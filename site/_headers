@@ -15,7 +15,7 @@
   Cache-Control: public, max-age=86400
 
 # The pages and their stylesheet change together; a stale stylesheet under a new page breaks it.
-/*.css
+/style.css
   Cache-Control: public, max-age=0, must-revalidate
-/*.js
+/site.js
   Cache-Control: public, max-age=0, must-revalidate
