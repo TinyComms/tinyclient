@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self'; style-src 'self'; script-src 'self'; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<title>Privacy &amp; security · tinyclient docs</title>
+<meta name="description" content="What tinyclient stores, which connections it makes, what it never does, its known limits, and how to report a vulnerability.">
+<meta name="color-scheme" content="dark light">
+<meta name="theme-color" content="#121315" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<link rel="icon" href="../favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="../style.css">
+<script src="../site.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../" aria-label="tinyclient home"><img src="../favicon.svg" alt="" width="28" height="28">tinyclient</a>
+    <nav class="site-nav" aria-label="Site">
+      <a href="./" aria-current="page">Docs</a>
+      <a class="hide-sm" href="privacy.html">Privacy</a>
+      <a class="hide-sm" href="networks.html">Networks &amp; terms</a>
+      <a class="gh" href="https://github.com/itz4blitz/tinyclient"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap docs">
+  <nav class="docs-nav" aria-label="Documentation">
+    <div class="docs-nav-inner">
+      <h2>Documentation</h2>
+      <ul>
+          <li><a href="index.html">Getting started</a></li>
+          <li><a href="build.html">Build from source</a></li>
+          <li><a href="architecture.html">Architecture</a></li>
+          <li><a href="privacy.html" aria-current="page">Privacy &amp; security</a></li>
+          <li><a href="networks.html">Networks &amp; terms</a></li>
+          <li><a href="contributing.html">Contributing</a></li>
+      </ul>
+      <h2 class="ext">On GitHub</h2>
+      <ul class="ext">
+          <li><a href="https://github.com/itz4blitz/tinyclient/releases">Releases</a></li>
+          <li><a href="https://github.com/itz4blitz/tinyclient/blob/main/SECURITY.md">Security policy</a></li>
+          <li><a href="https://github.com/itz4blitz/tinyclient/tree/main/docs">Design documents</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <main id="main" class="prose">
+    <h1>Privacy &amp; security</h1>
+    <p class="lede">What tinyclient stores, which connections it makes, what it never does, and where it falls short today.</p>
+
+    <div class="callout">
+      <p><strong>There is no tinyclient server.</strong> The project runs no service, collects no accounts and receives no data. Everything below happens on your computer, between it and the networks you sign in to.</p>
+    </div>
+
+    <h2 id="stored">What is stored</h2>
+    <div class="table-wrap" tabindex="0" role="region" aria-label="What is stored">
+      <table>
+        <thead><tr><th scope="col">What</th><th scope="col">Where</th><th scope="col">Protection</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">Sessions</th><td>System credential store: macOS login keychain, Windows Credential Manager, or the Secret Service on Linux. Service <code>tinyclient</code>, one item per network.</td><td>The system&rsquo;s. <code>chatd</code> refuses to sign in on a build whose credential store would not persist.</td></tr>
+          <tr><th scope="row">Message cache</th><td><code>chat.sqlite</code> in the <a href="./#data">data directory</a></td><td>Not encrypted by tinyclient</td></tr>
+          <tr><th scope="row">Media you looked at</th><td><code>media/</code> beside it, at most 500 MB</td><td>Not encrypted by tinyclient</td></tr>
+          <tr><th scope="row">Signal keys and sessions</th><td><code>signal/</code> beside it</td><td>Each value sealed (AES-GCM-SIV) with a key held only in the credential store</td></tr>
+          <tr><th scope="row">Sign-in window&rsquo;s browser data</th><td>A browser profile of its own, so an interrupted sign-in can resume</td><td>The system web view&rsquo;s</td></tr>
+          <tr><th scope="row">Logs</th><td><code>crash.log</code> and <code>chatd.log</code> in the data directory</td><td>Credentials redacted before writing</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>Use your system&rsquo;s disk encryption (FileVault, BitLocker, LUKS): the cache relies on it.</p>
+    <p><strong>Signing out</strong> of an account deletes its credential item, its rows in the database and its media.</p>
+
+    <h2 id="connections">Connections it makes</h2>
+    <ul>
+      <li><strong>To the networks you sign in to, and nothing else.</strong> No update check, no analytics, no crash upload, no font or asset download.</li>
+      <li><strong>Media</strong> is fetched only from an allow-list of each network&rsquo;s own hosts, and a session&rsquo;s credentials are only sent to the hosts that need them. Discord&rsquo;s GIF stills come from <code>media.tenor.com</code>, because Discord&rsquo;s own GIF search returns them there. The list is in <a href="https://github.com/itz4blitz/tinyclient/blob/main/crates/chatd/src/blobs/fetch.rs"><code>blobs/fetch.rs</code></a>.</li>
+      <li><strong>Links</strong> in messages are never fetched. Link previews are the ones the network itself sends.</li>
+      <li><strong>Sign-in</strong> shows the network&rsquo;s own page in a separate window. That page loads what the network&rsquo;s page loads.</li>
+      <li><strong>Calls</strong> connect <code>mediad</code> directly to Discord&rsquo;s voice servers.</li>
+    </ul>
+
+    <h2 id="never">What it never does</h2>
+    <ul>
+      <li>Send anything to the people who make tinyclient.</li>
+      <li>Embed a network&rsquo;s web app. The one web page it shows is the sign-in page.</li>
+      <li>Act for you. No reaction, edit, delete, friend request, read receipt, typing notice or presence change goes out unless you made it. A conversation is marked read only when the window is active, the conversation is open and the message is on screen.</li>
+      <li>Enumerate. No whole-server member lists, no history crawl. History is fetched for what you open or have on screen.</li>
+      <li>Write a credential to a log. Slack, Discord and Teams tokens, JWTs, authorization headers, signed URL parameters and Signal&rsquo;s keys are redacted (<a href="https://github.com/itz4blitz/tinyclient/blob/main/crates/protocol/src/crash.rs"><code>protocol/src/crash.rs</code></a>).</li>
+    </ul>
+
+    <h2 id="crashes">Crash reports</h2>
+    <p><code>chatd</code>, <code>mediad</code> and the window each install one panic hook. A panic writes one entry, redacted, to standard error and to <code>crash.log</code>, naming the program and thread, with a backtrace. If the window crashed on its main thread it reopens once and says so, with a <strong>Copy report</strong> button that copies the last entry to your clipboard. Nothing is sent. If you want to share a report, read it first and attach it to an issue yourself.</p>
+
+    <h2 id="identity">How it presents itself</h2>
+    <p>To Discord and Slack, tinyclient presents itself as the web client in a browser, the same identity the sign-in window used: on macOS the version of Safari you have installed, elsewhere a fixed Chrome identity. One consistent identity draws less attention than an unknown one. To Teams it signs in as Microsoft&rsquo;s own Teams client. This is described with its risks on <a href="networks.html">Networks &amp; terms</a>.</p>
+
+    <h2 id="limits">Known limits</h2>
+    <ul>
+      <li>The message cache and media are not encrypted by tinyclient.</li>
+      <li>The local socket is not authenticated. Any program running as your user can connect to it, as such a program can already read your files.</li>
+      <li>Signal safety numbers are not shown yet, and a contact&rsquo;s new identity key is trusted automatically, as presage&rsquo;s own stores do.</li>
+      <li>The release builds are not notarized on macOS and not code-signed on Windows.</li>
+    </ul>
+
+    <h2 id="report">Reporting a vulnerability</h2>
+    <p>Please report security problems privately through <a href="https://github.com/itz4blitz/tinyclient/security/advisories/new">GitHub Security Advisories</a>, not in a public issue. What is in scope and what to expect: <a href="https://github.com/itz4blitz/tinyclient/blob/main/SECURITY.md"><code>SECURITY.md</code></a>.</p>
+
+    <h2 id="website">This website</h2>
+    <p>Static HTML and one stylesheet. No cookies, no analytics, no fonts or scripts from other sites; a Content-Security-Policy allows only this site&rsquo;s own files. The one small script names your system on the download button and adds Copy buttons, and every page reads the same without it. GitHub Pages serves the site and, like any web host, can see your request.</p>
+
+    <nav class="pager" aria-label="Previous and next"><a href="architecture.html"><span>Previous</span>Architecture</a><a class="next" href="networks.html"><span>Next</span>Networks &amp; terms</a></nav>
+    <p class="edit">This page is <a href="https://github.com/itz4blitz/tinyclient/blob/main/site/docs/privacy.html"><code>site/docs/privacy.html</code></a>. Sources for its claims: <a href="https://github.com/itz4blitz/tinyclient/blob/main/docs/architecture.md">docs/architecture.md</a>, <a href="https://github.com/itz4blitz/tinyclient/blob/main/crates/chatd/src/session.rs">chatd/src/session.rs</a>, <a href="https://github.com/itz4blitz/tinyclient/blob/main/crates/chatd/src/blobs/fetch.rs">blobs/fetch.rs</a>, <a href="https://github.com/itz4blitz/tinyclient/blob/main/crates/protocol/src/crash.rs">protocol/src/crash.rs</a>.</p>
+  </main>
+</div>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="fine">
+      <p>tinyclient is open source under the MIT license; a <code>chatd</code> built with Signal support is a combined work under the AGPL-3.0. Not affiliated with Slack, Discord, Telegram, Microsoft or Signal; network icons from <a href="https://github.com/homarr-labs/dashboard-icons">Dashboard Icons</a> (Apache-2.0).</p>
+      <p>This website sets no cookies, runs no analytics and loads nothing from any other site. GitHub Pages hosts it and can see your request the way any web server can.</p>
+    </div>
+  </div>
+</footer>
+</body>
+</html>

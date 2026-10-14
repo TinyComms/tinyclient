@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self'; style-src 'self'; script-src 'self'; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<title>Contributing · tinyclient docs</title>
+<meta name="description" content="How to contribute to tinyclient: where help is needed, how to start, and the rules every change keeps.">
+<meta name="color-scheme" content="dark light">
+<meta name="theme-color" content="#121315" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<link rel="icon" href="../favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="../style.css">
+<script src="../site.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../" aria-label="tinyclient home"><img src="../favicon.svg" alt="" width="28" height="28">tinyclient</a>
+    <nav class="site-nav" aria-label="Site">
+      <a href="./" aria-current="page">Docs</a>
+      <a class="hide-sm" href="privacy.html">Privacy</a>
+      <a class="hide-sm" href="networks.html">Networks &amp; terms</a>
+      <a class="gh" href="https://github.com/itz4blitz/tinyclient"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap docs">
+  <nav class="docs-nav" aria-label="Documentation">
+    <div class="docs-nav-inner">
+      <h2>Documentation</h2>
+      <ul>
+          <li><a href="index.html">Getting started</a></li>
+          <li><a href="build.html">Build from source</a></li>
+          <li><a href="architecture.html">Architecture</a></li>
+          <li><a href="privacy.html">Privacy &amp; security</a></li>
+          <li><a href="networks.html">Networks &amp; terms</a></li>
+          <li><a href="contributing.html" aria-current="page">Contributing</a></li>
+      </ul>
+      <h2 class="ext">On GitHub</h2>
+      <ul class="ext">
+          <li><a href="https://github.com/itz4blitz/tinyclient/releases">Releases</a></li>
+          <li><a href="https://github.com/itz4blitz/tinyclient/blob/main/SECURITY.md">Security policy</a></li>
+          <li><a href="https://github.com/itz4blitz/tinyclient/tree/main/docs">Design documents</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <main id="main" class="prose">
+    <h1>Contributing</h1>
+    <p class="lede">From a typo to a network adapter. The full guide is <a href="https://github.com/itz4blitz/tinyclient/blob/main/CONTRIBUTING.md"><code>CONTRIBUTING.md</code></a>; this page is the short version.</p>
+
+    <h2 id="needed">Where help is needed</h2>
+    <ul>
+      <li><strong>Real-account testing</strong> of Teams, Telegram and Signal, and of everything on Linux and Windows. A bug report with the redacted log is as useful as code.</li>
+      <li><strong>Notifications and a dock badge</strong>, and the settings that control them.</li>
+      <li><strong>An interactive terminal UI</strong> on the existing socket protocol. The protocol is all it needs.</li>
+      <li><strong>Signal</strong>: attachments, safety numbers, calls.</li>
+      <li><strong>Packaging</strong>: a notarized macOS build, Linux packages, a Windows installer.</li>
+      <li><strong>Message search</strong>, video and screen share.</li>
+    </ul>
+
+    <h2 id="start">Start here</h2>
+<div class="code"><pre><code>git clone https://github.com/itz4blitz/tinyclient
+cd tinyclient
+cargo test --workspace
+TINYCLIENT_DIR=/tmp/tinyclient-demo cargo run -p chatd -- --seed-demo=live
+TINYCLIENT_DIR=/tmp/tinyclient-demo cargo run -p tinyclient --features gui</code></pre></div>
+    <p>Work against the demo or the tests&rsquo; local fakes. Run <code>chatd</code> with <code>TINYCLIENT_DIR</code> set while developing, so a half-finished change never touches your real sessions or cache. <a href="build.html">Build from source</a> lists the prerequisites.</p>
+
+    <h2 id="rules">What a change must keep true</h2>
+    <ul>
+      <li><strong>Budgets.</strong> A feature is done when it passes its memory, speed and idle budget, measured from outside the process.</li>
+      <li><strong>Process boundaries.</strong> <code>chatd</code> never decodes media; <code>mediad</code> never runs without a call; the window never talks to a network.</li>
+      <li><strong>Nothing automated</strong>, and nothing sent that the user did not ask for.</li>
+      <li><strong>Protocol additions are optional fields</strong>, so an older frame still reads.</li>
+      <li><strong>No new async runtime and no second TLS stack</strong> in <code>chatd</code> without a measured reason.</li>
+    </ul>
+
+    <h2 id="docs">Where the documentation lives</h2>
+    <div class="table-wrap" tabindex="0" role="region" aria-label="Repository documentation">
+      <table>
+        <thead><tr><th scope="col">Document</th><th scope="col">Answers</th></tr></thead>
+        <tbody>
+          <tr><th scope="row"><a href="https://github.com/itz4blitz/tinyclient/blob/main/docs/architecture.md"><code>docs/architecture.md</code></a></th><td>How the processes fit, the socket contract, where data lives, what an adapter must do</td></tr>
+          <tr><th scope="row"><a href="https://github.com/itz4blitz/tinyclient/blob/main/docs/stories.md"><code>docs/stories.md</code></a>, <a href="https://github.com/itz4blitz/tinyclient/tree/main/docs/product"><code>docs/product/</code></a></th><td>What is in the product and what is cut; budgets and account risk</td></tr>
+          <tr><th scope="row"><a href="https://github.com/itz4blitz/tinyclient/blob/main/docs/design.md"><code>docs/design.md</code></a>, <a href="https://github.com/itz4blitz/tinyclient/tree/main/docs/design"><code>docs/design/</code></a></th><td>The visual system, with an HTML mockup per area</td></tr>
+          <tr><th scope="row"><a href="https://github.com/itz4blitz/tinyclient/blob/main/SECURITY.md"><code>SECURITY.md</code></a></th><td>How to report a vulnerability</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2 id="license">License</h2>
+    <p>The source is MIT. A <code>chatd</code> built with the default <code>signal</code> feature links AGPL-3.0 libraries and is distributed under the AGPL-3.0 as a combined work.</p>
+
+    <nav class="pager" aria-label="Previous and next"><a href="networks.html"><span>Previous</span>Networks &amp; terms</a></nav>
+    <p class="edit">This page is <a href="https://github.com/itz4blitz/tinyclient/blob/main/site/docs/contributing.html"><code>site/docs/contributing.html</code></a>. Sources for its claims: <a href="https://github.com/itz4blitz/tinyclient/blob/main/docs/architecture.md">docs/architecture.md</a>, <a href="https://github.com/itz4blitz/tinyclient/blob/main/docs/stories.md">docs/stories.md</a>.</p>
+  </main>
+</div>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="fine">
+      <p>tinyclient is open source under the MIT license; a <code>chatd</code> built with Signal support is a combined work under the AGPL-3.0. Not affiliated with Slack, Discord, Telegram, Microsoft or Signal; network icons from <a href="https://github.com/homarr-labs/dashboard-icons">Dashboard Icons</a> (Apache-2.0).</p>
+      <p>This website sets no cookies, runs no analytics and loads nothing from any other site. GitHub Pages hosts it and can see your request the way any web server can.</p>
+    </div>
+  </div>
+</footer>
+</body>
+</html>

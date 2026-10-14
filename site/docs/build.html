@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self'; style-src 'self'; script-src 'self'; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<title>Build from source · tinyclient docs</title>
+<meta name="description" content="Build tinyclient from source: prerequisites, cargo commands, the Telegram app id, the Signal feature and the demo mode.">
+<meta name="color-scheme" content="dark light">
+<meta name="theme-color" content="#121315" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<link rel="icon" href="../favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="../style.css">
+<script src="../site.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../" aria-label="tinyclient home"><img src="../favicon.svg" alt="" width="28" height="28">tinyclient</a>
+    <nav class="site-nav" aria-label="Site">
+      <a href="./" aria-current="page">Docs</a>
+      <a class="hide-sm" href="privacy.html">Privacy</a>
+      <a class="hide-sm" href="networks.html">Networks &amp; terms</a>
+      <a class="gh" href="https://github.com/itz4blitz/tinyclient"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap docs">
+  <nav class="docs-nav" aria-label="Documentation">
+    <div class="docs-nav-inner">
+      <h2>Documentation</h2>
+      <ul>
+          <li><a href="index.html">Getting started</a></li>
+          <li><a href="build.html" aria-current="page">Build from source</a></li>
+          <li><a href="architecture.html">Architecture</a></li>
+          <li><a href="privacy.html">Privacy &amp; security</a></li>
+          <li><a href="networks.html">Networks &amp; terms</a></li>
+          <li><a href="contributing.html">Contributing</a></li>
+      </ul>
+      <h2 class="ext">On GitHub</h2>
+      <ul class="ext">
+          <li><a href="https://github.com/itz4blitz/tinyclient/releases">Releases</a></li>
+          <li><a href="https://github.com/itz4blitz/tinyclient/blob/main/SECURITY.md">Security policy</a></li>
+          <li><a href="https://github.com/itz4blitz/tinyclient/tree/main/docs">Design documents</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <main id="main" class="prose">
+    <h1>Build from source</h1>
+    <p class="lede">A Cargo workspace of five crates. No custom build system.</p>
+
+    <h2 id="prerequisites">Prerequisites</h2>
+    <ul>
+      <li><strong>Rust</strong>, current stable, through <a href="https://rustup.rs">rustup</a>.</li>
+      <li><strong><code>protoc</code></strong> on the <code>PATH</code>. Signal&rsquo;s libraries compile protobufs while building. macOS: <code>brew install protobuf</code>. Debian and Ubuntu: <code>apt install protobuf-compiler</code>.</li>
+      <li><strong>macOS</strong>: the Command Line Tools are enough. The window builds with runtime shaders, so Xcode&rsquo;s Metal compiler is not needed.</li>
+      <li><strong>Linux</strong>: the system libraries CI installs.</li>
+    </ul>
+<div class="code"><pre><code>sudo apt-get install build-essential pkg-config libssl-dev libasound2-dev libgtk-3-dev \
+  libwebkit2gtk-4.1-dev libsoup-3.0-dev libvulkan-dev libwayland-dev libxkbcommon-dev \
+  libx11-dev libxcb1-dev libfontconfig1-dev protobuf-compiler</code></pre></div>
+    <ul>
+      <li><strong>Windows</strong>: <code>protoc</code> on the <code>PATH</code>, and WebView2 for the sign-in window.</li>
+    </ul>
+
+    <h2 id="build">Build and run</h2>
+<div class="code"><pre><code>git clone https://github.com/itz4blitz/tinyclient
+cd tinyclient
+cargo test --workspace  <span class="c"># every crate; no GPU stack is built</span>
+cargo build -p chatd -p mediad -p login  <span class="c"># the daemon and its helpers</span>
+cargo run -p tinyclient --features gui  <span class="c"># the window; starts chatd beside it</span>
+cargo run -p tinyclient  <span class="c"># status and inbox as text</span></code></pre></div>
+    <p>The window is behind the <code>gui</code> feature so that the daemons and the tests never build a GPU stack. <code>tinyclient</code> starts the <code>chatd</code> that sits beside it in <code>target/&lt;profile&gt;</code>, so build both. <code>TINYCLIENT_CHATD</code> names a different one.</p>
+
+    <h3 id="crates">The crates</h3>
+    <div class="table-wrap" tabindex="0" role="region" aria-label="Workspace crates">
+      <table>
+        <thead><tr><th scope="col">Crate</th><th scope="col">Binary</th><th scope="col">Role</th></tr></thead>
+        <tbody>
+          <tr><th scope="row"><code>chatd</code></th><td><code>chatd</code></td><td>The daemon: network adapters, SQLite store, media cache, call signalling.</td></tr>
+          <tr><th scope="row"><code>tinyclient</code></th><td><code>tinyclient</code></td><td>The window (GPUI, feature <code>gui</code>) or the text output.</td></tr>
+          <tr><th scope="row"><code>mediad</code></th><td><code>mediad</code></td><td>One call: voice gateway, UDP, Opus, Discord&rsquo;s end-to-end encryption, audio devices.</td></tr>
+          <tr><th scope="row"><code>login</code></th><td><code>tinyclient-login</code></td><td>One sign-in window for Discord, Slack and Teams.</td></tr>
+          <tr><th scope="row"><code>protocol</code></th><td>library</td><td>The frames the programs exchange. Local IPC only.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3 id="release">Release builds</h3>
+<div class="code"><pre><code>cargo build --release -p tinyclient --features tinyclient/gui -p chatd -p mediad -p login
+packaging/bundle.sh  <span class="c"># macOS: builds and assembles target/release/tinyclient.app</span></code></pre></div>
+    <p>On macOS, calls need the bundle: the system grants the microphone to an app, and a bare program run from a terminal borrows the terminal&rsquo;s permission instead.</p>
+
+    <h2 id="telegram">Telegram needs your own app id</h2>
+    <p>Telegram asks every client to register an app id, and the id is not in the repository. Register one at <a href="https://my.telegram.org">my.telegram.org</a> (the app name must not contain &ldquo;Telegram&rdquo;) and build <code>chatd</code> with both values in the environment:</p>
+<div class="code"><pre><code>TINYCLIENT_TELEGRAM_API_ID=... TINYCLIENT_TELEGRAM_API_HASH=... cargo build -p chatd</code></pre></div>
+    <p>Without them, Telegram is listed as unavailable and says why. A binary built this way carries your id, and Telegram holds the id&rsquo;s owner responsible for what the app does: give it to other people only if you accept that.</p>
+
+    <h2 id="signal">Signal, and the AGPL</h2>
+    <p>The <code>signal</code> feature of <code>chatd</code> is on by default. It links <a href="https://github.com/whisperfish/presage">presage</a>, libsignal-service-rs and Signal&rsquo;s libsignal, which are AGPL-3.0, so a <code>chatd</code> built with it is a combined work under the AGPL-3.0. The release binaries are built with it. To leave Signal out:</p>
+<div class="code"><pre><code>cargo build -p chatd --no-default-features</code></pre></div>
+
+    <h2 id="demo">Try it without an account</h2>
+    <p><code>TINYCLIENT_DIR</code> moves the socket, database and logs to a directory you choose and turns sign-in off, so nothing touches your credential store. <code>--seed-demo</code> fills that directory with invented servers, workspaces, people and conversations for Discord, two Slack workspaces, Telegram and Teams. <code>#showcase</code> holds every kind of message.</p>
+<div class="code"><pre><code>TINYCLIENT_DIR=/tmp/tinyclient-demo cargo run -p chatd -- --seed-demo
+TINYCLIENT_DIR=/tmp/tinyclient-demo cargo run -p tinyclient --features gui</code></pre></div>
+    <ul>
+      <li><code>--seed-demo=live</code> keeps one conversation busy: someone types, a message lands, a reaction, an edit.</li>
+      <li>Other variants, comma separated: <code>expired</code>, <code>many</code> (50 Discord servers), <code>attention</code>, <code>reconnecting</code>.</li>
+      <li><code>chatd</code> refuses <code>--seed-demo</code> without <code>TINYCLIENT_DIR</code>, so it cannot write into your real store.</li>
+    </ul>
+
+    <h3 id="screenshots">Screenshots without screen recording</h3>
+    <p>The <code>gui-shot</code> feature adds <code>--shot out.png</code>, which renders the window to a file and quits. A shell built with it never marks anything read on a network.</p>
+<div class="code"><pre><code>TINYCLIENT_DIR=/tmp/tinyclient-demo cargo run -p tinyclient --features gui-shot -- --shot out.png</code></pre></div>
+
+    <h2 id="tests">Tests</h2>
+    <p>The <code>chatd</code> tests drive the daemon through its socket against local fakes of each network: HTTP and websocket fakes for Discord, Slack and Teams, and scripted wires for Telegram and Signal. <code>mediad</code>&rsquo;s tests run a whole encrypted call against a fake voice server. None of them needs an account or the network.</p>
+
+    <nav class="pager" aria-label="Previous and next"><a href="index.html"><span>Previous</span>Getting started</a><a class="next" href="architecture.html"><span>Next</span>Architecture</a></nav>
+    <p class="edit">This page is <a href="https://github.com/itz4blitz/tinyclient/blob/main/site/docs/build.html"><code>site/docs/build.html</code></a>. Sources for its claims: <a href="https://github.com/itz4blitz/tinyclient/blob/main/Cargo.toml">Cargo.toml</a>, <a href="https://github.com/itz4blitz/tinyclient/blob/main/crates/chatd/Cargo.toml">crates/chatd/Cargo.toml</a>, <a href="https://github.com/itz4blitz/tinyclient/blob/main/packaging/bundle.sh">packaging/bundle.sh</a>, <a href="https://github.com/itz4blitz/tinyclient/blob/main/.github/workflows/ci.yml">ci.yml</a>.</p>
+  </main>
+</div>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="fine">
+      <p>tinyclient is open source under the MIT license; a <code>chatd</code> built with Signal support is a combined work under the AGPL-3.0. Not affiliated with Slack, Discord, Telegram, Microsoft or Signal; network icons from <a href="https://github.com/homarr-labs/dashboard-icons">Dashboard Icons</a> (Apache-2.0).</p>
+      <p>This website sets no cookies, runs no analytics and loads nothing from any other site. GitHub Pages hosts it and can see your request the way any web server can.</p>
+    </div>
+  </div>
+</footer>
+</body>
+</html>

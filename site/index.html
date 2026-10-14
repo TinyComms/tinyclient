@@ -1,0 +1,432 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self'; style-src 'self'; script-src 'self'; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<title>tinyclient: a native client for Slack, Discord, Telegram, Teams and Signal</title>
+<meta name="description" content="tinyclient is an open-source native chat client in Rust for Slack, Discord, Telegram, Microsoft Teams and Signal. It runs on your computer and talks to each network directly. There is no tinyclient server.">
+<meta name="color-scheme" content="dark light">
+<meta name="theme-color" content="#121315" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<meta property="og:type" content="website">
+<meta property="og:title" content="tinyclient">
+<meta property="og:description" content="One native app for Slack, Discord, Telegram, Teams and Signal. No server in the middle, no telemetry. Open source, written in Rust.">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+<script src="site.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="./" aria-label="tinyclient home"><img src="favicon.svg" alt="" width="28" height="28">tinyclient</a>
+    <nav class="site-nav" aria-label="Site">
+      <a href="docs/">Docs</a>
+      <a class="hide-sm" href="docs/privacy.html">Privacy</a>
+      <a class="hide-sm" href="docs/networks.html">Networks &amp; terms</a>
+      <a class="gh" href="https://github.com/itz4blitz/tinyclient"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+
+<section class="hero" aria-labelledby="title">
+  <div class="wrap">
+    <img class="hero-icon" src="icon.svg" alt="" width="76" height="76">
+    <h1 id="title">tinyclient</h1>
+    <p class="pitch">One native app for Slack, Discord, Telegram, Microsoft&nbsp;Teams and Signal. It runs on your computer and talks to each network directly. <strong>There is no tinyclient server</strong>, and nothing is sent anywhere else.</p>
+    <div class="actions">
+      <a class="btn btn-primary" href="https://github.com/itz4blitz/tinyclient/releases/latest"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/><path d="M12 15V3"/></svg><span data-download-label>Download the latest release</span></a>
+      <a class="btn btn-secondary" href="https://github.com/itz4blitz/tinyclient"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>View source</a>
+    </div>
+    <p class="platforms"><span data-download-hint>macOS 13+ on Apple silicon · Linux x86_64 · Windows x86_64</span> · Free and open source, MIT · <a href="docs/">Install guide</a></p>
+    <p class="notice"><span><strong>Early software.</strong> Discord and Slack have been used on real accounts. Teams, Telegram, Signal and voice calls have so far run only against local fakes of each network. tinyclient is unofficial, and using it can break a network&rsquo;s terms: <a href="docs/networks.html">read the terms for each network</a> before you sign in.</span></p>
+
+    <figure class="shot">
+      <div class="app" role="img" aria-label="Illustration of the tinyclient window: a rail of network buttons on the left, a unified inbox of conversations from several networks in the middle, and an open Slack channel on the right.">
+        <div class="app-rail" aria-hidden="true">
+          <span class="lights"><i></i><i></i><i></i></span>
+          <span class="rb on"><svg viewBox="0 0 24 24"><path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></svg><span class="pill">4</span></span>
+          <span class="rb"><svg viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg></span>
+          <span class="rail-sep"></span>
+          <span class="rb"><img src="assets/networks/discord.svg" alt=""><span class="pill">2</span></span>
+          <span class="rb"><img src="assets/networks/slack.svg" alt=""><span class="pill">1</span></span>
+          <span class="rb"><img src="assets/networks/telegram.svg" alt=""><span class="dot"></span></span>
+          <span class="rb"><img src="assets/networks/microsoft-teams.svg" alt=""></span>
+          <span class="rb"><img src="assets/networks/signal.svg" alt=""><span class="pill">1</span></span>
+          <span class="rail-sep"></span>
+          <span class="rb"><svg viewBox="0 0 24 24"><path d="M5 12h14"/><path d="M12 5v14"/></svg></span>
+          <span class="rb rail-me"><span class="av c4">JS<span class="pres"></span></span></span>
+        </div>
+
+        <div class="app-side" aria-hidden="true">
+          <div class="strip"><span class="strip-title">Inbox</span><span class="seg"><span>All</span><span>Unread 3</span><span>Mentions 1</span></span></div>
+          <div class="jump"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>Jump to…<kbd>⌘K</kbd></div>
+          <div class="day">Today</div>
+          <ul class="rows">
+            <li class="row on unread"><span class="av sq c1">#</span><span class="row-main"><span class="row-top"><img src="assets/networks/slack.svg" alt=""><span class="row-title">Northwind › #release</span></span><span class="row-prev">Wren: @Justin can you take the notes?</span></span><span class="row-end">10:42<span class="pill">1</span></span></li>
+            <li class="row unread"><span class="av c2">TK<span class="pres"></span></span><span class="row-main"><span class="row-top"><img src="assets/networks/discord.svg" alt=""><span class="row-title">Tomasz Kiel</span></span><span class="row-prev typing">typing…</span></span><span class="row-end">10:38<span class="pill">2</span></span></li>
+            <li class="row unread"><span class="av c3">MO<span class="pres idle"></span></span><span class="row-main"><span class="row-top"><img src="assets/networks/signal.svg" alt=""><span class="row-title">Mara Okafor</span></span><span class="row-prev">Train gets in at 6, see you there</span></span><span class="row-end">10:12<span class="pill">1</span></span></li>
+            <li class="row"><span class="av c5">WC</span><span class="row-main"><span class="row-top"><img src="assets/networks/telegram.svg" alt=""><span class="row-title">Weekend Climbers</span></span><span class="row-prev">Kofi: who has the spare rope?</span></span><span class="row-end">9:20</span></li>
+            <li class="row"><span class="av c6">PL</span><span class="row-main"><span class="row-top"><img src="assets/networks/microsoft-teams.svg" alt=""><span class="row-title">Platform leads</span></span><span class="row-prev">You: agreed, Thursday works</span></span><span class="row-end">8:57</span></li>
+          </ul>
+          <div class="day">Yesterday</div>
+          <ul class="rows">
+            <li class="row"><span class="av c4">SD<span class="pres"></span></span><span class="row-main"><span class="row-top"><img src="assets/networks/slack.svg" alt=""><span class="row-title">Sunniva Dahl</span></span><span class="row-prev">Sent a file: q3-notes.pdf</span></span><span class="row-end">Tue</span></li>
+            <li class="row"><span class="av sq c2">#</span><span class="row-main"><span class="row-top"><img src="assets/networks/discord.svg" alt=""><span class="row-title">Driftwood › #general</span></span><span class="row-prev">Bex: the map pack is up</span></span><span class="row-end">Tue</span></li>
+            <li class="row"><span class="av c1">NF</span><span class="row-main"><span class="row-top"><img src="assets/networks/telegram.svg" alt=""><span class="row-title">Nilo Ferrante</span></span><span class="row-prev">ok, thanks!</span></span><span class="row-end">Tue</span></li>
+          </ul>
+        </div>
+
+        <div class="app-main" aria-hidden="true">
+          <div class="strip">
+            <span class="av sq c1">#</span>
+            <span class="conv-title"><b>#release</b><span><img src="assets/networks/slack.svg" alt="">Northwind › Channels · 18 members</span></span>
+            <span class="tools"><svg viewBox="0 0 24 24"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.13.96.36 1.9.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.91.34 1.85.57 2.81.7A2 2 0 0 1 22 16.92z"/></svg><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg><svg viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg><svg viewBox="0 0 24 24"><path d="M12 17v5"/><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z"/></svg></span>
+          </div>
+          <div class="msgs">
+            <div class="divider">Today</div>
+            <div class="msg"><span class="av s36 c4">SD</span><div><div class="msg-head"><b>Sunniva Dahl</b><time>10:18</time></div><p>Release branch is cut. Changelog draft is in the doc, edits welcome.</p></div></div>
+            <div class="msg"><span class="av s36 c6">JM</span><div><div class="msg-head"><b>Jules Marek</b><time>10:24</time></div><p>Migration ran clean on staging. <code>v2.14.0</code> is tagged.</p><div class="reacts"><span class="mine">👍 3</span><span>🎉 2</span></div></div></div>
+            <div class="divider new">New</div>
+            <div class="msg me"><span class="av s36 c1">WM</span><div><div class="msg-head"><b>Wren Moss</b><time>10:42</time></div><p><span class="m">@Justin</span> can you take the notes for the release call? I am on the train until 11.</p></div></div>
+          </div>
+          <div class="typing-line">Jules Marek is typing…</div>
+          <div class="composer"><svg viewBox="0 0 24 24"><path d="M5 12h14"/><path d="M12 5v14"/></svg>Message #release<svg class="send" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><path d="M9 9h.01"/><path d="M15 9h.01"/></svg></div>
+        </div>
+      </div>
+      <figcaption>An illustration, not a screenshot: drawn in HTML with the app&rsquo;s own palette and sizes from <a href="https://github.com/itz4blitz/tinyclient/blob/main/crates/tinyclient/src/gui/theme.rs"><code>theme.rs</code></a>. Names and messages are invented.</figcaption>
+    </figure>
+  </div>
+</section>
+
+<section class="section" id="networks" aria-labelledby="networks-title">
+  <div class="wrap">
+    <span class="eyebrow">Networks</span>
+    <h2 id="networks-title">Five networks, one window, one design</h2>
+    <p class="lede">Each network keeps its own structure: Discord servers, Slack workspaces, Telegram folders, Teams channels. They share one inbox, one people list and one way of drawing a message.</p>
+    <ul class="nets">
+      <li class="net">
+        <div class="net-head"><img src="assets/networks/discord.svg" alt="" width="24" height="24"><h3>Discord</h3></div>
+        <dl>
+          <div><dt>Used on a real account</dt><dd><span class="tag yes">Yes, reading</span></dd></div>
+          <div><dt>Calls</dt><dd>Voice with Discord&rsquo;s end-to-end encryption. Not yet on a real call.</dd></div>
+          <div><dt>Terms</dt><dd><span class="tag no">Prohibits third-party clients</span></dd></div>
+        </dl>
+      </li>
+      <li class="net">
+        <div class="net-head"><img src="assets/networks/slack.svg" alt="" width="24" height="24"><h3>Slack</h3></div>
+        <dl>
+          <div><dt>Used on a real account</dt><dd><span class="tag yes">Yes</span></dd></div>
+          <div><dt>Calls</dt><dd>Huddles open in Slack.</dd></div>
+          <div><dt>Terms</dt><dd><span class="tag warn">Outside Slack&rsquo;s API terms</span></dd></div>
+        </dl>
+      </li>
+      <li class="net">
+        <div class="net-head"><img src="assets/networks/telegram.svg" alt="" width="24" height="24"><h3>Telegram</h3></div>
+        <dl>
+          <div><dt>Used on a real account</dt><dd><span class="tag">Not yet</span></dd></div>
+          <div><dt>Calls</dt><dd>Open in Telegram.</dd></div>
+          <div><dt>Terms</dt><dd><span class="tag yes">Allows third-party clients</span></dd></div>
+        </dl>
+      </li>
+      <li class="net">
+        <div class="net-head"><img src="assets/networks/microsoft-teams.svg" alt="" width="24" height="24"><h3>Teams</h3></div>
+        <dl>
+          <div><dt>Used on a real account</dt><dd><span class="tag">Not yet</span></dd></div>
+          <div><dt>Calls</dt><dd>Calls and meetings open in Teams.</dd></div>
+          <div><dt>Terms</dt><dd><span class="tag warn">Your organization decides</span></dd></div>
+        </dl>
+      </li>
+      <li class="net">
+        <div class="net-head"><img src="assets/networks/signal.svg" alt="" width="24" height="24"><h3>Signal</h3></div>
+        <dl>
+          <div><dt>Used on a real account</dt><dd><span class="tag">Not yet</span></dd></div>
+          <div><dt>Calls</dt><dd>Not built.</dd></div>
+          <div><dt>Terms</dt><dd><span class="tag warn">Not offered to other clients</span></dd></div>
+        </dl>
+      </li>
+    </ul>
+    <p class="after">What each network supports, and the full account-risk warnings: <a href="docs/networks.html">Networks &amp; terms</a>. tinyclient is not made, endorsed or supported by any of these companies.</p>
+  </div>
+</section>
+
+<section class="section" id="principles" aria-labelledby="principles-title">
+  <div class="wrap">
+    <span class="eyebrow">Principles</span>
+    <h2 id="principles-title">Built so you can check it</h2>
+    <p class="lede">Every claim below points at the code or document that makes it true.</p>
+    <div class="grid grid-3">
+      <div class="cell">
+        <h3>No server in the middle</h3>
+        <p>There is no tinyclient service and no account with us. A process on your computer, <code>chatd</code>, connects to each network you sign in to. Files are fetched only from an allow-list of each network&rsquo;s own hosts, and a link in a message is never fetched.</p>
+        <p class="src">See <a href="https://github.com/itz4blitz/tinyclient/blob/main/crates/chatd/src/blobs/fetch.rs"><code>blobs/fetch.rs</code></a></p>
+      </div>
+      <div class="cell">
+        <h3>No telemetry</h3>
+        <p>No analytics, usage pings, update check or crash upload. A crash is written to <code>crash.log</code> on your disk with tokens and cookies redacted. &ldquo;Copy report&rdquo; puts it on your clipboard; sending it is up to you.</p>
+        <p class="src">See <a href="https://github.com/itz4blitz/tinyclient/blob/main/crates/protocol/src/crash.rs"><code>protocol/src/crash.rs</code></a></p>
+      </div>
+      <div class="cell">
+        <h3>Local first</h3>
+        <p>Messages are cached in SQLite on your disk. Sessions live in the system credential store: the macOS keychain, Windows Credential Manager or the Secret Service on Linux. Signing out deletes the session, the cached messages and the media.</p>
+        <p class="src">See <a href="docs/privacy.html">Privacy &amp; security</a></p>
+      </div>
+      <div class="cell">
+        <h3>Native, with budgets</h3>
+        <p>The window is drawn with GPUI, the GPU UI framework from the Zed editor. No Electron and no embedded web client. Every feature has a memory, speed and idle-CPU budget, measured from outside the process.</p>
+        <p class="src">See <a href="https://github.com/itz4blitz/tinyclient/blob/main/docs/product/07-budgets-and-risk.md"><code>07-budgets-and-risk.md</code></a></p>
+      </div>
+      <div class="cell">
+        <h3>Calls cost nothing until you make one</h3>
+        <p>Voice runs in its own process, <code>mediad</code>, which starts when a call connects and exits when it ends. No audio code is loaded the rest of the time, and the sign-in window is a separate process that exits when you are in.</p>
+        <p class="src">See <a href="docs/architecture.html">Architecture</a></p>
+      </div>
+      <div class="cell">
+        <h3>Never acts for you</h3>
+        <p>No reaction, edit, friend request, read receipt or status change goes out unless you made it. A conversation is marked read only when the window is active, it is open and the message is on screen.</p>
+        <p class="src">See <a href="https://github.com/itz4blitz/tinyclient/blob/main/docs/architecture.md"><code>docs/architecture.md</code></a></p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="section" id="budgets" aria-labelledby="budgets-title">
+  <div class="wrap">
+    <span class="eyebrow">Resources</span>
+    <h2 id="budgets-title">Small, and measured</h2>
+    <p class="lede">Four programs, each running only when it has work. The target for the whole product, idle and signed in to four networks, is 150&nbsp;MB.</p>
+    <div class="table-wrap" tabindex="0" role="region" aria-labelledby="budgets-title">
+      <table class="stack">
+        <caption><code>chatd</code> signed in to Discord and the window, measured on macOS on 2026-10-13. <code>mediad</code> in an end-to-end encrypted call against a local fake voice server (<code>crates/mediad/tests/voice.rs</code>). Budgets and how each is measured: <a href="https://github.com/itz4blitz/tinyclient/blob/main/docs/product/07-budgets-and-risk.md">07-budgets-and-risk.md</a>.</caption>
+        <thead><tr><th scope="col">Process</th><th scope="col">Runs</th><th scope="col">Measured</th><th scope="col">Budget</th></tr></thead>
+        <tbody>
+          <tr><th scope="row"><code>chatd</code></th><td data-label="Runs">Always, in the background</td><td data-label="Measured" class="num">10 MB RSS</td><td data-label="Budget">20 MB idle on Discord, Slack and Teams</td></tr>
+          <tr><th scope="row"><code>tinyclient</code></th><td data-label="Runs">While the window is open</td><td data-label="Measured" class="num">64 MB RSS</td><td data-label="Budget">80 MB footprint with a list on screen</td></tr>
+          <tr><th scope="row"><code>mediad</code></th><td data-label="Runs">During a call only</td><td data-label="Measured" class="num">&lt; 40 MB RSS</td><td data-label="Budget">40 MB in a voice call; asserted by a test</td></tr>
+          <tr><th scope="row"><code>tinyclient-login</code></th><td data-label="Runs">During a sign-in only</td><td data-label="Measured" class="num">n/a</td><td data-label="Budget">Exits with the session</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<section class="section" id="architecture" aria-labelledby="arch-title">
+  <div class="wrap">
+    <span class="eyebrow">Architecture</span>
+    <h2 id="arch-title">Where your messages go</h2>
+    <p class="lede">From your computer to the network you sent them on, over TLS. Nowhere else.</p>
+    <figure class="diagram">
+      <svg class="dg" viewBox="0 0 960 470" role="img" aria-labelledby="dg-title dg-desc">
+        <title id="dg-title">tinyclient process diagram</title>
+        <desc id="dg-desc">On your computer, the tinyclient window talks to chatd over a local socket. chatd keeps the cache on disk and sessions in the system credential store, and connects directly to Slack, Discord, Telegram, Teams and Signal. chatd starts mediad only for a call, which connects to Discord's voice servers, and tinyclient-login only for a sign-in, which shows the network's own sign-in page. There is no tinyclient server.</desc>
+        <defs>
+          <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="head" d="M0 0 10 5 0 10z"/></marker>
+          <marker id="ao" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="head out" d="M0 0 10 5 0 10z"/></marker>
+        </defs>
+
+        <rect class="zone" x="10" y="20" width="660" height="430" rx="16"/>
+        <text class="f" x="30" y="46">YOUR COMPUTER</text>
+        <rect class="zone-out" x="700" y="20" width="250" height="430" rx="16"/>
+        <text class="f" x="720" y="46">THE NETWORKS</text>
+
+        <!-- window -->
+        <rect class="box" x="36" y="150" width="190" height="92" rx="10"/>
+        <text class="mono" x="56" y="182">tinyclient</text>
+        <text class="s" x="56" y="204">The window. Draws what</text>
+        <text class="s" x="56" y="222">chatd reports.</text>
+
+        <!-- socket -->
+        <path class="wire" d="M228 196 H294" marker-start="url(#ah)" marker-end="url(#ah)"/>
+        <text class="lbl" x="261" y="184" text-anchor="middle">socket</text>
+        <text class="lbl" x="261" y="216" text-anchor="middle">JSON</text>
+
+        <!-- chatd -->
+        <rect class="box core" x="296" y="118" width="200" height="156" rx="10"/>
+        <text class="mono" x="316" y="150">chatd</text>
+        <text class="s" x="316" y="174">Always on. Holds the</text>
+        <text class="s" x="316" y="192">sessions and network</text>
+        <text class="s" x="316" y="210">sockets. One adapter</text>
+        <text class="s" x="316" y="228">per network.</text>
+        <text class="f" x="316" y="256">No audio, no media decode</text>
+
+        <!-- storage -->
+        <path class="wire" d="M396 276 V330"/>
+        <rect class="box store" x="296" y="332" width="200" height="94" rx="10"/>
+        <text class="t" x="316" y="362">On your disk</text>
+        <text class="s" x="316" y="384">chat.sqlite, media/ cache</text>
+        <text class="s" x="316" y="404">sessions: credential store</text>
+
+        <!-- mediad -->
+        <path class="wire temp" d="M498 150 H510 V102 H518" marker-end="url(#ah)"/>
+        <rect class="box temp" x="520" y="64" width="140" height="80" rx="10"/>
+        <text class="mono" x="536" y="94">mediad</text>
+        <text class="s" x="536" y="116">During a call only</text>
+        <text class="f" x="536" y="133">Voice, Opus, DAVE</text>
+
+        <!-- login -->
+        <path class="wire temp" d="M498 250 H510 V384 H518" marker-end="url(#ah)"/>
+        <rect class="box temp" x="520" y="344" width="140" height="80" rx="10"/>
+        <text class="mono sm" x="536" y="374">tinyclient-login</text>
+        <text class="s" x="536" y="396">During sign-in only</text>
+        <text class="f" x="536" y="413">Then exits</text>
+
+        <!-- outbound -->
+        <path class="wire out" d="M498 196 C 600 196, 640 160, 718 160" marker-end="url(#ao)"/>
+        <path class="wire out" d="M498 196 C 600 196, 640 204, 718 204" marker-end="url(#ao)"/>
+        <path class="wire out" d="M498 196 C 600 196, 640 248, 718 248" marker-end="url(#ao)"/>
+        <path class="wire out" d="M498 196 C 600 196, 640 292, 718 292" marker-end="url(#ao)"/>
+        <path class="wire out" d="M498 196 C 600 196, 640 116, 718 116" marker-end="url(#ao)"/>
+        <path class="wire out" d="M662 104 C 692 104, 692 70, 718 70" marker-end="url(#ao)"/>
+        <path class="wire out" d="M662 384 C 692 384, 692 400, 718 400" marker-end="url(#ao)"/>
+
+        <rect class="nbox" x="720" y="54" width="210" height="32" rx="8"/><text class="s" x="736" y="75">Discord voice servers</text>
+        <rect class="nbox" x="720" y="100" width="210" height="32" rx="8"/><text class="s" x="736" y="121">Slack</text>
+        <rect class="nbox" x="720" y="144" width="210" height="32" rx="8"/><text class="s" x="736" y="165">Discord</text>
+        <rect class="nbox" x="720" y="188" width="210" height="32" rx="8"/><text class="s" x="736" y="209">Telegram</text>
+        <rect class="nbox" x="720" y="232" width="210" height="32" rx="8"/><text class="s" x="736" y="253">Microsoft Teams</text>
+        <rect class="nbox" x="720" y="276" width="210" height="32" rx="8"/><text class="s" x="736" y="297">Signal</text>
+        <rect class="nbox" x="720" y="384" width="210" height="32" rx="8"/><text class="s" x="736" y="405">The network&#8217;s sign-in page</text>
+        <text class="f" x="720" y="338">Only those you sign in to.</text>
+        <text class="f" x="720" y="354">No tinyclient server.</text>
+      </svg>
+      <p class="scroll-hint" aria-hidden="true">Scroll sideways to see the whole diagram.</p>
+      <figcaption>Solid boxes run while you are signed in; dashed ones exist only while they have work. The window never talks to a network, reads the database or holds a credential.</figcaption>
+    </figure>
+    <p class="more"><a href="docs/architecture.html">Read the architecture →</a></p>
+  </div>
+</section>
+
+<section class="section" id="privacy" aria-labelledby="privacy-title">
+  <div class="wrap">
+    <span class="eyebrow">Privacy and security</span>
+    <h2 id="privacy-title">What it keeps, and what it never does</h2>
+    <div class="cols">
+      <div>
+        <h3>Kept on your computer</h3>
+        <ul class="checks">
+          <li><strong>Sessions</strong> in the system credential store, one item per network under the service <code>tinyclient</code>. Never in the database or a log.</li>
+          <li><strong>Messages</strong> in <code>chat.sqlite</code>: the newest 2,000 per conversation, nothing older than 90 days unless you opened it in that time.</li>
+          <li><strong>Media</strong> you have looked at, in <code>media/</code>, capped at 500 MB and evicted oldest first.</li>
+          <li><strong>Signal&rsquo;s keys</strong> in <code>signal/</code>, each value sealed with a key that only the credential store holds.</li>
+        </ul>
+      </div>
+      <div>
+        <h3>Never</h3>
+        <ul class="checks never">
+          <li>Sends anything to the people who make tinyclient. There is nowhere to send it.</li>
+          <li>Runs an embedded copy of a network&rsquo;s web app. The one web page it shows is the sign-in page, in its own process.</li>
+          <li>Writes a credential to a log. Tokens, cookies and keys are redacted before anything is written.</li>
+          <li>Automates anything: no scheduled actions, no bulk reads, no friend requests or joins you did not make.</li>
+        </ul>
+      </div>
+    </div>
+    <div class="gaps">
+      <h3>Known limits, stated plainly</h3>
+      <ul>
+        <li>The message cache is not encrypted by tinyclient. Use your system&rsquo;s disk encryption.</li>
+        <li>The local socket is not authenticated: any program running as your user can connect to it, as it can read your files.</li>
+        <li>Signal safety numbers are not shown yet, and a contact&rsquo;s new identity key is trusted automatically.</li>
+      </ul>
+    </div>
+    <p class="more"><a href="docs/privacy.html">Privacy &amp; security in full →</a> &nbsp;·&nbsp; <a href="https://github.com/itz4blitz/tinyclient/security/advisories/new">Report a vulnerability privately</a></p>
+  </div>
+</section>
+
+<section class="section" id="status" aria-labelledby="status-title">
+  <div class="wrap">
+    <span class="eyebrow">Status</span>
+    <h2 id="status-title">What works today</h2>
+    <p class="lede">Every row is covered by tests that run through <code>chatd</code>&rsquo;s socket against local fakes of the network. The last column says what has met a real account.</p>
+    <div class="table-wrap" tabindex="0" role="region" aria-labelledby="status-title">
+      <table class="stack">
+        <caption>Not built yet: message search, notifications and a dock badge, video and screen share, voice messages, Signal attachments and safety numbers. Development happens on macOS; Linux and Windows builds are tested in CI and have had far less hands-on use.</caption>
+        <thead><tr><th scope="col">Network</th><th scope="col">Reading</th><th scope="col">Writing</th><th scope="col">Calls</th><th scope="col">Real account</th></tr></thead>
+        <tbody>
+          <tr><th scope="row"><span class="th-net"><img src="assets/networks/discord.svg" alt="" width="16" height="16">Discord</span></th><td data-label="Reading">Servers, channels, threads, DMs, friends and presence, images, files, link cards, reactions, replies</td><td data-label="Writing">Text, replies, files, reactions, edit, delete, friend requests, status</td><td data-label="Calls">Voice, end-to-end encrypted</td><td data-label="Real account"><span class="tag yes">Reading</span></td></tr>
+          <tr><th scope="row"><span class="th-net"><img src="assets/networks/slack.svg" alt="" width="16" height="16">Slack</span></th><td data-label="Reading">Every workspace of one sign-in: sections, channels, threads, DMs, files, reactions</td><td data-label="Writing">Text, replies, files, reactions, edit, delete, status</td><td data-label="Calls">Opens in Slack</td><td data-label="Real account"><span class="tag yes">Yes</span></td></tr>
+          <tr><th scope="row"><span class="th-net"><img src="assets/networks/telegram.svg" alt="" width="16" height="16">Telegram</span></th><td data-label="Reading">Chats, folders, topics, photos, pins</td><td data-label="Writing">Text, files, reactions, edit, delete</td><td data-label="Calls">Opens in Telegram</td><td data-label="Real account"><span class="tag">Not yet</span></td></tr>
+          <tr><th scope="row"><span class="th-net"><img src="assets/networks/microsoft-teams.svg" alt="" width="16" height="16">Teams</span></th><td data-label="Reading">Teams, channels, chats, reply chains as threads. Work and school accounts.</td><td data-label="Writing">Text, files, reactions, edit, delete</td><td data-label="Calls">Opens in Teams</td><td data-label="Real account"><span class="tag">Not yet</span></td></tr>
+          <tr><th scope="row"><span class="th-net"><img src="assets/networks/signal.svg" alt="" width="16" height="16">Signal</span></th><td data-label="Reading">Direct and group chats, replies, reactions, edits. Attachments named, not shown.</td><td data-label="Writing">Text, replies, reactions, edit and delete your own</td><td data-label="Calls">Not built</td><td data-label="Real account"><span class="tag">Not yet</span></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<section class="section contrib" id="contribute" aria-labelledby="contrib-title">
+  <div class="wrap">
+    <span class="eyebrow">Contribute</span>
+    <h2 id="contrib-title">Help make it real</h2>
+    <p class="lede">tinyclient is MIT-licensed and developed in the open. The most useful help right now is not always code.</p>
+    <div class="grid grid-3">
+      <div class="cell">
+        <h3>Use it on a real account</h3>
+        <p>Teams, Telegram and Signal have only met fakes so far, and Linux and Windows have had little use. A bug report with the redacted log is as valuable as a patch.</p>
+        <a class="cta" href="https://github.com/itz4blitz/tinyclient/issues">Open an issue →</a>
+      </div>
+      <div class="cell">
+        <h3>Build what is missing</h3>
+        <p>Notifications, an interactive terminal UI on the existing socket protocol, Signal attachments and safety numbers, a notarized macOS build, Linux packages.</p>
+        <a class="cta" href="https://github.com/itz4blitz/tinyclient/blob/main/CONTRIBUTING.md">Read CONTRIBUTING.md →</a>
+      </div>
+      <div class="cell">
+        <h3>Try it with no account</h3>
+        <p>A demo mode fills a scratch directory with invented servers and people and never touches your keychain.</p>
+        <a class="cta" href="docs/build.html#demo">Run the demo →</a>
+      </div>
+    </div>
+    <div class="code"><pre><code>git clone https://github.com/itz4blitz/tinyclient
+cd tinyclient
+cargo test --workspace
+TINYCLIENT_DIR=/tmp/tinyclient-demo cargo run -p chatd -- --seed-demo
+TINYCLIENT_DIR=/tmp/tinyclient-demo cargo run -p tinyclient --features gui</code></pre></div>
+  </div>
+</section>
+
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="foot">
+      <div>
+        <a class="brand" href="./"><img src="favicon.svg" alt="" width="28" height="28">tinyclient</a>
+        <p>Open source under the MIT license. A <code>chatd</code> built with Signal support, as the releases are, is a combined work under the AGPL-3.0.</p>
+      </div>
+      <nav aria-labelledby="f-docs">
+        <h2 id="f-docs">Docs</h2>
+        <ul>
+          <li><a href="docs/">Getting started</a></li>
+          <li><a href="docs/build.html">Build from source</a></li>
+          <li><a href="docs/architecture.html">Architecture</a></li>
+        </ul>
+      </nav>
+      <nav aria-labelledby="f-trust">
+        <h2 id="f-trust">Trust</h2>
+        <ul>
+          <li><a href="docs/privacy.html">Privacy &amp; security</a></li>
+          <li><a href="docs/networks.html">Networks &amp; terms</a></li>
+          <li><a href="https://github.com/itz4blitz/tinyclient/blob/main/SECURITY.md">Security policy</a></li>
+        </ul>
+      </nav>
+      <nav aria-labelledby="f-project">
+        <h2 id="f-project">Project</h2>
+        <ul>
+          <li><a href="https://github.com/itz4blitz/tinyclient">Source on GitHub</a></li>
+          <li><a href="https://github.com/itz4blitz/tinyclient/releases">Releases</a></li>
+          <li><a href="docs/contributing.html">Contributing</a></li>
+        </ul>
+      </nav>
+    </div>
+    <div class="fine">
+      <p>This website sets no cookies, runs no analytics and loads nothing from any other site. It is static HTML on GitHub Pages, and GitHub, as its host, can see your request the way any web server can.</p>
+      <p>tinyclient is not affiliated with Slack, Discord, Telegram, Microsoft or Signal. Their names and logos are trademarks of their owners; the network icons are from <a href="https://github.com/homarr-labs/dashboard-icons">Dashboard Icons</a> (Apache-2.0).</p>
+    </div>
+  </div>
+</footer>
+</body>
+</html>

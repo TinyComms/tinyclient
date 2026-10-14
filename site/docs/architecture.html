@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self'; style-src 'self'; script-src 'self'; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<title>Architecture · tinyclient docs</title>
+<meta name="description" content="How tinyclient's processes fit together: chatd, the window, mediad and the sign-in helper, the local protocol, storage and adapters.">
+<meta name="color-scheme" content="dark light">
+<meta name="theme-color" content="#121315" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<link rel="icon" href="../favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="../style.css">
+<script src="../site.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../" aria-label="tinyclient home"><img src="../favicon.svg" alt="" width="28" height="28">tinyclient</a>
+    <nav class="site-nav" aria-label="Site">
+      <a href="./" aria-current="page">Docs</a>
+      <a class="hide-sm" href="privacy.html">Privacy</a>
+      <a class="hide-sm" href="networks.html">Networks &amp; terms</a>
+      <a class="gh" href="https://github.com/itz4blitz/tinyclient"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap docs">
+  <nav class="docs-nav" aria-label="Documentation">
+    <div class="docs-nav-inner">
+      <h2>Documentation</h2>
+      <ul>
+          <li><a href="index.html">Getting started</a></li>
+          <li><a href="build.html">Build from source</a></li>
+          <li><a href="architecture.html" aria-current="page">Architecture</a></li>
+          <li><a href="privacy.html">Privacy &amp; security</a></li>
+          <li><a href="networks.html">Networks &amp; terms</a></li>
+          <li><a href="contributing.html">Contributing</a></li>
+      </ul>
+      <h2 class="ext">On GitHub</h2>
+      <ul class="ext">
+          <li><a href="https://github.com/itz4blitz/tinyclient/releases">Releases</a></li>
+          <li><a href="https://github.com/itz4blitz/tinyclient/blob/main/SECURITY.md">Security policy</a></li>
+          <li><a href="https://github.com/itz4blitz/tinyclient/tree/main/docs">Design documents</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <main id="main" class="prose">
+    <h1>Architecture</h1>
+    <p class="lede">Four programs with strict jobs, one local protocol between them, and no server of our own anywhere.</p>
+
+    <h2 id="processes">Processes, and what each may never do</h2>
+    <div class="table-wrap" tabindex="0" role="region" aria-label="Processes">
+      <table>
+        <thead><tr><th scope="col">Process</th><th scope="col">Does</th><th scope="col">Never</th></tr></thead>
+        <tbody>
+          <tr><th scope="row"><code>chatd</code></th><td>Always on, one per data directory (it holds <code>chatd.lock</code>). Answers its socket first, then reads the sessions. Holds the sessions, the network sockets, SQLite and the media cache. Call signalling.</td><td>Decode media, link a codec or audio code, hold a member list or history in memory, fetch a link from a message, send anything you did not ask for.</td></tr>
+          <tr><th scope="row"><code>mediad</code></th><td>Exists from &ldquo;connecting&rdquo; to the end of one call. Voice gateway, UDP, Opus, Discord&rsquo;s end-to-end encryption (DAVE), audio devices.</td><td>Run with no call, touch SQLite, the credential store or the chat socket. It speaks only to <code>chatd</code>, over stdin and stdout.</td></tr>
+          <tr><th scope="row"><code>tinyclient</code></th><td>The window. Draws what <code>chatd</code> reports and decodes images for the rows on screen. Starts <code>chatd</code> when nothing answers.</td><td>Talk to a network, read the database or the credential store, or block its main thread on a socket, file or decode.</td></tr>
+          <tr><th scope="row"><code>tinyclient-login</code></th><td>One sign-in window, then exits with the session on stdout.</td><td>Stay running.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2 id="protocol">The local protocol</h2>
+    <p>The window and <code>chatd</code> talk over a local socket: a Unix domain socket at <code>chat.sock</code> in the data directory, or the matching named pipe on Windows. Nothing listens on a network port.</p>
+    <ul>
+      <li><strong>Frames</strong>: a 4-byte big-endian length, then JSON, at most 1 MiB. Either side refuses a larger frame before writing or reading it.</li>
+      <li><strong>Requests</strong>: one request, one response. A frame <code>chatd</code> cannot parse is answered <code>Unsupported</code> (&ldquo;versions differ&rdquo;) rather than dropped.</li>
+      <li><strong>Changes</strong>: the window asks <code>Wait {since}</code>, which blocks up to 30 seconds and answers every change newer than <code>since</code>. The change list is bounded at 256 entries; a window that fell further behind is told to read again.</li>
+      <li><strong>Bounded</strong>: pages are capped at 200 rows, and so is everything a network could make large: 25 voice occupants, 10 card fields, a character cap on every string that is not a message&rsquo;s text.</li>
+      <li><strong>Compatible</strong>: every field added after the first version is optional and left off the wire when empty, so an older frame still reads.</li>
+    </ul>
+    <p><code>chatd</code> and <code>mediad</code> use the same framing over <code>mediad</code>&rsquo;s stdin and stdout. Closing stdin is the hang-up. <code>tinyclient-login</code> prints its session as one line of JSON on stdout and says how it ended with its exit status.</p>
+    <p>The full contract is the code in <a href="https://github.com/itz4blitz/tinyclient/tree/main/crates/protocol"><code>crates/protocol</code></a>, and the map of it is <a href="https://github.com/itz4blitz/tinyclient/blob/main/docs/architecture.md"><code>docs/architecture.md</code></a>.</p>
+
+    <h2 id="storage">Storage</h2>
+    <div class="table-wrap" tabindex="0" role="region" aria-label="Where data lives">
+      <table>
+        <thead><tr><th scope="col">Data</th><th scope="col">Where</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">Sessions</th><td>The system credential store, service <code>tinyclient</code>, one item per network. Never in the database.</td></tr>
+          <tr><th scope="row">Accounts, conversations, people, messages</th><td><code>chat.sqlite</code> in the data directory, with a 1 MB page cache.</td></tr>
+          <tr><th scope="row">Media bytes</th><td><code>media/&lt;network&gt;/&lt;account&gt;/</code>, 500 MB, least recently used evicted first.</td></tr>
+          <tr><th scope="row">Signal state</th><td><code>signal/&lt;account&gt;.state</code>: keys, sessions, contacts and groups, each value sealed with a key that only the credential store item holds.</td></tr>
+          <tr><th scope="row">Presence, typing, voice occupants, upload progress</th><td><code>chatd</code>&rsquo;s memory, bounded, gone at restart.</td></tr>
+          <tr><th scope="row">Logs</th><td><code>crash.log</code> (cut at 256 KB) and <code>chatd.log</code> (cut at 4 MB at start), credentials redacted.</td></tr>
+          <tr><th scope="row">Window state</th><td>The window&rsquo;s own preferences file: last conversation, pane widths, scroll positions.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p><strong>Retention</strong>: the newest 2,000 messages per conversation, and nothing older than 90 days unless you opened the conversation in that time. Pruned at start and daily.</p>
+
+    <h2 id="adapters">Adapters</h2>
+    <p>Each network is one adapter inside <code>chatd</code>, on its own thread, mapping the network&rsquo;s model onto one shared one: Spaces (a server, workspace or team), groups, conversations, threads and messages. No network markup reaches the window.</p>
+    <div class="table-wrap" tabindex="0" role="region" aria-label="Adapters">
+      <table>
+        <thead><tr><th scope="col">Network</th><th scope="col">Built on</th><th scope="col">TLS</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">Discord</th><td>Discord&rsquo;s HTTP API and gateway websocket, written in this repository</td><td>System</td></tr>
+          <tr><th scope="row">Slack</th><td>Slack&rsquo;s web API and websocket, written in this repository</td><td>System</td></tr>
+          <tr><th scope="row">Teams</th><td>The chat service and push channel of Microsoft&rsquo;s Teams client, written in this repository</td><td>System</td></tr>
+          <tr><th scope="row">Telegram</th><td><a href="https://codeberg.org/Lonami/grammers">grammers</a>, a pure-Rust MTProto client</td><td>MTProto&rsquo;s own encryption</td></tr>
+          <tr><th scope="row">Signal</th><td><a href="https://github.com/whisperfish/presage">presage</a>, on libsignal-service-rs and Signal&rsquo;s libsignal</td><td>rustls, pinned to Signal&rsquo;s certificate authority</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>&ldquo;System&rdquo; TLS is the operating system&rsquo;s: Security.framework on macOS, SChannel on Windows, OpenSSL on Linux. Telegram and Signal run on one single-threaded async runtime each, created only when such an account exists or a sign-in begins.</p>
+
+    <h2 id="idle">Idle means idle</h2>
+    <ul>
+      <li>Adapters block on their sockets and command queues with no polling timer. The whole of <code>chatd</code> has a budget of about one wakeup a second.</li>
+      <li>No polling request to any network: sockets push.</li>
+      <li>The window draws a frame only when state changed. A blinking caret, typing dots and animation stop when the window is not focused.</li>
+      <li>Only rows on screen are drawn; lists are virtualized and image decodes are capped.</li>
+    </ul>
+
+    <h2 id="calls">Calls</h2>
+    <p>A call on Discord starts <code>mediad</code>, which connects to Discord&rsquo;s voice servers itself, runs Discord&rsquo;s end-to-end encryption (DAVE, through <code>davey</code> on OpenMLS) and encodes with Opus (libopus 1.3.1 transpiled to Rust, so no C toolchain). Every way a call can fail ends the same way: the reason stays on screen until dismissed, <code>mediad</code> is gone, and the network is told we left. Calls on other networks open in that network&rsquo;s own app.</p>
+
+    <h2 id="sizes">Sizes</h2>
+    <div class="table-wrap" tabindex="0" role="region" aria-label="Binary sizes and memory">
+      <table>
+        <caption>macOS arm64 release builds, 2026-10-14; <code>chatd</code> includes Signal&rsquo;s libraries. Memory measured 2026-10-13. Every budget: <a href="https://github.com/itz4blitz/tinyclient/blob/main/docs/product/07-budgets-and-risk.md">07-budgets-and-risk.md</a>.</caption>
+        <thead><tr><th scope="col">Program</th><th scope="col">Binary</th><th scope="col">Memory</th><th scope="col">Runs</th></tr></thead>
+        <tbody>
+          <tr><th scope="row"><code>chatd</code></th><td class="num">28 MB</td><td>10 MB RSS signed in to Discord</td><td>Always</td></tr>
+          <tr><th scope="row"><code>tinyclient</code></th><td class="num">22 MB</td><td>64 MB RSS</td><td>While the window is open</td></tr>
+          <tr><th scope="row"><code>mediad</code></th><td class="num">5.5 MB</td><td>Under 40 MB RSS in a call (test-asserted)</td><td>During a call</td></tr>
+          <tr><th scope="row"><code>tinyclient-login</code></th><td class="num">1.8 MB</td><td></td><td>During a sign-in</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <nav class="pager" aria-label="Previous and next"><a href="build.html"><span>Previous</span>Build from source</a><a class="next" href="privacy.html"><span>Next</span>Privacy &amp; security</a></nav>
+    <p class="edit">This page is <a href="https://github.com/itz4blitz/tinyclient/blob/main/site/docs/architecture.html"><code>site/docs/architecture.html</code></a>. Sources for its claims: <a href="https://github.com/itz4blitz/tinyclient/blob/main/docs/architecture.md">docs/architecture.md</a>, <a href="https://github.com/itz4blitz/tinyclient/blob/main/crates/protocol/src/ipc.rs">protocol/src/ipc.rs</a>, <a href="https://github.com/itz4blitz/tinyclient/blob/main/crates/mediad/Cargo.toml">crates/mediad/Cargo.toml</a>.</p>
+  </main>
+</div>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="fine">
+      <p>tinyclient is open source under the MIT license; a <code>chatd</code> built with Signal support is a combined work under the AGPL-3.0. Not affiliated with Slack, Discord, Telegram, Microsoft or Signal; network icons from <a href="https://github.com/homarr-labs/dashboard-icons">Dashboard Icons</a> (Apache-2.0).</p>
+      <p>This website sets no cookies, runs no analytics and loads nothing from any other site. GitHub Pages hosts it and can see your request the way any web server can.</p>
+    </div>
+  </div>
+</footer>
+</body>
+</html>

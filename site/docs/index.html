@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self'; style-src 'self'; script-src 'self'; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<title>Getting started · tinyclient docs</title>
+<meta name="description" content="Install tinyclient on macOS, Linux or Windows, sign in to a network, and find where your data is kept.">
+<meta name="color-scheme" content="dark light">
+<meta name="theme-color" content="#121315" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<link rel="icon" href="../favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="../style.css">
+<script src="../site.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../" aria-label="tinyclient home"><img src="../favicon.svg" alt="" width="28" height="28">tinyclient</a>
+    <nav class="site-nav" aria-label="Site">
+      <a href="./" aria-current="page">Docs</a>
+      <a class="hide-sm" href="privacy.html">Privacy</a>
+      <a class="hide-sm" href="networks.html">Networks &amp; terms</a>
+      <a class="gh" href="https://github.com/itz4blitz/tinyclient"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap docs">
+  <nav class="docs-nav" aria-label="Documentation">
+    <div class="docs-nav-inner">
+      <h2>Documentation</h2>
+      <ul>
+          <li><a href="index.html" aria-current="page">Getting started</a></li>
+          <li><a href="build.html">Build from source</a></li>
+          <li><a href="architecture.html">Architecture</a></li>
+          <li><a href="privacy.html">Privacy &amp; security</a></li>
+          <li><a href="networks.html">Networks &amp; terms</a></li>
+          <li><a href="contributing.html">Contributing</a></li>
+      </ul>
+      <h2 class="ext">On GitHub</h2>
+      <ul class="ext">
+          <li><a href="https://github.com/itz4blitz/tinyclient/releases">Releases</a></li>
+          <li><a href="https://github.com/itz4blitz/tinyclient/blob/main/SECURITY.md">Security policy</a></li>
+          <li><a href="https://github.com/itz4blitz/tinyclient/tree/main/docs">Design documents</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <main id="main" class="prose">
+    <h1>Getting started</h1>
+    <p class="lede">Install a release, sign in to a network, and know where your data goes.</p>
+
+    <div class="callout warn">
+      <p><strong>Read this before you sign in.</strong> tinyclient is an unofficial client and it is early. Discord&rsquo;s terms prohibit third-party clients, Slack and Teams do not offer their services to them, and Teams, Telegram and Signal have not yet been used on a real account. <a href="networks.html">Networks &amp; terms</a> has the details for each.</p>
+    </div>
+
+    <h2 id="download">Download</h2>
+    <p>Every release is built by GitHub Actions from a <code>v*</code> tag (<a href="https://github.com/itz4blitz/tinyclient/blob/main/.github/workflows/release.yml"><code>release.yml</code></a>) and published on the <a href="https://github.com/itz4blitz/tinyclient/releases/latest">latest release</a> page.</p>
+    <div class="table-wrap" tabindex="0" role="region" aria-label="Release archives">
+      <table>
+        <thead><tr><th scope="col">System</th><th scope="col">Archive</th><th scope="col">Contents</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">macOS 13 or later, Apple silicon</th><td><code>…-macos.zip</code></td><td><code>tinyclient.app</code>, with all four programs inside</td></tr>
+          <tr><th scope="row">Linux x86_64</th><td><code>…-linux-x86_64.tar.gz</code></td><td><code>tinyclient</code>, <code>chatd</code>, <code>mediad</code>, <code>tinyclient-login</code></td></tr>
+          <tr><th scope="row">Windows x86_64</th><td><code>…-windows-x86_64.zip</code></td><td>The same four programs as <code>.exe</code> files</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>Keep the four programs together in one directory: each finds the others beside itself. You start only <code>tinyclient</code>; it starts <code>chatd</code> when nothing answers on its socket, and <code>chatd</code> starts the other two when they are needed.</p>
+
+    <h2 id="macos">macOS</h2>
+    <ol>
+      <li>Unzip the archive and move <code>tinyclient.app</code> to Applications.</li>
+      <li>Open it. The app is signed ad hoc, not notarized by Apple, so macOS refuses it the first time.</li>
+      <li>Open <strong>System Settings &rsaquo; Privacy &amp; Security</strong>, find the message about tinyclient and choose <strong>Open Anyway</strong>, if you trust the build.</li>
+    </ol>
+    <p>Open the app rather than the programs inside it. macOS grants the microphone to an app bundle, so a call needs the bundle.</p>
+    <p>On first start, <code>chatd</code> reads your sign-ins from the login keychain. If macOS asks, allow it; until then the window says it is waiting for permission and shows what is cached.</p>
+
+    <h2 id="linux">Linux</h2>
+<div class="code"><pre><code>tar -xzf tinyclient-*-linux-x86_64.tar.gz
+./tinyclient</code></pre></div>
+    <ul>
+      <li>Sign-ins are kept in the Secret Service (GNOME Keyring or KWallet), which has to be running. Without it, <code>chatd</code> refuses to sign anyone in rather than keep a session it would lose.</li>
+      <li>The sign-in window needs WebKitGTK 4.1. The window itself needs Vulkan, and Wayland or X11.</li>
+      <li>Linux builds are tested in CI and have had far less hands-on use than macOS. Reports are welcome.</li>
+    </ul>
+
+    <h2 id="windows">Windows</h2>
+    <ul>
+      <li>Extract the zip into one folder and run <code>tinyclient.exe</code>.</li>
+      <li>The programs are not code-signed, so SmartScreen may warn you before the first run.</li>
+      <li>The sign-in window needs WebView2, which current Windows includes. Sign-ins are kept in Windows Credential Manager.</li>
+    </ul>
+
+    <h2 id="sign-in">Sign in</h2>
+    <p>Press <strong>Sign in</strong> beside a network. Each network has its own way in:</p>
+    <div class="table-wrap" tabindex="0" role="region" aria-label="Sign-in per network">
+      <table>
+        <thead><tr><th scope="col">Network</th><th scope="col">How</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">Discord</th><td>Discord&rsquo;s own sign-in page opens in a separate window, which closes when you are in. Passwords, two-factor codes and captchas are Discord&rsquo;s page, not tinyclient&rsquo;s.</td></tr>
+          <tr><th scope="row">Slack</th><td>Slack&rsquo;s sign-in page, the same way. Every workspace that sign-in holds is added.</td></tr>
+          <tr><th scope="row">Teams</th><td>Microsoft&rsquo;s sign-in page. Work and school accounts only; your organization can refuse the sign-in.</td></tr>
+          <tr><th scope="row">Telegram</th><td>Scan the code tinyclient shows with Telegram on your phone, or enter your phone number and the code Telegram sends. Then your cloud password, if you set one.</td></tr>
+          <tr><th scope="row">Signal</th><td>On your phone, open Signal &rsaquo; Settings &rsaquo; Linked devices &rsaquo; Link new device, and scan the code. A linked device receives only what arrives after it was linked.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>The finished session goes to your system&rsquo;s credential store, under the service <code>tinyclient</code>, one item per network. <a href="privacy.html">Privacy &amp; security</a> lists everything that is stored.</p>
+
+    <h2 id="data">Where your data lives</h2>
+    <div class="table-wrap" tabindex="0" role="region" aria-label="Data directory per system">
+      <table>
+        <thead><tr><th scope="col">System</th><th scope="col">Data directory</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">macOS</th><td><code>~/Library/Application Support/tinyclient</code></td></tr>
+          <tr><th scope="row">Linux</th><td><code>$XDG_DATA_HOME/tinyclient</code>, by default <code>~/.local/share/tinyclient</code></td></tr>
+          <tr><th scope="row">Windows</th><td><code>%APPDATA%\tinyclient</code></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>Setting <code>TINYCLIENT_DIR</code> moves everything to that directory instead, and turns sign-in off so the credential store is never touched. That is how the <a href="build.html#demo">demo</a> and the tests run.</p>
+
+    <h2 id="sign-out">Sign out and remove</h2>
+    <p>Signing out of an account ends its session on the network where the network allows it, then deletes its credential item, its cached messages and its media. Signing out of Signal removes the linked device from your account.</p>
+    <p>To remove tinyclient completely: sign out of each account, quit, delete the app or the four programs, and delete the data directory above. The sign-in window keeps its own browser data so an interrupted sign-in can resume; on Linux and Windows it is in <code>tinyclient/login/</code> under the same parent directory, and on macOS it is a WebKit data store of its own.</p>
+
+    <h2 id="text">Without a window</h2>
+    <p><code>tinyclient --text</code>, or any build without the <code>gui</code> feature, prints account status and the inbox as lines of text and exits. An interactive terminal interface is not built yet.</p>
+
+    <nav class="pager" aria-label="Previous and next"><a class="next" href="build.html"><span>Next</span>Build from source</a></nav>
+    <p class="edit">This page is <a href="https://github.com/itz4blitz/tinyclient/blob/main/site/docs/index.html"><code>site/docs/index.html</code></a>. Sources for its claims: <a href="https://github.com/itz4blitz/tinyclient/blob/main/.github/workflows/release.yml">release.yml</a>, <a href="https://github.com/itz4blitz/tinyclient/blob/main/crates/protocol/src/lib.rs">protocol/src/lib.rs</a> (<code>support_dir</code>), <a href="https://github.com/itz4blitz/tinyclient/blob/main/crates/chatd/src/session.rs">chatd/src/session.rs</a>.</p>
+  </main>
+</div>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="fine">
+      <p>tinyclient is open source under the MIT license; a <code>chatd</code> built with Signal support is a combined work under the AGPL-3.0. Not affiliated with Slack, Discord, Telegram, Microsoft or Signal; network icons from <a href="https://github.com/homarr-labs/dashboard-icons">Dashboard Icons</a> (Apache-2.0).</p>
+      <p>This website sets no cookies, runs no analytics and loads nothing from any other site. GitHub Pages hosts it and can see your request the way any web server can.</p>
+    </div>
+  </div>
+</footer>
+</body>
+</html>
