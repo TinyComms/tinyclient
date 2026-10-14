@@ -21,20 +21,45 @@ use std::time::{Duration, Instant};
 
 const MB: u64 = 1024 * 1024;
 
+/// The process's resident memory in KB, or 0 once it has exited. Asked of the system directly:
+/// the upload is sampled every 20 ms, more often than `ps` or a PowerShell can be started.
 fn process_rss_kb(pid: u32) -> u64 {
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: plain data, zero is a valid value for every field.
+        let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
+        // SAFETY: `info` is as large as the call is told it is.
+        let got = unsafe { libc::proc_pidinfo(pid as libc::c_int, libc::PROC_PIDTASKINFO, 0, (&raw mut info).cast(), size) };
+        if got == size { info.pti_resident_size / 1024 } else { 0 }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // An exited process waiting to be reaped has no VmRSS line.
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
+        let rss = status.lines().find_map(|line| line.strip_prefix("VmRSS:"));
+        rss.and_then(|kb| kb.trim().trim_end_matches("kB").trim().parse().ok()).unwrap_or(0)
+    }
     #[cfg(windows)]
     {
-        let out = Command::new("powershell")
-            .args(["-NoProfile", "-Command", &format!("(Get-Process -Id {pid}).WorkingSet64")])
-            .output()
-            .expect("working set");
-        let bytes: u64 = String::from_utf8(out.stdout).unwrap().trim().parse().unwrap();
-        return bytes / 1024;
-    }
-    #[cfg(not(windows))]
-    {
-        let out = Command::new("ps").args(["-o", "rss=", "-p", &pid.to_string()]).output().unwrap();
-        String::from_utf8(out.stdout).unwrap().trim().parse().unwrap_or(0)
+        use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+        use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+        use windows_sys::Win32::System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+        // SAFETY: the handle is checked before use and closed after; the counters are sized for
+        // the call.
+        unsafe {
+            let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if process.is_null() {
+                return 0;
+            }
+            let mut code = 0u32;
+            let mut counters: PROCESS_MEMORY_COUNTERS = std::mem::zeroed();
+            counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+            let alive = GetExitCodeProcess(process, &mut code) != 0 && code == STILL_ACTIVE as u32;
+            let read = alive && GetProcessMemoryInfo(process, &mut counters, counters.cb) != 0;
+            CloseHandle(process);
+            if read { counters.WorkingSetSize as u64 / 1024 } else { 0 }
+        }
     }
 }
 
