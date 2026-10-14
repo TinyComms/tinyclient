@@ -7,6 +7,7 @@
 // CONTRACT: the protocol has no home for what only the window knows, so it is a file of its own.
 
 use super::super::layout;
+use super::super::settings::Section;
 use super::super::sidebar::Mode;
 use protocol::settings::Values;
 use protocol::{Key, Network};
@@ -32,13 +33,14 @@ pub struct Choices {
     pub emoticons: bool,
     /// P3: pictures and link previews load by themselves.
     pub images: bool,
-    /// The Settings section last shown, by its index.
-    pub section: u8,
+    /// The Settings section last shown. Written by its name, which stays when sections are
+    /// added or moved; a name this build does not know opens Accounts.
+    pub section: Section,
 }
 
 impl Default for Choices {
     fn default() -> Choices {
-        Choices { compact: false, previews: true, command_return: false, newest: false, typing: true, emoticons: false, images: true, section: 0 }
+        Choices { compact: false, previews: true, command_return: false, newest: false, typing: true, emoticons: false, images: true, section: Section::Accounts }
     }
 }
 
@@ -51,7 +53,7 @@ static CHOICES: Mutex<Choices> = Mutex::new(Choices {
     typing: true,
     emoticons: false,
     images: true,
-    section: 0,
+    section: Section::Accounts,
 });
 static VALUES: Mutex<Option<Values>> = Mutex::new(None);
 
@@ -195,7 +197,7 @@ pub fn parse(text: &str) -> Prefs {
             "typing" => prefs.choices.typing = fields.next() != Some("off"),
             "emoticons" => prefs.choices.emoticons = fields.next() == Some("on"),
             "images" => prefs.choices.images = fields.next() != Some("click"),
-            "settings_section" => prefs.choices.section = fields.next().and_then(|n| n.parse().ok()).unwrap_or(0),
+            "settings_section" => prefs.choices.section = fields.next().and_then(Section::from_word).unwrap_or(Section::Accounts),
             _ if !line.trim().is_empty() => prefs.kept.push(line.to_owned()),
             _ => {}
         }
@@ -240,7 +242,7 @@ pub fn write(prefs: &Prefs) -> String {
             continue;
         }
         match name {
-            "settings_section" => text.push_str(&format!("{name}\t{}\n", choices.section)),
+            "settings_section" => text.push_str(&format!("{name}\t{}\n", choices.section.word())),
             _ => text.push_str(&format!("{name}\t{value}\n")),
         }
     }
@@ -286,7 +288,7 @@ mod tests {
             details_channels: true,
             details_directs: false,
             text_step: 2,
-            choices: Choices { compact: true, previews: false, command_return: true, newest: true, typing: false, emoticons: true, images: false, section: 6 },
+            choices: Choices { compact: true, previews: false, command_return: true, newest: true, typing: false, emoticons: true, images: false, section: Section::Audio },
             kept: Vec::new(),
         };
         let read = parse(&write(&saved));
@@ -323,6 +325,12 @@ mod tests {
         assert!(again.contains("theme\tlight\n") && again.contains("bounce\tonce\n"), "{again}");
         // Junk reads as the default.
         assert_eq!(parse("density\tcosy\nsend\t?\nsettings_section\tx\n").choices, Choices::default());
+        // A section is kept by its name: an index from an older build, or a section a newer
+        // build added, opens Accounts rather than whatever sits at that place now.
+        assert!(write(&Prefs { choices: Choices { section: Section::Privacy, ..Choices::default() }, ..Prefs::default() }).contains("settings_section\tprivacy\n"));
+        assert_eq!(parse("settings_section\tstorage\n").choices.section, Section::Storage);
+        assert_eq!(parse("settings_section\t6\n").choices.section, Section::Accounts);
+        assert_eq!(parse("settings_section\tnotifications\n").choices.section, Section::Accounts);
     }
 
     #[test]

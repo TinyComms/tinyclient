@@ -38,7 +38,7 @@ pub const ROWS: &[Row] = &[
     row("S7", Sounds, "In calls", "Someone joins or leaves", &[], &["sound", "chime", "ding", "join", "leave", "cue"]),
     row("S8", Sounds, "In calls", "I mute, unmute or deafen", &[], &["sound", "ding", "tick", "cue", "deafen"]),
     row("S9", Sounds, "In calls", "Connection lost or back", &[], &["sound", "ding", "cue", "disconnect", "reconnect"]),
-    row("S10", Sounds, "In calls", "Volume of call sounds", &[], &["volume", "loud", "quiet", "sound", "test sound", "play"]),
+    row("S10", Sounds, "In calls", "Call sound volume", &[], &["volume", "loud", "quiet", "sound", "test sound", "play"]),
     row("A2", Appearance, "", "Text size", &["13 pt", "14 pt", "15 pt", "16 pt", "17 pt"], &["font", "bigger", "smaller", "zoom", "large"]),
     row("A3", Appearance, "", "Density", &["Comfortable", "Compact"], &["rows", "dense", "spacing", "compact"]),
     row("A4", Appearance, "", "Show message previews in the list", &[], &["preview", "screen sharing", "privacy", "list"]),
@@ -69,7 +69,13 @@ pub const ROWS: &[Row] = &[
 pub const NOT_YET: &[(&str, &str)] = &[
     ("proxy", "tinyclient has no proxy setting yet."),
     ("socks", "tinyclient has no proxy setting yet."),
+    ("message sound", "tinyclient plays no sound for messages yet. It comes with notifications."),
+    ("sound for messages", "tinyclient plays no sound for messages yet. It comes with notifications."),
     ("notification", "tinyclient does not post notifications yet."),
+    ("notify", "tinyclient does not post notifications yet."),
+    ("alert", "tinyclient does not post notifications yet."),
+    ("dnd", "tinyclient does not post notifications yet. Do Not Disturb you set in Slack or Discord is shown on your status."),
+    ("focus", "tinyclient does not post notifications yet, so a Focus has nothing to hold back."),
     ("banner", "tinyclient does not post notifications yet."),
     ("do not disturb", "tinyclient does not post notifications yet. Do Not Disturb you set in Slack or Discord is shown on your status."),
     ("quiet hours", "tinyclient does not post notifications yet."),
@@ -77,6 +83,8 @@ pub const NOT_YET: &[(&str, &str)] = &[
     ("ringtone", "tinyclient has no ring sound yet; calls ring in the window."),
     ("login", "tinyclient has no open-at-login setting yet."),
     ("startup", "tinyclient has no open-at-login setting yet."),
+    ("launch", "tinyclient has no open-at-login setting yet."),
+    ("autostart", "tinyclient has no open-at-login setting yet."),
     ("theme", "tinyclient is dark only for now."),
     ("light", "tinyclient is dark only for now."),
     ("dark mode", "tinyclient is dark only for now."),
@@ -144,6 +152,27 @@ pub fn search(query: &str) -> Vec<&'static Row> {
 pub fn not_yet(query: &str) -> Option<&'static str> {
     let query = fold(query.trim());
     NOT_YET.iter().find(|(term, _)| query.contains(term) || (query.len() >= 3 && term.starts_with(&query))).map(|(_, words)| *words)
+}
+
+/// A search result's breadcrumb: its section, and its group when it has one. P1 and P2 are a
+/// card of accounts under their group, so the group is what names the setting there.
+pub fn crumb(row: &Row) -> String {
+    if row.group.is_empty() {
+        row.section.name().to_owned()
+    } else {
+        format!("{} › {}", row.section.name(), row.group)
+    }
+}
+
+/// Whether a row draws its own label. P1 and P2 draw one line per account instead.
+pub fn draws_label(id: &str) -> bool {
+    !matches!(id, "P1" | "P2")
+}
+
+/// The rows whose value chatd keeps or whose action chatd carries out: drawn disabled, and
+/// taking no change, while chatd cannot be reached.
+pub fn kept_by_chatd(id: &str) -> bool {
+    matches!(id, "G2" | "S1" | "S7" | "S8" | "S9" | "S10" | "P1" | "P2" | "P4" | "V1" | "V2" | "V3" | "V4" | "V5" | "V6" | "D1" | "D2" | "D3")
 }
 
 pub fn find(id: &str) -> Option<&'static Row> {
@@ -233,10 +262,26 @@ mod tests {
     }
 
     #[test]
+    fn every_result_says_which_setting_it_is() {
+        // A result is its breadcrumb over its live row: one of the two names the setting, so a
+        // card of account switches is never shown without saying what the switches do.
+        for row in ROWS {
+            assert!(crumb(row).contains(row.label) || draws_label(row.id), "{} has no name in its result", row.id);
+        }
+        assert_eq!(crumb(find("P1").unwrap()), "Privacy › Let others see when I am typing");
+        assert_eq!(crumb(find("G2").unwrap()), "General");
+    }
+
+    #[test]
     fn a_search_for_what_is_not_built_says_so() {
         assert!(search("proxy").is_empty());
         assert_eq!(not_yet("proxy"), Some("tinyclient has no proxy setting yet."));
         assert!(not_yet("Notifications").is_some());
+        // The words people reach for, not only the names in the product doc.
+        for words in ["notify", "alert", "dnd", "focus", "launch", "start at login", "autostart", "sound for messages", "message sound"] {
+            assert!(search(words).is_empty(), "{words} finds a row");
+            assert!(not_yet(words).is_some(), "{words} gets no line");
+        }
         assert_eq!(not_yet("zzz"), None);
     }
 

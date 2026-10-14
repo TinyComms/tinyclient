@@ -44,15 +44,15 @@ pub fn caption(words: impl Into<SharedString>) -> Div {
 }
 
 /// A row: its label (and the line saying what the value does) on the left, the control on the
-/// right. 40 high with one line, 52 with two, 6 more for each text step past +0... as the rows
-/// of the main window grow.
+/// right. 40 high with one line, 52 with two, 2 more for each text step past +0, as the rows
+/// of the main window grow. 6 above and below at least, so a label that wraps has room.
 pub fn row(label: impl Into<SharedString>, second: Option<SharedString>, control: impl IntoElement) -> Div {
     let step = theme::text_step().max(0) as f32 * 2.;
     let two = second.is_some();
     div()
         .min_h(px(if two { 52. } else { 40. } + step))
         .px(px(12.))
-        .py(px(if two { 8. } else { 0. }))
+        .py(px(if two { 8. } else { 6. }))
         .flex()
         .items_center()
         .gap(px(16.))
@@ -217,9 +217,14 @@ pub fn meter(level: Option<u8>, gate: u32) -> Div {
         .child(div().absolute().top_0().left(px(line - 1.)).w(px(2.)).h(px(14.)).bg(theme::text()))
 }
 
-/// The value beside a slider: right-aligned in a 48 box.
+/// The value beside a slider: right-aligned in a box as wide as the meter row's Test button and
+/// its gap, so every value ends on the column's edge and V6's track sits under the meter.
+pub const VALUE_BOX: f32 = 56.;
+/// Between a track's end and its value: the thumb overhangs the track by 8, and 8 stay clear.
+pub const VALUE_GAP: f32 = 16.;
+
 pub fn slider_value(words: impl Into<SharedString>) -> Div {
-    div().w(px(48.)).flex().justify_end().type_ui().text_color(theme::text_soft()).child(words.into())
+    div().w(px(VALUE_BOX)).flex().justify_end().type_ui().text_color(theme::text_soft()).child(words.into())
 }
 
 #[cfg(test)]

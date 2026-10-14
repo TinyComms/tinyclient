@@ -96,20 +96,37 @@ impl Section {
         }
     }
 
-    fn index(self) -> u8 {
-        Section::ALL.iter().position(|s| *s == self).unwrap_or(0) as u8
+    /// The name `shell.prefs` keeps it by. Never changed once shipped.
+    pub const fn word(self) -> &'static str {
+        match self {
+            Section::Accounts => "accounts",
+            Section::General => "general",
+            Section::Sounds => "sounds",
+            Section::Appearance => "appearance",
+            Section::Messages => "messages",
+            Section::Privacy => "privacy",
+            Section::Audio => "audio",
+            Section::Storage => "storage",
+            Section::Shortcuts => "shortcuts",
+            Section::About => "about",
+        }
+    }
+
+    pub fn from_word(word: &str) -> Option<Section> {
+        Section::ALL.into_iter().find(|s| s.word() == word)
     }
 
     /// The section ⌘, opens: the one last shown, Accounts the first time.
     pub fn last() -> Section {
-        Section::ALL.get(usize::from(prefs::choices().section)).copied().unwrap_or(Section::Accounts)
+        prefs::choices().section
     }
 }
 
 /// What a modal is asking.
 #[derive(Clone)]
 pub(super) enum Confirm {
-    SignOut(AccountStatus),
+    /// Boxed: an account's status is ten times the size of the other questions.
+    SignOut(Box<AccountStatus>),
     /// A shorter retention, with what it would delete when chatd said.
     Retention { days: u32, prunable: Option<(u64, u64)> },
     Clear,
@@ -215,6 +232,14 @@ pub struct SettingsWindow {
     pub(super) section: Section,
     pub(super) confirm: Option<Confirm>,
     pub(super) picker: Option<Picker>,
+    /// The device pickers' buttons, by `Picker`, so closing a menu gives the key back to its
+    /// button; and the open menu, which takes ↑ ↓ Return Space and letters.
+    pub(super) picker_focus: [FocusHandle; 2],
+    pub(super) menu_focus: FocusHandle,
+    /// The menu item the keys are on.
+    pub(super) menu_cursor: usize,
+    /// The section list: one Tab stop, ↑ and ↓ move through the sections.
+    list_focus: FocusHandle,
     /// Where controls were drawn, for the sliders and the menus below their buttons.
     pub(super) anchors: Rc<RefCell<HashMap<&'static str, Bounds<Pixels>>>>,
     search: Entity<TextInput>,
@@ -232,8 +257,10 @@ pub struct SettingsWindow {
     pub(super) devices: Option<Devices>,
     /// Bytes on this Mac: messages, files.
     pub(super) storage: Option<(u64, u64)>,
-    /// The row whose value could not be stored.
+    /// The row whose value could not be stored, or whose action did not happen.
     pub(super) failed: Option<&'static str>,
+    /// When the test sound was asked for, while it plays.
+    pub(super) playing: Option<Instant>,
     /// "Copied", for 4 s after Copy diagnostics.
     pub(super) copied: Option<Instant>,
     /// A row opened from search, lit for 1.5 s.
@@ -267,6 +294,10 @@ impl SettingsWindow {
             section,
             confirm: None,
             picker: None,
+            picker_focus: [cx.focus_handle().tab_index(0).tab_stop(true), cx.focus_handle().tab_index(0).tab_stop(true)],
+            menu_focus: cx.focus_handle(),
+            menu_cursor: 0,
+            list_focus: cx.focus_handle().tab_index(0).tab_stop(true),
             anchors: Rc::default(),
             search,
             query: String::new(),
@@ -280,6 +311,7 @@ impl SettingsWindow {
             devices: None,
             storage: None,
             failed: None,
+            playing: None,
             copied: None,
             highlight: None,
             _subscriptions: subscriptions,
@@ -302,8 +334,8 @@ impl SettingsWindow {
         window.set_window_title(section.name());
         self.entered(section, cx);
         let mut choices = prefs::choices();
-        if choices.section != section.index() {
-            choices.section = section.index();
+        if choices.section != section {
+            choices.section = section;
             prefs::set_choices(choices);
             let _ = self.shell.update(cx, |shell, cx| shell.save_prefs(cx));
         }
@@ -337,22 +369,46 @@ impl SettingsWindow {
         .detach();
     }
 
-    /// Stores one of chatd's settings. The window shows the new value at once; if chatd refuses
-    /// it, the stored one comes back and the row says so.
+    /// Stores one of chatd's settings: the one gate every row chatd keeps goes through. While
+    /// chatd cannot be reached nothing changes, as the rows are drawn disabled. Otherwise the
+    /// window shows the new value at once; if it is not saved, the value from before comes back
+    /// whether or not chatd answers again, and the row says so.
     pub(super) fn set(&mut self, row: &'static str, scope: String, key: &'static str, value: Option<String>, cx: &mut Context<Self>) {
+        if !self.reachable(cx) {
+            return;
+        }
         let mut values = prefs::values();
+        let before = values.stored(&scope, key).map(str::to_owned);
         values.set(&scope, key, value.clone());
         prefs::set_values(values);
         self.failed = None;
-        cx.notify();
-        let request = Request::Set { scope, key: key.to_owned(), value };
+        self.shown_everywhere(cx);
+        let request = Request::Set { scope: scope.clone(), key: key.to_owned(), value: value.clone() };
         self.off_thread(cx, move || crate::client::ask(&request), move |this, answer, cx| {
             if !matches!(answer, Ok(Response::Ok)) {
+                // Only this row goes back, and only if nothing changed it since.
+                let mut values = prefs::values();
+                if values.stored(&scope, key) == value.as_deref() {
+                    values.set(&scope, key, before);
+                    prefs::set_values(values);
+                }
                 this.failed = Some(row);
+                this.shown_everywhere(cx);
                 let _ = this.shell.update(cx, |shell, cx| shell.load_settings(cx));
             }
             cx.notify();
         });
+    }
+
+    /// chatd's settings changed here: the main window and the call's menu read them too.
+    fn shown_everywhere(&mut self, cx: &mut Context<Self>) {
+        let _ = self.shell.update(cx, |_, cx| cx.notify());
+        cx.notify();
+    }
+
+    /// Whether row `id` is one chatd keeps, and so waits on chatd.
+    pub(super) fn waits_on_chatd(&self, id: &str, cx: &App) -> bool {
+        rows::kept_by_chatd(id) && !self.reachable(cx)
     }
 
     /// Changes one of the window's own settings and saves it. Every window draws it at once.
@@ -378,6 +434,9 @@ impl SettingsWindow {
 
     /// A slider's value moved by the pointer.
     pub(super) fn slide_to(&mut self, id: &'static str, x: Pixels, cx: &mut Context<Self>) {
+        if self.waits_on_chatd(id, cx) {
+            return;
+        }
         let Some(bounds) = self.anchors.borrow().get(id).copied() else {
             return;
         };
@@ -403,6 +462,9 @@ impl SettingsWindow {
 
     /// Arrow keys on a focused slider: one step, ten with ⌥, Home and End to the ends.
     pub(super) fn slider_key(&mut self, id: &'static str, key: &str, alt: bool, cx: &mut Context<Self>) -> bool {
+        if self.waits_on_chatd(id, cx) {
+            return false;
+        }
         let spec = pages::slider(id);
         let now = self.pending.get(id).copied().unwrap_or_else(|| (spec.read)());
         let by = if alt { 10 } else { 1 };
@@ -476,9 +538,96 @@ impl SettingsWindow {
         });
     }
 
+    /// Opens a device menu with the keys on the item that is checked.
+    pub(super) fn open_picker(&mut self, picker: Picker, window: &mut Window, cx: &mut Context<Self>) {
+        let key = match picker {
+            Picker::Input => protocol::settings::INPUT,
+            Picker::Output => protocol::settings::OUTPUT,
+        };
+        let stored = prefs::values().device(key);
+        self.menu_cursor = self.picker_choices(picker).iter().position(|(value, _)| *value == stored).unwrap_or(0);
+        self.picker = Some(picker);
+        window.focus(&self.menu_focus, cx);
+        // The list is read again as the menu opens: a device may have come or gone.
+        self.list_devices(cx);
+        cx.notify();
+    }
+
+    /// Closes the device menu and gives the keys back to its button.
+    pub(super) fn close_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(picker) = self.picker.take() {
+            if self.menu_focus.is_focused(window) {
+                window.focus(&self.picker_focus[picker as usize], cx);
+            }
+        }
+        cx.notify();
+    }
+
+    pub(super) fn pick_device(&mut self, picker: Picker, name: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_picker(window, cx);
+        let (row, key) = match picker {
+            Picker::Input => ("V1", protocol::settings::INPUT),
+            Picker::Output => ("V2", protocol::settings::OUTPUT),
+        };
+        self.set(row, protocol::settings::GLOBAL.into(), key, name, cx);
+    }
+
+    /// A key in an open device menu: ↑ and ↓ move, Return and Space pick, a letter goes to
+    /// the next item that starts with it. Esc and Tab are the window's (`dismiss`).
+    pub(super) fn menu_key(&mut self, picker: Picker, keystroke: &gpui::Keystroke, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let choices = self.picker_choices(picker);
+        let last = choices.len().saturating_sub(1);
+        let modified = keystroke.modifiers.platform || keystroke.modifiers.control || keystroke.modifiers.alt;
+        match keystroke.key.as_str() {
+            "up" => self.menu_cursor = self.menu_cursor.saturating_sub(1),
+            "down" => self.menu_cursor = (self.menu_cursor + 1).min(last),
+            "home" => self.menu_cursor = 0,
+            "end" => self.menu_cursor = last,
+            "enter" | "space" => {
+                if let Some((value, _)) = choices.into_iter().nth(self.menu_cursor) {
+                    self.pick_device(picker, value, window, cx);
+                }
+                return true;
+            }
+            key if !modified && key.chars().count() == 1 => {
+                let letter = key.to_lowercase();
+                let next = (1..=choices.len()).map(|step| (self.menu_cursor + step) % choices.len()).find(|ix| choices[*ix].1.to_lowercase().starts_with(&letter));
+                match next {
+                    Some(ix) => self.menu_cursor = ix,
+                    None => return false,
+                }
+            }
+            _ => return false,
+        }
+        cx.notify();
+        true
+    }
+
+    /// ↑ and ↓ on the section list: the section above or below, About last.
+    fn list_key(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let at = Section::ALL.iter().position(|s| *s == self.section).unwrap_or(0);
+        let next = match key {
+            "up" => at.checked_sub(1),
+            "down" => Some(at + 1).filter(|ix| *ix < Section::ALL.len()),
+            "home" => Some(0),
+            "end" => Some(Section::ALL.len() - 1),
+            _ => return false,
+        };
+        if let Some(section) = next.and_then(|ix| Section::ALL.get(ix).copied()) {
+            if !self.query.is_empty() {
+                self.query.clear();
+                self.search.update(cx, |input, cx| input.set_text("", cx));
+            }
+            self.show(section, window, cx);
+        }
+        true
+    }
+
     /// Esc: closes a menu or modal, then clears the search, then closes the window.
     fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.picker.take().is_some() || self.confirm.take().is_some() {
+        if self.picker.is_some() {
+            self.close_picker(window, cx);
+        } else if self.confirm.take().is_some() {
             cx.notify();
         } else if !self.query.is_empty() {
             self.query.clear();
@@ -508,6 +657,9 @@ impl SettingsWindow {
 
     fn list(&self, window: &Window, cx: &mut Context<Self>) -> Div {
         let searching = !self.query.trim().is_empty();
+        // The list is one Tab stop (§11): the ring is on the selected section while it has the
+        // keys, and ↑ ↓ move the selection.
+        let list_focused = self.list_focus.is_focused(window);
         let item = |section: Section, cx: &mut Context<Self>| {
             let selected = self.section == section;
             div()
@@ -520,15 +672,14 @@ impl SettingsWindow {
                 .items_center()
                 .gap(px(8.))
                 .cursor_pointer()
-                .tab_index(0)
                 .role(gpui::Role::Tab)
                 .aria_label(section.name())
                 .aria_selected(selected)
                 .type_ui()
                 .text_color(if selected { theme::text() } else { theme::text_soft() })
                 .when(selected, |item| item.bg(theme::selected()))
+                .when(selected && list_focused, |item| item.shadow(theme::focus_ring_inset()))
                 .when(!selected, |item| item.hover(|style| style.bg(theme::hover())))
-                .focus_visible(|style| style.shadow(theme::focus_ring_inset()))
                 .child(glyph(section.icon(), 16., if selected { theme::text() } else { theme::text_faint() }))
                 .child(section.name())
                 .on_click(cx.listener(move |this, _, window, cx| {
@@ -543,7 +694,8 @@ impl SettingsWindow {
         let field = super::components::search_field(focused)
             .w(px(168.))
             .child(div().flex_1().min_w_0().child(self.search.clone()))
-            .when(!searching && !focused, |field| field.child(keycap("⌘F")))
+            // Past +1 the placeholder and the keycap do not both fit; the placeholder stays.
+            .when(!searching && !focused && theme::text_step() <= 1, |field| field.child(keycap("⌘F")))
             .when(searching, |field| {
                 field.child(
                     div()
@@ -571,11 +723,26 @@ impl SettingsWindow {
             .border_color(theme::hairline())
             .child(field)
             .child(div().h(px(8.)).flex_none());
-        let mut items = div().id("sections").flex().flex_col().gap(px(2.)).role(gpui::Role::TabList);
+        let mut items = div().flex().flex_col().gap(px(2.));
         for section in Section::ALL.into_iter().filter(|s| *s != Section::About) {
             items = items.child(item(section, cx));
         }
-        list = list.child(items).child(div().flex_1()).child(item(Section::About, cx));
+        let sections = div()
+            .id("sections")
+            .track_focus(&self.list_focus)
+            .role(gpui::Role::TabList)
+            .flex_1()
+            .flex()
+            .flex_col()
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                if this.list_key(event.keystroke.key.as_str(), window, cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            .child(items)
+            .child(div().flex_1())
+            .child(item(Section::About, cx));
+        list = list.child(sections);
         list
     }
 
@@ -713,8 +880,14 @@ impl Render for SettingsWindow {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &Dismiss, window, cx| this.dismiss(window, cx)))
-            .on_action(cx.listener(|_, _: &NextControl, window, cx| window.focus_next(cx)))
-            .on_action(cx.listener(|_, _: &PreviousControl, window, cx| window.focus_prev(cx)))
+            .on_action(cx.listener(|this, _: &NextControl, window, cx| {
+                this.close_picker(window, cx);
+                window.focus_next(cx);
+            }))
+            .on_action(cx.listener(|this, _: &PreviousControl, window, cx| {
+                this.close_picker(window, cx);
+                window.focus_prev(cx);
+            }))
             .on_action(cx.listener(|this, _: &super::CloseWindow, window, cx| {
                 this.stop_test(cx);
                 window.remove_window();
@@ -764,7 +937,7 @@ pub fn shot(cx: &mut App) {
                 settings.search.update(cx, |input, cx| input.set_text(&words, cx));
             }
             settings.confirm = match flag("--settings-confirm").as_deref() {
-                Some("sign-out") => settings.shell.upgrade().and_then(|shell| shell.read(cx).snapshot.as_ref()?.accounts.first().cloned()).map(Confirm::SignOut),
+                Some("sign-out") => settings.shell.upgrade().and_then(|shell| shell.read(cx).snapshot.as_ref()?.accounts.first().cloned()).map(|account| Confirm::SignOut(Box::new(account))),
                 Some("clear") => Some(Confirm::Clear),
                 Some("reset") => Some(Confirm::Reset),
                 Some("retention") => Some(Confirm::Retention { days: 7, prunable: Some((41_210, 12 * 1024 * 1024)) }),

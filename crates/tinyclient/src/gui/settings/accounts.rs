@@ -100,7 +100,7 @@ impl SettingsWindow {
                     let account = (*account).clone();
                     button(("sign-out", ix + 10 * network as usize), ButtonKind::Ghost, "Sign out…")
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.confirm = Some(Confirm::SignOut(account.clone()));
+                            this.confirm = Some(Confirm::SignOut(Box::new(account.clone())));
                             cx.notify();
                         }))
                         .into_any_element()

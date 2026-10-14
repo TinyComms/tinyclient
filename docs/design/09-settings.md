@@ -146,7 +146,7 @@ Captions. Under the first group: "Conversations you muted never notify." Under E
 | In calls | "Someone joins or leaves" (S7) | Switch | |
 | In calls | "I mute, unmute or deafen" (S8) | Switch | |
 | In calls | "Connection lost or back" (S9) | Switch | |
-| In calls | "Volume of call sounds" (S10) | Slider 0 to 100 %, ticks none, default 50 %, then the play button (S12) | |
+| In calls | "Call sound volume" (S10) | Slider 0 to 100 %, ticks none, default 50 %, then the play button (S12) | |
 
 Captions. Under Notification sounds: "Notification sounds use the alert volume in System Settings › Sound." with the link "Open Sound Settings". Under Conversations: "Give one conversation its own sound from its Notifications… menu." When no conversation has one, the Conversations group is absent and this caption sits under Each account instead. Under In calls: "Call sounds play on your call speaker, quieter than voices. Voice volume is in Audio & video." S12's tooltip names the device: "Play test sound on AirPods Pro".
 
