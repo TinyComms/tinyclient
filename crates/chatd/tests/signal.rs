@@ -124,12 +124,23 @@ impl World {
         self.until("the fake to listen", || path.exists().then_some(()));
         // Blocks until the fake is reading, which it is whenever it is alive. The fake opens the
         // FIFO again after each writer: a write that met it closing went nowhere, and is made again.
+        // On Windows the fake reads a plain file on from where it was, so lines go on its end.
         loop {
-            let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
             match writeln!(file, "{line}") {
                 Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => continue,
                 written => break written.unwrap(),
             }
+        }
+        // A FIFO's write waits for the fake to read; on Windows the fake says how far it has read.
+        #[cfg(windows)]
+        {
+            let end = std::fs::metadata(&path).unwrap().len();
+            let mut taken = path.clone().into_os_string();
+            taken.push(".taken");
+            let taken = std::path::PathBuf::from(taken);
+            let read = || std::fs::read_to_string(&taken).ok().and_then(|at| at.trim().parse::<u64>().ok()).unwrap_or(0);
+            self.until("the fake to take the line", || (read() >= end).then_some(()));
         }
     }
 

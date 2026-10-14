@@ -132,9 +132,20 @@ impl World {
     fn write_to(&self, fifo: &str, line: &str) {
         let path = self.dir.join(fifo);
         self.until("the fake to listen", || path.exists().then_some(()));
-        // Blocks until the fake is reading, which it is whenever it is alive.
-        let mut file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        // Blocks until the fake is reading, which it is whenever it is alive. On Windows the fake
+        // reads a plain file on from where it was, so lines go on its end.
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
         writeln!(file, "{line}").unwrap();
+        // A FIFO's write waits for the fake to read; on Windows the fake says how far it has read.
+        #[cfg(windows)]
+        {
+            let end = std::fs::metadata(&path).unwrap().len();
+            let mut taken = path.clone().into_os_string();
+            taken.push(".taken");
+            let taken = std::path::PathBuf::from(taken);
+            let read = || std::fs::read_to_string(&taken).ok().and_then(|at| at.trim().parse::<u64>().ok()).unwrap_or(0);
+            self.until("the fake to take the line", || (read() >= end).then_some(()));
+        }
     }
 
     fn status(&self) -> (Vec<protocol::AccountStatus>, u64) {
@@ -431,7 +442,7 @@ fn messages_arrive_change_and_go_and_what_they_hold_is_mapped() {
         }
     });
     assert_eq!(std::fs::metadata(&landed).unwrap().len(), FILE_BYTES);
-    assert!(landed.contains("/media/telegram/7001/"), "{landed}");
+    assert!(std::path::Path::new(&landed).parent().unwrap().ends_with("media/telegram/7001"), "{landed}");
     let calls = world.calls();
     assert!(calls.contains(&"ExportAuthorization 4".to_owned()) && calls.contains(&"ImportAuthorization".to_owned()), "{calls:#?}");
     assert_eq!(world.called("GetFile photo 6014 m"), 2, "{calls:#?}");

@@ -3,8 +3,8 @@
 //! can be driven through chatd's real socket (`tests/telegram.rs`); it is reachable only in a
 //! scratch directory with `TINYCLIENT_TELEGRAM_FAKE` set, never from a real session.
 //!
-//! A test steers it by writing lines to a FIFO in the scratch directory: `telegram.signin.ctl`
-//! while signing in (`scan`, `scan-password`), `telegram.ctl` once signed in (`incoming`,
+//! A test steers it by writing lines to a FIFO in the scratch directory (on Windows a file it
+//! appends to, see `adapters/script.rs`): `telegram.signin.ctl` while signing in (`scan`, `scan-password`), `telegram.ctl` once signed in (`incoming`,
 //! `photo`, `react`, `edit`, `delete`, `topic`, `typing`, `typing-stop`, `read`, `status`,
 //! `poll`, `voice`, `forward`, `flood-send N`, `revoke`). Every request it is sent is appended
 //! to `telegram.calls`, one line each, so a test can see what the network would have heard.
@@ -17,10 +17,11 @@
 
 use super::peers::Who;
 use super::wire::{Event, Fault, Wire};
+use crate::adapters::script;
 use grammers_crypto::two_factor_auth::calculate_2fa;
 use grammers_tl_types as tl;
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -460,7 +461,7 @@ pub struct Fake {
 impl Fake {
     pub fn open(signed_in: bool) -> Fake {
         let name = if signed_in { "telegram.ctl" } else { "telegram.signin.ctl" };
-        let control = protocol::support_dir().join(name);
+        let control = script::control(name);
         let (events, heard) = channel();
         let fake = Fake {
             world: Arc::new(Mutex::new(World::new(signed_in))),
@@ -476,34 +477,20 @@ impl Fake {
     /// Reads the test's lines for as long as this wire lives. Blocked in the FIFO between
     /// lines, so it costs nothing; dropping the wire writes it one last line to end it.
     fn listen(&self) {
-        if !self.control.exists() {
-            #[cfg(unix)]
-            if let Ok(path) = std::ffi::CString::new(self.control.to_string_lossy().as_bytes()) {
-                // SAFETY: `path` is a valid C string for the length of the call.
-                unsafe { libc::mkfifo(path.as_ptr(), 0o600) };
-            }
-            #[cfg(windows)]
-            {
-                let _ = std::fs::OpenOptions::new().create(true).write(true).open(&self.control);
-            }
-        }
         let (world, events, closed, control) = (self.world.clone(), self.events.clone(), self.closed.clone(), self.control.clone());
-        let _ = std::thread::Builder::new().name("telegram-fake".into()).spawn(move || loop {
-            let Ok(file) = std::fs::File::open(&control) else {
-                return;
-            };
-            for line in BufReader::new(file).lines().map_while(Result::ok) {
+        let _ = std::thread::Builder::new().name("telegram-fake".into()).spawn(move || {
+            script::follow(&control, |line| {
                 if closed.load(Ordering::Relaxed) {
-                    return;
+                    return false;
                 }
-                let mut world = world.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                for event in world.steer(line.trim()) {
-                    let _ = events.send(event);
+                if let Some(line) = line {
+                    let mut world = world.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    for event in world.steer(line.trim()) {
+                        let _ = events.send(event);
+                    }
                 }
-            }
-            if closed.load(Ordering::Relaxed) {
-                return;
-            }
+                true
+            });
         });
     }
 }
@@ -511,21 +498,8 @@ impl Fake {
 impl Drop for Fake {
     fn drop(&mut self) {
         self.closed.store(true, Ordering::Relaxed);
-        // Wakes the reader out of the FIFO. With no reader the open fails, and there is nobody
-        // to wake.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            if let Ok(mut file) = std::fs::OpenOptions::new().write(true).custom_flags(libc::O_NONBLOCK).open(&self.control) {
-                let _ = file.write_all(b"closed\n");
-            }
-        }
-        #[cfg(windows)]
-        {
-            if let Ok(mut file) = std::fs::OpenOptions::new().write(true).append(true).open(&self.control) {
-                let _ = file.write_all(b"closed\n");
-            }
-        }
+        // Wakes the reader out of the FIFO. With no reader there is nobody to wake.
+        script::wake(&self.control);
     }
 }
 

@@ -17,6 +17,7 @@
 
 mod discord;
 pub mod net;
+mod script;
 pub mod signal;
 mod slack;
 mod teams;

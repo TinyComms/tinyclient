@@ -3,8 +3,9 @@
 //! chatd's socket (`tests/signal.rs`) with no Signal library linked; it is reachable only in a
 //! scratch directory with `TINYCLIENT_SIGNAL_FAKE` set, never from a real session.
 //!
-//! A test steers it by writing lines to a FIFO in the scratch directory: `signal.signin.ctl`
-//! while linking (`scan`, `expire`, `fail`), `signal.ctl` once linked:
+//! A test steers it by writing lines to a FIFO in the scratch directory (on Windows a file it
+//! appends to, see `adapters/script.rs`): `signal.signin.ctl` while linking (`scan`, `expire`, `fail`),
+//! `signal.ctl` once linked:
 //!
 //! | Line | What Signal then says |
 //! | --- | --- |
@@ -30,8 +31,9 @@
 
 use super::wire::{Body, Contact, Event, Fault, GroupInfo, Linked, Linker, Peer, Quote, Text, Wire};
 use super::Saved;
-use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
+use crate::adapters::script;
+use std::io::Write;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -63,42 +65,6 @@ fn record(line: &str) {
     }
 }
 
-/// A FIFO in the scratch directory, made if it is not there.
-fn fifo(name: &str) -> PathBuf {
-    let path = protocol::support_dir().join(name);
-    if !path.exists() {
-        #[cfg(unix)]
-        if let Ok(c_path) = std::ffi::CString::new(path.to_string_lossy().as_bytes()) {
-            // SAFETY: `c_path` is a valid C string for the length of the call.
-            unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
-        }
-        #[cfg(windows)]
-        {
-            let _ = std::fs::OpenOptions::new().create(true).write(true).open(&path);
-        }
-    }
-    path
-}
-
-/// Wakes a reader blocked on a FIFO with one last line. True if there was a reader to wake.
-fn wake(path: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        if let Ok(mut file) = std::fs::OpenOptions::new().write(true).custom_flags(libc::O_NONBLOCK).open(path) {
-            return file.write_all(b"closed\n").is_ok();
-        }
-        false
-    }
-    #[cfg(windows)]
-    {
-        if let Ok(mut file) = std::fs::OpenOptions::new().write(true).append(true).open(path) {
-            return file.write_all(b"closed\n").is_ok();
-        }
-        false
-    }
-}
-
 pub struct Fake {
     events: Sender<Event>,
     heard: Mutex<Option<Receiver<Event>>>,
@@ -125,7 +91,7 @@ impl Fake {
             closed: Arc::default(),
             refuse: Arc::default(),
             clock: AtomicU64::new(T0 + 1_000_000),
-            control: fifo("signal.ctl"),
+            control: script::control("signal.ctl"),
         };
         fake.listen();
         fake
@@ -135,26 +101,23 @@ impl Fake {
     /// lines, so it costs nothing; closing the wire writes it one last line to end it.
     fn listen(&self) {
         let (events, closed, refuse, control) = (self.events.clone(), self.closed.clone(), self.refuse.clone(), self.control.clone());
-        let _ = std::thread::Builder::new().name("signal-fake".into()).spawn(move || loop {
-            let Ok(file) = std::fs::File::open(&control) else {
-                return;
-            };
-            for line in BufReader::new(file).lines().map_while(Result::ok) {
+        let _ = std::thread::Builder::new().name("signal-fake".into()).spawn(move || {
+            script::follow(&control, |line| {
                 if closed.load(Ordering::Relaxed) {
-                    return;
+                    return false;
                 }
-                let line = line.trim();
+                let Some(line) = line.map(str::trim) else {
+                    return true;
+                };
                 if let Some(words) = line.strip_prefix("refuse ") {
                     *refuse.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(words.to_owned());
-                    continue;
+                    return true;
                 }
                 for event in steer(line) {
                     let _ = events.send(event);
                 }
-            }
-            if closed.load(Ordering::Relaxed) {
-                return;
-            }
+                true
+            });
         });
     }
 }
@@ -290,7 +253,7 @@ impl Wire for Fake {
 
     fn close(&self) {
         if !self.closed.swap(true, Ordering::Relaxed) {
-            wake(&self.control);
+            script::wake(&self.control);
         }
     }
 }
@@ -310,7 +273,7 @@ pub fn wake_link() {
     let path = protocol::support_dir().join("signal.signin.ctl");
     let _ = std::thread::Builder::new().name("signal-fake-wake".into()).spawn(move || {
         for _ in 0..40 {
-            if wake(&path) {
+            if script::wake(&path) {
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
@@ -321,30 +284,32 @@ pub fn wake_link() {
 impl Linker for FakeLinker {
     fn link(self: Box<Self>, device: &str, show: &dyn Fn(String), cancelled: Arc<AtomicBool>) -> Result<Linked, Fault> {
         record(&format!("link {device}"));
-        let control = fifo("signal.signin.ctl");
+        let control = script::control("signal.signin.ctl");
         show(LINK.to_owned());
-        loop {
+        let mut outcome = None;
+        script::follow(&control, |line| {
             if cancelled.load(Ordering::Relaxed) {
                 record("link cancelled");
-                return Err(Fault::Net("cancelled".into()));
+                outcome = Some(Err(Fault::Net("cancelled".into())));
+                return false;
             }
-            let file = std::fs::File::open(&control).map_err(|err| Fault::Net(err.to_string()))?;
-            for line in BufReader::new(file).lines().map_while(Result::ok) {
-                if cancelled.load(Ordering::Relaxed) {
-                    record("link cancelled");
-                    return Err(Fault::Net("cancelled".into()));
+            match line.map(str::trim) {
+                Some("scan") => {
+                    let saved = Saved { aci: ME.into(), name: "Ada Quill".into(), vault: VAULT.into() };
+                    outcome = Some(serde_json::to_string(&saved).map(|session| Linked { session }).map_err(|err| Fault::Net(err.to_string())));
+                    false
                 }
-                match line.trim() {
-                    "scan" => {
-                        let saved = Saved { aci: ME.into(), name: "Ada Quill".into(), vault: VAULT.into() };
-                        let session = serde_json::to_string(&saved).map_err(|err| Fault::Net(err.to_string()))?;
-                        return Ok(Linked { session });
-                    }
-                    "expire" => show(LINK_AGAIN.to_owned()),
-                    "fail" => return Err(Fault::Net("the fake could not reach Signal".into())),
-                    _ => {}
+                Some("expire") => {
+                    show(LINK_AGAIN.to_owned());
+                    true
                 }
+                Some("fail") => {
+                    outcome = Some(Err(Fault::Net("the fake could not reach Signal".into())));
+                    false
+                }
+                _ => true,
             }
-        }
+        });
+        outcome.unwrap_or_else(|| Err(Fault::Net("the fake's control file could not be read".into())))
     }
 }
