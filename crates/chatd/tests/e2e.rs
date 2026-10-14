@@ -814,7 +814,9 @@ fn an_account_id_that_is_not_one_plain_file_name_is_never_used() {
             ("TINYCLIENT_SLACK_SOCKET", "ws://127.0.0.1:9"),
         ];
         let chatd = Daemon::with(&[], &env, |_| {});
-        let Response::Status { networks, accounts, .. } = chatd.ask(Request::Status) else {
+        // Sessions are read on a thread of their own while the socket already answers.
+        let read = chatd.until("the sessions to be read", Request::Status, |answer| matches!(answer, Response::Status { keychain, .. } if keychain.is_settled()));
+        let Response::Status { networks, accounts, .. } = read else {
             panic!("not a status");
         };
         let link = networks.iter().find(|status| status.network == Network::Slack).unwrap().link;
