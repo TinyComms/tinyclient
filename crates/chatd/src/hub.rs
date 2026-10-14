@@ -156,6 +156,7 @@ pub struct Hub {
     pub space_infos: Recent<Key, protocol::SpaceInfo>,
     pub catalogs: Recent<CatalogAsked, (Vec<protocol::CatalogItem>, Option<String>)>,
     pub calls: Calls,
+    pub player: crate::playback::Player,
 }
 
 impl Hub {
@@ -188,6 +189,7 @@ impl Hub {
             space_infos: Recent::new(16),
             catalogs: Recent::new(32),
             calls: Calls::default(),
+            player: crate::playback::Player::default(),
         }
     }
 

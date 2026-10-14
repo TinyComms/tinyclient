@@ -106,7 +106,7 @@ pub struct Calls {
 /// `tinyclient.app/Contents/MacOS`, where `packaging/bundle.sh` puts every executable so that
 /// each finds the others this way. A bundle that keeps helpers apart has them in
 /// `Contents/Helpers`, which is looked in second.
-fn mediad_path() -> io::Result<PathBuf> {
+pub(crate) fn mediad_path() -> io::Result<PathBuf> {
     if let Some(path) = std::env::var_os("TINYCLIENT_MEDIAD") {
         return Ok(PathBuf::from(path));
     }

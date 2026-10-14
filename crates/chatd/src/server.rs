@@ -293,6 +293,7 @@ impl Chat {
     }
 
     fn forget(&self, account: &AccountKey) {
+        self.hub.player.forget(&self.hub, account);
         self.blobs.forget(account);
         if let Err(err) = self.hub.store().forget(account) {
             eprintln!("chatd: {}: {err}", account.network.label());
@@ -1492,6 +1493,10 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
+            Request::Play(request) => match self.hub.player.request(&self.hub, &support_dir().join("media"), request) {
+                Ok(()) => Response::Ok,
+                Err(detail) => error(ErrorCode::Media, detail),
+            },
             Request::Media(request) => {
                 let asked = match request {
                     // Joining is the adapter's to ask for, with what the network handed out.
