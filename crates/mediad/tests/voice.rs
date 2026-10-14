@@ -181,6 +181,20 @@ impl Mediad {
         }
     }
 
+    /// As [`Mediad::event`], with the fake's end of the websocket kept going meanwhile: its
+    /// frames are read and its heartbeats answered, as a voice server would.
+    fn event_serving(&mut self, peer: &mut Peer, what: &str, matches: impl Fn(&MediaResponse) -> bool) -> MediaResponse {
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            self.seen.extend(self.frames.try_iter());
+            if let Some(at) = self.seen.iter().position(&matches) {
+                return self.seen.remove(at);
+            }
+            assert!(Instant::now() < deadline, "no {what} event; saw {:?}", self.seen);
+            peer.pump();
+        }
+    }
+
     fn connected(&mut self) -> (u32, u16) {
         match self.event("Connected", |e| matches!(e, MediaResponse::Connected { .. })) {
             MediaResponse::Connected { ssrc, dave_version } => (ssrc, dave_version),
@@ -534,6 +548,17 @@ impl Fake {
         datagram.extend_from_slice(&counter);
         self.udp.send_to(&datagram, self.client.unwrap()).unwrap();
     }
+
+    /// Another member talking: a packet every 20 ms by the clock, as a sender's audio clock
+    /// paces them. Sleeping 20 ms after each would fall behind wherever sleeps run long (a busy
+    /// CI runner makes them three times that), and mediad's playout would run dry and conceal.
+    fn talk(&mut self, packets: &[(u16, &[u8])]) {
+        let began = Instant::now();
+        for (n, &(sequence, frame)) in packets.iter().enumerate() {
+            sleep((began + Duration::from_millis(20) * n as u32).saturating_duration_since(Instant::now()));
+            self.say(sequence, frame);
+        }
+    }
 }
 
 /// Stands between mediad and the fake and passes bytes on. What the server sends can be cut
@@ -734,15 +759,11 @@ fn another_member_is_announced_decoded_and_seen_speaking() {
     let frames = tone_frames(50);
     let mut order: Vec<usize> = (0..50).filter(|&n| n != 20).collect();
     order.swap(28, 29);
-    for n in order {
-        fake.say(n as u16, &frames[n]);
-        sleep(Duration::from_millis(20));
-    }
+    let tone: Vec<(u16, &[u8])> = order.into_iter().map(|n| (n as u16, &frames[n][..])).collect();
+    fake.talk(&tone);
     mediad.speaking(THEM, true);
-    for n in 50..55 {
-        fake.say(n, &SILENCE);
-        sleep(Duration::from_millis(20));
-    }
+    let trail: Vec<(u16, &[u8])> = (50..55).map(|n| (n, &SILENCE[..])).collect();
+    fake.talk(&trail);
     mediad.speaking(THEM, false);
     peer.send(13, json!({ "user_id": THEM }));
     assert_eq!(mediad.event("Gone", |e| matches!(e, MediaResponse::Gone { .. })), MediaResponse::Gone { user_id: THEM.into() });
@@ -784,10 +805,8 @@ fn mute_sends_a_trail_of_silence_and_then_nothing_and_deafen_plays_nothing() {
     peer.send(5, json!({ "user_id": THEM, "ssrc": THEIR_SSRC, "speaking": 1 }));
     sleep(Duration::from_millis(100));
     let frames = tone_frames(25);
-    for (n, frame) in frames.iter().enumerate() {
-        fake.say(n as u16, frame);
-        sleep(Duration::from_millis(20));
-    }
+    let tone: Vec<(u16, &[u8])> = frames.iter().enumerate().map(|(n, frame)| (n as u16, &frame[..])).collect();
+    fake.talk(&tone);
 
     // Unmuted, the tone is sent again.
     assert_eq!(mediad.ask(MediaRequest::Audio { muted: false, deafened: true }), MediaResponse::Done);
@@ -1003,26 +1022,28 @@ fn frames_that_arrive_in_pieces_over_tls_are_read_whole_while_heartbeats_go_on()
     let mut mediad = Mediad::start("null", None);
     mediad.join(&dribble.address.to_string(), NO_DAVE);
     let mut peer = fake.accept();
-    fake.handshake(&mut peer, &[AES], 0, 1000);
+    // mediad gives a server up after two heartbeats go unanswered. The answers come back
+    // through the dribble too, behind whatever is still in it.
+    fake.handshake(&mut peer, &[AES], 0, 1500);
     mediad.connected();
 
     // 16 bytes every 25 ms: a frame's TLS record of about a hundred bytes comes in six pieces,
-    // each later than the 20 ms a read waits.
+    // each later than the 20 ms a read waits. Each frame is sent once the one before arrived,
+    // so an answer to a heartbeat never waits behind more than one of them: on a runner where
+    // the 25 ms sleeps run long, all of them at once could hold it back past mediad's patience.
     dribble.piece.store(16, Ordering::Relaxed);
     let began = Instant::now();
     for n in 0..4u32 {
         peer.send(5, json!({ "user_id": (500 + n).to_string(), "ssrc": 5000 + n, "speaking": 1 }));
+        let wanted = MediaResponse::Source { user_id: (500 + n).to_string(), ssrc: 5000 + n };
+        mediad.event_serving(&mut peer, "a Source that arrived in pieces", |e| *e == wanted);
     }
     // And one that takes dozens of reads to arrive.
     let crowd: Vec<String> = (0..20).map(|n| (10_000_000_000_000_000u64 + n).to_string()).collect();
     peer.send(11, json!({ "user_ids": crowd }));
     peer.send(5, json!({ "user_id": THEM, "ssrc": THEIR_SSRC, "speaking": 1 }));
-    for n in 0..4u32 {
-        let wanted = MediaResponse::Source { user_id: (500 + n).to_string(), ssrc: 5000 + n };
-        mediad.event("a Source that arrived in pieces", |e| *e == wanted);
-    }
     let last = MediaResponse::Source { user_id: THEM.into(), ssrc: THEIR_SSRC };
-    mediad.event("the Source after the large frame", |e| *e == last);
+    mediad.event_serving(&mut peer, "the Source after the large frame", |e| *e == last);
     let took = began.elapsed();
     assert!(took > Duration::from_secs(1), "the frames were not cut up: {took:?}");
     let sources = mediad.seen.iter().filter(|e| matches!(e, MediaResponse::Source { .. })).count();
@@ -1031,10 +1052,10 @@ fn frames_that_arrive_in_pieces_over_tls_are_read_whole_while_heartbeats_go_on()
 
     // While all that trickled in, mediad kept its own side going.
     peer.serve(Duration::from_millis(100));
-    assert!(!peer.heartbeats.is_empty(), "no heartbeat in {took:?} at one a second");
+    assert!(!peer.heartbeats.is_empty(), "no heartbeat in {took:?} at one every 1.5 s");
     // Six frames since the session description, which was the third.
     peer.heartbeats.clear();
-    peer.serve(Duration::from_millis(1300));
+    peer.serve(Duration::from_millis(1800));
     assert_eq!(peer.heartbeats.last().expect("a heartbeat")["seq_ack"], 9, "every frame was counted");
 
     // A close that arrives in pieces is still a close with its code.
@@ -1061,10 +1082,9 @@ fn a_call_that_moves_to_another_voice_server_keeps_its_devices_and_goes_on() {
     // Someone is heard on the first server, so there is something played before the move.
     first.send(5, json!({ "user_id": THEM, "ssrc": THEIR_SSRC, "speaking": 1 }));
     mediad.event("Source", |e| matches!(e, MediaResponse::Source { .. }));
-    for (n, frame) in tone_frames(25).iter().enumerate() {
-        old.say(n as u16, frame);
-        sleep(Duration::from_millis(20));
-    }
+    let frames = tone_frames(25);
+    let tone: Vec<(u16, &[u8])> = frames.iter().enumerate().map(|(n, frame)| (n as u16, &frame[..])).collect();
+    old.talk(&tone);
     mediad.speaking(THEM, true);
     let devices = mediad.seen.iter().filter(|e| matches!(e, MediaResponse::Devices { .. })).count();
     assert_eq!(devices, 1, "the devices were opened once");
@@ -1346,12 +1366,16 @@ fn dave_two_members_exchange_end_to_end_encrypted_audio() {
     assert!(is_the_tone(decoded_level(&opened)), "what the member decrypts is the tone");
 
     // And the member's sealed frames are heard by mediad.
-    for (n, frame) in tone_frames(50).iter().enumerate() {
-        let sealed = them.encrypt_opus(frame).unwrap();
-        assert_ne!(&sealed[..], &frame[..]);
-        fake.say(n as u16, &sealed);
-        sleep(Duration::from_millis(20));
-    }
+    let sealed: Vec<Vec<u8>> = tone_frames(50)
+        .iter()
+        .map(|frame| {
+            let sealed = them.encrypt_opus(frame).unwrap();
+            assert_ne!(&sealed[..], &frame[..]);
+            sealed.into_owned()
+        })
+        .collect();
+    let tone: Vec<(u16, &[u8])> = sealed.iter().enumerate().map(|(n, frame)| (n as u16, &frame[..])).collect();
+    fake.talk(&tone);
     mediad.speaking(THEM, true);
 
     // The budget for mediad in a voice call is about 40 MB. This is the whole engine at work
