@@ -495,8 +495,14 @@ fn a_send_naming_a_file_outside_where_the_user_picks_is_refused_before_anything_
     let store = chatd.dir.join("chat.sqlite");
     let link = chatd.dir.join("outbox").join("hosts.png");
     std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+    // On Windows only an administrator or developer mode may make a link: it is tried on Unix.
+    #[cfg(unix)]
     std::os::unix::fs::symlink("/etc/hosts", &link).unwrap();
-    let paths = [PathBuf::from("/etc/hosts"), store.clone(), link.clone(), PathBuf::from("/dev/null")];
+    #[cfg(unix)]
+    let links = vec![link.clone()];
+    #[cfg(not(unix))]
+    let links: Vec<PathBuf> = Vec::new();
+    let paths: Vec<PathBuf> = [PathBuf::from("/etc/hosts"), store.clone(), PathBuf::from("/dev/null")].into_iter().chain(links.iter().cloned()).collect();
     for (at, path) in paths.iter().enumerate() {
         let client_id = format!("170000000000010{at}");
         let asked = Request::Send { conversation: telegram.clone(), client_id: client_id.clone(), text: "look".to_owned(), reply_to: None, with: with_file(path) };
@@ -509,7 +515,7 @@ fn a_send_naming_a_file_outside_where_the_user_picks_is_refused_before_anything_
         assert!(chatd.message(&telegram, &client_id).is_none(), "{path:?} stored nothing");
     }
     // Nothing was touched: the link is the shell's to clear, the store is chatd's.
-    assert!(store.exists() && std::fs::symlink_metadata(&link).is_ok());
+    assert!(store.exists() && links.iter().all(|link| std::fs::symlink_metadata(link).is_ok()));
 }
 
 #[test]
