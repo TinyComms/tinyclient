@@ -36,12 +36,16 @@ done
 sed "s/@VERSION@/$version/g" "$root/packaging/Info.plist" > "$app/Contents/Info.plist"
 plutil -lint "$app/Contents/Info.plist" >/dev/null
 
-# The icon is a placeholder (packaging/icon.png, 1024 px) until the real one is drawn.
+# The icon: packaging/icon.png is the 1024 px master, drawn from icon.svg. Spotlight and the Dock
+# show 16 and 32, where that drawing blurs, so those (and their @2x) come from icon-small.png,
+# drawn from icon-small.svg with a larger bubble and heavier letters. Re-render the PNGs when an SVG changes.
 iconset=$(mktemp -d)/tinyclient.iconset
 mkdir -p "$iconset"
 for size in 16 32 128 256 512; do
-    sips -z $size $size "$root/packaging/icon.png" --out "$iconset/icon_${size}x${size}.png" >/dev/null
-    sips -z $((size * 2)) $((size * 2)) "$root/packaging/icon.png" --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
+    master=$root/packaging/icon.png
+    [ $size -le 32 ] && master=$root/packaging/icon-small.png
+    sips -z $size $size "$master" --out "$iconset/icon_${size}x${size}.png" >/dev/null
+    sips -z $((size * 2)) $((size * 2)) "$master" --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
 done
 iconutil -c icns "$iconset" -o "$app/Contents/Resources/tinyclient.icns"
 rm -rf "$(dirname "$iconset")"

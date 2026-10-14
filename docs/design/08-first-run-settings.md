@@ -102,7 +102,7 @@ If macOS notifications are denied, Notifications opens with one `warning` line: 
 
 ## 7. Identity
 
-**Name:** "tinyclient", always lower case. **Icon:** 1024 canvas. Plate 824 square at 100,100, radius 186, vertical gradient `#262a40` to `#0c0d11`, 3 inner stroke white at 8%. Centered speech bubble, 472 × 392, radius 132, tail to the lower left, gradient `#a3acff` to `#6a76f2`. Inside it four dots of radius 44 in a 2 × 2 square, 132 apart, `#0c0d11`: four networks in one small place. No network color or mark (Telegram's terms forbid using its logo). For 32 and below a second drawing: bubble 536 wide, dots radius 58. Menu bar item: the bubble outline with four dots, template image, 18.
+**Name:** "tinyclient", always lower case. **Icon:** 1024 canvas. Plate 824 square at 100,100, radius 186, vertical gradient `#4f8cff` to `#1f56d6` (the accent, lit from above), 4 inner stroke white at 10%. A white speech bubble 500 wide by 440 high at 262,282: three corners radius 160, the lower-left corner radius 18, and that sharp corner is the tail. "tc" is cut from it in the accent `#2f6feb`: round-capped strokes 64 wide, the t's stem curving into its foot, the c a circle open on the right. No network color or logo, and not a count of networks. For 32 and below the bubble and letters are drawn 24% larger with 74 strokes so the letters stay open. Menu bar item: the bubble with "tc" cut out, template image, 18.
 
 **About** is the last Settings section; "About tinyclient" in the menu opens it. Icon 96; "tinyclient" 22 semibold; "Version 0.4.0 (212)" 12 `text_faint`; "One small app for Slack, Discord, Telegram and Teams."; buttons "Website", "Release notes", "Copy version". Acknowledgements group: "Network icons: Dashboard Icons (homarr-labs/dashboard-icons), Apache-2.0. The logos are trademarks of their owners." / "Interface icons: Lucide, ISC." / "Open-source libraries" opens the bundled license list.
 
@@ -132,7 +132,7 @@ Updates download in the background and install on quit; no dialog, no toast. Whi
 | `warning_soft` | `rgba(227,169,74,0.14)` | Signed-out bar |
 | `switch_off` | `rgba(255,255,255,0.16)` | Switch track when off; knob is white |
 | `qr_paper`, `qr_ink` | `#ffffff`, `#0c0d11` | The QR tile only |
-| `icon_plate_hi`, `icon_bubble_hi`, `icon_bubble_lo` | `#262a40`, `#a3acff`, `#6a76f2` | The app icon only |
+| `icon_plate_hi`, `icon_plate_lo`, `icon_bubble` | `#4f8cff`, `#1f56d6`, `#ffffff` | The app icon only |
 
 The visual-system spec wins where it names the same thing. New Lucide glyphs: `plus`, `settings`, `check`, `arrow-left`, `circle-alert`, `building-2`, `grip-vertical`, `chevron-down`.
 
