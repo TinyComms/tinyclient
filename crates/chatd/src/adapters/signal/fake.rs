@@ -139,6 +139,10 @@ impl Fake {
             let Ok(file) = std::fs::File::open(&control) else {
                 return;
             };
+            // A writer of its own keeps the FIFO from ever reaching its end. Without it, a test
+            // writing lines back to back could open the FIFO just as this side saw the last one
+            // end and closed it, and that line went nowhere.
+            let _held = std::fs::OpenOptions::new().write(true).open(&control);
             for line in BufReader::new(file).lines().map_while(Result::ok) {
                 if closed.load(Ordering::Relaxed) {
                     return;
