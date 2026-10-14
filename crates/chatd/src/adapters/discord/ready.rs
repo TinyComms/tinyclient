@@ -8,8 +8,8 @@ use super::model::{
 };
 use super::{proto, Discord, GuildInfo, Quiet, Resumable, RoleInfo, WARM};
 use crate::hub::now;
-use crate::store::{ConversationRow, PersonRow, SpaceRow};
-use protocol::{CallSupport, ConversationKind, Group, MediaFile, Presence, Relation};
+use crate::store::{ConversationRow, Filing, FolderRow, PersonRow, SpaceRow};
+use protocol::{CallSupport, ConversationKind, Group, MediaFile, Presence, Relation, Special};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 
@@ -17,6 +17,12 @@ use std::collections::{HashMap, HashSet};
 struct Folder {
     #[serde(default)]
     guild_ids: Vec<String>,
+    #[serde(default)]
+    id: Option<i64>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    color: Option<u32>,
 }
 
 /// Settings as JSON, which only older sessions still get.
@@ -87,21 +93,55 @@ fn until(config: Option<&MuteConfig>) -> i64 {
     end.and_then(model::iso_seconds).unwrap_or(i64::MAX)
 }
 
-fn quiet(settings: &GuildSettings) -> Quiet {
-    let muted = settings.channel_overrides.iter().filter(|channel| channel.muted);
+pub(super) fn quiet(settings: &GuildSettings) -> Quiet {
+    let overrides = &settings.channel_overrides;
+    let muted = overrides.iter().filter(|channel| channel.muted);
+    let opted = overrides.iter().filter(|channel| channel.flags & model::OPT_IN_ENABLED != 0);
+    let levels = overrides.iter().filter(|channel| channel.message_notifications < 3);
     Quiet {
         muted_until: settings.muted.then(|| until(settings.mute_config.as_ref())),
         suppress_everyone: settings.suppress_everyone,
         suppress_roles: settings.suppress_roles,
         channels: muted.map(|channel| (channel.channel_id.clone(), until(channel.mute_config.as_ref()))).collect(),
+        hide_muted: settings.hide_muted_channels,
+        opt_in: settings.flags & model::OPT_IN_CHANNELS_ON != 0,
+        opted_in: opted.map(|channel| channel.channel_id.clone()).collect(),
+        level: settings.message_notifications,
+        levels: levels.map(|channel| (channel.channel_id.clone(), channel.message_notifications)).collect(),
     }
 }
 
 impl Quiet {
     /// Muted now: the server, the channel, or the category it is in.
-    fn mutes(&self, channel: &str, parent: Option<&str>, now: i64) -> bool {
+    pub(super) fn mutes(&self, channel: &str, parent: Option<&str>, now: i64) -> bool {
         let on = |until: Option<&i64>| until.is_some_and(|until| *until > now);
         on(self.muted_until.as_ref()) || on(self.channels.get(channel)) || on(parent.and_then(|parent| self.channels.get(parent)))
+    }
+
+    /// The server as a whole is muted now.
+    pub(super) fn server_muted(&self, now: i64) -> bool {
+        self.muted_until.is_some_and(|until| until > now)
+    }
+
+    /// Not opted in to, where the user turned "Show all channels" off: neither the channel nor
+    /// its category is opted in. Unverified against a real account: the flag bits are the
+    /// community's, and the channels a server's onboarding always shows are not known here, so
+    /// such a server may show fewer channels than Discord does until they are opted in.
+    pub(super) fn opted_out(&self, channel: &str, parent: Option<&str>) -> bool {
+        self.opt_in && !self.opted_in.contains(channel) && !parent.is_some_and(|parent| self.opted_in.contains(parent))
+    }
+
+    /// The network's notification setting for one conversation, mute first.
+    pub(super) fn notify(&self, channel: &str, parent: Option<&str>, now: i64) -> protocol::Notify {
+        if self.mutes(channel, parent, now) {
+            return protocol::Notify::Nothing;
+        }
+        let level = self.levels.get(channel).or_else(|| parent.and_then(|parent| self.levels.get(parent))).copied();
+        match level.unwrap_or(self.level) {
+            1 => protocol::Notify::Mentions,
+            2 => protocol::Notify::Nothing,
+            _ => protocol::Notify::All,
+        }
     }
 
     /// The next time one of its mutes runs out.
@@ -196,6 +236,7 @@ impl GuildInfo {
             topic: one_line(channel.topic.as_deref()),
             read_only: written && self.permissions(guild, me, channel) & SEND_MESSAGES == 0,
             private: self.private(guild, channel),
+            opted_out: self.quiet.opted_out(&channel.id, parent),
             ..ConversationRow::new(&channel.id, kind, name)
         })
     }
@@ -239,6 +280,21 @@ impl Discord {
             categories: categories.collect(),
             channels: Vec::new(),
             quiet,
+            nick: member.and_then(|member| member.nick.clone()).unwrap_or_default(),
+            emojis: guild.emojis.iter().filter(|emoji| emoji.available).filter_map(|emoji| {
+                Some(super::Pickable {
+                    id: emoji.id.clone()?,
+                    name: emoji.name.clone(),
+                    animated: emoji.animated,
+                    format: 0,
+                })
+            }).collect(),
+            stickers: guild.stickers.iter().filter(|sticker| sticker.available).map(|sticker| super::Pickable {
+                id: sticker.id.clone(),
+                name: sticker.name.clone(),
+                animated: sticker.format_type != 1,
+                format: sticker.format_type,
+            }).collect(),
         }
     }
 
@@ -296,6 +352,11 @@ impl Discord {
                 parent: thread.parent_id.clone(),
                 // A thread started from a message has that message's id.
                 root: Some(thread.id.clone()),
+                // A server's threads in READY are the ones we were added to.
+                filing: Some(Filing {
+                    followed: true,
+                    ..Filing::default()
+                }),
                 ..ConversationRow::new(&thread.id, ConversationKind::Thread, name)
             });
             info.remember(&thread.id, thread.parent_id.as_deref());
@@ -303,9 +364,12 @@ impl Discord {
         }
         let used: HashSet<&str> = rows.iter().filter_map(|row| row.group.as_deref()).collect();
         let categories = guild.channels.iter().filter(|channel| channel.kind == model::CATEGORY);
-        let groups = categories
-            .filter(|category| used.contains(category.id.as_str()))
-            .map(|category| header(&category.id, category.name.as_deref().unwrap_or(""), category.position));
+        let now = now();
+        let groups = categories.filter(|category| used.contains(category.id.as_str())).map(|category| Group {
+            // A muted category starts collapsed. The server's own mute is on the Space.
+            muted: info.quiet.channels.get(&category.id).is_some_and(|until| *until > now),
+            ..header(&category.id, category.name.as_deref().unwrap_or(""), category.position)
+        });
         Tree {
             groups: groups.collect(),
             rows,
@@ -400,6 +464,10 @@ impl Discord {
         for (row, muted) in tree.rows.iter().zip(muted) {
             self.ctx.muted(&row.id, muted)?;
         }
+        let flags = self.state.lock().unwrap().guilds.get(guild_id).map(|info| (info.quiet.server_muted(now()), info.quiet.hide_muted));
+        if let Some((muted, hide)) = flags {
+            self.ctx.space_flags(guild_id, muted, hide)?;
+        }
         Ok(())
     }
 
@@ -455,8 +523,11 @@ impl Discord {
 
     /// Every server as a Space, in the user's order.
     pub(super) fn spaces(&self) -> rusqlite::Result<()> {
+        let now = now();
+        let mut flags = Vec::new();
         let (rows, files): (Vec<SpaceRow>, Vec<(MediaFile, String)>) = {
             let state = self.state.lock().unwrap();
+            flags.extend(state.guilds.iter().map(|(id, info)| (id.clone(), info.quiet.server_muted(now), info.quiet.hide_muted)));
             let listed = state.guilds.iter().map(|(id, info)| {
                 let icon = info.icon.as_deref().map(|hash| model::guild_icon(id, hash));
                 let row = SpaceRow {
@@ -471,7 +542,12 @@ impl Discord {
             (rows, icons.into_iter().flatten().collect())
         };
         self.ctx.media(&files)?;
-        self.ctx.spaces(&rows)
+        self.ctx.spaces(&rows)?;
+        // A server's own mute and "hide muted channels", once its Space exists to hold them.
+        for (id, muted, hide) in flags {
+            self.ctx.space_flags(&id, muted, hide)?;
+        }
+        Ok(())
     }
 
     /// A direct or group conversation's row, its people and their pictures. `known` resolves
@@ -502,10 +578,22 @@ impl Discord {
         }
         let mut row = ConversationRow::new(&channel.id, kind, names.join(", "));
         row.call = CallSupport::Native;
+        // Unverified against a real account: the flags are the community's names. A request
+        // and one Discord judged spam both wait behind Message Requests.
+        if channel.is_message_request || channel.is_spam {
+            row.special = Special::Request;
+        }
         match (kind, recipients.first()) {
             (ConversationKind::Direct, Some(peer)) => {
                 row.peer = Some(peer.id.clone());
                 row.avatar = Some(peer.avatar().0.id);
+                row.bot = peer.bot;
+                if peer.system {
+                    // Discord's own account: no replies, no call.
+                    row.special = Special::Service;
+                    row.read_only = true;
+                    row.call = CallSupport::None;
+                }
                 state.directs.insert(peer.id.clone(), channel.id.clone());
             }
             (ConversationKind::Direct, None) => return None,
@@ -535,6 +623,67 @@ impl Discord {
         self.ctx.conversation(&row)
     }
 
+    /// The user's server folders as JSON settings or protobuf ones carry them. Only a folder with
+    /// an id is one; a server alone in a nameless one is simply not in a folder.
+    fn folders(ready: &Ready) -> Option<Vec<proto::GuildFolder>> {
+        let legacy = ready.user_settings.as_ref().map(|settings| {
+            let folders = settings.guild_folders.iter().map(|folder| proto::GuildFolder {
+                id: folder.id,
+                name: folder.name.clone().unwrap_or_default(),
+                color: folder.color,
+                guild_ids: folder.guild_ids.clone(),
+            });
+            folders.collect::<Vec<_>>()
+        });
+        legacy.filter(|folders| !folders.is_empty()).or_else(|| ready.user_settings_proto.as_deref().and_then(proto::guild_folders))
+    }
+
+    /// Records the server folders. One with no id holds a server that is in no folder.
+    pub(super) fn record_folders(&self, folders: &[proto::GuildFolder]) -> rusqlite::Result<()> {
+        let rows: Vec<FolderRow> = folders
+            .iter()
+            .filter_map(|folder| Some((folder.id?, folder)))
+            .enumerate()
+            .map(|(position, (id, folder))| FolderRow {
+                id: id.to_string(),
+                name: folder.name.clone(),
+                position: position as i32,
+                color: folder.color,
+                spaces: folder.guild_ids.clone(),
+                pinned: Vec::new(),
+            })
+            .collect();
+        self.ctx.folders(&rows)
+    }
+
+    /// What this account may send, from its plan. Unverified against a real account: the free
+    /// file limit is the documented 10 MiB (a press report says 20 MB since August 2026; the
+    /// smaller one is used until a real session says otherwise), and a server's boosts, which
+    /// raise it there, are not counted.
+    pub(super) fn capabilities(&self, premium: u8) {
+        let (max_file_bytes, emoji) = match premium {
+            2 => (500 << 20, protocol::EmojiScope::All),
+            1 | 3 => (50 << 20, protocol::EmojiScope::All),
+            _ => (10 << 20, protocol::EmojiScope::Space),
+        };
+        self.ctx.capabilities(protocol::Capabilities {
+            max_file_bytes,
+            max_files: 10,
+            caption_limit: 0,
+            spoiler: true,
+            as_file: false,
+            gifs: true,
+            stickers: true,
+            custom_emoji: emoji,
+            silent: true,
+            schedule: false,
+            suppress_embeds: true,
+            reply_ping: true,
+            edit_window: 0,
+        });
+        self.state.lock().unwrap().premium = premium;
+    }
+
     /// The user's own order of servers: folders flattened, then anything they do not mention on
     /// top, newest first, which is where Discord puts a server just joined.
     fn order(ready: &Ready) -> Vec<String> {
@@ -554,7 +703,9 @@ impl Discord {
     pub(super) fn ready(&self, ready: Ready) -> Result<(), Failure> {
         let me = ready.user.id.clone();
         self.ctx.describe(ready.user.name(), &me)?;
+        self.capabilities(ready.user.premium_type);
         let order = Self::order(&ready);
+        let folders = Self::folders(&ready);
         let known: HashMap<String, User> = ready.users.into_iter().map(|user| (user.id.clone(), user)).collect();
         let read = ready.read_state.map_or_else(Vec::new, Versioned::into_entries);
         let read: HashMap<String, ReadState> =
@@ -595,6 +746,7 @@ impl Discord {
             state.directs.clear();
             state.privates.clear();
             state.presence.clear();
+            state.doing.clear();
             state.guilds.clear();
             state.quiet_directs = settings.remove(&None).unwrap_or_default();
             // Whatever happened between the sessions was not heard: nothing fetched before
@@ -629,7 +781,8 @@ impl Discord {
             self.ctx.counts(&row.id, unread, 0, read_to.as_deref(), updated)?;
             let muted = self.state.lock().unwrap().quiet_directs.mutes(&row.id, None, now);
             self.ctx.muted(&row.id, muted)?;
-            if unread > 0 && !muted {
+            // A request is never warmed: opening one must not look read to its sender.
+            if unread > 0 && !muted && row.special != Special::Request {
                 unread_directs.push((updated, row.id.clone()));
             }
         }
@@ -651,6 +804,9 @@ impl Discord {
             self.state.lock().unwrap().guilds.insert(guild.id.clone(), info);
         }
         self.spaces()?;
+        if let Some(folders) = &folders {
+            self.record_folders(folders)?;
+        }
         self.reschedule_unmute();
         for presence in &ready.presences {
             self.presence(presence);
@@ -731,6 +887,43 @@ impl Discord {
             }
         }
         self.ctx.presence(id, update.presence(), update.status(), owned);
+        let (emoji, doing) = (update.emoji().to_owned(), update.doing());
+        if owned {
+            self.state.lock().unwrap().doing.insert(id.to_owned(), (emoji.clone(), doing.clone()));
+            self.tell_activity(id);
+        } else {
+            self.ctx.activity(id, &emoji, doing, false);
+        }
+    }
+
+    /// A friend's status emoji and what they are doing: in voice, from their voice state, wins
+    /// over a game, since it is what says they can be joined.
+    pub(super) fn tell_activity(&self, person: &str) {
+        let (emoji, doing, voice) = {
+            let state = self.state.lock().unwrap();
+            let (emoji, doing) = state.doing.get(person).cloned().unwrap_or_default();
+            let voice = state.voice.states.get(person).map(|heard| (heard.channel().to_owned(), heard.guild.clone()));
+            let voice = voice.map(|(channel, guild)| {
+                let place = guild.as_ref().and_then(|guild| state.guilds.get(guild)).map(|info| info.name.clone());
+                (channel, guild, place.unwrap_or_default())
+            });
+            (emoji, doing, voice)
+        };
+        let doing = match voice {
+            Some((channel, guild, place)) => {
+                let name = self.ctx.known(&channel).ok().flatten().map(|row| row.title).unwrap_or_default();
+                let mut voice = protocol::Activity {
+                    kind: if guild.is_some() { protocol::ActivityKind::InVoice } else { protocol::ActivityKind::InCall },
+                    name,
+                    place,
+                    conversation: Some(self.ctx.key(&channel)),
+                };
+                voice.bound();
+                Some(voice)
+            }
+            None => doing,
+        };
+        self.ctx.activity(person, &emoji, doing, true);
     }
 
     /// After a resume: chatd dropped what it knew live when the link went down, and Discord
@@ -918,6 +1111,11 @@ impl Discord {
         let mut row = ConversationRow {
             parent: Some(parent.key.id.clone()),
             root: Some(thread.id.clone()),
+            // Joined, or our membership came with it: followed. Otherwise left as it was.
+            filing: (joined || thread.member.is_some()).then(|| Filing {
+                followed: true,
+                ..Filing::default()
+            }),
             ..ConversationRow::new(&thread.id, ConversationKind::Thread, name)
         };
         let archived = thread.thread_metadata.as_ref().is_some_and(|metadata| metadata.archived);
@@ -963,6 +1161,10 @@ impl Discord {
             }
         }
         self.apply_quiet(settings.guild_id.as_deref())?;
+        // What is opted in, hidden or collapsed lives on the tree and the Space.
+        if let Some(guild) = &settings.guild_id {
+            self.replant(guild)?;
+        }
         self.reschedule_unmute();
         Ok(())
     }

@@ -20,6 +20,15 @@ pub const EMOJI: &[(&str, &str, &str)] = &[
     ("emoji-trailboot", ":trailboot:", "Moss & Lichen"),
     ("emoji-campfire", ":campfire:", "Moss & Lichen"),
 ];
+/// Harbor Labs' own emoji, as Slack lists a workspace's custom set.
+pub const SLACK_EMOJI: &[(&str, &str, &str)] = &[
+    ("emoji-shipit", ":shipit:", "Harbor Labs"),
+    ("emoji-lgtm", ":lgtm:", "Harbor Labs"),
+    ("emoji-anchor_wave", ":anchor_wave:", "Harbor Labs"),
+    ("emoji-tidepool", ":tidepool:", "Harbor Labs"),
+    ("emoji-lighthouse", ":lighthouse:", "Harbor Labs"),
+    ("emoji-this", ":this:", "Harbor Labs"),
+];
 pub const STICKERS: &[(&str, &str, &str)] = &[
     ("sticker-fox-wave", "👋", "Forest Friends"),
     ("sticker-fox-sleep", "😴", "Forest Friends"),
@@ -28,26 +37,31 @@ pub const STICKERS: &[(&str, &str, &str)] = &[
     ("sticker-hedgehog-heart", "❤️", "Forest Friends"),
     ("sticker-hedgehog-sad", "😢", "Forest Friends"),
 ];
+/// Discord's picker shows Favorites, then Trending; Telegram's answer names them "Saved"
+/// (`adapter.rs`), and a search has no sections.
 pub const GIFS: &[(&str, &str, &str)] = &[
-    ("gif-cat-typing", "cat typing", ""),
-    ("gif-cat-nap", "cat nap", ""),
-    ("gif-dog-wave", "dog wave", ""),
-    ("gif-thumbs-up", "thumbs up", ""),
-    ("gif-party", "party", ""),
-    ("gif-facepalm", "facepalm", ""),
-    ("gif-mushroom-dance", "mushroom dance", ""),
-    ("gif-rain", "rain on a window", ""),
-    ("gif-coffee", "coffee", ""),
-    ("gif-high-five", "high five", ""),
-    ("gif-applause", "applause", ""),
-    ("gif-shrug", "shrug", ""),
+    ("gif-cat-typing", "cat typing", "Favorites"),
+    ("gif-cat-nap", "cat nap", "Favorites"),
+    ("gif-dog-wave", "dog wave", "Favorites"),
+    ("gif-thumbs-up", "thumbs up", "Trending"),
+    ("gif-party", "party", "Trending"),
+    ("gif-facepalm", "facepalm", "Trending"),
+    ("gif-mushroom-dance", "mushroom dance", "Trending"),
+    ("gif-rain", "rain on a window", "Trending"),
+    ("gif-coffee", "coffee", "Trending"),
+    ("gif-high-five", "high five", "Trending"),
+    ("gif-applause", "applause", "Trending"),
+    ("gif-shrug", "shrug", "Trending"),
 ];
+/// GIFs come in every shape: their stills are drawn at these sizes, in turn.
+const GIF_SIZES: &[(u32, u32)] = &[(220, 124), (160, 160), (200, 150), (240, 100), (140, 180), (220, 160)];
 
 /// The catalog an account answers, if it has that kind at all.
 pub fn catalog(account: &AccountKey, kind: CatalogKind) -> &'static [(&'static str, &'static str, &'static str)] {
     use protocol::Network::{Discord, Slack, Telegram};
     match (account.network, kind) {
-        (Discord | Slack, CatalogKind::Emoji) => EMOJI,
+        (Discord, CatalogKind::Emoji) => EMOJI,
+        (Slack, CatalogKind::Emoji) => SLACK_EMOJI,
         (Discord | Telegram, CatalogKind::Stickers) => STICKERS,
         (Discord | Telegram, CatalogKind::Gifs) => GIFS,
         _ => &[],
@@ -96,10 +110,16 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<()> {
     slack_extras(s)?;
     for account in [discord::account(), telegram::account()] {
         registered(s, &account, STICKERS, MediaKind::Image, Art::Blob, 160)?;
-        registered(s, &account, GIFS, MediaKind::Gif, Art::Scene, 200)?;
+        for (at, (id, ..)) in GIFS.iter().enumerate() {
+            if s.store.media(&account, &[(*id).to_owned()])?.is_empty() {
+                let look = s.look(Art::Scene);
+                let (width, height) = GIF_SIZES[at % GIF_SIZES.len()];
+                s.waiting(&account, id, MediaKind::Gif, look, width, height)?;
+            }
+        }
     }
     registered(s, &discord::account(), EMOJI, MediaKind::Emoji, Art::Blob, 48)?;
-    registered(s, &slack::harbor(), EMOJI, MediaKind::Emoji, Art::Blob, 48)?;
+    registered(s, &slack::harbor(), SLACK_EMOJI, MediaKind::Emoji, Art::Blob, 48)?;
 
     // What each account may send, as its session would say.
     let mb = 1 << 20;
@@ -163,6 +183,9 @@ fn discord_extras(s: &mut Seeder, discord: &Discord) -> Fallible<()> {
     for who in [INES, TOMASZ, WREN] {
         s.activities.push((at(who), String::new(), activity(ActivityKind::InVoice, "Campfire", "Moss & Lichen", Some(campfire.clone()))));
     }
+    s.activities.push((at(discord::YUSUF), String::new(), activity(ActivityKind::InVoice, "Field recording", "Moss & Lichen", None)));
+    // In a call of her own, not a voice channel: "In a call" on her DM row and in People.
+    s.activities.push((at(discord::ODALYS), String::new(), activity(ActivityKind::InCall, "", "", None)));
     s.activities.push((at(HARUTO), String::new(), activity(ActivityKind::Playing, "Hades", "", None)));
     s.activities.push((at(MIRELA), "🎧".to_owned(), activity(ActivityKind::Listening, "Spotify", "", None)));
     s.activities.push((at(discord::DITA), "🌿".to_owned(), None));

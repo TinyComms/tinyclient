@@ -6,7 +6,7 @@ use super::model::{self, VoiceState};
 use super::rest::Refused;
 use super::Discord;
 use protocol::{
-    CallFailure, CallSupport, ConversationKind, Dave, Network, Occupant, Participant, VoiceJoin, Watching,
+    CallFailure, CallSupport, ConversationKind, Dave, Network, Occupant, Participant, Relation, VoiceJoin, Watching,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -126,6 +126,13 @@ pub struct Heard {
     name: String,
     muted: bool,
     deafened: bool,
+    streaming: bool,
+}
+
+impl Heard {
+    pub fn channel(&self) -> &str {
+        &self.channel
+    }
 }
 
 /// The call the user started or accepted, from the request until it is left.
@@ -266,7 +273,9 @@ impl Discord {
                     }
                     continue;
                 }
-                if !state.voice.watched(&channel, guild.as_deref()) {
+                // A channel with a friend in it is told wherever it is: the home's "In voice".
+                let friend = there.iter().any(|(id, _)| state.relations.get(*id) == Some(&Relation::Friend));
+                if !friend && !state.voice.watched(&channel, guild.as_deref()) {
                     // No longer on screen and not our call any more: chatd lets it go.
                     if state.voice.told.remove(&channel).is_some() {
                         reports.push((channel, Vec::new(), 0));
@@ -280,9 +289,7 @@ impl Discord {
                     name: heard.name.clone(),
                     muted: heard.muted,
                     deafened: heard.deafened,
-                    // Not known here: the voice state as this adapter reads it carries no
-                    // `self_stream` or `self_video`.
-                    streaming: false,
+                    streaming: heard.streaming,
                 });
                 let people: Vec<Occupant> = people.collect();
                 state.voice.told.insert(channel.clone(), guild);
@@ -302,13 +309,23 @@ impl Discord {
         let shown = shown.map(|space| space.id.clone());
         let (leave, enter) = {
             let mut state = self.state.lock().unwrap();
+            let state = &mut *state;
             let voice = &mut state.voice;
             if voice.shown == shown {
                 return;
             }
             let before = std::mem::replace(&mut voice.shown, shown.clone());
             let ours = voice.call.as_ref().map(|call| call.conversation.clone());
-            let left = voice.told.iter().filter(|(channel, guild)| guild.is_some() && **guild == before && Some(*channel) != ours.as_ref());
+            // A friend's channel stays told: it is not the server on screen that wants it.
+            let friended: BTreeSet<&String> = voice
+                .states
+                .iter()
+                .filter(|(id, _)| state.relations.get(*id) == Some(&Relation::Friend))
+                .map(|(_, heard)| &heard.channel)
+                .collect();
+            let left = voice.told.iter().filter(|(channel, guild)| {
+                guild.is_some() && **guild == before && Some(*channel) != ours.as_ref() && !friended.contains(channel)
+            });
             let leave: Vec<String> = left.map(|(channel, _)| channel.clone()).collect();
             for channel in &leave {
                 voice.told.remove(channel);
@@ -352,6 +369,7 @@ impl Discord {
                     name: named.or(before.map(|before| before.name)).or(me).unwrap_or_default(),
                     muted: voice.self_mute || voice.mute,
                     deafened: voice.self_deaf || voice.deaf,
+                    streaming: voice.self_stream || voice.self_video,
                 };
                 changed.insert(channel.clone());
                 state.voice.states.insert(voice.user_id.clone(), heard);
@@ -359,6 +377,7 @@ impl Discord {
         }
         self.roster();
         self.occupancy(changed);
+        self.friends_moved(states.iter().map(|voice| voice.user_id.as_str()));
     }
 
     pub(super) fn voice_left(&self, people: &[String]) {
@@ -371,6 +390,19 @@ impl Discord {
         }
         self.roster();
         self.occupancy(changed);
+        self.friends_moved(people.iter().map(String::as_str));
+    }
+
+    /// Friends whose voice state changed: what they are doing is told again.
+    fn friends_moved<'a>(&self, people: impl Iterator<Item = &'a str>) {
+        let friends: Vec<String> = {
+            let state = self.state.lock().unwrap();
+            let friend = |id: &&str| state.relations.get(*id) == Some(&Relation::Friend);
+            people.filter(friend).map(str::to_owned).collect()
+        };
+        for friend in friends {
+            self.tell_activity(&friend);
+        }
     }
 
     /// Hands mediad the voice session once both halves of it are here.
@@ -469,7 +501,7 @@ impl Discord {
         };
         let direct = conversation.kind.is_direct();
         if conversation.call != CallSupport::Native || (!direct && conversation.kind != ConversationKind::Voice) {
-            return refuse("This conversation has no call tinychat can join.");
+            return refuse("This conversation has no call tinyclient can join.");
         }
         let guild = conversation.space.clone();
         let ring = {

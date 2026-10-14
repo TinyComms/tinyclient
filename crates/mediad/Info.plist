@@ -3,12 +3,12 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleIdentifier</key>
-	<string>dev.tinychat.mediad</string>
+	<string>dev.tinyclient.mediad</string>
 	<key>CFBundleName</key>
-	<string>tinychat</string>
+	<string>tinyclient</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>tinychat uses the microphone so the people in your call can hear you.</string>
+	<string>tinyclient uses the microphone so the people in your call can hear you.</string>
 </dict>
 </plist>

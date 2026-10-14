@@ -4,8 +4,8 @@
 use super::emoji;
 use super::{https_host, within, Fault, Slack, SEARCHED, SEARCH_EVERY, UNKNOWN};
 use crate::adapters::{Failure, Members};
-use crate::store::{ConversationRow, PersonRow};
-use protocol::{MediaFile, MediaKind, MemberSection, Person, Presence, Relation, SEARCH_MIN_CHARS};
+use crate::store::{ConversationRow, PersonDetails, PersonRow};
+use protocol::{Activity, ActivityKind, Mark, MediaFile, MediaKind, MemberSection, Person, Presence, Relation, SEARCH_MIN_CHARS};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
@@ -28,7 +28,7 @@ const ROSTER: usize = 1_000;
 /// none for someone Slack does serve one for.
 const NOTE: u8 = 4;
 
-/// What tinychat keeps of a person in memory.
+/// What tinyclient keeps of a person in memory.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(super) struct User {
     #[serde(rename = "n")]
@@ -42,6 +42,50 @@ pub(super) struct User {
     pub bot: bool,
     #[serde(rename = "s", default)]
     pub status: String,
+    /// Guest, from another organization, deactivated. Absent from notes written before it.
+    #[serde(rename = "m", default, skip_serializing_if = "Option::is_none")]
+    pub mark: Option<Mark>,
+    /// The status emoji alone, and whether they are in a huddle, told again on each connect.
+    #[serde(rename = "e", default, skip_serializing_if = "String::is_empty")]
+    pub emoji: String,
+    #[serde(rename = "u", default, skip_serializing_if = "std::ops::Not::not")]
+    pub huddle: bool,
+}
+
+/// Slackbot is an app, though Slack does not flag it as one.
+const SLACKBOT: &str = "USLACKBOT";
+
+/// The one tag after a person's name, from fields of the user object already fetched.
+/// Unverified against a real workspace: `is_stranger` and the profile's `team` for someone of
+/// another organization are the community's reading of Slack Connect users.
+fn mark_of(user: &Value, workspace: &str) -> Option<Mark> {
+    let team = [&user["team_id"], &user["profile"]["team"]].into_iter().filter_map(Value::as_str).find(|team| !team.is_empty());
+    // On Enterprise Grid a colleague's team is another workspace of the same organization.
+    let org = user["enterprise_user"].is_object();
+    if user["deleted"] == true {
+        Some(Mark::Deactivated)
+    } else if user["is_stranger"] == true || (team.is_some_and(|team| team != workspace) && !org) {
+        Some(Mark::External)
+    } else if user["is_restricted"] == true || user["is_ultra_restricted"] == true {
+        Some(Mark::Guest)
+    } else {
+        None
+    }
+}
+
+/// In a huddle now, as the profile says. Unverified: `huddle_state` and its value are the
+/// community's; Slack documents neither.
+fn huddling(profile: &Value) -> bool {
+    profile["huddle_state"] == "in_a_huddle"
+}
+
+fn huddle(on: bool) -> Option<Activity> {
+    on.then(|| Activity {
+        kind: ActivityKind::Huddle,
+        name: String::new(),
+        place: String::new(),
+        conversation: None,
+    })
 }
 
 /// A person as kept in a note, so a restart asks Slack nothing: what is remembered in memory,
@@ -197,7 +241,7 @@ impl Slack {
     /// file is registered before the person who names it, and the person before any message
     /// or row of theirs.
     pub(super) fn learn(&self, users: &[Value]) -> Vec<(String, User)> {
-        let (mut learned, mut rows) = (Vec::new(), Vec::new());
+        let (mut learned, mut rows, mut details, mut doing) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for user in users {
             let Some(id) = user["id"].as_str() else {
                 continue;
@@ -226,14 +270,22 @@ impl Slack {
             let status_emoji = profile["status_emoji"].as_str().unwrap_or("").trim_matches(':');
             let status_emoji = emoji::standard(status_emoji).unwrap_or_default();
             let status = format!("{status_emoji} {}", profile["status_text"].as_str().unwrap_or(""));
+            let mark = mark_of(user, &self.session.team_id);
             let known = User {
                 name: name.unwrap_or(id).to_owned(),
                 handle: user["name"].as_str().unwrap_or("").to_owned(),
                 avatar: avatar.unwrap_or_default(),
-                bot: user["is_bot"] == true || user["is_app_user"] == true,
+                bot: user["is_bot"] == true || user["is_app_user"] == true || id == SLACKBOT,
                 status: status.trim().to_owned(),
+                mark,
+                emoji: status_emoji.to_owned(),
+                huddle: huddling(profile),
             };
             rows.push(self.person_row(id, &known));
+            let title = profile["title"].as_str().unwrap_or("").to_owned();
+            let utc_offset = user["tz_offset"].as_i64().map(|offset| offset as i32);
+            details.push((id.to_owned(), PersonDetails { title, utc_offset, mark }));
+            doing.push((id.to_owned(), status_emoji.to_owned(), huddle(huddling(profile))));
             let kept = Kept {
                 user: known.clone(),
                 form: NOTE,
@@ -244,8 +296,13 @@ impl Slack {
             self.remember(id, &known);
             learned.push((id.to_owned(), known));
         }
-        if let Err(err) = self.ctx.people(&rows) {
+        if let Err(err) = self.ctx.people(&rows).and_then(|()| self.ctx.details(&details)) {
             eprintln!("chatd: Slack: {err}");
+        }
+        // The status emoji and a huddle, kept like presence: only for people the user owns or
+        // has on screen.
+        for (id, emoji, activity) in doing {
+            self.ctx.activity(&id, &emoji, activity, self.owned(&id));
         }
         let mut state = self.state();
         for (id, _) in &learned {
@@ -295,11 +352,13 @@ impl Slack {
             name: id.to_owned(),
             ..User::default()
         };
-        if self.state().unknown.contains(id) {
+        if self.state().unknown.contains(id) || !self.info_due(id) {
             return nameless();
         }
         match self.api("users.info", &[("user", id)]) {
             Ok(info) => {
+                // The same answer is the card: opened within the hour, nothing more is asked.
+                self.keep_about(id, &info["user"]);
                 let mut learned = self.learn(std::slice::from_ref(&info["user"]));
                 learned.pop().map_or_else(nameless, |(_, user)| user)
             }
@@ -523,6 +582,9 @@ impl Slack {
         row.avatar = Some(user.avatar).filter(|avatar| !avatar.is_empty());
         row.peer = Some(person.to_owned());
         row.private = true;
+        // An app's DM, Slackbot's included: never a person (rule 4).
+        row.bot = user.bot;
+        row.mark = user.mark;
         row
     }
 
@@ -551,8 +613,20 @@ impl Slack {
         Ok(())
     }
 
+    /// The status emoji and huddle of everyone the user has a DM with, from what is cached: chatd
+    /// keeps them only for owned people, which partners are once the sidebar says so, and
+    /// forgets them when the socket drops. Asks Slack nothing.
+    pub(super) fn tell_partners(&self) {
+        let partners: Vec<String> = self.state().partners.keys().cloned().collect();
+        for id in partners {
+            if let Some(user) = self.cached(&id) {
+                self.ctx.activity(&id, &user.emoji, huddle(user.huddle), true);
+            }
+        }
+    }
+
     /// Whether a person is on a list the user owns: someone they talk to, or themselves.
-    fn owned(&self, id: &str) -> bool {
+    pub(super) fn owned(&self, id: &str) -> bool {
         self.me.get().is_some_and(|me| me == id) || self.state().partners.contains_key(id)
     }
 

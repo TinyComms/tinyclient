@@ -1,0 +1,53 @@
+{
+ "messages": [
+  {
+   "id": "1760000900001",
+   "type": "Message",
+   "messagetype": "Text",
+   "contenttype": "text",
+   "content": "",
+   "conversationid": "48:notifications",
+   "conversationLink": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/conversations/48:notifications",
+   "from": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/8:orgid:00000000-0000-4000-8000-0000000000b2",
+   "imdisplayname": "Ben Okafor",
+   "composetime": "2025-10-09T09:05:00.0000000Z",
+   "originalarrivaltime": "2025-10-09T09:05:00.0000000Z",
+   "properties": {
+    "activity": "{\"activityType\": \"mention\", \"sourceThreadId\": \"19:grp1@thread.v2\", \"sourceMessageId\": 1759600000000, \"sourceUserId\": \"8:orgid:00000000-0000-4000-8000-0000000000b2\"}"
+   }
+  },
+  {
+   "id": "1760000900002",
+   "type": "Message",
+   "messagetype": "Text",
+   "contenttype": "text",
+   "content": "",
+   "conversationid": "48:notifications",
+   "conversationLink": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/conversations/48:notifications",
+   "from": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/8:orgid:00000000-0000-4000-8000-0000000000b2",
+   "imdisplayname": "Ben Okafor",
+   "composetime": "2025-10-09T09:05:00.0000000Z",
+   "originalarrivaltime": "2025-10-09T09:05:00.0000000Z",
+   "properties": {
+    "activity": "{\"activityType\": \"mention\", \"sourceThreadId\": \"19:platform0general@thread.tacv2\", \"sourceMessageId\": 1760000100100, \"sourceUserId\": \"8:orgid:00000000-0000-4000-8000-0000000000b2\"}"
+   }
+  },
+  {
+   "id": "1760000900003",
+   "type": "Message",
+   "messagetype": "Text",
+   "contenttype": "text",
+   "content": "",
+   "conversationid": "48:notifications",
+   "conversationLink": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/conversations/48:notifications",
+   "from": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/8:orgid:00000000-0000-4000-8000-0000000000b2",
+   "imdisplayname": "Ben Okafor",
+   "composetime": "2025-10-09T09:05:00.0000000Z",
+   "originalarrivaltime": "2025-10-09T09:05:00.0000000Z",
+   "properties": {
+    "activity": "{\"activityType\": \"reaction\", \"sourceThreadId\": \"19:grp1@thread.v2\", \"sourceMessageId\": 1759600000001, \"sourceUserId\": \"8:orgid:00000000-0000-4000-8000-0000000000b2\"}"
+   }
+  }
+ ],
+ "_metadata": {}
+}

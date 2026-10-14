@@ -292,7 +292,7 @@ impl ConversationKind {
 pub enum CallSupport {
     #[default]
     None,
-    /// tinychat carries the call itself.
+    /// tinyclient carries the call itself.
     Native,
     /// The official app does: ask `Handoff` for the link and open it.
     Handoff,
@@ -411,7 +411,7 @@ pub struct Conversation {
     #[serde(default, skip_serializing_if = "is_false")]
     pub archived: bool,
     /// Pinned on the network, and where among the pins (lowest first). Separate from `starred`,
-    /// which is tinychat's own.
+    /// which is tinyclient's own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pin: Option<i32>,
     /// Hidden on the network (a Teams chat the user hid): never listed. The adapter unhides it
@@ -507,7 +507,7 @@ impl Conversation {
     pub fn subtitle(&self) -> String {
         let place = [self.space_title.as_str(), self.group_title.as_str()];
         let place: Vec<&str> = place.into_iter().filter(|part| !part.is_empty()).collect();
-        let mut line = place.join(" > ");
+        let mut line = place.join(" › ");
         if !self.topic.is_empty() {
             if !line.is_empty() {
                 line.push_str(" · ");
@@ -1482,22 +1482,22 @@ pub fn support_dir() -> PathBuf {
     }
     if cfg!(target_os = "macos") {
         let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/tmp"));
-        return home.join("Library/Application Support/tinychat");
+        return home.join("Library/Application Support/tinyclient");
     }
     if cfg!(windows) {
         if let Some(appdata) = std::env::var_os("APPDATA") {
-            return PathBuf::from(appdata).join("tinychat");
+            return PathBuf::from(appdata).join("tinyclient");
         }
         if let Some(profile) = std::env::var_os("USERPROFILE") {
-            return PathBuf::from(profile).join("AppData/Roaming/tinychat");
+            return PathBuf::from(profile).join("AppData/Roaming/tinyclient");
         }
-        return PathBuf::from(r"C:\ProgramData\tinychat");
+        return PathBuf::from(r"C:\ProgramData\tinyclient");
     }
     if let Some(data_home) = std::env::var_os("XDG_DATA_HOME") {
-        return PathBuf::from(data_home).join("tinychat");
+        return PathBuf::from(data_home).join("tinyclient");
     }
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/tmp"));
-    home.join(".local/share/tinychat")
+    home.join(".local/share/tinyclient")
 }
 
 pub fn chat_sock_path() -> PathBuf {
@@ -1666,9 +1666,9 @@ mod tests {
         assert_eq!(place.subtitle(), "");
         place.space_title = "Moss & Lichen".into();
         place.group_title = "Trail".into();
-        assert_eq!(place.subtitle(), "Moss & Lichen > Trail");
+        assert_eq!(place.subtitle(), "Moss & Lichen › Trail");
         place.topic = "Where we walk".into();
-        assert_eq!(place.subtitle(), "Moss & Lichen > Trail · Where we walk");
+        assert_eq!(place.subtitle(), "Moss & Lichen › Trail · Where we walk");
     }
 
     #[test]

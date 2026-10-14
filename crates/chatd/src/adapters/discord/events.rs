@@ -184,7 +184,7 @@ impl Discord {
                             action if action.contains("CAPTCHA") => "pass a captcha",
                             _ => "verify your account",
                         };
-                        self.rest.challenge(&format!("Discord wants you to {what}. Do that in Discord; tinychat asks nothing more until then."));
+                        self.rest.challenge(&format!("Discord wants you to {what}. Do that in Discord; tinyclient asks nothing more until then."));
                     }
                     None => {
                         self.rest.challenged.store(false, Ordering::Relaxed);
@@ -204,6 +204,7 @@ impl Discord {
             "GUILD_MEMBER_LIST_UPDATE" => self.member_list(from_str(data)?),
             "GUILD_MEMBERS_CHUNK" => self.members_chunk(from_str(data)?)?,
             "VOICE_STATE_UPDATE" => self.voice_state(from_str(data)?),
+            "GUILD_EMOJIS_UPDATE" | "GUILD_STICKERS_UPDATE" => self.pickables_changed(from_str(data)?),
             "VOICE_SERVER_UPDATE" => self.voice_server(from_str(data)?),
             "CALL_CREATE" | "CALL_UPDATE" => self.call_changed(from_str(data)?),
             "CALL_DELETE" => self.call_deleted(from_str(data)?),
@@ -411,6 +412,9 @@ impl Discord {
         }
         if update.partial {
             return Ok(());
+        }
+        if let Some(folders) = proto::guild_folders(&update.settings.proto) {
+            self.record_folders(&folders)?;
         }
         let Some(order) = proto::guild_order(&update.settings.proto) else {
             return Ok(());

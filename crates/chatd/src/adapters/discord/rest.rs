@@ -146,10 +146,10 @@ impl Refused {
         let whole = |seconds: f64| seconds.ceil().max(1.) as u64;
         match self {
             Refused::Expired => "Discord signed you out. Sign in again.".to_owned(),
-            Refused::Challenge => "Discord asked for a check tinychat cannot do. Finish it in Discord, then try again.".to_owned(),
+            Refused::Challenge => "Discord asked for a check tinyclient cannot do. Finish it in Discord, then try again.".to_owned(),
             Refused::Limited(seconds) => format!("Rate limited: try again in {} s.", whole(*seconds)),
             Refused::Paused(seconds) => {
-                format!("Discord refused too many requests. tinychat asks again in {} min.", whole(*seconds / 60.))
+                format!("Discord refused too many requests. tinyclient asks again in {} min.", whole(*seconds / 60.))
             }
             Refused::Status { code: 20016, retry_after, .. } => {
                 format!("Slow mode: wait {} s.", whole(retry_after.unwrap_or(1.)))
@@ -227,9 +227,15 @@ struct Limit {
     shared: bool,
 }
 
+/// A header's seconds. "NaN" and "inf" parse as numbers; neither is a wait, and NaN would reach
+/// `Duration::from_secs_f64` through `clamp` and panic.
+fn seconds_of(value: &str) -> Option<f64> {
+    value.trim().parse::<f64>().ok().filter(|seconds| seconds.is_finite())
+}
+
 fn limit(problem: &Value, header: impl Fn(&str) -> Option<String>) -> Limit {
-    let seconds = |name: &str| header(name).and_then(|value| value.trim().parse::<f64>().ok());
-    let stated = problem["retry_after"].as_f64().or_else(|| seconds("retry-after")).or_else(|| seconds("x-ratelimit-reset-after"));
+    let seconds = |name: &str| header(name).as_deref().and_then(seconds_of);
+    let stated = problem["retry_after"].as_f64().filter(|seconds| seconds.is_finite()).or_else(|| seconds("retry-after")).or_else(|| seconds("x-ratelimit-reset-after"));
     let scope = header("x-ratelimit-scope").unwrap_or_default();
     let flagged = header("x-ratelimit-global").is_some_and(|value| value == "true");
     // A 429 that is not Discord's own (no JSON, no scope) is the edge refusing the address:
@@ -275,13 +281,13 @@ impl Rest {
     fn pace(&self, route: &str) -> Result<(), Refused> {
         let now = Instant::now();
         let window = {
-            let mut windows = self.windows.lock().unwrap();
+            let mut windows = crate::hub::lock(&self.windows);
             if windows.len() > 64 {
                 windows.retain(|_, window| window.resets > now);
             }
             windows.get(route).filter(|window| window.remaining == 0).map(|window| window.resets)
         };
-        let everything = *self.everything_waits.lock().unwrap();
+        let everything = *crate::hub::lock(&self.everything_waits);
         let until = window.into_iter().chain(everything).max().filter(|until| *until > now);
         if let Some(until) = until {
             let wait = until - now;
@@ -297,7 +303,7 @@ impl Rest {
     /// refused here until they are over, with the account marked as needing attention.
     fn refused(&self) {
         let now = Instant::now();
-        let mut refusals = self.refusals.lock().unwrap();
+        let mut refusals = crate::hub::lock(&self.refusals);
         let (recent, paused) = &mut *refusals;
         recent.push_back(now);
         while recent.front().is_some_and(|at| now.duration_since(*at) > REFUSALS_WITHIN) {
@@ -307,13 +313,13 @@ impl Rest {
             *paused = Some(now + REFUSALS_WITHIN);
             recent.clear();
             drop(refusals);
-            self.ctx.attention("Discord is refusing tinychat's requests. Nothing more is asked for 10 minutes; check your account in Discord.");
+            self.ctx.attention("Discord is refusing tinyclient's requests. Nothing more is asked for 10 minutes; check your account in Discord.");
         }
     }
 
     /// Seconds left of a pause for too many refusals.
     fn paused(&self) -> Option<f64> {
-        let mut refusals = self.refusals.lock().unwrap();
+        let mut refusals = crate::hub::lock(&self.refusals);
         let until = refusals.1?;
         let left = until.saturating_duration_since(Instant::now());
         if left.is_zero() {
@@ -401,13 +407,13 @@ impl Rest {
             let headers = response.headers().clone();
             let header = |name: &str| headers.get(name).and_then(|value| value.to_str().ok()).map(str::to_owned);
             let remaining = header("x-ratelimit-remaining").and_then(|value| value.parse::<u32>().ok());
-            let reset = header("x-ratelimit-reset-after").and_then(|value| value.parse::<f64>().ok());
+            let reset = header("x-ratelimit-reset-after").as_deref().and_then(seconds_of);
             if let (Some(remaining), Some(reset)) = (remaining, reset) {
                 let window = Window {
                     remaining,
                     resets: Instant::now() + Duration::from_secs_f64(reset.clamp(0., 3600.)),
                 };
-                self.windows.lock().unwrap().insert(route.clone(), window);
+                crate::hub::lock(&self.windows).insert(route.clone(), window);
             }
             let status = response.status().as_u16();
             let text = response.body_mut().read_to_string().unwrap_or_default();
@@ -434,10 +440,10 @@ impl Rest {
                     }
                     let until = Instant::now() + Duration::from_secs_f64(limit.wait.min(3600.));
                     if limit.global {
-                        *self.everything_waits.lock().unwrap() = Some(until);
+                        *crate::hub::lock(&self.everything_waits) = Some(until);
                     }
                     let window = Window { remaining: 0, resets: until };
-                    self.windows.lock().unwrap().insert(route.clone(), window);
+                    crate::hub::lock(&self.windows).insert(route.clone(), window);
                     if waited || limit.wait > PATIENCE || self.paused().is_some() {
                         return Err(Refused::Limited(limit.wait));
                     }
@@ -486,6 +492,14 @@ mod tests {
         let shared = limit(&json!({"retry_after": 0.5, "global": false}), headers(&[("x-ratelimit-scope", "shared")]));
         assert_eq!((shared.wait, shared.global, shared.shared), (0.5, false, true));
         assert!(limit(&json!({"retry_after": 1.0, "global": true}), headers(&[])).global);
+        // A header that is not a number of seconds is no wait at all, and never panics.
+        for odd in ["NaN", "inf", "-inf", " nan "] {
+            assert_eq!(seconds_of(odd), None, "{odd}");
+            let odd = limit(&Value::Null, move |name: &str| (name == "retry-after").then(|| odd.to_owned()));
+            assert!(odd.wait.is_finite());
+            let _ = Duration::from_secs_f64(odd.wait.min(3600.));
+        }
+        assert_eq!(seconds_of(" 1.5 "), Some(1.5));
     }
 
     #[test]

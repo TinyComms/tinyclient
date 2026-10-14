@@ -1,13 +1,13 @@
 //! Sample data for looking at the shell with no account signed in. Everything here is invented.
 //!
 //! ```text
-//! TINYCHAT_DIR=/tmp/tinychat-demo chatd --seed-demo            # the data, then serve it
-//! TINYCHAT_DIR=/tmp/tinychat-demo chatd --seed-demo=expired    # one Slack workspace is Expired
-//! TINYCHAT_DIR=/tmp/tinychat-demo chatd --seed-demo=live       # and things keep happening
-//! TINYCHAT_DIR=/tmp/tinychat-demo chatd --seed-demo=live,expired
-//! TINYCHAT_DIR=/tmp/tinychat-demo chatd --seed-demo=many         # 50 Discord servers
-//! TINYCHAT_DIR=/tmp/tinychat-demo chatd --seed-demo=attention    # Discord wants a verification
-//! TINYCHAT_DIR=/tmp/tinychat-demo chatd --seed-demo=reconnecting # one Slack workspace is retrying
+//! TINYCHAT_DIR=/tmp/tinyclient-demo chatd --seed-demo            # the data, then serve it
+//! TINYCHAT_DIR=/tmp/tinyclient-demo chatd --seed-demo=expired    # one Slack workspace is Expired
+//! TINYCHAT_DIR=/tmp/tinyclient-demo chatd --seed-demo=live       # and things keep happening
+//! TINYCHAT_DIR=/tmp/tinyclient-demo chatd --seed-demo=live,expired
+//! TINYCHAT_DIR=/tmp/tinyclient-demo chatd --seed-demo=many         # 50 Discord servers
+//! TINYCHAT_DIR=/tmp/tinyclient-demo chatd --seed-demo=attention    # Discord wants a verification
+//! TINYCHAT_DIR=/tmp/tinyclient-demo chatd --seed-demo=reconnecting # one Slack workspace is retrying
 //! ```
 //!
 //! Refused without `TINYCHAT_DIR`, so it can never write to the real store. Each run replaces

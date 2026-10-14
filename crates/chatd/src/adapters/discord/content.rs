@@ -688,7 +688,7 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
             }
         }
         Some(line) if line.is_empty() => {
-            rich.text = if content.is_empty() { "A message tinychat cannot show.".to_owned() } else { content.to_owned() };
+            rich.text = if content.is_empty() { "A message tinyclient cannot show.".to_owned() } else { content.to_owned() };
             message_kind = MessageKind::Unsupported { link: link.clone() };
         }
         Some(line) => {
@@ -732,7 +732,7 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
     {
         // Buttons, menus, or something newer than this build: never a blank row.
         rich.text = if posted.components.is_empty() {
-            "A message tinychat cannot show.".to_owned()
+            "A message tinyclient cannot show.".to_owned()
         } else {
             "Interactive message".to_owned()
         };

@@ -1,0 +1,699 @@
+//! Acting on a message: the toolbar over the row under the pointer, the context menu, the
+//! reaction picker and the delete dialog, and the requests they send. Nothing changes on screen
+//! until chatd says so, except a reaction, which chatd itself shows at once.
+
+use super::emoji::{self, Picker, PickerEvent};
+use super::icons::{icon, Icon};
+use super::rows::Item;
+use super::{Pane, PaneEvent};
+use crate::client::ask;
+use crate::gui::components::{
+    button, fade_in, menu, menu_item, menu_item_danger, menu_separator, modal, modal_body, modal_buttons, popover, tip,
+    ButtonKind,
+};
+use crate::gui::theme::{self, Type};
+use crate::gui::time;
+use gpui::{
+    anchored, deferred, div, point, prelude::*, px, AnyElement, Bounds, ClipboardItem, Context, Div, ElementId, Entity,
+    KeyDownEvent, MouseButton, Pixels, Point, SharedString, Stateful, Subscription, Window,
+};
+use protocol::{ErrorCode, Message, MessageKind, Network, Request, Response, SendState};
+use std::rc::Rc;
+
+/// How far the toolbar rises above its row, and how wide the strip it can occupy is.
+const TOOLBAR_RISE: f32 = 14.;
+const TOOLBAR_REACH: f32 = 320.;
+
+/// The context menu of a message, where the pointer was.
+pub struct Menu {
+    pub message: Rc<Message>,
+    pub at: Point<Pixels>,
+}
+
+/// The reaction picker, open for a message.
+pub struct Picking {
+    pub message: String,
+    pub at: Point<Pixels>,
+    pub picker: Entity<Picker>,
+    _listening: Subscription,
+}
+
+/// What may be done to a message, decided apart from any drawing.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Can {
+    /// It is on the network: the toolbar shows and it can be reacted to.
+    pub act: bool,
+    pub reply: bool,
+    pub thread: bool,
+    pub edit: bool,
+    pub delete: bool,
+    /// Never left: deleting it is local, and it can be sent again.
+    pub unsent: bool,
+}
+
+/// `in_thread`: the row is in the thread pane, where a thread cannot be opened again.
+pub fn can(message: &Message, network: Network, in_thread: bool) -> Can {
+    let sent = message.state == SendState::Sent;
+    let said = matches!(message.kind, MessageKind::Normal | MessageKind::Unsupported { .. }) && !message.deleted;
+    let act = sent && said;
+    let own = message.outgoing && message.kind == MessageKind::Normal && !message.deleted;
+    Can {
+        act,
+        // Slack has no inline reply: its reply is the thread.
+        reply: act && network != Network::Slack,
+        // CONTRACT: a thread can only be opened where one exists. A message with no replies has
+        // no `ThreadSummary`, so nothing names the thread a first reply would start, and
+        // "Reply in thread" cannot be offered on it.
+        thread: sent && message.thread.is_some() && !in_thread,
+        // CONTRACT: nothing says how long a network lets a message be edited, so Edit is offered
+        // on every message of mine and a refusal is the network's answer.
+        edit: sent && own,
+        delete: own,
+        unsent: !sent && message.outgoing,
+    }
+}
+
+/// Where a message leads in the network's own app, for "Copy link" and "Open in <network>".
+/// An unsupported message names its own; Discord's and Slack's are built from ids, as the
+/// conversation's are (`profile/facts.rs`).
+// CONTRACT: `Message` carries no permalink. Telegram's needs a public username the shell does
+// not hold, and Teams has none, so those offer neither item.
+pub fn message_link(conversation: &protocol::Key, space: Option<&str>, message: &Message) -> Option<String> {
+    if let MessageKind::Unsupported { link } = &message.kind {
+        if !link.is_empty() {
+            return Some(link.clone());
+        }
+    }
+    if message.state != SendState::Sent || message.deleted {
+        return None;
+    }
+    let (channel, id) = (&conversation.id, &message.id);
+    match conversation.network {
+        Network::Discord => {
+            let place = space.unwrap_or("@me");
+            Some(format!("https://discord.com/channels/{place}/{channel}/{id}"))
+        }
+        Network::Slack => space.map(|team| format!("slack://channel?team={team}&id={channel}&message={id}")),
+        Network::Telegram | Network::Teams => None,
+    }
+}
+
+fn tool(id: impl Into<ElementId>, child: impl IntoElement) -> Stateful<Div> {
+    div()
+        .id(id)
+        .w(px(26.))
+        .h(px(24.))
+        .flex_none()
+        .rounded(px(theme::R_CONTROL))
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .hover(|style| style.bg(theme::selected()))
+        .active(|style| style.bg(theme::pressed()))
+        // A press here is not a press on the row under it.
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .child(child)
+}
+
+fn glyph_of(emoji: &str) -> Div {
+    div().text_size(px(15.)).line_height(px(20.)).child(SharedString::from(emoji.to_owned()))
+}
+
+impl Pane {
+    fn network(&self) -> Network {
+        self.open.as_ref().map_or(Network::Discord, |open| open.key.network)
+    }
+
+    pub(super) fn can(&self, message: &Message) -> Can {
+        can(message, self.network(), self.is_thread())
+    }
+
+    // The pointer.
+
+    /// Notes which message the pointer is over. Drawn again only when that changes.
+    pub(super) fn point_at(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        // A menu or the picker belongs to a message: the toolbar stays with it.
+        if self.menu.is_some() || self.picker.is_some() || self.confirm.is_some() || self.viewer.is_some() {
+            return;
+        }
+        #[cfg(feature = "gui-shot")]
+        if self.script.holds_hover() {
+            return;
+        }
+        let viewport = self.list.viewport_bounds();
+        let over = viewport.contains(&position).then(|| {
+            let seen = self.seen.borrow();
+            let row = |bounds: &Bounds<Pixels>| bounds.contains(&position);
+            // The toolbar rises over the row above; the pointer on it is still on its own row.
+            let held = self.hover.as_ref().and_then(|id| {
+                seen.iter().find(|(ix, bounds)| {
+                    let rise = Bounds::from_corners(
+                        point(bounds.right() - px(TOOLBAR_REACH), bounds.top() - px(TOOLBAR_RISE)),
+                        point(bounds.right(), bounds.top() + px(TOOLBAR_RISE + 8.)),
+                    );
+                    rise.contains(&position) && self.items.get(*ix).and_then(Item::message).is_some_and(|m| m.id == *id)
+                })
+            });
+            let found = held.or_else(|| seen.iter().find(|(_, bounds)| row(bounds)));
+            found.and_then(|(ix, _)| self.items.get(*ix)).and_then(Item::message).filter(|m| self.can(m).act).map(|m| m.id.clone())
+        });
+        let over = over.flatten();
+        if over != self.hover {
+            self.hover = over;
+            cx.notify();
+        }
+    }
+
+    pub(super) fn unpoint(&mut self, cx: &mut Context<Self>) {
+        if self.menu.is_none() && self.picker.is_none() && self.hover.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    // The toolbar.
+
+    /// A menu, picker, dialog, viewer or a window-level layer is up: no toolbar shows.
+    pub(super) fn overlay_up(&self, cx: &Context<Self>) -> bool {
+        let own = self.menu.is_some() || self.picker.is_some() || self.confirm.is_some() || self.viewer.is_some();
+        own || self.shell.upgrade().is_some_and(|shell| {
+            let shell = shell.read(cx);
+            shell.layout_state.menu.is_some() || shell.layout_state.floating || shell.sidebar_state.switcher.is_some() || shell.pane_card_open(cx)
+        })
+    }
+
+    /// The message whose menu, picker or delete dialog is open: its row keeps `selected`.
+    pub(super) fn owns_overlay(&self, id: &str) -> bool {
+        self.menu.as_ref().is_some_and(|menu| menu.message.id == id)
+            || self.picker.as_ref().is_some_and(|picking| picking.message == id)
+            || self.confirm.as_ref().is_some_and(|message| message.id == id)
+    }
+
+    /// The toolbar of the row under the pointer: one instance, straddling the row's top edge.
+    pub(super) fn toolbar(&self, message: &Rc<Message>, cx: &mut Context<Self>) -> Option<AnyElement> {
+        // Not while text is being selected: it would sit under the drag. Never over a menu or
+        // under a scrim (polish/01 §2): the row that owns a menu is lit instead.
+        if self.hover.as_deref() != Some(message.id.as_str()) || self.dragging || self.overlay_up(cx) {
+            return None;
+        }
+        let can = self.can(message);
+        if !can.act {
+            return None;
+        }
+        let mut bar = div()
+            .absolute()
+            .top(px(-TOOLBAR_RISE))
+            .right(px(16.))
+            .h(px(30.))
+            .p(px(2.))
+            .rounded(px(theme::R_CARD))
+            .bg(theme::overlay())
+            .border_1()
+            .border_color(theme::hairline())
+            .shadow(theme::shadow_tooltip())
+            .flex()
+            .items_center()
+            .occlude();
+        for (slot, quick) in emoji::recents(3).into_iter().enumerate() {
+            let (id, react) = (message.id.clone(), quick.clone());
+            let mine = message.reactions.iter().any(|reaction| reaction.mine && reaction.emoji == quick);
+            bar = bar.child(tool(("quick", slot), glyph_of(&quick)).on_click(cx.listener(move |this, _, _, cx| {
+                this.react(&id, &react, !mine, cx);
+            })));
+        }
+        bar = bar.child(div().w(px(1.)).h(px(16.)).mx(px(3.)).bg(theme::hairline()));
+        let id = message.id.clone();
+        bar = bar.child(
+            tool("add", icon(Icon::SmilePlus, 16., theme::text_soft()))
+                .tooltip(tip("Add reaction", None))
+                .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                    this.open_picker(&id, event.position(), window, cx);
+                })),
+        );
+        if can.reply {
+            let reply = message.clone();
+            bar = bar.child(
+                tool("reply", icon(Icon::Reply, 16., theme::text_soft()))
+                    .tooltip(tip("Reply", None))
+                    .on_click(cx.listener(move |this, _, window, cx| this.reply(&reply, window, cx))),
+            );
+        }
+        if can.thread {
+            let root = message.clone();
+            bar = bar.child(
+                tool("thread", icon(Icon::Thread, 16., theme::text_soft()))
+                    .tooltip(tip("Open thread", None))
+                    .on_click(cx.listener(move |_, _, _, cx| cx.emit(PaneEvent::OpenThread(root.clone())))),
+            );
+        }
+        if can.edit {
+            let edit = message.clone();
+            bar = bar.child(
+                tool("edit", icon(Icon::Pencil, 16., theme::text_soft()))
+                    .tooltip(tip("Edit", None))
+                    .on_click(cx.listener(move |this, _, window, cx| this.edit(&edit, window, cx))),
+            );
+        }
+        let more = message.clone();
+        bar = bar.child(
+            tool("more", icon(Icon::More, 16., theme::text_soft()))
+                .tooltip(tip("More", None))
+                .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
+                    this.open_menu(more.clone(), event.position(), cx);
+                })),
+        );
+        Some(bar.into_any_element())
+    }
+
+    // Requests.
+
+    fn say(&self, words: String, cx: &mut Context<Self>) {
+        let _ = self.shell.update(cx, |shell, cx| shell.toast(Some(("icons/circle-alert.svg", theme::danger())), words, cx));
+    }
+
+    /// Sends a request that changes a message and says so if the network refuses. What it
+    /// changed arrives as a `Messages` change, like anything else.
+    fn act(&mut self, request: Request, refused: &'static str, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+            let why = match answer {
+                Ok(Response::Error { code: ErrorCode::Unsupported, .. }) => Some(format!("{refused}: not supported on this network yet.")),
+                Ok(Response::Error { detail, .. }) => Some(format!("{refused}: {detail}")),
+                Ok(_) => None,
+                Err(err) => Some(format!("{refused}: {}", crate::client::trouble_words(&err))),
+            };
+            if let Some(why) = why {
+                let _ = this.update(cx, |this, cx| this.say(why, cx));
+            }
+        })
+        .detach();
+    }
+
+    /// Adds my reaction, or takes it back.
+    pub(super) fn react(&mut self, message_id: &str, emoji: &str, on: bool, cx: &mut Context<Self>) {
+        let Some(conversation) = self.key().cloned() else {
+            return;
+        };
+        if on {
+            emoji::used(emoji);
+        }
+        let request = Request::React { conversation, message_id: message_id.to_owned(), emoji: emoji.to_owned(), on };
+        self.act(request, "Couldn't react", cx);
+        cx.notify();
+    }
+
+    /// A reaction chosen where the message may already carry it: mine toggles off.
+    fn react_toggle(&mut self, message_id: &str, emoji: &str, cx: &mut Context<Self>) {
+        let mine = self.find(message_id).is_some_and(|message| message.reactions.iter().any(|r| r.mine && r.emoji == emoji));
+        self.react(message_id, emoji, !mine, cx);
+    }
+
+    /// Replying and editing happen in the composer, which is the composer's owner's: this
+    /// hands it the message and the caret.
+    pub(super) fn reply(&mut self, message: &Rc<Message>, window: &mut Window, cx: &mut Context<Self>) {
+        let message = message.clone();
+        let _ = self.shell.update(cx, |shell, cx| {
+            shell.composer_reply(&message, cx);
+            shell.composer_focus(window, cx);
+        });
+    }
+
+    pub(super) fn edit(&mut self, message: &Rc<Message>, window: &mut Window, cx: &mut Context<Self>) {
+        let message = message.clone();
+        let _ = self.shell.update(cx, |shell, cx| {
+            shell.composer_edit(&message, cx);
+            shell.composer_focus(window, cx);
+        });
+    }
+
+    /// Deletes for everyone. `at_once` is a Shift-click, which does not ask. A message that
+    /// never left is only ever here, so removing it asks nothing either.
+    pub(super) fn delete(&mut self, message: &Rc<Message>, at_once: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(conversation) = self.key().cloned() else {
+            return;
+        };
+        if message.state != SendState::Sent {
+            let client_id = message.client_id.clone().unwrap_or_else(|| message.id.clone());
+            let _ = self.shell.update(cx, |shell, cx| shell.discard_send(conversation, client_id, cx));
+            return;
+        }
+        if !at_once {
+            self.confirm = Some(message.clone());
+            window.focus(&self.focus, cx);
+            cx.notify();
+            return;
+        }
+        self.confirm = None;
+        self.act(Request::Delete { conversation, message_id: message.id.clone() }, "Couldn't delete", cx);
+        cx.notify();
+    }
+
+    fn copy_text(&mut self, message: &Message, cx: &mut Context<Self>) {
+        let selected = self.selection.as_ref().is_some_and(|selection| selection.message == message.id);
+        let text = selected.then(|| self.selected_text()).flatten().or_else(|| self.message_text(&message.id));
+        if let Some(text) = text {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+    }
+
+    // The menu.
+
+    pub(super) fn open_menu(&mut self, message: Rc<Message>, at: Point<Pixels>, cx: &mut Context<Self>) {
+        self.close_picker(cx);
+        self.hover = Some(message.id.clone());
+        self.menu = Some(Menu { message, at });
+        cx.notify();
+    }
+
+    fn close_menu(&mut self, cx: &mut Context<Self>) {
+        if self.menu.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Where a message leads in the network's own app.
+    fn link_of(&self, message: &Message, cx: &Context<Self>) -> Option<String> {
+        let shell = self.shell.upgrade()?;
+        let shell = shell.read(cx);
+        let open = shell.snapshot.as_ref()?.open.as_ref()?;
+        // A Slack thread's replies are linked in their channel; a Discord thread is a channel.
+        let key = match (&self.open, open.key.network) {
+            (Some(mine), protocol::Network::Discord) => &mine.key,
+            _ => &open.key,
+        };
+        message_link(key, open.space.as_deref(), message)
+    }
+
+    fn menu_layer(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let Menu { message, at } = self.menu.as_ref()?;
+        let can = self.can(message);
+        let network = self.network().label();
+        let mut items = menu().w(px(248.));
+        let then = |act: fn(&mut Pane, &Rc<Message>, &gpui::ClickEvent, &mut Window, &mut Context<Pane>)| {
+            let message = message.clone();
+            cx.listener(move |this: &mut Pane, event: &gpui::ClickEvent, window, cx| {
+                this.close_menu(cx);
+                act(this, &message, event, window, cx);
+            })
+        };
+        if can.unsent {
+            // A row that did not go: send it again, copy it, or drop it.
+            if matches!(message.state, SendState::Failed { .. }) {
+                items = items.child(menu_item("retry", Some("icons/refresh-cw.svg"), "Retry", None).on_click(then(
+                    |this, message, _, _, cx| {
+                        let (Some(conversation), client_id) = (this.key().cloned(), message.client_id.clone().unwrap_or_else(|| message.id.clone()))
+                        else {
+                            return;
+                        };
+                        let _ = this.shell.update(cx, |shell, cx| shell.retry_send(conversation, client_id, cx));
+                    },
+                )));
+            }
+            items = items
+                .child(menu_item("copy", Some("icons/copy.svg"), "Copy text", None).on_click(then(|this, message, _, _, cx| this.copy_text(message, cx))))
+                .child(menu_separator())
+                .child(menu_item_danger("delete", Some("icons/trash-2.svg"), "Delete").on_click(then(|this, message, _, window, cx| {
+                    this.delete(message, true, window, cx);
+                })));
+        } else {
+            if can.act {
+                let mut strip = div().h(px(36.)).px(px(2.)).flex().items_center().justify_between();
+                for (slot, quick) in emoji::recents(6).into_iter().enumerate() {
+                    let (id, react) = (message.id.clone(), quick.clone());
+                    strip = strip.child(tool(("menu-quick", slot), glyph_of(&quick).text_size(px(18.))).size(px(32.)).on_click(cx.listener(
+                        move |this, _, _, cx| {
+                            this.close_menu(cx);
+                            this.react_toggle(&id, &react, cx);
+                        },
+                    )));
+                }
+                items = items.child(strip).child(menu_separator());
+            }
+            if can.reply {
+                items = items.child(menu_item("reply", Some("icons/corner-up-left.svg"), "Reply", None).on_click(then(|this, message, _, window, cx| this.reply(message, window, cx))));
+            }
+            if can.thread {
+                items = items.child(menu_item("thread", Some("icons/message-square.svg"), "Open thread", None).on_click(then(
+                    |_, message, _, _, cx| cx.emit(PaneEvent::OpenThread(message.clone())),
+                )));
+            }
+            if can.act {
+                let at = *at;
+                let id = message.id.clone();
+                items = items.child(menu_item("react", Some("icons/smile-plus.svg"), "React", None).on_click(cx.listener(
+                    move |this, _, window, cx| {
+                        this.close_menu(cx);
+                        this.open_picker(&id, at, window, cx);
+                    },
+                )));
+            }
+            if can.edit {
+                items = items.child(menu_item("edit", Some("icons/pencil.svg"), "Edit", None).on_click(then(|this, message, _, window, cx| this.edit(message, window, cx))));
+            }
+            let selected = self.selection.as_ref().is_some_and(|s| s.message == message.id && s.head.is_some());
+            let copy = if selected { "Copy selection" } else { "Copy text" };
+            if !message.text.is_empty() {
+                items = items
+                    .child(menu_separator())
+                    .child(menu_item("copy", Some("icons/copy.svg"), copy, Some("⌘C")).on_click(then(|this, message, _, _, cx| this.copy_text(message, cx))));
+            }
+            if let Some(link) = self.link_of(message, cx) {
+                let open = link.clone();
+                items = items
+                    .child(menu_item("link", Some("icons/link.svg"), "Copy link", None).on_click(cx.listener(move |this, _, _, cx| {
+                        this.close_menu(cx);
+                        cx.write_to_clipboard(ClipboardItem::new_string(link.clone()));
+                    })))
+                    .child(menu_separator())
+                    .child(menu_item("open-in", Some("icons/external-link.svg"), format!("Open in {network}"), None).on_click(cx.listener(
+                        move |this, _, _, cx| {
+                            this.close_menu(cx);
+                            cx.open_url(&open);
+                        },
+                    )));
+            }
+            if can.delete {
+                items = items.child(menu_separator()).child(
+                    menu_item_danger("delete", Some("icons/trash-2.svg"), "Delete…").on_click(then(|this, message, event, window, cx| {
+                        this.delete(message, event.modifiers().shift, window, cx);
+                    })),
+                );
+            }
+        }
+        let items = items.on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_menu(cx)));
+        Some(deferred(anchored().position(*at).snap_to_window().child(fade_in("message-menu", 120, items))).with_priority(1).into_any_element())
+    }
+
+    // The picker.
+
+    pub(super) fn open_picker(&mut self, message_id: &str, at: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_picker(cx);
+        let custom = self.custom_emoji();
+        let picker = cx.new(|cx| Picker::new(custom, window, cx));
+        let listening = cx.subscribe_in(&picker, window, |this, _, event: &PickerEvent, window, cx| {
+            let target = this.picker.as_ref().map(|picking| picking.message.clone());
+            if let (PickerEvent::Picked(emoji), Some(target)) = (event, target) {
+                this.react_toggle(&target, emoji, cx);
+            }
+            this.close_picker(cx);
+            window.focus(&this.focus, cx);
+        });
+        self.hover = Some(message_id.to_owned());
+        self.picker = Some(Picking { message: message_id.to_owned(), at, picker, _listening: listening });
+        cx.notify();
+    }
+
+    pub(super) fn close_picker(&mut self, cx: &mut Context<Self>) {
+        if self.picker.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// The custom emoji this conversation has shown, by `:name:`: what its messages and
+    /// reactions carry.
+    // CONTRACT: no request lists a Space's custom emoji, so the picker offers the ones the
+    // messages held have used, which is where their images are known.
+    fn custom_emoji(&self) -> Vec<(String, protocol::MediaFile)> {
+        let mut found: Vec<(String, protocol::MediaFile)> = Vec::new();
+        let mut add = |name: &str, file: &protocol::MediaFile| {
+            if name.starts_with(':') && !found.iter().any(|(held, _)| held == name) {
+                let mut file = file.clone();
+                file.path = file.path.or_else(|| self.known.get(&file.id).cloned());
+                found.push((name.to_owned(), file));
+            }
+        };
+        for message in &self.window.messages {
+            for span in &message.spans {
+                if let (protocol::Style::Emoji { file }, Some(name)) = (&span.style, message.text.get(span.start as usize..span.end as usize)) {
+                    add(name, file);
+                }
+            }
+            for reaction in &message.reactions {
+                if let Some(file) = &reaction.file {
+                    add(&reaction.emoji, file);
+                }
+            }
+        }
+        found
+    }
+
+    fn picker_layer(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let picking = self.picker.as_ref()?;
+        let panel = popover()
+            .p(px(0.))
+            .max_w(px(emoji::WIDTH))
+            .child(picking.picker.clone())
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_picker(cx)));
+        // Beside the pointer, to its left: the toolbar it came from is at the pane's right edge.
+        let at = point(picking.at.x - px(emoji::WIDTH - 24.), picking.at.y + px(14.));
+        Some(deferred(anchored().position(at).snap_to_window().child(fade_in("picker", 120, panel))).with_priority(1).into_any_element())
+    }
+
+    // The delete dialog.
+
+    fn confirm_layer(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let message = self.confirm.as_ref()?;
+        let open = self.open.as_ref()?;
+        let network = open.key.network.label();
+        let consequence = if open.kind.is_direct() {
+            format!("It is removed for both of you. {network} cannot bring it back.")
+        } else {
+            format!("It is removed for everyone in {}. {network} cannot bring it back.", open.title)
+        };
+        let words = if message.text.is_empty() { "Attachment".to_owned() } else { message.text.clone() };
+        let quoted = div()
+            .mt(px(12.))
+            .p(px(10.))
+            .rounded(px(theme::R_CARD))
+            .bg(theme::raised())
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .child(
+                div()
+                    .flex()
+                    .items_baseline()
+                    .gap(px(8.))
+                    .child(div().type_ui().font_weight(theme::SEMIBOLD).child(if message.outgoing { "You".to_owned() } else { message.sender.name.clone() }))
+                    .child(div().type_micro().text_color(theme::text_faint()).child(time::clock(message.sent))),
+            )
+            .child(div().line_clamp(2).type_ui().text_color(theme::text_soft()).child(words));
+        let target = message.clone();
+        let panel = modal("Delete this message?")
+            .w(px(400.))
+            .child(modal_body(consequence))
+            .child(quoted)
+            .child(
+                modal_buttons()
+                    .child(button("cancel", ButtonKind::Secondary, "Cancel").on_click(cx.listener(|this, _, _, cx| {
+                        this.confirm = None;
+                        cx.notify();
+                    })))
+                    .child(button("delete", ButtonKind::Danger, "Delete").on_click(cx.listener(move |this, _, window, cx| {
+                        this.delete(&target, true, window, cx);
+                    }))),
+            )
+            // A press on the panel is not a press on the scrim behind it.
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+        let size = window.viewport_size();
+        let scrim = div()
+            .id("confirm")
+            .w(size.width)
+            .h(size.height)
+            .bg(theme::scrim())
+            .occlude()
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.confirm = None;
+                    cx.notify();
+                }),
+            )
+            .child(fade_in("confirm-panel", 160, panel));
+        Some(deferred(anchored().position(point(px(0.), px(0.))).child(scrim)).with_priority(1).into_any_element())
+    }
+
+    pub(super) fn action_layers(&self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        [self.menu_layer(cx), self.picker_layer(cx), self.confirm_layer(window, cx)].into_iter().flatten().collect()
+    }
+
+    /// Keys for whatever floats over the messages. True when the key was theirs.
+    pub(super) fn action_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let key = event.keystroke.key.as_str();
+        if let Some(message) = self.confirm.clone() {
+            match key {
+                "enter" => self.delete(&message, true, window, cx),
+                "escape" => {
+                    self.confirm = None;
+                    cx.notify();
+                }
+                _ => {}
+            }
+            return true;
+        }
+        if key == "escape" && (self.menu.is_some() || self.picker.is_some()) {
+            self.close_menu(cx);
+            self.close_picker(cx);
+            return true;
+        }
+        false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_message_link_is_built_from_ids_where_the_network_has_one() {
+        let mut key = protocol::Key { network: Network::Discord, account: "1".into(), id: "C9".into() };
+        let said = Message::plain("M3", "Mara", "hello", 1, false);
+        assert_eq!(message_link(&key, Some("G7"), &said).as_deref(), Some("https://discord.com/channels/G7/C9/M3"));
+        assert_eq!(message_link(&key, None, &said).as_deref(), Some("https://discord.com/channels/@me/C9/M3"));
+        key.network = Network::Slack;
+        assert_eq!(message_link(&key, None, &said), None, "a Slack link needs its workspace");
+        assert_eq!(message_link(&key, Some("T1"), &said).as_deref(), Some("slack://channel?team=T1&id=C9&message=M3"));
+        key.network = Network::Telegram;
+        assert_eq!(message_link(&key, Some("x"), &said), None);
+        // One that never left has no place on the network; an unsupported one names its own.
+        key.network = Network::Discord;
+        let mut pending = said.clone();
+        pending.state = SendState::Pending;
+        assert_eq!(message_link(&key, None, &pending), None);
+        let mut odd = said.clone();
+        odd.kind = MessageKind::Unsupported { link: "https://x.test/1".into() };
+        assert_eq!(message_link(&key, None, &odd).as_deref(), Some("https://x.test/1"));
+    }
+
+    #[test]
+    fn what_a_message_offers_follows_whose_it_is_and_whether_it_left() {
+        let theirs = Message::plain("1", "Mara", "hello", 1, false);
+        let on = can(&theirs, Network::Discord, false);
+        assert_eq!((on.act, on.reply, on.edit, on.delete, on.thread), (true, true, false, false, false));
+        // Slack answers in a thread, never inline.
+        assert!(!can(&theirs, Network::Slack, false).reply);
+
+        let mut mine = Message::plain("2", "Robin", "on it", 2, true);
+        let own = can(&mine, Network::Discord, false);
+        assert!(own.edit && own.delete && !own.unsent);
+        mine.thread = Some(protocol::ThreadSummary { id: "t".into(), replies: 1, last: 3, participants: Vec::new(), unread: 0 });
+        assert!(can(&mine, Network::Discord, false).thread);
+        assert!(!can(&mine, Network::Discord, true).thread, "a thread does not open inside a thread");
+
+        // Not on the network yet: no toolbar, nothing to edit, and deleting is local.
+        mine.state = SendState::Failed { reason: "Slow mode".into() };
+        let failed = can(&mine, Network::Discord, false);
+        assert_eq!((failed.act, failed.edit, failed.delete, failed.unsent), (false, false, true, true));
+
+        // A tombstone and a system line say nothing that can be acted on.
+        let mut gone = Message::plain("3", "Wren", "", 4, true);
+        gone.tombstone();
+        assert_eq!(can(&gone, Network::Discord, false), Can { thread: false, ..Can::default() });
+        let mut joined = Message::plain("4", "Wren", "joined", 5, false);
+        joined.kind = MessageKind::System;
+        assert!(!can(&joined, Network::Discord, false).act);
+    }
+}

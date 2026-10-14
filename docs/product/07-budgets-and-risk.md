@@ -106,18 +106,18 @@ What is known:
   or leaving servers, frequent reconnects, starting new DMs, managing friends, editing the profile.
   Ripcord users reported more false positives from 2021 *(anecdotal)*. Dissent and discordo are
   believed to imitate too *(unverified)*.
-- **tinychat on Discord today is honest and anomalous:** User-Agent `tinychat/x`, IDENTIFY browser
-  `tinychat`, API v10, no super properties, no gateway RESUME (every drop is a fresh IDENTIFY), and
+- **tinyclient on Discord today is honest and anomalous:** User-Agent `tinyclient/x`, IDENTIFY browser
+  `tinyclient`, API v10, no super properties, no gateway RESUME (every drop is a fresh IDENTIFY), and
   up to 20 history fetches at a fixed 600 ms after each connect.
 - **Slack** documents four tiers (1, 20, 50, 100 calls per minute per method), one message per
   second per channel, and 429 with `Retry-After`. Enterprise audit logs raise anomaly events
   including `unexpected_client`, `unexpected_user_agent`, `session_fingerprint` (stale cookie),
   `unexpected_scraping`, `unexpected_api_call_volume` and `excessive_downloads`, and admins can
   reset a user's sessions. Whether an anomaly signs the user out is an org setting *(unverified)*.
-- **tinychat on Slack today changes User-Agent mid-session:** the sign-in helper presents Safari,
-  then chatd uses the same token as `tinychat/x`. That is what `unexpected_user_agent` describes.
+- **tinyclient on Slack today changes User-Agent mid-session:** the sign-in helper presents Safari,
+  then chatd uses the same token as `tinyclient/x`. That is what `unexpected_user_agent` describes.
 
-Honest identification (`tinychat` everywhere) deceives nobody and matches the README, but gives
+Honest identification (`tinyclient` everywhere) deceives nobody and matches the README, but gives
 every user one fingerprint a single server rule can flag, without the fields Discord's system
 weighs. Imitative identification (the web client's User-Agent, properties, build number, API
 version, endpoint set) is what surviving Discord clients do; it is deliberate impersonation, a
@@ -151,7 +151,7 @@ Rules:
 
 ## 6. Disk and privacy
 
-- Everything is under `~/Library/Application Support/tinychat/`: `chat.sqlite` and
+- Everything is under `~/Library/Application Support/tinyclient/`: `chat.sqlite` and
   `media/<network>/` (avatars, thumbnails, custom emoji) as files named by content hash. Sessions
   stay in the keychain. Nothing goes to temp directories; logs hold no message bodies or tokens.
 - Caps: media 500 MB, least recently used evicted; database by the retention rule in section 2.
@@ -166,7 +166,7 @@ Rules:
 1. **Discord identity: honest or imitative?** Imitation is safer for the account; honesty is easier
    to stand behind in a public release. Decide before avatars and presence ship, and never mix.
 2. **Slack identity.** Should chatd present the helper's Safari string (consistent, but hidden from
-   a work admin), or should both say `tinychat`? Google and Okta sign-in may refuse the second.
+   a work admin), or should both say `tinyclient`? Google and Okta sign-in may refuse the second.
 3. **Local search.** Is the network's own search enough, or is an offline index worth the disk?
 4. **Five Slack workspaces** conflicts with "multiple accounts per network" being cut in
    `stories.md`. Which stands?

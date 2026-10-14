@@ -60,6 +60,9 @@ impl Fault {
                 "MESSAGE_DELETE_FORBIDDEN" => "You can't delete this message.".to_owned(),
                 "MESSAGE_ID_INVALID" => "That message is no longer there.".to_owned(),
                 "REACTION_INVALID" | "REACTIONS_TOO_MANY" => "That reaction isn't allowed here.".to_owned(),
+                "SERVICE_NEVER_MUTED" => "Telegram's own account isn't muted from here.".to_owned(),
+                "PEER_NOT_A_GROUP" => "Only a group or a channel can be left.".to_owned(),
+                "PICK_EXPIRED" => "That sticker or GIF is no longer in the picker. Choose it again.".to_owned(),
                 "PEER_FLOOD" => "Telegram is limiting this account for now.".to_owned(),
                 "PEER_ID_INVALID" | "CHANNEL_INVALID" | "CHANNEL_PRIVATE" | "USER_ID_INVALID" => {
                     "Telegram no longer lets this account reach that chat.".to_owned()

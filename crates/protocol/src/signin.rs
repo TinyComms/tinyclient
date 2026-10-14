@@ -1,4 +1,4 @@
-//! A sign-in tinychat draws itself, one step at a time, for a network that has no web page to
+//! A sign-in tinyclient draws itself, one step at a time, for a network that has no web page to
 //! show (Telegram). The shell asks chatd to begin, draws the step it is told, and answers it;
 //! chatd tells the step again whenever it moves on its own (`Change::SignIn`).
 //!
@@ -28,7 +28,7 @@ pub enum SignInProblem {
     /// The network could not be reached.
     Unreachable,
     PhoneInvalid,
-    /// No account uses this number, and tinychat does not create accounts.
+    /// No account uses this number, and tinyclient does not create accounts.
     PhoneUnknown,
     PhoneBanned,
     CodeInvalid,

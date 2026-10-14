@@ -12,6 +12,11 @@ reads or a real fixture shows:
 | `thread.*.json` | `GET /v1/threads/{id}` as mautrix-teams reads it (`members[]`, `properties`) |
 | `users.json` | `fetchShortProfile` values as purple-teams and Squads read them |
 | `presence.json` | `getpresence` items as purple-teams reads them |
+| `messages.activity.json` | The Activity stream (`48:notifications`) as a page of messages whose `properties.activity` names the source thread and message, after the field names the web client reads; shape unverified |
 
 The test's fake (`tests/teams.rs`) replaces Microsoft's hosts in these files with its own
 address, and builds the token, trouter and registrar answers itself.
+
+The chat list also carries an app chat (`28:` partner, not flagged one-to-one, last message
+mine), a meeting chat (`chatType: meeting`, `meetingInformation.subject`) and `lastMessage`
+bodies for previews; `presence.json` an out-of-office colleague (`outOfOfficeNote`).

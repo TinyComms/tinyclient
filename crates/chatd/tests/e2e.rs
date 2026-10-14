@@ -88,7 +88,7 @@ impl Daemon {
         static NEXT: AtomicU32 = AtomicU32::new(0);
         // Short path: a unix socket address holds about 100 bytes.
         let dir = PathBuf::from(format!(
-            "/tmp/tinychat-{}-{}",
+            "/tmp/tinyclient-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
@@ -272,7 +272,7 @@ fn callable(store: &mut Store, id: &str, call: CallSupport) {
     store.upsert_conversation(&key(Network::Teams, id).account(), &row).unwrap();
 }
 
-/// The meeting the call tests join: one tinychat carries itself.
+/// The meeting the call tests join: one tinyclient carries itself.
 fn standup(store: &mut Store) {
     callable(store, "19:standup", CallSupport::Native);
 }
@@ -494,7 +494,7 @@ fn a_call_spawns_mediad_and_ending_it_exits_mediad_while_chat_keeps_answering() 
 }
 
 #[test]
-fn a_call_starts_only_where_tinychat_carries_calls_itself_and_a_refusal_spawns_nothing() {
+fn a_call_starts_only_where_tinyclient_carries_calls_itself_and_a_refusal_spawns_nothing() {
     let chatd = Daemon::start(|store| {
         standup(store);
         callable(store, "huddle", CallSupport::Handoff);
@@ -770,7 +770,7 @@ fn a_row_says_where_it_is_and_a_thread_lives_and_dies_with_its_parent() {
 
     let general = chatd.row(&key(Network::Discord, "C1"));
     assert_eq!((general.space_title.as_str(), general.group_title.as_str()), ("Rustaceans", "Text channels"));
-    assert_eq!(general.subtitle(), "Rustaceans > Text channels · Borrow checker support group");
+    assert_eq!(general.subtitle(), "Rustaceans › Text channels · Borrow checker support group");
     // Two channels of one name are told apart by their Space, in one answer.
     let found = chatd.ask(Request::Find { network: None, query: "gener".into(), limit: 10 });
     let Response::Conversations { conversations, .. } = found else {
@@ -831,7 +831,7 @@ fn an_account_id_that_is_not_one_plain_file_name_is_never_used() {
 
 #[test]
 fn the_sign_in_window_is_told_where_to_open_and_how_it_ended_is_told_apart() {
-    let helper = std::env::temp_dir().join(format!("tinychat-login-{}", std::process::id()));
+    let helper = std::env::temp_dir().join(format!("tinyclient-login-{}", std::process::id()));
     std::fs::create_dir_all(&helper).unwrap();
     // A real executable: Windows will not CreateProcess a shell script.
     let source = helper.join("login.rs");

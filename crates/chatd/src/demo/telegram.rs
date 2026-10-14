@@ -74,10 +74,13 @@ pub fn seed(s: &mut Seeder) -> Fallible<Who> {
     s.store.upsert_people(&account, &[super::person_row(&account, &service, "telegram", "")])?;
     s.store.set_details(&account, &[(SERVICE.to_owned(), PersonDetails { mark: Some(Mark::Verified), ..PersonDetails::default() })])?;
 
+    // A person's call opens in Telegram's own app, as the adapter says of every person's chat;
+    // bots and Telegram's own account have none.
     let direct = |who: &Who, filing: Filing| ConversationRow {
         avatar: who.avatar.as_ref().map(|file| file.id.clone()),
         peer: Some(who.id.clone()),
         filing: Some(filing),
+        call: if who.bot || who.id == SERVICE { protocol::CallSupport::None } else { protocol::CallSupport::Handoff },
         ..ConversationRow::new(who.id.clone(), Direct, who.name.clone())
     };
     let talk = |s: &mut Seeder, row: ConversationRow, lines: &[(usize, i64, &str)]| -> Fallible<(Key, Vec<String>)> {
@@ -115,7 +118,8 @@ pub fn seed(s: &mut Seeder) -> Fallible<Who> {
     ])?;
     talk(s, direct(&cast[HARUTO], Filing::default()), &[(HARUTO, 3000, "Thanks for the lens!"), (usize::MAX, 2990, "Any time.")])?;
     talk(s, direct(&cast[PAVEL], Filing::default()), &[(PAVEL, 12_000, "Long time. Still in Lisbon?")])?;
-    let (rosa, _) = talk(s, direct(&cast[ROSA], Filing { folders: folders(&["family"]), ..Filing::default() }), &[
+    // In two folders: listed, and counted, in both tabs.
+    let (rosa, _) = talk(s, direct(&cast[ROSA], Filing { folders: folders(&["family", "work"]), ..Filing::default() }), &[
         (ROSA, 70, "Sunday lunch at one. Bring bread."),
     ])?;
     s.counts(&rosa, 1, 0, None)?;

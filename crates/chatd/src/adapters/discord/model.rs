@@ -102,6 +102,12 @@ pub struct User {
     pub discriminator: String,
     #[serde(default, deserialize_with = "nullable")]
     pub bot: bool,
+    /// Discord's own account, which writes the system DMs.
+    #[serde(default, deserialize_with = "nullable")]
+    pub system: bool,
+    /// Our own plan, on READY's user: 0 none, 1 Nitro Classic, 2 Nitro, 3 Nitro Basic.
+    #[serde(default, deserialize_with = "nullable")]
+    pub premium_type: u8,
     /// Present on the users of a message's `mentions`.
     #[serde(default)]
     pub member: Option<Box<Member>>,
@@ -279,6 +285,12 @@ pub struct Channel {
     /// Our own membership of a thread, present when we are in it.
     #[serde(default)]
     pub member: Option<IgnoredAny>,
+    /// A DM from someone who is not a friend, waiting behind Message Requests, and one Discord
+    /// judged spam.
+    #[serde(default, deserialize_with = "nullable")]
+    pub is_message_request: bool,
+    #[serde(default, deserialize_with = "nullable")]
+    pub is_spam: bool,
 }
 
 /// What is kept of a server's channel between connects, in a note: enough to work out again
@@ -386,6 +398,56 @@ pub struct Guild {
     pub voice_states: Vec<VoiceState>,
     #[serde(default)]
     pub unavailable: Option<bool>,
+    /// The server's own emoji and stickers, top-level even when the rest is in `properties`.
+    #[serde(default, deserialize_with = "nullable")]
+    pub emojis: Vec<GuildEmoji>,
+    #[serde(default, deserialize_with = "nullable")]
+    pub stickers: Vec<GuildSticker>,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+pub struct GuildEmoji {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default, deserialize_with = "nullable")]
+    pub name: String,
+    #[serde(default, deserialize_with = "nullable")]
+    pub animated: bool,
+    /// False once the server lost the boosts that paid for it.
+    #[serde(default = "yes", deserialize_with = "nullable_yes")]
+    pub available: bool,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+pub struct GuildSticker {
+    pub id: String,
+    #[serde(default, deserialize_with = "nullable")]
+    pub name: String,
+    /// 1 PNG, 2 APNG, 3 Lottie, 4 GIF.
+    #[serde(default, deserialize_with = "nullable")]
+    pub format_type: u8,
+    #[serde(default = "yes", deserialize_with = "nullable_yes")]
+    pub available: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// A flag that is on unless it says otherwise.
+fn nullable_yes<'de, D: Deserializer<'de>>(de: D) -> Result<bool, D::Error> {
+    Ok(Option::<bool>::deserialize(de)?.unwrap_or(true))
+}
+
+/// A sticker's picture from the media proxy, registered as a message shows it (`content.rs`), so
+/// the picker and a sent sticker share one file. `None` for a Lottie one, which has no still.
+pub fn sticker(id: &str, format: u8) -> Option<(MediaFile, String)> {
+    let (kind, url) = match format {
+        1 | 2 => (MediaKind::Image, format!("{}/stickers/{id}.png?size=160", media())),
+        4 => (MediaKind::Gif, format!("{}/stickers/{id}.gif", media())),
+        _ => return None,
+    };
+    Some((sized(format!("sticker:{id}"), kind, 160), url))
 }
 
 impl Guild {
@@ -482,7 +544,26 @@ pub struct ChannelOverride {
     pub muted: bool,
     #[serde(default)]
     pub mute_config: Option<MuteConfig>,
+    /// 0 all, 1 mentions, 2 nothing, 3 as the server says.
+    #[serde(default = "inherit", deserialize_with = "nullable_inherit")]
+    pub message_notifications: u8,
+    /// `OPT_IN_ENABLED` and the like.
+    #[serde(default, deserialize_with = "nullable")]
+    pub flags: u32,
 }
+
+fn inherit() -> u8 {
+    3
+}
+
+fn nullable_inherit<'de, D: Deserializer<'de>>(de: D) -> Result<u8, D::Error> {
+    Ok(Option::<u8>::deserialize(de)?.unwrap_or(3))
+}
+
+/// Guild settings flags: the user turned "Show all channels" off, so only opted-in ones show.
+pub const OPT_IN_CHANNELS_ON: u32 = 1 << 14;
+/// Channel override flags: this channel (or category) is opted in.
+pub const OPT_IN_ENABLED: u32 = 1 << 12;
 
 #[derive(Deserialize, Clone, Debug)]
 pub struct GuildSettings {
@@ -499,6 +580,13 @@ pub struct GuildSettings {
     pub suppress_roles: bool,
     #[serde(default, deserialize_with = "nullable")]
     pub channel_overrides: Vec<ChannelOverride>,
+    #[serde(default, deserialize_with = "nullable")]
+    pub hide_muted_channels: bool,
+    #[serde(default, deserialize_with = "nullable")]
+    pub flags: u32,
+    /// 0 all, 1 mentions, 2 nothing.
+    #[serde(default, deserialize_with = "nullable")]
+    pub message_notifications: u8,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -507,6 +595,12 @@ pub struct Activity {
     pub kind: u8,
     #[serde(default)]
     pub state: Option<String>,
+    /// The game, the service, the show.
+    #[serde(default, deserialize_with = "nullable")]
+    pub name: String,
+    /// A custom status's emoji: a Unicode one has no id.
+    #[serde(default)]
+    pub emoji: Option<Emoji>,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -550,6 +644,36 @@ impl PresenceUpdate {
         let custom = self.activities.iter().find(|activity| activity.kind == 4);
         custom.and_then(|activity| activity.state.as_deref()).unwrap_or("")
     }
+
+    /// The custom status's emoji when it is a Unicode one; a server's own has no glyph to show.
+    pub fn emoji(&self) -> &str {
+        let custom = self.activities.iter().find(|activity| activity.kind == 4);
+        let emoji = custom.and_then(|activity| activity.emoji.as_ref()).filter(|emoji| emoji.id.is_none());
+        emoji.and_then(|emoji| emoji.name.as_deref()).unwrap_or("")
+    }
+
+    /// What they are doing, as the first activity that is not the custom status says.
+    pub fn doing(&self) -> Option<protocol::Activity> {
+        use protocol::ActivityKind::*;
+        self.activities.iter().find_map(|activity| {
+            let kind = match activity.kind {
+                0 => Playing,
+                1 => Streaming,
+                2 => Listening,
+                3 => Watching,
+                5 => Competing,
+                _ => return None,
+            };
+            let mut doing = protocol::Activity {
+                kind,
+                name: activity.name.clone(),
+                place: String::new(),
+                conversation: None,
+            };
+            doing.bound();
+            Some(doing)
+        })
+    }
 }
 
 #[derive(Deserialize, Clone, Debug, Default)]
@@ -570,6 +694,10 @@ pub struct VoiceState {
     pub mute: bool,
     #[serde(default, deserialize_with = "nullable")]
     pub deaf: bool,
+    #[serde(default, deserialize_with = "nullable")]
+    pub self_stream: bool,
+    #[serde(default, deserialize_with = "nullable")]
+    pub self_video: bool,
     #[serde(default)]
     pub member: Option<Member>,
 }
@@ -804,6 +932,21 @@ fn nonce<'de, D: Deserializer<'de>>(de: D) -> Result<Option<String>, D::Error> {
 pub struct ProfileText {
     #[serde(default, deserialize_with = "nullable")]
     pub bio: String,
+    #[serde(default, deserialize_with = "nullable")]
+    pub pronouns: String,
+    #[serde(default)]
+    pub accent_color: Option<u32>,
+}
+
+/// Their membership of the server asked about (`guild_id` on the profile request).
+#[derive(Deserialize, Default)]
+pub struct ProfileMember {
+    #[serde(default)]
+    pub nick: Option<String>,
+    #[serde(default, deserialize_with = "nullable")]
+    pub roles: Vec<String>,
+    #[serde(default)]
+    pub joined_at: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -820,6 +963,8 @@ pub struct Profile {
     pub user_profile: Option<ProfileText>,
     #[serde(default, deserialize_with = "nullable")]
     pub mutual_guilds: Vec<MutualGuild>,
+    #[serde(default)]
+    pub guild_member: Option<ProfileMember>,
 }
 
 impl Profile {

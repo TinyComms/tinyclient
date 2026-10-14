@@ -219,7 +219,7 @@ pub fn closed(code: Option<u16>) -> Closed {
         None | Some(..4000) | Some(4015) => Closed::Resume,
         Some(4017) => Closed::Fatal(
             CallFailure::Encryption,
-            "Discord raised its encryption requirement. Update tinychat, or take this call in Discord.",
+            "Discord raised its encryption requirement. Update tinyclient, or take this call in Discord.",
         ),
         Some(4014) => Closed::Removed,
         Some(4022) => Closed::Ended,
@@ -227,7 +227,7 @@ pub fn closed(code: Option<u16>) -> Closed {
         Some(4009) => Closed::Fatal(CallFailure::Lost, "The voice session timed out. Call again to rejoin."),
         Some(4016) => Closed::Fatal(
             CallFailure::Encryption,
-            "Discord and this tinychat share no way to encrypt call audio. Update tinychat, or take this call in Discord.",
+            "Discord and this tinyclient share no way to encrypt call audio. Update tinyclient, or take this call in Discord.",
         ),
         Some(4021) => Closed::Fatal(
             CallFailure::Refused,

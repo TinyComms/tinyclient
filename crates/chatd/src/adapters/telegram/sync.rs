@@ -2,23 +2,33 @@
 //! forum's topics, a channel's sponsored message. Everything goes to the store as it is read.
 
 use super::content::{self, Mapped, Want};
+use super::filing::{self, Cursor, Facts, Filed};
 use super::peers::{thread_id, Known, Who};
 use super::wire::Fault;
-use super::{presence, Account, PAGE, SPACE};
-use crate::store::{ConversationRow, SpaceRow};
+use super::{presence, Account, PAGE};
+use crate::store::{ConversationRow, Filing, PreviewLine};
 use grammers_tl_types as tl;
-use protocol::{CallSupport, Card, ConversationKind, Group, MediaFile, MediaKind, Message, Relation, ReplyTo, Span, Style};
+use protocol::{CallSupport, Capabilities, Card, ConversationKind, EmojiScope, MediaFile, MediaKind, Message, Relation, ReplyTo, Span, Special, Style, Watching};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-/// Chats read at sign-on, a hundred a request. Older ones appear when something happens in them.
+/// Pages of the main list read at sign-on, a hundred chats each: the newest 500. The rest are
+/// read a page at a time as the list is scrolled to the end of what is loaded.
 const DIALOG_PAGES: usize = 5;
-/// Chats whose pictures are fetched at sign-on: about what the first screen of the Inbox shows.
-const FIRST_SCREEN: usize = 40;
+const ARCHIVE_PAGES: usize = 1;
+/// How close to the end of the loaded list a row on screen asks for the next page.
+const NEAR_END: usize = 30;
 /// Topics read when a forum is opened.
 const TOPICS: i32 = 50;
 /// A `HistoryAfter` for the same place is not asked again within this long.
 const AFTER_FRESH: Duration = Duration::from_secs(60);
+/// Telegram's own rule: a channel's sponsored messages are asked again at most this often.
+const ADS_FRESH: Duration = Duration::from_secs(300);
+/// Rows whose newest message is fetched for one `Previews`, and the pause between them.
+const PREVIEWS: usize = 20;
+const PREVIEW_PACE: Duration = Duration::from_secs(1);
+/// Telegram's own account, which sends login codes.
+pub(super) const SERVICE: i64 = 777_000;
 
 fn now() -> i64 {
     crate::hub::now()
@@ -56,22 +66,36 @@ fn kind(who: Who, known: &Known) -> ConversationKind {
     }
 }
 
+/// A chat's row. Telegram has no Spaces: the row has none, and its filing is the caller's.
 fn row(account: &Account, who: Who, known: &Known) -> ConversationRow {
     let mut row = ConversationRow::new(who.text(), kind(who, known), known.name.clone());
-    if who == Who::User(account.me) {
-        row.title = "Saved Messages".to_owned();
-    }
-    row.space = Some(SPACE.to_owned());
     row.avatar = known.avatar();
-    // Every Telegram chat is in the Inbox, channels included.
-    row.listed = true;
     row.read_only = known.read_only;
-    if let Who::User(id) = who {
-        row.peer = Some(who.text());
-        // Calls are a later stage: until then a person's call opens in Telegram's own app.
-        if id != account.me && !known.bot && !known.deleted {
-            row.call = CallSupport::Handoff;
+    row.mark = known.mark;
+    row.bot = known.bot;
+    // People, bots, groups and the service chat are the Inbox's; a broadcast channel only when
+    // the user stars it.
+    row.listed = !(matches!(who, Who::Channel(_)) && known.broadcast);
+    match who {
+        Who::User(id) if id == account.me => {
+            // Saved Messages: the user's own notes, with no presence and no call.
+            row.title = "Saved Messages".to_owned();
+            row.special = Special::Saved;
         }
+        Who::User(SERVICE) => {
+            // Telegram's own account: read-only, never a call.
+            row.special = Special::Service;
+            row.read_only = true;
+            row.peer = Some(who.text());
+        }
+        Who::User(_) => {
+            row.peer = Some(who.text());
+            // Calls are a later stage: until then a person's call opens in Telegram's own app.
+            if !known.bot && !known.deleted {
+                row.call = CallSupport::Handoff;
+            }
+        }
+        _ => {}
     }
     row
 }
@@ -92,12 +116,24 @@ pub(super) fn ensure_row(account: &Account, who: Who, topic: Option<i32>) -> boo
     let Some(known) = account.dir().get(who).cloned() else {
         return false;
     };
+    let fresh = |account: &Account| {
+        let mut fresh = row(account, who, &known);
+        let filing = {
+            let mut live = account.live();
+            if !live.filed.facts.contains_key(&who) {
+                live.filed.note(who, Facts::default());
+            }
+            live.filed.filing(who, &known)
+        };
+        fresh.filing = Some(filing);
+        fresh
+    };
     if topic.is_none() {
-        return account.ctx.conversation(&row(account, who, &known)).is_ok();
+        return account.ctx.conversation(&fresh(account)).is_ok();
     }
     // A topic nobody has listed yet: the forum is asked once, and a topic it does not list (a
     // new one, heard of before its row) is recorded under a plain name until it does.
-    if !matches!(account.ctx.known(&who.text()), Ok(Some(_))) && account.ctx.conversation(&row(account, who, &known)).is_err() {
+    if !matches!(account.ctx.known(&who.text()), Ok(Some(_))) && account.ctx.conversation(&fresh(account)).is_err() {
         return false;
     }
     let _ = topics(account, who);
@@ -105,13 +141,13 @@ pub(super) fn ensure_row(account: &Account, who: Who, topic: Option<i32>) -> boo
         return true;
     }
     let mut thread = ConversationRow::new(id, ConversationKind::Thread, "Topic");
-    thread.space = Some(SPACE.to_owned());
     thread.parent = Some(who.text());
     thread.root = topic.map(|topic| topic.to_string());
     account.ctx.conversation(&thread).is_ok()
 }
 
-/// A group or channel was renamed, or its picture or our rights in it changed.
+/// A group or channel was renamed, or its picture or our rights in it changed. Its filing is
+/// left as stored.
 pub(super) fn refresh_row(account: &Account, who: Who) {
     let Ok(Some(stored)) = account.ctx.known(&who.text()) else {
         return;
@@ -120,10 +156,31 @@ pub(super) fn refresh_row(account: &Account, who: Who) {
         return;
     };
     let mut fresh = row(account, who, &known);
-    fresh.group = stored.group;
     fresh.position = stored.position;
     fresh.topic = stored.topic;
     let _ = account.ctx.conversation(&fresh);
+}
+
+/// What this account may send, from what Telegram says of it: Premium raises the file size and
+/// the caption, and allows custom emoji.
+fn capabilities(premium: bool) -> Capabilities {
+    Capabilities {
+        // 2 GB, 4 GB with Premium: 4,000 parts of 512 KB, 8,000 with Premium.
+        max_file_bytes: if premium { 4_000 * 1024 * 1024 } else { 2_000 * 1024 * 1024 },
+        max_files: 10,
+        caption_limit: if premium { 4_096 } else { 1_024 },
+        spoiler: true,
+        as_file: true,
+        gifs: true,
+        stickers: true,
+        custom_emoji: if premium { EmojiScope::All } else { EmojiScope::None },
+        silent: true,
+        schedule: true,
+        suppress_embeds: true,
+        reply_ping: false,
+        // Telegram lets a message be edited for 48 hours (unverified for every chat kind).
+        edit_window: 48 * 3_600,
+    }
 }
 
 /// The first requests of a connection: are we still signed in, who are we, what is muted by
@@ -132,8 +189,12 @@ pub(super) fn sign_on(account: &Account) -> Result<(), Fault> {
     account.ask(&tl::functions::updates::GetState {})?;
     let me = account.ask(&tl::functions::users::GetUsers { id: vec![tl::enums::InputUser::UserSelf] })?;
     account.learn(&me, &[]);
-    let name = account.dir().name(Who::User(account.me));
+    let (name, premium) = {
+        let dir = account.dir();
+        (dir.name(Who::User(account.me)), dir.get(Who::User(account.me)).is_some_and(|known| known.premium))
+    };
     let _ = account.ctx.describe(&name, &Who::User(account.me).text());
+    account.ctx.capabilities(capabilities(premium));
     let kinds = [
         tl::enums::InputNotifyPeer::InputNotifyUsers,
         tl::enums::InputNotifyPeer::InputNotifyChats,
@@ -143,16 +204,47 @@ pub(super) fn sign_on(account: &Account) -> Result<(), Fault> {
         let tl::enums::PeerNotifySettings::Settings(settings) = account.ask(&tl::functions::account::GetNotifySettings { peer })?;
         account.live().muted[index] = settings.mute_until.is_some_and(|until| i64::from(until) > now());
     }
-    let _ = account.ctx.spaces(&[SpaceRow { id: SPACE.to_owned(), name: "Telegram".to_owned(), icon: None, position: 0 }]);
     dialogs(account)?;
+    // An earlier build kept every chat in one invented Space. The rows read just now have left
+    // it; what is left (chats past the newest 500) goes with it, and comes back on scroll.
+    let _ = account.ctx.spaces(&[]);
     contacts(account)
 }
 
+/// Telegram's caching hash over a list of numbers (`core.telegram.org/api/offsets`, "Hash
+/// generation"): Telegram answers "not modified" when it matches what it would send.
+pub(super) fn telegram_hash(numbers: impl IntoIterator<Item = i64>) -> i64 {
+    let mut hash: u64 = 0;
+    for number in numbers {
+        hash ^= hash >> 21;
+        hash ^= hash << 35;
+        hash ^= hash >> 4;
+        hash = hash.wrapping_add(number as u64);
+    }
+    hash as i64
+}
+
+/// The hash `contacts.getContacts` takes: the saved count it last answered, then the contacts'
+/// user ids in order.
+pub(super) fn contacts_hash(saved_count: i32, users: &[i64]) -> i64 {
+    let mut ids = users.to_vec();
+    ids.sort_unstable();
+    telegram_hash(std::iter::once(i64::from(saved_count)).chain(ids))
+}
+
+/// Where the hash of the contacts last read is kept.
+const CONTACTS_HASH: &str = "contacts:hash";
+
 /// The contacts, which are the list the user owns on Telegram, and whether each is online.
+/// Asked with the hash of the list last read: an unchanged list costs Telegram nothing, and
+/// what was stored of it stands.
 fn contacts(account: &Account) -> Result<(), Fault> {
-    let tl::enums::contacts::Contacts::Contacts(found) = account.ask(&tl::functions::contacts::GetContacts { hash: 0 })? else {
+    let hash = account.ctx.note(CONTACTS_HASH).and_then(|hash| hash.parse::<i64>().ok()).unwrap_or(0);
+    let tl::enums::contacts::Contacts::Contacts(found) = account.ask(&tl::functions::contacts::GetContacts { hash })? else {
         return Ok(());
     };
+    let ids: Vec<i64> = found.contacts.iter().map(|tl::enums::Contact::Contact(contact)| contact.user_id).collect();
+    account.ctx.set_note(CONTACTS_HASH, &contacts_hash(found.saved_count, &ids).to_string());
     account.learn(&found.users, &[]);
     let mut owned = Vec::with_capacity(found.users.len());
     for user in &found.users {
@@ -165,82 +257,6 @@ fn contacts(account: &Account) -> Result<(), Fault> {
     }
     let _ = account.ctx.relations(&owned);
     Ok(())
-}
-
-/// Which chats a folder holds.
-struct Folder {
-    id: i32,
-    title: String,
-    named: HashSet<Who>,
-    left_out: HashSet<Who>,
-    contacts: bool,
-    strangers: bool,
-    groups: bool,
-    broadcasts: bool,
-    bots: bool,
-}
-
-fn input_who(peer: &tl::enums::InputPeer, me: i64) -> Option<Who> {
-    Some(match peer {
-        tl::enums::InputPeer::PeerSelf => Who::User(me),
-        tl::enums::InputPeer::User(user) => Who::User(user.user_id),
-        tl::enums::InputPeer::Chat(chat) => Who::Group(chat.chat_id),
-        tl::enums::InputPeer::Channel(channel) => Who::Channel(channel.channel_id),
-        _ => return None,
-    })
-}
-
-fn folders(account: &Account) -> Vec<Folder> {
-    let Ok(tl::enums::messages::DialogFilters::Filters(found)) = account.ask(&tl::functions::messages::GetDialogFilters {}) else {
-        return Vec::new();
-    };
-    let whos = |peers: &[tl::enums::InputPeer]| peers.iter().filter_map(|peer| input_who(peer, account.me)).collect::<HashSet<Who>>();
-    let title = |title: &tl::enums::TextWithEntities| {
-        let tl::enums::TextWithEntities::Entities(title) = title;
-        title.text.clone()
-    };
-    let one = |filter: &tl::enums::DialogFilter| match filter {
-        tl::enums::DialogFilter::Filter(filter) => Some(Folder {
-            id: filter.id,
-            title: title(&filter.title),
-            named: whos(&filter.pinned_peers).union(&whos(&filter.include_peers)).copied().collect(),
-            left_out: whos(&filter.exclude_peers),
-            contacts: filter.contacts,
-            strangers: filter.non_contacts,
-            groups: filter.groups,
-            broadcasts: filter.broadcasts,
-            bots: filter.bots,
-        }),
-        tl::enums::DialogFilter::Chatlist(list) => Some(Folder {
-            id: list.id,
-            title: title(&list.title),
-            named: whos(&list.pinned_peers).union(&whos(&list.include_peers)).copied().collect(),
-            left_out: HashSet::new(),
-            contacts: false,
-            strangers: false,
-            groups: false,
-            broadcasts: false,
-            bots: false,
-        }),
-        tl::enums::DialogFilter::Default => None,
-    };
-    found.filters.iter().filter_map(one).collect()
-}
-
-impl Folder {
-    fn holds(&self, who: Who, known: &Known) -> bool {
-        if self.left_out.contains(&who) {
-            return false;
-        }
-        self.named.contains(&who)
-            || match who {
-                Who::User(_) if known.bot => self.bots,
-                Who::User(_) if known.contact => self.contacts,
-                Who::User(_) => self.strangers,
-                Who::Channel(_) if known.broadcast => self.broadcasts,
-                _ => self.groups,
-            }
-    }
 }
 
 /// One page of chats: the dialogs with what they need (their newest messages, the peers).
@@ -289,89 +305,184 @@ fn page(account: &Account, folder: Option<i32>, offset: (i32, i32, tl::enums::In
     Ok(Page { dialogs: dialogs.collect(), newest, more })
 }
 
-/// Reads the chats and writes the Space's tree: pinned first, then a group per folder, the
-/// rest, and the archive.
-// CONTRACT: a row sits under one group, so a chat that is in several folders shows under the
-// first of them only; and the Inbox has no place for Telegram's own pin, which is the "Pinned"
-// group here (a row's `starred` is the user's local pin and is not the adapter's to set).
+/// Reads the chats at sign-on (and again when a default mute changed): the folders first, so
+/// every row is written once with its filing; then the newest 500 of the main list and the
+/// newest of the archive. Each row names its folders, its pin and whether it is archived;
+/// nothing is grouped.
 pub(super) fn dialogs(account: &Account) -> Result<(), Fault> {
-    let mut all: Vec<(tl::types::Dialog, Option<tl::enums::Message>, bool)> = Vec::new();
-    for archived in [false, true] {
-        let mut offset = (0, 0, tl::enums::InputPeer::Empty);
-        for _ in 0..if archived { 1 } else { DIALOG_PAGES } {
-            let mut page = page(account, Some(i32::from(archived)), offset)?;
-            let Some(last) = page.dialogs.last() else {
-                break;
-            };
-            let who = Who::of(&last.peer);
-            let date = match page.newest.get(&(who, last.top_message)) {
-                Some(tl::enums::Message::Message(message)) => message.date,
-                Some(tl::enums::Message::Service(message)) => message.date,
-                _ => 0,
-            };
-            offset = (date, last.top_message, account.input(who).unwrap_or(tl::enums::InputPeer::Empty));
-            let more = page.more;
-            for dialog in std::mem::take(&mut page.dialogs) {
-                let newest = page.newest.remove(&(Who::of(&dialog.peer), dialog.top_message));
-                all.push((dialog, newest, archived));
+    let rules = match filing::ask_rules(account) {
+        Ok(rules) => rules,
+        Err(fault) if fault.flood().is_some() || fault.signed_out() => return Err(fault),
+        Err(_) => Vec::new(),
+    };
+    account.live().filed = Filed { rules, ..Filed::default() };
+    filing::report(account);
+    for (list, pages) in [(0, DIALOG_PAGES), (1, ARCHIVE_PAGES)] {
+        let mut offset = None;
+        for _ in 0..pages {
+            match read_page(account, list, offset)? {
+                Some(next) => offset = Some(next),
+                None => break,
             }
-            if !more || account.ctx.stopped() {
+            if account.ctx.stopped() {
                 break;
             }
         }
     }
-    let folders = folders(account);
-    let mut groups = vec![Group::new("pinned", "Pinned", 0)];
-    groups.extend(folders.iter().enumerate().map(|(at, folder)| Group::new(format!("f{}", folder.id), folder.title.clone(), at as i32 + 1)));
-    groups.push(Group::new("chats", "Chats", folders.len() as i32 + 1));
-    groups.push(Group::new("archived", "Archived", folders.len() as i32 + 2));
-    let mut rows = Vec::with_capacity(all.len());
-    {
-        let dir = account.dir();
-        for (dialog, _, archived) in &all {
-            let who = Who::of(&dialog.peer);
-            let Some(known) = dir.get(who) else {
-                continue;
-            };
-            let mut row = row(account, who, known);
-            let folder = folders.iter().position(|folder| folder.holds(who, known));
-            let (group, order) = match (archived, dialog.pinned, folder) {
-                (true, ..) => ("archived".to_owned(), folders.len() + 2),
-                (false, true, _) => ("pinned".to_owned(), 0),
-                (false, false, Some(at)) => (format!("f{}", folders[at].id), at + 1),
-                (false, false, None) => ("chats".to_owned(), folders.len() + 1),
-            };
-            row.group = Some(group);
-            // Telegram's order within a group is the order it listed the chats in.
-            row.position = (order * 100_000 + rows.len()) as i32;
-            rows.push(row);
-        }
-    }
-    // A group nothing sits under is not drawn.
-    groups.retain(|group| rows.iter().any(|row| row.group.as_deref() == Some(group.id.as_str())));
-    account.ctx.tree(SPACE, &groups, &rows).map_err(|err| Fault::Net(err.to_string()))?;
-    let mut pictures = Vec::new();
-    for (at, (dialog, newest, _)) in all.iter().enumerate() {
+    Ok(())
+}
+
+/// One page of a list (0 the main list, 1 the archive) from `offset`, written row by row.
+/// Answers where the next page starts, if Telegram has one.
+fn read_page(account: &Account, list: usize, offset: Option<Cursor>) -> Result<Option<Cursor>, Fault> {
+    let start = match offset {
+        Some((date, id, who)) => (date, id, account.input(who).unwrap_or(tl::enums::InputPeer::Empty)),
+        None => (0, 0, tl::enums::InputPeer::Empty),
+    };
+    let mut page = page(account, Some(list as i32), start)?;
+    let mut next = None;
+    for dialog in std::mem::take(&mut page.dialogs) {
         let who = Who::of(&dialog.peer);
-        let id = who.text();
-        let mut updated = 0;
-        if let Some(mapped) = newest.as_ref().and_then(|newest| content::map(&account.dir(), newest)) {
-            updated = mapped.message.sent;
-            // A forum's newest message belongs to one of its topics, not to the forum's row.
-            if !account.dir().get(who).is_some_and(|known| known.forum) {
-                let _ = account.ctx.history(&id, std::slice::from_ref(&mapped.message));
-            }
+        let newest = page.newest.remove(&(who, dialog.top_message));
+        let date = match &newest {
+            Some(tl::enums::Message::Message(message)) => message.date,
+            Some(tl::enums::Message::Service(message)) => message.date,
+            _ => 0,
+        };
+        next = Some((date, dialog.top_message, who));
+        record(account, list, &dialog, newest.as_ref());
+    }
+    let next = next.filter(|_| page.more);
+    account.live().filed.ends[list] = next;
+    Ok(next)
+}
+
+/// One dialog to the store: its row with its filing, its newest message, counts, mute and
+/// whether the other side has read my last message.
+fn record(account: &Account, list: usize, dialog: &tl::types::Dialog, newest: Option<&tl::enums::Message>) {
+    let who = Who::of(&dialog.peer);
+    let id = who.text();
+    let Some(known) = account.dir().get(who).cloned() else {
+        return;
+    };
+    let is_muted = muted(account, who, &dialog.notify_settings);
+    let unread = (dialog.unread_count.max(0) as u32).max(u32::from(dialog.unread_mark));
+    let filing = {
+        let mut live = account.live();
+        let filed = &mut live.filed;
+        filed.note(who, Facts { archived: list == 1, muted: is_muted, read: unread == 0 });
+        if !filed.order[list].contains(&who) {
+            filed.order[list].push(who);
         }
-        let unread = (dialog.unread_count.max(0) as u32).max(u32::from(dialog.unread_mark));
-        let read = (dialog.read_inbox_max_id > 0).then(|| dialog.read_inbox_max_id.to_string());
-        let _ = account.ctx.counts(&id, unread, dialog.unread_mentions_count.max(0) as u32, read.as_deref(), updated);
-        let _ = account.ctx.muted(&id, muted(account, who, &dialog.notify_settings));
-        if at < FIRST_SCREEN {
-            pictures.extend(avatar(account, who));
+        // Telegram lists the pins first, in their order.
+        if dialog.pinned && !filed.pins[list].contains(&who) {
+            filed.pins[list].push(who);
+        }
+        filed.filing(who, &known)
+    };
+    let mut fresh = row(account, who, &known);
+    fresh.filing = Some(filing);
+    if account.ctx.conversation(&fresh).is_err() {
+        return;
+    }
+    let mut updated = 0;
+    // The dialog list carries each chat's newest message: that is its preview, for free.
+    if let Some(mapped) = newest.and_then(|newest| content::map(&account.dir(), newest)) {
+        updated = mapped.message.sent;
+        if known.forum {
+            // A forum's newest message belongs to one of its topics; the row shows its line.
+            let line = PreviewLine {
+                id: mapped.message.id.clone(),
+                text: mapped.message.text.clone(),
+                sender: mapped.message.sender.name.clone(),
+                mine: mapped.message.outgoing,
+                sent: mapped.message.sent,
+            };
+            let _ = account.ctx.preview(&id, &line);
+        } else {
+            let _ = account.ctx.history(&id, std::slice::from_ref(&mapped.message));
+        }
+    }
+    let read = (dialog.read_inbox_max_id > 0).then(|| dialog.read_inbox_max_id.to_string());
+    let _ = account.ctx.counts(&id, unread, dialog.unread_mentions_count.max(0) as u32, read.as_deref(), updated);
+    let _ = account.ctx.muted(&id, is_muted);
+    // ✓✓: the other side read my messages up to here. Not for my own notes or a broadcast.
+    if dialog.read_outbox_max_id > 0 && who != Who::User(account.me) && !known.broadcast {
+        let _ = account.ctx.seen(&id, &dialog.read_outbox_max_id.to_string());
+    }
+}
+
+/// What the shell has on screen changed: the pictures of the rows on it are fetched, each once,
+/// and a list scrolled near the end of what is loaded reads its next page.
+pub(super) fn on_screen(account: &Account, watching: &Watching) {
+    let rows: Vec<Who> = watching
+        .rows
+        .iter()
+        .filter(|row| row.account() == account.ctx.account)
+        .filter_map(|row| Who::parse(&row.id))
+        .filter_map(|(who, topic)| topic.is_none().then_some(who))
+        .collect();
+    let mut pictures = Vec::new();
+    for who in &rows {
+        let Some(want) = avatar(account, *who) else {
+            continue;
+        };
+        let mut live = account.live();
+        if live.pictured.len() >= 4_096 {
+            live.pictured.clear();
+        }
+        if live.pictured.insert(want.file.id.clone()) {
+            pictures.push(want);
         }
     }
     account.files.want(pictures);
-    Ok(())
+    for list in 0..2 {
+        let next = {
+            let live = account.live();
+            let order = &live.filed.order[list];
+            let tail = &order[order.len().saturating_sub(NEAR_END)..];
+            live.filed.ends[list].filter(|_| rows.iter().any(|who| tail.contains(who)))
+        };
+        if let Some(next) = next {
+            if let Err(fault) = read_page(account, list, Some(next)) {
+                eprintln!("chatd: Telegram: more chats: {fault}");
+            }
+        }
+    }
+    ads_on_screen(account, watching);
+}
+
+/// Rows on screen with no preview line: each one's newest message, one request a second. A row
+/// read with the dialog list already has its line; these are what that did not cover.
+pub(super) fn previews(account: &Account, ids: &[String]) {
+    for (at, id) in ids.iter().take(PREVIEWS).enumerate() {
+        let Some((who, topic)) = Who::parse(id) else {
+            continue;
+        };
+        // A forum's own row shows its newest topic's line, set with the dialog list.
+        if topic.is_none() && account.dir().get(who).is_some_and(|known| known.forum) {
+            continue;
+        }
+        if at > 0 && account.ctx.pause(PREVIEW_PACE) {
+            return;
+        }
+        let raw = match fetch(account, who, topic, &Around::Newest, 1) {
+            Ok(raw) => raw,
+            Err(fault) => {
+                eprintln!("chatd: Telegram: preview: {fault}");
+                continue;
+            }
+        };
+        let mut mapped: Vec<Mapped> = {
+            let dir = account.dir();
+            raw.iter().filter_map(|message| content::map(&dir, message)).collect()
+        };
+        for one in &mut mapped {
+            finish(account, id, one, &HashMap::new());
+        }
+        let messages: Vec<Message> = mapped.into_iter().map(|one| one.message).collect();
+        let _ = account.ctx.history(id, &messages);
+    }
 }
 
 /// A peer's picture as something to fetch.
@@ -410,19 +521,24 @@ fn topics(account: &Account, forum: Who) -> Result<usize, Fault> {
             tl::enums::Message::Empty(_) => None,
         })
         .collect();
-    let mut count = 0;
+    let (mut count, mut pinned) = (0, 0);
     for (at, topic) in found.topics.iter().enumerate() {
         let tl::enums::ForumTopic::Topic(topic) = topic else {
             continue;
         };
         let id = thread_id(forum, topic.id);
         let mut thread = ConversationRow::new(id.clone(), ConversationKind::Thread, topic.title.clone());
-        thread.space = Some(SPACE.to_owned());
         thread.parent = Some(forum.text());
         thread.root = Some(topic.id.to_string());
         // Pinned topics first, then as Telegram lists them: the most recently active first.
         thread.position = at as i32 - if topic.pinned { TOPICS } else { 0 };
         thread.read_only = topic.closed && !topic.my;
+        // The forum's own pins, in Telegram's order.
+        let pin = topic.pinned.then(|| {
+            pinned += 1;
+            pinned - 1
+        });
+        thread.filing = Some(Filing { pin, ..Filing::default() });
         if account.ctx.conversation(&thread).is_err() {
             continue;
         }
@@ -482,15 +598,15 @@ pub(super) fn finish(account: &Account, conversation: &str, mapped: &mut Mapped,
 }
 
 /// One request for a page of a conversation's messages, newest first as Telegram answers.
-fn fetch(account: &Account, who: Who, topic: Option<i32>, around: &Around) -> Result<Vec<tl::enums::Message>, Fault> {
+fn fetch(account: &Account, who: Who, topic: Option<i32>, around: &Around, limit: i32) -> Result<Vec<tl::enums::Message>, Fault> {
     let peer = account.input(who)?;
     let number = |id: &str| id.parse::<i32>().unwrap_or(0);
-    let (offset_id, add_offset, limit) = match around {
-        Around::Newest => (0, 0, PAGE),
-        Around::Before(id) => (number(id), 0, PAGE),
+    let (offset_id, add_offset) = match around {
+        Around::Newest => (0, 0),
+        Around::Before(id) => (number(id), 0),
         // Telegram counts back from the offset: a negative shift reads forward of it.
-        Around::After(id) => (number(id), -PAGE, PAGE),
-        Around::At(id) => (number(id), -PAGE / 2, PAGE),
+        Around::After(id) => (number(id), -limit),
+        Around::At(id) => (number(id), -limit / 2),
     };
     let answer = match topic {
         // Unverified against a real forum: the General topic (id 1) is read the same way as any
@@ -542,7 +658,7 @@ pub(super) fn history(account: &Account, conversation: &str, around: Around) -> 
         }
         live.after.push_back((conversation.to_owned(), (*after).to_owned(), Instant::now()));
     }
-    let raw = match fetch(account, who, topic, &around) {
+    let raw = match fetch(account, who, topic, &around, PAGE) {
         Ok(raw) => raw,
         Err(fault) => {
             eprintln!("chatd: Telegram: history: {fault}");
@@ -605,13 +721,29 @@ pub(super) fn backfill(account: &Account, conversation: &str) {
 }
 
 /// A channel's sponsored message, which the terms require a client that shows channels to show.
-// CONTRACT: there is no kind for an advertisement and no word of when a row is on screen, so it
-// is a message at the foot of the channel with a card that says "Sponsored", recorded when the
-// channel is opened, and told to Telegram as seen then. The one before it is taken away.
+/// Asked when the channel is opened, at most once in five minutes as Telegram asks; told to
+/// Telegram as viewed once it is on screen (`ads_on_screen`), once for each.
+// CONTRACT: there is no kind for an advertisement, so it is a message at the foot of the
+// channel with a card that says "Sponsored". And nothing tells chatd that the user followed its
+// link (the shell opens the address itself), so `messages.clickSponsoredMessage` is never sent:
+// the terms want it sent on a click. A `Request` naming a clicked message would carry it.
 fn sponsored(account: &Account, channel: Who, conversation: &str, newest: Option<Message>) {
     let Ok(peer) = account.input(channel) else {
         return;
     };
+    {
+        let mut live = account.live();
+        live.ads.retain(|(_, at)| at.elapsed() < ADS_FRESH);
+        if live.ads.iter().any(|(place, _)| place == conversation) {
+            drop(live);
+            ads_on_screen(account, &account.ctx.watching());
+            return;
+        }
+        if live.ads.len() >= 32 {
+            live.ads.remove(0);
+        }
+        live.ads.push((conversation.to_owned(), Instant::now()));
+    }
     let note = format!("sponsored:{conversation}");
     if let Some(old) = account.ctx.note(&note).filter(|old| !old.is_empty()) {
         let _ = account.ctx.deleted(conversation, &old);
@@ -653,6 +785,91 @@ fn sponsored(account: &Account, channel: Who, conversation: &str, newest: Option
             newest.client_id = Some(newest.id.clone());
             let _ = account.ctx.history(conversation, std::slice::from_ref(&newest));
         }
-        let _ = account.ask(&tl::functions::messages::ViewSponsoredMessage { random_id: ad.random_id.clone() });
+        {
+            // The same advertisement asked again later is still told as viewed only once.
+            let mut live = account.live();
+            let viewed = live.shown.iter().any(|(_, random, viewed)| *random == ad.random_id && *viewed);
+            live.shown.push((conversation.to_owned(), ad.random_id.clone(), viewed));
+        }
+        ads_on_screen(account, &account.ctx.watching());
+    }
+}
+
+/// The open conversation is a channel whose sponsored message has not been told as viewed: it
+/// is now, once.
+fn ads_on_screen(account: &Account, watching: &Watching) {
+    let Some(open) = watching.conversation.as_ref().filter(|open| open.account() == account.ctx.account) else {
+        return;
+    };
+    let due: Vec<Vec<u8>> = {
+        let mut live = account.live();
+        if live.shown.len() > 64 {
+            let extra = live.shown.len() - 64;
+            live.shown.drain(..extra);
+        }
+        let mut due = Vec::new();
+        for (place, random, viewed) in live.shown.iter_mut() {
+            if *place == open.id && !*viewed {
+                *viewed = true;
+                due.push(random.clone());
+            }
+        }
+        due
+    };
+    for random_id in due {
+        let _ = account.ask(&tl::functions::messages::ViewSponsoredMessage { random_id });
+    }
+}
+
+/// A list of Telegram's messages as the contract's, for the conversation they are in, and the
+/// pictures they show. Nothing is recorded.
+pub(super) fn mapped(account: &Account, conversation: &str, raw: &[tl::enums::Message]) -> (Vec<Message>, Vec<Want>) {
+    let mut mapped: Vec<Mapped> = {
+        let dir = account.dir();
+        raw.iter().filter_map(|message| content::map(&dir, message)).collect()
+    };
+    let page: HashMap<i32, (String, String, String)> =
+        mapped.iter().map(|one| (one.id, (one.message.sender.id.clone(), one.message.sender.name.clone(), one.message.text.clone()))).collect();
+    let mut wants = Vec::new();
+    for one in &mut mapped {
+        finish(account, conversation, one, &page);
+        wants.append(&mut one.wants);
+    }
+    (mapped.into_iter().map(|one| one.message).collect(), wants)
+}
+
+/// What a `messages.search` answer holds, and the count Telegram keeps for it.
+pub(super) fn searched(account: &Account, answer: tl::enums::messages::Messages) -> (Vec<tl::enums::Message>, Option<u32>) {
+    let (messages, chats, users, count) = match answer {
+        tl::enums::messages::Messages::Messages(page) => {
+            let count = page.messages.len() as u32;
+            (page.messages, page.chats, page.users, Some(count))
+        }
+        tl::enums::messages::Messages::Slice(page) => (page.messages, page.chats, page.users, Some(page.count.max(0) as u32)),
+        tl::enums::messages::Messages::ChannelMessages(page) => (page.messages, page.chats, page.users, Some(page.count.max(0) as u32)),
+        tl::enums::messages::Messages::NotModified(_) => (Vec::new(), Vec::new(), Vec::new(), None),
+    };
+    account.learn(&users, &chats);
+    (messages, count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_contacts_hash_is_telegrams_over_the_saved_count_and_the_sorted_ids() {
+        assert_eq!(telegram_hash([]), 0);
+        assert_eq!(telegram_hash([5]), 5);
+        // One more step by hand: 5 shifted and folded, then 7 added.
+        let mut hash: u64 = 5;
+        hash ^= hash >> 21;
+        hash ^= hash << 35;
+        hash ^= hash >> 4;
+        assert_eq!(telegram_hash([5, 7]), hash.wrapping_add(7) as i64);
+        // The order Telegram listed them in does not matter; the saved count does.
+        assert_eq!(contacts_hash(2, &[30, 10]), contacts_hash(2, &[10, 30]));
+        assert_ne!(contacts_hash(2, &[10, 30]), contacts_hash(3, &[10, 30]));
+        assert_ne!(contacts_hash(1, &[10]), 0);
     }
 }

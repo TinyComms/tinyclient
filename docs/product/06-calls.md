@@ -87,8 +87,8 @@ Each check is observable from outside the process. "Peer" is a second account on
 14. I turn my camera on, and I see the active speaker's camera when nobody is sharing.
     *Check:* peer sees my video; at most one speaker decode exists and it follows `speaking`.
 
-**When tinychat can't**
-15. On a network or call type tinychat does not carry, the button says so and takes me there.
+**When tinyclient can't**
+15. On a network or call type tinyclient does not carry, the button says so and takes me there.
     *Check:* label reads "Open in Teams" (never "Call"); pressing it opens the official app on that call or meeting; no mediad; `status` never reports a call.
 16. If a call fails I'm told why, in words, and offered the official app.
     *Check:* killing the network mid-join yields a named reason ("Discord refused the voice connection") within 10 s and no leftover mediad.

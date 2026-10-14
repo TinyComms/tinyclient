@@ -1,6 +1,6 @@
 # Polish 03 · Telegram lists
 
-Owner of Telegram inside tinychat. Telegram is one flat chat list with folders as *filters*; it is
+Owner of Telegram inside tinyclient. Telegram is one flat chat list with folders as *filters*; it is
 not servers with channels. **[C]** read in our code, **[V]** checked at source this pass (Telegram
 API terms), **[U]** from memory of the official apps, confirm on the live account.
 
@@ -52,7 +52,7 @@ API terms), **[U]** from memory of the official apps, confirm on the live accoun
 | Channel | round photo | megaphone glyph only when no photo | text, no sender | read-only unless I may post | none | sponsored, views, comments |
 | Forum | round photo | topics glyph | "Topic › Sender: text" | per topic | none | drills into topics |
 | Saved Messages | bookmark tile | none | text | yes | none | no presence, pinned by default [U] |
-| Service 777000 | Telegram logo | verified ✓ | text, codes shown | read-only | none | never muted by tinychat |
+| Service 777000 | Telegram logo | verified ✓ | text, codes shown | read-only | none | never muted by tinyclient |
 | Secret chat | n/a | | | | | not visible to this client at all |
 | Scam / fake | photo | red "Scam" / "Fake" tag, always | | | | from the user/channel flags, free |
 
@@ -126,7 +126,7 @@ Secret chats are device-bound and never reach us. Rule: when Telegram tells us s
 
 1. A network may have **no Spaces**: its home is a flat recency list of its conversations.
 2. A conversation carries **its folders** (a set), **archived**, and **the network's pin** with its
-   order in All and per folder, separate from tinychat's local star.
+   order in All and per folder, separate from tinyclient's local star.
 3. A **folder** is id, title, order and rules (kinds, contacts, include/exclude, exclude
    muted/read/archived). chatd applies the live rules when it answers and returns folder counts.
 4. A row carries last sender (groups), **read by them** on my last message, unread reactions, a

@@ -28,7 +28,7 @@ fn process_rss_kb(pid: u32) -> u64 {
         String::from_utf8(out.stdout).unwrap().trim().parse().unwrap()
     }
 }
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
@@ -44,6 +44,8 @@ fn pattern(length: usize) -> Vec<u8> {
 struct Files {
     port: u16,
     asked: Arc<Mutex<Vec<String>>>,
+    /// Requests being answered now, and the most there ever were at once.
+    busy: Arc<(AtomicUsize, AtomicUsize)>,
 }
 
 impl Files {
@@ -51,16 +53,29 @@ impl Files {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let asked = Arc::new(Mutex::new(Vec::new()));
-        let log = asked.clone();
+        let busy: Arc<(AtomicUsize, AtomicUsize)> = Arc::default();
+        let (log, load) = (asked.clone(), busy.clone());
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
-                let log = log.clone();
+                let (log, load) = (log.clone(), load.clone());
                 std::thread::spawn(move || {
+                    let now = load.0.fetch_add(1, Ordering::SeqCst) + 1;
+                    load.1.fetch_max(now, Ordering::SeqCst);
                     let _ = Files::answer(stream, &log);
+                    load.0.fetch_sub(1, Ordering::SeqCst);
                 });
             }
         });
-        Files { port, asked }
+        Files { port, asked, busy }
+    }
+
+    /// The most requests that were ever being answered at once.
+    fn most_at_once(&self) -> usize {
+        self.busy.1.load(Ordering::SeqCst)
+    }
+
+    fn asked(&self) -> Vec<String> {
+        self.asked.lock().unwrap().clone()
     }
 
     fn url(&self, path: &str) -> String {
@@ -71,8 +86,9 @@ impl Files {
         self.asked.lock().unwrap().len()
     }
 
-    /// `/bytes/N` is N bytes with a length; `/chunked/N` is N bytes without one; `/page` is a
-    /// sign-in page; anything else is not there.
+    /// `/bytes/N` is N bytes with a length; `/slow/N` the same after 600 ms; `/cdn/...` a small
+    /// picture; `/chunked/N` is N bytes without one; `/page` is a sign-in page; anything else is
+    /// not there.
     fn answer(stream: TcpStream, log: &Mutex<Vec<String>>) -> std::io::Result<()> {
         let mut reader = BufReader::new(stream);
         let mut request = String::new();
@@ -85,7 +101,15 @@ impl Files {
         log.lock().unwrap().push(path.clone());
         let mut stream = reader.into_inner();
         let (kind, length) = path.trim_start_matches('/').split_once('/').unwrap_or((&path[1..], "0"));
-        let length: usize = length.parse().unwrap_or(0);
+        let length = length.split('?').next().unwrap_or("0");
+        let (kind, length): (&str, usize) = match kind {
+            "slow" => {
+                sleep(Duration::from_millis(600));
+                ("bytes", length.parse().unwrap_or(0))
+            }
+            "cdn" => ("bytes", 300),
+            _ => (kind, length.parse().unwrap_or(0)),
+        };
         let head = "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type:";
         match kind {
             "bytes" => {
@@ -138,14 +162,20 @@ struct Daemon {
 impl Daemon {
     /// A scratch directory holding one account and the files `registered` names.
     fn scratch(registered: &[(MediaFile, String)]) -> PathBuf {
+        Daemon::scratch_with(registered, |_| {})
+    }
+
+    /// The same, and whatever else `seed` puts in the store.
+    fn scratch_with(registered: &[(MediaFile, String)], seed: impl FnOnce(&mut Store)) -> PathBuf {
         static NEXT: AtomicU32 = AtomicU32::new(0);
         // Short path: a unix socket address holds about 100 bytes.
-        let dir = PathBuf::from(format!("/tmp/tinychat-blobs-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        let dir = PathBuf::from(format!("/tmp/tinyclient-blobs-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let mut store = Store::open(&dir.join("chat.sqlite")).unwrap();
         store.set_account(&account(), "Robin", "42").unwrap();
         store.register_media(&account(), registered).unwrap();
+        seed(&mut store);
         dir
     }
 
@@ -516,4 +546,172 @@ fn a_large_download_is_streamed_to_disk_and_not_held_in_memory() {
     let after = chatd.rss_kb();
     assert!(peak < before + 4 * 1024, "RSS rose from {before} KB to {peak} KB during a 20 MB download");
     assert!(after < before + 4 * 1024, "RSS rose from {before} KB to {after} KB after a 20 MB download");
+}
+
+/// Says what the shell has on screen.
+fn watch_rows(chatd: &Daemon, rows: &[&str]) {
+    let rows = rows.iter().map(|id| protocol::Key::new(&account(), *id)).collect();
+    let watching = protocol::Watching { rows, ..protocol::Watching::default() };
+    let answer = chatd.ask(Request::Watch(watching));
+    assert!(matches!(answer, Response::Watching { .. }), "{answer:?}");
+}
+
+#[test]
+fn rows_pictures_are_fetched_four_at_a_time_and_not_once_their_rows_scrolled_away() {
+    let files = Files::start();
+    let rows: Vec<String> = (1..=8).map(|at| format!("c{at}")).collect();
+    let registered: Vec<(MediaFile, String)> = (1..=8).map(|at| (file(&format!("row-{at}"), MediaKind::Avatar), files.url(&format!("/slow/200?row={at}")))).collect();
+    let dir = Daemon::scratch_with(&registered, |store| {
+        for (at, id) in rows.iter().enumerate() {
+            let mut row = chatd::store::ConversationRow::new(id.clone(), protocol::ConversationKind::Direct, format!("Row {}", at + 1));
+            row.avatar = Some(format!("row-{}", at + 1));
+            store.upsert_conversation(&account(), &row).unwrap();
+        }
+    });
+    let chatd = Daemon::start_in(dir, &[]);
+
+    // Eight rows on screen; the shell asks for their pictures in one go. The newest asked go
+    // first, four at once.
+    watch_rows(&chatd, &["c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8"]);
+    let since = chatd.seq();
+    let asked: Vec<String> = (1..=8).map(|at| format!("row-{at}")).collect();
+    assert_eq!(chatd.fetch(&asked.iter().map(String::as_str).collect::<Vec<_>>()).len(), 8);
+    // Then the list scrolls: only the last four rows are on screen.
+    watch_rows(&chatd, &["c5", "c6", "c7", "c8"]);
+    for at in 5..=8 {
+        assert!(chatd.landed(since, &format!("row-{at}")).path.is_some());
+    }
+    sleep(Duration::from_millis(1500));
+    let mut fetched: Vec<String> = files.asked();
+    fetched.sort();
+    assert_eq!(fetched, (5..=8).map(|at| format!("/slow/200?row={at}")).collect::<Vec<_>>(), "nothing for rows that scrolled away");
+    assert_eq!(files.most_at_once(), 4, "four at once, no more");
+
+    // Scrolled back: they are fetched now, still four at most at once.
+    let since = chatd.seq();
+    watch_rows(&chatd, &["c1", "c2", "c3", "c4"]);
+    for at in 1..=4 {
+        assert!(chatd.landed(since, &format!("row-{at}")).path.is_some());
+    }
+    assert_eq!(files.hits(), 8, "each picture once");
+    assert_eq!(files.most_at_once(), 4);
+}
+
+#[test]
+fn picker_previews_live_in_their_own_directory_and_go_when_the_picker_closes() {
+    let files = Files::start();
+    let sticker = chatd::blobs::pick("st-1");
+    let still = chatd::blobs::pick("gif-1");
+    let registered = [
+        (file(&sticker, MediaKind::Image), files.url("/bytes/3000")),
+        (file(&still, MediaKind::Image), files.url("/bytes/4000")),
+        (file("emoji-1", MediaKind::Emoji), files.url("/bytes/500")),
+    ];
+    // A picker counts as closed after 2 s without asking.
+    let chatd = Daemon::start(&registered, &[("TINYCHAT_PICK_IDLE", "2")]);
+    let pick_dir = chatd.dir.join("media/discord/pick/42");
+    let landed = [chatd.fetched(&sticker), chatd.fetched(&still)];
+    for file in &landed {
+        let path = PathBuf::from(file.path.clone().unwrap());
+        assert!(path.starts_with(&pick_dir), "{path:?} is in the picker's directory");
+        assert!(path.exists());
+    }
+    // A custom emoji is not a pick: it stays in the cache.
+    let emoji = PathBuf::from(chatd.fetched("emoji-1").path.unwrap());
+    assert!(emoji.starts_with(chatd.media_dir()));
+
+    until("the picker's files to go once it closed", || !pick_dir.exists());
+    assert!(!chatd.dir.join("media/discord/pick").exists());
+    assert!(emoji.exists(), "the emoji stays");
+    // Opened again: the previews are fetched again, from the network.
+    assert!(chatd.fetched(&sticker).path.is_some());
+    assert_eq!(files.hits(), 4);
+}
+
+/// A gateway that says hello and answers an identify with the READY of Discord's fixture.
+fn discord_gateway() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let gateway = format!("ws://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let address = gateway.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let address = address.clone();
+            std::thread::spawn(move || {
+                let Ok(mut socket) = tungstenite::accept(stream) else {
+                    return;
+                };
+                let _ = socket.send(r#"{"op":10,"d":{"heartbeat_interval":1500}}"#.into());
+                while let Ok(frame) = socket.read() {
+                    let tungstenite::Message::Text(text) = frame else {
+                        continue;
+                    };
+                    let frame: serde_json::Value = serde_json::from_str(text.as_str()).unwrap_or_default();
+                    let answer = match frame["op"].as_u64() {
+                        Some(1) => r#"{"op":11}"#.to_owned(),
+                        Some(2) => {
+                            let ready = include_str!("fixtures/discord/ready.json").replace("{{GATEWAY}}", &address);
+                            format!(r#"{{"op":0,"t":"READY","s":1,"d":{ready}}}"#)
+                        }
+                        _ => continue,
+                    };
+                    if socket.send(answer.into()).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    gateway
+}
+
+#[test]
+fn the_accounts_own_picture_lands_after_it_connects_without_the_shell_asking() {
+    let files = Files::start();
+    let gateway = discord_gateway();
+    // The session's token names user 1000, which the READY says we are.
+    let me = AccountKey {
+        network: Network::Discord,
+        account: "1000".to_owned(),
+    };
+    let dir = Daemon::scratch_with(&[], |store| {
+        store.set_account(&me, "Justin", "1000").unwrap();
+        store.register_media(&me, &[(file("me-pic", MediaKind::Avatar), files.url("/bytes/900"))]).unwrap();
+        let person = chatd::store::PersonRow {
+            id: "1000".to_owned(),
+            name: "Justin".to_owned(),
+            handle: "justin".to_owned(),
+            avatar: Some("me-pic".to_owned()),
+            bot: false,
+            status: String::new(),
+            link: String::new(),
+        };
+        store.upsert_people(&me, &[person]).unwrap();
+    });
+    let session = r#"{"token":"MTAwMA.Zx9aBc.not-a-real-signature"}"#;
+    let chatd = Daemon::start_in(
+        dir,
+        &[
+            ("TINYCHAT_SESSION_DISCORD", session),
+            ("TINYCHAT_DISCORD_API", &files.url("/api")),
+            ("TINYCHAT_DISCORD_GATEWAY", &format!("{gateway}/?encoding=json&v=9")),
+            ("TINYCHAT_DISCORD_CDN", &files.url("/cdn")),
+        ],
+    );
+    // Nothing but `Status` is asked: no `Fetch`.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let (link, avatar) = loop {
+        let Response::Status { accounts, .. } = chatd.ask(Request::Status) else {
+            panic!("status");
+        };
+        let own = accounts.into_iter().find(|status| status.key == me).expect("the account is listed");
+        if own.link == protocol::Link::Connected && own.avatar.as_ref().is_some_and(|avatar| avatar.path.is_some()) {
+            break (own.link, own.avatar.unwrap());
+        }
+        assert!(Instant::now() < deadline, "the own picture did not land: {:?} {:?}", own.link, own.avatar);
+        sleep(Duration::from_millis(100));
+    };
+    assert_eq!(link, protocol::Link::Connected);
+    assert!(Path::new(&avatar.path.unwrap()).exists());
+    let pictures = files.asked().into_iter().filter(|path| path.starts_with("/bytes/") || path.starts_with("/cdn/")).count();
+    assert_eq!(pictures, 1, "the own picture, once");
 }

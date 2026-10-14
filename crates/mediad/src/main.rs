@@ -21,7 +21,7 @@ const DEVICES_EVERY: Duration = Duration::from_secs(2);
 const NO_VIDEO: &str = "Screen sharing and video are not built yet. This call carries voice only.";
 
 /// macOS reads the reason for the microphone prompt from the Info.plist of the process it holds
-/// responsible. Inside `tinychat.app` that is the app, whose Info.plist says it. When mediad is
+/// responsible. Inside `tinyclient.app` that is the app, whose Info.plist says it. When mediad is
 /// responsible for itself (its parents were started by hand and are gone), this copy, in the
 /// section a single-file tool keeps its Info.plist in, is what the system reads; without one
 /// the system kills the process the moment it opens the microphone.

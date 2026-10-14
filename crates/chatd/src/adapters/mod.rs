@@ -34,7 +34,8 @@ use protocol::{
     SendState, SharedItem, SharedKind, Typist, VoiceJoin, Warning, Watching,
 };
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -370,6 +371,9 @@ impl<E: std::fmt::Display> From<E> for Failure {
 #[derive(Default)]
 struct Halt {
     stopped: AtomicBool,
+    /// Panics caught on this adapter's threads. The first is recovered from; the second stops
+    /// the adapter and the account says why.
+    panics: AtomicU32,
     waiting: Mutex<()>,
     wake: Condvar,
 }
@@ -900,14 +904,88 @@ impl Drop for Adapter {
     }
 }
 
+/// What the account says when tinyclient itself failed on it, and stopped trying.
+pub const BROKEN: &str = "Something went wrong in tinyclient with this account. Quit and reopen tinyclient to try again.";
+/// What the account says while it recovers from tinyclient's own failure.
+pub const RECOVERING: &str = "Something went wrong in tinyclient with this account. Trying again.";
+/// The pause before an adapter thread that panicked runs again.
+const PANIC_PAUSE: Duration = if cfg!(test) { Duration::from_millis(20) } else { Duration::from_secs(30) };
+const PANIC_PAUSE_COMMANDS: Duration = if cfg!(test) { Duration::from_millis(20) } else { Duration::from_secs(5) };
+
+impl Context {
+    /// A panic was caught on one of this adapter's threads. Answers true when it is the first
+    /// and the thread should run again after its pause; the second stops the adapter, and the
+    /// account is offline with [`BROKEN`] until the user restarts tinyclient.
+    fn panicked(&self, thread: &str) -> bool {
+        let count = self.stop.panics.fetch_add(1, Ordering::Relaxed) + 1;
+        eprintln!("chatd: {}: the {thread} thread panicked ({count})", self.account.network.label());
+        self.hub.forget_live(&self.account);
+        if count > 1 {
+            self.stop.stopped.store(true, Ordering::Relaxed);
+            drop(self.stop.waiting.lock());
+            self.stop.wake.notify_all();
+            let _ = self.commands.send(Command::Stop);
+            self.hub.set_link(&self.account, Link::Offline, BROKEN);
+            return false;
+        }
+        true
+    }
+}
+
+/// Counts recent drops of connections that had held, so a link that drops every minute backs
+/// off as one that never held does, rather than signing on again every minute for ever. The
+/// count halves every [`DROPS_HALF_LIFE`].
+#[derive(Debug, Default)]
+struct Drops {
+    count: f64,
+    last: Option<Instant>,
+}
+
+const DROPS_HALF_LIFE: Duration = Duration::from_secs(600);
+
+impl Drops {
+    /// One more drop at `now`: the pause before the next attempt. `held` says the connection
+    /// was up longer than a minute; `pause` is the last pause, which a connection that never
+    /// held doubles.
+    fn next(&mut self, now: Instant, held: bool, pause: Duration) -> Duration {
+        let since = self.last.map_or(Duration::MAX, |last| now.saturating_duration_since(last));
+        let decay = 0.5f64.powf(since.as_secs_f64() / DROPS_HALF_LIFE.as_secs_f64());
+        self.count = self.count * decay + 1.;
+        self.last = Some(now);
+        if !held {
+            return (pause * 2).min(RETRY_CEILING);
+        }
+        // The first drop in a while retries in a second; each recent one doubles it.
+        let doublings = (self.count.floor() as u32).saturating_sub(1).min(16);
+        Duration::from_secs(1u64 << doublings).min(RETRY_CEILING)
+    }
+}
+
 /// Keeps one connection up: reconnects with a growing pause, and gives up only when the network
 /// says the session is no longer valid. Then the account is `Expired`: its session and cache
 /// stay, so what was read stays readable and signing in again replaces the session.
+///
+/// A panic inside `connect` is caught here, at the thread's edge: the account goes offline
+/// with [`RECOVERING`] and connects again after [`PANIC_PAUSE`]; a second panic on this
+/// adapter stops it with [`BROKEN`].
 fn keep_connected(ctx: &Context, mut connect: impl FnMut() -> Failure) {
     let mut pause = Duration::from_secs(1);
+    let mut drops = Drops::default();
     while !ctx.stopped() {
         let began = Instant::now();
-        let failure = connect();
+        let failure = match catch_unwind(AssertUnwindSafe(&mut connect)) {
+            Ok(failure) => failure,
+            Err(_) => {
+                if !ctx.panicked("connection") {
+                    return;
+                }
+                ctx.hub.set_link(&ctx.account, Link::Offline, RECOVERING);
+                if ctx.pause(PANIC_PAUSE) {
+                    return;
+                }
+                continue;
+            }
+        };
         if ctx.stopped() {
             return;
         }
@@ -922,13 +1000,10 @@ fn keep_connected(ctx: &Context, mut connect: impl FnMut() -> Failure) {
                 eprintln!("chatd: {}: {}", ctx.account.network.label(), net::redact(&why));
             }
         }
-        // A connection that held for a while earns a quick retry. One that never holds backs off
-        // to a quarter of an hour: unattended, that is under a hundred sign-ons a day, not 1,400.
-        pause = if began.elapsed() > Duration::from_secs(60) {
-            Duration::from_secs(1)
-        } else {
-            (pause * 2).min(RETRY_CEILING)
-        };
+        // A connection that held for a while earns a quick retry, unless it has been dropping
+        // often. One that never holds backs off to a quarter of an hour: unattended, that is
+        // under a hundred sign-ons a day, not 1,400.
+        pause = drops.next(Instant::now(), began.elapsed() > Duration::from_secs(60), pause);
         ctx.hub.forget_live(&ctx.account);
         ctx.hub.set_offline(&ctx.account, pause <= RECONNECTING);
         // Not on the second: many clients retrying in step is what a network watches for.
@@ -953,6 +1028,10 @@ const FRESH: Duration = Duration::from_secs(60);
 ///
 /// With nothing queued this waits on the inbox and nothing else: no timer, so an idle account
 /// costs no wakeups. Dropping the [`Adapter`] sends `Command::Stop`, which ends it.
+///
+/// A panic while serving one command is caught: that command's reply is dropped (its asker
+/// hears it failed), and the thread serves on after a short pause. A second panic on this
+/// adapter stops it, and the account says why ([`Context::panicked`]).
 pub(crate) fn serve_commands(
     ctx: &Context,
     inbox: Receiver<Command>,
@@ -981,7 +1060,9 @@ pub(crate) fn serve_commands(
         let id = match urgent.pop_front() {
             Some(Command::Backfill(id)) => id,
             Some(command) => {
-                other(command);
+                if catch_unwind(AssertUnwindSafe(|| other(command))).is_err() && (!ctx.panicked("command") || ctx.pause(PANIC_PAUSE_COMMANDS)) {
+                    return;
+                }
                 continue;
             }
             None => match warm.pop_front() {
@@ -992,7 +1073,9 @@ pub(crate) fn serve_commands(
         if fetched.get(&id).is_some_and(|at| at.elapsed() < FRESH) {
             continue;
         }
-        backfill(&id);
+        if catch_unwind(AssertUnwindSafe(|| backfill(&id))).is_err() && (!ctx.panicked("command") || ctx.pause(PANIC_PAUSE_COMMANDS)) {
+            return;
+        }
         fetched.insert(id, Instant::now());
         if ctx.pause(pace) {
             return;
@@ -1078,4 +1161,94 @@ pub(crate) fn local(account: AccountKey, hub: Arc<Hub>) -> (Adapter, Context, Re
         stop: stop.clone(),
     };
     (Adapter { commands, stop }, ctx, inbox)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::Store;
+
+    fn hub() -> Arc<Hub> {
+        Arc::new(Hub::new(Store::open(std::path::Path::new(":memory:")).expect("a store in memory")))
+    }
+
+    fn linked(hub: &Hub, account: &AccountKey) -> (Link, String) {
+        let links = hub.links();
+        let linked = links.iter().find(|linked| linked.account == *account).expect("the account is linked");
+        (linked.link, linked.detail.clone())
+    }
+
+    #[test]
+    fn a_link_that_drops_every_minute_backs_off_and_one_drop_after_a_quiet_hour_does_not() {
+        let t0 = Instant::now();
+        let minute = Duration::from_secs(60);
+        let mut drops = Drops::default();
+        let mut pause = Duration::from_secs(1);
+        let mut pauses = Vec::new();
+        for n in 0..12 {
+            pause = drops.next(t0 + minute * n, true, pause);
+            pauses.push(pause.as_secs());
+        }
+        assert_eq!(pauses[..2], [1, 1], "the first drops retry at once");
+        assert!(pauses.windows(2).all(|pair| pair[1] >= pair[0]), "{pauses:?}");
+        assert!(pauses[11] >= 120, "after twelve drops in twelve minutes it waits minutes: {pauses:?}");
+        // An hour of quiet: the count has decayed, and a drop retries in a second again.
+        let quiet = drops.next(t0 + minute * 80, true, pause);
+        assert!(quiet <= Duration::from_secs(2), "{quiet:?}");
+        // One that never held doubles, up to the ceiling, whatever the count.
+        assert_eq!(drops.next(t0 + minute * 81, false, Duration::from_secs(8)), Duration::from_secs(16));
+        assert_eq!(drops.next(t0 + minute * 82, false, RETRY_CEILING), RETRY_CEILING);
+    }
+
+    #[test]
+    fn a_panicking_command_is_recovered_from_once_and_the_second_stops_the_account_with_words() {
+        let hub = hub();
+        let account = AccountKey { network: Network::Slack, account: "T1".into() };
+        let (adapter, ctx, inbox) = local(account.clone(), hub.clone());
+        ctx.link(Link::Connected);
+        let served = Arc::new(Mutex::new(Vec::new()));
+        let seen = served.clone();
+        let thread_ctx = ctx.clone();
+        let thread = std::thread::spawn(move || {
+            serve_commands(&thread_ctx, inbox, Duration::ZERO, |id| {
+                if id.starts_with("bad") {
+                    panic!("a bug in the adapter");
+                }
+                lock(&seen).push(id.to_owned());
+            }, |_| {})
+        });
+        adapter.command(Command::Backfill("bad1".into()));
+        adapter.command(Command::Backfill("good".into()));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while lock(&served).is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(*lock(&served), ["good"], "the thread served on after the first panic");
+        assert_eq!(linked(&hub, &account), (Link::Connected, String::new()), "one recovered panic leaves the link alone");
+        adapter.command(Command::Backfill("bad2".into()));
+        thread.join().expect("the panic was caught, not carried out of the thread");
+        assert!(ctx.stopped());
+        assert_eq!(linked(&hub, &account), (Link::Offline, BROKEN.to_owned()));
+    }
+
+    #[test]
+    fn a_panicking_connection_says_why_and_is_connected_again_once() {
+        let hub = hub();
+        let account = AccountKey { network: Network::Discord, account: "1".into() };
+        let (_adapter, ctx, _inbox) = local(account.clone(), hub.clone());
+        let mut attempts = 0;
+        let mut said = None;
+        let watch = (hub.clone(), account.clone());
+        keep_connected(&ctx, || {
+            attempts += 1;
+            if attempts == 1 {
+                panic!("a bug in the socket thread");
+            }
+            said = Some(linked(&watch.0, &watch.1));
+            Failure::SignedOut("done".into())
+        });
+        assert_eq!(attempts, 2, "restarted once");
+        assert_eq!(said, Some((Link::Offline, RECOVERING.to_owned())), "while it recovered the account said why");
+        assert_eq!(linked(&hub, &account).0, Link::Expired);
+    }
 }

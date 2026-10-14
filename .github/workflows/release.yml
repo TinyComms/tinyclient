@@ -23,16 +23,16 @@ jobs:
           TINYCHAT_TELEGRAM_API_HASH: ${{ secrets.TINYCHAT_TELEGRAM_API_HASH }}
         run: |
           cargo build --release \
-            -p tinychat --features tinychat/gui \
+            -p tinyclient --features tinyclient/gui \
             -p chatd -p mediad -p login
-      - name: Bundle tinychat.app
+      - name: Bundle tinyclient.app
         run: packaging/bundle.sh --no-build
       - name: Zip app bundle
-        run: ditto -c -k --keepParent target/release/tinychat.app "tinychat-${{ github.ref_name }}-macos.zip"
+        run: ditto -c -k --keepParent target/release/tinyclient.app "tinyclient-${{ github.ref_name }}-macos.zip"
       - uses: actions/upload-artifact@v4
         with:
           name: release-macos
-          path: tinychat-${{ github.ref_name }}-macos.zip
+          path: tinyclient-${{ github.ref_name }}-macos.zip
 
   linux:
     runs-on: ubuntu-latest
@@ -55,16 +55,16 @@ jobs:
           TINYCHAT_TELEGRAM_API_HASH: ${{ secrets.TINYCHAT_TELEGRAM_API_HASH }}
         run: |
           cargo build --release \
-            -p tinychat --features tinychat/gui \
+            -p tinyclient --features tinyclient/gui \
             -p chatd -p mediad -p login
       - name: Pack binaries
         run: |
-          tar -czf "tinychat-${{ github.ref_name }}-linux-x86_64.tar.gz" \
-            -C target/release tinychat chatd mediad tinychat-login
+          tar -czf "tinyclient-${{ github.ref_name }}-linux-x86_64.tar.gz" \
+            -C target/release tinyclient chatd mediad tinyclient-login
       - uses: actions/upload-artifact@v4
         with:
           name: release-linux
-          path: tinychat-${{ github.ref_name }}-linux-x86_64.tar.gz
+          path: tinyclient-${{ github.ref_name }}-linux-x86_64.tar.gz
 
   windows:
     runs-on: windows-latest
@@ -83,21 +83,21 @@ jobs:
           TINYCHAT_TELEGRAM_API_HASH: ${{ secrets.TINYCHAT_TELEGRAM_API_HASH }}
         run: |
           cargo build --release `
-            -p tinychat --features tinychat/gui `
+            -p tinyclient --features tinyclient/gui `
             -p chatd -p mediad -p login
       - name: Pack binaries
         shell: pwsh
         run: |
           Compress-Archive -Path `
-            target/release/tinychat.exe, `
+            target/release/tinyclient.exe, `
             target/release/chatd.exe, `
             target/release/mediad.exe, `
-            target/release/tinychat-login.exe `
-            -DestinationPath "tinychat-${{ github.ref_name }}-windows-x86_64.zip"
+            target/release/tinyclient-login.exe `
+            -DestinationPath "tinyclient-${{ github.ref_name }}-windows-x86_64.zip"
       - uses: actions/upload-artifact@v4
         with:
           name: release-windows
-          path: tinychat-${{ github.ref_name }}-windows-x86_64.zip
+          path: tinyclient-${{ github.ref_name }}-windows-x86_64.zip
 
   publish:
     needs: [macos, linux, windows]

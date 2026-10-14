@@ -191,7 +191,7 @@ fn topic_of(name: &str) -> &'static str {
 type Seat = (usize, bool, bool, bool);
 const VOICES: &[(&str, &[Seat], u32)] = &[
     ("Campfire", &[(INES, false, false, false), (TOMASZ, true, false, false), (WREN, false, false, true)], 3),
-    ("Field recording", &[(ODALYS, true, true, false)], 1),
+    ("Field recording", &[(YUSUF, true, true, false)], 1),
     ("Quiet room", &[], 31),
 ];
 
@@ -313,9 +313,11 @@ fn moss(s: &mut Seeder, account: &AccountKey, cast: &[Who], me: &Who) -> Fallibl
             streaming,
         };
         let mut people: Vec<Occupant> = seats.iter().map(seated).collect();
-        // A full room: everyone we know, and more than a row may name.
-        let filling = cast.iter().take((*total as usize).saturating_sub(people.len()));
-        people.extend(filling.enumerate().map(|(at, _)| seated(&(at, at % 3 == 0, false, false))));
+        // A full room: everyone we know who is not already talking somewhere (a person is in
+        // one voice channel at a time, and Odalys is in a call), and more than a row may name.
+        let busy = |at: usize| at == ODALYS || VOICES.iter().any(|(_, seats, _)| seats.iter().any(|seat| seat.0 == at));
+        let free = (0..cast.len()).filter(|at| !busy(*at)).take((*total as usize).saturating_sub(people.len()));
+        people.extend(free.map(|at| seated(&(at, at % 3 == 0, false, false))));
         s.occupants.push((id_of(channel), Occupants { people, total: *total }));
     }
 

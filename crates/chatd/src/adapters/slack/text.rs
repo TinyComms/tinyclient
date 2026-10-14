@@ -31,7 +31,7 @@ pub struct Rich<'a> {
     pub mentioned: bool,
     /// The text names everyone: `@here`, `@channel`, `@everyone`.
     pub broadcast: bool,
-    /// Blocks tinychat does not draw (buttons, inputs, video) were left out.
+    /// Blocks tinyclient does not draw (buttons, inputs, video) were left out.
     pub undrawn: bool,
 }
 

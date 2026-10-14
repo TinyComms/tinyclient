@@ -27,6 +27,8 @@ use std::sync::{Arc, Weak};
 const WAITING: usize = 256;
 /// Bytes asked for at a time. Telegram wants a multiple of 4096.
 const PIECE: i32 = 256 * 1024;
+/// The least time between two file requests.
+const PACE: std::time::Duration = std::time::Duration::from_millis(250);
 /// The largest picture fetched for a row.
 const LARGEST: u64 = 2 * 1024 * 1024;
 
@@ -174,6 +176,11 @@ fn download(account: &Account, want: &Want, carried: &mut HashSet<i32>, out: &mu
     }
     let mut offset = 0i64;
     loop {
+        // Pictures for a scrolled list are many small requests: paced, never back to back, the
+        // way a busy client still stays well under Telegram's flood limits.
+        if account.ctx.pause(PACE) {
+            return Err(Fault::Net("stopped".to_owned()));
+        }
         let request = tl::functions::upload::GetFile {
             precise: false,
             cdn_supported: false,
@@ -193,7 +200,7 @@ fn download(account: &Account, want: &Want, carried: &mut HashSet<i32>, out: &mu
             Ok(piece) => piece,
         };
         let tl::enums::upload::File::File(piece) = piece else {
-            return Err(Fault::Net("Telegram keeps this file where tinychat cannot fetch it yet".to_owned()));
+            return Err(Fault::Net("Telegram keeps this file where tinyclient cannot fetch it yet".to_owned()));
         };
         out.write_all(&piece.bytes).map_err(|err| Fault::Net(err.to_string()))?;
         offset += piece.bytes.len() as i64;

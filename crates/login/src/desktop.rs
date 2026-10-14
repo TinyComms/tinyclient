@@ -25,7 +25,7 @@ struct State {
 
 fn data_dir(network: &str) -> PathBuf {
     let root = platform_data_root();
-    let dir = root.join("tinychat").join("login").join(network);
+    let dir = root.join("tinyclient").join("login").join(network);
     let _ = std::fs::create_dir_all(&dir);
     dir
 }
@@ -112,7 +112,7 @@ pub fn run(site: Site, at: Option<(f64, f64)>, network: &str) {
                     state.lock().unwrap().current_url = url.clone();
                 }
                 if matches!(event, PageLoadEvent::Finished) && load_failed_message(&url) {
-                    eprintln!("tinychat-login: the page did not load: {url}");
+                    eprintln!("tinyclient-login: the page did not load: {url}");
                     std::process::exit(LOAD_FAILED);
                 }
             }
@@ -182,7 +182,7 @@ fn tick(web: &WebView, site: Site, agent: &str, state: &Arc<Mutex<State>>) {
             let since = guard.on_client.get_or_insert_with(Instant::now);
             if since.elapsed() >= NO_TOKEN_AFTER {
                 eprintln!(
-                    "tinychat-login: signed in to Slack, but the browser holds no token to read after \
+                    "tinyclient-login: signed in to Slack, but the browser holds no token to read after \
                      {} seconds; Enterprise Grid organizations are known to do this",
                     NO_TOKEN_AFTER.as_secs()
                 );
@@ -204,7 +204,7 @@ fn tick(web: &WebView, site: Site, agent: &str, state: &Arc<Mutex<State>>) {
         let mut guard = state_page.lock().unwrap();
         if blocked(url, text) && !guard.refused {
             guard.refused = true;
-            eprintln!("tinychat-login: the organization does not allow this sign-in");
+            eprintln!("tinyclient-login: the organization does not allow this sign-in");
         }
     });
 

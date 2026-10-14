@@ -80,7 +80,7 @@ fn tls() -> &'static Tls {
         std::fs::create_dir_all(&dir).unwrap();
         let config = dir.join("openssl.cnf");
         let request = "[req]\ndistinguished_name=dn\nx509_extensions=ext\nprompt=no\n\
-            [dn]\nCN=tinychat test voice server\n\
+            [dn]\nCN=tinyclient test voice server\n\
             [ext]\nsubjectAltName=IP:127.0.0.1,DNS:localhost\nkeyUsage=digitalSignature,keyEncipherment\n\
             extendedKeyUsage=serverAuth\n";
         std::fs::write(&config, request).unwrap();

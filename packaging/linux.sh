@@ -6,9 +6,9 @@
 #     libxkbcommon-dev libx11-dev libxcb1-dev libfontconfig1-dev
 #
 #   TINYCHAT_TELEGRAM_API_ID=... TINYCHAT_TELEGRAM_API_HASH=... \
-#     cargo build --release -p tinychat --features tinychat/gui -p chatd -p mediad -p login
+#     cargo build --release -p tinyclient --features tinyclient/gui -p chatd -p mediad -p login
 #
-# Binaries: target/release/{tinychat,chatd,mediad,tinychat-login}
+# Binaries: target/release/{tinyclient,chatd,mediad,tinyclient-login}
 set -eu
 root=$(cd "$(dirname "$0")/.." && pwd)
 echo "See comments in packaging/linux.sh for apt packages and the cargo build command."

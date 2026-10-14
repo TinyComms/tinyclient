@@ -48,8 +48,8 @@ const SILENT: &str = "Discord's voice server didn't answer. Try again in a momen
 const NO_AUDIO_PATH: &str =
     "Discord's voice server answered, but call audio couldn't get through. A VPN or firewall may be blocking it.";
 const DROPPED: &str = "The connection to Discord dropped and didn't come back. You've left the call.";
-const UNUSABLE: &str = "Discord sent a voice session this tinychat can't use. Try again, or take this call in Discord.";
-const NO_CIPHER: &str = "Discord and this tinychat share no way to encrypt call audio. Update tinychat, or take this call in Discord.";
+const UNUSABLE: &str = "Discord sent a voice session this tinyclient can't use. Try again, or take this call in Discord.";
+const NO_CIPHER: &str = "Discord and this tinyclient share no way to encrypt call audio. Update tinyclient, or take this call in Discord.";
 const ENGINE: &str = "The call engine could not start. Try again.";
 
 type Devices = (Option<String>, Option<String>);

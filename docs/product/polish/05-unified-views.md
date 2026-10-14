@@ -127,7 +127,7 @@ each network's own (Discord Friends, Telegram Contacts, Slack/Teams DMs in their
 **Inside a network's own place its structure, order and words win; in a place that mixes networks
 the shell's row and order win, and the only network-specific things shown are a monochrome glyph
 and the Space name.** Examples: Telegram folders and pinned chats, Slack sections and Discord
-server folders appear only in their homes, never in the Inbox; tinychat's star is the Inbox's only
+server folders appear only in their homes, never in the Inbox; tinyclient's star is the Inbox's only
 pin. Mute and "what counts as unread" are always the network's (they are the user's settings).
 Discord's "Friends" and Telegram's "Contacts" keep their names in their homes; mixed People says "People".
 

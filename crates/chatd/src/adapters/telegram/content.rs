@@ -1,5 +1,5 @@
 //! Telegram's messages into the one message model: entities to spans, media to attachments,
-//! service messages to one grey line, and whatever tinychat cannot draw to a named line with a
+//! service messages to one grey line, and whatever tinyclient cannot draw to a named line with a
 //! link into Telegram's own app. Nothing here asks the network anything.
 
 use super::peers::{message_link, Directory, Who};
@@ -193,7 +193,7 @@ fn photo(photo: &tl::types::Photo, spoiler: bool, wants: &mut Vec<Want>) -> Opti
     Some(attachment)
 }
 
-fn document(media: &tl::types::MessageMediaDocument, document: &tl::types::Document, wants: &mut Vec<Want>) -> Attachment {
+pub(super) fn document(media: &tl::types::MessageMediaDocument, document: &tl::types::Document, wants: &mut Vec<Want>) -> Attachment {
     let (mut name, mut size, mut duration, mut wave) = (String::new(), (0u32, 0u32), 0u32, Vec::new());
     let (mut sticker, mut animated, mut video, mut round, mut voice, mut audio) = (false, false, false, false, false, false);
     for attribute in &document.attributes {
@@ -280,7 +280,7 @@ fn plain(text: &tl::enums::TextWithEntities) -> &str {
     &text.text
 }
 
-/// What stands in for media tinychat cannot draw. Never empty.
+/// What stands in for media tinyclient cannot draw. Never empty.
 fn unsupported(media: &MessageMedia) -> Option<String> {
     Some(match media {
         MessageMedia::Poll(media) => {
@@ -301,7 +301,7 @@ fn unsupported(media: &MessageMedia) -> Option<String> {
         MessageMedia::PaidMedia(_) => "Paid media".to_owned(),
         MessageMedia::ToDo(_) => "Checklist".to_owned(),
         MessageMedia::VideoStream(_) => "Live stream".to_owned(),
-        MessageMedia::Unsupported => "A message this version of tinychat cannot show".to_owned(),
+        MessageMedia::Unsupported => "A message this version of tinyclient cannot show".to_owned(),
         // A photo or document that has run out (a self-destructing one, once seen).
         MessageMedia::Photo(photo) if photo.photo.is_none() => "Photo that has expired".to_owned(),
         MessageMedia::Document(document) if document.document.is_none() => "File that has expired".to_owned(),
@@ -414,7 +414,7 @@ fn action(dir: &Directory, who: &str, action: &MessageAction) -> String {
         },
         A::SetMessagesTtl(_) => format!("{who} changed how long messages are kept"),
         A::CustomAction(custom) => custom.message.clone(),
-        _ => format!("{who} changed something tinychat cannot show yet"),
+        _ => format!("{who} changed something tinyclient cannot show yet"),
     }
 }
 

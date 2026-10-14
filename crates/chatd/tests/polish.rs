@@ -23,7 +23,7 @@ impl Daemon {
     fn start(args: &[&str], env: &[(&str, &str)], seed: impl FnOnce(&mut Store)) -> Daemon {
         static NEXT: AtomicU32 = AtomicU32::new(0);
         // Short: a unix socket address holds about 100 bytes.
-        let dir = PathBuf::from(format!("/tmp/tinychat-pl-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        let dir = PathBuf::from(format!("/tmp/tinyclient-pl-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         seed(&mut Store::open(&dir.join("chat.sqlite")).unwrap());
@@ -116,6 +116,29 @@ impl Drop for Daemon {
         let _ = self.child.kill();
         let _ = self.child.wait();
         let _ = std::fs::remove_dir_all(&self.dir);
+        let _ = std::fs::remove_dir_all(self.picked());
+    }
+}
+
+impl Daemon {
+    /// A place outside chatd's own directory where the user picks files from.
+    fn picked(&self) -> PathBuf {
+        self.dir.with_extension("picked")
+    }
+
+    fn pick(&self, name: &str, bytes: usize) -> PathBuf {
+        std::fs::create_dir_all(self.picked()).unwrap();
+        let path = self.picked().join(name);
+        std::fs::write(&path, vec![7u8; bytes]).unwrap();
+        path
+    }
+
+    /// A paste the shell staged in `outbox/`.
+    fn stage(&self, name: &str, bytes: usize) -> PathBuf {
+        std::fs::create_dir_all(self.dir.join("outbox")).unwrap();
+        let path = self.dir.join("outbox").join(name);
+        std::fs::write(&path, vec![7u8; bytes]).unwrap();
+        path
     }
 }
 
@@ -380,8 +403,7 @@ fn a_card_and_an_info_pane_are_typed_and_a_mute_is_the_network_s() {
 fn files_go_from_their_paths_with_progress_within_the_account_s_limits_and_can_be_cancelled() {
     let chatd = Daemon::demo(&[("TINYCHAT_DEMO_UPLOAD_MS", "150")]);
     let telegram = at(Network::Telegram, TELEGRAM, "u7000001");
-    let photo = chatd.dir.join("trail.png");
-    std::fs::write(&photo, vec![7u8; 900 * 1024]).unwrap();
+    let photo = chatd.pick("trail.png", 900 * 1024);
     let with = |path: &std::path::Path| Outgoing {
         files: vec![OutgoingFile { path: path.to_string_lossy().into_owned(), name: String::new(), spoiler: true, as_file: false, original: false }],
         ..Outgoing::default()
@@ -409,7 +431,7 @@ fn files_go_from_their_paths_with_progress_within_the_account_s_limits_and_can_b
     assert_eq!(progress.last(), Some(&(900 * 1024, 900 * 1024)), "{progress:?}");
 
     // Over the account's limit: refused on the spot, naming it; nothing is stored.
-    let big = chatd.dir.join("big.mov");
+    let big = chatd.pick("big.mov", 0);
     std::fs::File::create(&big).unwrap().set_len(11 << 20).unwrap();
     let refused = chatd.ask(Request::Send { conversation: at(Network::Discord, ROBIN, "500000000000000001"), client_id: "1700000000000002".to_owned(), text: String::new(), reply_to: None, with: with(&big) });
     assert!(matches!(&refused, Response::Error { code: ErrorCode::Refused, detail } if detail.contains("too big for Discord (limit 10 MB)")), "{refused:?}");
@@ -444,6 +466,10 @@ fn the_pickers_are_answered_on_demand_by_page_and_what_an_account_may_send_is_in
     let discord = AccountKey { network: Network::Discord, account: ROBIN.to_owned() };
     let (emoji, _) = catalog(&discord, CatalogKind::Emoji, "", None);
     assert!(emoji.iter().any(|item| item.name == ":mossparrot:"));
+    // Slack answers its own workspace's emoji, never Discord's server's.
+    let slack = AccountKey { network: Network::Slack, account: "T04HARBOR1".to_owned() };
+    let (emoji, _) = catalog(&slack, CatalogKind::Emoji, "", None);
+    assert!(!emoji.is_empty() && emoji.iter().all(|item| item.pack == "Harbor Labs" && item.file.is_some()), "{emoji:?}");
     // A network without stickers has none.
     let teams = AccountKey { network: Network::Teams, account: TEAMS.to_owned() };
     assert!(catalog(&teams, CatalogKind::Stickers, "", None).0.is_empty());
@@ -453,4 +479,72 @@ fn the_pickers_are_answered_on_demand_by_page_and_what_an_account_may_send_is_in
     assert_eq!(can(Network::Discord).max_file_bytes, 10 << 20);
     assert!(can(Network::Telegram).as_file && can(Network::Telegram).silent);
     assert!(!can(Network::Teams).gifs && can(Network::Teams).max_file_bytes > 0);
+}
+
+fn with_file(path: &std::path::Path) -> Outgoing {
+    Outgoing {
+        files: vec![OutgoingFile { path: path.to_string_lossy().into_owned(), name: String::new(), spoiler: false, as_file: false, original: false }],
+        ..Outgoing::default()
+    }
+}
+
+#[test]
+fn a_send_naming_a_file_outside_where_the_user_picks_is_refused_before_anything_is_stored() {
+    let chatd = Daemon::demo(&[]);
+    let telegram = at(Network::Telegram, TELEGRAM, "u7000001");
+    let store = chatd.dir.join("chat.sqlite");
+    let link = chatd.dir.join("outbox").join("hosts.png");
+    std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink("/etc/hosts", &link).unwrap();
+    let paths = [PathBuf::from("/etc/hosts"), store.clone(), link.clone(), PathBuf::from("/dev/null")];
+    for (at, path) in paths.iter().enumerate() {
+        let client_id = format!("170000000000010{at}");
+        let asked = Request::Send { conversation: telegram.clone(), client_id: client_id.clone(), text: "look".to_owned(), reply_to: None, with: with_file(path) };
+        let answer = chatd.ask(asked);
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            matches!(&answer, Response::Error { code: ErrorCode::Refused, detail } if detail == &format!("{name} is not a file tinyclient can send.")),
+            "{path:?}: {answer:?}"
+        );
+        assert!(chatd.message(&telegram, &client_id).is_none(), "{path:?} stored nothing");
+    }
+    // Nothing was touched: the link is the shell's to clear, the store is chatd's.
+    assert!(store.exists() && std::fs::symlink_metadata(&link).is_ok());
+}
+
+#[test]
+fn a_staged_paste_leaves_outbox_once_it_is_sent_or_discarded_and_a_picked_file_stays() {
+    let chatd = Daemon::demo(&[("TINYCHAT_DEMO_UPLOAD_MS", "150")]);
+    let telegram = at(Network::Telegram, TELEGRAM, "u7000001");
+    let send = |client_id: &str, path: &std::path::Path| {
+        let asked = Request::Send { conversation: telegram.clone(), client_id: client_id.to_owned(), text: String::new(), reply_to: None, with: with_file(path) };
+        assert!(matches!(chatd.ask(asked), Response::Sent { .. }), "{path:?} was taken");
+    };
+
+    // Sent: the outbox copy goes; the sent message still shows the picture.
+    let pasted = chatd.stage("Pasted image.png", 4096);
+    send("1700000000000201", &pasted);
+    let sent = chatd.until("the paste to go", || chatd.message(&telegram, "1700000000000201").filter(|message| message.state == SendState::Sent));
+    assert!(!pasted.exists(), "the sent paste left outbox/");
+    let kept = sent.attachments[0].file.path.clone().unwrap();
+    assert!(std::path::Path::new(&kept).exists(), "the sent picture is kept in the media cache: {kept}");
+
+    // Discarded: the outbox copy goes; a file the user picked is theirs and stays.
+    let pasted = chatd.stage("Pasted image 2.png", 4096);
+    let picked = chatd.pick("notes.txt", 4096);
+    let asked = Request::Send {
+        conversation: telegram.clone(),
+        client_id: "1700000000000202".to_owned(),
+        text: String::new(),
+        reply_to: None,
+        with: Outgoing { files: [with_file(&pasted).files, with_file(&picked).files].concat(), ..Outgoing::default() },
+    };
+    assert!(matches!(chatd.ask(asked), Response::Sent { .. }));
+    assert!(matches!(chatd.ask(Request::CancelSend { conversation: telegram.clone(), client_id: "1700000000000202".to_owned() }), Response::Ok));
+    chatd.until("the cancel", || chatd.message(&telegram, "1700000000000202").filter(|message| message.state != SendState::Pending));
+    assert!(pasted.exists(), "a failed send keeps its paste for Retry");
+    assert!(matches!(chatd.ask(Request::Discard { conversation: telegram.clone(), client_id: "1700000000000202".to_owned() }), Response::Ok));
+    assert!(chatd.message(&telegram, "1700000000000202").is_none());
+    assert!(!pasted.exists(), "the discarded paste left outbox/");
+    assert!(picked.exists(), "the user's own file stays");
 }

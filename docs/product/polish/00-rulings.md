@@ -54,7 +54,7 @@ file answers. The owner asked that open choices be decided rather than sent back
 | 06 | Leave a group from the pane | In, behind one confirm. Leaving servers stays cut. |
 | 07 | One Details switch or two | Two (rule 2). |
 | 07 | Pinned Space opens its last channel | Yes. |
-| 09 | Scheduled send | Allowed where the network schedules it on its servers (Slack, Telegram). The user picks the time; tinychat automates nothing. P2. |
+| 09 | Scheduled send | Allowed where the network schedules it on its servers (Slack, Telegram). The user picks the time; tinyclient automates nothing. P2. |
 | 09 | Second Teams token for OneDrive | Yes; Teams cannot send files without it. |
 | 09 | Voice messages | P2. |
 | 09 | GIFs on Slack and Teams | Hidden until the call is captured on a live session. |

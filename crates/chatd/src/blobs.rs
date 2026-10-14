@@ -7,6 +7,14 @@
 //! - At most [`IN_FLIGHT`] fetches at once, the newest request first: what is on screen now
 //!   matters more than what scrolled past. A fetch is started only by `request`, which the
 //!   shell sends for what is on screen; nothing is fetched ahead.
+//! - A picture asked for as a row's (its avatar, while the row is in `Watching.rows`) waits,
+//!   unfetched, once the row has scrolled away, and goes back in line when it is on screen again.
+//! - Each account's own picture (the rail's) is fetched when the account is signed in or starts,
+//!   and again on each connect if it is not on disk, without the shell asking.
+//! - A picker's previews (stickers, GIF stills: ids made with [`pick`]) go to
+//!   `media/<network>/pick/<account>/`, are fetched only while the picker asks for them, and are
+//!   deleted when it closes ([`Blobs::picker_closed`], or [`PICK_IDLE`] without a request).
+//!   Custom emoji are not picks: they stay in the cache at the 48 px size the adapter registers.
 //! - Only the address the adapter registered is fetched (`Store::register_media`), and only
 //!   from the network's own hosts (`fetch::Hosts`). The adapter's `Command::Download` supplies
 //!   the session's headers or a fresh signed address. Never an arbitrary link from a message.
@@ -27,11 +35,15 @@
 //! `Attachment::file`), so the original is fetched only when it is asked for.
 
 mod fetch;
+// CONTRACT: `upload` belongs in `lib.rs` (`pub mod upload;`), which is frozen; until the
+// integrator moves it, adapters reach it as `crate::blobs::upload`.
+#[path = "upload.rs"]
+pub mod upload;
 
 use crate::adapters::Command;
 use crate::hub::{now, Hub};
 use crate::session;
-use protocol::{AccountKey, Change, MediaFile, Network};
+use protocol::{AccountKey, Change, Link, MediaFile, Network, Watching};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
@@ -39,7 +51,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 pub const CACHE_BYTES: u64 = 500 * 1024 * 1024;
-pub const IN_FLIGHT: usize = 2;
+pub const IN_FLIGHT: usize = 4;
 /// Most fetches waiting their turn. Past this the oldest request gives way: it is the one
 /// most likely to have scrolled off screen, and the shell asks again if it is still there.
 const WAITING: usize = 256;
@@ -51,6 +63,45 @@ const RENEWED_TOGETHER: usize = 50;
 /// Most files whose last place on disk is remembered, to remove a smaller size once a larger
 /// one lands. What this forgets, `reconcile` removes at the next start.
 const REMEMBERED: usize = 4_096;
+/// A picker that has asked for none of its previews for this long has closed, and its files go.
+/// `TINYCHAT_PICK_IDLE`, in seconds, replaces it in a scratch directory.
+pub const PICK_IDLE: Duration = Duration::from_secs(120);
+/// How often the accounts are looked at for one that signed in or connected, whose own picture
+/// is then fetched.
+const OWN_EVERY: Duration = Duration::from_secs(2);
+/// How long after an account starts or connects its own picture is looked for.
+const OWN_FOR: Duration = Duration::from_secs(120);
+/// What marks a picker's preview among an account's files.
+const PICK: &str = "pick:";
+/// While a row's picture waits for its row to come back, the screen is looked at this often:
+/// `Watch` goes to the server, which does not tell the cache.
+const PARKED_LOOK: Duration = Duration::from_secs(1);
+/// A row's picture whose row has been away this long is no longer waited for.
+const PARKED_FOR: Duration = Duration::from_secs(600);
+
+/// The id an adapter registers a picker's preview under (a sticker's or GIF's still), so it
+/// lands in the picker's own directory and goes when the picker closes. Custom emoji keep their
+/// plain id: they stay in the cache.
+pub fn pick(id: &str) -> String {
+    format!("{PICK}{id}")
+}
+
+fn is_pick(id: &str) -> bool {
+    id.starts_with(PICK)
+}
+
+/// Where an account's picker previews go: `media/<network>/pick/<account>`.
+fn pick_dir(media: &Path, account: &AccountKey) -> PathBuf {
+    media.join(account.network.label().to_lowercase()).join("pick").join(&account.account)
+}
+
+/// The directory a file of the account lands in.
+fn dir_for(media: &Path, account: &AccountKey, id: &str) -> PathBuf {
+    match is_pick(id) {
+        true => pick_dir(media, account),
+        false => dir_under(media, account),
+    }
+}
 
 /// Where an account's files go under the `media` directory.
 pub fn dir_under(media: &Path, account: &AccountKey) -> PathBuf {
@@ -75,7 +126,7 @@ pub fn path_of(media: &Path, account: &AccountKey, id: &str) -> PathBuf {
 /// another address and so another path: a shell that holds the smaller one decoded can tell
 /// that what landed is new.
 fn path_from(media: &Path, account: &AccountKey, id: &str, url: &str) -> PathBuf {
-    dir_under(media, account).join(format!("{}-{:08x}", name_of(id), fnv(url) as u32))
+    dir_for(media, account, id).join(format!("{}-{:08x}", name_of(id), fnv(url) as u32))
 }
 
 type FileKey = (AccountKey, String);
@@ -85,6 +136,27 @@ struct Job {
     /// The account's sign-out count when this was asked for.
     epoch: u64,
     adapter: Option<Sender<Command>>,
+    /// Asked for as the picture of a row on screen: it waits while that row is scrolled away.
+    row: bool,
+    /// When it was asked for.
+    at: Instant,
+}
+
+/// What is on screen, as files: worked out once per `Watching`.
+#[derive(Default)]
+struct Screen {
+    watching: Arc<Watching>,
+    /// The pictures of the rows in `Watching.rows`.
+    rows: HashSet<FileKey>,
+    /// Pictures on screen for another reason: the people drawn, the open conversation.
+    kept: HashSet<FileKey>,
+}
+
+impl Screen {
+    /// A row's picture that is not on screen now, while the shell says what is.
+    fn scrolled_away(&self, file: &FileKey) -> bool {
+        !self.watching.rows.is_empty() && !self.rows.contains(file) && !self.kept.contains(file)
+    }
 }
 
 #[derive(Default)]
@@ -99,6 +171,10 @@ struct Queue {
     landed: HashMap<FileKey, PathBuf>,
     /// How many times each account has been signed out since start.
     epochs: HashMap<AccountKey, u64>,
+    /// Rows' pictures asked for and since scrolled away, newest last.
+    parked: Vec<Job>,
+    /// Accounts whose picker is open, with when it last asked for a preview.
+    picked: HashMap<AccountKey, Instant>,
 }
 
 struct Cache {
@@ -108,9 +184,14 @@ struct Cache {
     cap: u64,
     /// `TINYCHAT_MEDIA_ON_SCREEN`, in seconds, replaces [`ON_SCREEN`] in a scratch directory.
     on_screen: Duration,
+    /// `TINYCHAT_PICK_IDLE`, in seconds, replaces [`PICK_IDLE`] in a scratch directory.
+    pick_idle: Duration,
     hosts: fetch::Hosts,
     queue: Mutex<Queue>,
     wake: Condvar,
+    /// Wakes the thread that deletes a closed picker's files.
+    picks: Condvar,
+    screen: Mutex<Arc<Screen>>,
     evicting: Mutex<()>,
 }
 
@@ -143,11 +224,23 @@ impl Blobs {
             dir,
             cap: number("TINYCHAT_MEDIA_CAP").unwrap_or(CACHE_BYTES),
             on_screen: number("TINYCHAT_MEDIA_ON_SCREEN").map_or(ON_SCREEN, Duration::from_secs),
+            pick_idle: number("TINYCHAT_PICK_IDLE").map_or(PICK_IDLE, Duration::from_secs),
             hosts: fetch::Hosts { local },
             queue: Mutex::new(Queue::default()),
             wake: Condvar::new(),
+            picks: Condvar::new(),
+            screen: Mutex::default(),
             evicting: Mutex::new(()),
         });
+        type Helper = fn(&Cache);
+        let helpers: [(&str, Helper); 2] = [("media-pick", Cache::sweep_picks), ("media-own", Cache::own_pictures)];
+        for (name, helper) in helpers {
+            let cache = cache.clone();
+            let spawned = std::thread::Builder::new().name(name.into()).stack_size(256 * 1024).spawn(move || helper(&cache));
+            if let Err(err) = spawned {
+                eprintln!("chatd: media: {err}");
+            }
+        }
         for worker in 0..IN_FLIGHT {
             let cache = cache.clone();
             // The first worker checks the directory before either fetches anything, so a file
@@ -159,7 +252,7 @@ impl Blobs {
                     crate::hub::lock(&cache.queue).ready = true;
                     cache.wake.notify_all();
                 }
-                cache.work();
+                cache.work(worker == 0);
             });
             if let Err(err) = spawned {
                 eprintln!("chatd: media: {err}");
@@ -186,55 +279,16 @@ impl Blobs {
         ids: &[String],
         adapter: Option<Sender<Command>>,
     ) -> rusqlite::Result<Vec<MediaFile>> {
-        let files: Vec<MediaFile> = {
-            let mut store = self.cache.hub.store();
-            store.media_used(account, ids, now())?;
-            let mut files = Vec::with_capacity(ids.len());
-            for (mut file, _) in store.media(account, ids)? {
-                // Something else deleted it: it is simply not fetched yet.
-                if file.path.as_ref().is_some_and(|path| !Path::new(path).exists()) {
-                    store.media_evicted(account, &file.id)?;
-                    file.path = None;
-                }
-                files.push(file);
-            }
-            files
-        };
-        let mut dropped = Vec::new();
-        {
-            let mut queue = crate::hub::lock(&self.cache.queue);
-            let at = Instant::now();
-            queue.asked.retain(|_, asked| at.duration_since(*asked) < self.cache.on_screen);
-            let epoch = queue.epochs.get(account).copied().unwrap_or(0);
-            for file in &files {
-                let key = (account.clone(), file.id.clone());
-                queue.asked.insert(key.clone(), at);
-                // A failure stands until `Fetch` says `retry` (the server clears it before
-                // this) or the adapter registers a fresh address.
-                if file.path.is_some() || file.failed.is_some() || queue.fetching.contains(&key) {
-                    continue;
-                }
-                // Asked for again while waiting: it goes back to the front.
-                queue.waiting.retain(|job| job.file != key);
-                queue.waiting.push(Job {
-                    file: key,
-                    epoch,
-                    adapter: adapter.clone(),
-                });
-                if queue.waiting.len() > WAITING {
-                    dropped.push(queue.waiting.remove(0).file);
-                }
-            }
-        }
-        self.cache.wake.notify_all();
-        // Whoever asked for what gave way is told it did not arrive, so nothing waits on it.
-        for (account, id) in dropped {
-            let known = self.cache.hub.store().media(&account, &[id])?;
-            for (file, _) in known {
-                self.cache.announce(&account, file);
-            }
-        }
-        Ok(files)
+        self.cache.request(account, ids, adapter)
+    }
+
+    /// The picker closed: its previews' files go now, and whatever of them is still waiting is
+    /// not fetched.
+    // CONTRACT: nothing in the protocol says the picker closed, so the server cannot call this
+    // yet; until it can (a `Request::PickerClosed { account }`, or `Watching.picker`), a picker
+    // counts as closed after `PICK_IDLE` with no `Fetch` of a preview.
+    pub fn picker_closed(&self, account: &AccountKey) {
+        self.cache.close_picker(account);
     }
 
     /// Brings the cache back under its cap. Runs after a fetch lands and at start.
@@ -249,10 +303,13 @@ impl Blobs {
             let mut queue = crate::hub::lock(&self.cache.queue);
             *queue.epochs.entry(account.clone()).or_default() += 1;
             queue.waiting.retain(|job| job.file.0 != *account);
+            queue.parked.retain(|job| job.file.0 != *account);
+            queue.picked.remove(account);
             queue.asked.retain(|(of, _), _| of != account);
             queue.landed.retain(|(of, _), _| of != account);
         }
         let _ = std::fs::remove_dir_all(self.dir_of(account));
+        let _ = std::fs::remove_dir_all(pick_dir(&self.cache.dir, account));
     }
 }
 
@@ -265,6 +322,210 @@ impl Cache {
         });
     }
 
+    /// [`Blobs::request`].
+    fn request(&self, account: &AccountKey, ids: &[String], adapter: Option<Sender<Command>>) -> rusqlite::Result<Vec<MediaFile>> {
+        let files: Vec<MediaFile> = {
+            let mut store = self.hub.store();
+            store.media_used(account, ids, now())?;
+            let mut files = Vec::with_capacity(ids.len());
+            for (mut file, _) in store.media(account, ids)? {
+                // Something else deleted it: it is simply not fetched yet.
+                if file.path.as_ref().is_some_and(|path| !Path::new(path).exists()) {
+                    store.media_evicted(account, &file.id)?;
+                    file.path = None;
+                }
+                files.push(file);
+            }
+            files
+        };
+        let screen = self.screen();
+        let mut dropped = Vec::new();
+        let mut picking = false;
+        {
+            let mut queue = crate::hub::lock(&self.queue);
+            let at = Instant::now();
+            queue.asked.retain(|_, asked| at.duration_since(*asked) < self.on_screen);
+            let epoch = queue.epochs.get(account).copied().unwrap_or(0);
+            for file in &files {
+                let key = (account.clone(), file.id.clone());
+                queue.asked.insert(key.clone(), at);
+                // The picker asking for a preview is the picker being open.
+                if is_pick(&file.id) {
+                    queue.picked.insert(account.clone(), at);
+                    picking = true;
+                }
+                // A failure stands until `Fetch` says `retry` (the server clears it before
+                // this) or the adapter registers a fresh address.
+                if file.path.is_some() || file.failed.is_some() || queue.fetching.contains(&key) {
+                    continue;
+                }
+                // Asked for again while waiting: it goes back to the front.
+                queue.waiting.retain(|job| job.file != key);
+                queue.parked.retain(|job| job.file != key);
+                queue.waiting.push(Job {
+                    at,
+                    row: screen.rows.contains(&key),
+                    file: key,
+                    epoch,
+                    adapter: adapter.clone(),
+                });
+                if queue.waiting.len() > WAITING {
+                    dropped.push(queue.waiting.remove(0).file);
+                }
+            }
+        }
+        self.wake.notify_all();
+        if picking {
+            self.picks.notify_all();
+        }
+        // Whoever asked for what gave way is told it did not arrive, so nothing waits on it.
+        for (account, id) in dropped {
+            let known = self.hub.store().media(&account, &[id])?;
+            for (file, _) in known {
+                self.announce(&account, file);
+            }
+        }
+        Ok(files)
+    }
+
+    /// What is on screen now, as files. Worked out again only when `Watching` changed; then the
+    /// rows' pictures that were waiting for their row to come back go back in line.
+    fn screen(&self) -> Arc<Screen> {
+        let watching = self.hub.watching();
+        {
+            let held = crate::hub::lock(&self.screen);
+            if Arc::ptr_eq(&held.watching, &watching) {
+                return held.clone();
+            }
+        }
+        let mut screen = Screen {
+            watching: watching.clone(),
+            ..Screen::default()
+        };
+        {
+            let store = self.hub.store();
+            let avatar_of = |key: &protocol::Key| store.conversation(key).ok().flatten().and_then(|row| row.avatar).map(|file| (key.account(), file.id));
+            screen.rows.extend(watching.rows.iter().filter_map(avatar_of));
+            screen.kept.extend(watching.conversation.iter().filter_map(avatar_of));
+            let person = |key: &protocol::Key| store.person(key).ok().flatten().and_then(|person| person.avatar).map(|file| (key.account(), file.id));
+            screen.kept.extend(watching.people.iter().filter_map(person));
+        }
+        let screen = Arc::new(screen);
+        *crate::hub::lock(&self.screen) = screen.clone();
+        let back = {
+            let mut queue = crate::hub::lock(&self.queue);
+            let (back, still): (Vec<Job>, Vec<Job>) = std::mem::take(&mut queue.parked).into_iter().partition(|job| !screen.scrolled_away(&job.file));
+            queue.parked = still;
+            let any = !back.is_empty();
+            queue.waiting.extend(back);
+            any
+        };
+        if back {
+            self.wake.notify_all();
+        }
+        screen
+    }
+
+    /// Deletes the files of each picker that has closed. Sleeps while no picker is open.
+    fn sweep_picks(&self) {
+        let mut queue = crate::hub::lock(&self.queue);
+        loop {
+            let at = Instant::now();
+            let closed: Vec<AccountKey> = queue.picked.iter().filter(|(_, asked)| at.duration_since(**asked) >= self.pick_idle).map(|(account, _)| account.clone()).collect();
+            if !closed.is_empty() {
+                drop(queue);
+                for account in &closed {
+                    self.close_picker(account);
+                }
+                queue = crate::hub::lock(&self.queue);
+                continue;
+            }
+            let next = queue.picked.values().map(|asked| self.pick_idle.saturating_sub(at.duration_since(*asked))).min();
+            queue = match next {
+                Some(wait) => self.picks.wait_timeout(queue, wait).map_or_else(|err| err.into_inner().0, |(queue, _)| queue),
+                None => self.picks.wait(queue).unwrap_or_else(std::sync::PoisonError::into_inner),
+            };
+        }
+    }
+
+    /// A picker closed: its previews go, on disk and in the store, and none waits to be fetched.
+    fn close_picker(&self, account: &AccountKey) {
+        {
+            let mut queue = crate::hub::lock(&self.queue);
+            queue.picked.remove(account);
+            let gone = |file: &FileKey| file.0 == *account && is_pick(&file.1);
+            queue.waiting.retain(|job| !gone(&job.file));
+            queue.parked.retain(|job| !gone(&job.file));
+            queue.landed.retain(|file, _| !gone(file));
+        }
+        let dir = pick_dir(&self.dir, account);
+        // Read first: the store is locked again for each row.
+        let rows = self.hub.store().media_on_disk(Some(account), u32::MAX).unwrap_or_default();
+        for row in rows.iter().filter(|row| is_pick(&row.id) || Path::new(&row.path).starts_with(&dir)) {
+            let _ = self.hub.store().media_evicted(account, &row.id);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        // The network's directory of pickers goes too once no account's is left.
+        let _ = std::fs::remove_dir(dir.parent().unwrap_or(&dir));
+    }
+
+    /// Fetches each account's own picture (the rail's) when the account signs in or starts,
+    /// and on each connect if it is not on disk. Looks at the links every [`OWN_EVERY`] (one
+    /// lock); the store only while an account that just started or connected has not had its
+    /// picture asked for, for at most [`OWN_FOR`], since the adapter records us a little after.
+    fn own_pictures(&self) {
+        struct Own {
+            connected: bool,
+            /// Until when to look for the picture, while it has not been asked for.
+            until: Option<Instant>,
+        }
+        let mut seen: HashMap<AccountKey, Own> = HashMap::new();
+        loop {
+            std::thread::sleep(OWN_EVERY);
+            let links = self.hub.links();
+            seen.retain(|account, _| links.iter().any(|linked| linked.account == *account));
+            let at = Instant::now();
+            for linked in &links {
+                let connected = linked.link == Link::Connected;
+                // New here: signed in, or chatd started with it.
+                let own = seen.entry(linked.account.clone()).or_insert(Own { connected, until: Some(at + OWN_FOR) });
+                if connected && !own.connected {
+                    own.until = Some(at + OWN_FOR);
+                }
+                own.connected = connected;
+                if own.until.is_some_and(|until| until < at) {
+                    own.until = None;
+                }
+            }
+            if seen.values().all(|own| own.until.is_none()) {
+                continue;
+            }
+            let Ok(accounts) = self.hub.store().accounts() else {
+                continue;
+            };
+            for (account, own) in seen.iter_mut().filter(|(_, own)| own.until.is_some()) {
+                let Some(avatar) = accounts.iter().find(|row| row.key == *account).and_then(|row| row.avatar.clone()) else {
+                    continue;
+                };
+                own.until = None;
+                if avatar.path.as_ref().is_some_and(|path| Path::new(path).exists()) {
+                    continue;
+                }
+                // CONTRACT: the server holds the adapters, so this thread asks without one: a
+                // picture behind the session (Teams, Telegram) waits for the shell's `Fetch`,
+                // which the server sends with the adapter. `Blobs::new` taking a way to reach
+                // the adapters would let it come here too.
+                let url = self.hub.store().media(account, std::slice::from_ref(&avatar.id)).ok().and_then(|mut known| known.pop()).map(|(_, url)| url);
+                if url.is_none_or(|url| self.hosts.trust(account.network, &url) != Some(fetch::Trust::Open)) {
+                    continue;
+                }
+                if let Err(err) = self.request(account, &[avatar.id], None) {
+                    eprintln!("chatd: {}: own picture: {err}", account.network.label());
+                }
+            }
+        }
+    }
+
     /// Makes the directory and the store agree, once, at start. A file no row points to is
     /// removed, parts of interrupted downloads included; a row whose file is gone loses its path.
     fn reconcile(&self) {
@@ -273,6 +534,11 @@ impl Cache {
                 continue;
             };
             for entry in accounts.flatten() {
+                // No picker is open at start: every preview from before goes.
+                if entry.file_name() == "pick" {
+                    let _ = std::fs::remove_dir_all(entry.path());
+                    continue;
+                }
                 let account = AccountKey {
                     network,
                     account: entry.file_name().to_string_lossy().into_owned(),
@@ -355,8 +621,9 @@ impl Cache {
         }
     }
 
-    /// One worker: takes the newest request, fetches it, and says how it went.
-    fn work(&self) {
+    /// One worker: takes the newest request, fetches it, and says how it went. The `first`
+    /// also looks at the screen while rows' pictures wait for their rows.
+    fn work(&self, first: bool) {
         let agent = fetch::agent();
         let mut buffer = vec![0u8; fetch::BUFFER];
         loop {
@@ -369,10 +636,28 @@ impl Cache {
                             queue.fetching.push(job.file.clone());
                             break job;
                         }
+                        None if first && !queue.parked.is_empty() => {
+                            queue.parked.retain(|job| job.at.elapsed() < PARKED_FOR);
+                            let (waited, _) = self.wake.wait_timeout(queue, PARKED_LOOK).unwrap_or_else(std::sync::PoisonError::into_inner);
+                            drop(waited);
+                            // Rows that came back put their pictures in line.
+                            self.screen();
+                            queue = crate::hub::lock(&self.queue);
+                        }
                         None => queue = self.wake.wait(queue).unwrap_or_else(std::sync::PoisonError::into_inner),
                     }
                 }
             };
+            // A row's picture whose row scrolled away waits for it to come back.
+            if job.row && self.screen().scrolled_away(&job.file) {
+                let mut queue = crate::hub::lock(&self.queue);
+                queue.fetching.retain(|file| file != &job.file);
+                queue.parked.push(job);
+                if queue.parked.len() > WAITING {
+                    queue.parked.remove(0);
+                }
+                continue;
+            }
             let outcome = self.fetch(&agent, &job, &mut buffer);
             let (account, id) = &job.file;
             crate::hub::lock(&self.queue).fetching.retain(|file| file != &job.file);
@@ -397,6 +682,11 @@ impl Cache {
         }
     }
 
+    /// The account's picker is open.
+    fn picking(&self, account: &AccountKey) -> bool {
+        crate::hub::lock(&self.queue).picked.contains_key(account)
+    }
+
     fn signed_out_since(&self, job: &Job) -> bool {
         let queue = crate::hub::lock(&self.queue);
         queue.epochs.get(&job.file.0).copied().unwrap_or(0) != job.epoch
@@ -419,7 +709,8 @@ impl Cache {
     fn fetch(&self, agent: &ureq::Agent, job: &Job, buffer: &mut [u8]) -> Option<Result<MediaFile, (MediaFile, String)>> {
         let (account, id) = &job.file;
         let failed = |file: &MediaFile, why: String| Some(Err((file.clone(), why)));
-        let part = dir_under(&self.dir, account).join(format!(".{}.part", name_of(id)));
+        let dir = dir_for(&self.dir, account, id);
+        let part = dir.join(format!(".{}.part", name_of(id)));
         // Twice at most: a file the shell wanted larger while the smaller one was arriving is
         // fetched again from where the row points now.
         for last in [false, true] {
@@ -432,7 +723,7 @@ impl Cache {
             if file.path.is_some() {
                 return Some(Ok(file));
             }
-            if let Err(err) = std::fs::create_dir_all(dir_under(&self.dir, account)) {
+            if let Err(err) = std::fs::create_dir_all(&dir) {
                 return failed(&file, format!("The cache directory could not be made: {err}."));
             }
             let want = fetch::Want {
@@ -448,7 +739,7 @@ impl Cache {
                 Ok(fetched) => fetched,
                 Err(why) => return failed(&file, why),
             };
-            if self.signed_out_since(job) {
+            if self.signed_out_since(job) || (is_pick(id) && !self.picking(account)) {
                 let _ = std::fs::remove_file(&part);
                 return None;
             }
@@ -462,6 +753,10 @@ impl Cache {
             let path = path_from(&self.dir, account, id, &now_at);
             if let Err(err) = std::fs::rename(&part, &path) {
                 let _ = std::fs::remove_file(&part);
+                // The picker closed and took its directory while this arrived: nobody wants it.
+                if is_pick(id) && !self.picking(account) {
+                    return None;
+                }
                 return failed(&file, format!("The file could not be kept: {err}."));
             }
             let landed = self.hub.store().media_landed(account, id, &path.to_string_lossy(), bytes, now());

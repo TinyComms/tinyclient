@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>tinychat design 08: first run, sign-in, accounts, settings</title>
+<title>tinyclient design 08: first run, sign-in, accounts, settings</title>
 <style>
 :root{
   --rail:#0c0d11;--sidebar:#111217;--canvas:#15161c;--panel:#1b1c24;
@@ -119,7 +119,7 @@ figcaption b{color:var(--text);font-weight:600}
 </head>
 <body>
 
-<!-- Shared symbols: network icons (crates/tinychat/assets/networks), Lucide glyphs, app icon -->
+<!-- Shared symbols: network icons (crates/tinyclient/assets/networks), Lucide glyphs, app icon -->
 <svg width="0" height="0" style="position:absolute" aria-hidden="true">
 <symbol id="n-discord" viewBox="0.02 57.8 511.92 396.3"><path d="M433.7 91a416.5 416.5 0 0 0-105.6-33.2c-4.6 8.2-9.9 19.3-13.5 28.1-39.4-5.9-78.4-5.9-117.1 0-3.7-8.8-9.1-19.9-13.7-28.1-37.1 6.4-72.6 17.7-105.7 33.3-66.8 101-85 199.5-75.9 296.6 44.3 33.1 87.3 53.2 129.6 66.4 10.4-14.4 19.7-29.6 27.7-45.7-15.3-5.8-29.9-13-43.7-21.3 3.7-2.7 7.2-5.6 10.7-8.5 84.2 39.4 175.8 39.4 259 0 3.5 2.9 7.1 5.8 10.7 8.5-13.9 8.3-28.5 15.5-43.8 21.3 8 16 17.3 31.3 27.7 45.7 42.3-13.2 85.3-33.3 129.6-66.4 10.8-112.5-18-210.1-76-296.7M170.9 328c-25.3 0-46-23.6-46-52.4s20.3-52.4 46-52.4 46.5 23.6 46 52.4c.1 28.8-20.2 52.4-46 52.4m170.2 0c-25.3 0-46-23.6-46-52.4s20.3-52.4 46-52.4 46.5 23.6 46 52.4c0 28.8-20.3 52.4-46 52.4" fill="#5865f2"/></symbol>
 <symbol id="n-slack" viewBox="0 0 512 512"><path d="M107.9 323.6c0 29.7-24 53.8-53.8 53.8S.3 353.4.3 323.6c0-29.7 24-53.8 53.8-53.8h53.8zm26.9 0c0-29.7 24-53.8 53.8-53.8s53.8 24 53.8 53.8V458c0 29.7-24 53.8-53.8 53.8s-53.8-24-53.8-53.8z" fill="#e01e5a"/><path d="M188.6 107.7c-29.7 0-53.8-24-53.8-53.8S158.8.1 188.6.1s53.8 24 53.8 53.8v53.8zm0 27.3c29.7 0 53.8 24 53.8 53.8s-24 53.8-53.8 53.8H53.8C24 242.6 0 218.5 0 188.8S24 135 53.8 135z" fill="#36c5f0"/><path d="M404.1 188.8c0-29.7 24-53.8 53.8-53.8s53.8 24 53.8 53.8-24 53.8-53.8 53.8h-53.8zm-26.9 0c0 29.7-24 53.8-53.8 53.8-29.7 0-53.8-24-53.8-53.8V54c0-29.7 24-53.8 53.8-53.8s53.8 24 53.8 53.8z" fill="#2eb67d"/><path d="M323.4 404.3c29.7 0 53.8 24 53.8 53.8 0 29.7-24 53.8-53.8 53.8-29.7 0-53.8-24-53.8-53.8v-53.8zm0-26.9c-29.7 0-53.8-24-53.8-53.8s24-53.8 53.8-53.8h134.8c29.7 0 53.8 24 53.8 53.8 0 29.7-24 53.8-53.8 53.8z" fill="#ecb22e"/></symbol>
@@ -167,7 +167,7 @@ figcaption b{color:var(--text);font-weight:600}
   <div class="lights"><i></i><i></i><i></i></div>
   <div class="center">
     <svg width="64" height="64"><use href="#appicon"/></svg>
-    <div class="t22" style="margin-top:16px">Welcome to tinychat</div>
+    <div class="t22" style="margin-top:16px">Welcome to tinyclient</div>
     <div class="soft" style="margin:6px 0 28px">Sign in to one network to start. Add the others whenever you like.</div>
     <div class="netcard">
       <div class="net focus"><svg class="ico" width="32" height="32"><use href="#n-discord"/></svg><div class="w"><div class="b">Discord</div><div class="s12 faint">Servers, direct messages and voice</div></div><div class="btn pri">Sign in</div></div>
@@ -187,7 +187,7 @@ figcaption b{color:var(--text);font-weight:600}
   <div class="lights"><i></i><i></i><i></i></div>
   <div class="center">
     <svg width="64" height="64"><use href="#appicon"/></svg>
-    <div class="t22" style="margin-top:16px">Welcome to tinychat</div>
+    <div class="t22" style="margin-top:16px">Welcome to tinyclient</div>
     <div class="soft" style="margin:6px 0 28px">Sign in to one network to start. Add the others whenever you like.</div>
     <div class="netcard">
       <div class="net" style="background:var(--hover)"><svg class="ico" width="32" height="32"><use href="#n-discord"/></svg><div class="w"><div class="b">Discord</div><div class="s12 soft">Finish signing in in the Discord window.</div></div><div class="btn quiet">Cancel</div></div>
@@ -202,7 +202,7 @@ figcaption b{color:var(--text);font-weight:600}
     <div class="page"><div style="color:#f2f3f5;font-size:18px;font-weight:600">Discord's own login page</div><div>discord.com/login, drawn by Discord.<br>Captcha, 2FA and passkeys happen here.</div><div class="ph"></div><div class="ph"></div><div class="ph" style="background:#5865f2"></div></div>
   </div>
 </div>
-<figcaption><b>2. Waiting during a Discord sign-in.</b> The helper window (520 × 760, shown at 75%) opens centered on the main window and stays above it; drawn offset here so the row is visible. The row says where to look and offers Cancel; clicking the row brings the helper forward. Other rows drop to 40% and do not respond. No spinner: tinychat does not know how far the person is. Closing the helper equals Cancel and leaves no message.</figcaption>
+<figcaption><b>2. Waiting during a Discord sign-in.</b> The helper window (520 × 760, shown at 75%) opens centered on the main window and stays above it; drawn offset here so the row is visible. The row says where to look and offers Cancel; clicking the row brings the helper forward. Other rows drop to 40% and do not respond. No spinner: tinyclient does not know how far the person is. Closing the helper equals Cancel and leaves no message.</figcaption>
 </figure>
 
 <!-- 3 SLACK WORKSPACES + LOADING -->

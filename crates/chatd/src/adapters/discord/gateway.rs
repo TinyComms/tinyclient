@@ -335,7 +335,7 @@ impl Discord {
             refused.1.clone()
         };
         self.ctx.attention(&format!(
-            "Discord would not start a session ({why}). Check your account in Discord; tinychat tries again when you open a conversation."
+            "Discord would not start a session ({why}). Check your account in Discord; tinyclient tries again when you open a conversation."
         ));
         self.held.store(true, Ordering::Relaxed);
         let wake = self.outbox.wake.poll_read();

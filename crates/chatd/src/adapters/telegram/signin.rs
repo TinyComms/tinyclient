@@ -475,7 +475,7 @@ impl Flow {
         let (Some(tl::enums::PasswordKdfAlgo::Sha256Sha256Pbkdf2Hmacsha512iter100000Sha256ModPow(algo)), Some(g_b), Some(srp_id)) =
             (&asked.current_algo, asked.srp_b.clone(), asked.srp_id)
         else {
-            return self.fail("This account's password is kept in a way this version of tinychat does not know. Update tinychat.");
+            return self.fail("This account's password is kept in a way this version of tinyclient does not know. Update tinyclient.");
         };
         // Telegram's numbers are checked before anything is proved with them: a bad group
         // would give the password away.
@@ -510,7 +510,7 @@ impl Flow {
     fn finish(&self, authorization: tl::enums::auth::Authorization, announce: bool) -> SignInStep {
         let user = match authorization {
             tl::enums::auth::Authorization::Authorization(tl::types::auth::Authorization { user: tl::enums::User::User(user), .. }) => user,
-            // tinychat does not create accounts.
+            // tinyclient does not create accounts.
             _ => return self.show(SignInStep::Phone { problem: Some(SignInProblem::PhoneUnknown) }, announce),
         };
         self.wire.signed_in(&user);
@@ -529,7 +529,7 @@ impl Flow {
                 let _ = wire::call(self.wire.as_ref(), &tl::functions::auth::LogOut {});
                 let keychain = why.starts_with("keychain");
                 SignInStep::Failed {
-                    reason: if keychain { "tinychat couldn't save the sign-in to your keychain.".to_owned() } else { why },
+                    reason: if keychain { "tinyclient couldn't save the sign-in to your keychain.".to_owned() } else { why },
                 }
             }
         };

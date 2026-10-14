@@ -25,6 +25,11 @@ use ureq::tls::{TlsConfig, TlsProvider};
 /// The session itself comes from `TINYCHAT_SESSION_DISCORD` / `TINYCHAT_SESSION_SLACK` (see
 /// `session::load`), which are read only in a scratch directory.
 pub fn address(var: &str, default: &str) -> String {
+    // Only a scratch directory may point an adapter elsewhere: a stray variable must never send a
+    // real session to some other server.
+    if crate::session::enabled() {
+        return default.to_owned();
+    }
     std::env::var(var).unwrap_or_else(|_| default.to_owned())
 }
 
@@ -128,7 +133,7 @@ mod tests {
     #[test]
     fn a_logged_address_loses_its_token() {
         let logged = redact("Unable to connect to wss://wss-primary.slack.com/?token=xoxc-12-ab_C&batch=1 (timed out)");
-        assert_eq!(logged, "Unable to connect to wss://wss-primary.slack.com/?[redacted]&batch=1 (timed out)");
+        assert_eq!(logged, "Unable to connect to wss://wss-primary.slack.com/?token=[redacted]&batch=1 (timed out)");
         assert_eq!(redact("cookie d=xoxd-abc%2Fdef rejected"), "cookie d=[redacted] rejected");
         assert_eq!(redact("410 Gone"), "410 Gone");
     }

@@ -170,7 +170,7 @@ impl Attachment {
     }
 }
 
-/// A link's card, as the network built it. tinychat never fetches the link itself.
+/// A link's card, as the network built it. tinyclient never fetches the link itself.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Preview {
     pub url: String,
@@ -266,7 +266,7 @@ pub enum MessageKind {
     Normal,
     /// One grey line: joined, pinned, call started. `text` says it.
     System,
-    /// Something tinychat cannot draw. `text` names it ("Poll: Lunch?") and `link` opens it in the
+    /// Something tinyclient cannot draw. `text` names it ("Poll: Lunch?") and `link` opens it in the
     /// official app. Never blank, never dropped.
     Unsupported {
         #[serde(default, skip_serializing_if = "String::is_empty")]

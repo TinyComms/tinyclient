@@ -75,8 +75,15 @@
   "department": "Product",
   "userLocation": "Lisbon",
   "tenantName": "Contoso",
-  "userType": "Member",
+  "userType": "Guest",
   "type": "ADUser",
+  "isShortProfile": true
+ },
+ {
+  "mri": "28:00000000-0000-4000-8000-0000000000f1",
+  "objectId": "00000000-0000-4000-8000-0000000000f1",
+  "displayName": "Workflows",
+  "type": "Bot",
   "isShortProfile": true
  }
 ]

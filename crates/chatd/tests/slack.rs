@@ -58,6 +58,8 @@ struct Call {
     params: HashMap<String, String>,
     user_agent: String,
     cookie: String,
+    /// The body's length: what an upload carried.
+    bytes: usize,
     at: Instant,
 }
 
@@ -247,6 +249,7 @@ impl Fake {
             params: HashMap::new(),
             user_agent: header("user-agent"),
             cookie: header("cookie"),
+            bytes: body.len(),
             at: Instant::now(),
         };
         if let Some(method) = path.strip_prefix("/api/") {
@@ -335,7 +338,35 @@ impl Fake {
                 }));
                 Some(json!({"ok": true, "channel": channel, "ts": param("ts")}))
             }
-            "users.setPresence" => Some(json!({"ok": true})),
+            "users.setPresence" | "users.prefs.setNotifications" => Some(json!({"ok": true})),
+            "files.getUploadURLExternal" => {
+                let id = format!("F0UP{}", param("filename").len());
+                Some(json!({"ok": true, "upload_url": format!("{}/upload/v1/{id}", self.base), "file_id": id}))
+            }
+            "files.completeUploadExternal" => {
+                // Slack shares the files, then tells every client of the message holding them.
+                let files: Value = serde_json::from_str(param("files")).unwrap();
+                let shared: Vec<Value> = files
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|file| json!({"id": file["id"], "name": file["title"], "title": file["title"], "mimetype": "text/plain", "size": 3,
+                                        "url_private": format!("https://files.slack.com/files-pri/{}-{}/f", team(token), file["id"].as_str().unwrap())}))
+                    .collect();
+                let number = self.posted.fetch_add(1, Ordering::Relaxed) + 1;
+                let ts = format!("17600020{number:02}.{number:06}");
+                let mut event = json!({"type": "message", "subtype": "file_share", "user": me(token), "channel": param("channel_id"),
+                                       "text": param("initial_comment"), "ts": ts, "files": shared, "upload": true});
+                if !param("thread_ts").is_empty() {
+                    event["thread_ts"] = param("thread_ts").into();
+                }
+                echo(event);
+                Some(json!({"ok": true, "files": files}))
+            }
+            "chat.scheduleMessage" => Some(json!({
+                "ok": true, "channel": channel, "scheduled_message_id": "Q0SCHED", "post_at": param("post_at").parse::<i64>().unwrap(),
+                "message": {"type": "message", "user": me(token), "text": param("text"), "bot_id": null},
+            })),
             "users.profile.set" => {
                 let asked: Value = serde_json::from_str(param("profile")).unwrap();
                 let mut profile = self.user(token, me(token)).unwrap()["profile"].clone();
@@ -638,7 +669,7 @@ impl World {
         setup(&fake);
         // Short path: a unix socket address holds about 100 bytes.
         let dir = PathBuf::from(format!(
-            "/tmp/tinychat-slack-{}-{}",
+            "/tmp/tinyclient-slack-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
@@ -797,6 +828,7 @@ impl Drop for World {
         let _ = self.child.kill();
         let _ = self.child.wait();
         let _ = std::fs::remove_dir_all(&self.dir);
+        let _ = std::fs::remove_dir_all(self.dir.with_extension("files"));
     }
 }
 
@@ -859,7 +891,7 @@ fn one_sign_in_is_two_workspaces_each_with_its_sidebar_and_unread_state() {
     assert_eq!(row("D0ANA").avatar.as_ref().map(|avatar| (avatar.kind, avatar.width)), Some((MediaKind::Avatar, 72)));
     assert!(rows.iter().all(|row| row.call == CallSupport::Handoff && row.space.as_deref() == Some("T01ALPHA")));
     // What a row says of itself: where it is, what it is for, who may see it and post in it.
-    assert_eq!(row("C0GEN").subtitle(), "Acme > Channels · Company-wide");
+    assert_eq!(row("C0GEN").subtitle(), "Acme › Channels · Company-wide");
     assert_eq!(row("C0SIDE").topic, "Announcements only", "the purpose, where no topic is set");
     let flags = |id: &str| (row(id).private, row(id).read_only);
     assert_eq!((flags("C0GEN"), flags("C0DEP"), flags("C0SIDE"), flags("D0ANA")), ((false, false), (true, false), (false, true), (true, false)));
@@ -994,10 +1026,10 @@ fn a_channel_reads_as_it_does_in_slack_and_stays_current() {
         .iter()
         .map(|reaction| (reaction.emoji.as_str(), reaction.count, reaction.mine, reaction.file.is_some()))
         .collect();
-    assert_eq!(reactions, [("🎉", 2, true, false), (":partyparrot:", 1, false, true)]);
-
-    let parrot = shipping.reactions[1].file.as_ref().unwrap();
-    assert!(parrot.kind == MediaKind::Emoji && parrot.id.starts_with("emoji:partyparrot:"), "{}", parrot.id);
+    // A custom emoji shows by name: the workspace's list is read when the picker asks for
+    // it, never because a message arrived.
+    assert_eq!(reactions, [("🎉", 2, true, false), (":partyparrot:", 1, false, false)]);
+    assert!(world.fake.calls(ALPHA, "emoji.list").is_empty());
 
     // Its files are registered with their sizes before any byte is fetched. Only the upload is
     // asked for here: its address is the fake's, and the avatar's and emoji's are Slack's own.
@@ -1728,10 +1760,19 @@ fn presence_a_profile_and_signing_out() {
     let Response::Profile { profile } = world.ask(Request::Profile { person: alpha("U0ANA"), space: None }) else {
         panic!("no profile");
     };
-    assert_eq!((profile.bio.as_str(), profile.time_zone.as_str(), profile.utc_offset), ("Design lead", "Europe/Lisbon", Some(3600)));
+    // The title is a title, not a bio (06, story 3).
+    assert_eq!((profile.title.as_str(), profile.bio.as_str()), ("Design lead", ""));
+    assert_eq!((profile.time_zone.as_str(), profile.utc_offset), ("Europe/Lisbon", Some(3600)));
     assert_eq!((profile.person.name.as_str(), profile.person.link.as_str()), ("Ana", "slack://user?team=T01ALPHA&id=U0ANA"));
     assert_eq!(world.fake.calls(ALPHA, "users.info").len(), before + 1);
     assert!(world.fake.calls(ALPHA, "users.profile.get").is_empty());
+    // Opened again from the Space (an answer chatd itself has not kept), Slack is still not
+    // asked again: one `users.info` per person per hour, the card read then answered again.
+    let Response::Profile { profile } = world.ask(Request::Profile { person: alpha("U0ANA"), space: Some(alpha("T01ALPHA")) }) else {
+        panic!("no profile");
+    };
+    assert_eq!(profile.title.as_str(), "Design lead");
+    assert_eq!(world.fake.calls(ALPHA, "users.info").len(), before + 1);
 
     // Signing out of one workspace has nothing to end on Slack, so it answers at once, and the
     // browser's session, which the other workspace shares, is left alone.
@@ -1854,18 +1895,17 @@ fn connecting_asks_little_spaces_what_it_warms_and_a_reconnect_asks_less() {
     sleep(Duration::from_secs(2));
     assert_eq!(world.fake.counted(ALPHA), expected(5, 2, 1));
 
-    // chatd is run again, on its cache: connecting reads the unread state and not the sidebar.
-    // Opening the Space is what reads that, once.
+    // chatd is run again, on its cache: connecting reads the unread state and not the sidebar,
+    // and opening the Space reads nothing more. Every DM ever is paged only on a first load.
     world.restart();
     world.ready();
     world.until("the unread state after the restart", || (world.fake.calls(ALPHA, "users.prefs.get").len() == 3).then_some(()));
     sleep(Duration::from_secs(2));
-    assert_eq!(world.fake.calls(ALPHA, "users.conversations").len(), 1);
     world.tree(&alpha("T01ALPHA")).unwrap();
-    world.until("the sidebar to be read", || (world.fake.calls(ALPHA, "users.conversations").len() == 2).then_some(()));
     world.tree(&alpha("T01ALPHA")).unwrap();
     sleep(Duration::from_secs(2));
-    assert_eq!(world.fake.calls(ALPHA, "users.conversations").len(), 2);
+    assert_eq!(world.fake.calls(ALPHA, "users.conversations").len(), 1);
+    assert_eq!(world.fake.calls(ALPHA, "client.counts").len(), 3, "one per connection, none for opening");
     // A new run warms again, the same few and no more.
     world.within(Duration::from_secs(40), "the second run's warming", || (history(&world).len() >= 10).then_some(()));
     sleep(Duration::from_secs(7));
@@ -1954,4 +1994,180 @@ fn a_reissued_cookie_is_used_and_saved_and_a_demand_only_slacks_app_can_meet_sto
     sleep(Duration::from_millis(1500));
     assert_eq!(world.fake.calls.lock().unwrap().iter().filter(|call| call.token == ALPHA).count(), asked);
     assert_eq!(world.account("T02BETA").required, "", "the other workspace is not held up");
+}
+
+#[test]
+fn rows_on_screen_get_their_newest_message_paced_and_people_carry_what_slack_says_of_them() {
+    let world = World::start();
+    world.ready();
+    world.until("the sidebar", || world.tree(&alpha("T01ALPHA")).filter(|(_, rows)| rows.len() >= 7));
+    let limited = |world: &World| -> Vec<Call> {
+        let calls = world.fake.calls(ALPHA, "conversations.history");
+        calls.into_iter().filter(|call| call.params.get("limit").map(String::as_str) == Some("1")).collect()
+    };
+    // Four rows with no preview are on screen. The first is asked for at once.
+    let rows: Vec<Key> = ["C0RND", "C0SIDE", "G0GRP", "D0BOT"].iter().map(|id| alpha(id)).collect();
+    assert!(rows.iter().all(|row| world.conversation(row).unwrap().preview.is_empty()));
+    world.ask(Request::Watch(Watching { rows: rows.clone(), ..Watching::default() }));
+    world.until("the first preview", || (!limited(&world).is_empty()).then_some(()));
+    // The screen moves on before the rest come up: only what is still there is asked for.
+    world.ask(Request::Watch(Watching { rows: rows[..2].to_vec(), ..Watching::default() }));
+    world.until("the second preview", || (limited(&world).len() == 2).then_some(()));
+    sleep(Duration::from_secs(3));
+    let asked = limited(&world);
+    let channels: Vec<&str> = asked.iter().map(|call| call.params["channel"].as_str()).collect();
+    assert_eq!(channels, ["C0RND", "C0SIDE"], "rows that left the screen are not asked for");
+    assert!(asked[1].at - asked[0].at >= Duration::from_secs(1), "at most one a second: {:?}", asked[1].at - asked[0].at);
+    // The store answers with the preview.
+    world.until("the row's preview", || world.conversation(&alpha("C0RND")).filter(|row| row.preview.contains("lunch at noon")));
+    // Asked again (the shell repaints), nothing more is fetched.
+    world.ask(Request::Watch(Watching { rows: rows[..2].to_vec(), ..Watching::default() }));
+    sleep(Duration::from_millis(1500));
+    assert_eq!(limited(&world).len(), 2);
+
+    // What Slack's user objects say, kept at no extra request: title, local offset, status
+    // emoji and a huddle; a guest is tagged; an app's DM is an app's.
+    let people = |query: &str| match world.ask(Request::People { network: Some(Network::Slack), relation: None, query: Some(query.into()), offset: 0, limit: 10 }) {
+        Response::People { people, .. } => people,
+        other => panic!("{other:?}"),
+    };
+    let ana = people("Ana").into_iter().find(|person| person.key == alpha("U0ANA")).expect("Ana");
+    assert_eq!((ana.title.as_str(), ana.utc_offset, ana.emoji.as_str()), ("Design lead", Some(3600), "🎧"));
+    assert_eq!(ana.activity.as_deref().map(|activity| activity.kind), Some(protocol::ActivityKind::Huddle));
+    let ben = people("Ben").into_iter().find(|person| person.key == alpha("U0BEN")).expect("Ben, who wrote in #random");
+    assert_eq!(ben.mark, Some(protocol::Mark::Guest));
+    assert!(world.conversation(&alpha("D0BOT")).unwrap().bot && !world.conversation(&alpha("D0ANA")).unwrap().bot);
+
+    // What the account may send, said at connect.
+    let can = world.account("T01ALPHA").can;
+    assert_eq!((can.max_file_bytes, can.max_files, can.custom_emoji), (1 << 30, 10, protocol::EmojiScope::All));
+    assert!(can.schedule && can.suppress_embeds && !can.gifs && !can.stickers && !can.silent);
+}
+
+#[test]
+fn info_mute_pins_files_emoji_threads_and_a_scheduled_send_ask_slack_once_each() {
+    let world = World::start();
+    world.ready();
+    let general = alpha("C0GEN");
+    let info = match world.ask(Request::ConversationInfo { conversation: general.clone() }) {
+        Response::ConversationInfo { info } => info,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(info.members, Some(4));
+    assert_eq!(world.fake.calls(ALPHA, "conversations.info").last().unwrap().params["include_num_members"], "true");
+    // A DM's is two people, and asks nothing.
+    let before = world.fake.calls(ALPHA, "conversations.info").len();
+    match world.ask(Request::ConversationInfo { conversation: alpha("D0ANA") }) {
+        Response::ConversationInfo { info } => assert_eq!(info.members, Some(2)),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(world.fake.calls(ALPHA, "conversations.info").len(), before);
+
+    // Mute and unmute: the web client's notification call, and the row follows.
+    assert_eq!(world.ask(Request::SetMute { conversation: general.clone(), notify: protocol::Notify::Nothing }), Response::Ok);
+    let set = world.fake.calls(ALPHA, "users.prefs.setNotifications");
+    assert_eq!((set[0].params["name"].as_str(), set[0].params["value"].as_str(), set[0].params["channel_id"].as_str()), ("muted", "true", "C0GEN"));
+    assert!(world.conversation(&general).unwrap().muted);
+    assert_eq!(world.ask(Request::SetMute { conversation: general.clone(), notify: protocol::Notify::Mentions }), Response::Ok);
+    let set = world.fake.calls(ALPHA, "users.prefs.setNotifications");
+    assert!(set[1].params["prefs"].contains("mentions_dms") && set[1].params["channel_ids"] == "C0GEN");
+    assert!(!world.conversation(&general).unwrap().muted);
+
+    // Pins: the pinned messages, not the file pinned on its own.
+    let pinned = match world.ask(Request::Pinned { conversation: general.clone() }) {
+        Response::Pinned { messages, .. } => messages,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(pinned.iter().map(|message| message.text.as_str()).collect::<Vec<_>>(), ["Release checklist lives in the wiki"]);
+
+    // Files shared here, from Slack's list, because the user asked; links have no such list.
+    let shared = |kind, search| world.ask(Request::Shared { conversation: general.clone(), kind, before: None, limit: 25, search });
+    match shared(protocol::SharedKind::Media, true) {
+        Response::Shared { items, complete, total, .. } => {
+            assert!(complete && total == Some(12));
+            assert_eq!((items[0].message_id.as_str(), items[0].attachment.as_ref().unwrap().name.as_str()), ("1760000201.000201", "map.png"));
+        }
+        other => panic!("{other:?}"),
+    }
+    let listed = world.fake.calls(ALPHA, "files.list");
+    assert_eq!((listed[0].params["channel"].as_str(), listed[0].params["types"].as_str()), ("C0GEN", "images"));
+    assert!(matches!(shared(protocol::SharedKind::Links, true), Response::Error { code: ErrorCode::Unsupported, .. }));
+    assert_eq!(world.fake.calls(ALPHA, "files.list").len(), 1);
+
+    // The workspace's emoji, from the list kept a day: asked once, then read from the store.
+    let emoji = |query: &str| match world.ask(Request::Catalog { account: alpha("x").account(), kind: protocol::CatalogKind::Emoji, space: None, query: query.into(), cursor: None }) {
+        Response::Catalog { items, .. } => items.into_iter().map(|item| item.name).collect::<Vec<_>>(),
+        other => panic!("{other:?}"),
+    };
+    let listed_before = world.fake.calls(ALPHA, "emoji.list").len();
+    assert_eq!(emoji("parrot"), [":parrot:", ":partyparrot:"], "an alias of a custom emoji is offered with its picture");
+    assert!(!emoji("").contains(&":shipit:".to_owned()), "an alias of a standard emoji is the shell's own list's");
+    assert!(emoji("").contains(&":partyparrot:".to_owned()));
+    assert!(world.fake.calls(ALPHA, "emoji.list").len() <= listed_before.max(1));
+
+    // The Threads list: the followed threads, asked once, recorded as followed with their
+    // newest replies; a thread in a channel not in the sidebar is left alone.
+    let threads = |world: &World| match world.ask(Request::Threads { space: alpha("T01ALPHA"), offset: 0, limit: 50 }) {
+        Response::Conversations { conversations, .. } => conversations,
+        other => panic!("{other:?}"),
+    };
+    threads(&world);
+    let thread = format!("C0GEN:{ROOT}");
+    let followed = world.until("the followed thread", || world.conversation(&alpha(&thread)).filter(|row| row.followed));
+    assert_eq!(followed.unread, 1, "one reply after the last read");
+    assert!(world.messages(&alpha(&thread)).iter().any(|message| message.text == "moved to 3pm"));
+    assert!(world.conversation(&alpha("C0ELSEWHERE:1760000100.000100")).is_none());
+    threads(&world);
+    sleep(Duration::from_millis(500));
+    assert_eq!(world.fake.calls(ALPHA, "subscriptions.thread.getView").len(), 1);
+
+    // Scheduled: Slack sends it later; nothing here runs a timer.
+    let at = now() + 3600;
+    let with = protocol::Outgoing { schedule: Some(at), suppress_embeds: true, ..Default::default() };
+    let asked = Request::Send { conversation: general.clone(), client_id: "61".into(), text: "standup <in> 1h".into(), reply_to: None, with };
+    assert!(matches!(world.ask(asked), Response::Sent { .. }));
+    let scheduled = world.until("the schedule to be asked", || world.fake.calls(ALPHA, "chat.scheduleMessage").pop());
+    assert_eq!(scheduled.params["post_at"], at.to_string());
+    assert_eq!(scheduled.params["text"], "standup &lt;in&gt; 1h");
+    assert_eq!(scheduled.params["unfurl_links"], "false");
+    assert!(world.fake.calls(ALPHA, "chat.postMessage").is_empty());
+}
+
+#[test]
+fn files_go_up_from_their_paths_and_the_socket_names_the_message() {
+    let world = World::start();
+    world.ready();
+    // Beside chatd's directory: it never sends from its own.
+    let dir = world.dir.with_extension("files");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("notes.txt");
+    std::fs::write(&path, b"abc").unwrap();
+    let with = protocol::Outgoing {
+        files: vec![protocol::OutgoingFile { path: path.to_string_lossy().into_owned(), name: String::new(), spoiler: false, as_file: false, original: false }],
+        ..Default::default()
+    };
+    let asked = Request::Send { conversation: alpha("C0GEN"), client_id: "71".into(), text: "the notes".into(), reply_to: None, with };
+    assert!(matches!(world.ask(asked), Response::Sent { .. }));
+    let sent = world.until("the upload to settle", || {
+        world.messages(&alpha("C0GEN")).into_iter().find(|message| message.client_id.as_deref() == Some("71")).filter(|message| message.state != SendState::Pending)
+    });
+    assert_eq!(sent.state, SendState::Sent);
+    assert!(sent.id.starts_with("1760002"), "named by the socket: {}", sent.id);
+    assert_eq!(sent.attachments.iter().map(|attachment| attachment.name.as_str()).collect::<Vec<_>>(), ["notes.txt"]);
+    let address = world.fake.calls(ALPHA, "files.getUploadURLExternal");
+    assert_eq!((address[0].params["filename"].as_str(), address[0].params["length"].as_str()), ("notes.txt", "3"));
+    let upload = world.fake.file("/upload/v1/F0UP9").expect("the bytes went to the address Slack gave");
+    assert_eq!(upload.bytes, 3);
+    let completed = world.fake.calls(ALPHA, "files.completeUploadExternal");
+    assert_eq!((completed[0].params["channel_id"].as_str(), completed[0].params["initial_comment"].as_str()), ("C0GEN", "the notes"));
+    assert_eq!(completed[0].params["files"], r#"[{"id":"F0UP9","title":"notes.txt"}]"#);
+    // Listed once: the socket's copy is the send's own.
+    assert_eq!(world.messages(&alpha("C0GEN")).iter().filter(|message| message.id == sent.id).count(), 1);
+
+    // A link preview dismissed: Slack is asked not to unfurl.
+    let with = protocol::Outgoing { suppress_embeds: true, ..Default::default() };
+    let asked = Request::Send { conversation: alpha("C0GEN"), client_id: "72".into(), text: "see https://example.com".into(), reply_to: None, with };
+    assert!(matches!(world.ask(asked), Response::Sent { .. }));
+    let posted = world.until("the post", || world.fake.calls(ALPHA, "chat.postMessage").pop());
+    assert_eq!((posted.params["unfurl_links"].as_str(), posted.params["unfurl_media"].as_str()), ("false", "false"));
 }

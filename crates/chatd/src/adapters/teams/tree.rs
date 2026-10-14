@@ -1,18 +1,26 @@
-//! Teams as Spaces: each team with its channels as the tree, the chat list as a Space of its
-//! own, and the unread state Teams keeps for all of it. Everything comes from one call.
+//! Teams' lists: the chats, which belong to no Space (meeting chats, app chats and the user's
+//! own Notes among them), each team as a Space with its channels as the tree, and the unread
+//! state Teams keeps for all of it. Everything comes from one call, and the Activity stream is
+//! read once at connect for the mentions that came while tinyclient was closed.
 
 use super::{chain_id, escaped, id_of, millis, seconds, thread_of, Auth, Body, Fault, Teams, AGGREGATOR, TREE_FRESH};
 use crate::adapters::Command;
-use crate::store::{ConversationRow, SpaceRow};
-use protocol::{CallSupport, ConversationKind, Group, GroupKind, Relation};
+use crate::store::{ConversationRow, Filing, PreviewLine, SpaceRow};
+use protocol::{CallSupport, ConversationKind, Relation, Special};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::time::Instant;
 
-/// The Space, and the group in it, that hold the chat list.
-/// CONTRACT: a conversation is in one Space, so the chats cannot be a `Directs` group in every
-/// team's tree. They are a Space of their own, first, with that one group.
-const CHATS: &str = "chats";
+/// The Space an earlier build kept the chats in. Gone: chats belong to no Space.
+const OLD_CHATS: &str = "chats";
+/// The user's own notes, Teams' "(You)" chat.
+const NOTES: &str = "48:notes";
+/// Teams' Activity stream: mentions, replies and reactions, as messages of a conversation.
+const ACTIVITY: &str = "48:notifications";
+/// The Activity stream's page read at connect.
+const ACTIVITY_PAGE: u32 = 50;
+/// The longest a reply chain's title is: the start of its post.
+const CHAIN_TITLE: usize = 40;
 /// Unread chats whose newest page is fetched after connecting, paced, so their rows have a
 /// preview. Everything else is fetched when it is opened.
 const WARMED: usize = 5;
@@ -90,29 +98,30 @@ impl Teams {
         let (teams, chats) = (taken(&mut listed, "teams"), taken(&mut listed, "chats"));
         drop(listed);
         let me = self.me();
+        // The chats first: written with no Space, they leave the one an earlier build kept them
+        // in before that Space goes.
+        self.chats(chats, &me, first)?;
         let teams: Vec<&Value> = teams.iter().filter(|team| team["isDeleted"] != true && !text(team, "id").is_empty()).collect();
-        let mut spaces = vec![SpaceRow {
-            id: CHATS.to_owned(),
-            name: "Chats".to_owned(),
-            icon: None,
-            position: 0,
-        }];
-        spaces.extend(teams.iter().enumerate().map(|(at, team)| SpaceRow {
-            id: text(team, "id").to_owned(),
-            name: text(team, "displayName").to_owned(),
-            icon: None,
-            position: at as i32 + 1,
-        }));
+        let spaces: Vec<SpaceRow> = teams
+            .iter()
+            .enumerate()
+            .map(|(at, team)| SpaceRow {
+                id: text(team, "id").to_owned(),
+                name: text(team, "displayName").to_owned(),
+                icon: None,
+                position: at as i32,
+            })
+            .filter(|space| space.id != OLD_CHATS)
+            .collect();
         self.ctx.spaces(&spaces)?;
 
         for team in teams {
             let id = text(team, "id");
-            // General first, then the order Teams lists them in. A channel the user hid is left
-            // out. Unverified: that `isFavorite: false` is what hiding a channel writes.
-            let shown = |channel: &&Value| {
-                channel["isDeleted"] != true && (channel["isGeneral"] == true || channel["isFavorite"] != false || channel["isPinned"] == true)
-            };
-            let mut channels: Vec<&Value> = team["channels"].as_array().into_iter().flatten().filter(shown).collect();
+            // General first, then the order Teams lists them in. A channel the user hid is kept
+            // apart (`opted_out`), behind the tree's "Show hidden". Unverified: that
+            // `isFavorite: false` is what hiding a channel writes.
+            let hidden = |channel: &Value| channel["isGeneral"] != true && channel["isFavorite"] == false && channel["isPinned"] != true;
+            let mut channels: Vec<&Value> = team["channels"].as_array().into_iter().flatten().filter(|channel| channel["isDeleted"] != true).collect();
             channels.sort_by_key(|channel| channel["isGeneral"] != true);
             let rows: Vec<ConversationRow> = channels
                 .iter()
@@ -123,6 +132,7 @@ impl Teams {
                     call: CallSupport::Handoff,
                     private: channel["channelType"].as_u64().is_some_and(|kind| kind != 0),
                     read_only: team["isArchived"] == true || channel["isArchived"] == true,
+                    opted_out: hidden(channel),
                     ..ConversationRow::new(text(channel, "id"), ConversationKind::Channel, text(channel, "displayName"))
                 })
                 .collect();
@@ -135,8 +145,12 @@ impl Teams {
                 self.count(text(channel, "id"), &counted(channel, &me), channel["isMuted"] == true)?;
             }
         }
-        self.chats(chats, &me, first)?;
         self.state().listed = Some(Instant::now());
+        if first {
+            if let Err(fault) = self.activity_feed() {
+                eprintln!("chatd: Teams: activity: {}", super::reason(fault));
+            }
+        }
         Ok(())
     }
 
@@ -158,13 +172,17 @@ impl Teams {
             let members = chat["members"].as_array().into_iter().flatten();
             members.filter_map(|member| member["mri"].as_str()).filter(|mri| *mri != me).map(str::to_owned).collect()
         };
-        // System streams (notifications, call logs, notes to self) are not conversations.
-        let shown = |chat: &&Value| chat["hidden"] != true && chat["isConversationDeleted"] != true && !text(chat, "id").starts_with("48:");
+        // System streams are not conversations, but for the user's own notes. The Activity
+        // stream is read for its mentions (`activity_feed`); the call log is not read.
+        let shown = |chat: &&Value| {
+            let id = text(chat, "id");
+            chat["isConversationDeleted"] != true && !id.is_empty() && (!id.starts_with("48:") || id == NOTES)
+        };
         let mut chats: Vec<(&Value, Counted)> = chats.iter().filter(shown).map(|chat| (chat, counted(chat, me))).collect();
         // Teams' own order: the chat that spoke last is first.
         chats.sort_by_key(|(_, counted)| std::cmp::Reverse(counted.updated));
-        // The people a chat is named after: its partner, or the first few of a group with no
-        // title. Asked for together, once, and only those not already known.
+        // The people a chat is named after: its partner (a person or an app), or the first few
+        // of a group with no title. Asked for together, once, and only those not already known.
         let mut wanted: Vec<String> = Vec::new();
         for (chat, _) in &chats {
             if chat["isOneOnOne"] == true || text(chat, "title").is_empty() {
@@ -174,34 +192,41 @@ impl Teams {
         wanted.truncate(NAMED);
         self.lookup(&wanted);
 
-        let (mut rows, mut partners, mut warm) = (Vec::with_capacity(chats.len()), HashMap::new(), Vec::new());
+        let (mut partners, mut warm) = (HashMap::new(), Vec::new());
         for (position, (chat, counted)) in chats.iter().enumerate() {
             let (id, people) = (text(chat, "id"), others(chat));
-            let partner = people.first().filter(|_| chat["isOneOnOne"] == true && people.len() == 1);
-            let mut row = self.chat_row(id, text(chat, "title"), &people, partner.map(String::as_str));
+            // A one-to-one with a person, or with an app (`28:`), which Teams may not flag as
+            // one-to-one (unverified).
+            let alone = people.len() == 1 && (chat["isOneOnOne"] == true || people[0].starts_with("28:"));
+            let partner = people.first().filter(|_| alone);
+            let mut row = self.chat_row(id, &title_of(chat), &people, partner.map(String::as_str));
             row.position = position as i32;
+            row.meeting = is_meeting(chat);
+            row.filing = Some(Filing { hidden: chat["hidden"] == true, ..Filing::default() });
             if row.title.is_empty() {
-                row.title = Some(text(&chat["lastMessage"], "imDisplayName")).filter(|name| !name.is_empty()).unwrap_or("Chat").to_owned();
+                // Never the user's own name: the last sender is used only when it was not me.
+                let last = &chat["lastMessage"];
+                let from = text(last, "from");
+                let other = !from.is_empty() && from.rsplit('/').next() != Some(me);
+                row.title = match (other, last["imDisplayName"].as_str()) {
+                    (true, Some(name)) if !name.is_empty() => name.to_owned(),
+                    _ if people.len() > 1 => format!("Group chat ({})", people.len() + 1),
+                    _ => "Chat".to_owned(),
+                };
             }
-            if let Some(partner) = partner {
+            if let Some(partner) = partner.filter(|partner| partner.starts_with("8:")) {
                 partners.insert(partner.clone(), id.to_owned());
             }
             if counted.unread && warm.len() < WARMED {
                 warm.push(id.to_owned());
             }
-            rows.push(row);
+            self.ctx.conversation(&row)?;
+            self.count(id, counted, chat["members"].as_array().into_iter().flatten().any(|member| member["mri"] == me && member["isMuted"] == true))?;
+            if let Some(line) = preview_of(chat, me) {
+                self.ctx.preview(id, &line)?;
+            }
         }
-        let group = Group {
-            kind: GroupKind::Directs,
-            ..Group::new(CHATS, "Chats", 0)
-        };
-        self.ctx.tree(CHATS, &[group], &rows)?;
-        drop(rows);
-        for (chat, counted) in &chats {
-            let mine = chat["members"].as_array().into_iter().flatten().find(|member| member["mri"] == me);
-            self.count(text(chat, "id"), counted, mine.is_some_and(|mine| mine["isMuted"] == true))?;
-        }
-        // The list the user owns on Teams: the people they have a chat with.
+        // The list the user owns on Teams: the people they have a chat with. Apps are not people.
         let relations: Vec<(String, Relation)> = partners.keys().map(|person| (person.clone(), Relation::Contact)).collect();
         self.ctx.relations(&relations)?;
         self.state().partners = partners;
@@ -213,29 +238,81 @@ impl Teams {
         Ok(())
     }
 
-    /// A chat's row: named after its partner, its own title, or the first people in it.
+    /// A chat's row: named after its partner, its own title, or the first people in it. The
+    /// user's Notes are `Saved`; a chat with an app is `bot` and named after the app.
     fn chat_row(&self, id: &str, title: &str, people: &[String], partner: Option<&str>) -> ConversationRow {
         let name = |person: &String| self.name_of(person);
+        let me = self.me();
         let (kind, title) = match partner {
+            _ if id == NOTES => (ConversationKind::Direct, "Notes".to_owned()),
             Some(partner) => (ConversationKind::Direct, self.name_of(partner).unwrap_or_default()),
             None if !title.is_empty() => (ConversationKind::Group, title.to_owned()),
             None => {
-                let mut names: Vec<String> = people.iter().take(3).filter_map(name).collect();
+                // The first two, then how many more: "Ana, Ben, +3".
+                let mut names: Vec<String> = people.iter().filter(|person| **person != me).take(2).filter_map(name).collect();
                 if people.len() > names.len() && !names.is_empty() {
                     names.push(format!("+{}", people.len() - names.len()));
                 }
                 (ConversationKind::Group, names.join(", "))
             }
         };
+        let bot = partner.is_some_and(|partner| partner.starts_with("28:"));
+        let notes = id == NOTES;
+        let avatar = match notes {
+            true => self.picture(&me, &title),
+            false => partner.and_then(|partner| self.picture(partner, &title)),
+        };
         ConversationRow {
-            space: Some(CHATS.to_owned()),
-            group: Some(CHATS.to_owned()),
-            position: LAST,
-            avatar: partner.and_then(|partner| self.picture(partner, &title)).map(|file| file.id),
-            peer: partner.map(str::to_owned),
-            call: CallSupport::Handoff,
+            avatar: avatar.map(|file| file.id),
+            peer: partner.filter(|_| !bot).map(str::to_owned),
+            call: if bot || notes { CallSupport::None } else { CallSupport::Handoff },
+            bot,
+            special: if notes { Special::Saved } else { Special::None },
             ..ConversationRow::new(id, kind, title)
         }
+    }
+
+    /// The Activity stream's newest page, once at connect: each mention of me newer than its
+    /// conversation's read marker counts, so mentions that came while tinyclient was closed are
+    /// not lost. Unverified: the shape of an activity (`properties.activity`), read off the web
+    /// client's own reading of this stream.
+    fn activity_feed(&self) -> Result<(), Fault> {
+        let (items, _) = self.page(ACTIVITY, ACTIVITY_PAGE, "startTime=1")?;
+        let mut found: HashMap<String, Vec<String>> = HashMap::new();
+        for item in &items {
+            let activity = match &item["properties"]["activity"] {
+                Value::String(text) => serde_json::from_str(text).unwrap_or(Value::Null),
+                other => other.clone(),
+            };
+            let kind = text(&activity, "activityType").to_ascii_lowercase();
+            if !kind.contains("mention") {
+                continue;
+            }
+            let (thread, message) = (text(&activity, "sourceThreadId"), id_of(&activity["sourceMessageId"]));
+            if thread.is_empty() || millis(&message) == 0 {
+                continue;
+            }
+            // A mention in a reply chain is the chain's.
+            let chain = id_of(&activity["sourceReplyChainId"]);
+            let place = if millis(&chain) > 0 && chain != message { chain_id(thread, &chain) } else { thread.to_owned() };
+            let ids = found.entry(place).or_default();
+            if !ids.contains(&message) {
+                ids.push(message);
+            }
+        }
+        for (place, messages) in found {
+            let Some(row) = self.ctx.known(&place)?.or(self.ctx.known(thread_of(&place))?) else {
+                continue;
+            };
+            let read = row.last_read.as_deref().map(millis).unwrap_or(0);
+            let unseen = messages.iter().filter(|message| millis(message) > read).count() as u32;
+            if unseen > row.mentions {
+                let id = row.key.id.clone();
+                let newest = messages.iter().map(|message| millis(message) / 1000).max().unwrap_or(0);
+                self.ctx.counts(&id, row.unread.max(unseen), unseen, row.last_read.as_deref(), newest.max(row.updated))?;
+            }
+        }
+        Ok(())
     }
 
     /// True once the conversation a message belongs to has a row. A chat never seen (someone
@@ -260,14 +337,16 @@ impl Teams {
         let people: Vec<String> = members.filter_map(|member| member["id"].as_str()).filter(|id| *id != me).map(str::to_owned).collect();
         self.lookup(&people[..people.len().min(3)]);
         let properties = &described["properties"];
-        let one = people.len() == 1 && (properties["uniquerosterthread"] == "true" || thread.ends_with("@unq.gbl.spaces"));
+        let one = people.len() == 1 && (properties["uniquerosterthread"] == "true" || thread.ends_with("@unq.gbl.spaces") || people[0].starts_with("28:"));
         let partner = people.first().filter(|_| one).map(String::as_str);
         let mut row = self.chat_row(thread, text(properties, "topic"), &people, partner);
+        row.meeting = thread.starts_with("19:meeting_");
+        row.position = LAST;
         if row.title.is_empty() {
-            row.title = "Chat".to_owned();
+            row.title = if people.len() > 1 { format!("Group chat ({})", people.len() + 1) } else { "Chat".to_owned() };
         }
         self.ctx.conversation(&row)?;
-        if let Some(partner) = partner {
+        if let Some(partner) = partner.filter(|partner| partner.starts_with("8:")) {
             self.state().partners.insert(partner.to_owned(), thread.to_owned());
             self.ctx.relation(partner, Relation::Contact)?;
         }
@@ -277,14 +356,23 @@ impl Teams {
     /// A reply chain's own conversation, so its replies have somewhere to be read. It names
     /// the channel it hangs off and the post that started it, so it stays through a listing
     /// and goes when its channel goes.
+    /// It is titled by its post: the subject, else the post's first words; "Replies" until
+    /// the post is known, and retitled once it is.
     pub(super) fn chain_known(&self, channel: &str, root: &str) -> Result<(), Fault> {
         let id = chain_id(channel, root);
-        if self.ctx.known(&id)?.is_some() {
+        let title = self.ctx.stored_message(channel, root)?.map(|post| chain_title(&post.text)).filter(|title| !title.is_empty());
+        if let Some(held) = self.ctx.known(&id)? {
+            if let Some(title) = title.filter(|title| *title != held.title) {
+                let mut row = ConversationRow::new(id, ConversationKind::Thread, title);
+                row.parent = Some(channel.to_owned());
+                row.root = Some(root.to_owned());
+                (row.private, row.read_only) = (held.private, held.read_only);
+                self.ctx.conversation(&row)?;
+            }
             return Ok(());
         }
         let parent = self.ctx.known(channel)?;
-        let title = parent.as_ref().map_or_else(|| "Replies".to_owned(), |parent| format!("Replies in {}", parent.title));
-        let mut row = ConversationRow::new(id, ConversationKind::Thread, title);
+        let mut row = ConversationRow::new(id, ConversationKind::Thread, title.unwrap_or_else(|| "Replies".to_owned()));
         row.parent = Some(channel.to_owned());
         row.root = Some(root.to_owned());
         if let Some(parent) = parent {
@@ -324,10 +412,63 @@ impl Teams {
     }
 }
 
+/// A chat's own title: its topic, or a meeting's subject.
+fn title_of(chat: &Value) -> String {
+    let named = [&chat["title"], &chat["meetingInformation"]["subject"]];
+    named.into_iter().filter_map(Value::as_str).map(str::trim).find(|title| !title.is_empty()).unwrap_or("").to_owned()
+}
+
+/// A meeting's chat: by its id, or by what the list says it is (unverified field).
+fn is_meeting(chat: &Value) -> bool {
+    text(chat, "id").starts_with("19:meeting_") || chat["chatType"] == "meeting" || chat["meetingInformation"].is_object()
+}
+
+/// The chat list's `lastMessage` as the row's preview line, its markup read for words alone.
+fn preview_of(chat: &Value, me: &str) -> Option<PreviewLine> {
+    let last = &chat["lastMessage"];
+    let id = id_of(&last["id"]);
+    let content = text(last, "content");
+    if millis(&id) == 0 || content.is_empty() || !text(last, "messageType").starts_with("RichText") && text(last, "messageType") != "Text" {
+        return None;
+    }
+    let words = super::html::parse(content, &super::people::Nobody, me).text;
+    let words = words.lines().map(str::trim).filter(|line| !line.is_empty()).collect::<Vec<_>>().join(" ");
+    if words.is_empty() {
+        return None;
+    }
+    let from = text(last, "from");
+    Some(PreviewLine {
+        id: id.clone(),
+        text: words,
+        sender: text(last, "imDisplayName").to_owned(),
+        mine: chat["isLastMessageFromMe"] == true || (!me.is_empty() && from.rsplit('/').next() == Some(me)),
+        sent: millis(&id) / 1000,
+    })
+}
+
+/// A reply chain's title from its post's text: the subject line, else its first words.
+fn chain_title(post: &str) -> String {
+    let first = post.lines().map(str::trim).find(|line| !line.is_empty()).unwrap_or("");
+    match first.chars().count() > CHAIN_TITLE {
+        true => format!("{}…", first.chars().take(CHAIN_TITLE).collect::<String>().trim_end()),
+        false => first.to_owned(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_chain_is_titled_by_its_post_and_a_meeting_by_its_subject() {
+        assert_eq!(chain_title("Release train\nWho drives this week?"), "Release train");
+        assert_eq!(chain_title("A post with no subject that goes on for quite a while"), "A post with no subject that goes on for…");
+        let meeting = json!({"id": "19:meeting_abc@thread.v2", "title": null, "meetingInformation": {"subject": "Weekly sync"}});
+        assert!(is_meeting(&meeting));
+        assert_eq!(title_of(&meeting), "Weekly sync");
+        assert!(!is_meeting(&json!({"id": "19:grp@thread.v2"})));
+    }
 
     #[test]
     fn unread_is_the_newest_message_against_the_read_marker() {

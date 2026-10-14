@@ -102,7 +102,7 @@ search field, in Network and Space mode for that network; 12 px text, 14 px glyp
 - Mac offline replaces all per-network lines. Recovery removes the line; there is no "Back online". No countdowns:
   a ticking second is a repaint for no information. Last known counts stay visible in every state.
 - Rail tooltip is the state in words: `Slack · Reconnecting`. Expired with the window closed: one notification,
-  `Slack signed you out` / `Open tinychat to sign in again.`
+  `Slack signed you out` / `Open tinyclient to sign in again.`
 
 ## 6. Notifications
 Posted for states 1 and 2 only. Never for state 3, my own messages, history at connect, or the conversation open in
@@ -154,11 +154,11 @@ screen (a row changed, a message appeared, a strip is showing), there is no toas
   stop it". Hosted by the always-running process, not the shell.
   - Icon: one static 16 px template glyph (`message-circle`): plain; with a 6 px dot when `N > 0`; with a slash
     when a network is Offline or Expired. No number.
-  - Menu: `Open tinychat` · one disabled line per network (`Slack · Connected`, `Discord · Reconnecting`) ·
-    `Pause Notifications` ▸ `For 1 Hour` / `Until Tomorrow` / `Resume` · `Settings…` · `Quit tinychat Completely`.
+  - Menu: `Open tinyclient` · one disabled line per network (`Slack · Connected`, `Discord · Reconnecting`) ·
+    `Pause Notifications` ▸ `For 1 Hour` / `Until Tomorrow` / `Resume` · `Settings…` · `Quit tinyclient Completely`.
 - **cmd-Q** closes the window and keeps receiving. **opt-cmd-Q** stops chatd too. The first cmd-Q shows one alert,
-  once: `tinychat keeps receiving messages` / `Notifications still arrive while the window is closed. To stop
-  completely, choose Quit tinychat Completely from the menu bar.` Buttons `OK`, `Quit Completely`.
+  once: `tinyclient keeps receiving messages` / `Notifications still arrive while the window is closed. To stop
+  completely, choose Quit tinyclient Completely from the menu bar.` Buttons `OK`, `Quit Completely`.
 
 ## New tokens
 - `quiet_fill` `rgba(0xffffff1f)`: muted-mention pill and quiet roll-up pill; visible on `selected` too.

@@ -14,7 +14,11 @@ serde_json = { workspace = true, features = ["raw_value"] }
 # Both use the system TLS (Security.framework), so no second TLS stack is linked or kept in memory.
 ureq = { version = "3", default-features = false, features = ["native-tls", "json"] }
 tungstenite = { version = "0.30", default-features = false, features = ["handshake", "native-tls"] }
-keyring = "3"
+# Without a backend feature keyring quietly uses an in-memory mock and finds no sessions
+# (`session::persistent` refuses to run on it). On Linux the Secret Service keeps sign-ins on disk;
+# `linux-native` alone is the kernel keyring, emptied at every reboot. The sync flavour needs no
+# async runtime; `vendored` builds libdbus so no system headers are needed.
+keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native-sync-persistent", "vendored"] }
 iana-time-zone = "0.1"
 # Discord adapter: `poll` on the gateway socket and a wake pipe, local time for `<t:..>`; base64 for
 # the client properties header. Both are already in the tree through other dependencies.

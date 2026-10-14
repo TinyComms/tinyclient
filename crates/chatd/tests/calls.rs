@@ -48,7 +48,7 @@ fn alone() -> MutexGuard<'static, ()> {
 fn hub() -> (Arc<Hub>, PathBuf) {
     environment();
     static NEXT: AtomicU32 = AtomicU32::new(0);
-    let dir = PathBuf::from(format!("/tmp/tinychat-calls-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+    let dir = PathBuf::from(format!("/tmp/tinyclient-calls-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
     std::fs::create_dir_all(&dir).unwrap();
     let store = Store::open(&dir.join("chat.sqlite")).unwrap();
     (Arc::new(Hub::new(store)), dir)
@@ -411,7 +411,7 @@ struct Daemon {
 impl Daemon {
     fn start(voice: &Voice, answer_ms: &str) -> Daemon {
         environment();
-        let dir = PathBuf::from(format!("/tmp/tinychat-ring-{}", std::process::id()));
+        let dir = PathBuf::from(format!("/tmp/tinyclient-ring-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let child = Command::new(env!("CARGO_BIN_EXE_chatd"))
             .arg("--seed-demo")

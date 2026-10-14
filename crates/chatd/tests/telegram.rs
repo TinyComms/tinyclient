@@ -8,9 +8,9 @@
 //! account.
 
 use protocol::{
-    read_frame, write_frame, AccountKey, Change, CodeVia, Conversation, ConversationKind, ErrorCode, Group, Key, Link,
+    read_frame, write_frame, AccountKey, Change, CodeVia, Conversation, ConversationKind, ErrorCode, Key, Link,
     MediaKind, MentionKind, Message, MessageKind, Network, Page, Presence, Relation, Request, Response, SendState,
-    SignInInput, SignInProblem, SignInStep, Style, Watching,
+    SignInInput, SignInProblem, SignInStep, Style, Watching, Shelf, Special, Mark,
 };
 use std::io::Write;
 use protocol::ChatStream;
@@ -43,10 +43,19 @@ impl World {
         World::start(Some(SESSION), "30")
     }
 
+    /// Signed in to an account with this many more chats, each with a person of its own.
+    fn crowded(many: u32) -> World {
+        World::with(Some(SESSION), "30", &[("TINYCHAT_TELEGRAM_MANY", &many.to_string())])
+    }
+
     /// `session` is the stored sign-in, if any; `qr_seconds` how long the fake's QR codes last.
     fn start(session: Option<&str>, qr_seconds: &str) -> World {
+        World::with(session, qr_seconds, &[])
+    }
+
+    fn with(session: Option<&str>, qr_seconds: &str, env: &[(&str, &str)]) -> World {
         static NEXT: AtomicU32 = AtomicU32::new(0);
-        let dir = PathBuf::from(format!("/tmp/tinychat-tg-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        let dir = PathBuf::from(format!("/tmp/tinyclient-tg-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let log = std::fs::File::create(dir.join("stderr.log")).unwrap();
@@ -57,7 +66,11 @@ impl World {
             .env_remove("TINYCHAT_SESSION_DISCORD")
             .env_remove("TINYCHAT_SESSION_SLACK")
             .env_remove("TINYCHAT_SESSION_TELEGRAM")
+            .env_remove("TINYCHAT_TELEGRAM_MANY")
             .stderr(Stdio::from(log));
+        for (name, value) in env {
+            command.env(name, value);
+        }
         if let Some(session) = session {
             command.env("TINYCHAT_SESSION_TELEGRAM", session);
         }
@@ -142,11 +155,21 @@ impl World {
         }
     }
 
-    fn tree(&self) -> (Vec<Group>, Vec<Conversation>) {
-        match self.ask(Request::Tree { space: key("chats"), offset: 0, limit: 500, peek: true }) {
-            Response::Tree { groups, conversations, .. } => (groups, conversations),
+    /// The Telegram home: the main list, a folder of it, or the archive.
+    fn home(&self, folder: Option<&str>, shelf: Shelf) -> Vec<Conversation> {
+        let asked = Request::Home { network: Network::Telegram, account: Some(account()), folder: folder.map(str::to_owned), shelf, offset: 0, limit: 200 };
+        match self.ask(asked) {
+            Response::Conversations { conversations, .. } => conversations,
             other => panic!("{other:?}"),
         }
+    }
+
+    fn watch(&self, watching: Watching) {
+        self.ask(Request::Watch(watching));
+    }
+
+    fn rows_on_screen(&self, ids: &[&str]) {
+        self.watch(Watching { rows: ids.iter().map(|id| key(id)).collect(), ..Watching::default() });
     }
 
     /// The newest page, asked as the shell asks when the conversation is opened.
@@ -223,45 +246,76 @@ fn ranges(message: &Message) -> Vec<(&str, &Style)> {
 }
 
 #[test]
-fn the_chats_come_as_one_space_with_folders_as_groups_and_everything_in_the_inbox() {
+fn the_chats_are_one_list_with_no_space_each_filed_in_every_folder_it_matches() {
     let world = World::signed_in();
     world.connected();
     let (accounts, _) = world.status();
     assert_eq!((accounts[0].name.as_str(), accounts[0].me.as_str(), accounts[0].key.account.as_str()), ("Mira Kessler", "u7001", "7001"));
+    // What Telegram lets this account send, as its session says.
+    assert!(accounts[0].can.spoiler && accounts[0].can.silent && accounts[0].can.schedule && accounts[0].can.gifs);
+    assert_eq!((accounts[0].can.max_files, accounts[0].can.caption_limit), (10, 1_024));
+    // No invented Space: the chats are the Telegram home.
     let Response::Spaces { spaces } = world.ask(Request::Spaces { network: Some(Network::Telegram) }) else {
         panic!("no spaces");
     };
-    assert_eq!(spaces.iter().map(|space| space.name.as_str()).collect::<Vec<_>>(), vec!["Telegram"]);
+    assert!(spaces.is_empty(), "{spaces:?}");
 
-    // Pinned first, then the folder, then the rest, then the archive: each chat under one group.
-    let (groups, rows) = world.tree();
-    assert_eq!(groups.iter().map(|group| group.name.as_str()).collect::<Vec<_>>(), vec!["Pinned", "Work", "Chats", "Archived"]);
-    let placed: Vec<(&str, &str, ConversationKind)> = rows.iter().map(|row| (row.key.id.as_str(), row.group_title.as_str(), row.kind)).collect();
-    assert_eq!(
-        placed,
-        vec![
-            ("u7002", "Pinned", ConversationKind::Direct),
-            ("g8001", "Work", ConversationKind::Group),
-            ("c9002", "Work", ConversationKind::Forum),
-            ("c9001", "Chats", ConversationKind::Channel),
-            ("u7001", "Chats", ConversationKind::Direct),
-            ("u7003", "Archived", ConversationKind::Direct),
-        ]
-    );
+    // Telegram's pin first, then by recency; the archived chat is on its own shelf.
+    let rows = world.home(None, Shelf::Main);
+    let listed: Vec<(&str, Option<i32>)> = rows.iter().map(|row| (row.key.id.as_str(), row.pin)).collect();
+    assert_eq!(&listed[..3], &[("u7002", Some(0)), ("c9002", None), ("g8001", None)]);
+    assert!(rows.iter().all(|row| row.space.is_none() && row.key.id != "u7003"));
     let row = |id: &str| rows.iter().find(|row| row.key.id == id).unwrap();
     assert_eq!((row("u7002").title.as_str(), row("u7002").unread, row("u7002").last_read.as_deref()), ("Odalys Brandt", 1, Some("11")));
     assert_eq!(row("u7002").preview, "Good. Trailhead at seven.");
-    assert_eq!(row("u7002").peer.as_deref(), Some("u7002"));
-    assert_eq!(row("u7002").call, protocol::CallSupport::Handoff);
-    assert_eq!(row("u7001").title, "Saved Messages");
+    assert_eq!((row("u7002").peer.as_deref(), row("u7002").call), (Some("u7002"), protocol::CallSupport::Handoff));
+    // Saved Messages: the user's own notes, no presence, no call.
+    assert_eq!((row("u7001").title.as_str(), row("u7001").special, row("u7001").peer.as_deref(), row("u7001").call), ("Saved Messages", Special::Saved, None, protocol::CallSupport::None));
+    // The login-code chat: Telegram's own, verified, read-only, no Call button.
+    let service = row("u777000");
+    assert_eq!((service.special, service.mark, service.read_only, service.call), (Special::Service, Some(Mark::Verified), true, protocol::CallSupport::None));
+    // Marks from Telegram's flags; a bot is a bot.
+    assert_eq!((row("u7005").mark, row("c9001").mark), (Some(Mark::Scam), Some(Mark::Verified)));
+    assert!(row("u7004").bot && row("u7004").call == protocol::CallSupport::None);
     // The channel is muted on Telegram and only its owners post in it.
     assert!(row("c9001").muted && row("c9001").read_only && !row("g8001").muted);
+    let archive = world.home(None, Shelf::Archive);
+    assert_eq!(archive.iter().map(|row| (row.key.id.as_str(), row.archived)).collect::<Vec<_>>(), [("u7003", true)]);
 
-    // Every Telegram chat is in the Inbox, channels included.
-    let Response::Conversations { total, .. } = world.ask(Request::Inbox { network: Some(Network::Telegram), filter: Default::default(), offset: 0, limit: 50 }) else {
-        panic!("no inbox");
+    // Folders are filters: the group is in Work and in Family; Family's own pin comes first.
+    let Response::Folders { folders } = world.ask(Request::Folders { network: Network::Telegram }) else {
+        panic!("no folders");
     };
-    assert_eq!(total, 6);
+    assert_eq!(folders.iter().map(|folder| (folder.key.id.as_str(), folder.name.as_str())).collect::<Vec<_>>(), [("2", "Work"), ("3", "Family")]);
+    assert_eq!(row("g8001").folders, ["2", "3"]);
+    let ids = |rows: Vec<Conversation>| rows.into_iter().map(|row| row.key.id).collect::<Vec<_>>();
+    assert_eq!(ids(world.home(Some("2"), Shelf::Main)), ["c9002", "g8001"]);
+    assert_eq!(ids(world.home(Some("3"), Shelf::Main)), ["u7002", "g8001"]);
+
+    // The Inbox has people, bots, groups and the service chat; the channel only if starred,
+    // the archived chat only if it mentions me.
+    let inbox = || match world.ask(Request::Inbox { network: Some(Network::Telegram), filter: Default::default(), offset: 0, limit: 50 }) {
+        Response::Conversations { conversations, .. } => conversations.into_iter().map(|row| row.key.id).collect::<Vec<_>>(),
+        other => panic!("{other:?}"),
+    };
+    let held = inbox();
+    assert!(held.contains(&"u777000".to_owned()) && held.contains(&"g8001".to_owned()) && held.contains(&"u7004".to_owned()));
+    assert!(!held.contains(&"c9001".to_owned()) && !held.contains(&"u7003".to_owned()), "{held:?}");
+    world.ask(Request::Star { conversation: key("c9001"), starred: true });
+    assert!(inbox().contains(&"c9001".to_owned()));
+
+    // Connecting read the chat list once (one page here, and the archive), the folders once,
+    // and fetched no picture: pictures are for rows on screen.
+    let calls = world.calls();
+    let count = |start: &str| calls.iter().filter(|call| call.starts_with(start)).count();
+    assert_eq!((count("GetDialogs 0"), count("GetDialogs 1"), count("GetDialogFilters"), count("GetContacts")), (1, 1, 1, 1), "{calls:#?}");
+    assert_eq!(count("GetFile"), 0, "{calls:#?}");
+    world.rows_on_screen(&["u7002", "u7001"]);
+    world.until("the picture of the row on screen", || (world.called("GetFile avatar 5002") > 0).then_some(()));
+    // Shown again, it is not asked again.
+    world.rows_on_screen(&["u7002"]);
+    sleep(Duration::from_millis(300));
+    assert_eq!(world.called("GetFile avatar 5002 at 0"), 1, "{:#?}", world.calls());
 
     // The contacts are the list the user owns, with what Telegram says of each.
     let people = world.until("the contacts", || {
@@ -279,11 +333,60 @@ fn the_chats_come_as_one_space_with_folders_as_groups_and_everything_in_the_inbo
 }
 
 #[test]
+fn chats_past_the_newest_500_load_as_the_list_scrolls_with_their_pictures() {
+    let world = World::crowded(650);
+    world.connected();
+    // 8 chats of the account's own and 650 more: five pages of a hundred are read at connect.
+    let known = |at: u32| world.conversation(&format!("u{}", 100_000 + at)).is_some();
+    world.until("the newest 500", || known(491).then_some(()));
+    assert!(!known(492), "chat 501 is not read at connect");
+    assert_eq!(world.called("GetDialogs 0"), 5, "{:#?}", world.calls());
+    // Scrolled to near the end of what is loaded: the next page, once, and the rows on screen
+    // get their pictures.
+    world.rows_on_screen(&["u100480", "u100491"]);
+    world.until("the next page", || known(591).then_some(()));
+    assert_eq!(world.called("GetDialogs 0"), 6);
+    world.until("the picture of a row past 400", || (world.called("GetFile avatar 5100491") > 0).then_some(()));
+    // A row in the middle of what is loaded asks for nothing more.
+    world.rows_on_screen(&["u100300"]);
+    sleep(Duration::from_millis(300));
+    assert_eq!(world.called("GetDialogs 0"), 6);
+}
+
+#[test]
+fn a_pin_or_a_folder_change_is_told_row_by_row_and_never_rereads_the_chats() {
+    let world = World::signed_in();
+    world.connected();
+    let before = world.calls().len();
+    let pin = |id: &str| world.conversation(id).unwrap().pin;
+
+    // Pinned on another device: the group goes to the top of the pins. No request at all.
+    world.steer("pin");
+    world.until("the group to be pinned", || (pin("g8001") == Some(0)).then_some(()));
+    assert_eq!(pin("u7002"), Some(1));
+    assert_eq!(world.calls().len(), before, "{:#?}", &world.calls()[before..]);
+
+    // Reordered without saying how: the pins alone are asked, once.
+    world.steer("pins");
+    world.until("the pins to be asked", || (world.called("GetPinnedDialogs 0") == 1).then_some(()));
+    world.until("the new order", || (pin("g8001") == Some(0) && pin("u7002") == Some(1)).then_some(()));
+
+    // A folder changed, with its rules in the update: refiled from what is held.
+    world.steer("folder");
+    world.until("Tobin in Family", || world.conversation("u7003").filter(|row| row.folders == ["3"]));
+    let added: Vec<String> = world.calls()[before..].to_vec();
+    assert_eq!(added, ["GetPinnedDialogs 0"], "one request for all three changes");
+    assert_eq!(world.called("GetDialogs"), 2);
+}
+#[test]
 fn messages_arrive_change_and_go_and_what_they_hold_is_mapped() {
     let world = World::signed_in();
     world.connected();
     // The conversation is on screen, so what a new message shows is fetched as it arrives.
     world.ask(Request::Watch(Watching { conversation: Some(key("u7002")), ..Watching::default() }));
+    // Opened first, so the page read on opening cannot take the new message in before the
+    // update counts it.
+    world.until("history", || world.message("u7002", "12"));
 
     world.steer("incoming");
     let rich = world.arrived("u7002", "13");
@@ -357,7 +460,7 @@ fn messages_arrive_change_and_go_and_what_they_hold_is_mapped() {
     world.steer("delete");
     world.until("the message to go", || world.message("u7002", "13").is_none().then_some(()));
 
-    // What tinychat cannot draw is named and linked, never dropped; a service message is a line.
+    // What tinyclient cannot draw is named and linked, never dropped; a service message is a line.
     world.steer("poll");
     let poll = world.arrived("g8001", "21");
     assert_eq!(poll.text, "Poll: Saturday or Sunday?");
@@ -388,6 +491,14 @@ fn a_forum_topic_is_a_thread_under_the_forum() {
     world.send("c9002_31", "9001", "On my way", None);
     world.until("the post to be sent", || world.calls().contains(&"SendMessage c9002_31 On my way".to_owned()).then_some(()));
     world.until("it to be in the thread", || world.messages("c9002_31").into_iter().find(|message| message.text == "On my way" && message.state == SendState::Sent));
+
+    // A topic row on screen with no line yet: its newest message is asked for, one only.
+    world.rows_on_screen(&["c9002_1"]);
+    world.until("the topic's preview to be asked", || (world.called("GetReplies c9002_1") == 1).then_some(()));
+    // A row the dialog list already gave a line asks nothing.
+    world.rows_on_screen(&["u7002"]);
+    sleep(Duration::from_millis(300));
+    assert_eq!(world.called("GetHistory u7002"), 0);
 
     // Read in a topic is told for the topic.
     world.ask(Request::MarkRead { conversation: key("c9002_31"), message_id: "42".into() });
@@ -515,14 +626,27 @@ fn a_flood_wait_is_slept_in_full_and_a_long_one_is_told_not_retried() {
 }
 
 #[test]
-fn a_channel_shows_its_sponsored_message_when_opened_and_says_so() {
+fn a_channel_shows_its_sponsored_message_and_tells_telegram_once_it_is_on_screen() {
     let world = World::signed_in();
     world.connected();
     let ad = world.until("the sponsored message", || world.messages("c9001").into_iter().find(|message| message.id == "adad01"));
     assert_eq!(ad.card.as_ref().map(|card| (card.title.as_str(), card.footer.as_str())), Some(("Sponsored", "Larch Boots GmbH")));
     assert_eq!((ad.sender.name.as_str(), ad.text.as_str()), ("Larch Boots", "Resoled by hand in Innsbruck.\nOpen site"));
     assert_eq!(ranges(&ad), vec![("Open site", &Style::Link { url: "https://example.org/boots".into() })]);
+    // Read, but not on screen: Telegram is not told it was viewed.
+    sleep(Duration::from_millis(300));
+    assert_eq!((world.called("GetSponsoredMessages"), world.called("ViewSponsoredMessage")), (1, 0));
+    // On screen: told once, however often the channel is shown or opened again.
+    let open = || world.watch(Watching { conversation: Some(key("c9001")), ..Watching::default() });
+    open();
     world.until("Telegram to be told it was shown", || (world.called("ViewSponsoredMessage") == 1).then_some(()));
+    open();
+    world.watch(Watching::default());
+    open();
+    world.messages("c9001");
+    sleep(Duration::from_millis(400));
+    // Asked again within five minutes, the one already asked is kept.
+    assert_eq!((world.called("GetSponsoredMessages"), world.called("ViewSponsoredMessage")), (1, 1));
     // It sits at the foot of the channel, and the channel's row still previews its own post.
     let messages = world.messages("c9001");
     assert_eq!(messages.iter().map(|message| message.id.as_str()).collect::<Vec<_>>(), vec!["5", "adad01"]);
@@ -531,6 +655,143 @@ fn a_channel_shows_its_sponsored_message_when_opened_and_says_so() {
     // A direct chat has none.
     world.until("history", || world.message("u7002", "12"));
     assert_eq!(world.called("GetSponsoredMessages"), 1);
+}
+
+#[test]
+fn the_panes_ask_telegram_once_each_and_counts_are_telegrams_own() {
+    let world = World::signed_in();
+    world.connected();
+    // A card: the bio, the phone masked, the username; in a group, the admin title there.
+    let Response::Profile { profile } = world.ask(Request::Profile { person: key("u7002"), space: None }) else {
+        panic!("no profile");
+    };
+    assert_eq!(profile.bio, "Maps, mostly.");
+    assert_eq!(profile.contacts.iter().map(|contact| (contact.value.as_str(), contact.masked)).collect::<Vec<_>>(), [("+15550100777", true)]);
+    let Response::Profile { profile } = world.ask(Request::Profile { person: key("u7003"), space: Some(key("c9002")) }) else {
+        panic!("no profile in the forum");
+    };
+    assert_eq!((profile.nickname.as_str(), profile.joined), ("Quartermaster", Some(1_791_891_800)));
+    assert_eq!(world.called("GetParticipant u7003"), 1);
+    // A scam account's card warns.
+    let Response::Profile { profile } = world.ask(Request::Profile { person: key("u7005"), space: None }) else {
+        panic!("no profile");
+    };
+    assert_eq!(profile.warning, Some(protocol::Warning::Scam));
+
+    // A channel's info: its own about text and Telegram's counts.
+    let Response::ConversationInfo { info } = world.ask(Request::ConversationInfo { conversation: key("c9001") }) else {
+        panic!("no info");
+    };
+    assert_eq!((info.description.as_str(), info.members, info.online, info.link.as_str()), ("Notes from the high country.", Some(1_204), Some(230), "https://t.me/fieldnotes"));
+    assert_eq!(info.notify, protocol::Notify::Nothing);
+
+    // Mute is Telegram's, then shown.
+    assert_eq!(world.ask(Request::SetMute { conversation: key("g8001"), notify: protocol::Notify::Nothing }), Response::Ok);
+    assert_eq!(world.called("UpdateNotifySettings g8001 2147483647"), 1);
+    assert!(world.conversation("g8001").unwrap().muted);
+    assert_eq!(world.ask(Request::SetMute { conversation: key("g8001"), notify: protocol::Notify::All }), Response::Ok);
+    assert!(!world.conversation("g8001").unwrap().muted);
+
+    // Pins and shared things from Telegram's own search, with its count as the total.
+    let Response::Pinned { messages, .. } = world.ask(Request::Pinned { conversation: key("u7002") }) else {
+        panic!("no pins");
+    };
+    assert_eq!(messages.iter().map(|message| message.id.as_str()).collect::<Vec<_>>(), ["12"]);
+    world.steer("photo");
+    world.arrived("u7002", "14");
+    let shared = |kind| match world.ask(Request::Shared { conversation: key("u7002"), kind, before: None, limit: 30, search: true }) {
+        Response::Shared { items, total, complete, .. } => (items, total, complete),
+        other => panic!("{other:?}"),
+    };
+    let (items, total, complete) = shared(protocol::SharedKind::Media);
+    assert_eq!((items.len(), total, complete), (1, Some(37), true));
+    assert_eq!(items[0].attachment.as_ref().map(|file| file.file.id.as_str()), Some("p6014x"));
+    let (links, total, _) = shared(protocol::SharedKind::Links);
+    assert_eq!((links[0].url.as_str(), total), ("https://example.org/route", Some(4)));
+
+    // Leaving a channel is Telegram's, and the row goes.
+    assert_eq!(world.ask(Request::Leave { conversation: key("c9001") }), Response::Ok);
+    assert_eq!(world.called("LeaveChannel c9001"), 1);
+    assert!(world.conversation("c9001").is_none());
+    // A direct chat cannot be left.
+    assert!(matches!(world.ask(Request::Leave { conversation: key("u7002") }), Response::Error { .. }));
+}
+
+#[test]
+fn pickers_and_sending_with_files_options_and_picks() {
+    let world = World::signed_in();
+    world.connected();
+    world.until("history", || world.message("u7002", "12"));
+    let catalog = |kind, query: &str, cursor: Option<&str>| match world.ask(Request::Catalog { account: account(), kind, space: None, query: query.into(), cursor: cursor.map(str::to_owned) }) {
+        Response::Catalog { items, cursor } => (items, cursor),
+        other => panic!("{other:?}"),
+    };
+    // Saved GIFs, the @gif bot's results for a query, the installed packs a pack a page; every
+    // preview a still.
+    let (gifs, _) = catalog(protocol::CatalogKind::Gifs, "", None);
+    assert_eq!(gifs.iter().map(|gif| (gif.id.as_str(), gif.animated)).collect::<Vec<_>>(), [("d6200", true)]);
+    assert_eq!(gifs[0].file.as_ref().map(|still| (still.id.as_str(), still.kind)), Some(("d6200m", protocol::MediaKind::Image)));
+    let (found, next) = catalog(protocol::CatalogKind::Gifs, "hike", None);
+    assert_eq!((found[0].id.as_str(), next.as_deref()), ("i77:r1", Some("2")));
+    assert_eq!((world.called("ResolveUsername gif"), world.called("GetInlineBotResults hike")), (1, 1));
+    let (stickers, next) = catalog(protocol::CatalogKind::Stickers, "", None);
+    assert_eq!(stickers.iter().map(|sticker| (sticker.name.as_str(), sticker.pack.as_str())).collect::<Vec<_>>(), [("🥾", "Hiking"), ("🥾", "Hiking")]);
+    assert_eq!(next, None);
+
+    let send = |client_id: &str, text: &str, with: protocol::Outgoing| {
+        let asked = Request::Send { conversation: key("u7002"), client_id: client_id.into(), text: text.into(), reply_to: None, with };
+        assert!(matches!(world.ask(asked), Response::Sent { .. }));
+        world.until(&format!("send {client_id}"), || {
+            world.messages("u7002").into_iter().find(|message| message.client_id.as_deref() == Some(client_id) && message.state != SendState::Pending)
+        })
+    };
+    let pick = |id: &str| protocol::Outgoing { pick: Some(protocol::Pick { kind: protocol::CatalogKind::Gifs, id: id.into() }), ..Default::default() };
+    // A pick uploads nothing.
+    assert_eq!(send("8101", "", pick("d6200")).state, SendState::Sent);
+    assert_eq!(world.called("SendMedia u7002 gif"), 1);
+    assert_eq!(send("8102", "", pick("i77:r1")).state, SendState::Sent);
+    assert_eq!(world.called("SendInlineBotResult u7002 77 r1"), 1);
+    assert_eq!(world.called("SaveFilePart"), 0);
+
+    // Silent and scheduled are Telegram's to carry out.
+    let silent = send("8103", "hush", protocol::Outgoing { silent: true, ..Default::default() });
+    assert_eq!(silent.state, SendState::Sent);
+    assert_eq!(world.called("SendMessage u7002 hush [silent]"), 1);
+    // ✓✓: Odalys read my message.
+    let id: i32 = silent.id.parse().unwrap();
+    assert!(!world.conversation("u7002").unwrap().seen);
+    world.steer(&format!("outbox {id}"));
+    world.until("the second tick", || world.conversation("u7002").filter(|row| row.seen && row.preview_mine));
+    // Scheduled: Telegram holds it and sends it then; until then it is shown under its own id.
+    let scheduled = send("8104", "later on", protocol::Outgoing { schedule: Some(1_893_456_000), ..Default::default() });
+    assert_eq!((scheduled.state, scheduled.id.starts_with('s')), (SendState::Sent, true));
+    assert_eq!(world.called("SendMessage u7002 later on [scheduled]"), 1);
+
+    // Files, from their paths, in 512 KB parts: one photo with a spoiler; then two photos and
+    // a document sent as a file, an album of the photos and the document on its own.
+    let dir = PathBuf::from(format!("/tmp/tinyclient-tg-files-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = |name: &str, bytes: usize| {
+        let path = dir.join(name);
+        std::fs::write(&path, vec![7u8; bytes]).unwrap();
+        path.to_string_lossy().into_owned()
+    };
+    let one = |path: String, spoiler: bool, as_file: bool| protocol::OutgoingFile { path, name: String::new(), spoiler, as_file, original: false };
+    let photo = file("ridge.jpg", 700 * 1024);
+    let sent = send("8105", "the ridge", protocol::Outgoing { files: vec![one(photo.clone(), true, false)], ..Default::default() });
+    assert_eq!(sent.state, SendState::Sent, "{:?}", world.calls());
+    assert_eq!((world.called("SaveFilePart 0 524288"), world.called("SaveFilePart 1 192512")), (1, 1));
+    assert_eq!(world.called("SendMedia u7002 photo+spoiler the ridge"), 1);
+    let with = vec![one(photo.clone(), false, false), one(file("map.png", 1_000), false, false), one(file("plan.pdf", 2_000), false, true)];
+    let album = send("8106", "trip", protocol::Outgoing { files: with, ..Default::default() });
+    assert_eq!(album.state, SendState::Sent);
+    assert_eq!((world.called("UploadMedia photo"), world.called("SendMultiMedia u7002 kept-photo,kept-photo")), (2, 1));
+    assert_eq!(world.called("SendMedia u7002 file:application/pdf"), 1);
+    // A big file goes in big parts.
+    let big = file("track.gpx", 10 * 1024 * 1024 + 5);
+    assert_eq!(send("8107", "", protocol::Outgoing { files: vec![one(big, false, false)], ..Default::default() }).state, SendState::Sent);
+    assert_eq!((world.called("SaveBigFilePart 0/21 524288"), world.called("SaveBigFilePart 20/21 5")), (1, 1));
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -662,7 +923,7 @@ fn cancelling_keeps_nothing_and_a_build_without_an_app_id_says_so() {
     if option_env!("TINYCHAT_TELEGRAM_API_ID").is_some() {
         return;
     }
-    let dir = PathBuf::from(format!("/tmp/tinychat-tg-{}-plain", std::process::id()));
+    let dir = PathBuf::from(format!("/tmp/tinyclient-tg-{}-plain", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_chatd")).env("TINYCHAT_DIR", &dir).env_remove("TINYCHAT_TELEGRAM_FAKE").stderr(Stdio::null()).spawn().unwrap();

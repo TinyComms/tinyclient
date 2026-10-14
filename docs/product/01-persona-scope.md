@@ -4,7 +4,7 @@ This replaces the persona and the "Cut" list in `docs/stories.md`. The other sev
 
 ## What "full-fledged" means
 
-**I can quit the official app for a normal day and nobody on the other side can tell.** tinychat is a complete *participant*: it reads everything I am a member of, shows it the way it was sent, and replies in kind. It is not an *administrator* or a *platform*: it does not configure servers, install apps, or host mini-programs. Anything past the line opens in the official app with one click, on the exact message, channel, or meeting. A handoff that lands in the right place is a feature; a dead end is a bug.
+**I can quit the official app for a normal day and nobody on the other side can tell.** tinyclient is a complete *participant*: it reads everything I am a member of, shows it the way it was sent, and replies in kind. It is not an *administrator* or a *platform*: it does not configure servers, install apps, or host mini-programs. Anything past the line opens in the official app with one click, on the exact message, channel, or meeting. A handoff that lands in the right place is a feature; a dead end is a bug.
 
 ## Personas
 
@@ -47,18 +47,18 @@ Ranked by how fast its absence sends someone back. P0 = not a real client withou
 
 Checks are observable from outside the process, as in `docs/stories.md`.
 
-1. **P0. I see every place I belong.** I open tinychat and every server, channel, group and DM I can see in the official app is reachable in at most two clicks. *Check:* for a test account, the set of conversation ids chatd can list equals the set the official client shows, per network.
-2. **P0. I never miss a message.** A DM or mention arrives while tinychat is in the background and I get a macOS notification; reading it on my phone clears it here, and the reverse. *Check:* a message from a second account produces one notification and unread 1; marking read on another device brings unread to 0 without touching tinychat.
+1. **P0. I see every place I belong.** I open tinyclient and every server, channel, group and DM I can see in the official app is reachable in at most two clicks. *Check:* for a test account, the set of conversation ids chatd can list equals the set the official client shows, per network.
+2. **P0. I never miss a message.** A DM or mention arrives while tinyclient is in the background and I get a macOS notification; reading it on my phone clears it here, and the reverse. *Check:* a message from a second account produces one notification and unread 1; marking read on another device brings unread to 0 without touching tinyclient.
 3. **P0. A message looks like what was sent.** An image shows as an image, a file opens, a link is clickable, an edit replaces the text, a deletion removes it. *Check:* a fixture conversation containing each content type renders with zero rows that are a bare filename or raw markup.
 4. **P0. I know who I am talking to and whether they are around.** Every row and message carries the person's real avatar and name; friends and DM partners carry a presence dot. *Check:* a second account switching to idle changes its dot within 10 s; no initials placeholder remains once the avatar has loaded.
 5. **P0. I can start a conversation.** I open the people view, pick a friend or coworker, and message them without having talked before. *Check:* a send to a user with no prior conversation creates one and delivers.
-6. **P0. I can follow and answer a thread.** *Check:* a reply sent from tinychat lands inside the thread in the official app, not in the channel.
+6. **P0. I can follow and answer a thread.** *Check:* a reply sent from tinyclient lands inside the thread in the official app, not in the channel.
 7. **P0. I can answer the way I would in the official app.** Paste a screenshot, mention someone, react, fix a typo. *Check:* each of paste-image, mention, reaction, edit, delete is visible from a second account in the official client.
 8. **P0. I can talk.** I click call or a voice channel and hear and am heard; when I leave, the media process is gone. *Check:* two-way audio with a second account; no `mediad` after leaving; chatd's memory is unchanged across the call.
 9. **P0. It stays small while doing all this.** *Check:* the budgets in the performance doc hold with all networks signed in and a media-heavy channel open. This story gates every other one: a feature that breaks it is not done.
 10. **P1. I can watch or give one screen share.** *Check:* as story 5 in `docs/stories.md`.
 11. **P1. All four networks work the same way.** *Check:* stories 1 to 7 pass on Telegram and Teams.
-12. **Cut, handed off. I can get to what tinychat does not do.** Every message, channel and meeting has "Open in Slack/Discord/Telegram/Teams". *Check:* the link opens the official app on that exact item.
+12. **Cut, handed off. I can get to what tinyclient does not do.** Every message, channel and meeting has "Open in Slack/Discord/Telegram/Teams". *Check:* the link opens the official app on that exact item.
 
 ## The cut line
 
@@ -67,17 +67,17 @@ Rule: **in** if a member does it inside a conversation on an ordinary day; **out
 | Out | Why | Instead |
 | --- | --- | --- |
 | Admin and moderation: server and workspace settings, roles, permissions, bans, audit logs, channel creation settings, invites management | Rare, high-stakes, large surface, and the riskiest calls to make from an unofficial client | Open in official app |
-| App platforms: Slack app directory and workflows, Teams apps and tabs, Discord activities, Telegram mini apps and payments | These are embedded web apps. They need a webview, which is the thing tinychat exists to avoid | Open in official app |
+| App platforms: Slack app directory and workflows, Teams apps and tabs, Discord activities, Telegram mini apps and payments | These are embedded web apps. They need a webview, which is the thing tinyclient exists to avoid | Open in official app |
 | Bot interactivity: buttons, menus, modals, slash-command forms | Each is a custom UI protocol. Bot messages still render as text, images and links | P2: render as a message with "Open in ..." |
 | Documents inside chat: Slack canvases and lists, Teams Loop, whiteboards, Planner, the SharePoint file browser | Document editors, not chat | Show as a link card that opens the browser |
 | Teams meetings and anything with a lobby, breakout rooms, captions, recording; Discord stage channels; Slack huddle extras (drawing, threads, reactions) | Tenant policy and vendor media stacks decide whether you get in. A half-working meeting join loses a real meeting | Meeting link opens Teams. Plain 1:1 and group calls are in scope |
 | Video grid, virtual backgrounds, noise-suppression models, soundboard | Each tile is a decoder. One speaker, one share is the design | None |
 | Commerce and growth: Nitro, shop, quests, server discovery, boosts, Telegram Premium and stars, stories | Not conversation | Open in official app |
-| Account management: sign-up, password, 2FA, billing, privacy settings, per-channel notification rules | Do it once in the official app. tinychat reads and honors the result (mutes, folders) | Open in official app |
+| Account management: sign-up, password, 2FA, billing, privacy settings, per-channel notification rules | Do it once in the official app. tinyclient reads and honors the result (mutes, folders) | Open in official app |
 | Telegram secret chats | Device-bound end-to-end keys; a second device cannot see them by design | Say so in the row |
 | Automation of any kind: auto-reply, scheduled bulk send, logging other users' presence, exporting member lists | This is what gets accounts banned. Discord's enforcement is aimed at self-bots and scraping ([Discord](https://support.discord.com/hc/en-us/articles/360039598252)) | Never |
 
-**Guardrail for presence and member lists.** The owner's request overrides the old cut, and the README line "does not ... scrape member lists, or track presence" must change with it. The new rule: tinychat asks the network only for what the official client would ask for the screen I am looking at (friends, open DMs, the member list of the channel that is open, paged as it scrolls) and stores presence in memory only, never in SQLite. No request exists whose purpose is to enumerate a server.
+**Guardrail for presence and member lists.** The owner's request overrides the old cut, and the README line "does not ... scrape member lists, or track presence" must change with it. The new rule: tinyclient asks the network only for what the official client would ask for the screen I am looking at (friends, open DMs, the member list of the channel that is open, paged as it scrolls) and stores presence in memory only, never in SQLite. No request exists whose purpose is to enumerate a server.
 
 ## Release order
 
@@ -91,7 +91,7 @@ Each increment is usable on its own. Discord and Slack first, because they are s
 
 ## Open questions for the owner
 
-1. **Presence and member lists on Discord.** They require gateway subscriptions the README currently promises tinychat does not make. Is the guardrail above (only what the official client requests for the visible screen, nothing stored) the rule, with the README rewritten to match?
+1. **Presence and member lists on Discord.** They require gateway subscriptions the README currently promises tinyclient does not make. Is the guardrail above (only what the official client requests for the visible screen, nothing stored) the rule, with the README rewritten to match?
 2. **More than one account per network.** Still cut, or in? Persona C usually has two or more Slack workspaces, and Teams users often have guest tenants. Saying yes changes the store, the rail and sign-in now; adding it later is a migration.
 3. **Teams meetings.** Is handoff to the Teams app acceptable as the permanent answer, with only plain Teams calls native? Native meeting join is the single most expensive item on any list here.
 4. **Depth or breadth first.** The order above finishes Discord and Slack before Telegram and Teams. If Teams is where your own workday is, should Teams chat move ahead of increment 3?

@@ -25,7 +25,7 @@ pub const CHATD_LOG: &str = "chatd.log";
 pub const CHATD_LOG_LIMIT: u64 = 4 * 1024 * 1024;
 
 /// Where chatd is: `TINYCHAT_CHATD` when set, else beside the running executable. That is
-/// `tinychat.app/Contents/MacOS/chatd` in the bundle (`packaging/bundle.sh` puts every binary
+/// `tinyclient.app/Contents/MacOS/chatd` in the bundle (`packaging/bundle.sh` puts every binary
 /// there) and `target/<profile>/chatd` under cargo, which builds it with `cargo build -p chatd`.
 /// `None` when there is no such file.
 pub fn chatd_path() -> Option<PathBuf> {
@@ -51,7 +51,7 @@ pub fn chatd_answers(timeout: Duration) -> bool {
 /// stderr appended to `chatd.log`. It inherits the environment (`TINYCHAT_DIR` included). The
 /// child is reaped on a thread of its own. Answers its pid.
 pub fn start_chatd() -> io::Result<u32> {
-    let path = chatd_path().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "chatd is not beside tinychat"))?;
+    let path = chatd_path().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "chatd is not beside tinyclient"))?;
     let dir = crate::support_dir();
     std::fs::create_dir_all(&dir)?;
     let log = dir.join(CHATD_LOG);

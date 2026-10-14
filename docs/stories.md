@@ -1,6 +1,6 @@
 # Stories
 
-tinychat is a full client: I can quit the Slack, Discord, Telegram and Teams apps for a normal day
+tinyclient is a full client: I can quit the Slack, Discord, Telegram and Teams apps for a normal day
 and nobody on the other side can tell. It is a complete participant, not an admin tool or an app
 platform. The detail, with a check for every story, is in `docs/product/`:
 
@@ -29,9 +29,9 @@ feature. They do not forgive a missed message or one that looks broken.
   paths. `mediad` exists only during a call.
 - Lists I own (friends, contacts, DMs) are held whole. Servers and directories are searched or
   loaded by visible range, never downloaded. Presence is kept in memory for what is on screen.
-- Anything tinychat cannot draw is one labelled line with a link to that item in the official app.
+- Anything tinyclient cannot draw is one labelled line with a link to that item in the official app.
   Nothing is blank and nothing is silently dropped.
-- The shell shows a call only after the network confirms the join. A call tinychat cannot carry
+- The shell shows a call only after the network confirms the join. A call tinyclient cannot carry
   opens in the official app.
 - A conversation is read only when the window is active, it is open, and its newest message is on
   screen. Mute settings made in the official apps are honored.
@@ -47,7 +47,7 @@ Discord and Slack first, because they sign in today. Each increment is usable on
    *I can read a normal conversation without opening the official app.*
 2. **Everything and everyone.** Servers, channels and group DMs; People view with presence; typing;
    start a DM; Cmd-K; correct unread, mention and mute state; notifications and dock badge, which
-   need `tinychat.app`. Several Slack workspaces under one Slack sign-in.
+   need `tinyclient.app`. Several Slack workspaces under one Slack sign-in.
    *I can leave the official app closed all day for text and miss nothing.*
 3. **Answer in kind.** Threads; add reactions; reply, edit, delete; paste and attach; mention
    completion; emoji picker; search.
@@ -57,7 +57,7 @@ Discord and Slack first, because they sign in today. Each increment is usable on
    *I can take a call without launching anything else.*
 5. **Four networks.** Telegram, then Teams chat, to the level of 1 to 3. Telegram 1:1 calls. Teams
    calls and meetings open in Teams. Work Teams accounts can be blocked by the tenant's own policy;
-   nothing tinychat does changes that.
+   nothing tinyclient does changes that.
 
 ## Cut
 

@@ -1,0 +1,12 @@
+{"ok": true, "total_unread_replies": 1, "new_threads_count": 0, "has_more": false, "max_ts": "1760000250.000250",
+ "threads": [
+  {"root_msg": {"type": "message", "user": "U0ANA", "ts": "1760000200.000200", "team": "T01ALPHA", "text": "Ship plan for Friday",
+                "channel": "C0GEN", "thread_ts": "1760000200.000200", "reply_count": 2, "subscribed": true, "last_read": "1760000210.000210",
+                "latest_reply": "1760000250.000250"},
+   "latest_replies": [
+     {"type": "message", "user": "U0BEN", "ts": "1760000210.000210", "team": "T01ALPHA", "text": "works for me", "thread_ts": "1760000200.000200"},
+     {"type": "message", "user": "U0ANA", "ts": "1760000250.000250", "team": "T01ALPHA", "text": "moved to 3pm", "thread_ts": "1760000200.000200"}
+   ]},
+  {"root_msg": {"type": "message", "user": "U0ZZZ", "ts": "1760000100.000100", "channel": "C0ELSEWHERE", "text": "a channel not in the sidebar", "thread_ts": "1760000100.000100"},
+   "latest_replies": []}
+ ]}

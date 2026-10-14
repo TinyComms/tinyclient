@@ -70,7 +70,7 @@ fn socket_path(path: &Path) -> PathBuf {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         path.as_os_str().hash(&mut hasher);
-        PathBuf::from(format!(r"\\.\pipe\tinychat-{:016x}", hasher.finish()))
+        PathBuf::from(format!(r"\\.\pipe\tinyclient-{:016x}", hasher.finish()))
     }
     #[cfg(not(windows))]
     {

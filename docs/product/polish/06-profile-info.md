@@ -100,7 +100,7 @@ the network. Nothing in more is a network write without that click.
   item, "Search all on Discord" (one click, never automatic). Empty from cache reads "None in the messages loaded here", never
   "No pictures shared yet". A count on a tab only when the network gave an exact total.
 
-| Network | Complete, server-side | What tinychat shows |
+| Network | Complete, server-side | What tinyclient shows |
 | --- | --- | --- |
 | Telegram | `messages.search` with photo-video / document / url filters; `getSearchCounters` gives exact totals | exact counts on tabs at open (one request); full lists on scroll: P1 |
 | Discord | channel message search `has:image/file/link` (what the client does; unverified for DMs) | cache, "Search all on Discord" on click: P1 |

@@ -7,10 +7,10 @@ How the processes fit together and who may edit what. The contract itself is the
 
 | Process | Does | Never |
 |---|---|---|
-| `chatd` | Always on. Holds the sessions, the network sockets, SQLite and the media cache. Call signalling. | Decode media, link a codec or audio code, hold a tree, a member list or history in memory, fetch a link from a message, send anything the user did not ask for. |
+| `chatd` | Always on, one per support directory (`chatd.lock`). Answers its socket first, then reads the sessions behind it. Holds the sessions, the network sockets, SQLite and the media cache. Call signalling. | Decode media, link a codec or audio code, hold a tree, a member list or history in memory, fetch a link from a message, send anything the user did not ask for. |
 | `mediad` | Exists from "connecting" to the end of one call. Voice gateway, UDP, Opus, DAVE, audio devices. | Run with no call, touch SQLite, the keychain or the chat socket. It speaks only to chatd over stdin and stdout. |
-| `tinychat` | The window. Draws what chatd reports; decodes images for rows on screen. | Talk to a network, read the database or keychain, run a socket call, file read or decode on the main thread, run `mediad` itself. |
-| `tinychat-login` | One sign-in window, then exits with the session on stdout. | Stay running. |
+| `tinyclient` | The window. Draws what chatd reports; decodes images for rows on screen. Starts chatd when nothing answers (`protocol::launch`). | Talk to a network, read the database or keychain, run a socket call, file read or decode on the main thread, run `mediad` itself. |
+| `tinyclient-login` | One sign-in window, then exits with the session on stdout. | Stay running. |
 
 ## Contract in brief (`crates/protocol`)
 
@@ -28,19 +28,30 @@ How the processes fit together and who may edit what. The contract itself is the
 
 | Request | Answer | Served by |
 |---|---|---|
-| `Ping`, `Status` | `Pong`; `Status {networks, accounts (link, detail, reconnecting, required, totals, own avatar, presence, status), media, call, seq}` | hub, store |
+| `Ping`, `Status` | `Pong`; `Status {networks, accounts (link, detail, reconnecting, required, totals, own avatar, presence, status, can), media, call, seq, keychain, started}` | hub, store |
+| `ReadSessions` | `Status` (the read goes on behind it) | server: reads again the networks in `keychain.denied` |
 | `Wait {since}` | `Changes {seq, reset, changes}` | hub |
-| `Inbox {network, filter, offset, limit}` | `Conversations {conversations, total, counts}` | store |
+| `Inbox {network, filter, offset, limit}` | `Conversations {conversations, total, counts (all, unread, mentions, apps)}` | store (rules below) |
+| `Home {network, account, folder, shelf, offset, limit}` | `Conversations` (with this list's `counts`) | store; `Command::OpenHome` at offset 0 |
+| `Folders {network}` | `Folders {folders}` (name, order, colour, Spaces, unread, mentions) | store |
+| `Threads {space, offset, limit}`, `Topics {forum, offset, limit}` | `Conversations` | store; `Command::OpenThreads` at offset 0 |
+| `InVoice {network}`, `Around {network}` | `Conversations`; `Around {requests, in_call, online, recent}` | hub (occupants, presence, activity) and store |
 | `Find {network, query, limit}` | `Conversations` (title contains, newest first, cache only) | store |
 | `Spaces {network}`, `Tree {space, offset, limit, peek}` | `Spaces`; `Tree {groups (kind, count), conversations, total}` | store; `Command::OpenSpace` |
 | `Conversation`, `Collapse`, `Star`, `SetDraft` | `Conversation`; `Ok` | store (local only) |
 | `People {network, relation, query, offset, limit}` | `People {people, total}` | store; `Command::SearchPeople`, debounced |
-| `Members`, `StartDirect`, `Handoff`, `Profile {person}` | `Members`; `Conversation`; `Link`; `Profile` | adapter only (`Unsupported` until built) |
+| `Members`, `StartDirect`, `Handoff` | `Members`; `Conversation`; `Link` | adapter only (`Unsupported` until built) |
+| `Profile {person, space}` | `Profile` (typed, kept 5 min) | `Command::ProfileIn`, falling back to `Command::Profile` |
+| `ConversationInfo {conversation}`, `SpaceInfo {space}` | `ConversationInfo {info}`; `SpaceInfo {info}` (kept 5 min) | `Command::ConversationInfo` / `SpaceInfo` |
+| `SetMute {conversation, notify}`, `Leave`, `CloseDirect` | `Ok` once the network accepted | `Command::SetMute` / `Leave` / `CloseDirect` |
+| `Pinned {conversation}` | `Pinned {conversation, messages}` (≤ 50) | `Command::Pinned` |
+| `Shared {conversation, kind, before, limit, search}` | `Shared {items, more, complete, total}` | store; with `search`, `Command::SearchShared` |
 | `Relate {person, action}`, `SetPresence {account, presence, status}` | `Ok` | `Command::Relate` / `SetPresence` (`Unsupported` until built) |
 | `Watch(Watching)` | `Watching {people, typists}` | hub; `Command::Watch` |
 | `Messages {conversation, page, limit}` | `Messages {messages, last_read, older, newer}` | store; `Command::Backfill` / `History` / `HistoryAfter` / `HistoryAround` |
 | `MarkRead {conversation, message_id}` | `Ok` | store; `Command::MarkRead` |
-| `Send`, `Retry`, `Discard`, `Typing` | `Sent {message}` (pending); `Ok` | store; `Command::Send` / `Typing` |
+| `Send {.., with}`, `Retry`, `Discard`, `CancelSend`, `Typing` | `Sent {message}` (pending, files listed); `Ok` | store; `Command::Send`, or `SendWith` when `with` is not plain; `CancelSend`; `Typing` |
+| `Catalog {account, kind, space, query, cursor}` | `Catalog {items, cursor}` (≤ 200, kept 5 min) | `Command::Catalog` |
 | `React {conversation, message_id, emoji, on}` | `Ok` | store at once; `Command::React` (`Unsupported` until built) |
 | `Edit {.., text}`, `Delete {..}` | `Ok` once the network accepted | `Command::Edit` / `Delete` (`Unsupported` until built) |
 | `Fetch {account, ids, size, retry}` | `Media {files}` | store (size, retry); `blobs` |
@@ -105,6 +116,63 @@ How the processes fit together and who may edit what. The contract itself is the
   the same query is not sent to an account twice within a minute. The adapter says
   `Context::searched` when it is done, found or not (`Change::Searched`).
 
+### Added in the polish round (`protocol/src/info.rs` and the fields below)
+
+- **Start and the keychain**: chatd binds and answers first, then reads each network's session on
+  a thread (`Chat::read_sessions`). `Status.keychain` says `reading`, `waiting` (a read past one
+  second: the shell shows "Waiting for permission to read your sign-in from the keychain") and
+  `denied` (refused, cancelled or locked: cache kept, "Try again" is `ReadSessions`). Meanwhile
+  a cached account is listed `Offline` with that in `detail`, never dropped. `Status.started`
+  (unix ms) changes at every start: with `Changes.reset`, how a shell learns chatd restarted.
+- **Starting chatd** is the shell's (`protocol::launch`): `chatd_answers`, `start_chatd` (its own
+  process group, stderr to `chatd.log`), `chatd_path` (`TINYCHAT_CHATD`, else beside the running
+  binary: the bundle's `Contents/MacOS` or `target/<profile>`; build both with
+  `cargo build -p chatd -p tinyclient`). A second chatd finds `chatd.lock` held and exits.
+- **Panics**: `protocol::crash::install_panic_hook` in chatd, mediad (and the shell) writes one
+  redacted entry (`protocol::redact`) to stderr and `crash.log`. chatd answers a request that
+  panicked with `Internal` and keeps the connection; every lock in chatd is taken with
+  `hub::lock`, which recovers a poisoned one. A failed accept or thread spawn drops that one
+  connection. A frame chatd cannot parse is answered `Unsupported` ("versions differ"); an
+  answer over 1 MiB is `TooLarge`; `write_frame` refuses to write one.
+- **Navigation**: a network may have no Spaces: its rows have no `space`, and its home is `Home`
+  (the network's pins in `pin` order, then recency; `shelf` picks the archive or message
+  requests). A row carries `folders`, `archived`, `pin` (the network's, apart from the local
+  `starred`), `hidden`, `followed`, `bot`, `meeting` (the shell folds one quiet 14 days by
+  `updated`), `special` (Saved, Service, Request), `mark`, `opted_out` (under "Browse n more"),
+  and `quiet` (filled by chatd: nothing in 30 days, nothing unread, not starred, no draft). A
+  folder (`Folder`) is a filter over chats (Telegram, membership on the row, the folder's own
+  pins first) or a group of Spaces (Discord, `spaces`, `Space.folder`). `Change::Folders` says
+  the list or a membership changed; the counts on folders move with unread, so a shell showing
+  them reads `Folders` again on `Status` too. `Space` has `muted` and
+  `hide_muted`; `Group` has `muted` (starts collapsed) and `unread_only`.
+- **The Inbox** holds direct and group conversations, starred rows, rows the adapter lists, and
+  channels that mention me, for 24 h after the mention, read or not. Never hidden rows, message
+  requests, rows with no message, archived rows unless they mention me, or rows idle 30 days that
+  are not starred, unread, drafted or failed. Bot rows are in it, `bot` set, for the one Apps
+  row; their plain unread raises no number (`counts.apps` is their dot). Order: All starred then
+  newest; Unread and Mentions mentions first. Day groups are the shell's, from `updated`.
+  `Conversation::badge` and the SQL `ATTENTION` agree: bots and archived rows count mentions
+  only; requests and hidden rows nothing.
+- **Previews**: a row carries `preview`, `preview_from` (a group's last speaker), `preview_mine`
+  and `seen` (the other side read my last message). The shell names the rows on screen in
+  `Watching.rows`; chatd sends `Command::Previews` for those with none, each once, never to
+  Discord.
+- **People**: `Presence::Busy`; `Person.emoji` and `activity` (live, from `Context::activity`),
+  `title`, `utc_offset`, `mark` (stored, `Context::details`). People and Around never list bots.
+- **Profiles** are typed (`nickname`, `pronouns`, `title`, `department`, `roles`, `contacts` with
+  phones `masked`, `mutual_total`, `joined`, `friends_since`, `last_seen`, `status_until`, `away`,
+  `away_until`, `note`, `warning`); `fields` keeps leftovers only, and chatd moves a labelled
+  line an adapter still sends (Pronouns, Title, Email, Phone, Roles) to its place.
+- **Sending**: `Send.with` (`Outgoing`) carries `files` (paths, never bytes; ≤ 10 and the
+  account's `max_files`), `silent`, `suppress_embeds`, `ping` (on by default), `pick` (a sticker
+  or GIF by catalog id) and `schedule` (the network's own). chatd checks `AccountStatus.can`
+  (`Capabilities`) first and refuses in words ("trail.mov is too big for Discord (limit 10 MB)").
+  The pending message lists the files from their paths at once; progress is `Change::Upload`,
+  at most four a second; `CancelSend` ends it `Failed` ("Cancelled"), and `Retry` sends the files
+  again. Catalogs are asked when a picker tab opens, never before.
+- **Shell memory** (last conversation, sidebar mode, Details switches, pane width, scroll
+  anchors, remembered threads) is the shell's own prefs file, not chatd's: nothing else needs it.
+
 ## How the shell learns what changed
 
 The hub keeps one entry per changed thing, each stamped with a rising `seq`; the same thing
@@ -112,9 +180,10 @@ changing again replaces its entry, so the list is bounded (256) by how many thin
 `Wait {since}` blocks up to 30 s and answers every entry newer than `since`.
 
 - Stored things name what to read again: `Status`, `Conversation`, `Messages`, `Spaces`, `Tree`,
-  `People`, `Members`, `Media` (carries the file).
+  `People`, `Members`, `Folders`, `Media` (carries the file).
 - Ephemeral things carry their whole value and cause no reads: `Typing {typists}` (each with
-  `until`; the shell times the line out itself), `Presence`, `Call`, `Occupants`, `Searched`.
+  `until`; the shell times the line out itself), `Presence` (with `emoji` and `activity`),
+  `Call`, `Occupants`, `Searched`, `Upload {client_id, sent, total}`.
 - `Occupants {conversation, occupants}` is who is in a voice channel: at most 25 people with
   mute, deafen and streaming flags, and the true total. It never announces the tree. The current
   value rides on the row whenever `Tree`, `Conversation` or `Inbox` is read; an emptied channel
@@ -131,10 +200,11 @@ changing again replaces its entry, so the list is bounded (256) by how many thin
 
 | Data | Where |
 |---|---|
-| Sessions | Keychain, service `tinychat`, one item per network. Never in SQLite. |
-| Accounts, Spaces, groups (with their kind), conversations (with unread, mentions, muted, read marker, star, topic, thread parent and root, draft), people and relationships, messages (rich fields as JSON in `message.body`), media rows with their failure and size variants, adapter notes | `chat.sqlite`, schema version in `PRAGMA user_version` (now 3). A version change drops and refills the cache. |
+| Sessions | Keychain, service `tinyclient`, one item per network. Never in SQLite. |
+| Accounts, Spaces (muted, hide muted), folders, groups (kind, muted, unread only), conversations (unread, mentions, muted, read marker, star, topic, thread parent and root, draft, filing, kind flags, preview parts, seen, when it last mentioned me), people and relationships (title, time zone, mark), messages (rich fields as JSON in `message.body`), media rows with their failure and size variants, adapter notes | `chat.sqlite`, schema version in `PRAGMA user_version` (now 4), page cache 1 MB. A version change drops and refills the cache: the 3 → 4 change does, once. |
 | Media bytes | `media/<network>/<account>/` under the support directory, 500 MB, least recently used first. |
-| Presence, typing, voice occupants, what the shell watches, links, the change list, the call | chatd memory, bounded, gone at restart. |
+| Presence and activity, typing, voice occupants, what the shell watches, links and capabilities, the change list, the call, upload progress, previews asked, and five minutes of profiles, info panes and catalog pages (64 / 64 / 16 / 32 at most) | chatd memory, bounded, gone at restart. |
+| Panics, chatd's stderr | `crash.log` (cut at 256 KB), `chatd.log` (cut at 4 MB at start) in the support directory. |
 | Retention | Newest 2,000 messages per conversation; nothing older than 90 days unless the conversation was opened in that time. A thread row that names its parent goes when its parent goes, or when its root message has aged out and nobody opened the thread in 90 days. `Store::prune`, at start and daily. |
 
 ## What an adapter must do
@@ -146,13 +216,30 @@ changing again replaces its entry, so the list is bounded (256) by how many thin
   lists its DMs and group DMs as rows of the Space's tree, with `space` set, under one `Group`
   whose `kind` is `GroupKind::Directs`, after the channel sections. They stay in the Inbox, which
   holds every direct conversation whatever its Space. Discord's DMs belong to no Space.
-- **Calls**: set `call: Native` only on what tinychat can carry itself. A stage channel, and
+- **Calls**: set `call: Native` only on what tinyclient can carry itself. A stage channel, and
   anything else a listener cannot simply join and speak in, is not `Native`.
 - **Voice occupancy**: `Context::occupants(conversation, people, total)` for every voice channel
   of a Space on screen, whenever it changes, us included when we are in it.
 - **Idle**: `serve_commands` blocks on the inbox with no timer, and `Context::pause` is the one
   interruptible wait. No loop of short sleeps: the whole process has a budget of about one idle
   wakeup a second.
+- **Filing**: `ConversationRow` carries `bot`, `meeting`, `special`, `mark`, `opted_out`, and
+  `filing: Option<Filing>` (folders, archived, pin, hidden, followed): `None` leaves what is
+  stored, so a tree reload never undoes a pin. One change alone is `Context::filing`; the
+  folder list is `Context::folders` (`FolderRow`); a Space's mute and hide-muted
+  `Context::space_flags`.
+- **Previews and reads**: `Command::Previews(ids)` for rows on screen with none: one request a
+  second at most, recorded with `Context::history` (a whole message) or `Context::preview` (a
+  line). `Context::seen` when the other side read up to a message.
+- **People**: `Context::details` (title, time zone, mark) after `Context::people`;
+  `Context::activity` (emoji, playing, in voice, in a meeting) beside `Context::presence`.
+- **Sending**: `Context::capabilities` once the session says what the account may send.
+  `Command::SendWith` streams each file from its path in parts (one part in memory, 512 KB on
+  Telegram, 8 MB elsewhere), calls `Context::upload` as it goes and `Context::sent` at the end
+  (a failure names the file); `CancelSend` stops it.
+- **New commands**, all answered `Unsupported` until built: `ProfileIn`, `ConversationInfo`,
+  `SpaceInfo`, `SetMute` (report with `Context::muted`), `Leave`, `CloseDirect`, `Pinned`,
+  `SearchShared`, `Catalog`, `SendWith`, `CancelSend`, `Previews`, `OpenHome`, `OpenThreads`.
 
 ## chatd and mediad (`protocol/src/call.rs`)
 
@@ -187,15 +274,23 @@ sends `Levels` and chatd passes our input level on as `Call.level`; `Call.inputs
 ## The demo (`chatd --seed-demo`, `chatd/src/demo*`)
 
 Invented data in a scratch `TINYCHAT_DIR`, and an adapter with no network behind it
-(`demo/adapter.rs`) that answers for the three demo accounts: a send is accepted, a reaction
-toggles, edit and delete work, a friend request can be answered, our presence set, a profile and
-a member list read, a call in a voice channel puts us among its occupants. The server's own
-tests use it as their network (`tests/e2e.rs`, `tests/calls.rs`). Variants, comma separated:
-`live`, `expired`, `many` (50 Discord servers), `attention`, `reconnecting`. `TINYCHAT_DEMO_VOICE`
-hands calls a voice server; `TINYCHAT_DEMO_ANSWER_MS` and `TINYCHAT_DEMO_SIGN_OUT_MS` set how long
-the "network" takes to answer a ring and to sign out.
+(`demo/adapter.rs`) that answers for the five demo accounts (Discord, two Slack workspaces,
+Telegram, Teams): a send is accepted, files "upload" from their paths with progress and can be
+cancelled, a reaction toggles, edit and delete work, a friend request can be answered, our
+presence set, a typed profile, a conversation's and a Space's info, a member list, pinned
+messages, a shared-media search and the pickers' catalogs read, a mute set, a group left, a DM
+closed, rows with no preview filled when on screen, and a call in a voice channel puts us among
+its occupants. What each account holds is listed at the top of `demo.rs` (`demo/telegram.rs`,
+`demo/teams.rs`, `demo/polish.rs` for this round). The server's own tests use it as their network
+(`tests/e2e.rs`, `tests/calls.rs`, `tests/polish.rs`). Variants, comma separated: `live`,
+`expired`, `many` (50 Discord servers), `attention`, `reconnecting`. `TINYCHAT_DEMO_VOICE` hands
+calls a voice server; `TINYCHAT_DEMO_ANSWER_MS`, `TINYCHAT_DEMO_SIGN_OUT_MS` and
+`TINYCHAT_DEMO_UPLOAD_MS` set how long the "network" takes to answer a ring, to sign out and to
+take each quarter of a file. In a scratch directory only, `TINYCHAT_TEST_KEYCHAIN_MS` makes each
+session read that slow and `TINYCHAT_TEST_PANIC=<query>` makes a `Find` for it panic while it
+holds the store.
 
-## Ownership
+## Ownership (polish round)
 
 **Shared, edit only through the extension point:**
 
@@ -203,23 +298,27 @@ the "network" takes to answer a ring and to sign out.
 |---|---|
 | `crates/protocol/**` | Frozen. Ask the integrator; additions must be optional fields (`default`, `skip_serializing_if`). |
 | `chatd/src/store.rs` | Frozen. Small lookups: `Context::note` / `set_note`. A new column is a `SCHEMA` bump by the integrator. |
-| `chatd/src/adapters/mod.rs` | Frozen. Serve a `Command`, call a `Context` method. Unserved commands go to `Command::unsupported`. |
-| `chatd/src/hub.rs`, `server.rs`, `session.rs`, `lib.rs`, `main.rs`, `demo.rs`, `demo/*`, `tests/e2e.rs` | Frozen. |
-| `tinychat/src/gui/mod.rs`, `state.rs` | Slice D only. Other views keep their own `State` and take changes in their `*_changed` hook. |
+| `chatd/src/adapters/mod.rs`, `adapters/net.rs` | Frozen. Serve a `Command`, call a `Context` method. Unserved commands go to `Command::unsupported`, which every adapter's `match` already ends in. |
+| `chatd/src/hub.rs`, `server.rs`, `session.rs`, `lib.rs`, `main.rs`, `media.rs`, `demo.rs`, `demo/*`, `tests/e2e.rs`, `tests/polish.rs`, `tests/calls.rs`, `crates/mediad/**` | Frozen. A demo answer a slice needs is a `// CONTRACT:` note for the integrator. |
+| `tinyclient/src/gui/state.rs` | Slice A, except the `load_*` list functions (`load_inbox`, `load_spaces`, `load_tree`, `load_directs`, `load_row`, `refresh_row`), which are slice B's. Other views keep their own `State` and take changes in their `*_changed` hook. |
 | `Cargo.toml` files | Add only your own dependency lines. No async runtime, no second TLS stack. |
 
 New files go in a directory named after your module and are declared from your own file
-(`adapters/discord/*.rs` from `discord.rs`, `gui/people/*.rs` from `people.rs`), so no shared
-`mod` list changes. Tests go in your own files or a new `tests/<slice>.rs`. A gap in the contract
-is a `// CONTRACT:` comment where it was worked around, for the integrator.
+(`adapters/discord/*.rs` from `discord.rs`, `gui/pane/*.rs` from `pane.rs`), so no shared `mod`
+list changes; a new top-level `gui/<name>.rs` is declared in `gui/mod.rs` by slice A on request.
+Tests go in your own files or a new `tests/<slice>.rs`. A gap in the contract is a
+`// CONTRACT:` comment where it was worked around, for the integrator.
 
-| | Slice | May edit | Now implements |
+| | Slice | May edit | Implements or consumes |
 |---|---|---|---|
-| A | Calls | `crates/mediad/**`, `chatd/src/media.rs`, `adapters/discord/voice*`, `gui/call.rs`, `gui/call/*` | mediad: `Rejoin`, `Meter`, `DeviceList`, our own `Speaking`, `Ready {engine_linked: true}`. Adapter voice: `Context::occupants` for every voice channel on screen, `Context::answered`, `call: Native` never on a stage, `CallLeave` for a call it already left is nothing. Dock: `Call.speaking`, `level`, `inputs`, `outputs`; `Media(Meter)` around the device menu, no `mediad --devices-lines`; a failed call's words; occupants on the joined channel. |
-| B | Adapters and media cache | `adapters/discord.rs`, `adapters/discord/*` (but `voice*`), `adapters/slack.rs`, `adapters/slack/*`, `chatd/src/blobs.rs`, `blobs/*`, `crates/login/**` | Commands: `React`, `Edit`, `Delete`, `Relate`, `SetPresence`, `Profile`, `HistoryAfter`, `HistoryAround`, `SignOut(reply)` answered after the network logout. Rows: `topic`, `read_only`, `private`, thread `parent` / `root`, `PersonRow.link`, Slack DMs under a `GroupKind::Directs` group. Messages: `forwarded`, `card`, `spoiler`, `sticker`, `waveform`, `ReplyTo.person`, `ThreadSummary.participants` / `unread`. Context: `attention`, `save_session`, `group`, `searched`, `members_changed`, `presence_of`, `stored_ids`, `media_variants`, `media_refreshed`; release a Space when `Watching.space` moves off it. Cache: `Store::media_failed` on a failed fetch and the reason on `Change::Media`, no fetch while `failed` is set, variants at 2x. |
-| C | Shell conversation view | `gui/conversation.rs`, `gui/conversation/*` | `React`, `Edit`, `Delete`; `card`, `forwarded`, tombstones and deleted replies, `spoiler`, `sticker`, `waveform`; thread line with faces and unread; reply avatars from `ReplyTo.person`; `Fetch` with `size` (and `retry` only on the user's click), stop asking when `failed`; header subtitle from `Conversation::subtitle()`; `Page::After` / `Around`; never `MarkRead` under `gui-shot`. |
-| D | Shell navigation, people and composer | every other file under `crates/tinychat/src/` | Space title on rows and in the switcher (`Find`); Inbox `counts` and the `Directs` filter; `Group.kind` / `count`; threads nested by `parent`; occupants on tree rows (`Change::Occupants`); `Watching.space`; `Relate`, `SetPresence`, `Profile`, `Person.link`; own avatar and presence from `Status`; `reconnecting` and `required` on a link; `SignIn.at` and the three sign-in errors; drafts through `SetDraft`; `Change::Searched` and `Change::Members`; `read_only` and `private` on rows. |
-
+| A | Shell foundation | `tinyclient/src/main.rs`, `client.rs`, `gui/mod.rs`, `gui/state.rs` (above), `gui/layout.rs`, `gui/theme.rs`, `gui/components.rs`, `gui/components/*`, `gui/assets.rs`, `gui/time.rs`, `gui/signin.rs`, `gui/signin/*`, new `gui/app/*` (menu bar, window states, overlays), `packaging/**` | Tokens and components of `design/polish/01-system.md`; every overlay (menu, popover, modal scrim) inside the window; window states from `Status.keychain` (`reading`, `waiting`, `denied` → `ReadSessions`), an account's `detail`, `reconnecting`, `required`; starting chatd with `protocol::launch::{chatd_answers, start_chatd}`, keeping the last snapshot behind "Reconnecting…", three restarts in 30 s, re-reading on `Status.started` changing or `reset`; socket timeouts in `client.rs`; `ErrorCode::TooLarge` and `Unsupported` ("versions differ") in words; `install_panic_hook("tinyclient")` and the crash-restart toast from `crash.log`; menu bar, ⌘W hides, window frame and prefs restored (last conversation, sidebar mode, Details switches, pane width). |
+| B | Shell lists | `gui/sidebar.rs`, `gui/sidebar/*`, `gui/rail.rs`, `gui/people.rs`, `gui/people/list.rs`, `gui/people/hub.rs`, `gui/people/presence.rs`, `gui/people/status.rs`, the `load_*` functions of `gui/state.rs`, new `gui/home/*` | Inbox by `Inbox` (its rules are chatd's), day headers from `updated`, one Apps row from `bot` and `counts.apps`, chips from `counts`; `Watching.rows` for every list on screen (previews); People sections from `Around` (`in_call`, `online`, `recent`, `requests`), never bots; the rail's one number (`AccountStatus.attention`) and dots, its own picture fetched with `Fetch`; the switcher (`Find`, Needs you, Recent); the four homes: Discord (`Home` DMs, `Shelf::Requests`, `InVoice`, `Folders` of Spaces, `Space.folder` / `muted`, `opted_out` under "Browse", `Group.muted` collapsed, `followed` threads), Slack (`Tree`, `Group.unread_only`, `quiet` rows folded, `Threads`), Telegram (`Home` with `pin`, `Folders` chips and `folder`, `Shelf::Archive`, `Topics`, `special`, `mark`, `seen`, `preview_from`), Teams (`Home` chats, `meeting` 14-day fold, `special` Saved, `hidden`, teams' `opted_out` channels); `Presence::Busy`, `Person.emoji`, `activity`, `title`, `utc_offset` on rows. |
+| C | Shell conversation and panes | `gui/conversation.rs`, `gui/conversation/*` (but `emoji.rs`), `gui/people/members.rs`, new `gui/pane.rs`, `gui/pane/*` | **P0**: a thread composer never posts to the conversation the user left (put the thread away on every switch, R2). Right pane kinds and following (07 §1), one width 300 (260–420), landing at the first unread, per-conversation memory (scroll anchor, remembered thread, last 50), Escape ladder; header from `Conversation::subtitle()`, `read_only`, `special` (no composer for Service), `mark`; `Pinned` for the pins; `Change::Upload` progress and Cancel (`CancelSend`) on a pending row; a pending row keeps its place and time; `rich.rs` span ranges never panic. |
+| D | Shell profile, info pane and card | `gui/people/card.rs`, `gui/people/info.rs`, `gui/people/shot.rs`, new `gui/profile/*` | `Profile {person, space}` with the typed fields in the fixed order (06), `contacts` masked until clicked, `warning`, `away`; `ConversationInfo` (description, members, online, created, creator, `notify`, `pinned`, `external`, `link`) and `SpaceInfo` from the Space's name; `SetMute`, `Leave` (one confirm), `CloseDirect`, `Relate`; `Shared` from the cache labelled as such (`complete: false`) and "Search all" as `search: true`, counts only from `total`; the floating card 300 wide, 64 avatar. |
+| E | Shell composer and pickers | `gui/composer.rs`, `gui/composer/*`, `gui/input.rs`, `gui/conversation/emoji.rs`, new `gui/picker/*` | `Send.with` (`Outgoing`): attach, paste and drop staging paths (pasted pixels to `$TINYCHAT_DIR/outbox/`), per-file `spoiler`, `as_file`, `original`, refusals checked against `AccountStatus.can` before staging; `silent` (Option-Return where `can.silent`), `suppress_embeds` (the preview chip), `ping` on replies, `pick` from the picker; one picker with Emoji (Unicode list local, custom from `Catalog` `Emoji`), GIFs and Stickers tabs, each only where `can` allows, asked on tab open; autocomplete; the `@everyone` confirm from `ConversationInfo.members`; `input.rs` IME ranges never panic. |
+| F | Discord and Slack adapters | `adapters/discord.rs`, `adapters/discord/*`, `adapters/slack.rs`, `adapters/slack/*`, `crates/login/**`, `tests/discord.rs`, `tests/slack.rs`, `tests/fixtures/{discord,slack}/**` | Discord: `guild_folders` → `Context::folders`, server mute and hide-muted → `space_flags`, opt-in → `opted_out`, muted categories → `Group.muted`, message requests → `Special::Request`, bot DMs `bot`, joined threads `followed`, `Context::activity` from presences and voice states (friends in voice reported as occupants), `ProfileIn` (nickname, roles, joined), `ConversationInfo`, `SpaceInfo`, `SetMute`, `Leave`, `CloseDirect`, `Pinned`, `SearchShared`, `Catalog` (READY's emoji and stickers, `/gifs/search`), `SendWith` (attachments, `SPOILER_`, flags `silent` / `suppress_embeds`, `allowed_mentions.replied_user`), `capabilities` from `premium_type`; never a per-row preview fetch. Slack: sections' `unread_only`, app and bot DMs `bot` (Slackbot too), guests and external `mark`, `details` (title, `tz_offset`), status emoji through `activity`, huddles, `Previews` (`conversations.history limit=1`, paced), `OpenThreads` (`subscriptions.thread.getView`) → `followed`, `ConversationInfo`, `SetMute`, `Pinned`, `SearchShared` (`files.list`), `Catalog` (`emoji.list`), `SendWith` (`files.getUploadURLExternal` …), `schedule`. |
+| G | Telegram and Teams adapters | `adapters/telegram.rs`, `adapters/telegram/*`, `adapters/teams.rs`, `adapters/teams/*`, `tests/telegram.rs`, `tests/teams.rs`, `tests/fixtures/{telegram,teams}/**` | Telegram: no Space (rows with no `space`), `filing` (folders from the dialog filters' rules, archive, pins), `Context::folders` with the folders' own pins, `listed` only for people, groups, bots and the service chat, `special` Saved and Service, `mark` (verified, scam, fake), `seen` from `read_outbox_max_id`, topics as `Thread` rows under the forum with their pins, `OpenHome`, `Previews` (paced), `ProfileIn` (admin title), `ConversationInfo`, `SetMute`, `Leave`, `Pinned`, `SearchShared` (with counters), `Catalog` (saved GIFs, `@gif`, sticker packs), `SendWith` (`saveFilePart` in 512 KB parts, albums, spoiler, as file), `silent`, `schedule`. Teams: chats with no Space, `meeting`, bot chats `bot`, Notes `Special::Saved`, `hidden` (unhidden by a new message), team channels' `opted_out`, `Presence::Busy` and `activity` (in a meeting, presenting), out of office in `Profile.away`, `details` (title, department), `Context::preview` from `lastMessage`, `seen`, `ConversationInfo`, `SetMute`, `SendWith` (OneDrive, second token). |
+| H | Media and sending in chatd | `chatd/src/blobs.rs`, `blobs/*`, new `chatd/src/upload.rs`, `upload/*`, `tests/blobs.rs`, new `tests/upload.rs` | One upload helper for F and G: a file read from its path in bounded parts, progress through `Context::upload`, cancel, a failure that names the file; the catalog previews' files under `media/<network>/pick/`, deleted when the picker closes, custom emoji in the 48 px cache; the on-screen rows' avatars and previews fetched with at most 4 in flight; each account's own picture fetched at sign-in (the rail's). |
 ## Working in one checkout
 
 - One cargo command at a time, `-j 6`. Slices A and B share the `chatd` crate, so someone else's
@@ -229,5 +328,9 @@ is a `// CONTRACT:` comment where it was worked around, for the integrator.
   it at a local fake with `TINYCHAT_DISCORD_API`, `TINYCHAT_DISCORD_GATEWAY`, `TINYCHAT_SLACK_API`,
   `TINYCHAT_SLACK_SOCKET`. In a scratch directory `SignIn` runs only a helper the test names in
   `TINYCHAT_LOGIN`, and a session an adapter saves goes to `session.<network>` in that directory.
-- Left for later, with room kept: Telegram and Teams, message search, sending attachments,
-  notifications, settings, video.
+- Slices F, G and H share the `chatd` crate, and A to E the `tinyclient` crate: someone else's
+  half-written file can break your build. Check with `cargo check -p chatd` (or `-p tinyclient
+  --features gui`) and say so; do not fix it.
+- Left for later, with room kept: message search, notifications, settings, video, voice
+  messages (P2), Discord's per-server file limit (boosts) and Telegram's boosted packs in
+  `Capabilities`, picker recents in SQLite.

@@ -1,4 +1,4 @@
-//! `tinychat-login <network>`: the one place a web page is shown.
+//! `tinyclient-login <network>`: the one place a web page is shown.
 //!
 //! Slack and Discord sign-in (passwords, SSO, 2FA, captchas) only exists as their web pages, so
 //! this opens that page in a window, waits for the signed-in session to appear, prints it as one
@@ -37,7 +37,7 @@ fn main() {
         Some("discord") => "discord",
         Some("teams") => "teams",
         other => {
-            eprintln!("tinychat-login: no web sign-in for {other:?}");
+            eprintln!("tinyclient-login: no web sign-in for {other:?}");
             std::process::exit(USAGE);
         }
     };
@@ -48,7 +48,7 @@ fn main() {
         _ => unreachable!(),
     };
     let at = parse_at(&args).unwrap_or_else(|why| {
-        eprintln!("tinychat-login: {why}");
+        eprintln!("tinyclient-login: {why}");
         std::process::exit(USAGE);
     });
     #[cfg(target_os = "macos")]

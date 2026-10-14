@@ -84,7 +84,7 @@ list.
   (`sidebar_selected`). Blocked rows: avatar 45% opacity, name `text_faint`.
 - **Click a row = Message.** Click the avatar = profile card. **Hover actions**: two 28 px buttons (radius 8, gap 4) at right
   10, top 14, on a patch of the row's own opaque color with 10 px left padding, covering the text's end so nothing reflows:
-  `phone` (only where tinychat can carry or hand off the call) and `ellipsis` (Profile, Open in network, Remove friend,
+  `phone` (only where tinyclient can carry or hand off the call) and `ellipsis` (Profile, Open in network, Remove friend,
   Block). There is no separate Message button; the row is the button.
 - **Request rows** (same 56 px): line 2 is "Wants to be friends" plus mutual-server count, or "Request sent Oct 9". Actions
   are always visible, not hover-only: incoming `check` (`positive_soft` fill, `positive` glyph) and `x`; outgoing `x` only.

@@ -5,7 +5,7 @@ members = [
     "crates/chatd",
     "crates/mediad",
     "crates/login",
-    "crates/tinychat",
+    "crates/tinyclient",
 ]
 
 [workspace.package]

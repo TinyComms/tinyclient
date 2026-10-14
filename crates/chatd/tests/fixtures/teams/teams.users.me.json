@@ -205,7 +205,7 @@
    "createdAt": "2026-09-01T10:00:00.000Z",
    "lastMessage": {
     "messageType": "RichText/Html",
-    "content": "",
+    "content": "<p>Launch moved to Thursday</p>",
     "clientMessageId": "13929521000000000",
     "imDisplayName": "Me Myself",
     "id": "1759000000000",
@@ -245,7 +245,7 @@
    "createdAt": "2026-08-01T10:00:00.000Z",
    "lastMessage": {
     "messageType": "RichText/Html",
-    "content": "",
+    "content": "<p>Can you look at the <b>deploy</b>?</p>",
     "clientMessageId": "13937443963459500",
     "imDisplayName": "Ana Ruiz",
     "id": "1760000500500",
@@ -342,6 +342,87 @@
    "isRead": true,
    "isOneOnOne": false,
    "hidden": false
+  },
+  {
+   "id": "19:00000000-0000-4000-8000-0000000000aa_workflows@unq.gbl.spaces",
+   "members": [
+    {
+     "isMuted": false,
+     "mri": "8:orgid:00000000-0000-4000-8000-0000000000aa",
+     "objectId": "00000000-0000-4000-8000-0000000000aa",
+     "role": "Admin",
+     "isIdentityMasked": false
+    },
+    {
+     "isMuted": false,
+     "mri": "28:00000000-0000-4000-8000-0000000000f1",
+     "objectId": "00000000-0000-4000-8000-0000000000f1",
+     "role": "Admin",
+     "isIdentityMasked": false
+    }
+   ],
+   "title": null,
+   "isRead": true,
+   "isOneOnOne": false,
+   "hidden": false,
+   "isLastMessageFromMe": true,
+   "chatType": "chat",
+   "lastMessage": {
+    "messageType": "RichText/Html",
+    "content": "<p>run the weekly report</p>",
+    "clientMessageId": "1",
+    "imDisplayName": "Me Myself",
+    "id": "1758000000000",
+    "type": "Message",
+    "composeTime": "2025-09-01T00:00:00.0000000Z",
+    "originalArrivalTime": "2025-09-01T00:00:00.0000000Z",
+    "containerId": "19:00000000-0000-4000-8000-0000000000aa_workflows@unq.gbl.spaces",
+    "parentMessageId": "1758000000000",
+    "from": "8:orgid:00000000-0000-4000-8000-0000000000aa",
+    "sequenceId": 0
+   }
+  },
+  {
+   "id": "19:meeting_NzQ2YjE@thread.v2",
+   "members": [
+    {
+     "isMuted": false,
+     "mri": "8:orgid:00000000-0000-4000-8000-0000000000aa",
+     "objectId": "00000000-0000-4000-8000-0000000000aa",
+     "role": "Admin",
+     "isIdentityMasked": false
+    },
+    {
+     "isMuted": false,
+     "mri": "8:orgid:00000000-0000-4000-8000-0000000000a1",
+     "objectId": "00000000-0000-4000-8000-0000000000a1",
+     "role": "Admin",
+     "isIdentityMasked": false
+    }
+   ],
+   "title": null,
+   "isRead": true,
+   "isOneOnOne": false,
+   "hidden": false,
+   "isLastMessageFromMe": false,
+   "chatType": "meeting",
+   "meetingInformation": {
+    "subject": "Weekly sync"
+   },
+   "lastMessage": {
+    "messageType": "RichText/Html",
+    "content": "<p>Notes are in the doc</p>",
+    "clientMessageId": "1",
+    "imDisplayName": "Ana Ruiz",
+    "id": "1757000000000",
+    "type": "Message",
+    "composeTime": "2025-09-01T00:00:00.0000000Z",
+    "originalArrivalTime": "2025-09-01T00:00:00.0000000Z",
+    "containerId": "19:meeting_NzQ2YjE@thread.v2",
+    "parentMessageId": "1757000000000",
+    "from": "8:orgid:00000000-0000-4000-8000-0000000000a1",
+    "sequenceId": 0
+   }
   }
  ],
  "users": [],

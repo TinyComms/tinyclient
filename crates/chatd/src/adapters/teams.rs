@@ -57,8 +57,10 @@
 //!
 //! Teams, channels and chats: `GET https://teams.microsoft.com/api/csa/api/v1/teams/users/me`
 //! with a `chatsvcagg` bearer [C, with a fixture]. That hidden channels are `isFavorite:
-//! false`, that the listed order is the user's, and how unread is told for a chat (`isRead`)
-//! are read off field names [U]. Mentions unread at connect are not told at all.
+//! false`, that the listed order is the user's, how unread is told for a chat (`isRead`), a
+//! meeting's `meetingInformation` and a chat's `lastMessage.content` are read off field names
+//! [U]. Mentions unread at connect come from one page of the Activity stream
+//! (`48:notifications`), its `properties.activity` shape unverified [U].
 //!
 //! People: `POST {middleTier}/beta/users/fetchShortProfile` with a list of ids, `searchV2` with
 //! the query as the body, pictures at `…/users/{id}/profilepicturev2?size=HR64x64` behind an
@@ -89,9 +91,11 @@
 //! `https://go.trouter.teams.microsoft.com`. The session comes from `TINYCHAT_SESSION_TEAMS`.
 
 mod html;
+mod info;
 mod message;
 mod people;
 mod push;
+mod send;
 mod tree;
 
 use super::net::{address, browser};
@@ -115,8 +119,11 @@ const TEAMS: &str = "https://teams.microsoft.com";
 const SPACES: &str = "https://api.spaces.skype.com";
 const AGGREGATOR: &str = "https://chatsvcagg.teams.microsoft.com";
 const PRESENCE: &str = "https://presence.teams.microsoft.com";
+/// The second audience: Microsoft Graph, for the user's OneDrive (files in chats). Unverified
+/// that Teams' client id may mint it.
+const GRAPH: &str = "https://graph.microsoft.com";
 /// Hosts a service address handed out by Teams may be on. A token goes nowhere else.
-const OURS: &[&str] = &["teams.microsoft.com", "skype.com", "teams.cloud.microsoft", "teams.office.com"];
+const OURS: &[&str] = &["teams.microsoft.com", "skype.com", "teams.cloud.microsoft", "teams.office.com", "graph.microsoft.com"];
 
 /// Messages per page of history, and per opening of a reply chain.
 const PAGE: u32 = 50;
@@ -127,6 +134,8 @@ const PACE: Duration = Duration::from_millis(1500);
 const GAP: Duration = Duration::from_millis(250);
 /// The longest a 429 is waited out in place. A longer one fails the call.
 const PATIENCE: u64 = 30;
+/// A 429 that says no `Retry-After` is taken to mean this many seconds.
+const LIMITED_FOR: u64 = 30;
 /// A token this close to its end is replaced before it is used.
 const EARLY: Duration = Duration::from_secs(300);
 /// Typing is told at most this often per conversation, and shown this long when heard.
@@ -255,6 +264,8 @@ struct State {
     listed: Option<Instant>,
     /// Push has just reconnected, or said it lost something.
     resync: bool,
+    /// Out-of-office notes from presence, and until when: what a card says under "away".
+    away: HashMap<String, (String, Option<i64>)>,
 }
 
 /// What a call presents.
@@ -290,6 +301,8 @@ struct Teams {
     /// Where Microsoft's sign-in service is, and Teams' own front door.
     login: String,
     api: String,
+    /// Microsoft Graph, for OneDrive.
+    graph: String,
     /// A test moved the front door: the addresses it hands out are its own.
     moved: Option<String>,
     state: Mutex<State>,
@@ -378,6 +391,7 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
         agent,
         login: address("TINYCHAT_TEAMS_LOGIN", LOGIN).trim_end_matches('/').to_owned(),
         moved: (api != TEAMS).then(|| api.clone()),
+        graph: address("TINYCHAT_TEAMS_GRAPH", GRAPH).trim_end_matches('/').to_owned(),
         api,
         session,
         state: Mutex::new(state),
@@ -525,6 +539,7 @@ impl Teams {
     /// True for an address Teams' own services are at.
     fn ours(&self, url: &str) -> bool {
         self.moved.as_ref().is_some_and(|base| url.starts_with(base.as_str()))
+            || (self.graph != GRAPH && url.starts_with(self.graph.as_str()))
             || https_host(url).is_some_and(|host| OURS.iter().any(|domain| within(host, domain)))
     }
 
@@ -730,7 +745,7 @@ impl Teams {
         if !self.ours(url) {
             return Err(Fault::Net(format!("{} is not a Teams address", bare(url))));
         }
-        let (mut renewed, mut wait) = (false, 0);
+        let (mut renewed, mut limited, mut wait) = (false, false, 0);
         for _ in 0..3 {
             let headers = self.headers(auth)?;
             self.pace();
@@ -751,11 +766,13 @@ impl Teams {
                     renewed = true;
                     self.forget(auth);
                 }
+                // Waited out once at most: a second 429 fails the call.
                 429 => {
-                    wait = retry.unwrap_or(5);
-                    if !patient || wait > PATIENCE {
+                    wait = retry.unwrap_or(LIMITED_FOR);
+                    if limited || !patient || wait > PATIENCE {
                         break;
                     }
+                    limited = true;
                     sleep(Duration::from_secs(wait));
                 }
                 _ => {
@@ -793,6 +810,10 @@ impl Teams {
         self.ctx.describe(&self.session.name, &self.me())?;
         let mut push = self.open()?;
         self.ctx.link(Link::Connected);
+        // Files are off until they can be shared with the chat's members only. The OneDrive path
+        // below made an organization-wide link, which is not what the Teams app does and shows
+        // up in a company's audit logs.
+        self.ctx.capabilities(protocol::Capabilities { max_file_bytes: 0, max_files: 0, ..protocol::Capabilities::default() });
         {
             let mut state = self.state();
             state.watched.clear();
@@ -811,13 +832,13 @@ impl Teams {
 
     // Commands.
 
-    fn serve(&self, command: Command) {
+    fn serve(self: &Arc<Self>, command: Command) {
         let refuse = |fault: Fault| Refusal::Refused(reason(fault));
         match command {
             Command::History { conversation_id, before } => self.report(self.older(&conversation_id, &before).map_err(Failure::from)),
             Command::HistoryAfter { conversation_id, after } => self.report(self.after(&conversation_id, &after).map_err(Failure::from)),
             Command::HistoryAround { conversation_id, around } => self.report(self.around(&conversation_id, &around).map_err(Failure::from)),
-            Command::OpenSpace(_) => self.report(self.open_space().map_err(Failure::from)),
+            Command::OpenSpace(_) | Command::OpenHome => self.report(self.open_space().map_err(Failure::from)),
             Command::MarkRead { conversation_id, message_id } => self.report(self.mark_read(&conversation_id, &message_id).map_err(Failure::from)),
             Command::Send { conversation_id, client_id, text, reply_to } => {
                 self.post(&conversation_id, &client_id, &text, reply_to.as_deref())
@@ -846,6 +867,19 @@ impl Teams {
             Command::Profile { person_id, reply } => {
                 let _ = reply.send(self.profile(&person_id).map_err(refuse));
             }
+            Command::ConversationInfo { conversation_id, reply } => {
+                let _ = reply.send(self.conversation_info(&conversation_id).map_err(refuse));
+            }
+            Command::SetMute { conversation_id, notify, reply } => {
+                let _ = reply.send(self.set_mute(&conversation_id, notify).map_err(refuse));
+            }
+            Command::SendWith { conversation_id, client_id, text, reply_to, with } => {
+                self.send_with(&conversation_id, &client_id, &text, reply_to.as_deref(), *with);
+            }
+            Command::CancelSend { client_id, .. } => self.cancel_send(&client_id),
+            // Each row's line comes with the chat list (`lastMessage`); a row still without one
+            // has no message, or one the list did not show.
+            Command::Previews(_) => {}
             Command::SetPresence { presence, status, reply } => {
                 let _ = reply.send(self.set_presence(presence, status.as_deref()).map_err(refuse));
             }

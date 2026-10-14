@@ -34,8 +34,8 @@ packaging:
 | `NSUserNotification` | Historically yes | Deprecated since macOS 11. Do not build on it. |
 | `CFUserNotification` | Yes | A modal alert, not a banner. Wrong tool. |
 
-So tinychat ships as `tinychat.app` (bundle id, `Info.plist`, signed). chatd lives at
-`tinychat.app/Contents/MacOS/chatd` so its main bundle resolves to the app, and it posts with
+So tinyclient ships as `tinyclient.app` (bundle id, `Info.plist`, signed). chatd lives at
+`tinyclient.app/Contents/MacOS/chatd` so its main bundle resolves to the app, and it posts with
 `UNUserNotificationCenter` directly. The 65 MB shell does not have to be running.
 **Spike before committing (unverified):** (a) a second executable in `Contents/MacOS` gets the
 app's notification permission; (b) it still does when started by launchd at login (Apple DTS says
@@ -75,29 +75,29 @@ Typing is not stored and must not bump `version` in a way that makes the shell r
 | C3 | P0 | `@everyone`, `@here`, `@channel` and role mentions count as mentions only where my settings on that network say so (Discord `suppress_everyone` / `suppress_roles`; Slack per-channel prefs). | Fixture with `suppress_everyone: true`: no number. |
 | C4 | P0 | The rail number per network is the sum of row numbers. Dots do not add up to a number. | Arithmetic over `list`. |
 | C5 | P1 | Changing mute in the official app takes effect here without a restart. | Inject `USER_GUILD_SETTINGS_UPDATE` / `pref_change`. |
-| C6 | P1 | I can mute and unmute from tinychat and the official app agrees. | Round trip against the network. |
+| C6 | P1 | I can mute and unmute from tinyclient and the official app agrees. | Round trip against the network. |
 | C7 | P1 | A mention in a muted channel shows a quiet number and no notification (what Slack and Discord both do). | Row has a number; nothing posted. |
 
 ### Notifications, badge, sounds
 | # | P | Story | Check |
 | --- | --- | --- | --- |
-| N1 | P0 | I get a macOS notification for exactly the things that get a number in C1, with the shell closed. Title: sender. Subtitle: "#channel · Server" or nothing for a DM. Body: the message as plain text. | Quit the shell, receive a DM: banner appears from "tinychat" with those fields. |
+| N1 | P0 | I get a macOS notification for exactly the things that get a number in C1, with the shell closed. Title: sender. Subtitle: "#channel · Server" or nothing for a DM. Body: the message as plain text. | Quit the shell, receive a DM: banner appears from "tinyclient" with those fields. |
 | N2 | P0 | No notification when the conversation is open in the key window, for my own messages, for muted things, or for history loaded at connect or reconnect. | Each case posts nothing. After a reconnect with 20 missed messages, at most one summary per conversation. |
-| N3 | P0 | Clicking a notification opens tinychat on that conversation, starting the shell if needed. | Click with the shell closed: window opens on the right conversation at the bottom. |
+| N3 | P0 | Clicking a notification opens tinyclient on that conversation, starting the shell if needed. | Click with the shell closed: window opens on the right conversation at the bottom. |
 | N4 | P0 | The Dock badge is the total of all numbers (C4). Nothing when zero. It is right with the shell closed. | Set through `UNUserNotificationCenter.setBadgeCount` from chatd (unverified with the app not running; otherwise the badge is only right while the shell is up). |
 | N5 | P0 | Focus and Do Not Disturb are honored because the system delivers the notification, and the network's own DND (Slack snooze, Discord status "Do Not Disturb") silences that network. | Slack `dnd` active: number rises, no banner. |
 | N6 | P1 | Notifications stack per conversation, and a burst from one person collapses into one that updates. | `threadIdentifier` = network + conversation id; five quick messages leave one banner. |
 | N7 | P1 | I can reply from the notification. | Reply text goes out through chatd without opening the window; a failure posts "Not sent" that opens the draft. |
 | N8 | P1 | One short sound for a notification, none while a call is up, and a "hide message text" setting for screen sharing. Global pause for 1 h / until tomorrow in the rail. | Settings change what is posted. |
-| N9 | P2 | Per-conversation override inside tinychat (all / mentions / nothing) that is written back to the network. | Same as C6. |
-| — | cut | Custom sounds per network, keyword alerts managed in tinychat (we honor Slack's keyword list if the server already counts it as a mention), time-sensitive breakthrough, avatar images in notifications in v1. | |
+| N9 | P2 | Per-conversation override inside tinyclient (all / mentions / nothing) that is written back to the network. | Same as C6. |
+| — | cut | Custom sounds per network, keyword alerts managed in tinyclient (we honor Slack's keyword list if the server already counts it as a mention), time-sensitive breakthrough, avatar images in notifications in v1. | |
 
 ### Send state
 | # | P | Story | Check |
 | --- | --- | --- | --- |
 | S1 | P0 | My message appears in the conversation the instant I press Return, slightly dimmed, and the composer is empty. It turns solid when the network accepts it. No duplicate when the echo arrives. | `Send` answers at once with a pending message carrying a client id; the adapter sends that id as nonce and the echo replaces the pending row. |
 | S2 | P0 | If it fails, the row stays with "Not sent · Retry · Delete" and the reason in words ("Slow mode: 8 s", "You can't post here"). Nothing is lost on restart. | Force 403 / 429 / timeout; pending rows are in SQLite. |
-| S3 | P0 | Offline: I can still press Return. The row says "Waiting for Slack…" and goes out if the network returns within 60 s; after that it becomes "Not sent" and waits for me. tinychat never sends an old message on its own hours later. | Drop the link, send, restore at 30 s and at 90 s. |
+| S3 | P0 | Offline: I can still press Return. The row says "Waiting for Slack…" and goes out if the network returns within 60 s; after that it becomes "Not sent" and waits for me. tinyclient never sends an old message on its own hours later. | Drop the link, send, restore at 30 s and at 90 s. |
 | S4 | P1 | Rate limits are retried once after the delay the network gives, silently. | 429 with `retry_after`. |
 
 ### Connection state
@@ -126,7 +126,7 @@ Typing is not stored and must not bump `version` in a way that makes the shell r
 | Signed out | Close 4004, HTTP 401 | `invalid_auth`, `token_revoked`, `account_inactive` | `authorizationStateLoggedOut` | HTTP 401 on token refresh |
 
 Discord risk note: subscribing to guilds, sending typing, and an identify whose `browser` is
-`"tinychat"` are each visible to Discord. Sending the real client's `capabilities` is what makes
+`"tinyclient"` are each visible to Discord. Sending the real client's `capabilities` is what makes
 `read_state` and `user_guild_settings` arrive in the shape the docs describe.
 
 ## Order of work
@@ -141,6 +141,6 @@ Discord risk note: subscribing to guilds, sending typing, and an identify whose 
 
 1. **Send typing on Discord by default?** It is the one network where a third-party client risks the account, and each typing POST is another request from a non-official client. Recommendation: receive always, send off by default on Discord, on elsewhere.
 2. **Dock badge: only "needs me" (DMs + mentions), as recommended, or also a dot for any unread channel like Slack?** The system badge API takes numbers only, so the dot works only while the shell is running.
-3. **Packaging: is a signed `tinychat.app` with chatd inside acceptable now?** Real notifications are impossible without it. "For anyone who wants it" also implies a Developer ID and notarization (paid account).
+3. **Packaging: is a signed `tinyclient.app` with chatd inside acceptable now?** Real notifications are impossible without it. "For anyone who wants it" also implies a Developer ID and notarization (paid account).
 4. **Offline sends: the 60 s window in S3, or strict "nothing queues, ever"?**
 5. **Should chatd start at login** (launchd agent) so notifications arrive before the window is ever opened? It is the difference between replacing the official apps and sitting beside them.

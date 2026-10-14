@@ -3,8 +3,8 @@
 
 use super::{escaped, Auth, Body, Fault, Teams, PRESENCE, REMEMBERED, SPACES};
 use crate::adapters::{About, Members};
-use crate::store::PersonRow;
-use protocol::{MediaFile, MediaKind, MemberSection, Person, Presence, Relation};
+use crate::store::{PersonDetails, PersonRow};
+use protocol::{Activity, ActivityKind, Contact, ContactKind, Mark, MediaFile, MediaKind, MemberSection, Person, Presence, Relation};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
@@ -18,7 +18,7 @@ const AVATAR: u32 = 64;
 const WATCHED: usize = 200;
 const AGAIN: Duration = Duration::from_secs(60);
 
-/// What tinychat keeps of a person. Stored as a note, so a restart asks Teams nothing.
+/// What tinyclient keeps of a person. Stored as a note, so a restart asks Teams nothing.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(super) struct Known {
     #[serde(rename = "n")]
@@ -32,15 +32,22 @@ pub(super) struct Known {
     pub department: String,
     #[serde(rename = "b", default)]
     pub bot: bool,
+    /// A guest in this tenant.
+    #[serde(rename = "g", default)]
+    pub guest: bool,
 }
 
-/// Teams' availability as the one presence model. Busy is drawn as do-not-disturb: it is the
-/// nearest of the four, and "in a meeting" is said in the status line.
+/// Most people whose out-of-office note is held, from the presence answers.
+const AWAY_KEPT: usize = 500;
+
+/// Teams' availability as the one presence model: Busy (in a meeting, in a call) is its own
+/// state, not do-not-disturb.
 fn presence_of(availability: &str) -> Presence {
     match availability {
         "Available" => Presence::Online,
         "AvailableIdle" | "Away" | "BeRightBack" => Presence::Idle,
-        "Busy" | "BusyIdle" | "DoNotDisturb" => Presence::Dnd,
+        "Busy" | "BusyIdle" => Presence::Busy,
+        "DoNotDisturb" | "Focusing" | "Presenting" => Presence::Dnd,
         "Offline" => Presence::Offline,
         _ => Presence::Unknown,
     }
@@ -57,6 +64,16 @@ fn activity(activity: &str) -> &'static str {
         "Focusing" => "Focusing",
         _ => "",
     }
+}
+
+/// What someone is doing, as the shared activity kinds.
+fn doing(activity: &str) -> Option<ActivityKind> {
+    Some(match activity {
+        "InAMeeting" | "InAConferenceCall" => ActivityKind::InMeeting,
+        "InACall" => ActivityKind::InCall,
+        "Presenting" => ActivityKind::Presenting,
+        _ => return None,
+    })
 }
 
 impl Teams {
@@ -136,11 +153,22 @@ impl Teams {
                 title: text("jobTitle"),
                 department: text("department"),
                 bot: id.starts_with("28:") || user["type"].as_str().is_some_and(|kind| kind.eq_ignore_ascii_case("bot")),
+                guest: user["userType"].as_str().is_some_and(|kind| kind.eq_ignore_ascii_case("guest")),
             };
             learned.push((id.to_owned(), known));
         }
         let rows: Vec<PersonRow> = learned.iter().map(|(id, known)| self.row(id, known)).collect();
         if let Err(err) = self.ctx.people(&rows) {
+            eprintln!("chatd: Teams: {err}");
+        }
+        let details: Vec<(String, PersonDetails)> = learned
+            .iter()
+            .map(|(id, known)| {
+                let mark = known.guest.then_some(Mark::Guest);
+                (id.clone(), PersonDetails { title: known.title.clone(), mark, ..PersonDetails::default() })
+            })
+            .collect();
+        if let Err(err) = self.ctx.details(&details) {
             eprintln!("chatd: Teams: {err}");
         }
         let mut state = self.state();
@@ -180,7 +208,9 @@ impl Teams {
     /// Looks up everyone in `ids` not yet known, together. Someone Teams will not name is left
     /// unknown: a message shows the name it came with.
     pub(super) fn lookup(&self, ids: &[String]) {
-        let mut unknown: Vec<&String> = ids.iter().filter(|id| id.starts_with("8:") && self.cached(id).is_none()).collect();
+        // People (`8:`) and apps and bots (`28:`), whose names the same call gives with
+        // `includeBots`.
+        let mut unknown: Vec<&String> = ids.iter().filter(|id| (id.starts_with("8:") || id.starts_with("28:")) && self.cached(id).is_none()).collect();
         unknown.sort();
         unknown.dedup();
         for batch in unknown.chunks(BATCH) {
@@ -293,10 +323,13 @@ impl Teams {
         let learned = self.learn(Teams::listed(&found));
         let known = learned.into_iter().find(|(id, _)| id == person).map(|(_, known)| known).or_else(|| self.cached(person));
         let known = known.unwrap_or_default();
-        let role = [known.title.as_str(), known.department.as_str()].into_iter().filter(|part| !part.is_empty()).collect::<Vec<_>>().join(" · ");
-        let lines = [role.as_str(), known.mail.as_str()].into_iter().filter(|line| !line.is_empty()).collect::<Vec<_>>().join("\n");
+        let (away, away_until) = self.state().away.get(person).cloned().unwrap_or_default();
         Ok(About {
-            bio: lines,
+            title: known.title,
+            department: known.department,
+            contacts: Some(known.mail).filter(|mail| !mail.is_empty()).map(|value| Contact { kind: ContactKind::Email, value, masked: false }).into_iter().collect(),
+            away,
+            away_until,
             ..About::default()
         })
     }
@@ -313,9 +346,30 @@ impl Teams {
             let presence = &entry["presence"];
             let note = presence["note"]["message"].as_str().unwrap_or("");
             let said = super::html::parse(note, &Nobody, "").text;
-            let status = if said.is_empty() { activity(presence["activity"].as_str().unwrap_or("")).to_owned() } else { said };
+            let doing_now = presence["activity"].as_str().unwrap_or("");
+            // The status line: what they are doing, else out of office, else their note.
+            // Unverified: the out-of-office fields' names, read off the web client's answer.
+            let oof = presence["outOfOfficeNote"]["message"].as_str().map(|note| super::html::parse(note, &Nobody, "").text).filter(|note| !note.is_empty());
+            let away = presence["calendarData"]["isOutOfOffice"] == true || oof.is_some() || doing_now == "OutOfOffice";
+            let status = match (activity(doing_now), away) {
+                (words, _) if !words.is_empty() && words != "Out of office" => words.to_owned(),
+                (_, true) => "Out of office".to_owned(),
+                _ => said,
+            };
             let owned = id == self.me() || self.state().partners.contains_key(id);
             self.ctx.presence(id, presence_of(presence["availability"].as_str().unwrap_or("")), &status, owned);
+            let kind = doing(doing_now);
+            self.ctx.activity(id, "", kind.map(|kind| Activity { kind, name: String::new(), place: String::new(), conversation: None }), owned);
+            let mut state = self.state();
+            if away {
+                if state.away.len() >= AWAY_KEPT {
+                    state.away.clear();
+                }
+                let until = presence["outOfOfficeNote"]["expiry"].as_str().map(super::seconds).filter(|until| *until > 0);
+                state.away.insert(id.to_owned(), (oof.unwrap_or_else(|| "Out of office".to_owned()), until));
+            } else {
+                state.away.remove(id);
+            }
         }
     }
 
@@ -374,7 +428,7 @@ impl Teams {
 }
 
 /// A presence note is read for its words alone: it names nobody and carries no pictures.
-struct Nobody;
+pub(super) struct Nobody;
 
 impl super::html::Lookup for Nobody {
     fn mention(&self, _: &str) -> Option<(protocol::MentionKind, String)> {
@@ -395,10 +449,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn availability_is_one_of_four_dots() {
+    fn availability_is_one_of_five_states() {
         assert_eq!(presence_of("Available"), Presence::Online);
         assert_eq!((presence_of("Away"), presence_of("BeRightBack"), presence_of("AvailableIdle")), (Presence::Idle, Presence::Idle, Presence::Idle));
-        assert_eq!((presence_of("Busy"), presence_of("DoNotDisturb")), (Presence::Dnd, Presence::Dnd));
+        assert_eq!((presence_of("Busy"), presence_of("DoNotDisturb")), (Presence::Busy, Presence::Dnd));
+        assert_eq!((doing("InAMeeting"), doing("Presenting"), doing("Available")), (Some(ActivityKind::InMeeting), Some(ActivityKind::Presenting), None));
         assert_eq!((presence_of("Offline"), presence_of("PresenceUnknown")), (Presence::Offline, Presence::Unknown));
         assert_eq!((activity("InACall"), activity("Available")), ("In a call", ""));
     }

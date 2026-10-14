@@ -12,7 +12,7 @@
 
 use base64::Engine;
 use protocol::{
-    read_frame, write_frame, Badge, CallSupport, Change, Conversation, ConversationKind, Group, GroupKind,
+    read_frame, write_frame, Badge, CallSupport, Change, Conversation, ConversationKind, Group,
     Key, Link, MediaKind, MentionKind, Message, MessageKind, Network, Page, Presence, Relation,
     Request, Response, SendState, Style, Watching,
 };
@@ -292,8 +292,16 @@ impl Fake {
                 self.chat(call, &path["/chat".len()..])
             }
             _ if path.starts_with("/api/mt/emea/") && bearer("spaces") && header("x-skypetoken") == skype => self.middle(call),
+            // Someone whose presence Teams will not give out just now: a 429, a second after.
+            "/presence/v1/presence/getpresence/" if bearer("presence") && call.body.contains("limit-me") => {
+                let mut limited = answer("429 Too Many Requests", json!({"errorCode": 429, "message": "API calls quota exceeded!"}));
+                limited.headers.push(("Retry-After", "1".to_owned()));
+                limited
+            }
             "/presence/v1/presence/getpresence/" if bearer("presence") => ok(self.fixture("presence").unwrap()),
             "/presence/v1/me/forceavailability/" if bearer("presence") => ok(json!({})),
+            _ if path.starts_with("/graph/") && bearer("graph") => self.graph(call, &path["/graph".len()..]),
+            _ if path.starts_with("/upload/") => self.upload(call),
             _ if path.starts_with("/ams/") || path.contains("/profilepicturev2") => Reply {
                 status: "200 OK",
                 headers: Vec::new(),
@@ -314,6 +322,7 @@ impl Fake {
             scope if scope.starts_with("https://api.spaces.skype.com/.default ") => "spaces",
             scope if scope.starts_with("https://chatsvcagg.teams.microsoft.com/.default ") => "csa",
             scope if scope.starts_with("https://presence.teams.microsoft.com/.default ") => "presence",
+            scope if scope.starts_with("https://graph.microsoft.com/.default ") => "graph",
             _ => return answer("400 Bad Request", json!({"error": "invalid_scope", "error_description": "AADSTS70011: The provided value for the input parameter 'scope' is not valid."})),
         };
         let shaped = asked.get("grant_type").map(String::as_str) == Some("refresh_token")
@@ -342,6 +351,18 @@ impl Fake {
             created.headers.push(("Location", format!("{}/chat/v1/threads/{CHAT_DEE}", self.base)));
             return created;
         }
+        if let Some(thread) = path.strip_prefix("/v1/threads/").and_then(|rest| rest.strip_suffix("/consumptionhorizons")) {
+            // Everyone else in the launch chat has read past my last message there.
+            let horizons = match thread {
+                "19:grp2@thread.v2" => json!([
+                    {"id": ME, "consumptionhorizon": "1759000000000;1759000001000;1"},
+                    {"id": BEN, "consumptionhorizon": "1759000000000;1759000002000;1"},
+                    {"id": "8:orgid:00000000-0000-4000-8000-0000000000c3", "consumptionhorizon": "1759000000500;1759000003000;1"},
+                ]),
+                _ => json!([]),
+            };
+            return ok(json!({"id": thread, "consumptionhorizons": horizons}));
+        }
         if let Some(thread) = path.strip_prefix("/v1/threads/") {
             let described = match thread {
                 CHAT_DEE => self.fixture("thread.dee"),
@@ -363,6 +384,7 @@ impl Fake {
                     DEPLOYS => "messages.deploys",
                     CHAT_ANA => "messages.ana",
                     chain if chain == format!("{GENERAL};messageid={ROOT}") => "messages.chain",
+                    "48:notifications" => "messages.activity",
                     _ => return ok(json!({"messages": [], "_metadata": {}})),
                 };
                 ok(self.fixture(name).unwrap())
@@ -400,6 +422,31 @@ impl Fake {
             }
         });
         answer("201 Created", json!({"OriginalArrivalTime": arrived}))
+    }
+
+    /// Microsoft Graph's OneDrive: an upload session for a file, and a link to share it.
+    fn graph(&self, call: &Call, path: &str) -> Reply {
+        if call.method == "POST" && path.starts_with("/v1.0/me/drive/root:/Microsoft Teams Chat Files/") && path.ends_with(":/createUploadSession") {
+            return ok(json!({"uploadUrl": format!("{}/upload/session-1?sig=x", self.base), "expirationDateTime": "2026-10-15T00:00:00Z"}));
+        }
+        if call.method == "POST" && path.starts_with("/v1.0/me/drive/items/") && path.ends_with("/createLink") {
+            return ok(json!({"link": {"type": "view", "scope": "organization", "webUrl": "https://contoso-my.sharepoint.com/:t:/g/personal/me/share-1"}}));
+        }
+        answer("404 Not Found", json!({"error": {"code": "itemNotFound"}}))
+    }
+
+    /// An upload session: each range is taken, and the last answers with the item made.
+    fn upload(&self, call: &Call) -> Reply {
+        let range = call.headers.get("content-range").cloned().unwrap_or_default();
+        let (span, total) = range.trim_start_matches("bytes ").split_once('/').unwrap_or(("", "0"));
+        let end: u64 = span.split_once('-').and_then(|(_, end)| end.parse().ok()).unwrap_or(0);
+        if end + 1 < total.parse::<u64>().unwrap_or(0) {
+            return answer("202 Accepted", json!({"nextExpectedRanges": [format!("{}-", end + 1)]}));
+        }
+        answer("201 Created", json!({
+            "id": "01ITEM", "name": "notes.txt", "size": total.parse::<u64>().unwrap_or(0),
+            "webUrl": "https://contoso-my.sharepoint.com/personal/me_contoso_com/Documents/Microsoft Teams Chat Files/notes.txt",
+        }))
     }
 
     /// The middle tier: people by id, people by name, and their pictures.
@@ -512,7 +559,7 @@ impl World {
         static NEXT: AtomicU32 = AtomicU32::new(0);
         let fake = Fake::start();
         // Short path: a unix socket address holds about 100 bytes.
-        let dir = PathBuf::from(format!("/tmp/tinychat-teams-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        let dir = PathBuf::from(format!("/tmp/tinyclient-teams-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
         std::fs::create_dir_all(&dir).unwrap();
         // What the sign-in helper prints for someone who is also a guest in a second tenant.
         let session = json!({
@@ -530,6 +577,7 @@ impl World {
             .env("TINYCHAT_TEAMS_LOGIN", &fake.base)
             .env("TINYCHAT_TEAMS_API", &fake.base)
             .env("TINYCHAT_TEAMS_TROUTER", &fake.base)
+            .env("TINYCHAT_TEAMS_GRAPH", format!("{}/graph", fake.base))
             .env("TINYCHAT_MEDIA_HOSTS", "127.0.0.1")
             .env_remove("TINYCHAT_SESSION_DISCORD")
             .env_remove("TINYCHAT_SESSION_SLACK")
@@ -604,7 +652,12 @@ impl World {
 
     /// Connected, with the teams, channels, chats and their unread state listed.
     fn ready(&self) {
-        self.until("the home tenant to connect", || Some(self.account(HOME)).filter(|account| account.link == Link::Connected));
+        // The accounts are listed once chatd has read the sessions, a moment after it answers.
+        let listed = || match self.ask(Request::Status) {
+            Response::Status { accounts, .. } => accounts.into_iter().find(|account| account.key.account == HOME),
+            _ => None,
+        };
+        self.until("the home tenant to connect", || listed().filter(|account| account.link == Link::Connected));
         self.until("the chat list and Teams' unread state", || self.conversation(&key(CHAT_ANA)).filter(|row| row.unread == 1));
     }
 
@@ -653,21 +706,26 @@ fn one_sign_in_is_a_tenant_each_with_teams_channels_chats_and_their_unread_state
     assert_eq!(guest.detail, "Microsoft ended this sign-in (AADSTS700082). Sign in again.");
     assert_eq!(world.account(HOME).link, Link::Connected);
 
-    // Spaces: the chat list first, then each team. A deleted team is not one.
+    // Spaces are the teams alone: chats belong to none. A deleted team is not one.
     let Response::Spaces { spaces } = world.ask(Request::Spaces { network: Some(Network::Teams) }) else {
         panic!("no spaces");
     };
     let named: Vec<(&str, &str)> = spaces.iter().map(|space| (space.key.id.as_str(), space.name.as_str())).collect();
-    assert_eq!(named, [("chats", "Chats"), (GENERAL, "Platform"), ("19:design0general@thread.tacv2", "Design")]);
+    assert_eq!(named, [(GENERAL, "Platform"), ("19:design0general@thread.tacv2", "Design")]);
 
     // A team's tree is its channels: General first, the rest as Teams lists them, without the
-    // one the user hid and the one that was deleted.
+    // deleted one. The one the user hid is there but opted out, for "Show hidden".
     let (groups, rows) = world.tree(GENERAL).unwrap();
     assert!(groups.is_empty());
-    let shown: Vec<(&str, ConversationKind, bool)> = rows.iter().map(|row| (row.title.as_str(), row.kind, row.private)).collect();
+    let shown: Vec<(&str, ConversationKind, bool, bool)> = rows.iter().map(|row| (row.title.as_str(), row.kind, row.private, row.opted_out)).collect();
     assert_eq!(
         shown,
-        [("General", ConversationKind::Channel, false), ("Deploys", ConversationKind::Channel, false), ("Leads", ConversationKind::Channel, true)]
+        [
+            ("General", ConversationKind::Channel, false, false),
+            ("Deploys", ConversationKind::Channel, false, false),
+            ("Hidden one", ConversationKind::Channel, false, true),
+            ("Leads", ConversationKind::Channel, true, false),
+        ]
     );
     assert!(rows.iter().all(|row| row.call == CallSupport::Handoff && row.space.as_deref() == Some(GENERAL)));
     let row = |id: &str| rows.iter().find(|row| row.key.id == id).unwrap();
@@ -676,10 +734,13 @@ fn one_sign_in_is_a_tenant_each_with_teams_channels_chats_and_their_unread_state
     assert_eq!((row(DEPLOYS).unread, row(DEPLOYS).badge()), (0, Badge::None));
     assert!(row("19:platform0leads@thread.tacv2").muted && !row(GENERAL).muted);
 
-    // The chat list is a Space of its own with one group of direct conversations, newest
-    // first. A hidden chat and the notes-to-self stream are not in it.
-    let (groups, rows) = world.tree("chats").unwrap();
-    assert_eq!(groups.iter().map(|group| (group.name.as_str(), group.kind)).collect::<Vec<_>>(), [("Chats", GroupKind::Directs)]);
+    // The chats are the Teams home: no Space, newest first, each with its line from the chat
+    // list. The hidden chat is not listed; my Notes are, as Saved.
+    let home = || match world.ask(Request::Home { network: Network::Teams, account: Some(key("").account()), folder: None, shelf: Default::default(), offset: 0, limit: 50 }) {
+        Response::Conversations { conversations, .. } => conversations,
+        other => panic!("{other:?}"),
+    };
+    let rows = home();
     let shown: Vec<(&str, ConversationKind, &str)> = rows.iter().map(|row| (row.title.as_str(), row.kind, row.key.id.as_str())).collect();
     assert_eq!(
         shown,
@@ -687,12 +748,24 @@ fn one_sign_in_is_a_tenant_each_with_teams_channels_chats_and_their_unread_state
             ("Ana Ruiz", ConversationKind::Direct, CHAT_ANA),
             ("Ben Okafor, Cy Tran", ConversationKind::Group, "19:grp1@thread.v2"),
             ("Launch crew", ConversationKind::Group, "19:grp2@thread.v2"),
+            ("Workflows", ConversationKind::Direct, "19:00000000-0000-4000-8000-0000000000aa_workflows@unq.gbl.spaces"),
+            ("Weekly sync", ConversationKind::Group, "19:meeting_NzQ2YjE@thread.v2"),
+            ("Notes", ConversationKind::Direct, "48:notes"),
         ]
     );
+    assert!(rows.iter().all(|row| row.space.is_none()), "a chat is in no Space");
     assert_eq!((rows[0].peer.as_deref(), rows[0].unread, rows[0].badge()), (Some(ANA), 1, Badge::Count(1)));
     assert_eq!(rows[0].avatar.as_ref().map(|avatar| (avatar.kind, avatar.width)), Some((MediaKind::Avatar, 64)));
+    assert_eq!((rows[0].preview.as_str(), rows[0].preview_from.as_str(), rows[0].preview_mine), ("Can you look at the deploy?", "Ana Ruiz", false));
     assert!(rows[2].muted && rows[2].unread == 0, "muted by me, and what I said last is not unread");
-    assert_eq!(world.account(HOME).attention, 1);
+    assert!(rows[2].preview_mine && rows[2].preview == "Launch moved to Thursday");
+    // An app's chat is titled with the app's name, never with mine (its last message is mine),
+    // is a bot row with no presence and no call.
+    assert!(rows[3].bot && rows[3].peer.is_none() && rows[3].call == CallSupport::None);
+    assert!(rows[4].meeting && !rows[3].meeting);
+    assert_eq!((rows[5].special, rows[5].call), (protocol::Special::Saved, CallSupport::None));
+    let hidden = world.conversation(&key("19:gone@thread.v2")).expect("a hidden chat is kept");
+    assert!(hidden.hidden);
 
     // The list I own on Teams is the people I have a chat with.
     let asked = Request::People { network: Some(Network::Teams), relation: Some(Relation::Contact), query: None, offset: 0, limit: 50 };
@@ -826,7 +899,8 @@ fn a_channel_page_is_the_one_message_model_and_reply_chains_are_threads() {
     assert_eq!(summary.participants, [key(ME), key(ANA)]);
     let thread = world.conversation(&chain()).expect("the chain is a conversation");
     assert_eq!((thread.kind, thread.parent.as_deref(), thread.root.as_deref()), (ConversationKind::Thread, Some(GENERAL), Some(ROOT)));
-    assert_eq!(thread.title, "Replies in General");
+    // Titled by its post, never "Replies in General".
+    assert_eq!(thread.title, "Dashboard after the fix");
     // Opening it reads the chain whole, post first, and the post's count is then exact.
     let replies = world.until("the whole chain", || Some(world.messages(&chain())).filter(|replies| replies.len() == 4));
     assert_eq!(replies.iter().map(|reply| reply.text.as_str()).collect::<Vec<_>>(), ["Dashboard after the fix", "nice, which panel?", "on it", "the latency one"]);
@@ -921,11 +995,12 @@ fn push_delivers_messages_edits_reactions_deletes_typing_and_reads() {
     assert_eq!(post.thread.unwrap().last, 1_760_000_700);
     assert!(world.message(&general, "1760000700700").is_none());
     assert_eq!(world.messages(&chain()).last().map(|reply| reply.text.clone()).as_deref(), Some("fixed in 513"));
-    // A post in a channel the user hid arrives and is dropped: it has no row to land in.
+    // A post in a channel the user hid lands in its row, which stays behind "Show hidden".
     world.fake.push("NewMessage", message("19:platform0hidden@thread.tacv2", Some("1760000710710"), 1_760_000_710_710, ANA, "Ana Ruiz", "<p>psst</p>"), false);
     world.fake.push("NewMessage", message(DEPLOYS, Some("1760000720720"), 1_760_000_720_720, BEN, "Ben Okafor", "<p>v513 is out</p>"), false);
     world.until("the next channel post", || world.conversation(&key(DEPLOYS)).filter(|row| row.unread == 1 && row.preview == "v513 is out"));
-    assert!(world.conversation(&key("19:platform0hidden@thread.tacv2")).is_none());
+    let hidden = world.until("the hidden channel's post", || world.conversation(&key("19:platform0hidden@thread.tacv2")).filter(|row| row.preview == "psst"));
+    assert!(hidden.opted_out);
 
     // Every event was answered, as trouter requires, under its own id.
     let answered = world.until("every event to be answered", || {
@@ -1054,7 +1129,7 @@ fn people_are_searched_watched_and_called_through_the_official_app() {
         panic!("no chat");
     };
     assert_eq!((conversation.key.id.as_str(), conversation.kind, conversation.title.as_str()), (CHAT_DEE, ConversationKind::Direct, "Dee Park"));
-    assert_eq!((conversation.peer.as_deref(), conversation.space.as_deref()), (Some(DEE), Some("chats")));
+    assert_eq!((conversation.peer.as_deref(), conversation.space.as_deref()), (Some(DEE), None));
     let created = world.fake.calls("POST", "/chat/v1/threads").pop().unwrap().json();
     assert_eq!(created["members"], json!([{"id": ME, "role": "Admin"}, {"id": DEE, "role": "Admin"}]));
     assert_eq!(created["properties"], json!({"threadType": "chat", "fixedRoster": true, "uniquerosterthread": true}));
@@ -1066,7 +1141,10 @@ fn people_are_searched_watched_and_called_through_the_official_app() {
     let Response::Profile { profile } = world.ask(Request::Profile { person: key(ANA), space: None }) else {
         panic!("no profile");
     };
-    assert_eq!((profile.person.name.as_str(), profile.bio.as_str()), ("Ana Ruiz", "Staff Engineer · Platform\nana@contoso.com"));
+    // Title, department and email each in their place; nothing left as a bio.
+    assert_eq!((profile.person.name.as_str(), profile.bio.as_str()), ("Ana Ruiz", ""));
+    assert_eq!((profile.title.as_str(), profile.department.as_str()), ("Staff Engineer", "Platform"));
+    assert_eq!(profile.contacts.iter().map(|contact| contact.value.as_str()).collect::<Vec<_>>(), ["ana@contoso.com"]);
 
     // Presence is asked for exactly who is on screen, together.
     let Response::Status { seq, .. } = world.ask(Request::Status) else {
@@ -1077,7 +1155,9 @@ fn people_are_searched_watched_and_called_through_the_official_app() {
         Response::Watching { people, .. } => people.into_iter().find(|person| person.presence != Presence::Unknown),
         _ => None,
     });
-    assert_eq!((seen.key.id.as_str(), seen.presence), (ANA, Presence::Dnd));
+    // In a meeting is Busy, not do-not-disturb, and what she is doing rides beside it.
+    assert_eq!((seen.key.id.as_str(), seen.presence), (ANA, Presence::Busy));
+    assert_eq!(seen.activity.as_ref().map(|activity| activity.kind), Some(protocol::ActivityKind::InMeeting));
     // Her note rides with the presence itself, read for its words.
     let Response::Changes { changes, .. } = world.ask(Request::Wait { since: seq }) else {
         panic!("no changes");
@@ -1086,7 +1166,8 @@ fn people_are_searched_watched_and_called_through_the_official_app() {
         Change::Presence { person, presence, status, .. } if person == key(ANA) => Some((presence, status)),
         _ => None,
     });
-    assert_eq!(told, Some((Presence::Dnd, "Heads down until 3".to_owned())));
+    // What she is doing comes before her note.
+    assert_eq!(told, Some((Presence::Busy, "In a meeting".to_owned())));
     let presence = world.fake.calls("POST", "/presence/v1/presence/getpresence/");
     assert_eq!(presence[0].json(), json!([{"mri": ANA}, {"mri": ME}]), "who is on screen, and me");
     // Asked again at once for the same people, Teams is not asked again.
@@ -1120,4 +1201,112 @@ fn people_are_searched_watched_and_called_through_the_official_app() {
         format!("msteams:/l/channel/19%3Aplatform0general%40thread.tacv2/General?groupId=e0873025-0000-4000-8000-00000000beef&tenantId={HOME}")
     );
     assert!(matches!(world.ask(Request::CallStart { conversation: key(CHAT_ANA) }), Response::Error { .. }), "a Teams call is never carried here");
+}
+
+#[test]
+fn mentions_missed_while_closed_info_mute_seen_hidden_chats_and_files_through_onedrive() {
+    let world = World::start();
+    world.ready();
+    let grp1 = key("19:grp1@thread.v2");
+
+    // The Activity stream is read once at connect: a mention in a chat while tinyclient was
+    // closed counts there; one already read (General, before its marker) and a reaction do not.
+    let counted = world.until("the missed mention", || world.conversation(&grp1).filter(|row| row.mentions == 1));
+    assert_eq!(counted.unread, 1);
+    assert_eq!(world.conversation(&key(GENERAL)).unwrap().mentions, 0);
+    assert_eq!(world.fake.calls("GET", "/48:notifications/messages").len(), 1);
+    let Response::Conversations { counts, .. } = world.ask(Request::Inbox { network: Some(Network::Teams), filter: protocol::InboxFilter::Mentions, offset: 0, limit: 50 }) else {
+        panic!("no inbox");
+    };
+    assert_eq!(counts.mentions, 1);
+
+    // What connecting asked, once each: the token audiences, authz, the one list, one lookup of
+    // the chats' people, and one page of the Activity stream; history for the unread chats only.
+    world.until("the unread chat to be warmed", || world.fake.calls("GET", &format!("{CHAT_ANA}/messages")).pop());
+    let calls = world.fake.calls.lock().unwrap().clone();
+    let at_connect: Vec<String> = calls.iter().map(|call| format!("{} {}", call.method, call.path.rsplit('/').next().unwrap_or(""))).collect();
+    let lists = calls.iter().filter(|call| call.path.ends_with("/teams/users/me")).count();
+    // The list is answered 401 once by the fake (a stale token), so twice.
+    assert_eq!(lists, 2, "{at_connect:#?}");
+    assert_eq!(calls.iter().filter(|call| call.path.ends_with("/fetchShortProfile")).count(), 1);
+    assert_eq!(calls.iter().filter(|call| call.path.contains("/48:")).count(), 1, "the call log is not read");
+
+    // The info pane: one description of the thread.
+    let Response::ConversationInfo { info } = world.ask(Request::ConversationInfo { conversation: key(GENERAL) }) else {
+        panic!("no info");
+    };
+    assert_eq!((info.members, info.notify), (Some(4), protocol::Notify::All));
+
+    // Mute is set on Teams, then shown.
+    assert_eq!(world.ask(Request::SetMute { conversation: grp1.clone(), notify: protocol::Notify::Nothing }), Response::Ok);
+    let muted = world.fake.calls("PUT", "19:grp1@thread.v2/properties").pop().unwrap();
+    assert_eq!((muted.query.as_str(), muted.json()), ("name=alerts", json!({"alerts": "false"})));
+    assert!(world.conversation(&grp1).unwrap().muted);
+
+    // Opening a chat whose last message is mine asks who has read it: everyone has.
+    let launch = key("19:grp2@thread.v2");
+    assert!(!world.conversation(&launch).unwrap().seen);
+    world.messages(&launch);
+    world.until("the launch chat to be seen", || world.conversation(&launch).filter(|row| row.seen));
+    assert_eq!(world.fake.calls("GET", "/consumptionhorizons").len(), 1);
+    // A chat whose last message is not mine is not asked about.
+    world.messages(&key(CHAT_ANA));
+    world.until("Ana's chat to be read", || world.fake.calls("GET", &format!("{CHAT_ANA}/messages")).pop());
+    sleep(Duration::from_millis(300));
+    assert_eq!(world.fake.calls("GET", "/consumptionhorizons").len(), 1);
+
+    // A hidden chat comes back with a new message, as in Teams.
+    world.fake.push("NewMessage", message("19:gone@thread.v2", None, 1_760_000_700_700, DEE, "Dee Park", "<p>still there?</p>"), false);
+    world.until("the hidden chat to come back", || world.conversation(&key("19:gone@thread.v2")).filter(|row| !row.hidden));
+
+    // A colleague out of office: their card says so, in their own words, until when.
+    let search = || Request::People { network: Some(Network::Teams), relation: None, query: Some("dee".to_owned()), offset: 0, limit: 25 };
+    world.until("Dee to be found", || match world.ask(search()) {
+        Response::People { people, .. } => people.into_iter().find(|person| person.key == key(DEE)),
+        _ => None,
+    });
+    world.until("Dee's presence", || match world.ask(Request::Watch(Watching { people: vec![key(DEE)], ..Watching::default() })) {
+        Response::Watching { people, .. } => people.into_iter().find(|person| person.presence == Presence::Idle),
+        _ => None,
+    });
+    let Response::Profile { profile } = world.ask(Request::Profile { person: key(DEE), space: None }) else {
+        panic!("no profile");
+    };
+    assert_eq!((profile.away.as_str(), profile.away_until), ("Back Monday, ask Ben", Some(1_792_396_800)));
+    assert_eq!((profile.title.as_str(), profile.department.as_str()), ("Product Manager", "Product"));
+
+    // A file is refused until it can be shared with the chat's members alone: an
+    // organization-wide link is not what the Teams app makes. Nothing reaches OneDrive.
+    let staged = PathBuf::from(format!("/tmp/tinyclient-teams-file-{}", std::process::id()));
+    std::fs::create_dir_all(&staged).unwrap();
+    let path = staged.join("notes.txt");
+    std::fs::write(&path, b"standup notes").unwrap();
+    let with = protocol::Outgoing {
+        files: vec![protocol::OutgoingFile { path: path.to_string_lossy().into_owned(), name: String::new(), spoiler: false, as_file: false, original: false }],
+        ..Default::default()
+    };
+    let asked = Request::Send { conversation: key(CHAT_ANA), client_id: "88001".into(), text: "notes attached".into(), reply_to: None, with };
+    let answer = world.ask(asked);
+    assert!(!matches!(answer, Response::Sent { .. }), "a file went to Teams: {answer:?}");
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert!(world.fake.calls("POST", ":/createUploadSession").is_empty());
+    assert!(world.fake.calls("POST", "/createLink").is_empty());
+    let _ = std::fs::remove_dir_all(&staged);
+}
+
+#[test]
+fn presence_is_asked_only_for_who_is_watched_and_a_rate_limit_is_waited_out_once() {
+    let world = World::start();
+    world.ready();
+    // Connected and idle, nobody on screen: presence is pushed or not asked at all.
+    sleep(Duration::from_millis(500));
+    assert!(world.fake.calls("POST", "/presence/v1/presence/getpresence/").is_empty());
+
+    // Someone on screen whose presence is rate limited: asked, waited out once, asked again,
+    // and then left; never a third time.
+    let limited = key("8:orgid:limit-me");
+    world.ask(Request::Watch(Watching { people: vec![limited], ..Watching::default() }));
+    world.until("the second try", || (world.fake.calls("POST", "/presence/v1/presence/getpresence/").len() >= 2).then_some(()));
+    sleep(Duration::from_millis(1600));
+    assert_eq!(world.fake.calls("POST", "/presence/v1/presence/getpresence/").len(), 2);
 }

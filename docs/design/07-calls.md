@@ -33,7 +33,7 @@ One pill in the conversation header, 30 px high, radius 15, 12 px side padding, 
 | Native, voice channel | `raised` fill, `volume` | **Join voice** | "Join Lounge. People there will see you arrive." |
 | Native, a call is already running | `accent_soft` fill, `accent` text | **Join call · 3** | "Iris, Jun and 1 more are in this call" |
 | This conversation's call is mine | `danger_soft`, `phone-off` | **Leave** (ringing/connecting: **Cancel**) | "Leave the call  ⌘⇧H" |
-| Hand-off | no fill, 1 px `hairline_strong` border, `text_soft`; the **network's own icon** 14 px, then label, then `arrow-up-right` 12 px `text_faint` | **Open in Teams** · **Open huddle in Slack** · **Open in Telegram** · **Open in Discord** | "Teams calls open in the Teams app. tinychat doesn't carry them." / "Huddles open in Slack. Press the headphones there to join." |
+| Hand-off | no fill, 1 px `hairline_strong` border, `text_soft`; the **network's own icon** 14 px, then label, then `arrow-up-right` 12 px `text_faint` | **Open in Teams** · **Open huddle in Slack** · **Open in Telegram** · **Open in Discord** | "Teams calls open in the Teams app. tinyclient doesn't carry them." / "Huddles open in Slack. Press the headphones there to join." |
 | None (a Discord text channel) | no button | | |
 
 The hand-off reads as deliberate because it is a different object: outlined, branded, with an out-arrow and a destination in its name. It never says "Call". If the official app is missing, a 32 px line appears under the header: "Teams isn't installed. **Open in browser ↗**". There is no separate video or share button in the header: camera and share are turned on inside a call. Pressing Call while in another call asks in the dock first ("Leave Lounge and call Mara Okafor?"). A voice channel joins from its header pill, its hover **Join** pill, or a double-click; a single click only opens its chat, because joining is seen by everyone there.
@@ -45,7 +45,7 @@ Dock: full sidebar width (316), 8 px padding, 1 px `hairline` top border, presen
 - **Row 1, 36 px, the title row.** 28 px avatar (person: round, in a 4 px speaking-ring slot; voice channel: 28 px square, radius 8, `positive_soft` fill, `volume` glyph in `positive`). Title 13 px semibold. Sub-line 11.5 px `text_soft`: network icon 11 px + context + state. Right side: the peer's `mic-off` glyph (DM), or an avatar stack (group, channel): up to three 20 px avatars overlapping 6 px, then "+N". Click the row: open that conversation ("Go to Lounge"). Click the stack: participant list.
 - **Row 2, 32 px, controls.** Icon buttons 40 × 32, radius 8, 4 px gap, 16 px glyphs, left to right: mute, deafen, share, camera, devices. A flexible gap, then Leave, 48 × 32, at the right edge. Controls a stage or a network cannot do are absent, not greyed: stage 2 shows mute, deafen, devices, Leave.
 
-Sub-line wording: `Ringing… 0:12` · `Connecting…` · `Discord · 12:04` (DM) · `tinychat-dev · 4:31` (channel: server name) · `Reconnecting… 0:08` (`warning`) · `Call ended · 12:04`. The sub-line's tooltip in a Discord call: "End-to-end encrypted by Discord". Left alone in a DM call: `Mara left · 12:40`; tinychat does not hang up for me.
+Sub-line wording: `Ringing… 0:12` · `Connecting…` · `Discord · 12:04` (DM) · `tinyclient-dev · 4:31` (channel: server name) · `Reconnecting… 0:08` (`warning`) · `Call ended · 12:04`. The sub-line's tooltip in a Discord call: "End-to-end encrypted by Discord". Left alone in a DM call: `Mara left · 12:40`; tinyclient does not hang up for me.
 
 | Control | Rest | On | Tooltip / shortcut |
 |---|---|---|---|
@@ -58,7 +58,7 @@ Sub-line wording: `Ringing… 0:12` · `Connecting…` · `Discord · 12:04` (DM
 
 Hover on any rest state: `selected` fill, `text` glyph. Disabled: 40 % opacity, no hover; used while reconnecting (all but Leave) and for a moderator's mute ("Muted by a moderator in Lounge"). Ringing and connecting show only mute and devices (both may be preset) and a text **Cancel** button (32 high, `danger_soft`).
 
-**Shortcuts** work in any tinychat window: ⌘⇧M mute, ⌘⇧D deafen, ⌘⇧H leave or cancel, ⌘⇧A accept, ⌘⇧R decline, ⌘⇧J jump to the call's conversation. Mute can also be system-wide: off by default, a Settings switch ("Mute works while tinychat is in the background"), registered only while a call exists. Layout and navigation arbitrates any clash with these.
+**Shortcuts** work in any tinyclient window: ⌘⇧M mute, ⌘⇧D deafen, ⌘⇧H leave or cancel, ⌘⇧A accept, ⌘⇧R decline, ⌘⇧J jump to the call's conversation. Mute can also be system-wide: off by default, a Settings switch ("Mute works while tinyclient is in the background"), registered only while a call exists. Layout and navigation arbitrates any clash with these.
 
 ## 3. Outgoing and failed (frames 2, 8)
 
@@ -69,10 +69,10 @@ Ringing shows who, an elapsed counter and Cancel, in the dock; the header pill b
 | No answer | "Mara Okafor didn't pick up." | Call again · Message |
 | Declined | "Mara Okafor declined the call." | Message |
 | Couldn't connect | "Discord refused the voice connection." / "No reply from Discord after 10 seconds." / "The call engine stopped." | Try again · Open in Discord |
-| tinychat can't use the microphone | "Allow it in System Settings › Privacy & Security › Microphone, then call again." | Open System Settings |
+| tinyclient can't use the microphone | "Allow it in System Settings › Privacy & Security › Microphone, then call again." | Open System Settings |
 | No microphone found | "Plug one in, or choose another in Microphone and speaker." | Try again |
 | Lounge is full | "10 of 10 people are in it." · or "You don't have permission to join Lounge." | (dismiss only) |
-| Discord needs a newer tinychat for calls | "Discord raised its encryption requirement. Update tinychat, or take this call in Discord." | Open in Discord |
+| Discord needs a newer tinyclient for calls | "Discord raised its encryption requirement. Update tinyclient, or take this call in Discord." | Open in Discord |
 | Connection lost | "No reply from Discord for 30 seconds. You've left Lounge." | Rejoin · Open in Discord |
 
 ## 4. Incoming (frame 3)
@@ -95,7 +95,7 @@ Ringing shows who, an elapsed counter and Cancel, in the dock; the header pill b
 - **Where.** Top of the conversation pane under the header, in whatever conversation is open: it belongs to the call. Margins 20 px side, 16 px top. Card: radius 12, black fill, 1 px `hairline`, 6 px bezel, the picture aspect-fit inside, then a **32 px caption strip**: 18 px avatar, "**Dev Patel's screen** · Lounge", and at the right Pop out (`picture-in-picture-2`) and Stop watching (`x`), 28 × 24 each. No control is drawn over the picture.
 - **Size.** Default: 16:9 at pane width, at most 45 % of pane height, at least 160 px. The bottom edge is a 6 px drag zone; the height is remembered. **Pop out** moves the same surface to its own window (still one decode); the pane keeps a 36 px line, "Watching in its own window · **Bring back**". Full screen is that window's green button (⌃⌘F). Double-click the picture: pop out.
 - **Precedence.** The surface shows what I last chose. A watched share ending closes the surface, or falls back to cameras if I was watching cameras before. While watching cameras it follows the active speaker, switching at most once every 2 s. A share starting never replaces what I am watching; the strip offers it. Choosing a second share replaces the first.
-- **My share.** Share opens the macOS system picker (screen or one window). While sharing: the button is on, and an `accent_soft` strip tops the bar: "You're sharing Zed — mod.rs" · **Stop**. macOS shows its own indicator. I do not see a preview of my own share. Permission missing: nothing starts and the strip reads, in `warning`, "tinychat can't record the screen. Allow it in System Settings › Privacy & Security › Screen & System Audio Recording." · **Open System Settings**. Camera on is the button state alone; no self-view.
+- **My share.** Share opens the macOS system picker (screen or one window). While sharing: the button is on, and an `accent_soft` strip tops the bar: "You're sharing Zed — mod.rs" · **Stop**. macOS shows its own indicator. I do not see a preview of my own share. Permission missing: nothing starts and the strip reads, in `warning`, "tinyclient can't record the screen. Allow it in System Settings › Privacy & Security › Screen & System Audio Recording." · **Open System Settings**. Camera on is the button state alone; no self-view.
 
 ## 7. Device menu (frame 7)
 
@@ -127,8 +127,8 @@ Voice channels leave no rows. A failed call leaves its card in the dock, not a r
 - The dock is a flex-none child at the end of the sidebar column; the list above it shrinks.
 - The 6 px bezel exists because a video surface may not clip to rounded corners. If it can, drop it.
 - Strips, the incoming card and failures are the same card with different children: one component.
-- The share picker and both permission prompts are the system's; tinychat draws none of them. Whether the system picker avoids the blanket Screen Recording permission is unverified.
-- Notification action buttons show only when the user's style for tinychat is Alerts; under Banners they sit behind "Options". First run should say so. Unverified on current macOS.
+- The share picker and both permission prompts are the system's; tinyclient draws none of them. Whether the system picker avoids the blanket Screen Recording permission is unverified.
+- Notification action buttons show only when the user's style for tinyclient is Alerts; under Banners they sit behind "Options". First run should say so. Unverified on current macOS.
 
 ## Deliberately absent
 

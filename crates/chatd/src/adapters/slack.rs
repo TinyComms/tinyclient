@@ -10,8 +10,10 @@
 //! and messages go to the store as they are parsed.
 
 mod emoji;
+mod info;
 mod message;
 mod people;
+mod send;
 mod text;
 mod tree;
 
@@ -21,8 +23,8 @@ use people::{Roster, User};
 use protocol::{Link, Message, Presence, Reaction, ReplyTo, ThreadSummary, THREAD_FACES};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
-use std::sync::mpsc::Receiver;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 use tree::Counted;
@@ -203,7 +205,24 @@ struct State {
     search_at: Option<Instant>,
     groups_listed: bool,
     partners_read: bool,
+    /// When the followed threads were last asked for.
+    threads_at: Option<Instant>,
+    /// Rows on screen waiting for their newest message, whether a thread is fetching them, and
+    /// when the last one was fetched.
+    previews: VecDeque<String>,
+    previewing: bool,
+    previewed: Option<Instant>,
+    /// Sends with files waiting for the socket to show the message that shares them, by the
+    /// first file's id.
+    shares: HashMap<String, Sender<Message>>,
+    /// When `users.info` was last asked about each person: once an hour each ([`INFO_EVERY`]).
+    info_asked: HashMap<String, Instant>,
+    /// The card last read for each person, answered again inside that hour.
+    abouts: HashMap<String, About>,
 }
+
+/// `users.info` is asked about one person at most this often.
+const INFO_EVERY: Duration = Duration::from_secs(3600);
 
 /// When Slack was last asked anything, and what each method has left of its allowance.
 #[derive(Default)]
@@ -458,13 +477,20 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
         });
         let socket = slack.clone();
         std::thread::spawn(move || keep_connected(&socket.ctx, || socket.connect()));
-        serve_commands(
-            &slack.ctx,
-            inbox,
-            PACE,
-            |id| slack.report(slack.fetch(id)),
-            |command| slack.serve(command),
-        )
+        // A send with files uploads on a thread of its own, and previews are fetched on one,
+        // paced: the commands behind either (a cancel among them) are not held up.
+        let other = |command| match command {
+            Command::SendWith { conversation_id, client_id, text, reply_to, with } => {
+                let sending = slack.clone();
+                let (conversation, client) = (conversation_id.clone(), client_id.clone());
+                crate::blobs::upload::spawn(&slack.ctx, &conversation_id, &client_id, &with.files.clone(), move |up| {
+                    sending.send_with(&conversation, &client, &text, reply_to.as_deref(), &with, up)
+                });
+            }
+            Command::Previews(ids) => slack.previews(ids),
+            command => slack.serve(command),
+        };
+        serve_commands(&slack.ctx, inbox, PACE, |id| slack.report(slack.fetch(id)), other)
     });
     spawned.map(drop).map_err(|err| err.to_string())
 }
@@ -529,7 +555,23 @@ fn within(host: &str, domain: &str) -> bool {
 
 impl Slack {
     fn state(&self) -> MutexGuard<'_, State> {
-        self.state.lock().unwrap()
+        crate::hub::lock(&self.state)
+    }
+
+    /// Whether `users.info` may be asked about `person` now, and if so, notes that it was. Once
+    /// per person per [`INFO_EVERY`], however often a card is opened or a name is unknown.
+    fn info_due(&self, person: &str) -> bool {
+        let mut state = self.state();
+        if state.info_asked.get(person).is_some_and(|at| at.elapsed() < INFO_EVERY) {
+            return false;
+        }
+        if state.info_asked.len() >= 1024 {
+            state.info_asked.retain(|_, at| at.elapsed() < INFO_EVERY);
+            let State { info_asked, abouts, .. } = &mut *state;
+            abouts.retain(|person, _| info_asked.contains_key(person));
+        }
+        state.info_asked.insert(person.to_owned(), Instant::now());
+        true
     }
 
     fn report(&self, result: Result<(), Failure>) {
@@ -539,7 +581,7 @@ impl Slack {
     }
 
     fn cookie(&self) -> String {
-        self.cookie.lock().unwrap().clone()
+        crate::hub::lock(&self.cookie).clone()
     }
 
     /// True for an address Slack serves: its files, avatars, emoji and image proxy.
@@ -573,7 +615,7 @@ impl Slack {
     fn pace(&self, method: &str) -> bool {
         loop {
             let wait = {
-                let mut pacer = self.pacer.lock().unwrap();
+                let mut pacer = crate::hub::lock(&self.pacer);
                 let now = Instant::now();
                 let gap = pacer.last.map_or(Duration::ZERO, |last| GAP.saturating_sub(now.duration_since(last)));
                 let (a_second, most) = (per_minute(method) / 2. / 60., (per_minute(method) / 10.).max(2.));
@@ -626,7 +668,7 @@ impl Slack {
             if fresh.is_empty() || fresh == "deleted" {
                 continue;
             }
-            let old = std::mem::replace(&mut *self.cookie.lock().unwrap(), format!("d={fresh}"));
+            let old = std::mem::replace(&mut *crate::hub::lock(&self.cookie), format!("d={fresh}"));
             let old = old.trim_start_matches("d=").to_owned();
             if old != fresh {
                 self.ctx.save_session(|stored| recookied(stored, &old, fresh));
@@ -725,6 +767,7 @@ impl Slack {
         let _ = self.me.set(me.to_owned());
         let name = auth["team"].as_str().unwrap_or_default();
         self.ctx.describe(name, me)?;
+        self.ctx.capabilities(capabilities());
         self.space(name)?;
         let cookie = self.cookie();
         let headers = [
@@ -821,7 +864,10 @@ impl Slack {
             "channel_left" | "group_left" | "channel_deleted" | "group_deleted" | "channel_archive"
             | "group_archive" | "im_close" | "mpim_close" | "group_close" => self.left(event),
             "channel_rename" | "group_rename" => self.renamed(event),
-            "user_change" => self.user_changed(&event["user"]),
+            // A huddle joined or left, a status set: the user object comes whole with each.
+            // Unverified: `user_huddle_changed` and `user_status_changed` carry it as
+            // `user_change` does (the community's reading).
+            "user_change" | "user_huddle_changed" | "user_status_changed" => self.user_changed(&event["user"]),
             "member_joined_channel" | "member_left_channel" => {
                 self.member_moved(event);
                 Ok(())
@@ -905,6 +951,10 @@ impl Slack {
             return Ok(());
         };
         let root = event["thread_ts"].as_str().filter(|root| *root != message.id);
+        // The files of a send of ours, shared: that send records it as its own.
+        if event["files"].is_array() && self.shared_here(event, &message) {
+            return Ok(());
+        }
         let Some(root) = root else {
             if message.thread.is_some() {
                 self.thread_known(channel, &message.id)?;
@@ -1241,8 +1291,24 @@ impl Slack {
             Command::OpenSpace(_) => self.report(self.open_space()),
             Command::MarkRead { conversation_id, message_id } => self.report(self.mark_read(&conversation_id, &message_id)),
             Command::Send { conversation_id, client_id, text, reply_to } => {
-                self.send(&conversation_id, &client_id, &text, reply_to.as_deref())
+                self.send(&conversation_id, &client_id, &text, reply_to.as_deref(), false)
             }
+            Command::CancelSend { client_id, .. } => crate::blobs::upload::cancel(&self.ctx.account, &client_id),
+            Command::ConversationInfo { conversation_id, reply } => answer(reply, self.conversation_info(&conversation_id)),
+            Command::SetMute { conversation_id, notify, reply } => answer(reply, self.set_mute(&conversation_id, notify)),
+            Command::Pinned { conversation_id, reply } => answer(reply, self.pinned(&conversation_id)),
+            Command::SearchShared { conversation_id, kind, before, limit, reply } => {
+                match self.search_shared(&conversation_id, kind, before.as_deref(), limit) {
+                    Some(found) => answer(reply, found),
+                    None => drop(reply.send(Err(Refusal::Unsupported))),
+                }
+            }
+            // Only the workspace's emoji: Slack's GIFs are hidden until its client's call is
+            // captured, and it has no stickers.
+            Command::Catalog { kind: protocol::CatalogKind::Emoji, query, cursor, reply, .. } => {
+                answer(reply, self.emoji_catalog(&query, cursor.as_deref()))
+            }
+            Command::OpenThreads(_) => self.report(self.open_threads()),
             Command::React { conversation_id, message_id, emoji, on, reply } => {
                 answer(reply, self.react(&conversation_id, &message_id, &emoji, on));
             }
@@ -1274,7 +1340,7 @@ impl Slack {
             Command::SignOut(reply) => {
                 let _ = reply.send(Ok(()));
             }
-            // Slack has no friends to accept or block (`Relate`), and no calls tinychat carries.
+            // Slack has no friends to accept or block (`Relate`), and no calls tinyclient carries.
             command => command.unsupported(&self.ctx),
         }
     }
@@ -1282,9 +1348,10 @@ impl Slack {
     /// The socket has just connected, or the shell opened the Space.
     ///
     /// Connecting reads the unread state (`client.counts`) and the mutes, and nothing else:
-    /// the rows are in the cache. Only a workspace never listed here has its sidebar read then,
-    /// because without it there is nothing to show. Opening the Space is what brings the full
-    /// channel list up to date.
+    /// the rows are in the cache. Only a workspace never listed here has its sidebar read
+    /// (`users.conversations`, every conversation ever), because without it there is nothing to
+    /// show. Opening the Space again later reads `client.counts` alone: the socket has kept the
+    /// rows current, and paging every DM again on each visit is the burst to avoid.
     fn open_space(&self) -> Result<(), Failure> {
         let (connected, loaded) = {
             let mut state = self.state();
@@ -1292,6 +1359,7 @@ impl Slack {
         };
         if connected {
             self.partners();
+            self.tell_partners();
             return match self.ctx.note("tree") {
                 Some(_) => self.resync(),
                 None => self.load_tree(),
@@ -1299,7 +1367,9 @@ impl Slack {
         }
         match loaded {
             Some(at) if at.elapsed() < TREE_FRESH => Ok(()),
-            _ => self.load_tree(),
+            Some(_) => self.recount(),
+            None if self.ctx.note("tree").is_some() => self.recount(),
+            None => self.load_tree(),
         }
     }
 
@@ -1348,7 +1418,13 @@ impl Slack {
     /// Posts a message and ends the send. In a thread's conversation it is a reply to that
     /// thread. Slack has no reply outside threads, so a reply to a message in a channel is a
     /// reply in its thread that is also shown in the channel.
-    fn send(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>) {
+    fn send(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, suppress: bool) {
+        let outcome = self.post(conversation, client_id, text, reply_to, suppress);
+        self.ctx.sent(conversation, client_id, outcome);
+    }
+
+    /// The post itself, answering what Slack accepted.
+    fn post(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, suppress: bool) -> Result<Message, String> {
         let (channel, thread) = match thread_of(conversation) {
             Some((channel, root)) => (channel, Some(root)),
             None => (conversation, None),
@@ -1363,6 +1439,10 @@ impl Slack {
         if shown.is_some() {
             params.push(("reply_broadcast", "true"));
         }
+        // The preview chip dismissed: Slack is asked not to unfurl the links.
+        if suppress {
+            params.extend([("unfurl_links", "false"), ("unfurl_media", "false")]);
+        }
         let posted = self.api("chat.postMessage", &params).map_err(reason);
         let outcome = posted.and_then(|posted| {
             let mut event = posted["message"].clone();
@@ -1372,7 +1452,7 @@ impl Slack {
             let accepted = self.message(channel, &event);
             accepted.ok_or_else(|| "Slack accepted it but sent nothing back.".to_owned())
         });
-        let outcome = outcome.map(|mut message| {
+        outcome.map(|mut message| {
             if let Some(root) = thread {
                 self.report(self.bump(channel, root, &message));
             }
@@ -1380,8 +1460,7 @@ impl Slack {
                 message.reply_to = self.quote(channel, root);
             }
             message
-        });
-        self.ctx.sent(conversation, client_id, outcome);
+        })
     }
 
     /// Slack's name for a reaction: the shell sends the emoji itself, a custom one as `:name:`,
@@ -1484,21 +1563,55 @@ impl Slack {
     /// time zone and its offset beside it), so the one request the contract allows is enough
     /// and `users.profile.get` is not called as well.
     fn profile(&self, person: &str) -> Result<About, Fault> {
+        if !self.info_due(person) {
+            // Asked within the hour: the card read then, or what the row knows.
+            return Ok(self.state().abouts.get(person).cloned().unwrap_or_default());
+        }
         let info = self.api("users.info", &[("user", person)])?;
-        let user = &info["user"];
-        self.learn(std::slice::from_ref(user));
-        Ok(About {
-            bio: user["profile"]["title"].as_str().unwrap_or("").to_owned(),
-            // Every workspace of the sign-in is its own account; what they share is not asked.
-            mutual_spaces: Vec::new(),
-            time_zone: user["tz"].as_str().unwrap_or("").to_owned(),
-            utc_offset: user["tz_offset"].as_i64().map(|offset| offset as i32),
-            fields: [("Email", "email"), ("Phone", "phone"), ("Pronouns", "pronouns")]
-                .into_iter()
-                .map(|(label, key)| (label.to_owned(), user["profile"][key].as_str().unwrap_or("").to_owned()))
-                .collect(),
-            ..About::default()
-        })
+        self.learn(std::slice::from_ref(&info["user"]));
+        Ok(self.keep_about(person, &info["user"]))
+    }
+
+    /// The card in a `users.info` answer, kept for the hour no other is asked for.
+    fn keep_about(&self, person: &str, user: &Value) -> About {
+        let about = about_of(user);
+        self.state().abouts.insert(person.to_owned(), about.clone());
+        about
+    }
+}
+
+/// A person's card from their `users.info` answer.
+fn about_of(user: &Value) -> About {
+    let said = |key: &str| user["profile"][key].as_str().unwrap_or("").trim().to_owned();
+    let contact = |kind, value: String| (!value.is_empty()).then_some(protocol::Contact { kind, value, masked: kind == protocol::ContactKind::Phone });
+    let contacts = [contact(protocol::ContactKind::Email, said("email")), contact(protocol::ContactKind::Phone, said("phone"))];
+    // Slack's status expiry, 0 for none.
+    let until = user["profile"]["status_expiration"].as_i64().filter(|until| *until > 0);
+    About {
+        // Slack has no bio: the title is a title (06, story 3).
+        title: said("title"),
+        pronouns: said("pronouns"),
+        contacts: contacts.into_iter().flatten().collect(),
+        // Every workspace of the sign-in is its own account; what they share is not asked.
+        mutual_spaces: Vec::new(),
+        time_zone: user["tz"].as_str().unwrap_or("").to_owned(),
+        utc_offset: user["tz_offset"].as_i64().map(|offset| offset as i32),
+        status_until: until,
+        ..About::default()
+    }
+}
+
+/// What a Slack account may send. The same on every plan (unverified: a workspace may lower
+/// the file limit or turn uploads off, which Slack then refuses in words). Slack's GIF picker
+/// is left out until its client's call is captured on a live session (ruling 09).
+fn capabilities() -> protocol::Capabilities {
+    protocol::Capabilities {
+        max_file_bytes: send::LARGEST,
+        max_files: send::FILES as u32,
+        custom_emoji: protocol::EmojiScope::All,
+        schedule: true,
+        suppress_embeds: true,
+        ..protocol::Capabilities::default()
     }
 }
 

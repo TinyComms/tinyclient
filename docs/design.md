@@ -57,4 +57,4 @@ The eight were written in parallel and disagree in places. Where they do, this s
 ## Icons
 
 Network icons are from Dashboard Icons and interface glyphs from Lucide; both are compiled in.
-Sources and licenses are in `crates/tinychat/assets/README.md`.
+Sources and licenses are in `crates/tinyclient/assets/README.md`.

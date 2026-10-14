@@ -6,7 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 [[bin]]
-name = "tinychat-login"
+name = "tinyclient-login"
 path = "src/main.rs"
 
 [dependencies]

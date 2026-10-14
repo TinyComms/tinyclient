@@ -151,7 +151,7 @@ fn random(bytes: usize) -> String {
     let mut buffer = vec![0u8; bytes];
     let read = random_bytes(&mut buffer);
     if let Err(err) = read {
-        eprintln!("tinychat-login: no randomness to sign in with: {err}");
+        eprintln!("tinyclient-login: no randomness to sign in with: {err}");
         std::process::exit(super::LOAD_FAILED);
     }
     encode(&buffer)
@@ -273,14 +273,14 @@ fn refuse(error: &str, description: &str) -> ! {
     let code = aadsts(description).unwrap_or(error);
     let said = description.lines().next().unwrap_or("").chars().take(300).collect::<String>();
     if organization(code) {
-        eprintln!("tinychat-login: the organization does not allow this sign-in ({code}): {said}");
+        eprintln!("tinyclient-login: the organization does not allow this sign-in ({code}): {said}");
         std::process::exit(super::BLOCKED);
     }
     // Declining the page's own prompt is closing the window by another button.
     if error == "access_denied" && aadsts(description).is_none() {
         std::process::exit(super::CLOSED);
     }
-    eprintln!("tinychat-login: Microsoft refused the sign-in ({code}): {said}");
+    eprintln!("tinyclient-login: Microsoft refused the sign-in ({code}): {said}");
     std::process::exit(REFUSED);
 }
 
@@ -298,7 +298,7 @@ fn read(found: &str) -> Option<serde_json::Value> {
             static SHOWN: OnceLock<Instant> = OnceLock::new();
             let code = aadsts(text).filter(|code| organization(code) && !super::blocked(url, text))?;
             let since = SHOWN.get_or_init(|| {
-                eprintln!("tinychat-login: the organization does not allow this sign-in ({code})");
+                eprintln!("tinyclient-login: the organization does not allow this sign-in ({code})");
                 Instant::now()
             });
             if since.elapsed() >= READ_IT {
@@ -392,7 +392,7 @@ fn signed_in(code: &str, verifier: &str) -> serde_json::Value {
     let redeemed = match token(&agent, TENANT, &grant) {
         Ok(redeemed) => redeemed,
         Err(why) => {
-            eprintln!("tinychat-login: Microsoft could not be reached to finish the sign-in: {why}");
+            eprintln!("tinyclient-login: Microsoft could not be reached to finish the sign-in: {why}");
             std::process::exit(super::LOAD_FAILED);
         }
     };
@@ -428,7 +428,7 @@ fn signed_in(code: &str, verifier: &str) -> serde_json::Value {
         let reached = token(&agent, &id, &[("grant_type", "refresh_token"), ("refresh_token", refresh.as_str())]);
         match reached.ok().filter(|reached| reached.status == 200).map(|reached| text(&reached.body["refresh_token"])) {
             Some(own) if !own.is_empty() => tenants.push((id, name, own)),
-            _ => eprintln!("tinychat-login: guest tenant {name:?} did not accept this sign-in and is left out"),
+            _ => eprintln!("tinyclient-login: guest tenant {name:?} did not accept this sign-in and is left out"),
         }
     }
     session(&claims, &tenants)

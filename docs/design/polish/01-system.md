@@ -123,16 +123,16 @@ Labels roll over once at midnight, not on a minute timer. A pending message keep
 ## 5. Window-level states
 
 The window never shows a blank canvas or a developer message. Rail and strips are always drawn; the last snapshot
-stays on screen whenever there is one. The service is never named: users see "tinychat".
+stays on screen whenever there is one. The service is never named: users see "tinyclient".
 
 | State | Trigger | Where | Words | Action |
 |---|---|---|---|---|
-| Starting | shell launched chatd, no answer yet | sidebar: skeleton rows after 150; nothing else for 3 s | (none for 3 s) then sidebar banner "Starting tinychat…" | — |
-| Keychain wait | `Status` says waiting, or no answer at 3 s with the process alive | conversation region empty state + sidebar banner | Title "Waiting for keychain access". Line "macOS is asking to let tinychat use its saved sign-ins. Choose Always Allow. The prompt may be behind this window." Banner "Waiting for keychain access" | none (nothing we can press helps) |
-| Keychain denied | read refused or locked | same | Title "tinychat can't read its sign-ins". Line "Your accounts are still signed in. Allow access to continue." | "Try again" |
+| Starting | shell launched chatd, no answer yet | sidebar: skeleton rows after 150; nothing else for 3 s | (none for 3 s) then sidebar banner "Starting tinyclient…" | — |
+| Keychain wait | `Status` says waiting, or no answer at 3 s with the process alive | conversation region empty state + sidebar banner | Title "Waiting for keychain access". Line "macOS is asking to let tinyclient use its saved sign-ins. Choose Always Allow. The prompt may be behind this window." Banner "Waiting for keychain access" | none (nothing we can press helps) |
+| Keychain denied | read refused or locked | same | Title "tinyclient can't read its sign-ins". Line "Your accounts are still signed in. Allow access to continue." | "Try again" |
 | Reconnecting | socket dropped mid-session; shell restarts chatd | sidebar banner; composer stays editable, Send waits | "Reconnecting…" · tooltip "Showing what was saved at 10:42" | — |
 | Couldn't restart | 3 restarts in 30 s failed, or a version mismatch | sidebar banner (service priority) | "Not receiving messages." | "Try again"; Help › Copy Diagnostics |
-| Crash restart | relaunched after a panic | toast, error style, stays until dismissed | "tinychat quit unexpectedly and reopened." | "Copy report" |
+| Crash restart | relaunched after a panic | toast, error style, stays until dismissed | "tinyclient quit unexpectedly and reopened." | "Copy report" |
 | Account needs you | verification, captcha | that network's home and the Inbox, banner | "Discord wants you to verify your account." | "Open Discord" |
 | Signed out (expired) | token rejected | home + Inbox banner; its rows stay readable | "Slack signed you out of Harbor Labs." | "Sign in" |
 | Network late | adapter reconnecting > 5 s | home banner; in the Inbox too, naming it | "Slack is reconnecting. Showing what was saved at 10:42." | — |
@@ -144,12 +144,12 @@ stays on screen whenever there is one. The service is never named: users see "ti
 
 | Menu | Items |
 |---|---|
-| tinychat | About tinychat · Check for Updates… · — · Settings… ⌘, · — · Services ▸ · — · Hide tinychat ⌘H · Hide Others ⌥⌘H · Show All · — · Quit tinychat ⌘Q |
+| tinyclient | About tinyclient · Check for Updates… · — · Settings… ⌘, · — · Services ▸ · — · Hide tinyclient ⌘H · Hide Others ⌥⌘H · Show All · — · Quit tinyclient ⌘Q |
 | File | New Message ⌘N · Add Account… · — · Attach File… ⌘U · — · Close Window ⌘W |
 | Edit | Undo ⌘Z · Redo ⇧⌘Z · — · Cut ⌘X · Copy ⌘C · Paste ⌘V · Paste and Match Style ⌥⇧⌘V · Select All ⌘A · — · Find ▸ (Search in Conversation ⌘F · Search Everywhere ⇧⌘F) · — · Emoji & Symbols ⌃⌘Space |
 | View | Inbox ⌘1 · People ⌘2 · one item per network and pin in rail order ⌘3–⌘9 · — · Quick Switcher ⌘K · Hide Sidebar ⌘\ · Close Right Pane ⌘. · — · Bigger Text ⌘+ · Smaller Text ⌘− · Actual Size ⌘0 · — · Enter Full Screen ⌃⌘F |
 | Conversation | Back ⌘[ · Forward ⌘] · Up a Level ⌘↑ · — · Next ⌥↓ · Previous ⌥↑ · Next Unread ⌥⇧↓ · Previous Unread ⌥⇧↑ · — · Mark as Read · Mark as Unread ⌥⌘U · Mark Server as Read ⇧⎋ · — · Show Details ⌥⌘I · Star · Mute… · — · Start Call ⇧⌘C · Open in Discord ⌥⌘O · Copy Link |
-| Window | Minimize ⌘M · Zoom · (macOS tiling items) · — · tinychat · Bring All to Front |
+| Window | Minimize ⌘M · Zoom · (macOS tiling items) · — · tinyclient · Bring All to Front |
 | Help | Keyboard Shortcuts ⌘/ · Release Notes · — · Copy Diagnostics · Report a Problem… |
 
 Items that do not apply are disabled, never hidden; names follow the open place ("Open in Slack"). Esc is no item.
@@ -157,7 +157,7 @@ Items that do not apply are disabled, never hidden; names follow the open place 
 - **About** opens Settings › About (`08-first-run-settings` §7). **Settings**: own 720 × 560 window, ⌘,. Sections:
   Accounts · General · Notifications · Appearance · Privacy · Audio & video · Storage · About.
 - **Close versus quit** (ruling 11): ⌘W and the red button hide the window; chatd keeps receiving and the Dock badge
-  counting; the Dock icon or Window › tinychat shows it unchanged. ⌘Q stops both; in a call it asks "End the call and quit?".
+  counting; the Dock icon or Window › tinyclient shows it unchanged. ⌘Q stops both; in a call it asks "End the call and quit?".
 - **Frame**: saved 500 ms after a move or resize with its display; restored if that display exists and half the frame
   is visible, else 1120 × 720 centered on the main display. Minimum 540 × 440. Double-click on a strip does what macOS
   is set to. The window title is the open conversation ("#showcase · Moss & Lichen"). Full screen keeps every strip 52.

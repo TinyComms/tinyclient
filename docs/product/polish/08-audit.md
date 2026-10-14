@@ -2,7 +2,7 @@
 
 What the build is today, measured from about 95 offscreen shots (about 80 distinct states) of the debug shell against scratch `chatd --seed-demo` daemons
 (default, `fresh`, `expired`, `reconnecting`, `attention`, `many`; chatd absent), plus a read of
-`crates/tinychat/src` and `crates/chatd/src`. Shots are at 1120×720 unless stated otherwise. Shot names in `code` are
+`crates/tinyclient/src` and `crates/chatd/src`. Shots are at 1120×720 unless stated otherwise. Shot names in `code` are
 the states below; refs are to `docs/design/01-system.md` (§) or another doc. Each finding is on one line, in this form: severity · area · where · what → expected.
 **S1** looks broken or loses data · **S2** looks unfinished · **S3** refinement.
 
@@ -14,7 +14,7 @@ fine when re-run one at a time, so the display was awake and the render was a ti
 - **S1 · Inbox · no preview line on real accounts.** The row draws `Conversation.preview` (`gui/sidebar.rs:744`), but chatd only sets it when it ingests a message (`chatd/src/store.rs:1025,1045`). Discord (`adapters/discord/ready.rs:629`), Slack (`slack/tree.rs:369`) and Teams (`teams/tree.rs:151`) report unread counts through `set_counts` (`store.rs:917`) without ingesting the newest message, and only about 5 unread conversations are warmed. Telegram ingests the top message, and the demo ingests everything, which is why the demo looks right. Likely trigger today: a `SCHEMA` bump drops every table (`store.rs:22,512-521`), so yesterday's previews were wiped and nothing refills them. → The adapters should send the last message (Teams already has `lastMessage`, `teams/tree.rs:50`) or ingest it.
 - **S1 · Rail · own avatar shows a letter.** `rail.rs:153` → `own_avatar` (`state.rs:624`) → `media_path` (`state.rs:712`) only reads a path that is already known and never asks for the file to be fetched. The own menu (`people.rs:309`) and the rows (`sidebar.rs:1001`) do ask. So the picture appears only if something else happens to fetch the same id, and it falls back to the letter when `Shell.media` is cleared at 2000 entries (`state.rs:750`). The rail also takes the *first* connected account (`rail.rs:148`), which may have no picture. → The rail should ask for the file through the hub as the menu does, and pick the account that has a picture.
 - **S1 · People / Inbox · app and bot DMs listed among people.** `Person.bot` exists (`protocol/src/lib.rs:443`), but `people/list.rs:145-175` and `store.rs:1482` never filter on it. Slack and Teams turn every DM partner into `Relation::Contact` (`slack/tree.rs:347`, `teams/tree.rs:205`), and `Conversation` has no bot flag. → 05-people-presence: People is for people; apps belong under their own heading.
-- **S1 · Conversation · SVG shows "Couldn't load image · Retry".** The adapters map any `image/*` MIME type to `MediaKind::Image` (`slack/message.rs:255`, `discord/content.rs:406`, `telegram/content.rs:248`). The shell trusts that (`conversation/media.rs:117`), and then the magic-byte check rejects the SVG (`images.rs:182`). → stories.md: "anything tinychat cannot draw is one labelled line". Treat SVG, HEIC and PDF as File, or fall back to a file row when decoding fails.
+- **S1 · Conversation · SVG shows "Couldn't load image · Retry".** The adapters map any `image/*` MIME type to `MediaKind::Image` (`slack/message.rs:255`, `discord/content.rs:406`, `telegram/content.rs:248`). The shell trusts that (`conversation/media.rs:117`), and then the magic-byte check rejects the SVG (`images.rs:182`). → stories.md: "anything tinyclient cannot draw is one labelled line". Treat SVG, HEIC and PDF as File, or fall back to a file row when decoding fails.
 - **S1 · App · window closed on its own.** There is no panic hook, `catch_unwind` or `panic=` profile anywhere. A Rust panic inside a GPUI callback crosses AppKit's `extern "C"` boundary and aborts the whole process. A second path ends at the same "chatd is gone" screen: one poisoned `Mutex` in chatd (183 `lock().unwrap()`) panics every later request while the process stays alive. The riskiest sites are listed below.
 
 ## 1. Consistency across areas
@@ -62,7 +62,7 @@ fine when re-run one at a time, so the display was awake and the render was a ti
 
 - S1 · Modal · `confirm2` · The scrim dims only the conversation pane. The "Delete this message?" dialog overlaps the undimmed sidebar, so the sidebar stays bright and looks clickable. → §3 Modal: `scrim` over the whole window.
 - S1 · No daemon · `nodaemon` · The whole window is "chatd isn't running — Start it with `cargo run -p chatd`". The same screen replaces the UI whenever the socket drops mid-session (`state.rs:249` → `layout.rs:757-767`). The shell never starts chatd except from the call dock (`call.rs:289-319` `ensure_daemon`). → The shell launches chatd and keeps the last snapshot on screen behind a 06-live-signals banner ("Reconnecting…") while retrying.
-- S1 · Hung daemon · chatd binds its socket, then reads the keychain synchronously in `Chat::new` before accepting (`chatd/src/main.rs:23`, `server.rs:175-184`, `session.rs:31`). The shell's request sits in the backlog with no timeout (`client.rs:6-10`), so the window is a blank canvas with no words. → Accept first, answer `Status` with "Waiting for the keychain…"; the shell times out at about 3 s and says "tinychat is waiting for macOS to allow keychain access. Look for the prompt."
+- S1 · Hung daemon · chatd binds its socket, then reads the keychain synchronously in `Chat::new` before accepting (`chatd/src/main.rs:23`, `server.rs:175-184`, `session.rs:31`). The shell's request sits in the backlog with no timeout (`client.rs:6-10`), so the window is a blank canvas with no words. → Accept first, answer `Status` with "Waiting for the keychain…"; the shell times out at about 3 s and says "tinyclient is waiting for macOS to allow keychain access. Look for the prompt."
 - S1 · Data loss · A denied keychain prompt reads as "no session" (`session.rs:31` `.ok()?`), and then `forget_strangers` deletes that account's store and blobs (`server.rs:185,207-216`). → treat "denied" and "locked" as unknown, never as signed out.
 - S2 · Narrow window · `narrow2` (700 wide) · The sidebar hides itself and the empty state says "Pick a conversation" with no list on screen; `--open-first` opens nothing. → the sidebar floats on demand, or the empty state offers ⌘K / the sidebar toggle.
 - S2 · Reconnecting · `rec-inbox` · In the Inbox (a mixed list) a reconnecting Slack account is never mentioned (`sidebar.rs:1262` requires `!mixed`), and in Slack mode it appears only after 5 s. → 06-live-signals: the Inbox says which network is late.
@@ -84,18 +84,18 @@ fine when re-run one at a time, so the display was awake and the render was a ti
 
 ## 6. Copy
 
-- S1 · `layout.rs:763-764` · "chatd isn't running / Start it with `cargo run -p chatd`" is a developer instruction with code ticks. → "tinychat is starting…" / "Couldn't start tinychat's background service. [Try again]".
-- S2 · `signin.rs:227,445,483`, `conversation.rs:433` · "tinychat couldn't reach chatd", "chatd gave an answer tinychat did not expect", "chatd answered with something else". → never name chatd; say what to do.
+- S1 · `layout.rs:763-764` · "chatd isn't running / Start it with `cargo run -p chatd`" is a developer instruction with code ticks. → "tinyclient is starting…" / "Couldn't start tinyclient's background service. [Try again]".
+- S2 · `signin.rs:227,445,483`, `conversation.rs:433` · "tinyclient couldn't reach chatd", "chatd gave an answer tinyclient did not expect", "chatd answered with something else". → never name chatd; say what to do.
 - S2 · `composer.rs:560` · `format!("Not sent: unexpected {other:?}")` prints a Rust Debug value to the user.
 - S2 · `layout.rs:613` · "Show in its Space": "Space" is internal vocabulary. → "Show in Moss & Lichen" (the real name).
 - S2 · `att-inbox` · The 3-line "Discord wants you to verify your account. Open Discord, finish the check there, then come back." has no button. → a one-line banner + "Open Discord" action.
-- S3 · "tinychat can't use the microphone" (sentence starts lowercase); "Wants to be friends · @otis.b…" truncates the handle; "Return sets it."; "Online on 3 accounts".
+- S3 · "tinyclient can't use the microphone" (sentence starts lowercase); "Wants to be friends · @otis.b…" truncates the handle; "Return sets it."; "Online on 3 accounts".
 - S3 · The menu-add entries are inconsistent: "Add a Slack workspace" vs bare "Telegram / Sign in" and "Teams / Sign in" (first launch says "Microsoft Teams").
 - S3 · `menu-net` · The network menu is the account name + "Sign out" only; Sign out is the one action on offer and sits in red at rest.
 
 ## 7. Robustness
 
-- S1 · The shell has no panic containment (see above). → `panic = "abort"` is no worse, but a panic hook that writes `~/Library/Logs/tinychat/crash.log` and relaunches would make "closed on its own" diagnosable.
+- S1 · The shell has no panic containment (see above). → `panic = "abort"` is no worse, but a panic hook that writes `~/Library/Logs/tinyclient/crash.log` and relaunches would make "closed on its own" diagnosable.
 - S1 · `server.rs:1068,1076` · One `accept()` or thread-spawn error (for example running out of file descriptors) returns from `serve` and chatd exits.
 - S2 · Frames · `protocol/src/lib.rs:1051-1072` · Reads are capped at 1 MiB but writes are not. One page of 60 long Slack or code messages can exceed the cap, and callers drop the error silently (`state.rs:491,511,587`). A bad frame from the shell makes chatd drop the connection without an `Error` reply (`server.rs:1052`). → cap on write, and answer `Error::TooLarge`.
 - S2 · A shell and chatd on different versions (unknown serde variant) reads as "chatd isn't running".
@@ -115,7 +115,7 @@ fine when re-run one at a time, so the display was awake and the render was a ti
 
 - S1 · There is no menu bar at all: no `set_menus` anywhere. So there is no About, no Settings (⌘,), no Edit menu (Undo, Cut, Copy and Paste exist only as key bindings), no Window menu, no Hide (⌘H), Minimize (⌘M) or Close (⌘W). → 08-first-run-settings §menus.
 - S2 · Closing the window quits the app (`mod.rs:533`). → Ruling 11: closing keeps chatd receiving; the app stays in the Dock.
-- S2 · Window size and position are always centred at 1120×720 and not restored (`mod.rs:506-511`); there is no double-click-to-zoom on the drag strips (`layout.rs:38`); the title is the fixed "tinychat", not the conversation name.
+- S2 · Window size and position are always centred at 1120×720 and not restored (`mod.rs:506-511`); there is no double-click-to-zoom on the drag strips (`layout.rs:38`); the title is the fixed "tinyclient", not the conversation name.
 - S2 · No Reduce Motion: menus and toasts animate unconditionally (`overlay.rs:192`, `draw.rs:437`). → §2 Motion: durations 0. No Increase Contrast.
 - S2 · No accessibility labels; the GPUI revision exposes none, so VoiceOver reads nothing. Call it a known gap in the README rather than leave it silent.
 - S3 · Dark-only under a light system: traffic lights and the drag strip stay dark (by ruling 12; still worth a screenshot check).
@@ -127,14 +127,14 @@ fine when re-run one at a time, so the display was awake and the render was a ti
 
 1. `chatd/src/hub.rs:100`, `server.rs:71,152,199,236,948`: `lock().unwrap()` on the store and adapter maps. One panic while held poisons them and every later request panics.
 2. Shell-wide: no panic hook; any panic in `render` or a callback aborts across AppKit's FFI boundary.
-3. `tinychat/src/gui/conversation/rich.rs:360`: `text[range.clone()]` in `jumbo()`. A span with start > end on an emoji-only message (spans are never validated in `protocol/src/message.rs:399`).
-4. `tinychat/src/gui/input.rs:666`: `self.editor.text()[range]`. An IME or Dictation range with start > end; `composer/edit.rs:534-548` clamps the length but not the order.
+3. `tinyclient/src/gui/conversation/rich.rs:360`: `text[range.clone()]` in `jumbo()`. A span with start > end on an emoji-only message (spans are never validated in `protocol/src/message.rs:399`).
+4. `tinyclient/src/gui/input.rs:666`: `self.editor.text()[range]`. An IME or Dictation range with start > end; `composer/edit.rs:534-548` clamps the length but not the order.
 5. `chatd/src/server.rs:1068,1076`: `conn?` / spawn `?` ends `serve`, so chatd exits.
-6. `tinychat/src/gui/mod.rs:529`: `.expect("the window opens")` at launch (no Metal device, headless session).
+6. `tinyclient/src/gui/mod.rs:529`: `.expect("the window opens")` at launch (no Metal device, headless session).
 7. `chatd/src/adapters/teams/html.rs:483`: `self.out.text[start..]`. It is safe only while nothing rewrites earlier text; fragile under edits.
-8. `tinychat/src/gui/conversation/pages.rs:91,108`: `messages[..before]`, `messages[len-after..]`. In range by construction (`:82`) today; one change to `merge` breaks that.
-9. `tinychat/src/gui/sidebar/rank.rs:18-21`: `wanted.len() - 1`, guarded only by the `is_empty` check at `:10`.
-10. `tinychat/src/gui/sidebar.rs:1164`: `unreachable!`, guarded at `:1206`. The adapters' slicing (`slack/text.rs:332`, `discord/content.rs:134-297`, `telegram/content.rs:87`) was checked and is bounded.
+8. `tinyclient/src/gui/conversation/pages.rs:91,108`: `messages[..before]`, `messages[len-after..]`. In range by construction (`:82`) today; one change to `merge` breaks that.
+9. `tinyclient/src/gui/sidebar/rank.rs:18-21`: `wanted.len() - 1`, guarded only by the `is_empty` check at `:10`.
+10. `tinyclient/src/gui/sidebar.rs:1164`: `unreachable!`, guarded at `:1206`. The adapters' slicing (`slack/text.rs:332`, `discord/content.rs:134-297`, `telegram/content.rs:87`) was checked and is bounded.
 
 ## What would most change the first impression in one day
 

@@ -79,6 +79,10 @@ impl Slack {
         // The topic is what Slack shows in the header; the purpose stands in when there is none.
         row.topic = said("topic").or(said("purpose")).unwrap_or("").to_owned();
         row.private = channel["is_private"] == true;
+        // Slack Connect: shared with another organization.
+        if channel["is_ext_shared"] == true {
+            row.mark = Some(protocol::Mark::External);
+        }
         // Unverified: `is_read_only` is the documented flag; a channel only some may post in
         // (`posting_restricted_to`) is not told apart from one I may post in.
         row.read_only = ["is_read_only", "is_archived", "is_frozen"].iter().any(|flag| channel[*flag] == true);
@@ -99,6 +103,9 @@ impl Slack {
             root: known.root.clone(),
             read_only: known.read_only,
             private: known.private,
+            bot: known.bot,
+            special: known.special,
+            mark: known.mark,
             ..ConversationRow::new(&known.key.id, known.kind, &known.title)
         }
     }
@@ -262,6 +269,9 @@ impl Slack {
         // is what `client.counts` reports (unverified: taken from what the web client draws).
         let open: HashSet<&str> = listed("ims").chain(listed("mpims")).collect();
         let sections = self.sections();
+        // The mutes and the sidebar's "unreads only" are in the same prefs, read once here.
+        let prefs = self.prefs()?;
+        let unread_only = matches!(prefs["sidebar_behavior"].as_str(), Some("hide_read_channels" | "hide_read_channels_unless_starred"));
         let default = |kind: &str| sections.iter().find(|section| section.kind == kind).map(|section| section.id.clone());
         self.ctx.set_note("group:channel", &default("channels").unwrap_or_default());
         self.ctx.set_note("group:directs", DIRECTS);
@@ -332,7 +342,10 @@ impl Slack {
             .iter()
             .enumerate()
             .filter(|(_, section)| used(&section.id))
-            .map(|(position, section)| Group::new(&section.id, &section.name, position as i32))
+            .map(|(position, section)| Group {
+                unread_only,
+                ..Group::new(&section.id, &section.name, position as i32)
+            })
             .collect();
         if used(DIRECTS) {
             groups.push(Group {
@@ -353,8 +366,9 @@ impl Slack {
             state.tree = Some(Instant::now());
         }
         self.keep_partners();
+        self.tell_partners();
         self.ctx.set_note("tree", "1");
-        self.mutes()?;
+        self.apply_mutes(&prefs)?;
         self.apply_counts(&counts)
     }
 
@@ -362,6 +376,16 @@ impl Slack {
     pub(super) fn resync(&self) -> Result<(), Failure> {
         let counts = self.api("client.counts", &[])?;
         self.mutes()?;
+        // The rows are the cache's and now current: opening the Space soon asks nothing more.
+        self.state().tree = Some(Instant::now());
+        self.apply_counts(&counts)
+    }
+
+    /// The Space opened again, its sidebar long read: only the unread state, one
+    /// `client.counts`. The rows and mutes are kept current by the socket.
+    pub(super) fn recount(&self) -> Result<(), Failure> {
+        let counts = self.api("client.counts", &[])?;
+        self.state().tree = Some(Instant::now());
         self.apply_counts(&counts)
     }
 
@@ -409,21 +433,33 @@ impl Slack {
         Ok(())
     }
 
+    /// The user's prefs: the mutes, and how the sidebar shows read channels. Null when Slack
+    /// would not say: they are a refinement, and the sidebar is not held up for them.
+    fn prefs(&self) -> Result<Value, Failure> {
+        match self.api("users.prefs.get", &[]) {
+            Ok(mut prefs) => Ok(prefs["prefs"].take()),
+            Err(fault) => match Failure::from(fault) {
+                failure @ Failure::SignedOut(_) => Err(failure),
+                Failure::Dropped(_) => Ok(Value::Null),
+            },
+        }
+    }
+
     /// The channels the user muted in Slack. Unverified for this kind of session:
     /// `users.prefs.get` and its `muted_channels` list are the documented user-token forms.
+    ///
+    /// Unverified: `sidebar_behavior` ("hide_read_channels") as the pref behind Slack's "show
+    /// unreads only"; no per-section setting was found in any client, so it applies to every
+    /// channel section, and is read when the sidebar is.
     fn mutes(&self) -> Result<(), Failure> {
-        let prefs = match self.api("users.prefs.get", &[]) {
-            Ok(prefs) => prefs,
-            Err(fault) => {
-                let failure = Failure::from(fault);
-                return match failure {
-                    Failure::SignedOut(_) => Err(failure),
-                    // Mutes are a refinement; the sidebar is not held up for them.
-                    Failure::Dropped(_) => Ok(()),
-                };
-            }
-        };
-        let prefs = &prefs["prefs"];
+        let prefs = self.prefs()?;
+        self.apply_mutes(&prefs)
+    }
+
+    fn apply_mutes(&self, prefs: &Value) -> Result<(), Failure> {
+        if prefs.is_null() {
+            return Ok(());
+        }
         self.muted("muted_channels", &prefs["muted_channels"])?;
         if prefs["muted_channels"].is_null() {
             self.muted("all_notifications_prefs", &prefs["all_notifications_prefs"])?;

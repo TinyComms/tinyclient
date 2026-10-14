@@ -116,12 +116,10 @@ impl Names for Slack {
         self.ctx.note(&note)
     }
 
+    /// A custom emoji as the workspace's list names it. A message arriving never asks for the
+    /// list (`emoji.list`): only the picker does (`info.rs`), and until then the name shows.
     fn custom(&self, name: &str) -> Option<Custom> {
-        let note = format!("e:{name}");
-        let known = self.ctx.note(&note).or_else(|| {
-            self.list_emoji();
-            self.ctx.note(&note)
-        })?;
+        let known = self.ctx.note(&format!("e:{name}"))?;
         if let Some(emoji) = known.strip_prefix('=') {
             return Some(Custom::Unicode(emoji.to_owned()));
         }
@@ -134,9 +132,9 @@ impl Names for Slack {
 }
 
 impl Slack {
-    /// The workspace's custom emoji, written to the store once a day at most and only when a
-    /// message first uses a name that is not a standard one. Nothing of it stays in memory.
-    fn list_emoji(&self) {
+    /// The workspace's custom emoji, written to the store once a day at most and only when the
+    /// picker asks for them. Nothing of it stays in memory.
+    pub(super) fn list_emoji(&self) {
         let now = crate::hub::now();
         let listed = self.ctx.note("emoji").and_then(|at| at.parse::<i64>().ok());
         if listed.is_some_and(|at| now - at < 86_400) {
@@ -149,6 +147,10 @@ impl Slack {
         let Some(all) = list["emoji"].as_object() else {
             return;
         };
+        // The names, for the picker: one note, not one read per emoji.
+        let mut names: Vec<&str> = all.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        self.ctx.set_note("emoji:names", &names.join(","));
         for (name, value) in all {
             let mut value = value.as_str().unwrap_or("");
             // `alias:other` names another custom emoji or a standard one.
@@ -177,6 +179,10 @@ impl Slack {
                 let (name, value) = (event["name"].as_str().unwrap_or(""), event["value"].as_str().unwrap_or(""));
                 if !name.is_empty() && self.hosted(value) {
                     self.ctx.set_note(&format!("e:{name}"), value);
+                    let names = self.ctx.note("emoji:names").unwrap_or_default();
+                    if !names.split(',').any(|known| known == name) {
+                        self.ctx.set_note("emoji:names", &format!("{names},{name}"));
+                    }
                 }
             }
             Some("remove") => {
@@ -564,7 +570,7 @@ impl Slack {
             MessageKind::Normal
         } else if empty {
             // Never blank, never dropped: one line and the way to the real thing.
-            let what = if rich.undrawn { "An interactive message" } else { "A message tinychat cannot show yet" };
+            let what = if rich.undrawn { "An interactive message" } else { "A message tinyclient cannot show yet" };
             rich.text = format!("{what} from {}", sender.name);
             MessageKind::Unsupported { link }
         } else if system || event["room"].is_object() {

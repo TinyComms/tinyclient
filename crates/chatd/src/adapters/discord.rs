@@ -12,14 +12,18 @@
 mod content;
 mod events;
 mod gateway;
+mod info;
 mod members;
 mod model;
+mod picker;
 mod proto;
 mod ready;
 mod rest;
+mod send;
 mod voice;
 
-use super::{serve_commands, keep_connected, About, Command, Context, Download, Failure, Refusal, Reply, Signed};
+use super::{serve_commands, keep_connected, Command, Context, Download, Failure, Refusal, Reply, Signed};
+use crate::blobs::upload;
 use crate::store::ConversationRow;
 use base64::Engine;
 use content::{Files, Names, Place};
@@ -63,6 +67,25 @@ struct Quiet {
     suppress_everyone: bool,
     suppress_roles: bool,
     channels: HashMap<String, i64>,
+    /// "Hide muted channels", as the user set it for the server.
+    hide_muted: bool,
+    /// "Show all channels" is off: only what is opted in shows.
+    opt_in: bool,
+    /// Channels and categories opted in.
+    opted_in: HashSet<String>,
+    /// The server's notification level (0 all, 1 mentions, 2 nothing), and the channels and
+    /// categories that set their own.
+    level: u8,
+    levels: HashMap<String, u8>,
+}
+
+/// One of a server's custom emoji or stickers, kept for the picker: about 40 bytes each.
+struct Pickable {
+    id: String,
+    name: String,
+    animated: bool,
+    /// A sticker's format; 0 for an emoji.
+    format: u8,
 }
 
 struct RoleInfo {
@@ -88,6 +111,10 @@ struct GuildInfo {
     /// themselves are in the store.
     channels: Vec<(u64, u64)>,
     quiet: Quiet,
+    /// Our own nickname there.
+    nick: String,
+    emojis: Vec<Pickable>,
+    stickers: Vec<Pickable>,
 }
 
 /// The gateway session, to resume it after a dropped socket.
@@ -136,7 +163,31 @@ struct State {
     renewing: Vec<(String, String, Reply<Download>)>,
     /// The last addresses renewed, old to fresh.
     renewed: HashMap<String, String>,
+    /// Our plan (`premium_type`), which says what may be sent.
+    premium: u8,
+    /// Friends' status emoji and what they are doing, as their presence last said, so a voice
+    /// state can be told beside it.
+    doing: HashMap<String, (String, Option<protocol::Activity>)>,
+    /// When the last profile was asked for: the route is watched, so one per 3 s at most.
+    profiled: Option<Instant>,
+    /// How many profiles have been asked for: one still waiting its turn that is not the newest
+    /// was superseded, and is dropped rather than sent (`info.rs`).
+    profile_asked: u64,
+    /// Per channel, the read acknowledgement last sent and the newest one held back since
+    /// (`mark_read`): one per channel per [`ACK_EVERY`].
+    acks: HashMap<String, Ack>,
 }
+
+/// One channel's read acknowledgements.
+#[derive(Default)]
+struct Ack {
+    sent: Option<Instant>,
+    /// The newest message read since `sent`, sent when the 3 s are up.
+    held: Option<String>,
+}
+
+/// Read acknowledgements to one channel are at most this often; the newest goes.
+const ACK_EVERY: Duration = Duration::from_secs(3);
 
 /// Frames the command thread wants sent, and a local socket pair that wakes the socket thread.
 struct Outbox {
@@ -203,7 +254,24 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
     let socket = discord.clone();
     std::thread::spawn(move || keep_connected(&socket.ctx, || socket.connect()));
     std::thread::spawn(move || {
-        serve_commands(&discord.ctx, inbox, PACE, |id| discord.backfill(id), |command| discord.command(command))
+        // A send with files uploads on a thread of its own, so the commands behind it (its own
+        // cancel among them) are not held up for as long as the upload takes.
+        let other = |command| match command {
+            Command::SendWith { conversation_id, client_id, text, reply_to, with } => {
+                discord.asked();
+                let sending = discord.clone();
+                let (channel, client) = (conversation_id.clone(), client_id.clone());
+                upload::spawn(&discord.ctx, &conversation_id, &client_id, &with.files.clone(), move |up| {
+                    sending.send_with(&channel, &client, &text, reply_to.as_deref(), &with, up)
+                });
+            }
+            // A profile waits its turn (one per 3 s) on a thread of its own, so a send behind it
+            // is never held up, and one superseded while it waits is dropped.
+            Command::Profile { person_id, reply } => Discord::profile_queued(&discord, person_id, None, reply),
+            Command::ProfileIn { person_id, space_id, reply } => Discord::profile_queued(&discord, person_id, Some(space_id), reply),
+            command => discord.command(command),
+        };
+        serve_commands(&discord.ctx, inbox, PACE, |id| discord.backfill(id), other)
     });
     Ok(())
 }
@@ -226,11 +294,11 @@ impl Names for Lookup<'_> {
             let nick = user.member.as_ref().and_then(|member| member.nick.clone());
             return Some(nick.filter(|nick| !nick.is_empty()).unwrap_or_else(|| user.name().to_owned()));
         }
-        self.discord.state.lock().unwrap().users.get(id).cloned()
+        crate::hub::lock(&self.discord.state).users.get(id).cloned()
     }
 
     fn role(&self, id: &str) -> Option<String> {
-        let state = self.discord.state.lock().unwrap();
+        let state = crate::hub::lock(&self.discord.state);
         let guild = state.guilds.get(self.guild?)?;
         guild.roles.get(&number(id)).map(|role| role.name.clone())
     }
@@ -240,7 +308,7 @@ impl Names for Lookup<'_> {
     }
 
     fn space(&self, id: &str) -> Option<String> {
-        self.discord.state.lock().unwrap().guilds.get(id).map(|guild| guild.name.clone())
+        crate::hub::lock(&self.discord.state).guilds.get(id).map(|guild| guild.name.clone())
     }
 }
 
@@ -274,7 +342,7 @@ impl Discord {
     }
 
     fn me(&self) -> String {
-        self.state.lock().unwrap().me.clone()
+        crate::hub::lock(&self.state).me.clone()
     }
 
     /// A request, with the socket thread woken when it shows the session is over.
@@ -296,7 +364,7 @@ impl Discord {
         };
         // Outside a server a friend goes by the nickname the user gave them.
         let author = posted.author.as_ref().filter(|_| guild.is_none() && posted.webhook_id.is_none());
-        let author = author.and_then(|author| self.state.lock().unwrap().users.get(&author.id).cloned());
+        let author = author.and_then(|author| crate::hub::lock(&self.state).users.get(&author.id).cloned());
         let place = Place {
             account: &self.ctx.account,
             me: &me,
@@ -319,7 +387,7 @@ impl Discord {
         if kind == ConversationKind::Direct {
             return false;
         }
-        let state = self.state.lock().unwrap();
+        let state = crate::hub::lock(&self.state);
         let Some(info) = guild.and_then(|guild| state.guilds.get(guild)) else {
             return named || posted.mention_everyone;
         };
@@ -351,7 +419,7 @@ impl Discord {
 
     /// Remembers that the messages `from..=to` of a conversation are stored whole.
     fn cover(&self, channel: &str, from: u64, to: u64) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = crate::hub::lock(&self.state);
         if state.covered.len() >= COVERED && !state.covered.contains_key(channel) {
             state.covered.clear();
         }
@@ -373,7 +441,7 @@ impl Discord {
     /// True when what follows message `after` is already stored: it lies inside a stretch
     /// fetched in this session, short of its end.
     fn covered_after(&self, channel: &str, after: u64) -> bool {
-        let state = self.state.lock().unwrap();
+        let state = crate::hub::lock(&self.state);
         let stretches = state.covered.get(channel);
         stretches.is_some_and(|stretches| stretches.iter().any(|(from, to)| *from <= after && after < *to))
     }
@@ -462,7 +530,7 @@ impl Discord {
 
     fn backfill(&self, channel: &str) {
         // Warming is nobody's click, so it does not run at a machine's pace.
-        if self.state.lock().unwrap().warming.remove(channel) {
+        if crate::hub::lock(&self.state).warming.remove(channel) {
             std::thread::sleep(jitter(400, 2500));
         } else {
             self.asked();
@@ -505,7 +573,7 @@ impl Discord {
             // CONTRACT: `:name:` says which custom emoji only while it is on the message. One
             // that is not there has to come as its file's id.
             let Some(id) = id.as_deref().and_then(|id| id.strip_prefix("emoji:")) else {
-                return Err(Refusal::Refused("That emoji is not on the message, so tinychat cannot tell Discord which one it is.".to_owned()));
+                return Err(Refusal::Refused("That emoji is not on the message, so tinyclient cannot tell Discord which one it is.".to_owned()));
             };
             let name = known.map_or_else(|| "emoji".to_owned(), |reaction| reaction.emoji.trim_matches(':').to_owned());
             format!("{name}:{id}")
@@ -558,7 +626,7 @@ impl Discord {
         let context = context(location);
         self.rest.call_with(method, &path, body, &[("X-Context-Properties", &context)]).map_err(refusal)?;
         {
-            let mut state = self.state.lock().unwrap();
+            let mut state = crate::hub::lock(&self.state);
             match becomes {
                 Relation::None => {
                     state.relations.remove(person);
@@ -585,7 +653,7 @@ impl Discord {
             Presence::Online | Presence::Unknown | Presence::Busy => "online",
         };
         let (kept, text) = {
-            let state = self.state.lock().unwrap();
+            let state = crate::hub::lock(&self.state);
             (state.status_settings.clone(), status.clone().unwrap_or_else(|| state.own.1.clone()))
         };
         let settings = proto::with_status(&kept, word, status.as_deref());
@@ -597,7 +665,7 @@ impl Discord {
         };
         self.tell(3, json!({"status": word, "since": 0, "activities": custom, "afk": false}));
         {
-            let mut state = self.state.lock().unwrap();
+            let mut state = crate::hub::lock(&self.state);
             state.status_settings = settings;
             state.own = (presence, text.clone());
         }
@@ -605,41 +673,44 @@ impl Discord {
         Ok(())
     }
 
-    /// One person's card: their own words and the servers we share. Discord does not tell a
-    /// time zone. The profile card draws the picture at 80 points, so its larger sizes are
-    /// registered here, for this one person, rather than for everyone ever seen.
-    ///
-    /// The query is the web client's as the community documents it, unconfirmed.
-    fn profile(&self, person: &str) -> Result<About, Refusal> {
-        let path = format!(
-            "/users/{person}/profile?type=popout&with_mutual_guilds=true&with_mutual_friends=false&with_mutual_friends_count=false"
-        );
-        let answer = self.call("GET", &path, None).map_err(refusal)?;
-        let profile: model::Profile = serde_json::from_str(&answer).map_err(|err| Refusal::Refused(err.to_string()))?;
-        if let Some(user) = &profile.user {
-            let (file, url) = user.avatar();
-            let sizes = model::avatar_variants(&file.id);
-            let id = file.id.clone();
-            let registered = self.ctx.media(&[(file, url)]);
-            if let (Ok(()), Some(sizes)) = (registered, sizes) {
-                let _ = self.ctx.media_variants(&id, &sizes);
-            }
-        }
-        let state = self.state.lock().unwrap();
-        let shared = profile.mutual_guilds.iter().filter_map(|guild| state.guilds.get(&guild.id));
-        Ok(About {
-            bio: profile.bio(),
-            mutual_spaces: shared.map(|guild| guild.name.clone()).take(protocol::MUTUAL_SPACES).collect(),
-            time_zone: String::new(),
-            utc_offset: None,
-            // An id carries the moment it was made: the day they joined Discord.
-            since: Some(model::seconds(person)).filter(|since| *since > 1_420_070_400),
-            ..About::default()
-        })
-    }
-
+    /// Acknowledges reading up to `message`. At most one per channel per [`ACK_EVERY`]: a read
+    /// inside that time is held, and the newest held one is sent when the time is up, once.
     fn mark_read(&self, channel: &str, message: &str) {
-        let token = self.state.lock().unwrap().ack_token.clone();
+        // Opening a message request reads nothing on Discord: its sender is not told.
+        let request = self.ctx.known(channel).ok().flatten().is_some_and(|row| row.special == protocol::Special::Request);
+        if request {
+            return;
+        }
+        let message = {
+            let mut state = crate::hub::lock(&self.state);
+            // Only channels inside their 3 s are worth keeping.
+            if state.acks.len() > 256 {
+                state.acks.retain(|_, ack| ack.held.is_some() || ack.sent.is_some_and(|at| at.elapsed() < ACK_EVERY));
+            }
+            let ack = state.acks.entry(channel.to_owned()).or_default();
+            let first = ack.held.is_none();
+            let newest = match ack.held.take() {
+                Some(held) if number(&held) > number(message) => held,
+                _ => message.to_owned(),
+            };
+            if let Some(left) = ack.sent.map(|at| ACK_EVERY.saturating_sub(at.elapsed())).filter(|left| !left.is_zero()) {
+                // The first read held in this window sends the newest when the window ends.
+                ack.held = Some(newest.clone());
+                if first {
+                    let (ctx, channel) = (self.ctx.clone(), channel.to_owned());
+                    let _ = std::thread::Builder::new().name("discord-ack".into()).stack_size(64 * 1024).spawn(move || {
+                        if !ctx.pause(left) {
+                            let _ = ctx.commands.send(Command::MarkRead { conversation_id: channel, message_id: newest });
+                        }
+                    });
+                }
+                return;
+            }
+            ack.sent = Some(Instant::now());
+            newest
+        };
+        let message = message.as_str();
+        let token = crate::hub::lock(&self.state).ack_token.clone();
         // `last_viewed` is the day, counted from Discord's epoch, as the web client sends it.
         // Unconfirmed against a real account.
         let day = (crate::hub::now() - 1_420_070_400) / 86_400;
@@ -647,7 +718,7 @@ impl Discord {
         match self.call("POST", &format!("/channels/{channel}/messages/{message}/ack"), Some(body)) {
             Ok(text) => {
                 let answer: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-                self.state.lock().unwrap().ack_token = answer["token"].as_str().map(str::to_owned);
+                crate::hub::lock(&self.state).ack_token = answer["token"].as_str().map(str::to_owned);
             }
             Err(refused) => self.log("mark read", refused),
         }
@@ -686,7 +757,7 @@ impl Discord {
 
     fn typing(&self, channel: &str) {
         {
-            let mut state = self.state.lock().unwrap();
+            let mut state = crate::hub::lock(&self.state);
             if state.typed.get(channel).is_some_and(|at| at.elapsed() < TYPING_EVERY) {
                 return;
             }
@@ -701,7 +772,7 @@ impl Discord {
     /// The direct conversation with a person. One request, and only when the user asked: opening
     /// conversations is something Discord watches.
     fn start_direct(&self, person: &str) -> Result<String, Refusal> {
-        if let Some(known) = self.state.lock().unwrap().directs.get(person) {
+        if let Some(known) = crate::hub::lock(&self.state).directs.get(person) {
             return Ok(known.clone());
         }
         let refuse = |why: String| Refusal::Refused(why);
@@ -731,12 +802,12 @@ impl Discord {
         }
         // Asked about twice (two fetches renewing at once each name the other's file): the
         // answer Discord already gave is given again.
-        let renewed = self.state.lock().unwrap().renewed.get(&url).cloned();
+        let renewed = crate::hub::lock(&self.state).renewed.get(&url).cloned();
         if let Some(fresh) = renewed {
             return answer(reply, Ok(self.from(fresh)));
         }
         let first = {
-            let mut state = self.state.lock().unwrap();
+            let mut state = crate::hub::lock(&self.state);
             state.renewing.push((id, url, reply));
             state.renewing.len() == 1
         };
@@ -764,7 +835,7 @@ impl Discord {
     /// A resized picture's address is the attachment's with our own size appended
     /// (`content::resized`): Discord is asked about the attachment's, and the size goes back on.
     fn renew(&self) {
-        let waiting = std::mem::take(&mut self.state.lock().unwrap().renewing);
+        let waiting = std::mem::take(&mut crate::hub::lock(&self.state).renewing);
         let plain = |url: &str| -> (String, String) {
             let cut = url.find("&format=webp&width=").or_else(|| url.find("?format=webp&width="));
             cut.map_or_else(|| (url.to_owned(), String::new()), |cut| (url[..cut].to_owned(), url[cut + 1..].to_owned()))
@@ -794,7 +865,7 @@ impl Discord {
                         if let Err(err) = self.ctx.media_refreshed(id, &fresh) {
                             self.log("media", err);
                         }
-                        let mut state = self.state.lock().unwrap();
+                        let mut state = crate::hub::lock(&self.state);
                         if state.renewed.len() >= 4 * RENEWED_TOGETHER {
                             state.renewed.clear();
                         }
@@ -857,7 +928,7 @@ impl Discord {
             Command::HistoryAround { conversation_id, around } => {
                 let at = number(&around);
                 let inside = {
-                    let state = self.state.lock().unwrap();
+                    let state = crate::hub::lock(&self.state);
                     let stretches = state.covered.get(&conversation_id);
                     stretches.is_some_and(|stretches| stretches.iter().any(|(from, to)| (*from..=*to).contains(&at)))
                 };
@@ -883,7 +954,24 @@ impl Discord {
             Command::Delete { conversation_id, message_id, reply } => answer(reply, self.delete(&conversation_id, &message_id)),
             Command::Relate { person_id, action, reply } => answer(reply, self.relate(&person_id, action)),
             Command::SetPresence { presence, status, reply } => answer(reply, self.set_presence(presence, status)),
-            Command::Profile { person_id, reply } => answer(reply, self.profile(&person_id)),
+            Command::Profile { person_id, reply } => answer(reply, self.profile(&person_id, None)),
+            Command::ProfileIn { person_id, space_id, reply } => answer(reply, self.profile(&person_id, Some(&space_id))),
+            Command::ConversationInfo { conversation_id, reply } => answer(reply, self.conversation_info(&conversation_id)),
+            Command::SpaceInfo { space_id, reply } => answer(reply, self.space_info(&space_id)),
+            Command::SetMute { conversation_id, notify, reply } => answer(reply, self.set_mute(&conversation_id, notify)),
+            Command::Leave { conversation_id, reply } => answer(reply, self.leave(&conversation_id, false)),
+            Command::CloseDirect { conversation_id, reply } => answer(reply, self.leave(&conversation_id, true)),
+            Command::Pinned { conversation_id, reply } => answer(reply, self.pinned(&conversation_id)),
+            Command::SearchShared { conversation_id, kind, before, limit, reply } => {
+                answer(reply, self.search_shared(&conversation_id, kind, before.as_deref(), limit))
+            }
+            Command::Catalog { kind, space_id, query, cursor, reply } => {
+                answer(reply, self.catalog(kind, space_id.as_deref(), &query, cursor.as_deref()))
+            }
+            Command::CancelSend { client_id, .. } => upload::cancel(&self.ctx.account, &client_id),
+            // Never: a fetch per DM is the burst that flags accounts. chatd does not send it,
+            // and it is refused here too should it ever arrive.
+            Command::Previews(_) => {}
             Command::Typing(conversation_id) => self.typing(&conversation_id),
             Command::Watch(watching) => {
                 self.watch(&watching);

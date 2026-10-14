@@ -4,7 +4,7 @@ Read 2026-10-13 from `adapters/teams*`, `gui/sidebar*`, `gui/people*` and shots 
 (the demo has no Teams account). **[U]** = not seen on a real tenant. Teams' own client (May 2025
 "new chat and channels experience") has one Chat view: **Favorites**, **Chats** by recency, **Teams
 and channels** in the user's order; filters Unread / Chats / Channels / Meeting chats; an @mentions
-view; custom sections. tinychat follows that shape, with the departures marked below.
+view; custom sections. tinyclient follows that shape, with the departures marked below.
 
 ## 1. What a Teams account looks like today, and what is wrong
 
@@ -30,7 +30,7 @@ Teams home has no chat section (`load_directs` drops rows with a Space) and list
    group and the `CONTRACT` in `tree.rs` go. Free on the wire.
 2. **One list in Teams' order:** `Pinned` (if any) → `Chats` → `Teams`. The home's direct section is
    titled per network ("Chats" on Teams). Pinned = Teams' own pins if the list carries them [U],
-   else tinychat's star; one section either way.
+   else tinyclient's star; one section either way.
 3. **Chats**: 48 px two-line rows (as the Inbox), by recency. Shown: unread, draft, or active in 7
    days, at least 8, then `Show n more`. Chats never collapse.
 4. **Meetings**: a collapsed group closing Chats, holding meeting chats silent for 14 days; a new
@@ -105,7 +105,7 @@ Teams`. Fields Teams lacks (banner, mutual servers, pronouns) are absent, never 
 ## 8. Things multi-network clients get wrong on Teams
 
 - **Importance** (`properties.importance`, not read today): red `!`/"URGENT" on message and row;
-  Teams repeats urgent alerts, tinychat notifies once and keeps the row marked until read.
+  Teams repeats urgent alerts, tinyclient notifies once and keeps the row marked until read.
 - **"Seen"** under my last message in 1:1 and small chats (04 R5); never in channels.
 - **Cards, Loop, recaps, calls:** one labelled line + `Open in Teams` (Card: title · Loop component ·
   Meeting recording); `Event/Call` is a system row ("Call · 2 min", red "Missed call").
@@ -132,7 +132,7 @@ Teams`. Fields Teams lacks (banner, mutual servers, pronouns) are absent, never 
 | T3 | P0 | A Workflows or Power Automate chat is titled with the app's name. | `28:` partner chat titled by `fetchShortProfile`, row has `bot`. |
 | T4 | P0 | Old meeting chats are out of the way but findable. | A meeting chat silent 15 days is under collapsed `Meetings`; a new message moves it to Chats; ⌘K finds both. |
 | T5 | P0 | The right pane follows me: profile of the 1:1 partner, nothing stale. | Open chat B after A with profile docked: pane shows B's partner; open a channel: pane closes unless a thread of it is open. |
-| T6 | P0 | Mentions I got while tinychat was closed are in Mentions. | Mention while chatd stopped; start: Mentions count ≥1 from `48:notifications`. |
+| T6 | P0 | Mentions I got while tinyclient was closed are in Mentions. | Mention while chatd stopped; start: Mentions count ≥1 from `48:notifications`. |
 | T7 | P1 | A colleague in a meeting shows red and "In a meeting", not do-not-disturb. | `availability: Busy, activity: InAMeeting`: Busy shape, status "In a meeting" even with a note. |
 | T8 | P1 | Threads under a channel are named by their post. | Chain rows titled by subject or first words; ≤3; never "Replies in". |
 | T9 | P1 | I see which tenant a chat is in when I have two. | Two Teams accounts: home labels per tenant; Inbox rows say `Tenant ›`. |
@@ -148,7 +148,7 @@ Teams`. Fields Teams lacks (banner, mutual servers, pronouns) are absent, never 
    (all by recency, with a filter)?
 2. `Presence::Busy` as a fifth state in the protocol (recommended), or keep four and say "Busy" only
    in words?
-3. Hidden chats: stay hidden in tinychat even when a new message arrives, or unhide as Teams does?
+3. Hidden chats: stay hidden in tinyclient even when a new message arrives, or unhide as Teams does?
 4. Reading `48:notifications` (Teams' own Activity stream) to recover offline mentions: acceptable,
    given it is one more conversation the official client also reads?
 

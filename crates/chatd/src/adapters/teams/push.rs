@@ -19,8 +19,6 @@ const PING: Duration = Duration::from_secs(30);
 /// How long a registration lasts, in seconds, and how long before its end it is made again.
 const REGISTERED: u64 = 86_400;
 const RENEW: Duration = Duration::from_secs(REGISTERED - 600);
-/// Presence of what is on screen is asked again every this many pings.
-const PRESENCE_EVERY: u32 = 4;
 /// The largest event body unpacked.
 const BODY: usize = 4 * 1024 * 1024;
 
@@ -32,7 +30,6 @@ pub(super) struct Push {
     endpoint: String,
     sent: u64,
     pinged: Instant,
-    pings: u32,
     registered: Option<Instant>,
 }
 
@@ -138,13 +135,13 @@ impl Teams {
             endpoint,
             sent: 0,
             pinged: Instant::now(),
-            pings: 0,
             registered: None,
         })
     }
 
-    /// Reads one frame if there is one, and sends what is due: the ping, a registration near
-    /// its end, and a fresh look at the presence of whoever is on screen.
+    /// Reads one frame if there is one, and sends what is due: the ping and a registration near
+    /// its end. Presence is never asked on a timer: it comes pushed, or when the shell starts
+    /// watching someone (`Command::Watch`).
     pub(super) fn pump(&self, push: &mut Push) -> Result<(), Failure> {
         if let Some(frame) = push.socket.read()? {
             self.frame(push, &frame)?;
@@ -153,13 +150,6 @@ impl Teams {
             push.sent += 1;
             push.socket.send(format!("5:{}+::{{\"name\":\"ping\"}}", push.sent))?;
             push.pinged = Instant::now();
-            push.pings += 1;
-            // The shell's watch lapses without telling anyone, and presence is not pushed here.
-            let watching = self.ctx.watching();
-            let ours = watching.people.iter().any(|person| person.account() == self.ctx.account);
-            if push.pings.is_multiple_of(PRESENCE_EVERY) && ours {
-                let _ = self.ctx.commands.send(Command::Watch(watching));
-            }
         }
         if push.registered.is_some_and(|at| at.elapsed() > RENEW) {
             self.register(push)?;

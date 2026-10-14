@@ -55,7 +55,7 @@ recording stays out of v1.
     AVFoundation. Animated stickers never play. Everything previewed lives on disk and is deleted
     when the picker closes.
 11. **Server-side only.** Silent and scheduled sends (when they exist) are flags the network
-    carries out. tinychat never runs a timer that sends.
+    carries out. tinyclient never runs a timer that sends.
 
 ## 3. Per network
 
@@ -107,7 +107,7 @@ recording stays out of v1.
   shows "This notifies 1,204 people in #general. Return again to send." in `warning`. Esc returns
   to editing.
 - Someone not in the channel completes ranked last, with the note "not in #ops". After sending,
-  the caption says they were not notified. No invite from tinychat.
+  the caption says they were not notified. No invite from tinyclient.
 - `:` completion never opens inside a link or after a digit (10:30), and only one list is open at
   a time.
 

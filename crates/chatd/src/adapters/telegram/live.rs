@@ -3,7 +3,7 @@
 use super::content::{self, Mapped};
 use super::peers::{thread_id, Who};
 use super::sync::{self, conversation_of, ensure_row, finish};
-use super::{presence, Account, TYPING_SHOWN};
+use super::{filing, presence, Account, Options, TYPING_SHOWN};
 use grammers_tl_types as tl;
 use protocol::Message;
 use std::collections::HashMap;
@@ -76,6 +76,9 @@ fn read(account: &Account, conversation: &str, max_id: i32, unread: i32) {
     // unread there are none, otherwise what was known stands.
     let mentions = if unread == 0 { 0 } else { row.mentions.min(unread) };
     let _ = account.ctx.counts(conversation, unread, mentions, Some(&max_id.to_string()), row.updated);
+    if let Some((who, None)) = Who::parse(conversation) {
+        filing::facts_changed(account, who, |facts| facts.read = unread == 0);
+    }
 }
 
 fn reactions(account: &Account, conversation: &str, message: i32, update: &tl::enums::MessageReactions) {
@@ -87,8 +90,15 @@ fn reactions(account: &Account, conversation: &str, message: i32, update: &tl::e
 }
 
 pub(super) fn apply(account: &Account, update: &Update) {
+    // A pin or a folder: told row by row from what is held, never by reading every chat.
+    if filing::apply(account, update) {
+        return;
+    }
     match update {
-        Update::NewMessage(new) => message(account, &new.message, false),
+        Update::NewMessage(new) => {
+            gone_from_schedule(account, &new.message);
+            message(account, &new.message, false)
+        }
         Update::NewChannelMessage(new) => message(account, &new.message, false),
         Update::EditMessage(edit) => message(account, &edit.message, true),
         Update::EditChannelMessage(edit) => message(account, &edit.message, true),
@@ -143,9 +153,26 @@ pub(super) fn apply(account: &Account, update: &Update) {
             read(account, &conversation, seen.max_id, seen.still_unread_count);
         }
         Update::ReadChannelInbox(seen) => read(account, &Who::Channel(seen.channel_id).text(), seen.max_id, seen.still_unread_count),
-        // CONTRACT: a sent message is `Sent`, `Pending` or `Failed`; there is nowhere to say
-        // that the other side has read it (Telegram's second tick), so this is heard and dropped.
-        Update::ReadHistoryOutbox(_) | Update::ReadChannelOutbox(_) => {}
+        // Telegram's second tick: the other side read my messages up to here.
+        Update::ReadHistoryOutbox(seen) => {
+            let who = Who::of(&seen.peer);
+            if who != Who::User(account.me) {
+                let _ = account.ctx.seen(&who.text(), &seen.max_id.to_string());
+            }
+        }
+        Update::ReadChannelOutbox(seen) => {
+            let who = Who::Channel(seen.channel_id);
+            if !account.dir().get(who).is_some_and(|known| known.broadcast || known.forum) {
+                let _ = account.ctx.seen(&who.text(), &seen.max_id.to_string());
+            }
+        }
+        // A scheduled message went, or was dropped: its placeholder goes.
+        Update::DeleteScheduledMessages(gone) => {
+            let conversation = Who::of(&gone.peer).text();
+            for id in &gone.messages {
+                let _ = account.ctx.deleted(&conversation, &format!("s{id}"));
+            }
+        }
         Update::MessageReactions(reacted) => {
             let conversation = place(account, Who::of(&reacted.peer), reacted.top_msg_id);
             reactions(account, &conversation, reacted.msg_id, &reacted.reactions);
@@ -153,7 +180,9 @@ pub(super) fn apply(account: &Account, update: &Update) {
         Update::NotifySettings(settings) => match &settings.peer {
             tl::enums::NotifyPeer::Peer(peer) => {
                 let who = Who::of(&peer.peer);
-                let _ = account.ctx.muted(&who.text(), sync::is_muted(account, who, &settings.notify_settings));
+                let muted = sync::is_muted(account, who, &settings.notify_settings);
+                let _ = account.ctx.muted(&who.text(), muted);
+                filing::facts_changed(account, who, |facts| facts.muted = muted);
             }
             tl::enums::NotifyPeer::NotifyForumTopic(topic) => {
                 let who = Who::of(&topic.peer);
@@ -163,14 +192,8 @@ pub(super) fn apply(account: &Account, update: &Update) {
             // reading the chats again shows.
             _ => account.live().stale = true,
         },
-        // A pin, a folder, a chat joined or left: the tree is read again when it is next opened.
-        Update::DialogPinned(_)
-        | Update::PinnedDialogs(_)
-        | Update::FolderPeers(_)
-        | Update::DialogFilter(_)
-        | Update::DialogFilters
-        | Update::DialogFilterOrder(_)
-        | Update::Channel(_) => account.live().stale = true,
+        // A chat joined, left or changed: what changed came with the update's chats, which
+        // `learn` has already written.
         _ => {}
     }
 }
@@ -220,4 +243,56 @@ pub(super) fn sent(account: &Account, conversation: &str, who: Who, text: &str, 
         let (place, mapped) = placed(account, raw)?;
         (place == conversation && mapped.message.outgoing).then_some(mapped.message)
     })
+}
+
+/// A scheduled message Telegram has now sent is a message like any other; the placeholder the
+/// schedule left goes. Telegram also says so itself (`DeleteScheduledMessages`); this covers
+/// an account that hears the new message first.
+fn gone_from_schedule(account: &Account, raw: &tl::enums::Message) {
+    let tl::enums::Message::Message(sent) = raw else {
+        return;
+    };
+    if !sent.from_scheduled || !sent.out {
+        return;
+    }
+    let conversation = Who::of(&sent.peer_id).text();
+    let held = {
+        let mut live = account.live();
+        let at = live.scheduled.iter().position(|(place, text, _)| *place == conversation && *text == sent.message);
+        at.and_then(|at| live.scheduled.remove(at)).map(|(_, _, id)| id)
+    };
+    if let Some(id) = held {
+        let _ = account.ctx.deleted(&conversation, &id);
+    }
+}
+
+/// A send Telegram scheduled rather than sent: shown as sent now, under an id of its own
+/// (`s<id>`), until Telegram sends it at its time and it is replaced by the real message.
+// CONTRACT: a message has no "scheduled" state (nor a time it will go), so a scheduled one reads
+// as sent now; dated at its time it would sit at the top of the Inbox until then.
+pub(super) fn answered_scheduled(account: &Account, conversation: &str, text: &str, opts: Options, answer: &tl::enums::Updates) -> Option<Message> {
+    let at = opts.schedule?;
+    let updates = match answer {
+        tl::enums::Updates::Updates(all) => &all.updates,
+        tl::enums::Updates::Combined(all) => &all.updates,
+        _ => return None,
+    };
+    let id = updates.iter().find_map(|update| match update {
+        Update::NewScheduledMessage(new) => match &new.message {
+            tl::enums::Message::Message(message) => Some(message.id),
+            _ => None,
+        },
+        _ => None,
+    })?;
+    let me = Who::User(account.me);
+    let id = format!("s{id}");
+    let _ = at;
+    let mut message = Message::plain(id.clone(), account.dir().name(me), text, crate::hub::now(), true);
+    message.sender.id = me.text();
+    let mut live = account.live();
+    if live.scheduled.len() >= 64 {
+        live.scheduled.pop_front();
+    }
+    live.scheduled.push_back((conversation.to_owned(), text.to_owned(), id));
+    Some(message)
 }

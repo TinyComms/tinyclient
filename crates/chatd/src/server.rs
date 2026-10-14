@@ -127,12 +127,12 @@ fn call_error(err: CallError) -> Response {
     }
 }
 
-/// `TINYCHAT_LOGIN`, or the `tinychat-login` next to this binary.
+/// `TINYCHAT_LOGIN`, or the `tinyclient-login` next to this binary.
 fn login_path() -> io::Result<PathBuf> {
     if let Some(path) = std::env::var_os("TINYCHAT_LOGIN") {
         return Ok(PathBuf::from(path));
     }
-    Ok(std::env::current_exe()?.with_file_name(format!("tinychat-login{}", std::env::consts::EXE_SUFFIX)))
+    Ok(std::env::current_exe()?.with_file_name(format!("tinyclient-login{}", std::env::consts::EXE_SUFFIX)))
 }
 
 /// `TINYCHAT_TEST_KEYCHAIN_MS`: in a scratch directory, a session read takes this long, as one
@@ -179,7 +179,7 @@ impl Chat {
         // A seeded demo serves its own accounts.
         lock(&chat.adapters).extend(crate::demo::attach(&chat.hub));
         // Whatever was on its way when chatd last stopped did not go.
-        let _ = chat.hub.store().fail_pending(i64::MAX, "tinychat was restarted before this was sent.");
+        let _ = chat.hub.store().fail_pending(i64::MAX, "tinyclient was restarted before this was sent.");
         // Retention runs behind the socket, at start and once a day. A sleeping thread costs
         // nothing in between.
         let hub = chat.hub.clone();
@@ -202,27 +202,33 @@ impl Chat {
         chat.hub.reading(&networks);
         let chat = chat.clone();
         let spawned = std::thread::Builder::new().name("sessions".into()).stack_size(256 * 1024).spawn(move || {
-            let mut unreadable = Vec::new();
+            // The networks whose accounts are known for certain: no session at all, or a session
+            // whose every account started. Only their leftovers are forgotten. A start that
+            // failed, a refused keychain or a network this build does not speak keeps its cache.
+            let mut settled = Vec::new();
             for network in networks {
                 match chat.read_session(network) {
                     session::Stored::Found(session) => {
-                        if let Err(err) = chat.connect(network, &session) {
-                            eprintln!("chatd: {}: {err}", network.label());
+                        match chat.connect(network, &session) {
+                            Ok(()) => settled.push(network),
+                            Err(err) => eprintln!("chatd: {}: {err}; keeping its cache", network.label()),
                         }
                         chat.hub.read_now(network, false, false);
                     }
-                    session::Stored::Absent => chat.hub.read_now(network, false, false),
+                    session::Stored::Absent => {
+                        settled.push(network);
+                        chat.hub.read_now(network, false, false);
+                    }
                     // A refused keychain prompt is not a sign-out. What was cached stays, and
                     // `ReadSessions` (or the next start) asks again.
                     session::Stored::Unreadable(why) => {
                         eprintln!("chatd: {}: the keychain did not hand over the session ({why}); keeping its cache", network.label());
-                        unreadable.push(network);
                         chat.hub.read_now(network, false, true);
                     }
                 }
             }
             if first {
-                chat.forget_strangers(&unreadable);
+                chat.forget_strangers(&settled);
             }
         });
         if let Err(err) = spawned {
@@ -271,13 +277,13 @@ impl Chat {
     /// Drops the cache of accounts that no longer have a session: signed out while chatd was
     /// down, or renamed by a newer adapter. A scratch directory has no sessions at all and keeps
     /// what was seeded into it.
-    fn forget_strangers(&self, unreadable: &[Network]) {
+    fn forget_strangers(&self, settled: &[Network]) {
         if !session::enabled() {
             return;
         }
         let stored = self.hub.store().accounts().unwrap_or_default();
         for account in stored.into_iter().map(|row| row.key) {
-            if unreadable.contains(&account.network) {
+            if !settled.contains(&account.network) {
                 continue;
             }
             if !lock(&self.adapters).contains_key(&account) {
@@ -342,7 +348,7 @@ impl Chat {
                 let unread_session = match linked {
                     Some(_) => None,
                     None if keychain.denied.contains(&network) => {
-                        Some("tinychat can't read your sign-in from the keychain. You are still signed in.")
+                        Some("tinyclient can't read your sign-in from the keychain. You are still signed in.")
                     }
                     None if keychain.waiting == Some(network) => Some("Waiting for permission to read your sign-in from the keychain."),
                     None if pending.contains(&network) => Some(""),
@@ -591,7 +597,7 @@ impl Chat {
             return Ok(());
         }
         if can.max_file_bytes == 0 {
-            return refuse(format!("Files can't be sent to {name} from tinychat yet."));
+            return refuse(format!("Files can't be sent to {name} from tinyclient yet."));
         }
         let most = (can.max_files.max(1) as usize).min(protocol::ATTACHMENTS_LIMIT);
         if with.files.len() > most {
@@ -599,7 +605,13 @@ impl Chat {
         }
         for file in &with.files {
             let named = file_name(file);
-            match std::fs::metadata(&file.path) {
+            // The same rule the upload reads by: never chatd's own files, a device, a secret, or
+            // a link in `outbox/`.
+            let real = match crate::blobs::upload::allowed(&file.path) {
+                Ok((real, _)) => real,
+                Err(why) => return refuse(format!("{named} {why}")),
+            };
+            match std::fs::metadata(&real) {
                 Ok(meta) if meta.is_dir() => return refuse(format!("{named}: folders can't be sent. Zip it first.")),
                 Ok(meta) if meta.len() > can.max_file_bytes => {
                     return refuse(format!("{named} is too big for {name} (limit {}).", megabytes(can.max_file_bytes)))
@@ -1140,7 +1152,7 @@ impl Chat {
         self.status()
     }
 
-    /// Only a conversation tinychat can carry a call for starts one. Anything else is refused
+    /// Only a conversation tinyclient can carry a call for starts one. Anything else is refused
     /// before mediad is spawned or the network hears a thing.
     fn call_start(&self, conversation: Key) -> Response {
         match self.hub.store().conversation(&conversation) {
@@ -1148,7 +1160,7 @@ impl Chat {
             Ok(Some(row)) if row.call == CallSupport::Handoff => {
                 return error(ErrorCode::Unsupported, format!("{} calls open in its own app.", conversation.network.label()))
             }
-            Ok(Some(_)) => return error(ErrorCode::Unsupported, "This conversation has no calls tinychat can join."),
+            Ok(Some(_)) => return error(ErrorCode::Unsupported, "This conversation has no calls tinyclient can join."),
             Ok(None) => return error(ErrorCode::NotFound, "no such conversation"),
             Err(err) => return internal(err),
         }
@@ -1375,11 +1387,14 @@ impl Chat {
                 Err(refused) => *refused,
             },
             Request::Discard { conversation, client_id } => {
-                if let Err(refused) = self.unsent(&conversation, &client_id) {
-                    return *refused;
-                }
+                let message = match self.unsent(&conversation, &client_id) {
+                    Ok(message) => message,
+                    Err(refused) => return *refused,
+                };
                 match self.hub.store().delete_message(&conversation, &client_id) {
                     Ok(_) => {
+                        // The shell's staged copies in `outbox/` go with it; the user's own stay.
+                        crate::blobs::upload::discard(&outgoing_files(&message));
                         self.hub.changed(Change::Messages { conversation });
                         Response::Ok
                     }
@@ -1517,9 +1532,9 @@ fn serve_connection(chat: &Chat, mut stream: ChatStream) -> io::Result<()> {
         let answer = match serde_json::from_slice::<Request>(&bytes) {
             Ok(request) => {
                 let handled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| chat.handle(request)));
-                handled.unwrap_or_else(|_| error(ErrorCode::Internal, "tinychat hit a problem answering this. It has been noted."))
+                handled.unwrap_or_else(|_| error(ErrorCode::Internal, "tinyclient hit a problem answering this. It has been noted."))
             }
-            Err(err) => error(ErrorCode::Unsupported, format!("chatd does not understand this request; tinychat and chatd may be different versions ({err})")),
+            Err(err) => error(ErrorCode::Unsupported, format!("chatd does not understand this request; tinyclient and chatd may be different versions ({err})")),
         };
         match write_frame(&mut stream, &answer) {
             Err(err) if err.kind() == ErrorKind::InvalidData => {

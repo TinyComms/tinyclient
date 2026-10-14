@@ -463,6 +463,11 @@ impl Teams {
         if !self.known(place)? {
             return Ok(());
         }
+        // A chat the user hid comes back with a new message, as it does in Teams.
+        if self.ctx.known(place)?.is_some_and(|row| row.hidden) {
+            let filing = crate::store::Filing { hidden: false, ..crate::store::Filing::default() };
+            self.ctx.filing(place, &filing)?;
+        }
         let Some(root) = root.filter(|root| *root != message.id) else {
             self.ctx.message(place, &message)?;
             return Ok(());
@@ -538,7 +543,7 @@ impl Teams {
     // Pages.
 
     /// One page of a conversation, newest first, and the cursor of the page before it.
-    fn page(&self, conversation: &str, size: u32, window: &str) -> Result<(Vec<Value>, String), Fault> {
+    pub(super) fn page(&self, conversation: &str, size: u32, window: &str) -> Result<(Vec<Value>, String), Fault> {
         let path = format!(
             "/v1/users/ME/conversations/{}/messages?view=msnp24Equivalent&pageSize={size}&{window}\
              &targetType=Passport%7CSkype%7CLync%7CThread%7CPSTN%7CAgent",
@@ -591,6 +596,14 @@ impl Teams {
             }
         }
         self.ctx.history(conversation, &own)?;
+        // A chain named "Replies" before its post was read is titled by the post now.
+        if channel {
+            for post in own.iter().filter(|post| post.thread.is_some()) {
+                if self.ctx.known(&chain_id(conversation, &post.id))?.is_some() {
+                    self.chain_known(conversation, &post.id)?;
+                }
+            }
+        }
         let mut roots: Vec<&str> = replies.iter().map(|(root, _)| root.as_str()).collect();
         roots.sort_unstable();
         roots.dedup();
@@ -618,7 +631,8 @@ impl Teams {
         }
         let (messages, older) = self.page(conversation, PAGE, "startTime=1")?;
         self.remember_cursor(conversation, &messages, &older);
-        self.record(conversation, &messages)
+        self.record(conversation, &messages)?;
+        self.seen_by(conversation)
     }
 
     /// Where the page before the oldest message of this one starts, for when it is asked for.
@@ -665,7 +679,7 @@ impl Teams {
         if chain_of(conversation).is_some() || millis(around) == 0 {
             return Ok(());
         }
-        let (messages, _) = self.page(conversation, PAGE, &format!("startTime=1&endTime={}", millis(around) + 1))?;
+        let (messages, _) = self.page(conversation, PAGE, &format!("startTime=1&endTime={}", millis(around).saturating_add(1)))?;
         self.record(conversation, &messages)
     }
 
@@ -707,6 +721,11 @@ impl Teams {
     }
 
     fn posted(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>) -> Result<Message, Fault> {
+        self.posted_with(conversation, client_id, text, reply_to, None)
+    }
+
+    /// The same, with `properties` (the files a message names) beside the body.
+    pub(super) fn posted_with(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, properties: Option<Value>) -> Result<Message, Fault> {
         let mut content = html::compose(text);
         let mut target = conversation.to_owned();
         let quote = match reply_to {
@@ -720,7 +739,11 @@ impl Teams {
             _ => {}
         }
         let path = format!("/v1/users/ME/conversations/{}/messages", escaped(&target));
-        let answer = self.chat("POST", &path, Body::Json(&self.body(client_id, &content)), false)?;
+        let mut body = self.body(client_id, &content);
+        if let Some(properties) = properties {
+            body["properties"] = properties;
+        }
+        let answer = self.chat("POST", &path, Body::Json(&body), false)?;
         let id = id_of(&answer.body["OriginalArrivalTime"]);
         if millis(&id) == 0 {
             return Err(Fault::Net("Teams accepted the message but did not name it".to_owned()));
@@ -780,7 +803,7 @@ impl Teams {
         let Some(key) = key_of(emoji).map(str::to_owned).or_else(learned) else {
             return Err(Fault::Refused {
                 status: 400,
-                message: "tinychat does not know Teams' name for that emoji yet".to_owned(),
+                message: "tinyclient does not know Teams' name for that emoji yet".to_owned(),
             });
         };
         let path = format!("{}/properties?name=emotions", self.message_path(conversation, id));

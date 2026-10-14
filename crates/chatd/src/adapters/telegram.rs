@@ -14,7 +14,7 @@
 //! | Covers | Everything, secret chats and call signalling included. | Phone login and 2FA as methods; QR login, folders, topics, reactions, typing, read state and files through its raw request call, which reaches the whole schema. No secret chats, no calls. |
 //!
 //! grammers wins on the two things this app is about, weight and one cache, and it is the only
-//! one of the two that can be built on the machine tinychat is developed on. What it costs: a
+//! one of the two that can be built on the machine tinyclient is developed on. What it costs: a
 //! schema change at Telegram waits on one maintainer, secret chats are out, and calls (a later
 //! stage, tgcalls either way) will need their signalling written here. If grammers is ever
 //! abandoned, everything above `wire::Wire` speaks Telegram's schema, not grammers, so the
@@ -40,7 +40,8 @@
 //! Reading is told to Telegram exactly when the shell says a message was seen, typing while the
 //! user types, and being here when the user acts; no setting hides any of the three. Nothing is
 //! automated. A flood wait is slept in full or told to the user, never cut short. A channel's
-//! sponsored message is shown when the channel is opened.
+//! sponsored message is asked when the channel is opened (at most every five minutes) and told
+//! as viewed once it is on screen.
 //!
 //! # Unproven
 //!
@@ -49,23 +50,27 @@
 //! socket against a scripted wire (`fake`); `real` has only been run as far as a datacenter's
 //! refusal of a missing app id.
 
+mod catalog;
 mod content;
 mod fake;
 mod files;
+mod filing;
+mod info;
 mod live;
 mod peers;
 mod real;
+mod send;
 pub mod signin;
 mod sync;
 mod wire;
 
-use super::{keep_connected, serve_commands, About, Command, Context, Failure, Members, Refusal, Signed};
+use super::{keep_connected, serve_commands, Command, Context, Failure, Members, Refusal, Signed};
 use crate::session;
 use grammers_tl_types as tl;
 use peers::{Directory, Who};
 use protocol::{Link, MemberSection, Person, Presence, Relation};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -75,9 +80,10 @@ use wire::{Event, Fault, Wire};
 const PACE: Duration = Duration::from_millis(300);
 /// Messages asked for in one page of history.
 const PAGE: i32 = 50;
-/// Others are told the user is typing at most this often per conversation. Telegram shows it
-/// for six seconds and its own apps renew it every five; the terms ask for the same.
-const TYPING_EVERY: Duration = Duration::from_secs(5);
+/// Others are told the user is typing at most this often per conversation (budget rule 8).
+/// Telegram shows it for six seconds and its own apps renew it every five; less is never an
+/// anomaly.
+const TYPING_EVERY: Duration = Duration::from_secs(8);
 /// How long "is typing" stays without another signal.
 const TYPING_SHOWN: i64 = 6;
 /// Being here is told at most this often, and only when the user acts. Telegram lets it lapse
@@ -85,10 +91,6 @@ const TYPING_SHOWN: i64 = 6;
 const HERE_EVERY: Duration = Duration::from_secs(240);
 /// Messages whose conversation is remembered, for a deletion that names only the message.
 const PLACED: usize = 4_096;
-/// The one implicit Space of an account. Telegram has none; its folders are this Space's groups.
-// CONTRACT: groups exist only inside a Space's tree, so Telegram's folders hang off one Space
-// per account, named "Telegram", where the navigation spec wants them directly under the network.
-pub(super) const SPACE: &str = "chats";
 
 /// The registered app id, when this build was given one.
 pub fn credentials() -> Option<(i32, &'static str)> {
@@ -108,7 +110,7 @@ pub fn supported() -> bool {
 
 /// Why Telegram cannot be used in this build, for the sign-in sheet.
 pub fn unsupported_reason() -> String {
-    "This build of tinychat was made without a Telegram app id, so it cannot sign in to Telegram.".to_owned()
+    "This build of tinyclient was made without a Telegram app id, so it cannot sign in to Telegram.".to_owned()
 }
 
 /// What the keychain holds for Telegram. Not `Debug`: it is the account's keys.
@@ -171,10 +173,34 @@ struct Live {
     here: Option<Instant>,
     /// Whether people, groups and channels are muted when a chat has no setting of its own.
     muted: [bool; 3],
-    /// The dialogs changed in a way only reading them again shows (a pin, a folder).
+    /// A default mute changed, which only reading the chats again shows. Pins and folders
+    /// never need it: they are told row by row (`filing`).
     stale: bool,
     /// Conversations a `HistoryAfter` was served for, so reading on does not ask twice.
     after: VecDeque<(String, String, Instant)>,
+    /// How the chats are filed: folders, pins, archive, and where each list continues.
+    filed: filing::Filed,
+    /// Pictures already queued this connection, so a row on screen is fetched once.
+    pictured: HashSet<String>,
+    /// Channels whose sponsored messages were asked, and when (asked again after 5 minutes).
+    ads: Vec<(String, Instant)>,
+    /// Sponsored messages recorded: the channel, the ad's id, and whether it was told as viewed.
+    shown: Vec<(String, Vec<u8>, bool)>,
+    /// What the picker's items send.
+    picks: VecDeque<(String, catalog::Pick)>,
+    /// The installed sticker packs, from the first page of the Stickers tab.
+    sticker_sets: Option<Vec<(i64, i64, String)>>,
+    /// Scheduled sends shown until Telegram sends them: the chat, the text, the placeholder.
+    scheduled: VecDeque<(String, String, String)>,
+}
+
+/// Telegram's own send options, which Telegram carries out.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct Options {
+    pub silent: bool,
+    pub no_webpage: bool,
+    /// Unix seconds: Telegram sends it then.
+    pub schedule: Option<i32>,
 }
 
 /// One connection's worth of an account: what every thread of the adapter shares.
@@ -214,6 +240,7 @@ impl Account {
         }
         if !learned.people.is_empty() {
             let _ = self.ctx.people(&learned.people);
+            let _ = self.ctx.details(&learned.details);
         }
         for who in learned.chats {
             sync::refresh_row(self, who);
@@ -418,7 +445,13 @@ fn offline(ctx: &Context, command: Command) {
         Command::Send { conversation_id, client_id, .. } => ctx.sent(&conversation_id, &client_id, Err("Telegram is offline.".to_owned())),
         Command::React { reply, .. } | Command::Edit { reply, .. } | Command::Delete { reply, .. } => drop(reply.send(Err(down()))),
         Command::Members { reply, .. } => drop(reply.send(Err(down()))),
-        Command::Profile { reply, .. } => drop(reply.send(Err(down()))),
+        Command::Profile { reply, .. } | Command::ProfileIn { reply, .. } => drop(reply.send(Err(down()))),
+        Command::ConversationInfo { reply, .. } => drop(reply.send(Err(down()))),
+        Command::SetMute { reply, .. } | Command::Leave { reply, .. } => drop(reply.send(Err(down()))),
+        Command::Pinned { reply, .. } => drop(reply.send(Err(down()))),
+        Command::SearchShared { reply, .. } => drop(reply.send(Err(down()))),
+        Command::Catalog { reply, .. } => drop(reply.send(Err(down()))),
+        Command::SendWith { conversation_id, client_id, .. } => ctx.sent(&conversation_id, &client_id, Err("Telegram is offline.".to_owned())),
         Command::StartDirect { reply, .. } | Command::Handoff { reply, .. } => drop(reply.send(Err(down()))),
         Command::SearchPeople(query) => ctx.searched(&query),
         other => other.unsupported(ctx),
@@ -431,19 +464,27 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::History { conversation_id, before } => drop(sync::history(account, &conversation_id, sync::Around::Before(&before))),
         Command::HistoryAfter { conversation_id, after } => drop(sync::history(account, &conversation_id, sync::Around::After(&after))),
         Command::HistoryAround { conversation_id, around } => drop(sync::history(account, &conversation_id, sync::Around::At(&around))),
-        Command::OpenSpace(_) => {
+        // The chat list is current from updates; only a default mute changing needs it read
+        // again, and then only when the user opens it.
+        Command::OpenHome => {
             if std::mem::take(&mut account.live().stale) {
                 if let Err(fault) = sync::dialogs(account) {
                     eprintln!("chatd: Telegram: chats: {fault}");
                 }
             }
         }
+        Command::Watch(watching) => sync::on_screen(account, &watching),
+        Command::Previews(ids) => sync::previews(account, &ids),
         Command::MarkRead { conversation_id, message_id } => mark_read(account, &conversation_id, &message_id),
         Command::Send { conversation_id, client_id, text, reply_to } => {
             account.here();
-            let outcome = send(account, &conversation_id, &client_id, &text, reply_to.as_deref());
+            let outcome = send_text(account, &conversation_id, &client_id, &text, reply_to.as_deref(), Options::default());
             ctx.sent(&conversation_id, &client_id, outcome.map_err(|fault| fault.words()));
         }
+        Command::SendWith { conversation_id, client_id, text, reply_to, with } => {
+            send::send_with(account, &conversation_id, &client_id, &text, reply_to.as_deref(), *with);
+        }
+        Command::CancelSend { client_id, .. } => send::cancel(account, &client_id),
         Command::React { conversation_id, message_id, emoji, on, reply } => {
             let _ = reply.send(react(account, &conversation_id, &message_id, &emoji, on).map_err(refused));
         }
@@ -473,7 +514,28 @@ fn serve(account: &Arc<Account>, command: Command) {
             let _ = reply.send(started.ok_or_else(|| Refusal::Refused("That person can't be messaged from here.".to_owned())));
         }
         Command::Profile { person_id, reply } => {
-            let _ = reply.send(profile(account, &person_id).map_err(refused));
+            let _ = reply.send(info::profile(account, &person_id).map_err(refused));
+        }
+        Command::ProfileIn { person_id, space_id, reply } => {
+            let _ = reply.send(info::profile_in(account, &person_id, &space_id).map_err(refused));
+        }
+        Command::ConversationInfo { conversation_id, reply } => {
+            let _ = reply.send(info::conversation(account, &conversation_id).map_err(refused));
+        }
+        Command::SetMute { conversation_id, notify, reply } => {
+            let _ = reply.send(info::set_mute(account, &conversation_id, notify).map_err(refused));
+        }
+        Command::Leave { conversation_id, reply } => {
+            let _ = reply.send(info::leave(account, &conversation_id).map_err(refused));
+        }
+        Command::Pinned { conversation_id, reply } => {
+            let _ = reply.send(info::pinned(account, &conversation_id).map_err(refused));
+        }
+        Command::SearchShared { conversation_id, kind, before, limit, reply } => {
+            let _ = reply.send(info::shared(account, &conversation_id, kind, before.as_deref(), limit).map_err(refused));
+        }
+        Command::Catalog { kind, query, cursor, reply, .. } => {
+            let _ = reply.send(catalog::catalog(account, kind, &query, cursor.as_deref()).map_err(refused));
         }
         Command::Handoff { conversation_id, reply } => {
             let link = Who::parse(&conversation_id).map(|(who, _)| {
@@ -530,28 +592,49 @@ fn random_id(client_id: &str) -> i64 {
     })
 }
 
-fn send(account: &Account, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>) -> Result<protocol::Message, Fault> {
-    let invalid = || Fault::Rpc { code: 400, name: "PEER_ID_INVALID".to_owned(), value: None };
-    let (who, topic) = Who::parse(conversation).ok_or_else(invalid)?;
-    let peer = account.input(who)?;
-    let reply = reply_to.and_then(|id| id.parse::<i32>().ok());
-    // In a forum a post names its topic the way a reply names its message. General needs none.
+/// How a send names what it answers. In a forum a post names its topic the way a reply names
+/// its message; General needs none.
+fn reply_header(reply: Option<i32>, topic: Option<i32>) -> Option<tl::enums::InputReplyTo> {
     let reply_to = match (reply, topic.filter(|topic| *topic != 1)) {
         (None, None) => None,
         (Some(reply), top) => Some((reply, top)),
         (None, Some(topic)) => Some((topic, None)),
     };
-    let random = random_id(client_id);
-    {
-        let mut live = account.live();
-        if live.random.len() >= 64 {
-            live.random.pop_front();
+    reply_to.map(|(reply_to_msg_id, top_msg_id)| {
+        tl::types::InputReplyToMessage {
+            reply_to_msg_id,
+            top_msg_id,
+            reply_to_peer_id: None,
+            quote_text: None,
+            quote_entities: None,
+            quote_offset: None,
+            monoforum_peer_id: None,
+            todo_item_id: None,
+            poll_option: None,
         }
-        live.random.push_back((random, client_id.to_owned()));
+        .into()
+    })
+}
+
+/// Remembers which pending message a nonce belongs to, so the echo replaces it.
+fn remember_random(account: &Account, random: i64, client_id: &str) {
+    let mut live = account.live();
+    if live.random.len() >= 64 {
+        live.random.pop_front();
     }
+    live.random.push_back((random, client_id.to_owned()));
+}
+
+fn send_text(account: &Account, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, opts: Options) -> Result<protocol::Message, Fault> {
+    let invalid = || Fault::Rpc { code: 400, name: "PEER_ID_INVALID".to_owned(), value: None };
+    let (who, topic) = Who::parse(conversation).ok_or_else(invalid)?;
+    let peer = account.input(who)?;
+    let reply = reply_to.and_then(|id| id.parse::<i32>().ok());
+    let random = random_id(client_id);
+    remember_random(account, random, client_id);
     let request = tl::functions::messages::SendMessage {
-        no_webpage: false,
-        silent: false,
+        no_webpage: opts.no_webpage,
+        silent: opts.silent,
         background: false,
         clear_draft: true,
         noforwards: false,
@@ -559,25 +642,12 @@ fn send(account: &Account, conversation: &str, client_id: &str, text: &str, repl
         invert_media: false,
         allow_paid_floodskip: false,
         peer,
-        reply_to: reply_to.map(|(reply_to_msg_id, top_msg_id)| {
-            tl::types::InputReplyToMessage {
-                reply_to_msg_id,
-                top_msg_id,
-                reply_to_peer_id: None,
-                quote_text: None,
-                quote_entities: None,
-                quote_offset: None,
-                monoforum_peer_id: None,
-                todo_item_id: None,
-                poll_option: None,
-            }
-            .into()
-        }),
+        reply_to: reply_header(reply, topic),
         message: text.to_owned(),
         random_id: random,
         reply_markup: None,
         entities: None,
-        schedule_date: None,
+        schedule_date: opts.schedule,
         schedule_repeat_period: None,
         send_as: None,
         quick_reply_shortcut: None,
@@ -587,7 +657,9 @@ fn send(account: &Account, conversation: &str, client_id: &str, text: &str, repl
         rich_message: None,
     };
     let answer = account.ask(&request)?;
-    live::sent(account, conversation, who, text, reply, &answer).ok_or_else(|| Fault::Net("Telegram accepted the message but did not name it".to_owned()))
+    live::answered_scheduled(account, conversation, text, opts, &answer)
+        .or_else(|| live::sent(account, conversation, who, text, reply, &answer))
+        .ok_or_else(|| Fault::Net("Telegram accepted the message but did not name it".to_owned()))
 }
 
 fn edit(account: &Account, conversation: &str, message: &str, text: &str) -> Result<(), Fault> {
@@ -746,21 +818,5 @@ fn members(account: &Account, conversation: &str, offset: u32, limit: u32) -> Re
     Ok(Members {
         sections: vec![MemberSection { name: "Members".to_owned(), count: total }],
         members: ids.into_iter().map(|id| person(account, Who::User(id), relation(account, id))).collect(),
-    })
-}
-
-fn profile(account: &Account, person_id: &str) -> Result<About, Fault> {
-    let invalid = || Fault::Rpc { code: 400, name: "USER_ID_INVALID".to_owned(), value: None };
-    let Some((who @ Who::User(_), None)) = Who::parse(person_id) else {
-        return Err(invalid());
-    };
-    account.input(who)?;
-    let id = account.dir().input_user(who).ok_or_else(invalid)?;
-    let tl::enums::users::UserFull::Full(full) = account.ask(&tl::functions::users::GetFullUser { id })?;
-    account.learn(&full.users, &full.chats);
-    let tl::enums::UserFull::Full(user) = full.full_user;
-    Ok(About {
-        bio: user.about.unwrap_or_default(),
-        ..About::default()
     })
 }

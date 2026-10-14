@@ -6,12 +6,31 @@
 use keyring::Entry;
 use protocol::Network;
 
-const SERVICE: &str = "tinychat";
+const SERVICE: &str = "tinyclient";
 
 /// False when `TINYCHAT_DIR` points chatd at a scratch directory. Tests and the demo never touch
 /// the keychain and never sign in.
 pub fn enabled() -> bool {
     std::env::var_os("TINYCHAT_DIR").is_none()
+}
+
+/// Said instead of reading or saving when this build's keyring keeps nothing past the process
+/// (its in-memory mock, chosen when no system store was compiled in) or past a reboot.
+pub const NO_STORE: &str = "This copy of tinyclient has no keychain to keep sign-ins in, so it signs nobody in. Install a build for this system.";
+
+/// Whether sign-ins are kept until deleted: the macOS keychain, the Windows credential store,
+/// the Secret Service on Linux. Asked once.
+pub fn persistent() -> bool {
+    use keyring::credential::CredentialPersistence;
+    static PERSISTENT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *PERSISTENT.get_or_init(|| {
+        let persistence = keyring::default::default_credential_builder().persistence();
+        let kept = matches!(persistence, CredentialPersistence::UntilDelete);
+        if !kept {
+            eprintln!("chatd: the keyring does not keep sign-ins past a restart; refusing to read or save any");
+        }
+        kept
+    })
 }
 
 fn account(network: Network) -> &'static str {
@@ -43,6 +62,9 @@ pub fn read(network: Network) -> Stored {
         let name = format!("TINYCHAT_SESSION_{}", network.label().to_uppercase());
         return std::env::var(name).map_or(Stored::Absent, Stored::Found);
     }
+    if !persistent() {
+        return Stored::Unreadable(NO_STORE.to_owned());
+    }
     let entry = match Entry::new(SERVICE, account(network)) {
         Ok(entry) => entry,
         Err(err) => return Stored::Unreadable(err.to_string()),
@@ -57,6 +79,9 @@ pub fn read(network: Network) -> Stored {
 pub fn save(network: Network, session: &str) -> Result<(), String> {
     if !enabled() {
         return Err("sessions are not kept while TINYCHAT_DIR is set".to_owned());
+    }
+    if !persistent() {
+        return Err(NO_STORE.to_owned());
     }
     Entry::new(SERVICE, account(network))
         .map_err(|err| format!("keychain: {err}"))?
@@ -101,5 +126,16 @@ pub fn rewrite(network: Network, rewrite: impl FnOnce(&str) -> Option<String>) -
 pub fn forget(network: Network) {
     if enabled() {
         let _ = Entry::new(SERVICE, account(network)).and_then(|entry| entry.delete_credential());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn this_build_keeps_sign_ins_past_a_restart() {
+        // A build without a system store falls back to keyring's mock: it would find no
+        // sessions and say nothing. `persistent` is what makes chatd refuse instead.
+        assert!(super::persistent());
+        assert!(super::NO_STORE.ends_with('.') && !super::NO_STORE.contains("keyring"));
     }
 }

@@ -42,7 +42,7 @@ pub const NO_ANSWER: &str = "Nobody picked up.";
 /// What the dock shows when mediad is gone or mute; what mediad or the system said is logged.
 const ENGINE_STOPPED: &str = "The call engine stopped.";
 const ENGINE_SILENT: &str = "The call engine stopped answering. Try again.";
-const ENGINE_MISSING: &str = "The call engine could not start. Reinstall tinychat, then try again.";
+const ENGINE_MISSING: &str = "The call engine could not start. Reinstall tinyclient, then try again.";
 
 pub enum CallError {
     Active,
@@ -103,7 +103,7 @@ pub struct Calls {
 }
 
 /// `TINYCHAT_MEDIAD`, or the `mediad` next to this binary: in `target/`, and in
-/// `tinychat.app/Contents/MacOS`, where `packaging/bundle.sh` puts every executable so that
+/// `tinyclient.app/Contents/MacOS`, where `packaging/bundle.sh` puts every executable so that
 /// each finds the others this way. A bundle that keeps helpers apart has them in
 /// `Contents/Helpers`, which is looked in second.
 fn mediad_path() -> io::Result<PathBuf> {

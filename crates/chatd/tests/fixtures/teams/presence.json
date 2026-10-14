@@ -18,5 +18,23 @@
     "expiry": "9999-12-30T23:00:00.0000000Z"
    }
   }
+ },
+ {
+  "mri": "8:orgid:00000000-0000-4000-8000-0000000000d4",
+  "etag": "A1",
+  "status": 20000,
+  "presence": {
+   "sourceNetwork": "Self",
+   "availability": "Away",
+   "activity": "OutOfOffice",
+   "calendarData": {
+    "isOutOfOffice": true
+   },
+   "outOfOfficeNote": {
+    "message": "<p>Back Monday, ask Ben</p>",
+    "publishTime": "2026-10-09T07:00:00.0000000Z",
+    "expiry": "2026-10-19T08:00:00.0000000Z"
+   }
+  }
  }
 ]

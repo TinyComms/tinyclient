@@ -178,13 +178,25 @@ impl Demo {
                         Some("png" | "jpg" | "jpeg" | "webp") => protocol::MediaKind::Image,
                         _ => protocol::MediaKind::File,
                     };
-                    let mut attached = Attachment::new(name, MediaFile { bytes, path: Some(file.path.clone()), ..MediaFile::new(format!("sent-{client_id}-{at}"), kind) });
+                    let id = format!("sent-{client_id}-{at}");
+                    // A paste staged in outbox/ is the network's now: the demo keeps its copy in
+                    // the media cache, as a network's would come back, and the outbox copy goes.
+                    let mut path = file.path.clone();
+                    if let Ok((staged, true)) = crate::blobs::upload::allowed(&file.path) {
+                        let kept = crate::blobs::path_of(&protocol::support_dir().join("media"), &demo.ctx.account, &id);
+                        let copied = kept.parent().is_some_and(|dir| std::fs::create_dir_all(dir).is_ok()) && std::fs::copy(&staged, &kept).is_ok();
+                        if copied {
+                            path = kept.to_string_lossy().into_owned();
+                        }
+                    }
+                    let mut attached = Attachment::new(name, MediaFile { bytes, path: Some(path), ..MediaFile::new(id, kind) });
                     attached.spoiler = file.spoiler;
                     attached
                 })
                 .collect();
             let message = demo.accepted(&conversation_id, text, reply_to, attachments);
             demo.ctx.sent(&conversation_id, &client_id, Ok(message));
+            crate::blobs::upload::discard(&with.files);
         });
         if let Err(err) = spawned {
             eprintln!("chatd: demo: upload: {err}");
@@ -224,24 +236,35 @@ impl Demo {
         let pick = person_id.bytes().fold(0usize, |sum, byte| sum.wrapping_mul(31).wrapping_add(byte as usize));
         let spaces = self.hub.store().spaces(Some(self.ctx.account.network)).unwrap_or_default();
         let ours: Vec<String> = spaces.into_iter().filter(|space| space.key.account() == self.ctx.account).map(|space| space.name).collect();
-        let (zone, offset) = ZONES[pick % ZONES.len()];
         let person = self.hub.store().person(&self.key(person_id)).ok().flatten();
+        // The zone the list already shows them in, so the two agree.
+        let (zone, offset) = match person.as_ref().and_then(|person| person.utc_offset) {
+            Some(known) => ZONES.iter().find(|(_, offset)| *offset == known).map_or(("", known), |(zone, _)| (*zone, known)),
+            None => ZONES[pick % ZONES.len()],
+        };
         let name = person.as_ref().map_or_else(String::new, |person| person.name.clone());
         let first = name.split_whitespace().next().unwrap_or("").to_lowercase();
-        let since = Some(1_500_000_000 + (pick % 200_000_000) as i64);
+        let bot = person.as_ref().is_some_and(|person| person.bot);
+        let friend = person.as_ref().is_some_and(|person| person.relation == Relation::Friend);
+        // An app's About is what it says it does, not a person's line.
         let mut about = About {
-            bio: BIOS[pick % BIOS.len()].to_owned(),
-            since,
+            bio: if bot { "Answers commands. Send /help to see them.".to_owned() } else { BIOS[pick % BIOS.len()].to_owned() },
             ..About::default()
         };
         match self.ctx.account.network {
             Network::Discord => {
+                // Discord's ids carry the date the account was made.
+                about.since = Some(1_500_000_000 + (pick % 200_000_000) as i64);
                 about.mutual_spaces = ours.iter().take(1 + pick % 4).cloned().collect();
                 about.mutual_total = (about.mutual_spaces.len() + pick % 3) as u32;
                 about.mutual_friends = (pick % 9) as u32;
                 about.accent = Some([0xd9_82_4a, 0x4c_9a_6a, 0x5b_6e_e1, 0xb5_4a_7a][pick % 4]);
-                about.pronouns = ["she/her", "he/him", "they/them", ""][pick % 4].to_owned();
-                about.friends_since = Some(1_620_000_000 + (pick % 50_000_000) as i64);
+                if !bot {
+                    about.pronouns = ["she/her", "he/him", "they/them", ""][pick % 4].to_owned();
+                }
+                if friend && !bot {
+                    about.friends_since = Some(1_620_000_000 + (pick % 50_000_000) as i64);
+                }
                 about.note = if pick % 3 == 0 { "Met at the spring foray. Knows lichens.".to_owned() } else { String::new() };
                 if space_id.is_some() {
                     about.nickname = format!("{} 🌿", name.split_whitespace().next().unwrap_or(""));
@@ -250,20 +273,37 @@ impl Demo {
                 }
             }
             Network::Slack => {
-                about.time_zone = zone.to_owned();
-                about.utc_offset = Some(offset);
-                about.title = person.as_ref().map_or_else(String::new, |person| person.title.clone());
-                about.pronouns = ["she/her", "he/him", "they/them", ""][pick % 4].to_owned();
-                about.contacts = vec![
-                    Contact { kind: ContactKind::Email, value: format!("{first}@harbor.example"), masked: false },
-                    Contact { kind: ContactKind::Phone, value: format!("+44 7700 900{:03}", pick % 1000), masked: true },
-                ];
+                // Slack has no bio and no join date: the title is all it says of someone.
+                about.bio = String::new();
+                if !bot {
+                    about.time_zone = zone.to_owned();
+                    about.utc_offset = Some(offset);
+                    about.title = person.as_ref().map_or_else(String::new, |person| person.title.clone());
+                    about.pronouns = ["she/her", "he/him", "they/them", ""][pick % 4].to_owned();
+                    about.contacts = vec![
+                        Contact { kind: ContactKind::Email, value: format!("{first}@harbor.example"), masked: false },
+                        Contact { kind: ContactKind::Phone, value: format!("+44 7700 900{:03}", pick % 1000), masked: true },
+                    ];
+                }
                 about.status_until = Some(now() + 3_600 * (1 + (pick % 5) as i64));
             }
             Network::Telegram => {
-                about.contacts = vec![Contact { kind: ContactKind::Phone, value: format!("+351 912 345 {:03}", pick % 1000), masked: true }];
-                about.last_seen = Some(now() - 600 * (1 + (pick % 30) as i64));
-                about.mutual_total = (pick % 4) as u32;
+                // Neither bots nor Telegram's own account share a phone; no join date is told.
+                let service = person.as_ref().is_some_and(|person| person.mark == Some(Mark::Verified));
+                if !bot && !service {
+                    about.contacts = vec![Contact { kind: ContactKind::Phone, value: format!("+351 912 345 {:03}", pick % 1000), masked: true }];
+                }
+                if service {
+                    about.bio = String::new();
+                }
+                // An exact last seen only for someone who shows it: who hides it has Telegram's
+                // rough words ("last seen recently") and nothing more.
+                let hidden = person.as_ref().is_some_and(|person| person.status.to_lowercase().starts_with("last seen"));
+                let around = matches!(self.ctx.presence_of(person_id), Presence::Online);
+                if !bot && !service && !hidden && !around {
+                    about.last_seen = Some(now() - 600 * (1 + (pick % 30) as i64));
+                }
+                about.mutual_total = if bot || service { 0 } else { (pick % 4) as u32 };
                 if person.as_ref().is_some_and(|person| person.mark == Some(Mark::Scam)) {
                     about.warning = Some(Warning::Scam);
                     about.bio = "Official giveaway. Limited time!".to_owned();
@@ -271,14 +311,19 @@ impl Demo {
             }
             Network::Teams => {
                 about.bio = String::new();
-                about.since = None;
                 about.title = person.as_ref().map_or_else(String::new, |person| person.title.clone());
                 about.department = "Engineering".to_owned();
                 about.contacts = vec![Contact { kind: ContactKind::Email, value: person.as_ref().map_or_else(String::new, |person| person.handle.clone()), masked: false }];
                 about.utc_offset = person.as_ref().and_then(|person| person.utc_offset);
                 if name.starts_with("Chloé") {
-                    about.away = "Out of office until Friday. For onboarding, ask Robin.".to_owned();
-                    about.away_until = Some(now() + 3 * 86_400);
+                    about.away = "At the design offsite. For onboarding, ask Robin.".to_owned();
+                    // Back the Friday her status names: the banner and the status agree.
+                    let day = now().div_euclid(86_400);
+                    let to_friday = match (5 - (day + 4).rem_euclid(7)).rem_euclid(7) {
+                        0 => 7,
+                        days => days,
+                    };
+                    about.away_until = Some((day + to_friday) * 86_400 + 17 * 3_600);
                 }
             }
         }
@@ -290,7 +335,8 @@ impl Demo {
         let pick = conversation_id.bytes().fold(0usize, |sum, byte| sum.wrapping_mul(31).wrapping_add(byte as usize));
         let members = match row.kind {
             ConversationKind::Direct => 2,
-            ConversationKind::Group => 3 + (pick % 6) as u32,
+            // A group's count is its own people, the ones its member list names.
+            ConversationKind::Group => self.group_people(conversation_id).len() as u32,
             _ => 40 + (pick % 1_200) as u32,
         };
         Ok(ConversationAbout {
@@ -308,10 +354,12 @@ impl Demo {
 
     fn space_about(&self, space_id: &str) -> Result<SpaceAbout, Refusal> {
         let pick = space_id.bytes().fold(0usize, |sum, byte| sum.wrapping_mul(31).wrapping_add(byte as usize));
+        let network = self.ctx.account.network;
+        // Slack says nothing of a workspace but its name; Teams has no online count.
         Ok(SpaceAbout {
-            description: "Field trips, identification help and a lot of photos of moss.".to_owned(),
-            members: Some(200 + (pick % 2_000) as u32),
-            online: Some(20 + (pick % 200) as u32),
+            description: if network == Network::Slack { String::new() } else { "Field trips, identification help and a lot of photos of moss.".to_owned() },
+            members: (network != Network::Slack).then_some(200 + (pick % 2_000) as u32),
+            online: (network == Network::Discord).then_some(20 + (pick % 200) as u32),
             nickname: if self.ctx.account.network == Network::Discord { "Robin 🍄".to_owned() } else { String::new() },
             roles: if self.ctx.account.network == Network::Discord { vec!["Member".to_owned(), "Trail lead".to_owned()] } else { Vec::new() },
             notify: Notify::Mentions,
@@ -342,7 +390,17 @@ impl Demo {
         let items = super::polish::catalog(&self.ctx.account, kind);
         let ids: Vec<String> = items.iter().map(|(id, ..)| (*id).to_owned()).collect();
         let files: Vec<MediaFile> = self.hub.store().media(&self.ctx.account, &ids).unwrap_or_default().into_iter().map(|(file, _)| file).collect();
-        let (items, cursor) = super::polish::page(&files, kind, items, query, cursor);
+        let (mut items, cursor) = super::polish::page(&files, kind, items, query, cursor);
+        if kind == CatalogKind::Gifs {
+            // Sections are the empty query's: a search is one list. Telegram's are the saved ones.
+            for item in &mut items {
+                item.pack = match (query.is_empty(), self.ctx.account.network) {
+                    (false, _) => String::new(),
+                    (true, Network::Telegram) => "Saved".to_owned(),
+                    (true, _) => std::mem::take(&mut item.pack),
+                };
+            }
+        }
         CatalogPage { items, cursor }
     }
 
@@ -362,11 +420,34 @@ impl Demo {
         }
     }
 
-    /// The people the account owns, as a member list: who is around, then who is not.
-    fn members(&self, offset: u32, limit: u32) -> Result<Members, Refusal> {
+    /// A group's people: us, whoever wrote in it, and whoever its title names.
+    fn group_people(&self, conversation_id: &str) -> Vec<protocol::Person> {
         let owned = self.hub.store().people(Some(self.ctx.account.network), None, None, 0, protocol::PAGE_LIMIT);
-        let (mut people, _) = owned.map_err(|err| Refusal::Refused(err.to_string()))?;
+        let mut people = owned.map(|(people, _)| people).unwrap_or_default();
         people.retain(|person| person.key.account() == self.ctx.account);
+        let title = self.ctx.known(conversation_id).ok().flatten().map(|row| row.title).unwrap_or_default();
+        let named: Vec<&str> = title.split(',').map(str::trim).collect();
+        let page = self.hub.store().messages(&self.key(conversation_id), &protocol::Page::Newest, 200, now());
+        let spoke: HashSet<String> = page.ok().flatten().map(|page| page.messages.into_iter().map(|message| message.sender.id).collect()).unwrap_or_default();
+        people.retain(|person| {
+            let first = person.name.split_whitespace().next().unwrap_or("");
+            person.key.id == self.me.id || spoke.contains(&person.key.id) || named.iter().any(|name| *name == person.name || *name == first)
+        });
+        people
+    }
+
+    /// The people the account owns, as a member list: who is around, then who is not. A group
+    /// lists only its own.
+    fn members(&self, conversation_id: &str, offset: u32, limit: u32) -> Result<Members, Refusal> {
+        let group = self.ctx.known(conversation_id).ok().flatten().is_some_and(|row| row.kind == ConversationKind::Group);
+        let mut people = if group {
+            self.group_people(conversation_id)
+        } else {
+            let owned = self.hub.store().people(Some(self.ctx.account.network), None, None, 0, protocol::PAGE_LIMIT);
+            let (mut people, _) = owned.map_err(|err| Refusal::Refused(err.to_string()))?;
+            people.retain(|person| person.key.account() == self.ctx.account);
+            people
+        };
         for person in &mut people {
             person.presence = self.ctx.presence_of(&person.key.id);
         }
@@ -540,7 +621,7 @@ impl Demo {
                 lock(&demo.cancelled).insert(client_id);
             }
             Command::Previews(ids) => demo.previews(&ids),
-            Command::Members { offset, limit, reply, .. } => drop(reply.send(demo.members(offset, limit))),
+            Command::Members { conversation_id, offset, limit, reply } => drop(reply.send(demo.members(&conversation_id, offset, limit))),
             Command::StartDirect { person_id, reply } => drop(reply.send(demo.start_direct(&person_id))),
             Command::SearchPeople(query) => demo.ctx.searched(&query),
             Command::Download { url, reply, .. } => drop(reply.send(Ok(Download { url, headers: Vec::new() }))),

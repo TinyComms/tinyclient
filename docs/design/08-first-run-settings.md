@@ -9,7 +9,7 @@ Main window 1120 × 720, minimum 880 × 560. With zero accounts there is no rail
 | Element | Spec |
 |---|---|
 | App mark | 64, then 16 gap |
-| Headline | "Welcome to tinychat", 22 semibold, `text` |
+| Headline | "Welcome to tinyclient", 22 semibold, `text` |
 | Line | "Sign in to one network to start. Add the others whenever you like." 14 `text_soft`; 6 above, 28 below |
 | Network card | 440 wide, `raised`, 1 `hairline` border, radius 14, four 64 rows split by hairlines |
 | Row | padding 0 16; network icon 32; 14 gap; name 14 semibold over a 12 `text_faint` line; quiet button "Sign in" (30 high, radius 15, `selected` fill) |
@@ -32,9 +32,9 @@ Row second lines: Discord "Servers, direct messages and voice"; Slack "Every wor
 | Helper closed, or Cancel | Nothing. The screen is exactly as before. |
 | Page did not load | "Couldn't reach Discord. Check your connection and try again." |
 | Helper exited on its own | "The sign-in window closed unexpectedly. Try again." |
-| Signed in, session not found after 30 s | "You're signed in, but tinychat couldn't pick up the session. Try again." |
+| Signed in, session not found after 30 s | "You're signed in, but tinyclient couldn't pick up the session. Try again." |
 | Network rejected the session | "Discord didn't accept that sign-in. Try again." |
-| Keychain write failed | "tinychat couldn't save the sign-in to your keychain." |
+| Keychain write failed | "tinyclient couldn't save the sign-in to your keychain." |
 
 **Success.** The helper closes and the shell appears in the same frame: rail (All chats, the network, "+", settings at the bottom), sidebar, empty conversation pane. At the top of the sidebar, under the heading, a progress list (padding 20, rows 13 text, 12 gap, 16 leading mark): finished steps have a `positive` check and `text`; the current step has its number and `text_soft`; later steps `text_faint`. Steps, with real numbers: "Signed in as mira.k", "Connected to Discord", "Loading conversations: 38 so far", then per extra workspace "Connecting to Lumen Labs". Rows appear below a hairline as they arrive. The list is removed when the last step finishes. If a step fails it turns `warning`: "Couldn't load conversations. Retrying at 10:42."
 
@@ -92,31 +92,31 @@ Cached messages stay visible and readable; only sending stops. Nothing about oth
 | Storage | "Clear…" | | Confirm: "Clear 496 MB of saved messages and files? You stay signed in. Conversations load again from the networks." "Cancel" / "Clear" |
 | About | Section 7 | | |
 
-If macOS notifications are denied, Notifications opens with one `warning` line: "Notifications are turned off for tinychat in System Settings." and "Open System Settings".
+If macOS notifications are denied, Notifications opens with one `warning` line: "Notifications are turned off for tinyclient in System Settings." and "Open System Settings".
 
 ## 6. Sign-out, and quit versus close
 
 **Sign-out sheet**, 420 wide, padding 24. Avatar 32 and "Sign out of Lumen Labs?" (17 semibold). "This removes from this Mac the saved sign-in, 18,204 saved messages and 212 MB of images and files for this workspace, and ends this session on Slack." Then "Nothing is deleted on Slack. Your other accounts are not touched." Buttons right-aligned: quiet "Cancel" (default, Return), `danger` "Sign out". Unknown counts are dropped from the sentence. If the network's own logout fails, the account still goes and one line stays in Accounts until dismissed: "Signed out here. Slack may still list this session; end it at slack.com." The header "Sign out" link in today's sidebar goes away.
 
-**Quit versus close, said once.** After the first inbox finishes loading, a card sits at the foot of the sidebar (284 wide, `raised`, radius 12, padding 14): "Messages keep arriving when this window is closed" (14 semibold); "Closing the window leaves tinychat running. Quit with Cmd-Q to stop it." (12 `text_soft`); primary "Open at login", quiet "Not now". Either button removes it for good. The same two sentences are the caption under the General switches, which is where to find them again. Close (Cmd-W) hides the window and keeps receiving; Quit (Cmd-Q) stops everything until the next launch or login. The macOS notification prompt is the system's own and is requested when that first load ends.
+**Quit versus close, said once.** After the first inbox finishes loading, a card sits at the foot of the sidebar (284 wide, `raised`, radius 12, padding 14): "Messages keep arriving when this window is closed" (14 semibold); "Closing the window leaves tinyclient running. Quit with Cmd-Q to stop it." (12 `text_soft`); primary "Open at login", quiet "Not now". Either button removes it for good. The same two sentences are the caption under the General switches, which is where to find them again. Close (Cmd-W) hides the window and keeps receiving; Quit (Cmd-Q) stops everything until the next launch or login. The macOS notification prompt is the system's own and is requested when that first load ends.
 
 ## 7. Identity
 
-**Name:** "tinychat", always lower case. **Icon:** 1024 canvas. Plate 824 square at 100,100, radius 186, vertical gradient `#262a40` to `#0c0d11`, 3 inner stroke white at 8%. Centered speech bubble, 472 × 392, radius 132, tail to the lower left, gradient `#a3acff` to `#6a76f2`. Inside it four dots of radius 44 in a 2 × 2 square, 132 apart, `#0c0d11`: four networks in one small place. No network color or mark (Telegram's terms forbid using its logo). For 32 and below a second drawing: bubble 536 wide, dots radius 58. Menu bar item: the bubble outline with four dots, template image, 18.
+**Name:** "tinyclient", always lower case. **Icon:** 1024 canvas. Plate 824 square at 100,100, radius 186, vertical gradient `#262a40` to `#0c0d11`, 3 inner stroke white at 8%. Centered speech bubble, 472 × 392, radius 132, tail to the lower left, gradient `#a3acff` to `#6a76f2`. Inside it four dots of radius 44 in a 2 × 2 square, 132 apart, `#0c0d11`: four networks in one small place. No network color or mark (Telegram's terms forbid using its logo). For 32 and below a second drawing: bubble 536 wide, dots radius 58. Menu bar item: the bubble outline with four dots, template image, 18.
 
-**About** is the last Settings section; "About tinychat" in the menu opens it. Icon 96; "tinychat" 22 semibold; "Version 0.4.0 (212)" 12 `text_faint`; "One small app for Slack, Discord, Telegram and Teams."; buttons "Website", "Release notes", "Copy version". Acknowledgements group: "Network icons: Dashboard Icons (homarr-labs/dashboard-icons), Apache-2.0. The logos are trademarks of their owners." / "Interface icons: Lucide, ISC." / "Open-source libraries" opens the bundled license list.
+**About** is the last Settings section; "About tinyclient" in the menu opens it. Icon 96; "tinyclient" 22 semibold; "Version 0.4.0 (212)" 12 `text_faint`; "One small app for Slack, Discord, Telegram and Teams."; buttons "Website", "Release notes", "Copy version". Acknowledgements group: "Network icons: Dashboard Icons (homarr-labs/dashboard-icons), Apache-2.0. The logos are trademarks of their owners." / "Interface icons: Lucide, ISC." / "Open-source libraries" opens the bundled license list.
 
 **Menus.** Conversation and View shortcuts yield to the navigation spec where they differ.
 
 | Menu | Items |
 |---|---|
-| tinychat | About tinychat · Check for Updates… · Settings… ⌘, · Services · Hide tinychat ⌘H · Hide Others ⌥⌘H · Show All · Quit tinychat ⌘Q |
+| tinyclient | About tinyclient · Check for Updates… · Settings… ⌘, · Services · Hide tinyclient ⌘H · Hide Others ⌥⌘H · Show All · Quit tinyclient ⌘Q |
 | File | New Message ⌘N · Add Network… · Add Slack Workspace… · Attach File… ⌘U · Close Window ⌘W |
 | Edit | Undo ⌘Z · Redo ⇧⌘Z · Cut ⌘X · Copy ⌘C · Paste ⌘V · Paste and Match Style ⌥⇧⌘V · Select All ⌘A · Find in Conversation ⌘F · Search Everywhere ⇧⌘F · Emoji & Symbols ⌃⌘Space |
 | View | All Chats ⌘1 · one item per network in rail order ⌘2 to ⌘5 · Quick Switcher ⌘K · Hide Sidebar ⌃⌘S · Bigger ⌘+ · Smaller ⌘− · Actual Size ⌘0 · Enter Full Screen ⌃⌘F |
 | Conversation | Next ⌥↓ · Previous ⌥↑ · Next Unread ⌥⇧↓ · Previous Unread ⌥⇧↑ · Back ⌘[ · Forward ⌘] · Mark as Unread ⌥⌘U · Mute… · Start Call ⇧⌘C · Open in Slack ⌥⌘O (names the network) · Copy Link |
-| Window | Minimize ⌘M · Zoom · tinychat (reopens the main window) · Bring All to Front |
-| Help | tinychat Help · Keyboard Shortcuts ⌘/ · Release Notes · Report a Problem… · Copy Diagnostics (version, macOS, connection states; no message content) |
+| Window | Minimize ⌘M · Zoom · tinyclient (reopens the main window) · Bring All to Front |
+| Help | tinyclient Help · Keyboard Shortcuts ⌘/ · Release Notes · Report a Problem… · Copy Diagnostics (version, macOS, connection states; no message content) |
 
 ## 8. Update available
 

@@ -1,0 +1,6 @@
+{"ok": true,
+ "items": [
+  {"type": "message", "channel": "C0GEN", "created": 1760000400, "created_by": "U0ANA",
+   "message": {"type": "message", "user": "U0ANA", "ts": "1760000110.000110", "team": "T01ALPHA", "text": "Release checklist lives in the wiki", "permalink": "https://acme.slack.com/archives/C0GEN/p1760000110000110"}},
+  {"type": "file", "channel": "C0GEN", "created": 1760000300, "created_by": "U0ANA", "file": {"id": "F0PIN", "name": "logo.png"}}
+ ]}

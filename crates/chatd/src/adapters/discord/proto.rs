@@ -14,6 +14,7 @@ use base64::Engine;
 enum Field<'a> {
     Bytes(&'a [u8]),
     Fixed64(u64),
+    Varint(u64),
     Other,
 }
 
@@ -45,10 +46,7 @@ impl<'a> Reader<'a> {
     fn field(&mut self) -> Option<(u64, Field<'a>)> {
         let tag = self.varint()?;
         let field = match tag & 7 {
-            0 => {
-                self.varint()?;
-                Field::Other
-            }
+            0 => Field::Varint(self.varint()?),
             1 => Field::Fixed64(u64::from_le_bytes(self.take(8)?.try_into().ok()?)),
             2 => {
                 let len = self.varint()? as usize;
@@ -159,6 +157,56 @@ fn ids(message: &[u8], wanted: u64, into: &mut Vec<String>) {
     }
 }
 
+/// One of the user's server folders. A server outside any folder comes as a folder of one with
+/// no id, which is not a folder at all.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GuildFolder {
+    pub id: Option<i64>,
+    pub name: String,
+    pub color: Option<u32>,
+    pub guild_ids: Vec<String>,
+}
+
+/// A wrapped scalar (`google.protobuf.Int64Value` and the like): its field 1.
+fn wrapped_varint(message: &[u8]) -> Option<u64> {
+    let mut reader = Reader(message);
+    while let Some((number, field)) = reader.field() {
+        if let (1, Field::Varint(value)) = (number, field) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+/// The user's server folders, in their order. Unverified against a real account: the field
+/// numbers are the community's (`GuildFolder`: 1 `guild_ids` packed fixed64, 2 `id` Int64Value,
+/// 3 `name` StringValue, 4 `color` UInt64Value). `None` when the settings do not say.
+pub fn guild_folders(settings: &str) -> Option<Vec<GuildFolder>> {
+    let bytes = base64::engine::general_purpose::STANDARD.decode(settings.trim()).ok()?;
+    let folders = bytes_of(&bytes, 14)?;
+    let mut found = Vec::new();
+    let mut reader = Reader(folders);
+    while let Some((number, field)) = reader.field() {
+        let (1, Field::Bytes(folder)) = (number, field) else {
+            continue;
+        };
+        let mut parsed = GuildFolder::default();
+        ids(folder, 1, &mut parsed.guild_ids);
+        for (number, field, _) in fields(folder) {
+            match (number, field) {
+                (2, Field::Bytes(id)) => parsed.id = wrapped_varint(id).map(|id| id as i64),
+                (3, Field::Bytes(name)) => {
+                    parsed.name = bytes_of(name, 1).map(|name| String::from_utf8_lossy(name).into_owned()).unwrap_or_default();
+                }
+                (4, Field::Bytes(color)) => parsed.color = wrapped_varint(color).map(|color| (color & 0xff_ffff) as u32),
+                _ => {}
+            }
+        }
+        found.push(parsed);
+    }
+    (!found.is_empty()).then_some(found)
+}
+
 /// The server ids in the user's own order, folders flattened. `None` when the settings do not
 /// say (or are not what this expects).
 pub fn guild_order(settings: &str) -> Option<Vec<String>> {
@@ -206,6 +254,30 @@ mod tests {
         let encoded = base64::engine::general_purpose::STANDARD.encode(settings);
         assert_eq!(guild_order(&encoded).unwrap(), ["30", "10", "20"]);
         assert_eq!(guild_order("not base64!"), None);
+    }
+
+    #[test]
+    fn folders_keep_their_id_name_and_colour_and_a_loose_server_has_none() {
+        let mut folders = Vec::new();
+        // A named, coloured folder of [30, 10], then a loose server 20.
+        let mut folder = Vec::new();
+        write(&mut folder, 1, &[30u64, 10].iter().flat_map(|id| id.to_le_bytes()).collect::<Vec<u8>>());
+        write(&mut folder, 2, &[0x08, 0x07]);
+        let mut name = Vec::new();
+        write(&mut name, 1, b"Games");
+        write(&mut folder, 3, &name);
+        write(&mut folder, 4, &[0x08, 0xff, 0x01]);
+        write(&mut folders, 1, &folder);
+        let mut loose = Vec::new();
+        write(&mut loose, 1, &20u64.to_le_bytes());
+        write(&mut folders, 1, &loose);
+        let mut settings = Vec::new();
+        write(&mut settings, 14, &folders);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&settings);
+        let parsed = guild_folders(&encoded).unwrap();
+        assert_eq!(parsed[0], GuildFolder { id: Some(7), name: "Games".into(), color: Some(255), guild_ids: vec!["30".into(), "10".into()] });
+        assert_eq!(parsed[1], GuildFolder { id: None, name: String::new(), color: None, guild_ids: vec!["20".into()] });
+        assert_eq!(guild_order(&encoded).unwrap(), ["30", "10", "20"]);
     }
 
     #[test]

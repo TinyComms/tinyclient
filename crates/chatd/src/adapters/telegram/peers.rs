@@ -5,8 +5,9 @@
 //! chat with that person), `g<id>` (a basic group), `c<id>` (a supergroup or a channel) or
 //! `c<id>_<topic>` (one topic of a forum, a `Thread`). The account is the user's own id.
 
-use crate::store::PersonRow;
+use crate::store::{PersonDetails, PersonRow};
 use grammers_tl_types as tl;
+use protocol::Mark;
 use std::collections::HashMap;
 
 /// Most peers held in memory. Past this the directory starts over; hashes are also kept as
@@ -86,6 +87,20 @@ pub struct Known {
     pub photo: i64,
     pub photo_dc: i32,
     pub deleted: bool,
+    /// Telegram's own word on the account: verified, or flagged as a scam or an impostor.
+    pub mark: Option<Mark>,
+    /// Telegram Premium, which only matters for our own account (what it may send).
+    pub premium: bool,
+}
+
+/// The tag Telegram's flags give: a warning wins over a tick.
+fn mark(verified: bool, scam: bool, fake: bool) -> Option<Mark> {
+    match (scam, fake, verified) {
+        (true, ..) => Some(Mark::Scam),
+        (_, true, _) => Some(Mark::Fake),
+        (_, _, true) => Some(Mark::Verified),
+        _ => None,
+    }
 }
 
 impl Known {
@@ -134,6 +149,8 @@ fn of_user(user: &tl::types::User) -> Known {
         photo,
         photo_dc,
         deleted: user.deleted,
+        mark: mark(user.verified, user.scam, user.fake),
+        premium: user.premium,
         ..Known::default()
     }
 }
@@ -178,6 +195,7 @@ fn of_chat(chat: &tl::enums::Chat) -> Option<(Who, Known)> {
                 read_only: channel.left || (channel.broadcast && !may_post),
                 photo,
                 photo_dc,
+                mark: mark(channel.verified, channel.scam, channel.fake),
                 ..Known::default()
             };
             (Who::Channel(channel.id), known)
@@ -200,6 +218,8 @@ fn of_chat(chat: &tl::enums::Chat) -> Option<(Who, Known)> {
 pub struct Learned {
     /// People whose row in the store is now out of date.
     pub people: Vec<PersonRow>,
+    /// The tags of those people, for their rows beyond `PersonRow`.
+    pub details: Vec<(String, PersonDetails)>,
     /// Hashes to keep as notes, by note key.
     pub notes: Vec<(String, String)>,
     /// Groups and channels whose title, picture or rights changed.
@@ -259,6 +279,7 @@ impl Directory {
                 learned.notes.extend(known.note().map(|note| (note_key(who), note)));
             }
             learned.people.push(person_row(who, &known));
+            learned.details.push((who.text(), PersonDetails { mark: known.mark, ..PersonDetails::default() }));
             self.map.insert(who, known);
         }
         for chat in chats {

@@ -66,7 +66,7 @@ pub enum Special {
     /// No presence, no call.
     Saved,
     /// The network's own account: Telegram's 777000 (login codes), Discord's system DMs.
-    /// Read-only, never a call, never muted by tinychat.
+    /// Read-only, never a call, never muted by tinyclient.
     Service,
     /// A message request from a stranger. Listed only behind the Requests row, never counted,
     /// and opening it reads nothing on the network.
@@ -293,7 +293,7 @@ pub struct Capabilities {
     pub spoiler: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub as_file: bool,
-    /// The network has a GIF search tinychat can ask (`Catalog` with `Gifs`).
+    /// The network has a GIF search tinyclient can ask (`Catalog` with `Gifs`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub gifs: bool,
     #[serde(default, skip_serializing_if = "is_false")]
@@ -374,7 +374,7 @@ pub struct Outgoing {
     pub ping: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pick: Option<Pick>,
-    /// Unix seconds: the network sends it then (Slack, Telegram). tinychat never runs a timer
+    /// Unix seconds: the network sends it then (Slack, Telegram). tinyclient never runs a timer
     /// that sends.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schedule: Option<i64>,

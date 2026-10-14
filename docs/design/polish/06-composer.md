@@ -144,7 +144,7 @@ edit, Esc or leaving disarms. ⌥Return on the armed message sends silently and 
 - **Send menu** (right-click or long-press Send; P1§ menu): "Send without notification ⌥↩" (Discord, Telegram),
   "Schedule message…" (Slack, Telegram, P2). Empty menu = no menu (Teams).
 - **Schedule (P2).** Popover 240: "Tomorrow 9:00 AM", "Monday 9:00 AM", "Custom…". Then mode bar "Scheduled for Tue
-  9:00 AM" ×, send glyph clock. The network holds it; tinychat runs no timer.
+  9:00 AM" ×, send glyph clock. The network holds it; tinyclient runs no timer.
 
 ## 6. Edit and reply with attachments
 

@@ -34,12 +34,12 @@ pub struct Hosts {
 }
 
 /// A host that is `name` or ends in `.name`.
-fn under(host: &str, name: &str) -> bool {
+pub(super) fn under(host: &str, name: &str) -> bool {
     host == name || host.strip_suffix(name).is_some_and(|rest| rest.ends_with('.'))
 }
 
 impl Hosts {
-    fn trust(&self, network: Network, url: &str) -> Option<Trust> {
+    pub(super) fn trust(&self, network: Network, url: &str) -> Option<Trust> {
         let (secure, host) = host_of(url)?;
         if let Some((_, trust)) = self.local.iter().find(|(local, _)| *local == host) {
             return Some(*trust);
@@ -49,7 +49,8 @@ impl Hosts {
         }
         let (open, session): (&[&str], &[&str]) = match network {
             // The CDN and the media proxy. Their addresses are signed and expire.
-            Network::Discord => (&["cdn.discordapp.com", "discordapp.net"], &[]),
+            // Discord's own GIF search answers with stills on Tenor's host.
+            Network::Discord => (&["cdn.discordapp.com", "discordapp.net", "media.tenor.com"], &[]),
             // Avatars, emoji and unfurled images are public; files need the workspace's token.
             Network::Slack => (&["slack-edge.com", "slack-imgs.com", "slack-files.com"], &["files.slack.com"]),
             // Pictures in messages and people's pictures, each behind the session's own token.
@@ -68,7 +69,7 @@ impl Hosts {
 
 /// Whether an address is `https`, and its host in lower case. `None` for anything that is not
 /// a plain host name: a user part, a bracketed address, an odd character.
-fn host_of(url: &str) -> Option<(bool, String)> {
+pub(super) fn host_of(url: &str) -> Option<(bool, String)> {
     let (scheme, rest) = url.split_once("://")?;
     let secure = match scheme {
         "https" => true,
@@ -379,7 +380,7 @@ mod tests {
     fn fetched(hosts: &Hosts, network: Network, url: &str, adapter: Option<&Sender<Command>>) -> Result<Vec<u8>, String> {
         static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let next = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let part = std::env::temp_dir().join(format!("tinychat-fetch-{}-{next}.part", std::process::id()));
+        let part = std::env::temp_dir().join(format!("tinyclient-fetch-{}-{next}.part", std::process::id()));
         let file = MediaFile::new("F1", MediaKind::Image);
         let want = Want {
             network,
@@ -461,7 +462,7 @@ mod tests {
         };
         let address = |name: &str, ends: &str| format!("http://127.0.0.1:{port}/old/{name}.png?ex={ends}&is=1");
         let (commands, downloads) = adapter(format!("http://127.0.0.1:{port}/new/a.png?ex=7fffffff"));
-        let part = std::env::temp_dir().join(format!("tinychat-fetch-{}-also.part", std::process::id()));
+        let part = std::env::temp_dir().join(format!("tinyclient-fetch-{}-also.part", std::process::id()));
         let file = MediaFile::new("F1", MediaKind::Image);
         let url = address("a", "1");
         let waiting = vec![("F2".to_owned(), address("b", "1")), ("F3".to_owned(), address("c", "7fffffff")), ("F1".to_owned(), url.clone())];

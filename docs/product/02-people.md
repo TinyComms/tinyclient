@@ -7,12 +7,12 @@ presence" must be reworded by the owner when this ships (see question 1).
 
 ## The rule that replaces the old cut
 
-tinychat knows about a person only when that person is on screen or in a list the user owns.
+tinyclient knows about a person only when that person is on screen or in a list the user owns.
 
 - **Owned lists are held whole**: Discord relationships (hard cap 1,000 friends), Telegram
   contacts, DM partners on every network. These are small.
 - **Directories are searched, never downloaded**: a Slack workspace, a Teams org and a Discord
-  server can be 100k people. tinychat never pages through them. It asks the server for a search
+  server can be 100k people. tinyclient never pages through them. It asks the server for a search
   result or for the rows of the member list that are visible.
 - **Presence is a subscription for what is visible**: friends and DM partners in the list, plus the
   people in the open conversation. Closing the conversation drops its subscription. Presence lives
@@ -31,7 +31,7 @@ Checks are observable on the chat socket or on disk. `people`, `person`, `member
 | 2 | P0 | If a picture is missing, still loading or failed, I see the colored initials, never a blank or a spinner. | Block the image host: every row still renders initials and nothing reflows when the image arrives later. |
 | 3 | P0 | I open People and see my Discord friends, Slack and Teams DM partners and Telegram contacts in one list, each row with avatar, name, network icon, presence dot and status text. | `people` returns rows with network, id, name, avatar, presence, status text; count for Discord equals the number of type-1 relationships. |
 | 4 | P0 | People is ordered online first, then everyone else, A to Z inside each group. A network button in the rail narrows it, exactly as it narrows chats. | `people` with a network filter returns only that network; a friend going idle or offline moves groups within 5 s without a refetch. |
-| 5 | P0 | I see a presence dot (online, idle, do not disturb, offline) on DM rows, People rows and the open conversation's header. Unknown is shown as no dot, never as offline. | Change status on a second account from the official app: the dot changes in tinychat within 5 s. A Discord DM partner who is not a friend shows no dot. |
+| 5 | P0 | I see a presence dot (online, idle, do not disturb, offline) on DM rows, People rows and the open conversation's header. Unknown is shown as no dot, never as offline. | Change status on a second account from the official app: the dot changes in tinyclient within 5 s. A Discord DM partner who is not a friend shows no dot. |
 | 6 | P0 | I pick a person I have never talked to and start a conversation. It opens empty and my first message creates it on the network. | `start {network, person}` returns a conversation id; the same call twice returns the same id; nothing appears in the other person's app until I send. |
 | 7 | P0 | I type a name in People and find someone who is not in my list: a Slack or Teams colleague, a Telegram username, a member of a Discord server I am in. | `people {query}` returns server-side matches in under 1 s, at most 25 rows, and chatd memory does not grow by more than the rows returned. |
 | 8 | P1 | I see custom status text and emoji next to a name, and "in a call" when the network reports it. | Status text set in the official app appears on that person's row and in the conversation header. |
@@ -105,17 +105,17 @@ during this research. Confirm against a live session before building.
   authors in server channels unless the member list already has them.
 - Slack and Teams: the subscription set is DM partners visible in the sidebar or People, plus
   authors in the open conversation, capped at 500 ids, replaced as a whole when it changes.
-- Telegram: only what TDLib pushes for contacts and open chats; tinychat sends nothing extra.
+- Telegram: only what TDLib pushes for contacts and open chats; tinyclient sends nothing extra.
 
 ## Open questions for the owner
 
 1. Discord risk. Member-list subscriptions (`op 14`) and profile fetches are what the official
    client does when you open a channel, but they end the README promise "does not scrape member
    lists, or track presence". Accept "only for what is on screen", and reword the README?
-2. Should tinychat ever send a Discord friend request or open a DM with a non-friend (story 13,
+2. Should tinyclient ever send a Discord friend request or open a DM with a non-friend (story 13,
    and story 6 for strangers)? These are the actions Discord flags for user accounts. Default
    proposed: DMs yes, friend requests P2 behind a confirmation.
-3. Does tinychat show me as online while it runs in the background all day, or only while its
+3. Does tinyclient show me as online while it runs in the background all day, or only while its
    window is focused? This decides what colleagues see on Slack and Teams.
 4. Slack and Teams People default: only people I already talk to (proposed), or should the
    directory be browsable A to Z without typing?

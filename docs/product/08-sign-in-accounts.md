@@ -8,7 +8,7 @@ verified; from memory or a single report, test before relying on it.
 
 | Network | How you sign in | "Anyone can sign in"? | Evidence |
 | --- | --- | --- | --- |
-| Discord | Web login page in `tinychat-login`; token read from the page. Captcha, 2FA and passkeys are the page's own. | Yes. Works today against a real account. | Repo state. Token lasts until password change or remote logout [U]. |
+| Discord | Web login page in `tinyclient-login`; token read from the page. Captcha, 2FA and passkeys are the page's own. | Yes. Works today against a real account. | Repo state. Token lasts until password change or remote logout [U]. |
 | Slack | Web login page; one `d` cookie for the whole browser session plus one `xoxc` token per workspace. | Yes for ordinary workspaces. Enterprise Grid is at risk. | "Each workspace has its own token, the cookie is the same for all" [V]. One 2026 report: on Grid, `localConfig_v2.teams` is `{}` when signed in and tokens rotate within hours [V that the report exists, U that it is general]. Our probe reads exactly that key. |
 | Telegram | Native: QR code scanned from the phone, or phone number, code, optional 2FA password. No web page. | Yes. The only sanctioned one. | API terms welcome third-party clients; one `api_id` per app, registered by the owner, shipped in the binary [V]. |
 | Teams, personal account | Microsoft login page; client id `8ec6bc83-…`, tenant `consumers`, skype token from `teams.live.com/api/auth/v1.0/authz/consumer`. | Probably yes. | Constants from purple-teams `teams_login.c` [V]. Not run by us [U]. |
@@ -46,7 +46,7 @@ verified; from memory or a single report, test before relying on it.
   `*.ng.msg.teams.microsoft.com` chat service; new messages arrive over trouter (websocket).
   purple-teams does this and is active (issues filed Sep 2026) [V]. It has no calls; it links to
   the web client, which matches our hand-off rule in `stories.md`.
-- **Sign-in shape:** show Microsoft's real login page in `tinychat-login` (MFA, passkeys and
+- **Sign-in shape:** show Microsoft's real login page in `tinyclient-login` (MFA, passkeys and
   federated SSO are the page's own), using the authorization-code flow with the native-client
   redirect that purple-teams' source also carries [U that it still works], not device code,
   which is the flow tenants are blocking. A native-client
@@ -55,7 +55,7 @@ verified; from memory or a single report, test before relying on it.
   `teams.microsoft.com` the way we do for Slack would mean signing in every day. Do not do that.
 - **What stops it:** conditional access. A WKWebView in an unknown app has no device identity, so
   "require compliant device" fails even with correct credentials [U for WKWebView specifically].
-  The user sees Microsoft's own block page. tinychat must then say in words: "Your organization
+  The user sees Microsoft's own block page. tinyclient must then say in words: "Your organization
   doesn't allow this app. Teams stays in the Teams app." and stop offering to retry.
 - **Graph, the official route, does not rescue this.** Delegated `Chat.Read` does not itself
   need admin consent [V], but: personal accounts are "Not supported" [V]; there is no push to a
@@ -81,7 +81,7 @@ and Okta.
 
 | # | P | Story | Observable check |
 | --- | --- | --- | --- |
-| 1 | P0 | I double-click tinychat and it works. I never start a daemon. | With no chatd running, launching the app yields a `status` answer on the socket within 1 s. |
+| 1 | P0 | I double-click tinyclient and it works. I never start a daemon. | With no chatd running, launching the app yields a `status` answer on the socket within 1 s. |
 | 2 | P0 | On first launch I see one screen: four networks, each with a Sign in button, nothing else to configure. | Fresh data dir: `status` reports four networks `SignedOut`; the window shows four buttons and no list. |
 | 3 | P0 | I sign in to one network and see real conversations without restarting. | After the login window closes, `list` is non-empty within 5 s and the first open returns messages. |
 | 4 | P0 | Networks I have not added stay out of my way: a single "+" in the rail, not three dead icons. | With only Discord signed in, the rail has All chats, Discord, and "+". |
@@ -91,14 +91,14 @@ and Okta.
 | 8 | P0 | I sign out of one account and it is gone from this Mac and from the network's device list. | After `sign_out`: no keychain item for it, no rows for it in SQLite, files for it deleted, and the network's own logout was called (best effort). Other accounts untouched. |
 | 9 | P0 | I sign in to Telegram by scanning a QR code with my phone. | QR shown within 2 s of pressing Sign in; after the scan `status` shows Telegram online; a 2FA account is asked for its password in a native field. |
 | 10 | P0 | I install from a disk image and open it without a security warning. | A downloaded copy passes `spctl --assess` and opens on a Mac that has never run it. |
-| 11 | P0 | I get notifications that are named tinychat, and I am never asked for my keychain password after an update. | Notification shows the app name and icon; replacing the app with the next version produces no keychain dialog. |
+| 11 | P0 | I get notifications that are named tinyclient, and I am never asked for my keychain password after an update. | Notification shows the app name and icon; replacing the app with the next version produces no keychain dialog. |
 | 12 | P1 | I sign in to Telegram with phone number and code when my phone is not nearby. | Number, code, optional password; wrong code says so and lets me retry without restarting. |
 | 13 | P1 | I sign in to Teams with a personal or an unrestricted work account. | `status` shows Teams online; a message sent from the real Teams app appears without polling. |
-| 14 | P1 | If my organization blocks tinychat, I am told that plainly and not asked to try again. | A tenant with a compliant-device policy ends in the "organization doesn't allow this app" state, not a spinner or a loop. |
-| 15 | P1 | tinychat keeps receiving while its window is closed, and starts when I log in. | Quit the window: chatd is still up and notifications arrive. Toggle in Settings appears in System Settings, Login Items. |
+| 14 | P1 | If my organization blocks tinyclient, I am told that plainly and not asked to try again. | A tenant with a compliant-device policy ends in the "organization doesn't allow this app" state, not a spinner or a loop. |
+| 15 | P1 | tinyclient keeps receiving while its window is closed, and starts when I log in. | Quit the window: chatd is still up and notifications arrive. Toggle in Settings appears in System Settings, Login Items. |
 | 16 | P1 | I open Settings with Cmd-comma and see every account, its state, and Sign out. | The account list matches `status`; Sign out here is the same action as story 8. |
-| 17 | P1 | I can see how much disk tinychat uses and clear it without signing out. | Size shown matches the data dir within 5%; after Clear, sessions remain and the list refills from the network. |
-| 18 | P1 | tinychat updates itself. | An older build offers the new version and relaunches into it with sessions intact. |
+| 17 | P1 | I can see how much disk tinyclient uses and clear it without signing out. | Size shown matches the data dir within 5%; after Clear, sessions remain and the list refills from the network. |
+| 18 | P1 | tinyclient updates itself. | An older build offers the new version and relaunches into it with sessions intact. |
 | 19 | P1 | I add a Slack workspace that was not in my browser session. | "Add workspace" yields one more Slack account; existing ones do not reconnect. |
 | 20 | P2 | I use two Discord or Telegram accounts, or a Teams account that is a guest in other tenants. | Two accounts on one network in `status`, each with its own unread. |
 | cut | | Creating an account on any network; pasting a token; importing a session from Chrome or the official app; a risk-acknowledgement screen (the README carries it). | |
@@ -138,8 +138,8 @@ anything that hides presence on Telegram.
 
 ## Packaging
 
-- **A signed, notarized `tinychat.app`** holding the shell, `chatd`, `mediad` and
-  `tinychat-login`, shipped as a disk image. Without a Developer ID ($99 a year) and
+- **A signed, notarized `tinyclient.app`** holding the shell, `chatd`, `mediad` and
+  `tinyclient-login`, shipped as a disk image. Without a Developer ID ($99 a year) and
   notarization, a downloaded copy is blocked until the person allows it in System Settings.
 - **Why the bundle matters for behavior, not looks.** Notifications need a bundle identifier; a
   bare binary cannot post one with our name and icon. Keychain items are tied to the code
@@ -160,7 +160,7 @@ anything that hides presence on Telegram.
    maintainer. Is 12 MB a hard number, or is "Telegram costs extra only if you use it" fine?
 3. Will you pay for an Apple Developer ID and register the Telegram `api_id` under your own name
    and phone number? Both tie the app to you, and both are required for "anyone can install it".
-4. Signing in to Teams as Microsoft's own client id presents tinychat as a first-party app, a
+4. Signing in to Teams as Microsoft's own client id presents tinyclient as a first-party app, a
    step past what we do for Slack and Discord. Accept that, or limit Teams to personal accounts?
 5. Slack Enterprise Grid: if page storage no longer holds the token, the fallback is reading it
    from the page's own boot request. In scope for the first release, or a README gap?

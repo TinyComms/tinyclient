@@ -1,0 +1,9 @@
+{"ok": true,
+ "files": [
+  {"id": "F0MAP", "created": 1760000200, "timestamp": 1760000200, "name": "map.png", "title": "map.png", "mimetype": "image/png", "filetype": "png",
+   "user": "U0ANA", "size": 2048, "original_w": 640, "original_h": 480,
+   "url_private": "https://files.slack.com/files-pri/T01ALPHA-F0MAP/map.png",
+   "thumb_480": "https://files.slack.com/files-tmb/T01ALPHA-F0MAP/map_480.png", "thumb_480_w": 480, "thumb_480_h": 360,
+   "shares": {"public": {"C0GEN": [{"ts": "1760000201.000201", "channel_name": "general"}]}}}
+ ],
+ "paging": {"count": 25, "total": 12, "page": 1, "pages": 1}}

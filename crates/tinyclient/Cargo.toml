@@ -1,0 +1,32 @@
+[package]
+name = "tinyclient"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+protocol.workspace = true
+
+# GPUI is the shell. It is behind `gui` so `cargo test` and the daemons never pull the GPU stack.
+#   cargo run -p tinyclient --features gui
+# Pinned to a Zed commit: gpui_platform is not on crates.io. `runtime_shaders` lets it build with
+# Command Line Tools only (no Xcode `metal` compiler).
+gpui = { git = "https://github.com/zed-industries/zed", rev = "cb13b37a6d80d034119888b534aa0d9067fb5aee", optional = true }
+unicode-segmentation = { version = "1.10", optional = true }
+libc = { version = "0.2", optional = true }
+# Avatars are decoded at the size they are drawn. Both are already in the tree through GPUI.
+image = { version = "0.25", optional = true, default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+smallvec = { version = "1.6", optional = true }
+
+[features]
+gui = ["dep:gpui", "dep:gpui_platform", "dep:unicode-segmentation", "dep:libc", "dep:image", "dep:smallvec"]
+# Adds `--shot out.png`: render the window to a file and quit, for design review without
+# Screen Recording permission. Pulls GPUI's test support, so it is not part of `gui`.
+gui-shot = ["gui", "gpui/test-support", "gpui_platform/test-support"]
+
+[target.'cfg(target_os = "macos")'.dependencies]
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "cb13b37a6d80d034119888b534aa0d9067fb5aee", optional = true, default-features = false, features = ["font-kit", "runtime_shaders"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "cb13b37a6d80d034119888b534aa0d9067fb5aee", optional = true, default-features = false, features = ["font-kit"] }

@@ -69,6 +69,8 @@ struct Seen {
     path: String,
     headers: HashMap<String, String>,
     body: Value,
+    /// How many bytes the body was, for an upload, which is not JSON.
+    bytes: usize,
     at: Instant,
 }
 
@@ -222,15 +224,78 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
             (204, Value::Null)
         }
         ("PATCH", ["users", "@me", "settings-proto", "1"]) => (200, json!({"settings": seen.body["settings"]})),
-        ("GET", ["users", person, "profile"]) => (
-            200,
-            json!({
+        ("GET", ["users", person, "profile"]) => {
+            let mut profile = json!({
                 "user": {"id": person, "username": "sam", "global_name": "Sam Whitlock", "discriminator": "0", "avatar": "s4m", "bio": ""},
                 "user_profile": {"bio": "Maintains the build. **Tea**, not coffee.", "pronouns": ""},
                 "mutual_guilds": [{"id": "4000", "nick": null}, {"id": "7777", "nick": null}],
                 "connected_accounts": [], "premium_since": null,
-            }),
+            });
+            // Asked from inside a server: their membership there.
+            if seen.path.contains("guild_id=4000") {
+                profile["user_profile"]["pronouns"] = json!("they/them");
+                profile["guild_member"] = json!({"nick": "Sammy", "roles": ["4010", "4000"], "joined_at": "2023-03-01T12:00:00+00:00"});
+            }
+            (200, profile)
+        }
+        ("PATCH", ["users", "@me", "guilds", guild, "settings"]) => {
+            // The server's settings whole, with the override asked for, as Discord answers.
+            let overrides = seen.body["channel_overrides"].as_object().cloned().unwrap_or_default();
+            let overrides: Vec<Value> = overrides
+                .into_iter()
+                .map(|(id, mut setting)| {
+                    setting["channel_id"] = json!(id);
+                    setting
+                })
+                .collect();
+            let guild_id = if *guild == "@me" { Value::Null } else { json!(guild) };
+            (200, json!({"guild_id": guild_id, "muted": false, "suppress_everyone": false, "suppress_roles": false, "message_notifications": 0, "flags": 0, "channel_overrides": overrides}))
+        }
+        ("DELETE", ["channels", channel]) => (200, json!({"id": channel, "type": 1})),
+        ("GET", ["channels", channel, "messages", "pins"]) => {
+            let pinned = json!({
+                "id": "1300000000000000700", "channel_id": channel, "type": 0, "author": me(), "content": "Read the rules first",
+                "timestamp": "2026-10-13T08:15:00.000000+00:00", "edited_timestamp": null, "mentions": [], "mention_roles": [],
+                "mention_everyone": false, "attachments": [], "embeds": [], "pinned": true,
+            });
+            (200, json!({"items": [{"pinned_at": "2026-10-13T09:00:00.000000+00:00", "message": pinned}], "has_more": false}))
+        }
+        ("GET", ["guilds", _, "messages", "search"]) | ("GET", ["channels", _, "messages", "search"]) => {
+            let channel = if parts[0] == "channels" { parts[1].to_owned() } else { "4101".to_owned() };
+            let hit = json!({
+                "id": "1300000000000000600", "channel_id": channel, "type": 0, "author": me(), "content": "the map",
+                "timestamp": "2026-10-13T08:15:00.000000+00:00", "edited_timestamp": null, "mentions": [], "mention_roles": [],
+                "mention_everyone": false, "embeds": [], "pinned": false,
+                "attachments": [{"id": "9001", "filename": "map.png", "size": 2048, "url": "https://cdn.discordapp.com/attachments/1/9001/map.png",
+                                 "proxy_url": "https://media.discordapp.net/attachments/1/9001/map.png", "width": 640, "height": 480, "content_type": "image/png"}],
+            });
+            (200, json!({"analytics_id": "a", "doing_deep_historical_index": false, "total_results": 37, "messages": [[hit]]}))
+        }
+        ("GET", ["guilds", guild]) => (
+            200,
+            json!({"id": guild, "name": "Rustaceans", "description": "Crabs and their friends", "approximate_member_count": 1204, "approximate_presence_count": 230}),
         ),
+        ("GET", ["gifs", "search" | "trending-gifs"]) => (
+            200,
+            json!([
+                {"id": "1", "title": "cat typing", "url": "https://tenor.com/view/cat-typing-1", "src": "https://media.tenor.com/1.mp4",
+                 "gif_src": "https://media.tenor.com/1.gif", "preview": "https://media.tenor.com/1.png", "width": 220, "height": 160},
+            ]),
+        ),
+        ("POST", ["channels", _, "attachments"]) => {
+            let host = seen.headers.get("host").cloned().unwrap_or_default();
+            let files = seen.body["files"].as_array().cloned().unwrap_or_default();
+            let slots: Vec<Value> = files
+                .iter()
+                .map(|file| {
+                    let name = format!("up/{}", file["filename"].as_str().unwrap());
+                    json!({"id": file["id"], "upload_url": format!("http://{host}/upload/{name}"), "upload_filename": name})
+                })
+                .collect();
+            (200, json!({"attachments": slots}))
+        }
+        ("PUT", ["upload", ..]) => (200, Value::Null),
+        ("DELETE", ["attachments", ..]) => (204, Value::Null),
         // A fresh signature for each address asked about; one that names `lost` is not renewed.
         ("POST", ["attachments", "refresh-urls"]) => {
             let asked = seen.body["attachment_urls"].as_array().cloned().unwrap_or_default();
@@ -263,6 +328,22 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
             if !seen.body["message_reference"].is_null() {
                 message["type"] = json!(19);
                 message["message_reference"] = seen.body["message_reference"].clone();
+            }
+            message["flags"] = seen.body["flags"].clone();
+            // Uploaded files become attachments under the name they were sent as.
+            let sent = seen.body["attachments"].as_array().cloned().unwrap_or_default();
+            let attached: Vec<Value> = sent
+                .iter()
+                .enumerate()
+                .map(|(at, file)| {
+                    json!({"id": format!("880{at}"), "filename": file["filename"], "size": 3, "url": format!("https://cdn.discordapp.com/attachments/1/880{at}/f"),
+                           "content_type": "text/plain"})
+                })
+                .collect();
+            message["attachments"] = json!(attached);
+            if let Some(stickers) = seen.body["sticker_ids"].as_array() {
+                let items: Vec<Value> = stickers.iter().map(|id| json!({"id": id, "name": "wave", "format_type": 1})).collect();
+                message["sticker_items"] = json!(items);
             }
             // The gateway tells every session, the sender's included.
             shared.push("MESSAGE_CREATE", message.clone());
@@ -305,6 +386,7 @@ fn serve_http(shared: Arc<Shared>, stream: TcpStream) {
             path,
             headers,
             body: serde_json::from_slice(&body).unwrap_or(Value::Null),
+            bytes: body.len(),
             at: Instant::now(),
         };
         shared.requests.lock().unwrap().push(seen.clone());
@@ -483,7 +565,7 @@ impl World {
     fn launch(env: &[(&str, &str)], prepare: impl FnOnce(&Shared)) -> World {
         static NEXT: AtomicU32 = AtomicU32::new(0);
         // Short path: a unix socket address holds about 100 bytes.
-        let dir = PathBuf::from(format!("/tmp/tinychat-dc-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        let dir = PathBuf::from(format!("/tmp/tinyclient-dc-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -705,6 +787,7 @@ impl Drop for World {
         let _ = self.child.kill();
         let _ = self.child.wait();
         let _ = std::fs::remove_dir_all(&self.dir);
+        let _ = std::fs::remove_dir_all(self.dir.with_extension("files"));
     }
 }
 
@@ -2250,4 +2333,384 @@ fn a_challenge_stops_every_request_and_shows_on_the_account() {
     wait("the account to be clear", || world.required().is_empty().then_some(()));
     world.discord.push("USER_REQUIRED_ACTION_UPDATE", json!({"required_action": "REQUIRE_VERIFIED_PHONE"}));
     wait("the account to say what Discord wants", || world.required().contains("phone number").then_some(()));
+}
+
+/// READY as the polish round reads it: server folders, a server's hide-muted and opt-in
+/// settings, a muted category, a message request, a bot's and Discord's own DM, and a server's
+/// emoji and stickers. Everything else is the usual fixture.
+fn polished_ready() -> String {
+    let mut ready: Value = serde_json::from_str(READY).unwrap();
+    ready["user"]["premium_type"] = json!(0);
+    ready["user_settings"] = json!({"guild_folders": [
+        {"id": 77, "name": "Games", "color": 0xff0000, "guild_ids": ["4000"]},
+        {"id": null, "name": null, "color": null, "guild_ids": ["5000"]},
+    ]});
+    let rustaceans = &mut ready["user_guild_settings"]["entries"][0];
+    rustaceans["hide_muted_channels"] = json!(true);
+    // "Show all channels" off: #general and the Text category's #rules are opted in; the Voice
+    // category is muted.
+    rustaceans["flags"] = json!(1 << 14);
+    let overrides = rustaceans["channel_overrides"].as_array_mut().unwrap();
+    overrides.push(json!({"channel_id": "4101", "muted": false, "mute_config": null, "message_notifications": 3, "flags": 1 << 12}));
+    overrides.push(json!({"channel_id": "4200", "muted": true, "mute_config": null, "message_notifications": 3, "flags": 0}));
+    let users = ready["users"].as_array_mut().unwrap();
+    users.push(json!({"id": "2007", "username": "stranger", "global_name": "A Stranger", "discriminator": "0", "avatar": null}));
+    users.push(json!({"id": "2008", "username": "deploybot", "global_name": null, "discriminator": "0", "avatar": null, "bot": true}));
+    users.push(json!({"id": "643945264868098049", "username": "discord", "global_name": "Discord", "discriminator": "0", "avatar": null, "system": true}));
+    let private = ready["private_channels"].as_array_mut().unwrap();
+    private.push(json!({"id": "3005", "type": 1, "recipient_ids": ["2007"], "last_message_id": "1300000000000000050", "is_message_request": true, "is_message_request_timestamp": "2026-10-13T08:00:00+00:00"}));
+    private.push(json!({"id": "3006", "type": 1, "recipient_ids": ["2008"], "last_message_id": "1300000000000000060"}));
+    private.push(json!({"id": "3007", "type": 1, "recipient_ids": ["643945264868098049"], "last_message_id": "1300000000000000070"}));
+    let rustaceans = &mut ready["guilds"][0];
+    rustaceans["emojis"] = json!([
+        {"id": "5101", "name": "ferris", "animated": false, "available": true},
+        {"id": "5102", "name": "lost_boost", "animated": false, "available": false},
+    ]);
+    rustaceans["stickers"] = json!([{"id": "5201", "name": "wave", "format_type": 1}, {"id": "5202", "name": "dance", "format_type": 3}]);
+    let general = rustaceans["channels"].as_array_mut().unwrap().iter_mut().find(|channel| channel["id"] == "4101").unwrap();
+    general["topic"] = json!("Anything goes.\nKeep it kind.");
+    ready.to_string()
+}
+
+fn polished() -> World {
+    let world = World::launch(&[], |shared| *shared.ready.lock().unwrap() = polished_ready());
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+    world
+}
+
+#[test]
+fn the_home_follows_discords_own_folders_mutes_opt_in_requests_threads_and_plan() {
+    let world = polished();
+    // The server folders as the user made them; a server alone is in none.
+    let folders = match world.ask(Request::Folders { network: Network::Discord }) {
+        Response::Folders { folders } => folders,
+        other => panic!("{other:?}"),
+    };
+    let named: Vec<(&str, &str, Option<u32>, Vec<&str>)> =
+        folders.iter().map(|folder| (folder.key.id.as_str(), folder.name.as_str(), folder.color, folder.spaces.iter().map(String::as_str).collect())).collect();
+    assert_eq!(named, [("77", "Games", Some(0xff0000), vec!["4000"])]);
+    let spaces = match world.ask(Request::Spaces { network: Some(Network::Discord) }) {
+        Response::Spaces { spaces } => spaces,
+        other => panic!("{other:?}"),
+    };
+    let space = |id: &str| spaces.iter().find(|space| space.key.id == id).unwrap().clone();
+    assert_eq!((space("4000").folder.as_deref(), space("4000").muted, space("4000").hide_muted), (Some("77"), false, true));
+    assert_eq!((space("5000").folder, space("5000").muted, space("5000").hide_muted), (None, true, false));
+
+    // The tree marks what is not opted in, and the muted category; our thread is followed.
+    let asked = Request::Tree { space: world.key("4000"), offset: 0, limit: 500, peek: false };
+    let Response::Tree { groups, conversations, .. } = world.ask(asked) else { panic!("no tree") };
+    let group = |name: &str| groups.iter().find(|group| group.name == name).unwrap_or_else(|| panic!("{name} not in {groups:?}"));
+    assert!(group("Voice").muted && !group("Text").muted);
+    let row = |id: &str| conversations.iter().find(|row| row.key.id == id).unwrap_or_else(|| panic!("{id} is not in the tree"));
+    let shown: Vec<&str> = conversations.iter().filter(|row| !row.opted_out && row.kind != ConversationKind::Thread).map(|row| row.key.id.as_str()).collect();
+    assert_eq!(shown, ["4101"], "#general shows; the rest wait under Browse");
+    assert!(row("4201").opted_out && row("4102").opted_out && conversations.len() > 3);
+    assert!(world.conversation("4500").followed, "a thread READY lists is one we are in");
+
+    // A message request waits behind Requests; a bot's DM is an app's; Discord's own is read-only.
+    let home = |shelf| match world.ask(Request::Home { network: Network::Discord, account: None, folder: None, shelf, offset: 0, limit: 50 }) {
+        Response::Conversations { conversations, .. } => conversations.into_iter().map(|row| row.key.id).collect::<Vec<_>>(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(home(protocol::Shelf::Requests), ["3005"]);
+    assert!(!home(protocol::Shelf::Main).contains(&"3005".to_owned()));
+    assert_eq!(world.conversation("3005").special, protocol::Special::Request);
+    assert!(world.conversation("3006").bot && !world.conversation("3001").bot);
+    let system = world.conversation("3007");
+    assert_eq!((system.special, system.read_only, system.call), (protocol::Special::Service, true, CallSupport::None));
+
+    // What the free plan may send.
+    let can = match world.ask(Request::Status) {
+        Response::Status { accounts, .. } => accounts.into_iter().find(|account| account.key == world.account()).unwrap().can,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!((can.max_file_bytes, can.max_files, can.custom_emoji), (10 << 20, 10, protocol::EmojiScope::Space));
+    assert!(can.gifs && can.stickers && can.spoiler && can.silent && can.suppress_embeds && can.reply_ping && !can.schedule);
+
+    // Friends: in voice (from the voice states) and playing (from presence). The voice channel
+    // with a friend in it is told although no server is on screen.
+    let around = match world.ask(Request::Around { network: Some(Network::Discord) }) {
+        Response::Around { in_call, online, .. } => (in_call, online),
+        other => panic!("{other:?}"),
+    };
+    let dev = around.0.iter().find(|person| person.key.id == "2002").expect("Dev is in a call");
+    let voice = dev.activity.as_deref().unwrap();
+    assert_eq!((voice.kind, voice.name.as_str(), voice.place.as_str()), (protocol::ActivityKind::InVoice, "Lounge", "Rustaceans"));
+    assert_eq!(voice.conversation, Some(world.key("4201")));
+    let mara = around.1.iter().find(|person| person.key.id == "2001").expect("Mara is online");
+    let playing = mara.activity.as_deref().unwrap();
+    assert_eq!((playing.kind, playing.name.as_str()), (protocol::ActivityKind::Playing, "Factorio"));
+    let in_voice = match world.ask(Request::InVoice { network: Some(Network::Discord) }) {
+        Response::Conversations { conversations, .. } => conversations,
+        other => panic!("{other:?}"),
+    };
+    let lounge = in_voice.iter().find(|row| row.key.id == "4201").expect("the friend's voice channel");
+    assert_eq!(lounge.occupants.as_ref().map(|occupants| occupants.people[0].person.id.as_str()), Some("2002"));
+    // Dev leaves: the activity and the channel go.
+    world.discord.push("VOICE_STATE_UPDATE", json!({"user_id": "2002", "guild_id": "4000", "channel_id": null, "session_id": "voice-dev"}));
+    wait("Dev to leave the call", || match world.ask(Request::Around { network: Some(Network::Discord) }) {
+        Response::Around { in_call, .. } => in_call.is_empty().then_some(()),
+        _ => None,
+    });
+
+    // Opening the request reads nothing on Discord.
+    wait("the unread DM to be warmed", || world.discord.requests_to("GET", "/channels/3001/messages").first().cloned());
+    sleep(Duration::from_secs(3));
+    let before = world.discord.asked();
+    assert_eq!(world.ask(Request::MarkRead { conversation: world.key("3005"), message_id: "1300000000000000050".into() }), Response::Ok);
+    world.ask(Request::MarkRead { conversation: world.key("3001"), message_id: "1300000000000000010".into() });
+    wait("the other mark", || world.discord.requests_to("POST", "/channels/3001/messages/").first().cloned());
+    assert!(world.discord.requests_to("POST", "/channels/3005/").is_empty(), "no ack for a request");
+
+    // Connecting asked for the one unread DM's history and nothing else; rows on screen with no
+    // preview ask nothing at all on Discord.
+    assert_eq!(before, ["GET /channels/3001/messages?limit=50"]);
+    let rows: Vec<Key> = ["3002", "3003", "3005", "3006", "3007"].iter().map(|id| world.key(id)).collect();
+    world.ask(Request::Watch(Watching { rows, ..Watching::default() }));
+    sleep(Duration::from_secs(2));
+    let after: Vec<String> = world.discord.asked().into_iter().filter(|asked| !asked.contains("/ack")).collect();
+    assert_eq!(after, before, "no preview is fetched on Discord");
+}
+
+#[test]
+fn info_mute_leave_pins_and_the_shared_search_ask_discord_once_each_and_only_when_asked() {
+    let world = polished();
+    let asked_now = || world.discord.asked().len();
+
+    // A profile opened inside a server: nickname, roles by name (the everyone role left out),
+    // the join date, pronouns. One request, with the server named.
+    let profile = match world.ask(Request::Profile { person: world.key("2006"), space: Some(world.key("4000")) }) {
+        Response::Profile { profile } => profile,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!((profile.nickname.as_str(), profile.pronouns.as_str()), ("Sammy", "they/them"));
+    assert_eq!(profile.joined, Some(1_677_672_000));
+    assert_eq!(profile.roles.len(), 1, "{:?}", profile.roles);
+    let profiles = world.discord.requests_to("GET", "/users/2006/profile");
+    assert_eq!(profiles.len(), 1);
+    assert!(profiles[0].path.contains("guild_id=4000") && profiles[0].path.contains("with_mutual_friends=false"));
+
+    // A channel's info is what READY said: nothing is asked.
+    let before = asked_now();
+    let info = match world.ask(Request::ConversationInfo { conversation: world.key("4101") }) {
+        Response::ConversationInfo { info } => info,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(asked_now(), before, "a channel's info asks Discord nothing");
+    assert_eq!(info.notify, protocol::Notify::Mentions, "the server's own level");
+    assert_eq!(info.description, "Anything goes.\nKeep it kind.", "the topic whole, where the row has one line");
+    assert_eq!(world.conversation("4101").topic, "Anything goes. Keep it kind.");
+
+    // A server's info: one request with counts; our nickname from READY.
+    let space = match world.ask(Request::SpaceInfo { space: world.key("4000") }) {
+        Response::SpaceInfo { info } => info,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!((space.members, space.online, space.description.as_str()), (Some(1204), Some(230), "Crabs and their friends"));
+    assert_eq!(space.nickname, "jscroggins");
+    assert_eq!(world.discord.requests_to("GET", "/guilds/4000").len(), 1);
+
+    // Mute: the server's settings for that one channel, as Discord's own menu sends them; the
+    // row follows Discord's answer.
+    assert_eq!(world.ask(Request::SetMute { conversation: world.key("4101"), notify: protocol::Notify::Nothing }), Response::Ok);
+    let patched = world.discord.requests_to("PATCH", "/users/@me/guilds/4000/settings");
+    assert_eq!(patched.len(), 1);
+    assert_eq!(patched[0].body["channel_overrides"]["4101"]["muted"], true);
+    assert_eq!(patched[0].body["channel_overrides"]["4101"]["mute_config"]["selected_time_window"], -1);
+    assert!(world.conversation("4101").muted);
+    assert_eq!(world.ask(Request::SetMute { conversation: world.key("3001"), notify: protocol::Notify::Mentions }), Response::Ok);
+    let direct = world.discord.requests_to("PATCH", "/users/@me/guilds/@me/settings");
+    assert_eq!(direct[0].body["channel_overrides"]["3001"], json!({"muted": false, "message_notifications": 1, "mute_config": {"end_time": null, "selected_time_window": -1}}));
+
+    // Leave a group, close a DM: one DELETE each, and the row goes. A server channel is neither.
+    assert_eq!(world.ask(Request::Leave { conversation: world.key("3003") }), Response::Ok);
+    assert_eq!(world.ask(Request::CloseDirect { conversation: world.key("3002") }), Response::Ok);
+    let deleted: Vec<String> = world.discord.requests_to("DELETE", "/channels/").into_iter().map(|seen| seen.path).collect();
+    assert_eq!(deleted, ["/channels/3003?silent=false", "/channels/3002"]);
+    assert!(matches!(world.ask(Request::Conversation { conversation: world.key("3003") }), Response::Error { .. }));
+    assert!(matches!(world.ask(Request::Leave { conversation: world.key("4101") }), Response::Error { .. }));
+    assert_eq!(world.discord.requests_to("DELETE", "/channels/").len(), 2, "refused here, not asked");
+
+    // Pins, from the current route.
+    let pinned = match world.ask(Request::Pinned { conversation: world.key("4101") }) {
+        Response::Pinned { messages, .. } => messages,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!((pinned.len(), pinned[0].text.as_str(), pinned[0].pinned), (1, "Read the rules first", true));
+    assert_eq!(world.discord.requests_to("GET", "/channels/4101/messages/pins").len(), 1);
+
+    // What was shared: the cache, asking nothing; then Discord's search, because the user asked.
+    let shared = |search: bool, before: Option<&str>| match world.ask(Request::Shared {
+        conversation: world.key("4101"),
+        kind: protocol::SharedKind::Media,
+        before: before.map(str::to_owned),
+        limit: 25,
+        search,
+    }) {
+        Response::Shared { items, complete, total, .. } => (items, complete, total),
+        other => panic!("{other:?}"),
+    };
+    let before = asked_now();
+    assert!(!shared(false, None).1);
+    assert_eq!(asked_now(), before, "the cache's list asks nothing");
+    let (items, complete, total) = shared(true, None);
+    assert!(complete && total == Some(37));
+    assert_eq!(items.iter().map(|item| item.attachment.as_ref().unwrap().name.as_str()).collect::<Vec<_>>(), ["map.png"]);
+    let search = world.discord.requests_to("GET", "/guilds/4000/messages/search");
+    assert!(search[0].path.contains("channel_id=4101") && search[0].path.contains("has=image&has=video"), "{}", search[0].path);
+    let (_, _, total) = shared(true, Some("1300000000000000600"));
+    assert_eq!(total, None, "a later page has no total");
+    assert!(world.discord.requests_to("GET", "/guilds/4000/messages/search")[1].path.contains("max_id=1300000000000000599"));
+}
+
+/// A file of `size` bytes beside the world's directory: chatd never sends from its own.
+fn staged(world: &World, name: &str, size: usize) -> String {
+    let dir = world.dir.with_extension("files");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(name);
+    std::fs::write(&path, vec![b'x'; size]).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+fn send_with(world: &World, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, with: protocol::Outgoing) {
+    let asked = Request::Send { conversation: world.key(conversation), client_id: client_id.into(), text: text.into(), reply_to: reply_to.map(str::to_owned), with };
+    let answer = world.ask(asked);
+    assert!(matches!(answer, Response::Sent { .. }), "{answer:?}");
+}
+
+fn file(path: &str, spoiler: bool) -> protocol::OutgoingFile {
+    protocol::OutgoingFile { path: path.to_owned(), name: String::new(), spoiler, as_file: false, original: false }
+}
+
+#[test]
+fn files_go_up_from_their_paths_with_the_senders_options_and_a_cancel_stops_them() {
+    let world = polished();
+    let notes = staged(&world, "notes.txt", 3);
+    let photo = staged(&world, "photo.png", 70_000);
+
+    // Two files, one a spoiler, silent, no link previews, a reply that does not ping.
+    let with = protocol::Outgoing { files: vec![file(&notes, false), file(&photo, true)], silent: true, suppress_embeds: true, ping: false, ..Default::default() };
+    send_with(&world, "4101", "77001", "see attached https://example.com", Some("1300000000000000090"), with);
+    let sent = world.outcome("4101", "77001");
+    assert_eq!(sent.state, SendState::Sent);
+    let named = world.discord.requests_to("POST", "/channels/4101/attachments");
+    assert_eq!(named.len(), 1);
+    assert_eq!(named[0].body["files"], json!([
+        {"id": "0", "filename": "notes.txt", "file_size": 3, "is_clip": false},
+        {"id": "1", "filename": "SPOILER_photo.png", "file_size": 70_000, "is_clip": false},
+    ]));
+    // Each file went up whole, from its path, to the address Discord gave, without the session.
+    let uploads = world.discord.requests_to("PUT", "/upload/");
+    let shapes: Vec<(&str, usize, bool)> = uploads.iter().map(|seen| (seen.path.as_str(), seen.bytes, seen.headers.contains_key("authorization"))).collect();
+    assert_eq!(shapes, [("/upload/up/notes.txt", 3, false), ("/upload/up/SPOILER_photo.png", 70_000, false)]);
+    let posted = world.discord.requests_to("POST", "/channels/4101/messages");
+    let body = &posted[0].body;
+    assert_eq!(body["flags"], json!((1 << 12) | (1 << 2)));
+    assert_eq!(body["allowed_mentions"]["replied_user"], false);
+    assert_eq!(body["attachments"], json!([
+        {"id": "0", "filename": "notes.txt", "uploaded_filename": "up/notes.txt"},
+        {"id": "1", "filename": "SPOILER_photo.png", "uploaded_filename": "up/SPOILER_photo.png"},
+    ]));
+    assert_eq!(sent.attachments.len(), 2);
+    assert!(sent.attachments[1].spoiler);
+
+    // Too big for the free plan: refused with the file named, and nothing is asked.
+    let big = world.dir.with_extension("files").join("big.mov");
+    std::fs::File::create(&big).unwrap().set_len(11 << 20).unwrap();
+    let before = world.discord.asked().len();
+    let with = protocol::Outgoing { files: vec![file(&big.to_string_lossy(), false)], ..Default::default() };
+    let asked = Request::Send { conversation: world.key("4101"), client_id: "77002".into(), text: String::new(), reply_to: None, with };
+    match world.ask(asked) {
+        Response::Error { detail, .. } => assert_eq!(detail, "big.mov is too big for Discord (limit 10 MB)."),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(world.discord.asked().len(), before);
+
+    // Cancelled while Discord is still handing out addresses: nothing goes up.
+    *world.discord.stall.lock().unwrap() = Some(("/channels/4101/attachments".to_owned(), Duration::from_millis(1500)));
+    let with = protocol::Outgoing { files: vec![file(&notes, false)], ..Default::default() };
+    send_with(&world, "4101", "77003", "", None, with);
+    sleep(Duration::from_millis(300));
+    assert_eq!(world.ask(Request::CancelSend { conversation: world.key("4101"), client_id: "77003".into() }), Response::Ok);
+    assert_eq!(world.failure("4101", "77003"), "Cancelled");
+    assert_eq!(world.discord.requests_to("PUT", "/upload/").len(), 2, "the cancelled file never went up");
+    *world.discord.stall.lock().unwrap() = None;
+
+    // A GIF from the picker is its address; a sticker goes by id; the ping stays on by default.
+    let catalog = |kind, query: &str, space: Option<&str>| match world.ask(Request::Catalog {
+        account: world.account(),
+        kind,
+        space: space.map(|space| world.key(space)),
+        query: query.into(),
+        cursor: None,
+    }) {
+        Response::Catalog { items, .. } => items,
+        other => panic!("{other:?}"),
+    };
+    let gifs = catalog(protocol::CatalogKind::Gifs, "cat", None);
+    assert_eq!(gifs[0].id, "https://tenor.com/view/cat-typing-1");
+    assert!(world.discord.requests_to("GET", "/gifs/search?q=cat&media_format=mp4").len() == 1);
+    let pick = protocol::Pick { kind: protocol::CatalogKind::Gifs, id: gifs[0].id.clone() };
+    send_with(&world, "4101", "77004", "", Some("1300000000000000090"), protocol::Outgoing { pick: Some(pick), ..Default::default() });
+    world.outcome("4101", "77004");
+    let posted = world.discord.requests_to("POST", "/channels/4101/messages");
+    assert_eq!(posted[1].body["content"], "https://tenor.com/view/cat-typing-1");
+    assert_eq!(posted[1].body["allowed_mentions"]["replied_user"], true);
+    // The server's own emoji and stickers, from READY: what lost its boost and the Lottie
+    // sticker are not offered, and a DM offers none without Nitro. Nothing is asked.
+    let before = world.discord.asked().len();
+    let emoji = catalog(protocol::CatalogKind::Emoji, "", Some("4000"));
+    assert_eq!(emoji.iter().map(|item| (item.id.as_str(), item.name.as_str())).collect::<Vec<_>>(), [("emoji:5101", ":ferris:")]);
+    assert!(catalog(protocol::CatalogKind::Emoji, "", None).is_empty());
+    let stickers = catalog(protocol::CatalogKind::Stickers, "", Some("4000"));
+    assert_eq!(stickers.iter().map(|item| item.id.as_str()).collect::<Vec<_>>(), ["5201"]);
+    assert_eq!(world.discord.asked().len(), before);
+    let pick = protocol::Pick { kind: protocol::CatalogKind::Stickers, id: "5201".into() };
+    send_with(&world, "4101", "77005", "", None, protocol::Outgoing { pick: Some(pick), ..Default::default() });
+    world.outcome("4101", "77005");
+    assert_eq!(world.discord.requests_to("POST", "/channels/4101/messages")[2].body["sticker_ids"], json!(["5201"]));
+}
+
+#[test]
+fn a_waiting_profile_never_holds_up_a_send_a_superseded_one_is_dropped_and_reads_are_acked_once_per_three_seconds() {
+    let world = World::start();
+    settled(&world);
+    let socket = world.dir.join("chat.sock");
+    let ask_at = |request: Request| {
+        let mut stream = ChatStream::connect(&socket).unwrap();
+        write_frame(&mut stream, &request).unwrap();
+        read_frame::<Response>(&mut stream).unwrap()
+    };
+    let profile = |person: &str| Request::Profile { person: world.key(person), space: None };
+
+    // One profile now; the next two must wait out the 3 s. The later one supersedes the first.
+    assert!(matches!(ask_at(profile("2006")), Response::Profile { .. }));
+    std::thread::scope(|scope| {
+        let stale = scope.spawn(|| ask_at(profile("2002")));
+        sleep(Duration::from_millis(200));
+        let newest = scope.spawn(|| ask_at(profile("2003")));
+        sleep(Duration::from_millis(200));
+        // A send while they wait goes at once.
+        let sent = Instant::now();
+        world.send("3001", "1730000000000000099", "not held up", None);
+        world.outcome("3001", "1730000000000000099");
+        assert!(sent.elapsed() < Duration::from_millis(1500), "the send waited {:?}", sent.elapsed());
+        assert!(matches!(stale.join().unwrap(), Response::Error { .. }), "the superseded profile is not asked");
+        assert!(matches!(newest.join().unwrap(), Response::Profile { .. }));
+    });
+    assert!(world.discord.requests_to("GET", "/users/2002/profile").is_empty());
+    assert_eq!(world.discord.requests_to("GET", "/users/2003/profile").len(), 1);
+
+    // Three reads in a row in one channel: the first is told at once, the newest when the 3 s
+    // are up, and the one between never.
+    let read: Vec<String> = (0..3).map(|n| world.incoming("3001", None, &format!("read {n}"), json!({}))).collect();
+    wait("the messages to arrive", || world.messages("3001").iter().any(|message| message.id == read[2]).then_some(()));
+    for id in &read {
+        world.ask(Request::MarkRead { conversation: world.key("3001"), message_id: id.clone() });
+    }
+    let acked = |id: &str| world.discord.requests_to("POST", &format!("/channels/3001/messages/{id}/ack")).len();
+    wait("the newest read to be told", || (acked(&read[2]) == 1).then_some(()));
+    sleep(Duration::from_millis(500));
+    assert_eq!((acked(&read[0]), acked(&read[1]), acked(&read[2])), (1, 0, 1));
 }
