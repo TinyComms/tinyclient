@@ -268,8 +268,9 @@ pub(super) fn document(media: &tl::types::MessageMediaDocument, document: &tl::t
     // its own still, but only the thumbnail is fetched for a row either way.
     if let (true, Some(still)) = (sticker, &still) {
         file = still.clone();
-    } else if kind == MediaKind::Image && still.is_some() {
-        // A picture sent as a file opens in the viewer like a photo, so it is kept the same way.
+    } else if kind != MediaKind::Image || still.is_some() {
+        // A picture sent as a file opens in the viewer like a photo, so it is kept the same way;
+        // so is anything else, which is fetched only when the user plays or opens it.
         let location = tl::types::InputDocumentFileLocation {
             id: document.id,
             access_hash: document.access_hash,
@@ -285,6 +286,7 @@ pub(super) fn document(media: &tl::types::MessageMediaDocument, document: &tl::t
     attachment.spoiler = media.spoiler;
     attachment.sticker = sticker;
     attachment.waveform = wave;
+    attachment.round = round || media.round;
     attachment
 }
 

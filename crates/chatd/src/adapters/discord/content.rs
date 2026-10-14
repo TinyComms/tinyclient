@@ -505,6 +505,7 @@ fn attachment(rich: &mut Rich, attached: &Attached) -> Attachment {
         thumb,
         mime: mime.to_owned(),
         duration: attached.duration_secs.round() as u32,
+        round: false,
     }
 }
 
@@ -534,6 +535,7 @@ fn sticker(rich: &mut Rich, sticker: &model::Sticker) -> Attachment {
         thumb: None,
         mime: mime.to_owned(),
         duration: 0,
+        round: false,
     }
 }
 
