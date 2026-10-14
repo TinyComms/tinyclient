@@ -1128,21 +1128,21 @@ caption {
 .vs-row.us .vs-name, .vs-row.us .vs-val { color: var(--text); font-weight: 600; }
 .vs-val { font-variant-numeric: tabular-nums; text-align: right; font-size: 15px; }
 .vs-bar { display: flex; height: 44px; border-radius: 10px; overflow: hidden; background: var(--hover, rgba(255,255,255,.04)); }
-.vs-bar .seg { display: flex; align-items: center; min-width: 0; overflow: hidden; border-right: 2px solid var(--bg); transform-origin: left; animation: grow 1.1s cubic-bezier(.2,.7,.2,1) both; }
-.vs-bar .seg:last-child { border-right: 0; }
-.seg-l { padding: 0 10px; font-size: 12px; color: rgba(255,255,255,.88); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.seg.s0 { flex: 1100 1 0; background: #5b5fc7; animation-delay: .00s; }
-.seg.s1 { flex: 625 1 0;  background: #3a76f0; animation-delay: .08s; }
-.seg.s2 { flex: 554 1 0;  background: #4a154b; animation-delay: .16s; }
-.seg.s3 { flex: 481 1 0;  background: #5865f2; animation-delay: .24s; }
-.seg.s4 { flex: 346 1 0;  background: #229ed9; animation-delay: .32s; }
-.seg.mine { flex: 0 0 1.77%; min-width: 6px; background: var(--accent); box-shadow: 0 0 18px var(--accent); border-radius: 0 6px 6px 0; animation-delay: .6s; }
+.vs-bar .vseg { display: flex; align-items: center; min-width: 0; overflow: hidden; border-right: 2px solid var(--bg); transform-origin: left; animation: grow 1.1s cubic-bezier(.2,.7,.2,1) both; }
+.vs-bar .vseg:last-child { border-right: 0; }
+.vseg-l { padding: 0 10px; font-size: 12px; color: rgba(255,255,255,.88); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.vseg.s0 { flex: 1100 1 0; background: #5b5fc7; animation-delay: .00s; }
+.vseg.s1 { flex: 625 1 0;  background: #3a76f0; animation-delay: .08s; }
+.vseg.s2 { flex: 554 1 0;  background: #4a154b; animation-delay: .16s; }
+.vseg.s3 { flex: 481 1 0;  background: #5865f2; animation-delay: .24s; }
+.vseg.s4 { flex: 346 1 0;  background: #229ed9; animation-delay: .32s; }
+.vseg.mine { flex: 0 0 1.77%; min-width: 6px; background: var(--accent); box-shadow: 0 0 18px var(--accent); border-radius: 0 6px 6px 0; animation-delay: .6s; }
 @keyframes grow { from { transform: scaleX(0); } to { transform: scaleX(1); } }
 .fine-note { margin: 22px auto 0; font-size: 13px; color: var(--faint); }
 @media (max-width: 600px) {
   .vs-row { grid-template-columns: 1fr auto; }
   .vs-bar { grid-column: 1 / -1; grid-row: 2; height: 34px; }
-  .seg-l { display: none; }
+  .vseg-l { display: none; }
 }
 
 .trio { list-style: none; padding: 0; margin: 28px 0 0; display: flex; justify-content: center; flex-wrap: wrap; gap: 12px 36px; font-size: 16px; }
@@ -1157,6 +1157,6 @@ caption {
 .join h2 { font-size: clamp(30px, 4vw, 44px); }
 
 @media (prefers-reduced-motion: reduce) {
-  .vs-bar .seg, .ico::after { animation: none; }
+  .vs-bar .vseg, .ico::after { animation: none; }
   .net-row li { transition: none; }
 }
