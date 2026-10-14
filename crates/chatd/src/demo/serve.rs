@@ -139,6 +139,10 @@ fn file(path: &str) -> Option<(&'static str, Vec<u8>)> {
         "pdf" => Some(("application/pdf", pdf(number()? as usize))),
         "zip" => Some(("application/zip", zip(number()? as usize))),
         "wav" => Some(("audio/wav", wav(number()?.min(60)))),
+        "photo" => {
+            let name = parts.next()?;
+            super::photos::bytes(name).map(|bytes| (super::photos::mime(name), bytes))
+        }
         _ => None,
     }
 }

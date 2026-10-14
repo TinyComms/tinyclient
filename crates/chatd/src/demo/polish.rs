@@ -219,7 +219,12 @@ fn discord_extras(s: &mut Seeder, discord: &Discord) -> Fallible<()> {
 fn slack_extras(s: &mut Seeder) -> Fallible<()> {
     let account = slack::harbor();
     let app = |id: &str, name: &str| Who { id: id.to_owned(), name: name.to_owned(), avatar: None, bot: true, me: false };
-    let apps = [app("U04MEMBER008", "Deploy Bot"), app("B04GITHUB", "GitHub"), app("USLACKBOT", "Slackbot")];
+    let mut apps = [app("U04MEMBER008", "Deploy Bot"), app("B04GITHUB", "GitHub"), app("USLACKBOT", "Slackbot")];
+    for who in &mut apps[1..] {
+        if let Some(file) = super::photos::portrait(&who.name) {
+            who.avatar = Some(s.photo(&account, &format!("avatar-{}", who.id), MediaKind::Avatar, &file, (Art::Badge, 0), 192, 192)?);
+        }
+    }
     for who in &apps[1..] {
         s.store.upsert_people(&account, &[super::person_row(&account, who, "", "")])?;
     }

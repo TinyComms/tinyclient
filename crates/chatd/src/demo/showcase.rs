@@ -43,12 +43,13 @@ fn waveform(bars: usize) -> Vec<u8> {
 }
 
 /// An image as a message carries it: a thumbnail on disk and an original nobody has fetched.
-fn photo(s: &mut Seeder, account: &AccountKey, name: &str, art: Art, width: u32, height: u32) -> Fallible<Attachment> {
+/// `shows` is the photograph in `photos/`; `art` is drawn when it is not there.
+fn photo(s: &mut Seeder, account: &AccountKey, name: &str, shows: &str, art: Art, width: u32, height: u32) -> Fallible<Attachment> {
     let id = format!("att-{:08x}", s.roll(u32::MAX as u64));
     let look = s.look(art);
-    let thumb = s.picture(account, &format!("{id}-thumb"), MediaKind::Image, look, width, height)?;
+    let thumb = s.photo(account, &format!("{id}-thumb"), MediaKind::Image, shows, look, width, height)?;
     let scale = (2400 / width.max(height)).clamp(1, 3);
-    let file = s.waiting(account, &id, MediaKind::Image, look, width * scale, height * scale)?;
+    let file = s.photo_waiting(account, &id, MediaKind::Image, shows, look, width * scale, height * scale)?;
     Ok(Attachment {
         thumb: Some(thumb),
         mime: "image/png".to_owned(),
@@ -152,28 +153,34 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<Pending> {
 
     // Yesterday: pictures and files.
     let mut single = s.message(account, who(INES), step(1300), "Frost on the cushion moss this morning.");
-    single.attachments.push(photo(s, account, "frost-cushion.png", Art::Scene, 800, 600)?);
+    single.attachments.push(photo(s, account, "frost-cushion.png", "moss-frost.webp", Art::Scene, 800, 600)?);
     let single_id = single.id.clone();
     feed.push(single);
-    for (count, text) in [(2, "Before and after the thaw."), (3, "Three from the weir."), (4, "The fence post, from every side."), (6, "Everything from camera 2 last night.")] {
+    let grids: [(usize, &str, &[&str]); 4] = [
+        (2, "Before and after the thaw.", &["thaw-before.webp", "thaw-after.webp"]),
+        (3, "Three from the weir.", &["weir-1.webp", "weir-2.webp", "weir-3.webp"]),
+        (4, "The fence post, from every side.", &["fence-1.webp", "fence-2.webp", "fence-3.webp", "fence-4.webp"]),
+        (6, "Everything from camera 2 last night.", &["camera-1.webp", "camera-2.webp", "camera-3.webp", "camera-4.webp", "camera-5.webp", "camera-6.webp"]),
+    ];
+    for (count, text, shows) in grids {
         let mut grid = s.message(account, who(if count % 2 == 0 { WREN } else { TOMASZ }), step(16), text);
         for n in 0..count {
             let (width, height) = [(400, 300), (300, 400), (420, 280)][(n + count) % 3];
-            grid.attachments.push(photo(s, account, &format!("IMG_{}.png", 4100 + count * 10 + n), Art::Scene, width, height)?);
+            grid.attachments.push(photo(s, account, &format!("IMG_{}.png", 4100 + count * 10 + n), shows[n], Art::Scene, width, height)?);
         }
         feed.push(grid);
     }
     let mut tall = s.message(account, who(HARUTO), step(12), "The whole trunk, top to bottom.");
-    tall.attachments.push(photo(s, account, "trunk-panorama.png", Art::Bands, 200, 1400)?);
+    tall.attachments.push(photo(s, account, "trunk-panorama.png", "trunk.webp", Art::Bands, 200, 1400)?);
     feed.push(tall);
     let mut wide = s.message(account, who(HARUTO), step(3), "And the ridge line.");
-    wide.attachments.push(photo(s, account, "ridge-panorama.png", Art::Scene, 800, 130)?);
+    wide.attachments.push(photo(s, account, "ridge-panorama.png", "ridge.webp", Art::Scene, 800, 130)?);
     feed.push(wide);
     // Hidden until asked for. The name keeps Discord's own prefix, as the network sends it.
     let mut hidden = s.message(account, who(WREN), step(2), "What camera 3 caught. Do not open before breakfast.");
     hidden.attachments.push(Attachment {
         spoiler: true,
-        ..photo(s, account, "SPOILER_camera3-0412.png", Art::Scene, 640, 480)?
+        ..photo(s, account, "SPOILER_camera3-0412.png", "camera-3-catch.webp", Art::Scene, 640, 480)?
     });
     feed.push(hidden);
 
@@ -181,7 +188,7 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<Pending> {
     let look = s.look(Art::Scene);
     let mut gif = s.message(account, who(WREN), step(20), "");
     gif.attachments.push(Attachment {
-        thumb: Some(s.picture(account, "att-gif-thumb", MediaKind::Image, look, 480, 270)?),
+        thumb: Some(s.photo(account, "att-gif-thumb", MediaKind::Image, "gif-thumb.webp", look, 480, 270)?),
         mime: "image/gif".to_owned(),
         duration: 3,
         ..Attachment::new("marten-hop.gif", s.broken(account, "att-gif", MediaKind::Gif, 480, 270, 2_310_144)?)
@@ -190,7 +197,7 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<Pending> {
     let look = s.look(Art::Scene);
     let mut video = s.message(account, who(TOMASZ), step(9), "Full clip from 03:12.");
     video.attachments.push(Attachment {
-        thumb: Some(s.picture(account, "att-video-thumb", MediaKind::Image, look, 640, 360)?),
+        thumb: Some(s.photo(account, "att-video-thumb", MediaKind::Image, "video-thumb.webp", look, 640, 360)?),
         mime: "video/mp4".to_owned(),
         duration: 94,
         ..Attachment::new("camera2-0312.mp4", s.broken(account, "att-video", MediaKind::Video, 1920, 1080, 19_293_798)?)
@@ -232,9 +239,9 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<Pending> {
     let look = s.look(Art::Scene);
     let mut late = s.message(account, who(HARUTO), step(15), "Two more, if they load on this connection.");
     late.attachments.push(Attachment {
-        thumb: Some(s.waiting(account, "att-late-thumb", MediaKind::Image, look, 800, 600)?),
+        thumb: Some(s.photo_waiting(account, "att-late-thumb", MediaKind::Image, "weir-dawn.webp", look, 800, 600)?),
         mime: "image/png".to_owned(),
-        ..Attachment::new("weir-dawn.png", s.waiting(account, "att-late", MediaKind::Image, look, 1600, 1200)?)
+        ..Attachment::new("weir-dawn.png", s.photo_waiting(account, "att-late", MediaKind::Image, "weir-dawn.webp", look, 1600, 1200)?)
     });
     late.attachments.push(Attachment {
         thumb: Some(s.broken(account, "att-lost-thumb", MediaKind::Image, 800, 600, 0)?),
@@ -253,7 +260,7 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<Pending> {
         site: "Field Encyclopedia".to_owned(),
         title: "Lepraria".to_owned(),
         description: "A genus of leprose crustose lichens that grow on rock, bark and soil as patches of powdery granules.".to_owned(),
-        image: Some(s.picture(account, "preview-small", MediaKind::Image, look, 120, 120)?),
+        image: Some(s.photo(account, "preview-small", MediaKind::Image, "preview-lichen.webp", look, 120, 120)?),
     });
     feed.push(small);
     let look = s.look(Art::Bands);
@@ -266,7 +273,7 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<Pending> {
         site: "County Naturalist".to_owned(),
         title: "Forty species in one morning on the creek route".to_owned(),
         description: "Volunteers recorded forty bryophytes and a first county record along two kilometres of bank.".to_owned(),
-        image: Some(s.picture(account, "preview-large", MediaKind::Image, look, 800, 420)?),
+        image: Some(s.photo(account, "preview-large", MediaKind::Image, "preview-creek.webp", look, 800, 420)?),
     });
     feed.push(large);
 
@@ -361,7 +368,7 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<Pending> {
         from_space: "Rustaceans Anonymous".to_owned(),
         link: "https://discord.com/channels/300000000000000002/410000000000000002".to_owned(),
     }));
-    afar.attachments.push(photo(s, account, "schematic.png", Art::Bands, 480, 320)?);
+    afar.attachments.push(photo(s, account, "schematic.png", "schematic.webp", Art::Bands, 480, 320)?);
     feed.push(afar);
 
     let mut edited = s.message(account, who(HARUTO), step(9), "Microscope club is Thursday at 19:00, not 18:00.");

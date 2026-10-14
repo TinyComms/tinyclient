@@ -38,7 +38,7 @@ pub(super) fn call(snapshot: &Snapshot) -> Option<Call> {
     // The sentences are the ones chatd, the adapter and mediad send.
     let state = match name.as_str() {
         "ringing_out" => CallState::RingingOut,
-        "incoming" => CallState::RingingIn { from: "Mara Okafor".to_owned() },
+        "incoming" => CallState::RingingIn { from: snapshot.open.as_ref().map_or_else(|| "Mara Okafor".to_owned(), |open| open.title.clone()) },
         "connecting" => CallState::Connecting,
         "reconnecting" => CallState::Reconnecting,
         "failed_noanswer" => failed(CallFailure::NoAnswer, "Nobody picked up."),
@@ -83,7 +83,9 @@ pub(super) fn call(snapshot: &Snapshot) -> Option<Call> {
     } else if name == "joined_alone" {
         Vec::new()
     } else {
-        vec![person("Mara Okafor", name == "joined", muted, false)]
+        // With a conversation open the call is with it, so its own picture and name are drawn.
+        let peer = snapshot.open.as_ref().map_or("Mara Okafor", |open| open.title.as_str());
+        vec![person(peer, name == "joined", muted, false)]
     };
     let joined = match name.as_str() {
         "ringing_out" => now() - 12,
@@ -118,13 +120,14 @@ fn mara() -> Subject {
     Subject { title: "Mara Okafor".to_owned(), kind: ConversationKind::Direct, avatar: None, space: None }
 }
 
-/// Who the made-up call is with, or the voice channel of the channel shots.
-pub(super) fn subject() -> Option<Subject> {
+/// Who the made-up call is with, or the voice channel of the channel shots. `None` with a
+/// conversation open: the call is in it, and its row says who.
+pub(super) fn subject(snapshot: &Snapshot) -> Option<Subject> {
     if channel(&named()?) {
         let space = Some("tinyclient-dev".to_owned());
         return Some(Subject { title: "Lounge".to_owned(), kind: ConversationKind::Voice, avatar: None, space });
     }
-    Some(mara())
+    snapshot.open.is_none().then(mara)
 }
 
 /// Whoever was left alone in `joined_alone`.

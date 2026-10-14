@@ -45,14 +45,21 @@ const VIVA: usize = 7;
 
 const DAY: i64 = 1_440;
 
+/// The group chats with a picture of their own in `photos/` (`group-<name>.webp`).
+const COVERS: &[(&str, &str)] = &[
+    ("19:design-crit@thread.v2", "design-crit"),
+    ("19:oncall@thread.v2", "oncall"),
+    ("19:hiring@thread.v2", "hiring"),
+    ("19:offsite@thread.v2", "offsite"),
+];
+
 pub fn seed(s: &mut Seeder) -> Fallible<Who> {
     let account = account();
     s.store.set_account(&account, "Harbor Labs", ME)?;
-    let look = s.look(Art::Person);
     let me = Who {
         id: ME.to_owned(),
         name: "Robin Vale".to_owned(),
-        avatar: Some(s.picture(&account, "teams-avatar-me", MediaKind::Avatar, look, 80, 80)?),
+        avatar: Some(s.avatar(&account, "teams-avatar-me", "Robin Vale")?),
         bot: false,
         me: true,
     };
@@ -107,7 +114,8 @@ pub fn seed(s: &mut Seeder) -> Fallible<Who> {
         (usize::MAX, 140, "In."),
     ])?;
     s.counts(&group, 0, 0, None)?;
-    talk(s, chat("19:platform-guild@thread.v2", Group, "Platform guild"), &[(ESI, 40, "Notebook for the latency analysis is up.")])?;
+    let avatar = s.cover(&account, "19:platform-guild@thread.v2", "group-platform-guild.webp")?;
+    talk(s, ConversationRow { avatar, ..chat("19:platform-guild@thread.v2", Group, "Platform guild") }, &[(ESI, 40, "Notebook for the latency analysis is up.")])?;
 
     // Meeting chats: one from this week, one quiet 20 days (the collapsed Meetings group), one
     // quiet 40 days (out of the Inbox too).
@@ -132,7 +140,8 @@ pub fn seed(s: &mut Seeder) -> Fallible<Who> {
     // Two chats whose list gave only a line, as Teams' does, and two with nothing yet: those
     // are filled when they come on screen (`Command::Previews`).
     let line = |s: &mut Seeder, id: &str, title: &str, from: usize, minutes: i64, text: &str| -> Fallible<()> {
-        let key = s.conversation(&account, chat(id, Group, title))?;
+        let avatar = s.cover(&account, id, &format!("group-{}.webp", COVERS.iter().find(|(of, _)| *of == id).map_or("", |(_, name)| *name)))?;
+        let key = s.conversation(&account, ConversationRow { avatar, ..chat(id, Group, title) })?;
         let sent = s.now - minutes * 60;
         let line = PreviewLine { id: format!("{sent}000"), text: text.to_owned(), sender: cast[from].name.clone(), mine: false, sent };
         s.store.set_preview(&key, &line)?;
@@ -141,16 +150,17 @@ pub fn seed(s: &mut Seeder) -> Fallible<Who> {
     line(s, "19:design-crit@thread.v2", "Design crit", CHLOE, 4 * DAY, "New nav mocks are in Figma")?;
     line(s, "19:oncall@thread.v2", "On-call handover", DMITRI, 7, "Pager is yours from 18:00")?;
     for (id, title) in [("19:hiring@thread.v2", "Hiring loop"), ("19:offsite@thread.v2", "Offsite planning")] {
-        let key = s.conversation(&account, chat(id, Group, title))?;
+        let avatar = s.cover(&account, id, &format!("group-{}.webp", COVERS.iter().find(|(of, _)| *of == id).map_or("", |(_, name)| *name)))?;
+        let key = s.conversation(&account, ConversationRow { avatar, ..chat(id, Group, title) })?;
         s.store.set_counts(&key, 0, 0, None, s.now - 3 * DAY * 60)?;
     }
 
     // Two teams. Teams has no categories: channels sit under no group, General first; the
     // channels the user hid are there for "Show hidden".
     let look = s.look(Art::Badge);
-    let engineering_icon = s.picture(&account, "teams-icon-engineering", MediaKind::Icon, look, 96, 96)?;
+    let engineering_icon = s.photo(&account, "teams-icon-engineering", MediaKind::Icon, "logo-harbor-engineering.png", look, 192, 192)?;
     let look = s.look(Art::Badge);
-    let social_icon = s.picture(&account, "teams-icon-social", MediaKind::Icon, look, 96, 96)?;
+    let social_icon = s.photo(&account, "teams-icon-social", MediaKind::Icon, "logo-harbor-social.png", look, 192, 192)?;
     s.store.replace_spaces(&account, &[
         SpaceRow { id: ENGINEERING.to_owned(), name: "Harbor Engineering".to_owned(), icon: Some(engineering_icon.id), position: 0 },
         SpaceRow { id: SOCIAL.to_owned(), name: "Harbor Social".to_owned(), icon: Some(social_icon.id), position: 1 },

@@ -227,7 +227,7 @@ pub(super) struct Subject {
 impl Subject {
     fn of(shell: &Shell, snapshot: &Snapshot, call: &Call) -> Subject {
         #[cfg(feature = "gui-shot")]
-        if let Some(subject) = shot::subject() {
+        if let Some(subject) = shot::subject(snapshot) {
             return subject;
         }
         let key = &call.conversation;

@@ -95,7 +95,7 @@ impl Demo {
             Network::Telegram => person_id.to_owned(),
             Network::Teams => format!("19:{}_robin@unq.gbl.spaces", number.parse::<u32>().unwrap_or(0)),
             Network::Discord => format!("500000000000000{number}"),
-            // Not in the demo. A Signal chat with a person is named by the person.
+            // A Signal chat with a person is named by the person.
             Network::Signal => person_id.to_owned(),
         }
     }
@@ -328,7 +328,7 @@ impl Demo {
                     about.away_until = Some((day + to_friday) * 86_400 + 17 * 3_600);
                 }
             }
-            // Not in the demo.
+            // Signal tells a linked device nothing more about a person.
             Network::Signal => {}
         }
         about
@@ -476,7 +476,11 @@ impl Demo {
         let row = ConversationRow {
             avatar: person.avatar.map(|file| file.id),
             peer: Some(person_id.to_owned()),
-            call: if self.ctx.account.network == Network::Discord { CallSupport::Native } else { CallSupport::Handoff },
+            call: match self.ctx.account.network {
+                Network::Discord => CallSupport::Native,
+                Network::Signal => CallSupport::None,
+                _ => CallSupport::Handoff,
+            },
             ..ConversationRow::new(id.clone(), ConversationKind::Direct, person.name)
         };
         self.ctx.conversation(&row).map_err(|_| gone())?;

@@ -167,7 +167,7 @@ binaries are built with it. `cargo build -p chatd --no-default-features` leaves 
 
 `TINYCLIENT_DIR` moves the socket, database and logs to a directory of your choosing and turns
 sign-in off, so nothing touches your keychain. `--seed-demo` fills that directory with invented
-servers, workspaces, people and conversations (Discord, two Slack workspaces, Telegram, Teams);
+servers, workspaces, people and conversations (Discord, two Slack workspaces, Telegram, Teams, Signal);
 `#showcase` holds every kind of message.
 
 ```sh

@@ -146,6 +146,18 @@ const MOSS_TREE: &[(&str, &[Row])] = &[
 
 /// The other servers: name, then categories of text channels.
 type Small = (&'static str, &'static [(&'static str, &'static [&'static str])]);
+/// The servers' icons in `photos/`, Moss & Lichen first, then [`SMALL`] in order.
+const ICONS: &[&str] = &[
+    "icon-moss-lichen.webp",
+    "icon-rustaceans.png",
+    "icon-synth-diy.webp",
+    "logo-pixel-foundry.png",
+    "logo-night-shift.png",
+    "logo-tiny-tools.png",
+    "logo-long-names.png",
+    "logo-volcano-club.png",
+];
+
 const SMALL: &[Small] = &[
     ("Rustaceans Anonymous", &[
         ("Talk", &["general", "beginners", "show-and-tell"]),
@@ -452,8 +464,10 @@ fn direct(s: &mut Seeder, account: &AccountKey, cast: &[Who], me: &Who) -> Falli
     ])?;
 
     // Group conversations: one unread (a number), one read.
+    let avatar = s.cover(account, "510000000000000001", "group-foray-carpool.webp")?;
     let carpool = s.conversation(account, ConversationRow {
         call: CallSupport::Native,
+        avatar,
         ..ConversationRow::new("510000000000000001", ConversationKind::Group, "Foray carpool")
     })?;
     let said = s.script(&carpool, cast, me, &[
@@ -523,8 +537,7 @@ fn many(s: &mut Seeder, account: &AccountKey, cast: &[Who], spaces: &mut Vec<Spa
 pub fn seed(s: &mut Seeder) -> Fallible<Discord> {
     let account = account();
     s.store.set_account(&account, "Robin Vale", ME)?;
-    let look = s.look(Art::Person);
-    let mine = s.picture(&account, "avatar-me-5f1c2a9e", MediaKind::Avatar, look, 80, 80)?;
+    let mine = s.avatar(&account, "avatar-me-5f1c2a9e", "Robin Vale")?;
     let me = Who {
         id: ME.to_owned(),
         name: "Robin Vale".to_owned(),
@@ -541,9 +554,10 @@ pub fn seed(s: &mut Seeder) -> Fallible<Discord> {
         let icon = format!("icon-{at}-{:08x}", s.roll(u32::MAX as u64));
         // The last server's icon has not been fetched yet.
         let look = s.look(Art::Badge);
+        let photo = ICONS.get(at).copied().unwrap_or_default();
         let icon = match at {
-            5 => s.waiting(&account, &icon, MediaKind::Icon, look, 96, 96)?,
-            _ => s.picture(&account, &icon, MediaKind::Icon, look, 96, 96)?,
+            5 => s.photo_waiting(&account, &icon, MediaKind::Icon, photo, look, 192, 192)?,
+            _ => s.photo(&account, &icon, MediaKind::Icon, photo, look, 192, 192)?,
         };
         spaces.push(SpaceRow {
             id: format!("30000000000000000{}", at + 1),

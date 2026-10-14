@@ -50,11 +50,10 @@ fn folders(ids: &[&str]) -> Vec<String> {
 pub fn seed(s: &mut Seeder) -> Fallible<Who> {
     let account = account();
     s.store.set_account(&account, "Robin Vale", ME)?;
-    let look = s.look(Art::Person);
     let me = Who {
         id: ME.to_owned(),
         name: "Robin Vale".to_owned(),
-        avatar: Some(s.picture(&account, "tg-avatar-me", MediaKind::Avatar, look, 80, 80)?),
+        avatar: Some(s.avatar(&account, "tg-avatar-me", "Robin Vale")?),
         bot: false,
         me: true,
     };
@@ -67,7 +66,7 @@ pub fn seed(s: &mut Seeder) -> Fallible<Who> {
     let service = Who {
         id: SERVICE.to_owned(),
         name: "Telegram".to_owned(),
-        avatar: Some(s.picture(&account, "tg-avatar-777000", MediaKind::Avatar, (Art::Badge, 200), 80, 80)?),
+        avatar: Some(s.photo(&account, "tg-avatar-777000", MediaKind::Avatar, "avatar-telegram.png", (Art::Badge, 200), 192, 192)?),
         bot: false,
         me: false,
     };
@@ -144,8 +143,10 @@ pub fn seed(s: &mut Seeder) -> Fallible<Who> {
     s.counts(&service_chat, 1, 0, None)?;
 
     // Groups: who spoke last shows in the preview. Family is pinned inside its folder.
+    let avatar = s.cover(&account, "g8001", "group-foraging-lisbon.webp")?;
     let (foraging, said) = talk(s, ConversationRow {
         listed: true,
+        avatar,
         filing: Some(Filing { folders: folders(&["work"]), ..Filing::default() }),
         ..ConversationRow::new("g8001", Group, "Foraging Lisbon")
     }, &[
@@ -158,7 +159,9 @@ pub fn seed(s: &mut Seeder) -> Fallible<Who> {
     mention.mentions_me = true;
     s.post(&foraging, &mention)?;
     s.counts(&foraging, 3, 1, Some(&said[0]))?;
+    let avatar = s.cover(&account, "g8002", "group-family.webp")?;
     talk(s, ConversationRow {
+        avatar,
         filing: Some(Filing { folders: folders(&["family"]), ..Filing::default() }),
         ..ConversationRow::new("g8002", Group, "Family")
     }, &[(ROSA, 200, "Photos from the weekend 💛"), (usize::MAX, 190, "Lovely!")])?;
@@ -167,8 +170,10 @@ pub fn seed(s: &mut Seeder) -> Fallible<Who> {
     // never its preview.
     // A channel's posts are the channel's, not a person's.
     let poster = |name: &str| Who { id: String::new(), name: name.to_owned(), avatar: None, bot: false, me: false };
+    let avatar = s.cover(&account, CHANNEL, "group-lichen-daily.webp")?;
     let (channel, _) = talk(s, ConversationRow {
         read_only: true,
+        avatar,
         filing: Some(Filing { folders: folders(&["channels"]), ..Filing::default() }),
         ..ConversationRow::new(CHANNEL, Announcement, "Lichen Daily")
     }, &[])?;
@@ -188,7 +193,9 @@ pub fn seed(s: &mut Seeder) -> Fallible<Who> {
     s.counts(&channel, 4, 0, Some(&said[0]))?;
 
     // A forum: topics under it, pinned first, one unread.
+    let avatar = s.cover(&account, FORUM, "group-mycology.webp")?;
     s.conversation(&account, ConversationRow {
+        avatar,
         filing: Some(Filing { folders: folders(&["work"]), ..Filing::default() }),
         ..ConversationRow::new(FORUM, Forum, "Mycology Forum")
     })?;
@@ -205,14 +212,18 @@ pub fn seed(s: &mut Seeder) -> Fallible<Who> {
     s.say(&forum, &cast[LENA], 5, "ID requests: new photos of a bolete")?;
 
     // The archive: out of the Inbox; the mention in one still counts.
+    let avatar = s.cover(&account, "c9002", "group-trail-conditions.webp")?;
     let (trail, _) = talk(s, ConversationRow {
+        avatar,
         filing: Some(Filing { archived: true, folders: folders(&["channels"]), ..Filing::default() }),
         read_only: true,
         ..ConversationRow::new("c9002", Announcement, "Trail Conditions")
     }, &[])?;
     s.say(&trail, &poster("Trail Conditions"), 1500, "Ridge loop closed until April.")?;
     s.store.set_muted(&trail, true)?;
+    let avatar = s.cover(&account, "g8003", "group-old-flatshare.webp")?;
     let (flat, said) = talk(s, ConversationRow {
+        avatar,
         filing: Some(Filing { archived: true, ..Filing::default() }),
         ..ConversationRow::new("g8003", Group, "Old Flatshare")
     }, &[(PAVEL, 20_000, "Who took the good pan?"), (HARUTO, 19_000, "Not me.")])?;

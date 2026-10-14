@@ -190,11 +190,10 @@ fn directs(tag: char) -> String {
 fn workspace(s: &mut Seeder, space: &Workspace, tag: char) -> Fallible<Who> {
     let account = &space.account;
     s.store.set_account(account, space.name, space.me)?;
-    let look = s.look(Art::Person);
     let me = Who {
         id: space.me.to_owned(),
         name: "Robin Vale".to_owned(),
-        avatar: Some(s.picture(account, &format!("avatar-{}", space.me), MediaKind::Avatar, look, 72, 72)?),
+        avatar: Some(s.avatar(account, &format!("avatar-{}", space.me), "Robin Vale")?),
         bot: false,
         me: true,
     };
@@ -202,7 +201,8 @@ fn workspace(s: &mut Seeder, space: &Workspace, tag: char) -> Fallible<Who> {
     let cast = s.people(account, &format!("U0{tag}MEMBER"), space.people)?;
 
     let look = s.look(Art::Badge);
-    let icon = s.picture(account, &format!("icon-{}", account.account), MediaKind::Icon, look, 88, 88)?;
+    let photo = if space.name == "Harbor Labs" { "logo-harbor-labs.png" } else { "icon-fernhill.webp" };
+    let icon = s.photo(account, &format!("icon-{}", account.account), MediaKind::Icon, photo, look, 192, 192)?;
     // A workspace is the one Space of its account, under the team's own id.
     s.store.replace_spaces(account, &[SpaceRow {
         id: account.account.clone(),

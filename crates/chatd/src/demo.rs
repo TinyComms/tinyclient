@@ -30,12 +30,16 @@
 //!   chats older and newer than 14 days, two app chats, the Notes self-chat, a hidden chat,
 //!   two rows with no preview yet), two teams with shown and hidden channels and a channel post
 //!   with replies, and people who are Busy, presenting or out of office.
+//! - Signal (connected): a linked device's flat chat list: direct chats and two groups, with
+//!   replies, a mention, reactions and an edited message, and no presence and no calls.
 //! - Across them (`polish`): Discord server folders and friends in voice, playing and
 //!   listening; a message request; app DMs on Discord and Slack; a Slack section that shows
 //!   unread only and channels quiet for 30 days; titles, time zones and tags; what each
 //!   account may send; custom emoji, stickers and GIFs for the pickers.
-//! - Pictures are real PNG files made here. Most are on disk; a few are left unfetched and land
-//!   through the media cache from a server on localhost when the shell asks, and some fail.
+//! - Pictures: portraits, server icons, group pictures and photographs from `demo/photos/`
+//!   (credited in its `CREDITS.md`), read from the source tree when seeding; where a file is
+//!   missing, a PNG drawn here (`png`) stands in. Most are on disk; a few are left unfetched and
+//!   land through the media cache from a server on localhost when the shell asks, and some fail.
 //!
 //! `live` adds, every few seconds in turn: someone typing, a new message, a reaction, an edit, a
 //! presence change (and someone in the Campfire voice channel muting) and a picture landing.
@@ -57,10 +61,12 @@
 mod adapter;
 mod discord;
 mod live;
+mod photos;
 mod png;
 mod polish;
 mod serve;
 mod showcase;
+mod signal;
 mod slack;
 mod teams;
 mod telegram;
@@ -88,8 +94,7 @@ fn me_of(account: &AccountKey) -> &'static str {
         Network::Telegram => telegram::ME,
         Network::Teams => teams::ME,
         Network::Discord => discord::ME,
-        // The demo has no Signal account.
-        Network::Signal => "",
+        Network::Signal => signal::ME,
     }
 }
 
@@ -319,6 +324,52 @@ impl Seeder<'_> {
         Ok(file)
     }
 
+    /// A photograph from `photos/` (see [`photos`]), on disk as if fetched, at the size the
+    /// network reports it. `look` is drawn instead when the file is not there.
+    pub fn photo(&mut self, account: &AccountKey, id: &str, kind: MediaKind, name: &str, look: (Art, u32), width: u32, height: u32) -> Fallible<MediaFile> {
+        let Some(bytes) = photos::bytes(name) else {
+            return self.picture(account, id, kind, look, width, height);
+        };
+        let mut file = Self::drawn(id, kind, width, height);
+        self.register(account, &file, &format!("photo/{name}"))?;
+        let path = crate::blobs::path_of(&self.media, account, id);
+        std::fs::create_dir_all(path.parent().unwrap_or(Path::new("/")))?;
+        std::fs::write(&path, &bytes)?;
+        let path = path.to_string_lossy().into_owned();
+        self.store.media_landed(account, id, &path, bytes.len() as u64, self.now)?;
+        file.bytes = bytes.len() as u64;
+        Ok(file)
+    }
+
+    /// A photograph from `photos/` nobody has fetched, as [`Seeder::waiting`] is a drawn one.
+    pub fn photo_waiting(&mut self, account: &AccountKey, id: &str, kind: MediaKind, name: &str, look: (Art, u32), width: u32, height: u32) -> Fallible<MediaFile> {
+        if photos::bytes(name).is_none() {
+            return self.waiting(account, id, kind, look, width, height);
+        }
+        let file = Self::drawn(id, kind, width, height);
+        self.register(account, &file, &format!("photo/{name}?wait=900"))?;
+        Ok(file)
+    }
+
+    /// A group's or channel's own picture from `photos/`, as its row's `avatar`. None without
+    /// the file: such a row shows its initials, as it would on the network.
+    pub fn cover(&mut self, account: &AccountKey, conversation: &str, name: &str) -> Fallible<Option<String>> {
+        if photos::bytes(name).is_none() {
+            return Ok(None);
+        }
+        let id: String = conversation.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
+        Ok(Some(self.photo(account, &format!("cover-{id}"), MediaKind::Avatar, name, (Art::Badge, 0), 192, 192)?.id))
+    }
+
+    /// The picture of someone called `name`: their portrait from `photos/`, or one drawn.
+    pub fn avatar(&mut self, account: &AccountKey, id: &str, name: &str) -> Fallible<MediaFile> {
+        let look = self.look(Art::Person);
+        match photos::portrait(name) {
+            Some(file) => self.photo(account, id, MediaKind::Avatar, &file, look, 192, 192),
+            None => self.picture(account, id, MediaKind::Avatar, look, 80, 80),
+        }
+    }
+
     /// A picture nobody has fetched. It lands, after a visible wait, when the shell asks.
     pub fn waiting(&mut self, account: &AccountKey, id: &str, kind: MediaKind, look: (Art, u32), width: u32, height: u32) -> Fallible<MediaFile> {
         let (art, seed) = look;
@@ -345,7 +396,8 @@ impl Seeder<'_> {
     }
 
     /// Records the people of a table and their relationships, and answers them as speakers.
-    /// Every fifth has no picture, a few have one not yet fetched and one has one that fails.
+    /// Everyone with a portrait in `photos/` has it, as people on a network mostly do. Without
+    /// one, every fifth has no picture, a few have one not yet fetched and one has one that fails.
     pub fn people(&mut self, account: &AccountKey, prefix: &str, listed: &[Listed]) -> Fallible<Vec<Who>> {
         let mut rows = Vec::new();
         let mut cast = Vec::new();
@@ -354,11 +406,12 @@ impl Seeder<'_> {
             let id = format!("{prefix}{:03}", at + 1);
             let avatar_id = format!("avatar-{id}-{:08x}", self.roll(u32::MAX as u64));
             let look = self.look(Art::Person);
-            let avatar = match at % 10 {
-                4 => None,
-                8 => Some(self.waiting(account, &avatar_id, MediaKind::Avatar, look, 80, 80)?),
-                9 if at == 19 => Some(self.broken(account, &avatar_id, MediaKind::Avatar, 80, 80, 0)?),
-                _ => Some(self.picture(account, &avatar_id, MediaKind::Avatar, look, 80, 80)?),
+            let avatar = match (photos::portrait(name), at % 10) {
+                (Some(file), _) => Some(self.photo(account, &avatar_id, MediaKind::Avatar, &file, look, 192, 192)?),
+                (None, 4) => None,
+                (None, 8) => Some(self.waiting(account, &avatar_id, MediaKind::Avatar, look, 80, 80)?),
+                (None, 9) if at == 19 => Some(self.broken(account, &avatar_id, MediaKind::Avatar, 80, 80, 0)?),
+                (None, _) => Some(self.picture(account, &avatar_id, MediaKind::Avatar, look, 80, 80)?),
             };
             let who = Who {
                 id: id.clone(),
@@ -452,7 +505,7 @@ pub fn seed(store: &mut Store, dir: &Path, mode: Mode) -> Fallible<()> {
         occupants: Vec::new(),
     };
     // Whatever an earlier run seeded goes first, files included, so ids never collide.
-    for account in [discord::account(), slack::harbor(), slack::fernhill(), telegram::account(), teams::account()] {
+    for account in [discord::account(), slack::harbor(), slack::fernhill(), telegram::account(), teams::account(), signal::account()] {
         seeder.store.forget(&account)?;
         let _ = std::fs::remove_dir_all(crate::blobs::dir_under(&media, &account));
     }
@@ -463,6 +516,8 @@ pub fn seed(store: &mut Store, dir: &Path, mode: Mode) -> Fallible<()> {
     me.push((telegram::account(), telegram::seed(&mut seeder)?));
     me.push((teams::account(), teams::seed(&mut seeder)?));
     polish::seed(&mut seeder, &discord)?;
+    // Last, so every id the others drew is what it was before Signal was in the demo.
+    me.push((signal::account(), signal::seed(&mut seeder)?));
 
     let fernhill = match (mode.expired, mode.reconnecting) {
         (true, _) => (Link::Expired, "Slack ended this session. Sign in again to send and receive."),
@@ -477,6 +532,7 @@ pub fn seed(store: &mut Store, dir: &Path, mode: Mode) -> Fallible<()> {
             (slack::fernhill(), fernhill.0, fernhill.1),
             (telegram::account(), Link::Connected, ""),
             (teams::account(), Link::Connected, ""),
+            (signal::account(), Link::Connected, ""),
         ],
         me,
         presence: seeder.presence,
