@@ -1,7 +1,7 @@
 //! Discord's messages into the one message model: markdown to text and spans, attachments,
 //! embeds, stickers, reactions, replies, system lines.
 
-use super::model::{self, seconds, Attachment as Attached, Embed, Posted};
+use super::model::{self, seconds, Attachment as Attached, Embed, EmbedImage, Posted};
 use crate::adapters::Context;
 use base64::Engine;
 use protocol::{
@@ -539,6 +539,48 @@ fn sticker(rich: &mut Rich, sticker: &model::Sticker) -> Attachment {
     }
 }
 
+/// An embed's picture, registered at the size a row draws it, when Discord's proxy serves it.
+fn embed_still(rich: &mut Rich, id: String, picture: &EmbedImage) -> Option<MediaFile> {
+    let proxy = picture.proxy_url.as_deref()?;
+    let (width, height) = fitted(picture.width, picture.height);
+    let file = MediaFile { width, height, ..MediaFile::new(id, MediaKind::Image) };
+    rich.files.push((file.clone(), resized(proxy, width, height)));
+    let sizes = larger(proxy, (width, height), (picture.width, picture.height));
+    if !sizes.is_empty() {
+        rich.files.sizes.push((file.id.clone(), sizes));
+    }
+    Some(file)
+}
+
+/// A GIF from Tenor or Giphy (`gifv`, an MP4) or a video Discord's proxy serves, as an
+/// attachment: its still in the row, the moving picture fetched only when it is played. A
+/// video only its site can play (YouTube) has no proxy address and stays a link card.
+fn moving(rich: &mut Rich, message: &str, index: usize, embed: &Embed) -> Option<Attachment> {
+    let kind = match embed.kind.as_deref() {
+        Some("gifv") => MediaKind::Gif,
+        Some("video") => MediaKind::Video,
+        _ => return None,
+    };
+    let video = embed.video.as_ref()?;
+    let proxy = video.proxy_url.as_deref()?;
+    let poster = embed.thumbnail.as_ref().or(embed.image.as_ref())?;
+    let thumb = embed_still(rich, format!("embed:{message}:{index}"), poster)?;
+    let file = MediaFile {
+        width: video.width,
+        height: video.height,
+        ..MediaFile::new(format!("embed:{message}:{index}:video"), kind)
+    };
+    rich.files.push((file.clone(), proxy.to_owned()));
+    let name = match kind {
+        MediaKind::Gif => "GIF".to_owned(),
+        _ => embed.title.clone().filter(|title| !title.is_empty()).unwrap_or_else(|| "Video".to_owned()),
+    };
+    let mut attachment = Attachment::new(name, file);
+    attachment.thumb = Some(thumb);
+    attachment.mime = "video/mp4".to_owned();
+    Some(attachment)
+}
+
 /// A card, with a picture only when Discord's own proxy serves it.
 fn preview(rich: &mut Rich, message: &str, index: usize, embed: &Embed) -> Preview {
     let mut description = embed.description.clone().unwrap_or_default();
@@ -549,21 +591,7 @@ fn preview(rich: &mut Rich, message: &str, index: usize, embed: &Embed) -> Previ
         description.push_str(&format!("{}: {}", field.name, field.value));
     }
     let picture = embed.image.as_ref().or(embed.thumbnail.as_ref());
-    let image = picture.and_then(|picture| {
-        let proxy = picture.proxy_url.as_deref()?;
-        let (width, height) = fitted(picture.width, picture.height);
-        let file = MediaFile {
-            width,
-            height,
-            ..MediaFile::new(format!("embed:{message}:{index}"), MediaKind::Image)
-        };
-        rich.files.push((file.clone(), resized(proxy, width, height)));
-        let sizes = larger(proxy, (width, height), (picture.width, picture.height));
-        if !sizes.is_empty() {
-            rich.files.sizes.push((file.id.clone(), sizes));
-        }
-        Some(file)
-    });
+    let image = picture.and_then(|picture| embed_still(rich, format!("embed:{message}:{index}"), picture));
     let site = embed.provider.as_ref().or(embed.author.as_ref());
     Preview {
         url: embed.url.clone().unwrap_or_default(),
@@ -705,7 +733,8 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
     attachments.extend(carried.sticker_items.iter().map(|item| sticker(&mut rich, item)));
     let embeds = carried.embeds.as_deref().unwrap_or(&[]);
     let composed = carried.author.as_ref().is_some_and(|author| author.bot) || carried.webhook_id.is_some();
-    let (card, previews) = cards(&mut rich, &posted.id, embeds, place.names, composed);
+    let (card, previews, moving_pictures) = cards(&mut rich, &posted.id, embeds, place.names, composed);
+    attachments.extend(moving_pictures);
     let reactions = reactions(&mut rich, posted.reactions.as_deref().unwrap_or(&[]));
     let origin = posted.message_reference.as_ref().filter(|reference| reference.kind == 1 && forwarded.is_some());
     let forwarded_from = origin.map(|origin| {
@@ -815,10 +844,15 @@ fn cards(
     embeds: &[Embed],
     names: &dyn Names,
     by_bot: bool,
-) -> (Option<Box<Card>>, Vec<Preview>) {
+) -> (Option<Box<Card>>, Vec<Preview>, Vec<Attachment>) {
     let mut composed = None;
     let mut previews = Vec::new();
+    let mut moving_pictures = Vec::new();
     for (index, embed) in embeds.iter().enumerate() {
+        if let Some(attachment) = moving(rich, message, index, embed) {
+            moving_pictures.push(attachment);
+            continue;
+        }
         if !by_bot || composed.is_some() || embed.kind.as_deref() != Some("rich") {
             previews.push(preview(rich, message, index, embed));
             continue;
@@ -841,7 +875,7 @@ fn cards(
             }
         }
     }
-    (composed, previews)
+    (composed, previews, moving_pictures)
 }
 
 /// Applies the fields a partial `MESSAGE_UPDATE` carries to the message as stored.
@@ -855,15 +889,22 @@ pub fn patch(stored: &mut Message, update: &Posted, place: &Place) -> Files {
         }
     }
     if let Some(attached) = &update.attachments {
-        let stickers: Vec<Attachment> =
-            stored.attachments.iter().filter(|kept| kept.file.id.starts_with("sticker:")).cloned().collect();
+        // Stickers and embeds' moving pictures are not attachments to Discord.
+        let stickers: Vec<Attachment> = stored
+            .attachments
+            .iter()
+            .filter(|kept| kept.file.id.starts_with("sticker:") || kept.file.id.starts_with("embed:"))
+            .cloned()
+            .collect();
         stored.attachments = attached.iter().map(|attached| attachment(&mut rich, attached)).collect();
         stored.attachments.extend(stickers);
     }
     if let Some(embeds) = &update.embeds {
-        let (card, previews) = cards(&mut rich, &stored.id, embeds, place.names, stored.sender.bot);
+        let (card, previews, moving_pictures) = cards(&mut rich, &stored.id, embeds, place.names, stored.sender.bot);
         stored.card = card;
         stored.previews = previews;
+        stored.attachments.retain(|kept| !kept.file.id.starts_with("embed:"));
+        stored.attachments.extend(moving_pictures);
     }
     if let Some(reacted) = &update.reactions {
         stored.reactions = reactions(&mut rich, reacted);

@@ -2715,3 +2715,50 @@ fn a_waiting_profile_never_holds_up_a_send_a_superseded_one_is_dropped_and_reads
     sleep(Duration::from_millis(500));
     assert_eq!((acked(&read[0]), acked(&read[1]), acked(&read[2])), (1, 0, 1));
 }
+
+#[test]
+fn a_voice_message_and_a_gif_from_tenor_are_attachments_fetched_only_from_discord() {
+    let world = World::start();
+    let dm = "3002";
+    let voice = format!("{}/media/attachments/1/9201/voice-message.ogg?ex=7fffffff&is=1&hm=abc", world.api);
+    let still = format!("{}/media/external/tenor-still.png", world.api);
+    let moving = format!("{}/media/external/tenor.mp4", world.api);
+    let id = world.incoming(
+        dm,
+        None,
+        "https://tenor.com/view/otter-123",
+        json!({
+            "flags": 8192,
+            "attachments": [{"id": "9201", "filename": "voice-message.ogg", "size": 9120, "content_type": "audio/ogg",
+                             "duration_secs": 4.2, "waveform": "AAoUHigyPEZQWg==", "url": voice, "proxy_url": voice}],
+            "embeds": [{"type": "gifv", "url": "https://tenor.com/view/otter-123", "provider": {"name": "Tenor"},
+                        "thumbnail": {"url": "https://media.tenor.com/still.png", "proxy_url": still, "width": 498, "height": 280},
+                        "video": {"url": "https://media.tenor.com/otter.mp4", "proxy_url": moving, "width": 498, "height": 280}}]
+        }),
+    );
+    let message = wait("the message", || world.messages(dm).pop().filter(|message| message.id == id));
+    // The voice message: what the player and its waveform need, from Discord's own fields.
+    let note = &message.attachments[0];
+    assert_eq!((note.file.id.as_str(), note.file.kind, note.mime.as_str(), note.duration), ("att:9201", MediaKind::Audio, "audio/ogg", 4));
+    assert_eq!(note.waveform, vec![0, 10, 20, 30, 40, 50, 60, 70, 80, 90]);
+    // The GIF is an attachment, not a link card: a still in the row, the MP4 behind it.
+    assert!(message.previews.is_empty(), "{:?}", message.previews);
+    let gif = &message.attachments[1];
+    assert_eq!((gif.name.as_str(), gif.file.kind, gif.mime.as_str()), ("GIF", MediaKind::Gif, "video/mp4"));
+    assert_eq!((gif.file.width, gif.file.height), (498, 280));
+    let thumb = gif.thumb.as_ref().unwrap();
+    assert_eq!((thumb.id.clone(), thumb.kind), (format!("embed:{id}:0"), MediaKind::Image));
+
+    // Nothing moving is fetched until asked, and then only from Discord's proxy.
+    settled(&world);
+    assert!(world.discord.requests_to("GET", "/media/external/tenor.mp4").is_empty());
+    assert!(world.discord.requests_to("GET", "/media/attachments/1/9201/").is_empty());
+    let played = world.fetched(&gif.file.id, None, false);
+    assert!(played.path.is_some(), "{played:?}");
+    assert_eq!(world.discord.requests_to("GET", "/media/external/tenor.mp4").len(), 1);
+    let heard = world.fetched("att:9201", None, false);
+    assert!(heard.path.is_some(), "{heard:?}");
+    let fetched = world.discord.requests_to("GET", "/media/attachments/1/9201/");
+    let paths: Vec<&str> = fetched.iter().map(|seen| seen.path.as_str()).collect();
+    assert_eq!(paths, ["/media/attachments/1/9201/voice-message.ogg?ex=7fffffff&is=1&hm=abc"]);
+}
