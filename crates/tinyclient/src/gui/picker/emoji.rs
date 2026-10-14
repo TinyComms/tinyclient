@@ -2,7 +2,7 @@
 //! tone, search, and the "Frequently used" row kept per account. No drawing here.
 
 use super::table::{EMOJI, GROUPS};
-use protocol::{AccountKey, MediaFile, Network};
+use protocol::{AccountKey, MediaFile, Network, Reaction, ReactionRules, ReactionSet};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -82,6 +82,18 @@ pub fn name_of(cell: &Cell, customs: &[Custom]) -> String {
         Cell::Unicode(ix) => EMOJI.get(*ix as usize).map_or_else(String::new, |emoji| format!(":{}:", emoji.code)),
         Cell::Glyph(glyph) => find(glyph).map_or_else(String::new, |ix| format!(":{}:", EMOJI[ix].code)),
         Cell::Custom(ix) => customs.get(*ix as usize).map_or_else(String::new, |custom| custom.name.clone()),
+    }
+}
+
+/// An emoji as it is drawn: one a network writes without its variation selector (Telegram's
+/// ❤) is drawn as the table has it, or it would be a text glyph.
+pub fn display(emoji: &str) -> String {
+    if emoji.contains('\u{FE0F}') {
+        return emoji.to_owned();
+    }
+    match find(emoji) {
+        Some(ix) if protocol::bare_emoji(EMOJI[ix].glyph) == emoji => EMOJI[ix].glyph.to_owned(),
+        _ => emoji.to_owned(),
     }
 }
 
@@ -189,6 +201,109 @@ pub fn search_rows(query: &str, recent: &[String], customs: &[Custom]) -> Vec<Ro
     let mut rows = Vec::new();
     chunked(&mut rows, search(query, recent, customs, usize::MAX));
     rows
+}
+
+// What a conversation takes as a reaction.
+
+/// What a custom emoji is called in a reaction: what the network named it by, else its name.
+pub fn reaction_text(custom: &Custom) -> String {
+    if custom.id.is_empty() { custom.name.clone() } else { custom.id.clone() }
+}
+
+/// Skin tones apply: anything goes, or the network takes a listed emoji in a tone.
+pub fn tones_allowed(rules: &ReactionRules) -> bool {
+    rules.set == ReactionSet::Any || rules.tones
+}
+
+/// A cell may be chosen as a new reaction under these rules.
+pub fn allows(rules: &ReactionRules, cell: &Cell, tone: usize, customs: &[Custom]) -> bool {
+    match cell {
+        Cell::Custom(ix) => customs.get(*ix as usize).is_some_and(|custom| {
+            (rules.animated || !custom.animated) && (rules.offers(&custom.id, true) || rules.offers(&custom.name, true))
+        }),
+        other => rules.offers(&text_of(other, tone, customs), false),
+    }
+}
+
+fn kept_rows(rows: Vec<Row>, keep: impl Fn(&Cell) -> bool) -> (Vec<Row>, Sections) {
+    let mut sections: Vec<(String, Vec<Cell>)> = Vec::new();
+    for row in rows {
+        match row {
+            Row::Label(label) => sections.push((label, Vec::new())),
+            Row::Cells(cells) => {
+                if let Some((_, held)) = sections.last_mut() {
+                    held.extend(cells.into_iter().filter(&keep));
+                }
+            }
+        }
+    }
+    let (mut out, mut starts) = (Vec::new(), Vec::new());
+    for (label, cells) in sections.into_iter().filter(|(_, cells)| !cells.is_empty()) {
+        starts.push((label.clone(), out.len()));
+        out.push(Row::Label(label));
+        chunked(&mut out, cells);
+    }
+    (out, starts)
+}
+
+/// The grid with no query, for a reaction: only what the conversation takes, each section
+/// left out when nothing in it is allowed. A listed emoji the table does not have goes last.
+pub fn browse_for(rules: &ReactionRules, recent: &[String], customs: &[Custom], tone: usize) -> (Vec<Row>, Sections) {
+    let (rows, _) = browse(recent, customs);
+    let (mut rows, mut sections) = kept_rows(rows, |cell| allows(rules, cell, tone, customs));
+    let missing: Vec<Cell> = rules
+        .only
+        .iter()
+        .filter(|listed| !listed.starts_with(':') && find(listed).is_none() && !customs.iter().any(|custom| custom.id == **listed))
+        .map(|listed| Cell::Glyph(listed.clone()))
+        .collect();
+    if !missing.is_empty() {
+        sections.push(("More".to_owned(), rows.len()));
+        rows.push(Row::Label("More".to_owned()));
+        chunked(&mut rows, missing);
+    }
+    (rows, sections)
+}
+
+/// A search's matches that the conversation takes.
+pub fn search_for(rules: &ReactionRules, query: &str, recent: &[String], customs: &[Custom], tone: usize) -> Vec<Row> {
+    let mut rows = Vec::new();
+    let found = search(query, recent, customs, usize::MAX).into_iter().filter(|cell| allows(rules, cell, tone, customs)).collect();
+    chunked(&mut rows, found);
+    rows
+}
+
+/// The toolbar's and menu's quick reactions for one message: the most used, then the
+/// defaults, then what the conversation lists and what is already on the message, keeping
+/// only what would go through now. Mine on the message stays, as taking it back. With no
+/// rules known, the most used and the defaults, as before there were any.
+pub fn quick(rules: Option<&ReactionRules>, used: &[String], reactions: &[Reaction], count: usize) -> Vec<String> {
+    let Some(rules) = rules else {
+        return filled(used, count);
+    };
+    let tone = if tones_allowed(rules) { None } else { Some(()) };
+    let listed = rules.only.iter().filter(|listed| !listed.starts_with(':') && find(listed).is_some());
+    let there = reactions.iter().filter(|have| have.file.is_none()).map(|have| &have.emoji);
+    let candidates = used.iter().filter(|held| !held.starts_with(':')).map(String::as_str).chain(DEFAULTS).chain(listed.chain(there).map(String::as_str));
+    let mut out: Vec<String> = Vec::new();
+    for candidate in candidates {
+        if out.len() >= count {
+            break;
+        }
+        // A tone the network would not keep is left off.
+        let plain = match tone {
+            Some(()) => candidate.chars().filter(|ch| !('\u{1F3FB}'..='\u{1F3FF}').contains(ch)).collect(),
+            None => candidate.to_owned(),
+        };
+        let shown = rules.spelled(&plain).to_owned();
+        if out.iter().any(|held| protocol::bare_emoji(held) == protocol::bare_emoji(&shown)) {
+            continue;
+        }
+        if rules.check(reactions, &shown, false).is_ok() {
+            out.push(shown);
+        }
+    }
+    out
 }
 
 // Frequently used, per account.
@@ -393,6 +508,7 @@ mod tests {
         let tada = &EMOJI[find("🎉").unwrap()];
         assert_eq!(toned(tada, 5), "🎉");
         assert_eq!(find("👋\u{1F3FD}"), find("👋"));
+        assert_eq!((display("❤"), display("🎉"), display("🦀🦀")), ("❤️".to_owned(), "🎉".to_owned(), "🦀🦀".to_owned()));
     }
 
     #[test]
@@ -430,6 +546,72 @@ mod tests {
         let (empty, sections) = browse(&[], &[]);
         assert_eq!(empty[0], Row::Label("Smileys & people".into()));
         assert_eq!(sections.len(), GROUPS.len());
+    }
+
+    fn cells(rows: &[Row]) -> Vec<Cell> {
+        rows.iter().flat_map(|row| if let Row::Cells(cells) = row { cells.clone() } else { Vec::new() }).collect()
+    }
+
+    fn on(emoji: &str, count: u32, mine: bool) -> Reaction {
+        Reaction { emoji: emoji.into(), file: None, count, mine }
+    }
+
+    #[test]
+    fn a_chat_with_a_short_list_shows_only_it_and_no_custom_emoji() {
+        let rules = ReactionRules {
+            set: ReactionSet::Only,
+            only: vec!["👍".into(), "❤".into(), "🔥".into(), "🦀🦀".into()],
+            join: false,
+            mine: 1,
+            replaces: true,
+            ..ReactionRules::default()
+        };
+        let customs = [custom(":mossparrot:", "Moss & Lichen")];
+        let (rows, sections) = browse_for(&rules, &["🚀".into(), "👍".into()], &customs, 0);
+        let mut shown = glyphs(&cells(&rows), &customs);
+        // Frequently used keeps 👍 alone, the groups hold the rest, and one the table lacks
+        // goes last.
+        assert_eq!((shown.remove(0), shown.pop()), ("👍".to_owned(), Some("🦀🦀".to_owned())));
+        shown.sort();
+        assert_eq!(shown, ["❤️", "👍", "🔥"]);
+        let labels: Vec<&str> = sections.iter().map(|(label, _)| label.as_str()).collect();
+        assert_eq!((labels[0], labels[labels.len() - 1]), ("Frequently used", "More"));
+        assert!(!labels.contains(&"Moss & Lichen") && !labels.contains(&"Flags"));
+        assert_eq!(glyphs(&cells(&search_for(&rules, "heart", &[], &customs, 0)), &customs), ["❤️"]);
+        // A tone is another reaction here: none is applied.
+        assert!(!allows(&rules, &Cell::Unicode(find("👍").unwrap() as u16), 3, &customs));
+        assert!(allows(&rules, &Cell::Unicode(find("👍").unwrap() as u16), 0, &customs));
+    }
+
+    #[test]
+    fn custom_emoji_follow_the_scope_and_animated_ones_need_leave() {
+        let mut parrot = custom(":party_parrot:", "Moss & Lichen");
+        parrot.animated = true;
+        let customs = [custom(":mossparrot:", "Moss & Lichen"), parrot];
+        let space = ReactionRules { custom: protocol::EmojiScope::Space, ..ReactionRules::default() };
+        let shown = glyphs(&cells(&browse_for(&space, &[], &customs, 0).0), &customs);
+        assert!(shown.contains(&":mossparrot:".to_owned()) && !shown.contains(&":party_parrot:".to_owned()));
+        let nitro = ReactionRules { animated: true, ..space.clone() };
+        assert!(glyphs(&cells(&browse_for(&nitro, &[], &customs, 0).0), &customs).contains(&":party_parrot:".to_owned()));
+        let none = ReactionRules::default();
+        assert!(!glyphs(&cells(&browse_for(&none, &[], &customs, 0).0), &customs).iter().any(|glyph| glyph.starts_with(':')));
+    }
+
+    #[test]
+    fn quick_reactions_are_only_what_would_go_through() {
+        let used = ["🚀".to_owned(), "👍🏽".to_owned()];
+        // No rules known: as before.
+        assert_eq!(quick(None, &used, &[], 3), ["🚀", "👍🏽", "👍"]);
+        let telegram = ReactionRules { set: ReactionSet::Only, only: vec!["👍".into(), "❤".into(), "🔥".into()], join: false, mine: 1, replaces: true, ..ReactionRules::default() };
+        assert_eq!(quick(Some(&telegram), &used, &[], 3), ["👍", "❤", "🔥"], "the tone is dropped, the list's spelling kept");
+        // Reactions off: nothing to offer.
+        assert!(quick(Some(&ReactionRules::off("off")), &used, &[], 3).is_empty());
+        // Only what is there may be added to.
+        let join = ReactionRules { join_only: true, ..ReactionRules::default() };
+        assert_eq!(quick(Some(&join), &used, &[on("🍄", 2, false)], 3), ["🍄"]);
+        // A full message takes what it has, and mine to take back.
+        let full = ReactionRules { distinct: 2, ..ReactionRules::default() };
+        assert_eq!(quick(Some(&full), &used, &[on("🍄", 2, false), on("🌲", 1, true)], 3), ["🍄", "🌲"]);
     }
 
     #[test]

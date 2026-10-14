@@ -1,7 +1,8 @@
 //! For `--shot` only: puts the pane in a state worth a screenshot before the frame is written,
 //! and prints what was measured. Read from the environment so no flag is needed in `mod.rs`:
 //!
-//! - `TINYCLIENT_SHOT_CONVERSATION=<id>`: show another conversation of the open one's account.
+//! - `TINYCLIENT_SHOT_CONVERSATION=<id>`: show another conversation of the open one's account,
+//!   or `network/account/id` one of any account.
 //! - `TINYCLIENT_SHOT_AT=<message id>`: jump to it, as a reply quote would.
 //! - `TINYCLIENT_SHOT_UP=<points>`: scroll up this far from the bottom.
 //! - `TINYCLIENT_SHOT_THREAD=<message id>`: open the thread under it.
@@ -100,10 +101,16 @@ impl Script {
 
 /// `TINYCLIENT_SHOT_CONVERSATION=<id>`: show this conversation of the open one's account instead,
 /// for one the Inbox does not list.
+/// `network/account/id` names one of any account (`telegram/7000000/g8001`).
 pub fn instead(open: &protocol::Conversation) -> Option<protocol::Conversation> {
     let id = std::env::var("TINYCLIENT_SHOT_CONVERSATION").ok().filter(|id| !id.is_empty())?;
     let mut other = open.clone();
-    other.key.id = id;
+    let named = id.splitn(3, '/').collect::<Vec<_>>();
+    let network = named.first().and_then(|word| protocol::Network::ALL.into_iter().find(|network| network.label().eq_ignore_ascii_case(word)));
+    match (network, named.as_slice()) {
+        (Some(network), [_, account, id]) => other.key = protocol::Key { network, account: (*account).to_owned(), id: (*id).to_owned() },
+        _ => other.key.id = id,
+    }
     Some(other)
 }
 
