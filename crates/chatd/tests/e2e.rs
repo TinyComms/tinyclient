@@ -1262,7 +1262,12 @@ fn settings_are_kept_refused_when_unknown_and_acted_on_at_once() {
     assert_eq!(prunable, 1);
     let seq = chatd.seq();
     assert_eq!(chatd.ask(set(KEEP_DAYS, Some("7"))), Response::Ok);
-    assert!(chatd.changes(seq, Duration::from_millis(300)).contains(&Change::Settings));
+    // Windows are told: by the change itself, or, when the prune it set off already emptied
+    // the change log, by the reset that has them read everything again, settings included.
+    let Response::Changes { reset, changes, .. } = chatd.ask(Request::Wait { since: seq }) else {
+        panic!("wait did not answer with changes");
+    };
+    assert!(reset || changes.contains(&Change::Settings), "{changes:?}");
     chatd.until("the old message to be pruned", messages(Network::Slack, "C01", 10), |answer| {
         matches!(answer, Response::Messages { messages, .. } if messages.len() == 1)
     });
