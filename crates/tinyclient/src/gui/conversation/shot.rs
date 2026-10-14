@@ -1,23 +1,23 @@
 //! For `--shot` only: puts the pane in a state worth a screenshot before the frame is written,
 //! and prints what was measured. Read from the environment so no flag is needed in `mod.rs`:
 //!
-//! - `TINYCHAT_SHOT_CONVERSATION=<id>`: show another conversation of the open one's account.
-//! - `TINYCHAT_SHOT_AT=<message id>`: jump to it, as a reply quote would.
-//! - `TINYCHAT_SHOT_UP=<points>`: scroll up this far from the bottom.
-//! - `TINYCHAT_SHOT_THREAD=<message id>`: open the thread under it.
-//! - `TINYCHAT_SHOT_VIEW=<message id>`: open the viewer on its first picture.
-//! - `TINYCHAT_SHOT_ZOOM=<percent>`: with `VIEW`, zoom the viewer to it (`100`, `250`).
-//! - `TINYCHAT_SHOT_VIEW_STEPS=<n>`: with `VIEW`, go on through that many pictures, which
+//! - `TINYCLIENT_SHOT_CONVERSATION=<id>`: show another conversation of the open one's account.
+//! - `TINYCLIENT_SHOT_AT=<message id>`: jump to it, as a reply quote would.
+//! - `TINYCLIENT_SHOT_UP=<points>`: scroll up this far from the bottom.
+//! - `TINYCLIENT_SHOT_THREAD=<message id>`: open the thread under it.
+//! - `TINYCLIENT_SHOT_VIEW=<message id>`: open the viewer on its first picture.
+//! - `TINYCLIENT_SHOT_ZOOM=<percent>`: with `VIEW`, zoom the viewer to it (`100`, `250`).
+//! - `TINYCLIENT_SHOT_VIEW_STEPS=<n>`: with `VIEW`, go on through that many pictures, which
 //!   decodes more than the ceiling holds, and print what was dropped.
-//! - `TINYCHAT_SHOT_HOVER=<message id>`: show the toolbar on it, as the pointer would.
-//! - `TINYCHAT_SHOT_MENU=<message id>`: open its context menu.
-//! - `TINYCHAT_SHOT_PICKER=<message id>`: open the reaction picker for it.
-//! - `TINYCHAT_SHOT_CONFIRM=<message id>`: open the delete dialog for it.
-//! - `TINYCHAT_SHOT_SELECT=<message id>`: select all of its text.
-//! - `TINYCHAT_SHOT_REVEAL=1`: open every spoilered picture.
-//! - `TINYCHAT_SHOT_STATS=1`: print the time to open, the memory footprint and decoded bytes.
-//! - `TINYCHAT_SHOT_PAGE_BACK=<messages>`: page that far into history and come back.
-//! - `TINYCHAT_SHOT_STEPS=<step;step;…>`: things the user does to the window, 120 ms apart
+//! - `TINYCLIENT_SHOT_HOVER=<message id>`: show the toolbar on it, as the pointer would.
+//! - `TINYCLIENT_SHOT_MENU=<message id>`: open its context menu.
+//! - `TINYCLIENT_SHOT_PICKER=<message id>`: open the reaction picker for it.
+//! - `TINYCLIENT_SHOT_CONFIRM=<message id>`: open the delete dialog for it.
+//! - `TINYCLIENT_SHOT_SELECT=<message id>`: select all of its text.
+//! - `TINYCLIENT_SHOT_REVEAL=1`: open every spoilered picture.
+//! - `TINYCLIENT_SHOT_STATS=1`: print the time to open, the memory footprint and decoded bytes.
+//! - `TINYCLIENT_SHOT_PAGE_BACK=<messages>`: page that far into history and come back.
+//! - `TINYCLIENT_SHOT_STEPS=<step;step;…>`: things the user does to the window, 120 ms apart
 //!   from the first conversation drawn (use with `--open`), before the picture: `open:N` (row N of the list on show), `members`,
 //!   `details` (the header's buttons), `thread` (the first thread in the open conversation),
 //!   `back`, `forward`, `close` (the pane's ✕), `escape` (in the composer, with nothing of its
@@ -74,21 +74,21 @@ impl Script {
     pub fn from_env() -> Script {
         let var = |name: &str| std::env::var(name).ok().filter(|value| !value.is_empty());
         Script {
-            at: var("TINYCHAT_SHOT_AT"),
-            up: var("TINYCHAT_SHOT_UP").and_then(|points| points.parse().ok()),
-            thread: var("TINYCHAT_SHOT_THREAD"),
-            view: var("TINYCHAT_SHOT_VIEW"),
-            zoom: var("TINYCHAT_SHOT_ZOOM").and_then(|percent| percent.parse::<f32>().ok()).map(|percent| percent / 100.),
-            view_steps: var("TINYCHAT_SHOT_VIEW_STEPS").and_then(|steps| steps.parse().ok()).unwrap_or(0),
-            hover: var("TINYCHAT_SHOT_HOVER"),
-            menu: var("TINYCHAT_SHOT_MENU"),
-            picker: var("TINYCHAT_SHOT_PICKER"),
-            confirm: var("TINYCHAT_SHOT_CONFIRM"),
-            select: var("TINYCHAT_SHOT_SELECT"),
-            reveal: var("TINYCHAT_SHOT_REVEAL").is_some(),
+            at: var("TINYCLIENT_SHOT_AT"),
+            up: var("TINYCLIENT_SHOT_UP").and_then(|points| points.parse().ok()),
+            thread: var("TINYCLIENT_SHOT_THREAD"),
+            view: var("TINYCLIENT_SHOT_VIEW"),
+            zoom: var("TINYCLIENT_SHOT_ZOOM").and_then(|percent| percent.parse::<f32>().ok()).map(|percent| percent / 100.),
+            view_steps: var("TINYCLIENT_SHOT_VIEW_STEPS").and_then(|steps| steps.parse().ok()).unwrap_or(0),
+            hover: var("TINYCLIENT_SHOT_HOVER"),
+            menu: var("TINYCLIENT_SHOT_MENU"),
+            picker: var("TINYCLIENT_SHOT_PICKER"),
+            confirm: var("TINYCLIENT_SHOT_CONFIRM"),
+            select: var("TINYCLIENT_SHOT_SELECT"),
+            reveal: var("TINYCLIENT_SHOT_REVEAL").is_some(),
             staged: false,
-            stats: var("TINYCHAT_SHOT_STATS").is_some(),
-            page_back: var("TINYCHAT_SHOT_PAGE_BACK").and_then(|messages| messages.parse().ok()),
+            stats: var("TINYCLIENT_SHOT_STATS").is_some(),
+            page_back: var("TINYCLIENT_SHOT_PAGE_BACK").and_then(|messages| messages.parse().ok()),
             opened: false,
             drawn: false,
             paged: 0,
@@ -98,10 +98,10 @@ impl Script {
     }
 }
 
-/// `TINYCHAT_SHOT_CONVERSATION=<id>`: show this conversation of the open one's account instead,
+/// `TINYCLIENT_SHOT_CONVERSATION=<id>`: show this conversation of the open one's account instead,
 /// for one the Inbox does not list.
 pub fn instead(open: &protocol::Conversation) -> Option<protocol::Conversation> {
-    let id = std::env::var("TINYCHAT_SHOT_CONVERSATION").ok().filter(|id| !id.is_empty())?;
+    let id = std::env::var("TINYCLIENT_SHOT_CONVERSATION").ok().filter(|id| !id.is_empty())?;
     let mut other = open.clone();
     other.key.id = id;
     Some(other)
@@ -295,9 +295,9 @@ fn stage(pane: &mut Pane, window: &mut Window, cx: &mut Context<Pane>) {
     cx.notify();
 }
 
-/// Runs `TINYCHAT_SHOT_STEPS` once.
+/// Runs `TINYCLIENT_SHOT_STEPS` once.
 pub fn steps(cx: &mut gpui::Context<crate::gui::state::Shell>) {
-    let Some(steps) = std::env::var("TINYCHAT_SHOT_STEPS").ok().filter(|steps| !steps.is_empty()) else {
+    let Some(steps) = std::env::var("TINYCLIENT_SHOT_STEPS").ok().filter(|steps| !steps.is_empty()) else {
         return;
     };
     cx.spawn(async move |this, cx| {

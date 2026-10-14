@@ -102,12 +102,12 @@ pub struct Calls {
     failed: Mutex<Option<Failed>>,
 }
 
-/// `TINYCHAT_MEDIAD`, or the `mediad` next to this binary: in `target/`, and in
+/// `TINYCLIENT_MEDIAD`, or the `mediad` next to this binary: in `target/`, and in
 /// `tinyclient.app/Contents/MacOS`, where `packaging/bundle.sh` puts every executable so that
 /// each finds the others this way. A bundle that keeps helpers apart has them in
 /// `Contents/Helpers`, which is looked in second.
 fn mediad_path() -> io::Result<PathBuf> {
-    if let Some(path) = std::env::var_os("TINYCHAT_MEDIAD") {
+    if let Some(path) = std::env::var_os("TINYCLIENT_MEDIAD") {
         return Ok(PathBuf::from(path));
     }
     let beside = std::env::current_exe()?.with_file_name(format!("mediad{}", std::env::consts::EXE_SUFFIX));

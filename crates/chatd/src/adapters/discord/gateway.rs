@@ -392,7 +392,7 @@ impl Discord {
         let session = self.state.lock().unwrap().session.clone();
         let url = match &session {
             Some(session) => session.url.clone(),
-            None => address("TINYCHAT_DISCORD_GATEWAY", GATEWAY),
+            None => address("TINYCLIENT_DISCORD_GATEWAY", GATEWAY),
         };
         let mut wire = Wire::connect(&url, &self.rest.identity().user_agent)?;
         self.outbox.queue.lock().unwrap().clear();

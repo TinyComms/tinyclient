@@ -262,6 +262,20 @@ pub fn telegram(home: &Home) -> Vec<Item> {
     out
 }
 
+/// The Signal home: the chats, starred ones first. Signal has no Spaces, folders or archive a
+/// linked device hears of.
+pub fn signal(home: &Home) -> Vec<Item> {
+    let mut out = Vec::new();
+    let starred = home.chats.iter().any(|c| c.starred);
+    if starred {
+        header(&mut out, "Pinned");
+        out.extend(home.chats.iter().filter(|c| c.starred).cloned().map(Item::Chat));
+        header(&mut out, "Chats");
+    }
+    out.extend(home.chats.iter().filter(|c| !c.starred).cloned().map(Item::Chat));
+    out
+}
+
 // CONTRACT: `Space` says nothing of a team being archived, so the "Archived teams" fold of
 // `03` §5 is not drawn; archived teams list with the rest.
 /// The Teams home: Pinned, Chats (never collapsed, at least eight), the Meetings fold, then the
@@ -411,6 +425,16 @@ mod tests {
         let channels = |_: &Key| vec![at("general", 1, false, 0), at("releases", 1, false, 3)];
         let got = shape(&teams(&home, std::slice::from_ref(&team), &channels, None, NOW), std::slice::from_ref(&team));
         assert_eq!(got, ["[Chats]", "ana", "standup", "offsite", "<Meetings>", "[Teams]", "Platform", "releases"]);
+    }
+
+    #[test]
+    fn signal_lists_its_chats_with_the_starred_first() {
+        let mut grace = (*chat("grace", 1)).clone();
+        grace.starred = true;
+        let home = Home { chats: vec![chat("club", 0), Rc::new(grace)], ..Home::for_network(Network::Signal) };
+        assert_eq!(shape(&signal(&home), &[]), ["[Pinned]", "grace", "[Chats]", "club"]);
+        let plain = Home { chats: vec![chat("club", 0)], ..Home::for_network(Network::Signal) };
+        assert_eq!(shape(&signal(&plain), &[]), ["club"]);
     }
 
     #[test]

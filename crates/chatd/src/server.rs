@@ -127,27 +127,27 @@ fn call_error(err: CallError) -> Response {
     }
 }
 
-/// `TINYCHAT_LOGIN`, or the `tinyclient-login` next to this binary.
+/// `TINYCLIENT_LOGIN`, or the `tinyclient-login` next to this binary.
 fn login_path() -> io::Result<PathBuf> {
-    if let Some(path) = std::env::var_os("TINYCHAT_LOGIN") {
+    if let Some(path) = std::env::var_os("TINYCLIENT_LOGIN") {
         return Ok(PathBuf::from(path));
     }
     Ok(std::env::current_exe()?.with_file_name(format!("tinyclient-login{}", std::env::consts::EXE_SUFFIX)))
 }
 
-/// `TINYCHAT_TEST_KEYCHAIN_MS`: in a scratch directory, a session read takes this long, as one
+/// `TINYCLIENT_TEST_KEYCHAIN_MS`: in a scratch directory, a session read takes this long, as one
 /// held up by a keychain prompt does. Never read otherwise.
 fn test_keychain_delay() -> Option<Duration> {
     if session::enabled() {
         return None;
     }
-    std::env::var("TINYCHAT_TEST_KEYCHAIN_MS").ok()?.parse().ok().map(Duration::from_millis)
+    std::env::var("TINYCLIENT_TEST_KEYCHAIN_MS").ok()?.parse().ok().map(Duration::from_millis)
 }
 
-/// `TINYCHAT_TEST_PANIC`: in a scratch directory, a `Find` for this query panics while it holds
+/// `TINYCLIENT_TEST_PANIC`: in a scratch directory, a `Find` for this query panics while it holds
 /// the store, as a bug in one request would. Never read otherwise.
 fn test_panic(query: &str) -> bool {
-    !session::enabled() && std::env::var("TINYCHAT_TEST_PANIC").is_ok_and(|panics| panics == query)
+    !session::enabled() && std::env::var("TINYCLIENT_TEST_PANIC").is_ok_and(|panics| panics == query)
 }
 
 impl Chat {
@@ -1064,10 +1064,15 @@ impl Chat {
                 format!("{} is not built yet", network.label()),
             );
         }
+        // Signal links this computer from the phone, in the sheet the shell draws itself
+        // (`SignInBegin`); it has no sign-in page for a window to show.
+        if network == Network::Signal {
+            return error(ErrorCode::Unsupported, "Signal signs in by linking from your phone, not in a window.");
+        }
         // A scratch directory signs nobody in. A test may still name a helper of its own, to
         // see what it is run with and how its answer is told; its session is never kept.
-        if !session::enabled() && std::env::var_os("TINYCHAT_LOGIN").is_none() {
-            return error(ErrorCode::SignIn, "sign-in is off while TINYCHAT_DIR is set");
+        if !session::enabled() && std::env::var_os("TINYCLIENT_LOGIN").is_none() {
+            return error(ErrorCode::SignIn, "sign-in is off while TINYCLIENT_DIR is set");
         }
         let helper = login_path().and_then(|path| {
             let mut helper = std::process::Command::new(path);
@@ -1111,6 +1116,7 @@ impl Chat {
         let adopt = move |session: &str| adopt(&hub, &adapters, network, session);
         let step = match network {
             Network::Telegram => adapters::telegram::signin::step(&self.hub, input, Box::new(adopt)),
+            Network::Signal => adapters::signal::signin::step(&self.hub, input, Box::new(adopt)),
             _ => Err(format!("{} signs in in its own window.", network.label())),
         };
         match step {
@@ -1440,8 +1446,10 @@ impl Chat {
             Request::SignInBegin { network } => self.sign_in_step(network, None),
             Request::SignInAnswer { network, input } => self.sign_in_step(network, Some(input)),
             Request::SignInCancel { network } => {
-                if network == Network::Telegram {
-                    adapters::telegram::signin::cancel();
+                match network {
+                    Network::Telegram => adapters::telegram::signin::cancel(),
+                    Network::Signal => adapters::signal::signin::cancel(),
+                    _ => {}
                 }
                 Response::Ok
             }

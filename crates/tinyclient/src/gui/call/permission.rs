@@ -141,7 +141,7 @@ mod macos {
     /// answer. Blocks, possibly for as long as a prompt stays up: never on the main thread.
     pub(super) fn ensure() -> Microphone {
         // Devices that tests and the demo replace need nobody's permission.
-        if std::env::var_os("TINYCHAT_MEDIAD_AUDIO").is_some() {
+        if std::env::var_os("TINYCLIENT_MEDIAD_AUDIO").is_some() {
             return Microphone::Allowed;
         }
         match status() {
@@ -188,7 +188,7 @@ mod portable {
     }
 
     pub(super) fn ensure() -> Microphone {
-        if std::env::var_os("TINYCHAT_MEDIAD_AUDIO").is_some() {
+        if std::env::var_os("TINYCLIENT_MEDIAD_AUDIO").is_some() {
             return Microphone::Allowed;
         }
         Microphone::Allowed

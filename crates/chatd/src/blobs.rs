@@ -64,7 +64,7 @@ const RENEWED_TOGETHER: usize = 50;
 /// one lands. What this forgets, `reconcile` removes at the next start.
 const REMEMBERED: usize = 4_096;
 /// A picker that has asked for none of its previews for this long has closed, and its files go.
-/// `TINYCHAT_PICK_IDLE`, in seconds, replaces it in a scratch directory.
+/// `TINYCLIENT_PICK_IDLE`, in seconds, replaces it in a scratch directory.
 pub const PICK_IDLE: Duration = Duration::from_secs(120);
 /// How often the accounts are looked at for one that signed in or connected, whose own picture
 /// is then fetched.
@@ -180,11 +180,11 @@ struct Queue {
 struct Cache {
     hub: Arc<Hub>,
     dir: PathBuf,
-    /// Bytes on disk in all. `TINYCHAT_MEDIA_CAP` replaces it in a scratch directory.
+    /// Bytes on disk in all. `TINYCLIENT_MEDIA_CAP` replaces it in a scratch directory.
     cap: u64,
-    /// `TINYCHAT_MEDIA_ON_SCREEN`, in seconds, replaces [`ON_SCREEN`] in a scratch directory.
+    /// `TINYCLIENT_MEDIA_ON_SCREEN`, in seconds, replaces [`ON_SCREEN`] in a scratch directory.
     on_screen: Duration,
-    /// `TINYCHAT_PICK_IDLE`, in seconds, replaces [`PICK_IDLE`] in a scratch directory.
+    /// `TINYCLIENT_PICK_IDLE`, in seconds, replaces [`PICK_IDLE`] in a scratch directory.
     pick_idle: Duration,
     hosts: fetch::Hosts,
     queue: Mutex<Queue>,
@@ -210,8 +210,8 @@ fn scratch(name: &str) -> Option<String> {
 impl Blobs {
     /// `dir` is the `media` directory under the support directory.
     pub fn new(hub: Arc<Hub>, dir: PathBuf) -> Blobs {
-        // `TINYCHAT_MEDIA_HOSTS`: hosts a test serves files from, separated by commas.
-        let mut local: Vec<(String, fetch::Trust)> = scratch("TINYCHAT_MEDIA_HOSTS")
+        // `TINYCLIENT_MEDIA_HOSTS`: hosts a test serves files from, separated by commas.
+        let mut local: Vec<(String, fetch::Trust)> = scratch("TINYCLIENT_MEDIA_HOSTS")
             .map(|hosts| hosts.split(',').map(|host| (host.to_owned(), fetch::Trust::Open)).collect())
             .unwrap_or_default();
         // The demo's files come from its own server on localhost.
@@ -222,9 +222,9 @@ impl Blobs {
         let cache = Arc::new(Cache {
             hub,
             dir,
-            cap: number("TINYCHAT_MEDIA_CAP").unwrap_or(CACHE_BYTES),
-            on_screen: number("TINYCHAT_MEDIA_ON_SCREEN").map_or(ON_SCREEN, Duration::from_secs),
-            pick_idle: number("TINYCHAT_PICK_IDLE").map_or(PICK_IDLE, Duration::from_secs),
+            cap: number("TINYCLIENT_MEDIA_CAP").unwrap_or(CACHE_BYTES),
+            on_screen: number("TINYCLIENT_MEDIA_ON_SCREEN").map_or(ON_SCREEN, Duration::from_secs),
+            pick_idle: number("TINYCLIENT_PICK_IDLE").map_or(PICK_IDLE, Duration::from_secs),
             hosts: fetch::Hosts { local },
             queue: Mutex::new(Queue::default()),
             wake: Condvar::new(),

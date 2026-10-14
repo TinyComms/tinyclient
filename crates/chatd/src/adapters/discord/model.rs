@@ -9,17 +9,17 @@ use serde::{Deserialize, Serialize};
 const CDN: &str = "https://cdn.discordapp.com";
 const MEDIA: &str = "https://media.discordapp.net";
 
-/// Where avatars, icons and emoji are served from. `TINYCHAT_DISCORD_CDN` replaces it, and the
+/// Where avatars, icons and emoji are served from. `TINYCLIENT_DISCORD_CDN` replaces it, and the
 /// media proxy with it, so a test's pictures come from its own fake and never from Discord.
 pub fn cdn() -> &'static str {
     static CDN_AT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    CDN_AT.get_or_init(|| super::super::net::address("TINYCHAT_DISCORD_CDN", CDN))
+    CDN_AT.get_or_init(|| super::super::net::address("TINYCLIENT_DISCORD_CDN", CDN))
 }
 
 /// The media proxy, which serves stickers and resized pictures.
 pub fn media() -> &'static str {
     static MEDIA_AT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    MEDIA_AT.get_or_init(|| super::super::net::address("TINYCHAT_DISCORD_CDN", MEDIA))
+    MEDIA_AT.get_or_init(|| super::super::net::address("TINYCLIENT_DISCORD_CDN", MEDIA))
 }
 
 /// Channel types.

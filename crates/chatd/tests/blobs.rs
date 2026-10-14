@@ -183,8 +183,8 @@ impl Daemon {
     /// a test needs.
     fn start_in(dir: PathBuf, env: &[(&str, &str)]) -> Daemon {
         let child = Command::new(env!("CARGO_BIN_EXE_chatd"))
-            .env("TINYCHAT_DIR", &dir)
-            .env("TINYCHAT_MEDIA_HOSTS", "127.0.0.1")
+            .env("TINYCLIENT_DIR", &dir)
+            .env("TINYCLIENT_MEDIA_HOSTS", "127.0.0.1")
             .envs(env.iter().copied())
             .spawn()
             .unwrap();
@@ -434,7 +434,7 @@ fn the_least_recently_used_file_goes_when_the_cache_is_over_its_cap() {
         .map(|id| (file(id, MediaKind::Image), files.url("/bytes/100000")))
         .collect();
     // Room for two of the three, and nothing counts as on screen.
-    let chatd = Daemon::start(&registered, &[("TINYCHAT_MEDIA_CAP", "250000"), ("TINYCHAT_MEDIA_ON_SCREEN", "0")]);
+    let chatd = Daemon::start(&registered, &[("TINYCLIENT_MEDIA_CAP", "250000"), ("TINYCLIENT_MEDIA_ON_SCREEN", "0")]);
     let path = |file: MediaFile| PathBuf::from(file.path.expect("landed"));
     let a = path(chatd.fetched("a"));
     // Use is kept to the second.
@@ -461,7 +461,7 @@ fn what_was_asked_for_in_the_last_minute_is_not_evicted() {
         .into_iter()
         .map(|id| (file(id, MediaKind::Image), files.url("/bytes/100000")))
         .collect();
-    let chatd = Daemon::start(&registered, &[("TINYCHAT_MEDIA_CAP", "250000")]);
+    let chatd = Daemon::start(&registered, &[("TINYCLIENT_MEDIA_CAP", "250000")]);
     for id in ["a", "b", "c"] {
         assert!(chatd.fetched(id).path.is_some());
     }
@@ -608,7 +608,7 @@ fn picker_previews_live_in_their_own_directory_and_go_when_the_picker_closes() {
         (file("emoji-1", MediaKind::Emoji), files.url("/bytes/500")),
     ];
     // A picker counts as closed after 2 s without asking.
-    let chatd = Daemon::start(&registered, &[("TINYCHAT_PICK_IDLE", "2")]);
+    let chatd = Daemon::start(&registered, &[("TINYCLIENT_PICK_IDLE", "2")]);
     let pick_dir = chatd.dir.join("media/discord/pick/42");
     let landed = [chatd.fetched(&sticker), chatd.fetched(&still)];
     for file in &landed {
@@ -691,10 +691,10 @@ fn the_accounts_own_picture_lands_after_it_connects_without_the_shell_asking() {
     let chatd = Daemon::start_in(
         dir,
         &[
-            ("TINYCHAT_SESSION_DISCORD", session),
-            ("TINYCHAT_DISCORD_API", &files.url("/api")),
-            ("TINYCHAT_DISCORD_GATEWAY", &format!("{gateway}/?encoding=json&v=9")),
-            ("TINYCHAT_DISCORD_CDN", &files.url("/cdn")),
+            ("TINYCLIENT_SESSION_DISCORD", session),
+            ("TINYCLIENT_DISCORD_API", &files.url("/api")),
+            ("TINYCLIENT_DISCORD_GATEWAY", &format!("{gateway}/?encoding=json&v=9")),
+            ("TINYCLIENT_DISCORD_CDN", &files.url("/cdn")),
         ],
     );
     // Nothing but `Status` is asked: no `Fetch`.

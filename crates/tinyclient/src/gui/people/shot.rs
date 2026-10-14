@@ -1,4 +1,4 @@
-//! States for `--shot` that no flag reaches: `TINYCHAT_S6=people,profile,...` puts made-up
+//! States for `--shot` that no flag reaches: `TINYCLIENT_S6=people,profile,...` puts made-up
 //! people on screen so the People views can be looked at beside the mockups. Compiled only
 //! with `gui-shot`. Staging only draws: nothing here, and nothing clicked in a shot run, is
 //! sent to a network.
@@ -25,7 +25,7 @@ use protocol::{ConversationKind, Key, Link, Network, Occupant, Occupants, Person
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub fn wants(what: &str) -> bool {
-    std::env::var("TINYCHAT_S6").is_ok_and(|states| states.split(',').any(|state| state == what))
+    std::env::var("TINYCLIENT_S6").is_ok_and(|states| states.split(',').any(|state| state == what))
 }
 
 fn once(flag: &AtomicBool) -> bool {
@@ -196,7 +196,7 @@ impl Shell {
     /// What needs the shell itself changed: the sidebar's mode, a pane, a popover.
     pub(super) fn stage(&mut self, cx: &mut Context<Self>) {
         static DONE: AtomicBool = AtomicBool::new(false);
-        if std::env::var_os("TINYCHAT_S6").is_none() || !once(&DONE) {
+        if std::env::var_os("TINYCLIENT_S6").is_none() || !once(&DONE) {
             return;
         }
         let hub = self.people_state.hub();
@@ -211,7 +211,7 @@ impl Shell {
         if wants("open1") {
             self.open_listed(1, cx);
         }
-        if std::env::var("TINYCHAT_S6").is_ok_and(|states| states.split(',').any(|state| state.starts_with("people"))) {
+        if std::env::var("TINYCLIENT_S6").is_ok_and(|states| states.split(',').any(|state| state.starts_with("people"))) {
             self.go(Mode::People, cx);
         }
         if wants("members") {
@@ -349,16 +349,16 @@ pub fn sheet() -> Option<AnyElement> {
 /// open conversation's Space), `d-space`, `d-card`, `d-dock` (the card, then View profile),
 /// `d-menu`, `d-confirm`, `d-phones`, `d-files`, `d-links`, `d-pinned`, `d-search`.
 fn stage_details(cx: &mut Context<Shell>) {
-    let Ok(states) = std::env::var("TINYCHAT_S6") else {
+    let Ok(states) = std::env::var("TINYCLIENT_S6") else {
         return;
     };
     if !states.split(',').any(|state| state.starts_with("d-")) {
         return;
     }
-    // `TINYCHAT_PD=telegram:Nadia` opens the first row of that network whose title holds the words.
-    if let Some((network, words)) = std::env::var("TINYCHAT_PD").ok().and_then(|pick| {
+    // `TINYCLIENT_PD=telegram:Nadia` opens the first row of that network whose title holds the words.
+    if let Some((network, words)) = std::env::var("TINYCLIENT_PD").ok().and_then(|pick| {
         let (network, words) = pick.split_once(':')?;
-        let network = [Network::Discord, Network::Slack, Network::Telegram, Network::Teams].into_iter().find(|net| net.label().eq_ignore_ascii_case(network))?;
+        let network = Network::ALL.into_iter().find(|net| net.label().eq_ignore_ascii_case(network))?;
         Some((network, words.to_owned()))
     }) {
         let this = cx.weak_entity();

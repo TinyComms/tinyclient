@@ -62,14 +62,16 @@ pub enum Network {
     Discord,
     Slack,
     Teams,
+    Signal,
 }
 
 impl Network {
-    pub const ALL: [Network; 4] = [
+    pub const ALL: [Network; 5] = [
         Network::Telegram,
         Network::Discord,
         Network::Slack,
         Network::Teams,
+        Network::Signal,
     ];
 
     /// The label the shell shows on a row. The network is a label, never a different layout.
@@ -79,6 +81,7 @@ impl Network {
             Network::Discord => "Discord",
             Network::Slack => "Slack",
             Network::Teams => "Teams",
+            Network::Signal => "Signal",
         }
     }
 }
@@ -1475,9 +1478,9 @@ pub enum Response {
     },
 }
 
-/// `TINYCHAT_DIR` moves the socket and database, for tests and the demo seed.
+/// `TINYCLIENT_DIR` moves the socket and database, for tests and the demo seed.
 pub fn support_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("TINYCHAT_DIR") {
+    if let Some(dir) = std::env::var_os("TINYCLIENT_DIR") {
         return PathBuf::from(dir);
     }
     if cfg!(target_os = "macos") {

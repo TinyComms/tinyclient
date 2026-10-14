@@ -125,7 +125,7 @@ How the processes fit together and who may edit what. The contract itself is the
   a cached account is listed `Offline` with that in `detail`, never dropped. `Status.started`
   (unix ms) changes at every start: with `Changes.reset`, how a shell learns chatd restarted.
 - **Starting chatd** is the shell's (`protocol::launch`): `chatd_answers`, `start_chatd` (its own
-  process group, stderr to `chatd.log`), `chatd_path` (`TINYCHAT_CHATD`, else beside the running
+  process group, stderr to `chatd.log`), `chatd_path` (`TINYCLIENT_CHATD`, else beside the running
   binary: the bundle's `Contents/MacOS` or `target/<profile>`; build both with
   `cargo build -p chatd -p tinyclient`). A second chatd finds `chatd.lock` held and exits.
 - **Panics**: `protocol::crash::install_panic_hook` in chatd, mediad (and the shell) writes one
@@ -200,7 +200,7 @@ changing again replaces its entry, so the list is bounded (256) by how many thin
 
 | Data | Where |
 |---|---|
-| Sessions | Keychain, service `tinyclient`, one item per network. Never in SQLite. |
+| Sessions | Keychain, service `tinyclient`, one item per network. Never in chat.sqlite. Signal's item holds the account id and the key to `signal/<account>.state`, where its ratchets, keys, contacts and groups live, each value sealed with that key (`adapters/signal/vault.rs`, built with the `signal` feature only). |
 | Accounts, Spaces (muted, hide muted), folders, groups (kind, muted, unread only), conversations (unread, mentions, muted, read marker, star, topic, thread parent and root, draft, filing, kind flags, preview parts, seen, when it last mentioned me), people and relationships (title, time zone, mark), messages (rich fields as JSON in `message.body`), media rows with their failure and size variants, adapter notes | `chat.sqlite`, schema version in `PRAGMA user_version` (now 4), page cache 1 MB. A version change drops and refills the cache: the 3 → 4 change does, once. |
 | Media bytes | `media/<network>/<account>/` under the support directory, 500 MB, least recently used first. |
 | Presence and activity, typing, voice occupants, what the shell watches, links and capabilities, the change list, the call, upload progress, previews asked, and five minutes of profiles, info panes and catalog pages (64 / 64 / 16 / 32 at most) | chatd memory, bounded, gone at restart. |
@@ -273,7 +273,7 @@ sends `Levels` and chatd passes our input level on as `Call.level`; `Call.inputs
 
 ## The demo (`chatd --seed-demo`, `chatd/src/demo*`)
 
-Invented data in a scratch `TINYCHAT_DIR`, and an adapter with no network behind it
+Invented data in a scratch `TINYCLIENT_DIR`, and an adapter with no network behind it
 (`demo/adapter.rs`) that answers for the five demo accounts (Discord, two Slack workspaces,
 Telegram, Teams): a send is accepted, files "upload" from their paths with progress and can be
 cancelled, a reaction toggles, edit and delete work, a friend request can be answered, our
@@ -283,11 +283,11 @@ closed, rows with no preview filled when on screen, and a call in a voice channe
 its occupants. What each account holds is listed at the top of `demo.rs` (`demo/telegram.rs`,
 `demo/teams.rs`, `demo/polish.rs` for this round). The server's own tests use it as their network
 (`tests/e2e.rs`, `tests/calls.rs`, `tests/polish.rs`). Variants, comma separated: `live`,
-`expired`, `many` (50 Discord servers), `attention`, `reconnecting`. `TINYCHAT_DEMO_VOICE` hands
-calls a voice server; `TINYCHAT_DEMO_ANSWER_MS`, `TINYCHAT_DEMO_SIGN_OUT_MS` and
-`TINYCHAT_DEMO_UPLOAD_MS` set how long the "network" takes to answer a ring, to sign out and to
-take each quarter of a file. In a scratch directory only, `TINYCHAT_TEST_KEYCHAIN_MS` makes each
-session read that slow and `TINYCHAT_TEST_PANIC=<query>` makes a `Find` for it panic while it
+`expired`, `many` (50 Discord servers), `attention`, `reconnecting`. `TINYCLIENT_DEMO_VOICE` hands
+calls a voice server; `TINYCLIENT_DEMO_ANSWER_MS`, `TINYCLIENT_DEMO_SIGN_OUT_MS` and
+`TINYCLIENT_DEMO_UPLOAD_MS` set how long the "network" takes to answer a ring, to sign out and to
+take each quarter of a file. In a scratch directory only, `TINYCLIENT_TEST_KEYCHAIN_MS` makes each
+session read that slow and `TINYCLIENT_TEST_PANIC=<query>` makes a `Find` for it panic while it
 holds the store.
 
 ## Ownership (polish round)
@@ -315,7 +315,7 @@ Tests go in your own files or a new `tests/<slice>.rs`. A gap in the contract is
 | B | Shell lists | `gui/sidebar.rs`, `gui/sidebar/*`, `gui/rail.rs`, `gui/people.rs`, `gui/people/list.rs`, `gui/people/hub.rs`, `gui/people/presence.rs`, `gui/people/status.rs`, the `load_*` functions of `gui/state.rs`, new `gui/home/*` | Inbox by `Inbox` (its rules are chatd's), day headers from `updated`, one Apps row from `bot` and `counts.apps`, chips from `counts`; `Watching.rows` for every list on screen (previews); People sections from `Around` (`in_call`, `online`, `recent`, `requests`), never bots; the rail's one number (`AccountStatus.attention`) and dots, its own picture fetched with `Fetch`; the switcher (`Find`, Needs you, Recent); the four homes: Discord (`Home` DMs, `Shelf::Requests`, `InVoice`, `Folders` of Spaces, `Space.folder` / `muted`, `opted_out` under "Browse", `Group.muted` collapsed, `followed` threads), Slack (`Tree`, `Group.unread_only`, `quiet` rows folded, `Threads`), Telegram (`Home` with `pin`, `Folders` chips and `folder`, `Shelf::Archive`, `Topics`, `special`, `mark`, `seen`, `preview_from`), Teams (`Home` chats, `meeting` 14-day fold, `special` Saved, `hidden`, teams' `opted_out` channels); `Presence::Busy`, `Person.emoji`, `activity`, `title`, `utc_offset` on rows. |
 | C | Shell conversation and panes | `gui/conversation.rs`, `gui/conversation/*` (but `emoji.rs`), `gui/people/members.rs`, new `gui/pane.rs`, `gui/pane/*` | **P0**: a thread composer never posts to the conversation the user left (put the thread away on every switch, R2). Right pane kinds and following (07 §1), one width 300 (260–420), landing at the first unread, per-conversation memory (scroll anchor, remembered thread, last 50), Escape ladder; header from `Conversation::subtitle()`, `read_only`, `special` (no composer for Service), `mark`; `Pinned` for the pins; `Change::Upload` progress and Cancel (`CancelSend`) on a pending row; a pending row keeps its place and time; `rich.rs` span ranges never panic. |
 | D | Shell profile, info pane and card | `gui/people/card.rs`, `gui/people/info.rs`, `gui/people/shot.rs`, new `gui/profile/*` | `Profile {person, space}` with the typed fields in the fixed order (06), `contacts` masked until clicked, `warning`, `away`; `ConversationInfo` (description, members, online, created, creator, `notify`, `pinned`, `external`, `link`) and `SpaceInfo` from the Space's name; `SetMute`, `Leave` (one confirm), `CloseDirect`, `Relate`; `Shared` from the cache labelled as such (`complete: false`) and "Search all" as `search: true`, counts only from `total`; the floating card 300 wide, 64 avatar. |
-| E | Shell composer and pickers | `gui/composer.rs`, `gui/composer/*`, `gui/input.rs`, `gui/conversation/emoji.rs`, new `gui/picker/*` | `Send.with` (`Outgoing`): attach, paste and drop staging paths (pasted pixels to `$TINYCHAT_DIR/outbox/`), per-file `spoiler`, `as_file`, `original`, refusals checked against `AccountStatus.can` before staging; `silent` (Option-Return where `can.silent`), `suppress_embeds` (the preview chip), `ping` on replies, `pick` from the picker; one picker with Emoji (Unicode list local, custom from `Catalog` `Emoji`), GIFs and Stickers tabs, each only where `can` allows, asked on tab open; autocomplete; the `@everyone` confirm from `ConversationInfo.members`; `input.rs` IME ranges never panic. |
+| E | Shell composer and pickers | `gui/composer.rs`, `gui/composer/*`, `gui/input.rs`, `gui/conversation/emoji.rs`, new `gui/picker/*` | `Send.with` (`Outgoing`): attach, paste and drop staging paths (pasted pixels to `$TINYCLIENT_DIR/outbox/`), per-file `spoiler`, `as_file`, `original`, refusals checked against `AccountStatus.can` before staging; `silent` (Option-Return where `can.silent`), `suppress_embeds` (the preview chip), `ping` on replies, `pick` from the picker; one picker with Emoji (Unicode list local, custom from `Catalog` `Emoji`), GIFs and Stickers tabs, each only where `can` allows, asked on tab open; autocomplete; the `@everyone` confirm from `ConversationInfo.members`; `input.rs` IME ranges never panic. |
 | F | Discord and Slack adapters | `adapters/discord.rs`, `adapters/discord/*`, `adapters/slack.rs`, `adapters/slack/*`, `crates/login/**`, `tests/discord.rs`, `tests/slack.rs`, `tests/fixtures/{discord,slack}/**` | Discord: `guild_folders` → `Context::folders`, server mute and hide-muted → `space_flags`, opt-in → `opted_out`, muted categories → `Group.muted`, message requests → `Special::Request`, bot DMs `bot`, joined threads `followed`, `Context::activity` from presences and voice states (friends in voice reported as occupants), `ProfileIn` (nickname, roles, joined), `ConversationInfo`, `SpaceInfo`, `SetMute`, `Leave`, `CloseDirect`, `Pinned`, `SearchShared`, `Catalog` (READY's emoji and stickers, `/gifs/search`), `SendWith` (attachments, `SPOILER_`, flags `silent` / `suppress_embeds`, `allowed_mentions.replied_user`), `capabilities` from `premium_type`; never a per-row preview fetch. Slack: sections' `unread_only`, app and bot DMs `bot` (Slackbot too), guests and external `mark`, `details` (title, `tz_offset`), status emoji through `activity`, huddles, `Previews` (`conversations.history limit=1`, paced), `OpenThreads` (`subscriptions.thread.getView`) → `followed`, `ConversationInfo`, `SetMute`, `Pinned`, `SearchShared` (`files.list`), `Catalog` (`emoji.list`), `SendWith` (`files.getUploadURLExternal` …), `schedule`. |
 | G | Telegram and Teams adapters | `adapters/telegram.rs`, `adapters/telegram/*`, `adapters/teams.rs`, `adapters/teams/*`, `tests/telegram.rs`, `tests/teams.rs`, `tests/fixtures/{telegram,teams}/**` | Telegram: no Space (rows with no `space`), `filing` (folders from the dialog filters' rules, archive, pins), `Context::folders` with the folders' own pins, `listed` only for people, groups, bots and the service chat, `special` Saved and Service, `mark` (verified, scam, fake), `seen` from `read_outbox_max_id`, topics as `Thread` rows under the forum with their pins, `OpenHome`, `Previews` (paced), `ProfileIn` (admin title), `ConversationInfo`, `SetMute`, `Leave`, `Pinned`, `SearchShared` (with counters), `Catalog` (saved GIFs, `@gif`, sticker packs), `SendWith` (`saveFilePart` in 512 KB parts, albums, spoiler, as file), `silent`, `schedule`. Teams: chats with no Space, `meeting`, bot chats `bot`, Notes `Special::Saved`, `hidden` (unhidden by a new message), team channels' `opted_out`, `Presence::Busy` and `activity` (in a meeting, presenting), out of office in `Profile.away`, `details` (title, department), `Context::preview` from `lastMessage`, `seen`, `ConversationInfo`, `SetMute`, `SendWith` (OneDrive, second token). |
 | H | Media and sending in chatd | `chatd/src/blobs.rs`, `blobs/*`, new `chatd/src/upload.rs`, `upload/*`, `tests/blobs.rs`, new `tests/upload.rs` | One upload helper for F and G: a file read from its path in bounded parts, progress through `Context::upload`, cancel, a failure that names the file; the catalog previews' files under `media/<network>/pick/`, deleted when the picker closes, custom emoji in the 48 px cache; the on-screen rows' avatars and previews fetched with at most 4 in flight; each account's own picture fetched at sign-in (the rail's). |
@@ -323,11 +323,12 @@ Tests go in your own files or a new `tests/<slice>.rs`. A gap in the contract is
 
 - One cargo command at a time, `-j 6`. Slices A and B share the `chatd` crate, so someone else's
   half-written file can break your build: check with `cargo check -p chatd` and say so, do not fix it.
-- Never run `chatd` without `TINYCHAT_DIR`. A scratch directory never reads the keychain; a test
-  hands an adapter its session in `TINYCHAT_SESSION_DISCORD` / `TINYCHAT_SESSION_SLACK` and points
-  it at a local fake with `TINYCHAT_DISCORD_API`, `TINYCHAT_DISCORD_GATEWAY`, `TINYCHAT_SLACK_API`,
-  `TINYCHAT_SLACK_SOCKET`. In a scratch directory `SignIn` runs only a helper the test names in
-  `TINYCHAT_LOGIN`, and a session an adapter saves goes to `session.<network>` in that directory.
+- Never run `chatd` without `TINYCLIENT_DIR`. A scratch directory never reads the keychain; a test
+  hands an adapter its session in `TINYCLIENT_SESSION_DISCORD` / `TINYCLIENT_SESSION_SLACK` and points
+  it at a local fake with `TINYCLIENT_DISCORD_API`, `TINYCLIENT_DISCORD_GATEWAY`, `TINYCLIENT_SLACK_API`,
+  `TINYCLIENT_SLACK_SOCKET`. Telegram and Signal have no HTTP to fake: `TINYCLIENT_TELEGRAM_FAKE` and
+  `TINYCLIENT_SIGNAL_FAKE` put a scripted wire under the adapter instead (`adapters/*/fake.rs`). In a scratch directory `SignIn` runs only a helper the test names in
+  `TINYCLIENT_LOGIN`, and a session an adapter saves goes to `session.<network>` in that directory.
 - Slices F, G and H share the `chatd` crate, and A to E the `tinyclient` crate: someone else's
   half-written file can break your build. Check with `cargo check -p chatd` (or `-p tinyclient
   --features gui`) and say so; do not fix it.

@@ -1,6 +1,8 @@
-//! The Telegram sign-in sheet (`docs/design/08-first-run-settings.md`, section 2). Telegram has
-//! no web page to show, so tinyclient draws the sign-in itself: a code to scan, or a phone number,
-//! the code Telegram sends and, for accounts that have one, the two-step password.
+//! The Telegram and Signal sign-in sheet (`docs/design/08-first-run-settings.md`, section 2).
+//! Neither has a web page to show, so tinyclient draws the sign-in itself. Telegram: a code to
+//! scan, or a phone number, the code Telegram sends and, for accounts that have one, the two-step
+//! password. Signal: only the code to scan from the phone, which links this computer as one more
+//! device; a number typed here would take the account from the phone, so none is asked.
 //!
 //! chatd owns the sign-in. The sheet asks it to begin, draws the step it is told
 //! (`protocol::SignInStep`) and answers it; while the sheet is open its own loop asks `Wait` and
@@ -88,7 +90,7 @@ pub struct Sheet {
     refocus: bool,
     /// What had the keys before the sheet opened; it gets them back when it closes.
     before: Option<FocusHandle>,
-    /// `TINYCHAT_SIGNIN` has been looked at.
+    /// `TINYCLIENT_SIGNIN` has been looked at.
     launched: bool,
     /// A made-up step for a screenshot: chatd is never asked.
     canned: bool,
@@ -110,7 +112,7 @@ fn holder(cx: &mut App) -> Entity<Sheet> {
 /// Opens the sheet for a network that signs in here. `false` for one that signs in through its
 /// own web page, so the caller goes on to the helper window.
 pub fn open(network: Network, cx: &mut Context<Shell>) -> bool {
-    if network != Network::Telegram {
+    if !matches!(network, Network::Telegram | Network::Signal) {
         return false;
     }
     holder(cx).update(cx, |sheet, cx| sheet.open(network, cx));
@@ -139,17 +141,18 @@ fn now() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_secs() as i64)
 }
 
-/// The words for a problem. They name Telegram because only Telegram signs in here.
-fn problem_words(problem: &SignInProblem) -> String {
+/// The words for a problem, naming the network that is signing in.
+fn problem_words(network: Network, problem: &SignInProblem) -> String {
+    let name = network.label();
     match problem {
-        SignInProblem::Unreachable => "Couldn't reach Telegram. Check your connection.".to_owned(),
+        SignInProblem::Unreachable => format!("Couldn't reach {name}. Check your connection."),
         SignInProblem::PhoneInvalid => "That doesn't look like a phone number.".to_owned(),
-        SignInProblem::PhoneUnknown => "No Telegram account uses this number. Create one in the Telegram app first.".to_owned(),
-        SignInProblem::PhoneBanned => "Telegram has blocked this number.".to_owned(),
+        SignInProblem::PhoneUnknown => format!("No {name} account uses this number. Create one in the {name} app first."),
+        SignInProblem::PhoneBanned => format!("{name} has blocked this number."),
         SignInProblem::CodeInvalid => "That code isn't right. Check it and type it again.".to_owned(),
         SignInProblem::CodeExpired => "That code has expired.".to_owned(),
         SignInProblem::PasswordInvalid => "That password isn't right.".to_owned(),
-        SignInProblem::TooMany { until } => format!("Too many tries. Telegram allows another at {}.", clock(*until)),
+        SignInProblem::TooMany { until } => format!("Too many tries. {name} allows another at {}.", clock(*until)),
         SignInProblem::Other { reason } => reason.clone(),
     }
 }
@@ -280,17 +283,18 @@ impl Sheet {
         }
     }
 
-    /// Once, at the first frame: `TINYCHAT_SIGNIN=telegram` opens the sheet, which is how it is
-    /// reached while the first-run row still says "Not available yet". A screenshot build may
-    /// ask for a made-up step instead.
+    /// Once, at the first frame: `TINYCLIENT_SIGNIN=telegram` (or `signal`) opens the sheet, which is
+    /// how it is reached while the first-run row still says "Not available yet". A screenshot
+    /// build may ask for a made-up step instead.
     fn launch(&mut self, cx: &mut Context<Sheet>) {
         #[cfg(feature = "gui-shot")]
         if let Some(canned) = shot::canned() {
             self.show_canned(canned, cx);
             return;
         }
-        if std::env::var("TINYCHAT_SIGNIN").is_ok_and(|network| network.eq_ignore_ascii_case("telegram")) {
-            self.open(Network::Telegram, cx);
+        let asked = std::env::var("TINYCLIENT_SIGNIN").ok().and_then(|word| [Network::Telegram, Network::Signal].into_iter().find(|n| n.label().eq_ignore_ascii_case(&word)));
+        if let Some(network) = asked {
+            self.open(network, cx);
         }
     }
 
@@ -433,7 +437,7 @@ impl Sheet {
                 self.face.is_some()
             }
             Ok(Response::Error { code: ErrorCode::Unsupported, detail }) => {
-                let words = if detail.is_empty() { "This build of tinyclient can't sign in to Telegram.".to_owned() } else { detail };
+                let words = if detail.is_empty() { format!("This build of tinyclient can't sign in to {}.", self.network.label()) } else { detail };
                 self.face = Some(Face::Unsupported(words));
                 false
             }
@@ -675,23 +679,26 @@ impl Sheet {
         let tile = match (problem, &self.code) {
             (Some(problem), _) => quiet_tile()
                 .gap(px(12.))
-                .child(div().text_center().child(problem_words(problem)))
+                .child(div().text_center().child(problem_words(self.network, problem)))
                 .child(button("signin-again", ButtonKind::Secondary, "Try again").on_click(cx.listener(|this, _, _, cx| this.restart(cx)))),
             (None, Some((_, code))) => code_tile(code.clone()),
-            (None, None) => quiet_tile().child(div().text_center().child("Getting a code from Telegram")),
+            (None, None) => quiet_tile().child(div().text_center().child(format!("Getting a code from {}", self.network.label()))),
         };
-        let steps = ["Open Telegram on your phone.", "Go to Settings > Devices > Link Desktop Device.", "Point the phone at this code."];
+        let signal = self.network == Network::Signal;
+        let steps = if signal {
+            ["Open Signal on your phone.", "Go to Settings > Linked devices > Link new device.", "Point the phone at this code."]
+        } else {
+            ["Open Telegram on your phone.", "Go to Settings > Devices > Link Desktop Device.", "Point the phone at this code."]
+        };
+        // Signal links a computer only from the phone: there is no other way in to offer.
+        let other_way = (!signal).then(|| self.answer_link("signin-use-phone", "Use a phone number instead", || SignInInput::UsePhone, cx));
         div()
             .flex()
             .flex_col()
-            .child(self.header("Sign in to Telegram", false, cx))
+            .child(self.header(self.title(), false, cx))
             .child(div().mt(px(20.)).mb(px(18.)).flex().justify_center().child(tile))
             .child(div().flex().flex_col().gap(px(8.)).children(steps.into_iter().enumerate().map(|(at, words)| numbered(at + 1, words))))
-            .child(
-                footer(22.)
-                    .child(self.answer_link("signin-use-phone", "Use a phone number instead", || SignInInput::UsePhone, cx))
-                    .child(self.cancel("Cancel", cx)),
-            )
+            .child(footer(22.).child(other_way.map_or_else(|| div().into_any_element(), IntoElement::into_any_element)).child(self.cancel("Cancel", cx)))
     }
 
     fn phone_step(&self, problem: Option<&SignInProblem>, window: &mut Window, cx: &Context<Sheet>) -> Div {
@@ -707,7 +714,7 @@ impl Sheet {
             .flex_col()
             .child(self.header("Your phone number", true, cx))
             .child(div().mt(px(16.)).flex().gap(px(8.)).child(country).child(number))
-            .children(problem.map(|problem| error_line(problem_words(problem)).mt(px(6.))))
+            .children(problem.map(|problem| error_line(problem_words(self.network, problem)).mt(px(6.))))
             .child(
                 footer(22.)
                     .child(self.answer_link("signin-use-qr", "Scan a code instead", || SignInInput::UseQr, cx))
@@ -771,7 +778,7 @@ impl Sheet {
                 .justify_center()
                 .items_center()
                 .gap(px(6.))
-                .child(error_line(problem_words(problem)).text_center())
+                .child(error_line(problem_words(self.network, problem)).text_center())
                 .children(expired.then(|| again().type_small()))
         });
         // Under the boxes, left: the other way to get a code, or when one may be asked for.
@@ -852,7 +859,7 @@ impl Sheet {
             .flex_col()
             .child(self.header("Two-step verification password", true, cx))
             .child(div().mt(px(16.)).child(secret))
-            .children(problem.map(|problem| error_line(problem_words(problem)).mt(px(6.))))
+            .children(problem.map(|problem| error_line(problem_words(self.network, problem)).mt(px(6.))))
             // `text_faint` does not sit on `overlay` (`01-system.md`, rule 7): one level up.
             .children((!hint.is_empty()).then(|| div().mt(px(6.)).type_small().text_color(theme::text_soft()).child(format!("Hint from Telegram: {hint}"))))
             .child(
@@ -863,12 +870,19 @@ impl Sheet {
             )
     }
 
+    fn title(&self) -> &'static str {
+        match self.network {
+            Network::Signal => "Sign in to Signal",
+            _ => "Sign in to Telegram",
+        }
+    }
+
     /// The sign-in cannot go on: chatd's reason, and the way to start over.
     fn failed_step(&self, reason: &str, cx: &Context<Sheet>) -> Div {
         div()
             .flex()
             .flex_col()
-            .child(self.header("Sign in to Telegram", false, cx))
+            .child(self.header(self.title(), false, cx))
             .child(div().mt(px(8.)).text_color(theme::text_soft()).child(reason.to_owned()))
             .child(footer(20.).child(div()).child(buttons().child(self.cancel("Close", cx)).child(self.primary("Try again", Sheet::restart, cx))))
     }
@@ -877,7 +891,7 @@ impl Sheet {
         div()
             .flex()
             .flex_col()
-            .child(self.header("Sign in to Telegram", false, cx))
+            .child(self.header(self.title(), false, cx))
             .child(div().mt(px(16.)).text_center().text_color(theme::text_soft()).child(words.to_owned()))
             .child(
                 footer(20.).child(div()).child(
@@ -1145,7 +1159,7 @@ mod tests {
 
     #[test]
     fn every_problem_has_the_words_of_the_design() {
-        let words = |problem| problem_words(&problem);
+        let words = |problem| problem_words(Network::Telegram, &problem);
         assert_eq!(words(SignInProblem::Unreachable), "Couldn't reach Telegram. Check your connection.");
         assert_eq!(words(SignInProblem::PhoneInvalid), "That doesn't look like a phone number.");
         assert_eq!(words(SignInProblem::PhoneUnknown), "No Telegram account uses this number. Create one in the Telegram app first.");
@@ -1156,6 +1170,8 @@ mod tests {
         assert_eq!(words(SignInProblem::Other { reason: "Telegram is having trouble.".into() }), "Telegram is having trouble.");
         let until = 1_760_000_000;
         assert_eq!(words(SignInProblem::TooMany { until }), format!("Too many tries. Telegram allows another at {}.", clock(until)));
+        // Signal is named for itself.
+        assert_eq!(problem_words(Network::Signal, &SignInProblem::Unreachable), "Couldn't reach Signal. Check your connection.");
     }
 
     #[test]

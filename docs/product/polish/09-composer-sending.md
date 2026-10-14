@@ -1,7 +1,7 @@
 # Polish 09 · The composer and everything you can send
 
 Files, images, emoji, GIFs, stickers, voice, formatting and mentions, per network. Looked at:
-`--seed-demo` shots of `#showcase` with `--open-first` and `TINYCHAT_SHOT_PICKER`; `composer.rs`,
+`--seed-demo` shots of `#showcase` with `--open-first` and `TINYCLIENT_SHOT_PICKER`; `composer.rs`,
 `composer/*`, `input.rs`, `conversation/emoji.rs`; each adapter's `send`. Tags: **[C]** in our code,
 **[W]** confirmed on the web (sources at the end), **[U]** unconfirmed, check on a live session.
 This file reverses the cut of the GIF picker and of stickers in `stories.md` and `03`; voice
@@ -32,7 +32,7 @@ recording stays out of v1.
    closes (as `emoji.rs` already is).
 4. **Bytes never pass through the socket.** The shell stages paths. chatd streams each file from
    its path in parts and never holds the whole file. Pasted pixels become a file in
-   `$TINYCHAT_DIR/outbox/`, deleted once sent or once the draft is dropped.
+   `$TINYCLIENT_DIR/outbox/`, deleted once sent or once the draft is dropped.
 5. **Staging never uploads** (`04`). Send creates a pending row with its own progress (ruling 9).
    The composer is free at once, and Esc or the × on that row cancels the upload.
 6. **Limits come from the session** (`03` rule 7). An oversize file is refused at staging, on its

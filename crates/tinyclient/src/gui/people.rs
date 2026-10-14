@@ -103,7 +103,7 @@ pub(in crate::gui) fn only_draws() -> bool {
     #[cfg(feature = "gui-shot")]
     {
         static SHOT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *SHOT.get_or_init(|| std::env::args().any(|arg| arg == "--shot") || std::env::var_os("TINYCHAT_S6").is_some())
+        *SHOT.get_or_init(|| std::env::args().any(|arg| arg == "--shot") || std::env::var_os("TINYCLIENT_S6").is_some())
     }
     #[cfg(not(feature = "gui-shot"))]
     false

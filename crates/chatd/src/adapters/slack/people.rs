@@ -247,7 +247,7 @@ impl Slack {
                 continue;
             };
             let profile = &user["profile"];
-            if std::env::var_os("TINYCHAT_SHAPES").is_some() {
+            if std::env::var_os("TINYCLIENT_SHAPES").is_some() {
                 // Field names only, never values: for comparing what Slack sends with what is read.
                 let keys = |value: &Value| value.as_object().map(|map| map.keys().cloned().collect::<Vec<_>>().join(",")).unwrap_or_default();
                 eprintln!("chatd: Slack: user shape [{}] profile [{}]", keys(user), keys(profile));

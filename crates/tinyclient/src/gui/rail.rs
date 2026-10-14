@@ -121,7 +121,7 @@ impl Shell {
             let workspaces = snapshot.accounts_of(network);
             let name = match (link, workspaces) {
                 (Link::Connected, 0 | 1) => network.label().to_owned(),
-                (Link::Connected, n) => format!("{} · {n} {}", network.label(), if network == Network::Discord || network == Network::Telegram { "accounts" } else { "workspaces" }),
+                (Link::Connected, n) => format!("{} · {n} {}", network.label(), if matches!(network, Network::Discord | Network::Telegram | Network::Signal) { "accounts" } else { "workspaces" }),
                 (other, _) => format!("{} · {}", network.label(), super::components::link_word(other)),
             };
             let trouble = snapshot.accounts.iter().any(|a| a.key.network == network && (a.link == Link::Expired || !a.required.is_empty()));

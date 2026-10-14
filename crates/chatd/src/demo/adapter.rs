@@ -2,12 +2,12 @@
 //! the shell's requests become, with the same `Context` calls a real adapter makes, so the shell
 //! can be clicked through and the server's own tests have a network that does as it is told.
 //!
-//! - `TINYCHAT_DEMO_VOICE` (`host:port`): a voice server to hand mediad when a call starts.
+//! - `TINYCLIENT_DEMO_VOICE` (`host:port`): a voice server to hand mediad when a call starts.
 //!   Without it a call gets no voice session, as on a network that never answers.
-//! - `TINYCHAT_DEMO_ANSWER_MS`: how long the other side of a direct call takes to pick up
+//! - `TINYCLIENT_DEMO_ANSWER_MS`: how long the other side of a direct call takes to pick up
 //!   (4000). Only with a voice server; without one nobody answers.
-//! - `TINYCHAT_DEMO_SIGN_OUT_MS`: how long ending the session on the "network" takes (150).
-//! - `TINYCHAT_DEMO_UPLOAD_MS`: how long each quarter of a file upload takes (60), so a test
+//! - `TINYCLIENT_DEMO_SIGN_OUT_MS`: how long ending the session on the "network" takes (150).
+//! - `TINYCLIENT_DEMO_UPLOAD_MS`: how long each quarter of a file upload takes (60), so a test
 //!   can cancel one on its way.
 
 use super::Who;
@@ -95,6 +95,8 @@ impl Demo {
             Network::Telegram => person_id.to_owned(),
             Network::Teams => format!("19:{}_robin@unq.gbl.spaces", number.parse::<u32>().unwrap_or(0)),
             Network::Discord => format!("500000000000000{number}"),
+            // Not in the demo. A Signal chat with a person is named by the person.
+            Network::Signal => person_id.to_owned(),
         }
     }
 
@@ -126,7 +128,7 @@ impl Demo {
         let spawned = std::thread::Builder::new().name("demo-upload".into()).stack_size(256 * 1024).spawn(move || {
             use std::io::Read;
             let total: u64 = with.files.iter().map(|file| std::fs::metadata(&file.path).map_or(0, |meta| meta.len())).sum();
-            let step = millis("TINYCHAT_DEMO_UPLOAD_MS", 60);
+            let step = millis("TINYCLIENT_DEMO_UPLOAD_MS", 60);
             let mut sent = 0u64;
             let mut part = vec![0u8; 64 * 1024];
             for file in &with.files {
@@ -326,6 +328,8 @@ impl Demo {
                     about.away_until = Some((day + to_friday) * 86_400 + 17 * 3_600);
                 }
             }
+            // Not in the demo.
+            Network::Signal => {}
         }
         about
     }
@@ -518,7 +522,7 @@ impl Demo {
             });
             demo.ctx.participants(conversation_id, roster.collect());
         }
-        let Ok(endpoint) = std::env::var("TINYCHAT_DEMO_VOICE") else {
+        let Ok(endpoint) = std::env::var("TINYCLIENT_DEMO_VOICE") else {
             return;
         };
         demo.ctx.voice(conversation_id, VoiceJoin {
@@ -539,7 +543,7 @@ impl Demo {
         // The other side picks up after a while, unless we hung up first.
         let (demo, conversation_id) = (demo.clone(), conversation_id.to_owned());
         let _ = std::thread::Builder::new().stack_size(256 * 1024).spawn(move || {
-            if demo.ctx.pause(millis("TINYCHAT_DEMO_ANSWER_MS", 4_000)) {
+            if demo.ctx.pause(millis("TINYCLIENT_DEMO_ANSWER_MS", 4_000)) {
                 return;
             }
             if demo.call.lock().unwrap().as_deref() != Some(conversation_id.as_str()) {
@@ -642,7 +646,7 @@ impl Demo {
                 }
             }
             Command::SignOut(reply) => {
-                demo.ctx.pause(millis("TINYCHAT_DEMO_SIGN_OUT_MS", 150));
+                demo.ctx.pause(millis("TINYCLIENT_DEMO_SIGN_OUT_MS", 150));
                 let _ = reply.send(Ok(()));
             }
             // Nothing is behind these: what is stored is all there is.

@@ -17,7 +17,9 @@ pub const CRASH_LOG_LIMIT: u64 = 256 * 1024;
 /// tokens (three base64url parts joined by dots, no prefix) and JWTs, the values of the
 /// `Authorization`, `X-Skypetoken` and `Authentication` headers and of `Bearer`, the values of
 /// signed or credential URL parameters (`token=`, `hm=`, `tempauth=`, `sig=`,
-/// `X-Amz-Signature=`, ...) and of JSON fields such as `"token"` and `"skypetoken"`.
+/// `X-Amz-Signature=`, ...) and of JSON fields such as `"token"` and `"skypetoken"`. For Signal:
+/// the account password in a socket address (`password=`) and as Basic credentials, the key in
+/// a device-link address (`pub_key=`), and the key to the account's state (`"vault"`).
 pub fn redact(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut at = 0;
@@ -45,12 +47,12 @@ const PREFIXED: [&str; 11] = ["xoxc-", "xoxd-", "xoxs-", "xoxp-", "xoxb-", "xoxe
 /// Headers whose value is a credential: the name stays, the value (scheme included) goes.
 const HEADERS: [&str; 5] = ["authorization:", "proxy-authorization:", "x-skypetoken:", "authentication:", "x-ms-skypetoken:"];
 /// URL or form parameters whose value is a credential or a signature: the name stays.
-const PARAMS: [&str; 13] = [
+const PARAMS: [&str; 15] = [
     "token=", "access_token=", "refresh_token=", "id_token=", "skypetoken=", "hm=", "tempauth=", "sig=",
-    "x-amz-signature=", "x-amz-credential=", "x-amz-security-token=", "signature=", "code=",
+    "x-amz-signature=", "x-amz-credential=", "x-amz-security-token=", "signature=", "code=", "password=", "pub_key=",
 ];
 /// JSON fields whose string value is a credential.
-const FIELDS: [&str; 7] = ["token", "access_token", "refresh_token", "id_token", "skypetoken", "authorization", "password"];
+const FIELDS: [&str; 8] = ["token", "access_token", "refresh_token", "id_token", "skypetoken", "authorization", "password", "vault"];
 
 fn starts_with_ignore_case(text: &str, prefix: &str) -> bool {
     text.len() >= prefix.len() && text.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
@@ -198,6 +200,13 @@ mod tests {
         );
         // JSON fields.
         assert_eq!(redact(r#"{"skypetoken": "abc\"def", "ok": true}"#), r#"{"skypetoken": "[redacted]", "ok": true}"#);
+        // Signal: the account password on a socket address, a device link's key, the state's key.
+        assert_eq!(
+            redact("wss://chat.signal.org/v1/websocket/?login=1b2c&password=s3cr3tPassw0rd closed"),
+            "wss://chat.signal.org/v1/websocket/?login=1b2c&password=[redacted] closed"
+        );
+        assert_eq!(redact("sgnl://linkdevice?uuid=Ab12&pub_key=BQx%2Fy9"), "sgnl://linkdevice?uuid=Ab12&pub_key=[redacted]");
+        assert_eq!(redact(r#"{"aci":"1b2c","vault":"00ff00ff"}"#), r#"{"aci":"1b2c","vault":"[redacted]"}"#);
         // Nothing ordinary is taken: versions, hosts, words ending like a key.
         for plain in [
             "chatd 0.4.0 on macos 15.1.2",

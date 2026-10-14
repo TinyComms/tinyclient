@@ -2,7 +2,7 @@
 //! server on localhost. The adapter is not involved: the test calls what `Context::voice`,
 //! `Context::participants` and `Context::call_failed` call, with what the adapter would pass.
 //!
-//! mediad hears a generated tone and opens no sound device (`TINYCHAT_MEDIAD_AUDIO`).
+//! mediad hears a generated tone and opens no sound device (`TINYCLIENT_MEDIAD_AUDIO`).
 
 use chatd::hub::Hub;
 use chatd::media::CallError;
@@ -33,9 +33,9 @@ fn environment() {
         let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
         let built = Command::new(cargo).args(["build", "-p", "mediad", "--bin", "mediad"]).status().unwrap();
         assert!(built.success(), "could not build mediad");
-        std::env::set_var("TINYCHAT_MEDIAD", chatd.with_file_name(format!("mediad{}", std::env::consts::EXE_SUFFIX)));
-        std::env::set_var("TINYCHAT_MEDIAD_AUDIO", "tone");
-        std::env::set_var("TINYCHAT_VOICE_PLAIN", "1");
+        std::env::set_var("TINYCLIENT_MEDIAD", chatd.with_file_name(format!("mediad{}", std::env::consts::EXE_SUFFIX)));
+        std::env::set_var("TINYCLIENT_MEDIAD_AUDIO", "tone");
+        std::env::set_var("TINYCLIENT_VOICE_PLAIN", "1");
     });
 }
 
@@ -415,9 +415,9 @@ impl Daemon {
         std::fs::create_dir_all(&dir).unwrap();
         let child = Command::new(env!("CARGO_BIN_EXE_chatd"))
             .arg("--seed-demo")
-            .env("TINYCHAT_DIR", &dir)
-            .env("TINYCHAT_DEMO_VOICE", voice.listener.local_addr().unwrap().to_string())
-            .env("TINYCHAT_DEMO_ANSWER_MS", answer_ms)
+            .env("TINYCLIENT_DIR", &dir)
+            .env("TINYCLIENT_DEMO_VOICE", voice.listener.local_addr().unwrap().to_string())
+            .env("TINYCLIENT_DEMO_ANSWER_MS", answer_ms)
             .spawn()
             .unwrap();
         let daemon = Daemon { child, dir };

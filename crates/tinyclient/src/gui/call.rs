@@ -256,7 +256,7 @@ impl Subject {
     }
 }
 
-/// The call the views draw: chatd's, or under `--shot` the one `TINYCHAT_SHOT_CALL` names.
+/// The call the views draw: chatd's, or under `--shot` the one `TINYCLIENT_SHOT_CALL` names.
 fn shown(snapshot: &Snapshot) -> Option<Call> {
     #[cfg(feature = "gui-shot")]
     if let Some(call) = shot::call(snapshot) {

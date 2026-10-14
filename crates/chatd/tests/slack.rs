@@ -687,15 +687,15 @@ impl World {
                 {"id": "T02BETA", "name": "Side Project", "url": "https://side.slack.com/", "token": BETA, "enterprise_id": ""},
             ],
         });
-        let log = if std::env::var_os("TINYCHAT_TEST_LOG").is_some() { Stdio::inherit() } else { Stdio::null() };
+        let log = if std::env::var_os("TINYCLIENT_TEST_LOG").is_some() { Stdio::inherit() } else { Stdio::null() };
         let child = Command::new(env!("CARGO_BIN_EXE_chatd"))
-            .env("TINYCHAT_DIR", dir)
-            .env("TINYCHAT_SESSION_SLACK", session.to_string())
-            .env("TINYCHAT_SLACK_API", format!("{}/", fake.base))
-            .env("TINYCHAT_SLACK_SOCKET", socket_url)
+            .env("TINYCLIENT_DIR", dir)
+            .env("TINYCLIENT_SESSION_SLACK", session.to_string())
+            .env("TINYCLIENT_SLACK_API", format!("{}/", fake.base))
+            .env("TINYCLIENT_SLACK_SOCKET", socket_url)
             // The fake also stands in for Slack's file hosts.
-            .env("TINYCHAT_MEDIA_HOSTS", "127.0.0.1")
-            .env_remove("TINYCHAT_SESSION_DISCORD")
+            .env("TINYCLIENT_MEDIA_HOSTS", "127.0.0.1")
+            .env_remove("TINYCLIENT_SESSION_DISCORD")
             .stderr(log)
             .spawn()
             .unwrap();

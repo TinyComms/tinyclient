@@ -1,5 +1,5 @@
 //! `--shot` only: a made-up call for design review, so every face of the dock can be drawn with
-//! no call, no mediad and no microphone. `TINYCHAT_SHOT_CALL` names the state:
+//! no call, no mediad and no microphone. `TINYCLIENT_SHOT_CALL` names the state:
 //! `ringing_out`, `incoming`, `connecting`, `joined`, `joined_speaking`, `joined_muted`,
 //! `joined_deafened`, `joined_alone`, `joined_channel`, `reconnecting`, `ended`, `confirm`,
 //! `incoming_strip`, `confirm_answer`, `join_call` (the header pill of a conversation whose
@@ -14,7 +14,7 @@ use protocol::{
 };
 
 fn named() -> Option<String> {
-    std::env::var("TINYCHAT_SHOT_CALL").ok().filter(|name| !name.is_empty())
+    std::env::var("TINYCLIENT_SHOT_CALL").ok().filter(|name| !name.is_empty())
 }
 
 fn channel(name: &str) -> bool {

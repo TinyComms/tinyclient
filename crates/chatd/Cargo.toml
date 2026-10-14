@@ -40,5 +40,25 @@ tokio = { version = "1", default-features = false, features = ["rt", "time", "sy
 # 2026-10-13, changed API). Pinned until grammers follows.
 glass_pumpkin = "=2.0.0-rc0"
 
+# Signal: presage, on libsignal-service-rs and Signal's libsignal (the decision is at the top of
+# `adapters/signal.rs`). On in every build. The libraries are AGPL-3.0 git dependencies at fixed
+# commits, need `protoc` on the path, and bring rustls (pinned to Signal's own CA) for Signal's
+# sockets alone. `--no-default-features` leaves Signal `Unsupported`; the tests run against the
+# scripted wire either way.
+presage = { git = "https://github.com/whisperfish/presage", rev = "9e1f0b8d", optional = true }
+# Seals each value of the Signal state file with the key the keychain holds. In presage's tree.
+aes-gcm-siv = { version = "0.11", optional = true }
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"], optional = true }
+getrandom = { version = "0.3", optional = true }
+# The store traits presage asks for are async-trait's, and name chrono's times and rand's
+# generator. All three are in presage's tree at these versions.
+async-trait = { version = "0.1", optional = true }
+chrono = { version = "0.4", default-features = false, features = ["clock"], optional = true }
+rand = { version = "0.9", optional = true }
+
+[features]
+default = ["signal"]
+signal = ["dep:presage", "dep:aes-gcm-siv", "dep:futures", "dep:getrandom", "dep:async-trait", "dep:chrono", "dep:rand", "tokio/rt"]
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Networking_WinSock"] }

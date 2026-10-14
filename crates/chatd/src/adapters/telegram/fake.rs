@@ -1,7 +1,7 @@
 //! A wire with a script behind it and no network: a small invented account that answers the
 //! requests the adapter makes and sends updates when a test says so. It exists so the adapter
 //! can be driven through chatd's real socket (`tests/telegram.rs`); it is reachable only in a
-//! scratch directory with `TINYCHAT_TELEGRAM_FAKE` set, never from a real session.
+//! scratch directory with `TINYCLIENT_TELEGRAM_FAKE` set, never from a real session.
 //!
 //! A test steers it by writing lines to a FIFO in the scratch directory: `telegram.signin.ctl`
 //! while signing in (`scan`, `scan-password`), `telegram.ctl` once signed in (`incoming`,
@@ -43,7 +43,7 @@ const GIF_BOT: i64 = 7050;
 /// The folders: Work (the group and the forum) and Family (Odalys pinned, and the group too).
 const WORK: i32 = 2;
 const FAMILY: i32 = 3;
-/// Extra people, each with a chat of their own, when `TINYCHAT_TELEGRAM_MANY` asks for them.
+/// Extra people, each with a chat of their own, when `TINYCLIENT_TELEGRAM_MANY` asks for them.
 const CROWD: i64 = 100_000;
 const CODE: &str = "24680";
 const PASSWORD: &str = "correct horse";
@@ -100,7 +100,7 @@ fn user(id: i64, first: &str, last: &str, username: &str) -> tl::types::User {
 
 /// How many extra chats the account has, for the tests of a long chat list.
 fn crowd() -> i64 {
-    std::env::var("TINYCHAT_TELEGRAM_MANY").ok().and_then(|many| many.parse().ok()).unwrap_or(0)
+    std::env::var("TINYCLIENT_TELEGRAM_MANY").ok().and_then(|many| many.parse().ok()).unwrap_or(0)
 }
 
 fn users() -> Vec<tl::enums::User> {
@@ -759,7 +759,7 @@ impl World {
                 }
                 None => {
                     self.tokens += 1;
-                    let seconds = std::env::var("TINYCHAT_TELEGRAM_FAKE").ok().and_then(|seconds| seconds.parse::<i64>().ok()).unwrap_or(30);
+                    let seconds = std::env::var("TINYCLIENT_TELEGRAM_FAKE").ok().and_then(|seconds| seconds.parse::<i64>().ok()).unwrap_or(30);
                     let token = tl::types::auth::LoginToken { expires: (crate::hub::now() + seconds) as i32, token: vec![self.tokens; 32] };
                     answer(tl::enums::auth::LoginToken::Token(token))
                 }

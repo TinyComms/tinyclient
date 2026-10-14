@@ -243,6 +243,7 @@ pub(super) fn account_word(account: &AccountKey) -> String {
         Network::Slack => "slack",
         Network::Telegram => "telegram",
         Network::Teams => "teams",
+        Network::Signal => "signal",
     };
     format!("{network}:{}", account.account)
 }

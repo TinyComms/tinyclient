@@ -3,14 +3,14 @@
 //! to abort across AppKit) the shell starts itself again and the new window says so in a toast
 //! that stays until dismissed: "tinyclient quit unexpectedly and reopened." with "Copy report".
 //!
-//! A relaunch passes the crash's time in `TINYCHAT_CRASHED`. A second crash within
+//! A relaunch passes the crash's time in `TINYCLIENT_CRASHED`. A second crash within
 //! [`LOOP_GUARD`] of the first does not relaunch, so a panic at startup cannot loop.
 
 use protocol::crash::{install_panic_hook, CRASH_LOG};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Set on the relaunched shell: the unix second of the crash it follows.
-pub const CRASHED_ENV: &str = "TINYCHAT_CRASHED";
+pub const CRASHED_ENV: &str = "TINYCLIENT_CRASHED";
 pub const LOOP_GUARD: Duration = Duration::from_secs(60);
 
 fn now() -> u64 {

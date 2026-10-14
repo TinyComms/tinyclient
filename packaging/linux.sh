@@ -5,7 +5,7 @@
 #     libwebkit2gtk-4.1-dev libsoup-3.0-dev libvulkan-dev libwayland-dev \
 #     libxkbcommon-dev libx11-dev libxcb1-dev libfontconfig1-dev
 #
-#   TINYCHAT_TELEGRAM_API_ID=... TINYCHAT_TELEGRAM_API_HASH=... \
+#   TINYCLIENT_TELEGRAM_API_ID=... TINYCLIENT_TELEGRAM_API_HASH=... \
 #     cargo build --release -p tinyclient --features tinyclient/gui -p chatd -p mediad -p login
 #
 # Binaries: target/release/{tinyclient,chatd,mediad,tinyclient-login}

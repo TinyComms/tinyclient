@@ -115,7 +115,7 @@ pub fn context(c: &Conversation) -> String {
         (true, Some(space)) if matches!(c.key.network, Network::Slack | Network::Teams) => format!("{space} · {}", kind_word(c)),
         (true, _) => kind_word(c).to_owned(),
         (false, Some(_)) => place.join(" › "),
-        (false, None) if c.key.network == Network::Telegram => kind_word(c).to_owned(),
+        (false, None) if matches!(c.key.network, Network::Telegram | Network::Signal) => kind_word(c).to_owned(),
         (false, None) => c.key.network.label().to_owned(),
     }
 }
@@ -126,6 +126,8 @@ fn space_word(network: Network) -> &'static str {
         Network::Slack => "Workspace",
         Network::Teams => "Team",
         Network::Telegram => "Folder",
+        // Signal has no Spaces; this is never asked of it.
+        Network::Signal => "Group",
     }
 }
 

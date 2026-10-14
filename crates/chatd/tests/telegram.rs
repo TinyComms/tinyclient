@@ -45,7 +45,7 @@ impl World {
 
     /// Signed in to an account with this many more chats, each with a person of its own.
     fn crowded(many: u32) -> World {
-        World::with(Some(SESSION), "30", &[("TINYCHAT_TELEGRAM_MANY", &many.to_string())])
+        World::with(Some(SESSION), "30", &[("TINYCLIENT_TELEGRAM_MANY", &many.to_string())])
     }
 
     /// `session` is the stored sign-in, if any; `qr_seconds` how long the fake's QR codes last.
@@ -61,18 +61,18 @@ impl World {
         let log = std::fs::File::create(dir.join("stderr.log")).unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_chatd"));
         command
-            .env("TINYCHAT_DIR", &dir)
-            .env("TINYCHAT_TELEGRAM_FAKE", qr_seconds)
-            .env_remove("TINYCHAT_SESSION_DISCORD")
-            .env_remove("TINYCHAT_SESSION_SLACK")
-            .env_remove("TINYCHAT_SESSION_TELEGRAM")
-            .env_remove("TINYCHAT_TELEGRAM_MANY")
+            .env("TINYCLIENT_DIR", &dir)
+            .env("TINYCLIENT_TELEGRAM_FAKE", qr_seconds)
+            .env_remove("TINYCLIENT_SESSION_DISCORD")
+            .env_remove("TINYCLIENT_SESSION_SLACK")
+            .env_remove("TINYCLIENT_SESSION_TELEGRAM")
+            .env_remove("TINYCLIENT_TELEGRAM_MANY")
             .stderr(Stdio::from(log));
         for (name, value) in env {
             command.env(name, value);
         }
         if let Some(session) = session {
-            command.env("TINYCHAT_SESSION_TELEGRAM", session);
+            command.env("TINYCLIENT_SESSION_TELEGRAM", session);
         }
         let child = command.spawn().unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -920,13 +920,13 @@ fn cancelling_keeps_nothing_and_a_build_without_an_app_id_says_so() {
 
     // Without the scripted wire this is chatd as it is built with no app id: Telegram is
     // unsupported, with the reason, and nothing of it is loaded.
-    if option_env!("TINYCHAT_TELEGRAM_API_ID").is_some() {
+    if option_env!("TINYCLIENT_TELEGRAM_API_ID").is_some() {
         return;
     }
     let dir = PathBuf::from(format!("/tmp/tinyclient-tg-{}-plain", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_chatd")).env("TINYCHAT_DIR", &dir).env_remove("TINYCHAT_TELEGRAM_FAKE").stderr(Stdio::null()).spawn().unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_chatd")).env("TINYCLIENT_DIR", &dir).env_remove("TINYCLIENT_TELEGRAM_FAKE").stderr(Stdio::null()).spawn().unwrap();
     let plain = World { child, dir };
     plain.until("the socket", || ChatStream::connect(&plain.dir.join("chat.sock")).ok().map(drop));
     let answer = plain.ask(Request::SignInBegin { network: Network::Telegram });

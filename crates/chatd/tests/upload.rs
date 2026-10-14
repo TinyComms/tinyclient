@@ -1,5 +1,5 @@
 //! The upload helper, from outside: each case runs in a process of its own (this test binary,
-//! started again with `UPLOAD_CHILD` naming the case) with a scratch `TINYCHAT_DIR` and `HOME`,
+//! started again with `UPLOAD_CHILD` naming the case) with a scratch `TINYCLIENT_DIR` and `HOME`,
 //! so its memory is measured alone. A sink on localhost stands in for a network's upload host
 //! and records what arrived. Only what the sink saw, what the process said and what is on disk
 //! is asserted.
@@ -195,9 +195,9 @@ impl Scratch {
         let mut child = Command::new(std::env::current_exe().unwrap())
             .args(["child", "--exact", "--nocapture", "--test-threads", "1"])
             .env("UPLOAD_CHILD", case)
-            .env("TINYCHAT_DIR", &self.dir)
+            .env("TINYCLIENT_DIR", &self.dir)
             .env("HOME", &self.home)
-            .env_remove("TINYCHAT_MEDIA_HOSTS")
+            .env_remove("TINYCLIENT_MEDIA_HOSTS")
             .envs(env.iter().map(|(name, value)| (*name, value.as_str())))
             .stdout(Stdio::piped())
             .spawn()

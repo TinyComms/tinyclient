@@ -29,7 +29,7 @@ impl Daemon {
         seed(&mut Store::open(&dir.join("chat.sqlite")).unwrap());
         let child = Command::new(env!("CARGO_BIN_EXE_chatd"))
             .args(args)
-            .env("TINYCHAT_DIR", &dir)
+            .env("TINYCLIENT_DIR", &dir)
             .envs(env.iter().copied())
             .stderr(std::fs::File::create(dir.join("stderr")).unwrap())
             .spawn()
@@ -158,7 +158,7 @@ const TEAMS: &str = "harbor-tenant";
 fn the_socket_answers_while_a_keychain_read_waits_and_the_cached_account_stays_on_screen() {
     let account = AccountKey { network: Network::Discord, account: "acct".to_owned() };
     let began = Instant::now();
-    let chatd = Daemon::start(&[], &[("TINYCHAT_TEST_KEYCHAIN_MS", "1500")], |store| {
+    let chatd = Daemon::start(&[], &[("TINYCLIENT_TEST_KEYCHAIN_MS", "1500")], |store| {
         store.set_account(&account, "Robin", "me").unwrap();
         store.upsert_conversation(&account, &ConversationRow::new("dm", ConversationKind::Direct, "Mara")).unwrap();
     });
@@ -197,7 +197,7 @@ fn the_socket_answers_while_a_keychain_read_waits_and_the_cached_account_stays_o
 #[test]
 fn a_request_that_panics_is_answered_and_what_it_held_is_taken_again() {
     let account = AccountKey { network: Network::Slack, account: "T1".to_owned() };
-    let chatd = Daemon::start(&[], &[("TINYCHAT_TEST_PANIC", "boom")], |store| {
+    let chatd = Daemon::start(&[], &[("TINYCLIENT_TEST_PANIC", "boom")], |store| {
         store.set_account(&account, "Acme", "U1").unwrap();
     });
     // One connection: the panicking request is answered in words, and the next request on the
@@ -221,7 +221,7 @@ fn a_request_that_panics_is_answered_and_what_it_held_is_taken_again() {
 fn a_second_chatd_for_the_same_directory_leaves_the_first_one_serving() {
     let chatd = Daemon::start(&[], &[], |_| {});
     let started = chatd.status().3;
-    let second = Command::new(env!("CARGO_BIN_EXE_chatd")).env("TINYCHAT_DIR", &chatd.dir).output().unwrap();
+    let second = Command::new(env!("CARGO_BIN_EXE_chatd")).env("TINYCLIENT_DIR", &chatd.dir).output().unwrap();
     assert!(second.status.success());
     assert!(String::from_utf8_lossy(&second.stderr).contains("already running"), "{second:?}");
     assert_eq!(chatd.status().3, started, "the first one still answers");
@@ -401,7 +401,7 @@ fn a_card_and_an_info_pane_are_typed_and_a_mute_is_the_network_s() {
 
 #[test]
 fn files_go_from_their_paths_with_progress_within_the_account_s_limits_and_can_be_cancelled() {
-    let chatd = Daemon::demo(&[("TINYCHAT_DEMO_UPLOAD_MS", "150")]);
+    let chatd = Daemon::demo(&[("TINYCLIENT_DEMO_UPLOAD_MS", "150")]);
     let telegram = at(Network::Telegram, TELEGRAM, "u7000001");
     let photo = chatd.pick("trail.png", 900 * 1024);
     let with = |path: &std::path::Path| Outgoing {
@@ -514,7 +514,7 @@ fn a_send_naming_a_file_outside_where_the_user_picks_is_refused_before_anything_
 
 #[test]
 fn a_staged_paste_leaves_outbox_once_it_is_sent_or_discarded_and_a_picked_file_stays() {
-    let chatd = Daemon::demo(&[("TINYCHAT_DEMO_UPLOAD_MS", "150")]);
+    let chatd = Daemon::demo(&[("TINYCLIENT_DEMO_UPLOAD_MS", "150")]);
     let telegram = at(Network::Telegram, TELEGRAM, "u7000001");
     let send = |client_id: &str, path: &std::path::Path| {
         let asked = Request::Send { conversation: telegram.clone(), client_id: client_id.to_owned(), text: String::new(), reply_to: None, with: with_file(path) };

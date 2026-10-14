@@ -814,6 +814,7 @@ impl PeopleList {
                 Network::Telegram => "Telegram contacts",
                 Network::Slack => "Slack",
                 Network::Teams => "Teams",
+                Network::Signal => "Signal contacts",
             };
             let shell = self.shell.clone();
             let link = div()

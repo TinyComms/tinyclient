@@ -8,10 +8,10 @@ use protocol::Network;
 
 const SERVICE: &str = "tinyclient";
 
-/// False when `TINYCHAT_DIR` points chatd at a scratch directory. Tests and the demo never touch
+/// False when `TINYCLIENT_DIR` points chatd at a scratch directory. Tests and the demo never touch
 /// the keychain and never sign in.
 pub fn enabled() -> bool {
-    std::env::var_os("TINYCHAT_DIR").is_none()
+    std::env::var_os("TINYCLIENT_DIR").is_none()
 }
 
 /// Said instead of reading or saving when this build's keyring keeps nothing past the process
@@ -38,7 +38,7 @@ fn account(network: Network) -> &'static str {
 }
 
 /// The session JSON the sign-in produced, if there is one. In a scratch directory the only
-/// session is one a test hands over in `TINYCHAT_SESSION_DISCORD` or `TINYCHAT_SESSION_SLACK`,
+/// session is one a test hands over in `TINYCLIENT_SESSION_DISCORD` or `TINYCLIENT_SESSION_SLACK`,
 /// which it points at a local fake server with the variables in `adapters::net`.
 pub fn load(network: Network) -> Option<String> {
     match read(network) {
@@ -59,7 +59,7 @@ pub enum Stored {
 
 pub fn read(network: Network) -> Stored {
     if !enabled() {
-        let name = format!("TINYCHAT_SESSION_{}", network.label().to_uppercase());
+        let name = format!("TINYCLIENT_SESSION_{}", network.label().to_uppercase());
         return std::env::var(name).map_or(Stored::Absent, Stored::Found);
     }
     if !persistent() {
@@ -78,7 +78,7 @@ pub fn read(network: Network) -> Stored {
 
 pub fn save(network: Network, session: &str) -> Result<(), String> {
     if !enabled() {
-        return Err("sessions are not kept while TINYCHAT_DIR is set".to_owned());
+        return Err("sessions are not kept while TINYCLIENT_DIR is set".to_owned());
     }
     if !persistent() {
         return Err(NO_STORE.to_owned());

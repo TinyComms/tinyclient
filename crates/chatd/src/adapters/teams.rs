@@ -84,11 +84,11 @@
 //! Deep links: `…/l/meetup-join/{thread}/0` [C]; `msteams:/l/call/0/0?users=`, `/l/chat/…`,
 //! `/l/channel/…` and `/l/message/…` are Microsoft's documented forms, in no client read [U].
 //!
-//! For tests (`tests/teams.rs`), read through `net::address`: `TINYCHAT_TEAMS_LOGIN` replaces
-//! `https://login.microsoftonline.com`, `TINYCHAT_TEAMS_API` replaces
+//! For tests (`tests/teams.rs`), read through `net::address`: `TINYCLIENT_TEAMS_LOGIN` replaces
+//! `https://login.microsoftonline.com`, `TINYCLIENT_TEAMS_API` replaces
 //! `https://teams.microsoft.com` (authz, the teams list, the registrar; the addresses authz
-//! then hands out must be under it), `TINYCHAT_TEAMS_TROUTER` replaces
-//! `https://go.trouter.teams.microsoft.com`. The session comes from `TINYCHAT_SESSION_TEAMS`.
+//! then hands out must be under it), `TINYCLIENT_TEAMS_TROUTER` replaces
+//! `https://go.trouter.teams.microsoft.com`. The session comes from `TINYCLIENT_SESSION_TEAMS`.
 
 mod html;
 mod info;
@@ -372,7 +372,7 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
     if session.client_id.is_empty() {
         session.client_id = CLIENT.to_owned();
     }
-    let api = address("TINYCHAT_TEAMS_API", TEAMS).trim_end_matches('/').to_owned();
+    let api = address("TINYCLIENT_TEAMS_API", TEAMS).trim_end_matches('/').to_owned();
     let agent = ureq::Agent::config_builder()
         .tls_config(ureq::tls::TlsConfig::builder().provider(ureq::tls::TlsProvider::NativeTls).build())
         .timeout_global(Some(Duration::from_secs(30)))
@@ -389,9 +389,9 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
     let teams = Arc::new(Teams {
         ctx,
         agent,
-        login: address("TINYCHAT_TEAMS_LOGIN", LOGIN).trim_end_matches('/').to_owned(),
+        login: address("TINYCLIENT_TEAMS_LOGIN", LOGIN).trim_end_matches('/').to_owned(),
         moved: (api != TEAMS).then(|| api.clone()),
-        graph: address("TINYCHAT_TEAMS_GRAPH", GRAPH).trim_end_matches('/').to_owned(),
+        graph: address("TINYCLIENT_TEAMS_GRAPH", GRAPH).trim_end_matches('/').to_owned(),
         api,
         session,
         state: Mutex::new(state),

@@ -27,10 +27,10 @@ const BUILD_PATIENCE: Duration = Duration::from_secs(5);
 /// page did not answer in time or does not say.
 ///
 /// A fake server in a test is asked only when the test names the page too
-/// (`TINYCHAT_DISCORD_LOGIN`).
+/// (`TINYCLIENT_DISCORD_LOGIN`).
 fn build(user_agent: &str) -> Option<u64> {
-    let faked = std::env::var_os("TINYCHAT_DISCORD_API").is_some();
-    if faked && std::env::var_os("TINYCHAT_DISCORD_LOGIN").is_none() {
+    let faked = std::env::var_os("TINYCLIENT_DISCORD_API").is_some();
+    if faked && std::env::var_os("TINYCLIENT_DISCORD_LOGIN").is_none() {
         return None;
     }
     let agent: ureq::Agent = ureq::Agent::config_builder()
@@ -40,7 +40,7 @@ fn build(user_agent: &str) -> Option<u64> {
         .user_agent(user_agent)
         .build()
         .into();
-    let mut response = agent.get(address("TINYCHAT_DISCORD_LOGIN", LOGIN)).call().ok()?;
+    let mut response = agent.get(address("TINYCLIENT_DISCORD_LOGIN", LOGIN)).call().ok()?;
     let page = response.body_mut().read_to_string().ok()?;
     let rest = page.split_once("\"BUILD_NUMBER\":\"")?.1;
     rest.split_once('"')?.0.parse::<u64>().ok()
@@ -397,7 +397,7 @@ impl Rest {
         if let Some(left) = self.paused() {
             return Err(Refused::Paused(left));
         }
-        let url = format!("{}{path}", address("TINYCHAT_DISCORD_API", API));
+        let url = format!("{}{path}", address("TINYCLIENT_DISCORD_API", API));
         let route = route(method, path);
         let mut waited = false;
         loop {

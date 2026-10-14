@@ -91,7 +91,7 @@ impl Teams {
             self.ctx.set_note("endpoint", &made);
             made
         });
-        let base = address("TINYCHAT_TEAMS_TROUTER", TROUTER);
+        let base = address("TINYCLIENT_TEAMS_TROUTER", TROUTER);
         let base = base.trim_end_matches('/');
         let named = self.call("POST", &format!("{base}/v4/a?epid={}", escaped(&endpoint)), Auth::Push, Body::None, true)?.body;
         let socketio = named["socketio"].as_str().unwrap_or(base).trim_end_matches('/').to_owned();

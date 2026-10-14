@@ -4,7 +4,7 @@ What the right pane (and its small version, the card) says about a person, a con
 `product/polish/06-profile-info.md`, ruled by `00-rulings.md`. Frame and following: `polish/07-panes.md`. Tokens and parts:
 `design/01-system.md` and `polish/01-system.md`. Mockup: `mockups/05-profile-info.html`. Sizes in pt.
 
-**Today** (seeded scratch daemon, `--open 2 --right info`, `TINYCHAT_S6=profile-body`): a 340 pane on `canvas` with a grey
+**Today** (seeded scratch daemon, `--open 2 --right info`, `TINYCLIENT_S6=profile-body`): a 340 pane on `canvas` with a grey
 72 band behind an 80 avatar even when the network gives no colour, a "Discord" chip, a lone "Friend" line, a Message button
 beside the DM it would open, tabs whose empty state claims "No pictures or videos shared here yet.", nothing for channels
 or group DMs (`--open 0|3 --right info` opens nothing). The card stacks 11 items before its body.

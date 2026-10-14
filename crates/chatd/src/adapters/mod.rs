@@ -17,6 +17,7 @@
 
 mod discord;
 pub mod net;
+pub mod signal;
 mod slack;
 mod teams;
 pub mod telegram;
@@ -1095,7 +1096,11 @@ pub struct Signed {
 
 /// True for the networks `start` can run.
 pub fn supported(network: Network) -> bool {
-    matches!(network, Network::Slack | Network::Discord | Network::Teams) || (network == Network::Telegram && telegram::supported())
+    match network {
+        Network::Slack | Network::Discord | Network::Teams => true,
+        Network::Telegram => telegram::supported(),
+        Network::Signal => signal::supported(),
+    }
 }
 
 /// An account id names a directory of the media cache, so it must be one plain file name:
@@ -1111,6 +1116,7 @@ pub fn accounts(network: Network, session: &str) -> Result<Vec<Signed>, String> 
         Network::Discord => discord::accounts(session)?,
         Network::Telegram => telegram::accounts(session)?,
         Network::Teams => teams::accounts(session)?,
+        Network::Signal => signal::accounts(session)?,
     };
     match found.iter().find(|signed| !safe(&signed.account)) {
         Some(bad) => Err(format!("{}: unusable account id {:?}", network.label(), bad.account)),
@@ -1126,6 +1132,7 @@ pub fn without(network: Network, session: &str, account: &str) -> Option<String>
         Network::Discord => discord::without(session, account),
         Network::Telegram => telegram::without(session, account),
         Network::Teams => teams::without(session, account),
+        Network::Signal => signal::without(session, account),
     }
 }
 
@@ -1144,6 +1151,7 @@ pub fn start(account: AccountKey, session: &str, hub: Arc<Hub>) -> Result<Adapte
         Network::Discord => discord::start(ctx.clone(), session, inbox)?,
         Network::Telegram => telegram::start(ctx.clone(), session, inbox)?,
         Network::Teams => teams::start(ctx.clone(), session, inbox)?,
+        Network::Signal => signal::start(ctx.clone(), session, inbox)?,
     }
     ctx.link(Link::Offline);
     Ok(Adapter { commands, stop })

@@ -160,7 +160,7 @@ fn sends_typing(network: Network) -> bool {
 /// How often a network needs to hear that we are still typing for its line to stay up.
 fn typing_interval(network: Network) -> Duration {
     Duration::from_secs(match network {
-        Network::Discord => 8,
+        Network::Discord | Network::Signal => 8,
         Network::Teams => 6,
         Network::Slack | Network::Telegram => 4,
     })
@@ -2107,7 +2107,7 @@ impl Composer {
             if staged("chip-menu") {
                 self.chip_menu = self.tray.get(1).map(|chip| chip.id);
             }
-        } else if staged("uploading") && std::env::var_os("TINYCHAT_DIR").is_some() {
+        } else if staged("uploading") && std::env::var_os("TINYCLIENT_DIR").is_some() {
             // Only ever against a scratch daemon: a screenshot must never send on a real account.
             // A real send of two files, silently: with a slow demo upload the pending row shows
             // "Uploading 1 of 2" and the bell-off.
@@ -2120,7 +2120,7 @@ impl Composer {
                 tray.push(Staged::new(n as u64 + 1, path, Found::File(bytes as u64), &target.can, target.key.network));
             }
             // Shots never send (`live`); this one does, to the scratch chatd it names only.
-            if std::env::var_os("TINYCHAT_DIR").is_some() {
+            if std::env::var_os("TINYCLIENT_DIR").is_some() {
                 let with = protocol::Outgoing { files: tray.iter().filter_map(Staged::outgoing).collect(), silent: true, ..protocol::Outgoing::default() };
                 let text = "Notes and the route for Saturday".to_owned();
                 let out = Outgoing {
@@ -2806,14 +2806,14 @@ mod tests {
         assert_eq!(draft_text(&"é".repeat(DRAFT_LIMIT + 10)).chars().count(), DRAFT_LIMIT);
     }
 
-    /// Run by hand against a scratch demo daemon (`TINYCHAT_DIR` set, `chatd --seed-demo`
+    /// Run by hand against a scratch demo daemon (`TINYCLIENT_DIR` set, `chatd --seed-demo`
     /// running): `TC_DRIVE=1 cargo test -p tinyclient --features gui -- --ignored drives`.
     /// Stages a pasted picture and a file the way the composer does, refuses one too big for
     /// the account before any request, sends the rest, and follows the pending row to the end.
     #[test]
     #[ignore]
     fn drives_a_send_with_files_against_a_running_demo() {
-        if std::env::var_os("TC_DRIVE").is_none() || std::env::var_os("TINYCHAT_DIR").is_none() {
+        if std::env::var_os("TC_DRIVE").is_none() || std::env::var_os("TINYCLIENT_DIR").is_none() {
             return;
         }
         let Ok(Response::Status { accounts, .. }) = ask(&Request::Status) else { panic!("a demo chatd answers") };

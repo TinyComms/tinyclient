@@ -97,10 +97,10 @@ impl Daemon {
 
         let child = Command::new(env!("CARGO_BIN_EXE_chatd"))
             .args(args)
-            .env("TINYCHAT_DIR", &dir)
-            .env("TINYCHAT_MEDIAD", mediad())
+            .env("TINYCLIENT_DIR", &dir)
+            .env("TINYCLIENT_MEDIAD", mediad())
             // No test call opens a sound device.
-            .env("TINYCHAT_MEDIAD_AUDIO", "tone")
+            .env("TINYCLIENT_MEDIAD_AUDIO", "tone")
             .envs(env.iter().copied())
             .spawn()
             .unwrap();
@@ -809,9 +809,9 @@ fn an_account_id_that_is_not_one_plain_file_name_is_never_used() {
         let session = format!(r#"{{"cookie":"xoxd-test","teams":[{{"token":"xoxc-test","url":"https://example.slack.com/","id":"{team}","name":"Test"}}]}}"#);
         // Whatever starts must not reach a network: these point at a port nothing listens on.
         let env = [
-            ("TINYCHAT_SESSION_SLACK", session.as_str()),
-            ("TINYCHAT_SLACK_API", "http://127.0.0.1:9/"),
-            ("TINYCHAT_SLACK_SOCKET", "ws://127.0.0.1:9"),
+            ("TINYCLIENT_SESSION_SLACK", session.as_str()),
+            ("TINYCLIENT_SLACK_API", "http://127.0.0.1:9/"),
+            ("TINYCLIENT_SLACK_SOCKET", "ws://127.0.0.1:9"),
         ];
         let chatd = Daemon::with(&[], &env, |_| {});
         let Response::Status { networks, accounts, .. } = chatd.ask(Request::Status) else {
@@ -840,7 +840,7 @@ fn the_sign_in_window_is_told_where_to_open_and_how_it_ended_is_told_apart() {
         &source,
         r#"fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>().join(" ");
-    let dir = std::env::var("TINYCHAT_LOGIN_DIR").unwrap();
+    let dir = std::env::var("TINYCLIENT_LOGIN_DIR").unwrap();
     std::fs::write(format!("{dir}/args"), args).unwrap();
     let code = std::fs::read_to_string(format!("{dir}/code")).unwrap();
     std::process::exit(code.trim().parse().unwrap());
@@ -854,8 +854,8 @@ fn the_sign_in_window_is_told_where_to_open_and_how_it_ended_is_told_apart() {
     let chatd = Daemon::with(
         &[],
         &[
-            ("TINYCHAT_LOGIN", &script.to_string_lossy()),
-            ("TINYCHAT_LOGIN_DIR", &helper.to_string_lossy()),
+            ("TINYCLIENT_LOGIN", &script.to_string_lossy()),
+            ("TINYCLIENT_LOGIN_DIR", &helper.to_string_lossy()),
         ],
         |_| {},
     );
@@ -1130,7 +1130,7 @@ fn a_picture_is_fetched_again_larger_when_it_is_drawn_larger_and_never_smaller()
 #[test]
 fn signing_out_waits_for_the_network_to_end_the_session_but_not_for_long() {
     let signed_out = |network_takes: &str| {
-        let chatd = Daemon::demo(&[("TINYCHAT_DEMO_SIGN_OUT_MS", network_takes)]);
+        let chatd = Daemon::demo(&[("TINYCLIENT_DEMO_SIGN_OUT_MS", network_takes)]);
         let account = harbor("").account();
         let began = Instant::now();
         let Response::Status { accounts, .. } = chatd.ask(Request::SignOut { account: account.clone() }) else {

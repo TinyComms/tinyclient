@@ -446,7 +446,7 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
     if session.team_id.is_empty() {
         session.team_id = ctx.account.account.clone();
     }
-    let mut api = address("TINYCHAT_SLACK_API", &session.url);
+    let mut api = address("TINYCLIENT_SLACK_API", &session.url);
     if !api.ends_with('/') {
         api.push('/');
     }
@@ -733,7 +733,7 @@ impl Slack {
     /// Enterprise Grid the web client is believed to name the org there; that was not confirmed
     /// either, so the workspace's own id is kept.
     fn socket_url(&self) -> String {
-        let base = address("TINYCHAT_SLACK_SOCKET", "wss://wss-primary.slack.com/");
+        let base = address("TINYCLIENT_SLACK_SOCKET", "wss://wss-primary.slack.com/");
         format!(
             "{base}?token={}&gateway_server={}-1&slack_client=desktop&batch_presence_aware=1",
             self.session.token, self.session.team_id

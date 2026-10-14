@@ -1,16 +1,16 @@
 //! Sample data for looking at the shell with no account signed in. Everything here is invented.
 //!
 //! ```text
-//! TINYCHAT_DIR=/tmp/tinyclient-demo chatd --seed-demo            # the data, then serve it
-//! TINYCHAT_DIR=/tmp/tinyclient-demo chatd --seed-demo=expired    # one Slack workspace is Expired
-//! TINYCHAT_DIR=/tmp/tinyclient-demo chatd --seed-demo=live       # and things keep happening
-//! TINYCHAT_DIR=/tmp/tinyclient-demo chatd --seed-demo=live,expired
-//! TINYCHAT_DIR=/tmp/tinyclient-demo chatd --seed-demo=many         # 50 Discord servers
-//! TINYCHAT_DIR=/tmp/tinyclient-demo chatd --seed-demo=attention    # Discord wants a verification
-//! TINYCHAT_DIR=/tmp/tinyclient-demo chatd --seed-demo=reconnecting # one Slack workspace is retrying
+//! TINYCLIENT_DIR=/tmp/tinyclient-demo chatd --seed-demo            # the data, then serve it
+//! TINYCLIENT_DIR=/tmp/tinyclient-demo chatd --seed-demo=expired    # one Slack workspace is Expired
+//! TINYCLIENT_DIR=/tmp/tinyclient-demo chatd --seed-demo=live       # and things keep happening
+//! TINYCLIENT_DIR=/tmp/tinyclient-demo chatd --seed-demo=live,expired
+//! TINYCLIENT_DIR=/tmp/tinyclient-demo chatd --seed-demo=many         # 50 Discord servers
+//! TINYCLIENT_DIR=/tmp/tinyclient-demo chatd --seed-demo=attention    # Discord wants a verification
+//! TINYCLIENT_DIR=/tmp/tinyclient-demo chatd --seed-demo=reconnecting # one Slack workspace is retrying
 //! ```
 //!
-//! Refused without `TINYCHAT_DIR`, so it can never write to the real store. Each run replaces
+//! Refused without `TINYCLIENT_DIR`, so it can never write to the real store. Each run replaces
 //! what the last one seeded. What is in it:
 //!
 //! - Discord (connected) as Robin Vale: eight servers (one with a very long name, one with emoji
@@ -48,7 +48,7 @@
 //! a group left, a DM closed, pinned messages and the pickers' catalogs listed, and rows with no
 //! preview filled in when they come on screen. A call in a voice channel puts us among its
 //! occupants; there is no voice server, so it ends as a call the network never answered, unless
-//! `TINYCHAT_DEMO_VOICE` names one (`host:port`), which is how the tests join for real.
+//! `TINYCLIENT_DEMO_VOICE` names one (`host:port`), which is how the tests join for real.
 //!
 //! The data is written with the store calls an adapter's `Context` makes. Links, presence,
 //! occupants and everything `live` does need the hub, which exists only once `Chat::new` has
@@ -88,6 +88,8 @@ fn me_of(account: &AccountKey) -> &'static str {
         Network::Telegram => telegram::ME,
         Network::Teams => teams::ME,
         Network::Discord => discord::ME,
+        // The demo has no Signal account.
+        Network::Signal => "",
     }
 }
 
@@ -222,6 +224,8 @@ fn link_of(account: &AccountKey, id: &str) -> String {
         Network::Telegram => format!("tg://user?id={}", id.trim_start_matches('u')),
         Network::Teams => format!("https://teams.microsoft.com/l/chat/0/0?users={id}"),
         Network::Discord => format!("discord://-/users/{id}"),
+        // Signal opens a person only by their phone number or username, which are not ids.
+        Network::Signal => String::new(),
     }
 }
 

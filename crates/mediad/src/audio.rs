@@ -1,9 +1,9 @@
 //! The microphone and the speaker. Everything above this file sees 48 kHz stereo `i16`; a device
 //! that runs at another rate or channel count is converted here, without touching its settings.
 //!
-//! `TINYCHAT_MEDIAD_AUDIO` replaces the devices for tests: `null` hears silence, `tone` hears a
+//! `TINYCLIENT_MEDIAD_AUDIO` replaces the devices for tests: `null` hears silence, `tone` hears a
 //! 440 Hz tone, `onset` hears that tone once a second, each time led in by 40 ms too quiet to
-//! count as speech, and none of them opens a device. `TINYCHAT_MEDIAD_SINK` names a file that then takes
+//! count as speech, and none of them opens a device. `TINYCLIENT_MEDIAD_SINK` names a file that then takes
 //! what would have been played, as raw 48 kHz stereo `i16`.
 
 use crate::{CHANNELS, FRAME_SAMPLES, RATE};
@@ -87,7 +87,7 @@ fn name(device: &cpal::Device) -> Option<String> {
 
 /// Asks CoreAudio what exists. Opens nothing.
 pub fn listing() -> Listing {
-    if let Ok(kind) = std::env::var("TINYCHAT_MEDIAD_AUDIO") {
+    if let Ok(kind) = std::env::var("TINYCLIENT_MEDIAD_AUDIO") {
         return Listing {
             inputs: vec![kind.clone()],
             outputs: vec!["null".to_owned()],
@@ -351,7 +351,7 @@ fn open_output(device: &cpal::Device, broken: &Arc<AtomicBool>) -> Result<Output
 impl Audio {
     /// True when the environment replaced the devices, so no permission applies.
     pub fn simulated() -> bool {
-        std::env::var_os("TINYCHAT_MEDIAD_AUDIO").is_some()
+        std::env::var_os("TINYCLIENT_MEDIAD_AUDIO").is_some()
     }
 
     /// Opens the microphone and speaker, or their stand-ins.
@@ -367,13 +367,13 @@ impl Audio {
             input: String::new(),
             output: String::new(),
         };
-        if let Ok(kind) = std::env::var("TINYCHAT_MEDIAD_AUDIO") {
+        if let Ok(kind) = std::env::var("TINYCLIENT_MEDIAD_AUDIO") {
             audio.source = match kind.as_str() {
                 "tone" => Source::Tone { phase: 0. },
                 "onset" => Source::Onset { at: 0 },
                 _ => Source::Silence,
             };
-            audio.sink = match std::env::var_os("TINYCHAT_MEDIAD_SINK") {
+            audio.sink = match std::env::var_os("TINYCLIENT_MEDIAD_SINK") {
                 Some(path) => Sink::File(File::create(path).map_err(|e| AudioError::Speaker(e.to_string()))?),
                 None => Sink::Null,
             };

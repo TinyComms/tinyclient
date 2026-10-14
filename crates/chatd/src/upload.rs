@@ -585,7 +585,7 @@ fn uploads_to(network: Network, url: &str) -> bool {
         return false;
     };
     if !crate::session::enabled() {
-        let local = std::env::var("TINYCHAT_MEDIA_HOSTS").unwrap_or_default();
+        let local = std::env::var("TINYCLIENT_MEDIA_HOSTS").unwrap_or_default();
         if host == "127.0.0.1" || host == "localhost" || local.split(',').any(|named| named == host) {
             return true;
         }
@@ -602,6 +602,8 @@ fn uploads_to(network: Network, url: &str) -> bool {
         Network::Teams => &["graph.microsoft.com", "sharepoint.com", "asm.skype.com", "teams.microsoft.com"],
         // MTProto, through `parts`: nothing goes over HTTP.
         Network::Telegram => &[],
+        // Encrypted before it leaves, by the adapter: nothing goes through this helper.
+        Network::Signal => &[],
     };
     hosts.iter().any(|name| super::fetch::under(&host, name))
 }

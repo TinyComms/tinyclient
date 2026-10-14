@@ -18,8 +18,8 @@ fn main() -> io::Result<()> {
     let mut store = Store::open(&dir.join("chat.sqlite")).map_err(io::Error::other)?;
 
     if let Some(mode) = chatd::demo::requested(std::env::args()) {
-        if std::env::var_os("TINYCHAT_DIR").is_none() {
-            eprintln!("chatd: --seed-demo needs TINYCHAT_DIR so it cannot write to the real store");
+        if std::env::var_os("TINYCLIENT_DIR").is_none() {
+            eprintln!("chatd: --seed-demo needs TINYCLIENT_DIR so it cannot write to the real store");
             std::process::exit(64);
         }
         chatd::demo::seed(&mut store, &dir, mode).map_err(io::Error::other)?;

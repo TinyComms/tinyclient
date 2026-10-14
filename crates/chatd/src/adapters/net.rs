@@ -15,14 +15,14 @@ use ureq::tls::{TlsConfig, TlsProvider};
 ///
 /// | Variable | Replaces |
 /// | --- | --- |
-/// | `TINYCHAT_DISCORD_API` | `https://discord.com/api/v10` |
-/// | `TINYCHAT_DISCORD_GATEWAY` | `wss://gateway.discord.gg/?v=10&encoding=json` |
-/// | `TINYCHAT_DISCORD_CDN` | `https://cdn.discordapp.com` and the media proxy |
-/// | `TINYCHAT_DISCORD_LOGIN` | the page that names the web client's build, read only when set beside a fake API |
-/// | `TINYCHAT_SLACK_API` | the workspace's own address, `https://example.slack.com/` |
-/// | `TINYCHAT_SLACK_SOCKET` | the websocket address Slack hands out |
+/// | `TINYCLIENT_DISCORD_API` | `https://discord.com/api/v10` |
+/// | `TINYCLIENT_DISCORD_GATEWAY` | `wss://gateway.discord.gg/?v=10&encoding=json` |
+/// | `TINYCLIENT_DISCORD_CDN` | `https://cdn.discordapp.com` and the media proxy |
+/// | `TINYCLIENT_DISCORD_LOGIN` | the page that names the web client's build, read only when set beside a fake API |
+/// | `TINYCLIENT_SLACK_API` | the workspace's own address, `https://example.slack.com/` |
+/// | `TINYCLIENT_SLACK_SOCKET` | the websocket address Slack hands out |
 ///
-/// The session itself comes from `TINYCHAT_SESSION_DISCORD` / `TINYCHAT_SESSION_SLACK` (see
+/// The session itself comes from `TINYCLIENT_SESSION_DISCORD` / `TINYCLIENT_SESSION_SLACK` (see
 /// `session::load`), which are read only in a scratch directory.
 pub fn address(var: &str, default: &str) -> String {
     // Only a scratch directory may point an adapter elsewhere: a stray variable must never send a

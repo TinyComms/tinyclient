@@ -56,6 +56,8 @@ impl Hosts {
             // Pictures in messages and people's pictures, each behind the session's own token.
             Network::Teams => (&[], &["asm.skype.com", "asyncgw.teams.microsoft.com", "teams.microsoft.com"]),
             Network::Telegram => (&[], &[]),
+            // Attachments are encrypted end to end: the adapter fetches and opens them itself.
+            Network::Signal => (&[], &[]),
         };
         if session.iter().any(|name| under(&host, name)) {
             Some(Trust::Session)

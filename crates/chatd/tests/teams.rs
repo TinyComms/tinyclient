@@ -570,18 +570,18 @@ impl World {
                 {"id": GUEST, "name": "Fabrikam", "refresh_token": "rt-guest"},
             ],
         });
-        let log = if std::env::var_os("TINYCHAT_TEST_LOG").is_some() { Stdio::inherit() } else { Stdio::null() };
+        let log = if std::env::var_os("TINYCLIENT_TEST_LOG").is_some() { Stdio::inherit() } else { Stdio::null() };
         let child = Command::new(env!("CARGO_BIN_EXE_chatd"))
-            .env("TINYCHAT_DIR", &dir)
-            .env("TINYCHAT_SESSION_TEAMS", session.to_string())
-            .env("TINYCHAT_TEAMS_LOGIN", &fake.base)
-            .env("TINYCHAT_TEAMS_API", &fake.base)
-            .env("TINYCHAT_TEAMS_TROUTER", &fake.base)
-            .env("TINYCHAT_TEAMS_GRAPH", format!("{}/graph", fake.base))
-            .env("TINYCHAT_MEDIA_HOSTS", "127.0.0.1")
-            .env_remove("TINYCHAT_SESSION_DISCORD")
-            .env_remove("TINYCHAT_SESSION_SLACK")
-            .env_remove("TINYCHAT_SESSION_TELEGRAM")
+            .env("TINYCLIENT_DIR", &dir)
+            .env("TINYCLIENT_SESSION_TEAMS", session.to_string())
+            .env("TINYCLIENT_TEAMS_LOGIN", &fake.base)
+            .env("TINYCLIENT_TEAMS_API", &fake.base)
+            .env("TINYCLIENT_TEAMS_TROUTER", &fake.base)
+            .env("TINYCLIENT_TEAMS_GRAPH", format!("{}/graph", fake.base))
+            .env("TINYCLIENT_MEDIA_HOSTS", "127.0.0.1")
+            .env_remove("TINYCLIENT_SESSION_DISCORD")
+            .env_remove("TINYCLIENT_SESSION_SLACK")
+            .env_remove("TINYCLIENT_SESSION_TELEGRAM")
             .stderr(log)
             .spawn()
             .unwrap();

@@ -3,15 +3,15 @@
 //!
 //! The websocket is `wss`, as Discord's is: the fake holds a certificate made for the test run
 //! (the `openssl` command line makes it; macOS ships one) and mediad is told to trust it through
-//! `TINYCHAT_VOICE_TRUST`, which it honors only in a scratch `TINYCHAT_DIR`. So every test here
+//! `TINYCLIENT_VOICE_TRUST`, which it honors only in a scratch `TINYCLIENT_DIR`. So every test here
 //! goes through the real TLS handshake, reads with the 20 ms timeout on a TLS stream at both
 //! ends, and closes through TLS. `Dribble` stands between the two for the tests that need the
 //! server's bytes to arrive a few at a time.
 //!
 //! The fake does its own transport crypto straight on the cipher crates, so a packet that opens
 //! here was sealed the way the documentation says, not merely the way mediad's own code reads.
-//! No sound device is opened: `TINYCHAT_MEDIAD_AUDIO` gives mediad a tone or silence to hear and
-//! `TINYCHAT_MEDIAD_SINK` a file to play into.
+//! No sound device is opened: `TINYCLIENT_MEDIAD_AUDIO` gives mediad a tone or silence to hear and
+//! `TINYCLIENT_MEDIAD_SINK` a file to play into.
 
 #[path = "support/mls.rs"]
 mod mls;
@@ -67,7 +67,7 @@ const PATIENCE: Duration = Duration::from_secs(8);
 /// What the fake voice server presents, and where mediad finds it to trust it.
 struct Tls {
     acceptor: TlsAcceptor,
-    /// A scratch `TINYCHAT_DIR`: the trust override below is ignored without one.
+    /// A scratch `TINYCLIENT_DIR`: the trust override below is ignored without one.
     dir: PathBuf,
     certificate: PathBuf,
 }
@@ -112,22 +112,22 @@ struct Mediad {
 impl Mediad {
     fn start(hears: &str, sink: Option<&PathBuf>) -> Mediad {
         let tls = tls();
-        Mediad::start_in(hears, sink, &[("TINYCHAT_DIR", &tls.dir), ("TINYCHAT_VOICE_TRUST", &tls.certificate)])
+        Mediad::start_in(hears, sink, &[("TINYCLIENT_DIR", &tls.dir), ("TINYCLIENT_VOICE_TRUST", &tls.certificate)])
     }
 
     fn start_in(hears: &str, sink: Option<&PathBuf>, env: &[(&str, &PathBuf)]) -> Mediad {
         let mut command = Command::new(env!("CARGO_BIN_EXE_mediad"));
         command
             .arg("1")
-            .env_remove("TINYCHAT_VOICE_PLAIN")
-            .env_remove("TINYCHAT_DIR")
-            .env_remove("TINYCHAT_VOICE_TRUST")
-            .env("TINYCHAT_MEDIAD_AUDIO", hears)
+            .env_remove("TINYCLIENT_VOICE_PLAIN")
+            .env_remove("TINYCLIENT_DIR")
+            .env_remove("TINYCLIENT_VOICE_TRUST")
+            .env("TINYCLIENT_MEDIAD_AUDIO", hears)
             .envs(env.iter().copied())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped());
         if let Some(sink) = sink {
-            command.env("TINYCHAT_MEDIAD_SINK", sink);
+            command.env("TINYCLIENT_MEDIAD_SINK", sink);
         }
         let mut child = command.spawn().unwrap();
         let stdin = child.stdin.take();
@@ -976,7 +976,7 @@ fn a_dropped_call_that_cannot_resume_is_lost_after_three_resumes() {
 #[test]
 fn a_certificate_the_system_does_not_trust_is_refused_unless_in_a_scratch_directory() {
     let trust = &tls().certificate;
-    for env in [&[][..], &[("TINYCHAT_VOICE_TRUST", trust)][..]] {
+    for env in [&[][..], &[("TINYCLIENT_VOICE_TRUST", trust)][..]] {
         let fake = Fake::new();
         let mut mediad = Mediad::start_in("null", None, env);
         mediad.join(&fake.endpoint(), NO_DAVE);

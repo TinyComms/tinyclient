@@ -537,15 +537,15 @@ impl World {
 
     fn spawn(&self) -> Child {
         Command::new(env!("CARGO_BIN_EXE_chatd"))
-            .env("TINYCHAT_DIR", &self.dir)
-            .env("TINYCHAT_DISCORD_API", &self.api)
-            .env("TINYCHAT_DISCORD_GATEWAY", format!("{}/?encoding=json&v=9", self.gateway))
-            .env("TINYCHAT_SESSION_DISCORD", json!({"token": TOKEN}).to_string())
-            .env_remove("TINYCHAT_SESSION_SLACK")
+            .env("TINYCLIENT_DIR", &self.dir)
+            .env("TINYCLIENT_DISCORD_API", &self.api)
+            .env("TINYCLIENT_DISCORD_GATEWAY", format!("{}/?encoding=json&v=9", self.gateway))
+            .env("TINYCLIENT_SESSION_DISCORD", json!({"token": TOKEN}).to_string())
+            .env_remove("TINYCLIENT_SESSION_SLACK")
             // The fake stands in for the CDN and the media proxy too: nothing here reaches Discord.
-            .env("TINYCHAT_DISCORD_CDN", format!("{}/media", self.api))
-            .env("TINYCHAT_MEDIA_HOSTS", "127.0.0.1")
-            .env("TINYCHAT_MEDIAD", mediad())
+            .env("TINYCLIENT_DISCORD_CDN", format!("{}/media", self.api))
+            .env("TINYCLIENT_MEDIA_HOSTS", "127.0.0.1")
+            .env("TINYCLIENT_MEDIAD", mediad())
             .envs(self.env.iter().map(|(name, value)| (name.as_str(), value.as_str())))
             .spawn()
             .unwrap()
@@ -1973,7 +1973,7 @@ fn chatd_serves_before_the_build_is_read_and_remembers_the_last_one_read() {
 
     // The page that names the build takes three seconds. chatd answers long before that.
     let started = Instant::now();
-    let mut world = World::launch(&[("TINYCHAT_DISCORD_LOGIN", "{{API}}/login")], |shared| {
+    let mut world = World::launch(&[("TINYCLIENT_DISCORD_LOGIN", "{{API}}/login")], |shared| {
         *shared.login.lock().unwrap() = (Duration::from_secs(3), 200);
     });
     assert_eq!(world.ask(Request::Ping), Response::Pong);

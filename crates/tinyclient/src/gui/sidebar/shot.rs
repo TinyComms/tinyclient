@@ -44,6 +44,7 @@ impl Shell {
         match flag("--mode").as_deref() {
             Some("telegram") => self.go(Mode::Network(Network::Telegram), cx),
             Some("teams") => self.go(Mode::Network(Network::Teams), cx),
+            Some("signal") => self.go(Mode::Network(Network::Signal), cx),
             _ => self.show_mode(cx),
         }
         if has("--friends") {

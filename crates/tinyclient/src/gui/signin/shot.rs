@@ -1,5 +1,5 @@
 //! `--shot` only: a made-up step for design review, so every face of the sheet can be drawn
-//! with no Telegram and no sign-in begun. `TINYCHAT_SIGNIN_SHOT` names the state: `qr-waiting`,
+//! with no Telegram and no sign-in begun. `TINYCLIENT_SIGNIN_SHOT` names the state: `qr-waiting`,
 //! `qr`, `qr-offline`, `phone`, `phone-error`, `code`, `code-sms`, `code-wrong`, `code-expired`,
 //! `code-toomany`, `code-later`, `password`, `password-wrong`, `failed`, `unsupported`.
 //! chatd is never asked about the sign-in while one is on show.
@@ -34,7 +34,7 @@ fn code(via: CodeVia, next: Option<CodeVia>, resend_at: i64, problem: Option<Sig
 }
 
 pub(super) fn canned() -> Option<Canned> {
-    let name = std::env::var("TINYCHAT_SIGNIN_SHOT").ok().filter(|name| !name.is_empty())?;
+    let name = std::env::var("TINYCLIENT_SIGNIN_SHOT").ok().filter(|name| !name.is_empty())?;
     let qr = |link: &str, problem| SignInStep::Qr { link: link.to_owned(), expires: 0, problem };
     let password = |problem| SignInStep::Password { hint: "the old street".to_owned(), problem };
     let sms = Some(CodeVia::Sms);

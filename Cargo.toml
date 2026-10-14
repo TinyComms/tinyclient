@@ -18,3 +18,12 @@ publish = false
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 protocol = { path = "crates/protocol" }
+
+# chatd's optional `signal` feature pins libsignal v0.94, which builds only against Signal's fork of
+# curve25519-dalek; a patch here is the only way a git dependency gets it. The fork is upstream
+# 4.1.3 with a `lizard` module added and `field` made public (compared 2026-10-14), so mediad's
+# DAVE, which reaches the crate through ed25519-dalek and x25519-dalek, links the same code.
+# It can go when presage can move past libsignal v0.97: that waits on davey, whose MLS stack
+# pins hax-lib 0.3.6 where libsignal v0.98 wants 0.3.7.
+[patch.crates-io]
+curve25519-dalek = { git = "https://github.com/signalapp/curve25519-dalek", tag = "signal-curve25519-4.1.3" }

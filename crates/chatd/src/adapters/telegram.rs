@@ -27,8 +27,8 @@
 //! # The app id
 //!
 //! Telegram wants one registered `api_id` per app, shipped in the binary and kept out of the
-//! repository. It is read at build time from `TINYCHAT_TELEGRAM_API_ID` and
-//! `TINYCHAT_TELEGRAM_API_HASH`. Built without them, Telegram is `Unsupported` and says why.
+//! repository. It is read at build time from `TINYCLIENT_TELEGRAM_API_ID` and
+//! `TINYCLIENT_TELEGRAM_API_HASH`. Built without them, Telegram is `Unsupported` and says why.
 //!
 //! # The session
 //!
@@ -94,14 +94,14 @@ const PLACED: usize = 4_096;
 
 /// The registered app id, when this build was given one.
 pub fn credentials() -> Option<(i32, &'static str)> {
-    let id = option_env!("TINYCHAT_TELEGRAM_API_ID")?.trim().parse().ok()?;
-    let hash = option_env!("TINYCHAT_TELEGRAM_API_HASH")?.trim();
+    let id = option_env!("TINYCLIENT_TELEGRAM_API_ID")?.trim().parse().ok()?;
+    let hash = option_env!("TINYCLIENT_TELEGRAM_API_HASH")?.trim();
     (id > 0 && !hash.is_empty()).then_some((id, hash))
 }
 
 /// A test in a scratch directory asked for the scripted wire.
 fn scripted() -> bool {
-    !session::enabled() && std::env::var_os("TINYCHAT_TELEGRAM_FAKE").is_some()
+    !session::enabled() && std::env::var_os("TINYCLIENT_TELEGRAM_FAKE").is_some()
 }
 
 pub fn supported() -> bool {

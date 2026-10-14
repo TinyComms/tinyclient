@@ -18,13 +18,13 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 /// Names the chatd binary to start, overriding the rule below.
-pub const CHATD_ENV: &str = "TINYCHAT_CHATD";
+pub const CHATD_ENV: &str = "TINYCLIENT_CHATD";
 /// chatd's stderr, under [`crate::support_dir`]. Cut to nothing past [`CHATD_LOG_LIMIT`] at each
 /// start.
 pub const CHATD_LOG: &str = "chatd.log";
 pub const CHATD_LOG_LIMIT: u64 = 4 * 1024 * 1024;
 
-/// Where chatd is: `TINYCHAT_CHATD` when set, else beside the running executable. That is
+/// Where chatd is: `TINYCLIENT_CHATD` when set, else beside the running executable. That is
 /// `tinyclient.app/Contents/MacOS/chatd` in the bundle (`packaging/bundle.sh` puts every binary
 /// there) and `target/<profile>/chatd` under cargo, which builds it with `cargo build -p chatd`.
 /// `None` when there is no such file.
@@ -48,7 +48,7 @@ pub fn chatd_answers(timeout: Duration) -> bool {
 }
 
 /// Starts chatd in its own process group, so it outlives the shell and a terminal's ^C, with its
-/// stderr appended to `chatd.log`. It inherits the environment (`TINYCHAT_DIR` included). The
+/// stderr appended to `chatd.log`. It inherits the environment (`TINYCLIENT_DIR` included). The
 /// child is reaped on a thread of its own. Answers its pid.
 pub fn start_chatd() -> io::Result<u32> {
     let path = chatd_path().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "chatd is not beside tinyclient"))?;

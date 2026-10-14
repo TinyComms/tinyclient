@@ -50,21 +50,21 @@ pub struct Socket {
     pub seq_ack: Option<u64>,
 }
 
-/// `TINYCHAT_VOICE_PLAIN` drops TLS, for a fake voice server on localhost. Discord is always TLS.
+/// `TINYCLIENT_VOICE_PLAIN` drops TLS, for a fake voice server on localhost. Discord is always TLS.
 fn url(endpoint: &str) -> String {
-    let scheme = if std::env::var_os("TINYCHAT_VOICE_PLAIN").is_some() { "ws" } else { "wss" };
+    let scheme = if std::env::var_os("TINYCLIENT_VOICE_PLAIN").is_some() { "ws" } else { "wss" };
     let endpoint = endpoint.trim_start_matches("wss://").trim_end_matches('/');
     format!("{scheme}://{endpoint}/?v=8")
 }
 
 /// The system's trust, and nothing else, decides whether a voice server is who it says. One
-/// exception, for tests: in a scratch directory (`TINYCHAT_DIR` set, as every test and demo
-/// runs) `TINYCHAT_VOICE_TRUST` names a PEM certificate to trust as well, so a fake voice server
-/// can speak real TLS. Without `TINYCHAT_DIR` the variable is ignored.
+/// exception, for tests: in a scratch directory (`TINYCLIENT_DIR` set, as every test and demo
+/// runs) `TINYCLIENT_VOICE_TRUST` names a PEM certificate to trust as well, so a fake voice server
+/// can speak real TLS. Without `TINYCLIENT_DIR` the variable is ignored.
 fn connector() -> io::Result<native_tls::TlsConnector> {
     let mut builder = native_tls::TlsConnector::builder();
-    let scratch = std::env::var_os("TINYCHAT_DIR").is_some();
-    if let Some(path) = std::env::var_os("TINYCHAT_VOICE_TRUST").filter(|_| scratch) {
+    let scratch = std::env::var_os("TINYCLIENT_DIR").is_some();
+    if let Some(path) = std::env::var_os("TINYCLIENT_VOICE_TRUST").filter(|_| scratch) {
         let certificate = native_tls::Certificate::from_pem(&std::fs::read(path)?).map_err(io::Error::other)?;
         builder.add_root_certificate(certificate);
     }
