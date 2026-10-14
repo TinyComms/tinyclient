@@ -38,6 +38,9 @@ pub fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// A catalog page as asked: account, kind, Space, query, cursor.
+pub type CatalogAsked = (AccountKey, protocol::CatalogKind, Option<Key>, String, Option<String>);
+
 /// Answers asked of a network, kept a few minutes so a card opened twice asks once. Bounded:
 /// the oldest goes when it is full.
 pub struct Recent<K, V> {
@@ -151,7 +154,7 @@ pub struct Hub {
     pub profiles: Recent<(Key, Option<Key>), protocol::Profile>,
     pub infos: Recent<Key, protocol::ConversationInfo>,
     pub space_infos: Recent<Key, protocol::SpaceInfo>,
-    pub catalogs: Recent<(AccountKey, protocol::CatalogKind, Option<Key>, String, Option<String>), (Vec<protocol::CatalogItem>, Option<String>)>,
+    pub catalogs: Recent<CatalogAsked, (Vec<protocol::CatalogItem>, Option<String>)>,
     pub calls: Calls,
 }
 

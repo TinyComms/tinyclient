@@ -108,7 +108,7 @@ impl InfoPane {
             let _ = this.update(cx, |this, cx| {
                 if this.asked == asked {
                     this.hub.learn(std::slice::from_ref(&profile.person));
-                    this.profile = Some(profile);
+                    this.profile = Some(*profile);
                     cx.notify();
                 }
             });

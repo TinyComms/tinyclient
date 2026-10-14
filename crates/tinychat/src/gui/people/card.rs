@@ -15,7 +15,7 @@ use gpui::{
     anchored, deferred, div, point, prelude::*, px, ClipboardItem, Context, Div, FocusHandle, KeyDownEvent,
     Pixels, Point, WeakEntity, Window,
 };
-use protocol::{Key, Network, Person, Presence, Profile, RelateAction, Relation, Request, Response};
+use protocol::{Key, Network, Person, Profile, RelateAction, Relation, Request, Response};
 
 const CARD_WIDTH: f32 = 320.;
 const CARD_HEIGHT: f32 = 480.;
@@ -196,7 +196,7 @@ impl Floating {
             let _ = this.update(cx, |this, cx| {
                 if this.profile_asked == asked {
                     this.hub.learn(std::slice::from_ref(&profile.person));
-                    this.profile = Some(profile);
+                    this.profile = Some(*profile);
                     cx.notify();
                 }
             });

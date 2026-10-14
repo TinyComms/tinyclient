@@ -67,7 +67,7 @@ impl Searches {
                 };
                 state.sent.retain(|_, (_, sent)| sent.elapsed() < SEARCH_AGAIN);
                 state.sent.insert(account.clone(), (query.clone(), at));
-                if let Some(adapter) = lock(&adapters).get(&account) {
+                if let Some(adapter) = lock(adapters).get(&account) {
                     adapter.command(Command::SearchPeople(query));
                 }
             }
@@ -407,7 +407,7 @@ impl Chat {
             let doing = self.hub.doing(&person.key);
             person.presence = doing.presence;
             person.emoji = doing.emoji;
-            person.activity = doing.activity;
+            person.activity = doing.activity.map(Box::new);
             if !doing.status.is_empty() {
                 person.status = doing.status;
             }
@@ -794,7 +794,7 @@ impl Chat {
         let cached = (person.clone(), space.clone());
         if let Some(mut profile) = self.hub.profiles.get(&cached) {
             profile.person = self.with_presence(vec![known]).remove(0);
-            return Response::Profile { profile };
+            return Response::Profile { profile: Box::new(profile) };
         }
         let account = person.account();
         let space_id = space.filter(|space| space.account() == account).map(|space| space.id);
@@ -818,7 +818,7 @@ impl Chat {
         };
         let profile = typed_profile(self.with_presence(vec![known]).remove(0), about);
         self.hub.profiles.keep(cached, profile.clone());
-        Response::Profile { profile }
+        Response::Profile { profile: Box::new(profile) }
     }
 
     /// A conversation's info: its row, and what the network says beyond it, kept five minutes.
@@ -830,7 +830,7 @@ impl Chat {
         };
         if let Some(mut info) = self.hub.infos.get(&conversation) {
             info.conversation = row;
-            return Response::ConversationInfo { info };
+            return Response::ConversationInfo { info: Box::new(info) };
         }
         let conversation_id = conversation.id.clone();
         let about = match self.ask(&conversation.account(), |reply| Command::ConversationInfo { conversation_id, reply }) {
@@ -854,7 +854,7 @@ impl Chat {
         clip(&mut info.external, 100);
         clip(&mut info.link, 300);
         self.hub.infos.keep(conversation, info.clone());
-        Response::ConversationInfo { info }
+        Response::ConversationInfo { info: Box::new(info) }
     }
 
     fn space_info(&self, space: Key) -> Response {
@@ -866,7 +866,7 @@ impl Chat {
         };
         if let Some(mut info) = self.hub.space_infos.get(&space) {
             info.space = known;
-            return Response::SpaceInfo { info };
+            return Response::SpaceInfo { info: Box::new(info) };
         }
         let space_id = space.id.clone();
         let about = match self.ask(&space.account(), |reply| Command::SpaceInfo { space_id, reply }) {
@@ -887,7 +887,7 @@ impl Chat {
         info.roles.truncate(protocol::PROFILE_ROLES);
         info.roles.iter_mut().for_each(|role| clip(role, 100));
         self.hub.space_infos.keep(space, info.clone());
-        Response::SpaceInfo { info }
+        Response::SpaceInfo { info: Box::new(info) }
     }
 
     /// Something the user did to a conversation on the network: mute, leave, close. The answer
@@ -1214,6 +1214,12 @@ impl Chat {
                     Err(err) => internal(err),
                 }
             }
+            Request::Topics { forum, offset, limit } => match self.hub.store().topics(&forum, offset, limit.min(PAGE_LIMIT)) {
+                Ok((conversations, total)) => {
+                    Response::Conversations { conversations: self.rows(conversations), total, counts: InboxCounts::default() }
+                }
+                Err(err) => internal(err),
+            },
             Request::InVoice { network } => self.in_voice(network),
             Request::Around { network } => self.around(network),
             Request::Catalog { account, kind, space, query, cursor } => self.catalog(account, kind, space, query, cursor),
@@ -1481,7 +1487,7 @@ fn adopt(hub: &Arc<Hub>, adapters: &Adapters, network: Network, session: &str) -
     if session::enabled() {
         session::save(network, session)?;
     }
-    lock(&adapters).retain(|account, _| account.network != network);
+    lock(adapters).retain(|account, _| account.network != network);
     let mut started = Vec::new();
     for signed in adapters::accounts(network, session)? {
         let account = AccountKey {
@@ -1490,7 +1496,7 @@ fn adopt(hub: &Arc<Hub>, adapters: &Adapters, network: Network, session: &str) -
         };
         hub.store().set_account(&account, &signed.name, "").map_err(|err| err.to_string())?;
         let adapter = adapters::start(account.clone(), &signed.session, hub.clone())?;
-        lock(&adapters).insert(account.clone(), adapter);
+        lock(adapters).insert(account.clone(), adapter);
         started.push(account);
     }
     hub.changed(Change::Status);

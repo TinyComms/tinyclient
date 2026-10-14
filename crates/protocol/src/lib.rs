@@ -598,9 +598,10 @@ pub struct Person {
     /// Their status's emoji, apart from its words (`status`). Live, like presence.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub emoji: String,
-    /// What they are doing now: playing, listening, in voice, in a meeting. Live.
+    /// What they are doing now: playing, listening, in voice, in a meeting. Live. Boxed: few
+    /// people in a list are doing anything.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub activity: Option<Activity>,
+    pub activity: Option<Box<Activity>>,
     /// Their job title (Slack, Teams). Stored.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub title: String,
@@ -980,6 +981,13 @@ pub enum Request {
     /// the network's own list, once; it is kept fresh by the socket after that.
     Threads {
         space: Key,
+        offset: u32,
+        limit: u32,
+    },
+    /// The topics of a forum (a Telegram forum group, a Discord forum), the network's pins
+    /// first, then newest first. From the cache; opening a topic is opening a conversation.
+    Topics {
+        forum: Key,
         offset: u32,
         limit: u32,
     },
@@ -1414,7 +1422,7 @@ pub enum Response {
         url: String,
     },
     Profile {
-        profile: Profile,
+        profile: Box<Profile>,
     },
     Shared {
         conversation: Key,
@@ -1439,11 +1447,12 @@ pub enum Response {
         online: Vec<Person>,
         recent: Vec<Person>,
     },
+    /// Boxed, as `Profile` is: few answers are one, and every answer would carry its size.
     ConversationInfo {
-        info: ConversationInfo,
+        info: Box<ConversationInfo>,
     },
     SpaceInfo {
-        info: SpaceInfo,
+        info: Box<SpaceInfo>,
     },
     Pinned {
         conversation: Key,

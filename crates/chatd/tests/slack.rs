@@ -871,10 +871,13 @@ fn one_sign_in_is_two_workspaces_each_with_its_sidebar_and_unread_state() {
     };
     let mut direct: Vec<&str> = inbox.iter().map(|row| row.key.id.as_str()).collect();
     direct.sort_unstable();
-    // The bot's and the group's conversations have no message at all, so they are not listed
-    // (polish rule I2) while they stay in the workspace's tree.
+    // The bot's and the group's conversations are read and quiet for over 30 days, so they are
+    // not listed (polish rule I2) while they stay in the workspace's tree.
     assert_eq!(direct, ["D0ANA"]);
-    assert!(row("D0BOT").updated == 0 && row("G0GRP").updated == 0);
+    let month_ago = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64 - 30 * 86_400;
+    for quiet in ["D0BOT", "G0GRP"] {
+        assert!(row(quiet).updated < month_ago && row(quiet).unread == 0 && row(quiet).mentions == 0, "{:?}", row(quiet));
+    }
 
     // Unread, mentions and mute are Slack's own: `client.counts` and the muted-channels pref.
     let state = |id: &str| (row(id).unread, row(id).mentions, row(id).muted, row(id).badge());
@@ -898,7 +901,8 @@ fn one_sign_in_is_two_workspaces_each_with_its_sidebar_and_unread_state() {
         panic!("no people");
     };
     let partners: Vec<(&str, bool, &str)> = people.iter().map(|person| (person.name.as_str(), person.bot, person.status.as_str())).collect();
-    assert_eq!(partners, [("Ana", false, "🎧 Heads down"), ("Deploy Bot", true, "")]);
+    // A bot is never among people (polish rule P2), though its DM is a contact's.
+    assert_eq!(partners, [("Ana", false, "🎧 Heads down")]);
 
     // Every request and both sockets carried the browser the user signed in with, and the cookie.
     let calls = world.fake.calls.lock().unwrap().clone();

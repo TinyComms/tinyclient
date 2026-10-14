@@ -22,7 +22,18 @@
 //!   a `#general`, so a row has to say which Space it is in.
 //! - Slack (connected) with two workspaces as two accounts, Harbor Labs and Fernhill Collective.
 //!   Their direct and group conversations are in the workspace's tree, as Slack has them.
-//! - Telegram and Teams signed out.
+//! - Telegram (connected): one flat chat list with no Space: pins, folders as filters (Work,
+//!   Family, Channels), an archive, a channel with a sponsored message, a forum with topics,
+//!   Saved Messages, the 777000 service chat, a bot, a scam account, and ✓ / ✓✓ on our own
+//!   last messages.
+//! - Teams (connected): chats with no Space (one-to-one, untitled and titled groups, meeting
+//!   chats older and newer than 14 days, two app chats, the Notes self-chat, a hidden chat,
+//!   two rows with no preview yet), two teams with shown and hidden channels and a channel post
+//!   with replies, and people who are Busy, presenting or out of office.
+//! - Across them (`polish`): Discord server folders and friends in voice, playing and
+//!   listening; a message request; app DMs on Discord and Slack; a Slack section that shows
+//!   unread only and channels quiet for 30 days; titles, time zones and tags; what each
+//!   account may send; custom emoji, stickers and GIFs for the pickers.
 //! - Pictures are real PNG files made here. Most are on disk; a few are left unfetched and land
 //!   through the media cache from a server on localhost when the shell asks, and some fail.
 //!
@@ -30,9 +41,12 @@
 //! presence change (and someone in the Campfire voice channel muting) and a picture landing.
 //! Watch the direct conversation with Yusuf Demirci.
 //!
-//! The demo answers for its accounts itself (`adapter`): a message sent is accepted, a reaction
+//! The demo answers for its accounts itself (`adapter`): a message sent is accepted (with its
+//! files, which "upload" in steps that report progress and can be cancelled), a reaction
 //! toggles, an edit and a delete work, a friend request can be answered, our own presence set,
-//! a person's card opened, a member list read. A call in a voice channel puts us among its
+//! a person's card and a conversation's or Space's info opened, a member list read, a mute set,
+//! a group left, a DM closed, pinned messages and the pickers' catalogs listed, and rows with no
+//! preview filled in when they come on screen. A call in a voice channel puts us among its
 //! occupants; there is no voice server, so it ends as a call the network never answered, unless
 //! `TINYCHAT_DEMO_VOICE` names one (`host:port`), which is how the tests join for real.
 //!
@@ -44,17 +58,20 @@ mod adapter;
 mod discord;
 mod live;
 mod png;
+mod polish;
 mod serve;
 mod showcase;
 mod slack;
+mod teams;
+mod telegram;
 
 use crate::adapters::Adapter;
 use crate::hub::Hub;
 use crate::store::{ConversationRow, PersonRow, Store, Stored};
 use png::Art;
 use protocol::{
-    AccountKey, Key, Link, MediaFile, MediaKind, MentionKind, Message, Network, Occupants, Presence, Relation,
-    SendState, Sender, Span, Style,
+    AccountKey, Activity, Capabilities, Key, Link, MediaFile, MediaKind, MentionKind, Message, Network, Occupants,
+    Presence, Relation, SendState, Sender, Span, Style,
 };
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -68,7 +85,9 @@ fn me_of(account: &AccountKey) -> &'static str {
     match account.network {
         Network::Slack if *account == slack::fernhill() => slack::ME_FERNHILL,
         Network::Slack => slack::ME_HARBOR,
-        _ => discord::ME,
+        Network::Telegram => telegram::ME,
+        Network::Teams => teams::ME,
+        Network::Discord => discord::ME,
     }
 }
 
@@ -116,6 +135,8 @@ struct Stage {
     /// Who we are on each account, for the adapter that answers for it.
     me: Vec<(AccountKey, Who)>,
     presence: Vec<(Key, Presence, String)>,
+    activities: Vec<(Key, String, Option<Activity>)>,
+    capabilities: Vec<(AccountKey, Capabilities)>,
     occupants: Vec<(Key, Occupants)>,
     pending: showcase::Pending,
     live: live::Plan,
@@ -188,6 +209,9 @@ pub(crate) struct Seeder<'a> {
     made: u64,
     pub mode: Mode,
     presence: Vec<(Key, Presence, String)>,
+    /// Status emoji and what people are doing: live, so told to the hub at `attach`.
+    pub activities: Vec<(Key, String, Option<Activity>)>,
+    pub capabilities: Vec<(AccountKey, Capabilities)>,
     pub occupants: Vec<(Key, Occupants)>,
 }
 
@@ -195,7 +219,9 @@ pub(crate) struct Seeder<'a> {
 fn link_of(account: &AccountKey, id: &str) -> String {
     match account.network {
         Network::Slack => format!("slack://user?team={}&id={id}", account.account),
-        _ => format!("discord://-/users/{id}"),
+        Network::Telegram => format!("tg://user?id={}", id.trim_start_matches('u')),
+        Network::Teams => format!("https://teams.microsoft.com/l/chat/0/0?users={id}"),
+        Network::Discord => format!("discord://-/users/{id}"),
     }
 }
 
@@ -417,10 +443,12 @@ pub fn seed(store: &mut Store, dir: &Path, mode: Mode) -> Fallible<()> {
         made: 0,
         mode,
         presence: Vec::new(),
+        activities: Vec::new(),
+        capabilities: Vec::new(),
         occupants: Vec::new(),
     };
     // Whatever an earlier run seeded goes first, files included, so ids never collide.
-    for account in [discord::account(), slack::harbor(), slack::fernhill()] {
+    for account in [discord::account(), slack::harbor(), slack::fernhill(), telegram::account(), teams::account()] {
         seeder.store.forget(&account)?;
         let _ = std::fs::remove_dir_all(crate::blobs::dir_under(&media, &account));
     }
@@ -428,6 +456,9 @@ pub fn seed(store: &mut Store, dir: &Path, mode: Mode) -> Fallible<()> {
     let showcase = showcase::seed(&mut seeder, &discord)?;
     let mut me = slack::seed(&mut seeder)?;
     me.push((discord.account.clone(), discord.me.clone()));
+    me.push((telegram::account(), telegram::seed(&mut seeder)?));
+    me.push((teams::account(), teams::seed(&mut seeder)?));
+    polish::seed(&mut seeder, &discord)?;
 
     let fernhill = match (mode.expired, mode.reconnecting) {
         (true, _) => (Link::Expired, "Slack ended this session. Sign in again to send and receive."),
@@ -440,9 +471,13 @@ pub fn seed(store: &mut Store, dir: &Path, mode: Mode) -> Fallible<()> {
             (discord::account(), Link::Connected, ""),
             (slack::harbor(), Link::Connected, ""),
             (slack::fernhill(), fernhill.0, fernhill.1),
+            (telegram::account(), Link::Connected, ""),
+            (teams::account(), Link::Connected, ""),
         ],
         me,
         presence: seeder.presence,
+        activities: seeder.activities,
+        capabilities: seeder.capabilities,
         occupants: seeder.occupants,
         pending: showcase,
         live: live::Plan::new(&discord, media, origin),
@@ -482,6 +517,12 @@ pub fn attach(hub: &Arc<Hub>) -> Vec<(AccountKey, Adapter)> {
     }
     for (person, presence, status) in stage.presence {
         hub.set_presence(person, presence, &status, true);
+    }
+    for (person, emoji, activity) in stage.activities {
+        hub.set_activity(person, &emoji, activity, true);
+    }
+    for (account, can) in stage.capabilities {
+        hub.set_capabilities(&account, can);
     }
     for (conversation, occupants) in stage.occupants {
         hub.set_occupants(conversation, occupants);

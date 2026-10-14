@@ -7,15 +7,19 @@
 //! - `TINYCHAT_DEMO_ANSWER_MS`: how long the other side of a direct call takes to pick up
 //!   (4000). Only with a voice server; without one nobody answers.
 //! - `TINYCHAT_DEMO_SIGN_OUT_MS`: how long ending the session on the "network" takes (150).
+//! - `TINYCHAT_DEMO_UPLOAD_MS`: how long each quarter of a file upload takes (60), so a test
+//!   can cancel one on its way.
 
 use super::Who;
-use crate::adapters::{self, About, Adapter, Command, Context, Download, Members, Refusal};
-use crate::hub::{now, Hub};
-use crate::store::ConversationRow;
+use crate::adapters::{self, About, Adapter, CatalogPage, Command, Context, ConversationAbout, Download, Members, Refusal, SharedPage, SpaceAbout};
+use crate::hub::{lock, now, Hub};
+use crate::store::{ConversationRow, Filing, PreviewLine};
 use protocol::{
-    AccountKey, CallSupport, ConversationKind, Dave, Key, MemberSection, Message, Network,
-    Occupant, Participant, Presence, Reaction, RelateAction, Relation, ReplyTo, VoiceJoin,
+    AccountKey, Attachment, CallSupport, CatalogKind, Contact, ContactKind, ConversationKind, Dave, Key, Mark,
+    MediaFile, MemberSection, Message, Network, Notify, Occupant, Outgoing, Participant, Presence, Reaction,
+    RelateAction, Relation, ReplyTo, SharedKind, VoiceJoin, Warning,
 };
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -28,6 +32,8 @@ struct Demo {
     made: AtomicU64,
     /// The conversation of the call we are in or ringing.
     call: Mutex<Option<String>>,
+    /// Uploads the user cancelled, by client id, until their thread sees it.
+    cancelled: Mutex<HashSet<String>>,
 }
 
 fn millis(name: &str, default: u64) -> Duration {
@@ -53,6 +59,7 @@ pub fn start(account: AccountKey, hub: Arc<Hub>, me: Who) -> std::io::Result<Ada
             me,
             made: AtomicU64::new(0),
             call: Mutex::new(None),
+            cancelled: Mutex::new(HashSet::new()),
         });
         adapters::serve_commands(&ctx, inbox, Duration::ZERO, |_| {}, |command| Demo::serve(&demo, command));
     })?;
@@ -84,13 +91,22 @@ impl Demo {
                 let at = number.parse::<u32>().unwrap_or(1).saturating_sub(1);
                 format!("D0{}DIRECT{at:03}", &self.ctx.account.account[2..3])
             }
-            _ => format!("500000000000000{number}"),
+            // A Telegram chat with a person is named by the person.
+            Network::Telegram => person_id.to_owned(),
+            Network::Teams => format!("19:{}_robin@unq.gbl.spaces", number.parse::<u32>().unwrap_or(0)),
+            Network::Discord => format!("500000000000000{number}"),
         }
     }
 
     fn send(&self, conversation_id: &str, client_id: &str, text: String, reply_to: Option<String>) {
+        self.ctx.sent(conversation_id, client_id, Ok(self.accepted(conversation_id, text, reply_to, Vec::new())));
+    }
+
+    /// Our message as the network would echo it.
+    fn accepted(&self, conversation_id: &str, text: String, reply_to: Option<String>, attachments: Vec<Attachment>) -> Message {
         let sent = now();
         let mut message = Message::plain(self.message_id(sent), "", text, sent, true);
+        message.attachments = attachments;
         message.sender = self.me.sender();
         let quoted = reply_to.and_then(|id| self.ctx.stored_message(conversation_id, &id).ok().flatten());
         message.reply_to = quoted.map(|quoted| ReplyTo {
@@ -100,7 +116,79 @@ impl Demo {
             snippet: quoted.text.chars().take(120).collect(),
             deleted: quoted.deleted,
         });
-        self.ctx.sent(conversation_id, client_id, Ok(message));
+        message
+    }
+
+    /// Files "upload" from their paths in quarters, read from disk in parts as a real upload
+    /// streams them, telling the progress as they go. A cancel stops them before the next part.
+    fn send_with(demo: &Arc<Demo>, conversation_id: String, client_id: String, text: String, reply_to: Option<String>, with: Outgoing) {
+        let demo = demo.clone();
+        let spawned = std::thread::Builder::new().name("demo-upload".into()).stack_size(256 * 1024).spawn(move || {
+            use std::io::Read;
+            let total: u64 = with.files.iter().map(|file| std::fs::metadata(&file.path).map_or(0, |meta| meta.len())).sum();
+            let step = millis("TINYCHAT_DEMO_UPLOAD_MS", 60);
+            let mut sent = 0u64;
+            let mut part = vec![0u8; 64 * 1024];
+            for file in &with.files {
+                let Ok(mut reader) = std::fs::File::open(&file.path) else {
+                    let name = std::path::Path::new(&file.path).file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+                    demo.ctx.sent(&conversation_id, &client_id, Err(format!("{name} could not be read.")));
+                    return;
+                };
+                let size = reader.metadata().map_or(0, |meta| meta.len());
+                let quarter = size.div_ceil(4).max(1);
+                let mut done = 0u64;
+                while done < size {
+                    if lock(&demo.cancelled).remove(&client_id) {
+                        demo.ctx.sent(&conversation_id, &client_id, Err("Cancelled".to_owned()));
+                        return;
+                    }
+                    let mut read = 0u64;
+                    while read < quarter {
+                        match reader.read(&mut part) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => read += n as u64,
+                        }
+                    }
+                    done += read.max(1);
+                    sent = (sent + read.max(1)).min(total);
+                    demo.ctx.upload(&conversation_id, &client_id, sent, total);
+                    if demo.ctx.pause(step) {
+                        return;
+                    }
+                }
+            }
+            if lock(&demo.cancelled).remove(&client_id) {
+                demo.ctx.sent(&conversation_id, &client_id, Err("Cancelled".to_owned()));
+                return;
+            }
+            demo.ctx.upload(&conversation_id, &client_id, total, total);
+            let attachments = with
+                .files
+                .iter()
+                .enumerate()
+                .map(|(at, file)| {
+                    let name = if file.name.is_empty() {
+                        std::path::Path::new(&file.path).file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default()
+                    } else {
+                        file.name.clone()
+                    };
+                    let bytes = std::fs::metadata(&file.path).map_or(0, |meta| meta.len());
+                    let kind = match std::path::Path::new(&file.path).extension().and_then(|extension| extension.to_str()) {
+                        Some("png" | "jpg" | "jpeg" | "webp") => protocol::MediaKind::Image,
+                        _ => protocol::MediaKind::File,
+                    };
+                    let mut attached = Attachment::new(name, MediaFile { bytes, path: Some(file.path.clone()), ..MediaFile::new(format!("sent-{client_id}-{at}"), kind) });
+                    attached.spoiler = file.spoiler;
+                    attached
+                })
+                .collect();
+            let message = demo.accepted(&conversation_id, text, reply_to, attachments);
+            demo.ctx.sent(&conversation_id, &client_id, Ok(message));
+        });
+        if let Err(err) = spawned {
+            eprintln!("chatd: demo: upload: {err}");
+        }
     }
 
     /// Our reaction as the network would report it. A custom emoji is named by its file's id.
@@ -131,39 +219,146 @@ impl Demo {
         self.ctx.message(conversation_id, &message).map_err(|err| Refusal::Refused(err.to_string()))
     }
 
-    fn about(&self, person_id: &str) -> About {
+    /// A person's card as each network would fill it, typed.
+    fn about(&self, person_id: &str, space_id: Option<&str>) -> About {
         let pick = person_id.bytes().fold(0usize, |sum, byte| sum.wrapping_mul(31).wrapping_add(byte as usize));
         let spaces = self.hub.store().spaces(Some(self.ctx.account.network)).unwrap_or_default();
-        let ours = spaces.into_iter().filter(|space| space.key.account() == self.ctx.account);
+        let ours: Vec<String> = spaces.into_iter().filter(|space| space.key.account() == self.ctx.account).map(|space| space.name).collect();
         let (zone, offset) = ZONES[pick % ZONES.len()];
-        About {
+        let person = self.hub.store().person(&self.key(person_id)).ok().flatten();
+        let name = person.as_ref().map_or_else(String::new, |person| person.name.clone());
+        let first = name.split_whitespace().next().unwrap_or("").to_lowercase();
+        let since = Some(1_500_000_000 + (pick % 200_000_000) as i64);
+        let mut about = About {
             bio: BIOS[pick % BIOS.len()].to_owned(),
-            mutual_spaces: ours.map(|space| space.name).take(1 + pick % 4).collect(),
-            time_zone: zone.to_owned(),
-            utc_offset: Some(offset),
-            fields: match self.ctx.account.network {
-                Network::Slack => vec![("Title".to_owned(), "Platform engineer".to_owned()), ("Email".to_owned(), format!("{}@harbor.example", person_id.to_lowercase()))],
-                _ => vec![("Username".to_owned(), format!("user{}", pick % 1000))],
-            },
-            since: Some(1_500_000_000 + (pick % 200_000_000) as i64),
-            mutual_friends: (pick % 9) as u32,
-            accent: Some([0xd9_82_4a, 0x4c_9a_6a, 0x5b_6e_e1, 0xb5_4a_7a][pick % 4]),
-            banner: None,
-            nickname: String::new(),
-            pronouns: String::new(),
-            title: String::new(),
-            department: String::new(),
-            roles: Vec::new(),
-            contacts: Vec::new(),
-            mutual_total: 0,
-            joined: None,
-            friends_since: None,
-            last_seen: None,
-            status_until: None,
-            away: String::new(),
-            away_until: None,
-            note: String::new(),
-            warning: None,
+            since,
+            ..About::default()
+        };
+        match self.ctx.account.network {
+            Network::Discord => {
+                about.mutual_spaces = ours.iter().take(1 + pick % 4).cloned().collect();
+                about.mutual_total = (about.mutual_spaces.len() + pick % 3) as u32;
+                about.mutual_friends = (pick % 9) as u32;
+                about.accent = Some([0xd9_82_4a, 0x4c_9a_6a, 0x5b_6e_e1, 0xb5_4a_7a][pick % 4]);
+                about.pronouns = ["she/her", "he/him", "they/them", ""][pick % 4].to_owned();
+                about.friends_since = Some(1_620_000_000 + (pick % 50_000_000) as i64);
+                about.note = if pick % 3 == 0 { "Met at the spring foray. Knows lichens.".to_owned() } else { String::new() };
+                if space_id.is_some() {
+                    about.nickname = format!("{} 🌿", name.split_whitespace().next().unwrap_or(""));
+                    about.roles = ["Trail lead", "Moderator", "Photographer"].iter().take(1 + pick % 3).map(|role| (*role).to_owned()).collect();
+                    about.joined = Some(1_640_000_000 + (pick % 40_000_000) as i64);
+                }
+            }
+            Network::Slack => {
+                about.time_zone = zone.to_owned();
+                about.utc_offset = Some(offset);
+                about.title = person.as_ref().map_or_else(String::new, |person| person.title.clone());
+                about.pronouns = ["she/her", "he/him", "they/them", ""][pick % 4].to_owned();
+                about.contacts = vec![
+                    Contact { kind: ContactKind::Email, value: format!("{first}@harbor.example"), masked: false },
+                    Contact { kind: ContactKind::Phone, value: format!("+44 7700 900{:03}", pick % 1000), masked: true },
+                ];
+                about.status_until = Some(now() + 3_600 * (1 + (pick % 5) as i64));
+            }
+            Network::Telegram => {
+                about.contacts = vec![Contact { kind: ContactKind::Phone, value: format!("+351 912 345 {:03}", pick % 1000), masked: true }];
+                about.last_seen = Some(now() - 600 * (1 + (pick % 30) as i64));
+                about.mutual_total = (pick % 4) as u32;
+                if person.as_ref().is_some_and(|person| person.mark == Some(Mark::Scam)) {
+                    about.warning = Some(Warning::Scam);
+                    about.bio = "Official giveaway. Limited time!".to_owned();
+                }
+            }
+            Network::Teams => {
+                about.bio = String::new();
+                about.since = None;
+                about.title = person.as_ref().map_or_else(String::new, |person| person.title.clone());
+                about.department = "Engineering".to_owned();
+                about.contacts = vec![Contact { kind: ContactKind::Email, value: person.as_ref().map_or_else(String::new, |person| person.handle.clone()), masked: false }];
+                about.utc_offset = person.as_ref().and_then(|person| person.utc_offset);
+                if name.starts_with("Chloé") {
+                    about.away = "Out of office until Friday. For onboarding, ask Robin.".to_owned();
+                    about.away_until = Some(now() + 3 * 86_400);
+                }
+            }
+        }
+        about
+    }
+
+    fn conversation_about(&self, conversation_id: &str) -> Result<ConversationAbout, Refusal> {
+        let row = self.ctx.known(conversation_id).ok().flatten().ok_or_else(|| Refusal::Refused("That conversation is gone.".to_owned()))?;
+        let pick = conversation_id.bytes().fold(0usize, |sum, byte| sum.wrapping_mul(31).wrapping_add(byte as usize));
+        let members = match row.kind {
+            ConversationKind::Direct => 2,
+            ConversationKind::Group => 3 + (pick % 6) as u32,
+            _ => 40 + (pick % 1_200) as u32,
+        };
+        Ok(ConversationAbout {
+            description: if row.topic.is_empty() { String::new() } else { format!("{}\n\nPinned rules and links are in the pins.", row.topic) },
+            members: Some(members),
+            online: Some(members / 3),
+            created: Some(1_600_000_000 + (pick % 100_000_000) as i64),
+            creator: if row.kind.is_direct() { String::new() } else { "Ines Marchetti".to_owned() },
+            notify: if row.muted { Notify::Nothing } else { Notify::All },
+            pinned: Some((pick % 4) as u32),
+            external: if self.ctx.account.network == Network::Slack && row.title == "customer-voice" { "Northwind Traders".to_owned() } else { String::new() },
+            link: if self.ctx.account.network == Network::Telegram && !row.kind.is_direct() { format!("https://t.me/{}", row.title.to_lowercase().replace(' ', "_")) } else { String::new() },
+        })
+    }
+
+    fn space_about(&self, space_id: &str) -> Result<SpaceAbout, Refusal> {
+        let pick = space_id.bytes().fold(0usize, |sum, byte| sum.wrapping_mul(31).wrapping_add(byte as usize));
+        Ok(SpaceAbout {
+            description: "Field trips, identification help and a lot of photos of moss.".to_owned(),
+            members: Some(200 + (pick % 2_000) as u32),
+            online: Some(20 + (pick % 200) as u32),
+            nickname: if self.ctx.account.network == Network::Discord { "Robin 🍄".to_owned() } else { String::new() },
+            roles: if self.ctx.account.network == Network::Discord { vec!["Member".to_owned(), "Trail lead".to_owned()] } else { Vec::new() },
+            notify: Notify::Mentions,
+        })
+    }
+
+    /// What is pinned: the cached messages that say so, newest first.
+    fn pinned(&self, conversation_id: &str) -> Vec<Message> {
+        let page = self.hub.store().messages(&self.key(conversation_id), &protocol::Page::Newest, 200, now());
+        let messages = page.ok().flatten().map(|page| page.messages).unwrap_or_default();
+        messages.into_iter().rev().filter(|message| message.pinned).take(protocol::PINNED_LIMIT).collect()
+    }
+
+    /// The "network's" own search of what was shared: the whole cache, said to be complete.
+    fn search_shared(&self, conversation_id: &str, kind: SharedKind, before: Option<&str>, limit: u32) -> Result<SharedPage, Refusal> {
+        let found = self.hub.store().shared(&self.key(conversation_id), kind, before, limit);
+        match found {
+            Ok(Some((items, more))) => {
+                let total = (!more && before.is_none()).then_some(items.len() as u32);
+                Ok(SharedPage { items, more, total })
+            }
+            Ok(None) => Err(Refusal::Refused("That conversation is gone.".to_owned())),
+            Err(err) => Err(Refusal::Refused(err.to_string())),
+        }
+    }
+
+    fn catalog(&self, kind: CatalogKind, query: &str, cursor: Option<&str>) -> CatalogPage {
+        let items = super::polish::catalog(&self.ctx.account, kind);
+        let ids: Vec<String> = items.iter().map(|(id, ..)| (*id).to_owned()).collect();
+        let files: Vec<MediaFile> = self.hub.store().media(&self.ctx.account, &ids).unwrap_or_default().into_iter().map(|(file, _)| file).collect();
+        let (items, cursor) = super::polish::page(&files, kind, items, query, cursor);
+        CatalogPage { items, cursor }
+    }
+
+    /// Rows on screen with no preview: the "network" says what was said last.
+    fn previews(&self, ids: &[String]) {
+        for id in ids {
+            let line = PreviewLine {
+                id: format!("{}000", now()),
+                text: "Calendar invite: kickoff on Monday".to_owned(),
+                sender: "Ana Ruiz".to_owned(),
+                mine: false,
+                sent: self.ctx.known(id).ok().flatten().map_or_else(now, |row| row.updated.max(1)),
+            };
+            if let Err(err) = self.ctx.preview(id, &line) {
+                eprintln!("chatd: demo: preview: {err}");
+            }
         }
     }
 
@@ -317,7 +512,34 @@ impl Demo {
                 demo.ctx.presence(&demo.me.id, presence, status.as_deref().unwrap_or(&old), true);
                 let _ = reply.send(Ok(()));
             }
-            Command::Profile { person_id, reply } => drop(reply.send(Ok(demo.about(&person_id)))),
+            Command::Profile { person_id, reply } => drop(reply.send(Ok(demo.about(&person_id, None)))),
+            Command::ProfileIn { person_id, space_id, reply } => drop(reply.send(Ok(demo.about(&person_id, Some(&space_id))))),
+            Command::ConversationInfo { conversation_id, reply } => drop(reply.send(demo.conversation_about(&conversation_id))),
+            Command::SpaceInfo { space_id, reply } => drop(reply.send(demo.space_about(&space_id))),
+            Command::SetMute { conversation_id, notify, reply } => {
+                let muted = demo.ctx.muted(&conversation_id, notify == Notify::Nothing);
+                let _ = reply.send(muted.map_err(|err| Refusal::Refused(err.to_string())));
+            }
+            Command::Leave { conversation_id, reply } => {
+                let left = demo.ctx.conversation_gone(&conversation_id);
+                let _ = reply.send(left.map_err(|err| Refusal::Refused(err.to_string())));
+            }
+            Command::CloseDirect { conversation_id, reply } => {
+                let closed = demo.ctx.filing(&conversation_id, &Filing { hidden: true, ..Filing::default() });
+                let _ = reply.send(closed.map_err(|err| Refusal::Refused(err.to_string())));
+            }
+            Command::Pinned { conversation_id, reply } => drop(reply.send(Ok(demo.pinned(&conversation_id)))),
+            Command::SearchShared { conversation_id, kind, before, limit, reply } => {
+                let _ = reply.send(demo.search_shared(&conversation_id, kind, before.as_deref(), limit));
+            }
+            Command::Catalog { kind, query, cursor, reply, .. } => drop(reply.send(Ok(demo.catalog(kind, &query, cursor.as_deref())))),
+            Command::SendWith { conversation_id, client_id, text, reply_to, with } => {
+                Demo::send_with(demo, conversation_id, client_id, text, reply_to, *with);
+            }
+            Command::CancelSend { client_id, .. } => {
+                lock(&demo.cancelled).insert(client_id);
+            }
+            Command::Previews(ids) => demo.previews(&ids),
             Command::Members { offset, limit, reply, .. } => drop(reply.send(demo.members(offset, limit))),
             Command::StartDirect { person_id, reply } => drop(reply.send(demo.start_direct(&person_id))),
             Command::SearchPeople(query) => demo.ctx.searched(&query),
@@ -349,14 +571,12 @@ impl Demo {
             | Command::HistoryAfter { .. }
             | Command::HistoryAround { .. }
             | Command::OpenSpace(_)
+            | Command::OpenHome
+            | Command::OpenThreads(_)
             | Command::MarkRead { .. }
             | Command::Typing(_)
             | Command::Watch(_)
             | Command::Stop => {}
-            Command::SendWith { conversation_id, client_id, text, reply_to, .. } => {
-                demo.send(&conversation_id, &client_id, text, reply_to);
-            }
-            other => other.unsupported(&demo.ctx),
         }
     }
 }

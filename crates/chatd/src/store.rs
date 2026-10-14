@@ -731,8 +731,9 @@ fn upsert_conversation(tx: &Transaction, account: &AccountKey, row: &Conversatio
 impl Store {
     pub fn open(path: &Path) -> rusqlite::Result<Store> {
         let db = Connection::open(path)?;
-        // SQLite's default page cache is 2 MB. Keep it there; the idle budget belongs to TDLib.
-        db.execute_batch("PRAGMA journal_mode = WAL;")?;
+        // A 1 MB page cache, half SQLite's default: every list read is one page of rows, the
+        // file is on a local disk the system already caches, and chatd's idle budget is tight.
+        db.execute_batch("PRAGMA journal_mode = WAL; PRAGMA cache_size = -1024;")?;
         let version: i32 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if version != SCHEMA {
             let old: Vec<String> = db
@@ -1180,6 +1181,22 @@ impl Store {
             )?
             .collect::<rusqlite::Result<_>>()?;
         Ok((rows, counts.all, counts))
+    }
+
+    /// A forum's topics: its pins in order, then newest first, and how many there are.
+    pub fn topics(&self, forum: &Key, offset: u32, limit: u32) -> rusqlite::Result<(Vec<Conversation>, u32)> {
+        let belongs = "c.network = ?1 AND c.account = ?2 AND c.parent = ?3 AND NOT c.hidden";
+        let key = params![word(&forum.network), forum.account, forum.id];
+        let total = self.db.query_row(&format!("SELECT COUNT(*) FROM conversation c WHERE {belongs}"), key, |row| row.get(0))?;
+        let rows = self
+            .db
+            .prepare(&format!(
+                "{CONVERSATION} WHERE {belongs}
+                 ORDER BY coalesce(c.pin, 2147483647), c.updated DESC, c.id LIMIT ?4 OFFSET ?5"
+            ))?
+            .query_map(params![word(&forum.network), forum.account, forum.id, limit, offset], conversation_from)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok((rows, total))
     }
 
     /// The followed threads of a Space, newest first, and how many there are.

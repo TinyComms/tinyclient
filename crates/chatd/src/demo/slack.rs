@@ -66,6 +66,8 @@ const HARBOR_SECTIONS: &[Section] = &[
         ("eng-reviews", 0, 0, false),
     ]),
     ("Product", &[("product-roadmap", 0, 0, false), ("design-crit", 2, 0, false), ("customer-voice", 3, 1, true)]),
+    // Nothing said in a month and a half: Slack's "n quiet channels".
+    ("Archive", &[("offsite-2025", 0, 0, false), ("old-launch", 0, 0, false)]),
 ];
 
 const HARBOR_TALK: &[(&str, Lines)] = &[
@@ -111,6 +113,8 @@ const HARBOR_TALK: &[(&str, Lines)] = &[
         (3, 480, "Ours, last I heard."),
     ]),
     ("random", &[(1, 60, "Whoever left the oat milk out: it is a science project now.")]),
+    ("offsite-2025", &[(4, 64_800, "Offsite photos are in the shared drive.")]),
+    ("old-launch", &[(0, 70_000, "Launch retro notes, for the record.")]),
 ];
 
 const HARBOR_DIRECT: &[Direct] = &[
@@ -211,7 +215,8 @@ fn workspace(s: &mut Seeder, space: &Workspace, tag: char) -> Fallible<Who> {
     let mut state = Vec::new();
     for (name, channels) in space.sections {
         let group = format!("S0{tag}SECTION{}", groups.len());
-        groups.push(Group::new(group.clone(), *name, rows.len() as i32));
+        // The user set Product to show unread channels only.
+        groups.push(Group { unread_only: *name == "Product", ..Group::new(group.clone(), *name, rows.len() as i32) });
         for (channel, unread, mentions, muted) in *channels {
             let id = format!("C0{tag}CHANNEL{:02}", rows.len());
             state.push((Key::new(account, id.clone()), *channel, *unread, *mentions, *muted));

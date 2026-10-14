@@ -36,7 +36,7 @@ const FOUND: u32 = 80;
 pub enum Target {
     Conversation(Rc<Conversation>),
     Space(Key),
-    Person(Person),
+    Person(Box<Person>),
     /// The last row: search messages for what was typed.
     Search(String),
 }
@@ -169,7 +169,7 @@ pub fn hits(
                 title: person.name.clone(),
                 context: context.to_owned(),
                 matched,
-                target: Target::Person(person.clone()),
+                target: Target::Person(Box::new(person.clone())),
                 section: None,
             };
             scored.push((score, 0, hit));

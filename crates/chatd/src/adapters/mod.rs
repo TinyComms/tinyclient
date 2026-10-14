@@ -487,6 +487,9 @@ impl Context {
     pub fn conversation(&self, row: &ConversationRow) -> Stores {
         self.hub.store().upsert_conversation(&self.account, row)?;
         self.row_changed(&row.id, row.space.as_deref());
+        if row.filing.is_some() {
+            self.hub.changed(Change::Folders { account: self.account.clone() });
+        }
         Ok(())
     }
 

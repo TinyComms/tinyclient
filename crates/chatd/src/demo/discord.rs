@@ -249,7 +249,8 @@ fn moss(s: &mut Seeder, account: &AccountKey, cast: &[Who], me: &Who) -> Fallibl
     for (at, (category, channels)) in MOSS_TREE.iter().enumerate() {
         let group = (!category.is_empty()).then(|| format!("350000000000000{at:03}"));
         if let Some(id) = &group {
-            groups.push(Group::new(id.clone(), *category, rows.len() as i32));
+            // The staff category is muted, so it starts collapsed.
+            groups.push(Group { muted: *category == "Staff", ..Group::new(id.clone(), *category, rows.len() as i32) });
         }
         for (name, kind, unread, mentions, muted) in *channels {
             let id = format!("400000000000000{:03}", rows.len() + 1);
@@ -344,6 +345,8 @@ fn small(s: &mut Seeder, account: &AccountKey, cast: &[Who]) -> Fallible<()> {
                 rows.push(ConversationRow {
                     group: Some(group.clone()),
                     position: rows.len() as i32,
+                    // Not opted in to: listed only under "Browse more channels".
+                    opted_out: at == 0 && *category == "Deep ends",
                     ..ConversationRow::new(format!("41000000000000{at}{:03}", rows.len()), Channel, *name)
                 });
             }
