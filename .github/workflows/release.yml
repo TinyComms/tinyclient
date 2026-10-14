@@ -117,6 +117,16 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      # Each package also goes up without the version in its name, so a fixed address
+      # (releases/latest/download/tinyclient-macos.zip, which tinyclient.io/download/macos points
+      # at) always serves the newest one. SHA256SUMS covers both names.
+      - name: Unversioned copies and checksums
+        working-directory: dist
+        run: |
+          for f in tinyclient-${{ github.ref_name }}-*; do
+            cp "$f" "tinyclient-${f#tinyclient-${{ github.ref_name }}-}"
+          done
+          sha256sum tinyclient-* > SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*
