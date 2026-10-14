@@ -259,9 +259,9 @@ Per-conversation settings live with the conversation and are mirrored in Sounds 
 
 ## 8. The sounds
 
-All are generated from code by one synthesiser, so the licence is the repository's (MIT): no samples, no third-party presets, no fonts of sounds. The synthesiser is `mediad`'s cue module: sine and two-operator FM voices, ADSR envelopes, a 2-pole 300 Hz high-pass and 6 kHz low-pass, all deterministic. `cargo run -p mediad --example sounds -- <dir>` renders the seven bundled sounds to WAV; `afconvert -f caff -d ima4 -c 1` encodes them; the CAF files are committed under the app's Resources as `tinyclient-<name>.caf`, prefixed so they cannot collide with system sounds. CI renders the WAVs again and compares their SHA-256 to a committed manifest, so the files cannot drift from the code. Nothing is rendered at build time.
+All are generated from code by one synthesiser, so the licence is the repository's (MIT): no samples, no third-party presets, no fonts of sounds. The synthesiser is `mediad`'s cue module: sine and two-operator FM voices, ADSR envelopes, a 4-pole (two 2-pole sections) 300 Hz high-pass and 6 kHz low-pass, all deterministic; one 2-pole section let Chime's upper FM sidebands through at 2 %. `cargo run -p mediad --example sounds -- <dir>` renders the seven bundled sounds to WAV; `afconvert -f caff -d ima4 -c 1` encodes them; `packaging/sounds/render.sh` does both. The CAF files are committed in `packaging/sounds` as `tinyclient-<name>.caf`, prefixed so they cannot collide with system sounds, and go into the app's Resources when notifications post them. A macOS test (`crates/mediad/tests/sounds.rs`) renders the WAVs again and compares their SHA-256 to `packaging/sounds/SHA256SUMS`, so the files cannot drift from the code; other platforms' maths libraries may round a sample differently. Nothing is rendered at build time.
 
-**Rate and size.** Every sound is 22.05 kHz mono IMA4, about 11.7 KB a second, because nothing is above 6 kHz. Correction to the product doc: at 44.1 kHz the 8 s of rings alone are about 187 KB, past the 160 KB budget. At 22.05 kHz the seven files total about 115 KB.
+**Rate and size.** Every sound is 22.05 kHz mono IMA4, about 11.7 KB a second, because nothing is above 6 kHz. Correction to the product doc: at 44.1 kHz the 8 s of rings alone are about 187 KB, past the 160 KB budget. At 22.05 kHz the seven files total 142 KB.
 
 **Message and mention sounds.** At most 0.5 s, peak −14 dBFS, 300 Hz to 6 kHz. They differ by contour, not only timbre, so each is recognisable on a laptop speaker.
 
@@ -286,7 +286,7 @@ All are generated from code by one synthesiser, so the licence is the repository
 |---|---|---|
 | Someone joins / leaves | Two sines, E5 → A5 (659 → 880 Hz) / A5 → E5, 90 ms each | 180 ms |
 | I mute / unmute | One tick, sine 440 / 880 Hz, 60 ms decay | 60 ms |
-| I deafen / undeafen | Two ticks 40 ms apart, 440 / 880 Hz | 120 ms |
+| I deafen / undeafen | Two ticks, one after the other (60 ms each), 440 / 880 Hz | 120 ms |
 | Connection lost / back | Two sines, A4 → E4 (440 → 330 Hz) / E4 → A4, 125 ms each | 250 ms |
 | Test sound (S12) | The join cue | 180 ms |
 
@@ -334,7 +334,7 @@ The pinned GPUI exposes AccessKit roles (`role`, `aria_label`, `aria_toggled`, `
 - Sections render as plain flex columns; the longest (Notifications with many accounts) is a few dozen rows, so no virtual list is needed. Search results are the same rows re-parented.
 - Menus and popovers use `menu()`, `popover()` and `placed()`; the inheriting dropdown is `menu_item_check` plus a separator. The conversation popover is placed in the main window, not the Settings window.
 - The level meter is its own element that repaints at 10 Hz from `Call::level` only while a test runs; the rest of the pane does not repaint.
-- The device list is read with `AudioObjectGetPropertyData` in the shell when Audio & video shows, plus a property listener while it shows. It opens no device or audio unit. Confirm this against the product rule "no audio in the shell"; the alternative, starting mediad to list devices, costs 40 MB and 3 s.
+- The device list is read by running `mediad --devices` when Audio & video shows and each time a device menu opens. It lists through CoreAudio, opens no device and exits at once (about 150 ms, off the main thread), so the shell links no audio code. There is no live listener: a device plugged in while the menu is closed shows the next time it opens.
 - S11 preview is `NSSound` on the system alert device, released when it ends. If that routing cannot be done, `ROWS` drops the play buttons and play-on-pick.
 - The switch, slider, meter, time field and reset slot are new components in `components.rs`; the existing `segmented`, `button` and overlay pieces are reused unchanged.
 - The modal for P4 needs a count from chatd: `Request::Prunable { days }` → messages and bytes. Without it, the modal drops the numbers.
@@ -346,7 +346,11 @@ The pinned GPUI exposes AccessKit roles (`role`, `aria_label`, `aria_toggled`, `
 | `switch_off` (from 08, light value new) | white 16% | black 14% | Switch track off, slider track, unlit meter segment |
 | `knob` | #FFFFFF | #FFFFFF, 0 1 2 0 black 20% | Switch knob, slider thumb |
 
-New Lucide glyphs: `sun-moon`, `hard-drive`, `command`, `play`, `rotate-ccw`, at 14 and 16. Seven sound files, about 115 KB.
+New Lucide glyphs: `sun-moon`, `hard-drive`, `command`, `play`, `rotate-ccw`, at 14 and 16. Seven sound files, 142 KB.
+
+## In this build (2026-10-14)
+
+The window has Accounts, General, Sounds, Appearance, Messages, Privacy, Audio & video, Storage, Shortcuts and About; ⌘1 to ⌘9 reach the first nine in that order. Notifications is absent, and so are Sounds' notification groups, S11's play buttons and the Theme row (product: Built so far). Sounds therefore holds S1 and In calls, and S1's second line says it silences calls. The pieces live in `crates/tinyclient/src/gui/settings/`: `rows.rs` (the row table, search, Shortcuts), `controls.rs` (card, row, switch, slider, meter, reset slot), `pages.rs` (sections, results, modals, device menus). Device pickers are 220 wide. Two-line rows grow 2 a text step. The Accounts row's ⋯ menu, the time field and the conversation popover (§5) wait on Notifications.
 
 ## Deliberately absent
 

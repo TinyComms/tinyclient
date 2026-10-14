@@ -195,7 +195,7 @@ no control.
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | V1 | Microphone | Menu: "System default (name)" then devices | System default | G | d | chatd sends it to mediad right after `Join`. Shown by name; a missing device falls back to the default and the menu says "(not connected)" | v1 |
 | V2 | Speaker | Menu, as V1 | System default | G | d | As V1, for output. Also where S12 plays | v1 |
-| V3 | Test microphone | Button, held | | | | While held, the 12-segment meter of 07 §7 is live. Outside a call, mediad starts for it and exits within 3 s of release | v1 |
+| V3 | Test microphone | Button, "Test" / "Stop" (a toggle, design 09 §4) | | | | While on, the 20-segment meter is live, for at most 30 s. Outside a call, mediad starts for it (`mediad test`) and exits within 3 s of Stop | v1 |
 | V4 | Join calls with my microphone muted | Switch | Off | G | d | On: every join and every Accept starts muted, and the dock shows it | v1 |
 | V5 | Call volume | Slider 0 to 100 % | 100 % | G | d | Gain on everyone's voice in mediad's mix. 100 % is today's level | v1 |
 | V6 | Microphone sensitivity | Slider over the live meter, with "Default" mark | 25 (today's `VOICE`) | G | d | The voice gate threshold in mediad: below it, nothing is sent and no speaking ring shows | v1 |
@@ -286,7 +286,9 @@ from any conversation. The OS then applies Focus, its own mute and the app's sou
   licence is ours and they can be rebuilt.
 - Message sounds at most 0.5 s, peak −14 dBFS, no energy under 300 Hz (laptop speakers) and
   none above 6 kHz (not shrill). Rings at most 4 s, peak −10 dBFS.
-- CAF, IMA4, mono, 44.1 kHz: about 22 KB per second. Seven files total under 160 KB.
+- CAF, IMA4, mono, 22.05 kHz, since nothing in them is above 6 kHz: about 11.7 KB a second.
+  The seven files are 142 KB (`packaging/sounds`, rendered by `packaging/sounds/render.sh`). At
+  44.1 kHz the 8 s of rings alone would pass the 160 KB budget.
 - The ring stops when the notification is withdrawn (caller gave up, answered elsewhere,
   declined). A 4 s cap keeps an unwithdrawable sound short. A longer looping ring is Later,
   after checking that `removeDeliveredNotifications` cuts a playing sound.
@@ -388,6 +390,12 @@ mediad, RSS for chatd; 60 s after the state is reached.
 | mediad started for V3 or S12 outside a call | 40 MB (the call budget), exits within 3 s of the test ending |
 | Idle CPU from any of this | 0.0 %, no new wakeups |
 
+Measured for the first pass (release, `strip -x`, against `be477fb`): the shell +527 KB, over its
+400 KB; chatd +112 KB; mediad +116 KB, over its 20 KB, most of it the cue synthesiser's float
+maths, the test mode and the new protocol frames. Both overruns are to be won back before the
+notification step adds more. The seven sound files are 142 KB. Idle memory was not measured in
+this pass.
+
 What keeps idle at zero: pause and quiet hours are checked when a notification would be posted,
 not by a timer. The only timer is one one-shot at the pause's end, to redraw the rail bell. No
 audio device is open while nothing plays: the shell holds no audio unit after a preview ends,
@@ -488,6 +496,33 @@ notification delivered by the system, read with `log stream --predicate 'subsyst
 **Budgets**: each row of the budget table, measured before and after, in the release notes.
 
 ## Release cut
+
+### Built so far (2026-10-14)
+
+30 of the 50 v1 controls are in the window, each with its check, plus Accounts, Shortcuts and
+search:
+
+- **General:** G2, with `Request::Shutdown`. ⌘Q now stops chatd too.
+- **Sounds:** S1, S7 to S10, S12. The in-call cues are mixed in mediad; S1 governs the cues only
+  until notifications post sounds.
+- **Appearance:** A2 (five stops, the ⌘+ state), A3, A4.
+- **Messages:** M1 to M4.
+- **Privacy:** P1 and P2 per account, P3 (pictures, stickers and link-preview images in
+  messages; avatars and custom emoji still load), P4 with its count.
+- **Audio & video:** V1 to V6. The device menus list devices by running `mediad --devices`,
+  which opens nothing and exits; the shell links no audio code.
+- **Storage:** D1 to D3. **About:** B1 to B3.
+- **Defects fixed:** the stale call device (a pick in the call's menu ends with the call); Discord
+  typing now follows P1, off by default; Teams receipts follow P2; ⌘Q stops chatd; text size has
+  five lit stops; About names Signal.
+- **Sounds:** the seven bundled files are rendered and committed, checked against a manifest on
+  macOS. They are not copied into the bundle until notifications post them.
+
+Not built yet, and so absent from the window: G1 (needs a login item that starts chatd alone, in
+the signed bundle), the whole Notifications section with N1 to N13, S2 to S6 and S11 (step 6: the
+notification spike), A1 (step 7: light tokens and contrast), the Accounts row menu that opens them,
+and VPIO with `OPUS_APPLICATION_VOIP` (V-notes). Search answers "notifications", "theme",
+"login" and the Later terms with a line saying so.
 
 ### v1, build now
 
