@@ -11,8 +11,9 @@
   Cross-Origin-Opener-Policy: same-origin
   Cross-Origin-Resource-Policy: same-origin
 
+# Screenshots are renamed when they change (inbox-2.webp, ...), so a name never changes content.
 /shots/*
-  Cache-Control: public, max-age=86400
+  Cache-Control: public, max-age=31536000, immutable
 
 # The pages and their stylesheet change together; a stale stylesheet under a new page breaks it.
 /style.css
