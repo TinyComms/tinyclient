@@ -1,0 +1,11 @@
+# Downloads are the files GitHub Actions built and attached to the newest release. Each release
+# also carries these names without the version (.github/workflows/release.yml), so the links
+# never change. 302: the target moves with every release.
+/download/macos      https://github.com/itz4blitz/tinyclient/releases/latest/download/tinyclient-macos.zip              302
+/download/linux      https://github.com/itz4blitz/tinyclient/releases/latest/download/tinyclient-linux-x86_64.tar.gz   302
+/download/windows    https://github.com/itz4blitz/tinyclient/releases/latest/download/tinyclient-windows-x86_64.zip   302
+/download/checksums  https://github.com/itz4blitz/tinyclient/releases/latest/download/SHA256SUMS                     302
+/download            /docs/                                                                                          302
+/releases            https://github.com/itz4blitz/tinyclient/releases                                                302
+/source              https://github.com/itz4blitz/tinyclient                                                         302
+/github              https://github.com/itz4blitz/tinyclient                                                         302

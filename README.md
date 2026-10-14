@@ -10,7 +10,7 @@
 [![Latest release](https://img.shields.io/github/v/release/itz4blitz/tinyclient)](https://github.com/itz4blitz/tinyclient/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-[Website](https://itz4blitz.github.io/tinyclient/) ·
+[Website](https://tinyclient.io) ·
 [Releases](https://github.com/itz4blitz/tinyclient/releases) ·
 [Architecture](docs/architecture.md) ·
 [Contributing](CONTRIBUTING.md) ·
@@ -25,8 +25,10 @@ Telegram, Microsoft Teams and Signal and shows them in one window with one desig
 entirely on your machine: it talks to each network directly, there is no tinyclient server,
 and nothing is sent anywhere else. It is built for macOS, Linux and Windows.
 
-It is early. Read [Status](#status) and [Read this before you sign in](#read-this-before-you-sign-in)
-before you point it at an account you care about.
+tinyclient is early. We are building a community around one goal: a chat client that is a
+pleasure to use and does everything the official apps do, on every network. Read
+[Read this before you sign in](#read-this-before-you-sign-in) before you point it at an account
+you care about, and [come help](#contributing).
 
 ## Why
 
@@ -63,25 +65,24 @@ Sizes of a macOS arm64 release build of this tree, 2026-10-14:
 
 ## Status
 
-What the code does today, per network. Every row is covered by tests that run through chatd's
-socket against local fakes of the network (`crates/chatd/tests/`). Real-account use is less even,
-and the last column says so.
+What the code does today, per network. The goal is full parity with each official app; every gap
+below is a place to help.
 
-| Network | Sign-in | Reading | Writing | Calls | Used on a real account |
-| --- | --- | --- | --- | --- | --- |
-| **Discord** | Discord's web sign-in page | Servers, channels, threads, DMs, friends with presence, avatars, images, files, link cards, reactions, replies, pins, profiles | Text, replies, threads, files, reactions, edit, delete, friend requests, own status, mute, leave | Voice in DMs and voice channels, with Discord's end-to-end encryption (DAVE). Stage channels are not joined. | Reading: yes. Voice: never joined a real call yet. |
-| **Slack** | Slack's web sign-in page; every workspace of one sign-in | Sections, channels, threads, DMs, avatars, files, reactions, pins | Text, replies, files, reactions, edit, delete, own status, mute | Huddles open in Slack | Yes |
-| **Teams** | Microsoft's sign-in page. Work and school accounts only. | Teams, channels, chats, reply chains as threads, presence | Text, files (through OneDrive), reactions, edit, delete, mute | Calls and meetings open in Teams | Not yet |
-| **Telegram** | QR code from your phone, or phone number and code; 2FA password | Chats, folders, topics, photos, pins | Text, files, reactions, edit, delete, mute, leave | Calls open in Telegram | Not yet |
-| **Signal** | Linked as a device: scan a QR code from your phone | Direct and group chats, replies, mentions, reactions, edits, deletes. Photos and files appear as a labelled line, not shown. Nothing from before the link. | Text, replies, reactions, edit and delete your own | Not built | Not yet |
+| Network | Sign-in | Reading | Writing | Calls |
+| --- | --- | --- | --- | --- |
+| **Discord** | Discord's web sign-in page | Servers, channels, threads, DMs, friends with presence, avatars, images, files, link cards, reactions, replies, pins, profiles | Text, replies, threads, files, reactions, edit, delete, friend requests, own status, mute, leave | Voice in DMs and voice channels, with Discord's end-to-end encryption (DAVE). Stage channels are not joined. |
+| **Slack** | Slack's web sign-in page; every workspace of one sign-in | Sections, channels, threads, DMs, avatars, files, reactions, pins | Text, replies, files, reactions, edit, delete, own status, mute | Huddles open in Slack |
+| **Teams** | Microsoft's sign-in page. Work and school accounts only. | Teams, channels, chats, reply chains as threads, presence | Text, files (through OneDrive), reactions, edit, delete, mute | Calls and meetings open in Teams |
+| **Telegram** | QR code from your phone, or phone number and code; 2FA password | Chats, folders, topics, photos, pins | Text, files, reactions, edit, delete, mute, leave | Calls open in Telegram |
+| **Signal** | Linked as a device: scan a QR code from your phone | Direct and group chats, replies, mentions, reactions, edits, deletes. Photos and files appear as a labelled line, not shown. Nothing from before the link. | Text, replies, reactions, edit and delete your own | Not built |
 
 Not built yet: message search (the switcher finds conversations by title in the local cache),
 notifications and a dock badge, video and screen share, voice messages, Signal attachments and
 safety numbers, Teams personal accounts. Each is a place to help; see [Contributing](#contributing).
 
 **Platforms.** CI builds and tests all three on every push (`.github/workflows/ci.yml`).
-Development and daily use happen on macOS; the Linux and Windows builds have had far less
-hands-on use.
+Most development happens on macOS today, so Linux and Windows users who report and fix
+what they find are especially welcome.
 
 **Terminal.** `tinyclient --text` (or any build without the `gui` feature) prints account status
 and the inbox as lines of text. An interactive terminal UI is not built; the socket protocol is
@@ -89,15 +90,16 @@ all one needs to write one.
 
 ## Install
 
-Download the archive for your system from the
-[latest release](https://github.com/itz4blitz/tinyclient/releases/latest). Each release is
-built by `.github/workflows/release.yml` from a `v*` tag.
+Download from [tinyclient.io](https://tinyclient.io), or straight from the
+[latest release](https://github.com/itz4blitz/tinyclient/releases/latest). The site's links go to
+the same GitHub release files. Each release is built in the open by
+`.github/workflows/release.yml` from a `v*` tag, with a `SHA256SUMS` file to check them against.
 
-| OS | Archive | Contents |
+| OS | Download | Contents |
 | --- | --- | --- |
-| macOS (Apple silicon) | `tinyclient-<version>-macos.zip` | `tinyclient.app` |
-| Linux x86_64 | `tinyclient-<version>-linux-x86_64.tar.gz` | `tinyclient`, `chatd`, `mediad`, `tinyclient-login` |
-| Windows x86_64 | `tinyclient-<version>-windows-x86_64.zip` | the same four `.exe` files |
+| macOS (Apple silicon) | [`tinyclient-macos.zip`](https://tinyclient.io/download/macos) | `tinyclient.app` |
+| Linux x86_64 | [`tinyclient-linux-x86_64.tar.gz`](https://tinyclient.io/download/linux) | `tinyclient`, `chatd`, `mediad`, `tinyclient-login` |
+| Windows x86_64 | [`tinyclient-windows-x86_64.zip`](https://tinyclient.io/download/windows) | the same four `.exe` files |
 
 Keep the four programs in one directory: each finds the others beside itself. Start `tinyclient`;
 it starts `chatd` when nothing answers on the socket.

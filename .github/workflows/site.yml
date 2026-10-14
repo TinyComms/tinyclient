@@ -1,0 +1,34 @@
+name: Site
+
+# Publishes site/ to tinyclient.io (Cloudflare Pages project "tinyclient"). The token can only
+# deploy Pages and edit the tinyclient.io zone.
+on:
+  push:
+    branches: [main]
+    paths: ["site/**", ".github/workflows/site.yml"]
+  workflow_dispatch:
+
+concurrency:
+  group: site
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The site promises it loads nothing from anywhere else; fail the deploy if a page would.
+      - name: No third-party requests
+        run: |
+          if grep -rnE '(src|srcset)="(https?:)?//|url\((["'"'"']?)(https?:)?//|@import' site --include='*.html' --include='*.css'; then
+            echo "site/ loads something from another origin" >&2
+            exit 1
+          fi
+      - uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy site --project-name tinyclient --branch main --commit-hash ${{ github.sha }}
