@@ -33,25 +33,71 @@ const CARDS: usize = 3;
 /// Reaction chips drawn before the rest are counted.
 const CHIPS: usize = 12;
 
-/// Opens a file in Quick Look. The panel is a process of its own; a thread waits for it so
-/// nothing of ours blocks.
-pub fn quick_look(path: &str) {
-    let path = path.to_owned();
+/// Where files are linked under their own names to be opened: `open/` in the support
+/// directory, emptied at each start. The cache names files by a hash with no extension, which
+/// no player, Quick Look or default app can tell the type of.
+fn opened_dir() -> std::path::PathBuf {
+    protocol::support_dir().join("open")
+}
+
+/// Empties [`opened_dir`], once a run. A player that still has a file open keeps it: the
+/// link goes, the bytes stay until it closes them.
+fn clear_opened() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| drop(std::fs::remove_dir_all(opened_dir())));
+}
+
+/// The cached file at `path` under `name`: a hard link in [`opened_dir`], so no bytes are
+/// copied; a copy where a link cannot be made; the file itself if neither works.
+fn named(path: &str, name: &str) -> std::path::PathBuf {
+    clear_opened();
+    let hash = path.bytes().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3));
+    let dir = opened_dir().join(format!("{hash:016x}"));
+    let target = dir.join(name);
+    if target.exists() {
+        return target;
+    }
+    let made = std::fs::create_dir_all(&dir)
+        .and_then(|()| std::fs::hard_link(path, &target).or_else(|_| std::fs::copy(path, &target).map(drop)));
+    match made {
+        Ok(()) => target,
+        Err(err) => {
+            eprintln!("tinyclient: could not name {name} for opening: {err}");
+            std::path::PathBuf::from(path)
+        }
+    }
+}
+
+/// Opens a cached file under its own name: in Quick Look, or in the system's app for it (a
+/// video in the system's player). Both are processes of their own; a thread waits for them so
+/// nothing of ours blocks, and makes the link off the main thread.
+pub fn open_file(path: &str, name: &str, then: Then) {
+    let (path, name) = (path.to_owned(), name.to_owned());
     std::thread::spawn(move || {
-        let mut command = Command::new("/usr/bin/qlmanage");
+        let path = named(&path, &name);
+        let mut command;
         #[cfg(target_os = "macos")]
         {
-            command.arg("-p").arg(&path);
+            command = match then {
+                Then::QuickLook => Command::new("/usr/bin/qlmanage"),
+                Then::Open => Command::new("/usr/bin/open"),
+            };
+            if then == Then::QuickLook {
+                command.arg("-p");
+            }
+            command.arg(&path);
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(not(any(target_os = "macos", windows)))]
         {
+            let _ = then;
             command = Command::new("xdg-open");
             command.arg(&path);
         }
         #[cfg(windows)]
         {
+            let _ = then;
             command = Command::new("cmd");
-            command.args(["/C", "start", "", &path]);
+            command.arg("/C").arg("start").arg("").arg(&path);
         }
         let _ = command.stdout(Stdio::null()).stderr(Stdio::null()).status();
     });
@@ -878,7 +924,8 @@ impl Pane {
         for (ix, shape) in shapes.iter().enumerate() {
             match shape {
                 MediaShape::Sticker => out.push(self.sticker(message, ix, window, cx)),
-                MediaShape::Voice => out.push(self.voice_row(message, ix, cx)),
+                MediaShape::Voice => out.push(self.player_row(message, ix, true, cx)),
+                MediaShape::Audio => out.push(self.player_row(message, ix, false, cx)),
                 MediaShape::File => out.push(self.file_row(message, ix, cx)),
                 MediaShape::Image | MediaShape::Gif | MediaShape::Video => {}
             }
@@ -1001,14 +1048,24 @@ impl Pane {
             }
         };
 
+        // A moving picture plays in the system's player once it is on disk; until then the
+        // badge says it is on its way.
+        let fetching = self.then.contains_key(&attachment.file.id);
         let tile = match shape {
-            MediaShape::Gif => tile.child(play_disc()).child(badge("GIF".to_owned()).left(px(6.))),
+            MediaShape::Gif => {
+                let words = if fetching { "Loading…" } else { "GIF" };
+                tile.child(play_disc()).child(badge(words.to_owned()).left(px(6.)))
+            }
             MediaShape::Video => {
-                let length = (attachment.duration > 0).then(|| badge(media::duration_label(attachment.duration)).right(px(6.)));
-                tile.child(play_disc()).children(length)
+                let words = match fetching {
+                    true => Some("Loading…".to_owned()),
+                    false => (attachment.duration > 0).then(|| media::duration_label(attachment.duration)),
+                };
+                tile.child(play_disc()).children(words.map(|words| badge(words).right(px(6.))))
             }
             _ => tile,
         };
+        let tile = if attachment.round { tile.rounded_full() } else { tile };
         let tile = tile.child(edge_line()).children(more.map(|more| {
             div()
                 .absolute()
@@ -1022,10 +1079,15 @@ impl Pane {
                 .text_color(gpui::white())
                 .child(format!("+{more}"))
         }));
-        let (id, file) = (message.id.clone(), attachment.file.clone());
+        let (id, attached) = (message.id.clone(), attachment.clone());
+        let tile = match shape {
+            MediaShape::Gif | MediaShape::Video => tile.tooltip(tip("Play in your video player", None)),
+            _ => tile,
+        };
         tile.on_click(cx.listener(move |this, _, window, cx| match shape {
-            // Moving pictures open in Quick Look, which can play them; nothing here decodes video.
-            MediaShape::Gif | MediaShape::Video => this.fetch_then(&file, Then::QuickLook, cx),
+            // Moving pictures play in the system's player, which decodes them with the system's
+            // own codecs; nothing here decodes video.
+            MediaShape::Gif | MediaShape::Video => this.fetch_then(&attached, Then::Open, cx),
             _ => this.open_viewer(&id, index, window, cx),
         }))
         .into_any_element()
@@ -1062,7 +1124,7 @@ impl Pane {
             (_, _, true) => (format!("{meta} · Downloaded"), theme::text_faint()),
             _ => (meta, theme::text_faint()),
         };
-        let look = file.clone();
+        let look = attachment.clone();
         let row = div()
             .id(("file", index))
             .w(px(360.))
@@ -1102,7 +1164,7 @@ impl Pane {
             );
         let row = match on_disk {
             Some(path) => {
-                let (open, reveal) = (file.clone(), path);
+                let (open, reveal) = (attachment.clone(), path);
                 row.child(
                     tool("open", Icon::External, 28.)
                         .tooltip(tip("Open", None))
@@ -1123,60 +1185,6 @@ impl Pane {
             None => row.child(tool("download", Icon::Download, 28.).tooltip(tip("Download", None))),
         };
         row.into_any_element()
-    }
-
-    fn voice_row(&mut self, message: &Rc<Message>, index: usize, cx: &mut Context<Self>) -> AnyElement {
-        let attachment = &message.attachments[index];
-        let file = attachment.file.clone();
-        let bars = media::waveform(&attachment.waveform, 40);
-        let reason = file.failed.clone();
-        // Nothing here plays audio, so the played part is always the start.
-        let time = match &reason {
-            Some(_) => "Couldn't load · Retry".to_owned(),
-            None => format!("0:00 / {}", media::duration_label(attachment.duration)),
-        };
-        div()
-            .id(("voice", index))
-            .w(px(300.))
-            .max_w_full()
-            .h(px(48.))
-            .px(px(8.))
-            .rounded(px(theme::R_FLOAT))
-            .bg(tokens::card())
-            .border_1()
-            .border_color(theme::hairline())
-            .flex()
-            .items_center()
-            .gap(px(10.))
-            .cursor_pointer()
-            .when_some(reason.clone(), |row, reason| row.tooltip(tip(format!("{reason} Click to try again."), None)))
-            // LATER: play in place. Until an audio path exists in the shell this opens Quick
-            // Look, which plays it.
-            .on_click(cx.listener(move |this, _, _, cx| this.fetch_then(&file, Then::QuickLook, cx)))
-            .child(
-                div()
-                    .size(px(32.))
-                    .flex_none()
-                    .rounded_full()
-                    .bg(theme::accent_soft())
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(icon(Icon::Play, 14., theme::accent_text())),
-            )
-            .child(
-                div().flex_1().min_w_0().h(px(20.)).flex().items_center().gap(px(2.)).overflow_hidden().children(
-                    bars.into_iter().map(|tall| div().w(px(2.)).h(px(tall)).flex_none().rounded(px(1.)).bg(theme::text_faint())),
-                ),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .type_small()
-                    .text_color(if reason.is_some() { theme::danger() } else { theme::text_soft() })
-                    .child(time),
-            )
-            .into_any_element()
     }
 
     /// What a bot or app posts instead of text: one framed card, its bar in one of our colors.
