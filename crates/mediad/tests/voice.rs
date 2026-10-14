@@ -27,6 +27,23 @@ use std::io::{ErrorKind, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
+
+fn process_rss_kb(pid: u32) -> u64 {
+    #[cfg(windows)]
+    {
+        let out = Command::new("powershell")
+            .args(["-NoProfile", "-Command", &format!("(Get-Process -Id {pid}).WorkingSet64")])
+            .output()
+            .expect("working set");
+        let bytes: u64 = String::from_utf8(out.stdout).unwrap().trim().parse().unwrap();
+        return bytes / 1024;
+    }
+    #[cfg(not(windows))]
+    {
+        let out = Command::new("ps").args(["-o", "rss=", "-p", &pid.to_string()]).output().unwrap();
+        String::from_utf8(out.stdout).unwrap().trim().parse().unwrap()
+    }
+}
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, OnceLock};
@@ -1339,8 +1356,7 @@ fn dave_two_members_exchange_end_to_end_encrypted_audio() {
 
     // The budget for mediad in a voice call is about 40 MB. This is the whole engine at work
     // (gateway, MLS group, both codecs, the mix) with no sound device open.
-    let rss = Command::new("ps").args(["-o", "rss=", "-p", &mediad.child.id().to_string()]).output().unwrap();
-    let rss_kb: u64 = String::from_utf8_lossy(&rss.stdout).trim().parse().unwrap();
+    let rss_kb = process_rss_kb(mediad.child.id());
     eprintln!("mediad RSS in an end-to-end encrypted call: {rss_kb} KB");
     assert!(rss_kb < 40 * 1024, "{rss_kb} KB");
 

@@ -11,6 +11,23 @@ use std::net::{TcpListener, TcpStream};
 use protocol::ChatStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
+
+fn process_rss_kb(pid: u32) -> u64 {
+    #[cfg(windows)]
+    {
+        let out = Command::new("powershell")
+            .args(["-NoProfile", "-Command", &format!("(Get-Process -Id {pid}).WorkingSet64")])
+            .output()
+            .expect("working set");
+        let bytes: u64 = String::from_utf8(out.stdout).unwrap().trim().parse().unwrap();
+        return bytes / 1024;
+    }
+    #[cfg(not(windows))]
+    {
+        let out = Command::new("ps").args(["-o", "rss=", "-p", &pid.to_string()]).output().unwrap();
+        String::from_utf8(out.stdout).unwrap().trim().parse().unwrap()
+    }
+}
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::sleep;
@@ -216,8 +233,7 @@ impl Daemon {
     }
 
     fn rss_kb(&self) -> u64 {
-        let out = Command::new("ps").args(["-o", "rss=", "-p", &self.child.id().to_string()]).output().unwrap();
-        String::from_utf8(out.stdout).unwrap().trim().parse().unwrap()
+        process_rss_kb(self.child.id())
     }
 
     /// Stops chatd and keeps its directory, for starting it again.

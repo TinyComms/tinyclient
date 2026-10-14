@@ -10,6 +10,23 @@ use protocol::{
 use protocol::ChatStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
+
+fn process_rss_kb(pid: u32) -> u64 {
+    #[cfg(windows)]
+    {
+        let out = Command::new("powershell")
+            .args(["-NoProfile", "-Command", &format!("(Get-Process -Id {pid}).WorkingSet64")])
+            .output()
+            .expect("working set");
+        let bytes: u64 = String::from_utf8(out.stdout).unwrap().trim().parse().unwrap();
+        return bytes / 1024;
+    }
+    #[cfg(not(windows))]
+    {
+        let out = Command::new("ps").args(["-o", "rss=", "-p", &pid.to_string()]).output().unwrap();
+        String::from_utf8(out.stdout).unwrap().trim().parse().unwrap()
+    }
+}
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Once;
 use std::thread::sleep;
@@ -153,11 +170,7 @@ impl Daemon {
     }
 
     fn rss_kb(&self) -> u64 {
-        let out = Command::new("ps")
-            .args(["-o", "rss=", "-p", &self.child.id().to_string()])
-            .output()
-            .unwrap();
-        String::from_utf8(out.stdout).unwrap().trim().parse().unwrap()
+        process_rss_kb(self.child.id())
     }
 }
 
@@ -976,7 +989,8 @@ fn people_are_answered_looked_up_and_searched_for_only_when_the_typing_pauses() 
         panic!("not a profile");
     };
     assert_eq!((profile.person.key, profile.person.name.as_str()), (ines, "Ines Marchetti"));
-    assert!(!profile.time_zone.is_empty() && profile.utc_offset.is_some());
+    // Discord says when we became friends and has no time zone for anyone.
+    assert!(profile.friends_since.is_some() && profile.time_zone.is_empty() && profile.utc_offset.is_none());
     assert!((1..=protocol::MUTUAL_SPACES).contains(&profile.mutual_spaces.len()), "{:?}", profile.mutual_spaces);
     let stranger = chatd.ask(Request::Profile { person: demo("1"), space: None });
     assert!(matches!(stranger, Response::Error { code: ErrorCode::NotFound, .. }), "{stranger:?}");
@@ -1188,5 +1202,6 @@ fn what_was_shared_in_a_conversation_is_listed_by_kind_newest_first() {
         panic!("not a profile");
     };
     assert!(profile.since.is_some() && profile.accent.is_some());
-    assert_eq!(profile.fields.first().map(|(label, _)| label.as_str()), Some("Username"));
+    // Every detail is in its typed place: nothing is left as a labelled line.
+    assert!(profile.fields.is_empty(), "{:?}", profile.fields);
 }
