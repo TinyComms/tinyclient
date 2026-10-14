@@ -260,6 +260,8 @@ pub struct Audio {
     pub want_output: Option<String>,
     pub input: String,
     pub output: String,
+    /// Which of the two are opened. A call opens both; a test opens only what it tries.
+    sides: (bool, bool),
 }
 
 fn find(host: &cpal::Host, wanted: Option<&str>, input: bool) -> Option<cpal::Device> {
@@ -356,6 +358,11 @@ impl Audio {
 
     /// Opens the microphone and speaker, or their stand-ins.
     pub fn open(want_input: Option<String>, want_output: Option<String>) -> Result<Audio, AudioError> {
+        Audio::open_sides(want_input, want_output, (true, true))
+    }
+
+    /// Opens only the microphone (`sides.0`) or only the speaker (`sides.1`), for a test.
+    pub fn open_sides(want_input: Option<String>, want_output: Option<String>, sides: (bool, bool)) -> Result<Audio, AudioError> {
         let mut audio = Audio {
             source: Source::Device(None),
             sink: Sink::Device(None),
@@ -366,6 +373,7 @@ impl Audio {
             want_output,
             input: String::new(),
             output: String::new(),
+            sides,
         };
         if let Ok(kind) = std::env::var("TINYCLIENT_MEDIAD_AUDIO") {
             audio.source = match kind.as_str() {
@@ -400,18 +408,22 @@ impl Audio {
         self.broken.store(false, Ordering::Relaxed);
         let host = cpal::default_host();
 
-        let microphone = find(&host, self.want_input.as_deref(), true).ok_or(AudioError::NoMicrophone)?;
-        let mut input = open_input(&microphone, &self.broken)?;
-        if !was_running {
-            let _ = input.stream.pause();
-            input.running = false;
+        if self.sides.0 {
+            let microphone = find(&host, self.want_input.as_deref(), true).ok_or(AudioError::NoMicrophone)?;
+            let mut input = open_input(&microphone, &self.broken)?;
+            if !was_running {
+                let _ = input.stream.pause();
+                input.running = false;
+            }
+            self.input = name(&microphone).unwrap_or_default();
+            self.source = Source::Device(Some(input));
         }
-        self.input = name(&microphone).unwrap_or_default();
-        self.source = Source::Device(Some(input));
 
-        let speaker = find(&host, self.want_output.as_deref(), false).ok_or(AudioError::NoSpeaker)?;
-        self.sink = Sink::Device(Some(open_output(&speaker, &self.broken)?));
-        self.output = name(&speaker).unwrap_or_default();
+        if self.sides.1 {
+            let speaker = find(&host, self.want_output.as_deref(), false).ok_or(AudioError::NoSpeaker)?;
+            self.sink = Sink::Device(Some(open_output(&speaker, &self.broken)?));
+            self.output = name(&speaker).unwrap_or_default();
+        }
         Ok(())
     }
 
@@ -427,8 +439,8 @@ impl Audio {
         let default_moved = |wanted: &Option<String>, current: &str, device: Option<cpal::Device>| {
             wanted.is_none() && device.as_ref().and_then(name).is_some_and(|name| name != current)
         };
-        default_moved(&self.want_input, &self.input, host.default_input_device())
-            || default_moved(&self.want_output, &self.output, host.default_output_device())
+        (self.sides.0 && default_moved(&self.want_input, &self.input, host.default_input_device()))
+            || (self.sides.1 && default_moved(&self.want_output, &self.output, host.default_output_device()))
     }
 
     /// Stops or starts the microphone itself, so a muted call shows no recording indicator.

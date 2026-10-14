@@ -47,10 +47,16 @@ use protocol::{AccountKey, Change, Link, MediaFile, Network, Watching};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 pub const CACHE_BYTES: u64 = 500 * 1024 * 1024;
+
+/// D2 in bytes.
+fn cap_of(hub: &Hub) -> u64 {
+    u64::from(hub.settings().number(protocol::settings::CACHE_MB)) * 1024 * 1024
+}
 pub const IN_FLIGHT: usize = 4;
 /// Most fetches waiting their turn. Past this the oldest request gives way: it is the one
 /// most likely to have scrolled off screen, and the shell asks again if it is still there.
@@ -180,8 +186,10 @@ struct Queue {
 struct Cache {
     hub: Arc<Hub>,
     dir: PathBuf,
-    /// Bytes on disk in all. `TINYCLIENT_MEDIA_CAP` replaces it in a scratch directory.
-    cap: u64,
+    /// Bytes on disk in all: Settings › Storage (D2), [`CACHE_BYTES`] by default.
+    /// `TINYCLIENT_MEDIA_CAP` replaces it in a scratch directory, and then the setting does not.
+    cap: AtomicU64,
+    cap_fixed: bool,
     /// `TINYCLIENT_MEDIA_ON_SCREEN`, in seconds, replaces [`ON_SCREEN`] in a scratch directory.
     on_screen: Duration,
     /// `TINYCLIENT_PICK_IDLE`, in seconds, replaces [`PICK_IDLE`] in a scratch directory.
@@ -220,9 +228,10 @@ impl Blobs {
         }
         let number = |name: &str| scratch(name).and_then(|value| value.parse::<u64>().ok());
         let cache = Arc::new(Cache {
-            hub,
+            hub: hub.clone(),
             dir,
-            cap: number("TINYCLIENT_MEDIA_CAP").unwrap_or(CACHE_BYTES),
+            cap: AtomicU64::new(number("TINYCLIENT_MEDIA_CAP").unwrap_or_else(|| cap_of(&hub))),
+            cap_fixed: number("TINYCLIENT_MEDIA_CAP").is_some(),
             on_screen: number("TINYCLIENT_MEDIA_ON_SCREEN").map_or(ON_SCREEN, Duration::from_secs),
             pick_idle: number("TINYCLIENT_PICK_IDLE").map_or(PICK_IDLE, Duration::from_secs),
             hosts: fetch::Hosts { local },
@@ -294,6 +303,50 @@ impl Blobs {
     /// Brings the cache back under its cap. Runs after a fetch lands and at start.
     pub fn evict(&self) {
         self.cache.evict();
+    }
+
+    /// The cap setting changed: takes it up, and brings the cache under it off this thread.
+    pub fn cap_changed(&self) {
+        if self.cache.cap_fixed {
+            return;
+        }
+        self.cache.cap.store(cap_of(&self.cache.hub), Ordering::Relaxed);
+        let cache = self.cache.clone();
+        let spawned = std::thread::Builder::new().name("media-evict".into()).stack_size(256 * 1024).spawn(move || cache.evict());
+        if let Err(err) = spawned {
+            eprintln!("chatd: media: {err}");
+        }
+    }
+
+    /// Clear (D3): every cached file goes, with whatever is on its way. The store's rows are
+    /// `Store::clear_cache`'s, which runs after.
+    pub fn clear(&self) {
+        let _one = crate::hub::lock(&self.cache.evicting);
+        {
+            let mut queue = crate::hub::lock(&self.cache.queue);
+            for epoch in queue.epochs.values_mut() {
+                *epoch += 1;
+            }
+            let queued = queue.waiting.iter().chain(queue.parked.iter()).map(|job| job.file.0.clone());
+            let accounts: Vec<AccountKey> = queued.chain(queue.fetching.iter().map(|file| file.0.clone())).collect();
+            for account in accounts {
+                *queue.epochs.entry(account).or_default() += 1;
+            }
+            queue.waiting.clear();
+            queue.parked.clear();
+            queue.asked.clear();
+            queue.landed.clear();
+        }
+        if let Ok(networks) = std::fs::read_dir(&self.cache.dir) {
+            for network in networks.flatten() {
+                let _ = std::fs::remove_dir_all(network.path());
+            }
+        }
+    }
+
+    /// Bytes of cached files on disk, as the store counts them.
+    pub fn bytes(&self) -> u64 {
+        self.cache.hub.store().media_bytes().unwrap_or(0)
     }
 
     /// Sign-out: every file of the account goes, and whatever is on its way is dropped. The
@@ -583,7 +636,8 @@ impl Cache {
                     _ => return,
                 }
             };
-            if total <= self.cap {
+            let cap = self.cap.load(Ordering::Relaxed);
+            if total <= cap {
                 return;
             }
             let on_screen: HashSet<FileKey> = {
@@ -594,7 +648,7 @@ impl Cache {
             let listed = oldest.len();
             let mut freed = false;
             for file in oldest {
-                if total <= self.cap {
+                if total <= cap {
                     return;
                 }
                 let key = (file.account, file.id);
@@ -732,7 +786,7 @@ impl Cache {
                 url: &url,
                 adapter: job.adapter.as_ref(),
                 part: &part,
-                cap: fetch::cap(&file, self.cap),
+                cap: fetch::cap(&file, self.cap.load(Ordering::Relaxed)),
                 also: &|| self.waiting_with(job),
             };
             let (bytes, from) = match fetch::download(&self.hosts, agent, &want, buffer) {

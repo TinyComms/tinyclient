@@ -4,6 +4,7 @@ use crate::hub::{lock, now, Hub, KEYCHAIN_PROMPT};
 use crate::media::CallError;
 use crate::session;
 use crate::store::Store;
+use protocol::settings;
 use protocol::{
     clip, read_frame_bytes, support_dir, write_frame, CatalogKind, ConversationInfo, MediaFile, MediaKind, Outgoing, SharedKind, SpaceInfo, AccountKey, AccountStatus, CallSupport, Capabilities,
     Change, ChatListener, ChatStream, Conversation, ConversationKind, ErrorCode, InboxCounts, Key,
@@ -180,15 +181,20 @@ impl Chat {
         lock(&chat.adapters).extend(crate::demo::attach(&chat.hub));
         // Whatever was on its way when chatd last stopped did not go.
         let _ = chat.hub.store().fail_pending(i64::MAX, "tinyclient was restarted before this was sent.");
-        // Retention runs behind the socket, at start and once a day. A sleeping thread costs
-        // nothing in between.
+        // Retention runs behind the socket, at start, once a day, and when its setting changes.
+        // A sleeping thread costs nothing in between.
         let hub = chat.hub.clone();
         std::thread::spawn(move || loop {
-            match hub.store().prune(now()) {
+            let days = hub.settings().number(settings::KEEP_DAYS);
+            match hub.store().prune(now(), days) {
                 Ok(0) | Err(_) => {}
-                Ok(gone) => eprintln!("chatd: pruned {gone} old messages"),
+                Ok(gone) => {
+                    eprintln!("chatd: pruned {gone} old messages");
+                    // What is on screen may be gone.
+                    hub.reset();
+                }
             }
-            std::thread::sleep(Duration::from_secs(86_400));
+            hub.prune_due(Duration::from_secs(86_400));
         });
         chat
     }
@@ -297,7 +303,82 @@ impl Chat {
         if let Err(err) = self.hub.store().forget(account) {
             eprintln!("chatd: {}: {err}", account.network.label());
         }
+        self.hub.reload_settings();
         self.hub.forget_live(account);
+    }
+
+    /// Stores a setting and has whatever reads it take it up now.
+    fn set(&self, scope: String, key: String, value: Option<String>) -> Response {
+        let allowed = match &value {
+            Some(value) => settings::valid(&scope, &key, value),
+            None => settings::known(&scope, &key),
+        };
+        if !allowed {
+            return error(ErrorCode::Refused, format!("{key} cannot be {value:?} here"));
+        }
+        if let Err(err) = self.hub.set_setting(&scope, &key, value) {
+            return internal(err);
+        }
+        match key.as_str() {
+            settings::KEEP_DAYS => self.hub.prune_soon(),
+            settings::CACHE_MB => self.blobs.cap_changed(),
+            settings::SOUNDS
+            | settings::CUE_JOINS
+            | settings::CUE_MINE
+            | settings::CUE_CONNECTION
+            | settings::CUE_VOLUME
+            | settings::VOICE_VOLUME
+            | settings::SENSITIVITY => self.hub.calls.retune(&self.hub),
+            _ => {}
+        }
+        Response::Ok
+    }
+
+    /// Reset all (B3). The cache cap and retention go back to their defaults with the rest.
+    fn reset_settings(&self) -> Response {
+        if let Err(err) = self.hub.reset_settings() {
+            return internal(err);
+        }
+        self.blobs.cap_changed();
+        self.hub.prune_soon();
+        self.hub.calls.retune(&self.hub);
+        Response::Ok
+    }
+
+    /// Bytes on this Mac: the database with its journal, and the cached files.
+    fn storage(&self) -> Response {
+        let dir = support_dir();
+        let size = |name: &str| std::fs::metadata(dir.join(name)).map_or(0, |meta| meta.len());
+        let messages = size("chat.sqlite") + size("chat.sqlite-wal") + size("chat.sqlite-shm");
+        Response::Storage { messages, files: self.blobs.bytes() }
+    }
+
+    /// Clear (D3): the files, then the messages, then every window reads what is left.
+    fn clear(&self) -> Response {
+        self.blobs.clear();
+        if let Err(err) = self.hub.store().clear_cache() {
+            return internal(err);
+        }
+        self.hub.reset();
+        Response::Ok
+    }
+
+    /// chatd stops: the call is left on the network first, and the answer goes out before the
+    /// process does.
+    fn shutdown(&self) -> Response {
+        if let Some(conversation) = self.hub.calls.end(&self.hub) {
+            self.command(&conversation.account(), Command::CallLeave(conversation.id));
+        }
+        let spawned = std::thread::Builder::new().name("shutdown".into()).stack_size(64 * 1024).spawn(|| {
+            // Time for this answer to be written and the adapter to say goodbye.
+            std::thread::sleep(Duration::from_millis(300));
+            eprintln!("chatd: asked to stop, exiting");
+            std::process::exit(0);
+        });
+        if spawned.is_err() {
+            std::process::exit(0);
+        }
+        Response::Ok
     }
 
     fn command(&self, account: &AccountKey, command: Command) {
@@ -541,7 +622,12 @@ impl Chat {
         match self.hub.store().mark_read(&conversation, &message_id) {
             Ok(true) => {
                 let conversation_id = conversation.id.clone();
-                self.command(&conversation.account(), Command::MarkRead { conversation_id, message_id });
+                // P2: off, the chat is read here and the network is not told, which is what
+                // others would see as a receipt.
+                let account = conversation.account();
+                if self.hub.settings().receipts(&account) {
+                    self.command(&account, Command::MarkRead { conversation_id, message_id });
+                }
                 self.hub.changed(Change::Conversation { conversation });
                 self.hub.changed(Change::Status);
                 Response::Ok
@@ -1173,8 +1259,17 @@ impl Chat {
         if let Err(err) = self.hub.calls.start(&self.hub, conversation.clone()) {
             return call_error(err);
         }
-        self.command(&conversation.account(), Command::CallJoin(conversation.id));
+        self.join(conversation);
         self.status()
+    }
+
+    /// Has the adapter join, muted when the user joins muted (V4).
+    fn join(&self, conversation: Key) {
+        let account = conversation.account();
+        self.command(&account, Command::CallJoin(conversation.id));
+        if self.hub.settings().on(settings::JOIN_MUTED) {
+            self.command(&account, Command::CallAudio { muted: true, deafened: false });
+        }
     }
 
     pub fn handle(&self, request: Request) -> Response {
@@ -1409,7 +1504,8 @@ impl Chat {
             }
             Request::Typing { conversation } => {
                 let account = conversation.account();
-                if self.hub.link(&account) == Link::Connected {
+                // P1: off, the network never hears it.
+                if self.hub.link(&account) == Link::Connected && self.hub.settings().typing(&account) {
                     self.command(&account, Command::Typing(conversation.id));
                 }
                 Response::Ok
@@ -1465,7 +1561,7 @@ impl Chat {
             Request::CallStart { conversation } => self.call_start(conversation),
             Request::CallAccept => match self.hub.calls.accept(&self.hub) {
                 Ok(conversation) => {
-                    self.command(&conversation.account(), Command::CallJoin(conversation.id));
+                    self.join(conversation);
                     self.status()
                 }
                 Err(err) => call_error(err),
@@ -1506,6 +1602,28 @@ impl Chat {
                     Err(err) => call_error(err),
                 }
             }
+
+            Request::Settings => match self.hub.store().settings() {
+                Ok(values) => Response::Settings { values },
+                Err(err) => internal(err),
+            },
+            Request::Set { scope, key, value } => self.set(scope, key, value),
+            Request::ResetSettings => self.reset_settings(),
+            Request::Shutdown => self.shutdown(),
+            Request::Storage => self.storage(),
+            Request::Clear => self.clear(),
+            Request::Prunable { days } => match self.hub.store().prunable(now(), days) {
+                Ok((messages, bytes)) => Response::Prunable { messages, bytes },
+                Err(err) => internal(err),
+            },
+            Request::TestMicrophone { on } => match self.hub.calls.test_microphone(&self.hub, on) {
+                Ok(()) => Response::Ok,
+                Err(err) => call_error(err),
+            },
+            Request::TestSound => match self.hub.calls.test_sound(&self.hub) {
+                Ok(()) => Response::Ok,
+                Err(err) => call_error(err),
+            },
         }
     }
 }

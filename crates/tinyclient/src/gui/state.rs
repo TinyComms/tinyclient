@@ -168,7 +168,9 @@ impl Dirty {
             | Change::Searched { .. }
             | Change::SignIn { .. }
             | Change::Call { .. }
-            | Change::Upload { .. } => {}
+            | Change::Upload { .. }
+            | Change::Settings
+            | Change::Meter { .. } => {}
             Change::Folders { .. } => self.spaces = true,
         }
     }

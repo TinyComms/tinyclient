@@ -6,6 +6,7 @@
 //! frames chatd sends.
 
 pub mod audio;
+pub mod cue;
 pub mod dave;
 pub mod gateway;
 pub mod jitter;
@@ -13,6 +14,7 @@ pub mod media;
 pub mod opus;
 pub mod out;
 pub mod permission;
+pub mod probe;
 pub mod rtp;
 pub mod session;
 

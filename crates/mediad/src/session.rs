@@ -14,7 +14,7 @@ use crate::media::{self, FromMedia, MICROPHONE_DENIED};
 use crate::permission::{microphone, Microphone};
 use crate::rtp::{self, Cipher, Sender};
 use crate::out;
-use protocol::{CallFailure, MediaResponse, VoiceJoin};
+use protocol::{CallFailure, Cue, MediaResponse, Tuning, VoiceJoin};
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap};
 use std::net::UdpSocket;
@@ -72,6 +72,10 @@ pub struct Controls {
     /// Set to have the devices listed again now, and what wakes the thread that lists them.
     relist: Mutex<bool>,
     wake: Condvar,
+    /// Gains, the speech gate and which cues play.
+    tuning: Mutex<Tuning>,
+    /// The cue to play next, taken by whatever plays (the media loop, or a test).
+    cue: Mutex<Option<Cue>>,
 }
 
 impl Controls {
@@ -102,6 +106,41 @@ impl Controls {
         std::mem::take(&mut *relist)
     }
 
+    pub fn tune(&self, tuning: Tuning) {
+        *self.tuning.lock().unwrap() = tuning;
+    }
+
+    pub fn tuning(&self) -> Tuning {
+        *self.tuning.lock().unwrap()
+    }
+
+    /// Asks for a cue, if the user wants that kind heard. Someone joining or leaving is not
+    /// heard while deafened; the test sound always is. A new cue replaces one not yet begun.
+    pub fn cue(&self, cue: Cue) {
+        let tuning = self.tuning();
+        let wanted = match cue {
+            Cue::Test => true,
+            Cue::Joined | Cue::Left => tuning.joins && !self.deafened.load(Ordering::Relaxed),
+            Cue::Muted | Cue::Unmuted | Cue::Deafened | Cue::Undeafened => tuning.mine,
+            Cue::Lost | Cue::Back => tuning.connection,
+        };
+        if wanted {
+            *self.cue.lock().unwrap() = Some(cue);
+        }
+    }
+
+    pub fn take_cue(&self) -> Option<Cue> {
+        self.cue.lock().unwrap().take()
+    }
+
+    /// Mute and deafen as asked, with the cue the change calls for (S8).
+    pub fn set_audio(&self, muted: bool, deafened: bool) {
+        let was = (self.muted.swap(muted, Ordering::Relaxed), self.deafened.swap(deafened, Ordering::Relaxed));
+        if let Some(cue) = mine(was, (muted, deafened)) {
+            self.cue(cue);
+        }
+    }
+
     /// The call moved to another voice server or session: the voice thread takes it from here.
     pub fn rejoin(&self, join: VoiceJoin) {
         *self.moved.lock().unwrap() = Some(join);
@@ -109,6 +148,21 @@ impl Controls {
 
     fn moving(&self) -> bool {
         self.moved.lock().unwrap().is_some()
+    }
+}
+
+/// The cue for going from `was` to `now`, each (muted, deafened). Deafening mutes too, and is
+/// the one heard.
+pub fn mine(was: (bool, bool), now: (bool, bool)) -> Option<Cue> {
+    match (was.1, now.1) {
+        (false, true) => return Some(Cue::Deafened),
+        (true, false) => return Some(Cue::Undeafened),
+        _ => {}
+    }
+    match (was.0, now.0) {
+        (false, true) => Some(Cue::Muted),
+        (true, false) => Some(Cue::Unmuted),
+        _ => None,
     }
 }
 
@@ -382,6 +436,7 @@ impl Call {
             gateway::HEARTBEAT_ACK => self.unacked = 0,
             gateway::RESUMED => {
                 self.deadline = None;
+                self.controls.cue(Cue::Back);
                 out::send(&MediaResponse::Connected { ssrc: self.ssrc, dave_version: self.dave_version });
             }
             gateway::SPEAKING => self.source(&d["user_id"], &d["ssrc"]),
@@ -630,6 +685,10 @@ pub fn run(join: VoiceJoin, controls: Arc<Controls>) {
             resumes += 1;
             eprintln!("mediad: resume {resumes} of {RESUMES}");
             out::send(&MediaResponse::Interrupted);
+            // Heard once per drop, not once per try.
+            if resumes == 1 {
+                call.controls.cue(Cue::Lost);
+            }
             Duration::from_secs(u64::from(resumes))
         } else {
             if attempt == ATTEMPTS {
@@ -677,5 +736,39 @@ pub fn run(join: VoiceJoin, controls: Arc<Controls>) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_change_of_my_own_audio_has_its_cue_and_deafening_outranks_muting() {
+        assert_eq!(mine((false, false), (true, false)), Some(Cue::Muted));
+        assert_eq!(mine((true, false), (false, false)), Some(Cue::Unmuted));
+        assert_eq!(mine((false, false), (true, true)), Some(Cue::Deafened));
+        assert_eq!(mine((true, true), (false, false)), Some(Cue::Undeafened));
+        assert_eq!(mine((true, true), (true, false)), Some(Cue::Undeafened));
+        assert_eq!(mine((true, false), (true, false)), None);
+    }
+
+    #[test]
+    fn a_cue_is_heard_only_when_its_kind_is_on_and_joins_not_while_deafened() {
+        let controls = Controls::default();
+        controls.cue(Cue::Joined);
+        assert_eq!(controls.take_cue(), Some(Cue::Joined));
+        controls.tune(Tuning { joins: false, mine: false, connection: false, ..Tuning::default() });
+        for cue in [Cue::Joined, Cue::Muted, Cue::Lost] {
+            controls.cue(cue);
+            assert_eq!(controls.take_cue(), None, "{cue:?}");
+        }
+        controls.cue(Cue::Test);
+        assert_eq!(controls.take_cue(), Some(Cue::Test), "the test sound always plays");
+        controls.tune(Tuning::default());
+        controls.set_audio(true, true);
+        assert_eq!(controls.take_cue(), Some(Cue::Deafened));
+        controls.cue(Cue::Left);
+        assert_eq!(controls.take_cue(), None, "deafened, nobody is heard leaving");
     }
 }
