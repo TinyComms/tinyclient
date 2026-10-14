@@ -107,13 +107,18 @@ pub(super) fn own_offset(now: i64) -> i32 {
 fn utc_offset_seconds(seconds: libc::time_t) -> i32 {
     let mut local: libc::tm = unsafe { std::mem::zeroed() };
     let mut utc: libc::tm = unsafe { std::mem::zeroed() };
+    // The libc crate does not expose these on Windows. They are in the CRT.
+    extern "C" {
+        fn mktime(tm: *mut libc::tm) -> libc::time_t;
+        fn _mkgmtime(tm: *mut libc::tm) -> libc::time_t;
+    }
     // SAFETY: `gmtime_s`, `localtime_s`, `mktime`, and `_mkgmtime` fill or read the buffers we own.
     unsafe {
         libc::localtime_s(&mut local, &seconds);
         libc::gmtime_s(&mut utc, &seconds);
         local.tm_isdst = -1;
-        let local_sec = libc::mktime(&mut local);
-        let utc_sec = libc::_mkgmtime(&mut utc);
+        let local_sec = mktime(&mut local);
+        let utc_sec = _mkgmtime(&mut utc);
         (local_sec - utc_sec) as i32
     }
 }
