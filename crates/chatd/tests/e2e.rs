@@ -1217,7 +1217,7 @@ fn what_was_shared_in_a_conversation_is_listed_by_kind_newest_first() {
     let (files, _) = shared(protocol::SharedKind::Files, None, 50);
     let mut names: Vec<&str> = files.iter().map(|item| item.attachment.as_ref().unwrap().name.as_str()).collect();
     names.sort();
-    assert_eq!(names, ["Trail camera wiring.pdf", "camera-logs.zip", "voice-message.wav"]);
+    assert_eq!(names, ["Trail camera wiring.pdf", "camera-logs.zip", "dawn-chorus-lynx-hollow.m4a", "voice-message.ogg"]);
     let (links, _) = shared(protocol::SharedKind::Links, None, 50);
     let lepraria = links.iter().find(|item| item.url == "https://example.org/wiki/Lepraria").expect("the previewed link");
     assert_eq!((lepraria.title.as_str(), lepraria.sender.as_str()), ("Lepraria", "Wren Halloran"));

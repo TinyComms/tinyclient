@@ -18,6 +18,9 @@ pub fn mime(name: &str) -> &'static str {
     match name.rsplit('.').next() {
         Some("jpg") => "image/jpeg",
         Some("webp") => "image/webp",
+        Some("opus") => "audio/ogg",
+        Some("m4a") => "audio/mp4",
+        Some("mp4") => "video/mp4",
         _ => "image/png",
     }
 }
