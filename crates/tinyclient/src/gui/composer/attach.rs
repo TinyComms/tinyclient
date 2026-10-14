@@ -347,11 +347,8 @@ pub fn sweep(dir: &Path, keep: Duration, now: SystemTime) -> usize {
 
 fn local_clock(now: SystemTime) -> (u32, u32, u32) {
     let seconds = now.duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs()) as libc::time_t;
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    // SAFETY: `localtime_r` writes a full `tm` into the buffer we own.
-    unsafe {
-        libc::localtime_r(&seconds, &mut tm);
-    }
+    // The same reading as everywhere else in the window: `localtime_r`, `localtime_s` on Windows.
+    let tm = super::super::time::broken_down_local(seconds);
     (tm.tm_hour as u32, tm.tm_min as u32, tm.tm_sec as u32)
 }
 
