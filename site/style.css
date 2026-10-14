@@ -1185,6 +1185,7 @@ caption {
 .car-lights i:nth-child(3) { background: #28c840; }
 .car-track {
   display: flex;
+  width: 100%;
   overflow-x: auto;
   overscroll-behavior-x: contain;
   scroll-snap-type: x mandatory;
@@ -1193,8 +1194,9 @@ caption {
 .car-track:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; border-radius: var(--r-modal); }
 .carousel.js .car-track { scrollbar-width: none; }
 .carousel.js .car-track::-webkit-scrollbar { display: none; }
-.car-slide { flex: 0 0 100%; margin: 0; scroll-snap-align: start; scroll-snap-stop: always; }
-.car-slide img { display: block; width: 100%; height: auto; aspect-ratio: 16 / 10; }
+.car-slide { flex: 0 0 100%; width: 100%; min-width: 0; margin: 0; scroll-snap-align: start; scroll-snap-stop: always; }
+/* min-width and max-width: Safari otherwise sizes a slide to the picture's own 2000 px and crops it. */
+.car-slide img { display: block; width: 100%; max-width: 100%; min-width: 0; height: auto; aspect-ratio: 16 / 10; object-fit: contain; }
 .car-cap { padding: 10px 16px; font-size: 13px; color: #a8abb3; background: #121315; }
 .carousel.js .car-cap { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; padding: 0; }
 
