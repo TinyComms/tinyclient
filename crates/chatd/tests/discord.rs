@@ -2429,11 +2429,12 @@ fn the_home_follows_discords_own_folders_mutes_opt_in_requests_threads_and_plan(
     assert!(can.gifs && can.stickers && can.spoiler && can.silent && can.suppress_embeds && can.reply_ping && !can.schedule);
 
     // Friends: in voice (from the voice states) and playing (from presence). The voice channel
-    // with a friend in it is told although no server is on screen.
-    let around = match world.ask(Request::Around { network: Some(Network::Discord) }) {
-        Response::Around { in_call, online, .. } => (in_call, online),
+    // with a friend in it is told although no server is on screen. Both come in
+    // READY_SUPPLEMENTAL, which may still be on its way when the account shows connected.
+    let around = wait("Dev to be in a call", || match world.ask(Request::Around { network: Some(Network::Discord) }) {
+        Response::Around { in_call, online, .. } => in_call.iter().any(|person| person.key.id == "2002").then_some((in_call, online)),
         other => panic!("{other:?}"),
-    };
+    });
     let dev = around.0.iter().find(|person| person.key.id == "2002").expect("Dev is in a call");
     let voice = dev.activity.as_deref().unwrap();
     assert_eq!((voice.kind, voice.name.as_str(), voice.place.as_str()), (protocol::ActivityKind::InVoice, "Lounge", "Rustaceans"));
