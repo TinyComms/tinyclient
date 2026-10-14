@@ -1001,8 +1001,17 @@ fn a_certificate_the_system_does_not_trust_is_refused_unless_in_a_scratch_direct
         mediad.join(&fake.endpoint(), NO_DAVE);
         for _ in 0..3 {
             let stream = fake.accept_tcp(PATIENCE).expect("a try");
-            let refused = tls().acceptor.accept(stream);
-            assert!(refused.is_err(), "mediad accepted a certificate nobody vouches for");
+            match tls().acceptor.accept(stream) {
+                // OpenSSL and Secure Transport check the certificate inside the handshake.
+                Err(_) => {}
+                // SChannel finishes the handshake and checks it after: then mediad must hang up
+                // without a word, so no websocket upgrade and no identify with its token.
+                Ok(mut accepted) => {
+                    let mut said = Vec::new();
+                    let _ = accepted.read_to_end(&mut said);
+                    assert!(said.is_empty(), "mediad accepted a certificate nobody vouches for: {}", String::from_utf8_lossy(&said));
+                }
+            }
         }
         let (reason, detail) = mediad.failed();
         assert_eq!(reason, CallFailure::Lost);
