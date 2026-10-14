@@ -204,38 +204,40 @@ impl Hub {
 
     // Settings.
 
+    /// The settings in force. Whoever holds both locks takes the store's first, then this one;
+    /// never the store while holding this.
     pub fn settings(&self) -> MutexGuard<'_, Values> {
         lock(&self.settings)
     }
 
     /// Stores one setting and keeps the copy here in step. Tells every window.
     pub fn set_setting(&self, scope: &str, key: &str, value: Option<String>) -> rusqlite::Result<()> {
-        // The store first: the copy here never holds what was not saved.
-        let mut settings = lock(&self.settings);
-        self.store().set_setting(scope, key, value.as_deref())?;
-        settings.set(scope, key, value);
-        drop(settings);
+        // The store first, held until the copy matches it: the copy never holds what was not
+        // saved, and two writers cannot leave the two in a different order.
+        let mut store = self.store();
+        store.set_setting(scope, key, value.as_deref())?;
+        lock(&self.settings).set(scope, key, value);
+        drop(store);
         self.changed(Change::Settings);
         Ok(())
     }
 
     /// Reads the settings again after the store removed rows itself (sign-out).
     pub fn reload_settings(&self) {
-        let mut settings = lock(&self.settings);
-        if let Ok(stored) = self.store().settings() {
-            *settings = Values::new(stored);
+        let store = self.store();
+        if let Ok(stored) = store.settings() {
+            *lock(&self.settings) = Values::new(stored);
         }
-        drop(settings);
+        drop(store);
         self.changed(Change::Settings);
     }
 
     /// Reset all: every row but the version goes.
     pub fn reset_settings(&self) -> rusqlite::Result<()> {
-        let mut settings = lock(&self.settings);
         let mut store = self.store();
         store.reset_settings()?;
-        *settings = Values::new(store.settings()?);
-        drop((store, settings));
+        *lock(&self.settings) = Values::new(store.settings()?);
+        drop(store);
         self.changed(Change::Settings);
         Ok(())
     }

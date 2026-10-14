@@ -1076,6 +1076,16 @@ fn sending_editing_reacting_deleting_and_reading_go_to_teams() {
     assert_eq!((parts.len(), parts[0], parts[2]), (3, "1760001000000", "1760001000000"));
     assert!(parts[1].parse::<u64>().unwrap() > 1_700_000_000_000);
 
+    // P2 off: the chat is read here and Teams is not told.
+    let scope = protocol::settings::account_scope(&ana.account());
+    let receipts = |value: Option<&str>| Request::Set { scope: scope.clone(), key: protocol::settings::RECEIPTS.to_owned(), value: value.map(str::to_owned) };
+    assert_eq!(world.ask(receipts(Some("off"))), Response::Ok);
+    let told = world.fake.calls("PUT", &path("/properties")).len();
+    assert_eq!(world.ask(Request::MarkRead { conversation: ana.clone(), message_id: "1760000500500".to_owned() }), Response::Ok);
+    sleep(Duration::from_millis(400));
+    assert_eq!(world.fake.calls("PUT", &path("/properties")).len(), told, "Teams heard a read with receipts off");
+    assert_eq!(world.ask(receipts(None)), Response::Ok);
+
     // Typing: one signal however often the draft changes.
     for _ in 0..3 {
         assert_eq!(world.ask(Request::Typing { conversation: ana.clone() }), Response::Ok);

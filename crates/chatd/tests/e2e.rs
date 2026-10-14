@@ -1292,6 +1292,40 @@ fn settings_are_kept_refused_when_unknown_and_acted_on_at_once() {
 }
 
 #[test]
+fn reading_while_settings_change_never_stalls_chatd() {
+    use protocol::settings::KEEP_RUNNING;
+    // Read markers and settings writes take the store and the settings both. Taken in two
+    // orders, a MarkRead and a Set at the same moment waited on each other for ever.
+    let chatd = Daemon::start(|store| incoming(store, "#platform", Network::Slack, "C01", "a", "deploy is green"));
+    let (done, finished) = std::sync::mpsc::channel();
+    let ask = |socket: PathBuf, request: Request| -> Response {
+        let mut stream = ChatStream::connect(&socket).unwrap();
+        write_frame(&mut stream, &request).unwrap();
+        read_frame(&mut stream).unwrap()
+    };
+    for worker in 0..8u32 {
+        let (socket, done) = (chatd.dir.join("chat.sock"), done.clone());
+        std::thread::spawn(move || {
+            for n in 0..300u32 {
+                let request = if worker % 2 == 0 {
+                    // Every id is a new read marker, so each one is a write.
+                    Request::MarkRead { conversation: key(Network::Slack, "C01"), message_id: format!("{worker}-{n}") }
+                } else {
+                    let value = (n % 2 == 0).then(|| "off".to_owned());
+                    Request::Set { scope: String::new(), key: KEEP_RUNNING.into(), value }
+                };
+                assert_eq!(ask(socket.clone(), request), Response::Ok);
+            }
+            let _ = done.send(());
+        });
+    }
+    for _ in 0..8 {
+        finished.recv_timeout(Duration::from_secs(30)).expect("chatd stalled with a read and a setting in flight");
+    }
+    assert!(matches!(chatd.ask(Request::Settings), Response::Settings { .. }));
+}
+
+#[test]
 fn shutdown_answers_and_then_chatd_is_gone() {
     let mut chatd = Daemon::start(|_| {});
     assert_eq!(chatd.ask(Request::Shutdown), Response::Ok);

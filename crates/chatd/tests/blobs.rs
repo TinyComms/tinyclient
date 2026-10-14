@@ -455,6 +455,32 @@ fn the_least_recently_used_file_goes_when_the_cache_is_over_its_cap() {
 }
 
 #[test]
+fn a_smaller_cap_chosen_in_settings_evicts_at_once() {
+    let ids = ["a", "b", "c"];
+    let registered: Vec<_> = ids.iter().map(|id| (file(id, MediaKind::Image), "http://127.0.0.1:9/never".to_owned())).collect();
+    let dir = Daemon::scratch(&registered);
+    // Three files on disk that the store counts as 100 MB each: 300 MB, under the default
+    // 500 MB and over the smallest choice, 250 MB. `a` is the least recently used.
+    let media = dir.join("media/discord/42");
+    std::fs::create_dir_all(&media).unwrap();
+    let mut store = Store::open(&dir.join("chat.sqlite")).unwrap();
+    let paths: Vec<PathBuf> = ids.iter().map(|id| media.join(format!("cached-{id}"))).collect();
+    for (at, (id, path)) in ids.iter().zip(&paths).enumerate() {
+        std::fs::write(path, b"x").unwrap();
+        store.media_landed(&account(), id, path.to_str().unwrap(), 100 * 1024 * 1024, 1_000 + at as i64).unwrap();
+    }
+    drop(store);
+    let chatd = Daemon::start_in(dir, &[("TINYCLIENT_MEDIA_ON_SCREEN", "0")]);
+    sleep(Duration::from_millis(300));
+    assert!(paths.iter().all(|path| path.exists()), "300 MB is under the default cap");
+
+    let set = Request::Set { scope: String::new(), key: protocol::settings::CACHE_MB.to_owned(), value: Some("250".to_owned()) };
+    assert_eq!(chatd.ask(set), Response::Ok);
+    until("the oldest file to go under the new cap", || !paths[0].exists());
+    assert!(paths[1].exists() && paths[2].exists(), "only what the cap needs goes");
+}
+
+#[test]
 fn what_was_asked_for_in_the_last_minute_is_not_evicted() {
     let files = Files::start();
     let registered: Vec<_> = ["a", "b", "c"]

@@ -619,7 +619,10 @@ impl Chat {
     }
 
     fn mark_read(&self, conversation: Key, message_id: String) -> Response {
-        match self.hub.store().mark_read(&conversation, &message_id) {
+        // The store is let go before the settings are read: a guard made in a `match` lives
+        // to its end, and `Hub::set_setting` takes the two the other way round.
+        let marked = self.hub.store().mark_read(&conversation, &message_id);
+        match marked {
             Ok(true) => {
                 let conversation_id = conversation.id.clone();
                 // P2: off, the chat is read here and the network is not told, which is what
