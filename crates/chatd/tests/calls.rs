@@ -311,8 +311,7 @@ fn a_mediad_that_dies_holding_a_voice_session_is_a_failure_in_words_not_a_vanish
     assert!(hub.calls.start(&hub, lounge()).is_ok());
     hub.calls.join(&hub, &lounge(), voice.join());
     let (_peer, _) = voice.identified();
-    let out = Command::new("pgrep").args(["-P", &std::process::id().to_string(), "mediad"]).output().unwrap();
-    let pid = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    let pid = mediad_pid();
     assert!(kill_pid(&pid));
     until("the failure", || matches!(state(&hub), Some(CallState::Failed { .. })));
     let expected = CallState::Failed {
