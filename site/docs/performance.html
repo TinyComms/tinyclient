@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self'; style-src 'self'; script-src 'self'; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<title>Size &amp; performance · tinyclient docs</title>
+<meta name="description" content="tinyclient's size on disk next to the official Slack, Discord, Telegram, Teams and Signal apps, its memory use per process, and how each number was measured.">
+<meta name="color-scheme" content="dark light">
+<meta name="theme-color" content="#121315" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<link rel="icon" href="../favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="../style.css">
+<script src="../site.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../" aria-label="tinyclient home"><img src="../favicon.svg" alt="" width="28" height="28">tinyclient</a>
+    <nav class="site-nav" aria-label="Site">
+      <a href="./" aria-current="page">Docs</a>
+      <a class="hide-sm" href="privacy.html">Privacy</a>
+      <a class="hide-sm" href="networks.html">Networks &amp; terms</a>
+      <a class="gh" href="https://github.com/itz4blitz/tinyclient"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap docs">
+  <nav class="docs-nav" aria-label="Documentation">
+    <div class="docs-nav-inner">
+      <h2>Documentation</h2>
+      <ul>
+          <li><a href="index.html">Getting started</a></li>
+          <li><a href="build.html">Build from source</a></li>
+          <li><a href="architecture.html">Architecture</a></li>
+          <li><a href="performance.html" aria-current="page">Size &amp; performance</a></li>
+          <li><a href="privacy.html">Privacy &amp; security</a></li>
+          <li><a href="networks.html">Networks &amp; terms</a></li>
+          <li><a href="contributing.html">Contributing</a></li>
+      </ul>
+      <h2 class="ext">On GitHub</h2>
+      <ul class="ext">
+          <li><a href="https://github.com/itz4blitz/tinyclient/releases">Releases</a></li>
+          <li><a href="https://github.com/itz4blitz/tinyclient/blob/main/SECURITY.md">Security policy</a></li>
+          <li><a href="https://github.com/itz4blitz/tinyclient/tree/main/docs">Design documents</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <main id="main" class="prose">
+    <h1>Size &amp; performance</h1>
+    <p class="lede">How big tinyclient is next to the official apps, what it uses while it runs, and how each number was taken.</p>
+
+    <h2 id="size">App size on disk</h2>
+    <div class="table-wrap" tabindex="0" role="region" aria-label="App size on disk">
+      <table>
+        <caption>macOS, measured 2026-10-14 with <code>du -sh</code> on each <code>.app</code> as installed by its vendor&rsquo;s official macOS installer.</caption>
+        <thead><tr><th scope="col">App</th><th scope="col">Size on disk</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">Microsoft Teams</th><td class="num">1.1 GB</td></tr>
+          <tr><th scope="row">Signal</th><td class="num">625 MB</td></tr>
+          <tr><th scope="row">Slack</th><td class="num">554 MB</td></tr>
+          <tr><th scope="row">Discord</th><td class="num">481 MB</td></tr>
+          <tr><th scope="row">Telegram</th><td class="num">346 MB</td></tr>
+          <tr><th scope="row">The five together</th><td class="num">about 3.1 GB</td></tr>
+          <tr><th scope="row">tinyclient, all five networks</th><td class="num">55 MB</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>Method: install each app from its vendor&rsquo;s official macOS installer, then run <code>du -sh</code> on the <code>.app</code> bundle. Slack and Telegram ship universal binaries (Apple silicon and Intel in one app); tinyclient&rsquo;s figure is its Apple silicon build, <code>tinyclient.app</code> from the release zip. We compare size on disk only: we have not measured the official apps&rsquo; memory.</p>
+
+    <h2 id="processes">Four programs, each only when needed</h2>
+    <div class="table-wrap" tabindex="0" role="region" aria-label="Memory by process">
+      <table>
+        <caption><code>chatd</code> signed in to Discord and the window, measured on macOS on 2026-10-13. <code>mediad</code> in an end-to-end encrypted call against a local test voice server (<a href="https://github.com/itz4blitz/tinyclient/blob/main/crates/mediad/tests/voice.rs"><code>crates/mediad/tests/voice.rs</code></a>).</caption>
+        <thead><tr><th scope="col">Process</th><th scope="col">Runs</th><th scope="col">Measured</th><th scope="col">Budget</th></tr></thead>
+        <tbody>
+          <tr><th scope="row"><code>chatd</code></th><td>Always, in the background</td><td class="num">10 MB RSS</td><td>20 MB idle on Discord, Slack and Teams</td></tr>
+          <tr><th scope="row"><code>tinyclient</code></th><td>While the window is open</td><td class="num">64 MB RSS</td><td>80 MB footprint with a list on screen</td></tr>
+          <tr><th scope="row"><code>mediad</code></th><td>During a call only</td><td class="num">&lt; 40 MB RSS</td><td>40 MB in a voice call; asserted by a test</td></tr>
+          <tr><th scope="row"><code>tinyclient-login</code></th><td>During a sign-in only</td><td class="num">n/a</td><td>Exits with the sign-in</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>The target for the whole product, idle and signed in to four networks, is 150&nbsp;MB. Voice runs in <code>mediad</code>, which starts when a call connects and exits when it ends, so no audio code is loaded the rest of the time. The sign-in window is its own process and exits when you are in.</p>
+
+    <h2 id="budgets">Budgets</h2>
+    <p>Every feature has a memory, speed and idle-CPU budget, measured from outside the process. The full list and how each is measured: <a href="https://github.com/itz4blitz/tinyclient/blob/main/docs/product/07-budgets-and-risk.md"><code>07-budgets-and-risk.md</code></a>. Binary sizes per program are on <a href="architecture.html#sizes">Architecture</a>.</p>
+
+    <nav class="pager" aria-label="Previous and next"><a href="architecture.html"><span>Previous</span>Architecture</a><a class="next" href="privacy.html"><span>Next</span>Privacy &amp; security</a></nav>
+    <p class="edit">This page is <a href="https://github.com/itz4blitz/tinyclient/blob/main/site/docs/performance.html"><code>site/docs/performance.html</code></a>.</p>
+  </main>
+</div>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="fine">
+      <p>tinyclient is open source under the MIT license; a <code>chatd</code> built with Signal support is a combined work under the AGPL-3.0. Not affiliated with Slack, Discord, Telegram, Microsoft or Signal; network icons from <a href="https://github.com/homarr-labs/dashboard-icons">Dashboard Icons</a> (Apache-2.0).</p>
+      <p>This website sets no cookies, runs no analytics and loads nothing from any other site. Cloudflare Pages hosts it and can see your request the way any web server can.</p>
+    </div>
+  </div>
+</footer>
+</body>
+</html>

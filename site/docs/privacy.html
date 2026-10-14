@@ -37,6 +37,7 @@
           <li><a href="index.html">Getting started</a></li>
           <li><a href="build.html">Build from source</a></li>
           <li><a href="architecture.html">Architecture</a></li>
+          <li><a href="performance.html">Size &amp; performance</a></li>
           <li><a href="privacy.html" aria-current="page">Privacy &amp; security</a></li>
           <li><a href="networks.html">Networks &amp; terms</a></li>
           <li><a href="contributing.html">Contributing</a></li>
@@ -97,7 +98,7 @@
     <p><code>chatd</code>, <code>mediad</code> and the window each install one panic hook. A panic writes one entry, redacted, to standard error and to <code>crash.log</code>, naming the program and thread, with a backtrace. If the window crashed on its main thread it reopens once and says so, with a <strong>Copy report</strong> button that copies the last entry to your clipboard. Nothing is sent. If you want to share a report, read it first and attach it to an issue yourself.</p>
 
     <h2 id="identity">How it presents itself</h2>
-    <p>To Discord and Slack, tinyclient presents itself as the web client in a browser, the same identity the sign-in window used: on macOS the version of Safari you have installed, elsewhere a fixed Chrome identity. One consistent identity draws less attention than an unknown one. To Teams it signs in as Microsoft&rsquo;s own Teams client. This is described with its risks on <a href="networks.html">Networks &amp; terms</a>.</p>
+    <p>To Discord and Slack, tinyclient presents itself as the web client in a browser, the same identity the sign-in window used: on macOS the version of Safari you have installed, elsewhere a fixed Chrome identity. To Teams it signs in as Microsoft&rsquo;s own Teams client. How each network treats this: <a href="networks.html">Networks &amp; terms</a>.</p>
 
     <h2 id="limits">Known limits</h2>
     <ul>
@@ -111,9 +112,9 @@
     <p>Please report security problems privately through <a href="https://github.com/itz4blitz/tinyclient/security/advisories/new">GitHub Security Advisories</a>, not in a public issue. What is in scope and what to expect: <a href="https://github.com/itz4blitz/tinyclient/blob/main/SECURITY.md"><code>SECURITY.md</code></a>.</p>
 
     <h2 id="website">This website</h2>
-    <p>Static HTML and one stylesheet. No cookies, no analytics, no fonts or scripts from other sites; a Content-Security-Policy allows only this site&rsquo;s own files. The one small script names your system on the download button and adds Copy buttons, and every page reads the same without it. GitHub Pages serves the site and, like any web host, can see your request.</p>
+    <p>Static HTML and one stylesheet. No cookies, no analytics, no fonts or scripts from other sites; a Content-Security-Policy allows only this site&rsquo;s own files. The one small script names your system on the download button and adds Copy buttons, and every page reads the same without it. Cloudflare Pages serves the site and, like any web host, can see your request.</p>
 
-    <nav class="pager" aria-label="Previous and next"><a href="architecture.html"><span>Previous</span>Architecture</a><a class="next" href="networks.html"><span>Next</span>Networks &amp; terms</a></nav>
+    <nav class="pager" aria-label="Previous and next"><a href="performance.html"><span>Previous</span>Size &amp; performance</a><a class="next" href="networks.html"><span>Next</span>Networks &amp; terms</a></nav>
     <p class="edit">This page is <a href="https://github.com/itz4blitz/tinyclient/blob/main/site/docs/privacy.html"><code>site/docs/privacy.html</code></a>. Sources for its claims: <a href="https://github.com/itz4blitz/tinyclient/blob/main/docs/architecture.md">docs/architecture.md</a>, <a href="https://github.com/itz4blitz/tinyclient/blob/main/crates/chatd/src/session.rs">chatd/src/session.rs</a>, <a href="https://github.com/itz4blitz/tinyclient/blob/main/crates/chatd/src/blobs/fetch.rs">blobs/fetch.rs</a>, <a href="https://github.com/itz4blitz/tinyclient/blob/main/crates/protocol/src/crash.rs">protocol/src/crash.rs</a>.</p>
   </main>
 </div>
@@ -122,7 +123,7 @@
   <div class="wrap">
     <div class="fine">
       <p>tinyclient is open source under the MIT license; a <code>chatd</code> built with Signal support is a combined work under the AGPL-3.0. Not affiliated with Slack, Discord, Telegram, Microsoft or Signal; network icons from <a href="https://github.com/homarr-labs/dashboard-icons">Dashboard Icons</a> (Apache-2.0).</p>
-      <p>This website sets no cookies, runs no analytics and loads nothing from any other site. GitHub Pages hosts it and can see your request the way any web server can.</p>
+      <p>This website sets no cookies, runs no analytics and loads nothing from any other site. Cloudflare Pages hosts it and can see your request the way any web server can.</p>
     </div>
   </div>
 </footer>

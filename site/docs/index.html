@@ -37,6 +37,7 @@
           <li><a href="index.html" aria-current="page">Getting started</a></li>
           <li><a href="build.html">Build from source</a></li>
           <li><a href="architecture.html">Architecture</a></li>
+          <li><a href="performance.html">Size &amp; performance</a></li>
           <li><a href="privacy.html">Privacy &amp; security</a></li>
           <li><a href="networks.html">Networks &amp; terms</a></li>
           <li><a href="contributing.html">Contributing</a></li>
@@ -54,19 +55,16 @@
     <h1>Getting started</h1>
     <p class="lede">Install a release, sign in to a network, and know where your data goes.</p>
 
-    <div class="callout warn">
-      <p><strong>Read this before you sign in.</strong> tinyclient is an unofficial client and it is early. Discord&rsquo;s terms prohibit third-party clients, Slack and Teams do not offer their services to them, and Teams, Telegram and Signal have not yet been used on a real account. <a href="networks.html">Networks &amp; terms</a> has the details for each.</p>
-    </div>
 
     <h2 id="download">Download</h2>
-    <p>Every release is built by GitHub Actions from a <code>v*</code> tag (<a href="https://github.com/itz4blitz/tinyclient/blob/main/.github/workflows/release.yml"><code>release.yml</code></a>) and published on the <a href="https://github.com/itz4blitz/tinyclient/releases/latest">latest release</a> page.</p>
+    <p>Every release is built by GitHub Actions from a <code>v*</code> tag (<a href="https://github.com/itz4blitz/tinyclient/blob/main/.github/workflows/release.yml"><code>release.yml</code></a>). The links below always fetch the latest one; <a href="/download/checksums">SHA256SUMS</a> lists each archive&rsquo;s checksum.</p>
     <div class="table-wrap" tabindex="0" role="region" aria-label="Release archives">
       <table>
         <thead><tr><th scope="col">System</th><th scope="col">Archive</th><th scope="col">Contents</th></tr></thead>
         <tbody>
-          <tr><th scope="row">macOS 13 or later, Apple silicon</th><td><code>…-macos.zip</code></td><td><code>tinyclient.app</code>, with all four programs inside</td></tr>
-          <tr><th scope="row">Linux x86_64</th><td><code>…-linux-x86_64.tar.gz</code></td><td><code>tinyclient</code>, <code>chatd</code>, <code>mediad</code>, <code>tinyclient-login</code></td></tr>
-          <tr><th scope="row">Windows x86_64</th><td><code>…-windows-x86_64.zip</code></td><td>The same four programs as <code>.exe</code> files</td></tr>
+          <tr><th scope="row">macOS 13 or later, Apple silicon</th><td><a href="/download/macos"><code>…-macos.zip</code></a></td><td><code>tinyclient.app</code>, with all four programs inside</td></tr>
+          <tr><th scope="row">Linux x86_64</th><td><a href="/download/linux"><code>…-linux-x86_64.tar.gz</code></a></td><td><code>tinyclient</code>, <code>chatd</code>, <code>mediad</code>, <code>tinyclient-login</code></td></tr>
+          <tr><th scope="row">Windows x86_64</th><td><a href="/download/windows"><code>…-windows-x86_64.zip</code></a></td><td>The same four programs as <code>.exe</code> files</td></tr>
         </tbody>
       </table>
     </div>
@@ -142,7 +140,7 @@
   <div class="wrap">
     <div class="fine">
       <p>tinyclient is open source under the MIT license; a <code>chatd</code> built with Signal support is a combined work under the AGPL-3.0. Not affiliated with Slack, Discord, Telegram, Microsoft or Signal; network icons from <a href="https://github.com/homarr-labs/dashboard-icons">Dashboard Icons</a> (Apache-2.0).</p>
-      <p>This website sets no cookies, runs no analytics and loads nothing from any other site. GitHub Pages hosts it and can see your request the way any web server can.</p>
+      <p>This website sets no cookies, runs no analytics and loads nothing from any other site. Cloudflare Pages hosts it and can see your request the way any web server can.</p>
     </div>
   </div>
 </footer>
