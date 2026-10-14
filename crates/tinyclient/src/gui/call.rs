@@ -191,7 +191,8 @@ pub struct State {
     menu: Option<Menu>,
     /// When a click outside closed the menu, so the same click on its button does not reopen it.
     menu_closed: Option<Instant>,
-    /// The device picked in this window. The outer `None` is "not picked here".
+    /// The device this call uses as far as this window knows: the Settings default it started
+    /// with, or what was picked in its menu since. The outer `None` is "no call yet".
     input: Option<Option<String>>,
     output: Option<Option<String>>,
     /// Whether I was muted when I deafened, to go back to on undeafen.
@@ -396,6 +397,13 @@ impl Shell {
                 let menus = matches!(call.state, CallState::RingingOut | CallState::Connecting | CallState::Joined);
                 if !menus {
                     self.call_menu_set(None, cx);
+                } else {
+                    // chatd gave mediad the Settings defaults when it started the call, and
+                    // changes there are for the next call: the menu marks what this call uses.
+                    let values = super::app::prefs::values();
+                    let state = &mut self.call_state;
+                    state.input.get_or_insert_with(|| values.device(protocol::settings::INPUT));
+                    state.output.get_or_insert_with(|| values.device(protocol::settings::OUTPUT));
                 }
                 if !call.deafened {
                     self.call_state.mute_before_deafen = None;

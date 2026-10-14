@@ -24,8 +24,8 @@ use std::time::{Duration, Instant};
 /// Segments of the level meter.
 const SEGMENTS: u8 = 12;
 
-/// The row to mark: what was picked in this call, else the default from Settings, where `None`
-/// is "System default".
+/// The row to mark: what this call uses (the default it started with, or what was picked in
+/// it), else the default from Settings, where `None` is "System default".
 fn chosen(picked: &Option<Option<String>>, default: Option<String>) -> Option<String> {
     match picked {
         Some(picked) => picked.clone(),
