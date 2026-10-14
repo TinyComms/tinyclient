@@ -140,13 +140,25 @@ pub fn bind_keys(cx: &mut App) {
     ]);
 }
 
-/// ⌘Q: chatd stops too (`docs/product/09-settings.md` G2). Asked briefly, so a chatd that does
-/// not answer cannot hold the quit.
+/// ⌘Q. chatd is stopped by `stop_chatd_on_quit`, as for every other way out.
 pub fn quit(cx: &mut App) {
-    if !cfg!(feature = "gui-shot") {
-        let _ = crate::client::ask_within(&protocol::Request::Shutdown, Some(std::time::Duration::from_millis(500)));
-    }
     cx.quit();
+}
+
+/// Quitting stops chatd too (`docs/product/09-settings.md` G2), however it happens: ⌘Q, Dock ›
+/// Quit, logging out or shutting down all end in the app's quit handlers. Asked off the main
+/// thread and briefly, so a chatd that does not answer cannot hold the quit; GPUI waits 200 ms
+/// for the handlers, and the request is written well before that.
+pub fn stop_chatd_on_quit(cx: &mut App) {
+    if cfg!(feature = "gui-shot") {
+        return;
+    }
+    cx.on_app_quit(|cx| {
+        cx.background_executor().spawn(async {
+            let _ = crate::client::ask_within(&protocol::Request::Shutdown, Some(std::time::Duration::from_millis(150)));
+        })
+    })
+    .detach();
 }
 
 /// ⌘W and the red button: with Keep receiving on, the window hides and chatd goes on receiving
@@ -161,6 +173,7 @@ pub fn close_window(cx: &mut App) {
 
 /// The app-wide handlers: they act on the app, not on what has focus.
 pub fn app_actions(cx: &mut App) {
+    stop_chatd_on_quit(cx);
     cx.on_action(|_: &Quit, cx| quit(cx));
     cx.on_action(|_: &Hide, cx| cx.hide());
     cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
