@@ -1022,21 +1022,26 @@ fn frames_that_arrive_in_pieces_over_tls_are_read_whole_while_heartbeats_go_on()
     let mut mediad = Mediad::start("null", None);
     mediad.join(&dribble.address.to_string(), NO_DAVE);
     let mut peer = fake.accept();
-    // mediad gives a server up after two heartbeats go unanswered. The answers come back
-    // through the dribble too, behind whatever is still in it.
-    fake.handshake(&mut peer, &[AES], 0, 1500);
+    // mediad gives a server up after two heartbeats go unanswered, and the answers come back
+    // through the dribble, behind whatever is still in it. A beat every 4 s leaves 8 s for an
+    // answer to get through behind one frame, however long a busy runner stretches the sleeps.
+    fake.handshake(&mut peer, &[AES], 0, 4000);
     mediad.connected();
 
     // 16 bytes every 25 ms: a frame's TLS record of about a hundred bytes comes in six pieces,
     // each later than the 20 ms a read waits. Each frame is sent once the one before arrived,
-    // so an answer to a heartbeat never waits behind more than one of them: on a runner where
-    // the 25 ms sleeps run long, all of them at once could hold it back past mediad's patience.
+    // so nothing but that frame is ahead of an answer, and they go on until a heartbeat has
+    // gone out meanwhile.
     dribble.piece.store(16, Ordering::Relaxed);
     let began = Instant::now();
-    for n in 0..4u32 {
-        peer.send(5, json!({ "user_id": (500 + n).to_string(), "ssrc": 5000 + n, "speaking": 1 }));
-        let wanted = MediaResponse::Source { user_id: (500 + n).to_string(), ssrc: 5000 + n };
+    peer.heartbeats.clear();
+    let mut sent = 0u32;
+    while sent < 4 || peer.heartbeats.is_empty() {
+        let (user_id, ssrc) = ((500 + sent).to_string(), 5000 + sent);
+        peer.send(5, json!({ "user_id": user_id, "ssrc": ssrc, "speaking": 1 }));
+        let wanted = MediaResponse::Source { user_id, ssrc };
         mediad.event_serving(&mut peer, "a Source that arrived in pieces", |e| *e == wanted);
+        sent += 1;
     }
     // And one that takes dozens of reads to arrive.
     let crowd: Vec<String> = (0..20).map(|n| (10_000_000_000_000_000u64 + n).to_string()).collect();
@@ -1050,13 +1055,11 @@ fn frames_that_arrive_in_pieces_over_tls_are_read_whole_while_heartbeats_go_on()
     assert_eq!(sources, 0, "each frame was taken once");
     assert!(mediad.seen.iter().all(|e| *e != MediaResponse::Interrupted), "the connection held: {:?}", mediad.seen);
 
-    // While all that trickled in, mediad kept its own side going.
-    peer.serve(Duration::from_millis(100));
-    assert!(!peer.heartbeats.is_empty(), "no heartbeat in {took:?} at one every 1.5 s");
-    // Six frames since the session description, which was the third.
+    // Every frame since the session description, which was the third, was counted.
     peer.heartbeats.clear();
-    peer.serve(Duration::from_millis(1800));
-    assert_eq!(peer.heartbeats.last().expect("a heartbeat")["seq_ack"], 9, "every frame was counted");
+    peer.serve(Duration::from_millis(4500));
+    let counted = peer.heartbeats.last().expect("a heartbeat")["seq_ack"].clone();
+    assert_eq!(counted, 3 + sent + 2, "{sent} speaking frames, the crowd and the last");
 
     // A close that arrives in pieces is still a close with its code.
     peer.close(4017);
