@@ -25,8 +25,9 @@ use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tungstenite::handshake::server::{Request as Upgrade, Response as Upgraded};
 
-const AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 \
-                     (KHTML, like Gecko) Version/26.0 Safari/605.1.15";
+fn agent() -> &'static str {
+    chatd::adapters::net::browser()
+}
 const COOKIE: &str = "xoxd-fake%2Bcookie%3D";
 const ALPHA: &str = "xoxc-alpha";
 const BETA: &str = "xoxc-beta";
@@ -649,7 +650,7 @@ impl World {
     fn spawn(fake: &Fake, socket_url: &str, dir: &PathBuf) -> Child {
         // What the sign-in helper prints for a browser session holding two workspaces.
         let session = json!({
-            "cookie": COOKIE, "user_agent": AGENT, "active": "T01ALPHA",
+            "cookie": COOKIE, "user_agent": agent(), "active": "T01ALPHA",
             "teams": [
                 {"id": "T01ALPHA", "name": "Acme", "url": "https://acme.slack.com/", "token": ALPHA, "enterprise_id": ""},
                 {"id": "T02BETA", "name": "Side Project", "url": "https://side.slack.com/", "token": BETA, "enterprise_id": ""},
@@ -905,7 +906,7 @@ fn one_sign_in_is_two_workspaces_each_with_its_sidebar_and_unread_state() {
         assert!(calls.iter().any(|call| call.token == token && call.method == "client.counts"));
     }
     for call in &calls {
-        assert_eq!(call.user_agent, AGENT, "{} was asked as another browser", call.method);
+        assert_eq!(call.user_agent, agent(), "{} was asked as another browser", call.method);
         assert_eq!(call.cookie, format!("d={COOKIE}"), "{}", call.method);
     }
     let shakes = world.fake.shakes.lock().unwrap().clone();
@@ -913,7 +914,7 @@ fn one_sign_in_is_two_workspaces_each_with_its_sidebar_and_unread_state() {
     sockets.sort_unstable();
     assert_eq!(sockets, [ALPHA, BETA], "each workspace has a socket of its own");
     for shake in &shakes {
-        assert_eq!((shake.user_agent.as_str(), shake.cookie.as_str()), (AGENT, format!("d={COOKIE}").as_str()));
+        assert_eq!((shake.user_agent.as_str(), shake.cookie.as_str()), (agent(), format!("d={COOKIE}").as_str()));
     }
     // Connecting listed the sidebar and nothing heavier, and fetched no history nobody needs.
     // The socket's address is derived, as the web client derives it, not asked for.
@@ -1171,7 +1172,7 @@ fn a_channel_reads_as_it_does_in_slack_and_stays_current() {
     let files = world.fake.files();
     assert!(files.len() >= 4, "{files:?}");
     for call in &files {
-        assert!(same_browser(&call.user_agent, AGENT), "{} was fetched as {:?}", call.method, call.user_agent);
+        assert!(same_browser(&call.user_agent, agent()), "{} was fetched as {:?}", call.method, call.user_agent);
     }
 }
 
@@ -1566,7 +1567,7 @@ fn someone_who_uploaded_no_picture_shows_slacks_default_for_them_and_not_initial
     assert!(on_disk.path.is_some_and(|path| std::fs::metadata(path).is_ok_and(|file| file.len() > 0)));
     // at the size a 2x screen draws a row's picture, from Slack and from nobody else,
     let fetched = world.fake.file("/img/avatars/ava_0002-192.png").expect("the default, at twice list size");
-    assert!(same_browser(&fetched.user_agent, AGENT), "{:?}", fetched.user_agent);
+    assert!(same_browser(&fetched.user_agent, agent()), "{:?}", fetched.user_agent);
     assert_eq!((fetched.token.as_str(), fetched.cookie.as_str()), ("", ""), "a public picture is not shown the session");
     assert!(world.fake.files().iter().all(|call| call.method.contains("/img/avatars/ava_0002-")), "{:?}", world.fake.files());
 
@@ -1932,7 +1933,7 @@ fn a_reissued_cookie_is_used_and_saved_and_a_demand_only_slacks_app_can_meet_sto
     let saved = world.until("the session to be saved", || std::fs::read_to_string(world.dir.join("session.slack")).ok());
     let saved: Value = serde_json::from_str(&saved).unwrap();
     assert_eq!(saved["cookie"], fresh);
-    assert_eq!((saved["user_agent"].as_str(), saved["teams"].as_array().map(Vec::len)), (Some(AGENT), Some(2)));
+    assert_eq!((saved["user_agent"].as_str(), saved["teams"].as_array().map(Vec::len)), (Some(agent()), Some(2)));
     assert_eq!((saved["teams"][0]["token"].as_str(), saved["teams"][1]["token"].as_str()), (Some(ALPHA), Some(BETA)));
 
     // Slack wants a second factor set up: only its own app can do that. The account says so,

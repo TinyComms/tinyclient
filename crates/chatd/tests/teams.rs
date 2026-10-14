@@ -30,8 +30,9 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 use tungstenite::handshake::server::{Request as Upgrade, Response as Upgraded};
 
-const AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 \
-                     (KHTML, like Gecko) Version/26.0 Safari/605.1.15";
+fn agent() -> &'static str {
+    chatd::adapters::net::browser()
+}
 const HOME: &str = "11111111-1111-4111-8111-111111111111";
 const GUEST: &str = "22222222-2222-4222-8222-222222222222";
 const ME: &str = "8:orgid:00000000-0000-4000-8000-0000000000aa";
@@ -515,7 +516,7 @@ impl World {
         std::fs::create_dir_all(&dir).unwrap();
         // What the sign-in helper prints for someone who is also a guest in a second tenant.
         let session = json!({
-            "client_id": "1fec8e78-bce4-4aaf-ab1b-5451cc387264", "user_agent": AGENT,
+            "client_id": "1fec8e78-bce4-4aaf-ab1b-5451cc387264", "user_agent": agent(),
             "oid": "00000000-0000-4000-8000-0000000000aa", "name": "Me Myself", "upn": "me@contoso.com",
             "tenants": [
                 {"id": HOME, "name": "Contoso", "refresh_token": "rt-0"},
@@ -711,7 +712,7 @@ fn one_sign_in_is_a_tenant_each_with_teams_channels_chats_and_their_unread_state
     assert_eq!(asked("GET", &format!("{GENERAL}/messages")) + asked("GET", "19:grp1@thread.v2/messages"), 0);
     assert_eq!(asked("POST", "/beta/users/searchV2"), 0, "the directory is never listed");
     for call in &calls {
-        assert_eq!(call.headers["user-agent"], AGENT, "{} was asked as another browser", call.path);
+        assert_eq!(call.headers["user-agent"], agent(), "{} was asked as another browser", call.path);
     }
 
     // The teams list was refused once (a token the service no longer took): the token was
@@ -729,14 +730,14 @@ fn one_sign_in_is_a_tenant_each_with_teams_channels_chats_and_their_unread_state
         let saved: Value = serde_json::from_str(&std::fs::read_to_string(world.dir.join("session.teams")).ok()?).ok()?;
         (saved["tenants"][0]["refresh_token"] == tokens.last().unwrap().3.as_str()).then_some(saved)
     });
-    assert_eq!((&saved["tenants"][1]["refresh_token"], &saved["user_agent"]), (&json!("rt-guest"), &json!(AGENT)));
+    assert_eq!((&saved["tenants"][1]["refresh_token"], &saved["user_agent"]), (&json!("rt-guest"), &json!(agent())));
 
     // Push: one socket as the same browser, said who it is, and had the chat service deliver
     // to it under the endpoint trouter was told. It did not claim the user is at the desk.
     let shakes = world.fake.shakes.lock().unwrap().clone();
     assert_eq!(shakes.len(), 1);
     assert!(shakes[0].0.starts_with("/socket.io/1/websocket/sid-42?v=v4&") && shakes[0].0.contains("sig=c2VjcmV0K3NpZw%3D%3D"), "{}", shakes[0].0);
-    assert_eq!((shakes[0].1["user-agent"].as_str(), shakes[0].1["x-skypetoken"].as_str()), (AGENT, Fake::skype_token().as_str()));
+    assert_eq!((shakes[0].1["user-agent"].as_str(), shakes[0].1["x-skypetoken"].as_str()), (agent(), Fake::skype_token().as_str()));
     let heard = world.fake.heard.lock().unwrap().clone();
     assert!(heard.iter().any(|frame| frame.starts_with("5:::{") && frame.contains("user.authenticate") && frame.contains("Bearer at.spaces.")));
     assert!(!heard.iter().any(|frame| frame.contains("user.activity")));

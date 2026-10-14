@@ -717,13 +717,26 @@ fn ids(conversations: &[Conversation]) -> Vec<&str> {
 fn ready_fills_spaces_trees_people_and_unread_state() {
     let world = World::start();
 
-    // The session says it is the web client in Safari, the same on the socket and over HTTP.
+    // The session says it is the web client for this OS, the same on the socket and over HTTP.
     let identify = world.discord.frames_of(2).remove(0);
     let properties = &identify["d"]["properties"];
-    assert_eq!(properties["browser"], "Safari");
-    assert_eq!(properties["os"], "Mac OS X");
     let agent = properties["browser_user_agent"].as_str().unwrap();
-    assert!(agent.starts_with("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)") && agent.ends_with("Safari/605.1.15"));
+    assert_eq!(agent, chatd::adapters::net::browser());
+    #[cfg(target_os = "macos")]
+    {
+        assert_eq!(properties["browser"], "Safari");
+        assert_eq!(properties["os"], "Mac OS X");
+    }
+    #[cfg(target_os = "windows")]
+    {
+        assert_eq!(properties["browser"], "Chrome");
+        assert_eq!(properties["os"], "Windows");
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        assert_eq!(properties["browser"], "Chrome");
+        assert_eq!(properties["os"], "Linux");
+    }
     assert_eq!(identify["d"]["compress"], false);
     assert!(identify["d"]["capabilities"].as_u64().unwrap() > 0);
 

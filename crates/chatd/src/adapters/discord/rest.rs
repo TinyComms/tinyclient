@@ -58,7 +58,26 @@ fn timezone() -> Option<String> {
     iana_time_zone::get_timezone().ok()
 }
 
-/// Who the session says it is: the Discord web client in Safari on macOS.
+/// Who the session says it is: the same browser the sign-in window used on this OS.
+fn client_fields(user_agent: &str) -> (&'static str, &'static str, &'static str, String) {
+    #[cfg(target_os = "macos")]
+    {
+        let version = user_agent.split_once("Version/").map_or("26.0", |(_, rest)| rest.split(' ').next().unwrap_or("26.0")).to_owned();
+        ("Mac OS X", "Safari", "10.15.7", version)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let version = user_agent.split_once("Chrome/").map_or("131.0.0.0", |(_, rest)| rest.split(' ').next().unwrap_or("131.0.0.0")).to_owned();
+        ("Windows", "Chrome", "10", version)
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let version = user_agent.split_once("Chrome/").map_or("131.0.0.0", |(_, rest)| rest.split(' ').next().unwrap_or("131.0.0.0")).to_owned();
+        ("Linux", "Chrome", "", version)
+    }
+}
+
+/// Who the session says it is: the Discord web client in the browser this OS signs in with.
 pub struct Identity {
     pub user_agent: String,
     /// The `properties` of the gateway's identify.
@@ -73,16 +92,16 @@ impl Identity {
     /// identity from sign-in through every request and the socket.
     pub fn new(build: u64) -> Identity {
         let user_agent = browser().to_owned();
-        let version = user_agent.split_once("Version/").map_or("26.0", |(_, rest)| rest.split(' ').next().unwrap_or("26.0"));
+        let (os, browser_name, os_version, version) = client_fields(&user_agent);
         let properties = json!({
-            "os": "Mac OS X",
-            "browser": "Safari",
+            "os": os,
+            "browser": browser_name,
             "device": "",
             "system_locale": "en-US",
             "has_client_mods": false,
             "browser_user_agent": user_agent,
             "browser_version": version,
-            "os_version": "10.15.7",
+            "os_version": os_version,
             "referrer": "",
             "referring_domain": "",
             "referrer_current": "",

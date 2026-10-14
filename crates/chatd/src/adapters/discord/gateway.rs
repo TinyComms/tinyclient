@@ -101,8 +101,8 @@ fn wait_sockets(until: Instant, sockets: &[(Pollable, i16)]) {
         let mut fds: Vec<windows_sys::Win32::Networking::WinSock::WSAPOLLFD> = sockets
             .iter()
             .map(|(socket, events)| windows_sys::Win32::Networking::WinSock::WSAPOLLFD {
-                socket: socket.socket,
-                events: *events as i16,
+                fd: socket.socket as _,
+                events: *events,
                 revents: 0,
             })
             .collect();
@@ -122,6 +122,8 @@ fn set_cloexec(stream: &TcpStream) {
     unsafe {
         libc::fcntl(stream.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
     }
+    #[cfg(windows)]
+    let _ = stream;
 }
 
 fn set_nonblocking(stream: &TcpStream) -> io::Result<()> {

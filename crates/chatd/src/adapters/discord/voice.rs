@@ -11,7 +11,6 @@ use protocol::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::ffi::c_void;
 use std::time::{Duration, Instant};
 
 /// Voice states remembered across every server. A person in a voice channel is one entry.
@@ -54,8 +53,21 @@ fn link(guild: Option<&str>, channel: &str, app: bool) -> String {
 }
 
 /// True when some application on this Mac opens `discord://` links. Asks LaunchServices;
-/// nothing is launched.
+/// nothing is launched. Other systems hand off through the browser.
 fn app_installed() -> bool {
+    #[cfg(not(target_os = "macos"))]
+    {
+        return false;
+    }
+    #[cfg(target_os = "macos")]
+    {
+    app_installed_macos()
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn app_installed_macos() -> bool {
+    use std::ffi::c_void;
     #[link(name = "CoreServices", kind = "framework")]
     extern "C" {
         fn CFURLCreateWithBytes(
