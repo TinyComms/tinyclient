@@ -799,13 +799,21 @@ impl Store {
             )?,
             None => self.db.execute("DELETE FROM settings WHERE scope = ?1 AND key = ?2", params![scope, key])?,
         };
-        Ok(())
+        self.settle()
     }
 
     /// Reset all (B3): every row but the version.
     pub fn reset_settings(&mut self) -> rusqlite::Result<()> {
         self.db.execute("DELETE FROM settings WHERE NOT (scope = '' AND key = ?1)", params![protocol::settings::VERSION])?;
-        Ok(())
+        self.settle()
+    }
+
+    /// Puts a settings write on the disk now. The rest of this file is a cache of what the
+    /// networks hold, and may sync only at checkpoints (synchronous = NORMAL); a choice the
+    /// user just made is not, and a power cut must not undo it. A checkpoint syncs the log and
+    /// the file; settings change a few times a day, so its cost does not matter.
+    fn settle(&self) -> rusqlite::Result<()> {
+        self.db.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()))
     }
 
     // Storage.
