@@ -261,9 +261,9 @@ Per-conversation settings live with the conversation and are mirrored in Sounds 
 
 All are generated from code by one synthesiser, so the licence is the repository's (MIT): no samples, no third-party presets, no fonts of sounds. The synthesiser is `mediad`'s cue module: sine and two-operator FM voices, ADSR envelopes, a 4-pole (two 2-pole sections) 300 Hz high-pass and 6 kHz low-pass, all deterministic; one 2-pole section let Chime's upper FM sidebands through at 2 %. `cargo run -p mediad --example sounds -- <dir>` renders the seven bundled sounds to WAV; `afconvert -f caff -d ima4 -c 1` encodes them; `packaging/sounds/render.sh` does both. The CAF files are committed in `packaging/sounds` as `tinyclient-<name>.caf`, prefixed so they cannot collide with system sounds, and go into the app's Resources when notifications post them. A macOS test (`crates/mediad/tests/sounds.rs`) renders the WAVs again and compares their SHA-256 to `packaging/sounds/SHA256SUMS`, so the files cannot drift from the code; other platforms' maths libraries may round a sample differently. Nothing is rendered at build time.
 
-**Rate and size.** Every sound is 22.05 kHz mono IMA4, about 11.7 KB a second, because nothing is above 6 kHz. Correction to the product doc: at 44.1 kHz the 8 s of rings alone are about 187 KB, past the 160 KB budget. At 22.05 kHz the seven files total 142 KB.
+**Rate and size.** Every sound is 22.05 kHz mono IMA4, about 11.7 KB a second, because nothing is above 6 kHz. Correction to the product doc: at 44.1 kHz the 8 s of rings alone are about 187 KB, past the 160 KB budget. At 22.05 kHz, with afconvert's padding and info chunks stripped, the seven files total 114 KB.
 
-**Message and mention sounds.** At most 0.5 s, peak −14 dBFS, 300 Hz to 6 kHz. They differ by contour, not only timbre, so each is recognisable on a laptop speaker.
+**Message and mention sounds.** At most 0.5 s, peak −14 dBFS, 300 Hz to 6 kHz. Rendered to a −14.5 dBFS ceiling, since IMA4 lifts a peak by up to 0.4 dB, and to an average of −32 dBFS (RMS) ±2 dB, so changing sound does not change loudness. A test decodes the committed files and checks peak and band on what plays. They differ by contour, not only timbre, so each is recognisable on a laptop speaker.
 
 | Name | Character | Recipe | Length |
 |---|---|---|---|
@@ -273,7 +273,7 @@ All are generated from code by one synthesiser, so the licence is the repository
 | Chime | bright, two notes | FM bell, ratio 1:3.5, index 1.5 → 0.2; G5 then C6 (784, 1,047 Hz) 90 ms apart, each decaying over 350 ms | 0.5 s |
 | Glass | clear, high | Sine A6 (1,760 Hz) plus an inharmonic partial at 2.76× (4,858 Hz, −10 dB), 3 ms attack, 400 ms decay | 0.45 s |
 
-**Rings.** At most 4 s, peak −10 dBFS, 300 Hz to 6 kHz, not looped (product: until withdrawal is proven to cut a playing sound).
+**Rings.** At most 4 s, peak −10 dBFS (rendered to −10.5), 300 Hz to 6 kHz, not looped (product: until withdrawal is proven to cut a playing sound).
 
 | Name | Character | Recipe |
 |---|---|---|
@@ -346,7 +346,7 @@ The pinned GPUI exposes AccessKit roles (`role`, `aria_label`, `aria_toggled`, `
 | `switch_off` (from 08, light value new) | white 16% | black 14% | Switch track off, slider track, unlit meter segment |
 | `knob` | #FFFFFF | #FFFFFF, 0 1 2 0 black 20% | Switch knob, slider thumb |
 
-New Lucide glyphs: `sun-moon`, `hard-drive`, `command`, `play`, `rotate-ccw`, at 14 and 16. Seven sound files, 142 KB.
+New Lucide glyphs: `sun-moon`, `hard-drive`, `command`, `play`, `rotate-ccw`, at 14 and 16. Seven sound files, 114 KB.
 
 ## In this build (2026-10-14)
 

@@ -26,7 +26,8 @@ fn the_committed_sounds_are_the_ones_the_code_renders() {
 }
 
 #[test]
-fn the_seven_files_fit_in_160_kb() {
+fn the_seven_files_fit_in_120_kb() {
+    // 160 KB is the product's budget; without afconvert's padding they need under 120.
     let total: u64 = Sound::ALL.iter().map(|which| std::fs::metadata(sounds().join(format!("{}.caf", which.file()))).map_or(0, |m| m.len())).sum();
-    assert!(total < 160 * 1024, "{total} bytes");
+    assert!(total < 120 * 1024, "{total} bytes");
 }

@@ -41,17 +41,30 @@ impl Sound {
         matches!(self, Sound::SoftRing | Sound::ClassicRing)
     }
 
-    /// Length in seconds and peak in dBFS.
+    /// Length in seconds and peak in dBFS. Half a decibel under the design's limits (-14 and
+    /// -10): IMA4 encoding moves a peak up by as much as 0.4.
     pub fn shape(self) -> (f64, f64) {
         match self {
-            Sound::Pebble => (0.35, -14.),
-            Sound::Drop => (0.25, -14.),
-            Sound::Tap => (0.12, -14.),
-            Sound::Chime => (0.5, -14.),
-            Sound::Glass => (0.45, -14.),
-            Sound::SoftRing | Sound::ClassicRing => (4.0, -10.),
+            Sound::Pebble => (0.35, -14.5),
+            Sound::Drop => (0.25, -14.5),
+            Sound::Tap => (0.12, -14.5),
+            Sound::Chime => (0.5, -14.5),
+            Sound::Glass => (0.45, -14.5),
+            Sound::SoftRing | Sound::ClassicRing => (4.0, -10.5),
         }
     }
+}
+
+/// The message sounds' average level, whole file, in dBFS. Peaks alone left them 10.7 dB apart
+/// (Drop twice as loud as Tap), so each is brought down to this, under its peak ceiling: picking
+/// another sound does not make notifications louder. Tap, the quietest, sits within 2 dB of it
+/// at its ceiling.
+pub const MESSAGE_RMS_DB: f64 = -32.;
+
+/// The level of `samples` in dBFS, by their root mean square.
+pub fn rms_db(samples: &[f32]) -> f64 {
+    let sum: f64 = samples.iter().map(|&s| f64::from(s) * f64::from(s)).sum();
+    10. * (sum / samples.len().max(1) as f64).log10()
 }
 
 /// The peak of a cue at 100 % of its volume: under normal speech.
@@ -198,7 +211,9 @@ pub fn sound(sound: Sound, rate: u32) -> Vec<f32> {
                 for (n, out) in samples.iter_mut().enumerate() {
                     let t = n as f64 / r - start;
                     if t >= 0. {
-                        *out += fm(t, hertz, 3.5, (1.5, 0.2), 0.35) * rise(t, 0.003) * decay(t, 0.003, 0.35);
+                        // Index 1, not 1.5: the sidebands past 6 kHz then hold well under 1 %
+                        // of the energy, encoded too.
+                        *out += fm(t, hertz, 3.5, (1., 0.2), 0.35) * rise(t, 0.003) * decay(t, 0.003, 0.35);
                     }
                 }
             }
@@ -237,6 +252,13 @@ pub fn sound(sound: Sound, rate: u32) -> Vec<f32> {
     }
     band(&mut samples, r);
     normalise(&mut samples, peak);
+    if !sound.ring() {
+        let level: f64 = 10. * (samples.iter().map(|s| s * s).sum::<f64>() / count as f64).log10();
+        if level > MESSAGE_RMS_DB {
+            let gain = 10f64.powf((MESSAGE_RMS_DB - level) / 20.);
+            samples.iter_mut().for_each(|s| *s *= gain);
+        }
+    }
     // The filters ring a little past the end: the last 5 ms fade so the file ends at zero.
     let tail = ((0.005 * r) as usize).min(count);
     for (k, sample) in samples[count - tail..].iter_mut().enumerate() {
@@ -404,11 +426,48 @@ mod tests {
             assert!((seconds - length).abs() < 0.001, "{sound:?} lasts {seconds}");
             assert!(seconds <= if sound.ring() { 4. } else { 0.5 }, "{sound:?} is too long");
             let peak = db(peak(&samples));
-            assert!((peak - target).abs() < 0.1, "{sound:?} peaks at {peak} dBFS");
+            assert!(peak <= target + 0.01, "{sound:?} peaks at {peak} dBFS");
+            if sound.ring() {
+                assert!((peak - target).abs() < 0.1, "{sound:?} peaks at {peak} dBFS");
+            } else {
+                let level = rms_db(&samples);
+                assert!((level - MESSAGE_RMS_DB).abs() <= 2., "{sound:?} averages {level:.1} dBFS");
+            }
             let stray = outside(&samples, FILE_RATE, 300., 6_000.);
-            assert!(stray < 0.01, "{sound:?} has {:.2} % of its energy outside 300 Hz to 6 kHz", stray * 100.);
+            // Under half the 1 % limit, so encoding cannot push it over.
+            assert!(stray < 0.005, "{sound:?} has {:.2} % of its energy outside 300 Hz to 6 kHz", stray * 100.);
             assert!(samples.last().is_some_and(|s| s.abs() < 1e-3), "{sound:?} ends on a click");
         }
+    }
+
+    /// The committed files, decoded by afconvert as the system would play them, keep the
+    /// design's limits: a peak at most -14 dBFS (-10 for rings) and under 1 % of the energy
+    /// outside 300 Hz to 6 kHz. The checks above see only the samples before encoding.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn the_encoded_files_keep_the_peak_and_band_limits() {
+        let dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../packaging/sounds"));
+        let scratch = std::env::temp_dir().join(format!("tinyclient-sounds-{}", std::process::id()));
+        std::fs::create_dir_all(&scratch).unwrap();
+        for sound in Sound::ALL {
+            let wav = scratch.join(format!("{}.wav", sound.file()));
+            let decoded = std::process::Command::new("afconvert")
+                .args(["-f", "WAVE", "-d", "LEI16"])
+                .arg(dir.join(format!("{}.caf", sound.file())))
+                .arg(&wav)
+                .status()
+                .expect("afconvert runs");
+            assert!(decoded.success(), "{sound:?} does not decode");
+            let bytes = std::fs::read(&wav).unwrap();
+            let data = bytes.windows(4).position(|w| w == b"data").expect("a data chunk") + 8;
+            let samples: Vec<f32> = bytes[data..].chunks_exact(2).map(|b| f32::from(i16::from_le_bytes([b[0], b[1]])) / 32768.).collect();
+            let limit = if sound.ring() { -10. } else { -14. };
+            let peak = db(peak(&samples));
+            assert!(peak <= limit, "{sound:?} peaks at {peak:.2} dBFS encoded");
+            let stray = outside(&samples, FILE_RATE, 300., 6_000.);
+            assert!(stray < 0.01, "{sound:?} has {:.2} % outside the band encoded", stray * 100.);
+        }
+        let _ = std::fs::remove_dir_all(&scratch);
     }
 
     #[test]

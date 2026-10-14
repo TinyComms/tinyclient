@@ -287,7 +287,7 @@ from any conversation. The OS then applies Focus, its own mute and the app's sou
 - Message sounds at most 0.5 s, peak −14 dBFS, no energy under 300 Hz (laptop speakers) and
   none above 6 kHz (not shrill). Rings at most 4 s, peak −10 dBFS.
 - CAF, IMA4, mono, 22.05 kHz, since nothing in them is above 6 kHz: about 11.7 KB a second.
-  The seven files are 142 KB (`packaging/sounds`, rendered by `packaging/sounds/render.sh`). At
+  The seven files are 114 KB (`packaging/sounds`, rendered by `packaging/sounds/render.sh`). At
   44.1 kHz the 8 s of rings alone would pass the 160 KB budget.
 - The ring stops when the notification is withdrawn (caller gave up, answered elsewhere,
   declined). A 4 s cap keeps an unwithdrawable sound short. A longer looping ring is Later,
@@ -393,7 +393,7 @@ mediad, RSS for chatd; 60 s after the state is reached.
 Measured for the first pass (release, `strip -x`, against `be477fb`): the shell +527 KB, over its
 400 KB; chatd +112 KB; mediad +116 KB, over its 20 KB, most of it the cue synthesiser's float
 maths, the test mode and the new protocol frames. Both overruns are to be won back before the
-notification step adds more. The seven sound files are 142 KB. Idle memory was not measured in
+notification step adds more. The seven sound files are 114 KB. Idle memory was not measured in
 this pass.
 
 What keeps idle at zero: pause and quiet hours are checked when a notification would be posted,
