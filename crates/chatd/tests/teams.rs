@@ -659,6 +659,9 @@ impl World {
         };
         self.until("the home tenant to connect", || listed().filter(|account| account.link == Link::Connected));
         self.until("the chat list and Teams' unread state", || self.conversation(&key(CHAT_ANA)).filter(|row| row.unread == 1));
+        // The teams and their channels are written after the chats, and the activity feed is
+        // asked once all of it is.
+        self.until("the teams and their channels", || self.fake.calls("GET", "/48:notifications/messages").first().map(drop));
     }
 
     /// A conversation with its newest page fetched.
