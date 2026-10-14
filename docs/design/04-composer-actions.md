@@ -90,7 +90,8 @@ One popover component for `@`, `#` and `:`. Anchored 6 px above the card, left e
 
 - **Grid.** 9 columns of 36 px cells, glyph 23 px, hover and keyboard cell `selected`, radius 8. Section labels are 28 px rows. Arrow keys move, Return inserts, Shift-Return inserts and keeps the picker open, Esc closes. Search replaces the grid with one flat ranked result list.
 - **Recent.** 18 (two rows), per account, most recent first; also feeds the toolbar's three slots.
-- **Custom.** Only the open conversation's workspace or server, under its name. Other Discord servers' emoji appear only if the session says the account may use them. Telegram shows only the reactions the chat allows when picking a reaction.
+- **Custom.** Only the open conversation's workspace or server, under its name. Other Discord servers' emoji appear only if the session says the account may use them. Animated ones and ones limited to roles the account lacks are left out without Nitro.
+- **Reacting.** The picker shows only what the conversation's rules (`Reactions`) take: each section keeps only its allowed emoji and drops out when none are left, a listed emoji the table lacks goes under More, and the footer says "Only the reactions allowed here" where the network has a list of its own. Where a listed emoji takes no skin tone (Telegram, Teams) the tone button is absent and no tone is applied.
 - **Skin tone.** One global choice: the footer button opens a row of six swatches. No per-emoji long-press.
 - **How it stays cheap.** Glyphs come from Apple Color Emoji through the text system: no sprite sheet, no image set. The catalog is a static table in the binary (about 1,900 entries, names and keywords, under 100 KB). The grid is one `uniform_list` of rows, so about 10 rows exist at a time. Custom emoji decode at 48 px only while their row is visible and are dropped when it scrolls off. The picker entity is created on open and dropped on close. Budget: under 4 MB while open, zero when closed. Animated custom emoji show their first frame.
 - **Zero-cost path.** Ctrl-Cmd-Space works from the first release because the field is a real text input client; the in-app picker is release 3.
@@ -99,7 +100,7 @@ One popover component for `@`, `#` and `:`. Anchored 6 px above the card, left e
 
 Shown for the row under the pointer and for the keyboard-focused row, with no delay and no fade. Height 30, pad 2, radius 8, `popover` fill, 1 px `hairline`, shadow `0 2 8 rgba(0,0,0,.35)`. Right edge 16 px from the pane's right edge; top edge 14 px above the row's top, so it straddles the boundary and never covers the hovered text. Buttons 26 x 24, radius 6, glyph 16 `text_soft`, hover `selected` and `text`. Tooltips after 500 ms with the key: "Reply  R".
 
-Slots, left to right: three quick reactions (my three most used; 👍 ❤️ 😂 until I have any), 1 px divider, Add reaction, Reply (absent on Slack), Thread (only where the conversation has threads), Edit (my messages only), More. Hidden while a text selection is being dragged, while the row is pending or failed, and on system lines.
+Slots, left to right: three quick reactions (my three most used, then 👍 ❤️ 😂 🎉 🙏 👀, then what the conversation lists and what is on the message, keeping only what would go through on it; fewer, or none, where less is allowed), 1 px divider, Add reaction (absent where nothing more may be added), Reply (absent on Slack), Thread (only where the conversation has threads), Edit (my messages only), More. Hidden while a text selection is being dragged, while the row is pending or failed, and on system lines.
 
 ## Context menu (frame 10)
 
@@ -107,7 +108,7 @@ Right-click a message, or More. 248 wide, pad 4, rows 30 px with a 14 px glyph, 
 
 | # | Row | Present when |
 | --- | --- | --- |
-| 0 | Reaction strip: six recents (32 px) and Add reaction | Reactions allowed here |
+| 0 | Reaction strip: six quick reactions (32 px), as the toolbar picks them; React is absent where nothing more may be added | Reactions allowed here |
 | 1 | Reply | Discord, Telegram, Teams chats |
 | 2 | Reply in thread / Open thread | Slack, Teams channels; Discord when the message has a thread |
 | 3 | Edit | My message, inside the network's edit window |
@@ -123,7 +124,19 @@ Separators after 0, 3, 6, 8 and 9. On a failed row the menu is only Retry, Copy 
 
 ## Reactions
 
-Add: toolbar slot, menu strip, the `+` chip at the end of a message's chips, or `+` on a focused message. Choosing closes the picker. A chip click toggles mine: count and outline change at once; if the network refuses, the chip reverts and a toast says why ("This chat allows one reaction"). Where the network allows one reaction per person, choosing another replaces mine. Hovering a chip for 500 ms asks who reacted (P2) and shows names in a tooltip.
+Add: toolbar slot, menu strip, the `+` chip at the end of a message's chips, or `+` on a focused message. Choosing closes the picker. A chip click toggles mine: count and outline change at once; if the network refuses, the chip reverts and a toast says why ("Couldn't react: That reaction isn't allowed here."), and the rules are asked again. Where the network allows one reaction per person, choosing another replaces mine. Hovering a chip for 500 ms asks who reacted (P2) and shows names in a tooltip.
+
+What may be added follows the conversation's rules, asked when it opens (`Reactions`, kept five minutes by chatd), and chatd refuses anything they refuse before the network hears of it:
+
+| Network | Emoji | Mine on one message | Different on one message | Off or narrowed when |
+| --- | --- | --- | --- | --- |
+| Telegram | Telegram's own list, or the chat's part of it; Premium-only ones and custom emoji with Premium | 1, 3 with Premium; a new one replaces the oldest | The chat's `reactions_limit`, else 11 | The chat turned reactions off |
+| Discord | Any; the server's own custom emoji, every server's with Nitro, animated only with Nitro | No limit | 20 | No Read Message History: off. No Add Reactions: only reactions already there can be added to |
+| Slack | The standard emoji chatd can name, in any tone; the workspace's custom emoji | 23 | 50 | |
+| Teams | The emoji Teams has a key for here | No limit | No limit | |
+| Signal | Any one emoji | 1; a new one replaces mine | No limit | |
+
+Where nothing may be added (reactions off, only joining allowed, a message at its cap) the toolbar's Add reaction, the menu's React and the `+` chip are absent; the `+` chip stays laid out so the row keeps its height. A chip that cannot be joined is not clickable and its tooltip says why. A chatd that does not answer `Reactions` leaves everything offered, as before.
 
 ## Delete (frame 12)
 

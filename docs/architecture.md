@@ -52,7 +52,8 @@ How the processes fit together and who may edit what. The contract itself is the
 | `MarkRead {conversation, message_id}` | `Ok` | store; `Command::MarkRead` |
 | `Send {.., with}`, `Retry`, `Discard`, `CancelSend`, `Typing` | `Sent {message}` (pending, files listed); `Ok` | store; `Command::Send`, or `SendWith` when `with` is not plain; `CancelSend`; `Typing` |
 | `Catalog {account, kind, space, query, cursor}` | `Catalog {items, cursor}` (≤ 200, kept 5 min) | `Command::Catalog` |
-| `React {conversation, message_id, emoji, on}` | `Ok` | store at once; `Command::React` (`Unsupported` until built) |
+| `React {conversation, message_id, emoji, on}` | `Ok` | refused by the rules first; store at once; `Command::React` (`Unsupported` until built) |
+| `Reactions {conversation}` | `Reactions {conversation, rules}` (kept 5 min) | `Command::ReactionRules` |
 | `Edit {.., text}`, `Delete {..}` | `Ok` once the network accepted | `Command::Edit` / `Delete` (`Unsupported` until built) |
 | `Fetch {account, ids, size, retry}` | `Media {files}` | store (size, retry); `blobs` |
 | `SignIn {network, at}`, `SignOut {account}` | `Status` | server |
@@ -73,7 +74,11 @@ How the processes fit together and who may edit what. The contract itself is the
   markup reaches the shell.
 - **Acting on a message**: a reaction shows at once (ours counts once, however often it is
   reported) and is taken back if the network refuses; a custom emoji that is not on the message
-  yet waits for the network's word, which names it. Edit and delete change nothing until the
+  yet waits for the network's word, which names it. Before that, chatd checks it against the
+  conversation's `ReactionRules` (which emoji, custom ones, how many of mine and how many
+  different ones a message holds), as the adapter reports them, and refuses what they refuse
+  without asking the network; where one reaction a person is the rule, a new one replaces mine
+  at once. It is sent as the network spells it (Telegram's ❤, not ❤️). Edit and delete change nothing until the
   adapter reports the result; the request's answer is the network's.
 - **Media** is `MediaFile {id, kind, width, height, bytes, path, failed}`. `path` is `None` until
   the file is on disk. The shell asks `Fetch` for what is on screen; a file landing is
