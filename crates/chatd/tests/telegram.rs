@@ -55,7 +55,8 @@ impl World {
 
     fn with(session: Option<&str>, qr_seconds: &str, env: &[(&str, &str)]) -> World {
         static NEXT: AtomicU32 = AtomicU32::new(0);
-        let dir = PathBuf::from(format!("/tmp/tinyclient-tg-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        // On Windows "/tmp" has no drive; chatd takes only absolute paths.
+        let dir = std::path::absolute(format!("/tmp/tinyclient-tg-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed))).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let log = std::fs::File::create(dir.join("stderr.log")).unwrap();
@@ -769,7 +770,8 @@ fn pickers_and_sending_with_files_options_and_picks() {
 
     // Files, from their paths, in 512 KB parts: one photo with a spoiler; then two photos and
     // a document sent as a file, an album of the photos and the document on its own.
-    let dir = PathBuf::from(format!("/tmp/tinyclient-tg-files-{}", std::process::id()));
+    // On Windows "/tmp" has no drive; chatd takes only absolute paths.
+    let dir = std::path::absolute(format!("/tmp/tinyclient-tg-files-{}", std::process::id())).unwrap();
     std::fs::create_dir_all(&dir).unwrap();
     let file = |name: &str, bytes: usize| {
         let path = dir.join(name);
@@ -923,7 +925,8 @@ fn cancelling_keeps_nothing_and_a_build_without_an_app_id_says_so() {
     if option_env!("TINYCLIENT_TELEGRAM_API_ID").is_some() {
         return;
     }
-    let dir = PathBuf::from(format!("/tmp/tinyclient-tg-{}-plain", std::process::id()));
+    // On Windows "/tmp" has no drive; chatd takes only absolute paths.
+    let dir = std::path::absolute(format!("/tmp/tinyclient-tg-{}-plain", std::process::id())).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_chatd")).env("TINYCLIENT_DIR", &dir).env_remove("TINYCLIENT_TELEGRAM_FAKE").stderr(Stdio::null()).spawn().unwrap();

@@ -667,12 +667,12 @@ impl World {
         static NEXT: AtomicU32 = AtomicU32::new(0);
         let (fake, socket_url) = Fake::start();
         setup(&fake);
-        // Short path: a unix socket address holds about 100 bytes.
-        let dir = PathBuf::from(format!(
+        // Short path: a unix socket address holds about 100 bytes. On Windows "/tmp" has no drive; chatd takes only absolute paths.
+        let dir = std::path::absolute(format!(
             "/tmp/tinyclient-slack-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
+        )).unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         let child = World::spawn(&fake, &socket_url, &dir);
         World { fake, socket_url, child, dir }

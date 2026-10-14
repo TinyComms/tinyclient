@@ -51,7 +51,8 @@ impl World {
 
     fn start(session: Option<&str>) -> World {
         static NEXT: AtomicU32 = AtomicU32::new(0);
-        let dir = PathBuf::from(format!("/tmp/tinyclient-sg-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        // On Windows "/tmp" has no drive; chatd takes only absolute paths.
+        let dir = std::path::absolute(format!("/tmp/tinyclient-sg-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed))).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let log = std::fs::File::create(dir.join("stderr.log")).unwrap();

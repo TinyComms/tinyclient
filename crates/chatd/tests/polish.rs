@@ -23,7 +23,8 @@ impl Daemon {
     fn start(args: &[&str], env: &[(&str, &str)], seed: impl FnOnce(&mut Store)) -> Daemon {
         static NEXT: AtomicU32 = AtomicU32::new(0);
         // Short: a unix socket address holds about 100 bytes.
-        let dir = PathBuf::from(format!("/tmp/tinyclient-pl-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        // On Windows "/tmp" has no drive; chatd takes only absolute paths.
+        let dir = std::path::absolute(format!("/tmp/tinyclient-pl-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed))).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         seed(&mut Store::open(&dir.join("chat.sqlite")).unwrap());

@@ -86,12 +86,12 @@ impl Daemon {
 
     fn with(args: &[&str], env: &[(&str, &str)], seed: impl FnOnce(&mut Store)) -> Daemon {
         static NEXT: AtomicU32 = AtomicU32::new(0);
-        // Short path: a unix socket address holds about 100 bytes.
-        let dir = PathBuf::from(format!(
+        // Short path: a unix socket address holds about 100 bytes. On Windows "/tmp" has no drive; chatd takes only absolute paths.
+        let dir = std::path::absolute(format!(
             "/tmp/tinyclient-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
+        )).unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         seed(&mut Store::open(&dir.join("chat.sqlite")).unwrap());
 
@@ -191,12 +191,28 @@ impl Drop for Daemon {
 }
 
 fn running(pid: u32) -> bool {
-    Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .output()
-        .unwrap()
-        .status
-        .success()
+    #[cfg(windows)]
+    {
+        // tasklist succeeds either way; a process that is gone is not in its list.
+        let filter = format!("PID eq {pid}");
+        let out = Command::new("tasklist").args(["/FI", &filter, "/FO", "CSV", "/NH"]).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).contains(&format!("\"{pid}\""))
+    }
+    #[cfg(not(windows))]
+    {
+        Command::new("kill").args(["-0", &pid.to_string()]).output().unwrap().status.success()
+    }
+}
+
+fn kill_pid(pid: u32) -> bool {
+    #[cfg(windows)]
+    {
+        Command::new("taskkill").args(["/F", "/PID", &pid.to_string()]).status().unwrap().success()
+    }
+    #[cfg(not(windows))]
+    {
+        Command::new("kill").args(["-9", &pid.to_string()]).status().unwrap().success()
+    }
 }
 
 fn gone_within(pid: u32, wait: Duration) -> bool {
@@ -519,7 +535,7 @@ fn mediad_dying_before_the_voice_session_arrives_is_a_failure_in_words_not_a_van
     chatd.ask(call_start());
     let pid = chatd.mediad_pids()[0];
 
-    assert!(Command::new("kill").args(["-9", &pid.to_string()]).status().unwrap().success());
+    assert!(kill_pid(pid));
     // The thread that reads mediad settles the call once its stdout closes.
     let settled = chatd.until("the failure", Request::Status, |status| failed_with(status, CallFailure::Engine));
     assert!(matches!(settled, Response::Status { media: Media::Stopped, .. }), "{settled:?}");
@@ -1071,7 +1087,7 @@ fn a_voice_channel_says_who_is_in_it_and_a_call_that_fails_takes_us_out_of_it() 
 
     // mediad dies. The call is a failure in words, and the network no longer shows us there.
     let pid = chatd.mediad_pids()[0];
-    assert!(Command::new("kill").args(["-9", &pid.to_string()]).status().unwrap().success());
+    assert!(kill_pid(pid));
     chatd.until("the failure", Request::Status, |status| failed_with(status, CallFailure::Engine));
     let request = Request::Conversation { conversation: campfire.clone() };
     let left = |answer: &Response| matches!(answer, Response::Conversation { conversation } if names(conversation).len() == 3);

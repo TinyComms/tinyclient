@@ -558,8 +558,8 @@ impl World {
     fn start() -> World {
         static NEXT: AtomicU32 = AtomicU32::new(0);
         let fake = Fake::start();
-        // Short path: a unix socket address holds about 100 bytes.
-        let dir = PathBuf::from(format!("/tmp/tinyclient-teams-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        // Short path: a unix socket address holds about 100 bytes. On Windows "/tmp" has no drive; chatd takes only absolute paths.
+        let dir = std::path::absolute(format!("/tmp/tinyclient-teams-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed))).unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         // What the sign-in helper prints for someone who is also a guest in a second tenant.
         let session = json!({
@@ -1277,7 +1277,8 @@ fn mentions_missed_while_closed_info_mute_seen_hidden_chats_and_files_through_on
 
     // A file is refused until it can be shared with the chat's members alone: an
     // organization-wide link is not what the Teams app makes. Nothing reaches OneDrive.
-    let staged = PathBuf::from(format!("/tmp/tinyclient-teams-file-{}", std::process::id()));
+    // On Windows "/tmp" has no drive; chatd takes only absolute paths.
+    let staged = std::path::absolute(format!("/tmp/tinyclient-teams-file-{}", std::process::id())).unwrap();
     std::fs::create_dir_all(&staged).unwrap();
     let path = staged.join("notes.txt");
     std::fs::write(&path, b"standup notes").unwrap();

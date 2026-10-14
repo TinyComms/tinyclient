@@ -168,8 +168,8 @@ impl Daemon {
     /// The same, and whatever else `seed` puts in the store.
     fn scratch_with(registered: &[(MediaFile, String)], seed: impl FnOnce(&mut Store)) -> PathBuf {
         static NEXT: AtomicU32 = AtomicU32::new(0);
-        // Short path: a unix socket address holds about 100 bytes.
-        let dir = PathBuf::from(format!("/tmp/tinyclient-blobs-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        // Short path: a unix socket address holds about 100 bytes. On Windows "/tmp" has no drive; chatd takes only absolute paths.
+        let dir = std::path::absolute(format!("/tmp/tinyclient-blobs-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed))).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let mut store = Store::open(&dir.join("chat.sqlite")).unwrap();
