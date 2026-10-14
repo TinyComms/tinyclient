@@ -1,0 +1,154 @@
+//! Settings › Accounts (08 §5 and §6, with 01's sizes): one card per network, a row per
+//! account with its state in words, Sign in, Sign in again and Sign out…
+
+use super::controls::{caption, card, group_label, rule};
+use super::{Confirm, SettingsWindow};
+use crate::gui::components::{button, link_word, network_icon, ButtonKind};
+use crate::gui::layout::NETWORK_ORDER;
+use crate::gui::theme::{self, Type};
+use gpui::{div, prelude::*, px, AnyElement, Context, Div, SharedString};
+use protocol::{AccountStatus, Link, Network};
+
+pub fn network_name(network: Network) -> &'static str {
+    match network {
+        Network::Teams => "Microsoft Teams",
+        other => other.label(),
+    }
+}
+
+/// An account's state in words: the link, or what stands in its way.
+fn account_state(account: &AccountStatus) -> String {
+    if !account.required.is_empty() {
+        return "Needs attention in its own app".to_owned();
+    }
+    match account.link {
+        Link::Offline if !account.reconnecting => "Offline".to_owned(),
+        link => link_word(link).to_owned(),
+    }
+}
+
+fn dot(account: &AccountStatus) -> Div {
+    let color = match account.link {
+        Link::Connected => theme::positive(),
+        Link::Offline => theme::warning(),
+        Link::Expired | Link::SignedOut => theme::text_faint(),
+    };
+    div().size(px(6.)).rounded_full().bg(color).flex_none()
+}
+
+fn account_row(network: Network, name: SharedString, line: SharedString, dot: Option<Div>, action: AnyElement) -> Div {
+    div()
+        .min_h(px(52.))
+        .px(px(12.))
+        .py(px(8.))
+        .flex()
+        .items_center()
+        .gap(px(12.))
+        .child(
+            div()
+                .size(px(32.))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(network_icon(network, 24.)),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .child(div().type_ui().text_color(theme::text()).truncate().child(name))
+                .child(div().flex().items_center().gap(px(6.)).children(dot).child(div().type_small().text_color(theme::text_soft()).child(line))),
+        )
+        .child(action)
+}
+
+impl SettingsWindow {
+    pub(super) fn accounts(&mut self, cx: &mut Context<Self>) -> Div {
+        let Some(shell) = self.shell.upgrade() else {
+            return div();
+        };
+        let shell = shell.read(cx);
+        let accounts = shell.snapshot.as_ref().map(|s| s.accounts.clone()).unwrap_or_default();
+        let (signing_in, failed) = (shell.signing_in, shell.sign_in_failed.clone());
+        let mut pane = div().flex().flex_col().gap(px(20.));
+        for network in NETWORK_ORDER {
+            let mine: Vec<&AccountStatus> = accounts.iter().filter(|a| a.key.network == network && a.link != Link::SignedOut).collect();
+            let mut group = card();
+            if mine.is_empty() {
+                let waiting = signing_in == Some(network);
+                let line = if waiting { "Finish signing in in the other window." } else { "Not signed in" };
+                let action = if waiting {
+                    div().into_any_element()
+                } else {
+                    button(("sign-in", network as usize), ButtonKind::Secondary, "Sign in")
+                        .on_click(cx.listener(move |this, _, _, cx| this.sign_in(network, cx)))
+                        .into_any_element()
+                };
+                group = group.child(account_row(network, network_name(network).into(), line.into(), None, action));
+            }
+            for (ix, account) in mine.iter().enumerate() {
+                let state = account_state(account);
+                let action = if account.link == Link::Expired {
+                    button(("sign-in-again", ix + 10 * network as usize), ButtonKind::Primary, "Sign in again")
+                        .on_click(cx.listener(move |this, _, _, cx| this.sign_in(network, cx)))
+                        .into_any_element()
+                } else {
+                    let account = (*account).clone();
+                    button(("sign-out", ix + 10 * network as usize), ButtonKind::Ghost, "Sign out…")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.confirm = Some(Confirm::SignOut(account.clone()));
+                            cx.notify();
+                        }))
+                        .into_any_element()
+                };
+                let name: SharedString = if account.name.is_empty() { network_name(network).into() } else { account.name.clone().into() };
+                let line = format!("{} · {}", network_name(network), state);
+                group = group.when(ix > 0, |group| group.child(rule())).child(account_row(network, name, line.into(), Some(dot(account)), action));
+            }
+            pane = pane.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(group_label(network_name(network)))
+                    .child(group)
+                    .children(failed.as_ref().filter(|(at, _)| *at == network).map(|(_, words)| {
+                        div().pt(px(6.)).px(px(12.)).type_small().text_color(theme::danger()).child(words.clone())
+                    })),
+            );
+        }
+        pane.child(caption("Signing out removes this account's sign-in and everything tinyclient saved for it from this Mac.").pt(px(0.)))
+    }
+
+    fn sign_in(&mut self, network: Network, cx: &mut Context<Self>) {
+        let _ = self.shell.update(cx, |shell, cx| shell.sign_in(network, cx));
+        cx.notify();
+    }
+
+    pub(super) fn sign_out(&mut self, account: protocol::AccountKey, cx: &mut Context<Self>) {
+        let _ = self.shell.update(cx, |shell, cx| shell.sign_out(account, cx));
+        cx.notify();
+    }
+
+    /// The sign-out question (§6), over the whole window.
+    pub(super) fn sign_out_modal(&self, account: &AccountStatus, cx: &mut Context<Self>) -> Div {
+        let network = network_name(account.key.network);
+        let name = if account.name.is_empty() { network.to_owned() } else { account.name.clone() };
+        let key = account.key.clone();
+        super::modal_panel(
+            format!("Sign out of {name}?"),
+            vec![
+                format!("This removes from this Mac the saved sign-in and the saved messages, images and files of this account, and ends this session on {network}."),
+                format!("Nothing is deleted on {network}. Your other accounts are not touched."),
+            ],
+            button("sign-out-confirm", ButtonKind::Danger, "Sign out").on_click(cx.listener(move |this, _, _, cx| {
+                this.confirm = None;
+                this.sign_out(key.clone(), cx);
+            })),
+            cx,
+        )
+    }
+}

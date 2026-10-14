@@ -1,0 +1,1000 @@
+//! What each section draws (`docs/design/09-settings.md` §4), the search results (§7), the
+//! modals and the device menus. Every row is built by `control_row` from its id, so a search
+//! result is the same live row its section shows.
+
+use super::accounts::network_name;
+use super::controls::{self, caption, card, group_label, reset_button, reset_slot, row, rule, slider_track, slider_value, switch};
+use super::rows::{self, Row};
+use super::{modal_panel, Confirm, Picker, Section, SettingsWindow};
+use crate::gui::app::prefs::{self, Choices};
+use crate::gui::components::{button, glyph, keycap, menu, menu_item_check, menu_separator, network_icon, placed, segment, segmented, ButtonKind, Layer, Place};
+use crate::gui::layout::NETWORK_ORDER;
+use crate::gui::theme::{self, Type};
+use gpui::{canvas, div, prelude::*, px, AnyElement, ClipboardItem, Context, Div, MouseButton, SharedString, Window};
+use protocol::settings::{
+    self as keys, account_scope, Values, CACHE_MB, CACHE_MB_CHOICES, CUE_CONNECTION, CUE_JOINS, CUE_MINE, CUE_VOLUME, GLOBAL,
+    INPUT, JOIN_MUTED, KEEP_DAYS, KEEP_DAYS_CHOICES, KEEP_RUNNING, OUTPUT, RECEIPTS, SENSITIVITY, SOUNDS, TYPING, VOICE_VOLUME,
+};
+use protocol::{AccountStatus, Link, Network, Request, Response};
+use std::rc::Rc;
+
+/// How a slider reads, stores and labels its value.
+pub struct Slider {
+    pub range: (u32, u32),
+    pub default: u32,
+    pub read: fn() -> u32,
+    pub stops: Option<u32>,
+    pub width: f32,
+    pub words: fn(u32) -> String,
+}
+
+pub fn slider(id: &str) -> Slider {
+    let percent = |value: u32| format!("{value} %");
+    match id {
+        // Text size: five stops, −1 to +3, stored as 0 to 4.
+        "A2" => Slider { range: (0, 4), default: 1, read: || (theme::text_step() + 1) as u32, stops: Some(5), width: controls::TRACK, words: |v| format!("{} pt", 13 + v) },
+        "S10" => Slider { range: (0, 100), default: 50, read: || prefs::values().number(CUE_VOLUME), stops: None, width: controls::TRACK, words: percent },
+        "V5" => Slider { range: (0, 100), default: 100, read: || prefs::values().number(VOICE_VOLUME), stops: None, width: controls::TRACK, words: percent },
+        _ => Slider { range: (0, 100), default: 25, read: || prefs::values().number(SENSITIVITY), stops: None, width: controls::METER, words: |v| v.to_string() },
+    }
+}
+
+pub fn store_slider(window: &mut SettingsWindow, id: &'static str, value: u32, cx: &mut Context<SettingsWindow>) {
+    let key = match id {
+        "A2" => return window.set_text_step(value as i32 - 1, cx),
+        "S10" => CUE_VOLUME,
+        "V5" => VOICE_VOLUME,
+        _ => SENSITIVITY,
+    };
+    // Only what differs from the default is stored.
+    let stored = (value != Values::default_number(key)).then(|| value.to_string());
+    window.set(id, GLOBAL.into(), key, stored, cx);
+}
+
+fn label_of(id: &str) -> &'static str {
+    rows::find(id).map_or("", |row| row.label)
+}
+
+/// The accounts that have rows of their own, in the rail's order.
+fn accounts(window: &SettingsWindow, cx: &gpui::App) -> Vec<AccountStatus> {
+    let Some(shell) = window.shell.upgrade() else {
+        return Vec::new();
+    };
+    let held = shell.read(cx).snapshot.as_ref().map(|s| s.accounts.clone()).unwrap_or_default();
+    let mut accounts: Vec<AccountStatus> = held.into_iter().filter(|a| a.link != Link::SignedOut).collect();
+    accounts.sort_by_key(|a| NETWORK_ORDER.iter().position(|n| *n == a.key.network));
+    accounts
+}
+
+fn megabytes(bytes: u64) -> String {
+    let mb = bytes as f64 / (1024. * 1024.);
+    if mb >= 1024. {
+        format!("{:.1} GB", mb / 1024.)
+    } else if mb >= 10. {
+        format!("{mb:.0} MB")
+    } else {
+        format!("{mb:.1} MB")
+    }
+}
+
+/// The P4 modal's sentence.
+pub fn retention_words(prunable: Option<(u64, u64)>) -> String {
+    let rest = "are removed from this Mac. They stay on Slack, Discord and the others.";
+    match prunable {
+        Some((0, _)) => "Nothing here is that old yet. Older messages will be removed from this Mac as they age.".to_owned(),
+        Some((messages, bytes)) => {
+            let count = messages.to_string();
+            // Thousands get a comma, as everywhere else in the app.
+            let mut grouped = String::new();
+            for (ix, digit) in count.chars().enumerate() {
+                if ix > 0 && (count.len() - ix).is_multiple_of(3) {
+                    grouped.push(',');
+                }
+                grouped.push(digit);
+            }
+            let noun = if messages == 1 { "message" } else { "messages" };
+            let verb = if messages == 1 { "is removed" } else { "are removed" };
+            let rest = rest.replacen("are removed", verb, 1);
+            // A size under a tenth of a megabyte says nothing worth reading.
+            if bytes < 100 * 1024 {
+                format!("{grouped} {noun} {rest}")
+            } else {
+                format!("{grouped} {noun}, about {}, {rest}", megabytes(bytes))
+            }
+        }
+        None => format!("Older messages {rest}"),
+    }
+}
+
+impl SettingsWindow {
+    pub(super) fn page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let column = div().w(px(controls::COLUMN)).flex().flex_col();
+        let groups: Vec<Div> = match self.section {
+            Section::Accounts => return column.child(self.accounts(cx)),
+            Section::General => vec![self.group(&["G2"], None, window, cx).child(caption(self.keep_running_caption()))],
+            Section::Sounds => vec![
+                self.group(&["S1"], None, window, cx),
+                self.group(&["S7", "S8", "S9", "S10"], Some("In calls"), window, cx)
+                    .child(caption("Call sounds play on your call speaker, quieter than voices. Voice volume is in Audio & video.")),
+            ],
+            Section::Appearance => vec![
+                self.group(&["A2", "A3", "A4"], None, window, cx)
+                    .child(caption("Text size is also ⌘+, ⌘− and ⌘0. Reduce Motion follows System Settings.")),
+            ],
+            Section::Messages => vec![self.group(&["M1", "M2", "M3", "M4"], None, window, cx)],
+            Section::Privacy => {
+                let mut groups = self.per_account(window, cx);
+                groups.push(self.group(&["P3"], None, window, cx));
+                groups.push(
+                    self.group(&["P4"], None, window, cx)
+                        .child(caption("Older messages are deleted here, never on the networks. Each conversation also keeps at most its newest 2,000.")),
+                );
+                groups
+            }
+            Section::Audio => vec![
+                self.group(&["V1", "V3"], Some("Microphone"), window, cx),
+                self.group(&["V2", "V5"], Some("Speaker"), window, cx)
+                    .child(caption("Picking a device in a call's menu changes that call only. These are the defaults.")),
+                self.group(&["V4"], Some("Joining"), window, cx),
+            ],
+            Section::Storage => vec![self.group(&["D1", "D2", "D3"], None, window, cx).child(caption("Sign-ins, drafts and settings are not part of this."))],
+            Section::Shortcuts => return column.child(self.shortcuts("")),
+            Section::About => return column.child(self.about(window, cx)),
+        };
+        let banner = self.banner(cx);
+        column.children(banner).children(groups.into_iter().enumerate().map(|(ix, group)| group.when(ix > 0, |group| group.pt(px(20.)))))
+    }
+
+    /// A banner over sections whose rows chatd keeps, when chatd does not answer.
+    fn banner(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let chatd = matches!(self.section, Section::General | Section::Sounds | Section::Privacy | Section::Audio | Section::Storage);
+        let denied = self.section == Section::Audio && self.devices.as_ref().is_some_and(|d| d.microphone == "denied");
+        let (icon, words, action): (&'static str, &'static str, Option<(&'static str, &'static str)>) = if chatd && !self.reachable(cx) {
+            ("icons/wifi-off.svg", "Can't reach tinyclient's background service. These settings return when it does.", None)
+        } else if denied {
+            (
+                "icons/mic-off.svg",
+                "tinyclient can't use the microphone. Allow it in System Settings › Privacy & Security › Microphone.",
+                Some(("Open System Settings", "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")),
+            )
+        } else {
+            return None;
+        };
+        Some(
+            div().pb(px(16.)).child(
+                div()
+                    .min_h(px(40.))
+                    .px(px(12.))
+                    .py(px(8.))
+                    .rounded(px(theme::R_CONTROL))
+                    .bg(theme::raised())
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(glyph(icon, 16., theme::warning()))
+                    .child(div().flex_1().type_ui().text_color(theme::text()).child(words))
+                    .children(action.map(|(label, url)| {
+                        button("banner-action", ButtonKind::Secondary, label).h(px(24.)).on_click(cx.listener(move |_, _, _, cx| cx.open_url(url)))
+                    })),
+            ),
+        )
+    }
+
+    fn keep_running_caption(&self) -> &'static str {
+        if prefs::values().on(KEEP_RUNNING) {
+            "Closing the window leaves tinyclient running. Quit with ⌘Q to stop it."
+        } else {
+            "Closing the window quits tinyclient. Nothing arrives until you open it again."
+        }
+    }
+
+    /// A card of rows, with its label above.
+    fn group(&mut self, ids: &[&'static str], label: Option<&'static str>, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let mut card = card();
+        for (ix, id) in ids.iter().enumerate() {
+            card = card.when(ix > 0, |card| card.child(rule())).child(self.control_row(id, window, cx));
+        }
+        div().flex().flex_col().children(label.map(group_label)).child(card)
+    }
+
+    /// One row by its id, live: the same in its section and in search results.
+    pub(super) fn control_row(&mut self, id: &'static str, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let values = prefs::values();
+        let choices = prefs::choices();
+        let label = label_of(id);
+        let built = match id {
+            "G2" => {
+                let on = values.on(KEEP_RUNNING);
+                self.switch_row(id, on, true, None, move |this, on, cx| this.set_switch(id, KEEP_RUNNING, on, true, cx), cx)
+            }
+            "S1" => {
+                let on = values.on(SOUNDS);
+                let second = (!on).then(|| "Calls make no sounds. Your choices below are kept.".to_owned());
+                self.switch_row(id, on, true, second, move |this, on, cx| this.set_switch(id, SOUNDS, on, true, cx), cx)
+            }
+            "S7" | "S8" | "S9" => {
+                let key = match id {
+                    "S7" => CUE_JOINS,
+                    "S8" => CUE_MINE,
+                    _ => CUE_CONNECTION,
+                };
+                let on = values.on(key);
+                self.switch_row(id, on, true, None, move |this, on, cx| this.set_switch(id, key, on, true, cx), cx)
+            }
+            "S10" => {
+                let output = self.devices.as_ref().map(|d| d.default_output.clone()).unwrap_or_default();
+                let device = values.device(OUTPUT).unwrap_or(output);
+                let tip = if device.is_empty() { "Play test sound".to_owned() } else { format!("Play test sound on {device}") };
+                let play = div()
+                    .id("S12")
+                    .ml(px(4.))
+                    .size(px(28.))
+                    .rounded(px(theme::R_CONTROL))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .tab_index(0)
+                    .role(gpui::Role::Button)
+                    .aria_label(SharedString::from(tip.clone()))
+                    .tooltip(crate::gui::components::tip(tip, None))
+                    .hover(|style| style.bg(theme::hover()))
+                    .focus_visible(|style| style.shadow(theme::focus_ring()))
+                    .child(glyph("icons/play.svg", 16., theme::text_soft()))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if this.reachable(cx) {
+                            this.off_thread(cx, || crate::client::ask(&Request::TestSound), |this, answer, cx| {
+                                if !matches!(answer, Ok(Response::Ok)) {
+                                    this.failed = Some("S10");
+                                    cx.notify();
+                                }
+                            });
+                        }
+                    }));
+                row(label, None, div().flex().items_center().child(self.slider_control(id, cx)).child(play))
+            }
+            "A2" => row(label, None, self.slider_control(id, cx)),
+            "A3" => {
+                let second = choices.compact.then(|| "List rows are 40 instead of 48.".to_owned());
+                self.segmented_row(id, &["Comfortable", "Compact"], usize::from(choices.compact), 0, second, |this, ix, cx| this.choose(|c| c.compact = ix == 1, cx), cx)
+            }
+            "A4" => {
+                let second = (!choices.previews).then(|| "Rows show names and times only.".to_owned());
+                self.switch_row(id, choices.previews, true, second, |this, on, cx| this.choose(|c| c.previews = on, cx), cx)
+            }
+            "M1" => {
+                let second = if choices.command_return { "Return adds a line." } else { "⇧Return adds a line." };
+                self.segmented_row(id, &["Return", "⌘Return"], usize::from(choices.command_return), 0, Some(second.to_owned()), |this, ix, cx| this.choose(|c| c.command_return = ix == 1, cx), cx)
+            }
+            "M2" => self.segmented_row(id, &["First unread", "Newest message"], usize::from(choices.newest), 0, None, |this, ix, cx| this.choose(|c| c.newest = ix == 1, cx), cx),
+            "M3" => self.switch_row(id, choices.typing, true, None, |this, on, cx| this.choose(|c| c.typing = on, cx), cx),
+            "M4" => {
+                let second = "When you send, :) :( :D ;) <3 become 🙂 🙁 😀 😉 ❤️. Never inside code.".to_owned();
+                self.switch_row(id, choices.emoticons, false, Some(second), |this, on, cx| this.choose(|c| c.emoticons = on, cx), cx)
+            }
+            "P3" => {
+                let second = (!choices.images).then(|| "Nothing is fetched until you click it.".to_owned());
+                self.switch_row(id, choices.images, true, second, |this, on, cx| this.choose(|c| c.images = on, cx), cx)
+            }
+            "P4" => {
+                let days = values.number(KEEP_DAYS);
+                let at = KEEP_DAYS_CHOICES.iter().position(|d| *d == days).unwrap_or(2);
+                self.segmented_row(id, &["7 days", "30 days", "90 days"], at, 2, None, move |this, ix, cx| this.pick_retention(KEEP_DAYS_CHOICES[ix], cx), cx)
+            }
+            "P1" | "P2" => return self.per_account_rows(id, cx),
+            "V1" | "V2" => self.device_row(id, cx),
+            "V3" => self.meter_row(cx),
+            "V6" => row(label, None, self.slider_control(id, cx)),
+            "V5" => row(label, None, self.slider_control(id, cx)),
+            "V4" => {
+                let on = values.on(JOIN_MUTED);
+                self.switch_row(id, on, false, None, move |this, on, cx| this.set_switch(id, JOIN_MUTED, on, false, cx), cx)
+            }
+            "D1" => self.usage(cx),
+            "D2" => {
+                let cap = values.number(CACHE_MB);
+                let at = CACHE_MB_CHOICES.iter().position(|mb| *mb == cap).unwrap_or(1);
+                let second = Some("The oldest unused go first.".to_owned());
+                self.segmented_row(id, &["250 MB", "500 MB", "1 GB", "2 GB"], at, 1, second, move |this, ix, cx| {
+                    let mb = CACHE_MB_CHOICES[ix];
+                    let stored = (mb != Values::default_number(CACHE_MB)).then(|| mb.to_string());
+                    this.set("D2", GLOBAL.into(), CACHE_MB, stored, cx);
+                }, cx)
+            }
+            "D3" => row(
+                label,
+                None,
+                button("D3", ButtonKind::Danger, "Clear…").on_click(cx.listener(|this, _, _, cx| {
+                    this.confirm = Some(Confirm::Clear);
+                    cx.notify();
+                })),
+            ),
+            "B1" => row(
+                label,
+                Some("Version, macOS, memory and connection states. No messages, names or tokens.".into()),
+                button("B1", ButtonKind::Secondary, "Copy").on_click(cx.listener(|this, _, _, cx| this.copy_diagnostics(cx))),
+            ),
+            "B2" => row(
+                label,
+                None,
+                button("B2", ButtonKind::Secondary, "Show in Finder").on_click(cx.listener(|_, _, _, cx| {
+                    let log = protocol::support_dir().join(protocol::launch::CHATD_LOG);
+                    if log.exists() {
+                        cx.reveal_path(&log);
+                    } else {
+                        cx.open_with_system(&protocol::support_dir());
+                    }
+                })),
+            ),
+            "B3" => row(
+                label,
+                None,
+                button("B3", ButtonKind::Danger, "Reset…").on_click(cx.listener(|this, _, _, cx| {
+                    this.confirm = Some(Confirm::Reset);
+                    cx.notify();
+                })),
+            ),
+            _ => div(),
+        };
+        let _ = window;
+        let lit = self.highlight == Some(id);
+        let failed = (self.failed == Some(id)).then(|| div().px(px(12.)).pb(px(8.)).type_small().text_color(theme::danger()).child("Couldn't save. Try again."));
+        div().flex().flex_col().rounded(px(theme::R_CARD)).when(lit, |row| row.bg(theme::selected())).child(built).children(failed)
+    }
+
+    fn set_switch(&mut self, row: &'static str, key: &'static str, on: bool, default: bool, cx: &mut Context<Self>) {
+        if !self.reachable(cx) {
+            return;
+        }
+        let stored = (on != default).then(|| if on { "on" } else { "off" }.to_owned());
+        self.set(row, GLOBAL.into(), key, stored, cx);
+    }
+
+    /// A row whose whole width toggles its switch, with the reset slot before it.
+    fn switch_row(
+        &mut self,
+        id: &'static str,
+        on: bool,
+        default: bool,
+        second: Option<String>,
+        toggle: impl Fn(&mut SettingsWindow, bool, &mut Context<SettingsWindow>) + 'static,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let label = label_of(id);
+        let toggle = Rc::new(toggle);
+        let (by_row, by_switch, by_reset) = (toggle.clone(), toggle.clone(), toggle);
+        let reset = (on != default).then(|| {
+            reset_button(SharedString::from(format!("{id}-reset")), format!("Reset {label} to {}", if default { "on" } else { "off" }).into())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    by_reset(this, default, cx);
+                }))
+        });
+        let control = div().flex().items_center().child(reset_slot(reset)).child(switch(SharedString::from(format!("{id}-switch")), label, on).on_click(
+            cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                by_switch(this, !on, cx);
+            }),
+        ));
+        div().child(
+            div()
+                .id(SharedString::from(format!("{id}-row")))
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _, _, cx| by_row(this, !on, cx)))
+                .child(row(label, second.map(SharedString::from), control)),
+        )
+    }
+
+    /// Two to four choices, ← → moving between them when it has the keys.
+    #[allow(clippy::too_many_arguments)]
+    fn segmented_row(
+        &mut self,
+        id: &'static str,
+        choices: &[&'static str],
+        current: usize,
+        default: usize,
+        second: Option<String>,
+        pick: impl Fn(&mut SettingsWindow, usize, &mut Context<SettingsWindow>) + 'static,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let label = label_of(id);
+        let pick = Rc::new(pick);
+        let count = choices.len();
+        let mut control = segmented()
+            .id(SharedString::from(format!("{id}-choices")))
+            .tab_index(0)
+            .role(gpui::Role::RadioGroup)
+            .aria_label(label)
+            .focus_visible(|style| style.shadow(theme::focus_ring()));
+        let keys = pick.clone();
+        control = control.on_key_down(cx.listener(move |this, event: &gpui::KeyDownEvent, _, cx| {
+            let next = match event.keystroke.key.as_str() {
+                "left" if current > 0 => current - 1,
+                "right" if current + 1 < count => current + 1,
+                _ => return,
+            };
+            cx.stop_propagation();
+            keys(this, next, cx);
+        }));
+        for (ix, choice) in choices.iter().enumerate() {
+            let pick = pick.clone();
+            control = control.child(
+                segment(SharedString::from(format!("{id}-{ix}")), *choice, ix == current)
+                    .role(gpui::Role::RadioButton)
+                    .aria_label(*choice)
+                    .aria_selected(ix == current)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if ix != current {
+                            pick(this, ix, cx);
+                        }
+                    })),
+            );
+        }
+        let reset_to = pick.clone();
+        let reset = (current != default).then(|| {
+            reset_button(SharedString::from(format!("{id}-reset")), format!("Reset {label} to {}", choices[default]).into())
+                .on_click(cx.listener(move |this, _, _, cx| reset_to(this, default, cx)))
+        });
+        row(label, second.map(SharedString::from), div().flex().items_center().child(reset_slot(reset)).child(control))
+    }
+
+    /// The track, its value and its reset, for slider `id`.
+    fn slider_control(&mut self, id: &'static str, cx: &mut Context<Self>) -> Div {
+        let spec = slider(id);
+        let stored = (spec.read)();
+        let value = self.pending.get(id).copied().unwrap_or(stored);
+        let anchors = self.anchors.clone();
+        let label = label_of(id);
+        let reset = (stored != spec.default).then(|| {
+            reset_button(SharedString::from(format!("{id}-reset")), format!("Reset {label} to {}", (spec.words)(spec.default)).into())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.pending.remove(id);
+                    let default = slider(id).default;
+                    store_slider(this, id, default, cx);
+                }))
+        });
+        let track = div()
+            .id(SharedString::from(format!("{id}-slider")))
+            .relative()
+            .cursor_pointer()
+            .tab_index(0)
+            .role(gpui::Role::Slider)
+            .aria_label(label)
+            .aria_numeric_value(f64::from(value))
+            .aria_min_numeric_value(f64::from(spec.range.0))
+            .aria_max_numeric_value(f64::from(spec.range.1))
+            .aria_numeric_value_step(1.)
+            .aria_value((spec.words)(value))
+            .rounded(px(theme::R_CONTROL))
+            .focus_visible(|style| style.shadow(theme::focus_ring()))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                    this.drag = Some(id);
+                    this.slide_to(id, event.position.x, cx);
+                }),
+            )
+            .on_key_down(cx.listener(move |this, event: &gpui::KeyDownEvent, _, cx| {
+                if this.slider_key(id, event.keystroke.key.as_str(), event.keystroke.modifiers.alt, cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            .child(slider_track(value, spec.range, spec.stops, Some(spec.default), spec.width))
+            .child(canvas(move |bounds, _, _| { anchors.borrow_mut().insert(id, bounds); }, |_, _, _, _| {}).absolute().top_0().left_0().size_full());
+        let ends = |size: f32| div().w(px(16.)).flex().justify_center().type_ui().text_size(px(size)).text_color(theme::text_soft()).child("A");
+        let track = if id == "A2" { div().flex().items_center().gap(px(8.)).child(ends(11.)).child(track).child(ends(16.)) } else { div().child(track) };
+        div().flex().items_center().child(reset_slot(reset)).child(track).child(div().w(px(8.))).child(slider_value((spec.words)(value)))
+    }
+
+    /// P1 and P2: a card per setting, one row per account, fixed rows where the network decides.
+    fn per_account(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<Div> {
+        let accounts = accounts(self, cx);
+        if accounts.is_empty() {
+            return vec![div().flex().flex_col().child(group_label("Let others see")).child(caption("Sign in to an account to choose what it shares.").pt(px(0.)))];
+        }
+        let _ = window;
+        let typing = div().flex().flex_col().child(group_label(label_of("P1"))).child(self.per_account_rows("P1", cx));
+        let receipts = div()
+            .pt(px(20.))
+            .flex()
+            .flex_col()
+            .child(group_label(label_of("P2")))
+            .child(self.per_account_rows("P2", cx))
+            .child(caption("Discord and Slack have no read receipts."));
+        vec![typing, receipts]
+    }
+
+    fn per_account_rows(&mut self, id: &'static str, cx: &mut Context<Self>) -> Div {
+        let values = prefs::values();
+        let accounts = accounts(self, cx);
+        let several = |network: Network| accounts.iter().filter(|a| a.key.network == network).count() > 1;
+        let mut card = card();
+        let mut drawn = 0;
+        for (ix, account) in accounts.iter().enumerate() {
+            let network = account.key.network;
+            // Fixed rows say what the network decides; Discord and Slack have no receipts.
+            let (fixed, reason): (Option<&str>, Option<&str>) = match (id, network) {
+                ("P1", Network::Telegram) | ("P2", Network::Telegram) => (Some("Always on"), Some("Telegram does not let an app turn this off.")),
+                ("P1", Network::Signal) | ("P2", Network::Signal) => (Some("Set on your phone"), Some("Signal takes this from your phone's settings.")),
+                ("P2", Network::Discord | Network::Slack) => continue,
+                _ => (None, None),
+            };
+            let name = if account.name.is_empty() { network_name(network).to_owned() } else { account.name.clone() };
+            let second = if let Some(reason) = reason {
+                Some(reason.to_owned())
+            } else if id == "P2" {
+                Some("Off also leaves chats unread on your other devices.".to_owned())
+            } else if several(network) {
+                Some(network_name(network).to_owned())
+            } else {
+                None
+            };
+            let lead = div()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .when(account.link == Link::Expired, |lead| lead.opacity(0.4))
+                .child(network_icon(network, 16.))
+                .child(div().type_ui().text_color(theme::text()).child(name.clone()));
+            let control: AnyElement = match fixed {
+                Some(words) => div().type_ui().text_color(theme::text_soft()).child(words).into_any_element(),
+                None => {
+                    let scope = account_scope(&account.key);
+                    let (key, on, default) = if id == "P1" {
+                        (TYPING, values.typing(&account.key), keys::typing_default(network))
+                    } else {
+                        (RECEIPTS, values.receipts(&account.key), true)
+                    };
+                    let reset = (on != default).then(|| {
+                        let scope = scope.clone();
+                        reset_button(SharedString::from(format!("{id}-{ix}-reset")), format!("Reset {name} to {}", if default { "on" } else { "off" }).into())
+                            .on_click(cx.listener(move |this, _, _, cx| this.set(id, scope.clone(), key, None, cx)))
+                    });
+                    let toggle = move |this: &mut SettingsWindow, on: bool, scope: String, cx: &mut Context<SettingsWindow>| {
+                        if this.reachable(cx) {
+                            let stored = (on != default).then(|| if on { "on" } else { "off" }.to_owned());
+                            this.set(id, scope, key, stored, cx);
+                        }
+                    };
+                    div()
+                        .flex()
+                        .items_center()
+                        .child(reset_slot(reset))
+                        .child(switch(SharedString::from(format!("{id}-{ix}")), &name, on).on_click(cx.listener(move |this, _, _, cx| toggle(this, !on, scope.clone(), cx))))
+                        .into_any_element()
+                }
+            };
+            let step = theme::text_step().max(0) as f32 * 2.;
+            let line = div()
+                .min_h(px(if second.is_some() { 52. } else { 40. } + step))
+                .px(px(12.))
+                .py(px(if second.is_some() { 8. } else { 0. }))
+                .flex()
+                .items_center()
+                .gap(px(16.))
+                .child(div().flex_1().min_w_0().flex().flex_col().gap(px(2.)).child(lead).children(second.map(|line| div().pl(px(24.)).type_small().text_color(theme::text_soft()).child(line))))
+                .child(control);
+            card = card.when(drawn > 0, |card| card.child(rule())).child(line);
+            drawn += 1;
+        }
+        card
+    }
+
+    /// The menu button of a device picker (V1, V2).
+    fn device_row(&mut self, id: &'static str, cx: &mut Context<Self>) -> Div {
+        let (key, picker, noun) = if id == "V1" { (INPUT, Picker::Input, "microphone") } else { (OUTPUT, Picker::Output, "speaker") };
+        let stored = prefs::values().device(key);
+        let devices = self.devices.clone().unwrap_or_default();
+        let (listed, default) = if id == "V1" { (&devices.inputs, &devices.default_input) } else { (&devices.outputs, &devices.default_output) };
+        let gone = stored.as_ref().is_some_and(|name| self.devices.is_some() && !listed.contains(name));
+        let shown = match &stored {
+            Some(name) if gone => format!("{name} (not connected)"),
+            Some(name) => name.clone(),
+            None if listed.is_empty() && self.devices.is_some() => format!("No {noun} found"),
+            None if default.is_empty() => "System default".to_owned(),
+            None => format!("System default ({default})"),
+        };
+        let second = gone.then(|| "Calls use the system default until it is back.".into());
+        let anchors = self.anchors.clone();
+        let anchor: &'static str = if id == "V1" { "V1-menu" } else { "V2-menu" };
+        let label = label_of(id);
+        let picker_button = div()
+            .id(SharedString::from(format!("{id}-picker")))
+            .w(px(220.))
+            .h(px(theme::CONTROL))
+            .pl(px(10.))
+            .pr(px(8.))
+            .rounded(px(theme::R_CONTROL))
+            .bg(theme::hover())
+            .border_1()
+            .border_color(theme::border())
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .cursor_pointer()
+            .tab_index(0)
+            .role(gpui::Role::ComboBox)
+            .aria_label(label)
+            .aria_value(SharedString::from(shown.clone()))
+            .hover(|style| style.bg(theme::selected()).border_color(theme::border_strong()))
+            .focus_visible(|style| style.shadow(theme::focus_ring()))
+            .child(div().flex_1().min_w_0().truncate().type_ui().font_weight(theme::MEDIUM).text_color(if stored.is_some() && !gone { theme::text() } else { theme::text_soft() }).child(shown))
+            .child(glyph("icons/chevron-down.svg", 14., theme::text_soft()))
+            .child(canvas(move |bounds, _, _| { anchors.borrow_mut().insert(anchor, bounds); }, |_, _, _, _| {}).absolute().top_0().left_0().size_full())
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.picker = if this.picker == Some(picker) { None } else { Some(picker) };
+                // The list is read again as the menu opens: a device may have come or gone.
+                this.list_devices(cx);
+                cx.notify();
+            }));
+        let reset = stored.as_ref().map(|_| {
+            reset_button(SharedString::from(format!("{id}-reset")), format!("Reset {label} to the system default").into())
+                .on_click(cx.listener(move |this, _, _, cx| this.set(id, GLOBAL.into(), key, None, cx)))
+        });
+        row(label, second, div().flex().items_center().child(reset_slot(reset)).child(picker_button))
+    }
+
+    pub(super) fn device_menu(&mut self, picker: Picker, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (key, anchor, id) = match picker {
+            Picker::Input => (INPUT, "V1-menu", "V1"),
+            Picker::Output => (OUTPUT, "V2-menu", "V2"),
+        };
+        let bounds = self.anchors.borrow().get(anchor).copied()?;
+        let devices = self.devices.clone().unwrap_or_default();
+        let (listed, default) = match picker {
+            Picker::Input => (devices.inputs, devices.default_input),
+            Picker::Output => (devices.outputs, devices.default_output),
+        };
+        let stored = prefs::values().device(key);
+        let system = if default.is_empty() { "System default".to_owned() } else { format!("System default ({default})") };
+        fn pick(id: &'static str, key: &'static str, name: Option<String>) -> impl Fn(&mut SettingsWindow, &gpui::ClickEvent, &mut Window, &mut Context<SettingsWindow>) {
+            move |this, _, _, cx| {
+                this.picker = None;
+                if this.reachable(cx) {
+                    this.set(id, GLOBAL.into(), key, name.clone(), cx);
+                }
+                cx.notify();
+            }
+        }
+        let mut items = menu().min_w(px(bounds.size.width.into())).child(menu_item_check("device-default", stored.is_none(), system, None).on_click(cx.listener(pick(id, key, None))));
+        let mut names = listed;
+        if let Some(name) = stored.as_ref().filter(|name| !names.contains(name)) {
+            names.push(name.clone());
+        }
+        if !names.is_empty() {
+            items = items.child(menu_separator());
+        }
+        for (ix, name) in names.into_iter().enumerate() {
+            let missing = !self.devices.as_ref().is_some_and(|d| match picker {
+                Picker::Input => d.inputs.contains(&name),
+                Picker::Output => d.outputs.contains(&name),
+            });
+            let words = if missing { format!("{name} (not connected)") } else { name.clone() };
+            items = items.child(menu_item_check(("device", ix), stored.as_ref() == Some(&name), words, None).on_click(cx.listener(pick(id, key, Some(name)))));
+        }
+        let menu = div()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.picker = None;
+                cx.notify();
+            }))
+            .child(items);
+        Some(placed("device-menu", Place::Below(bounds), Layer::Menu, window, menu))
+    }
+
+    /// V3 and V6 on one row: the live meter with its Test button, and under it the
+    /// sensitivity slider whose thumb sits under the meter's line.
+    fn meter_row(&mut self, cx: &mut Context<Self>) -> Div {
+        let gate = self.pending.get("V6").copied().unwrap_or_else(|| prefs::values().number(SENSITIVITY));
+        let in_call = self.shell.upgrade().and_then(|shell| shell.read(cx).snapshot.as_ref()?.call.clone());
+        let level = match (&in_call, self.testing) {
+            (Some(call), Some(_)) => call.level,
+            (None, Some(_)) => self.level,
+            _ => None,
+        };
+        let testing = self.testing.is_some();
+        let test = button("V3", ButtonKind::Secondary, if testing { "Stop" } else { "Test" })
+            .w(px(64.))
+            .on_click(cx.listener(|this, _, _, cx| {
+                if this.reachable(cx) {
+                    this.toggle_test(cx);
+                }
+            }));
+        let second = if testing { "Speak normally. Green is what others would hear." } else { "Below the line nothing is sent and your speaking ring stays off." };
+        let label = |words: &'static str| div().w(px(96.)).type_ui().text_color(theme::text()).child(words);
+        let meter = div()
+            .id("V3-meter")
+            .role(gpui::Role::Meter)
+            .aria_label("Input level")
+            .aria_numeric_value(f64::from(level.unwrap_or(0)))
+            .child(controls::meter(level, gate));
+        div()
+            .px(px(12.))
+            .py(px(8.))
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .child(div().h(px(28.)).flex().items_center().child(label("Input level")).child(div().flex_1()).child(div().w(px(controls::RESET_SLOT))).child(meter).child(div().w(px(8.))).child(test))
+            .child(div().flex().items_center().child(label("Sensitivity")).child(div().flex_1()).child(self.slider_control("V6", cx)).child(div().w(px(16.))))
+            .child(div().pt(px(2.)).type_small().text_color(theme::text_soft()).child(second))
+    }
+
+    /// D1: what tinyclient keeps on this Mac, as a two-part bar.
+    fn usage(&mut self, cx: &mut Context<Self>) -> Div {
+        let Some((messages, files)) = self.storage else {
+            return row("Storage used", None, div().type_ui().text_color(theme::text_soft()).child("Counting…"));
+        };
+        let total = (messages + files).max(1);
+        let width = 238.;
+        let first = (messages as f32 / total as f32 * width).round();
+        let legend = |color: gpui::Rgba, words: String| div().flex().items_center().gap(px(6.)).child(div().size(px(8.)).rounded(px(2.)).bg(color)).child(words);
+        div()
+            .px(px(12.))
+            .py(px(8.))
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .child(div().flex_1().type_ui().font_weight(theme::SEMIBOLD).text_color(theme::text()).child(format!("{} on this Mac", megabytes(messages + files))))
+                    .child(button("D1", ButtonKind::Ghost, "Show in Finder").on_click(cx.listener(|_, _, _, cx| cx.open_with_system(&protocol::support_dir())))),
+            )
+            .child(
+                div()
+                    .w(px(width))
+                    .h(px(8.))
+                    .rounded(px(4.))
+                    .overflow_hidden()
+                    .flex()
+                    .gap(px(1.))
+                    .bg(theme::raised())
+                    .child(div().w(px(first)).h_full().bg(theme::accent()))
+                    .child(div().flex_1().h_full().bg(theme::positive())),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap(px(16.))
+                    .type_small()
+                    .text_color(theme::text_soft())
+                    .child(legend(theme::accent(), format!("Messages {}", megabytes(messages))))
+                    .child(legend(theme::positive(), format!("Images and files {}", megabytes(files)))),
+            )
+    }
+
+    /// P4: a longer time applies at once; a shorter one asks first, with what it deletes.
+    fn pick_retention(&mut self, days: u32, cx: &mut Context<Self>) {
+        if !self.reachable(cx) {
+            return;
+        }
+        if days >= prefs::values().number(KEEP_DAYS) {
+            let stored = (days != Values::default_number(KEEP_DAYS)).then(|| days.to_string());
+            self.set("P4", GLOBAL.into(), KEEP_DAYS, stored, cx);
+            return;
+        }
+        self.confirm = Some(Confirm::Retention { days, prunable: None });
+        self.off_thread(cx, move || crate::client::ask(&Request::Prunable { days }), move |this, answer, cx| {
+            if let (Some(Confirm::Retention { days: asked, prunable }), Ok(Response::Prunable { messages, bytes })) = (&mut this.confirm, answer) {
+                if *asked == days {
+                    *prunable = Some((messages, bytes));
+                    cx.notify();
+                }
+            }
+        });
+        cx.notify();
+    }
+
+    pub(super) fn modal(&mut self, confirm: &Confirm, cx: &mut Context<Self>) -> Div {
+        match confirm.clone() {
+            Confirm::SignOut(account) => self.sign_out_modal(&account, cx),
+            Confirm::Retention { days, prunable } => modal_panel(
+                format!("Delete messages older than {days} days?"),
+                vec![retention_words(prunable)],
+                button("retention-confirm", ButtonKind::Danger, "Delete").on_click(cx.listener(move |this, _, _, cx| {
+                    this.confirm = None;
+                    this.set("P4", GLOBAL.into(), KEEP_DAYS, Some(days.to_string()), cx);
+                })),
+                cx,
+            ),
+            Confirm::Clear => modal_panel(
+                "Clear saved messages and files?",
+                vec!["Everything tinyclient saved to show you quickly is deleted from this Mac. It comes back from the networks as you open conversations. Sign-ins, drafts and settings stay.".to_owned()],
+                button("clear-confirm", ButtonKind::Danger, "Clear").on_click(cx.listener(|this, _, _, cx| {
+                    this.confirm = None;
+                    this.off_thread(cx, || crate::client::ask(&Request::Clear), |this, answer, cx| {
+                        if !matches!(answer, Ok(Response::Ok)) {
+                            this.failed = Some("D3");
+                        }
+                        this.read_storage(cx);
+                        cx.notify();
+                    });
+                    cx.notify();
+                })),
+                cx,
+            ),
+            Confirm::Reset => modal_panel(
+                "Reset every setting to its default?",
+                vec!["Accounts, messages and files are not touched.".to_owned()],
+                button("reset-confirm", ButtonKind::Danger, "Reset").on_click(cx.listener(|this, _, _, cx| {
+                    this.confirm = None;
+                    this.reset_all(cx);
+                })),
+                cx,
+            ),
+        }
+    }
+
+    /// B3: chatd's settings, the window's own, and the text size, all to their defaults.
+    fn reset_all(&mut self, cx: &mut Context<Self>) {
+        let section = prefs::choices().section;
+        prefs::set_choices(Choices { section, ..Choices::default() });
+        theme::set_text_step(0);
+        self.pending.clear();
+        let _ = self.shell.update(cx, |shell, cx| {
+            shell.save_prefs(cx);
+            cx.notify();
+        });
+        cx.refresh_windows();
+        self.off_thread(cx, || crate::client::ask(&Request::ResetSettings), |this, answer, cx| {
+            if !matches!(answer, Ok(Response::Ok)) {
+                this.failed = Some("B3");
+            }
+            let _ = this.shell.update(cx, |shell, cx| shell.load_settings(cx));
+            cx.notify();
+        });
+    }
+
+    fn copy_diagnostics(&mut self, cx: &mut Context<Self>) {
+        let Some(shell) = self.shell.upgrade() else {
+            return;
+        };
+        let text = shell.read(cx).diagnostics();
+        self.off_thread(cx, move || super::super::app::with_memory(text), |this, text, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+            this.copied = Some(std::time::Instant::now());
+            cx.notify();
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(std::time::Duration::from_secs(4)).await;
+                let _ = this.update(cx, |_, cx| cx.notify());
+            })
+            .detach();
+        });
+    }
+
+    /// The Shortcuts section, or its lines that match `query`.
+    pub(super) fn shortcuts(&self, query: &str) -> Div {
+        let mut column = div().flex().flex_col();
+        if query.is_empty() {
+            column = column.child(caption("To change a shortcut, add it in System Settings › Keyboard › Keyboard Shortcuts › App Shortcuts. The call keys are in no menu, so they cannot be changed there.").pt(px(0.)).pb(px(14.)));
+        }
+        let found = rows::shortcuts(query);
+        let mut menus: Vec<&str> = Vec::new();
+        for shortcut in &found {
+            if !menus.contains(&shortcut.menu) {
+                menus.push(shortcut.menu);
+            }
+        }
+        for (ix, name) in menus.iter().enumerate() {
+            let mut card = card();
+            for (n, shortcut) in found.iter().filter(|s| s.menu == *name).enumerate() {
+                let keys = div().flex().gap(px(2.)).child(keycap(shortcut.keys));
+                card = card.when(n > 0, |card| card.child(rule())).child(
+                    div().h(px(32.)).px(px(12.)).flex().items_center().child(div().flex_1().type_ui().text_color(theme::text()).child(shortcut.command)).child(keys),
+                );
+            }
+            column = column.child(div().when(ix > 0, |group| group.pt(px(20.))).flex().flex_col().child(group_label(*name)).child(card));
+        }
+        column
+    }
+
+    fn about(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let version = format!("Version {}", env!("CARGO_PKG_VERSION"));
+        let plate = div()
+            .size(px(96.))
+            .rounded(px(22.))
+            .bg(gpui::rgb(0x1a1c2a))
+            .border_1()
+            .border_color(theme::hairline())
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(glyph("icons/messages-square.svg", 52., gpui::rgb(0xa3acff)));
+        let credit = |words: &'static str| div().px(px(12.)).py(px(10.)).type_small().text_color(theme::text_soft()).child(words);
+        let tools = self.group(&["B1", "B2", "B3"], None, window, cx);
+        div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap(px(6.))
+            .child(plate)
+            .child(div().pt(px(10.)).type_headline().text_color(theme::text()).child("tinyclient"))
+            .child(div().type_small().text_color(theme::text_faint()).child(version))
+            .child(div().type_ui().text_color(theme::text_soft()).child("One small app for Slack, Discord, Telegram, Teams and Signal."))
+            .child(
+                div()
+                    .w_full()
+                    .pt(px(18.))
+                    .flex()
+                    .flex_col()
+                    .child(group_label("Acknowledgements"))
+                    .child(
+                        card()
+                            .child(credit("Network icons: Dashboard Icons (homarr-labs/dashboard-icons), Apache-2.0. The logos are trademarks of their owners."))
+                            .child(rule())
+                            .child(credit("Interface icons: Lucide, ISC. Sounds: made by tinyclient's own code."))
+                    ),
+            )
+            .child(div().w_full().pt(px(20.)).child(tools))
+    }
+
+    /// Search results: each a breadcrumb and its live row, best first; or the honest line.
+    pub(super) fn results(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let query = self.query.clone();
+        let found: Vec<&'static Row> = rows::search(&query);
+        let keys = rows::shortcuts(&query);
+        let mut column = div().w(px(controls::COLUMN)).flex().flex_col().gap(px(12.));
+        if found.is_empty() && (keys.is_empty() || query.trim().len() < 2) {
+            let honest = rows::not_yet(&query);
+            return column.child(
+                div()
+                    .pt(px(80.))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(glyph("icons/search.svg", 24., theme::text_faint()))
+                    .child(div().type_title().text_color(theme::text()).child(format!("No settings match “{}”.", query.trim())))
+                    .children(honest.map(|line| div().type_ui().text_color(theme::text_soft()).child(line))),
+            );
+        }
+        for row in found {
+            let crumb = if row.group.is_empty() || row.group == row.label { row.section.name().to_owned() } else { format!("{} › {}", row.section.name(), row.group) };
+            let breadcrumb = div()
+                .id(SharedString::from(format!("crumb-{}", row.id)))
+                .cursor_pointer()
+                .type_small()
+                .text_color(theme::text_faint())
+                .hover(|style| style.text_color(theme::text_soft()))
+                .child(crumb)
+                .on_click(cx.listener(move |this, _, window, cx| this.reveal(row, window, cx)));
+            let live = match row.id {
+                "P1" | "P2" | "D1" | "V3" => self.control_row(row.id, window, cx),
+                id => card().child(self.control_row(id, window, cx)),
+            };
+            let live = if matches!(row.id, "D1" | "V3") { card().child(live) } else { live };
+            column = column.child(div().flex().flex_col().gap(px(4.)).child(breadcrumb).child(live));
+        }
+        if !keys.is_empty() && query.trim().len() >= 2 {
+            column = column.child(div().flex().flex_col().gap(px(4.)).child(div().type_small().text_color(theme::text_faint()).child("Shortcuts")).child(self.shortcuts(&query)));
+        }
+        column
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_retention_question_says_how_much_goes_and_drops_what_it_does_not_know() {
+        assert_eq!(
+            retention_words(Some((41_210, 12 * 1024 * 1024))),
+            "41,210 messages, about 12 MB, are removed from this Mac. They stay on Slack, Discord and the others."
+        );
+        assert_eq!(retention_words(Some((1, 300))), "1 message is removed from this Mac. They stay on Slack, Discord and the others.");
+        assert_eq!(retention_words(None), "Older messages are removed from this Mac. They stay on Slack, Discord and the others.");
+    }
+
+    #[test]
+    fn every_slider_stores_only_what_differs_from_its_default() {
+        for id in ["S10", "V5", "V6"] {
+            let spec = slider(id);
+            assert!(spec.range.0 <= spec.default && spec.default <= spec.range.1, "{id}");
+        }
+        assert_eq!(slider("A2").default, 1, "text size 14 pt is the second stop");
+        assert_eq!(slider("V6").default, Values::default_number(SENSITIVITY));
+        assert_eq!(slider("S10").default, Values::default_number(CUE_VOLUME));
+        assert_eq!(slider("V5").default, Values::default_number(VOICE_VOLUME));
+    }
+}

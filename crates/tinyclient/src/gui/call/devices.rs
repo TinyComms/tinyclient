@@ -5,23 +5,32 @@
 //! chatd sends the level only between `Media(Meter { on: true })` and `Meter { on: false }`,
 //! which the menu sends as it opens and closes. The shell runs no process to ask.
 //!
-//! Left out because they are not built: "Play test sound" (nothing here may make a sound yet)
-//! and "Call settings…" (there are no settings).
+//! A pick here changes this call only; Settings › Audio & video holds the defaults a call starts
+//! with, and the picks are forgotten when the call ends. "Play test sound" plays the join cue on
+//! the call's speaker; "Call settings…" opens that section.
 
 use super::{in_call, Menu};
 use crate::client::ask;
+use crate::gui::app::prefs;
+use crate::gui::components::{menu_item, menu_separator};
+use crate::gui::settings;
 use crate::gui::state::Shell;
 use crate::gui::theme;
 use gpui::{div, prelude::*, px, Context, Div, FontWeight, SharedString};
+use protocol::settings::{INPUT, OUTPUT};
 use protocol::{Call, MediaRequest, Request};
 use std::time::{Duration, Instant};
 
 /// Segments of the level meter.
 const SEGMENTS: u8 = 12;
 
-/// The row to mark: what was picked here, else "System default".
-fn marked(picked: &Option<Option<String>>) -> Option<String> {
-    picked.clone().flatten()
+/// The row to mark: what was picked in this call, else the default from Settings, where `None`
+/// is "System default".
+fn chosen(picked: &Option<Option<String>>, default: Option<String>) -> Option<String> {
+    match picked {
+        Some(picked) => picked.clone(),
+        None => default,
+    }
 }
 
 /// How many of the meter's segments a level of 0 to 100 lights. Any sound at all lights one.
@@ -101,8 +110,9 @@ impl Shell {
             Side::Input => self.call_state.input = Some(device),
             Side::Output => self.call_state.output = Some(device),
         }
-        let input = marked(&self.call_state.input);
-        let output = marked(&self.call_state.output);
+        let values = prefs::values();
+        let input = chosen(&self.call_state.input, values.device(INPUT));
+        let output = chosen(&self.call_state.output, values.device(OUTPUT));
         self.call_ask(Request::Media(MediaRequest::Devices { input, output }), cx);
         cx.notify();
     }
@@ -148,11 +158,11 @@ impl Shell {
     }
 
     fn call_device_section(&self, side: Side, call: &Call, cx: &mut Context<Self>) -> Div {
-        let (title, picked, in_use, listed) = match side {
-            Side::Input => ("MICROPHONE", &self.call_state.input, &call.input, &call.inputs),
-            Side::Output => ("SPEAKER", &self.call_state.output, &call.output, &call.outputs),
+        let (title, picked, in_use, listed, key) = match side {
+            Side::Input => ("MICROPHONE", &self.call_state.input, &call.input, &call.inputs, INPUT),
+            Side::Output => ("SPEAKER", &self.call_state.output, &call.output, &call.outputs, OUTPUT),
         };
-        let chosen = marked(picked);
+        let chosen = chosen(picked, prefs::values().device(key));
         // A device picked here that the system no longer lists still has its row, so the
         // choice can be seen and changed.
         let mut names = listed.clone();
@@ -214,6 +224,13 @@ impl Shell {
     /// What the device menu holds: MICROPHONE with its level, then SPEAKER, "System default"
     /// first in each.
     pub(super) fn call_devices_menu(&self, call: &Call, cx: &mut Context<Self>) -> Div {
+        let test = menu_item("call-test-sound", Some("icons/volume-2.svg"), "Play test sound", None).on_click(cx.listener(|this, _, _, cx| {
+            this.call_ask(Request::TestSound, cx);
+        }));
+        let settings = menu_item("call-settings", Some("icons/settings.svg"), "Call settings…", None).on_click(cx.listener(|this, _, _, cx| {
+            this.call_menu_close(cx);
+            settings::open(settings::Section::Audio, cx);
+        }));
         div()
             .flex()
             .flex_col()
@@ -221,6 +238,9 @@ impl Shell {
             .child(self.call_level(call))
             .child(div().flex_none().my(px(4.)).mx(px(8.)).h(px(1.)).bg(theme::hairline()))
             .child(self.call_device_section(Side::Output, call, cx))
+            .child(menu_separator().mx(px(8.)))
+            .child(test)
+            .child(settings)
     }
 }
 
@@ -240,9 +260,11 @@ mod tests {
     }
 
     #[test]
-    fn the_marked_row_is_what_was_picked_here_and_the_default_otherwise() {
-        assert_eq!(marked(&None), None);
-        assert_eq!(marked(&Some(None)), None);
-        assert_eq!(marked(&Some(Some("Studio headset".into()))), Some("Studio headset".into()));
+    fn the_marked_row_is_what_was_picked_in_this_call_and_the_settings_default_otherwise() {
+        let headset = Some("Studio headset".to_owned());
+        assert_eq!(chosen(&None, None), None);
+        assert_eq!(chosen(&None, headset.clone()), headset, "the default from Settings");
+        assert_eq!(chosen(&Some(None), headset.clone()), None, "System default picked in this call");
+        assert_eq!(chosen(&Some(Some("AirPods".into())), headset), Some("AirPods".into()));
     }
 }

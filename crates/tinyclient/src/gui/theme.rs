@@ -158,10 +158,32 @@ pub fn set_text_step(step: i32) -> i32 {
     step
 }
 
-/// A row height at the current text step: `ROW_ONE`, `ROW_MID` or `ROW_TWO` in, points out.
+/// Settings › Appearance › Density (A3): conversation rows 40 instead of 48.
+static COMPACT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_compact(compact: bool) {
+    COMPACT.store(compact, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn compact() -> bool {
+    COMPACT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A row height at the current text step and density: `ROW_ONE`, `ROW_MID` or `ROW_TWO` in,
+/// points out.
 pub fn row_height(base: f32) -> f32 {
     let per_step = if base >= ROW_TWO { 4. } else { 2. };
-    base + per_step * text_step() as f32
+    let dense = if base >= ROW_TWO && compact() { 8. } else { 0. };
+    base - dense + per_step * text_step() as f32
+}
+
+/// The avatar of a conversation row: 32, or 28 when compact.
+pub fn row_avatar() -> f32 {
+    if compact() {
+        28.
+    } else {
+        32.
+    }
 }
 
 fn sized(size: f32) -> gpui::Pixels {

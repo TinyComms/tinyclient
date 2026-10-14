@@ -461,6 +461,10 @@ impl Hub {
 
     /// Who is typing in a conversation right now. Lines that have had their time are left out.
     pub fn typists_in(&self, conversation: &Key) -> Vec<Typist> {
+        // M3 off: nobody is drawn typing, in the list or the conversation.
+        if !crate::gui::app::prefs::choices().typing {
+            return Vec::new();
+        }
         let inner = self.0.borrow();
         let Some((typists, heard)) = inner.typing.get(conversation) else {
             return Vec::new();

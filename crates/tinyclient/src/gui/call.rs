@@ -374,6 +374,9 @@ impl Shell {
             None => {
                 self.call_menu_set(None, cx);
                 let state = &mut self.call_state;
+                // A pick in the device menu was for that call; the next starts from Settings.
+                state.input = None;
+                state.output = None;
                 state.mute_before_deafen = None;
                 state.confirm = None;
                 state.notice = None;

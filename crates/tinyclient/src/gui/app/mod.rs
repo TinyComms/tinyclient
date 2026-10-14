@@ -55,6 +55,28 @@ pub fn read_reduce_motion() {
     });
 }
 
+/// Diagnostics, with what takes a process to find out: the macOS version and the window's
+/// memory. Off the main thread.
+pub(in crate::gui) fn with_memory(mut text: String) -> String {
+    let run = |program: &str, args: &[&str]| {
+        std::process::Command::new(program)
+            .args(args)
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+            .filter(|out| !out.is_empty())
+    };
+    if let Some(version) = run("/usr/bin/sw_vers", &["-productVersion"]) {
+        text.push_str(&format!("macOS {version}\n"));
+    }
+    let pid = std::process::id().to_string();
+    if let Some(kb) = run("/bin/ps", &["-o", "rss=", "-p", &pid]).and_then(|kb| kb.parse::<u64>().ok()) {
+        text.push_str(&format!("window memory: {} MB\n", kb / 1024));
+    }
+    text
+}
+
 fn unix_now() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
 }
@@ -74,6 +96,7 @@ impl Shell {
                         let came_back = this.service.phase == Phase::Reconnecting;
                         let restarted = this.service.answered(started, keychain, unix_now());
                         this.apply_status(networks, accounts, call, cx);
+                        this.load_settings(cx);
                         this.reload_all(cx);
                         if restarted || came_back {
                             this.conversation_reset(cx);
@@ -92,6 +115,7 @@ impl Shell {
                                 let applied = this.update(cx, |this, cx| {
                                     if reset {
                                         this.load_status(cx);
+                                        this.load_settings(cx);
                                         this.reload_all(cx);
                                         this.conversation_reset(cx);
                                     } else {
@@ -407,7 +431,20 @@ impl Shell {
             details_channels: state.details_channels,
             details_directs: state.details_directs,
             text_step: theme::text_step(),
+            choices: prefs::choices(),
+            kept: self.prefs_kept.clone(),
         }
+    }
+
+    /// Reads chatd's settings: at start, after a restart, and whenever one changes. Every
+    /// window draws again with them.
+    pub(in crate::gui) fn load_settings(&mut self, cx: &mut Context<Self>) {
+        self.off_thread(cx, || ask(&Request::Settings), |_, answer, cx| {
+            if let Ok(Response::Settings { values }) = answer {
+                prefs::set_values(protocol::settings::Values::new(values));
+                cx.refresh_windows();
+            }
+        });
     }
 
     /// Writes what the window remembers, off the main thread. A screenshot run writes nothing.
@@ -458,9 +495,17 @@ impl Shell {
         self.save_prefs(cx);
     }
 
-    /// Help › Copy Diagnostics: versions, the connection and each account's link, in words a
-    /// support reply can use. Nothing that names a person or a message.
+    /// Help › Copy Diagnostics and Settings › About: versions, the connection and each account's
+    /// link, in words a support reply can use. Nothing that names a person or a message.
     pub(in crate::gui) fn copy_diagnostics(&mut self, cx: &mut Context<Self>) {
+        let text = self.diagnostics();
+        self.off_thread(cx, move || with_memory(text), |this, text, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+            this.toast(Some(("icons/check.svg", theme::text_soft())), "Diagnostics copied", cx);
+        });
+    }
+
+    pub(in crate::gui) fn diagnostics(&self) -> String {
         let mut text = format!(
             "tinyclient {}\n{} {}\nservice: {:?}{}, keychain: {:?}, started {}\n",
             env!("CARGO_PKG_VERSION"),
@@ -474,8 +519,7 @@ impl Shell {
         for account in self.snapshot.iter().flat_map(|s| &s.accounts) {
             text.push_str(&format!("{}: {:?}{}\n", account.key.network.label(), account.link, if account.reconnecting { " (reconnecting)" } else { "" }));
         }
-        cx.write_to_clipboard(ClipboardItem::new_string(protocol::redact(&text)));
-        self.toast(Some(("icons/check.svg", theme::text_soft())), "Diagnostics copied", cx);
+        protocol::redact(&text)
     }
 
     /// The window's banner while the sidebar is hidden. A drawn sidebar puts

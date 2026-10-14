@@ -7,8 +7,8 @@
 // composer), Show Details (`ShowDetails`, pane), Mute… (`Mute`, profile), Start Call
 // (`StartCall`, call) and Open in <network> (`OpenInNetwork`, handoff). Items with nothing built
 // behind them are left out rather than shown dead: Check for Updates…, Find (⌘F, ⇧⌘F), Mark as
-// Unread, Mark Server as Read, Copy Link, Keyboard Shortcuts, Release Notes and Report a
-// Problem…. They come back with what they do.
+// Unread, Mark Server as Read, Copy Link, Release Notes and Report a Problem…. They come back
+// with what they do.
 
 use super::super::settings;
 use super::super::sidebar::Mode;
@@ -110,7 +110,10 @@ pub fn menus(places: &[(String, usize)], open_network: Option<Network>) -> Vec<M
             MenuItem::action("tinyclient", ShowWindow),
             MenuItem::action("Bring All to Front", ShowWindow),
         ]),
-        Menu::new("Help").items([MenuItem::action("Copy Diagnostics", CopyDiagnostics)]),
+        Menu::new("Help").items([
+            MenuItem::action("Keyboard Shortcuts", KeyboardShortcuts),
+            MenuItem::action("Copy Diagnostics", CopyDiagnostics),
+        ]),
     ]
 }
 
@@ -133,20 +136,40 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-shift-c", StartCall, None),
         KeyBinding::new("alt-cmd-o", OpenInNetwork, None),
         KeyBinding::new("cmd-m", Minimize, None),
+        KeyBinding::new("cmd-/", KeyboardShortcuts, None),
     ]);
+}
+
+/// ⌘Q: chatd stops too (`docs/product/09-settings.md` G2). Asked briefly, so a chatd that does
+/// not answer cannot hold the quit.
+pub fn quit(cx: &mut App) {
+    if !cfg!(feature = "gui-shot") {
+        let _ = crate::client::ask_within(&protocol::Request::Shutdown, Some(std::time::Duration::from_millis(500)));
+    }
+    cx.quit();
+}
+
+/// ⌘W and the red button: with Keep receiving on, the window hides and chatd goes on receiving
+/// and the Dock badge counting; off, tinyclient quits.
+pub fn close_window(cx: &mut App) {
+    if super::prefs::values().on(protocol::settings::KEEP_RUNNING) {
+        cx.hide();
+    } else {
+        quit(cx);
+    }
 }
 
 /// The app-wide handlers: they act on the app, not on what has focus.
 pub fn app_actions(cx: &mut App) {
-    cx.on_action(|_: &Quit, cx| cx.quit());
+    cx.on_action(|_: &Quit, cx| quit(cx));
     cx.on_action(|_: &Hide, cx| cx.hide());
     cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
     cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
-    // ⌘W and the red button hide the window: chatd keeps receiving and the Dock badge counting.
-    cx.on_action(|_: &CloseWindow, cx| cx.hide());
+    cx.on_action(|_: &CloseWindow, cx| close_window(cx));
     cx.on_action(|_: &ShowWindow, cx| cx.activate(true));
-    cx.on_action(|_: &Settings, cx| settings::open(settings::Section::Accounts, cx));
+    cx.on_action(|_: &Settings, cx| settings::open(settings::Section::last(), cx));
     cx.on_action(|_: &About, cx| settings::open(settings::Section::About, cx));
+    cx.on_action(|_: &KeyboardShortcuts, cx| settings::open(settings::Section::Shortcuts, cx));
 }
 
 impl Shell {
@@ -201,7 +224,7 @@ mod tests {
         assert!(items(&bar[1]).contains(&"Close Window".to_owned()));
         // Nothing is offered that does nothing.
         let all: Vec<String> = bar.iter().flat_map(items).collect();
-        for dead in ["Check for Updates…", "Search in Conversation", "Search Everywhere", "Keyboard Shortcuts", "Release Notes", "Report a Problem…", "Mark as Unread", "Copy Link"] {
+        for dead in ["Check for Updates…", "Search in Conversation", "Search Everywhere", "Release Notes", "Report a Problem…", "Mark as Unread", "Copy Link"] {
             assert!(!all.contains(&dead.to_owned()), "{dead} is offered");
         }
         assert!(all.contains(&"Settings…".to_owned()) && all.contains(&"About tinyclient".to_owned()));

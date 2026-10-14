@@ -228,6 +228,8 @@ pub struct Shell {
     pub(super) saved_prefs: RefCell<String>,
     /// What the menu bar was last set for.
     pub(super) menus_set: RefCell<String>,
+    /// Lines of `shell.prefs` this build does not know, written back as they were.
+    pub(super) prefs_kept: Vec<String>,
     /// A window state forced by `--state`, for looking at it.
     #[cfg(feature = "gui-shot")]
     pub(super) forced_state: Option<app::service::Shown>,
@@ -280,6 +282,7 @@ impl Shell {
             frame: Cell::new(prefs.frame),
             saved_prefs: RefCell::new(String::new()),
             menus_set: RefCell::new(String::new()),
+            prefs_kept: prefs.kept.clone(),
             #[cfg(feature = "gui-shot")]
             forced_state: None,
             #[cfg(feature = "gui-shot")]
@@ -384,6 +387,8 @@ impl Shell {
                     }
                 }
                 Change::Occupants { conversation, occupants } => self.occupants_changed(conversation, occupants, cx),
+                Change::Settings => self.load_settings(cx),
+                Change::Meter { level } => super::settings::meter(*level, cx),
                 _ => {}
             }
             self.composer_changed(change, cx);

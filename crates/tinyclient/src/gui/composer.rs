@@ -152,9 +152,10 @@ pub(in crate::gui) fn sent_silently(client_id: &str) -> bool {
     SILENT.with_borrow(|silent| silent.contains(client_id))
 }
 
-/// Whether others see that we are typing. Constants until there are settings.
-fn sends_typing(network: Network) -> bool {
-    !matches!(network, Network::Discord)
+/// Whether others see that we are typing: Settings › Privacy (P1), per account. chatd checks
+/// again; asking here saves a request per keystroke burst.
+fn sends_typing(account: &protocol::AccountKey) -> bool {
+    super::app::prefs::values().typing(account)
 }
 
 /// How often a network needs to hear that we are still typing for its line to stay up.
@@ -624,7 +625,7 @@ impl Composer {
             let _ = this.update(cx, |this, cx| this.save_draft(cx));
         }));
         let network = target.key.network;
-        if target.link != Link::Connected || !sends_typing(network) || self.input.read(cx).text().trim().is_empty() {
+        if target.link != Link::Connected || !sends_typing(&target.key.account()) || self.input.read(cx).text().trim().is_empty() {
             return;
         }
         let recently = self
@@ -732,10 +733,14 @@ impl Composer {
             pick: None,
             schedule: None,
         };
+        let (mut shown, mut wire) = (field.trim().to_owned(), mention::wire(&field, &self.tokens, network).trim().to_owned());
+        if super::app::prefs::choices().emoticons {
+            (shown, wire) = (niceties::emoticons(&shown), niceties::emoticons(&wire));
+        }
         let out = Outgoing {
             key: target.key.clone(),
-            shown: field.trim().to_owned(),
-            wire: mention::wire(&field, &self.tokens, network).trim().to_owned(),
+            shown,
+            wire,
             field,
             client_id: client_id(),
             reply_to,
@@ -2752,9 +2757,10 @@ mod tests {
     }
 
     #[test]
-    fn typing_is_shared_on_slack_and_kept_private_on_discord() {
-        assert!(sends_typing(Network::Slack));
-        assert!(!sends_typing(Network::Discord));
+    fn typing_is_shared_on_slack_and_kept_private_on_discord_until_the_user_says() {
+        let account = |network| protocol::AccountKey { network, account: "T1".into() };
+        assert!(sends_typing(&account(Network::Slack)));
+        assert!(!sends_typing(&account(Network::Discord)));
         assert!(typing_interval(Network::Discord) < Duration::from_secs(10));
     }
 

@@ -218,15 +218,20 @@ impl Shell {
     /// preview with its sender and my ticks.
     pub(super) fn line_two(&self, c: &Conversation, look: Look, color: Rgba) -> Div {
         let line = div().flex_1().min_w_0().h(px(16.)).flex().items_center().gap(px(4.)).type_small();
+        // A4 off: no words of any message, for screen sharing. Typing and Not sent still say so.
+        let previews = crate::gui::app::prefs::choices().previews;
         if self.send_failed_in(&c.key) {
             return line
                 .child(glyph("icons/circle-alert.svg", 12., theme::danger()))
                 .child(div().flex_none().text_color(theme::danger()).child("Not sent"))
-                .child(div().min_w_0().truncate().text_color(theme::text_faint()).child(format!("· {}", c.preview)));
+                .when(previews, |line| line.child(div().min_w_0().truncate().text_color(theme::text_faint()).child(format!("· {}", c.preview))));
         }
         let typing = self.slots.typing.and_then(|typing| typing(self, &c.key));
         if let Some(words) = typing {
             return line.child(div().min_w_0().truncate().text_color(theme::accent_text()).child(words));
+        }
+        if !previews {
+            return line;
         }
         // A muted row is one grey throughout (C7): `color` is already its faint.
         let quiet = |lit: Rgba| if c.muted { color } else { lit };
@@ -341,7 +346,7 @@ impl Shell {
         let badge = row_badge(c);
         let content = div()
             .gap(px(10.))
-            .child(self.conversation_avatar(c, 32., surface, cx))
+            .child(self.conversation_avatar(c, theme::row_avatar(), surface, cx))
             .child(
                 div()
                     .flex_1()

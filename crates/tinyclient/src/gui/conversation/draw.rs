@@ -890,6 +890,31 @@ impl Pane {
             .collect()
     }
 
+    /// Settings › Privacy › Load images (P3) off: a picture not on disk waits for a click, so
+    /// nothing is fetched until then.
+    fn held_back(&self, file: &MediaFile) -> bool {
+        !crate::gui::app::prefs::choices().images && file.path.is_none() && !self.known.contains_key(&file.id) && !self.shown.contains(&file.id)
+    }
+
+    /// What stands in a held-back picture's box: what it is, its size, and the click that
+    /// loads it.
+    fn load_box(&self, holder: Stateful<Div>, file: &MediaFile, what: &str, bytes: u64, words: bool, cx: &mut Context<Self>) -> Stateful<Div> {
+        let id = file.id.clone();
+        let line = match (words, bytes) {
+            (false, _) => "Load".to_owned(),
+            (true, 0) => format!("{what} · Click to load"),
+            (true, bytes) => format!("{what} · {} · Click to load", media::size_label(bytes)),
+        };
+        holder
+            .child(div().absolute().inset_0().flex().items_center().justify_center().type_small().text_color(theme::text_soft()).child(line))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.shown.insert(id.clone());
+                cx.notify();
+            }))
+    }
+
     /// The still of a file, or what stands in its box until it is on disk. `size` is the
     /// longest side the whole picture is shown at, which is what chatd is asked for; `edge` is
     /// what it is decoded to.
@@ -968,6 +993,16 @@ impl Pane {
                 .into_any_element();
         }
 
+        if self.held_back(&still) {
+            let what = match shape {
+                MediaShape::Video => "Video",
+                MediaShape::Gif => "GIF",
+                _ => "Image",
+            };
+            let bytes = attachment.file.bytes;
+            return self.load_box(tile, &still, what, bytes, width >= 160., cx).child(edge_line()).into_any_element();
+        }
+
         let natural = natural(attachment);
         let edge = media::decode_edge(natural, width, height, fit, window.scale_factor());
         let size = media::fetch_size(natural, width, height, fit, window.scale_factor());
@@ -1037,6 +1072,9 @@ impl Pane {
         let still = attachment.thumb.as_ref().unwrap_or(&attachment.file).clone();
         let edge = media::square_size(128., window.scale_factor());
         let sticker = div().id(("sticker", index)).size(px(128.)).flex_none().relative();
+        if self.held_back(&still) {
+            return self.load_box(sticker.rounded(px(theme::R_CARD)).bg(tokens::media_fill()), &still, "Sticker", 0, false, cx).into_any_element();
+        }
         match self.still(&still, edge, edge, None, cx) {
             Picture::Ready(image) => sticker.child(img(ImageSource::Render(image)).size_full().object_fit(ObjectFit::Contain)),
             Picture::Loading => sticker.child(in_box(Icon::Image, None)),
@@ -1281,6 +1319,10 @@ impl Pane {
             let wide = self.media_width().min(416.);
             let tall = (wide * image.height as f32 / image.width.max(1) as f32).round().min(210.);
             let edge = media::decode_edge((image.width, image.height), wide, tall, Fit::Cover, scale);
+            if self.held_back(&image) {
+                let picture = self.load_box(holder("preview", wide, tall, 8.), &image, "Preview", image.bytes, true, cx);
+                return card.flex().flex_col().gap(px(8.)).child(words).child(picture).into_any_element();
+            }
             let picture = match self.still(&image, edge, edge, None, cx) {
                 Picture::Ready(decoded) => holder("preview", wide, tall, 8.).child(shown(decoded, 8.)),
                 Picture::Loading => holder("preview", wide, tall, 8.).child(in_box(Icon::Image, None)),
@@ -1289,6 +1331,10 @@ impl Pane {
             return card.flex().flex_col().gap(px(8.)).child(words).child(picture).into_any_element();
         }
         let edge = media::decode_edge((image.width, image.height), 72., 72., Fit::Cover, scale);
+        if self.held_back(&image) {
+            let picture = self.load_box(holder("preview", 72., 72., 6.), &image, "Preview", 0, false, cx);
+            return card.flex().gap(px(12.)).child(words).child(picture).into_any_element();
+        }
         let picture = match self.still(&image, edge, edge, None, cx) {
             Picture::Ready(decoded) => holder("preview", 72., 72., 6.).child(shown(decoded, 6.)),
             Picture::Loading => holder("preview", 72., 72., 6.).child(in_box(Icon::Image, None)),

@@ -580,13 +580,16 @@ impl TextInput {
         cx.notify();
     }
 
-    fn submit(&mut self, _: &Submit, _: &mut Window, cx: &mut Context<Self>) {
+    fn submit(&mut self, _: &Submit, window: &mut Window, cx: &mut Context<Self>) {
         // Return during composition belongs to the input method.
         if self.editor.marked().is_some() {
             return;
         }
         if self.list_open {
             cx.emit(InputList::Complete);
+        } else if self.editor.is_multiline() && super::app::prefs::choices().command_return {
+            // Settings › Messages › Send with ⌘Return (M1): Return adds a line.
+            self.newline(&Newline, window, cx);
         } else {
             cx.emit(InputEvent::Submit);
         }
