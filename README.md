@@ -26,9 +26,8 @@ entirely on your machine: it talks to each network directly, there is no tinycli
 and nothing is sent anywhere else. It is built for macOS, Linux and Windows.
 
 tinyclient is early. We are building a community around one goal: a chat client that is a
-pleasure to use and does everything the official apps do, on every network. Read
-[Read this before you sign in](#read-this-before-you-sign-in) before you point it at an account
-you care about, and [come help](#contributing).
+pleasure to use and does everything the official apps do, on every network.
+[Come help](#contributing).
 
 ## Why
 
@@ -246,7 +245,7 @@ The data directory is `~/Library/Application Support/tinyclient` on macOS,
 
 How to report a vulnerability, and what is in scope: [SECURITY.md](SECURITY.md).
 
-## Read this before you sign in
+## Networks and terms
 
 tinyclient is an unofficial client. It is not made, endorsed or supported by Slack, Discord,
 Telegram, Microsoft or Signal. You use it at your own risk.
