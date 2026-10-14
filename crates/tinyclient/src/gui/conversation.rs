@@ -21,6 +21,7 @@ mod shot;
 mod side;
 mod text;
 mod tokens;
+mod video;
 mod viewer;
 mod when;
 

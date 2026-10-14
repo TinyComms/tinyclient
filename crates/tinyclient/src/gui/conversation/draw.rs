@@ -187,7 +187,7 @@ fn in_box(which: Icon, words: Option<&'static str>) -> Div {
 }
 
 /// The label over a still that says what a click will do.
-fn badge(words: String) -> Div {
+pub(super) fn badge(words: String) -> Div {
     div()
         .absolute()
         .bottom(px(6.))
@@ -203,7 +203,7 @@ fn badge(words: String) -> Div {
         .child(words)
 }
 
-fn play_disc() -> Div {
+pub(super) fn play_disc() -> Div {
     div().absolute().inset_0().flex().items_center().justify_center().child(
         div()
             .size(px(44.))
@@ -1048,24 +1048,12 @@ impl Pane {
             }
         };
 
-        // A moving picture plays in the system's player once it is on disk; until then the
-        // badge says it is on its way.
-        let fetching = self.then.contains_key(&attachment.file.id);
+        // A video or GIF: what says it moves, and what a click does, are `video`'s.
+        let id = message.id.clone();
         let tile = match shape {
-            MediaShape::Gif => {
-                let words = if fetching { "Loading…" } else { "GIF" };
-                tile.child(play_disc()).child(badge(words.to_owned()).left(px(6.)))
-            }
-            MediaShape::Video => {
-                let words = match fetching {
-                    true => Some("Loading…".to_owned()),
-                    false => (attachment.duration > 0).then(|| media::duration_label(attachment.duration)),
-                };
-                tile.child(play_disc()).children(words.map(|words| badge(words).right(px(6.))))
-            }
-            _ => tile,
+            MediaShape::Gif | MediaShape::Video => self.moving(attachment, tile, cx),
+            _ => tile.on_click(cx.listener(move |this, _, window, cx| this.open_viewer(&id, index, window, cx))),
         };
-        let tile = if attachment.round { tile.rounded_full() } else { tile };
         let tile = tile.child(edge_line()).children(more.map(|more| {
             div()
                 .absolute()
@@ -1079,18 +1067,7 @@ impl Pane {
                 .text_color(gpui::white())
                 .child(format!("+{more}"))
         }));
-        let (id, attached) = (message.id.clone(), attachment.clone());
-        let tile = match shape {
-            MediaShape::Gif | MediaShape::Video => tile.tooltip(tip("Play in your video player", None)),
-            _ => tile,
-        };
-        tile.on_click(cx.listener(move |this, _, window, cx| match shape {
-            // Moving pictures play in the system's player, which decodes them with the system's
-            // own codecs; nothing here decodes video.
-            MediaShape::Gif | MediaShape::Video => this.fetch_then(&attached, Then::Open, cx),
-            _ => this.open_viewer(&id, index, window, cx),
-        }))
-        .into_any_element()
+        tile.into_any_element()
     }
 
     /// A sticker: its own size, no box, no border, and whatever it leaves clear shows the row.
