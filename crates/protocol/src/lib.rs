@@ -17,6 +17,7 @@ mod info;
 pub mod ipc;
 pub mod launch;
 mod message;
+mod play;
 mod signin;
 
 pub use call::*;
@@ -24,6 +25,7 @@ pub use crash::redact;
 pub use info::*;
 pub use ipc::{ChatListener, ChatStream};
 pub use message::*;
+pub use play::*;
 pub use signin::*;
 
 pub const CHAT_SOCK_NAME: &str = "chat.sock";
@@ -1246,6 +1248,9 @@ pub enum Request {
         conversation: Key,
     },
     Media(MediaRequest),
+    /// A voice message or audio file: play, pause, seek, speed, stop. Answers `Ok`; the rest is
+    /// `Change::Playback`.
+    Play(PlayRequest),
 }
 
 /// One thing that changed. The shell asks again for exactly that; the ephemeral kinds carry their
@@ -1296,13 +1301,18 @@ pub enum Change {
     /// Ephemeral. A sign-in the shell is drawing moved on by itself: the code was scanned, or
     /// ran out and was replaced.
     SignIn { network: Network, step: SignInStep },
+    /// Ephemeral. The voice message or audio file playing, paused or just ended; `None` once
+    /// stopped.
+    Playback { playback: Option<Playback> },
 }
 
 impl Change {
     /// Two changes to the same thing: the later one replaces the earlier.
     pub fn same_scope(&self, other: &Change) -> bool {
         match (self, other) {
-            (Change::Status, Change::Status) | (Change::Call { .. }, Change::Call { .. }) => true,
+            (Change::Status, Change::Status)
+            | (Change::Call { .. }, Change::Call { .. })
+            | (Change::Playback { .. }, Change::Playback { .. }) => true,
             (Change::SignIn { network: a, .. }, Change::SignIn { network: b, .. }) => a == b,
             (Change::Conversation { conversation: a }, Change::Conversation { conversation: b })
             | (Change::Messages { conversation: a }, Change::Messages { conversation: b })
@@ -1337,6 +1347,7 @@ impl Change {
                 | Change::Searched { .. }
                 | Change::SignIn { .. }
                 | Change::Upload { .. }
+                | Change::Playback { .. }
         )
     }
 }
