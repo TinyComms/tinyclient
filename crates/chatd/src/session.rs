@@ -8,6 +8,10 @@ use protocol::Network;
 
 const SERVICE: &str = "tinyclient";
 
+/// The keychain service before the product was renamed. A session found only there is moved to
+/// `SERVICE` the first time it is read, so the rename signs nobody out.
+const RENAMED_FROM: &str = "tinychat";
+
 /// False when `TINYCLIENT_DIR` points chatd at a scratch directory. Tests and the demo never touch
 /// the keychain and never sign in.
 pub fn enabled() -> bool {
@@ -71,6 +75,24 @@ pub fn read(network: Network) -> Stored {
     };
     match entry.get_password() {
         Ok(session) => Stored::Found(session),
+        Err(keyring::Error::NoEntry) => moved(network, &entry),
+        Err(err) => Stored::Unreadable(err.to_string()),
+    }
+}
+
+/// The session kept under the old name, now saved under the new one. The old item is deleted
+/// only once the new one holds the session.
+fn moved(network: Network, entry: &Entry) -> Stored {
+    let Ok(old) = Entry::new(RENAMED_FROM, account(network)) else {
+        return Stored::Absent;
+    };
+    match old.get_password() {
+        Ok(session) => {
+            if entry.set_password(&session).is_ok() {
+                let _ = old.delete_credential();
+            }
+            Stored::Found(session)
+        }
         Err(keyring::Error::NoEntry) => Stored::Absent,
         Err(err) => Stored::Unreadable(err.to_string()),
     }
@@ -125,7 +147,9 @@ pub fn rewrite(network: Network, rewrite: impl FnOnce(&str) -> Option<String>) -
 
 pub fn forget(network: Network) {
     if enabled() {
-        let _ = Entry::new(SERVICE, account(network)).and_then(|entry| entry.delete_credential());
+        for service in [SERVICE, RENAMED_FROM] {
+            let _ = Entry::new(service, account(network)).and_then(|entry| entry.delete_credential());
+        }
     }
 }
 
