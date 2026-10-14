@@ -2,6 +2,7 @@
 //! network. Every box that holds a picture is sized from what the network said about it, so a
 //! row is its final height before any file arrives.
 
+use super::emoji;
 use super::icons::{icon, Icon};
 use super::images::Picture;
 use super::media::{self, Fit, Shape as MediaShape};
@@ -1334,20 +1335,32 @@ impl Pane {
             };
             // A custom emoji is its name until its image is here.
             let emoji = picture.unwrap_or_else(|| {
-                div().text_size(px(15.)).line_height(px(20.)).child(reaction.emoji.clone()).into_any_element()
+                div().text_size(px(15.)).line_height(px(20.)).child(emoji::display(&reaction.emoji)).into_any_element()
             });
             let count = div()
                 .type_small()
                 .font_weight(theme::MEDIUM)
                 .text_color(if reaction.mine { theme::accent_text() } else { theme::text_soft() })
                 .child(reaction.count.to_string());
-            let (id, toggled, on) = (message.id.clone(), reaction.emoji.clone(), !reaction.mine);
-            let words = if reaction.mine { "Take back your reaction" } else { "React with this too" };
+            // A custom one goes by its file, which names it where its `:name:` may not.
+            let toggled = reaction.file.as_ref().map_or_else(|| reaction.emoji.clone(), |file| file.id.clone());
+            let (id, on) = (message.id.clone(), !reaction.mine);
+            // Joining one the conversation no longer takes, or past a limit, is not offered:
+            // the chip says why instead.
+            let refused = (!reaction.mine).then(|| self.refusal(message, &toggled)).flatten();
+            let words = match (&refused, reaction.mine) {
+                (Some(why), _) => why.clone(),
+                (None, true) => "Take back your reaction".to_owned(),
+                (None, false) => "React with this too".to_owned(),
+            };
+            let joins = acts && refused.is_none();
             row = row.child(
                 chip(("chip", ix).into(), reaction.mine)
                     .child(emoji)
                     .child(count)
-                    .when(acts, |chip| chip.tooltip(tip(words, None)).on_click(cx.listener(move |this, _, _, cx| this.react(&id, &toggled, on, cx)))),
+                    .when(acts, |chip| chip.tooltip(tip(words, None)))
+                    .when(joins, |chip| chip.on_click(cx.listener(move |this, _, _, cx| this.react(&id, &toggled, on, cx))))
+                    .when(!joins, |chip| chip.cursor_default()),
             );
         }
         let hidden = message.reactions.len().saturating_sub(CHIPS);
@@ -1355,12 +1368,14 @@ impl Pane {
             row = row.child(chip("chips-more".into(), false).type_small().text_color(theme::text_soft()).child(format!("+{hidden}")));
         }
         // Always laid out and shown on hover only, so hovering a row never changes its height.
+        // Where nothing more may be added it stays laid out and never shows.
         let id = message.id.clone();
+        let adds = acts && self.adds(message);
         let add = chip("chip-add".into(), false)
             .opacity(0.)
-            .group_hover("row", |style| style.opacity(1.))
+            .when(adds, |chip| chip.group_hover("row", |style| style.opacity(1.)))
             .child(icon(Icon::SmilePlus, 16., theme::text_soft()))
-            .when(acts, |chip| {
+            .when(adds, |chip| {
                 chip.tooltip(tip("Add reaction", None)).on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
                     this.open_picker(&id, event.position(), window, cx);
                 }))

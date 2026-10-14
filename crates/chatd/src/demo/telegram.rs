@@ -5,7 +5,7 @@
 use super::png::Art;
 use super::{Fallible, Listed, Seeder, Who};
 use crate::store::{ConversationRow, Filing, FolderRow, PersonDetails, PreviewLine};
-use protocol::{AccountKey, Card, ConversationKind, Key, Mark, MediaKind, Network, Presence, Relation, Special};
+use protocol::{AccountKey, Card, ConversationKind, Key, Mark, MediaKind, Network, Presence, Reaction, Relation, Special};
 use ConversationKind::{Announcement, Direct, Forum, Group, Thread};
 use Presence::{Offline, Online, Unknown};
 use Relation::Contact;
@@ -15,6 +15,15 @@ pub const ME: &str = "u7000000";
 pub const SERVICE: &str = "u777000";
 pub const CHANNEL: &str = "c9001";
 pub const FORUM: &str = "c9100";
+/// Telegram's own reaction emoji, as `messages.getAvailableReactions` lists them for an account
+/// without Premium: the only ones a chat can allow.
+pub const REACTIONS: &[&str] = &[
+    "👍", "👎", "❤", "🔥", "🥰", "👏", "😁", "🤔", "🤯", "😱", "🤬", "😢", "🎉", "🤩", "🤮", "💩", "🙏",
+    "👌", "🕊", "🤡", "🥱", "🥴", "😍", "🐳", "❤\u{200d}🔥", "🌚", "🌭", "💯", "🤣", "⚡", "🍌", "🏆", "💔",
+    "🤨", "😐", "🍓", "🍾", "💋", "🖕", "😈", "😴", "😭", "🤓", "👻", "👨\u{200d}💻", "👀", "🎃", "🙈",
+    "😇", "😨", "🤝", "✍", "🤗", "🫡", "🎅", "🎄", "☃", "💅", "🤪", "🗿", "🆒", "💘", "🙉", "🦄", "😘",
+    "💊", "🙊", "😎", "👾", "🤷\u{200d}♂", "🤷", "🤷\u{200d}♀", "😡",
+];
 
 pub fn account() -> AccountKey {
     AccountKey {
@@ -42,6 +51,15 @@ const PAVEL: usize = 4;
 const ROSA: usize = 5;
 const WEATHER: usize = 6;
 const SCAM: usize = 7;
+
+/// Puts reactions on a message already recorded.
+fn reacted(s: &mut Seeder, conversation: &Key, id: &str, list: &[(&str, u32, bool)]) -> Fallible<()> {
+    if let Some(mut message) = s.store.message(conversation, id)? {
+        message.reactions = list.iter().map(|(emoji, count, mine)| Reaction { emoji: (*emoji).to_owned(), file: None, count: *count, mine: *mine }).collect();
+        s.post(conversation, &message)?;
+    }
+    Ok(())
+}
 
 fn folders(ids: &[&str]) -> Vec<String> {
     ids.iter().map(|id| (*id).to_owned()).collect()
@@ -155,6 +173,9 @@ pub fn seed(s: &mut Seeder) -> Fallible<Who> {
         (MARA, 18, "ok"),
     ])?;
     s.counts(&foraging, 2, 0, Some(&said[0]))?;
+    // Its admins allow five reactions (`adapter.rs`); ours is one of them, and a second would
+    // replace it, as Telegram has it without Premium.
+    reacted(s, &foraging, &said[0], &[("🔥", 3, false), ("❤", 2, true)])?;
     let mut mention = s.message(&account, &cast[INES], 10, "@Robin Vale are you bringing the basket?");
     mention.mentions_me = true;
     s.post(&foraging, &mention)?;
@@ -191,6 +212,7 @@ pub fn seed(s: &mut Seeder) -> Fallible<Who> {
         s.store.set_preview(&channel, &line)?;
     }
     s.counts(&channel, 4, 0, Some(&said[0]))?;
+    reacted(s, &channel, &said[1], &[("👍", 14, false), ("🔥", 6, false)])?;
 
     // A forum: topics under it, pinned first, one unread.
     let avatar = s.cover(&account, FORUM, "group-mycology.webp")?;

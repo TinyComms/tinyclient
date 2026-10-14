@@ -1117,6 +1117,7 @@ impl Composer {
             custom: controls.custom_emoji,
             known: Vec::new(),
             reacting: false,
+            rules: None,
         };
         let picker = cx.new(|cx| Picker::open(setup, window, cx));
         let listening = cx.subscribe_in(&picker, window, |this, _, event: &PickerEvent, window, cx| {

@@ -110,6 +110,9 @@ struct Open {
     marker_known: bool,
     /// The message a thread hangs off, and how many replies it had.
     root: Option<(Rc<Message>, u32)>,
+    /// What it takes as reactions, once chatd said. `None` until then, or from a chatd that
+    /// does not say: everything is offered, as before there were rules.
+    reactions: Option<protocol::ReactionRules>,
     #[cfg_attr(not(feature = "gui-shot"), allow(dead_code))]
     started: Instant,
 }
@@ -381,6 +384,7 @@ impl Pane {
             last_read: None,
             marker_known: false,
             root,
+            reactions: None,
             started: Instant::now(),
         });
         self.window = pages::Window::default();
@@ -419,6 +423,7 @@ impl Pane {
         self.uploads.clear();
         self.pending_at.clear();
         self.relay(true, ListOffset::default());
+        self.ask_reactions(cx);
         match back {
             Some(place) => self.load(Page::Around { id: place.id.clone() }, Purpose::Restore(place.id, place.offset), cx),
             None => match around {

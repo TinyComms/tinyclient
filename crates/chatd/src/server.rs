@@ -663,53 +663,97 @@ impl Chat {
         }
     }
 
-    /// Our reaction, shown at once and taken back if the network refuses it. A custom emoji
-    /// that is not on the message yet has no name here to draw, so that one waits for the
-    /// network's own word.
+    /// What reactions a conversation takes, kept five minutes. `None` when the adapter does not
+    /// say, or could not ask: then the network alone judges.
+    fn reaction_rules(&self, conversation: &Key) -> Result<protocol::ReactionRules, Refused> {
+        if let Some(rules) = self.hub.reactions.get(conversation) {
+            return Ok(rules);
+        }
+        let conversation_id = conversation.id.clone();
+        let mut rules = self.ask(&conversation.account(), |reply| Command::ReactionRules { conversation_id, reply })?;
+        rules.bound();
+        self.hub.reactions.keep(conversation.clone(), rules.clone());
+        Ok(rules)
+    }
+
+    fn reactions(&self, conversation: Key) -> Response {
+        match self.reaction_rules(&conversation) {
+            Ok(rules) => Response::Reactions { conversation, rules },
+            Err(refused) => *refused,
+        }
+    }
+
+    /// Our reaction, shown at once and taken back if the network refuses it. One the
+    /// conversation's rules refuse is refused here and never sent; one that replaces mine (a
+    /// network with one reaction a person) takes mine off at once too. A custom emoji that is
+    /// not on the message yet has no name here to draw, so that one waits for the network's word.
     fn react(&self, conversation: Key, message_id: String, emoji: String, on: bool) -> Response {
         let account = conversation.account();
         if let Err(refused) = self.online(&account) {
             return *refused;
         }
-        let ours = Reaction {
-            emoji: emoji.clone(),
+        let ours = |emoji: &str| Reaction {
+            emoji: emoji.to_owned(),
             file: None,
             count: 1,
             mine: true,
         };
+        let message = match self.hub.store().message(&conversation, &message_id) {
+            Ok(Some(message)) => message,
+            Ok(None) => return error(ErrorCode::NotFound, "no such message"),
+            Err(err) => return internal(err),
+        };
+        let known = self.hub.store().media(&account, std::slice::from_ref(&emoji)).is_ok_and(|known| !known.is_empty());
+        // Rules the adapter cannot give leave it to the network, as before there were any.
+        let (emoji, replacing) = match (on, self.reaction_rules(&conversation)) {
+            (true, Ok(rules)) => match rules.check(&message.reactions, &emoji, known || emoji.starts_with(':')) {
+                // Sent as the network spells it, so its own word of it is the same reaction.
+                Ok(replacing) => (rules.spelled(&emoji).to_owned(), replacing),
+                Err(why) => return error(ErrorCode::Refused, why),
+            },
+            _ => (emoji, Vec::new()),
+        };
         let shown = {
             let mut store = self.hub.store();
-            let message = match store.message(&conversation, &message_id) {
-                Ok(Some(message)) => message,
-                Ok(None) => return error(ErrorCode::NotFound, "no such message"),
-                Err(err) => return internal(err),
-            };
+            for old in &replacing {
+                if let Err(err) = store.react(&conversation, &message_id, &ours(old), false) {
+                    return internal(err);
+                }
+            }
             let on_it = message.reactions.iter().any(|have| have.emoji == emoji || have.file.as_ref().is_some_and(|file| file.id == emoji));
-            let custom = store.media(&account, std::slice::from_ref(&emoji)).is_ok_and(|known| !known.is_empty());
-            if custom && !on_it {
+            if known && !on_it {
                 false
             } else {
-                match store.react(&conversation, &message_id, &ours, on) {
+                match store.react(&conversation, &message_id, &ours(&emoji), on) {
                     Ok(changed) => changed,
                     Err(err) => return internal(err),
                 }
             }
         };
-        if shown {
+        if shown || !replacing.is_empty() {
             self.hub.changed(Change::Messages { conversation: conversation.clone() });
         }
         let (conversation_id, id) = (conversation.id.clone(), message_id.clone());
         let asked = self.ask(&account, |reply| Command::React {
             conversation_id,
             message_id: id,
-            emoji,
+            emoji: emoji.clone(),
             on,
             reply,
         });
         match asked {
             Ok(()) => Response::Ok,
             Err(refused) => {
-                if shown && self.hub.store().react(&conversation, &message_id, &ours, !on).unwrap_or(false) {
+                // What the network refused may be what the kept rules allowed: ask again next time.
+                self.hub.reactions.forget(&conversation);
+                let mut store = self.hub.store();
+                let mut undone = shown && store.react(&conversation, &message_id, &ours(&emoji), !on).unwrap_or(false);
+                for old in &replacing {
+                    let had = message.reactions.iter().find(|have| have.emoji == *old).map(|have| Reaction { count: 1, ..have.clone() });
+                    undone |= store.react(&conversation, &message_id, &had.unwrap_or_else(|| ours(old)), true).unwrap_or(false);
+                }
+                drop(store);
+                if undone {
                     self.hub.changed(Change::Messages { conversation });
                 }
                 *refused
@@ -1416,6 +1460,7 @@ impl Chat {
             }
 
             Request::React { conversation, message_id, emoji, on } => self.react(conversation, message_id, emoji, on),
+            Request::Reactions { conversation } => self.reactions(conversation),
             Request::Edit { conversation, message_id, text } => self.rewrite(conversation, message_id, Some(text)),
             Request::Delete { conversation, message_id } => self.rewrite(conversation, message_id, None),
 

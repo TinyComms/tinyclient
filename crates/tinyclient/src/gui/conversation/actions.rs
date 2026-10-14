@@ -17,7 +17,7 @@ use gpui::{
     anchored, deferred, div, point, prelude::*, px, AnyElement, Bounds, ClipboardItem, Context, Div, ElementId, Entity,
     KeyDownEvent, MouseButton, Pixels, Point, SharedString, Stateful, Subscription, Window,
 };
-use protocol::{ErrorCode, Message, MessageKind, Network, Request, Response, SendState};
+use protocol::{ErrorCode, Message, MessageKind, Network, ReactionRules, Request, Response, SendState};
 use std::rc::Rc;
 
 /// How far the toolbar rises above its row, and how wide the strip it can occupy is.
@@ -117,7 +117,7 @@ fn tool(id: impl Into<ElementId>, child: impl IntoElement) -> Stateful<Div> {
 }
 
 fn glyph_of(emoji: &str) -> Div {
-    div().text_size(px(15.)).line_height(px(20.)).child(SharedString::from(emoji.to_owned()))
+    div().text_size(px(15.)).line_height(px(20.)).child(SharedString::from(emoji::display(emoji)))
 }
 
 impl Pane {
@@ -127,6 +127,62 @@ impl Pane {
 
     pub(super) fn can(&self, message: &Message) -> Can {
         can(message, self.network(), self.is_thread())
+    }
+
+    // Reactions.
+
+    /// What the open conversation takes as reactions, when chatd said.
+    pub(super) fn rules(&self) -> Option<&ReactionRules> {
+        self.open.as_ref().and_then(|open| open.reactions.as_ref())
+    }
+
+    /// Something may be added to this message: the add affordances are drawn.
+    pub(super) fn adds(&self, message: &Message) -> bool {
+        self.rules().is_none_or(|rules| rules.adds(&message.reactions))
+    }
+
+    /// Why this reaction cannot be added to this message, or `None` when it can (or nothing is
+    /// known to say otherwise). Taking mine back is always allowed.
+    pub(super) fn refusal(&self, message: &Message, emoji: &str) -> Option<String> {
+        // A custom emoji is named by an id or `:name:`, which are plain text; a Unicode one never is.
+        let custom = emoji.is_ascii() || message.reactions.iter().any(|have| have.emoji == emoji && have.file.is_some());
+        self.rules()?.check(&message.reactions, emoji, custom).err()
+    }
+
+    /// Asks what the open conversation takes as reactions; chatd keeps the answer five minutes.
+    /// When it lands an open picker is narrowed to it.
+    pub(super) fn ask_reactions(&mut self, cx: &mut Context<Self>) {
+        let Some(conversation) = self.key().cloned() else {
+            return;
+        };
+        let request = Request::Reactions { conversation: conversation.clone() };
+        cx.spawn(async move |this, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+            let rules = match answer {
+                Ok(Response::Reactions { rules, .. }) => Some(rules),
+                _ => None,
+            };
+            let _ = this.update(cx, |this, cx| {
+                let Some(open) = this.open.as_mut().filter(|open| open.key == conversation) else {
+                    return;
+                };
+                open.reactions = rules.clone();
+                let space = this.space(cx);
+                if let Some(picking) = &this.picker {
+                    picking.picker.update(cx, |picker, cx| picker.set_rules(rules, space, cx));
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The open conversation's Space, where its custom emoji come from.
+    fn space(&self, cx: &Context<Self>) -> Option<protocol::Key> {
+        let shell = self.shell.upgrade()?;
+        let shell = shell.read(cx);
+        let open = shell.snapshot.as_ref()?.open.as_ref()?;
+        Some(protocol::Key::new(&open.key.account(), open.space.clone()?))
     }
 
     // The pointer.
@@ -214,22 +270,28 @@ impl Pane {
             .flex()
             .items_center()
             .occlude();
-        for (slot, quick) in emoji::recents(3).into_iter().enumerate() {
+        // Only reactions the conversation takes, and none at all where it takes none.
+        let quick = emoji::quick(self.rules(), &message.reactions, 3);
+        for (slot, quick) in quick.iter().enumerate() {
             let (id, react) = (message.id.clone(), quick.clone());
-            let mine = message.reactions.iter().any(|reaction| reaction.mine && reaction.emoji == quick);
-            bar = bar.child(tool(("quick", slot), glyph_of(&quick)).on_click(cx.listener(move |this, _, _, cx| {
-                this.react(&id, &react, !mine, cx);
+            bar = bar.child(tool(("quick", slot), glyph_of(quick)).on_click(cx.listener(move |this, _, _, cx| {
+                this.react_toggle(&id, &react, cx);
             })));
         }
-        bar = bar.child(div().w(px(1.)).h(px(16.)).mx(px(3.)).bg(theme::hairline()));
-        let id = message.id.clone();
-        bar = bar.child(
-            tool("add", icon(Icon::SmilePlus, 16., theme::text_soft()))
-                .tooltip(tip("Add reaction", None))
-                .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
-                    this.open_picker(&id, event.position(), window, cx);
-                })),
-        );
+        let adds = self.adds(message);
+        if !quick.is_empty() || adds {
+            bar = bar.child(div().w(px(1.)).h(px(16.)).mx(px(3.)).bg(theme::hairline()));
+        }
+        if adds {
+            let id = message.id.clone();
+            bar = bar.child(
+                tool("add", icon(Icon::SmilePlus, 16., theme::text_soft()))
+                    .tooltip(tip("Add reaction", None))
+                    .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                        this.open_picker(&id, event.position(), window, cx);
+                    })),
+            );
+        }
         if can.reply {
             let reply = message.clone();
             bar = bar.child(
@@ -274,6 +336,11 @@ impl Pane {
     /// Sends a request that changes a message and says so if the network refuses. What it
     /// changed arrives as a `Messages` change, like anything else.
     fn act(&mut self, request: Request, refused: &'static str, cx: &mut Context<Self>) {
+        self.act_then(request, refused, |_, _| {}, cx);
+    }
+
+    /// The same, doing `then` after a refusal.
+    fn act_then(&mut self, request: Request, refused: &'static str, then: impl FnOnce(&mut Pane, &mut Context<Pane>) + 'static, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
             let why = match answer {
@@ -283,28 +350,43 @@ impl Pane {
                 Err(err) => Some(format!("{refused}: {}", crate::client::trouble_words(&err))),
             };
             if let Some(why) = why {
-                let _ = this.update(cx, |this, cx| this.say(why, cx));
+                let _ = this.update(cx, |this, cx| {
+                    this.say(why, cx);
+                    then(this, cx);
+                });
             }
         })
         .detach();
     }
 
-    /// Adds my reaction, or takes it back.
+    /// Adds my reaction, or takes it back. One the conversation's rules refuse says why and
+    /// is never sent. chatd shows it at once and takes it back if the network refuses, and
+    /// then the rules are asked again: they may be what changed.
     pub(super) fn react(&mut self, message_id: &str, emoji: &str, on: bool, cx: &mut Context<Self>) {
         let Some(conversation) = self.key().cloned() else {
             return;
         };
         if on {
-            emoji::used(emoji);
+            if let Some(why) = self.find(message_id).and_then(|message| self.refusal(&message, emoji)) {
+                self.say(format!("Couldn't react: {why}"), cx);
+                return;
+            }
+            // A custom one's id is no glyph to offer again.
+            if !emoji.is_ascii() || emoji.starts_with(':') {
+                emoji::used(emoji);
+            }
         }
         let request = Request::React { conversation, message_id: message_id.to_owned(), emoji: emoji.to_owned(), on };
-        self.act(request, "Couldn't react", cx);
+        self.act_then(request, "Couldn't react", |this, cx| this.ask_reactions(cx), cx);
         cx.notify();
     }
 
     /// A reaction chosen where the message may already carry it: mine toggles off.
     fn react_toggle(&mut self, message_id: &str, emoji: &str, cx: &mut Context<Self>) {
-        let mine = self.find(message_id).is_some_and(|message| message.reactions.iter().any(|r| r.mine && r.emoji == emoji));
+        let same = |have: &protocol::Reaction| {
+            have.emoji == emoji || have.file.as_ref().is_some_and(|file| file.id == emoji) || protocol::bare_emoji(&have.emoji) == protocol::bare_emoji(emoji)
+        };
+        let mine = self.find(message_id).is_some_and(|message| message.reactions.iter().any(|have| have.mine && same(have)));
         self.react(message_id, emoji, !mine, cx);
     }
 
@@ -416,9 +498,10 @@ impl Pane {
                     this.delete(message, true, window, cx);
                 })));
         } else {
-            if can.act {
+            let quick = if can.act { emoji::quick(self.rules(), &message.reactions, 6) } else { Vec::new() };
+            if !quick.is_empty() {
                 let mut strip = div().h(px(36.)).px(px(2.)).flex().items_center().justify_between();
-                for (slot, quick) in emoji::recents(6).into_iter().enumerate() {
+                for (slot, quick) in quick.into_iter().enumerate() {
                     let (id, react) = (message.id.clone(), quick.clone());
                     strip = strip.child(tool(("menu-quick", slot), glyph_of(&quick).text_size(px(18.))).size(px(32.)).on_click(cx.listener(
                         move |this, _, _, cx| {
@@ -437,7 +520,7 @@ impl Pane {
                     |_, message, _, _, cx| cx.emit(PaneEvent::OpenThread(message.clone())),
                 )));
             }
-            if can.act {
+            if can.act && self.adds(message) {
                 let at = *at;
                 let id = message.id.clone();
                 items = items.child(menu_item("react", Some("icons/smile-plus.svg"), "React", None).on_click(cx.listener(
@@ -489,7 +572,8 @@ impl Pane {
     pub(super) fn open_picker(&mut self, message_id: &str, at: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
         self.close_picker(cx);
         let custom = self.custom_emoji();
-        let picker = cx.new(|cx| Picker::new(custom, window, cx));
+        let (rules, account, space) = (self.rules().cloned(), self.key().map(protocol::Key::account), self.space(cx));
+        let picker = cx.new(|cx| Picker::new(custom, rules, account, space, window, cx));
         let listening = cx.subscribe_in(&picker, window, |this, _, event: &PickerEvent, window, cx| {
             let target = this.picker.as_ref().map(|picking| picking.message.clone());
             if let (PickerEvent::Picked(emoji), Some(target)) = (event, target) {

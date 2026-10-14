@@ -86,6 +86,8 @@ struct Pickable {
     animated: bool,
     /// A sticker's format; 0 for an emoji.
     format: u8,
+    /// The roles an emoji is limited to; empty for everyone.
+    roles: Box<[u64]>,
 }
 
 struct RoleInfo {
@@ -968,6 +970,7 @@ impl Discord {
             Command::Catalog { kind, space_id, query, cursor, reply } => {
                 answer(reply, self.catalog(kind, space_id.as_deref(), &query, cursor.as_deref()))
             }
+            Command::ReactionRules { conversation_id, reply } => drop(reply.send(Ok(self.reaction_rules(&conversation_id)))),
             Command::CancelSend { client_id, .. } => upload::cancel(&self.ctx.account, &client_id),
             // Never: a fetch per DM is the burst that flags accounts. chatd does not send it,
             // and it is refused here too should it ever arrive.

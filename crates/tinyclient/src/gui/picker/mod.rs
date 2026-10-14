@@ -32,7 +32,7 @@ use gpui::{
 };
 use kept::List as Kept;
 use images::{Images, Loaded, Picture};
-use protocol::{AccountKey, CatalogItem, CatalogKind, ErrorCode, Key, MediaFile, MediaKind, Network, Pick, Request, Response};
+use protocol::{AccountKey, CatalogItem, CatalogKind, EmojiScope, ErrorCode, Key, MediaFile, MediaKind, Network, Pick, ReactionRules, Request, Response};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -116,6 +116,8 @@ pub struct Setup {
     /// Custom emoji already known with their files: a reaction's conversation has shown them.
     pub known: Vec<(String, MediaFile)>,
     pub reacting: bool,
+    /// For a reaction: what the conversation takes, when chatd said. Only that is offered.
+    pub rules: Option<ReactionRules>,
 }
 
 /// A GIF or sticker grid row: items by index, with their drawn widths.
@@ -178,10 +180,59 @@ pub struct Picker {
 }
 
 impl Picker {
-    /// The reaction picker: Emoji only, with the conversation's own custom emoji.
-    pub fn new(known: Vec<(String, MediaFile)>, window: &mut Window, cx: &mut Context<Self>) -> Picker {
-        let setup = Setup { account: None, network: None, space: None, tabs: vec![Tab::Emoji], open: Tab::Emoji, custom: false, known, reacting: true };
-        Picker::open(setup, window, cx)
+    /// The reaction picker: Emoji only, with the conversation's own custom emoji, and with
+    /// rules only what they allow, the account's custom emoji among it where they may be used.
+    pub fn new(
+        known: Vec<(String, MediaFile)>,
+        rules: Option<ReactionRules>,
+        account: Option<AccountKey>,
+        space: Option<Key>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Picker {
+        let setup = Setup {
+            network: account.as_ref().map(|account| account.network),
+            account,
+            space: None,
+            tabs: vec![Tab::Emoji],
+            open: Tab::Emoji,
+            custom: false,
+            known,
+            reacting: true,
+            rules: None,
+        };
+        let mut picker = Picker::open(setup, window, cx);
+        picker.set_rules(rules, space, cx);
+        picker
+    }
+
+    /// What the conversation takes arrived, or changed. `space` is where its custom emoji are
+    /// from, for a scope of one Space.
+    pub fn set_rules(&mut self, rules: Option<ReactionRules>, space: Option<Key>, cx: &mut Context<Self>) {
+        let Some(rules) = rules else {
+            return;
+        };
+        // Emoji seen on messages may be another Space's; with a narrower scope than everything
+        // the account's own catalog says which may be used.
+        if rules.custom != EmojiScope::All {
+            self.customs.retain(|custom| !custom.id.is_empty());
+        }
+        if !emoji::tones_allowed(&rules) {
+            self.tone = 0;
+            self.choosing_tone = false;
+        }
+        self.setup.custom = rules.custom != EmojiScope::None && self.setup.account.is_some();
+        self.setup.space = if rules.custom == EmojiScope::Space { space } else { None };
+        self.setup.rules = Some(rules);
+        if self.setup.custom && !self.custom_asked {
+            self.custom_asked = true;
+            self.ask(Tab::Emoji, String::new(), None, cx);
+        }
+        self.requery(cx);
+    }
+
+    fn tones(&self) -> bool {
+        self.setup.rules.as_ref().is_none_or(emoji::tones_allowed)
     }
 
     pub fn open(setup: Setup, window: &mut Window, cx: &mut Context<Self>) -> Picker {
@@ -328,9 +379,11 @@ impl Picker {
         self.select(None, cx);
         match self.tab {
             Tab::Emoji => {
-                (self.rows, self.sections) = match query.is_empty() {
-                    true => emoji::browse(&self.recent, &self.customs),
-                    false => (emoji::search_rows(&query, &self.recent, &self.customs), Vec::new()),
+                (self.rows, self.sections) = match (&self.setup.rules, query.is_empty()) {
+                    (None, true) => emoji::browse(&self.recent, &self.customs),
+                    (None, false) => (emoji::search_rows(&query, &self.recent, &self.customs), Vec::new()),
+                    (Some(rules), true) => emoji::browse_for(rules, &self.recent, &self.customs, self.tone),
+                    (Some(rules), false) => (emoji::search_for(rules, &query, &self.recent, &self.customs, self.tone), Vec::new()),
                 };
             }
             Tab::Gifs => {
@@ -511,6 +564,8 @@ impl Picker {
         }
         let event = match custom {
             Some(custom) if !self.setup.reacting && !custom.id.is_empty() => PickerEvent::Custom { name: custom.name, id: custom.id, animated: custom.animated },
+            // One from the catalog is not on the message yet: its id says which it is.
+            Some(custom) if self.setup.reacting => PickerEvent::Picked(emoji::reaction_text(&custom)),
             _ => PickerEvent::Picked(text),
         };
         self.chosen(event, keep, cx);
@@ -939,7 +994,14 @@ impl Picker {
                         this.choosing_tone = true;
                         cx.notify();
                     }));
-                footer.child(preview.unwrap_or_else(|| div().flex_1())).child(tone).into_any_element()
+                // A list of its own: say so where nothing is hovered.
+                let only = self.setup.rules.as_ref().is_some_and(|rules| rules.set == protocol::ReactionSet::Only);
+                let idle = || match only {
+                    true => div().flex_1().min_w_0().truncate().text_color(theme::text_faint()).child("Only the reactions allowed here"),
+                    false => div().flex_1(),
+                };
+                let tones = self.tones();
+                footer.child(preview.unwrap_or_else(idle)).when(tones, |footer| footer.child(tone)).into_any_element()
             }
             Tab::Gifs => {
                 let network = self.setup.network.map_or("the network", |network| network.label());

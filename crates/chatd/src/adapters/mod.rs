@@ -19,8 +19,8 @@ mod discord;
 pub mod net;
 mod script;
 pub mod signal;
-mod slack;
-mod teams;
+pub(crate) mod slack;
+pub(crate) mod teams;
 pub mod telegram;
 
 use crate::hub::{lock, now, Hub};
@@ -204,6 +204,11 @@ pub enum Command {
         on: bool,
         reply: Reply<()>,
     },
+    /// What reactions a conversation takes from this account, from what the network says of
+    /// it: the chat's own set, our permissions and plan. One request at most, because the user
+    /// opened it; chatd keeps the answer five minutes. `Unsupported` leaves every reaction to the
+    /// network to judge.
+    ReactionRules { conversation_id: String, reply: Reply<protocol::ReactionRules> },
     /// Replace the text of one of our messages. Report the edited message through
     /// [`Context::message`] before answering: nothing was changed locally.
     Edit {
@@ -335,6 +340,7 @@ impl Command {
             Command::Pinned { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SearchShared { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Catalog { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ReactionRules { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SendWith { conversation_id, client_id, .. } => {
                 let why = format!("Sending files and options is not built for {} yet.", ctx.account.network.label());
                 ctx.sent(&conversation_id, &client_id, Err(why));

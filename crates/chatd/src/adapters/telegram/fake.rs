@@ -1023,6 +1023,26 @@ impl World {
             }
             return answer(tl::enums::messages::AffectedMessages::Messages(tl::types::messages::AffectedMessages { pts: 2, pts_count: 1 }));
         }
+        if asked::<f::messages::GetAvailableReactions>(body).is_some() {
+            self.log("GetAvailableReactions");
+            // Telegram's list, short: 🚫 is one Telegram then refuses, and 🦄 needs Premium.
+            let one = |emoji: &str, premium: bool| {
+                let mut reaction: tl::types::AvailableReaction = blank(&[
+                    &put(0u32),
+                    &put(emoji.to_owned()),
+                    &put(emoji.to_owned()),
+                    &put(tl::enums::Document::Empty(tl::types::DocumentEmpty { id: 0 })),
+                    &put(tl::enums::Document::Empty(tl::types::DocumentEmpty { id: 0 })),
+                    &put(tl::enums::Document::Empty(tl::types::DocumentEmpty { id: 0 })),
+                    &put(tl::enums::Document::Empty(tl::types::DocumentEmpty { id: 0 })),
+                    &put(tl::enums::Document::Empty(tl::types::DocumentEmpty { id: 0 })),
+                ]);
+                reaction.premium = premium;
+                tl::enums::AvailableReaction::Reaction(reaction)
+            };
+            let reactions = vec![one("👍", false), one("❤", false), one("🔥", false), one("🎉", false), one("🚫", false), one("🦄", true)];
+            return answer(tl::enums::messages::AvailableReactions::Reactions(tl::types::messages::AvailableReactions { hash: 1, reactions }));
+        }
         if let Some(request) = asked::<f::messages::SendReaction>(body) {
             let peer = input_who(&request.peer);
             let sent: Vec<String> = request.reaction.iter().flatten().filter_map(|reaction| match reaction {
@@ -1088,6 +1108,9 @@ impl World {
                 &put(settings(None)),
             ]);
             full.about = "Weekend routes.".to_owned();
+            // Its admins allow three reactions.
+            let three = ["👍", "❤", "🔥"].map(|emoticon| tl::types::ReactionEmoji { emoticon: emoticon.to_owned() }.into());
+            full.available_reactions = Some(tl::types::ChatReactionsSome { reactions: three.to_vec() }.into());
             let found = tl::types::messages::ChatFull { full_chat: full.into(), chats: chats(), users: users() };
             return answer(tl::enums::messages::ChatFull::Full(found));
         }
@@ -1159,6 +1182,14 @@ impl World {
                 &put(1i32),
             ]);
             full.about = "Notes from the high country.".to_owned();
+            // The channel turned reactions off; the forum allows all of them, two different
+            // ones a message.
+            if channel.channel_id == NOTES {
+                full.available_reactions = Some(tl::enums::ChatReactions::None);
+            } else {
+                full.available_reactions = Some(tl::types::ChatReactionsAll { allow_custom: false }.into());
+                full.reactions_limit = Some(2);
+            }
             full.participants_count = Some(1_204);
             full.online_count = Some(230);
             let found = tl::types::messages::ChatFull { full_chat: full.into(), chats: chats(), users: users() };

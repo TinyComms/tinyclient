@@ -9,7 +9,7 @@
 use protocol::{
     read_frame, write_frame, AccountKey, Badge, CallSupport, Change, Conversation, ConversationKind,
     ErrorCode, Group, GroupKind, InboxFilter, Key, Link, MediaKind, MentionKind, Message,
-    MessageKind, Network, Page, Presence, Relation, Request, Response, SendState, Style, Watching,
+    MessageKind, Network, Page, Presence, ReactionSet, EmojiScope, Relation, Request, Response, SendState, Style, Watching,
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -1675,9 +1675,21 @@ fn reacting_editing_and_deleting_ask_slack_and_show_what_slack_says() {
     assert_eq!(reaction("👀"), None);
     // Slack refuses: the answer says why, and what was shown is taken back.
     let refused = react("🚫", true);
-    assert_eq!(refused, Response::Error { code: ErrorCode::Refused, detail: "This message has as many reactions as Slack allows.".to_owned() });
+    assert_eq!(refused, Response::Error { code: ErrorCode::Refused, detail: "You have added as many reactions to this message as Slack allows.".to_owned() });
     assert_eq!(reaction("🚫"), None);
     assert_eq!(world.fake.calls(ALPHA, "reactions.add").len(), 4, "a refused reaction is not tried again");
+
+    // What Slack takes: the emoji chatd can name, in any tone, the workspace's own, 23 of mine
+    // and 50 different a message. One it cannot name is refused here and never asked of Slack.
+    let Response::Reactions { rules, .. } = world.ask(Request::Reactions { conversation: general.clone() }) else {
+        panic!("no rules");
+    };
+    assert_eq!((rules.set, rules.custom, rules.mine, rules.distinct, rules.tones), (ReactionSet::Only, EmojiScope::All, 23, 50, true));
+    assert!(rules.only.contains(&"👀".to_owned()) && !rules.only.contains(&"🫥".to_owned()));
+    let unnamed = react("🫥", true);
+    assert_eq!(unnamed, Response::Error { code: ErrorCode::Refused, detail: "That reaction isn't allowed here.".to_owned() });
+    assert_eq!(world.fake.calls(ALPHA, "reactions.add").len(), 4, "never asked of Slack");
+    assert_eq!(reaction("🫥"), None);
 
     // An edit changes nothing until Slack accepts it, and is there when the answer is.
     let mine = "1760000100.000100";

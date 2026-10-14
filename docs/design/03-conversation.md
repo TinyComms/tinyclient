@@ -92,7 +92,8 @@ All cards: no proxied image means a text-only card. No favicon. Clicking a card 
 - **Reactions.** Row under the content, margin 6 / 3, wraps. Chip: height 26, radius 13, padding 0 / 8, emoji 15 (custom emoji 18 x 18), count 12
   medium tabular `text_soft`, fill `raised`, 6 px gaps. Mine: fill `accent_soft`, 1 px `accent` border, count `link`. Hover: 1 px `hairline_strong`
   border; tooltip lists who (fetched then). At most 12 chips, then a "+7" chip that expands the row. A final add chip (smiley) is always laid out and
-  is invisible until the row is hovered, so hovering never changes the height.
+  is invisible until the row is hovered, so hovering never changes the height; where nothing more may be added (04, Reactions) it never
+  shows. A chip the conversation will not let me join is not clickable and its tooltip says why.
 - **Reply quote.** One 20 px line above the header, starting at x = 68: 16 px avatar, name 12.5 semibold `text_soft`, snippet 12.5 `text_faint`,
   truncated. An elbow (2 px `hairline_strong`, top-left radius 6) joins it to the avatar column. Media-only target: glyph and "Photo" / "File".
   Deleted target: italic "Original message was deleted". Hover: snippet `text`. Click scrolls to the target and flashes it (row flag above), loading
