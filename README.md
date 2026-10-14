@@ -247,29 +247,22 @@ How to report a vulnerability, and what is in scope: [SECURITY.md](SECURITY.md).
 
 ## Networks and terms
 
-tinyclient is an unofficial client. It is not made, endorsed or supported by Slack, Discord,
-Telegram, Microsoft or Signal. You use it at your own risk.
+tinyclient is an independent project, not made or endorsed by Slack, Discord, Telegram, Microsoft
+or Signal. How each network treats third-party clients, so you can decide for yourself:
 
-- **Slack.** tinyclient signs in the way Slack's web app does and uses that session. Slack does
-  not offer this to third-party clients, so it can stop working without notice, and it is outside
-  Slack's terms for API use. If this is a work Slack, your employer's security policy may not
-  allow unofficial clients. Ask first.
-- **Discord.** Discord's terms prohibit third-party clients that use your user account. Discord
-  can lock or ban an account for it, and has. tinyclient only does what you do by hand: it
-  automates nothing, and asks for members and presence only for what is on your screen, as the
-  official app does. That lowers the risk and does not remove it. To Discord and Slack it presents
-  itself as the web client in a browser (on macOS the Safari you have installed, elsewhere a fixed
-  Chrome identity), the same one the sign-in window used, because one consistent identity draws
-  less attention than an unknown one. Use it on an account you can afford to lose, or not at all.
-- **Teams.** tinyclient signs in as Microsoft's own Teams client and uses that client's chat
-  service, which Microsoft does not offer to others. Your organization's policy applies, its
-  administrators can see the sign-in, and an organization can refuse it outright.
-- **Telegram.** Telegram permits third-party clients, so this one is within its terms. Those terms
-  also mean tinyclient cannot hide that you read a message or are typing there.
-- **Signal.** tinyclient links to your account as one more device, the way Signal Desktop does,
-  through presage and Signal's own libsignal. Signal does not offer its service to third-party
-  clients, and a change on Signal's servers can stop this working without notice. A linked device
-  receives only what arrives after it was linked. Signing out removes the device from your account.
+- **Slack.** Signs in the way Slack's web app does and uses that session. Slack doesn't offer an
+  API for full clients, so a change on Slack's side can break this until we catch up. Work
+  workspaces may have their own policy on clients.
+- **Discord.** Discord's terms disallow third-party clients on user accounts. In practice its
+  enforcement goes after automation, self-bots and spam. tinyclient automates nothing: it only does
+  what you do, and asks for members and presence only for what is on screen, like the official
+  app. It identifies as Discord's web client in a browser, the same one you signed in with.
+- **Teams.** Signs in as Microsoft's own Teams client. Your organization's policy applies, and an
+  organization can turn third-party sign-ins off.
+- **Telegram.** Telegram welcomes third-party clients. Its rules mean read receipts and typing
+  indicators are always sent.
+- **Signal.** Links as one more device, like Signal Desktop, using Signal's own libsignal through
+  presage. It receives what arrives after it is linked, and signing out removes the device.
 
 ## Contributing
 
