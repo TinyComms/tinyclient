@@ -1,0 +1,40 @@
+[package]
+name = "chatd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+protocol.workspace = true
+# Ships SQLite in the crate so Windows and Linux builds need no system libsqlite3.
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
+# Both use the system TLS (Security.framework), so no second TLS stack is linked or kept in memory.
+ureq = { version = "3", default-features = false, features = ["native-tls", "json"] }
+tungstenite = { version = "0.30", default-features = false, features = ["handshake", "native-tls"] }
+keyring = "3"
+iana-time-zone = "0.1"
+# Discord adapter: `poll` on the gateway socket and a wake pipe, local time for `<t:..>`; base64 for
+# the client properties header. Both are already in the tree through other dependencies.
+libc = "0.2"
+base64 = "0.22"
+# Teams adapter: push bodies arrive gzipped. Already in the tree through other dependencies.
+miniz_oxide = "0.8"
+# Telegram: grammers, a pure-Rust MTProto client (the decision is at the top of
+# `adapters/telegram.rs`). No default features: that leaves out its second SQLite (libsql). It is
+# async, so tokio is here for one current-thread runtime that only the Telegram adapter's own
+# thread owns, built when a Telegram account exists or a sign-in begins.
+grammers-client = { version = "0.10", default-features = false }
+grammers-session = { version = "0.10", default-features = false }
+grammers-mtsender = "0.10"
+grammers-tl-types = { version = "0.10", features = ["deserializable-functions"] }
+grammers-crypto = "0.10"
+tokio = { version = "1", default-features = false, features = ["rt", "time", "sync", "macros"] }
+# grammers-crypto 0.10.0 asks for "2.0.0-rc0" and does not build against 2.0.0 (released
+# 2026-10-13, changed API). Pinned until grammers follows.
+glass_pumpkin = "=2.0.0-rc0"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Networking_WinSock"] }

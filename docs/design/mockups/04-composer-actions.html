@@ -1,0 +1,443 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>tinychat · 04 composer and message actions</title>
+<style>
+:root{
+  --rail:#0c0d11;--sidebar:#111217;--canvas:#15161c;--hairline:rgba(255,255,255,.06);
+  --raised:rgba(255,255,255,.04);--hover:rgba(255,255,255,.05);--selected:rgba(255,255,255,.09);
+  --text:#ededf2;--soft:#a0a2b1;--faint:#676a7d;
+  --accent:#7f8cff;--accent-soft:rgba(127,140,255,.15);--on-accent:#0c0d11;
+  --positive:#3fcf8e;--danger:#f2616b;--danger-soft:rgba(242,97,107,.14);--warning:#e3a94a;
+  /* new tokens */
+  --popover:#1d1e26;--focus-ring:rgba(127,140,255,.55);--scrim:rgba(0,0,0,.5);
+  --shadow-pop:0 8px 24px rgba(0,0,0,.45);
+}
+*{box-sizing:border-box}
+body{margin:0;background:#08090c;color:var(--text);font:14px/20px -apple-system,BlinkMacSystemFont,sans-serif;padding:32px 0 64px}
+h1{width:720px;margin:0 auto 4px;font-size:20px;line-height:28px}
+.lede{width:720px;margin:0 auto 28px;color:var(--soft);font-size:13px}
+figure{width:720px;margin:0 auto 36px}
+figcaption{font-size:12px;line-height:18px;color:var(--soft);margin-bottom:8px}
+figcaption b{color:var(--text);font-weight:600}
+.frame{position:relative;background:var(--canvas);border:1px solid var(--hairline);border-radius:10px;overflow:hidden}
+svg.i{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;flex:none}
+.i12{width:12px!important;height:12px!important}.i14{width:14px!important;height:14px!important}.i15{width:15px!important;height:15px!important}
+
+/* message rows (at rest look belongs to the conversation view; drawn here only as context) */
+.msgs{padding:14px 0 6px}
+.row{position:relative;display:flex;gap:12px;padding:4px 20px}
+.row.hovered{background:var(--hover)}
+.row.editing{background:var(--accent-soft);box-shadow:inset 2px 0 0 var(--accent)}
+.av{width:36px;height:36px;border-radius:18px;flex:none;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:600;color:#fff}
+.a1{background:linear-gradient(135deg,#d98a4e,#b8643a)}.a2{background:linear-gradient(135deg,#4e7fd9,#3a4fb8)}
+.a3{background:linear-gradient(135deg,#3fbf8e,#2a8f7a)}.a4{background:linear-gradient(135deg,#c75fb0,#8a3fa8)}
+.who{font-weight:600}.time{color:var(--faint);font-size:12px;margin-left:8px}
+.body{color:var(--text)}
+.pending .body{opacity:.55}
+.chips{display:flex;gap:6px;margin-top:6px}
+.chip{height:24px;padding:0 8px;border-radius:12px;background:var(--raised);border:1px solid var(--hairline);display:flex;align-items:center;gap:5px;font-size:12px;color:var(--soft)}
+.chip.mine{background:var(--accent-soft);border-color:var(--focus-ring);color:var(--text)}
+.chip.add{padding:0 6px;color:var(--faint)}
+.sendline{display:flex;align-items:center;gap:6px;margin-top:2px;font-size:12px;line-height:18px}
+.sendline.fail{color:var(--danger)}.sendline.wait{color:var(--warning)}
+.tbtn{height:22px;padding:0 8px;border-radius:6px;background:var(--raised);color:var(--text);font-size:12px;line-height:22px;font-weight:500}
+.sep{color:var(--faint)}
+
+/* hover toolbar */
+.toolbar{position:absolute;right:16px;top:-14px;height:30px;padding:2px;display:flex;align-items:center;gap:0;background:var(--popover);border:1px solid var(--hairline);border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.35)}
+.toolbar .b{width:26px;height:24px;border-radius:6px;display:flex;align-items:center;justify-content:center;color:var(--soft);font-size:15px}
+.toolbar .b.on{background:var(--selected);color:var(--text)}
+.toolbar .d{width:1px;height:16px;background:var(--hairline);margin:0 3px}
+.tip{position:absolute;right:16px;top:-46px;height:24px;padding:0 8px;border-radius:6px;background:#000;color:var(--text);font-size:12px;line-height:24px}
+.tip kbd{font:inherit;color:var(--soft);margin-left:6px}
+
+/* composer */
+.typing{height:20px;padding:0 24px;font-size:12px;line-height:20px;color:var(--faint)}
+.typing.ghost{color:rgba(255,255,255,.14);font-style:italic}
+.dock{padding:0 20px 16px}
+.card{background:var(--raised);border:1px solid var(--hairline);border-radius:14px;overflow:hidden}
+.card.focus{border-color:var(--focus-ring)}
+.bar{height:32px;padding:0 6px 0 12px;display:flex;align-items:center;gap:8px;border-bottom:1px solid var(--hairline);font-size:12px;color:var(--soft)}
+.bar .lead{color:var(--accent);display:flex}
+.bar b{color:var(--text);font-weight:600}
+.bar .snip{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--faint)}
+.bar .hint{color:var(--faint)}
+.ib{width:30px;height:30px;border-radius:8px;display:flex;align-items:center;justify-content:center;color:var(--soft);flex:none}
+.ib.sm{width:24px;height:24px;border-radius:6px}
+.ib.on{background:var(--selected);color:var(--text)}
+.tray{display:flex;gap:8px;padding:10px 10px 0}
+.thumb{position:relative;width:64px;height:64px;border-radius:8px;border:1px solid var(--hairline);flex:none;overflow:hidden}
+.t1{background:linear-gradient(160deg,#27406b,#1a2338 55%,#3b2a55)}.t2{background:linear-gradient(200deg,#274d44,#17222a 60%,#4a3a22)}
+.rm{position:absolute;top:3px;right:3px;width:18px;height:18px;border-radius:9px;background:rgba(12,13,17,.85);color:var(--text);display:flex;align-items:center;justify-content:center}
+.filechip{position:relative;width:296px;height:64px;border-radius:8px;border:1px solid var(--hairline);background:var(--raised);display:flex;align-items:center;gap:10px;padding:0 30px 0 10px;flex:none;overflow:hidden}
+.filechip.bad{border-color:var(--danger);background:var(--danger-soft)}
+.fic{width:36px;height:36px;border-radius:8px;background:var(--raised);display:flex;align-items:center;justify-content:center;color:var(--soft);flex:none}
+.fn{font-size:13px;line-height:18px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.fs{font-size:12px;line-height:16px;color:var(--faint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.bad .fs{color:var(--danger)}
+.prog{position:absolute;left:0;right:0;bottom:0;height:3px;background:rgba(0,0,0,.45)}
+.prog i{display:block;height:3px;background:var(--accent)}
+.pct{position:absolute;left:0;right:0;bottom:6px;text-align:center;font-size:11px;line-height:14px;color:#fff}
+.dim{position:absolute;inset:0;background:rgba(12,13,17,.45)}
+.inrow{display:flex;align-items:flex-end;gap:6px;padding:0 7px 0 8px;min-height:44px}
+.inrow .ib{margin-bottom:7px}
+.field{flex:1;min-width:0;padding:12px 0;line-height:20px;white-space:pre-wrap}
+.field.ph{color:var(--faint)}
+.caret{display:inline-block;width:1.5px;height:17px;background:var(--accent);vertical-align:-3px;margin-left:1px}
+.tok{background:var(--accent-soft);color:var(--accent);border-radius:4px;padding:1px 3px}
+.md{color:var(--faint)}
+.send{width:32px;height:32px;border-radius:16px;display:flex;align-items:center;justify-content:center;background:var(--raised);color:var(--faint);flex:none;margin:0 0 6px 2px}
+.send.ready{background:var(--accent);color:var(--on-accent)}
+.scroll{position:absolute;right:3px;top:8px;width:4px;height:56px;border-radius:2px;background:var(--selected)}
+.cap{display:flex;align-items:center;gap:6px;padding:8px 4px 0;font-size:12px;line-height:16px}
+.cap.warn{color:var(--warning)}.cap.err{color:var(--danger)}.cap.mute{color:var(--faint)}
+.count{margin-left:auto;color:var(--danger);font-variant-numeric:tabular-nums}
+.locked{height:46px;border-radius:14px;border:1px solid var(--hairline);display:flex;align-items:center;gap:10px;padding:0 7px 0 16px;color:var(--faint)}
+.locked span{flex:1}
+.pbtn{height:32px;padding:0 14px;border-radius:16px;background:var(--accent);color:var(--on-accent);font-size:13px;font-weight:600;line-height:32px}
+.gbtn{height:32px;padding:0 14px;border-radius:16px;background:var(--raised);color:var(--text);font-size:13px;font-weight:500;line-height:32px}
+.dbtn{height:32px;padding:0 14px;border-radius:16px;background:var(--danger);color:#fff;font-size:13px;font-weight:600;line-height:32px}
+
+/* floating surfaces */
+.pop{position:absolute;background:var(--popover);border:1px solid var(--hairline);border-radius:12px;box-shadow:var(--shadow-pop);overflow:hidden}
+.ac{left:20px;width:340px;padding:4px}
+.ach{height:26px;padding:0 8px;font-size:11px;line-height:26px;color:var(--faint);font-weight:600;letter-spacing:.04em;text-transform:uppercase}
+.aci{height:40px;border-radius:8px;display:flex;align-items:center;gap:10px;padding:0 8px}
+.aci.sel{background:var(--selected)}
+.aci .av{width:26px;height:26px;border-radius:13px;font-size:10px;position:relative}
+.dot{position:absolute;right:-2px;bottom:-2px;width:10px;height:10px;border-radius:5px;border:2px solid var(--popover);background:var(--faint)}
+.dot.on{background:var(--positive)}.dot.idle{background:var(--warning)}
+.aci .n{font-size:13px;font-weight:600}.aci .s{font-size:12px;color:var(--faint);margin-left:8px;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.aci kbd{font:11px/18px -apple-system;color:var(--faint);border:1px solid var(--hairline);border-radius:4px;padding:0 5px}
+.acf{height:28px;padding:0 8px;font-size:12px;line-height:28px;color:var(--faint);border-top:1px solid var(--hairline);margin-top:4px}
+.at{width:26px;height:26px;border-radius:13px;background:var(--raised);display:flex;align-items:center;justify-content:center;color:var(--soft);font-weight:600;flex:none}
+
+.picker{right:20px;width:352px;height:420px;display:flex;flex-direction:column}
+.psearch{margin:10px 10px 8px;height:32px;border-radius:9px;background:var(--raised);border:1px solid var(--hairline);display:flex;align-items:center;gap:8px;padding:0 10px;color:var(--faint);font-size:13px;flex:none}
+.ptabs{height:32px;display:flex;padding:0 10px;border-bottom:1px solid var(--hairline);flex:none}
+.ptabs div{width:30px;height:32px;display:flex;align-items:center;justify-content:center;font-size:15px;color:var(--faint);filter:grayscale(1);opacity:.6}
+.ptabs div.on{filter:none;opacity:1;box-shadow:inset 0 -2px 0 var(--accent)}
+.pgrid{flex:1;padding:0 14px;overflow:hidden}
+.ph2{height:28px;font-size:11px;line-height:28px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:var(--faint)}
+.er{display:flex;height:36px}
+.er span{width:36px;height:36px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:23px;line-height:1}
+.er span.on{background:var(--selected)}
+.cu{width:24px;height:24px;border-radius:5px;display:block}
+.pfoot{height:40px;border-top:1px solid var(--hairline);display:flex;align-items:center;gap:8px;padding:0 10px 0 12px;font-size:12px;color:var(--soft);flex:none}
+.pfoot .big{font-size:22px}.pfoot .nm{flex:1;color:var(--text)}
+.pfoot .sys{color:var(--faint)}
+.tone{width:26px;height:26px;border-radius:6px;background:var(--raised);display:flex;align-items:center;justify-content:center;font-size:16px}
+
+.menu{width:248px;padding:4px}
+.mrx{display:flex;padding:2px 2px 4px;gap:2px}
+.mrx span{width:32px;height:32px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:18px}
+.mrx span.more{color:var(--soft);margin-left:auto}
+.mi{height:30px;border-radius:6px;display:flex;align-items:center;gap:10px;padding:0 8px;font-size:13px;color:var(--text)}
+.mi svg{color:var(--soft)}
+.mi.sel{background:var(--selected)}
+.mi.danger,.mi.danger svg{color:var(--danger)}
+.mi kbd{margin-left:auto;font:12px -apple-system;color:var(--faint)}
+.mi em{margin-left:auto;font-style:normal;font-size:10px;line-height:16px;color:var(--faint);border:1px solid var(--hairline);border-radius:4px;padding:0 4px}
+.ms{height:1px;background:var(--hairline);margin:4px 0}
+
+.scrim{position:absolute;inset:0;background:var(--scrim)}
+.modal{left:160px;top:44px;width:400px;padding:20px}
+.modal h3{margin:0 0 4px;font-size:15px;line-height:22px}
+.modal p{margin:0 0 12px;font-size:13px;color:var(--soft)}
+.quote{border-radius:8px;background:var(--raised);padding:8px 10px;font-size:13px;color:var(--soft);margin-bottom:16px;box-shadow:inset 2px 0 0 var(--hairline)}
+.quote b{color:var(--text);font-weight:600}
+.btns{display:flex;justify-content:flex-end;gap:8px}
+.note{font-size:11px;line-height:16px;color:var(--faint);margin-top:6px}
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute">
+ <defs>
+  <symbol id="paperclip" viewBox="0 0 24 24"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"/></symbol>
+  <symbol id="smile" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><path d="M9 9h.01M15 9h.01"/></symbol>
+  <symbol id="smileplus" viewBox="0 0 24 24"><path d="M22 11v1a10 10 0 1 1-9-10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><path d="M9 9h.01M15 9h.01M16 5h6M19 2v6"/></symbol>
+  <symbol id="send" viewBox="0 0 24 24"><path d="m3 3 3 9-3 9 19-9Z"/><path d="M6 12h16"/></symbol>
+  <symbol id="check" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></symbol>
+  <symbol id="stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></symbol>
+  <symbol id="x" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></symbol>
+  <symbol id="reply" viewBox="0 0 24 24"><path d="M9 14 4 9l5-5"/><path d="M20 20v-7a4 4 0 0 0-4-4H4"/></symbol>
+  <symbol id="thread" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="more" viewBox="0 0 24 24"><circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/></symbol>
+  <symbol id="pencil" viewBox="0 0 24 24"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/></symbol>
+  <symbol id="trash" viewBox="0 0 24 24"><path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></symbol>
+  <symbol id="copy" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></symbol>
+  <symbol id="link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></symbol>
+  <symbol id="pin" viewBox="0 0 24 24"><path d="M12 17v5M5 17h14v-1.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V6h1a2 2 0 0 0 0-4H8a2 2 0 0 0 0 4h1v4.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24Z"/></symbol>
+  <symbol id="mail" viewBox="0 0 24 24"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7"/></symbol>
+  <symbol id="ext" viewBox="0 0 24 24"><path d="M15 3h6v6M10 14 21 3M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></symbol>
+  <symbol id="wifioff" viewBox="0 0 24 24"><path d="M12 20h.01M8.5 16.43a5 5 0 0 1 7 0M5 12.86a10 10 0 0 1 5.17-2.7M19 12.86a10 10 0 0 0-2.01-1.52M2 8.82a15 15 0 0 1 4.18-2.64M22 8.82a15 15 0 0 0-11.29-3.76M2 2l20 20"/></symbol>
+  <symbol id="alert" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/></symbol>
+  <symbol id="file" viewBox="0 0 24 24"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/></symbol>
+  <symbol id="search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></symbol>
+  <symbol id="clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></symbol>
+  <symbol id="lock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></symbol>
+ </defs>
+</svg>
+
+<h1>04 · Composer and message actions</h1>
+<p class="lede">Frames are 720 px wide and drawn 1:1 with the tokens in <code>theme.rs</code>. Flat fills, 1 px borders, rounded rectangles, box shadows, system emoji glyphs, monochrome Lucide glyphs. No blur, no gradients except avatar and image placeholders. The italic line above each composer is the 20 px typing slot owned by live signals.</p>
+
+<figure>
+<figcaption><b>1 · At rest.</b> Card 46 px tall, radius 14. Paperclip 30 px, emoji 30 px, send 32 px. Send is flat until there is something to send.</figcaption>
+<div class="frame">
+ <div class="typing ghost" style="margin-top:12px">typing slot · 20 px · live signals</div>
+ <div class="dock"><div class="card"><div class="inrow">
+  <div class="ib"><svg class="i"><use href="#paperclip"/></svg></div>
+  <div class="field ph">Message #platform</div>
+  <div class="ib"><svg class="i"><use href="#smile"/></svg></div>
+  <div class="send"><svg class="i i15"><use href="#send"/></svg></div>
+ </div></div></div>
+</div>
+</figure>
+
+<figure>
+<figcaption><b>2 · Focused, multi-line.</b> Border becomes <code>focus_ring</code>. Markdown characters stay visible and faint; a completed mention is one tinted token. Grows one 20 px line at a time to 8 lines (186 px card), then scrolls inside with a 4 px thumb. Buttons stay pinned to the bottom edge.</figcaption>
+<div class="frame">
+ <div class="typing" style="margin-top:12px">Mara Okafor is typing…</div>
+ <div class="dock"><div class="card focus" style="position:relative"><div class="inrow">
+  <div class="ib"><svg class="i"><use href="#paperclip"/></svg></div>
+  <div class="field">Rollout plan for tonight:
+<span class="md">-</span> canary at 22:00, <span class="md">**</span><b>hold 20 minutes</b><span class="md">**</span>
+<span class="md">-</span> then 25%, 50%, 100% if error rate stays under <span class="md">`</span><span style="font-family:ui-monospace,Menlo,monospace;font-size:13px">0.1%</span><span class="md">`</span>
+<span class="md">-</span> <span class="tok">@Dev Patel</span> owns the rollback switch<span class="caret"></span></div>
+  <div class="ib"><svg class="i"><use href="#smile"/></svg></div>
+  <div class="send ready"><svg class="i i15"><use href="#send"/></svg></div>
+ </div></div></div>
+</div>
+</figure>
+
+<figure>
+<figcaption><b>3 · Staged attachments.</b> Tray above the text: 64 px thumbnails, 18 px remove button. The oversize file is refused before any upload, in words, and blocks Send until removed. Below: the same tray during upload (after Return): 3 px bar, percent, send becomes Stop.</figcaption>
+<div class="frame">
+ <div class="typing ghost" style="margin-top:12px">typing slot</div>
+ <div class="dock"><div class="card focus">
+  <div class="tray">
+   <div class="thumb t1"><div class="rm"><svg class="i i12"><use href="#x"/></svg></div></div>
+   <div class="thumb t2"><div class="rm"><svg class="i i12"><use href="#x"/></svg></div></div>
+   <div class="filechip bad"><div class="fic"><svg class="i"><use href="#file"/></svg></div>
+    <div style="min-width:0"><div class="fn">load-test-capture.mov</div><div class="fs">Too big for Discord (limit 20 MB)</div></div>
+    <div class="rm"><svg class="i i12"><use href="#x"/></svg></div></div>
+  </div>
+  <div class="inrow">
+   <div class="ib"><svg class="i"><use href="#paperclip"/></svg></div>
+   <div class="field">Before and after from the dashboard<span class="caret"></span></div>
+   <div class="ib"><svg class="i"><use href="#smile"/></svg></div>
+   <div class="send"><svg class="i i15"><use href="#send"/></svg></div>
+  </div></div>
+  <div class="cap err"><svg class="i i12"><use href="#alert"/></svg>Remove load-test-capture.mov to send. It is 84 MB.</div>
+ </div>
+ <div class="dock"><div class="card">
+  <div class="tray">
+   <div class="thumb t1"><div class="dim"></div><div class="pct">100%</div><div class="prog"><i style="width:100%"></i></div></div>
+   <div class="thumb t2"><div class="dim"></div><div class="pct">42%</div><div class="prog"><i style="width:42%"></i></div></div>
+  </div>
+  <div class="inrow">
+   <div class="ib" style="opacity:.4"><svg class="i"><use href="#paperclip"/></svg></div>
+   <div class="field" style="color:var(--soft)">Before and after from the dashboard</div>
+   <div class="ib" style="opacity:.4"><svg class="i"><use href="#smile"/></svg></div>
+   <div class="send" style="background:var(--selected);color:var(--text)"><svg class="i i14"><use href="#stop"/></svg></div>
+  </div></div>
+  <div class="cap mute">Uploading 2 of 2 · 3.1 MB of 5.4 MB · Esc cancels and keeps the draft</div>
+ </div>
+</div>
+</figure>
+
+<figure>
+<figcaption><b>4 · Reply mode.</b> A 32 px bar inside the card. Clicking the snippet jumps to the message; the x or Esc cancels. Absent on Slack, which has threads and no inline reply.</figcaption>
+<div class="frame">
+ <div class="typing ghost" style="margin-top:12px">typing slot</div>
+ <div class="dock"><div class="card focus">
+  <div class="bar"><span class="lead"><svg class="i i14"><use href="#reply"/></svg></span><span>Replying to <b>Mara Okafor</b></span><span class="snip">Migration finished clean. Resuming consumers now.</span><div class="ib sm"><svg class="i i14"><use href="#x"/></svg></div></div>
+  <div class="inrow">
+   <div class="ib"><svg class="i"><use href="#paperclip"/></svg></div>
+   <div class="field">Nice, lag looks flat on my side too<span class="caret"></span></div>
+   <div class="ib"><svg class="i"><use href="#smile"/></svg></div>
+   <div class="send ready"><svg class="i i15"><use href="#send"/></svg></div>
+  </div></div></div>
+</div>
+</figure>
+
+<figure>
+<figcaption><b>5 · Edit mode.</b> Editing happens in the composer, never in the row. The row being edited is tinted with a 2 px accent bar, the bar says so, the paperclip is gone, Send becomes a check. The unsent draft is stashed and comes back on save or Esc.</figcaption>
+<div class="frame">
+ <div class="msgs">
+  <div class="row"><div class="av a1">MO</div><div><span class="who">Mara Okafor</span><span class="time">9:07 AM</span><div class="body">Migration finished clean. Resuming consumers now.</div></div></div>
+  <div class="row editing" style="margin-top:8px"><div class="av a2">Y</div><div><span class="who">You</span><span class="time">9:12 AM</span><div class="body">Sounds good. I'll keep the consumers paused until it finishs.</div></div></div>
+ </div>
+ <div class="typing ghost">typing slot</div>
+ <div class="dock"><div class="card focus">
+  <div class="bar"><span class="lead"><svg class="i i14"><use href="#pencil"/></svg></span><span><b>Editing message</b></span><span class="snip"></span><span class="hint">Return to save · Esc to cancel</span><div class="ib sm"><svg class="i i14"><use href="#x"/></svg></div></div>
+  <div class="inrow" style="padding-left:16px">
+   <div class="field">Sounds good. I'll keep the consumers paused until it finishes.<span class="caret"></span></div>
+   <div class="ib"><svg class="i"><use href="#smile"/></svg></div>
+   <div class="send ready"><svg class="i i15"><use href="#check"/></svg></div>
+  </div></div></div>
+</div>
+</figure>
+
+<figure>
+<figcaption><b>6 · Offline, and the three locked states.</b> Offline keeps the composer usable: Return still queues the message for 60 s. Signed out, read-only and no-permission replace the card with one sentence at the same 46 px height, so the layout never moves.</figcaption>
+<div class="frame">
+ <div class="typing ghost" style="margin-top:12px">typing slot</div>
+ <div class="dock"><div class="card"><div class="inrow">
+   <div class="ib"><svg class="i"><use href="#paperclip"/></svg></div>
+   <div class="field">Back in ten</div>
+   <div class="ib"><svg class="i"><use href="#smile"/></svg></div>
+   <div class="send ready"><svg class="i i15"><use href="#send"/></svg></div>
+  </div></div>
+  <div class="cap warn"><svg class="i i12"><use href="#wifioff"/></svg>Slack is offline. A message sent now waits up to 60 seconds for it to come back.</div>
+ </div>
+ <div class="dock"><div class="locked"><svg class="i i14"><use href="#lock"/></svg><span>Discord is signed out.</span><div class="pbtn">Sign in</div></div></div>
+ <div class="dock"><div class="locked"><svg class="i i14"><use href="#lock"/></svg><span>Only admins can post in #announcements.</span></div></div>
+ <div class="dock"><div class="locked"><svg class="i i14"><use href="#clock"/></svg><span>Slow mode. You can send again in 8 s.</span></div></div>
+</div>
+</figure>
+
+<figure>
+<figcaption><b>7 · Mention autocomplete.</b> Opens 6 px above the card, left edges aligned, 340 px wide, 40 px rows, at most 8. Recent speakers first. A server lookup shows one static line of text at the bottom; rows already shown never reorder.</figcaption>
+<div class="frame" style="height:404px">
+ <div class="pop ac" style="bottom:88px">
+  <div class="ach">In this conversation</div>
+  <div class="aci sel"><div class="av a3">DP<i class="dot on"></i></div><span class="n">Dev Patel</span><span class="s">devp · spoke 9:36 AM</span><kbd>Tab</kbd></div>
+  <div class="aci"><div class="av a4">DR<i class="dot idle"></i></div><span class="n">Devon Reyes</span><span class="s">devon.reyes · Platform</span></div>
+  <div class="aci"><div class="av a1">ND<i class="dot"></i></div><span class="n">Nadia Devlin</span><span class="s">ndevlin</span></div>
+  <div class="aci"><div class="at">@</div><span class="n">developers</span><span class="s">Role · notifies 14 people</span></div>
+  <div class="ach">More people</div>
+  <div class="aci"><div class="av a2">DK<i class="dot on"></i></div><span class="n">Dev Kapoor</span><span class="s">devk · Design</span></div>
+  <div class="acf">Searching Discord for “dev”…</div>
+ </div>
+ <div style="position:absolute;left:0;right:0;bottom:0">
+  <div class="typing ghost">typing slot</div>
+  <div class="dock"><div class="card focus"><div class="inrow">
+   <div class="ib"><svg class="i"><use href="#paperclip"/></svg></div>
+   <div class="field">Can you take a look, @dev<span class="caret"></span></div>
+   <div class="ib"><svg class="i"><use href="#smile"/></svg></div>
+   <div class="send ready"><svg class="i i15"><use href="#send"/></svg></div>
+  </div></div></div>
+ </div>
+</div>
+</figure>
+
+<figure>
+<figcaption><b>8 · Emoji picker.</b> 352 x 420, anchored to the emoji button, right edges aligned. 9 columns of 36 px cells, system glyphs. One virtual list of 36 px rows; this workspace's custom emoji decode only while their row is on screen. The footer names the hovered emoji and holds skin tone and the system picker.</figcaption>
+<div class="frame" style="height:520px">
+ <div class="pop picker" style="bottom:88px">
+  <div class="psearch"><svg class="i i14"><use href="#search"/></svg>Search emoji</div>
+  <div class="ptabs"><div class="on">🕘</div><div>⭐</div><div>😀</div><div>👋</div><div>🌿</div><div>🍔</div><div>⚽</div><div>🚗</div><div>💡</div><div>🔣</div><div>🏁</div></div>
+  <div class="pgrid">
+   <div class="ph2">Recent</div>
+   <div class="er"><span>👍</span><span>❤️</span><span>😂</span><span>🎉</span><span>🙏</span><span>👀</span><span>🔥</span><span>✅</span><span>🚀</span></div>
+   <div class="ph2">Northwind workspace</div>
+   <div class="er"><span><i class="cu" style="background:#3fcf8e"></i></span><span><i class="cu" style="background:#e3a94a;border-radius:12px"></i></span><span><i class="cu" style="background:#7f8cff"></i></span><span><i class="cu" style="background:#f2616b;border-radius:12px"></i></span><span><i class="cu" style="background:#c75fb0"></i></span><span><i class="cu" style="background:#4e7fd9;border-radius:12px"></i></span><span><i class="cu" style="background:#8a8d9f"></i></span></div>
+   <div class="ph2">Smileys</div>
+   <div class="er"><span>😀</span><span>😃</span><span>😄</span><span>😁</span><span>😆</span><span>😅</span><span>🤣</span><span>😂</span><span>🙂</span></div>
+   <div class="er"><span>🙃</span><span>😉</span><span>😊</span><span>😇</span><span class="on">🥰</span><span>😍</span><span>🤩</span><span>😘</span><span>😗</span></div>
+   <div class="er"><span>😋</span><span>😛</span><span>😜</span><span>🤪</span><span>😝</span><span>🤑</span><span>🤗</span><span>🤭</span><span>🤫</span></div>
+   <div class="er"><span>🤔</span><span>🤐</span><span>🤨</span><span>😐</span><span>😑</span><span>😶</span><span>😏</span><span>😒</span><span>🙄</span></div>
+  </div>
+  <div class="pfoot"><span class="big">🥰</span><span class="nm">:smiling_face_with_hearts:</span><span class="sys">⌃⌘Space</span><div class="tone">✋🏽</div></div>
+ </div>
+ <div style="position:absolute;left:0;right:0;bottom:0">
+  <div class="typing ghost">typing slot</div>
+  <div class="dock"><div class="card focus"><div class="inrow">
+   <div class="ib"><svg class="i"><use href="#paperclip"/></svg></div>
+   <div class="field">Shipped <span class="caret"></span></div>
+   <div class="ib on"><svg class="i"><use href="#smile"/></svg></div>
+   <div class="send ready"><svg class="i i15"><use href="#send"/></svg></div>
+  </div></div></div>
+ </div>
+</div>
+</figure>
+
+<figure>
+<figcaption><b>9 · Hover toolbar.</b> 30 px tall, 16 px from the right edge, overlapping the row's top edge by 14 px so it never covers the hovered text. Three quick reactions (my most used), then add reaction, reply, thread, more. Opaque fill, 1 px border, small shadow. Clicking a chip toggles mine; mine is outlined.</figcaption>
+<div class="frame">
+ <div class="msgs" style="padding-top:44px">
+  <div class="row"><div class="av a1">MO</div><div><span class="who">Mara Okafor</span><span class="time">9:07 AM</span><div class="body">Migration finished clean. Resuming consumers now.</div></div></div>
+  <div class="row hovered" style="margin-top:8px">
+   <div class="tip">Reply<kbd>R</kbd></div>
+   <div class="toolbar"><div class="b">👍</div><div class="b">❤️</div><div class="b">😂</div><div class="d"></div>
+    <div class="b"><svg class="i"><use href="#smileplus"/></svg></div><div class="b on"><svg class="i"><use href="#reply"/></svg></div><div class="b"><svg class="i"><use href="#thread"/></svg></div><div class="b"><svg class="i"><use href="#more"/></svg></div></div>
+   <div class="av a3">DP</div><div><span class="who">Dev Patel</span><span class="time">9:36 AM</span><div class="body">Canary looks healthy on my side, no new errors in the last 20 minutes.</div>
+    <div class="chips"><div class="chip mine">👍 3</div><div class="chip">🚀 1</div><div class="chip add"><svg class="i i14"><use href="#smileplus"/></svg></div></div></div>
+  </div>
+  <div class="row" style="margin-top:8px"><div class="av a1">MO</div><div><span class="who">Mara Okafor</span><span class="time">9:45 AM</span><div class="body">Deploy is green, rolling to prod at 3.</div></div></div>
+ </div>
+</div>
+</figure>
+
+<figure>
+<figcaption><b>10 · Context menu</b> (right-click, or More). 248 px wide, 30 px rows, six reactions on top. Shown for my own message on Discord. Tags mark rows that exist only where the network has the feature; a row that does not apply is absent, never greyed.</figcaption>
+<div class="frame" style="height:440px">
+ <div class="msgs">
+  <div class="row"><div class="av a1">MO</div><div><span class="who">Mara Okafor</span><span class="time">9:07 AM</span><div class="body">Migration finished clean. Resuming consumers now.</div></div></div>
+  <div class="row hovered" style="margin-top:8px"><div class="av a2">Y</div><div><span class="who">You</span><span class="time">9:12 AM</span><div class="body">Sounds good. I'll keep the consumers paused until it finishes.</div></div></div>
+ </div>
+ <div class="pop menu" style="left:250px;top:76px">
+  <div class="mrx"><span>👍</span><span>❤️</span><span>😂</span><span>🎉</span><span>🙏</span><span>👀</span><span class="more"><svg class="i"><use href="#smileplus"/></svg></span></div>
+  <div class="ms"></div>
+  <div class="mi sel"><svg class="i i14"><use href="#reply"/></svg>Reply<kbd>R</kbd></div>
+  <div class="mi"><svg class="i i14"><use href="#thread"/></svg>Reply in thread<em>if threads</em><kbd style="margin-left:8px">T</kbd></div>
+  <div class="mi"><svg class="i i14"><use href="#pencil"/></svg>Edit<em>own</em><kbd style="margin-left:8px">E</kbd></div>
+  <div class="ms"></div>
+  <div class="mi"><svg class="i i14"><use href="#copy"/></svg>Copy text<kbd>⌘C</kbd></div>
+  <div class="mi"><svg class="i i14"><use href="#link"/></svg>Copy link<em>if linkable</em></div>
+  <div class="ms"></div>
+  <div class="mi"><svg class="i i14"><use href="#pin"/></svg>Pin<em>if allowed</em></div>
+  <div class="mi"><svg class="i i14"><use href="#mail"/></svg>Mark unread from here<kbd>U</kbd></div>
+  <div class="ms"></div>
+  <div class="mi"><svg class="i i14"><use href="#ext"/></svg>Open in Discord</div>
+  <div class="ms"></div>
+  <div class="mi danger"><svg class="i i14"><use href="#trash"/></svg>Delete…<em>own</em><kbd style="margin-left:8px">⌫</kbd></div>
+ </div>
+</div>
+</figure>
+
+<figure>
+<figcaption><b>11 · Send states.</b> Pending: body at 55% with a clock where the time goes. Offline: “Waiting for Slack…” for up to 60 s. Failed: the reason in words with Retry and Delete. Nothing here animates.</figcaption>
+<div class="frame">
+ <div class="msgs" style="padding-bottom:14px">
+  <div class="row pending"><div class="av a2">Y</div><div><span class="who">You</span><span class="time"><svg class="i i12" style="vertical-align:-2px"><use href="#clock"/></svg></span><div class="body">On it, give me five minutes.</div></div></div>
+  <div class="row pending" style="margin-top:8px"><div class="av a2">Y</div><div><span class="who">You</span><span class="time"><svg class="i i12" style="vertical-align:-2px"><use href="#clock"/></svg></span><div class="body">Pushed the fix to the release branch.</div>
+   <div class="sendline wait"><svg class="i i12"><use href="#wifioff"/></svg>Waiting for Slack…</div></div></div>
+  <div class="row" style="margin-top:8px"><div class="av a2">Y</div><div><span class="who">You</span><span class="time">9:52 AM</span><div class="body" style="color:var(--soft)">Can someone restart the staging workers?</div>
+   <div class="sendline fail"><svg class="i i12"><use href="#alert"/></svg>Not sent. You can't post in this channel.<span class="tbtn" style="margin-left:6px">Retry</span><span class="tbtn">Delete</span></div></div></div>
+ </div>
+</div>
+</figure>
+
+<figure>
+<figcaption><b>12 · Delete asks once.</b> 400 px modal over a 50% scrim, the message quoted so I know which one. Return deletes, Esc cancels. Shift-click on Delete skips the question.</figcaption>
+<div class="frame" style="height:290px">
+ <div class="msgs">
+  <div class="row"><div class="av a1">MO</div><div><span class="who">Mara Okafor</span><span class="time">9:07 AM</span><div class="body">Migration finished clean. Resuming consumers now.</div></div></div>
+  <div class="row" style="margin-top:8px"><div class="av a2">Y</div><div><span class="who">You</span><span class="time">9:12 AM</span><div class="body">Sounds good. I'll keep the consumers paused until it finishes.</div></div></div>
+ </div>
+ <div class="scrim"></div>
+ <div class="pop modal">
+  <h3>Delete this message?</h3>
+  <p>It is removed for everyone in #platform. Discord cannot bring it back.</p>
+  <div class="quote"><b>You</b> · 9:12 AM<br>Sounds good. I'll keep the consumers paused until it finishes.</div>
+  <div class="btns"><div class="gbtn">Cancel</div><div class="dbtn">Delete</div></div>
+ </div>
+</div>
+</figure>
+
+<figure>
+<figcaption><b>13 · Draft in the sidebar.</b> The preview line of a conversation holding a draft reads “Draft:” with a pencil, in place of the last message. An unread conversation keeps its incoming preview and pill; the draft is still there when opened.</figcaption>
+<div class="frame" style="background:var(--sidebar);width:316px;padding:8px 10px">
+ <div style="height:64px;border-radius:12px;display:flex;align-items:center;gap:12px;padding:0 10px">
+  <div class="av a4" style="width:40px;height:40px;border-radius:20px">DR</div>
+  <div style="flex:1;min-width:0"><div style="display:flex"><span style="flex:1">Devon Reyes</span><span style="font-size:12px;color:var(--faint)">5:38 AM</span></div>
+   <div style="display:flex;align-items:center;gap:5px;font-size:13px;color:var(--faint);white-space:nowrap;overflow:hidden"><svg class="i i12" style="color:var(--soft)"><use href="#pencil"/></svg><span style="color:var(--soft)">Draft:</span> I can review it after lunch if th…</div></div>
+ </div>
+</div>
+</figure>
+</body>
+</html>

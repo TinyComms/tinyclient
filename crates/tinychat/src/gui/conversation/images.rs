@@ -1,0 +1,537 @@
+//! Pictures for the rows on screen. A file is decoded off the main thread, by the system's own
+//! decoder, straight to the size it is shown at: a 4000 px photo in a 198 pt tile costs 0.6 MB,
+//! not 48. Only the first frame of an animated file is ever read, at most [`DECODES`] files are
+//! being read at once, and a row that scrolled away before its turn is never read at all. What
+//! scrolls away is dropped once the total passes [`BUDGET`].
+
+use gpui::{App, Context, RenderImage, Window};
+use image::{Frame, ImageBuffer};
+use std::collections::{HashMap, VecDeque};
+use std::ffi::c_void;
+use std::path::Path;
+use std::sync::Arc;
+
+/// Most decoded bytes held. Pictures on screen are never dropped to get under it.
+pub const BUDGET: usize = 32 * 1024 * 1024;
+
+/// Most files being decoded at once. Each holds its pixels twice for a moment (the system's
+/// and ours), so this bounds the peak as well as the threads taken.
+pub const DECODES: usize = 2;
+
+#[cfg(target_os = "macos")]
+type Ref = *const c_void;
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct Opaque {
+    _private: [u8; 0],
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct Rect {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+#[cfg(target_os = "macos")]
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    static kCFTypeDictionaryKeyCallBacks: Opaque;
+    static kCFTypeDictionaryValueCallBacks: Opaque;
+    static kCFBooleanTrue: Ref;
+    fn CFURLCreateFromFileSystemRepresentation(allocator: Ref, path: *const u8, len: isize, directory: u8) -> Ref;
+    fn CFDictionaryCreate(
+        allocator: Ref,
+        keys: *const Ref,
+        values: *const Ref,
+        count: isize,
+        key_callbacks: *const Opaque,
+        value_callbacks: *const Opaque,
+    ) -> Ref;
+    fn CFNumberCreate(allocator: Ref, kind: isize, value: *const c_void) -> Ref;
+    fn CFRelease(object: Ref);
+}
+
+#[cfg(target_os = "macos")]
+#[link(name = "ImageIO", kind = "framework")]
+unsafe extern "C" {
+    static kCGImageSourceCreateThumbnailFromImageAlways: Ref;
+    static kCGImageSourceCreateThumbnailWithTransform: Ref;
+    static kCGImageSourceThumbnailMaxPixelSize: Ref;
+    fn CGImageSourceCreateWithURL(url: Ref, options: Ref) -> Ref;
+    fn CGImageSourceCreateThumbnailAtIndex(source: Ref, index: usize, options: Ref) -> Ref;
+    fn CGImageSourceGetCount(source: Ref) -> usize;
+}
+
+#[cfg(target_os = "macos")]
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    static kCGColorSpaceSRGB: Ref;
+    fn CGImageGetWidth(image: Ref) -> usize;
+    fn CGImageGetHeight(image: Ref) -> usize;
+    fn CGColorSpaceCreateWithName(name: Ref) -> Ref;
+    fn CGBitmapContextCreate(
+        data: *mut c_void,
+        width: usize,
+        height: usize,
+        bits_per_component: usize,
+        bytes_per_row: usize,
+        space: Ref,
+        bitmap_info: u32,
+    ) -> Ref;
+    fn CGContextDrawImage(context: Ref, rect: Rect, image: Ref);
+}
+
+#[cfg(target_os = "macos")]
+/// `kCFNumberSInt32Type`
+const SINT32: isize = 3;
+#[cfg(target_os = "macos")]
+/// `kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little`: BGRA in memory.
+const BGRA: u32 = 2 | (2 << 12);
+
+#[cfg(target_os = "macos")]
+/// Releases a Core Foundation object when it goes out of scope.
+struct Owned(Ref);
+
+#[cfg(target_os = "macos")]
+impl Owned {
+    fn new(object: Ref) -> Option<Owned> {
+        (!object.is_null()).then_some(Owned(object))
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for Owned {
+    fn drop(&mut self) {
+        // SAFETY: the pointer came from a Create function, is not null, and is released once.
+        unsafe { CFRelease(self.0) }
+    }
+}
+
+pub struct Decoded {
+    pub width: u32,
+    pub height: u32,
+    /// Straight alpha, four bytes a pixel.
+    pub bgra: Vec<u8>,
+}
+
+/// Reads the picture at `path` no larger than `edge` pixels on its longer side, upright. The
+/// system decodes at a reduced size where the format allows, so a large photo is never held
+/// whole. `crop` keeps only the top of a very tall picture: that many times its width.
+/// `None` when the file is missing or is not a picture.
+pub fn decode(path: &Path, edge: u32, crop: Option<f32>) -> Option<Decoded> {
+    if !looks_like_a_picture(path) {
+        return None;
+    }
+    #[cfg(target_os = "macos")]
+    return decode_imageio(path, edge, crop);
+    #[cfg(not(target_os = "macos"))]
+    return decode_portable(path, edge, crop);
+}
+
+#[cfg(not(target_os = "macos"))]
+fn decode_portable(path: &Path, edge: u32, crop: Option<f32>) -> Option<Decoded> {
+    let edge = edge.clamp(1, 8192);
+    let mut img = image::open(path).ok()?.into_rgba8();
+    let (w, h) = (img.width(), img.height());
+    let (nw, nh) = if w >= h {
+        let nh = ((h as u64 * edge as u64) / w as u64).max(1) as u32;
+        (edge, nh)
+    } else {
+        let nw = ((w as u64 * edge as u64) / h as u64).max(1) as u32;
+        (nw, edge)
+    };
+    if (nw, nh) != (w, h) {
+        img = image::imageops::resize(&img, nw, nh, image::imageops::FilterType::Triangle);
+    }
+    let (width, height) = (img.width() as usize, img.height() as usize);
+    let height = match crop {
+        Some(ratio) => ((width as f32 * ratio).round() as usize).clamp(1, height),
+        None => height,
+    };
+    let mut bgra = Vec::with_capacity(width * height * 4);
+    for y in 0..height {
+        for x in 0..width {
+            let pixel = img.get_pixel(x as u32, y as u32);
+            bgra.extend([pixel[2], pixel[1], pixel[0], pixel[3]]);
+        }
+    }
+    Some(Decoded { width: width as u32, height: height as u32, bgra })
+}
+
+#[cfg(target_os = "macos")]
+fn decode_imageio(path: &Path, edge: u32, crop: Option<f32>) -> Option<Decoded> {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = path.as_os_str().as_bytes();
+    let edge = edge.clamp(1, 8192) as i32;
+    // SAFETY: every pointer handed to the system is either a constant it exports or an object
+    // created just above and kept alive by an `Owned` until after the call. The pixel buffer is
+    // `width * height * 4` bytes, which is what the bitmap context is told it may write.
+    unsafe {
+        let null = std::ptr::null();
+        let url = Owned::new(CFURLCreateFromFileSystemRepresentation(null, bytes.as_ptr(), bytes.len() as isize, 0))?;
+        let source = Owned::new(CGImageSourceCreateWithURL(url.0, null))?;
+        // A file that is not a picture holds none; asking it for one anyway is a trap.
+        if CGImageSourceGetCount(source.0) == 0 {
+            return None;
+        }
+        let size = Owned::new(CFNumberCreate(null, SINT32, (&raw const edge).cast()))?;
+        let keys = [
+            kCGImageSourceCreateThumbnailFromImageAlways,
+            kCGImageSourceCreateThumbnailWithTransform,
+            kCGImageSourceThumbnailMaxPixelSize,
+        ];
+        let values = [kCFBooleanTrue, kCFBooleanTrue, size.0];
+        let options = Owned::new(CFDictionaryCreate(
+            null,
+            keys.as_ptr(),
+            values.as_ptr(),
+            keys.len() as isize,
+            &raw const kCFTypeDictionaryKeyCallBacks,
+            &raw const kCFTypeDictionaryValueCallBacks,
+        ))?;
+        // Index 0: an animated file gives its first frame and the rest is never touched.
+        let image = Owned::new(CGImageSourceCreateThumbnailAtIndex(source.0, 0, options.0))?;
+        let (width, height) = (CGImageGetWidth(image.0), CGImageGetHeight(image.0));
+        if width == 0 || height == 0 {
+            return None;
+        }
+        let mut bgra = vec![0u8; width * height * 4];
+        let space = Owned::new(CGColorSpaceCreateWithName(kCGColorSpaceSRGB))?;
+        let context = Owned::new(CGBitmapContextCreate(bgra.as_mut_ptr().cast(), width, height, 8, width * 4, space.0, BGRA))?;
+        let all = Rect { x: 0., y: 0., width: width as f64, height: height as f64 };
+        CGContextDrawImage(context.0, all, image.0);
+        drop(context);
+
+        // The system hands back premultiplied color; the renderer wants straight.
+        for pixel in bgra.as_chunks_mut::<4>().0 {
+            let alpha = u32::from(pixel[3]);
+            if alpha != 0 && alpha != 255 {
+                for channel in &mut pixel[..3] {
+                    *channel = (u32::from(*channel) * 255 / alpha).min(255) as u8;
+                }
+            }
+        }
+        // Rows run top to bottom, so what is kept is the top.
+        let height = match crop {
+            Some(ratio) => ((width as f32 * ratio).round() as usize).clamp(1, height),
+            None => height,
+        };
+        bgra.truncate(width * height * 4);
+        Some(Decoded { width: width as u32, height: height as u32, bgra })
+    }
+}
+
+/// True when the file is there and starts the way a picture the system reads starts.
+fn looks_like_a_picture(path: &Path) -> bool {
+    use std::io::Read;
+    let mut head = [0u8; 12];
+    let read = std::fs::File::open(path).and_then(|mut file| file.read(&mut head)).unwrap_or(0);
+    let head = &head[..read];
+    let starts = |magic: &[u8]| head.starts_with(magic);
+    starts(b"\x89PNG\r\n\x1a\n")
+        || starts(b"\xff\xd8\xff")
+        || starts(b"GIF8")
+        || starts(b"BM")
+        || starts(b"II*\0")
+        || starts(b"MM\0*")
+        || starts(b"\0\0\x01\0")
+        || (starts(b"RIFF") && head.get(8..12) == Some(b"WEBP"))
+        // HEIC and AVIF: an ISO media file says so in its second word.
+        || head.get(4..8) == Some(b"ftyp")
+}
+
+fn render_image(decoded: Decoded) -> Option<Arc<RenderImage>> {
+    let buffer = ImageBuffer::from_raw(decoded.width, decoded.height, decoded.bgra)?;
+    Some(Arc::new(RenderImage::new(vec![Frame::new(buffer)])))
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct Slot {
+    path: Arc<str>,
+    edge: u32,
+    /// Height kept per thousand of width; 0 keeps it all.
+    crop: u32,
+}
+
+/// What a decode produced, to hand back to [`Images::store`].
+pub struct Loaded {
+    slot: Slot,
+    image: Option<Arc<RenderImage>>,
+}
+
+enum Held {
+    /// Asked for; `asked` is the last draw that wanted it.
+    Loading { asked: u64 },
+    Failed,
+    Ready { image: Arc<RenderImage>, bytes: usize, used: u64 },
+}
+
+/// The decoded pictures of one pane.
+#[derive(Default)]
+pub struct Images {
+    held: HashMap<Slot, Held>,
+    bytes: usize,
+    /// Counts draws, to tell what is on screen now from what was.
+    frame: u64,
+    /// Waiting for a turn to be decoded, oldest ask first.
+    queue: VecDeque<Slot>,
+    decoding: usize,
+    /// Pictures dropped to stay under the budget, for measuring.
+    pub evicted: usize,
+    /// The most bytes ever held at once, for measuring.
+    pub peak: usize,
+}
+
+pub enum Picture {
+    Ready(Arc<RenderImage>),
+    Loading,
+    Failed,
+}
+
+impl Images {
+    pub fn begin_frame(&mut self) {
+        self.frame += 1;
+    }
+
+    #[cfg_attr(not(feature = "gui-shot"), allow(dead_code))]
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Nothing is waiting to be decoded or being decoded.
+    #[cfg_attr(not(feature = "gui-shot"), allow(dead_code))]
+    pub fn settled(&self) -> bool {
+        self.decoding == 0 && self.queue.is_empty()
+    }
+
+    /// The picture at `path`, `edge` pixels on its longer side. The first ask queues the decode
+    /// for a background thread; `landed` is told when it is done, and must hand the result to
+    /// [`Images::store`] and call [`Images::pump`].
+    pub fn get<T: 'static>(
+        &mut self,
+        path: &str,
+        edge: u32,
+        crop: Option<f32>,
+        cx: &mut Context<T>,
+        landed: fn(&mut T, Loaded, &mut Context<T>),
+    ) -> Picture {
+        // A few sizes rather than every size: a box that differs by a pixel reuses the decode.
+        let edge = edge.div_ceil(32) * 32;
+        let slot = Slot { path: path.into(), edge, crop: crop.map_or(0, |ratio| (ratio * 1000.) as u32) };
+        let frame = self.frame;
+        match self.held.get_mut(&slot) {
+            Some(Held::Ready { image, used, .. }) => {
+                *used = frame;
+                return Picture::Ready(image.clone());
+            }
+            Some(Held::Loading { asked }) => {
+                *asked = frame;
+                // It may be waiting behind pictures nobody wants any more, with nothing being
+                // decoded to move the queue on.
+                self.pump(cx, landed);
+                return Picture::Loading;
+            }
+            Some(Held::Failed) => return Picture::Failed,
+            None => {}
+        }
+        self.held.insert(slot.clone(), Held::Loading { asked: frame });
+        self.queue.push_back(slot);
+        self.pump(cx, landed);
+        Picture::Loading
+    }
+
+    /// Starts decodes while there is room for them. A picture nobody has drawn since it was
+    /// queued is skipped: its row scrolled away, and asking again queues it again.
+    pub fn pump<T: 'static>(&mut self, cx: &mut Context<T>, landed: fn(&mut T, Loaded, &mut Context<T>)) {
+        while self.decoding < DECODES {
+            let Some(slot) = self.queue.pop_front() else {
+                return;
+            };
+            match self.held.get(&slot) {
+                Some(Held::Loading { asked }) if *asked + 1 >= self.frame => {}
+                Some(Held::Loading { .. }) => {
+                    self.held.remove(&slot);
+                    continue;
+                }
+                _ => continue,
+            }
+            self.decoding += 1;
+            cx.spawn(async move |this, cx| {
+                let (file, edge) = (slot.path.clone(), slot.edge);
+                let crop = (slot.crop > 0).then(|| slot.crop as f32 / 1000.);
+                let image = cx
+                    .background_executor()
+                    .spawn(async move { decode(Path::new(&*file), edge, crop).and_then(render_image) })
+                    .await;
+                let _ = this.update(cx, |this, cx| landed(this, Loaded { slot, image }, cx));
+            })
+            .detach();
+        }
+    }
+
+    /// Stores what a decode produced. False when nobody is waiting for it any more.
+    pub fn store(&mut self, loaded: Loaded) -> bool {
+        let Loaded { slot, image } = loaded;
+        self.decoding = self.decoding.saturating_sub(1);
+        if !matches!(self.held.get(&slot), Some(Held::Loading { .. })) {
+            return false;
+        }
+        let held = match image {
+            Some(image) => {
+                let bytes = image.as_bytes(0).map_or(0, <[u8]>::len);
+                self.bytes += bytes;
+                self.peak = self.peak.max(self.bytes);
+                Held::Ready { image, bytes, used: self.frame }
+            }
+            None => Held::Failed,
+        };
+        self.held.insert(slot, held);
+        true
+    }
+
+    /// After a draw: drops pictures that are no longer on screen, oldest first, until the total
+    /// is back under the budget. Their textures go with them.
+    pub fn sweep(&mut self, window: &mut Window, cx: &mut App) {
+        if self.bytes <= BUDGET {
+            return;
+        }
+        let mut idle: Vec<(u64, Slot)> = self
+            .held
+            .iter()
+            .filter_map(|(slot, held)| match held {
+                Held::Ready { used, .. } if *used < self.frame => Some((*used, slot.clone())),
+                _ => None,
+            })
+            .collect();
+        idle.sort_unstable_by_key(|(used, _)| *used);
+        for (_, slot) in idle {
+            if self.bytes <= BUDGET {
+                break;
+            }
+            self.evicted += 1;
+            self.drop_slot(&slot, window, cx);
+        }
+    }
+
+    fn drop_slot(&mut self, slot: &Slot, window: &mut Window, cx: &mut App) {
+        if let Some(Held::Ready { image, bytes, .. }) = self.held.remove(slot) {
+            self.bytes -= bytes;
+            cx.drop_image(image, Some(window));
+        }
+    }
+
+    /// The file at `path` was replaced by a larger one: what was decoded from the old one goes,
+    /// so the next draw reads the new.
+    pub fn replaced(&mut self, path: &str, window: &mut Window, cx: &mut App) {
+        let slots: Vec<Slot> = self.held.keys().filter(|slot| &*slot.path == path).cloned().collect();
+        for slot in slots {
+            self.drop_slot(&slot, window, cx);
+            self.held.remove(&slot);
+        }
+    }
+
+    /// Lets go of everything: the conversation changed, or the viewer needs the room.
+    pub fn clear(&mut self, window: &mut Window, cx: &mut App) {
+        let slots: Vec<Slot> = self.held.keys().cloned().collect();
+        for slot in slots {
+            self.drop_slot(&slot, window, cx);
+        }
+        self.held.clear();
+        self.queue.clear();
+    }
+
+    /// A file that failed to decode may have been half-written; a new path is a new try.
+    pub fn forget_failed(&mut self) {
+        self.held.retain(|_, held| !matches!(held, Held::Failed));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_or_unreadable_file_is_no_picture() {
+        // Neither reaches the system's reader, which is what trapped: a path that is not
+        // there, and a directory.
+        assert!(!looks_like_a_picture(Path::new("/nonexistent/picture.png")));
+        assert!(decode(Path::new("/nonexistent/picture.png"), 256, None).is_none());
+        assert!(decode(&std::env::temp_dir(), 256, None).is_none());
+    }
+
+    #[test]
+    fn only_a_file_that_starts_like_a_picture_is_handed_to_the_system() {
+        let dir = std::env::temp_dir();
+        let write = |name: &str, bytes: &[u8]| {
+            let path = dir.join(format!("tc-fc-{name}-{}", std::process::id()));
+            std::fs::write(&path, bytes).unwrap();
+            path
+        };
+        let empty = write("empty", b"");
+        let short = write("short", b"\x89P");
+        let web = write("web", b"RIFF\x10\0\0\0WEBPVP8 ");
+        let wave = write("wave", b"RIFF\x10\0\0\0WAVEfmt ");
+        assert!(!looks_like_a_picture(&empty) && !looks_like_a_picture(&short) && !looks_like_a_picture(&wave));
+        assert!(looks_like_a_picture(&web));
+        // Truncated to its signature: a picture by its first bytes, and still no trap.
+        let stub = write("stub", b"\x89PNG\r\n\x1a\n");
+        assert!(looks_like_a_picture(&stub));
+        assert!(decode(&stub, 64, None).is_none());
+        for path in [empty, short, web, wave, stub] {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_picture_is_no_picture() {
+        let not_a_picture = std::env::temp_dir().join(format!("tc-s5-not-a-picture-{}", std::process::id()));
+        std::fs::write(&not_a_picture, b"plain text").unwrap();
+        assert!(decode(&not_a_picture, 256, None).is_none());
+        std::fs::remove_file(not_a_picture).unwrap();
+    }
+
+    #[test]
+    fn a_picture_is_decoded_at_the_size_asked_for_not_its_own() {
+        // A 64 x 32 BMP, bottom-up BGR: the left half red, the right half blue.
+        let (width, height) = (64u32, 32u32);
+        let mut bmp = Vec::new();
+        let pixels = width * height * 3;
+        bmp.extend(b"BM");
+        bmp.extend((54 + pixels).to_le_bytes());
+        bmp.extend([0; 4]);
+        bmp.extend(54u32.to_le_bytes());
+        bmp.extend(40u32.to_le_bytes());
+        bmp.extend(width.to_le_bytes());
+        bmp.extend(height.to_le_bytes());
+        bmp.extend(1u16.to_le_bytes());
+        bmp.extend(24u16.to_le_bytes());
+        bmp.extend([0; 24]);
+        for _ in 0..height {
+            for x in 0..width {
+                bmp.extend(if x < width / 2 { [0, 0, 255] } else { [255, 0, 0] });
+            }
+        }
+        let path = std::env::temp_dir().join(format!("tc-s5-halves-{}.bmp", std::process::id()));
+        std::fs::write(&path, bmp).unwrap();
+
+        let small = decode(&path, 16, None).unwrap();
+        assert_eq!((small.width, small.height, small.bgra.len()), (16, 8, 16 * 8 * 4));
+        // Bytes are blue, green, red, alpha: red on the left, blue on the right.
+        let pixel = |x: usize| &small.bgra[x * 4..x * 4 + 4];
+        assert!(pixel(1)[2] > 200 && pixel(1)[0] < 60, "left is {:?}", pixel(1));
+        assert!(pixel(14)[0] > 200 && pixel(14)[2] < 60, "right is {:?}", pixel(14));
+        assert_eq!(pixel(1)[3], 255);
+
+        // Asking for more than the file has does not enlarge it.
+        let whole = decode(&path, 4096, None).unwrap();
+        assert_eq!((whole.width, whole.height), (64, 32));
+        // A crop keeps the top rows: a quarter as tall as it is wide is 4 rows of 16.
+        let top = decode(&path, 16, Some(0.25)).unwrap();
+        assert_eq!((top.width, top.height, top.bgra.len()), (16, 4, 16 * 4 * 4));
+        std::fs::remove_file(path).unwrap();
+    }
+}

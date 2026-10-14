@@ -1,0 +1,496 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>tinychat · 03 conversation view</title>
+<style>
+:root{
+  --rail:#0c0d11; --sidebar:#111217; --canvas:#15161c;
+  --hairline:rgba(255,255,255,.06); --raised:rgba(255,255,255,.04); --hover:rgba(255,255,255,.05);
+  --text:#ededf2; --soft:#a0a2b1; --faint:#676a7d;
+  --accent:#7f8cff; --accent-soft:rgba(127,140,255,.15); --on-accent:#0c0d11;
+  --positive:#3fcf8e; --danger:#f2616b; --warning:#e3a94a;
+  /* new tokens */
+  --row-hover:rgba(255,255,255,.03); --mention-row:rgba(127,140,255,.08);
+  --hairline-strong:rgba(255,255,255,.14); --code-bg:#0e0f14; --code-inline:rgba(255,255,255,.08);
+  --media-fill:#1d1f27; --float:#22242d; --scrim:#07080b; --badge:rgba(0,0,0,.65);
+  --spoiler:#34364a; --link:#9ea8ff;
+  --mono:"SF Mono",Menlo,monospace;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#08090c;color:var(--text);font:14px/21px -apple-system,BlinkMacSystemFont,sans-serif;padding:32px;-webkit-font-smoothing:antialiased}
+.page{display:flex;gap:32px;align-items:flex-start;flex-wrap:wrap}
+.col{display:flex;flex-direction:column;gap:32px}
+.cap{font-size:12px;color:var(--faint);margin-bottom:8px;letter-spacing:.2px}
+.frame{background:var(--canvas);border:1px solid var(--hairline);border-radius:12px;overflow:hidden;position:relative}
+svg.i{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;flex:none}
+
+/* list items */
+.gap{height:10px}
+.row{display:flex;gap:12px;padding:3px 20px;position:relative}
+.row.cont{padding:1px 20px}
+.row:hover{background:var(--row-hover)}
+.row.me{background:var(--mention-row);box-shadow:inset 2px 0 0 var(--accent)}
+.row.fail{box-shadow:inset 2px 0 0 var(--danger)}
+.gut{width:36px;flex:none;text-align:right;font-size:10.5px;line-height:21px;color:transparent;font-variant-numeric:tabular-nums}
+.row:hover .gut{color:var(--faint)}
+.av{width:36px;height:36px;border-radius:18px;flex:none;margin-top:2px;display:flex;align-items:center;justify-content:center;font-size:13.5px;font-weight:600;color:#fff}
+.av.app{border-radius:9px}
+.a1{background:linear-gradient(160deg,#dc9a5c,#a85a2e)} .a2{background:linear-gradient(160deg,#5fd6a0,#2a8f78)}
+.a3{background:linear-gradient(160deg,#6f8ee6,#3a4fb0)} .a4{background:linear-gradient(160deg,#d96aa8,#9a3a86)}
+.a5{background:linear-gradient(160deg,#c9b85a,#8e7a2c)} .a6{background:linear-gradient(160deg,#8a8fa6,#51556b)}
+.c{flex:1;min-width:0}
+.h{display:flex;align-items:center;gap:8px;height:20px}
+.n{font-weight:600}
+.t{font-size:11.5px;color:var(--faint);font-variant-numeric:tabular-nums}
+.tag{height:16px;padding:0 5px;border-radius:4px;background:var(--raised);font-size:10px;font-weight:600;color:var(--soft);letter-spacing:.4px;line-height:16px}
+.flag{display:flex;align-items:center;gap:4px;font-size:11.5px;color:var(--faint)} .flag svg{width:12px;height:12px}
+.b{max-width:620px;overflow-wrap:anywhere}
+.b p+p{margin-top:0}
+.ed{font-size:11.5px;color:var(--faint);margin-left:4px}
+b{font-weight:600} s{color:var(--soft)}
+a,.lk{color:var(--link);text-decoration:none;cursor:pointer} a:hover,.lk:hover{text-decoration:underline}
+code{font:13px/21px var(--mono);background:var(--code-inline);border-radius:4px;padding:0 4px}
+.mn{background:var(--accent-soft);color:var(--link);font-weight:500;border-radius:4px;padding:0 3px}
+.mn.self{background:rgba(127,140,255,.32);color:#fff}
+.sp{background:var(--spoiler);color:var(--spoiler);border-radius:4px;padding:0 3px;cursor:pointer}
+.sp.open{background:var(--code-inline);color:var(--text)}
+.ce{display:inline-block;width:18px;height:18px;border-radius:4px;vertical-align:-4px;margin:0 1px;background:linear-gradient(135deg,#ffd45c,#ff7a59 60%,#c63d7a)}
+.jumbo{font-size:40px;line-height:48px}
+.q{border-left:3px solid var(--hairline-strong);padding-left:12px;color:var(--soft);margin:3px 0}
+.li{display:flex;gap:0} .li i{width:22px;flex:none;color:var(--faint);font-style:normal} .li.l2{padding-left:22px}
+.code{margin:5px 0 3px;max-width:620px;background:var(--code-bg);border:1px solid var(--hairline);border-radius:8px;overflow:hidden}
+.code .bar{height:28px;padding:0 6px 0 12px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--hairline);font-size:11px;color:var(--faint)}
+.ib{width:24px;height:24px;border-radius:6px;display:flex;align-items:center;justify-content:center;color:var(--faint)} .ib:hover{background:var(--hover);color:var(--text)} .ib svg{width:14px;height:14px}
+.code pre{font:12.5px/19px var(--mono);padding:9px 12px;overflow-x:auto;white-space:pre;color:#d7d9e4}
+.code .more{height:28px;padding:0 12px;border-top:1px solid var(--hairline);font-size:12px;color:var(--link);line-height:28px}
+
+/* media */
+.att{margin-top:5px;display:flex;flex-direction:column;gap:4px;align-items:flex-start}
+.ph{position:relative;border-radius:8px;overflow:hidden;background:var(--media-fill);box-shadow:inset 0 0 0 1px var(--hairline);flex:none}
+.grid{display:flex;gap:4px;width:400px} .grid .colr{display:flex;flex-direction:column;gap:4px}
+.grid2{display:flex;flex-wrap:wrap;gap:4px;width:400px}
+.more-n{position:absolute;inset:0;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;font-size:22px;font-weight:600;color:#fff}
+.p1{background:linear-gradient(180deg,#2d3a66 0%,#5a6fae 38%,#e9a56b 62%,#3a2f3d 63%,#1c1a24 100%)}
+.p2{background:radial-gradient(circle at 30% 30%,#ffd98a 0,#ef8a52 30%,#7a2f52 70%,#2a1630 100%)}
+.p3{background:linear-gradient(135deg,#1f4d4a,#3fae8c 55%,#d7e8a0)}
+.p4{background:linear-gradient(200deg,#f3f4f8 0%,#cfd4e6 45%,#8089b3 100%)}
+.p5{background:linear-gradient(160deg,#3b2a5c,#8a4fb3 50%,#f08bb0)}
+.p6{background:linear-gradient(180deg,#0f2a44,#1d6a8f 55%,#9fd7d0)}
+.shot{background:linear-gradient(#20222b 0 28px,transparent 28px),repeating-linear-gradient(180deg,#2a2d39 0 8px,#181a21 8px 22px),#181a21}
+.badge{position:absolute;height:20px;padding:0 6px;border-radius:5px;background:var(--badge);font-size:10.5px;font-weight:700;color:#fff;line-height:20px;letter-spacing:.3px;font-variant-numeric:tabular-nums}
+.badge.bl{left:8px;bottom:8px} .badge.br{right:8px;bottom:8px}
+.play{position:absolute;left:50%;top:50%;width:44px;height:44px;margin:-22px 0 0 -22px;border-radius:22px;background:var(--badge);display:flex;align-items:center;justify-content:center;color:#fff}
+.play svg{width:18px;height:18px;fill:#fff;stroke:none;margin-left:2px}
+.phs{position:absolute;inset:0;display:flex;flex-direction:column;gap:6px;align-items:center;justify-content:center;font-size:12px;color:var(--faint)}
+.blurph{background:linear-gradient(150deg,#3a3550,#5b4a52 50%,#2b3a44)}
+.file{width:360px;height:56px;border-radius:10px;background:var(--raised);border:1px solid var(--hairline);display:flex;align-items:center;gap:10px;padding:0 8px 0 10px;position:relative;overflow:hidden}
+.file .ic{width:36px;height:36px;border-radius:8px;background:var(--raised);display:flex;align-items:center;justify-content:center;color:var(--soft);flex:none} .file .ic svg{width:18px;height:18px}
+.file .fn{font-size:13.5px;font-weight:500;line-height:18px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.file .fm{font-size:11.5px;color:var(--faint);line-height:16px}
+.file .ib{width:28px;height:28px;color:var(--soft)} .file .ib svg{width:16px;height:16px}
+.prog{position:absolute;left:0;bottom:0;height:2px;background:var(--accent)}
+.voice{width:300px;height:48px;border-radius:10px;background:var(--raised);border:1px solid var(--hairline);display:flex;align-items:center;gap:10px;padding:0 12px 0 8px}
+.voice .pb{width:32px;height:32px;border-radius:16px;background:var(--accent-soft);color:var(--accent);display:flex;align-items:center;justify-content:center;flex:none}
+.voice .pb svg{width:13px;height:13px;fill:currentColor;stroke:none;margin-left:1px}
+.wave{flex:1;height:20px;display:flex;align-items:center;gap:2px} .wave u{width:2px;border-radius:1px;background:var(--faint);flex:none} .wave u.on{background:var(--accent)}
+.sticker{width:128px;height:128px;border-radius:28px;background:radial-gradient(circle at 35% 30%,#ffe9a8,#ffc24a 55%,#e88a1e);display:flex;align-items:center;justify-content:center;font-size:64px;line-height:1}
+.card{width:440px;max-width:100%;border-radius:10px;background:var(--raised);border:1px solid var(--hairline);padding:10px 12px;display:flex;gap:12px}
+.card .site{font-size:11.5px;color:var(--faint);line-height:16px}
+.card .ti{font-size:14px;font-weight:600;line-height:20px;color:var(--text)}
+.card .de{font-size:13px;line-height:18px;color:var(--soft);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.card.big{flex-direction:column;gap:8px;width:424px}
+.embed{width:440px;max-width:100%;border-radius:10px;background:var(--raised);border:1px solid var(--hairline);padding:10px 12px 10px 15px;position:relative;overflow:hidden}
+.embed::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--positive)}
+.fields{display:flex;flex-wrap:wrap;gap:6px 0;margin-top:6px} .fields div{width:50%} .fl{font-size:12px;color:var(--faint);line-height:16px} .fv{font-size:13.5px;line-height:19px}
+.line{display:inline-flex;align-items:center;gap:8px;height:36px;padding:0 12px;border-radius:8px;background:var(--raised);border:1px solid var(--hairline);font-size:13.5px;color:var(--soft)}
+.fwd{margin-top:2px} .fwd .fh{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--faint);height:18px} .fwd .fh svg{width:13px;height:13px}
+.fwd .fb{border-left:2px solid var(--hairline-strong);padding-left:12px;margin-top:2px}
+
+/* reactions, reply, thread */
+.rx{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0 3px}
+.chip{height:26px;padding:0 8px;border-radius:13px;background:var(--raised);border:1px solid transparent;display:flex;align-items:center;gap:5px;font-size:15px;cursor:pointer}
+.chip span{font-size:12px;font-weight:500;color:var(--soft);font-variant-numeric:tabular-nums}
+.chip:hover{border-color:var(--hairline-strong)}
+.chip.mine{background:var(--accent-soft);border-color:var(--accent)} .chip.mine span{color:var(--link)}
+.chip.add{color:var(--faint);opacity:0;padding:0 7px} .row:hover .chip.add{opacity:1} .chip.add svg{width:15px;height:15px}
+.chip.ov span{color:var(--soft)}
+.reply{display:flex;align-items:center;gap:6px;height:20px;padding:0 20px 0 68px;position:relative;font-size:12.5px;color:var(--faint);cursor:pointer}
+.reply::before{content:"";position:absolute;left:38px;top:9px;width:24px;height:12px;border-left:2px solid var(--hairline-strong);border-top:2px solid var(--hairline-strong);border-top-left-radius:6px}
+.reply .ra{width:16px;height:16px;border-radius:8px;flex:none} .reply b{color:var(--soft);white-space:nowrap;flex:none}
+.reply span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis} .reply:hover span{color:var(--text)}
+.thr{display:inline-flex;align-items:center;gap:8px;height:30px;padding:0 10px 0 6px;margin:5px 0 2px -6px;border-radius:8px;border:1px solid transparent;font-size:12px;color:var(--faint);cursor:pointer}
+.thr:hover{background:var(--raised);border-color:var(--hairline)}
+.thr .avs{display:flex} .thr .avs i{width:20px;height:20px;border-radius:10px;box-shadow:0 0 0 2px var(--canvas);margin-left:-5px} .thr .avs i:first-child{margin-left:0}
+.thr b{font-size:13px;color:var(--link)} .dot{width:6px;height:6px;border-radius:3px;background:var(--accent)}
+.status{display:flex;align-items:center;gap:6px;height:18px;margin-top:1px;font-size:12px} .status svg{width:13px;height:13px}
+.status.bad{color:var(--danger)} .status.wait{color:var(--warning)} .status .act{font-weight:600;color:var(--link);cursor:pointer} .status .act2{color:var(--soft);cursor:pointer} .status .sep{color:var(--faint)}
+.pend{opacity:.6}
+.tomb{font-style:italic;color:var(--faint)}
+.rm{position:absolute;right:20px;top:5px;color:var(--accent)} .rm svg{width:14px;height:14px}
+
+/* dividers */
+.day{display:flex;align-items:center;gap:12px;height:36px;padding:14px 20px 0}
+.day::before,.day::after{content:"";flex:1;height:1px;background:var(--hairline)}
+.day span{font-size:11.5px;font-weight:500;color:var(--faint)}
+.new{display:flex;align-items:center;height:24px;padding:4px 20px 0}
+.new::before{content:"";flex:1;height:1px;background:var(--accent)}
+.new span{height:16px;padding:0 6px;border-radius:0 4px 4px 0;background:var(--accent);color:var(--on-accent);font-size:10.5px;font-weight:700;line-height:16px;letter-spacing:.3px}
+.sys{display:flex;align-items:center;justify-content:center;gap:7px;height:28px;font-size:12.5px;color:var(--faint)} .sys svg{width:14px;height:14px} .sys b{color:var(--soft);font-weight:500}
+.top{padding:28px 20px 6px} .top .big{width:56px;height:56px;border-radius:17px;font-size:24px;font-weight:600;color:#fff;display:flex;align-items:center;justify-content:center}
+.top h1{font-size:20px;line-height:26px;font-weight:700;margin-top:12px} .top p{font-size:13px;line-height:19px;color:var(--soft)}
+.loadrow{display:flex;align-items:center;justify-content:center;gap:8px;height:44px;font-size:12px;color:var(--faint)} .loadrow svg{width:14px;height:14px}
+.jump{position:absolute;right:20px;bottom:80px;height:32px;padding:0 12px 0 14px;border-radius:16px;background:var(--accent);color:var(--on-accent);font-size:12.5px;font-weight:600;display:flex;align-items:center;gap:6px;box-shadow:0 6px 20px rgba(0,0,0,.4)}
+.jump.idle{position:static;width:32px;padding:0;justify-content:center;background:var(--float);color:var(--text);border:1px solid var(--hairline)}
+.slot{margin:10px 20px 16px;height:48px;border-radius:12px;border:1px dashed var(--hairline-strong);display:flex;align-items:center;justify-content:center;font-size:12px;color:var(--faint)}
+.note{font-size:11px;color:var(--faint);padding:10px 20px 2px;letter-spacing:.2px}
+
+/* thread pane: dense metrics */
+.tp .row{padding:3px 16px;gap:10px} .tp .row.cont{padding:1px 16px} .tp .av{width:28px;height:28px;font-size:11px} .tp .gut{width:28px}
+.tp .day,.tp .new{padding-left:16px;padding-right:16px} .tp .slot{margin:10px 16px 16px}
+.tp .ph.fit{width:310px;height:207px}
+.th{height:52px;padding:0 10px 0 16px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--hairline)}
+.th b{font-size:14.5px} .th span{font-size:11.5px;color:var(--faint);display:block;line-height:14px}
+.cnt{display:flex;align-items:center;gap:10px;height:32px;padding:0 16px;font-size:11.5px;font-weight:500;color:var(--faint)} .cnt::after{content:"";flex:1;height:1px;background:var(--hairline)}
+
+/* viewer */
+.vw{width:960px;height:620px;background:var(--scrim);border-radius:12px;position:relative;overflow:hidden;border:1px solid var(--hairline)}
+.vbar{height:52px;padding:0 12px 0 16px;display:flex;align-items:center;gap:10px}
+.vbar .av{width:24px;height:24px;font-size:9.5px;margin:0} .vbar .vn{font-size:13px;font-weight:600;line-height:16px} .vbar .vm{font-size:11.5px;color:var(--faint);line-height:14px}
+.vbar .sp2{flex:1} .vb{width:32px;height:32px;border-radius:8px;display:flex;align-items:center;justify-content:center;color:var(--soft)} .vb:hover{background:var(--hover);color:var(--text)}
+.vz{font-size:12px;color:var(--soft);width:44px;text-align:center;font-variant-numeric:tabular-nums} .vsep{width:1px;height:18px;background:var(--hairline-strong);margin:0 4px}
+.vimg{position:absolute;left:144px;top:68px;width:672px;height:448px;border-radius:4px;box-shadow:0 20px 60px rgba(0,0,0,.6)}
+.vnav{position:absolute;top:272px;width:40px;height:40px;border-radius:20px;background:var(--float);border:1px solid var(--hairline);display:flex;align-items:center;justify-content:center;color:var(--text)} .vnav svg{width:18px;height:18px}
+.vfoot{position:absolute;left:0;right:0;bottom:22px;text-align:center;font-size:12px;color:var(--soft)} .vfoot span{color:var(--faint)}
+.toast{position:absolute;left:50%;bottom:60px;transform:translateX(-50%);height:32px;padding:0 14px;border-radius:16px;background:var(--float);border:1px solid var(--hairline);font-size:12.5px;display:flex;align-items:center;gap:8px;box-shadow:0 6px 20px rgba(0,0,0,.4)}
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute">
+  <symbol id="copy" viewBox="0 0 24 24"><rect x="8" y="8" width="14" height="14" rx="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></symbol>
+  <symbol id="dl" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></symbol>
+  <symbol id="play" viewBox="0 0 24 24"><polygon points="6 3 20 12 6 21"/></symbol>
+  <symbol id="file" viewBox="0 0 24 24"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7zM14 2v4a2 2 0 0 0 2 2h4"/></symbol>
+  <symbol id="ftext" viewBox="0 0 24 24"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7zM14 2v4a2 2 0 0 0 2 2h4M8 13h8M8 17h6"/></symbol>
+  <symbol id="pin" viewBox="0 0 24 24"><path d="M12 17v5M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z"/></symbol>
+  <symbol id="down" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
+  <symbol id="left" viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"/></symbol>
+  <symbol id="right" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></symbol>
+  <symbol id="x" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></symbol>
+  <symbol id="alert" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/></symbol>
+  <symbol id="img" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.09-3.09a2 2 0 0 0-2.82 0L6 21"/></symbol>
+  <symbol id="imgoff" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="M2 2l20 20"/></symbol>
+  <symbol id="fwd" viewBox="0 0 24 24"><path d="m15 17 5-5-5-5M4 18v-2a4 4 0 0 1 4-4h12"/></symbol>
+  <symbol id="smile" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2M9 9h.01M15 9h.01"/></symbol>
+  <symbol id="phones" viewBox="0 0 24 24"><path d="M3 14h3a2 2 0 0 1 2 2v3a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-7a9 9 0 0 1 18 0v7a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3"/></symbol>
+  <symbol id="chart" viewBox="0 0 24 24"><path d="M12 20V10M18 20V4M6 20v-4"/></symbol>
+  <symbol id="ext" viewBox="0 0 24 24"><path d="M7 7h10v10M7 17 17 7"/></symbol>
+  <symbol id="cc" viewBox="0 0 24 24"><path d="M18 6 7 17l-5-5M22 10l-7.5 7.5L13 16"/></symbol>
+  <symbol id="clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></symbol>
+  <symbol id="zin" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3M11 8v6M8 11h6"/></symbol>
+  <symbol id="zout" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3M8 11h6"/></symbol>
+  <symbol id="eye" viewBox="0 0 24 24"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></symbol>
+  <symbol id="join" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2M19 8v6M22 11h-6"/><circle cx="9" cy="7" r="4"/></symbol>
+  <symbol id="load" viewBox="0 0 24 24"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></symbol>
+</svg>
+
+<div class="page">
+
+<!-- ============ FRAME 1: conversation pane, 720 wide ============ -->
+<div>
+<div class="cap">1 · Conversation pane, 720 px. Header, hover toolbar and composer belong to other areas.</div>
+<div class="frame" style="width:720px">
+
+  <div class="top">
+    <div class="big a3">#</div>
+    <h1>#launch-week</h1>
+    <p>This is the start of #launch-week. Created by Ines Vauquelin on March 4, 2026.</p>
+  </div>
+
+  <div class="day"><span>Monday, October 12</span></div>
+  <div class="sys"><svg class="i"><use href="#join"/></svg><span><b>Tomas Reyes-Lind</b>, <b>Nadia Brandt</b> and 2 others joined</span></div>
+
+  <div class="gap"></div>
+  <div class="row"><div class="av a1">MO</div><div class="c">
+    <div class="h"><span class="n">Mara Okafor</span><span class="t">4:12 PM</span></div>
+    <div class="b">Plan for Thursday: we ship <b>2.4</b> behind the flag, <i>not</i> to everyone. The <s>Tuesday</s> date is gone. Flip <code>launch.checkout_v2</code> once the canary is clean, runbook is at <a>wiki.northwind.example/runbooks/launch</a>.<span class="ed">(edited)</span></div>
+  </div></div>
+  <div class="row cont"><div class="gut">4:13</div><div class="c"><div class="b">
+    Order of work:
+    <div class="li"><i>1.</i><span>Freeze <code>main</code> at noon</span></div>
+    <div class="li"><i>2.</i><span>Canary to 5% for an hour</span></div>
+    <div class="li l2"><i>•</i><span>watch p95 and the error budget</span></div>
+    <div class="li l2"><i>•</i><span>roll back on any 5xx spike</span></div>
+    <div class="li"><i>3.</i><span>Everyone, in two steps</span></div>
+  </div></div></div>
+  <div class="row cont"><div class="gut">4:14</div><div class="c"><div class="b">
+    <div class="q">If the canary is noisy we hold a day. Nobody is a hero on a Thursday night.</div>
+    That is from last quarter's retro and it still stands.
+  </div></div></div>
+
+  <div class="gap"></div>
+  <div class="row"><div class="av a2">DP</div><div class="c">
+    <div class="h"><span class="n">Dev Patel</span><span class="t">4:31 PM</span></div>
+    <div class="b">This is what I'll run for the canary:</div>
+    <div class="code">
+      <div class="bar"><span>sh</span><span class="ib" title="Copy"><svg class="i"><use href="#copy"/></svg></span></div>
+<pre>$ flagctl set launch.checkout_v2 --percent 5 --region us-east
+$ flagctl watch launch.checkout_v2 --metric p95,errors --for 60m --abort-on "errors &gt; 0.5%"
+canary  5%   p95 182ms   errors 0.02%   ok</pre>
+    </div>
+  </div></div>
+
+  <div class="gap"></div>
+  <div class="row"><div class="av app a6">BB</div><div class="c">
+    <div class="h"><span class="n">Buildbot</span><span class="tag">APP</span><span class="t">4:40 PM</span></div>
+    <div class="att" style="margin-top:3px"><div class="embed">
+      <div class="card ti" style="all:unset;display:block;font-size:14px;font-weight:600;line-height:20px">Build #4187 passed</div>
+      <div style="font-size:13.5px;line-height:19px;color:var(--soft)">main · “Freeze checkout schema for 2.4”</div>
+      <div class="fields">
+        <div><div class="fl">Duration</div><div class="fv">6 min 12 s</div></div>
+        <div><div class="fl">Tests</div><div class="fv">2,318 passed, 0 failed</div></div>
+        <div><div class="fl">Commit</div><div class="fv"><code>9f3c1ae</code></div></div>
+        <div><div class="fl">Triggered by</div><div class="fv">Dev Patel</div></div>
+      </div>
+      <div style="font-size:12px;line-height:18px;color:var(--faint);margin-top:8px">2 actions · <span class="lk">Open in Slack ↗</span></div>
+    </div></div>
+  </div></div>
+
+  <div class="gap"></div>
+  <div class="row"><div class="av a4">IV</div><div class="c">
+    <div class="h"><span class="n">Ines Vauquelin</span><span class="t">5:02 PM</span><span class="flag"><svg class="i"><use href="#pin"/></svg>Pinned</span></div>
+    <div class="b">Hero image for the announcement, final.</div>
+    <div class="att"><div class="ph p1" style="width:400px;height:267px"></div></div>
+    <div class="rx">
+      <div class="chip mine">🔥<span>6</span></div><div class="chip">👏<span>3</span></div><div class="chip"><i class="ce" style="margin:0"></i><span>2</span></div><div class="chip">👀<span>1</span></div>
+      <div class="chip add"><svg class="i"><use href="#smile"/></svg></div>
+    </div>
+  </div></div>
+
+  <div class="day"><span>Today</span></div>
+
+  <div class="gap"></div>
+  <div class="reply"><i class="ra a1"></i><b>Mara Okafor</b><span>Plan for Thursday: we ship 2.4 behind the flag, not to everyone. The Tuesday date is gone.</span></div>
+  <div class="row"><div class="av a5">TR</div><div class="c">
+    <div class="h"><span class="n">Tomas Reyes-Lind</span><span class="t">9:07 AM</span></div>
+    <div class="b">Works for me. <span class="mn">@Mara Okafor</span> I'll post progress in <span class="mn">#deploys</span>, and <span class="mn">@backend</span> is on call. <span class="mn">@everyone</span> please hold merges after noon.</div>
+  </div></div>
+
+  <div class="gap"></div>
+  <div class="row me"><div class="av a2">DP</div><div class="c">
+    <div class="h"><span class="n">Dev Patel</span><span class="t">9:15 AM</span></div>
+    <div class="b"><span class="mn self">@You</span> can you look at the rollback step before noon? I changed the order.</div>
+    <div class="thr"><span class="avs"><i class="a1"></i><i class="a5"></i><i class="a4"></i></span><b>4 replies</b><span>Last reply 2h ago</span><i class="dot"></i><span style="color:var(--link)">2 new</span></div>
+  </div></div>
+
+  <div class="gap"></div>
+  <div class="row"><div class="av a4">IV</div><div class="c">
+    <div class="h"><span class="n">Ines Vauquelin</span><span class="t">9:40 AM</span></div>
+    <div class="b">Before and after of the checkout page.</div>
+    <div class="att"><div class="grid"><div class="ph shot" style="width:198px;height:198px"></div><div class="ph p4" style="width:198px;height:198px"></div></div></div>
+  </div></div>
+  <div class="row cont"><div class="gut">9:41</div><div class="c">
+    <div class="b">Three from the offsite.</div>
+    <div class="att"><div class="grid"><div class="ph p2" style="width:264px;height:264px"></div><div class="colr"><div class="ph p3" style="width:132px;height:130px"></div><div class="ph p5" style="width:132px;height:130px"></div></div></div></div>
+  </div></div>
+  <div class="row cont"><div class="gut">9:41</div><div class="c">
+    <div class="att"><div class="grid2"><div class="ph p6" style="width:198px;height:148px"></div><div class="ph p1" style="width:198px;height:148px"></div><div class="ph p5" style="width:198px;height:148px"></div><div class="ph p3" style="width:198px;height:148px"></div></div></div>
+  </div></div>
+  <div class="row cont"><div class="gut">9:43</div><div class="c">
+    <div class="b">And the whole album, six of them.</div>
+    <div class="att"><div class="grid2"><div class="ph p2" style="width:198px;height:148px"></div><div class="ph p4" style="width:198px;height:148px"></div><div class="ph p6" style="width:198px;height:148px"></div><div class="ph p1" style="width:198px;height:148px"><div class="more-n">+2</div></div></div></div>
+    <div class="rx"><div class="chip">😍<span>4</span></div><div class="chip mine">🙌<span>2</span></div><div class="chip">🎉<span>2</span></div><div class="chip">🌊<span>1</span></div><div class="chip">🏔️<span>1</span></div><div class="chip ov"><span>+7</span></div><div class="chip add"><svg class="i"><use href="#smile"/></svg></div></div>
+  </div></div>
+
+  <div class="gap"></div>
+  <div class="row"><div class="av a5">TR</div><div class="c">
+    <div class="h"><span class="n">Tomas Reyes-Lind</span><span class="t">10:02 AM</span></div>
+    <div class="b">Mood, and the screen recording of the new flow.</div>
+    <div class="att">
+      <div class="ph p5" style="width:320px;height:240px"><div class="play"><svg class="i"><use href="#play"/></svg></div><div class="badge bl">GIF</div></div>
+      <div class="ph shot" style="width:400px;height:225px"><div class="play"><svg class="i"><use href="#play"/></svg></div><div class="badge br">1:24</div></div>
+    </div>
+  </div></div>
+
+  <div class="gap"></div>
+  <div class="row"><div class="av a1">MO</div><div class="c">
+    <div class="h"><span class="n">Mara Okafor</span><span class="t">10:20 AM</span></div>
+    <div class="b">Draft of the post: <a>blog.northwind.example/checkout-v2</a> and the status page we'll point to: <a>status.northwind.example</a></div>
+    <div class="att">
+      <div class="card big">
+        <div><div class="site">blog.northwind.example</div><div class="ti">Checkout, rebuilt: one page, half the taps</div><div class="de">We rewrote checkout from the ground up. Here is what changed, what we measured during the canary, and what comes next for saved carts.</div></div>
+        <div class="ph p6" style="width:400px;height:210px"></div>
+      </div>
+      <div class="card">
+        <div style="flex:1;min-width:0"><div class="site">status.northwind.example</div><div class="ti">Northwind Status</div><div class="de">All systems operational. Subscribe for updates on incidents and scheduled maintenance.</div></div>
+        <div class="ph p3" style="width:72px;height:72px;border-radius:6px"></div>
+      </div>
+    </div>
+  </div></div>
+  <div class="row cont"><div class="gut">10:22</div><div class="c">
+    <div class="b">Runbook as a PDF for whoever is offline, plus my notes read out loud.</div>
+    <div class="att">
+      <div class="file"><div class="ic"><svg class="i"><use href="#ftext"/></svg></div><div style="flex:1;min-width:0"><div class="fn">Launch runbook 2.4 (final, really).pdf</div><div class="fm">PDF · 2.4 MB</div></div><div class="ib" title="Download"><svg class="i"><use href="#dl"/></svg></div></div>
+      <div class="file"><div class="ic"><svg class="i"><use href="#file"/></svg></div><div style="flex:1;min-width:0"><div class="fn">canary-metrics.zip</div><div class="fm">7.1 of 18.6 MB</div></div><div class="ib" title="Cancel"><svg class="i"><use href="#x"/></svg></div><div class="prog" style="width:38%"></div></div>
+      <div class="voice"><div class="pb"><svg class="i"><use href="#play"/></svg></div>
+        <div class="wave"><u class="on" style="height:6px"></u><u class="on" style="height:12px"></u><u class="on" style="height:18px"></u><u class="on" style="height:9px"></u><u class="on" style="height:14px"></u><u class="on" style="height:20px"></u><u class="on" style="height:11px"></u><u class="on" style="height:7px"></u><u class="on" style="height:15px"></u><u class="on" style="height:17px"></u><u class="on" style="height:8px"></u><u class="on" style="height:13px"></u><u style="height:19px"></u><u style="height:10px"></u><u style="height:5px"></u><u style="height:12px"></u><u style="height:16px"></u><u style="height:20px"></u><u style="height:14px"></u><u style="height:8px"></u><u style="height:6px"></u><u style="height:11px"></u><u style="height:17px"></u><u style="height:13px"></u><u style="height:9px"></u><u style="height:15px"></u><u style="height:18px"></u><u style="height:7px"></u><u style="height:4px"></u><u style="height:10px"></u><u style="height:14px"></u><u style="height:12px"></u><u style="height:6px"></u><u style="height:9px"></u><u style="height:16px"></u><u style="height:11px"></u><u style="height:5px"></u><u style="height:8px"></u><u style="height:4px"></u><u style="height:3px"></u></div>
+        <span class="t" style="font-size:12px;color:var(--soft)">0:14 / 0:47</span></div>
+    </div>
+  </div></div>
+
+  <div class="gap"></div>
+  <div class="row"><div class="av a4">IV</div><div class="c">
+    <div class="h"><span class="n">Ines Vauquelin</span><span class="t">10:48 AM</span></div>
+    <div class="fwd">
+      <div class="fh"><svg class="i"><use href="#fwd"/></svg>Forwarded from <b style="color:var(--soft);font-weight:500">Nadia Brandt</b> in #support</div>
+      <div class="fb"><div class="b">Three customers asked today whether saved carts survive the upgrade. Can we say yes in the post?</div></div>
+    </div>
+    <div class="b" style="margin-top:3px">They do. The answer to the pricing question is <span class="sp">held until Thursday at ten</span>, revealed it reads <span class="sp open">$12 a seat</span>. Also <i class="ce"></i> for the new empty state.</div>
+  </div></div>
+  <div class="row cont"><div class="gut">10:49</div><div class="c"><div class="b jumbo">🚀🎉</div></div></div>
+  <div class="row cont"><div class="gut">10:49</div><div class="c"><div class="att" style="margin-top:2px"><div class="sticker">😎</div></div></div></div>
+
+  <div class="sys" style="margin-top:6px"><svg class="i"><use href="#phones"/></svg><span><b>Mara Okafor</b> started a huddle · 14 min</span></div>
+
+  <div class="gap"></div>
+  <div class="row"><div class="av a5">TR</div><div class="c">
+    <div class="h"><span class="n">Tomas Reyes-Lind</span><span class="t">11:30 AM</span></div>
+    <div class="att" style="margin-top:3px"><div class="line"><svg class="i"><use href="#chart"/></svg><span>Poll: Lunch on Thursday, before or after the flip?</span><span class="lk">Open in Slack ↗</span></div></div>
+  </div></div>
+  <div class="gap"></div>
+  <div class="row"><div class="av a6" style="opacity:.5">NB</div><div class="c">
+    <div class="h"><span class="n" style="color:var(--soft)">Nadia Brandt</span><span class="t">11:34 AM</span></div>
+    <div class="b tomb">Message deleted</div>
+    <div class="thr"><span class="avs"><i class="a2"></i><i class="a1"></i></span><b>2 replies</b><span>Last reply 11:52 AM</span></div>
+  </div></div>
+
+  <div class="new"><span>NEW</span></div>
+
+  <div class="gap"></div>
+  <div class="row"><div class="av a1">MO</div><div class="c">
+    <div class="h"><span class="n">Mara Okafor</span><span class="t">12:04 PM</span></div>
+    <div class="b">Main is frozen. Dashboard and the trace for the one slow request:</div>
+    <div class="att">
+      <div class="ph blurph" style="width:400px;height:225px"></div>
+      <div class="ph" style="width:300px;height:200px"><div class="phs"><svg class="i" style="width:20px;height:20px"><use href="#imgoff"/></svg><span>Couldn't load image · <span class="lk">Retry</span></span></div></div>
+    </div>
+  </div></div>
+
+  <div class="gap"></div>
+  <div class="row"><div class="av a3">Y</div><div class="c">
+    <div class="h"><span class="n">You</span><span class="t">12:06 PM</span></div>
+    <div class="b">Rollback order looks right to me. Starting the canary.</div>
+  </div><span class="rm" title="Read"><svg class="i"><use href="#cc"/></svg></span></div>
+  <div class="row cont"><div class="gut">12:07</div><div class="c"><div class="b pend">5% is live in us-east.</div></div></div>
+  <div class="row cont"><div class="gut">12:07</div><div class="c">
+    <div class="b pend">Posting numbers every ten minutes.</div>
+    <div class="status wait"><svg class="i"><use href="#clock"/></svg>Waiting for Slack…</div>
+  </div></div>
+  <div class="row cont fail"><div class="gut">12:08</div><div class="c">
+    <div class="b">p95 182 ms, errors 0.02%.</div>
+    <div class="status bad"><svg class="i"><use href="#alert"/></svg>Not sent · Slow mode: 8 s<span class="sep">·</span><span class="act">Retry</span><span class="sep">·</span><span class="act2">Delete</span></div>
+  </div></div>
+
+  <div style="height:44px"></div>
+  <div class="jump">3 new<svg class="i" style="width:14px;height:14px"><use href="#down"/></svg></div>
+  <div class="slot">typing row and composer (other areas)</div>
+</div>
+</div>
+
+<!-- ============ column 2 ============ -->
+<div class="col">
+
+<!-- FRAME 2: thread pane -->
+<div>
+<div class="cap">2 · Thread pane contents, 380 px. Dense metrics: 28 px avatars, 16 px inset.</div>
+<div class="frame tp" style="width:380px">
+  <div class="th"><div><b>Thread</b><span>#launch-week</span></div><div class="vb"><svg class="i"><use href="#x"/></svg></div></div>
+  <div class="gap"></div>
+  <div class="row me"><div class="av a2">DP</div><div class="c">
+    <div class="h"><span class="n">Dev Patel</span><span class="t">9:15 AM</span></div>
+    <div class="b"><span class="mn self">@You</span> can you look at the rollback step before noon? I changed the order.</div>
+  </div></div>
+  <div class="cnt">4 replies</div>
+  <div class="row"><div class="av a1">MO</div><div class="c">
+    <div class="h"><span class="n">Mara Okafor</span><span class="t">9:21 AM</span></div>
+    <div class="b">Which step moved? I only see the flag flip going first now.</div>
+  </div></div>
+  <div class="gap"></div>
+  <div class="row"><div class="av a2">DP</div><div class="c">
+    <div class="h"><span class="n">Dev Patel</span><span class="t">9:24 AM</span></div>
+    <div class="b">Flag off first, <i>then</i> drain. Before it was the other way round and we dropped carts.</div>
+    <div class="att"><div class="ph shot fit"></div></div>
+    <div class="rx"><div class="chip mine">👍<span>2</span></div><div class="chip add"><svg class="i"><use href="#smile"/></svg></div></div>
+  </div></div>
+  <div class="new"><span>NEW</span></div>
+  <div class="gap"></div>
+  <div class="row"><div class="av a5">TR</div><div class="c">
+    <div class="h"><span class="n">Tomas Reyes-Lind</span><span class="t">10:11 AM</span></div>
+    <div class="b">Agree. I'd add a check that <code>drain_queue</code> is empty before step 3.</div>
+  </div></div>
+  <div class="gap"></div>
+  <div class="row"><div class="av a4">IV</div><div class="c">
+    <div class="h"><span class="n">Ines Vauquelin</span><span class="t">10:14 AM</span></div>
+    <div class="b">+1, and say so in the runbook.</div>
+  </div></div>
+  <div class="slot">thread composer (composer area)</div>
+</div>
+</div>
+
+<!-- FRAME 4: states that cannot share a screen -->
+<div>
+<div class="cap">4 · States that cannot share a screen with frame 1.</div>
+<div class="frame" style="width:380px;padding-bottom:14px">
+  <div class="note">Top of list while fetching, and when it fails</div>
+  <div class="loadrow"><svg class="i"><use href="#load"/></svg>Loading earlier messages…</div>
+  <div class="loadrow" style="height:32px">Couldn't load earlier messages · <span class="lk">Retry</span></div>
+  <div class="note">Jump to bottom, nothing new</div>
+  <div style="padding:6px 20px"><div class="jump idle"><svg class="i"><use href="#down"/></svg></div></div>
+  <div class="note">New divider landing on a day boundary</div>
+  <div class="new" style="height:28px"><span>NEW</span></div><div class="day" style="height:22px;padding-top:0"><span>Today</span></div>
+  <div class="note">Very tall (120 × 300, cropped) · very wide (400 × 64, cropped) · tiny (natural size)</div>
+  <div style="padding:6px 20px;display:flex;gap:8px;align-items:flex-start;flex-wrap:wrap">
+    <div class="ph shot" style="width:120px;height:300px"></div>
+    <div style="display:flex;flex-direction:column;gap:8px;width:212px">
+      <div class="ph p1" style="width:212px;height:34px"></div>
+      <div class="ph p2" style="width:48px;height:48px"></div>
+      <div class="ph" style="width:212px;height:140px"><div class="phs"><svg class="i" style="width:20px;height:20px"><use href="#img"/></svg></div></div>
+      <div class="ph" style="width:212px;height:44px"><div class="phs" style="flex-direction:row"><span>Spoiler · click to show</span></div></div>
+    </div>
+  </div>
+  <div class="note">File: downloaded, and failed</div>
+  <div style="padding:6px 20px;display:flex;flex-direction:column;gap:4px">
+    <div class="file" style="width:340px"><div class="ic"><svg class="i"><use href="#ftext"/></svg></div><div style="flex:1;min-width:0"><div class="fn">Launch runbook 2.4.pdf</div><div class="fm">PDF · 2.4 MB · Downloaded</div></div><div class="ib" title="Quick Look"><svg class="i"><use href="#eye"/></svg></div></div>
+    <div class="file" style="width:340px"><div class="ic"><svg class="i"><use href="#file"/></svg></div><div style="flex:1;min-width:0"><div class="fn">canary-metrics.zip</div><div class="fm" style="color:var(--danger)">Couldn't download · <span class="lk">Retry</span></div></div><div class="ib"><svg class="i"><use href="#dl"/></svg></div></div>
+  </div>
+</div>
+</div>
+</div>
+
+<!-- ============ FRAME 3: image viewer ============ -->
+<div>
+<div class="cap">3 · Image viewer, drawn over the whole window. Flat scrim, no blur.</div>
+<div class="vw">
+  <div class="vbar">
+    <div class="av a4">IV</div>
+    <div><div class="vn">Ines Vauquelin</div><div class="vm">Monday 5:02 PM · #launch-week · hero-final.png · 2400 × 1600</div></div>
+    <div class="sp2"></div>
+    <div class="vb" title="Zoom out"><svg class="i"><use href="#zout"/></svg></div><div class="vz">Fit</div><div class="vb" title="Zoom in"><svg class="i"><use href="#zin"/></svg></div>
+    <div class="vsep"></div>
+    <div class="vb" title="Copy  ⌘C"><svg class="i"><use href="#copy"/></svg></div>
+    <div class="vb" title="Save to Downloads  ⌘S"><svg class="i"><use href="#dl"/></svg></div>
+    <div class="vb" title="Quick Look  Space"><svg class="i"><use href="#eye"/></svg></div>
+    <div class="vsep"></div>
+    <div class="vb" title="Close  Esc"><svg class="i"><use href="#x"/></svg></div>
+  </div>
+  <div class="vimg p1"></div>
+  <div class="vnav" style="left:20px"><svg class="i"><use href="#left"/></svg></div>
+  <div class="vnav" style="right:20px"><svg class="i"><use href="#right"/></svg></div>
+  <div class="toast">Saved to Downloads<span class="lk">Show in Finder</span></div>
+  <div class="vfoot">3 of 12 <span>· Hero image for the announcement, final.</span></div>
+</div>
+</div>
+
+</div>
+</body>
+</html>

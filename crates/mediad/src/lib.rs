@@ -1,0 +1,25 @@
+//! The call process: one Discord voice connection, from "connecting" until chatd closes our stdin.
+//!
+//! `voice` holds the pieces that need no network or device and are tested on their own (`rtp`,
+//! `jitter`, `opus`, `dave`); `gateway` speaks the voice websocket; `media` is the 20 ms loop that
+//! moves audio between the devices in `audio` and the UDP socket; `session` ties them to the
+//! frames chatd sends.
+
+pub mod audio;
+pub mod dave;
+pub mod gateway;
+pub mod jitter;
+pub mod media;
+pub mod opus;
+pub mod out;
+pub mod permission;
+pub mod rtp;
+pub mod session;
+
+/// Samples a second, on the wire and in every buffer between the codec and the devices.
+pub const RATE: u32 = 48_000;
+pub const CHANNELS: usize = 2;
+/// Samples per channel in one 20 ms frame.
+pub const FRAME: usize = 960;
+/// Interleaved samples in one frame.
+pub const FRAME_SAMPLES: usize = FRAME * CHANNELS;

@@ -1,0 +1,352 @@
+{
+ "teams": [
+  {
+   "id": "19:platform0general@thread.tacv2",
+   "displayName": "Platform",
+   "pictureETag": "\"4EFB33A6\"",
+   "isFavorite": true,
+   "isDeleted": false,
+   "isArchived": false,
+   "isFollowed": false,
+   "tenantId": "11111111-1111-4111-8111-111111111111",
+   "memberRole": 0,
+   "teamSiteInformation": {
+    "groupId": "e0873025-0000-4000-8000-00000000beef"
+   },
+   "membershipSummary": {
+    "botCount": 0,
+    "totalMemberCount": 4,
+    "adminRoleCount": 1
+   },
+   "channels": [
+    {
+     "id": "19:platform0deploys@thread.tacv2",
+     "displayName": "Deploys",
+     "parentTeamId": "19:platform0general@thread.tacv2",
+     "isGeneral": false,
+     "isFavorite": true,
+     "isFollowed": false,
+     "isMember": true,
+     "isPinned": false,
+     "isMuted": false,
+     "isDeleted": false,
+     "isArchived": false,
+     "channelType": 0,
+     "isMessageRead": true,
+     "consumptionHorizon": {
+      "originalArrivalTime": 1760000400400,
+      "timeStamp": 1760000401139,
+      "clientMessageId": "13937443170767600"
+     },
+     "lastMessage": {
+      "messageType": "RichText/Html",
+      "content": "",
+      "clientMessageId": "13937443170767600",
+      "imDisplayName": "Ben Okafor",
+      "id": "1760000400400",
+      "type": "Message",
+      "composeTime": "2025-10-09T09:00:00.4000000Z",
+      "originalArrivalTime": "2025-10-09T09:00:00.4000000Z",
+      "containerId": "19:platform0deploys@thread.tacv2",
+      "parentMessageId": "1760000400400",
+      "from": "8:orgid:00000000-0000-4000-8000-0000000000b2",
+      "sequenceId": 400
+     }
+    },
+    {
+     "id": "19:platform0hidden@thread.tacv2",
+     "displayName": "Hidden one",
+     "parentTeamId": "19:platform0general@thread.tacv2",
+     "isGeneral": false,
+     "isFavorite": false,
+     "isFollowed": false,
+     "isMember": true,
+     "isPinned": false,
+     "isMuted": false,
+     "isDeleted": false,
+     "isArchived": false,
+     "channelType": 0,
+     "isMessageRead": true
+    },
+    {
+     "id": "19:platform0general@thread.tacv2",
+     "displayName": "General",
+     "parentTeamId": "19:platform0general@thread.tacv2",
+     "isGeneral": true,
+     "isFavorite": true,
+     "isFollowed": false,
+     "isMember": true,
+     "isPinned": false,
+     "isMuted": false,
+     "isDeleted": false,
+     "isArchived": false,
+     "channelType": 0,
+     "isMessageRead": true,
+     "consumptionHorizon": {
+      "originalArrivalTime": 1760000260260,
+      "timeStamp": 1760000260999,
+      "clientMessageId": "13937442060998940"
+     },
+     "lastMessage": {
+      "messageType": "RichText/Html",
+      "content": "",
+      "clientMessageId": "13937442378075700",
+      "imDisplayName": "Ana Ruiz",
+      "id": "1760000300300",
+      "type": "Message",
+      "composeTime": "2025-10-09T08:58:20.3000000Z",
+      "originalArrivalTime": "2025-10-09T08:58:20.3000000Z",
+      "containerId": "19:platform0general@thread.tacv2",
+      "parentMessageId": "1760000300300",
+      "from": "8:orgid:00000000-0000-4000-8000-0000000000a1",
+      "sequenceId": 300
+     }
+    },
+    {
+     "id": "19:platform0old@thread.tacv2",
+     "displayName": "Old",
+     "parentTeamId": "19:platform0general@thread.tacv2",
+     "isGeneral": false,
+     "isFavorite": true,
+     "isFollowed": false,
+     "isMember": true,
+     "isPinned": false,
+     "isMuted": false,
+     "isDeleted": true,
+     "isArchived": false,
+     "channelType": 0,
+     "isMessageRead": true
+    },
+    {
+     "id": "19:platform0leads@thread.tacv2",
+     "displayName": "Leads",
+     "parentTeamId": "19:platform0general@thread.tacv2",
+     "isGeneral": false,
+     "isFavorite": true,
+     "isFollowed": false,
+     "isMember": true,
+     "isPinned": false,
+     "isMuted": true,
+     "isDeleted": false,
+     "isArchived": false,
+     "channelType": 1,
+     "isMessageRead": true
+    }
+   ]
+  },
+  {
+   "id": "19:design0general@thread.tacv2",
+   "displayName": "Design",
+   "isFavorite": true,
+   "isDeleted": false,
+   "isArchived": false,
+   "tenantId": "11111111-1111-4111-8111-111111111111",
+   "memberRole": 0,
+   "teamSiteInformation": {
+    "groupId": "e0873025-0000-4000-8000-00000000d351"
+   },
+   "channels": [
+    {
+     "id": "19:design0general@thread.tacv2",
+     "displayName": "General",
+     "parentTeamId": "19:design0general@thread.tacv2",
+     "isGeneral": true,
+     "isFavorite": true,
+     "isFollowed": false,
+     "isMember": true,
+     "isPinned": false,
+     "isMuted": false,
+     "isDeleted": false,
+     "isArchived": false,
+     "channelType": 0,
+     "isMessageRead": true
+    }
+   ]
+  },
+  {
+   "id": "19:gone0general@thread.tacv2",
+   "displayName": "Left behind",
+   "isDeleted": true,
+   "channels": []
+  }
+ ],
+ "chats": [
+  {
+   "id": "19:grp2@thread.v2",
+   "members": [
+    {
+     "isMuted": true,
+     "mri": "8:orgid:00000000-0000-4000-8000-0000000000aa",
+     "objectId": "00000000-0000-4000-8000-0000000000aa",
+     "role": "Admin",
+     "isIdentityMasked": false
+    },
+    {
+     "isMuted": false,
+     "mri": "8:orgid:00000000-0000-4000-8000-0000000000b2",
+     "objectId": "00000000-0000-4000-8000-0000000000b2",
+     "role": "Admin",
+     "isIdentityMasked": false
+    },
+    {
+     "isMuted": false,
+     "mri": "8:orgid:00000000-0000-4000-8000-0000000000c3",
+     "objectId": "00000000-0000-4000-8000-0000000000c3",
+     "role": "Admin",
+     "isIdentityMasked": false
+    }
+   ],
+   "title": "Launch crew",
+   "isRead": true,
+   "isOneOnOne": false,
+   "hidden": false,
+   "isLastMessageFromMe": true,
+   "chatType": "chat",
+   "createdAt": "2026-09-01T10:00:00.000Z",
+   "lastMessage": {
+    "messageType": "RichText/Html",
+    "content": "",
+    "clientMessageId": "13929521000000000",
+    "imDisplayName": "Me Myself",
+    "id": "1759000000000",
+    "type": "Message",
+    "composeTime": "2025-09-27T19:06:40.0000000Z",
+    "originalArrivalTime": "2025-09-27T19:06:40.0000000Z",
+    "containerId": "19:grp2@thread.v2",
+    "parentMessageId": "1759000000000",
+    "from": "8:orgid:00000000-0000-4000-8000-0000000000aa",
+    "sequenceId": 0
+   }
+  },
+  {
+   "id": "19:00000000-0000-4000-8000-0000000000a1_00000000-0000-4000-8000-0000000000aa@unq.gbl.spaces",
+   "members": [
+    {
+     "isMuted": false,
+     "mri": "8:orgid:00000000-0000-4000-8000-0000000000aa",
+     "objectId": "00000000-0000-4000-8000-0000000000aa",
+     "role": "Admin",
+     "isIdentityMasked": false
+    },
+    {
+     "isMuted": false,
+     "mri": "8:orgid:00000000-0000-4000-8000-0000000000a1",
+     "objectId": "00000000-0000-4000-8000-0000000000a1",
+     "role": "Admin",
+     "isIdentityMasked": false
+    }
+   ],
+   "title": null,
+   "isRead": false,
+   "isOneOnOne": true,
+   "hidden": false,
+   "isLastMessageFromMe": false,
+   "chatType": "chat",
+   "createdAt": "2026-08-01T10:00:00.000Z",
+   "lastMessage": {
+    "messageType": "RichText/Html",
+    "content": "",
+    "clientMessageId": "13937443963459500",
+    "imDisplayName": "Ana Ruiz",
+    "id": "1760000500500",
+    "type": "Message",
+    "composeTime": "2025-10-09T09:01:40.5000000Z",
+    "originalArrivalTime": "2025-10-09T09:01:40.5000000Z",
+    "containerId": "19:00000000-0000-4000-8000-0000000000a1_00000000-0000-4000-8000-0000000000aa@unq.gbl.spaces",
+    "parentMessageId": "1760000500500",
+    "from": "8:orgid:00000000-0000-4000-8000-0000000000a1",
+    "sequenceId": 500
+   }
+  },
+  {
+   "id": "19:grp1@thread.v2",
+   "members": [
+    {
+     "isMuted": false,
+     "mri": "8:orgid:00000000-0000-4000-8000-0000000000b2",
+     "objectId": "00000000-0000-4000-8000-0000000000b2",
+     "role": "Admin",
+     "isIdentityMasked": false
+    },
+    {
+     "isMuted": false,
+     "mri": "8:orgid:00000000-0000-4000-8000-0000000000aa",
+     "objectId": "00000000-0000-4000-8000-0000000000aa",
+     "role": "Admin",
+     "isIdentityMasked": false
+    },
+    {
+     "isMuted": false,
+     "mri": "8:orgid:00000000-0000-4000-8000-0000000000c3",
+     "objectId": "00000000-0000-4000-8000-0000000000c3",
+     "role": "Admin",
+     "isIdentityMasked": false
+    }
+   ],
+   "title": null,
+   "isRead": true,
+   "isOneOnOne": false,
+   "hidden": false,
+   "isLastMessageFromMe": false,
+   "chatType": "chat",
+   "lastMessage": {
+    "messageType": "RichText/Html",
+    "content": "",
+    "clientMessageId": "13933480500000000",
+    "imDisplayName": "Cy Tran",
+    "id": "1759500000000",
+    "type": "Message",
+    "composeTime": "2025-10-03T14:00:00.0000000Z",
+    "originalArrivalTime": "2025-10-03T14:00:00.0000000Z",
+    "containerId": "19:grp1@thread.v2",
+    "parentMessageId": "1759500000000",
+    "from": "8:orgid:00000000-0000-4000-8000-0000000000c3",
+    "sequenceId": 0
+   }
+  },
+  {
+   "id": "19:gone@thread.v2",
+   "members": [
+    {
+     "isMuted": false,
+     "mri": "8:orgid:00000000-0000-4000-8000-0000000000aa",
+     "objectId": "00000000-0000-4000-8000-0000000000aa",
+     "role": "Admin",
+     "isIdentityMasked": false
+    },
+    {
+     "isMuted": false,
+     "mri": "8:orgid:00000000-0000-4000-8000-0000000000d4",
+     "objectId": "00000000-0000-4000-8000-0000000000d4",
+     "role": "Admin",
+     "isIdentityMasked": false
+    }
+   ],
+   "title": "Old thing",
+   "isRead": true,
+   "isOneOnOne": false,
+   "hidden": true
+  },
+  {
+   "id": "48:notes",
+   "members": [
+    {
+     "isMuted": false,
+     "mri": "8:orgid:00000000-0000-4000-8000-0000000000aa",
+     "objectId": "00000000-0000-4000-8000-0000000000aa",
+     "role": "Admin",
+     "isIdentityMasked": false
+    }
+   ],
+   "title": null,
+   "isRead": true,
+   "isOneOnOne": false,
+   "hidden": false
+  }
+ ],
+ "users": [],
+ "privateFeeds": [],
+ "metadata": {
+  "syncToken": "W3sic3luY1Rva2VuIjoiZmFrZSJ9XQ=="
+ }
+}

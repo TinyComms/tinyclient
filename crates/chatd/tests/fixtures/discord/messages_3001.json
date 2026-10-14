@@ -1,0 +1,142 @@
+[
+  {
+    "id": "1300000010000000010",
+    "channel_id": "3001",
+    "type": 19,
+    "author": {"id": "2001", "username": "mara", "global_name": "Mara Okafor", "discriminator": "0", "avatar": "a1b2c3", "public_flags": 0},
+    "content": "**Deploy** is _green_, see <https://status.example/x> and ask <@2002> :tada: <:ferris:7001>\n```rust\nfn main() {}\n```",
+    "timestamp": "2024-10-27T16:53:20.100000+00:00",
+    "edited_timestamp": null,
+    "tts": false,
+    "flags": 0,
+    "pinned": true,
+    "mention_everyone": false,
+    "mentions": [{"id": "2002", "username": "dev", "global_name": "Dev Patel", "discriminator": "0", "avatar": null}],
+    "mention_roles": [],
+    "attachments": [
+      {
+        "id": "8001",
+        "filename": "graph.png",
+        "size": 48213,
+        "url": "https://cdn.discordapp.com/attachments/3001/8001/graph.png?ex=7fffffff&is=671e0000&hm=abcdef",
+        "proxy_url": "https://media.discordapp.net/attachments/3001/8001/graph.png?ex=7fffffff&is=671e0000&hm=abcdef",
+        "width": 1600,
+        "height": 900,
+        "content_type": "image/png",
+        "placeholder": "blurhash",
+        "placeholder_version": 1
+      },
+      {
+        "id": "8002",
+        "filename": "deploy.log",
+        "size": 9120,
+        "url": "https://cdn.discordapp.com/attachments/3001/8002/deploy.log?ex=7fffffff&is=671e0000&hm=123456",
+        "proxy_url": "https://media.discordapp.net/attachments/3001/8002/deploy.log?ex=7fffffff&is=671e0000&hm=123456",
+        "content_type": "text/plain; charset=utf-8"
+      }
+    ],
+    "embeds": [
+      {
+        "type": "link",
+        "url": "https://status.example/x",
+        "title": "Status",
+        "description": "All systems operational",
+        "provider": {"name": "Statuspage"},
+        "thumbnail": {
+          "url": "https://status.example/og.png",
+          "proxy_url": "https://images-ext-1.discordapp.net/external/abc/https/status.example/og.png",
+          "width": 1200,
+          "height": 630
+        }
+      }
+    ],
+    "reactions": [
+      {"count": 3, "count_details": {"burst": 0, "normal": 3}, "me": true, "me_burst": false, "emoji": {"id": null, "name": "👍"}, "burst_colors": []},
+      {"count": 1, "count_details": {"burst": 0, "normal": 1}, "me": false, "me_burst": false, "emoji": {"id": "7001", "name": "ferris"}, "burst_colors": []}
+    ],
+    "message_reference": {"type": 0, "channel_id": "3001", "message_id": "1300000000000000009"},
+    "referenced_message": {
+      "id": "1300000000000000009",
+      "channel_id": "3001",
+      "type": 0,
+      "author": {"id": "1000", "username": "justin", "global_name": "Justin", "discriminator": "0", "avatar": "me0hash"},
+      "content": "is the **deploy** done?",
+      "timestamp": "2024-10-27T16:53:20.000000+00:00",
+      "edited_timestamp": null,
+      "mentions": [],
+      "mention_roles": [],
+      "attachments": [],
+      "embeds": [],
+      "pinned": false
+    },
+    "components": []
+  },
+  {
+    "id": "1300000000000000009",
+    "channel_id": "3001",
+    "type": 0,
+    "author": {"id": "1000", "username": "justin", "global_name": "Justin", "discriminator": "0", "avatar": "me0hash"},
+    "content": "is the **deploy** done?",
+    "timestamp": "2024-10-27T16:53:20.000000+00:00",
+    "edited_timestamp": null,
+    "mentions": [],
+    "mention_roles": [],
+    "mention_everyone": false,
+    "attachments": [],
+    "embeds": [],
+    "pinned": false,
+    "nonce": "1299999999999999999",
+    "components": []
+  },
+  {
+    "id": "1300000000000000008",
+    "channel_id": "3001",
+    "type": 3,
+    "author": {"id": "2001", "username": "mara", "global_name": "Mara Okafor", "discriminator": "0", "avatar": "a1b2c3"},
+    "content": "",
+    "timestamp": "2024-10-27T16:53:19.900000+00:00",
+    "edited_timestamp": null,
+    "mentions": [],
+    "mention_roles": [],
+    "attachments": [],
+    "embeds": [],
+    "pinned": false,
+    "call": {"participants": ["2001"], "ended_timestamp": "2024-10-27T16:55:00+00:00"}
+  },
+  {
+    "id": "1300000000000000007",
+    "channel_id": "3001",
+    "type": 0,
+    "author": {"id": "2001", "username": "mara", "global_name": "Mara Okafor", "discriminator": "0", "avatar": "a1b2c3"},
+    "content": "",
+    "timestamp": "2024-10-27T16:53:19.800000+00:00",
+    "edited_timestamp": null,
+    "mentions": [],
+    "mention_roles": [],
+    "attachments": [],
+    "embeds": [],
+    "pinned": false,
+    "poll": {
+      "question": {"text": "Lunch?"},
+      "answers": [{"answer_id": 1, "poll_media": {"text": "Tacos"}}, {"answer_id": 2, "poll_media": {"text": "Ramen"}}],
+      "expiry": "2024-10-28T16:53:19+00:00",
+      "allow_multiselect": false,
+      "layout_type": 1
+    }
+  },
+  {
+    "id": "1300000000000000006",
+    "channel_id": "3001",
+    "type": 0,
+    "author": {"id": "2001", "username": "mara", "global_name": "Mara Okafor", "discriminator": "0", "avatar": "a1b2c3"},
+    "content": "",
+    "timestamp": "2024-10-27T16:53:19.700000+00:00",
+    "edited_timestamp": null,
+    "mentions": [],
+    "mention_roles": [],
+    "attachments": [],
+    "embeds": [],
+    "pinned": false,
+    "sticker_items": [{"id": "9001", "name": "Wave", "format_type": 1}]
+  }
+]

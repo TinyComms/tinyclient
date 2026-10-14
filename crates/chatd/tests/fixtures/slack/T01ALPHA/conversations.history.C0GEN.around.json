@@ -1,0 +1,5 @@
+{"ok": true, "has_more": true, "pin_count": 0,
+ "messages": [
+  {"type": "message", "user": "U0ANA", "ts": "1759000500.000500", "team": "T01ALPHA", "text": "the one that was linked to"},
+  {"type": "message", "user": "U0BEN", "ts": "1759000400.000400", "team": "T01ALPHA", "text": "just before it"}
+ ]}

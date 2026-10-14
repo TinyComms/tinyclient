@@ -1,0 +1,114 @@
+{
+ "messages": [
+  {
+   "id": "1760000230230",
+   "sequenceId": 230,
+   "clientmessageid": "13937441823191370",
+   "version": "1760000230230",
+   "conversationid": "19:platform0general@thread.tacv2",
+   "conversationLink": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/conversations/19:platform0general@thread.tacv2;messageid=1760000200200",
+   "type": "Message",
+   "messagetype": "RichText/Html",
+   "contenttype": "text",
+   "content": "<p>the latency one</p>",
+   "amsreferences": [],
+   "from": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/8:orgid:00000000-0000-4000-8000-0000000000b2",
+   "imdisplayname": "Ben Okafor",
+   "composetime": "2025-10-09T08:57:10.2300000Z",
+   "originalarrivaltime": "2025-10-09T08:57:10.2300000Z",
+   "properties": {}
+  },
+  {
+   "id": "1760000220220",
+   "sequenceId": 220,
+   "clientmessageid": "13937441743922180",
+   "version": "1760000220220",
+   "conversationid": "19:platform0general@thread.tacv2",
+   "conversationLink": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/conversations/19:platform0general@thread.tacv2;messageid=1760000200200",
+   "type": "Message",
+   "messagetype": "RichText/Html",
+   "contenttype": "text",
+   "content": "<p>on it</p>",
+   "amsreferences": [],
+   "from": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/8:orgid:00000000-0000-4000-8000-0000000000aa",
+   "imdisplayname": "Me Myself",
+   "composetime": "2025-10-09T08:57:00.2200000Z",
+   "originalarrivaltime": "2025-10-09T08:57:00.2200000Z",
+   "properties": {}
+  },
+  {
+   "id": "1760000210210",
+   "sequenceId": 210,
+   "clientmessageid": "13937441664652990",
+   "version": "1760000210210",
+   "conversationid": "19:platform0general@thread.tacv2",
+   "conversationLink": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/conversations/19:platform0general@thread.tacv2;messageid=1760000200200",
+   "type": "Message",
+   "messagetype": "RichText/Html",
+   "contenttype": "text",
+   "content": "<p>nice, which panel?</p>",
+   "amsreferences": [],
+   "from": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/8:orgid:00000000-0000-4000-8000-0000000000a1",
+   "imdisplayname": "Ana Ruiz",
+   "composetime": "2025-10-09T08:56:50.2100000Z",
+   "originalarrivaltime": "2025-10-09T08:56:50.2100000Z",
+   "properties": {}
+  },
+  {
+   "id": "1760000200200",
+   "sequenceId": 200,
+   "clientmessageid": "13937441585383800",
+   "version": "1760000200200",
+   "conversationid": "19:platform0general@thread.tacv2",
+   "conversationLink": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/conversations/19:platform0general@thread.tacv2;messageid=1760000200200",
+   "type": "Message",
+   "messagetype": "RichText/Html",
+   "contenttype": "text",
+   "content": "<p>Dashboard after the fix</p><p><img itemscope=\"image\" style=\"vertical-align:bottom\" src=\"https://eu-api.asm.skype.com/v1/objects/0-weu-d1-0123456789abcdef/views/imgo\" alt=\"image\" itemtype=\"http://schema.skype.com/AMSImage\" width=\"640\" height=\"360\" id=\"x_0-weu-d1-0123456789abcdef\" itemid=\"0-weu-d1-0123456789abcdef\"></p>",
+   "amsreferences": [],
+   "from": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/8:orgid:00000000-0000-4000-8000-0000000000b2",
+   "imdisplayname": "Ben Okafor",
+   "composetime": "2025-10-09T08:56:40.2000000Z",
+   "originalarrivaltime": "2025-10-09T08:56:40.2000000Z",
+   "properties": {
+    "emotions": [
+     {
+      "key": "like",
+      "users": [
+       {
+        "mri": "8:orgid:00000000-0000-4000-8000-0000000000a1",
+        "time": 1760000201000,
+        "value": "1760000201000"
+       },
+       {
+        "mri": "8:orgid:00000000-0000-4000-8000-0000000000aa",
+        "time": 1760000202000,
+        "value": "1760000202000"
+       },
+       {
+        "mri": "8:orgid:00000000-0000-4000-8000-0000000000a1",
+        "time": 1760000203000,
+        "value": "1760000203000"
+       }
+      ]
+     },
+     {
+      "key": "heart",
+      "users": [
+       {
+        "mri": "8:orgid:00000000-0000-4000-8000-0000000000b2",
+        "time": 1760000204000,
+        "value": "1760000204000"
+       }
+      ]
+     },
+     {
+      "key": "laugh",
+      "users": []
+     }
+    ]
+   }
+  }
+ ],
+ "_metadata": {}
+}

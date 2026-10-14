@@ -1,0 +1,8 @@
+{"ok": true,
+ "channel_sections": [
+   {"channel_section_id": "S0DMS", "name": "", "type": "direct_messages", "emoji": "", "next_channel_section_id": "S0APPS", "last_updated": 1759000000, "channel_ids_page": {"channel_ids": [], "count": 0}, "is_redacted": false},
+   {"channel_section_id": "S0APPS", "name": "", "type": "recent_apps", "emoji": "", "next_channel_section_id": null, "last_updated": 1759000000, "channel_ids_page": {"channel_ids": [], "count": 0}, "is_redacted": false},
+   {"channel_section_id": "S0SHIP", "name": "Shipping", "type": "standard", "emoji": "ship", "next_channel_section_id": "S0CHAN", "last_updated": 1759000000, "channel_ids_page": {"channel_ids": ["C0DEP"], "count": 1}, "is_redacted": false},
+   {"channel_section_id": "S0CHAN", "name": "", "type": "channels", "emoji": "", "next_channel_section_id": "S0DMS", "last_updated": 1759000000, "channel_ids_page": {"channel_ids": [], "count": 0}, "is_redacted": false}
+ ],
+ "last_updated": 1759000000, "count": 4}

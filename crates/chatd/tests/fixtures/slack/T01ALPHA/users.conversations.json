@@ -1,0 +1,12 @@
+{"ok": true,
+ "channels": [
+   {"id": "C0RND", "name": "random", "name_normalized": "random", "is_channel": true, "is_group": false, "is_im": false, "is_mpim": false, "is_private": false, "is_archived": false, "is_general": false, "created": 1700000000, "creator": "U0BEN", "topic": {"value": "", "creator": "", "last_set": 0}, "purpose": {"value": "", "creator": "", "last_set": 0}},
+   {"id": "C0GEN", "name": "general", "name_normalized": "general", "is_channel": true, "is_group": false, "is_im": false, "is_mpim": false, "is_private": false, "is_archived": false, "is_general": true, "created": 1700000000, "creator": "U0BEN", "topic": {"value": "Company-wide", "creator": "U0BEN", "last_set": 1700000000}, "purpose": {"value": "", "creator": "", "last_set": 0}},
+   {"id": "C0DEP", "name": "deploys", "name_normalized": "deploys", "is_channel": true, "is_group": false, "is_im": false, "is_mpim": false, "is_private": true, "is_archived": false, "is_general": false, "created": 1700000000, "creator": "U0ANA", "topic": {"value": "", "creator": "", "last_set": 0}, "purpose": {"value": "", "creator": "", "last_set": 0}},
+   {"id": "C0SIDE", "name": "sidecar", "name_normalized": "sidecar", "is_channel": true, "is_group": false, "is_im": false, "is_mpim": false, "is_private": false, "is_archived": false, "is_general": false, "is_read_only": true, "created": 1700000000, "creator": "U0BEN", "topic": {"value": "", "creator": "", "last_set": 0}, "purpose": {"value": "Announcements only", "creator": "U0BEN", "last_set": 1700000000}},
+   {"id": "G0GRP", "name": "mpdm-justin--ana--ben-1", "name_normalized": "mpdm-justin--ana--ben-1", "is_channel": false, "is_group": true, "is_im": false, "is_mpim": true, "is_private": true, "is_archived": false, "created": 1700000000, "creator": "U0ANA"},
+   {"id": "D0ANA", "created": 1700000000, "is_im": true, "is_org_shared": false, "user": "U0ANA", "is_user_deleted": false, "priority": 0},
+   {"id": "D0BOT", "created": 1700000000, "is_im": true, "is_org_shared": false, "user": "U0BOT", "is_user_deleted": false, "priority": 0},
+   {"id": "D0OLD", "created": 1690000000, "is_im": true, "is_org_shared": false, "user": "U0BEN", "is_user_deleted": false, "priority": 0}
+ ],
+ "response_metadata": {"next_cursor": ""}}

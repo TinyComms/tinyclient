@@ -1,0 +1,15 @@
+{"ok": true,
+ "channels": [
+   {"id": "C0GEN", "last_read": "1760000100.000100", "latest": "1760000300.000300", "updated": "1760000300.000300", "history_invalid": "0", "mention_count": 0, "has_unreads": true},
+   {"id": "C0DEP", "last_read": "1760000000.000001", "latest": "1760000310.000310", "updated": "1760000310.000310", "history_invalid": "0", "mention_count": 2, "has_unreads": true},
+   {"id": "C0RND", "last_read": "1760000000.000002", "latest": "1760000050.000050", "updated": "1760000050.000050", "history_invalid": "0", "mention_count": 0, "has_unreads": true}
+ ],
+ "mpims": [
+   {"id": "G0GRP", "last_read": "1759990000.000100", "latest": "1759990000.000100", "updated": "1759990000.000100", "history_invalid": "0", "mention_count": 0, "has_unreads": false}
+ ],
+ "ims": [
+   {"id": "D0ANA", "last_read": "1760000000.000003", "latest": "1760000320.000320", "updated": "1760000320.000320", "history_invalid": "0", "mention_count": 3, "has_unreads": true},
+   {"id": "D0BOT", "last_read": "1759980000.000100", "latest": "1759980000.000100", "updated": "1759980000.000100", "history_invalid": "0", "mention_count": 0, "has_unreads": false}
+ ],
+ "threads": {"has_unreads": true, "mention_count": 0},
+ "channel_badges": {"channels": 2, "dms": 3, "app_dms": 0, "thread_mentions": 0, "thread_unreads": 1}}

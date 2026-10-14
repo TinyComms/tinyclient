@@ -1,0 +1,18 @@
+[
+  {
+    "id": "1300000000000000800",
+    "channel_id": "4500",
+    "type": 0,
+    "author": {"id": "2001", "username": "mara", "global_name": "Mara Okafor", "discriminator": "0", "avatar": "a1b2c3"},
+    "member": {"nick": null, "roles": ["4010"]},
+    "content": "cut the branch on ~~Monday~~ Tuesday",
+    "timestamp": "2024-10-27T16:56:28.000000+00:00",
+    "edited_timestamp": null,
+    "mentions": [],
+    "mention_roles": [],
+    "mention_everyone": false,
+    "attachments": [],
+    "embeds": [],
+    "pinned": false
+  }
+]

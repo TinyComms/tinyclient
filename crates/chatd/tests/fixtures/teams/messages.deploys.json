@@ -1,0 +1,23 @@
+{
+ "messages": [
+  {
+   "id": "1760000400400",
+   "sequenceId": 400,
+   "clientmessageid": "13937443170767600",
+   "version": "1760000400400",
+   "conversationid": "19:platform0deploys@thread.tacv2",
+   "conversationLink": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/conversations/19:platform0deploys@thread.tacv2;messageid=1760000400400",
+   "type": "Message",
+   "messagetype": "RichText/Html",
+   "contenttype": "text",
+   "content": "<p>v512 is out</p>",
+   "amsreferences": [],
+   "from": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/8:orgid:00000000-0000-4000-8000-0000000000b2",
+   "imdisplayname": "Ben Okafor",
+   "composetime": "2025-10-09T09:00:00.4000000Z",
+   "originalarrivaltime": "2025-10-09T09:00:00.4000000Z",
+   "properties": {}
+  }
+ ],
+ "_metadata": {}
+}

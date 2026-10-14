@@ -1,0 +1,348 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>tinychat · polish 06 · composer</title>
+<style>
+:root{--sidebar:#121315;--canvas:#18191C;--raised:#1F2023;--overlay:#25262A;--tooltip:#2C2D32;
+--hair:rgba(255,255,255,.08);--border:rgba(255,255,255,.12);--bstrong:rgba(255,255,255,.2);--edge:rgba(255,255,255,.1);
+--hover:rgba(255,255,255,.06);--sel:rgba(255,255,255,.12);--field:rgba(255,255,255,.04);
+--text:#EDEEF0;--soft:#A8ABB3;--faint:#858993;--dis:#53565E;--accent:#2F6FEB;--atext:#8AB4FF;--asoft:rgba(47,111,235,.18);
+--awash:rgba(47,111,235,.10);--warn:#E0A63A;--danger:#F0655D;--dsoft:rgba(240,101,93,.15);--pos:#3FBF7A;
+--pop:0 0 0 1px rgba(0,0,0,.4),0 2px 6px rgba(0,0,0,.3),0 12px 32px rgba(0,0,0,.45);}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0c0c0e;color:var(--text);font:13px/18px -apple-system,BlinkMacSystemFont,sans-serif;padding:32px;display:flex;flex-direction:column;align-items:center;gap:40px}
+h1{font-size:20px;line-height:26px;font-weight:600;width:760px}
+.intro{width:760px;color:var(--soft)}
+.frame{width:760px}
+.cap{font-size:12px;line-height:16px;color:var(--soft);margin-bottom:10px}
+.cap b{color:var(--text);font-weight:600;font-size:13px;margin-right:6px}
+.win{background:var(--canvas);border:1px solid var(--hair);border-radius:10px;overflow:hidden;position:relative}
+.pad{padding:16px 20px}
+.dock{padding:0 20px 16px}
+.lbl{font-size:11px;line-height:14px;font-weight:500;color:var(--faint);margin:0 0 6px 2px}
+/* card */
+.card{background:var(--raised);border:1px solid var(--border);border-radius:10px;min-height:40px;display:flex;flex-direction:column}
+.card.focus{border-color:var(--atext);box-shadow:0 0 0 3px rgba(47,111,235,.35)}
+.card.warnb{border-color:var(--warn)}
+.row{display:flex;align-items:flex-end;padding:5px;gap:4px}
+.fieldt{flex:1;min-width:0;padding:4px 2px;font-size:14px;line-height:20px;color:var(--text)}
+.ph{color:var(--faint)}
+.caret{display:inline-block;width:2px;height:16px;background:var(--atext);vertical-align:-3px}
+.ib{width:28px;height:28px;border-radius:6px;display:flex;align-items:center;justify-content:center;flex:none;color:var(--soft)}
+.ib.on{background:var(--sel);color:var(--text)}
+.ib.hov{background:var(--hover);color:var(--text)}
+.send{width:28px;height:28px;border-radius:6px;display:flex;align-items:center;justify-content:center;flex:none;color:var(--dis);margin-left:2px}
+.send.ready{background:var(--accent);color:#fff}
+.gap2{width:0}
+svg.g{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round}
+svg.s12{width:12px;height:12px}svg.s14{width:14px;height:14px}svg.s20{width:20px;height:20px}
+.gif{font-size:8px;font-weight:700;letter-spacing:0;border:1.5px solid currentColor;border-radius:3px;width:18px;height:13px;display:flex;align-items:center;justify-content:center;line-height:1}
+.capline{display:flex;align-items:center;gap:6px;margin-top:6px;padding:0 13px;font-size:12px;line-height:16px}
+.netlabel{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--soft);margin:12px 0 6px 2px}
+.dot{width:14px;height:14px;border-radius:4px;display:inline-block}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.ann{font-size:11px;line-height:14px;color:var(--faint);margin-top:6px}
+/* messages */
+.msg{display:flex;gap:12px;padding:6px 20px}
+.av{width:36px;height:36px;border-radius:50%;flex:none}
+.who{font-weight:600;font-size:14px;line-height:20px}
+.time{font-size:11px;color:var(--faint);font-weight:500;margin-left:6px}
+.body{font-size:14px;line-height:20px}
+.pending .body,.pending .thumbs{opacity:.55}
+.thumbs{display:flex;gap:6px;margin-top:6px}
+.th{width:120px;height:84px;border-radius:8px;position:relative;overflow:hidden}
+.dim::after{content:"";position:absolute;inset:0;background:rgba(0,0,0,.45)}
+.bar{width:240px;height:4px;border-radius:2px;background:rgba(255,255,255,.1);overflow:hidden}
+.bar i{display:block;height:100%;background:var(--accent)}
+.prog{display:flex;align-items:center;gap:8px;margin-top:8px;font-size:12px;color:var(--faint);font-variant-numeric:tabular-nums}
+.ghost{font-size:12px;color:var(--soft);padding:2px 8px;border-radius:6px;background:var(--raised)}
+/* chips */
+.tray{display:flex;gap:8px;padding:8px 8px 0;overflow:hidden}
+.chip{position:relative;flex:none;height:64px;border-radius:8px}
+.img{width:64px}
+.file{width:220px;background:var(--field);border:1px solid var(--border);display:flex;align-items:center;gap:8px;padding:8px}
+.file.bad{border-color:var(--danger);background:var(--dsoft)}
+.tile{width:36px;height:36px;border-radius:6px;background:var(--sel);display:flex;align-items:center;justify-content:center;color:var(--soft);flex:none}
+.fn{font-size:13px;line-height:18px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.fs{font-size:12px;line-height:16px;color:var(--soft);white-space:nowrap}
+.x{position:absolute;top:4px;right:4px;width:20px;height:20px;border-radius:6px;background:var(--overlay);border:1px solid var(--border);display:flex;align-items:center;justify-content:center;color:var(--soft)}
+.more{right:28px}
+.tag{position:absolute;left:4px;bottom:4px;height:16px;padding:0 5px;border-radius:4px;background:rgba(0,0,0,.6);font-size:11px;line-height:16px;font-weight:500;color:#fff}
+/* popover */
+.pop{background:var(--overlay);border:1px solid var(--edge);border-radius:10px;box-shadow:var(--pop);position:absolute}
+.seg{display:flex;background:var(--hover);border-radius:6px;padding:2px;height:28px;margin:6px 10px}
+.seg span{flex:1;text-align:center;border-radius:4px;font-size:13px;line-height:24px;color:var(--soft);font-weight:500}
+.seg span.on{background:rgba(255,255,255,.14);color:var(--text)}
+.search{margin:0 10px 8px;height:28px;border-radius:6px;background:var(--field);border:1px solid var(--atext);box-shadow:0 0 0 3px rgba(47,111,235,.35);display:flex;align-items:center;gap:6px;padding:0 8px;color:var(--faint);font-size:13px}
+.strip{display:flex;gap:2px;padding:0 10px;height:32px;align-items:flex-start}
+.strip .ib{width:28px;height:28px}
+.sec{font-size:11px;line-height:24px;font-weight:500;color:var(--soft);padding:0 2px;display:flex;align-items:center;gap:6px}
+.eg{display:grid;grid-template-columns:repeat(9,36px);padding:0 10px}
+.eg span{width:36px;height:36px;display:flex;align-items:center;justify-content:center;font-size:22px;border-radius:6px}
+.eg span.k{background:var(--sel)}
+.foot{height:36px;border-top:1px solid var(--hair);display:flex;align-items:center;gap:8px;padding:0 10px;font-size:13px}
+.foot .r{margin-left:auto;font-size:12px;color:var(--soft)}
+.jr{display:flex;gap:4px;padding:0 10px;margin-bottom:4px}
+.jr>div{height:96px;border-radius:6px;position:relative}
+.star{position:absolute;top:4px;right:4px;width:24px;height:24px;border-radius:6px;background:rgba(0,0,0,.6);color:#fff;display:flex;align-items:center;justify-content:center}
+.sg{display:grid;grid-template-columns:repeat(4,80px);padding:0 10px}
+.sg span{width:80px;height:80px;display:flex;align-items:center;justify-content:center;border-radius:6px}
+.sg i{width:64px;height:64px;border-radius:50%;display:block}
+.list{width:340px;padding:4px}
+.li{height:28px;border-radius:6px;display:flex;align-items:center;gap:8px;padding:0 8px;font-size:13px}
+.li.on{background:var(--sel)}
+.li .e{font-size:18px;width:20px;text-align:center}
+.li .sp{margin-left:auto;font-size:12px;color:var(--soft)}
+.menu{width:248px;padding:4px}
+.mi{height:28px;border-radius:6px;display:flex;align-items:center;gap:8px;padding:0 8px;font-size:13px}
+.mi.on{background:var(--sel)}
+.mi .k{margin-left:auto;font-size:12px;color:var(--soft)}
+.tip{position:absolute;background:var(--tooltip);border:1px solid var(--border);border-radius:6px;padding:4px 8px;font-size:12px;line-height:16px;box-shadow:0 2px 8px rgba(0,0,0,.4);white-space:nowrap}
+.tip span{color:var(--faint)}
+.modebar{height:32px;display:flex;align-items:center;gap:6px;padding:0 4px 0 12px;border-bottom:1px solid var(--hair);font-size:12px;color:var(--soft)}
+.modebar b{color:var(--text);font-weight:600}
+.lchip{display:inline-flex;align-items:center;gap:6px;height:20px;border-radius:4px;background:var(--hover);padding:0 6px;font-size:12px;color:var(--soft)}
+.before{opacity:.95}
+</style></head><body>
+<svg width="0" height="0" style="position:absolute">
+<defs>
+<symbol id="clip" viewBox="0 0 24 24"><path d="m21.4 11.1-9.2 9.2a6 6 0 0 1-8.5-8.5l8.6-8.6a4 4 0 0 1 5.7 5.7l-8.6 8.6a2 2 0 0 1-2.9-2.9l8.5-8.5"/></symbol>
+<symbol id="smile" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2M9 9h.01M15 9h.01"/></symbol>
+<symbol id="send" viewBox="0 0 24 24"><path d="M3.7 3.5 21 12 3.7 20.5 6 12zM6 12h15"/></symbol>
+<symbol id="x" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></symbol>
+<symbol id="dots" viewBox="0 0 24 24"><circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/></symbol>
+<symbol id="filetext" viewBox="0 0 24 24"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7z"/><path d="M14 2v5h6M16 13H8M16 17H8M10 9H8"/></symbol>
+<symbol id="filevideo" viewBox="0 0 24 24"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7z"/><path d="m10 11 5 3-5 3z"/></symbol>
+<symbol id="folder" viewBox="0 0 24 24"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.7-.9l-.8-1.2A2 2 0 0 0 7.9 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2z"/></symbol>
+<symbol id="alert" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/></symbol>
+<symbol id="tri" viewBox="0 0 24 24"><path d="m21.7 18-8-14a2 2 0 0 0-3.4 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.7-3M12 9v4M12 17h.01"/></symbol>
+<symbol id="wifioff" viewBox="0 0 24 24"><path d="M12 20h.01M8.5 16.4a5 5 0 0 1 7 0M2 8.8a15 15 0 0 1 4.2-2.6M22 8.8a15 15 0 0 0-11.3-3.8M5 12.9a10 10 0 0 1 5.2-2.7M19 12.9a10 10 0 0 0-1.7-1.4M2 2l20 20"/></symbol>
+<symbol id="search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></symbol>
+<symbol id="clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></symbol>
+<symbol id="leaf" viewBox="0 0 24 24"><path d="M11 20A7 7 0 0 1 9.8 6.1C15.5 5 17 4.5 19 2c1 2 2 4.2 2 8 0 5.5-4.8 10-10 10Z"/><path d="M2 21c0-3 1.9-5.4 5.1-6"/></symbol>
+<symbol id="cup" viewBox="0 0 24 24"><path d="M17 8h1a4 4 0 1 1 0 8h-1M3 8h14v9a4 4 0 0 1-4 4H7a4 4 0 0 1-4-4ZM6 2v2M10 2v2M14 2v2"/></symbol>
+<symbol id="ball" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 2a14 14 0 0 0 0 20M2 12h20"/></symbol>
+<symbol id="car" viewBox="0 0 24 24"><path d="M19 17h2v-4l-3-5H6l-3 5v4h2"/><circle cx="7" cy="17" r="2"/><circle cx="17" cy="17" r="2"/></symbol>
+<symbol id="bulb" viewBox="0 0 24 24"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V16h8v-1.3A7 7 0 0 0 12 2"/></symbol>
+<symbol id="heart" viewBox="0 0 24 24"><path d="M19 14c1.5-1.5 3-3.2 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.8 0-3 .5-4.5 2-1.5-1.5-2.7-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4 3 5.5l7 7Z"/></symbol>
+<symbol id="flag" viewBox="0 0 24 24"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1zM4 22v-7"/></symbol>
+<symbol id="star" viewBox="0 0 24 24"><path d="m12 2 3.1 6.3 6.9 1-5 4.9 1.2 6.8L12 17.8 5.8 21l1.2-6.8-5-4.9 6.9-1z"/></symbol>
+<symbol id="belloff" viewBox="0 0 24 24"><path d="M8.7 3A6 6 0 0 1 18 8a21 21 0 0 0 .6 5M17 17H3s3-2 3-9a4.7 4.7 0 0 1 .3-1.7M10.3 21a1.9 1.9 0 0 0 3.4 0M2 2l20 20"/></symbol>
+<symbol id="reply" viewBox="0 0 24 24"><path d="M9 17 4 12l5-5M20 18v-2a4 4 0 0 0-4-4H4"/></symbol>
+<symbol id="link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7"/></symbol>
+<symbol id="info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></symbol>
+<symbol id="eyeoff" viewBox="0 0 24 24"><path d="M10.7 5.1A10.7 10.7 0 0 1 22 12a13 13 0 0 1-1.7 2.7M6.6 6.6A13.5 13.5 0 0 0 2 12a10.8 10.8 0 0 0 15.4 5.4M2 2l20 20M9.9 9.9a3 3 0 0 0 4.2 4.2"/></symbol>
+</defs></svg>
+
+<h1>Polish 06 · The composer and everything you send</h1>
+<p class="intro">Frames at 1× (pt), dark. Spec: <code>docs/design/polish/06-composer.md</code>. Gradients stand in for images, GIFs and stickers; names are invented.</p>
+
+<!-- 0 before/after -->
+<section class="frame">
+<p class="cap"><b>0 · Before and after</b>Today, a field and a send square: nothing says files, emoji or GIFs exist, and paste or drop says "Sending files isn't built yet." After (Discord): attach, field, GIF, emoji, send. All 28, one row, pad 5.</p>
+<div class="win"><div class="pad" style="padding-bottom:6px"><div class="lbl">Before (current build)</div></div>
+<div class="dock before"><div class="card"><div class="row" style="padding-left:12px"><div class="fieldt ph">Message showcase</div><div class="send"><svg class="g"><use href="#send"/></svg></div></div></div>
+<div class="capline" style="color:var(--soft)"><svg class="g s12"><use href="#info"/></svg>Sending files isn't built yet. Nothing was attached.</div></div>
+<div class="pad" style="padding-bottom:6px;border-top:1px solid var(--hair)"><div class="lbl">After</div></div>
+<div class="dock"><div class="card"><div class="row"><div class="ib"><svg class="g"><use href="#clip"/></svg></div><div class="fieldt ph">Message #showcase</div><div class="ib"><span class="gif">GIF</span></div><div class="ib"><svg class="g"><use href="#smile"/></svg></div><div class="send"><svg class="g"><use href="#send"/></svg></div></div></div></div>
+</div></section>
+
+<!-- 1 per network -->
+<section class="frame">
+<p class="cap"><b>1 · Per network, at rest</b>A control the account can't use isn't laid out: neighbors close up. No ghosts, no locks. Slack and Teams have no GIF button until their own calls are captured.</p>
+<div class="win pad">
+<div class="netlabel" style="margin-top:0"><span class="dot" style="background:#5865F2"></span>Discord: attach · GIF · emoji · send</div>
+<div class="card"><div class="row"><div class="ib"><svg class="g"><use href="#clip"/></svg></div><div class="fieldt ph">Message #trail-cams</div><div class="ib"><span class="gif">GIF</span></div><div class="ib"><svg class="g"><use href="#smile"/></svg></div><div class="send"><svg class="g"><use href="#send"/></svg></div></div></div>
+<div class="netlabel"><span class="dot" style="background:#4A154B"></span>Slack: attach · emoji · send</div>
+<div class="card"><div class="row"><div class="ib"><svg class="g"><use href="#clip"/></svg></div><div class="fieldt ph">Message #eng-incidents</div><div class="ib"><svg class="g"><use href="#smile"/></svg></div><div class="send"><svg class="g"><use href="#send"/></svg></div></div></div>
+<div class="netlabel"><span class="dot" style="background:#2AABEE"></span>Telegram: attach · GIF · emoji · send (voice replaces send while empty at P2)</div>
+<div class="card"><div class="row"><div class="ib"><svg class="g"><use href="#clip"/></svg></div><div class="fieldt ph">Message Foray carpool</div><div class="ib"><span class="gif">GIF</span></div><div class="ib"><svg class="g"><use href="#smile"/></svg></div><div class="send"><svg class="g"><use href="#send"/></svg></div></div></div>
+<div class="netlabel"><span class="dot" style="background:#5B5FC7"></span>Teams: attach · emoji · send (no importance)</div>
+<div class="card"><div class="row"><div class="ib"><svg class="g"><use href="#clip"/></svg></div><div class="fieldt ph">Message Imogen Castellanos</div><div class="ib"><svg class="g"><use href="#smile"/></svg></div><div class="send"><svg class="g"><use href="#send"/></svg></div></div></div>
+<div class="netlabel">Focused with text, hovering GIF (tooltip after 500 ms)</div>
+<div style="position:relative;padding-top:34px">
+<div class="tip" style="right:62px;top:0">GIFs <span>⇧⌘G</span></div>
+<div class="card focus"><div class="row"><div class="ib"><svg class="g"><use href="#clip"/></svg></div><div class="fieldt">Camera 2 caught the pine marten again<span class="caret"></span></div><div class="ib hov"><span class="gif">GIF</span></div><div class="ib"><svg class="g"><use href="#smile"/></svg></div><div class="send ready"><svg class="g"><use href="#send"/></svg></div></div></div></div>
+</div></section>
+
+<!-- 2 drag over -->
+<section class="frame">
+<p class="cap"><b>2 · Drag over the conversation</b>The whole pane, composer included, is the target. The frame floats over the messages (no reflow). Right: every dragged path is a folder.</p>
+<div class="grid2">
+<div class="win" style="height:300px">
+<div class="msg"><div class="av" style="background:#3c7a5a"></div><div><div class="who">Ines Marchetti<span class="time">10:31 PM</span></div><div class="body">Can you check #trail-cams before Saturday?</div></div></div>
+<div class="msg"><div class="av" style="background:#8a4f3c"></div><div><div class="who">Tomasz Brandt<span class="time">10:39 PM</span></div><div class="body">I do have the keys.</div></div></div>
+<div style="position:absolute;left:20px;right:20px;bottom:16px"><div class="card"><div class="row"><div class="ib"><svg class="g"><use href="#clip"/></svg></div><div class="fieldt ph">Message #showcase</div><div class="ib"><span class="gif">GIF</span></div><div class="ib"><svg class="g"><use href="#smile"/></svg></div><div class="send"><svg class="g"><use href="#send"/></svg></div></div></div></div>
+<div style="position:absolute;inset:8px;border:2px solid var(--accent);border-radius:10px;background:rgba(24,25,28,.6);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px">
+<div style="position:absolute;inset:0;background:var(--awash);border-radius:8px"></div>
+<svg class="g s20" style="color:var(--atext);margin-bottom:4px"><use href="#clip"/></svg>
+<div style="font-size:16px;line-height:22px;font-weight:600">Drop to attach to #showcase</div>
+<div style="font-size:13px;color:var(--soft)">Up to 10 files · 20 MB each on Discord</div></div>
+</div>
+<div class="win" style="height:300px">
+<div class="msg"><div class="av" style="background:#3c7a5a"></div><div><div class="who">Ines Marchetti<span class="time">10:31 PM</span></div><div class="body">Can you check #trail-cams before Saturday?</div></div></div>
+<div style="position:absolute;inset:8px;border:2px solid var(--danger);border-radius:10px;background:rgba(24,25,28,.6);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px">
+<div style="position:absolute;inset:0;background:var(--dsoft);border-radius:8px"></div>
+<svg class="g s20" style="color:var(--danger);margin-bottom:4px"><use href="#folder"/></svg>
+<div style="font-size:16px;line-height:22px;font-weight:600">Folders can't be sent</div>
+<div style="font-size:13px;color:var(--soft)">Zip it first.</div></div>
+</div></div></section>
+
+<!-- 3 chips -->
+<section class="frame">
+<p class="cap"><b>3 · Staged chips</b>Pasted screenshot · HEIC converted (tag JPEG; "Send original" in ⋯) · spoiler image · PDF · a video over the limit, refused before any request. Caption = the typed text. Return with a refused chip shows the caption below.</p>
+<div class="win pad">
+<div class="card focus">
+<div class="tray">
+<div class="chip img" style="background:linear-gradient(135deg,#2b3a55,#5d7aa8 60%,#c9d6ea)"><div class="x"><svg class="g s12"><use href="#x"/></svg></div></div>
+<div class="chip img" style="background:linear-gradient(160deg,#3e5a2c,#9bb36a 70%,#e6dca0)"><div class="x"><svg class="g s12"><use href="#x"/></svg></div><div class="x more"><svg class="g s12"><use href="#dots"/></svg></div><div class="tag">JPEG</div></div>
+<div class="chip img" style="background:linear-gradient(120deg,#5a2c4a,#b0607a)"><div style="position:absolute;inset:0;background:rgba(0,0,0,.45);border-radius:8px;display:flex;align-items:center;justify-content:center;color:#fff"><svg class="g"><use href="#eyeoff"/></svg></div><div class="x"><svg class="g s12"><use href="#x"/></svg></div><div class="x more"><svg class="g s12"><use href="#dots"/></svg></div><div class="tag">Spoiler</div></div>
+<div class="chip file" style="width:176px"><div class="tile"><svg class="g"><use href="#filetext"/></svg></div><div style="min-width:0"><div class="fn">Trail map…autumn.pdf</div><div class="fs">PDF · 2.4 MB</div></div><div class="x"><svg class="g s12"><use href="#x"/></svg></div></div>
+<div class="chip file bad" style="width:268px"><div class="tile" style="color:var(--danger)"><svg class="g"><use href="#filevideo"/></svg></div><div style="min-width:0"><div class="fn">marten-night.mov</div><div class="fs" style="color:var(--danger)">Too big for Discord · limit 20 MB</div></div><div class="x"><svg class="g s12"><use href="#x"/></svg></div></div>
+</div>
+<div class="row"><div class="ib"><svg class="g"><use href="#clip"/></svg></div><div class="fieldt">Last night on camera 2<span class="caret"></span></div><div class="ib"><span class="gif">GIF</span></div><div class="ib"><svg class="g"><use href="#smile"/></svg></div><div class="send ready"><svg class="g"><use href="#send"/></svg></div></div></div>
+<div class="capline" style="color:var(--danger)"><svg class="g s12"><use href="#alert"/></svg>Remove marten-night.mov to send. It is 84 MB.</div>
+<div style="display:flex;gap:24px;margin-top:14px">
+<div class="pop menu" style="position:relative;align-self:flex-start"><div class="mi"><span style="width:16px"></span>Mark as spoiler</div><div class="mi on"><span style="width:16px;color:var(--text)">✓</span>Send original (HEIC)</div></div>
+<div style="font-size:12px;color:var(--soft);line-height:18px;flex:1">⋯ on the JPEG chip (or Space on a focused chip). P1 menu style: 28 rows, check slot.<br>Telegram adds "Send as file". 11th file: not added; caption "Discord sends up to 10 files at once. 1 was not added."<br>Telegram over 10: <span style="color:var(--text)">ⓘ Sends as 2 albums</span>.</div></div>
+</div></section>
+
+<!-- 4 upload progress -->
+<section class="frame">
+<p class="cap"><b>4 · Upload on the pending row (ruling 9)</b>Return empties the composer at once; the row carries the progress. Bar moves only on Upload events. Below: the same row failed, and Return while offline.</p>
+<div class="win" style="padding-top:8px">
+<div class="msg pending"><div class="av" style="background:#6b8a3a"></div><div><div class="who">You<span class="time" style="display:inline-flex;align-items:center"><svg class="g s12"><use href="#clock"/></svg></span></div><div class="body">Last night on camera 2</div>
+<div class="thumbs"><div class="th" style="background:linear-gradient(135deg,#2b3a55,#5d7aa8 60%,#c9d6ea)"></div><div class="th dim" style="background:linear-gradient(160deg,#3e5a2c,#9bb36a 70%,#e6dca0)"></div><div class="th dim" style="background:linear-gradient(120deg,#4a3a2c,#a88a5d)"></div></div>
+<div class="prog"><div class="bar"><i style="width:57%"></i></div>Uploading 2 of 3 · 3.1 of 5.4 MB<div class="ib" style="width:20px;height:20px"><svg class="g s12"><use href="#x"/></svg></div></div></div></div>
+<div class="msg"><div class="av" style="background:#6b8a3a"></div><div><div class="who">You<span class="time">10:52 PM</span></div><div class="body" style="color:var(--soft)">Trail map for Saturday</div>
+<div style="display:flex;align-items:center;gap:6px;margin-top:4px;font-size:12px;color:var(--danger)"><svg class="g s12"><use href="#alert"/></svg>Not sent · trail-map.pdf didn't upload: connection lost.<span class="ghost" style="color:var(--atext)">Retry</span><span class="ghost">Delete</span></div></div></div>
+<div class="dock" style="padding-top:12px"><div class="card focus"><div class="row"><div class="ib"><svg class="g"><use href="#clip"/></svg></div><div class="fieldt">And the thermos<span class="caret"></span></div><div class="ib"><span class="gif">GIF</span></div><div class="ib"><svg class="g"><use href="#smile"/></svg></div><div class="send ready"><svg class="g"><use href="#send"/></svg></div></div></div>
+<div class="ann">The composer is free while the row above uploads. Offline, Return with chips:</div>
+<div class="capline" style="color:var(--text)"><svg class="g s12" style="color:var(--warn)"><use href="#wifioff"/></svg>Files need a connection. Your text and files are kept.</div></div>
+</div></section>
+
+<!-- 5 emoji picker -->
+<section class="frame">
+<p class="cap"><b>5 · Picker: Emoji (Discord)</b>352 × 400, above the card, right edges aligned, 6 gap. Tabs show only what the account has (Stickers on Discord is P2). Sentence-case labels; this server's custom emoji under its name.</p>
+<div class="win" style="height:520px">
+<div class="pop" style="right:20px;bottom:62px;width:352px;height:400px;display:flex;flex-direction:column">
+<div class="seg"><span class="on">Emoji</span><span>GIFs</span></div>
+<div class="search"><svg class="g s14"><use href="#search"/></svg>Search emoji</div>
+<div class="strip"><div class="ib on"><svg class="g"><use href="#clock"/></svg></div><div class="ib"><span style="width:16px;height:16px;border-radius:4px;background:linear-gradient(135deg,#3c7a5a,#9bd3a6)"></span></div><div class="ib"><svg class="g"><use href="#smile"/></svg></div><div class="ib"><svg class="g"><use href="#leaf"/></svg></div><div class="ib"><svg class="g"><use href="#cup"/></svg></div><div class="ib"><svg class="g"><use href="#ball"/></svg></div><div class="ib"><svg class="g"><use href="#car"/></svg></div><div class="ib"><svg class="g"><use href="#bulb"/></svg></div><div class="ib"><svg class="g"><use href="#heart"/></svg></div><div class="ib"><svg class="g"><use href="#flag"/></svg></div></div>
+<div style="flex:1;overflow:hidden;padding:0 0">
+<div class="sec" style="padding-left:12px">Frequently used</div>
+<div class="eg"><span>👍</span><span>❤️</span><span>😂</span><span class="k">🎉</span><span>🙏</span><span>👀</span><span>🔥</span><span>✅</span><span>🦡</span><span>🌲</span><span>📷</span><span>🍄</span><span>☕</span><span>🥾</span><span>🌧️</span><span>🙌</span><span>😅</span><span>🫡</span></div>
+<div class="sec" style="padding-left:12px"><span style="width:14px;height:14px;border-radius:4px;background:linear-gradient(135deg,#3c7a5a,#9bd3a6)"></span>Moss &amp; Lichen</div>
+<div class="eg"><span><i style="width:22px;height:22px;border-radius:50%;background:radial-gradient(circle at 40% 40%,#e9c46a,#a5762a)"></i></span><span><i style="width:22px;height:22px;border-radius:6px;background:linear-gradient(135deg,#2a9d8f,#a8dadc)"></i></span><span><i style="width:22px;height:22px;border-radius:50%;background:radial-gradient(circle,#9bd3a6,#2d6a4f)"></i></span><span><i style="width:22px;height:22px;border-radius:4px;background:linear-gradient(45deg,#e76f51,#f4a261)"></i></span></div>
+<div class="sec" style="padding-left:12px">Smileys &amp; people</div>
+<div class="eg"><span>😀</span><span>😃</span><span>😄</span><span>😁</span><span>😆</span><span>🥹</span><span>🤣</span><span>🙂</span><span>🙃</span></div>
+</div>
+<div class="foot"><span style="font-size:22px">🎉</span>:tada:<span class="r" style="margin-left:auto"></span><div class="ib" style="font-size:16px">👋</div></div>
+</div>
+<div style="position:absolute;left:20px;right:20px;bottom:16px"><div class="card focus"><div class="row"><div class="ib"><svg class="g"><use href="#clip"/></svg></div><div class="fieldt">Great find<span class="caret"></span></div><div class="ib"><span class="gif">GIF</span></div><div class="ib on"><svg class="g"><use href="#smile"/></svg></div><div class="send ready"><svg class="g"><use href="#send"/></svg></div></div></div></div>
+<div style="position:absolute;left:24px;top:24px;width:330px;font-size:12px;line-height:18px;color:var(--soft)">Bands: tabs 40 · search 36 · strip 32 · grid · footer 36.<br>9 × 36 cells, glyph 22, keyboard cell <span style="color:var(--text)">selected</span> (🎉).<br>Footer: hovered emoji, :name:, skin tone 28 → six swatches.<br>Slack, Teams and every reaction: no tab row; the grid gains 40.</div>
+</div></section>
+
+<!-- 6 GIFs -->
+<section class="frame">
+<p class="cap"><b>6 · Picker: GIFs (Discord)</b>Justified rows 96 high, aspect kept, no crop: still one row height, so a virtual list. Stills only; the hovered cell plays after 300 ms. Click sends at once; the typed text stays.</p>
+<div class="win" style="height:520px">
+<div class="pop" style="right:20px;bottom:62px;width:352px;height:400px;display:flex;flex-direction:column">
+<div class="seg"><span>Emoji</span><span class="on">GIFs</span></div>
+<div class="search" style="color:var(--text)"><svg class="g s14" style="color:var(--faint)"><use href="#search"/></svg>otter</div>
+<div style="flex:1;overflow:hidden">
+<div class="jr"><div style="flex:1.5;background:linear-gradient(135deg,#3d5a80,#98c1d9)"></div><div style="flex:1;background:linear-gradient(135deg,#6d597a,#b56576)"></div></div>
+<div class="jr"><div style="flex:1;background:linear-gradient(135deg,#355070,#e56b6f)"></div><div style="flex:.8;background:linear-gradient(135deg,#283618,#dda15e);outline:2px solid var(--atext);outline-offset:-2px"><div class="star"><svg class="g s14"><use href="#star"/></svg></div></div><div style="flex:1.1;background:linear-gradient(135deg,#264653,#2a9d8f)"></div></div>
+<div class="jr"><div style="flex:1.8;background:linear-gradient(135deg,#5f0f40,#fb8b24)"></div><div style="flex:.9;background:linear-gradient(135deg,#1d3557,#a8dadc)"></div></div>
+</div>
+<div class="foot" style="font-size:12px;color:var(--soft)">Searches go to Discord · via Tenor</div>
+</div>
+<div style="position:absolute;left:20px;right:20px;bottom:16px"><div class="card focus"><div class="row"><div class="ib"><svg class="g"><use href="#clip"/></svg></div><div class="fieldt">Great find<span class="caret"></span></div><div class="ib on"><span class="gif">GIF</span></div><div class="ib"><svg class="g"><use href="#smile"/></svg></div><div class="send ready"><svg class="g"><use href="#send"/></svg></div></div></div></div>
+<div style="position:absolute;left:24px;top:24px;width:330px;font-size:12px;line-height:18px;color:var(--soft)">Empty query: Favorites, then Trending.<br>Ringed cell = hovered or keyboard; it alone plays (muted, one at a time, never under Reduce Motion). Star = favorite (F).<br>While asking: "Searching Discord for “otter”…" over the old results.<br>Offline:<br>
+<span style="display:block;margin-top:8px;padding:16px;border:1px solid var(--hair);border-radius:8px;text-align:center"><svg class="g s20" style="color:var(--faint)"><use href="#wifioff"/></svg><br><span style="font-size:16px;line-height:22px;font-weight:600;color:var(--text)">GIFs need a connection</span><br>Favorites come back with Discord.</span></div>
+</div></section>
+
+<!-- 7 stickers -->
+<section class="frame">
+<p class="cap"><b>7 · Picker: Stickers (Telegram)</b>Pack strip under search; a pack loads when its thumb is clicked, never on scroll. Animated stickers show their still and never play. Click sends.</p>
+<div class="win" style="height:520px">
+<div class="pop" style="right:20px;bottom:62px;width:352px;height:400px;display:flex;flex-direction:column">
+<div class="seg"><span>Emoji</span><span>GIFs</span><span class="on">Stickers</span></div>
+<div class="search"><svg class="g s14"><use href="#search"/></svg>Search stickers</div>
+<div class="strip"><div class="ib"><svg class="g"><use href="#clock"/></svg></div><div class="ib"><svg class="g"><use href="#star"/></svg></div><div class="ib on"><i style="width:20px;height:20px;border-radius:50%;background:radial-gradient(circle,#9bd3a6,#2d6a4f)"></i></div><div class="ib"><i style="width:20px;height:20px;border-radius:50%;background:radial-gradient(circle,#f4a261,#9c4f1f)"></i></div><div class="ib"><i style="width:20px;height:20px;border-radius:50%;background:radial-gradient(circle,#a8dadc,#1d3557)"></i></div></div>
+<div style="flex:1;overflow:hidden">
+<div class="sec" style="padding-left:12px">Recent</div>
+<div class="sg"><span><i style="background:radial-gradient(circle at 40% 35%,#ffe8a3,#d4a017)"></i></span><span><i style="background:radial-gradient(circle at 40% 35%,#f8c4b4,#b5543c)"></i></span><span class="k" style="background:var(--sel)"><i style="background:radial-gradient(circle at 40% 35%,#c7f0d8,#2d6a4f)"></i></span><span><i style="background:radial-gradient(circle at 40% 35%,#d0d8ff,#4a5bb5)"></i></span></div>
+<div class="sec" style="padding-left:12px">Forest Folk · 24</div>
+<div class="sg"><span><i style="background:radial-gradient(circle at 40% 35%,#c7f0d8,#2d6a4f)"></i></span><span><i style="background:radial-gradient(circle at 40% 35%,#e9edc9,#606c38)"></i></span><span><i style="background:radial-gradient(circle at 40% 35%,#fefae0,#bc6c25)"></i></span><span><i style="background:radial-gradient(circle at 40% 35%,#ccd5ae,#283618)"></i></span></div>
+</div>
+<div class="foot"><span style="font-size:13px">🦔</span><span style="color:var(--soft);font-size:12px">Forest Folk</span></div>
+</div>
+<div style="position:absolute;left:20px;right:20px;bottom:16px"><div class="card focus"><div class="row"><div class="ib"><svg class="g"><use href="#clip"/></svg></div><div class="fieldt ph">Message Foray carpool</div><div class="ib"><span class="gif">GIF</span></div><div class="ib on"><svg class="g"><use href="#smile"/></svg></div><div class="send"><svg class="g"><use href="#send"/></svg></div></div></div></div>
+<div style="position:absolute;left:24px;top:24px;width:330px;font-size:12px;line-height:18px;color:var(--soft)">4 × 80 cells, still 72.<br>Strip: Recent, Favorites, then installed packs (scrolls sideways).<br>Footer: the sticker's emoji and pack.</div>
+</div></section>
+
+<!-- 8 near bottom -->
+<section class="frame">
+<p class="cap"><b>8 · Picker from a reaction near the window bottom</b>Fixes audit S1. Preferred below the toolbar; no room, so it flips above. At 900 × 600 it would also lack room above: the taller side wins and the height shrinks (≥ 240), the grid scrolls. 8 from every window edge.</p>
+<div class="win" style="height:470px">
+<div class="msg" style="padding-top:12px"><div class="av" style="background:#3c7a5a"></div><div><div class="who">Ines Marchetti<span class="time">10:31 PM</span></div><div class="body">Can you check #trail-cams before Saturday?</div></div></div>
+<div class="msg" style="background:var(--hover);position:absolute;left:0;right:0;bottom:74px"><div class="av" style="background:#8a4f3c"></div><div><div class="who">Tomasz Brandt<span class="time">10:39 PM</span></div><div class="body">I do have the keys. I checked twice.</div></div></div>
+<div style="position:absolute;right:16px;bottom:110px;height:30px;padding:2px;border-radius:8px;background:var(--overlay);border:1px solid var(--edge);display:flex;gap:2px"><span class="ib" style="width:26px;height:24px">👍</span><span class="ib" style="width:26px;height:24px">❤️</span><span class="ib" style="width:26px;height:24px">😂</span><span class="ib on" style="width:26px;height:24px"><svg class="g"><use href="#smile"/></svg></span><span class="ib" style="width:26px;height:24px"><svg class="g"><use href="#reply"/></svg></span></div>
+<div class="pop" style="right:16px;bottom:146px;width:352px;height:316px;display:flex;flex-direction:column">
+<div class="search" style="margin-top:10px"><svg class="g s14"><use href="#search"/></svg>Search emoji</div>
+<div class="strip"><div class="ib on"><svg class="g"><use href="#clock"/></svg></div><div class="ib"><svg class="g"><use href="#smile"/></svg></div><div class="ib"><svg class="g"><use href="#leaf"/></svg></div><div class="ib"><svg class="g"><use href="#cup"/></svg></div><div class="ib"><svg class="g"><use href="#ball"/></svg></div><div class="ib"><svg class="g"><use href="#car"/></svg></div><div class="ib"><svg class="g"><use href="#bulb"/></svg></div><div class="ib"><svg class="g"><use href="#heart"/></svg></div><div class="ib"><svg class="g"><use href="#flag"/></svg></div></div>
+<div style="flex:1;overflow:hidden"><div class="sec" style="padding-left:12px">Frequently used</div>
+<div class="eg"><span>👍</span><span>❤️</span><span>😂</span><span>🎉</span><span>🙏</span><span>👀</span><span>🔥</span><span>✅</span><span>🦡</span><span>🌲</span><span>📷</span><span>🍄</span><span>☕</span><span>🥾</span><span>🌧️</span><span>🙌</span><span>😅</span><span>🫡</span></div>
+<div class="sec" style="padding-left:12px">Smileys &amp; people</div><div class="eg"><span>😀</span><span>😃</span><span>😄</span><span>😁</span><span>😆</span><span>🥹</span><span>🤣</span><span>🙂</span><span>🙃</span></div></div>
+<div class="foot"><span style="font-size:22px">👍</span>:thumbsup:<div class="ib" style="margin-left:auto;font-size:16px">👋</div></div></div>
+<div style="position:absolute;left:20px;right:20px;bottom:16px"><div class="card"><div class="row"><div class="ib"><svg class="g"><use href="#clip"/></svg></div><div class="fieldt ph">Message #showcase</div><div class="ib"><span class="gif">GIF</span></div><div class="ib"><svg class="g"><use href="#smile"/></svg></div><div class="send"><svg class="g"><use href="#send"/></svg></div></div></div></div>
+<div style="position:absolute;left:24px;top:84px;width:300px;font-size:12px;line-height:18px;color:var(--soft)">Reaction: Emoji only, so no tab row. Toolbar keeps the trigger <span style="color:var(--text)">selected</span>.<br>Window bottom ↓ is 8 from the picker's would-be edge: flipped.</div>
+</div></section>
+
+<!-- 9 colon autocomplete -->
+<section class="frame">
+<p class="cap"><b>9 · <code>:</code> autocomplete</b>Opens after two letters, never in a link or after a digit. The one popover style: 340 wide, rows 28, glyph 20, custom emoji with their Space right-aligned.</p>
+<div class="win" style="height:330px">
+<div class="pop list" style="left:20px;bottom:62px">
+<div class="li on"><span class="e">🎉</span>:tada:</div>
+<div class="li"><span class="e">🪅</span>:piñata:</div>
+<div class="li"><span class="e"><i style="display:inline-block;width:18px;height:18px;border-radius:4px;background:linear-gradient(45deg,#e76f51,#f4a261)"></i></span>:tada_marten:<span class="sp">Moss &amp; Lichen</span></div>
+<div class="li"><span class="e"><i style="display:inline-block;width:18px;height:18px;border-radius:50%;background:radial-gradient(circle,#ffe8a3,#d4a017)"></i></span>:tadpole:<span class="sp">Moss &amp; Lichen</span></div>
+</div>
+<div style="position:absolute;left:20px;right:20px;bottom:16px"><div class="card focus"><div class="row"><div class="ib"><svg class="g"><use href="#clip"/></svg></div><div class="fieldt">We found the marten den :tad<span class="caret"></span></div><div class="ib"><span class="gif">GIF</span></div><div class="ib"><svg class="g"><use href="#smile"/></svg></div><div class="send ready"><svg class="g"><use href="#send"/></svg></div></div></div></div>
+<div style="position:absolute;left:390px;top:24px;width:340px;font-size:12px;line-height:18px;color:var(--soft)">Rank: frecency, prefix, keyword; custom emoji with the rest.<br>Return or Tab inserts. Esc closes. A space with no match closes.<br>`@` and `#` use this same popover (people rows stay 36).</div>
+</div></section>
+
+<!-- 10 large ping -->
+<section class="frame">
+<p class="cap"><b>10 · More than 25 people</b>The first Return arms; the card border turns warning and the caption says who would be notified. Return again sends; any edit or Esc disarms.</p>
+<div class="win pad">
+<div class="card warnb"><div class="row"><div class="ib"><svg class="g"><use href="#clip"/></svg></div><div class="fieldt"><span style="color:var(--atext);background:var(--asoft);border-radius:4px;padding:0 2px">@everyone</span> the creek route is on for Saturday<span class="caret"></span></div><div class="ib"><span class="gif">GIF</span></div><div class="ib"><svg class="g"><use href="#smile"/></svg></div><div class="send ready"><svg class="g"><use href="#send"/></svg></div></div></div>
+<div class="capline" style="color:var(--text)"><svg class="g s12" style="color:var(--warn)"><use href="#tri"/></svg>This notifies&nbsp;<b style="font-weight:600">1,204 people</b>&nbsp;in #general. Return again to send.</div>
+</div></section>
+
+<!-- 11 silent send -->
+<section class="frame">
+<p class="cap"><b>11 · Silent send (Discord, Telegram)</b>Learned from the send tooltip and the send menu (right-click Send). Seen afterwards as bell-off after the time. Schedule (P2, Slack and Telegram) lives in the same menu, out of the way.</p>
+<div class="win" style="height:300px">
+<div class="msg" style="padding-top:14px"><div class="av" style="background:#6b8a3a"></div><div><div class="who">You<span class="time" style="display:inline-flex;align-items:center;gap:4px">11:02 PM <svg class="g s12" style="color:var(--faint)"><use href="#belloff"/></svg></span></div><div class="body">Late-night photos are up, no rush.</div></div></div>
+<div class="tip" style="left:132px;top:64px">Sent without notification</div>
+<div class="pop menu" style="right:20px;bottom:62px"><div class="mi on">Send without notification<span class="k">⌥↩</span></div><div class="mi">Schedule message…<span class="k" style="font-size:11px">P2</span></div></div>
+<div class="tip" style="right:290px;bottom:70px">Send <span>↩</span> · Silently <span>⌥↩</span></div>
+<div class="ann" style="position:absolute;left:20px;bottom:100px;width:300px">Two moments: the tooltip on hover (500 ms), then the menu on right-click (the tooltip is gone by then). Slack shows only Schedule; Teams has no menu.</div>
+<div style="position:absolute;left:20px;right:20px;bottom:16px"><div class="card focus"><div class="row"><div class="ib"><svg class="g"><use href="#clip"/></svg></div><div class="fieldt">One more from camera 3<span class="caret"></span></div><div class="ib"><span class="gif">GIF</span></div><div class="ib"><svg class="g"><use href="#smile"/></svg></div><div class="send ready"><svg class="g"><use href="#send"/></svg></div></div></div></div>
+</div></section>
+
+<!-- 12 reply + ping + link chip -->
+<section class="frame">
+<p class="cap"><b>12 · Reply with ping toggle, files and a link (Discord)</b>Card order: mode bar, tray, input row. "@ On" mentions the author; click for "@ Off". The link chip sits on the caption line; × keeps the network from unfurling.</p>
+<div class="win pad">
+<div class="card focus">
+<div class="modebar"><svg class="g s14" style="color:var(--atext)"><use href="#reply"/></svg>Replying to <b>Ines Marchetti</b><span style="color:var(--faint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1">Can you check #trail-cams before Saturday?</span><span style="font-size:12px;color:var(--atext);font-weight:500;padding:0 6px;height:24px;line-height:24px;border-radius:6px">@ On</span><div class="ib" style="width:24px;height:24px"><svg class="g s14"><use href="#x"/></svg></div></div>
+<div class="tray"><div class="chip img" style="background:linear-gradient(135deg,#2b3a55,#5d7aa8 60%,#c9d6ea)"><div class="x"><svg class="g s12"><use href="#x"/></svg></div></div></div>
+<div class="row"><div class="ib"><svg class="g"><use href="#clip"/></svg></div><div class="fieldt">Checked. Route notes: <span style="color:var(--atext)">https://trailnotes.example/creek</span><span class="caret"></span></div><div class="ib"><span class="gif">GIF</span></div><div class="ib"><svg class="g"><use href="#smile"/></svg></div><div class="send ready"><svg class="g"><use href="#send"/></svg></div></div></div>
+<div class="capline"><span class="lchip"><svg class="g s12"><use href="#link"/></svg>Preview: trailnotes.example<svg class="g s12"><use href="#x"/></svg></span></div>
+<div class="capline" style="margin-top:10px"><span class="lchip" style="background:none;color:var(--faint);padding:0">No preview: trailnotes.example</span><span class="ghost" style="background:none;color:var(--atext)">Undo</span><span style="color:var(--faint);margin-left:8px">← after ×</span></div>
+<div class="ann" style="margin-top:12px">Edit mode: Attach and GIF are absent, chips stashed; text and captions only on all four networks.</div>
+</div></section>
+
+</body></html>

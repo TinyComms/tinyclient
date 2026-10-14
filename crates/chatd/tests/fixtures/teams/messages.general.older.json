@@ -1,0 +1,23 @@
+{
+ "messages": [
+  {
+   "id": "1759990000000",
+   "sequenceId": 0,
+   "clientmessageid": "13937360810000000",
+   "version": "1759990000000",
+   "conversationid": "19:platform0general@thread.tacv2",
+   "conversationLink": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/conversations/19:platform0general@thread.tacv2;messageid=1759990000000",
+   "type": "Message",
+   "messagetype": "RichText/Html",
+   "contenttype": "text",
+   "content": "<p>before all that</p>",
+   "amsreferences": [],
+   "from": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/8:orgid:00000000-0000-4000-8000-0000000000c3",
+   "imdisplayname": "Cy Tran",
+   "composetime": "2025-10-09T06:06:40.0000000Z",
+   "originalarrivaltime": "2025-10-09T06:06:40.0000000Z",
+   "properties": {}
+  }
+ ],
+ "_metadata": {}
+}

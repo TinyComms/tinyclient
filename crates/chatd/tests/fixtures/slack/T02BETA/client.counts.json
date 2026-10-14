@@ -1,0 +1,5 @@
+{"ok": true,
+ "channels": [{"id": "C0SIDE", "last_read": "1760000010.000010", "latest": "1760000010.000010", "updated": "1760000010.000010", "history_invalid": "0", "mention_count": 0, "has_unreads": false}],
+ "mpims": [], "ims": [],
+ "threads": {"has_unreads": false, "mention_count": 0},
+ "channel_badges": {"channels": 0, "dms": 0, "app_dms": 0, "thread_mentions": 0, "thread_unreads": 0}}

@@ -1,0 +1,36 @@
+[package]
+name = "mediad"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+protocol.workspace = true
+serde_json.workspace = true
+# The voice gateway. Same versions and TLS (Security.framework) as chatd, so nothing is built twice.
+tungstenite = { version = "0.30", default-features = false, features = ["handshake", "native-tls"] }
+# The same TLS tungstenite uses, named here only to hand it one more certificate to trust when a
+# test's fake voice server speaks `wss` (see `gateway::connector`).
+native-tls = "0.2"
+# Discord's end-to-end encryption (DAVE, MLS on OpenMLS). Pinned: Discord moves the floor, and a
+# new version must be read before it is taken.
+davey = "=0.1.5"
+# Transport encryption of RTP. Both share `aead`, `aes` and `ghash` with davey.
+aes-gcm = "0.10"
+chacha20poly1305 = "0.10"
+# libopus 1.3.1 transpiled to Rust: no C toolchain, cmake or system library needed.
+unsafe-libopus = "=0.2.0"
+# CoreAudio capture and playback, and device enumeration.
+cpal = "0.18"
+rand = "0.8"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# AVCaptureDevice's microphone authorization, which CoreAudio does not report.
+objc2 = "0.6"
+
+[dev-dependencies]
+# The fake voice server acts as Discord's MLS external sender. Same version davey links.
+openmls = { version = "0.8.1", features = ["js"] }
+openmls_basic_credential = "0.5.0"
+openmls_rust_crypto = "0.5.1"

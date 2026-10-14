@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: swatinem/rust-cache@v2
+      - name: Test (no GUI)
+        run: cargo test --workspace
+      - name: Build release
+        env:
+          TINYCHAT_TELEGRAM_API_ID: ${{ secrets.TINYCHAT_TELEGRAM_API_ID }}
+          TINYCHAT_TELEGRAM_API_HASH: ${{ secrets.TINYCHAT_TELEGRAM_API_HASH }}
+        run: |
+          cargo build --release \
+            -p tinychat --features tinychat/gui \
+            -p chatd -p mediad -p login
+      - name: Bundle tinychat.app
+        run: packaging/bundle.sh --no-build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tinychat-macos
+          path: target/release/tinychat.app
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential pkg-config libssl-dev libgtk-3-dev libwebkit2gtk-4.1-dev \
+            libsoup-3.0-dev libvulkan-dev libwayland-dev libxkbcommon-dev libx11-dev \
+            libxcb1-dev libfontconfig1-dev
+      - uses: swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --workspace
+      - name: Build release
+        env:
+          TINYCHAT_TELEGRAM_API_ID: ${{ secrets.TINYCHAT_TELEGRAM_API_ID }}
+          TINYCHAT_TELEGRAM_API_HASH: ${{ secrets.TINYCHAT_TELEGRAM_API_HASH }}
+        run: |
+          cargo build --release \
+            -p tinychat --features tinychat/gui \
+            -p chatd -p mediad -p login
+      - name: Pack binaries
+        run: |
+          tar -czf tinychat-linux-x86_64.tar.gz \
+            -C target/release tinychat chatd mediad tinychat-login
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tinychat-linux-x86_64
+          path: tinychat-linux-x86_64.tar.gz
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --workspace
+      - name: Build release
+        env:
+          TINYCHAT_TELEGRAM_API_ID: ${{ secrets.TINYCHAT_TELEGRAM_API_ID }}
+          TINYCHAT_TELEGRAM_API_HASH: ${{ secrets.TINYCHAT_TELEGRAM_API_HASH }}
+        run: |
+          cargo build --release `
+            -p tinychat --features tinychat/gui `
+            -p chatd -p mediad -p login
+      - name: Pack binaries
+        shell: pwsh
+        run: |
+          Compress-Archive -Path `
+            target/release/tinychat.exe, `
+            target/release/chatd.exe, `
+            target/release/mediad.exe, `
+            target/release/tinychat-login.exe `
+            -DestinationPath tinychat-windows-x86_64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tinychat-windows-x86_64
+          path: tinychat-windows-x86_64.zip

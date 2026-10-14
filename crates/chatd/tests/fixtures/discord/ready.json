@@ -1,0 +1,177 @@
+{
+  "v": 9,
+  "user": {
+    "id": "1000",
+    "username": "justin",
+    "global_name": "Justin",
+    "discriminator": "0",
+    "avatar": "me0hash",
+    "email": "not-used@example.com",
+    "verified": true,
+    "mfa_enabled": true,
+    "premium_type": 0
+  },
+  "session_id": "session-one",
+  "session_type": "normal",
+  "resume_gateway_url": "{{GATEWAY}}",
+  "analytics_token": "ignored",
+  "country_code": "US",
+  "users": [
+    {"id": "2001", "username": "mara", "global_name": "Mara Okafor", "discriminator": "0", "avatar": "a1b2c3"},
+    {"id": "2002", "username": "dev", "global_name": "Dev Patel", "discriminator": "0", "avatar": null},
+    {"id": "2003", "username": "asker", "global_name": null, "discriminator": "0", "avatar": null},
+    {"id": "2004", "username": "asked", "global_name": "Asked Person", "discriminator": "0", "avatar": null},
+    {"id": "2005", "username": "blockedone", "global_name": null, "discriminator": "0", "avatar": null},
+    {"id": "2006", "username": "sam", "global_name": "Sam Whitlock", "discriminator": "0", "avatar": "s4m", "bot": false}
+  ],
+  "relationships": [
+    {"id": "2001", "type": 1, "nickname": "Mara O", "user_id": "2001", "since": "2024-01-05T10:00:00+00:00"},
+    {"id": "2002", "type": 1, "nickname": null, "user_id": "2002"},
+    {"id": "2003", "type": 3, "nickname": null, "user_id": "2003"},
+    {"id": "2004", "type": 4, "nickname": null, "user_id": "2004"},
+    {"id": "2005", "type": 2, "nickname": null, "user_id": "2005"}
+  ],
+  "private_channels": [
+    {"id": "3001", "type": 1, "recipient_ids": ["2001"], "last_message_id": "1300000010000000010", "flags": 0},
+    {"id": "3002", "type": 1, "recipient_ids": ["2006"], "last_message_id": "1300000000000000020", "flags": 0},
+    {"id": "3003", "type": 3, "recipient_ids": ["2001", "2002"], "name": "Trip", "icon": null, "owner_id": "1000", "last_message_id": "1300000000000000030"},
+    {"id": "3004", "type": 1, "recipient_ids": ["2002"], "last_message_id": "1300000000000000040", "flags": 0}
+  ],
+  "read_state": {
+    "version": 812,
+    "partial": false,
+    "entries": [
+      {"id": "3001", "last_message_id": "1300000000000000005", "mention_count": 2, "last_pin_timestamp": "1970-01-01T00:00:00+00:00", "flags": 0},
+      {"id": "3002", "last_message_id": "1300000000000000020", "mention_count": 0, "flags": 0},
+      {"id": "3003", "last_message_id": "1300000000000000030", "mention_count": 0, "flags": 0},
+      {"id": "3004", "last_message_id": "1300000000000000035", "mention_count": 1, "flags": 0},
+      {"id": "4101", "last_message_id": "1300000000000000090", "mention_count": 1, "flags": 1},
+      {"id": "4102", "last_message_id": "1300000000000000200", "mention_count": 0, "flags": 1},
+      {"id": "4104", "last_message_id": "1300000000000000250", "mention_count": 0, "flags": 1},
+      {"id": "4105", "last_message_id": "1300000000000000350", "mention_count": 0, "flags": 1},
+      {"id": "5001", "last_message_id": 0, "mention_count": 0, "flags": 1},
+      {"id": "1000", "read_state_type": 1, "last_acked_id": "55", "badge_count": 3}
+    ]
+  },
+  "user_guild_settings": {
+    "version": 44,
+    "partial": false,
+    "entries": [
+      {
+        "guild_id": "4000",
+        "muted": false,
+        "mute_config": null,
+        "suppress_everyone": true,
+        "suppress_roles": false,
+        "message_notifications": 1,
+        "mobile_push": true,
+        "flags": 0,
+        "channel_overrides": [
+          {"channel_id": "4105", "muted": true, "mute_config": {"end_time": null, "selected_time_window": -1}, "message_notifications": 3, "collapsed": false, "flags": 0}
+        ]
+      },
+      {
+        "guild_id": "5000",
+        "muted": true,
+        "mute_config": {"end_time": null, "selected_time_window": -1},
+        "suppress_everyone": false,
+        "suppress_roles": false,
+        "message_notifications": 1,
+        "channel_overrides": []
+      },
+      {
+        "guild_id": null,
+        "muted": false,
+        "suppress_everyone": false,
+        "suppress_roles": false,
+        "channel_overrides": [
+          {"channel_id": "3004", "muted": true, "mute_config": null, "message_notifications": 3, "collapsed": false}
+        ]
+      }
+    ]
+  },
+  "user_settings_proto": "CgIIAXIYCgoKCIgTAAAAAAAACgoKCKAPAAAAAAAA",
+  "merged_members": [
+    [{"user_id": "1000", "roles": ["4010"], "nick": "jscroggins", "joined_at": "2023-03-01T12:00:00+00:00", "flags": 0}],
+    [{"user_id": "1000", "roles": [], "nick": null, "joined_at": "2024-06-01T12:00:00+00:00", "flags": 0}]
+  ],
+  "guilds": [
+    {
+      "id": "4000",
+      "version": 1700000000000,
+      "data_mode": "full",
+      "joined_at": "2023-03-01T12:00:00+00:00",
+      "large": false,
+      "lazy": true,
+      "member_count": 312,
+      "premium_subscription_count": 2,
+      "properties": {
+        "id": "4000",
+        "name": "Rustaceans",
+        "icon": "gu1ldicon",
+        "owner_id": "9999",
+        "description": null,
+        "features": ["COMMUNITY"]
+      },
+      "roles": [
+        {"id": "4000", "name": "@everyone", "permissions": "3072", "position": 0, "color": 0},
+        {"id": "4010", "name": "mods", "permissions": "0", "position": 2, "color": 15105570},
+        {"id": "4011", "name": "core", "permissions": "0", "position": 3, "color": 0}
+      ],
+      "emojis": [{"id": "7001", "name": "ferris", "animated": false, "available": true}],
+      "stickers": [],
+      "stage_instances": [],
+      "guild_scheduled_events": [],
+      "channels": [
+        {"id": "4200", "type": 4, "name": "Voice", "position": 1, "permission_overwrites": []},
+        {"id": "4100", "type": 4, "name": "Text", "position": 0, "permission_overwrites": []},
+        {"id": "4300", "type": 4, "name": "Core team", "position": 2, "permission_overwrites": []},
+        {"id": "4102", "type": 5, "name": "announcements", "position": 1, "parent_id": "4100", "last_message_id": "1300000000000000200", "permission_overwrites": []},
+        {"id": "4101", "type": 0, "name": "general", "position": 0, "parent_id": "4100", "last_message_id": "1300000000000000100", "topic": "anything", "rate_limit_per_user": 0, "permission_overwrites": []},
+        {"id": "4103", "type": 0, "name": "staff", "position": 2, "parent_id": "4100", "last_message_id": "1300000000000000500", "permission_overwrites": [
+          {"id": "4000", "type": 0, "allow": "0", "deny": "1024"},
+          {"id": "4011", "type": 0, "allow": "1024", "deny": "0"}
+        ]},
+        {"id": "4104", "type": 0, "name": "mods-only", "position": 3, "parent_id": "4100", "last_message_id": "1300000000000000300", "permission_overwrites": [
+          {"id": "4000", "type": 0, "allow": "0", "deny": "1024"},
+          {"id": "4010", "type": 0, "allow": "1024", "deny": "0"}
+        ]},
+        {"id": "4106", "type": 15, "name": "help", "position": 4, "parent_id": "4100", "last_message_id": "1300000000000000600", "permission_overwrites": []},
+        {"id": "4201", "type": 2, "name": "Lounge", "position": 0, "parent_id": "4200", "bitrate": 64000, "user_limit": 0, "permission_overwrites": []},
+        {"id": "4105", "type": 0, "name": "rules", "position": 0, "parent_id": null, "last_message_id": "1300000000000000400", "permission_overwrites": []},
+        {"id": "4301", "type": 0, "name": "roadmap", "position": 5, "parent_id": "4300", "last_message_id": "1300000000000000700", "permission_overwrites": [
+          {"id": "4000", "type": 0, "allow": "0", "deny": "1024"},
+          {"id": "1234", "type": 1, "allow": "1024", "deny": "0"}
+        ]}
+      ],
+      "threads": [
+        {"id": "4500", "type": 11, "name": "release plan", "parent_id": "4101", "owner_id": "2001", "last_message_id": "1300000000000000800", "message_count": 4, "member_count": 3,
+         "thread_metadata": {"archived": false, "auto_archive_duration": 4320, "archive_timestamp": "2024-10-20T00:00:00+00:00", "locked": false},
+         "member": {"flags": 1, "join_timestamp": "2024-10-20T00:00:00+00:00", "muted": false}}
+      ]
+    },
+    {
+      "id": "5000",
+      "name": "Zed",
+      "icon": null,
+      "owner_id": "1000",
+      "joined_at": "2024-06-01T12:00:00+00:00",
+      "member_count": 4,
+      "roles": [
+        {"id": "5000", "name": "@everyone", "permissions": "0", "position": 0}
+      ],
+      "channels": [
+        {"id": "5001", "type": 0, "name": "general", "position": 0, "last_message_id": "1300000000000000900", "permission_overwrites": [
+          {"id": "5000", "type": 0, "allow": "0", "deny": "1024"}
+        ]}
+      ],
+      "threads": []
+    }
+  ],
+  "sessions": [{"session_id": "session-one", "status": "online", "activities": [], "client_info": {"client": "web", "os": "other", "version": 0}}],
+  "connected_accounts": [],
+  "experiments": [],
+  "guild_experiments": [],
+  "notes": {},
+  "tutorial": null
+}

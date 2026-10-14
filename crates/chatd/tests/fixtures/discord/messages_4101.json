@@ -1,0 +1,67 @@
+[
+  {
+    "id": "1300000000000000100",
+    "channel_id": "4101",
+    "type": 0,
+    "author": {"id": "2006", "username": "sam", "global_name": "Sam Whitlock", "discriminator": "0", "avatar": "s4m"},
+    "member": {"nick": "sam (infra)", "roles": ["4011"], "joined_at": "2023-04-01T00:00:00+00:00"},
+    "content": "<@&4010> the plan is in <#4102>, starts <t:1730000000:d>",
+    "timestamp": "2024-10-27T16:53:41.000000+00:00",
+    "edited_timestamp": "2024-10-27T16:54:00.000000+00:00",
+    "mentions": [],
+    "mention_roles": ["4010"],
+    "mention_everyone": false,
+    "attachments": [],
+    "embeds": [],
+    "pinned": false,
+    "thread": {
+      "id": "4500",
+      "type": 11,
+      "name": "release plan",
+      "parent_id": "4101",
+      "guild_id": "4000",
+      "last_message_id": "1300000000000000800",
+      "message_count": 4,
+      "member_count": 3,
+      "thread_metadata": {"archived": false, "auto_archive_duration": 4320, "locked": false}
+    }
+  },
+  {
+    "id": "1300000000000000095",
+    "channel_id": "4101",
+    "type": 7,
+    "author": {"id": "2002", "username": "dev", "global_name": "Dev Patel", "discriminator": "0", "avatar": null},
+    "content": "",
+    "timestamp": "2024-10-27T16:53:40.000000+00:00",
+    "edited_timestamp": null,
+    "mentions": [],
+    "mention_roles": [],
+    "attachments": [],
+    "embeds": [],
+    "pinned": false
+  },
+  {
+    "id": "1300000000000000094",
+    "channel_id": "4101",
+    "type": 0,
+    "author": {"id": "6001", "username": "CI", "discriminator": "0000", "avatar": null, "bot": true},
+    "webhook_id": "6001",
+    "content": "",
+    "timestamp": "2024-10-27T16:53:39.000000+00:00",
+    "edited_timestamp": null,
+    "mentions": [],
+    "mention_roles": [],
+    "attachments": [],
+    "embeds": [
+      {
+        "type": "rich",
+        "title": "Build #812 passed",
+        "description": "main at 4f2a9c1",
+        "color": 3066993,
+        "fields": [{"name": "Duration", "value": "3m 12s", "inline": true}],
+        "image": {"url": "https://ci.example/badge.png"}
+      }
+    ],
+    "pinned": false
+  }
+]

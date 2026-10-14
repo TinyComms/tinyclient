@@ -1,0 +1,460 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>tinychat polish 05: profile and info pane</title><style>
+:root{--sidebar:#121315;--canvas:#18191c;--raised:#1f2023;--overlay:#25262a;--hair:rgba(255,255,255,.08);--border:rgba(255,255,255,.12);--bstrong:rgba(255,255,255,.2);--hover:rgba(255,255,255,.06);--sel:rgba(255,255,255,.12);--text:#edeef0;--soft:#a8abb3;--faint:#858993;--accent:#2f6feb;--at:#8ab4ff;--pos:#3fbf7a;--warn:#e0a63a;--danger:#f0655d;--dfill:#d13f3f;--dsoft:rgba(240,101,93,.15);--ring:var(--sidebar)}
+*{box-sizing:border-box}
+body{margin:0;background:#0b0b0d;color:var(--text);font:13px/18px -apple-system,BlinkMacSystemFont,sans-serif;-webkit-font-smoothing:antialiased;padding:40px 40px 80px}
+h1{font:600 20px/26px -apple-system,system-ui,sans-serif;margin:0 0 6px}.lede{color:var(--soft);max-width:900px;margin:0 0 40px}
+h2{font:600 16px/22px -apple-system,system-ui,sans-serif;margin:0 0 4px}h2 b{color:var(--at);font-weight:600;margin-right:8px}
+.cap{color:var(--soft);font-size:12px;line-height:16px;max-width:680px;margin:0 0 14px}
+.row{display:flex;gap:40px;flex-wrap:wrap;align-items:flex-start;margin-bottom:56px}
+.fig{flex:none}.fig>.note{color:var(--faint);font-size:12px;line-height:16px;margin-top:10px;max-width:680px}
+.win{width:max-content;display:flex;border-radius:10px;overflow:hidden;border:1px solid rgba(255,255,255,.1);box-shadow:0 20px 60px rgba(0,0,0,.5);background:var(--canvas);position:relative;align-items:stretch}
+svg.i{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:2.25;stroke-linecap:round;stroke-linejoin:round;flex:none;display:block}
+svg.i14{width:14px;height:14px;stroke-width:2.5}svg.i12{width:12px;height:12px;stroke-width:2.5}
+svg.n{width:16px;height:16px;flex:none;display:block}svg.n14{width:14px;height:14px}
+/* conversation slice */
+.conv{width:380px;background:var(--canvas);display:flex;flex-direction:column;flex:none}
+.cstrip{height:52px;border-bottom:1px solid var(--hair);display:flex;align-items:center;padding:0 12px 0 16px;gap:8px;flex:none}
+.cstrip .tt{flex:1;min-width:0}.cstrip .t1{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:flex;gap:6px;align-items:center}.cstrip .t2{font-size:12px;line-height:16px;color:var(--faint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ib{width:28px;height:28px;border-radius:6px;display:flex;align-items:center;justify-content:center;color:var(--soft);flex:none}.ib.on{background:var(--sel);color:var(--text)}
+.msgs{flex:1;padding:12px 16px 0;display:flex;flex-direction:column;justify-content:flex-end}
+.m{display:flex;gap:12px;margin-top:12px}.m .a{width:36px;height:36px;border-radius:50%;flex:none;margin-top:2px}.m .who{font:600 14px/20px -apple-system,system-ui,sans-serif}.m .who span{font:500 11px/14px -apple-system,system-ui,sans-serif;color:var(--faint);margin-left:6px}.m .tx{font-size:14px;line-height:20px}
+.comp{margin:12px 16px 16px;height:36px;border:1px solid var(--border);border-radius:10px;color:var(--faint);display:flex;align-items:center;padding:0 12px;flex:none}
+/* pane */
+.pane{width:300px;background:var(--sidebar);border-left:1px solid var(--hair);flex:none;display:flex;flex-direction:column}
+.pstrip{height:52px;border-bottom:1px solid var(--hair);display:flex;align-items:center;padding:0 12px 0 16px;gap:8px;flex:none}
+.pstrip .t{font:600 16px/22px -apple-system,system-ui,sans-serif;flex:1}
+.crumb{height:28px;display:flex;align-items:center;gap:2px;color:var(--soft);font-weight:500;margin-left:-8px;padding:0 8px 0 4px;border-radius:6px}
+.pb{padding:0 16px 16px;position:relative}
+.head{position:relative;margin:0 -16px;padding:16px 16px 0}
+.band{position:absolute;left:0;right:0;top:0;height:48px}
+.av{position:relative;border-radius:50%;flex:none}
+.av64{width:64px;height:64px;box-shadow:0 0 0 1px rgba(255,255,255,.06)}
+.ini{display:flex;align-items:center;justify-content:center;font-weight:600}
+.dot{position:absolute;right:-2px;bottom:-2px;width:18px;height:18px;border-radius:50%;background:var(--ring);display:flex;align-items:center;justify-content:center}
+.dot i,.g{display:block;width:14px;height:14px;border-radius:50%;position:relative;overflow:hidden}
+.g{display:inline-block;width:10px;height:10px;margin-right:6px;vertical-align:-1px}
+.on{background:var(--pos)}.idle{background:var(--warn)}.idle::after{content:"";position:absolute;width:62%;height:62%;border-radius:50%;background:var(--ring);left:-8%;top:-8%}
+.dnd{background:var(--dfill)}.dnd::after{content:"";position:absolute;left:20%;width:60%;top:calc(50% - 1px);height:2px;background:var(--ring)}
+.busy{background:var(--dfill)}.off{border:2px solid var(--faint);background:var(--ring)}
+.name{margin-top:12px;font:600 16px/22px -apple-system,system-ui,sans-serif;display:flex;align-items:center;gap:6px;white-space:nowrap}
+.tag{height:16px;padding:0 5px;border-radius:4px;font:500 11px/16px -apple-system,system-ui,sans-serif;background:var(--sel);color:var(--soft)}.tag.bad{background:var(--dsoft);color:var(--danger)}
+.l3{color:var(--soft)}.pres{color:var(--text)}.pres .s{color:var(--soft)}.pres .u{color:var(--faint)}
+.acts{display:flex;gap:8px;margin-top:16px}
+.btn{height:28px;border-radius:6px;font:500 13px/18px -apple-system,system-ui,sans-serif;display:flex;align-items:center;justify-content:center;gap:6px;padding:0 12px 0 10px;white-space:nowrap;flex:none}
+.btn.pri{background:var(--accent);color:#fff}.btn.sec{background:var(--hover);border:1px solid var(--border)}.btn.gh{color:var(--soft)}.btn.dg{background:var(--dsoft);color:var(--danger)}.btn.sm{height:24px;padding:0 8px;font-size:12px}.btn.f{flex:1}.btn .x{color:var(--faint)}
+.btn.dis{background:var(--hover);color:#53565e;border:1px solid transparent}
+.r28{height:28px;display:flex;align-items:center;justify-content:space-between;margin-top:12px}
+.sw{width:32px;height:18px;border-radius:9px;background:var(--accent);position:relative}.sw::after{content:"";position:absolute;width:14px;height:14px;border-radius:50%;background:#fff;top:2px;right:2px}.sw.offsw{background:rgba(255,255,255,.16)}.sw.offsw::after{right:auto;left:2px}
+.seg{height:28px;padding:2px;border-radius:6px;background:var(--hover);display:flex}.seg span{height:24px;padding:0 8px;border-radius:4px;display:flex;align-items:center;font-weight:500;color:var(--soft);font-size:12px}.seg span.sel{background:rgba(255,255,255,.14);color:var(--text)}
+.ban{margin-top:12px;min-height:32px;background:var(--raised);border:1px solid var(--hair);border-radius:6px;display:flex;gap:8px;align-items:center;padding:6px 8px}.ban .w{flex:1;min-width:0}.ban .w2{font-size:12px;line-height:16px;color:var(--soft)}
+.hr{height:1px;background:var(--hair);margin:16px -16px}
+.sh{height:28px;display:flex;align-items:flex-end;padding-bottom:8px;font:500 11px/14px -apple-system,system-ui,sans-serif;color:var(--faint)}.sh.first{height:20px}
+.fact{min-height:28px;display:flex;gap:8px;align-items:flex-start;padding:5px 0;color:var(--text)}.fact svg{margin-top:1px;color:var(--soft)}.fact .v{flex:1}.fact .v .s{color:var(--soft)}
+.fact.hv{background:var(--hover);margin:0 -8px;padding:5px 8px;border-radius:6px}
+.chips{display:flex;flex-wrap:wrap;gap:4px;margin-top:6px}.chip{height:20px;padding:0 6px;border-radius:4px;background:var(--hover);display:inline-flex;gap:5px;align-items:center;font-size:12px;line-height:16px;color:var(--soft)}.chip i{width:8px;height:8px;border-radius:50%;display:block}
+.place{height:28px;display:flex;align-items:center;gap:8px;margin:0 -8px;padding:0 8px;border-radius:6px}.sq{border-radius:25%;flex:none}.sq20{width:20px;height:20px;border-radius:5px}.place .x{margin-left:auto;color:var(--faint)}
+.more{color:var(--at);font-weight:500}
+.tabs{display:flex;gap:16px;height:32px;border-bottom:1px solid var(--hair);margin:0 -16px;padding:0 16px}.tab{display:flex;align-items:center;gap:4px;font-weight:500;color:var(--soft);position:relative}.tab.sel{color:var(--text)}.tab.sel::after{content:"";position:absolute;left:0;right:0;bottom:-1px;height:2px;background:var(--text)}.tab .c{font:500 11px/14px -apple-system,system-ui,sans-serif;color:var(--faint);font-variant-numeric:tabular-nums}
+.src{font-size:12px;line-height:16px;color:var(--faint);margin:8px 0}
+.grid{display:grid;grid-template-columns:repeat(3,88px);gap:2px;border-radius:8px;overflow:hidden}.tile{height:88px;position:relative}.dur{position:absolute;left:4px;bottom:4px;height:16px;padding:0 4px;border-radius:4px;background:rgba(0,0,0,.6);font:500 11px/16px -apple-system,system-ui,sans-serif}
+.fr{height:48px;display:flex;align-items:center;gap:10px}.ft{width:32px;height:32px;border-radius:6px;background:var(--raised);display:flex;align-items:center;justify-content:center;font:600 11px/14px -apple-system,system-ui,sans-serif;color:var(--soft);flex:none}.fr .w{min-width:0;flex:1}.fr .w div{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.fr .w .s{font-size:12px;line-height:16px;color:var(--soft)}
+.foot{font-size:12px;line-height:16px;color:var(--faint);margin-top:16px}
+.openin{height:28px;display:flex;align-items:center;gap:8px;color:var(--soft);font-weight:500;margin:8px -8px 0;padding:0 8px;border-radius:6px}.openin svg.i{color:var(--faint)}
+.mrow{height:36px;display:flex;align-items:center;gap:8px;margin:0 -8px;padding:0 8px;border-radius:6px}.mrow .ctx{font-size:12px;color:var(--faint)}
+.av24{width:24px;height:24px}.av20{width:20px;height:20px}
+.faces{display:flex}.faces .av{width:20px;height:20px;box-shadow:0 0 0 2px var(--ring)}.faces .av+.av{margin-left:-6px}
+.sk{background:var(--hover);border-radius:4px;height:10px}.sk8{height:8px}
+/* overlays */
+.ovl{position:absolute;background:var(--overlay);border:1px solid rgba(255,255,255,.1);border-radius:10px;box-shadow:0 0 0 1px rgba(0,0,0,.4),0 2px 6px rgba(0,0,0,.3),0 12px 32px rgba(0,0,0,.45);--ring:var(--overlay)}
+.menu{padding:4px;width:220px}.mi{height:28px;display:flex;align-items:center;gap:8px;padding:0 8px;border-radius:6px}.mi svg{color:var(--soft)}.mi.hl{background:var(--sel)}.mi.red{color:var(--danger)}.mi.red svg{color:var(--danger)}.mi .k{margin-left:auto;font-size:12px;color:var(--soft)}.msep{height:1px;background:var(--hair);margin:4px 0}
+.card{width:300px;overflow:hidden}.card .pb{padding-bottom:0}
+.cardfoot{height:40px;border-top:1px solid var(--hair);margin:16px -16px 0;padding:0 8px 0 8px;display:flex;align-items:center;justify-content:space-between}
+.modal{width:360px;padding:20px;border-radius:12px;background:var(--overlay);border:1px solid rgba(255,255,255,.1);box-shadow:0 0 0 1px rgba(0,0,0,.4),0 4px 12px rgba(0,0,0,.35),0 24px 64px rgba(0,0,0,.55)}
+.ann{position:absolute;font:500 11px/14px -apple-system,system-ui,sans-serif;color:#ffd479;white-space:nowrap}.ann::before{content:"";position:absolute}
+.lbl{font:500 11px/14px -apple-system,system-ui,sans-serif;color:var(--faint);margin:0 0 8px}
+.col{display:flex;flex-direction:column}
+/* photo stand-ins */
+.p-juno{background:radial-gradient(circle at 50% 38%,#f1c7a3 0 22%,transparent 23%),radial-gradient(ellipse at 50% 100%,#2f7d74 0 45%,transparent 46%),linear-gradient(160deg,#5a3d2e,#2a1d18)}
+.p-tess{background:radial-gradient(circle at 50% 40%,#8a5a3c 0 22%,transparent 23%),radial-gradient(ellipse at 50% 100%,#c8c2b6 0 45%,transparent 46%),linear-gradient(200deg,#6d7f96,#2f3a4a)}
+.p-nadia{background:radial-gradient(circle at 50% 38%,#e9c2a8 0 21%,transparent 22%),radial-gradient(ellipse at 50% 100%,#8c3b4f 0 45%,transparent 46%),linear-gradient(170deg,#e4b36a,#9c6a2f)}
+.p-omar{background:radial-gradient(circle at 50% 40%,#b07a55 0 21%,transparent 22%),radial-gradient(ellipse at 50% 100%,#2c3e66 0 46%,transparent 47%),linear-gradient(190deg,#9fb7c9,#5e7487)}
+.p-a{background:linear-gradient(135deg,#557a5b,#2b4030)}.p-b{background:linear-gradient(135deg,#7b5a8c,#3d2a48)}.p-c{background:linear-gradient(135deg,#a0704a,#4a3020)}.p-d{background:linear-gradient(135deg,#4a6d93,#22354d)}.p-e{background:linear-gradient(135deg,#8c4a4a,#3e2020)}
+.s-moss{background:linear-gradient(135deg,#4f7a3a,#24391c)}.s-tile{background:linear-gradient(135deg,#c97a40,#6b3a1a)}.s-night{background:linear-gradient(135deg,#2d3a6b,#121a38)}.s-gpui{background:linear-gradient(135deg,#777,#333)}
+.bot{background:linear-gradient(135deg,#c9b458,#7d6d24)}
+.m1{background:linear-gradient(160deg,#4f6f52 0,#a9bf8a 60%,#e8e2c8 100%)}.m2{background:radial-gradient(circle at 30% 70%,#d8a24a 0 18%,transparent 19%),linear-gradient(180deg,#26405e,#0f1a28)}.m3{background:linear-gradient(200deg,#6c4a3a,#c7926b)}.m4{background:linear-gradient(120deg,#30553a,#86a96a,#d9d39b)}.m5{background:radial-gradient(circle at 60% 40%,#f2efe6 0 14%,transparent 15%),linear-gradient(160deg,#3d3f55,#16171f)}.m6{background:linear-gradient(100deg,#8d6b49,#cfa77a 50%,#5e7a4d)}
+</style></head><body>
+<svg width="0" height="0" style="position:absolute"><defs>
+<symbol id="n-discord" viewBox="0.02 57.8 511.92 396.3"><path d="M433.7 91a416.5 416.5 0 0 0-105.6-33.2c-4.6 8.2-9.9 19.3-13.5 28.1-39.4-5.9-78.4-5.9-117.1 0-3.7-8.8-9.1-19.9-13.7-28.1-37.1 6.4-72.6 17.7-105.7 33.3-66.8 101-85 199.5-75.9 296.6 44.3 33.1 87.3 53.2 129.6 66.4 10.4-14.4 19.7-29.6 27.7-45.7-15.3-5.8-29.9-13-43.7-21.3 3.7-2.7 7.2-5.6 10.7-8.5 84.2 39.4 175.8 39.4 259 0 3.5 2.9 7.1 5.8 10.7 8.5-13.9 8.3-28.5 15.5-43.8 21.3 8 16 17.3 31.3 27.7 45.7 42.3-13.2 85.3-33.3 129.6-66.4 10.8-112.5-18-210.1-76-296.7M170.9 328c-25.3 0-46-23.6-46-52.4s20.3-52.4 46-52.4 46.5 23.6 46 52.4c.1 28.8-20.2 52.4-46 52.4m170.2 0c-25.3 0-46-23.6-46-52.4s20.3-52.4 46-52.4 46.5 23.6 46 52.4c0 28.8-20.3 52.4-46 52.4" style="fill:#5865f2"/></symbol><symbol id="n-slack" viewBox="0 0 512 512"><path d="M107.9 323.6c0 29.7-24 53.8-53.8 53.8S.3 353.4.3 323.6c0-29.7 24-53.8 53.8-53.8h53.8zm26.9 0c0-29.7 24-53.8 53.8-53.8s53.8 24 53.8 53.8V458c0 29.7-24 53.8-53.8 53.8s-53.8-24-53.8-53.8z" style="fill:#e01e5a"/><path d="M188.6 107.7c-29.7 0-53.8-24-53.8-53.8S158.8.1 188.6.1s53.8 24 53.8 53.8v53.8zm0 27.3c29.7 0 53.8 24 53.8 53.8s-24 53.8-53.8 53.8H53.8C24 242.6 0 218.5 0 188.8S24 135 53.8 135z" style="fill:#36c5f0"/><path d="M404.1 188.8c0-29.7 24-53.8 53.8-53.8s53.8 24 53.8 53.8-24 53.8-53.8 53.8h-53.8zm-26.9 0c0 29.7-24 53.8-53.8 53.8-29.7 0-53.8-24-53.8-53.8V54c0-29.7 24-53.8 53.8-53.8s53.8 24 53.8 53.8z" style="fill:#2eb67d"/><path d="M323.4 404.3c29.7 0 53.8 24 53.8 53.8 0 29.7-24 53.8-53.8 53.8-29.7 0-53.8-24-53.8-53.8v-53.8zm0-26.9c-29.7 0-53.8-24-53.8-53.8s24-53.8 53.8-53.8h134.8c29.7 0 53.8 24 53.8 53.8 0 29.7-24 53.8-53.8 53.8z" style="fill:#ecb22e"/></symbol><symbol id="n-telegram" viewBox="0 0 512 512"><linearGradient id="tga" x1="256" x2="256" y1="2" y2="514" gradientTransform="matrix(1 0 0 -1 0 514)" gradientUnits="userSpaceOnUse"><stop offset="0" style="stop-color:#1d93d2"/><stop offset="1" style="stop-color:#38b0e3"/></linearGradient><circle cx="256" cy="256" r="256" style="fill:url(#tga)"/><path d="m173.3 274.7 30.4 84.1s3.8 7.9 7.9 7.9 64.5-62.9 64.5-62.9l67.3-129.9-169 79.1z" style="fill:#c8daea"/><path d="m213.6 296.3-5.8 62s-2.4 19 16.5 0c19-19 37.2-33.6 37.2-33.6" style="fill:#a9c6d8"/><path d="m173.8 277.7-62.5-20.4s-7.5-3-5.1-9.9c.5-1.4 1.5-2.6 4.5-4.7C124.6 233.1 367 146 367 146s6.8-2.3 10.9-.8c2 .6 3.6 2.3 4 4.4.4 1.8.6 3.7.5 5.5 0 1.6-.2 3.1-.4 5.4-1.5 23.8-45.7 201.6-45.7 201.6s-2.6 10.4-12.1 10.8c-4.7.2-9.3-1.6-12.6-4.9-18.6-16-82.8-59.2-97-68.6-.6-.4-1.1-1.1-1.2-1.9-.2-1 .9-2.2.9-2.2s111.8-99.4 114.8-109.8c.2-.8-.6-1.2-1.8-.9-7.4 2.7-136.2 84.1-150.4 93-.9.2-2 .3-3.1.1" style="fill:#fff"/></symbol><symbol id="n-teams" viewBox="4 4 36 38"><path fill="url(#tma)" d="M21.9999 20h12c3.3137 0 6 2.6863 6 6v10c0 3.3137-2.6863 6-6 6s-6-2.6863-6-6V26c0-3.3137-2.6863-6-6-6"/><path fill="url(#tmb)" d="M7.99988 24c0-3.3137 2.68632-6 6.00002-6h8c3.3137 0 6 2.6863 6 6v12c0 3.3137 2.6863 6 6 6l-16.0001-.0001c-5.5228 0-9.99992-4.4771-9.99992-10z"/><path fill="url(#tmc)" fill-opacity=".7" d="M7.99988 24c0-3.3137 2.68632-6 6.00002-6h8c3.3137 0 6 2.6863 6 6v12c0 3.3137 2.6863 6 6 6l-16.0001-.0001c-5.5228 0-9.99992-4.4771-9.99992-10z"/><path fill="url(#tmd)" fill-opacity=".7" d="M7.99988 24c0-3.3137 2.68632-6 6.00002-6h8c3.3137 0 6 2.6863 6 6v12c0 3.3137 2.6863 6 6 6l-16.0001-.0001c-5.5228 0-9.99992-4.4771-9.99992-10z"/><path fill="url(#tme)" d="M32.9999 18c2.7614 0 5-2.2386 5-5s-2.2386-5-5-5-5 2.2386-5 5 2.2386 5 5 5"/><path fill="url(#tmf)" fill-opacity=".46" d="M32.9999 18c2.7614 0 5-2.2386 5-5s-2.2386-5-5-5-5 2.2386-5 5 2.2386 5 5 5"/><path fill="url(#tmg)" fill-opacity=".4" d="M32.9999 18c2.7614 0 5-2.2386 5-5s-2.2386-5-5-5-5 2.2386-5 5 2.2386 5 5 5"/><path fill="url(#tmh)" d="M17.9999 16c3.3137 0 6-2.6863 6-6 0-3.31371-2.6863-6-6-6s-6 2.68629-6 6c0 3.3137 2.6863 6 6 6"/><path fill="url(#tmi)" fill-opacity=".6" d="M17.9999 16c3.3137 0 6-2.6863 6-6 0-3.31371-2.6863-6-6-6s-6 2.68629-6 6c0 3.3137 2.6863 6 6 6"/><path fill="url(#tmj)" fill-opacity=".5" d="M17.9999 16c3.3137 0 6-2.6863 6-6 0-3.31371-2.6863-6-6-6s-6 2.68629-6 6c0 3.3137 2.6863 6 6 6"/><rect width="16" height="16" x="4" y="23" fill="url(#tmk)" rx="3.25"/><rect width="16" height="16" x="4" y="23" fill="url(#tml)" fill-opacity=".7" rx="3.25"/><path fill="#fff" d="M15.4792 28.1054h-2.4471v7.466h-2.0648v-7.466H8.52014v-1.6768h6.95906z"/><defs><radialGradient id="tma" cx="0" cy="0" r="1" gradientTransform="matrix(13.4784 0 0 33.2694 39.7967 22.1739)" gradientUnits="userSpaceOnUse"><stop stop-color="#a98aff"/><stop offset=".14" stop-color="#8c75ff"/><stop offset=".565" stop-color="#5f50e2"/><stop offset=".9" stop-color="#3c2cb8"/></radialGradient><radialGradient id="tmb" cx="0" cy="0" r="1" gradientTransform="rotate(68.1539 -7.71566095 14.71355834)scale(32.752 33.1231)" gradientUnits="userSpaceOnUse"><stop stop-color="#85c2ff"/><stop offset=".69" stop-color="#7588ff"/><stop offset="1" stop-color="#6459fe"/></radialGradient><radialGradient id="tmd" cx="0" cy="0" r="1" gradientTransform="rotate(113.326 8.09285255 17.64474501)scale(19.2186 15.4273)" gradientUnits="userSpaceOnUse"><stop stop-color="#bd96ff"/><stop offset=".686685" stop-color="#bd96ff" stop-opacity="0"/></radialGradient><radialGradient id="tme" cx="0" cy="0" r="1" gradientTransform="matrix(0 -10 12.6216 0 32.9999 11.5714)" gradientUnits="userSpaceOnUse"><stop offset=".268201" stop-color="#6868f7"/><stop offset="1" stop-color="#3923b1"/></radialGradient><radialGradient id="tmf" cx="0" cy="0" r="1" gradientTransform="rotate(40.0516 -.03068196 44.8729095)scale(7.14629 10.3363)" gradientUnits="userSpaceOnUse"><stop offset=".270711" stop-color="#a1d3ff"/><stop offset=".813393" stop-color="#a1d3ff" stop-opacity="0"/></radialGradient><radialGradient id="tmg" cx="0" cy="0" r="1" gradientTransform="rotate(-41.6581 32.11799918 -43.41948423)scale(8.51275 20.8824)" gradientUnits="userSpaceOnUse"><stop stop-color="#e3acfd"/><stop offset=".816041" stop-color="#9fa2ff" stop-opacity="0"/></radialGradient><radialGradient id="tmh" cx="0" cy="0" r="1" gradientTransform="matrix(0 -12 15.146 0 17.9999 8.28571)" gradientUnits="userSpaceOnUse"><stop offset=".268201" stop-color="#8282ff"/><stop offset="1" stop-color="#3923b1"/></radialGradient><radialGradient id="tmi" cx="0" cy="0" r="1" gradientTransform="rotate(40.0516 -3.15465147 21.41641466)scale(8.57554 12.4035)" gradientUnits="userSpaceOnUse"><stop offset=".270711" stop-color="#a1d3ff"/><stop offset=".813393" stop-color="#a1d3ff" stop-opacity="0"/></radialGradient><radialGradient id="tmj" cx="0" cy="0" r="1" gradientTransform="rotate(-41.6581 20.38180375 -26.51566158)scale(10.2153 25.0589)" gradientUnits="userSpaceOnUse"><stop stop-color="#e3acfd"/><stop offset=".816041" stop-color="#9fa2ff" stop-opacity="0"/></radialGradient><radialGradient id="tmk" cx="0" cy="0" r="1" gradientTransform="rotate(45 -25.76345597 16.32842712)scale(22.6274)" gradientUnits="userSpaceOnUse"><stop offset=".046875" stop-color="#688eff"/><stop offset=".946875" stop-color="#230f94"/></radialGradient><radialGradient id="tml" cx="0" cy="0" r="1" gradientTransform="matrix(0 11.2 -13.0702 0 12 32.6)" gradientUnits="userSpaceOnUse"><stop offset=".570647" stop-color="#6965f6" stop-opacity="0"/><stop offset="1" stop-color="#8f8fff"/></radialGradient><linearGradient id="tmc" x1="20.5936" x2="20.5936" y1="18" y2="42" gradientUnits="userSpaceOnUse"><stop offset=".801159" stop-color="#6864f6" stop-opacity="0"/><stop offset="1" stop-color="#5149de"/></linearGradient></defs></symbol>
+<symbol id="phone" viewBox="0 0 24 24"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"/></symbol>
+<symbol id="msg" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="more" viewBox="0 0 24 24"><circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/></symbol>
+<symbol id="x" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></symbol>
+<symbol id="chl" viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"/></symbol>
+<symbol id="chr" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></symbol>
+<symbol id="vol" viewBox="0 0 24 24"><path d="M11 4.7a.7.7 0 0 0-1.2-.5L6.4 7.6A1.4 1.4 0 0 1 5.4 8H3a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2.4a1.4 1.4 0 0 1 1 .4l3.4 3.4a.7.7 0 0 0 1.2-.5z"/><path d="M16 9a5 5 0 0 1 0 6"/><path d="M19.4 5.6a9 9 0 0 1 0 12.8"/></symbol>
+<symbol id="game" viewBox="0 0 24 24"><path d="M6 11h4M8 9v4M15 12h.01M18 10h.01"/><path d="M17.32 5H6.68a4 4 0 0 0-3.98 3.59C2.6 9.42 2 14.46 2 16a3 3 0 0 0 3 3c1 0 1.5-.5 2-1l1.41-1.41A2 2 0 0 1 9.83 16h4.34a2 2 0 0 1 1.41.59L17 18c.5.5 1 1 2 1a3 3 0 0 0 3-3c0-1.55-.6-6.58-.69-7.26A4 4 0 0 0 17.32 5z"/></symbol>
+<symbol id="music" viewBox="0 0 24 24"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></symbol>
+<symbol id="hp" viewBox="0 0 24 24"><path d="M3 14h3a2 2 0 0 1 2 2v3a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-7a9 9 0 0 1 18 0v7a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3"/></symbol>
+<symbol id="clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></symbol>
+<symbol id="cal" viewBox="0 0 24 24"><rect width="18" height="18" x="3" y="4" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></symbol>
+<symbol id="mail" viewBox="0 0 24 24"><rect width="20" height="16" x="2" y="4" rx="2"/><path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7"/></symbol>
+<symbol id="ext" viewBox="0 0 24 24"><path d="M15 3h6v6M10 14 21 3M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></symbol>
+<symbol id="search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></symbol>
+<symbol id="link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></symbol>
+<symbol id="lock" viewBox="0 0 24 24"><rect width="18" height="11" x="3" y="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></symbol>
+<symbol id="users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+<symbol id="user" viewBox="0 0 24 24"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></symbol>
+<symbol id="shield" viewBox="0 0 24 24"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="M12 8v4M12 16h.01"/></symbol>
+<symbol id="ban" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="m4.9 4.9 14.2 14.2"/></symbol>
+<symbol id="info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></symbol>
+<symbol id="hash" viewBox="0 0 24 24"><path d="M4 9h16M4 15h16M10 3 8 21M16 3l-2 18"/></symbol>
+<symbol id="plane" viewBox="0 0 24 24"><path d="M17.8 19.2 16 11l3.5-3.5C21 6 21.5 4 21 3c-1-.5-3 0-4.5 1.5L13 8 4.8 6.2c-.5-.1-.9.1-1.1.5l-.3.5c-.2.5-.1 1 .3 1.3L9 12l-2 3H4l-1 1 3 2 2 3 1-1v-3l3-2 3.5 5.3c.3.4.8.5 1.3.3l.5-.2c.4-.3.6-.7.5-1.2z"/></symbol>
+<symbol id="badge" viewBox="0 0 24 24"><path d="M3.85 8.62a4 4 0 0 1 4.78-4.77 4 4 0 0 1 6.74 0 4 4 0 0 1 4.78 4.78 4 4 0 0 1 0 6.74 4 4 0 0 1-4.77 4.78 4 4 0 0 1-6.75 0 4 4 0 0 1-4.78-4.77 4 4 0 0 1 0-6.76Z"/><path d="m9 12 2 2 4-4"/></symbol>
+<symbol id="panel" viewBox="0 0 24 24"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M15 3v18"/></symbol>
+<symbol id="out" viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/></symbol>
+<symbol id="umin" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 11h-6"/></symbol>
+<symbol id="copy" viewBox="0 0 24 24"><rect width="14" height="14" x="8" y="8" rx="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></symbol>
+<symbol id="belloff" viewBox="0 0 24 24"><path d="M8.7 3A6 6 0 0 1 18 8a21.3 21.3 0 0 0 .6 5M17 17H3s3-2 3-9a4.67 4.67 0 0 1 .3-1.7M10.3 21a1.94 1.94 0 0 0 3.4 0M2 2l20 20"/></symbol>
+<symbol id="info2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></symbol>
+<symbol id="mega" viewBox="0 0 24 24"><path d="m3 11 18-5v12L3 14v-3z"/><path d="M11.6 16.8a3 3 0 1 1-5.8-1.6"/></symbol>
+<symbol id="cloud" viewBox="0 0 24 24"><path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z"/><path d="m2 2 20 20"/></symbol>
+<symbol id="pin" viewBox="0 0 24 24"><path d="M12 17v5M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z"/></symbol>
+</defs></svg>
+
+<h1>05 · Profile and info pane</h1>
+<p class="lede">Every frame is the right pane at its real width (300) beside a slice of the conversation, drawn at 1 CSS px = 1 pt. Photos are gradients. Everything above each pane's first hairline paints from the row in the first frame; everything below arrives with the one profile answer and only extends downward. Spec: <code>docs/design/polish/05-profile-info.md</code>.</p>
+
+<!-- ============ BEFORE / AFTER ============ -->
+<h2><b>A</b>Before and after: a Discord DM with the profile open</h2>
+<p class="cap">Left, redrawn from the current build's shot (<code>--open 2 --right info</code>): 340 wide on <code>canvas</code>, a grey 72 band with no colour behind it, an 80 avatar, a "Discord" chip the strip already says, a lone "Friend" line, Message beside the DM it would open, and an empty tab that claims nobody shared anything. Right: the same person in the polish design.</p>
+<div class="row">
+ <div class="fig"><div class="lbl">Before · current build</div>
+  <div class="win" style="height:640px">
+   <div class="conv" style="width:300px"><div class="cstrip"><div class="av av24 p-juno"></div><div class="tt"><div class="t1"><svg class="n n14"><use href="#n-discord"/></svg>Juno Castellane</div></div><div class="ib on"><svg class="i"><use href="#user"/></svg></div></div>
+    <div class="msgs"><div class="m"><div class="a p-juno"></div><div><div class="who">Juno Castellane<span>10:25 PM</span></div><div class="tx">Did you see the frost flowers by the weir this morning?</div></div></div><div class="m"><div class="a p-a"></div><div><div class="who">You<span>10:30 PM</span></div><div class="tx">Missed them. Wrong weir.</div></div></div></div><div class="comp">Message Juno Castellane</div></div>
+   <div class="pane" style="width:340px;background:var(--canvas);--ring:var(--canvas)">
+    <div class="pstrip" style="border-bottom:0"><div class="t">Profile</div><div class="ib"><svg class="i"><use href="#x"/></svg></div></div>
+    <div class="pb" style="padding-top:0"><div class="head" style="padding-top:24px"><div class="band" style="height:72px;background:#232427"></div>
+     <div style="display:flex;justify-content:space-between;align-items:flex-end;position:relative"><div class="av p-juno" style="width:80px;height:80px;border:4px solid var(--canvas)"><div class="dot" style="width:22px;height:22px;right:0;bottom:0"><i class="on" style="width:16px;height:16px"></i></div></div><div class="chip" style="background:var(--raised);height:24px;margin-bottom:4px"><svg class="n n14"><use href="#n-discord"/></svg>Discord</div></div>
+     <div class="name" style="margin-top:8px">Juno Castellane</div><div class="l3">@juno.c</div><div class="pres" style="margin-top:6px"><span class="g on"></span>Online · <span class="s">foraging all weekend</span></div><div class="l3">Friend</div></div>
+     <div class="acts"><div class="btn pri f"><svg class="i"><use href="#msg"/></svg>Message</div><div class="btn sec f"><svg class="i"><use href="#phone"/></svg>Call</div><div class="ib"><svg class="i"><use href="#more"/></svg></div></div>
+     <div class="hr"></div><div class="seg" style="display:inline-flex;background:var(--raised)"><span class="sel">Media</span><span>Files</span><span>Links</span></div>
+     <div style="color:var(--soft);margin-top:16px">No pictures or videos shared here yet.</div><div class="hr"></div><div class="openin" style="margin-top:0">Open in Discord <svg class="i i14"><use href="#ext"/></svg></div></div>
+   </div></div></div>
+ <div class="fig"><div class="lbl">After · polish</div>
+  <div class="win" style="height:640px">
+   <div class="conv" style="width:300px"><div class="cstrip"><div class="av av24 p-juno"></div><div class="tt"><div class="t1"><svg class="n n14"><use href="#n-discord"/></svg>Juno Castellane</div><div class="t2">Online · foraging all weekend</div></div><div class="ib on"><svg class="i"><use href="#user"/></svg></div></div>
+    <div class="msgs"><div class="m"><div class="a p-juno"></div><div><div class="who">Juno Castellane<span>10:25 PM</span></div><div class="tx">Did you see the frost flowers by the weir this morning?</div></div></div><div class="m"><div class="a p-a"></div><div><div class="who">You<span>10:30 PM</span></div><div class="tx">Missed them. Wrong weir.</div></div></div></div><div class="comp">Message Juno Castellane</div></div>
+   <div class="pane">
+    <div class="pstrip"><div class="t">Profile</div><div class="ib"><svg class="i"><use href="#x"/></svg></div></div>
+    <div class="pb"><div class="head"><div class="band" style="background:#1d3a37"></div><div class="av av64 p-juno"><div class="dot"><i class="on"></i></div></div>
+     <div class="name">Juno Castellane</div><div class="l3">@juno.c · they/them</div><div class="pres"><span class="g on"></span>Online · <span class="s">🌿 foraging all weekend</span></div></div>
+     <div class="acts"><div class="btn sec f"><svg class="i"><use href="#phone"/></svg>Call</div><div class="ib"><svg class="i"><use href="#more"/></svg></div></div>
+     <div class="r28"><span>Notifications</span><div class="sw"></div></div>
+     <div class="hr"></div>
+     <div class="fact"><svg class="i"><use href="#vol"/></svg><div class="v">In voice · #trail · <span class="s">Moss &amp; Lichen</span></div></div>
+     <div class="sh">In common</div>
+     <div class="place"><div class="sq20 s-moss"></div>Moss &amp; Lichen</div><div class="place"><div class="sq20 s-tile"></div>Tile Makers</div>
+     <div class="hr"></div><div class="tabs"><div class="tab sel">Media</div><div class="tab">Files</div><div class="tab">Links</div><div class="tab">Pinned</div></div>
+     <div class="src">None in the messages loaded here</div><div class="btn sec"><svg class="i"><use href="#search"/></svg>Search all on Discord</div>
+     <div class="foot">On Discord since Dec 2017 · Friends since Mar 2021</div><div class="openin"><svg class="n"><use href="#n-discord"/></svg>Open in Discord<svg class="i i14"><use href="#ext"/></svg></div></div>
+   </div></div>
+  <div class="note">No Message in their DM; mute is the Notifications switch; the band is Juno's own colour; the empty tab says what it knows and offers the server search.</div></div>
+</div>
+
+<!-- ============ PERSONS ============ -->
+<h2><b>P1</b>Discord friend, opened from a server's member list</h2>
+<p class="cap">Pushed over Members (crumb). Opened from Moss &amp; Lichen, so Role shows the server nickname and roles and the foot says when they joined it. Message is present because the open conversation is #trail-cams, not their DM. Right now carries voice and game. Note (P2) sits at the end of About.</p>
+<div class="row"><div class="fig"><div class="win">
+ <div class="conv"><div class="cstrip"><svg class="i" style="color:var(--soft)"><use href="#hash"/></svg><div class="tt"><div class="t1">trail-cams</div><div class="t2">Moss &amp; Lichen › Trail</div></div><div class="ib on"><svg class="i"><use href="#users"/></svg></div><div class="ib"><svg class="i"><use href="#info"/></svg></div></div>
+  <div class="msgs"><div class="m"><div class="a p-juno"></div><div><div class="who">Ju<span>9:51 PM</span></div><div class="tx">Camera 2 caught a pine marten at 03:12. Clip in the thread.</div></div></div><div class="m"><div class="a p-c"></div><div><div class="who">Bastien Orr<span>9:58 PM</span></div><div class="tx">That's the third this month. Same log?</div></div></div><div class="m"><div class="a p-juno"></div><div><div class="who">Ju<span>10:02 PM</span></div><div class="tx">Same log. I'll swap the card Saturday.</div></div></div></div><div class="comp">Message #trail-cams</div></div>
+ <div class="pane"><div class="pstrip"><div class="crumb"><svg class="i"><use href="#chl"/></svg>Members</div><div class="t">Profile</div><div class="ib"><svg class="i"><use href="#x"/></svg></div></div>
+  <div class="pb"><div class="head"><div class="band" style="background:#1d3a37"></div><div class="av av64 p-juno"><div class="dot"><i class="on"></i></div></div>
+   <div class="name">Juno Castellane</div><div class="l3">@juno.c · they/them</div><div class="pres"><span class="g on"></span>Online · <span class="s">🌿 foraging all weekend</span></div></div>
+   <div class="acts"><div class="btn pri f"><svg class="i"><use href="#msg"/></svg>Message</div><div class="btn sec f"><svg class="i"><use href="#phone"/></svg>Call</div><div class="ib"><svg class="i"><use href="#more"/></svg></div></div>
+   <div class="hr"></div>
+   <div class="fact hv"><svg class="i"><use href="#vol"/></svg><div class="v">In voice · #trail · <span class="s">Moss &amp; Lichen</span></div></div>
+   <div class="fact"><svg class="i"><use href="#game"/></svg><div class="v">Playing Outer Wilds · <span class="s">42 minutes</span></div></div>
+   <div class="sh">Role</div>
+   <div style="display:flex;align-items:center;gap:8px"><div class="sq20 s-moss" style="width:16px;height:16px;border-radius:4px"></div><span><b style="font-weight:600">Ju</b> <span class="l3">in Moss &amp; Lichen</span></span></div>
+   <div class="chips"><span class="chip"><i style="background:#5fb37a"></i>Trail lead</span><span class="chip"><i style="background:#e0a63a"></i>Moderator</span><span class="chip"><i style="background:#7a9be0"></i>Photographer</span><span class="chip"><i style="background:#c77ad6"></i>Map team</span></div>
+   <div class="sh">About</div>
+   <div>Trail cameras, fungi, bad puns. Logging every pine marten on the north ridge since 2021. <span class="more">more</span></div>
+   <div class="lbl" style="margin:10px 0 2px">Note · only you see this</div><div style="color:var(--soft)">Owes me the 50mm lens back.</div>
+   <div class="sh">In common</div>
+   <div class="place"><div class="sq20 s-moss"></div>Moss &amp; Lichen</div><div class="place"><div class="sq20 s-tile"></div>Tile Makers</div><div class="place"><div class="sq20 s-night"></div>Night Buses</div>
+   <div class="hr"></div><div class="tabs"><div class="tab sel">Media</div><div class="tab">Files</div><div class="tab">Links</div><div class="tab">Pinned</div></div>
+   <div class="src">From your DM, messages loaded here · 6</div>
+   <div class="grid"><div class="tile m1"></div><div class="tile m2"><span class="dur">0:14</span></div><div class="tile m3"></div><div class="tile m4"></div><div class="tile m5"></div><div class="tile m6"></div></div>
+   <div class="btn sec" style="margin-top:8px"><svg class="i"><use href="#search"/></svg>Search all on Discord</div>
+   <div class="foot">On Discord since Dec 2017 · Friends since Mar 2021 · In Moss &amp; Lichen since 2021</div><div class="openin"><svg class="n"><use href="#n-discord"/></svg>Open in Discord<svg class="i i14"><use href="#ext"/></svg></div></div>
+ </div></div>
+ <div class="note">Shared always lists the DM with this person, whichever conversation is open, and says so. Opened from the DM, Role and "In Moss &amp; Lichen since" are absent: the request carries no server.</div></div>
+
+<!-- P2 Slack -->
+<div class="fig"><h2><b>P2</b>Slack colleague, in their DM</h2>
+<p class="cap">No handle-less guesswork: title moves from About to Role; local time is a person's sentence; phone masked until Show. Call is a hand-off. The second pane (narrow, same rules) is a Slack Connect person: the External tag, their org in line 4.</p>
+<div class="win">
+ <div class="conv"><div class="cstrip"><div class="av av24 p-tess"></div><div class="tt"><div class="t1"><svg class="n n14"><use href="#n-slack"/></svg>Tess Oduya</div><div class="t2">Away · Heads down</div></div><div class="ib on"><svg class="i"><use href="#user"/></svg></div></div>
+  <div class="msgs"><div class="m"><div class="a p-tess"></div><div><div class="who">Tess Oduya<span>3:40 PM</span></div><div class="tx">Pager test at 4 is real this time. Can you shadow?</div></div></div><div class="m"><div class="a p-a"></div><div><div class="who">You<span>3:44 PM</span></div><div class="tx">Yes. Joining the huddle after standup.</div></div></div></div><div class="comp">Message Tess Oduya</div></div>
+ <div class="pane"><div class="pstrip"><div class="t">Profile</div><div class="ib"><svg class="i"><use href="#x"/></svg></div></div>
+  <div class="pb"><div class="head"><div class="av av64 p-tess"><div class="dot"><i class="idle"></i></div></div>
+   <div class="name">Tess Oduya</div><div class="l3">@tess.o · she/her</div><div class="pres"><span class="g idle"></span>Away · <span class="s">🎧 Heads down</span> <span class="u">· until 5 PM</span></div></div>
+   <div class="acts"><div class="btn sec f"><svg class="i"><use href="#hp"/></svg>Huddle in Slack<svg class="i i14 x"><use href="#ext"/></svg></div><div class="ib"><svg class="i"><use href="#more"/></svg></div></div>
+   <div class="r28"><span>Notifications</span><div class="sw"></div></div>
+   <div class="hr"></div>
+   <div class="fact"><svg class="i"><use href="#hp"/></svg><div class="v">In a huddle in #eng-incidents</div></div>
+   <div class="fact"><svg class="i"><use href="#clock"/></svg><div class="v">4:12 PM local · <span class="s">3 h behind you</span></div></div>
+   <div class="sh">Role</div><div>Staff Engineer, Payments</div>
+   <div class="sh">Contact</div>
+   <div class="fact hv"><svg class="i"><use href="#mail"/></svg><div class="v">tess@harborlabs.dev</div><span style="font-size:12px;color:var(--soft)">Copy</span></div>
+   <div class="fact" style="align-items:center"><svg class="i" style="margin:0"><use href="#phone"/></svg><div class="v" style="font-variant-numeric:tabular-nums">+1 ••• ••• ••42</div><div class="btn gh sm">Show</div></div>
+   <div class="hr"></div><div class="tabs"><div class="tab">Media</div><div class="tab sel">Files <span class="c">23</span></div><div class="tab">Links</div><div class="tab">Pinned</div></div>
+   <div class="src">All on Slack · 23</div>
+   <div class="fr"><div class="ft">PDF</div><div class="w"><div>pager-runbook-v4.pdf</div><div class="s">184 KB · Tess · Oct 9</div></div></div>
+   <div class="fr"><div class="ft">CSV</div><div class="w"><div>refund-errors-sept.csv</div><div class="s">1.2 MB · You · Oct 2</div></div></div>
+   <div class="fr"><div class="ft">KEY</div><div class="w"><div>Q4 payments review.key</div><div class="s">8.4 MB · Tess · Sep 30</div></div></div>
+   <div class="openin" style="margin-top:12px"><svg class="n"><use href="#n-slack"/></svg>Open in Slack<svg class="i i14"><use href="#ext"/></svg></div></div>
+ </div></div>
+ <div class="win" style="margin-top:16px;width:300px"><div class="pane" style="border-left:0"><div class="pb"><div class="head"><div class="av av64 ini" style="background:hsl(185 30% 22%);color:hsl(185 70% 82%);font-size:26px">JL</div>
+  <div class="name">Jo Lindqvist <span class="tag">External</span></div><div class="l3">@jo · Northwind Co.</div></div>
+  <div class="acts"><div class="btn pri f"><svg class="i"><use href="#msg"/></svg>Message</div><div class="ib"><svg class="i"><use href="#more"/></svg></div></div></div></div></div>
+ <div class="note">Files show a count only after the click on "Search all on Slack" filled the tab from <code>files.list</code>; before that the tab reads like Discord's.</div></div>
+</div>
+
+<!-- P3 Telegram, P4 Teams -->
+<div class="row"><div class="fig"><h2><b>P3</b>Telegram contact, in the chat</h2>
+<p class="cap">Peer colour band. Exact last seen gets the hollow ring and a time, never "2 h ago". Telegram gives exact totals, so the tabs carry counts and the list is complete: no honesty line needed, no search button.</p>
+<div class="win">
+ <div class="conv"><div class="cstrip"><div class="av av24 p-nadia"></div><div class="tt"><div class="t1"><svg class="n n14"><use href="#n-telegram"/></svg>Nadia Kovač</div><div class="t2">last seen today at 8:12 PM</div></div><div class="ib on"><svg class="i"><use href="#user"/></svg></div></div>
+  <div class="msgs"><div class="m"><div class="a p-nadia"></div><div><div class="who">Nadia Kovač<span>8:04 PM</span></div><div class="tx">Sent you the ferry times for Sunday.</div></div></div><div class="m"><div class="a p-a"></div><div><div class="who">You<span>8:11 PM</span></div><div class="tx">The 7:40 works. Bringing the stove.</div></div></div></div><div class="comp">Message Nadia Kovač</div></div>
+ <div class="pane"><div class="pstrip"><div class="t">Profile</div><div class="ib"><svg class="i"><use href="#x"/></svg></div></div>
+  <div class="pb"><div class="head"><div class="band" style="background:#4a3220"></div><div class="av av64 p-nadia"><div class="dot"><i class="off"></i></div></div>
+   <div class="name">Nadia Kovač</div><div class="l3">@nadia_k</div><div class="pres" style="color:var(--soft)"><span class="g off"></span>Last seen today at 8:12 PM</div></div>
+   <div class="acts"><div class="btn sec f"><svg class="i"><use href="#phone"/></svg>Call</div><div class="ib"><svg class="i"><use href="#more"/></svg></div></div>
+   <div class="r28"><span>Notifications</span><div class="sw offsw"></div></div>
+   <div class="hr"></div>
+   <div class="sh first">About</div><div>Ferries, film cameras, too many plants. Split ⇄ Zagreb.</div>
+   <div class="sh">Contact</div>
+   <div class="fact" style="align-items:center"><svg class="i" style="margin:0"><use href="#phone"/></svg><div class="v">+385 •• ••• ••17</div><div class="btn gh sm">Show</div></div>
+   <div class="sh">In common</div><div class="place"><svg class="i" style="color:var(--soft)"><use href="#users"/></svg>4 groups in common<svg class="i x"><use href="#chr"/></svg></div>
+   <div class="hr"></div><div class="tabs"><div class="tab sel">Media <span class="c">128</span></div><div class="tab">Files <span class="c">14</span></div><div class="tab">Links <span class="c">37</span></div></div>
+   <div class="src">All on Telegram</div>
+   <div class="grid"><div class="tile m2"></div><div class="tile m4"></div><div class="tile m6"><span class="dur">1:02</span></div><div class="tile m5"></div><div class="tile m1"></div><div class="tile m3"></div></div>
+   <div class="openin" style="margin-top:12px"><svg class="n"><use href="#n-telegram"/></svg>Open in Telegram<svg class="i i14"><use href="#ext"/></svg></div></div>
+ </div></div><div class="note">"4 groups in common" is the count from the profile answer; its names are a second request, only on click, drawn in the same place.</div></div>
+
+<div class="fig"><h2><b>P4</b>Teams colleague, from a channel</h2>
+<p class="cap">No handle on Teams, so line 4 is the title. Busy is its own glyph (rule 6; drawn here as Teams' solid red until <code>polish/01</code> fixes it). Out of office is the one heads-up, with their note on its second line. Call is a hand-off.</p>
+<div class="win">
+ <div class="conv"><div class="cstrip"><div class="av av24 sq" style="background:#3a3570"></div><div class="tt"><div class="t1"><svg class="n n14"><use href="#n-teams"/></svg>Design reviews</div><div class="t2">Contoso Design</div></div><div class="ib"><svg class="i"><use href="#users"/></svg></div><div class="ib"><svg class="i"><use href="#info"/></svg></div></div>
+  <div class="msgs"><div class="m"><div class="a p-omar"></div><div><div class="who">Omar Haddadi<span>1:12 PM</span></div><div class="tx">Tokens doc is updated. Reviews Thursday.</div></div></div></div><div class="comp">Reply in Design reviews</div></div>
+ <div class="pane"><div class="pstrip"><div class="t">Profile</div><div class="ib"><svg class="i"><use href="#x"/></svg></div></div>
+  <div class="pb"><div class="head"><div class="av av64 p-omar"><div class="dot"><i class="busy"></i></div></div>
+   <div class="name">Omar Haddadi</div><div class="l3">Product Designer</div><div class="pres"><span class="g busy"></span>Busy · <span class="s">reviewing Q4 plans</span></div></div>
+   <div class="acts"><div class="btn pri f"><svg class="i"><use href="#msg"/></svg>Message</div><div class="btn sec f"><svg class="i"><use href="#phone"/></svg>Call in Teams<svg class="i i14 x"><use href="#ext"/></svg></div><div class="ib"><svg class="i"><use href="#more"/></svg></div></div>
+   <div class="ban" style="align-items:flex-start"><svg class="i" style="color:var(--warn);margin-top:1px"><use href="#plane"/></svg><div class="w"><div>Out of office until Mon, Oct 19</div><div class="w2">At a conference. For urgent design reviews, ask Lena Brandt.</div></div></div>
+   <div class="hr"></div>
+   <div class="fact"><svg class="i"><use href="#cal"/></svg><div class="v">In a meeting · <span class="s">until 3:30 PM</span></div></div>
+   <div class="sh">Role</div><div>Product Designer</div><div class="l3">Design Systems</div>
+   <div class="sh">Contact</div><div class="fact"><svg class="i"><use href="#mail"/></svg><div class="v">omar.haddadi@contoso.com</div></div>
+   <div class="hr"></div><div class="tabs"><div class="tab sel">Media</div><div class="tab">Files</div><div class="tab">Links</div></div>
+   <div class="src">From messages loaded here · 3</div>
+   <div class="grid"><div class="tile m5"></div><div class="tile m3"></div><div class="tile m1"></div></div>
+   <div class="src" style="margin-top:12px">The rest is in Teams.</div><div class="btn sec"><svg class="n n14"><use href="#n-teams"/></svg>Open in Teams</div>
+   </div>
+ </div></div><div class="note">Teams has no confirmed route for chat files, so the tab is always labelled as partial and hands off. No Pinned tab on Teams.</div></div>
+</div>
+
+<!-- P5 bot, P6 sparse, P7 marks -->
+<div class="row">
+<div class="fig"><h2><b>P5</b>App</h2><p class="cap" style="max-width:300px">Tag, no dot, no presence line, no Call. About is its description.</p>
+<div class="win"><div class="pane" style="border-left:0"><div class="pstrip"><div class="t">Profile</div><div class="ib"><svg class="i"><use href="#x"/></svg></div></div>
+ <div class="pb"><div class="head"><div class="av av64 bot"></div><div class="name">Lichen Bot <span class="tag">App</span></div><div class="l3">@lichenbot</div></div>
+  <div class="acts"><div class="btn pri f"><svg class="i"><use href="#msg"/></svg>Message</div><div class="ib"><svg class="i"><use href="#more"/></svg></div></div>
+  <div class="hr"></div><div class="sh first">About</div><div>Posts the nightly trail-camera report and battery levels. Run by the Moss &amp; Lichen mods.</div>
+  <div class="sh">In common</div><div class="place"><div class="sq20 s-moss"></div>Moss &amp; Lichen</div>
+  <div class="foot">In Moss &amp; Lichen since Apr 2024</div><div class="openin"><svg class="n"><use href="#n-discord"/></svg>Open in Discord<svg class="i i14"><use href="#ext"/></svg></div></div></div></div></div>
+
+<div class="fig"><h2><b>P6</b>Almost no data</h2><p class="cap" style="max-width:300px">Telegram, no username, bio, phone or photo; presence is a bucket in words. Still complete: head, actions, switch, Shared, foot.</p>
+<div class="win"><div class="pane" style="border-left:0"><div class="pstrip"><div class="t">Profile</div><div class="ib"><svg class="i"><use href="#x"/></svg></div></div>
+ <div class="pb"><div class="head"><div class="av av64 ini" style="background:hsl(265 30% 22%);color:hsl(265 70% 82%);font-size:26px">OL</div><div class="name">Oskar Lind</div><div class="pres" style="color:var(--soft)">last seen a long time ago</div></div>
+  <div class="acts"><div class="btn sec f"><svg class="i"><use href="#phone"/></svg>Call</div><div class="ib"><svg class="i"><use href="#more"/></svg></div></div>
+  <div class="r28"><span>Notifications</span><div class="sw"></div></div>
+  <div class="hr"></div><div class="tabs"><div class="tab sel">Media <span class="c">0</span></div><div class="tab">Files <span class="c">0</span></div><div class="tab">Links <span class="c">2</span></div></div>
+  <div class="src" style="color:var(--soft);font-size:13px;line-height:18px;margin-top:12px">No photos or videos in this chat</div>
+  <div class="openin" style="margin-top:16px"><svg class="n"><use href="#n-telegram"/></svg>Open in Telegram<svg class="i i14"><use href="#ext"/></svg></div></div></div></div></div>
+
+<div class="fig"><h2><b>P7</b>Marks and heads-ups</h2><p class="cap" style="max-width:300px">One tag after the name; one banner at most, by severity.</p>
+<div class="win" style="width:300px"><div class="pane" style="border-left:0;padding:16px">
+ <div style="display:flex;flex-wrap:wrap;gap:8px"><span class="tag">Bot</span><span class="tag">App</span><span class="tag">Guest</span><span class="tag">External</span><span class="tag bad">Scam</span><span class="tag bad">Fake</span><span style="display:flex;gap:4px;align-items:center;color:var(--soft)">Verified<svg class="i i14"><use href="#badge"/></svg></span></div>
+ <div class="name" style="margin-top:16px">Crypto Support <span class="tag bad">Scam</span></div>
+ <div class="ban" style="align-items:flex-start"><svg class="i" style="color:var(--danger);margin-top:1px"><use href="#shield"/></svg><div class="w"><div>Telegram flags this account as a scam.</div><div class="w2">Never send codes or money.</div></div></div>
+ <div class="ban"><svg class="i" style="color:var(--danger)"><use href="#ban"/></svg><div class="w">You blocked Vex Tolland</div><div class="btn gh sm">Unblock</div></div>
+ <div class="ban"><svg class="i" style="color:var(--warn)"><use href="#plane"/></svg><div class="w">Out of office until Mon, Oct 19</div></div>
+ <div class="ban"><svg class="i" style="color:var(--soft)"><use href="#info"/></svg><div class="w" style="font-size:12px">Not friends · they may not see your message</div></div>
+ <div class="ban"><svg class="i" style="color:var(--warn)"><use href="#cloud"/></svg><div class="w" style="font-size:12px">Discord is offline · showing what's on this Mac</div></div>
+</div></div></div>
+</div>
+
+<!-- SHARED -->
+<h2><b>S</b>Shared: the honesty rules</h2>
+<p class="cap">Four tab states, each the Shared region of a 300 pane. A count only when the network gave an exact total. Cache lists are labelled and end with a search button that sends one request, on click only. Media tiles open the viewer at that item.</p>
+<div class="row">
+ <div class="fig"><div class="lbl">Media · from cache (Discord)</div><div class="win"><div class="pane" style="border-left:0"><div class="pb" style="padding-top:0"><div class="tabs"><div class="tab sel">Media</div><div class="tab">Files</div><div class="tab">Links</div><div class="tab">Pinned</div></div>
+  <div class="src">From messages loaded here · 14</div><div class="grid"><div class="tile m1"></div><div class="tile m2"><span class="dur">0:14</span></div><div class="tile m3" style="box-shadow:inset 0 0 0 2px var(--at)"></div><div class="tile m4"></div><div class="tile m5"></div><div class="tile m6"></div><div class="tile m3"></div><div class="tile m1"></div><div class="tile m4"></div></div>
+  <div style="font-size:12px;color:var(--faint);margin-top:8px">5 more loaded</div><div class="btn sec" style="margin-top:8px"><svg class="i"><use href="#search"/></svg>Search all on Discord</div></div></div></div></div>
+ <div class="fig"><div class="lbl">After the click · from the network</div><div class="win"><div class="pane" style="border-left:0"><div class="pb" style="padding-top:0"><div class="tabs"><div class="tab sel">Media <span class="c">37</span></div><div class="tab">Files</div><div class="tab">Links</div><div class="tab">Pinned</div></div>
+  <div class="src">All on Discord · 37</div><div class="grid"><div class="tile m4"></div><div class="tile m1"></div><div class="tile m2"><span class="dur">0:14</span></div><div class="tile m6"></div><div class="tile m3"></div><div class="tile m5"></div><div class="tile m2"></div><div class="tile m4"></div><div class="tile m1"></div></div><div style="font-size:12px;color:var(--faint);margin-top:8px">Scroll for older</div></div></div></div></div>
+ <div class="fig"><div class="lbl">Links · empty in cache</div><div class="win"><div class="pane" style="border-left:0"><div class="pb" style="padding-top:0"><div class="tabs"><div class="tab">Media</div><div class="tab">Files</div><div class="tab sel">Links</div><div class="tab">Pinned</div></div>
+  <div class="src" style="color:var(--soft);font-size:13px;line-height:18px;margin-top:12px">None in the messages loaded here</div><div class="btn sec"><svg class="i"><use href="#search"/></svg>Search all on Discord</div>
+  <div class="lbl" style="margin-top:24px">Links with items</div>
+  <div class="fr"><div class="ft"><svg class="i"><use href="#link"/></svg></div><div class="w"><div>North ridge trail map</div><div class="s">maps.example.org</div></div></div>
+  <div class="fr"><div class="ft"><svg class="i"><use href="#link"/></svg></div><div class="w"><div>example.net/forage/autumn-2026</div><div class="s">example.net</div></div></div></div></div></div></div>
+ <div class="fig"><div class="lbl">Pinned (P1)</div><div class="win"><div class="pane" style="border-left:0"><div class="pb" style="padding-top:0"><div class="tabs"><div class="tab">Media</div><div class="tab">Files</div><div class="tab">Links</div><div class="tab sel">Pinned <span class="c">3</span></div></div>
+  <div style="height:8px"></div>
+  <div style="display:flex;gap:8px;padding:6px 0"><div class="av av20 p-juno"></div><div><div style="font:600 12px/16px -apple-system,system-ui,sans-serif">Juno Castellane</div><div style="display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden">Van leaves 7:30 from the usual corner. Bring the long tripod and spare cards.</div></div></div>
+  <div style="display:flex;gap:8px;padding:6px 0"><div class="av av20 p-a"></div><div><div style="font:600 12px/16px -apple-system,system-ui,sans-serif">You</div><div>Gate code is 4471.</div></div></div></div></div></div></div>
+</div>
+
+<!-- CONVERSATION DETAILS -->
+<h2><b>C</b>Conversation details</h2>
+<p class="cap">The header's <code>info</code> opens "Details" for whatever is open. Same frame and order as a person: head, actions, Notifications, About, Members, Shared, foot.</p>
+<div class="row">
+<div class="fig"><div class="lbl">C1 · Slack channel (private)</div><div class="win">
+ <div class="conv"><div class="cstrip"><svg class="i" style="color:var(--soft)"><use href="#lock"/></svg><div class="tt"><div class="t1">eng-incidents</div><div class="t2">Harbor Labs · paging and postmortems</div></div><div class="ib"><svg class="i"><use href="#users"/></svg></div><div class="ib on"><svg class="i"><use href="#info"/></svg></div></div>
+  <div class="msgs"><div class="m"><div class="a p-tess"></div><div><div class="who">Tess Oduya<span>6:35 PM</span></div><div class="tx">Marking resolved. Follow-ups in the doc.</div></div></div></div><div class="comp">Message #eng-incidents</div></div>
+ <div class="pane"><div class="pstrip"><div class="t">Details</div><div class="ib"><svg class="i"><use href="#x"/></svg></div></div>
+  <div class="pb"><div class="head"><div class="av64 sq" style="width:64px;height:64px;border-radius:16px;background:var(--raised);display:flex;align-items:center;justify-content:center;color:var(--soft)"><svg class="i" style="width:28px;height:28px;stroke-width:2"><use href="#lock"/></svg></div>
+   <div class="name">eng-incidents <span class="tag">Private</span></div><div class="l3">Harbor Labs</div></div>
+   <div class="acts"><div class="btn sec f"><svg class="i"><use href="#hp"/></svg>Huddle in Slack<svg class="i i14 x"><use href="#ext"/></svg></div><div class="ib"><svg class="i"><use href="#more"/></svg></div></div>
+   <div class="r28"><span>Notifications</span><div class="seg"><span>All</span><span class="sel">Mentions</span><span>Nothing</span></div></div>
+   <div class="hr"></div>
+   <div class="sh first">About</div><div>Paging and postmortems. Sev-1 and Sev-2 only; everything else goes to #eng-triage. Runbooks: <span style="color:var(--at)">harborlabs.dev/runbooks</span></div>
+   <div class="sh">Members</div>
+   <div class="place"><div class="faces"><div class="av p-tess"></div><div class="av p-c"></div><div class="av p-d"></div><div class="av p-e"></div><div class="av p-b"></div></div><span>128 <span class="l3">· 12 online</span></span><svg class="i x"><use href="#chr"/></svg></div>
+   <div class="hr"></div><div class="tabs"><div class="tab">Media</div><div class="tab sel">Files</div><div class="tab">Links</div><div class="tab">Pinned <span class="c">4</span></div></div>
+   <div class="src">From messages loaded here · 2</div>
+   <div class="fr"><div class="ft">MD</div><div class="w"><div>postmortem-2026-10-11.md</div><div class="s">12 KB · Tess · Oct 11</div></div></div>
+   <div class="btn sec" style="margin-top:8px"><svg class="i"><use href="#search"/></svg>Search all on Slack</div>
+   <div class="foot">Created by Dev Patel · Mar 2024</div><div class="openin"><svg class="n"><use href="#n-slack"/></svg>Open in Slack<svg class="i i14"><use href="#ext"/></svg></div></div></div></div></div>
+
+<div class="fig"><div class="lbl">C2 · Discord group DM</div><div class="win">
+ <div class="conv"><div class="cstrip"><div class="faces" style="--ring:var(--canvas)"><div class="av p-juno"></div><div class="av p-c"></div></div><div class="tt"><div class="t1">Mushroom run</div><div class="t2">4 people · Juno, Bastien, Mei</div></div><div class="ib"><svg class="i"><use href="#users"/></svg></div><div class="ib on"><svg class="i"><use href="#info"/></svg></div></div>
+  <div class="msgs"><div class="m"><div class="a p-c"></div><div><div class="who">Bastien Orr<span>10:14 PM</span></div><div class="tx">Always boots.</div></div></div><div class="m"><div class="a p-d"></div><div><div class="who">Mei Arden<span>10:20 PM</span></div><div class="tx">And the thermos.</div></div></div></div><div class="comp">Message Mushroom run</div></div>
+ <div class="pane"><div class="pstrip"><div class="t">Details</div><div class="ib"><svg class="i"><use href="#x"/></svg></div></div>
+  <div class="pb"><div class="head"><div style="position:relative;width:64px;height:64px"><div class="av p-juno" style="width:42px;height:42px;position:absolute;left:0;top:0"></div><div class="av p-c" style="width:42px;height:42px;position:absolute;right:0;bottom:0;box-shadow:0 0 0 2px var(--sidebar)"></div></div>
+   <div class="name">Mushroom run</div><div class="l3">Group · 4 people</div></div>
+   <div class="acts"><div class="btn sec f"><svg class="i"><use href="#phone"/></svg>Call</div><div class="ib"><svg class="i"><use href="#more"/></svg></div></div>
+   <div class="r28"><span>Notifications</span><div class="sw"></div></div>
+   <div class="hr"></div><div class="sh first">Members</div>
+   <div class="mrow"><div class="av av24 p-juno"><div class="dot" style="width:12px;height:12px"><i class="on" style="width:8px;height:8px"></i></div></div>Juno Castellane <span class="ctx">· Online</span></div>
+   <div class="mrow"><div class="av av24 p-c"><div class="dot" style="width:12px;height:12px"><i class="idle" style="width:8px;height:8px"></i></div></div>Bastien Orr <span class="ctx">· Idle</span></div>
+   <div class="mrow"><div class="av av24 p-d"></div>Mei Arden</div>
+   <div class="mrow"><div class="av av24 p-a"></div>You</div>
+   <div class="hr"></div><div class="tabs"><div class="tab sel">Media</div><div class="tab">Files</div><div class="tab">Links</div><div class="tab">Pinned</div></div>
+   <div class="src">From messages loaded here · 3</div><div class="grid"><div class="tile m4"></div><div class="tile m1"></div><div class="tile m6"></div></div>
+   <div class="btn sec" style="margin-top:8px"><svg class="i"><use href="#search"/></svg>Search all on Discord</div>
+   <div class="foot">Created Mar 2024</div><div class="openin"><svg class="n"><use href="#n-discord"/></svg>Open in Discord<svg class="i i14"><use href="#ext"/></svg></div></div></div></div>
+ <div class="note">"…": Copy link · Open in Discord · — · Leave group (red, one confirm). Unknown presence (Mei) draws no dot and no word.</div></div>
+</div>
+
+<div class="row">
+<div class="fig"><div class="lbl">C3 · Telegram channel</div><div class="win"><div class="pane" style="border-left:0"><div class="pstrip"><div class="t">Details</div><div class="ib"><svg class="i"><use href="#x"/></svg></div></div>
+ <div class="pb"><div class="head"><div class="av av64" style="background:linear-gradient(135deg,#1e6f8f,#0d3346)"></div>
+  <div class="name">Riverbend News <svg class="i i14" style="color:var(--soft)"><use href="#badge"/></svg></div><div class="l3">@riverbend_news · Channel · 12,408 subscribers</div></div>
+  <div class="acts"><div class="btn sec f"><svg class="i"><use href="#copy"/></svg>Copy link</div><div class="ib"><svg class="i"><use href="#more"/></svg></div></div>
+  <div class="r28"><span>Notifications</span><div class="sw offsw"></div></div>
+  <div class="hr"></div><div class="sh first">About</div><div>Local news for the Riverbend valley. Tips: <span style="color:var(--at)">@riverbend_tips</span></div>
+  <div class="hr"></div><div class="tabs"><div class="tab sel">Media <span class="c">2,140</span></div><div class="tab">Files <span class="c">88</span></div><div class="tab">Links <span class="c">911</span></div></div>
+  <div class="src">All on Telegram</div><div class="grid"><div class="tile m2"></div><div class="tile m6"></div><div class="tile m1"></div></div></div></div></div>
+ <div class="note" style="max-width:300px">Not an admin, so no members row: the count stays in line 4. A group reads "Group · 214 members · 18 online" and has the members row.</div></div>
+
+<div class="fig"><div class="lbl">C4 · Teams channel, and a thread's strip</div><div class="win"><div class="pane" style="border-left:0"><div class="pstrip"><div class="t">Details</div><div class="ib"><svg class="i"><use href="#x"/></svg></div></div>
+ <div class="pb"><div class="head"><div class="av64" style="width:64px;height:64px;border-radius:16px;background:#3a3570"></div>
+  <div class="name">Design reviews <span class="tag">Shared</span></div><div class="l3">Contoso Design</div></div>
+  <div class="acts"><div class="btn sec f"><svg class="n n14"><use href="#n-teams"/></svg>Open in Teams</div><div class="ib"><svg class="i"><use href="#more"/></svg></div></div>
+  <div class="r28"><span>Notifications</span><div class="seg"><span class="sel">All</span><span>Mentions</span><span>Off</span></div></div>
+  <div class="hr"></div><div class="sh first">About</div><div>Weekly critique. Post work by Wednesday noon.</div>
+  <div class="sh">Members</div><div class="place"><div class="faces"><div class="av p-omar"></div><div class="av p-b"></div><div class="av p-e"></div></div><span>46</span><svg class="i x"><use href="#chr"/></svg></div></div></div></div>
+ <div class="win" style="margin-top:16px;width:300px"><div class="pane" style="border-left:0"><div class="pstrip" style="height:auto;padding:12px 12px 12px 16px;align-items:flex-start"><div style="flex:1"><div class="t" style="font:600 16px/22px -apple-system,system-ui,sans-serif">Thread</div><div style="color:var(--faint);margin-top:2px;white-space:nowrap">in #trail-cams · 6 replies</div><div style="display:flex;align-items:center;gap:6px;margin-top:6px;color:var(--faint);white-space:nowrap"><div class="faces"><div class="av p-juno"></div><div class="av p-c"></div><div class="av p-d"></div><div class="av p-a"></div></div>4 people</div></div><div class="ib"><svg class="i"><use href="#x"/></svg></div></div></div></div>
+ <div class="note" style="max-width:300px">A thread has no details of its own: up to 5 faces in its strip (P2); a face opens the card.</div></div>
+
+<div class="fig"><div class="lbl">D · Space details (Discord server, from its name)</div><div class="win"><div class="pane" style="border-left:0"><div class="pstrip"><div class="t">Details</div><div class="ib"><svg class="i"><use href="#x"/></svg></div></div>
+ <div class="pb"><div class="head"><div class="band" style="background:#24331d"></div><div class="av64 s-moss" style="width:64px;height:64px;border-radius:16px;position:relative"></div>
+  <div class="name">Moss &amp; Lichen</div><div class="l3">1,204 members · <span class="g on" style="width:8px;height:8px;margin-right:4px"></span>230 online</div></div>
+  <div class="r28" style="margin-top:16px"><span>Notifications</span><div class="seg"><span>All</span><span class="sel">Mentions</span><span>Nothing</span></div></div>
+  <div class="hr"></div><div class="sh first">About</div><div>Foraging, fungi and field cameras across the north ridge. Read #rules before posting finds.</div>
+  <div class="sh">Role</div><div><b style="font-weight:600">Robin</b> <span class="l3">in Moss &amp; Lichen</span></div><div class="chips"><span class="chip"><i style="background:#7a9be0"></i>Photographer</span><span class="chip"><i style="background:#5fb37a"></i>Member</span></div>
+  <div class="foot">You joined Jun 2021</div><div class="openin"><svg class="n"><use href="#n-discord"/></svg>Open in Discord<svg class="i i14"><use href="#ext"/></svg></div></div></div></div>
+ <div class="note" style="max-width:300px">No invite, settings or leave. Slack: workspace host, no counts. Teams: "Team · 46 members".</div></div>
+</div>
+
+<!-- CARD -->
+<h2><b>K</b>The floating card</h2>
+<p class="cap">The pane's top third at the same content width. Anchored right of the clicked avatar, 8 gap, tops aligned. View profile pushes the pane with the same answer. Right: from a member row the card opens to the pane's left, shifted up to stay 8 from the window's bottom.</p>
+<div class="row">
+<div class="fig"><div class="win" style="width:640px;height:560px"><div class="conv" style="width:640px"><div class="cstrip"><svg class="i" style="color:var(--soft)"><use href="#hash"/></svg><div class="tt"><div class="t1">trail-cams</div><div class="t2">Moss &amp; Lichen › Trail</div></div></div>
+ <div class="msgs" style="justify-content:flex-start;padding-top:20px"><div class="m"><div class="a p-c"></div><div><div class="who">Bastien Orr<span>9:40 PM</span></div><div class="tx">Card 2 is nearly full again.</div></div></div><div class="m"><div class="a p-juno" style="box-shadow:0 0 0 2px var(--at)"></div><div><div class="who">Ju<span>9:51 PM</span></div><div class="tx">Pine marten at 03:12. Clip in the thread.</div></div></div></div><div class="comp">Message #trail-cams</div></div>
+ <div class="ovl card" style="left:68px;top:136px"><div class="pb"><div class="head"><div class="band" style="background:#2a3e3a"></div><div class="av av64 p-juno"><div class="dot"><i class="on"></i></div></div>
+  <div class="name">Juno Castellane</div><div class="l3">@juno.c · they/them</div><div class="pres"><span class="g on"></span>Online · <span style="color:var(--soft)">🌿 foraging all weekend</span></div></div>
+  <div class="acts"><div class="btn pri f"><svg class="i"><use href="#msg"/></svg>Message</div><div class="btn sec f"><svg class="i"><use href="#phone"/></svg>Call</div></div>
+  <div style="margin-top:12px"><span class="l3" style="font-size:12px"><b style="color:var(--text);font-weight:600">Ju</b> in Moss &amp; Lichen</span><div class="chips"><span class="chip"><i style="background:#5fb37a"></i>Trail lead</span><span class="chip"><i style="background:#e0a63a"></i>Moderator</span><span class="chip">+2</span></div></div>
+  <div style="display:flex;align-items:center;gap:4px;margin-top:12px"><div class="sq20 s-moss"></div><div class="sq20 s-tile"></div><div class="sq20 s-night"></div><span style="font-size:12px;color:var(--soft);margin-left:4px">3 servers in common</span></div>
+  <div class="cardfoot"><div class="btn gh"><svg class="i"><use href="#panel"/></svg>View profile</div><svg class="n" style="margin-right:8px"><use href="#n-discord"/></svg></div></div></div>
+ <div class="ann" style="left:376px;top:142px">← top aligned with the avatar, 8 gap</div><div class="ann" style="left:376px;top:470px">← grows down only; max H − 16, then scrolls</div>
+</div></div>
+
+<div class="fig"><div class="win" style="width:680px;height:560px"><div class="conv"><div class="cstrip"><svg class="i" style="color:var(--soft)"><use href="#hash"/></svg><div class="tt"><div class="t1">general</div><div class="t2">Moss &amp; Lichen</div></div><div class="ib on"><svg class="i"><use href="#users"/></svg></div></div><div class="msgs"></div><div class="comp">Message #general</div></div>
+ <div class="pane"><div class="pstrip"><div class="t">Members</div><div class="ib"><svg class="i"><use href="#x"/></svg></div></div><div class="pb">
+  <div class="sh first">Online · 12</div>
+  <div class="mrow"><div class="av av24 p-c"></div>Bastien Orr</div><div class="mrow"><div class="av av24 p-d"></div>Mei Arden</div><div class="mrow"><div class="av av24 p-b"></div>Rook Ellery</div>
+  <div class="sh">Offline · 116</div><div class="mrow"><div class="av av24 p-e"></div>Sable Quinn</div><div class="mrow"><div class="av av24 p-omar"></div>Tamsin Gale</div><div class="mrow"><div class="av av24 p-nadia"></div>Ulla Brandt</div><div class="mrow"><div class="av av24 p-a"></div>Vito Marsh</div><div class="mrow"><div class="av av24 p-tess"></div>Wendell Ash</div><div class="mrow" style="background:var(--sel)"><div class="av av24 p-c"></div>Xan Pell</div></div></div>
+ <div class="ovl card" style="left:72px;top:204px"><div class="pb"><div class="head"><div class="av av64 p-c"><div class="dot"><i class="off"></i></div></div>
+  <div class="name">Xan Pell</div><div class="l3">@xanpell</div><div class="pres" style="color:var(--soft)"><span class="g off"></span>Offline</div></div>
+  <div class="acts"><div class="btn pri f"><svg class="i"><use href="#msg"/></svg>Message</div></div>
+  <div style="margin-top:12px;font-size:12px;line-height:16px;color:var(--soft);display:flex;gap:6px;align-items:center"><svg class="i i14"><use href="#info"/></svg>Not friends · they may not see your message</div>
+  <div style="margin-top:12px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden">Mostly lurking. Ask me about lichens on old stone walls and I will not stop.</div>
+  <div class="cardfoot"><div class="btn gh"><svg class="i"><use href="#panel"/></svg>View profile</div><svg class="n" style="margin-right:8px"><use href="#n-discord"/></svg></div></div></div>
+ <div class="ann" style="left:380px;top:470px">row is here ↘ card shifted up, 8 from bottom</div>
+</div></div>
+</div>
+
+<!-- LOADING -->
+<h2><b>L</b>Loading, staleness, failure</h2>
+<p class="cap">The head is never a skeleton: it comes from the row. Nothing is drawn below the actions until the answer; after 150 ms static skeletons hold the commonest shape. No spinner. The 5-minute memory makes card → pane and reopen complete in the first frame.</p>
+<div class="row">
+ <div class="fig"><div class="lbl">0–150 ms · first frame</div><div class="win" style="height:520px"><div class="pane" style="border-left:0"><div class="pstrip"><div class="t">Profile</div><div class="ib"><svg class="i"><use href="#x"/></svg></div></div>
+  <div class="pb"><div class="head"><div class="av av64 p-tess"><div class="dot"><i class="idle"></i></div></div><div class="name">Tess Oduya</div><div class="l3">@tess.o</div><div class="pres"><span class="g idle"></span>Away · <span class="s">🎧 Heads down</span></div></div>
+  <div class="acts"><div class="btn sec f"><svg class="i"><use href="#hp"/></svg>Huddle in Slack<svg class="i i14 x"><use href="#ext"/></svg></div><div class="ib"><svg class="i"><use href="#more"/></svg></div></div><div class="r28"><span>Notifications</span><div class="sw"></div></div></div></div></div></div>
+ <div class="fig"><div class="lbl">after 150 ms, still waiting</div><div class="win" style="height:520px"><div class="pane" style="border-left:0"><div class="pstrip"><div class="t">Profile</div><div class="ib"><svg class="i"><use href="#x"/></svg></div></div>
+  <div class="pb"><div class="head"><div class="av av64 p-tess"><div class="dot"><i class="idle"></i></div></div><div class="name">Tess Oduya</div><div class="l3">@tess.o</div><div class="pres"><span class="g idle"></span>Away · <span class="s">🎧 Heads down</span></div></div>
+  <div class="acts"><div class="btn sec f"><svg class="i"><use href="#hp"/></svg>Huddle in Slack<svg class="i i14 x"><use href="#ext"/></svg></div><div class="ib"><svg class="i"><use href="#more"/></svg></div></div><div class="r28"><span>Notifications</span><div class="sw"></div></div>
+  <div class="hr"></div><div class="sk" style="width:30%;margin-top:8px"></div><div class="sk sk8" style="width:70%;margin-top:12px"></div><div class="sk sk8" style="width:90%;margin-top:8px"></div><div class="sk sk8" style="width:50%;margin-top:8px"></div>
+  <div style="display:flex;gap:2px;margin-top:24px"><div class="sk" style="width:88px;height:88px"></div><div class="sk" style="width:88px;height:88px"></div><div class="sk" style="width:88px;height:88px"></div></div></div></div></div></div>
+ <div class="fig"><div class="lbl">network unreachable</div><div class="win" style="height:520px"><div class="pane" style="border-left:0"><div class="pstrip"><div class="t">Profile</div><div class="ib"><svg class="i"><use href="#x"/></svg></div></div>
+  <div class="pb"><div class="head"><div class="av av64 p-juno"></div><div class="name">Juno Castellane</div><div class="l3">@juno.c</div></div>
+  <div class="acts"><div class="btn dis f"><svg class="i"><use href="#phone"/></svg>Call</div><div class="ib"><svg class="i"><use href="#more"/></svg></div></div>
+  <div class="ban"><svg class="i" style="color:var(--warn)"><use href="#cloud"/></svg><div class="w" style="font-size:12px">Discord is offline · showing what's on this Mac</div></div>
+  <div class="hr"></div><div class="tabs"><div class="tab sel">Media</div><div class="tab">Files</div><div class="tab">Links</div></div>
+  <div class="src">From messages loaded here · 3</div><div class="grid"><div class="tile m1"></div><div class="tile m2"></div><div class="tile m3"></div></div></div></div></div>
+  <div class="note" style="max-width:300px">Presence is unknown while offline, so no dot and no line. Call disabled (tooltip says why).</div></div>
+ <div class="fig"><div class="lbl">request failed, network up</div><div class="win" style="height:520px"><div class="pane" style="border-left:0"><div class="pstrip"><div class="t">Profile</div><div class="ib"><svg class="i"><use href="#x"/></svg></div></div>
+  <div class="pb"><div class="head"><div class="av av64 p-nadia"><div class="dot"><i class="off"></i></div></div><div class="name">Nadia Kovač</div><div class="l3">@nadia_k</div><div class="pres" style="color:var(--soft)"><span class="g off"></span>Last seen today at 8:12 PM</div></div>
+  <div class="acts"><div class="btn sec f"><svg class="i"><use href="#phone"/></svg>Call</div><div class="ib"><svg class="i"><use href="#more"/></svg></div></div>
+  <div class="hr"></div><div style="display:flex;align-items:center;justify-content:space-between;font-size:12px;color:var(--soft)">Couldn't load the rest<div class="btn gh sm">Retry</div></div></div></div></div></div>
+</div>
+
+<!-- MENU -->
+<h2><b>M</b>The "…" menu and its one confirm</h2>
+<p class="cap">Order: mute (when not their DM) · copies · open in · then destructive, last and red, after a separator. Each destructive item asks once, naming the person and the network.</p>
+<div class="row"><div class="fig"><div class="win" style="width:680px;height:420px;background:var(--canvas)">
+ <div class="ovl menu" style="left:24px;top:24px">
+  <div class="mi"><svg class="i"><use href="#belloff"/></svg>Mute</div><div class="msep"></div>
+  <div class="mi hl"><svg class="i"><use href="#copy"/></svg>Copy username</div><div class="mi"><svg class="i"><use href="#link"/></svg>Copy link</div><div class="mi" style="color:var(--soft)"><svg class="i"><use href="#copy"/></svg>Copy ID<span class="k">⌥</span></div>
+  <div class="mi"><svg class="n"><use href="#n-discord"/></svg>Open in Discord</div><div class="msep"></div>
+  <div class="mi red"><svg class="i"><use href="#umin"/></svg>Remove friend</div><div class="mi red"><svg class="i"><use href="#ban"/></svg>Block</div></div>
+ <div style="position:absolute;inset:0 0 0 268px;background:rgba(0,0,0,.5);display:flex;align-items:center;justify-content:center"><div class="modal"><div style="font:600 16px/22px -apple-system,system-ui,sans-serif">Block Lior Ashby on Discord?</div><div style="color:var(--soft);margin-top:8px">They won't be able to message you, and their messages in shared servers are hidden. You can unblock them from their profile.</div><div style="display:flex;justify-content:flex-end;gap:8px;margin-top:20px"><div class="btn sec">Cancel</div><div class="btn dg" style="height:32px">Block</div></div></div></div>
+</div><div class="note">The scrim covers the whole window in the build (<code>polish/01</code> §4); it is cropped here to keep the menu visible beside it. "Leave group" sits in the same slot on group details.</div></div></div>
+
+</body></html>

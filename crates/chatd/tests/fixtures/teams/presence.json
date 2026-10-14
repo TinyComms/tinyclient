@@ -1,0 +1,22 @@
+[
+ {
+  "mri": "8:orgid:00000000-0000-4000-8000-0000000000a1",
+  "etag": "A0072086544",
+  "status": 20000,
+  "presence": {
+   "sourceNetwork": "Self",
+   "availability": "Busy",
+   "activity": "InAMeeting",
+   "lastActiveTime": "2026-10-09T08:00:00.0000000Z",
+   "deviceType": "Desktop",
+   "calendarData": {
+    "isOutOfOffice": false
+   },
+   "note": {
+    "message": "<p>Heads down until 3</p>",
+    "publishTime": "2026-10-09T07:00:00.0000000Z",
+    "expiry": "9999-12-30T23:00:00.0000000Z"
+   }
+  }
+ }
+]

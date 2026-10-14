@@ -1,0 +1,219 @@
+{
+ "messages": [
+  {
+   "id": "1760000300300",
+   "sequenceId": 300,
+   "clientmessageid": "13937442378075700",
+   "version": "1760000300300",
+   "conversationid": "19:platform0general@thread.tacv2",
+   "conversationLink": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/conversations/19:platform0general@thread.tacv2;messageid=1760000300300",
+   "type": "Message",
+   "messagetype": "RichText/Media_Card",
+   "contenttype": "text",
+   "content": "<URIObject type=\"SWIFT.1\" url_thumbnail=\"https://urlp.asm.skype.com/v1/url/content?url=https://neu1-urlp.secure.skypeassets.com/static/card-128x128.png\"><Swift b64=\"eyJ0eXBlIjoibWVzc2FnZS9jYXJkIn0=\"></Swift>Card - access it on https://go.skype.com/cards.unsupported</URIObject>",
+   "amsreferences": [],
+   "from": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/8:orgid:00000000-0000-4000-8000-0000000000b2",
+   "imdisplayname": "Deploy Bot",
+   "composetime": "2025-10-09T08:58:20.3000000Z",
+   "originalarrivaltime": "2025-10-09T08:58:20.3000000Z",
+   "properties": {
+    "cards": "[{\"cardClientId\": \"c1\", \"contentType\": \"application/vnd.microsoft.card.adaptive\", \"content\": \"{\\\"type\\\": \\\"AdaptiveCard\\\", \\\"version\\\": \\\"1.4\\\", \\\"body\\\": [{\\\"type\\\": \\\"TextBlock\\\", \\\"text\\\": \\\"Build 512 passed\\\", \\\"weight\\\": \\\"bolder\\\"}], \\\"actions\\\": [{\\\"type\\\": \\\"Action.OpenUrl\\\", \\\"title\\\": \\\"Open\\\", \\\"url\\\": \\\"https://ci.example/512\\\"}]}\"}]"
+   }
+  },
+  {
+   "id": "1760000260260",
+   "sequenceId": 260,
+   "clientmessageid": "13937442060998940",
+   "version": "1760000260260",
+   "conversationid": "19:platform0general@thread.tacv2",
+   "conversationLink": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/conversations/19:platform0general@thread.tacv2;messageid=1760000260260",
+   "type": "Message",
+   "messagetype": "Event/Call",
+   "contenttype": "text",
+   "content": "<partlist type=\"ended\" alt=\"\"><part identity=\"8:orgid:00000000-0000-4000-8000-0000000000a1\"><name>Ana Ruiz</name><duration>185</duration></part></partlist>",
+   "amsreferences": [],
+   "from": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/8:orgid:00000000-0000-4000-8000-0000000000a1",
+   "imdisplayname": "Ana Ruiz",
+   "composetime": "2025-10-09T08:57:40.2600000Z",
+   "originalarrivaltime": "2025-10-09T08:57:40.2600000Z",
+   "properties": {}
+  },
+  {
+   "id": "1760000250250",
+   "sequenceId": 250,
+   "clientmessageid": "13937441981729750",
+   "version": "1760000250250",
+   "conversationid": "19:platform0general@thread.tacv2",
+   "conversationLink": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/conversations/19:platform0general@thread.tacv2;messageid=1760000250250",
+   "type": "Message",
+   "messagetype": "RichText/Html",
+   "contenttype": "text",
+   "content": "<p>Numbers are in</p>",
+   "amsreferences": [],
+   "from": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/8:orgid:00000000-0000-4000-8000-0000000000a1",
+   "imdisplayname": "Ana Ruiz",
+   "composetime": "2025-10-09T08:57:30.2500000Z",
+   "originalarrivaltime": "2025-10-09T08:57:30.2500000Z",
+   "properties": {
+    "files": "[{\"@type\": \"http://schema.skype.com/File\", \"version\": 2, \"id\": \"5f2b0d7e-0000-4000-8000-00000000f11e\", \"itemid\": \"5f2b0d7e-0000-4000-8000-00000000f11e\", \"fileName\": \"Q4 plan.xlsx\", \"title\": \"Q4 plan.xlsx\", \"fileType\": \"xlsx\", \"type\": \"xlsx\", \"state\": \"active\", \"fileSize\": 48211, \"baseUrl\": \"https://contoso.sharepoint.com/sites/Platform\", \"objectUrl\": \"https://contoso.sharepoint.com/sites/Platform/Shared Documents/General/Q4 plan.xlsx\", \"fileInfo\": {\"fileUrl\": \"https://contoso.sharepoint.com/sites/Platform/Shared Documents/General/Q4 plan.xlsx\", \"siteUrl\": \"https://contoso.sharepoint.com/sites/Platform\", \"serverRelativeUrl\": \"/sites/Platform/Shared Documents/General/Q4 plan.xlsx\", \"shareUrl\": \"https://contoso.sharepoint.com/:x:/s/Platform/EaBcDeF\", \"shareId\": \"u!abc\"}}]"
+   }
+  },
+  {
+   "id": "1760000220220",
+   "sequenceId": 220,
+   "clientmessageid": "13937441743922180",
+   "version": "1760000220220",
+   "conversationid": "19:platform0general@thread.tacv2",
+   "conversationLink": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/conversations/19:platform0general@thread.tacv2;messageid=1760000200200",
+   "type": "Message",
+   "messagetype": "RichText/Html",
+   "contenttype": "text",
+   "content": "<p>on it</p>",
+   "amsreferences": [],
+   "from": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/8:orgid:00000000-0000-4000-8000-0000000000aa",
+   "imdisplayname": "Me Myself",
+   "composetime": "2025-10-09T08:57:00.2200000Z",
+   "originalarrivaltime": "2025-10-09T08:57:00.2200000Z",
+   "properties": {}
+  },
+  {
+   "id": "1760000210210",
+   "sequenceId": 210,
+   "clientmessageid": "13937441664652990",
+   "version": "1760000210210",
+   "conversationid": "19:platform0general@thread.tacv2",
+   "conversationLink": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/conversations/19:platform0general@thread.tacv2;messageid=1760000200200",
+   "type": "Message",
+   "messagetype": "RichText/Html",
+   "contenttype": "text",
+   "content": "<p>nice, which panel?</p>",
+   "amsreferences": [],
+   "from": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/8:orgid:00000000-0000-4000-8000-0000000000a1",
+   "imdisplayname": "Ana Ruiz",
+   "composetime": "2025-10-09T08:56:50.2100000Z",
+   "originalarrivaltime": "2025-10-09T08:56:50.2100000Z",
+   "properties": {}
+  },
+  {
+   "id": "1760000200200",
+   "sequenceId": 200,
+   "clientmessageid": "13937441585383800",
+   "version": "1760000200200",
+   "conversationid": "19:platform0general@thread.tacv2",
+   "conversationLink": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/conversations/19:platform0general@thread.tacv2;messageid=1760000200200",
+   "type": "Message",
+   "messagetype": "RichText/Html",
+   "contenttype": "text",
+   "content": "<p>Dashboard after the fix</p><p><img itemscope=\"image\" style=\"vertical-align:bottom\" src=\"https://eu-api.asm.skype.com/v1/objects/0-weu-d1-0123456789abcdef/views/imgo\" alt=\"image\" itemtype=\"http://schema.skype.com/AMSImage\" width=\"640\" height=\"360\" id=\"x_0-weu-d1-0123456789abcdef\" itemid=\"0-weu-d1-0123456789abcdef\"></p>",
+   "amsreferences": [],
+   "from": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/8:orgid:00000000-0000-4000-8000-0000000000b2",
+   "imdisplayname": "Ben Okafor",
+   "composetime": "2025-10-09T08:56:40.2000000Z",
+   "originalarrivaltime": "2025-10-09T08:56:40.2000000Z",
+   "properties": {
+    "emotions": [
+     {
+      "key": "like",
+      "users": [
+       {
+        "mri": "8:orgid:00000000-0000-4000-8000-0000000000a1",
+        "time": 1760000201000,
+        "value": "1760000201000"
+       },
+       {
+        "mri": "8:orgid:00000000-0000-4000-8000-0000000000aa",
+        "time": 1760000202000,
+        "value": "1760000202000"
+       },
+       {
+        "mri": "8:orgid:00000000-0000-4000-8000-0000000000a1",
+        "time": 1760000203000,
+        "value": "1760000203000"
+       }
+      ]
+     },
+     {
+      "key": "heart",
+      "users": [
+       {
+        "mri": "8:orgid:00000000-0000-4000-8000-0000000000b2",
+        "time": 1760000204000,
+        "value": "1760000204000"
+       }
+      ]
+     },
+     {
+      "key": "laugh",
+      "users": []
+     }
+    ]
+   }
+  },
+  {
+   "id": "1760000150150",
+   "sequenceId": 150,
+   "clientmessageid": "13937441189037850",
+   "version": "1760000150150",
+   "conversationid": "19:platform0general@thread.tacv2",
+   "conversationLink": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/conversations/19:platform0general@thread.tacv2;messageid=1760000150150",
+   "type": "Message",
+   "messagetype": "RichText/Html",
+   "contenttype": "text",
+   "content": "",
+   "amsreferences": [],
+   "from": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/8:orgid:00000000-0000-4000-8000-0000000000c3",
+   "imdisplayname": "Cy Tran",
+   "composetime": "2025-10-09T08:55:50.1500000Z",
+   "originalarrivaltime": "2025-10-09T08:55:50.1500000Z",
+   "properties": {
+    "deletetime": "1760000151000"
+   }
+  },
+  {
+   "id": "1760000100100",
+   "sequenceId": 100,
+   "clientmessageid": "13937440792691900",
+   "version": "1760000100100",
+   "conversationid": "19:platform0general@thread.tacv2",
+   "conversationLink": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/conversations/19:platform0general@thread.tacv2;messageid=1760000100100",
+   "type": "Message",
+   "messagetype": "RichText/Html",
+   "contenttype": "text",
+   "content": "<p><b>Ship</b> <i>today</i>, <s>not</s> tomorrow: <code>cargo test</code> then <a href=\"https://ex.com/plan?a=1&amp;b=2\" title=\"https://ex.com/plan\">the plan</a>, <span itemscope=\"\" itemtype=\"http://schema.skype.com/Mention\" itemid=\"0\">Me Myself</span> &amp; <span itemscope=\"\" itemtype=\"http://schema.skype.com/Mention\" itemid=\"1\">General</span> <span class=\"animated-emoticon-20-smile\" title=\"Smile\" type=\"(smile)\"><img itemscope=\"\" itemtype=\"http://schema.skype.com/Emoji\" itemid=\"smile\" src=\"https://statics.teams.cdn.office.net/evergreen-assets/personal-expressions/v2/assets/emoticons/smile/default/20_f.png\" alt=\"🙂\" style=\"width:20px; height:20px\"></span></p><ol><li>build</li><li>deploy</li></ol><blockquote><p>looks good</p></blockquote>",
+   "amsreferences": [],
+   "from": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/8:orgid:00000000-0000-4000-8000-0000000000a1",
+   "imdisplayname": "Ana Ruiz",
+   "composetime": "2025-10-09T08:55:00.1000000Z",
+   "originalarrivaltime": "2025-10-09T08:55:00.1000000Z",
+   "properties": {
+    "subject": "Release plan",
+    "edittime": "1760000105000",
+    "mentions": "[{\"@type\": \"http://schema.skype.com/Mention\", \"itemid\": 0, \"mri\": \"8:orgid:00000000-0000-4000-8000-0000000000aa\", \"mentionType\": \"person\", \"displayName\": \"Me Myself\"}, {\"@type\": \"http://schema.skype.com/Mention\", \"itemid\": 1, \"mri\": \"19:platform0general@thread.tacv2\", \"mentionType\": \"channel\", \"displayName\": \"General\"}]"
+   }
+  },
+  {
+   "id": "1760000050050",
+   "sequenceId": 50,
+   "clientmessageid": "13937440396345950",
+   "version": "1760000050050",
+   "conversationid": "19:platform0general@thread.tacv2",
+   "conversationLink": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/conversations/19:platform0general@thread.tacv2;messageid=1760000050050",
+   "type": "Message",
+   "messagetype": "ThreadActivity/AddMember",
+   "contenttype": "text",
+   "content": "<addmember><eventtime>1760000050050</eventtime><initiator>8:orgid:00000000-0000-4000-8000-0000000000a1</initiator><target>8:orgid:00000000-0000-4000-8000-0000000000b2</target></addmember>",
+   "amsreferences": [],
+   "from": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/19:platform0general@thread.tacv2",
+   "imdisplayname": "",
+   "composetime": "2025-10-09T08:54:10.0500000Z",
+   "originalarrivaltime": "2025-10-09T08:54:10.0500000Z",
+   "properties": {}
+  }
+ ],
+ "_metadata": {
+  "backwardLink": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/conversations/19:platform0general@thread.tacv2/messages?startTime=1&pageSize=50&view=msnp24Equivalent&syncState=3e30cursor1",
+  "syncState": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/conversations/19:platform0general@thread.tacv2/messages?startTime=1&pageSize=50&view=msnp24Equivalent&syncState=3e30cursor1-now",
+  "lastCompleteSegmentStartTime": 1,
+  "lastCompleteSegmentEndTime": 1760000300300
+ }
+}

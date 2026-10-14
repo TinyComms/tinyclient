@@ -1,0 +1,5 @@
+{"ok": true,
+ "channels": [
+   {"id": "C0SIDE", "name": "main", "name_normalized": "main", "is_channel": true, "is_group": false, "is_im": false, "is_mpim": false, "is_private": false, "is_archived": false, "is_general": true, "created": 1700000000, "creator": "U0PAT"}
+ ],
+ "response_metadata": {"next_cursor": ""}}

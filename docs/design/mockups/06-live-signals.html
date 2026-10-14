@@ -1,0 +1,443 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>tinychat · 06 Live signals</title>
+<style>
+:root{
+  --rail:#0c0d11; --sidebar:#111217; --canvas:#15161c;
+  --hairline:rgba(255,255,255,.06); --raised:rgba(255,255,255,.04); --hover:rgba(255,255,255,.05); --selected:rgba(255,255,255,.09);
+  --text:#ededf2; --soft:#a0a2b1; --faint:#676a7d;
+  --accent:#7f8cff; --accent-soft:rgba(127,140,255,.15); --on-accent:#0c0d11;
+  --positive:#3fcf8e; --danger:#f2616b; --danger-soft:rgba(242,97,107,.14); --warning:#e3a94a;
+  /* new tokens */
+  --quiet-fill:rgba(255,255,255,.12); --warning-soft:rgba(227,169,74,.14); --toast:#23252e; --shadow:rgba(0,0,0,.4);
+}
+*{box-sizing:border-box}
+body{margin:0;padding:32px 40px 80px;background:#08090c;color:var(--text);font:13.5px/1.4 -apple-system,BlinkMacSystemFont,sans-serif;-webkit-font-smoothing:antialiased}
+h1{font-size:20px;margin:0 0 4px} h2{font-size:15px;margin:0 0 4px}
+.sub{color:var(--soft);margin:0 0 6px;max-width:860px}
+.frame{border:1px solid var(--hairline);border-radius:14px;padding:22px 24px;margin:26px 0;background:#0a0b0e}
+.cap{color:var(--soft);font-size:12px;margin:0 0 16px;max-width:900px}
+.lab{color:var(--soft);font-size:12px;padding-left:18px;max-width:520px}
+.lab b{color:var(--text);font-weight:600}
+.lab code,.cap code,.sub code{font:11px ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--accent)}
+.line{display:flex;align-items:center}
+.flex{display:flex} .wrap{flex-wrap:wrap} .gap{gap:20px}
+svg.g{fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;flex:none}
+
+/* ---- avatar ---- */
+.av{position:relative;flex:none;width:44px;height:44px}
+.av i{display:flex;align-items:center;justify-content:center;width:100%;height:100%;border-radius:50%;font-style:normal;font-weight:600;font-size:16.5px;color:#fff;
+  background:linear-gradient(160deg,hsl(var(--h) 62% 62%),hsl(calc(var(--h) + 29) 58% 42%))}
+.av.sq i{border-radius:13px}
+.av b{position:absolute;right:-3px;bottom:-3px;width:19px;height:19px;border-radius:6px;background:var(--sidebar);display:flex;align-items:center;justify-content:center}
+.av b svg{width:14px;height:14px}
+
+/* ---- badges ---- */
+.pill{flex:none;height:18px;min-width:18px;padding:0 5px;border-radius:9px;background:var(--accent);color:var(--on-accent);font-size:11px;font-weight:700;display:inline-flex;align-items:center;justify-content:center}
+.pill.quiet{background:var(--quiet-fill);color:var(--soft)}
+.pill.sm{height:16px;min-width:16px;padding:0 4px;border-radius:8px;font-size:10.5px}
+.slot{flex:none;width:18px;height:18px;display:flex;align-items:center;justify-content:center}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--accent)}
+.dot.sm{width:6px;height:6px}
+
+/* ---- sidebar ---- */
+.sb{flex:none;width:316px;background:var(--sidebar)}
+.row{height:64px;padding:2px 8px}
+.row>div{height:100%;padding:0 10px;border-radius:10px;display:flex;align-items:center;gap:12px}
+.row.sel>div{background:var(--selected)} .row.sel .av b{background:#26272c}
+.tx{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}
+.l1,.l2{display:flex;align-items:center;gap:8px}
+.ti{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:13.5px}
+.tm{flex:none;font-size:11.5px;color:var(--faint)}
+.pv{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:12.5px;color:var(--soft)}
+.s-num .ti,.s-unread .ti{font-weight:600}
+.s-num .pv{color:var(--text)} .s-num .tm{color:var(--accent)}
+.s-unread .tm{color:var(--soft)}
+.s-muted .ti,.s-muted .pv,.s-muted .tm{color:var(--faint)}
+.pv.ty{color:var(--accent)}
+.grp{height:28px;padding:0 18px 0 14px;display:flex;align-items:center;gap:6px;font-size:11.5px;font-weight:600;letter-spacing:.3px;text-transform:uppercase;color:var(--faint)}
+.grp .gl{flex:1} .grp.on{color:var(--text)}
+.strip{height:28px;margin:0 14px 8px;padding:0 10px;border-radius:8px;display:flex;align-items:center;gap:8px;font-size:12px}
+.strip span{flex:1} .strip a{font-weight:600;cursor:pointer}
+.strip.warn{background:var(--warning-soft);color:var(--warning)}
+.strip.dang{background:var(--danger-soft);color:var(--danger)}
+.strip.net{background:var(--raised);color:var(--soft)}
+.search{margin:14px 14px 10px;height:34px;padding:0 10px;border-radius:9px;background:var(--raised);border:1px solid var(--hairline);display:flex;align-items:center;gap:8px;color:var(--faint)}
+
+/* ---- rail ---- */
+.rc{width:132px;display:flex;flex-direction:column;align-items:center;margin-bottom:18px}
+.rc>div.r{width:72px;height:72px;background:var(--rail);display:flex;align-items:center;justify-content:center;border-radius:8px}
+.rc p{margin:8px 0 0;font-size:11.5px;color:var(--soft);text-align:center;line-height:1.35}
+.rc p b{color:var(--text);font-weight:600;display:block}
+.rb{position:relative;width:44px;height:44px;border-radius:13px;display:flex;align-items:center;justify-content:center}
+.rb.act{background:var(--selected)}
+.rb svg.ni{width:26px;height:26px}
+.rb .pill{position:absolute;top:-4px;right:-6px;box-shadow:0 0 0 2px var(--rail)}
+.rb .dot{position:absolute;top:0;right:0;box-shadow:0 0 0 2px var(--rail)}
+.ld{position:absolute;right:5px;bottom:5px;width:11px;height:11px;border-radius:6px;background:var(--rail);display:flex;align-items:center;justify-content:center}
+.ld i{width:7px;height:7px;border-radius:4px}
+.ld.hollow i{border:1.5px solid var(--warning)} .ld.hollowf i{border:1.5px solid var(--faint)}
+.ld.warn i{background:var(--warning)} .ld.dang i{background:var(--danger)}
+.o55 svg.ni{opacity:.55} .o40 svg.ni{opacity:.4}
+
+/* ---- conversation bits ---- */
+.cv{width:560px;background:var(--canvas);border-radius:10px;overflow:hidden}
+.msg{padding:12px 20px 2px;display:flex;gap:12px}
+.msg .av{width:34px;height:34px} .msg .av i{font-size:13px}
+.msg .hd{display:flex;align-items:center;gap:8px} .msg .hd b{font-weight:600} .msg .hd span{font-size:11.5px;color:var(--faint)}
+.msg .bd{font-size:14px;line-height:21px}
+.msg .note{font-size:12px;color:var(--faint)} .msg .note a{color:var(--accent);font-weight:600}
+.typing{height:20px;padding:0 36px;display:flex;align-items:center;gap:8px;font-size:12px;color:var(--soft)}
+.typing b{font-weight:500}
+.dots{width:18px;height:6px;display:flex;align-items:center;gap:3px}
+.dots i{width:4px;height:4px;border-radius:2px;background:var(--soft);opacity:.35}
+/* stepped: one change every 400 ms, no easing. In GPUI this is a timer, not an animation. */
+@keyframes d1{0%,33.33%{opacity:1}33.34%,100%{opacity:.35}}
+@keyframes d2{0%,33.33%{opacity:.35}33.34%,66.66%{opacity:1}66.67%,100%{opacity:.35}}
+@keyframes d3{0%,66.66%{opacity:.35}66.67%,100%{opacity:1}}
+.dots.live i:nth-child(1){animation:d1 1.2s steps(1) infinite}
+.dots.live i:nth-child(2){animation:d2 1.2s steps(1) infinite}
+.dots.live i:nth-child(3){animation:d3 1.2s steps(1) infinite}
+.dots.still i{opacity:.6}
+.comp{padding:0 20px 16px}
+.field{height:46px;padding:0 7px 0 16px;border-radius:14px;background:var(--raised);border:1px solid var(--hairline);display:flex;align-items:center;gap:10px;color:var(--faint)}
+.field span{flex:1}
+.sendb{width:32px;height:32px;border-radius:16px;background:var(--raised);display:flex;align-items:center;justify-content:center}
+.cline{padding:8px 4px 0;display:flex;align-items:center;gap:6px;font-size:12px}
+.cline a{font-weight:600;margin-left:4px}
+.bar{height:46px;padding:0 7px 0 16px;border-radius:14px;background:var(--danger-soft);display:flex;align-items:center;gap:10px;color:var(--text)}
+.bar span{flex:1}
+.btn{height:32px;padding:0 14px;border-radius:16px;background:var(--accent);color:var(--on-accent);font-weight:600;display:flex;align-items:center}
+
+/* ---- notifications ---- */
+.nt{width:356px;background:#2a2b31;border:1px solid rgba(255,255,255,.08);border-radius:16px;box-shadow:0 10px 30px rgba(0,0,0,.45);overflow:hidden}
+.nt .top{padding:12px 14px;display:flex;gap:11px}
+.app{flex:none;width:38px;height:38px;border-radius:9px;background:linear-gradient(160deg,#8f9bff,#5560d8);display:flex;align-items:center;justify-content:center;color:#fff}
+.nt .t{flex:1;min-width:0;font-size:13px;line-height:17px}
+.nt .t b{font-weight:600;display:flex;justify-content:space-between} .nt .t b span{font-weight:400;color:var(--soft);font-size:12px}
+.nt .t em{font-style:normal;font-weight:600;display:block}
+.nt .t p{margin:0;color:#d8d9e0}
+.nt .acts{display:flex;border-top:1px solid rgba(255,255,255,.08)}
+.nt .acts a{flex:1;text-align:center;padding:8px 0;font-size:13px;color:var(--text)}
+.nt .acts a+a{border-left:1px solid rgba(255,255,255,.08)}
+.nt .reply{margin:0 14px 12px;height:30px;border-radius:8px;background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.1);display:flex;align-items:center;padding:0 6px 0 10px;color:var(--faint);font-size:13px}
+.nt .reply span{flex:1} .nt .reply a{color:var(--accent);font-weight:600;padding:0 6px}
+.ncap{width:356px;font-size:12px;color:var(--soft);margin:10px 0 0}
+
+/* ---- toast ---- */
+.toast{display:inline-flex;align-items:center;gap:8px;height:36px;padding:0 12px;border-radius:10px;background:var(--toast);border:1px solid var(--hairline);box-shadow:0 8px 24px var(--shadow);font-size:13px;color:var(--text)}
+.toast .ac{align-self:stretch;display:flex;align-items:center;margin-left:4px;padding-left:12px;border-left:1px solid var(--hairline);color:var(--accent);font-weight:600}
+.pane{position:relative;width:640px;height:150px;background:var(--canvas);border-radius:10px;overflow:hidden}
+.pane .hd{height:52px;border-bottom:1px solid var(--hairline);display:flex;align-items:center;gap:12px;padding:0 20px;font-weight:600;font-size:14.5px}
+.pane .toast{position:absolute;top:64px;left:50%;transform:translateX(-50%)}
+
+/* ---- menu bar ---- */
+.mbar{height:26px;background:#1d1e24;display:flex;align-items:center;justify-content:flex-end;gap:16px;padding:0 14px;font-size:12.5px;color:#dcdde4;border-radius:8px 8px 0 0}
+.mi{position:relative;display:flex;align-items:center}
+.mi u{position:absolute;top:-1px;right:-3px;width:6px;height:6px;border-radius:3px;background:currentColor}
+.menu{width:270px;margin-left:auto;background:#2a2b31;border:1px solid rgba(255,255,255,.1);border-radius:8px;padding:5px;box-shadow:0 12px 30px rgba(0,0,0,.5);font-size:13px}
+.menu div{padding:4px 10px;border-radius:5px;display:flex;justify-content:space-between}
+.menu div.dis{color:var(--faint)} .menu hr{border:0;border-top:1px solid rgba(255,255,255,.1);margin:5px 8px}
+.menu div.hi{background:var(--accent);color:var(--on-accent)}
+.dock{width:64px;height:64px;border-radius:15px;background:linear-gradient(160deg,#8f9bff,#5560d8);position:relative;display:flex;align-items:center;justify-content:center;color:#fff}
+.dock s{position:absolute;top:-6px;right:-6px;min-width:24px;height:24px;border-radius:12px;background:#ff3b30;color:#fff;font-size:14px;text-decoration:none;display:flex;align-items:center;justify-content:center;padding:0 7px}
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute">
+  <defs>
+    <symbol id="n-slack" viewBox="0 0 512 512"><path d="M107.9 323.6c0 29.7-24 53.8-53.8 53.8S.3 353.4.3 323.6c0-29.7 24-53.8 53.8-53.8h53.8zm26.9 0c0-29.7 24-53.8 53.8-53.8s53.8 24 53.8 53.8V458c0 29.7-24 53.8-53.8 53.8s-53.8-24-53.8-53.8z" style="fill:#e01e5a"/><path d="M188.6 107.7c-29.7 0-53.8-24-53.8-53.8S158.8.1 188.6.1s53.8 24 53.8 53.8v53.8zm0 27.3c29.7 0 53.8 24 53.8 53.8s-24 53.8-53.8 53.8H53.8C24 242.6 0 218.5 0 188.8S24 135 53.8 135z" style="fill:#36c5f0"/><path d="M404.1 188.8c0-29.7 24-53.8 53.8-53.8s53.8 24 53.8 53.8-24 53.8-53.8 53.8h-53.8zm-26.9 0c0 29.7-24 53.8-53.8 53.8-29.7 0-53.8-24-53.8-53.8V54c0-29.7 24-53.8 53.8-53.8s53.8 24 53.8 53.8z" style="fill:#2eb67d"/><path d="M323.4 404.3c29.7 0 53.8 24 53.8 53.8 0 29.7-24 53.8-53.8 53.8-29.7 0-53.8-24-53.8-53.8v-53.8zm0-26.9c-29.7 0-53.8-24-53.8-53.8s24-53.8 53.8-53.8h134.8c29.7 0 53.8 24 53.8 53.8 0 29.7-24 53.8-53.8 53.8z" style="fill:#ecb22e"/></symbol>
+    <symbol id="n-discord" viewBox="0.02 57.8 511.92 396.3"><path d="M433.7 91a416.5 416.5 0 0 0-105.6-33.2c-4.6 8.2-9.9 19.3-13.5 28.1-39.4-5.9-78.4-5.9-117.1 0-3.7-8.8-9.1-19.9-13.7-28.1-37.1 6.4-72.6 17.7-105.7 33.3-66.8 101-85 199.5-75.9 296.6 44.3 33.1 87.3 53.2 129.6 66.4 10.4-14.4 19.7-29.6 27.7-45.7-15.3-5.8-29.9-13-43.7-21.3 3.7-2.7 7.2-5.6 10.7-8.5 84.2 39.4 175.8 39.4 259 0 3.5 2.9 7.1 5.8 10.7 8.5-13.9 8.3-28.5 15.5-43.8 21.3 8 16 17.3 31.3 27.7 45.7 42.3-13.2 85.3-33.3 129.6-66.4 10.8-112.5-18-210.1-76-296.7M170.9 328c-25.3 0-46-23.6-46-52.4s20.3-52.4 46-52.4 46.5 23.6 46 52.4c.1 28.8-20.2 52.4-46 52.4m170.2 0c-25.3 0-46-23.6-46-52.4s20.3-52.4 46-52.4 46.5 23.6 46 52.4c0 28.8-20.3 52.4-46 52.4" style="fill:#5865f2"/></symbol>
+    <symbol id="n-telegram" viewBox="0 0 512 512"><linearGradient id="tg-a" x1="256" x2="256" y1="2" y2="514" gradientTransform="matrix(1 0 0 -1 0 514)" gradientUnits="userSpaceOnUse"><stop offset="0" style="stop-color:#1d93d2"/><stop offset="1" style="stop-color:#38b0e3"/></linearGradient><circle cx="256" cy="256" r="256" style="fill:url(#tg-a)"/><path d="m173.3 274.7 30.4 84.1s3.8 7.9 7.9 7.9 64.5-62.9 64.5-62.9l67.3-129.9-169 79.1z" style="fill:#c8daea"/><path d="m213.6 296.3-5.8 62s-2.4 19 16.5 0c19-19 37.2-33.6 37.2-33.6" style="fill:#a9c6d8"/><path d="m173.8 277.7-62.5-20.4s-7.5-3-5.1-9.9c.5-1.4 1.5-2.6 4.5-4.7C124.6 233.1 367 146 367 146s6.8-2.3 10.9-.8c2 .6 3.6 2.3 4 4.4.4 1.8.6 3.7.5 5.5 0 1.6-.2 3.1-.4 5.4-1.5 23.8-45.7 201.6-45.7 201.6s-2.6 10.4-12.1 10.8c-4.7.2-9.3-1.6-12.6-4.9-18.6-16-82.8-59.2-97-68.6-.6-.4-1.1-1.1-1.2-1.9-.2-1 .9-2.2.9-2.2s111.8-99.4 114.8-109.8c.2-.8-.6-1.2-1.8-.9-7.4 2.7-136.2 84.1-150.4 93-.9.2-2 .3-3.1.1" style="fill:#fff"/></symbol>
+    <symbol id="n-microsoft-teams" viewBox="4 4 36 38"><path fill="url(#tm-a)" d="M21.9999 20h12c3.3137 0 6 2.6863 6 6v10c0 3.3137-2.6863 6-6 6s-6-2.6863-6-6V26c0-3.3137-2.6863-6-6-6"/><path fill="url(#tm-b)" d="M7.99988 24c0-3.3137 2.68632-6 6.00002-6h8c3.3137 0 6 2.6863 6 6v12c0 3.3137 2.6863 6 6 6l-16.0001-.0001c-5.5228 0-9.99992-4.4771-9.99992-10z"/><path fill="url(#tm-c)" fill-opacity=".7" d="M7.99988 24c0-3.3137 2.68632-6 6.00002-6h8c3.3137 0 6 2.6863 6 6v12c0 3.3137 2.6863 6 6 6l-16.0001-.0001c-5.5228 0-9.99992-4.4771-9.99992-10z"/><path fill="url(#tm-d)" fill-opacity=".7" d="M7.99988 24c0-3.3137 2.68632-6 6.00002-6h8c3.3137 0 6 2.6863 6 6v12c0 3.3137 2.6863 6 6 6l-16.0001-.0001c-5.5228 0-9.99992-4.4771-9.99992-10z"/><path fill="url(#tm-e)" d="M32.9999 18c2.7614 0 5-2.2386 5-5s-2.2386-5-5-5-5 2.2386-5 5 2.2386 5 5 5"/><path fill="url(#tm-f)" fill-opacity=".46" d="M32.9999 18c2.7614 0 5-2.2386 5-5s-2.2386-5-5-5-5 2.2386-5 5 2.2386 5 5 5"/><path fill="url(#tm-g)" fill-opacity=".4" d="M32.9999 18c2.7614 0 5-2.2386 5-5s-2.2386-5-5-5-5 2.2386-5 5 2.2386 5 5 5"/><path fill="url(#tm-h)" d="M17.9999 16c3.3137 0 6-2.6863 6-6 0-3.31371-2.6863-6-6-6s-6 2.68629-6 6c0 3.3137 2.6863 6 6 6"/><path fill="url(#tm-i)" fill-opacity=".6" d="M17.9999 16c3.3137 0 6-2.6863 6-6 0-3.31371-2.6863-6-6-6s-6 2.68629-6 6c0 3.3137 2.6863 6 6 6"/><path fill="url(#tm-j)" fill-opacity=".5" d="M17.9999 16c3.3137 0 6-2.6863 6-6 0-3.31371-2.6863-6-6-6s-6 2.68629-6 6c0 3.3137 2.6863 6 6 6"/><rect width="16" height="16" x="4" y="23" fill="url(#tm-k)" rx="3.25"/><rect width="16" height="16" x="4" y="23" fill="url(#tm-l)" fill-opacity=".7" rx="3.25"/><path fill="#fff" d="M15.4792 28.1054h-2.4471v7.466h-2.0648v-7.466H8.52014v-1.6768h6.95906z"/><defs><radialGradient id="tm-a" cx="0" cy="0" r="1" gradientTransform="matrix(13.4784 0 0 33.2694 39.7967 22.1739)" gradientUnits="userSpaceOnUse"><stop stop-color="#a98aff"/><stop offset=".14" stop-color="#8c75ff"/><stop offset=".565" stop-color="#5f50e2"/><stop offset=".9" stop-color="#3c2cb8"/></radialGradient><radialGradient id="tm-b" cx="0" cy="0" r="1" gradientTransform="rotate(68.1539 -7.71566095 14.71355834)scale(32.752 33.1231)" gradientUnits="userSpaceOnUse"><stop stop-color="#85c2ff"/><stop offset=".69" stop-color="#7588ff"/><stop offset="1" stop-color="#6459fe"/></radialGradient><radialGradient id="tm-d" cx="0" cy="0" r="1" gradientTransform="rotate(113.326 8.09285255 17.64474501)scale(19.2186 15.4273)" gradientUnits="userSpaceOnUse"><stop stop-color="#bd96ff"/><stop offset=".686685" stop-color="#bd96ff" stop-opacity="0"/></radialGradient><radialGradient id="tm-e" cx="0" cy="0" r="1" gradientTransform="matrix(0 -10 12.6216 0 32.9999 11.5714)" gradientUnits="userSpaceOnUse"><stop offset=".268201" stop-color="#6868f7"/><stop offset="1" stop-color="#3923b1"/></radialGradient><radialGradient id="tm-f" cx="0" cy="0" r="1" gradientTransform="rotate(40.0516 -.03068196 44.8729095)scale(7.14629 10.3363)" gradientUnits="userSpaceOnUse"><stop offset=".270711" stop-color="#a1d3ff"/><stop offset=".813393" stop-color="#a1d3ff" stop-opacity="0"/></radialGradient><radialGradient id="tm-g" cx="0" cy="0" r="1" gradientTransform="rotate(-41.6581 32.11799918 -43.41948423)scale(8.51275 20.8824)" gradientUnits="userSpaceOnUse"><stop stop-color="#e3acfd"/><stop offset=".816041" stop-color="#9fa2ff" stop-opacity="0"/></radialGradient><radialGradient id="tm-h" cx="0" cy="0" r="1" gradientTransform="matrix(0 -12 15.146 0 17.9999 8.28571)" gradientUnits="userSpaceOnUse"><stop offset=".268201" stop-color="#8282ff"/><stop offset="1" stop-color="#3923b1"/></radialGradient><radialGradient id="tm-i" cx="0" cy="0" r="1" gradientTransform="rotate(40.0516 -3.15465147 21.41641466)scale(8.57554 12.4035)" gradientUnits="userSpaceOnUse"><stop offset=".270711" stop-color="#a1d3ff"/><stop offset=".813393" stop-color="#a1d3ff" stop-opacity="0"/></radialGradient><radialGradient id="tm-j" cx="0" cy="0" r="1" gradientTransform="rotate(-41.6581 20.38180375 -26.51566158)scale(10.2153 25.0589)" gradientUnits="userSpaceOnUse"><stop stop-color="#e3acfd"/><stop offset=".816041" stop-color="#9fa2ff" stop-opacity="0"/></radialGradient><radialGradient id="tm-k" cx="0" cy="0" r="1" gradientTransform="rotate(45 -25.76345597 16.32842712)scale(22.6274)" gradientUnits="userSpaceOnUse"><stop offset=".046875" stop-color="#688eff"/><stop offset=".946875" stop-color="#230f94"/></radialGradient><radialGradient id="tm-l" cx="0" cy="0" r="1" gradientTransform="matrix(0 11.2 -13.0702 0 12 32.6)" gradientUnits="userSpaceOnUse"><stop offset=".570647" stop-color="#6965f6" stop-opacity="0"/><stop offset="1" stop-color="#8f8fff"/></radialGradient><linearGradient id="tm-c" x1="20.5936" x2="20.5936" y1="18" y2="42" gradientUnits="userSpaceOnUse"><stop offset=".801159" stop-color="#6864f6" stop-opacity="0"/><stop offset="1" stop-color="#5149de"/></linearGradient></defs></symbol>
+    
+    <symbol id="g-check" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></symbol>
+    <symbol id="g-check-check" viewBox="0 0 24 24"><path d="M18 6 7 17l-5-5"/><path d="m22 10-7.5 7.5L13 16"/></symbol>
+    <symbol id="g-circle-alert" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 8v4"/><path d="M12 16h.01"/></symbol>
+    <symbol id="g-wifi-off" viewBox="0 0 24 24"><path d="M12 20h.01"/><path d="M8.5 16.429a5 5 0 0 1 7 0"/><path d="M5 12.859a10 10 0 0 1 5.17-2.69"/><path d="M19 12.859a10 10 0 0 0-2.007-1.523"/><path d="M2 8.82a15 15 0 0 1 4.177-2.643"/><path d="M22 8.82a15 15 0 0 0-11.288-3.764"/><path d="m2 2 20 20"/></symbol>
+    <symbol id="g-bell-off" viewBox="0 0 24 24"><path d="M10.268 21a2 2 0 0 0 3.464 0"/><path d="M17 17H4a1 1 0 0 1-.74-1.673C4.59 13.956 6 12.499 6 8a6 6 0 0 1 .258-1.742"/><path d="m2 2 20 20"/><path d="M8.668 3.01A6 6 0 0 1 18 8c0 2.687.77 4.653 1.707 6.05"/></symbol>
+    <symbol id="g-download" viewBox="0 0 24 24"><path d="M12 15V3"/><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/></symbol>
+    <symbol id="g-log-out" viewBox="0 0 24 24"><path d="m16 17 5-5-5-5"/><path d="M21 12H9"/><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/></symbol>
+    <symbol id="g-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></symbol>
+    <symbol id="g-inbox" viewBox="0 0 24 24"><path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></symbol>
+    <symbol id="g-message-circle" viewBox="0 0 24 24"><path d="M7.9 20A9 9 0 1 0 4 16.1L2 22Z"/></symbol>
+    <symbol id="g-send" viewBox="0 0 24 24"><path d="M3.714 3.048a.498.498 0 0 0-.683.627l2.843 7.627a2 2 0 0 1 0 1.396l-2.842 7.627a.498.498 0 0 0 .682.627l18-8.5a.5.5 0 0 0 0-.904z"/><path d="M6 12h16"/></symbol>
+    <symbol id="g-chev-r" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></symbol>
+    <symbol id="g-chev-d" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
+    <symbol id="g-slash" viewBox="0 0 24 24"><path d="m3 3 18 18"/></symbol>
+  </defs>
+</svg>
+
+<h1>06 · Live signals</h1>
+<p class="sub">A number means someone needs me. A dot means there is something new. Healthy is silent. Every value swaps in one frame; the only motion in this file is the three typing dots in frame 3. Spec: <code>docs/design/06-live-signals.md</code>.</p>
+
+<!-- ============ 1. ROW STATES ============ -->
+<div class="frame">
+<h2>1 · Conversation row: the six states</h2>
+<p class="cap">64 px row, first match wins. The badge slot is a fixed 18 px at the right end of line 2, so nothing re-wraps when a state changes.</p>
+
+<div class="line"><div class="sb"><div class="row s-num"><div>
+  <div class="av sq" style="--h:265"><i>#</i><b><svg><use href="#n-slack"/></svg></b></div>
+  <div class="tx"><div class="l1"><div class="ti">#platform</div><div class="tm">9:45 AM</div></div>
+  <div class="l2"><div class="pv">Tomasz: @you can you check the canary?</div><span class="pill">@3</span></div></div></div></div></div>
+  <div class="lab"><b>1 Mention</b> · unmuted channel, mentions &gt; 0. Title 600 <code>text</code>, preview <code>text</code>, time <code>accent</code>, pill <code>@3</code> on <code>accent</code>. Notifies.</div></div>
+
+<div class="line"><div class="sb"><div class="row s-num"><div>
+  <div class="av" style="--h:22"><i>IV</i><b><svg><use href="#n-telegram"/></svg></b></div>
+  <div class="tx"><div class="l1"><div class="ti">Ines Varga</div><div class="tm">9:39 AM</div></div>
+  <div class="l2"><div class="pv">Are we still on for Thursday?</div><span class="pill">2</span></div></div></div></div></div>
+  <div class="lab"><b>2 Direct</b> · unmuted DM or group DM, unread &gt; 0. Same strength as a mention: both are a person waiting. No <code>@</code>. Notifies.</div></div>
+
+<div class="line"><div class="sb"><div class="row s-muted"><div>
+  <div class="av sq" style="--h:150"><i>#</i><b><svg><use href="#n-discord"/></svg></b></div>
+  <div class="tx"><div class="l1"><div class="ti">Driftwood / #random</div><div class="tm">9:31 AM</div></div>
+  <div class="l2"><div class="pv">Kwame: @you look at this</div><span class="pill quiet">@1</span></div></div></div></div></div>
+  <div class="lab"><b>3 Muted mention</b> · muted, mentions &gt; 0. Everything <code>text_faint</code>, weight 400, pill on <code>quiet_fill</code> with <code>text_soft</code>. Counts upward. Never notifies.</div></div>
+
+<div class="line"><div class="sb"><div class="row s-unread"><div>
+  <div class="av sq" style="--h:200"><i>#</i><b><svg><use href="#n-discord"/></svg></b></div>
+  <div class="tx"><div class="l1"><div class="ti">Driftwood / #gpui</div><div class="tm">9:15 AM</div></div>
+  <div class="l2"><div class="pv">Odile: uniform_list only lays out what is on screen</div><span class="slot"><span class="dot"></span></span></div></div></div></div></div>
+  <div class="lab"><b>4 Unread</b> · unmuted channel, unread, no mention. Title 600, preview and time <code>text_soft</code>, 8 px <code>accent</code> dot. Never a count. Never notifies.</div></div>
+
+<div class="line"><div class="sb"><div class="row s-muted"><div>
+  <div class="av sq" style="--h:320"><i>#</i><b><svg><use href="#n-slack"/></svg></b></div>
+  <div class="tx"><div class="l1"><div class="ti">#announcements</div><div class="tm">8:13 AM</div></div>
+  <div class="l2"><div class="pv">Office closed Friday for the move.</div><span class="slot" style="color:var(--faint)"><svg class="g" width="12" height="12"><use href="#g-bell-off"/></svg></span></div></div></div></div></div>
+  <div class="lab"><b>5 Muted</b> · muted, unread or not. All <code>text_faint</code>, <code>bell-off</code> 12 px. No dot, sorts as read. An <code>@everyone</code> the network suppresses lands here or in 4, never in 1.</div></div>
+
+<div class="line"><div class="sb"><div class="row"><div>
+  <div class="av" style="--h:95"><i>KA</i><b><svg><use href="#n-microsoft-teams"/></svg></b></div>
+  <div class="tx"><div class="l1"><div class="ti">Kwame Adeyo</div><div class="tm">7:44 AM</div></div>
+  <div class="l2"><div class="pv">On it.</div><span class="slot"></span></div></div></div></div></div>
+  <div class="lab"><b>6 Read</b> · title 400 <code>text</code>, preview <code>text_soft</code>, time <code>text_faint</code>, empty slot.</div></div>
+
+<div class="line"><div class="sb"><div class="row s-muted sel"><div>
+  <div class="av sq" style="--h:150"><i>#</i><b><svg><use href="#n-discord"/></svg></b></div>
+  <div class="tx"><div class="l1"><div class="ti">Driftwood / #random</div><div class="tm">9:31 AM</div></div>
+  <div class="l2"><div class="pv">Kwame: @you look at this</div><span class="pill quiet">@1</span></div></div></div></div></div>
+  <div class="lab">State 3 on a selected row: <code>quiet_fill</code> (white 12%) stays visible on <code>selected</code> (white 9%).</div></div>
+
+<div class="line"><div class="sb"><div class="row s-num"><div>
+  <div class="av" style="--h:22"><i>IV</i><b><svg><use href="#n-telegram"/></svg></b></div>
+  <div class="tx"><div class="l1"><div class="ti">Ines Varga</div><div class="tm">9:39 AM</div></div>
+  <div class="l2"><div class="pv ty">typing…</div><span class="pill">2</span></div></div></div></div></div>
+  <div class="lab"><b>Typing in a 1:1</b> · preview replaced by <code>typing…</code> in <code>accent</code>. Static, no dots. State and position unchanged.</div></div>
+
+<div class="line"><div class="sb"><div class="row"><div>
+  <div class="av" style="--h:290"><i>LT</i><b><svg><use href="#n-discord"/></svg></b></div>
+  <div class="tx"><div class="l1"><div class="ti">Lisbon trip</div><div class="tm">Yesterday</div></div>
+  <div class="l2"><div class="pv ty">Ines is typing…</div><span class="slot"></span></div></div></div></div></div>
+  <div class="lab"><b>Typing in a group DM</b> · the name is included. Channel rows never show typing.</div></div>
+</div>
+
+<!-- ============ 1b. GROUP + SPACE ============ -->
+<div class="frame">
+<h2>1b · The same signals one level up: Group headers and Space rows</h2>
+<p class="cap">A parent's number is the sum of the numbers inside. A parent's dot means "no number, but an unmuted channel inside is unread". Never both. Expanded headers show nothing: the rows speak.</p>
+
+<div class="line"><div class="sb"><div class="grp on"><svg class="g" width="12" height="12"><use href="#g-chev-r"/></svg><span class="gl">Engineering</span><span class="pill sm">4</span></div></div>
+  <div class="lab"><b>Collapsed Group, number</b> · 28 px header, pill h 16, 10.5 px bold. Label <code>text_faint</code> → <code>text</code>. No <code>@</code> above row level.</div></div>
+<div class="line"><div class="sb"><div class="grp on"><svg class="g" width="12" height="12"><use href="#g-chev-r"/></svg><span class="gl">Text channels</span><span class="slot" style="width:16px;height:16px"><span class="dot sm"></span></span></div></div>
+  <div class="lab"><b>Collapsed Group, dot</b> · 6 px dot.</div></div>
+<div class="line"><div class="sb"><div class="grp on"><svg class="g" width="12" height="12"><use href="#g-chev-r"/></svg><span class="gl">Off topic</span><span class="pill sm quiet">1</span></div></div>
+  <div class="lab"><b>Collapsed Group, quiet number</b> · every number inside is a muted mention.</div></div>
+<div class="line"><div class="sb"><div class="grp"><svg class="g" width="12" height="12"><use href="#g-chev-r"/></svg><span class="gl">Archive</span></div></div>
+  <div class="lab"><b>Collapsed Group, read or all muted</b> · nothing.</div></div>
+<div class="line"><div class="sb"><div class="grp"><svg class="g" width="12" height="12"><use href="#g-chev-d"/></svg><span class="gl">Direct messages</span></div></div>
+  <div class="lab"><b>Expanded Group</b> · never carries a signal, whatever is inside.</div></div>
+
+<div class="line" style="margin-top:10px"><div class="sb"><div class="row s-num"><div>
+  <div class="av sq" style="--h:230"><i>NW</i></div>
+  <div class="tx"><div class="l1"><div class="ti">Northwind</div></div>
+  <div class="l2"><div class="pv">Workspace · 42 channels</div><span class="pill">5</span></div></div></div></div></div>
+  <div class="lab"><b>Space row, number</b> · sum of DMs and mentions inside. Title 600.</div></div>
+<div class="line"><div class="sb"><div class="row s-unread"><div>
+  <div class="av sq" style="--h:40"><i>DW</i></div>
+  <div class="tx"><div class="l1"><div class="ti">Driftwood</div></div>
+  <div class="l2"><div class="pv">Server · 18 channels</div><span class="slot"><span class="dot"></span></span></div></div></div></div></div>
+  <div class="lab"><b>Space row, dot</b> · unread in a channel I follow, nothing addressed to me.</div></div>
+<div class="line"><div class="sb"><div class="row s-muted"><div>
+  <div class="av sq" style="--h:340"><i>PK</i></div>
+  <div class="tx"><div class="l1"><div class="ti">Pixel Kitchen</div></div>
+  <div class="l2"><div class="pv">Server · 96 channels</div><span class="slot" style="color:var(--faint)"><svg class="g" width="12" height="12"><use href="#g-bell-off"/></svg></span></div></div></div></div></div>
+  <div class="lab"><b>Muted Space</b> · contributes nothing upward unless I am mentioned inside; then a quiet pill.</div></div>
+</div>
+
+<!-- ============ 2. RAIL ============ -->
+<div class="frame">
+<h2>2 · Rail button: every badge and every connection state</h2>
+<p class="cap">Top right is "what is waiting" (pill 18 px or dot 8 px, each on a 2 px rail-colored ring). Bottom right is "what is wrong with the link" (7 px in an 11 px ring). A healthy, read network shows neither.</p>
+<div class="flex wrap">
+  <div class="rc"><div class="r"><div class="rb act" style="color:var(--text)"><svg class="g" width="22" height="22"><use href="#g-inbox"/></svg><span class="pill">7</span></div></div><p><b>Inbox, number</b>equals the Dock badge</p></div>
+  <div class="rc"><div class="r"><div class="rb" style="color:var(--soft)"><svg class="g" width="22" height="22"><use href="#g-inbox"/></svg><span class="dot"></span></div></div><p><b>Inbox, dot</b>a starred channel is unread</p></div>
+  <div class="rc"><div class="r"><div class="rb"><svg class="ni"><use href="#n-slack"/></svg><span class="pill">3</span></div></div><p><b>Number</b>DMs + mentions</p></div>
+  <div class="rc"><div class="r"><div class="rb"><svg class="ni"><use href="#n-discord"/></svg><span class="pill">99+</span></div></div><p><b>99+</b>cap</p></div>
+  <div class="rc"><div class="r"><div class="rb"><svg class="ni"><use href="#n-discord"/></svg><span class="dot"></span></div></div><p><b>Dot</b>unread, nothing for me</p></div>
+  <div class="rc"><div class="r"><div class="rb"><svg class="ni"><use href="#n-discord"/></svg><span class="pill quiet">1</span></div></div><p><b>Quiet number</b>only muted mentions</p></div>
+  <div class="rc"><div class="r"><div class="rb"><svg class="ni"><use href="#n-telegram"/></svg></div></div><p><b>Connected, read</b>nothing at all</p></div>
+  <div class="rc"><div class="r"><div class="rb"><div class="av sq" style="--h:230;width:32px;height:32px"><i style="font-size:12px;border-radius:9px">NW</i></div><span class="pill">5</span></div></div><p><b>Pinned Space</b>its own number</p></div>
+</div>
+<div class="flex wrap" style="margin-top:6px">
+  <div class="rc"><div class="r"><div class="rb o55"><svg class="ni"><use href="#n-slack"/></svg></div></div><p><b>Connecting</b>icon at 0.55, first 5 s</p></div>
+  <div class="rc"><div class="r"><div class="rb"><svg class="ni"><use href="#n-slack"/></svg><span class="ld hollow"><i></i></span></div></div><p><b>Reconnecting</b>hollow, at once</p></div>
+  <div class="rc"><div class="r"><div class="rb"><svg class="ni"><use href="#n-slack"/></svg><span class="pill">3</span><span class="ld hollow"><i></i></span></div></div><p><b>Reconnecting + number</b>last known count stays</p></div>
+  <div class="rc"><div class="r"><div class="rb"><svg class="ni"><use href="#n-discord"/></svg><span class="ld warn"><i></i></span></div></div><p><b>Offline</b>solid warning, after 60 s</p></div>
+  <div class="rc"><div class="r"><div class="rb o55"><svg class="ni"><use href="#n-microsoft-teams"/></svg><span class="ld dang"><i></i></span></div></div><p><b>Session expired</b>solid danger, icon 0.55</p></div>
+  <div class="rc"><div class="r"><div class="rb o40"><svg class="ni"><use href="#n-telegram"/></svg></div></div><p><b>Signed out</b>icon 0.4, no dot</p></div>
+  <div class="rc"><div class="r"><div class="rb"><svg class="ni"><use href="#n-telegram"/></svg><span class="ld hollowf"><i></i></span></div></div><p><b>Mac offline</b>hollow, faint: not its fault</p></div>
+  <div class="rc"><div class="r"><div class="rb" style="color:var(--warning)"><svg class="g" width="20" height="20"><use href="#g-bell-off"/></svg></div></div><p><b>Notifications paused</b>bell button, warning</p></div>
+</div>
+</div>
+
+<!-- ============ 3. TYPING ============ -->
+<div class="frame">
+<h2>3 · Typing row</h2>
+<p class="cap">A fixed 20 px slot directly above the composer, always reserved, so messages never shift. Three 4 px dots in an 18 x 6 px box; the lit dot steps every 400 ms (2.5 changes a second, no easing). No avatars. This is the only motion in the product's live signals.</p>
+<div class="flex wrap gap">
+  <div><div class="cv">
+    <div class="msg"><div class="av" style="--h:22"><i>IV</i></div><div><div class="hd"><b>Ines Varga</b><span>9:39 AM</span></div><div class="bd">Are we still on for Thursday?</div></div></div>
+    <div style="height:10px"></div>
+    <div class="typing"><span class="dots live"><i></i><i></i><i></i></span><span><b>Ines</b> is typing…</span></div>
+    <div class="comp"><div class="field"><span>Message Ines Varga</span><div class="sendb"><svg class="g" width="16" height="16"><use href="#g-send"/></svg></div></div></div>
+  </div><p class="ncap"><b style="color:var(--text)">One person.</b> Live: stepped dots.</p></div>
+
+  <div><div class="cv">
+    <div style="height:14px"></div>
+    <div class="typing"><span class="dots live"><i></i><i></i><i></i></span><span><b>Ines</b> and <b>Tomasz</b> are typing…</span></div>
+    <div class="comp"><div class="field"><span>Message #platform</span><div class="sendb"><svg class="g" width="16" height="16"><use href="#g-send"/></svg></div></div></div>
+  </div><p class="ncap"><b style="color:var(--text)">Two people.</b></p>
+  <div class="cv" style="margin-top:14px">
+    <div style="height:14px"></div>
+    <div class="typing"><span class="dots live"><i></i><i></i><i></i></span><span>Several people are typing…</span></div>
+    <div class="comp"><div class="field"><span>Message #platform</span><div class="sendb"><svg class="g" width="16" height="16"><use href="#g-send"/></svg></div></div></div>
+  </div><p class="ncap"><b style="color:var(--text)">Three or more.</b> No names, no count.</p></div>
+
+  <div><div class="cv">
+    <div style="height:14px"></div>
+    <div class="typing"><span class="dots still"><i></i><i></i><i></i></span><span><b>Ines</b> is typing…</span></div>
+    <div class="comp"><div class="field"><span>Message Ines Varga</span><div class="sendb"><svg class="g" width="16" height="16"><use href="#g-send"/></svg></div></div></div>
+  </div><p class="ncap"><b style="color:var(--text)">Still.</b> Window not key, or 30 s of continuous typing: all three dots at 0.6, no timer.</p>
+  <div class="cv" style="margin-top:14px">
+    <div style="height:14px"></div>
+    <div class="typing"></div>
+    <div class="comp"><div class="field"><span>Message Ines Varga</span><div class="sendb"><svg class="g" width="16" height="16"><use href="#g-send"/></svg></div></div></div>
+  </div><p class="ncap"><b style="color:var(--text)">Nobody.</b> The slot is empty but keeps its 20 px.</p></div>
+</div>
+</div>
+
+<!-- ============ 4. CONNECTION ============ -->
+<div class="frame">
+<h2>4 · Connection states: sidebar strip and composer line</h2>
+<p class="cap">Strip: 28 px under the search field, in Network and Space mode for that network. Composer line: the existing 12 px line under the field. Both appear only after 5 s of trouble; a blip changes nothing but the rail dot. No countdowns.</p>
+<div class="flex wrap gap">
+  <div><div class="sb" style="border-radius:10px"><div style="height:1px"></div><div class="search"><svg class="g" width="15" height="15"><use href="#g-search"/></svg>Search</div>
+    <div class="strip warn"><svg class="g" width="14" height="14"><use href="#g-wifi-off"/></svg><span>Reconnecting…</span></div></div>
+    <p class="ncap" style="width:316px"><b style="color:var(--text)">Reconnecting</b>, after 5 s. <code>warning</code> on <code>warning_soft</code>. No action.</p></div>
+  <div><div class="sb" style="border-radius:10px"><div style="height:1px"></div><div class="search"><svg class="g" width="15" height="15"><use href="#g-search"/></svg>Search</div>
+    <div class="strip warn"><svg class="g" width="14" height="14"><use href="#g-wifi-off"/></svg><span>Can't reach Discord</span><a>Retry now</a></div></div>
+    <p class="ncap" style="width:316px"><b style="color:var(--text)">Offline</b>, after 60 s with the Mac online.</p></div>
+  <div><div class="sb" style="border-radius:10px"><div style="height:1px"></div><div class="search"><svg class="g" width="15" height="15"><use href="#g-search"/></svg>Search</div>
+    <div class="strip dang"><svg class="g" width="14" height="14"><use href="#g-log-out"/></svg><span>Slack signed you out</span><a>Sign in again</a></div></div>
+    <p class="ncap" style="width:316px"><b style="color:var(--text)">Session expired.</b> <code>danger</code> on <code>danger_soft</code>. The cached list stays below it. Not the same as never signed in, which shows the sign-in prompt instead of a list.</p></div>
+  <div><div class="sb" style="border-radius:10px"><div style="height:1px"></div><div class="search"><svg class="g" width="15" height="15"><use href="#g-search"/></svg>Search</div>
+    <div class="strip net"><svg class="g" width="14" height="14"><use href="#g-wifi-off"/></svg><span>No internet connection</span></div></div>
+    <p class="ncap" style="width:316px"><b style="color:var(--text)">Mac offline.</b> One neutral strip in every mode including Inbox; it replaces all per-network lines.</p></div>
+</div>
+<div class="flex wrap gap" style="margin-top:22px">
+  <div><div class="cv"><div style="height:14px"></div><div class="typing"></div><div class="comp"><div class="field"><span>Message #gpui</span><div class="sendb"><svg class="g" width="16" height="16"><use href="#g-send"/></svg></div></div>
+    <div class="cline" style="color:var(--warning)"><svg class="g" width="14" height="14"><use href="#g-wifi-off"/></svg>Discord is reconnecting…</div></div></div>
+    <p class="ncap"><b style="color:var(--text)">Reconnecting.</b> Return still works: the message waits up to 60 s.</p></div>
+  <div><div class="cv"><div style="height:14px"></div><div class="typing"></div><div class="comp"><div class="field"><span>Message #gpui</span><div class="sendb"><svg class="g" width="16" height="16"><use href="#g-send"/></svg></div></div>
+    <div class="cline" style="color:var(--warning)"><svg class="g" width="14" height="14"><use href="#g-wifi-off"/></svg>Can't reach Discord. Messages won't send.<a>Retry now</a></div></div></div>
+    <p class="ncap"><b style="color:var(--text)">Offline.</b></p></div>
+  <div><div class="cv"><div style="height:14px"></div><div class="typing"></div><div class="comp"><div class="field"><span>Message #gpui</span><div class="sendb"><svg class="g" width="16" height="16"><use href="#g-send"/></svg></div></div>
+    <div class="cline" style="color:var(--soft)">Discord is slowing things down. Sending in a moment.</div></div></div>
+    <p class="ncap"><b style="color:var(--text)">Rate-limited</b>, only when a send has waited over 2 s. <code>text_soft</code>: it is not an error yet.</p></div>
+  <div><div class="cv"><div style="height:14px"></div><div class="typing"></div><div class="comp"><div class="bar"><span>Slack signed you out. Your messages are still here.</span><div class="btn">Sign in again</div></div></div></div>
+    <p class="ncap"><b style="color:var(--text)">Session expired.</b> The composer is replaced by a bar of the same 46 px height.</p></div>
+</div>
+</div>
+
+<!-- ============ 5. RECEIPTS ============ -->
+<div class="frame">
+<h2>5 · Delivery and read marks</h2>
+<p class="cap">One 12 px glyph after the timestamp of my newest message only. Telegram and Teams direct chats get sent and read; every network gets pending and failed.</p>
+<div class="flex wrap gap">
+  <div class="cv" style="width:400px;padding-bottom:12px"><div class="msg" style="opacity:.55"><div class="av" style="--h:215"><i>Y</i></div><div><div class="hd"><b>You</b><span>9:46 AM</span></div><div class="bd">Thursday works. 10?</div></div></div></div>
+  <div class="cv" style="width:400px;padding-bottom:12px"><div class="msg"><div class="av" style="--h:215"><i>Y</i></div><div><div class="hd"><b>You</b><span>9:46 AM</span><svg class="g" width="12" height="12" style="color:var(--faint)"><use href="#g-check"/></svg></div><div class="bd">Thursday works. 10?</div></div></div></div>
+  <div class="cv" style="width:400px;padding-bottom:12px"><div class="msg"><div class="av" style="--h:215"><i>Y</i></div><div><div class="hd"><b>You</b><span>9:46 AM</span><svg class="g" width="12" height="12" style="color:var(--accent)"><use href="#g-check-check"/></svg></div><div class="bd">Thursday works. 10?</div></div></div></div>
+  <div class="cv" style="width:400px;padding-bottom:12px"><div class="msg" style="opacity:.55"><div class="av" style="--h:215"><i>Y</i></div><div><div class="hd"><b>You</b><span>9:46 AM</span></div><div class="bd">Thursday works. 10?</div><div class="note">Waiting for Slack…</div></div></div></div>
+  <div class="cv" style="width:400px;padding-bottom:12px"><div class="msg"><div class="av" style="--h:215"><i>Y</i></div><div><div class="hd"><b>You</b><span>9:46 AM</span><svg class="g" width="12" height="12" style="color:var(--danger)"><use href="#g-circle-alert"/></svg></div><div class="bd">Thursday works. 10?</div><div class="note"><span style="color:var(--danger)">Not sent</span> · <a>Retry</a> · <a>Delete</a> · You can't post here</div></div></div></div>
+</div>
+<p class="cap" style="margin:14px 0 0">In order: pending (row at 0.55, no glyph) · sent <code>check</code> · read <code>check-check</code> in <code>accent</code> · waiting for the link · failed <code>circle-alert</code> in <code>danger</code> with the reason in words.</p>
+</div>
+
+<!-- ============ 6. NOTIFICATIONS ============ -->
+<div class="frame">
+<h2>6 · macOS notifications</h2>
+<p class="cap">System notifications; drawn here only to fix the content. One per conversation, replaced in place. No avatar image in v1.</p>
+<div class="flex wrap gap">
+  <div><div class="nt"><div class="top"><div class="app"><svg class="g" width="20" height="20"><use href="#g-message-circle"/></svg></div>
+    <div class="t"><b>Ines Varga <span>now</span></b><p>Are we still on for Thursday?<br>I can do 10 or 2.</p></div></div>
+    <div class="reply"><span>Reply to Ines</span><a>Send</a></div></div>
+    <p class="ncap"><b style="color:var(--text)">DM</b>, two messages in a burst: one notification, newest lines in the body, the second made no sound. Reply expanded. Actions: Reply, Mark as Read.</p></div>
+  <div><div class="nt"><div class="top"><div class="app"><svg class="g" width="20" height="20"><use href="#g-message-circle"/></svg></div>
+    <div class="t"><b>Tomasz Brandt <span>2m ago</span></b><em>#platform · Northwind</em><p>@you can you check the canary before we roll to prod?</p></div></div>
+    <div class="acts"><a>Reply</a><a>Mark as Read</a></div></div>
+    <p class="ncap"><b style="color:var(--text)">Mention.</b> Subtitle is channel and Space. A thread reply reads <code>Thread in #platform · Northwind</code>.</p></div>
+  <div><div class="nt"><div class="top"><div class="app"><svg class="g" width="20" height="20"><use href="#g-message-circle"/></svg></div>
+    <div class="t"><b>Ines Varga <span>5m ago</span></b><p>Missed voice call</p></div></div>
+    <div class="acts"><a>Call Back</a><a>Message</a></div></div>
+    <p class="ncap"><b style="color:var(--text)">Missed call.</b></p></div>
+  <div><div class="nt"><div class="top"><div class="app"><svg class="g" width="20" height="20"><use href="#g-message-circle"/></svg></div>
+    <div class="t"><b>Slack <span>now</span></b><p>New mention</p></div></div></div>
+    <p class="ncap"><b style="color:var(--text)">Text hidden</b> (our "Show message text" off, for screen sharing). On a locked Mac the system does the same with its own setting and shows only <code>New message</code>.</p></div>
+  <div><div class="nt"><div class="top"><div class="app"><svg class="g" width="20" height="20"><use href="#g-message-circle"/></svg></div>
+    <div class="t"><b>Slack signed you out <span>now</span></b><p>Open tinychat to sign in again.</p></div></div></div>
+    <p class="ncap"><b style="color:var(--text)">Session expired</b>, posted once, only when the window is closed.</p></div>
+</div>
+</div>
+
+<!-- ============ 7. TOASTS ============ -->
+<div class="frame">
+<h2>7 · Toasts</h2>
+<p class="cap">Only for the result of something I just did that is not visible where I am looking. Top center of the conversation pane, 12 px under the header. One at a time; a new one replaces the old. Opaque surface with a shadow, no blur, no slide, no fade.</p>
+<div class="pane"><div class="hd"><div class="av sq" style="--h:265;width:30px;height:30px"><i style="font-size:12px;border-radius:9px">#</i></div>#platform</div>
+  <div class="toast"><svg class="g" width="14" height="14" style="color:var(--soft)"><use href="#g-check"/></svg>Copied</div></div>
+<div class="flex wrap" style="gap:14px;margin-top:18px">
+  <div class="toast"><svg class="g" width="14" height="14" style="color:var(--soft)"><use href="#g-download"/></svg>Saved to Downloads<span class="ac">Show</span></div>
+  <div class="toast"><svg class="g" width="14" height="14" style="color:var(--soft)"><use href="#g-check-check"/></svg>Marked 14 conversations read<span class="ac">Undo</span></div>
+  <div class="toast"><svg class="g" width="14" height="14" style="color:var(--danger)"><use href="#g-circle-alert"/></svg>Not sent to Ines Varga<span class="ac">Open</span></div>
+  <div class="toast"><svg class="g" width="14" height="14" style="color:var(--danger)"><use href="#g-log-out"/></svg>Slack signed you out<span class="ac">Sign in again</span></div>
+  <div class="toast"><svg class="g" width="14" height="14" style="color:var(--danger)"><use href="#g-circle-alert"/></svg>Couldn't open Teams</div>
+</div>
+<p class="cap" style="margin:14px 0 0">2 s plain, 5 s with an action, 6 to 8 s for the two that need me. "Not sent" appears only when that conversation is not the open one; otherwise the message row already says it.</p>
+</div>
+
+<!-- ============ 8. DOCK + MENU BAR ============ -->
+<div class="frame">
+<h2>8 · Dock badge and menu bar</h2>
+<p class="cap">The Dock badge is the sum of every number (DMs + mentions) and nothing else; the system draws it. The menu-bar item is how I know tinychat is still receiving with the window closed, and where I stop it.</p>
+<div class="flex wrap" style="gap:48px;align-items:flex-start">
+  <div style="padding-top:8px"><div class="dock"><svg class="g" width="34" height="34"><use href="#g-message-circle"/></svg><s>7</s></div><p class="ncap" style="width:150px">Dock: <code>7</code>. Cleared at zero. Never a dot.</p></div>
+  <div><div class="flex" style="gap:26px;color:#dcdde4;padding:8px 0">
+      <div class="mi"><svg class="g" width="16" height="16"><use href="#g-message-circle"/></svg></div>
+      <div class="mi"><svg class="g" width="16" height="16"><use href="#g-message-circle"/></svg><u></u></div>
+      <div class="mi"><svg class="g" width="16" height="16"><use href="#g-message-circle"/></svg><svg class="g" width="16" height="16" style="position:absolute;left:0"><use href="#g-slash"/></svg></div>
+    </div><p class="ncap" style="width:230px">Menu-bar glyph, static template image: all quiet · something is waiting · a network is offline or needs sign-in. No number.</p></div>
+  <div style="width:300px"><div class="mbar"><div class="mi"><svg class="g" width="16" height="16"><use href="#g-message-circle"/></svg><u></u></div><span>Tue 9:46 AM</span></div>
+    <div class="menu">
+      <div>Open tinychat</div><hr>
+      <div class="dis">Slack · Connected</div><div class="dis">Discord · Reconnecting</div><div class="dis">Telegram · Connected</div><div class="dis">Teams · Signed out by Teams</div><hr>
+      <div>Pause Notifications <span>›</span></div><div>Settings… <span style="color:var(--faint)">⌘,</span></div><hr>
+      <div>Quit tinychat Completely <span style="color:var(--faint)">⌥⌘Q</span></div>
+    </div></div>
+</div>
+</div>
+
+</body>
+</html>

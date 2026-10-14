@@ -1,0 +1,306 @@
+//! Avatars: a circle is a person, a rounded square is a place. An image when its file is on
+//! disk, decoded off the main thread at the size it is drawn; a flat tint with initials until then.
+
+use super::glyph;
+use crate::gui::theme;
+use gpui::{
+    div, img, prelude::*, px, App, Asset, Div, Global, ImageSource, RenderImage, Rgba, Window,
+};
+use image::{imageops::FilterType, Frame, ImageReader};
+use protocol::{Key, MediaFile, Presence};
+use smallvec::SmallVec;
+use std::collections::{HashSet, VecDeque};
+use std::path::PathBuf;
+use std::sync::Arc;
+
+/// Decoded avatars kept. Far more than one screen shows; the rest are decoded again on demand.
+const THUMBS: usize = 512;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Shape {
+    Person,
+    Place,
+}
+
+/// A file on disk, and how many pixels across it is wanted.
+type ThumbSource = (PathBuf, u32);
+
+struct Thumb;
+
+impl Asset for Thumb {
+    type Source = ThumbSource;
+    type Output = Option<Arc<RenderImage>>;
+
+    fn load(
+        (path, pixels): Self::Source,
+        cx: &mut App,
+    ) -> impl std::future::Future<Output = Self::Output> + Send + 'static {
+        cx.background_executor().spawn(async move { decode(&path, pixels) })
+    }
+}
+
+fn decode(path: &std::path::Path, pixels: u32) -> Option<Arc<RenderImage>> {
+    let image = ImageReader::open(path).ok()?.with_guessed_format().ok()?.decode().ok()?;
+    let mut scaled = image.resize_to_fill(pixels, pixels, FilterType::CatmullRom).into_rgba8();
+    // GPUI's textures are BGRA.
+    for pixel in scaled.pixels_mut() {
+        pixel.0.swap(0, 2);
+    }
+    let frames: SmallVec<[Frame; 1]> = SmallVec::from_elem(Frame::new(scaled), 1);
+    Some(Arc::new(RenderImage::new(frames)))
+}
+
+/// Which thumbs are decoded, oldest first, so the cache stays bounded.
+#[derive(Default)]
+struct Thumbs {
+    known: HashSet<ThumbSource>,
+    order: VecDeque<ThumbSource>,
+}
+
+impl Global for Thumbs {}
+
+fn thumb(source: &ThumbSource, window: &mut Window, cx: &mut App) -> Option<Arc<RenderImage>> {
+    if !cx.default_global::<Thumbs>().known.contains(source) {
+        let thumbs = cx.global_mut::<Thumbs>();
+        thumbs.known.insert(source.clone());
+        thumbs.order.push_back(source.clone());
+        if thumbs.order.len() > THUMBS {
+            if let Some(old) = thumbs.order.pop_front() {
+                thumbs.known.remove(&old);
+                if let Some(Some(image)) = window.use_asset::<Thumb>(&old, cx) {
+                    cx.drop_image(image, Some(window));
+                }
+                cx.remove_asset::<Thumb>(&old);
+            }
+        }
+    }
+    window.use_asset::<Thumb>(source, cx).flatten()
+}
+
+/// Up to `count` letters that stand for a name.
+pub fn initials(name: &str, count: usize) -> String {
+    let letters: String = name
+        .split(|c: char| !c.is_alphanumeric())
+        .filter_map(|word| word.chars().next())
+        .take(count)
+        .flat_map(char::to_uppercase)
+        .collect();
+    if letters.is_empty() {
+        "?".to_owned()
+    } else {
+        letters
+    }
+}
+
+fn hash(parts: &[&str]) -> u32 {
+    parts.iter().flat_map(|part| part.bytes().chain([0])).fold(2166136261u32, |hash, byte| {
+        (hash ^ byte as u32).wrapping_mul(16777619)
+    })
+}
+
+/// The tint of a person or place: hashed from the network and id, so it is the same everywhere.
+pub fn tint_of(key: &Key) -> usize {
+    (hash(&[key.network.label(), &key.id]) % 8) as usize
+}
+
+pub struct Avatar {
+    name: String,
+    tint: usize,
+    size: f32,
+    shape: Shape,
+    image: Option<PathBuf>,
+    glyph: Option<&'static str>,
+    /// A glyph plate takes the tint rather than the neutral fill.
+    tinted: bool,
+    presence: Option<(Presence, Rgba)>,
+}
+
+impl Avatar {
+    pub fn new(key: &Key, name: &str, size: f32) -> Avatar {
+        Avatar {
+            name: name.to_owned(),
+            tint: tint_of(key),
+            size,
+            shape: Shape::Person,
+            image: None,
+            glyph: None,
+            tinted: false,
+            presence: None,
+        }
+    }
+
+    /// With no id to hash, the name stands in.
+    pub fn named(name: &str, size: f32) -> Avatar {
+        Avatar {
+            name: name.to_owned(),
+            tint: (hash(&[name]) % 8) as usize,
+            size,
+            shape: Shape::Person,
+            image: None,
+            glyph: None,
+            tinted: false,
+            presence: None,
+        }
+    }
+
+    /// A channel: its glyph on a neutral plate.
+    pub fn channel(icon: &'static str, size: f32) -> Avatar {
+        Avatar {
+            glyph: Some(icon),
+            shape: Shape::Place,
+            ..Avatar::named("", size)
+        }
+    }
+
+    /// A channel in a list that mixes Spaces: its glyph on its Space's tint, so the channels
+    /// of one Space read as one family and two Spaces apart.
+    pub fn channel_in(space: &Key, icon: &'static str, size: f32) -> Avatar {
+        Avatar { glyph: Some(icon), shape: Shape::Place, tinted: true, ..Avatar::new(space, "", size) }
+    }
+
+    pub fn shape(mut self, shape: Shape) -> Avatar {
+        self.shape = shape;
+        self
+    }
+
+    /// Drawn once the file is on disk; the tint holds its box until then.
+    pub fn image(mut self, file: Option<&MediaFile>) -> Avatar {
+        self.image = file.and_then(|file| file.path.clone()).map(PathBuf::from);
+        self
+    }
+
+    /// The picture's file, when the caller has already found where it is.
+    pub fn image_at(mut self, path: Option<PathBuf>) -> Avatar {
+        self.image = path;
+        self
+    }
+
+    /// `ring` is the color behind the avatar, so the dot's ring follows hover and selection.
+    #[allow(dead_code)]
+    pub fn presence(mut self, presence: Presence, ring: Rgba) -> Avatar {
+        self.presence = Some((presence, ring));
+        self
+    }
+
+    pub fn build(self) -> Div {
+        let size = self.size;
+        let radius = match self.shape {
+            Shape::Person => size / 2.,
+            Shape::Place => (size * 0.25).round(),
+        };
+        let (fill, letters) = theme::tint(self.tint);
+        let plate = div().size(px(size)).rounded(px(radius)).flex().items_center().justify_center();
+        let plate = match self.glyph {
+            Some(icon) if self.tinted => plate.bg(fill).child(glyph(icon, if size >= 32. { 16. } else { 14. }, letters)),
+            Some(icon) => plate
+                .bg(theme::raised())
+                .child(glyph(icon, if size >= 32. { 16. } else { 14. }, theme::text_soft())),
+            None => plate
+                .bg(fill)
+                .text_color(letters)
+                .text_size(px((size * 0.4).round()))
+                .font_weight(theme::SEMIBOLD)
+                .child(initials(&self.name, if size >= 32. { 2 } else { 1 })),
+        };
+        let picture = self.image.map(|path| {
+            let source: ThumbSource = (path, (size * 2.).ceil() as u32);
+            img(ImageSource::Custom(Arc::new(move |window, cx| {
+                thumb(&source, window, cx).map(Ok)
+            })))
+            .absolute()
+            .top_0()
+            .left_0()
+            .size(px(size))
+            .rounded(px(radius))
+        });
+        div()
+            .relative()
+            .size(px(size))
+            .flex_none()
+            .child(plate)
+            .children(picture)
+            // Keeps a dark image off the dark surface.
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size(px(size))
+                    .rounded(px(radius))
+                    .border_1()
+                    .border_color(gpui::rgba(0xffffff0f)),
+            )
+            .children(self.presence.and_then(|(presence, ring)| presence_dot(presence, size, ring)))
+    }
+}
+
+/// A group conversation with no picture of its own: two of its people at 66% on the diagonal,
+/// the front one ringed in the color behind the avatar.
+// CONTRACT: a group conversation does not list its members, so the two are the first two names
+// of its title, which the networks build from the members.
+pub fn pair(key: &Key, title: &str, size: f32, ring: Rgba) -> Div {
+    let mut names = title.split(',').map(str::trim).filter(|name| !name.is_empty());
+    let (back, front) = (names.next().unwrap_or(title), names.next().unwrap_or(title));
+    let small = (size * 0.66).round();
+    let person = |name: &str| Avatar::new(&Key { id: format!("{}/{name}", key.id), ..key.clone() }, name, small).build();
+    div()
+        .relative()
+        .size(px(size))
+        .flex_none()
+        .child(div().absolute().top_0().left_0().child(person(back)))
+        .child(
+            div()
+                .absolute()
+                .right(px(-2.))
+                .bottom(px(-2.))
+                .rounded(px(small / 2. + 2.))
+                .border_2()
+                .border_color(ring)
+                .child(person(front)),
+        )
+}
+
+/// The presence shape on an avatar's bottom-right corner, coded by shape as well as color.
+/// Unknown draws nothing, and so does a 16 pt avatar.
+pub fn presence_dot(presence: Presence, avatar: f32, ring: Rgba) -> Option<Div> {
+    let diameter = match avatar as u32 {
+        0..=19 => return None,
+        20..=31 => 8.,
+        32..=63 => 10.,
+        _ => 14.,
+    };
+    let dot = div().size(px(diameter)).rounded(px(diameter / 2.));
+    let dot = match presence {
+        Presence::Unknown => return None,
+        Presence::Online => dot.bg(theme::online()),
+        // A bite out of the top-left.
+        Presence::Idle => dot.bg(theme::idle()).relative().child(
+            div()
+                .absolute()
+                .top(px(-1.))
+                .left(px(-1.))
+                .size(px((diameter * 0.6).round()))
+                .rounded(px(diameter))
+                .bg(ring),
+        ),
+        Presence::Busy => dot.bg(theme::dnd()),
+        Presence::Dnd => dot.bg(theme::dnd()).flex().items_center().justify_center().child(
+            div().w(px((diameter * 0.6).round())).h(px(2.)).rounded(px(1.)).bg(ring),
+        ),
+        Presence::Offline => dot.border_2().border_color(theme::offline()),
+    };
+    let outer = diameter + 4.;
+    Some(
+        div()
+            .absolute()
+            .right(px(-4.))
+            .bottom(px(-4.))
+            .size(px(outer))
+            .rounded(px(outer / 2.))
+            .bg(ring)
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(dot),
+    )
+}

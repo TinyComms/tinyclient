@@ -1,0 +1,480 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>tinychat · 01 visual system · component sheet</title>
+<meta name="viewport" content="width=1280">
+<style>
+/* Only effects GPUI reproduces: solid and linear-gradient fills, borders, radii, box shadows,
+   opacity. No transitions, no animation, no filter, no backdrop-filter, no blend modes. */
+:root{
+  --sidebar:#121315; --canvas:#18191C; --raised:#1F2023; --overlay:#25262A;
+  --hairline:rgba(255,255,255,.08); --border:rgba(255,255,255,.12); --border-strong:rgba(255,255,255,.20);
+  --hover:rgba(255,255,255,.06); --selected:rgba(255,255,255,.12); --pressed:rgba(255,255,255,.16);
+  --text:#EDEEF0; --soft:#A8ABB3; --faint:#858993; --disabled:#53565E;
+  --accent:#2F6FEB; --accent-hover:#3A77EE; --accent-pressed:#2861D3; --accent-text:#8AB4FF;
+  --accent-soft:rgba(47,111,235,.18); --on-accent:#FFFFFF; --focus:#8AB4FF;
+  --online:#3FBF7A; --idle:#E0A63A; --danger:#F0655D; --danger-fill:#D13F3F; --danger-soft:rgba(240,101,93,.15);
+  --scrim:rgba(0,0,0,.5);
+  --sh-tip:0 2px 8px rgba(0,0,0,.40);
+  --sh-pop:0 0 0 1px rgba(0,0,0,.40),0 2px 6px rgba(0,0,0,.30),0 12px 32px rgba(0,0,0,.45);
+  --sh-modal:0 0 0 1px rgba(0,0,0,.40),0 4px 12px rgba(0,0,0,.35),0 24px 64px rgba(0,0,0,.55);
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--canvas);color:var(--text);font:400 13px/18px -apple-system,system-ui,sans-serif;
+  -webkit-font-smoothing:antialiased;padding:32px 40px 64px;width:1280px}
+svg.i{width:16px;height:16px;flex:none;fill:none;stroke:currentColor;stroke-width:2.25;stroke-linecap:round;stroke-linejoin:round}
+svg.i14{width:14px;height:14px;stroke-width:2.5} svg.i20{width:20px;height:20px;stroke-width:1.75}
+img.net{flex:none;display:block}
+.tn{font-variant-numeric:tabular-nums}
+
+/* sheet chrome */
+h1{font:600 20px/26px -apple-system,system-ui,sans-serif;margin-bottom:4px}
+.lede{color:var(--soft);max-width:760px;margin-bottom:8px}
+section{margin-top:40px;border-top:1px solid var(--hairline);padding-top:16px}
+h2{font:600 16px/22px -apple-system,system-ui,sans-serif;margin-bottom:16px}
+.grid{display:flex;flex-wrap:wrap;gap:24px 32px;align-items:flex-start}
+.spec{display:flex;flex-direction:column;gap:8px}
+.spec>label,.cap{font:500 11px/14px -apple-system,system-ui,sans-serif;color:var(--faint)}
+.line{display:flex;gap:12px;align-items:center}
+.pane{width:306px;background:var(--sidebar);border:1px solid var(--hairline);border-radius:8px;padding:8px}
+.stage{position:relative;background:var(--canvas);border:1px solid var(--hairline);border-radius:8px}
+
+/* swatches */
+.sw{width:136px}.sw i{display:block;height:40px;border-radius:6px;border:1px solid var(--hairline)}
+.sw b{display:block;font:500 12px/16px -apple-system,system-ui,sans-serif;margin-top:6px}.sw span{font:400 11px/14px ui-monospace,Menlo,monospace;color:var(--faint)}
+
+/* type */
+.t11{font:500 11px/14px -apple-system,system-ui,sans-serif}.t12{font:400 12px/16px -apple-system,system-ui,sans-serif}.t13{font:400 13px/18px -apple-system,system-ui,sans-serif}
+.t14{font:400 14px/20px -apple-system,system-ui,sans-serif}.t16{font:600 16px/22px -apple-system,system-ui,sans-serif}.t20{font:600 20px/26px -apple-system,system-ui,sans-serif}
+.code{font:400 13px/20px ui-monospace,"SF Mono",Menlo,monospace}
+
+/* button */
+.btn{height:28px;padding:0 12px;border-radius:6px;display:inline-flex;align-items:center;justify-content:center;gap:6px;
+  font:500 13px/18px -apple-system,system-ui,sans-serif;border:1px solid transparent;white-space:nowrap;cursor:default}
+.btn.icon-l{padding-left:10px}
+.btn.sm{height:24px;padding:0 8px;font-size:12px}.btn.lg{height:32px;padding:0 16px}
+.primary{background:var(--accent);color:var(--on-accent)}
+.primary.h{background:var(--accent-hover)}.primary.a{background:var(--accent-pressed)}
+.secondary{background:var(--hover);border-color:var(--border);color:var(--text)}
+.secondary.h{background:var(--selected);border-color:var(--border-strong)}.secondary.a{background:rgba(255,255,255,.03)}
+.ghost{color:var(--soft)}.ghost.h{background:var(--hover);color:var(--text)}.ghost.a{background:var(--selected);color:var(--text)}
+.dangerb{background:var(--danger-soft);color:var(--danger)}
+.dangerb.h{background:var(--danger-fill);color:#fff}.dangerb.a{background:#B93636;color:#fff}
+.btn.d{background:var(--hover);border-color:transparent;color:var(--disabled)}
+.ghost.d{background:none}
+.fr{box-shadow:0 0 0 2px var(--focus)}
+.fr-gap{box-shadow:0 0 0 2px var(--canvas),0 0 0 4px var(--focus)}
+.ib{width:28px;height:28px;border-radius:6px;display:inline-flex;align-items:center;justify-content:center;color:var(--soft)}
+.ib.h{background:var(--hover);color:var(--text)}.ib.a{background:var(--pressed);color:var(--text)}
+.ib.on{background:var(--selected);color:var(--text)}.ib.d{color:var(--disabled)}
+.ib.sm{width:24px;height:24px}
+
+/* fields */
+.field{height:28px;width:220px;border-radius:6px;background:rgba(255,255,255,.04);border:1px solid var(--border);
+  display:flex;align-items:center;gap:6px;padding:0 8px;color:var(--text)}
+.field .ph{color:var(--faint)}.field.h{border-color:var(--border-strong)}
+.field.f{border-color:var(--focus);box-shadow:0 0 0 3px rgba(47,111,235,.35);background:rgba(255,255,255,.02)}
+.field.e{border-color:var(--danger)}.field.d{opacity:.5}
+.caret{width:2px;height:16px;background:var(--accent-text);margin-left:-5px}
+.selx{background:rgba(47,111,235,.45);border-radius:2px}
+.help{font:400 12px/16px -apple-system,system-ui,sans-serif;color:var(--soft)}.help.e{color:var(--danger)}
+.kbd{height:18px;min-width:18px;padding:0 4px;border-radius:4px;border:1px solid var(--border);color:var(--faint);
+  font:500 11px/16px -apple-system,system-ui,sans-serif;display:inline-flex;align-items:center;justify-content:center}
+.grow{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.clear{width:20px;height:20px;border-radius:4px;display:flex;align-items:center;justify-content:center;color:var(--faint);margin-right:-4px}
+
+/* switch, checkbox */
+.switch{width:32px;height:18px;border-radius:9px;background:rgba(255,255,255,.16);padding:2px;display:flex}
+.switch i{width:14px;height:14px;border-radius:7px;background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.4)}
+.switch.on{background:var(--accent);justify-content:flex-end}
+.check{width:16px;height:16px;border-radius:4px;border:1px solid var(--border-strong);display:flex;align-items:center;justify-content:center}
+.check.on{background:var(--accent);border-color:var(--accent);color:#fff}.check svg{width:12px;height:12px;stroke-width:3}
+
+/* avatar */
+.av{position:relative;flex:none;display:flex;align-items:center;justify-content:center;border-radius:50%;
+  font-weight:600;width:var(--s);height:var(--s);font-size:calc(var(--s)*.4);line-height:1;--ring:var(--canvas)}
+.av::after{content:"";position:absolute;inset:0;border-radius:inherit;border:1px solid rgba(255,255,255,.06)}
+.av.place{border-radius:calc(var(--s)*.25)}
+.av.neutral{background:var(--raised);color:var(--soft)}
+.s16{--s:16px}.s20{--s:20px}.s24{--s:24px}.s32{--s:32px}.s36{--s:36px}.s64{--s:64px}
+.h1{background:#492C27;color:#F1BAB1}.h2{background:#493927;color:#F1D3B1}.h3{background:#274938;color:#B1F1D1}
+.h4{background:#274649;color:#B1ECF1}.h5{background:#273549;color:#B1CCF1}.h6{background:#352749;color:#CCB1F1}
+.h7{background:#49273B;color:#F1B1D6}.h8{background:#354927;color:#CCF1B1}
+.av svg.photo{width:100%;height:100%;border-radius:inherit;display:block}
+.pair{position:relative;flex:none;width:var(--s);height:var(--s);--ring:var(--canvas)}
+.pair .av{position:absolute;--s:calc(var(--p))}
+.pair .av:first-child{left:0;top:0}.pair .av:last-child{right:-1px;bottom:-1px;box-shadow:0 0 0 2px var(--ring)}
+.pair.s32{--p:21px}.pair.s36{--p:24px}
+/* presence: shape-coded, ring is the colour of whatever is behind the avatar */
+.dot{position:absolute;right:-2px;bottom:-2px;width:var(--d);height:var(--d);border-radius:50%;
+  border:2px solid var(--ring);box-sizing:content-box;--d:10px}
+.s20 .dot,.s24 .dot{--d:8px}.s64 .dot{--d:14px;right:0;bottom:0;border-width:3px}
+.dot.on{background:var(--online)}
+.dot.idle{background:var(--idle)}
+.dot.idle::after{content:"";position:absolute;left:-1px;top:-1px;width:60%;height:60%;border-radius:50%;background:var(--ring)}
+.dot.dnd{background:var(--danger-fill);display:flex;align-items:center;justify-content:center}
+.dot.dnd::after{content:"";width:60%;height:2px;border-radius:1px;background:var(--ring)}
+.dot.off{background:var(--ring);box-shadow:inset 0 0 0 2px var(--faint)}
+
+/* badge */
+.bd{height:16px;min-width:16px;padding:0 5px;border-radius:8px;display:inline-flex;align-items:center;justify-content:center;
+  font:600 11px/16px -apple-system,system-ui,sans-serif;font-variant-numeric:tabular-nums;flex:none;background:rgba(255,255,255,.16);color:var(--text)}
+.bd.m{background:var(--accent);color:#fff}
+.pip{width:8px;height:8px;border-radius:4px;background:var(--text);flex:none}.pip.m{background:var(--accent)}
+.pip.mu{width:6px;height:6px;background:var(--faint)}
+
+/* list rows */
+.list{width:288px;display:flex;flex-direction:column;gap:1px}
+.row{border-radius:6px;padding:0 8px;display:flex;align-items:center;color:var(--soft);--ring:var(--sidebar)}
+.row.one{height:28px;gap:8px}
+.row.two{height:48px;gap:10px;color:var(--text)}
+.row.h{background:var(--hover);--ring:#202123}
+.row.sel{background:var(--selected);color:var(--text);--ring:#2E2F31}
+.row.un{color:var(--text);font-weight:600}
+.row.mu{color:var(--faint)}
+.row .av{--ring:inherit}
+.col{flex:1;min-width:0;display:flex;flex-direction:column}
+.l1,.l2{display:flex;align-items:baseline;gap:8px}
+.l1{height:18px}.l2{height:16px;align-items:center}
+.ttl{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font:inherit;font-size:13px;line-height:18px}
+.two .ttl{font-weight:400}.two.un .ttl{font-weight:600}
+.time{font:400 11px/18px -apple-system,system-ui,sans-serif;color:var(--faint);font-variant-numeric:tabular-nums;flex:none}
+.sel .time,.un .time{color:var(--soft)}
+.pv{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font:400 12px/16px -apple-system,system-ui,sans-serif;color:var(--soft)}
+.un .pv{color:var(--text)}.mu .pv,.mu .time{color:var(--faint)}
+.sect{height:24px;padding:0 8px;display:flex;align-items:center;font:500 11px/14px -apple-system,system-ui,sans-serif;color:var(--faint);margin-top:8px}
+
+/* overlays */
+.tip{display:inline-flex;align-items:center;gap:8px;padding:4px 8px;border-radius:6px;background:#2C2D32;border:1px solid var(--border);
+  font:400 12px/16px -apple-system,system-ui,sans-serif;box-shadow:var(--sh-tip)}
+.float{background:var(--overlay);border:1px solid rgba(255,255,255,.10);border-radius:10px;box-shadow:var(--sh-pop)}
+.menu{width:228px;padding:4px}
+.mi{height:28px;border-radius:6px;padding:0 8px;display:flex;align-items:center;gap:8px;color:var(--text)}
+.mi svg{color:var(--soft)}.mi.h{background:var(--selected)}.mi.h svg{color:var(--text)}
+.mi .sc{margin-left:auto;font:400 12px/16px -apple-system,system-ui,sans-serif;color:var(--faint)}
+.mi.dg,.mi.dg svg{color:var(--danger)}.mi.dg.h{background:var(--danger-soft)}
+.mi.dis,.mi.dis svg{color:var(--disabled)}
+.msep{height:1px;background:var(--hairline);margin:4px 0}
+.mlabel{height:24px;padding:0 8px;display:flex;align-items:center;font:500 11px/14px -apple-system,system-ui,sans-serif;color:var(--faint)}
+.pop{width:280px;padding:12px}
+.modal{width:440px;padding:20px;border-radius:12px;box-shadow:var(--sh-modal)}
+.modal h3{font:600 16px/22px -apple-system,system-ui,sans-serif;margin-bottom:6px}.modal p{color:var(--soft);margin-bottom:20px}
+.foot{display:flex;justify-content:flex-end;gap:8px}
+.toast{width:340px;min-height:40px;padding:6px 6px 6px 12px;display:flex;align-items:center;gap:10px}
+.toast.plain{padding:11px 12px}
+
+/* segmented, tabs */
+.seg{height:28px;padding:2px;border-radius:6px;background:var(--hover);display:inline-flex;gap:2px}
+.seg span{height:24px;padding:0 10px;border-radius:4px;display:flex;align-items:center;gap:6px;color:var(--soft);font-weight:500}
+.seg .on{background:rgba(255,255,255,.14);color:var(--text)}.seg .h{color:var(--text)}
+.tabs{display:flex;gap:16px;border-bottom:1px solid var(--hairline)}
+.tabs span{height:32px;display:flex;align-items:center;gap:6px;color:var(--soft);font-weight:500;border-bottom:2px solid transparent;margin-bottom:-1px}
+.tabs .on{color:var(--text);border-color:var(--text)}.tabs .h{color:var(--text)}
+
+/* dividers */
+.hr{height:1px;background:var(--hairline)}
+.day{display:flex;align-items:center;gap:12px;font:500 11px/14px -apple-system,system-ui,sans-serif;color:var(--faint)}
+.day::before,.day::after{content:"";flex:1;height:1px;background:var(--hairline)}
+.new{display:flex;align-items:center;gap:8px;font:600 11px/14px -apple-system,system-ui,sans-serif;color:var(--accent-text)}
+.new::before{content:"";flex:1;height:1px;background:var(--accent)}
+
+/* skeleton, progress, banner */
+.sk{background:var(--hover);border-radius:4px;height:10px}
+.sk.av{border-radius:50%;height:auto}.sk.av::after{display:none}
+.bar{height:4px;border-radius:2px;background:rgba(255,255,255,.10);overflow:hidden}.bar i{display:block;height:4px;background:var(--accent);border-radius:2px}
+.banner{height:32px;padding:0 10px;border-radius:6px;background:var(--raised);border:1px solid var(--hairline);display:flex;align-items:center;gap:8px}
+
+/* message */
+.msg{display:flex;gap:12px;padding:2px 16px}
+.msg.first{padding-top:4px}
+.msg.h{background:rgba(255,255,255,.03)}
+.msg.me{background:rgba(47,111,235,.10);box-shadow:inset 2px 0 0 var(--accent)}
+.msg .gut{width:36px;flex:none;text-align:right;font:400 11px/20px -apple-system,system-ui,sans-serif;color:var(--faint);font-variant-numeric:tabular-nums}
+.msg .av{margin-top:2px}
+.hd{display:flex;align-items:baseline;gap:8px;height:20px}
+.hd b{font:600 14px/20px -apple-system,system-ui,sans-serif}.hd span{font:400 11px/20px -apple-system,system-ui,sans-serif;color:var(--faint);font-variant-numeric:tabular-nums}
+.body{font:400 14px/20px -apple-system,system-ui,sans-serif}
+.men{background:var(--accent-soft);color:var(--accent-text);border-radius:4px;padding:0 3px;font-weight:500}
+.icode{font:400 13px/20px ui-monospace,"SF Mono",Menlo,monospace;background:var(--raised);border:1px solid var(--hairline);border-radius:4px;padding:0 4px}
+a.lk{color:var(--accent-text);text-decoration:none}
+
+/* scrollbar */
+.scroll{position:relative;width:140px;height:112px;border-radius:6px;background:var(--sidebar);border:1px solid var(--hairline)}
+.thumb{position:absolute;right:3px;top:12px;width:6px;height:40px;border-radius:3px;background:rgba(255,255,255,.20)}
+.thumb.h{width:8px;right:2px;border-radius:4px;background:rgba(255,255,255,.36)}
+
+/* empty */
+.empty{width:360px;height:200px;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center}
+.empty svg{color:var(--faint);margin-bottom:12px}.empty b{font:600 16px/22px -apple-system,system-ui,sans-serif}
+.empty p{color:var(--soft);max-width:320px;margin:4px 0 16px}
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute">
+  <symbol id="search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></symbol>
+  <symbol id="x" viewBox="0 0 24 24"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></symbol>
+  <symbol id="hash" viewBox="0 0 24 24"><path d="M4 9h16M4 15h16M10 3 8 21M16 3l-2 18"/></symbol>
+  <symbol id="plus" viewBox="0 0 24 24"><path d="M5 12h14"/><path d="M12 5v14"/></symbol>
+  <symbol id="check" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></symbol>
+  <symbol id="chev" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></symbol>
+  <symbol id="more" viewBox="0 0 24 24"><circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/></symbol>
+  <symbol id="phone" viewBox="0 0 24 24"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"/></symbol>
+  <symbol id="smile" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><path d="M9 9h.01M15 9h.01"/></symbol>
+  <symbol id="reply" viewBox="0 0 24 24"><path d="m9 17-5-5 5-5"/><path d="M20 18v-2a4 4 0 0 0-4-4H4"/></symbol>
+  <symbol id="copy" viewBox="0 0 24 24"><rect width="14" height="14" x="8" y="8" rx="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></symbol>
+  <symbol id="trash" viewBox="0 0 24 24"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></symbol>
+  <symbol id="pencil" viewBox="0 0 24 24"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></symbol>
+  <symbol id="users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+  <symbol id="warn" viewBox="0 0 24 24"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><path d="M12 9v4"/><path d="M12 17h.01"/></symbol>
+  <symbol id="ok" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/></symbol>
+  <symbol id="chat" viewBox="0 0 24 24"><path d="M7.9 20A9 9 0 1 0 4 16.1L2 22Z"/></symbol>
+  <symbol id="portrait" viewBox="0 0 32 32"><rect width="32" height="32" fill="#6B7A8C"/><circle cx="16" cy="13" r="6" fill="#D9C2AE"/><path d="M4 34c0-8 5-13 12-13s12 5 12 13z" fill="#2E3B4A"/></symbol>
+</svg>
+
+<h1>tinychat · visual system</h1>
+<p class="lede">Component sheet for <code class="code">docs/design/01-system.md</code>. Drawn at 1× CSS px, dark theme, static: every state is laid out side by side and nothing on this page moves. Names are invented. The portrait is a stand-in for a real avatar image.</p>
+
+<section>
+<h2>Color</h2>
+<div class="grid">
+  <div class="sw"><i style="background:var(--sidebar)"></i><b>sidebar · rail</b><span>#121315</span></div>
+  <div class="sw"><i style="background:var(--canvas)"></i><b>canvas</b><span>#18191C</span></div>
+  <div class="sw"><i style="background:var(--raised)"></i><b>raised</b><span>#1F2023</span></div>
+  <div class="sw"><i style="background:var(--overlay)"></i><b>overlay</b><span>#25262A</span></div>
+  <div class="sw"><i style="background:var(--sidebar);display:flex;flex-direction:column;justify-content:space-evenly;padding:0 8px"><u style="height:1px;background:var(--hairline)"></u><u style="height:1px;background:var(--border)"></u><u style="height:1px;background:var(--border-strong)"></u></i><b>hairline · border · strong</b><span>white 8 / 12 / 20%</span></div>
+  <div class="sw"><i style="background:linear-gradient(90deg,#202123 0 33.3%,#2E2F31 33.3% 66.6%,#383939 66.6%)"></i><b>hover · selected · pressed</b><span>white 6 / 12 / 16%</span></div>
+</div>
+<div class="grid" style="margin-top:20px">
+  <div class="sw"><i style="background:var(--text)"></i><b>text</b><span>#EDEEF0 · 15.1:1</span></div>
+  <div class="sw"><i style="background:var(--soft)"></i><b>text_soft</b><span>#A8ABB3 · 7.7:1</span></div>
+  <div class="sw"><i style="background:var(--faint)"></i><b>text_faint</b><span>#858993 · 5.0:1</span></div>
+  <div class="sw"><i style="background:var(--disabled)"></i><b>text_disabled</b><span>#53565E · 2.4:1</span></div>
+  <div class="sw"><i style="background:var(--accent)"></i><b>accent</b><span>#2F6FEB · white 4.6:1</span></div>
+  <div class="sw"><i style="background:var(--accent-text)"></i><b>accent_text · focus</b><span>#8AB4FF · 8.4:1</span></div>
+  <div class="sw"><i style="background:var(--online)"></i><b>online · positive</b><span>#3FBF7A</span></div>
+  <div class="sw"><i style="background:var(--idle)"></i><b>idle · warning</b><span>#E0A63A</span></div>
+  <div class="sw"><i style="background:var(--danger)"></i><b>danger (text)</b><span>#F0655D · 5.6:1</span></div>
+  <div class="sw"><i style="background:var(--danger-fill)"></i><b>danger_fill · dnd</b><span>#D13F3F · white 4.7:1</span></div>
+</div>
+</section>
+
+<section>
+<h2>Type · six sizes, three weights</h2>
+<div class="grid">
+  <div class="spec" style="width:520px">
+    <div class="line"><span class="cap" style="width:120px">20 / 26 · 600</span><span class="t20">Sign in to your networks</span></div>
+    <div class="line"><span class="cap" style="width:120px">16 / 22 · 600</span><span class="t16">Pane and dialog titles</span></div>
+    <div class="line"><span class="cap" style="width:120px">14 / 20 · 400, 600</span><span class="t14"><b style="font-weight:600">Sender name</b> and the message body.</span></div>
+    <div class="line"><span class="cap" style="width:120px">13 / 18 · 400–600</span><span class="t13">Rows, buttons, fields, menus: the interface size.</span></div>
+    <div class="line"><span class="cap" style="width:120px">12 / 16 · 400</span><span class="t12" style="color:var(--soft)">Previews, helper text, tooltips, shortcuts.</span></div>
+    <div class="line"><span class="cap" style="width:120px">11 / 14 · 500, 600</span><span class="t11" style="color:var(--faint)">Timestamps · section labels · badge numerals 12</span></div>
+    <div class="line"><span class="cap" style="width:120px">code 13 / 20</span><span class="code">let rows = uniform_list(…);</span></div>
+  </div>
+  <div class="spec">
+    <label>Icons · drawn stroke 1.5 px at every size · 14 / 16 / 20</label>
+    <div class="line" style="color:var(--soft)"><svg class="i i14"><use href="#search"/></svg><svg class="i"><use href="#search"/></svg><svg class="i i20"><use href="#search"/></svg>
+      <span style="width:12px"></span><svg class="i"><use href="#hash"/></svg><svg class="i"><use href="#phone"/></svg><svg class="i"><use href="#smile"/></svg><svg class="i"><use href="#reply"/></svg><svg class="i"><use href="#users"/></svg><svg class="i"><use href="#more"/></svg></div>
+    <label style="margin-top:8px">Network icons · real, full colour, never tinted or plated · 14 / 16 / 20 / 32</label>
+    <div class="line"><img class="net" width="14" height="14" src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHhtbDpzcGFjZT0icHJlc2VydmUiIHZpZXdCb3g9IjAgMCA1MTIgNTEyIj48cGF0aCBkPSJNMTA3LjkgMzIzLjZjMCAyOS43LTI0IDUzLjgtNTMuOCA1My44Uy4zIDM1My40LjMgMzIzLjZjMC0yOS43IDI0LTUzLjggNTMuOC01My44aDUzLjh6bTI2LjkgMGMwLTI5LjcgMjQtNTMuOCA1My44LTUzLjhzNTMuOCAyNCA1My44IDUzLjhWNDU4YzAgMjkuNy0yNCA1My44LTUzLjggNTMuOHMtNTMuOC0yNC01My44LTUzLjh6IiBzdHlsZT0iZmlsbDojZTAxZTVhIi8+PHBhdGggZD0iTTE4OC42IDEwNy43Yy0yOS43IDAtNTMuOC0yNC01My44LTUzLjhTMTU4LjguMSAxODguNi4xczUzLjggMjQgNTMuOCA1My44djUzLjh6bTAgMjcuM2MyOS43IDAgNTMuOCAyNCA1My44IDUzLjhzLTI0IDUzLjgtNTMuOCA1My44SDUzLjhDMjQgMjQyLjYgMCAyMTguNSAwIDE4OC44UzI0IDEzNSA1My44IDEzNXoiIHN0eWxlPSJmaWxsOiMzNmM1ZjAiLz48cGF0aCBkPSJNNDA0LjEgMTg4LjhjMC0yOS43IDI0LTUzLjggNTMuOC01My44czUzLjggMjQgNTMuOCA1My44LTI0IDUzLjgtNTMuOCA1My44aC01My44em0tMjYuOSAwYzAgMjkuNy0yNCA1My44LTUzLjggNTMuOC0yOS43IDAtNTMuOC0yNC01My44LTUzLjhWNTRjMC0yOS43IDI0LTUzLjggNTMuOC01My44czUzLjggMjQgNTMuOCA1My44eiIgc3R5bGU9ImZpbGw6IzJlYjY3ZCIvPjxwYXRoIGQ9Ik0zMjMuNCA0MDQuM2MyOS43IDAgNTMuOCAyNCA1My44IDUzLjggMCAyOS43LTI0IDUzLjgtNTMuOCA1My44LTI5LjcgMC01My44LTI0LTUzLjgtNTMuOHYtNTMuOHptMC0yNi45Yy0yOS43IDAtNTMuOC0yNC01My44LTUzLjhzMjQtNTMuOCA1My44LTUzLjhoMTM0LjhjMjkuNyAwIDUzLjggMjQgNTMuOCA1My44IDAgMjkuNy0yNCA1My44LTUzLjggNTMuOHoiIHN0eWxlPSJmaWxsOiNlY2IyMmUiLz48L3N2Zz4="><img class="net" width="16" height="16" src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHhtbDpzcGFjZT0icHJlc2VydmUiIHZpZXdCb3g9IjAuMDIgNTcuOCA1MTEuOTIgMzk2LjMiPjxwYXRoIGQ9Ik00MzMuNyA5MWE0MTYuNSA0MTYuNSAwIDAgMC0xMDUuNi0zMy4yYy00LjYgOC4yLTkuOSAxOS4zLTEzLjUgMjguMS0zOS40LTUuOS03OC40LTUuOS0xMTcuMSAwLTMuNy04LjgtOS4xLTE5LjktMTMuNy0yOC4xLTM3LjEgNi40LTcyLjYgMTcuNy0xMDUuNyAzMy4zLTY2LjggMTAxLTg1IDE5OS41LTc1LjkgMjk2LjYgNDQuMyAzMy4xIDg3LjMgNTMuMiAxMjkuNiA2Ni40IDEwLjQtMTQuNCAxOS43LTI5LjYgMjcuNy00NS43LTE1LjMtNS44LTI5LjktMTMtNDMuNy0yMS4zIDMuNy0yLjcgNy4yLTUuNiAxMC43LTguNSA4NC4yIDM5LjQgMTc1LjggMzkuNCAyNTkgMCAzLjUgMi45IDcuMSA1LjggMTAuNyA4LjUtMTMuOSA4LjMtMjguNSAxNS41LTQzLjggMjEuMyA4IDE2IDE3LjMgMzEuMyAyNy43IDQ1LjcgNDIuMy0xMy4yIDg1LjMtMzMuMyAxMjkuNi02Ni40IDEwLjgtMTEyLjUtMTgtMjEwLjEtNzYtMjk2LjdNMTcwLjkgMzI4Yy0yNS4zIDAtNDYtMjMuNi00Ni01Mi40czIwLjMtNTIuNCA0Ni01Mi40IDQ2LjUgMjMuNiA0NiA1Mi40Yy4xIDI4LjgtMjAuMiA1Mi40LTQ2IDUyLjRtMTcwLjIgMGMtMjUuMyAwLTQ2LTIzLjYtNDYtNTIuNHMyMC4zLTUyLjQgNDYtNTIuNCA0Ni41IDIzLjYgNDYgNTIuNGMwIDI4LjgtMjAuMyA1Mi40LTQ2IDUyLjQiIHN0eWxlPSJmaWxsOiM1ODY1ZjIiLz48L3N2Zz4="><img class="net" width="20" height="20" src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHhtbDpzcGFjZT0icHJlc2VydmUiIHZpZXdCb3g9IjAgMCA1MTIgNTEyIj48bGluZWFyR3JhZGllbnQgaWQ9ImEiIHgxPSIyNTYiIHgyPSIyNTYiIHkxPSIyIiB5Mj0iNTE0IiBncmFkaWVudFRyYW5zZm9ybT0ibWF0cml4KDEgMCAwIC0xIDAgNTE0KSIgZ3JhZGllbnRVbml0cz0idXNlclNwYWNlT25Vc2UiPjxzdG9wIG9mZnNldD0iMCIgc3R5bGU9InN0b3AtY29sb3I6IzFkOTNkMiIvPjxzdG9wIG9mZnNldD0iMSIgc3R5bGU9InN0b3AtY29sb3I6IzM4YjBlMyIvPjwvbGluZWFyR3JhZGllbnQ+PGNpcmNsZSBjeD0iMjU2IiBjeT0iMjU2IiByPSIyNTYiIHN0eWxlPSJmaWxsOnVybCgjYSkiLz48cGF0aCBkPSJtMTczLjMgMjc0LjcgMzAuNCA4NC4xczMuOCA3LjkgNy45IDcuOSA2NC41LTYyLjkgNjQuNS02Mi45bDY3LjMtMTI5LjktMTY5IDc5LjF6IiBzdHlsZT0iZmlsbDojYzhkYWVhIi8+PHBhdGggZD0ibTIxMy42IDI5Ni4zLTUuOCA2MnMtMi40IDE5IDE2LjUgMGMxOS0xOSAzNy4yLTMzLjYgMzcuMi0zMy42IiBzdHlsZT0iZmlsbDojYTljNmQ4Ii8+PHBhdGggZD0ibTE3My44IDI3Ny43LTYyLjUtMjAuNHMtNy41LTMtNS4xLTkuOWMuNS0xLjQgMS41LTIuNiA0LjUtNC43QzEyNC42IDIzMy4xIDM2NyAxNDYgMzY3IDE0NnM2LjgtMi4zIDEwLjktLjhjMiAuNiAzLjYgMi4zIDQgNC40LjQgMS44LjYgMy43LjUgNS41IDAgMS42LS4yIDMuMS0uNCA1LjQtMS41IDIzLjgtNDUuNyAyMDEuNi00NS43IDIwMS42cy0yLjYgMTAuNC0xMi4xIDEwLjhjLTQuNy4yLTkuMy0xLjYtMTIuNi00LjktMTguNi0xNi04Mi44LTU5LjItOTctNjguNi0uNi0uNC0xLjEtMS4xLTEuMi0xLjktLjItMSAuOS0yLjIuOS0yLjJzMTExLjgtOTkuNCAxMTQuOC0xMDkuOGMuMi0uOC0uNi0xLjItMS44LS45LTcuNCAyLjctMTM2LjIgODQuMS0xNTAuNCA5My0uOS4yLTIgLjMtMy4xLjEiIHN0eWxlPSJmaWxsOiNmZmYiLz48L3N2Zz4="><img class="net" width="32" height="32" src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIGZpbGw9Im5vbmUiIHZpZXdCb3g9IjQgNCAzNiAzOCI+PHBhdGggZmlsbD0idXJsKCNhKSIgZD0iTTIxLjk5OTkgMjBoMTJjMy4zMTM3IDAgNiAyLjY4NjMgNiA2djEwYzAgMy4zMTM3LTIuNjg2MyA2LTYgNnMtNi0yLjY4NjMtNi02VjI2YzAtMy4zMTM3LTIuNjg2My02LTYtNiIvPjxwYXRoIGZpbGw9InVybCgjYikiIGQ9Ik03Ljk5OTg4IDI0YzAtMy4zMTM3IDIuNjg2MzItNiA2LjAwMDAyLTZoOGMzLjMxMzcgMCA2IDIuNjg2MyA2IDZ2MTJjMCAzLjMxMzcgMi42ODYzIDYgNiA2bC0xNi4wMDAxLS4wMDAxYy01LjUyMjggMC05Ljk5OTkyLTQuNDc3MS05Ljk5OTkyLTEweiIvPjxwYXRoIGZpbGw9InVybCgjYykiIGZpbGwtb3BhY2l0eT0iLjciIGQ9Ik03Ljk5OTg4IDI0YzAtMy4zMTM3IDIuNjg2MzItNiA2LjAwMDAyLTZoOGMzLjMxMzcgMCA2IDIuNjg2MyA2IDZ2MTJjMCAzLjMxMzcgMi42ODYzIDYgNiA2bC0xNi4wMDAxLS4wMDAxYy01LjUyMjggMC05Ljk5OTkyLTQuNDc3MS05Ljk5OTkyLTEweiIvPjxwYXRoIGZpbGw9InVybCgjZCkiIGZpbGwtb3BhY2l0eT0iLjciIGQ9Ik03Ljk5OTg4IDI0YzAtMy4zMTM3IDIuNjg2MzItNiA2LjAwMDAyLTZoOGMzLjMxMzcgMCA2IDIuNjg2MyA2IDZ2MTJjMCAzLjMxMzcgMi42ODYzIDYgNiA2bC0xNi4wMDAxLS4wMDAxYy01LjUyMjggMC05Ljk5OTkyLTQuNDc3MS05Ljk5OTkyLTEweiIvPjxwYXRoIGZpbGw9InVybCgjZSkiIGQ9Ik0zMi45OTk5IDE4YzIuNzYxNCAwIDUtMi4yMzg2IDUtNXMtMi4yMzg2LTUtNS01LTUgMi4yMzg2LTUgNSAyLjIzODYgNSA1IDUiLz48cGF0aCBmaWxsPSJ1cmwoI2YpIiBmaWxsLW9wYWNpdHk9Ii40NiIgZD0iTTMyLjk5OTkgMThjMi43NjE0IDAgNS0yLjIzODYgNS01cy0yLjIzODYtNS01LTUtNSAyLjIzODYtNSA1IDIuMjM4NiA1IDUgNSIvPjxwYXRoIGZpbGw9InVybCgjZykiIGZpbGwtb3BhY2l0eT0iLjQiIGQ9Ik0zMi45OTk5IDE4YzIuNzYxNCAwIDUtMi4yMzg2IDUtNXMtMi4yMzg2LTUtNS01LTUgMi4yMzg2LTUgNSAyLjIzODYgNSA1IDUiLz48cGF0aCBmaWxsPSJ1cmwoI2gpIiBkPSJNMTcuOTk5OSAxNmMzLjMxMzcgMCA2LTIuNjg2MyA2LTYgMC0zLjMxMzcxLTIuNjg2My02LTYtNnMtNiAyLjY4NjI5LTYgNmMwIDMuMzEzNyAyLjY4NjMgNiA2IDYiLz48cGF0aCBmaWxsPSJ1cmwoI2kpIiBmaWxsLW9wYWNpdHk9Ii42IiBkPSJNMTcuOTk5OSAxNmMzLjMxMzcgMCA2LTIuNjg2MyA2LTYgMC0zLjMxMzcxLTIuNjg2My02LTYtNnMtNiAyLjY4NjI5LTYgNmMwIDMuMzEzNyAyLjY4NjMgNiA2IDYiLz48cGF0aCBmaWxsPSJ1cmwoI2opIiBmaWxsLW9wYWNpdHk9Ii41IiBkPSJNMTcuOTk5OSAxNmMzLjMxMzcgMCA2LTIuNjg2MyA2LTYgMC0zLjMxMzcxLTIuNjg2My02LTYtNnMtNiAyLjY4NjI5LTYgNmMwIDMuMzEzNyAyLjY4NjMgNiA2IDYiLz48cmVjdCB3aWR0aD0iMTYiIGhlaWdodD0iMTYiIHg9IjQiIHk9IjIzIiBmaWxsPSJ1cmwoI2spIiByeD0iMy4yNSIvPjxyZWN0IHdpZHRoPSIxNiIgaGVpZ2h0PSIxNiIgeD0iNCIgeT0iMjMiIGZpbGw9InVybCgjbCkiIGZpbGwtb3BhY2l0eT0iLjciIHJ4PSIzLjI1Ii8+PHBhdGggZmlsbD0iI2ZmZiIgZD0iTTE1LjQ3OTIgMjguMTA1NGgtMi40NDcxdjcuNDY2aC0yLjA2NDh2LTcuNDY2SDguNTIwMTR2LTEuNjc2OGg2Ljk1OTA2eiIvPjxkZWZzPjxyYWRpYWxHcmFkaWVudCBpZD0iYSIgY3g9IjAiIGN5PSIwIiByPSIxIiBncmFkaWVudFRyYW5zZm9ybT0ibWF0cml4KDEzLjQ3ODQgMCAwIDMzLjI2OTQgMzkuNzk2NyAyMi4xNzM5KSIgZ3JhZGllbnRVbml0cz0idXNlclNwYWNlT25Vc2UiPjxzdG9wIHN0b3AtY29sb3I9IiNhOThhZmYiLz48c3RvcCBvZmZzZXQ9Ii4xNCIgc3RvcC1jb2xvcj0iIzhjNzVmZiIvPjxzdG9wIG9mZnNldD0iLjU2NSIgc3RvcC1jb2xvcj0iIzVmNTBlMiIvPjxzdG9wIG9mZnNldD0iLjkiIHN0b3AtY29sb3I9IiMzYzJjYjgiLz48L3JhZGlhbEdyYWRpZW50PjxyYWRpYWxHcmFkaWVudCBpZD0iYiIgY3g9IjAiIGN5PSIwIiByPSIxIiBncmFkaWVudFRyYW5zZm9ybT0icm90YXRlKDY4LjE1MzkgLTcuNzE1NjYwOTUgMTQuNzEzNTU4MzQpc2NhbGUoMzIuNzUyIDMzLjEyMzEpIiBncmFkaWVudFVuaXRzPSJ1c2VyU3BhY2VPblVzZSI+PHN0b3Agc3RvcC1jb2xvcj0iIzg1YzJmZiIvPjxzdG9wIG9mZnNldD0iLjY5IiBzdG9wLWNvbG9yPSIjNzU4OGZmIi8+PHN0b3Agb2Zmc2V0PSIxIiBzdG9wLWNvbG9yPSIjNjQ1OWZlIi8+PC9yYWRpYWxHcmFkaWVudD48cmFkaWFsR3JhZGllbnQgaWQ9ImQiIGN4PSIwIiBjeT0iMCIgcj0iMSIgZ3JhZGllbnRUcmFuc2Zvcm09InJvdGF0ZSgxMTMuMzI2IDguMDkyODUyNTUgMTcuNjQ0NzQ1MDEpc2NhbGUoMTkuMjE4NiAxNS40MjczKSIgZ3JhZGllbnRVbml0cz0idXNlclNwYWNlT25Vc2UiPjxzdG9wIHN0b3AtY29sb3I9IiNiZDk2ZmYiLz48c3RvcCBvZmZzZXQ9Ii42ODY2ODUiIHN0b3AtY29sb3I9IiNiZDk2ZmYiIHN0b3Atb3BhY2l0eT0iMCIvPjwvcmFkaWFsR3JhZGllbnQ+PHJhZGlhbEdyYWRpZW50IGlkPSJlIiBjeD0iMCIgY3k9IjAiIHI9IjEiIGdyYWRpZW50VHJhbnNmb3JtPSJtYXRyaXgoMCAtMTAgMTIuNjIxNiAwIDMyLjk5OTkgMTEuNTcxNCkiIGdyYWRpZW50VW5pdHM9InVzZXJTcGFjZU9uVXNlIj48c3RvcCBvZmZzZXQ9Ii4yNjgyMDEiIHN0b3AtY29sb3I9IiM2ODY4ZjciLz48c3RvcCBvZmZzZXQ9IjEiIHN0b3AtY29sb3I9IiMzOTIzYjEiLz48L3JhZGlhbEdyYWRpZW50PjxyYWRpYWxHcmFkaWVudCBpZD0iZiIgY3g9IjAiIGN5PSIwIiByPSIxIiBncmFkaWVudFRyYW5zZm9ybT0icm90YXRlKDQwLjA1MTYgLS4wMzA2ODE5NiA0NC44NzI5MDk1KXNjYWxlKDcuMTQ2MjkgMTAuMzM2MykiIGdyYWRpZW50VW5pdHM9InVzZXJTcGFjZU9uVXNlIj48c3RvcCBvZmZzZXQ9Ii4yNzA3MTEiIHN0b3AtY29sb3I9IiNhMWQzZmYiLz48c3RvcCBvZmZzZXQ9Ii44MTMzOTMiIHN0b3AtY29sb3I9IiNhMWQzZmYiIHN0b3Atb3BhY2l0eT0iMCIvPjwvcmFkaWFsR3JhZGllbnQ+PHJhZGlhbEdyYWRpZW50IGlkPSJnIiBjeD0iMCIgY3k9IjAiIHI9IjEiIGdyYWRpZW50VHJhbnNmb3JtPSJyb3RhdGUoLTQxLjY1ODEgMzIuMTE3OTk5MTggLTQzLjQxOTQ4NDIzKXNjYWxlKDguNTEyNzUgMjAuODgyNCkiIGdyYWRpZW50VW5pdHM9InVzZXJTcGFjZU9uVXNlIj48c3RvcCBzdG9wLWNvbG9yPSIjZTNhY2ZkIi8+PHN0b3Agb2Zmc2V0PSIuODE2MDQxIiBzdG9wLWNvbG9yPSIjOWZhMmZmIiBzdG9wLW9wYWNpdHk9IjAiLz48L3JhZGlhbEdyYWRpZW50PjxyYWRpYWxHcmFkaWVudCBpZD0iaCIgY3g9IjAiIGN5PSIwIiByPSIxIiBncmFkaWVudFRyYW5zZm9ybT0ibWF0cml4KDAgLTEyIDE1LjE0NiAwIDE3Ljk5OTkgOC4yODU3MSkiIGdyYWRpZW50VW5pdHM9InVzZXJTcGFjZU9uVXNlIj48c3RvcCBvZmZzZXQ9Ii4yNjgyMDEiIHN0b3AtY29sb3I9IiM4MjgyZmYiLz48c3RvcCBvZmZzZXQ9IjEiIHN0b3AtY29sb3I9IiMzOTIzYjEiLz48L3JhZGlhbEdyYWRpZW50PjxyYWRpYWxHcmFkaWVudCBpZD0iaSIgY3g9IjAiIGN5PSIwIiByPSIxIiBncmFkaWVudFRyYW5zZm9ybT0icm90YXRlKDQwLjA1MTYgLTMuMTU0NjUxNDcgMjEuNDE2NDE0NjYpc2NhbGUoOC41NzU1NCAxMi40MDM1KSIgZ3JhZGllbnRVbml0cz0idXNlclNwYWNlT25Vc2UiPjxzdG9wIG9mZnNldD0iLjI3MDcxMSIgc3RvcC1jb2xvcj0iI2ExZDNmZiIvPjxzdG9wIG9mZnNldD0iLjgxMzM5MyIgc3RvcC1jb2xvcj0iI2ExZDNmZiIgc3RvcC1vcGFjaXR5PSIwIi8+PC9yYWRpYWxHcmFkaWVudD48cmFkaWFsR3JhZGllbnQgaWQ9ImoiIGN4PSIwIiBjeT0iMCIgcj0iMSIgZ3JhZGllbnRUcmFuc2Zvcm09InJvdGF0ZSgtNDEuNjU4MSAyMC4zODE4MDM3NSAtMjYuNTE1NjYxNTgpc2NhbGUoMTAuMjE1MyAyNS4wNTg5KSIgZ3JhZGllbnRVbml0cz0idXNlclNwYWNlT25Vc2UiPjxzdG9wIHN0b3AtY29sb3I9IiNlM2FjZmQiLz48c3RvcCBvZmZzZXQ9Ii44MTYwNDEiIHN0b3AtY29sb3I9IiM5ZmEyZmYiIHN0b3Atb3BhY2l0eT0iMCIvPjwvcmFkaWFsR3JhZGllbnQ+PHJhZGlhbEdyYWRpZW50IGlkPSJrIiBjeD0iMCIgY3k9IjAiIHI9IjEiIGdyYWRpZW50VHJhbnNmb3JtPSJyb3RhdGUoNDUgLTI1Ljc2MzQ1NTk3IDE2LjMyODQyNzEyKXNjYWxlKDIyLjYyNzQpIiBncmFkaWVudFVuaXRzPSJ1c2VyU3BhY2VPblVzZSI+PHN0b3Agb2Zmc2V0PSIuMDQ2ODc1IiBzdG9wLWNvbG9yPSIjNjg4ZWZmIi8+PHN0b3Agb2Zmc2V0PSIuOTQ2ODc1IiBzdG9wLWNvbG9yPSIjMjMwZjk0Ii8+PC9yYWRpYWxHcmFkaWVudD48cmFkaWFsR3JhZGllbnQgaWQ9ImwiIGN4PSIwIiBjeT0iMCIgcj0iMSIgZ3JhZGllbnRUcmFuc2Zvcm09Im1hdHJpeCgwIDExLjIgLTEzLjA3MDIgMCAxMiAzMi42KSIgZ3JhZGllbnRVbml0cz0idXNlclNwYWNlT25Vc2UiPjxzdG9wIG9mZnNldD0iLjU3MDY0NyIgc3RvcC1jb2xvcj0iIzY5NjVmNiIgc3RvcC1vcGFjaXR5PSIwIi8+PHN0b3Agb2Zmc2V0PSIxIiBzdG9wLWNvbG9yPSIjOGY4ZmZmIi8+PC9yYWRpYWxHcmFkaWVudD48bGluZWFyR3JhZGllbnQgaWQ9ImMiIHgxPSIyMC41OTM2IiB4Mj0iMjAuNTkzNiIgeTE9IjE4IiB5Mj0iNDIiIGdyYWRpZW50VW5pdHM9InVzZXJTcGFjZU9uVXNlIj48c3RvcCBvZmZzZXQ9Ii44MDExNTkiIHN0b3AtY29sb3I9IiM2ODY0ZjYiIHN0b3Atb3BhY2l0eT0iMCIvPjxzdG9wIG9mZnNldD0iMSIgc3RvcC1jb2xvcj0iIzUxNDlkZSIvPjwvbGluZWFyR3JhZGllbnQ+PC9kZWZzPjwvc3ZnPg==">
+      <span style="width:12px"></span><img class="net" width="20" height="20" src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHhtbDpzcGFjZT0icHJlc2VydmUiIHZpZXdCb3g9IjAgMCA1MTIgNTEyIj48cGF0aCBkPSJNMTA3LjkgMzIzLjZjMCAyOS43LTI0IDUzLjgtNTMuOCA1My44Uy4zIDM1My40LjMgMzIzLjZjMC0yOS43IDI0LTUzLjggNTMuOC01My44aDUzLjh6bTI2LjkgMGMwLTI5LjcgMjQtNTMuOCA1My44LTUzLjhzNTMuOCAyNCA1My44IDUzLjhWNDU4YzAgMjkuNy0yNCA1My44LTUzLjggNTMuOHMtNTMuOC0yNC01My44LTUzLjh6IiBzdHlsZT0iZmlsbDojZTAxZTVhIi8+PHBhdGggZD0iTTE4OC42IDEwNy43Yy0yOS43IDAtNTMuOC0yNC01My44LTUzLjhTMTU4LjguMSAxODguNi4xczUzLjggMjQgNTMuOCA1My44djUzLjh6bTAgMjcuM2MyOS43IDAgNTMuOCAyNCA1My44IDUzLjhzLTI0IDUzLjgtNTMuOCA1My44SDUzLjhDMjQgMjQyLjYgMCAyMTguNSAwIDE4OC44UzI0IDEzNSA1My44IDEzNXoiIHN0eWxlPSJmaWxsOiMzNmM1ZjAiLz48cGF0aCBkPSJNNDA0LjEgMTg4LjhjMC0yOS43IDI0LTUzLjggNTMuOC01My44czUzLjggMjQgNTMuOCA1My44LTI0IDUzLjgtNTMuOCA1My44aC01My44em0tMjYuOSAwYzAgMjkuNy0yNCA1My44LTUzLjggNTMuOC0yOS43IDAtNTMuOC0yNC01My44LTUzLjhWNTRjMC0yOS43IDI0LTUzLjggNTMuOC01My44czUzLjggMjQgNTMuOCA1My44eiIgc3R5bGU9ImZpbGw6IzJlYjY3ZCIvPjxwYXRoIGQ9Ik0zMjMuNCA0MDQuM2MyOS43IDAgNTMuOCAyNCA1My44IDUzLjggMCAyOS43LTI0IDUzLjgtNTMuOCA1My44LTI5LjcgMC01My44LTI0LTUzLjgtNTMuOHYtNTMuOHptMC0yNi45Yy0yOS43IDAtNTMuOC0yNC01My44LTUzLjhzMjQtNTMuOCA1My44LTUzLjhoMTM0LjhjMjkuNyAwIDUzLjggMjQgNTMuOCA1My44IDAgMjkuNy0yNCA1My44LTUzLjggNTMuOHoiIHN0eWxlPSJmaWxsOiNlY2IyMmUiLz48L3N2Zz4=" style="opacity:.4"><span class="cap">signed out or offline: 40% opacity</span></div>
+  </div>
+</div>
+</section>
+
+<section>
+<h2>Button · 28 px, radius 6</h2>
+<div class="grid">
+  <div class="spec"><label>Primary · rest, hover, pressed, focus, disabled</label><div class="line">
+    <span class="btn primary">Send</span><span class="btn primary h">Send</span><span class="btn primary a">Send</span><span class="btn primary fr-gap">Send</span><span class="btn primary d">Send</span></div></div>
+  <div class="spec"><label>Secondary</label><div class="line">
+    <span class="btn secondary">Cancel</span><span class="btn secondary h">Cancel</span><span class="btn secondary a">Cancel</span><span class="btn secondary fr">Cancel</span><span class="btn secondary d">Cancel</span></div></div>
+  <div class="spec"><label>Ghost</label><div class="line">
+    <span class="btn ghost">Mark read</span><span class="btn ghost h">Mark read</span><span class="btn ghost a">Mark read</span><span class="btn ghost fr">Mark read</span><span class="btn ghost d">Mark read</span></div></div>
+  <div class="spec"><label>Danger · quiet at rest, solid on hover</label><div class="line">
+    <span class="btn dangerb">Sign out</span><span class="btn dangerb h">Sign out</span><span class="btn dangerb a">Sign out</span><span class="btn dangerb fr">Sign out</span><span class="btn dangerb d">Sign out</span></div></div>
+  <div class="spec"><label>Icon-only 28 · rest, hover, pressed, toggled on, focus, disabled · 24 in toolbars</label><div class="line">
+    <span class="ib"><svg class="i"><use href="#smile"/></svg></span><span class="ib h"><svg class="i"><use href="#smile"/></svg></span><span class="ib a"><svg class="i"><use href="#smile"/></svg></span><span class="ib on"><svg class="i"><use href="#smile"/></svg></span><span class="ib fr"><svg class="i"><use href="#smile"/></svg></span><span class="ib d"><svg class="i"><use href="#smile"/></svg></span>
+    <span style="width:8px"></span><span class="ib sm h"><svg class="i"><use href="#reply"/></svg></span></div></div>
+  <div class="spec"><label>With icon (10 px icon side, 12 px text side) · sizes 24 / 28 / 32 · busy says so in words</label><div class="line">
+    <span class="btn secondary icon-l"><svg class="i"><use href="#phone"/></svg>Call</span><span class="btn secondary sm">Retry</span><span class="btn secondary">Retry</span><span class="btn primary lg">Continue</span><span class="btn primary d" style="width:74px">Sending…</span></div></div>
+</div>
+</section>
+
+<section>
+<h2>Input · search · switch</h2>
+<div class="grid">
+  <div class="spec"><label>Rest (placeholder)</label><div class="field"><span class="ph">Display name</span></div></div>
+  <div class="spec"><label>Hover</label><div class="field h"><span class="ph">Display name</span></div></div>
+  <div class="spec"><label>Focus · typing</label><div class="field f"><span>Wren Halloran</span><i class="caret"></i></div></div>
+  <div class="spec"><label>Selection</label><div class="field f"><span>Wren <span class="selx">Halloran</span></span></div></div>
+  <div class="spec"><label>Error</label><div class="field e"><span>wren@</span></div><span class="help e">That is not a complete address.</span></div>
+  <div class="spec"><label>Disabled</label><div class="field d"><span>Managed by Slack</span></div></div>
+</div>
+<div class="grid" style="margin-top:20px">
+  <div class="spec"><label>Search · rest</label><div class="field"><svg class="i i14" style="color:var(--faint)"><use href="#search"/></svg><span class="ph grow">Search</span><span class="kbd">⌘K</span></div></div>
+  <div class="spec"><label>Search · focus, empty</label><div class="field f"><svg class="i i14" style="color:var(--soft)"><use href="#search"/></svg><i class="caret" style="margin-left:0"></i><span class="ph grow" style="margin-left:-4px">Search</span></div></div>
+  <div class="spec"><label>Search · with a query</label><div class="field f"><svg class="i i14" style="color:var(--soft)"><use href="#search"/></svg><span class="grow">release notes</span><span class="clear"><svg class="i i14"><use href="#x"/></svg></span></div></div>
+  <div class="spec"><label>Switch 32 × 18 · checkbox 16</label><div class="line" style="height:28px"><span class="switch"><i></i></span><span class="switch on"><i></i></span><span class="check"></span><span class="check on"><svg class="i"><use href="#check"/></svg></span></div></div>
+</div>
+</section>
+
+<section>
+<h2>Avatar · circle is a person, rounded square is a place</h2>
+<div class="grid">
+  <div class="spec"><label>Person · 16, 20, 24, 32, 36, 64 · initials until the image lands</label><div class="line" style="align-items:flex-end">
+    <span class="av s16 h5">I</span><span class="av s20 h3">T</span><span class="av s24 h7">N</span><span class="av s32 h2">WH</span><span class="av s36 h6">OB</span><span class="av s64 h4">IV</span>
+    <span class="av s36"><svg class="photo"><use href="#portrait"/></svg></span></div></div>
+  <div class="spec"><label>Presence · online, idle, do not disturb, offline · shape and colour</label><div class="line">
+    <span class="av s32 h2">WH<i class="dot on"></i></span><span class="av s32 h6">OB<i class="dot idle"></i></span><span class="av s32 h4">IV<i class="dot dnd"></i></span><span class="av s32 h7">NA<i class="dot off"></i></span>
+    <span style="width:8px"></span><span class="av s24 h3">T<i class="dot on"></i></span><span class="av s20 h5">I<i class="dot idle"></i></span><span class="av s64 h1">SK<i class="dot on"></i></span></div></div>
+  <div class="spec"><label>Group · two members, or its own picture</label><div class="line">
+    <span class="pair s32"><span class="av h3">T</span><span class="av h7">N</span></span><span class="pair s36"><span class="av h2">W</span><span class="av h5">I</span></span><span class="av s32 neutral"><svg class="i"><use href="#users"/></svg></span></div></div>
+  <div class="spec"><label>Channel · glyph on a neutral plate</label><div class="line">
+    <span class="av place s32 neutral"><svg class="i"><use href="#hash"/></svg></span><span class="av place s36 neutral"><svg class="i"><use href="#hash"/></svg></span></div></div>
+  <div class="spec"><label>Server or workspace · radius 25%</label><div class="line">
+    <span class="av place s24 h8">F</span><span class="av place s32 h1">LB</span><span class="av place s36 h5">HQ</span></div></div>
+  <div class="spec"><label>Fallback tints · eight fixed hues, flat, no gradient</label><div class="line" style="gap:6px">
+    <span class="av s24 h1">A</span><span class="av s24 h2">B</span><span class="av s24 h8">C</span><span class="av s24 h3">D</span><span class="av s24 h4">E</span><span class="av s24 h5">F</span><span class="av s24 h6">G</span><span class="av s24 h7">H</span></div></div>
+</div>
+</section>
+
+<section>
+<h2>Badge</h2>
+<div class="grid">
+  <div class="spec"><label>Count · unread, neutral</label><div class="line"><span class="bd">3</span><span class="bd">27</span><span class="bd">99+</span></div></div>
+  <div class="spec"><label>Mention · for you, accent</label><div class="line"><span class="bd m">1</span><span class="bd m">12</span><span class="bd m">99+</span></div></div>
+  <div class="spec"><label>Dot · unread, mention, muted unread</label><div class="line"><span class="pip"></span><span class="pip m"></span><span class="pip mu"></span></div></div>
+  <div class="spec"><label>On a 20 px icon · 2 px ring of the surface</label><div class="line" style="background:var(--sidebar);padding:8px 12px;border-radius:6px;gap:20px">
+    <span style="position:relative;display:flex"><img class="net" width="20" height="20" src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHhtbDpzcGFjZT0icHJlc2VydmUiIHZpZXdCb3g9IjAuMDIgNTcuOCA1MTEuOTIgMzk2LjMiPjxwYXRoIGQ9Ik00MzMuNyA5MWE0MTYuNSA0MTYuNSAwIDAgMC0xMDUuNi0zMy4yYy00LjYgOC4yLTkuOSAxOS4zLTEzLjUgMjguMS0zOS40LTUuOS03OC40LTUuOS0xMTcuMSAwLTMuNy04LjgtOS4xLTE5LjktMTMuNy0yOC4xLTM3LjEgNi40LTcyLjYgMTcuNy0xMDUuNyAzMy4zLTY2LjggMTAxLTg1IDE5OS41LTc1LjkgMjk2LjYgNDQuMyAzMy4xIDg3LjMgNTMuMiAxMjkuNiA2Ni40IDEwLjQtMTQuNCAxOS43LTI5LjYgMjcuNy00NS43LTE1LjMtNS44LTI5LjktMTMtNDMuNy0yMS4zIDMuNy0yLjcgNy4yLTUuNiAxMC43LTguNSA4NC4yIDM5LjQgMTc1LjggMzkuNCAyNTkgMCAzLjUgMi45IDcuMSA1LjggMTAuNyA4LjUtMTMuOSA4LjMtMjguNSAxNS41LTQzLjggMjEuMyA4IDE2IDE3LjMgMzEuMyAyNy43IDQ1LjcgNDIuMy0xMy4yIDg1LjMtMzMuMyAxMjkuNi02Ni40IDEwLjgtMTEyLjUtMTgtMjEwLjEtNzYtMjk2LjdNMTcwLjkgMzI4Yy0yNS4zIDAtNDYtMjMuNi00Ni01Mi40czIwLjMtNTIuNCA0Ni01Mi40IDQ2LjUgMjMuNiA0NiA1Mi40Yy4xIDI4LjgtMjAuMiA1Mi40LTQ2IDUyLjRtMTcwLjIgMGMtMjUuMyAwLTQ2LTIzLjYtNDYtNTIuNHMyMC4zLTUyLjQgNDYtNTIuNCA0Ni41IDIzLjYgNDYgNTIuNGMwIDI4LjgtMjAuMyA1Mi40LTQ2IDUyLjQiIHN0eWxlPSJmaWxsOiM1ODY1ZjIiLz48L3N2Zz4="><span class="bd m" style="position:absolute;left:11px;top:-7px;box-shadow:0 0 0 2px var(--sidebar)">4</span></span>
+    <span style="position:relative;display:flex"><img class="net" width="20" height="20" src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHhtbDpzcGFjZT0icHJlc2VydmUiIHZpZXdCb3g9IjAgMCA1MTIgNTEyIj48cGF0aCBkPSJNMTA3LjkgMzIzLjZjMCAyOS43LTI0IDUzLjgtNTMuOCA1My44Uy4zIDM1My40LjMgMzIzLjZjMC0yOS43IDI0LTUzLjggNTMuOC01My44aDUzLjh6bTI2LjkgMGMwLTI5LjcgMjQtNTMuOCA1My44LTUzLjhzNTMuOCAyNCA1My44IDUzLjhWNDU4YzAgMjkuNy0yNCA1My44LTUzLjggNTMuOHMtNTMuOC0yNC01My44LTUzLjh6IiBzdHlsZT0iZmlsbDojZTAxZTVhIi8+PHBhdGggZD0iTTE4OC42IDEwNy43Yy0yOS43IDAtNTMuOC0yNC01My44LTUzLjhTMTU4LjguMSAxODguNi4xczUzLjggMjQgNTMuOCA1My44djUzLjh6bTAgMjcuM2MyOS43IDAgNTMuOCAyNCA1My44IDUzLjhzLTI0IDUzLjgtNTMuOCA1My44SDUzLjhDMjQgMjQyLjYgMCAyMTguNSAwIDE4OC44UzI0IDEzNSA1My44IDEzNXoiIHN0eWxlPSJmaWxsOiMzNmM1ZjAiLz48cGF0aCBkPSJNNDA0LjEgMTg4LjhjMC0yOS43IDI0LTUzLjggNTMuOC01My44czUzLjggMjQgNTMuOCA1My44LTI0IDUzLjgtNTMuOCA1My44aC01My44em0tMjYuOSAwYzAgMjkuNy0yNCA1My44LTUzLjggNTMuOC0yOS43IDAtNTMuOC0yNC01My44LTUzLjhWNTRjMC0yOS43IDI0LTUzLjggNTMuOC01My44czUzLjggMjQgNTMuOCA1My44eiIgc3R5bGU9ImZpbGw6IzJlYjY3ZCIvPjxwYXRoIGQ9Ik0zMjMuNCA0MDQuM2MyOS43IDAgNTMuOCAyNCA1My44IDUzLjggMCAyOS43LTI0IDUzLjgtNTMuOCA1My44LTI5LjcgMC01My44LTI0LTUzLjgtNTMuOHYtNTMuOHptMC0yNi45Yy0yOS43IDAtNTMuOC0yNC01My44LTUzLjhzMjQtNTMuOCA1My44LTUzLjhoMTM0LjhjMjkuNyAwIDUzLjggMjQgNTMuOCA1My44IDAgMjkuNy0yNCA1My44LTUzLjggNTMuOHoiIHN0eWxlPSJmaWxsOiNlY2IyMmUiLz48L3N2Zz4="><span class="bd" style="position:absolute;left:11px;top:-7px;box-shadow:0 0 0 2px var(--sidebar)">18</span></span>
+    <span style="position:relative;display:flex"><img class="net" width="20" height="20" src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHhtbDpzcGFjZT0icHJlc2VydmUiIHZpZXdCb3g9IjAgMCA1MTIgNTEyIj48bGluZWFyR3JhZGllbnQgaWQ9ImEiIHgxPSIyNTYiIHgyPSIyNTYiIHkxPSIyIiB5Mj0iNTE0IiBncmFkaWVudFRyYW5zZm9ybT0ibWF0cml4KDEgMCAwIC0xIDAgNTE0KSIgZ3JhZGllbnRVbml0cz0idXNlclNwYWNlT25Vc2UiPjxzdG9wIG9mZnNldD0iMCIgc3R5bGU9InN0b3AtY29sb3I6IzFkOTNkMiIvPjxzdG9wIG9mZnNldD0iMSIgc3R5bGU9InN0b3AtY29sb3I6IzM4YjBlMyIvPjwvbGluZWFyR3JhZGllbnQ+PGNpcmNsZSBjeD0iMjU2IiBjeT0iMjU2IiByPSIyNTYiIHN0eWxlPSJmaWxsOnVybCgjYSkiLz48cGF0aCBkPSJtMTczLjMgMjc0LjcgMzAuNCA4NC4xczMuOCA3LjkgNy45IDcuOSA2NC41LTYyLjkgNjQuNS02Mi45bDY3LjMtMTI5LjktMTY5IDc5LjF6IiBzdHlsZT0iZmlsbDojYzhkYWVhIi8+PHBhdGggZD0ibTIxMy42IDI5Ni4zLTUuOCA2MnMtMi40IDE5IDE2LjUgMGMxOS0xOSAzNy4yLTMzLjYgMzcuMi0zMy42IiBzdHlsZT0iZmlsbDojYTljNmQ4Ii8+PHBhdGggZD0ibTE3My44IDI3Ny43LTYyLjUtMjAuNHMtNy41LTMtNS4xLTkuOWMuNS0xLjQgMS41LTIuNiA0LjUtNC43QzEyNC42IDIzMy4xIDM2NyAxNDYgMzY3IDE0NnM2LjgtMi4zIDEwLjktLjhjMiAuNiAzLjYgMi4zIDQgNC40LjQgMS44LjYgMy43LjUgNS41IDAgMS42LS4yIDMuMS0uNCA1LjQtMS41IDIzLjgtNDUuNyAyMDEuNi00NS43IDIwMS42cy0yLjYgMTAuNC0xMi4xIDEwLjhjLTQuNy4yLTkuMy0xLjYtMTIuNi00LjktMTguNi0xNi04Mi44LTU5LjItOTctNjguNi0uNi0uNC0xLjEtMS4xLTEuMi0xLjktLjItMSAuOS0yLjIuOS0yLjJzMTExLjgtOTkuNCAxMTQuOC0xMDkuOGMuMi0uOC0uNi0xLjItMS44LS45LTcuNCAyLjctMTM2LjIgODQuMS0xNTAuNCA5My0uOS4yLTIgLjMtMy4xLjEiIHN0eWxlPSJmaWxsOiNmZmYiLz48L3N2Zz4="><span class="pip" style="position:absolute;right:-3px;top:-3px;box-shadow:0 0 0 2px var(--sidebar)"></span></span></div></div>
+</div>
+</section>
+
+<section>
+<h2>List row · 28 px one line, 48 px two lines, radius 6, inset 8</h2>
+<div class="grid">
+  <div class="spec"><label>One line: rest, hover, selected, unread, mention, muted, muted unread, focus</label>
+  <div class="pane"><div class="list">
+    <div class="row one"><svg class="i"><use href="#hash"/></svg><span class="ttl">general</span></div>
+    <div class="row one h"><svg class="i"><use href="#hash"/></svg><span class="ttl">design-review</span></div>
+    <div class="row one sel"><svg class="i"><use href="#hash"/></svg><span class="ttl">platform</span></div>
+    <div class="row one un"><svg class="i"><use href="#hash"/></svg><span class="ttl">release-train</span><span class="bd">6</span></div>
+    <div class="row one un"><svg class="i"><use href="#hash"/></svg><span class="ttl">incidents</span><span class="bd m">2</span></div>
+    <div class="row one mu"><svg class="i"><use href="#hash"/></svg><span class="ttl">random</span></div>
+    <div class="row one mu"><svg class="i"><use href="#hash"/></svg><span class="ttl">bot-noise</span><span class="pip mu" style="margin-right:5px"></span></div>
+    <div class="row one fr" style="margin-top:3px"><svg class="i"><use href="#hash"/></svg><span class="ttl">keyboard-focus</span></div>
+  </div></div></div>
+
+  <div class="spec"><label>Two lines: rest, hover, selected, unread, mention, muted</label>
+  <div class="pane"><div class="list">
+    <div class="row two"><span class="av s32 h2">WH<i class="dot on"></i></span><div class="col"><div class="l1"><span class="ttl">Wren Halloran</span><span class="time">9:45 AM</span></div><div class="l2"><span class="pv">On it.</span></div></div></div>
+    <div class="row two h"><span class="av s32 h6">OB<i class="dot idle"></i></span><div class="col"><div class="l1"><span class="ttl">Odalys Brandt</span><span class="time">9:12 AM</span></div><div class="l2"><span class="pv">You: I'll keep the consumers paused until it finishes.</span></div></div></div>
+    <div class="row two sel"><span class="av place s32 neutral"><svg class="i"><use href="#hash"/></svg></span><div class="col"><div class="l1"><span class="ttl">platform</span><span class="time">8:38 AM</span></div><div class="l2"><span class="pv">Tobin: Deploy is green, rolling to prod at 3.</span></div></div></div>
+    <div class="row two un"><span class="av s32 h4">IV<i class="dot dnd"></i></span><div class="col"><div class="l1"><span class="ttl">Ines Varga</span><span class="time">8:13 AM</span></div><div class="l2"><span class="pv">Dinner Sunday?</span><span class="bd">2</span></div></div></div>
+    <div class="row two un"><span class="pair s32"><span class="av h3">T</span><span class="av h7">N</span></span><div class="col"><div class="l1"><span class="ttl">Release captains</span><span class="time">7:44 AM</span></div><div class="l2"><span class="pv">Niko: @you can you share your screen?</span><span class="bd m">1</span></div></div></div>
+    <div class="row two mu"><span class="av place s32 h1" style="opacity:.6">LB</span><div class="col"><div class="l1"><span class="ttl">Lanternbay / announcements</span><span class="time">Yesterday</span></div><div class="l2"><span class="pv">Weekly digest is out.</span><span class="pip mu" style="margin-right:5px"></span></div></div></div>
+  </div></div></div>
+
+  <div class="spec"><label>A list that mixes networks: 14 px icon leads the title. The avatar corner stays presence.</label>
+  <div class="pane"><div class="list">
+    <div class="sect">Direct messages</div>
+    <div class="row two un"><span class="av s32 h2">WH<i class="dot on"></i></span><div class="col"><div class="l1" style="align-items:center"><img class="net" width="14" height="14" src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHhtbDpzcGFjZT0icHJlc2VydmUiIHZpZXdCb3g9IjAgMCA1MTIgNTEyIj48cGF0aCBkPSJNMTA3LjkgMzIzLjZjMCAyOS43LTI0IDUzLjgtNTMuOCA1My44Uy4zIDM1My40LjMgMzIzLjZjMC0yOS43IDI0LTUzLjggNTMuOC01My44aDUzLjh6bTI2LjkgMGMwLTI5LjcgMjQtNTMuOCA1My44LTUzLjhzNTMuOCAyNCA1My44IDUzLjhWNDU4YzAgMjkuNy0yNCA1My44LTUzLjggNTMuOHMtNTMuOC0yNC01My44LTUzLjh6IiBzdHlsZT0iZmlsbDojZTAxZTVhIi8+PHBhdGggZD0iTTE4OC42IDEwNy43Yy0yOS43IDAtNTMuOC0yNC01My44LTUzLjhTMTU4LjguMSAxODguNi4xczUzLjggMjQgNTMuOCA1My44djUzLjh6bTAgMjcuM2MyOS43IDAgNTMuOCAyNCA1My44IDUzLjhzLTI0IDUzLjgtNTMuOCA1My44SDUzLjhDMjQgMjQyLjYgMCAyMTguNSAwIDE4OC44UzI0IDEzNSA1My44IDEzNXoiIHN0eWxlPSJmaWxsOiMzNmM1ZjAiLz48cGF0aCBkPSJNNDA0LjEgMTg4LjhjMC0yOS43IDI0LTUzLjggNTMuOC01My44czUzLjggMjQgNTMuOCA1My44LTI0IDUzLjgtNTMuOCA1My44aC01My44em0tMjYuOSAwYzAgMjkuNy0yNCA1My44LTUzLjggNTMuOC0yOS43IDAtNTMuOC0yNC01My44LTUzLjhWNTRjMC0yOS43IDI0LTUzLjggNTMuOC01My44czUzLjggMjQgNTMuOCA1My44eiIgc3R5bGU9ImZpbGw6IzJlYjY3ZCIvPjxwYXRoIGQ9Ik0zMjMuNCA0MDQuM2MyOS43IDAgNTMuOCAyNCA1My44IDUzLjggMCAyOS43LTI0IDUzLjgtNTMuOCA1My44LTI5LjcgMC01My44LTI0LTUzLjgtNTMuOHYtNTMuOHptMC0yNi45Yy0yOS43IDAtNTMuOC0yNC01My44LTUzLjhzMjQtNTMuOCA1My44LTUzLjhoMTM0LjhjMjkuNyAwIDUzLjggMjQgNTMuOCA1My44IDAgMjkuNy0yNCA1My44LTUzLjggNTMuOHoiIHN0eWxlPSJmaWxsOiNlY2IyMmUiLz48L3N2Zz4=" style="margin-right:-2px"><span class="ttl">Wren Halloran</span><span class="time">9:45 AM</span></div><div class="l2"><span class="pv">Thanks for the review, merged.</span><span class="bd m">1</span></div></div></div>
+    <div class="row two"><span class="av s32 h7">NA<i class="dot off"></i></span><div class="col"><div class="l1" style="align-items:center"><img class="net" width="14" height="14" src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHhtbDpzcGFjZT0icHJlc2VydmUiIHZpZXdCb3g9IjAuMDIgNTcuOCA1MTEuOTIgMzk2LjMiPjxwYXRoIGQ9Ik00MzMuNyA5MWE0MTYuNSA0MTYuNSAwIDAgMC0xMDUuNi0zMy4yYy00LjYgOC4yLTkuOSAxOS4zLTEzLjUgMjguMS0zOS40LTUuOS03OC40LTUuOS0xMTcuMSAwLTMuNy04LjgtOS4xLTE5LjktMTMuNy0yOC4xLTM3LjEgNi40LTcyLjYgMTcuNy0xMDUuNyAzMy4zLTY2LjggMTAxLTg1IDE5OS41LTc1LjkgMjk2LjYgNDQuMyAzMy4xIDg3LjMgNTMuMiAxMjkuNiA2Ni40IDEwLjQtMTQuNCAxOS43LTI5LjYgMjcuNy00NS43LTE1LjMtNS44LTI5LjktMTMtNDMuNy0yMS4zIDMuNy0yLjcgNy4yLTUuNiAxMC43LTguNSA4NC4yIDM5LjQgMTc1LjggMzkuNCAyNTkgMCAzLjUgMi45IDcuMSA1LjggMTAuNyA4LjUtMTMuOSA4LjMtMjguNSAxNS41LTQzLjggMjEuMyA4IDE2IDE3LjMgMzEuMyAyNy43IDQ1LjcgNDIuMy0xMy4yIDg1LjMtMzMuMyAxMjkuNi02Ni40IDEwLjgtMTEyLjUtMTgtMjEwLjEtNzYtMjk2LjdNMTcwLjkgMzI4Yy0yNS4zIDAtNDYtMjMuNi00Ni01Mi40czIwLjMtNTIuNCA0Ni01Mi40IDQ2LjUgMjMuNiA0NiA1Mi40Yy4xIDI4LjgtMjAuMiA1Mi40LTQ2IDUyLjRtMTcwLjIgMGMtMjUuMyAwLTQ2LTIzLjYtNDYtNTIuNHMyMC4zLTUyLjQgNDYtNTIuNCA0Ni41IDIzLjYgNDYgNTIuNGMwIDI4LjgtMjAuMyA1Mi40LTQ2IDUyLjQiIHN0eWxlPSJmaWxsOiM1ODY1ZjIiLz48L3N2Zz4=" style="margin-right:-2px"><span class="ttl">Niko Aldana</span><span class="time">Oct 11</span></div><div class="l2"><span class="pv">Sent you the photos from the trip.</span></div></div></div>
+    <div class="row two"><span class="av s32 h4">IV<i class="dot idle"></i></span><div class="col"><div class="l1" style="align-items:center"><img class="net" width="14" height="14" src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHhtbDpzcGFjZT0icHJlc2VydmUiIHZpZXdCb3g9IjAgMCA1MTIgNTEyIj48bGluZWFyR3JhZGllbnQgaWQ9ImEiIHgxPSIyNTYiIHgyPSIyNTYiIHkxPSIyIiB5Mj0iNTE0IiBncmFkaWVudFRyYW5zZm9ybT0ibWF0cml4KDEgMCAwIC0xIDAgNTE0KSIgZ3JhZGllbnRVbml0cz0idXNlclNwYWNlT25Vc2UiPjxzdG9wIG9mZnNldD0iMCIgc3R5bGU9InN0b3AtY29sb3I6IzFkOTNkMiIvPjxzdG9wIG9mZnNldD0iMSIgc3R5bGU9InN0b3AtY29sb3I6IzM4YjBlMyIvPjwvbGluZWFyR3JhZGllbnQ+PGNpcmNsZSBjeD0iMjU2IiBjeT0iMjU2IiByPSIyNTYiIHN0eWxlPSJmaWxsOnVybCgjYSkiLz48cGF0aCBkPSJtMTczLjMgMjc0LjcgMzAuNCA4NC4xczMuOCA3LjkgNy45IDcuOSA2NC41LTYyLjkgNjQuNS02Mi45bDY3LjMtMTI5LjktMTY5IDc5LjF6IiBzdHlsZT0iZmlsbDojYzhkYWVhIi8+PHBhdGggZD0ibTIxMy42IDI5Ni4zLTUuOCA2MnMtMi40IDE5IDE2LjUgMGMxOS0xOSAzNy4yLTMzLjYgMzcuMi0zMy42IiBzdHlsZT0iZmlsbDojYTljNmQ4Ii8+PHBhdGggZD0ibTE3My44IDI3Ny43LTYyLjUtMjAuNHMtNy41LTMtNS4xLTkuOWMuNS0xLjQgMS41LTIuNiA0LjUtNC43QzEyNC42IDIzMy4xIDM2NyAxNDYgMzY3IDE0NnM2LjgtMi4zIDEwLjktLjhjMiAuNiAzLjYgMi4zIDQgNC40LjQgMS44LjYgMy43LjUgNS41IDAgMS42LS4yIDMuMS0uNCA1LjQtMS41IDIzLjgtNDUuNyAyMDEuNi00NS43IDIwMS42cy0yLjYgMTAuNC0xMi4xIDEwLjhjLTQuNy4yLTkuMy0xLjYtMTIuNi00LjktMTguNi0xNi04Mi44LTU5LjItOTctNjguNi0uNi0uNC0xLjEtMS4xLTEuMi0xLjktLjItMSAuOS0yLjIuOS0yLjJzMTExLjgtOTkuNCAxMTQuOC0xMDkuOGMuMi0uOC0uNi0xLjItMS44LS45LTcuNCAyLjctMTM2LjIgODQuMS0xNTAuNCA5My0uOS4yLTIgLjMtMy4xLjEiIHN0eWxlPSJmaWxsOiNmZmYiLz48L3N2Zz4=" style="margin-right:-2px"><span class="ttl">Ines Varga</span><span class="time">Oct 9</span></div><div class="l2"><span class="pv">Voice message · 0:42</span></div></div></div>
+  </div></div></div>
+</div>
+</section>
+
+<section>
+<h2>Message · name, time and body share a 20 px line and one baseline</h2>
+<div class="stage" style="width:760px;padding:12px 0">
+  <div class="msg first"><span class="av s36 h2">WH</span><div><div class="hd"><b>Wren Halloran</b><span>9:07 AM</span></div><div class="body">Migration finished clean. Resuming consumers now.</div></div></div>
+  <div class="msg h"><span class="gut">9:08</span><div class="body">Lag is back under a second, see <a class="lk">the dashboard</a> or run <span class="icode">make lag</span>.</div></div>
+  <div style="padding:10px 16px"><div class="new">New</div></div>
+  <div class="msg first me"><span class="av s36 h6">OB</span><div><div class="hd"><b>Odalys Brandt</b><span>9:36 AM</span></div><div class="body"><span class="men">@you</span> canary looks healthy on my side, no new errors in the last 20 minutes.</div></div></div>
+  <div style="padding:10px 16px"><div class="day">Today</div></div>
+  <div class="msg first"><span class="av s36"><svg class="photo"><use href="#portrait"/></svg></span><div><div class="hd"><b>Tobin Reyes-Lindqvist</b><span>9:45 AM</span></div><div class="body">Deploy is green, rolling to prod at 3.</div></div></div>
+</div>
+</section>
+
+<section>
+<h2>Tooltip · popover · context menu</h2>
+<div class="grid">
+  <div class="spec"><label>Tooltip · 500 ms delay, no arrow</label><div class="line"><span class="tip">Add reaction</span><span class="tip">Search<span class="kbd" style="border:0;padding:0">⌘K</span></span></div></div>
+  <div class="spec"><label>Popover · radius 10, padding 12</label>
+    <div class="float pop"><div class="line" style="margin-bottom:12px"><span class="av s36 h2" style="--ring:var(--overlay)">WH<i class="dot on"></i></span><div><div style="font-weight:600">Wren Halloran</div><div class="t12" style="color:var(--soft)">Online · 10:14 local time</div></div></div>
+    <div class="line" style="gap:8px"><span class="btn primary" style="flex:1">Message</span><span class="btn secondary icon-l"><svg class="i"><use href="#phone"/></svg>Call</span></div></div></div>
+  <div class="spec"><label>Context menu · item 28, radius 6 inside 10 with 4 padding</label>
+    <div class="float menu">
+      <div class="mi"><svg class="i"><use href="#reply"/></svg>Reply<span class="sc">R</span></div>
+      <div class="mi h"><svg class="i"><use href="#smile"/></svg>Add reaction<span class="sc">E</span></div>
+      <div class="mi"><svg class="i"><use href="#pencil"/></svg>Edit message</div>
+      <div class="mi"><svg class="i"><use href="#copy"/></svg>Copy text<span class="sc">⌘C</span></div>
+      <div class="mi dis"><svg class="i"><use href="#hash"/></svg>Open thread</div>
+      <div class="msep"></div>
+      <div class="mlabel">Slack</div>
+      <div class="mi"><img class="net" width="16" height="16" src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHhtbDpzcGFjZT0icHJlc2VydmUiIHZpZXdCb3g9IjAgMCA1MTIgNTEyIj48cGF0aCBkPSJNMTA3LjkgMzIzLjZjMCAyOS43LTI0IDUzLjgtNTMuOCA1My44Uy4zIDM1My40LjMgMzIzLjZjMC0yOS43IDI0LTUzLjggNTMuOC01My44aDUzLjh6bTI2LjkgMGMwLTI5LjcgMjQtNTMuOCA1My44LTUzLjhzNTMuOCAyNCA1My44IDUzLjhWNDU4YzAgMjkuNy0yNCA1My44LTUzLjggNTMuOHMtNTMuOC0yNC01My44LTUzLjh6IiBzdHlsZT0iZmlsbDojZTAxZTVhIi8+PHBhdGggZD0iTTE4OC42IDEwNy43Yy0yOS43IDAtNTMuOC0yNC01My44LTUzLjhTMTU4LjguMSAxODguNi4xczUzLjggMjQgNTMuOCA1My44djUzLjh6bTAgMjcuM2MyOS43IDAgNTMuOCAyNCA1My44IDUzLjhzLTI0IDUzLjgtNTMuOCA1My44SDUzLjhDMjQgMjQyLjYgMCAyMTguNSAwIDE4OC44UzI0IDEzNSA1My44IDEzNXoiIHN0eWxlPSJmaWxsOiMzNmM1ZjAiLz48cGF0aCBkPSJNNDA0LjEgMTg4LjhjMC0yOS43IDI0LTUzLjggNTMuOC01My44czUzLjggMjQgNTMuOCA1My44LTI0IDUzLjgtNTMuOCA1My44aC01My44em0tMjYuOSAwYzAgMjkuNy0yNCA1My44LTUzLjggNTMuOC0yOS43IDAtNTMuOC0yNC01My44LTUzLjhWNTRjMC0yOS43IDI0LTUzLjggNTMuOC01My44czUzLjggMjQgNTMuOCA1My44eiIgc3R5bGU9ImZpbGw6IzJlYjY3ZCIvPjxwYXRoIGQ9Ik0zMjMuNCA0MDQuM2MyOS43IDAgNTMuOCAyNCA1My44IDUzLjggMCAyOS43LTI0IDUzLjgtNTMuOCA1My44LTI5LjcgMC01My44LTI0LTUzLjgtNTMuOHYtNTMuOHptMC0yNi45Yy0yOS43IDAtNTMuOC0yNC01My44LTUzLjhzMjQtNTMuOCA1My44LTUzLjhoMTM0LjhjMjkuNyAwIDUzLjggMjQgNTMuOCA1My44IDAgMjkuNy0yNCA1My44LTUzLjggNTMuOHoiIHN0eWxlPSJmaWxsOiNlY2IyMmUiLz48L3N2Zz4=">Open in Slack<svg class="i i14" style="margin-left:auto"><use href="#chev"/></svg></div>
+      <div class="msep"></div>
+      <div class="mi dg"><svg class="i"><use href="#trash"/></svg>Delete message</div>
+      <div class="mi dg h"><svg class="i"><use href="#trash"/></svg>Delete message</div>
+    </div></div>
+</div>
+</section>
+
+<section>
+<h2>Modal · toast · inline banner</h2>
+<div class="grid">
+  <div class="spec"><label>Modal 440 on a 50% scrim · radius 12, padding 20</label>
+    <div class="stage" style="width:560px;height:240px;overflow:hidden">
+      <div style="position:absolute;inset:0;background:var(--scrim);display:flex;align-items:center;justify-content:center">
+        <div class="float modal"><h3>Sign out of Slack?</h3><p>Lanternbay and Fennel Works will stop receiving messages here. Your history on this Mac is kept.</p>
+        <div class="foot"><span class="btn secondary">Cancel</span><span class="btn dangerb h">Sign out</span></div></div>
+      </div></div></div>
+  <div class="spec"><label>Toast · neutral, success with action, error (stays)</label>
+    <div class="float toast plain"><span>Link copied</span></div>
+    <div class="float toast"><svg class="i" style="color:var(--online)"><use href="#ok"/></svg><span class="grow">Message deleted</span><span class="btn ghost sm h">Undo</span></div>
+    <div class="float toast"><svg class="i" style="color:var(--danger)"><use href="#warn"/></svg><span class="grow">Couldn't send to #platform</span><span class="btn ghost sm">Retry</span><span class="ib sm"><svg class="i i14"><use href="#x"/></svg></span></div>
+    <label style="margin-top:8px">Inline banner · a state said in words, in the pane it concerns</label>
+    <div class="banner" style="width:400px"><svg class="i" style="color:var(--idle)"><use href="#warn"/></svg><span class="grow">Slack is offline. Messages will send when it is back.</span></div>
+  </div>
+</div>
+</section>
+
+<section>
+<h2>Segmented switch · tabs · dividers · scrollbar</h2>
+<div class="grid">
+  <div class="spec"><label>Segmented · 28 outer, 24 segment, radius 6 / 4</label>
+    <div class="seg"><span class="on">All</span><span>Unread</span><span class="h">Mentions</span></div>
+    <div class="seg"><span>Online</span><span class="on">All friends</span><span>Pending<span class="bd m">2</span></span></div></div>
+  <div class="spec" style="width:280px"><label>Tabs · 32, neutral 2 px bar</label>
+    <div class="tabs"><span class="on">Messages</span><span>Files</span><span class="h">Pins</span><span>Members</span></div></div>
+  <div class="spec" style="width:260px"><label>Divider · hairline, day, new</label>
+    <div class="hr"></div><div class="day" style="margin-top:8px">Monday, October 12</div><div class="new" style="margin-top:8px">New</div></div>
+  <div class="spec"><label>Scrollbar · overlay 6 px, hover 8 px, no track</label>
+    <div class="line"><div class="scroll"><i class="thumb"></i></div><div class="scroll"><i class="thumb h"></i></div></div></div>
+</div>
+</section>
+
+<section>
+<h2>Loading · empty</h2>
+<div class="grid">
+  <div class="spec"><label>Skeleton rows · static, final geometry, shown after 150 ms</label>
+  <div class="pane"><div class="list">
+    <div class="row two"><span class="sk av s32" style="width:32px;height:32px"></span><div class="col" style="gap:8px"><span class="sk" style="width:120px"></span><span class="sk" style="width:200px;height:8px"></span></div></div>
+    <div class="row two"><span class="sk av s32" style="width:32px;height:32px"></span><div class="col" style="gap:8px"><span class="sk" style="width:88px"></span><span class="sk" style="width:164px;height:8px"></span></div></div>
+    <div class="row two"><span class="sk av s32" style="width:32px;height:32px"></span><div class="col" style="gap:8px"><span class="sk" style="width:140px"></span><span class="sk" style="width:104px;height:8px"></span></div></div>
+  </div></div></div>
+  <div class="spec" style="width:260px"><label>Known progress: a 4 px bar that moves only when the value does</label>
+    <div class="line" style="justify-content:space-between"><span>harbor-map.png</span><span class="t12 tn" style="color:var(--soft)">62%</span></div><div class="bar"><i style="width:62%"></i></div>
+    <label style="margin-top:12px">Unknown progress: words, never a spinner</label><span style="color:var(--soft)">Loading earlier messages…</span>
+    <label style="margin-top:12px">Image not yet decoded: its final box, flat</label><div style="width:200px;height:120px;border-radius:8px;background:var(--raised)"></div></div>
+  <div class="spec"><label>Empty state · no disc, no illustration</label>
+    <div class="stage empty"><svg class="i i20"><use href="#chat"/></svg><b>No conversation selected</b><p>Pick one from the list, or press ⌘K to jump to anyone.</p><span class="btn secondary">New message</span></div></div>
+</div>
+</section>
+
+</body>
+</html>

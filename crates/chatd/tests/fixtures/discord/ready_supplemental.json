@@ -1,0 +1,21 @@
+{
+  "merged_presences": {
+    "friends": [
+      {"user_id": "2001", "status": "online", "client_status": {"desktop": "online"}, "activities": [
+        {"type": 0, "name": "Factorio", "id": "ec0b28a579ecb4bd", "created_at": 1729400000000},
+        {"type": 4, "name": "Custom Status", "id": "custom", "state": "shipping", "emoji": null, "created_at": 1729400000000}
+      ]},
+      {"user_id": "2002", "status": "idle", "client_status": {"mobile": "idle"}, "activities": []}
+    ],
+    "guilds": [[], []]
+  },
+  "merged_members": [[], []],
+  "guilds": [
+    {"id": "4000", "voice_states": [
+      {"user_id": "2002", "channel_id": "4201", "session_id": "voice-dev", "self_mute": true, "self_deaf": false, "mute": false, "deaf": false, "self_video": false, "suppress": false}
+    ], "embedded_activities": [], "activity_instances": []},
+    {"id": "5000", "voice_states": [], "embedded_activities": [], "activity_instances": []}
+  ],
+  "lazy_private_channels": [],
+  "disclose": []
+}

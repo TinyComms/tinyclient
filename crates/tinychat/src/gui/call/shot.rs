@@ -1,0 +1,173 @@
+//! `--shot` only: a made-up call for design review, so every face of the dock can be drawn with
+//! no call, no mediad and no microphone. `TINYCHAT_SHOT_CALL` names the state:
+//! `ringing_out`, `incoming`, `connecting`, `joined`, `joined_speaking`, `joined_muted`,
+//! `joined_deafened`, `joined_alone`, `joined_channel`, `reconnecting`, `ended`, `confirm`,
+//! `incoming_strip`, `confirm_answer`, `join_call` (the header pill of a conversation whose
+//! call is running), `devices_menu`, `people_menu`, and the failures `failed_noanswer`,
+//! `failed_declined`, `failed_refused`, `failed_lost`, `failed_unreachable`, `failed_udp`,
+//! `failed_mic`, `failed_nomic`, `failed_speaker`, `failed_engine`, `failed_dave`.
+
+use super::{now, Confirm, Ended, Menu, Subject};
+use crate::gui::state::Snapshot;
+use protocol::{
+    Call, CallFailure, CallState, ConversationKind, Key, Network, Occupant, Occupants, Participant,
+};
+
+fn named() -> Option<String> {
+    std::env::var("TINYCHAT_SHOT_CALL").ok().filter(|name| !name.is_empty())
+}
+
+fn channel(name: &str) -> bool {
+    matches!(name, "joined_channel" | "devices_menu" | "people_menu" | "confirm" | "incoming_strip" | "confirm_answer")
+}
+
+fn person(name: &str, speaking: bool, muted: bool, deafened: bool) -> Participant {
+    Participant { id: name.to_lowercase().replace(' ', "-"), name: name.to_owned(), speaking, muted, deafened }
+}
+
+fn key(id: &str) -> Key {
+    Key { network: Network::Discord, account: "shot".to_owned(), id: id.to_owned() }
+}
+
+pub(super) fn call(snapshot: &Snapshot) -> Option<Call> {
+    let name = named()?;
+    if matches!(name.as_str(), "ended" | "join_call") {
+        return None;
+    }
+    let failed = |reason, detail: &str| CallState::Failed { reason, detail: detail.to_owned() };
+    // The sentences are the ones chatd, the adapter and mediad send.
+    let state = match name.as_str() {
+        "ringing_out" => CallState::RingingOut,
+        "incoming" => CallState::RingingIn { from: "Mara Okafor".to_owned() },
+        "connecting" => CallState::Connecting,
+        "reconnecting" => CallState::Reconnecting,
+        "failed_noanswer" => failed(CallFailure::NoAnswer, "Nobody picked up."),
+        "failed_declined" => failed(CallFailure::NoAnswer, "They declined the call."),
+        "failed_refused" => failed(CallFailure::Refused, "Discord refused the voice connection. Try again, or take this call in Discord."),
+        "failed_lost" => failed(CallFailure::Lost, "The connection to Discord dropped and didn't come back. You've left the call."),
+        "failed_unreachable" => failed(
+            CallFailure::Lost,
+            "Couldn't reach Discord's voice server. Check your internet connection, then try again.",
+        ),
+        "failed_udp" => failed(
+            CallFailure::Lost,
+            "Discord's voice server answered, but call audio couldn't get through. A VPN or firewall may be blocking it.",
+        ),
+        "failed_mic" => failed(
+            CallFailure::Audio,
+            "Allow it in System Settings › Privacy & Security › Microphone, then call again.",
+        ),
+        "failed_nomic" => failed(CallFailure::Audio, "Plug in a microphone, or choose another in Microphone and speaker."),
+        "failed_speaker" => failed(
+            CallFailure::Audio,
+            "The speaker didn't start. Reconnect it or choose another in Microphone and speaker, then try again.",
+        ),
+        "failed_engine" => failed(CallFailure::Engine, "The call engine stopped."),
+        "failed_dave" => failed(
+            CallFailure::Encryption,
+            "Discord raised its encryption requirement. Update tinychat, or take this call in Discord.",
+        ),
+        _ => CallState::Joined,
+    };
+    // The open conversation's, so the header pill reads Leave or Cancel as it would.
+    let conversation = snapshot.open.as_ref().map_or_else(|| key("shot"), |open| open.key.clone());
+    let muted = name == "joined_muted";
+    let participants = if channel(&name) {
+        vec![
+            person("Dev Patel", false, false, false),
+            person("Iris Navarro", false, true, true),
+            person("Mara Okafor", true, false, false),
+            person("Tomas Lindqvist", false, true, false),
+            person("Jun Aoki", false, false, false),
+        ]
+    } else if name == "joined_alone" {
+        Vec::new()
+    } else {
+        vec![person("Mara Okafor", name == "joined", muted, false)]
+    };
+    let joined = match name.as_str() {
+        "ringing_out" => now() - 12,
+        "reconnecting" => now() - 8,
+        "failed_lost" => now() - 900,
+        "incoming" | "connecting" => 0,
+        name if name.starts_with("failed") => 0,
+        name if channel(name) => now() - 271,
+        _ => now() - 724,
+    };
+    let menu = name == "devices_menu";
+    let listed = |names: &[&str]| if menu { names.iter().map(|name| (*name).to_owned()).collect() } else { Vec::new() };
+    Some(Call {
+        speaking: matches!(name.as_str(), "joined_speaking" | "devices_menu" | "people_menu"),
+        level: menu.then_some(62),
+        inputs: listed(&["MacBook Pro Microphone", "Studio headset", "Desk camera microphone"]),
+        outputs: listed(&["MacBook Pro Speakers", "Studio headset"]),
+        conversation,
+        state,
+        participants,
+        muted: muted || name == "joined_deafened",
+        deafened: name == "joined_deafened",
+        joined,
+        input: "MacBook Pro Microphone".to_owned(),
+        output: "MacBook Pro Speakers".to_owned(),
+        engine_linked: true,
+        video: Vec::new(),
+    })
+}
+
+fn mara() -> Subject {
+    Subject { title: "Mara Okafor".to_owned(), kind: ConversationKind::Direct, avatar: None, space: None }
+}
+
+/// Who the made-up call is with, or the voice channel of the channel shots.
+pub(super) fn subject() -> Option<Subject> {
+    if channel(&named()?) {
+        let space = Some("tinychat-dev".to_owned());
+        return Some(Subject { title: "Lounge".to_owned(), kind: ConversationKind::Voice, avatar: None, space });
+    }
+    Some(mara())
+}
+
+/// Whoever was left alone in `joined_alone`.
+pub(super) fn left() -> Option<String> {
+    (named()? == "joined_alone").then(|| "Mara Okafor".to_owned())
+}
+
+pub(super) fn menu() -> Option<Menu> {
+    match named()?.as_str() {
+        "devices_menu" => Some(Menu::Devices),
+        "people_menu" => Some(Menu::People),
+        _ => None,
+    }
+}
+
+/// The other side hung up after twelve minutes and four seconds.
+pub(super) fn ended() -> Option<Ended> {
+    (named()? == "ended").then(|| Ended { conversation: key("shot"), subject: mara(), seconds: 724 })
+}
+
+/// The question the card asks before leaving Lounge.
+pub(super) fn confirm() -> Option<Confirm> {
+    match named()?.as_str() {
+        "confirm" => Some(Confirm { conversation: key("mara"), title: "Mara Okafor".to_owned(), answer: false }),
+        "confirm_answer" => Some(Confirm { conversation: key("crew"), title: "Iris Navarro".to_owned(), answer: true }),
+        _ => None,
+    }
+}
+
+/// A ring that arrives during the call: the conversation it is in, and who is calling.
+pub(super) fn strip() -> Option<(Confirm, String)> {
+    let ring = Confirm { conversation: key("crew"), title: "Weekend crew".to_owned(), answer: true };
+    (named()? == "incoming_strip").then(|| (ring, "Iris Navarro".to_owned()))
+}
+
+/// The open conversation's call is running and I am not in it.
+pub(super) fn running() -> Option<Occupants> {
+    let there = |name: &str| Occupant {
+        person: key(&name.to_lowercase()),
+        name: name.to_owned(),
+        muted: false,
+        deafened: false,
+        streaming: false,
+    };
+    (named()? == "join_call").then(|| Occupants { people: vec![there("Iris Navarro"), there("Jun Aoki")], total: 3 })
+}

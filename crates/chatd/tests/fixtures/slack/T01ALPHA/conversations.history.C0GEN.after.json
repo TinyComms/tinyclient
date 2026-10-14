@@ -1,0 +1,5 @@
+{"ok": true, "has_more": true, "pin_count": 0,
+ "messages": [
+  {"type": "message", "user": "U0BEN", "ts": "1759990200.000200", "team": "T01ALPHA", "text": "second of the old ones"},
+  {"type": "message", "user": "U0ANA", "ts": "1759990100.000100", "team": "T01ALPHA", "text": "first of the old ones"}
+ ]}

@@ -1,0 +1,34 @@
+{
+ "id": "19:platform0general@thread.tacv2",
+ "type": "Thread",
+ "properties": {
+  "threadType": "space",
+  "topic": "Platform"
+ },
+ "members": [
+  {
+   "id": "8:orgid:00000000-0000-4000-8000-0000000000aa",
+   "userLink": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/8:orgid:00000000-0000-4000-8000-0000000000aa",
+   "role": "Admin",
+   "friendlyName": ""
+  },
+  {
+   "id": "8:orgid:00000000-0000-4000-8000-0000000000a1",
+   "userLink": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/8:orgid:00000000-0000-4000-8000-0000000000a1",
+   "role": "User",
+   "friendlyName": ""
+  },
+  {
+   "id": "8:orgid:00000000-0000-4000-8000-0000000000b2",
+   "userLink": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/8:orgid:00000000-0000-4000-8000-0000000000b2",
+   "role": "User",
+   "friendlyName": ""
+  },
+  {
+   "id": "28:deploy-bot",
+   "userLink": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/28:deploy-bot",
+   "role": "User",
+   "friendlyName": "Deploy Bot"
+  }
+ ]
+}

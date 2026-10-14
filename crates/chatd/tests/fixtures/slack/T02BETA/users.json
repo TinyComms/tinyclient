@@ -1,0 +1,8 @@
+[
+ {"id": "U0ME2", "team_id": "T02BETA", "name": "justin", "deleted": false, "real_name": "Justin Example", "is_bot": false,
+  "profile": {"real_name": "Justin Example", "display_name": "", "status_text": "", "status_emoji": "", "avatar_hash": "e1e1e1",
+              "image_72": "https://avatars.slack-edge.com/2025-02-02/300_e1e1e1_72.png"}},
+ {"id": "U0PAT", "team_id": "T02BETA", "name": "pat", "deleted": false, "real_name": "Pat Kim", "is_bot": false,
+  "profile": {"real_name": "Pat Kim", "display_name": "", "status_text": "", "status_emoji": "", "avatar_hash": "d2d2d2",
+              "image_72": "https://avatars.slack-edge.com/2025-02-02/301_d2d2d2_72.png"}}
+]

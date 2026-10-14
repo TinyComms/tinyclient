@@ -1,0 +1,29 @@
+{
+ "tokens": {
+  "skypeToken": "SKYPETOKEN",
+  "expiresIn": 86397,
+  "tokenType": "SkypeToken"
+ },
+ "region": "emea",
+ "partition": "emea01",
+ "userRegion": "emea",
+ "regionGtms": {
+  "ams": "https://eu-api.asm.skype.com",
+  "amsV2": "https://eu-prod.asyncgw.teams.microsoft.com",
+  "chatService": "https://emea.ng.msg.teams.microsoft.com",
+  "chatServiceAggregator": "https://chatsvcagg.teams.microsoft.com",
+  "middleTier": "https://teams.microsoft.com/api/mt/emea",
+  "teamsAndChannelsService": "https://teams.microsoft.com/api/mt/emea",
+  "unifiedPresence": "https://presence.teams.microsoft.com",
+  "urlp": "https://urlp.asm.skype.com",
+  "search": "https://eu-prod.asyncgw.teams.microsoft.com/msgsearch"
+ },
+ "regionSettings": {
+  "isUnifiedPresenceEnabled": true,
+  "isFederationEnabled": true
+ },
+ "licenseDetails": {
+  "isFreemium": false,
+  "isTrial": false
+ }
+}

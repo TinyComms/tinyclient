@@ -1,0 +1,64 @@
+{
+ "messages": [
+  {
+   "id": "1760000500500",
+   "sequenceId": 500,
+   "clientmessageid": "13937443963459500",
+   "version": "1760000500500",
+   "conversationid": "19:00000000-0000-4000-8000-0000000000a1_00000000-0000-4000-8000-0000000000aa@unq.gbl.spaces",
+   "conversationLink": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/conversations/19:00000000-0000-4000-8000-0000000000a1_00000000-0000-4000-8000-0000000000aa@unq.gbl.spaces",
+   "type": "Message",
+   "messagetype": "RichText/Html",
+   "contenttype": "text",
+   "content": "<blockquote itemscope=\"\" itemtype=\"http://schema.skype.com/Reply\" itemid=\"1760000480480\"><strong itemprop=\"mri\" itemid=\"8:orgid:00000000-0000-4000-8000-0000000000aa\">Me Myself</strong><span itemprop=\"time\" itemid=\"1760000480480\"></span><p itemprop=\"preview\">is the build green?</p></blockquote><p>yes, since noon</p>",
+   "amsreferences": [],
+   "from": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/8:orgid:00000000-0000-4000-8000-0000000000a1",
+   "imdisplayname": "Ana Ruiz",
+   "composetime": "2025-10-09T09:01:40.5000000Z",
+   "originalarrivaltime": "2025-10-09T09:01:40.5000000Z",
+   "properties": {}
+  },
+  {
+   "id": "1760000480480",
+   "sequenceId": 480,
+   "clientmessageid": "13937443804921120",
+   "version": "1760000480480",
+   "conversationid": "19:00000000-0000-4000-8000-0000000000a1_00000000-0000-4000-8000-0000000000aa@unq.gbl.spaces",
+   "conversationLink": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/conversations/19:00000000-0000-4000-8000-0000000000a1_00000000-0000-4000-8000-0000000000aa@unq.gbl.spaces",
+   "type": "Message",
+   "messagetype": "RichText/Html",
+   "contenttype": "text",
+   "content": "<p>is the build green?</p>",
+   "amsreferences": [],
+   "from": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/8:orgid:00000000-0000-4000-8000-0000000000aa",
+   "imdisplayname": "Me Myself",
+   "composetime": "2025-10-09T09:01:20.4800000Z",
+   "originalarrivaltime": "2025-10-09T09:01:20.4800000Z",
+   "properties": {}
+  },
+  {
+   "id": "1760000470470",
+   "sequenceId": 470,
+   "clientmessageid": "13937443725651930",
+   "version": "1760000470470",
+   "conversationid": "19:00000000-0000-4000-8000-0000000000a1_00000000-0000-4000-8000-0000000000aa@unq.gbl.spaces",
+   "conversationLink": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/conversations/19:00000000-0000-4000-8000-0000000000a1_00000000-0000-4000-8000-0000000000aa@unq.gbl.spaces",
+   "type": "Message",
+   "messagetype": "Text",
+   "contenttype": "text",
+   "content": "1 < 2 && <b>not bold</b>",
+   "amsreferences": [],
+   "from": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/8:orgid:00000000-0000-4000-8000-0000000000a1",
+   "imdisplayname": "Ana Ruiz",
+   "composetime": "2025-10-09T09:01:10.4700000Z",
+   "originalarrivaltime": "2025-10-09T09:01:10.4700000Z",
+   "properties": {}
+  }
+ ],
+ "_metadata": {
+  "backwardLink": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/conversations/19:00000000-0000-4000-8000-0000000000a1_00000000-0000-4000-8000-0000000000aa@unq.gbl.spaces/messages?startTime=1&pageSize=50&view=msnp24Equivalent&syncState=3e30cursor2",
+  "syncState": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/conversations/19:00000000-0000-4000-8000-0000000000a1_00000000-0000-4000-8000-0000000000aa@unq.gbl.spaces/messages?startTime=1&pageSize=50&view=msnp24Equivalent&syncState=3e30cursor2-now",
+  "lastCompleteSegmentStartTime": 1,
+  "lastCompleteSegmentEndTime": 1760000300300
+ }
+}

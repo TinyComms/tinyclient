@@ -1,0 +1,27 @@
+{
+ "id": "19:00000000-0000-4000-8000-0000000000aa_00000000-0000-4000-8000-0000000000d4@unq.gbl.spaces",
+ "type": "Thread",
+ "version": 1760000600600,
+ "properties": {
+  "uniquerosterthread": "true",
+  "fixedRoster": "true",
+  "threadType": "chat",
+  "productThreadType": "OneToOneChat",
+  "createdat": "1760000600600",
+  "topic": ""
+ },
+ "members": [
+  {
+   "id": "8:orgid:00000000-0000-4000-8000-0000000000aa",
+   "userLink": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/8:orgid:00000000-0000-4000-8000-0000000000aa",
+   "role": "Admin",
+   "friendlyName": ""
+  },
+  {
+   "id": "8:orgid:00000000-0000-4000-8000-0000000000d4",
+   "userLink": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/8:orgid:00000000-0000-4000-8000-0000000000d4",
+   "role": "Admin",
+   "friendlyName": ""
+  }
+ ]
+}
