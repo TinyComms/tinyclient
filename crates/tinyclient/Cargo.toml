@@ -21,6 +21,10 @@ smallvec = { version = "1.6", optional = true }
 # Reads `mediad --devices` for Settings › Audio & video. Already in the tree through protocol.
 serde_json = { workspace = true, optional = true }
 
+[dev-dependencies]
+# The frame decoder's tests run without the window.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+
 [features]
 gui = ["dep:gpui", "dep:gpui_platform", "dep:unicode-segmentation", "dep:libc", "dep:image", "dep:smallvec", "dep:serde_json"]
 # Adds `--shot out.png`: render the window to a file and quit, for design review without
