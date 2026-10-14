@@ -733,7 +733,11 @@ impl Store {
         let db = Connection::open(path)?;
         // A 1 MB page cache, half SQLite's default: every list read is one page of rows, the
         // file is on a local disk the system already caches, and chatd's idle budget is tight.
-        db.execute_batch("PRAGMA journal_mode = WAL; PRAGMA cache_size = -1024;")?;
+        // Under WAL, NORMAL syncs at checkpoints, not at every write: a power cut can undo the
+        // last writes to this cache of what the networks hold, and never corrupts it. FULL
+        // flushed the disk at every write; on Windows four chatds seeding the demo at once took
+        // over a minute that way, and 3 s this way.
+        db.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA cache_size = -1024;")?;
         let version: i32 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if version != SCHEMA {
             let old: Vec<String> = db
