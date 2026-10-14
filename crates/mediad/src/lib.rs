@@ -4,17 +4,23 @@
 //! `jitter`, `opus`, `dave`); `gateway` speaks the voice websocket; `media` is the 20 ms loop that
 //! moves audio between the devices in `audio` and the UDP socket; `session` ties them to the
 //! frames chatd sends.
+//!
+//! `mediad --play` is the other mode: one voice message or audio file (`play`, reading it with
+//! `decode` and speeding it up with `stretch`), the speaker only, until playing stops.
 
 pub mod audio;
 pub mod dave;
+pub mod decode;
 pub mod gateway;
 pub mod jitter;
 pub mod media;
 pub mod opus;
 pub mod out;
 pub mod permission;
+pub mod play;
 pub mod rtp;
 pub mod session;
+pub mod stretch;
 
 /// Samples a second, on the wire and in every buffer between the codec and the devices.
 pub const RATE: u32 = 48_000;

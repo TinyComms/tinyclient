@@ -1358,6 +1358,7 @@ impl Shell {
             .children(tabs)
             .when(!banners.is_empty(), |sidebar| sidebar.child(div().flex_none().px(px(theme::INSET)).pb(px(8.)).flex().flex_col().gap(px(4.)).children(banners)))
             .child(div().id("sidebar-list").flex_1().min_h_0().track_focus(&self.sidebar_state.focus).key_context("Sidebar").child(body))
+            .children(super::playing::draw(self, window, cx))
             .children(self.slots.call_dock.and_then(|draw| draw(self, window, cx)))
             .children(self.slack_menu(cx))
     }

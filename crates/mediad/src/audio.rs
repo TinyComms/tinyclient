@@ -13,6 +13,7 @@ use std::fs::File;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 /// Device-rate stereo samples the callbacks and the media loop pass each other.
 type Ring = Arc<Mutex<VecDeque<f32>>>;
@@ -27,13 +28,15 @@ struct Playout {
     /// Samples still to be faded in after playing (re)started.
     fade: usize,
     underruns: u64,
+    /// Play what is held even when it is less than the cushion: a file's last moments.
+    flush: bool,
 }
 
 impl Playout {
     /// One stereo frame for the device, or silence while filling.
     fn next(&mut self, fill: usize, fade: usize) -> (f32, f32) {
         if !self.playing {
-            if self.ring.len() < fill {
+            if self.ring.len() < fill && !(self.flush && !self.ring.is_empty()) {
                 return (0., 0.);
             }
             self.playing = true;
@@ -154,7 +157,7 @@ fn table(cutoff: f64) -> Vec<[f32; TAPS]> {
 /// Band-limited conversion between two rates, one stereo stream: a polyphase windowed sinc. A
 /// device at 48 kHz bypasses it. Output sample `n` is the input at time `n * step`; it becomes
 /// available `TAPS - CENTRE` input frames later (under half a millisecond).
-struct Resampler {
+pub(crate) struct Resampler {
     /// Input frames per output frame.
     step: f64,
     /// Where the next output falls, in frames from the start of `held`.
@@ -166,7 +169,7 @@ struct Resampler {
 }
 
 impl Resampler {
-    fn new(from: u32, to: u32) -> Resampler {
+    pub(crate) fn new(from: u32, to: u32) -> Resampler {
         let step = f64::from(from) / f64::from(to);
         if from == to {
             return Resampler { step, position: 0., held: Vec::new(), table: Vec::new() };
@@ -176,7 +179,7 @@ impl Resampler {
         Resampler { step, position: 0., held: vec![0.; CENTRE * CHANNELS], table: table(cutoff) }
     }
 
-    fn push(&mut self, input: &[f32], output: &mut Vec<f32>) {
+    pub(crate) fn push(&mut self, input: &[f32], output: &mut Vec<f32>) {
         if self.table.is_empty() {
             output.extend_from_slice(input);
             return;
@@ -518,6 +521,108 @@ impl Audio {
                 }
             }
         }
+    }
+}
+
+/// The speaker alone, for playing a file (`mediad --play`): no microphone is opened, so no
+/// permission is asked and no recording indicator shows. Unlike a call it never drops what it
+/// is given; the player waits on [`Speaker::queued`] instead.
+pub struct Speaker {
+    sink: Sink,
+    /// For a stand-in sink, which has no device to drain it: when it began draining and how
+    /// much it was given since, so it drains at the pace a device would.
+    began: Instant,
+    given: u64,
+    scratch: Vec<f32>,
+    broken: Arc<AtomicBool>,
+    pub name: String,
+}
+
+impl Speaker {
+    /// The device named `want`, else the system default. `TINYCLIENT_MEDIAD_AUDIO` replaces it
+    /// with nothing, or with `TINYCLIENT_MEDIAD_SINK`'s file, as for a call.
+    pub fn open(want: Option<&str>) -> Result<Speaker, AudioError> {
+        let mut speaker = Speaker {
+            sink: Sink::Null,
+            began: Instant::now(),
+            given: 0,
+            scratch: Vec::new(),
+            broken: Arc::default(),
+            name: "null".to_owned(),
+        };
+        if Audio::simulated() {
+            if let Some(path) = std::env::var_os("TINYCLIENT_MEDIAD_SINK") {
+                speaker.sink = Sink::File(File::create(path).map_err(|e| AudioError::Speaker(e.to_string()))?);
+            }
+            return Ok(speaker);
+        }
+        let host = cpal::default_host();
+        let device = find(&host, want, false).ok_or(AudioError::NoSpeaker)?;
+        speaker.sink = Sink::Device(Some(open_output(&device, &speaker.broken)?));
+        speaker.name = name(&device).unwrap_or_default();
+        Ok(speaker)
+    }
+
+    /// 48 kHz frames given and not yet played.
+    pub fn queued(&self) -> usize {
+        match &self.sink {
+            Sink::Device(Some(output)) => {
+                let held = output.playout.lock().unwrap().ring.len() / CHANNELS;
+                // The ring is at the device's rate; the player counts at ours.
+                (held as f64 * output.resampler.step) as usize
+            }
+            _ => {
+                let drained = (self.began.elapsed().as_secs_f64() * f64::from(RATE)) as u64;
+                self.given.saturating_sub(drained) as usize
+            }
+        }
+    }
+
+    /// Interleaved 48 kHz stereo, played after what is already queued.
+    pub fn push(&mut self, pcm: &[f32]) {
+        if self.queued() == 0 {
+            // A stand-in starts draining when it is given something, as a device would.
+            self.began = Instant::now();
+            self.given = 0;
+        }
+        self.given += (pcm.len() / CHANNELS) as u64;
+        match &mut self.sink {
+            Sink::Null | Sink::Device(None) => {}
+            Sink::File(file) => {
+                let bytes: Vec<u8> =
+                    pcm.iter().flat_map(|s| ((s.clamp(-1., 1.) * 32767.) as i16).to_le_bytes()).collect();
+                let _ = file.write_all(&bytes);
+            }
+            Sink::Device(Some(output)) => {
+                self.scratch.clear();
+                output.resampler.push(pcm, &mut self.scratch);
+                let mut playout = output.playout.lock().unwrap();
+                playout.ring.extend(self.scratch.iter());
+                playout.flush = false;
+            }
+        }
+    }
+
+    /// Nothing more is coming: what is held plays even if it is shorter than the cushion.
+    pub fn finish(&mut self) {
+        if let Sink::Device(Some(output)) = &mut self.sink {
+            output.playout.lock().unwrap().flush = true;
+        }
+    }
+
+    /// Drops what is queued, so a seek or a new speed is heard at once.
+    pub fn clear(&mut self) {
+        if let Sink::Device(Some(output)) = &mut self.sink {
+            let mut playout = output.playout.lock().unwrap();
+            playout.ring.clear();
+            playout.playing = false;
+        }
+        self.given = 0;
+    }
+
+    /// The device stopped or went away.
+    pub fn broken(&self) -> bool {
+        self.broken.load(Ordering::Relaxed)
     }
 }
 

@@ -157,6 +157,7 @@ pub struct Hub {
     pub catalogs: Recent<CatalogAsked, (Vec<protocol::CatalogItem>, Option<String>)>,
     pub reactions: Recent<Key, protocol::ReactionRules>,
     pub calls: Calls,
+    pub player: crate::playback::Player,
 }
 
 impl Hub {
@@ -190,6 +191,7 @@ impl Hub {
             catalogs: Recent::new(32),
             reactions: Recent::new(64),
             calls: Calls::default(),
+            player: crate::playback::Player::default(),
         }
     }
 

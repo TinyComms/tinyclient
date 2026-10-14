@@ -359,6 +359,12 @@ pub(super) fn dock(shell: &Shell, _: &mut Window, cx: &mut Context<Shell>) -> Op
 }
 
 impl Shell {
+    /// The speaker picked in the call's device menu in this window, which a voice message plays
+    /// through too. `None` follows the system default.
+    pub(super) fn chosen_output(&self) -> Option<String> {
+        self.call_state.output.clone().flatten()
+    }
+
     /// Offered every change chatd reports, after `Shell` has applied its own part.
     pub(super) fn call_changed(&mut self, change: &Change, cx: &mut Context<Self>) {
         ensure_keys(cx);

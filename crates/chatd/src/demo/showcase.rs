@@ -3,11 +3,12 @@
 
 use super::discord::{self, Discord, BOT, HARUTO, INES, TOMASZ, WREN};
 use super::png::Art;
+use super::photos;
 use super::serve::wav_bytes;
 use super::{Fallible, Rich, Seeder, Who};
 use crate::store::ConversationRow;
 use protocol::{
-    AccountKey, Attachment, Card, ConversationKind, Forwarded, Key, MediaKind, MentionKind, Message,
+    AccountKey, Attachment, Card, ConversationKind, Forwarded, Key, MediaFile, MediaKind, MentionKind, Message,
     MessageKind, Preview, Reaction, ReplyTo, SendState, Span, Style, ThreadSummary,
 };
 
@@ -33,7 +34,7 @@ fn thread_row(id: &str, title: &str, root: &str, position: i32, group: Option<St
 }
 
 /// A voice message's loudness, as the network would send it: a few words and the gaps between.
-fn waveform(bars: usize) -> Vec<u8> {
+pub(super) fn waveform(bars: usize) -> Vec<u8> {
     (0..bars)
         .map(|bar| {
             let swell = ((bar as f32 / bars as f32) * std::f32::consts::PI * 5.0).sin().abs();
@@ -196,11 +197,20 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<Pending> {
     feed.push(gif);
     let look = s.look(Art::Scene);
     let mut video = s.message(account, who(TOMASZ), step(9), "Full clip from 03:12.");
+    // The clip itself is served when the user plays it; away from the source tree it is not.
+    let clip = match photos::bytes("camera2-clip.mp4") {
+        Some(bytes) => MediaFile {
+            width: 640,
+            height: 360,
+            ..s.file(account, "att-video", MediaKind::Video, bytes.len() as u64, "photo/camera2-clip.mp4?wait=600")?
+        },
+        None => s.broken(account, "att-video", MediaKind::Video, 1920, 1080, 19_293_798)?,
+    };
     video.attachments.push(Attachment {
         thumb: Some(s.photo(account, "att-video-thumb", MediaKind::Image, "video-thumb.webp", look, 640, 360)?),
         mime: "video/mp4".to_owned(),
-        duration: 94,
-        ..Attachment::new("camera2-0312.mp4", s.broken(account, "att-video", MediaKind::Video, 1920, 1080, 19_293_798)?)
+        duration: 5,
+        ..Attachment::new("camera2-0312.mp4", clip)
     });
     feed.push(video);
 
@@ -215,14 +225,33 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<Pending> {
     });
     feed.push(files);
 
+    // A voice message as Discord sends one: Ogg Opus, its length and loudness known before a
+    // byte of it is fetched. Away from the source tree, a WAV of two notes stands in.
     let mut voice = s.message(account, who(INES), step(18), "");
-    voice.attachments.push(Attachment {
-        mime: "audio/wav".to_owned(),
-        duration: 4,
-        waveform: waveform(64),
-        ..Attachment::new("voice-message.wav", s.file(account, "att-voice", MediaKind::Audio, wav_bytes(4), "wav/4")?)
+    voice.attachments.push(match photos::bytes("voice-ines.opus") {
+        Some(bytes) => Attachment {
+            mime: "audio/ogg".to_owned(),
+            duration: 6,
+            waveform: waveform(64),
+            ..Attachment::new("voice-message.ogg", s.file(account, "att-voice", MediaKind::Audio, bytes.len() as u64, "photo/voice-ines.opus")?)
+        },
+        None => Attachment {
+            mime: "audio/wav".to_owned(),
+            duration: 4,
+            waveform: waveform(64),
+            ..Attachment::new("voice-message.wav", s.file(account, "att-voice", MediaKind::Audio, wav_bytes(4), "wav/4")?)
+        },
     });
     feed.push(voice);
+    if let Some(bytes) = photos::bytes("dawn-chorus.m4a") {
+        let mut song = s.message(account, who(HARUTO), step(6), "Dawn chorus by the hollow, 5:40. The second trill is the wren.");
+        song.attachments.push(Attachment {
+            mime: "audio/mp4".to_owned(),
+            duration: 12,
+            ..Attachment::new("dawn-chorus-lynx-hollow.m4a", s.file(account, "att-chorus", MediaKind::Audio, bytes.len() as u64, "photo/dawn-chorus.m4a")?)
+        });
+        feed.push(song);
+    }
     let look = s.look(Art::Blob);
     let mut sticker = s.message(account, who(WREN), step(4), "");
     let stuck = s.picture(account, "sticker-moss-wave", MediaKind::Image, look, 320, 320)?;

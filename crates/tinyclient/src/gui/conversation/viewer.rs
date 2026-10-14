@@ -1,7 +1,7 @@
 //! The image viewer: one picture over the whole window, at fit or at its own size, with the
 //! rest of the conversation's pictures a key away.
 
-use super::draw::quick_look;
+use super::draw::open_file;
 use super::icons::{icon, Icon};
 use super::images::Picture;
 use super::media::{self, Shape};
@@ -298,7 +298,11 @@ impl Pane {
     }
 
     fn open_viewed(&mut self, preview: bool, cx: &mut Context<Self>) {
-        let Some(path) = self.viewed().and_then(|(_, attachment)| attachment.file.path) else {
+        let Some((_, attachment)) = self.viewed() else {
+            return;
+        };
+        let name = media::disk_name(&attachment);
+        let Some(path) = attachment.file.path else {
             return;
         };
         if preview {
@@ -320,7 +324,7 @@ impl Pane {
                 .status();
             });
         } else {
-            quick_look(&path);
+            open_file(&path, &name, super::Then::QuickLook);
         }
         let _ = cx;
     }

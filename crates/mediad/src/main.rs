@@ -219,6 +219,16 @@ fn main() -> ExitCode {
             println!("{}", permission::responsible().unwrap_or_default());
             return ExitCode::SUCCESS;
         }
+        // One voice message or audio file, for chatd, until it ends or chatd closes stdin.
+        Some("--play") => {
+            return match mediad::play::run() {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(err) => {
+                    eprintln!("mediad: {err}");
+                    ExitCode::from(1)
+                }
+            };
+        }
         _ => {}
     }
     let calls = first.and_then(|s| s.parse().ok()).unwrap_or(0);

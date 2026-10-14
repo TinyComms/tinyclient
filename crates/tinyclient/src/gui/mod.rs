@@ -14,6 +14,7 @@ mod input;
 mod layout;
 mod pane;
 mod people;
+mod playing;
 mod rail;
 mod settings;
 mod sidebar;

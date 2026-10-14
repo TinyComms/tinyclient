@@ -168,7 +168,8 @@ impl Dirty {
             | Change::Searched { .. }
             | Change::SignIn { .. }
             | Change::Call { .. }
-            | Change::Upload { .. } => {}
+            | Change::Upload { .. }
+            | Change::Playback { .. } => {}
             Change::Folders { .. } => self.spaces = true,
         }
     }
@@ -213,6 +214,8 @@ pub struct Shell {
     pub(super) composer_state: composer::State,
     #[allow(dead_code)]
     pub(super) call_state: call::State,
+    /// The voice message or audio file playing, across conversations.
+    pub(super) playing_state: super::playing::State,
 
     /// chatd as the shell sees it: starting, live, reconnecting, given up; the keychain.
     pub(super) service: Service,
@@ -272,6 +275,7 @@ impl Shell {
             people_state: people::State::default(),
             composer_state: composer::State::default(),
             call_state: call::State::default(),
+            playing_state: super::playing::State::default(),
             service: Service::new(!cfg!(feature = "gui-shot") || std::env::args().any(|arg| arg == "--start-chatd")),
             crashed: app::crash::relaunched_after(),
             restore: Some((prefs.open.clone(), prefs.mode.clone())),
@@ -382,6 +386,7 @@ impl Shell {
                     }
                 }
                 Change::Occupants { conversation, occupants } => self.occupants_changed(conversation, occupants, cx),
+                Change::Playback { playback } => self.playback_changed(playback.clone(), cx),
                 _ => {}
             }
             self.composer_changed(change, cx);

@@ -1,4 +1,4 @@
-# Demo pictures
+# Demo pictures, sounds and video
 
 Pictures for `chatd --seed-demo`, read from this directory when the demo is seeded (never compiled
 into `chatd`). Every file is public domain, CC0, or drawn for this repository; none needs
@@ -110,3 +110,11 @@ cropped and downscaled.
 | `icon-rustaceans.png` | [Ferris the crab, rustacean.net](https://rustacean.net/) | Karen Rustad Tölva | Public domain |
 | `avatar-telegram.png` | `crates/tinyclient/assets/networks/telegram.svg` ([Dashboard Icons](https://github.com/homarr-labs/dashboard-icons)) | homarr-labs | Apache-2.0; Telegram's logo is a trademark of its owner |
 | `logo-*.png`, `avatar-lichen-bot.png`, `avatar-deploy-bot.png`, `avatar-workflows.png`, `avatar-viva-insights.png`, `avatar-weather-bot.png`, `avatar-crypto-giveaway-official.png`, `avatar-github.png`, `avatar-slackbot.png` | Drawn for this repository | tinyclient contributors | MIT, as the repository |
+
+## Sound and video
+
+| File | Source | Author | License |
+|---|---|---|---|
+| `voice-ines.opus` | Synthesized for this repository: a pulse train through vowel formants, shaped to the demo voice message's waveform; Ogg Opus from Apple's encoder | tinyclient contributors | MIT, as the repository |
+| `dawn-chorus.m4a` | Synthesized for this repository: chirps over soft noise; AAC from Apple's encoder | tinyclient contributors | MIT, as the repository |
+| `camera2-clip.mp4` | A slow push into `video-thumb.webp` (above), H.264 from AVFoundation | Beata Ratuszniak beataratuszniak; tinyclient contributors | CC0 |

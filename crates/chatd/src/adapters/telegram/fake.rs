@@ -1083,6 +1083,7 @@ impl World {
             let what = match &request.location {
                 tl::enums::InputFileLocation::InputPhotoFileLocation(photo) => format!("photo {} {}", photo.id, photo.thumb_size),
                 tl::enums::InputFileLocation::InputPeerPhotoFileLocation(photo) => format!("avatar {}", photo.photo_id),
+                tl::enums::InputFileLocation::InputDocumentFileLocation(document) => format!("document {} {}", document.id, document.thumb_size).trim_end().to_owned(),
                 _ => "other".to_owned(),
             };
             self.log(&format!("GetFile {what} at {}", request.offset));

@@ -24,6 +24,10 @@ unsafe-libopus = "=0.2.0"
 # CoreAudio capture and playback, and device enumeration.
 cpal = "0.18"
 rand = "0.8"
+# Reading voice messages and audio files for `--play`: the containers (Ogg, WebM, MP4, WAV) and
+# every codec but Opus, which goes to the libopus above. Pure Rust, so no system library and
+# the same on every platform; it lives here so neither the window nor chatd links a codec.
+symphonia = { version = "0.5", default-features = false, features = ["ogg", "mkv", "isomp4", "wav", "pcm", "mp3", "aac", "flac", "vorbis"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # AVCaptureDevice's microphone authorization, which CoreAudio does not report.

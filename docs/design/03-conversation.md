@@ -66,17 +66,30 @@ Stack under the body: 5 px above the first, 4 px between. `W` = min(400, body wi
   120 ms opacity fade. Failed: `media_fill`, image-off glyph, "Couldn't load image · Retry" 12. Withheld by the network (Slack plan limit): the
   unsupported line, "Image hidden by Slack's plan".
 - **GIF.** Still frame; "GIF" badge bottom-left (height 20, radius 5, `badge` fill, 10.5 bold white); 44 px `badge` disc with an 18 px white play glyph
-  in the center. Click plays in place in the same box and removes disc and badge; stops when off screen or the window loses focus.
-- **Video.** Poster,
-  the same disc, duration badge bottom-right ("1:24"). Click downloads (2 px `accent` bar along the tile's bottom edge, disc becomes a cancel x) and
-  opens Quick Look.
+  in the center. A GIF that is an MP4 (Discord `gifv` from Tenor and Giphy, Telegram animations) is a video here: built today, a click plays it in
+  the system's player, as a video. Planned: it plays in place in the same box, muted and looping, and stops when off screen or the window loses
+  focus.
+- **Video.** Poster (the network's still), the same disc, duration badge bottom-right ("1:24"); a round video message (Telegram) is a circle. Click
+  fetches the file (the badge reads "Loading…") and plays it in the system's player (QuickTime on macOS, the default app on Linux and Windows), which
+  decodes with the system's codecs and has its own sound, scrubbing and full screen. It is opened through a link under the attachment's own name in
+  `open/` in the support directory, because the cache's file names have no extension. Every moving tile goes through one function,
+  `Pane::moving` (`gui/conversation/video.rs`), the one place an inline player would go.
 - **File row.** min(360, body width) x 56, radius 10, `raised`, 1 px `hairline`. 36 px icon tile (radius 8, `raised`, 18 px Lucide glyph in `text_soft`
   chosen by type: text, archive, sheet, audio, video, code, generic). Name 13.5 medium, one line, truncated; meta 11.5 `text_faint` "PDF · 2.4 MB" (the
   type is repeated here because truncation eats the extension). 28 px button at right. Idle: download glyph. Downloading: meta "7.1 of 18.6 MB", 2 px
   `accent` bar on the bottom edge, button is cancel. Downloaded: meta adds "Downloaded", button is Quick Look; click or Space opens Quick Look,
   double-click opens the default app. Failed: meta "Couldn't download · Retry" in `danger`.
-- **Voice message.** 300 x 48, radius 10, `raised`. 32 px round play button (`accent_soft`, glyph `accent`); waveform of 40 bars, 2 wide, 2 gap, 3 to 20
-  tall, `text_faint`, played part `accent`; time 12 `text_soft` "0:14 / 0:47". First click fetches, then plays; one message plays at a time.
+- **Voice message** (an audio attachment with the network's waveform: Discord, Telegram, Slack clips). min(360, body width) x 48, radius 10,
+  `raised`. 32 px round play / pause button (`accent_soft`, glyph `accent_text`); waveform of 40 bars, 2 wide, spread across the space left, 3 to 20 tall,
+  `text_faint`, played part `accent`; press or drag on it to seek. Time 12 `text_soft`: the length at rest ("0:47"), "0:14 / 0:47" once started,
+  "Loading…" while the file is fetched, "Couldn't play · Retry" in `danger` with the reason on hover. Then a speed chip (20 high, radius 4, `hover`
+  fill, 11 semibold): 1×, 1.5×, 2×, pitch kept; the last speed picked is where the next message starts. First click fetches, then plays; one file
+  plays at a time, across every conversation.
+- **Audio file** (an audio attachment with no waveform: music, Signal's and most phones' recordings). min(360, body width) x 56, the same box and
+  button; the name 13 medium over a 4 pt bar (`hover` track, `accent` played part, press or drag to seek) with the time beside it; the speed chip.
+- **Now playing.** Whatever plays keeps playing while the user scrolls or goes elsewhere. Above the call dock, in every sidebar mode: a 40 pt
+  `raised` bar with play / pause (28), the sender of a voice message or the file's name, "0:14 / 0:47" (or why it failed, in `danger`), and a ✕ that
+  stops it. Clicking the words opens the conversation. It goes when the file ends or is stopped.
 - **Sticker.** 128 x 128, no box, no border. Animated stickers show their static thumbnail.
 
 ## 4. Link cards
@@ -176,7 +189,7 @@ lightened for body-text contrast) · `MONO` = "SF Mono" falling back to Menlo.
 - **Animations:** image fade 120 ms, jump flash 1.2 s, the loader glyph. Nothing animates at idle.
 
 ## Deliberately absent
-Bubbles; compact density; role colors; syntax highlighting; inline video; autoplaying GIFs; animated stickers; shimmer placeholders; backdrop blur;
+Bubbles; compact density; role colors; syntax highlighting; inline video (for now: the system's player); autoplaying GIFs; animated stickers; shimmer placeholders; backdrop blur;
 favicons and any image not from the network's proxy; sticky day headers; a filmstrip in the viewer; per-message read receipts and "seen by" lists;
 edit history; interactive bot controls; polls, tables and headings as real elements (they are the unsupported line until P2); network badges on
 individual messages.

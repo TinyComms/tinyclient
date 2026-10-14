@@ -120,6 +120,19 @@ pub fn seed(s: &mut Seeder) -> Fallible<Who> {
         (INES, 38, "Also: are you in for Sunday?"),
     ])?;
     s.counts(&ines, 2, 0, Some(&said[0]))?;
+    // A voice note between the two, as Telegram sends one: Ogg Opus with its waveform.
+    if let Some(bytes) = super::photos::bytes("voice-ines.opus") {
+        let mut note = s.message(&account, &cast[INES], 39, "");
+        let file = s.file(&account, "tg-voice-ines", MediaKind::Audio, bytes.len() as u64, "photo/voice-ines.opus")?;
+        note.attachments.push(protocol::Attachment {
+            mime: "audio/ogg".to_owned(),
+            duration: 6,
+            waveform: super::showcase::waveform(64),
+            ..protocol::Attachment::new("Voice message", file)
+        });
+        s.post(&ines, &note)?;
+        s.counts(&ines, 3, 0, Some(&said[0]))?;
+    }
 
     // Ours last, and read by her: ✓✓.
     let (mara, said) = talk(s, direct(&cast[MARA], Filing { folders: folders(&["work"]), ..Filing::default() }), &[

@@ -22,7 +22,7 @@
 //!   from the first conversation drawn (use with `--open`), before the picture: `open:N` (row N of the list on show), `members`,
 //!   `details` (the header's buttons), `thread` (the first thread in the open conversation),
 //!   `back`, `forward`, `close` (the pane's ✕), `escape` (in the composer, with nothing of its
-//!   own up), `members-on` (the channel switch, as a wider window left it), `wait:ms` (let `--mode` and `--open` land first). Prints the pane after each.
+//!   own up), `members-on` (the channel switch, as a wider window left it), `wait:ms` (let `--mode` and `--open` land first), `play:<message id>` (press play on its voice message or audio file). Prints the pane after each.
 
 use super::media;
 use super::{Pane, PaneEvent};
@@ -319,6 +319,25 @@ pub fn steps(cx: &mut gpui::Context<crate::gui::state::Shell>) {
                 continue;
             }
             let step = step.to_owned();
+            // `play:<message id>`: goes to the message and presses play on its voice message or audio file,
+            // which fetches it first if it is not on disk. The pane asks the shell, so it is
+            // pressed outside the shell's own update.
+            if let Some(id) = step.strip_prefix("play:") {
+                let pane = this.update(cx, |shell, _| shell.conversation_state.pane.get().cloned()).ok().flatten();
+                if let Some(pane) = pane {
+                    let _ = pane.update(cx, |pane, cx| {
+                        pane.jump_to(id, cx);
+                        let Some(message) = pane.find(id) else {
+                            return eprintln!("shot: no message {id}");
+                        };
+                        let playable = |a: &protocol::Attachment| matches!(media::shape(a), media::Shape::Voice | media::Shape::Audio);
+                        if let Some(index) = message.attachments.iter().position(playable) {
+                            pane.press_play(&message, index, None, cx);
+                        }
+                    });
+                }
+                continue;
+            }
             let _ = this.update(cx, |shell, cx| {
                 match step.split_once(':') {
                     Some(("open", row)) => {

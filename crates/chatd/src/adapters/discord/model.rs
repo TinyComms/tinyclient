@@ -812,6 +812,10 @@ pub struct Embed {
     pub thumbnail: Option<EmbedImage>,
     #[serde(default)]
     pub image: Option<EmbedImage>,
+    /// The moving picture of a `gifv` (Tenor, Giphy) or `video` embed. Only its `proxy_url`,
+    /// on Discord's own media host, is ever fetched.
+    #[serde(default)]
+    pub video: Option<EmbedImage>,
     #[serde(default, deserialize_with = "nullable")]
     pub fields: Vec<EmbedField>,
 }

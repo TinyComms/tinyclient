@@ -467,6 +467,17 @@ fn messages_arrive_change_and_go_and_what_they_hold_is_mapped() {
     let note = &voice.attachments[0];
     assert_eq!((note.name.as_str(), note.file.kind, note.duration, note.mime.as_str()), ("Voice message", MediaKind::Audio, 7, "audio/ogg"));
     assert_eq!(note.waveform, vec![255, 0, 255, 0, 255, 0, 255, 0]);
+    // Played only when asked: the note itself is not fetched for its row, and comes from
+    // Telegram in one piece when the shell asks for it to play.
+    assert_eq!(world.called("GetFile document 6100"), 0);
+    let played = world.until("the voice message on disk", || {
+        match world.ask(Request::Fetch { account: account(), ids: vec!["d6100".into()], size: None, retry: false }) {
+            Response::Media { mut files } => files.pop().and_then(|file| file.path),
+            other => panic!("{other:?}"),
+        }
+    });
+    assert_eq!(std::fs::metadata(&played).unwrap().len(), FILE_BYTES);
+    assert_eq!(world.called("GetFile document 6100"), 1, "one piece of up to a megabyte");
 
     // Forwarded from the channel, in answer to an earlier message.
     world.steer("forward");
