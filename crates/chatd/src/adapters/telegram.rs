@@ -474,6 +474,7 @@ fn serve(account: &Arc<Account>, command: Command) {
             }
         }
         Command::Watch(watching) => sync::on_screen(account, &watching),
+        Command::Wanted(ids) => drop(account.files.asked(&ids)),
         Command::Previews(ids) => sync::previews(account, &ids),
         Command::MarkRead { conversation_id, message_id } => mark_read(account, &conversation_id, &message_id),
         Command::Send { conversation_id, client_id, text, reply_to } => {

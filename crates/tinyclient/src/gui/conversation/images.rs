@@ -257,6 +257,14 @@ struct Slot {
     crop: u32,
 }
 
+impl Slot {
+    fn new(path: &str, edge: u32, crop: Option<f32>) -> Slot {
+        // A few sizes rather than every size: a box that differs by a pixel reuses the decode.
+        let edge = edge.div_ceil(32) * 32;
+        Slot { path: path.into(), edge, crop: crop.map_or(0, |ratio| (ratio * 1000.) as u32) }
+    }
+}
+
 /// What a decode produced, to hand back to [`Images::store`].
 pub struct Loaded {
     slot: Slot,
@@ -319,9 +327,7 @@ impl Images {
         cx: &mut Context<T>,
         landed: fn(&mut T, Loaded, &mut Context<T>),
     ) -> Picture {
-        // A few sizes rather than every size: a box that differs by a pixel reuses the decode.
-        let edge = edge.div_ceil(32) * 32;
-        let slot = Slot { path: path.into(), edge, crop: crop.map_or(0, |ratio| (ratio * 1000.) as u32) };
+        let slot = Slot::new(path, edge, crop);
         let frame = self.frame;
         match self.held.get_mut(&slot) {
             Some(Held::Ready { image, used, .. }) => {
@@ -342,6 +348,21 @@ impl Images {
         self.queue.push_back(slot);
         self.pump(cx, landed);
         Picture::Loading
+    }
+
+    /// The largest whole picture already decoded from `path`, at whatever size: what stands in
+    /// while the size wanted now is being read.
+    pub fn largest(&mut self, path: &str) -> Option<Arc<RenderImage>> {
+        let frame = self.frame;
+        let held = self.held.iter_mut().filter(|(slot, _)| &*slot.path == path && slot.crop == 0);
+        let (_, held) = held.filter(|(_, held)| matches!(held, Held::Ready { .. })).max_by_key(|(slot, _)| slot.edge)?;
+        match held {
+            Held::Ready { image, used, .. } => {
+                *used = frame;
+                Some(image.clone())
+            }
+            _ => None,
+        }
     }
 
     /// Starts decodes while there is room for them. A picture nobody has drawn since it was
@@ -422,6 +443,13 @@ impl Images {
             self.bytes -= bytes;
             cx.drop_image(image, Some(window));
         }
+    }
+
+    /// Drops one whole picture decoded from `path` at `edge`, as asked of [`Images::get`]: the
+    /// viewer's original, once nothing shows it.
+    pub fn let_go(&mut self, path: &str, edge: u32, window: &mut Window, cx: &mut App) {
+        // One still being decoded goes too: what it brings back is then not kept.
+        self.drop_slot(&Slot::new(path, edge, None), window, cx);
     }
 
     /// The file at `path` was replaced by a larger one: what was decoded from the old one goes,

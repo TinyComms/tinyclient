@@ -15,12 +15,12 @@ use crate::blobs;
 use crate::hub::now;
 use grammers_tl_types as tl;
 use protocol::{Change, MediaKind};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Sender};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, Weak};
 
 /// Files waiting their turn. Past this, new ones are let go: they are asked for again when
 /// their conversation is next opened.
@@ -31,16 +31,25 @@ const PIECE: i32 = 256 * 1024;
 const PACE: std::time::Duration = std::time::Duration::from_millis(250);
 /// The largest picture fetched for a row.
 const LARGEST: u64 = 2 * 1024 * 1024;
+/// The largest original fetched for the viewer, whatever Telegram says it is.
+const LARGEST_ORIGINAL: u64 = 64 * 1024 * 1024;
+/// Originals whose place is remembered until the viewer asks for one. Past this they are
+/// forgotten, and come back when a page that shows them is read again.
+const HELD: usize = 4_096;
 
 enum Job {
     /// The connection files are fetched over from now on.
     Attach(Weak<Account>),
     Fetch(Box<Want>),
+    /// The viewer is waiting on it: it goes before every row's picture.
+    First(Box<Want>),
 }
 
 pub struct Files {
     jobs: Sender<Job>,
     waiting: Arc<AtomicUsize>,
+    /// Where each original is, by its id, until the shell asks for it.
+    held: Mutex<HashMap<String, Want>>,
 }
 
 impl Files {
@@ -53,14 +62,24 @@ impl Files {
             let mut account = Weak::new();
             // Datacenters this connection's sign-in has been carried to.
             let mut carried = HashSet::new();
-            for job in inbox {
-                let want = match job {
-                    Job::Attach(to) => {
-                        account = to;
-                        carried.clear();
-                        continue;
+            let mut queue: VecDeque<Box<Want>> = VecDeque::new();
+            loop {
+                // Everything sent so far is read before the next fetch, so an original the
+                // viewer asked for does not wait behind the rows' pictures.
+                let next = if queue.is_empty() { inbox.recv().ok() } else { inbox.try_recv().ok() };
+                if let Some(job) = next {
+                    match job {
+                        Job::Attach(to) => {
+                            account = to;
+                            carried.clear();
+                        }
+                        Job::Fetch(want) => queue.push_back(want),
+                        Job::First(want) => queue.push_front(want),
                     }
-                    Job::Fetch(want) => want,
+                    continue;
+                }
+                let Some(want) = queue.pop_front() else {
+                    return;
                 };
                 counted.fetch_sub(1, Ordering::Relaxed);
                 let Some(account) = account.upgrade() else {
@@ -74,22 +93,36 @@ impl Files {
                     if !fault.is("FILE_REFERENCE_EXPIRED") {
                         eprintln!("chatd: Telegram: file {}: {fault}", want.file.id);
                     }
+                    // The viewer is waiting on an original: it is told, and keeps the still.
+                    if want.original {
+                        let mut file = want.file.clone();
+                        file.failed = Some("Telegram did not send the full picture.".to_owned());
+                        ctx.hub.changed(Change::Media { account: ctx.account.clone(), file });
+                    }
                 }
             }
         });
         if let Err(err) = spawned {
             eprintln!("chatd: Telegram: files: {err}");
         }
-        Files { jobs, waiting }
+        Files { jobs, waiting, held: Mutex::default() }
     }
 
     pub fn attach(&self, account: &Arc<Account>) {
         let _ = self.jobs.send(Job::Attach(Arc::downgrade(account)));
     }
 
-    /// Queues what rows on screen show. Nothing is fetched twice: a file already on disk is
-    /// passed over when its turn comes.
+    /// Queues what rows on screen show, and keeps the originals' places for [`Files::asked`].
+    /// Nothing is fetched twice: a file already on disk is passed over when its turn comes.
     pub fn want(&self, wants: Vec<Want>) {
+        let (originals, wants): (Vec<Want>, Vec<Want>) = wants.into_iter().partition(|want| want.original);
+        if !originals.is_empty() {
+            let mut held = crate::hub::lock(&self.held);
+            if held.len() + originals.len() > HELD {
+                held.clear();
+            }
+            held.extend(originals.into_iter().map(|want| (want.file.id.clone(), want)));
+        }
         for want in wants {
             if self.waiting.fetch_add(1, Ordering::Relaxed) >= WAITING {
                 self.waiting.fetch_sub(1, Ordering::Relaxed);
@@ -97,6 +130,21 @@ impl Files {
             }
             let _ = self.jobs.send(Job::Fetch(Box::new(want)));
         }
+    }
+
+    /// The shell asked for these files, which the media cache does not know: the originals
+    /// among them are fetched next. Answers how many were.
+    pub fn asked(&self, ids: &[String]) -> usize {
+        let found: Vec<Want> = {
+            let held = crate::hub::lock(&self.held);
+            ids.iter().filter_map(|id| held.get(id).cloned()).collect()
+        };
+        let count = found.len();
+        for want in found {
+            self.waiting.fetch_add(1, Ordering::Relaxed);
+            let _ = self.jobs.send(Job::First(Box::new(want)));
+        }
+        count
     }
 }
 
@@ -207,8 +255,10 @@ fn download(account: &Account, want: &Want, carried: &mut HashSet<i32>, out: &mu
         if (piece.bytes.len() as i32) < PIECE {
             return Ok(offset as u64);
         }
-        if offset as u64 > LARGEST {
-            return Err(Fault::Net("the picture is larger than a row needs".to_owned()));
+        // An original may be as large as Telegram says it is; a row's picture never needs more.
+        let most = if want.original { (want.file.bytes + want.file.bytes / 8).clamp(LARGEST, LARGEST_ORIGINAL) } else { LARGEST };
+        if offset as u64 > most {
+            return Err(Fault::Net("the picture is larger than it should be".to_owned()));
         }
     }
 }

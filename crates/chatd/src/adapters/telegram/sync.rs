@@ -497,6 +497,7 @@ pub(super) fn avatar(account: &Account, who: Who) -> Option<Want> {
         location: tl::types::InputPeerPhotoFileLocation { big: false, peer: dir.input_peer(who)?, photo_id: known.photo }.into(),
         inline: None,
         row: Some(who.text()),
+        original: false,
     })
 }
 

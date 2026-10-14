@@ -1436,8 +1436,15 @@ impl Chat {
                 if let Err(err) = prepared {
                     return internal(err);
                 }
-                match self.blobs.request(&account, ids, adapter) {
-                    Ok(files) => Response::Media { files },
+                match self.blobs.request(&account, ids, adapter.clone()) {
+                    Ok(files) => {
+                        // What the cache has never heard of may be the adapter's to fetch itself.
+                        let unknown: Vec<String> = ids.iter().filter(|id| !files.iter().any(|file| file.id == **id)).cloned().collect();
+                        if let (false, Some(adapter)) = (unknown.is_empty(), adapter) {
+                            let _ = adapter.send(Command::Wanted(unknown));
+                        }
+                        Response::Media { files }
+                    }
                     Err(err) => internal(err),
                 }
             }

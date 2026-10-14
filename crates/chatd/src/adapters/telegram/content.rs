@@ -20,6 +20,9 @@ pub struct Want {
     pub inline: Option<Vec<u8>>,
     /// The conversation whose row shows it, for a chat's picture: the row is read again.
     pub row: Option<String>,
+    /// A picture itself, for the viewer: kept until the shell asks for it, never fetched for a
+    /// row.
+    pub original: bool,
 }
 
 pub struct Mapped {
@@ -30,7 +33,8 @@ pub struct Mapped {
     /// The message it answers, when it is a reply and not just a post in a topic.
     pub reply: Option<i32>,
     pub message: Message,
-    /// What it shows inline: thumbnails and stills, never an original.
+    /// What it shows inline (thumbnails and stills), and the originals of its pictures, which
+    /// are only fetched when the viewer asks.
     pub wants: Vec<Want>,
 }
 
@@ -164,27 +168,26 @@ fn pick(sizes: &[PhotoSize], least: u32) -> Option<Size<'_>> {
 const INLINE: u32 = 320;
 
 fn photo(photo: &tl::types::Photo, spoiler: bool, wants: &mut Vec<Want>) -> Option<Attachment> {
-    let (kind, width, height, bytes, inline) = pick(&photo.sizes, INLINE)?;
-    let mut thumb = MediaFile::new(format!("p{}{kind}", photo.id), MediaKind::Image);
-    (thumb.width, thumb.height, thumb.bytes) = (width, height, bytes);
-    wants.push(Want {
-        file: thumb.clone(),
-        dc: photo.dc_id,
-        location: tl::types::InputPhotoFileLocation {
+    let location = |kind: &str| -> tl::enums::InputFileLocation {
+        tl::types::InputPhotoFileLocation {
             id: photo.id,
             access_hash: photo.access_hash,
             file_reference: photo.file_reference.clone(),
             thumb_size: kind.to_owned(),
         }
-        .into(),
-        inline: inline.map(<[u8]>::to_vec),
-        row: None,
-    });
-    // The picture itself, at the size a viewer opens: 800 on its longer side where there is one.
+        .into()
+    };
+    let (kind, width, height, bytes, inline) = pick(&photo.sizes, INLINE)?;
+    let mut thumb = MediaFile::new(format!("p{}{kind}", photo.id), MediaKind::Image);
+    (thumb.width, thumb.height, thumb.bytes) = (width, height, bytes);
+    wants.push(Want { file: thumb.clone(), dc: photo.dc_id, location: location(kind), inline: inline.map(<[u8]>::to_vec), row: None, original: false });
+    // The picture itself is the largest size Telegram keeps: the viewer fills a screen with
+    // it, at the screen's own pixels.
     let mut file = thumb.clone();
-    if let Some((kind, width, height, bytes, _)) = pick(&photo.sizes, 800) {
+    if let Some((kind, width, height, bytes, inline)) = pick(&photo.sizes, u32::MAX).filter(|(largest, ..)| *largest != kind) {
         file.id = format!("p{}{kind}", photo.id);
         (file.width, file.height, file.bytes) = (width, height, bytes);
+        wants.push(Want { file: file.clone(), dc: photo.dc_id, location: location(kind), inline: inline.map(<[u8]>::to_vec), row: None, original: true });
     }
     let mut attachment = Attachment::new("Photo", file);
     attachment.thumb = Some(thumb);
@@ -236,6 +239,7 @@ pub(super) fn document(media: &tl::types::MessageMediaDocument, document: &tl::t
             .into(),
             inline: inline.map(<[u8]>::to_vec),
             row: None,
+            original: false,
         });
         thumb
     });
@@ -264,6 +268,15 @@ pub(super) fn document(media: &tl::types::MessageMediaDocument, document: &tl::t
     // its own still, but only the thumbnail is fetched for a row either way.
     if let (true, Some(still)) = (sticker, &still) {
         file = still.clone();
+    } else if kind == MediaKind::Image && still.is_some() {
+        // A picture sent as a file opens in the viewer like a photo, so it is kept the same way.
+        let location = tl::types::InputDocumentFileLocation {
+            id: document.id,
+            access_hash: document.access_hash,
+            file_reference: document.file_reference.clone(),
+            thumb_size: String::new(),
+        };
+        wants.push(Want { file: file.clone(), dc: document.dc_id, location: location.into(), inline: None, row: None, original: true });
     }
     let mut attachment = Attachment::new(if name.is_empty() { label.to_owned() } else { name }, file);
     attachment.thumb = still;

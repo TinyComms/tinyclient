@@ -421,7 +421,7 @@ fn messages_arrive_change_and_go_and_what_they_hold_is_mapped() {
     world.steer("photo");
     let photo = world.arrived("u7002", "14");
     let attachment = &photo.attachments[0];
-    assert_eq!((attachment.file.id.as_str(), attachment.file.kind, attachment.file.width, attachment.file.height), ("p6014x", MediaKind::Image, 800, 600));
+    assert_eq!((attachment.file.id.as_str(), attachment.file.kind, attachment.file.width, attachment.file.height), ("p6014y", MediaKind::Image, 1_280, 960));
     let thumb = attachment.thumb.as_ref().unwrap();
     assert_eq!((thumb.id.as_str(), thumb.width, thumb.height), ("p6014m", 320, 240));
     let landed = world.until("the thumbnail on disk", || {
@@ -437,11 +437,19 @@ fn messages_arrive_change_and_go_and_what_they_hold_is_mapped() {
     assert_eq!(world.called("GetFile photo 6014 m"), 2, "{calls:#?}");
     // The stored message now names the file where it is.
     assert_eq!(world.message("u7002", "14").unwrap().attachments[0].thumb.as_ref().unwrap().path.as_deref(), Some(landed.as_str()));
-    // The original is not fetched for a row, and asking for it does not mark it failed.
-    let Response::Media { files } = world.ask(Request::Fetch { account: account(), ids: vec!["p6014x".into()], size: None, retry: false }) else {
-        panic!("no answer");
-    };
-    assert!(files.is_empty());
+    // The original is the largest size Telegram keeps. It is not fetched for a row; the viewer
+    // asking for it fetches it, ahead of anything else waiting.
+    assert_eq!(world.called("GetFile photo 6014 y"), 0, "{calls:#?}");
+    let original = world.until("the original on disk", || {
+        match world.ask(Request::Fetch { account: account(), ids: vec!["p6014y".into()], size: Some(2_560), retry: false }) {
+            Response::Media { mut files } => files.pop().and_then(|file| file.path),
+            other => panic!("{other:?}"),
+        }
+    });
+    assert_ne!(original, landed);
+    assert_eq!(std::fs::metadata(&original).unwrap().len(), FILE_BYTES);
+    assert_eq!(world.called("GetFile photo 6014 y"), 2);
+    assert_eq!(world.called("GetFile photo 6014 x"), 0);
 
     world.steer("voice");
     let voice = world.arrived("u7002", "15");
@@ -706,7 +714,7 @@ fn the_panes_ask_telegram_once_each_and_counts_are_telegrams_own() {
     };
     let (items, total, complete) = shared(protocol::SharedKind::Media);
     assert_eq!((items.len(), total, complete), (1, Some(37), true));
-    assert_eq!(items[0].attachment.as_ref().map(|file| file.file.id.as_str()), Some("p6014x"));
+    assert_eq!(items[0].attachment.as_ref().map(|file| file.file.id.as_str()), Some("p6014y"));
     let (links, total, _) = shared(protocol::SharedKind::Links);
     assert_eq!((links[0].url.as_str(), total), ("https://example.org/route", Some(4)));
 

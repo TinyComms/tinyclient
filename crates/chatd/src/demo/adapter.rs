@@ -661,6 +661,7 @@ impl Demo {
             | Command::MarkRead { .. }
             | Command::Typing(_)
             | Command::Watch(_)
+            | Command::Wanted(_)
             | Command::Stop => {}
         }
     }

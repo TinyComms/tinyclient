@@ -27,6 +27,14 @@ const SIDE: f32 = 64.;
 /// The stops the zoom buttons and keys move between.
 const STOPS: [f32; 11] = [0.1, 0.25, 0.5, 0.75, 1., 1.5, 2., 3., 4., 6., 8.];
 
+/// The zoom that fits a picture of `natural` pixels in `room` points at `scale`, in screen
+/// pixels a picture pixel. Never past one point a pixel, as its row draws it: a small picture
+/// opens no larger than it was shown.
+pub fn fit_zoom(natural: (f32, f32), room: (f32, f32), scale: f32) -> f32 {
+    let (wide, tall) = (natural.0.max(1.), natural.1.max(1.));
+    (room.0 / wide).min(room.1 / tall).min(1.) * scale
+}
+
 /// The next stop up or down from `zoom`. Fit is rarely on a stop, so it moves to the nearest
 /// one in that direction.
 pub fn step_zoom(zoom: f32, closer: bool) -> f32 {
@@ -41,12 +49,12 @@ pub fn step_zoom(zoom: f32, closer: bool) -> f32 {
 /// The longest side to decode the original to: what it covers on screen at this zoom, in
 /// device pixels, and never more than it has or than [`MOST_EDGE`]. Fitted in a small window, a
 /// large photo costs the window's pixels, not its own.
-pub fn viewer_edge(natural: (u32, u32), zoom: f32, scale: f32) -> u32 {
+pub fn viewer_edge(natural: (u32, u32), zoom: f32) -> u32 {
     let longest = natural.0.max(natural.1);
     if longest == 0 {
         return MOST_EDGE;
     }
-    let shown = (longest as f32 * zoom * scale).ceil() as u32;
+    let shown = (longest as f32 * zoom).ceil() as u32;
     shown.clamp(1, longest.min(MOST_EDGE))
 }
 
@@ -74,7 +82,8 @@ fn clipboard_format(head: &[u8]) -> Option<ImageFormat> {
 pub struct Viewer {
     message: String,
     attachment: usize,
-    /// Picture pixels a point. `None` is fitted to the window.
+    /// Screen pixels a picture pixel, so 100% is the picture's own pixels whatever the screen's
+    /// scale. `None` is fitted to the window.
     zoom: Option<f32>,
     /// How far the picture is dragged from the middle, in points.
     pan: (f32, f32),
@@ -84,6 +93,9 @@ pub struct Viewer {
     dragged: bool,
     /// What the last save or copy said.
     note: Option<String>,
+    /// The sizes the original was asked to be decoded at, as `(path, edge)`: each goes once a
+    /// larger or smaller one shows, and all of them when the viewer moves on or closes.
+    decoded: Vec<(String, u32)>,
 }
 
 fn bar_button(id: impl Into<ElementId>, which: Icon) -> Stateful<Div> {
@@ -138,15 +150,34 @@ impl Pane {
     }
 
     pub(super) fn open_viewer(&mut self, message: &str, attachment: usize, window: &mut Window, cx: &mut Context<Self>) {
-        self.viewer = Some(Viewer { message: message.to_owned(), attachment, zoom: None, pan: (0., 0.), grab: None, dragged: false, note: None });
+        self.let_go_originals();
+        self.viewer = Some(Viewer {
+            message: message.to_owned(),
+            attachment,
+            zoom: None,
+            pan: (0., 0.),
+            grab: None,
+            dragged: false,
+            note: None,
+            decoded: Vec::new(),
+        });
         self.hover = None;
         window.focus(&self.focus, cx);
         cx.notify();
     }
 
     fn close_viewer(&mut self, cx: &mut Context<Self>) {
+        self.let_go_originals();
         self.viewer = None;
         cx.notify();
+    }
+
+    /// A full-screen original is the largest thing a pane decodes: it goes as soon as the
+    /// viewer stops showing it, not when the budget next needs the room.
+    fn let_go_originals(&mut self) {
+        if let Some(viewer) = self.viewer.as_mut() {
+            self.let_go.append(&mut viewer.decoded);
+        }
     }
 
     fn viewed(&self) -> Option<(Rc<Message>, Attachment)> {
@@ -166,6 +197,7 @@ impl Pane {
         let Some(next) = at.and_then(|at| at.checked_add_signed(by)).and_then(|at| pictures.get(at)) else {
             return;
         };
+        self.let_go.append(&mut viewer.decoded);
         viewer.message.clone_from(&next.0.id);
         viewer.attachment = next.1;
         viewer.zoom = None;
@@ -174,7 +206,7 @@ impl Pane {
         cx.notify();
     }
 
-    /// Fit (`None`) or so many picture pixels a point.
+    /// Fit (`None`) or so many screen pixels a picture pixel.
     pub(super) fn zoom(&mut self, zoom: Option<f32>, cx: &mut Context<Self>) {
         if let Some(viewer) = self.viewer.as_mut() {
             viewer.zoom = zoom.map(|zoom| zoom.clamp(STOPS[0], STOPS[STOPS.len() - 1]));
@@ -198,8 +230,7 @@ impl Pane {
         };
         let size = window.viewport_size();
         let room = ((f32::from(size.width) - 2. * SIDE).max(1.), (f32::from(size.height) - TOP_BAR - FOOTER).max(1.));
-        let (wide, tall) = (attachment.file.width.max(1) as f32, attachment.file.height.max(1) as f32);
-        (room.0 / wide).min(room.1 / tall).min(1.)
+        fit_zoom((attachment.file.width as f32, attachment.file.height as f32), room, window.scale_factor())
     }
 
     /// Puts the original on the clipboard as the picture it is, not as a path.
@@ -328,10 +359,29 @@ impl Pane {
         // The original, once it is here; the still from the row stands in until then.
         let full = &attachment.file;
         let still = attachment.thumb.as_ref().unwrap_or(full);
-        let fit_to = |wide: u32, tall: u32| (room.0 / wide.max(1) as f32).min(room.1 / tall.max(1) as f32).min(1.);
-        let edge = viewer_edge((full.width, full.height), asked.unwrap_or_else(|| fit_to(full.width, full.height)), scale);
+        let fit_to = |wide: u32, tall: u32| fit_zoom((wide as f32, tall as f32), room, scale);
+        let edge = viewer_edge((full.width, full.height), asked.unwrap_or_else(|| fit_to(full.width, full.height)));
         let original = match &full.path {
-            Some(path) => self.picture(path, edge, None, cx),
+            Some(path) => {
+                let picture = self.picture(path, edge, None, cx);
+                if let Some(viewer) = self.viewer.as_mut() {
+                    let now = (path.clone(), edge);
+                    if !viewer.decoded.contains(&now) {
+                        viewer.decoded.push(now.clone());
+                    }
+                    // Once this size shows, the sizes asked for before it are not needed.
+                    if matches!(picture, Picture::Ready(_)) && viewer.decoded.len() > 1 {
+                        let before = viewer.decoded.iter().filter(|held| **held != now).cloned();
+                        self.let_go.extend(before);
+                        viewer.decoded = vec![now];
+                    }
+                }
+                match picture {
+                    // Zoomed to a new size: the size before stands in until this one is read.
+                    Picture::Loading => self.images.largest(path).map_or(Picture::Loading, Picture::Ready),
+                    other => other,
+                }
+            }
             None if full.failed.is_some() => Picture::Failed,
             None => {
                 // The whole file, whatever size its still was asked for at.
@@ -343,11 +393,13 @@ impl Pane {
             Picture::Ready(image) => (Some(image), false, false),
             other => {
                 let edge = media::decode_edge((still.width, still.height), room.0, room.1, media::Fit::Contain, scale);
-                let stand_in = still.path.as_deref().filter(|_| still.id != full.id).map(|path| self.picture(path, edge, None, cx));
-                let stand_in = match stand_in {
-                    Some(Picture::Ready(image)) => Some(image),
-                    _ => None,
-                };
+                let stand_in = still.path.as_deref().filter(|_| still.id != full.id).and_then(|path| {
+                    match self.picture(path, edge, None, cx) {
+                        Picture::Ready(image) => Some(image),
+                        // The row's decode, whatever its size, until this one is read.
+                        _ => self.images.largest(path),
+                    }
+                });
                 (stand_in, matches!(other, Picture::Loading), matches!(other, Picture::Failed))
             }
         };
@@ -357,9 +409,10 @@ impl Pane {
             (_, _, Some(image)) => (image.size(0).width.0 as f32, image.size(0).height.0 as f32),
             _ => (room.0, room.1),
         };
-        let fit = (room.0 / natural.0).min(room.1 / natural.1).min(1.);
+        let fit = fit_zoom(natural, room, scale);
         let zoom = asked.unwrap_or(fit);
-        let drawn = ((natural.0 * zoom).round(), (natural.1 * zoom).round());
+        // In points: `zoom` is screen pixels a picture pixel.
+        let drawn = ((natural.0 * zoom / scale).round(), (natural.1 * zoom / scale).round());
         let pan = clamp_pan(pan, drawn, room);
         let pannable = drawn.0 > room.0 || drawn.1 > room.1;
 
@@ -621,12 +674,26 @@ mod tests {
     #[test]
     fn the_original_is_decoded_to_what_the_window_shows_of_it() {
         // 2400 x 1800 fitted at 41% on a 2x screen: 1968 px across, not 2400.
-        assert_eq!(viewer_edge((2400, 1800), 0.41, 2.), 1968);
+        assert_eq!(viewer_edge((2400, 1800), 0.82), 1968);
         // At its own size and beyond, all it has; a huge one stops at the limit.
-        assert_eq!(viewer_edge((2400, 1800), 1., 2.), 2400);
-        assert_eq!(viewer_edge((2400, 1800), 4., 2.), 2400);
-        assert_eq!(viewer_edge((12000, 9000), 1., 2.), MOST_EDGE);
-        assert_eq!(viewer_edge((0, 0), 1., 2.), MOST_EDGE);
+        assert_eq!(viewer_edge((2400, 1800), 1.), 2400);
+        assert_eq!(viewer_edge((2400, 1800), 4.), 2400);
+        assert_eq!(viewer_edge((12000, 9000), 1.), MOST_EDGE);
+        assert_eq!(viewer_edge((0, 0), 1.), MOST_EDGE);
+    }
+
+    #[test]
+    fn fitted_is_in_screen_pixels_and_never_past_a_point_a_pixel() {
+        // A 2400 x 1800 photo in a 1000 x 600 point room: a third of a point a pixel, which on
+        // a 2x screen is two thirds of a screen pixel each, 1600 across.
+        let fit = fit_zoom((2400., 1800.), (1000., 600.), 2.);
+        assert!((fit - 2. / 3.).abs() < 1e-6, "{fit}");
+        assert_eq!(viewer_edge((2400, 1800), fit), 1600);
+        // The same at 1x: half as many screen pixels, so half the decode.
+        assert_eq!(viewer_edge((2400, 1800), fit_zoom((2400., 1800.), (1000., 600.), 1.)), 800);
+        // A small picture is drawn at a point a pixel, as in its row: 200% on a 2x screen.
+        assert_eq!(fit_zoom((640., 480.), (1000., 600.), 2.), 2.);
+        assert_eq!(fit_zoom((640., 480.), (1000., 600.), 1.), 1.);
     }
 
     #[test]

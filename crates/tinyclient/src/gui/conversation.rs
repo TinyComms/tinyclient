@@ -212,6 +212,9 @@ pub struct Pane {
     known: HashMap<String, String>,
     /// Files whose bytes were replaced on disk; their decodes go at the next draw.
     replaced: Vec<String>,
+    /// The viewer's decodes of originals that nothing shows any more, as `(path, edge)`; they
+    /// go at the next draw.
+    let_go: Vec<(String, u32)>,
     /// The window's scale when sizes were last asked for.
     scale: f32,
     then: HashMap<String, Then>,
@@ -293,6 +296,7 @@ impl Pane {
             asked: HashMap::new(),
             known: HashMap::new(),
             replaced: Vec::new(),
+            let_go: Vec::new(),
             scale: 0.,
             then: HashMap::new(),
             revealed: HashSet::new(),
@@ -395,6 +399,7 @@ impl Pane {
         self.asked.clear();
         self.known.clear();
         self.replaced.clear();
+        self.let_go.clear();
         self.then.clear();
         self.revealed.clear();
         self.shown.clear();
@@ -1100,6 +1105,9 @@ impl Render for Pane {
         }
         for path in std::mem::take(&mut self.replaced) {
             self.images.replaced(&path, window, cx);
+        }
+        for (path, edge) in std::mem::take(&mut self.let_go) {
+            self.images.let_go(&path, edge, window, cx);
         }
         self.images.begin_frame();
         self.settle_hold(window, cx);
