@@ -17,6 +17,7 @@ mod info;
 pub mod ipc;
 pub mod launch;
 mod message;
+mod react;
 mod signin;
 
 pub use call::*;
@@ -24,6 +25,7 @@ pub use crash::redact;
 pub use info::*;
 pub use ipc::{ChatListener, ChatStream};
 pub use message::*;
+pub use react::*;
 pub use signin::*;
 
 pub const CHAT_SOCK_NAME: &str = "chat.sock";
@@ -1150,6 +1152,11 @@ pub enum Request {
         emoji: String,
         on: bool,
     },
+    /// What reactions the conversation takes from this account: asked when it opens, kept
+    /// five minutes. chatd refuses a `React` these rules refuse, before the network hears of it.
+    Reactions {
+        conversation: Key,
+    },
     /// Replaces the text of one of our own messages. Nothing changes on screen until the
     /// network accepts it; a refusal is the answer.
     Edit {
@@ -1460,6 +1467,10 @@ pub enum Response {
     Pinned {
         conversation: Key,
         messages: Vec<Message>,
+    },
+    Reactions {
+        conversation: Key,
+        rules: ReactionRules,
     },
     Catalog {
         items: Vec<CatalogItem>,

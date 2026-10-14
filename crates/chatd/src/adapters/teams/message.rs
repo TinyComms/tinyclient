@@ -23,6 +23,22 @@ const REACTIONS: &[(&str, &str)] = &[
     ("salute", "🫡"), ("skull", "💀"), ("coffee", "☕"), ("yes", "👍"),
 ];
 
+/// What reactions a Teams conversation takes: the emoji Teams has a key for here, and nothing
+/// custom. Teams names a reaction by a key of its catalog (`like`, `1f389_partypopper`), and
+/// one outside the table has no key chatd can spell; a reaction already on a message brought
+/// its own key and can be added to. Teams lets a person give several; no limit on them or on
+/// different emoji is documented, so none is set.
+pub(crate) fn reaction_rules() -> protocol::ReactionRules {
+    let mut only: Vec<String> = Vec::with_capacity(REACTIONS.len());
+    for (_, emoji) in REACTIONS {
+        if !only.iter().any(|held| held == emoji) {
+            only.push((*emoji).to_owned());
+        }
+    }
+    // Plain only: chatd sends a toned one as its plain key, so the tone would not stay.
+    protocol::ReactionRules { set: protocol::ReactionSet::Only, only, ..protocol::ReactionRules::default() }
+}
+
 /// An emoji without the marks that do not change which one it is.
 fn bare_emoji(emoji: &str) -> String {
     emoji.chars().filter(|c| *c != '\u{fe0f}' && !('\u{1f3fb}'..='\u{1f3ff}').contains(c)).collect()

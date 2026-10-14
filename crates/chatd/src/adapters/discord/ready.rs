@@ -184,7 +184,7 @@ fn one_line(topic: Option<&str>) -> String {
 impl GuildInfo {
     /// Discord's permission rule for a channel: the roles' own permissions, then the channel's
     /// overwrites for everyone, for our roles, and for us.
-    fn permissions(&self, guild: &str, me: &str, channel: &Channel) -> u64 {
+    pub(super) fn permissions(&self, guild: &str, me: &str, channel: &Channel) -> u64 {
         if self.owner {
             return u64::MAX;
         }
@@ -287,6 +287,7 @@ impl Discord {
                     name: emoji.name.clone(),
                     animated: emoji.animated,
                     format: 0,
+                    roles: emoji.roles.iter().map(|role| number(role)).collect(),
                 })
             }).collect(),
             stickers: guild.stickers.iter().filter(|sticker| sticker.available).map(|sticker| super::Pickable {
@@ -294,6 +295,7 @@ impl Discord {
                 name: sticker.name.clone(),
                 animated: sticker.format_type != 1,
                 format: sticker.format_type,
+                roles: Box::default(),
             }).collect(),
         }
     }

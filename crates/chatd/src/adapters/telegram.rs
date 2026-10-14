@@ -58,6 +58,7 @@ mod filing;
 mod info;
 mod live;
 mod peers;
+pub(crate) mod react;
 mod real;
 mod send;
 pub mod signin;
@@ -192,6 +193,8 @@ struct Live {
     sticker_sets: Option<Vec<(i64, i64, String)>>,
     /// Scheduled sends shown until Telegram sends them: the chat, the text, the placeholder.
     scheduled: VecDeque<(String, String, String)>,
+    /// Telegram's reaction emoji, and whether each needs Premium, once asked (`react`).
+    reactions: Option<Vec<(String, bool)>>,
 }
 
 /// Telegram's own send options, which Telegram carries out.
@@ -487,7 +490,10 @@ fn serve(account: &Arc<Account>, command: Command) {
         }
         Command::CancelSend { client_id, .. } => send::cancel(account, &client_id),
         Command::React { conversation_id, message_id, emoji, on, reply } => {
-            let _ = reply.send(react(account, &conversation_id, &message_id, &emoji, on).map_err(refused));
+            let _ = reply.send(react::react(account, &conversation_id, &message_id, &emoji, on).map_err(refused));
+        }
+        Command::ReactionRules { conversation_id, reply } => {
+            let _ = reply.send(react::rules(account, &conversation_id).map_err(refused));
         }
         Command::Edit { conversation_id, message_id, text, reply } => {
             let _ = reply.send(edit(account, &conversation_id, &message_id, &text).map_err(refused));
@@ -700,28 +706,6 @@ fn delete(account: &Account, conversation: &str, message: &str) -> Result<(), Fa
         }
     }
     let _ = account.ctx.deleted(conversation, message);
-    Ok(())
-}
-
-fn react(account: &Account, conversation: &str, message: &str, emoji: &str, on: bool) -> Result<(), Fault> {
-    let invalid = || Fault::Rpc { code: 400, name: "MESSAGE_ID_INVALID".to_owned(), value: None };
-    let ((who, _), msg_id) = (Who::parse(conversation).ok_or_else(invalid)?, message.parse::<i32>().map_err(|_| invalid())?);
-    // A custom emoji arrives as the id of its registered file, `e<document>`.
-    let reaction: tl::enums::Reaction = match emoji.strip_prefix('e').and_then(|id| id.parse::<i64>().ok()) {
-        Some(document_id) => tl::types::ReactionCustomEmoji { document_id }.into(),
-        None => tl::types::ReactionEmoji { emoticon: emoji.to_owned() }.into(),
-    };
-    // Telegram takes the whole set of our reactions on the message. An account without Premium
-    // has one, so adding replaces it and taking back leaves none.
-    let request = tl::functions::messages::SendReaction {
-        big: false,
-        add_to_recent: on,
-        peer: account.input(who)?,
-        msg_id,
-        reaction: Some(if on { vec![reaction] } else { Vec::new() }),
-    };
-    let answer = account.ask(&request)?;
-    live::answered(account, &answer);
     Ok(())
 }
 

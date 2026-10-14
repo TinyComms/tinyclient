@@ -6,7 +6,7 @@ use base64::Engine;
 use protocol::{
     read_frame, write_frame, AccountKey, Call, CallState, CallSupport, Change, Conversation, ConversationKind,
     ErrorCode, Key, Link, MediaKind, MentionKind, Message, MessageKind, Network, Page, Person,
-    Presence, RelateAction, Relation, Request, Response, SendState, Style, Watching,
+    Presence, ReactionSet, EmojiScope, RelateAction, Relation, Request, Response, SendState, Style, Watching,
 };
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
@@ -1652,6 +1652,70 @@ fn reactions_edits_and_deletes_go_to_discord_and_the_store_follows_its_word() {
     assert!(world.messages(dm).iter().all(|stored| stored.id != "1300000000000000007"));
 }
 
+/// READY where #rules does not let everyone add reactions and #announcements does not let
+/// them read its history.
+fn reacting_ready() -> String {
+    let mut ready: Value = serde_json::from_str(READY).unwrap();
+    for channel in ready["guilds"][0]["channels"].as_array_mut().unwrap() {
+        let deny: u64 = match channel["id"].as_str() {
+            Some("4105") => 1 << 6,
+            Some("4102") => 1 << 16,
+            _ => continue,
+        };
+        channel["permission_overwrites"] = json!([{"id": "4000", "type": 0, "allow": "0", "deny": deny.to_string()}]);
+    }
+    ready.to_string()
+}
+
+#[test]
+fn reactions_follow_the_channels_permissions_and_what_they_refuse_never_reaches_discord() {
+    let world = World::launch(&[], |shared| *shared.ready.lock().unwrap() = reacting_ready());
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+    let known = |id: &str| matches!(world.ask(Request::Conversation { conversation: world.key(id) }), Response::Conversation { .. });
+    wait("the server's tree", || known("4105").then_some(()));
+    let before = world.discord.asked().len();
+    let rules = |id: &str| match world.ask(Request::Reactions { conversation: world.key(id) }) {
+        Response::Reactions { rules, .. } => rules,
+        other => panic!("no rules for {id}: {other:?}"),
+    };
+    // Without Nitro: any emoji, the server's own custom ones in it and none in a DM, nothing
+    // animated, 20 different a message. A thread goes by its channel.
+    let dm = rules("3001");
+    assert_eq!((dm.set, dm.custom, dm.animated, dm.distinct, dm.join_only), (ReactionSet::Any, EmojiScope::None, false, 20, false));
+    assert_eq!((rules("4101").custom, rules("4500").custom), (EmojiScope::Space, EmojiScope::Space));
+    assert!(rules("4105").join_only, "no Add Reactions: only what is there can be added to");
+    assert_eq!(rules("4102").set, ReactionSet::Off);
+    // History being warmed meanwhile is the only thing asked.
+    let asked = world.discord.asked();
+    assert!(asked[before..].iter().all(|asked| asked.contains("/messages?")), "worked out from READY, nothing asked: {:?}", &asked[before..]);
+
+    let fruit = "🍎🍐🍊🍋🍌🍉🍇🍓🫐🍈🍒🍑🥭🍍🥥🥝🍅🍆🥑🥦";
+    let twenty: Vec<Value> = fruit.chars().map(|one| json!({"count": 1, "me": false, "emoji": {"id": null, "name": one.to_string()}})).collect();
+    // Each names a role we hold, so it is kept though the channel was never opened.
+    let full = world.incoming("4101", Some("4000"), "every fruit", json!({"reactions": twenty, "mention_roles": ["4010"]}));
+    let thumbs = json!({"reactions": [{"count": 2, "me": false, "emoji": {"id": null, "name": "👍"}}], "mention_roles": ["4010"]});
+    let said = world.incoming("4105", Some("4000"), "be kind", thumbs);
+    let news = world.incoming("4102", Some("4000"), "release is out", json!({"mention_roles": ["4010"]}));
+    let held = |channel: &str, id: &str| world.messages(channel).iter().any(|message| message.id == id);
+    wait("the messages", || (held("4101", &full) && held("4105", &said) && held("4102", &news)).then_some(()));
+    let react = |channel: &str, message: &str, emoji: &str| {
+        world.ask(Request::React { conversation: world.key(channel), message_id: message.to_owned(), emoji: emoji.to_owned(), on: true })
+    };
+    let refused = |answer: Response| match answer {
+        Response::Error { code: ErrorCode::Refused, detail } => detail,
+        other => panic!("not refused: {other:?}"),
+    };
+    assert_eq!(refused(react("4101", &full, "🦑")), "This message has 20 different reactions, as many as allowed.");
+    assert_eq!(refused(react("4105", &said, "🎉")), "You can only add to reactions already on this message.");
+    assert_eq!(refused(react("4102", &news, "👍")), "You can't react in this channel.");
+    let reacted = || world.discord.requests_to("PUT", "/channels/").into_iter().filter(|seen| seen.path.contains("/reactions/")).count();
+    assert_eq!(reacted(), 0, "{:?}", world.discord.asked());
+    // What is already there can be added to.
+    assert_eq!(react("4101", &full, "🍎"), Response::Ok);
+    assert_eq!(react("4105", &said, "👍"), Response::Ok);
+    assert_eq!(reacted(), 2);
+}
+
 #[test]
 fn friendships_presence_and_profiles_are_asked_of_discord_only_when_the_user_does() {
     let world = World::start();
@@ -2365,6 +2429,8 @@ fn polished_ready() -> String {
     rustaceans["emojis"] = json!([
         {"id": "5101", "name": "ferris", "animated": false, "available": true},
         {"id": "5102", "name": "lost_boost", "animated": false, "available": false},
+        {"id": "5103", "name": "party_blob", "animated": true, "available": true},
+        {"id": "5104", "name": "core_only", "animated": false, "available": true, "roles": ["4011"]},
     ]);
     rustaceans["stickers"] = json!([{"id": "5201", "name": "wave", "format_type": 1}, {"id": "5202", "name": "dance", "format_type": 3}]);
     let general = rustaceans["channels"].as_array_mut().unwrap().iter_mut().find(|channel| channel["id"] == "4101").unwrap();
@@ -2658,8 +2724,9 @@ fn files_go_up_from_their_paths_with_the_senders_options_and_a_cancel_stops_them
     let posted = world.discord.requests_to("POST", "/channels/4101/messages");
     assert_eq!(posted[1].body["content"], "https://tenor.com/view/cat-typing-1");
     assert_eq!(posted[1].body["allowed_mentions"]["replied_user"], true);
-    // The server's own emoji and stickers, from READY: what lost its boost and the Lottie
-    // sticker are not offered, and a DM offers none without Nitro. Nothing is asked.
+    // The server's own emoji and stickers, from READY: what lost its boost, an animated one
+    // (Nitro's), one only another role may use and the Lottie sticker are not offered, and a
+    // DM offers none without Nitro. Nothing is asked.
     let before = world.discord.asked().len();
     let emoji = catalog(protocol::CatalogKind::Emoji, "", Some("4000"));
     assert_eq!(emoji.iter().map(|item| (item.id.as_str(), item.name.as_str())).collect::<Vec<_>>(), [("emoji:5101", ":ferris:")]);

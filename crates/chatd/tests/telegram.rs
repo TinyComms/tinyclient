@@ -10,7 +10,7 @@
 use protocol::{
     read_frame, write_frame, AccountKey, Change, CodeVia, Conversation, ConversationKind, ErrorCode, Key, Link,
     MediaKind, MentionKind, Message, MessageKind, Network, Page, Presence, Relation, Request, Response, SendState,
-    SignInInput, SignInProblem, SignInStep, Style, Watching, Shelf, Special, Mark,
+    SignInInput, SignInProblem, SignInStep, Style, Watching, Shelf, Special, Mark, ReactionSet,
 };
 use std::io::Write;
 use protocol::ChatStream;
@@ -562,6 +562,46 @@ fn typing_reading_and_presence_go_both_ways_and_are_never_withheld() {
     assert_eq!(world.called("SetTyping u7003"), 1);
     // g8001 was already read up to 20, so there was nothing to tell for it.
     assert_eq!((world.called("ReadHistory g8001"), world.called("UpdateStatus")), (0, 1));
+}
+
+#[test]
+fn reactions_follow_each_chats_own_rules_and_what_they_refuse_never_reaches_telegram() {
+    let world = World::signed_in();
+    world.connected();
+    world.until("history", || world.message("g8001", "20"));
+    let rules = |id: &str| match world.ask(Request::Reactions { conversation: key(id) }) {
+        Response::Reactions { rules, .. } => rules,
+        other => panic!("no rules for {id}: {other:?}"),
+    };
+    // A person: Telegram's whole list but what needs Premium, one reaction each, replaced.
+    let person = rules("u7002");
+    assert_eq!((person.set, person.only.clone(), person.mine, person.replaces, person.distinct), (ReactionSet::Only, vec!["👍".to_owned(), "❤".into(), "🔥".into(), "🎉".into(), "🚫".into()], 1, true, 11));
+    // The group's admins picked three; the channel turned them off; the forum caps a message
+    // at two different ones.
+    assert_eq!(rules("g8001").only, ["👍", "❤", "🔥"]);
+    assert_eq!(rules("c9001").set, ReactionSet::Off);
+    assert_eq!(rules("c9002").distinct, 2);
+    assert_eq!(world.called("GetAvailableReactions"), 1, "the list is asked once a connection");
+    assert!(world.calls().iter().any(|call| call.starts_with("GetFullChannel c9001")));
+
+    let react = |id: &str, message: &str, emoji: &str| world.ask(Request::React { conversation: key(id), message_id: message.into(), emoji: emoji.into(), on: true });
+    let refused = |answer: Response| match answer {
+        Response::Error { code: ErrorCode::Refused, detail } => detail,
+        other => panic!("not refused: {other:?}"),
+    };
+    assert_eq!(refused(react("g8001", "20", "🎉")), "That reaction isn't allowed here.");
+    assert_eq!(refused(react("c9001", "5", "👍")), "Reactions are turned off in this chat.");
+    assert_eq!(refused(react("u7002", "12", "🦄")), "That reaction isn't allowed here.", "Premium's");
+    assert!(!world.calls().iter().any(|call| call.starts_with("SendReaction")), "{:?}", world.calls());
+    assert!(world.message("g8001", "20").unwrap().reactions.is_empty(), "nothing was shown either");
+
+    // Without Premium a second reaction replaces the first, on screen and on Telegram.
+    assert_eq!(react("g8001", "20", "👍"), Response::Ok);
+    assert_eq!(react("g8001", "20", "❤️"), Response::Ok);
+    let calls: Vec<String> = world.calls().into_iter().filter(|call| call.starts_with("SendReaction g8001")).collect();
+    assert_eq!(calls, ["SendReaction g8001 20 👍", "SendReaction g8001 20 ❤"], "as Telegram spells it");
+    let shown: Vec<(String, bool)> = world.message("g8001", "20").unwrap().reactions.into_iter().map(|have| (have.emoji, have.mine)).collect();
+    assert_eq!(shown.iter().filter(|(_, mine)| *mine).count(), 1, "{shown:?}");
 }
 
 #[test]

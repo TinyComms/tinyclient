@@ -1069,6 +1069,15 @@ fn sending_editing_reacting_deleting_and_reading_go_to_teams() {
     assert_eq!(world.ask(react("👍", false)), Response::Ok);
     let taken = world.until("the reaction to be taken back", || world.fake.calls("DELETE", &path("/messages/1760000500500/properties")).pop());
     assert_eq!(taken.json(), json!({"emotions": {"key": "like"}}));
+    // Teams takes the emoji it has a key for here; one it has none for is refused before
+    // Teams hears of it.
+    let Response::Reactions { rules, .. } = world.ask(Request::Reactions { conversation: ana.clone() }) else {
+        panic!("no rules");
+    };
+    assert_eq!((rules.set, &rules.only[..6]), (protocol::ReactionSet::Only, &["👍", "❤️", "😆", "😮", "🙁", "😠"].map(String::from)[..]));
+    let unkeyed = world.ask(react("🦑", true));
+    assert_eq!(unkeyed, Response::Error { code: protocol::ErrorCode::Refused, detail: "That reaction isn't allowed here.".to_owned() });
+    assert_eq!(world.fake.calls("PUT", &path("/messages/1760000500500/properties")).len(), 1, "only the 👍 went");
 
     // Mark read: the read marker, at that message.
     assert_eq!(world.ask(Request::MarkRead { conversation: ana.clone(), message_id: sent.id.clone() }), Response::Ok);

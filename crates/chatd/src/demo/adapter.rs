@@ -17,8 +17,9 @@ use crate::store::{ConversationRow, Filing, PreviewLine};
 use protocol::{
     AccountKey, Attachment, CallSupport, CatalogKind, Contact, ContactKind, ConversationKind, Dave, Key, Mark,
     MediaFile, MemberSection, Message, Network, Notify, Occupant, Outgoing, Participant, Presence, Reaction,
-    RelateAction, Relation, ReplyTo, SharedKind, VoiceJoin, Warning,
+    ReactionRules, RelateAction, Relation, ReplyTo, SharedKind, VoiceJoin, Warning, EmojiScope,
 };
+use crate::adapters::telegram::react::{rules_of as telegram_rules, Allowed};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -573,6 +574,39 @@ impl Demo {
         }
     }
 
+    /// Each network's real rules, with the restrictions a real account meets: on Telegram a
+    /// group whose admins picked five reactions, a channel with three and an archived one with
+    /// none; on Discord read-only channels where Add Reactions is off, so only reactions
+    /// already there can be added to; Signal's one reaction a person.
+    fn reaction_rules(&self, conversation_id: &str) -> ReactionRules {
+        let row = self.ctx.known(conversation_id).ok().flatten();
+        match self.ctx.account.network {
+            Network::Telegram => {
+                let standard: Vec<(String, bool)> = super::telegram::REACTIONS.iter().map(|emoji| ((*emoji).to_owned(), false)).collect();
+                let some = |list: &[&str]| Allowed::Some(list.iter().map(|emoji| (*emoji).to_owned()).collect());
+                let allowed = match conversation_id {
+                    "g8001" => some(&["👍", "❤", "🔥", "🎉", "😁"]),
+                    super::telegram::CHANNEL => some(&["👍", "❤", "🔥"]),
+                    "c9002" => Allowed::None,
+                    _ => Allowed::All { custom: true },
+                };
+                telegram_rules(&standard, allowed, false, None)
+            }
+            Network::Discord => {
+                let direct = row.as_ref().is_none_or(|row| row.space.is_none());
+                ReactionRules {
+                    custom: if direct { EmojiScope::None } else { EmojiScope::Space },
+                    join_only: row.is_some_and(|row| row.read_only),
+                    distinct: 20,
+                    ..ReactionRules::default()
+                }
+            }
+            Network::Slack => crate::adapters::slack::reaction_rules(),
+            Network::Teams => crate::adapters::teams::message::reaction_rules(),
+            Network::Signal => crate::adapters::signal::reaction_rules(),
+        }
+    }
+
     fn serve(demo: &Arc<Demo>, command: Command) {
         match command {
             Command::Send { conversation_id, client_id, text, reply_to } => demo.send(&conversation_id, &client_id, text, reply_to),
@@ -622,6 +656,7 @@ impl Demo {
                 let _ = reply.send(demo.search_shared(&conversation_id, kind, before.as_deref(), limit));
             }
             Command::Catalog { kind, query, cursor, reply, .. } => drop(reply.send(Ok(demo.catalog(kind, &query, cursor.as_deref())))),
+            Command::ReactionRules { conversation_id, reply } => drop(reply.send(Ok(demo.reaction_rules(&conversation_id)))),
             Command::SendWith { conversation_id, client_id, text, reply_to, with } => {
                 Demo::send_with(demo, conversation_id, client_id, text, reply_to, *with);
             }

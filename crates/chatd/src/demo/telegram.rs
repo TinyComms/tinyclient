@@ -15,6 +15,15 @@ pub const ME: &str = "u7000000";
 pub const SERVICE: &str = "u777000";
 pub const CHANNEL: &str = "c9001";
 pub const FORUM: &str = "c9100";
+/// Telegram's own reaction emoji, as `messages.getAvailableReactions` lists them for an account
+/// without Premium: the only ones a chat can allow.
+pub const REACTIONS: &[&str] = &[
+    "👍", "👎", "❤", "🔥", "🥰", "👏", "😁", "🤔", "🤯", "😱", "🤬", "😢", "🎉", "🤩", "🤮", "💩", "🙏",
+    "👌", "🕊", "🤡", "🥱", "🥴", "😍", "🐳", "❤\u{200d}🔥", "🌚", "🌭", "💯", "🤣", "⚡", "🍌", "🏆", "💔",
+    "🤨", "😐", "🍓", "🍾", "💋", "🖕", "😈", "😴", "😭", "🤓", "👻", "👨\u{200d}💻", "👀", "🎃", "🙈",
+    "😇", "😨", "🤝", "✍", "🤗", "🫡", "🎅", "🎄", "☃", "💅", "🤪", "🗿", "🆒", "💘", "🙉", "🦄", "😘",
+    "💊", "🙊", "😎", "👾", "🤷\u{200d}♂", "🤷", "🤷\u{200d}♀", "😡",
+];
 
 pub fn account() -> AccountKey {
     AccountKey {

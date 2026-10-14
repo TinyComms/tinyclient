@@ -155,6 +155,7 @@ pub struct Hub {
     pub infos: Recent<Key, protocol::ConversationInfo>,
     pub space_infos: Recent<Key, protocol::SpaceInfo>,
     pub catalogs: Recent<CatalogAsked, (Vec<protocol::CatalogItem>, Option<String>)>,
+    pub reactions: Recent<Key, protocol::ReactionRules>,
     pub calls: Calls,
 }
 
@@ -187,6 +188,7 @@ impl Hub {
             infos: Recent::new(64),
             space_infos: Recent::new(16),
             catalogs: Recent::new(32),
+            reactions: Recent::new(64),
             calls: Calls::default(),
         }
     }
