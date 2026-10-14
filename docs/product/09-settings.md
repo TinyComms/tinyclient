@@ -390,10 +390,16 @@ mediad, RSS for chatd; 60 s after the state is reached.
 | mediad started for V3 or S12 outside a call | 40 MB (the call budget), exits within 3 s of the test ending |
 | Idle CPU from any of this | 0.0 %, no new wakeups |
 
-Measured for the first pass (release, `strip -x`, against `be477fb`): the shell +527 KB, over its
-400 KB; chatd +112 KB; mediad +116 KB, over its 20 KB, most of it the cue synthesiser's float
-maths, the test mode and the new protocol frames. Both overruns are to be won back before the
-notification step adds more. The seven sound files are 114 KB. Idle memory was not measured in
+Measured after the review fixes (release, `strip -x`, against `be477fb` built the same way):
+the shell +590,032 bytes, over its 400 KB; chatd +110,256; mediad +118,592, about six times its
+20 KB. `cargo bloat` puts the shell's growth in its own code (+200 KB) and GPUI's generics
+instantiated for it (+200 KB), the element trees and listeners of ten sections, not one large
+item; mediad's in serde's internally tagged decoding of the new `MediaRequest` frames (`Tune`,
+`Cue`: about 70 KB of `ContentDeserializer` code), the test mode (`probe.rs`) and the cues. The
+notification sounds' synthesis is linked only into the example and the tests. Neither overrun
+has an easy cut: the shell's would need fewer, shared closures across the rows, mediad's a
+hand-written frame decoder. **The branch is not to merge past these budgets without the owner's
+sign-off recorded in `07-budgets-and-risk.md`.** The seven sound files are 114 KB. Idle memory was not measured in
 this pass.
 
 What keeps idle at zero: pause and quiet hours are checked when a notification would be posted,

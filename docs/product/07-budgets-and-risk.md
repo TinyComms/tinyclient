@@ -173,3 +173,14 @@ Rules:
 5. **TDLib.** If it measures above 50 MB, is a separate Telegram process acceptable?
 
 Sources: Discord Userdoccers ([reference](https://docs.discord.food/reference), [rate limits](https://docs.discord.food/topics/rate-limits), [gateway](https://docs.discord.food/topics/gateway)), [Abaddon README](https://github.com/uowuo/abaddon), Slack ([rate limits](https://docs.slack.dev/apis/web-api/rate-limits), [anomaly events](https://docs.slack.dev/reference/audit-logs-api/anomalous-events-reference)).
+
+## Open overruns
+
+Each waits on the owner: signed off here with a date, or won back before it merges.
+
+| Branch | What | Budget | Measured | Sign-off |
+|---|---|---|---|---|
+| `settings` | shell binary, stripped | +400 KB | +590,032 B | none yet |
+| `settings` | mediad binary, stripped | +20 KB | +118,592 B | none yet |
+
+Where the bytes go and what would cut them: `09-settings.md`, "Measured after the review fixes".
