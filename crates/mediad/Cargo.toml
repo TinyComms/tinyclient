@@ -30,6 +30,8 @@ rand = "0.8"
 objc2 = "0.6"
 
 [dev-dependencies]
+# The bundled sounds' manifest (`tests/sounds.rs`). Already in the tree through davey.
+sha2 = "0.10"
 # The fake voice server acts as Discord's MLS external sender. Same version davey links.
 openmls = { version = "0.8.1", features = ["js"] }
 openmls_basic_credential = "0.5.0"
