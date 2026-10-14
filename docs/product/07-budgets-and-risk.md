@@ -24,6 +24,7 @@ GPU textures and IOSurfaces that RSS misses. Read 60 s after the state is reache
 | shell, one image opened full size | +35 MB, released on close | one 2880 x 1800 px decode is 21 MB; the 4K original (33 MB) is never decoded whole |
 | mediad, voice call | 40 MB footprint | Opus, jitter buffer, audio unit, encryption. Rules out linking all of libwebrtc *(estimate)* |
 | mediad, watching or sending one share | 150 MB footprint | hardware codec; 6 pooled NV12 frames at 4K are 75 MB, at 1440p 33 MB |
+| mediad --play, one voice message or audio file | 8 MB footprint, gone when paused or ended | 5.3 MB measured 2026-10-14 (CoreAudio speaker, AAC at 1.5x, under 1% CPU); 250 ms of audio ahead, one packet decoded at a time |
 | mediad, no call | not running | already tested |
 | chatd growth during a call | under 16 MB | already tested |
 
