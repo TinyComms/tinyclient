@@ -64,14 +64,39 @@ fn lounge() -> Key {
 
 /// mediad processes this test process has spawned, from the process table.
 fn mediads() -> usize {
-    let out = Command::new("pgrep").args(["-P", &std::process::id().to_string(), "mediad"]).output().unwrap();
-    String::from_utf8_lossy(&out.stdout).lines().count()
+    child_pids(std::process::id(), "mediad").len()
 }
 
 /// The one mediad this test process runs.
 fn mediad_pid() -> String {
-    let out = Command::new("pgrep").args(["-P", &std::process::id().to_string(), "mediad"]).output().unwrap();
-    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    child_pids(std::process::id(), "mediad").first().map(|pid| pid.to_string()).unwrap_or_default()
+}
+
+fn child_pids(parent: u32, name: &str) -> Vec<u32> {
+    #[cfg(windows)]
+    {
+        let script = format!(
+            "(Get-CimInstance Win32_Process -Filter \"Name = '{name}.exe'\" | Where-Object {{ $_.ParentProcessId -eq {parent} }}).ProcessId"
+        );
+        let out = Command::new("powershell").args(["-NoProfile", "-Command", &script]).output().unwrap();
+        return String::from_utf8(out.stdout).unwrap().lines().filter_map(|line| line.trim().parse().ok()).collect();
+    }
+    #[cfg(not(windows))]
+    {
+        let out = Command::new("pgrep").args(["-P", &parent.to_string(), name]).output().unwrap();
+        String::from_utf8(out.stdout).unwrap().lines().filter_map(|pid| pid.trim().parse().ok()).collect()
+    }
+}
+
+fn kill_pid(pid: &str) -> bool {
+    #[cfg(windows)]
+    {
+        Command::new("taskkill").args(["/F", "/PID", pid]).status().unwrap().success()
+    }
+    #[cfg(not(windows))]
+    {
+        Command::new("kill").args(["-9", pid]).status().unwrap().success()
+    }
 }
 
 fn until(what: &str, done: impl Fn() -> bool) {
@@ -288,7 +313,7 @@ fn a_mediad_that_dies_holding_a_voice_session_is_a_failure_in_words_not_a_vanish
     let (_peer, _) = voice.identified();
     let out = Command::new("pgrep").args(["-P", &std::process::id().to_string(), "mediad"]).output().unwrap();
     let pid = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-    assert!(Command::new("kill").args(["-9", &pid]).status().unwrap().success());
+    assert!(kill_pid(&pid));
     until("the failure", || matches!(state(&hub), Some(CallState::Failed { .. })));
     let expected = CallState::Failed {
         reason: CallFailure::Engine,

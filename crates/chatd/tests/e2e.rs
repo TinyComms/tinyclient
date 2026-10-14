@@ -11,6 +11,22 @@ use protocol::ChatStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 
+fn child_pids(parent: u32, name: &str) -> Vec<u32> {
+    #[cfg(windows)]
+    {
+        let script = format!(
+            "(Get-CimInstance Win32_Process -Filter \"Name = '{name}.exe'\" | Where-Object {{ $_.ParentProcessId -eq {parent} }}).ProcessId"
+        );
+        let out = Command::new("powershell").args(["-NoProfile", "-Command", &script]).output().unwrap();
+        return String::from_utf8(out.stdout).unwrap().lines().filter_map(|line| line.trim().parse().ok()).collect();
+    }
+    #[cfg(not(windows))]
+    {
+        let out = Command::new("pgrep").args(["-P", &parent.to_string(), name]).output().unwrap();
+        String::from_utf8(out.stdout).unwrap().lines().filter_map(|pid| pid.trim().parse().ok()).collect()
+    }
+}
+
 fn process_rss_kb(pid: u32) -> u64 {
     #[cfg(windows)]
     {
@@ -105,15 +121,7 @@ impl Daemon {
 
     /// Pids of the mediad processes chatd has spawned, from the process table.
     fn mediad_pids(&self) -> Vec<u32> {
-        let out = Command::new("pgrep")
-            .args(["-P", &self.child.id().to_string(), "mediad"])
-            .output()
-            .unwrap();
-        String::from_utf8(out.stdout)
-            .unwrap()
-            .lines()
-            .map(|pid| pid.trim().parse().unwrap())
-            .collect()
+        child_pids(self.child.id(), "mediad")
     }
 
     /// Asks until the answer is the one wanted, and gives it.
@@ -392,7 +400,10 @@ fn a_waiting_shell_is_woken_by_a_change_and_not_before() {
     let chatd = Daemon::start(|store| {
         incoming(store, "#platform", Network::Slack, "C01", "a", "deploy is green");
     });
-    let Response::Status { seq, .. } = chatd.ask(Request::Status) else {
+    // The sessions are read after the socket answers, and that is told as it happens: start
+    // from after it.
+    let seq = chatd.until("the sessions to be read", Request::Status, |answer| matches!(answer, Response::Status { keychain, .. } if keychain.is_settled()));
+    let Response::Status { seq, .. } = seq else {
         panic!("not a status");
     };
 
