@@ -218,7 +218,7 @@ pub fn sound(sound: Sound, rate: u32) -> Vec<f32> {
                     let start = rise_at + 0.12 * step as f64;
                     for (n, out) in samples.iter_mut().enumerate() {
                         let t = n as f64 / r - start;
-                        if t >= 0. && t < 1.5 {
+                        if (0. ..1.5).contains(&t) {
                             *out += (TAU * hertz * t).sin() * rise(t, 0.01) * decay(t, 0.01, 0.6);
                         }
                     }
@@ -298,7 +298,7 @@ impl Playing {
 
     /// Adds the next frame of the cue to an interleaved stereo frame. False once it is over.
     pub fn mix(&mut self, frame: &mut [i16]) -> bool {
-        for pair in frame.chunks_exact_mut(crate::CHANNELS) {
+        for pair in frame.as_chunks_mut::<{ crate::CHANNELS }>().0 {
             let Some(&sample) = self.samples.get(self.at) else {
                 return false;
             };
