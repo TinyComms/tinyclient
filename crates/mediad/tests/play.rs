@@ -59,12 +59,14 @@ fn a_voice_message_plays_to_its_end_and_the_process_goes() {
     let started = Instant::now();
     let mut player = Player::open("end", &fixture("tone.opus"), 0, 100);
     let PlayerEvent::Playing { at: 0, duration, rate: 100 } = player.next() else { panic!("not playing") };
+    let playing = Instant::now();
     assert!((980..=1010).contains(&duration), "{duration} ms");
     let PlayerEvent::Ended { duration: ended } = player.next() else { panic!("did not end") };
     assert!(ended >= duration);
-    // It took as long as the message is: it was played, not just read.
-    let took = started.elapsed();
-    assert!(took > Duration::from_millis(900) && took < Duration::from_secs(3), "{took:?}");
+    // It took as long as the message is: it was played, not just read. The bound above is from
+    // when it played: starting the process is slow on a busy machine.
+    let (took, from_playing) = (started.elapsed(), playing.elapsed());
+    assert!(took > Duration::from_millis(900) && from_playing < Duration::from_secs(3), "{took:?}, {from_playing:?} from playing");
     let played = player.played();
     assert!((0.98..1.02).contains(&played), "{played} s played");
     player.exits_cleanly();
@@ -74,18 +76,22 @@ fn a_voice_message_plays_to_its_end_and_the_process_goes() {
 fn closing_stdin_pauses_and_says_where() {
     let mut player = Player::open("pause", &fixture("tone.opus"), 0, 100);
     assert!(matches!(player.next(), PlayerEvent::Playing { .. }));
+    let playing = Instant::now();
     std::thread::sleep(Duration::from_millis(400));
+    // Measured, not assumed: a busy machine stretches the sleep, and the sound plays on meanwhile.
+    let played = playing.elapsed().as_millis() as u32;
     drop(player.child.stdin.take());
     let PlayerEvent::Stopped { at } = player.next() else { panic!("did not stop") };
-    assert!((300..=500).contains(&at), "stopped at {at} ms");
+    assert!((played.saturating_sub(100)..=played + 100).contains(&at), "stopped at {at} ms after {played} ms of playing");
     player.exits_cleanly();
 }
 
 #[test]
 fn twice_as_fast_takes_half_as_long_and_a_seek_jumps() {
-    let started = Instant::now();
+    // Timed from when it plays: starting a process is no part of it, and is slow on a busy machine.
     let mut player = Player::open("fast", &fixture("tone.opus"), 0, 200);
     assert!(matches!(player.next(), PlayerEvent::Playing { rate: 200, .. }));
+    let started = Instant::now();
     assert!(matches!(player.next(), PlayerEvent::Ended { .. }));
     let took = started.elapsed();
     assert!(took < Duration::from_millis(900), "{took:?} at 2x");
@@ -99,9 +105,9 @@ fn twice_as_fast_takes_half_as_long_and_a_seek_jumps() {
     player.exits_cleanly();
 
     // Opened part of the way in, as a paused message resumes.
-    let started = Instant::now();
     let mut player = Player::open("resume", &fixture("tone.m4a"), 700, 100);
     assert!(matches!(player.next(), PlayerEvent::Playing { at: 700, .. }));
+    let started = Instant::now();
     assert!(matches!(player.next(), PlayerEvent::Ended { .. }));
     assert!(started.elapsed() < Duration::from_millis(800));
     player.exits_cleanly();
