@@ -34,5 +34,10 @@ gui-shot = ["gui", "gpui/test-support", "gpui_platform/test-support"]
 [target.'cfg(target_os = "macos")'.dependencies]
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "cb13b37a6d80d034119888b534aa0d9067fb5aee", optional = true, default-features = false, features = ["font-kit", "runtime_shaders"] }
 
-[target.'cfg(not(target_os = "macos"))'.dependencies]
+[target.'cfg(windows)'.dependencies]
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "cb13b37a6d80d034119888b534aa0d9067fb5aee", optional = true, default-features = false, features = ["font-kit"] }
+
+# Wayland and X11 are features of their own, off without default features: without them the
+# window cannot open at all ("the environment names no allowed Wayland or X11 display server").
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "cb13b37a6d80d034119888b534aa0d9067fb5aee", optional = true, default-features = false, features = ["font-kit", "wayland", "x11"] }
