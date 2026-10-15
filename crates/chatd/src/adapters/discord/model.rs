@@ -150,11 +150,22 @@ fn sized(id: String, kind: MediaKind, side: u32) -> MediaFile {
     }
 }
 
+/// What a CDN address adds for a picture that moves: Discord marks those with an `a_` hash,
+/// and serves their WebP still unless `animated=true` is asked for. The same small file then
+/// holds every frame; the window plays it under the pointer or as its setting says.
+fn moving(hash: &str) -> &'static str {
+    if hash.starts_with("a_") {
+        "&animated=true"
+    } else {
+        ""
+    }
+}
+
 pub fn avatar(user: &str, hash: Option<&str>, discriminator: &str) -> (MediaFile, String) {
     match hash {
         Some(hash) if !hash.is_empty() => (
             sized(format!("avatar:{user}:{hash}"), MediaKind::Avatar, 80),
-            format!("{}/avatars/{user}/{hash}.webp?size=80", cdn()),
+            format!("{}/avatars/{user}/{hash}.webp?size=80{}", cdn(), moving(hash)),
         ),
         _ => {
             // New-style names (discriminator 0) pick by id, old ones by discriminator.
@@ -179,13 +190,13 @@ pub fn avatar_variants(file: &str) -> Option<Vec<(u32, String)>> {
     if user == "default" {
         return None;
     }
-    Some([128, 256].into_iter().map(|size| (size, format!("{}/avatars/{user}/{hash}.webp?size={size}", cdn()))).collect())
+    Some([128, 256].into_iter().map(|size| (size, format!("{}/avatars/{user}/{hash}.webp?size={size}{}", cdn(), moving(hash)))).collect())
 }
 
 pub fn guild_icon(guild: &str, hash: &str) -> (MediaFile, String) {
     (
         sized(format!("icon:{guild}:{hash}"), MediaKind::Icon, 96),
-        format!("{}/icons/{guild}/{hash}.webp?size=96", cdn()),
+        format!("{}/icons/{guild}/{hash}.webp?size=96{}", cdn(), moving(hash)),
     )
 }
 
@@ -194,14 +205,15 @@ pub fn guild_icon(guild: &str, hash: &str) -> (MediaFile, String) {
 pub fn group_icon(channel: &str, hash: &str) -> (MediaFile, String) {
     (
         sized(format!("gicon:{channel}:{hash}"), MediaKind::Avatar, 80),
-        format!("{}/channel-icons/{channel}/{hash}.webp?size=80", cdn()),
+        format!("{}/channel-icons/{channel}/{hash}.webp?size=80{}", cdn(), moving(hash)),
     )
 }
 
-pub fn emoji(id: &str) -> (MediaFile, String) {
+/// A custom emoji at 48 px; an animated one as an animated WebP of that size, not its GIF.
+pub fn emoji(id: &str, animated: bool) -> (MediaFile, String) {
     (
         sized(format!("emoji:{id}"), MediaKind::Emoji, 48),
-        format!("{}/emojis/{id}.webp?size=48", cdn()),
+        format!("{}/emojis/{id}.webp?size=48{}", cdn(), if animated { "&animated=true" } else { "" }),
     )
 }
 
@@ -448,11 +460,18 @@ fn nullable_yes<'de, D: Deserializer<'de>>(de: D) -> Result<bool, D::Error> {
 /// the picker and a sent sticker share one file. `None` for a Lottie one, which has no still.
 pub fn sticker(id: &str, format: u8) -> Option<(MediaFile, String)> {
     let (kind, url) = match format {
-        1 | 2 => (MediaKind::Image, format!("{}/stickers/{id}.png?size=160", media())),
+        1 => (MediaKind::Image, format!("{}/stickers/{id}.png?size=160", media())),
+        2 => (MediaKind::Image, apng_sticker(id)),
         4 => (MediaKind::Gif, format!("{}/stickers/{id}.gif", media())),
         _ => return None,
     };
     Some((sized(format!("sticker:{id}"), kind, 160), url))
+}
+
+/// An APNG sticker, frames and all: the proxy flattens one to a still unless asked to pass it
+/// through. The parameter is the web client's, unconfirmed against a real account.
+pub fn apng_sticker(id: &str) -> String {
+    format!("{}/stickers/{id}.png?size=160&passthrough=true", media())
 }
 
 impl Guild {
@@ -713,6 +732,8 @@ pub struct Emoji {
     pub id: Option<String>,
     #[serde(default)]
     pub name: Option<String>,
+    #[serde(default, deserialize_with = "nullable")]
+    pub animated: bool,
 }
 
 impl Emoji {
@@ -720,7 +741,7 @@ impl Emoji {
     pub fn spelled(&self) -> (String, Option<(MediaFile, String)>) {
         let name = self.name.as_deref().unwrap_or("emoji");
         match &self.id {
-            Some(id) => (format!(":{name}:"), Some(emoji(id))),
+            Some(id) => (format!(":{name}:"), Some(emoji(id, self.animated))),
             None => (name.to_owned(), None),
         }
     }

@@ -280,7 +280,7 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
         ("GET", ["gifs", "search" | "trending-gifs"]) => (
             200,
             json!([
-                {"id": "1", "title": "cat typing", "url": "https://tenor.com/view/cat-typing-1", "src": "https://media.tenor.com/1.mp4",
+                {"id": "1", "title": "cat typing", "url": "https://tenor.com/view/cat-typing-1", "src": "https://media.tenor.com/1AAAM/cat-typing.gif",
                  "gif_src": "https://media.tenor.com/1.gif", "preview": "https://media.tenor.com/1.png", "width": 220, "height": 160},
             ]),
         ),
@@ -2734,7 +2734,7 @@ fn files_go_up_from_their_paths_with_the_senders_options_and_a_cancel_stops_them
     };
     let gifs = catalog(protocol::CatalogKind::Gifs, "cat", None);
     assert_eq!(gifs[0].id, "https://tenor.com/view/cat-typing-1");
-    assert!(world.discord.requests_to("GET", "/gifs/search?q=cat&media_format=mp4").len() == 1);
+    assert!(world.discord.requests_to("GET", "/gifs/search?q=cat&media_format=tinygif").len() == 1);
     let pick = protocol::Pick { kind: protocol::CatalogKind::Gifs, id: gifs[0].id.clone() };
     send_with(&world, "4101", "77004", "", Some("1300000000000000090"), protocol::Outgoing { pick: Some(pick), ..Default::default() });
     world.outcome("4101", "77004");

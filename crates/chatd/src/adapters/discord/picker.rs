@@ -40,6 +40,9 @@ struct Gif {
     url: String,
     #[serde(default)]
     title: String,
+    /// The media in the format asked for: Tenor's `tinygif`, a small GIF the size of a cell.
+    #[serde(default)]
+    src: String,
     /// A still of it.
     #[serde(default)]
     preview: String,
@@ -47,6 +50,19 @@ struct Gif {
     width: u32,
     #[serde(default)]
     height: u32,
+}
+
+impl Gif {
+    /// What a cell shows: the small moving GIF when there is one, so the grid plays without
+    /// a single original fetched; else the still.
+    fn shown(&self) -> &str {
+        let path = self.src.split('?').next().unwrap_or("");
+        if self.src.starts_with("https://") && path.ends_with(".gif") {
+            &self.src
+        } else {
+            &self.preview
+        }
+    }
 }
 
 /// A query as it goes in an address.
@@ -127,7 +143,7 @@ impl Discord {
         let (mut items, mut files) = (Vec::with_capacity(page.len()), Vec::with_capacity(page.len()));
         for (pack, pickable) in page {
             let registered = match kind {
-                CatalogKind::Emoji => Some(model::emoji(&pickable.id)),
+                CatalogKind::Emoji => Some(model::emoji(&pickable.id, pickable.animated)),
                 _ => model::sticker(&pickable.id, pickable.format),
             };
             let Some((file, url)) = registered else {
@@ -191,11 +207,9 @@ impl Discord {
     }
 
     /// Discord's GIF search, which it proxies to its provider. Sent as the result's address,
-    /// which Discord unfurls. Unverified against a real account: the routes and the GIF object
-    /// are the community's documentation.
-    // CONTRACT: the stills are on the provider's host (`media.tenor.com`), which the media
-    // cache does not trust for Discord (`blobs/fetch.rs` takes only Discord's CDN), so they are
-    // registered and will not load until it does.
+    /// which Discord unfurls. Each cell is the provider's `tinygif` (about 220 px), so the grid
+    /// moves for a few hundred kilobytes a page. Unverified against a real account: the routes,
+    /// `media_format` and the GIF object are the community's documentation.
     fn gifs(&self, query: &str) -> Result<CatalogPage, Refusal> {
         let asked = (self.ctx.account.account.clone(), query.trim().to_lowercase());
         if let Some((_, page)) = crate::hub::lock(&GIF_ANSWERS).get_or_insert_default().get(&asked).filter(|(at, _)| at.elapsed() < GIFS_KEPT) {
@@ -216,19 +230,20 @@ impl Discord {
 
     fn gifs_asked(&self, query: &str) -> Result<CatalogPage, Refusal> {
         let path = match query.trim() {
-            "" => format!("/gifs/trending-gifs?media_format=mp4&locale=en-US&limit={GIFS}"),
-            query => format!("/gifs/search?q={}&media_format=mp4&locale=en-US&limit={GIFS}", escaped(query)),
+            "" => format!("/gifs/trending-gifs?media_format=tinygif&locale=en-US&limit={GIFS}"),
+            query => format!("/gifs/search?q={}&media_format=tinygif&locale=en-US&limit={GIFS}", escaped(query)),
         };
         let answer = self.call("GET", &path, None).map_err(refusal)?;
         let gifs: Vec<Gif> = serde_json::from_str(&answer).map_err(|err| Refusal::Refused(err.to_string()))?;
         let (mut items, mut files) = (Vec::new(), Vec::new());
-        for gif in gifs.into_iter().filter(|gif| !gif.url.is_empty() && gif.preview.starts_with("http")) {
+        for gif in gifs.into_iter().filter(|gif| !gif.url.is_empty() && gif.shown().starts_with("http")) {
+            let shown = gif.shown().to_owned();
             let file = MediaFile {
                 width: gif.width,
                 height: gif.height,
-                ..MediaFile::new(format!("gif:{:x}", fnv(&gif.preview)), MediaKind::Image)
+                ..MediaFile::new(format!("gif:{:x}", fnv(&shown)), MediaKind::Image)
             };
-            files.push((file.clone(), gif.preview));
+            files.push((file.clone(), shown));
             items.push(CatalogItem {
                 id: gif.url,
                 name: gif.title,
@@ -239,5 +254,19 @@ impl Discord {
         }
         self.ctx.media(&files).map_err(|err| Refusal::Refused(err.to_string()))?;
         Ok(CatalogPage { items, cursor: None })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_cell_shows_the_small_moving_gif_and_falls_back_to_the_still() {
+        let gif = |src: &str| Gif { url: "https://tenor.com/view/x".into(), title: String::new(), src: src.into(), preview: "https://media.tenor.com/x.png".into(), width: 220, height: 124 };
+        assert_eq!(gif("https://media.tenor.com/xAAAM/cat.gif").shown(), "https://media.tenor.com/xAAAM/cat.gif");
+        // An MP4 needs a video decoder the window does not have; nothing at all is no picture.
+        assert_eq!(gif("https://media.tenor.com/xAAPo/cat.mp4").shown(), "https://media.tenor.com/x.png");
+        assert_eq!(gif("").shown(), "https://media.tenor.com/x.png");
     }
 }
