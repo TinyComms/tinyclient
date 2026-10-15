@@ -206,8 +206,10 @@ fn a_second_file_replaces_the_first_and_speed_and_seek_reach_mediad() {
     world.ask(second).unwrap();
     let playing = world.until_state(PlayState::Playing);
     assert_eq!(playing.file, "d6101");
-    // One file at a time: the first one's mediad went.
-    world.until("one mediad", |_| mediads() == 1);
+    // One file at a time: the first one's mediad went. Listing processes on Windows takes
+    // PowerShell a second or more, long enough for the second file to end and its mediad to go
+    // too, so none left counts as well.
+    world.until("at most one mediad", |_| mediads() <= 1);
     world.ask(PlayRequest::Stop).unwrap();
     until_no_mediad();
 }
