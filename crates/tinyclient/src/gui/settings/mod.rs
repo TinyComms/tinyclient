@@ -423,6 +423,16 @@ impl SettingsWindow {
         cx.refresh_windows();
     }
 
+    /// M5: when GIFs play, in effect at the next draw of every window.
+    pub(super) fn set_autoplay(&mut self, autoplay: crate::gui::anim::Autoplay, cx: &mut Context<Self>) {
+        crate::gui::anim::set_autoplay(autoplay);
+        let _ = self.shell.update(cx, |shell, cx| {
+            shell.save_prefs(cx);
+            cx.notify();
+        });
+        cx.refresh_windows();
+    }
+
     pub(super) fn set_text_step(&mut self, step: i32, cx: &mut Context<Self>) {
         theme::set_text_step(step);
         let _ = self.shell.update(cx, |shell, cx| {

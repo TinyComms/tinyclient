@@ -9,7 +9,6 @@
 //!   switches, remembered across launches.
 //! - `Shell::save_prefs(cx)`: after changing anything `prefs::Prefs` holds.
 //! - `app::reduce_motion()`: animate nothing when it is true.
-//! - `Shell::set_autoplay(autoplay, window, cx)`: when GIFs play (`anim::Autoplay`), saved.
 
 pub mod crash;
 pub mod menubar;
@@ -485,15 +484,6 @@ impl Shell {
             })
             .detach();
         }
-    }
-
-    /// When GIFs and other moving pictures play: kept with the prefs, in effect at once.
-    // The Settings window offers the choice; nothing else sets it.
-    #[allow(dead_code)]
-    pub(in crate::gui) fn set_autoplay(&mut self, autoplay: super::anim::Autoplay, window: &mut Window, cx: &mut Context<Self>) {
-        super::anim::set_autoplay(autoplay);
-        window.refresh();
-        self.save_prefs(cx);
     }
 
     /// ⌘+, ⌘−, ⌘0.

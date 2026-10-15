@@ -174,7 +174,7 @@ no control.
 | M2 | Open conversations at | Segmented: "First unread" / "Newest message" | First unread | G | s | Where the message list lands on open. First unread is today's behaviour (07 R3) | v1 |
 | M3 | Show when others are typing | Switch | On | G | s | Off: no typing line is drawn. What I send is P1 | v1 |
 | M4 | Convert typed emoticons to emoji | Switch | Off | G | s | On send, `:)` `:(` `:D` `;)` `<3` standing alone become 🙂 🙁 😀 😉 ❤️. Never inside code spans | v1 |
-| M5 | Play GIFs and animated stickers | Segmented: "Automatically" / "On hover" / "Never" | Automatically (one at a time, 07 rules) | G | s | | Later, with GIF playback |
+| M5 | Play GIFs and animated stickers | Segmented: "Automatically" / "On hover" / "Never" | Automatically | G | s | Automatically: every GIF, animated WebP, APNG and animated emoji on screen plays while the window is key, within the 07 budgets. On hover: a still with a GIF badge, playing under the pointer. Never: a still with a badge and a play disc; a click opens it in the viewer, which plays it. Reduce Motion makes Automatically play under the pointer. Kept in `shell.prefs` | v1 |
 | M6 | Check spelling | Switch | | G | s | | Later |
 
 ### Privacy

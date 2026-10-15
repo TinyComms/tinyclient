@@ -6,6 +6,7 @@ use super::accounts::network_name;
 use super::controls::{self, caption, card, group_label, reset_button, reset_slot, row, rule, slider_track, slider_value, switch};
 use super::rows::{self, Row};
 use super::{modal_panel, Confirm, Picker, Section, SettingsWindow};
+use crate::gui::anim::{self, Autoplay};
 use crate::gui::app::prefs::{self, Choices};
 use crate::gui::components::{button, glyph, keycap, menu, menu_item_check, menu_separator, network_icon, placed, segment, segmented, ButtonKind, Layer, Place};
 use crate::gui::layout::NETWORK_ORDER;
@@ -152,7 +153,7 @@ impl SettingsWindow {
                 self.group(&["A2", "A3", "A4"], None, window, cx)
                     .child(caption("Text size is also ⌘+, ⌘− and ⌘0. Reduce Motion follows System Settings.")),
             ],
-            Section::Messages => vec![self.group(&["M1", "M2", "M3", "M4"], None, window, cx)],
+            Section::Messages => vec![self.group(&["M1", "M2", "M3", "M4", "M5"], None, window, cx)],
             Section::Privacy => {
                 let mut groups = self.per_account(window, cx);
                 groups.push(self.group(&["P3"], None, window, cx));
@@ -300,6 +301,17 @@ impl SettingsWindow {
             "M4" => {
                 let second = "When you send, :) :( :D ;) <3 become 🙂 🙁 😀 😉 ❤️. Never inside code.".to_owned();
                 self.switch_row(id, choices.emoticons, false, Some(second), |this, on, cx| this.choose(|c| c.emoticons = on, cx), cx)
+            }
+            "M5" => {
+                let at = anim::autoplay() as usize;
+                let second = match (anim::autoplay(), crate::gui::app::reduce_motion()) {
+                    (Autoplay::Never, _) => Some("Click one to play it.".to_owned()),
+                    (Autoplay::Always, true) => Some("Reduce Motion is on, so they play under the pointer.".to_owned()),
+                    _ => None,
+                };
+                self.segmented_row(id, &["Automatically", "On hover", "Never"], at, 0, second, |this, ix, cx| {
+                    this.set_autoplay([Autoplay::Always, Autoplay::Hover, Autoplay::Never][ix], cx)
+                }, cx)
             }
             "P3" => {
                 let second = (!choices.images).then(|| "Nothing is fetched until you click it.".to_owned());
@@ -905,6 +917,7 @@ impl SettingsWindow {
         let section = prefs::choices().section;
         prefs::set_choices(Choices { section, ..Choices::default() });
         theme::set_text_step(0);
+        anim::set_autoplay(Autoplay::default());
         self.pending.clear();
         let _ = self.shell.update(cx, |shell, cx| {
             shell.save_prefs(cx);

@@ -167,6 +167,7 @@ Caption: "Text size is also ⌘+, ⌘− and ⌘0. Reduce Motion and Increase Co
 | "Open conversations at" (M2) | Segmented: "First unread" / "Newest message" | |
 | "Show when others are typing" (M3) | Switch | |
 | "Convert emoticons to emoji" (M4) | Switch | ":) :( :D ;) <3 become 🙂 🙁 😀 😉 ❤️ when you send. Never inside code." |
+| "Play GIFs and animated stickers" (M5) | Segmented: "Automatically" / "On hover" / "Never" | Never: "Click one to play it." Automatically with Reduce Motion on: "Reduce Motion is on, so they play under the pointer." |
 
 ### Privacy
 | Group | Row | Control | Second line |
