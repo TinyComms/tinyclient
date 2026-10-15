@@ -1157,14 +1157,20 @@ pub fn start(account: AccountKey, session: &str, hub: Arc<Hub>) -> Result<Adapte
         commands: commands.clone(),
         stop: stop.clone(),
     };
-    match account.network {
-        Network::Slack => slack::start(ctx.clone(), session, inbox)?,
-        Network::Discord => discord::start(ctx.clone(), session, inbox)?,
-        Network::Telegram => telegram::start(ctx.clone(), session, inbox)?,
-        Network::Teams => teams::start(ctx.clone(), session, inbox)?,
-        Network::Signal => signal::start(ctx.clone(), session, inbox)?,
-    }
+    // Offline until the adapter says more, and said before its threads start: one that connects
+    // at once (the scripted wires do) would otherwise have its Connected overwritten for good.
     ctx.link(Link::Offline);
+    let started = match account.network {
+        Network::Slack => slack::start(ctx.clone(), session, inbox),
+        Network::Discord => discord::start(ctx.clone(), session, inbox),
+        Network::Telegram => telegram::start(ctx.clone(), session, inbox),
+        Network::Teams => teams::start(ctx.clone(), session, inbox),
+        Network::Signal => signal::start(ctx.clone(), session, inbox),
+    };
+    if let Err(why) = started {
+        ctx.link(Link::SignedOut);
+        return Err(why);
+    }
     Ok(Adapter { commands, stop })
 }
 
