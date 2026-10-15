@@ -1112,6 +1112,7 @@ fn a_channel_reads_as_it_does_in_slack_and_stays_current() {
     let row = world.conversation(&general).unwrap();
     assert_eq!((row.unread, row.preview.as_str()), (before + 1, "from the offsite"));
 
+
     // Reactions come and go one person at a time.
     let react = |kind: &str, user: &str| {
         world.fake.push(ALPHA, json!({
@@ -1146,6 +1147,36 @@ fn a_channel_reads_as_it_does_in_slack_and_stays_current() {
     assert!(ranges(&edited).contains(&("offsite", &Style::Bold)));
     assert_eq!(edited.attachments.len(), 1);
     assert_eq!(world.conversation(&general).unwrap().unread, before + 1, "an edit is not a new message");
+
+    // A GIF's row picture is Slack's moving copy at the size drawn, never the original.
+    let gif = json!({
+        "id": "F0GIF", "name": "hop.gif", "title": "hop.gif", "mimetype": "image/gif", "filetype": "gif",
+        "size": 2310144, "mode": "hosted", "original_w": 498, "original_h": 280,
+        "url_private": "https://files.slack.com/files-pri/T01ALPHA-F0GIF/hop.gif",
+        "thumb_360": "https://files.slack.com/files-tmb/T01ALPHA-F0GIF-1c/hop_360.png", "thumb_360_w": 360, "thumb_360_h": 202,
+        "thumb_360_gif": "https://files.slack.com/files-tmb/T01ALPHA-F0GIF-1c/hop_360.gif",
+        "thumb_480": "https://files.slack.com/files-tmb/T01ALPHA-F0GIF-1c/hop_480.png", "thumb_480_w": 480, "thumb_480_h": 270,
+        "thumb_480_gif": "https://files.slack.com/files-tmb/T01ALPHA-F0GIF-1c/hop_480.gif",
+        "deanimate_gif": "https://files.slack.com/files-tmb/T01ALPHA-F0GIF-1c/hop_deanimate_gif.png",
+    });
+    let gif: Value = serde_json::from_str(&gif.to_string().replace("https://files.slack.com", &world.fake.base)).unwrap();
+    let hop = "1760000500.000600";
+    world.fake.push(ALPHA, json!({
+        "type": "message", "subtype": "file_share", "channel": "C0GEN", "user": "U0BEN", "text": "",
+        "files": [gif], "upload": true, "ts": hop, "event_ts": hop, "channel_type": "channel",
+    }));
+    let hopped = world.until("the GIF to arrive", || world.message(&general, hop));
+    let shown = hopped.attachments[0].thumb.clone().unwrap();
+    assert_eq!((hopped.attachments[0].file.kind, shown.width, shown.height), (MediaKind::Gif, 480, 270));
+    world.fetched(&general, &shown.id, Some(400));
+    assert!(world.fake.file("/files-tmb/T01ALPHA-F0GIF-1c/hop_480.gif").is_some(), "{:?}", world.fake.files());
+    assert!(world.fake.file("/files-tmb/T01ALPHA-F0GIF-1c/hop_480.png").is_none() && world.fake.file("/files-pri/T01ALPHA-F0GIF/hop.gif").is_none());
+    // Gone again, so what follows counts the channel as it was.
+    world.fake.push(ALPHA, json!({
+        "type": "message", "subtype": "message_deleted", "hidden": true, "channel": "C0GEN",
+        "deleted_ts": hop, "ts": "1760000502.500000", "event_ts": "1760000502.500000",
+    }));
+    world.until("the GIF to go", || world.message(&general, hop).is_none().then_some(()));
 
     // A delete removes it.
     world.fake.push(ALPHA, json!({

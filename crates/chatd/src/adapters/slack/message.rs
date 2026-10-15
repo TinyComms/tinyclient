@@ -282,7 +282,19 @@ impl Slack {
             };
             Some((url.to_owned(), width, height, longest))
         };
+        // Beside a GIF's stills Slack makes moving copies at 360 and 480 (`thumb_480_gif`, the
+        // still's size): those play in the row for a fraction of the original.
+        let moving: Vec<_> = [360, 480]
+            .iter()
+            .filter(|_| kind == MediaKind::Gif)
+            .filter_map(|side| {
+                let (url, ..) = still(&format!("thumb_{side}_gif"), *side)?;
+                let (_, width, height, longest) = still(&format!("thumb_{side}"), *side).unwrap_or((String::new(), 0, 0, *side));
+                Some((url, width, height, longest))
+            })
+            .collect();
         let mut sizes = match kind {
+            MediaKind::Gif if !moving.is_empty() => moving,
             MediaKind::Image | MediaKind::Gif => THUMBS.iter().filter_map(|side| still(&format!("thumb_{side}"), *side)).collect(),
             MediaKind::Video => still("thumb_video", 0).into_iter().collect(),
             MediaKind::File => still("thumb_pdf", 0).into_iter().collect::<Vec<_>>(),

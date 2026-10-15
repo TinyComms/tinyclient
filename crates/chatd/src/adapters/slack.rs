@@ -1323,8 +1323,8 @@ impl Slack {
                     None => drop(reply.send(Err(Refusal::Unsupported))),
                 }
             }
-            // Only the workspace's emoji: Slack's GIFs are hidden until its client's call is
-            // captured, and it has no stickers.
+            // Only the workspace's emoji: Slack has no GIFs or stickers of its own (see
+            // `capabilities`).
             Command::Catalog { kind: protocol::CatalogKind::Emoji, query, cursor, reply, .. } => {
                 answer(reply, self.emoji_catalog(&query, cursor.as_deref()))
             }
@@ -1623,8 +1623,12 @@ fn about_of(user: &Value) -> About {
 }
 
 /// What a Slack account may send. The same on every plan (unverified: a workspace may lower
-/// the file limit or turn uploads off, which Slack then refuses in words). Slack's GIF picker
-/// is left out until its client's call is captured on a live session (ruling 09).
+/// the file limit or turn uploads off, which Slack then refuses in words). No GIF picker:
+/// Slack has no GIF search of its own. Its GIFs come from the Giphy app a workspace may
+/// install, run as `/giphy`, which a client can only reach through the web client's
+/// undocumented `chat.command` (an imitation the account rules rule out, ruling 09); any other
+/// search would be a third-party service with a key of ours. A GIF pasted as a link still
+/// unfurls, and one sent as a file plays.
 fn capabilities() -> protocol::Capabilities {
     protocol::Capabilities {
         max_file_bytes: send::LARGEST,

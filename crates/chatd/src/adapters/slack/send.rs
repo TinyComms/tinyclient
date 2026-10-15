@@ -29,7 +29,7 @@ impl Slack {
     /// the files and ends the send through `Context::sent`.
     pub(super) fn send_with(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, with: &Outgoing, up: &mut Upload) -> Result<Message, String> {
         if with.pick.is_some() {
-            return Err("Slack's GIFs and stickers are not built.".to_owned());
+            return Err("Slack has no GIFs or stickers to pick from. Paste a GIF's link, or attach the file.".to_owned());
         }
         if let Some(at) = with.schedule {
             if !up.files().is_empty() {
