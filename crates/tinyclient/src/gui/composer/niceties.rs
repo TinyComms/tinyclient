@@ -3,6 +3,46 @@
 
 use protocol::Network;
 
+/// Settings › Messages › Convert emoticons (M4): each of these, standing alone, becomes its emoji.
+const EMOTICONS: [(&str, &str); 5] = [(":)", "🙂"), (":(", "🙁"), (":D", "😀"), (";)", "😉"), ("<3", "❤️")];
+
+/// The text with every emoticon that stands alone (spaces or the ends around it) replaced by its
+/// emoji. Inside `code` or a ```block``` nothing changes.
+pub fn emoticons(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut code = false;
+    let mut fence = false;
+    let mut rest = text;
+    while !rest.is_empty() {
+        if rest.starts_with("```") {
+            fence = !fence;
+            out.push_str("```");
+            rest = &rest[3..];
+            continue;
+        }
+        if !fence && rest.starts_with('`') {
+            code = !code;
+        }
+        let before = out.chars().next_back();
+        let alone_before = before.is_none_or(char::is_whitespace);
+        let swap = (!code && !fence && alone_before)
+            .then(|| EMOTICONS.iter().find(|(face, _)| rest.starts_with(face) && rest[face.len()..].chars().next().is_none_or(char::is_whitespace)))
+            .flatten();
+        match swap {
+            Some((face, emoji)) => {
+                out.push_str(emoji);
+                rest = &rest[face.len()..];
+            }
+            None => {
+                let ch = rest.chars().next().expect("not empty");
+                out.push(ch);
+                rest = &rest[ch.len_utf8()..];
+            }
+        }
+    }
+    out
+}
+
 /// More than this many people notified asks for a second Return.
 pub const LARGE_PING: u32 = 25;
 
@@ -110,6 +150,18 @@ pub fn preview_words(hosts: &[String], suppressed: bool) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn emoticons_standing_alone_become_emoji_and_code_is_left_as_typed() {
+        assert_eq!(emoticons(":) ok"), "🙂 ok");
+        assert_eq!(emoticons("fine :( but <3 you ;) :D"), "fine 🙁 but ❤️ you 😉 😀");
+        assert_eq!(emoticons("`:)`"), "`:)`");
+        assert_eq!(emoticons("```\n:)\n``` :)"), "```\n:)\n``` 🙂");
+        // Inside a word or a link, nothing changes.
+        assert_eq!(emoticons("a:) x<3 https://e.example/:D"), "a:) x<3 https://e.example/:D");
+        assert_eq!(emoticons(":)) <33"), ":)) <33");
+        assert_eq!(emoticons(""), "");
+    }
 
     #[test]
     fn a_broadcast_is_a_whole_word_the_network_knows() {

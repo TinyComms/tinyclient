@@ -440,6 +440,8 @@ impl Pane {
         self.pending_at.clear();
         self.relay(true, ListOffset::default());
         self.ask_reactions(cx);
+        // M2: a conversation opens at its newest message rather than the first unread.
+        let around = around.filter(|_| !super::app::prefs::choices().newest);
         match back {
             Some(place) => self.load(Page::Around { id: place.id.clone() }, Purpose::Restore(place.id, place.offset), cx),
             None => match around {
@@ -585,7 +587,7 @@ impl Pane {
             Purpose::Bottom => self.snap_to_end(),
             Purpose::Restore(id, offset) => self.restore(id, *offset),
             // Unread that may not fit: placed once the rows can be measured.
-            Purpose::Open => self.land = self.items.iter().any(|item| matches!(item, Item::New)),
+            Purpose::Open => self.land = !super::app::prefs::choices().newest && self.items.iter().any(|item| matches!(item, Item::New)),
             _ if mine => self.snap_to_end(),
             _ => {}
         }

@@ -170,6 +170,51 @@ pub enum MediaRequest {
     Audio { muted: bool, deafened: bool },
     /// Device names as the system lists them. `None` follows the system default.
     Devices { input: Option<String>, output: Option<String> },
+    /// Gains, the speech gate and which cues play (Settings › Sounds and Audio & video). Sent
+    /// at start and whenever one changes.
+    Tune(Tuning),
+    /// Plays one cue now, on the call's speaker, under the voices. Outside a call (a test
+    /// mediad) it opens the speaker for the cue alone.
+    Cue { cue: Cue },
+}
+
+/// What the user chose for a call's sound. Percentages, 0 to 100.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tuning {
+    /// Everyone's voice in the mix. 100 is the level as decoded.
+    pub voice: u8,
+    /// Our microphone counts as speech from this level (`audio::level`) up.
+    pub gate: u8,
+    /// The cues' volume. At 100 a cue peaks at -20 dBFS.
+    pub cues: u8,
+    /// Someone joins or leaves (S7).
+    pub joins: bool,
+    /// I mute, unmute, deafen or undeafen (S8).
+    pub mine: bool,
+    /// The connection is lost or back (S9).
+    pub connection: bool,
+}
+
+impl Default for Tuning {
+    fn default() -> Tuning {
+        Tuning { voice: 100, gate: 25, cues: 50, joins: true, mine: true, connection: true }
+    }
+}
+
+/// The short sounds mediad makes inside a call (`docs/design/09-settings.md` §8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Cue {
+    Joined,
+    Left,
+    Muted,
+    Unmuted,
+    Deafened,
+    Undeafened,
+    Lost,
+    Back,
+    /// "Play test sound": the join cue, whatever the switches say.
+    Test,
 }
 
 /// mediad to chatd, over mediad's stdout. `Ready` is sent once at start. `Streams`, `Done` and

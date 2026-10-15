@@ -102,7 +102,7 @@ impl Fake {
     fn listen(&self) {
         let (events, closed, refuse, control) = (self.events.clone(), self.closed.clone(), self.refuse.clone(), self.control.clone());
         let _ = std::thread::Builder::new().name("signal-fake".into()).spawn(move || {
-            script::follow(&control, |line| {
+            script::follow_held(&control, |line| {
                 if closed.load(Ordering::Relaxed) {
                     return false;
                 }

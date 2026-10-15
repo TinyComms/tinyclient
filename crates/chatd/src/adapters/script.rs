@@ -39,7 +39,20 @@ fn taken(path: &Path) -> PathBuf {
 /// Hands `each` every line written to a control file, and `None` whenever the writing paused: a
 /// writer closed the FIFO, or on Windows nothing more is in the file. Stops when `each` says
 /// false or the file cannot be opened. Each line is taken once, as a FIFO gives it.
-pub fn follow(path: &Path, mut each: impl FnMut(Option<&str>) -> bool) {
+pub fn follow(path: &Path, each: impl FnMut(Option<&str>) -> bool) {
+    read(path, false, each);
+}
+
+/// [`follow`], holding a writer of its own on a FIFO so it never reaches its end. Without it, a
+/// test writing lines back to back could open the FIFO just as this side saw the last one end and
+/// closed it, and that line went nowhere. Such a reader is ended only by a line, as [`wake`]
+/// writes.
+pub fn follow_held(path: &Path, each: impl FnMut(Option<&str>) -> bool) {
+    read(path, true, each);
+}
+
+#[cfg_attr(windows, allow(unused_variables))]
+fn read(path: &Path, hold: bool, mut each: impl FnMut(Option<&str>) -> bool) {
     #[cfg(unix)]
     loop {
         use std::io::BufRead;
@@ -47,6 +60,7 @@ pub fn follow(path: &Path, mut each: impl FnMut(Option<&str>) -> bool) {
         let Ok(file) = std::fs::File::open(path) else {
             return;
         };
+        let _held = hold.then(|| std::fs::OpenOptions::new().write(true).open(path));
         for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
             if !each(Some(&line)) {
                 return;

@@ -4903,6 +4903,7 @@ dependencies = [
  "protocol",
  "rand 0.8.8",
  "serde_json",
+ "sha2 0.10.9",
  "symphonia",
  "tungstenite 0.30.0",
  "unsafe-libopus",
@@ -8853,6 +8854,7 @@ dependencies = [
  "image",
  "libc",
  "protocol",
+ "serde_json",
  "smallvec",
  "unicode-segmentation",
 ]

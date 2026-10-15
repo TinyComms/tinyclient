@@ -1234,3 +1234,109 @@ fn what_was_shared_in_a_conversation_is_listed_by_kind_newest_first() {
     // Every detail is in its typed place: nothing is left as a labelled line.
     assert!(profile.fields.is_empty(), "{:?}", profile.fields);
 }
+
+#[test]
+fn settings_are_kept_refused_when_unknown_and_acted_on_at_once() {
+    use protocol::settings::{CUE_VOLUME, KEEP_DAYS, VERSION};
+    let chatd = Daemon::start(|store| {
+        incoming(store, "#platform", Network::Slack, "C01", "a", "deploy is green");
+        let old = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64 - 20 * 86_400;
+        store.ingest(&key(Network::Slack, "C01"), &Message::plain("old", "mara", "three weeks ago", old, false), true).unwrap();
+    });
+    let Response::Settings { values } = chatd.ask(Request::Settings) else {
+        panic!("no settings");
+    };
+    assert_eq!(values.len(), 1, "only the version row: every setting is at its default");
+    assert_eq!(values[0].key, VERSION);
+
+    let set = |key: &str, value: Option<&str>| Request::Set { scope: String::new(), key: key.into(), value: value.map(str::to_owned) };
+    let refused = chatd.ask(set("proxy", Some("socks5://127.0.0.1")));
+    assert!(matches!(refused, Response::Error { code: ErrorCode::Refused, .. }), "{refused:?}");
+    let refused = chatd.ask(set(KEEP_DAYS, Some("12")));
+    assert!(matches!(refused, Response::Error { code: ErrorCode::Refused, .. }), "{refused:?}");
+
+    // Counted before it is asked, then deleted within moments of the change.
+    let Response::Prunable { messages: prunable, .. } = chatd.ask(Request::Prunable { days: 7 }) else {
+        panic!("no count");
+    };
+    assert_eq!(prunable, 1);
+    let seq = chatd.seq();
+    assert_eq!(chatd.ask(set(KEEP_DAYS, Some("7"))), Response::Ok);
+    // Windows are told: by the change itself, or, when the prune it set off already emptied
+    // the change log, by the reset that has them read everything again, settings included.
+    let Response::Changes { reset, changes, .. } = chatd.ask(Request::Wait { since: seq }) else {
+        panic!("wait did not answer with changes");
+    };
+    assert!(reset || changes.contains(&Change::Settings), "{changes:?}");
+    chatd.until("the old message to be pruned", messages(Network::Slack, "C01", 10), |answer| {
+        matches!(answer, Response::Messages { messages, .. } if messages.len() == 1)
+    });
+
+    assert_eq!(chatd.ask(set(CUE_VOLUME, Some("80"))), Response::Ok);
+    let Response::Settings { values } = chatd.ask(Request::Settings) else {
+        panic!("no settings");
+    };
+    assert!(values.iter().any(|s| s.key == CUE_VOLUME && s.value == "80"));
+    assert_eq!(chatd.ask(Request::ResetSettings), Response::Ok);
+    let Response::Settings { values } = chatd.ask(Request::Settings) else {
+        panic!("no settings");
+    };
+    assert_eq!(values.len(), 1, "reset leaves only the version: {values:?}");
+
+    // Storage counts the database; Clear empties it of messages and keeps the conversation.
+    let Response::Storage { messages: bytes, .. } = chatd.ask(Request::Storage) else {
+        panic!("no storage");
+    };
+    assert!(bytes > 0);
+    assert_eq!(chatd.ask(Request::Clear), Response::Ok);
+    let Response::Messages { messages, .. } = chatd.ask(messages(Network::Slack, "C01", 10)) else {
+        panic!("no messages");
+    };
+    assert!(messages.is_empty());
+    assert_eq!(chatd.row(&key(Network::Slack, "C01")).title, "#platform");
+}
+
+#[test]
+fn reading_while_settings_change_never_stalls_chatd() {
+    use protocol::settings::KEEP_RUNNING;
+    // Read markers and settings writes take the store and the settings both. Taken in two
+    // orders, a MarkRead and a Set at the same moment waited on each other for ever.
+    let chatd = Daemon::start(|store| incoming(store, "#platform", Network::Slack, "C01", "a", "deploy is green"));
+    let (done, finished) = std::sync::mpsc::channel();
+    let ask = |socket: PathBuf, request: Request| -> Response {
+        let mut stream = ChatStream::connect(&socket).unwrap();
+        write_frame(&mut stream, &request).unwrap();
+        read_frame(&mut stream).unwrap()
+    };
+    for worker in 0..8u32 {
+        let (socket, done) = (chatd.dir.join("chat.sock"), done.clone());
+        std::thread::spawn(move || {
+            for n in 0..300u32 {
+                let request = if worker % 2 == 0 {
+                    // Every id is a new read marker, so each one is a write.
+                    Request::MarkRead { conversation: key(Network::Slack, "C01"), message_id: format!("{worker}-{n}") }
+                } else {
+                    let value = (n % 2 == 0).then(|| "off".to_owned());
+                    Request::Set { scope: String::new(), key: KEEP_RUNNING.into(), value }
+                };
+                assert_eq!(ask(socket.clone(), request), Response::Ok);
+            }
+            let _ = done.send(());
+        });
+    }
+    for _ in 0..8 {
+        finished.recv_timeout(Duration::from_secs(30)).expect("chatd stalled with a read and a setting in flight");
+    }
+    assert!(matches!(chatd.ask(Request::Settings), Response::Settings { .. }));
+}
+
+#[test]
+fn shutdown_answers_and_then_chatd_is_gone() {
+    let mut chatd = Daemon::start(|_| {});
+    assert_eq!(chatd.ask(Request::Shutdown), Response::Ok);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while chatd.child.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "chatd still runs");
+        sleep(Duration::from_millis(10));
+    }
+}

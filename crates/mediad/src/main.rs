@@ -125,8 +125,15 @@ impl Call {
                 return MediaResponse::Done;
             }
             MediaRequest::Audio { muted, deafened } => {
-                self.controls.muted.store(muted, Ordering::Relaxed);
-                self.controls.deafened.store(deafened, Ordering::Relaxed);
+                self.controls.set_audio(muted, deafened);
+                return MediaResponse::Done;
+            }
+            MediaRequest::Tune(tuning) => {
+                self.controls.tune(tuning);
+                return MediaResponse::Done;
+            }
+            MediaRequest::Cue { cue } => {
+                self.controls.cue(cue);
                 return MediaResponse::Done;
             }
             MediaRequest::Devices { input, output } => {
@@ -228,6 +235,12 @@ fn main() -> ExitCode {
                     ExitCode::from(1)
                 }
             };
+        }
+        // Settings' microphone test and test sound, with no call (`probe`).
+        Some("test") => {
+            mediad::probe::run();
+            eprintln!("mediad: test over, exiting");
+            return ExitCode::SUCCESS;
         }
         _ => {}
     }

@@ -9,6 +9,7 @@
 //! `decode` and speeding it up with `stretch`), the speaker only, until playing stops.
 
 pub mod audio;
+pub mod cue;
 pub mod dave;
 pub mod decode;
 pub mod gateway;
@@ -18,6 +19,7 @@ pub mod opus;
 pub mod out;
 pub mod permission;
 pub mod play;
+pub mod probe;
 pub mod rtp;
 pub mod session;
 pub mod stretch;

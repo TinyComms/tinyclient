@@ -23,7 +23,8 @@ const SCHEMA: i32 = 4;
 
 /// Retention: the newest messages kept per conversation.
 pub const KEEP_MESSAGES: u32 = 2_000;
-/// Retention: older messages go, unless the conversation was opened within this many days.
+/// Retention: older messages go, unless the conversation was opened within this many days. The
+/// default of Settings › Privacy › Keep messages (P4), which may shorten it.
 pub const KEEP_DAYS: i64 = 90;
 /// Most sizes one file is registered in.
 pub const VARIANTS: usize = 6;
@@ -728,6 +729,20 @@ fn upsert_conversation(tx: &Transaction, account: &AccountKey, row: &Conversatio
     Ok(())
 }
 
+/// The user's settings (`protocol::settings`). Not part of the cache: a schema change keeps it,
+/// and only sign-out and Reset all delete rows.
+const SETTINGS: &str = "
+    CREATE TABLE IF NOT EXISTS settings (
+        scope TEXT NOT NULL,
+        key   TEXT NOT NULL,
+        value TEXT NOT NULL,
+        PRIMARY KEY (scope, key)
+    ) WITHOUT ROWID;
+";
+
+/// The shape of the settings rows. A migration from an older one runs in `migrate_settings`.
+const SETTINGS_VERSION: u32 = 1;
+
 impl Store {
     pub fn open(path: &Path) -> rusqlite::Result<Store> {
         let db = Connection::open(path)?;
@@ -741,7 +756,7 @@ impl Store {
         let version: i32 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if version != SCHEMA {
             let old: Vec<String> = db
-                .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")?
+                .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name != 'settings'")?
                 .query_map([], |row| row.get(0))?
                 .collect::<rusqlite::Result<_>>()?;
             for table in old {
@@ -750,7 +765,86 @@ impl Store {
             db.execute_batch(TABLES)?;
             db.execute_batch(&format!("PRAGMA user_version = {SCHEMA};"))?;
         }
-        Ok(Store { db })
+        let mut store = Store { db };
+        store.migrate_settings()?;
+        Ok(store)
+    }
+
+    // Settings.
+
+    /// Creates the settings table and brings its rows to [`SETTINGS_VERSION`], in one
+    /// transaction, before the socket is served. There is nothing to convert yet.
+    fn migrate_settings(&mut self) -> rusqlite::Result<()> {
+        let tx = self.db.transaction()?;
+        tx.execute_batch(SETTINGS)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO settings (scope, key, value) VALUES ('', ?1, ?2)",
+            params![protocol::settings::VERSION, SETTINGS_VERSION.to_string()],
+        )?;
+        tx.commit()
+    }
+
+    /// Every stored setting, the version row included.
+    pub fn settings(&self) -> rusqlite::Result<Vec<protocol::settings::Setting>> {
+        let mut query = self.db.prepare("SELECT scope, key, value FROM settings ORDER BY scope, key")?;
+        let rows = query.query_map([], |row| {
+            Ok(protocol::settings::Setting { scope: row.get(0)?, key: row.get(1)?, value: row.get(2)? })
+        })?;
+        rows.collect()
+    }
+
+    /// Stores one value, or deletes the row so the default applies again.
+    pub fn set_setting(&mut self, scope: &str, key: &str, value: Option<&str>) -> rusqlite::Result<()> {
+        match value {
+            Some(value) => self.db.execute(
+                "INSERT INTO settings (scope, key, value) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (scope, key) DO UPDATE SET value = excluded.value",
+                params![scope, key, value],
+            )?,
+            None => self.db.execute("DELETE FROM settings WHERE scope = ?1 AND key = ?2", params![scope, key])?,
+        };
+        self.settle()
+    }
+
+    /// Reset all (B3): every row but the version.
+    pub fn reset_settings(&mut self) -> rusqlite::Result<()> {
+        self.db.execute("DELETE FROM settings WHERE NOT (scope = '' AND key = ?1)", params![protocol::settings::VERSION])?;
+        self.settle()
+    }
+
+    /// Puts a settings write on the disk now. The rest of this file is a cache of what the
+    /// networks hold, and may sync only at checkpoints (synchronous = NORMAL); a choice the
+    /// user just made is not, and a power cut must not undo it. A checkpoint syncs the log and
+    /// the file; settings change a few times a day, so its cost does not matter.
+    fn settle(&self) -> rusqlite::Result<()> {
+        self.db.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()))
+    }
+
+    // Storage.
+
+    /// Clear (D3): every message that is not the user's own unsent one, and every file's place
+    /// on disk. Conversations, people, drafts and settings stay. Then the file shrinks.
+    pub fn clear_cache(&mut self) -> rusqlite::Result<()> {
+        let tx = self.db.transaction()?;
+        tx.execute("DELETE FROM message WHERE pending = 0", [])?;
+        tx.execute("UPDATE media SET path = NULL WHERE path IS NOT NULL", [])?;
+        tx.commit()?;
+        self.db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")
+    }
+
+    /// What `prune` with `days` would delete by age now: messages, and about how many bytes
+    /// their rows hold.
+    pub fn prunable(&self, now: i64, days: u32) -> rusqlite::Result<(u64, u64)> {
+        let cutoff = now - i64::from(days) * 86_400;
+        self.db.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(LENGTH(text) + LENGTH(body) + 64), 0) FROM message
+              WHERE pending = 0 AND sent < ?1 AND NOT EXISTS
+                 (SELECT 1 FROM conversation c
+                   WHERE c.network = message.network AND c.account = message.account
+                     AND c.id = message.conversation AND c.opened >= ?1)",
+            params![cutoff],
+            |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64)),
+        )
     }
 
     // Accounts.
@@ -806,6 +900,14 @@ impl Store {
         for table in ["message", "conversation", "section", "space", "folder", "person", "media", "media_variant", "name"] {
             tx.execute(&format!("DELETE FROM {table} WHERE network = ?1 AND account = ?2"), key)?;
         }
+        // No trace of a removed account stays in its settings either: its own and its
+        // conversations'.
+        let own = protocol::settings::account_scope(account);
+        let conversations = protocol::settings::conversation_scope(&Key::new(account, ""));
+        tx.execute(
+            "DELETE FROM settings WHERE scope = ?1 OR substr(scope, 1, length(?2)) = ?2",
+            params![own, conversations],
+        )?;
         tx.commit()
     }
 
@@ -2283,11 +2385,12 @@ impl Store {
 
     // Retention.
 
-    /// Keeps the newest [`KEEP_MESSAGES`] of every conversation, and nothing older than
-    /// [`KEEP_DAYS`] unless the conversation was opened in that time. Run at start and daily.
-    /// Unsent messages are the user's and are never pruned. Returns how many rows went.
-    pub fn prune(&mut self, now: i64) -> rusqlite::Result<usize> {
-        let cutoff = now - KEEP_DAYS * 86_400;
+    /// Keeps the newest [`KEEP_MESSAGES`] of every conversation, and nothing older than `days`
+    /// (P4, [`KEEP_DAYS`] by default) unless the conversation was opened in that time. Run at
+    /// start, daily, and when P4 changes. Unsent messages are the user's and are never pruned.
+    /// Returns how many rows went.
+    pub fn prune(&mut self, now: i64, days: u32) -> rusqlite::Result<usize> {
+        let cutoff = now - i64::from(days) * 86_400;
         let tx = self.db.transaction()?;
         let mut gone = tx.execute(
             "DELETE FROM message WHERE pending = 0 AND sent < ?1 AND NOT EXISTS
@@ -2359,6 +2462,7 @@ mod tests {
     fn store() -> (Store, Key) {
         let mut store = Store { db: Connection::open_in_memory().unwrap() };
         store.db.execute_batch(TABLES).unwrap();
+        store.db.execute_batch(SETTINGS).unwrap();
         let account = AccountKey { network: Network::Discord, account: "me".into() };
         let row = ConversationRow::new("general", ConversationKind::Channel, "#general");
         store.upsert_conversation(&account, &row).unwrap();
@@ -2702,9 +2806,87 @@ mod tests {
         store.ingest(&opened, &said("1", "ancient but read lately", old), false).unwrap();
         store.messages(&opened, &Page::Newest, 1, NOW - 3_600).unwrap();
 
-        assert_eq!(store.prune(NOW).unwrap(), 1);
+        assert_eq!(store.prune(NOW, KEEP_DAYS as u32).unwrap(), 1);
         assert!(store.message(&key, "1").unwrap().is_none());
         assert!(store.message(&key, "2").unwrap().is_some());
         assert!(store.message(&opened, "1").unwrap().is_some());
+    }
+
+    #[test]
+    fn a_shorter_retention_is_counted_first_and_then_deletes_just_that() {
+        let (mut store, key) = store();
+        store.ingest(&key, &said("1", "five weeks old", NOW - 35 * 86_400), false).unwrap();
+        store.ingest(&key, &said("2", "ten days old", NOW - 10 * 86_400), false).unwrap();
+        store.ingest(&key, &said("3", "today", NOW - 60), false).unwrap();
+        assert_eq!(store.prunable(NOW, 90).unwrap().0, 0);
+        let (messages, bytes) = store.prunable(NOW, 7).unwrap();
+        assert_eq!(messages, 2);
+        assert!(bytes > 0);
+        assert_eq!(store.prunable(NOW, 30).unwrap().0, 1);
+        assert_eq!(store.prune(NOW, 30).unwrap(), 1);
+        assert_eq!(store.prune(NOW, 7).unwrap(), 1);
+        assert!(store.message(&key, "3").unwrap().is_some());
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("tc-store-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("chat.sqlite")
+    }
+
+    #[test]
+    fn settings_outlive_a_schema_change_and_sign_out_takes_only_that_accounts() {
+        use protocol::settings::{account_scope, conversation_scope, VERSION};
+        let path = scratch("settings");
+        let mut store = Store::open(&path).unwrap();
+        let (slack, discord) = (
+            AccountKey { network: Network::Slack, account: "T1".into() },
+            AccountKey { network: Network::Discord, account: "D1".into() },
+        );
+        store.set_setting("", "keep_days", Some("30")).unwrap();
+        store.set_setting(&account_scope(&slack), "typing", Some("off")).unwrap();
+        store.set_setting(&conversation_scope(&Key::new(&slack, "C1")), "sound", Some("chime")).unwrap();
+        store.set_setting(&account_scope(&discord), "typing", Some("on")).unwrap();
+        store.set_setting("", "keep_days", Some("7")).unwrap();
+        let read = |store: &Store| -> Vec<(String, String, String)> {
+            store.settings().unwrap().into_iter().map(|s| (s.scope, s.key, s.value)).collect()
+        };
+        assert!(read(&store).contains(&(String::new(), "keep_days".into(), "7".into())), "a second write replaces the first");
+        assert!(read(&store).contains(&(String::new(), VERSION.into(), "1".into())));
+
+        // A schema change drops the cache and keeps the user's choices.
+        store.db.execute_batch("PRAGMA user_version = 1;").unwrap();
+        drop(store);
+        let mut store = Store::open(&path).unwrap();
+        assert_eq!(read(&store).len(), 5);
+
+        store.forget(&slack).unwrap();
+        let left = read(&store);
+        assert!(left.iter().all(|(scope, _, _)| !scope.contains(":slack:")), "{left:?}");
+        assert!(left.iter().any(|(scope, _, _)| *scope == account_scope(&discord)));
+
+        store.set_setting("", "keep_days", None).unwrap();
+        assert!(!read(&store).iter().any(|(_, key, _)| key == "keep_days"), "reset to the default is no row");
+        store.reset_settings().unwrap();
+        assert_eq!(read(&store), [(String::new(), VERSION.to_owned(), "1".to_owned())]);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn clearing_the_cache_takes_messages_and_files_and_leaves_drafts_and_rows() {
+        let path = scratch("clear");
+        let mut store = Store::open(&path).unwrap();
+        let account = AccountKey { network: Network::Discord, account: "me".into() };
+        store.upsert_conversation(&account, &ConversationRow::new("general", ConversationKind::Channel, "#general")).unwrap();
+        let key = Key::new(&account, "general");
+        store.ingest(&key, &said("1", "hello", NOW), false).unwrap();
+        store.set_draft(&key, "half a thought").unwrap();
+        store.clear_cache().unwrap();
+        assert!(store.message(&key, "1").unwrap().is_none());
+        let row = store.conversation(&key).unwrap().expect("the conversation stays");
+        assert_eq!(row.draft, "half a thought");
+        assert_eq!(store.media_bytes().unwrap(), 0);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

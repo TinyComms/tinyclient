@@ -791,6 +791,13 @@ impl Drop for World {
     }
 }
 
+/// Lets this account tell Discord that we type (P1, off by default).
+fn allow_typing(world: &World, conversation: &Key) {
+    let scope = protocol::settings::account_scope(&conversation.account());
+    let set = Request::Set { scope, key: protocol::settings::TYPING.into(), value: Some("on".into()) };
+    assert_eq!(world.ask(set), Response::Ok);
+}
+
 /// Polls until `probe` has an answer. Everything here is the adapter reacting to the fake, so
 /// nothing is assumed to have happened by the time a request returns.
 fn wait<T>(what: &str, mut probe: impl FnMut() -> Option<T>) -> T {
@@ -1127,6 +1134,8 @@ fn typing_appears_expires_and_is_paced_on_the_way_out() {
     // Our own typing is never shown to us.
     world.discord.push("TYPING_START", json!({"channel_id": "3001", "user_id": "1000", "timestamp": heard}));
 
+    // Discord hears typing only once the user lets it (Settings › Privacy, off by default).
+    allow_typing(&world, &dm);
     // The draft changing three times is one signal to Discord.
     for _ in 0..3 {
         assert_eq!(world.ask(Request::Typing { conversation: dm.clone() }), Response::Ok);
@@ -1965,6 +1974,7 @@ fn a_run_of_refusals_stops_every_request_and_says_so() {
     world.send("3002", "1730000000000000031", "anyone?", None);
     let why = world.failure("3002", "1730000000000000031");
     assert!(why.contains("refused too many requests") && why.contains("10 min"), "{why}");
+    allow_typing(&world, &world.key("3002"));
     world.ask(Request::Typing { conversation: world.key("3002") });
     settled(&world);
     assert_eq!(world.discord.requests.lock().unwrap().len(), before);
@@ -1977,6 +1987,7 @@ fn a_rate_limit_that_is_not_json_is_waited_out_from_its_headers_and_tried_once_m
     for _ in 0..2 {
         world.discord.script_raw("/channels/3002/typing", 429, "Retry-After: 2\r\nContent-Type: text/html\r\n", "<html>error code: 1015</html>");
     }
+    allow_typing(&world, &world.key("3002"));
     world.ask(Request::Typing { conversation: world.key("3002") });
     let typed = wait("the second attempt", || Some(world.discord.requests_to("POST", "/channels/3002/typing")).filter(|typed| typed.len() == 2));
     let waited = typed[1].at.duration_since(typed[0].at);
@@ -2387,6 +2398,7 @@ fn a_challenge_stops_every_request_and_shows_on_the_account() {
     let asked = world.discord.requests.lock().unwrap().len();
     world.send("3002", "1730000000000000042", "hello again", None);
     world.failure("3002", "1730000000000000042");
+    allow_typing(&world, &world.key("3002"));
     world.ask(Request::Typing { conversation: world.key("3002") });
     world.messages("3004");
     settled(&world);

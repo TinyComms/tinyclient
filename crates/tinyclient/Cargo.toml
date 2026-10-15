@@ -18,9 +18,11 @@ libc = { version = "0.2", optional = true }
 # Avatars are decoded at the size they are drawn. Both are already in the tree through GPUI.
 image = { version = "0.25", optional = true, default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 smallvec = { version = "1.6", optional = true }
+# Reads `mediad --devices` for Settings › Audio & video. Already in the tree through protocol.
+serde_json = { workspace = true, optional = true }
 
 [features]
-gui = ["dep:gpui", "dep:gpui_platform", "dep:unicode-segmentation", "dep:libc", "dep:image", "dep:smallvec"]
+gui = ["dep:gpui", "dep:gpui_platform", "dep:unicode-segmentation", "dep:libc", "dep:image", "dep:smallvec", "dep:serde_json"]
 # Adds `--shot out.png`: render the window to a file and quit, for design review without
 # Screen Recording permission. Pulls GPUI's test support, so it is not part of `gui`.
 gui-shot = ["gui", "gpui/test-support", "gpui_platform/test-support"]
