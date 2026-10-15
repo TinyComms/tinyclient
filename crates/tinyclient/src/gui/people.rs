@@ -40,6 +40,7 @@ mod status;
 
 pub use hub::{ask_later, Hub};
 
+use super::anim::Play;
 use super::components::Avatar;
 use super::composer::typing_preview;
 use super::layout::{RightKind, RightPane};
@@ -646,7 +647,10 @@ fn peer_of(conversation: &Conversation) -> Option<Key> {
 /// presence shape on its corner. Bots never carry one.
 fn person_avatar(hub: &Hub, person: &Person, size: f32, ring: &Ring, in_call: bool, cx: &mut gpui::App) -> Div {
     let picture = hub.avatar(&person.key.account(), person.avatar.as_ref(), cx);
-    let avatar = Avatar::new(&person.key, &person.name, size).image(picture.as_ref()).build();
+    // Only the profile card draws a person this large: there a moving picture plays as the
+    // autoplay setting says; in a list, under the pointer.
+    let play = if size >= info::profile::draw::AVATAR { Play::Inline } else { Play::Hover };
+    let avatar = Avatar::new(&person.key, &person.name, size).image(picture.as_ref()).playing(play).build();
     let shape = match (person.bot, in_call) {
         (true, _) => None,
         (false, true) => Some(Shape::InCall),

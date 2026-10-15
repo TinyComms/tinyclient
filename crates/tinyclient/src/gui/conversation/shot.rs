@@ -133,11 +133,14 @@ fn footprint() -> (f64, f64) {
 fn report(pane: &Pane, what: &str) {
     let (now, peak) = footprint();
     eprintln!(
-        "s5: {what}: footprint {now:.1} MB (highest {peak:.1} MB), {} messages held, pictures {:.1} MB (peak {:.1} MB, {} dropped)",
+        "s5: {what}: footprint {now:.1} MB (highest {peak:.1} MB), {} messages held, pictures {:.1} MB (peak {:.1} MB, {} dropped), frames here {:.1} MB, all moving pictures {:.1} MB, moving avatars {:.1} MB",
         pane.window.messages.len(),
         pane.images.bytes() as f64 / 1_048_576.,
         pane.images.peak as f64 / 1_048_576.,
         pane.images.evicted,
+        pane.images.frame_bytes() as f64 / 1_048_576.,
+        crate::gui::anim::MESSAGES.held() as f64 / 1_048_576.,
+        crate::gui::anim::AVATARS.held() as f64 / 1_048_576.,
     );
 }
 

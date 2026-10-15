@@ -4,6 +4,7 @@
 //! how it stays current), `layout`, `rail`, `sidebar`, `conversation`, `people`, `composer`,
 //! `call`. Each view keeps its own `State` in its own file; `state::Shell` only holds them.
 
+mod anim;
 mod app;
 mod assets;
 mod call;
@@ -200,7 +201,9 @@ fn bind_keys(cx: &mut App) {
 /// `--state starting|keychain|denied|reconnecting|failed` (a window state, forced),
 /// `--crash-toast` (the toast after a crash relaunch), `--menu row-right|row-bottom` (the row
 /// menu opened at the window's edges), `--text-step N`, `--start-chatd` (let the shot start
-/// chatd when it is not running; off by default so a shot leaves no process behind).
+/// chatd when it is not running; off by default so a shot leaves no process behind),
+/// `--autoplay always|hover|never` (when GIFs play), `--frames N` (N frames 150 ms apart, as
+/// `out-1.png` …, to see moving pictures move).
 #[cfg(feature = "gui-shot")]
 mod shot {
     use super::layout::{Menu, RightKind, RightPane};
@@ -223,6 +226,9 @@ mod shot {
     fn stage(shell: &mut Shell, step: usize, window: &mut Window, cx: &mut Context<Shell>) {
         match step {
             0 => {
+                if let Some(autoplay) = flag("--autoplay").and_then(|word| super::anim::Autoplay::from_word(&word)) {
+                    super::anim::set_autoplay(autoplay);
+                }
                 if let Some(how) = flag("--sign-in-failed") {
                     use protocol::ErrorCode;
                     let (code, detail) = match how.as_str() {
@@ -524,10 +530,24 @@ mod shot {
                 let _ = window.update(cx, |shell, _, cx| shell.travel(true, cx));
                 cx.background_executor().timer(settle).await;
             }
-            let image = window.update(cx, |_, window, _| window.render_to_image());
-            match image {
-                Ok(Ok(image)) => image.save(&path).expect("the screenshot is written"),
-                other => eprintln!("tinyclient: no screenshot: {:?}", other.map(|r| r.map(|_| ()))),
+            let frames = flag("--frames").and_then(|n| n.parse::<usize>().ok()).unwrap_or(1).max(1);
+            if frames > 1 {
+                super::anim::SHOT_FRAMES.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            for frame in 1..=frames {
+                let named = match (frames, path.rsplit_once('.')) {
+                    (1, _) => path.clone(),
+                    (_, Some((stem, extension))) => format!("{stem}-{frame}.{extension}"),
+                    (_, None) => format!("{path}-{frame}"),
+                };
+                // A frame drawn now, as a moving picture's timer would have the window drawn.
+                let _ = window.update(cx, |_, window, _| window.refresh());
+                cx.background_executor().timer(Duration::from_millis(150)).await;
+                let image = window.update(cx, |_, window, _| window.render_to_image());
+                match image {
+                    Ok(Ok(image)) => image.save(&named).expect("the screenshot is written"),
+                    other => eprintln!("tinyclient: no screenshot: {:?}", other.map(|r| r.map(|_| ()))),
+                }
             }
             // `--hold 20` keeps the window up so its memory can be measured from outside.
             if let Some(seconds) = flag("--hold").and_then(|n| n.parse::<u64>().ok()) {
@@ -594,6 +614,7 @@ pub fn run() {
     let prefs = app::prefs::read();
     theme::set_text_step(prefs.text_step);
     app::prefs::set_choices(prefs.choices);
+    anim::set_autoplay(prefs.autoplay);
     let application = gpui_platform::application().with_assets(assets::Assets);
     // The Dock icon brings the hidden window back unchanged.
     application.on_reopen(|cx| cx.activate(true));

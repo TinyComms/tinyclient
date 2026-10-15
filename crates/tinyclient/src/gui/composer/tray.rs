@@ -7,7 +7,8 @@ use super::picker::images::{Loaded, Picture};
 use super::Composer;
 use crate::gui::components::{glyph, menu, menu_item};
 use crate::gui::theme::{self, Type};
-use gpui::{anchored, deferred, Anchor, div, img, point, prelude::*, px, rgba, AnyElement, Context, Div, ImageSource, MouseButton, Rgba, Window};
+use crate::gui::anim::{self, Play};
+use gpui::{anchored, deferred, Anchor, div, point, prelude::*, px, rgba, AnyElement, Context, Div, MouseButton, ObjectFit, Rgba, Window};
 
 const THUMB: f32 = 64.;
 const CONTROL: f32 = 20.;
@@ -148,7 +149,7 @@ impl Composer {
 
     fn picture_chip(&self, chip: &Staged, picture: Picture, options: Options, cx: &mut Context<Self>) -> AnyElement {
         let shown = match picture {
-            Picture::Ready(image) => img(ImageSource::Render(image)).size(px(THUMB)).into_any_element(),
+            Picture::Ready(image) => div().size(px(THUMB)).child(anim::picture(image, ObjectFit::Contain, 0., Play::Inline)).into_any_element(),
             _ => div().size(px(THUMB)).bg(theme::raised()).into_any_element(),
         };
         let tags = tags(chip);

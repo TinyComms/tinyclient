@@ -12,13 +12,14 @@ use super::text::{Look, Rich, TextEvent};
 use super::tokens::{self, Metrics, MEASURE};
 use super::when;
 use super::{Pane, PaneEvent, Selection, Then};
+use crate::gui::anim::{self, Play};
 use crate::gui::components::{glyph, tip, Avatar, Shape};
 use crate::gui::theme::{self, Type};
 use crate::gui::time;
 use crate::view::{age, now};
 use gpui::{
-    canvas, div, img, prelude::*, px, Animation, AnimationExt, AnyElement, ClipboardItem, Context, Div, ElementId,
-    Hsla, ImageSource, MouseButton, ObjectFit, SharedString, Stateful, Window,
+    canvas, div, prelude::*, px, Animation, AnimationExt, AnyElement, ClipboardItem, Context, Div, ElementId,
+    Hsla, MouseButton, ObjectFit, SharedString, Stateful, Window,
 };
 use protocol::{Attachment, Card, Forwarded, Key, MediaFile, MentionKind, Message, MessageKind, Preview, SendState};
 use std::process::{Command, Stdio};
@@ -308,15 +309,9 @@ impl Pane {
             Shape::Place => (size * 0.25).round(),
         };
         let picture = file.and_then(|file| match self.still(file, edge, edge, Some(1.), cx) {
-            Picture::Ready(image) => Some(
-                img(ImageSource::Render(image))
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .size(px(size))
-                    .rounded(px(radius))
-                    .object_fit(ObjectFit::Cover),
-            ),
+            Picture::Ready(image) => {
+                Some(div().absolute().top_0().left_0().size(px(size)).child(anim::picture(image, ObjectFit::Cover, radius, Play::Hover)))
+            }
             _ => None,
         });
         plate.build().children(picture)
@@ -659,7 +654,7 @@ impl Pane {
         self.images.get(path, edge, crop, cx, Self::decoded)
     }
 
-    fn decoded(&mut self, loaded: super::images::Loaded, cx: &mut Context<Self>) {
+    pub(super) fn decoded(&mut self, loaded: super::images::Loaded, cx: &mut Context<Self>) {
         if self.images.store(loaded) {
             cx.notify();
         }
@@ -777,7 +772,7 @@ impl Pane {
                 Jumbo::Unicode(glyphs) => line.child(div().text_size(px(40.)).line_height(px(48.)).child(glyphs.clone())),
                 Jumbo::Custom { file, name } => {
                     match self.still(file, edge, edge, None, cx) {
-                        Picture::Ready(image) => line.child(img(ImageSource::Render(image)).size(px(40.)).flex_none()),
+                        Picture::Ready(image) => line.child(div().size(px(40.)).flex_none().child(anim::picture(image, ObjectFit::Contain, 0., Play::Inline))),
                         _ => line.child(div().type_body().text_color(theme::text_soft()).child(name.clone())),
                     }
                 }
@@ -1055,6 +1050,8 @@ impl Pane {
         let edge = media::decode_edge(natural, width, height, fit, window.scale_factor());
         let size = media::fetch_size(natural, width, height, fit, window.scale_factor());
         let crop = (fit == Fit::CoverTop).then_some(height / width);
+        // Whether the picture moves, and whether its frames are here to move in place.
+        let (mut moves, mut frames) = (false, false);
         let tile = match self.still(&still, size, edge, crop, cx) {
             Picture::Ready(image) => {
                 // A picture smaller than its box sits in the middle at its own size.
@@ -1066,14 +1063,11 @@ impl Pane {
                     _ => (width, height),
                 };
                 let object_fit = if fit == Fit::Contain { ObjectFit::Contain } else { ObjectFit::Cover };
+                frames = image.frame_count() > 1;
+                moves = self.images.moves(&image);
                 tile.child(
                     div().absolute().inset_0().flex().items_center().justify_center().child(
-                        img(ImageSource::Render(image))
-                            .w(px(wide))
-                            .h(px(tall))
-                            .flex_none()
-                            .object_fit(object_fit)
-                            .rounded(px(theme::R_CARD)),
+                        div().w(px(wide)).h(px(tall)).flex_none().child(anim::picture(image, object_fit, theme::R_CARD, Play::Inline)),
                     ),
                 )
             }
@@ -1084,11 +1078,24 @@ impl Pane {
             }
         };
 
-        // A video or GIF: what says it moves, and what a click does, are `video`'s.
+        // A video, or a GIF that is really an MP4: what says it moves, and what a click does,
+        // are `video`'s (`Pane::moving`, where an inline player plugs in). A GIF that is a GIF
+        // plays here in its tile, and opens in the viewer like a picture.
         let id = message.id.clone();
         let tile = match shape {
-            MediaShape::Gif | MediaShape::Video => self.moving(attachment, tile, cx),
-            _ => tile.on_click(cx.listener(move |this, _, window, cx| this.open_viewer(&id, index, window, cx))),
+            MediaShape::Video => self.moving(attachment, tile, cx),
+            MediaShape::Gif if media::is_video(attachment) => self.moving(attachment, tile, cx),
+            _ => {
+                // A GIF says so where it does not play by itself. One held still (the setting
+                // is Never, the network sent a still, or there was no room) shows that a click
+                // plays it: the viewer does.
+                let tile = match (shape == MediaShape::Gif || moves, frames) {
+                    (true, false) => tile.child(play_disc()).child(badge("GIF".to_owned()).left(px(6.))),
+                    (true, true) if anim::badged(Play::Inline) => tile.child(badge("GIF".to_owned()).left(px(6.))),
+                    _ => tile,
+                };
+                tile.on_click(cx.listener(move |this, _, window, cx| this.open_viewer(&id, index, window, cx)))
+            }
         };
         let tile = tile.child(edge_line()).children(more.map(|more| {
             div()
@@ -1116,7 +1123,7 @@ impl Pane {
             return self.load_box(sticker.rounded(px(theme::R_CARD)).bg(tokens::media_fill()), &still, "Sticker", 0, false, cx).into_any_element();
         }
         match self.still(&still, edge, edge, None, cx) {
-            Picture::Ready(image) => sticker.child(img(ImageSource::Render(image)).size_full().object_fit(ObjectFit::Contain)),
+            Picture::Ready(image) => sticker.child(anim::picture(image, ObjectFit::Contain, 0., Play::Inline)),
             Picture::Loading => sticker.child(in_box(Icon::Image, None)),
             Picture::Failed => self.failed_box(sticker, &still, false, cx),
         }
@@ -1300,7 +1307,7 @@ impl Pane {
         let holder = |id: &'static str, wide: f32, tall: f32, radius: f32| {
             div().id(id).relative().w(px(wide)).h(px(tall)).flex_none().rounded(px(radius)).bg(theme::hover()).overflow_hidden()
         };
-        let shown = |image, radius: f32| img(ImageSource::Render(image)).size_full().object_fit(ObjectFit::Cover).rounded(px(radius));
+        let shown = |image, radius: f32| anim::picture(image, ObjectFit::Cover, radius, Play::Inline);
         if large {
             let wide = self.media_width().min(416.);
             let tall = (wide * image.height as f32 / image.width.max(1) as f32).round().min(210.);
@@ -1359,7 +1366,7 @@ impl Pane {
         for (ix, reaction) in message.reactions.iter().take(CHIPS).enumerate() {
             let picture = match &reaction.file {
                 Some(file) => match self.still(file, edge, edge, None, cx) {
-                    Picture::Ready(image) => Some(img(ImageSource::Render(image)).size(px(18.)).flex_none().into_any_element()),
+                    Picture::Ready(image) => Some(div().size(px(18.)).flex_none().child(anim::picture(image, ObjectFit::Contain, 0., Play::Inline)).into_any_element()),
                     _ => None,
                 },
                 None => None,

@@ -21,20 +21,22 @@ mod table;
 // One decoder and one picture budget for the whole window, shared with the conversation.
 pub(in crate::gui) use crate::gui::conversation::images;
 
+use crate::frames;
+use crate::gui::anim::{self, Play};
 use crate::gui::components::{field, glyph, segment, segmented};
 use crate::gui::input::{self, InputEvent, InputGrid, InputKey, TextInput};
 use crate::gui::people::ask_later;
 use crate::gui::theme::{self, Type};
 use emoji::{Cell, Custom, Row, Sections, COLUMNS, TONES};
 use gpui::{
-    div, img, list, prelude::*, px, uniform_list, AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, ImageSource,
-    ListAlignment, ListOffset, ListState, ScrollStrategy, SharedString, Subscription, Task, UniformListScrollHandle, Window,
+    canvas, div, list, prelude::*, px, uniform_list, AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    ListAlignment, ListOffset, ListState, ObjectFit, ScrollStrategy, SharedString, Subscription, Task, UniformListScrollHandle, Window,
 };
 use kept::List as Kept;
 use images::{Images, Loaded, Picture};
-use protocol::{AccountKey, CatalogItem, CatalogKind, EmojiScope, ErrorCode, Key, MediaFile, MediaKind, Network, Pick, ReactionRules, Request, Response};
+use protocol::{AccountKey, CatalogItem, CatalogKind, EmojiScope, ErrorCode, Key, MediaFile, Network, Pick, ReactionRules, Request, Response};
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+
 use std::time::Duration;
 
 pub const WIDTH: f32 = 352.;
@@ -56,12 +58,6 @@ const STICKER_GAP: f32 = 3.;
 const LABEL: f32 = 24.;
 /// A GIF search waits for the keys to rest this long.
 const QUIET: Duration = Duration::from_millis(300);
-/// The pointer rests this long on a GIF before it plays.
-const REST: Duration = Duration::from_millis(300);
-/// A GIF whose frames decoded (width × height × 4 × frames) pass this stays a still.
-const PLAY_DECODED: u64 = 8 << 20;
-/// The most of a GIF's file read to count its frames; a larger file stays a still.
-const PLAY_READ: u64 = 32 << 20;
 
 /// One tab of the picker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -170,8 +166,6 @@ pub struct Picker {
     recent_stickers: Vec<String>,
     /// The GIF and sticker grid: rows of one height under labels of another.
     items_list: ListState,
-    playing: Option<PathBuf>,
-    rest: Option<Task<()>>,
     images: Images,
     /// Files asked for once, so a still that has not landed is not asked again each frame.
     fetched: HashSet<String>,
@@ -256,7 +250,6 @@ impl Picker {
         input.update(cx, |input, _| input.set_grid(true));
         // What it decoded goes with it.
         let released = cx.on_release_in(window, |this: &mut Picker, window, cx| {
-            this.stop_playing(cx);
             this.images.clear(window, cx);
         });
         window.focus(&input.focus_handle(cx), cx);
@@ -293,9 +286,8 @@ impl Picker {
             favorites,
             recent_stickers,
             items_list: ListState::new(0, ListAlignment::Top, px(GIF_ROW)),
-            playing: None,
-            rest: None,
-            images: Images::default(),
+            // Many cells show at once: each moving one holds little.
+            images: Images::with_limits(frames::SMALL),
             fetched: HashSet::new(),
             scroll: UniformListScrollHandle::new(),
             _listening: vec![changed, keys, grid, released],
@@ -332,7 +324,6 @@ impl Picker {
         if !self.setup.tabs.contains(&tab) {
             return;
         }
-        self.stop_playing(cx);
         self.tab = tab;
         self.select(None, cx);
         self.hovered = None;
@@ -746,46 +737,15 @@ impl Picker {
         }
     }
 
-    // GIF playback: one at a time, only the cell the pointer rests on.
+    // A GIF plays as the autoplay setting says (`anim`); the hovered cell shows its star.
 
     fn hover_item(&mut self, ix: usize, on: bool, cx: &mut Context<Self>) {
-        if !on {
-            if self.hovered_item == Some(ix) {
-                self.hovered_item = None;
-                self.rest = None;
-                self.stop_playing(cx);
-                cx.notify();
-            }
-            return;
-        }
-        self.hovered_item = Some(ix);
-        cx.notify();
-        let file = self.gifs.items.get(ix).and_then(|item| item.file.clone()).filter(|_| self.tab == Tab::Gifs);
-        let Some(path) = file.filter(|file| file.kind == MediaKind::Gif).and_then(|file| file.path) else {
-            return;
-        };
-        self.rest = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(REST).await;
-            // What its frames cost decoded decides, not the file's size: read off the main thread.
-            let read = path.clone();
-            let cost = cx.background_executor().spawn(async move { play_cost(Path::new(&read)) }).await;
-            if cost.is_none_or(|cost| cost > PLAY_DECODED) {
-                return;
-            }
-            let _ = this.update(cx, |this, cx| {
-                if this.hovered_item == Some(ix) && !cx.reduce_motion() {
-                    this.stop_playing(cx);
-                    this.playing = Some(PathBuf::from(path));
-                    cx.notify();
-                }
-            });
-        }));
-    }
-
-    fn stop_playing(&mut self, cx: &mut App) {
-        if let Some(path) = self.playing.take() {
-            // Its frames leave the asset cache with it.
-            ImageSource::from(path).remove_asset(cx);
+        if on {
+            self.hovered_item = Some(ix);
+            cx.notify();
+        } else if self.hovered_item == Some(ix) {
+            self.hovered_item = None;
+            cx.notify();
         }
     }
 
@@ -903,7 +863,7 @@ impl Picker {
     fn thumb(&mut self, path: &str, size: f32, glyph: Option<&str>, cx: &mut Context<Self>) -> AnyElement {
         let edge = (size * 2.).ceil() as u32;
         match self.images.get(path, edge, None, cx, Self::decoded) {
-            Picture::Ready(image) => img(ImageSource::Render(image)).size(px(size)).rounded(px(4.)).into_any_element(),
+            Picture::Ready(image) => div().size(px(size)).child(anim::picture(image, ObjectFit::Fill, 4., Play::Inline)).into_any_element(),
             _ => standin(glyph.unwrap_or(""), size),
         }
     }
@@ -961,7 +921,7 @@ impl Picker {
                         Cell::Custom(ix) => {
                             let path = self.customs.get(*ix as usize).and_then(|custom| custom.file.as_ref()?.path.clone());
                             match path.map(|path| self.images.get(&path, 48, None, cx, Self::decoded)) {
-                                Some(Picture::Ready(image)) => img(ImageSource::Render(image)).size(px(GLYPH)).into_any_element(),
+                                Some(Picture::Ready(image)) => div().size(px(GLYPH)).child(anim::picture(image, ObjectFit::Fill, 0., Play::Inline)).into_any_element(),
                                 _ => standin("", GLYPH),
                             }
                         }
@@ -1098,7 +1058,7 @@ impl Picker {
                                 // A neutral tile until the picture lands; never a cut-off name.
                                 match (path, custom) {
                                     (Some(path), _) => match self.images.get(&path, edge, None, cx, Self::decoded) {
-                                        Picture::Ready(image) => img(ImageSource::Render(image)).size(px(24.)).into_any_element(),
+                                        Picture::Ready(image) => div().size(px(24.)).child(anim::picture(image, ObjectFit::Fill, 0., Play::Inline)).into_any_element(),
                                         _ => standin("", 24.),
                                     },
                                     (None, Some(custom)) => {
@@ -1185,19 +1145,16 @@ impl Picker {
             let path = item.file.as_ref().and_then(|file| file.path.clone());
             let tile = || div().size_full().rounded(px(theme::R_CONTROL)).bg(theme::raised()).into_any_element();
             let picture = match (&path, &item.file) {
-                (Some(path), _) if gifs && hovered && self.playing.as_deref() == Some(Path::new(path)) => {
-                    img(PathBuf::from(path)).w(px(w)).h(px(h)).rounded(px(theme::R_CONTROL)).into_any_element()
-                }
                 (Some(path), _) => {
                     let edge = (w.max(h) * scale).ceil() as u32;
                     // Cover: the row's box keeps its height; the little a justified row
                     // stretches it by is cropped.
                     let crop = gifs.then_some(h / w);
                     match self.images.get(path, edge, crop, cx, Self::decoded) {
-                        Picture::Ready(image) => img(ImageSource::Render(image))
+                        Picture::Ready(image) => div()
                             .w(px(if gifs { w } else { STICKER - 8. }))
                             .h(px(if gifs { h } else { STICKER - 8. }))
-                            .rounded(px(theme::R_CONTROL))
+                            .child(anim::picture(image, ObjectFit::Fill, theme::R_CONTROL, Play::Inline))
                             .into_any_element(),
                         _ => tile(),
                     }
@@ -1333,51 +1290,6 @@ fn section_target(starts: &[usize], rows: &[usize], current: Option<usize>, down
     Some((target, first))
 }
 
-/// What a GIF's frames take decoded, width × height × 4 × frames, from its file; `None` when it
-/// is not a GIF or too large to read.
-fn play_cost(path: &Path) -> Option<u64> {
-    let bytes = std::fs::metadata(path).ok().filter(|meta| meta.len() <= PLAY_READ).and_then(|_| std::fs::read(path).ok())?;
-    let (width, height, frames) = gif_frames(&bytes)?;
-    Some(width as u64 * height as u64 * 4 * frames as u64)
-}
-
-/// A GIF's screen size and how many frames it has, by walking its blocks without decoding.
-fn gif_frames(bytes: &[u8]) -> Option<(u16, u16, u32)> {
-    if bytes.len() < 13 || !(bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")) {
-        return None;
-    }
-    let width = u16::from_le_bytes([bytes[6], bytes[7]]);
-    let height = u16::from_le_bytes([bytes[8], bytes[9]]);
-    let table = |packed: u8| if packed & 0x80 != 0 { 3usize << ((packed & 7) + 1) } else { 0 };
-    let mut at = 13 + table(bytes[10]);
-    // Data sub-blocks: a length byte, that many bytes, until a zero length.
-    let skip_blocks = |mut at: usize| -> Option<usize> {
-        loop {
-            let length = *bytes.get(at)? as usize;
-            at += 1;
-            if length == 0 {
-                return Some(at);
-            }
-            at += length;
-        }
-    };
-    let mut frames = 0u32;
-    loop {
-        match *bytes.get(at)? {
-            // Extension: its label, then its sub-blocks.
-            0x21 => at = skip_blocks(at + 2)?,
-            // Image: the descriptor, its colour table, the LZW code size, then its data.
-            0x2C => {
-                let packed = *bytes.get(at + 9)?;
-                at = skip_blocks(at + 10 + table(packed) + 1)?;
-                frames += 1;
-            }
-            0x3B => break,
-            _ => return None,
-        }
-    }
-    (frames > 0).then_some((width, height, frames))
-}
 
 /// GIFs in justified rows of one height: each keeps its shape, and a full row is stretched
 /// to the width, its stills cropped by the little it takes. With no query they sit under their
@@ -1487,6 +1399,7 @@ impl Focusable for Picker {
 impl Render for Picker {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.images.begin_frame();
+        let this = cx.entity();
         let tabs = self.tabs_band(cx);
         let strip = self.strip_band(cx);
         let bands = tabs.as_ref().map_or(6., |_| TABS) + SEARCH + strip.as_ref().map_or(0., |_| STRIP) + FOOTER;
@@ -1524,12 +1437,15 @@ impl Render for Picker {
             .children(strip)
             .child(grid)
             .child(self.footer_band(cx))
+            // After the cells are laid out: frames of cells scrolled away go.
+            .child(canvas(|_, _, _| (), move |_, (), window, cx| this.update(cx, |this, cx| this.images.sweep(window, cx))).absolute().size_0())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use protocol::MediaKind;
 
     fn gif(id: &str, w: u32, h: u32) -> CatalogItem {
         let file = MediaFile { width: w, height: h, ..MediaFile::new(id, MediaKind::Gif) };
@@ -1608,48 +1524,6 @@ mod tests {
         assert_eq!(section_target(&starts, &rows, Some(4), false), Some((0, 1)), "at a start: the one before");
         assert_eq!(section_target(&starts, &rows, None, false), None);
         assert_eq!(section_target(&[], &rows, Some(4), true), Some((7, 7)), "no sections: the end");
-    }
-
-    /// A GIF of `frames` frames of `w` × `h`, as encoders write one: header, global table,
-    /// a loop extension, then per frame a graphic control extension and an image.
-    fn gif_file(w: u16, h: u16, frames: u32) -> Vec<u8> {
-        let mut out = b"GIF89a".to_vec();
-        out.extend(w.to_le_bytes());
-        out.extend(h.to_le_bytes());
-        out.extend([0x80, 0, 0]); // a global table of two colours
-        out.extend([0, 0, 0, 255, 255, 255]);
-        out.extend([0x21, 0xFF, 11]);
-        out.extend(b"NETSCAPE2.0");
-        out.extend([3, 1, 0, 0, 0]);
-        for _ in 0..frames {
-            out.extend([0x21, 0xF9, 4, 0, 10, 0, 0, 0]);
-            out.push(0x2C);
-            out.extend([0, 0, 0, 0]);
-            out.extend(w.to_le_bytes());
-            out.extend(h.to_le_bytes());
-            out.push(0);
-            out.extend([2, 2, 0x4C, 0x01, 0]); // code size, one data block, end
-        }
-        out.push(0x3B);
-        out
-    }
-
-    #[test]
-    fn a_gif_plays_only_when_its_frames_decoded_fit_eight_megabytes() {
-        assert_eq!(gif_frames(&gif_file(220, 160, 30)), Some((220, 160, 30)));
-        assert_eq!(gif_frames(b"\x89PNG\r\n\x1a\n0000000"), None);
-        assert_eq!(gif_frames(&gif_file(220, 160, 30)[..40]), None, "a cut-off file is not counted");
-        let dir = std::env::temp_dir().join(format!("tinyclient-picker-gif-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        // 220 × 160 × 4 × 30 = 4.2 MB: plays. 498 × 280 × 4 × 20 = 11.2 MB: a small file, still.
-        let (small, large) = (dir.join("small.gif"), dir.join("large.gif"));
-        std::fs::write(&small, gif_file(220, 160, 30)).unwrap();
-        std::fs::write(&large, gif_file(498, 280, 20)).unwrap();
-        assert!(play_cost(&small).is_some_and(|cost| cost <= PLAY_DECODED));
-        assert!(play_cost(&large).is_some_and(|cost| cost > PLAY_DECODED));
-        assert!(std::fs::metadata(&large).unwrap().len() < 4 << 20, "the file alone would have let it play");
-        assert_eq!(play_cost(&dir.join("gone.gif")), None);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

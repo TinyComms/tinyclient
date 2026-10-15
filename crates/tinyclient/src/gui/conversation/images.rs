@@ -1,15 +1,20 @@
 //! Pictures for the rows on screen. A file is decoded off the main thread, by the system's own
 //! decoder, straight to the size it is shown at: a 4000 px photo in a 198 pt tile costs 0.6 MB,
-//! not 48. Only the first frame of an animated file is ever read, at most [`DECODES`] files are
-//! being read at once, and a row that scrolled away before its turn is never read at all. What
-//! scrolls away is dropped once the total passes [`BUDGET`].
+//! not 48. A moving picture (GIF, WebP, APNG) is decoded to frames at that size too, within
+//! its [`Limits`] and the window's [`anim::MESSAGES`] budget, and keeps only its first frame
+//! once it scrolls away. At most [`DECODES`] files are being read at once, and a row that
+//! scrolled away before its turn is never read at all. Stills that scroll away are dropped once
+//! the total passes [`BUDGET`].
 
+use crate::frames::{self, Limits};
+use crate::gui::anim::{self, Play};
 use gpui::{App, Context, RenderImage, Window};
 use image::{Frame, ImageBuffer};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// Most decoded bytes held. Pictures on screen are never dropped to get under it.
 pub const BUDGET: usize = 32 * 1024 * 1024;
@@ -249,6 +254,50 @@ fn render_image(decoded: Decoded) -> Option<Arc<RenderImage>> {
     Some(Arc::new(RenderImage::new(vec![Frame::new(buffer)])))
 }
 
+/// Whether a picture moves, and whether its frames are held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Moves {
+    No,
+    /// Every kept frame is held, paid for from [`anim::MESSAGES`].
+    Playing,
+    /// It moves, but only its first frame is held: it will not play here, it was off screen,
+    /// or there was no room.
+    Still,
+}
+
+/// The largest file read whole to look for frames. A moving picture that large is drawn still.
+const MOST_READ: u64 = 32 << 20;
+
+/// Reads the picture at `path` for the window: its frames, at most `limits`, when it moves and
+/// they are wanted and fit in the budget; else its first frame.
+pub fn load(path: &Path, edge: u32, crop: Option<f32>, frames: Option<Limits>) -> Option<(Arc<RenderImage>, Moves)> {
+    let moving = std::fs::metadata(path)
+        .ok()
+        .filter(|meta| meta.len() <= MOST_READ && might_move(path))
+        .and_then(|_| std::fs::read(path).ok())
+        .filter(|bytes| frames::sniff(bytes).is_some());
+    if let (Some(bytes), Some(limits)) = (&moving, frames) {
+        if let Some(image) = frames::decode(bytes, edge, crop, limits).filter(|found| anim::MESSAGES.take(found.bytes())).and_then(anim::render_image) {
+            return Some((image, Moves::Playing));
+        }
+    }
+    // The first frame, by the same reader a still picture uses.
+    let still = decode(path, edge, crop).and_then(render_image)?;
+    Some((still, if moving.is_some() { Moves::Still } else { Moves::No }))
+}
+
+/// Whether the start of a file says it may move: a GIF, a WebP marked animated, a PNG with an
+/// animation chunk before its pixels. Only those are read whole.
+fn might_move(path: &Path) -> bool {
+    use std::io::Read;
+    let mut head = vec![0u8; 4096];
+    let read = std::fs::File::open(path).and_then(|mut file| file.read(&mut head)).unwrap_or(0);
+    let head = &head[..read];
+    head.starts_with(b"GIF8")
+        || (head.starts_with(b"RIFF") && head.get(8..16) == Some(b"WEBPVP8X") && head.get(20).is_some_and(|flags| flags & 0x02 != 0))
+        || (head.starts_with(b"\x89PNG") && head.windows(4).take_while(|chunk| *chunk != b"IDAT").any(|chunk| chunk == b"acTL"))
+}
+
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct Slot {
     path: Arc<str>,
@@ -268,30 +317,49 @@ impl Slot {
 /// What a decode produced, to hand back to [`Images::store`].
 pub struct Loaded {
     slot: Slot,
-    image: Option<Arc<RenderImage>>,
+    image: Option<(Arc<RenderImage>, Moves)>,
 }
 
 enum Held {
     /// Asked for; `asked` is the last draw that wanted it.
     Loading { asked: u64 },
     Failed,
-    Ready { image: Arc<RenderImage>, bytes: usize, used: u64 },
+    Ready {
+        image: Arc<RenderImage>,
+        /// Bytes counted against [`BUDGET`]; frames are counted in [`anim::MESSAGES`].
+        bytes: usize,
+        used: u64,
+        moves: Moves,
+        /// Its frames are being read again, last asked for at this draw.
+        upgrading: Option<u64>,
+        /// No sooner than this: the last try found no room.
+        retry: Option<Instant>,
+    },
 }
 
 /// The decoded pictures of one pane.
-#[derive(Default)]
 pub struct Images {
     held: HashMap<Slot, Held>,
     bytes: usize,
     /// Counts draws, to tell what is on screen now from what was.
     frame: u64,
-    /// Waiting for a turn to be decoded, oldest ask first.
-    queue: VecDeque<Slot>,
+    /// Waiting for a turn to be decoded, oldest ask first, and whether its frames are wanted.
+    queue: VecDeque<(Slot, bool)>,
     decoding: usize,
+    /// What one moving picture here may hold.
+    limits: Limits,
+    /// First frames that stood in for an animation, whose textures go at the next sweep.
+    dropped: Vec<Arc<RenderImage>>,
     /// Pictures dropped to stay under the budget, for measuring.
     pub evicted: usize,
     /// The most bytes ever held at once, for measuring.
     pub peak: usize,
+}
+
+impl Default for Images {
+    fn default() -> Images {
+        Images::with_limits(frames::MESSAGE)
+    }
 }
 
 pub enum Picture {
@@ -300,7 +368,25 @@ pub enum Picture {
     Failed,
 }
 
+/// How long a moving picture that found no room waits before it asks again.
+const RETRY: Duration = Duration::from_secs(1);
+
 impl Images {
+    /// A cache whose moving pictures each hold at most `limits`: a picker's cells are small.
+    pub fn with_limits(limits: Limits) -> Images {
+        Images {
+            held: HashMap::new(),
+            bytes: 0,
+            frame: 0,
+            queue: VecDeque::new(),
+            decoding: 0,
+            limits,
+            dropped: Vec::new(),
+            evicted: 0,
+            peak: 0,
+        }
+    }
+
     pub fn begin_frame(&mut self) {
         self.frame += 1;
     }
@@ -310,15 +396,30 @@ impl Images {
         self.bytes
     }
 
+    /// Bytes of frames held here, for measuring.
+    #[cfg_attr(not(feature = "gui-shot"), allow(dead_code))]
+    pub fn frame_bytes(&self) -> usize {
+        self.held.values().map(|held| match held {
+            Held::Ready { image, moves: Moves::Playing, .. } => anim::bytes_of(image),
+            _ => 0,
+        }).sum()
+    }
+
     /// Nothing is waiting to be decoded or being decoded.
     #[cfg_attr(not(feature = "gui-shot"), allow(dead_code))]
     pub fn settled(&self) -> bool {
         self.decoding == 0 && self.queue.is_empty()
     }
 
-    /// The picture at `path`, `edge` pixels on its longer side. The first ask queues the decode
-    /// for a background thread; `landed` is told when it is done, and must hand the result to
-    /// [`Images::store`] and call [`Images::pump`].
+    /// Whether the picture decoded as `image` moves, held whole or not: what wears a GIF badge.
+    pub fn moves(&self, image: &RenderImage) -> bool {
+        image.frame_count() > 1
+            || self.held.values().any(|held| matches!(held, Held::Ready { image: held, moves: Moves::Still, .. } if held.id == image.id))
+    }
+
+    /// The picture at `path`, `edge` pixels on its longer side, playing as messages do. The
+    /// first ask queues the decode for a background thread; `landed` is told when it is done,
+    /// and must hand the result to [`Images::store`] and call [`Images::pump`].
     pub fn get<T: 'static>(
         &mut self,
         path: &str,
@@ -327,12 +428,37 @@ impl Images {
         cx: &mut Context<T>,
         landed: fn(&mut T, Loaded, &mut Context<T>),
     ) -> Picture {
+        self.get_to(path, edge, crop, Play::Inline, cx, landed)
+    }
+
+    /// [`Images::get`] for a place that plays differently: the viewer plays what it opens.
+    pub fn get_to<T: 'static>(
+        &mut self,
+        path: &str,
+        edge: u32,
+        crop: Option<f32>,
+        play: Play,
+        cx: &mut Context<T>,
+        landed: fn(&mut T, Loaded, &mut Context<T>),
+    ) -> Picture {
         let slot = Slot::new(path, edge, crop);
         let frame = self.frame;
+        let wants = anim::wants_frames(play);
         match self.held.get_mut(&slot) {
-            Some(Held::Ready { image, used, .. }) => {
+            Some(Held::Ready { image, used, moves, upgrading, retry, .. }) => {
                 *used = frame;
-                return Picture::Ready(image.clone());
+                let image = image.clone();
+                // Back on screen, or room again: its frames are read once more, and its
+                // first frame stands in meanwhile.
+                let due = retry.is_none_or(|at| at <= Instant::now());
+                if *moves == Moves::Still && wants && due && anim::MESSAGES.room(image.as_bytes(0).map_or(0, <[u8]>::len) * 2) {
+                    if upgrading.is_none() {
+                        self.queue.push_back((slot, true));
+                    }
+                    *upgrading = Some(frame);
+                    self.pump(cx, landed);
+                }
+                return Picture::Ready(image);
             }
             Some(Held::Loading { asked }) => {
                 *asked = frame;
@@ -345,7 +471,7 @@ impl Images {
             None => {}
         }
         self.held.insert(slot.clone(), Held::Loading { asked: frame });
-        self.queue.push_back(slot);
+        self.queue.push_back((slot, wants));
         self.pump(cx, landed);
         Picture::Loading
     }
@@ -369,25 +495,28 @@ impl Images {
     /// queued is skipped: its row scrolled away, and asking again queues it again.
     pub fn pump<T: 'static>(&mut self, cx: &mut Context<T>, landed: fn(&mut T, Loaded, &mut Context<T>)) {
         while self.decoding < DECODES {
-            let Some(slot) = self.queue.pop_front() else {
+            let Some((slot, wants)) = self.queue.pop_front() else {
                 return;
             };
-            match self.held.get(&slot) {
-                Some(Held::Loading { asked }) if *asked + 1 >= self.frame => {}
+            match self.held.get_mut(&slot) {
+                Some(Held::Loading { asked } | Held::Ready { upgrading: Some(asked), .. }) if *asked + 1 >= self.frame => {}
                 Some(Held::Loading { .. }) => {
                     self.held.remove(&slot);
+                    continue;
+                }
+                Some(Held::Ready { upgrading, .. }) => {
+                    *upgrading = None;
                     continue;
                 }
                 _ => continue,
             }
             self.decoding += 1;
+            let limits = self.limits;
             cx.spawn(async move |this, cx| {
                 let (file, edge) = (slot.path.clone(), slot.edge);
                 let crop = (slot.crop > 0).then(|| slot.crop as f32 / 1000.);
-                let image = cx
-                    .background_executor()
-                    .spawn(async move { decode(Path::new(&*file), edge, crop).and_then(render_image) })
-                    .await;
+                let frames = wants.then_some(limits);
+                let image = cx.background_executor().spawn(async move { load(Path::new(&*file), edge, crop, frames) }).await;
                 let _ = this.update(cx, |this, cx| landed(this, Loaded { slot, image }, cx));
             })
             .detach();
@@ -398,15 +527,45 @@ impl Images {
     pub fn store(&mut self, loaded: Loaded) -> bool {
         let Loaded { slot, image } = loaded;
         self.decoding = self.decoding.saturating_sub(1);
-        if !matches!(self.held.get(&slot), Some(Held::Loading { .. })) {
-            return false;
+        let upgrade = match self.held.get(&slot) {
+            Some(Held::Loading { .. }) => false,
+            Some(Held::Ready { upgrading: Some(_), .. }) => true,
+            _ => {
+                // Nobody waits for it: its frames go back.
+                if let Some((image, Moves::Playing)) = &image {
+                    anim::MESSAGES.give(anim::bytes_of(image));
+                    anim::forget(image);
+                }
+                return false;
+            }
+        };
+        if upgrade {
+            match image {
+                Some((image, Moves::Playing)) => {
+                    // The first frame that stood in goes; its texture with it at the next sweep.
+                    if let Some(Held::Ready { image: old, bytes, .. }) = self.held.remove(&slot) {
+                        self.bytes -= bytes;
+                        self.dropped.push(old);
+                    }
+                    self.held.insert(slot, Held::Ready { image, bytes: 0, used: self.frame, moves: Moves::Playing, upgrading: None, retry: None });
+                }
+                _ => {
+                    if let Some(Held::Ready { upgrading, retry, .. }) = self.held.get_mut(&slot) {
+                        *upgrading = None;
+                        *retry = Some(Instant::now() + RETRY);
+                    }
+                }
+            }
+            return true;
         }
         let held = match image {
-            Some(image) => {
-                let bytes = image.as_bytes(0).map_or(0, <[u8]>::len);
+            Some((image, moves)) => {
+                let bytes = if moves == Moves::Playing { 0 } else { image.as_bytes(0).map_or(0, <[u8]>::len) };
                 self.bytes += bytes;
                 self.peak = self.peak.max(self.bytes);
-                Held::Ready { image, bytes, used: self.frame }
+                // A moving picture that found no room tries again a little later.
+                let retry = (moves == Moves::Still).then(|| Instant::now() + RETRY);
+                Held::Ready { image, bytes, used: self.frame, moves, upgrading: None, retry }
             }
             None => Held::Failed,
         };
@@ -414,9 +573,31 @@ impl Images {
         true
     }
 
-    /// After a draw: drops pictures that are no longer on screen, oldest first, until the total
-    /// is back under the budget. Their textures go with them.
+    /// After a draw: lets go of the frames of every moving picture that is no longer on
+    /// screen, keeping its first frame, then drops stills that are no longer on screen, oldest
+    /// first, until the total is back under the budget. Their textures go with them.
     pub fn sweep(&mut self, window: &mut Window, cx: &mut App) {
+        for image in self.dropped.drain(..) {
+            cx.drop_image(image, Some(window));
+        }
+        let gone: Vec<Slot> = self
+            .held
+            .iter()
+            .filter_map(|(slot, held)| match held {
+                Held::Ready { used, moves: Moves::Playing, .. } if *used < self.frame => Some(slot.clone()),
+                _ => None,
+            })
+            .collect();
+        for slot in gone {
+            let Some(Held::Ready { image, used, .. }) = self.held.remove(&slot) else { continue };
+            let still = anim::first_frame(&image);
+            self.drop_frames(image, window, cx);
+            if let Some(still) = still {
+                let bytes = still.as_bytes(0).map_or(0, <[u8]>::len);
+                self.bytes += bytes;
+                self.held.insert(slot, Held::Ready { image: still, bytes, used, moves: Moves::Still, upgrading: None, retry: None });
+            }
+        }
         if self.bytes <= BUDGET {
             return;
         }
@@ -438,10 +619,21 @@ impl Images {
         }
     }
 
+    /// An animation's frames leave the window and the budget.
+    fn drop_frames(&mut self, image: Arc<RenderImage>, window: &mut Window, cx: &mut App) {
+        anim::MESSAGES.give(anim::bytes_of(&image));
+        anim::forget(&image);
+        cx.drop_image(image, Some(window));
+    }
+
     fn drop_slot(&mut self, slot: &Slot, window: &mut Window, cx: &mut App) {
-        if let Some(Held::Ready { image, bytes, .. }) = self.held.remove(slot) {
+        if let Some(Held::Ready { image, bytes, moves, .. }) = self.held.remove(slot) {
             self.bytes -= bytes;
-            cx.drop_image(image, Some(window));
+            if moves == Moves::Playing {
+                self.drop_frames(image, window, cx);
+            } else {
+                cx.drop_image(image, Some(window));
+            }
         }
     }
 
@@ -468,6 +660,9 @@ impl Images {
         for slot in slots {
             self.drop_slot(&slot, window, cx);
         }
+        for image in self.dropped.drain(..) {
+            cx.drop_image(image, Some(window));
+        }
         self.held.clear();
         self.queue.clear();
     }
@@ -478,9 +673,40 @@ impl Images {
     }
 }
 
+impl Drop for Images {
+    /// A pane or picker that goes without clearing still gives its frames back.
+    fn drop(&mut self) {
+        for held in self.held.values() {
+            if let Held::Ready { image, moves: Moves::Playing, .. } = held {
+                anim::MESSAGES.give(anim::bytes_of(image));
+                anim::forget(image);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fixture(name: &str) -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name)
+    }
+
+    #[test]
+    fn a_moving_picture_is_read_for_frames_only_when_they_are_wanted() {
+        // Only these are read whole: a GIF, a WebP marked animated, a PNG with an animation chunk.
+        assert!(might_move(&fixture("forever.gif")) && might_move(&fixture("twice.webp")) && might_move(&fixture("apng.png")));
+        assert!(!might_move(&fixture("still.webp")));
+        let (playing, moves) = load(&fixture("forever.gif"), 16, None, Some(frames::SMALL)).unwrap();
+        assert_eq!((playing.frame_count(), moves, playing.size(0).width.0), (4, Moves::Playing, 16));
+        anim::MESSAGES.give(anim::bytes_of(&playing));
+        // Not wanted (the setting is Never): its first frame, known to move.
+        let (still, moves) = load(&fixture("apng.png"), 16, None, None).unwrap();
+        assert_eq!((still.frame_count(), moves), (1, Moves::Still));
+        let (plain, moves) = load(&fixture("still.webp"), 16, None, Some(frames::SMALL)).unwrap();
+        assert_eq!((plain.frame_count(), moves), (1, Moves::No));
+    }
 
     #[test]
     fn a_missing_or_unreadable_file_is_no_picture() {
