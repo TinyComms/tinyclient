@@ -360,10 +360,13 @@ pub(super) fn dock(shell: &Shell, _: &mut Window, cx: &mut Context<Shell>) -> Op
 }
 
 impl Shell {
-    /// The speaker picked in the call's device menu in this window, which a voice message plays
-    /// through too. `None` follows the system default.
+    /// The speaker picked in the call's device menu in this window, else Settings' speaker (V2),
+    /// which a voice message plays through too. `None` follows the system default.
     pub(super) fn chosen_output(&self) -> Option<String> {
-        self.call_state.output.clone().flatten()
+        match &self.call_state.output {
+            Some(picked) => picked.clone(),
+            None => super::app::prefs::values().device(protocol::settings::OUTPUT),
+        }
     }
 
     /// Offered every change chatd reports, after `Shell` has applied its own part.
