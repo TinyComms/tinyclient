@@ -71,7 +71,27 @@
         </tbody>
       </table>
     </div>
-    <p>Method: install each app from its vendor&rsquo;s official macOS installer, then run <code>du -sh</code> on the <code>.app</code> bundle. Slack and Telegram ship universal binaries (Apple silicon and Intel in one app); tinyclient&rsquo;s figure is its Apple silicon build, <code>tinyclient.app</code> from the release zip. We compare size on disk only: we have not measured the official apps&rsquo; memory.</p>
+    <p>Method: install each app from its vendor&rsquo;s official macOS installer, then run <code>du -sh</code> on the <code>.app</code> bundle. Slack and Telegram ship universal binaries (Apple silicon and Intel in one app); tinyclient&rsquo;s figure is its Apple silicon build, <code>tinyclient.app</code> from the release zip. The Apple silicon Slack disk image measured the same day is 323&nbsp;MB; the 554&nbsp;MB row is the universal build.</p>
+
+    <h2 id="memory">Memory while running</h2>
+    <p>One reading, all six signed in with a window open, on this Mac: Apple M3 Pro, 18&nbsp;GB of RAM, macOS 26.7.1 (25G241), 14&nbsp;October 2026. Slack, Discord and Telegram had been open about four minutes, each with a conversation on screen. Teams had been up 5&nbsp;hours, Signal 11&nbsp;hours, tinyclient 1&nbsp;hour.</p>
+    <div class="table-wrap" tabindex="0" role="region" aria-label="Memory while signed in">
+      <table>
+        <caption>Physical footprint is the sum of <code>phys_footprint</code> from <code>footprint</code>, which is the number Activity Monitor calls Memory. Resident is the sum of <code>ps -o rss</code>. CPU is the sum of CPU time over the next 60 seconds, as a percent of one core.</caption>
+        <thead><tr><th scope="col">App</th><th scope="col">Processes</th><th scope="col">Footprint</th><th scope="col">Resident</th><th scope="col">CPU</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">Microsoft Teams</th><td class="num">14</td><td class="num">1,807 MB</td><td class="num">328 MB</td><td class="num">0.4%</td></tr>
+          <tr><th scope="row">Slack 4.52.178</th><td class="num">7</td><td class="num">808 MB</td><td class="num">356 MB</td><td class="num">0.4%</td></tr>
+          <tr><th scope="row">Discord 0.0.415</th><td class="num">7</td><td class="num">677 MB</td><td class="num">329 MB</td><td class="num">2.5%</td></tr>
+          <tr><th scope="row">Signal 8.30.0</th><td class="num">6</td><td class="num">579 MB</td><td class="num">170 MB</td><td class="num">3.3%</td></tr>
+          <tr><th scope="row">Telegram 13.0</th><td class="num">1</td><td class="num">138 MB</td><td class="num">113 MB</td><td class="num">0.7%</td></tr>
+          <tr><th scope="row">The five together</th><td class="num">35</td><td class="num">3.9 GB</td><td class="num">1.3 GB</td><td class="num">7.3%</td></tr>
+          <tr><th scope="row">tinyclient 0.1.0, all five networks</th><td class="num">2</td><td class="num">145 MB</td><td class="num">42 MB</td><td class="num">0.5%</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>Of tinyclient&rsquo;s 145&nbsp;MB, the window was 123&nbsp;MB and <code>chatd</code> was 23&nbsp;MB. Almost all of its CPU was <code>chatd</code>. Teams&rsquo; footprint is one WebView renderer at 1,228&nbsp;MB plus helpers. Most of Teams, Slack, Discord and Signal is compressed: 1,686&nbsp;MB, 695&nbsp;MB, 548&nbsp;MB and 495&nbsp;MB. The Teams audio driver, 9&nbsp;MB resident, is in the resident column and not in the footprint, because <code>footprint</code> could not read it.</p>
+    <p>Before Slack, Discord and Telegram were open, tinyclient was 260&nbsp;MB of footprint and 69&nbsp;MB resident, over the 150&nbsp;MB target. With all five official apps running it was 145&nbsp;MB. A minute after this table, Slack&rsquo;s footprint was still 808&nbsp;MB and Telegram&rsquo;s was 143&nbsp;MB. Discord&rsquo;s footprint was 632&nbsp;MB and its resident memory had risen to 523&nbsp;MB, so that row was still moving.</p>
 
     <h2 id="processes">Four programs, each only when needed</h2>
     <div class="table-wrap" tabindex="0" role="region" aria-label="Memory by process">
