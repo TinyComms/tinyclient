@@ -26,6 +26,13 @@ all_answer() { # dir
     for program in $programs; do answers "$program" "$1/$program"; done
 }
 
+# The libraries opened with dlopen (packaging/linux.sh), which --version never loads.
+loadable() {
+    for soname in libvulkan.so.1 libwayland-client.so.0; do
+        ldconfig -p | grep -q "^[[:space:]]*$soname " || { echo "smoke.sh: $soname was not installed" >&2; exit 1; }
+    done
+}
+
 case ${1:?usage: smoke.sh deb|deb-full|rpm} in
 deb|deb-full)
     export DEBIAN_FRONTEND=noninteractive
@@ -34,6 +41,7 @@ deb|deb-full)
     dpkg -s tinyclient | sed -n '/^Depends/p;/^Recommends/p'
     answers tinyclient /usr/bin/tinyclient
     all_answer /usr/lib/tinyclient
+    loadable
     test -f /usr/share/icons/hicolor/256x256/apps/$id.png
     test -f /usr/share/doc/tinyclient/copyright
     if [ "$1" = deb-full ]; then
@@ -94,6 +102,7 @@ rpm)
     rpm -qR tinyclient | head -50
     answers tinyclient /usr/bin/tinyclient
     all_answer /usr/lib/tinyclient
+    loadable
     # Listed rather than looked for: container images install without docs and licences (nodocs).
     rpm -ql tinyclient | grep -qx /usr/share/licenses/tinyclient/AGPL-3.0.txt
     rpm -e tinyclient

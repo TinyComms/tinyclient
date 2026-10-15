@@ -87,15 +87,17 @@ bins=
 for program in $programs; do bins="$bins $usr/lib/tinyclient/$program"; done
 # shellcheck disable=SC2086
 linked=$(for b in $bins; do objdump -p "$b" | awk '$1 == "NEEDED" { print $2 }'; done | sort -u)
-# Opened with dlopen at run time, so no NEEDED entry names it: GPUI's Vulkan loader.
-opened="libvulkan.so.1"
+# Opened with dlopen at run time, so no NEEDED entry names them: wgpu's Vulkan loader, and the
+# Wayland client library (GPUI loads it only in a Wayland session). wgpu's GL fallback (libEGL,
+# libwayland-egl) is left to the system: Vulkan is what it draws with.
+opened="libvulkan.so.1 libwayland-client.so.0"
 # shellcheck disable=SC2086
 glibc=$(for b in $bins; do objdump -T "$b"; done | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)
 echo "linux.sh: linked: $(echo "$linked" | tr "\n" " ")"
 echo "linux.sh: opened at run time: $opened"
 # What else the programs name that could be opened at run time, for whoever revises `opened`.
 # shellcheck disable=SC2086
-echo "linux.sh: other library names in the programs: $(strings $bins | grep -oE '^lib[A-Za-z0-9_+-]+\.so(\.[0-9]+)*$' | sort -u | grep -vxF "$linked" | tr '\n' ' ')"
+echo "linux.sh: other library names in the programs: $(strings $bins | grep -oE 'lib[A-Za-z0-9_+-]+\.so(\.[0-9]+)*' | sort -u | grep -vxF "$linked" | tr '\n' ' ')"
 echo "linux.sh: newest glibc symbol: $glibc"
 
 # .deb: dpkg-shlibdeps reads the libraries' symbols files for the lowest versions that will do.
