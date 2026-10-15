@@ -489,11 +489,12 @@ fn a_ring_we_placed_is_not_a_call_until_the_other_side_answers_whatever_our_medi
 fn the_microphone_test_outside_a_call_meters_ten_times_a_second_and_its_mediad_leaves_when_it_stops() {
     let _turn = alone();
     let (hub, dir) = hub();
-    let seq = hub.seq();
     assert!(hub.calls.test_microphone(&hub, true).is_ok());
     assert_eq!(mediads(), 1, "one mediad, for the test");
+    // Counted from here: looking for mediad can take a second on Windows, and the levels told
+    // meanwhile would make five seem to come at once.
     let mut levels = Vec::new();
-    let mut since = seq;
+    let mut since = hub.seq();
     let began = Instant::now();
     while levels.len() < 5 {
         assert!(began.elapsed() < PATIENCE, "no levels");
