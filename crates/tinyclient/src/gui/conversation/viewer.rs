@@ -324,7 +324,9 @@ impl Pane {
                     }
                     #[cfg(windows)]
                     {
-                        std::process::Command::new("cmd").args(["/C", "start", "", &path])
+                        let mut command = std::process::Command::new("cmd");
+                        protocol::launch::no_console(command.args(["/C", "start", "", &path]));
+                        command
                     }
                 }
                 .status();

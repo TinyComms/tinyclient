@@ -125,7 +125,7 @@ struct Tester {
 impl Tester {
     fn start(hub: &Arc<Hub>, id: u64) -> io::Result<Tester> {
         let path = mediad_path()?;
-        let mut child = Command::new(&path).arg("test").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
+        let mut child = protocol::launch::no_console(Command::new(&path).arg("test")).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
         let stdin = child.stdin.take();
         let mut stdout = BufReader::new(child.stdout.take().expect("stdout is piped"));
         let reader = hub.clone();
@@ -338,7 +338,7 @@ impl Live {
 impl ActiveCall {
     fn start(hub: &Arc<Hub>, id: u64, conversation: Key) -> io::Result<ActiveCall> {
         let path = mediad_path()?;
-        let spawned = Command::new(&path).arg("1").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn();
+        let spawned = protocol::launch::no_console(Command::new(&path).arg("1")).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn();
         let mut child = spawned.map_err(|err| {
             eprintln!("chatd: could not run {}: {err}", path.display());
             io::Error::other(ENGINE_MISSING)

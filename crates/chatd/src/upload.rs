@@ -556,6 +556,10 @@ pub fn allowed(path: &str) -> Result<(PathBuf, bool), String> {
 
 /// Places a file to send never comes from, by their real path.
 fn forbidden(real: &Path) -> bool {
+    #[cfg(windows)]
+    if windows_places::Places::here().refuse(&real.to_string_lossy()) {
+        return true;
+    }
     let support = protocol::support_dir();
     let own = support.canonicalize().unwrap_or(support);
     if real.starts_with(&own) {
@@ -576,6 +580,95 @@ fn forbidden(real: &Path) -> bool {
     // A hidden directory (`~/.ssh`, `~/.config`), not a hidden file the user picked.
     let hidden_dir = first.as_deref().is_some_and(|first| first.starts_with('.')) && parts.next().is_some();
     hidden_dir || first.as_deref() == Some("Library")
+}
+
+/// Windows's places a file to send never comes from, mirroring `forbidden`'s Unix ones: tinyclient's
+/// own folder, the system's secrets (`System32\config` for `/etc`), the profile's hidden folders
+/// (`%USERPROFILE%\.ssh`), and AppData for `~/Library`, whose credentials, DPAPI keys and browser
+/// profiles are named again in case AppData is moved. Paths compare case-insensitively, as
+/// Windows does.
+#[cfg(any(windows, test))]
+mod windows_places {
+    /// A path folded for comparing: no `\\?\`, `\` between parts, lower case, no `\` at the end.
+    pub fn fold(path: &str) -> String {
+        let path = match path.strip_prefix(r"\\?\UNC\") {
+            Some(share) => format!(r"\\{share}"),
+            None => path.strip_prefix(r"\\?\").unwrap_or(path).to_owned(),
+        };
+        path.replace('/', "\\").trim_end_matches('\\').to_lowercase()
+    }
+
+    /// Whether folded `path` is `dir` or inside it; `C:\a\bc` is not inside `C:\a\b`.
+    fn under(path: &str, dir: &str) -> bool {
+        !dir.is_empty() && path.strip_prefix(dir).is_some_and(|rest| rest.is_empty() || rest.starts_with('\\'))
+    }
+
+    /// The places, each folded once.
+    pub struct Places {
+        /// Never, whatever else holds: tinyclient's own, the system's and the browsers' secrets.
+        never: Vec<String>,
+        /// AppData, the way `~/Library` is: never, except below `temp`.
+        app_data: Vec<String>,
+        /// The temporary folder, inside AppData\Local: what Explorer unpacks from a zip to send
+        /// lands there.
+        temp: Vec<String>,
+        /// `%USERPROFILE%`, for its hidden folders.
+        profile: Option<String>,
+    }
+
+    impl Places {
+        pub fn new(never: &[String], app_data: &[String], temp: &[String], profile: Option<&str>) -> Places {
+            let folded = |dirs: &[String]| dirs.iter().map(|dir| fold(dir)).filter(|dir| !dir.is_empty()).collect();
+            Places {
+                never: folded(never),
+                app_data: folded(app_data),
+                temp: folded(temp),
+                profile: profile.map(fold).filter(|dir| !dir.is_empty()),
+            }
+        }
+
+        /// This user's, from the environment, by real path where the folder is there.
+        #[cfg(windows)]
+        pub fn here() -> Places {
+            use std::path::PathBuf;
+            let real = |path: PathBuf| path.canonicalize().unwrap_or(path).to_string_lossy().into_owned();
+            let var = |name: &str| std::env::var_os(name).map(PathBuf::from).filter(|dir| dir.is_absolute());
+            let profile = var("USERPROFILE");
+            let roaming = var("APPDATA").or_else(|| profile.as_ref().map(|dir| dir.join(r"AppData\Roaming")));
+            let local = var("LOCALAPPDATA").or_else(|| profile.as_ref().map(|dir| dir.join(r"AppData\Local")));
+            let system = var("SystemRoot").unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+            let mut never = vec![real(protocol::support_dir()), real(system.join(r"System32\config"))];
+            let within = |base: &Option<PathBuf>, parts: &[&str]| -> Vec<String> {
+                base.iter().flat_map(|base| parts.iter().map(move |part| real(base.join(part)))).collect()
+            };
+            never.extend(within(&roaming, &[r"Microsoft\Credentials", r"Microsoft\Protect", r"Microsoft\Crypto", r"Mozilla\Firefox"]));
+            never.extend(within(&local, &[r"Microsoft\Credentials", r"Google\Chrome\User Data", r"Microsoft\Edge\User Data", r"Mozilla\Firefox"]));
+            let app_data: Vec<String> = [profile.as_ref().map(|dir| dir.join("AppData")), roaming, local].into_iter().flatten().map(real).collect();
+            let temp: Vec<String> = [var("TEMP"), var("TMP"), Some(std::env::temp_dir())].into_iter().flatten().map(real).collect();
+            Places::new(&never, &app_data, &temp, profile.map(real).as_deref())
+        }
+
+        /// Whether the file at real path `real` must not be sent.
+        pub fn refuse(&self, real: &str) -> bool {
+            let real = fold(real);
+            // The device namespace, as `/dev` is.
+            if real.starts_with(r"\\.\") {
+                return true;
+            }
+            if self.never.iter().any(|dir| under(&real, dir)) {
+                return true;
+            }
+            if self.app_data.iter().any(|dir| under(&real, dir)) && !self.temp.iter().any(|dir| under(&real, dir)) {
+                return true;
+            }
+            let Some(inside) = self.profile.as_deref().and_then(|profile| real.strip_prefix(profile)).and_then(|rest| rest.strip_prefix('\\')) else {
+                return false;
+            };
+            // A hidden folder (`.ssh`, `.aws`), not a hidden file the user picked.
+            let mut parts = inside.split('\\').filter(|part| !part.is_empty());
+            parts.next().is_some_and(|first| first.starts_with('.')) && parts.next().is_some()
+        }
+    }
 }
 
 /// Whether the network takes uploads at this address. Never plain HTTP, except a test's own
@@ -720,5 +813,57 @@ mod tests {
         assert!(!uploads_to(Network::Slack, "http://files.slack.com/upload/v1/abc"));
         assert!(!uploads_to(Network::Slack, "https://files.slack.com.example.org/upload"));
         assert!(!uploads_to(Network::Telegram, "https://core.telegram.org/x"));
+    }
+
+    #[test]
+    fn windows_places_are_matched_by_real_path_whatever_the_case() {
+        let owned = |dirs: &[&str]| dirs.iter().map(|dir| dir.to_string()).collect::<Vec<_>>();
+        let places = windows_places::Places::new(
+            &owned(&[r"C:\Users\Me\AppData\Roaming\tinyclient", r"C:\Windows\System32\config", r"D:\Moved\Microsoft\Credentials"]),
+            &owned(&[r"\\?\C:\Users\Me\AppData\", r"D:\Moved"]),
+            &owned(&[r"C:\Users\Me\AppData\Local\Temp"]),
+            Some(r"C:\Users\Me"),
+        );
+        for refused in [
+            r"\\?\C:\Users\me\appdata\roaming\TINYCLIENT\chat.sqlite",
+            r"C:\WINDOWS\system32\CONFIG\SAM",
+            r"C:\Users\Me\.ssh\id_ed25519",
+            r"c:/users/me/.aws/credentials",
+            r"C:\Users\Me\AppData\Local\Google\Chrome\User Data\Default\Cookies",
+            r"C:\Users\Me\AppData\Roaming\Microsoft\Protect\S-1-5\key",
+            r"D:\moved\microsoft\credentials\blob",
+            r"D:\Moved\Mozilla\Firefox\Profiles\x\logins.json",
+            r"\\.\PhysicalDrive0",
+        ] {
+            assert!(places.refuse(refused), "{refused} is refused");
+        }
+        for sent in [
+            r"\\?\C:\Users\Me\Documents\notes.txt",
+            r"C:\Users\Me\.bashrc",
+            r"C:\Users\Me\AppDataX\notes.txt",
+            r"C:\Users\Me\AppData\Local\Temp\Temp1_photos.zip\cat.png",
+            r"C:\Windows\System32\configuration.txt",
+            r"\\?\UNC\server\share\report.pdf",
+        ] {
+            assert!(!places.refuse(sent), "{sent} may be sent");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_secrets_are_refused_and_a_picked_file_is_not() {
+        let var = |name: &str| PathBuf::from(std::env::var_os(name).unwrap());
+        let real = |path: PathBuf| path.canonicalize().unwrap_or(path);
+        assert!(forbidden(&real(var("SystemRoot").join(r"System32\config\SAM"))));
+        assert!(forbidden(&real(var("USERPROFILE")).join(r".ssh\id_ed25519")));
+        assert!(forbidden(&real(var("APPDATA")).join(r"Microsoft\Credentials\blob")));
+        assert!(forbidden(&real(var("LOCALAPPDATA")).join(r"Microsoft\Edge\User Data\Default\Login Data")));
+        let upper = real(var("APPDATA")).to_string_lossy().to_uppercase();
+        assert!(forbidden(Path::new(&format!(r"{upper}\Microsoft\Protect\key"))), "{upper} in capitals");
+        let picked = std::env::temp_dir().join(format!("tinyclient-picked-{}.txt", std::process::id()));
+        std::fs::write(&picked, b"hello").unwrap();
+        let answer = allowed(&picked.to_string_lossy());
+        std::fs::remove_file(&picked).unwrap();
+        assert!(answer.is_ok(), "{answer:?}");
     }
 }

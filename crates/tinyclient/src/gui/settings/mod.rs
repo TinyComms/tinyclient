@@ -801,7 +801,7 @@ fn mediad_path() -> std::path::PathBuf {
 
 /// The system's devices, by the names a call takes. `None` when mediad could not say.
 fn read_devices() -> Option<Devices> {
-    let output = std::process::Command::new(mediad_path()).arg("--devices").stderr(std::process::Stdio::null()).output().ok()?;
+    let output = protocol::launch::no_console(std::process::Command::new(mediad_path()).arg("--devices")).stderr(std::process::Stdio::null()).output().ok()?;
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
     let names = |key: &str| -> Vec<String> {
         json[key].as_array().into_iter().flatten().filter_map(|name| name.as_str().map(str::to_owned)).take(protocol::DEVICES_LIMIT).collect()

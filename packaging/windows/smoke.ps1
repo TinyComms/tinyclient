@@ -1,5 +1,5 @@
 # Installs dist\tinyclient-<Label>-windows-x86_64-setup.exe silently for the current user, checks
-# that the programs run, the Start menu entry and the Apps & features entry exist, then uninstalls
+# that the programs run (tinyclient.exe as a windowed program that still prints --version), the Start menu entry and the Apps & features entry exist, then uninstalls
 # silently and checks that nothing is left. Then checks the portable zip. The release workflow
 # runs it after packaging/windows.ps1.
 param(
@@ -19,6 +19,43 @@ function Assert-Answers([string]$Dir) {
     }
 }
 
+# The Start menu entry opens no console beside the window: tinyclient.exe is a Windows GUI
+# program. The PE optional header, 24 bytes past "PE\0\0", has Subsystem at 68: 2 GUI, 3 console.
+function Assert-Windowed([string]$Dir) {
+    $exe = Join-Path $Dir "tinyclient.exe"
+    $bytes = [System.IO.File]::ReadAllBytes($exe)
+    $pe = [BitConverter]::ToInt32($bytes, 0x3C)
+    if ([BitConverter]::ToUInt32($bytes, $pe) -ne 0x4550) { throw "$exe is not a PE file" }
+    $subsystem = [BitConverter]::ToUInt16($bytes, $pe + 24 + 68)
+    Write-Host "tinyclient.exe subsystem: $subsystem"
+    if ($subsystem -ne 2) { throw "tinyclient.exe is not a GUI program (subsystem $subsystem)" }
+
+    # Run in a console with nothing redirected, --version still prints there: it borrows the
+    # console it was started from. A PowerShell in a console of its own runs it, then copies
+    # what its console shows to a file.
+    $out = Join-Path $env:RUNNER_TEMP "tinyclient-console.txt"
+    $script = Join-Path $env:RUNNER_TEMP "tinyclient-console.ps1"
+    Remove-Item -Force $out -ErrorAction SilentlyContinue
+    Set-Content -Path $script -Value @'
+param([string]$Exe, [string]$Out)
+& $Exe --version
+# PowerShell does not wait for a GUI program whose output it does not read.
+Start-Sleep -Seconds 3
+$raw = $Host.UI.RawUI
+$rect = New-Object System.Management.Automation.Host.Rectangle 0, 0, ($raw.BufferSize.Width - 1), $raw.CursorPosition.Y
+$cells = $raw.GetBufferContents($rect)
+$lines = for ($y = 0; $y -le $cells.GetUpperBound(0); $y++) {
+    -join (0..$cells.GetUpperBound(1) | ForEach-Object { $cells[$y, $_].Character })
+}
+Set-Content -Path $Out -Value $lines
+'@
+    $shell = (Get-Process -Id $PID).Path
+    Start-Process -FilePath $shell -ArgumentList "-NoProfile", "-File", "`"$script`"", "`"$exe`"", "`"$out`"" -Wait
+    $shown = @(Get-Content $out | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    Write-Host "tinyclient.exe --version in a console: $($shown -join ' | ')"
+    if ($shown -notcontains "tinyclient $Version") { throw "tinyclient.exe --version printed nothing to the console it ran in" }
+}
+
 $setup = Join-Path $root "dist\$name-setup.exe"
 $log = Join-Path $env:RUNNER_TEMP "tinyclient-setup.log"
 $p = Start-Process -FilePath $setup -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CURRENTUSER", "/LOG=`"$log`"" -Wait -PassThru
@@ -27,6 +64,7 @@ if ($p.ExitCode -ne 0) { Get-Content $log; throw "setup exited $($p.ExitCode)" }
 # Per user: no administrator, so it lands under %LOCALAPPDATA%\Programs.
 $app = Join-Path $env:LOCALAPPDATA "Programs\tinyclient"
 Assert-Answers $app
+Assert-Windowed $app
 $shortcut = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\tinyclient.lnk"
 if (-not (Test-Path $shortcut)) { throw "no Start menu entry at $shortcut" }
 $target = (New-Object -ComObject WScript.Shell).CreateShortcut($shortcut).TargetPath

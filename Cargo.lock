@@ -4928,6 +4928,7 @@ name = "login"
 version = "0.2.2"
 dependencies = [
  "block2 0.6.2",
+ "embed-resource",
  "getrandom 0.3.4",
  "objc2 0.6.5",
  "objc2-app-kit 0.3.2",
@@ -9069,6 +9070,7 @@ dependencies = [
 name = "tinyclient"
 version = "0.2.2"
 dependencies = [
+ "embed-resource",
  "gpui",
  "gpui_platform",
  "image",
@@ -9077,6 +9079,7 @@ dependencies = [
  "serde_json",
  "smallvec",
  "unicode-segmentation",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

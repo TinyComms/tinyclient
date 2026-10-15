@@ -122,7 +122,7 @@ impl Player {
     /// Runs `mediad --play` for the slot's file, from the slot's place.
     fn spawn(&self, hub: &Arc<Hub>, slot: &Slot, generation: u64) -> io::Result<ChildStdin> {
         let shown = slot.shown.as_ref().expect("a file to play");
-        let mut child = Command::new(mediad_path()?).arg("--play").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
+        let mut child = protocol::launch::no_console(Command::new(mediad_path()?).arg("--play")).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
         let mut stdin = child.stdin.take().expect("stdin is piped");
         let mut stdout = BufReader::new(child.stdout.take().expect("stdout is piped"));
         let open = PlayerRequest::Open {

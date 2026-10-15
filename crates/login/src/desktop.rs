@@ -61,6 +61,12 @@ pub fn run(site: Site, at: Option<(f64, f64)>, network: &str) {
     if let Some((x, y)) = at {
         builder = builder.with_position(LogicalPosition::new(x - SIZE.0 / 2., y - SIZE.1 / 2.));
     }
+    // The icon build.rs puts in the .exe; tao's window has none of its own.
+    #[cfg(windows)]
+    {
+        use tao::platform::windows::IconExtWindows;
+        builder = builder.with_window_icon(tao::window::Icon::from_resource(1, None).ok());
+    }
     let window = builder.build(&event_loop).expect("window");
 
     let state = Arc::new(Mutex::new(State {
