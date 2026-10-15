@@ -183,6 +183,16 @@ rpm:
   summary: One small native app for Slack, Discord, Telegram, Teams and Signal
   group: Applications/Internet
 contents:
+  # The package's own directories, so rpm removes them with it (dpkg would anyway).
+  - dst: /usr/lib/tinyclient
+    type: dir
+    file_info:
+      mode: 0755
+  - dst: /usr/share/licenses/tinyclient
+    type: dir
+    file_info:
+      mode: 0755
+    packager: rpm
   - src: /usr/lib/tinyclient/tinyclient
     dst: /usr/bin/tinyclient
     type: symlink

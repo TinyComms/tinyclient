@@ -103,10 +103,9 @@ rpm)
     answers tinyclient /usr/bin/tinyclient
     all_answer /usr/lib/tinyclient
     loadable
-    # Listed rather than looked for: container images install without docs and licences (nodocs).
-    rpm -ql tinyclient | grep -qx /usr/share/licenses/tinyclient/AGPL-3.0.txt
+    rpm -qlp "./$base.rpm" | grep -x /usr/share/licenses/tinyclient/AGPL-3.0.txt
     rpm -e tinyclient
-    test ! -e /usr/lib/tinyclient
+    test ! -e /usr/lib/tinyclient || { ls -la /usr/lib/tinyclient; exit 1; }
     ;;
 *)
     echo "smoke.sh: unknown check $1" >&2
