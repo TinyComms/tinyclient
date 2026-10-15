@@ -299,6 +299,8 @@ hr { border: 0; border-top: 1px solid var(--line); margin: 0; }
   font-size: 14px;
   color: var(--faint);
 }
+/* The Linux formats, shown under the first line to Linux visitors (site.js). */
+.platforms + .platforms { margin-top: 4px; }
 
 .notice {
   display: flex;

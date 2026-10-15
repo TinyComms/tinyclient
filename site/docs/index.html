@@ -57,43 +57,83 @@
 
 
     <h2 id="download">Download</h2>
-    <p>Every release is built by GitHub Actions from a <code>v*</code> tag (<a href="https://github.com/itz4blitz/tinyclient/blob/main/.github/workflows/release.yml"><code>release.yml</code></a>). The links below always fetch the latest one; <a href="/download/checksums">SHA256SUMS</a> lists each archive&rsquo;s checksum.</p>
-    <div class="table-wrap" tabindex="0" role="region" aria-label="Release archives">
+    <p>Every release is built by GitHub Actions from a <code>v*</code> tag (<a href="https://github.com/itz4blitz/tinyclient/blob/main/.github/workflows/release.yml"><code>release.yml</code></a>), and every package is installed and started on a clean system there before the release is published. The links below always fetch the latest release.</p>
+    <div class="table-wrap" tabindex="0" role="region" aria-label="Downloads">
       <table>
-        <thead><tr><th scope="col">System</th><th scope="col">Archive</th><th scope="col">Contents</th></tr></thead>
+        <thead><tr><th scope="col">System</th><th scope="col">Download</th><th scope="col">What it is</th></tr></thead>
         <tbody>
-          <tr><th scope="row">macOS 13 or later, Apple silicon</th><td><a href="/download/macos"><code>…-macos.zip</code></a></td><td><code>tinyclient.app</code>, with all four programs inside</td></tr>
-          <tr><th scope="row">Linux x86_64</th><td><a href="/download/linux"><code>…-linux-x86_64.tar.gz</code></a></td><td><code>tinyclient</code>, <code>chatd</code>, <code>mediad</code>, <code>tinyclient-login</code></td></tr>
-          <tr><th scope="row">Windows x86_64</th><td><a href="/download/windows"><code>…-windows-x86_64.zip</code></a></td><td>The same four programs as <code>.exe</code> files</td></tr>
+          <tr><th scope="row">macOS 13 or later, Apple silicon</th><td><a href="/download/macos"><code>.dmg</code></a> or <a href="/download/macos-zip"><code>.zip</code></a></td><td><code>tinyclient.app</code>, to drag to Applications</td></tr>
+          <tr><th scope="row">Debian, Ubuntu</th><td><a href="/download/deb"><code>.deb</code></a> (<a href="/download/deb-arm64">arm64</a>)</td><td>A package for apt, with a menu entry</td></tr>
+          <tr><th scope="row">Fedora, openSUSE</th><td><a href="/download/rpm"><code>.rpm</code></a> (<a href="/download/rpm-arm64">arm64</a>)</td><td>A package for dnf or zypper, with a menu entry</td></tr>
+          <tr><th scope="row">Any Linux</th><td><a href="/download/appimage"><code>.AppImage</code></a> (<a href="/download/appimage-arm64">arm64</a>)</td><td>One file that runs without installing</td></tr>
+          <tr><th scope="row">Any Linux</th><td><a href="/download/linux-tar"><code>.tar.gz</code></a> (<a href="/download/linux-tar-arm64">arm64</a>)</td><td>The four programs and <code>install.sh</code></td></tr>
+          <tr><th scope="row">Windows 10 or 11, x86_64</th><td><a href="/download/windows"><code>-setup.exe</code></a></td><td>An installer that needs no administrator</td></tr>
+          <tr><th scope="row">Windows, portable</th><td><a href="/download/windows-portable"><code>.zip</code></a></td><td>The four programs, run where you unpack them</td></tr>
         </tbody>
       </table>
     </div>
-    <p>Keep the four programs together in one directory: each finds the others beside itself. You start only <code>tinyclient</code>; it starts <code>chatd</code> when nothing answers on its socket, and <code>chatd</code> starts the other two when they are needed.</p>
+    <p>Linux files are for x86_64 unless they say arm64; on arm64 the names carry <code>aarch64</code> where these carry <code>x86_64</code>.</p>
+
+    <h3 id="verify">Check a download</h3>
+    <p><a href="/download/checksums">SHA256SUMS</a> lists every file&rsquo;s checksum. Put it beside the download and run:</p>
+<div class="code"><pre><code>sha256sum -c --ignore-missing SHA256SUMS  <span class="c"># Linux</span>
+shasum -a 256 -c --ignore-missing SHA256SUMS  <span class="c"># macOS</span>
+Get-FileHash tinyclient-windows-x86_64-setup.exe  <span class="c"># Windows: compare with its line in SHA256SUMS</span></code></pre></div>
 
     <h2 id="macos">macOS</h2>
     <ol>
-      <li>Unzip the archive and move <code>tinyclient.app</code> to Applications.</li>
+      <li>Open the disk image and drag <code>tinyclient</code> to <strong>Applications</strong>. The <code>.zip</code> holds the same app.</li>
       <li>Open it. The app is signed ad hoc, not notarized by Apple, so macOS refuses it the first time.</li>
       <li>Open <strong>System Settings &rsaquo; Privacy &amp; Security</strong>, find the message about tinyclient and choose <strong>Open Anyway</strong>, if you trust the build.</li>
     </ol>
     <p>Open the app rather than the programs inside it. macOS grants the microphone to an app bundle, so a call needs the bundle.</p>
     <p>On first start, <code>chatd</code> reads your sign-ins from the login keychain. If macOS asks, allow it; until then the window says it is waiting for permission and shows what is cached.</p>
+    <p>To upgrade, replace the app with the new one. To remove it, quit tinyclient and move the app to the Trash.</p>
 
     <h2 id="linux">Linux</h2>
-<div class="code"><pre><code>tar -xzf tinyclient-*-linux-x86_64.tar.gz
-./tinyclient</code></pre></div>
+    <p>Choose the format for your distribution. All of them need glibc 2.35 or later: Ubuntu 22.04, Debian 12, Fedora 38 or newer. The <code>.deb</code> and <code>.rpm</code> bring in the libraries tinyclient uses; with the AppImage and the <code>.tar.gz</code> they must already be there: GTK 3, WebKitGTK 4.1, ALSA, OpenSSL 3 and Vulkan, which a desktop with a web browser usually has.</p>
+
+    <h3 id="deb">Debian and Ubuntu</h3>
+<div class="code"><pre><code>sudo apt install ./tinyclient-linux-x86_64.deb
+sudo apt remove tinyclient  <span class="c"># to remove it</span></code></pre></div>
+
+    <h3 id="rpm">Fedora and openSUSE</h3>
+<div class="code"><pre><code>sudo dnf install ./tinyclient-linux-x86_64.rpm  <span class="c"># Fedora</span>
+sudo zypper install --allow-unsigned-rpm ./tinyclient-linux-x86_64.rpm  <span class="c"># openSUSE</span>
+sudo dnf remove tinyclient  <span class="c"># to remove it; zypper remove on openSUSE</span></code></pre></div>
+    <p>The packages are not in a repository and not signed, so nothing updates them: install a newer download the same way to upgrade.</p>
+
+    <h3 id="appimage">AppImage</h3>
+<div class="code"><pre><code>chmod +x tinyclient-linux-x86_64.AppImage
+./tinyclient-linux-x86_64.AppImage</code></pre></div>
+    <p>Nothing is installed; delete the file to remove it. It mounts itself with FUSE (the <code>fuse3</code> package); without FUSE, add <code>--appimage-extract-and-run</code>. If it does not start, install WebKitGTK 4.1: <code>libwebkit2gtk-4.1-0</code> on Debian and Ubuntu, <code>webkit2gtk4.1</code> on Fedora.</p>
+
+    <h3 id="tar">Any distribution: the .tar.gz</h3>
+<div class="code"><pre><code>tar -xzf tinyclient-linux-x86_64.tar.gz
+cd tinyclient
+./install.sh  <span class="c"># for you, in ~/.local; no root</span>
+sudo ./install.sh --system  <span class="c"># or for everyone, in /usr/local</span></code></pre></div>
+    <p><code>install.sh</code> puts the four programs in <code>lib/tinyclient</code>, <code>tinyclient</code> in <code>bin</code>, and adds the menu entry and icons. Run it from a newer download to upgrade. To remove it, run <code>~/.local/lib/tinyclient/install.sh --uninstall</code>, or <code>sudo /usr/local/lib/tinyclient/install.sh --uninstall --system</code>. You can also skip it and run <code>./tinyclient</code> where you unpacked it.</p>
+
+    <h3 id="linux-notes">On every distribution</h3>
     <ul>
       <li>Sign-ins are kept in the Secret Service (GNOME Keyring or KWallet), which has to be running. Without it, <code>chatd</code> refuses to sign anyone in rather than keep a session it would lose.</li>
-      <li>The sign-in window needs WebKitGTK 4.1. The window itself needs Vulkan, and Wayland or X11.</li>
+      <li>The window needs Vulkan, and Wayland or X11.</li>
       <li>Linux builds are tested in CI and have had far less hands-on use than macOS. Reports are welcome.</li>
     </ul>
 
     <h2 id="windows">Windows</h2>
+    <ol>
+      <li>Run <code>tinyclient-windows-x86_64-setup.exe</code>. It installs for you only, in <code>%LOCALAPPDATA%\Programs\tinyclient</code>, without asking for an administrator, and adds tinyclient to the Start menu.</li>
+      <li>The installer is not code-signed, so SmartScreen may say <strong>Windows protected your PC</strong>. Choose <strong>More info &rsaquo; Run anyway</strong>, if you trust the build.</li>
+    </ol>
     <ul>
-      <li>Extract the zip into one folder and run <code>tinyclient.exe</code>.</li>
-      <li>The programs are not code-signed, so SmartScreen may warn you before the first run.</li>
+      <li>To upgrade, run a newer installer. To remove tinyclient, use <strong>Settings &rsaquo; Apps &rsaquo; Installed apps</strong>.</li>
+      <li>For a scripted install: <code>tinyclient-windows-x86_64-setup.exe /VERYSILENT /CURRENTUSER</code>.</li>
+      <li>The portable <code>.zip</code> needs no installing: unpack it into one folder and run <code>tinyclient.exe</code>; delete the folder to remove it.</li>
       <li>The sign-in window needs WebView2, which current Windows includes. Sign-ins are kept in Windows Credential Manager.</li>
     </ul>
+    <p>However it is installed, the four programs stay together in one folder: each finds the others beside itself. You start only <code>tinyclient</code>; it starts <code>chatd</code> when nothing answers on its socket, and <code>chatd</code> starts the other two when they are needed.</p>
 
     <h2 id="sign-in">Sign in</h2>
     <p>Press <strong>Sign in</strong> beside a network. Each network has its own way in:</p>
@@ -126,7 +166,7 @@
 
     <h2 id="sign-out">Sign out and remove</h2>
     <p>Signing out of an account ends its session on the network where the network allows it, then deletes its credential item, its cached messages and its media. Signing out of Signal removes the linked device from your account.</p>
-    <p>To remove tinyclient completely: sign out of each account, quit, delete the app or the four programs, and delete the data directory above. The sign-in window keeps its own browser data so an interrupted sign-in can resume; on Linux and Windows it is in <code>tinyclient/login/</code> under the same parent directory, and on macOS it is a WebKit data store of its own.</p>
+    <p>To remove tinyclient completely: sign out of each account, quit, uninstall it as above for the way you installed it, and delete the data directory above. The sign-in window keeps its own browser data so an interrupted sign-in can resume; on Linux and Windows it is in <code>tinyclient/login/</code> under the same parent directory, and on macOS it is a WebKit data store of its own.</p>
 
     <h2 id="text">Without a window</h2>
     <p><code>tinyclient --text</code>, or any build without the <code>gui</code> feature, prints account status and the inbox as lines of text and exits. An interactive terminal interface is not built yet.</p>
