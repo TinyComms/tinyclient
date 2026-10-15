@@ -39,6 +39,11 @@ gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "cb13b37a
 # `--version` and `--text` print to the terminal from a windowed program. Already in the tree.
 windows-sys = { version = "0.61", optional = true, features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console"] }
 
+# The icon, in the .exe: Explorer, the taskbar and the window (GPUI loads resource 1) show it.
+# Already in the tree.
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3"
+
 # Wayland and X11 are features of their own, off without default features: without them the
 # window cannot open at all ("the environment names no allowed Wayland or X11 display server").
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]

@@ -25,3 +25,7 @@ wry = "0.57"
 tao = "0.37"
 sha2 = "0.10"
 getrandom = "0.3"
+
+# The icon, in the .exe (build.rs). Already in the tree.
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3"
