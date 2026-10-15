@@ -279,7 +279,7 @@ put together. Where the rest of the documentation lives:
 | Document | What it answers |
 | --- | --- |
 | [`docs/architecture.md`](docs/architecture.md) | How the processes fit, the socket contract, where data lives, what an adapter must do |
-| [`docs/stories.md`](docs/stories.md) and [`docs/product/`](docs/product) | What is in the product and what is cut, per area; budgets and account risk |
+| [`docs/stories.md`](docs/stories.md) and [`docs/product/`](docs/product) | What is in the product and what is not built yet, per area; budgets and account risk |
 | [`docs/design.md`](docs/design.md) and [`docs/design/`](docs/design) | The visual system, with an HTML mockup per area in `docs/design/mockups/` |
 
 ## License
