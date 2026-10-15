@@ -1145,12 +1145,12 @@ caption {
 .vseg.s4 { flex: 346 1 0;  background: #229ed9; min-width: 74px; animation-delay: .32s; }
 .vseg.mine { flex: 0 0 1.77%; min-width: 6px; background: var(--accent); box-shadow: 0 0 18px var(--accent); border-radius: 0 6px 6px 0; animation-delay: .6s; }
 .mem .vseg { flex-grow: 0; flex-shrink: 0; border-right: 0; }
-.mem .vseg.slack { flex-basis: 100%; background: #4a154b; }
-.mem .vseg.discord { flex-basis: 92.4%; background: #5865f2; }
-.mem .vseg.teams { flex-basis: 92.1%; background: #5b5fc7; }
-.mem .vseg.signal { flex-basis: 47.8%; background: #3a76f0; }
-.mem .vseg.telegram { flex-basis: 31.7%; background: #229ed9; }
-.mem .vseg.mine { flex-basis: 11.8%; min-width: 8px; }
+.mem .vseg.teams { flex-basis: 100%; background: #5b5fc7; }
+.mem .vseg.slack { flex-basis: 98.9%; background: #4a154b; }
+.mem .vseg.discord { flex-basis: 98.9%; background: #5865f2; }
+.mem .vseg.signal { flex-basis: 60.2%; background: #3a76f0; }
+.mem .vseg.telegram { flex-basis: 24.1%; background: #229ed9; }
+.mem .vseg.mine { flex-basis: 15.2%; min-width: 8px; }
 @keyframes grow { from { transform: scaleX(0); } to { transform: scaleX(1); } }
 .fine-note { margin: 22px auto 0; font-size: 13px; color: var(--faint); }
 @media (max-width: 600px) {

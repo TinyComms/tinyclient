@@ -74,24 +74,23 @@
     <p>Method: install each app from its vendor&rsquo;s official macOS installer, then run <code>du -sh</code> on the <code>.app</code> bundle. Slack and Telegram ship universal binaries (Apple silicon and Intel in one app); tinyclient&rsquo;s figure is its Apple silicon build, <code>tinyclient.app</code> from the release zip. The Apple silicon Slack disk image measured the same day is 323&nbsp;MB; the 554&nbsp;MB row is the universal build.</p>
 
     <h2 id="memory">Memory while running</h2>
-    <p>One reading, all six signed in with a window open, on this Mac: Apple M3 Pro, 18&nbsp;GB of RAM, macOS 26.7.1 (25G241), 14&nbsp;October 2026. Slack, Discord and Telegram had been open about four minutes, each with a conversation on screen. Teams had been up 5&nbsp;hours, Signal 11&nbsp;hours, tinyclient 1&nbsp;hour.</p>
+    <p>One reading, all six signed in with a window open, on this Mac: Apple M3 Pro, 18&nbsp;GB of RAM, macOS 26.7.1 (25G241), 14&nbsp;October 2026. tinyclient is 0.2.0, up 21&nbsp;minutes. Slack and Discord had been open about 40&nbsp;minutes. Teams had been up 6&nbsp;hours, Signal 11&nbsp;hours. During the CPU minute Teams used 10% of a core, so that app was not idle.</p>
     <div class="table-wrap" tabindex="0" role="region" aria-label="Memory while signed in">
       <table>
         <caption>Physical footprint is the sum of <code>phys_footprint</code> from <code>footprint</code>, which is the number Activity Monitor calls Memory. Resident is the sum of <code>ps -o rss</code>. CPU is the sum of CPU time over the next 60 seconds, as a percent of one core.</caption>
         <thead><tr><th scope="col">App</th><th scope="col">Processes</th><th scope="col">Footprint</th><th scope="col">Resident</th><th scope="col">CPU</th></tr></thead>
         <tbody>
-          <tr><th scope="row">Microsoft Teams</th><td class="num">14</td><td class="num">1,807 MB</td><td class="num">328 MB</td><td class="num">0.4%</td></tr>
-          <tr><th scope="row">Slack 4.52.178</th><td class="num">7</td><td class="num">808 MB</td><td class="num">356 MB</td><td class="num">0.4%</td></tr>
-          <tr><th scope="row">Discord 0.0.415</th><td class="num">7</td><td class="num">677 MB</td><td class="num">329 MB</td><td class="num">2.5%</td></tr>
-          <tr><th scope="row">Signal 8.30.0</th><td class="num">6</td><td class="num">579 MB</td><td class="num">170 MB</td><td class="num">3.3%</td></tr>
-          <tr><th scope="row">Telegram 13.0</th><td class="num">1</td><td class="num">138 MB</td><td class="num">113 MB</td><td class="num">0.7%</td></tr>
-          <tr><th scope="row">The five together</th><td class="num">35</td><td class="num">3.9 GB</td><td class="num">1.3 GB</td><td class="num">7.3%</td></tr>
-          <tr><th scope="row">tinyclient 0.1.0, all five networks</th><td class="num">2</td><td class="num">145 MB</td><td class="num">42 MB</td><td class="num">0.5%</td></tr>
+          <tr><th scope="row">Microsoft Teams</th><td class="num">14</td><td class="num">1,775 MB</td><td class="num">374 MB</td><td class="num">10%</td></tr>
+          <tr><th scope="row">Slack 4.52.178</th><td class="num">7</td><td class="num">824 MB</td><td class="num">370 MB</td><td class="num">0.4%</td></tr>
+          <tr><th scope="row">Discord 0.0.415</th><td class="num">7</td><td class="num">627 MB</td><td class="num">370 MB</td><td class="num">3.7%</td></tr>
+          <tr><th scope="row">Signal 8.30.0</th><td class="num">6</td><td class="num">612 MB</td><td class="num">225 MB</td><td class="num">4.6%</td></tr>
+          <tr><th scope="row">Telegram 13.0</th><td class="num">1</td><td class="num">129 MB</td><td class="num">90 MB</td><td class="num">0.4%</td></tr>
+          <tr><th scope="row">The five together</th><td class="num">35</td><td class="num">3.9 GB</td><td class="num">1.4 GB</td><td class="num">19%</td></tr>
+          <tr><th scope="row">tinyclient 0.2.0, all five networks</th><td class="num">2</td><td class="num">91 MB</td><td class="num">57 MB</td><td class="num">0.2%</td></tr>
         </tbody>
       </table>
     </div>
-    <p>Of tinyclient&rsquo;s 145&nbsp;MB, the window was 123&nbsp;MB and <code>chatd</code> was 23&nbsp;MB. Almost all of its CPU was <code>chatd</code>. Teams&rsquo; footprint is one WebView renderer at 1,228&nbsp;MB plus helpers. Most of Teams, Slack, Discord and Signal is compressed: 1,686&nbsp;MB, 695&nbsp;MB, 548&nbsp;MB and 495&nbsp;MB. The Teams audio driver, 9&nbsp;MB resident, is in the resident column and not in the footprint, because <code>footprint</code> could not read it.</p>
-    <p>Before Slack, Discord and Telegram were open, tinyclient was 260&nbsp;MB of footprint and 69&nbsp;MB resident, over the 150&nbsp;MB target. With all five official apps running it was 145&nbsp;MB. A minute after this table, Slack&rsquo;s footprint was still 808&nbsp;MB and Telegram&rsquo;s was 143&nbsp;MB. Discord&rsquo;s footprint was 632&nbsp;MB and its resident memory had risen to 523&nbsp;MB, so that row was still moving.</p>
+    <p>Of tinyclient&rsquo;s 91&nbsp;MB, the window was 69&nbsp;MB and <code>chatd</code> was 22&nbsp;MB. Teams&rsquo; footprint is one WebView renderer at 1,196&nbsp;MB plus helpers. Most of Teams, Slack, Signal and Discord is compressed: 1,649&nbsp;MB, 693&nbsp;MB, 524&nbsp;MB and 493&nbsp;MB. The Teams audio driver is in the resident column and not in the footprint, because <code>footprint</code> could not read it. An earlier reading the same evening, of tinyclient 0.1.0, was 42&nbsp;MB resident. 0.2.0 is the latest release, and it is the build in this table.</p>
 
     <h2 id="processes">Four programs, each only when needed</h2>
     <div class="table-wrap" tabindex="0" role="region" aria-label="Memory by process">
