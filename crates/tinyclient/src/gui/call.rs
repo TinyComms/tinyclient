@@ -308,7 +308,7 @@ fn ensure_daemon() {
             let _ = std::fs::create_dir_all(protocol::support_dir());
             let out = std::fs::OpenOptions::new().create(true).append(true).open(log);
             let mut command = std::process::Command::new(chatd);
-            command.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null());
+            protocol::launch::no_console(&mut command).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null());
             if let Ok(out) = out {
                 command.stderr(out);
             }

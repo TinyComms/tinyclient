@@ -1210,7 +1210,7 @@ impl Chat {
         }
         let helper = login_path().and_then(|path| {
             let mut helper = std::process::Command::new(path);
-            helper.arg(network.label().to_lowercase());
+            protocol::launch::no_console(&mut helper).arg(network.label().to_lowercase());
             if let Some((x, y)) = at {
                 helper.args(["--at", &format!("{x},{y}")]);
             }

@@ -100,6 +100,7 @@ pub fn open_file(path: &str, name: &str, then: Then) {
             let _ = then;
             command = Command::new("cmd");
             command.arg("/C").arg("start").arg("").arg(&path);
+            protocol::launch::no_console(&mut command);
         }
         let _ = command.stdout(Stdio::null()).stderr(Stdio::null()).status();
     });

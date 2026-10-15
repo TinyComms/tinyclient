@@ -9077,6 +9077,7 @@ dependencies = [
  "serde_json",
  "smallvec",
  "unicode-segmentation",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

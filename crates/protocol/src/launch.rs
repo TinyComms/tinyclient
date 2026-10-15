@@ -70,14 +70,30 @@ pub fn start_chatd() -> io::Result<u32> {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
+    // CREATE_NEW_PROCESS_GROUP, for the same reason.
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        // CREATE_NEW_PROCESS_GROUP
-        command.creation_flags(0x0000_0200);
+        command.creation_flags(0x0000_0200 | CREATE_NO_WINDOW);
     }
     let mut child = command.spawn()?;
     let pid = child.id();
     let _ = std::thread::Builder::new().name("chatd-reaper".into()).stack_size(64 * 1024).spawn(move || child.wait());
     Ok(pid)
+}
+
+/// Windows's CREATE_NO_WINDOW: a console program started with it gets a console nobody sees.
+#[cfg(windows)]
+pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// Starts a helper (mediad, the sign-in window) without a console window of its own. They are
+/// console programs, and started from the windowed shell or from chatd each would open one on
+/// Windows. Redirected stdin, stdout and stderr still reach the helper. Nothing elsewhere.
+pub fn no_console(command: &mut std::process::Command) -> &mut std::process::Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
 }
