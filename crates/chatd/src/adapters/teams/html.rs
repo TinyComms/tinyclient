@@ -1,6 +1,7 @@
 //! A Teams message body, which is HTML, as plain text and styled ranges. The markup is read
 //! token by token and never rendered: an element this does not know contributes its text and
-//! nothing else, and no address in it is ever fetched.
+//! nothing else, and no address in it is ever fetched but Teams' own and the GIFs its Giphy
+//! button puts in.
 
 use protocol::{MediaFile, MentionKind, Span, Style};
 
@@ -8,6 +9,7 @@ const MENTION: &str = "http://schema.skype.com/Mention";
 const REPLY: &str = "http://schema.skype.com/Reply";
 const EMOJI: &str = "http://schema.skype.com/Emoji";
 const CUSTOM_EMOJI: &str = "http://schema.skype.com/CustomEmoji";
+const GIPHY: &str = "http://schema.skype.com/Giphy";
 
 /// What the text cannot say for itself, answered by the adapter.
 pub(super) trait Lookup {
@@ -42,6 +44,8 @@ pub(super) struct Parsed {
     pub text: String,
     pub spans: Vec<Span>,
     pub images: Vec<Image>,
+    /// GIFs from Teams' Giphy button, on Giphy's own host.
+    pub gifs: Vec<Image>,
     pub quote: Option<Quote>,
     /// It holds a card or another object that is not text.
     pub card: bool,
@@ -240,6 +244,15 @@ fn pixels(attrs: &[(String, String)], name: &str) -> u32 {
 }
 
 /// An address a link may carry: the web, mail, or a Teams deep link.
+/// An address on Giphy's own host, over HTTPS.
+pub(super) fn giphy(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    let host = rest.split(['/', '?', '#', ':']).next().unwrap_or("").to_ascii_lowercase();
+    host == "giphy.com" || host.ends_with(".giphy.com")
+}
+
 fn linkable(url: &str) -> bool {
     ["https://", "http://", "mailto:", "msteams:"].iter().any(|scheme| {
         url.get(..scheme.len()).is_some_and(|start| start.eq_ignore_ascii_case(scheme))
@@ -324,6 +337,17 @@ impl Builder<'_> {
         if self.quote.is_some() || self.hidden > 0 {
             return;
         }
+        if kind == GIPHY && giphy(src) {
+            // Teams' own client loads these from Giphy too, so fetching one says no more than
+            // reading the message there does.
+            self.out.gifs.push(Image {
+                src: src.to_owned(),
+                width: pixels(attrs, "width"),
+                height: pixels(attrs, "height"),
+                name: alt.to_owned(),
+            });
+            return;
+        }
         if self.lookup.hosted(src) {
             self.out.images.push(Image {
                 src: src.to_owned(),
@@ -333,8 +357,8 @@ impl Builder<'_> {
             });
             return;
         }
-        // A picture from anywhere else (a GIF service) is a link: nothing outside Teams is
-        // fetched for a message.
+        // A picture from anywhere else is a link: nothing outside Teams is fetched for a
+        // message.
         self.settle();
         let start = self.at();
         self.say(if alt.trim().is_empty() { "Image" } else { alt });
@@ -657,7 +681,7 @@ mod tests {
              <p><img itemtype=\"http://schema.skype.com/CustomEmoji\" itemid=\"0-weu-d2-partyparrot\" alt=\"partyparrot\" \
              src=\"https://eu-api.asm.skype.com/v1/objects/0-weu-d2-partyparrot/views/imgt1_anim\"></p>",
         );
-        assert_eq!(parsed.text, "Look 🙂\nCat GIF\n:partyparrot:");
+        assert_eq!(parsed.text, "Look 🙂\n:partyparrot:");
         let image = Image {
             src: "https://eu-api.asm.skype.com/v1/objects/0-weu-d1-abc/views/imgo".into(),
             width: 1024,
@@ -665,7 +689,13 @@ mod tests {
             name: "image".into(),
         };
         assert_eq!(parsed.images, [image]);
-        assert!(has(&parsed, "Cat GIF", Style::Link { url: "https://media4.giphy.com/media/x/giphy.gif".into() }));
+        // A GIF from Teams' Giphy button is a picture of its own; Giphy's host is the only one
+        // outside Teams that is ever fetched, and only for that.
+        let gif = Image { src: "https://media4.giphy.com/media/x/giphy.gif".into(), width: 200, height: 100, name: "Cat GIF".into() };
+        assert_eq!(parsed.gifs, [gif]);
+        assert!(giphy("https://i.giphy.com/x.gif") && !giphy("http://media.giphy.com/x.gif") && !giphy("https://giphy.com.evil.example/x.gif"));
+        let elsewhere = read("<p><img itemtype=\"http://schema.skype.com/Giphy\" alt=\"Not Giphy\" src=\"https://example.org/x.gif\"></p>");
+        assert!(elsewhere.gifs.is_empty() && has(&elsewhere, "Not Giphy", Style::Link { url: "https://example.org/x.gif".into() }));
         assert!(parsed.spans.iter().any(|span| matches!(&span.style, Style::Emoji { file } if file.id == "emoji:0-weu-d2-partyparrot")));
 
         let card = read("<URIObject type=\"SWIFT.1\" url_thumbnail=\"https://x\"><Swift b64=\"eyJ0eXBlIjoibWVzc2FnZSJ9\"></Swift>Card - access it on https://go.skype.com/cards.unsupported</URIObject>");

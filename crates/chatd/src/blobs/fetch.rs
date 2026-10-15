@@ -53,8 +53,9 @@ impl Hosts {
             Network::Discord => (&["cdn.discordapp.com", "discordapp.net", "media.tenor.com"], &[]),
             // Avatars, emoji and unfurled images are public; files need the workspace's token.
             Network::Slack => (&["slack-edge.com", "slack-imgs.com", "slack-files.com"], &["files.slack.com"]),
-            // Pictures in messages and people's pictures, each behind the session's own token.
-            Network::Teams => (&[], &["asm.skype.com", "asyncgw.teams.microsoft.com", "teams.microsoft.com"]),
+            // Pictures in messages and people's pictures, each behind the session's own token;
+            // GIFs from Teams' Giphy button, public, on Giphy's host.
+            Network::Teams => (&["giphy.com"], &["asm.skype.com", "asyncgw.teams.microsoft.com", "teams.microsoft.com"]),
             Network::Telegram => (&[], &[]),
             // Attachments are encrypted end to end: the adapter fetches and opens them itself.
             Network::Signal => (&[], &[]),
