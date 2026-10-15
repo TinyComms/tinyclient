@@ -4,7 +4,7 @@ This replaces the persona and the "Cut" list in `docs/stories.md`. The other sev
 
 ## What "full-fledged" means
 
-**I can quit the official app for a normal day and nobody on the other side can tell.** tinyclient is a complete *participant*: it reads everything I am a member of, shows it the way it was sent, and replies in kind. It is not an *administrator* or a *platform*: it does not configure servers, install apps, or host mini-programs. Anything past the line opens in the official app with one click, on the exact message, channel, or meeting. A handoff that lands in the right place is a feature; a dead end is a bug.
+**I can quit the official app for a normal day and nobody on the other side can tell.** The destination is every feature of the official clients, in a client that stays small and fast. What is not built yet opens in the official app with one click, on the exact message, channel, or meeting. A handoff that lands in the right place is how a missing feature behaves until it ships. A dead end is a bug.
 
 ## Personas
 
@@ -60,21 +60,21 @@ Checks are observable from outside the process, as in `docs/stories.md`.
 11. **P1. All four networks work the same way.** *Check:* stories 1 to 7 pass on Telegram and Teams.
 12. **Cut, handed off. I can get to what tinyclient does not do.** Every message, channel and meeting has "Open in Slack/Discord/Telegram/Teams". *Check:* the link opens the official app on that exact item.
 
-## The cut line
+## Not built yet
 
-Rule: **in** if a member does it inside a conversation on an ordinary day; **out** if it configures a space, runs someone else's program, or needs the vendor's media stack to be correct.
+These are part of the goal. They are not in the product yet, so each one opens in the official app. A feature ships when it passes the budgets in `07-budgets-and-risk.md`. A heavy part runs only while it is in use.
 
-| Out | Why | Instead |
+| Not yet | What has to be true when it ships | Until then |
 | --- | --- | --- |
-| Admin and moderation: server and workspace settings, roles, permissions, bans, audit logs, channel creation settings, invites management | Rare, high-stakes, large surface, and the riskiest calls to make from an unofficial client | Open in official app |
-| App platforms: Slack app directory and workflows, Teams apps and tabs, Discord activities, Telegram mini apps and payments | These are embedded web apps. They need a webview, which is the thing tinyclient exists to avoid | Open in official app |
-| Bot interactivity: buttons, menus, modals, slash-command forms | Each is a custom UI protocol. Bot messages still render as text, images and links | P2: render as a message with "Open in ..." |
-| Documents inside chat: Slack canvases and lists, Teams Loop, whiteboards, Planner, the SharePoint file browser | Document editors, not chat | Show as a link card that opens the browser |
-| Teams meetings and anything with a lobby, breakout rooms, captions, recording; Discord stage channels; Slack huddle extras (drawing, threads, reactions) | Tenant policy and vendor media stacks decide whether you get in. A half-working meeting join loses a real meeting | Meeting link opens Teams. Plain 1:1 and group calls are in scope |
-| Video grid, virtual backgrounds, noise-suppression models, soundboard | Each tile is a decoder. One speaker, one share is the design | None |
-| Commerce and growth: Nitro, shop, quests, server discovery, boosts, Telegram Premium and stars, stories | Not conversation | Open in official app |
-| Account management: sign-up, password, 2FA, billing, privacy settings, per-channel notification rules | Do it once in the official app. tinyclient reads and honors the result (mutes, folders) | Open in official app |
-| Telegram secret chats | Device-bound end-to-end keys; a second device cannot see them by design | Say so in the row |
+| Admin and moderation: server and workspace settings, roles, permissions, bans, audit logs, channel creation settings, invites management | Native screens. The calls are high-stakes, so they go through the same account-safety rules as everything else | Open in official app |
+| App platforms: Slack app directory and workflows, Teams apps and tabs, Discord activities, Telegram mini apps and payments | A webview in its own process, running only while that app is open | Open in official app |
+| Bot interactivity: buttons, menus, modals, slash-command forms | Native controls for that network's components. The message's text, images, and links already render | Open in official app |
+| Documents inside chat: Slack canvases and lists, Teams Loop, whiteboards, Planner, the SharePoint file browser | A viewer or editor that is running only while it is open | A link card that opens the browser |
+| Teams meetings and anything with a lobby, breakout rooms, captions, recording; Discord stage channels; Slack huddle extras (drawing, threads, reactions) | A join that works, with the media in `mediad` for the length of the meeting | The meeting link opens the official app |
+| Video grid, virtual backgrounds, noise-suppression models, soundboard | Only the visible tiles decoded, in `mediad`, for the length of the call | One speaker and one share |
+| Commerce and growth: Nitro, shop, quests, server discovery, boosts, Telegram Premium and stars, stories | The same budgets as the rest of the client | Open in official app |
+| Account management: sign-up, password, 2FA, billing, privacy settings, per-channel notification rules | tinyclient already reads and honors the result (mutes, folders). Changing the account itself is still to build | Open in official app |
+| Telegram secret chats | A second device cannot see them. The row says so | Say so in the row |
 | Automation of any kind: auto-reply, scheduled bulk send, logging other users' presence, exporting member lists | This is what gets accounts banned. Discord's enforcement is aimed at self-bots and scraping ([Discord](https://support.discord.com/hc/en-us/articles/360039598252)) | Never |
 
 **Guardrail for presence and member lists.** The owner's request overrides the old cut, and the README line "does not ... scrape member lists, or track presence" must change with it. The new rule: tinyclient asks the network only for what the official client would ask for the screen I am looking at (friends, open DMs, the member list of the channel that is open, paged as it scrolls) and stores presence in memory only, never in SQLite. No request exists whose purpose is to enumerate a server.
@@ -93,6 +93,6 @@ Each increment is usable on its own. Discord and Slack first, because they are s
 
 1. **Presence and member lists on Discord.** They require gateway subscriptions the README currently promises tinyclient does not make. Is the guardrail above (only what the official client requests for the visible screen, nothing stored) the rule, with the README rewritten to match?
 2. **More than one account per network.** Still cut, or in? Persona C usually has two or more Slack workspaces, and Teams users often have guest tenants. Saying yes changes the store, the rail and sign-in now; adding it later is a migration.
-3. **Teams meetings.** Is handoff to the Teams app acceptable as the permanent answer, with only plain Teams calls native? Native meeting join is the single most expensive item on any list here.
+3. **Teams meetings.** Handoff is how a meeting behaves until a join works inside `mediad` for the length of the meeting. It is not the permanent answer.
 4. **Depth or breadth first.** The order above finishes Discord and Slack before Telegram and Teams. If Teams is where your own workday is, should Teams chat move ahead of increment 3?
 5. **"Anyone who wants it".** Does that mean a signed, notarized app that starts chatd itself and updates itself, for people who will never open a terminal? If yes, packaging and first-run become an increment of their own, before 5.

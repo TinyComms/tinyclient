@@ -59,8 +59,10 @@ Discord and Slack first, because they sign in today. Each increment is usable on
    calls and meetings open in Teams. Work Teams accounts can be blocked by the tenant's own policy;
    nothing tinyclient does changes that.
 
-## Cut
+## Not built yet
 
-Admin and moderation, app directories and bot UIs (buttons, slash commands), canvases and
-whiteboards, a video gallery, Teams meetings, GIF picker, animated stickers, voice recording,
-commerce, account settings of the networks themselves. Each opens in the official app.
+The destination is the official clients' features, in a client that stays small and fast. Admin
+and moderation, app directories and bot UIs, canvases and whiteboards, a video gallery, Teams
+meetings, a GIF picker, animated stickers, voice recording, commerce, and the networks' own
+account settings are not built yet. Until each one ships, it opens in the official app. It ships
+when it passes the budgets in `docs/product/07-budgets-and-risk.md`.
