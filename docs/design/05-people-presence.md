@@ -41,7 +41,8 @@ room for the name without a taller card.
   or nickname does not recolor a person. Text is 0.38 x size, semibold, white; at 16 and 20 one initial only.
 - **Loading, missing and failed are the same picture: the fallback.** The bitmap replaces it in one frame when decoded. No
   spinner, no fade, no skeleton, no retry mark. The box is sized before anything loads, so nothing shifts.
-- Animated avatars are stills everywhere (card animation is P2 and out of this round).
+- Animated avatars (Discord `a_` avatars and server icons) are stills in lists and play under the pointer, as Discord's own lists do; on the
+  profile card they play as the autoplay setting says.
 
 ## Presence
 Shape carries the state; color repeats it. The dot is a child of the avatar: a ring-colored disc (dot + 2 x ring) with the

@@ -232,7 +232,8 @@ The data directory is `~/Library/Application Support/tinyclient` on macOS,
 
 - **Network connections** go only to the networks you sign in to, and media is fetched only from
   each network's own hosts (an allow-list per network in `crates/chatd/src/blobs/fetch.rs`;
-  Discord's GIF stills come from `media.tenor.com`, which Discord's own search returns). Link
+  Discord's GIF picker cells come from `media.tenor.com`, which Discord's own search returns, and
+  Teams' Giphy GIFs from Giphy's host, as Teams' own client loads them). Link
   previews are the ones the network sends; chatd never fetches a URL from a message.
 - **TLS** is the operating system's (Security.framework, SChannel, OpenSSL) for every network but
   Signal, whose libraries use rustls pinned to Signal's own certificate authority.

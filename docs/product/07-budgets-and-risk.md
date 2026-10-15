@@ -40,7 +40,14 @@ Per-item costs behind the heavy-account row (decoded pixels are 4 bytes each, at
 - Avatar, 40 pt = 80 x 80 px = 26 KB. About 40 are visible; cap 256 in memory = 6.5 MB.
 - Inline image, at most 400 x 300 pt = 800 x 600 px = 1.9 MB. Three or four are visible. Keep the
   visible screen plus one screen each way, about 16 images: cap 32 MB.
-- A GIF of that size with 100 frames is 192 MB decoded. It is never decoded as frames.
+- A GIF of that size with 100 frames would be 192 MB decoded whole, so it never is: frames are
+  decoded at the size drawn, at most 120 of them and 16 MB a picture (2 MB for an emoji, avatar or
+  picker cell), smaller first (to half) and then with fewer frames. All moving pictures in
+  messages and pickers hold at most 48 MB of frames, avatars 8 MB; one that scrolls away keeps
+  its first frame only. Measured 2026-10-14 (demo `#photo-dump`, 30 GIFs and animated WebPs,
+  release build, 1120 x 720 at 2x): 8.1 MB of frames on screen, footprint 84 MB held with
+  autoplay on against 76 MB with it off; after scrolling 4,000 pt through the wall, 11.5 MB of
+  frames and 4.5 MB of first frames.
 
 ## 2. Feature threats and the rule that defuses each
 
@@ -48,7 +55,7 @@ Per-item costs behind the heavy-account row (decoded pixels are 4 bytes each, at
 | --- | --- | --- |
 | Avatars | Request the CDN size that matches the pixels drawn (`?size=80` or `128`), store the file on disk, decode on a background thread, evict off-screen ones past the cap. Initials show until it arrives. | Full-size avatars are 1024 px = 4 MB each decoded. |
 | Images | Ask the network for a thumbnail no larger than 800 px wide. Decode only inside the keep window. Layout uses the width and height from the message, so nothing reflows when the image lands. | Keeps scroll at 120 Hz and the cache at 32 MB. |
-| GIFs and video | Show the first frame. Play one at a time, only while visible and the window is key, through AVFoundation's hardware decoder (Discord, Tenor and Giphy serve MP4). | 192 MB per decoded GIF; animation is the main idle-CPU leak in chat apps. |
+| GIFs and video | GIF, WebP and APNG: frames at the drawn size within the caps above, playing only while drawn, on screen and the window is key; one timer per window draws at the next frame due, never at the display's rate. Ask for the network's small moving copy (Discord's proxy `animated=true`, Tenor `tinygif`, Slack `thumb_480_gif`, Giphy `200.webp`), never the original. Autoplay is a setting (always, on hover, never); Reduce Motion plays only under the pointer. MP4 GIFs and video: the system's player until an inline player exists (`Pane::moving`). | 192 MB per decoded GIF; animation is the main idle-CPU leak in chat apps. |
 | Presence | Subscribe to friends, DM partners, and members visible in the open channel. Drop the rest on arrival. | Bounded at about 1,200 entries regardless of server size. |
 | Member lists | Request only the visible range of the open channel, in windows of 100, and drop it when the channel closes. Never page a whole server. | Memory, and paging members is what scrapers do (section 5). |
 | Discord READY | Keep parsing into a struct that names only used fields. Add fields per feature; never keep the raw payload or a `Value` tree. Budget the peak. | A `Value` tree is 3 to 5 times the JSON size. |
