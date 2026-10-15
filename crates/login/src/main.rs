@@ -33,6 +33,10 @@ pub(crate) use common::*;
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let network = match args.first().map(String::as_str) {
+        Some("--version") => {
+            println!("tinyclient-login {}", env!("CARGO_PKG_VERSION"));
+            return;
+        }
         Some("slack") => "slack",
         Some("discord") => "discord",
         Some("teams") => "teams",

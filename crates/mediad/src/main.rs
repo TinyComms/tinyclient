@@ -217,6 +217,10 @@ fn main() -> ExitCode {
     protocol::crash::install_panic_hook("mediad");
     let first = env::args().nth(1);
     match first.as_deref() {
+        Some("--version") => {
+            println!("mediad {}", env!("CARGO_PKG_VERSION"));
+            return ExitCode::SUCCESS;
+        }
         Some("--devices") => {
             list_devices();
             return ExitCode::SUCCESS;

@@ -54,6 +54,11 @@ fn print_status() -> io::Result<()> {
 }
 
 fn main() -> ExitCode {
+    // Before the window opens: it is how an installed package proves it runs, with no display.
+    if std::env::args().nth(1).as_deref() == Some("--version") {
+        println!("tinyclient {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
     #[cfg(feature = "gui")]
     if !std::env::args().any(|arg| arg == "--text") {
         gui::run();
