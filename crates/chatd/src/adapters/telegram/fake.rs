@@ -3,8 +3,8 @@
 //! can be driven through chatd's real socket (`tests/telegram.rs`); it is reachable only in a
 //! scratch directory with `TINYCLIENT_TELEGRAM_FAKE` set, never from a real session.
 //!
-//! A test steers it by writing lines to a FIFO in the scratch directory (on Windows a file it
-//! appends to, see `adapters/script.rs`): `telegram.signin.ctl` while signing in (`scan`, `scan-password`), `telegram.ctl` once signed in (`incoming`,
+//! A test steers it by appending lines to a file in the scratch directory (`adapters/script.rs`):
+//! `telegram.signin.ctl` while signing in (`scan`, `scan-password`), `telegram.ctl` once signed in (`incoming`,
 //! `photo`, `react`, `edit`, `delete`, `topic`, `typing`, `typing-stop`, `read`, `status`,
 //! `poll`, `voice`, `forward`, `flood-send N`, `revoke`). Every request it is sent is appended
 //! to `telegram.calls`, one line each, so a test can see what the network would have heard.
@@ -474,8 +474,7 @@ impl Fake {
         fake
     }
 
-    /// Reads the test's lines for as long as this wire lives. Blocked in the FIFO between
-    /// lines, so it costs nothing; dropping the wire writes it one last line to end it.
+    /// Reads the test's lines for as long as this wire lives; dropping the wire ends it.
     fn listen(&self) {
         let (world, events, closed, control) = (self.world.clone(), self.events.clone(), self.closed.clone(), self.control.clone());
         let _ = std::thread::Builder::new().name("telegram-fake".into()).spawn(move || {
@@ -497,9 +496,8 @@ impl Fake {
 
 impl Drop for Fake {
     fn drop(&mut self) {
+        // The reader sees it within 20 ms and stops.
         self.closed.store(true, Ordering::Relaxed);
-        // Wakes the reader out of the FIFO. With no reader there is nobody to wake.
-        script::wake(&self.control);
     }
 }
 

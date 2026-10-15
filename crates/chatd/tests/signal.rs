@@ -1,6 +1,6 @@
 //! The Signal adapter through chatd's real socket, with a scripted wire where Signal would be
 //! (`adapters/signal/fake.rs`): the account, its contacts and its group are invented there, and
-//! each test steers it by writing a line to a FIFO in its scratch directory.
+//! each test steers it by appending a line to a file in its scratch directory.
 //!
 //! What this proves is everything above the wire: what the adapter asks Signal for and how it maps
 //! what comes back into the contract, and the link steps. It proves nothing about presage and
@@ -119,29 +119,19 @@ impl World {
         self.write_to("signal.signin.ctl", line);
     }
 
-    fn write_to(&self, fifo: &str, line: &str) {
-        let path = self.dir.join(fifo);
+    fn write_to(&self, control: &str, line: &str) {
+        let path = self.dir.join(control);
         self.until("the fake to listen", || path.exists().then_some(()));
-        // Blocks until the fake is reading, which it is whenever it is alive. The fake opens the
-        // FIFO again after each writer: a write that met it closing went nowhere, and is made again.
-        // On Windows the fake reads a plain file on from where it was, so lines go on its end.
-        loop {
-            let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
-            match writeln!(file, "{line}") {
-                Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => continue,
-                written => break written.unwrap(),
-            }
-        }
-        // A FIFO's write waits for the fake to read; on Windows the fake says how far it has read.
-        #[cfg(windows)]
-        {
-            let end = std::fs::metadata(&path).unwrap().len();
-            let mut taken = path.clone().into_os_string();
-            taken.push(".taken");
-            let taken = std::path::PathBuf::from(taken);
-            let read = || std::fs::read_to_string(&taken).ok().and_then(|at| at.trim().parse::<u64>().ok()).unwrap_or(0);
-            self.until("the fake to take the line", || (read() >= end).then_some(()));
-        }
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(file, "{line}").unwrap();
+        drop(file);
+        // The fake says how far it has read and acted: the line is taken when this returns.
+        let end = std::fs::metadata(&path).unwrap().len();
+        let mut taken = path.clone().into_os_string();
+        taken.push(".taken");
+        let taken = PathBuf::from(taken);
+        let read = || std::fs::read_to_string(&taken).ok().and_then(|at| at.trim().parse::<u64>().ok()).unwrap_or(0);
+        self.until("the fake to take the line", || (read() >= end).then_some(()));
     }
 
     fn status(&self) -> (Vec<protocol::AccountStatus>, u64) {
