@@ -9,9 +9,10 @@
 //! server has the adapter leave on the network, so nobody is left ringing or shown in a channel.
 
 use crate::hub::{now, Hub};
+use protocol::settings::{INPUT, JOIN_MUTED, OUTPUT};
 use protocol::{
-    clip, read_frame, write_frame, Call, CallFailure, CallState, Change, Key, MediaRequest,
-    MediaResponse, Participant, VoiceJoin, DEVICES_LIMIT,
+    clip, read_frame, write_frame, Call, CallFailure, CallState, Change, Cue, Key, MediaRequest,
+    MediaResponse, Participant, VoiceJoin, DEVICES_LIMIT, OCCUPANTS_LIMIT,
 };
 use std::io::{self, BufReader};
 use std::path::PathBuf;
@@ -40,6 +41,8 @@ const RING: Duration = Duration::from_secs(60);
 const WATCH: Duration = Duration::from_millis(250);
 /// Speakers remembered ahead of the roster that names them.
 const TALKING: usize = 64;
+/// A roster change this soon after joining is the roster arriving, not someone joining.
+const SETTLING: i64 = 2;
 
 /// The one sentence for a ring nobody took. The dock says it with the person's name.
 pub const NO_ANSWER: &str = "Nobody picked up.";
@@ -106,13 +109,64 @@ pub struct Calls {
     slot: Mutex<Slot>,
     next: AtomicU64,
     failed: Mutex<Option<Failed>>,
+    /// The mediad started for Settings' microphone test or test sound, outside a call.
+    tester: Mutex<Option<Tester>>,
+}
+
+/// A mediad with no call (`mediad test`): it opens the microphone while the meter is on and the
+/// speaker while a cue plays, and exits by itself once neither has happened for a moment, or
+/// after 30 s of metering. Nothing waits on its replies.
+struct Tester {
+    id: u64,
+    child: Child,
+    stdin: Option<ChildStdin>,
+}
+
+impl Tester {
+    fn start(hub: &Arc<Hub>, id: u64) -> io::Result<Tester> {
+        let path = mediad_path()?;
+        let mut child = Command::new(&path).arg("test").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
+        let stdin = child.stdin.take();
+        let mut stdout = BufReader::new(child.stdout.take().expect("stdout is piped"));
+        let reader = hub.clone();
+        std::thread::Builder::new().stack_size(256 * 1024).spawn(move || {
+            // Ends when mediad exits.
+            while let Ok(frame) = read_frame::<MediaResponse>(&mut stdout) {
+                if let MediaResponse::Levels { input, .. } = frame {
+                    reader.changed(Change::Meter { level: Some(input.min(100)) });
+                }
+            }
+            reader.calls.tester_gone(&reader, id);
+        })?;
+        Ok(Tester { id, child, stdin })
+    }
+
+    fn send(&mut self, request: &MediaRequest) -> io::Result<()> {
+        let stdin = self.stdin.as_mut().ok_or_else(|| io::Error::other(ENGINE_SILENT))?;
+        write_frame(stdin, request)
+    }
+}
+
+impl Drop for Tester {
+    fn drop(&mut self) {
+        self.stdin.take();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while matches!(self.child.try_wait(), Ok(None)) {
+            if Instant::now() > deadline {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                return;
+            }
+            sleep(Duration::from_millis(5));
+        }
+    }
 }
 
 /// `TINYCLIENT_MEDIAD`, or the `mediad` next to this binary: in `target/`, and in
 /// `tinyclient.app/Contents/MacOS`, where `packaging/bundle.sh` puts every executable so that
 /// each finds the others this way. A bundle that keeps helpers apart has them in
 /// `Contents/Helpers`, which is looked in second.
-fn mediad_path() -> io::Result<PathBuf> {
+pub(crate) fn mediad_path() -> io::Result<PathBuf> {
     if let Some(path) = std::env::var_os("TINYCLIENT_MEDIAD") {
         return Ok(PathBuf::from(path));
     }
@@ -474,6 +528,16 @@ impl Calls {
 
     /// Starts mediad for a call in `conversation`. A ring or a failure being shown gives way.
     pub fn start(&self, hub: &Arc<Hub>, conversation: Key) -> Result<(), CallError> {
+        // A microphone test gives way: the call needs the devices.
+        let tester = crate::hub::lock(&self.tester).take();
+        if tester.is_some() {
+            drop(tester);
+            hub.changed(Change::Meter { level: None });
+        }
+        let (tuning, input, output, muted) = {
+            let settings = hub.settings();
+            (settings.tuning(), settings.device(INPUT), settings.device(OUTPUT), settings.on(JOIN_MUTED))
+        };
         {
             let mut slot = crate::hub::lock(&self.slot);
             if slot.running().is_some() {
@@ -482,10 +546,102 @@ impl Calls {
             // The old mediad, if any, is reaped before the new one starts.
             *slot = Slot::Idle;
             let id = self.next.fetch_add(1, Ordering::Relaxed);
-            *slot = Slot::Active(ActiveCall::start(hub, id, conversation).map_err(CallError::Media)?);
+            let mut active = ActiveCall::start(hub, id, conversation).map_err(CallError::Media)?;
+            // The user's defaults, before the voice session arrives: mediad opens the devices
+            // only once it holds one. A mediad that refuses them still carries the call.
+            crate::hub::lock(&active.live).call.muted = muted;
+            let _ = active.request(&MediaRequest::Tune(tuning));
+            if input.is_some() || output.is_some() {
+                let _ = active.request(&MediaRequest::Devices { input, output });
+            }
+            *slot = Slot::Active(active);
         }
         self.tell(hub);
         Ok(())
+    }
+
+    /// Whether a call is starting or up with its mediad: a test then uses that mediad.
+    fn in_call(&self) -> bool {
+        crate::hub::lock(&self.slot).running().is_some()
+    }
+
+    /// The tuning changed in Settings: the call's mediad, or the test's, takes it at once.
+    pub fn retune(&self, hub: &Hub) {
+        let tuning = hub.settings().tuning();
+        if let Some(active) = crate::hub::lock(&self.slot).running() {
+            let _ = active.request(&MediaRequest::Tune(tuning));
+        }
+        if let Some(tester) = crate::hub::lock(&self.tester).as_mut() {
+            let _ = tester.send(&MediaRequest::Tune(tuning));
+        }
+    }
+
+    /// The running test mediad, started with the user's devices and tuning if there is none.
+    fn tester<'a>(&self, hub: &Arc<Hub>, held: &'a mut Option<Tester>) -> Result<&'a mut Tester, CallError> {
+        if held.is_none() {
+            let id = self.next.fetch_add(1, Ordering::Relaxed);
+            let mut tester = Tester::start(hub, id).map_err(|err| {
+                eprintln!("chatd: the test mediad did not start: {err}");
+                CallError::Media(io::Error::other(ENGINE_MISSING))
+            })?;
+            let (tuning, input, output) = {
+                let settings = hub.settings();
+                (settings.tuning(), settings.device(INPUT), settings.device(OUTPUT))
+            };
+            let told = tester.send(&MediaRequest::Tune(tuning)).and_then(|()| tester.send(&MediaRequest::Devices { input, output }));
+            told.map_err(CallError::Media)?;
+            *held = Some(tester);
+        }
+        Ok(held.as_mut().expect("started above"))
+    }
+
+    /// Settings' microphone test. In a call it is the call's own meter; otherwise a test mediad
+    /// carries it, and stops it after 30 s by itself.
+    pub fn test_microphone(&self, hub: &Arc<Hub>, on: bool) -> Result<(), CallError> {
+        if self.in_call() {
+            return self.meter(hub, on);
+        }
+        let mut held = crate::hub::lock(&self.tester);
+        if !on {
+            if let Some(tester) = held.as_mut() {
+                // Gone already is as good as stopped.
+                let _ = tester.send(&MediaRequest::Meter { on: false });
+            }
+            return Ok(());
+        }
+        let tester = self.tester(hub, &mut held)?;
+        let asked = tester.send(&MediaRequest::Meter { on: true });
+        if asked.is_err() {
+            // It had just exited: start it again.
+            *held = None;
+            self.tester(hub, &mut held)?.send(&MediaRequest::Meter { on: true }).map_err(CallError::Media)?;
+        }
+        Ok(())
+    }
+
+    /// Settings' test sound, on the call speaker: in the call, or from a test mediad.
+    pub fn test_sound(&self, hub: &Arc<Hub>) -> Result<(), CallError> {
+        let test = MediaRequest::Cue { cue: Cue::Test };
+        if let Some(active) = crate::hub::lock(&self.slot).running() {
+            return active.request(&test).map(drop).map_err(CallError::Media);
+        }
+        let mut held = crate::hub::lock(&self.tester);
+        if self.tester(hub, &mut held)?.send(&test).is_err() {
+            *held = None;
+            self.tester(hub, &mut held)?.send(&test).map_err(CallError::Media)?;
+        }
+        Ok(())
+    }
+
+    /// The test mediad exited. The meter is over.
+    fn tester_gone(&self, hub: &Hub, id: u64) {
+        let mut held = crate::hub::lock(&self.tester);
+        if held.as_ref().is_some_and(|tester| tester.id == id) {
+            let gone = held.take();
+            drop(held);
+            drop(gone);
+            hub.changed(Change::Meter { level: None });
+        }
     }
 
     /// Answers the ring. Gives the conversation, for the adapter to join on the network.
@@ -697,7 +853,9 @@ impl Calls {
     /// Everyone in the call but us, as the network lists them. Who is speaking is mediad's to say
     /// and is carried over.
     pub fn set_participants(&self, hub: &Hub, conversation: &Key, mut participants: Vec<Participant>) {
+        let mut cue = None;
         self.update(hub, conversation, |live| {
+            cue = arrival(&live.call, &participants, now());
             for participant in &mut participants {
                 participant.speaking = live.talking.contains(&participant.id);
             }
@@ -707,6 +865,10 @@ impl Calls {
                 live.join();
             }
         });
+        // mediad decides whether it is heard (S7, deafen).
+        if let Some(cue) = cue {
+            let _ = self.request(hub, &MediaRequest::Cue { cue });
+        }
     }
 
     /// The network handed out a voice session. mediad takes it from here. A second one for the
@@ -734,6 +896,23 @@ impl Calls {
             let detail = if err.kind() == io::ErrorKind::Other { err.to_string() } else { ENGINE_SILENT.to_owned() };
             self.set_state(hub, conversation, failed(CallFailure::Engine, detail));
         }
+    }
+}
+
+/// The cue a new roster calls for: someone joined or left a call that has been up a moment,
+/// and at most [`OCCUPANTS_LIMIT`] people are in it (a busy channel would chime all day).
+fn arrival(call: &Call, roster: &[Participant], now: i64) -> Option<Cue> {
+    if call.state != CallState::Joined || call.joined == 0 || now - call.joined < SETTLING || roster.len() > OCCUPANTS_LIMIT {
+        return None;
+    }
+    let had = |id: &str| call.participants.iter().any(|p| p.id == id);
+    let has = |id: &str| roster.iter().any(|p| p.id == id);
+    if roster.iter().any(|p| !had(&p.id)) {
+        Some(Cue::Joined)
+    } else if call.participants.iter().any(|p| !has(&p.id)) {
+        Some(Cue::Left)
+    } else {
+        None
     }
 }
 
@@ -848,6 +1027,21 @@ mod tests {
         let failure = MediaResponse::Failed { reason: CallFailure::Encryption, detail: "why".into() };
         assert!(live.apply(failure));
         assert_eq!(live.call.state, failed(CallFailure::Encryption, "why"));
+    }
+
+    #[test]
+    fn someone_joining_or_leaving_a_settled_call_is_a_cue_and_the_first_roster_is_not() {
+        let mut live = live(CallState::Joined);
+        live.call.joined = 1_000;
+        live.call.participants = vec![person("a")];
+        assert_eq!(arrival(&live.call, &[person("a"), person("b")], 1_001), None, "the roster is still arriving");
+        assert_eq!(arrival(&live.call, &[person("a"), person("b")], 1_010), Some(Cue::Joined));
+        assert_eq!(arrival(&live.call, &[], 1_010), Some(Cue::Left));
+        assert_eq!(arrival(&live.call, &[person("a")], 1_010), None);
+        let crowd: Vec<Participant> = (0..30).map(|n| person(&n.to_string())).collect();
+        assert_eq!(arrival(&live.call, &crowd, 1_010), None, "a crowded channel stays quiet");
+        live.enter(CallState::Reconnecting);
+        assert_eq!(arrival(&live.call, &[person("a"), person("b")], 1_010), None);
     }
 
     #[test]

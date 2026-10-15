@@ -1,6 +1,6 @@
 //! The Telegram adapter through chatd's real socket, with a scripted wire where Telegram would
 //! be (`adapters/telegram/fake.rs`): the account, its people and its messages are invented there,
-//! and each test steers it by writing a line to a FIFO in its scratch directory.
+//! and each test steers it by appending a line to a file in its scratch directory.
 //!
 //! What this proves is everything above the wire: which requests the adapter makes and how it
 //! maps what comes back into the contract, and the sign-in steps. It proves nothing about the
@@ -10,7 +10,7 @@
 use protocol::{
     read_frame, write_frame, AccountKey, Change, CodeVia, Conversation, ConversationKind, ErrorCode, Key, Link,
     MediaKind, MentionKind, Message, MessageKind, Network, Page, Presence, Relation, Request, Response, SendState,
-    SignInInput, SignInProblem, SignInStep, Style, Watching, Shelf, Special, Mark,
+    SignInInput, SignInProblem, SignInStep, Style, Watching, Shelf, Special, Mark, ReactionSet,
 };
 use std::io::Write;
 use protocol::ChatStream;
@@ -129,23 +129,19 @@ impl World {
         self.write_to("telegram.signin.ctl", line);
     }
 
-    fn write_to(&self, fifo: &str, line: &str) {
-        let path = self.dir.join(fifo);
+    fn write_to(&self, control: &str, line: &str) {
+        let path = self.dir.join(control);
         self.until("the fake to listen", || path.exists().then_some(()));
-        // Blocks until the fake is reading, which it is whenever it is alive. On Windows the fake
-        // reads a plain file on from where it was, so lines go on its end.
         let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
         writeln!(file, "{line}").unwrap();
-        // A FIFO's write waits for the fake to read; on Windows the fake says how far it has read.
-        #[cfg(windows)]
-        {
-            let end = std::fs::metadata(&path).unwrap().len();
-            let mut taken = path.clone().into_os_string();
-            taken.push(".taken");
-            let taken = std::path::PathBuf::from(taken);
-            let read = || std::fs::read_to_string(&taken).ok().and_then(|at| at.trim().parse::<u64>().ok()).unwrap_or(0);
-            self.until("the fake to take the line", || (read() >= end).then_some(()));
-        }
+        drop(file);
+        // The fake says how far it has read and acted: the line is taken when this returns.
+        let end = std::fs::metadata(&path).unwrap().len();
+        let mut taken = path.clone().into_os_string();
+        taken.push(".taken");
+        let taken = PathBuf::from(taken);
+        let read = || std::fs::read_to_string(&taken).ok().and_then(|at| at.trim().parse::<u64>().ok()).unwrap_or(0);
+        self.until("the fake to take the line", || (read() >= end).then_some(()));
     }
 
     fn status(&self) -> (Vec<protocol::AccountStatus>, u64) {
@@ -414,7 +410,8 @@ fn messages_arrive_change_and_go_and_what_they_hold_is_mapped() {
         ]
     );
     assert_eq!((rich.sender.id.as_str(), rich.sender.name.as_str(), rich.outgoing), ("u7002", "Odalys Brandt", false));
-    assert_eq!(world.conversation("u7002").unwrap().unread, 2);
+    // The row's count is written just after the message.
+    world.until("the second unread", || world.conversation("u7002").filter(|row| row.unread == 2));
 
     world.steer("react");
     let reacted = world.until("the reactions", || world.message("u7002", "13").filter(|message| !message.reactions.is_empty()));
@@ -467,6 +464,17 @@ fn messages_arrive_change_and_go_and_what_they_hold_is_mapped() {
     let note = &voice.attachments[0];
     assert_eq!((note.name.as_str(), note.file.kind, note.duration, note.mime.as_str()), ("Voice message", MediaKind::Audio, 7, "audio/ogg"));
     assert_eq!(note.waveform, vec![255, 0, 255, 0, 255, 0, 255, 0]);
+    // Played only when asked: the note itself is not fetched for its row, and comes from
+    // Telegram in one piece when the shell asks for it to play.
+    assert_eq!(world.called("GetFile document 6100"), 0);
+    let played = world.until("the voice message on disk", || {
+        match world.ask(Request::Fetch { account: account(), ids: vec!["d6100".into()], size: None, retry: false }) {
+            Response::Media { mut files } => files.pop().and_then(|file| file.path),
+            other => panic!("{other:?}"),
+        }
+    });
+    assert_eq!(std::fs::metadata(&played).unwrap().len(), FILE_BYTES);
+    assert_eq!(world.called("GetFile document 6100"), 1, "one piece of up to a megabyte");
 
     // Forwarded from the channel, in answer to an earlier message.
     world.steer("forward");
@@ -562,6 +570,46 @@ fn typing_reading_and_presence_go_both_ways_and_are_never_withheld() {
     assert_eq!(world.called("SetTyping u7003"), 1);
     // g8001 was already read up to 20, so there was nothing to tell for it.
     assert_eq!((world.called("ReadHistory g8001"), world.called("UpdateStatus")), (0, 1));
+}
+
+#[test]
+fn reactions_follow_each_chats_own_rules_and_what_they_refuse_never_reaches_telegram() {
+    let world = World::signed_in();
+    world.connected();
+    world.until("history", || world.message("g8001", "20"));
+    let rules = |id: &str| match world.ask(Request::Reactions { conversation: key(id) }) {
+        Response::Reactions { rules, .. } => rules,
+        other => panic!("no rules for {id}: {other:?}"),
+    };
+    // A person: Telegram's whole list but what needs Premium, one reaction each, replaced.
+    let person = rules("u7002");
+    assert_eq!((person.set, person.only.clone(), person.mine, person.replaces, person.distinct), (ReactionSet::Only, vec!["👍".to_owned(), "❤".into(), "🔥".into(), "🎉".into(), "🚫".into()], 1, true, 11));
+    // The group's admins picked three; the channel turned them off; the forum caps a message
+    // at two different ones.
+    assert_eq!(rules("g8001").only, ["👍", "❤", "🔥"]);
+    assert_eq!(rules("c9001").set, ReactionSet::Off);
+    assert_eq!(rules("c9002").distinct, 2);
+    assert_eq!(world.called("GetAvailableReactions"), 1, "the list is asked once a connection");
+    assert!(world.calls().iter().any(|call| call.starts_with("GetFullChannel c9001")));
+
+    let react = |id: &str, message: &str, emoji: &str| world.ask(Request::React { conversation: key(id), message_id: message.into(), emoji: emoji.into(), on: true });
+    let refused = |answer: Response| match answer {
+        Response::Error { code: ErrorCode::Refused, detail } => detail,
+        other => panic!("not refused: {other:?}"),
+    };
+    assert_eq!(refused(react("g8001", "20", "🎉")), "That reaction isn't allowed here.");
+    assert_eq!(refused(react("c9001", "5", "👍")), "Reactions are turned off in this chat.");
+    assert_eq!(refused(react("u7002", "12", "🦄")), "That reaction isn't allowed here.", "Premium's");
+    assert!(!world.calls().iter().any(|call| call.starts_with("SendReaction")), "{:?}", world.calls());
+    assert!(world.message("g8001", "20").unwrap().reactions.is_empty(), "nothing was shown either");
+
+    // Without Premium a second reaction replaces the first, on screen and on Telegram.
+    assert_eq!(react("g8001", "20", "👍"), Response::Ok);
+    assert_eq!(react("g8001", "20", "❤️"), Response::Ok);
+    let calls: Vec<String> = world.calls().into_iter().filter(|call| call.starts_with("SendReaction g8001")).collect();
+    assert_eq!(calls, ["SendReaction g8001 20 👍", "SendReaction g8001 20 ❤"], "as Telegram spells it");
+    let shown: Vec<(String, bool)> = world.message("g8001", "20").unwrap().reactions.into_iter().map(|have| (have.emoji, have.mine)).collect();
+    assert_eq!(shown.iter().filter(|(_, mine)| *mine).count(), 1, "{shown:?}");
 }
 
 #[test]
@@ -807,6 +855,8 @@ fn pickers_and_sending_with_files_options_and_picks() {
     let album = send("8106", "trip", protocol::Outgoing { files: with, ..Default::default() });
     assert_eq!(album.state, SendState::Sent);
     assert_eq!((world.called("UploadMedia photo"), world.called("SendMultiMedia u7002 kept-photo,kept-photo")), (2, 1));
+    // The album is the message, and shows as sent once it lands; the document goes after it.
+    world.until("the document after the album", || (world.called("SendMedia u7002 file:application/pdf") > 0).then_some(()));
     assert_eq!(world.called("SendMedia u7002 file:application/pdf"), 1);
     // A big file goes in big parts.
     let big = file("track.gpx", 10 * 1024 * 1024 + 5);

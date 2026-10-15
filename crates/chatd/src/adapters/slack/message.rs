@@ -326,6 +326,7 @@ impl Slack {
             thumb,
             mime: mime.to_owned(),
             duration: (file["duration_ms"].as_u64().unwrap_or(0) / 1000) as u32,
+            round: false,
         })
     }
 

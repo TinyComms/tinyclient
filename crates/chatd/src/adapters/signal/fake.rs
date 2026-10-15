@@ -3,9 +3,8 @@
 //! chatd's socket (`tests/signal.rs`) with no Signal library linked; it is reachable only in a
 //! scratch directory with `TINYCLIENT_SIGNAL_FAKE` set, never from a real session.
 //!
-//! A test steers it by writing lines to a FIFO in the scratch directory (on Windows a file it
-//! appends to, see `adapters/script.rs`): `signal.signin.ctl` while linking (`scan`, `expire`, `fail`),
-//! `signal.ctl` once linked:
+//! A test steers it by appending lines to a file in the scratch directory (`adapters/script.rs`):
+//! `signal.signin.ctl` while linking (`scan`, `expire`, `fail`), `signal.ctl` once linked:
 //!
 //! | Line | What Signal then says |
 //! | --- | --- |
@@ -97,8 +96,7 @@ impl Fake {
         fake
     }
 
-    /// Reads the test's lines for as long as this wire lives. Blocked in the FIFO between
-    /// lines, so it costs nothing; closing the wire writes it one last line to end it.
+    /// Reads the test's lines for as long as this wire lives; closing the wire ends it.
     fn listen(&self) {
         let (events, closed, refuse, control) = (self.events.clone(), self.closed.clone(), self.refuse.clone(), self.control.clone());
         let _ = std::thread::Builder::new().name("signal-fake".into()).spawn(move || {
@@ -252,9 +250,8 @@ impl Wire for Fake {
     }
 
     fn close(&self) {
-        if !self.closed.swap(true, Ordering::Relaxed) {
-            script::wake(&self.control);
-        }
+        // The reader sees it within 20 ms and stops.
+        self.closed.store(true, Ordering::Relaxed);
     }
 }
 
@@ -266,20 +263,6 @@ impl Drop for Fake {
 
 /// Links when the test says the phone scanned the code.
 pub struct FakeLinker;
-
-/// Wakes a link waiting on the test, when the sign-in is cancelled. The link may be between two
-/// opens of its FIFO, so this tries for a moment until it is reading.
-pub fn wake_link() {
-    let path = protocol::support_dir().join("signal.signin.ctl");
-    let _ = std::thread::Builder::new().name("signal-fake-wake".into()).spawn(move || {
-        for _ in 0..40 {
-            if script::wake(&path) {
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-    });
-}
 
 impl Linker for FakeLinker {
     fn link(self: Box<Self>, device: &str, show: &dyn Fn(String), cancelled: Arc<AtomicBool>) -> Result<Linked, Fault> {

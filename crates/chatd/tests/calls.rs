@@ -534,3 +534,76 @@ fn a_ring_we_placed_is_not_a_call_until_the_other_side_answers_whatever_our_medi
 
     assert!(matches!(chatd.ask(Request::CallEnd), Response::Status { call: None, .. }));
 }
+
+#[test]
+fn the_microphone_test_outside_a_call_meters_ten_times_a_second_and_its_mediad_leaves_when_it_stops() {
+    let _turn = alone();
+    let (hub, dir) = hub();
+    let seq = hub.seq();
+    assert!(hub.calls.test_microphone(&hub, true).is_ok());
+    assert_eq!(mediads(), 1, "one mediad, for the test");
+    let mut levels = Vec::new();
+    let mut since = seq;
+    let began = Instant::now();
+    while levels.len() < 5 {
+        assert!(began.elapsed() < PATIENCE, "no levels");
+        let (seq, _, changes) = hub.wait(since, Duration::from_millis(200));
+        since = seq;
+        levels.extend(changes.iter().filter_map(|change| match change {
+            Change::Meter { level: Some(level) } => Some(*level),
+            _ => None,
+        }));
+    }
+    assert!(levels.iter().all(|level| (60..90).contains(level)), "the tone's level: {levels:?}");
+    // Ten a second: five took about half a second, not less.
+    assert!(began.elapsed() >= Duration::from_millis(350), "{:?} for five", began.elapsed());
+
+    let stopped = Instant::now();
+    assert!(hub.calls.test_microphone(&hub, false).is_ok());
+    until("the test mediad to exit", || mediads() == 0);
+    assert!(stopped.elapsed() < Duration::from_secs(3), "gone {:?} after the test ended", stopped.elapsed());
+    let (_, _, changes) = hub.wait(since, Duration::from_millis(10));
+    assert!(changes.iter().any(|change| matches!(change, Change::Meter { level: None })), "the meter is told it is over");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn the_test_sound_outside_a_call_plays_on_a_mediad_of_its_own_that_then_exits() {
+    let _turn = alone();
+    let (hub, dir) = hub();
+    let played = dir.join("played.pcm");
+    std::env::set_var("TINYCLIENT_MEDIAD_SINK", &played);
+    hub.set_setting("", protocol::settings::CUE_VOLUME, Some("100".into())).unwrap();
+    assert_eq!(hub.settings().number(protocol::settings::CUE_VOLUME), 100);
+
+    let pressed = Instant::now();
+    assert!(hub.calls.test_sound(&hub).is_ok());
+    assert_eq!(mediads(), 1);
+    until("the test mediad to exit", || mediads() == 0);
+    std::env::remove_var("TINYCLIENT_MEDIAD_SINK");
+    assert!(pressed.elapsed() < Duration::from_secs(3), "{:?}", pressed.elapsed());
+    let bytes = std::fs::read(&played).unwrap();
+    let peak = bytes.as_chunks::<2>().0.iter().map(|&pair| i16::from_le_bytes(pair).saturating_abs()).max().unwrap_or(0);
+    let db = 20. * (f64::from(peak) / 32767.).log10();
+    assert!((db + 20.).abs() < 1., "the join cue at 100 % peaks at -20 dBFS, not {db}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn a_call_starts_muted_when_the_user_joins_muted_and_a_test_gives_way_to_it() {
+    let _turn = alone();
+    let (hub, dir) = hub();
+    hub.set_setting("", protocol::settings::JOIN_MUTED, Some("on".into())).unwrap();
+    assert!(hub.calls.test_microphone(&hub, true).is_ok());
+    assert_eq!(mediads(), 1);
+    assert!(hub.calls.start(&hub, lounge()).is_ok());
+    // The test's mediad went; the call's is the one left.
+    until("one mediad", || mediads() == 1);
+    assert!(hub.calls.describe().0.unwrap().muted, "joined muted");
+    // In a call the microphone test is the call's own meter.
+    assert!(hub.calls.test_microphone(&hub, true).is_ok());
+    assert_eq!(mediads(), 1);
+    assert!(hub.calls.end(&hub).is_some());
+    until("no mediad", || mediads() == 0);
+    let _ = std::fs::remove_dir_all(dir);
+}

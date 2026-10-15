@@ -1,6 +1,6 @@
 //! The Signal adapter through chatd's real socket, with a scripted wire where Signal would be
 //! (`adapters/signal/fake.rs`): the account, its contacts and its group are invented there, and
-//! each test steers it by writing a line to a FIFO in its scratch directory.
+//! each test steers it by appending a line to a file in its scratch directory.
 //!
 //! What this proves is everything above the wire: what the adapter asks Signal for and how it maps
 //! what comes back into the contract, and the link steps. It proves nothing about presage and
@@ -119,29 +119,19 @@ impl World {
         self.write_to("signal.signin.ctl", line);
     }
 
-    fn write_to(&self, fifo: &str, line: &str) {
-        let path = self.dir.join(fifo);
+    fn write_to(&self, control: &str, line: &str) {
+        let path = self.dir.join(control);
         self.until("the fake to listen", || path.exists().then_some(()));
-        // Blocks until the fake is reading, which it is whenever it is alive. The fake opens the
-        // FIFO again after each writer: a write that met it closing went nowhere, and is made again.
-        // On Windows the fake reads a plain file on from where it was, so lines go on its end.
-        loop {
-            let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
-            match writeln!(file, "{line}") {
-                Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => continue,
-                written => break written.unwrap(),
-            }
-        }
-        // A FIFO's write waits for the fake to read; on Windows the fake says how far it has read.
-        #[cfg(windows)]
-        {
-            let end = std::fs::metadata(&path).unwrap().len();
-            let mut taken = path.clone().into_os_string();
-            taken.push(".taken");
-            let taken = std::path::PathBuf::from(taken);
-            let read = || std::fs::read_to_string(&taken).ok().and_then(|at| at.trim().parse::<u64>().ok()).unwrap_or(0);
-            self.until("the fake to take the line", || (read() >= end).then_some(()));
-        }
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(file, "{line}").unwrap();
+        drop(file);
+        // The fake says how far it has read and acted: the line is taken when this returns.
+        let end = std::fs::metadata(&path).unwrap().len();
+        let mut taken = path.clone().into_os_string();
+        taken.push(".taken");
+        let taken = PathBuf::from(taken);
+        let read = || std::fs::read_to_string(&taken).ok().and_then(|at| at.trim().parse::<u64>().ok()).unwrap_or(0);
+        self.until("the fake to take the line", || (read() >= end).then_some(()));
     }
 
     fn status(&self) -> (Vec<protocol::AccountStatus>, u64) {
@@ -337,6 +327,20 @@ fn reactions_edits_deletes_and_receipts_land_on_the_right_message() {
     let again = world.arrived(GRACE, &id(T0 + 2_000, GRACE));
     assert_eq!(world.ask(Request::React { conversation: key(GRACE), message_id: again.id.clone(), emoji: "👋".into(), on: true }), Response::Ok);
     world.heard(&format!("send {GRACE} react {}-{GRACE} 👋 remove=false", T0 + 2_000));
+    // One reaction a person: another replaces mine at once and on Signal, and is the only one.
+    let Response::Reactions { rules, .. } = world.ask(Request::Reactions { conversation: key(GRACE) }) else {
+        panic!("no rules");
+    };
+    assert_eq!((rules.mine, rules.replaces, rules.custom), (1, true, protocol::EmojiScope::None));
+    assert_eq!(world.ask(Request::React { conversation: key(GRACE), message_id: again.id.clone(), emoji: "🎉".into(), on: true }), Response::Ok);
+    let held = world.messages(GRACE).into_iter().find(|m| m.id == again.id).unwrap();
+    let mine: Vec<String> = held.reactions.into_iter().filter(|r| r.mine).map(|r| r.emoji).collect();
+    assert_eq!(mine, ["🎉"]);
+    world.heard(&format!("send {GRACE} react {}-{GRACE} 🎉 remove=false", T0 + 2_000));
+    // A custom emoji is nothing Signal can carry, so it is never sent.
+    let custom = world.ask(Request::React { conversation: key(GRACE), message_id: again.id.clone(), emoji: ":party:".into(), on: true });
+    assert!(matches!(&custom, Response::Error { code: protocol::ErrorCode::Refused, .. }), "{custom:?}");
+    assert!(!world.calls().iter().any(|call| call.contains(":party:")));
     assert_eq!(world.ask(Request::Edit { conversation: key(GRACE), message_id: ours.id.clone(), text: "Sure!".into() }), Response::Ok);
     world.heard(&format!("send {GRACE} edit {FIRST_SENT} Sure!"));
     assert!(world.messages(GRACE).iter().any(|m| m.id == ours.id && m.edited && m.text == "Sure!"));

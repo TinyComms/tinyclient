@@ -19,8 +19,8 @@ mod discord;
 pub mod net;
 mod script;
 pub mod signal;
-mod slack;
-mod teams;
+pub(crate) mod slack;
+pub(crate) mod teams;
 pub mod telegram;
 
 use crate::hub::{lock, now, Hub};
@@ -204,6 +204,11 @@ pub enum Command {
         on: bool,
         reply: Reply<()>,
     },
+    /// What reactions a conversation takes from this account, from what the network says of
+    /// it: the chat's own set, our permissions and plan. One request at most, because the user
+    /// opened it; chatd keeps the answer five minutes. `Unsupported` leaves every reaction to the
+    /// network to judge.
+    ReactionRules { conversation_id: String, reply: Reply<protocol::ReactionRules> },
     /// Replace the text of one of our messages. Report the edited message through
     /// [`Context::message`] before answering: nothing was changed locally.
     Edit {
@@ -335,6 +340,7 @@ impl Command {
             Command::Pinned { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SearchShared { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Catalog { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ReactionRules { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SendWith { conversation_id, client_id, .. } => {
                 let why = format!("Sending files and options is not built for {} yet.", ctx.account.network.label());
                 ctx.sent(&conversation_id, &client_id, Err(why));
@@ -1151,14 +1157,20 @@ pub fn start(account: AccountKey, session: &str, hub: Arc<Hub>) -> Result<Adapte
         commands: commands.clone(),
         stop: stop.clone(),
     };
-    match account.network {
-        Network::Slack => slack::start(ctx.clone(), session, inbox)?,
-        Network::Discord => discord::start(ctx.clone(), session, inbox)?,
-        Network::Telegram => telegram::start(ctx.clone(), session, inbox)?,
-        Network::Teams => teams::start(ctx.clone(), session, inbox)?,
-        Network::Signal => signal::start(ctx.clone(), session, inbox)?,
-    }
+    // Offline until the adapter says more, and said before its threads start: one that connects
+    // at once (the scripted wires do) would otherwise have its Connected overwritten for good.
     ctx.link(Link::Offline);
+    let started = match account.network {
+        Network::Slack => slack::start(ctx.clone(), session, inbox),
+        Network::Discord => discord::start(ctx.clone(), session, inbox),
+        Network::Telegram => telegram::start(ctx.clone(), session, inbox),
+        Network::Teams => teams::start(ctx.clone(), session, inbox),
+        Network::Signal => signal::start(ctx.clone(), session, inbox),
+    };
+    if let Err(why) = started {
+        ctx.link(Link::SignedOut);
+        return Err(why);
+    }
     Ok(Adapter { commands, stop })
 }
 

@@ -41,7 +41,7 @@ pub fn local(unix: i64) -> Local {
     }
 }
 
-fn broken_down_local(seconds: libc::time_t) -> libc::tm {
+pub(super) fn broken_down_local(seconds: libc::time_t) -> libc::tm {
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     // SAFETY: `localtime_r` / `localtime_s` write a full `tm` into the buffer we own.
     unsafe {

@@ -152,6 +152,9 @@ pub struct Attachment {
     /// length in seconds is `duration`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub waveform: Vec<u8>,
+    /// A round video message (Telegram's): drawn in a circle.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub round: bool,
 }
 
 impl Attachment {
@@ -166,6 +169,7 @@ impl Attachment {
             spoiler: false,
             sticker: false,
             waveform: Vec::new(),
+            round: false,
         }
     }
 }

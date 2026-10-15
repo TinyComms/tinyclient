@@ -4,6 +4,7 @@ use crate::hub::{lock, now, Hub, KEYCHAIN_PROMPT};
 use crate::media::CallError;
 use crate::session;
 use crate::store::Store;
+use protocol::settings;
 use protocol::{
     clip, read_frame_bytes, support_dir, write_frame, CatalogKind, ConversationInfo, MediaFile, MediaKind, Outgoing, SharedKind, SpaceInfo, AccountKey, AccountStatus, CallSupport, Capabilities,
     Change, ChatListener, ChatStream, Conversation, ConversationKind, ErrorCode, InboxCounts, Key,
@@ -180,15 +181,20 @@ impl Chat {
         lock(&chat.adapters).extend(crate::demo::attach(&chat.hub));
         // Whatever was on its way when chatd last stopped did not go.
         let _ = chat.hub.store().fail_pending(i64::MAX, "tinyclient was restarted before this was sent.");
-        // Retention runs behind the socket, at start and once a day. A sleeping thread costs
-        // nothing in between.
+        // Retention runs behind the socket, at start, once a day, and when its setting changes.
+        // A sleeping thread costs nothing in between.
         let hub = chat.hub.clone();
         std::thread::spawn(move || loop {
-            match hub.store().prune(now()) {
+            let days = hub.settings().number(settings::KEEP_DAYS);
+            match hub.store().prune(now(), days) {
                 Ok(0) | Err(_) => {}
-                Ok(gone) => eprintln!("chatd: pruned {gone} old messages"),
+                Ok(gone) => {
+                    eprintln!("chatd: pruned {gone} old messages");
+                    // What is on screen may be gone.
+                    hub.reset();
+                }
             }
-            std::thread::sleep(Duration::from_secs(86_400));
+            hub.prune_due(Duration::from_secs(86_400));
         });
         chat
     }
@@ -293,11 +299,87 @@ impl Chat {
     }
 
     fn forget(&self, account: &AccountKey) {
+        self.hub.player.forget(&self.hub, account);
         self.blobs.forget(account);
         if let Err(err) = self.hub.store().forget(account) {
             eprintln!("chatd: {}: {err}", account.network.label());
         }
+        self.hub.reload_settings();
         self.hub.forget_live(account);
+    }
+
+    /// Stores a setting and has whatever reads it take it up now.
+    fn set(&self, scope: String, key: String, value: Option<String>) -> Response {
+        let allowed = match &value {
+            Some(value) => settings::valid(&scope, &key, value),
+            None => settings::known(&scope, &key),
+        };
+        if !allowed {
+            return error(ErrorCode::Refused, format!("{key} cannot be {value:?} here"));
+        }
+        if let Err(err) = self.hub.set_setting(&scope, &key, value) {
+            return internal(err);
+        }
+        match key.as_str() {
+            settings::KEEP_DAYS => self.hub.prune_soon(),
+            settings::CACHE_MB => self.blobs.cap_changed(),
+            settings::SOUNDS
+            | settings::CUE_JOINS
+            | settings::CUE_MINE
+            | settings::CUE_CONNECTION
+            | settings::CUE_VOLUME
+            | settings::VOICE_VOLUME
+            | settings::SENSITIVITY => self.hub.calls.retune(&self.hub),
+            _ => {}
+        }
+        Response::Ok
+    }
+
+    /// Reset all (B3). The cache cap and retention go back to their defaults with the rest.
+    fn reset_settings(&self) -> Response {
+        if let Err(err) = self.hub.reset_settings() {
+            return internal(err);
+        }
+        self.blobs.cap_changed();
+        self.hub.prune_soon();
+        self.hub.calls.retune(&self.hub);
+        Response::Ok
+    }
+
+    /// Bytes on this Mac: the database with its journal, and the cached files.
+    fn storage(&self) -> Response {
+        let dir = support_dir();
+        let size = |name: &str| std::fs::metadata(dir.join(name)).map_or(0, |meta| meta.len());
+        let messages = size("chat.sqlite") + size("chat.sqlite-wal") + size("chat.sqlite-shm");
+        Response::Storage { messages, files: self.blobs.bytes() }
+    }
+
+    /// Clear (D3): the files, then the messages, then every window reads what is left.
+    fn clear(&self) -> Response {
+        self.blobs.clear();
+        if let Err(err) = self.hub.store().clear_cache() {
+            return internal(err);
+        }
+        self.hub.reset();
+        Response::Ok
+    }
+
+    /// chatd stops: the call is left on the network first, and the answer goes out before the
+    /// process does.
+    fn shutdown(&self) -> Response {
+        if let Some(conversation) = self.hub.calls.end(&self.hub) {
+            self.command(&conversation.account(), Command::CallLeave(conversation.id));
+        }
+        let spawned = std::thread::Builder::new().name("shutdown".into()).stack_size(64 * 1024).spawn(|| {
+            // Time for this answer to be written and the adapter to say goodbye.
+            std::thread::sleep(Duration::from_millis(300));
+            eprintln!("chatd: asked to stop, exiting");
+            std::process::exit(0);
+        });
+        if spawned.is_err() {
+            std::process::exit(0);
+        }
+        Response::Ok
     }
 
     fn command(&self, account: &AccountKey, command: Command) {
@@ -538,10 +620,18 @@ impl Chat {
     }
 
     fn mark_read(&self, conversation: Key, message_id: String) -> Response {
-        match self.hub.store().mark_read(&conversation, &message_id) {
+        // The store is let go before the settings are read: a guard made in a `match` lives
+        // to its end, and `Hub::set_setting` takes the two the other way round.
+        let marked = self.hub.store().mark_read(&conversation, &message_id);
+        match marked {
             Ok(true) => {
                 let conversation_id = conversation.id.clone();
-                self.command(&conversation.account(), Command::MarkRead { conversation_id, message_id });
+                // P2: off, the chat is read here and the network is not told, which is what
+                // others would see as a receipt.
+                let account = conversation.account();
+                if self.hub.settings().receipts(&account) {
+                    self.command(&account, Command::MarkRead { conversation_id, message_id });
+                }
                 self.hub.changed(Change::Conversation { conversation });
                 self.hub.changed(Change::Status);
                 Response::Ok
@@ -663,53 +753,97 @@ impl Chat {
         }
     }
 
-    /// Our reaction, shown at once and taken back if the network refuses it. A custom emoji
-    /// that is not on the message yet has no name here to draw, so that one waits for the
-    /// network's own word.
+    /// What reactions a conversation takes, kept five minutes. `None` when the adapter does not
+    /// say, or could not ask: then the network alone judges.
+    fn reaction_rules(&self, conversation: &Key) -> Result<protocol::ReactionRules, Refused> {
+        if let Some(rules) = self.hub.reactions.get(conversation) {
+            return Ok(rules);
+        }
+        let conversation_id = conversation.id.clone();
+        let mut rules = self.ask(&conversation.account(), |reply| Command::ReactionRules { conversation_id, reply })?;
+        rules.bound();
+        self.hub.reactions.keep(conversation.clone(), rules.clone());
+        Ok(rules)
+    }
+
+    fn reactions(&self, conversation: Key) -> Response {
+        match self.reaction_rules(&conversation) {
+            Ok(rules) => Response::Reactions { conversation, rules },
+            Err(refused) => *refused,
+        }
+    }
+
+    /// Our reaction, shown at once and taken back if the network refuses it. One the
+    /// conversation's rules refuse is refused here and never sent; one that replaces mine (a
+    /// network with one reaction a person) takes mine off at once too. A custom emoji that is
+    /// not on the message yet has no name here to draw, so that one waits for the network's word.
     fn react(&self, conversation: Key, message_id: String, emoji: String, on: bool) -> Response {
         let account = conversation.account();
         if let Err(refused) = self.online(&account) {
             return *refused;
         }
-        let ours = Reaction {
-            emoji: emoji.clone(),
+        let ours = |emoji: &str| Reaction {
+            emoji: emoji.to_owned(),
             file: None,
             count: 1,
             mine: true,
         };
+        let message = match self.hub.store().message(&conversation, &message_id) {
+            Ok(Some(message)) => message,
+            Ok(None) => return error(ErrorCode::NotFound, "no such message"),
+            Err(err) => return internal(err),
+        };
+        let known = self.hub.store().media(&account, std::slice::from_ref(&emoji)).is_ok_and(|known| !known.is_empty());
+        // Rules the adapter cannot give leave it to the network, as before there were any.
+        let (emoji, replacing) = match (on, self.reaction_rules(&conversation)) {
+            (true, Ok(rules)) => match rules.check(&message.reactions, &emoji, known || emoji.starts_with(':')) {
+                // Sent as the network spells it, so its own word of it is the same reaction.
+                Ok(replacing) => (rules.spelled(&emoji).to_owned(), replacing),
+                Err(why) => return error(ErrorCode::Refused, why),
+            },
+            _ => (emoji, Vec::new()),
+        };
         let shown = {
             let mut store = self.hub.store();
-            let message = match store.message(&conversation, &message_id) {
-                Ok(Some(message)) => message,
-                Ok(None) => return error(ErrorCode::NotFound, "no such message"),
-                Err(err) => return internal(err),
-            };
+            for old in &replacing {
+                if let Err(err) = store.react(&conversation, &message_id, &ours(old), false) {
+                    return internal(err);
+                }
+            }
             let on_it = message.reactions.iter().any(|have| have.emoji == emoji || have.file.as_ref().is_some_and(|file| file.id == emoji));
-            let custom = store.media(&account, std::slice::from_ref(&emoji)).is_ok_and(|known| !known.is_empty());
-            if custom && !on_it {
+            if known && !on_it {
                 false
             } else {
-                match store.react(&conversation, &message_id, &ours, on) {
+                match store.react(&conversation, &message_id, &ours(&emoji), on) {
                     Ok(changed) => changed,
                     Err(err) => return internal(err),
                 }
             }
         };
-        if shown {
+        if shown || !replacing.is_empty() {
             self.hub.changed(Change::Messages { conversation: conversation.clone() });
         }
         let (conversation_id, id) = (conversation.id.clone(), message_id.clone());
         let asked = self.ask(&account, |reply| Command::React {
             conversation_id,
             message_id: id,
-            emoji,
+            emoji: emoji.clone(),
             on,
             reply,
         });
         match asked {
             Ok(()) => Response::Ok,
             Err(refused) => {
-                if shown && self.hub.store().react(&conversation, &message_id, &ours, !on).unwrap_or(false) {
+                // What the network refused may be what the kept rules allowed: ask again next time.
+                self.hub.reactions.forget(&conversation);
+                let mut store = self.hub.store();
+                let mut undone = shown && store.react(&conversation, &message_id, &ours(&emoji), !on).unwrap_or(false);
+                for old in &replacing {
+                    let had = message.reactions.iter().find(|have| have.emoji == *old).map(|have| Reaction { count: 1, ..have.clone() });
+                    undone |= store.react(&conversation, &message_id, &had.unwrap_or_else(|| ours(old)), true).unwrap_or(false);
+                }
+                drop(store);
+                if undone {
                     self.hub.changed(Change::Messages { conversation });
                 }
                 *refused
@@ -1173,8 +1307,17 @@ impl Chat {
         if let Err(err) = self.hub.calls.start(&self.hub, conversation.clone()) {
             return call_error(err);
         }
-        self.command(&conversation.account(), Command::CallJoin(conversation.id));
+        self.join(conversation);
         self.status()
+    }
+
+    /// Has the adapter join, muted when the user joins muted (V4).
+    fn join(&self, conversation: Key) {
+        let account = conversation.account();
+        self.command(&account, Command::CallJoin(conversation.id));
+        if self.hub.settings().on(settings::JOIN_MUTED) {
+            self.command(&account, Command::CallAudio { muted: true, deafened: false });
+        }
     }
 
     pub fn handle(&self, request: Request) -> Response {
@@ -1409,13 +1552,15 @@ impl Chat {
             }
             Request::Typing { conversation } => {
                 let account = conversation.account();
-                if self.hub.link(&account) == Link::Connected {
+                // P1: off, the network never hears it.
+                if self.hub.link(&account) == Link::Connected && self.hub.settings().typing(&account) {
                     self.command(&account, Command::Typing(conversation.id));
                 }
                 Response::Ok
             }
 
             Request::React { conversation, message_id, emoji, on } => self.react(conversation, message_id, emoji, on),
+            Request::Reactions { conversation } => self.reactions(conversation),
             Request::Edit { conversation, message_id, text } => self.rewrite(conversation, message_id, Some(text)),
             Request::Delete { conversation, message_id } => self.rewrite(conversation, message_id, None),
 
@@ -1465,7 +1610,7 @@ impl Chat {
             Request::CallStart { conversation } => self.call_start(conversation),
             Request::CallAccept => match self.hub.calls.accept(&self.hub) {
                 Ok(conversation) => {
-                    self.command(&conversation.account(), Command::CallJoin(conversation.id));
+                    self.join(conversation);
                     self.status()
                 }
                 Err(err) => call_error(err),
@@ -1492,6 +1637,10 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
+            Request::Play(request) => match self.hub.player.request(&self.hub, &support_dir().join("media"), request) {
+                Ok(()) => Response::Ok,
+                Err(detail) => error(ErrorCode::Media, detail),
+            },
             Request::Media(request) => {
                 let asked = match request {
                     // Joining is the adapter's to ask for, with what the network handed out.
@@ -1506,6 +1655,28 @@ impl Chat {
                     Err(err) => call_error(err),
                 }
             }
+
+            Request::Settings => match self.hub.store().settings() {
+                Ok(values) => Response::Settings { values },
+                Err(err) => internal(err),
+            },
+            Request::Set { scope, key, value } => self.set(scope, key, value),
+            Request::ResetSettings => self.reset_settings(),
+            Request::Shutdown => self.shutdown(),
+            Request::Storage => self.storage(),
+            Request::Clear => self.clear(),
+            Request::Prunable { days } => match self.hub.store().prunable(now(), days) {
+                Ok((messages, bytes)) => Response::Prunable { messages, bytes },
+                Err(err) => internal(err),
+            },
+            Request::TestMicrophone { on } => match self.hub.calls.test_microphone(&self.hub, on) {
+                Ok(()) => Response::Ok,
+                Err(err) => call_error(err),
+            },
+            Request::TestSound => match self.hub.calls.test_sound(&self.hub) {
+                Ok(()) => Response::Ok,
+                Err(err) => call_error(err),
+            },
         }
     }
 }

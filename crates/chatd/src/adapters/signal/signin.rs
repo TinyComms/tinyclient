@@ -8,7 +8,7 @@
 //! the user cancels after the phone accepted it is undone on the account (the linker's duty).
 
 use super::wire::Fault;
-use super::{linker, scripted, supported, unsupported_reason};
+use super::{linker, supported, unsupported_reason};
 use crate::hub::Hub;
 use protocol::{AccountKey, Change, Network, SignInInput, SignInProblem, SignInStep};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -85,9 +85,6 @@ pub fn cancel() {
     if let Some(flow) = current().take() {
         flow.cancelled.store(true, Ordering::Relaxed);
         flow.ended.store(true, Ordering::Relaxed);
-        if scripted() {
-            super::fake::wake_link();
-        }
     }
 }
 

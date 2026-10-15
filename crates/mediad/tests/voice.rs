@@ -20,7 +20,7 @@ use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::Aes256Gcm;
 use chacha20poly1305::XChaCha20Poly1305;
 use mediad::opus::{Decoder, Encoder, MAX_FRAME};
-use protocol::{read_frame, write_frame, CallFailure, Dave, MediaRequest, MediaResponse, Network, VoiceJoin};
+use protocol::{read_frame, write_frame, CallFailure, Cue, Dave, MediaRequest, MediaResponse, Network, Tuning, VoiceJoin};
 use serde_json::{json, Value};
 use native_tls::{Identity, TlsAcceptor, TlsStream};
 use std::io::{ErrorKind, Read, Write};
@@ -781,6 +781,9 @@ fn mute_sends_a_trail_of_silence_and_then_nothing_and_deafen_plays_nothing() {
     let mut fake = Fake::new();
     let played_to = sink("deafen");
     let mut mediad = Mediad::start("tone", Some(&played_to));
+    // Without the mute and deafen cues: this is about the voices.
+    let quiet = Tuning { mine: false, ..Tuning::default() };
+    assert_eq!(mediad.ask(MediaRequest::Tune(quiet)), MediaResponse::Done);
     mediad.join(&fake.endpoint(), NO_DAVE);
     let mut peer = fake.accept();
     fake.handshake(&mut peer, &[AES], 0, 30_000);
@@ -817,6 +820,55 @@ fn mute_sends_a_trail_of_silence_and_then_nothing_and_deafen_plays_nothing() {
     assert_eq!(mediad.hang_up().0.code(), Some(0));
     let loudest = played(&played_to).chunks(960 * 2 * 5).map(rms).fold(0., f64::max);
     assert!(loudest < 1., "deafened, yet level {loudest} was played");
+    let _ = std::fs::remove_file(played_to);
+}
+
+#[test]
+fn a_mute_is_heard_as_one_quiet_cue_at_the_chosen_volume_and_not_at_all_when_switched_off() {
+    let mut fake = Fake::new();
+    let played_to = sink("cues");
+    let mut mediad = Mediad::start("null", Some(&played_to));
+    let loud = Tuning { cues: 100, ..Tuning::default() };
+    assert_eq!(mediad.ask(MediaRequest::Tune(loud)), MediaResponse::Done);
+    mediad.join(&fake.endpoint(), NO_DAVE);
+    let mut peer = fake.accept();
+    fake.handshake(&mut peer, &[AES], 0, 30_000);
+    mediad.connected();
+    sleep(Duration::from_millis(200));
+
+    assert_eq!(mediad.ask(MediaRequest::Audio { muted: true, deafened: false }), MediaResponse::Done);
+    sleep(Duration::from_millis(300));
+    // S8 off: unmuting is silent. The test sound still plays, at half the volume.
+    assert_eq!(mediad.ask(MediaRequest::Tune(Tuning { mine: false, cues: 50, ..loud })), MediaResponse::Done);
+    assert_eq!(mediad.ask(MediaRequest::Audio { muted: false, deafened: false }), MediaResponse::Done);
+    sleep(Duration::from_millis(300));
+    assert_eq!(mediad.ask(MediaRequest::Cue { cue: Cue::Test }), MediaResponse::Done);
+    sleep(Duration::from_millis(400));
+    assert_eq!(mediad.hang_up().0.code(), Some(0));
+
+    // Sounds are where nothing is silent; the null microphone and no peer leave only cues.
+    let pcm = played(&played_to);
+    let mut heard: Vec<(usize, usize, i16)> = Vec::new();
+    for (at, sample) in pcm.iter().enumerate() {
+        if sample.saturating_abs() < 30 {
+            continue;
+        }
+        match heard.last_mut() {
+            Some((_, end, peak)) if at - *end < 960 => {
+                *end = at;
+                *peak = (*peak).max(sample.saturating_abs());
+            }
+            _ => heard.push((at, at, sample.saturating_abs())),
+        }
+    }
+    assert_eq!(heard.len(), 2, "the mute cue and the test sound, nothing for the unmute: {heard:?}");
+    let db = |peak: i16| 20. * (f64::from(peak) / 32767.).log10();
+    let (mute, test) = (heard[0], heard[1]);
+    assert!((db(mute.2) + 20.).abs() < 1., "at 100 % a cue peaks at -20 dBFS, not {}", db(mute.2));
+    assert!((db(test.2) + 26.).abs() < 1., "at 50 % it is 6 dB lower, not {}", db(test.2));
+    // Stereo: twice the samples of the 60 ms tick and of the 180 ms join cue.
+    assert!((mute.1 - mute.0) <= 2 * 48 * 60, "the mute cue lasts {} samples", mute.1 - mute.0);
+    assert!((test.1 - test.0) > 2 * 48 * 150, "the test sound lasts {} samples", test.1 - test.0);
     let _ = std::fs::remove_file(played_to);
 }
 

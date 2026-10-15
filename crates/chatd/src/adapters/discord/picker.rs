@@ -4,7 +4,7 @@
 use super::super::{CatalogPage, Refusal};
 use super::model::{self, GuildEmoji, GuildSticker};
 use super::{refusal, Discord, Pickable};
-use protocol::{CatalogItem, CatalogKind, MediaFile, MediaKind};
+use protocol::{CatalogItem, CatalogKind, EmojiScope, MediaFile, MediaKind, ReactionRules};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -73,7 +73,8 @@ impl Discord {
         };
         if let Some(emojis) = changed.emojis {
             info.emojis = emojis.into_iter().filter(|emoji| emoji.available).filter_map(|emoji| {
-                Some(Pickable { id: emoji.id?, name: emoji.name, animated: emoji.animated, format: 0 })
+                let roles = emoji.roles.iter().map(|role| model::number(role)).collect();
+                Some(Pickable { id: emoji.id?, name: emoji.name, animated: emoji.animated, format: 0, roles })
             }).collect();
         }
         if let Some(stickers) = changed.stickers {
@@ -82,13 +83,15 @@ impl Discord {
                 format: sticker.format_type,
                 id: sticker.id,
                 name: sticker.name,
+                roles: Box::default(),
             }).collect();
         }
     }
 
     /// One page of a picker's catalog. Emoji and stickers come from what READY said: without
-    /// Nitro only the server the message is said in (none in a DM), with it every server's.
-    /// GIFs are Discord's own search (trending when nothing is typed).
+    /// Nitro only the server the message is said in (none in a DM) and no animated emoji, with
+    /// it every server's. An emoji limited to roles we lack is never offered. GIFs are Discord's
+    /// own search (trending when nothing is typed).
     pub(super) fn catalog(&self, kind: CatalogKind, space: Option<&str>, query: &str, cursor: Option<&str>) -> Result<CatalogPage, Refusal> {
         match kind {
             CatalogKind::Gifs => self.gifs(query),
@@ -110,7 +113,13 @@ impl Discord {
         let query = query.trim().trim_matches(':').to_lowercase();
         let all = guilds.into_iter().flat_map(|(_, info)| {
             let list = if kind == CatalogKind::Emoji { &info.emojis } else { &info.stickers };
-            list.iter().map(move |pickable| (info.name.as_str(), pickable))
+            let usable = move |pickable: &&Pickable| {
+                let emoji = kind == CatalogKind::Emoji;
+                let allowed = pickable.roles.is_empty() || pickable.roles.iter().any(|role| info.my_roles.contains(role));
+                // An animated emoji is Nitro's, even in its own server.
+                !emoji || (allowed && (everywhere || !pickable.animated))
+            };
+            list.iter().filter(usable).map(move |pickable| (info.name.as_str(), pickable))
         });
         let mut matching = all.filter(|(_, pickable)| query.is_empty() || pickable.name.to_lowercase().contains(&query));
         let page: Vec<(&str, &Pickable)> = matching.by_ref().skip(from).take(PAGE).collect();
@@ -135,6 +144,50 @@ impl Discord {
             files.push((file, url));
         }
         (items, files, more)
+    }
+
+    /// What reactions a channel takes from us, from what READY and its updates said, so asking
+    /// costs Discord nothing. In a server: Read Message History to react at all and Add
+    /// Reactions to start a new one (without it only existing ones can be added to), worked out
+    /// from the kept channel as the tree is; a thread goes by its channel. Custom emoji: without
+    /// Nitro only the server's own and none animated, none in a DM; with it any. A message holds
+    /// at most 20 different reactions. Super reactions are never sent.
+    pub(super) fn reaction_rules(&self, channel: &str) -> ReactionRules {
+        let nitro = matches!(crate::hub::lock(&self.state).premium, 1..=3);
+        let mut rules = ReactionRules {
+            custom: if nitro { EmojiScope::All } else { EmojiScope::Space },
+            animated: nitro,
+            distinct: 20,
+            ..ReactionRules::default()
+        };
+        let row = self.ctx.known(channel).ok().flatten();
+        let thread = row.as_ref().is_some_and(|row| row.kind == protocol::ConversationKind::Thread);
+        let Some(guild) = row.and_then(|row| row.space) else {
+            if !nitro {
+                rules.custom = EmojiScope::None;
+            }
+            return rules;
+        };
+        let me = self.me();
+        let kept: Vec<model::Kept> = self.ctx.note(&format!("kept:{guild}")).and_then(|kept| serde_json::from_str(&kept).ok()).unwrap_or_default();
+        let state = crate::hub::lock(&self.state);
+        let Some(info) = state.guilds.get(&guild) else {
+            return rules;
+        };
+        // Threads are not kept; a thread is known by its channel.
+        let parent = info.channels.iter().find(|(id, _)| thread && *id == model::number(channel)).map(|(_, parent)| parent.to_string());
+        let wanted = |id: &str| id == channel || parent.as_deref() == Some(id);
+        let found = kept.into_iter().filter(|kept| wanted(&kept.id)).min_by_key(|kept| kept.id != channel);
+        // A channel not kept (READY not yet seen) is left to Discord to judge.
+        let Some(found) = found else {
+            return rules;
+        };
+        let allowed = info.permissions(&guild, &me, &found.channel());
+        if allowed & model::READ_MESSAGE_HISTORY == 0 {
+            return ReactionRules::off("You can't react in this channel.");
+        }
+        rules.join_only = allowed & model::ADD_REACTIONS == 0;
+        rules
     }
 
     /// Discord's GIF search, which it proxies to its provider. Sent as the result's address,

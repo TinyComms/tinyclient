@@ -3,6 +3,7 @@ pub mod blobs;
 pub mod demo;
 pub mod hub;
 pub mod media;
+pub mod playback;
 pub mod server;
 pub mod session;
 pub mod store;

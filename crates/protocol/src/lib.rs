@@ -17,6 +17,9 @@ mod info;
 pub mod ipc;
 pub mod launch;
 mod message;
+mod play;
+mod react;
+pub mod settings;
 mod signin;
 
 pub use call::*;
@@ -24,6 +27,8 @@ pub use crash::redact;
 pub use info::*;
 pub use ipc::{ChatListener, ChatStream};
 pub use message::*;
+pub use play::*;
+pub use react::*;
 pub use signin::*;
 
 pub const CHAT_SOCK_NAME: &str = "chat.sock";
@@ -1150,6 +1155,11 @@ pub enum Request {
         emoji: String,
         on: bool,
     },
+    /// What reactions the conversation takes from this account: asked when it opens, kept
+    /// five minutes. chatd refuses a `React` these rules refuse, before the network hears of it.
+    Reactions {
+        conversation: Key,
+    },
     /// Replaces the text of one of our own messages. Nothing changes on screen until the
     /// network accepts it; a refusal is the answer.
     Edit {
@@ -1246,6 +1256,40 @@ pub enum Request {
         conversation: Key,
     },
     Media(MediaRequest),
+    /// A voice message or audio file: play, pause, seek, speed, stop. Answers `Ok`; the rest is
+    /// `Change::Playback`.
+    Play(PlayRequest),
+
+    /// Every stored setting (`settings`). Missing ones are at their defaults.
+    Settings,
+    /// Stores one setting, or with `None` returns it to its default. Answered `Ok`, then
+    /// `Change::Settings`. Refused unless `settings::valid` (or, for `None`, `settings::known`).
+    Set {
+        scope: String,
+        key: String,
+        #[serde(default)]
+        value: Option<String>,
+    },
+    /// Reset all settings: every stored row goes, so every setting is at its default.
+    ResetSettings,
+    /// Stops chatd: ⌘Q, and closing the window while Keep receiving is off. Answered `Ok`
+    /// first; a call is left on the network before the process exits.
+    Shutdown,
+    /// What tinyclient keeps on this Mac, in bytes (Settings › Storage).
+    Storage,
+    /// Deletes every cached message and file. Sessions, drafts and settings stay.
+    Clear,
+    /// How much a retention of `days` would delete now.
+    Prunable {
+        days: u32,
+    },
+    /// The microphone test: on, the level arrives as `Change::Meter` ten times a second until
+    /// off, 30 s, or a call starts. In a call it is the call's own meter.
+    TestMicrophone {
+        on: bool,
+    },
+    /// Plays the test sound on the call speaker (V2): in the call's mediad, or one started for it.
+    TestSound,
 }
 
 /// One thing that changed. The shell asks again for exactly that; the ephemeral kinds carry their
@@ -1296,13 +1340,24 @@ pub enum Change {
     /// Ephemeral. A sign-in the shell is drawing moved on by itself: the code was scanned, or
     /// ran out and was replaced.
     SignIn { network: Network, step: SignInStep },
+    /// Ephemeral. The voice message or audio file playing, paused or just ended; `None` once
+    /// stopped.
+    Playback { playback: Option<Playback> },
+    /// A setting was stored or reset: ask `Settings`.
+    Settings,
+    /// Ephemeral. The microphone test's level, 0 to 100; `None` once the test is over.
+    Meter { level: Option<u8> },
 }
 
 impl Change {
     /// Two changes to the same thing: the later one replaces the earlier.
     pub fn same_scope(&self, other: &Change) -> bool {
         match (self, other) {
-            (Change::Status, Change::Status) | (Change::Call { .. }, Change::Call { .. }) => true,
+            (Change::Status, Change::Status)
+            | (Change::Call { .. }, Change::Call { .. })
+            | (Change::Playback { .. }, Change::Playback { .. })
+            | (Change::Settings, Change::Settings)
+            | (Change::Meter { .. }, Change::Meter { .. }) => true,
             (Change::SignIn { network: a, .. }, Change::SignIn { network: b, .. }) => a == b,
             (Change::Conversation { conversation: a }, Change::Conversation { conversation: b })
             | (Change::Messages { conversation: a }, Change::Messages { conversation: b })
@@ -1337,6 +1392,8 @@ impl Change {
                 | Change::Searched { .. }
                 | Change::SignIn { .. }
                 | Change::Upload { .. }
+                | Change::Playback { .. }
+                | Change::Meter { .. }
         )
     }
 }
@@ -1461,6 +1518,10 @@ pub enum Response {
         conversation: Key,
         messages: Vec<Message>,
     },
+    Reactions {
+        conversation: Key,
+        rules: ReactionRules,
+    },
     Catalog {
         items: Vec<CatalogItem>,
         /// Pass back for the next page; `None` at the end.
@@ -1475,6 +1536,19 @@ pub enum Response {
     Error {
         code: ErrorCode,
         detail: String,
+    },
+    Settings {
+        values: Vec<settings::Setting>,
+    },
+    /// Bytes on this Mac: the message database and the cached images and files.
+    Storage {
+        messages: u64,
+        files: u64,
+    },
+    /// What a shorter retention would delete: messages, and about how many bytes of them.
+    Prunable {
+        messages: u64,
+        bytes: u64,
     },
 }
 

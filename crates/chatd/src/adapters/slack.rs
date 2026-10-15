@@ -130,6 +130,25 @@ impl From<Fault> for Failure {
     }
 }
 
+/// What reactions a Slack conversation takes. Slack takes a reaction by name, so the standard
+/// emoji are the ones chatd can name (`emoji::nameable`); a reaction already on a message is
+/// named there and can always be added to. The workspace's custom emoji are all usable. Slack's
+/// help centre puts the limits at 23 reactions a person and 50 different emoji a message
+/// (`too_many_reactions`, `too_many_emoji`); unverified against a real workspace. An archived
+/// channel, which takes none, is never listed (`exclude_archived`).
+pub(crate) fn reaction_rules() -> protocol::ReactionRules {
+    protocol::ReactionRules {
+        set: protocol::ReactionSet::Only,
+        only: emoji::nameable(),
+        // Slack names a tone (`+1::skin-tone-4`).
+        tones: true,
+        custom: protocol::EmojiScope::All,
+        mine: 23,
+        distinct: 50,
+        ..protocol::ReactionRules::default()
+    }
+}
+
 /// A fault in words the user can read.
 fn reason(fault: Fault) -> String {
     let words = match fault {
@@ -140,7 +159,8 @@ fn reason(fault: Fault) -> String {
             "cant_update_message" | "edit_window_closed" => "This message can no longer be edited.",
             "cant_delete_message" => "Slack does not let you delete this message.",
             "message_not_found" => "That message is gone.",
-            "too_many_reactions" | "too_many_emoji" => "This message has as many reactions as Slack allows.",
+            "too_many_reactions" => "You have added as many reactions to this message as Slack allows.",
+            "too_many_emoji" => "This message has as many different reactions as Slack allows.",
             "invalid_name" => "Slack does not know that emoji.",
             "no_emoji_name" => "Slack has no name for that emoji, so it cannot be a reaction here.",
             "no_dnd_end" => "Slack's Do Not Disturb needs an end time. Set it in the Slack app.",
@@ -1308,6 +1328,7 @@ impl Slack {
             Command::Catalog { kind: protocol::CatalogKind::Emoji, query, cursor, reply, .. } => {
                 answer(reply, self.emoji_catalog(&query, cursor.as_deref()))
             }
+            Command::ReactionRules { reply, .. } => drop(reply.send(Ok(reaction_rules()))),
             Command::OpenThreads(_) => self.report(self.open_threads()),
             Command::React { conversation_id, message_id, emoji, on, reply } => {
                 answer(reply, self.react(&conversation_id, &message_id, &emoji, on));

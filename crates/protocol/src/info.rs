@@ -274,6 +274,12 @@ pub enum EmojiScope {
     All,
 }
 
+impl EmojiScope {
+    pub fn is_none(&self) -> bool {
+        *self == EmojiScope::None
+    }
+}
+
 /// What an account may send, as the session says (the plan, the workspace's settings). A
 /// control the account lacks is absent in the shell, never disabled. Nothing is allowed until
 /// the adapter reports it (`Context::capabilities`).

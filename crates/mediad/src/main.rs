@@ -125,8 +125,15 @@ impl Call {
                 return MediaResponse::Done;
             }
             MediaRequest::Audio { muted, deafened } => {
-                self.controls.muted.store(muted, Ordering::Relaxed);
-                self.controls.deafened.store(deafened, Ordering::Relaxed);
+                self.controls.set_audio(muted, deafened);
+                return MediaResponse::Done;
+            }
+            MediaRequest::Tune(tuning) => {
+                self.controls.tune(tuning);
+                return MediaResponse::Done;
+            }
+            MediaRequest::Cue { cue } => {
+                self.controls.cue(cue);
                 return MediaResponse::Done;
             }
             MediaRequest::Devices { input, output } => {
@@ -217,6 +224,22 @@ fn main() -> ExitCode {
         // Who macOS would name in the microphone prompt. Touches no audio and no permission.
         Some("--responsible") => {
             println!("{}", permission::responsible().unwrap_or_default());
+            return ExitCode::SUCCESS;
+        }
+        // One voice message or audio file, for chatd, until it ends or chatd closes stdin.
+        Some("--play") => {
+            return match mediad::play::run() {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(err) => {
+                    eprintln!("mediad: {err}");
+                    ExitCode::from(1)
+                }
+            };
+        }
+        // Settings' microphone test and test sound, with no call (`probe`).
+        Some("test") => {
+            mediad::probe::run();
+            eprintln!("mediad: test over, exiting");
             return ExitCode::SUCCESS;
         }
         _ => {}

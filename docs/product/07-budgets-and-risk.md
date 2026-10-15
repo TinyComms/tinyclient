@@ -24,6 +24,7 @@ GPU textures and IOSurfaces that RSS misses. Read 60 s after the state is reache
 | shell, one image opened full size | +35 MB, released on close | one 2880 x 1800 px decode is 21 MB; the 4K original (33 MB) is never decoded whole |
 | mediad, voice call | 40 MB footprint | Opus, jitter buffer, audio unit, encryption. Rules out linking all of libwebrtc *(estimate)* |
 | mediad, watching or sending one share | 150 MB footprint | hardware codec; 6 pooled NV12 frames at 4K are 75 MB, at 1440p 33 MB |
+| mediad --play, one voice message or audio file | 8 MB footprint, gone when paused or ended | 5.3 MB measured 2026-10-14 (CoreAudio speaker, AAC at 1.5x, under 1% CPU); 250 ms of audio ahead, one packet decoded at a time |
 | mediad, no call | not running | already tested |
 | chatd growth during a call | under 16 MB | already tested |
 
@@ -173,3 +174,14 @@ Rules:
 5. **TDLib.** If it measures above 50 MB, is a separate Telegram process acceptable?
 
 Sources: Discord Userdoccers ([reference](https://docs.discord.food/reference), [rate limits](https://docs.discord.food/topics/rate-limits), [gateway](https://docs.discord.food/topics/gateway)), [Abaddon README](https://github.com/uowuo/abaddon), Slack ([rate limits](https://docs.slack.dev/apis/web-api/rate-limits), [anomaly events](https://docs.slack.dev/reference/audit-logs-api/anomalous-events-reference)).
+
+## Open overruns
+
+Each waits on the owner: signed off here with a date, or won back before it merges.
+
+| Branch | What | Budget | Measured | Sign-off |
+|---|---|---|---|---|
+| `settings` | shell binary, stripped | +400 KB | +590,032 B | none yet |
+| `settings` | mediad binary, stripped | +20 KB | +118,592 B | none yet |
+
+Where the bytes go and what would cut them: `09-settings.md`, "Measured after the review fixes".

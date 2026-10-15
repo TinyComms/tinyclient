@@ -17,6 +17,10 @@ jobs:
       - uses: swatinem/rust-cache@v2
       - name: Test (no GUI)
         run: cargo test --workspace
+      # The window's own tests (prefs, search, shortcuts against the menus, the controls) build
+      # only with the gui feature.
+      - name: Test the window
+        run: cargo test -p tinyclient --features gui
       - name: Build release
         env:
           TINYCLIENT_TELEGRAM_API_ID: ${{ secrets.TINYCLIENT_TELEGRAM_API_ID }}

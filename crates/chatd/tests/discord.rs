@@ -6,7 +6,7 @@ use base64::Engine;
 use protocol::{
     read_frame, write_frame, AccountKey, Call, CallState, CallSupport, Change, Conversation, ConversationKind,
     ErrorCode, Key, Link, MediaKind, MentionKind, Message, MessageKind, Network, Page, Person,
-    Presence, RelateAction, Relation, Request, Response, SendState, Style, Watching,
+    Presence, ReactionSet, EmojiScope, RelateAction, Relation, Request, Response, SendState, Style, Watching,
 };
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
@@ -103,6 +103,8 @@ struct Shared {
     closes: Mutex<VecDeque<u16>>,
     /// The page that names the web client's build: how long it takes, and its status.
     login: Mutex<(Duration, u16)>,
+    /// How many times that page has been answered.
+    logins: AtomicUsize,
     /// A path whose answer is held back this long.
     stall: Mutex<Option<(String, Duration)>>,
     /// The last sequence number dispatched.
@@ -402,6 +404,7 @@ fn serve_http(shared: Arc<Shared>, stream: TcpStream) {
         } else if bare == "/login" {
             let (takes, status) = *shared.login.lock().unwrap();
             sleep(takes);
+            shared.logins.fetch_add(1, Ordering::Relaxed);
             let page = r#"<script>window.GLOBAL_ENV = {"API_ENDPOINT":"//discord.com/api","BUILD_NUMBER":"987654","RELEASE_CHANNEL":"stable"}</script>"#;
             Some((status, "Content-Type: text/html\r\n".to_owned(), page.to_owned()))
         } else {
@@ -580,6 +583,7 @@ impl World {
             ready: Mutex::new(READY.to_owned()),
             closes: Mutex::new(VecDeque::new()),
             login: Mutex::new((Duration::ZERO, 200)),
+            logins: AtomicUsize::new(0),
             stall: Mutex::new(None),
             sequence: AtomicU64::new(0),
             connections: AtomicUsize::new(0),
@@ -789,6 +793,13 @@ impl Drop for World {
         let _ = std::fs::remove_dir_all(&self.dir);
         let _ = std::fs::remove_dir_all(self.dir.with_extension("files"));
     }
+}
+
+/// Lets this account tell Discord that we type (P1, off by default).
+fn allow_typing(world: &World, conversation: &Key) {
+    let scope = protocol::settings::account_scope(&conversation.account());
+    let set = Request::Set { scope, key: protocol::settings::TYPING.into(), value: Some("on".into()) };
+    assert_eq!(world.ask(set), Response::Ok);
 }
 
 /// Polls until `probe` has an answer. Everything here is the adapter reacting to the fake, so
@@ -1127,6 +1138,8 @@ fn typing_appears_expires_and_is_paced_on_the_way_out() {
     // Our own typing is never shown to us.
     world.discord.push("TYPING_START", json!({"channel_id": "3001", "user_id": "1000", "timestamp": heard}));
 
+    // Discord hears typing only once the user lets it (Settings › Privacy, off by default).
+    allow_typing(&world, &dm);
     // The draft changing three times is one signal to Discord.
     for _ in 0..3 {
         assert_eq!(world.ask(Request::Typing { conversation: dm.clone() }), Response::Ok);
@@ -1652,6 +1665,70 @@ fn reactions_edits_and_deletes_go_to_discord_and_the_store_follows_its_word() {
     assert!(world.messages(dm).iter().all(|stored| stored.id != "1300000000000000007"));
 }
 
+/// READY where #rules does not let everyone add reactions and #announcements does not let
+/// them read its history.
+fn reacting_ready() -> String {
+    let mut ready: Value = serde_json::from_str(READY).unwrap();
+    for channel in ready["guilds"][0]["channels"].as_array_mut().unwrap() {
+        let deny: u64 = match channel["id"].as_str() {
+            Some("4105") => 1 << 6,
+            Some("4102") => 1 << 16,
+            _ => continue,
+        };
+        channel["permission_overwrites"] = json!([{"id": "4000", "type": 0, "allow": "0", "deny": deny.to_string()}]);
+    }
+    ready.to_string()
+}
+
+#[test]
+fn reactions_follow_the_channels_permissions_and_what_they_refuse_never_reaches_discord() {
+    let world = World::launch(&[], |shared| *shared.ready.lock().unwrap() = reacting_ready());
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+    let known = |id: &str| matches!(world.ask(Request::Conversation { conversation: world.key(id) }), Response::Conversation { .. });
+    wait("the server's tree", || known("4105").then_some(()));
+    let before = world.discord.asked().len();
+    let rules = |id: &str| match world.ask(Request::Reactions { conversation: world.key(id) }) {
+        Response::Reactions { rules, .. } => rules,
+        other => panic!("no rules for {id}: {other:?}"),
+    };
+    // Without Nitro: any emoji, the server's own custom ones in it and none in a DM, nothing
+    // animated, 20 different a message. A thread goes by its channel.
+    let dm = rules("3001");
+    assert_eq!((dm.set, dm.custom, dm.animated, dm.distinct, dm.join_only), (ReactionSet::Any, EmojiScope::None, false, 20, false));
+    assert_eq!((rules("4101").custom, rules("4500").custom), (EmojiScope::Space, EmojiScope::Space));
+    assert!(rules("4105").join_only, "no Add Reactions: only what is there can be added to");
+    assert_eq!(rules("4102").set, ReactionSet::Off);
+    // History being warmed meanwhile is the only thing asked.
+    let asked = world.discord.asked();
+    assert!(asked[before..].iter().all(|asked| asked.contains("/messages?")), "worked out from READY, nothing asked: {:?}", &asked[before..]);
+
+    let fruit = "🍎🍐🍊🍋🍌🍉🍇🍓🫐🍈🍒🍑🥭🍍🥥🥝🍅🍆🥑🥦";
+    let twenty: Vec<Value> = fruit.chars().map(|one| json!({"count": 1, "me": false, "emoji": {"id": null, "name": one.to_string()}})).collect();
+    // Each names a role we hold, so it is kept though the channel was never opened.
+    let full = world.incoming("4101", Some("4000"), "every fruit", json!({"reactions": twenty, "mention_roles": ["4010"]}));
+    let thumbs = json!({"reactions": [{"count": 2, "me": false, "emoji": {"id": null, "name": "👍"}}], "mention_roles": ["4010"]});
+    let said = world.incoming("4105", Some("4000"), "be kind", thumbs);
+    let news = world.incoming("4102", Some("4000"), "release is out", json!({"mention_roles": ["4010"]}));
+    let held = |channel: &str, id: &str| world.messages(channel).iter().any(|message| message.id == id);
+    wait("the messages", || (held("4101", &full) && held("4105", &said) && held("4102", &news)).then_some(()));
+    let react = |channel: &str, message: &str, emoji: &str| {
+        world.ask(Request::React { conversation: world.key(channel), message_id: message.to_owned(), emoji: emoji.to_owned(), on: true })
+    };
+    let refused = |answer: Response| match answer {
+        Response::Error { code: ErrorCode::Refused, detail } => detail,
+        other => panic!("not refused: {other:?}"),
+    };
+    assert_eq!(refused(react("4101", &full, "🦑")), "This message has 20 different reactions, as many as allowed.");
+    assert_eq!(refused(react("4105", &said, "🎉")), "You can only add to reactions already on this message.");
+    assert_eq!(refused(react("4102", &news, "👍")), "You can't react in this channel.");
+    let reacted = || world.discord.requests_to("PUT", "/channels/").into_iter().filter(|seen| seen.path.contains("/reactions/")).count();
+    assert_eq!(reacted(), 0, "{:?}", world.discord.asked());
+    // What is already there can be added to.
+    assert_eq!(react("4101", &full, "🍎"), Response::Ok);
+    assert_eq!(react("4105", &said, "👍"), Response::Ok);
+    assert_eq!(reacted(), 2);
+}
+
 #[test]
 fn friendships_presence_and_profiles_are_asked_of_discord_only_when_the_user_does() {
     let world = World::start();
@@ -1901,6 +1978,7 @@ fn a_run_of_refusals_stops_every_request_and_says_so() {
     world.send("3002", "1730000000000000031", "anyone?", None);
     let why = world.failure("3002", "1730000000000000031");
     assert!(why.contains("refused too many requests") && why.contains("10 min"), "{why}");
+    allow_typing(&world, &world.key("3002"));
     world.ask(Request::Typing { conversation: world.key("3002") });
     settled(&world);
     assert_eq!(world.discord.requests.lock().unwrap().len(), before);
@@ -1913,6 +1991,7 @@ fn a_rate_limit_that_is_not_json_is_waited_out_from_its_headers_and_tried_once_m
     for _ in 0..2 {
         world.discord.script_raw("/channels/3002/typing", 429, "Retry-After: 2\r\nContent-Type: text/html\r\n", "<html>error code: 1015</html>");
     }
+    allow_typing(&world, &world.key("3002"));
     world.ask(Request::Typing { conversation: world.key("3002") });
     let typed = wait("the second attempt", || Some(world.discord.requests_to("POST", "/channels/3002/typing")).filter(|typed| typed.len() == 2));
     let waited = typed[1].at.duration_since(typed[0].at);
@@ -1971,14 +2050,15 @@ fn chatd_serves_before_the_build_is_read_and_remembers_the_last_one_read() {
         wait("an identify", || world.discord.frames_of(2).get(nth).map(|identify| identify["d"]["properties"]["client_build_number"].clone()))
     };
 
-    // The page that names the build takes three seconds. chatd answers long before that.
+    // The page that names the build takes three seconds. chatd answers while it is still
+    // waiting for it. That is what is checked, not a time: how long a busy machine takes to
+    // start chatd is no part of it.
     let started = Instant::now();
     let mut world = World::launch(&[("TINYCLIENT_DISCORD_LOGIN", "{{API}}/login")], |shared| {
         *shared.login.lock().unwrap() = (Duration::from_secs(3), 200);
     });
     assert_eq!(world.ask(Request::Ping), Response::Pong);
-    let serving = started.elapsed();
-    assert!(serving < Duration::from_millis(1500), "chatd took {serving:?} to answer");
+    assert_eq!(world.discord.logins.load(Ordering::Relaxed), 0, "chatd answered only once it had the build");
     assert!(world.discord.frames_of(2).is_empty(), "nothing is said to Discord before the build is known");
     assert_eq!(build(&world, 0), json!(987_654));
     assert!(started.elapsed() >= Duration::from_secs(3));
@@ -2323,6 +2403,7 @@ fn a_challenge_stops_every_request_and_shows_on_the_account() {
     let asked = world.discord.requests.lock().unwrap().len();
     world.send("3002", "1730000000000000042", "hello again", None);
     world.failure("3002", "1730000000000000042");
+    allow_typing(&world, &world.key("3002"));
     world.ask(Request::Typing { conversation: world.key("3002") });
     world.messages("3004");
     settled(&world);
@@ -2365,6 +2446,8 @@ fn polished_ready() -> String {
     rustaceans["emojis"] = json!([
         {"id": "5101", "name": "ferris", "animated": false, "available": true},
         {"id": "5102", "name": "lost_boost", "animated": false, "available": false},
+        {"id": "5103", "name": "party_blob", "animated": true, "available": true},
+        {"id": "5104", "name": "core_only", "animated": false, "available": true, "roles": ["4011"]},
     ]);
     rustaceans["stickers"] = json!([{"id": "5201", "name": "wave", "format_type": 1}, {"id": "5202", "name": "dance", "format_type": 3}]);
     let general = rustaceans["channels"].as_array_mut().unwrap().iter_mut().find(|channel| channel["id"] == "4101").unwrap();
@@ -2658,8 +2741,9 @@ fn files_go_up_from_their_paths_with_the_senders_options_and_a_cancel_stops_them
     let posted = world.discord.requests_to("POST", "/channels/4101/messages");
     assert_eq!(posted[1].body["content"], "https://tenor.com/view/cat-typing-1");
     assert_eq!(posted[1].body["allowed_mentions"]["replied_user"], true);
-    // The server's own emoji and stickers, from READY: what lost its boost and the Lottie
-    // sticker are not offered, and a DM offers none without Nitro. Nothing is asked.
+    // The server's own emoji and stickers, from READY: what lost its boost, an animated one
+    // (Nitro's), one only another role may use and the Lottie sticker are not offered, and a
+    // DM offers none without Nitro. Nothing is asked.
     let before = world.discord.asked().len();
     let emoji = catalog(protocol::CatalogKind::Emoji, "", Some("4000"));
     assert_eq!(emoji.iter().map(|item| (item.id.as_str(), item.name.as_str())).collect::<Vec<_>>(), [("emoji:5101", ":ferris:")]);
@@ -2714,4 +2798,51 @@ fn a_waiting_profile_never_holds_up_a_send_a_superseded_one_is_dropped_and_reads
     wait("the newest read to be told", || (acked(&read[2]) == 1).then_some(()));
     sleep(Duration::from_millis(500));
     assert_eq!((acked(&read[0]), acked(&read[1]), acked(&read[2])), (1, 0, 1));
+}
+
+#[test]
+fn a_voice_message_and_a_gif_from_tenor_are_attachments_fetched_only_from_discord() {
+    let world = World::start();
+    let dm = "3002";
+    let voice = format!("{}/media/attachments/1/9201/voice-message.ogg?ex=7fffffff&is=1&hm=abc", world.api);
+    let still = format!("{}/media/external/tenor-still.png", world.api);
+    let moving = format!("{}/media/external/tenor.mp4", world.api);
+    let id = world.incoming(
+        dm,
+        None,
+        "https://tenor.com/view/otter-123",
+        json!({
+            "flags": 8192,
+            "attachments": [{"id": "9201", "filename": "voice-message.ogg", "size": 9120, "content_type": "audio/ogg",
+                             "duration_secs": 4.2, "waveform": "AAoUHigyPEZQWg==", "url": voice, "proxy_url": voice}],
+            "embeds": [{"type": "gifv", "url": "https://tenor.com/view/otter-123", "provider": {"name": "Tenor"},
+                        "thumbnail": {"url": "https://media.tenor.com/still.png", "proxy_url": still, "width": 498, "height": 280},
+                        "video": {"url": "https://media.tenor.com/otter.mp4", "proxy_url": moving, "width": 498, "height": 280}}]
+        }),
+    );
+    let message = wait("the message", || world.messages(dm).pop().filter(|message| message.id == id));
+    // The voice message: what the player and its waveform need, from Discord's own fields.
+    let note = &message.attachments[0];
+    assert_eq!((note.file.id.as_str(), note.file.kind, note.mime.as_str(), note.duration), ("att:9201", MediaKind::Audio, "audio/ogg", 4));
+    assert_eq!(note.waveform, vec![0, 10, 20, 30, 40, 50, 60, 70, 80, 90]);
+    // The GIF is an attachment, not a link card: a still in the row, the MP4 behind it.
+    assert!(message.previews.is_empty(), "{:?}", message.previews);
+    let gif = &message.attachments[1];
+    assert_eq!((gif.name.as_str(), gif.file.kind, gif.mime.as_str()), ("GIF", MediaKind::Gif, "video/mp4"));
+    assert_eq!((gif.file.width, gif.file.height), (498, 280));
+    let thumb = gif.thumb.as_ref().unwrap();
+    assert_eq!((thumb.id.clone(), thumb.kind), (format!("embed:{id}:0"), MediaKind::Image));
+
+    // Nothing moving is fetched until asked, and then only from Discord's proxy.
+    settled(&world);
+    assert!(world.discord.requests_to("GET", "/media/external/tenor.mp4").is_empty());
+    assert!(world.discord.requests_to("GET", "/media/attachments/1/9201/").is_empty());
+    let played = world.fetched(&gif.file.id, None, false);
+    assert!(played.path.is_some(), "{played:?}");
+    assert_eq!(world.discord.requests_to("GET", "/media/external/tenor.mp4").len(), 1);
+    let heard = world.fetched("att:9201", None, false);
+    assert!(heard.path.is_some(), "{heard:?}");
+    let fetched = world.discord.requests_to("GET", "/media/attachments/1/9201/");
+    let paths: Vec<&str> = fetched.iter().map(|seen| seen.path.as_str()).collect();
+    assert_eq!(paths, ["/media/attachments/1/9201/voice-message.ogg?ex=7fffffff&is=1&hm=abc"]);
 }

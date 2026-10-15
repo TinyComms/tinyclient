@@ -1,14 +1,84 @@
 //! What only the window remembers between launches: its frame, pane widths, rail pins, the
-//! last conversation and sidebar mode, the two Details switches and the text size. One small
+//! last conversation and sidebar mode, the two Details switches, the text size, and the
+//! settings only the window acts on (`Choices`, `docs/product/09-settings.md`). One small
 //! tab-separated file beside chatd's, read once before the window opens (so the first frame
-//! draws where the user was) and written off the main thread.
+//! draws where the user was) and written off the main thread. A line this build does not know
+//! is kept as it was, so an older build never erases a newer one's choices.
 // CONTRACT: the protocol has no home for what only the window knows, so it is a file of its own.
 
 use super::super::layout;
+use super::super::settings::Section;
 use super::super::sidebar::Mode;
+use protocol::settings::Values;
 use protocol::{Key, Network};
+use std::sync::Mutex;
 
 pub const FILE: &str = "shell.prefs";
+
+/// The settings the window keeps (Appearance, Messages, P3) and the Settings section last open.
+/// Only what differs from these defaults is written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Choices {
+    /// A3: list rows 40 instead of 48.
+    pub compact: bool,
+    /// A4: list rows show the last message.
+    pub previews: bool,
+    /// M1: ⌘Return sends and Return adds a line.
+    pub command_return: bool,
+    /// M2: a conversation opens at its newest message, not the first unread.
+    pub newest: bool,
+    /// M3: others typing are shown.
+    pub typing: bool,
+    /// M4: `:)` and friends become emoji when sent.
+    pub emoticons: bool,
+    /// P3: pictures and link previews load by themselves.
+    pub images: bool,
+    /// The Settings section last shown. Written by its name, which stays when sections are
+    /// added or moved; a name this build does not know opens Accounts.
+    pub section: Section,
+}
+
+impl Default for Choices {
+    fn default() -> Choices {
+        Choices { compact: false, previews: true, command_return: false, newest: false, typing: true, emoticons: false, images: true, section: Section::Accounts }
+    }
+}
+
+// One window, one value each, read while drawing: globals, as the text step is.
+static CHOICES: Mutex<Choices> = Mutex::new(Choices {
+    compact: false,
+    previews: true,
+    command_return: false,
+    newest: false,
+    typing: true,
+    emoticons: false,
+    images: true,
+    section: Section::Accounts,
+});
+static VALUES: Mutex<Option<Values>> = Mutex::new(None);
+
+pub fn choices() -> Choices {
+    *CHOICES.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+pub fn set_choices(choices: Choices) {
+    *CHOICES.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = choices;
+    super::super::theme::set_compact(choices.compact);
+}
+
+/// chatd's settings as last read (`Request::Settings`). Defaults until the first answer.
+pub fn values() -> Values {
+    VALUES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone().unwrap_or_default()
+}
+
+/// Whether chatd's settings have been read since the window opened.
+pub fn values_known() -> bool {
+    VALUES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some()
+}
+
+pub fn set_values(values: Values) {
+    *VALUES.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(values);
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Prefs {
@@ -25,6 +95,9 @@ pub struct Prefs {
     pub details_channels: bool,
     pub details_directs: bool,
     pub text_step: i32,
+    pub choices: Choices,
+    /// Lines this build does not know, as they were.
+    pub kept: Vec<String>,
 }
 
 impl Default for Prefs {
@@ -39,6 +112,8 @@ impl Default for Prefs {
             details_channels: false,
             details_directs: false,
             text_step: 0,
+            choices: Choices::default(),
+            kept: Vec::new(),
         }
     }
 }
@@ -114,6 +189,16 @@ pub fn parse(text: &str) -> Prefs {
             "text" => {
                 prefs.text_step = fields.next().and_then(|n| n.parse::<i32>().ok()).unwrap_or(0).clamp(-1, 3);
             }
+            // A value that does not parse reads as the default.
+            "density" => prefs.choices.compact = fields.next() == Some("compact"),
+            "previews" => prefs.choices.previews = fields.next() != Some("off"),
+            "send" => prefs.choices.command_return = fields.next() == Some("cmd-return"),
+            "open_at" => prefs.choices.newest = fields.next() == Some("newest"),
+            "typing" => prefs.choices.typing = fields.next() != Some("off"),
+            "emoticons" => prefs.choices.emoticons = fields.next() == Some("on"),
+            "images" => prefs.choices.images = fields.next() != Some("click"),
+            "settings_section" => prefs.choices.section = fields.next().and_then(Section::from_word).unwrap_or(Section::Accounts),
+            _ if !line.trim().is_empty() => prefs.kept.push(line.to_owned()),
             _ => {}
         }
     }
@@ -141,6 +226,30 @@ pub fn write(prefs: &Prefs) -> String {
     let word = |on: bool| if on { "on" } else { "off" };
     text.push_str(&format!("details\t{}\t{}\n", word(prefs.details_channels), word(prefs.details_directs)));
     text.push_str(&format!("text\t{}\n", prefs.text_step));
+    let (choices, default) = (prefs.choices, Choices::default());
+    let lines: [(&str, bool, &str); 8] = [
+        ("density", choices.compact != default.compact, "compact"),
+        ("previews", choices.previews != default.previews, "off"),
+        ("send", choices.command_return != default.command_return, "cmd-return"),
+        ("open_at", choices.newest != default.newest, "newest"),
+        ("typing", choices.typing != default.typing, "off"),
+        ("emoticons", choices.emoticons != default.emoticons, "on"),
+        ("images", choices.images != default.images, "click"),
+        ("settings_section", choices.section != default.section, ""),
+    ];
+    for (name, changed, value) in lines {
+        if !changed {
+            continue;
+        }
+        match name {
+            "settings_section" => text.push_str(&format!("{name}\t{}\n", choices.section.word())),
+            _ => text.push_str(&format!("{name}\t{value}\n")),
+        }
+    }
+    for line in &prefs.kept {
+        text.push_str(line);
+        text.push('\n');
+    }
     text
 }
 
@@ -179,6 +288,8 @@ mod tests {
             details_channels: true,
             details_directs: false,
             text_step: 2,
+            choices: Choices { compact: true, previews: false, command_return: true, newest: true, typing: false, emoticons: true, images: false, section: Section::Audio },
+            kept: Vec::new(),
         };
         let read = parse(&write(&saved));
         assert_eq!(read, Prefs { open: Some((key(Network::Discord, "c1"), "#general with a tab".into())), ..saved.clone() });
@@ -199,6 +310,27 @@ mod tests {
         assert_eq!(odd.frame, Some((1., 2., 540., 440.)));
         assert_eq!((odd.text_step, odd.mode), (3, Mode::Inbox));
         assert_eq!(parse(""), Prefs::default());
+    }
+
+    #[test]
+    fn only_changed_choices_are_written_and_lines_from_a_newer_build_are_kept() {
+        let text = write(&Prefs::default());
+        for name in ["density", "previews", "send", "open_at", "typing", "emoticons", "images", "settings_section"] {
+            assert!(!text.contains(name), "{name} is at its default and not written");
+        }
+        let newer = "sidebar\t300\ntheme\tlight\nbounce\tonce\n";
+        let read = parse(newer);
+        assert_eq!(read.kept, ["theme\tlight", "bounce\tonce"]);
+        let again = write(&read);
+        assert!(again.contains("theme\tlight\n") && again.contains("bounce\tonce\n"), "{again}");
+        // Junk reads as the default.
+        assert_eq!(parse("density\tcosy\nsend\t?\nsettings_section\tx\n").choices, Choices::default());
+        // A section is kept by its name: an index from an older build, or a section a newer
+        // build added, opens Accounts rather than whatever sits at that place now.
+        assert!(write(&Prefs { choices: Choices { section: Section::Privacy, ..Choices::default() }, ..Prefs::default() }).contains("settings_section\tprivacy\n"));
+        assert_eq!(parse("settings_section\tstorage\n").choices.section, Section::Storage);
+        assert_eq!(parse("settings_section\t6\n").choices.section, Section::Accounts);
+        assert_eq!(parse("settings_section\tnotifications\n").choices.section, Section::Accounts);
     }
 
     #[test]

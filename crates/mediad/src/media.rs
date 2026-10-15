@@ -3,6 +3,7 @@
 //! it sends one frame of the microphone and plays one frame of everyone mixed.
 
 use crate::audio::{level, Audio, AudioError};
+use crate::cue::Playing;
 use crate::dave::{Dave, Outgoing};
 use crate::jitter::{Jitter, Pop};
 use crate::opus::{Decoder, Encoder, MAX_FRAME};
@@ -20,7 +21,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const TICK: Duration = Duration::from_millis(20);
-/// The level (see [`level`]) from which a frame counts as speech: about -45 dBFS.
+/// The level (see [`level`]) from which someone else's frame counts as speech: about -45 dBFS.
+/// Our own gate is the user's (V6, `Tuning::gate`), this by default.
 const VOICE: u8 = 25;
 /// Quiet ticks before speaking is over: 260 ms, so a ring cannot flicker between words.
 const HOLD: u32 = 13;
@@ -113,6 +115,8 @@ struct Loop {
     ticks: u64,
     keepalive: u32,
     levels: (u8, u8),
+    /// The cue being played under the voices.
+    cue: Option<Playing>,
 }
 
 impl Loop {
@@ -192,8 +196,9 @@ impl Loop {
         let mut frame = [0i16; FRAME_SAMPLES];
         let captured = self.setup.audio.capture(&mut frame);
         let heard = if captured { level(&frame) } else { 0 };
+        let gate = controls.tuning().gate;
         let mut opened = false;
-        if captured && !muted && heard >= VOICE {
+        if captured && !muted && heard >= gate {
             self.quiet = 0;
             if !self.talking {
                 self.talking = true;
@@ -308,12 +313,26 @@ impl Loop {
                 }
             }
         }
+        let tuning = self.setup.controls.tuning();
         let mut mixed = [0i16; FRAME_SAMPLES];
         for (out, sum) in mixed.iter_mut().zip(mix) {
+            // V5: everyone's voice, before anything else is added.
+            let sum = sum * i32::from(tuning.voice.min(100)) / 100;
             *out = sum.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
         }
+        // The meter in the device menu measures voices, not our own cues.
+        let heard = level(&mixed);
+        // A cue goes on after deafen: undeafening is heard, as is the test sound.
+        if let Some(cue) = self.setup.controls.take_cue() {
+            self.cue = Some(Playing::new(cue, f32::from(tuning.cues.min(100)) / 100.));
+        }
+        if let Some(cue) = &mut self.cue {
+            if !cue.mix(&mut mixed) {
+                self.cue = None;
+            }
+        }
         self.setup.audio.play(&mixed);
-        level(&mixed)
+        heard
     }
 
     fn devices(&self) {
@@ -452,6 +471,7 @@ pub fn run(setup: Setup) -> Audio {
         ticks: 0,
         keepalive: 0,
         levels: (0, 0),
+        cue: None,
     };
     state.run();
     state.setup.audio

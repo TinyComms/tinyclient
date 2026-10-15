@@ -560,8 +560,16 @@ fn offline(ctx: &Context, command: Command) {
         Command::React { reply, .. } | Command::Edit { reply, .. } | Command::Delete { reply, .. } => drop(reply.send(Err(down()))),
         Command::StartDirect { reply, .. } => drop(reply.send(Err(down()))),
         Command::SearchPeople(query) => ctx.searched(&query),
+        Command::ReactionRules { reply, .. } => drop(reply.send(Ok(reaction_rules()))),
         other => other.unsupported(ctx),
     }
+}
+
+/// What reactions a Signal conversation takes: any one emoji, and one reaction a person on a
+/// message, a new one replacing it (which Signal's own apps do, and its protocol carries one
+/// emoji per person). No custom emoji, and no cap on how many different ones a message holds.
+pub fn reaction_rules() -> protocol::ReactionRules {
+    protocol::ReactionRules { mine: 1, replaces: true, ..protocol::ReactionRules::default() }
 }
 
 fn serve(account: &Arc<Account>, command: Command) {
@@ -575,6 +583,7 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::React { conversation_id, message_id, emoji, on, reply } => {
             let _ = reply.send(react(account, &conversation_id, &message_id, &emoji, on).map_err(refused));
         }
+        Command::ReactionRules { reply, .. } => drop(reply.send(Ok(reaction_rules()))),
         Command::Edit { conversation_id, message_id, text, reply } => {
             let _ = reply.send(edit(account, &conversation_id, &message_id, &text).map_err(refused));
         }

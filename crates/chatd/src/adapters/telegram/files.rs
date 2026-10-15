@@ -33,6 +33,11 @@ const PACE: std::time::Duration = std::time::Duration::from_millis(250);
 const LARGEST: u64 = 2 * 1024 * 1024;
 /// The largest original fetched for the viewer, whatever Telegram says it is.
 const LARGEST_ORIGINAL: u64 = 64 * 1024 * 1024;
+/// The largest voice message, audio file or video fetched to be played or opened.
+const LARGEST_FILE: u64 = 200 * 1024 * 1024;
+/// Bytes asked for at a time for such a file, which the user is waiting on: the most Telegram
+/// gives in one piece, at the same pace as everything else.
+const FILE_PIECE: i32 = 1024 * 1024;
 /// Originals whose place is remembered until the viewer asks for one. Past this they are
 /// forgotten, and come back when a page that shows them is read again.
 const HELD: usize = 4_096;
@@ -96,7 +101,8 @@ impl Files {
                     // The viewer is waiting on an original: it is told, and keeps the still.
                     if want.original {
                         let mut file = want.file.clone();
-                        file.failed = Some("Telegram did not send the full picture.".to_owned());
+                        let what = if want.file.kind == MediaKind::Image { "the full picture" } else { "the file" };
+                        file.failed = Some(format!("Telegram did not send {what}."));
                         ctx.hub.changed(Change::Media { account: ctx.account.clone(), file });
                     }
                 }
@@ -222,6 +228,12 @@ fn download(account: &Account, want: &Want, carried: &mut HashSet<i32>, out: &mu
             carried.insert(dc);
         }
     }
+    // A picture's pieces stay small; a file the user pressed play on comes in the largest.
+    let (limit, most) = match (want.original, want.file.kind) {
+        (true, MediaKind::Image) => (PIECE, (want.file.bytes + want.file.bytes / 8).clamp(LARGEST, LARGEST_ORIGINAL)),
+        (true, _) => (FILE_PIECE, (want.file.bytes + want.file.bytes / 8).clamp(LARGEST, LARGEST_FILE)),
+        (false, _) => (PIECE, LARGEST),
+    };
     let mut offset = 0i64;
     loop {
         // Pictures for a scrolled list are many small requests: paced, never back to back, the
@@ -234,7 +246,7 @@ fn download(account: &Account, want: &Want, carried: &mut HashSet<i32>, out: &mu
             cdn_supported: false,
             location: want.location.clone(),
             offset,
-            limit: PIECE,
+            limit,
         };
         let pause = |time| account.ctx.pause(time);
         let piece = match wire::call_in(wire, dc, &request) {
@@ -252,11 +264,10 @@ fn download(account: &Account, want: &Want, carried: &mut HashSet<i32>, out: &mu
         };
         out.write_all(&piece.bytes).map_err(|err| Fault::Net(err.to_string()))?;
         offset += piece.bytes.len() as i64;
-        if (piece.bytes.len() as i32) < PIECE {
+        if (piece.bytes.len() as i32) < limit {
             return Ok(offset as u64);
         }
         // An original may be as large as Telegram says it is; a row's picture never needs more.
-        let most = if want.original { (want.file.bytes + want.file.bytes / 8).clamp(LARGEST, LARGEST_ORIGINAL) } else { LARGEST };
         if offset as u64 > most {
             return Err(Fault::Net("the picture is larger than it should be".to_owned()));
         }

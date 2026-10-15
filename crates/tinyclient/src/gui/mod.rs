@@ -14,6 +14,7 @@ mod input;
 mod layout;
 mod pane;
 mod people;
+mod playing;
 mod rail;
 mod settings;
 mod sidebar;
@@ -592,6 +593,7 @@ pub fn run() {
     // Read before the window opens, so its first frame draws where the user was.
     let prefs = app::prefs::read();
     theme::set_text_step(prefs.text_step);
+    app::prefs::set_choices(prefs.choices);
     let application = gpui_platform::application().with_assets(assets::Assets);
     // The Dock icon brings the hidden window back unchanged.
     application.on_reopen(|cx| cx.activate(true));
@@ -614,9 +616,9 @@ pub fn run() {
                 ..Default::default()
             };
             let opened = cx.open_window(options, |window, cx| {
-                // The red button hides the window like ⌘W; ⌘Q is what stops tinyclient.
+                // The red button closes the window as ⌘W does (Keep receiving decides how).
                 window.on_window_should_close(cx, |_, cx| {
-                    cx.hide();
+                    app::menubar::close_window(cx);
                     false
                 });
                 cx.new(|cx| {

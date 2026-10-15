@@ -13,6 +13,7 @@ mod icons;
 pub(in crate::gui) mod images;
 mod media;
 mod pages;
+mod player;
 mod rich;
 mod rows;
 #[cfg(feature = "gui-shot")]
@@ -20,8 +21,11 @@ mod shot;
 mod side;
 mod text;
 mod tokens;
+mod video;
 mod viewer;
 mod when;
+
+pub(in crate::gui) use player::glyph as player_glyph;
 
 
 use super::components::empty_state;
@@ -110,6 +114,9 @@ struct Open {
     marker_known: bool,
     /// The message a thread hangs off, and how many replies it had.
     root: Option<(Rc<Message>, u32)>,
+    /// What it takes as reactions, once chatd said. `None` until then, or from a chatd that
+    /// does not say: everything is offered, as before there were rules.
+    reactions: Option<protocol::ReactionRules>,
     #[cfg_attr(not(feature = "gui-shot"), allow(dead_code))]
     started: Instant,
 }
@@ -161,6 +168,7 @@ const SCREENSHOTS: bool = cfg!(feature = "gui-shot");
 #[derive(Clone, Copy, PartialEq)]
 enum Then {
     QuickLook,
+    /// The system's own app for it: a video plays in the system's player.
     Open,
 }
 
@@ -217,7 +225,8 @@ pub struct Pane {
     let_go: Vec<(String, u32)>,
     /// The window's scale when sizes were last asked for.
     scale: f32,
-    then: HashMap<String, Then>,
+    /// Files the user asked to open, and the name each is opened under.
+    then: HashMap<String, (Then, String)>,
 
     /// Spoilers opened, by message and span.
     revealed: HashSet<(String, u32)>,
@@ -259,6 +268,13 @@ pub struct Pane {
     uploads: HashMap<String, (u64, u64)>,
     /// When each pending message was first drawn, so its time and place hold until it is sent.
     pending_at: HashMap<String, i64>,
+
+    /// A drag along a player, until it is let go.
+    scrub: Option<player::Scrub>,
+    /// Where each player's waveform or bar was last drawn, by file.
+    scrub_bounds: Rc<RefCell<HashMap<String, Bounds<Pixels>>>>,
+    /// A file the user pressed play on before it was on disk: file, message, attachment, from.
+    play_after: Option<(String, String, usize, Option<u32>)>,
 
     /// How wide the list was when last drawn; 0 before the first draw.
     width: f32,
@@ -320,6 +336,9 @@ impl Pane {
             wants_focus: false,
             uploads: HashMap::new(),
             pending_at: HashMap::new(),
+            scrub: None,
+            scrub_bounds: Rc::default(),
+            play_after: None,
             width: 0.,
             seen: Rc::default(),
             #[cfg(feature = "gui-shot")]
@@ -381,6 +400,7 @@ impl Pane {
             last_read: None,
             marker_known: false,
             root,
+            reactions: None,
             started: Instant::now(),
         });
         self.window = pages::Window::default();
@@ -419,6 +439,9 @@ impl Pane {
         self.uploads.clear();
         self.pending_at.clear();
         self.relay(true, ListOffset::default());
+        self.ask_reactions(cx);
+        // M2: a conversation opens at its newest message rather than the first unread.
+        let around = around.filter(|_| !super::app::prefs::choices().newest);
         match back {
             Some(place) => self.load(Page::Around { id: place.id.clone() }, Purpose::Restore(place.id, place.offset), cx),
             None => match around {
@@ -564,7 +587,7 @@ impl Pane {
             Purpose::Bottom => self.snap_to_end(),
             Purpose::Restore(id, offset) => self.restore(id, *offset),
             // Unread that may not fit: placed once the rows can be measured.
-            Purpose::Open => self.land = self.items.iter().any(|item| matches!(item, Item::New)),
+            Purpose::Open => self.land = !super::app::prefs::choices().newest && self.items.iter().any(|item| matches!(item, Item::New)),
             _ if mine => self.snap_to_end(),
             _ => {}
         }
@@ -777,13 +800,15 @@ impl Pane {
                 self.replaced.push(path.clone());
             }
             self.known.insert(file.id.clone(), path.clone());
-            match self.then.remove(&file.id) {
-                Some(Then::QuickLook) => draw::quick_look(path),
-                Some(Then::Open) => cx.open_with_system(std::path::Path::new(path)),
-                None => {}
+            if let Some((then, name)) = self.then.remove(&file.id) {
+                draw::open_file(path, &name, then);
             }
+            self.play_landed(&file.id, cx);
         } else if file.failed.is_some() {
             self.then.remove(&file.id);
+            if self.play_after.as_ref().is_some_and(|(wanted, ..)| *wanted == file.id) {
+                self.play_after = None;
+            }
         }
         let mut changed = self.window.landed(file);
         if let Some((root, _)) = self.open.as_mut().and_then(|open| open.root.as_mut()) {
@@ -857,15 +882,14 @@ impl Pane {
     }
 
     /// Fetches a whole file because the user asked for it, and does `then` when it is here.
-    fn fetch_then(&mut self, file: &protocol::MediaFile, then: Then, cx: &mut Context<Self>) {
-        if let Some(path) = &file.path {
-            match then {
-                Then::QuickLook => draw::quick_look(path),
-                Then::Open => cx.open_with_system(std::path::Path::new(path)),
-            }
+    fn fetch_then(&mut self, attachment: &protocol::Attachment, then: Then, cx: &mut Context<Self>) {
+        let file = &attachment.file;
+        let name = media::disk_name(attachment);
+        if let Some(path) = file.path.clone().or_else(|| self.known.get(&file.id).cloned()) {
+            draw::open_file(&path, &name, then);
             return;
         }
-        self.then.insert(file.id.clone(), then);
+        self.then.insert(file.id.clone(), (then, name));
         // The user asked, so a file that failed before is tried again.
         self.fetch(vec![file.id.clone()], None, file.failed.is_some(), cx);
         cx.notify();
@@ -1183,6 +1207,17 @@ impl Shell {
         let account = conversation.account();
         let accounts = self.snapshot.iter().flat_map(|snapshot| &snapshot.accounts);
         accounts.filter(|status| status.key == account).map(|status| status.me.clone()).next().unwrap_or_default()
+    }
+
+    /// Draws the panes again: a player in them moved on. Only marks them, so it is safe from
+    /// inside a pane's own handler, where the pane cannot be updated.
+    pub(super) fn conversation_redraw(&mut self, cx: &mut Context<Self>) {
+        let state = &self.conversation_state;
+        let panes: Vec<gpui::EntityId> = state.pane.get().into_iter().chain(state.thread.borrow().as_ref()).map(Entity::entity_id).collect();
+        let app: &mut gpui::App = cx;
+        for pane in panes {
+            app.notify(pane);
+        }
     }
 
     /// Offered every change chatd reports, after `Shell` has applied its own part.

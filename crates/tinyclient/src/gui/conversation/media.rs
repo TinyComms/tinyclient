@@ -110,7 +110,10 @@ pub enum Shape {
     Gif,
     Video,
     Sticker,
+    /// A voice message: its waveform, played in place.
     Voice,
+    /// An audio file: its name over a bar, played in place.
+    Audio,
     File,
 }
 
@@ -121,8 +124,9 @@ pub fn shape(attachment: &Attachment) -> Shape {
         MediaKind::Gif => Shape::Gif,
         MediaKind::Video if has_still => Shape::Video,
         MediaKind::Image | MediaKind::Emoji | MediaKind::Avatar | MediaKind::Icon => Shape::Image,
-        MediaKind::Audio if attachment.duration > 0 || !attachment.waveform.is_empty() => Shape::Voice,
-        MediaKind::Video | MediaKind::Audio | MediaKind::File => Shape::File,
+        MediaKind::Audio if !attachment.waveform.is_empty() => Shape::Voice,
+        MediaKind::Audio => Shape::Audio,
+        MediaKind::Video | MediaKind::File => Shape::File,
     }
 }
 
@@ -169,6 +173,49 @@ pub fn duration_label(seconds: u32) -> String {
 
 fn extension(name: &str) -> &str {
     name.rsplit_once('.').map_or("", |(_, extension)| extension)
+}
+
+/// The extension a type is known by, for a file whose name has none ("Voice message").
+fn extension_for(mime: &str) -> Option<&'static str> {
+    Some(match mime.split(';').next().unwrap_or("").trim() {
+        "video/mp4" => "mp4",
+        "video/quicktime" => "mov",
+        "video/webm" => "webm",
+        "video/x-matroska" => "mkv",
+        "audio/ogg" | "audio/opus" => "ogg",
+        "audio/mpeg" | "audio/mp3" => "mp3",
+        "audio/mp4" | "audio/x-m4a" | "audio/aac" => "m4a",
+        "audio/wav" | "audio/x-wav" => "wav",
+        "audio/flac" => "flac",
+        "audio/webm" => "webm",
+        "image/gif" => "gif",
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/webp" => "webp",
+        "application/pdf" => "pdf",
+        _ => return None,
+    })
+}
+
+/// The name a file is opened under: its own, made safe for a file system, with the extension
+/// its type has when the name carries none, so the app that opens it knows what it is.
+pub fn disk_name(attachment: &Attachment) -> String {
+    let mut name: String = attachment
+        .name
+        .chars()
+        .map(|c| if c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') { '-' } else { c })
+        .collect();
+    name = name.trim().trim_start_matches('.').to_owned();
+    if name.is_empty() {
+        name = "file".to_owned();
+    }
+    protocol::clip(&mut name, 120);
+    let known = extension(&name);
+    let fitting = !known.is_empty() && known.len() <= 5 && !known.contains(' ');
+    match extension_for(&attachment.mime) {
+        Some(wanted) if !fitting => format!("{name}.{wanted}"),
+        _ => name,
+    }
 }
 
 /// The word for a file's type on its row, since truncation eats the extension: `PDF`.
@@ -354,12 +401,16 @@ mod tests {
             thumb: thumb.then(|| MediaFile::new("t", MediaKind::Image)),
             mime: mime.into(),
             duration,
+            round: false,
         };
         assert_eq!(shape(&attachment("a.png", MediaKind::Image, "image/png", true, 0)), Shape::Image);
         assert_eq!(shape(&attachment("a.mp4", MediaKind::Video, "video/mp4", true, 84)), Shape::Video);
         assert_eq!(shape(&attachment("a.mp4", MediaKind::Video, "video/mp4", false, 84)), Shape::File);
-        assert_eq!(shape(&attachment("voice.ogg", MediaKind::Audio, "audio/ogg", false, 47)), Shape::Voice);
-        assert_eq!(shape(&attachment("song.mp3", MediaKind::Audio, "audio/mpeg", false, 0)), Shape::File);
+        let mut voice = attachment("voice.ogg", MediaKind::Audio, "audio/ogg", false, 47);
+        assert_eq!(shape(&voice), Shape::Audio, "no waveform: the audio player");
+        voice.waveform = vec![10, 200, 40];
+        assert_eq!(shape(&voice), Shape::Voice);
+        assert_eq!(shape(&attachment("song.mp3", MediaKind::Audio, "audio/mpeg", false, 0)), Shape::Audio);
         let mut sticker = attachment("s.webp", MediaKind::Image, "image/webp", true, 0);
         sticker.sticker = true;
         assert_eq!(shape(&sticker), Shape::Sticker);
@@ -393,6 +444,23 @@ mod tests {
             [256, 144, 36, 32]
         );
         assert_eq!(square_size(18., 1.), 18);
+    }
+
+    #[test]
+    fn a_file_is_opened_under_a_name_its_app_understands() {
+        let named = |name: &str, mime: &str| {
+            let mut attachment = Attachment::new(name, MediaFile::new("f", MediaKind::File));
+            attachment.mime = mime.to_owned();
+            disk_name(&attachment)
+        };
+        assert_eq!(named("Voice message", "audio/ogg"), "Voice message.ogg");
+        assert_eq!(named("Video message", "video/mp4"), "Video message.mp4");
+        assert_eq!(named("clip.mov", "video/quicktime"), "clip.mov");
+        assert_eq!(named("camera2-0312.mp4", "video/mp4"), "camera2-0312.mp4");
+        assert_eq!(named("Q3 report.pdf", "application/pdf"), "Q3 report.pdf");
+        assert_eq!(named("../../etc/passwd", ""), "-..-etc-passwd", "never a path");
+        assert_eq!(named("", "video/webm"), "file.webm");
+        assert_eq!(named("notes", "application/x-unknown"), "notes");
     }
 
     #[test]

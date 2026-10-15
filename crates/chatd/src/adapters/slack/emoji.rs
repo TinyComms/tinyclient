@@ -159,6 +159,18 @@ pub fn skin_tone(name: &str) -> Option<char> {
     (2..=6).contains(&level).then(|| char::from_u32(0x1f3fb + level - 2)).flatten()
 }
 
+/// Every emoji this table can name, once each, in its order: the only ones a reaction can be
+/// (a custom one aside), since Slack takes a reaction by name.
+pub fn nameable() -> Vec<String> {
+    let mut all: Vec<String> = Vec::with_capacity(TABLE.len());
+    for (_, emoji) in TABLE {
+        if !all.iter().any(|held| held == emoji) {
+            all.push((*emoji).to_owned());
+        }
+    }
+    all
+}
+
 /// Rich text names the code points itself: `1f44d-1f3fd`.
 pub fn from_code_points(unicode: &str) -> Option<String> {
     let points = unicode.split('-').map(|hex| u32::from_str_radix(hex, 16).ok().and_then(char::from_u32));

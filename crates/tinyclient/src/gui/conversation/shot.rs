@@ -1,7 +1,8 @@
 //! For `--shot` only: puts the pane in a state worth a screenshot before the frame is written,
 //! and prints what was measured. Read from the environment so no flag is needed in `mod.rs`:
 //!
-//! - `TINYCLIENT_SHOT_CONVERSATION=<id>`: show another conversation of the open one's account.
+//! - `TINYCLIENT_SHOT_CONVERSATION=<id>`: show another conversation of the open one's account,
+//!   or `network/account/id` one of any account.
 //! - `TINYCLIENT_SHOT_AT=<message id>`: jump to it, as a reply quote would.
 //! - `TINYCLIENT_SHOT_UP=<points>`: scroll up this far from the bottom.
 //! - `TINYCLIENT_SHOT_THREAD=<message id>`: open the thread under it.
@@ -21,7 +22,7 @@
 //!   from the first conversation drawn (use with `--open`), before the picture: `open:N` (row N of the list on show), `members`,
 //!   `details` (the header's buttons), `thread` (the first thread in the open conversation),
 //!   `back`, `forward`, `close` (the pane's ✕), `escape` (in the composer, with nothing of its
-//!   own up), `members-on` (the channel switch, as a wider window left it), `wait:ms` (let `--mode` and `--open` land first). Prints the pane after each.
+//!   own up), `members-on` (the channel switch, as a wider window left it), `wait:ms` (let `--mode` and `--open` land first), `play:<message id>` (press play on its voice message or audio file). Prints the pane after each.
 
 use super::media;
 use super::{Pane, PaneEvent};
@@ -100,10 +101,16 @@ impl Script {
 
 /// `TINYCLIENT_SHOT_CONVERSATION=<id>`: show this conversation of the open one's account instead,
 /// for one the Inbox does not list.
+/// `network/account/id` names one of any account (`telegram/7000000/g8001`).
 pub fn instead(open: &protocol::Conversation) -> Option<protocol::Conversation> {
     let id = std::env::var("TINYCLIENT_SHOT_CONVERSATION").ok().filter(|id| !id.is_empty())?;
     let mut other = open.clone();
-    other.key.id = id;
+    let named = id.splitn(3, '/').collect::<Vec<_>>();
+    let network = named.first().and_then(|word| protocol::Network::ALL.into_iter().find(|network| network.label().eq_ignore_ascii_case(word)));
+    match (network, named.as_slice()) {
+        (Some(network), [_, account, id]) => other.key = protocol::Key { network, account: (*account).to_owned(), id: (*id).to_owned() },
+        _ => other.key.id = id,
+    }
     Some(other)
 }
 
@@ -312,6 +319,25 @@ pub fn steps(cx: &mut gpui::Context<crate::gui::state::Shell>) {
                 continue;
             }
             let step = step.to_owned();
+            // `play:<message id>`: goes to the message and presses play on its voice message or audio file,
+            // which fetches it first if it is not on disk. The pane asks the shell, so it is
+            // pressed outside the shell's own update.
+            if let Some(id) = step.strip_prefix("play:") {
+                let pane = this.update(cx, |shell, _| shell.conversation_state.pane.get().cloned()).ok().flatten();
+                if let Some(pane) = pane {
+                    let _ = pane.update(cx, |pane, cx| {
+                        pane.jump_to(id, cx);
+                        let Some(message) = pane.find(id) else {
+                            return eprintln!("shot: no message {id}");
+                        };
+                        let playable = |a: &protocol::Attachment| matches!(media::shape(a), media::Shape::Voice | media::Shape::Audio);
+                        if let Some(index) = message.attachments.iter().position(playable) {
+                            pane.press_play(&message, index, None, cx);
+                        }
+                    });
+                }
+                continue;
+            }
             let _ = this.update(cx, |shell, cx| {
                 match step.split_once(':') {
                     Some(("open", row)) => {

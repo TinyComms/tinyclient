@@ -39,6 +39,8 @@ pub const MEDIA_FORUM: u8 = 16;
 pub const VIEW_CHANNEL: u64 = 1 << 10;
 pub const SEND_MESSAGES: u64 = 1 << 11;
 pub const ADMINISTRATOR: u64 = 1 << 3;
+pub const ADD_REACTIONS: u64 = 1 << 6;
+pub const READ_MESSAGE_HISTORY: u64 = 1 << 16;
 
 /// Where Discord's own app, or its site when the app is not installed, shows a person.
 pub fn user_link(id: &str) -> String {
@@ -416,6 +418,9 @@ pub struct GuildEmoji {
     /// False once the server lost the boosts that paid for it.
     #[serde(default = "yes", deserialize_with = "nullable_yes")]
     pub available: bool,
+    /// The roles allowed to use it; empty for everyone.
+    #[serde(default, deserialize_with = "nullable")]
+    pub roles: Vec<String>,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -807,6 +812,10 @@ pub struct Embed {
     pub thumbnail: Option<EmbedImage>,
     #[serde(default)]
     pub image: Option<EmbedImage>,
+    /// The moving picture of a `gifv` (Tenor, Giphy) or `video` embed. Only its `proxy_url`,
+    /// on Discord's own media host, is ever fetched.
+    #[serde(default)]
+    pub video: Option<EmbedImage>,
     #[serde(default, deserialize_with = "nullable")]
     pub fields: Vec<EmbedField>,
 }

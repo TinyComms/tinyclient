@@ -1069,6 +1069,15 @@ fn sending_editing_reacting_deleting_and_reading_go_to_teams() {
     assert_eq!(world.ask(react("👍", false)), Response::Ok);
     let taken = world.until("the reaction to be taken back", || world.fake.calls("DELETE", &path("/messages/1760000500500/properties")).pop());
     assert_eq!(taken.json(), json!({"emotions": {"key": "like"}}));
+    // Teams takes the emoji it has a key for here; one it has none for is refused before
+    // Teams hears of it.
+    let Response::Reactions { rules, .. } = world.ask(Request::Reactions { conversation: ana.clone() }) else {
+        panic!("no rules");
+    };
+    assert_eq!((rules.set, &rules.only[..6]), (protocol::ReactionSet::Only, &["👍", "❤️", "😆", "😮", "🙁", "😠"].map(String::from)[..]));
+    let unkeyed = world.ask(react("🦑", true));
+    assert_eq!(unkeyed, Response::Error { code: protocol::ErrorCode::Refused, detail: "That reaction isn't allowed here.".to_owned() });
+    assert_eq!(world.fake.calls("PUT", &path("/messages/1760000500500/properties")).len(), 1, "only the 👍 went");
 
     // Mark read: the read marker, at that message.
     assert_eq!(world.ask(Request::MarkRead { conversation: ana.clone(), message_id: sent.id.clone() }), Response::Ok);
@@ -1078,6 +1087,16 @@ fn sending_editing_reacting_deleting_and_reading_go_to_teams() {
     let parts: Vec<&str> = horizon.split(';').collect();
     assert_eq!((parts.len(), parts[0], parts[2]), (3, "1760001000000", "1760001000000"));
     assert!(parts[1].parse::<u64>().unwrap() > 1_700_000_000_000);
+
+    // P2 off: the chat is read here and Teams is not told.
+    let scope = protocol::settings::account_scope(&ana.account());
+    let receipts = |value: Option<&str>| Request::Set { scope: scope.clone(), key: protocol::settings::RECEIPTS.to_owned(), value: value.map(str::to_owned) };
+    assert_eq!(world.ask(receipts(Some("off"))), Response::Ok);
+    let told = world.fake.calls("PUT", &path("/properties")).len();
+    assert_eq!(world.ask(Request::MarkRead { conversation: ana.clone(), message_id: "1760000500500".to_owned() }), Response::Ok);
+    sleep(Duration::from_millis(400));
+    assert_eq!(world.fake.calls("PUT", &path("/properties")).len(), told, "Teams heard a read with receipts off");
+    assert_eq!(world.ask(receipts(None)), Response::Ok);
 
     // Typing: one signal however often the draft changes.
     for _ in 0..3 {

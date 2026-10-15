@@ -1,5 +1,6 @@
 use crate::media::Calls;
 use crate::store::Store;
+use protocol::settings::Values;
 use protocol::{
     clip, AccountKey, Activity, Capabilities, Change, Key, Keychain, Link, Network, Occupants,
     Presence, Typist, Watching, OCCUPANTS_LIMIT,
@@ -155,11 +156,20 @@ pub struct Hub {
     pub infos: Recent<Key, protocol::ConversationInfo>,
     pub space_infos: Recent<Key, protocol::SpaceInfo>,
     pub catalogs: Recent<CatalogAsked, (Vec<protocol::CatalogItem>, Option<String>)>,
+    pub reactions: Recent<Key, protocol::ReactionRules>,
     pub calls: Calls,
+    pub player: crate::playback::Player,
+    /// The settings as stored (`protocol::settings`), read once and kept in step with every
+    /// `Set`, so a typing signal or a call start asks no query.
+    settings: Mutex<Values>,
+    /// Retention runs when this is set, and once a day.
+    prune_now: Mutex<bool>,
+    prune_wake: Condvar,
 }
 
 impl Hub {
     pub fn new(store: Store) -> Hub {
+        let settings = Values::new(store.settings().unwrap_or_default());
         // Starting from the clock makes a `seq` from an earlier run older than `floor`, so a
         // shell that outlived a restart is told to read everything again.
         let start = SystemTime::now().duration_since(UNIX_EPOCH).map_or(1, |d| d.as_micros() as u64);
@@ -187,8 +197,66 @@ impl Hub {
             infos: Recent::new(64),
             space_infos: Recent::new(16),
             catalogs: Recent::new(32),
+            reactions: Recent::new(64),
             calls: Calls::default(),
+            player: crate::playback::Player::default(),
+            settings: Mutex::new(settings),
+            prune_now: Mutex::new(false),
+            prune_wake: Condvar::new(),
         }
+    }
+
+    // Settings.
+
+    /// The settings in force. Whoever holds both locks takes the store's first, then this one;
+    /// never the store while holding this.
+    pub fn settings(&self) -> MutexGuard<'_, Values> {
+        lock(&self.settings)
+    }
+
+    /// Stores one setting and keeps the copy here in step. Tells every window.
+    pub fn set_setting(&self, scope: &str, key: &str, value: Option<String>) -> rusqlite::Result<()> {
+        // The store first, held until the copy matches it: the copy never holds what was not
+        // saved, and two writers cannot leave the two in a different order.
+        let mut store = self.store();
+        store.set_setting(scope, key, value.as_deref())?;
+        lock(&self.settings).set(scope, key, value);
+        drop(store);
+        self.changed(Change::Settings);
+        Ok(())
+    }
+
+    /// Reads the settings again after the store removed rows itself (sign-out).
+    pub fn reload_settings(&self) {
+        let store = self.store();
+        if let Ok(stored) = store.settings() {
+            *lock(&self.settings) = Values::new(stored);
+        }
+        drop(store);
+        self.changed(Change::Settings);
+    }
+
+    /// Reset all: every row but the version goes.
+    pub fn reset_settings(&self) -> rusqlite::Result<()> {
+        let mut store = self.store();
+        store.reset_settings()?;
+        *lock(&self.settings) = Values::new(store.settings()?);
+        drop(store);
+        self.changed(Change::Settings);
+        Ok(())
+    }
+
+    /// Has retention run now rather than at its daily time.
+    pub fn prune_soon(&self) {
+        *lock(&self.prune_now) = true;
+        self.prune_wake.notify_all();
+    }
+
+    /// Waits until retention is due: `every`, or sooner when asked.
+    pub fn prune_due(&self, every: Duration) {
+        let asked = lock(&self.prune_now);
+        let (mut asked, _) = self.prune_wake.wait_timeout_while(asked, every, |asked| !*asked).unwrap_or_else(PoisonError::into_inner);
+        *asked = false;
     }
 
     pub fn store(&self) -> MutexGuard<'_, Store> {
@@ -361,6 +429,17 @@ impl Hub {
             let (dropped, _) = changes.entries.remove(0);
             changes.floor = dropped;
         }
+        drop(changes);
+        self.moved.notify_all();
+    }
+
+    /// Everything a shell holds may be stale (the cache was cleared): its next `Wait` answers
+    /// `reset`, and it reads what is on screen again.
+    pub fn reset(&self) {
+        let mut changes = lock(&self.changes);
+        changes.seq += 1;
+        changes.floor = changes.seq;
+        changes.entries.clear();
         drop(changes);
         self.moved.notify_all();
     }

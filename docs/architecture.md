@@ -8,8 +8,8 @@ How the processes fit together and who may edit what. The contract itself is the
 | Process | Does | Never |
 |---|---|---|
 | `chatd` | Always on, one per support directory (`chatd.lock`). Answers its socket first, then reads the sessions behind it. Holds the sessions, the network sockets, SQLite and the media cache. Call signalling. | Decode media, link a codec or audio code, hold a tree, a member list or history in memory, fetch a link from a message, send anything the user did not ask for. |
-| `mediad` | Exists from "connecting" to the end of one call. Voice gateway, UDP, Opus, DAVE, audio devices. | Run with no call, touch SQLite, the keychain or the chat socket. It speaks only to chatd over stdin and stdout. |
-| `tinyclient` | The window. Draws what chatd reports; decodes images for rows on screen. Starts chatd when nothing answers (`protocol::launch`). | Talk to a network, read the database or keychain, run a socket call, file read or decode on the main thread, run `mediad` itself. |
+| `mediad` | Exists from "connecting" to the end of one call. Voice gateway, UDP, Opus, DAVE, audio devices. `mediad --play` is its other mode: one voice message or audio file, from play until it ends or is paused (below). | Run with no call or nothing playing, touch SQLite, the keychain or the chat socket, open the microphone to play a file. It speaks only to chatd over stdin and stdout. |
+| `tinyclient` | The window. Draws what chatd reports; decodes images for rows on screen. Starts chatd when nothing answers (`protocol::launch`). Hands a video to the system's player. | Talk to a network, read the database or keychain, run a socket call, file read or decode on the main thread, run `mediad` itself, link an audio or video codec. |
 | `tinyclient-login` | One sign-in window, then exits with the session on stdout. | Stay running. |
 
 ## Contract in brief (`crates/protocol`)
@@ -52,11 +52,13 @@ How the processes fit together and who may edit what. The contract itself is the
 | `MarkRead {conversation, message_id}` | `Ok` | store; `Command::MarkRead` |
 | `Send {.., with}`, `Retry`, `Discard`, `CancelSend`, `Typing` | `Sent {message}` (pending, files listed); `Ok` | store; `Command::Send`, or `SendWith` when `with` is not plain; `CancelSend`; `Typing` |
 | `Catalog {account, kind, space, query, cursor}` | `Catalog {items, cursor}` (≤ 200, kept 5 min) | `Command::Catalog` |
-| `React {conversation, message_id, emoji, on}` | `Ok` | store at once; `Command::React` (`Unsupported` until built) |
+| `React {conversation, message_id, emoji, on}` | `Ok` | refused by the rules first; store at once; `Command::React` (`Unsupported` until built) |
+| `Reactions {conversation}` | `Reactions {conversation, rules}` (kept 5 min) | `Command::ReactionRules` |
 | `Edit {.., text}`, `Delete {..}` | `Ok` once the network accepted | `Command::Edit` / `Delete` (`Unsupported` until built) |
 | `Fetch {account, ids, size, retry}` | `Media {files}` | store (size, retry); `blobs` |
 | `SignIn {network, at}`, `SignOut {account}` | `Status` | server |
 | `CallStart`, `CallAccept`, `CallDecline`, `CallEnd`, `CallSet`, `Media(..)` | `Status` | `media::Calls`; `Command::Call*` |
+| `Play(Start {account, file, path, conversation, message, title, at, rate, output} \| Pause \| Seek {at} \| Rate {rate} \| Stop)` | `Ok`; then `Change::Playback` | `playback::Player`; `mediad --play` |
 
 - **Rows**: a `Conversation` carries its Space's and Group's titles and its topic
   (`Conversation::subtitle()` is the header's second line: `Space > group · topic`), `read_only`,
@@ -73,7 +75,11 @@ How the processes fit together and who may edit what. The contract itself is the
   markup reaches the shell.
 - **Acting on a message**: a reaction shows at once (ours counts once, however often it is
   reported) and is taken back if the network refuses; a custom emoji that is not on the message
-  yet waits for the network's word, which names it. Edit and delete change nothing until the
+  yet waits for the network's word, which names it. Before that, chatd checks it against the
+  conversation's `ReactionRules` (which emoji, custom ones, how many of mine and how many
+  different ones a message holds), as the adapter reports them, and refuses what they refuse
+  without asking the network; where one reaction a person is the rule, a new one replaces mine
+  at once. It is sent as the network spells it (Telegram's ❤, not ❤️). Edit and delete change nothing until the
   adapter reports the result; the request's answer is the network's.
 - **Media** is `MediaFile {id, kind, width, height, bytes, path, failed}`. `path` is `None` until
   the file is on disk. The shell asks `Fetch` for what is on screen; a file landing is
@@ -183,7 +189,9 @@ changing again replaces its entry, so the list is bounded (256) by how many thin
   `People`, `Members`, `Folders`, `Media` (carries the file).
 - Ephemeral things carry their whole value and cause no reads: `Typing {typists}` (each with
   `until`; the shell times the line out itself), `Presence` (with `emoji` and `activity`),
-  `Call`, `Occupants`, `Searched`, `Upload {client_id, sent, total}`.
+  `Call`, `Occupants`, `Searched`, `Upload {client_id, sent, total}`, `Playback` (the file
+  playing, paused or just ended, `None` once stopped; its position runs with the clock while
+  it plays, `Playback::position`, so no tick crosses the socket).
 - `Occupants {conversation, occupants}` is who is in a voice channel: at most 25 people with
   mute, deafen and streaming flags, and the true total. It never announces the tree. The current
   value rides on the row whenever `Tree`, `Conversation` or `Inbox` is read; an emptied channel
@@ -204,6 +212,7 @@ changing again replaces its entry, so the list is bounded (256) by how many thin
 | Accounts, Spaces (muted, hide muted), folders, groups (kind, muted, unread only), conversations (unread, mentions, muted, read marker, star, topic, thread parent and root, draft, filing, kind flags, preview parts, seen, when it last mentioned me), people and relationships (title, time zone, mark), messages (rich fields as JSON in `message.body`), media rows with their failure and size variants, adapter notes | `chat.sqlite`, schema version in `PRAGMA user_version` (now 4), page cache 1 MB. A version change drops and refills the cache: the 3 → 4 change does, once. |
 | Media bytes | `media/<network>/<account>/` under the support directory, 500 MB, least recently used first. |
 | Presence and activity, typing, voice occupants, what the shell watches, links and capabilities, the change list, the call, upload progress, previews asked, and five minutes of profiles, info panes and catalog pages (64 / 64 / 16 / 32 at most) | chatd memory, bounded, gone at restart. |
+| Files opened in another app under their own names | `open/` in the support directory: hard links into the cache, emptied when the shell starts. |
 | Panics, chatd's stderr | `crash.log` (cut at 256 KB), `chatd.log` (cut at 4 MB at start) in the support directory. |
 | Retention | Newest 2,000 messages per conversation; nothing older than 90 days unless the conversation was opened in that time. A thread row that names its parent goes when its parent goes, or when its root message has aged out and nobody opened the thread in 90 days. `Store::prune`, at start and daily. |
 
@@ -271,6 +280,43 @@ sends `Levels` and chatd passes our input level on as `Call.level`; `Call.inputs
 `Call.outputs` are every device the system lists (`DeviceList`), so the shell never runs
 `mediad` to ask.
 
+## Playing voice messages and audio (`protocol/src/play.rs`, `chatd/src/playback.rs`, `mediad/src/play.rs`)
+
+One file plays at a time, across every network. The shell fetches the attachment with `Fetch`
+like any file (the first press; Telegram's comes over the session, `adapters/telegram/files.rs`)
+and then sends `Play(Start)` with its path. chatd refuses a path outside its media cache, starts
+`mediad --play`, writes `PlayerRequest::Open {path, at, rate, output}` and tells the shell
+`Loading` at once. mediad answers `Playing {at, duration, rate}` when sound leaves the speaker,
+again after each `Seek` or `Rate`, then `Ended` (and exits). Pause closes its stdin: it answers
+`Stopped {at}` with where the listener got to, and exits, so a paused file holds no process,
+decoder, buffer or device; Play again starts a new one from there. `Stop` forgets it.
+A mediad that dies while playing is `Failed` in words. Sign-out stops a file of that account.
+
+Why mediad and not the window: the Opus decoder, the resampler and the device code are already
+there and are reused as they are; a decoder fed a stranger's file runs in a process that can
+crash alone and holds nothing (no session, no socket, no window); the shell and chatd stay free of
+codecs; and the process model already says media lives in mediad for as long as it is used.
+`mediad --play` opens only the speaker (`audio::Speaker`), never the microphone, so no
+permission prompt or recording light. It reads Ogg, WebM, MP4, WAV, MP3 and FLAC with
+symphonia (pure Rust, the same on every platform); Opus goes to the call's libopus. It decodes
+only 250 ms ahead of the speaker. 1.5x and 2x keep the pitch (WSOLA, `stretch.rs`). The speaker
+is the one picked in the call's device menu in this window, else the system default. The cost
+is mediad's size: release mediad went from 5.4 MB to 7.5 MB (symphonia), the shell grew 0.15 MB
+and chatd nothing. Playing costs 5.3 MB of footprint and under 1% CPU (`07-budgets-and-risk.md`).
+
+Video is not decoded by tinyclient. A video or a GIF that is an MP4 plays in the system's
+player once fetched, through a hard link under the attachment's name in `open/` in the support
+directory (emptied at the shell's start), since cached files are named by a hash with no
+extension. `Pane::moving` is the one place an inline, muted, looping player would go.
+
+| Network | Voice messages | Audio files | Video, MP4 GIFs |
+|---|---|---|---|
+| Discord | play inline (Ogg Opus, Discord's waveform and length) | play inline | system player; `gifv` and proxied `video` embeds are attachments with their still |
+| Telegram | play inline (Ogg Opus, Telegram's waveform) | play inline | system player; round video messages are drawn round |
+| Slack | play inline (clips with `audio_wave_samples`) | play inline | system player |
+| Teams | none sent as such | file row; SharePoint and OneDrive files cannot be fetched yet | file row, same |
+| Signal | not yet: attachments are not fetched or decrypted | not yet | not yet |
+
 ## The demo (`chatd --seed-demo`, `chatd/src/demo*`)
 
 Invented data in a scratch `TINYCLIENT_DIR`, and an adapter with no network behind it
@@ -333,6 +379,6 @@ Tests go in your own files or a new `tests/<slice>.rs`. A gap in the contract is
 - Slices F, G and H share the `chatd` crate, and A to E the `tinyclient` crate: someone else's
   half-written file can break your build. Check with `cargo check -p chatd` (or `-p tinyclient
   --features gui`) and say so; do not fix it.
-- Left for later, with room kept: message search, notifications, settings, video, voice
-  messages (P2), Discord's per-server file limit (boosts) and Telegram's boosted packs in
+- Left for later, with room kept: message search, notifications, settings, inline video
+  (videos play in the system's player), Discord's per-server file limit (boosts) and Telegram's boosted packs in
   `Capabilities`, picker recents in SQLite.

@@ -217,16 +217,19 @@ hr { border: 0; border-top: 1px solid var(--line); margin: 0; }
 .site-nav a:hover { color: var(--text); background: var(--hover); text-decoration: none; }
 .site-nav a[aria-current="page"] { color: var(--text); }
 
-.site-nav .gh {
+.site-nav .gh,
+.site-nav .dc {
   display: inline-flex;
   align-items: center;
   gap: 6px;
 }
-.site-nav .gh svg { width: 16px; height: 16px; fill: currentColor; }
+.site-nav .gh svg,
+.site-nav .dc svg { width: 16px; height: 16px; fill: currentColor; }
 
 @media (max-width: 640px) {
   .site-header .wrap { gap: 12px; padding: 0 16px; }
-  .site-nav .hide-sm { display: none; }
+  .site-nav .hide-sm,
+  .site-nav .dc .nav-label { display: none; }
   .site-nav a { padding: 6px 8px; }
 }
 
@@ -255,6 +258,7 @@ hr { border: 0; border-top: 1px solid var(--line); margin: 0; }
 .btn-primary:hover { background: var(--accent-hover); }
 .btn-primary:active { background: var(--accent-pressed); }
 .btn-primary svg { fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.btn-primary svg.fill { fill: currentColor; stroke: none; }
 
 .btn-secondary { background: var(--raised); color: var(--text); border-color: var(--border); }
 .btn-secondary:hover { border-color: var(--border-strong); }

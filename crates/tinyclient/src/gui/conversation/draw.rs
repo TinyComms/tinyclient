@@ -2,6 +2,7 @@
 //! network. Every box that holds a picture is sized from what the network said about it, so a
 //! row is its final height before any file arrives.
 
+use super::emoji;
 use super::icons::{icon, Icon};
 use super::images::Picture;
 use super::media::{self, Fit, Shape as MediaShape};
@@ -33,25 +34,71 @@ const CARDS: usize = 3;
 /// Reaction chips drawn before the rest are counted.
 const CHIPS: usize = 12;
 
-/// Opens a file in Quick Look. The panel is a process of its own; a thread waits for it so
-/// nothing of ours blocks.
-pub fn quick_look(path: &str) {
-    let path = path.to_owned();
+/// Where files are linked under their own names to be opened: `open/` in the support
+/// directory, emptied at each start. The cache names files by a hash with no extension, which
+/// no player, Quick Look or default app can tell the type of.
+fn opened_dir() -> std::path::PathBuf {
+    protocol::support_dir().join("open")
+}
+
+/// Empties [`opened_dir`], once a run. A player that still has a file open keeps it: the
+/// link goes, the bytes stay until it closes them.
+fn clear_opened() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| drop(std::fs::remove_dir_all(opened_dir())));
+}
+
+/// The cached file at `path` under `name`: a hard link in [`opened_dir`], so no bytes are
+/// copied; a copy where a link cannot be made; the file itself if neither works.
+fn named(path: &str, name: &str) -> std::path::PathBuf {
+    clear_opened();
+    let hash = path.bytes().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3));
+    let dir = opened_dir().join(format!("{hash:016x}"));
+    let target = dir.join(name);
+    if target.exists() {
+        return target;
+    }
+    let made = std::fs::create_dir_all(&dir)
+        .and_then(|()| std::fs::hard_link(path, &target).or_else(|_| std::fs::copy(path, &target).map(drop)));
+    match made {
+        Ok(()) => target,
+        Err(err) => {
+            eprintln!("tinyclient: could not name {name} for opening: {err}");
+            std::path::PathBuf::from(path)
+        }
+    }
+}
+
+/// Opens a cached file under its own name: in Quick Look, or in the system's app for it (a
+/// video in the system's player). Both are processes of their own; a thread waits for them so
+/// nothing of ours blocks, and makes the link off the main thread.
+pub fn open_file(path: &str, name: &str, then: Then) {
+    let (path, name) = (path.to_owned(), name.to_owned());
     std::thread::spawn(move || {
-        let mut command = Command::new("/usr/bin/qlmanage");
+        let path = named(&path, &name);
+        let mut command;
         #[cfg(target_os = "macos")]
         {
-            command.arg("-p").arg(&path);
+            command = match then {
+                Then::QuickLook => Command::new("/usr/bin/qlmanage"),
+                Then::Open => Command::new("/usr/bin/open"),
+            };
+            if then == Then::QuickLook {
+                command.arg("-p");
+            }
+            command.arg(&path);
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(not(any(target_os = "macos", windows)))]
         {
+            let _ = then;
             command = Command::new("xdg-open");
             command.arg(&path);
         }
         #[cfg(windows)]
         {
+            let _ = then;
             command = Command::new("cmd");
-            command.args(["/C", "start", "", &path]);
+            command.arg("/C").arg("start").arg("").arg(&path);
         }
         let _ = command.stdout(Stdio::null()).stderr(Stdio::null()).status();
     });
@@ -141,7 +188,7 @@ fn in_box(which: Icon, words: Option<&'static str>) -> Div {
 }
 
 /// The label over a still that says what a click will do.
-fn badge(words: String) -> Div {
+pub(super) fn badge(words: String) -> Div {
     div()
         .absolute()
         .bottom(px(6.))
@@ -157,7 +204,7 @@ fn badge(words: String) -> Div {
         .child(words)
 }
 
-fn play_disc() -> Div {
+pub(super) fn play_disc() -> Div {
     div().absolute().inset_0().flex().items_center().justify_center().child(
         div()
             .size(px(44.))
@@ -878,7 +925,8 @@ impl Pane {
         for (ix, shape) in shapes.iter().enumerate() {
             match shape {
                 MediaShape::Sticker => out.push(self.sticker(message, ix, window, cx)),
-                MediaShape::Voice => out.push(self.voice_row(message, ix, cx)),
+                MediaShape::Voice => out.push(self.player_row(message, ix, true, cx)),
+                MediaShape::Audio => out.push(self.player_row(message, ix, false, cx)),
                 MediaShape::File => out.push(self.file_row(message, ix, cx)),
                 MediaShape::Image | MediaShape::Gif | MediaShape::Video => {}
             }
@@ -888,6 +936,31 @@ impl Pane {
             .enumerate()
             .map(|(ix, element)| div().pt(px(if ix == 0 { 5. } else { 4. })).flex().child(element).into_any_element())
             .collect()
+    }
+
+    /// Settings › Privacy › Load images (P3) off: a picture not on disk waits for a click, so
+    /// nothing is fetched until then.
+    fn held_back(&self, file: &MediaFile) -> bool {
+        !crate::gui::app::prefs::choices().images && file.path.is_none() && !self.known.contains_key(&file.id) && !self.shown.contains(&file.id)
+    }
+
+    /// What stands in a held-back picture's box: what it is, its size, and the click that
+    /// loads it.
+    fn load_box(&self, holder: Stateful<Div>, file: &MediaFile, what: &str, bytes: u64, words: bool, cx: &mut Context<Self>) -> Stateful<Div> {
+        let id = file.id.clone();
+        let line = match (words, bytes) {
+            (false, _) => "Load".to_owned(),
+            (true, 0) => format!("{what} · Click to load"),
+            (true, bytes) => format!("{what} · {} · Click to load", media::size_label(bytes)),
+        };
+        holder
+            .child(div().absolute().inset_0().flex().items_center().justify_center().type_small().text_color(theme::text_soft()).child(line))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.shown.insert(id.clone());
+                cx.notify();
+            }))
     }
 
     /// The still of a file, or what stands in its box until it is on disk. `size` is the
@@ -968,6 +1041,16 @@ impl Pane {
                 .into_any_element();
         }
 
+        if self.held_back(&still) {
+            let what = match shape {
+                MediaShape::Video => "Video",
+                MediaShape::Gif => "GIF",
+                _ => "Image",
+            };
+            let bytes = attachment.file.bytes;
+            return self.load_box(tile, &still, what, bytes, width >= 160., cx).child(edge_line()).into_any_element();
+        }
+
         let natural = natural(attachment);
         let edge = media::decode_edge(natural, width, height, fit, window.scale_factor());
         let size = media::fetch_size(natural, width, height, fit, window.scale_factor());
@@ -1001,13 +1084,11 @@ impl Pane {
             }
         };
 
+        // A video or GIF: what says it moves, and what a click does, are `video`'s.
+        let id = message.id.clone();
         let tile = match shape {
-            MediaShape::Gif => tile.child(play_disc()).child(badge("GIF".to_owned()).left(px(6.))),
-            MediaShape::Video => {
-                let length = (attachment.duration > 0).then(|| badge(media::duration_label(attachment.duration)).right(px(6.)));
-                tile.child(play_disc()).children(length)
-            }
-            _ => tile,
+            MediaShape::Gif | MediaShape::Video => self.moving(attachment, tile, cx),
+            _ => tile.on_click(cx.listener(move |this, _, window, cx| this.open_viewer(&id, index, window, cx))),
         };
         let tile = tile.child(edge_line()).children(more.map(|more| {
             div()
@@ -1022,13 +1103,7 @@ impl Pane {
                 .text_color(gpui::white())
                 .child(format!("+{more}"))
         }));
-        let (id, file) = (message.id.clone(), attachment.file.clone());
-        tile.on_click(cx.listener(move |this, _, window, cx| match shape {
-            // Moving pictures open in Quick Look, which can play them; nothing here decodes video.
-            MediaShape::Gif | MediaShape::Video => this.fetch_then(&file, Then::QuickLook, cx),
-            _ => this.open_viewer(&id, index, window, cx),
-        }))
-        .into_any_element()
+        tile.into_any_element()
     }
 
     /// A sticker: its own size, no box, no border, and whatever it leaves clear shows the row.
@@ -1037,6 +1112,9 @@ impl Pane {
         let still = attachment.thumb.as_ref().unwrap_or(&attachment.file).clone();
         let edge = media::square_size(128., window.scale_factor());
         let sticker = div().id(("sticker", index)).size(px(128.)).flex_none().relative();
+        if self.held_back(&still) {
+            return self.load_box(sticker.rounded(px(theme::R_CARD)).bg(tokens::media_fill()), &still, "Sticker", 0, false, cx).into_any_element();
+        }
         match self.still(&still, edge, edge, None, cx) {
             Picture::Ready(image) => sticker.child(img(ImageSource::Render(image)).size_full().object_fit(ObjectFit::Contain)),
             Picture::Loading => sticker.child(in_box(Icon::Image, None)),
@@ -1062,7 +1140,7 @@ impl Pane {
             (_, _, true) => (format!("{meta} · Downloaded"), theme::text_faint()),
             _ => (meta, theme::text_faint()),
         };
-        let look = file.clone();
+        let look = attachment.clone();
         let row = div()
             .id(("file", index))
             .w(px(360.))
@@ -1102,7 +1180,7 @@ impl Pane {
             );
         let row = match on_disk {
             Some(path) => {
-                let (open, reveal) = (file.clone(), path);
+                let (open, reveal) = (attachment.clone(), path);
                 row.child(
                     tool("open", Icon::External, 28.)
                         .tooltip(tip("Open", None))
@@ -1123,60 +1201,6 @@ impl Pane {
             None => row.child(tool("download", Icon::Download, 28.).tooltip(tip("Download", None))),
         };
         row.into_any_element()
-    }
-
-    fn voice_row(&mut self, message: &Rc<Message>, index: usize, cx: &mut Context<Self>) -> AnyElement {
-        let attachment = &message.attachments[index];
-        let file = attachment.file.clone();
-        let bars = media::waveform(&attachment.waveform, 40);
-        let reason = file.failed.clone();
-        // Nothing here plays audio, so the played part is always the start.
-        let time = match &reason {
-            Some(_) => "Couldn't load · Retry".to_owned(),
-            None => format!("0:00 / {}", media::duration_label(attachment.duration)),
-        };
-        div()
-            .id(("voice", index))
-            .w(px(300.))
-            .max_w_full()
-            .h(px(48.))
-            .px(px(8.))
-            .rounded(px(theme::R_FLOAT))
-            .bg(tokens::card())
-            .border_1()
-            .border_color(theme::hairline())
-            .flex()
-            .items_center()
-            .gap(px(10.))
-            .cursor_pointer()
-            .when_some(reason.clone(), |row, reason| row.tooltip(tip(format!("{reason} Click to try again."), None)))
-            // LATER: play in place. Until an audio path exists in the shell this opens Quick
-            // Look, which plays it.
-            .on_click(cx.listener(move |this, _, _, cx| this.fetch_then(&file, Then::QuickLook, cx)))
-            .child(
-                div()
-                    .size(px(32.))
-                    .flex_none()
-                    .rounded_full()
-                    .bg(theme::accent_soft())
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(icon(Icon::Play, 14., theme::accent_text())),
-            )
-            .child(
-                div().flex_1().min_w_0().h(px(20.)).flex().items_center().gap(px(2.)).overflow_hidden().children(
-                    bars.into_iter().map(|tall| div().w(px(2.)).h(px(tall)).flex_none().rounded(px(1.)).bg(theme::text_faint())),
-                ),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .type_small()
-                    .text_color(if reason.is_some() { theme::danger() } else { theme::text_soft() })
-                    .child(time),
-            )
-            .into_any_element()
     }
 
     /// What a bot or app posts instead of text: one framed card, its bar in one of our colors.
@@ -1281,6 +1305,10 @@ impl Pane {
             let wide = self.media_width().min(416.);
             let tall = (wide * image.height as f32 / image.width.max(1) as f32).round().min(210.);
             let edge = media::decode_edge((image.width, image.height), wide, tall, Fit::Cover, scale);
+            if self.held_back(&image) {
+                let picture = self.load_box(holder("preview", wide, tall, 8.), &image, "Preview", image.bytes, true, cx);
+                return card.flex().flex_col().gap(px(8.)).child(words).child(picture).into_any_element();
+            }
             let picture = match self.still(&image, edge, edge, None, cx) {
                 Picture::Ready(decoded) => holder("preview", wide, tall, 8.).child(shown(decoded, 8.)),
                 Picture::Loading => holder("preview", wide, tall, 8.).child(in_box(Icon::Image, None)),
@@ -1289,6 +1317,10 @@ impl Pane {
             return card.flex().flex_col().gap(px(8.)).child(words).child(picture).into_any_element();
         }
         let edge = media::decode_edge((image.width, image.height), 72., 72., Fit::Cover, scale);
+        if self.held_back(&image) {
+            let picture = self.load_box(holder("preview", 72., 72., 6.), &image, "Preview", 0, false, cx);
+            return card.flex().gap(px(12.)).child(words).child(picture).into_any_element();
+        }
         let picture = match self.still(&image, edge, edge, None, cx) {
             Picture::Ready(decoded) => holder("preview", 72., 72., 6.).child(shown(decoded, 6.)),
             Picture::Loading => holder("preview", 72., 72., 6.).child(in_box(Icon::Image, None)),
@@ -1334,20 +1366,32 @@ impl Pane {
             };
             // A custom emoji is its name until its image is here.
             let emoji = picture.unwrap_or_else(|| {
-                div().text_size(px(15.)).line_height(px(20.)).child(reaction.emoji.clone()).into_any_element()
+                div().text_size(px(15.)).line_height(px(20.)).child(emoji::display(&reaction.emoji)).into_any_element()
             });
             let count = div()
                 .type_small()
                 .font_weight(theme::MEDIUM)
                 .text_color(if reaction.mine { theme::accent_text() } else { theme::text_soft() })
                 .child(reaction.count.to_string());
-            let (id, toggled, on) = (message.id.clone(), reaction.emoji.clone(), !reaction.mine);
-            let words = if reaction.mine { "Take back your reaction" } else { "React with this too" };
+            // A custom one goes by its file, which names it where its `:name:` may not.
+            let toggled = reaction.file.as_ref().map_or_else(|| reaction.emoji.clone(), |file| file.id.clone());
+            let (id, on) = (message.id.clone(), !reaction.mine);
+            // Joining one the conversation no longer takes, or past a limit, is not offered:
+            // the chip says why instead.
+            let refused = (!reaction.mine).then(|| self.refusal(message, &toggled)).flatten();
+            let words = match (&refused, reaction.mine) {
+                (Some(why), _) => why.clone(),
+                (None, true) => "Take back your reaction".to_owned(),
+                (None, false) => "React with this too".to_owned(),
+            };
+            let joins = acts && refused.is_none();
             row = row.child(
                 chip(("chip", ix).into(), reaction.mine)
                     .child(emoji)
                     .child(count)
-                    .when(acts, |chip| chip.tooltip(tip(words, None)).on_click(cx.listener(move |this, _, _, cx| this.react(&id, &toggled, on, cx)))),
+                    .when(acts, |chip| chip.tooltip(tip(words, None)))
+                    .when(joins, |chip| chip.on_click(cx.listener(move |this, _, _, cx| this.react(&id, &toggled, on, cx))))
+                    .when(!joins, |chip| chip.cursor_default()),
             );
         }
         let hidden = message.reactions.len().saturating_sub(CHIPS);
@@ -1355,12 +1399,14 @@ impl Pane {
             row = row.child(chip("chips-more".into(), false).type_small().text_color(theme::text_soft()).child(format!("+{hidden}")));
         }
         // Always laid out and shown on hover only, so hovering a row never changes its height.
+        // Where nothing more may be added it stays laid out and never shows.
         let id = message.id.clone();
+        let adds = acts && self.adds(message);
         let add = chip("chip-add".into(), false)
             .opacity(0.)
-            .group_hover("row", |style| style.opacity(1.))
+            .when(adds, |chip| chip.group_hover("row", |style| style.opacity(1.)))
             .child(icon(Icon::SmilePlus, 16., theme::text_soft()))
-            .when(acts, |chip| {
+            .when(adds, |chip| {
                 chip.tooltip(tip("Add reaction", None)).on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
                     this.open_picker(&id, event.position(), window, cx);
                 }))
