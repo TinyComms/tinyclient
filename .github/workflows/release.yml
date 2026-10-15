@@ -87,7 +87,14 @@ jobs:
           sudo apt-get install -y \
             build-essential pkg-config libssl-dev libasound2-dev libgtk-3-dev libwebkit2gtk-4.1-dev \
             libsoup-3.0-dev libvulkan-dev libwayland-dev libxkbcommon-dev libx11-dev \
-            libxcb1-dev libfontconfig1-dev protobuf-compiler librsvg2-bin dpkg-dev
+            libxcb1-dev libfontconfig1-dev librsvg2-bin dpkg-dev
+      # Ubuntu 22.04's protoc (3.12) is too old for Signal's protobufs (proto3 optional fields).
+      - name: Install protobuf
+        run: |
+          case $(uname -m) in x86_64) a=x86_64 ;; aarch64) a=aarch_64 ;; esac
+          curl -fsSL -o "$RUNNER_TEMP/protoc.zip" "https://github.com/protocolbuffers/protobuf/releases/download/v29.3/protoc-29.3-linux-$a.zip"
+          unzip -q "$RUNNER_TEMP/protoc.zip" -d "$RUNNER_TEMP/protoc"
+          echo "$RUNNER_TEMP/protoc/bin" >> "$GITHUB_PATH"
       - uses: swatinem/rust-cache@v2
         with:
           key: ${{ matrix.runner }}
