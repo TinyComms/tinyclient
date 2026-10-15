@@ -103,6 +103,8 @@ struct Shared {
     closes: Mutex<VecDeque<u16>>,
     /// The page that names the web client's build: how long it takes, and its status.
     login: Mutex<(Duration, u16)>,
+    /// How many times that page has been answered.
+    logins: AtomicUsize,
     /// A path whose answer is held back this long.
     stall: Mutex<Option<(String, Duration)>>,
     /// The last sequence number dispatched.
@@ -402,6 +404,7 @@ fn serve_http(shared: Arc<Shared>, stream: TcpStream) {
         } else if bare == "/login" {
             let (takes, status) = *shared.login.lock().unwrap();
             sleep(takes);
+            shared.logins.fetch_add(1, Ordering::Relaxed);
             let page = r#"<script>window.GLOBAL_ENV = {"API_ENDPOINT":"//discord.com/api","BUILD_NUMBER":"987654","RELEASE_CHANNEL":"stable"}</script>"#;
             Some((status, "Content-Type: text/html\r\n".to_owned(), page.to_owned()))
         } else {
@@ -580,6 +583,7 @@ impl World {
             ready: Mutex::new(READY.to_owned()),
             closes: Mutex::new(VecDeque::new()),
             login: Mutex::new((Duration::ZERO, 200)),
+            logins: AtomicUsize::new(0),
             stall: Mutex::new(None),
             sequence: AtomicU64::new(0),
             connections: AtomicUsize::new(0),
@@ -2046,14 +2050,15 @@ fn chatd_serves_before_the_build_is_read_and_remembers_the_last_one_read() {
         wait("an identify", || world.discord.frames_of(2).get(nth).map(|identify| identify["d"]["properties"]["client_build_number"].clone()))
     };
 
-    // The page that names the build takes three seconds. chatd answers long before that.
+    // The page that names the build takes three seconds. chatd answers while it is still
+    // waiting for it. That is what is checked, not a time: how long a busy machine takes to
+    // start chatd is no part of it.
     let started = Instant::now();
     let mut world = World::launch(&[("TINYCLIENT_DISCORD_LOGIN", "{{API}}/login")], |shared| {
         *shared.login.lock().unwrap() = (Duration::from_secs(3), 200);
     });
     assert_eq!(world.ask(Request::Ping), Response::Pong);
-    let serving = started.elapsed();
-    assert!(serving < Duration::from_millis(1500), "chatd took {serving:?} to answer");
+    assert_eq!(world.discord.logins.load(Ordering::Relaxed), 0, "chatd answered only once it had the build");
     assert!(world.discord.frames_of(2).is_empty(), "nothing is said to Discord before the build is known");
     assert_eq!(build(&world, 0), json!(987_654));
     assert!(started.elapsed() >= Duration::from_secs(3));
