@@ -1,0 +1,6 @@
+#!/bin/sh
+# The AppImage's entry point. The four programs sit side by side in usr/bin, so tinyclient finds
+# chatd beside itself as it does everywhere else. Libraries come from the system (see
+# packaging/linux.sh), so nothing is added to LD_LIBRARY_PATH.
+here=$(dirname "$(readlink -f "$0")")
+exec "$here/usr/bin/tinyclient" "$@"

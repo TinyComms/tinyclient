@@ -95,21 +95,33 @@ Download from [tinyclient.io](https://tinyclient.io), or straight from the
 the same GitHub release files. Each release is built in the open by
 `.github/workflows/release.yml` from a `v*` tag, with a `SHA256SUMS` file to check them against.
 
-| OS | Download | Contents |
+| OS | Download | What it is |
 | --- | --- | --- |
-| macOS (Apple silicon) | [`tinyclient-macos.zip`](https://tinyclient.io/download/macos) | `tinyclient.app` |
-| Linux x86_64 | [`tinyclient-linux-x86_64.tar.gz`](https://tinyclient.io/download/linux) | `tinyclient`, `chatd`, `mediad`, `tinyclient-login` |
-| Windows x86_64 | [`tinyclient-windows-x86_64.zip`](https://tinyclient.io/download/windows) | the same four `.exe` files |
+| macOS 13+, Apple silicon | [`tinyclient-macos.dmg`](https://tinyclient.io/download/macos) ([`.zip`](https://tinyclient.io/download/macos-zip)) | `tinyclient.app`, to drag to Applications |
+| Debian, Ubuntu | [`tinyclient-linux-x86_64.deb`](https://tinyclient.io/download/deb) | `sudo apt install ./tinyclient-linux-x86_64.deb` |
+| Fedora, openSUSE | [`tinyclient-linux-x86_64.rpm`](https://tinyclient.io/download/rpm) | `sudo dnf install ./tinyclient-linux-x86_64.rpm` |
+| Any Linux | [`tinyclient-linux-x86_64.AppImage`](https://tinyclient.io/download/appimage) | One file: `chmod +x` it and run it |
+| Any Linux | [`tinyclient-linux-x86_64.tar.gz`](https://tinyclient.io/download/linux-tar) | The four programs and `install.sh` (`~/.local`, or `--system`) |
+| Windows 10+, x86_64 | [`tinyclient-windows-x86_64-setup.exe`](https://tinyclient.io/download/windows) | Installer for the current user, no administrator; Apps & features uninstalls it |
+| Windows, portable | [`tinyclient-windows-x86_64.zip`](https://tinyclient.io/download/windows-portable) | The four `.exe` files, run in place |
 
-Keep the four programs in one directory: each finds the others beside itself. Start `tinyclient`;
-it starts `chatd` when nothing answers on the socket.
+Each Linux format is also built for arm64, named `aarch64` in place of `x86_64`. The `.deb` and
+`.rpm` bring in the libraries tinyclient needs; the AppImage and `.tar.gz` use the system's (GTK 3,
+WebKitGTK 4.1, ALSA, OpenSSL 3, Vulkan) and need glibc 2.35 or later. Every package is installed and
+started on a clean system in the release workflow before it is published.
+[Getting started](https://tinyclient.io/docs/) has the commands for each, and how to remove them.
+
+However it is installed, the four programs stay in one directory: each finds the others beside
+itself. Start `tinyclient`; it starts `chatd` when nothing answers on the socket.
 
 - **macOS.** The app is signed ad hoc, not notarized, so Gatekeeper warns the first time you open
   it. Allow it in System Settings > Privacy & Security if you trust the build. Open the app
   rather than the bare binaries: macOS grants the microphone to an app bundle, so calls need it.
 - **Linux.** Sessions are kept in the Secret Service (GNOME Keyring, KWallet), which must be
   running. The sign-in window needs WebKitGTK 4.1.
-- **Windows.** The sign-in window needs WebView2, which current Windows includes.
+- **Windows.** The installer and programs are not code-signed, so SmartScreen warns before the
+  first run (More info > Run anyway). The sign-in window needs WebView2, which current Windows
+  includes.
 
 ## Build from source
 
@@ -122,7 +134,7 @@ Prerequisites:
 
   ```sh
   sudo apt-get install build-essential pkg-config libssl-dev libasound2-dev libgtk-3-dev \
-    libwebkit2gtk-4.1-dev libsoup-3.0-dev libvulkan-dev libwayland-dev libxkbcommon-dev \
+    libwebkit2gtk-4.1-dev libsoup-3.0-dev libvulkan-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
     libx11-dev libxcb1-dev libfontconfig1-dev protobuf-compiler
   ```
 
@@ -137,10 +149,12 @@ cargo run -p tinyclient --features gui     # the window; starts chatd beside it
 cargo run -p tinyclient                    # status and inbox as text
 ```
 
-The macOS app bundle, with all four programs inside and the microphone entitlement:
+The downloads, as the release workflow makes them, into `dist/`:
 
 ```sh
-packaging/bundle.sh                        # builds --release, writes target/release/tinyclient.app
+packaging/bundle.sh && packaging/dmg.sh dist/tinyclient.dmg   # macOS: the app bundle and its disk image
+eval "$(packaging/linux/tools.sh)" && packaging/linux.sh      # Linux: .deb, .rpm, AppImage, .tar.gz
+packaging\windows.ps1                                         # Windows: the installer (Inno Setup 6) and .zip
 ```
 
 ### Telegram needs your own app id

@@ -4,6 +4,11 @@ use protocol::{chat_sock_path, support_dir, ChatListener};
 use std::io;
 
 fn main() -> io::Result<()> {
+    // Before the support directory is touched: the packages' smoke tests run it on a bare system.
+    if std::env::args().nth(1).as_deref() == Some("--version") {
+        println!("chatd {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     protocol::crash::install_panic_hook("chatd");
     let dir = support_dir();
     std::fs::create_dir_all(&dir)?;

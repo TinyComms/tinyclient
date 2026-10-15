@@ -1,9 +1,19 @@
 name: Release
 
+# A v* tag builds every download, installs each one on a clean system to prove it works, and
+# publishes them as that tag's GitHub release. Run by hand on a branch, it builds and tests the
+# same files without publishing (`gh workflow run release.yml --ref BRANCH`); they are kept as the
+# run's `release-all` artifact.
 on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish a GitHub release. Only when run on a v* tag.
+        type: boolean
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -13,10 +23,13 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Name the files
+        run: packaging/ci-label.sh >> "$GITHUB_ENV"
       - name: Install protobuf
         run: brew install protobuf
       - uses: swatinem/rust-cache@v2
       - name: Test (no GUI)
+        if: github.event_name == 'push'
         run: cargo test --workspace
         continue-on-error: true
       - name: Build release
@@ -29,26 +42,65 @@ jobs:
             -p chatd -p mediad -p login
       - name: Bundle tinyclient.app
         run: packaging/bundle.sh --no-build
-      - name: Zip app bundle
-        run: ditto -c -k --keepParent target/release/tinyclient.app "tinyclient-${{ github.ref_name }}-macos.zip"
+      - name: Zip and disk image
+        run: |
+          mkdir -p dist
+          ditto -c -k --keepParent target/release/tinyclient.app "dist/tinyclient-$LABEL-macos.zip"
+          packaging/dmg.sh "dist/tinyclient-$LABEL-macos.dmg"
+      # Mounted as a user would: the Applications link is there, the app's ad hoc signature holds,
+      # and every program in it runs.
+      - name: Smoke test the disk image
+        run: |
+          mnt=$(mktemp -d)
+          hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "dist/tinyclient-$LABEL-macos.dmg"
+          test "$(readlink "$mnt/Applications")" = /Applications
+          codesign --verify --deep --strict --verbose=2 "$mnt/tinyclient.app"
+          codesign -dv "$mnt/tinyclient.app" 2>&1 | grep -q 'Signature=adhoc'
+          for program in tinyclient chatd mediad tinyclient-login; do
+            out=$("$mnt/tinyclient.app/Contents/MacOS/$program" --version)
+            echo "$out"
+            test "$out" = "$program $VERSION"
+          done
+          hdiutil detach "$mnt"
       - uses: actions/upload-artifact@v4
         with:
           name: release-macos
-          path: tinyclient-${{ github.ref_name }}-macos.zip
+          path: dist/*
 
   linux:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The oldest supported Ubuntu: the packages need the glibc they were built against or newer.
+          - arch: x86_64
+            runner: ubuntu-22.04
+          - arch: aarch64
+            runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+      - name: Name the files
+        run: packaging/ci-label.sh >> "$GITHUB_ENV"
       - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             build-essential pkg-config libssl-dev libasound2-dev libgtk-3-dev libwebkit2gtk-4.1-dev \
-            libsoup-3.0-dev libvulkan-dev libwayland-dev libxkbcommon-dev libx11-dev \
-            libxcb1-dev libfontconfig1-dev protobuf-compiler
+            libsoup-3.0-dev libvulkan-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libx11-dev \
+            libxcb1-dev libfontconfig1-dev librsvg2-bin dpkg-dev
+      # Ubuntu 22.04's protoc (3.12) is too old for Signal's protobufs (proto3 optional fields).
+      - name: Install protobuf
+        run: |
+          case $(uname -m) in x86_64) a=x86_64 ;; aarch64) a=aarch_64 ;; esac
+          curl -fsSL -o "$RUNNER_TEMP/protoc.zip" "https://github.com/protocolbuffers/protobuf/releases/download/v29.3/protoc-29.3-linux-$a.zip"
+          unzip -q "$RUNNER_TEMP/protoc.zip" -d "$RUNNER_TEMP/protoc"
+          echo "$RUNNER_TEMP/protoc/bin" >> "$GITHUB_PATH"
       - uses: swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.runner }}
       - name: Test
+        if: github.event_name == 'push'
         run: cargo test --workspace
         continue-on-error: true
       - name: Build release
@@ -59,19 +111,52 @@ jobs:
           cargo build --release \
             -p tinyclient --features tinyclient/gui \
             -p chatd -p mediad -p login
-      - name: Pack binaries
+      - name: Package .deb, .rpm, AppImage and .tar.gz
         run: |
-          tar -czf "tinyclient-${{ github.ref_name }}-linux-x86_64.tar.gz" \
-            -C target/release tinyclient chatd mediad tinyclient-login
+          eval "$(packaging/linux/tools.sh)"
+          packaging/linux.sh --no-build "$LABEL"
       - uses: actions/upload-artifact@v4
         with:
-          name: release-linux
-          path: tinyclient-${{ github.ref_name }}-linux-x86_64.tar.gz
+          name: release-linux-${{ matrix.arch }}
+          path: dist/*
+
+  # Each Linux package installed on clean systems that never saw the build: the package manager
+  # must find every library from the package's own dependencies, or the programs do not start.
+  linux-smoke:
+    needs: linux
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Name the files
+        run: packaging/ci-label.sh >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-linux-${{ matrix.arch }}
+          path: dist
+      - name: .deb on Ubuntu 24.04 (with the desktop entry, metainfo, AppImage and tar.gz)
+        run: docker run --rm -v "$PWD:/w" -w /w -e LABEL -e VERSION -e ARCH=${{ matrix.arch }} ubuntu:24.04 packaging/linux/smoke.sh deb-full
+      - name: .deb on Debian 12
+        run: docker run --rm -v "$PWD:/w" -w /w -e LABEL -e VERSION -e ARCH=${{ matrix.arch }} debian:12 packaging/linux/smoke.sh deb
+      - name: .rpm on Fedora
+        run: docker run --rm -v "$PWD:/w" -w /w -e LABEL -e VERSION -e ARCH=${{ matrix.arch }} fedora:latest packaging/linux/smoke.sh rpm
+      - name: .rpm on openSUSE Tumbleweed
+        run: docker run --rm -v "$PWD:/w" -w /w -e LABEL -e VERSION -e ARCH=${{ matrix.arch }} opensuse/tumbleweed packaging/linux/smoke.sh rpm
 
   windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Name the files
+        shell: bash
+        run: packaging/ci-label.sh >> "$GITHUB_ENV"
       - uses: swatinem/rust-cache@v2
       - name: OpenSSL from Git
         shell: pwsh
@@ -83,6 +168,7 @@ jobs:
           Expand-Archive protoc.zip -DestinationPath protoc
           echo "$pwd\protoc\bin" >> $env:GITHUB_PATH
       - name: Test
+        if: github.event_name == 'push'
         run: cargo test --workspace
         continue-on-error: true
       - name: Build release
@@ -93,40 +179,54 @@ jobs:
           cargo build --release `
             -p tinyclient --features tinyclient/gui `
             -p chatd -p mediad -p login
-      - name: Pack binaries
+      - name: Install Inno Setup
         shell: pwsh
         run: |
-          Compress-Archive -Path `
-            target/release/tinyclient.exe, `
-            target/release/chatd.exe, `
-            target/release/mediad.exe, `
-            target/release/tinyclient-login.exe `
-            -DestinationPath "tinyclient-${{ github.ref_name }}-windows-x86_64.zip"
+          if (-not (Get-Command iscc.exe -ErrorAction SilentlyContinue) -and -not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup -y --no-progress
+          }
+      - name: Installer and portable zip
+        shell: pwsh
+        run: packaging/windows.ps1 -NoBuild -Label $env:LABEL
+      - name: Smoke test the installer and the zip
+        shell: pwsh
+        run: packaging/windows/smoke.ps1 -Label $env:LABEL -Version $env:VERSION
       - uses: actions/upload-artifact@v4
         with:
           name: release-windows
-          path: tinyclient-${{ github.ref_name }}-windows-x86_64.zip
+          path: dist/*
 
   publish:
-    needs: [macos, linux, windows]
+    needs: [macos, linux, linux-smoke, windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+      - name: Name the files
+        run: packaging/ci-label.sh >> "$GITHUB_ENV"
       - uses: actions/download-artifact@v4
         with:
+          pattern: release-*
           path: dist
           merge-multiple: true
       # Each package also goes up without the version in its name, so a fixed address
-      # (releases/latest/download/tinyclient-macos.zip, which tinyclient.io/download/macos points
+      # (releases/latest/download/tinyclient-macos.dmg, which tinyclient.io/download/macos points
       # at) always serves the newest one. SHA256SUMS covers both names.
       - name: Unversioned copies and checksums
         working-directory: dist
         run: |
-          for f in tinyclient-${{ github.ref_name }}-*; do
-            cp "$f" "tinyclient-${f#tinyclient-${{ github.ref_name }}-}"
+          for f in "tinyclient-$LABEL-"*; do
+            cp "$f" "tinyclient-${f#"tinyclient-$LABEL-"}"
           done
           sha256sum tinyclient-* > SHA256SUMS
+          sha256sum -c SHA256SUMS
+          ls -l
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-all
+          path: dist/*
       - uses: softprops/action-gh-release@v2
+        if: github.ref_type == 'tag' && (github.event_name == 'push' || inputs.publish)
         with:
           files: dist/*

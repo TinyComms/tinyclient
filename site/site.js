@@ -1,13 +1,15 @@
 // Progressive enhancement only. Every page reads the same without it.
-// 1. Names your system on the download button and points it at that build. 2. Adds Copy to
-// code blocks. 3. Drives the hero screenshots.
+// 1. Names your system on the download button and points it at that build (on Linux, at the
+// choice of formats, which it also lists). 2. Adds Copy to code blocks. 3. Drives the hero
+// screenshots.
 (function () {
   "use strict";
 
   var systems = {
-    mac: { label: "Download for macOS", hint: "For Apple silicon, macOS 13 or later", href: "/download/macos" },
-    linux: { label: "Download for Linux", hint: "For x86_64; four binaries in a .tar.gz", href: "/download/linux" },
-    windows: { label: "Download for Windows", hint: "For x86_64; four .exe files in a .zip", href: "/download/windows" }
+    mac: { label: "Download for macOS", hint: "For Apple silicon, macOS 13 or later; a disk image", href: "/download/macos" },
+    // Linux has a format per distribution, so the button opens the choice and the formats are listed.
+    linux: { label: "Download for Linux", hint: "For x86_64 and arm64: .deb, .rpm, AppImage or .tar.gz", href: "/docs/#linux" },
+    windows: { label: "Download for Windows", hint: "For x86_64; an installer that needs no administrator", href: "/download/windows" }
   };
 
   function detect() {
@@ -31,6 +33,10 @@
     }
     var hint = document.querySelectorAll("[data-download-hint]");
     for (var j = 0; j < hint.length; j++) hint[j].textContent = systems[os].hint;
+    if (os === "linux") {
+      var choices = document.querySelectorAll("[data-linux-choices]");
+      for (var k = 0; k < choices.length; k++) choices[k].hidden = false;
+    }
   }
 
   // 3. The hero screenshots: arrows, tabs, keyboard and auto-advance on top of a scroll-snap

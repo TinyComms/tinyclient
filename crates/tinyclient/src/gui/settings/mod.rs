@@ -209,6 +209,7 @@ pub fn open(section: Section, cx: &mut App) {
         }),
         is_resizable: false,
         is_minimizable: false,
+        app_id: Some(super::APP_ID.into()),
         ..Default::default()
     };
     let opened = cx.open_window(options, |window, cx| {

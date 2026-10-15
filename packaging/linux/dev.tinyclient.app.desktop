@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=tinyclient
+GenericName=Chat Client
+Comment=Slack, Discord, Telegram, Teams and Signal in one small native window
+Exec=tinyclient
+Icon=dev.tinyclient.app
+Terminal=false
+StartupNotify=true
+StartupWMClass=dev.tinyclient.app
+Categories=Network;InstantMessaging;Chat;
+Keywords=Slack;Discord;Telegram;Teams;Signal;chat;messenger;

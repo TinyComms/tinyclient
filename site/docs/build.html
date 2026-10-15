@@ -63,7 +63,7 @@
       <li><strong>Linux</strong>: the system libraries CI installs.</li>
     </ul>
 <div class="code"><pre><code>sudo apt-get install build-essential pkg-config libssl-dev libasound2-dev libgtk-3-dev \
-  libwebkit2gtk-4.1-dev libsoup-3.0-dev libvulkan-dev libwayland-dev libxkbcommon-dev \
+  libwebkit2gtk-4.1-dev libsoup-3.0-dev libvulkan-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
   libx11-dev libxcb1-dev libfontconfig1-dev protobuf-compiler</code></pre></div>
     <ul>
       <li><strong>Windows</strong>: <code>protoc</code> on the <code>PATH</code>, and WebView2 for the sign-in window.</li>
@@ -94,7 +94,10 @@ cargo run -p tinyclient  <span class="c"># status and inbox as text</span></code
 
     <h3 id="release">Release builds</h3>
 <div class="code"><pre><code>cargo build --release -p tinyclient --features tinyclient/gui -p chatd -p mediad -p login
-packaging/bundle.sh  <span class="c"># macOS: builds and assembles target/release/tinyclient.app</span></code></pre></div>
+packaging/bundle.sh  <span class="c"># macOS: builds and assembles target/release/tinyclient.app</span>
+packaging/dmg.sh dist/tinyclient.dmg  <span class="c"># macOS: the app in a disk image</span>
+eval "$(packaging/linux/tools.sh)" &amp;&amp; packaging/linux.sh  <span class="c"># Linux: .deb, .rpm, AppImage and .tar.gz in dist/</span>
+packaging\windows.ps1  <span class="c"># Windows: the installer (needs Inno Setup 6) and .zip in dist\</span></code></pre></div>
     <p>On macOS, calls need the bundle: the system grants the microphone to an app, and a bare program run from a terminal borrows the terminal&rsquo;s permission instead.</p>
 
     <h2 id="telegram">Telegram needs your own app id</h2>

@@ -27,6 +27,10 @@ mod time;
 use gpui::{point, prelude::*, px, size, App, Bounds, Context, Div, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions};
 use state::Shell;
 
+/// The windows' Wayland app id and X11 class: a desktop matches them to `dev.tinyclient.app.desktop`
+/// (packaging/linux) for the dock icon and name. The same id as the macOS bundle's.
+pub(crate) const APP_ID: &str = "dev.tinyclient.app";
+
 gpui::actions!(
     tinyclient,
     [
@@ -634,6 +638,7 @@ pub fn run() {
                     // Centered on the 52 pt strips, inside the rail.
                     traffic_light_position: Some(point(px(10.), px(20.))),
                 }),
+                app_id: Some(APP_ID.into()),
                 ..Default::default()
             };
             let opened = cx.open_window(options, |window, cx| {
