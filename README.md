@@ -11,6 +11,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 [Website](https://tinyclient.io) ·
+[Discord](https://discord.gg/ZBhXsMPkA) ·
 [Releases](https://github.com/itz4blitz/tinyclient/releases) ·
 [Architecture](docs/architecture.md) ·
 [Contributing](CONTRIBUTING.md) ·
@@ -27,7 +28,7 @@ and nothing is sent anywhere else. It is built for macOS, Linux and Windows.
 
 tinyclient is early. We are building a community around one goal: a chat client that is a
 pleasure to use and does everything the official apps do, on every network.
-[Come help](#contributing).
+Talk with us on [Discord](https://discord.gg/ZBhXsMPkA), or [come help](#contributing).
 
 ## Why
 
