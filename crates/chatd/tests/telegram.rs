@@ -410,7 +410,8 @@ fn messages_arrive_change_and_go_and_what_they_hold_is_mapped() {
         ]
     );
     assert_eq!((rich.sender.id.as_str(), rich.sender.name.as_str(), rich.outgoing), ("u7002", "Odalys Brandt", false));
-    assert_eq!(world.conversation("u7002").unwrap().unread, 2);
+    // The row's count is written just after the message.
+    world.until("the second unread", || world.conversation("u7002").filter(|row| row.unread == 2));
 
     world.steer("react");
     let reacted = world.until("the reactions", || world.message("u7002", "13").filter(|message| !message.reactions.is_empty()));
@@ -854,6 +855,8 @@ fn pickers_and_sending_with_files_options_and_picks() {
     let album = send("8106", "trip", protocol::Outgoing { files: with, ..Default::default() });
     assert_eq!(album.state, SendState::Sent);
     assert_eq!((world.called("UploadMedia photo"), world.called("SendMultiMedia u7002 kept-photo,kept-photo")), (2, 1));
+    // The album is the message, and shows as sent once it lands; the document goes after it.
+    world.until("the document after the album", || (world.called("SendMedia u7002 file:application/pdf") > 0).then_some(()));
     assert_eq!(world.called("SendMedia u7002 file:application/pdf"), 1);
     // A big file goes in big parts.
     let big = file("track.gpx", 10 * 1024 * 1024 + 5);
