@@ -185,8 +185,12 @@ impl Sink {
         if seen.received == want && !seen.chunked {
             let body = json!({"ok": true, "bytes": want}).to_string();
             let answer = format!("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len());
-            if reader.into_inner().write_all(answer.as_bytes()).is_ok() {
-                seen.completed = true;
+            // Logged as answered before the answer goes: the uploader, and the test after it,
+            // may look the moment the answer arrives.
+            seen.completed = true;
+            log.lock().unwrap()[at] = seen.clone();
+            if reader.into_inner().write_all(answer.as_bytes()).is_err() {
+                seen.completed = false;
             }
         }
         log.lock().unwrap()[at] = seen;
