@@ -64,5 +64,5 @@ signal = ["dep:presage", "dep:aes-gcm-siv", "dep:futures", "dep:getrandom", "dep
 windows-sys = { version = "0.59", features = ["Win32_Networking_WinSock"] }
 
 [target.'cfg(windows)'.dev-dependencies]
-# tests/upload.rs reads a child's memory as often as every 20 ms.
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_ProcessStatus", "Win32_System_Threading"] }
+# tests/upload.rs reads a child's memory as often as every 20 ms; e2e and calls list mediads.
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Diagnostics_ToolHelp", "Win32_System_ProcessStatus", "Win32_System_Threading"] }

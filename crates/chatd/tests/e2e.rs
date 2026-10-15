@@ -12,13 +12,34 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 
 fn child_pids(parent: u32, name: &str) -> Vec<u32> {
+    // Asked of the system directly: PowerShell takes up to a second to start, long enough for a
+    // short-lived mediad to come and go unseen.
     #[cfg(windows)]
     {
-        let script = format!(
-            "(Get-CimInstance Win32_Process -Filter \"Name = '{name}.exe'\" | Where-Object {{ $_.ParentProcessId -eq {parent} }}).ProcessId"
-        );
-        let out = Command::new("powershell").args(["-NoProfile", "-Command", &script]).output().unwrap();
-        return String::from_utf8(out.stdout).unwrap().lines().filter_map(|line| line.trim().parse().ok()).collect();
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS};
+        let program = format!("{name}.exe");
+        let mut found = Vec::new();
+        // SAFETY: the snapshot is checked before use and closed after; the entry is sized for the
+        // calls that fill it.
+        unsafe {
+            let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if snapshot == INVALID_HANDLE_VALUE {
+                return found;
+            }
+            let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+            entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+            let mut more = Process32FirstW(snapshot, &mut entry) != 0;
+            while more {
+                let end = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(entry.szExeFile.len());
+                if entry.th32ParentProcessID == parent && String::from_utf16_lossy(&entry.szExeFile[..end]).eq_ignore_ascii_case(&program) {
+                    found.push(entry.th32ProcessID);
+                }
+                more = Process32NextW(snapshot, &mut entry) != 0;
+            }
+            CloseHandle(snapshot);
+        }
+        return found;
     }
     #[cfg(not(windows))]
     {
