@@ -6,7 +6,7 @@
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self'; style-src 'self'; script-src 'self'; base-uri 'none'; form-action 'none'">
 <meta name="referrer" content="no-referrer">
 <title>Contributing · tinyclient docs</title>
-<meta name="description" content="How to contribute to tinyclient: where help is needed, how to start, and the rules every change keeps.">
+<meta name="description" content="How to contribute to tinyclient: the roadmap, areas you can own, and the rules every change keeps.">
 <meta name="color-scheme" content="dark light">
 <meta name="theme-color" content="#121315" media="(prefers-color-scheme: dark)">
 <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
@@ -55,15 +55,113 @@
     <h1>Contributing</h1>
     <p class="lede">From a typo to a network adapter. Talk it through on <a href="https://discord.gg/ZBhXsMPkA">Discord</a>, or follow <a href="https://github.com/itz4blitz/tinyclient/blob/main/CONTRIBUTING.md"><code>CONTRIBUTING.md</code></a>. This page is the short version.</p>
 
+    <h2 id="roadmap">Roadmap</h2>
+    <p>Five increments. Each one is usable on its own. Discord and Slack came first, because they signed in first. The goal is a normal day on Slack, Discord, Telegram and Teams without the official apps. Signal is a fifth network, and it is partial.</p>
+    <div class="table-wrap" tabindex="0" role="region" aria-label="Roadmap">
+      <table>
+        <thead><tr><th scope="col">Increment</th><th scope="col">Done when</th><th scope="col">Where it stands</th></tr></thead>
+        <tbody>
+          <tr>
+            <th scope="row">1. Looks real</th>
+            <td>A normal conversation reads here: avatars, names, images, files, links, formatting, mentions, emoji, edits, deletions, reactions, scrollback, a multi-line composer.</td>
+            <td>In, on Discord, Slack, Teams and Telegram. On Signal a photo or file is a labelled line, not the file.</td>
+          </tr>
+          <tr>
+            <th scope="row">2. Everything and everyone</th>
+            <td>Every server, channel and group is listed. People, presence, typing, starting a DM, the quick switcher, unread, mentions and mutes are right. A DM or mention notifies, and the Dock badge matches.</td>
+            <td>The lists, people, presence, typing, unread and mutes are in. Notifications and the Dock badge are not.</td>
+          </tr>
+          <tr>
+            <th scope="row">3. Answer in kind</th>
+            <td>Threads, reactions, reply, edit, delete, paste, attach, mention completion, the emoji picker, and message search. Nobody can tell which client sent it.</td>
+            <td>All of that is in except message search. The switcher finds conversations by title in the local cache.</td>
+          </tr>
+          <tr>
+            <th scope="row">4. Talk</th>
+            <td>A call in <code>mediad</code>, which runs only while the call does. Discord voice first, then one screen share each way. Slack huddles after a spike that is heard on a real huddle. Telegram 1:1 calls. Teams calls and meetings open in Teams.</td>
+            <td>Discord voice is in, including its end-to-end encryption. Video, screen share, Slack huddles and Telegram calls are not. Their buttons open the official app.</td>
+          </tr>
+          <tr>
+            <th scope="row">5. Four networks</th>
+            <td>Telegram, then Teams chat, at the level of increments 1 to 3. Teams meetings stay a hand-off. A work or school Teams account can still be blocked by the tenant, and nothing here changes that.</td>
+            <td>Telegram and Teams chat are in at that level, except search and notifications. Teams personal accounts are not built.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p>Admin, moderation, bot buttons, app platforms, canvases, a video gallery, and Teams meetings stay cut. Each one opens in the official app. The line, and why, is in <a href="https://github.com/itz4blitz/tinyclient/blob/main/docs/product/01-persona-scope.md"><code>docs/product/01-persona-scope.md</code></a>.</p>
+
     <h2 id="needed">Where help is needed</h2>
-    <ul>
-      <li><strong>Real-account testing</strong> of Teams, Telegram and Signal, and of everything on Linux and Windows. A bug report with the redacted log is as useful as code.</li>
-      <li><strong>Notifications and a dock badge</strong>, and the settings that control them.</li>
-      <li><strong>An interactive terminal UI</strong> on the existing socket protocol. The protocol is all it needs.</li>
-      <li><strong>Signal</strong>: attachments, safety numbers, calls.</li>
-      <li><strong>Packaging</strong>: a notarized macOS build, Linux packages, a Windows installer.</li>
-      <li><strong>Message search</strong>, video and screen share.</li>
-    </ul>
+    <p>Say which area you want on <a href="https://discord.gg/ZBhXsMPkA">Discord</a>, and it is yours until it ships or you hand it back. One area at a time.</p>
+    <p>The product documents are the spec. Read the one named for your area before you write code. Where a document still leaves a choice open, propose the answer in Discord. Once there is general agreement, the decision goes into that document in the same change as the code. A bug report with the redacted log counts, and so does testing an area someone else owns, on a real account, on Linux or on Windows.</p>
+    <p>The order below is the order we would build them. A later row is still open if that is the one you want.</p>
+    <div class="table-wrap" tabindex="0" role="region" aria-label="Open areas">
+      <table>
+        <thead><tr><th scope="col">Area</th><th scope="col">Done when</th><th scope="col">Spec</th></tr></thead>
+        <tbody>
+          <tr>
+            <th scope="row">Notifications and the Dock badge</th>
+            <td>A DM or mention while the window is in the background posts one notification. Reading it on another device clears it here. The settings that control posting, sound, quiet hours and the badge are real, and each one passes the check in the settings doc.</td>
+            <td><a href="https://github.com/itz4blitz/tinyclient/blob/main/docs/product/04-live-signals.md"><code>04</code></a>, <a href="https://github.com/itz4blitz/tinyclient/blob/main/docs/product/09-settings.md"><code>09</code></a></td>
+          </tr>
+          <tr>
+            <th scope="row">Message search</th>
+            <td>Typing searches cached messages. Enter searches the network. Results are labelled with where they came from, and opening one lands on that message.</td>
+            <td><a href="https://github.com/itz4blitz/tinyclient/blob/main/docs/product/05-navigation.md"><code>05</code></a></td>
+          </tr>
+          <tr>
+            <th scope="row">Discord video and screen share</th>
+            <td>Watch one share, then send one. One surface, never a grid. <code>mediad</code> is gone when the call ends.</td>
+            <td><a href="https://github.com/itz4blitz/tinyclient/blob/main/docs/product/06-calls.md"><code>06</code></a></td>
+          </tr>
+          <tr>
+            <th scope="row">Slack huddles</th>
+            <td>A spike that joins a real huddle and is heard. Audio ships only if that spike holds. Until then the button opens Slack.</td>
+            <td><a href="https://github.com/itz4blitz/tinyclient/blob/main/docs/product/06-calls.md"><code>06</code></a></td>
+          </tr>
+          <tr>
+            <th scope="row">Telegram calls</th>
+            <td>A 1:1 call. Group calls stay a hand-off.</td>
+            <td><a href="https://github.com/itz4blitz/tinyclient/blob/main/docs/product/06-calls.md"><code>06</code></a></td>
+          </tr>
+          <tr>
+            <th scope="row">Signal</th>
+            <td>Photos and files shown, safety numbers shown, and calls only if they fit the same <code>mediad</code> rules as Discord voice.</td>
+            <td><a href="https://github.com/itz4blitz/tinyclient/blob/main/docs/architecture.md"><code>architecture</code></a></td>
+          </tr>
+          <tr>
+            <th scope="row">Terminal</th>
+            <td>An interactive UI on the existing socket. The protocol is the whole API. The window never has to change for it.</td>
+            <td><a href="https://github.com/itz4blitz/tinyclient/blob/main/docs/architecture.md"><code>architecture</code></a></td>
+          </tr>
+          <tr>
+            <th scope="row">Packaging</th>
+            <td>A notarized macOS app, Linux packages, and a Windows installer. Notifications on macOS need the bundle.</td>
+            <td><a href="https://github.com/itz4blitz/tinyclient/blob/main/docs/product/08-sign-in-accounts.md"><code>08</code></a></td>
+          </tr>
+          <tr>
+            <th scope="row">Real-account testing</th>
+            <td>Teams, Telegram and Signal, and the whole app on Linux and Windows, exercised on a real account. The deliverable is a bug report with the redacted log.</td>
+            <td><a href="https://github.com/itz4blitz/tinyclient/blob/main/docs/product/07-budgets-and-risk.md"><code>07</code></a></td>
+          </tr>
+          <tr>
+            <th scope="row">Voice messages</th>
+            <td>A voice message plays. Recording one is later.</td>
+            <td><a href="https://github.com/itz4blitz/tinyclient/blob/main/docs/product/03-message-content.md"><code>03</code></a></td>
+          </tr>
+          <tr>
+            <th scope="row">Teams personal accounts</th>
+            <td>Sign-in and chat for a personal Microsoft account, or a written finding that the flow does not work.</td>
+            <td><a href="https://github.com/itz4blitz/tinyclient/blob/main/docs/product/08-sign-in-accounts.md"><code>08</code></a></td>
+          </tr>
+          <tr>
+            <th scope="row">The rest of Settings</th>
+            <td>The settings rows marked v1 that are still absent, after notifications. Light theme is the last of them.</td>
+            <td><a href="https://github.com/itz4blitz/tinyclient/blob/main/docs/product/09-settings.md"><code>09</code></a></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
 
     <h2 id="start">Start here</h2>
 <div class="code"><pre><code>git clone https://github.com/itz4blitz/tinyclient

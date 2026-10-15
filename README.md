@@ -268,14 +268,10 @@ or Signal. How each network treats third-party clients, so you can decide for yo
 
 ## Contributing
 
-Contributions are welcome, from a typo to a network adapter. Places that need work now:
-
-- **An interactive terminal UI** on the existing socket protocol.
-- **Real-account testing** of Teams, Telegram and Signal, and of everything on Linux and Windows.
-  Bug reports with redacted logs are as useful as code.
-- **Notifications and a dock badge**, and the Settings sections that set them.
-- **Signal**: attachments, safety numbers, and calls.
-- **Packaging**: a notarized macOS build, Linux packages, a Windows installer.
+Contributions are welcome, from a typo to a network adapter. The roadmap and the areas
+you can own are on the [contributing page](https://tinyclient.io/docs/contributing). Say which
+area you want on [Discord](https://discord.gg/ZBhXsMPkA). The product documents are the spec;
+a choice they leave open is settled there, by agreement, before the code.
 
 [CONTRIBUTING.md](CONTRIBUTING.md) covers building, testing, code style and how an adapter is
 put together. Where the rest of the documentation lives:
