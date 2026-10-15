@@ -69,6 +69,7 @@ jobs:
 
   linux:
     strategy:
+      fail-fast: false
       matrix:
         include:
           # The oldest supported Ubuntu: the packages need the glibc they were built against or newer.
