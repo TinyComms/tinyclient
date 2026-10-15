@@ -32,7 +32,9 @@ fn child_pids(parent: u32, name: &str) -> Vec<u32> {
             let mut more = Process32FirstW(snapshot, &mut entry) != 0;
             while more {
                 let end = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(entry.szExeFile.len());
-                if entry.th32ParentProcessID == parent && String::from_utf16_lossy(&entry.szExeFile[..end]).eq_ignore_ascii_case(&program) {
+                // A process with no threads has exited and is only held open by a handle.
+                let alive = entry.cntThreads > 0;
+                if alive && entry.th32ParentProcessID == parent && String::from_utf16_lossy(&entry.szExeFile[..end]).eq_ignore_ascii_case(&program) {
                     found.push(entry.th32ProcessID);
                 }
                 more = Process32NextW(snapshot, &mut entry) != 0;
