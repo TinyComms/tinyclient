@@ -46,6 +46,7 @@ pub const ROWS: &[Row] = &[
     row("M2", Messages, "", "Open conversations at", &["First unread", "Newest message"], &["scroll", "unread", "bottom", "jump"]),
     row("M3", Messages, "", "Show when others are typing", &[], &["typing", "indicator"]),
     row("M4", Messages, "", "Convert emoticons to emoji", &[], &["smiley", "emoji", "emoticon", ":)"]),
+    row("M5", Messages, "", "Play GIFs and animated stickers", &["Automatically", "On hover", "Never"], &["gif", "animated", "autoplay", "sticker", "motion", "animation"]),
     row("P1", Privacy, "Let others see when I am typing", "Let others see when I am typing", &[], &["typing", "indicator", "privacy"]),
     row("P2", Privacy, "Let others see what I have read", "Let others see what I have read", &[], &["receipts", "read receipts", "seen", "privacy"]),
     row("P3", Privacy, "", "Load images and link previews automatically", &[], &["images", "pictures", "previews", "data", "tracking"]),
@@ -92,7 +93,6 @@ pub const NOT_YET: &[(&str, &str)] = &[
     ("touch id", "tinyclient has no lock yet."),
     ("camera", "tinyclient has no camera yet."),
     ("push to talk", "tinyclient has no push to talk yet."),
-    ("gif", "tinyclient has no GIF playback setting yet."),
     ("menu bar", "tinyclient has no menu bar icon yet."),
     ("update", "tinyclient has no updater yet."),
     ("accent", "tinyclient keeps one accent colour."),
@@ -254,6 +254,7 @@ mod tests {
         assert!(ids("receipts").contains(&"P2"));
         assert!(ids("cache").contains(&"D2"));
         assert_eq!(ids("compact"), ["A3"]);
+        assert_eq!((ids("GIF"), not_yet("gif")), (vec!["M5"], None));
         // At word starts only: "ize" is in "size" and finds nothing.
         assert!(ids("ize").is_empty());
         assert!(ids("   ").is_empty());

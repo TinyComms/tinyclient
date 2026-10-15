@@ -40,7 +40,7 @@ Checks are observable on the chat socket or on disk. `people`, `person`, `member
 | 11 | P1 | Discord: People has tabs Online, All, Pending, Blocked. I can accept or ignore an incoming request and cancel an outgoing one. | Pending shows types 3 and 4 with direction; accept turns the row into a friend without a restart. |
 | 12 | P1 | In a channel or group I open a member list on the right: sections with counts, online first, only the rows on screen loaded. | `members {conversation, from, count}` returns at most 100 rows plus section counts; scrolling a 100k-member server keeps chatd under its budget; closing the pane ends the subscription. |
 | 13 | P2 | I add or remove a Discord friend, block a person, add a Telegram contact. | The relationship changes in the official app. Adding by username is one at a time, user-typed only. |
-| 14 | P2 | Animated avatars play on the profile card only. Lists always use a still frame. | A Discord `a_` avatar is static in rows and animates on the card. |
+| 14 | P2 | Animated avatars play on the profile card (as the autoplay setting says) and under the pointer in lists; otherwise a still frame. | A Discord `a_` avatar is still in rows until hovered and animates on the card. Built. |
 | cut | | Server-wide or workspace-wide presence, "who is online in this server" counts beyond what the member list returns, last-seen history, activity/game detail ("Playing X for 2 h"), Spotify listen-along, avatar decorations and nameplates, profile banners and themes, mutual-friend graphs, importing the macOS address book to Telegram, org charts in Teams. | |
 
 ## One People view, not four

@@ -31,11 +31,11 @@ The order is my estimate from how the four networks are used, not measured data.
 | 11 | Link previews | P1 | |
 | 12 | Files (PDF, zip, docs) | P0 row and download, P1 Quick Look | |
 | 13 | Custom emoji | P1 | P0 fallback is `:name:` as text. |
-| 14 | GIFs | P1 | Still frame with a GIF badge, plays on click. |
+| 14 | GIFs | P1 | GIF, animated WebP and APNG play in place as the autoplay setting says (always, on hover, never); a still frame with a GIF badge otherwise. MP4 GIFs open in the system's player. Built. |
 | 15 | Video | P1 | Poster, duration, play badge; opens Quick Look. |
 | 16 | Forwarded / shared messages | P1 | A nested card with the origin's name. |
 | 17 | System lines (joined, call started, pinned) | P1 | One grey centered line. |
-| 18 | Stickers | P1 static, cut animated | Lottie and WebM renderers are weight for little use. |
+| 18 | Stickers | P1 static; APNG and GIF animated, Lottie, TGS and WebM cut | APNG and GIF play like GIFs. Lottie and WebM renderers are weight for little use. |
 | 19 | Voice messages | P1 | Play button, waveform, duration. Needs an Ogg/Opus decoder; macOS does not play Ogg natively. |
 | 20 | Spoilers | P1 | Hidden until clicked. |
 | 21 | Pins | P2 | |
@@ -73,7 +73,7 @@ Each check is observable from outside the process: on the chat socket, on disk, 
 ### P1
 
 22. **Links show their card.** Site, title, two lines of description, one image. *Check:* with a packet capture running, opening a conversation full of links contacts only the network's own hosts.
-23. **GIFs play when I ask.** Still frame with a badge; click plays in place, stops when it leaves the screen or the window loses focus. *Check:* no CPU use from a visible conversation of GIFs that I have not clicked.
+23. **GIFs play as I chose.** By default they play in place; "on hover" and "never" (and Reduce Motion) show a still frame with a badge. Each stops when it leaves the screen or the window loses focus, and the window draws only when a frame is due. *Check:* no frames drawn while the window is not key; no CPU use from a visible conversation of GIFs with the setting on "never".
 24. **Video and documents open in Quick Look.** Space or click on a downloaded file opens the panel. *Check:* no video decoder is linked into `tinyclient` or `chatd`.
 25. **Custom emoji draw as images**, in text and as reactions, at text height. *Check:* a Slack `:partyparrot:` returns an emoji range with an image path.
 26. **I pick an emoji.** `:tad` autocompletes Unicode and the workspace's custom emoji; a picker button opens a searchable grid. (P0 already has the macOS picker, Ctrl-Cmd-Space, for free.) *Check:* the sent emoji matches in the official app.

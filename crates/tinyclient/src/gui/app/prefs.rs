@@ -1,11 +1,12 @@
 //! What only the window remembers between launches: its frame, pane widths, rail pins, the
-//! last conversation and sidebar mode, the two Details switches, the text size, and the
-//! settings only the window acts on (`Choices`, `docs/product/09-settings.md`). One small
-//! tab-separated file beside chatd's, read once before the window opens (so the first frame
+//! last conversation and sidebar mode, the two Details switches, the text size, when GIFs
+//! play, and the settings only the window acts on (`Choices`, `docs/product/09-settings.md`).
+//! One small tab-separated file beside chatd's, read once before the window opens (so the first frame
 //! draws where the user was) and written off the main thread. A line this build does not know
 //! is kept as it was, so an older build never erases a newer one's choices.
 // CONTRACT: the protocol has no home for what only the window knows, so it is a file of its own.
 
+use super::super::anim::Autoplay;
 use super::super::layout;
 use super::super::settings::Section;
 use super::super::sidebar::Mode;
@@ -98,6 +99,7 @@ pub struct Prefs {
     pub choices: Choices,
     /// Lines this build does not know, as they were.
     pub kept: Vec<String>,
+    pub autoplay: Autoplay,
 }
 
 impl Default for Prefs {
@@ -114,6 +116,7 @@ impl Default for Prefs {
             text_step: 0,
             choices: Choices::default(),
             kept: Vec::new(),
+            autoplay: Autoplay::Always,
         }
     }
 }
@@ -186,6 +189,7 @@ pub fn parse(text: &str) -> Prefs {
                 prefs.details_channels = on(fields.next());
                 prefs.details_directs = on(fields.next());
             }
+            "autoplay" => prefs.autoplay = fields.next().and_then(Autoplay::from_word).unwrap_or_default(),
             "text" => {
                 prefs.text_step = fields.next().and_then(|n| n.parse::<i32>().ok()).unwrap_or(0).clamp(-1, 3);
             }
@@ -250,6 +254,9 @@ pub fn write(prefs: &Prefs) -> String {
         text.push_str(line);
         text.push('\n');
     }
+    if prefs.autoplay != Autoplay::default() {
+        text.push_str(&format!("autoplay\t{}\n", prefs.autoplay.word()));
+    }
     text
 }
 
@@ -290,6 +297,7 @@ mod tests {
             text_step: 2,
             choices: Choices { compact: true, previews: false, command_return: true, newest: true, typing: false, emoticons: true, images: false, section: Section::Audio },
             kept: Vec::new(),
+            autoplay: Autoplay::Hover,
         };
         let read = parse(&write(&saved));
         assert_eq!(read, Prefs { open: Some((key(Network::Discord, "c1"), "#general with a tab".into())), ..saved.clone() });
@@ -301,14 +309,14 @@ mod tests {
     #[test]
     fn bad_lines_are_skipped_and_values_are_kept_in_range() {
         let odd = parse(
-            "sidebar\t9000\nright\twide\npin\tmyspace\ta\tb\nnonsense\npin\tslack\tT1\tT1\nframe\t1\t2\t100\t100\ntext\t9\nmode\tspace\tnope\n",
+            "sidebar\t9000\nright\twide\npin\tmyspace\ta\tb\nnonsense\npin\tslack\tT1\tT1\nframe\t1\t2\t100\t100\ntext\t9\nmode\tspace\tnope\nautoplay\tsometimes\n",
         );
         assert_eq!(odd.sidebar, 420.);
         assert_eq!(odd.right, layout::RIGHT_WIDTH);
         assert_eq!(odd.pins, vec![key(Network::Slack, "T1")]);
         // A frame below the minimum grows to it; the text step stops at +3.
         assert_eq!(odd.frame, Some((1., 2., 540., 440.)));
-        assert_eq!((odd.text_step, odd.mode), (3, Mode::Inbox));
+        assert_eq!((odd.text_step, odd.mode, odd.autoplay), (3, Mode::Inbox, Autoplay::Always));
         assert_eq!(parse(""), Prefs::default());
     }
 

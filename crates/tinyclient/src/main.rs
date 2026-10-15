@@ -1,5 +1,7 @@
 #[cfg_attr(not(feature = "gui"), allow(dead_code))]
 mod client;
+#[cfg(any(feature = "gui", test))]
+mod frames;
 #[cfg(feature = "gui")]
 mod gui;
 mod view;

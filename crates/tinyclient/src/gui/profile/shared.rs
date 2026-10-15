@@ -367,8 +367,10 @@ fn list(shared: &Shared, hub: &Hub, width: f32, cx: &mut App) -> Div {
                         .overflow_hidden()
                         .cursor_pointer()
                         .bg(theme::raised())
+                        // At the tile's size, never the whole file: a GIF here is a few frames, not
+                        // all of them at full size.
                         .children(picture.path.clone().map(|path| {
-                            gpui::img(std::path::PathBuf::from(path)).size_full().object_fit(gpui::ObjectFit::Cover)
+                            crate::gui::components::square(std::path::PathBuf::from(path), tile, 0., crate::gui::anim::Play::Inline).size_full()
                         }))
                         .children((attachment.duration > 0).then(|| {
                             div()

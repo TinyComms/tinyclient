@@ -6,7 +6,7 @@ use super::rich::Inline;
 use super::tokens;
 use crate::gui::theme;
 use gpui::{
-    fill, font, point, prelude::*, px, quad, size, App, BorderStyle, Bounds, Corners, CursorStyle,
+    fill, font, point, prelude::*, px, quad, size, App, BorderStyle, Bounds, CursorStyle,
     DispatchPhase, ElementId, FontStyle, FontWeight, GlobalElementId, Hitbox, HitboxBehavior, Hsla,
     InspectorElementId, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
     RenderImage, StrikethroughStyle, StyledText, TextLayout, TextRun, UnderlineStyle, Window,
@@ -385,7 +385,7 @@ impl Element for Rich {
                 point(slot.center().x - side / 2., slot.center().y - side / 2.),
                 size(side, side),
             );
-            let _ = window.paint_image(at, at, Corners::default(), image.clone(), 0, false);
+            crate::gui::anim::paint(at, image, gpui::ObjectFit::Fill, px(0.), crate::gui::anim::Play::Inline, window, cx);
         }
 
         let over = |position, layout: &TextLayout, hot: &[(Range<usize>, usize)]| {

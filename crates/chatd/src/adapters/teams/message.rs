@@ -151,6 +151,39 @@ fn call_line(content: &str) -> String {
     }
 }
 
+/// The size Teams draws a Giphy GIF at, about: what the small copy is asked for.
+const GIPHY_TALL: u32 = 200;
+
+/// A GIF from Teams' Giphy button as an attachment: the original GIF for opening, and for the
+/// row Giphy's own 200 px tall WebP of it (`200.webp`, its "fixed height" copy), so the row
+/// plays for a fraction of the original. An address not in Giphy's usual shape has no smaller
+/// copy and is shown as it is.
+fn giphy_gif(gif: &html::Image, media: &mut Vec<(MediaFile, String)>) -> Attachment {
+    let path = gif.src.split(['?', '#']).next().unwrap_or(&gif.src);
+    let object = path.trim_end_matches("/giphy.gif").rsplit('/').next().unwrap_or(path);
+    let file = MediaFile {
+        width: gif.width,
+        height: gif.height,
+        ..MediaFile::new(format!("giphy:{}", escaped(object)), MediaKind::Gif)
+    };
+    media.push((file.clone(), gif.src.clone()));
+    let thumb = path.strip_suffix("/giphy.gif").filter(|_| path.contains("/media/")).map(|base| {
+        let (width, height) = match (gif.width, gif.height) {
+            (w, h) if w > 0 && h > 0 => ((u64::from(w) * u64::from(GIPHY_TALL) / u64::from(h)).max(1) as u32, GIPHY_TALL),
+            _ => (0, 0),
+        };
+        let thumb = MediaFile { width, height, ..MediaFile::new(format!("{}:small", file.id), MediaKind::Image) };
+        media.push((thumb.clone(), format!("{base}/{GIPHY_TALL}.webp")));
+        thumb
+    });
+    let named = if gif.name.trim().is_empty() { "GIF" } else { gif.name.trim() };
+    Attachment {
+        thumb: Some(thumb.unwrap_or_else(|| file.clone())),
+        mime: "image/gif".to_owned(),
+        ..Attachment::new(named, file)
+    }
+}
+
 /// What one of Teams' message objects turned out to be.
 enum Read {
     Message(Box<Message>),
@@ -346,6 +379,9 @@ impl Teams {
                 thumb: Some(file.clone()),
                 ..Attachment::new(named, file)
             });
+        }
+        for gif in parsed.gifs {
+            message.attachments.push(giphy_gif(&gif, &mut media));
         }
         for shared in listed(&props["files"]) {
             let info = &shared["fileInfo"];
@@ -835,6 +871,23 @@ impl Teams {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_giphy_gif_plays_from_giphys_small_copy_and_opens_as_the_original() {
+        let gif = html::Image { src: "https://media4.giphy.com/media/abc123/giphy.gif?cid=1&rid=giphy.gif".into(), width: 342, height: 250, name: "happy dance".into() };
+        let mut media = Vec::new();
+        let attached = giphy_gif(&gif, &mut media);
+        let thumb = attached.thumb.clone().unwrap();
+        assert_eq!((attached.file.kind, attached.mime.as_str(), attached.name.as_str()), (MediaKind::Gif, "image/gif", "happy dance"));
+        assert_eq!((thumb.width, thumb.height), (273, 200));
+        let urls: Vec<&str> = media.iter().map(|(_, url)| url.as_str()).collect();
+        assert_eq!(urls, [gif.src.as_str(), "https://media4.giphy.com/media/abc123/200.webp"]);
+        // An address of another shape is shown as it is.
+        let odd = html::Image { src: "https://i.giphy.com/abc123.gif".into(), width: 0, height: 0, name: String::new() };
+        let mut media = Vec::new();
+        let attached = giphy_gif(&odd, &mut media);
+        assert_eq!((attached.thumb.as_ref().map(|thumb| thumb.id.clone()), media.len()), (Some(attached.file.id.clone()), 1));
+    }
 
     #[test]
     fn reaction_keys_read_as_emoji_and_back() {

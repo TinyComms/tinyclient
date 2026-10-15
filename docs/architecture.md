@@ -309,6 +309,28 @@ player once fetched, through a hard link under the attachment's name in `open/` 
 directory (emptied at the shell's start), since cached files are named by a hash with no
 extension. `Pane::moving` is the one place an inline, muted, looping player would go.
 
+GIFs, animated WebP and APNG are not video and play in the window itself (`tinyclient/src/frames.rs`
+decodes, `gui/anim.rs` plays). A file is sniffed by its header for canvas, frame count and play
+count; frames are decoded with the `image` crate at the size drawn, one at a time, within a
+per-picture limit (16 MB and 120 frames in a message, 2 MB for emoji, avatars and picker cells:
+smaller first, down to half, then fewer frames) and a window-wide budget (48 MB of frames for
+messages and pickers, 8 MB for avatars). Off screen, a picture keeps its first frame only. A
+picture plays while it is painted, on screen, in the key window, and as the autoplay setting
+(`shell.prefs`, `anim::Autoplay`) and Reduce Motion allow; one timer per window draws it again
+when the next frame is due. The networks are asked for their small moving copies, never the
+original: Discord's proxy with `animated=true` (attachments, `a_` avatars and icons, animated
+emoji), Discord's GIF search with `media_format=tinygif`, Slack's `thumb_480_gif`, Giphy's
+`200.webp` for Teams' Giphy button. Telegram's GIFs are MP4 and its animated stickers TGS or
+WebM: stills.
+
+| Network | GIFs shown | GIF picker |
+|---|---|---|
+| Discord | play (attachments, embeds, stickers, emoji, avatars, icons); `gifv` is MP4: still | search and trending, cells play, sends the link Discord unfurls |
+| Telegram | MP4: still with a badge; static stickers | saved GIFs and `@gif` search, sent as Telegram animations; cells are stills |
+| Slack | play (`thumb_*_gif`) | none: Slack has no GIF search of its own (its Giphy is a slash-command app) |
+| Teams | Giphy button GIFs play (Giphy's host, nothing else outside Teams) | none: no search Teams documents |
+| Signal | not yet | none |
+
 | Network | Voice messages | Audio files | Video, MP4 GIFs |
 |---|---|---|---|
 | Discord | play inline (Ogg Opus, Discord's waveform and length) | play inline | system player; `gifv` and proxied `video` embeds are attachments with their still |

@@ -446,7 +446,8 @@ impl Composer {
             tray: Vec::new(),
             next_chip: 1,
             chip_menu: None,
-            thumbs: Images::default(),
+            // Chips and the `:` list are small: each moving one holds little.
+            thumbs: Images::with_limits(crate::frames::SMALL),
             drag: None,
             picking: None,
             colon: None,
@@ -1909,7 +1910,7 @@ impl Composer {
             let image = |custom: &Custom| {
                 let path = custom.file.as_ref()?.path.clone()?;
                 match thumbs.get(&path, 40, None, cx, Self::thumb_decoded) {
-                    picker::images::Picture::Ready(image) => Some(gpui::ImageSource::Render(image)),
+                    picker::images::Picture::Ready(image) => Some(image),
                     _ => None,
                 }
             };

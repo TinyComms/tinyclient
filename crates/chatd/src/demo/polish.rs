@@ -44,15 +44,25 @@ pub const GIFS: &[(&str, &str, &str)] = &[
     ("gif-cat-nap", "cat nap", "Favorites"),
     ("gif-dog-wave", "dog wave", "Favorites"),
     ("gif-thumbs-up", "thumbs up", "Trending"),
-    ("gif-party", "party", "Trending"),
-    ("gif-facepalm", "facepalm", "Trending"),
+    ("gif-horse", "horse gallop", "Trending"),
+    ("gif-greyhound", "greyhound", "Trending"),
     ("gif-mushroom-dance", "mushroom dance", "Trending"),
-    ("gif-rain", "rain on a window", "Trending"),
+    ("gif-pigeons", "pigeons", "Trending"),
     ("gif-coffee", "coffee", "Trending"),
-    ("gif-high-five", "high five", "Trending"),
-    ("gif-applause", "applause", "Trending"),
+    ("gif-jump", "horse jump", "Trending"),
+    ("gif-lion", "lion walk", "Trending"),
     ("gif-shrug", "shrug", "Trending"),
 ];
+/// The picker GIFs that are real moving files in `photos/`, and their sizes. Only Discord's
+/// picker shows them moving: Telegram's GIFs are MP4s, which a cell shows as a still.
+const MOVING: &[(&str, &str, u32, u32)] = &[
+    ("gif-horse", "gif-horse.gif", 210, 140),
+    ("gif-greyhound", "gif-greyhound.webp", 480, 146),
+    ("gif-pigeons", "pigeons.webp", 400, 147),
+    ("gif-jump", "gif-jump.webp", 320, 120),
+    ("gif-lion", "gif-lion.webp", 320, 95),
+];
+
 /// GIFs come in every shape: their stills are drawn at these sizes, in turn.
 const GIF_SIZES: &[(u32, u32)] = &[(220, 124), (160, 160), (200, 150), (240, 100), (140, 180), (220, 160)];
 
@@ -113,8 +123,14 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<()> {
         for (at, (id, ..)) in GIFS.iter().enumerate() {
             if s.store.media(&account, &[(*id).to_owned()])?.is_empty() {
                 let look = s.look(Art::Scene);
-                let (width, height) = GIF_SIZES[at % GIF_SIZES.len()];
-                s.waiting(&account, id, MediaKind::Gif, look, width, height)?;
+                let moving = MOVING.iter().find(|(gif, ..)| gif == id).filter(|_| account.network == protocol::Network::Discord);
+                match moving {
+                    Some((_, file, width, height)) => drop(s.photo_waiting(&account, id, MediaKind::Image, file, look, *width, *height)?),
+                    None => {
+                        let (width, height) = GIF_SIZES[at % GIF_SIZES.len()];
+                        s.waiting(&account, id, MediaKind::Gif, look, width, height)?;
+                    }
+                }
             }
         }
     }

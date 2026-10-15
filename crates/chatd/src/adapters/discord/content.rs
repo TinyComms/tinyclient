@@ -158,7 +158,7 @@ fn angle(rich: &mut Rich, text: &str, names: &dyn Names) -> Option<usize> {
         if !digits(id) || name.is_empty() {
             return None;
         }
-        let (file, url) = model::emoji(id);
+        let (file, url) = model::emoji(id, inner.starts_with("a:"));
         rich.text.push_str(&format!(":{name}:"));
         rich.span(start, Style::Emoji { file: file.clone() });
         rich.files.push((file, url));
@@ -433,31 +433,40 @@ fn fitted(width: u32, height: u32) -> (u32, u32) {
     }
 }
 
-/// Discord's media proxy resizes when asked, and answers a still for a video or a GIF. The
-/// parameter names are from the community documentation and unconfirmed against a real account.
-fn resized(proxy: &str, width: u32, height: u32) -> String {
+/// Discord's media proxy resizes when asked, and answers a still for a video or a GIF. A GIF
+/// asked for `animated` comes back as an animated WebP at that size, so a row plays it without
+/// the whole original. The parameter names are from the community documentation and
+/// unconfirmed against a real account.
+fn resized(proxy: &str, width: u32, height: u32, animated: bool) -> String {
     if width == 0 || height == 0 {
         return proxy.to_owned();
     }
     let joiner = if proxy.contains('?') { '&' } else { '?' };
-    format!("{proxy}{joiner}format=webp&width={width}&height={height}")
+    let moving = if animated { "&animated=true" } else { "" };
+    format!("{proxy}{joiner}format=webp&width={width}&height={height}{moving}")
+}
+
+/// Whether a proxied picture may move: a GIF, or a WebP, which can.
+fn may_move(address: &str) -> bool {
+    let path = address.split(['?', '#']).next().unwrap_or("").to_ascii_lowercase();
+    path.ends_with(".gif") || path.ends_with(".webp")
 }
 
 /// The larger sizes of a picture registered at `fitted`: one and a half, two and three times
 /// it, for a 2x screen and for a grid tile, which crops and so draws the whole picture larger
 /// than its box. Never larger than the picture is; the picture itself is the last size when
 /// it is smaller than the next step.
-fn larger(proxy: &str, (width, height): (u32, u32), (full_width, full_height): (u32, u32)) -> Vec<(u32, String)> {
+fn larger(proxy: &str, (width, height): (u32, u32), (full_width, full_height): (u32, u32), animated: bool) -> Vec<(u32, String)> {
     let mut sizes = Vec::new();
     for (times, over) in [(3, 2), (2, 1), (3, 1)] {
         let (wide, high) = (width * times / over, height * times / over);
         if wide >= full_width || high >= full_height {
             if full_width > width {
-                sizes.push((full_width.max(full_height), resized(proxy, full_width, full_height)));
+                sizes.push((full_width.max(full_height), resized(proxy, full_width, full_height, animated)));
             }
             break;
         }
-        sizes.push((wide.max(high), resized(proxy, wide, high)));
+        sizes.push((wide.max(high), resized(proxy, wide, high, animated)));
     }
     sizes
 }
@@ -489,8 +498,9 @@ fn attachment(rich: &mut Rich, attached: &Attached) -> Attachment {
             height,
             ..MediaFile::new(format!("att:{}:thumb", attached.id), MediaKind::Image)
         };
-        rich.files.push((thumb.clone(), resized(proxy, width, height)));
-        let sizes = larger(proxy, (width, height), (attached.width, attached.height));
+        let animated = kind == MediaKind::Gif || mime == "image/webp";
+        rich.files.push((thumb.clone(), resized(proxy, width, height, animated)));
+        let sizes = larger(proxy, (width, height), (attached.width, attached.height), animated);
         if !sizes.is_empty() {
             rich.files.sizes.push((thumb.id.clone(), sizes));
         }
@@ -514,6 +524,7 @@ fn sticker(rich: &mut Rich, sticker: &model::Sticker) -> Attachment {
     let (kind, url, mime) = match sticker.format_type {
         3 => (MediaKind::File, format!("{}/stickers/{}.json", model::cdn(), sticker.id), "application/json"),
         4 => (MediaKind::Gif, format!("{}/stickers/{}.gif", model::media(), sticker.id), "image/gif"),
+        2 => (MediaKind::Image, model::apng_sticker(&sticker.id), "image/png"),
         _ => (MediaKind::Image, format!("{}/stickers/{}.png?size=160", model::media(), sticker.id), "image/png"),
     };
     let file = MediaFile {
@@ -521,7 +532,8 @@ fn sticker(rich: &mut Rich, sticker: &model::Sticker) -> Attachment {
         height: 160,
         ..MediaFile::new(format!("sticker:{}", sticker.id), kind)
     };
-    if kind == MediaKind::Image {
+    // An APNG's frames are passed through at the size Discord made them.
+    if kind == MediaKind::Image && sticker.format_type != 2 {
         let twice = format!("{}/stickers/{}.png?size=320", model::media(), sticker.id);
         rich.files.sizes.push((file.id.clone(), vec![(320, twice)]));
     }
@@ -544,8 +556,9 @@ fn embed_still(rich: &mut Rich, id: String, picture: &EmbedImage) -> Option<Medi
     let proxy = picture.proxy_url.as_deref()?;
     let (width, height) = fitted(picture.width, picture.height);
     let file = MediaFile { width, height, ..MediaFile::new(id, MediaKind::Image) };
-    rich.files.push((file.clone(), resized(proxy, width, height)));
-    let sizes = larger(proxy, (width, height), (picture.width, picture.height));
+    let animated = may_move(proxy);
+    rich.files.push((file.clone(), resized(proxy, width, height, animated)));
+    let sizes = larger(proxy, (width, height), (picture.width, picture.height), animated);
     if !sizes.is_empty() {
         rich.files.sizes.push((file.id.clone(), sizes));
     }
@@ -1006,12 +1019,16 @@ mod tests {
         let sides = |sizes: Vec<(u32, String)>| sizes.into_iter().map(|(side, _)| side).collect::<Vec<_>>();
         let proxy = "https://media.discordapp.net/attachments/1/2/a.png?ex=1";
         // A 2x screen showing the 400 pt picture asks for 800: there is a size that large.
-        assert_eq!(sides(larger(proxy, (400, 225), (1600, 900))), [600, 800, 1200]);
+        assert_eq!(sides(larger(proxy, (400, 225), (1600, 900), false)), [600, 800, 1200]);
         // Never a size the picture does not have: its own is the last one.
-        let small = larger(proxy, (400, 225), (700, 394));
+        let small = larger(proxy, (400, 225), (700, 394), false);
         assert_eq!(sides(small.clone()), [600, 700]);
         assert!(small[1].1.ends_with("&format=webp&width=700&height=394"), "{}", small[1].1);
-        assert_eq!(sides(larger(proxy, (320, 200), (320, 200))), Vec::<u32>::new());
+        assert_eq!(sides(larger(proxy, (320, 200), (320, 200), false)), Vec::<u32>::new());
+        // A GIF is asked for moving at every size, never as its whole original.
+        let gif = larger("https://media.discordapp.net/attachments/1/2/hop.gif?ex=1", (400, 225), (800, 450), true);
+        assert!(gif.iter().all(|(_, url)| url.ends_with("&animated=true") && url.contains("format=webp")), "{gif:?}");
+        assert!(may_move("https://images-ext-1.discordapp.net/external/x/https/example.org/a.GIF?width=1") && !may_move("https://x/a.png"));
     }
 
     #[test]

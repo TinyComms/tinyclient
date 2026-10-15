@@ -433,6 +433,7 @@ impl Shell {
             text_step: theme::text_step(),
             choices: prefs::choices(),
             kept: self.prefs_kept.clone(),
+            autoplay: super::anim::autoplay(),
         }
     }
 

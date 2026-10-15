@@ -1,11 +1,13 @@
 //! Avatars: a circle is a person, a rounded square is a place. An image when its file is on
 //! disk, decoded off the main thread at the size it is drawn; a flat tint with initials until then.
+//! A moving one (Discord's `a_` avatars and server icons) plays under the pointer in a list, as
+//! Discord's own lists do, and as the autoplay setting says where it is asked to.
 
 use super::glyph;
+use crate::frames;
+use crate::gui::anim::{self, Play};
 use crate::gui::theme;
-use gpui::{
-    div, img, prelude::*, px, App, Asset, Div, Global, ImageSource, RenderImage, Rgba, Window,
-};
+use gpui::{canvas, div, prelude::*, px, App, Asset, Div, Global, ObjectFit, RenderImage, Rgba, Window};
 use image::{imageops::FilterType, Frame, ImageReader};
 use protocol::{Key, MediaFile, Presence};
 use smallvec::SmallVec;
@@ -22,8 +24,11 @@ pub enum Shape {
     Place,
 }
 
-/// A file on disk, and how many pixels across it is wanted.
-type ThumbSource = (PathBuf, u32);
+/// A file on disk, how many pixels across it is wanted, and whether its frames are.
+type ThumbSource = (PathBuf, u32, bool);
+
+/// The largest avatar file read whole to look for frames.
+const MOST_READ: u64 = 4 << 20;
 
 struct Thumb;
 
@@ -32,11 +37,21 @@ impl Asset for Thumb {
     type Output = Option<Arc<RenderImage>>;
 
     fn load(
-        (path, pixels): Self::Source,
+        (path, pixels, moving): Self::Source,
         cx: &mut App,
     ) -> impl std::future::Future<Output = Self::Output> + Send + 'static {
-        cx.background_executor().spawn(async move { decode(&path, pixels) })
+        cx.background_executor().spawn(async move { moving.then(|| frames_of(&path, pixels)).flatten().or_else(|| decode(&path, pixels)) })
     }
+}
+
+/// A moving avatar's frames, when it moves and there is room in [`anim::AVATARS`].
+fn frames_of(path: &std::path::Path, pixels: u32) -> Option<Arc<RenderImage>> {
+    let bytes = std::fs::metadata(path).ok().filter(|meta| meta.len() <= MOST_READ).and_then(|_| std::fs::read(path).ok())?;
+    let animation = frames::decode(&bytes, pixels, None, frames::SMALL)?;
+    if !anim::AVATARS.take(animation.bytes()) {
+        return None;
+    }
+    anim::render_image(animation)
 }
 
 fn decode(path: &std::path::Path, pixels: u32) -> Option<Arc<RenderImage>> {
@@ -68,6 +83,10 @@ fn thumb(source: &ThumbSource, window: &mut Window, cx: &mut App) -> Option<Arc<
             if let Some(old) = thumbs.order.pop_front() {
                 thumbs.known.remove(&old);
                 if let Some(Some(image)) = window.use_asset::<Thumb>(&old, cx) {
+                    if image.frame_count() > 1 {
+                        anim::AVATARS.give(anim::bytes_of(&image));
+                        anim::forget(&image);
+                    }
                     cx.drop_image(image, Some(window));
                 }
                 cx.remove_asset::<Thumb>(&old);
@@ -75,6 +94,18 @@ fn thumb(source: &ThumbSource, window: &mut Window, cx: &mut App) -> Option<Arc<
         }
     }
     window.use_asset::<Thumb>(source, cx).flatten()
+}
+
+/// The picture at `path` filling a square of `size` points, decoded off the main thread at that
+/// size and kept in the avatars' cache: an avatar's picture, or a tile of shared media.
+pub fn square(path: PathBuf, size: f32, radius: f32, play: Play) -> gpui::Canvas<()> {
+    let source: ThumbSource = (path, (size * 2.).ceil() as u32, anim::wants_frames(play));
+    // Asked for while painting, so a picture that lands draws the view again.
+    canvas(|_, _, _| (), move |bounds, (), window, cx| {
+        if let Some(image) = thumb(&source, window, cx) {
+            anim::paint(bounds, &image, ObjectFit::Cover, px(radius), play, window, cx);
+        }
+    })
 }
 
 /// Up to `count` letters that stand for a name.
@@ -115,6 +146,8 @@ pub struct Avatar {
     presence: Option<(Presence, Rgba)>,
     /// How many letters stand in for a missing picture; by size when unset.
     letters: Option<usize>,
+    /// When a moving picture plays: under the pointer, unless asked otherwise.
+    play: Play,
 }
 
 impl Avatar {
@@ -129,6 +162,7 @@ impl Avatar {
             tinted: false,
             presence: None,
             letters: None,
+            play: Play::Hover,
         }
     }
 
@@ -144,6 +178,7 @@ impl Avatar {
             tinted: false,
             presence: None,
             letters: None,
+            play: Play::Hover,
         }
     }
 
@@ -165,6 +200,12 @@ impl Avatar {
     /// A group's letters: two at every size, so its initials read the same in every list.
     pub fn letters(mut self, count: usize) -> Avatar {
         self.letters = Some(count);
+        self
+    }
+
+    /// Where a moving picture plays as messages do, not only under the pointer: a profile.
+    pub fn playing(mut self, play: Play) -> Avatar {
+        self.play = play;
         self
     }
 
@@ -212,17 +253,7 @@ impl Avatar {
                 .font_weight(theme::SEMIBOLD)
                 .child(initials(&self.name, self.letters.unwrap_or(if size >= 32. { 2 } else { 1 }))),
         };
-        let picture = self.image.map(|path| {
-            let source: ThumbSource = (path, (size * 2.).ceil() as u32);
-            img(ImageSource::Custom(Arc::new(move |window, cx| {
-                thumb(&source, window, cx).map(Ok)
-            })))
-            .absolute()
-            .top_0()
-            .left_0()
-            .size(px(size))
-            .rounded(px(radius))
-        });
+        let picture = self.image.map(|path| square(path, size, radius, self.play).absolute().top_0().left_0().size(px(size)));
         div()
             .relative()
             .size(px(size))

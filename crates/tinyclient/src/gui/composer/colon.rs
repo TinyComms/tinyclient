@@ -4,7 +4,9 @@
 use super::picker::emoji::{self, Cell, Custom};
 use crate::gui::components::menu;
 use crate::gui::theme::{self, Type};
-use gpui::{div, img, prelude::*, px, App, Div, ImageSource, MouseButton, MouseDownEvent, Window};
+use crate::gui::anim::{self, Play};
+use gpui::{div, prelude::*, px, App, Div, MouseButton, MouseDownEvent, ObjectFit, RenderImage, Window};
+use std::sync::Arc;
 
 pub const ROWS: usize = 8;
 pub const WIDTH: f32 = 340.;
@@ -61,7 +63,7 @@ pub fn draw(
     list: &List,
     customs: &[Custom],
     tone: usize,
-    mut custom_image: impl FnMut(&Custom) -> Option<ImageSource>,
+    mut custom_image: impl FnMut(&Custom) -> Option<Arc<RenderImage>>,
     pick: impl Fn(usize, &mut Window, &mut App) + Clone + 'static,
 ) -> Div {
     menu().w(px(WIDTH)).max_w(px(WIDTH)).children(list.cells.iter().enumerate().map(|(ix, cell)| {
@@ -71,7 +73,7 @@ pub fn draw(
         };
         let face = match custom {
             Some(custom) => match custom_image(custom) {
-                Some(source) => img(source).size(px(20.)).into_any_element(),
+                Some(image) => div().size(px(20.)).child(anim::picture(image, ObjectFit::Fill, 0., Play::Inline)).into_any_element(),
                 None => div().size(px(20.)).rounded(px(4.)).bg(theme::raised()).into_any_element(),
             },
             None => div().w(px(22.)).text_size(px(18.)).line_height(px(22.)).child(emoji::text_of(cell, tone, customs)).into_any_element(),

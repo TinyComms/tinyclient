@@ -18,6 +18,7 @@ pub fn mime(name: &str) -> &'static str {
     match name.rsplit('.').next() {
         Some("jpg") => "image/jpeg",
         Some("webp") => "image/webp",
+        Some("gif") => "image/gif",
         Some("opus") => "audio/ogg",
         Some("m4a") => "audio/mp4",
         Some("mp4") => "video/mp4",
@@ -26,7 +27,7 @@ pub fn mime(name: &str) -> &'static str {
 }
 
 /// The portrait of the person called `name`, when there is one: "Chloé Martin" is
-/// `avatar-chloe-martin.jpg` (or `.png`).
+/// `avatar-chloe-martin.jpg` (or `.png`, or a moving `.webp`, as a Discord `a_` avatar is).
 pub fn portrait(name: &str) -> Option<String> {
     let mut slug = String::new();
     for c in name.chars().flat_map(char::to_lowercase) {
@@ -43,7 +44,7 @@ pub fn portrait(name: &str) -> Option<String> {
         }
     }
     let slug = slug.trim_end_matches('-');
-    ["jpg", "png"].into_iter().map(|ext| format!("avatar-{slug}.{ext}")).find(|file| Path::new(DIR).join(file).is_file())
+    ["webp", "jpg", "png"].into_iter().map(|ext| format!("avatar-{slug}.{ext}")).find(|file| Path::new(DIR).join(file).is_file())
 }
 
 #[cfg(test)]

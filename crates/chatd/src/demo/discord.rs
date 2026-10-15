@@ -152,7 +152,8 @@ const ICONS: &[&str] = &[
     "icon-rustaceans.png",
     "icon-synth-diy.webp",
     "logo-pixel-foundry.png",
-    "logo-night-shift.png",
+    // Moving, as a boosted server's `a_` icon is.
+    "icon-night-shift.webp",
     "logo-tiny-tools.png",
     "logo-long-names.png",
     "logo-volcano-club.png",
@@ -305,6 +306,7 @@ fn moss(s: &mut Seeder, account: &AccountKey, cast: &[Who], me: &Who) -> Fallibl
         (ODALYS, 11, "Lepraria, probably. Do you have a closer shot?"),
         (WREN, 9, "Phone would not focus. Going back tomorrow with the hand lens."),
     ])?;
+    super::showcase::gif_wall(s, &id_of("photo-dump"), cast)?;
     s.script(&id_of("gear-swap"), cast, me, &[
         (KOFI, 700, "Selling a barely used field press. Too big for my flat."),
         (DITA, 640, "Robin was after one of those, I think?"),

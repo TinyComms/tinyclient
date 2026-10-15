@@ -130,6 +130,12 @@ pub fn shape(attachment: &Attachment) -> Shape {
     }
 }
 
+/// A GIF that is a video underneath (Discord's `gifv` from Tenor and Giphy, Telegram's
+/// animations): it plays only where video does, and its still stands in until then.
+pub fn is_video(attachment: &Attachment) -> bool {
+    attachment.mime.starts_with("video/")
+}
+
 /// Covered until the user asks to see it.
 pub fn is_spoiler(attachment: &Attachment) -> bool {
     attachment.spoiler

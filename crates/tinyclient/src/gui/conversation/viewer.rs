@@ -7,14 +7,15 @@ use super::images::Picture;
 use super::media::{self, Shape};
 use super::tokens;
 use super::Pane;
+use crate::gui::anim::{self, Play};
 use crate::gui::components::{tip, Avatar};
 use crate::gui::layout::TOP_BAR;
 use crate::gui::theme::{self, Type};
 use crate::gui::time;
 use crate::view::now;
 use gpui::{
-    anchored, deferred, div, img, point, prelude::*, px, AnyElement, ClipboardItem, Context, Div, ElementId, Image,
-    ImageFormat, ImageSource, KeyDownEvent, MouseButton, ObjectFit, Pixels, Point, Stateful, Window,
+    anchored, deferred, div, point, prelude::*, px, AnyElement, ClipboardItem, Context, Div, ElementId, Image,
+    ImageFormat, KeyDownEvent, MouseButton, ObjectFit, Pixels, Point, Stateful, Window,
 };
 use protocol::{Attachment, Message};
 use std::path::PathBuf;
@@ -141,7 +142,12 @@ impl Pane {
             .chain(&self.window.messages)
             .flat_map(|message| {
                 message.attachments.iter().enumerate().filter_map(move |(ix, attachment)| {
-                    let shown = matches!(media::shape(attachment), Shape::Image | Shape::Gif);
+                    // A GIF that is an MP4 plays in the video player, not here.
+                    let shown = match media::shape(attachment) {
+                        Shape::Image => true,
+                        Shape::Gif => !media::is_video(attachment),
+                        _ => false,
+                    };
                     let open = !media::is_spoiler(attachment) || self.shown.contains(&attachment.file.id);
                     (shown && open).then(|| (message.clone(), ix))
                 })
@@ -367,7 +373,7 @@ impl Pane {
         let edge = viewer_edge((full.width, full.height), asked.unwrap_or_else(|| fit_to(full.width, full.height)));
         let original = match &full.path {
             Some(path) => {
-                let picture = self.picture(path, edge, None, cx);
+                let picture = self.images.get_to(path, edge, None, Play::Asked, cx, Self::decoded);
                 if let Some(viewer) = self.viewer.as_mut() {
                     let now = (path.clone(), edge);
                     if !viewer.decoded.contains(&now) {
@@ -553,7 +559,8 @@ impl Pane {
                         this.zoom(if asked.is_some() { None } else { Some(1.) }, cx);
                     }
                 }))
-                .child(img(ImageSource::Render(image)).size_full().object_fit(ObjectFit::Fill))
+                // Opened on purpose: a moving picture plays here whatever the autoplay setting.
+                .child(anim::picture(image, ObjectFit::Fill, 0., Play::Asked))
                 .into_any_element(),
             None => div()
                 .type_ui()
