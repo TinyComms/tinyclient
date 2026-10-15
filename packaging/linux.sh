@@ -9,7 +9,7 @@
 # Building needs (Debian and Ubuntu names):
 #
 #   sudo apt-get install build-essential pkg-config libssl-dev libasound2-dev libgtk-3-dev \
-#     libwebkit2gtk-4.1-dev libsoup-3.0-dev libvulkan-dev libwayland-dev libxkbcommon-dev \
+#     libwebkit2gtk-4.1-dev libsoup-3.0-dev libvulkan-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
 #     libx11-dev libxcb1-dev libfontconfig1-dev protobuf-compiler
 #
 # Packaging needs librsvg2-bin, binutils and dpkg-dev, and nfpm (github.com/goreleaser/nfpm) and
