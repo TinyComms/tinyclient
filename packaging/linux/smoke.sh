@@ -94,7 +94,8 @@ rpm)
     rpm -qR tinyclient | head -50
     answers tinyclient /usr/bin/tinyclient
     all_answer /usr/lib/tinyclient
-    test -f /usr/share/licenses/tinyclient/AGPL-3.0.txt
+    # Listed rather than looked for: container images install without docs and licences (nodocs).
+    rpm -ql tinyclient | grep -qx /usr/share/licenses/tinyclient/AGPL-3.0.txt
     rpm -e tinyclient
     test ! -e /usr/lib/tinyclient
     ;;
