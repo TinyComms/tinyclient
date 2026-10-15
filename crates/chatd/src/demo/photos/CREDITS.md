@@ -36,7 +36,6 @@ cropped and downscaled.
 | `avatar-lena-brandt.jpg` | [The Perfect Portrait? (Unsplash).jpg](https://commons.wikimedia.org/wiki/File:The_Perfect_Portrait%3F_(Unsplash).jpg) | Michael  Mroczek mroczekm | CC0 |
 | `avatar-mara-okafor.jpg` | [Smiling woman pink shirt.jpg](https://commons.wikimedia.org/wiki/File:Smiling_woman_pink_shirt.jpg) | Joshua McKnight | CC0 |
 | `avatar-marit-aasen.jpg` | [Smiling woman by a window (Unsplash NoRsyXmHGpI).jpg](https://commons.wikimedia.org/wiki/File:Smiling_woman_by_a_window_(Unsplash_NoRsyXmHGpI).jpg) | Brooke Cagle brookecagle | CC0 |
-| `avatar-mirela-dragan.jpg` | [Outdoor portrait (Unsplash).jpg](https://commons.wikimedia.org/wiki/File:Outdoor_portrait_(Unsplash).jpg) | Anthony Ginsbrook aginsbrook | CC0 |
 | `avatar-nadia-rahimi.jpg` | [Woman pink and blue dress (crop waist).jpg](https://commons.wikimedia.org/wiki/File:Woman_pink_and_blue_dress_(crop_waist).jpg) | Mustafa ezz | CC0 |
 | `avatar-nonno-elio.jpg` | [Man with a white beard and glasses, by Angelina Litvin, 2015-10-05 (Unsplash).jpg](https://commons.wikimedia.org/wiki/File:Man_with_a_white_beard_and_glasses,_by_Angelina_Litvin,_2015-10-05_(Unsplash).jpg) | Angelina Litvin | CC0 |
 | `avatar-noor-haddad.jpg` | [Woman afro glasses blue top.jpg](https://commons.wikimedia.org/wiki/File:Woman_afro_glasses_blue_top.jpg) | Christina Morillo | CC0 |
@@ -118,3 +117,20 @@ cropped and downscaled.
 | `voice-ines.opus` | Synthesized for this repository: a pulse train through vowel formants, shaped to the demo voice message's waveform; Ogg Opus from Apple's encoder | tinyclient contributors | MIT, as the repository |
 | `dawn-chorus.m4a` | Synthesized for this repository: chirps over soft noise; AAC from Apple's encoder | tinyclient contributors | MIT, as the repository |
 | `camera2-clip.mp4` | A slow push into `video-thumb.webp` (above), H.264 from AVFoundation | Beata Ratuszniak beataratuszniak; tinyclient contributors | CC0 |
+
+## Moving pictures
+
+Downloaded once from Wikimedia Commons, scaled down and re-encoded (GIF in fewer colours,
+WebP and APNG from the GIF's frames); timing and frame order are the source's.
+
+| File | Source | Author | License |
+|---|---|---|---|
+| `gif-horse.gif` | [Muybridge race horse animated.gif](https://commons.wikimedia.org/wiki/File:Muybridge_race_horse_animated.gif) | Eadweard Muybridge | Public domain |
+| `gif-greyhound.webp` | [Descriptive Zoopraxography Greyhound Galloping Animated 13.gif](https://commons.wikimedia.org/wiki/File:Descriptive_Zoopraxography_Greyhound_Galloping_Animated_13.gif) | Eadweard Muybridge | Public domain |
+| `pigeons.webp` | [Descriptive Zoopraxography Pigeons Flying Animated 12.gif](https://commons.wikimedia.org/wiki/File:Descriptive_Zoopraxography_Pigeons_Flying_Animated_12.gif) | Eadweard Muybridge | Public domain |
+| `gif-lion.webp` | [Descriptive Zoopraxography Lion Walking Animated 13.gif](https://commons.wikimedia.org/wiki/File:Descriptive_Zoopraxography_Lion_Walking_Animated_13.gif) | Eadweard Muybridge | Public domain |
+| `gif-jump.webp` | [Descriptive Zoopraxography Horse Jumping Animated 13.gif](https://commons.wikimedia.org/wiki/File:Descriptive_Zoopraxography_Horse_Jumping_Animated_13.gif) | Eadweard Muybridge | Public domain |
+| `icon-night-shift.webp` | [Optical Toy, Phenakistiscope Disc with Cats and Donkey, ca. 1830.gif](https://commons.wikimedia.org/wiki/File:Optical_Toy,_Phenakistiscope_Disc_with_Cats_and_Donkey,_ca._1830.gif) | Unknown artist | Public domain |
+| `avatar-mirela-dragan.webp` | [Optical Toy, Phenakistiscope Disc with Dancing Man, ca. 1835-Animated.gif](https://commons.wikimedia.org/wiki/File:Optical_Toy,_Phenakistiscope_Disc_with_Dancing_Man,_ca._1835-Animated.gif) | Simon Stampfer | Public domain |
+| `emoji-tailwag.gif` | [Cat tail ani.gif](https://commons.wikimedia.org/wiki/File:Cat_tail_ani.gif) | GeeAlice | Public domain |
+| `sticker-heartbeat.png` | [Animated heart5.gif](https://commons.wikimedia.org/wiki/File:Animated_heart5.gif) | Filthy cat | Public domain |

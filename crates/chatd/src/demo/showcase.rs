@@ -58,6 +58,28 @@ fn photo(s: &mut Seeder, account: &AccountKey, name: &str, shows: &str, art: Art
     })
 }
 
+/// `#photo-dump`: a wall of moving pictures, newest at the bottom, for seeing what a
+/// conversation of GIFs costs. Each is its own file, as each message's would be.
+pub(super) fn gif_wall(s: &mut Seeder, room: &Key, cast: &[Who]) -> Fallible<()> {
+    const MOVING: &[(&str, MediaKind, &str, u32, u32)] = &[
+        ("gif-greyhound.webp", MediaKind::Gif, "image/gif", 480, 146),
+        ("gif-horse.gif", MediaKind::Gif, "image/gif", 210, 140),
+        ("pigeons.webp", MediaKind::Image, "image/webp", 400, 147),
+        ("gif-jump.webp", MediaKind::Image, "image/webp", 320, 120),
+        ("gif-lion.webp", MediaKind::Image, "image/webp", 320, 95),
+    ];
+    let account = room.account();
+    for at in 0..30usize {
+        let (shows, kind, mime, width, height) = MOVING[at % MOVING.len()];
+        let look = s.look(Art::Scene);
+        let file = s.photo(&account, &format!("att-wall-{at}"), kind, shows, look, width, height)?;
+        let mut message = s.message(&account, &cast[at % 7], 600 - at as i64 * 15, "");
+        message.attachments.push(Attachment { mime: mime.to_owned(), ..Attachment::new(shows, file) });
+        s.post(room, &message)?;
+    }
+    Ok(())
+}
+
 fn mention(text: &str, name: &str, kind: MentionKind, id: &str) -> Span {
     let start = text.find(name).expect("the name is in the text");
     Span {
@@ -151,6 +173,13 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<Pending> {
     feed.push(s.message(account, who(WREN), step(2), "🎉🌿🔥"));
     let jumbo = Rich::default().styled(":mossparrot:", Style::Emoji { file: parrot.clone() });
     feed.push(jumbo.into(s.message(account, who(HARUTO), step(1), "")));
+    // An animated custom emoji, inline and alone, as Discord sends one: a moving WebP or GIF.
+    let look = s.look(Art::Blob);
+    let wag = s.photo(account, "emoji-tailwag", MediaKind::Emoji, "emoji-tailwag.gif", look, 48, 48)?;
+    let wagging = Rich::default().plain("The marten's tail on the clip, frame by frame ").styled(":tailwag:", Style::Emoji { file: wag.clone() });
+    feed.push(wagging.into(s.message(account, who(WREN), step(1), "")));
+    let jumbo = Rich::default().styled(":tailwag:", Style::Emoji { file: wag.clone() }).plain(" ").styled(":tailwag:", Style::Emoji { file: wag.clone() });
+    feed.push(jumbo.into(s.message(account, who(TOMASZ), step(1), "")));
 
     // Yesterday: pictures and files.
     let mut single = s.message(account, who(INES), step(1300), "Frost on the cushion moss this morning.");
@@ -185,16 +214,38 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<Pending> {
     });
     feed.push(hidden);
 
-    // The moving files themselves are not served, so asking for one shows a failure.
+    // A GIF as Discord sends one: the row's picture is the proxy's moving WebP at the size it is
+    // drawn, and the original is fetched only when it is opened (here the WebP stands in).
     let look = s.look(Art::Scene);
     let mut gif = s.message(account, who(WREN), step(20), "");
     gif.attachments.push(Attachment {
-        thumb: Some(s.photo(account, "att-gif-thumb", MediaKind::Image, "gif-thumb.webp", look, 480, 270)?),
+        thumb: Some(s.photo(account, "att-gif-thumb", MediaKind::Image, "gif-greyhound.webp", look, 480, 146)?),
         mime: "image/gif".to_owned(),
-        duration: 3,
-        ..Attachment::new("marten-hop.gif", s.broken(account, "att-gif", MediaKind::Gif, 480, 270, 2_310_144)?)
+        ..Attachment::new("greyhound-gallop.gif", s.photo_waiting(account, "att-gif", MediaKind::Gif, "gif-greyhound.webp", look, 480, 146)?)
     });
     feed.push(gif);
+    // A GIF with no smaller copy, as Slack and Teams send one: the file itself, decoded at the
+    // size it is drawn.
+    let mut horse = s.message(account, who(INES), step(2), "Muybridge's horse, 1878. All four hooves off the ground.");
+    let galloping = s.photo(account, "att-horse", MediaKind::Gif, "gif-horse.gif", look, 210, 140)?;
+    horse.attachments.push(Attachment { mime: "image/gif".to_owned(), ..Attachment::new("horse-in-motion.gif", galloping) });
+    feed.push(horse);
+    // A moving WebP sent as a picture.
+    let mut pigeons = s.message(account, who(HARUTO), step(3), "Pigeons off the barn roof, from the same plates.");
+    let flying = s.photo(account, "att-pigeons", MediaKind::Image, "pigeons.webp", look, 400, 147)?;
+    pigeons.attachments.push(Attachment { mime: "image/webp".to_owned(), ..Attachment::new("pigeons.webp", flying) });
+    feed.push(pigeons);
+    // A GIF from Tenor, which is an MP4 underneath: its still, until video plays in place.
+    if let Some(bytes) = photos::bytes("camera2-clip.mp4") {
+        let mut tenor = s.message(account, who(TOMASZ), step(2), "");
+        let clip = MediaFile { width: 640, height: 360, ..s.file(account, "att-tenor", MediaKind::Gif, bytes.len() as u64, "photo/camera2-clip.mp4?wait=600")? };
+        tenor.attachments.push(Attachment {
+            thumb: Some(s.photo(account, "att-tenor-thumb", MediaKind::Image, "gif-thumb.webp", look, 480, 270)?),
+            mime: "video/mp4".to_owned(),
+            ..Attachment::new("GIF", clip)
+        });
+        feed.push(tenor);
+    }
     let look = s.look(Art::Scene);
     let mut video = s.message(account, who(TOMASZ), step(9), "Full clip from 03:12.");
     // The clip itself is served when the user plays it; away from the source tree it is not.
@@ -263,6 +314,16 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<Pending> {
         ..Attachment::new("Sticker: Moss Wave", stuck)
     });
     feed.push(sticker);
+    // An APNG sticker, which moves.
+    let mut beating = s.message(account, who(INES), step(1), "");
+    let heart = s.photo(account, "sticker-heartbeat", MediaKind::Image, "sticker-heartbeat.png", look, 200, 150)?;
+    beating.attachments.push(Attachment {
+        thumb: Some(heart.clone()),
+        mime: "image/png".to_owned(),
+        sticker: true,
+        ..Attachment::new("Sticker: Heartbeat", heart)
+    });
+    feed.push(beating);
 
     // One picture that was never fetched and one that cannot be.
     let look = s.look(Art::Scene);
@@ -317,6 +378,12 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<Pending> {
         emoji: ":mossparrot:".to_owned(),
         file: Some(parrot),
         count: 6,
+        mine: false,
+    });
+    loved.reactions.insert(3, Reaction {
+        emoji: ":tailwag:".to_owned(),
+        file: Some(wag),
+        count: 3,
         mine: false,
     });
     feed.push(loved);
