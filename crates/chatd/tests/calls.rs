@@ -304,6 +304,56 @@ fn a_failure_from_the_adapter_stops_mediad_stays_on_screen_and_gives_way_to_a_ne
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// A helper that starts and never speaks, built here so the test depends on no other program
+/// ignoring its arguments. It stands for a stale engine, a wrong `TINYCLIENT_MEDIAD`, or one
+/// wedged before its first word.
+fn silent_helper(dir: &Path) -> PathBuf {
+    let source = dir.join("silent.rs");
+    std::fs::write(&source, "fn main() { loop { std::thread::sleep(std::time::Duration::from_secs(3600)); } }").unwrap();
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    let rustc = Path::new(&cargo).with_file_name(format!("rustc{}", std::env::consts::EXE_SUFFIX));
+    let out = dir.join(format!("silent{}", std::env::consts::EXE_SUFFIX));
+    let built = Command::new(rustc).args(["--edition", "2021", "-o"]).arg(&out).arg(&source).status().unwrap();
+    assert!(built.success(), "could not build the silent helper");
+    out
+}
+
+#[test]
+fn a_mediad_that_never_says_it_is_ready_fails_in_words_and_chatd_answers_on() {
+    let _turn = alone();
+    let (hub, dir) = hub();
+    let real = std::env::var("TINYCLIENT_MEDIAD").unwrap();
+    std::env::set_var("TINYCLIENT_MEDIAD", silent_helper(&dir));
+
+    // Asked on a thread, so the test fails in words if the ask never comes back.
+    let (said, answered) = std::sync::mpsc::channel();
+    let asking = hub.clone();
+    let key = lounge();
+    std::thread::spawn(move || said.send(asking.calls.start(&asking, key)));
+    let began = Instant::now();
+    let outcome = answered.recv_timeout(chatd::media::READY + Duration::from_secs(15));
+    std::env::set_var("TINYCLIENT_MEDIAD", real);
+    // The wedged ask, if it is still out, is this run's to stop.
+    for pid in child_pids(std::process::id(), "silent") {
+        let _ = kill_pid(&pid.to_string());
+    }
+    let failed = matches!(&outcome, Ok(Err(CallError::Media(err))) if err.to_string() == "The call engine stopped answering. Try again.");
+    assert!(failed, "the start did not fail in words: {}", match &outcome {
+        Ok(Err(CallError::Media(err))) => format!("the engine said: {err}"),
+        Ok(Err(_)) => "the engine refused".to_owned(),
+        Ok(Ok(())) => "the start succeeded".to_owned(),
+        Err(_) => "the ask did not come back in time".to_owned(),
+    });
+    assert!(began.elapsed() >= chatd::media::READY, "the engine had its time: {:?}", began.elapsed());
+
+    // The one call slot is free again: the state answers, and a real engine starts.
+    assert_eq!(hub.calls.describe(), (None, false));
+    assert!(hub.calls.start(&hub, lounge()).is_ok());
+    assert!(hub.calls.describe().1, "the real engine runs from connecting");
+    assert_eq!(hub.calls.end(&hub), Some(lounge()));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn a_mediad_that_dies_holding_a_voice_session_is_a_failure_in_words_not_a_vanished_call() {
     let _turn = alone();

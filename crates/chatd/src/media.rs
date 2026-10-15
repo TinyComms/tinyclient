@@ -24,6 +24,10 @@ use std::time::{Duration, Instant};
 
 /// How long mediad has to answer a request.
 const REPLY: Duration = Duration::from_secs(5);
+/// How long mediad has to say it is ready, which is its first act. Past this the engine is
+/// killed and the call fails: a helper that never speaks must not hold the one call slot, which
+/// every Status answer and every ring waits on.
+pub const READY: Duration = Duration::from_secs(10);
 /// How long the network has to hand out a voice session after the user pressed Call.
 const SESSION: Duration = Duration::from_secs(10);
 /// How long mediad has to connect once it holds the session. mediad bounds its own tries (three
@@ -44,6 +48,8 @@ const ENGINE_STOPPED: &str = "The call engine stopped.";
 const ENGINE_SILENT: &str = "The call engine stopped answering. Try again.";
 const ENGINE_MISSING: &str = "The call engine could not start. Reinstall tinyclient, then try again.";
 
+/// Why starting or asking the call engine failed. Debug, so a test can name one.
+#[derive(Debug)]
 pub enum CallError {
     Active,
     NoCall,
@@ -285,7 +291,32 @@ impl ActiveCall {
         })?;
         let stdin = child.stdin.take();
         let mut stdout = BufReader::new(child.stdout.take().expect("stdout is piped"));
-        let engine_linked = match read_frame(&mut stdout) {
+        // Ready is the first thing a healthy mediad says. The read waits on a thread of its own,
+        // for `Calls::start` holds the one call slot across this: a helper that never speaks (a
+        // stale binary, one wedged before its first word) must fail the call rather than hold
+        // every Status answer and every ring with it.
+        let (said, answered) = channel();
+        let spawned = std::thread::Builder::new().name("mediad-ready".into()).stack_size(128 * 1024).spawn(move || {
+            let frame = read_frame::<MediaResponse>(&mut stdout);
+            let _ = said.send((frame, stdout));
+        });
+        if let Err(err) = spawned {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("chatd: the reader of {} did not start: {err}", path.display());
+            return Err(io::Error::other(ENGINE_MISSING));
+        }
+        let (frame, mut stdout) = match answered.recv_timeout(READY) {
+            Ok(arrived) => arrived,
+            answer => {
+                let _ = child.kill();
+                let _ = child.wait();
+                eprintln!("chatd: {} did not say it was ready: {answer:?}", path.display());
+                let silent = matches!(answer, Err(std::sync::mpsc::RecvTimeoutError::Timeout));
+                return Err(io::Error::other(if silent { ENGINE_SILENT } else { ENGINE_MISSING }));
+            }
+        };
+        let engine_linked = match frame {
             Ok(MediaResponse::Ready { engine_linked }) => engine_linked,
             other => {
                 let _ = child.kill();
