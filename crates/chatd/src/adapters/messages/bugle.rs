@@ -556,7 +556,10 @@ pub fn pair(show: &dyn Fn(String), cancel: &std::sync::atomic::AtomicBool) -> Re
 }
 
 fn agent(timeout: Duration) -> ureq::Agent {
+    // The same system TLS as the rest of chatd. ureq's default is rustls, which this crate does
+    // not enable, and asking for it panics before a pairing code exists.
     ureq::Agent::config_builder()
+        .tls_config(ureq::tls::TlsConfig::builder().provider(ureq::tls::TlsProvider::NativeTls).build())
         .timeout_global(Some(timeout))
         .http_status_as_error(false)
         .user_agent(USER_AGENT)

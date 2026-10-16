@@ -39,7 +39,15 @@ pub fn step(hub: &Arc<Hub>, input: Option<SignInInput>, adopt: Adopt) -> Result<
         (None, None) => {
             let flow = Arc::new(Flow { hub: hub.clone(), step: Mutex::new(waiting()), ended: AtomicBool::new(false), cancelled: Arc::default() });
             let running = flow.clone();
-            std::thread::Builder::new().name("messages-link".into()).spawn(move || running.run(adopt)).map_err(|err| err.to_string())?;
+            std::thread::Builder::new().name("messages-link".into()).spawn(move || {
+                let flow = running.clone();
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| running.run(adopt))).is_err() {
+                    flow.show(SignInStep::Failed {
+                        reason: "Couldn't reach Messages to get a pairing code. Try again.".to_owned(),
+                    });
+                    flow.ended.store(true, Ordering::Relaxed);
+                }
+            }).map_err(|err| err.to_string())?;
             *held = Some(flow.clone());
             flow
         }
