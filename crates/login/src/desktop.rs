@@ -2,7 +2,7 @@
 
 use crate::teams;
 use crate::{
-    blocked, finish, load_failed_message, route, session, web_client, Route, Site, BLOCKED, CLOSED,
+    blocked, finish, hands_off, load_failed_message, route, session, web_client, Route, Site, BLOCKED, CLOSED,
     LOAD_FAILED, NO_TOKEN, NO_TOKEN_AFTER, PAGE, SIZE,
 };
 use std::path::PathBuf;
@@ -182,6 +182,9 @@ fn tick(web: &WebView, site: Site, agent: &str, state: &Arc<Mutex<State>>) {
                 let _ = web.load_url(instead);
                 return;
             }
+        }
+        if hands_off(&at) {
+            return;
         }
         let mut guard = state.lock().unwrap();
         if web_client(&at) {

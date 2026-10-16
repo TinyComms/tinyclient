@@ -34,13 +34,24 @@ pub const SLACK: Site = Site {
 pub const DISCORD: Site = Site {
     title: "Sign in to Discord",
     start: "https://discord.com/login",
-    probe: "(()=>{try{const f=document.createElement('iframe');f.style.display='none';\
-            document.body.appendChild(f);const t=f.contentWindow.localStorage.getItem('token');\
-            f.remove();return t?JSON.stringify({token:JSON.parse(t)}):null}catch(e){return null}})()",
+    // The token lives in this page's own localStorage. Read it there. An iframe appended to
+    // the page to reach the same storage is the same read, and it tears down the password
+    // field while the person is typing it.
+    probe: "(()=>{try{const t=localStorage.getItem('token');\
+            return t?JSON.stringify({token:JSON.parse(t)}):null}catch(e){return null}})()",
     read: |found| serde_json::from_str(found).ok(),
     cookie: None,
     detour: None,
 };
+
+/// Discord's email, password, 2FA and captcha all stay on this address. Script run against it
+/// (every second, while the person is typing) blurs the password field, so they have to enter
+/// it again and again. The token is read once the page has left this address.
+pub fn hands_off(url: &str) -> bool {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    path.strip_prefix("https://discord.com/login")
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
 
 pub const PAGE: &str = "JSON.stringify({url:location.href,\
                     text:document.body?document.body.innerText.slice(0,4000):''})";
@@ -244,7 +255,7 @@ pub fn finish(session: serde_json::Value) -> ! {
 #[cfg(test)]
 mod tests {
     use super::{
-        blocked, origin, parse_at, route, session, slack_session, web_client, Route, DISCORD,
+        blocked, hands_off, origin, parse_at, route, session, slack_session, web_client, Route, DISCORD,
     };
 
     #[test]
@@ -419,6 +430,18 @@ mod tests {
         {
             assert_eq!(slack_session(config), None, "{config:?}");
         }
+    }
+
+    #[test]
+    fn discord_login_is_left_alone_until_the_page_moves_on() {
+        assert!(hands_off("https://discord.com/login"));
+        assert!(hands_off("https://discord.com/login?redirect_to=%2Fchannels%2F%40me"));
+        assert!(hands_off("https://discord.com/login/"));
+        assert!(!hands_off("https://discord.com/channels/@me"));
+        assert!(!hands_off("https://discord.com/app"));
+        assert!(!hands_off("https://slack.com/signin"));
+        assert!(!DISCORD.probe.contains("iframe"));
+        assert!(DISCORD.probe.contains("localStorage.getItem('token')"));
     }
 
     #[test]

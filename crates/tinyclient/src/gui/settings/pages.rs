@@ -143,7 +143,10 @@ impl SettingsWindow {
         let column = div().w(px(controls::COLUMN)).flex().flex_col();
         let groups: Vec<Div> = match self.section {
             Section::Accounts => return column.child(self.accounts(cx)),
-            Section::General => vec![self.group(&["G2"], None, window, cx).child(caption(self.keep_running_caption()))],
+            Section::General => vec![
+                self.group(&["G2"], None, window, cx).child(caption(self.keep_running_caption())),
+                self.group(&["G4"], None, window, cx).child(caption(self.updates_caption())),
+            ],
             Section::Sounds => vec![
                 self.group(&["S1"], None, window, cx),
                 self.group(&["S7", "S8", "S9", "S10"], Some("In calls"), window, cx)
@@ -212,6 +215,35 @@ impl SettingsWindow {
         )
     }
 
+    fn updates_caption(&self) -> &'static str {
+        if prefs::choices().updates {
+            "A newer version is downloaded while tinyclient is open and installed when you quit."
+        } else {
+            "tinyclient tells you when a newer version is published. Nothing is downloaded until you ask."
+        }
+    }
+
+    fn set_updates(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.choose(|choices| choices.updates = on, cx);
+        if on {
+            self.off_thread(
+                cx,
+                || crate::update::pursue(crate::update::Policy::Now { automatic: true }),
+                |this, _, cx| {
+                    let _ = this.shell.update(cx, |shell, cx| {
+                        if crate::update::announced() {
+                            shell.layout_state.update_alert = true;
+                        }
+                        cx.notify();
+                    });
+                    cx.notify();
+                },
+            );
+        } else {
+            crate::update::discard_download();
+        }
+    }
+
     fn keep_running_caption(&self) -> &'static str {
         if prefs::values().on(KEEP_RUNNING) {
             "Closing the window leaves tinyclient running. Quit with ⌘Q to stop it."
@@ -238,6 +270,10 @@ impl SettingsWindow {
             "G2" => {
                 let on = values.on(KEEP_RUNNING);
                 self.switch_row(id, on, true, None, move |this, on, cx| this.set_switch(id, KEEP_RUNNING, on, true, cx), cx)
+            }
+            "G4" => {
+                let on = choices.updates;
+                self.switch_row(id, on, true, None, move |this, on, cx| this.set_updates(on, cx), cx)
             }
             "S1" => {
                 let on = values.on(SOUNDS);
@@ -984,6 +1020,50 @@ impl SettingsWindow {
         column
     }
 
+    fn update_status(&mut self, cx: &mut Context<Self>) -> Option<Div> {
+        let (words, label) = match crate::update::shown() {
+            crate::update::Shown::Ready { version } => (format!("Version {version} is ready. Restart to install it."), Some("Restart now")),
+            crate::update::Shown::Available { version, .. } => {
+                let label = if crate::update::install_into().is_some() { "Install" } else { "Download" };
+                (format!("Version {version} is available."), Some(label))
+            }
+            crate::update::Shown::Failed { version } => (format!("Couldn't install {version}. Will try again tomorrow."), None),
+            crate::update::Shown::Quiet => return None,
+        };
+        let action = label.map(|label| {
+            button("about-update", ButtonKind::Ghost, label).h(px(24.)).on_click(cx.listener(|this, _, _, cx| this.install_shown(cx)))
+        });
+        Some(
+            div()
+                .pt(px(4.))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .child(div().type_small().text_color(theme::text_soft()).child(words))
+                .children(action),
+        )
+    }
+
+    fn install_shown(&mut self, cx: &mut Context<Self>) {
+        match crate::update::shown() {
+            crate::update::Shown::Ready { .. } => cx.quit(),
+            crate::update::Shown::Available { page, .. } => {
+                if crate::update::install_into().is_some() {
+                    self.off_thread(cx, || crate::update::pursue(crate::update::Policy::Install), |this, _, cx| {
+                        let _ = this.shell.update(cx, |shell, cx| {
+                            shell.layout_state.update_alert = true;
+                            cx.notify();
+                        });
+                        cx.notify();
+                    });
+                } else {
+                    cx.open_url(&page);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn about(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let version = format!("Version {}", env!("CARGO_PKG_VERSION"));
         let plate = div()
@@ -1006,6 +1086,7 @@ impl SettingsWindow {
             .child(plate)
             .child(div().pt(px(10.)).type_headline().text_color(theme::text()).child("tinyclient"))
             .child(div().type_small().text_color(theme::text_faint()).child(version))
+            .children(self.update_status(cx))
             .child(div().type_ui().text_color(theme::text_soft()).child("One small app for Slack, Discord, Telegram, Teams and Signal."))
             .child(
                 div()

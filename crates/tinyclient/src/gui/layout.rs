@@ -120,6 +120,8 @@ pub struct State {
     pub details_directs: bool,
     toast: Option<Toast>,
     toasts: u64,
+    /// A newer release is waiting. Stays until the toast is dismissed.
+    pub update_alert: bool,
 }
 
 impl Default for State {
@@ -137,6 +139,7 @@ impl Default for State {
             details_directs: false,
             toast: None,
             toasts: 0,
+            update_alert: false,
         }
     }
 }
@@ -882,10 +885,11 @@ impl Shell {
     fn toast_layer(&self, window_width: f32, cx: &mut Context<Self>) -> Option<Div> {
         let width = place::toast_width(window_width);
         let crash = self.crash_toast(width, cx);
+        let update = self.update_toast(width, cx);
         let toast = self.layout_state.toast.as_ref().map(|(id, icon, words)| {
             fade_in(("toast", *id as usize), 160, toast(*icon, words.clone()).w(px(width))).into_any_element()
         });
-        if crash.is_none() && toast.is_none() {
+        if crash.is_none() && toast.is_none() && update.is_none() {
             return None;
         }
         Some(
@@ -897,6 +901,7 @@ impl Shell {
                 .flex_col()
                 .gap(px(8.))
                 .children(toast)
+                .children(update.map(|update| fade_in("update-toast", 160, div().child(update))))
                 .children(crash.map(|crash| fade_in("crash-toast", 160, div().child(crash)))),
         )
     }

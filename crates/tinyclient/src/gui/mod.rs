@@ -627,7 +627,10 @@ pub fn run() {
             call::bind_keys(cx);
             bind_keys(cx);
             app::menubar::app_actions(cx);
-            cx.set_menus(app::menubar::menus(&[], None));
+            if !cfg!(feature = "gui-shot") {
+                crate::update::recall();
+            }
+            cx.set_menus(app::menubar::menus(&[], None, crate::update::menu_label()));
 
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(window_bounds(prefs.frame, cx))),

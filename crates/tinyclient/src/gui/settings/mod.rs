@@ -159,6 +159,33 @@ struct Host {
 
 impl Global for Host {}
 
+/// The Settings window redraws. Safe to call while the shell is already being updated.
+pub fn redraw(cx: &mut App) {
+    let window = cx.default_global::<Host>().window;
+    if let Some(window) = window {
+        let _ = window.update(cx, |_, _, cx| cx.notify());
+    }
+}
+
+/// The shell and the Settings window redraw after an update check.
+pub fn note_changed(cx: &mut App) {
+    let host = cx.default_global::<Host>();
+    let window = host.window;
+    let shell = host.shell.clone();
+    if let Some(shell) = shell {
+        let _ = shell.update(cx, |shell, cx| {
+            if crate::update::announced() {
+                shell.layout_state.update_alert = true;
+            }
+            shell.refresh_menus(cx);
+            cx.notify();
+        });
+    }
+    if let Some(window) = window {
+        let _ = window.update(cx, |_, _, cx| cx.notify());
+    }
+}
+
 /// Called by the shell when it starts: Settings reads its accounts from it.
 pub fn attach(shell: WeakEntity<Shell>, cx: &mut App) {
     cx.default_global::<Host>().shell = Some(shell);

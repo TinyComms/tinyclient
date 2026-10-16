@@ -245,6 +245,7 @@ pub struct Shell {
 impl Shell {
     pub fn new(prefs: app::prefs::Prefs, window: &mut Window, cx: &mut Context<Self>) -> Shell {
         Self::watch(cx);
+        Self::watch_updates(cx);
         Self::wake_at_thresholds(cx);
         let subscriptions = [cx.observe_window_activation(window, |this, window, cx| {
             this.active = window.is_window_active();
@@ -299,6 +300,9 @@ impl Shell {
         shell.layout_state.details_directs = prefs.details_directs;
         shell.sidebar_state.pins = prefs.pins;
         shell.saved_prefs.replace(app::prefs::write(&shell.current_prefs()));
+        if crate::update::announce().is_some() {
+            shell.layout_state.update_alert = true;
+        }
         shell
     }
 

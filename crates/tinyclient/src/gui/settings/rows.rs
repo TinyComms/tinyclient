@@ -34,6 +34,7 @@ use Section::*;
 /// Every row, in the order the sections draw them.
 pub const ROWS: &[Row] = &[
     row("G2", General, "", "Keep receiving when the window is closed", &[], &["background", "quit", "close", "run", "daemon"]),
+    row("G4", General, "", "Install updates automatically", &[], &["update", "upgrade", "version", "install", "automatic"]),
     row("S1", Sounds, "", "Play sounds", &[], &["sound", "audio", "mute", "silent", "ding", "chime", "beep"]),
     row("S7", Sounds, "In calls", "Someone joins or leaves", &[], &["sound", "chime", "ding", "join", "leave", "cue"]),
     row("S8", Sounds, "In calls", "I mute, unmute or deafen", &[], &["sound", "ding", "tick", "cue", "deafen"]),
@@ -94,7 +95,6 @@ pub const NOT_YET: &[(&str, &str)] = &[
     ("camera", "tinyclient has no camera yet."),
     ("push to talk", "tinyclient has no push to talk yet."),
     ("menu bar", "tinyclient has no menu bar icon yet."),
-    ("update", "tinyclient has no updater yet."),
     ("accent", "tinyclient keeps one accent colour."),
     ("font", "tinyclient keeps the system font. Text size is in Appearance."),
     ("language", "tinyclient follows the language of macOS."),
@@ -302,7 +302,7 @@ mod tests {
     fn every_shortcut_names_a_menu_item_that_exists_and_every_keyed_item_is_listed() {
         use crate::gui::app::menubar::menus;
         use gpui::MenuItem;
-        let bar = menus(&[], None);
+        let bar = menus(&[], None, "Check for Updates…");
         for shortcut in SHORTCUTS.iter().filter(|s| s.menu != "Calls") {
             let menu = bar.iter().find(|menu| menu.name.as_ref() == shortcut.menu).unwrap_or_else(|| panic!("no {} menu", shortcut.menu));
             let found = menu.items.iter().any(|item| match item {

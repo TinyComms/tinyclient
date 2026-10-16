@@ -1,7 +1,7 @@
 //! macOS sign-in window (AppKit + WKWebView).
 
 use crate::{
-    blocked, finish, load_failed, origin, route, session, web_client, Route, Site, BLOCKED, CLOSED,
+    blocked, finish, hands_off, load_failed, origin, route, session, web_client, Route, Site, BLOCKED, CLOSED,
     LOAD_FAILED, NO_TOKEN, NO_TOKEN_AFTER, PAGE, SIZE,
 };
 use block2::RcBlock;
@@ -195,6 +195,9 @@ pub fn run(site: Site, at: Option<(f64, f64)>) {
                 load(&web, instead);
                 return;
             }
+        }
+        if hands_off(&at) {
+            return;
         }
         on_client.set(web_client(&at).then(|| on_client.get().unwrap_or_else(Instant::now)));
         if on_client.get().is_some_and(|since| since.elapsed() >= NO_TOKEN_AFTER) {

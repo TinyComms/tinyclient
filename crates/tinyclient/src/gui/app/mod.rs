@@ -356,6 +356,88 @@ impl Shell {
         )
     }
 
+    /// Asks GitHub shortly after launch, then about once an hour, and keeps the notice up
+    /// when a newer release exists.
+    pub(in crate::gui) fn watch_updates(cx: &mut Context<Self>) {
+        if cfg!(feature = "gui-shot") {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_secs(8)).await;
+            loop {
+                let automatic = this.update(cx, |_, _| prefs::choices().updates).unwrap_or(true);
+                cx.background_executor()
+                    .spawn(async move { crate::update::pursue(crate::update::Policy::Now { automatic }) })
+                    .await;
+                if this
+                    .update(cx, |this, cx| {
+                        if crate::update::announce().is_some() {
+                            this.layout_state.update_alert = true;
+                        }
+                        this.refresh_menus(cx);
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                // The settings window is a different entity. Notifying it from inside the shell
+                // update above leases the shell twice and aborts.
+                let _ = cx.update(|cx| super::settings::redraw(cx));
+                cx.background_executor().timer(Duration::from_secs(3600)).await;
+            }
+        })
+        .detach();
+    }
+
+    fn update_alert_act(&mut self, cx: &mut Context<Self>) {
+        match crate::update::shown() {
+            crate::update::Shown::Ready { .. } => cx.quit(),
+            crate::update::Shown::Available { page, .. } => {
+                if crate::update::install_into().is_some() {
+                    self.off_thread(cx, || crate::update::pursue(crate::update::Policy::Install), |this, _, cx| {
+                        this.layout_state.update_alert = true;
+                        cx.notify();
+                    });
+                } else {
+                    cx.open_url(&page);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Stays until dismissed. Install downloads; Restart quits so the staged app replaces this one.
+    pub(in crate::gui) fn update_toast(&self, width: f32, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.layout_state.update_alert {
+            return None;
+        }
+        let (words, label) = match crate::update::shown() {
+            crate::update::Shown::Ready { version } => (format!("Version {version} is available. Restart to install it."), "Restart"),
+            crate::update::Shown::Available { version, .. } => {
+                let label = if crate::update::install_into().is_some() { "Install" } else { "Download" };
+                (format!("Version {version} is available."), label)
+            }
+            _ => return None,
+        };
+        let action = button("update-act", ButtonKind::Ghost, label).h(px(24.)).px(px(8.)).text_color(theme::text()).on_click(cx.listener(|this, _, _, cx| {
+            this.update_alert_act(cx);
+        }));
+        let close = div().id("update-close").flex_none().cursor_pointer().child(glyph("icons/x.svg", 14., theme::text_faint())).on_click(
+            cx.listener(|this, _, _, cx| {
+                this.layout_state.update_alert = false;
+                cx.notify();
+            }),
+        );
+        Some(
+            toast(Some(("icons/download.svg", theme::accent())), words)
+                .w(px(width))
+                .child(action)
+                .child(close)
+                .into_any_element(),
+        )
+    }
+
     /// The crash-restart toast: error style, stays until dismissed.
     pub(in crate::gui) fn crash_toast(&self, width: f32, cx: &mut Context<Self>) -> Option<AnyElement> {
         self.crashed?;

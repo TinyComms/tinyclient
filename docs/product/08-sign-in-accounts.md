@@ -149,9 +149,12 @@ anything that hides presence on Telegram.
   and macOS asks for the login password per item. Login Items shows the bundle's name and icon.
 - **Open at login** registers chatd as a login agent from inside the bundle (`SMAppService`,
   macOS 13+), so it can be switched off in System Settings and goes when the app is deleted.
-- **Updates:** Sparkle, signed, checked daily, installed on quit; the update restarts chatd and
-  sessions survive in the keychain. Not the Mac App Store (review rules out three of the four
-  sign-ins). Apple silicon first.
+- **Updates:** while the window is open, tinyclient asks GitHub's public latest release about
+  once an hour. The request's user agent is `tinyclient/<version>` and it carries nothing else.
+  A newer release is said in the window. With Install updates automatically on, the archive is
+  checked against that release's `SHA256SUMS` and, on macOS, with `codesign`, then it replaces
+  this copy on quit. Sessions stay in the keychain. Not the Mac App Store. Apple silicon first.
+  See `docs/design/08-first-run-settings.md` §8.
 
 ## Open questions for the owner
 

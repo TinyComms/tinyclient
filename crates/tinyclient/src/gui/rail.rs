@@ -218,7 +218,16 @@ impl Shell {
                     .items_center()
                     .gap(px(4.))
                     .child(chrome("rail-add", Menu::Add, "Add an account").size(px(32.)).child(glyph("icons/plus.svg", 16., theme::text_faint())))
-                    .child(chrome("rail-me", Menu::Own, "You").child(mine)),
+                    .child({
+                        let (words, waiting) = match crate::update::shown() {
+                            crate::update::Shown::Ready { .. } => ("Update ready", true),
+                            crate::update::Shown::Available { .. } => ("Update available", true),
+                            _ => ("You", false),
+                        };
+                        div().relative().child(chrome("rail-me", Menu::Own, words).child(mine)).when(waiting, |row| {
+                            row.child(div().absolute().top(px(4.)).right(px(4.)).size(px(6.)).rounded(px(3.)).bg(theme::accent()))
+                        })
+                    }),
             )
     }
 }

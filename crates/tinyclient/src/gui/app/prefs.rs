@@ -34,6 +34,8 @@ pub struct Choices {
     pub emoticons: bool,
     /// P3: pictures and link previews load by themselves.
     pub images: bool,
+    /// G4: a newer release is downloaded and installed on quit. Off, the notice still appears.
+    pub updates: bool,
     /// The Settings section last shown. Written by its name, which stays when sections are
     /// added or moved; a name this build does not know opens Accounts.
     pub section: Section,
@@ -41,7 +43,7 @@ pub struct Choices {
 
 impl Default for Choices {
     fn default() -> Choices {
-        Choices { compact: false, previews: true, command_return: false, newest: false, typing: true, emoticons: false, images: true, section: Section::Accounts }
+        Choices { compact: false, previews: true, command_return: false, newest: false, typing: true, emoticons: false, images: true, updates: true, section: Section::Accounts }
     }
 }
 
@@ -54,6 +56,7 @@ static CHOICES: Mutex<Choices> = Mutex::new(Choices {
     typing: true,
     emoticons: false,
     images: true,
+    updates: true,
     section: Section::Accounts,
 });
 static VALUES: Mutex<Option<Values>> = Mutex::new(None);
@@ -202,6 +205,7 @@ pub fn parse(text: &str) -> Prefs {
             "typing" => prefs.choices.typing = fields.next() != Some("off"),
             "emoticons" => prefs.choices.emoticons = fields.next() == Some("on"),
             "images" => prefs.choices.images = fields.next() != Some("click"),
+            "updates" => prefs.choices.updates = fields.next() != Some("off"),
             "settings_section" => prefs.choices.section = fields.next().and_then(Section::from_word).unwrap_or(Section::Accounts),
             _ if !line.trim().is_empty() => prefs.kept.push(line.to_owned()),
             _ => {}
@@ -232,7 +236,7 @@ pub fn write(prefs: &Prefs) -> String {
     text.push_str(&format!("details\t{}\t{}\n", word(prefs.details_channels), word(prefs.details_directs)));
     text.push_str(&format!("text\t{}\n", prefs.text_step));
     let (choices, default) = (prefs.choices, Choices::default());
-    let lines: [(&str, bool, &str); 8] = [
+    let lines: [(&str, bool, &str); 9] = [
         ("density", choices.compact != default.compact, "compact"),
         ("previews", choices.previews != default.previews, "off"),
         ("send", choices.command_return != default.command_return, "cmd-return"),
@@ -240,6 +244,7 @@ pub fn write(prefs: &Prefs) -> String {
         ("typing", choices.typing != default.typing, "off"),
         ("emoticons", choices.emoticons != default.emoticons, "on"),
         ("images", choices.images != default.images, "click"),
+        ("updates", choices.updates != default.updates, "off"),
         ("settings_section", choices.section != default.section, ""),
     ];
     for (name, changed, value) in lines {
@@ -296,7 +301,7 @@ mod tests {
             details_channels: true,
             details_directs: false,
             text_step: 2,
-            choices: Choices { compact: true, previews: false, command_return: true, newest: true, typing: false, emoticons: true, images: false, section: Section::Audio },
+            choices: Choices { compact: true, previews: false, command_return: true, newest: true, typing: false, emoticons: true, images: false, updates: false, section: Section::Audio },
             kept: Vec::new(),
             autoplay: Autoplay::Hover,
         };

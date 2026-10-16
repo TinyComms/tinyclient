@@ -1,6 +1,6 @@
 # Contributing to tinyclient
 
-Thank you for looking. Questions and ideas are welcome on [Discord](https://discord.gg/ZBhXsMPkA).
+Thank you for looking. Questions and ideas are welcome on [Discord](https://discord.gg/kJHK7BNvJP).
 This file covers how to build and test, how the code is written, and how a network adapter is
 put together. The map of the system is [`docs/architecture.md`](docs/architecture.md);
 read its first two sections before changing anything across a process boundary.

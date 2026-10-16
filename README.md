@@ -11,7 +11,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 [Website](https://tinyclient.io) ·
-[Discord](https://discord.gg/ZBhXsMPkA) ·
+[Discord](https://discord.gg/kJHK7BNvJP) ·
 [Releases](https://github.com/itz4blitz/tinyclient/releases) ·
 [Architecture](docs/architecture.md) ·
 [Contributing](CONTRIBUTING.md) ·
@@ -28,7 +28,7 @@ and nothing is sent anywhere else. It is built for macOS, Linux and Windows.
 
 tinyclient is early. We are building a community around one goal: a chat client that is a
 pleasure to use and does everything the official apps do, on every network.
-Talk with us on [Discord](https://discord.gg/ZBhXsMPkA), or [come help](#contributing).
+Talk with us on [Discord](https://discord.gg/kJHK7BNvJP), or [come help](#contributing).
 
 ## Why
 
@@ -37,8 +37,11 @@ connections and a native window that draws what the daemon reports.
 
 - **Local first.** Messages are cached in SQLite on your disk. Sessions are kept in the system
   credential store. The only connections made are to the networks you sign in to.
-- **No telemetry.** No analytics, no usage pings, no update check, no crash upload. A panic is
-  written, with credentials redacted, to a `crash.log` on your disk and nowhere else.
+- **No telemetry.** No analytics, no usage pings, no crash upload. A panic is
+  written, with credentials redacted, to a `crash.log` on your disk and nowhere else. About once
+  an hour the window asks GitHub whether a newer release exists. That request sends only
+  `User-Agent: tinyclient/<version>`. With automatic install on, the new copy is checked and
+  replaces this one when you quit.
 - **Small, with budgets.** Every feature has a memory, speed and idle-CPU budget it must pass,
   measured from outside the process ([`docs/product/07-budgets-and-risk.md`](docs/product/07-budgets-and-risk.md)).
   The target for the whole product, idle, signed in to four networks, is **150 MB**. Measured on
@@ -289,7 +292,7 @@ Signal or Google. How each network treats third-party clients, so you can decide
 
 Contributions are welcome, from a typo to a network adapter. The roadmap and the areas
 you can own are on the [contributing page](https://tinyclient.io/docs/contributing). Say which
-area you want on [Discord](https://discord.gg/ZBhXsMPkA). The product documents are the spec;
+area you want on [Discord](https://discord.gg/kJHK7BNvJP). The product documents are the spec;
 a choice they leave open is settled there, by agreement, before the code.
 
 [CONTRIBUTING.md](CONTRIBUTING.md) covers building, testing, code style and how an adapter is

@@ -6,9 +6,9 @@
 // disabled until those views register them with `.on_action`: Attach File (`AttachFile`,
 // composer), Show Details (`ShowDetails`, pane), Mute… (`Mute`, profile), Start Call
 // (`StartCall`, call) and Open in <network> (`OpenInNetwork`, handoff). Items with nothing built
-// behind them are left out rather than shown dead: Check for Updates…, Find (⌘F, ⇧⌘F), Mark as
+// behind them are left out rather than shown dead: Find (⌘F, ⇧⌘F), Mark as
 // Unread, Mark Server as Read, Copy Link, Release Notes and Report a Problem…. They come back
-// with what they do.
+// with what they do. Check for Updates… is here; it becomes Restart to Update once a build is staged.
 
 use super::super::settings;
 use super::super::sidebar::Mode;
@@ -18,7 +18,7 @@ use gpui::{App, Menu, MenuItem, OsAction, SystemMenuType};
 use protocol::Network;
 
 /// The menus for a window with `places` on the rail and `open_network` open.
-pub fn menus(places: &[(String, usize)], open_network: Option<Network>) -> Vec<Menu> {
+pub fn menus(places: &[(String, usize)], open_network: Option<Network>, update_item: &str) -> Vec<Menu> {
     let place = |name: String, index: usize| -> MenuItem {
         match index {
             0 => MenuItem::action(name, Place1),
@@ -53,6 +53,7 @@ pub fn menus(places: &[(String, usize)], open_network: Option<Network>) -> Vec<M
     vec![
         Menu::new("tinyclient").items([
             MenuItem::action("About tinyclient", About),
+            MenuItem::action(update_item, CheckForUpdates),
             MenuItem::separator(),
             MenuItem::action("Settings…", Settings),
             MenuItem::separator(),
@@ -154,6 +155,7 @@ pub fn stop_chatd_on_quit(cx: &mut App) {
         return;
     }
     cx.on_app_quit(|cx| {
+        crate::update::apply_on_quit();
         cx.background_executor().spawn(async {
             let _ = crate::client::ask_within(&protocol::Request::Shutdown, Some(std::time::Duration::from_millis(150)));
         })
@@ -182,6 +184,20 @@ pub fn app_actions(cx: &mut App) {
     cx.on_action(|_: &ShowWindow, cx| cx.activate(true));
     cx.on_action(|_: &Settings, cx| settings::open(settings::Section::last(), cx));
     cx.on_action(|_: &About, cx| settings::open(settings::Section::About, cx));
+    cx.on_action(|_: &CheckForUpdates, cx| {
+        if matches!(crate::update::shown(), crate::update::Shown::Ready { .. }) {
+            cx.quit();
+            return;
+        }
+        let automatic = super::prefs::choices().updates;
+        cx.spawn(async move |cx| {
+            cx.background_executor()
+                .spawn(async move { crate::update::pursue(crate::update::Policy::Now { automatic }) })
+                .await;
+            let _ = cx.update(|cx| settings::note_changed(cx));
+        })
+        .detach();
+    });
     cx.on_action(|_: &KeyboardShortcuts, cx| settings::open(settings::Section::Shortcuts, cx));
 }
 
@@ -203,12 +219,12 @@ impl Shell {
             })
             .collect();
         let open = self.open.as_ref().map(|key| key.network);
-        let signature = format!("{places:?}{open:?}");
+        let signature = format!("{places:?}{open:?}{}", crate::update::menu_label());
         if *self.menus_set.borrow() == signature {
             return;
         }
         self.menus_set.replace(signature);
-        cx.set_menus(menus(&places, open));
+        cx.set_menus(menus(&places, open, crate::update::menu_label()));
     }
 }
 
@@ -219,7 +235,7 @@ mod tests {
     #[test]
     fn the_bar_has_every_menu_and_names_the_open_network() {
         let places = vec![("Inbox".to_owned(), 0), ("People".to_owned(), 1), ("Discord".to_owned(), 2), ("Moss & Lichen".to_owned(), 3)];
-        let bar = menus(&places, Some(Network::Slack));
+        let bar = menus(&places, Some(Network::Slack), "Check for Updates…");
         let names: Vec<&str> = bar.iter().map(|menu| menu.name.as_ref()).collect();
         assert_eq!(names, ["tinyclient", "File", "Edit", "View", "Conversation", "Window", "Help"]);
         let items = |menu: &Menu| -> Vec<String> {
@@ -237,9 +253,10 @@ mod tests {
         assert!(items(&bar[1]).contains(&"Close Window".to_owned()));
         // Nothing is offered that does nothing.
         let all: Vec<String> = bar.iter().flat_map(items).collect();
-        for dead in ["Check for Updates…", "Search in Conversation", "Search Everywhere", "Release Notes", "Report a Problem…", "Mark as Unread", "Copy Link"] {
+        for dead in ["Search in Conversation", "Search Everywhere", "Release Notes", "Report a Problem…", "Mark as Unread", "Copy Link"] {
             assert!(!all.contains(&dead.to_owned()), "{dead} is offered");
         }
+        assert!(all.contains(&"Check for Updates…".to_owned()));
         assert!(all.contains(&"Settings…".to_owned()) && all.contains(&"About tinyclient".to_owned()));
     }
 }

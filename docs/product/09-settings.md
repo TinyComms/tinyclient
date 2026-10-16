@@ -90,7 +90,7 @@ Notifications scrolled to that account's row. No settings of its own.
 | G1 | Open at login | Switch | Off until the first-load card (08 §6) asks | G | OS | Registers the bundle with `SMAppService`. At login only chatd starts; the window opens when the Dock icon or a notification is clicked | v1 |
 | G2 | Keep receiving when the window is closed | Switch | On | G | d | On: closing the window hides it and chatd keeps running. Off: closing the window quits the window and chatd | v1 |
 | G3 | Show in menu bar | Switch | Off | G | s | | Later |
-| G4 | Install updates automatically | Switch | On | G | s | | Later (no updater exists) |
+| G4 | Install updates automatically | Switch | On | G | s | On: a newer GitHub release is downloaded while the window is open and replaces this copy on quit. Off: the notice still appears and nothing is downloaded until asked | v1 |
 
 Caption under G2, from 08 §6: "Closing the window leaves tinyclient running. Quit with ⌘Q to
 stop it." ⌘Q stops chatd and the window in every case; that is a defect fix, not a setting.
@@ -554,7 +554,6 @@ v1 is 50 controls. If a step slips, its rows stay out and the rest still ship.
 | Item | Waits on |
 | --- | --- |
 | G3 Show in menu bar | Design of the menu; low demand while the Dock badge works |
-| G4 Install updates automatically | An updater |
 | N14 Reaction notifications, N15 thread replies | Adapters telling reactions to my messages and followed threads apart, per network |
 | N16 Focus filter | App Intents in a Rust bundle; check cost |
 | S13 Custom sound files | The `~/Library/Sounds` spike |

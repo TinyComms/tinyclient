@@ -7,6 +7,7 @@ publish.workspace = true
 
 [dependencies]
 protocol.workspace = true
+sha2 = "0.10"
 
 # GPUI is the shell. It is behind `gui` so `cargo test` and the daemons never pull the GPU stack.
 #   cargo run -p tinyclient --features gui
