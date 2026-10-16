@@ -94,7 +94,7 @@ impl Shell {
                         read.folders = folders;
                     }
                 }
-                Network::Teams | Network::Signal => read.chats = whole(network, None, Shelf::Main)?.0,
+                Network::Teams | Network::Signal | Network::Messages => read.chats = whole(network, None, Shelf::Main)?.0,
                 Network::Slack => {}
             }
             Ok(read)
@@ -172,7 +172,7 @@ impl Shell {
                     .collect()
             }
             (Mode::Network(Network::Telegram), None) => home::telegram(&state.home),
-            (Mode::Network(Network::Signal), None) => home::signal(&state.home),
+            (Mode::Network(Network::Signal | Network::Messages), None) => home::signal(&state.home),
             (Mode::Network(Network::Teams), None) => {
                 let channels = |team: &Key| -> Vec<Rc<Conversation>> {
                     self.trees.get(team).map(|tree| tree.conversations.iter().filter(|c| c.kind != ConversationKind::Thread).cloned().collect()).unwrap_or_default()
@@ -256,7 +256,7 @@ impl Shell {
             Item::Chat(c) => {
                 let look = match network {
                     Some(Network::Discord) if self.sidebar_state.drill.is_none() => Look { status: true, ..Look::default() },
-                    Some(Network::Telegram | Network::Teams | Network::Signal) => Look { time: true, ticks: true, ..Look::default() },
+                    Some(Network::Telegram | Network::Teams | Network::Signal | Network::Messages) => Look { time: true, ticks: true, ..Look::default() },
                     _ => Look { time: true, context: false, ..Look::default() },
                 };
                 self.chat_row("home", &c, look, focused, cx).into_any_element()
@@ -437,6 +437,7 @@ impl Shell {
             (Some(Network::Teams), None) => ("icons/message-circle.svg", "No chats yet".into(), "Type a name to start one.".into()),
             // A newly linked device is sent no history: chats appear as messages arrive.
             (Some(Network::Signal), None) => ("icons/message-circle.svg", "No chats yet".into(), "New messages show up here as they arrive.".into()),
+            (Some(Network::Messages), None) => ("icons/message-circle.svg", "No chats yet".into(), "Texts show up here while your phone is online.".into()),
             _ => ("icons/message-circle.svg", "Nothing here yet".into(), String::new()),
         };
         empty_state(icon, &title, &detail).px(px(24.))

@@ -1,6 +1,6 @@
 # 08. Getting in and staying in
 
-Sign-in for four networks, first run, accounts, settings, sign-out, packaging. Researched
+Sign-in for the networks, first run, accounts, settings, sign-out, packaging. Researched
 2026-10-13. **[V]** = checked against a source this session (listed at the end). **[U]** = not
 verified; from memory or a single report, test before relying on it.
 
@@ -13,6 +13,7 @@ verified; from memory or a single report, test before relying on it.
 | Telegram | Native: QR code scanned from the phone, or phone number, code, optional 2FA password. No web page. | Yes. The only sanctioned one. | API terms welcome third-party clients; one `api_id` per app, registered by the owner, shipped in the binary [V]. |
 | Teams, personal account | Microsoft login page; client id `8ec6bc83-…`, tenant `consumers`, skype token from `teams.live.com/api/auth/v1.0/authz/consumer`. | Probably yes. | Constants from purple-teams `teams_login.c` [V]. Not run by us [U]. |
 | Teams, work or school | Microsoft login page, signing in as Teams' own client id `1fec8e78-…`, scope `api.spaces.skype.com`, skype token from `teams.microsoft.com/api/authsvc/v1.0/authz`, push over trouter. | **No.** Expected to work in tenants with default policy [U, not run by us]. Fails wherever the tenant requires a managed or compliant device, an approved app, or blocks the flow. The user cannot fix that; only their admin can. | purple-teams issues #28 (conditional access block, open since 2022) and #78 (AADSTS 53003, Apr 2026, 27 comments, fixed Jun 2026 by adding request headers and a browser user agent) [V]. Microsoft now ships a managed policy that blocks device-code flow [V]. |
+| Messages (Android) | Native QR. The phone scans it from Messages › Device pairing. No Google account in this app, and no phone number to type. | The pairing itself is what messages.google.com does [U, not run by us against a phone]. Google does not publish the protocol and can change it. The phone stays the account and has to stay online. | Field layout of the Bugle relay as published by third-party clients [V for the field numbers used in code]. A scripted phone covers the adapter. A real pair has not been run [U]. |
 
 ### Telegram, in detail
 

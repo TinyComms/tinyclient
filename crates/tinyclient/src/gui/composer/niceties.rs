@@ -59,7 +59,7 @@ pub fn broadcast(text: &str, network: Network) -> Option<Broadcast> {
     let words: &[(&str, Broadcast)] = match network {
         Network::Discord => &[("@everyone", Broadcast::All), ("@here", Broadcast::Here)],
         Network::Slack => &[("@channel", Broadcast::All), ("@everyone", Broadcast::All), ("@here", Broadcast::Here)],
-        Network::Telegram | Network::Teams | Network::Signal => &[],
+        Network::Telegram | Network::Teams | Network::Signal | Network::Messages => &[],
     };
     let found = |word: &str| {
         text.match_indices(word).any(|(at, _)| {

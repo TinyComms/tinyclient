@@ -1251,6 +1251,7 @@ impl Chat {
         let step = match network {
             Network::Telegram => adapters::telegram::signin::step(&self.hub, input, Box::new(adopt)),
             Network::Signal => adapters::signal::signin::step(&self.hub, input, Box::new(adopt)),
+            Network::Messages => adapters::messages::signin::step(&self.hub, input, Box::new(adopt)),
             _ => Err(format!("{} signs in in its own window.", network.label())),
         };
         match step {
@@ -1601,6 +1602,7 @@ impl Chat {
                 match network {
                     Network::Telegram => adapters::telegram::signin::cancel(),
                     Network::Signal => adapters::signal::signin::cancel(),
+                    Network::Messages => adapters::messages::signin::cancel(),
                     _ => {}
                 }
                 Response::Ok

@@ -30,9 +30,9 @@ pub const WINDOW_MIN: (f32, f32) = (540., 440.);
 /// Height of the strip that starts every region, level with the traffic lights.
 pub const TOP_BAR: f32 = 52.;
 /// Networks in the order the rail and first launch list them.
-pub const NETWORK_ORDER: [Network; 5] = [Network::Discord, Network::Slack, Network::Telegram, Network::Teams, Network::Signal];
+pub const NETWORK_ORDER: [Network; 6] = [Network::Discord, Network::Slack, Network::Telegram, Network::Teams, Network::Signal, Network::Messages];
 /// The networks tinyclient signs in to today. The others are shown as coming later.
-pub const AVAILABLE: [Network; 5] = NETWORK_ORDER;
+pub const AVAILABLE: [Network; 6] = NETWORK_ORDER;
 
 /// Lets a strip of chrome move the window, as a title bar would.
 pub fn drags_window(strip: Div) -> Div {
@@ -463,6 +463,7 @@ impl Shell {
                 (_, _, Network::Telegram) => "Scan a code with your phone, or use your number".into(),
                 (_, _, Network::Teams) => "Work and school accounts; calls open in Teams".into(),
                 (_, _, Network::Signal) => "Link this computer from your phone; text for now".into(),
+                (_, _, Network::Messages) => "Pair from your Android phone. It has to stay online.".into(),
             };
             let failed = self.sign_in_failed.as_ref().filter(|(failed, _)| *failed == network);
             let action = match (available, waiting) {

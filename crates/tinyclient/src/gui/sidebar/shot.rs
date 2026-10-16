@@ -45,6 +45,7 @@ impl Shell {
             Some("telegram") => self.go(Mode::Network(Network::Telegram), cx),
             Some("teams") => self.go(Mode::Network(Network::Teams), cx),
             Some("signal") => self.go(Mode::Network(Network::Signal), cx),
+            Some("messages") => self.go(Mode::Network(Network::Messages), cx),
             _ => self.show_mode(cx),
         }
         if has("--friends") {

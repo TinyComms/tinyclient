@@ -18,6 +18,7 @@
 mod discord;
 pub mod net;
 mod script;
+pub mod messages;
 pub mod signal;
 pub(crate) mod slack;
 pub(crate) mod teams;
@@ -1111,6 +1112,7 @@ pub fn supported(network: Network) -> bool {
         Network::Slack | Network::Discord | Network::Teams => true,
         Network::Telegram => telegram::supported(),
         Network::Signal => signal::supported(),
+        Network::Messages => messages::supported(),
     }
 }
 
@@ -1128,6 +1130,7 @@ pub fn accounts(network: Network, session: &str) -> Result<Vec<Signed>, String> 
         Network::Telegram => telegram::accounts(session)?,
         Network::Teams => teams::accounts(session)?,
         Network::Signal => signal::accounts(session)?,
+        Network::Messages => messages::accounts(session)?,
     };
     match found.iter().find(|signed| !safe(&signed.account)) {
         Some(bad) => Err(format!("{}: unusable account id {:?}", network.label(), bad.account)),
@@ -1144,6 +1147,7 @@ pub fn without(network: Network, session: &str, account: &str) -> Option<String>
         Network::Telegram => telegram::without(session, account),
         Network::Teams => teams::without(session, account),
         Network::Signal => signal::without(session, account),
+        Network::Messages => messages::without(session, account),
     }
 }
 
@@ -1166,6 +1170,7 @@ pub fn start(account: AccountKey, session: &str, hub: Arc<Hub>) -> Result<Adapte
         Network::Telegram => telegram::start(ctx.clone(), session, inbox),
         Network::Teams => teams::start(ctx.clone(), session, inbox),
         Network::Signal => signal::start(ctx.clone(), session, inbox),
+        Network::Messages => messages::start(ctx.clone(), session, inbox),
     };
     if let Err(why) = started {
         ctx.link(Link::SignedOut);

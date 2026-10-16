@@ -697,6 +697,7 @@ fn uploads_to(network: Network, url: &str) -> bool {
         Network::Telegram => &[],
         // Encrypted before it leaves, by the adapter: nothing goes through this helper.
         Network::Signal => &[],
+        Network::Messages => &[],
     };
     hosts.iter().any(|name| super::fetch::under(&host, name))
 }
