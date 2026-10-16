@@ -59,6 +59,8 @@ impl Hosts {
             Network::Telegram => (&[], &[]),
             // Attachments are encrypted end to end: the adapter fetches and opens them itself.
             Network::Signal => (&[], &[]),
+            // Media is encrypted for the phone. The adapter fetches it itself, later.
+            Network::Messages => (&[], &[]),
         };
         if session.iter().any(|name| under(&host, name)) {
             Some(Trust::Session)

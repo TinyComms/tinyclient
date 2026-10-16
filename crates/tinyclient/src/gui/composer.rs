@@ -161,7 +161,7 @@ fn sends_typing(account: &protocol::AccountKey) -> bool {
 /// How often a network needs to hear that we are still typing for its line to stay up.
 fn typing_interval(network: Network) -> Duration {
     Duration::from_secs(match network {
-        Network::Discord | Network::Signal => 8,
+        Network::Discord | Network::Signal | Network::Messages => 8,
         Network::Teams => 6,
         Network::Slack | Network::Telegram => 4,
     })

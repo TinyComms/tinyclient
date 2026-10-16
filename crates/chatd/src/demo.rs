@@ -95,6 +95,7 @@ fn me_of(account: &AccountKey) -> &'static str {
         Network::Teams => teams::ME,
         Network::Discord => discord::ME,
         Network::Signal => signal::ME,
+        Network::Messages => "messages-me",
     }
 }
 
@@ -230,7 +231,7 @@ fn link_of(account: &AccountKey, id: &str) -> String {
         Network::Teams => format!("https://teams.microsoft.com/l/chat/0/0?users={id}"),
         Network::Discord => format!("discord://-/users/{id}"),
         // Signal opens a person only by their phone number or username, which are not ids.
-        Network::Signal => String::new(),
+        Network::Signal | Network::Messages => String::new(),
     }
 }
 

@@ -68,15 +68,18 @@ pub enum Network {
     Slack,
     Teams,
     Signal,
+    /// Android Messages: Google Messages on the phone, paired to this computer.
+    Messages,
 }
 
 impl Network {
-    pub const ALL: [Network; 5] = [
+    pub const ALL: [Network; 6] = [
         Network::Telegram,
         Network::Discord,
         Network::Slack,
         Network::Teams,
         Network::Signal,
+        Network::Messages,
     ];
 
     /// The label the shell shows on a row. The network is a label, never a different layout.
@@ -87,6 +90,7 @@ impl Network {
             Network::Slack => "Slack",
             Network::Teams => "Teams",
             Network::Signal => "Signal",
+            Network::Messages => "Messages",
         }
     }
 }

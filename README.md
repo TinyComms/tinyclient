@@ -4,7 +4,7 @@
 
 # tinyclient
 
-**One native app for Slack, Discord, Telegram, Teams and Signal. Small, local, and open source.**
+**One native app for Slack, Discord, Telegram, Teams, Signal and Messages. Small, local, and open source.**
 
 [![CI](https://github.com/itz4blitz/tinyclient/actions/workflows/ci.yml/badge.svg)](https://github.com/itz4blitz/tinyclient/actions/workflows/ci.yml)
 [![Latest release](https://img.shields.io/github/v/release/itz4blitz/tinyclient)](https://github.com/itz4blitz/tinyclient/releases/latest)
@@ -22,7 +22,7 @@
 ---
 
 tinyclient is a chat client written in Rust. It signs in to your Slack workspaces, Discord,
-Telegram, Microsoft Teams and Signal and shows them in one window with one design. It runs
+Telegram, Microsoft Teams, Signal and Android Messages and shows them in one window with one design. It runs
 entirely on your machine: it talks to each network directly, there is no tinyclient server,
 and nothing is sent anywhere else. It is built for macOS, Linux and Windows.
 
@@ -75,10 +75,11 @@ below is a place to help.
 | **Teams** | Microsoft's sign-in page. Work and school accounts only. | Teams, channels, chats, reply chains as threads, presence | Text, files (through OneDrive), reactions, edit, delete, mute | Calls and meetings open in Teams |
 | **Telegram** | QR code from your phone, or phone number and code; 2FA password | Chats, folders, topics, photos, pins | Text, files, reactions, edit, delete, mute, leave | Calls open in Telegram |
 | **Signal** | Linked as a device: scan a QR code from your phone | Direct and group chats, replies, mentions, reactions, edits, deletes. Photos and files appear as a labelled line, not shown. Nothing from before the link. | Text, replies, reactions, edit and delete your own | Not built |
+| **Messages** | Paired from the Android phone, the way messages.google.com is. The phone stays the account and has to stay online. | Texts in the chats the phone already has. Photos and files appear as a labelled line, not shown. | Text. Reactions are not in this version. | Opens in Messages |
 
 Not built yet: message search (the switcher finds conversations by title in the local cache),
 notifications and a dock badge, video and screen share, voice messages, Signal attachments and
-safety numbers, Teams personal accounts. Each is a place to help; see [Contributing](#contributing).
+safety numbers, Messages reactions and shown photos, Teams personal accounts. Each is a place to help; see [Contributing](#contributing).
 
 **Platforms.** CI builds and tests all three on every push (`.github/workflows/ci.yml`).
 Most development happens on macOS today, so Linux and Windows users who report and fix
@@ -205,7 +206,7 @@ flowchart LR
     mediad["mediad<br/>one call"]
     db[("chat.sqlite<br/>media/")]
     keys[("system<br/>credential store")]
-    nets(["Slack · Discord · Teams<br/>Telegram · Signal"])
+    nets(["Slack · Discord · Teams<br/>Telegram · Signal · Messages"])
     voice(["Discord voice"])
 
     shell <-->|"local socket<br/>length-prefixed JSON"| chatd
@@ -263,8 +264,8 @@ How to report a vulnerability, and what is in scope: [SECURITY.md](SECURITY.md).
 
 ## Networks and terms
 
-tinyclient is an independent project, not made or endorsed by Slack, Discord, Telegram, Microsoft
-or Signal. How each network treats third-party clients, so you can decide for yourself:
+tinyclient is an independent project, not made or endorsed by Slack, Discord, Telegram, Microsoft,
+Signal or Google. How each network treats third-party clients, so you can decide for yourself:
 
 - **Slack.** Signs in the way Slack's web app does and uses that session. Slack doesn't offer an
   API for full clients, so a change on Slack's side can break this until we catch up. Work
@@ -279,6 +280,10 @@ or Signal. How each network treats third-party clients, so you can decide for yo
   indicators are always sent.
 - **Signal.** Links as one more device, like Signal Desktop, using Signal's own libsignal through
   presage. It receives what arrives after it is linked, and signing out removes the device.
+- **Messages.** Pairs this computer to Google Messages on an Android phone, the same kind of
+  pairing messages.google.com uses. Google does not publish this protocol and can change it.
+  The phone is the account: it has to stay online, and a text is sent through it. This is not
+  iMessage, and it is not endorsed by Google.
 
 ## Contributing
 

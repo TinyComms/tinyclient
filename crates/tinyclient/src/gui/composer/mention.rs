@@ -55,7 +55,7 @@ pub fn wire(text: &str, tokens: &[Token], network: Network) -> String {
             // Slack takes the name as typed.
             (Network::Slack, Kind::Emoji) => out.push_str(&token.label),
             // No adapter yet says what these take, so the name goes as it reads.
-            (Network::Telegram | Network::Teams | Network::Signal, _) => out.push_str(&token.label),
+            (Network::Telegram | Network::Teams | Network::Signal | Network::Messages, _) => out.push_str(&token.label),
         }
         at = token.range.end;
     }

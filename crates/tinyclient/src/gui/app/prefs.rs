@@ -128,6 +128,7 @@ fn network_word(network: Network) -> &'static str {
         Network::Slack => "slack",
         Network::Teams => "teams",
         Network::Signal => "signal",
+        Network::Messages => "messages",
     }
 }
 

@@ -112,7 +112,7 @@ fn holder(cx: &mut App) -> Entity<Sheet> {
 /// Opens the sheet for a network that signs in here. `false` for one that signs in through its
 /// own web page, so the caller goes on to the helper window.
 pub fn open(network: Network, cx: &mut Context<Shell>) -> bool {
-    if !matches!(network, Network::Telegram | Network::Signal) {
+    if !matches!(network, Network::Telegram | Network::Signal | Network::Messages) {
         return false;
     }
     holder(cx).update(cx, |sheet, cx| sheet.open(network, cx));
@@ -292,7 +292,7 @@ impl Sheet {
             self.show_canned(canned, cx);
             return;
         }
-        let asked = std::env::var("TINYCLIENT_SIGNIN").ok().and_then(|word| [Network::Telegram, Network::Signal].into_iter().find(|n| n.label().eq_ignore_ascii_case(&word)));
+        let asked = std::env::var("TINYCLIENT_SIGNIN").ok().and_then(|word| [Network::Telegram, Network::Signal, Network::Messages].into_iter().find(|n| n.label().eq_ignore_ascii_case(&word)));
         if let Some(network) = asked {
             self.open(network, cx);
         }
@@ -684,14 +684,14 @@ impl Sheet {
             (None, Some((_, code))) => code_tile(code.clone()),
             (None, None) => quiet_tile().child(div().text_center().child(format!("Getting a code from {}", self.network.label()))),
         };
-        let signal = self.network == Network::Signal;
-        let steps = if signal {
-            ["Open Signal on your phone.", "Go to Settings > Linked devices > Link new device.", "Point the phone at this code."]
-        } else {
-            ["Open Telegram on your phone.", "Go to Settings > Devices > Link Desktop Device.", "Point the phone at this code."]
+        let phone_only = matches!(self.network, Network::Signal | Network::Messages);
+        let steps = match self.network {
+            Network::Signal => ["Open Signal on your phone.", "Go to Settings > Linked devices > Link new device.", "Point the phone at this code."],
+            Network::Messages => ["Open Messages on your Android phone.", "Go to Settings > Device pairing > QR code scanner.", "Point the phone at this code."],
+            _ => ["Open Telegram on your phone.", "Go to Settings > Devices > Link Desktop Device.", "Point the phone at this code."],
         };
-        // Signal links a computer only from the phone: there is no other way in to offer.
-        let other_way = (!signal).then(|| self.answer_link("signin-use-phone", "Use a phone number instead", || SignInInput::UsePhone, cx));
+        // Signal and Messages link a computer only from the phone: there is no other way in to offer.
+        let other_way = (!phone_only).then(|| self.answer_link("signin-use-phone", "Use a phone number instead", || SignInInput::UsePhone, cx));
         div()
             .flex()
             .flex_col()
@@ -873,6 +873,7 @@ impl Sheet {
     fn title(&self) -> &'static str {
         match self.network {
             Network::Signal => "Sign in to Signal",
+            Network::Messages => "Sign in to Messages",
             _ => "Sign in to Telegram",
         }
     }

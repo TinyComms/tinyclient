@@ -97,7 +97,7 @@ impl Demo {
             Network::Teams => format!("19:{}_robin@unq.gbl.spaces", number.parse::<u32>().unwrap_or(0)),
             Network::Discord => format!("500000000000000{number}"),
             // A Signal chat with a person is named by the person.
-            Network::Signal => person_id.to_owned(),
+            Network::Signal | Network::Messages => person_id.to_owned(),
         }
     }
 
@@ -330,7 +330,7 @@ impl Demo {
                 }
             }
             // Signal tells a linked device nothing more about a person.
-            Network::Signal => {}
+            Network::Signal | Network::Messages => {}
         }
         about
     }
@@ -604,6 +604,7 @@ impl Demo {
             Network::Slack => crate::adapters::slack::reaction_rules(),
             Network::Teams => crate::adapters::teams::message::reaction_rules(),
             Network::Signal => crate::adapters::signal::reaction_rules(),
+            Network::Messages => crate::adapters::messages::reaction_rules(),
         }
     }
 
@@ -672,6 +673,7 @@ impl Demo {
                 let account = &demo.ctx.account.account;
                 let link = match demo.ctx.account.network {
                     Network::Slack => format!("https://app.slack.com/huddle/{account}/{conversation_id}"),
+                    Network::Messages => "https://messages.google.com/web/".to_owned(),
                     _ => format!("https://discord.com/channels/@me/{conversation_id}"),
                 };
                 let _ = reply.send(Ok(link));

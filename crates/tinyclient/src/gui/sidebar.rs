@@ -1398,6 +1398,7 @@ fn network_app(network: Network) -> &'static str {
         Network::Teams => "https://teams.microsoft.com/",
         // Signal has no web app: what only it can do is done on the phone.
         Network::Signal => "https://signal.org/download/",
+        Network::Messages => "https://messages.google.com/web/",
     }
 }
 
