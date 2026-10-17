@@ -8,7 +8,10 @@ use super::people::presence;
 use super::sidebar::Mode;
 use super::state::{Shell, Snapshot};
 use super::theme;
-use gpui::{div, prelude::*, px, AnyElement, Context, Div, ElementId, SharedString, Stateful, Window};
+use gpui::{
+    div, prelude::*, px, AnyElement, Context, Div, ElementId, MouseButton, SharedString, Stateful,
+    Window,
+};
 use protocol::{Link, Network};
 
 /// What a rail button's tooltip says after its name.
@@ -224,11 +227,51 @@ impl Shell {
                             crate::update::Shown::Available { .. } => ("Update available", true),
                             _ => ("You", false),
                         };
-                        div().relative().child(chrome("rail-me", Menu::Own, words).child(mine)).when(waiting, |row| {
-                            row.child(div().absolute().top(px(4.)).right(px(4.)).size(px(6.)).rounded(px(3.)).bg(theme::accent()))
-                        })
+                        div()
+                            .relative()
+                            .child(chrome("rail-me", Menu::Own, words).child(mine))
+                            .when(waiting, |row| {
+                                row.child(
+                                    div()
+                                        .absolute()
+                                        .top(px(4.))
+                                        .right(px(4.))
+                                        .size(px(6.))
+                                        .rounded(px(3.))
+                                        .bg(theme::accent()),
+                                )
+                            })
+                            .child(self.settings_cog(cx))
                     }),
             )
+    }
+
+    /// Settings sits on the avatar so it is reachable without the macOS menu bar.
+    fn settings_cog(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        div()
+            .id("rail-settings")
+            .absolute()
+            .bottom(px(1.))
+            .left(px(1.))
+            .size(px(20.))
+            .rounded(px(10.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .occlude()
+            .cursor_pointer()
+            .bg(theme::overlay())
+            .border_2()
+            .border_color(theme::rail())
+            .hover(|style| style.bg(theme::hover()))
+            .tooltip(tip("Settings", Some("⌘,")))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.close_menu(cx);
+                super::settings::open(super::settings::Section::last(), cx);
+            }))
+            .child(glyph("icons/settings.svg", 12., theme::text()))
     }
 }
 
