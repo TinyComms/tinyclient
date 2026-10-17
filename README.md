@@ -140,6 +140,68 @@ itself. Start `tinyclient`; it starts `chatd` when nothing answers on the socket
   first run (More info > Run anyway). The sign-in window needs WebView2, which current Windows
   includes.
 
+## Optional systemd user service on Linux
+
+The `.deb`, `.rpm` and Arch package can install `tinyclient-chatd.service`. It is
+**disabled by default**. With the unit disabled, tinyclient starts its own daemon,
+logs to `chatd.log` and stops the daemon when the application quits.
+
+To let systemd manage the daemon, quit tinyclient first so its existing daemon
+releases the socket. Then, from a terminal in your graphical session:
+
+```sh
+systemctl --user daemon-reload
+systemctl --user import-environment WAYLAND_DISPLAY DISPLAY XDG_CURRENT_DESKTOP
+systemctl --user enable --now tinyclient-chatd.service
+journalctl --user -u tinyclient-chatd.service -f
+```
+
+Import only the variables your session actually sets (Wayland normally sets
+`WAYLAND_DISPLAY`; X11 sets `DISPLAY`). If you use `XDG_DATA_HOME`, import that too
+so the GUI and daemon use the same data directory. Your Secret Service provider
+must be running and unlocked on the same user session bus.
+
+When the unit is enabled, opening tinyclient asks systemd to start the daemon if
+needed. Quitting the GUI leaves the daemon receiving messages; the window's
+“Keep receiving” preference does not override the enabled service. Failed starts
+are reported without spawning a second, unmanaged daemon. Use
+`systemctl --user restart tinyclient-chatd.service` after upgrading the binaries.
+To stop background activity, quit the GUI and run
+`systemctl --user stop tinyclient-chatd.service`.
+
+The unit follows `graphical-session.target`. Desktops that manage that target
+start and stop it with the graphical session. With dwl or another standalone
+compositor, import the display environment after the compositor starts, then
+start the service; stop it when leaving the session. Repeat the environment
+import on each login so sign-in helpers use the current display. Do not enable
+lingering just for this service: sign-in windows need a live graphical session.
+
+To return to automatic daemon startup, quit the GUI and run:
+
+```sh
+systemctl --user disable --now tinyclient-chatd.service
+```
+
+
+The managed daemon inherits the user manager's environment, not the GUI's.
+For sign-in diagnostics, import `TINYCLIENT_LOGIN_DEBUG=1` into the manager and
+restart the service, then reproduce sign-in while watching its journal:
+
+```sh
+TINYCLIENT_LOGIN_DEBUG=1 systemctl --user import-environment TINYCLIENT_LOGIN_DEBUG
+systemctl --user restart tinyclient-chatd.service
+# After diagnosing:
+systemctl --user unset-environment TINYCLIENT_LOGIN_DEBUG
+systemctl --user restart tinyclient-chatd.service
+```
+
+Scratch runs (`TINYCLIENT_DIR`) and explicit `TINYCLIENT_CHATD` overrides always
+use direct startup. For source builds or archive installations, copy
+`packaging/linux/tinyclient-chatd.service` into `~/.config/systemd/user/`, change
+`ExecStart` to the absolute path of your installed `chatd`, and reload the user
+manager before enabling it. Keep the four executables together. AppImage users
+should use automatic daemon startup.
+
 ## Build from source
 
 Prerequisites:

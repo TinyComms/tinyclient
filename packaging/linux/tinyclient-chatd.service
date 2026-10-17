@@ -1,0 +1,18 @@
+[Unit]
+Description=tinyclient background chat service
+Documentation=https://github.com/itz4blitz/tinyclient
+PartOf=graphical-session.target
+After=graphical-session-pre.target
+StartLimitIntervalSec=30
+StartLimitBurst=3
+
+[Service]
+Type=exec
+ExecStart=/usr/lib/tinyclient/chatd
+Restart=on-failure
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=graphical-session.target

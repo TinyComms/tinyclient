@@ -93,7 +93,8 @@ Notifications scrolled to that account's row. No settings of its own.
 | G4 | Install updates automatically | Switch | On | G | s | On: a newer GitHub release is downloaded while the window is open and replaces this copy on quit. Off: the notice still appears and nothing is downloaded until asked | v1 |
 
 Caption under G2, from 08 §6: "Closing the window leaves tinyclient running. Quit with ⌘Q to
-stop it." ⌘Q stops chatd and the window in every case; that is a defect fix, not a setting.
+stop it." ⌘Q stops chatd and the window unless the optional Linux systemd user
+service is enabled; in that mode systemd owns the daemon's lifetime (see below).
 
 ### Notifications
 
@@ -574,3 +575,11 @@ Accent colours, fonts, per-network colours, a keybinding editor, in-app banner s
 volume, an in-app Reduce Motion, toggles for echo cancellation or gain, hardware acceleration,
 "experimental" options, language, cache location, notification rules editors beyond the levels
 above, a settings sync service.
+
+### Optional Linux service management
+
+When `tinyclient-chatd.service` is enabled in the systemd user manager, systemd
+owns the daemon's lifetime. Quitting the GUI leaves chatd running independently
+of the Keep receiving preference. Stop it with `systemctl --user stop
+tinyclient-chatd.service` after quitting the GUI. Disabled units retain the
+application-managed lifetime. See the README for setup and journal commands.
