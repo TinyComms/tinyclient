@@ -190,6 +190,27 @@ removing a file (Discord) and replacing a photo (Telegram) are P2.
   and stops under `reduce_motion()`. Played only if width × height × 4 × frames ≤ 8 MB, else it stays still; dropped
   on leave. Telegram's saved GIFs are MP4 and the shell has no video decoder: stills only in v1.
 
+
+### Wikipedia URL-only preview fallback
+
+When a network supplies a preview containing only a Wikipedia article URL, the
+conversation shows the decoded article title and Wikipedia label immediately.
+With automatic image and preview loading enabled, the GUI fetches a short plain
+text extract from the public Wikipedia summary API off the UI thread. Existing
+previews with text or an image are retained. This fallback does not create cards
+for links whose previews the sender suppressed, and does not fetch arbitrary
+websites. Article images are still supplied by the network, not this fallback.
+
+HTTPS desktop and mobile article links retain their Wikipedia language. Query
+strings and fragments are omitted from API requests; special namespaces are
+excluded. Requests send no chat credentials or cookies, do not follow redirects,
+and have an eight-second timeout and 256 KiB response limit. Each conversation
+pane holds at most 128 results and two requests at once; failed requests are
+retried on a later redraw after a minute. Offline or with automatic loading off,
+the local article title remains useful. Summary text is bounded, and rows are
+remeasured while preserving the reading position when it arrives.
+
+
 ## Deliberately absent
 
 Disabled or locked controls and upsells. A formatting bar. Uploading at staging. Locking the composer during upload.
