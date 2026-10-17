@@ -5,7 +5,7 @@
 //! mixed, so the list is a GPUI `list` whose heights are known from each item's kind.
 
 use protocol::{Badge, Conversation, Folder, Key, Network, Space, Special};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 /// Discord DMs before "Show n more" (product rulings: 10).
@@ -118,6 +118,24 @@ pub struct Home {
 }
 
 impl Home {
+    /// Save the outgoing home and restore the destination without waiting for chatd.
+    pub fn switch_network(&mut self, network: Option<Network>, saved: &mut HashMap<Network, Home>) {
+        if self.network == network {
+            return;
+        }
+        let mut outgoing = std::mem::take(self);
+        // An answer started before leaving must never overwrite a restored home.
+        outgoing.epoch += 1;
+        outgoing.loaded = outgoing.loaded_once;
+        outgoing.drilled.clear();
+        if let Some(previous) = outgoing.network {
+            saved.insert(previous, outgoing);
+        }
+        *self = network
+            .map(|n| saved.remove(&n).unwrap_or_else(|| Home::for_network(n)))
+            .unwrap_or_default();
+    }
+
     pub fn for_network(network: Network) -> Home {
         Home { network: Some(network), ..Home::default() }
     }
@@ -365,6 +383,45 @@ mod tests {
                 Item::Folder { name, open, lit, .. } => format!("{}{name}{}", if *open { "v" } else { ">" }, if *lit { "*" } else { "" }),
             })
             .collect()
+    }
+
+    #[test]
+    fn switching_networks_restores_chats_and_folds_without_a_read() {
+        let mut saved = HashMap::new();
+        let mut home = Home {
+            loaded: true,
+            loaded_once: true,
+            chats: vec![chat("club", 0)],
+            chats_all: true,
+            epoch: 7,
+            ..Home::for_network(Network::Signal)
+        };
+        home.switch_network(Some(Network::Discord), &mut saved);
+        assert!(!home.loaded);
+        home.switch_network(None, &mut saved);
+        home.switch_network(Some(Network::Signal), &mut saved);
+        assert!(home.loaded && home.loaded_once && home.chats_all);
+        assert_eq!(home.chats[0].key.id, "club");
+        assert_ne!(home.epoch, 7, "a pre-navigation read must be stale");
+        assert_eq!(shape(&signal(&home), &[]), ["club"]);
+    }
+
+    #[test]
+    fn leaving_a_sublist_restores_the_completed_home_loading_state() {
+        let mut saved = HashMap::new();
+        let mut home = Home {
+            loaded_once: true,
+            loaded: false,
+            drilled: vec![chat("request", 0)],
+            ..Home::for_network(Network::Discord)
+        };
+        home.switch_network(Some(Network::Signal), &mut saved);
+        home.switch_network(Some(Network::Discord), &mut saved);
+        assert!(home.loaded);
+        assert!(home.drilled.is_empty());
+        let epoch = home.epoch;
+        home.switch_network(Some(Network::Discord), &mut saved);
+        assert_eq!(home.epoch, epoch);
     }
 
     #[test]
