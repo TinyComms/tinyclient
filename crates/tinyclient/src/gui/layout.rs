@@ -607,7 +607,7 @@ impl Shell {
             }
             Menu::Own => {
                 let content = self.slots.own_menu.and_then(|draw| draw(self, window, cx));
-                let content = content.unwrap_or_else(|| self.accounts_menu(snapshot).into_any_element());
+                let content = content.unwrap_or_else(|| self.accounts_menu(snapshot, cx).into_any_element());
                 let content = fade_in("menu-own", 120, popover().p(px(4.)).child(content));
                 placed("menu-own-at", Place::Beside(rail_button(8.)), Layer::Popover, window, content)
             }
@@ -750,7 +750,7 @@ impl Shell {
     }
 
     /// What the own-avatar popover shows until the people slice fills it: who is signed in.
-    fn accounts_menu(&self, snapshot: &Snapshot) -> Div {
+    fn accounts_menu(&self, snapshot: &Snapshot, cx: &mut Context<Self>) -> Div {
         let mut list = div().w(px(240.)).flex().flex_col().child(menu_label("Signed in"));
         for account in &snapshot.accounts {
             let word = match account.link {
@@ -769,7 +769,13 @@ impl Shell {
                     .children(word.map(|word| div().type_small().text_color(theme::text_soft()).child(word))),
             );
         }
-        list
+        list.child(menu_separator()).child(
+            menu_item("own-settings", Some("icons/settings.svg"), "Settings…", Some("⌘,"))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.close_menu(cx);
+                    super::settings::open(super::settings::Section::last(), cx);
+                })),
+        )
     }
 }
 

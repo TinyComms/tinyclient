@@ -4,7 +4,9 @@
 
 use super::presence::{self, Shape};
 use super::{only_draws, Hub, Own, Scene};
-use crate::gui::components::{field, glyph, menu_label, network_icon, Avatar};
+use crate::gui::components::{
+    field, glyph, menu_item, menu_label, menu_separator, network_icon, Avatar,
+};
 use crate::gui::input::{InputEvent, InputKey, TextInput};
 use crate::gui::state::Shell;
 use crate::gui::theme::{self, Type};
@@ -340,6 +342,19 @@ impl Render for StatusMenu {
         list.children(self.refused.clone().map(|words| {
             div().px(px(8.)).pt(px(4.)).pb(px(4.)).type_small().text_color(theme::danger()).child(words)
         }))
+        .child(menu_separator())
+        .child(
+            menu_item(
+                "own-settings",
+                Some("icons/settings.svg"),
+                "Settings…",
+                Some("⌘,"),
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                let _ = this.shell.update(cx, |shell, cx| shell.close_menu(cx));
+                crate::gui::settings::open(crate::gui::settings::Section::last(), cx);
+            })),
+        )
     }
 }
 
