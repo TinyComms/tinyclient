@@ -1,17 +1,18 @@
 # tinyclient
 
-> A tiny, private, open-source desktop chat client for Slack, Discord, Telegram, Microsoft Teams, and Signal. Native. No tinyclient servers, no tinyclient accounts, no telemetry.
+> A tiny, private, open-source desktop chat client for Slack, Discord, Telegram, Microsoft Teams, Signal, and Android Messages. Native. No tinyclient servers, no tinyclient accounts, no telemetry.
 
 tinyclient runs on the person's computer. chatd keeps messages on disk and sessions in the OS keychain, and connects directly to each network. There is no remote tinyclient API and nothing to authenticate against on tinyclient.io.
 
 ## Docs
 
 - [Getting started](https://tinyclient.io/docs/): install on macOS, Linux, or Windows, sign in, and see where data is kept
+- [Using tinyclient](https://tinyclient.io/docs/using.html): shortcuts, updates, and the optional Linux systemd service
 - [Build from source](https://tinyclient.io/docs/build.html): prerequisites and cargo commands
 - [Architecture](https://tinyclient.io/docs/architecture.html): chatd, the window, mediad, and the sign-in helper
 - [Size and performance](https://tinyclient.io/docs/performance.html): disk and memory next to the official apps, and how each number was measured
 - [Privacy and security](https://tinyclient.io/docs/privacy.html): what is stored, which connections are made, and what the app never does
-- [Networks and terms](https://tinyclient.io/docs/networks.html): what each network supports and how it treats third-party clients
+- [Networks and terms](https://tinyclient.io/docs/networks.html): Slack, Discord, Telegram, Teams, Signal, and Messages, including what is not built yet
 - [Contributing](https://tinyclient.io/docs/contributing.html): roadmap and the rules every change keeps
 
 ## Downloads

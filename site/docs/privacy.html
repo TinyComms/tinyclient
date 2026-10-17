@@ -38,6 +38,7 @@
       <h2>Documentation</h2>
       <ul>
           <li><a href="index.html">Getting started</a></li>
+          <li><a href="using.html">Using tinyclient</a></li>
           <li><a href="build.html">Build from source</a></li>
           <li><a href="architecture.html">Architecture</a></li>
           <li><a href="performance.html">Size &amp; performance</a></li>
@@ -81,11 +82,12 @@
 
     <h2 id="connections">Connections it makes</h2>
     <ul>
-      <li><strong>To the networks you sign in to, and nothing else.</strong> No update check, no analytics, no crash upload, no font or asset download.</li>
+      <li><strong>To the networks you sign in to.</strong> No analytics, no crash upload, no font or asset download.</li>
+      <li><strong>One update check.</strong> About once an hour, while the window is open, it asks GitHub&rsquo;s public releases API whether a newer release exists. The request sends only <code>User-Agent: tinyclient/&lt;version&gt;</code>. With automatic install on, the new archive is downloaded from that GitHub release, checked against <code>SHA256SUMS</code>, and replaces this copy when you quit. <a href="using.html#updates">Details</a>.</li>
       <li><strong>Media</strong> is fetched only from an allow-list of each network&rsquo;s own hosts, and a session&rsquo;s credentials are only sent to the hosts that need them. Discord&rsquo;s GIF stills come from <code>media.tenor.com</code>, because Discord&rsquo;s own GIF search returns them there. The list is in <a href="https://github.com/itz4blitz/tinyclient/blob/main/crates/chatd/src/blobs/fetch.rs"><code>blobs/fetch.rs</code></a>.</li>
       <li><strong>Links</strong> in messages are never fetched. Link previews are the ones the network itself sends.</li>
       <li><strong>Sign-in</strong> shows the network&rsquo;s own page in a separate window. That page loads what the network&rsquo;s page loads.</li>
-      <li><strong>Calls</strong> connect <code>mediad</code> directly to Discord&rsquo;s voice servers.</li>
+      <li><strong>Calls</strong> connect <code>mediad</code> directly to Discord&rsquo;s voice servers. Messages texts go through the paired Android phone, the same way <code>messages.google.com</code> does. The phone has to stay online.</li>
     </ul>
 
     <h2 id="never">What it never does</h2>
@@ -125,7 +127,7 @@
 <footer class="site-footer">
   <div class="wrap">
     <div class="fine">
-      <p>tinyclient is open source under the MIT license; a <code>chatd</code> built with Signal support is a combined work under the AGPL-3.0. Not affiliated with Slack, Discord, Telegram, Microsoft or Signal; network icons from <a href="https://github.com/homarr-labs/dashboard-icons">Dashboard Icons</a> (Apache-2.0).</p>
+      <p>tinyclient is open source under the MIT license; a <code>chatd</code> built with Signal support is a combined work under the AGPL-3.0. Not affiliated with Slack, Discord, Telegram, Microsoft, Signal or Google; network icons from <a href="https://github.com/homarr-labs/dashboard-icons">Dashboard Icons</a> (Apache-2.0).</p>
       <p>This website sets no cookies, runs no analytics and loads nothing from any other site. Cloudflare Pages hosts it and can see your request the way any web server can.</p>
     </div>
   </div>

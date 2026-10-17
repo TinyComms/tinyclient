@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self'; style-src 'self'; script-src 'self'; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<title>Using tinyclient · tinyclient docs</title>
+<meta name="description" content="How the tinyclient window works: shortcuts, updates, and keeping chatd running on Linux.">
+<meta name="robots" content="index, follow">
+<link rel="canonical" href="https://tinyclient.io/docs/using.html">
+<link rel="ai-catalog" href="/.well-known/ai-catalog.json">
+<meta name="color-scheme" content="dark light">
+<meta name="theme-color" content="#121315" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<link rel="icon" href="../favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="../style.css">
+<script src="../site.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../" aria-label="tinyclient home"><img src="../favicon.svg" alt="" width="28" height="28">tinyclient</a>
+    <nav class="site-nav" aria-label="Site">
+      <a href="./" aria-current="page">Docs</a>
+      <a class="hide-sm" href="privacy.html">Privacy</a>
+      <a class="dc" href="https://discord.gg/kJHK7BNvJP" aria-label="Discord"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20.317 4.37a19.791 19.791 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028 14.09 14.09 0 0 0 1.226-1.994.076.076 0 0 0-.041-.106 13.107 13.107 0 0 1-1.872-.892.077.077 0 0 1-.008-.128 10.2 10.2 0 0 0 .372-.292.074.074 0 0 1 .077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 0 1 .078.01c.12.098.246.198.373.292a.077.077 0 0 1-.006.127 12.299 12.299 0 0 1-1.873.892.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.839 19.839 0 0 0 6.002-3.03.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.03zM8.02 15.33c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42.019 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42.019 1.333-.946 2.418-2.157 2.418z"/></svg><span class="nav-label">Discord</span></a>
+      <a class="gh" href="https://github.com/itz4blitz/tinyclient"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap docs">
+  <nav class="docs-nav" aria-label="Documentation">
+    <div class="docs-nav-inner">
+      <h2>Documentation</h2>
+      <ul>
+          <li><a href="index.html">Getting started</a></li>
+          <li><a href="using.html" aria-current="page">Using tinyclient</a></li>
+          <li><a href="build.html">Build from source</a></li>
+          <li><a href="architecture.html">Architecture</a></li>
+          <li><a href="performance.html">Size &amp; performance</a></li>
+          <li><a href="privacy.html">Privacy &amp; security</a></li>
+          <li><a href="networks.html">Networks &amp; terms</a></li>
+          <li><a href="contributing.html">Contributing</a></li>
+      </ul>
+      <h2 class="ext">On GitHub</h2>
+      <ul class="ext">
+          <li><a href="https://github.com/itz4blitz/tinyclient/releases">Releases</a></li>
+          <li><a href="https://github.com/itz4blitz/tinyclient/blob/main/SECURITY.md">Security policy</a></li>
+          <li><a href="https://github.com/itz4blitz/tinyclient/tree/main/docs">Design documents</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <main id="main" class="prose">
+    <h1>Using tinyclient</h1>
+    <p class="lede">One window for every network you sign in to. What each network can do is on <a href="networks.html">Networks &amp; terms</a>.</p>
+
+    <h2 id="window">The window</h2>
+    <p>You start <code>tinyclient</code>. It starts <code>chatd</code> when nothing is already listening on the local socket. <code>chatd</code> holds the connections and the cache. The window only draws what <code>chatd</code> reports.</p>
+    <ul>
+      <li>The inbox is one list across Slack, Discord, Telegram, Teams, Signal and Messages.</li>
+      <li>A network&rsquo;s own sidebar is there too: servers, workspaces, folders, teams.</li>
+      <li><strong>Quick Switcher</strong> finds a conversation, a person or a server in the local cache. It does not search message text. <code>tinyclient --text --search</code> does: it prints the newest cached hits, each with where it is. The window does not open those hits yet, and the networks themselves are not searched.</li>
+      <li>A conversation is marked read only when the window is active, that conversation is open, and the message is on screen.</li>
+      <li>What is not built yet opens in the official app, on that item. The list is on <a href="networks.html#gaps">Networks</a>.</li>
+    </ul>
+    <p><code>tinyclient --text</code> prints account status and the inbox as lines of text, then exits. An interactive terminal is not built. The socket protocol is the API for one.</p>
+
+    <h2 id="shortcuts">Keyboard shortcuts</h2>
+    <p>Menus, tooltips and Settings &rsaquo; Keyboard Shortcuts show the keys for your system. On Linux, Super stays with the desktop. The same chord is Command on macOS and Ctrl on Linux and Windows. Option becomes Alt. Control+Command becomes Ctrl+Alt, so full screen is Control+Command+F on macOS and Ctrl+Alt+F elsewhere. Shift stays Shift.</p>
+    <div class="table-wrap" tabindex="0" role="region" aria-label="Keyboard shortcuts">
+      <table>
+        <thead><tr><th scope="col">Menu</th><th scope="col">Command</th><th scope="col">macOS</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">tinyclient</th><td>Settings&hellip;</td><td>Command+,</td></tr>
+          <tr><th scope="row">tinyclient</th><td>Hide tinyclient</td><td>Command+H</td></tr>
+          <tr><th scope="row">tinyclient</th><td>Hide Others</td><td>Option+Command+H</td></tr>
+          <tr><th scope="row">tinyclient</th><td>Quit</td><td>Command+Q</td></tr>
+          <tr><th scope="row">File</th><td>New Message</td><td>Command+N</td></tr>
+          <tr><th scope="row">File</th><td>Attach File&hellip;</td><td>Command+U</td></tr>
+          <tr><th scope="row">File</th><td>Close Window</td><td>Command+W</td></tr>
+          <tr><th scope="row">Edit</th><td>Undo / Redo</td><td>Command+Z / Shift+Command+Z</td></tr>
+          <tr><th scope="row">Edit</th><td>Cut, Copy, Paste, Select All</td><td>Command+X, C, V, A</td></tr>
+          <tr><th scope="row">View</th><td>Inbox / People</td><td>Command+1 / Command+2</td></tr>
+          <tr><th scope="row">View</th><td>Quick Switcher</td><td>Command+K</td></tr>
+          <tr><th scope="row">View</th><td>Hide Sidebar / Close Right Pane</td><td>Command+\ / Command+.</td></tr>
+          <tr><th scope="row">View</th><td>Bigger, smaller, actual size</td><td>Command++, Command+−, Command+0</td></tr>
+          <tr><th scope="row">View</th><td>Enter Full Screen</td><td>Control+Command+F</td></tr>
+          <tr><th scope="row">Conversation</th><td>Back / Forward / Up a Level</td><td>Command+[ / Command+] / Command+Up</td></tr>
+          <tr><th scope="row">Conversation</th><td>Next / Previous</td><td>Option+Down / Option+Up</td></tr>
+          <tr><th scope="row">Conversation</th><td>Next unread / Previous unread</td><td>Option+Shift+Down / Option+Shift+Up</td></tr>
+          <tr><th scope="row">Conversation</th><td>Mark as Read</td><td>Shift+Esc</td></tr>
+          <tr><th scope="row">Conversation</th><td>Show Details / Start Call / Open in App</td><td>Option+Command+I / Shift+Command+C / Option+Command+O</td></tr>
+          <tr><th scope="row">Window</th><td>Minimize</td><td>Command+M</td></tr>
+          <tr><th scope="row">Help</th><td>Keyboard Shortcuts</td><td>Command+/</td></tr>
+          <tr><th scope="row">Calls</th><td>Mute, deafen, leave</td><td>Shift+Command+M, D, H</td></tr>
+          <tr><th scope="row">Calls</th><td>Accept, decline, go to the call</td><td>Shift+Command+A, R, J</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>Text fields use the platform&rsquo;s own editing keys. On Linux and Windows that is Ctrl+C, V, X, A and Z, Ctrl+Left and Ctrl+Right to move by word, and Home and End inside the line. The optional send shortcut is Command+Return on macOS and Ctrl+Enter elsewhere.</p>
+
+    <h2 id="updates">Updates</h2>
+    <p>While the window is open it asks GitHub, about once an hour and again shortly after launch, whether a newer release exists. The request is <code>User-Agent: tinyclient/&lt;version&gt;</code> and nothing else: no account, no machine id.</p>
+    <p>A newer release is shown until you dismiss it. <strong>Check for Updates&hellip;</strong> asks again. With automatic install on, and only for an installed copy (not a build under <code>target/</code>), the archive is downloaded, checked against that release&rsquo;s <code>SHA256SUMS</code>, and on macOS checked with <code>codesign</code> before it is kept. It replaces this copy when you quit. The menu then says <strong>Restart to Update</strong>. A failure is remembered for a day and said only in About.</p>
+
+    <h2 id="systemd">Linux: leave chatd running</h2>
+    <p>By default, quitting the window stops the daemon it started. Logs go to <code>chatd.log</code>.</p>
+    <p>The <code>.deb</code>, <code>.rpm</code> and Arch package can install <code>tinyclient-chatd.service</code>. The unit is disabled. With it disabled, nothing about startup changes.</p>
+    <p>To let systemd manage the daemon, quit tinyclient first so its daemon releases the socket. From a terminal in your graphical session:</p>
+<div class="code"><pre><code>systemctl --user daemon-reload
+systemctl --user import-environment WAYLAND_DISPLAY DISPLAY XDG_CURRENT_DESKTOP
+systemctl --user enable --now tinyclient-chatd.service
+journalctl --user -u tinyclient-chatd.service -f</code></pre></div>
+    <ul>
+      <li>Import only the variables your session sets. Wayland sets <code>WAYLAND_DISPLAY</code>; X11 sets <code>DISPLAY</code>. If you use <code>XDG_DATA_HOME</code>, import that too, so the window and the daemon share a data directory.</li>
+      <li>The Secret Service has to be running and unlocked on the same user session bus.</li>
+      <li>With the unit enabled, opening tinyclient asks systemd to start the daemon if needed. Quitting the window leaves the daemon receiving. The window&rsquo;s &ldquo;Keep receiving&rdquo; preference does not override an enabled service.</li>
+      <li>After an upgrade: <code>systemctl --user restart tinyclient-chatd.service</code>.</li>
+      <li>To stop background activity, quit the window and run <code>systemctl --user stop tinyclient-chatd.service</code>.</li>
+      <li>The unit follows <code>graphical-session.target</code>. With a standalone compositor such as dwl, import the display environment after the compositor starts, then start the service, and stop it when you leave the session. Do not enable lingering for this service: sign-in windows need a live graphical session.</li>
+    </ul>
+    <p>To go back to automatic startup, quit the window and run <code>systemctl --user disable --now tinyclient-chatd.service</code>.</p>
+    <p>For sign-in diagnostics, import <code>TINYCLIENT_LOGIN_DEBUG=1</code> into the user manager, restart the service, and watch the journal. Unset it when you are done. The messages name whether the helper is waiting on a login page. They do not include credentials.</p>
+    <p>A scratch directory (<code>TINYCLIENT_DIR</code>) and an explicit <code>TINYCLIENT_CHATD</code> always start the daemon directly. For a source build or a <code>.tar.gz</code> install, copy <code>packaging/linux/tinyclient-chatd.service</code> to <code>~/.config/systemd/user/</code>, set <code>ExecStart</code> to the absolute path of that <code>chatd</code>, and reload the user manager. Keep the four programs together. AppImage builds stay on automatic startup.</p>
+
+    <nav class="pager" aria-label="Previous and next"><a href="index.html"><span>Previous</span>Getting started</a><a class="next" href="build.html"><span>Next</span>Build from source</a></nav>
+    <p class="edit"><a href="https://github.com/itz4blitz/tinyclient/blob/main/site/docs/using.html">Edit this page on GitHub</a></p>
+  </main>
+</div>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="fine">
+      <p>tinyclient is open source under the MIT license; a <code>chatd</code> built with Signal support is a combined work under the AGPL-3.0. Not affiliated with Slack, Discord, Telegram, Microsoft, Signal or Google; network icons from <a href="https://github.com/homarr-labs/dashboard-icons">Dashboard Icons</a> (Apache-2.0).</p>
+      <p>This website sets no cookies, runs no analytics and loads nothing from any other site. Cloudflare Pages hosts it and can see your request the way any web server can.</p>
+    </div>
+  </div>
+</footer>
+</body>
+</html>
