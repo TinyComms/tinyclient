@@ -7,6 +7,56 @@ use keyring::Entry;
 use protocol::Network;
 
 const SERVICE: &str = "tinyclient";
+// Some providers wait for GPG inside GetSecret, outside the Secret Service prompt
+// protocol. The backend's two-second method timeout must not end the whole read.
+const UNLOCK_RETRY_WINDOW: std::time::Duration = std::time::Duration::from_secs(120);
+const UNLOCK_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_secs(1);
+
+fn unlock_timeout(error: &keyring::Error) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let mut error: &(dyn std::error::Error + 'static) = error;
+        loop {
+            if let Some(error) = error.downcast_ref::<dbus::Error>() {
+                return matches!(error.name(), Some("org.freedesktop.DBus.Error.NoReply"
+                    | "org.freedesktop.DBus.Error.Timeout" | "org.freedesktop.DBus.Error.TimedOut"));
+            }
+            let Some(source) = error.source() else { return false };
+            error = source;
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = error;
+        false
+    }
+}
+
+fn read_with_unlock_retry(
+    mut read: impl FnMut() -> keyring::Result<String>,
+    window: std::time::Duration,
+    pause: std::time::Duration,
+) -> keyring::Result<String> {
+    let began = std::time::Instant::now();
+    loop {
+        let result = read();
+        let Err(error) = &result else { return result };
+        if !unlock_timeout(error) || began.elapsed() >= window {
+            return result;
+        }
+        std::thread::sleep(pause.min(window.saturating_sub(began.elapsed())));
+        if began.elapsed() >= window {
+            return result;
+        }
+    }
+}
+
+fn read_password(entry: &Entry, retry_timeouts: bool) -> keyring::Result<String> {
+    if !retry_timeouts {
+        return entry.get_password();
+    }
+    read_with_unlock_retry(|| entry.get_password(), UNLOCK_RETRY_WINDOW, UNLOCK_RETRY_PAUSE)
+}
 
 /// The keychain service before the product was renamed. A session found only there is moved to
 /// `SERVICE` the first time it is read, so the rename signs nobody out.
@@ -62,8 +112,39 @@ pub enum Stored {
 }
 
 pub fn read(network: Network) -> Stored {
+    read_session(network, false)
+}
+
+/// Background account loading can wait for GPG to unlock after a short D-Bus timeout.
+/// Other reads keep their original behavior rather than extending a user action.
+pub fn read_waiting(network: Network) -> Stored {
+    read_session(network, true)
+}
+
+fn read_session(network: Network, retry_timeouts: bool) -> Stored {
     if !enabled() {
         let name = format!("TINYCLIENT_SESSION_{}", network.label().to_uppercase());
+        // Scratch-only simulation of a provider whose GetSecret times out until unlocked.
+        #[cfg(target_os = "linux")]
+        if retry_timeouts && network == Network::Signal && std::env::var_os("TINYCLIENT_TEST_KEYCHAIN_UNLOCK").is_some() {
+            let mut attempts = 0;
+            let result = read_with_unlock_retry(|| {
+                attempts += 1;
+                let dir = protocol::support_dir();
+                let _ = std::fs::write(dir.join("keychain-attempts"), attempts.to_string());
+                if !dir.join("keychain-unlocked").exists() {
+                    return Err(keyring::Error::PlatformFailure(Box::new(dbus::Error::new_custom(
+                        "org.freedesktop.DBus.Error.NoReply", "test provider is still locked",
+                    ))));
+                }
+                std::env::var(&name).map_err(|_| keyring::Error::NoEntry)
+            }, UNLOCK_RETRY_WINDOW, UNLOCK_RETRY_PAUSE);
+            return match result {
+                Ok(session) => Stored::Found(session),
+                Err(keyring::Error::NoEntry) => Stored::Absent,
+                Err(err) => Stored::Unreadable(err.to_string()),
+            };
+        }
         return std::env::var(name).map_or(Stored::Absent, Stored::Found);
     }
     if !persistent() {
@@ -73,20 +154,20 @@ pub fn read(network: Network) -> Stored {
         Ok(entry) => entry,
         Err(err) => return Stored::Unreadable(err.to_string()),
     };
-    match entry.get_password() {
+    match read_password(&entry, retry_timeouts) {
         Ok(session) => Stored::Found(session),
-        Err(keyring::Error::NoEntry) => moved(network, &entry),
+        Err(keyring::Error::NoEntry) => moved(network, &entry, retry_timeouts),
         Err(err) => Stored::Unreadable(err.to_string()),
     }
 }
 
 /// The session kept under the old name, now saved under the new one. The old item is deleted
 /// only once the new one holds the session.
-fn moved(network: Network, entry: &Entry) -> Stored {
+fn moved(network: Network, entry: &Entry, retry_timeouts: bool) -> Stored {
     let Ok(old) = Entry::new(RENAMED_FROM, account(network)) else {
         return Stored::Absent;
     };
-    match old.get_password() {
+    match read_password(&old, retry_timeouts) {
         Ok(session) => {
             if entry.set_password(&session).is_ok() {
                 let _ = old.delete_credential();
@@ -155,6 +236,70 @@ pub fn forget(network: Network) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    fn platform_error(name: &str) -> keyring::Error {
+        // Exercise a nested source chain, as keyring wraps the Secret Service error.
+        keyring::Error::PlatformFailure(Box::new(keyring::Error::PlatformFailure(Box::new(
+            dbus::Error::new_custom(name, "localized provider error"),
+        ))))
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dbus_timeouts_are_recognized_by_name_not_message() {
+        for name in ["NoReply", "Timeout", "TimedOut"] {
+            assert!(super::unlock_timeout(&platform_error(&format!("org.freedesktop.DBus.Error.{name}"))));
+        }
+        for name in ["AccessDenied", "Failed", "ServiceUnknown", "Disconnected"] {
+            assert!(!super::unlock_timeout(&platform_error(&format!("org.freedesktop.DBus.Error.{name}"))));
+        }
+        assert!(!super::unlock_timeout(&keyring::Error::NoEntry));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_timed_out_read_recovers_after_unlocking() {
+        let mut attempts = 0;
+        let result = super::read_with_unlock_retry(|| {
+            attempts += 1;
+            if attempts < 3 { Err(platform_error("org.freedesktop.DBus.Error.NoReply")) }
+            else { Ok("saved session".to_owned()) }
+        }, std::time::Duration::from_secs(1), std::time::Duration::ZERO);
+        assert_eq!(result.unwrap(), "saved session");
+        assert_eq!(attempts, 3);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn refusals_and_expired_retry_windows_stop_reading() {
+        for name in ["AccessDenied", "Failed", "NoReply"] {
+            let mut attempts = 0;
+            let window = if name == "NoReply" { std::time::Duration::ZERO } else { std::time::Duration::from_secs(1) };
+            let result = super::read_with_unlock_retry(|| {
+                attempts += 1;
+                Err(platform_error(&format!("org.freedesktop.DBus.Error.{name}")))
+            }, window, std::time::Duration::ZERO);
+            assert!(result.is_err());
+            assert_eq!(attempts, 1);
+        }
+    }
+    #[test]
+    fn missing_credentials_and_dismissed_prompts_are_not_retried() {
+        for error in [
+            keyring::Error::NoEntry,
+            keyring::Error::NoStorageAccess(Box::new(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied, "prompt dismissed",
+            ))),
+        ] {
+            let mut error = Some(error);
+            let result = super::read_with_unlock_retry(
+                || Err(error.take().expect("this read must not be retried")),
+                std::time::Duration::from_secs(1), std::time::Duration::ZERO,
+            );
+            assert!(result.is_err());
+        }
+    }
+
     #[test]
     fn this_build_keeps_sign_ins_past_a_restart() {
         // A build without a system store falls back to keyring's mock: it would find no

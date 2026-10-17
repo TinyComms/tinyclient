@@ -555,3 +555,38 @@ fn a_staged_paste_leaves_outbox_once_it_is_sent_or_discarded_and_a_picked_file_s
     assert!(!pasted.exists(), "the discarded paste left outbox/");
     assert!(picked.exists(), "the user's own file stays");
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_provider_timeout_recovers_after_unlock_without_restarting_or_signing_in() {
+    let me = "a1a1a1a1-0000-4000-8000-000000000001";
+    let account = AccountKey { network: Network::Signal, account: me.into() };
+    let session = r#"{"aci":"a1a1a1a1-0000-4000-8000-000000000001","name":"Ada Quill","vault":"00"}"#;
+    let chatd = Daemon::start(&[], &[
+        ("TINYCLIENT_TEST_KEYCHAIN_UNLOCK", "1"),
+        ("TINYCLIENT_SIGNAL_FAKE", "1"),
+        ("TINYCLIENT_SESSION_SIGNAL", session),
+    ], |store| {
+        store.set_account(&account, "Ada Quill", me).unwrap();
+        store.upsert_conversation(&account, &ConversationRow::new("saved-chat", ConversationKind::Direct, "Saved chat")).unwrap();
+    });
+    chatd.until("a timed-out keychain read to be retried while waiting", || {
+        let attempts: u32 = std::fs::read_to_string(chatd.dir.join("keychain-attempts")).ok()?.parse().ok()?;
+        let (accounts, keychain, _, _) = chatd.status();
+        let cached = accounts.iter().find(|status| status.key == account)?;
+        (attempts >= 2 && keychain.waiting == Some(Network::Signal)
+            && keychain.denied.is_empty() && cached.link == Link::Offline).then_some(())
+    });
+    assert_eq!(chatd.ask(Request::Ping), Response::Pong);
+    let (_, _, _, started) = chatd.status();
+    std::fs::write(chatd.dir.join("keychain-unlocked"), "").unwrap();
+    chatd.until("Signal to connect after unlocking without a manual retry", || {
+        let (accounts, keychain, _, again) = chatd.status();
+        assert_eq!(again, started, "the daemon must not restart");
+        (keychain.is_settled() && accounts.iter().any(|status| status.key == account && status.link == Link::Connected)).then_some(())
+    });
+    let cached = chatd.ask(Request::Conversation { conversation: Key {
+        network: Network::Signal, account: me.into(), id: "saved-chat".into(),
+    } });
+    assert!(matches!(cached, Response::Conversation { conversation: row } if row.title == "Saved chat"));
+}
