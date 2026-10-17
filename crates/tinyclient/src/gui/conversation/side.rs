@@ -14,8 +14,9 @@ use crate::gui::state::Shell;
 use crate::gui::theme::{self, Type};
 use crate::gui::time;
 use crate::view::{age, now};
-use gpui::{div, prelude::*, px, AnyElement, Context, Entity, MouseButton, Window};
+use gpui::{div, prelude::*, px, AnyElement, Context, Entity, FontWeight, HighlightStyle, MouseButton, SharedString, StyledText, Window};
 use protocol::{ConversationKind, Key, Link, Message, MessageHit, Request, Response};
+use std::ops::Range;
 use std::rc::Rc;
 
 /// The window keeps of the right pane.
@@ -49,7 +50,34 @@ pub struct Side {
 #[derive(Default)]
 pub struct SearchPage {
     pub words: String,
-    pub hits: Vec<MessageHit>,
+    /// What the cache answered: `None` while the read is outstanding or failed.
+    pub hits: Option<Vec<MessageHit>>,
+    /// The cache could not be asked.
+    pub failed: bool,
+}
+
+/// The letters of the query inside a hit's text, for the heavier drawing.
+fn matched(text: &str, words: &str) -> Vec<Range<usize>> {
+    let (lower, needle) = (text.to_lowercase(), words.to_lowercase());
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(at) = lower[from..].find(&needle) {
+        let (start, end) = (from + at, from + at + needle.len());
+        // A lowercased index can sit inside a letter that shrank or grew; such a range is skipped.
+        if text.is_char_boundary(start) && text.is_char_boundary(end) {
+            out.push(start..end);
+        }
+        from = end;
+    }
+    out
+}
+
+/// The heavier letters a match is drawn with, as the switcher's rows do.
+fn lit() -> HighlightStyle {
+    HighlightStyle { color: Some(theme::text().into()), font_weight: Some(FontWeight::SEMIBOLD), ..Default::default() }
 }
 
 impl Side {
@@ -328,7 +356,7 @@ impl Shell {
     /// The switcher's "Search messages" row: the pane opens at once and the cache is asked.
     pub(in crate::gui) fn open_message_search(&mut self, words: String, cx: &mut Context<Self>) {
         let side = &mut self.conversation_state.side;
-        side.search = Some(SearchPage { words: words.clone(), hits: Vec::new() });
+        side.search = Some(SearchPage { words: words.clone(), hits: None, failed: false });
         side.stack = pane::open(&side.stack, Layer::Search);
         self.install(cx);
         self.off_thread(
@@ -338,16 +366,15 @@ impl Shell {
                 move || ask(&Request::SearchMessages { conversation: None, network: None, query: asked, limit: protocol::PAGE_LIMIT })
             },
             move |this, answer, cx| {
-                let Ok(Response::MessageHits { hits }) = answer else {
+                let Some(page) = this.conversation_state.side.search.as_mut().filter(|page| page.words == words) else {
                     return;
                 };
-                let Some(page) = this.conversation_state.side.search.as_mut() else {
-                    return;
-                };
-                if page.words != words {
-                    return;
+                match answer {
+                    Ok(Response::MessageHits { hits }) => page.hits = Some(hits),
+                    // Another answer is not this request's; the read failing is the pane's word.
+                    Ok(_) => {}
+                    Err(_) => page.failed = true,
                 }
-                page.hits = hits;
                 cx.notify();
             },
         );
@@ -632,12 +659,17 @@ fn draw_search(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
         .child(glyph("icons/search.svg", 14., theme::text_soft()))
         .child(div().flex_1().min_w_0().truncate().type_ui().text_color(theme::text()).child(page.words.clone()))
         .child(div().type_small().text_color(theme::text_soft()).child("cached"));
-    let body = if page.hits.is_empty() {
-        empty_state("icons/search.svg", "Nothing in the cache yet.", "The networks are not asked yet.")
+    let body = if page.failed {
+        empty_state("icons/search.svg", "tinyclient isn't answering.", "The cache could not be asked. Try again in a moment.")
             .into_any_element()
+    } else if page.hits.is_none() {
+        empty_state("icons/search.svg", "Asking the cache…", "The hits land here as they are read.").into_any_element()
+    } else if page.hits.as_deref().is_none_or(|hits| hits.is_empty()) {
+        empty_state("icons/search.svg", "Nothing in the cache yet.", "The networks are not asked yet.").into_any_element()
     } else {
+        let hits = page.hits.as_deref().unwrap_or_default();
         let mut rows = div().id("search-hits").flex_1().min_h_0().overflow_y_scroll().flex().flex_col().p(px(4.));
-        for (ix, hit) in page.hits.iter().enumerate() {
+        for (ix, hit) in hits.iter().enumerate() {
             let clicked = hit.clone();
             rows = rows.child(
                 div()
@@ -665,7 +697,17 @@ fn draw_search(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
                             .flex()
                             .items_center()
                             .gap(px(6.))
-                            .child(div().flex_1().min_w_0().truncate().type_small().text_color(theme::text_soft()).child(hit.snippet.clone()))
+                            .child({
+                                let highlights: Vec<(Range<usize>, HighlightStyle)> =
+                                    matched(&hit.snippet, &page.words).into_iter().map(|range| (range, lit())).collect();
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .type_small()
+                                    .text_color(theme::text_soft())
+                                    .child(StyledText::new(SharedString::from(hit.snippet.clone())).with_highlights(highlights))
+                            })
                             .child(div().flex_none().type_micro().text_color(theme::text_soft()).child("cached")),
                     ),
             );
