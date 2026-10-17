@@ -51,9 +51,9 @@ fn platform_data_root() -> PathBuf {
 
 pub fn run(site: Site, at: Option<(f64, f64)>, network: &str) {
     let agent = crate::user_agent();
-    let mut web_context = WebContext::new(Some(data_dir(network)));
-
+    // Tao initializes GTK on Linux before WebKit creates GTK objects.
     let event_loop = EventLoop::new();
+    let mut web_context = WebContext::new(Some(data_dir(network)));
     let mut builder = WindowBuilder::new()
         .with_title(site.title)
         .with_inner_size(LogicalSize::new(SIZE.0, SIZE.1))
@@ -78,7 +78,7 @@ pub fn run(site: Site, at: Option<(f64, f64)>, network: &str) {
     }));
 
     let nav_state = state.clone();
-    let built = WebViewBuilder::new_with_web_context(&mut web_context)
+    let builder = WebViewBuilder::new_with_web_context(&mut web_context)
         .with_url(site.start)
         .with_user_agent(&agent)
         .with_navigation_handler({
@@ -122,9 +122,17 @@ pub fn run(site: Site, at: Option<(f64, f64)>, network: &str) {
                     std::process::exit(LOAD_FAILED);
                 }
             }
-        })
-        .build(&window)
-        .expect("webview");
+        });
+    #[cfg(target_os = "linux")]
+    let built = {
+        use tao::platform::unix::WindowExtUnix;
+        use wry::WebViewBuilderExtUnix;
+        // The raw window constructor supports only X11; GTK also supports Wayland.
+        builder.build_gtk(window.default_vbox().expect("window container"))
+    };
+    #[cfg(not(target_os = "linux"))]
+    let built = builder.build(&window);
+    let built = built.expect("webview");
 
     let webview = Arc::new(Mutex::new(built));
     let site = site;
@@ -132,7 +140,9 @@ pub fn run(site: Site, at: Option<(f64, f64)>, network: &str) {
     let mut last_tick = Instant::now();
 
     event_loop.run(move |event, _, control_flow| {
-        *control_flow = ControlFlow::Wait;
+        // WebKit callbacks do not necessarily produce Tao window events. Keep
+        // polling for the session even after the login page becomes idle.
+        *control_flow = ControlFlow::WaitUntil(last_tick + Duration::from_secs(1));
 
         if last_tick.elapsed() >= Duration::from_secs(1) {
             last_tick = Instant::now();
@@ -184,6 +194,9 @@ fn tick(web: &WebView, site: Site, agent: &str, state: &Arc<Mutex<State>>) {
             }
         }
         if hands_off(&at) {
+            if std::env::var_os("TINYCLIENT_LOGIN_DEBUG").is_some() {
+                eprintln!("tinyclient-login: waiting for the login page to finish");
+            }
             return;
         }
         let mut guard = state.lock().unwrap();
@@ -223,6 +236,11 @@ fn tick(web: &WebView, site: Site, agent: &str, state: &Arc<Mutex<State>>) {
     let agent = agent.to_owned();
     let state_probe = state.clone();
     let _ = web.evaluate_script_with_callback(probe, move |value| {
+        if std::env::var_os("TINYCLIENT_LOGIN_DEBUG").is_some() {
+            // Never print the JavaScript result: it may contain credentials.
+            let received = !value.is_empty() && value != "null" && value != "undefined";
+            eprintln!("tinyclient-login: session probe completed; result present: {received}");
+        }
         let Some(text) = js_return(&value) else {
             return;
         };
