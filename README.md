@@ -122,7 +122,20 @@ itself. Start `tinyclient`; it starts `chatd` when nothing answers on the socket
   it. Allow it in System Settings > Privacy & Security if you trust the build. Open the app
   rather than the bare binaries: macOS grants the microphone to an app bundle, so calls need it.
 - **Linux.** Sessions are kept in the Secret Service (GNOME Keyring, KWallet), which must be
-  running. The sign-in window needs WebKitGTK 4.1.
+  running with its keyring unlocked in your login session. With a standalone compositor
+  such as dwl, configure the provider's startup and unlocking separately; installing a
+  provider does not ensure the session is ready. KeePassXC also works when its Secret
+  Service integration is enabled. Arch packages can require the virtual dependency
+  `org.freedesktop.secrets` to accept any packaged provider.
+  The sign-in window needs WebKitGTK 4.1 and supports both Wayland and X11.
+
+  For sign-in diagnostics, launch tinyclient with `TINYCLIENT_LOGIN_DEBUG=1` to log
+  whether the helper is waiting on Discord's login page or completing session probes.
+  These messages go to stderr without credentials. A standalone helper's stdout
+  contains the session token; redirect it to `/dev/null` when diagnosing, and never
+  share it. A standalone helper does not attach an account to tinyclient.
+  The Discord storage probe fixtures can be run with
+  `node crates/login/tests/discord-probe.cjs` (Node.js is only needed for these fixtures).
 - **Windows.** The installer and programs are not code-signed, so SmartScreen warns before the
   first run (More info > Run anyway). The sign-in window needs WebView2, which current Windows
   includes.
