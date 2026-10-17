@@ -19,19 +19,19 @@ var TYPES = {
   "/sitemap.xml": "application/xml; charset=utf-8",
 };
 
-export async function onRequest(context) {
-  var response;
-  try {
-    response = await context.next();
-  } catch (err) {
-    return new Response("Bad gateway", { status: 502 });
-  }
-  try {
-    return await finish(context.request, response);
-  } catch (err) {
-    return response;
-  }
-}
+// Pages only bundles a worker from site/_worker.js. A functions/ directory
+// next to the assets is ignored by `wrangler pages deploy`, which looks for
+// functions/ in the repo root.
+export default {
+  async fetch(request, env) {
+    var response = await env.ASSETS.fetch(request);
+    try {
+      return await finish(request, response);
+    } catch (err) {
+      return response;
+    }
+  },
+};
 
 async function finish(request, response) {
   var url = new URL(request.url);
