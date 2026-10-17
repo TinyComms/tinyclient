@@ -126,11 +126,10 @@ fn archive_suffix() -> Option<&'static str> {
     })
 }
 
-/// Where a quit may write the new copy. A tree under Cargo's `target/` is a development build
-/// and is never replaced.
+/// Where a quit may write the new copy. See [`replaceable`].
 pub fn install_into() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
-    if exe.components().any(|part| part.as_os_str() == "target") {
+    if !replaceable(&exe) {
         return None;
     }
     if cfg!(target_os = "macos") {
@@ -139,6 +138,13 @@ pub fn install_into() -> Option<PathBuf> {
     let dir = exe.parent()?.to_owned();
     let sibling = |name: &str| dir.join(program(name)).is_file();
     (sibling("chatd") && sibling("mediad") && sibling("tinyclient-login")).then_some(dir)
+}
+
+/// A tree under Cargo's `target/` is a development build and is never replaced. Neither is a copy
+/// in the Nix store, which is read-only and changes only when Nix builds a new one
+/// (`packaging/nix/package.nix`).
+fn replaceable(exe: &Path) -> bool {
+    !exe.components().any(|part| part.as_os_str() == "target") && !exe.starts_with("/nix/store")
 }
 
 fn program(name: &str) -> String {
@@ -809,16 +815,20 @@ mod tests {
     }
 
     #[test]
-    fn the_bundle_is_recognised_and_a_target_tree_is_not_an_install() {
+    fn the_bundle_is_recognised_and_a_target_tree_or_the_nix_store_is_not_an_install() {
         let app = Path::new("/Applications/tinyclient.app/Contents/MacOS/tinyclient");
         assert_eq!(
             mac_bundle(app),
             Some(PathBuf::from("/Applications/tinyclient.app"))
         );
         assert_eq!(mac_bundle(Path::new("/usr/local/bin/tinyclient")), None);
-        assert!(Path::new("/src/target/release/tinyclient")
-            .components()
-            .any(|part| part.as_os_str() == "target"));
+        assert!(!replaceable(Path::new("/src/target/release/tinyclient")));
+        assert!(!replaceable(Path::new(
+            "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-tinyclient-0.2.5/lib/tinyclient/tinyclient"
+        )));
+        assert!(replaceable(Path::new(
+            "/home/me/.local/lib/tinyclient/tinyclient"
+        )));
     }
 
     #[test]

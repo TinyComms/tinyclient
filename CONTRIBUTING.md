@@ -11,7 +11,12 @@ A security problem is not an issue: report it privately as [SECURITY.md](SECURIT
 
 You need current stable Rust and `protoc` (Signal's libraries compile protobufs at build time:
 `brew install protobuf`, or `apt install protobuf-compiler`). On Linux, install the libraries
-listed under "Build from source" in the [README](README.md#build-from-source).
+listed under "Build from source" in the [README](README.md#build-from-source). With Nix,
+`nix develop` (or `direnv allow`, for `.envrc`) provides all of it.
+
+The Nix package (`packaging/nix/package.nix`) keeps a hash for each git dependency in
+`Cargo.lock`. When a change moves one to a new rev, run `packaging/nix/update-hashes.sh` (it
+needs Nix) to rewrite them.
 
 ```sh
 cargo build -p chatd -p mediad -p login    # the daemon and its helpers
@@ -30,7 +35,8 @@ Feature flags:
 
 Telegram needs a registered app id at build time (`TINYCLIENT_TELEGRAM_API_ID`,
 `TINYCLIENT_TELEGRAM_API_HASH`); see the README. Without it, everything else works and the tests
-still run Telegram against its scripted wire.
+still run Telegram against its scripted wire. With direnv, export both in `.envrc.local`, which
+`.envrc` loads and git ignores.
 
 ## Run without accounts
 

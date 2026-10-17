@@ -106,11 +106,11 @@
 
     <h2 id="updates">Updates</h2>
     <p>While the window is open it asks GitHub, about once an hour and again shortly after launch, whether a newer release exists. The request is <code>User-Agent: tinyclient/&lt;version&gt;</code> and nothing else: no account, no machine id.</p>
-    <p>A newer release is shown until you dismiss it. <strong>Check for Updates&hellip;</strong> asks again. With automatic install on, and only for an installed copy (not a build under <code>target/</code>), the archive is downloaded, checked against that release&rsquo;s <code>SHA256SUMS</code>, and on macOS checked with <code>codesign</code> before it is kept. It replaces this copy when you quit. The menu then says <strong>Restart to Update</strong>. A failure is remembered for a day and said only in About.</p>
+    <p>A newer release is shown until you dismiss it. <strong>Check for Updates&hellip;</strong> asks again. With automatic install on, and only for an installed copy (not a build under <code>target/</code> or a copy in the Nix store), the archive is downloaded, checked against that release&rsquo;s <code>SHA256SUMS</code>, and on macOS checked with <code>codesign</code> before it is kept. It replaces this copy when you quit. The menu then says <strong>Restart to Update</strong>. A failure is remembered for a day and said only in About.</p>
 
     <h2 id="systemd">Linux: leave chatd running</h2>
     <p>By default, quitting the window stops the daemon it started. Logs go to <code>chatd.log</code>.</p>
-    <p>The <code>.deb</code>, <code>.rpm</code> and Arch package can install <code>tinyclient-chatd.service</code>. The unit is disabled. With it disabled, nothing about startup changes.</p>
+    <p>The <code>.deb</code>, <code>.rpm</code>, Arch and Nix packages can install <code>tinyclient-chatd.service</code>. The unit is disabled. With it disabled, nothing about startup changes.</p>
     <p>To let systemd manage the daemon, quit tinyclient first so its daemon releases the socket. From a terminal in your graphical session:</p>
 <div class="code"><pre><code>systemctl --user daemon-reload
 systemctl --user import-environment WAYLAND_DISPLAY DISPLAY XDG_CURRENT_DESKTOP

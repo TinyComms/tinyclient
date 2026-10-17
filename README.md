@@ -108,6 +108,7 @@ Download from [tinyclient.io](https://tinyclient.io), or from the [latest releas
 | Fedora, openSUSE | [`tinyclient-linux-x86_64.rpm`](https://tinyclient.io/download/rpm) | `sudo dnf install ./tinyclient-linux-x86_64.rpm` |
 | Any Linux | [`tinyclient-linux-x86_64.AppImage`](https://tinyclient.io/download/appimage) | One file: `chmod +x` it and run it |
 | Any Linux | [`tinyclient-linux-x86_64.tar.gz`](https://tinyclient.io/download/linux-tar) | The four programs and `install.sh` (`~/.local`, or `--system`) |
+| NixOS, Nix on Linux | [`flake.nix`](flake.nix) | Built from source: `nix profile add github:itz4blitz/tinyclient`, or [Home Manager](#nix) |
 | Windows 10+, x86_64 | [`tinyclient-windows-x86_64-setup.exe`](https://tinyclient.io/download/windows) | Installer for the current user. Apps & features uninstalls it. |
 | Windows, portable | [`tinyclient-windows-x86_64.zip`](https://tinyclient.io/download/windows-portable) | The four `.exe` files, run in place |
 
@@ -123,11 +124,11 @@ The four programs stay in one directory. Each finds the others beside itself. St
 
 ### Updates
 
-The window checks GitHub for a newer release about once an hour. It can download that release, check it, and replace this copy when you quit. The check sends only the version in the user agent.
+The window checks GitHub for a newer release about once an hour. It can download that release, check it, and replace this copy when you quit. The check sends only the version in the user agent. It never replaces a copy in the Nix store: Nix updates that one.
 
 ### Optional systemd user service on Linux
 
-The `.deb`, `.rpm`, and Arch package can install `tinyclient-chatd.service`. It is **disabled by default**. With the unit disabled, tinyclient starts its own daemon, logs to `chatd.log`, and stops the daemon when the application quits.
+The `.deb`, `.rpm`, Arch, and Nix packages can install `tinyclient-chatd.service`. It is **disabled by default**. With the unit disabled, tinyclient starts its own daemon, logs to `chatd.log`, and stops the daemon when the application quits.
 
 To let systemd manage the daemon, quit tinyclient first so its existing daemon releases the socket. Then, from a terminal in your graphical session:
 
@@ -166,6 +167,10 @@ Scratch runs (`TINYCLIENT_DIR`) and an explicit `TINYCLIENT_CHATD` always use di
 
 On Linux, a Secret Service provider may also need you to unlock GPG before it returns saved sessions. Background account loading retries short D-Bus read timeouts for up to two minutes. Unlock within that window and the accounts reconnect without signing in again. An explicit refusal, another error, or an expired retry window keeps the cached accounts and offers "Try again". Stored credentials are not deleted.
 
+### Nix
+
+The flake builds tinyclient from source. With Home Manager, import `inputs.tinyclient.homeManagerModules.default` and set `programs.tinyclient.enable = true`. `programs.tinyclient.systemd.enable = true` adds the user service above. For Telegram, override the package with your app id (`telegramApiId`, `telegramApiHash`). On NixOS, the window needs `hardware.graphics.enable`.
+
 ## Keyboard shortcuts
 
 Shortcuts use Command on macOS and Ctrl on Linux and Windows. **Jump to…** is Command-K on macOS and Ctrl-K elsewhere. Menus, tooltips, and Settings → Keyboard Shortcuts show the keys for your platform. Super is left to the Linux desktop. Full screen uses Ctrl-Alt-F on Linux and Windows.
@@ -187,6 +192,8 @@ Prerequisites:
     libwebkit2gtk-4.1-dev libsoup-3.0-dev libvulkan-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
     libx11-dev libxcb1-dev libfontconfig1-dev protobuf-compiler
   ```
+
+- Or, with Nix, `nix develop` (or `direnv allow`) provides all of the above.
 
 Then:
 
@@ -288,7 +295,7 @@ There is no adapter trait. An adapter is a module under `crates/chatd/src/adapte
 | [`crates/login`](crates/login) | The sign-in helper. |
 | [`crates/tinyclient`](crates/tinyclient) | The window, the text shell, and the in-app updater. |
 | [`docs/`](docs) | The spec: architecture, product stories, and the visual system. A choice the docs leave open is settled there, by agreement, before the code. |
-| [`packaging/`](packaging) | The icon, the macOS bundle, Linux packages, the Windows installer, and the systemd unit. |
+| [`packaging/`](packaging) | The icon, the macOS bundle, Linux and Nix packages, the Windows installer, and the systemd unit. |
 | [`site/`](site) | [tinyclient.io](https://tinyclient.io). Pages are static. A worker serves Markdown to clients that ask for it. |
 | [`.github/workflows/`](.github/workflows) | CI on every push, the release workflow on a `v*` tag, and the site deploy. |
 
