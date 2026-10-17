@@ -11,11 +11,14 @@ case "${RUNNER_OS:-}" in
         echo 'RUSTFLAGS=-C linker-features=-lld -C link-arg=-fuse-ld=mold' >> "$GITHUB_ENV"
         ;;
     Windows)
+        # rustc calls the linker as `rust-lld -flavor link`. The gcc-ld copy named
+        # lld-link.exe is the same binary but ignores -flavor and then tries to open
+        # a file called "link".
         sysroot=$(rustc --print sysroot)
-        gcc_ld="$sysroot/lib/rustlib/x86_64-pc-windows-msvc/bin/gcc-ld"
-        if [ -x "$gcc_ld/lld-link.exe" ]; then
-            echo "$(cygpath -w "$gcc_ld")" >> "$GITHUB_PATH"
-            echo 'RUSTFLAGS=-C linker=lld-link' >> "$GITHUB_ENV"
+        lld="$sysroot/lib/rustlib/x86_64-pc-windows-msvc/bin/rust-lld.exe"
+        if [ -x "$lld" ]; then
+            echo "$(cygpath -w "$(dirname "$lld")")" >> "$GITHUB_PATH"
+            echo 'RUSTFLAGS=-C linker=rust-lld.exe' >> "$GITHUB_ENV"
         else
             echo "link-flags.sh: rust-lld is not in the sysroot; keeping the MSVC linker"
         fi
