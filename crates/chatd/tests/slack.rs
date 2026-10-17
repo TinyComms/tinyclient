@@ -2156,7 +2156,8 @@ fn info_mute_pins_files_emoji_threads_and_a_scheduled_send_ask_slack_once_each()
     };
     threads(&world);
     let thread = format!("C0GEN:{ROOT}");
-    let followed = world.until("the followed thread", || world.conversation(&alpha(&thread)).filter(|row| row.followed));
+    // Filing and unread counts are committed separately; wait for both updates.
+    let followed = world.until("the followed thread and its unread count", || world.conversation(&alpha(&thread)).filter(|row| row.followed && row.unread == 1));
     assert_eq!(followed.unread, 1, "one reply after the last read");
     assert!(world.messages(&alpha(&thread)).iter().any(|message| message.text == "moved to 3pm"));
     assert!(world.conversation(&alpha("C0ELSEWHERE:1760000100.000100")).is_none());
