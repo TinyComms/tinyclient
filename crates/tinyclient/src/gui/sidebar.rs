@@ -96,6 +96,7 @@ pub struct State {
     muted_open: bool,
     /// The network home on show: what chatd said, and the user's folds.
     pub home: home::Home,
+    saved_homes: HashMap<Network, home::Home>,
     home_list: ListState,
     home_items: Rc<Vec<home::Item>>,
     /// The home's Unread segment, and how many rows it holds.
@@ -165,6 +166,7 @@ impl State {
             muted_news: Vec::new(),
             muted_open: false,
             home: home::Home::default(),
+            saved_homes: HashMap::new(),
             home_list: list_state(cx),
             home_items: Rc::new(Vec::new()),
             home_unread: false,
@@ -319,9 +321,7 @@ impl Shell {
             }
         }
         let home_network = mode.network().filter(|_| matches!(mode, Mode::Network(_)));
-        if home_network != state.home.network {
-            state.home = home_network.map(home::Home::for_network).unwrap_or_default();
-        }
+        state.home.switch_network(home_network, &mut state.saved_homes);
         state.mode = mode;
         state.cursor = None;
         state.drill = None;
@@ -338,7 +338,8 @@ impl Shell {
         hub.watch_rows(WATCH, [], cx);
         self.show_mode(cx);
         self.rebuild_inbox(cx);
-        self.load_directs(cx);
+        // Navigation reads immediately; only background event bursts are debounced.
+        self.load_home(cx);
     }
 
     fn here(&self) -> Location {
