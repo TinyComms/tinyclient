@@ -427,6 +427,7 @@ impl TextInput {
     fn go(&mut self, motion: Motion, extend: bool, cx: &mut Context<Self>) {
         let rows = self.rows();
         self.editor.go(motion, extend, rows.as_ref());
+        if extend { self.publish_primary(cx); }
         cx.notify();
     }
 
@@ -585,6 +586,7 @@ impl TextInput {
 
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
         self.editor.select_all();
+        self.publish_primary(cx);
         cx.notify();
     }
 
@@ -694,22 +696,38 @@ impl TextInput {
         }
     }
 
+    /// Linux PRIMARY is selected text, separate from the Copy/Paste clipboard.
+    fn publish_primary(&self, _cx: &App) {
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        if !self.editor.selection().is_empty() {
+            _cx.write_to_primary(ClipboardItem::new_string(self.editor.selected_text().to_owned()));
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    fn on_middle_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // Read before moving the caret: the selected text may belong to this field.
+        let text = cx.read_from_primary().and_then(|item| item.text());
+        let offset = self.index_for_mouse_position(event.position);
+        window.focus(&self.focus_handle(cx), cx);
+        self.is_selecting = false;
+        if paste_primary_text(&mut self.editor, text.as_deref(), offset) {
+            self.edited(cx);
+        }
+        cx.stop_propagation();
+    }
+
     fn on_mouse_down(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         let offset = self.index_for_mouse_position(event.position);
-        match (event.modifiers.shift, event.click_count) {
-            (true, _) => self.editor.select_to(offset),
-            (false, 2) => self.editor.select_word_at(offset),
-            (false, 3..) => self.editor.select_line_at(offset),
-            (false, _) => {
-                self.is_selecting = true;
-                self.editor.place(offset);
-            }
-        }
+        self.is_selecting = select_on_press(&mut self.editor, offset, event.modifiers.shift, event.click_count);
+        if !self.is_selecting { self.publish_primary(cx); }
         cx.notify();
     }
 
-    fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
-        self.is_selecting = false;
+    fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if std::mem::replace(&mut self.is_selecting, false) {
+            self.publish_primary(cx);
+        }
     }
 
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -769,6 +787,26 @@ enum Pasted {
     Image(gpui::Image),
     Text,
     Nothing,
+}
+
+/// Only a plain click starts a drag. Word, line and shift selections are complete
+/// on press and must survive a move event at the same pointer position.
+fn select_on_press(editor: &mut Editor, offset: usize, shift: bool, clicks: usize) -> bool {
+    match (shift, clicks) {
+        (true, _) => editor.select_to(offset),
+        (false, 2) => editor.select_word_at(offset),
+        (false, 3..) => editor.select_line_at(offset),
+        (false, _) => { editor.place(offset); return true; }
+    }
+    false
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd", test))]
+fn paste_primary_text(editor: &mut Editor, text: Option<&str>, offset: usize) -> bool {
+    let Some(text) = text.filter(|text| !text.is_empty()) else { return false; };
+    editor.place(offset);
+    editor.insert(text);
+    true
 }
 
 fn pasted(entries: &[ClipboardEntry]) -> Pasted {
@@ -1237,6 +1275,11 @@ impl Render for TextInput {
             .on_action(cx.listener(Self::escape))
             .on_action(cx.listener(Self::tab))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .map(|input| {
+                #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+                let input = input.on_mouse_down(MouseButton::Middle, cx.listener(Self::on_middle_down));
+                input
+            })
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
@@ -1256,6 +1299,51 @@ mod tests {
     use super::{markup, pasted, Pasted};
     use gpui::{ClipboardEntry, ClipboardString, ExternalPaths, Image, ImageFormat};
     use std::path::PathBuf;
+
+    #[test]
+    fn word_line_and_shift_selections_survive_a_stationary_move() {
+        for (clicks, shift, expected) in [(2, false, "second"), (3, false, "first second third"), (1, true, "second thi")] {
+            let mut editor = super::Editor::new(true);
+            editor.set_text("first second third");
+            editor.place(16);
+            let dragging = super::select_on_press(&mut editor, 6, shift, clicks);
+            if dragging { editor.select_to(6); }
+            assert!(!dragging);
+            assert_eq!(editor.selected_text(), expected);
+        }
+        let mut editor = super::Editor::new(true);
+        editor.set_text("first second");
+        assert!(super::select_on_press(&mut editor, 6, false, 1));
+        editor.select_to(12);
+        assert_eq!(editor.selected_text(), "second");
+    }
+
+    #[test]
+    fn middle_paste_inserts_at_the_click_without_replacing_selected_text() {
+        let mut editor = super::Editor::new(true);
+        editor.set_text("hello 世界");
+        editor.select_all();
+        assert!(super::paste_primary_text(&mut editor, Some("https://example.invalid "), 6));
+        assert_eq!(editor.text(), "hello https://example.invalid 世界");
+        assert!(editor.selection().is_empty());
+        editor.undo();
+        assert_eq!(editor.text(), "hello 世界");
+    }
+
+    #[test]
+    fn an_empty_primary_selection_does_not_move_or_replace_the_draft() {
+        let mut editor = super::Editor::new(true);
+        editor.set_text("draft");
+        editor.select_all();
+        for text in [None, Some("")] {
+            assert!(!super::paste_primary_text(&mut editor, text, 2));
+            assert_eq!(editor.text(), "draft");
+            assert_eq!(editor.selected_text(), "draft");
+        }
+        let mut search = super::Editor::new(false);
+        assert!(super::paste_primary_text(&mut search, Some("one\r\ntwo"), 0));
+        assert_eq!(search.text(), "one two");
+    }
 
     #[test]
     fn finder_files_come_first_then_a_picture_without_words_else_words() {
