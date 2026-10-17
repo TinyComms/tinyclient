@@ -530,7 +530,7 @@ fn looks_b64(bytes: &[u8]) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
 }
 
-fn mime_of(name: &str) -> &'static str {
+pub(super) fn mime_of(name: &str) -> &'static str {
     match name
         .rsplit('.')
         .next()

@@ -218,6 +218,7 @@ struct Held {
     key: Vec<u8>,
     message: String,
     action: String,
+    mime: String,
 }
 
 struct Account {
@@ -481,6 +482,7 @@ fn message(account: &Account, note: &bugle::Note) -> Message {
                         key: piece.key.clone(),
                         message: note.id.clone(),
                         action: piece.action_id.clone(),
+                        mime: piece.mime.clone(),
                     },
                 );
         }
@@ -582,6 +584,7 @@ fn wanted(account: &Account, ids: &[String]) {
                 key: held.key.clone(),
                 message: held.message.clone(),
                 action: held.action.clone(),
+                mime: held.mime.clone(),
             });
         let Some(held) = held else {
             continue;
@@ -591,12 +594,12 @@ fn wanted(account: &Account, ids: &[String]) {
             .fetch(&held.media_id, &held.key, &held.message, &held.action)
         {
             Ok(bytes) => {
-                let mut file = MediaFile::new(id.clone(), MediaKind::File);
+                let mut file = MediaFile::new(id.clone(), kind_of(&held.mime));
                 file.bytes = bytes.len() as u64;
                 let _ = land(account, &file, &bytes);
             }
             Err(why) => {
-                let file = MediaFile::new(id.clone(), MediaKind::File);
+                let file = MediaFile::new(id.clone(), kind_of(&held.mime));
                 let mut store = account.ctx.hub.store();
                 let _ = store.register_media(
                     &account.ctx.account,
@@ -689,20 +692,15 @@ fn serve(account: &Arc<Account>, command: Command) {
                         file.name.clone()
                     };
                     let bytes = std::fs::read(&file.path).unwrap_or_default();
+                    let mime = bugle::mime_of(&name);
                     account
                         .drive
                         .send_file(&conversation_id, &text, &file.path, &name)
                         .map(|id| {
                             let mut message = outgoing(account, id.clone(), text);
                             if !bytes.is_empty() {
-                                let mut media = MediaFile::new(
-                                    format!("messages:{id}:0"),
-                                    kind_of(if name.ends_with(".png") {
-                                        "image/png"
-                                    } else {
-                                        "application/octet-stream"
-                                    }),
-                                );
+                                let mut media =
+                                    MediaFile::new(format!("messages:{id}:0"), kind_of(mime));
                                 media.bytes = bytes.len() as u64;
                                 if let Some(path) = land(account, &media, &bytes) {
                                     media.path = Some(path);
@@ -711,7 +709,7 @@ fn serve(account: &Arc<Account>, command: Command) {
                                     name: name.clone(),
                                     file: media,
                                     thumb: None,
-                                    mime: String::new(),
+                                    mime: mime.to_owned(),
                                     duration: 0,
                                     spoiler: false,
                                     sticker: false,

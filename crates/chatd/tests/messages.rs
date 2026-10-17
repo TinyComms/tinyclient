@@ -447,11 +447,58 @@ fn a_file_we_send_is_read_and_shown_back() {
                 && message
                     .attachments
                     .iter()
-                    .any(|file| file.name == "note.txt")
+                    .any(|file| file.name == "note.txt" && file.file.id.starts_with("messages:"))
         })
     });
     let path = sent.attachments[0].file.path.as_deref().expect("sent file");
     assert_eq!(std::fs::read(path).unwrap(), b"hello");
+    assert_eq!(
+        (
+            sent.attachments[0].file.kind,
+            sent.attachments[0].mime.as_str()
+        ),
+        (MediaKind::File, "application/octet-stream")
+    );
+
+    let photo = dir.join("shot.jpg");
+    std::fs::write(&photo, b"\xff\xd8\xff jpeg").unwrap();
+    match world.ask(Request::Send {
+        conversation: key(GRACE),
+        client_id: "file-2".into(),
+        text: "the picture".into(),
+        reply_to: None,
+        with: Outgoing {
+            files: vec![OutgoingFile {
+                path: photo.to_string_lossy().into_owned(),
+                name: "shot.jpg".into(),
+                spoiler: false,
+                as_file: false,
+                original: false,
+            }],
+            ..Outgoing::default()
+        },
+    }) {
+        Response::Sent { message } => {
+            assert!(matches!(message.state, SendState::Pending), "{message:?}")
+        }
+        other => panic!("{other:?}"),
+    }
+    let shown = world.until("the sent photo", || {
+        world.messages(GRACE).into_iter().find(|message| {
+            message.text == "the picture"
+                && message
+                    .attachments
+                    .iter()
+                    .any(|file| file.name == "shot.jpg" && file.file.id.starts_with("messages:"))
+        })
+    });
+    assert_eq!(
+        (
+            shown.attachments[0].file.kind,
+            shown.attachments[0].mime.as_str()
+        ),
+        (MediaKind::Image, "image/jpeg")
+    );
 }
 
 #[test]
