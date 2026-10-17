@@ -1,7 +1,7 @@
 // Progressive enhancement only. Every page reads the same without it.
 // 1. Names your system on the download button and points it at that build (on Linux, at the
 // choice of formats, which it also lists). 2. Adds Copy to code blocks. 3. Drives the hero
-// screenshots.
+// screenshots. 4. Reveals sections on scroll and lights cards under the pointer.
 (function () {
   "use strict";
 
@@ -50,34 +50,34 @@
     var tabList = root.querySelector(".car-tabs");
     var caption = root.querySelector(".car-caption");
     var play = root.querySelector(".car-play");
+    var counter = root.querySelector(".car-count");
     var count = slides.length;
     if (!track || count < 2) return;
     var EVERY = 5500;
     var still = window.matchMedia ? window.matchMedia("(prefers-reduced-motion: reduce)") : { matches: false };
-    var index = 0, timer = null, stopped = still.matches, hovered = false, focused = false, settle = null;
+    var index = 0, timer = null, early = null, stopped = still.matches, hovered = false, focused = false, away = false, settle = null;
 
     root.classList.add("js");
     root.style.setProperty("--car-ms", EVERY + "ms");
     Array.prototype.forEach.call(root.querySelectorAll("[hidden]"), function (el) { el.hidden = false; });
-    track.removeAttribute("tabindex");
+    // The browser makes a scrolling strip a tab stop by itself; the tabs and arrows are the way in.
+    track.setAttribute("tabindex", "-1");
     track.removeAttribute("aria-label");
+    // The caption under the strip says which slide is showing; the strip itself stays quiet.
+    track.removeAttribute("aria-live");
 
     function show(i) {
       index = i;
       Array.prototype.forEach.call(slides, function (slide, n) {
         slide.setAttribute("aria-label", (n + 1) + " of " + count);
         slide.setAttribute("aria-hidden", n === i ? "false" : "true");
-        // The next one loads before it is needed, so it never slides in empty.
-        if (n === (i + 1) % count) {
-          var img = slide.querySelector("img");
-          if (img) img.loading = "eager";
-        }
       });
       Array.prototype.forEach.call(tabs, function (tab, n) {
         if (n === i) tab.setAttribute("aria-current", "true"); else tab.removeAttribute("aria-current");
       });
       var cap = slides[i].querySelector("figcaption");
       if (caption && cap) caption.textContent = cap.textContent;
+      if (counter) counter.textContent = (i + 1) + " / " + count;
       // Keep the chosen tab in view in the tab strip, without moving the page.
       var tab = tabs[i];
       if (tab && tabList && tabList.scrollWidth > tabList.clientWidth) {
@@ -94,17 +94,26 @@
     }
 
     function rolling() {
-      return !stopped && !hovered && !focused && !document.hidden;
+      return !stopped && !hovered && !focused && !away && !document.hidden;
+    }
+
+    // The next slide loads shortly before it is due, so it never slides in empty and a visitor
+    // who never watches the slideshow never downloads it.
+    function preload(i) {
+      var img = slides[i % count].querySelector("img");
+      if (img) img.loading = "eager";
     }
 
     function restart() {
       clearTimeout(timer);
+      clearTimeout(early);
       root.classList.remove("rolling");
       var on = rolling();
-      track.setAttribute("aria-live", on ? "off" : "polite");
+      if (caption) caption.setAttribute("aria-live", on ? "off" : "polite");
       if (!on) return;
       void root.offsetWidth; // restart the progress bar's animation
       root.classList.add("rolling");
+      early = setTimeout(function () { preload(index + 1); }, EVERY - 1500);
       timer = setTimeout(function () { go(index + 1); }, EVERY);
     }
 
@@ -142,6 +151,13 @@
       if (!root.contains(event.relatedTarget)) { focused = false; restart(); }
     });
     document.addEventListener("visibilitychange", restart);
+    // Scrolled out of view, it stops turning.
+    if ("IntersectionObserver" in window) {
+      new IntersectionObserver(function (entries) {
+        away = !entries[0].isIntersecting;
+        restart();
+      }).observe(root);
+    }
     var onMotion = function () {
       stopped = still.matches || stopped;
       root.classList.toggle("stopped", stopped);
@@ -151,6 +167,43 @@
     root.classList.toggle("stopped", stopped);
     if (play && stopped) play.setAttribute("aria-label", "Play the slideshow");
     show(0);
+  })();
+
+  // 4. Sections fade up as they come into view, and cards follow the pointer with a soft light.
+  // Nothing is hidden unless this runs: the stylesheet only hides .reveal under html.rv.
+  (function () {
+    var still = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    var items = document.querySelectorAll(".reveal");
+    if (!still && items.length && "IntersectionObserver" in window) {
+      document.documentElement.classList.add("rv");
+      var seen = new IntersectionObserver(function (entries) {
+        entries.forEach(function (entry) {
+          if (!entry.isIntersecting) return;
+          entry.target.classList.add("in");
+          seen.unobserve(entry.target);
+        });
+      }, { rootMargin: "0px 0px -8% 0px", threshold: 0.12 });
+      Array.prototype.forEach.call(items, function (el) { seen.observe(el); });
+      // Tabbing ahead of the scroll shows what it lands on.
+      document.addEventListener("focusin", function (event) {
+        var hidden = event.target.closest && event.target.closest(".reveal");
+        if (hidden) hidden.classList.add("in");
+      });
+    }
+    // The privacy diagram rests while it is off screen.
+    var flow = document.getElementById("flow");
+    if (flow && "IntersectionObserver" in window) {
+      new IntersectionObserver(function (entries) {
+        flow.classList.toggle("paused", !entries[0].isIntersecting);
+      }).observe(flow);
+    }
+    document.addEventListener("pointermove", function (event) {
+      var card = event.target.closest && event.target.closest(".spot");
+      if (!card) return;
+      var box = card.getBoundingClientRect();
+      card.style.setProperty("--mx", (event.clientX - box.left) + "px");
+      card.style.setProperty("--my", (event.clientY - box.top) + "px");
+    }, { passive: true });
   })();
 
   registerSiteTools();
