@@ -116,6 +116,7 @@ impl Shell {
             home.archive_total = read.archive_total;
             home.drilled = rows(read.drilled);
             home.loaded = true;
+            home.loaded_once = true;
             this.rebuild_home(cx);
         });
     }

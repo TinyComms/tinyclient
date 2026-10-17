@@ -106,6 +106,8 @@ pub struct Home {
     /// The Telegram folder chosen, by id.
     pub folder: Option<String>,
     pub loaded: bool,
+    /// The home has completed a read; sublist loading keeps its cached rows ready.
+    pub loaded_once: bool,
     pub epoch: u64,
     // The user's folds, for this session.
     pub dms_all: bool,
@@ -133,6 +135,10 @@ fn header(out: &mut Vec<Item>, label: &'static str) {
 /// user's order with folders. `open_space`: the Space of the open conversation. `unread`: the
 /// Unread segment, which keeps only what has news.
 pub fn discord(home: &Home, spaces: &[Space], open_space: Option<&str>, unread: bool) -> Vec<Item> {
+    // Spaces arrive separately. Showing them before chats inserts DMs above visible rows.
+    if !home.loaded_once {
+        return Vec::new();
+    }
     let mut out = Vec::new();
     if !unread || home.friend_requests > 0 {
         let after = if home.online > 0 { format!("{} online", home.online) } else { String::new() };
@@ -402,11 +408,47 @@ mod tests {
             in_voice: (0..5).map(|n| chat(&format!("v{n}"), 0)).collect(),
             requests: 2,
             online: 6,
+            loaded: true,
+            loaded_once: true,
             ..Home::for_network(Network::Discord)
         };
         let got = shape(&discord(&home, &spaces, None, false), &spaces);
         assert_eq!(got, ["<Friends>", "<Message requests>", "[In voice]", "v0", "v1", "v2", "<2 more>", "[Direct messages]", "ines", "kofi", "[Servers]", "moss"]);
         assert_eq!(shape(&discord(&home, &spaces, None, true), &spaces), ["[Direct messages]", "ines"]);
+    }
+
+    #[test]
+    fn discord_waits_for_chats_before_showing_cached_servers() {
+        let spaces = [space("moss", None, 0, false)];
+        let mut home = Home::for_network(Network::Discord);
+        assert!(discord(&home, &spaces, None, false).is_empty());
+        assert!(discord(&home, &spaces, None, true).is_empty());
+
+        home.chats = vec![chat("ines", 1)];
+        home.loaded = true;
+        home.loaded_once = true;
+        let ready = shape(&discord(&home, &spaces, None, false), &spaces);
+        assert_eq!(ready, ["<Friends>", "[Direct messages]", "ines", "[Servers]", "moss"]);
+        // Refreshes and sublist loading keep the cached home ready.
+        home.epoch += 1;
+        home.loaded = false;
+        assert_eq!(shape(&discord(&home, &spaces, None, false), &spaces), ready);
+    }
+
+    #[test]
+    fn discord_shows_servers_after_a_completed_empty_chat_read() {
+        let spaces = [space("moss", None, 0, false)];
+        let home = Home { loaded: true, loaded_once: true, ..Home::for_network(Network::Discord) };
+        assert_eq!(shape(&discord(&home, &spaces, None, false), &spaces), ["<Friends>", "[Servers]", "moss"]);
+    }
+
+    #[test]
+    fn discord_servers_arriving_after_chats_append_below_them() {
+        let home = Home { loaded: true, loaded_once: true, chats: vec![chat("ines", 0)], ..Home::for_network(Network::Discord) };
+        let chats = shape(&discord(&home, &[], None, false), &[]);
+        let spaces = [space("moss", None, 0, false)];
+        let complete = shape(&discord(&home, &spaces, None, false), &spaces);
+        assert!(complete.starts_with(&chats));
     }
 
     #[test]
