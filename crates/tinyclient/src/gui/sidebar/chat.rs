@@ -38,6 +38,15 @@ pub fn row_time(now: i64, at: i64) -> String {
     time::stamp(now, at)
 }
 
+/// Sidebar text occupies one visual line, even when a message or draft has paragraphs.
+pub(super) fn one_line(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.chars().any(|c| c.is_whitespace() && c != ' ') {
+        std::borrow::Cow::Owned(text.split_whitespace().collect::<Vec<_>>().join(" "))
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
+}
+
 /// A preview that starts by naming me says it to me, so the name is dropped (C12).
 pub fn strip_me<'a>(preview: &'a str, me: &str) -> &'a str {
     if me.is_empty() {
@@ -217,18 +226,18 @@ impl Shell {
     /// Line two, first match wins: not sent, typing, a draft when nothing is unread, then the
     /// preview with its sender and my ticks.
     pub(super) fn line_two(&self, c: &Conversation, look: Look, color: Rgba) -> Div {
-        let line = div().flex_1().min_w_0().h(px(16.)).flex().items_center().gap(px(4.)).type_small();
+        let line = div().flex_1().min_w_0().h(px(16. + theme::text_step() as f32)).overflow_hidden().flex().items_center().gap(px(4.)).type_small();
         // A4 off: no words of any message, for screen sharing. Typing and Not sent still say so.
         let previews = crate::gui::app::prefs::choices().previews;
         if self.send_failed_in(&c.key) {
             return line
                 .child(glyph("icons/circle-alert.svg", 12., theme::danger()))
                 .child(div().flex_none().text_color(theme::danger()).child("Not sent"))
-                .when(previews, |line| line.child(div().min_w_0().truncate().text_color(theme::text_faint()).child(format!("· {}", c.preview))));
+                .when(previews, |line| line.child(div().min_w_0().truncate().text_color(theme::text_faint()).child(format!("· {}", one_line(&c.preview)))));
         }
         let typing = self.slots.typing.and_then(|typing| typing(self, &c.key));
         if let Some(words) = typing {
-            return line.child(div().min_w_0().truncate().text_color(theme::accent_text()).child(words));
+            return line.child(div().min_w_0().truncate().text_color(theme::accent_text()).child(one_line(&words).into_owned()));
         }
         if !previews {
             return line;
@@ -243,7 +252,7 @@ impl Shell {
             return line
                 .child(glyph("icons/pencil.svg", 12., quiet(theme::text_faint())))
                 .child(div().flex_none().text_color(quiet(theme::text())).font_weight(if c.muted { theme::REGULAR } else { theme::MEDIUM }).child("Draft:"))
-                .child(div().min_w_0().truncate().text_color(quiet(theme::text_soft())).child(draft.to_owned()));
+                .child(div().min_w_0().truncate().text_color(quiet(theme::text_soft())).child(one_line(draft).into_owned()));
         }
         let names = self.my_names(c);
         let preview = names.iter().map(|me| strip_me(&c.preview, me)).find(|stripped| stripped.len() != c.preview.len()).unwrap_or(&c.preview);
@@ -255,19 +264,19 @@ impl Shell {
             .children(ticks)
             .children(who)
             .children(attached)
-            .child(div().min_w_0().truncate().child(preview.to_owned()))
+            .child(div().min_w_0().truncate().child(one_line(preview).into_owned()))
     }
 
     /// What the other side of a DM is doing, for a home that shows it over the last message:
     /// in a call, then an activity, then their status. `muted` is the one color of a muted row.
     fn doing(&self, c: &Conversation, muted: Option<Rgba>) -> Option<Div> {
         let peer = Key { id: c.peer.clone()?, ..c.key.clone() };
-        let line = |color: Rgba| div().flex_1().min_w_0().h(px(16.)).flex().items_center().gap(px(4.)).type_small().text_color(muted.unwrap_or(color));
+        let line = |color: Rgba| div().flex_1().min_w_0().h(px(16. + theme::text_step() as f32)).overflow_hidden().flex().items_center().gap(px(4.)).type_small().text_color(muted.unwrap_or(color));
         let glyph = |icon: &'static str, size: f32, color: Rgba| glyph(icon, size, muted.unwrap_or(color));
         let person = self.people_state.hub().person(&peer);
         let voice = person.as_ref().and_then(|p| p.activity.as_ref()).filter(|a| a.kind == protocol::ActivityKind::InVoice && !a.name.is_empty());
         if let Some(voice) = voice {
-            return Some(line(theme::accent_text()).child(glyph("icons/volume-2.svg", 12., theme::accent_text())).child(div().min_w_0().truncate().child(format!("In {}", voice.name))));
+            return Some(line(theme::accent_text()).child(glyph("icons/volume-2.svg", 12., theme::accent_text())).child(div().min_w_0().truncate().child(format!("In {}", one_line(&voice.name)))));
         }
         if self.in_call(&peer) {
             return Some(line(theme::accent_text()).child(glyph("icons/phone.svg", 12., theme::accent_text())).child("In a call"));
@@ -287,12 +296,12 @@ impl Shell {
                 Presenting => "Presenting",
             };
             let words = if activity.name.is_empty() { verb.to_owned() } else { format!("{verb} {}", activity.name) };
-            return Some(line(theme::text_soft()).child(div().min_w_0().truncate().child(words)));
+            return Some(line(theme::text_soft()).child(div().min_w_0().truncate().child(one_line(&words).into_owned())));
         }
         let status = self.people_state.hub().status_of(&peer);
         let status = if status.is_empty() { person.status.clone() } else { status };
         (!status.is_empty() || !person.emoji.is_empty()).then(|| {
-            line(theme::text_soft()).child(div().min_w_0().truncate().child(presence::status_words(&person.emoji, &status)))
+            line(theme::text_soft()).child(div().min_w_0().truncate().child(one_line(&presence::status_words(&person.emoji, &status)).into_owned()))
         })
     }
 
@@ -322,7 +331,9 @@ impl Shell {
         // Six letters and the ellipsis, or nothing.
         let context = context.filter(|_| room > 6. * 7. + 14.);
         let line_one = div()
-            .h(px(18.))
+            .h(px(18. + theme::text_step() as f32))
+            .flex_none()
+            .overflow_hidden()
             .flex()
             .items_center()
             .gap(px(6.))
@@ -335,11 +346,11 @@ impl Shell {
                     .type_ui()
                     .font_weight(tone.weight)
                     .text_color(tone.title)
-                    .child(title),
+                    .child(one_line(&title).into_owned()),
             )
             .children(name_mark(c))
             .map(|line| match context {
-                Some(context) => line.child(div().flex_1().min_w_0().truncate().type_ui().text_color(faint).child(context)),
+                Some(context) => line.child(div().flex_1().min_w_0().truncate().type_ui().text_color(faint).child(one_line(&context).into_owned())),
                 None => line.child(div().flex_1()),
             })
             .when(!stamp.is_empty(), |line| line.child(div().flex_none().type_micro().text_color(faint).child(stamp)));
@@ -354,7 +365,7 @@ impl Shell {
                     .flex()
                     .flex_col()
                     .child(line_one)
-                    .child(div().h(px(16.)).flex().items_center().gap(px(6.)).child(self.line_two(c, look, tone.preview)).children(badge)),
+                    .child(div().h(px(16. + theme::text_step() as f32)).flex_none().overflow_hidden().flex().items_center().gap(px(6.)).child(self.line_two(c, look, tone.preview)).children(badge)),
             );
         let (picked, menu_row) = (c.clone(), c.clone());
         list_row(row_id(id, &c.key), theme::row_height(theme::ROW_TWO), selected, focused, content)
@@ -390,6 +401,20 @@ impl Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multiline_previews_and_drafts_stay_on_one_sidebar_line() {
+        for (text, expected) in [
+            ("@everyone\n\nWe will be performing network upgrade…", "@everyone We will be performing network upgrade…"),
+            ("UI Updates:\r\n+ RFQ builder now…", "UI Updates: + RFQ builder now…"),
+            ("first\u{2028}second\u{2029}third", "first second third"),
+            ("draft\titem\nnext", "draft item next"),
+        ] {
+            assert_eq!(one_line(text), expected);
+        }
+        assert!(matches!(one_line("You: Nice."), std::borrow::Cow::Borrowed(_)));
+        assert_eq!(one_line("two  spaces"), "two  spaces");
+    }
 
     #[test]
     fn a_preview_drops_my_name_and_names_its_attachment() {

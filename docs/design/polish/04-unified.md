@@ -32,6 +32,12 @@ Requirements: `docs/product/polish/05-unified-views.md`, settled by `00-rulings.
 | Line 2 | First match: **Not sent** (alert 12 + `danger` "Not sent" + faint ` · text`) · **typing** (three 4 pt dots + "Mara is typing", `accent_text`, the `06` timer) · **draft** when nothing is unread (pencil 12, "Draft:" `text`/500, then the text) · **missed call** (phone-missed 12 + `danger` "Missed call") · **preview**. `You: ` for mine, `Sender: ` in groups and channels (first name). Attachments: glyph 12 `text_faint` + word ("Photo", "2 photos", "Voice message", "Sticker", file name). Custom emoji `:name:`. A leading mention of me is stripped. Colour: `text_soft`, or `text` when unread. |
 | Badge | 16 high, end of line 2. **Mention:** `accent` fill, white numeral, no "@". **Unread count:** no fill, 1 pt `border_strong` inset ring, `text` numeral. **Starred channel, plain unread:** 8 `text` dot. **Muted:** 6 `text_faint` dot; a mention still shows its filled pill. |
 
+Sidebar text stays on one visual line per slot. Embedded line breaks and tabs in
+previews, drafts, activity/status text, and names are collapsed to spaces for
+sidebar display; stored messages and drafts keep their formatting. Each title
+and preview slot clips overflow and follows the current text-size step, so
+resizing the sidebar cannot let a preview paint into a neighboring row.
+
 | State | Drawn as |
 |---|---|
 | rest / hover / pressed | none / `hover` / `pressed` fill |

@@ -153,7 +153,7 @@ impl Shell {
                     .flex_col()
                     .child(
                         div()
-                            .h(px(18.))
+                            .h(px(18. + theme::text_step() as f32)).flex_none().overflow_hidden()
                             .flex()
                             .items_center()
                             .gap(px(4.))
@@ -164,11 +164,11 @@ impl Shell {
                     )
                     .child(
                         div()
-                            .h(px(16.))
+                            .h(px(16. + theme::text_step() as f32)).flex_none().overflow_hidden()
                             .flex()
                             .items_center()
                             .gap(px(6.))
-                            .child(div().flex_1().min_w_0().truncate().type_small().text_color(if unread { theme::text() } else { theme::text_soft() }).child(apps.names()))
+                            .child(div().flex_1().min_w_0().truncate().type_small().text_color(if unread { theme::text() } else { theme::text_soft() }).child(super::chat::one_line(&apps.names()).into_owned()))
                             .children(badge),
                     ),
             );
@@ -186,9 +186,9 @@ impl Shell {
             .gap(px(8.))
             .child(Avatar::new(&app.key, &app.title, 20.).shape(Shape::Place).image_at(picture).build())
             .children(mark.then(|| super::chat::mark(app.key.network, 12., faint)))
-            .child(div().flex_none().max_w(px(110.)).truncate().type_ui().font_weight(if unread { theme::SEMIBOLD } else { theme::REGULAR }).text_color(theme::text()).child(app.title.clone()))
+            .child(div().flex_none().max_w(px(110.)).truncate().type_ui().font_weight(if unread { theme::SEMIBOLD } else { theme::REGULAR }).text_color(theme::text()).child(super::chat::one_line(&app.title).into_owned()))
             // A4 off: the name and time only, as every other row.
-            .child(div().flex_1().min_w_0().truncate().type_small().text_color(faint).when(crate::gui::app::prefs::choices().previews, |line| line.child(app.preview.clone())))
+            .child(div().flex_1().min_w_0().truncate().type_small().text_color(faint).when(crate::gui::app::prefs::choices().previews, |line| line.child(super::chat::one_line(&app.preview).into_owned())))
             .child(div().flex_none().type_micro().text_color(faint).child(row_time(now(), app.updated)))
             .children(super::super::components::row_badge(app));
         let picked = app.clone();
