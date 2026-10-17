@@ -206,6 +206,17 @@ use direct startup. For source builds or archive installations, copy
 manager before enabling it. Keep the four executables together. AppImage users
 should use automatic daemon startup.
 
+## Keyboard shortcuts
+
+Shortcuts use Command on macOS and Ctrl on Linux and Windows. For example,
+**Jump to…** is Cmd+K on macOS and Ctrl+K elsewhere. Menus, tooltips, and
+Settings → Keyboard Shortcuts display the keys for your platform; Super is
+left to the Linux desktop. Full screen uses Ctrl+Alt+F on Linux and Windows.
+
+Text fields use native editing keys: Ctrl+C/V/X/A/Z on Linux and Windows,
+Ctrl+Left/Right to move by word, and Home/End to move within a line. The
+optional send shortcut is Ctrl+Enter there and Command+Return on macOS.
+
 ## Build from source
 
 Prerequisites:

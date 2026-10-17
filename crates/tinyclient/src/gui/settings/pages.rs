@@ -530,7 +530,7 @@ impl SettingsWindow {
             control = control.child(
                 segment(SharedString::from(format!("{id}-{ix}")), *choice, ix == current)
                     .role(gpui::Role::RadioButton)
-                    .aria_label(*choice)
+                    .aria_label(crate::gui::shortcuts::label(choice))
                     .aria_selected(ix == current)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if ix != current {

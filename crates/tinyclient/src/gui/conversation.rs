@@ -1082,7 +1082,7 @@ impl Pane {
             }
             "home" => self.list.scroll_to(ListOffset::default()),
             "end" => self.go_to_bottom(cx),
-            "c" if keys.modifiers.platform && self.selected_text().is_some() => self.copy_selection(cx),
+            "c" if crate::gui::shortcuts::primary(keys.modifiers) && self.selected_text().is_some() => self.copy_selection(cx),
             _ => return,
         }
         cx.stop_propagation();

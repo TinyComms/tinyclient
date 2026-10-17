@@ -122,22 +122,22 @@ pub fn menus(places: &[(String, usize)], open_network: Option<Network>, update_i
 pub fn bind_keys(cx: &mut App) {
     use gpui::KeyBinding;
     cx.bind_keys([
-        KeyBinding::new("cmd-,", Settings, None),
-        KeyBinding::new("cmd-h", Hide, None),
-        KeyBinding::new("alt-cmd-h", HideOthers, None),
-        KeyBinding::new("cmd-n", NewMessage, None),
-        KeyBinding::new("cmd-u", AttachFile, None),
-        KeyBinding::new("cmd-w", CloseWindow, None),
-        KeyBinding::new("cmd-=", BiggerText, None),
-        KeyBinding::new("cmd-+", BiggerText, None),
-        KeyBinding::new("cmd--", SmallerText, None),
-        KeyBinding::new("cmd-0", ActualSize, None),
-        KeyBinding::new("ctrl-cmd-f", FullScreen, None),
-        KeyBinding::new("alt-cmd-i", ShowDetails, None),
-        KeyBinding::new("cmd-shift-c", StartCall, None),
-        KeyBinding::new("alt-cmd-o", OpenInNetwork, None),
-        KeyBinding::new("cmd-m", Minimize, None),
-        KeyBinding::new("cmd-/", KeyboardShortcuts, None),
+        KeyBinding::new("secondary-,", Settings, None),
+        KeyBinding::new("secondary-h", Hide, None),
+        KeyBinding::new("alt-secondary-h", HideOthers, None),
+        KeyBinding::new("secondary-n", NewMessage, None),
+        KeyBinding::new("secondary-u", AttachFile, None),
+        KeyBinding::new("secondary-w", CloseWindow, None),
+        KeyBinding::new("secondary-=", BiggerText, None),
+        KeyBinding::new("secondary-+", BiggerText, None),
+        KeyBinding::new("secondary--", SmallerText, None),
+        KeyBinding::new("secondary-0", ActualSize, None),
+        KeyBinding::new(if cfg!(target_os = "macos") { "ctrl-cmd-f" } else { "ctrl-alt-f" }, FullScreen, None),
+        KeyBinding::new("alt-secondary-i", ShowDetails, None),
+        KeyBinding::new("secondary-shift-c", StartCall, None),
+        KeyBinding::new("alt-secondary-o", OpenInNetwork, None),
+        KeyBinding::new("secondary-m", Minimize, None),
+        KeyBinding::new("secondary-/", KeyboardShortcuts, None),
     ]);
 }
 

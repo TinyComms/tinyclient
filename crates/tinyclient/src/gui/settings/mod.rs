@@ -190,7 +190,7 @@ pub fn note_changed(cx: &mut App) {
 pub fn attach(shell: WeakEntity<Shell>, cx: &mut App) {
     cx.default_global::<Host>().shell = Some(shell);
     cx.bind_keys([
-        KeyBinding::new("cmd-f", Find, Some("Settings")),
+        KeyBinding::new("secondary-f", Find, Some("Settings")),
         KeyBinding::new("escape", Dismiss, Some("Settings")),
         KeyBinding::new("tab", NextControl, Some("Settings")),
         KeyBinding::new("shift-tab", PreviousControl, Some("Settings")),

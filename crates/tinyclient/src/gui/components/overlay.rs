@@ -41,9 +41,10 @@ pub fn tip(
     shortcut: Option<&'static str>,
 ) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
     let words: SharedString = words.into();
+    let words: SharedString = crate::gui::shortcuts::label(&words).into();
     move |_, cx| {
         let words = words.clone();
-        cx.new(|_| Tip { words, shortcut: shortcut.map(SharedString::from) }).into()
+        cx.new(|_| Tip { words, shortcut: shortcut.map(|keys| crate::gui::shortcuts::label(keys).into()) }).into()
     }
 }
 
@@ -115,7 +116,7 @@ fn menu_row(
                 .type_small()
                 .text_color(theme::text_faint())
                 .group_hover("menu-item", |style| style.text_color(theme::text_soft()))
-                .child(keys)
+                .child(crate::gui::shortcuts::label(keys))
         }))
 }
 

@@ -415,6 +415,7 @@ pub fn field_error_line(words: impl Into<SharedString>) -> Div {
 
 /// A keycap such as `⌘K`.
 pub fn keycap(keys: impl Into<SharedString>) -> Div {
+    let keys: SharedString = keys.into();
     div()
         .flex_none()
         .h(px(18.))
@@ -428,7 +429,7 @@ pub fn keycap(keys: impl Into<SharedString>) -> Div {
         .line_height(px(14.))
         .font_weight(theme::MEDIUM)
         .text_color(theme::text_faint())
-        .child(keys.into())
+        .child(crate::gui::shortcuts::label(&keys))
 }
 
 /// The search field's box, with its glyph. The caller adds the input, then a keycap or a clear.
@@ -451,6 +452,7 @@ pub fn segmented() -> Div {
 }
 
 pub fn segment(id: impl Into<ElementId>, label: impl Into<SharedString>, selected: bool) -> Stateful<Div> {
+    let label: SharedString = label.into();
     div()
         .id(id)
         .h(px(24.))
@@ -468,7 +470,7 @@ pub fn segment(id: impl Into<ElementId>, label: impl Into<SharedString>, selecte
                 segment.text_color(theme::text_soft()).hover(|style| style.text_color(theme::text()))
             }
         })
-        .child(label.into())
+        .child(crate::gui::shortcuts::label(&label))
 }
 
 /// A 1 pt line between sections.
@@ -569,7 +571,7 @@ fn empty_state_body(icon: Svg, title: &str, detail: &str) -> Div {
                     .text_center()
                     .type_ui()
                     .text_color(theme::text_soft())
-                    .child(detail.to_owned()),
+                    .child(crate::gui::shortcuts::label(detail)),
             )
         })
 }

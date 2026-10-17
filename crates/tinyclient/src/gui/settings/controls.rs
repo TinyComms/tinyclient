@@ -40,7 +40,8 @@ pub fn group_label(words: impl Into<SharedString>) -> Div {
 
 /// The words under a card, 6 below it.
 pub fn caption(words: impl Into<SharedString>) -> Div {
-    div().pt(px(6.)).px(px(12.)).max_w(px(456.)).type_small().text_color(theme::text_faint()).child(words.into())
+    let words: SharedString = words.into();
+    div().pt(px(6.)).px(px(12.)).max_w(px(456.)).type_small().text_color(theme::text_faint()).child(crate::gui::shortcuts::label(&words))
 }
 
 /// A row: its label (and the line saying what the value does) on the left, the control on the
