@@ -146,7 +146,7 @@ pub fn quit(cx: &mut App) {
     cx.quit();
 }
 
-/// Quitting stops chatd too (`docs/product/09-settings.md` G2), however it happens: ⌘Q, Dock ›
+/// Quitting stops an application-managed chatd too (`docs/product/09-settings.md` G2): ⌘Q, Dock ›
 /// Quit, logging out or shutting down all end in the app's quit handlers. Asked off the main
 /// thread and briefly, so a chatd that does not answer cannot hold the quit; GPUI waits 200 ms
 /// for the handlers, and the request is written well before that.
@@ -157,16 +157,21 @@ pub fn stop_chatd_on_quit(cx: &mut App) {
     cx.on_app_quit(|cx| {
         crate::update::apply_on_quit();
         cx.background_executor().spawn(async {
+            // An enabled user unit owns the daemon's lifetime, including restarts.
+            if protocol::launch::systemd_chatd() {
+                return;
+            }
             let _ = crate::client::ask_within(&protocol::Request::Shutdown, Some(std::time::Duration::from_millis(150)));
         })
     })
     .detach();
 }
 
-/// ⌘W and the red button: with Keep receiving on, the window hides and chatd goes on receiving
-/// and the Dock badge counting; off, tinyclient quits.
+/// Closing the main window quits on Linux and Windows, where application hiding is not
+/// implemented. On macOS, Keep receiving hides the window and leaves chatd receiving;
+/// otherwise closing quits there too.
 pub fn close_window(cx: &mut App) {
-    if super::prefs::values().on(protocol::settings::KEEP_RUNNING) {
+    if cfg!(target_os = "macos") && super::prefs::values().on(protocol::settings::KEEP_RUNNING) {
         cx.hide();
     } else {
         quit(cx);

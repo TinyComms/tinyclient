@@ -152,7 +152,7 @@ impl Shell {
                         let started = cx.background_executor().spawn(async { protocol::launch::start_chatd() }).await;
                         let Ok(()) = this.update(cx, |this, cx| match started {
                             Ok(pid) => {
-                                this.service.pid = Some(pid);
+                                this.service.pid = pid;
                                 this.service.launched = Some(Instant::now());
                             }
                             Err(_) => this.stop_trying(Stopped::CannotStart, cx),

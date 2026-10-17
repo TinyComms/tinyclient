@@ -80,6 +80,10 @@ below is a place to help.
 | **Signal** | Linked as a device: scan a QR code from your phone | Direct and group chats, replies, mentions, reactions, edits, deletes. Photos and files appear as a labelled line, not shown. Nothing from before the link. | Text, replies, reactions, edit and delete your own | Not built |
 | **Messages** | Paired from the Android phone, the way messages.google.com is. The phone stays the account and has to stay online. | Texts in the chats the phone already has. Photos and files appear as a labelled line, not shown. | Text. Reactions are not in this version. | Opens in Messages |
 
+Signal identifies your own conversation as **Note to Self**, including messages
+sent from your phone. Existing cached self-conversations are relabeled when the
+account reconnects; their messages are preserved.
+
 Not built yet: message search (the switcher finds conversations by title in the local cache),
 notifications and a dock badge, video and screen share, voice messages, Signal attachments and
 safety numbers, Messages reactions and shown photos, Teams personal accounts. Each is a place to help; see [Contributing](#contributing).
@@ -122,10 +126,85 @@ itself. Start `tinyclient`; it starts `chatd` when nothing answers on the socket
   it. Allow it in System Settings > Privacy & Security if you trust the build. Open the app
   rather than the bare binaries: macOS grants the microphone to an app bundle, so calls need it.
 - **Linux.** Sessions are kept in the Secret Service (GNOME Keyring, KWallet), which must be
-  running. The sign-in window needs WebKitGTK 4.1.
+  running with its keyring unlocked in your login session. With a standalone compositor
+  such as dwl, configure the provider's startup and unlocking separately; installing a
+  provider does not ensure the session is ready. KeePassXC also works when its Secret
+  Service integration is enabled. Arch packages can require the virtual dependency
+  `org.freedesktop.secrets` to accept any packaged provider.
+  The sign-in window needs WebKitGTK 4.1 and supports both Wayland and X11.
+
+  For sign-in diagnostics, launch tinyclient with `TINYCLIENT_LOGIN_DEBUG=1` to log
+  whether the helper is waiting on Discord's login page or completing session probes.
+  These messages go to stderr without credentials. A standalone helper's stdout
+  contains the session token; redirect it to `/dev/null` when diagnosing, and never
+  share it. A standalone helper does not attach an account to tinyclient.
+  The Discord storage probe fixtures can be run with
+  `node crates/login/tests/discord-probe.cjs` (Node.js is only needed for these fixtures).
 - **Windows.** The installer and programs are not code-signed, so SmartScreen warns before the
   first run (More info > Run anyway). The sign-in window needs WebView2, which current Windows
   includes.
+
+## Optional systemd user service on Linux
+
+The `.deb`, `.rpm` and Arch package can install `tinyclient-chatd.service`. It is
+**disabled by default**. With the unit disabled, tinyclient starts its own daemon,
+logs to `chatd.log` and stops the daemon when the application quits.
+
+To let systemd manage the daemon, quit tinyclient first so its existing daemon
+releases the socket. Then, from a terminal in your graphical session:
+
+```sh
+systemctl --user daemon-reload
+systemctl --user import-environment WAYLAND_DISPLAY DISPLAY XDG_CURRENT_DESKTOP
+systemctl --user enable --now tinyclient-chatd.service
+journalctl --user -u tinyclient-chatd.service -f
+```
+
+Import only the variables your session actually sets (Wayland normally sets
+`WAYLAND_DISPLAY`; X11 sets `DISPLAY`). If you use `XDG_DATA_HOME`, import that too
+so the GUI and daemon use the same data directory. Your Secret Service provider
+must be running and unlocked on the same user session bus.
+
+When the unit is enabled, opening tinyclient asks systemd to start the daemon if
+needed. Quitting the GUI leaves the daemon receiving messages; the window's
+“Keep receiving” preference does not override the enabled service. Failed starts
+are reported without spawning a second, unmanaged daemon. Use
+`systemctl --user restart tinyclient-chatd.service` after upgrading the binaries.
+To stop background activity, quit the GUI and run
+`systemctl --user stop tinyclient-chatd.service`.
+
+The unit follows `graphical-session.target`. Desktops that manage that target
+start and stop it with the graphical session. With dwl or another standalone
+compositor, import the display environment after the compositor starts, then
+start the service; stop it when leaving the session. Repeat the environment
+import on each login so sign-in helpers use the current display. Do not enable
+lingering just for this service: sign-in windows need a live graphical session.
+
+To return to automatic daemon startup, quit the GUI and run:
+
+```sh
+systemctl --user disable --now tinyclient-chatd.service
+```
+
+
+The managed daemon inherits the user manager's environment, not the GUI's.
+For sign-in diagnostics, import `TINYCLIENT_LOGIN_DEBUG=1` into the manager and
+restart the service, then reproduce sign-in while watching its journal:
+
+```sh
+TINYCLIENT_LOGIN_DEBUG=1 systemctl --user import-environment TINYCLIENT_LOGIN_DEBUG
+systemctl --user restart tinyclient-chatd.service
+# After diagnosing:
+systemctl --user unset-environment TINYCLIENT_LOGIN_DEBUG
+systemctl --user restart tinyclient-chatd.service
+```
+
+Scratch runs (`TINYCLIENT_DIR`) and explicit `TINYCLIENT_CHATD` overrides always
+use direct startup. For source builds or archive installations, copy
+`packaging/linux/tinyclient-chatd.service` into `~/.config/systemd/user/`, change
+`ExecStart` to the absolute path of your installed `chatd`, and reload the user
+manager before enabling it. Keep the four executables together. AppImage users
+should use automatic daemon startup.
 
 ## Build from source
 
@@ -243,6 +322,15 @@ adapter must do are in [`docs/architecture.md`](docs/architecture.md).
 | Avatars and attachments you looked at | `media/` in the data directory, capped at 500 MB | Not encrypted, as above |
 | Crash reports and chatd's log | `crash.log`, `chatd.log` in the data directory | Credentials redacted before writing (`protocol::redact`). Never uploaded. |
 | The sign-in window's browser data | A WebKit data store on macOS; `login/<network>/` in the data directory elsewhere | Kept so an interrupted sign-in resumes |
+
+On Linux, a Secret Service provider may need you to unlock GPG before returning
+saved sessions. Background account loading retries short D-Bus read timeouts for
+up to two minutes while
+tinyclient keeps waiting for the keychain. Unlock within that window and the
+accounts reconnect automatically, without signing in again. Explicit refusals,
+other errors, or an expired retry window keep the cached accounts and offer
+“Try again”; stored credentials are not deleted. This does not change GPG's
+passphrase cache settings.
 
 The data directory is `~/Library/Application Support/tinyclient` on macOS,
 `$XDG_DATA_HOME/tinyclient` (default `~/.local/share/tinyclient`) on Linux, and

@@ -34,11 +34,10 @@ pub const SLACK: Site = Site {
 pub const DISCORD: Site = Site {
     title: "Sign in to Discord",
     start: "https://discord.com/login",
-    // The token lives in this page's own localStorage. Read it there. An iframe appended to
-    // the page to reach the same storage is the same read, and it tears down the password
-    // field while the person is typing it.
-    probe: "(()=>{try{const t=localStorage.getItem('token');\
-            return t?JSON.stringify({token:JSON.parse(t)}):null}catch(e){return null}})()",
+    // The client may remove localStorage from its own window. A same-origin
+    // frame still exposes the shared storage. hands_off() prevents this probe
+    // from running while the user is typing on Discord's login page.
+    probe: "(()=>{let t=null;try{t=window.localStorage.getItem('token')}catch(e){}if(!t){let f;try{f=document.createElement('iframe');f.style.display='none';document.documentElement.appendChild(f);t=f.contentWindow.localStorage.getItem('token')}catch(e){}finally{if(f)f.remove()}}if(!t)return null;try{const token=JSON.parse(t);return typeof token==='string'&&token?JSON.stringify({token}):null}catch(e){return null}})()",
     read: |found| serde_json::from_str(found).ok(),
     cookie: None,
     detour: None,
@@ -440,7 +439,7 @@ mod tests {
         assert!(!hands_off("https://discord.com/channels/@me"));
         assert!(!hands_off("https://discord.com/app"));
         assert!(!hands_off("https://slack.com/signin"));
-        assert!(!DISCORD.probe.contains("iframe"));
+        assert!(DISCORD.probe.contains("iframe"));
         assert!(DISCORD.probe.contains("localStorage.getItem('token')"));
     }
 
