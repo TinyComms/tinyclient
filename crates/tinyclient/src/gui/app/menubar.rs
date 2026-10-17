@@ -146,7 +146,7 @@ pub fn quit(cx: &mut App) {
     cx.quit();
 }
 
-/// Quitting stops chatd too (`docs/product/09-settings.md` G2), however it happens: ⌘Q, Dock ›
+/// Quitting stops an application-managed chatd too (`docs/product/09-settings.md` G2): ⌘Q, Dock ›
 /// Quit, logging out or shutting down all end in the app's quit handlers. Asked off the main
 /// thread and briefly, so a chatd that does not answer cannot hold the quit; GPUI waits 200 ms
 /// for the handlers, and the request is written well before that.
@@ -157,6 +157,10 @@ pub fn stop_chatd_on_quit(cx: &mut App) {
     cx.on_app_quit(|cx| {
         crate::update::apply_on_quit();
         cx.background_executor().spawn(async {
+            // An enabled user unit owns the daemon's lifetime, including restarts.
+            if protocol::launch::systemd_chatd() {
+                return;
+            }
             let _ = crate::client::ask_within(&protocol::Request::Shutdown, Some(std::time::Duration::from_millis(150)));
         })
     })

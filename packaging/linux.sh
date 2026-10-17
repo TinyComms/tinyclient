@@ -67,6 +67,8 @@ mkdir -p "$usr/lib/tinyclient" "$usr/share/applications" "$usr/share/metainfo"
 for program in $programs; do
     install -m 755 "$release/$program" "$usr/lib/tinyclient/$program"
 done
+install -Dm644 "$root/packaging/linux/tinyclient-chatd.service" \
+    "$usr/lib/systemd/user/tinyclient-chatd.service"
 cp "$root/packaging/linux/$id.desktop" "$usr/share/applications/"
 sed -e "s/@VERSION@/$version/" -e "s/@DATE@/$(date -u +%Y-%m-%d)/" \
     "$root/packaging/linux/$id.metainfo.xml" > "$usr/share/metainfo/$id.metainfo.xml"
