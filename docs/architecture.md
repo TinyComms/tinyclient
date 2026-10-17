@@ -37,6 +37,7 @@ How the processes fit together and who may edit what. The contract itself is the
 | `Threads {space, offset, limit}`, `Topics {forum, offset, limit}` | `Conversations` | store; `Command::OpenThreads` at offset 0 |
 | `InVoice {network}`, `Around {network}` | `Conversations`; `Around {requests, in_call, online, recent}` | hub (occupants, presence, activity) and store |
 | `Find {network, query, limit}` | `Conversations` (title contains, newest first, cache only) | store |
+| `SearchMessages {conversation, network, query, limit}` | `MessageHits {hits (where, snippet, sender, title)}` (text contains, newest first, cache only) | store |
 | `Spaces {network}`, `Tree {space, offset, limit, peek}` | `Spaces`; `Tree {groups (kind, count), conversations, total}` | store; `Command::OpenSpace` |
 | `Conversation`, `Collapse`, `Star`, `SetDraft` | `Conversation`; `Ok` | store (local only) |
 | `People {network, relation, query, offset, limit}` | `People {people, total}` | store; `Command::SearchPeople`, debounced |
