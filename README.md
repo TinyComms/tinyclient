@@ -169,6 +169,19 @@ To return to automatic daemon startup, quit the GUI and run:
 systemctl --user disable --now tinyclient-chatd.service
 ```
 
+
+The managed daemon inherits the user manager's environment, not the GUI's.
+For sign-in diagnostics, import `TINYCLIENT_LOGIN_DEBUG=1` into the manager and
+restart the service, then reproduce sign-in while watching its journal:
+
+```sh
+TINYCLIENT_LOGIN_DEBUG=1 systemctl --user import-environment TINYCLIENT_LOGIN_DEBUG
+systemctl --user restart tinyclient-chatd.service
+# After diagnosing:
+systemctl --user unset-environment TINYCLIENT_LOGIN_DEBUG
+systemctl --user restart tinyclient-chatd.service
+```
+
 Scratch runs (`TINYCLIENT_DIR`) and explicit `TINYCLIENT_CHATD` overrides always
 use direct startup. For source builds or archive installations, copy
 `packaging/linux/tinyclient-chatd.service` into `~/.config/systemd/user/`, change
