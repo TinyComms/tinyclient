@@ -1145,7 +1145,17 @@ impl Render for Pane {
             .size_full();
         let after = gpui::canvas(
             |_, _, _| (),
-            move |_, (), window, cx| this.update(cx, |this, cx| this.after_layout(window, cx)),
+            move |_, (), window, cx| {
+                this.update(cx, |this, cx| this.after_layout(window, cx));
+                let pane = this.clone();
+                // Track geometry before hit testing/occlusion can hide the pane behind
+                // its own toolbar. Do not consume the event: buttons still receive it.
+                window.on_mouse_event(move |event: &gpui::MouseMoveEvent, phase, _, cx| {
+                    if phase == gpui::DispatchPhase::Capture {
+                        pane.update(cx, |this, cx| this.point_at(event.position, cx));
+                    }
+                });
+            },
         )
         .absolute()
         .size_0();
@@ -1173,10 +1183,10 @@ impl Render for Pane {
                     }
                 }),
             )
-            .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| this.point_at(event.position, cx)))
-            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+            .on_hover(cx.listener(|this, hovered: &bool, window, cx| {
                 if !*hovered {
-                    this.unpoint(cx);
+                    // Occlusion is not a pointer exit; recheck the row/toolbar bounds.
+                    this.point_at(window.mouse_position(), cx);
                 }
             }))
             .child(rows)
