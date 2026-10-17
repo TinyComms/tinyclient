@@ -395,7 +395,8 @@ impl Pane {
         root: Option<(Rc<Message>, u32)>,
         cx: &mut Context<Self>,
     ) {
-        let around = self.landing.take().or(self.around.take());
+        let landing = self.landing.take();
+        let around = self.around.take();
         // Where the one being left was, for coming back to it.
         if let Some((left, place)) = self.key().cloned().zip(self.place()) {
             self.places.put(left, place);
@@ -450,13 +451,17 @@ impl Pane {
         self.pending_at.clear();
         self.relay(true, ListOffset::default());
         self.ask_reactions(cx);
-        // M2: a conversation opens at its newest message rather than the first unread.
+        // M2: a conversation opens at its newest message rather than the first unread. A search
+        // hit's landing is the user's own ask: it lands as a jump, flashed, with the pill.
         let around = around.filter(|_| !super::app::prefs::choices().newest);
         match back {
             Some(place) => self.load(Page::Around { id: place.id.clone() }, Purpose::Restore(place.id, place.offset), cx),
-            None => match around {
-                Some(id) => self.load(Page::Around { id }, Purpose::Open, cx),
-                None => self.load(Page::Newest, Purpose::Open, cx),
+            None => match landing {
+                Some(id) => self.load(Page::Around { id: id.clone() }, Purpose::Jump(id), cx),
+                None => match around {
+                    Some(id) => self.load(Page::Around { id }, Purpose::Open, cx),
+                    None => self.load(Page::Newest, Purpose::Open, cx),
+                },
             },
         }
         cx.notify();
