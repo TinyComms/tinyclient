@@ -122,8 +122,7 @@ impl Real {
         let closed: Arc<AtomicBool> = Arc::default();
         let thread_closed = closed.clone();
         let fallback = saved.name.clone();
-        std::thread::Builder::new()
-            .name("signal-wire".into())
+        super::presage_thread("signal-wire")
             .spawn(move || {
                 let runtime = match runtime() {
                     Ok(runtime) => runtime,

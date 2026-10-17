@@ -54,8 +54,7 @@ pub fn step(hub: &Arc<Hub>, input: Option<SignInInput>, adopt: Adopt) -> Result<
             let linker = linker()?;
             let flow = Arc::new(Flow { hub: hub.clone(), step: Mutex::new(waiting()), ended: AtomicBool::new(false), cancelled: Arc::default() });
             let running = flow.clone();
-            std::thread::Builder::new()
-                .name("signal-link".into())
+            super::presage_thread("signal-link")
                 .spawn(move || running.run(linker, adopt))
                 .map_err(|err| err.to_string())?;
             *held = Some(flow.clone());

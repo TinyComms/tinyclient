@@ -146,6 +146,18 @@ fn linker() -> Result<Box<dyn wire::Linker>, String> {
     }
 }
 
+/// A thread that runs presage: the wire's, or a link's. Unoptimized, presage and libsignal keep far
+/// more on the stack than Rust's default 2 MiB, and a debug build overflows it, which aborts chatd.
+/// Only the pages a thread touches use memory.
+fn presage_thread(name: &str) -> std::thread::Builder {
+    let thread = std::thread::Builder::new().name(name.to_owned());
+    if cfg!(debug_assertions) {
+        thread.stack_size(64 * 1024 * 1024)
+    } else {
+        thread
+    }
+}
+
 /// What this device kept of an account, gone: after unlinking, or when signing out offline.
 fn forget(saved: &Saved) {
     #[cfg(feature = "signal")]
