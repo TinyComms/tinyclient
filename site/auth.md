@@ -2,7 +2,7 @@
 
 tinyclient does not run an account service. There is no agent registration, no client id, and no credential to claim or revoke.
 
-The desktop app signs in to Slack, Discord, Telegram, Microsoft Teams, and Signal on the computer where it is installed. Those sessions stay in the operating system keychain. tinyclient.io does not issue access tokens, does not accept credentials, and does not proxy messages.
+The desktop app signs in to Slack, Discord, Telegram, Microsoft Teams, Signal, and Android Messages on the computer where it is installed. Those sessions stay in the operating system keychain. tinyclient.io does not issue access tokens, does not accept credentials, and does not proxy messages.
 
 ## Audience
 

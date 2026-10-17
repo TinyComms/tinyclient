@@ -1308,6 +1308,7 @@ caption {
 .fl-pkt.n-telegram { stroke: #29a9eb; }
 .fl-pkt.n-teams { stroke: #7b83eb; }
 .fl-pkt.n-signal { stroke: #3a76f0; }
+.fl-pkt.n-messages { stroke: #1a73e8; }
 .fl-pkt.fl-login { stroke: var(--soft); }
 
 .flow-cap { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px 22px; margin-top: 14px; font-size: 13px; color: var(--faint); }
@@ -1326,6 +1327,7 @@ caption {
   .fl-pkt.d2 { animation-delay: 2.0s; } .fl-pkt.b2 { animation-delay: 4.4s; }
   .fl-pkt.d3 { animation-delay: 2.9s; } .fl-pkt.b3 { animation-delay: .5s; }
   .fl-pkt.d4 { animation-delay: 3.8s; } .fl-pkt.b4 { animation-delay: 1.4s; }
+  .fl-pkt.d5 { animation-delay: 4.6s; } .fl-pkt.b5 { animation-delay: 2.2s; }
   .fl-pkt.fl-voice { animation-duration: 1.2s; animation-timing-function: linear; }
   .fl-pkt.fl-voice.back { animation-delay: .6s; }
   .fl-pkt.fl-login { animation-duration: 2.4s; }

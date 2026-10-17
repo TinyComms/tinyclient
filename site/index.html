@@ -6,7 +6,7 @@
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self'; style-src 'self'; script-src 'self'; base-uri 'none'; form-action 'none'">
 <meta name="referrer" content="no-referrer">
 <title>tinyclient: one tiny, private app for all your chats</title>
-<meta name="description" content="A tiny, private, open-source chat client for Slack, Discord, Telegram, Teams and Signal. Native, no servers, no telemetry.">
+<meta name="description" content="A tiny, private, open-source chat client for Slack, Discord, Telegram, Teams, Signal and Messages. Native, no servers, no telemetry.">
 <meta name="robots" content="index, follow">
 <link rel="canonical" href="https://tinyclient.io/">
 <link rel="ai-catalog" href="/.well-known/ai-catalog.json">
@@ -22,7 +22,7 @@
 <link rel="stylesheet" href="style.css">
 <script src="site.js" defer></script>
 <script type="application/ld+json">
-{"@context":"https://schema.org","@type":"SoftwareApplication","name":"tinyclient","applicationCategory":"CommunicationApplication","operatingSystem":"macOS, Linux, Windows","url":"https://tinyclient.io/","description":"A tiny, private, open-source chat client for Slack, Discord, Telegram, Teams and Signal. Native, no servers, no telemetry.","license":"https://opensource.org/licenses/MIT","codeRepository":"https://github.com/itz4blitz/tinyclient","offers":{"@type":"Offer","price":"0","priceCurrency":"USD"}}
+{"@context":"https://schema.org","@type":"SoftwareApplication","name":"tinyclient","applicationCategory":"CommunicationApplication","operatingSystem":"macOS, Linux, Windows","url":"https://tinyclient.io/","description":"A tiny, private, open-source chat client for Slack, Discord, Telegram, Teams, Signal and Messages. Native, no servers, no telemetry.","license":"https://opensource.org/licenses/MIT","codeRepository":"https://github.com/itz4blitz/tinyclient","offers":{"@type":"Offer","price":"0","priceCurrency":"USD"}}
 </script>
 </head>
 <body>
@@ -121,6 +121,7 @@
         <li><img src="assets/networks/telegram.svg" alt="" width="44" height="44"><span>Telegram</span></li>
         <li><img src="assets/networks/microsoft-teams.svg" alt="" width="44" height="44"><span>Teams</span></li>
         <li><img src="assets/networks/signal.svg" alt="" width="44" height="44"><span>Signal</span></li>
+        <li><img src="assets/networks/messages.svg" alt="" width="44" height="44"><span>Messages</span></li>
       <li class="net-more"><a href="docs/contributing.html"><span class="plus" aria-hidden="true">+</span><span>More soon</span></a></li>
     </ul>
   </div>
@@ -211,7 +212,7 @@
       <svg class="fl-defs" width="0" height="0" aria-hidden="true" focusable="false"><defs><symbol id="fl-lock" viewBox="0 0 14 16"><path class="fl-lock-shackle" d="M3.5 7V4.8a3.5 3.5 0 0 1 7 0V7"/><rect class="fl-lock-body" x="1.5" y="7" width="11" height="8" rx="2"/></symbol></defs></svg>
 <svg class="fl fl-wide" viewBox="0 0 960 500" role="img" aria-labelledby="fl-title fl-desc">
 <title id="fl-title">Where your messages go</title>
-<desc id="fl-desc">On your computer, the tinyclient window talks to chatd over a local socket. chatd is always on, keeps messages and media on your disk and sessions in the system keychain, and connects directly, over encrypted connections, to Slack, Discord, Telegram, Microsoft Teams and Signal. mediad starts only during a call and connects to Discord's voice servers; tinyclient-login starts only to sign in and shows the network's own sign-in page. There is no tinyclient server in between.</desc>
+<desc id="fl-desc">On your computer, the tinyclient window talks to chatd over a local socket. chatd is always on, keeps messages and media on your disk and sessions in the system keychain, and connects directly, over encrypted connections, to Slack, Discord, Telegram, Microsoft Teams, Signal and Android Messages. mediad starts only during a call and connects to Discord's voice servers; tinyclient-login starts only to sign in and shows the network's own sign-in page. There is no tinyclient server in between.</desc>
 <g class="fl-ghost"><rect x="628" y="6" width="190" height="40" rx="10"/><text class="fl-s" x="723" y="31" text-anchor="middle">tinyclient server</text><path class="fl-strike" d="M640 40 L806 12"/></g>
 <text class="fl-f fl-ghost-note" x="723" y="60" text-anchor="middle">NONE. NOTHING IN BETWEEN.</text>
 <rect class="fl-zone" x="16" y="74" width="680" height="410" rx="18"/><text class="fl-f" x="38" y="102">YOUR COMPUTER</text>
@@ -224,6 +225,7 @@
 <path class="fl-wire fl-tls" d="M490 260 C 610 260, 640 265, 764 265"/>
 <path class="fl-wire fl-tls" d="M490 260 C 610 260, 640 309, 764 309"/>
 <path class="fl-wire fl-tls" d="M490 260 C 610 260, 640 353, 764 353"/>
+<path class="fl-wire fl-tls" d="M490 260 C 610 260, 640 397, 764 397"/>
 <g class="fl-node"><rect x="40" y="214" width="180" height="92" rx="12"/><circle class="fl-dot r" cx="56" cy="230" r="3.5"/><circle class="fl-dot y" cx="67" cy="230" r="3.5"/><circle class="fl-dot g" cx="78" cy="230" r="3.5"/><text class="fl-t" x="58" y="266">tinyclient</text><text class="fl-s" x="58" y="288">the window</text></g>
 <rect class="fl-ring" x="290" y="190" width="200" height="140" rx="12"/>
 <g class="fl-node fl-core"><rect x="290" y="190" width="200" height="140" rx="12"/><circle class="fl-live" cx="470" cy="210" r="4"/><text class="fl-t" x="310" y="224">chatd</text><text class="fl-s" x="310" y="248">Always on. One adapter</text><text class="fl-s" x="310" y="268">per network you use.</text><text class="fl-f" x="310" y="310">NO AUDIO · NO WEB VIEWS</text></g>
@@ -234,12 +236,14 @@
 <g class="fl-net"><rect x="764" y="248" width="166" height="34" rx="9"/><image href="assets/networks/telegram.svg" x="774" y="256" width="18" height="18"/><text class="fl-s fl-on" x="800" y="270">Telegram</text></g>
 <g class="fl-net"><rect x="764" y="292" width="166" height="34" rx="9"/><image href="assets/networks/microsoft-teams.svg" x="774" y="300" width="18" height="18"/><text class="fl-s fl-on" x="800" y="314">Microsoft Teams</text></g>
 <g class="fl-net"><rect x="764" y="336" width="166" height="34" rx="9"/><image href="assets/networks/signal.svg" x="774" y="344" width="18" height="18"/><text class="fl-s fl-on" x="800" y="358">Signal</text></g>
-<g class="fl-net fl-net-signin"><rect x="764" y="392" width="166" height="34" rx="9"/><text class="fl-s fl-on" x="776" y="414">Sign-in page</text></g>
+<g class="fl-net"><rect x="764" y="380" width="166" height="34" rx="9"/><image href="assets/networks/messages.svg" x="774" y="388" width="18" height="18"/><text class="fl-s fl-on" x="800" y="402">Messages</text></g>
+<g class="fl-net fl-net-signin"><rect x="764" y="424" width="166" height="34" rx="9"/><text class="fl-s fl-on" x="776" y="446">Sign-in page</text></g>
 <g class="fl-lockat"><use href="#fl-lock" x="721" y="169" width="14" height="16"/></g>
 <g class="fl-lockat"><use href="#fl-lock" x="721" y="213" width="14" height="16"/></g>
 <g class="fl-lockat"><use href="#fl-lock" x="721" y="257" width="14" height="16"/></g>
 <g class="fl-lockat"><use href="#fl-lock" x="721" y="301" width="14" height="16"/></g>
 <g class="fl-lockat"><use href="#fl-lock" x="721" y="345" width="14" height="16"/></g>
+<g class="fl-lockat"><use href="#fl-lock" x="721" y="389" width="14" height="16"/></g>
 <path class="fl-pkt fl-sock" pathLength="100" d="M220 260 H290"/>
 <path class="fl-pkt fl-sock back" pathLength="100" d="M220 260 H290"/>
 <path class="fl-pkt n-slack d0" pathLength="100" d="M490 260 C 610 260, 640 177, 764 177"/>
@@ -252,6 +256,8 @@
 <path class="fl-pkt back n-teams b3" pathLength="100" d="M490 260 C 610 260, 640 309, 764 309"/>
 <path class="fl-pkt n-signal d4" pathLength="100" d="M490 260 C 610 260, 640 353, 764 353"/>
 <path class="fl-pkt back n-signal b4" pathLength="100" d="M490 260 C 610 260, 640 353, 764 353"/>
+<path class="fl-pkt n-messages d5" pathLength="100" d="M490 260 C 610 260, 640 397, 764 397"/>
+<path class="fl-pkt back n-messages b5" pathLength="100" d="M490 260 C 610 260, 640 397, 764 397"/>
 <g class="fl-eph fl-call">
 <path class="fl-wire fl-temp" d="M490 220 H514 V135 H540"/><path class="fl-wire fl-tls" d="M684 135 C 720 135, 728 131, 764 131"/>
 <g class="fl-node fl-temp-node"><rect x="540" y="100" width="144" height="70" rx="12"/><text class="fl-t sm" x="556" y="128">mediad</text><text class="fl-s" x="556" y="150">during a call</text>
@@ -265,15 +271,15 @@
 <path class="fl-pkt fl-voice" pathLength="100" d="M684 135 C 720 135, 728 131, 764 131"/><path class="fl-pkt fl-voice back" pathLength="100" d="M684 135 C 720 135, 728 131, 764 131"/>
 </g>
 <g class="fl-eph fl-signin">
-<path class="fl-wire fl-temp" d="M490 300 H514 V395 H540"/><path class="fl-wire fl-tls" d="M684 395 C 720 395, 728 409, 764 409"/>
-<g class="fl-node fl-temp-node"><rect x="540" y="360" width="144" height="70" rx="12"/><text class="fl-t xs" x="554" y="388">tinyclient-login</text><text class="fl-s" x="554" y="410">only to sign in</text></g>
-<g class="fl-lockat"><use href="#fl-lock" x="721" y="397" width="14" height="16"/></g>
-<path class="fl-pkt fl-login" pathLength="100" d="M684 395 C 720 395, 728 409, 764 409"/><path class="fl-pkt fl-login back" pathLength="100" d="M684 395 C 720 395, 728 409, 764 409"/>
+<path class="fl-wire fl-temp" d="M490 300 H514 V427 H540"/><path class="fl-wire fl-tls" d="M684 427 C 720 427, 728 441, 764 441"/>
+<g class="fl-node fl-temp-node"><rect x="540" y="392" width="144" height="70" rx="12"/><text class="fl-t xs" x="554" y="420">tinyclient-login</text><text class="fl-s" x="554" y="442">only to sign in</text></g>
+<g class="fl-lockat"><use href="#fl-lock" x="721" y="429" width="14" height="16"/></g>
+<path class="fl-pkt fl-login" pathLength="100" d="M684 427 C 720 427, 728 441, 764 441"/><path class="fl-pkt fl-login back" pathLength="100" d="M684 427 C 720 427, 728 441, 764 441"/>
 </g>
 </svg>
 <svg class="fl fl-narrow" viewBox="0 0 360 726" role="img" aria-labelledby="fl-title-n fl-desc-n">
 <title id="fl-title-n">Where your messages go</title>
-<desc id="fl-desc-n">The tinyclient window talks to chatd on your computer. chatd keeps your messages on your disk and your sessions in the keychain, and connects directly and encrypted to Slack, Discord, Telegram, Microsoft Teams and Signal. A call starts mediad; a sign-in starts tinyclient-login. There is no tinyclient server in between.</desc>
+<desc id="fl-desc-n">The tinyclient window talks to chatd on your computer. chatd keeps your messages on your disk and your sessions in the keychain, and connects directly and encrypted to Slack, Discord, Telegram, Microsoft Teams, Signal and Android Messages. A call starts mediad; a sign-in starts tinyclient-login. There is no tinyclient server in between.</desc>
 <g class="fl-ghost"><rect x="96" y="6" width="168" height="36" rx="10"/><text class="fl-s" x="180" y="29" text-anchor="middle">tinyclient server</text><path class="fl-strike" d="M108 36 L252 12"/></g>
 <rect class="fl-zone" x="6" y="58" width="348" height="420" rx="16"/><text class="fl-f" x="24" y="84">YOUR COMPUTER</text>
 <path class="fl-wire" d="M98 168 V204"/>
@@ -300,6 +306,7 @@
 <g class="fl-net"><rect x="22" y="628" width="152" height="34" rx="9"/><image href="assets/networks/signal.svg" x="32" y="636" width="18" height="18"/><text class="fl-s fl-on" x="58" y="650">Signal</text></g>
 <g class="fl-net fl-net-call"><rect x="186" y="628" width="152" height="34" rx="9"/><image href="assets/networks/discord.svg" x="196" y="636" width="18" height="18"/><text class="fl-s fl-on" x="222" y="650">Discord voice</text></g>
 <g class="fl-net fl-net-signin"><rect x="22" y="672" width="152" height="34" rx="9"/><text class="fl-s fl-on" x="34" y="694">Sign-in page</text></g>
+<g class="fl-net"><rect x="186" y="672" width="152" height="34" rx="9"/><image href="assets/networks/messages.svg" x="196" y="680" width="18" height="18"/><text class="fl-s fl-on" x="222" y="694">Messages</text></g>
 <path class="fl-pkt fl-sock" pathLength="100" d="M98 168 V204"/><path class="fl-pkt fl-sock back" pathLength="100" d="M98 168 V204"/>
 <path class="fl-pkt n-slack d0" pathLength="100" d="M182 300 V500"/>
 <path class="fl-pkt back n-slack b0" pathLength="100" d="M182 300 V500"/>
@@ -371,7 +378,7 @@
     </div>
     <div class="fine">
       <p>This site sets no cookies, runs no analytics and loads nothing from anywhere else.</p>
-      <p>tinyclient is not affiliated with Slack, Discord, Telegram, Microsoft or Signal. Their names and logos are trademarks of their owners; the network icons are from <a href="https://github.com/homarr-labs/dashboard-icons">Dashboard Icons</a> (Apache-2.0).</p>
+      <p>tinyclient is not affiliated with Slack, Discord, Telegram, Microsoft, Signal or Google. Their names and logos are trademarks of their owners; the network icons are from <a href="https://github.com/homarr-labs/dashboard-icons">Dashboard Icons</a> (Apache-2.0).</p>
     </div>
   </div>
 </footer>

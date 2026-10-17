@@ -17,6 +17,28 @@
       ]
     },
     {
+      "identifier": "urn:air:tinyclient.io:docs:using",
+      "displayName": "Using tinyclient",
+      "type": "text/html",
+      "url": "https://tinyclient.io/docs/using.html",
+      "representativeQueries": [
+        "tinyclient keyboard shortcuts",
+        "how do tinyclient updates work",
+        "systemd user service for chatd"
+      ]
+    },
+    {
+      "identifier": "urn:air:tinyclient.io:docs:networks",
+      "displayName": "Networks and terms",
+      "type": "text/html",
+      "url": "https://tinyclient.io/docs/networks.html",
+      "representativeQueries": [
+        "does tinyclient support Android Messages",
+        "what can tinyclient do on Discord Slack Signal",
+        "which tinyclient features are not built yet"
+      ]
+    },
+    {
       "identifier": "urn:air:tinyclient.io:docs:privacy",
       "displayName": "Privacy and security",
       "type": "text/html",

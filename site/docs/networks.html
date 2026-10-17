@@ -6,7 +6,7 @@
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self'; style-src 'self'; script-src 'self'; base-uri 'none'; form-action 'none'">
 <meta name="referrer" content="no-referrer">
 <title>Networks &amp; terms · tinyclient docs</title>
-<meta name="description" content="What tinyclient supports on Slack, Discord, Telegram, Microsoft Teams and Signal, and how each network treats third-party clients.">
+<meta name="description" content="What tinyclient supports on Slack, Discord, Telegram, Microsoft Teams, Signal and Android Messages, and how each network treats third-party clients.">
 <meta name="robots" content="index, follow">
 <link rel="canonical" href="https://tinyclient.io/docs/networks.html">
 <link rel="ai-catalog" href="/.well-known/ai-catalog.json">
@@ -38,6 +38,7 @@
       <h2>Documentation</h2>
       <ul>
           <li><a href="index.html">Getting started</a></li>
+          <li><a href="using.html">Using tinyclient</a></li>
           <li><a href="build.html">Build from source</a></li>
           <li><a href="architecture.html">Architecture</a></li>
           <li><a href="performance.html">Size &amp; performance</a></li>
@@ -58,7 +59,7 @@
     <h1>Networks &amp; terms</h1>
     <p class="lede">What tinyclient does on each network, and how each network treats third-party clients, so you can decide for yourself.</p>
 
-    <p>tinyclient is an independent project. It is not made or endorsed by Slack, Discord, Telegram, Microsoft or Signal.</p>
+    <p>tinyclient is an independent project. It is not made or endorsed by Slack, Discord, Telegram, Microsoft, Signal or Google. Six networks are in the app. The goal is parity with each official client; the gaps below are the current ones.</p>
 
     <ul class="net-terms">
       <li class="term" id="slack">
@@ -121,7 +122,7 @@
       </li>
       <li class="term" id="signal">
         <div class="term-head"><img src="../assets/networks/signal.svg" alt="" width="22" height="22"><h2>Signal</h2></div>
-        <p>tinyclient links as one more device, like Signal Desktop, using Signal&rsquo;s own libsignal through presage. It never registers a phone number. It receives what arrives after it is linked, and signing out removes the device. Read receipts and typing are sent only as your Signal settings allow.</p>
+        <p>tinyclient links as one more device, like Signal Desktop, using Signal&rsquo;s own libsignal through presage. It never registers a phone number. It receives what arrives after it is linked, and signing out removes the device. Read receipts and typing are sent only as your Signal settings allow. Your own conversation is labelled <strong>Note to Self</strong>, including messages sent from your phone. A cached self-conversation is relabelled when the account reconnects; its messages stay.</p>
         <div class="table-wrap" tabindex="0" role="region" aria-label="Signal support">
           <table>
             <tbody>
@@ -129,6 +130,20 @@
             <tr><th scope="row">Reading</th><td>Direct and group chats, replies, mentions, reactions, edits, deletes. Photos and files appear as a labelled line, not shown.</td></tr>
             <tr><th scope="row">Writing</th><td>Text, replies, reactions, edit and delete your own</td></tr>
             <tr><th scope="row">Calls</th><td>Not built yet</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </li>
+      <li class="term" id="messages">
+        <div class="term-head"><img src="../assets/networks/messages.svg" alt="" width="22" height="22"><h2>Messages</h2></div>
+        <p>Android Messages, paired the way <code>messages.google.com</code> is. The phone stays the account. SMS and RCS go through it, so the phone has to stay online. This is not iMessage, and it is not a second phone number.</p>
+        <div class="table-wrap" tabindex="0" role="region" aria-label="Messages support">
+          <table>
+            <tbody>
+            <tr><th scope="row">Sign-in</th><td>Confirm a Google account with the emoji on your phone, or scan the code when the phone still shows a scanner</td></tr>
+            <tr><th scope="row">Reading</th><td>The chats already on the phone. Photos and files appear as a labelled line, not shown.</td></tr>
+            <tr><th scope="row">Writing</th><td>Text. Reactions are not in this version.</td></tr>
+            <tr><th scope="row">Calls</th><td>Open in Messages, on the phone</td></tr>
             </tbody>
           </table>
         </div>
@@ -143,7 +158,18 @@
       <li><strong>No polling.</strong> Sockets push; requests trace to something you did or to the socket.</li>
       <li><strong>Respect limits.</strong> On a rate limit, it waits the full time the network asks. On a captcha, phone or password check, it lets you finish in the official app.</li>
     </ul>
-    <p>The project is early. We are building a community devoted to a quality experience and full feature parity with the official apps. Join the <a href="https://discord.gg/kJHK7BNvJP">Discord</a>, or <a href="contributing.html">send a change</a>.</p>
+    <h2 id="gaps">Not in this version</h2>
+    <p>These are missing on purpose until they can pass the same memory, speed and idle budgets as the rest. Each one is a place to help.</p>
+    <ul>
+      <li>Message search in the window. The Quick Switcher finds a conversation, a person or a server. <code>tinyclient --text --search</code> searches cached message text. Opening a hit in the window, and searching the network, are not built.</li>
+      <li>Notifications and a Dock or taskbar badge.</li>
+      <li>Video, screen share, and voice messages.</li>
+      <li>Signal photos, files, safety numbers and calls. A contact&rsquo;s new identity key is trusted automatically until safety numbers are shown.</li>
+      <li>Messages reactions, and photos and files shown rather than named.</li>
+      <li>Teams personal accounts. Calls and meetings open in Teams.</li>
+      <li>Discord stage channels, Telegram secret chats, and Slack huddles inside tinyclient. Their buttons open the official app.</li>
+    </ul>
+    <p>Day-to-day use of the window, shortcuts and updates: <a href="using.html">Using tinyclient</a>. The project is early. Join the <a href="https://discord.gg/kJHK7BNvJP">Discord</a>, or <a href="contributing.html">send a change</a>.</p>
 
     <nav class="pager" aria-label="Previous and next"><a href="privacy.html"><span>Previous</span>Privacy &amp; security</a><a class="next" href="contributing.html"><span>Next</span>Contributing</a></nav>
     <p class="edit"><a href="https://github.com/itz4blitz/tinyclient/blob/main/site/docs/networks.html">Edit this page on GitHub</a></p>
@@ -153,7 +179,7 @@
 <footer class="site-footer">
   <div class="wrap">
     <div class="fine">
-      <p>tinyclient is open source under the MIT license; a <code>chatd</code> built with Signal support is a combined work under the AGPL-3.0. Not affiliated with Slack, Discord, Telegram, Microsoft or Signal; network icons from <a href="https://github.com/homarr-labs/dashboard-icons">Dashboard Icons</a> (Apache-2.0).</p>
+      <p>tinyclient is open source under the MIT license; a <code>chatd</code> built with Signal support is a combined work under the AGPL-3.0. Not affiliated with Slack, Discord, Telegram, Microsoft, Signal or Google; network icons from <a href="https://github.com/homarr-labs/dashboard-icons">Dashboard Icons</a> (Apache-2.0).</p>
       <p>This website sets no cookies, runs no analytics and loads nothing from any other site. Cloudflare Pages hosts it and can see your request the way any web server can.</p>
     </div>
   </div>

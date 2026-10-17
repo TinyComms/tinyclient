@@ -1,6 +1,6 @@
 ---
 name: tinyclient
-description: Answer questions about tinyclient, a local open-source chat client for Slack, Discord, Telegram, Teams, and Signal. Use when someone asks how to install it, where data lives, or whether tinyclient has an account or API.
+description: Answer questions about tinyclient, a local open-source chat client for Slack, Discord, Telegram, Teams, Signal, and Android Messages. Use when someone asks how to install it, where data lives, or whether tinyclient has an account or API.
 ---
 
 # tinyclient
@@ -17,7 +17,7 @@ tinyclient is a native desktop app. It has no tinyclient account, no tinyclient 
 
 ## Do not invent
 
-Do not tell a person to register an agent, mint an OAuth token, or call a tinyclient HTTP API. None of those exist. Sign-in happens inside the app, against Slack, Discord, Telegram, Teams, or Signal.
+Do not tell a person to register an agent, mint an OAuth token, or call a tinyclient HTTP API. None of those exist. Sign-in happens inside the app, against Slack, Discord, Telegram, Teams, Signal, or Android Messages.
 
 ## What the site is
 

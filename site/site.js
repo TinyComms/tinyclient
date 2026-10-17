@@ -186,11 +186,12 @@ function registerSiteTools() {
 
   var docs = [
     { path: "/docs/", title: "Getting started", about: "Install on macOS, Linux or Windows, sign in, and see where data is kept." },
+    { path: "/docs/using.html", title: "Using tinyclient", about: "Shortcuts, updates, and the optional Linux systemd service for chatd." },
     { path: "/docs/build.html", title: "Build from source", about: "Prerequisites, cargo commands, and the demo mode." },
     { path: "/docs/architecture.html", title: "Architecture", about: "chatd, the window, mediad, the sign-in helper, and storage." },
     { path: "/docs/performance.html", title: "Size and performance", about: "Disk and memory next to the official apps, and how each number was measured." },
     { path: "/docs/privacy.html", title: "Privacy and security", about: "What tinyclient stores, which connections it makes, and what it never does." },
-    { path: "/docs/networks.html", title: "Networks and terms", about: "Support on Slack, Discord, Telegram, Teams and Signal." },
+    { path: "/docs/networks.html", title: "Networks and terms", about: "Support on Slack, Discord, Telegram, Teams, Signal and Android Messages." },
     { path: "/docs/contributing.html", title: "Contributing", about: "Roadmap and the rules every change keeps." }
   ];
 

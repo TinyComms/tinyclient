@@ -38,6 +38,7 @@
       <h2>Documentation</h2>
       <ul>
           <li><a href="index.html">Getting started</a></li>
+          <li><a href="using.html">Using tinyclient</a></li>
           <li><a href="build.html">Build from source</a></li>
           <li><a href="architecture.html">Architecture</a></li>
           <li><a href="performance.html">Size &amp; performance</a></li>
@@ -59,7 +60,7 @@
     <p class="lede">From a typo to a network adapter. Talk it through on <a href="https://discord.gg/kJHK7BNvJP">Discord</a>, or follow <a href="https://github.com/itz4blitz/tinyclient/blob/main/CONTRIBUTING.md"><code>CONTRIBUTING.md</code></a>. This page is the short version.</p>
 
     <h2 id="roadmap">Roadmap</h2>
-    <p>The goal is a client as full as Slack, Discord, Telegram, Teams, and Signal, that stays small and fast. These five increments are what is underway. Each one is usable on its own. Discord and Slack came first, because they signed in first. Signal is partial.</p>
+    <p>The goal is a client as full as Slack, Discord, Telegram, Teams, Signal and Android Messages, that stays small and fast. These five increments are what is underway. Each one is usable on its own. Discord and Slack came first, because they signed in first. Signal and Messages are partial: photos and files are named, not shown.</p>
     <div class="table-wrap" tabindex="0" role="region" aria-label="Roadmap">
       <table>
         <thead><tr><th scope="col">Increment</th><th scope="col">Done when</th><th scope="col">Where it stands</th></tr></thead>
@@ -77,7 +78,7 @@
           <tr>
             <th scope="row">3. Answer in kind</th>
             <td>Threads, reactions, reply, edit, delete, paste, attach, mention completion, the emoji picker, and message search. Nobody can tell which client sent it.</td>
-            <td>All of that is in except message search. The switcher finds conversations by title in the local cache.</td>
+            <td>All of that is in the window except message search. <code>tinyclient --text --search</code> searches cached message text. The switcher finds a conversation, a person or a server. Opening a hit in the window, and searching the network, are not built.</td>
           </tr>
           <tr>
             <th scope="row">4. Talk</th>
@@ -85,9 +86,9 @@
             <td>Discord voice is in, including its end-to-end encryption. Video, screen share, Slack huddles and Telegram calls are not. Their buttons open the official app.</td>
           </tr>
           <tr>
-            <th scope="row">5. Four networks</th>
-            <td>Telegram, then Teams chat, at the level of increments 1 to 3. Teams meetings open in Teams until the native join ships. A work or school Teams account can still be blocked by the tenant, and nothing here changes that.</td>
-            <td>Telegram and Teams chat are in at that level, except search and notifications. Teams personal accounts are not built.</td>
+            <th scope="row">5. Every network</th>
+            <td>Telegram, then Teams chat, at the level of increments 1 to 3, then Signal and Android Messages. Teams meetings open in Teams until the native join ships. A work or school Teams account can still be blocked by the tenant, and nothing here changes that.</td>
+            <td>Telegram and Teams chat are in at that level, except search and notifications. Signal and Messages send and receive text; their photos and files are a labelled line. Teams personal accounts are not built.</td>
           </tr>
         </tbody>
       </table>
@@ -109,7 +110,7 @@
           </tr>
           <tr>
             <th scope="row">Message search</th>
-            <td>Typing searches cached messages. Enter searches the network. Results are labelled with where they came from, and opening one lands on that message.</td>
+            <td>Typing in the window searches cached messages and opening one lands on that message. Enter searches the network. The text shell already searches the cache.</td>
             <td><a href="https://github.com/itz4blitz/tinyclient/blob/main/docs/product/05-navigation.md"><code>05</code></a></td>
           </tr>
           <tr>
@@ -133,13 +134,18 @@
             <td><a href="https://github.com/itz4blitz/tinyclient/blob/main/docs/architecture.md"><code>architecture</code></a></td>
           </tr>
           <tr>
+            <th scope="row">Messages</th>
+            <td>Reactions, and photos and files shown. The phone stays the account. Calls stay on the phone until a design says otherwise.</td>
+            <td><a href="networks.html#messages">Networks</a></td>
+          </tr>
+          <tr>
             <th scope="row">Terminal</th>
             <td>An interactive UI on the existing socket. The protocol is the whole API. The window never has to change for it.</td>
             <td><a href="https://github.com/itz4blitz/tinyclient/blob/main/docs/architecture.md"><code>architecture</code></a></td>
           </tr>
           <tr>
             <th scope="row">Packaging</th>
-            <td>A notarized macOS app, Linux packages, and a Windows installer. Notifications on macOS need the bundle.</td>
+            <td>Linux packages and a Windows installer are published. Still open: a notarized macOS app, and code signing on Windows. Notifications on macOS need the bundle.</td>
             <td><a href="https://github.com/itz4blitz/tinyclient/blob/main/docs/product/08-sign-in-accounts.md"><code>08</code></a></td>
           </tr>
           <tr>
@@ -207,7 +213,7 @@ TINYCLIENT_DIR=/tmp/tinyclient-demo cargo run -p tinyclient --features gui</code
 <footer class="site-footer">
   <div class="wrap">
     <div class="fine">
-      <p>tinyclient is open source under the MIT license; a <code>chatd</code> built with Signal support is a combined work under the AGPL-3.0. Not affiliated with Slack, Discord, Telegram, Microsoft or Signal; network icons from <a href="https://github.com/homarr-labs/dashboard-icons">Dashboard Icons</a> (Apache-2.0).</p>
+      <p>tinyclient is open source under the MIT license; a <code>chatd</code> built with Signal support is a combined work under the AGPL-3.0. Not affiliated with Slack, Discord, Telegram, Microsoft, Signal or Google; network icons from <a href="https://github.com/homarr-labs/dashboard-icons">Dashboard Icons</a> (Apache-2.0).</p>
       <p>This website sets no cookies, runs no analytics and loads nothing from any other site. Cloudflare Pages hosts it and can see your request the way any web server can.</p>
     </div>
   </div>
