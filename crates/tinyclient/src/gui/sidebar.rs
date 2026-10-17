@@ -1239,7 +1239,7 @@ impl Shell {
                     .child(div().flex_1().min_w_0().truncate().type_ui().text_color(theme::text()).child(space.name.clone()))
                     .children(words.map(|words| div().type_small().text_color(theme::text_soft()).child(words)))
                     .children(rollup_badge(space.attention, space.unread))
-                    .child(div().type_small().text_color(theme::text_soft()).child(format!("⌃{}", ix + 1)));
+                    .child(div().type_small().text_color(theme::text_soft()).child(crate::gui::shortcuts::label(&format!("⌃{}", ix + 1))));
                 menu = menu.child(row);
             }
             menu = menu.child(super::components::menu_separator());

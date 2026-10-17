@@ -20,6 +20,7 @@ mod rail;
 mod settings;
 mod sidebar;
 mod signin;
+mod shortcuts;
 mod state;
 mod theme;
 mod time;
@@ -160,15 +161,19 @@ fn typed_text(text: &str) -> bool {
 
 fn bind_keys(cx: &mut App) {
     app::menubar::bind_keys(cx);
+    cx.bind_keys(shell_bindings());
+}
+
+fn shell_bindings() -> Vec<KeyBinding> {
     let shell = Some("Shell");
-    cx.bind_keys([
-        KeyBinding::new("cmd-q", Quit, None),
-        KeyBinding::new("cmd-k", Switcher, None),
-        KeyBinding::new("cmd-[", Back, None),
-        KeyBinding::new("cmd-]", Forward, None),
-        KeyBinding::new("cmd-up", UpLevel, shell),
-        KeyBinding::new("cmd-\\", ToggleSidebar, None),
-        KeyBinding::new("cmd-.", CloseRight, None),
+    vec![
+        KeyBinding::new("secondary-q", Quit, None),
+        KeyBinding::new("secondary-k", Switcher, None),
+        KeyBinding::new("secondary-[", Back, None),
+        KeyBinding::new("secondary-]", Forward, None),
+        KeyBinding::new("secondary-up", UpLevel, shell),
+        KeyBinding::new("secondary-\\", ToggleSidebar, None),
+        KeyBinding::new("secondary-.", CloseRight, None),
         KeyBinding::new("escape", CloseTop, shell),
         KeyBinding::new("shift-escape", MarkRead, shell),
         KeyBinding::new("tab", FocusNext, shell),
@@ -182,16 +187,16 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("enter", ListOpen, shell),
         KeyBinding::new("left", ListFold, shell),
         KeyBinding::new("right", ListUnfold, shell),
-        KeyBinding::new("cmd-1", Place1, None),
-        KeyBinding::new("cmd-2", Place2, None),
-        KeyBinding::new("cmd-3", Place3, None),
-        KeyBinding::new("cmd-4", Place4, None),
-        KeyBinding::new("cmd-5", Place5, None),
-        KeyBinding::new("cmd-6", Place6, None),
-        KeyBinding::new("cmd-7", Place7, None),
-        KeyBinding::new("cmd-8", Place8, None),
-        KeyBinding::new("cmd-9", Place9, None),
-    ]);
+        KeyBinding::new("secondary-1", Place1, None),
+        KeyBinding::new("secondary-2", Place2, None),
+        KeyBinding::new("secondary-3", Place3, None),
+        KeyBinding::new("secondary-4", Place4, None),
+        KeyBinding::new("secondary-5", Place5, None),
+        KeyBinding::new("secondary-6", Place6, None),
+        KeyBinding::new("secondary-7", Place7, None),
+        KeyBinding::new("secondary-8", Place8, None),
+        KeyBinding::new("secondary-9", Place9, None),
+    ]
 }
 
 /// `--shot out.png` draws one state with live data, writes the frame and quits, so every state

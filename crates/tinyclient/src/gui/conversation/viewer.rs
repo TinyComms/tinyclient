@@ -340,7 +340,7 @@ impl Pane {
     /// True when the key was the viewer's.
     pub(super) fn viewer_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let keys = &event.keystroke;
-        let command = keys.modifiers.platform;
+        let command = crate::gui::shortcuts::primary(keys.modifiers);
         let fit = self.fit_now(window);
         match (keys.key.as_str(), command) {
             ("escape", _) => self.close_viewer(cx),
@@ -583,7 +583,7 @@ impl Pane {
             .child(picture)
             .on_scroll_wheel(cx.listener(move |this, event: &gpui::ScrollWheelEvent, _, cx| {
                 let delta = event.delta.pixel_delta(px(20.));
-                if event.modifiers.platform {
+                if crate::gui::shortcuts::primary(event.modifiers) {
                     // A notch at a time, however far the wheel says it turned.
                     if delta.y != px(0.) {
                         this.zoom_step(delta.y > px(0.), fit, cx);

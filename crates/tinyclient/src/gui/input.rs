@@ -74,71 +74,79 @@ actions!(picker, [Star]);
 actions!(composer, [PickEmoji, PickGifs]);
 
 pub fn bind_keys(cx: &mut App) {
-    let context = Some("TextInput");
+    cx.bind_keys(text_bindings());
+    // F stars the chosen GIF or sticker; with no cell chosen it is a letter for the search.
+    cx.bind_keys([KeyBinding::new("f", Star, Some("PickerGrid"))]);
+    let composer = Some("Composer");
     cx.bind_keys([
+        KeyBinding::new("secondary-e", PickEmoji, composer),
+        KeyBinding::new("secondary-shift-g", PickGifs, composer),
+    ]);
+}
+
+pub(super) fn text_bindings() -> Vec<KeyBinding> {
+    let context = Some("TextInput");
+    let bindings = vec![
         KeyBinding::new("backspace", Backspace, context),
         KeyBinding::new("shift-backspace", Backspace, context),
-        KeyBinding::new("ctrl-h", Backspace, context),
         KeyBinding::new("delete", Delete, context),
-        KeyBinding::new("ctrl-d", Delete, context),
-        KeyBinding::new("alt-backspace", DeleteWordLeft, context),
-        KeyBinding::new("ctrl-w", DeleteWordLeft, context),
-        KeyBinding::new("alt-delete", DeleteWordRight, context),
-        KeyBinding::new("cmd-backspace", DeleteToLineStart, context),
-        KeyBinding::new("ctrl-k", DeleteToLineEnd, context),
+        KeyBinding::new(if cfg!(target_os = "macos") { "alt-backspace" } else { "ctrl-backspace" }, DeleteWordLeft, context),
+        KeyBinding::new(if cfg!(target_os = "macos") { "alt-delete" } else { "ctrl-delete" }, DeleteWordRight, context),
+        KeyBinding::new(if cfg!(target_os = "macos") { "cmd-backspace" } else { "ctrl-shift-backspace" }, DeleteToLineStart, context),
         KeyBinding::new("left", Left, context),
-        KeyBinding::new("ctrl-b", Left, context),
         KeyBinding::new("right", Right, context),
-        KeyBinding::new("ctrl-f", Right, context),
         KeyBinding::new("up", Up, context),
-        KeyBinding::new("ctrl-p", Up, context),
         KeyBinding::new("down", Down, context),
-        KeyBinding::new("ctrl-n", Down, context),
-        KeyBinding::new("alt-left", WordLeft, context),
-        KeyBinding::new("alt-right", WordRight, context),
-        KeyBinding::new("cmd-left", LineStart, context),
+        KeyBinding::new(if cfg!(target_os = "macos") { "alt-left" } else { "ctrl-left" }, WordLeft, context),
+        KeyBinding::new(if cfg!(target_os = "macos") { "alt-right" } else { "ctrl-right" }, WordRight, context),
         KeyBinding::new("home", LineStart, context),
-        KeyBinding::new("ctrl-a", LineStart, context),
-        KeyBinding::new("cmd-right", LineEnd, context),
         KeyBinding::new("end", LineEnd, context),
-        KeyBinding::new("ctrl-e", LineEnd, context),
-        KeyBinding::new("cmd-up", DocStart, context),
-        KeyBinding::new("cmd-down", DocEnd, context),
+        KeyBinding::new(if cfg!(target_os = "macos") { "cmd-up" } else { "ctrl-home" }, DocStart, context),
+        KeyBinding::new(if cfg!(target_os = "macos") { "cmd-down" } else { "ctrl-end" }, DocEnd, context),
         KeyBinding::new("shift-left", SelectLeft, context),
         KeyBinding::new("shift-right", SelectRight, context),
         KeyBinding::new("shift-up", SelectUp, context),
         KeyBinding::new("shift-down", SelectDown, context),
-        KeyBinding::new("alt-shift-left", SelectWordLeft, context),
-        KeyBinding::new("alt-shift-right", SelectWordRight, context),
-        KeyBinding::new("cmd-shift-left", SelectLineStart, context),
+        KeyBinding::new(if cfg!(target_os = "macos") { "alt-shift-left" } else { "ctrl-shift-left" }, SelectWordLeft, context),
+        KeyBinding::new(if cfg!(target_os = "macos") { "alt-shift-right" } else { "ctrl-shift-right" }, SelectWordRight, context),
         KeyBinding::new("shift-home", SelectLineStart, context),
-        KeyBinding::new("cmd-shift-right", SelectLineEnd, context),
         KeyBinding::new("shift-end", SelectLineEnd, context),
-        KeyBinding::new("cmd-shift-up", SelectDocStart, context),
-        KeyBinding::new("cmd-shift-down", SelectDocEnd, context),
-        KeyBinding::new("cmd-a", SelectAll, context),
-        KeyBinding::new("cmd-v", Paste, context),
-        KeyBinding::new("cmd-c", Copy, context),
-        KeyBinding::new("cmd-x", Cut, context),
-        KeyBinding::new("cmd-z", Undo, context),
-        KeyBinding::new("cmd-shift-z", Redo, context),
-        KeyBinding::new("ctrl-cmd-space", ShowCharacterPalette, context),
+        KeyBinding::new(if cfg!(target_os = "macos") { "cmd-shift-up" } else { "ctrl-shift-home" }, SelectDocStart, context),
+        KeyBinding::new(if cfg!(target_os = "macos") { "cmd-shift-down" } else { "ctrl-shift-end" }, SelectDocEnd, context),
+        KeyBinding::new("secondary-a", SelectAll, context),
+        KeyBinding::new("secondary-v", Paste, context),
+        KeyBinding::new("secondary-c", Copy, context),
+        KeyBinding::new("secondary-x", Cut, context),
+        KeyBinding::new("secondary-z", Undo, context),
+        KeyBinding::new("secondary-shift-z", Redo, context),
+        KeyBinding::new(if cfg!(target_os = "macos") { "ctrl-cmd-space" } else { "ctrl-alt-space" }, ShowCharacterPalette, context),
         KeyBinding::new("enter", Submit, context),
-        KeyBinding::new("cmd-enter", SubmitAlways, context),
+        KeyBinding::new("secondary-enter", SubmitAlways, context),
         KeyBinding::new("shift-enter", Newline, context),
         KeyBinding::new("alt-enter", SubmitAlt, context),
         KeyBinding::new("escape", Escape, context),
         KeyBinding::new("tab", Tab, context),
         KeyBinding::new("pageup", PageUp, context),
         KeyBinding::new("pagedown", PageDown, context),
-    ]);
-    // F stars the chosen GIF or sticker; with no cell chosen it is a letter for the search.
-    cx.bind_keys([KeyBinding::new("f", Star, Some("PickerGrid"))]);
-    let composer = Some("Composer");
-    cx.bind_keys([
-        KeyBinding::new("cmd-e", PickEmoji, composer),
-        KeyBinding::new("cmd-shift-g", PickGifs, composer),
-    ]);
+    ];
+    #[cfg(target_os = "macos")]
+    let bindings = bindings.into_iter().chain([
+        KeyBinding::new("cmd-left", LineStart, context),
+        KeyBinding::new("cmd-right", LineEnd, context),
+        KeyBinding::new("cmd-shift-left", SelectLineStart, context),
+        KeyBinding::new("cmd-shift-right", SelectLineEnd, context),
+        KeyBinding::new("ctrl-h", Backspace, context),
+        KeyBinding::new("ctrl-d", Delete, context),
+        KeyBinding::new("ctrl-w", DeleteWordLeft, context),
+        KeyBinding::new("ctrl-k", DeleteToLineEnd, context),
+        KeyBinding::new("ctrl-b", Left, context),
+        KeyBinding::new("ctrl-f", Right, context),
+        KeyBinding::new("ctrl-p", Up, context),
+        KeyBinding::new("ctrl-n", Down, context),
+        KeyBinding::new("ctrl-a", LineStart, context),
+        KeyBinding::new("ctrl-e", LineEnd, context),
+    ]).collect();
+    bindings
 }
 
 pub enum InputEvent {
