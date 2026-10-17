@@ -441,3 +441,29 @@ fn a_cancelled_link_stops_and_a_new_one_begins_afresh() {
     assert!(matches!(world.sign_in(None), SignInStep::Qr { .. }));
     world.ask(Request::SignInCancel { network: Network::Signal });
 }
+
+#[test]
+fn note_to_self_from_the_phone_has_its_own_label() {
+    let world = World::linked();
+    world.connected();
+    world.steer(&format!("note {} Remember the tickets", T0 + 9_000));
+    let mine = world.arrived(ME, &id(T0 + 9_000, ME));
+    assert!(mine.outgoing && mine.sender.id == ME);
+    assert_eq!(mine.sender.name, "Ada Quill");
+    let row = world.conversation(ME).unwrap();
+    assert_eq!((row.title.as_str(), row.kind, row.peer.as_deref()), ("Note to Self", ConversationKind::Direct, Some(ME)));
+
+    // Simulate a row cached by a previous build, then reconnect without another note.
+    let mut store = chatd::store::Store::open(&world.dir.join("chat.sqlite")).unwrap();
+    let mut old = chatd::store::ConversationRow::new(ME, ConversationKind::Direct, "Signal user");
+    old.peer = Some(ME.into());
+    old.listed = true;
+    old.private = true;
+    store.upsert_conversation(&account(), &old).unwrap();
+    drop(store);
+    world.steer("drop");
+    world.until("the cached self conversation to be renamed", || {
+        (world.conversation(ME)?.title == "Note to Self").then_some(())
+    });
+    assert_eq!(world.messages(ME).len(), 1, "renaming must preserve messages");
+}
