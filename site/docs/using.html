@@ -110,7 +110,7 @@
 
     <h2 id="systemd">Linux: leave chatd running</h2>
     <p>By default, quitting the window stops the daemon it started. Logs go to <code>chatd.log</code>.</p>
-    <p>The <code>.deb</code>, <code>.rpm</code> and Arch package can install <code>tinyclient-chatd.service</code>. The unit is disabled. With it disabled, nothing about startup changes.</p>
+    <p>The <code>.deb</code>, <code>.rpm</code>, Arch and Nix packages can install <code>tinyclient-chatd.service</code>. The unit is disabled. With it disabled, nothing about startup changes.</p>
     <p>To let systemd manage the daemon, quit tinyclient first so its daemon releases the socket. From a terminal in your graphical session:</p>
 <div class="code"><pre><code>systemctl --user daemon-reload
 systemctl --user import-environment WAYLAND_DISPLAY DISPLAY XDG_CURRENT_DESKTOP

@@ -71,6 +71,7 @@
           <tr><th scope="row">Fedora, openSUSE</th><td><a href="/download/rpm"><code>.rpm</code></a> (<a href="/download/rpm-arm64">arm64</a>)</td><td>A package for dnf or zypper, with a menu entry</td></tr>
           <tr><th scope="row">Any Linux</th><td><a href="/download/appimage"><code>.AppImage</code></a> (<a href="/download/appimage-arm64">arm64</a>)</td><td>One file that runs without installing</td></tr>
           <tr><th scope="row">Any Linux</th><td><a href="/download/linux-tar"><code>.tar.gz</code></a> (<a href="/download/linux-tar-arm64">arm64</a>)</td><td>The four programs and <code>install.sh</code></td></tr>
+          <tr><th scope="row">NixOS, Nix on Linux</th><td><a href="#nix">The flake</a></td><td>Built from source by Nix, with a Home Manager module</td></tr>
           <tr><th scope="row">Windows 10 or 11, x86_64</th><td><a href="/download/windows"><code>-setup.exe</code></a></td><td>An installer that needs no administrator</td></tr>
           <tr><th scope="row">Windows, portable</th><td><a href="/download/windows-portable"><code>.zip</code></a></td><td>The four programs, run where you unpack them</td></tr>
         </tbody>
@@ -119,12 +120,17 @@ cd tinyclient
 sudo ./install.sh --system  <span class="c"># or for everyone, in /usr/local</span></code></pre></div>
     <p><code>install.sh</code> puts the four programs in <code>lib/tinyclient</code>, <code>tinyclient</code> in <code>bin</code>, and adds the menu entry and icons. Run it from a newer download to upgrade. To remove it, run <code>~/.local/lib/tinyclient/install.sh --uninstall</code>, or <code>sudo /usr/local/lib/tinyclient/install.sh --uninstall --system</code>. You can also skip it and run <code>./tinyclient</code> where you unpacked it.</p>
 
+    <h3 id="nix">NixOS and Nix</h3>
+<div class="code"><pre><code>nix profile add github:itz4blitz/tinyclient
+nix profile remove tinyclient  <span class="c"># to remove it</span></code></pre></div>
+    <p>The flake builds tinyclient from source. With Home Manager, import <code>inputs.tinyclient.homeManagerModules.default</code> and set <code>programs.tinyclient.enable = true</code>; <code>systemd.enable = true</code> adds the <code>chatd</code> user service. For Telegram, override the package with your app id (<code>telegramApiId</code>, <code>telegramApiHash</code>). On NixOS, the window needs <code>hardware.graphics.enable</code>.</p>
+
     <h3 id="linux-notes">On every distribution</h3>
     <ul>
       <li>Sign-ins are kept in the Secret Service (GNOME Keyring or KWallet), which has to be running. Without it, <code>chatd</code> refuses to sign anyone in rather than keep a session it would lose.</li>
       <li>The window needs Vulkan, and Wayland or X11.</li>
       <li>Linux builds are tested in CI and have had far less hands-on use than macOS. Reports are welcome.</li>
-      <li>The <code>.deb</code>, <code>.rpm</code> and Arch package can install an optional systemd user service for <code>chatd</code>. It is off until you enable it. <a href="using.html#systemd">How to turn it on</a>.</li>
+      <li>The <code>.deb</code>, <code>.rpm</code>, Arch and Nix packages can install an optional systemd user service for <code>chatd</code>. It is off until you enable it. <a href="using.html#systemd">How to turn it on</a>.</li>
     </ul>
 
     <h2 id="windows">Windows</h2>

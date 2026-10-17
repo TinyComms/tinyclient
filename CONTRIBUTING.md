@@ -13,6 +13,10 @@ You need current stable Rust and `protoc` (Signal's libraries compile protobufs 
 `brew install protobuf`, or `apt install protobuf-compiler`). On Linux, install the libraries
 listed under "Build from source" in the [README](README.md#build-from-source).
 
+The Nix package (`packaging/nix/package.nix`) keeps a hash for each git dependency in
+`Cargo.lock`. When a change moves one to a new rev, run `packaging/nix/update-hashes.sh` (it
+needs Nix) to rewrite them.
+
 ```sh
 cargo build -p chatd -p mediad -p login    # the daemon and its helpers
 cargo run -p tinyclient --features gui     # the window; it starts the chatd beside it
