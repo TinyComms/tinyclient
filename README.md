@@ -323,6 +323,15 @@ adapter must do are in [`docs/architecture.md`](docs/architecture.md).
 | Crash reports and chatd's log | `crash.log`, `chatd.log` in the data directory | Credentials redacted before writing (`protocol::redact`). Never uploaded. |
 | The sign-in window's browser data | A WebKit data store on macOS; `login/<network>/` in the data directory elsewhere | Kept so an interrupted sign-in resumes |
 
+On Linux, a Secret Service provider may need you to unlock GPG before returning
+saved sessions. Background account loading retries short D-Bus read timeouts for
+up to two minutes while
+tinyclient keeps waiting for the keychain. Unlock within that window and the
+accounts reconnect automatically, without signing in again. Explicit refusals,
+other errors, or an expired retry window keep the cached accounts and offer
+“Try again”; stored credentials are not deleted. This does not change GPG's
+passphrase cache settings.
+
 The data directory is `~/Library/Application Support/tinyclient` on macOS,
 `$XDG_DATA_HOME/tinyclient` (default `~/.local/share/tinyclient`) on Linux, and
 `%APPDATA%\tinyclient` on Windows, or `TINYCLIENT_DIR` when set.

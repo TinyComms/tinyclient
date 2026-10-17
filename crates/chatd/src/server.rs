@@ -251,7 +251,7 @@ impl Chat {
             if let Some(delay) = test_keychain_delay() {
                 std::thread::sleep(delay);
             }
-            let _ = done.send(session::read(network));
+            let _ = done.send(session::read_waiting(network));
         });
         if let Err(err) = spawned {
             return session::Stored::Unreadable(err.to_string());
