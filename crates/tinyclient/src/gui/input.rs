@@ -7,8 +7,9 @@
 
 use super::composer::edit::{Editor, Motion, PlainRows, Rows};
 use super::theme;
+use super::components::{menu, menu_item, menu_item_disabled, menu_separator};
 use gpui::{
-    actions, div, fill, point, prelude::*, px, relative, size, App, Bounds, ClipboardEntry, ClipboardItem, Context,
+    actions, anchored, deferred, div, fill, point, prelude::*, px, relative, size, AnyElement, App, Bounds, ClipboardEntry, ClipboardItem, Context,
     CursorStyle, ElementId, ElementInputHandler, Entity, EntityInputHandler, EventEmitter,
     FocusHandle, Focusable, Font, GlobalElementId, Hsla, KeyBinding, LayoutId, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, ScrollWheelEvent,
@@ -317,6 +318,7 @@ pub struct TextInput {
     in_grid: bool,
     /// Ranges drawn as mentions. The holder keeps them in step with the text.
     highlights: Vec<Range<usize>>,
+    edit_menu: Option<(Point<Pixels>, bool, bool)>,
 }
 
 impl TextInput {
@@ -344,6 +346,7 @@ impl TextInput {
             grid: false,
             in_grid: false,
             highlights: Vec::new(),
+            edit_menu: None,
         }
     }
 
@@ -363,6 +366,7 @@ impl TextInput {
     /// Puts another draft in the field, caret at its end. Not an edit: nothing is emitted and
     /// undo does not lead back to the text that was here.
     pub fn set_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.edit_menu = None;
         self.editor.set_text(text);
         self.laid = None;
         self.scroll = px(0.);
@@ -420,6 +424,7 @@ impl TextInput {
     }
 
     fn edited(&mut self, cx: &mut Context<Self>) {
+        self.edit_menu = None;
         cx.emit(InputEvent::Changed);
         cx.notify();
     }
@@ -641,7 +646,11 @@ impl TextInput {
     }
 
     fn escape(&mut self, _: &Escape, _: &mut Window, cx: &mut Context<Self>) {
-        cx.emit(InputKey::Escape);
+        if self.edit_menu.take().is_some() {
+            cx.notify();
+        } else {
+            cx.emit(InputKey::Escape);
+        }
     }
 
     fn undo(&mut self, _: &Undo, window: &mut Window, cx: &mut Context<Self>) {
@@ -667,6 +676,7 @@ impl TextInput {
     /// Finder files first, then a picture that came with no text, else text: a browser's copy
     /// carries both a picture and its words, and stays words.
     fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
+        if self.edit_menu.take().is_some() { cx.notify(); }
         let Some(item) = cx.read_from_clipboard() else {
             return;
         };
@@ -717,7 +727,69 @@ impl TextInput {
         cx.stop_propagation();
     }
 
+    fn on_right_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.editor.is_multiline() {
+            return;
+        }
+        window.focus(&self.focus_handle, cx);
+        self.is_selecting = false;
+        let offset = self.index_for_mouse_position(event.position);
+        context_caret(&mut self.editor, offset);
+        let clipboard = cx.read_from_clipboard();
+        let entries = clipboard.as_ref().map_or(&[][..], |item| item.entries());
+        let paste = pasted(entries);
+        let can_paste = !matches!(paste, Pasted::Nothing);
+        let has_image = !matches!(paste, Pasted::Image(_))
+            && entries.iter().any(|entry| matches!(entry, ClipboardEntry::Image(_)));
+        self.edit_menu = Some((event.position, can_paste, has_image));
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn draw_edit_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (at, can_paste, has_image) = self.edit_menu?;
+        let selected = !self.editor.selection().is_empty();
+        let item = |id, label, shortcut, enabled| {
+            if enabled { menu_item(id, None, label, shortcut) } else { menu_item_disabled(id, None, label, shortcut) }
+        };
+        let cut = item("input-cut", "Cut", Some("⌘X"), selected).when(selected, |row| row.on_click(cx.listener(|this, _, window, cx| {
+            this.edit_menu = None;
+            this.cut(&Cut, window, cx);
+            cx.notify();
+        })));
+        let copy = item("input-copy", "Copy", Some("⌘C"), selected).when(selected, |row| row.on_click(cx.listener(|this, _, window, cx| {
+            this.edit_menu = None;
+            this.copy(&Copy, window, cx);
+            cx.notify();
+        })));
+        let paste = item("input-paste", "Paste", Some("⌘V"), can_paste).when(can_paste, |row| row.on_click(cx.listener(|this, _, window, cx| {
+            this.edit_menu = None;
+            this.paste(&Paste, window, cx);
+            cx.notify();
+        })));
+        let picture = has_image.then(|| menu_item("input-paste-image", None, "Paste image", None).on_click(cx.listener(|this, _, _, cx| {
+            this.edit_menu = None;
+            if let Some(image) = cx.read_from_clipboard().and_then(|item| image_from(item.entries())) {
+                cx.emit(InputPaste::Image(image));
+            }
+            cx.notify();
+        })));
+        let all = item("input-select-all", "Select all", Some("⌘A"), !self.editor.text().is_empty()).when(!self.editor.text().is_empty(), |row| row.on_click(cx.listener(|this, _, window, cx| {
+            this.edit_menu = None;
+            this.select_all(&SelectAll, window, cx);
+            cx.notify();
+        })));
+        let menu = menu().id("input-edit-menu").w(px(200.)).occlude()
+            // Menu clicks must not move the caret or replace the field's selection.
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| { this.edit_menu = None; cx.notify(); }))
+            .child(cut).child(copy).child(paste).children(picture).child(menu_separator()).child(all);
+        Some(deferred(anchored().position(at).snap_to_window().child(menu)).with_priority(2).into_any_element())
+    }
+
     fn on_mouse_down(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.edit_menu = None;
         let offset = self.index_for_mouse_position(event.position);
         self.is_selecting = select_on_press(&mut self.editor, offset, event.modifiers.shift, event.click_count);
         if !self.is_selecting { self.publish_primary(cx); }
@@ -787,6 +859,21 @@ enum Pasted {
     Image(gpui::Image),
     Text,
     Nothing,
+}
+
+/// A context menu preserves a selected range, otherwise it uses the clicked caret.
+fn context_caret(editor: &mut Editor, offset: usize) {
+    if editor.selection().is_empty() {
+        editor.place(offset);
+    }
+}
+
+/// Explicit image paste is available even when a browser also copied text.
+fn image_from(entries: &[ClipboardEntry]) -> Option<gpui::Image> {
+    entries.iter().find_map(|entry| match entry {
+        ClipboardEntry::Image(image) => Some(image.clone()),
+        _ => None,
+    })
 }
 
 /// Only a plain click starts a drag. Word, line and shift selections are complete
@@ -1275,6 +1362,7 @@ impl Render for TextInput {
             .on_action(cx.listener(Self::escape))
             .on_action(cx.listener(Self::tab))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::on_right_down))
             .map(|input| {
                 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
                 let input = input.on_mouse_down(MouseButton::Middle, cx.listener(Self::on_middle_down));
@@ -1285,6 +1373,7 @@ impl Render for TextInput {
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_scroll_wheel(cx.listener(Self::on_scroll))
             .child(TextElement { input: cx.entity() })
+            .children(self.draw_edit_menu(cx))
     }
 }
 
@@ -1343,6 +1432,30 @@ mod tests {
         let mut search = super::Editor::new(false);
         assert!(super::paste_primary_text(&mut search, Some("one\r\ntwo"), 0));
         assert_eq!(search.text(), "one two");
+    }
+
+    #[test]
+    fn context_menu_preserves_selected_text_or_places_an_unselected_caret() {
+        let mut editor = super::Editor::new(true);
+        editor.set_text("hello 世界");
+        editor.select_all();
+        super::context_caret(&mut editor, 2);
+        assert_eq!(editor.selected_text(), "hello 世界");
+        editor.place(0);
+        super::context_caret(&mut editor, 6);
+        editor.insert("link ");
+        assert_eq!(editor.text(), "hello link 世界");
+    }
+
+    #[test]
+    fn explicit_picture_paste_can_choose_pixels_from_a_mixed_browser_clipboard() {
+        let words = ClipboardEntry::String(ClipboardString::new("https://example.invalid/picture".into()));
+        let picture = ClipboardEntry::Image(Image::from_bytes(ImageFormat::Png, vec![1, 2, 3]));
+        let entries = [words, picture];
+        assert_eq!(pasted(&entries), Pasted::Text);
+        let image = super::image_from(&entries).expect("explicit Paste image keeps the pixels");
+        assert_eq!(image.format, ImageFormat::Png);
+        assert!(super::image_from(&[]).is_none());
     }
 
     #[test]

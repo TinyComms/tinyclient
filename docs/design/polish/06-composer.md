@@ -211,6 +211,23 @@ the local article title remains useful. Summary text is bounded, and rows are
 remeasured while preserving the reading position when it arrives.
 
 
+### Composer context menu
+
+Right-click the multiline message field to open Cut, Copy, Paste and Select all.
+Copy and Cut require a selection; right-click preserves that selection. With no
+selection, pasting text uses the clicked caret. Clipboard files or images use the
+same attachment staging path as keyboard paste and wait for the user to send.
+When the clipboard includes an image alongside text or files, a separate Paste
+image action can choose its pixels instead. For an image-only clipboard, Paste
+already chooses the image and no duplicate action appears.
+Plain Paste retains the keyboard shortcut's existing text/file/image priority.
+
+The menu stays above the composer, snaps into the window, and consumes its own
+mouse presses so clicking it cannot move the field's caret. Escape or an outside
+click closes it. Loading another draft closes it too. Single-line search fields
+keep their existing behavior. The menu is shared by every network's composer;
+attachment limits and permissions still apply through the staging tray.
+
 ## Deliberately absent
 
 Disabled or locked controls and upsells. A formatting bar. Uploading at staging. Locking the composer during upload.
