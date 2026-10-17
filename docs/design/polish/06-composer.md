@@ -172,7 +172,10 @@ removing a file (Discord) and replacing a photo (Telegram) are P2.
 - **Linux selection paste**: middle-click inserts PRIMARY's text at the clicked
   position and focuses the field, without sending a message or replacing another
   selected range. PRIMARY is separate from the Copy/Paste clipboard; selecting
-  text in a field publishes it for middle-click paste. An empty selection does
+  text in a field publishes it for middle-click paste. Word, line, and Shift-click
+  selections publish on press; only a plain click starts a drag and publishes
+  on release, so a stationary move cannot shrink a word or line selection.
+  An empty selection does
   nothing. This also works in single-line fields, which flatten pasted newlines.
 - **File panel**: `cx.prompt_for_paths` (files, multiple). **Progress**: bar width from the last `Upload`; no timer.
 - **Picker**: `deferred(anchored().position_mode(..).snap_to_window_with_margin(px(8.)))` gives shift; flip and shrink

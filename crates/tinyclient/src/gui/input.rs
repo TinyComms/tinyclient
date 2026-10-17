@@ -719,13 +719,8 @@ impl TextInput {
 
     fn on_mouse_down(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         let offset = self.index_for_mouse_position(event.position);
-        self.is_selecting = true;
-        match (event.modifiers.shift, event.click_count) {
-            (true, _) => self.editor.select_to(offset),
-            (false, 2) => self.editor.select_word_at(offset),
-            (false, 3..) => self.editor.select_line_at(offset),
-            (false, _) => self.editor.place(offset),
-        }
+        self.is_selecting = select_on_press(&mut self.editor, offset, event.modifiers.shift, event.click_count);
+        if !self.is_selecting { self.publish_primary(cx); }
         cx.notify();
     }
 
@@ -792,6 +787,18 @@ enum Pasted {
     Image(gpui::Image),
     Text,
     Nothing,
+}
+
+/// Only a plain click starts a drag. Word, line and shift selections are complete
+/// on press and must survive a move event at the same pointer position.
+fn select_on_press(editor: &mut Editor, offset: usize, shift: bool, clicks: usize) -> bool {
+    match (shift, clicks) {
+        (true, _) => editor.select_to(offset),
+        (false, 2) => editor.select_word_at(offset),
+        (false, 3..) => editor.select_line_at(offset),
+        (false, _) => { editor.place(offset); return true; }
+    }
+    false
 }
 
 #[cfg(any(target_os = "linux", target_os = "freebsd", test))]
@@ -1292,6 +1299,24 @@ mod tests {
     use super::{markup, pasted, Pasted};
     use gpui::{ClipboardEntry, ClipboardString, ExternalPaths, Image, ImageFormat};
     use std::path::PathBuf;
+
+    #[test]
+    fn word_line_and_shift_selections_survive_a_stationary_move() {
+        for (clicks, shift, expected) in [(2, false, "second"), (3, false, "first second third"), (1, true, "second thi")] {
+            let mut editor = super::Editor::new(true);
+            editor.set_text("first second third");
+            editor.place(16);
+            let dragging = super::select_on_press(&mut editor, 6, shift, clicks);
+            if dragging { editor.select_to(6); }
+            assert!(!dragging);
+            assert_eq!(editor.selected_text(), expected);
+        }
+        let mut editor = super::Editor::new(true);
+        editor.set_text("first second");
+        assert!(super::select_on_press(&mut editor, 6, false, 1));
+        editor.select_to(12);
+        assert_eq!(editor.selected_text(), "second");
+    }
 
     #[test]
     fn middle_paste_inserts_at_the_click_without_replacing_selected_text() {
