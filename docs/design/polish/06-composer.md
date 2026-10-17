@@ -169,6 +169,11 @@ removing a file (Discord) and replacing a photo (Telegram) are P2.
   `deferred` absolute child so the list does not reflow. `Exited` clears it.
 - **Clipboard**: `read_from_clipboard()` entries are `String`, `Image` (with `ImageFormat`) and `ExternalPaths`; walk
   them in §2 order. Image bytes are written to `outbox/` on a background task; the chip keeps the path only.
+- **Linux selection paste**: middle-click inserts PRIMARY's text at the clicked
+  position and focuses the field, without sending a message or replacing another
+  selected range. PRIMARY is separate from the Copy/Paste clipboard; selecting
+  text in a field publishes it for middle-click paste. An empty selection does
+  nothing. This also works in single-line fields, which flatten pasted newlines.
 - **File panel**: `cx.prompt_for_paths` (files, multiple). **Progress**: bar width from the last `Upload`; no timer.
 - **Picker**: `deferred(anchored().position_mode(..).snap_to_window_with_margin(px(8.)))` gives shift; flip and shrink
   are computed from the trigger bounds before layout. Grid = `uniform_list` of rows (9 emoji / 1 justified GIF row / 4
