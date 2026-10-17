@@ -163,10 +163,11 @@ pub fn stop_chatd_on_quit(cx: &mut App) {
     .detach();
 }
 
-/// ⌘W and the red button: with Keep receiving on, the window hides and chatd goes on receiving
-/// and the Dock badge counting; off, tinyclient quits.
+/// Closing the main window quits on Linux and Windows, where application hiding is not
+/// implemented. On macOS, Keep receiving hides the window and leaves chatd receiving;
+/// otherwise closing quits there too.
 pub fn close_window(cx: &mut App) {
-    if super::prefs::values().on(protocol::settings::KEEP_RUNNING) {
+    if cfg!(target_os = "macos") && super::prefs::values().on(protocol::settings::KEEP_RUNNING) {
         cx.hide();
     } else {
         quit(cx);
