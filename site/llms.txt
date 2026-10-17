@@ -1,0 +1,30 @@
+# tinyclient
+
+> A tiny, private, open-source desktop chat client for Slack, Discord, Telegram, Microsoft Teams, and Signal. Native. No tinyclient servers, no tinyclient accounts, no telemetry.
+
+tinyclient runs on the person's computer. chatd keeps messages on disk and sessions in the OS keychain, and connects directly to each network. There is no remote tinyclient API and nothing to authenticate against on tinyclient.io.
+
+## Docs
+
+- [Getting started](https://tinyclient.io/docs/): install on macOS, Linux, or Windows, sign in, and see where data is kept
+- [Build from source](https://tinyclient.io/docs/build.html): prerequisites and cargo commands
+- [Architecture](https://tinyclient.io/docs/architecture.html): chatd, the window, mediad, and the sign-in helper
+- [Size and performance](https://tinyclient.io/docs/performance.html): disk and memory next to the official apps, and how each number was measured
+- [Privacy and security](https://tinyclient.io/docs/privacy.html): what is stored, which connections are made, and what the app never does
+- [Networks and terms](https://tinyclient.io/docs/networks.html): what each network supports and how it treats third-party clients
+- [Contributing](https://tinyclient.io/docs/contributing.html): roadmap and the rules every change keeps
+
+## Downloads
+
+The latest release is always at these paths (they redirect to GitHub):
+
+- macOS: https://tinyclient.io/download/macos
+- Linux: https://tinyclient.io/docs/#linux
+- Windows: https://tinyclient.io/download/windows
+- Checksums: https://tinyclient.io/download/checksums
+
+## Optional
+
+- [Source](https://github.com/itz4blitz/tinyclient)
+- [Security policy](https://github.com/itz4blitz/tinyclient/blob/main/SECURITY.md)
+- [Agent skill](https://tinyclient.io/.well-known/agent-skills/tinyclient/SKILL.md)

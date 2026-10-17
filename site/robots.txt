@@ -1,0 +1,87 @@
+# tinyclient.io is a public documentation and download site.
+# Content Signals (https://contentsignals.org/) reserve rights under Article 4 of
+# EU Directive 2019/790 where a preference below is "no".
+#
+# search:   building a search index and showing links and short excerpts.
+# ai-input: using page text as input when answering a person (grounding).
+# ai-train: training or fine-tuning a model.
+#
+# Search crawlers and user-triggered fetchers may read the public pages.
+# Training crawlers may not. Disallowing a training crawler does not remove
+# these pages from AI search results.
+
+User-agent: *
+Content-Signal: ai-train=no, search=yes, ai-input=yes
+Allow: /
+
+# Search crawlers. These are what assistants use when they cite a page.
+User-agent: OAI-SearchBot
+Content-Signal: ai-train=no, search=yes, ai-input=yes
+Allow: /
+
+User-agent: Claude-SearchBot
+Content-Signal: ai-train=no, search=yes, ai-input=yes
+Allow: /
+
+User-agent: PerplexityBot
+Content-Signal: ai-train=no, search=yes, ai-input=yes
+Allow: /
+
+# Fetches a person triggered. Vendors may ignore robots.txt for these.
+User-agent: ChatGPT-User
+Allow: /
+
+User-agent: Claude-User
+Allow: /
+
+User-agent: Perplexity-User
+Allow: /
+
+# Training crawlers. Blocking these does not affect search citations.
+User-agent: GPTBot
+Content-Signal: ai-train=no, search=yes, ai-input=yes
+Disallow: /
+
+User-agent: ClaudeBot
+Content-Signal: ai-train=no, search=yes, ai-input=yes
+Disallow: /
+
+User-agent: anthropic-ai
+Disallow: /
+
+User-agent: claude-web
+Disallow: /
+
+User-agent: Google-Extended
+Content-Signal: ai-train=no, search=yes, ai-input=yes
+Disallow: /
+
+User-agent: Applebot-Extended
+Disallow: /
+
+User-agent: CCBot
+Disallow: /
+
+User-agent: Bytespider
+Disallow: /
+
+User-agent: Amazonbot
+Disallow: /
+
+User-agent: cohere-ai
+Disallow: /
+
+User-agent: meta-externalagent
+Disallow: /
+
+User-agent: FacebookBot
+Disallow: /
+
+User-agent: omgilibot
+Disallow: /
+
+User-agent: Diffbot
+Disallow: /
+
+Sitemap: https://tinyclient.io/sitemap.xml
+Agentmap: https://tinyclient.io/.well-known/ai-catalog.json

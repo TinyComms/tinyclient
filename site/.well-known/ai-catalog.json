@@ -1,0 +1,64 @@
+{
+  "specVersion": "1.0",
+  "host": {
+    "displayName": "tinyclient",
+    "identifier": "https://tinyclient.io"
+  },
+  "entries": [
+    {
+      "identifier": "urn:air:tinyclient.io:docs:getting-started",
+      "displayName": "Getting started",
+      "type": "text/html",
+      "url": "https://tinyclient.io/docs/",
+      "representativeQueries": [
+        "how do I install tinyclient",
+        "download tinyclient for macOS Linux or Windows",
+        "where does tinyclient keep my messages"
+      ]
+    },
+    {
+      "identifier": "urn:air:tinyclient.io:docs:privacy",
+      "displayName": "Privacy and security",
+      "type": "text/html",
+      "url": "https://tinyclient.io/docs/privacy.html",
+      "representativeQueries": [
+        "does tinyclient have telemetry",
+        "where are tinyclient sessions stored",
+        "what data does tinyclient send"
+      ]
+    },
+    {
+      "identifier": "urn:air:tinyclient.io:docs:architecture",
+      "displayName": "Architecture",
+      "type": "text/html",
+      "url": "https://tinyclient.io/docs/architecture.html",
+      "representativeQueries": [
+        "what is chatd in tinyclient",
+        "how does tinyclient connect to Slack and Signal",
+        "is there a tinyclient server"
+      ]
+    },
+    {
+      "identifier": "urn:air:tinyclient.io:skill:tinyclient",
+      "displayName": "tinyclient agent skill",
+      "type": "text/markdown",
+      "url": "https://tinyclient.io/.well-known/agent-skills/tinyclient/SKILL.md",
+      "representativeQueries": [
+        "what should an agent know about tinyclient",
+        "does tinyclient have an API or account",
+        "tinyclient download and privacy summary"
+      ]
+    },
+    {
+      "identifier": "urn:air:tinyclient.io:api:website",
+      "displayName": "Website API description",
+      "type": "application/vnd.oai.openapi+json",
+      "url": "https://tinyclient.io/.well-known/openapi.json",
+      "representativeQueries": [
+        "does tinyclient.io expose a chat API",
+        "openapi for the tinyclient website",
+        "how do agents authenticate to tinyclient"
+      ]
+    }
+  ]
+}

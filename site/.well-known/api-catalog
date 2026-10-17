@@ -1,0 +1,28 @@
+{
+  "linkset": [
+    {
+      "anchor": "https://tinyclient.io/",
+      "service-desc": [
+        {
+          "href": "https://tinyclient.io/.well-known/openapi.json",
+          "type": "application/vnd.oai.openapi+json",
+          "title": "OpenAPI description of tinyclient.io"
+        }
+      ],
+      "service-doc": [
+        {
+          "href": "https://tinyclient.io/docs/",
+          "type": "text/html",
+          "title": "tinyclient documentation"
+        }
+      ],
+      "describedby": [
+        {
+          "href": "https://tinyclient.io/llms.txt",
+          "type": "text/plain",
+          "title": "llms.txt"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "$schema": "https://schemas.agentskills.io/discovery/0.2.0/schema.json",
+  "skills": [
+    {
+      "name": "tinyclient",
+      "type": "skill-md",
+      "description": "Answer questions about tinyclient, a local open-source chat client for Slack, Discord, Telegram, Teams, and Signal. Use when someone asks how to install it, where data lives, or whether tinyclient has an account or API.",
+      "url": "https://tinyclient.io/.well-known/agent-skills/tinyclient/SKILL.md",
+      "digest": "sha256:9ca27e94064863bc4be84581dad430920836604296733398e3eb830a906372ee"
+    }
+  ]
+}

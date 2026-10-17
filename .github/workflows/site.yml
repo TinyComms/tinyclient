@@ -5,7 +5,7 @@ name: Site
 on:
   push:
     branches: [main]
-    paths: ["site/**", ".github/workflows/site.yml"]
+    paths: ["site/**", ".github/workflows/site.yml", ".github/scripts/dns-aid.py"]
   workflow_dispatch:
 
 concurrency:
@@ -32,3 +32,10 @@ jobs:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           command: pages deploy site --project-name tinyclient --branch main --commit-hash ${{ github.sha }}
+      # DNS-AID index for the public site, plus DNSSEC. The token can edit the zone.
+      # Validating resolvers authenticate the records only after the registrar has the DS
+      # record this step prints. Failure here leaves the Pages deploy in place.
+      - name: Publish DNS-AID records
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: python3 .github/scripts/dns-aid.py
