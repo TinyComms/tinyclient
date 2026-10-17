@@ -80,6 +80,10 @@ below is a place to help.
 | **Signal** | Linked as a device: scan a QR code from your phone | Direct and group chats, replies, mentions, reactions, edits, deletes. Photos and files appear as a labelled line, not shown. Nothing from before the link. | Text, replies, reactions, edit and delete your own | Not built |
 | **Messages** | Paired from the Android phone, the way messages.google.com is. The phone stays the account and has to stay online. | Texts in the chats the phone already has. Photos and files appear as a labelled line, not shown. | Text. Reactions are not in this version. | Opens in Messages |
 
+Signal identifies your own conversation as **Note to Self**, including messages
+sent from your phone. Existing cached self-conversations are relabeled when the
+account reconnects; their messages are preserved.
+
 Not built yet: message search (the switcher finds conversations by title in the local cache),
 notifications and a dock badge, video and screen share, voice messages, Signal attachments and
 safety numbers, Messages reactions and shown photos, Teams personal accounts. Each is a place to help; see [Contributing](#contributing).

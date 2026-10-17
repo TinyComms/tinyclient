@@ -14,6 +14,7 @@
 //! | `photo WHO SENT` | WHO sent a photo with no caption |
 //! | `quote WHO SENT QUOTED TEXT…` | WHO answered our message sent at QUOTED |
 //! | `mine SENT TEXT…` | we wrote TEXT to Grace from the phone |
+//! | `note SENT TEXT…` | we wrote TEXT to Note to Self from the phone |
 //! | `edit WHO TARGET TEXT…`, `delete WHO TARGET` | WHO changed or took back their message |
 //! | `react WHO AUTHOR TARGET EMOJI`, `unreact …` | WHO reacted to AUTHOR's message |
 //! | `read WHO SENT` | we read WHO's message on the phone |
@@ -151,10 +152,11 @@ fn steer(line: &str) -> Vec<Event> {
             let peer = if matches!(command, "group" | "mention") { club() } else { direct(author) };
             vec![Event::Message { peer, text, outgoing: false }]
         }
-        "mine" => {
+        "mine" | "note" => {
             let sent = next().parse().unwrap_or(T0);
             let text = Text { author: ME.into(), name: "Ada Quill".into(), sent, text: rest(line, 2), ..Text::default() };
-            vec![Event::Message { peer: direct(GRACE), text, outgoing: true }]
+            let peer = direct(if command == "note" { ME } else { GRACE });
+            vec![Event::Message { peer, text, outgoing: true }]
         }
         "edit" | "delete" => {
             let Some((author, _)) = who(next()) else {

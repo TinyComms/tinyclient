@@ -315,6 +315,11 @@ fn connect(ctx: &Context, saved: &Saved, live: &Arc<Mutex<Live>>, current: &Mute
         account.wire.close();
         return Failure::Dropped("stopped".to_owned());
     }
+    // Older builds may have cached our own conversation under the contact fallback.
+    // Repair it on reconnect without creating an empty self conversation.
+    if matches!(ctx.known(&account.me), Ok(Some(_))) {
+        ensure_row(&account, &Peer::Direct(account.me.clone()), "");
+    }
     ctx.link(Link::Connected);
     let ended = loop {
         match events.recv() {
@@ -334,6 +339,8 @@ fn connect(ctx: &Context, saved: &Saved, live: &Arc<Mutex<Live>>, current: &Mute
 
 /// The row of a conversation, recorded the first time it is seen.
 fn ensure_row(account: &Account, peer: &Peer, title: &str) {
+    // The phone need not include ourselves in its contact list.
+    let title = if matches!(peer, Peer::Direct(aci) if aci == &account.me) { "Note to Self" } else { title };
     let id = peer.conversation();
     match account.ctx.known(&id) {
         Ok(Some(known)) if title.is_empty() || known.title == title => {}
