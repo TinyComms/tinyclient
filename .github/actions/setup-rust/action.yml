@@ -1,0 +1,45 @@
+name: Set up the Rust build
+description: Toolchain, protoc, system libraries, linker, and the cargo cache shared by CI and release.
+
+inputs:
+  cache-key:
+    description: test or release. One cache per profile, shared by every job that builds it.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: System libraries
+      shell: bash
+      run: |
+        set -eu
+        case "$RUNNER_OS" in
+          Linux)
+            packaging/ci/apt.sh
+            ;;
+          Windows)
+            # native-tls finds OpenSSL beside Git's usr\bin.
+            echo "$(cygpath -w "/c/Program Files/Git/usr/bin")" >> "$GITHUB_PATH"
+            ;;
+        esac
+
+    - name: Install protoc
+      shell: bash
+      run: packaging/ci/protoc.sh
+
+    - uses: dtolnay/rust-toolchain@stable
+
+    - name: Faster linking
+      shell: bash
+      run: packaging/ci/link-flags.sh
+
+    # Only main writes the cache. A pull request restores that copy and does not save its own:
+    # each save is about a gigabyte, the repository holds 10 GB, and pull-request copies were
+    # evicting the cache before the next build could use it. shared-key drops the job name so
+    # CI and the release workflow restore the same entry. The v1 prefix starts clean of the
+    # caches from before the linker flags and the line-table profile.
+    - uses: swatinem/rust-cache@v2
+      with:
+        prefix-key: v1-rust
+        shared-key: ${{ inputs.cache-key }}
+        save-if: ${{ github.ref == 'refs/heads/main' }}

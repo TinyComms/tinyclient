@@ -4,6 +4,9 @@ name: Release
 # publishes them as that tag's GitHub release. Run by hand on a branch, it builds and tests the
 # same files without publishing (`gh workflow run release.yml --ref BRANCH`); they are kept as the
 # run's `release-all` artifact.
+#
+# macOS, Windows, and Linux x86_64 skip compilation when CI already built that commit. The
+# programs are packaged and signed here. Linux aarch64 is built here; CI does not cover it.
 on:
   push:
     tags:
@@ -15,6 +18,10 @@ on:
         type: boolean
         default: false
 
+permissions:
+  contents: read
+  actions: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -25,14 +32,17 @@ jobs:
       - uses: actions/checkout@v4
       - name: Name the files
         run: packaging/ci-label.sh >> "$GITHUB_ENV"
-      - name: Install protobuf
-        run: brew install protobuf
-      - uses: swatinem/rust-cache@v2
-      - name: Test (no GUI)
-        if: github.event_name == 'push'
-        run: cargo test --workspace
-        continue-on-error: true
+      - name: Reuse binaries built by CI
+        id: reuse
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: packaging/ci/reuse-binaries.sh macos
+      - uses: ./.github/actions/setup-rust
+        if: steps.reuse.outputs.found != 'true'
+        with:
+          cache-key: release
       - name: Build release
+        if: steps.reuse.outputs.found != 'true'
         env:
           TINYCLIENT_TELEGRAM_API_ID: ${{ secrets.TINYCLIENT_TELEGRAM_API_ID }}
           TINYCLIENT_TELEGRAM_API_HASH: ${{ secrets.TINYCLIENT_TELEGRAM_API_HASH }}
@@ -75,35 +85,30 @@ jobs:
           # The oldest supported Ubuntu: the packages need the glibc they were built against or newer.
           - arch: x86_64
             runner: ubuntu-22.04
+            artifact: linux-x86_64
           - arch: aarch64
             runner: ubuntu-22.04-arm
+            artifact: linux-aarch64
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - name: Name the files
         run: packaging/ci-label.sh >> "$GITHUB_ENV"
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential pkg-config libssl-dev libasound2-dev libgtk-3-dev libwebkit2gtk-4.1-dev \
-            libsoup-3.0-dev libvulkan-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libx11-dev \
-            libxcb1-dev libfontconfig1-dev librsvg2-bin dpkg-dev
-      # Ubuntu 22.04's protoc (3.12) is too old for Signal's protobufs (proto3 optional fields).
-      - name: Install protobuf
-        run: |
-          case $(uname -m) in x86_64) a=x86_64 ;; aarch64) a=aarch_64 ;; esac
-          curl -fsSL -o "$RUNNER_TEMP/protoc.zip" "https://github.com/protocolbuffers/protobuf/releases/download/v29.3/protoc-29.3-linux-$a.zip"
-          unzip -q "$RUNNER_TEMP/protoc.zip" -d "$RUNNER_TEMP/protoc"
-          echo "$RUNNER_TEMP/protoc/bin" >> "$GITHUB_PATH"
-      - uses: swatinem/rust-cache@v2
+      - name: Reuse binaries built by CI
+        id: reuse
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: packaging/ci/reuse-binaries.sh ${{ matrix.artifact }}
+      # Packaging reads the linked libraries even when the programs themselves came from CI.
+      - name: Install packaging dependencies
+        if: steps.reuse.outputs.found == 'true'
+        run: packaging/ci/apt.sh
+      - uses: ./.github/actions/setup-rust
+        if: steps.reuse.outputs.found != 'true'
         with:
-          key: ${{ matrix.runner }}
-      - name: Test
-        if: github.event_name == 'push'
-        run: cargo test --workspace
-        continue-on-error: true
+          cache-key: release
       - name: Build release
+        if: steps.reuse.outputs.found != 'true'
         env:
           TINYCLIENT_TELEGRAM_API_ID: ${{ secrets.TINYCLIENT_TELEGRAM_API_ID }}
           TINYCLIENT_TELEGRAM_API_HASH: ${{ secrets.TINYCLIENT_TELEGRAM_API_HASH }}
@@ -130,8 +135,36 @@ jobs:
         include:
           - arch: x86_64
             runner: ubuntu-24.04
+            image: ubuntu:24.04
+            kind: deb-full
+          - arch: x86_64
+            runner: ubuntu-24.04
+            image: debian:12
+            kind: deb
+          - arch: x86_64
+            runner: ubuntu-24.04
+            image: fedora:latest
+            kind: rpm
+          - arch: x86_64
+            runner: ubuntu-24.04
+            image: opensuse/tumbleweed
+            kind: rpm
           - arch: aarch64
             runner: ubuntu-24.04-arm
+            image: ubuntu:24.04
+            kind: deb-full
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            image: debian:12
+            kind: deb
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            image: fedora:latest
+            kind: rpm
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            image: opensuse/tumbleweed
+            kind: rpm
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -141,14 +174,8 @@ jobs:
         with:
           name: release-linux-${{ matrix.arch }}
           path: dist
-      - name: .deb on Ubuntu 24.04 (with the desktop entry, metainfo, AppImage and tar.gz)
-        run: docker run --rm -v "$PWD:/w" -w /w -e LABEL -e VERSION -e ARCH=${{ matrix.arch }} ubuntu:24.04 packaging/linux/smoke.sh deb-full
-      - name: .deb on Debian 12
-        run: docker run --rm -v "$PWD:/w" -w /w -e LABEL -e VERSION -e ARCH=${{ matrix.arch }} debian:12 packaging/linux/smoke.sh deb
-      - name: .rpm on Fedora
-        run: docker run --rm -v "$PWD:/w" -w /w -e LABEL -e VERSION -e ARCH=${{ matrix.arch }} fedora:latest packaging/linux/smoke.sh rpm
-      - name: .rpm on openSUSE Tumbleweed
-        run: docker run --rm -v "$PWD:/w" -w /w -e LABEL -e VERSION -e ARCH=${{ matrix.arch }} opensuse/tumbleweed packaging/linux/smoke.sh rpm
+      - name: Install on ${{ matrix.image }}
+        run: docker run --rm -v "$PWD:/w" -w /w -e LABEL -e VERSION -e ARCH=${{ matrix.arch }} ${{ matrix.image }} packaging/linux/smoke.sh ${{ matrix.kind }}
 
   windows:
     runs-on: windows-latest
@@ -157,21 +184,18 @@ jobs:
       - name: Name the files
         shell: bash
         run: packaging/ci-label.sh >> "$GITHUB_ENV"
-      - uses: swatinem/rust-cache@v2
-      - name: OpenSSL from Git
-        shell: pwsh
-        run: echo "C:\Program Files\Git\usr\bin" >> $env:GITHUB_PATH
-      - name: Install protobuf
-        shell: pwsh
-        run: |
-          Invoke-WebRequest -Uri "https://github.com/protocolbuffers/protobuf/releases/download/v29.3/protoc-29.3-win64.zip" -OutFile protoc.zip
-          Expand-Archive protoc.zip -DestinationPath protoc
-          echo "$pwd\protoc\bin" >> $env:GITHUB_PATH
-      - name: Test
-        if: github.event_name == 'push'
-        run: cargo test --workspace
-        continue-on-error: true
+      - name: Reuse binaries built by CI
+        id: reuse
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: packaging/ci/reuse-binaries.sh windows
+      - uses: ./.github/actions/setup-rust
+        if: steps.reuse.outputs.found != 'true'
+        with:
+          cache-key: release
       - name: Build release
+        if: steps.reuse.outputs.found != 'true'
         env:
           TINYCLIENT_TELEGRAM_API_ID: ${{ secrets.TINYCLIENT_TELEGRAM_API_ID }}
           TINYCLIENT_TELEGRAM_API_HASH: ${{ secrets.TINYCLIENT_TELEGRAM_API_HASH }}
