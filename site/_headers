@@ -20,6 +20,8 @@
   Cache-Control: public, max-age=0, must-revalidate
 /site.js
   Cache-Control: public, max-age=0, must-revalidate
+/demo.js
+  Cache-Control: public, max-age=0, must-revalidate
 
 # Discovery documents. Link is repeated by the Pages function so a cached HTML
 # response still advertises the catalog.

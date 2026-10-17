@@ -11,7 +11,7 @@
 <link rel="canonical" href="https://tinyclient.io/">
 <link rel="ai-catalog" href="/.well-known/ai-catalog.json">
 <meta property="og:url" content="https://tinyclient.io/">
-<meta property="og:image" content="https://tinyclient.io/shots/inbox-2.webp">
+<meta property="og:image" content="https://tinyclient.io/shots/inbox-3.webp">
 <meta name="color-scheme" content="dark light">
 <meta name="theme-color" content="#121315" media="(prefers-color-scheme: dark)">
 <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
@@ -21,6 +21,7 @@
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="style.css">
 <script src="site.js" defer></script>
+<script src="demo.js" defer></script>
 <script type="application/ld+json">
 {"@context":"https://schema.org","@type":"SoftwareApplication","name":"tinyclient","applicationCategory":"CommunicationApplication","operatingSystem":"macOS, Linux, Windows","url":"https://tinyclient.io/","description":"A tiny, private, open-source chat client for Slack, Discord, Telegram, Teams, Signal and Messages. Native, no servers, no telemetry.","license":"https://opensource.org/licenses/MIT","codeRepository":"https://github.com/itz4blitz/tinyclient","offers":{"@type":"Offer","price":"0","priceCurrency":"USD"}}
 </script>
@@ -44,57 +45,63 @@
 
 <section class="hero" aria-labelledby="title">
   <div class="wrap">
-    <img class="hero-icon" src="icon.svg" alt="" width="76" height="76">
-    <h1 id="title">tinyclient</h1>
+    <a class="hero-badge" href="docs/networks.html"><span class="hb-new">New</span>Android Messages, paired from your phone<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg></a>
+    <div class="hero-mark"><img class="hero-icon" src="icon.svg" alt="" width="76" height="76"><h1 id="title">tinyclient</h1></div>
     <p class="pitch">One tiny, private app for all your chats.</p>
     <div class="actions">
       <a class="btn btn-primary" href="/download/macos"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/><path d="M12 15V3"/></svg><span data-download-label>Download</span></a>
       <a class="btn btn-secondary" href="https://github.com/itz4blitz/tinyclient"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>View source</a>
     </div>
-    <p class="platforms">For <a href="/download/macos">macOS</a>, <a href="/download/linux">Linux</a> and <a href="/download/windows">Windows</a> · Free and open source</p>
+    <p class="platforms">For <a href="/download/macos">macOS</a> on Apple&nbsp;silicon, <a href="/download/linux">Linux</a> and <a href="/download/windows">Windows</a> · Free and open source</p>
     <p class="platforms" data-linux-choices hidden>Linux: <a href="/download/deb">.deb</a> for Debian and Ubuntu · <a href="/download/rpm">.rpm</a> for Fedora and openSUSE · <a href="/download/appimage">AppImage</a> · <a href="/download/linux-tar">.tar.gz</a></p>
 
+    <div class="tc-stage" id="tc-stage"></div>
     <div class="carousel" id="hero-shots" role="region" aria-roledescription="carousel" aria-label="Screenshots of tinyclient">
       <div class="car-frame">
         <span class="car-lights" aria-hidden="true"><i></i><i></i><i></i></span>
         <div class="car-track" tabindex="0" aria-live="polite" aria-label="Screenshots, scroll sideways for more">
-          <figure class="car-slide" id="shot-1" role="group" aria-roledescription="slide" aria-label="1 of 8">
-            <img src="shots/inbox-2.webp" width="2240" height="1400" alt="tinyclient's unified inbox showing unread conversations from Discord, Telegram, Slack, Microsoft Teams and Signal in one list, with a Discord channel open beside it." fetchpriority="high" decoding="async">
+          <figure class="car-slide" id="shot-1" role="group" aria-roledescription="slide" aria-label="1 of 9">
+            <img src="shots/inbox-3.webp" srcset="shots/inbox-3-1120.webp 1120w, shots/inbox-3.webp 2240w" sizes="(max-width: 1120px) calc(100vw - 32px), 1072px" width="2240" height="1400" alt="tinyclient's unified inbox showing unread conversations from Discord, Telegram, Slack, Microsoft Teams, Signal and Messages in one list, with a Discord channel open beside it." fetchpriority="high" decoding="async">
             <figcaption class="car-cap">One inbox for every network</figcaption>
           </figure>
-          <figure class="car-slide" id="shot-2" role="group" aria-roledescription="slide" aria-label="2 of 8">
-            <img src="shots/previews-2.webp" width="2240" height="1400" alt="A Discord channel in tinyclient with a link preview showing a creek photo, and a message with a row of emoji reactions." loading="lazy" decoding="async">
+          <figure class="car-slide" id="shot-2" role="group" aria-roledescription="slide" aria-label="2 of 9">
+            <img src="shots/previews-3.webp" srcset="shots/previews-3-1120.webp 1120w, shots/previews-3.webp 2240w" sizes="(max-width: 1120px) calc(100vw - 32px), 1072px" width="2240" height="1400" alt="A Discord channel in tinyclient with a link preview showing a creek photo, and a message with a row of emoji reactions." loading="lazy" decoding="async">
             <figcaption class="car-cap">Link previews, photos and reactions</figcaption>
           </figure>
-          <figure class="car-slide" id="shot-3" role="group" aria-roledescription="slide" aria-label="3 of 8">
-            <img src="shots/call-2.webp" width="2240" height="1400" alt="A Discord voice call in tinyclient: the call bar under the inbox shows who you are talking to, with mute, deafen, settings and hang-up buttons." loading="lazy" decoding="async">
+          <figure class="car-slide" id="shot-3" role="group" aria-roledescription="slide" aria-label="3 of 9">
+            <img src="shots/call-3.webp" srcset="shots/call-3-1120.webp 1120w, shots/call-3.webp 2240w" sizes="(max-width: 1120px) calc(100vw - 32px), 1072px" width="2240" height="1400" alt="A Discord voice call with Ines Marchetti in tinyclient: the call bar under the inbox shows who you are talking to, with mute, deafen, settings and hang-up buttons." loading="lazy" decoding="async">
             <figcaption class="car-cap">Voice calls on Discord</figcaption>
           </figure>
-          <figure class="car-slide" id="shot-4" role="group" aria-roledescription="slide" aria-label="4 of 8">
-            <img src="shots/thread-2.webp" width="2240" height="1400" alt="A thread open in a side pane next to a Discord channel in tinyclient, beside a bot's report card and a photo." loading="lazy" decoding="async">
+          <figure class="car-slide" id="shot-4" role="group" aria-roledescription="slide" aria-label="4 of 9">
+            <img src="shots/thread-3.webp" srcset="shots/thread-3-1120.webp 1120w, shots/thread-3.webp 2240w" sizes="(max-width: 1120px) calc(100vw - 32px), 1072px" width="2240" height="1400" alt="A thread open in a side pane next to a Discord channel in tinyclient, beside a bot's report card and a photo." loading="lazy" decoding="async">
             <figcaption class="car-cap">Threads beside the conversation</figcaption>
           </figure>
-          <figure class="car-slide" id="shot-5" role="group" aria-roledescription="slide" aria-label="5 of 8">
-            <img src="shots/slack-2.webp" width="2240" height="1400" alt="A Slack workspace in tinyclient: channel sections and direct messages on the left, and a channel with a mention and a thread summary." loading="lazy" decoding="async">
+          <figure class="car-slide" id="shot-5" role="group" aria-roledescription="slide" aria-label="5 of 9">
+            <img src="shots/slack-3.webp" srcset="shots/slack-3-1120.webp 1120w, shots/slack-3.webp 2240w" sizes="(max-width: 1120px) calc(100vw - 32px), 1072px" width="2240" height="1400" alt="A Slack workspace in tinyclient: channel sections and direct messages on the left, and a channel with a mention and a thread summary." loading="lazy" decoding="async">
             <figcaption class="car-cap">Slack workspaces, sections and threads</figcaption>
           </figure>
-          <figure class="car-slide" id="shot-6" role="group" aria-roledescription="slide" aria-label="6 of 8">
-            <img src="shots/telegram-2.webp" width="2240" height="1400" alt="Telegram in tinyclient: folder tabs, pinned chats, groups and channels on the left, and a group conversation where you are mentioned." loading="lazy" decoding="async">
+          <figure class="car-slide" id="shot-6" role="group" aria-roledescription="slide" aria-label="6 of 9">
+            <img src="shots/telegram-3.webp" srcset="shots/telegram-3-1120.webp 1120w, shots/telegram-3.webp 2240w" sizes="(max-width: 1120px) calc(100vw - 32px), 1072px" width="2240" height="1400" alt="Telegram in tinyclient: folder tabs, pinned chats, groups and channels on the left, and a group conversation where you are mentioned." loading="lazy" decoding="async">
             <figcaption class="car-cap">Telegram folders, groups and channels</figcaption>
           </figure>
-          <figure class="car-slide" id="shot-7" role="group" aria-roledescription="slide" aria-label="7 of 8">
-            <img src="shots/signal-2.webp" width="2240" height="1400" alt="A Signal group in tinyclient with a quoted reply, a mention, an edited message and reactions." loading="lazy" decoding="async">
+          <figure class="car-slide" id="shot-7" role="group" aria-roledescription="slide" aria-label="7 of 9">
+            <img src="shots/signal-3.webp" srcset="shots/signal-3-1120.webp 1120w, shots/signal-3.webp 2240w" sizes="(max-width: 1120px) calc(100vw - 32px), 1072px" width="2240" height="1400" alt="A Signal group in tinyclient with a quoted reply, a mention, an edited message and reactions." loading="lazy" decoding="async">
             <figcaption class="car-cap">Signal groups, replies and reactions</figcaption>
           </figure>
-          <figure class="car-slide" id="shot-8" role="group" aria-roledescription="slide" aria-label="8 of 8">
-            <img src="shots/reactions-2.webp" width="2240" height="1400" alt="tinyclient's emoji picker open over a Discord channel, with search, this conversation's custom emoji and every standard emoji." loading="lazy" decoding="async">
+          <figure class="car-slide" id="shot-8" role="group" aria-roledescription="slide" aria-label="8 of 9">
+            <img src="shots/messages-3.webp" srcset="shots/messages-3-1120.webp 1120w, shots/messages-3.webp 2240w" sizes="(max-width: 1120px) calc(100vw - 32px), 1072px" width="2240" height="1400" alt="Android Messages in tinyclient: the phone's texts on the left, a group text and a pharmacy among them, and a conversation with Chloe Martin about picking her up from the airport." loading="lazy" decoding="async">
+            <figcaption class="car-cap">Android Messages, paired from your phone</figcaption>
+          </figure>
+          <figure class="car-slide" id="shot-9" role="group" aria-roledescription="slide" aria-label="9 of 9">
+            <img src="shots/reactions-3.webp" srcset="shots/reactions-3-1120.webp 1120w, shots/reactions-3.webp 2240w" sizes="(max-width: 1120px) calc(100vw - 32px), 1072px" width="2240" height="1400" alt="tinyclient's emoji picker open over a Discord channel, with search, this conversation's custom emoji and every standard emoji." loading="lazy" decoding="async">
             <figcaption class="car-cap">Any emoji, one click away</figcaption>
           </figure>
         </div>
       </div>
-      <p class="car-caption" aria-hidden="true">One inbox for every network</p>
+      <p class="car-caption" aria-live="polite" aria-atomic="true">One inbox for every network</p>
       <div class="car-bar">
         <button class="car-btn car-prev" type="button" aria-controls="hero-shots" aria-label="Previous screenshot" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 18-6-6 6-6"/></svg></button>
+        <span class="car-count" aria-hidden="true">1 / 9</span>
         <ol class="car-tabs" aria-label="Choose a screenshot">
           <li><a class="car-tab" href="#shot-1" aria-current="true"><span class="car-prog" aria-hidden="true"></span>One inbox</a></li>
           <li><a class="car-tab" href="#shot-2"><span class="car-prog" aria-hidden="true"></span>Link previews</a></li>
@@ -103,7 +110,8 @@
           <li><a class="car-tab" href="#shot-5"><span class="car-prog" aria-hidden="true"></span>Slack</a></li>
           <li><a class="car-tab" href="#shot-6"><span class="car-prog" aria-hidden="true"></span>Telegram</a></li>
           <li><a class="car-tab" href="#shot-7"><span class="car-prog" aria-hidden="true"></span>Signal</a></li>
-          <li><a class="car-tab" href="#shot-8"><span class="car-prog" aria-hidden="true"></span>Emoji</a></li>
+          <li><a class="car-tab" href="#shot-8"><span class="car-prog" aria-hidden="true"></span>Messages</a></li>
+          <li><a class="car-tab" href="#shot-9"><span class="car-prog" aria-hidden="true"></span>Emoji</a></li>
         </ol>
         <button class="car-btn car-next" type="button" aria-controls="hero-shots" aria-label="Next screenshot" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg></button>
         <button class="car-play" type="button" aria-label="Pause the slideshow" hidden><svg class="i-pause" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6v12"/><path d="M15 6v12"/></svg><svg class="i-play" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5.5v13l10.5-6.5z"/></svg></button>
@@ -114,36 +122,74 @@
 
 <section class="section center" id="networks" aria-labelledby="networks-title">
   <div class="wrap">
-    <h2 id="networks-title">Your chats, one window</h2>
-    <ul class="net-row">
-        <li><img src="assets/networks/slack.svg" alt="" width="44" height="44"><span>Slack</span></li>
-        <li><img src="assets/networks/discord.svg" alt="" width="44" height="44"><span>Discord</span></li>
-        <li><img src="assets/networks/telegram.svg" alt="" width="44" height="44"><span>Telegram</span></li>
-        <li><img src="assets/networks/microsoft-teams.svg" alt="" width="44" height="44"><span>Teams</span></li>
-        <li><img src="assets/networks/signal.svg" alt="" width="44" height="44"><span>Signal</span></li>
-        <li><img src="assets/networks/messages.svg" alt="" width="44" height="44"><span>Messages</span></li>
+    <p class="kicker reveal">Six networks</p>
+    <h2 id="networks-title" class="reveal">Your chats, one window</h2>
+    <ul class="net-row reveal">
+        <li class="spot n-slack"><a href="docs/networks.html#slack"><img src="assets/networks/slack.svg" alt="" width="44" height="44"><span>Slack</span></a></li>
+        <li class="spot n-discord"><a href="docs/networks.html#discord"><img src="assets/networks/discord.svg" alt="" width="44" height="44"><span>Discord</span></a></li>
+        <li class="spot n-telegram"><a href="docs/networks.html#telegram"><img src="assets/networks/telegram.svg" alt="" width="44" height="44"><span>Telegram</span></a></li>
+        <li class="spot n-teams"><a href="docs/networks.html#teams"><img src="assets/networks/microsoft-teams.svg" alt="" width="44" height="44"><span>Teams</span></a></li>
+        <li class="spot n-signal"><a href="docs/networks.html#signal"><img src="assets/networks/signal.svg" alt="" width="44" height="44"><span>Signal</span></a></li>
+        <li class="spot n-messages"><a href="docs/networks.html#messages"><img src="assets/networks/messages.svg" alt="" width="44" height="44"><span>Messages</span></a></li>
       <li class="net-more"><a href="docs/contributing.html"><span class="plus" aria-hidden="true">+</span><span>More soon</span></a></li>
+    </ul>
+  </div>
+</section>
+
+<section class="section" id="features" aria-labelledby="features-title">
+  <div class="wrap">
+    <p class="kicker center reveal">The app</p>
+    <h2 id="features-title" class="center reveal">The parts you use every day</h2>
+    <p class="lede center reveal">Reading, replies, reactions and calls work the way each network does them. Anything not built yet opens in the official app, on that item.</p>
+    <ul class="feat reveal">
+      <li class="feat-card spot">
+        <div class="crop side"><img src="shots/tile-inbox-1.webp" alt="" width="630" height="576" loading="lazy" decoding="async"></div>
+        <div class="feat-text"><h3>One inbox</h3><p>Unread from every network in one list, newest&nbsp;first.</p></div>
+      </li>
+      <li class="feat-card spot">
+        <div class="crop side top"><img src="shots/tile-sidebar-1.webp" alt="" width="630" height="694" loading="lazy" decoding="async"></div>
+        <div class="feat-text"><h3>Each network&rsquo;s own sidebar</h3><p>Servers, workspaces, folders and teams, the way each network lays them&nbsp;out.</p></div>
+      </li>
+      <li class="feat-card spot">
+        <div class="crop side"><img src="shots/tile-call-1.webp" alt="" width="630" height="627" loading="lazy" decoding="async"></div>
+        <div class="feat-text"><h3>Voice calls</h3><p>Discord voice in DMs and channels, with Discord&rsquo;s end-to-end&nbsp;encryption.</p></div>
+      </li>
+      <li class="feat-card spot">
+        <div class="crop pane top"><img src="shots/tile-thread-1.webp" alt="" width="591" height="510" loading="lazy" decoding="async"></div>
+        <div class="feat-text"><h3>Threads beside the chat</h3><p>A thread opens in a pane, so the conversation stays where you&nbsp;left&nbsp;it.</p></div>
+      </li>
+      <li class="feat-card spot">
+        <div class="crop pane bottom"><img src="shots/tile-emoji-1.webp" alt="" width="706" height="806" loading="lazy" decoding="async"></div>
+        <div class="feat-text"><h3>Every emoji</h3><p>Search them all. In a server, its own emoji come&nbsp;first.</p></div>
+      </li>
+      <li class="feat-card spot">
+        <div class="crop side"><img src="shots/tile-sms-1.webp" alt="" width="630" height="594" loading="lazy" decoding="async"></div>
+        <div class="feat-text"><h3>Your phone&rsquo;s texts</h3><p>Android Messages, paired the way messages.google.com is. SMS and RCS go through your&nbsp;phone.</p></div>
+      </li>
     </ul>
   </div>
 </section>
 
 <section class="section" id="principles" aria-labelledby="principles-title">
   <div class="wrap">
-    <h2 id="principles-title" class="center">Small on purpose</h2>
-    <ul class="points">
-      <li><strong>Tiny</strong><span>Native. Not a browser in a&nbsp;box.</span></li>
-      <li><strong>Private</strong><span>No servers, no&nbsp;accounts, no&nbsp;telemetry.</span></li>
-      <li><strong>Secure</strong><span>Sessions live in your OS&nbsp;keychain.</span></li>
-      <li><strong>Open</strong><span>MIT licensed. Built in&nbsp;public.</span></li>
+    <p class="kicker center reveal">Principles</p>
+    <h2 id="principles-title" class="center reveal">Small on purpose</h2>
+    <ul class="points reveal">
+      <li class="spot"><span class="pt-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 14h6v6M20 10h-6V4M14 10l7-7M3 21l7-7"/></svg></span><strong>Tiny</strong><span>Native. Not a browser in a&nbsp;box.</span></li>
+      <li class="spot"><span class="pt-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M9.9 4.2A10.4 10.4 0 0 1 12 4c7 0 10 8 10 8a17.6 17.6 0 0 1-3.2 4.2M6.6 6.6A17.4 17.4 0 0 0 2 12s3 8 10 8a9.7 9.7 0 0 0 5.4-1.6M2 2l20 20M9.9 9.9a3 3 0 0 0 4.2 4.2"/></svg></span><strong>Private</strong><span>No servers, no&nbsp;accounts, no&nbsp;telemetry.</span></li>
+      <li class="spot"><span class="pt-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg></span><strong>Secure</strong><span>Sessions live in your OS&nbsp;keychain.</span></li>
+      <li class="spot"><span class="pt-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m16 18 6-6-6-6M8 6l-6 6 6 6"/></svg></span><strong>Open</strong><span>MIT licensed. Built in&nbsp;public.</span></li>
     </ul>
   </div>
 </section>
 
 <section class="section" id="memory" aria-labelledby="memory-title">
   <div class="wrap">
-    <h2 id="memory-title" class="center">Five apps, or one.</h2>
-    <p class="lede center"><span class="nowrap-s">While they are running, the official apps use 1.4&nbsp;GB of RAM.</span> <span class="nowrap-s">tinyclient uses 57&nbsp;MB.</span></p>
-    <div class="vs mem" role="img" aria-label="RAM in use while signed in: Teams 374 MB, Slack 370 MB, Discord 370 MB, Signal 225 MB, Telegram 90 MB, tinyclient 0.2.0 57 MB.">
+    <p class="kicker center reveal">Size</p>
+    <h2 id="memory-title" class="center reveal">Five apps, or one.</h2>
+    <p class="lede center reveal"><span class="nowrap-s">The official apps use 1.4&nbsp;GB of RAM and 3.1&nbsp;GB of disk.</span> <span class="nowrap-s">tinyclient uses 57&nbsp;MB and 55&nbsp;MB.</span></p>
+    <h3 class="vs-head reveal">In memory</h3>
+    <div class="vs mem reveal" role="img" aria-label="RAM in use while signed in: Teams 374 MB, Slack 370 MB, Discord 370 MB, Signal 225 MB, Telegram 90 MB, tinyclient 0.2.0 57 MB.">
       <div class="vs-row">
         <span class="vs-name">Teams</span>
         <div class="vs-bar"><span class="vseg teams"></span></div>
@@ -171,19 +217,13 @@
       </div>
       <div class="vs-row us">
         <span class="vs-name">tinyclient</span>
-        <div class="vs-bar"><span class="vseg mine"></span></div>
+        <div class="vs-bar"><span class="vseg mine"></span><span class="vs-win">25× less than all five</span></div>
         <span class="vs-val">57 MB</span>
       </div>
     </div>
     <p class="fine-note center">RAM in use while signed in, measured together on an M3 Pro, 14&nbsp;October 2026. tinyclient is 0.2.0. Activity Monitor&rsquo;s Memory column, which also counts compressed memory, is 3.9&nbsp;GB for the five and 91&nbsp;MB for tinyclient. <a href="docs/performance.html#memory">How we measure →</a></p>
-  </div>
-</section>
-
-<section class="section" id="size" aria-labelledby="size-title">
-  <div class="wrap">
-    <h2 id="size-title" class="center">On disk</h2>
-    <p class="lede center"><span class="nowrap-s">The official apps add up to 3.1&nbsp;GB.</span> <span class="nowrap-s">tinyclient is 55&nbsp;MB.</span></p>
-    <div class="vs" role="img" aria-label="The five official apps take 3.1 GB on disk together; tinyclient takes 55 MB.">
+    <h3 class="vs-head reveal">On disk</h3>
+    <div class="vs reveal" role="img" aria-label="The five official apps take 3.1 GB on disk together; tinyclient takes 55 MB.">
       <div class="vs-row">
         <span class="vs-name">Official apps</span>
         <div class="vs-bar stack">
@@ -197,18 +237,41 @@
       </div>
       <div class="vs-row us">
         <span class="vs-name">tinyclient</span>
-        <div class="vs-bar"><span class="vseg mine"></span></div>
+        <div class="vs-bar"><span class="vseg mine"></span><span class="vs-win">56× smaller</span></div>
         <span class="vs-val">55 MB</span>
       </div>
     </div>
-    <p class="fine-note center">App size on disk, macOS, from each vendor&rsquo;s installer, October 2026. <a href="docs/performance.html">How we measure →</a></p>
+    <p class="fine-note center">App size on disk, macOS, from each vendor&rsquo;s installer, October 2026. Slack and Telegram ship one app for Apple silicon and Intel; tinyclient&rsquo;s figure is its Apple silicon build. <a href="docs/performance.html">How we measure →</a></p>
+  </div>
+</section>
+
+<section class="section" id="keyboard" aria-labelledby="keyboard-title">
+  <div class="wrap">
+    <div class="kb">
+      <div class="kb-copy reveal">
+        <p class="kicker">Keyboard</p>
+        <h2 id="keyboard-title">Built for the keyboard</h2>
+        <p class="lede">Jump to any conversation, walk through what&rsquo;s unread and run a call from the keyboard. On Linux and Windows, Command is&nbsp;Ctrl and Option is&nbsp;Alt.</p>
+        <p class="more"><a href="docs/using.html#shortcuts">Every shortcut →</a></p>
+      </div>
+      <ul class="kb-list reveal" aria-label="Some keyboard shortcuts, as on macOS">
+        <li><span>Quick Switcher</span><span class="keys"><kbd>⌘</kbd><kbd>K</kbd></span></li>
+        <li><span>Next unread</span><span class="keys"><kbd>⌥</kbd><kbd>⇧</kbd><kbd>↓</kbd></span></li>
+        <li><span>Inbox, People</span><span class="keys"><kbd>⌘</kbd><kbd>1</kbd><i>/</i><kbd>⌘</kbd><kbd>2</kbd></span></li>
+        <li><span>Back, Forward</span><span class="keys"><kbd>⌘</kbd><kbd>[</kbd><i>/</i><kbd>⌘</kbd><kbd>]</kbd></span></li>
+        <li><span>Mark as read</span><span class="keys"><kbd>⇧</kbd><kbd>Esc</kbd></span></li>
+        <li><span>Mute in a call</span><span class="keys"><kbd>⇧</kbd><kbd>⌘</kbd><kbd>M</kbd></span></li>
+        <li><span>All shortcuts</span><span class="keys"><kbd>⌘</kbd><kbd>/</kbd></span></li>
+      </ul>
+    </div>
   </div>
 </section>
 
 <section class="section" id="flow-section" aria-labelledby="flow-title">
   <div class="wrap">
-    <h2 id="flow-title" class="center">Your messages go to the network. Nowhere&nbsp;else.</h2>
-    <figure class="flow" id="flow">
+    <p class="kicker center reveal">Privacy</p>
+    <h2 id="flow-title" class="center reveal">Your messages go to the network. Nowhere&nbsp;else.</h2>
+    <figure class="flow reveal" id="flow">
       <svg class="fl-defs" width="0" height="0" aria-hidden="true" focusable="false"><defs><symbol id="fl-lock" viewBox="0 0 14 16"><path class="fl-lock-shackle" d="M3.5 7V4.8a3.5 3.5 0 0 1 7 0V7"/><rect class="fl-lock-body" x="1.5" y="7" width="11" height="8" rx="2"/></symbol></defs></svg>
 <svg class="fl fl-wide" viewBox="0 0 960 500" role="img" aria-labelledby="fl-title fl-desc">
 <title id="fl-title">Where your messages go</title>
@@ -322,22 +385,160 @@
       <figcaption class="flow-cap"><span class="fl-key"><i class="k-solid"></i>always running</span><span class="fl-key"><i class="k-dash"></i>only while needed</span><span class="fl-key"><svg viewBox="0 0 14 16" aria-hidden="true"><use href="#fl-lock"/></svg>encrypted to the network</span></figcaption>
     </figure>
     <ul class="trio">
-      <li><span class="ico i-server" aria-hidden="true"></span>No servers</li>
-      <li><span class="ico i-pulse" aria-hidden="true"></span>No telemetry</li>
-      <li><span class="ico i-key" aria-hidden="true"></span>Keys in your keychain</li>
+      <li><span class="tico" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/><path d="M2 2l20 20"/></svg></span>No servers</li>
+      <li><span class="tico" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M3 12h4l3-8 4 16 3-8h4"/><path d="M2 2l20 20"/></svg></span>No telemetry</li>
+      <li><span class="tico" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="8" cy="15" r="4"/><path d="M10.8 12.2 20 3M17 6l3 3M14 9l2 2"/></svg></span>Keys in your keychain</li>
     </ul>
     <p class="more center"><a href="docs/privacy.html">How we handle your data →</a></p>
   </div>
 </section>
 
+<section class="section" id="support" aria-labelledby="support-title">
+  <div class="wrap">
+    <p class="kicker center reveal">Network by network</p>
+    <h2 id="support-title" class="center reveal">What works where</h2>
+    <p class="lede center reveal">The goal is everything the official apps do. Here is where each network stands today.</p>
+    <div class="table-wrap support reveal" tabindex="0" role="region" aria-labelledby="support-title">
+      <table class="stack">
+        <thead><tr><th scope="col">Network</th><th scope="col">Sign in</th><th scope="col">Reactions</th><th scope="col">Edit, delete</th><th scope="col">Files</th><th scope="col">Voice</th><th scope="col">Video</th><th scope="col">Screen share</th></tr></thead>
+        <tbody>
+        <tr>
+          <th scope="row"><span class="th-net"><img src="assets/networks/slack.svg" alt="" width="20" height="20">Slack</span></th>
+          <td data-label="Sign in">Slack&rsquo;s web sign-in</td>
+          <td data-label="Reactions"><span class="tag yes">Yes</span></td>
+          <td data-label="Edit, delete"><span class="tag yes">Yes</span></td>
+          <td data-label="Files"><span class="tag yes">Yes</span></td>
+          <td data-label="Voice"><span class="tag warn">Not yet</span></td>
+          <td data-label="Video"><span class="tag warn">Not yet</span></td>
+          <td data-label="Screen share"><span class="tag warn">Not yet</span></td>
+        </tr>
+        <tr>
+          <th scope="row"><span class="th-net"><img src="assets/networks/discord.svg" alt="" width="20" height="20">Discord</span></th>
+          <td data-label="Sign in">Discord&rsquo;s web sign-in</td>
+          <td data-label="Reactions"><span class="tag yes">Yes</span></td>
+          <td data-label="Edit, delete"><span class="tag yes">Yes</span></td>
+          <td data-label="Files"><span class="tag yes">Yes</span></td>
+          <td data-label="Voice"><span class="tag yes">In tinyclient</span></td>
+          <td data-label="Video"><span class="tag warn">Not yet</span></td>
+          <td data-label="Screen share"><span class="tag warn">Not yet</span></td>
+        </tr>
+        <tr>
+          <th scope="row"><span class="th-net"><img src="assets/networks/microsoft-teams.svg" alt="" width="20" height="20">Teams</span></th>
+          <td data-label="Sign in">Microsoft sign-in</td>
+          <td data-label="Reactions"><span class="tag yes">Yes</span></td>
+          <td data-label="Edit, delete"><span class="tag yes">Yes</span></td>
+          <td data-label="Files"><span class="tag yes">Through OneDrive</span></td>
+          <td data-label="Voice"><span class="tag warn">Not yet</span></td>
+          <td data-label="Video"><span class="tag warn">Not yet</span></td>
+          <td data-label="Screen share"><span class="tag warn">Not yet</span></td>
+        </tr>
+        <tr>
+          <th scope="row"><span class="th-net"><img src="assets/networks/telegram.svg" alt="" width="20" height="20">Telegram</span></th>
+          <td data-label="Sign in">QR code or phone number</td>
+          <td data-label="Reactions"><span class="tag yes">Yes</span></td>
+          <td data-label="Edit, delete"><span class="tag yes">Yes</span></td>
+          <td data-label="Files"><span class="tag yes">Yes</span></td>
+          <td data-label="Voice"><span class="tag warn">Not yet</span></td>
+          <td data-label="Video"><span class="tag warn">Not yet</span></td>
+          <td data-label="Screen share"><span class="tag warn">Not yet</span></td>
+        </tr>
+        <tr>
+          <th scope="row"><span class="th-net"><img src="assets/networks/signal.svg" alt="" width="20" height="20">Signal</span></th>
+          <td data-label="Sign in">Linked as a device</td>
+          <td data-label="Reactions"><span class="tag yes">Yes</span></td>
+          <td data-label="Edit, delete"><span class="tag yes">Your own</span></td>
+          <td data-label="Files"><span class="tag warn">Named, not shown</span></td>
+          <td data-label="Voice"><span class="tag warn">Not yet</span></td>
+          <td data-label="Video"><span class="tag warn">Not yet</span></td>
+          <td data-label="Screen share"><span class="tag warn">Not yet</span></td>
+        </tr>
+        <tr>
+          <th scope="row"><span class="th-net"><img src="assets/networks/messages.svg" alt="" width="20" height="20">Messages</span></th>
+          <td data-label="Sign in">Paired with your phone</td>
+          <td data-label="Reactions"><span class="tag yes">Yes</span></td>
+          <td data-label="Edit, delete"><span class="tag warn">Not yet</span></td>
+          <td data-label="Files"><span class="tag yes">Photos shown</span></td>
+          <td data-label="Voice"><span class="tag">On the phone</span></td>
+          <td data-label="Video"><span class="tag">On the phone</span></td>
+          <td data-label="Screen share"><span class="tag none">Not offered</span></td>
+        </tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="fine-note center">Not built yet: message search in the window, video and screen share, voice messages, Signal photos, files and calls, and Teams personal accounts.</p>
+    <p class="more center"><a href="docs/networks.html">The details, and each network&rsquo;s terms →</a></p>
+  </div>
+</section>
+
+<section class="section" id="faq" aria-labelledby="faq-title">
+  <div class="wrap">
+    <p class="kicker center reveal">Before you install</p>
+    <h2 id="faq-title" class="center reveal">Good questions</h2>
+    <div class="faq reveal">
+      <details>
+        <summary>Will my computer warn me the first time?</summary>
+        <p>Yes. The macOS app is signed ad hoc, not notarized by Apple: open System Settings &rsaquo; Privacy &amp; Security and choose Open Anyway. The Windows installer is Authenticode-signed. SmartScreen names the publisher and may still stop a new certificate: choose More info &rsaquo; Run anyway. <a href="docs/#macos">Installing →</a></p>
+      </details>
+      <details>
+        <summary>Do the networks allow it?</summary>
+        <p>Telegram welcomes third-party clients. Discord&rsquo;s terms disallow them on user accounts; its enforcement goes after automation, self-bots and spam, and tinyclient automates nothing. Workspaces on Slack and Teams may have their own policy, and an organization can turn third-party sign-ins off on Teams. <a href="docs/networks.html">Networks &amp; terms →</a></p>
+      </details>
+      <details>
+        <summary>Does it connect to anything besides the networks?</summary>
+        <p>One update check. About once an hour while the window is open, it asks GitHub whether a newer release exists, and sends only <code>tinyclient/&lt;version&gt;</code>. No analytics, no crash upload. <a href="docs/privacy.html">Privacy &amp; security →</a></p>
+      </details>
+      <details>
+        <summary>Is what it stores encrypted?</summary>
+        <p>Sessions live in your system&rsquo;s keychain, and Signal&rsquo;s keys are sealed with a key held only there. The message and media cache is not encrypted by tinyclient, so keep your disk encryption on: FileVault, BitLocker or LUKS.</p>
+      </details>
+      <details>
+        <summary>How does it update?</summary>
+        <p>While the window is open, it asks GitHub about once an hour whether a newer release exists, and tells you when one does. With automatic install on, it downloads the release, checks it against that release&rsquo;s checksums, and replaces itself when you quit. The Linux packages are not in a repository, so install a newer download the same way. <a href="docs/using.html#updates">Updates →</a></p>
+      </details>
+      <details>
+        <summary>I want another network added.</summary>
+        <p>Ask for it on <a href="https://discord.gg/kJHK7BNvJP">Discord</a> or in a <a href="https://github.com/itz4blitz/tinyclient/issues">GitHub issue</a>, so others can add their voice and we can see what people want most. Every network is one adapter in chatd, and adding one is a good way in: say on Discord that you&rsquo;d like to build it, and it&rsquo;s yours until it ships. <a href="docs/contributing.html">Contributing →</a></p>
+      </details>
+    </div>
+  </div>
+</section>
+
+<section class="section" id="download" aria-labelledby="download-title">
+  <div class="wrap">
+    <p class="kicker center reveal">Download</p>
+    <h2 id="download-title" class="center reveal">Free, with no account to&nbsp;make</h2>
+    <ul class="dl reveal">
+      <li class="dl-card spot">
+        <h3>macOS</h3>
+        <p>Apple silicon, macOS 13 or later. A disk&nbsp;image.</p>
+        <a class="btn btn-primary" href="/download/macos"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/><path d="M12 15V3"/></svg>Download for macOS</a>
+      </li>
+      <li class="dl-card spot">
+        <h3>Linux</h3>
+        <p>x86_64 and arm64, as .deb, .rpm, AppImage or&nbsp;.tar.gz.</p>
+        <a class="btn btn-secondary" href="/download/linux"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/><path d="M12 15V3"/></svg>Download for Linux</a>
+      </li>
+      <li class="dl-card spot">
+        <h3>Windows</h3>
+        <p>x86_64. An installer that needs no&nbsp;administrator.</p>
+        <a class="btn btn-secondary" href="/download/windows"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/><path d="M12 15V3"/></svg>Download for Windows</a>
+      </li>
+    </ul>
+    <p class="fine-note center">Every release is built by GitHub Actions from the public source. <a href="/download/checksums">Checksums</a> · <a href="https://github.com/itz4blitz/tinyclient/releases">All releases</a> · <a href="docs/build.html">Build it yourself</a></p>
+  </div>
+</section>
+
 <section class="section center join" id="community" aria-labelledby="join-title">
   <div class="wrap">
+   <div class="join-card reveal">
+    <img class="join-icon" src="icon.svg" alt="" width="64" height="64">
     <h2 id="join-title">Early, and built in the open.</h2>
-    <p class="lede center">We&rsquo;re building a community around one goal: the best chat client there is, with every feature of the official apps.</p>
+    <p class="lede center reveal">We&rsquo;re building a community around one goal: the best chat client there is, with every feature of the official apps.</p>
     <div class="actions center">
       <a class="btn btn-primary" href="https://discord.gg/kJHK7BNvJP"><svg class="fill" viewBox="0 0 24 24" aria-hidden="true"><path d="M20.317 4.37a19.791 19.791 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028 14.09 14.09 0 0 0 1.226-1.994.076.076 0 0 0-.041-.106 13.107 13.107 0 0 1-1.872-.892.077.077 0 0 1-.008-.128 10.2 10.2 0 0 0 .372-.292.074.074 0 0 1 .077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 0 1 .078.01c.12.098.246.198.373.292a.077.077 0 0 1-.006.127 12.299 12.299 0 0 1-1.873.892.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.839 19.839 0 0 0 6.002-3.03.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.03zM8.02 15.33c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42.019 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42.019 1.333-.946 2.418-2.157 2.418z"/></svg>Join Discord</a>
       <a class="btn btn-secondary" href="https://github.com/itz4blitz/tinyclient"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>Star and contribute</a>
     </div>
+   </div>
   </div>
 </section>
 
@@ -375,10 +576,6 @@
           <li><a href="docs/contributing.html">Contributing</a></li>
         </ul>
       </nav>
-    </div>
-    <div class="fine">
-      <p>This site sets no cookies, runs no analytics and loads nothing from anywhere else.</p>
-      <p>tinyclient is not affiliated with Slack, Discord, Telegram, Microsoft, Signal or Google. Their names and logos are trademarks of their owners; the network icons are from <a href="https://github.com/homarr-labs/dashboard-icons">Dashboard Icons</a> (Apache-2.0).</p>
     </div>
   </div>
 </footer>
