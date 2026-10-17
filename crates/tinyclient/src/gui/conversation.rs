@@ -395,7 +395,8 @@ impl Pane {
         root: Option<(Rc<Message>, u32)>,
         cx: &mut Context<Self>,
     ) {
-        let around = self.landing.take().or(self.around.take());
+        let landing = self.landing.take();
+        let around = self.around.take();
         // Where the one being left was, for coming back to it.
         if let Some((left, place)) = self.key().cloned().zip(self.place()) {
             self.places.put(left, place);
@@ -450,13 +451,18 @@ impl Pane {
         self.pending_at.clear();
         self.relay(true, ListOffset::default());
         self.ask_reactions(cx);
-        // M2: a conversation opens at its newest message rather than the first unread.
+        // M2: a conversation opens at its newest message rather than the first unread. The
+        // search hit is the user's own ask: it wins over where this conversation was left, and
+        // lands as a jump, flashed, with the pill.
         let around = around.filter(|_| !super::app::prefs::choices().newest);
-        match back {
-            Some(place) => self.load(Page::Around { id: place.id.clone() }, Purpose::Restore(place.id, place.offset), cx),
-            None => match around {
-                Some(id) => self.load(Page::Around { id }, Purpose::Open, cx),
-                None => self.load(Page::Newest, Purpose::Open, cx),
+        match landing {
+            Some(id) => self.load(Page::Around { id: id.clone() }, Purpose::Jump(id), cx),
+            None => match back {
+                Some(place) => self.load(Page::Around { id: place.id.clone() }, Purpose::Restore(place.id, place.offset), cx),
+                None => match around {
+                    Some(id) => self.load(Page::Around { id }, Purpose::Open, cx),
+                    None => self.load(Page::Newest, Purpose::Open, cx),
+                },
             },
         }
         cx.notify();
@@ -537,6 +543,12 @@ impl Pane {
             other => {
                 if let Purpose::Restore(..) = purpose {
                     // The place is gone from the history: open as if for the first time.
+                    self.load(Page::Newest, Purpose::Open, cx);
+                    return;
+                }
+                if matches!(purpose, Purpose::Jump(_)) && self.window.messages.is_empty() {
+                    // The message a search hit asked for is gone from the history, and nothing
+                    // is held beside it: open as if for the first time.
                     self.load(Page::Newest, Purpose::Open, cx);
                     return;
                 }

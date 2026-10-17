@@ -384,15 +384,14 @@ impl Shell {
     /// jumps to it.
     pub(in crate::gui) fn open_search_hit(&mut self, hit: &MessageHit, cx: &mut Context<Self>) {
         let key = hit.conversation.clone();
+        // The pane may never have been built: nothing may have opened yet. It is made here, so
+        // the landing reaches it before the conversation is told to open.
+        let pane = self.pane(cx);
         if self.open.as_ref() == Some(&key) {
-            if let Some(pane) = self.conversation_state.pane.get() {
-                pane.update(cx, |pane, cx| pane.jump_to(&hit.message_id, cx));
-            }
+            pane.update(cx, |pane, cx| pane.jump_to(&hit.message_id, cx));
             return;
         }
-        if let Some(pane) = self.conversation_state.pane.get() {
-            pane.update(cx, |pane, _| pane.land_next(hit.message_id.clone()));
-        }
+        pane.update(cx, |pane, _| pane.land_next(hit.message_id.clone()));
         let title = if hit.title.is_empty() { hit.conversation.id.clone() } else { hit.title.clone() };
         self.select(key, &title, cx);
     }
