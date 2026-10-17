@@ -24,6 +24,7 @@ mod tokens;
 mod video;
 mod viewer;
 mod when;
+mod wiki;
 
 pub(in crate::gui) use player::glyph as player_glyph;
 
@@ -209,6 +210,7 @@ pub struct Pane {
     watching_window: Option<Subscription>,
 
     images: Images,
+    wiki: wiki::Cache,
     /// The conversation changed; its pictures go at the next draw, which has the window.
     images_stale: bool,
     /// Files the rows being drawn need, and how many pixels their longest side must have.
@@ -307,6 +309,7 @@ impl Pane {
             active: false,
             watching_window: None,
             images: Images::default(),
+            wiki: wiki::Cache::default(),
             images_stale: false,
             want: Vec::new(),
             asked: HashMap::new(),

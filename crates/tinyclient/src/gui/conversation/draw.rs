@@ -1269,6 +1269,7 @@ impl Pane {
     }
 
     fn card(&mut self, index: usize, preview: &Preview, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let preview = self.wikipedia_preview(preview, cx);
         let scale = window.scale_factor();
         let image = preview.image.as_ref();
         // Only the first card may be large, and only for a picture wide enough to deserve it.
