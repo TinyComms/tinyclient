@@ -124,7 +124,7 @@ The four programs stay in one directory. Each finds the others beside itself. St
 
 ### Updates
 
-The window checks GitHub for a newer release about once an hour. It can download that release, check it, and replace this copy when you quit. The check sends only the version in the user agent.
+The window checks GitHub for a newer release about once an hour. It can download that release, check it, and replace this copy when you quit. The check sends only the version in the user agent. It never replaces a copy in the Nix store: Nix updates that one.
 
 ### Optional systemd user service on Linux
 
