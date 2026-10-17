@@ -50,6 +50,13 @@ fn platform_data_root() -> PathBuf {
 }
 
 pub fn run(site: Site, at: Option<(f64, f64)>, network: &str) {
+    // On Wayland, WebKitGTK turns on NVIDIA's explicit sync without the sync point it promises, and
+    // the compositor drops the window as it opens: "Error 71 (Protocol error)", WebKit bug 280210.
+    // Only NVIDIA's driver reads this.
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("__NV_DISABLE_EXPLICIT_SYNC").is_none() {
+        std::env::set_var("__NV_DISABLE_EXPLICIT_SYNC", "1");
+    }
     let agent = crate::user_agent();
     // Tao initializes GTK on Linux before WebKit creates GTK objects.
     let event_loop = EventLoop::new();
