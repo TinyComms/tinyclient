@@ -84,8 +84,9 @@ Signal identifies your own conversation as **Note to Self**, including messages
 sent from your phone. Existing cached self-conversations are relabeled when the
 account reconnects; their messages are preserved.
 
-Not built yet: message search (the switcher finds conversations by title in the local cache),
-notifications and a dock badge, video and screen share, voice messages, Signal attachments and
+Not built yet: message search in the window (the switcher finds conversations by title, and
+`tinyclient --text --search` searches the cache; the networks are not asked yet), notifications
+and a dock badge, video and screen share, voice messages, Signal attachments and
 safety numbers, Messages reactions and shown photos, Teams personal accounts. Each is a place to help; see [Contributing](#contributing).
 
 **Platforms.** CI builds and tests all three on every push (`.github/workflows/ci.yml`).

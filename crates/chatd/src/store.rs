@@ -8,9 +8,9 @@
 
 use protocol::{
     clip, AccountKey, CallSupport, Conversation, ConversationKind, Folder, Group, InboxCounts,
-    InboxFilter, Key, Mark, MediaFile, MediaKind, Message, Network, Page, Person, Presence,
-    Reaction, Relation, SendState, SharedItem, SharedKind, Shelf, Space, Special, DRAFT_LIMIT,
-    FOLDERS_LIMIT, FOLDERS_PER_ROW, FOLDER_MEMBERS,
+    InboxFilter, Key, Mark, MediaFile, MediaKind, Message, MessageHit, Network, Page, Person,
+    Presence, Reaction, Relation, SendState, SharedItem, SharedKind, Shelf, Space, Special,
+    DRAFT_LIMIT, FOLDERS_LIMIT, FOLDERS_PER_ROW, FOLDER_MEMBERS,
 };
 use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row, Transaction};
@@ -501,6 +501,28 @@ fn like_prefix(query: &str) -> String {
     }
     pattern.push('%');
     pattern
+}
+
+/// The text on one line, cut to a window that starts a little before the first match of
+/// `query`, at most 200 characters. Nothing marks the match here; the shell draws that.
+fn snippet(text: &str, query: &str) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let needle = query.to_lowercase();
+    // A lowercased byte index can sit off a boundary or past the end by a character or two
+    // (some letters lowercase to more than one); walking back to one is close enough.
+    let mut from = flat.to_lowercase().find(&needle).map_or(0, |at| at.saturating_sub(60)).min(flat.len());
+    while from > 0 && !flat.is_char_boundary(from) {
+        from -= 1;
+    }
+    let cut: String = flat[from..].chars().take(200).collect();
+    let began = from > 0;
+    let ended = flat[from..].chars().count() > 200;
+    match (began, ended) {
+        (true, true) => format!("...{cut}..."),
+        (true, false) => format!("...{cut}"),
+        (false, true) => format!("{cut}..."),
+        (false, false) => cut,
+    }
 }
 
 /// The seven `media` columns of a left join, starting at `at`.
@@ -1468,6 +1490,57 @@ impl Store {
                  ORDER BY c.updated DESC, c.network, c.account, c.id LIMIT ?3"
             ))?
             .query_map(params![network.map(|network| word(&network)), pattern, limit], conversation_from)?
+            .collect()
+    }
+
+    /// Cached messages whose text contains `query`, newest first. Hidden conversations and
+    /// message requests are not in it, and nor are messages that never went: both are kept out
+    /// of everything that counts, and a search does not get around that. The cache alone: what
+    /// a network itself finds lands when it answers, which is the shell's own later ask.
+    pub fn search_messages(
+        &self,
+        conversation: Option<&Key>,
+        network: Option<Network>,
+        query: &str,
+        limit: u32,
+    ) -> rusqlite::Result<Vec<MessageHit>> {
+        let pattern = format!("%{}%", like_prefix(query));
+        self.db
+            .prepare(
+                "SELECT m.network, m.account, m.conversation, m.id, m.sent, m.text, m.body, c.title
+                   FROM message m
+                   JOIN conversation c ON c.network = m.network AND c.account = m.account
+                      AND c.id = m.conversation
+                  WHERE m.pending = 0 AND m.text LIKE ?5 ESCAPE '\\'
+                    AND (?1 IS NULL OR m.network = ?1)
+                    AND (?2 IS NULL OR (m.network = ?2 AND m.account = ?3 AND m.conversation = ?4))
+                    AND NOT c.hidden AND c.special != 'request'
+                  ORDER BY m.sent DESC, length(m.id) DESC, m.id DESC LIMIT ?6",
+            )?
+            .query_map(
+                params![
+                    network.map(|network| word(&network)),
+                    conversation.map(|key| word(&key.network)),
+                    conversation.map(|key| key.account.as_str()),
+                    conversation.map(|key| key.id.as_str()),
+                    pattern,
+                    limit,
+                ],
+                |row| {
+                    let text: String = row.get(5)?;
+                    let body: String = row.get(6)?;
+                    let message: Message = serde_json::from_str(&body).map_err(broken)?;
+                    Ok(MessageHit {
+                        conversation: key_at(row)?,
+                        message_id: row.get(3)?,
+                        sent: row.get(4)?,
+                        sender: message.sender.name,
+                        snippet: snippet(&text, query),
+                        title: row.get(7)?,
+                        outgoing: message.outgoing,
+                    })
+                },
+            )?
             .collect()
     }
 
@@ -2475,6 +2548,62 @@ mod tests {
 
     fn ids(page: &MessagePage) -> Vec<&str> {
         page.messages.iter().map(|message| message.id.as_str()).collect()
+    }
+
+    #[test]
+    fn a_message_search_finds_the_words_said_newest_first_and_skips_what_never_went_or_went_hidden() {
+        let (mut store, key) = store();
+        let account = key.account();
+        let hidden = Key::new(&account, "secret");
+        store
+            .upsert_conversation(&account, &ConversationRow {
+                filing: Some(Filing { hidden: true, ..Filing::default() }),
+                ..ConversationRow::new("secret", ConversationKind::Direct, "Hidden")
+            })
+            .unwrap();
+        store.ingest(&key, &said("1", "hello world", 10), false).unwrap();
+        store.ingest(&key, &said("2", "WORLD peace", 20), true).unwrap();
+        let never = Message { state: SendState::Pending, ..said("3", "world in waiting", 30) };
+        store.ingest(&key, &never, false).unwrap();
+        store.ingest(&hidden, &said("4", "world of secrets", 40), true).unwrap();
+        let request = Key::new(&account, "stranger");
+        store
+            .upsert_conversation(&account, &ConversationRow {
+                special: Special::Request,
+                ..ConversationRow::new("stranger", ConversationKind::Direct, "Stranger")
+            })
+            .unwrap();
+        store.ingest(&request, &said("5", "world of tickets", 50), true).unwrap();
+
+        let hits = store.search_messages(None, None, "world", 10).unwrap();
+        assert_eq!(hits.iter().map(|hit| hit.message_id.as_str()).collect::<Vec<_>>(), ["2", "1"]);
+        assert_eq!((hits[0].sender.as_str(), hits[0].snippet.as_str()), ("mara", "WORLD peace"));
+        assert!(!hits[0].outgoing && hits[0].title == "#general");
+        assert_eq!(hits[0].conversation, key);
+
+        // Named conversation and network narrow; a hidden conversation answers nothing at all.
+        assert_eq!(store.search_messages(Some(&key), None, "world", 10).unwrap().len(), 2);
+        assert!(store.search_messages(Some(&hidden), None, "world", 10).unwrap().is_empty());
+        assert_eq!(store.search_messages(None, Some(Network::Slack), "world", 10).unwrap().len(), 0);
+        assert_eq!(store.search_messages(None, Some(Network::Discord), "world", 10).unwrap().len(), 2);
+
+        // Case goes for nothing, a longer cut carries the marker, and an empty query finds none.
+        let cut = store.search_messages(None, None, "peace", 1).unwrap();
+        assert_eq!(cut.len(), 1);
+        assert!(store.search_messages(None, None, "  ", 10).unwrap().is_empty());
+
+        // What the user typed means itself: a percent is not a wildcard.
+        store.ingest(&key, &said("5", "we matched 50% there", 50), false).unwrap();
+        assert_eq!(store.search_messages(None, None, "50%", 10).unwrap().len(), 1);
+        assert_eq!(store.search_messages(None, None, "0%_t", 10).unwrap().len(), 0);
+
+        // A match far into a long message is still the hit's window, marked on both ends.
+        let long = format!("{} the needle turns up here {}", "filler ".repeat(60), "and the text goes on".repeat(20));
+        store.ingest(&key, &said("6", &long, 60), false).unwrap();
+        let far = store.search_messages(None, None, "needle", 1).unwrap();
+        assert_eq!(far.len(), 1);
+        assert!(far[0].snippet.starts_with("...") && far[0].snippet.ends_with("..."), "{}", far[0].snippet);
+        assert!(far[0].snippet.contains("needle turns up"), "{}", far[0].snippet);
     }
 
     #[test]

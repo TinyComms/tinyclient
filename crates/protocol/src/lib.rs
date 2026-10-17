@@ -899,6 +899,26 @@ pub struct Watching {
     pub rows: Vec<Key>,
 }
 
+/// One hit of a message search: where the message is, and enough of it to choose by.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageHit {
+    pub conversation: Key,
+    /// The message's id, to land on it with `Page::Around`.
+    pub message_id: String,
+    /// Unix seconds.
+    pub sent: i64,
+    /// Who sent it, as the message's own row says.
+    pub sender: String,
+    /// The text around the match, on one line, at most 200 characters.
+    pub snippet: String,
+    /// The conversation's title, so a result row says where it is without a second request.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub title: String,
+    /// Mine, so the row can say "You".
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub outgoing: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
@@ -956,6 +976,18 @@ pub enum Request {
     /// Conversations whose title contains `query`, across every Space, most recent first. From
     /// the cache alone: a channel of a Space never opened is not in it.
     Find {
+        network: Option<Network>,
+        query: String,
+        limit: u32,
+    },
+    /// Cached messages whose text contains `query`, newest first. `conversation` narrows to one
+    /// conversation, `network` to one network. Hidden conversations and message requests stay
+    /// out of it, as they stay out of everything that counts. From the cache alone: what a
+    /// network itself finds lands as it answers, and is a later step.
+    SearchMessages {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conversation: Option<Key>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         network: Option<Network>,
         query: String,
         limit: u32,
@@ -1476,6 +1508,10 @@ pub enum Response {
         /// The cache holds messages newer than the last one here.
         newer: bool,
     },
+    /// Answers `SearchMessages`: the newest hits first, at most the limit asked for.
+    MessageHits {
+        hits: Vec<MessageHit>,
+    },
     Sent {
         message: Message,
     },
@@ -1685,6 +1721,38 @@ mod tests {
         let json = serde_json::to_string(&quiet).unwrap();
         assert_eq!(json, r#"{"ping":false}"#);
         assert_eq!(serde_json::from_str::<Outgoing>(&json).unwrap(), quiet);
+    }
+
+    #[test]
+    fn a_message_search_and_its_hits_read_off_the_wire() {
+        let ask: Request = serde_json::from_str(r#"{"op":"search_messages","query":"lichen","limit":20}"#).unwrap();
+        let Request::SearchMessages { conversation, network, query, limit } = &ask else {
+            panic!("not a search")
+        };
+        assert!(conversation.is_none() && network.is_none() && query == "lichen" && *limit == 20);
+        let with_filters = Request::SearchMessages {
+            conversation: Some(Key { network: Network::Slack, account: "T1".into(), id: "C1".into() }),
+            network: Some(Network::Slack),
+            query: "lichen".into(),
+            limit: 20,
+        };
+        assert_eq!(
+            serde_json::to_string(&with_filters).unwrap(),
+            r#"{"op":"search_messages","conversation":{"network":"slack","account":"T1","id":"C1"},"network":"slack","query":"lichen","limit":20}"#
+        );
+        let hit = MessageHit {
+            conversation: Key { network: Network::Discord, account: "1".into(), id: "C2".into() },
+            message_id: "9".into(),
+            sent: 20,
+            sender: "mara".into(),
+            snippet: "hello world".into(),
+            title: String::new(),
+            outgoing: false,
+        };
+        assert_eq!(
+            serde_json::to_string(&Response::MessageHits { hits: vec![hit] }).unwrap(),
+            r#"{"op":"message_hits","hits":[{"conversation":{"network":"discord","account":"1","id":"C2"},"message_id":"9","sent":20,"sender":"mara","snippet":"hello world"}]}"#
+        );
     }
 
     #[test]

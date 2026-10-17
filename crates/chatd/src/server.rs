@@ -1413,6 +1413,17 @@ impl Chat {
                     Err(err) => internal(err),
                 }
             }
+            Request::SearchMessages { conversation, network, query, limit } => {
+                let query = query.trim();
+                let found = match query.is_empty() {
+                    true => Ok(Vec::new()),
+                    false => self.hub.store().search_messages(conversation.as_ref(), network, query, limit.min(PAGE_LIMIT)),
+                };
+                match found {
+                    Ok(hits) => Response::MessageHits { hits },
+                    Err(err) => internal(err),
+                }
+            }
             Request::SetDraft { conversation, text } => match self.hub.store().set_draft(&conversation, &text) {
                 Ok(true) => Response::Ok,
                 Ok(false) => error(ErrorCode::NotFound, "no such conversation"),
