@@ -565,7 +565,7 @@ fn forbidden(real: &Path) -> bool {
     if real.starts_with(&own) {
         return true;
     }
-    if ["/dev", "/proc", "/sys", "/etc", "/private/etc", "/var/root", "/private/var/root"].iter().any(|dir| real.starts_with(dir)) {
+    if ["/dev", "/proc", "/sys", "/etc", "/private/etc", "/var/root", "/private/var/root", "/nix/store"].iter().any(|dir| real.starts_with(dir)) {
         return true;
     }
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from).filter(|home| home.is_absolute()) else {
