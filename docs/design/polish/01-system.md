@@ -61,6 +61,11 @@ toolbar hides. Destructive items sit last after a separator, `danger` text, `dan
 the only item (`menu-net` gains "Open in Discord" and "Account settings…" above "Sign out"). **Popover**: S§3, 200–360
 wide (pickers declare their own size), 6 from the anchor, no arrow.
 
+**Message action bar.** Hover ownership follows pointer geometry across the
+message and its raised action bar. The bar's occlusion of the pane does not
+count as leaving it. Moving onto a button or pressing it keeps the same message;
+leaving the pane clears hover. Pointer tracking does not consume button events.
+
 **Buttons.** S§3: primary, secondary, ghost, danger, icon. Accept = small primary; Decline = small secondary; no green
 buttons, no full-radius controls (Leave, hang up, jump-to-bottom and viewer discs become radius 6 / 8 squares).
 In-caption actions ("Retry") are small ghost buttons.

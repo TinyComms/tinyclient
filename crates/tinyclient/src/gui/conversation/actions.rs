@@ -24,6 +24,20 @@ use std::rc::Rc;
 const TOOLBAR_RISE: f32 = 14.;
 const TOOLBAR_REACH: f32 = 320.;
 
+/// Hover ownership is geometric: the toolbar occludes the pane's hitbox, but
+/// crossing onto its buttons must keep the current hover owner.
+fn pointed_row(position: Point<Pixels>, viewport: Bounds<Pixels>, seen: &[(usize, Bounds<Pixels>)], held: Option<usize>) -> Option<usize> {
+    if !viewport.contains(&position) { return None; }
+    let toolbar = held.and_then(|held| seen.iter().find(|(ix, bounds)| {
+        let rise = Bounds::from_corners(
+            point(bounds.right() - px(TOOLBAR_REACH), bounds.top() - px(TOOLBAR_RISE)),
+            point(bounds.right(), bounds.top() + px(TOOLBAR_RISE + 8.)),
+        );
+        *ix == held && rise.contains(&position)
+    }));
+    toolbar.or_else(|| seen.iter().find(|(_, bounds)| bounds.contains(&position))).map(|(ix, _)| *ix)
+}
+
 /// The context menu of a message, where the pointer was.
 pub struct Menu {
     pub message: Rc<Message>,
@@ -197,32 +211,15 @@ impl Pane {
         if self.script.holds_hover() {
             return;
         }
-        let viewport = self.list.viewport_bounds();
-        let over = viewport.contains(&position).then(|| {
+        let over = {
             let seen = self.seen.borrow();
-            let row = |bounds: &Bounds<Pixels>| bounds.contains(&position);
-            // The toolbar rises over the row above; the pointer on it is still on its own row.
-            let held = self.hover.as_ref().and_then(|id| {
-                seen.iter().find(|(ix, bounds)| {
-                    let rise = Bounds::from_corners(
-                        point(bounds.right() - px(TOOLBAR_REACH), bounds.top() - px(TOOLBAR_RISE)),
-                        point(bounds.right(), bounds.top() + px(TOOLBAR_RISE + 8.)),
-                    );
-                    rise.contains(&position) && self.items.get(*ix).and_then(Item::message).is_some_and(|m| m.id == *id)
-                })
-            });
-            let found = held.or_else(|| seen.iter().find(|(_, bounds)| row(bounds)));
-            found.and_then(|(ix, _)| self.items.get(*ix)).and_then(Item::message).filter(|m| self.can(m).act).map(|m| m.id.clone())
-        });
-        let over = over.flatten();
+            let held = self.hover.as_ref().and_then(|id| seen.iter().find(|(ix, _)| self.items.get(*ix).and_then(Item::message).is_some_and(|m| m.id == *id))).map(|(ix, _)| *ix);
+            pointed_row(position, self.list.viewport_bounds(), &seen, held)
+                .and_then(|ix| self.items.get(ix)).and_then(Item::message)
+                .filter(|m| self.can(m).act).map(|m| m.id.clone())
+        };
         if over != self.hover {
             self.hover = over;
-            cx.notify();
-        }
-    }
-
-    pub(super) fn unpoint(&mut self, cx: &mut Context<Self>) {
-        if self.menu.is_none() && self.picker.is_none() && self.hover.take().is_some() {
             cx.notify();
         }
     }
@@ -730,6 +727,26 @@ impl Pane {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crossing_onto_toolbar_buttons_keeps_the_same_message() {
+        let viewport = Bounds::from_corners(point(px(0.), px(0.)), point(px(800.), px(600.)));
+        let seen = [
+            (0, Bounds::from_corners(point(px(0.), px(100.)), point(px(800.), px(150.)))),
+            (1, Bounds::from_corners(point(px(0.), px(150.)), point(px(800.), px(200.)))),
+        ];
+        let mut held = pointed_row(point(px(400.), px(175.)), viewport, &seen, None);
+        assert_eq!(held, Some(1));
+        for position in [point(px(700.), px(151.)), point(px(700.), px(140.)), point(px(760.), px(140.))] {
+            // The latter points are above the message, in the occluding toolbar.
+            held = pointed_row(position, viewport, &seen, held);
+            assert_eq!(held, Some(1));
+            assert_eq!(pointed_row(position, viewport, &seen, held), held, "stationary redraw/press keeps the button's owner");
+        }
+        assert_eq!(pointed_row(point(px(100.), px(140.)), viewport, &seen, held), Some(0));
+        assert_eq!(pointed_row(point(px(801.), px(140.)), viewport, &seen, held), None);
+        assert_eq!(pointed_row(point(px(700.), px(-1.)), viewport, &seen, held), None);
+    }
 
     #[test]
     fn a_message_link_is_built_from_ids_where_the_network_has_one() {
