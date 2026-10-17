@@ -193,6 +193,8 @@ Prerequisites:
     libx11-dev libxcb1-dev libfontconfig1-dev protobuf-compiler
   ```
 
+- Or, with Nix, `nix develop` (or `direnv allow`) provides all of the above.
+
 Then:
 
 ```sh
