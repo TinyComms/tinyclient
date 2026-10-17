@@ -755,8 +755,8 @@ mod tests {
             "assets": [
                 {"name": "tinyclient-v0.9.0-macos.zip", "uploader": {"name": "not-the-file"}, "browser_download_url": "https://github.com/itz4blitz/tinyclient/releases/download/v0.9.0/tinyclient-v0.9.0-macos.zip"},
                 {"name": "tinyclient-macos.zip", "uploader": {"name": "not-the-file"}, "browser_download_url": "https://github.com/itz4blitz/tinyclient/releases/download/v0.9.0/tinyclient-macos.zip"},
-                {"name": "tinyclient-linux-x86_64.tar.gz", "browser_download_url": "https://example.invalid/linux"},
-                {"name": "tinyclient-windows-x86_64.zip", "browser_download_url": "https://example.invalid/windows"},
+                {"name": "tinyclient-linux-x86_64.tar.gz", "browser_download_url": "https://example.invalid/tinyclient-linux-x86_64.tar.gz"},
+                {"name": "tinyclient-windows-x86_64.zip", "browser_download_url": "https://example.invalid/tinyclient-windows-x86_64.zip"},
                 {"name": "SHA256SUMS", "browser_download_url": "https://example.invalid/SHA256SUMS"}
             ]
         }"#;
