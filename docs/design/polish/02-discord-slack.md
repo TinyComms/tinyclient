@@ -73,7 +73,8 @@ Opens in the sidebar from the Threads row (`‹ Threads`, workspace name `text_f
 The first Discord home remains in its loading state until its chat read finishes,
 even when cached servers arrive sooner. DMs then appear above servers in the
 normal order. A completed empty DM read still shows servers. Once the home has
-loaded, background refreshes and sublist loading keep its existing rows visible.
+loaded, background refreshes keep its existing rows visible, including when
+returning from a sublist.
 
 ## New tokens
 For reconciliation with `polish/01-system.md`: `LEAD 20` (leading box of every 28 row), `NAME_X 36`, `INDENT_CHILD 12`, `INDENT_SUB 28`; `tag` component (16, r4, 11/500, `text_soft` on `quiet_fill`, which survives here only as the tag fill); `folder_spine` (the folder's own colour at 70%, 3 wide); `sticky_header` (`sidebar` fill, no rule, per C8). **Divergence to reconcile**: C9 puts DMs in homes on 48 rows; Slack DMs stay 28 because they sit in the user's sections beside channels in one `uniform_list` (Slack's own structure, ruling 1). Discord DMs are 48. Glyphs added: mail, phone, radio, image, building-2, calendar, headphones, headphone-off, monitor, eye, list, moon, smile, log-out, external-link, check-check, wifi-off.
