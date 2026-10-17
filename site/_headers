@@ -20,3 +20,40 @@
   Cache-Control: public, max-age=0, must-revalidate
 /site.js
   Cache-Control: public, max-age=0, must-revalidate
+
+# Discovery documents. Link is repeated by the Pages function so a cached HTML
+# response still advertises the catalog.
+/
+  Link: </.well-known/api-catalog>; rel="api-catalog", </docs/>; rel="service-doc", </.well-known/openapi.json>; rel="service-desc", </llms.txt>; rel="describedby", </.well-known/ai-catalog.json>; rel="describedby"
+/index.html
+  Link: </.well-known/api-catalog>; rel="api-catalog", </docs/>; rel="service-doc", </.well-known/openapi.json>; rel="service-desc", </llms.txt>; rel="describedby", </.well-known/ai-catalog.json>; rel="describedby"
+
+/robots.txt
+  Content-Type: text/plain; charset=utf-8
+  Cache-Control: public, max-age=0, must-revalidate
+/sitemap.xml
+  Content-Type: application/xml; charset=utf-8
+  Cache-Control: public, max-age=0, must-revalidate
+/llms.txt
+  Content-Type: text/plain; charset=utf-8
+  Cache-Control: public, max-age=0, must-revalidate
+/auth.md
+  Content-Type: text/markdown; charset=utf-8
+  Cache-Control: public, max-age=0, must-revalidate
+/.well-known/api-catalog
+  Content-Type: application/linkset+json; charset=utf-8
+  Cache-Control: public, max-age=0, must-revalidate
+/.well-known/openapi.json
+  Content-Type: application/vnd.oai.openapi+json; charset=utf-8
+  Cache-Control: public, max-age=0, must-revalidate
+/.well-known/ai-catalog.json
+  Content-Type: application/json; charset=utf-8
+  Access-Control-Allow-Origin: *
+  Cross-Origin-Resource-Policy: cross-origin
+  Cache-Control: public, max-age=0, must-revalidate
+/.well-known/agent-skills/index.json
+  Content-Type: application/json; charset=utf-8
+  Cache-Control: public, max-age=0, must-revalidate
+/.well-known/agent-skills/tinyclient/SKILL.md
+  Content-Type: text/markdown; charset=utf-8
+  Cache-Control: public, max-age=0, must-revalidate

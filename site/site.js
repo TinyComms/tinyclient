@@ -153,6 +153,8 @@
     show(0);
   })();
 
+  registerSiteTools();
+
   if (!navigator.clipboard || !window.isSecureContext) return;
   var blocks = document.querySelectorAll(".code pre");
   Array.prototype.forEach.call(blocks, function (pre) {
@@ -175,3 +177,98 @@
     pre.parentNode.appendChild(button);
   });
 })();
+
+// WebMCP: key actions on the public site. document.modelContext is preferred;
+// navigator.modelContext is the fallback older Chrome builds expose.
+function registerSiteTools() {
+  var ac = new AbortController();
+  window.addEventListener("pagehide", function () { ac.abort(); });
+
+  var docs = [
+    { path: "/docs/", title: "Getting started", about: "Install on macOS, Linux or Windows, sign in, and see where data is kept." },
+    { path: "/docs/build.html", title: "Build from source", about: "Prerequisites, cargo commands, and the demo mode." },
+    { path: "/docs/architecture.html", title: "Architecture", about: "chatd, the window, mediad, the sign-in helper, and storage." },
+    { path: "/docs/performance.html", title: "Size and performance", about: "Disk and memory next to the official apps, and how each number was measured." },
+    { path: "/docs/privacy.html", title: "Privacy and security", about: "What tinyclient stores, which connections it makes, and what it never does." },
+    { path: "/docs/networks.html", title: "Networks and terms", about: "Support on Slack, Discord, Telegram, Teams and Signal." },
+    { path: "/docs/contributing.html", title: "Contributing", about: "Roadmap and the rules every change keeps." }
+  ];
+
+  var tools = [
+    {
+      name: "list_docs",
+      description: "List tinyclient's public documentation pages and what each one covers.",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false },
+      execute: function () {
+        var lines = docs.map(function (page) {
+          return page.title + " — " + page.about + " https://tinyclient.io" + page.path;
+        });
+        return Promise.resolve({ content: [{ type: "text", text: lines.join("\n") }] });
+      }
+    },
+    {
+      name: "downloads",
+      description: "Return the stable download URLs for tinyclient. There is no account and no license key.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          platform: {
+            type: "string",
+            enum: ["macos", "linux", "windows", "all"],
+            description: "Which builds to list. Defaults to all."
+          }
+        },
+        additionalProperties: false
+      },
+      execute: function (input) {
+        var platform = input && input.platform ? input.platform : "all";
+        var all = {
+          macos: "https://tinyclient.io/download/macos",
+          linux: "https://tinyclient.io/docs/#linux",
+          windows: "https://tinyclient.io/download/windows"
+        };
+        var text = platform === "all"
+          ? "macOS " + all.macos + "\nLinux " + all.linux + "\nWindows " + all.windows + "\nChecksums https://tinyclient.io/download/checksums"
+          : all[platform] || all.macos;
+        return Promise.resolve({ content: [{ type: "text", text: text }] });
+      }
+    },
+    {
+      name: "open_page",
+      description: "Open a tinyclient.io documentation page or the home page in this tab.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          path: {
+            type: "string",
+            description: "Site path, such as /docs/privacy.html or /."
+          }
+        },
+        required: ["path"],
+        additionalProperties: false
+      },
+      execute: function (input) {
+        var path = input && input.path ? String(input.path) : "/";
+        var allowed = path === "/" || docs.some(function (page) { return page.path === path; });
+        if (!allowed) {
+          return Promise.resolve({ content: [{ type: "text", text: "That path is not a public tinyclient page." }] });
+        }
+        window.location.assign(path);
+        return Promise.resolve({ content: [{ type: "text", text: "Opening " + path }] });
+      }
+    }
+  ];
+
+  function register(tool) {
+    var options = { signal: ac.signal };
+    if (document.modelContext && document.modelContext.registerTool) {
+      return document.modelContext.registerTool(tool, options);
+    }
+    if (navigator.modelContext && navigator.modelContext.registerTool) {
+      return navigator.modelContext.registerTool(tool, options);
+    }
+    return null;
+  }
+
+  for (var i = 0; i < tools.length; i++) register(tools[i]);
+}
