@@ -212,7 +212,13 @@ pub fn meter(level: Option<u8>, cx: &mut App) {
 }
 
 /// Opens Settings on `section`, or brings the open window forward and shows `section` there.
+/// Safe to call while the shell is already being updated: the shell's own buttons call it from
+/// inside its update, and a new window reads the shell as it first draws.
 pub fn open(section: Section, cx: &mut App) {
+    cx.defer(move |cx| open_now(section, cx));
+}
+
+fn open_now(section: Section, cx: &mut App) {
     let host = cx.default_global::<Host>();
     let Some(shell) = host.shell.clone() else {
         return;
@@ -965,7 +971,12 @@ pub fn shot(cx: &mut App) {
     cx.spawn(async move |cx| {
         cx.background_executor().timer(std::time::Duration::from_millis(900)).await;
         let open_on = Section::ALL.into_iter().find(|s| s.name().to_lowercase().starts_with(&section.to_lowercase())).unwrap_or(Section::Accounts);
-        cx.update(|cx| open(open_on, cx));
+        // From inside the shell's update, as the shell's own buttons open it.
+        cx.update(|cx| {
+            if let Some(shell) = cx.default_global::<Host>().shell.clone() {
+                let _ = shell.update(cx, |_, cx| open(open_on, cx));
+            }
+        });
         let Some(window) = cx.update(|cx| cx.default_global::<Host>().window) else {
             return;
         };
