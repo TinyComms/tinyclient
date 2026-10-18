@@ -464,7 +464,7 @@ impl Demo {
             MemberSection { name: "Offline".to_owned(), count: people.len() as u32 - online },
         ];
         let members = people.into_iter().skip(offset as usize).take(limit as usize).collect();
-        Ok(Members { sections, members })
+        Ok(Members { pending: false, sections, members })
     }
 
     fn start_direct(&self, person_id: &str) -> Result<String, Refusal> {

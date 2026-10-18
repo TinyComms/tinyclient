@@ -420,6 +420,9 @@ impl Shell {
         if self.right_kind() != Some(RightKind::Members) {
             hub.watch(members::SOURCE, [], cx);
             hub.watch_members(None, cx);
+            if let Some(members) = self.people_state.members.get() {
+                members.update(cx, |members, _| members.pause());
+            }
         }
         if self.right_kind() != Some(RightKind::Info) {
             if let Some(info) = self.people_state.info.get().filter(|info| info.read(cx).person().is_some()) {

@@ -41,7 +41,7 @@ How the processes fit together and who may edit what. The contract itself is the
 | `Spaces {network}`, `Tree {space, offset, limit, peek}` | `Spaces`; `Tree {groups (kind, count), conversations, total}` | store; `Command::OpenSpace` |
 | `Conversation`, `Collapse`, `Star`, `SetDraft` | `Conversation`; `Ok` | store (local only) |
 | `People {network, relation, query, offset, limit}` | `People {people, total}` | store; `Command::SearchPeople`, debounced |
-| `Members`, `StartDirect`, `Handoff` | `Members`; `Conversation`; `Link` | adapter only (`Unsupported` until built) |
+| `Members`, `StartDirect`, `Handoff` | `Members`; `Conversation`; `Link` | adapter only; Discord `Members.pending` returns a cache miss immediately, while `Watch.members` owns the live viewport |
 | `Profile {person, space}` | `Profile` (typed, kept 5 min) | `Command::ProfileIn`, falling back to `Command::Profile` |
 | `ConversationInfo {conversation}`, `SpaceInfo {space}` | `ConversationInfo {info}`; `SpaceInfo {info}` (kept 5 min) | `Command::ConversationInfo` / `SpaceInfo` |
 | `SetMute {conversation, notify}`, `Leave`, `CloseDirect` | `Ok` once the network accepted | `Command::SetMute` / `Leave` / `CloseDirect` |

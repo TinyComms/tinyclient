@@ -172,3 +172,45 @@ Glyphs: `info`, `user`, `users`, `messages-square`, `search`, `panel-left`, `ell
 - Auto-revealing the open row in the sidebar; reorder under the pointer; opening on arrow keys.
 - Slack's "jump to unread" banner at the top: landing at the divider already does it.
 - A second window, tabs inside the pane, a pane deeper than 2.
+
+
+### Member viewport and cache
+
+The member pane keeps 64 pages of 50 members. Cached rows display immediately.
+Only visible pages are read, one local cache query at a time; the latest viewport
+replaces queued ranges after one frame (16 ms). Missing pages precede refreshes
+of retained rows. Replies from a different conversation are discarded. Closing the pane cancels
+pending polls without discarding cached rows; reopening resumes from that cache.
+
+Discord uses one live viewport subscription, driven by `Watch.members`. The
+viewport rounds to the UI's 50-member pages and subscribes to Discord's own
+100-row windows. Page queries never change that subscription or wait for the
+network: `Members.pending: true` means the requested rows are not cached yet,
+not an empty roster or a refusal. Pending reads do not block a later viewport.
+Discord cache reads, viewport changes and viewport-bound member searches run
+on their own ordered thread,
+independent of history backfill sleeps and HTTP requests. Window `SYNC` and roster edits emit `Change::Members`; the GUI then reads the
+cache again. A 250 ms cache poll covers missed notifications without sending
+another subscription. Conversation details also handle pending previews.
+
+The GUI does not request speculative adjacent pages, which would displace live
+windows and cause subscription ping-pong. Discord's windows already hold nearby
+rows. Presence for members inside subscribed windows is not requested a second
+time by individual ID. Viewport watches settle separately from the slower
+presence watches, normally within one frame, and while changing within 50 ms
+(though an already sleeping watch dispatcher can add up to 200 ms).
+
+Unsent gateway subscriptions coalesce by guild, preserving unsubscribe
+transitions and only the newest window/presence state. Ready snapshots send
+immediately; there is no artificial two-second timer or burst-credit budget.
+The gateway keeps a rolling 100-frame/minute command budget, reserving 20 of
+Discord's documented 120 for heartbeat/handshake traffic. Only exhaustion of
+that actual budget delays queued snapshots.
+
+Cache eviction prefers pages outside the viewport. Pending data retains cached
+rows; after one second the pane explains that Discord has not sent the requested
+members yet. Transient connection/time-out failures retry while wanted, with
+2/4/8/16/32-second capped backoff. Other refusals offer Retry and preserve the
+loaded roster. No failure retries per render, and old-conversation timers have
+no effect after navigation. GUI and daemon must both be updated for the pending
+cache response contract.

@@ -276,6 +276,7 @@ impl Teams {
             })
             .collect();
         Ok(Members {
+        pending: false,
             // Teams' roster has no sections.
             sections: vec![MemberSection {
                 name: "Members".to_owned(),
