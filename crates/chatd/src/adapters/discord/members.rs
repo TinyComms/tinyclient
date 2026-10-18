@@ -300,6 +300,23 @@ impl Discord {
             }
             watched.seen = watching.clone();
         }
+        self.place(watching);
+    }
+
+    /// The screen the shell last named, placed again now that READY has said what its servers
+    /// and channels are: a Watch that came before READY found none of them, and the same Watch
+    /// again is not acted on.
+    pub(super) fn rewatch(&self) {
+        let seen = self.state.lock().unwrap().members.seen.clone();
+        if *seen == Watching::default() {
+            // Nothing named; a Space opened without a Watch stays as it is.
+            return self.sync_subscription();
+        }
+        self.place(&seen);
+    }
+
+    /// Works out what `watching` puts on screen and subscribes it.
+    fn place(&self, watching: &Arc<Watching>) {
         let ours = |key: &protocol::Key| key.network == Network::Discord && key.account == self.ctx.account.account;
         let open = watching.conversation.as_ref().filter(|key| ours(key));
         let conversation = open.and_then(|key| self.ctx.known(&key.id).ok().flatten());
@@ -308,6 +325,10 @@ impl Discord {
         {
             let mut state = self.state.lock().unwrap();
             let state = &mut *state;
+            // A newer Watch came meanwhile on the other thread; it places itself.
+            if !Arc::ptr_eq(&state.members.seen, watching) {
+                return;
+            }
             // The tree on screen is named outright; an open conversation says it too.
             let named = watching.space.as_ref().map(|space| ours(space).then(|| space.id.clone()));
             let guild = guild.filter(|guild| state.guilds.contains_key(guild));
