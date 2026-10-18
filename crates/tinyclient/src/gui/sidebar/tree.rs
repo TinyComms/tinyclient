@@ -241,7 +241,9 @@ pub fn flatten(space: &Key, groups: &[Group], conversations: &[Rc<Conversation>]
             rollup: if collapsed { rollup } else { Rollup::default() },
             depth,
         });
-        emit(&mut rows, &members, depth, collapsed);
+        // Discord categories own their channels, including the visible exceptions when folded.
+        let child_depth = depth + u8::from(!slack && space.network == Network::Discord);
+        emit(&mut rows, &members, child_depth, collapsed);
         if !quiet.is_empty() && !collapsed {
             let words = if quiet.len() == 1 { "1 quiet channel".to_owned() } else { format!("{} quiet channels", quiet.len()) };
             rows.push(Row::Fold { words, reveal: Reveal::Quiet(group.id.clone()), depth });
@@ -346,7 +348,7 @@ mod tests {
             ],
             None,
         );
-        assert_eq!(tree, ["rules", "orphan", "vtext", "general", "help", "vvoice", "lounge"]);
+        assert_eq!(tree, ["rules", "orphan", "vtext", ".general", ".help", "vvoice", ".lounge"]);
     }
 
     #[test]
@@ -363,7 +365,28 @@ mod tests {
         let groups = [group("text", 0, true), group("quiet", 1, true)];
         let all = vec![mentioned, unread, channel("help", Some("text"), Channel), lounge, muted];
         // The mention, the unread channel, voice with people and the open row stay.
-        assert_eq!(rows(&groups, all, Some("help")), [">text(2)", "design", "general", "help", "lounge", "+2", ">quiet"]);
+        assert_eq!(rows(&groups, all, Some("help")), [">text(2)", ".design", ".general", ".help", ".lounge", "+2", ">quiet"]);
+    }
+
+    #[test]
+    fn category_children_keep_their_depth_when_collapsed_with_an_open_thread() {
+        use ConversationKind::{Channel, Thread};
+        let mut thread = channel("thread", None, Thread);
+        thread.parent = Some("general".into());
+        let conversations = [channel("loose", None, Channel), channel("general", Some("text"), Channel), channel("quiet", Some("text"), Channel), thread].into_iter().map(Rc::new).collect::<Vec<_>>();
+        let groups = [group("text", 0, true)];
+        let open = key("thread");
+        let folded = flatten(&key("s"), &groups, &conversations, Some(&open), 2, &Rules::default());
+        assert!(matches!(&folded[0], Row::Conversation { depth: 2, .. }));
+        assert!(matches!(&folded[1], Row::Group { depth: 2, collapsed: true, .. }));
+        assert!(matches!(&folded[2], Row::Conversation { conversation, depth: 3 } if conversation.key.id == "general"));
+        assert!(matches!(&folded[3], Row::Conversation { conversation, depth: 4 } if conversation.key == open));
+        assert_eq!(folded.len(), 4, "the quiet sibling stays folded");
+        let opened = HashSet::from(["text".into()]);
+        let expanded = flatten(&key("s"), &groups, &conversations, Some(&open), 2, &Rules { opened: Some(&opened), ..Rules::default() });
+        assert!(matches!(&expanded[2], Row::Conversation { depth: 3, .. }));
+        assert!(matches!(&expanded[3], Row::Conversation { depth: 4, .. }));
+        assert!(matches!(&expanded[4], Row::Conversation { depth: 3, .. }));
     }
 
     #[test]
@@ -372,10 +395,10 @@ mod tests {
         let mut muted = group("muted", 0, false);
         muted.muted = true;
         let tree = vec![channel("a", Some("muted"), Channel), channel("b", Some("text"), Channel)];
-        assert_eq!(rows(&[muted.clone(), group("text", 1, false)], tree.clone(), None), [">muted", "vtext", "b"]);
+        assert_eq!(rows(&[muted.clone(), group("text", 1, false)], tree.clone(), None), [">muted", "vtext", ".b"]);
         let opened = HashSet::from(["muted".to_owned()]);
         let rules = Rules { opened: Some(&opened), ..Rules::default() };
-        assert_eq!(rows_with(&[muted, group("text", 1, false)], tree, None, &rules), ["vmuted", "a", "vtext", "b"]);
+        assert_eq!(rows_with(&[muted, group("text", 1, false)], tree, None, &rules), ["vmuted", ".a", "vtext", ".b"]);
 
         let mut many: Vec<Conversation> = (0..90).map(|n| channel(&format!("c{n}"), Some("big"), Channel)).collect();
         many[3].mentions = 1;
