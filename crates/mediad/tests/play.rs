@@ -2,13 +2,43 @@
 //! replaced by a file (`TINYCLIENT_MEDIAD_SINK`) that drains at a device's pace.
 
 use protocol::{read_frame, write_frame, PlayerEvent, PlayerRequest};
-use std::io::BufReader;
+use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
 
 fn fixture(name: &str) -> String {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name).display().to_string()
+}
+
+/// A silent WAV of `seconds`. The fixtures are about a second long, which a busy machine can
+/// play out before the thread reading stdin is scheduled, so a pause test needs a longer one.
+fn silence(path: &Path, seconds: u32) {
+    let rate = 48_000u32;
+    let channels = 2u16;
+    let data = rate * seconds * u32::from(channels) * 2;
+    let mut file = std::fs::File::create(path).unwrap();
+    let mut head = Vec::with_capacity(44);
+    head.extend_from_slice(b"RIFF");
+    head.extend_from_slice(&(36 + data).to_le_bytes());
+    head.extend_from_slice(b"WAVEfmt ");
+    head.extend_from_slice(&16u32.to_le_bytes());
+    head.extend_from_slice(&1u16.to_le_bytes());
+    head.extend_from_slice(&channels.to_le_bytes());
+    head.extend_from_slice(&rate.to_le_bytes());
+    head.extend_from_slice(&(rate * u32::from(channels) * 2).to_le_bytes());
+    head.extend_from_slice(&(channels * 2).to_le_bytes());
+    head.extend_from_slice(&16u16.to_le_bytes());
+    head.extend_from_slice(b"data");
+    head.extend_from_slice(&data.to_le_bytes());
+    file.write_all(&head).unwrap();
+    let piece = vec![0u8; 48_000];
+    let mut left = data;
+    while left > 0 {
+        let n = (left as usize).min(piece.len());
+        file.write_all(&piece[..n]).unwrap();
+        left -= n as u32;
+    }
 }
 
 struct Player {
@@ -74,16 +104,21 @@ fn a_voice_message_plays_to_its_end_and_the_process_goes() {
 
 #[test]
 fn closing_stdin_pauses_and_says_where() {
-    let mut player = Player::open("pause", &fixture("tone.opus"), 0, 100);
-    assert!(matches!(player.next(), PlayerEvent::Playing { .. }));
+    let wav = std::env::temp_dir().join(format!("tinyclient-play-{}-pause.wav", std::process::id()));
+    silence(&wav, 30);
+    let mut player = Player::open("pause", &wav.display().to_string(), 0, 100);
+    let PlayerEvent::Playing { duration, .. } = player.next() else { panic!("not playing") };
+    assert!(duration >= 30_000, "{duration} ms");
     let playing = Instant::now();
     std::thread::sleep(Duration::from_millis(400));
     // Measured, not assumed: a busy machine stretches the sleep, and the sound plays on meanwhile.
     let played = playing.elapsed().as_millis() as u32;
     drop(player.child.stdin.take());
-    let PlayerEvent::Stopped { at } = player.next() else { panic!("did not stop") };
+    let event = player.next();
+    let PlayerEvent::Stopped { at } = event else { panic!("did not stop: {event:?}") };
     assert!((played.saturating_sub(100)..=played + 100).contains(&at), "stopped at {at} ms after {played} ms of playing");
     player.exits_cleanly();
+    let _ = std::fs::remove_file(&wav);
 }
 
 #[test]

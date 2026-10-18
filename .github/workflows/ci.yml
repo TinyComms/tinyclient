@@ -35,7 +35,7 @@ jobs:
         os: [ubuntu-22.04, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: ./.github/actions/setup-rust
         with:
           cache-key: test
@@ -63,7 +63,7 @@ jobs:
             artifact: windows
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: ./.github/actions/setup-rust
         with:
           cache-key: release
@@ -79,7 +79,7 @@ jobs:
       - name: Bundle tinyclient.app
         if: matrix.artifact == 'macos'
         run: packaging/bundle.sh --no-build
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         if: matrix.artifact == 'macos'
         with:
           name: tinyclient-macos
@@ -94,7 +94,7 @@ jobs:
           desktop-file-validate packaging/linux/dev.tinyclient.app.desktop
           dpkg-deb --info dist/tinyclient-ci-linux-x86_64.deb
           dpkg-deb --contents dist/tinyclient-ci-linux-x86_64.deb
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         if: matrix.artifact == 'linux-x86_64'
         with:
           name: tinyclient-linux-x86_64
@@ -110,7 +110,7 @@ jobs:
             target/release/mediad.exe, `
             target/release/tinyclient-login.exe `
             -DestinationPath tinyclient-windows-x86_64.zip
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         if: matrix.artifact == 'windows'
         with:
           name: tinyclient-windows-x86_64

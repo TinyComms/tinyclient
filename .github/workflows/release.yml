@@ -29,7 +29,7 @@ jobs:
   macos:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Name the files
         run: packaging/ci-label.sh >> "$GITHUB_ENV"
       - name: Reuse binaries built by CI
@@ -72,7 +72,7 @@ jobs:
             test "$out" = "$program $VERSION"
           done
           hdiutil detach "$mnt"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: release-macos
           path: dist/*
@@ -91,7 +91,7 @@ jobs:
             artifact: linux-aarch64
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Name the files
         run: packaging/ci-label.sh >> "$GITHUB_ENV"
       - name: Reuse binaries built by CI
@@ -120,7 +120,7 @@ jobs:
         run: |
           eval "$(packaging/linux/tools.sh)"
           packaging/linux.sh --no-build "$LABEL"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: release-linux-${{ matrix.arch }}
           path: dist/*
@@ -167,10 +167,10 @@ jobs:
             kind: rpm
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Name the files
         run: packaging/ci-label.sh >> "$GITHUB_ENV"
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           name: release-linux-${{ matrix.arch }}
           path: dist
@@ -180,7 +180,7 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Name the files
         shell: bash
         run: packaging/ci-label.sh >> "$GITHUB_ENV"
@@ -215,7 +215,7 @@ jobs:
       - name: Smoke test the installer and the zip
         shell: pwsh
         run: packaging/windows/smoke.ps1 -Label $env:LABEL -Version $env:VERSION
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: release-windows
           path: dist/*
@@ -226,10 +226,10 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Name the files
         run: packaging/ci-label.sh >> "$GITHUB_ENV"
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           pattern: release-*
           path: dist
@@ -246,11 +246,11 @@ jobs:
           sha256sum tinyclient-* > SHA256SUMS
           sha256sum -c SHA256SUMS
           ls -l
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: release-all
           path: dist/*
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         if: github.ref_type == 'tag' && (github.event_name == 'push' || inputs.publish)
         with:
           files: dist/*
