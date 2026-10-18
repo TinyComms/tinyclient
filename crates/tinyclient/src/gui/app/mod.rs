@@ -55,26 +55,49 @@ pub fn read_reduce_motion() {
     });
 }
 
-/// Diagnostics, with what takes a process to find out: the macOS version and the window's
+/// Diagnostics, with what takes a process to find out: the operating system and the window's
 /// memory. Off the main thread.
 pub(in crate::gui) fn with_memory(mut text: String) -> String {
-    let run = |program: &str, args: &[&str]| {
-        std::process::Command::new(program)
-            .args(args)
-            .stderr(std::process::Stdio::null())
-            .output()
-            .ok()
-            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
-            .filter(|out| !out.is_empty())
-    };
-    if let Some(version) = run("/usr/bin/sw_vers", &["-productVersion"]) {
-        text.push_str(&format!("macOS {version}\n"));
+    let run = |program: &str, args: &[&str]| command_out(program, args);
+    if let Some(version) = os_version() {
+        text.push_str(&format!("{version}\n"));
     }
     let pid = std::process::id().to_string();
     if let Some(kb) = run("/bin/ps", &["-o", "rss=", "-p", &pid]).and_then(|kb| kb.parse::<u64>().ok()) {
         text.push_str(&format!("window memory: {} MB\n", kb / 1024));
     }
     text
+}
+
+fn command_out(program: &str, args: &[&str]) -> Option<String> {
+    std::process::Command::new(program)
+        .args(args)
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+        .filter(|out| !out.is_empty())
+}
+
+/// The operating system line in copied diagnostics. macOS from `sw_vers`, Linux from
+/// os-release, Windows from `ver`.
+fn os_version() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        return command_out("/usr/bin/sw_vers", &["-productVersion"]).map(|version| format!("macOS {version}"));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        return crate::host::os_release_name();
+    }
+    #[cfg(windows)]
+    {
+        return command_out("cmd", &["/C", "ver"]);
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    {
+        None
+    }
 }
 
 fn unix_now() -> i64 {

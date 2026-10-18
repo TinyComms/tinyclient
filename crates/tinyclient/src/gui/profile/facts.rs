@@ -158,7 +158,7 @@ pub fn heads_up_words(heads_up: &HeadsUp, name: &str, network: Network, now: i64
         HeadsUp::Offline => HeadsUpWords {
             glyph: "icons/wifi-off.svg",
             tone: Tone::Warning,
-            line: format!("{net} is offline · showing what's on this Mac"),
+            line: crate::host::offline(net),
             note: None,
         },
         HeadsUp::Flagged(warning) => {

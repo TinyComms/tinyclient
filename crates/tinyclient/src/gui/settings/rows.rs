@@ -51,7 +51,7 @@ pub const ROWS: &[Row] = &[
     row("P1", Privacy, "Let others see when I am typing", "Let others see when I am typing", &[], &["typing", "indicator", "privacy"]),
     row("P2", Privacy, "Let others see what I have read", "Let others see what I have read", &[], &["receipts", "read receipts", "seen", "privacy"]),
     row("P3", Privacy, "", "Load images and link previews automatically", &[], &["images", "pictures", "previews", "data", "tracking"]),
-    row("P4", Privacy, "", "Keep messages on this Mac for", &["7 days", "30 days", "90 days"], &["retention", "history", "delete", "days"]),
+    row("P4", Privacy, "", crate::host::KEEP_MESSAGES, &["7 days", "30 days", "90 days"], &["retention", "history", "delete", "days"]),
     row("V1", Audio, "Microphone", "Microphone", &[], &["input", "mic", "device", "headset"]),
     row("V3", Audio, "Microphone", "Input level", &[], &["test", "meter", "mic", "level"]),
     row("V6", Audio, "Microphone", "Sensitivity", &[], &["gate", "threshold", "noise", "voice activity"]),
@@ -97,8 +97,8 @@ pub const NOT_YET: &[(&str, &str)] = &[
     ("menu bar", "tinyclient has no menu bar icon yet."),
     ("accent", "tinyclient keeps one accent colour."),
     ("font", "tinyclient keeps the system font. Text size is in Appearance."),
-    ("language", "tinyclient follows the language of macOS."),
-    ("sync", "Settings stay on this Mac. Nothing is synced."),
+    ("language", crate::host::FOLLOWS_LANGUAGE),
+    ("sync", crate::host::SETTINGS_STAY),
 ];
 
 /// Lower case with the accents taken off, so "Résumé" finds "resume".

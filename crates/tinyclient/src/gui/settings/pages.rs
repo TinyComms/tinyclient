@@ -110,9 +110,9 @@ pub fn usage_words(messages: u64, files: u64) -> (String, String, String) {
 
 /// The P4 modal's sentence.
 pub fn retention_words(prunable: Option<(u64, u64)>) -> String {
-    let rest = "are removed from this Mac. They stay on Slack, Discord and the others.";
+    let rest = crate::host::removed_from_here();
     match prunable {
-        Some((0, _)) => "Nothing here is that old yet. Older messages will be removed from this Mac as they age.".to_owned(),
+        Some((0, _)) => crate::host::retention_none_yet(),
         Some((messages, bytes)) => {
             let count = messages.to_string();
             // Thousands get a comma, as everywhere else in the app.
@@ -388,13 +388,13 @@ impl SettingsWindow {
             ),
             "B1" => row(
                 label,
-                Some("Version, macOS, memory and connection states. No messages, names or tokens.".into()),
+                Some(crate::host::DIAGNOSTICS.into()),
                 button("B1", ButtonKind::Secondary, "Copy").on_click(cx.listener(|this, _, _, cx| this.copy_diagnostics(cx))),
             ),
             "B2" => row(
                 label,
                 None,
-                button("B2", ButtonKind::Secondary, "Show in Finder").on_click(cx.listener(|_, _, _, cx| {
+                button("B2", ButtonKind::Secondary, crate::host::REVEAL).on_click(cx.listener(|_, _, _, cx| {
                     let log = protocol::support_dir().join(protocol::launch::CHATD_LOG);
                     if log.exists() {
                         cx.reveal_path(&log);
@@ -861,8 +861,8 @@ impl SettingsWindow {
                 div()
                     .flex()
                     .items_center()
-                    .child(div().flex_1().type_ui().font_weight(theme::SEMIBOLD).text_color(theme::text()).child(format!("{total_words} on this Mac")))
-                    .child(button("D1", ButtonKind::Ghost, "Show in Finder").on_click(cx.listener(|_, _, _, cx| cx.open_with_system(&protocol::support_dir())))),
+                    .child(div().flex_1().type_ui().font_weight(theme::SEMIBOLD).text_color(theme::text()).child(crate::host::on_here(&total_words)))
+                    .child(button("D1", ButtonKind::Ghost, crate::host::REVEAL).on_click(cx.listener(|_, _, _, cx| cx.open_with_system(&protocol::support_dir())))),
             )
             .child(
                 div()
@@ -923,7 +923,7 @@ impl SettingsWindow {
             ),
             Confirm::Clear => modal_panel(
                 "Clear saved messages and files?",
-                vec!["Everything tinyclient saved to show you quickly is deleted from this Mac. It comes back from the networks as you open conversations. Sign-ins, drafts and settings stay.".to_owned()],
+                vec![crate::host::clear_saved()],
                 button("clear-confirm", ButtonKind::Danger, "Clear").on_click(cx.listener(|this, _, _, cx| {
                     this.confirm = None;
                     this.off_thread(cx, || crate::client::ask(&Request::Clear), |this, answer, cx| {
@@ -1152,12 +1152,13 @@ mod tests {
 
     #[test]
     fn the_retention_question_says_how_much_goes_and_drops_what_it_does_not_know() {
+        let here = crate::host::HERE;
         assert_eq!(
             retention_words(Some((41_210, 12 * 1024 * 1024))),
-            "41,210 messages, about 12 MB, are removed from this Mac. They stay on Slack, Discord and the others."
+            format!("41,210 messages, about 12 MB, are removed from {here}. They stay on Slack, Discord and the others.")
         );
-        assert_eq!(retention_words(Some((1, 300))), "1 message is removed from this Mac. It stays on Slack, Discord and the others.");
-        assert_eq!(retention_words(None), "Older messages are removed from this Mac. They stay on Slack, Discord and the others.");
+        assert_eq!(retention_words(Some((1, 300))), format!("1 message is removed from {here}. It stays on Slack, Discord and the others."));
+        assert_eq!(retention_words(None), format!("Older messages are removed from {here}. They stay on Slack, Discord and the others."));
     }
 
     #[test]

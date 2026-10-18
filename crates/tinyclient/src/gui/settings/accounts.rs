@@ -120,7 +120,7 @@ impl SettingsWindow {
                     })),
             );
         }
-        pane.child(caption("Signing out removes this account's sign-in and everything tinyclient saved for it from this Mac.").pt(px(0.)))
+        pane.child(caption(crate::host::sign_out_caption()).pt(px(0.)))
     }
 
     fn sign_in(&mut self, network: Network, cx: &mut Context<Self>) {
@@ -141,7 +141,7 @@ impl SettingsWindow {
         super::modal_panel(
             format!("Sign out of {name}?"),
             vec![
-                format!("This removes from this Mac the saved sign-in and the saved messages, images and files of this account, and ends this session on {network}."),
+                crate::host::sign_out_body(network),
                 format!("Nothing is deleted on {network}. Your other accounts are not touched."),
             ],
             button("sign-out-confirm", ButtonKind::Danger, "Sign out").on_click(cx.listener(move |this, _, _, cx| {

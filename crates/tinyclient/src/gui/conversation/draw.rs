@@ -1199,7 +1199,7 @@ impl Pane {
                 )
                 .child(
                     tool("reveal", Icon::Folder, 28.)
-                        .tooltip(tip("Show in Finder", None))
+                        .tooltip(tip(crate::host::REVEAL, None))
                         .on_click(cx.listener(move |_, _, _, cx| {
                             cx.stop_propagation();
                             cx.reveal_path(std::path::Path::new(&reveal));

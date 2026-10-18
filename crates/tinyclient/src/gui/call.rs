@@ -346,10 +346,24 @@ fn open(url: &str) -> Result<(), String> {
     if url.starts_with('-') || !url.contains(':') {
         return Err(format!("Not a link: {url}"));
     }
-    match std::process::Command::new("open").arg(url).status() {
+    #[cfg(target_os = "macos")]
+    let mut command = std::process::Command::new("open");
+    #[cfg(not(any(target_os = "macos", windows)))]
+    let mut command = std::process::Command::new("xdg-open");
+    #[cfg(windows)]
+    let mut command = std::process::Command::new("cmd");
+    #[cfg(windows)]
+    {
+        protocol::launch::no_console(command.args(["/C", "start", "", url]));
+    }
+    #[cfg(not(windows))]
+    {
+        command.arg(url);
+    }
+    match command.status() {
         Ok(status) if status.success() => Ok(()),
-        Ok(_) => Err(format!("Nothing on this Mac opens {url}")),
-        Err(_) => Err("This Mac could not open the link.".to_owned()),
+        Ok(_) => Err(crate::host::nothing_opens(url)),
+        Err(_) => Err(crate::host::COULD_NOT_OPEN.to_owned()),
     }
 }
 
