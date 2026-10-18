@@ -2,8 +2,8 @@
 //! a Slack workspace's sections, a team's channels. Rebuilt on collapse and on change. The
 //! network's settings are kept here (`design/polish/02-discord-slack.md` §4–5): opt-in and
 //! "hide muted channels", muted categories collapsed, only followed threads with news, Slack's
-//! "unread only" sections, its quiet channels folded, its apps in their own group. A collapsed
-//! group never hides what needs me (rule 3).
+//! "unread only" sections, its quiet channels folded, its apps in their own group. Collapsed Discord categories summarize hidden activity on the header; Slack
+//! sections retain attention exceptions.
 
 use protocol::{Badge, Conversation, ConversationKind, Group, GroupKind, Key, Network, Occupant, Special};
 use std::collections::{HashMap, HashSet};
@@ -108,7 +108,7 @@ impl Rules<'_> {
     }
 }
 
-/// Needs me, or is where I am: never hidden by a fold.
+/// Needs me, or is where I am: retained by Slack folds and channel visibility filters.
 fn needs_me(c: &Conversation, open: Option<&Key>) -> bool {
     open == Some(&c.key) || matches!(c.badge(), Badge::Count(_)) || (c.badge() == Badge::Dot && !c.muted)
 }
@@ -158,6 +158,9 @@ pub fn flatten(space: &Key, groups: &[Group], conversations: &[Rc<Conversation>]
     let listed: Vec<&Rc<Conversation>> = conversations.iter().filter(|c| !is_thread(c) && visible(c)).collect();
 
     let emit = |rows: &mut Vec<Row>, members: &[&Rc<Conversation>], depth: u8, collapsed: bool| {
+        if collapsed && space.network == Network::Discord && !slack {
+            return;
+        }
         for conversation in members {
             let under = threads.get(conversation.key.id.as_str()).map(Vec::as_slice).unwrap_or_default();
             if collapsed && !needs_me(conversation, open) && !occupied(conversation) {
@@ -241,7 +244,7 @@ pub fn flatten(space: &Key, groups: &[Group], conversations: &[Rc<Conversation>]
             rollup: if collapsed { rollup } else { Rollup::default() },
             depth,
         });
-        // Discord categories own their channels, including the visible exceptions when folded.
+        // Discord category children stay nested beneath their header.
         let child_depth = depth + u8::from(!slack && space.network == Network::Discord);
         emit(&mut rows, &members, child_depth, collapsed);
         if !quiet.is_empty() && !collapsed {
@@ -352,7 +355,7 @@ mod tests {
     }
 
     #[test]
-    fn a_collapsed_group_keeps_what_needs_me_and_says_what_else_is_inside() {
+    fn collapsed_discord_categories_hide_children_and_keep_attention_on_the_header() {
         use ConversationKind::Channel;
         let mut mentioned = channel("design", Some("text"), Channel);
         (mentioned.unread, mentioned.mentions) = (4, 2);
@@ -364,12 +367,14 @@ mod tests {
         (muted.muted, muted.unread) = (true, 9);
         let groups = [group("text", 0, true), group("quiet", 1, true)];
         let all = vec![mentioned, unread, channel("help", Some("text"), Channel), lounge, muted];
-        // The mention, the unread channel, voice with people and the open row stay.
-        assert_eq!(rows(&groups, all, Some("help")), [">text(2)", ".design", ".general", ".help", ".lounge", "+2", ">quiet"]);
+        // Even the selected channel, mentions and occupied voice channels fold away.
+        assert_eq!(rows(&groups, all.clone(), Some("help")), [">text(2)", ">quiet"]);
+        let slack = Rules { network: Some(Network::Slack), ..Rules::default() };
+        assert_eq!(rows_with(&groups, all, Some("help"), &slack), [">text(2)", "design", "general", "help", "lounge", "+2", ">quiet"]);
     }
 
     #[test]
-    fn category_children_keep_their_depth_when_collapsed_with_an_open_thread() {
+    fn a_collapsed_category_hides_the_open_thread_and_expands_with_nested_depths() {
         use ConversationKind::{Channel, Thread};
         let mut thread = channel("thread", None, Thread);
         thread.parent = Some("general".into());
@@ -379,9 +384,7 @@ mod tests {
         let folded = flatten(&key("s"), &groups, &conversations, Some(&open), 2, &Rules::default());
         assert!(matches!(&folded[0], Row::Conversation { depth: 2, .. }));
         assert!(matches!(&folded[1], Row::Group { depth: 2, collapsed: true, .. }));
-        assert!(matches!(&folded[2], Row::Conversation { conversation, depth: 3 } if conversation.key.id == "general"));
-        assert!(matches!(&folded[3], Row::Conversation { conversation, depth: 4 } if conversation.key == open));
-        assert_eq!(folded.len(), 4, "the quiet sibling stays folded");
+        assert_eq!(folded.len(), 2, "the selected thread and all channel children stay folded");
         let opened = HashSet::from(["text".into()]);
         let expanded = flatten(&key("s"), &groups, &conversations, Some(&open), 2, &Rules { opened: Some(&opened), ..Rules::default() });
         assert!(matches!(&expanded[2], Row::Conversation { depth: 3, .. }));

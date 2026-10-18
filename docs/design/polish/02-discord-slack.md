@@ -40,8 +40,8 @@ Top to bottom, one scroll:
 - **Followed threads** (only joined and unread or open, at most 3): corner glyph 14, name, count badge; then "n more threads" action sub-row expanding all followed threads under that channel, including read ones. "Show fewer threads" collapses back to the three-row limit; the open thread stays visible. Expansion is remembered per channel for the session. A thread whose starter is gone uses its own name.
 - **Voice**: occupied channel `text_soft` with `4/12` when it has a user limit; occupants as 28 sub-rows (avatar 20, server nickname, trailing mic-off / deafen 14 `danger`, screen share or camera 14 `text_soft`), 6 then "+n", friends first. Empty voice channel: `text_faint`, nothing trailing. Stage: "Live · 2 speaking" `text_faint`.
 - **Footers** (28 action rows, `text_faint`): "Show 41 muted channels" when *Hide muted channels* is on in Discord (reveals for the session); "Browse 212 more channels" for onboarding opt-outs (from the stored tree).
-- **Hierarchy**: Discord category channels are indented one 16 pt level under their header, including selected/unread channels kept visible while collapsed. Threads and voice participants indent one further level. Ungrouped channels remain at the header level; expanding or collapsing never changes a channel's indentation. Slack sections keep their existing flat layout.
-- **Collapse**: muted categories start collapsed; over 80 visible channels, every category without a number starts collapsed. Collapsed still shows the open row, unread unmuted channels, rows with a number and voice channels with people. The user's own collapse wins after and is kept per server.
+- **Hierarchy**: Discord category channels are indented one 16 pt level under their header, when expanded. Threads and voice participants indent one further level. Ungrouped channels remain at the header level; expanding or collapsing never changes a channel's indentation. Slack sections keep their existing flat layout.
+- **Collapse**: muted categories start collapsed; over 80 visible channels, every category without a number starts collapsed. A collapsed Discord category hides all its channels, threads and voice participants, including the selected channel; the conversation remains open. Hidden unread activity and mentions are represented on the category header. The user's own collapse wins after and is kept per server.
 - **300 channels** (frame 4): 10 headers, 9 rows that need you, 2 footers = 21 rows, 588 pt, one screen.
 
 ## 5. Slack home (`--mode slack`), frames 5–6
@@ -60,7 +60,7 @@ Opens in the sidebar from the Threads row (`‹ Threads`, workspace name `text_f
 | Strip anatomy (place name + chevron menu, `All · Unread`), jump strip | Discord: Friends, Message requests, In voice, Servers, folders. Slack: Threads, sections, Apps, quiet channels |
 | 28 and 48 rows, x 36 name line, section header, action rows, badges, tags | Discord DMs are 48 (who is around matters); Slack DMs are 28 inside sections (people are filed with channels) |
 | Unread = 600 + dot; to me = unfilled count; mention = accent pill; muted = faint, no glyph | Discord keeps muted rows in place; Slack sorts them last (each network's own rule) |
-| Collapsed groups never hide what needs me | Discord's words: server, category, friends. Slack's: workspace, section, huddle, Connect |
+| Collapsed Discord categories summarize hidden activity on the header; Slack sections retain their attention exceptions | Discord's words: server, category, friends. Slack's: workspace, section, huddle, Connect |
 
 ## 8. Empty, loading, error (frames 8–9); nothing animates
 | List | Empty | Loading / first sign-in | Error |
