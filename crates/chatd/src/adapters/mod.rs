@@ -1285,15 +1285,17 @@ mod tests {
     fn recovery_hints_do_not_bypass_http_or_command_pacing() {
         let (_adapter, ctx, _inbox) = local(AccountKey { network: Network::Signal, account: "pacing".into() }, hub());
         let thread_ctx = ctx.clone();
-        let (done, finished) = channel();
+        let (started, waiting) = channel();
         let thread = std::thread::spawn(move || {
+            let start = Instant::now();
+            started.send(()).unwrap();
             assert!(!thread_ctx.pause(Duration::from_millis(150)));
-            done.send(()).unwrap();
+            start.elapsed()
         });
+        waiting.recv_timeout(Duration::from_secs(2)).unwrap();
         recovery::hint(&ctx.stop);
-        assert!(finished.recv_timeout(Duration::from_millis(50)).is_err());
-        finished.recv_timeout(Duration::from_secs(2)).unwrap();
-        thread.join().unwrap();
+        // Timed inside the pause, so a slow runner cannot make it look early.
+        assert!(thread.join().unwrap() >= Duration::from_millis(150), "a hint does not cut a pacing pause short");
     }
 
     fn hub() -> Arc<Hub> {
