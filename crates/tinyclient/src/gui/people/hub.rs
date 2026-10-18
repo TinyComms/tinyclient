@@ -186,8 +186,11 @@ impl WatchSet {
         }
         let quiet = now.saturating_duration_since(last);
         let waited = now.saturating_duration_since(first);
-        if quiet < QUIET && waited < LATEST {
-            return Due::Wait((QUIET - quiet).min(LATEST - waited));
+        let viewport_changed = self.sent.as_ref().map_or(wanted.members.is_some(), |sent| sent.members != wanted.members);
+        let quiet_limit = if viewport_changed { Duration::from_millis(16) } else { QUIET };
+        let latest_limit = if viewport_changed { Duration::from_millis(50) } else { LATEST };
+        if quiet < quiet_limit && waited < latest_limit {
+            return Due::Wait((quiet_limit - quiet).min(latest_limit - waited));
         }
         self.changing = None;
         self.sent = Some(wanted.clone());
@@ -577,6 +580,19 @@ fn live(typists: &[Typist], heard: i64, now: i64) -> impl Iterator<Item = &Typis
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn member_viewports_settle_within_a_frame_and_do_not_wait_for_presence_quiet() {
+        let start = std::time::Instant::now();
+        let mut watch = super::WatchSet::default();
+        watch.members(Some((0, 50)), start);
+        assert!(matches!(watch.due(start + std::time::Duration::from_millis(16)), super::Due::Send(_)));
+        for step in 1..=5 {
+            watch.members(Some((step * 50, 50)), start + std::time::Duration::from_millis(16 + step as u64 * 10));
+        }
+        let due = watch.due(start + std::time::Duration::from_millis(76));
+        assert!(matches!(due, super::Due::Send(ref watching) if watching.members == Some((250, 50))));
+    }
+
     use super::*;
     use protocol::Network;
 

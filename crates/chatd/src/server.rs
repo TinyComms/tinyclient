@@ -1487,6 +1487,7 @@ impl Chat {
                 });
                 match asked {
                     Ok(found) => Response::Members {
+                        pending: found.pending,
                         conversation,
                         sections: found.sections,
                         offset,

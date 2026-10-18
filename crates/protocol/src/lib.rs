@@ -1488,6 +1488,9 @@ pub enum Response {
         total: u32,
     },
     Members {
+        /// Discord cache miss: rows will arrive through the active viewport subscription.
+        #[serde(default, skip_serializing_if = "is_false")]
+        pending: bool,
         conversation: Key,
         sections: Vec<MemberSection>,
         offset: u32,
@@ -1665,6 +1668,20 @@ pub fn media_process_needed(active_calls: usize) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn members_pending_is_explicit_and_old_complete_responses_still_decode() {
+        let mut value = serde_json::json!({"op": "members", "conversation": {
+            "network": "discord", "account": "account", "id": "channel"
+        }, "offset": 0, "sections": [], "members": []});
+        let complete: super::Response = serde_json::from_value(value.clone()).unwrap();
+        assert!(matches!(complete, super::Response::Members { pending: false, .. }));
+        assert!(serde_json::to_value(complete).unwrap().get("pending").is_none());
+        value["pending"] = serde_json::json!(true);
+        let pending: super::Response = serde_json::from_value(value).unwrap();
+        assert!(matches!(pending, super::Response::Members { pending: true, .. }));
+        assert_eq!(serde_json::to_value(pending).unwrap()["pending"], true);
+    }
+
     use super::*;
 
     fn row(kind: ConversationKind, unread: u32, mentions: u32, muted: bool) -> Conversation {

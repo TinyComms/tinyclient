@@ -468,6 +468,7 @@ impl Slack {
         self.users(&window);
         let members: Vec<Person> = window.iter().map(|id| self.person(id, &self.user(id))).collect();
         Ok(Members {
+        pending: false,
             // Slack's member list has no sections.
             sections: vec![MemberSection {
                 name: "Members".to_owned(),

@@ -40,11 +40,35 @@ const GATEWAY: &str = "wss://gateway.discord.gg/?encoding=json&v=9";
 const CAPABILITIES: u64 = 1_734_653;
 /// How often the loop looks up when nothing happens, to notice it was stopped.
 const IDLE: Duration = Duration::from_secs(5);
-const SENDS_A_MINUTE: usize = 60;
+const SENDS_A_MINUTE: usize = 100;
 /// This many sessions refused in a row and no more are asked for until the user does something.
 const IDENTIFIES: u32 = 3;
 /// How often a held adapter looks up, to notice it was stopped.
 const HELD: Duration = Duration::from_secs(30);
+
+#[derive(Default)]
+pub(super) struct SendQueue {
+    commands: VecDeque<String>,
+    subscriptions: serde_json::Map<String, Value>,
+}
+
+impl SendQueue {
+    fn push(&mut self, op: u8, data: Value) {
+        if op == 37 {
+            if let Some(guilds) = data.get("subscriptions").and_then(Value::as_object) {
+                self.subscriptions.extend(guilds.iter().map(|(guild, state)| (guild.clone(), state.clone())));
+            }
+        } else { self.commands.push_back(json!({"op": op, "d": data}).to_string()); }
+    }
+
+    fn pop(&mut self) -> Option<String> {
+        if let Some(command) = self.commands.pop_front() { return Some(command); }
+        if self.subscriptions.is_empty() { return None; }
+        Some(json!({"op": 37, "d": {"subscriptions": std::mem::take(&mut self.subscriptions)}}).to_string())
+    }
+
+    fn clear(&mut self) { *self = Self::default(); }
+}
 
 /// A socket handle for `poll` / `WSAPoll`.
 #[derive(Clone, Copy)]
@@ -302,7 +326,7 @@ impl Discord {
 
     /// Queues a gateway frame for the socket thread.
     pub(super) fn tell(&self, op: u8, d: Value) {
-        self.outbox.queue.lock().unwrap().push_back(json!({"op": op, "d": d}).to_string());
+        self.outbox.queue.lock().unwrap().push(op, d);
         self.wake();
     }
 
@@ -419,13 +443,13 @@ impl Discord {
                     Err(lost) => return Err(self.lost(lost)),
                 }
             }
-            // Discord closes a socket that sends more than 120 frames a minute. Half of that is
-            // ours to use; anything beyond waits in the queue.
+            // Discord allows 120 frames per minute. Twenty are
+            // reserved for heartbeats/handshake; anything beyond waits in the queue.
             while sent.front().is_some_and(|at: &Instant| at.elapsed() > Duration::from_secs(60)) {
                 sent.pop_front();
             }
             while beat.ready && sent.len() < SENDS_A_MINUTE {
-                let Some(frame) = self.outbox.queue.lock().unwrap().pop_front() else {
+                let Some(frame) = self.outbox.queue.lock().unwrap().pop() else {
                     break;
                 };
                 wire.send(frame)?;
@@ -447,7 +471,12 @@ impl Discord {
             }
             let pending = self.tick();
             let until_beat = beat.next.saturating_duration_since(Instant::now());
-            let limit = if pending { Duration::from_millis(500) } else { IDLE };
+            let mut limit = if pending { Duration::from_millis(500) } else { IDLE };
+            if sent.len() >= SENDS_A_MINUTE {
+                if let Some(at) = sent.front() {
+                    limit = limit.min(Duration::from_secs(60).saturating_sub(at.elapsed()));
+                }
+            }
             wire.wait(wake, until_beat.min(limit));
             self.outbox.wake.drain();
         }
@@ -545,10 +574,43 @@ impl Discord {
     /// Timers that ride on the socket thread. True while one is running, so the loop looks again
     /// soon.
     fn tick(&self) -> bool {
-        let members = self.members_tick();
         let voice = self.voice_tick();
         let search = self.search_tick();
         self.unmute_tick();
-        members || voice || search
+        voice || search
+    }
+}
+
+#[cfg(test)]
+mod send_queue_tests {
+    use super::*;
+
+    #[test]
+    fn scrolling_coalesces_only_unsent_snapshots_without_an_artificial_delay() {
+        let mut queue = SendQueue::default();
+        for step in 0..600 { queue.push(37, json!({"subscriptions": {"guild": {"window": step}}})); }
+        assert_eq!(queue.subscriptions.len(), 1);
+        let frame: Value = serde_json::from_str(&queue.pop().unwrap()).unwrap();
+        assert_eq!(frame["d"]["subscriptions"]["guild"]["window"], 599);
+        for step in 0..100 {
+            queue.push(37, json!({"subscriptions": {"guild": {"window": step}}}));
+            assert!(queue.pop().is_some(), "ready snapshots do not wait for a timer");
+        }
+    }
+
+    #[test]
+    fn coalescing_preserves_guild_unsubscribes_and_command_order() {
+        let mut queue = SendQueue::default();
+        queue.push(37, json!({"subscriptions": {"a": {"typing": true}}}));
+        queue.push(37, json!({"subscriptions": {"a": {"typing": false}, "b": {"typing": true}}}));
+        queue.push(4, json!({"channel_id": "voice"}));
+        let command: Value = serde_json::from_str(&queue.pop().unwrap()).unwrap();
+        assert_eq!(command["op"], 4);
+        let subscription: Value = serde_json::from_str(&queue.pop().unwrap()).unwrap();
+        assert_eq!(subscription["d"]["subscriptions"], json!({"a": {"typing": false}, "b": {"typing": true}}));
+        assert!(queue.pop().is_none());
+        queue.clear();
+        queue.push(37, json!({"subscriptions": {"c": {}}}));
+        assert!(queue.pop().is_some(), "a new connection sends its first subscription immediately");
     }
 }

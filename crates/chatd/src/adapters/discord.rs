@@ -1,9 +1,10 @@
 //! Discord, signed in as the user: the gateway websocket for everything live, the HTTP API for
 //! history and for what the user does.
 //!
-//! Two threads. The socket thread (`gateway.rs`) holds the gateway, turns its events into
+//! The socket thread (`gateway.rs`) holds the gateway, turns its events into
 //! `Context` calls and is the only one that writes to the socket; the command thread serves
-//! `Command`s, makes every HTTP request and hands gateway sends to the socket thread's outbox.
+//! HTTP commands and hands gateway sends to the socket thread's outbox. A separate
+//! viewport thread serves cache reads and Watch updates without waiting for HTTP/backfill.
 //!
 //! What stays in memory is bounded and listed on [`State`]: roles and ids per server, the lists
 //! the user owns, one visible member window, the voice states of the servers. Trees, people and
@@ -32,9 +33,9 @@ use protocol::{Conversation, ConversationKind, Message, Presence, RelateAction, 
 use rest::{Refused, Rest};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64};
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -193,7 +194,7 @@ const ACK_EVERY: Duration = Duration::from_secs(3);
 
 /// Frames the command thread wants sent, and a local socket pair that wakes the socket thread.
 struct Outbox {
-    queue: Mutex<VecDeque<String>>,
+    queue: Mutex<gateway::SendQueue>,
     wake: gateway::WakePair,
 }
 
@@ -246,7 +247,7 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
         token: session.token,
         state: Mutex::new(State::default()),
         outbox: Outbox {
-            queue: Mutex::new(VecDeque::new()),
+            queue: Mutex::new(gateway::SendQueue::default()),
             wake,
         },
         sequence: AtomicU64::new(0),
@@ -255,6 +256,21 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
     });
     let socket = discord.clone();
     std::thread::spawn(move || keep_connected(&socket.ctx, || socket.connect()));
+    let (commands, network_inbox) = channel();
+    let viewport = discord.clone();
+    std::thread::spawn(move || {
+        // Cache reads and desired viewport updates must not sit behind history
+        // backfill sleeps or an HTTP request. Preserve their order on one thread.
+        while let Ok(command) = inbox.recv() {
+            match command {
+                command @ (Command::Members { .. } | Command::Watch(_) | Command::OpenSpace(_) | Command::SearchPeople(_)) => viewport.command(command),
+                command => {
+                    let stop = matches!(&command, Command::Stop);
+                    if commands.send(command).is_err() || stop { break; }
+                }
+            }
+        }
+    });
     std::thread::spawn(move || {
         // A send with files uploads on a thread of its own, so the commands behind it (its own
         // cancel among them) are not held up for as long as the upload takes.
@@ -273,7 +289,7 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
             Command::ProfileIn { person_id, space_id, reply } => Discord::profile_queued(&discord, person_id, Some(space_id), reply),
             command => discord.command(command),
         };
-        serve_commands(&discord.ctx, inbox, PACE, |id| discord.backfill(id), other)
+        serve_commands(&discord.ctx, network_inbox, PACE, |id| discord.backfill(id), other)
     });
     Ok(())
 }
@@ -899,6 +915,7 @@ impl Discord {
         let unasked = match &command {
             Command::Watch(watching) => !ours(&watching.conversation) && !ours(&watching.space),
             Command::Warm(_)
+            | Command::Members { .. }
             | Command::Download { .. }
             | Command::Handoff { .. }
             | Command::CallLeave(_)

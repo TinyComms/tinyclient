@@ -801,6 +801,7 @@ fn members(account: &Account, conversation: &str, offset: u32, limit: u32) -> Re
         }
     };
     Ok(Members {
+        pending: false,
         sections: vec![MemberSection { name: "Members".to_owned(), count: total }],
         members: ids.into_iter().map(|id| person(account, Who::User(id), relation(account, id))).collect(),
     })

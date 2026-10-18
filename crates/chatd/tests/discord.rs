@@ -1302,15 +1302,12 @@ fn the_space_on_screen_is_the_only_one_subscribed() {
     sleep(Duration::from_millis(300));
     assert_eq!(subscriptions().len(), 1, "looking again changes nothing");
 
-    // The visible rows of a member list: asked for by range, answered from Discord's sync.
-    let asking = {
-        let (dir, conversation) = (world.dir.clone(), world.key("4101"));
-        std::thread::spawn(move || {
-            let mut stream = ChatStream::connect(&dir.join("chat.sock")).unwrap();
-            write_frame(&mut stream, &Request::Members { conversation, offset: 0, limit: 50 }).unwrap();
-            read_frame::<Response>(&mut stream).unwrap()
-        })
-    };
+    // A missing window returns immediately; no network request holds the caller.
+    let mut stream = ChatStream::connect(&world.dir.join("chat.sock")).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+    write_frame(&mut stream, &Request::Members { conversation: world.key("4101"), offset: 0, limit: 50 }).unwrap();
+    let pending: Response = read_frame(&mut stream).unwrap();
+    assert!(matches!(pending, Response::Members { pending: true, ref members, .. } if members.is_empty()), "{pending:?}");
     let ranged = wait("the range request", || subscriptions().pop().filter(|frame| frame["d"]["subscriptions"]["4000"]["channels"]["4101"].is_array()));
     assert_eq!(ranged["d"]["subscriptions"]["4000"]["channels"]["4101"], json!([[0, 99]]));
     let member = |id: &str, username: &str, name: &str, nick: Value, status: &str| {
@@ -1335,7 +1332,11 @@ fn the_space_on_screen_is_the_only_one_subscribed() {
             member("2002", "dev", "Dev Patel", Value::Null, "offline"),
         ]}],
     }));
-    match asking.join().unwrap() {
+    let delivered = wait("the cached member window", || {
+        let response = world.ask(Request::Members { conversation: world.key("4101"), offset: 0, limit: 50 });
+        matches!(response, Response::Members { pending: false, .. }).then_some(response)
+    });
+    match delivered {
         Response::Members { sections, members, offset, .. } => {
             let sections: Vec<(&str, u32)> = sections.iter().map(|section| (section.name.as_str(), section.count)).collect();
             assert_eq!(sections, [("mods", 1), ("Online", 1), ("Offline", 1)]);
@@ -1354,6 +1355,15 @@ fn the_space_on_screen_is_the_only_one_subscribed() {
         other => panic!("{other:?}"),
     }
     assert_eq!(subscriptions().len(), asked);
+    // Two uncached reads do not replace the live viewport or wait behind one another.
+    let before = subscriptions().len();
+    for offset in [500, 1000, 1500] {
+        let response = world.ask(Request::Members { conversation: world.key("4101"), offset, limit: 50 });
+        // Outside this tiny roster is a valid empty page; either way no gateway send.
+        assert!(matches!(response, Response::Members { .. }));
+    }
+    sleep(Duration::from_millis(100));
+    assert_eq!(subscriptions().len(), before, "cache reads must not move the live subscription");
     // A direct conversation has no member list.
     let none = world.ask(Request::Members { conversation: world.key("3001"), offset: 0, limit: 50 });
     assert!(matches!(none, Response::Error { code: ErrorCode::Unsupported, .. }), "{none:?}");
@@ -1395,6 +1405,57 @@ fn the_space_on_screen_is_the_only_one_subscribed() {
     world.ask(Request::Watch(watch));
     let closed = wait("the subscription ending", || subscriptions().pop().filter(|frame| frame["d"]["subscriptions"]["4000"]["typing"] == false));
     assert_eq!(closed["d"]["subscriptions"]["4000"]["channels"], json!({}));
+}
+
+#[test]
+fn missing_member_pages_never_block_a_new_viewport_or_move_its_subscription() {
+    let world = World::start();
+    world.tree("4000");
+    let cached = |offset| {
+        let mut stream = ChatStream::connect(&world.dir.join("chat.sock")).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        write_frame(&mut stream, &Request::Members { conversation: world.key("4101"), offset, limit: 50 }).unwrap();
+        read_frame::<Response>(&mut stream).unwrap()
+    };
+    assert!(matches!(cached(0), Response::Members { pending: true, .. }));
+    let groups = json!([{"id": "online", "count": 4000}]);
+    let member = |row: u32| json!({"member": {"user": {
+        "id": (10000 + row).to_string(), "username": format!("member-{row}"),
+        "discriminator": "0", "avatar": null
+    }, "roles": []}});
+    let mut first = vec![json!({"group": {"id": "online", "count": 4000}})];
+    first.extend((1..100).map(member));
+    world.discord.push("GUILD_MEMBER_LIST_UPDATE", json!({
+        "guild_id": "4000", "groups": groups,
+        "ops": [{"op": "SYNC", "range": [0, 99], "items": first}]
+    }));
+    wait("the initial cache", || matches!(cached(0), Response::Members { pending: false, .. }).then_some(()));
+    let before = world.discord.frames_of(37).len();
+    for offset in [500, 1000, 1500] { assert!(matches!(cached(offset), Response::Members { pending: true, .. })); }
+    sleep(Duration::from_millis(100));
+    assert_eq!(world.discord.frames_of(37).len(), before, "misses must not enqueue network reads");
+
+    let mut watch = Watching { space: Some(world.key("4000")), conversation: Some(world.key("4101")), members: Some((1200, 50)), ..Watching::default() };
+    world.ask(Request::Watch(watch.clone()));
+    wait("the latest viewport", || world.discord.frames_of(37).pop().filter(|frame|
+        frame["d"]["subscriptions"]["4000"]["channels"]["4101"] == json!([[0, 99], [1200, 1299]])));
+    world.discord.push("GUILD_MEMBER_LIST_UPDATE", json!({
+        "guild_id": "4000", "groups": groups,
+        "ops": [{"op": "SYNC", "range": [1200, 1299], "items": (1200..1300).map(member).collect::<Vec<_>>()}]
+    }));
+    let ready = wait("the new viewport cache", || {
+        let response = cached(1200);
+        matches!(response, Response::Members { pending: false, .. }).then_some(response)
+    });
+    let Response::Members { members, .. } = ready else { unreachable!() };
+    assert_eq!(members.len(), 50);
+    assert!(matches!(cached(500), Response::Members { pending: true, .. }), "old pending page need not finish first");
+    let before = world.discord.frames_of(37).len();
+    watch.people = members.iter().map(|person| person.key.clone()).collect();
+    world.ask(Request::Watch(watch));
+    for _ in 0..20 { assert!(matches!(cached(1200), Response::Members { pending: false, .. })); }
+    sleep(Duration::from_millis(100));
+    assert_eq!(world.discord.frames_of(37).len(), before, "cached reads and listed presence must not spend subscription budget");
 }
 
 #[test]

@@ -290,13 +290,22 @@ impl InfoPane {
 
     fn ask_members(&mut self, conversation: Key, asked: u64, cx: &mut Context<Self>) {
         let this = cx.weak_entity();
-        let request = Request::Members { conversation, offset: 0, limit: facts::INLINE_MEMBERS };
+        let request = Request::Members { conversation: conversation.clone(), offset: 0, limit: facts::INLINE_MEMBERS };
         super::ask_later(cx, request, move |answer, cx| {
-            let Ok(Response::Members { members, .. }) = answer else {
+            let Ok(Response::Members { members, pending, .. }) = answer else {
                 return;
             };
             let _ = this.update(cx, |this, cx| {
                 if this.asked == asked {
+                    if pending {
+                        cx.spawn(async move |this, cx| {
+                            cx.background_executor().timer(std::time::Duration::from_millis(250)).await;
+                            let _ = this.update(cx, |this, cx| {
+                                if this.asked == asked { this.ask_members(conversation, asked, cx); }
+                            });
+                        }).detach();
+                        return;
+                    }
                     this.hub.learn(&members);
                     this.hub.watch("info", members.iter().map(|person| person.key.clone()).collect::<Vec<_>>(), cx);
                     this.members = members;
