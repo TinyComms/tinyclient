@@ -1285,6 +1285,49 @@ fn a_dropped_socket_resumes_and_a_refused_token_expires_the_account() {
 }
 
 #[test]
+fn member_viewport_changed_while_offline_is_delivered_after_resume() {
+    let world = World::start();
+    world.tree("4000");
+    let watch = |channel: &str| Watching {
+        space: Some(world.key("4000")),
+        conversation: Some(world.key(channel)),
+        members: Some((0, 50)),
+        ..Watching::default()
+    };
+    let listed = |frame: &Value, channel: &str| frame["d"]["subscriptions"]["4000"]["channels"][channel] == json!([[0, 99]]);
+    world.ask(Request::Watch(watch("4101")));
+    wait("the first viewport", || world.discord.frames_of(37).pop().filter(|frame| listed(frame, "4101")));
+
+    world.discord.control.lock().unwrap().send(Control::Drop).unwrap();
+    wait("the link going down", || (world.link() == Link::Offline).then_some(()));
+    // Queued while there is no socket to write it to.
+    world.ask(Request::Watch(watch("4105")));
+    wait("the link coming back", || (world.link() == Link::Connected).then_some(()));
+    assert_eq!(world.discord.frames_of(6).len(), 1, "the session was resumed");
+
+    // Discord still holds the old viewport, so the new one has to be said on the resumed session.
+    wait("the viewport chosen while offline", || {
+        let frames = world.discord.frames.lock().unwrap();
+        let resumed = frames.iter().position(|frame| frame["op"] == 6)?;
+        frames[resumed + 1..].iter().find(|frame| frame["op"] == 37 && listed(frame, "4105")).cloned()
+    });
+    world.discord.push("GUILD_MEMBER_LIST_UPDATE", json!({
+        "guild_id": "4000",
+        "groups": [{"id": "online", "count": 1}],
+        "ops": [{"op": "SYNC", "range": [0, 99], "items": [
+            {"group": {"id": "online", "count": 1}},
+            {"member": {"user": {"id": "2006", "username": "sam", "global_name": "Sam Whitlock", "discriminator": "0", "avatar": null}, "roles": []}},
+        ]}],
+    }));
+    let filled = wait("the new viewport's members", || {
+        let response = world.ask(Request::Members { conversation: world.key("4105"), offset: 0, limit: 50 });
+        matches!(response, Response::Members { pending: false, .. }).then_some(response)
+    });
+    let Response::Members { members, .. } = filled else { unreachable!() };
+    assert_eq!(members.iter().map(|person| person.name.as_str()).collect::<Vec<_>>(), ["Sam Whitlock"]);
+}
+
+#[test]
 fn the_space_on_screen_is_the_only_one_subscribed() {
     let world = World::start();
     let subscriptions = || world.discord.frames_of(37);
