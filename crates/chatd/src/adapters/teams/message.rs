@@ -136,6 +136,17 @@ fn card_title(card: &Value, depth: u8) -> Option<String> {
     }
 }
 
+/// The shell's `client_id` on a copy of a message we sent. Teams names it `clientmessageid`,
+/// as text or as a number, and the store replaces the pending row only when it comes back on
+/// the message. Someone else's copy, or an id that is already the message's own, is not one.
+fn echoed_client_id(raw: &Value, outgoing: bool, id: &str) -> Option<String> {
+    if !outgoing {
+        return None;
+    }
+    let echoed = id_of(&raw["clientmessageid"]);
+    (!echoed.is_empty() && echoed != id).then_some(echoed)
+}
+
 /// `Event/Call`: `<partlist type="ended" …><part …><duration>125</duration></part></partlist>`.
 fn call_line(content: &str) -> String {
     let longest = inside(content, "duration").iter().filter_map(|text| text.trim().parse::<f64>().ok()).fold(0., f64::max);
@@ -446,6 +457,7 @@ impl Teams {
             message.text = "Unsupported message".to_owned();
             message.kind = MessageKind::Unsupported { link: self.message_link(conversation, &id) };
         }
+        message.client_id = echoed_client_id(raw, message.outgoing, &id);
         Read::Message(Box::new(message))
     }
 
@@ -887,6 +899,18 @@ mod tests {
         let mut media = Vec::new();
         let attached = giphy_gif(&odd, &mut media);
         assert_eq!((attached.thumb.as_ref().map(|thumb| thumb.id.clone()), media.len()), (Some(attached.file.id.clone()), 1));
+    }
+
+    #[test]
+    fn a_copy_of_our_message_keeps_the_client_id_teams_echoes() {
+        let raw = json!({"id": "1760001000000", "clientmessageid": "1760000999000111"});
+        assert_eq!(echoed_client_id(&raw, true, "1760001000000").as_deref(), Some("1760000999000111"));
+        // Teams writes the same id as a number in some payloads.
+        let numbered = json!({"id": "1760001000000", "clientmessageid": 1760000999000111u64});
+        assert_eq!(echoed_client_id(&numbered, true, "1760001000000").as_deref(), Some("1760000999000111"));
+        assert_eq!(echoed_client_id(&raw, false, "1760001000000"), None);
+        let same = json!({"id": "1760001000000", "clientmessageid": "1760001000000"});
+        assert_eq!(echoed_client_id(&same, true, "1760001000000"), None);
     }
 
     #[test]
