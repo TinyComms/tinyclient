@@ -1028,6 +1028,7 @@ dependencies = [
  "dbus",
  "futures",
  "getrandom 0.3.4",
+ "gio",
  "glass_pumpkin",
  "grammers-client",
  "grammers-crypto",

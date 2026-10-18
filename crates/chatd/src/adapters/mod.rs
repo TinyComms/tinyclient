@@ -16,6 +16,7 @@
 //! message edited, deleted or reacted to only by the command the shell's request became.
 
 mod discord;
+mod recovery;
 pub mod net;
 mod script;
 pub mod messages;
@@ -38,7 +39,7 @@ use protocol::{
 };
 use std::collections::{HashMap, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -385,6 +386,7 @@ impl<E: std::fmt::Display> From<E> for Failure {
 #[derive(Default)]
 struct Halt {
     stopped: AtomicBool,
+    recovery: AtomicU64,
     /// Panics caught on this adapter's threads. The first is recovered from; the second stops
     /// the adapter and the account says why.
     panics: AtomicU32,
@@ -415,6 +417,16 @@ impl Context {
         let waiting = lock(&self.stop.waiting);
         drop(self.stop.wake.wait_timeout_while(waiting, time, |_| !self.stopped()));
         self.stopped()
+    }
+
+    fn reconnect_pause(&self, time: Duration, generation: u64) -> ReconnectWait {
+        let waiting = lock(&self.stop.waiting);
+        drop(self.stop.wake.wait_timeout_while(waiting, time, |_| {
+            !self.stopped() && self.stop.recovery.load(Ordering::Relaxed) == generation
+        }));
+        if self.stopped() { ReconnectWait::Stopped }
+        else if self.stop.recovery.load(Ordering::Relaxed) != generation { ReconnectWait::Recovered }
+        else { ReconnectWait::Elapsed }
     }
 
     pub fn key(&self, id: &str) -> Key {
@@ -982,10 +994,14 @@ impl Drops {
 /// A panic inside `connect` is caught here, at the thread's edge: the account goes offline
 /// with [`RECOVERING`] and connects again after [`PANIC_PAUSE`]; a second panic on this
 /// adapter stops it with [`BROKEN`].
-fn keep_connected(ctx: &Context, mut connect: impl FnMut() -> Failure) {
-    let mut pause = Duration::from_secs(1);
+fn keep_connected(ctx: &Context, connect: impl FnMut() -> Failure) {
+    keep_connected_with_backoff(ctx, connect, Duration::from_secs(1));
+}
+
+fn keep_connected_with_backoff(ctx: &Context, mut connect: impl FnMut() -> Failure, mut pause: Duration) {
     let mut drops = Drops::default();
     while !ctx.stopped() {
+        let generation = ctx.stop.recovery.load(Ordering::Relaxed);
         let began = Instant::now();
         let failure = match catch_unwind(AssertUnwindSafe(&mut connect)) {
             Ok(failure) => failure,
@@ -1022,11 +1038,26 @@ fn keep_connected(ctx: &Context, mut connect: impl FnMut() -> Failure) {
         ctx.hub.set_offline(&ctx.account, pause <= RECONNECTING);
         // Not on the second: many clients retrying in step is what a network watches for.
         let jitter = pause.mul_f64(0.25 * f64::from(now().unsigned_abs() as u32 % 1000) / 1000.);
-        if ctx.pause(pause + jitter) {
-            return;
+        match ctx.reconnect_pause(pause + jitter, generation) {
+            ReconnectWait::Stopped => return,
+            ReconnectWait::Elapsed => {},
+            ReconnectWait::Recovered => {
+                // A changed route or resume is a reason to try, not proof that
+                // the remote service is reachable. Failures still back off.
+                drops = Drops::default();
+                pause = Duration::from_secs(1);
+                ctx.hub.set_offline(&ctx.account, true);
+                eprintln!("chatd: {}: network changed or system resumed; retrying connection", ctx.account.network.label());
+                // Consume bursts on the next iteration and never attempt more
+                // often than once per second, even if hints keep arriving.
+                if ctx.pause(Duration::from_secs(1).saturating_sub(began.elapsed())) { return; }
+            },
         }
     }
 }
+
+#[derive(Debug, PartialEq, Eq)]
+enum ReconnectWait { Elapsed, Recovered, Stopped }
 
 /// A retry this close is "reconnecting"; one further off is plain offline.
 const RECONNECTING: Duration = Duration::from_secs(30);
@@ -1155,6 +1186,7 @@ pub fn without(network: Network, session: &str, account: &str) -> Option<String>
 /// Starts the adapter for an account from its part of the session.
 pub fn start(account: AccountKey, session: &str, hub: Arc<Hub>) -> Result<Adapter, String> {
     let stop = Arc::new(Halt::default());
+    recovery::watch(&stop);
     let (commands, inbox): (Sender<Command>, Receiver<Command>) = channel();
     let ctx = Context {
         account: account.clone(),
@@ -1198,6 +1230,71 @@ pub(crate) fn local(account: AccountKey, hub: Arc<Hub>) -> (Adapter, Context, Re
 mod tests {
     use super::*;
     use crate::store::Store;
+
+    #[test]
+    fn recovery_interrupts_a_fifteen_minute_reconnect_wait_without_rapid_attempts() {
+        let hub = hub();
+        let account = AccountKey { network: Network::Signal, account: "recovery".into() };
+        let (_adapter, ctx, _inbox) = local(account.clone(), hub.clone());
+        ctx.link(Link::Connected);
+        let (attempted, attempts) = channel();
+        let thread_ctx = ctx.clone();
+        let thread = std::thread::spawn(move || {
+            let mut count = 0;
+            keep_connected_with_backoff(&thread_ctx, || {
+                count += 1;
+                attempted.send(Instant::now()).unwrap();
+                if count == 1 { Failure::Dropped("offline".into()) }
+                else { Failure::SignedOut("test finished".into()) }
+            }, Duration::from_secs(900));
+        });
+        let first = attempts.recv_timeout(Duration::from_secs(2)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while linked(&hub, &account).0 != Link::Offline {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        for _ in 0..100 { recovery::hint(&ctx.stop); }
+        let next = attempts.recv_timeout(Duration::from_secs(2)).expect("recovery must not wait out the 900 s delay");
+        assert!(next.duration_since(first) >= Duration::from_secs(1), "hints cannot create a rapid retry loop");
+        thread.join().unwrap();
+        assert_eq!(linked(&hub, &account).0, Link::Expired);
+        recovery::hint(&ctx.stop);
+        assert!(attempts.try_recv().is_err(), "an expired session is never retried by a hint");
+    }
+
+    #[test]
+    fn recovery_during_a_failed_connect_is_not_lost_before_the_wait() {
+        let (_adapter, ctx, _inbox) = local(AccountKey { network: Network::Signal, account: "during".into() }, hub());
+        let generation = ctx.stop.recovery.load(Ordering::Relaxed);
+        recovery::hint(&ctx.stop);
+        assert_eq!(ctx.reconnect_pause(Duration::from_secs(900), generation), ReconnectWait::Recovered);
+        let generation = ctx.stop.recovery.load(Ordering::Relaxed);
+        assert_eq!(ctx.reconnect_pause(Duration::ZERO, generation), ReconnectWait::Elapsed, "a consumed hint does not wake every later wait");
+    }
+
+    #[test]
+    fn stopping_an_adapter_interrupts_its_reconnect_wait() {
+        let (adapter, ctx, _inbox) = local(AccountKey { network: Network::Signal, account: "stop".into() }, hub());
+        let thread = std::thread::spawn(move || ctx.reconnect_pause(Duration::from_secs(900), 0));
+        drop(adapter);
+        assert_eq!(thread.join().unwrap(), ReconnectWait::Stopped);
+    }
+
+    #[test]
+    fn recovery_hints_do_not_bypass_http_or_command_pacing() {
+        let (_adapter, ctx, _inbox) = local(AccountKey { network: Network::Signal, account: "pacing".into() }, hub());
+        let thread_ctx = ctx.clone();
+        let (done, finished) = channel();
+        let thread = std::thread::spawn(move || {
+            assert!(!thread_ctx.pause(Duration::from_millis(150)));
+            done.send(()).unwrap();
+        });
+        recovery::hint(&ctx.stop);
+        assert!(finished.recv_timeout(Duration::from_millis(50)).is_err());
+        finished.recv_timeout(Duration::from_secs(2)).unwrap();
+        thread.join().unwrap();
+    }
 
     fn hub() -> Arc<Hub> {
         Arc::new(Hub::new(Store::open(std::path::Path::new(":memory:")).expect("a store in memory")))
