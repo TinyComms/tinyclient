@@ -625,6 +625,15 @@ impl Discord {
         self.ctx.conversation(&row)
     }
 
+    /// Who we are, from READY or a change to it: the account's name, and our own row in People,
+    /// which is where the account's picture is read from. The row goes first, so the status
+    /// the name announces already has the picture.
+    pub(super) fn myself(&self, user: &User) -> rusqlite::Result<()> {
+        self.ctx.media(&[user.avatar()])?;
+        self.ctx.people(&[user.person(None)])?;
+        self.ctx.describe(user.name(), &user.id)
+    }
+
     /// The user's server folders as JSON settings or protobuf ones carry them. Only a folder with
     /// an id is one; a server alone in a nameless one is simply not in a folder.
     fn folders(ready: &Ready) -> Option<Vec<proto::GuildFolder>> {
@@ -704,7 +713,7 @@ impl Discord {
     /// Takes READY apart into the store. Only [`super::State`] outlives this call.
     pub(super) fn ready(&self, ready: Ready) -> Result<(), Failure> {
         let me = ready.user.id.clone();
-        self.ctx.describe(ready.user.name(), &me)?;
+        self.myself(&ready.user)?;
         self.capabilities(ready.user.premium_type);
         let order = Self::order(&ready);
         let folders = Self::folders(&ready);
