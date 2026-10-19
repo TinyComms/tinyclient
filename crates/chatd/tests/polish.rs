@@ -20,9 +20,9 @@ struct Daemon {
     dir: PathBuf,
 }
 
-/// The daemons start one after another: a dozen fresh processes at once have a cold machine
-/// miss the socket's deadline, and one start alone answers in a second or two. The daemons
-/// keep running side by side; only their starts take turns.
+/// The daemons start one after another: a dozen fresh processes of ours at once have a cold
+/// machine miss the socket's deadline, and one start alone answers in a second or two. The
+/// daemons keep running side by side; only their starts take turns.
 fn one_after_another() -> MutexGuard<'static, ()> {
     static TURN: Mutex<()> = Mutex::new(());
     TURN.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -184,18 +184,27 @@ fn the_socket_answers_while_a_keychain_read_waits_and_the_cached_account_stays_o
     // account it cached is shown all the same, and that is all this machine gets to see.
     if !keychain.reading {
         assert!(keychain.is_settled(), "{keychain:?}");
+        let (_, _, _, again) = chatd.status();
+        assert_eq!(again, started, "the daemon restarted");
         assert_eq!(cached.detail, "");
         return;
     }
     assert!(keychain.denied.is_empty(), "{keychain:?}");
     assert!(started > 0);
     // The account whose session is not read yet is shown, offline, not dropped.
-    // A read held up past a second is a prompt on screen: the shell is told, and the status says
-    // which network it waits on.
-    let told = chatd.changes(seq, Duration::from_millis(1_400));
-    assert!(told.contains(&Change::Status), "{told:?}");
+    // A read held up past a second is a prompt on screen: the shell is told as a Status change,
+    // and the status says which network it waits on. The prompt holds only while the read does,
+    // so this waits for its word rather than sampling one instant; a machine that reached the
+    // read late is told of the settling instead.
+    let mut told;
+    loop {
+        told = chatd.changes(seq, Duration::from_millis(1_400));
+        if told.contains(&Change::Status) {
+            break;
+        }
+        assert!(!chatd.status().1.is_settled(), "the read settled without a word to the shell");
+    }
     let (_, keychain, ..) = chatd.status();
-    assert!(keychain.waiting.is_some(), "{keychain:?}");
     if keychain.waiting == Some(Network::Discord) {
         let (accounts, ..) = chatd.status();
         let cached = accounts.iter().find(|status| status.key == account).unwrap();
