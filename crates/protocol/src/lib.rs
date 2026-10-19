@@ -981,14 +981,17 @@ pub enum Request {
         limit: u32,
     },
     /// Cached messages whose text contains `query`, newest first. `conversation` narrows to one
-    /// conversation, `network` to one network. Hidden conversations and message requests stay
-    /// out of it, as they stay out of everything that counts. From the cache alone: what a
-    /// network itself finds lands as it answers, and is a later step.
+    /// conversation, `network` to one network, `space` to one Space's conversations. Hidden
+    /// conversations and message requests stay out of it, as they stay out of everything that
+    /// counts. From the cache alone: what a network itself finds lands as it answers, and is a
+    /// later step.
     SearchMessages {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         conversation: Option<Key>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         network: Option<Network>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        space: Option<Key>,
         query: String,
         limit: u32,
     },
@@ -1743,19 +1746,20 @@ mod tests {
     #[test]
     fn a_message_search_and_its_hits_read_off_the_wire() {
         let ask: Request = serde_json::from_str(r#"{"op":"search_messages","query":"lichen","limit":20}"#).unwrap();
-        let Request::SearchMessages { conversation, network, query, limit } = &ask else {
+        let Request::SearchMessages { conversation, network, space, query, limit } = &ask else {
             panic!("not a search")
         };
-        assert!(conversation.is_none() && network.is_none() && query == "lichen" && *limit == 20);
+        assert!(conversation.is_none() && network.is_none() && space.is_none() && query == "lichen" && *limit == 20);
         let with_filters = Request::SearchMessages {
             conversation: Some(Key { network: Network::Slack, account: "T1".into(), id: "C1".into() }),
             network: Some(Network::Slack),
+            space: Some(Key { network: Network::Slack, account: "T1".into(), id: "S1".into() }),
             query: "lichen".into(),
             limit: 20,
         };
         assert_eq!(
             serde_json::to_string(&with_filters).unwrap(),
-            r#"{"op":"search_messages","conversation":{"network":"slack","account":"T1","id":"C1"},"network":"slack","query":"lichen","limit":20}"#
+            r#"{"op":"search_messages","conversation":{"network":"slack","account":"T1","id":"C1"},"network":"slack","space":{"network":"slack","account":"T1","id":"S1"},"query":"lichen","limit":20}"#
         );
         let hit = MessageHit {
             conversation: Key { network: Network::Discord, account: "1".into(), id: "C2".into() },

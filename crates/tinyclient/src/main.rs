@@ -65,7 +65,7 @@ fn print_status() -> io::Result<()> {
 
 /// The shell without a window: what a search of the cache finds, as lines.
 fn print_search(query: &str) -> io::Result<()> {
-    let request = Request::SearchMessages { conversation: None, network: None, query: query.to_owned(), limit: PAGE_LIMIT };
+    let request = Request::SearchMessages { conversation: None, network: None, space: None, query: query.to_owned(), limit: PAGE_LIMIT };
     let hits = match ask(&request)? {
         Response::MessageHits { hits } => hits,
         other => return Err(unexpected(other)),

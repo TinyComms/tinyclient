@@ -58,7 +58,7 @@ pub struct Slots {
     /// `typing…` in place of a direct row's preview, while someone is.
     pub typing: Option<fn(&Shell, &Key) -> Option<SharedString>>,
     /// The switcher's last row: search messages for these words.
-    pub search: Option<fn(&mut Shell, String, &mut Context<Shell>)>,
+    pub search: Option<fn(&mut Shell, String, &mut Window, &mut Context<Shell>)>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -67,8 +67,7 @@ pub enum RightKind {
     Members,
     /// One person: who they are and what was shared with them.
     Info,
-    // For the search results, which are not built yet.
-    #[allow(dead_code)]
+    /// The search pane: the field, its scopes, the cache's hits.
     Search,
 }
 

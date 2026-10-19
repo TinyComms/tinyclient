@@ -111,6 +111,8 @@ impl Shell {
             .on_action(cx.listener(|this, _: &FocusPrevious, window, cx| this.focus_region(false, window, cx)))
             .on_key_down(cx.listener(Self::typed))
             .on_action(cx.listener(|this, _: &CloseRight, _, cx| this.close_right(cx)))
+            .on_action(cx.listener(|this, _: &SearchConversation, window, cx| this.search_here(window, cx)))
+            .on_action(cx.listener(|this, _: &SearchEverywhere, window, cx| this.search_everywhere(window, cx)))
             .on_action(cx.listener(|this, _: &CloseTop, window, cx| {
                 // With no layer to close, Escape belongs to the conversation.
                 if !this.close_top(window, cx) {

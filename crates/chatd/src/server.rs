@@ -1411,11 +1411,11 @@ impl Chat {
                     Err(err) => internal(err),
                 }
             }
-            Request::SearchMessages { conversation, network, query, limit } => {
+            Request::SearchMessages { conversation, network, space, query, limit } => {
                 let query = query.trim();
                 let found = match query.is_empty() {
                     true => Ok(Vec::new()),
-                    false => self.hub.store().search_messages(conversation.as_ref(), network, query, limit.min(PAGE_LIMIT)),
+                    false => self.hub.store().search_messages(conversation.as_ref(), network, space.as_ref(), query, limit.min(PAGE_LIMIT)),
                 };
                 match found {
                     Ok(hits) => Response::MessageHits { hits },
