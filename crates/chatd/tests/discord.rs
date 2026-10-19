@@ -530,6 +530,19 @@ fn mediad() -> PathBuf {
     chatd.with_file_name(format!("mediad{}", std::env::consts::EXE_SUFFIX))
 }
 
+/// A child that is over at once, for the `World` field until the real chatd is spawned.
+#[cfg(windows)]
+fn placeholder() -> Command {
+    let mut done = Command::new("cmd");
+    done.args(["/C", "exit 0"]);
+    done
+}
+
+#[cfg(not(windows))]
+fn placeholder() -> Command {
+    Command::new("true")
+}
+
 /// The fake Discord and a real chatd pointed at it.
 struct World {
     child: Child,
@@ -621,9 +634,10 @@ impl World {
 
         prepare(&shared);
         let env = env.iter().map(|(name, value)| ((*name).to_owned(), value.replace("{{API}}", &api))).collect();
-        // A placeholder child until the real one is spawned from the finished world.
+        // A placeholder child until the real one is spawned from the finished world. `true` is
+        // Unix's; Windows takes its own no-op.
         let mut world = World {
-            child: Command::new("true").spawn().unwrap(),
+            child: placeholder().spawn().unwrap(),
             dir,
             discord: shared,
             api,
