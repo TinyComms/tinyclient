@@ -297,7 +297,7 @@ impl Blobs {
     // yet; until it can (a `Request::PickerClosed { account }`, or `Watching.picker`), a picker
     // counts as closed after `PICK_IDLE` with no `Fetch` of a preview.
     pub fn picker_closed(&self, account: &AccountKey) {
-        self.cache.close_picker(account);
+        self.cache.close_picker(account, false);
     }
 
     /// Brings the cache back under its cap. Runs after a fetch lands and at start.
@@ -488,7 +488,7 @@ impl Cache {
             if !closed.is_empty() {
                 drop(queue);
                 for account in &closed {
-                    self.close_picker(account);
+                    self.close_picker(account, true);
                 }
                 queue = crate::hub::lock(&self.queue);
                 continue;
@@ -501,10 +501,15 @@ impl Cache {
         }
     }
 
-    /// A picker closed: its previews go, on disk and in the store, and none waits to be fetched.
-    fn close_picker(&self, account: &AccountKey) {
+    /// A picker closed: its previews go, on disk and in the store, and none waits to be
+    /// fetched. The sweeper asks `only_if_idle`: an ask that re-registered the picker while
+    /// the sweep was waking keeps its registration, its jobs, and its files.
+    fn close_picker(&self, account: &AccountKey, only_if_idle: bool) {
         {
             let mut queue = crate::hub::lock(&self.queue);
+            if only_if_idle && !queue.picked.get(account).is_none_or(|asked| asked.elapsed() >= self.pick_idle) {
+                return;
+            }
             queue.picked.remove(account);
             let gone = |file: &FileKey| file.0 == *account && is_pick(&file.1);
             queue.waiting.retain(|job| !gone(&job.file));
@@ -810,6 +815,11 @@ impl Cache {
                 // The picker closed and took its directory while this arrived: nobody wants it.
                 if is_pick(id) && !self.picking(account) {
                     return None;
+                }
+                // A picker reopened as the sweep took its directory: the second pass makes
+                // the directory again and fetches once more.
+                if is_pick(id) && !last && err.kind() == std::io::ErrorKind::NotFound {
+                    continue;
                 }
                 return failed(&file, format!("The file could not be kept: {err}."));
             }

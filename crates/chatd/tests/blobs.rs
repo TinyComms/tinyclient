@@ -633,8 +633,9 @@ fn picker_previews_live_in_their_own_directory_and_go_when_the_picker_closes() {
         (file(&still, MediaKind::Image), files.url("/bytes/4000")),
         (file("emoji-1", MediaKind::Emoji), files.url("/bytes/500")),
     ];
-    // A picker counts as closed after 2 s without asking.
-    let chatd = Daemon::start(&registered, &[("TINYCLIENT_PICK_IDLE", "2")]);
+    // A picker counts as closed after 5 s without asking. Roomy, so a slow or cold machine
+    // cannot overtake the last section, where a preview is asked for again.
+    let chatd = Daemon::start(&registered, &[("TINYCLIENT_PICK_IDLE", "5")]);
     let pick_dir = chatd.dir.join("media/discord/pick/42");
     let landed = [chatd.fetched(&sticker), chatd.fetched(&still)];
     for file in &landed {

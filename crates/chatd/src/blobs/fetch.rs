@@ -257,6 +257,13 @@ fn get(hosts: &Hosts, agent: &ureq::Agent, want: &Want, from: &Download, buffer:
         return Err(too_large());
     }
     let broken = |err: std::io::Error| Failed::Other(format!("The download failed: {err}."));
+    // A picker's sweep may have taken the directory while this address was being asked for:
+    // it is made again, so the part file has where to go.
+    if let Some(dir) = want.part.parent() {
+        if let Err(err) = std::fs::create_dir_all(dir) {
+            return Err(Failed::Other(format!("The cache directory could not be made: {err}.")));
+        }
+    }
     let mut out = File::create(want.part).map_err(broken)?;
     let mut reader = response.body_mut().as_reader();
     let mut total = 0u64;
