@@ -69,10 +69,9 @@ pub(in crate::gui) fn with_memory(mut text: String) -> String {
     text
 }
 
+/// A helper's trimmed output. Without a console, so Copy diagnostics flashes no window on Windows.
 fn command_out(program: &str, args: &[&str]) -> Option<String> {
-    std::process::Command::new(program)
-        .args(args)
-        .stderr(std::process::Stdio::null())
+    protocol::launch::no_console(std::process::Command::new(program).args(args).stderr(std::process::Stdio::null()))
         .output()
         .ok()
         .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
@@ -81,23 +80,24 @@ fn command_out(program: &str, args: &[&str]) -> Option<String> {
 
 /// The operating system line in copied diagnostics. macOS from `sw_vers`, Linux from
 /// os-release, Windows from `ver`.
+#[cfg(target_os = "macos")]
 fn os_version() -> Option<String> {
-    #[cfg(target_os = "macos")]
-    {
-        return command_out("/usr/bin/sw_vers", &["-productVersion"]).map(|version| format!("macOS {version}"));
-    }
-    #[cfg(target_os = "linux")]
-    {
-        return crate::host::os_release_name();
-    }
-    #[cfg(windows)]
-    {
-        return command_out("cmd", &["/C", "ver"]);
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-    {
-        None
-    }
+    command_out("/usr/bin/sw_vers", &["-productVersion"]).map(|version| format!("macOS {version}"))
+}
+
+#[cfg(target_os = "linux")]
+fn os_version() -> Option<String> {
+    Some(crate::host::os_release_name())
+}
+
+#[cfg(windows)]
+fn os_version() -> Option<String> {
+    command_out("cmd", &["/C", "ver"])
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+fn os_version() -> Option<String> {
+    None
 }
 
 fn unix_now() -> i64 {

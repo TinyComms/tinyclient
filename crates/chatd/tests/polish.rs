@@ -182,7 +182,7 @@ fn the_socket_answers_while_a_keychain_read_waits_and_the_cached_account_stays_o
     if keychain.waiting == Some(Network::Discord) {
         let (accounts, ..) = chatd.status();
         let cached = accounts.iter().find(|status| status.key == account).unwrap();
-        assert_eq!(cached.detail, "Waiting for permission to read your sign-in from the keychain.");
+        assert_eq!(cached.detail, chatd::session::STORE_WAITING);
     }
     // Requests are served while it waits.
     assert!(matches!(chatd.ask(Request::Inbox { network: None, filter: InboxFilter::All, offset: 0, limit: 10 }), Response::Conversations { .. }));

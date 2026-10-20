@@ -429,10 +429,8 @@ impl Chat {
                 let network = row.key.network;
                 let unread_session = match linked {
                     Some(_) => None,
-                    None if keychain.denied.contains(&network) => {
-                        Some("tinyclient can't read your sign-in from the keychain. You are still signed in.")
-                    }
-                    None if keychain.waiting == Some(network) => Some("Waiting for permission to read your sign-in from the keychain."),
+                    None if keychain.denied.contains(&network) => Some(session::STORE_REFUSED),
+                    None if keychain.waiting == Some(network) => Some(session::STORE_WAITING),
                     None if pending.contains(&network) => Some(""),
                     None => None,
                 };
@@ -1274,7 +1272,7 @@ impl Chat {
             session::Stored::Found(session) => Some(session),
             session::Stored::Absent => None,
             // Forgetting the item now would sign out every other account it holds.
-            session::Stored::Unreadable(why) => return error(ErrorCode::Internal, format!("The keychain did not hand over the session: {why}")),
+            session::Stored::Unreadable(why) => return error(ErrorCode::Internal, format!("The session could not be read from {}: {why}", session::STORE)),
         };
         let left = stored.and_then(|session| adapters::without(account.network, &session, &account.account));
         match left {

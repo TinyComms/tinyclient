@@ -81,7 +81,7 @@ pub const NOT_YET: &[(&str, &str)] = &[
     ("banner", "tinyclient does not post notifications yet."),
     ("do not disturb", "tinyclient does not post notifications yet. Do Not Disturb you set in Slack or Discord is shown on your status."),
     ("quiet hours", "tinyclient does not post notifications yet."),
-    ("badge", "tinyclient has no Dock badge setting yet."),
+    ("badge", crate::host::NO_BADGE),
     ("ringtone", "tinyclient has no ring sound yet; calls ring in the window."),
     ("login", "tinyclient has no open-at-login setting yet."),
     ("startup", "tinyclient has no open-at-login setting yet."),
@@ -94,7 +94,7 @@ pub const NOT_YET: &[(&str, &str)] = &[
     ("touch id", "tinyclient has no lock yet."),
     ("camera", "tinyclient has no camera yet."),
     ("push to talk", "tinyclient has no push to talk yet."),
-    ("menu bar", "tinyclient has no menu bar icon yet."),
+    ("menu bar", crate::host::NO_TRAY_ICON),
     ("accent", "tinyclient keeps one accent colour."),
     ("font", "tinyclient keeps the system font. Text size is in Appearance."),
     ("language", crate::host::FOLLOWS_LANGUAGE),
@@ -236,9 +236,17 @@ pub const SHORTCUTS: &[Shortcut] = &[
     key("Calls", "Go to the call", "⇧⌘J"),
 ];
 
+/// Hiding an application is macOS's: GPUI ignores it on Linux and panics at Hide Others on
+/// Windows, so these keys are bound and listed on macOS only (`menubar::bind_keys`).
+const MAC_ONLY: &[&str] = &["Hide tinyclient", "Hide Others"];
+
 pub fn shortcuts(query: &str) -> Vec<&'static Shortcut> {
     let query = fold(query.trim());
-    SHORTCUTS.iter().filter(|s| query.is_empty() || at_word_start(s.command, &query) || at_word_start(s.menu, &query)).collect()
+    SHORTCUTS
+        .iter()
+        .filter(|s| cfg!(target_os = "macos") || !MAC_ONLY.contains(&s.command))
+        .filter(|s| query.is_empty() || at_word_start(s.command, &query) || at_word_start(s.menu, &query))
+        .collect()
 }
 
 #[cfg(test)]
@@ -296,6 +304,14 @@ mod tests {
             let rows = ROWS.iter().filter(|row| row.section == section).count();
             assert_eq!(rows == 0, matches!(section, Section::Accounts | Section::Shortcuts), "{section:?}");
         }
+    }
+
+    #[test]
+    fn hiding_the_app_is_listed_only_where_it_does_something() {
+        let listed = shortcuts("").iter().filter(|s| MAC_ONLY.contains(&s.command)).count();
+        assert_eq!(listed, if cfg!(target_os = "macos") { MAC_ONLY.len() } else { 0 });
+        assert!(shortcuts("").iter().any(|s| s.command == "Quit tinyclient"));
+        assert_eq!(shortcuts("hide others").is_empty(), !cfg!(target_os = "macos"));
     }
 
     #[test]

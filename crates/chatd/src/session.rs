@@ -68,9 +68,43 @@ pub fn enabled() -> bool {
     std::env::var_os("TINYCLIENT_DIR").is_none()
 }
 
+/// The store sign-ins are kept in, named the way this system names it.
+pub const STORE: &str = if cfg!(target_os = "macos") {
+    "the keychain"
+} else if cfg!(windows) {
+    "Credential Manager"
+} else {
+    "the system keyring"
+};
+
 /// Said instead of reading or saving when this build's keyring keeps nothing past the process
 /// (its in-memory mock, chosen when no system store was compiled in) or past a reboot.
-pub const NO_STORE: &str = "This copy of tinyclient has no keychain to keep sign-ins in, so it signs nobody in. Install a build for this system.";
+pub const NO_STORE: &str = if cfg!(target_os = "macos") {
+    "This copy of tinyclient has no keychain to keep sign-ins in, so it signs nobody in. Install a build for this system."
+} else if cfg!(windows) {
+    "This copy of tinyclient cannot keep sign-ins in Credential Manager, so it signs nobody in. Install a build for this system."
+} else {
+    "This copy of tinyclient has no system keyring to keep sign-ins in, so it signs nobody in. Install a build for this system."
+};
+
+/// An account's line while its session is read for over a second. macOS and the Secret Service
+/// may be asking the person; Credential Manager never asks, so on Windows the read is only slow.
+pub const STORE_WAITING: &str = if cfg!(target_os = "macos") {
+    "Waiting for permission to read your sign-in from the keychain."
+} else if cfg!(windows) {
+    "Still reading your sign-in from Credential Manager."
+} else {
+    "Waiting for permission to read your sign-in from the system keyring."
+};
+
+/// An account's line when its session could not be read.
+pub const STORE_REFUSED: &str = if cfg!(target_os = "macos") {
+    "tinyclient can't read your sign-in from the keychain. You are still signed in."
+} else if cfg!(windows) {
+    "tinyclient can't read your sign-in from Credential Manager. You are still signed in."
+} else {
+    "tinyclient can't read your sign-in from the system keyring. You are still signed in."
+};
 
 /// Whether sign-ins are kept until deleted: the macOS keychain, the Windows credential store,
 /// the Secret Service on Linux. Asked once.
@@ -305,6 +339,24 @@ mod tests {
         // A build without a system store falls back to keyring's mock: it would find no
         // sessions and say nothing. `persistent` is what makes chatd refuse instead.
         assert!(super::persistent());
-        assert!(super::NO_STORE.ends_with('.') && !super::NO_STORE.contains("keyring"));
+        assert!(super::NO_STORE.ends_with('.') && super::NO_STORE.contains(super::STORE.trim_start_matches("the ")));
+    }
+
+    #[test]
+    fn each_system_names_its_own_store() {
+        use super::{NO_STORE, STORE, STORE_REFUSED, STORE_WAITING};
+        assert!(STORE_REFUSED.contains(STORE) && STORE_REFUSED.ends_with("You are still signed in."));
+        assert!(STORE_WAITING.contains(STORE));
+        if cfg!(target_os = "macos") {
+            assert_eq!(STORE_WAITING, "Waiting for permission to read your sign-in from the keychain.");
+        } else {
+            for words in [STORE, NO_STORE, STORE_WAITING, STORE_REFUSED] {
+                assert!(!words.contains("keychain"), "{words}");
+            }
+        }
+        if cfg!(windows) {
+            // Credential Manager puts up no prompt to wait on.
+            assert_eq!(STORE_WAITING, "Still reading your sign-in from Credential Manager.");
+        }
     }
 }

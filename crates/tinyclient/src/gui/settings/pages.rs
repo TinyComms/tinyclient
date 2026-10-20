@@ -154,7 +154,7 @@ impl SettingsWindow {
             ],
             Section::Appearance => vec![
                 self.group(&["A2", "A3", "A4"], None, window, cx)
-                    .child(caption("Text size is also ⌘+, ⌘− and ⌘0. Reduce Motion follows System Settings.")),
+                    .child(caption(crate::host::APPEARANCE_CAPTION)),
             ],
             Section::Messages => vec![self.group(&["M1", "M2", "M3", "M4", "M5"], None, window, cx)],
             Section::Privacy => {
@@ -991,7 +991,7 @@ impl SettingsWindow {
     pub(super) fn shortcuts(&self, query: &str) -> Div {
         let mut column = div().flex().flex_col();
         if query.is_empty() {
-            column = column.child(caption("To change a shortcut, add it in System Settings › Keyboard › Keyboard Shortcuts › App Shortcuts. The call keys are in no menu, so they cannot be changed there.").pt(px(0.)).pb(px(14.)));
+            column = column.child(caption(crate::host::SHORTCUTS_CAPTION).pt(px(0.)).pb(px(14.)));
         }
         let found = rows::shortcuts(query);
         let mut menus: Vec<&str> = Vec::new();

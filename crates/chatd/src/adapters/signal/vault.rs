@@ -135,7 +135,7 @@ impl Vault {
         let vault = Vault(Arc::new(Inner { db: Mutex::new(db), cipher, path: path.to_owned() }));
         // A key that does not open what is there is the wrong key: say so now, not mid-message.
         if let Some(name) = vault.first_name().map_err(|err| err.0)? {
-            vault.get(&name).map_err(|_| "the Signal state does not open with the key in the keychain".to_owned())?;
+            vault.get(&name).map_err(|_| format!("the Signal state does not open with the key in {}", crate::session::STORE))?;
         }
         Ok(vault)
     }
