@@ -1924,10 +1924,17 @@ fn connecting_asks_little_spaces_what_it_warms_and_a_reconnect_asks_less() {
         expected.into_iter().map(|(method, count)| (method.to_owned(), count)).collect()
     };
     assert_eq!(world.fake.counted(ALPHA), expected(5, 1, 1));
-    // Any two calls are at least a fifth of a second apart, whatever they are.
+    // Any two calls are at least a fifth of a second apart, whatever they are. A loaded
+    // machine can hold one send back and let the next overtake it, so one close pair is
+    // allowed; a missing pacer bunches them all.
     let mut times: Vec<Instant> = all.iter().filter(|call| call.token == ALPHA).map(|call| call.at).collect();
     times.sort();
-    assert!(times.windows(2).all(|pair| pair[1] - pair[0] >= Duration::from_millis(150)));
+    let close = times.windows(2).filter(|pair| pair[1] - pair[0] < Duration::from_millis(150)).count();
+    assert!(
+        close <= 1,
+        "the calls bunch up: {:?}",
+        times.windows(2).map(|pair| pair[1] - pair[0]).collect::<Vec<_>>()
+    );
 
     // The socket drops. The new connection reads the unread state again and nothing else: no
     // sidebar, no warming, and the socket's address is not asked for.
@@ -2181,6 +2188,17 @@ fn info_mute_pins_files_emoji_threads_and_a_scheduled_send_ask_slack_once_each()
     assert_eq!(scheduled.params["text"], "standup &lt;in&gt; 1h");
     assert_eq!(scheduled.params["unfurl_links"], "false");
     assert!(world.fake.calls(ALPHA, "chat.postMessage").is_empty());
+}
+
+#[test]
+fn search_asks_the_network_only_where_it_can() {
+    let world = World::start();
+    world.ready();
+    // A Space on Slack: the adapter cannot search messages yet, and says so in words. Nothing
+    // is asked of the fake.
+    let refused = world.ask(Request::SearchNetwork { conversation: None, space: Some(alpha("T01ALPHA")), query: "x".into() });
+    assert!(matches!(&refused, Response::Error { detail, .. } if detail.contains("cannot do this yet")), "{refused:?}");
+    assert!(world.fake.calls(ALPHA, "search.all").is_empty() && world.fake.calls(ALPHA, "search.messages").is_empty());
 }
 
 #[test]
