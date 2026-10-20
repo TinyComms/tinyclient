@@ -76,13 +76,14 @@ Current release: [v0.2.5](https://github.com/itz4blitz/tinyclient/releases/tag/v
 A few behaviours that are easy to miss:
 
 - **Animated images.** GIFs, animated WebP, and APNG play where pictures are drawn. Settings, under Messages, chooses when they play. A Slack GIF uses Slack's moving copy. A Teams GIF from the Giphy button is a GIF.
+- **Voice messages play**, with their waveform, at 1× to 2× — Telegram's and Discord's, through `mediad --play`, one at a time.
 - **Discord's server list** waits until chats have loaded before it shows cached servers, so a cold start does not flash an empty or stale tree.
 - **Signal's Note to Self.** A cached self-conversation is relabelled when the account reconnects. Its messages stay.
-- **Search.** `tinyclient --text --search` searches message text in the local cache, newest hits first. The switcher still finds conversations by title. The window does not show those hits yet, and the networks themselves are not asked.
+- **Search.** `tinyclient --text --search` searches message text in the local cache, newest hits first. The switcher still finds conversations by title, and its "Search messages" row opens a pane of those hits, where clicking one opens its conversation on that message. The networks themselves are not asked.
 - **Terminal.** `tinyclient --text`, or any build without the `gui` feature, prints account status and the inbox as lines of text. An interactive terminal UI is not built. The socket protocol is enough to write one.
 - **Platforms.** CI builds and tests macOS, Linux, and Windows on every push (`.github/workflows/ci.yml`). Most development happens on macOS, so reports and fixes from Linux and Windows are especially welcome. The main window closes cleanly on all three. Linux web sign-in, including Discord's session capture, works with WebKitGTK.
 
-Still not built, and not covered by an open pull request: message search in the window, notifications and a dock badge, voice messages, Signal attachments and safety numbers, Teams personal accounts, and video or screen share (see [work in progress](#work-in-progress) for the Discord slice that is underway).
+Still not built, and not covered by an open pull request: notifications and a dock badge, Signal attachments and safety numbers, Teams personal accounts, and video or screen share (see [work in progress](#work-in-progress) for the Discord slice that is underway).
 
 ## Work in progress
 
