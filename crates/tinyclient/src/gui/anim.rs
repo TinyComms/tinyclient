@@ -3,9 +3,11 @@
 //! user's autoplay setting and the system's Reduce Motion allow. Nothing asks for a frame at the
 //! display's rate: one timer per window wakes it when the next frame of any playing picture is
 //! due, so a 10 fps GIF draws the window 10 times a second and a paused one never. A file's
-//! faster frames are skipped rather than drawn, at most [`FASTEST`] apart, and the wake notifies
-//! only the views whose pictures are due rather than refreshing the window, which would draw
-//! even a view embedded with `.cached` again.
+//! faster frames are skipped rather than drawn, and the timer wakes the window at most once
+//! every [`FASTEST`], however many pictures play. The wake notifies only the views whose
+//! pictures are due rather than refreshing the window, which would draw even a view embedded
+//! with `.cached` again; the window's root alone is refreshed, as notifying it would also run
+//! whatever observes it.
 //!
 //! Decoded frames are paid for from one of two [`Budget`]s, so pictures in messages and
 //! avatars cannot crowd each other out and neither grows without end.
@@ -177,7 +179,7 @@ thread_local! {
     static WAKES: RefCell<HashMap<WindowId, Wake>> = RefCell::new(HashMap::new());
 }
 
-/// The shortest time between two draws of a moving picture: about 30 a second. Many GIFs ask
+/// The shortest time between two draws for moving pictures: about 30 a second. Many GIFs ask
 /// for 20 ms frames; their time is kept and the frames between are skipped, so they play at
 /// their speed for a third of the draws.
 const FASTEST: Duration = Duration::from_millis(33);
@@ -187,34 +189,61 @@ fn next_draw(next: Duration) -> Duration {
     next.max(FASTEST)
 }
 
-/// A window's timer: when it fires, and the task that waits for it.
+/// A window's timer: when it fires and for which views, and the task that waits for it.
 struct Wake {
     due: Due<EntityId>,
-    timer: Option<(Instant, Task<()>)>,
+    task: Option<Task<()>>,
 }
 
-/// When each view showing a playing picture wants drawing again.
+/// When a window's timer fires, and which views it draws: each view showing a playing picture
+/// says when it wants drawing again, and the timer fires for the soonest. While no view is
+/// `.cached`, any wake draws every view, so [`FASTEST`] holds for the window rather than each
+/// view: two views on different beats would otherwise draw it at both.
 struct Due<K> {
     at: HashMap<K, Instant>,
+    /// When the timer is set for; `None` while it is idle.
+    timer: Option<Instant>,
+    /// When it last fired for a view.
+    fired: Option<Instant>,
 }
 
 impl<K: Copy + Eq + Hash> Due<K> {
     fn new() -> Self {
-        Due { at: HashMap::new() }
+        Due { at: HashMap::new(), timer: None, fired: None }
     }
 
-    /// Notes that `key` wants drawing at `at`, unless it already does sooner.
-    fn add(&mut self, key: K, at: Instant) {
+    /// Notes that `key` wants drawing at `at`, unless it already does sooner, and says when to
+    /// set the timer for if it must now fire sooner than it is set.
+    fn add(&mut self, key: K, at: Instant) -> Option<Instant> {
         self.at.entry(key).and_modify(|due| *due = (*due).min(at)).or_insert(at);
+        let next = self.next()?;
+        if self.timer.is_some_and(|timer| timer <= next) {
+            return None;
+        }
+        self.timer = Some(next);
+        self.timer
     }
 
-    /// Takes every key due by `now`, and says when the next of the rest is.
-    fn take(&mut self, now: Instant) -> (Vec<K>, Option<Instant>) {
-        let due: Vec<K> = self.at.iter().filter(|(_, at)| **at <= now).map(|(key, _)| *key).collect();
+    /// The timer has fired at `now`: takes every key due, and says when to set it for the rest;
+    /// `None` leaves it idle until a key is added.
+    fn fire(&mut self, now: Instant) -> (Vec<K>, Option<Instant>) {
+        // A timer may fire a little early; what is due within a millisecond goes now.
+        let by = now + Duration::from_millis(1);
+        let due: Vec<K> = self.at.iter().filter(|(_, at)| **at <= by).map(|(key, _)| *key).collect();
         for key in &due {
             self.at.remove(key);
         }
-        (due, self.at.values().min().copied())
+        if !due.is_empty() {
+            self.fired = Some(now);
+        }
+        self.timer = self.next();
+        (due, self.timer)
+    }
+
+    /// When the soonest key is due, but no sooner than [`FASTEST`] after the last firing.
+    fn next(&self) -> Option<Instant> {
+        let soonest = self.at.values().min().copied()?;
+        Some(self.fired.map_or(soonest, |fired| soonest.max(fired + FASTEST)))
     }
 }
 
@@ -258,11 +287,15 @@ fn frame_now(bounds: Bounds<Pixels>, image: &Arc<RenderImage>, play: Play, windo
     let on_screen = window.content_mask().bounds.intersects(&bounds);
     // The view that draws it, which alone is drawn again for its next frame.
     let view = window.current_view();
-    // The pointer arriving or leaving starts or stops it, so its view must hear of it.
+    // The pointer arriving or leaving starts or stops it, so its view must hear of it: once the
+    // window is let go, which is when its root can be told apart.
     if on_screen && by_hover.is_some() {
+        let handle = window.window_handle();
         window.on_mouse_event(move |event: &MouseMoveEvent, _, _, cx| {
             if bounds.contains(&event.position) != hovered {
-                cx.notify(view);
+                cx.defer(move |cx| {
+                    let _ = handle.update(cx, |root, window, cx| redraw(view, root.entity_id(), window, cx));
+                });
             }
         });
     }
@@ -307,50 +340,58 @@ fn shot_frames() -> bool {
     false
 }
 
-/// Has `view` drawn again at `at`, and the window's timer set for it unless it fires sooner.
+/// Has `view` drawn again at `at`, and the window's timer set sooner if it must be.
 fn wake(at: Instant, view: EntityId, window: &mut Window, cx: &mut App) {
     let id = window.window_handle().window_id();
-    // The timer never fires later than the soonest view due, and each firing sets it for the
-    // next: a later one is dropped, which cancels it, and the one set here takes its views.
-    let sooner = WAKES.with(|wakes| {
-        let mut wakes = wakes.borrow_mut();
-        let wake = wakes.entry(id).or_insert_with(|| Wake { due: Due::new(), timer: None });
-        wake.due.add(view, at);
-        wake.timer.as_ref().is_none_or(|(pending, _)| at < *pending)
-    });
-    if sooner {
+    let sooner = WAKES.with(|wakes| wakes.borrow_mut().entry(id).or_insert_with(|| Wake { due: Due::new(), task: None }).due.add(view, at));
+    if let Some(at) = sooner {
         arm(id, at, window, cx);
     }
 }
 
-/// Sets the window's timer for `at`, replacing the one there.
+/// Sets the window's timer for `at`, replacing the one there: the later one is dropped, which
+/// cancels it.
 fn arm(id: WindowId, at: Instant, window: &mut Window, cx: &mut App) {
     let task = window.spawn(cx, async move |cx| {
         cx.background_executor().timer(at.saturating_duration_since(Instant::now())).await;
-        let _ = cx.update(|window, cx| fire(id, window, cx));
+        if cx.update_root(|root, window, cx| fire(id, root.entity_id(), window, cx)).is_err() {
+            // The window is gone, and with it what it was waiting for.
+            let gone = WAKES.with(|wakes| wakes.borrow_mut().remove(&id));
+            drop(gone);
+        }
     });
     // The one replaced is dropped once the map is let go, even when it is the one firing.
-    let replaced = WAKES.with(|wakes| wakes.borrow_mut().get_mut(&id).and_then(|wake| wake.timer.replace((at, task))));
+    let replaced = WAKES.with(|wakes| wakes.borrow_mut().get_mut(&id).and_then(|wake| wake.task.replace(task)));
     drop(replaced);
 }
 
 /// The timer has fired: the views now due are drawn, and the timer is set for the rest.
-fn fire(id: WindowId, window: &mut Window, cx: &mut App) {
+fn fire(id: WindowId, root: EntityId, window: &mut Window, cx: &mut App) {
     let (due, next, done) = WAKES.with(|wakes| {
         let mut wakes = wakes.borrow_mut();
         let Some(wake) = wakes.get_mut(&id) else { return (Vec::new(), None, None) };
-        // A timer may fire a little early; what is due within a millisecond goes now.
-        let (due, next) = wake.due.take(Instant::now() + Duration::from_millis(1));
-        // Nothing left: the draws these views make set the timer again if they still play.
+        let (due, next) = wake.due.fire(Instant::now());
+        // Nothing left: the draws these views make set the timer again if they still play. They
+        // ask for no sooner than FASTEST after drawing, so forgetting this firing keeps the floor.
         let done = if next.is_none() { wakes.remove(&id) } else { None };
         (due, next, done)
     });
     drop(done);
     for view in due {
-        cx.notify(view);
+        redraw(view, root, window, cx);
     }
     if let Some(next) = next {
         arm(id, next, window, cx);
+    }
+}
+
+/// Draws `view` again. The window's root is drawn by refreshing the window, the same draw:
+/// notifying it would also run whatever observes it, on every frame of a picture it paints.
+fn redraw(view: EntityId, root: EntityId, window: &mut Window, cx: &mut App) {
+    if view == root {
+        window.refresh();
+    } else {
+        cx.notify(view);
     }
 }
 
@@ -385,7 +426,7 @@ mod tests {
     }
 
     #[test]
-    fn a_fast_animation_is_drawn_at_most_thirty_times_a_second_and_keeps_its_time() {
+    fn a_fast_animation_asks_no_sooner_than_fastest_and_keeps_its_time() {
         let ms = Duration::from_millis;
         assert_eq!(next_draw(ms(20)), FASTEST);
         assert_eq!(next_draw(ms(1)), FASTEST);
@@ -402,14 +443,71 @@ mod tests {
         let now = Instant::now();
         let ms = Duration::from_millis;
         let mut due = Due::new();
-        due.add(1, now + ms(100));
-        due.add(2, now + ms(33));
-        // A sooner ask for a view replaces its later one; a later one does not.
-        due.add(1, now + ms(50));
-        due.add(2, now + ms(80));
-        assert_eq!(due.take(now), (vec![], Some(now + ms(33))));
-        assert_eq!(due.take(now + ms(40)), (vec![2], Some(now + ms(50))));
-        assert_eq!(due.take(now + ms(50)), (vec![1], None));
+        assert_eq!(due.add(1, now + ms(100)), Some(now + ms(100)));
+        assert_eq!(due.add(2, now + ms(40)), Some(now + ms(40)));
+        // A sooner ask for a view replaces its later one; a later one does not, and neither
+        // moves a timer already set sooner.
+        assert_eq!(due.add(1, now + ms(50)), None);
+        assert_eq!(due.add(2, now + ms(80)), None);
+        // Firing early draws nothing and keeps the timer.
+        assert_eq!(due.fire(now + ms(30)), (vec![], Some(now + ms(40))));
+        // The next is held FASTEST after this one, though it is due sooner.
+        assert_eq!(due.fire(now + ms(40)), (vec![2], Some(now + ms(40) + FASTEST)));
+        assert_eq!(due.fire(now + ms(40) + FASTEST), (vec![1], None));
+        // Idle until asked again.
+        assert_eq!(due.add(1, now + ms(200)), Some(now + ms(200)));
+    }
+
+    /// Plays views on these beats for `playing`, as a window would: every draw has every view
+    /// ask for its next frame, none being `.cached`, and the timer fires when `Due` says. When it
+    /// started, each draw, and each ask.
+    fn play(beats: &[(u8, Duration)], playing: Duration) -> (Instant, Vec<Instant>, Vec<Instant>) {
+        let start = Instant::now();
+        let (mut due, mut timer, mut now) = (Due::new(), None, start);
+        let (mut draws, mut asks) = (Vec::new(), Vec::new());
+        for _ in 0..1000 {
+            draws.push(now);
+            if now - start < playing {
+                for &(view, beat) in beats {
+                    let into = Duration::from_nanos(((now - start).as_nanos() % beat.as_nanos()) as u64);
+                    let at = now + next_draw(beat - into);
+                    asks.push(at);
+                    timer = due.add(view, at).or(timer);
+                }
+            }
+            // A firing with nothing due draws nothing; none set is idle.
+            loop {
+                let Some(at) = timer else { return (start, draws, asks) };
+                let (drawn, next) = due.fire(at);
+                (timer, now) = (next, at);
+                if !drawn.is_empty() {
+                    break;
+                }
+            }
+        }
+        panic!("the timer never went idle");
+    }
+
+    #[test]
+    fn the_window_wakes_at_most_thirty_times_a_second_however_many_views_play() {
+        let ms = Duration::from_millis;
+        // Two views on beats that seldom meet: each asks no sooner than FASTEST after a draw,
+        // and the other's earlier ask must not draw the window in between.
+        let (start, draws, asks) = play(&[(1, ms(20)), (2, ms(45))], ms(1000));
+        let gaps: Vec<Duration> = draws.windows(2).map(|pair| pair[1] - pair[0]).collect();
+        assert!(gaps.iter().all(|gap| *gap >= FASTEST), "{gaps:?}");
+        let first_second = draws.iter().filter(|draw| **draw - start < ms(1000)).count();
+        assert!((30..=31).contains(&first_second), "{first_second} draws in the first second");
+        // No ask is lost: a draw meets each, no more than FASTEST late.
+        for at in &asks {
+            assert!(draws.iter().any(|draw| *draw + ms(1) >= *at && *draw <= *at + FASTEST), "{:?} unmet", *at - start);
+        }
+        // Once none plays, what was asked is drawn and the timer goes idle.
+        assert!(*draws.last().unwrap() - start <= ms(1000) + FASTEST * 2);
+        // A slow picture alone is drawn at its own pace.
+        let (_, draws, _) = play(&[(1, ms(100))], ms(1000));
+        assert_eq!(draws.len(), 11);
+        assert!(draws.windows(2).all(|pair| pair[1] - pair[0] == ms(100)));
     }
 
     #[test]
