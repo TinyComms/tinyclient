@@ -72,7 +72,9 @@ to it through its socket, with the network replaced by a local fake:
   trait (`adapters/<network>/wire.rs`); `TINYCLIENT_TELEGRAM_FAKE` and `TINYCLIENT_SIGNAL_FAKE`
   put a scripted wire (`fake.rs`) under the adapter instead of the real one.
 - The call tests build `mediad` and run it with a generated tone and a fake voice server, so they
-  need no microphone and no Discord.
+  need no microphone and no Discord. On Windows, `mediad`'s voice tests make their TLS certificate
+  with the `openssl` command: Git for Windows ships one under `usr/bin`, which wants to be on the
+  `PATH`.
 
 Run one network's tests with `cargo test -p chatd --test discord`. If you change the window,
 check the GUI still builds: `cargo check -p tinyclient --features gui`.
