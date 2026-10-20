@@ -410,9 +410,8 @@ impl Shell {
         self.install(cx);
     }
 
-    /// The switcher's "Search messages" row: the pane opens with the words, asked everywhere.
     /// The switcher's "Search messages" row: the pane opens with the words already asked for.
-    /// The field is filled to match, whose `set_text` is not an edit and emits nothing — the
+    /// The field is filled to match, whose `set_text` is not an edit and emits nothing - the
     /// ask carries the words, so nothing depends on it emitting.
     pub(in crate::gui) fn open_message_search(&mut self, words: String, window: &mut Window, cx: &mut Context<Self>) {
         self.new_search_with(Scope::Everywhere, &words, window, cx);
@@ -456,7 +455,6 @@ impl Shell {
         self.open_search(Scope::Everywhere, window, cx);
     }
 
-    /// A fresh search: the field is made and focused, the pane opens, the cache is asked.
     /// A fresh search, seeded with the words it starts asked for. `open_search` and the
     /// switcher's row both come through here.
     fn new_search_with(&mut self, scope: Scope, words: &str, window: &mut Window, cx: &mut Context<Self>) {

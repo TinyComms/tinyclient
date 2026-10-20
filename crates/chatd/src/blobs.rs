@@ -925,12 +925,10 @@ mod tests {
         // The first session stands above no close at all.
         assert_eq!(next_generation(0, None), 1);
         // An ask while the sweep is closing generation 1 opens generation 2, whose jobs land
-        // where the close's removals cannot reach, and whose number never meets the closed
-        // one a landing check compares against.
+        // where the close's removals cannot reach. A job of the closed generation stands at 1,
+        // meets `picker_closed` = 1, and is dropped before its bytes are kept.
         assert_eq!(next_generation(1, Some(1)), 2);
         assert!(1 < next_generation(1, Some(1)));
-        // An older session's job is at its generation or below, and is dropped.
-        assert!(1 <= 1);
     }
 
     #[test]
