@@ -284,7 +284,7 @@ impl Shell {
             Some(peer) if self.right_kind() != Some(RightKind::Info) || shown.as_ref() != Some(&peer) => {
                 self.show_info(peer, cx);
             }
-            _ => self.close_right(cx),
+            _ => self.close_right(None, cx),
         }
     }
 
@@ -610,7 +610,7 @@ impl Shell {
     /// Shows or hides the member list of the open conversation in the right pane.
     pub(super) fn toggle_members(&mut self, cx: &mut Context<Self>) {
         if self.right_kind() == Some(RightKind::Members) {
-            self.close_right(cx);
+            self.close_right(None, cx);
             return;
         }
         let count = self.people_state.members.get().and_then(|members| members.read(cx).total());

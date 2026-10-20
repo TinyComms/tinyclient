@@ -102,6 +102,13 @@ struct SearchField {
     _subscriptions: Vec<gpui::Subscription>,
 }
 
+/// The page a fresh search opens with: the scope, and the words it starts asked for. The
+/// switcher's row seeds its words here, so the first ask carries them without relying on the
+/// field's `set_text`, which is not an edit and emits nothing.
+fn fresh_page(scope: Scope, words: &str) -> SearchPage {
+    SearchPage { scope, words: words.to_owned(), ..SearchPage::default() }
+}
+
 /// The letters of the query inside a hit's text, for the heavier drawing.
 fn matched(text: &str, words: &str) -> Vec<Range<usize>> {
     let (lower, needle) = (text.to_lowercase(), words.to_lowercase());
@@ -268,7 +275,7 @@ impl Shell {
             }
             None => {
                 if self.conversation_state.side.installed.take().is_some() && self.right_kind().is_some() {
-                    self.close_right(cx);
+                    self.close_right(None, cx);
                 }
             }
         }
@@ -308,6 +315,10 @@ impl Shell {
                 side.switches = pane::close(&side.stack, side.switches);
                 side.stack = Stack::default();
                 side.installed = None;
+                // A search pane the ✕ closed goes with its stack, exactly as Esc's closing
+                // does: no page behind, no field holding the keys.
+                side.search = None;
+                side.search_input = None;
                 self.conversation_state.thread.borrow_mut().take();
             }
             Some(RightKind::Info) => {
@@ -400,21 +411,28 @@ impl Shell {
     }
 
     /// The switcher's "Search messages" row: the pane opens with the words, asked everywhere.
+    /// The switcher's "Search messages" row: the pane opens with the words already asked for.
+    /// The field is filled to match, whose `set_text` is not an edit and emits nothing — the
+    /// ask carries the words, so nothing depends on it emitting.
     pub(in crate::gui) fn open_message_search(&mut self, words: String, window: &mut Window, cx: &mut Context<Self>) {
-        self.new_search(Scope::Everywhere, window, cx);
-        if let Some(field) = &self.conversation_state.side.search_input {
-            field.input.update(cx, |input, cx| input.set_text(&words, cx));
-        }
+        self.new_search_with(Scope::Everywhere, &words, window, cx);
     }
 
     /// Search in the conversation, or everywhere: the pane opens with its field focused, or,
     /// standing already, the scope switches and the asking starts again.
     pub(in crate::gui) fn open_search(&mut self, scope: Scope, window: &mut Window, cx: &mut Context<Self>) {
-        // A pane closed by its ✕ leaves its page behind: anything not showing starts over.
+        // A pane closed by its ✕ leaves its page behind: anything not showing starts over. And
+        // a conversation scope with nothing open names nothing — it asks everywhere, as the
+        // switcher's row does, so a chip is lit.
+        let scope = if scope == Scope::Conversation && self.open_key().is_none() {
+            Scope::Everywhere
+        } else {
+            scope
+        };
         if !matches!(self.conversation_state.side.stack.top(), Some(Layer::Search)) {
             self.conversation_state.side.search = None;
             self.conversation_state.side.search_input = None;
-            self.new_search(scope, window, cx);
+            self.new_search_with(scope, "", window, cx);
             return;
         }
         if let Some(page) = self.conversation_state.side.search.as_mut() {
@@ -439,7 +457,9 @@ impl Shell {
     }
 
     /// A fresh search: the field is made and focused, the pane opens, the cache is asked.
-    fn new_search(&mut self, scope: Scope, window: &mut Window, cx: &mut Context<Self>) {
+    /// A fresh search, seeded with the words it starts asked for. `open_search` and the
+    /// switcher's row both come through here.
+    fn new_search_with(&mut self, scope: Scope, words: &str, window: &mut Window, cx: &mut Context<Self>) {
         let input = cx.new(|cx| TextInput::new("Search messages", cx));
         let changed = cx.subscribe_in(&input, window, |this, _, event: &InputEvent, _, cx| match event {
             InputEvent::Changed => this.search_typed(cx),
@@ -453,12 +473,19 @@ impl Shell {
         {
             let side = &mut self.conversation_state.side;
             side.search_input = Some(SearchField { input, _subscriptions: vec![changed, keys] });
-            side.search = Some(SearchPage { scope, ..SearchPage::default() });
+            side.search = Some(fresh_page(scope, words));
             side.stack = pane::open(&side.stack, Layer::Search);
         }
         self.install(cx);
         if let Some(field) = &self.conversation_state.side.search_input {
             window.focus(&field.input.focus_handle(cx), cx);
+        }
+        if !words.is_empty() {
+            // The field is filled to match the ask. `set_text` is not an edit and emits
+            // nothing, which is why the ask above carries the words itself.
+            if let Some(field) = &self.conversation_state.side.search_input {
+                field.input.update(cx, |input, cx| input.set_text(words, cx));
+            }
         }
         self.reask_search(cx);
     }
@@ -716,7 +743,7 @@ impl Shell {
             Step::Latest => {
                 // A pane this view did not put there (search results, a sheet) closes first.
                 if self.conversation_state.side.installed.is_none() && self.right_kind().is_some() {
-                    self.close_right(cx);
+                    self.close_right(window, cx);
                     return true;
                 }
                 if let Some(pane) = self.conversation_state.pane.get().cloned() {
@@ -1064,5 +1091,14 @@ mod tests {
         assert_eq!(scope_filters(Scope::Space, Some((&channel, None))), (None, None));
         assert_eq!(scope_filters(Scope::Conversation, None), (None, None));
         assert_eq!(scope_filters(Scope::Space, None), (None, None));
+    }
+
+    #[test]
+    fn the_switcher_s_words_start_asked_for() {
+        // The switcher's row seeds its words into the page, so the first ask carries them
+        // without relying on the field's `set_text`, which is not an edit and emits nothing.
+        let page = fresh_page(Scope::Everywhere, "rules");
+        assert_eq!((page.scope, page.words.as_str()), (Scope::Everywhere, "rules"));
+        assert!(page.hits.is_none() && page.picked.is_none());
     }
 }

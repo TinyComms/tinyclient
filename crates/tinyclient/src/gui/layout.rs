@@ -194,8 +194,12 @@ impl Shell {
         cx.notify();
     }
 
-    pub(super) fn close_right(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn close_right(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
         self.layout_state.right = None;
+        // The keys go back to the composer, as Esc's closing of a pane does.
+        if let Some(window) = window {
+            self.composer_focus(window, cx);
+        }
         cx.notify();
     }
 
@@ -419,7 +423,7 @@ impl Shell {
                         .child(glyph("icons/chevron-left.svg", 16., theme::text_soft()))
                         .flex_row_reverse()
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .on_click(cx.listener(|this, _, _, cx| this.close_right(cx))),
+                        .on_click(cx.listener(|this, _, window, cx| this.close_right(Some(window), cx))),
                 )
             })
             .child(
@@ -438,7 +442,7 @@ impl Shell {
                 icon_button("right-close", "icons/x.svg", false)
                     .tooltip(tip("Close", Some("⌘.")))
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_click(cx.listener(|this, _, _, cx| this.close_right(cx))),
+                    .on_click(cx.listener(|this, _, window, cx| this.close_right(Some(window), cx))),
             );
         let resizable = !replaces;
         Some(

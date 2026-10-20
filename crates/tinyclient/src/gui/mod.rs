@@ -110,7 +110,7 @@ impl Shell {
             .on_action(cx.listener(|this, _: &FocusNext, window, cx| this.focus_region(true, window, cx)))
             .on_action(cx.listener(|this, _: &FocusPrevious, window, cx| this.focus_region(false, window, cx)))
             .on_key_down(cx.listener(Self::typed))
-            .on_action(cx.listener(|this, _: &CloseRight, _, cx| this.close_right(cx)))
+            .on_action(cx.listener(|this, _: &CloseRight, window, cx| this.close_right(Some(window), cx)))
             .on_action(cx.listener(|this, _: &SearchConversation, window, cx| this.search_here(window, cx)))
             .on_action(cx.listener(|this, _: &SearchEverywhere, window, cx| this.search_everywhere(window, cx)))
             .on_action(cx.listener(|this, _: &CloseTop, window, cx| {
