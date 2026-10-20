@@ -1487,6 +1487,42 @@ fn member_viewport_selected_before_ready_is_subscribed_after_connect() {
 }
 
 #[test]
+fn members_asked_before_ready_are_pending_and_fill_after_connect() {
+    let mut world = World::start();
+    world.tree("4000");
+    // chatd starts again with the server stored from the last run, and READY is slow to come.
+    *world.discord.ready_after.lock().unwrap() = Duration::from_millis(1500);
+    world.restart();
+    wait("the identify", || (world.discord.frames_of(2).len() == 2).then_some(()));
+    let members = || world.ask(Request::Members { conversation: world.key("4105"), offset: 0, limit: 50 });
+    let early = members();
+    assert_ne!(world.link(), Link::Connected, "READY came before the question");
+    // Not refused: the shell keeps asking for a pending page, and gives up on a refused one.
+    assert!(matches!(early, Response::Members { pending: true, ref members, .. } if members.is_empty()), "{early:?}");
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+
+    // Asked again, as the shell does for a pending page, the list is subscribed and fills.
+    wait("the member window", || {
+        members();
+        world.discord.frames_of(37).pop().filter(|frame| frame["d"]["subscriptions"]["4000"]["channels"]["4105"].is_array())
+    });
+    world.discord.push("GUILD_MEMBER_LIST_UPDATE", json!({
+        "guild_id": "4000",
+        "groups": [{"id": "online", "count": 1}],
+        "ops": [{"op": "SYNC", "range": [0, 99], "items": [
+            {"group": {"id": "online", "count": 1}},
+            {"member": {"user": {"id": "2006", "username": "sam", "global_name": "Sam Whitlock", "discriminator": "0", "avatar": null}, "roles": []}},
+        ]}],
+    }));
+    let filled = wait("the members", || {
+        let response = members();
+        matches!(response, Response::Members { pending: false, .. }).then_some(response)
+    });
+    let Response::Members { members, .. } = filled else { unreachable!() };
+    assert_eq!(members.iter().map(|person| person.name.as_str()).collect::<Vec<_>>(), ["Sam Whitlock"]);
+}
+
+#[test]
 fn servers_channels_people_and_settings_follow_live_events() {
     let world = World::start();
     let tree_ids = |space: &str| world.tree(space).1.iter().map(|row| row.key.id.clone()).collect::<Vec<_>>();
