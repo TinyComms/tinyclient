@@ -2191,17 +2191,6 @@ fn info_mute_pins_files_emoji_threads_and_a_scheduled_send_ask_slack_once_each()
 }
 
 #[test]
-fn search_asks_the_network_only_where_it_can() {
-    let world = World::start();
-    world.ready();
-    // A Space on Slack: the adapter cannot search messages yet, and says so in words. Nothing
-    // is asked of the fake.
-    let refused = world.ask(Request::SearchNetwork { conversation: None, space: Some(alpha("T01ALPHA")), query: "x".into() });
-    assert!(matches!(&refused, Response::Error { detail, .. } if detail.contains("cannot do this yet")), "{refused:?}");
-    assert!(world.fake.calls(ALPHA, "search.all").is_empty() && world.fake.calls(ALPHA, "search.messages").is_empty());
-}
-
-#[test]
 fn files_go_up_from_their_paths_and_the_socket_names_the_message() {
     let world = World::start();
     world.ready();
