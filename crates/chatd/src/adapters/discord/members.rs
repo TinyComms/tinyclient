@@ -401,7 +401,12 @@ impl Discord {
         }
         let (groups, members, pending) = {
             let mut state = self.state.lock().unwrap();
-            if !state.guilds.contains_key(&guild) { return answer(reply, Err(Refusal::Unsupported)); }
+            if !state.guilds.contains_key(&guild) {
+                if !state.guilds.is_empty() { return answer(reply, Err(Refusal::Unsupported)); }
+                // Before READY no server is known yet: the list is still to come, not refused.
+                // Nothing is placed here; READY places the Watch once it has said what the servers are.
+                return answer(reply, Ok(Members { pending: true, sections: Vec::new(), members: Vec::new() }));
+            }
             let watched = &mut state.members;
             if watched.seen.members.is_some() && watched.list.as_deref() != Some(&channel) {
                 // A delayed query from a previous conversation cannot take over
