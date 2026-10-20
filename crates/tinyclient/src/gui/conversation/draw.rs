@@ -500,18 +500,18 @@ impl Pane {
     /// Someone in this conversation, from what its messages say of them, else from the people
     /// hub: their name and their picture.
     fn who(&self, person: &Key, cx: &mut Context<Self>) -> (String, Option<MediaFile>) {
-        let root = self.open.as_ref().and_then(|open| open.root.as_ref()).map(|(root, _)| root);
-        let theirs = || root.into_iter().chain(&self.window.messages).rev().filter(|message| message.sender.id == person.id);
-        // A tombstone keeps the name and loses the picture, so one that has it is looked for first.
-        if let Some(message) = theirs().find(|message| message.sender.avatar.is_some()).or_else(|| theirs().next()) {
+        if let Some(message) = said_by(self.root(), &self.window.messages, &person.id) {
             return (message.sender.name.clone(), message.sender.avatar.clone());
         }
         let known = self.shell.upgrade().and_then(|shell| shell.read(cx).people_state.hub().person(person));
         known.map(|person| (person.name, person.avatar)).unwrap_or_default()
     }
 
-    /// My own picture on this account. A message I am sending is not from the network yet,
-    /// so it names no picture itself.
+    fn root(&self) -> Option<&Rc<Message>> {
+        self.open.as_ref().and_then(|open| open.root.as_ref()).map(|(root, _)| root)
+    }
+
+    /// My own picture on this account.
     fn own_picture(&self, cx: &mut Context<Self>) -> Option<MediaFile> {
         let key = self.key()?;
         self.shell.upgrade().and_then(|shell| shell.read(cx).own_picture(key))
@@ -527,8 +527,8 @@ impl Pane {
             None => Avatar::named(&sender.name, size),
         };
         let file = match (&sender.avatar, message.outgoing) {
-            (Some(file), _) => Some(file.clone()),
-            (None, true) => self.own_picture(cx),
+            (_, true) => own_face(message, self.root(), &self.window.messages, &me, || self.own_picture(cx)),
+            (Some(file), false) => Some(file.clone()),
             // A tombstone names its sender and nothing else; their other messages have the picture.
             (None, false) => self.person(id).and_then(|key| self.who(&key, cx).1),
         };
@@ -1703,5 +1703,89 @@ fn natural(attachment: &Attachment) -> (u32, u32) {
         (attachment.file.width, attachment.file.height)
     } else {
         (still.width, still.height)
+    }
+}
+
+/// The message that says most of who someone is here: their newest with a picture, else their
+/// newest. A tombstone keeps the name and loses the picture, so one that has it is looked for first.
+fn said_by<'a>(root: Option<&'a Rc<Message>>, messages: &'a [Rc<Message>], id: &str) -> Option<&'a Message> {
+    let theirs = || root.into_iter().chain(messages).rev().filter(|message| message.sender.id == id);
+    let found = theirs().find(|message| message.sender.avatar.is_some()).or_else(|| theirs().next());
+    found.map(|message| &**message)
+}
+
+/// The picture on a message of mine: the one it names, else the account's, which follows a
+/// change of picture. One I am sending is not from the network yet and names none. Without the
+/// account's (a network that keeps no row of me), my newest message here lends the picture it
+/// was stored with, which may since have changed.
+fn own_face(
+    message: &Message,
+    root: Option<&Rc<Message>>,
+    messages: &[Rc<Message>],
+    me: &str,
+    account: impl FnOnce() -> Option<MediaFile>,
+) -> Option<MediaFile> {
+    let shown = || match me {
+        // Without my id nothing here is known to be mine.
+        "" => None,
+        me => said_by(root, messages, me)?.sender.avatar.clone(),
+    };
+    message.sender.avatar.clone().or_else(account).or_else(shown)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use protocol::MediaKind;
+
+    fn picture(id: &str) -> MediaFile {
+        MediaFile::new(id, MediaKind::Avatar)
+    }
+
+    /// One of mine the network has, with the picture it was stored with.
+    fn mine(id: &str, avatar: Option<&str>) -> Rc<Message> {
+        let mut message = Message::plain(id, "Jo", "said", 10, true);
+        message.sender.id = "me".into();
+        message.sender.avatar = avatar.map(picture);
+        Rc::new(message)
+    }
+
+    /// One of mine still going: chatd names no sender on it.
+    fn sending() -> Message {
+        let mut message = Message::plain("c1", "You", "going", 20, true);
+        message.state = SendState::Pending;
+        message
+    }
+
+    fn face(message: &Message, messages: &[Rc<Message>], account: Option<&str>) -> Option<String> {
+        own_face(message, None, messages, "me", || account.map(picture)).map(|file| file.id)
+    }
+
+    #[test]
+    fn my_message_shows_its_own_picture_then_the_accounts_then_my_newest_here() {
+        let messages = [mine("1", Some("shown-here"))];
+        assert_eq!(face(&mine("2", Some("its-own")), &messages, Some("account")).as_deref(), Some("its-own"));
+        // One being sent names none.
+        assert_eq!(face(&sending(), &messages, Some("account")).as_deref(), Some("account"));
+        assert_eq!(face(&sending(), &messages, None).as_deref(), Some("shown-here"));
+        assert_eq!(face(&sending(), &[], None), None);
+    }
+
+    #[test]
+    fn a_picture_i_have_since_changed_does_not_come_back_from_my_earlier_messages() {
+        let messages = [mine("1", Some("before")), mine("2", Some("before"))];
+        assert_eq!(face(&sending(), &messages, Some("after")).as_deref(), Some("after"));
+    }
+
+    #[test]
+    fn only_my_newest_picture_here_is_lent_and_only_once_my_id_is_known() {
+        // A newer one of mine without a picture, a tombstone, does not lose it.
+        let messages = [mine("1", Some("older")), mine("2", Some("newer")), mine("3", None)];
+        assert_eq!(face(&sending(), &messages, None).as_deref(), Some("newer"));
+        let mut theirs = Message::plain("4", "mara", "hi", 30, false);
+        theirs.sender.id = "mara".into();
+        theirs.sender.avatar = Some(picture("mara"));
+        assert_eq!(face(&sending(), &[Rc::new(theirs)], None), None);
+        assert_eq!(own_face(&sending(), None, &messages, "", || None), None);
     }
 }

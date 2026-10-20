@@ -88,6 +88,9 @@ enum Control {
 
 struct Shared {
     requests: Mutex<Vec<Seen>>,
+    /// Fetches of our own picture, kept out of `requests`: chatd gets the rail's picture on its
+    /// own clock, which no test can time.
+    own_pictures: AtomicUsize,
     /// Every frame the adapter sent on the gateway, in order.
     frames: Mutex<Vec<Value>>,
     control: Mutex<Sender<Control>>,
@@ -393,7 +396,11 @@ fn serve_http(shared: Arc<Shared>, stream: TcpStream) {
             bytes: body.len(),
             at: Instant::now(),
         };
-        shared.requests.lock().unwrap().push(seen.clone());
+        if seen.path.starts_with("/media/avatars/1000/") {
+            shared.own_pictures.fetch_add(1, Ordering::Relaxed);
+        } else {
+            shared.requests.lock().unwrap().push(seen.clone());
+        }
         let bare = seen.path.split('?').next().unwrap().to_owned();
         // What is not Discord's JSON: a file from the media proxy, the page that names the
         // build, and whatever a test wrote out by hand.
@@ -578,6 +585,7 @@ impl World {
         let (control, controlled) = channel();
         let shared = Arc::new(Shared {
             requests: Mutex::new(Vec::new()),
+            own_pictures: AtomicUsize::new(0),
             frames: Mutex::new(Vec::new()),
             control: Mutex::new(control),
             scripted: Mutex::new(HashMap::new()),
@@ -966,6 +974,35 @@ fn ready_fills_spaces_trees_people_and_unread_state() {
     let decoded = base64::engine::general_purpose::STANDARD.decode(&headers["x-super-properties"]).unwrap();
     let sent: Value = serde_json::from_slice(&decoded).unwrap();
     assert_eq!(&sent, properties);
+}
+
+#[test]
+fn my_picture_is_the_accounts_from_ready_and_follows_a_change_to_it() {
+    let world = World::start();
+    let mine = || match world.ask(Request::Status) {
+        Response::Status { accounts, .. } => {
+            let ours = accounts.into_iter().find(|account| account.key == world.account()).unwrap();
+            (ours.name, ours.avatar.map(|avatar| avatar.id))
+        }
+        other => panic!("{other:?}"),
+    };
+    // READY names our picture, so the account has it before any message of ours is seen: a
+    // message being sent, which names none, shows it. It is registered, and fetched for the
+    // rail with nothing asked by the shell.
+    assert_eq!(mine(), ("Justin".to_owned(), Some("avatar:1000:me0hash".to_owned())));
+    wait("our picture to be fetched", || (world.discord.own_pictures.load(Ordering::Relaxed) > 0).then_some(()));
+    // Our own row is on none of the lists we own.
+    let owned = [world.people(None, None), world.people(Some(Relation::Friend), None), world.people(Some(Relation::Blocked), None)];
+    assert!(owned.iter().flatten().all(|person| person.key.id != "1000"), "we are listed among our own people");
+
+    // A new picture is the account's at once.
+    world.discord.push("USER_UPDATE", json!({"id": "1000", "username": "justin", "global_name": "Justin", "discriminator": "0", "avatar": "me1hash"}));
+    wait("the new picture", || (mine().1.as_deref() == Some("avatar:1000:me1hash")).then_some(()));
+    // Someone else's is not ours.
+    world.discord.push("USER_UPDATE", json!({"id": "2001", "username": "mara", "global_name": "Mara Okafor", "discriminator": "0", "avatar": "a1b2c3"}));
+    world.incoming("3002", None, "after the update", json!({}));
+    wait("the update to be handled", || world.messages("3002").pop().filter(|message| message.text == "after the update"));
+    assert_eq!(mine(), ("Justin".to_owned(), Some("avatar:1000:me1hash".to_owned())));
 }
 
 #[test]
@@ -2443,8 +2480,9 @@ fn a_ready_of_real_size_connects_quickly_within_the_memory_budget_and_is_not_kep
     assert!(released || kept_by_allocator, "settled at {settled} KB after a peak of {peak} KB");
 
     // The first thirty seconds: five unread conversations fetched ahead, at a person's pace,
-    // and nothing else asked of Discord at all.
+    // our own picture once, and nothing else asked of Discord at all.
     sleep(Duration::from_secs(30).saturating_sub(started.elapsed()));
+    assert_eq!(world.discord.own_pictures.load(Ordering::Relaxed), 1);
     let requests = world.discord.requests.lock().unwrap().clone();
     let paths: Vec<&str> = requests.iter().map(|seen| seen.path.as_str()).collect();
     assert_eq!(requests.len(), 5, "{paths:?}");

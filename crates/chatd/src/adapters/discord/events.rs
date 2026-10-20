@@ -169,7 +169,10 @@ impl Discord {
             "CHANNEL_UNREAD_UPDATE" | "PASSIVE_UPDATE_V2" => self.passive(from_str(data)?)?,
             "USER_UPDATE" => {
                 let user: User = from_str(data)?;
-                self.ctx.describe(user.name(), &user.id)?;
+                // Ours: a new name or picture.
+                if user.id == self.me() {
+                    self.myself(&user)?;
+                }
             }
             "USER_SETTINGS_PROTO_UPDATE" => self.settings_proto(from_str(data)?)?,
             // Discord wants a phone number, an email check or a captcha: nothing more is asked of
