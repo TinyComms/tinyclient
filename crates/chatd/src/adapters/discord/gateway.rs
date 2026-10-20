@@ -505,12 +505,15 @@ impl Discord {
                     Err(lost) => return Err(self.lost(lost)),
                 }
             }
-            // What the allowance does not let go yet waits in the queue: see `SendQueue::due`.
-            while beat.ready {
-                let Some(frame) = self.outbox.queue.lock().unwrap().pop(Instant::now()) else {
-                    break;
-                };
-                wire.send(frame)?;
+            // What the allowance does not let go yet waits in the queue: see `SendQueue::due`. The
+            // queue is let go before each frame is written.
+            if beat.ready {
+                loop {
+                    let Some(frame) = self.outbox.queue.lock().unwrap().pop(Instant::now()) else {
+                        break;
+                    };
+                    wire.send(frame)?;
+                }
             }
             if Instant::now() >= beat.next {
                 if !beat.acked {
