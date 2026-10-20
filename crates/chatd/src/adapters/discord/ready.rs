@@ -829,8 +829,9 @@ impl Discord {
         for (_, id) in warm {
             let _ = self.ctx.commands.send(Command::Warm(id));
         }
-        // The Space on screen is subscribed again on the new session.
-        self.sync_subscription();
+        // The Space on screen is subscribed again on the new session, placed against the
+        // servers just read, so a Watch sent while connecting is not left unsubscribed.
+        self.rewatch();
         Ok(())
     }
 

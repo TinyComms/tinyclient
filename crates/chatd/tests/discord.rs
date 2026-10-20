@@ -99,6 +99,8 @@ struct Shared {
     forbidden: Mutex<Vec<String>>,
     /// What an identify is answered with: READY as text.
     ready: Mutex<String>,
+    /// How long after an identify READY is held back.
+    ready_after: Mutex<Duration>,
     /// Close codes the next identifies are answered with instead.
     closes: Mutex<VecDeque<u16>>,
     /// The page that names the web client's build: how long it takes, and its status.
@@ -467,6 +469,7 @@ fn serve_gateway(shared: &Shared, stream: TcpStream, control: &Receiver<Control>
                             while Instant::now() < until && !matches!(socket.read(), Err(tungstenite::Error::ConnectionClosed)) {}
                             return;
                         }
+                        sleep(*shared.ready_after.lock().unwrap());
                         // Written out as text, so a READY of real size is sent as it is.
                         let ready = shared.ready.lock().unwrap().replace("{{GATEWAY}}", gateway);
                         let s = shared.sequence.fetch_add(1, Ordering::Relaxed) + 1;
@@ -581,6 +584,7 @@ impl World {
             raw: Mutex::new(HashMap::new()),
             forbidden: Mutex::new(Vec::new()),
             ready: Mutex::new(READY.to_owned()),
+            ready_after: Mutex::new(Duration::ZERO),
             closes: Mutex::new(VecDeque::new()),
             login: Mutex::new((Duration::ZERO, 200)),
             logins: AtomicUsize::new(0),
@@ -1456,6 +1460,30 @@ fn missing_member_pages_never_block_a_new_viewport_or_move_its_subscription() {
     for _ in 0..20 { assert!(matches!(cached(1200), Response::Members { pending: false, .. })); }
     sleep(Duration::from_millis(100));
     assert_eq!(world.discord.frames_of(37).len(), before, "cached reads and listed presence must not spend subscription budget");
+}
+
+#[test]
+fn member_viewport_selected_before_ready_is_subscribed_after_connect() {
+    let world = World::launch(&[], |shared| *shared.ready_after.lock().unwrap() = Duration::from_millis(1500));
+    wait("the identify", || world.discord.frames_of(2).pop());
+    // The shell moves twice while READY is on its way: the second screen is the one it shows.
+    let watch = |channel: &str| Watching { space: Some(world.key("4000")), conversation: Some(world.key(channel)), members: Some((0, 50)), ..Watching::default() };
+    world.ask(Request::Watch(watch("4101")));
+    world.ask(Request::Watch(watch("4105")));
+    assert_ne!(world.link(), Link::Connected, "READY came before the Watch");
+    assert!(world.discord.frames_of(37).is_empty(), "nothing can be subscribed before READY");
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+
+    // The shell's next Watch is the same one, so it is READY that subscribes the window.
+    world.ask(Request::Watch(watch("4105")));
+    let subscribed = wait("the member window", || world.discord.frames_of(37).pop().filter(|frame|
+        frame["d"]["subscriptions"]["4000"]["channels"]["4105"].is_array()));
+    assert_eq!(subscribed["d"]["subscriptions"]["4000"]["channels"], json!({"4105": [[0, 99]]}));
+    let earlier = world.discord.frames_of(37).iter().any(|frame| frame["d"]["subscriptions"]["4000"]["channels"]["4101"].is_array());
+    assert!(!earlier, "the screen left while connecting was subscribed");
+    // Until Discord answers, the list is pending rather than empty.
+    let pending = world.ask(Request::Members { conversation: world.key("4105"), offset: 0, limit: 50 });
+    assert!(matches!(pending, Response::Members { pending: true, ref members, .. } if members.is_empty()), "{pending:?}");
 }
 
 #[test]
