@@ -1481,7 +1481,13 @@ fn sending_typing_presence_and_people_go_through_slack() {
         world.fake.heard(ALPHA, "presence_sub").pop().filter(|frame| frame["ids"].as_array().is_some_and(|ids| ids.len() > 1))
     });
     assert_eq!(subscribed["ids"], json!(["U0ANA", "U0ME"]), "who is on screen, and me for the account's own dot");
-    assert_eq!(world.fake.heard(ALPHA, "presence_query").pop().map(|query| query["ids"].clone()), Some(json!(["U0ANA"])));
+    // The screen's people are queried. The account's own presence is asked for on its own
+    // clock, so the query naming the screen may not be the last one in the book.
+    assert!(
+        world.fake.heard(ALPHA, "presence_query").iter().any(|query| query["ids"] == json!(["U0ANA"])),
+        "no presence_query named the person on screen: {:?}",
+        world.fake.heard(ALPHA, "presence_query")
+    );
     world.fake.push(ALPHA, json!({"type": "presence_change", "users": ["U0ANA", "U0BEN"], "presence": "active"}));
     world.until("Ana to be online", || (watching(vec![alpha("U0ANA")]).0[0].presence == Presence::Online).then_some(()));
 
