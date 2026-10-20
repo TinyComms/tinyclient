@@ -123,8 +123,6 @@ pub fn bind_keys(cx: &mut App) {
     use gpui::KeyBinding;
     cx.bind_keys([
         KeyBinding::new("secondary-,", Settings, None),
-        KeyBinding::new("secondary-h", Hide, None),
-        KeyBinding::new("alt-secondary-h", HideOthers, None),
         KeyBinding::new("secondary-n", NewMessage, None),
         KeyBinding::new("secondary-u", AttachFile, None),
         KeyBinding::new("secondary-w", CloseWindow, None),
@@ -139,6 +137,10 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-m", Minimize, None),
         KeyBinding::new("secondary-/", KeyboardShortcuts, None),
     ]);
+    // Hiding is macOS's. Linux ignores it, and GPUI on Windows panics at Hide Others.
+    if cfg!(target_os = "macos") {
+        cx.bind_keys([KeyBinding::new("secondary-h", Hide, None), KeyBinding::new("alt-secondary-h", HideOthers, None)]);
+    }
 }
 
 /// ⌘Q. chatd is stopped by `stop_chatd_on_quit`, as for every other way out.

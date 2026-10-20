@@ -566,7 +566,7 @@ impl Shell {
                             .mt(px(16.))
                             .type_small()
                             .text_color(theme::text_faint())
-                            .child("Your sign-in is kept in the macOS keychain on this Mac."),
+                            .child(crate::host::SIGN_IN_KEPT),
                     ),
             )
     }

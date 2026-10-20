@@ -458,7 +458,7 @@ mod shot {
                     .child(banner(Tone::Attention, "Discord wants you to verify your account.").child(banner_action("ba1", "Open Discord")))
                     .child(banner(Tone::Warning, "Slack is reconnecting. Showing what was saved at 10:42."))
                     .child(banner(Tone::Danger, "Slack signed you out of Harbor Labs.").child(banner_action("ba2", "Sign in")))
-                    .child(banner(Tone::Keychain, "Waiting for keychain access"))
+                    .child(banner(Tone::Keychain, crate::host::STORE_WAITING))
                     .child(toast(Some(("icons/circle-alert.svg", theme::danger())), "tinyclient quit unexpectedly and reopened.").child(banner_action("t1", "Copy report"))),
             )
             .child(

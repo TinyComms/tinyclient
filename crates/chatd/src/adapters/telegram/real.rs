@@ -294,9 +294,19 @@ async fn follow(client: Client, updates: UnboundedReceiver<UpdatesLike>, events:
 }
 
 async fn run(api_id: i32, vault: Arc<Vault>, mut jobs: UnboundedReceiver<Job>, events: Sender<Event>) {
-    // What the account's device list shows for this session.
+    // What the account's device list shows for this session, beside the system version grammers
+    // reads from the OS.
+    let device_model = if cfg!(target_os = "macos") {
+        "Mac"
+    } else if cfg!(windows) {
+        "Windows PC"
+    } else if cfg!(target_os = "linux") {
+        "Linux PC"
+    } else {
+        "PC"
+    };
     let params = ConnectionParams {
-        device_model: "Mac".to_owned(),
+        device_model: device_model.to_owned(),
         app_version: env!("CARGO_PKG_VERSION").to_owned(),
         ..ConnectionParams::default()
     };

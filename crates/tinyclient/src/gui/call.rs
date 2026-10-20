@@ -346,10 +346,34 @@ fn open(url: &str) -> Result<(), String> {
     if url.starts_with('-') || !url.contains(':') {
         return Err(format!("Not a link: {url}"));
     }
-    match std::process::Command::new("open").arg(url).status() {
+    system_open(url)
+}
+
+#[cfg(not(windows))]
+fn system_open(url: &str) -> Result<(), String> {
+    match std::process::Command::new(if cfg!(target_os = "macos") { "open" } else { "xdg-open" }).arg(url).status() {
         Ok(status) if status.success() => Ok(()),
-        Ok(_) => Err(format!("Nothing on this Mac opens {url}")),
-        Err(_) => Err("This Mac could not open the link.".to_owned()),
+        Ok(_) => Err(crate::host::nothing_opens(url)),
+        Err(_) => Err(crate::host::COULD_NOT_OPEN.to_owned()),
+    }
+}
+
+/// ShellExecuteW, not `cmd /C start`: cmd splits a link at its `&`
+/// (`msteams:/l/channel/…?groupId=…&tenantId=…`) and runs the rest as a command.
+#[cfg(windows)]
+fn system_open(url: &str) -> Result<(), String> {
+    use windows_sys::Win32::UI::Shell::{ShellExecuteW, SE_ERR_ASSOCINCOMPLETE, SE_ERR_FNF, SE_ERR_NOASSOC, SE_ERR_PNF};
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    let wide = |text: &str| text.encode_utf16().chain([0]).collect::<Vec<u16>>();
+    let (verb, file) = (wide("open"), wide(url));
+    // SAFETY: both strings are NUL-terminated and outlive the call; the rest may be null.
+    let code = unsafe { ShellExecuteW(std::ptr::null_mut(), verb.as_ptr(), file.as_ptr(), std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL) } as isize;
+    // Above 32 a handler took it. These say no handler is registered, or its program is gone.
+    let unregistered = [SE_ERR_FNF, SE_ERR_PNF, SE_ERR_ASSOCINCOMPLETE, SE_ERR_NOASSOC];
+    match code {
+        33.. => Ok(()),
+        code if unregistered.iter().any(|&known| known as isize == code) => Err(crate::host::nothing_opens(url)),
+        _ => Err(crate::host::COULD_NOT_OPEN.to_owned()),
     }
 }
 

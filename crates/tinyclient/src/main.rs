@@ -5,6 +5,8 @@
 #[cfg_attr(not(feature = "gui"), allow(dead_code))]
 mod client;
 #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+mod host;
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
 mod update;
 #[cfg(any(feature = "gui", test))]
 mod frames;

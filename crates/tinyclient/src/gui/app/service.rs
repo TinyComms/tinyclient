@@ -266,7 +266,7 @@ impl Shown {
         match self {
             Shown::Quiet | Shown::Skeleton => None,
             Shown::Starting => Some("Starting tinyclient…"),
-            Shown::KeychainWaiting => Some("Waiting for keychain access"),
+            Shown::KeychainWaiting => Some(crate::host::STORE_WAITING),
             Shown::KeychainDenied(_) => None,
             Shown::Reconnecting => Some("Reconnecting…"),
             Shown::Failed => Some("Not receiving messages."),
@@ -276,11 +276,7 @@ impl Shown {
     /// The conversation region's empty state, when this state takes it: glyph, title, line.
     pub fn empty_state(&self) -> Option<(&'static str, &'static str, &'static str)> {
         match self {
-            Shown::KeychainWaiting => Some((
-                "icons/key.svg",
-                "Waiting for keychain access",
-                "macOS is asking to let tinyclient use its saved sign-ins. Choose Always Allow. The prompt may be behind this window.",
-            )),
+            Shown::KeychainWaiting => Some(("icons/key.svg", crate::host::STORE_WAITING, crate::host::STORE_WAITING_LINE)),
             Shown::KeychainDenied(_) => Some((
                 "icons/key.svg",
                 "tinyclient can't read its sign-ins",
@@ -347,8 +343,8 @@ mod tests {
         assert!(!service.answered(100, waiting, 0));
         assert_eq!(shown(&service, Instant::now()), Shown::KeychainWaiting);
         let (_, title, line) = Shown::KeychainWaiting.empty_state().unwrap();
-        assert_eq!(title, "Waiting for keychain access");
-        assert!(line.ends_with("The prompt may be behind this window."));
+        assert_eq!(title, crate::host::STORE_WAITING);
+        assert_eq!(line, crate::host::STORE_WAITING_LINE);
 
         let denied = Keychain { denied: vec![Network::Discord], ..Keychain::default() };
         service.answered(100, denied, 0);

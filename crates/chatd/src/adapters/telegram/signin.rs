@@ -529,7 +529,7 @@ impl Flow {
                 let _ = wire::call(self.wire.as_ref(), &tl::functions::auth::LogOut {});
                 let keychain = why.starts_with("keychain");
                 SignInStep::Failed {
-                    reason: if keychain { "tinyclient couldn't save the sign-in to your keychain.".to_owned() } else { why },
+                    reason: if keychain { format!("tinyclient couldn't save the sign-in to {}.", crate::session::STORE) } else { why },
                 }
             }
         };
