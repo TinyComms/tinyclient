@@ -24,13 +24,19 @@ fn current() -> MutexGuard<'static, Option<Flow>> {
 }
 
 /// An http or https origin: no user, no query, no fragment, no path. A trailing slash is dropped.
+/// A host with no scheme is https, except a machine on this computer, which is http.
 pub(crate) fn base_url(raw: &str) -> Option<String> {
     let raw = raw.trim();
     if raw.is_empty() || raw.chars().any(char::is_whitespace) {
         return None;
     }
-    let (scheme, rest) = raw.split_once("://")?;
-    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+    let (given, rest) = match raw.split_once("://") {
+        Some((scheme, rest)) => (Some(scheme), rest),
+        None => (None, raw),
+    };
+    if given.is_some_and(|scheme| {
+        !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https")
+    }) {
         return None;
     }
     if rest.contains(['@', '?', '#', '\\']) {
@@ -59,7 +65,30 @@ pub(crate) fn base_url(raw: &str) -> Option<String> {
             None => host_ok(rest),
         }
     };
-    ok.then(|| format!("{}://{rest}", scheme.to_ascii_lowercase()))
+    if !ok {
+        return None;
+    }
+    let scheme = match given {
+        Some(scheme) => scheme.to_ascii_lowercase(),
+        None if local_origin(rest) => "http".to_owned(),
+        None => "https".to_owned(),
+    };
+    Some(format!("{scheme}://{rest}"))
+}
+
+fn local_origin(rest: &str) -> bool {
+    let host = if let Some(v6) = rest.strip_prefix('[') {
+        v6.split_once(']').map(|(addr, _)| addr).unwrap_or("")
+    } else {
+        match rest.rsplit_once(':') {
+            Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) => host,
+            _ => rest,
+        }
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host == "127.0.0.1"
+        || host == "::1"
+        || host == "0.0.0.0"
 }
 
 fn host_ok(host: &str) -> bool {
@@ -329,6 +358,15 @@ mod tests {
             base_url("  https://Example.com/  ").as_deref(),
             Some("https://Example.com")
         );
+        assert_eq!(
+            base_url("private.tinyclient.io").as_deref(),
+            Some("https://private.tinyclient.io")
+        );
+        assert_eq!(
+            base_url("127.0.0.1:8080").as_deref(),
+            Some("http://127.0.0.1:8080")
+        );
+        assert_eq!(base_url("localhost").as_deref(), Some("http://localhost"));
         assert_eq!(
             base_url("http://[::1]:8080").as_deref(),
             Some("http://[::1]:8080")

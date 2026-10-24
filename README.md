@@ -62,7 +62,7 @@ Sizes of a macOS arm64 release build, 2026-10-14:
 
 ## What works today
 
-Current release: [v0.2.8](https://github.com/itz4blitz/tinyclient/releases/tag/v0.2.8). This is what `main` does. The goal is full parity with each official app. Every gap is a place to help.
+Current release: [v0.2.9](https://github.com/itz4blitz/tinyclient/releases/tag/v0.2.9). This is what `main` does. The goal is full parity with each official app. Every gap is a place to help.
 
 | Network | Sign-in | Reading and media | Writing | Calls |
 | --- | --- | --- | --- | --- |
