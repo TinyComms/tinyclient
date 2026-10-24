@@ -527,8 +527,10 @@ impl Drop for Daemon {
 fn a_ring_we_placed_is_not_a_call_until_the_other_side_answers_whatever_our_media_does() {
     let _turn = alone();
     let voice = Voice::new();
-    // The demo's network answers a direct call after this long.
-    let chatd = Daemon::start(&voice, "2500");
+    // The demo's network answers a direct call after this long. Roomy, so a slow or cold
+    // machine, where starting mediad alone can take a second, still outruns it.
+    const ANSWER_MS: u64 = 6_000;
+    let chatd = Daemon::start(&voice, &ANSWER_MS.to_string());
     let ines = Key {
         network: Network::Discord,
         account: "210000000000000000".into(),
@@ -543,14 +545,14 @@ fn a_ring_we_placed_is_not_a_call_until_the_other_side_answers_whatever_our_medi
     voice.admit(&mut peer);
     peer.expect(5);
     until("our devices", || chatd.call().is_some_and(|call| call.input == "tone"));
-    assert!(rang.elapsed() < Duration::from_millis(2_000), "the answer was not outrun: {:?}", rang.elapsed());
+    assert!(rang.elapsed() < Duration::from_millis(ANSWER_MS - 1_000), "the answer was not outrun: {:?}", rang.elapsed());
     let call = chatd.call().expect("the ring");
     assert_eq!((call.state, call.joined), (CallState::RingingOut, 0), "media being up is not an answer");
     assert!(call.participants.is_empty());
 
     // They pick up: now it is a call, with them in it.
     until("the answer", || chatd.call().is_some_and(|call| call.state == CallState::Joined));
-    assert!(rang.elapsed() >= Duration::from_millis(2_400), "joined before anyone answered: {:?}", rang.elapsed());
+    assert!(rang.elapsed() >= Duration::from_millis(ANSWER_MS - 600), "joined before anyone answered: {:?}", rang.elapsed());
     let call = chatd.call().unwrap();
     assert!(call.joined > 0);
     until("the roster", || chatd.call().is_some_and(|call| call.participants.iter().any(|who| who.name == "Ines Marchetti")));
