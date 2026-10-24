@@ -6,9 +6,17 @@ set -eu
 
 case "${RUNNER_OS:-}" in
     Linux)
-        # Stable rustc links x86_64 Linux with its own lld. Turn that off so mold is the
-        # linker on x86_64 and on aarch64 (where lld is not the default yet).
-        echo 'RUSTFLAGS=-C linker-features=-lld -C link-arg=-fuse-ld=mold' >> "$GITHUB_ENV"
+        # Stable rustc links x86_64 Linux with its own lld. Turning that off is stabilized
+        # only there. On aarch64 the same flag is rejected, and the system linker is already
+        # the default, so mold is selected with -fuse-ld alone.
+        case "$(uname -m)" in
+            x86_64)
+                echo 'RUSTFLAGS=-C linker-features=-lld -C link-arg=-fuse-ld=mold' >> "$GITHUB_ENV"
+                ;;
+            *)
+                echo 'RUSTFLAGS=-C link-arg=-fuse-ld=mold' >> "$GITHUB_ENV"
+                ;;
+        esac
         ;;
     Windows)
         # rustc calls the linker as `rust-lld -flavor link`. The gcc-ld copy named
