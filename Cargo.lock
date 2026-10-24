@@ -1015,7 +1015,7 @@ dependencies = [
 
 [[package]]
 name = "chatd"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "aes 0.8.4",
  "aes-gcm",
@@ -4934,7 +4934,7 @@ dependencies = [
 
 [[package]]
 name = "login"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "block2 0.6.2",
  "embed-resource",
@@ -5094,7 +5094,7 @@ checksum = "7ebb8d8732c6a6df3d8f032a82911cfc747e00efb95cc46e8d0acd5b5b88570c"
 
 [[package]]
 name = "mediad"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "aes-gcm",
  "chacha20poly1305",
@@ -7013,7 +7013,7 @@ dependencies = [
 
 [[package]]
 name = "protocol"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "interprocess",
  "serde",
@@ -9077,7 +9077,7 @@ dependencies = [
 
 [[package]]
 name = "tinyclient"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "embed-resource",
  "gpui",
