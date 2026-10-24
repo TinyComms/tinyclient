@@ -97,7 +97,7 @@ impl Demo {
             Network::Teams => format!("19:{}_robin@unq.gbl.spaces", number.parse::<u32>().unwrap_or(0)),
             Network::Discord => format!("500000000000000{number}"),
             // A Signal chat with a person is named by the person.
-            Network::Signal | Network::Messages => person_id.to_owned(),
+            Network::Signal | Network::Messages | Network::Tiny => person_id.to_owned(),
         }
     }
 
@@ -330,7 +330,7 @@ impl Demo {
                 }
             }
             // Signal tells a linked device nothing more about a person.
-            Network::Signal | Network::Messages => {}
+            Network::Signal | Network::Messages | Network::Tiny => {}
         }
         about
     }
@@ -479,7 +479,7 @@ impl Demo {
             peer: Some(person_id.to_owned()),
             call: match self.ctx.account.network {
                 Network::Discord => CallSupport::Native,
-                Network::Signal => CallSupport::None,
+                Network::Signal | Network::Tiny => CallSupport::None,
                 _ => CallSupport::Handoff,
             },
             ..ConversationRow::new(id.clone(), ConversationKind::Direct, person.name)
@@ -605,6 +605,7 @@ impl Demo {
             Network::Teams => crate::adapters::teams::message::reaction_rules(),
             Network::Signal => crate::adapters::signal::reaction_rules(),
             Network::Messages => crate::adapters::messages::reaction_rules(),
+            Network::Tiny => crate::adapters::messages::reaction_rules(),
         }
     }
 
@@ -676,6 +677,7 @@ impl Demo {
                 let link = match demo.ctx.account.network {
                     Network::Slack => format!("https://app.slack.com/huddle/{account}/{conversation_id}"),
                     Network::Messages => "https://messages.google.com/web/".to_owned(),
+                    Network::Tiny => String::new(),
                     _ => format!("https://discord.com/channels/@me/{conversation_id}"),
                 };
                 let _ = reply.send(Ok(link));

@@ -1201,6 +1201,10 @@ impl Chat {
         if network == Network::Signal {
             return error(ErrorCode::Unsupported, "Signal signs in by linking from your phone, not in a window.");
         }
+        // Tiny signs in through the sheet (`SignInBegin`), never the browser helper.
+        if network == Network::Tiny {
+            return error(ErrorCode::Unsupported, "A Tiny server signs in in the sheet, not in a window.");
+        }
         // A scratch directory signs nobody in. A test may still name a helper of its own, to
         // see what it is run with and how its answer is told; its session is never kept.
         if !session::enabled() && std::env::var_os("TINYCLIENT_LOGIN").is_none() {
@@ -1250,6 +1254,7 @@ impl Chat {
             Network::Telegram => adapters::telegram::signin::step(&self.hub, input, Box::new(adopt)),
             Network::Signal => adapters::signal::signin::step(&self.hub, input, Box::new(adopt)),
             Network::Messages => adapters::messages::signin::step(&self.hub, input, Box::new(adopt)),
+            Network::Tiny => adapters::tiny::signin::step(&self.hub, input, Box::new(adopt)),
             _ => Err(format!("{} signs in in its own window.", network.label())),
         };
         match step {
@@ -1631,6 +1636,7 @@ impl Chat {
                     Network::Telegram => adapters::telegram::signin::cancel(),
                     Network::Signal => adapters::signal::signin::cancel(),
                     Network::Messages => adapters::messages::signin::cancel(),
+                    Network::Tiny => adapters::tiny::signin::cancel(),
                     _ => {}
                 }
                 Response::Ok

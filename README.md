@@ -19,7 +19,7 @@
 
 </div>
 
-tinyclient is a chat client written in Rust. It signs in to Slack, Discord, Telegram, Microsoft Teams, Signal, and Android Messages, and shows them in one window with one design. It runs entirely on your machine. It talks to each network directly. There is no tinyclient server, and nothing you type is sent anywhere else. It is built for macOS, Linux, and Windows.
+tinyclient is a chat client written in Rust. It signs in to Slack, Discord, Telegram, Microsoft Teams, Signal, and Android Messages, and shows them in one window with one design. It runs entirely on your machine. It talks to each of those networks directly. There is no tinyclient server, and nothing you type is sent anywhere else. You can also add one Tiny server you already run; that sign-in talks only to that server. It is built for macOS, Linux, and Windows.
 
 The project is early. The goal is a client that is a pleasure to use and does everything the official apps do, on every network, while staying small. Talk with us on [Discord](https://discord.gg/kJHK7BNvJP), or [come help](#contributing).
 
@@ -72,6 +72,7 @@ Current release: [v0.2.5](https://github.com/itz4blitz/tinyclient/releases/tag/v
 | **Telegram** | QR code from your phone, or a phone number and code, plus a 2FA password | Chats, folders, topics, photos, pins | Text, files, reactions, edit, delete, mute, leave | Calls open in Telegram |
 | **Signal** | Linked as a device. Scan a QR code from your phone. | Direct and group chats, replies, mentions, reactions, edits, deletes. Photos and files appear as a labelled line. Nothing from before the link. Your own chat is **Note to Self**, including messages sent from your phone. | Text, replies, reactions, edit and delete your own | Not built |
 | **Messages** | Paired from the Android phone, the way [messages.google.com](https://messages.google.com) is. The phone stays the account and has to stay online. | Texts in the chats the phone already has. Photos are shown. Other files are named and can be opened. | Text, one file at a time, reactions. A large photo may be sent as a smaller copy. | Opens in Messages |
+| **Tiny server** | Server address, email, and password, in the app. One server. | Not yet: no conversations | Not yet | Not yet |
 
 A few behaviours that are easy to miss:
 
@@ -262,7 +263,7 @@ flowchart LR
     mediad["mediad<br/>one call"]
     db[("chat.sqlite<br/>media/")]
     keys[("system<br/>credential store")]
-    nets(["Slack · Discord · Teams<br/>Telegram · Signal · Messages"])
+    nets(["Slack · Discord · Teams<br/>Telegram · Signal · Messages<br/>a Tiny server you run"])
     voice(["Discord voice"])
 
     shell <-->|"local socket<br/>length-prefixed JSON"| chatd
@@ -279,7 +280,7 @@ flowchart LR
 | [`protocol`](crates/protocol) | | The contract: every request, answer, and change, as serde types. Frames are a 4-byte length, then JSON, at most 1 MiB, over a Unix socket (a named pipe on Windows). Also the panic hook, credential redaction, and how the shell starts chatd. |
 | [`chatd`](crates/chatd) | `chatd` | Always on, one per data directory. One adapter per account speaks that network's protocol. Everything lands in SQLite and the media cache. Spawns `tinyclient-login` for a sign-in and `mediad` for a call. Never decodes media and never fetches a link from a message. |
 | [`mediad`](crates/mediad) | `mediad` | Voice: Discord's voice gateway, RTP over UDP, Opus, DAVE, audio devices through cpal. Speaks only to chatd over stdin and stdout, and exits when the call ends or chatd closes its stdin. |
-| [`login`](crates/login) | `tinyclient-login` | The sign-in page for Slack, Discord, and Teams in a native web view (WKWebView on macOS, wry elsewhere). Prints the session on stdout and exits. Signal, Telegram, and Messages pair in the main window. |
+| [`login`](crates/login) | `tinyclient-login` | The sign-in page for Slack, Discord, and Teams in a native web view (WKWebView on macOS, wry elsewhere). Prints the session on stdout and exits. Signal, Telegram, Messages, and a Tiny server sign in in the main window. |
 | [`tinyclient`](crates/tinyclient) | `tinyclient` | The shell. Draws what chatd reports and decodes images for rows on screen. GPUI is behind the `gui` feature so tests and the daemons never build a GPU stack. Never talks to a network or reads the database. |
 
 The shell learns about changes by long-polling. `Wait {since}` blocks for up to 30 seconds and answers every change newer than `since`. The full contract, the data each process may hold, and what an adapter must do are in [`docs/architecture.md`](docs/architecture.md).

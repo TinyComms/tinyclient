@@ -17,6 +17,7 @@ assets!(
     "networks/microsoft-teams.svg",
     "networks/signal.svg",
     "networks/messages.svg",
+    "networks/tiny.svg",
     "icons/arrow-down.svg",
     "icons/arrow-left.svg",
     "icons/arrow-right.svg",
@@ -142,6 +143,7 @@ pub fn network_asset(network: Network, points: f32) -> SharedString {
         Network::Teams => "microsoft-teams",
         Network::Signal => "signal",
         Network::Messages => "messages",
+        Network::Tiny => "tiny",
     };
     format!("networks/{name}.svg@{}", points.ceil()).into()
 }

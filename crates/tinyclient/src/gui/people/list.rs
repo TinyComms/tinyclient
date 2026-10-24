@@ -816,6 +816,7 @@ impl PeopleList {
                 Network::Teams => "Teams",
                 Network::Signal => "Signal contacts",
                 Network::Messages => "Messages",
+                Network::Tiny => "Tiny server",
             };
             let shell = self.shell.clone();
             let link = div()
@@ -995,6 +996,7 @@ impl PeopleList {
                 (Chip::Online, Some(Network::Discord)) => ("No friends online".to_owned(), "Friends who come online show up here.".to_owned()),
                 (_, Some(Network::Discord)) => ("No friends on Discord yet".to_owned(), "Friends you add in Discord appear here.".to_owned()),
                 (_, Some(Network::Telegram)) => ("No contacts yet".to_owned(), "Type a @username to find someone.".to_owned()),
+                (_, Some(Network::Tiny)) => ("Nothing here yet".to_owned(), String::new()),
                 (_, Some(_)) => ("No direct messages yet".to_owned(), "Type a name to find anyone.".to_owned()),
                 (_, None) => ("Nobody's around right now".to_owned(), "People you talk to show up here.".to_owned()),
             }

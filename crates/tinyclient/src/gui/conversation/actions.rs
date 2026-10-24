@@ -108,7 +108,7 @@ pub fn message_link(conversation: &protocol::Key, space: Option<&str>, message: 
             Some(format!("https://discord.com/channels/{place}/{channel}/{id}"))
         }
         Network::Slack => space.map(|team| format!("slack://channel?team={team}&id={channel}&message={id}")),
-        Network::Telegram | Network::Teams | Network::Signal | Network::Messages => None,
+        Network::Telegram | Network::Teams | Network::Signal | Network::Messages | Network::Tiny => None,
     }
 }
 

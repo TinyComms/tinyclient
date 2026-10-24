@@ -401,8 +401,8 @@ pub fn place_word(network: Network, count: u32) -> &'static str {
         (Network::Teams, _) => "teams",
         (Network::Telegram, 1) => "group",
         (Network::Telegram, _) => "groups",
-        (Network::Signal | Network::Messages, 1) => "group",
-        (Network::Signal | Network::Messages, _) => "groups",
+        (Network::Signal | Network::Messages | Network::Tiny, 1) => "group",
+        (Network::Signal | Network::Messages | Network::Tiny, _) => "groups",
     }
 }
 
@@ -641,7 +641,7 @@ pub fn conversation_link(conversation: &Conversation, info: Option<&Conversation
         Network::Slack => conversation.space.as_ref().map(|team| format!("slack://channel?team={team}&id={id}")),
         Network::Telegram | Network::Teams => told,
         // Signal opens a chat only by a phone number or username, which a row does not carry.
-        Network::Signal | Network::Messages => None,
+        Network::Signal | Network::Messages | Network::Tiny => None,
     }
 }
 
@@ -649,7 +649,7 @@ pub fn space_link(space: &protocol::Key) -> Option<String> {
     match space.network {
         Network::Discord => Some(format!("https://discord.com/channels/{}", space.id)),
         Network::Slack => Some(format!("slack://open?team={}", space.id)),
-        Network::Telegram | Network::Teams | Network::Signal | Network::Messages => None,
+        Network::Telegram | Network::Teams | Network::Signal | Network::Messages | Network::Tiny => None,
     }
 }
 

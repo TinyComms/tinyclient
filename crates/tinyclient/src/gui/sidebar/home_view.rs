@@ -97,7 +97,7 @@ impl Shell {
                     }
                 }
                 Network::Teams | Network::Signal | Network::Messages => read.chats = whole(network, None, Shelf::Main)?.0,
-                Network::Slack => {}
+                Network::Slack | Network::Tiny => {}
             }
             Ok(read)
         };

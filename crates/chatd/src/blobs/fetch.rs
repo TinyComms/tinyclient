@@ -61,6 +61,8 @@ impl Hosts {
             Network::Signal => (&[], &[]),
             // Media is encrypted for the phone. The adapter fetches it itself, later.
             Network::Messages => (&[], &[]),
+            // A Tiny server has no files in this slice.
+            Network::Tiny => (&[], &[]),
         };
         if session.iter().any(|name| under(&host, name)) {
             Some(Trust::Session)

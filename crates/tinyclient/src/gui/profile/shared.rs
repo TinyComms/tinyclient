@@ -67,6 +67,7 @@ pub fn source(network: Network, tab: Tab, page: &Page) -> Source {
     // CONTRACT: Teams has no confirmed route to a chat's files, so its list is never searched.
     match network {
         Network::Teams => Source { line, search: false, open_in: true },
+        Network::Tiny => Source { line, search: false, open_in: false },
         _ => Source { line, search: true, open_in: false },
     }
 }
