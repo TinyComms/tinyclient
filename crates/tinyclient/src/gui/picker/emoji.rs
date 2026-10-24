@@ -360,6 +360,7 @@ pub(super) fn account_word(account: &AccountKey) -> String {
         Network::Teams => "teams",
         Network::Signal => "signal",
         Network::Messages => "messages",
+        Network::Tiny => "tiny",
     };
     format!("{network}:{}", account.account)
 }

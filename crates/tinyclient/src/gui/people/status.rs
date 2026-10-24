@@ -47,12 +47,12 @@ pub fn states(network: Network) -> &'static [Presence] {
         Network::Discord | Network::Teams => &[Presence::Online, Presence::Idle, Presence::Dnd, Presence::Offline],
         Network::Slack => &[Presence::Online, Presence::Idle],
         // Signal shows no presence at all.
-        Network::Telegram | Network::Signal | Network::Messages => &[],
+        Network::Telegram | Network::Signal | Network::Messages | Network::Tiny => &[],
     }
 }
 
 fn has_status_text(network: Network) -> bool {
-    !matches!(network, Network::Telegram | Network::Signal | Network::Messages)
+    !matches!(network, Network::Telegram | Network::Signal | Network::Messages | Network::Tiny)
 }
 
 /// The word for a state of our own: choosing to look offline has the network's name for it.

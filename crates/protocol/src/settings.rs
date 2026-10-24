@@ -116,6 +116,7 @@ fn network_word(network: Network) -> &'static str {
         Network::Teams => "teams",
         Network::Signal => "signal",
         Network::Messages => "messages",
+        Network::Tiny => "tiny",
     }
 }
 

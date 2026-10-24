@@ -1,8 +1,9 @@
-//! The Telegram and Signal sign-in sheet (`docs/design/08-first-run-settings.md`, section 2).
-//! Neither has a web page to show, so tinyclient draws the sign-in itself. Telegram: a code to
+//! The Telegram, Signal, Messages, and Tiny server sign-in sheet (`docs/design/08-first-run-settings.md`, section 2).
+//! None of them has a web page to show, so tinyclient draws the sign-in itself. Telegram: a code to
 //! scan, or a phone number, the code Telegram sends and, for accounts that have one, the two-step
 //! password. Signal: only the code to scan from the phone, which links this computer as one more
-//! device; a number typed here would take the account from the phone, so none is asked.
+//! device; a number typed here would take the account from the phone, so none is asked. A Tiny
+//! server asks for its address, then an email, then the password for that server.
 //!
 //! chatd owns the sign-in. The sheet asks it to begin, draws the step it is told
 //! (`protocol::SignInStep`) and answers it; while the sheet is open its own loop asks `Wait` and
@@ -84,6 +85,10 @@ pub struct Sheet {
     digits: Entity<TextInput>,
     /// The field behind the password's bullets.
     password: Entity<TextInput>,
+    /// A Tiny server's address.
+    url: Entity<TextInput>,
+    /// The email on that server.
+    email: Entity<TextInput>,
     /// Has the keys when no field does, so Escape still closes the sheet.
     focus: FocusHandle,
     /// The step changed: put the keys where typing goes, on the next frame.
@@ -112,7 +117,7 @@ fn holder(cx: &mut App) -> Entity<Sheet> {
 /// Opens the sheet for a network that signs in here. `false` for one that signs in through its
 /// own web page, so the caller goes on to the helper window.
 pub fn open(network: Network, cx: &mut Context<Shell>) -> bool {
-    if !matches!(network, Network::Telegram | Network::Signal | Network::Messages) {
+    if !matches!(network, Network::Telegram | Network::Signal | Network::Messages | Network::Tiny) {
         return false;
     }
     holder(cx).update(cx, |sheet, cx| sheet.open(network, cx));
@@ -144,14 +149,19 @@ fn now() -> i64 {
 /// The words for a problem, naming the network that is signing in.
 fn problem_words(network: Network, problem: &SignInProblem) -> String {
     let name = network.label();
+    let tiny = network == Network::Tiny;
     match problem {
+        SignInProblem::Unreachable if tiny => "Couldn't reach that server. Check the address and your connection.".to_owned(),
         SignInProblem::Unreachable => format!("Couldn't reach {name}. Check your connection."),
         SignInProblem::PhoneInvalid => "That doesn't look like a phone number.".to_owned(),
         SignInProblem::PhoneUnknown => format!("No {name} account uses this number. Create one in the {name} app first."),
         SignInProblem::PhoneBanned => format!("{name} has blocked this number."),
         SignInProblem::CodeInvalid => "That code isn't right. Check it and type it again.".to_owned(),
         SignInProblem::CodeExpired => "That code has expired.".to_owned(),
+        SignInProblem::PasswordInvalid if tiny => "That email or password isn't right.".to_owned(),
         SignInProblem::PasswordInvalid => "That password isn't right.".to_owned(),
+        SignInProblem::UrlInvalid => "That doesn't look like a server address.".to_owned(),
+        SignInProblem::EmailInvalid => "That doesn't look like an email address.".to_owned(),
         SignInProblem::TooMany { until } => format!("Too many tries. {name} allows another at {}.", clock(*until)),
         SignInProblem::Other { reason } => reason.clone(),
     }
@@ -214,13 +224,31 @@ fn step_problem(step: &SignInStep) -> Option<&SignInProblem> {
         SignInStep::Qr { problem, .. }
         | SignInStep::Phone { problem }
         | SignInStep::Code { problem, .. }
-        | SignInStep::Password { problem, .. } => problem.as_ref(),
+        | SignInStep::Password { problem, .. }
+        | SignInStep::Server { problem }
+        | SignInStep::Email { problem, .. } => problem.as_ref(),
         SignInStep::Done { .. } | SignInStep::Failed { .. } => None,
     }
 }
 
 fn waiting() -> SignInStep {
     SignInStep::Qr { link: String::new(), expires: 0, problem: None }
+}
+
+/// What the sheet draws before chatd has answered. Tiny starts on the address, not a code.
+fn waiting_for(network: Network) -> SignInStep {
+    if network == Network::Tiny {
+        SignInStep::Server { problem: None }
+    } else {
+        waiting()
+    }
+}
+
+/// `TINYCLIENT_SIGNIN` names a sheet. Tiny's label is "Tiny server"; `tiny` opens it too.
+fn asked_network(word: &str) -> Option<Network> {
+    [Network::Telegram, Network::Signal, Network::Messages, Network::Tiny]
+        .into_iter()
+        .find(|network| network.label().eq_ignore_ascii_case(word) || (*network == Network::Tiny && word.eq_ignore_ascii_case("tiny")))
 }
 
 fn failed(reason: &str) -> Face {
@@ -235,6 +263,8 @@ impl Sheet {
         let number = cx.new(|cx| TextInput::new("Phone number", cx));
         let digits = cx.new(|cx| TextInput::new("", cx));
         let password = cx.new(|cx| TextInput::new("", cx));
+        let url = cx.new(|cx| TextInput::new("Server URL", cx));
+        let email = cx.new(|cx| TextInput::new("Email", cx));
         for input in [&country, &number] {
             cx.subscribe(input, |this, _, event: &InputEvent, cx| match event {
                 InputEvent::Submit => this.send_phone(cx),
@@ -253,8 +283,18 @@ impl Sheet {
             InputEvent::Changed => cx.notify(),
         })
         .detach();
+        cx.subscribe(&url, |this, _, event: &InputEvent, cx| match event {
+            InputEvent::Submit => this.send_url(cx),
+            InputEvent::Changed => cx.notify(),
+        })
+        .detach();
+        cx.subscribe(&email, |this, _, event: &InputEvent, cx| match event {
+            InputEvent::Submit => this.send_email(cx),
+            InputEvent::Changed => cx.notify(),
+        })
+        .detach();
         // Escape in a field is the field's key; it hands it on.
-        for input in [&country, &number, &digits, &password] {
+        for input in [&country, &number, &digits, &password, &url, &email] {
             cx.subscribe(input, |this, _, event: &InputKey, cx| {
                 if matches!(event, InputKey::Escape) {
                     this.close(true, cx);
@@ -275,6 +315,8 @@ impl Sheet {
             number,
             digits,
             password,
+            url,
+            email,
             focus: cx.focus_handle(),
             refocus: false,
             before: None,
@@ -283,16 +325,16 @@ impl Sheet {
         }
     }
 
-    /// Once, at the first frame: `TINYCLIENT_SIGNIN=telegram` (or `signal`) opens the sheet, which is
-    /// how it is reached while the first-run row still says "Not available yet". A screenshot
-    /// build may ask for a made-up step instead.
+    /// Once, at the first frame: `TINYCLIENT_SIGNIN=telegram` (or `signal`, `messages`, `tiny`) opens
+    /// the sheet, which is how it is reached while the first-run row still says "Not available yet".
+    /// A screenshot build may ask for a made-up step instead.
     fn launch(&mut self, cx: &mut Context<Sheet>) {
         #[cfg(feature = "gui-shot")]
         if let Some(canned) = shot::canned() {
             self.show_canned(canned, cx);
             return;
         }
-        let asked = std::env::var("TINYCLIENT_SIGNIN").ok().and_then(|word| [Network::Telegram, Network::Signal, Network::Messages].into_iter().find(|n| n.label().eq_ignore_ascii_case(&word)));
+        let asked = std::env::var("TINYCLIENT_SIGNIN").ok().as_deref().and_then(asked_network);
         if let Some(network) = asked {
             self.open(network, cx);
         }
@@ -322,7 +364,7 @@ impl Sheet {
         self.network = network;
         self.clear_fields(cx);
         // The tile is up at once, saying a code is on its way.
-        self.face = Some(Face::Step(waiting()));
+        self.face = Some(Face::Step(waiting_for(network)));
         self.refocus = true;
         self.begin(cx);
         cx.notify();
@@ -351,6 +393,8 @@ impl Sheet {
         self.clear_typed(cx);
         self.number.update(cx, |input, cx| input.set_text("", cx));
         self.country.update(cx, |input, cx| input.set_text("+1", cx));
+        self.url.update(cx, |input, cx| input.set_text("", cx));
+        self.email.update(cx, |input, cx| input.set_text("", cx));
     }
 
     /// Drops a typed code and password. They live nowhere else.
@@ -536,7 +580,7 @@ impl Sheet {
         self.local = None;
         self.code = None;
         self.clear_typed(cx);
-        self.face = Some(Face::Step(waiting()));
+        self.face = Some(Face::Step(waiting_for(self.network)));
         self.refocus = true;
         // Bumped now, so an answer still on its way to the old sign-in is dropped.
         self.epoch += 1;
@@ -605,12 +649,36 @@ impl Sheet {
         self.answer(SignInInput::Password { password }, cx);
     }
 
+    fn send_url(&mut self, cx: &mut Context<Sheet>) {
+        if self.busy {
+            return;
+        }
+        let url = self.url.read(cx).text().to_owned();
+        if url.trim().is_empty() {
+            return;
+        }
+        self.answer(SignInInput::Server { url }, cx);
+    }
+
+    fn send_email(&mut self, cx: &mut Context<Sheet>) {
+        if self.busy {
+            return;
+        }
+        let email = self.email.read(cx).text().to_owned();
+        if email.trim().is_empty() {
+            return;
+        }
+        self.answer(SignInInput::Email { email }, cx);
+    }
+
     /// Where typing goes on the step on show.
     fn target(&self, cx: &App) -> FocusHandle {
         match &self.face {
             Some(Face::Step(SignInStep::Phone { .. })) => self.number.focus_handle(cx),
             Some(Face::Step(SignInStep::Code { .. })) => self.digits.focus_handle(cx),
             Some(Face::Step(SignInStep::Password { .. })) => self.password.focus_handle(cx),
+            Some(Face::Step(SignInStep::Server { .. })) => self.url.focus_handle(cx),
+            Some(Face::Step(SignInStep::Email { .. })) => self.email.focus_handle(cx),
             _ => self.focus.clone(),
         }
     }
@@ -684,11 +752,12 @@ impl Sheet {
             (None, Some((_, code))) => code_tile(code.clone()),
             (None, None) => quiet_tile().child(div().text_center().child(format!("Getting a code from {}", self.network.label()))),
         };
-        let phone_only = matches!(self.network, Network::Signal | Network::Messages);
+        let phone_only = matches!(self.network, Network::Signal | Network::Messages | Network::Tiny);
         let steps = match self.network {
             Network::Signal => ["Open Signal on your phone.", "Go to Settings > Linked devices > Link new device.", "Point the phone at this code."],
             Network::Messages => ["Open Messages on your Android phone.", "Go to Settings > Device pairing > QR code scanner.", "Point the phone at this code."],
-            _ => ["Open Telegram on your phone.", "Go to Settings > Devices > Link Desktop Device.", "Point the phone at this code."],
+            Network::Tiny => ["The address of a server you already run.", "Then the email on that account.", "Then the password."],
+            Network::Telegram | Network::Discord | Network::Slack | Network::Teams => ["Open Telegram on your phone.", "Go to Settings > Devices > Link Desktop Device.", "Point the phone at this code."],
         };
         // Signal and Messages link a computer only from the phone: there is no other way in to offer.
         let other_way = (!phone_only).then(|| self.answer_link("signin-use-phone", "Use a phone number instead", || SignInInput::UsePhone, cx));
@@ -854,27 +923,58 @@ impl Sheet {
             )
             .child(hidden(&self.password, 12., 10., 64.))
             .child(bullets);
+        let tiny = self.network == Network::Tiny;
+        let heading = if tiny { self.header("Password", true, cx) } else { self.header("Two-step verification password", true, cx) };
+        let aside = if tiny {
+            div().type_ui().text_color(theme::text_soft()).child("The password for that server.")
+        } else {
+            // Words in a link's color, not a link: the reset happens in Telegram's own app.
+            div().type_ui().text_color(theme::accent_text()).child("Forgot it? Reset it in the Telegram app.")
+        };
         div()
             .flex()
             .flex_col()
-            .child(self.header("Two-step verification password", true, cx))
+            .child(heading)
             .child(div().mt(px(16.)).child(secret))
             .children(problem.map(|problem| error_line(problem_words(self.network, problem)).mt(px(6.))))
             // `text_faint` does not sit on `overlay` (`01-system.md`, rule 7): one level up.
-            .children((!hint.is_empty()).then(|| div().mt(px(6.)).type_small().text_color(theme::text_soft()).child(format!("Hint from Telegram: {hint}"))))
-            .child(
-                footer(22.)
-                    // Words in a link's color, not a link: the reset happens in Telegram's own app.
-                    .child(div().type_ui().text_color(theme::accent_text()).child("Forgot it? Reset it in the Telegram app."))
-                    .child(buttons().child(self.cancel("Cancel", cx)).child(self.primary("Continue", Sheet::send_password, cx))),
-            )
+            .children((!tiny && !hint.is_empty()).then(|| div().mt(px(6.)).type_small().text_color(theme::text_soft()).child(format!("Hint from Telegram: {hint}"))))
+            .child(footer(22.).child(aside).child(buttons().child(self.cancel("Cancel", cx)).child(self.primary("Continue", Sheet::send_password, cx))))
+    }
+
+    fn server_step(&self, problem: Option<&SignInProblem>, window: &mut Window, cx: &Context<Sheet>) -> Div {
+        let focused = self.url.focus_handle(cx).is_focused(window);
+        let input = tall_field(focused, problem.is_some()).child(self.url.clone());
+        div()
+            .flex()
+            .flex_col()
+            .child(self.header("Server", false, cx))
+            .child(div().mt(px(6.)).mb(px(16.)).text_color(theme::text_soft()).child("The address of a server you already run."))
+            .child(input)
+            .children(problem.map(|problem| error_line(problem_words(self.network, problem)).mt(px(6.))))
+            .child(footer(22.).child(div()).child(buttons().child(self.cancel("Cancel", cx)).child(self.primary("Continue", Sheet::send_url, cx))))
+    }
+
+    fn email_step(&self, server: &str, problem: Option<&SignInProblem>, window: &mut Window, cx: &Context<Sheet>) -> Div {
+        let focused = self.email.focus_handle(cx).is_focused(window);
+        let input = tall_field(focused, problem.is_some()).child(self.email.clone());
+        div()
+            .flex()
+            .flex_col()
+            .child(self.header("Email", true, cx))
+            .child(div().mt(px(6.)).mb(px(16.)).text_color(theme::text_soft()).child(server.to_owned()))
+            .child(input)
+            .children(problem.map(|problem| error_line(problem_words(self.network, problem)).mt(px(6.))))
+            .child(footer(22.).child(div()).child(buttons().child(self.cancel("Cancel", cx)).child(self.primary("Continue", Sheet::send_email, cx))))
     }
 
     fn title(&self) -> &'static str {
         match self.network {
+            Network::Telegram => "Sign in to Telegram",
             Network::Signal => "Sign in to Signal",
             Network::Messages => "Sign in to Messages",
-            _ => "Sign in to Telegram",
+            Network::Tiny => "Sign in to Tiny server",
+            Network::Discord | Network::Slack | Network::Teams => "Sign in to Telegram",
         }
     }
 
@@ -1081,6 +1181,8 @@ impl Render for Sheet {
                         self.code_step(*via, *length, phone, *next, *resend_at, problem, window, cx)
                     }
                     SignInStep::Password { hint, .. } => self.password_step(hint, problem, window, cx),
+                    SignInStep::Server { .. } => self.server_step(problem, window, cx),
+                    SignInStep::Email { server, .. } => self.email_step(server, problem, window, cx),
                     SignInStep::Failed { reason } => self.failed_step(reason, cx),
                     SignInStep::Done { .. } => div(),
                 }
@@ -1173,6 +1275,12 @@ mod tests {
         assert_eq!(words(SignInProblem::TooMany { until }), format!("Too many tries. Telegram allows another at {}.", clock(until)));
         // Signal is named for itself.
         assert_eq!(problem_words(Network::Signal, &SignInProblem::Unreachable), "Couldn't reach Signal. Check your connection.");
+        assert_eq!(problem_words(Network::Tiny, &SignInProblem::UrlInvalid), "That doesn't look like a server address.");
+        assert_eq!(problem_words(Network::Tiny, &SignInProblem::EmailInvalid), "That doesn't look like an email address.");
+        assert_eq!(problem_words(Network::Tiny, &SignInProblem::PasswordInvalid), "That email or password isn't right.");
+        assert_eq!(problem_words(Network::Tiny, &SignInProblem::Unreachable), "Couldn't reach that server. Check the address and your connection.");
+        assert_eq!(asked_network("tiny"), Some(Network::Tiny));
+        assert_eq!(asked_network("Tiny server"), Some(Network::Tiny));
     }
 
     #[test]

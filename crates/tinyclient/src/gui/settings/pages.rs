@@ -627,7 +627,7 @@ impl SettingsWindow {
                 ("P1", Network::Telegram) | ("P2", Network::Telegram) => (Some("Always on"), Some("Telegram does not let an app turn this off.")),
                 ("P1", Network::Signal) | ("P2", Network::Signal) => (Some("Set on your phone"), Some("Signal takes this from your phone's settings.")),
                 ("P1", Network::Messages) => (Some("Sent to the phone"), Some("Messages shows typing on your other devices.")),
-                ("P2", Network::Discord | Network::Slack) => continue,
+                ("P2", Network::Discord | Network::Slack) | ("P1" | "P2", Network::Tiny) => continue,
                 _ => (None, None),
             };
             let name = if account.name.is_empty() { network_name(network).to_owned() } else { account.name.clone() };

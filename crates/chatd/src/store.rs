@@ -1522,10 +1522,12 @@ impl Store {
         let pattern = format!("%{}%", like_prefix(query));
         self.db
             .prepare(
-                "SELECT m.network, m.account, m.conversation, m.id, m.sent, m.text, m.body, c.title, c.space_title
+                "SELECT m.network, m.account, m.conversation, m.id, m.sent, m.text, m.body, c.title,
+                        COALESCE(s.name, '')
                    FROM message m
                    JOIN conversation c ON c.network = m.network AND c.account = m.account
                       AND c.id = m.conversation
+                   LEFT JOIN space s ON s.network = c.network AND s.account = c.account AND s.id = c.space
                   WHERE m.pending = 0 AND m.text LIKE ?8 ESCAPE '\\'
                     AND (?1 IS NULL OR m.network = ?1)
                     AND (?2 IS NULL OR (m.network = ?2 AND m.account = ?3 AND m.conversation = ?4))
@@ -2638,10 +2640,14 @@ mod tests {
         store.ingest(&Key::new(&account, "guilded"), &said("1", "world of the guild", 10), false).unwrap();
         store.ingest(&Key::new(&account, "loose"), &said("2", "world outside", 20), false).unwrap();
 
+        store
+            .replace_spaces(&account, &[SpaceRow { id: "guild".into(), name: "Moss & Lichen".into(), icon: None, position: 0 }])
+            .unwrap();
         let space = Key::new(&account, "guild");
         let hits = store.search_messages(None, None, Some(&space), "world", 10).unwrap();
         assert_eq!(hits.iter().map(|hit| hit.message_id.as_str()).collect::<Vec<_>>(), ["1"]);
         assert_eq!(hits[0].title, "#in the space");
+        assert_eq!(hits[0].space_title, "Moss & Lichen");
         // The same space id on another network or account holds other rows: nothing answers.
         let elsewhere = Key::new(&AccountKey { network: Network::Slack, account: "me".into() }, "guild");
         assert!(store.search_messages(None, None, Some(&elsewhere), "world", 10).unwrap().is_empty());

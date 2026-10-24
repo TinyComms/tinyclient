@@ -34,6 +34,10 @@ pub enum SignInProblem {
     CodeInvalid,
     CodeExpired,
     PasswordInvalid,
+    /// Not an http or https origin: a user, a query, a fragment, or a path.
+    UrlInvalid,
+    /// Not one address: missing `@`, more than one, or whitespace.
+    EmailInvalid,
     /// The network will not take another try before `until` (unix seconds).
     TooMany { until: i64 },
     /// Anything else, in words the user can read.
@@ -75,9 +79,21 @@ pub enum SignInStep {
         problem: Option<SignInProblem>,
     },
     /// The account has a second password. `hint` is the user's own, as the network keeps it.
+    /// A Tiny server uses this step for the account password; `hint` is empty there.
     Password {
         #[serde(default, skip_serializing_if = "String::is_empty")]
         hint: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        problem: Option<SignInProblem>,
+    },
+    /// Ask for a Tiny server's address. `problem` is skipped when there is none.
+    Server {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        problem: Option<SignInProblem>,
+    },
+    /// Ask for the email on that server. `server` is the address that was accepted.
+    Email {
+        server: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         problem: Option<SignInProblem>,
     },
@@ -101,6 +117,10 @@ pub enum SignInInput {
     Phone { number: String },
     Code { code: String },
     Password { password: String },
+    /// A Tiny server's address, as typed.
+    Server { url: String },
+    /// The email on that server, as typed.
+    Email { email: String },
     /// Send the code again, the way `SignInStep::Code::next` says.
     Resend,
     /// One step back: from the code to the number, from the number to the QR code.
@@ -116,6 +136,8 @@ impl fmt::Debug for SignInInput {
             SignInInput::Phone { .. } => "Phone { .. }",
             SignInInput::Code { .. } => "Code { .. }",
             SignInInput::Password { .. } => "Password { .. }",
+            SignInInput::Server { .. } => "Server { .. }",
+            SignInInput::Email { .. } => "Email { .. }",
             SignInInput::Resend => "Resend",
             SignInInput::Back => "Back",
         })
@@ -131,7 +153,17 @@ mod tests {
         let typed = SignInInput::Password { password: "hunter2".into() };
         assert!(!format!("{typed:?}").contains("hunter2"));
         assert!(!format!("{:?}", SignInInput::Code { code: "12345".into() }).contains("12345"));
+        let url = SignInInput::Server { url: "http://127.0.0.1:8080".into() };
+        let email = SignInInput::Email { email: "ada@example.com".into() };
+        assert_eq!(format!("{url:?}"), "Server { .. }");
+        assert_eq!(format!("{email:?}"), "Email { .. }");
+        assert!(!format!("{url:?}").contains("127.0.0.1"));
+        assert!(!format!("{email:?}").contains("ada@"));
+        assert!(!format!("{email:?}").contains("example.com"));
         // A step with nothing but its name still reads: every other field is optional.
+        assert_eq!(serde_json::from_str::<SignInStep>(r#"{"step":"server"}"#).unwrap(), SignInStep::Server { problem: None });
+        let email_step = SignInStep::Email { server: "http://127.0.0.1:8080".into(), problem: None };
+        assert_eq!(serde_json::to_string(&email_step).unwrap(), r#"{"step":"email","server":"http://127.0.0.1:8080"}"#);
         assert_eq!(serde_json::from_str::<SignInStep>(r#"{"step":"phone"}"#).unwrap(), SignInStep::Phone { problem: None });
         assert_eq!(
             serde_json::from_str::<SignInStep>(r#"{"step":"qr"}"#).unwrap(),

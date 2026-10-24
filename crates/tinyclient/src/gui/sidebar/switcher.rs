@@ -127,7 +127,7 @@ fn space_word(network: Network) -> &'static str {
         Network::Teams => "Team",
         Network::Telegram => "Folder",
         // Signal has no Spaces; this is never asked of it.
-        Network::Signal | Network::Messages => "Group",
+        Network::Signal | Network::Messages | Network::Tiny => "Group",
     }
 }
 

@@ -698,6 +698,8 @@ fn uploads_to(network: Network, url: &str) -> bool {
         // Encrypted before it leaves, by the adapter: nothing goes through this helper.
         Network::Signal => &[],
         Network::Messages => &[],
+        // Nothing is uploaded to a Tiny server in this slice.
+        Network::Tiny => &[],
     };
     hosts.iter().any(|name| super::fetch::under(&host, name))
 }
