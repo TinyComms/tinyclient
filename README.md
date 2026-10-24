@@ -19,7 +19,7 @@
 
 </div>
 
-tinyclient is a chat client written in Rust. It signs in to Slack, Discord, Telegram, Microsoft Teams, Signal, and Android Messages, and shows them in one window with one design. It runs entirely on your machine. It talks to each of those networks directly. There is no tinyclient server, and nothing you type is sent anywhere else. You can also add one Tiny server you already run; that sign-in talks only to that server. It is built for macOS, Linux, and Windows.
+tinyclient is a chat client written in Rust. It signs in to Slack, Discord, Telegram, Microsoft Teams, Signal, and Android Messages, and shows them in one window with one design. It runs entirely on your machine. It talks to each of those networks directly. There is no tinyclient server, and nothing you type is sent anywhere else. You can also add one [Tiny server](https://github.com/itz4blitz/tinyserver) you already run; that sign-in talks only to that server. It is built for macOS, Linux, and Windows.
 
 The project is early. The goal is a client that is a pleasure to use and does everything the official apps do, on every network, while staying small. Talk with us on [Discord](https://discord.gg/kJHK7BNvJP), or [come help](#contributing).
 
