@@ -4,17 +4,18 @@ const { readFileSync } = require('node:fs');
 const { test } = require('node:test');
 const { runInNewContext } = require('node:vm');
 
-const source = readFileSync(new URL('../src/common.rs', `file://${__filename}`), 'utf8');
-const discord = source.split('pub const DISCORD: Site = Site {')[1].split('\n};')[0];
-const probe = JSON.parse(discord.match(/probe: (".*"),/)[1]);
+const probe = readFileSync(new URL('../src/discord-probe.js', `file://${__filename}`), 'utf8');
 
-function check(main, frame, expected, expectFrame) {
+async function check(main, frame, expected, expectFrame, status = 200) {
+  let cleared = false;
+  let redirected = null;
+  let requests = 0;
   let appended = 0;
   let removed = 0;
   const storage = value => ({ getItem: key => {
     assert.equal(key, 'token');
     return value;
-  } });
+  }, clear: () => { cleared = true; } });
   const blocked = () => { throw new Error('storage unavailable'); };
   const window = {};
   Object.defineProperty(window, 'localStorage', {
@@ -31,10 +32,26 @@ function check(main, frame, expected, expectFrame) {
       return { style: {}, contentWindow, remove: () => { removed++; } };
     },
   };
-  const result = runInNewContext(probe, { window, document });
+  window.location = { replace: url => { redirected = url; } };
+  const context = { window, document, AbortController, setTimeout, clearTimeout,
+    fetch: async (url, options) => {
+      requests++;
+      assert.equal(url, 'https://discord.com/api/v9/users/@me');
+      assert.equal(options.headers.Authorization, expected?.token || 'revoked-token');
+      if (status === 'offline') throw new Error('offline');
+      return { ok: status === 200, status };
+    },
+  };
+  const first = runInNewContext(probe, context);
+  assert.equal(first, null, 'a stored token must be checked before it is returned');
+  await new Promise(resolve => setImmediate(resolve));
+  const result = status === 200 ? runInNewContext(probe, context) : first;
   assert.deepEqual(result === null ? null : JSON.parse(result), expected);
-  assert.equal(appended, expectFrame ? 1 : 0);
+  assert.equal(appended, expectFrame ? (status === 200 || status === 401 ? 2 : 1) : 0);
   assert.equal(removed, appended, 'temporary frames must be removed');
+  assert.equal(cleared, status === 401);
+  assert.equal(redirected, status === 401 ? 'https://discord.com/login' : null);
+  if (expected || status !== 200) assert.equal(requests, 1);
 }
 
 test('reads the token directly without creating a frame', () =>
@@ -51,3 +68,12 @@ for (const value of ['""', '{', 'null', '42', '{}']) {
   test(`rejects invalid token value ${value}`, () =>
     check(value, null, null, false));
 }
+
+test('a revoked token resets the browser login instead of closing the window', () =>
+  check('"revoked-token"', null, null, false, 401));
+test('a revoked token read through a frame resets the browser login too', () =>
+  check(null, '"revoked-token"', null, true, 401));
+test('a server error keeps the browser login for another attempt', () =>
+  check('"revoked-token"', null, null, false, 503));
+test('a connection failure keeps the browser login for another attempt', () =>
+  check('"revoked-token"', null, null, false, 'offline'));

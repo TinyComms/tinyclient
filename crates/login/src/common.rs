@@ -37,7 +37,7 @@ pub const DISCORD: Site = Site {
     // The client may remove localStorage from its own window. A same-origin
     // frame still exposes the shared storage. hands_off() prevents this probe
     // from running while the user is typing on Discord's login page.
-    probe: "(()=>{let t=null;try{t=window.localStorage.getItem('token')}catch(e){}if(!t){let f;try{f=document.createElement('iframe');f.style.display='none';document.documentElement.appendChild(f);t=f.contentWindow.localStorage.getItem('token')}catch(e){}finally{if(f)f.remove()}}if(!t)return null;try{const token=JSON.parse(t);return typeof token==='string'&&token?JSON.stringify({token}):null}catch(e){return null}})()",
+    probe: include_str!("discord-probe.js"),
     read: |found| serde_json::from_str(found).ok(),
     cookie: None,
     detour: None,
