@@ -11,6 +11,7 @@ use crate::client::ask;
 use crate::gui::components::{empty_state, glyph};
 use crate::gui::input::{InputEvent, InputKey, TextInput};
 use crate::gui::layout::{RightKind, RightPane};
+use crate::gui::sidebar::chat;
 use crate::gui::state::Shell;
 use crate::gui::theme::{self, Type};
 use crate::gui::time;
@@ -31,6 +32,9 @@ pub struct Side {
     pub search: Option<SearchPage>,
     /// The search pane's field and its wiring, alive while the pane is.
     search_input: Option<SearchField>,
+    /// How often the cache was asked for the search pane, counted across pages: a page remade
+    /// starts at nothing, and its number must never meet an older ask's.
+    search_asks: u32,
     /// The conversation the stack was last fitted to.
     fitted: Option<Key>,
     /// The kind this view last put in the layout's slot, so another view's change can be told
@@ -525,11 +529,13 @@ impl Shell {
     /// conversation open now, so a switch of conversation re-resolves the next ask.
     fn reask_search(&mut self, cx: &mut Context<Self>) {
         let (words, scope, asked) = {
-            let Some(page) = self.conversation_state.side.search.as_mut() else {
+            let side = &mut self.conversation_state.side;
+            let Some(page) = side.search.as_mut() else {
                 return;
             };
+            side.search_asks += 1;
             page.failed = false;
-            page.asked += 1;
+            page.asked = side.search_asks;
             (page.words.clone(), page.scope, page.asked)
         };
         if words.trim().is_empty() {
@@ -541,12 +547,18 @@ impl Shell {
         }
         let open = self.open_with_space();
         let (conversation, space) = scope_filters(scope, open.as_ref().map(|(key, space)| (key, space.as_deref())));
-        let request = Request::SearchMessages { conversation, network: None, space, query: words, limit: protocol::PAGE_LIMIT };
+        let request = Request::SearchMessages { conversation, network: None, space, query: words.clone(), limit: protocol::PAGE_LIMIT };
         self.off_thread(
             cx,
             move || ask(&request),
             move |this, answer, cx| {
-                let Some(page) = this.conversation_state.side.search.as_mut().filter(|page| page.asked == asked) else {
+                let Some(page) = this
+                    .conversation_state
+                    .side
+                    .search
+                    .as_mut()
+                    .filter(|page| page.asked == asked && page.words == words && page.scope == scope)
+                else {
                     return;
                 };
                 match answer {
@@ -955,7 +967,8 @@ fn draw_search(shell: &Shell, _window: &mut Window, cx: &mut Context<Shell>) -> 
                             .flex()
                             .items_center()
                             .gap(px(6.))
-                            .child(div().flex_1().min_w_0().truncate().type_ui().text_color(theme::text()).child(hit.title.clone()))
+                            .child(chat::mark(hit.conversation.network, 13., theme::text_faint()))
+                            .child(div().flex_1().min_w_0().truncate().type_small().text_color(theme::text_faint()).child(said_at(hit)))
                             .child(div().flex_none().type_small().text_color(theme::text_soft()).child(age(now(), hit.sent))),
                     )
                     .child(
@@ -1047,6 +1060,21 @@ fn draw_pins(shell: &Shell, conversation: &Key, cx: &mut Context<Shell>) -> AnyE
     div().id("pins").size_full().overflow_y_scroll().py(px(4.)).children(rows).into_any_element()
 }
 
+/// Where the message was said, as the spec's result line has it: the Space it sits in and the
+/// conversation, or the conversation's id when it has no title yet.
+fn said_at(hit: &MessageHit) -> String {
+    let name = if hit.title.is_empty() {
+        hit.conversation.id.as_str()
+    } else {
+        hit.title.as_str()
+    };
+    if hit.space_title.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{} › {name}", hit.space_title)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1087,6 +1115,27 @@ mod tests {
         assert_eq!(scope_filters(Scope::Space, Some((&channel, None))), (None, None));
         assert_eq!(scope_filters(Scope::Conversation, None), (None, None));
         assert_eq!(scope_filters(Scope::Space, None), (None, None));
+    }
+
+    #[test]
+    fn a_hit_row_names_its_space_and_conversation_or_falls_back_to_its_id() {
+        let mut hit = MessageHit {
+            conversation: key("C_a"),
+            message_id: "1".into(),
+            sent: 0,
+            sender: "Ines".into(),
+            snippet: "rules".into(),
+            title: "general".into(),
+            space_title: "Northwind".into(),
+            outgoing: false,
+        };
+        assert_eq!(said_at(&hit), "Northwind › general");
+        hit.space_title.clear();
+        assert_eq!(said_at(&hit), "general");
+        hit.title.clear();
+        assert_eq!(said_at(&hit), "C_a");
+        hit.space_title = "Northwind".into();
+        assert_eq!(said_at(&hit), "Northwind › C_a");
     }
 
     #[test]

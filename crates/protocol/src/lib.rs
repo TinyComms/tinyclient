@@ -914,6 +914,9 @@ pub struct MessageHit {
     /// The conversation's title, so a result row says where it is without a second request.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub title: String,
+    /// The title of the Space the conversation sits in, when it sits in one.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub space_title: String,
     /// Mine, so the row can say "You".
     #[serde(default, skip_serializing_if = "is_false")]
     pub outgoing: bool,
@@ -1768,6 +1771,7 @@ mod tests {
             sender: "mara".into(),
             snippet: "hello world".into(),
             title: String::new(),
+            space_title: String::new(),
             outgoing: false,
         };
         assert_eq!(

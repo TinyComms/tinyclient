@@ -1508,7 +1508,7 @@ impl Store {
         let pattern = format!("%{}%", like_prefix(query));
         self.db
             .prepare(
-                "SELECT m.network, m.account, m.conversation, m.id, m.sent, m.text, m.body, c.title
+                "SELECT m.network, m.account, m.conversation, m.id, m.sent, m.text, m.body, c.title, c.space_title
                    FROM message m
                    JOIN conversation c ON c.network = m.network AND c.account = m.account
                       AND c.id = m.conversation
@@ -1542,6 +1542,7 @@ impl Store {
                         sender: message.sender.name,
                         snippet: snippet(&text, query),
                         title: row.get(7)?,
+                        space_title: row.get(8)?,
                         outgoing: message.outgoing,
                     })
                 },
