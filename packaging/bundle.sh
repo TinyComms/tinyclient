@@ -20,6 +20,22 @@ app=$target/$profile/tinyclient.app
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' "$root/Cargo.toml" | head -1)
 
 if [ "${1:-}" != "--no-build" ]; then
+    # chatd embeds the Telegram app id at compile time. A release without it cannot sign in.
+    # --no-build only packs binaries that were already compiled, which is what CI does after
+    # the release build step has already refused a chatd with no id.
+    if [ -z "${TINYCLIENT_TELEGRAM_API_ID:-}" ] || [ -z "${TINYCLIENT_TELEGRAM_API_HASH:-}" ]; then
+        env_file=${TINYCLIENT_TELEGRAM_ENV:-"$HOME/.config/tinyclient/telegram.env"}
+        if [ -f "$env_file" ]; then
+            set -a
+            # shellcheck disable=SC1090
+            . "$env_file"
+            set +a
+        fi
+    fi
+    if [ -z "${TINYCLIENT_TELEGRAM_API_ID:-}" ] || [ -z "${TINYCLIENT_TELEGRAM_API_HASH:-}" ]; then
+        echo "bundle.sh: set TINYCLIENT_TELEGRAM_API_ID and TINYCLIENT_TELEGRAM_API_HASH before building" >&2
+        exit 1
+    fi
     cargo build --release -j "${JOBS:-6}" --manifest-path "$root/Cargo.toml" --target-dir "$target" \
         -p tinyclient --features tinyclient/gui -p chatd -p mediad -p login
 fi

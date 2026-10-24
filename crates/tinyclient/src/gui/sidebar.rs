@@ -33,7 +33,7 @@ use gpui::{
 };
 use history::History;
 use pages::Pages;
-use protocol::{Badge, Conversation, ConversationKind, InboxCounts, InboxFilter, Key, Link, Network, Request, Response, PAGE_LIMIT};
+use protocol::{AccountKey, Badge, Conversation, ConversationKind, InboxCounts, InboxFilter, Key, Link, Network, Request, Response, PAGE_LIMIT};
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::rc::Rc;
@@ -196,6 +196,38 @@ impl State {
             home_pending: false,
             switcher: None,
         }
+    }
+
+    /// Drops rows whose account is signed out. True when the Inbox changed, and when a home list did.
+    pub fn without_signed_out(&mut self, keep: &HashSet<AccountKey>) -> (bool, bool) {
+        let visible = |key: &Key| keep.contains(&key.account());
+        let kept: Vec<_> = self.inbox.all().iter().filter(|row| visible(&row.key)).cloned().collect();
+        let inbox_changed = kept.len() != self.inbox.all().len();
+        if inbox_changed {
+            let epoch = self.inbox.epoch();
+            let total = kept.len() as u32;
+            self.inbox.fill(epoch, kept, total);
+            self.muted_news.retain(|row| visible(&row.key));
+            if let Some(waiting) = self.waiting.as_mut() {
+                waiting.retain(|row| visible(&row.key));
+            }
+        }
+        let home = &mut self.home;
+        let before = home.chats.len() + home.drilled.len() + home.in_voice.len() + home.archive.len();
+        home.chats.retain(|row| visible(&row.key));
+        home.drilled.retain(|row| visible(&row.key));
+        home.in_voice.retain(|row| visible(&row.key));
+        home.archive.retain(|row| visible(&row.key));
+        let mut home_changed = home.chats.len() + home.drilled.len() + home.in_voice.len() + home.archive.len() != before;
+        for saved in self.saved_homes.values_mut() {
+            let before = saved.chats.len() + saved.drilled.len() + saved.in_voice.len() + saved.archive.len();
+            saved.chats.retain(|row| visible(&row.key));
+            saved.drilled.retain(|row| visible(&row.key));
+            saved.in_voice.retain(|row| visible(&row.key));
+            saved.archive.retain(|row| visible(&row.key));
+            home_changed |= saved.chats.len() + saved.drilled.len() + saved.in_voice.len() + saved.archive.len() != before;
+        }
+        (inbox_changed, home_changed)
     }
 
     /// Every row the sidebar holds, wherever it is drawn.

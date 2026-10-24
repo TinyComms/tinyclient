@@ -475,6 +475,39 @@ impl Chat {
         }
     }
 
+    /// Whether this account's cached chats and messages may be shown. A signed-out account keeps
+    /// them on disk so the next sign-in has them, and the window is shown none of them. A
+    /// keychain read still in progress is not a sign-out. Scratch directories have no sessions
+    /// and keep showing what was seeded.
+    fn shows(&self, account: &AccountKey) -> bool {
+        if !session::enabled() {
+            return true;
+        }
+        if self.hub.link(account) != Link::SignedOut {
+            return true;
+        }
+        let network = account.network;
+        let keychain = self.hub.keychain();
+        keychain.denied.contains(&network)
+            || keychain.waiting == Some(network)
+            || self.hub.sessions_pending().contains(&network)
+    }
+
+    /// Accounts whose stored rows must not be listed.
+    fn withheld(&self) -> Vec<AccountKey> {
+        if !session::enabled() {
+            return Vec::new();
+        }
+        self.hub
+            .store()
+            .accounts()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|row| row.key)
+            .filter(|key| !self.shows(key))
+            .collect()
+    }
+
     /// A row as the shell is told it: what is stored, and who is in it right now.
     fn row(&self, mut conversation: Conversation) -> Conversation {
         if conversation.kind == ConversationKind::Voice || conversation.call == CallSupport::Native {
@@ -573,6 +606,15 @@ impl Chat {
     }
 
     fn messages(&self, conversation: Key, page: Page, limit: u32) -> Response {
+        if !self.shows(&conversation.account()) {
+            return Response::Messages {
+                conversation,
+                messages: Vec::new(),
+                last_read: None,
+                older: false,
+                newer: false,
+            };
+        }
         let read = {
             let mut store = self.hub.store();
             let failed = store.fail_pending(now() - SEND_SECONDS, "The network did not answer.");
@@ -1096,6 +1138,7 @@ impl Chat {
     fn in_voice(&self, network: Option<Network>) -> Response {
         let mut occupied = self.hub.occupied();
         occupied.retain(|(conversation, _)| network.is_none_or(|network| conversation.network == network));
+        occupied.retain(|(conversation, _)| self.shows(&conversation.account()));
         occupied.sort_by_key(|(conversation, occupants)| (std::cmp::Reverse(occupants.total), conversation.id.clone()));
         let mut rows = Vec::new();
         {
@@ -1136,7 +1179,7 @@ impl Chat {
         let mut seen = std::collections::HashSet::new();
         let talked_ids: std::collections::HashSet<Key> = talked.iter().map(|person| person.key.clone()).collect();
         for person in self.with_presence(owned.into_iter().chain(talked).collect()) {
-            if !seen.insert(person.key.clone()) {
+            if !self.shows(&person.key.account()) || !seen.insert(person.key.clone()) {
                 continue;
             }
             if person.activity.as_ref().is_some_and(|activity| activity.kind.in_call()) {
@@ -1157,6 +1200,9 @@ impl Chat {
     /// What was shared: from the cache, saying it is only that; or, because the user asked,
     /// from the network's own search.
     fn shared(&self, conversation: Key, kind: SharedKind, before: Option<String>, limit: u32, search: bool) -> Response {
+        if !self.shows(&conversation.account()) {
+            return error(ErrorCode::NotFound, "signed out");
+        }
         let limit = limit.min(PAGE_LIMIT);
         if !search {
             return match self.hub.store().shared(&conversation, kind, before.as_deref(), limit) {
@@ -1334,10 +1380,11 @@ impl Chat {
             }
 
             Request::Inbox { network, filter, offset, limit } => {
+                let hidden = self.withheld();
                 let read = {
                     let store = self.hub.store();
-                    let page = store.inbox(network, filter, offset, limit.min(PAGE_LIMIT));
-                    page.and_then(|(conversations, total)| Ok((conversations, total, store.inbox_counts(network)?)))
+                    let page = store.inbox(network, filter, offset, limit.min(PAGE_LIMIT), &hidden);
+                    page.and_then(|(conversations, total)| Ok((conversations, total, store.inbox_counts(network, &hidden)?)))
                 };
                 match read {
                     Ok((conversations, total, counts)) => Response::Conversations {
@@ -1349,7 +1396,8 @@ impl Chat {
                 }
             }
             Request::Home { network, account, folder, shelf, offset, limit } => {
-                let read = self.hub.store().home(network, account.as_ref(), folder.as_deref(), shelf, offset, limit.min(PAGE_LIMIT));
+                let hidden = self.withheld();
+                let read = self.hub.store().home(network, account.as_ref(), folder.as_deref(), shelf, offset, limit.min(PAGE_LIMIT), &hidden);
                 if offset == 0 {
                     for linked in self.hub.links() {
                         let mine = linked.account.network == network && account.as_ref().is_none_or(|account| *account == linked.account);
@@ -1368,6 +1416,9 @@ impl Chat {
                 Err(err) => internal(err),
             },
             Request::Threads { space, offset, limit } => {
+                if !self.shows(&space.account()) {
+                    return Response::Conversations { conversations: Vec::new(), total: 0, counts: InboxCounts::default() };
+                }
                 let read = self.hub.store().threads(&space, offset, limit.min(PAGE_LIMIT));
                 if offset == 0 {
                     self.command(&space.account(), Command::OpenThreads(space.id.clone()));
@@ -1379,12 +1430,17 @@ impl Chat {
                     Err(err) => internal(err),
                 }
             }
-            Request::Topics { forum, offset, limit } => match self.hub.store().topics(&forum, offset, limit.min(PAGE_LIMIT)) {
-                Ok((conversations, total)) => {
-                    Response::Conversations { conversations: self.rows(conversations), total, counts: InboxCounts::default() }
+            Request::Topics { forum, offset, limit } => {
+                if !self.shows(&forum.account()) {
+                    return Response::Conversations { conversations: Vec::new(), total: 0, counts: InboxCounts::default() };
                 }
-                Err(err) => internal(err),
-            },
+                match self.hub.store().topics(&forum, offset, limit.min(PAGE_LIMIT)) {
+                    Ok((conversations, total)) => {
+                        Response::Conversations { conversations: self.rows(conversations), total, counts: InboxCounts::default() }
+                    }
+                    Err(err) => internal(err),
+                }
+            }
             Request::InVoice { network } => self.in_voice(network),
             Request::Around { network } => self.around(network),
             Request::Catalog { account, kind, space, query, cursor } => self.catalog(account, kind, space, query, cursor),
@@ -1408,11 +1464,14 @@ impl Chat {
                     false => self.hub.store().find(network, query, limit.min(PAGE_LIMIT)),
                 };
                 match found {
-                    Ok(conversations) => Response::Conversations {
-                        total: conversations.len() as u32,
-                        conversations: self.rows(conversations),
-                        counts: InboxCounts::default(),
-                    },
+                    Ok(conversations) => {
+                        let conversations: Vec<_> = conversations.into_iter().filter(|row| self.shows(&row.key.account())).collect();
+                        Response::Conversations {
+                            total: conversations.len() as u32,
+                            conversations: self.rows(conversations),
+                            counts: InboxCounts::default(),
+                        }
+                    }
                     Err(err) => internal(err),
                 }
             }
@@ -1423,7 +1482,10 @@ impl Chat {
                     false => self.hub.store().search_messages(conversation.as_ref(), network, space.as_ref(), query, limit.min(PAGE_LIMIT)),
                 };
                 match found {
-                    Ok(hits) => Response::MessageHits { hits },
+                    Ok(hits) => {
+                        let hits: Vec<_> = hits.into_iter().filter(|hit| self.shows(&hit.conversation.account())).collect();
+                        Response::MessageHits { hits }
+                    }
                     Err(err) => internal(err),
                 }
             }
@@ -1439,6 +1501,9 @@ impl Chat {
                             return error(ErrorCode::Unsupported, "a search on the network names a conversation or a Space")
                         }
                     };
+                    if !self.shows(&account) {
+                        return Response::MessageHits { hits: Vec::new() };
+                    }
                     match self.ask(&account, |reply| Command::Search { query, scope, at: std::time::Instant::now(), reply }) {
                         Ok(hits) => Response::MessageHits { hits },
                         Err(refused) => *refused,
@@ -1451,10 +1516,16 @@ impl Chat {
                 Err(err) => internal(err),
             },
             Request::Spaces { network } => match self.hub.store().spaces(network) {
-                Ok(spaces) => Response::Spaces { spaces },
+                Ok(spaces) => {
+                    let spaces = spaces.into_iter().filter(|space| self.shows(&space.key.account())).collect();
+                    Response::Spaces { spaces }
+                }
                 Err(err) => internal(err),
             },
             Request::Tree { space, offset, limit, peek } => {
+                if !self.shows(&space.account()) {
+                    return error(ErrorCode::NotFound, "signed out");
+                }
                 let tree = self.hub.store().tree(&space, offset, limit.min(TREE_LIMIT));
                 match tree {
                     Ok(Some(tree)) => {
@@ -1472,11 +1543,16 @@ impl Chat {
                     Err(err) => internal(err),
                 }
             }
-            Request::Conversation { conversation } => match self.hub.store().conversation(&conversation) {
-                Ok(Some(conversation)) => Response::Conversation { conversation: self.row(conversation) },
-                Ok(None) => error(ErrorCode::NotFound, "no such conversation"),
-                Err(err) => internal(err),
-            },
+            Request::Conversation { conversation } => {
+                if !self.shows(&conversation.account()) {
+                    return error(ErrorCode::NotFound, "signed out");
+                }
+                match self.hub.store().conversation(&conversation) {
+                    Ok(Some(conversation)) => Response::Conversation { conversation: self.row(conversation) },
+                    Ok(None) => error(ErrorCode::NotFound, "no such conversation"),
+                    Err(err) => internal(err),
+                }
+            }
             Request::Collapse { space, group, collapsed } => {
                 match self.hub.store().set_collapsed(&space, &group, collapsed) {
                     Ok(true) => Response::Ok,
