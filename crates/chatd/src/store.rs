@@ -465,6 +465,24 @@ pub struct OnDisk {
     pub bytes: u64,
 }
 
+/// SQL that leaves these accounts out of a conversation query. An id has to be the same shape a
+/// session account is allowed to have; anything else is skipped rather than written into SQL.
+fn not_these(hidden: &[AccountKey]) -> String {
+    let parts: Vec<String> = hidden
+        .iter()
+        .filter(|account| {
+            let id = account.account.as_str();
+            !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+        })
+        .map(|account| format!("(c.network = '{}' AND c.account = '{}')", word(&account.network), account.account))
+        .collect();
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" AND NOT ({})", parts.join(" OR "))
+    }
+}
+
 /// How an enum is spelled on the wire, which is also how it is stored.
 fn word<T: Serialize>(value: &T) -> String {
     match serde_json::to_value(value) {
@@ -1230,6 +1248,7 @@ impl Store {
         filter: InboxFilter,
         offset: u32,
         limit: u32,
+        hidden: &[AccountKey],
     ) -> rusqlite::Result<(Vec<Conversation>, u32)> {
         let narrowed = match filter {
             InboxFilter::All => "1",
@@ -1237,7 +1256,7 @@ impl Store {
             InboxFilter::Mentions => IS_MENTION,
             InboxFilter::Directs => "c.kind IN ('direct', 'group')",
         };
-        let belongs = format!("{IN_INBOX} AND (?1 IS NULL OR c.network = ?1) AND {narrowed}");
+        let belongs = format!("{IN_INBOX} AND (?1 IS NULL OR c.network = ?1) AND {narrowed}{}", not_these(hidden));
         let first = match filter {
             InboxFilter::Unread | InboxFilter::Mentions => "c.mentions > 0",
             InboxFilter::All | InboxFilter::Directs => "c.starred",
@@ -1261,12 +1280,13 @@ impl Store {
     }
 
     /// How many rows each Inbox filter holds, in one pass.
-    pub fn inbox_counts(&self, network: Option<Network>) -> rusqlite::Result<InboxCounts> {
+    pub fn inbox_counts(&self, network: Option<Network>, hidden: &[AccountKey]) -> rusqlite::Result<InboxCounts> {
         self.db.query_row(
             &format!(
                 "SELECT COUNT(*), COALESCE(SUM({IS_UNREAD}), 0), COALESCE(SUM({IS_MENTION}), 0),
                         COALESCE(SUM({IS_APP}), 0)
-                   FROM conversation c WHERE {IN_INBOX} AND (?1 IS NULL OR c.network = ?1)"
+                   FROM conversation c WHERE {IN_INBOX} AND (?1 IS NULL OR c.network = ?1){}",
+                not_these(hidden)
             ),
             params![network.map(|network| word(&network))],
             counts_from,
@@ -1284,6 +1304,7 @@ impl Store {
         shelf: Shelf,
         offset: u32,
         limit: u32,
+        hidden: &[AccountKey],
     ) -> rusqlite::Result<(Vec<Conversation>, u32, InboxCounts)> {
         let shelf = match shelf {
             Shelf::Main => "NOT c.archived AND c.special != 'request'",
@@ -1294,7 +1315,8 @@ impl Store {
             "c.network = ?1 AND (?2 IS NULL OR c.account = ?2) AND c.space = '' AND c.parent = ''
              AND NOT c.hidden
              AND CASE WHEN ?3 IS NULL THEN {shelf}
-                      ELSE instr(c.folders, ',' || ?3 || ',') > 0 AND c.special != 'request' END"
+                      ELSE instr(c.folders, ',' || ?3 || ',') > 0 AND c.special != 'request' END{}",
+            not_these(hidden)
         );
         let in_folder_pins = "(SELECT instr(f.pinned, ',' || c.id || ',') FROM folder f
                                 WHERE f.network = c.network AND f.account = c.account AND f.id = ?3)";
@@ -2723,7 +2745,7 @@ mod tests {
         store.ingest(&key, &mention, true).unwrap();
 
         let titles = |store: &Store, filter| -> Vec<String> {
-            let (rows, total) = store.inbox(None, filter, 0, 10).unwrap();
+            let (rows, total) = store.inbox(None, filter, 0, 10, &[]).unwrap();
             assert_eq!(rows.len() as u32, total);
             rows.into_iter().map(|row| row.title).collect()
         };
@@ -2739,9 +2761,23 @@ mod tests {
 
         store.set_muted(&Key::new(&account, "dm"), true).unwrap();
         assert_eq!(titles(&store, InboxFilter::Unread), ["#general", "#quiet"]);
-        let counts = store.inbox_counts(None).unwrap();
+        let counts = store.inbox_counts(None, &[]).unwrap();
         assert_eq!((counts.all, counts.unread, counts.mentions), (3, 2, 1));
-        assert_eq!(store.inbox(Some(Network::Slack), InboxFilter::All, 0, 10).unwrap().1, 0);
+        assert_eq!(store.inbox(Some(Network::Slack), InboxFilter::All, 0, 10, &[]).unwrap().1, 0);
+    }
+
+    #[test]
+    fn the_inbox_leaves_out_an_account_that_is_signed_out() {
+        let (mut store, key) = store();
+        let other = AccountKey { network: Network::Telegram, account: "123".into() };
+        store.upsert_conversation(&other, &ConversationRow::new("elyse", ConversationKind::Direct, "Elyse")).unwrap();
+        store.ingest(&Key::new(&other, "elyse"), &said("1", "hi", 10), true).unwrap();
+        // The seeded channel has no message, so the only inbox row is the signed-out chat.
+        assert_eq!(store.inbox(None, InboxFilter::All, 0, 10, &[]).unwrap().0.len(), 1);
+        let (rows, total) = store.inbox(None, InboxFilter::All, 0, 10, &[other.clone()]).unwrap();
+        assert!(rows.is_empty() && total == 0);
+        assert_eq!(store.inbox_counts(None, &[other]).unwrap().all, 0);
+        let _ = key;
     }
 
     #[test]
@@ -2771,12 +2807,12 @@ mod tests {
         store.set_starred(&at("starred-old"), true).unwrap();
         store.mark_read(&at("old"), "old-1").unwrap();
         let titles = |store: &Store, filter| -> Vec<String> {
-            store.inbox(None, filter, 0, 20).unwrap().0.into_iter().map(|row| row.title).collect()
+            store.inbox(None, filter, 0, 20, &[]).unwrap().0.into_iter().map(|row| row.title).collect()
         };
         // Old, empty, archived, hidden and request rows are out; a starred old one stays; the
         // app is in, flagged, for the shell to fold.
         assert_eq!(titles(&store, InboxFilter::All), ["Starred old", "GitHub", "Recent"]);
-        let counts = store.inbox_counts(None).unwrap();
+        let counts = store.inbox_counts(None, &[]).unwrap();
         // The app's unread raises no count but its own dot; the archived one and the request
         // count for nothing.
         assert_eq!((counts.all, counts.unread, counts.apps), (3, 2, 1), "{counts:?}");
@@ -2829,7 +2865,7 @@ mod tests {
             ])
             .unwrap();
         let ids = |store: &Store, folder: Option<&str>, shelf| -> Vec<String> {
-            let (rows, total, _) = store.home(Network::Discord, None, folder, shelf, 0, 20).unwrap();
+            let (rows, total, _) = store.home(Network::Discord, None, folder, shelf, 0, 20, &[]).unwrap();
             assert_eq!(rows.len() as u32, total);
             rows.into_iter().map(|row| row.key.id).collect()
         };

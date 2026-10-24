@@ -354,7 +354,56 @@ impl Shell {
                 self.sidebar_state.mode = Mode::Inbox;
             }
         }
+        // A signed-out account keeps its cache on disk and shows none of it.
+        self.drop_signed_out(cx);
         cx.notify();
+    }
+
+    /// Drops chats, the open thread, and list rows for accounts that are signed out. While the
+    /// keychain is still being read those accounts have not arrived yet, so nothing is dropped.
+    fn drop_signed_out(&mut self, cx: &mut Context<Self>) {
+        if self.service.keychain.reading {
+            return;
+        }
+        let Some(snapshot) = &self.snapshot else {
+            return;
+        };
+        let keep: HashSet<AccountKey> = snapshot
+            .accounts
+            .iter()
+            .filter(|account| account.link != Link::SignedOut)
+            .map(|account| account.key.clone())
+            .collect();
+        let visible = |key: &Key| keep.contains(&key.account());
+
+        if self.open.as_ref().is_some_and(|key| !visible(key)) {
+            self.open = None;
+            if let Some(snapshot) = &mut self.snapshot {
+                snapshot.open = None;
+            }
+        }
+
+        let (inbox_changed, home_changed) = self.sidebar_state.without_signed_out(&keep);
+        let trees_changed = {
+            let mut changed = false;
+            for tree in self.trees.values_mut() {
+                let before = tree.conversations.len();
+                tree.conversations.retain(|row| visible(&row.key));
+                changed |= tree.conversations.len() != before;
+            }
+            changed
+        };
+        if inbox_changed {
+            self.rebuild_inbox(cx);
+            let pages = self.sidebar_state.inbox.stale();
+            self.load_inbox(pages, cx);
+        }
+        if home_changed || trees_changed {
+            self.rebuild_rows(cx);
+        }
+        if home_changed {
+            self.load_home(cx);
+        }
     }
 
     pub(super) fn load_status(&mut self, cx: &mut Context<Self>) {
