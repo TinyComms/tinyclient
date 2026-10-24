@@ -195,10 +195,12 @@ impl Shell {
     }
 
     pub(super) fn close_right(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
-        self.layout_state.right = None;
-        // The keys go back to the composer, as Esc's closing of a pane does.
-        if let Some(window) = window {
-            self.composer_focus(window, cx);
+        let was_open = self.layout_state.right.take().is_some();
+        // The keys go back to the composer when a pane was open, as Esc's closing of it does.
+        if was_open {
+            if let Some(window) = window {
+                self.composer_focus(window, cx);
+            }
         }
         cx.notify();
     }

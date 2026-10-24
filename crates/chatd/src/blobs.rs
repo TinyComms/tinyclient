@@ -536,9 +536,9 @@ impl Cache {
             if only_if_idle && !queue.picked.get(account).is_none_or(|picker| picker.asked.elapsed() >= self.pick_idle) {
                 return;
             }
-            // The close ends this session's generation: a job of it is dropped before its
-            // bytes are kept, so the removals below cannot take a file that a fresh ask is
-            // about to read.
+            // The close ends this session's generation: a job of it is dropped unless a new
+            // session reopens the picker, narrowing the window against the directory removal
+            // below.
             if let Some(generation) = queue.picked.get(account).map(|picker| picker.generation) {
                 queue.picker_closed.insert(account.clone(), generation);
             }
@@ -559,9 +559,11 @@ impl Cache {
         let _ = std::fs::remove_dir(dir.parent().unwrap_or(&dir));
     }
 
-    /// The picker generation this account's sweep last closed. 0 before any close.
-    fn picker_closed(&self, account: &AccountKey) -> u64 {
-        crate::hub::lock(&self.queue).picker_closed.get(account).copied().unwrap_or(0)
+    /// True when this picker generation has been closed and no newer session is open.
+    fn closed_since(&self, account: &AccountKey, generation: u64) -> bool {
+        let queue = crate::hub::lock(&self.queue);
+        let closed = queue.picker_closed.get(account).copied().unwrap_or(0);
+        generation <= closed && !queue.picked.contains_key(account)
     }
 
     /// Fetches each account's own picture (the rail's) when the account signs in or starts,
@@ -778,11 +780,6 @@ impl Cache {
         }
     }
 
-    /// The account's picker is open.
-    fn picking(&self, account: &AccountKey) -> bool {
-        crate::hub::lock(&self.queue).picked.contains_key(account)
-    }
-
     fn signed_out_since(&self, job: &Job) -> bool {
         let queue = crate::hub::lock(&self.queue);
         queue.epochs.get(&job.file.0).copied().unwrap_or(0) != job.epoch
@@ -816,9 +813,9 @@ impl Cache {
             if self.signed_out_since(job) {
                 return None;
             }
-            // A job of a picker session the sweep closed: its files went with the close, and
-            // the bytes are not fetched only to be thrown away.
-            if is_pick(id) && job.picker_generation <= self.picker_closed(account) {
+            // A job of a picker session the sweep closed (with no newer session open): its
+            // files went with the close, and the bytes are not fetched only to be thrown away.
+            if is_pick(id) && self.closed_since(account, job.picker_generation) {
                 return None;
             }
             if file.path.is_some() {
@@ -835,13 +832,20 @@ impl Cache {
                 part: &part,
                 cap: fetch::cap(&file, self.cap.load(Ordering::Relaxed)),
                 also: &|| self.waiting_with(job),
-                pick: is_pick(id),
             };
             let (bytes, from) = match fetch::download(&self.hosts, agent, &want, buffer) {
                 Ok(fetched) => fetched,
-                Err(why) => return failed(&file, why),
+                Err(why) => {
+                    if is_pick(id) && self.closed_since(account, job.picker_generation) {
+                        return None;
+                    }
+                    if is_pick(id) && !last && !dir.exists() {
+                        continue;
+                    }
+                    return failed(&file, why);
+                }
             };
-            if self.signed_out_since(job) || (is_pick(id) && !self.picking(account)) {
+            if self.signed_out_since(job) || (is_pick(id) && self.closed_since(account, job.picker_generation)) {
                 let _ = std::fs::remove_file(&part);
                 return None;
             }
@@ -856,7 +860,7 @@ impl Cache {
             if let Err(err) = std::fs::rename(&part, &path) {
                 let _ = std::fs::remove_file(&part);
                 // The picker closed and took its directory while this arrived: nobody wants it.
-                if is_pick(id) && !self.picking(account) {
+                if is_pick(id) && self.closed_since(account, job.picker_generation) {
                     return None;
                 }
                 // A picker reopened as the sweep took its directory: the second pass makes
@@ -939,7 +943,7 @@ mod tests {
         let mut picked = HashMap::new();
         // Open long enough: the sweep closes it.
         picked.insert(account.clone(), Picker { asked: at - Duration::from_secs(3), generation: 1 });
-        assert_eq!(stale(&picked, at, idle), [account.clone()]);
+        assert_eq!(stale(&picked, at, idle), std::slice::from_ref(&account));
         // Re-asked a moment ago — the next session's generation: never stale, whatever the
         // generation's number.
         picked.insert(account.clone(), Picker { asked: at, generation: next_generation(1, Some(1)) });

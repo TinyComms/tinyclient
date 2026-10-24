@@ -420,8 +420,8 @@ impl Shell {
     /// Search in the conversation, or everywhere: the pane opens with its field focused, or,
     /// standing already, the scope switches and the asking starts again.
     pub(in crate::gui) fn open_search(&mut self, scope: Scope, window: &mut Window, cx: &mut Context<Self>) {
-        // A pane closed by its ✕ leaves its page behind: anything not showing starts over. And
-        // a conversation scope with nothing open names nothing — it asks everywhere, as the
+        // When another layer sits on top of Search, starting a search starts over. And a
+        // conversation scope with nothing open names nothing — it asks everywhere, as the
         // switcher's row does, so a chip is lit.
         let scope = if scope == Scope::Conversation && self.open_key().is_none() {
             Scope::Everywhere
@@ -540,7 +540,7 @@ impl Shell {
             return;
         }
         let open = self.open_with_space();
-        let (conversation, space) = scope_filters(scope, open.as_ref().map(|(key, space)| (&*key, space.as_deref())));
+        let (conversation, space) = scope_filters(scope, open.as_ref().map(|(key, space)| (key, space.as_deref())));
         let request = Request::SearchMessages { conversation, network: None, space, query: words, limit: protocol::PAGE_LIMIT };
         self.off_thread(
             cx,
@@ -551,9 +551,7 @@ impl Shell {
                 };
                 match answer {
                     Ok(Response::MessageHits { hits }) => page.hits = Some(hits),
-                    // Another answer is not this request's; the read failing is the pane's word.
-                    Ok(_) => {}
-                    Err(_) => page.failed = true,
+                    Ok(_) | Err(_) => page.failed = true,
                 }
                 cx.notify();
             },

@@ -164,8 +164,6 @@ pub struct Want<'a> {
     pub adapter: Option<&'a Sender<Command>>,
     /// Where the bytes go while they arrive. The caller renames it once it is whole.
     pub part: &'a Path,
-    /// True for a picker's preview, whose directory a sweep may remove under this download.
-    pub pick: bool,
     pub cap: u64,
     /// Other files of the account waiting to be fetched, as `(id, address)`, read only when
     /// an address has to be renewed.
@@ -259,16 +257,6 @@ fn get(hosts: &Hosts, agent: &ureq::Agent, want: &Want, from: &Download, buffer:
         return Err(too_large());
     }
     let broken = |err: std::io::Error| Failed::Other(format!("The download failed: {err}."));
-    // A picker's sweep may have taken the directory while this address was being asked for:
-    // it is made again, so the part file has where to go. Only a picker's directory is ever
-    // removed under a live download, so only a picker's is re-made.
-    if want.pick {
-        if let Some(dir) = want.part.parent() {
-            if let Err(err) = std::fs::create_dir_all(dir) {
-                return Err(Failed::Other(format!("The cache directory could not be made: {err}.")));
-            }
-        }
-    }
     let mut out = File::create(want.part).map_err(broken)?;
     let mut reader = response.body_mut().as_reader();
     let mut total = 0u64;
@@ -405,7 +393,6 @@ mod tests {
             url,
             adapter,
             part: &part,
-            pick: false,
             cap: MB,
             also: &Vec::new,
         };
@@ -490,7 +477,6 @@ mod tests {
             url: &url,
             adapter: Some(&commands),
             part: &part,
-            pick: false,
             cap: MB,
             also: &|| waiting.clone(),
         };
