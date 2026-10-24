@@ -505,7 +505,7 @@ fn like_prefix(query: &str) -> String {
 
 /// The text on one line, cut to a window that starts a little before the first match of
 /// `query`, at most 200 characters. Nothing marks the match here; the shell draws that.
-fn snippet(text: &str, query: &str) -> String {
+pub(crate) fn snippet(text: &str, query: &str) -> String {
     let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
     let needle = query.to_lowercase();
     // A lowercased byte index can sit off a boundary or past the end by a character or two
@@ -1205,6 +1205,20 @@ impl Store {
                 conversation_from,
             )
             .optional()
+    }
+
+    /// Whether a conversation may appear where the user asked for what is listed: hidden
+    /// conversations and message requests stay out of it, as they stay out of the cache's own
+    /// search. A conversation the store does not know is not listed.
+    pub fn conversation_listed(&self, conversation: &Key) -> rusqlite::Result<bool> {
+        self.db
+            .query_row(
+                "SELECT NOT c.hidden AND c.special != 'request' \
+                   FROM conversation c WHERE c.network = ?1 AND c.account = ?2 AND c.id = ?3",
+                params![word(&conversation.network), conversation.account, conversation.id],
+                |row| row.get::<_, bool>(0),
+            )
+            .or_else(|err| if err == rusqlite::Error::QueryReturnedNoRows { Ok(false) } else { Err(err) })
     }
 
     /// What the Inbox holds (`IN_INBOX`, said in words on `Request::Inbox`). All: starred

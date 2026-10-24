@@ -3,11 +3,11 @@
 //! the server-side search for what was shared. Each is one request at most, and only because
 //! the user opened or clicked something.
 
-use super::super::{About, ConversationAbout, Refusal, Reply, SharedPage, SpaceAbout};
+use super::super::{About, ConversationAbout, Refusal, Reply, SearchScope, SharedPage, SpaceAbout};
 use super::model::{self, number, GuildSettings, Posted};
-use super::{refusal, Discord};
+use super::{escaped, refusal, Discord};
 use crate::hub::now;
-use protocol::{ConversationKind, MediaKind, Message, Notify, SharedItem, SharedKind, Style};
+use protocol::{ConversationKind, MediaKind, Message, MessageHit, Notify, SharedItem, SharedKind, Style};
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::{Arc, Mutex};
@@ -19,6 +19,18 @@ const PROFILE_EVERY: Duration = Duration::from_secs(3);
 static PROFILE_TURN: Mutex<()> = Mutex::new(());
 /// Discord's search answers 25 messages a page at most.
 const SEARCH_PAGE: u32 = 25;
+/// Most characters Discord's message search accepts in `content`.
+const SEARCH_MAX_CHARS: usize = 1024;
+/// Recent message searches kept in memory per account, so the same scope and words are not
+/// asked twice in a session.
+const REMEMBERED_SEARCHES: usize = 32;
+
+#[derive(Default)]
+pub(super) struct MessageSearch {
+    in_flight: bool,
+    last: Option<Instant>,
+    remembered: std::collections::VecDeque<(SearchScope, String, Vec<MessageHit>)>,
+}
 
 fn refused(why: impl std::fmt::Display) -> Refusal {
     Refusal::Refused(why.to_string())
@@ -331,5 +343,121 @@ impl Discord {
             total: found.total_results.filter(|_| before.is_none()),
             items,
         })
+    }
+
+    /// Runs a message search off the command thread, one at a time per account.
+    pub(super) fn search_queued(
+        discord: &Arc<Discord>,
+        query: String,
+        scope: SearchScope,
+        at: Instant,
+        reply: Reply<Vec<MessageHit>>,
+    ) {
+        let searching = discord.clone();
+        let run = move || {
+            let _ = reply.send(searching.search_messages(&query, &scope, at));
+        };
+        if let Err(err) = std::thread::Builder::new().name("discord-search".into()).spawn(run) {
+            eprintln!("chatd: Discord: no thread for a search: {err}");
+        }
+    }
+
+    /// What the network itself finds for the pane's words, from Discord's own search: the
+    /// server's when a Space is the scope, the channel's when one conversation is. The hits
+    /// are mapped like the cache's, so the pane can merge the two lists and tell them apart.
+    pub(super) fn search_messages(&self, query: &str, scope: &SearchScope, at: Instant) -> Result<Vec<MessageHit>, Refusal> {
+        if at.elapsed() >= super::SEARCH_PATIENCE {
+            return Err(refused("That took too long. Try again."));
+        }
+        let capped: String = query.chars().take(SEARCH_MAX_CHARS).collect();
+        let query = capped.trim();
+        let key = query.to_lowercase();
+        let path = match scope {
+            SearchScope::Space(space) => {
+                // A Space's id is a guild's: one the account is in, as space_info checks.
+                if !crate::hub::lock(&self.state).guilds.contains_key(space) {
+                    return Err(refused("This server is gone."));
+                }
+                format!("/guilds/{space}/messages/search?content={}", escaped(query))
+            }
+            SearchScope::Conversation(channel) => {
+                let known = self.ctx.known(channel).map_err(refused)?.ok_or_else(|| refused("This conversation is gone."))?;
+                match self.guild_of(&known) {
+                    Some(guild) => {
+                        format!("/guilds/{guild}/messages/search?channel_id={channel}&content={}", escaped(query))
+                    }
+                    None => format!("/channels/{channel}/messages/search?content={}", escaped(query)),
+                }
+            }
+        };
+        // One search in flight per account, and at least SEARCH_GAP after the previous finished:
+        // no client turns Enter into a burst against Discord's tight search limits.
+        {
+            let mut search = crate::hub::lock(&self.message_search);
+            if let Some((_, _, hits)) = search.remembered.iter().find(|(s, q, _)| s == scope && *q == key) {
+                return Ok(hits.clone());
+            }
+            if search.in_flight || search.last.is_some_and(|last| last.elapsed() < super::members::SEARCH_GAP) {
+                return Err(refused("Discord search is paced. Try again in a moment."));
+            }
+            search.in_flight = true;
+        }
+        let outcome = self.run_message_search(&path, query, scope);
+        let mut search = crate::hub::lock(&self.message_search);
+        search.in_flight = false;
+        search.last = Some(Instant::now());
+        if let Ok(hits) = &outcome {
+            if search.remembered.len() >= REMEMBERED_SEARCHES {
+                search.remembered.pop_front();
+            }
+            search.remembered.push_back((scope.clone(), key, hits.clone()));
+        }
+        outcome
+    }
+
+    fn run_message_search(&self, path: &str, query: &str, scope: &SearchScope) -> Result<Vec<MessageHit>, Refusal> {
+        let answer = self.call("GET", path, None).map_err(refusal)?;
+        let found: Found = serde_json::from_str(&answer).map_err(refused)?;
+        // A 202 with no hits: the index is still being built.
+        let Some(hits) = found.messages.filter(|_| found.code.is_none()) else {
+            return Err(refused("Discord search isn't ready for this server yet. Try again in a moment."));
+        };
+        let space_id = match scope {
+            SearchScope::Space(space) => Some(space.clone()),
+            SearchScope::Conversation(channel) => {
+                self.ctx.known(channel).ok().flatten().and_then(|known| self.guild_of(&known))
+            }
+        };
+        let mut found_hits = Vec::new();
+        for posted in hits.iter().filter_map(|hit| hit.first()) {
+            // Hidden conversations and message requests stay out of it, as they stay out of
+            // the cache's own search.
+            if !self.ctx.listable(&posted.channel_id) {
+                continue;
+            }
+            let known = self.ctx.known(&posted.channel_id).ok().flatten();
+            let kind = known.as_ref().map_or(ConversationKind::Channel, |row| row.kind);
+            let title = known.as_ref().map_or_else(String::new, |row| row.title.clone());
+            let space_title = known.as_ref().map_or_else(String::new, |row| row.space_title.clone());
+            let (message, _) = self.convert(posted, space_id.as_deref(), kind);
+            let text = if !message.text.is_empty() {
+                message.text
+            } else if let Some(first) = message.attachments.first() {
+                if first.name.is_empty() { "Attachment".to_owned() } else { first.name.clone() }
+            } else {
+                posted.content.clone().unwrap_or_default()
+            };
+            found_hits.push(MessageHit {
+                conversation: self.ctx.key(&posted.channel_id),
+                message_id: posted.id.clone(),
+                sent: model::seconds(&posted.id),
+                sender: message.sender.name,
+                snippet: crate::store::snippet(&text, query),
+                title,
+                space_title,
+                outgoing: message.outgoing,
+            });
+        }
+        Ok(found_hits)
     }
 }

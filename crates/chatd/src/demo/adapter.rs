@@ -656,6 +656,8 @@ impl Demo {
             Command::SearchShared { conversation_id, kind, before, limit, reply } => {
                 let _ = reply.send(demo.search_shared(&conversation_id, kind, before.as_deref(), limit));
             }
+            // The demo's words are all in the cache: its network is not asked.
+            Command::Search { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Catalog { kind, query, cursor, reply, .. } => drop(reply.send(Ok(demo.catalog(kind, &query, cursor.as_deref())))),
             Command::ReactionRules { conversation_id, reply } => drop(reply.send(Ok(demo.reaction_rules(&conversation_id)))),
             Command::SendWith { conversation_id, client_id, text, reply_to, with } => {

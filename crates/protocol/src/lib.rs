@@ -998,6 +998,17 @@ pub enum Request {
         query: String,
         limit: u32,
     },
+    /// Ask the network itself for messages, as the pane's Enter does: a server's own search
+    /// when a Space is the scope, the channel's when one conversation is. The hits are mapped
+    /// like the cache's, so the pane can merge the two lists and tell them apart; a network
+    /// that cannot search here answers why.
+    SearchNetwork {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conversation: Option<Key>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        space: Option<Key>,
+        query: String,
+    },
     /// Keeps what the user typed and did not send. Empty text forgets it. Local: no network
     /// hears of it and no change is announced.
     SetDraft {
@@ -1777,6 +1788,21 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&Response::MessageHits { hits: vec![hit] }).unwrap(),
             r#"{"op":"message_hits","hits":[{"conversation":{"network":"discord","account":"1","id":"C2"},"message_id":"9","sent":20,"sender":"mara","snippet":"hello world"}]}"#
+        );
+        // The network's own ask: the scope is a conversation or a Space, the words ride along.
+        let ask: Request = serde_json::from_str(r#"{"op":"search_network","query":"lichen"}"#).unwrap();
+        let Request::SearchNetwork { conversation, space, query } = &ask else {
+            panic!("not a network search")
+        };
+        assert!(conversation.is_none() && space.is_none() && query == "lichen");
+        let asked = Request::SearchNetwork {
+            conversation: Some(Key { network: Network::Discord, account: "1".into(), id: "C2".into() }),
+            space: None,
+            query: "lichen".into(),
+        };
+        assert_eq!(
+            serde_json::to_string(&asked).unwrap(),
+            r#"{"op":"search_network","conversation":{"network":"discord","account":"1","id":"C2"},"query":"lichen"}"#
         );
     }
 

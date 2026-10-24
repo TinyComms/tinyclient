@@ -17,7 +17,7 @@ use crate::gui::theme::{self, Type};
 use crate::gui::time;
 use crate::view::{age, now};
 use gpui::{div, prelude::*, px, AnyElement, Context, Entity, Focusable, FontWeight, HighlightStyle, MouseButton, SharedString, StyledText, Window};
-use protocol::{ConversationKind, Key, Link, Message, MessageHit, Request, Response};
+use protocol::{ConversationKind, Key, Link, Message, MessageHit, Network, Request, Response};
 use std::ops::Range;
 use std::rc::Rc;
 
@@ -62,10 +62,27 @@ pub struct SearchPage {
     pub hits: Option<Vec<MessageHit>>,
     /// The cache could not be asked.
     pub failed: bool,
-    /// The hit the keyboard is on: drawn lit, opened on Enter.
-    pub picked: Option<usize>,
+    /// The hit the keyboard is on (`(conversation, message_id)`): drawn lit, opened on Enter.
+    pub picked: Option<(Key, String)>,
     /// How often the cache was asked, so an older answer never lands over a newer one.
     asked: u32,
+    /// The shell's ask count the network ask last carried, so a word or scope change drops a
+    /// late answer on the way.
+    network_asked: u32,
+    /// The words the network ask carried: Enter asks once for them while in flight or after a
+    /// successful answer, until they or the scope change.
+    network_asked_for: Option<String>,
+    /// Where the network is being asked right now, while an ask is in flight.
+    pub network_asking: Option<String>,
+    /// What the network answered on Enter, with where it was asked. `None` until asked, gone
+    /// when the words or the scope change.
+    pub network: Option<NetworkFound>,
+}
+
+/// What the network said on Enter: where that was, and its hits, or its word for why not.
+pub struct NetworkFound {
+    pub where_at: String,
+    pub result: Result<Vec<MessageHit>, String>,
 }
 
 /// How far a search asks: the conversation open now, its Space, or the whole cache.
@@ -111,6 +128,71 @@ struct SearchField {
 /// field's `set_text`, which is not an edit and emits nothing.
 fn fresh_page(scope: Scope, words: &str) -> SearchPage {
     SearchPage { scope, words: words.to_owned(), ..SearchPage::default() }
+}
+
+/// The user's word for what went wrong asking the network.
+fn asked_words(code: protocol::ErrorCode, detail: &str) -> String {
+    if detail.contains("does not understand") {
+        crate::client::OTHER_ANSWER.to_owned()
+    } else if detail == "the network did not answer" {
+        "The network did not answer. Try again.".to_owned()
+    } else if let Some(network) = detail.strip_suffix(" is not signed in") {
+        format!("{network} isn't signed in.")
+    } else {
+        crate::client::refusal_words(code, detail)
+    }
+}
+
+impl SearchPage {
+    /// The hits as listed: the cache's and the network's own merged by message id — the
+    /// network's not doubling what the cache had — newest first, each with whether the cache
+    /// said it.
+    fn listed(&self) -> Vec<(&MessageHit, bool)> {
+        let cache = self.hits.as_deref().unwrap_or_default();
+        let mut listed: Vec<(&MessageHit, bool)> = cache.iter().map(|hit| (hit, true)).collect();
+        if let Some(Ok(found)) = self.network.as_ref().map(|found| &found.result) {
+            let seen: std::collections::HashSet<(&Key, &str)> =
+                listed.iter().map(|(hit, _)| (&hit.conversation, hit.message_id.as_str())).collect();
+            listed.extend(
+                found
+                    .iter()
+                    .filter(|hit| !seen.contains(&(&hit.conversation, hit.message_id.as_str())))
+                    .map(|hit| (hit, false)),
+            );
+        }
+        listed.sort_by_key(|(hit, _)| std::cmp::Reverse(hit.sent));
+        listed
+    }
+
+    fn reset_network(&mut self) {
+        self.network = None;
+        self.network_asking = None;
+        self.network_asked_for = None;
+        self.network_asked = 0;
+    }
+
+    /// Moves the keyboard pick up or down in the merged list. Up from row 0 clears the pick so
+    /// Enter can ask the network again.
+    fn move_pick(&mut self, down: bool) {
+        let listed = self.listed();
+        if listed.is_empty() {
+            return;
+        }
+        let current = self.picked.as_ref().and_then(|(conv, id)| {
+            listed.iter().position(|(hit, _)| &hit.conversation == conv && hit.message_id == *id)
+        });
+        let next = match (current, down) {
+            (Some(at), true) => Some((at + 1).min(listed.len() - 1)),
+            (Some(0), false) => None,
+            (Some(at), false) => Some(at - 1),
+            (None, true) => Some(0),
+            (None, false) => Some(listed.len() - 1),
+        };
+        self.picked = next.map(|ix| {
+            let (hit, _) = listed[ix];
+            (hit.conversation.clone(), hit.message_id.clone())
+        });
+    }
 }
 
 /// The letters of the query inside a hit's text, for the heavier drawing.
@@ -442,6 +524,7 @@ impl Shell {
             page.scope = scope;
             page.hits = None;
             page.picked = None;
+            page.reset_network();
         }
         self.reask_search(cx);
         if let Some(field) = &self.conversation_state.side.search_input {
@@ -465,7 +548,7 @@ impl Shell {
         let input = cx.new(|cx| TextInput::new("Search messages", cx));
         let changed = cx.subscribe_in(&input, window, |this, _, event: &InputEvent, _, cx| match event {
             InputEvent::Changed => this.search_typed(cx),
-            InputEvent::Submit => this.open_picked_hit(cx),
+            InputEvent::Submit => this.enter_search(cx),
         });
         let keys = cx.subscribe_in(&input, window, |this, _, event: &InputKey, window, cx| match event {
             InputKey::Escape => this.close_search(window, cx),
@@ -522,6 +605,7 @@ impl Shell {
         page.words = words;
         page.hits = None;
         page.picked = None;
+        page.reset_network();
         self.reask_search(cx);
     }
 
@@ -541,6 +625,7 @@ impl Shell {
         if words.trim().is_empty() {
             if let Some(page) = self.conversation_state.side.search.as_mut() {
                 page.hits = None;
+                page.reset_network();
             }
             cx.notify();
             return;
@@ -582,35 +667,120 @@ impl Shell {
         Some((key, space))
     }
 
-    /// The keyboard moves over the hits; Enter opens the one it is on, or the first.
+    /// Enter in the field: with a hit picked, open it; otherwise the network itself is asked
+    /// when it can search here, or the first hit opens.
+    fn enter_search(&mut self, cx: &mut Context<Self>) {
+        let (scope, first, picked) = match self.conversation_state.side.search.as_ref() {
+            Some(page) => {
+                let listed = page.listed();
+                let first = listed.first().map(|(hit, _)| (*hit).clone());
+                let picked = page.picked.as_ref().and_then(|(conv, id)| {
+                    listed.iter().find(|(hit, _)| &hit.conversation == conv && hit.message_id == *id).map(|(hit, _)| (*hit).clone())
+                });
+                (page.scope, first, picked)
+            }
+            None => return,
+        };
+        if let Some(hit) = picked {
+            self.open_search_hit(&hit, cx);
+            return;
+        }
+        let can_ask_network = scope != Scope::Everywhere
+            && self.open_key().is_some_and(|key| key.network == Network::Discord);
+        if !can_ask_network {
+            if let Some(hit) = first {
+                self.open_search_hit(&hit, cx);
+            }
+            return;
+        }
+        self.ask_network(cx);
+    }
+
+    /// Asks the network itself for the page's words: a Space's own search, or the open
+    /// conversation's channel search.
+    fn ask_network(&mut self, cx: &mut Context<Self>) {
+        let Some(page) = self.conversation_state.side.search.as_ref() else {
+            return;
+        };
+        let (words, scope) = (page.words.clone(), page.scope);
+        let trimmed: String = words.trim().chars().take(1024).collect();
+        if trimmed.is_empty() {
+            return;
+        }
+        // The same words in the same scope are asked once while in flight or after a
+        // successful answer: Enter again, key repeats included, changes nothing until the
+        // words or the scope change.
+        if page.network_asked_for.as_deref() == Some(trimmed.as_str()) {
+            return;
+        }
+        let (conversation, space, where_at) = match scope {
+            Scope::Conversation => {
+                let Some(open) = self.snapshot.as_ref().and_then(|s| s.open.as_ref()) else {
+                    return;
+                };
+                let key = open.key.clone();
+                let name = if open.title.is_empty() { key.id.clone() } else { open.title.clone() };
+                let where_at = format!("{} · {}", key.network.label(), name);
+                (Some(key), None, where_at)
+            }
+            Scope::Space => {
+                let Some((key, Some(space))) = self.open_with_space() else {
+                    return;
+                };
+                let known = self
+                    .spaces
+                    .iter()
+                    .find(|known| known.key.network == key.network && known.key.account == key.account && known.key.id == space)
+                    .map_or_else(String::new, |known| known.name.clone());
+                let where_at = format!("{} · {}", key.network.label(), if known.is_empty() { space.clone() } else { known });
+                let space = Key { network: key.network, account: key.account.clone(), id: space };
+                (None, Some(space), where_at)
+            }
+            Scope::Everywhere => return,
+        };
+        let asked = {
+            let side = &mut self.conversation_state.side;
+            side.search_asks += 1;
+            if let Some(page) = side.search.as_mut() {
+                page.network_asked = side.search_asks;
+                page.network_asked_for = Some(trimmed.clone());
+                page.network_asking = Some(where_at.clone());
+            }
+            side.search_asks
+        };
+        cx.notify();
+        let request = Request::SearchNetwork { conversation, space, query: trimmed };
+        self.off_thread(
+            cx,
+            move || ask(&request),
+            move |this, answer, cx| {
+                let Some(page) = this.conversation_state.side.search.as_mut().filter(|page| page.network_asked == asked) else {
+                    return;
+                };
+                page.network_asking = None;
+                let result = match answer {
+                    Ok(Response::MessageHits { hits }) => Ok(hits),
+                    Ok(Response::Error { code, detail }) => Err(asked_words(code, &detail)),
+                    Ok(_) => Err(crate::client::OTHER_ANSWER.to_owned()),
+                    Err(err) => Err(crate::client::trouble_words(&err)),
+                };
+                if result.is_err() {
+                    page.network_asked_for = None;
+                }
+                page.network = Some(NetworkFound { where_at, result });
+                cx.notify();
+            },
+        );
+    }
+
+    /// The keyboard moves over the hits; Up from row 0 steps off the list so Enter can ask
+    /// the network again.
     fn move_search_pick(&mut self, down: bool, cx: &mut Context<Self>) {
         let Some(page) = self.conversation_state.side.search.as_mut() else {
             return;
         };
-        let Some(hits) = page.hits.as_ref() else {
-            return;
-        };
-        if hits.is_empty() {
-            return;
-        }
-        page.picked = Some(match page.picked {
-            Some(at) if down => (at + 1).min(hits.len() - 1),
-            Some(at) => at.saturating_sub(1),
-            None if down => 0,
-            None => hits.len() - 1,
-        });
+        page.move_pick(down);
         cx.notify();
-    }
-
-    fn open_picked_hit(&mut self, cx: &mut Context<Self>) {
-        let page = self.conversation_state.side.search.as_ref();
-        let picked = page
-            .and_then(|page| page.hits.as_ref())
-            .and_then(|hits| hits.get(page.and_then(|page| page.picked).unwrap_or(0)))
-            .cloned();
-        if let Some(hit) = picked {
-            self.open_search_hit(&hit, cx);
-        }
     }
 
     /// A search hit was clicked: its conversation opens on the message, or, being open already,
@@ -928,6 +1098,17 @@ fn draw_search(shell: &Shell, _window: &mut Window, cx: &mut Context<Shell>) -> 
                 .child(candidate.label()),
         );
     }
+    // What the network said on Enter: a line that names what is being searched, what was
+    // searched, or its word for why nothing came.
+    let said = if let Some(where_at) = &page.network_asking {
+        Some(format!("Asking {where_at}…"))
+    } else {
+        page.network.as_ref().map(|found| match &found.result {
+            Ok(_) => format!("Searched {}.", found.where_at),
+            Err(why) => why.clone(),
+        })
+    };
+    let listed = page.listed();
     let body = if page.words.trim().is_empty() {
         empty_state("icons/search.svg", "Search the cache.", "What was said in what tinyclient has read.").into_any_element()
     } else if page.failed {
@@ -935,14 +1116,25 @@ fn draw_search(shell: &Shell, _window: &mut Window, cx: &mut Context<Shell>) -> 
             .into_any_element()
     } else if page.hits.is_none() {
         empty_state("icons/search.svg", "Asking the cache…", "The hits land here as they are read.").into_any_element()
-    } else if page.hits.as_deref().is_none_or(|hits| hits.is_empty()) {
-        empty_state("icons/search.svg", "Nothing in the cache yet.", "The networks are not asked yet.").into_any_element()
+    } else if listed.is_empty() {
+        let why = if page.network_asking.is_some() {
+            "Waiting for the network's answer."
+        } else {
+            match page.network.as_ref().map(|found| &found.result) {
+                Some(Ok(_)) => "The network found nothing here.",
+                Some(Err(why)) => why.as_str(),
+                None => "The networks are not asked yet.",
+            }
+        };
+        empty_state("icons/search.svg", "Nothing in the cache yet.", why).into_any_element()
     } else {
-        let hits = page.hits.as_deref().unwrap_or_default();
         let mut rows = div().id("search-hits").flex_1().min_h_0().overflow_y_scroll().flex().flex_col().p(px(4.));
-        for (ix, hit) in hits.iter().enumerate() {
-            let clicked = hit.clone();
-            let picked = page.picked == Some(ix);
+        for (ix, (hit, cached)) in listed.iter().enumerate() {
+            let clicked = (*hit).clone();
+            let picked = page
+                .picked
+                .as_ref()
+                .is_some_and(|(conv, id)| conv == &hit.conversation && *id == hit.message_id);
             rows = rows.child(
                 div()
                     .id(("hit", ix))
@@ -958,7 +1150,7 @@ fn draw_search(shell: &Shell, _window: &mut Window, cx: &mut Context<Shell>) -> 
                     .hover(|style| style.bg(theme::hover()))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(page) = this.conversation_state.side.search.as_mut() {
-                            page.picked = Some(ix);
+                            page.picked = Some((clicked.conversation.clone(), clicked.message_id.clone()));
                         }
                         this.open_search_hit(&clicked, cx);
                     }))
@@ -987,7 +1179,9 @@ fn draw_search(shell: &Shell, _window: &mut Window, cx: &mut Context<Shell>) -> 
                                     .text_color(theme::text_soft())
                                     .child(StyledText::new(SharedString::from(hit.snippet.clone())).with_highlights(highlights))
                             })
-                            .child(div().flex_none().type_micro().text_color(theme::text_soft()).child("cached")),
+                            .when(*cached, |row| {
+                                row.child(div().flex_none().type_micro().text_color(theme::text_soft()).child("cached"))
+                            }),
                     ),
             );
         }
@@ -1000,6 +1194,7 @@ fn draw_search(shell: &Shell, _window: &mut Window, cx: &mut Context<Shell>) -> 
         .bg(theme::canvas())
         .child(head)
         .child(chips)
+        .children(said.map(|line| div().flex_none().px(px(12.)).pb(px(4.)).type_small().text_color(theme::text_soft()).child(line)))
         .child(body)
         .into_any_element()
 }
@@ -1145,5 +1340,40 @@ mod tests {
         let page = fresh_page(Scope::Everywhere, "rules");
         assert_eq!((page.scope, page.words.as_str()), (Scope::Everywhere, "rules"));
         assert!(page.hits.is_none() && page.picked.is_none());
+    }
+
+    #[test]
+    fn the_networks_hits_join_the_cache_s_and_the_picked_message_keeps_its_identity() {
+        let mut page = SearchPage { words: "rules".into(), ..SearchPage::default() };
+        let hit_of = |id: &str, sent: i64, conversation: &Key| MessageHit {
+            conversation: conversation.clone(),
+            message_id: id.into(),
+            sent,
+            sender: "mara".into(),
+            snippet: "the rules".into(),
+            title: String::new(),
+            space_title: String::new(),
+            outgoing: false,
+        };
+        page.hits = Some(vec![hit_of("1", 20, &key("C_a"))]);
+        assert_eq!(page.listed().iter().map(|(hit, cached)| (hit.message_id.as_str(), *cached)).collect::<Vec<_>>(), [("1", true)]);
+        // Picking the first row records its (conversation, message_id), and Up from row 0 clears it
+        // so Enter can ask the network again.
+        page.move_pick(true);
+        assert_eq!(page.picked, Some((key("C_a"), "1".into())));
+        page.move_pick(false);
+        assert_eq!(page.picked, None);
+        page.move_pick(true);
+        // The network's own join newest first, and the one the cache already had dropped by id;
+        // the picked message stays "1" even when a newer network hit lands above it.
+        page.network = Some(NetworkFound {
+            where_at: "Discord · Moss & Lichen".into(),
+            result: Ok(vec![hit_of("1", 20, &key("C_a")), hit_of("2", 25, &key("C_b")), hit_of("3", 15, &key("C_c"))]),
+        });
+        assert_eq!(
+            page.listed().iter().map(|(hit, cached)| (hit.message_id.as_str(), *cached)).collect::<Vec<_>>(),
+            [("2", false), ("1", true), ("3", false)]
+        );
+        assert_eq!(page.picked, Some((key("C_a"), "1".into())));
     }
 }

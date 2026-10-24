@@ -33,7 +33,7 @@ const LINGER: Duration = Duration::from_secs(600);
 /// A server's members are searched (op 8) at most once in this long.
 const SEARCH_AGAIN: Duration = Duration::from_secs(30);
 /// And the account as a whole at most once in this long.
-const SEARCH_GAP: Duration = Duration::from_millis(400);
+pub(super) const SEARCH_GAP: Duration = Duration::from_millis(400);
 /// Searches remembered as answered, so the same words are never sent twice in a session.
 const SEARCHED: usize = 512;
 
