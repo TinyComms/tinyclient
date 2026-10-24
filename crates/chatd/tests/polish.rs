@@ -180,8 +180,9 @@ fn the_socket_answers_while_a_keychain_read_waits_and_the_cached_account_stays_o
     let (accounts, keychain, seq, started) = chatd.status();
     let cached = accounts.iter().find(|status| status.key == account).expect("the cached account is listed");
     assert_eq!(cached.link, Link::Offline);
-    // A start slower than the read's 1,500 ms has missed the window: the read is over, the
-    // account it cached is shown all the same, and that is all this machine gets to see.
+    // The reads run one network after another, each held for 1,500 ms; a start slower than all
+    // of them has missed the window: the reads are over, the cached account is shown all the
+    // same, and that is all this machine gets to see.
     if !keychain.reading {
         assert!(keychain.is_settled(), "{keychain:?}");
         let (_, _, _, again) = chatd.status();
@@ -193,23 +194,16 @@ fn the_socket_answers_while_a_keychain_read_waits_and_the_cached_account_stays_o
     assert!(started > 0);
     // The account whose session is not read yet is shown, offline, not dropped.
     // A read held up past a second is a prompt on screen: the shell is told as a Status change,
-    // and the status says which network it waits on. The prompt holds only while the read does,
-    // so this waits for its word rather than sampling one instant; a machine that reached the
-    // read late is told of the settling instead.
-    let mut told;
-    loop {
-        told = chatd.changes(seq, Duration::from_millis(1_400));
-        if told.contains(&Change::Status) {
-            break;
-        }
-        assert!(!chatd.status().1.is_settled(), "the read settled without a word to the shell");
-    }
-    let (_, keychain, ..) = chatd.status();
-    if keychain.waiting == Some(Network::Discord) {
-        let (accounts, ..) = chatd.status();
+    // and the status says which network it waits on.
+    let waiting = chatd.until("a read waiting on the keychain", || chatd.status().1.waiting);
+    let (accounts, keychain, ..) = chatd.status();
+    assert!(!keychain.is_settled(), "{keychain:?}");
+    if waiting == Network::Discord {
         let cached = accounts.iter().find(|status| status.key == account).unwrap();
         assert_eq!(cached.detail, chatd::session::STORE_WAITING);
     }
+    let told = chatd.changes(seq, Duration::from_millis(1_400));
+    assert!(told.contains(&Change::Status), "{told:?}");
     // Requests are served while it waits.
     assert!(matches!(chatd.ask(Request::Inbox { network: None, filter: InboxFilter::All, offset: 0, limit: 10 }), Response::Conversations { .. }));
 
