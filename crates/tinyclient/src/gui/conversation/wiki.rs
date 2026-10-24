@@ -80,7 +80,7 @@ fn fetch(endpoint: &str) -> Option<Summary> {
         .max_redirects(0)
         .build().into();
     let mut answer = agent.get(endpoint)
-        .header("User-Agent", "TinyClient/0.2.5 (https://github.com/itz4blitz/tinyclient)")
+        .header("User-Agent", concat!("TinyClient/", env!("CARGO_PKG_VERSION"), " (https://github.com/itz4blitz/tinyclient)"))
         .header("Accept", "application/json")
         .call().ok()?;
     if answer.status() != 200 {
