@@ -23,8 +23,8 @@ fn current() -> MutexGuard<'static, Option<Flow>> {
     FLOW.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// An http or https origin: no user, no query, no fragment, no path. A trailing slash is dropped.
-/// A host with no scheme is https, except a machine on this computer, which is http.
+/// An http or https origin. A host with no scheme is https, except a machine on this computer,
+/// which is http. A path, query, or fragment is left off. A user in the address is refused.
 pub(crate) fn base_url(raw: &str) -> Option<String> {
     let raw = raw.trim();
     if raw.is_empty() || raw.chars().any(char::is_whitespace) {
@@ -39,11 +39,14 @@ pub(crate) fn base_url(raw: &str) -> Option<String> {
     }) {
         return None;
     }
-    if rest.contains(['@', '?', '#', '\\']) {
+    // A user in the address would carry a password. A backslash is not part of a host.
+    if rest.contains(['@', '\\']) || rest.is_empty() {
         return None;
     }
-    let rest = rest.strip_suffix('/').unwrap_or(rest);
-    if rest.is_empty() || rest.contains('/') {
+    let rest = rest.split_once('#').map(|(rest, _)| rest).unwrap_or(rest);
+    let rest = rest.split_once('?').map(|(rest, _)| rest).unwrap_or(rest);
+    let rest = rest.split_once('/').map(|(rest, _)| rest).unwrap_or(rest);
+    if rest.is_empty() {
         return None;
     }
     let ok = if let Some(v6) = rest.strip_prefix('[') {
@@ -225,13 +228,35 @@ impl Flow {
                     },
                 }
             }
-            Err(Fault::Unauthorized) => again(SignInProblem::PasswordInvalid),
-            Err(Fault::Unreachable) => again(SignInProblem::Unreachable),
-            Err(Fault::BadAnswer) => SignInStep::Failed {
-                reason: "The server's answer could not be read.".to_owned(),
+            Err(fault) => match password_outcome(fault) {
+                Ok(problem) => again(problem),
+                Err(reason) => SignInStep::Failed {
+                    reason: reason.to_owned(),
+                },
             },
         }
     }
+}
+
+/// A failed password step stays on that step. `Err` ends the sheet: the answer could not be read.
+fn password_outcome(fault: Fault) -> Result<SignInProblem, &'static str> {
+    match fault {
+        Fault::Unauthorized => Ok(SignInProblem::PasswordInvalid),
+        Fault::SlowDown => Ok(SignInProblem::TooMany {
+            until: unix_now() + 60,
+        }),
+        Fault::Unavailable => Ok(SignInProblem::Other {
+            reason: "The server had a problem. Try again in a moment.".to_owned(),
+        }),
+        Fault::Unreachable => Ok(SignInProblem::Unreachable),
+        Fault::BadAnswer => Err("The server's answer could not be read."),
+    }
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs() as i64)
 }
 
 #[cfg(test)]
@@ -292,19 +317,6 @@ mod tests {
                 adopt()
             )
             .unwrap(),
-            SignInStep::Server {
-                problem: Some(SignInProblem::UrlInvalid)
-            }
-        );
-        assert_eq!(
-            step(
-                &hub,
-                Some(SignInInput::Server {
-                    url: "http://127.0.0.1:8080/".into()
-                }),
-                adopt()
-            )
-            .unwrap(),
             SignInStep::Email {
                 server: "http://127.0.0.1:8080".into(),
                 problem: None
@@ -353,6 +365,33 @@ mod tests {
     }
 
     #[test]
+    fn a_slow_or_broken_server_stays_on_the_password() {
+        let before = unix_now();
+        let SignInProblem::TooMany { until } = password_outcome(Fault::SlowDown).unwrap() else {
+            panic!("a pause");
+        };
+        assert!((before + 60..=before + 61).contains(&until));
+        assert_eq!(
+            password_outcome(Fault::Unavailable).unwrap(),
+            SignInProblem::Other {
+                reason: "The server had a problem. Try again in a moment.".into()
+            }
+        );
+        assert!(matches!(
+            password_outcome(Fault::Unauthorized),
+            Ok(SignInProblem::PasswordInvalid)
+        ));
+        assert!(matches!(
+            password_outcome(Fault::Unreachable),
+            Ok(SignInProblem::Unreachable)
+        ));
+        assert_eq!(
+            password_outcome(Fault::BadAnswer),
+            Err("The server's answer could not be read.")
+        );
+    }
+
+    #[test]
     fn the_address_is_an_origin_and_the_email_has_one_at() {
         assert_eq!(
             base_url("  https://Example.com/  ").as_deref(),
@@ -371,8 +410,26 @@ mod tests {
             base_url("http://[::1]:8080").as_deref(),
             Some("http://[::1]:8080")
         );
-        assert_eq!(base_url("http://127.0.0.1:8080?x=1"), None);
-        assert_eq!(base_url("http://127.0.0.1:8080#top"), None);
+        assert_eq!(
+            base_url("http://127.0.0.1:8080?x=1").as_deref(),
+            Some("http://127.0.0.1:8080")
+        );
+        assert_eq!(
+            base_url("http://127.0.0.1:8080#top").as_deref(),
+            Some("http://127.0.0.1:8080")
+        );
+        assert_eq!(
+            base_url("https://chat.example/rooms?x=1#y").as_deref(),
+            Some("https://chat.example")
+        );
+        assert_eq!(
+            base_url("chat.example/health").as_deref(),
+            Some("https://chat.example")
+        );
+        assert_eq!(
+            base_url("localhost:8080/health").as_deref(),
+            Some("http://localhost:8080")
+        );
         assert_eq!(base_url("ftp://127.0.0.1:8080"), None);
         assert_eq!(base_url("http://127.0.0.1:0"), None);
         assert!(email_ok("ada@example.com"));

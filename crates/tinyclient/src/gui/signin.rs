@@ -160,8 +160,9 @@ fn problem_words(network: Network, problem: &SignInProblem) -> String {
         SignInProblem::CodeExpired => "That code has expired.".to_owned(),
         SignInProblem::PasswordInvalid if tiny => "That email or password isn't right.".to_owned(),
         SignInProblem::PasswordInvalid => "That password isn't right.".to_owned(),
-        SignInProblem::UrlInvalid => "That doesn't look like a server address.".to_owned(),
-        SignInProblem::EmailInvalid => "That doesn't look like an email address.".to_owned(),
+        SignInProblem::UrlInvalid => "Type a host, like tiny.example.com.".to_owned(),
+        SignInProblem::EmailInvalid => "Type an email address, like name@example.com.".to_owned(),
+        SignInProblem::TooMany { .. } if tiny => "Too many tries. Wait a minute, then try again.".to_owned(),
         SignInProblem::TooMany { until } => format!("Too many tries. {name} allows another at {}.", clock(*until)),
         SignInProblem::Other { reason } => reason.clone(),
     }
@@ -263,12 +264,15 @@ impl Sheet {
         let number = cx.new(|cx| TextInput::new("Phone number", cx));
         let digits = cx.new(|cx| TextInput::new("", cx));
         let password = cx.new(|cx| TextInput::new("", cx));
-        let url = cx.new(|cx| TextInput::new("Server URL", cx));
+        let url = cx.new(|cx| TextInput::new("tiny.example.com", cx));
         let email = cx.new(|cx| TextInput::new("Email", cx));
         for input in [&country, &number] {
             cx.subscribe(input, |this, _, event: &InputEvent, cx| match event {
                 InputEvent::Submit => this.send_phone(cx),
-                InputEvent::Changed => cx.notify(),
+                InputEvent::Changed => {
+                    this.dismiss();
+                    cx.notify();
+                }
             })
             .detach();
         }
@@ -280,17 +284,26 @@ impl Sheet {
         .detach();
         cx.subscribe(&password, |this, _, event: &InputEvent, cx| match event {
             InputEvent::Submit => this.send_password(cx),
-            InputEvent::Changed => cx.notify(),
+            InputEvent::Changed => {
+                this.dismiss();
+                cx.notify();
+            }
         })
         .detach();
         cx.subscribe(&url, |this, _, event: &InputEvent, cx| match event {
             InputEvent::Submit => this.send_url(cx),
-            InputEvent::Changed => cx.notify(),
+            InputEvent::Changed => {
+                this.dismiss();
+                cx.notify();
+            }
         })
         .detach();
         cx.subscribe(&email, |this, _, event: &InputEvent, cx| match event {
             InputEvent::Submit => this.send_email(cx),
-            InputEvent::Changed => cx.notify(),
+            InputEvent::Changed => {
+                this.dismiss();
+                cx.notify();
+            }
         })
         .detach();
         // Escape in a field is the field's key; it hands it on.
@@ -401,6 +414,21 @@ impl Sheet {
     fn clear_typed(&mut self, cx: &mut Context<Sheet>) {
         self.digits.update(cx, |input, cx| input.set_text("", cx));
         self.password.update(cx, |input, cx| input.set_text("", cx));
+    }
+
+    /// The red line describes the text that was submitted. Editing that text takes the line away.
+    fn dismiss(&mut self) {
+        self.local = None;
+        let Some(Face::Step(step)) = &mut self.face else {
+            return;
+        };
+        match step {
+            SignInStep::Phone { problem }
+            | SignInStep::Server { problem }
+            | SignInStep::Email { problem, .. }
+            | SignInStep::Password { problem, .. } => *problem = None,
+            _ => {}
+        }
     }
 
     // Talking to chatd.
@@ -544,9 +572,14 @@ impl Sheet {
         if moved {
             self.local = None;
         }
-        // A step shown again with a problem starts clean: the boxes clear and take the keys.
+        // A wrong code starts clean. A password stays, so a long one is not typed again.
         if moved || step_problem(&step).is_some() {
-            self.clear_typed(cx);
+            let keep_password = !moved && matches!(step, SignInStep::Password { .. });
+            if keep_password {
+                self.digits.update(cx, |input, cx| input.set_text("", cx));
+            } else {
+                self.clear_typed(cx);
+            }
             self.refocus = true;
         }
         match &step {
@@ -645,7 +678,8 @@ impl Sheet {
         if password.is_empty() {
             return;
         }
-        self.password.update(cx, |input, cx| input.set_text("", cx));
+        // Left in the field. A miss would make a long password be typed again.
+        self.dismiss();
         self.answer(SignInInput::Password { password }, cx);
     }
 
@@ -657,6 +691,7 @@ impl Sheet {
         if url.trim().is_empty() {
             return;
         }
+        self.dismiss();
         self.answer(SignInInput::Server { url }, cx);
     }
 
@@ -668,6 +703,7 @@ impl Sheet {
         if email.trim().is_empty() {
             return;
         }
+        self.dismiss();
         self.answer(SignInInput::Email { email }, cx);
     }
 
@@ -949,7 +985,7 @@ impl Sheet {
             .flex()
             .flex_col()
             .child(self.header("Server", false, cx))
-            .child(div().mt(px(6.)).mb(px(16.)).text_color(theme::text_soft()).child("The address of a server you already run."))
+            .child(div().mt(px(6.)).mb(px(16.)).text_color(theme::text_soft()).child("The host of a server you already run. https is added for you."))
             .child(input)
             .children(problem.map(|problem| error_line(problem_words(self.network, problem)).mt(px(6.))))
             .child(footer(22.).child(div()).child(buttons().child(self.cancel("Cancel", cx)).child(self.primary("Continue", Sheet::send_url, cx))))
@@ -1275,10 +1311,11 @@ mod tests {
         assert_eq!(words(SignInProblem::TooMany { until }), format!("Too many tries. Telegram allows another at {}.", clock(until)));
         // Signal is named for itself.
         assert_eq!(problem_words(Network::Signal, &SignInProblem::Unreachable), "Couldn't reach Signal. Check your connection.");
-        assert_eq!(problem_words(Network::Tiny, &SignInProblem::UrlInvalid), "That doesn't look like a server address.");
-        assert_eq!(problem_words(Network::Tiny, &SignInProblem::EmailInvalid), "That doesn't look like an email address.");
+        assert_eq!(problem_words(Network::Tiny, &SignInProblem::UrlInvalid), "Type a host, like tiny.example.com.");
+        assert_eq!(problem_words(Network::Tiny, &SignInProblem::EmailInvalid), "Type an email address, like name@example.com.");
         assert_eq!(problem_words(Network::Tiny, &SignInProblem::PasswordInvalid), "That email or password isn't right.");
         assert_eq!(problem_words(Network::Tiny, &SignInProblem::Unreachable), "Couldn't reach that server. Check the address and your connection.");
+        assert_eq!(problem_words(Network::Tiny, &SignInProblem::TooMany { until }), "Too many tries. Wait a minute, then try again.");
         assert_eq!(asked_network("tiny"), Some(Network::Tiny));
         assert_eq!(asked_network("Tiny server"), Some(Network::Tiny));
     }

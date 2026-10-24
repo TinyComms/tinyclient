@@ -34,7 +34,7 @@ pub enum SignInProblem {
     CodeInvalid,
     CodeExpired,
     PasswordInvalid,
-    /// Not an http or https origin: a user, a query, a fragment, or a path.
+    /// Not an http or https host. A user in the address is refused. A path, query, or fragment is dropped.
     UrlInvalid,
     /// Not one address: missing `@`, more than one, or whitespace.
     EmailInvalid,

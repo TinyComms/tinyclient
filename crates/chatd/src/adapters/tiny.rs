@@ -33,6 +33,10 @@ struct Me {
 enum Fault {
     Unauthorized,
     Unreachable,
+    /// The server asked for a pause. The password was not checked.
+    SlowDown,
+    /// The server answered, and the answer was a failure of its own.
+    Unavailable,
     BadAnswer,
 }
 
@@ -153,11 +157,12 @@ fn post_session(base: &str, email: &str, password: &str) -> Result<Saved, Fault>
         None,
         Some(serde_json::json!({ "email": email, "password": password })),
     )?;
-    if status == 401 {
-        return Err(Fault::Unauthorized);
-    }
-    if status != 200 {
-        return Err(Fault::Unreachable);
+    match status {
+        200 => {}
+        401 => return Err(Fault::Unauthorized),
+        429 => return Err(Fault::SlowDown),
+        500..=599 => return Err(Fault::Unavailable),
+        _ => return Err(Fault::Unreachable),
     }
     let answer: SessionAnswer = serde_json::from_value(body).map_err(|_| Fault::BadAnswer)?;
     if answer.token.is_empty()
@@ -301,6 +306,12 @@ mod tests {
         let base = serve(|request| {
             let first = request.lines().next().unwrap_or("");
             if first.starts_with("POST /v1/session ") {
+                if request.contains("\"password\": \"slow\"") {
+                    return http(429, "Too Many Requests", r#"{"error":"slow_down"}"#);
+                }
+                if request.contains("\"password\": \"boom\"") {
+                    return http(500, "Internal Server Error", r#"{"error":"unavailable"}"#);
+                }
                 if request.contains("\"password\": \"nope\"") {
                     return http(401, "Unauthorized", r#"{"error":"invalid_credentials"}"#);
                 }
@@ -333,6 +344,14 @@ mod tests {
         assert!(matches!(
             post_session(&base, "ada@example.com", "nope"),
             Err(Fault::Unauthorized)
+        ));
+        assert!(matches!(
+            post_session(&base, "ada@example.com", "slow"),
+            Err(Fault::SlowDown)
+        ));
+        assert!(matches!(
+            post_session(&base, "ada@example.com", "boom"),
+            Err(Fault::Unavailable)
         ));
         let saved = match post_session(&base, "ada@example.com", "correct-password") {
             Ok(saved) => saved,
