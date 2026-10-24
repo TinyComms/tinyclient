@@ -250,7 +250,21 @@ jobs:
         with:
           name: release-all
           path: dist/*
-      - uses: softprops/action-gh-release@v3
+      - id: release
+        uses: softprops/action-gh-release@v3
         if: github.ref_type == 'tag' && (github.event_name == 'push' || inputs.publish)
         with:
           files: dist/*
+      # The release lands in the community's #releases channel once the webhook's URL sits in
+      # the DISCORD_WEBHOOK_URL secret (an admin sets it). Nothing posts while it is unset, and
+      # a Discord hiccup does not fail a published release.
+      - name: Post the release to Discord
+        if: steps.release.outputs.url != ''
+        continue-on-error: true
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          RELEASE_URL: ${{ steps.release.outputs.url }}
+        run: |
+          [ -n "$DISCORD_WEBHOOK_URL" ] || exit 0
+          payload=$(jq -n --arg content "**tinyclient $VERSION is out.** Download: $RELEASE_URL Checksums are in SHA256SUMS on the release page." '{content: $content}')
+          curl -fsS -H "Content-Type: application/json" -d "$payload" "$DISCORD_WEBHOOK_URL"
