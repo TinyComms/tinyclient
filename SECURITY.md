@@ -73,7 +73,10 @@ What tinyclient protects, and how. Every point is checkable in the code named.
 **Sessions** are kept in the operating system's credential store (macOS Keychain, Windows
 Credential Manager, Linux Secret Service) under the service `tinyclient`, one item per network
 (`crates/chatd/src/session.rs`). A build whose credential store would not persist refuses to keep
-sessions at all rather than fall back to memory or disk.
+sessions at all rather than fall back to memory or disk. On macOS the release is ad-hoc signed, so
+each item's access list allows any app running as the same user to read it without a prompt.
+That is what stops a login-password dialog after every update. The keychain stays locked when
+the user is logged out. A Developer ID signature can restrict the list to chatd.
 
 **Signal's state** (identity keys, prekeys, sessions, group keys, contacts) is in
 `signal/<account>.state`, each value sealed with AES-256-GCM-SIV under a key held only in the

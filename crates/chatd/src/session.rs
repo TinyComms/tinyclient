@@ -156,6 +156,9 @@ pub fn read_waiting(network: Network) -> Stored {
 }
 
 fn read_session(network: Network, retry_timeouts: bool) -> Stored {
+    // The unlock retry is the Linux Secret Service. macOS reads through `apple` instead.
+    #[cfg(target_os = "macos")]
+    let _ = retry_timeouts;
     if !enabled() {
         let name = format!("TINYCLIENT_SESSION_{}", network.label().to_uppercase());
         // Scratch-only simulation of a provider whose GetSecret times out until unlocked.
@@ -184,14 +187,19 @@ fn read_session(network: Network, retry_timeouts: bool) -> Stored {
     if !persistent() {
         return Stored::Unreadable(NO_STORE.to_owned());
     }
-    let entry = match Entry::new(SERVICE, account(network)) {
-        Ok(entry) => entry,
-        Err(err) => return Stored::Unreadable(err.to_string()),
-    };
-    match read_password(&entry, retry_timeouts) {
-        Ok(session) => Stored::Found(session),
-        Err(keyring::Error::NoEntry) => moved(network, &entry, retry_timeouts),
-        Err(err) => Stored::Unreadable(err.to_string()),
+    #[cfg(target_os = "macos")]
+    return apple::read(network);
+    #[cfg(not(target_os = "macos"))]
+    {
+        let entry = match Entry::new(SERVICE, account(network)) {
+            Ok(entry) => entry,
+            Err(err) => return Stored::Unreadable(err.to_string()),
+        };
+        match read_password(&entry, retry_timeouts) {
+            Ok(session) => Stored::Found(session),
+            Err(keyring::Error::NoEntry) => moved(network, &entry, retry_timeouts),
+            Err(err) => Stored::Unreadable(err.to_string()),
+        }
     }
 }
 
@@ -205,6 +213,8 @@ fn moved(network: Network, entry: &Entry, retry_timeouts: bool) -> Stored {
         Ok(session) => {
             if entry.set_password(&session).is_ok() {
                 let _ = old.delete_credential();
+                #[cfg(target_os = "macos")]
+                apple::trust_account(account(network));
             }
             Stored::Found(session)
         }
@@ -220,10 +230,16 @@ pub fn save(network: Network, session: &str) -> Result<(), String> {
     if !persistent() {
         return Err(NO_STORE.to_owned());
     }
-    Entry::new(SERVICE, account(network))
+    let saved = Entry::new(SERVICE, account(network))
         .map_err(|err| format!("keychain: {err}"))?
         .set_password(session)
-        .map_err(|err| format!("keychain: {err}"))
+        .map_err(|err| format!("keychain: {err}"));
+    // The item a sign-in just wrote trusts only this binary. Open it to later releases too.
+    #[cfg(target_os = "macos")]
+    if saved.is_ok() {
+        apple::trust_account(account(network));
+    }
+    saved
 }
 
 /// A network reissued part of a session while it was in use (Slack rotates its `d` cookie).
@@ -265,6 +281,131 @@ pub fn forget(network: Network) {
         for service in [SERVICE, RENAMED_FROM] {
             let _ = Entry::new(service, account(network)).and_then(|entry| entry.delete_credential());
         }
+    }
+}
+
+/// macOS keeps one generic password per network in the login keychain. An ad-hoc release's
+/// designated requirement is only its cdhash, so the next release is a different app and macOS
+/// asks for the login password once per network. After this process has read or written an item,
+/// its access list allows any app on this Mac, which is what makes the next release silent.
+/// The keychain is still locked when the person is logged out. A Developer ID signature can
+/// limit that list to chatd; this release is not signed with one.
+#[cfg(target_os = "macos")]
+mod apple {
+    use super::{account, moved, Stored, SERVICE};
+    use core_foundation::array::CFArray;
+    use core_foundation::base::TCFType;
+    use core_foundation::string::CFString;
+    use core_foundation_sys::base::{CFRelease, CFTypeRef};
+    use protocol::Network;
+    use security_framework::os::macos::access::SecAccess;
+    use security_framework::os::macos::keychain::SecKeychain;
+    use security_framework::os::macos::keychain_item::SecKeychainItem;
+    use security_framework::os::macos::passwords::find_generic_password;
+    use security_framework_sys::base::{errSecItemNotFound, SecAccessRef};
+    use std::os::raw::c_void;
+    use std::ptr;
+
+    #[link(name = "Security", kind = "framework")]
+    extern "C" {
+        fn SecAccessCreate(descriptor: CFTypeRef, trusted: CFTypeRef, access: *mut SecAccessRef) -> i32;
+        fn SecAccessCopyACLList(access: SecAccessRef, list: *mut CFTypeRef) -> i32;
+        fn SecACLSetContents(acl: CFTypeRef, apps: CFTypeRef, description: CFTypeRef, prompt: u16) -> i32;
+        fn SecACLCreateWithSimpleContents(
+            access: SecAccessRef,
+            apps: CFTypeRef,
+            description: CFTypeRef,
+            prompt: u16,
+            new_acl: *mut CFTypeRef,
+        ) -> i32;
+        fn SecKeychainItemSetAccess(item: CFTypeRef, access: SecAccessRef) -> i32;
+    }
+
+    pub(super) fn read(network: Network) -> Stored {
+        let name = account(network);
+        let keychain = match SecKeychain::default() {
+            Ok(keychain) => keychain,
+            Err(err) => return Stored::Unreadable(err.to_string()),
+        };
+        match find_generic_password(Some(&[keychain]), SERVICE, name) {
+            Ok((password, item)) => {
+                let session = match String::from_utf8(password.as_ref().to_vec()) {
+                    Ok(session) => session,
+                    Err(_) => return Stored::Unreadable("the keychain item was not text".to_owned()),
+                };
+                // `password` frees its bytes on drop. The item stays, and this process may change it.
+                drop(password);
+                trust_item(name, &item);
+                Stored::Found(session)
+            }
+            Err(err) if err.code() == errSecItemNotFound => match keyring::Entry::new(SERVICE, name) {
+                Ok(entry) => moved(network, &entry, false),
+                Err(err) => Stored::Unreadable(err.to_string()),
+            },
+            Err(err) => Stored::Unreadable(err.to_string()),
+        }
+    }
+
+    pub(super) fn trust_account(name: &str) {
+        let Ok(keychain) = SecKeychain::default() else {
+            return;
+        };
+        match find_generic_password(Some(&[keychain]), SERVICE, name) {
+            Ok((password, item)) => {
+                drop(password);
+                trust_item(name, &item);
+            }
+            Err(err) => eprintln!("chatd: {name}: could not open the saved sign-in to keep it ({err})"),
+        }
+    }
+
+    fn trust_item(name: &str, item: &SecKeychainItem) {
+        if let Err(err) = allow_anyone(item) {
+            eprintln!("chatd: {name}: the sign-in will ask again after the next update ({err})");
+        }
+    }
+
+    /// `nil` applications means any app may read the item without a prompt. An empty list would
+    /// trust nobody. Apple documents the difference on `SecACLSetContents`.
+    fn allow_anyone(item: &SecKeychainItem) -> Result<(), String> {
+        let label = CFString::from("tinyclient");
+        let label_ref = label.as_concrete_TypeRef();
+        unsafe {
+            let mut created: SecAccessRef = ptr::null_mut();
+            let status = SecAccessCreate(label_ref.cast(), ptr::null(), &mut created);
+            if status != 0 {
+                return Err(format!("keychain access {status}"));
+            }
+            let access = SecAccess::wrap_under_create_rule(created);
+            let mut list: CFTypeRef = ptr::null();
+            let status = SecAccessCopyACLList(access.as_concrete_TypeRef(), &mut list);
+            if status != 0 || list.is_null() {
+                return Err(format!("keychain access list {status}"));
+            }
+            let acls = CFArray::<*const c_void>::wrap_under_create_rule(list.cast());
+            if acls.is_empty() {
+                let mut acl: CFTypeRef = ptr::null();
+                let status = SecACLCreateWithSimpleContents(access.as_concrete_TypeRef(), ptr::null(), label_ref.cast(), 0, &mut acl);
+                if status != 0 {
+                    return Err(format!("keychain access entry {status}"));
+                }
+                if !acl.is_null() {
+                    CFRelease(acl);
+                }
+            } else {
+                for acl in acls.iter() {
+                    let status = SecACLSetContents(*acl, ptr::null(), label_ref.cast(), 0);
+                    if status != 0 {
+                        return Err(format!("keychain access entry {status}"));
+                    }
+                }
+            }
+            let status = SecKeychainItemSetAccess(item.as_concrete_TypeRef().cast(), access.as_concrete_TypeRef());
+            if status != 0 {
+                return Err(format!("keychain access set {status}"));
+            }
+        }
+        Ok(())
     }
 }
 

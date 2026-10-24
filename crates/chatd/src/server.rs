@@ -463,7 +463,12 @@ impl Chat {
                 .into_iter()
                 .map(|network| NetworkStatus {
                     network,
-                    link: self.hub.network_link(network),
+                    // The rail trusts this link. A session still in the keychain, or waiting on
+                    // it, has no live link yet and would otherwise read as signed out.
+                    link: published_link(
+                        self.hub.network_link(network),
+                        accounts.iter().filter(|account| account.key.network == network).map(|account| account.link),
+                    ),
                 })
                 .collect(),
             accounts,
@@ -1985,4 +1990,32 @@ fn typed_profile(person: Person, mut about: About) -> Profile {
     profile.note = about.note;
     profile.warning = about.warning;
     profile
+}
+
+/// The link the shell uses to decide a network is on the rail. A live connection wins. When the
+/// adapter has not reported one, an account kept on screen (its session is unread, refused, or
+/// still in the keychain) stays as offline instead of disappearing.
+fn published_link(live: Link, kept: impl IntoIterator<Item = Link>) -> Link {
+    if live != Link::SignedOut {
+        return live;
+    }
+    if kept.into_iter().any(|link| link != Link::SignedOut) {
+        Link::Offline
+    } else {
+        Link::SignedOut
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::published_link;
+    use protocol::Link;
+
+    #[test]
+    fn a_stored_account_stays_on_the_rail_while_its_session_is_unread() {
+        assert_eq!(published_link(Link::SignedOut, [Link::Offline]), Link::Offline);
+        assert_eq!(published_link(Link::SignedOut, std::iter::empty()), Link::SignedOut);
+        assert_eq!(published_link(Link::Connected, [Link::Offline]), Link::Connected);
+        assert_eq!(published_link(Link::Expired, [Link::Offline]), Link::Expired);
+    }
 }
