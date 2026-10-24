@@ -108,17 +108,63 @@ fn start(path: &Path, at: Option<u32>, rate: u16) -> PlayRequest {
 fn mediads() -> usize {
     #[cfg(windows)]
     {
-        let script = format!(
-            "(Get-CimInstance Win32_Process -Filter \"Name = 'mediad.exe'\" | Where-Object {{ $_.ParentProcessId -eq {} }}).ProcessId",
-            std::process::id()
-        );
-        let out = Command::new("powershell").args(["-NoProfile", "-Command", &script]).output().unwrap();
-        String::from_utf8(out.stdout).unwrap().lines().filter(|line| !line.trim().is_empty()).count()
+        // PowerShell's process list takes longer than this one-second clip, so it reported
+        // none while mediad was still playing. The snapshot is the process list itself.
+        windows_mediads()
     }
     #[cfg(not(windows))]
     {
         let out = Command::new("pgrep").args(["-P", &std::process::id().to_string(), "mediad"]).output().unwrap();
         String::from_utf8(out.stdout).unwrap().lines().count()
+    }
+}
+
+/// `mediad.exe` whose parent is this test. A toolhelp snapshot, not PowerShell.
+#[cfg(windows)]
+fn windows_mediads() -> usize {
+    use std::ffi::c_void;
+    #[repr(C)]
+    struct Entry {
+        size: u32,
+        usage: u32,
+        pid: u32,
+        heap: usize,
+        module: u32,
+        threads: u32,
+        parent: u32,
+        priority: i32,
+        flags: u32,
+        exe: [u16; 260],
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateToolhelp32Snapshot(flags: u32, pid: u32) -> *mut c_void;
+        fn Process32FirstW(snap: *mut c_void, entry: *mut Entry) -> i32;
+        fn Process32NextW(snap: *mut c_void, entry: *mut Entry) -> i32;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+    }
+    const SNAPPROCESS: u32 = 2;
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(SNAPPROCESS, 0);
+        assert_ne!(snap as isize, -1, "could not list processes");
+        let mut entry: Entry = std::mem::zeroed();
+        entry.size = std::mem::size_of::<Entry>() as u32;
+        let mut count = 0usize;
+        let parent = std::process::id();
+        if Process32FirstW(snap, &mut entry) != 0 {
+            loop {
+                let end = entry.exe.iter().position(|unit| *unit == 0).unwrap_or(entry.exe.len());
+                let name = String::from_utf16_lossy(&entry.exe[..end]);
+                if entry.parent == parent && name.eq_ignore_ascii_case("mediad.exe") {
+                    count += 1;
+                }
+                if Process32NextW(snap, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snap);
+        count
     }
 }
 
@@ -206,9 +252,8 @@ fn a_second_file_replaces_the_first_and_speed_and_seek_reach_mediad() {
     world.ask(second).unwrap();
     let playing = world.until_state(PlayState::Playing);
     assert_eq!(playing.file, "d6101");
-    // One file at a time: the first one's mediad went. Listing processes on Windows takes
-    // PowerShell a second or more, long enough for the second file to end and its mediad to go
-    // too, so none left counts as well.
+    // One file at a time: the first one's mediad went. The second file is a second long, so
+    // it may have ended before this looks. None left is that.
     world.until("at most one mediad", |_| mediads() <= 1);
     world.ask(PlayRequest::Stop).unwrap();
     until_no_mediad();
