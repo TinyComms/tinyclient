@@ -867,7 +867,13 @@ impl Render for Shell {
                 self.sidebar(snapshot, width, window, cx).child(self.resize_handle(Edge::Sidebar, cx))
             }))
             .when(list_alone, |root| {
-                root.child(self.sidebar(snapshot, width - RAIL_WIDTH, window, cx))
+                // A narrow window has no pane beside the list. Tiny's controls are that
+                // pane, so they fill the window instead of the empty sidebar note.
+                if matches!(self.sidebar_state.mode, super::sidebar::Mode::Network(Network::Tiny)) && self.tiny_open() {
+                    root.child(div().flex_1().min_w_0().h_full().child(self.tiny_page(window, cx)))
+                } else {
+                    root.child(self.sidebar(snapshot, width - RAIL_WIDTH, window, cx))
+                }
             })
             .when(!replaced && !list_alone, |root| {
                 let pane = match (&snapshot.open, self.keychain_state(window, cx)) {

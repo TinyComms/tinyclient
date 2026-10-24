@@ -328,6 +328,14 @@ impl Shell {
 
     /// Goes to a mode, remembering where the user was.
     pub(super) fn go(&mut self, mode: Mode, cx: &mut Context<Self>) {
+        // Tiny has no chats. A conversation left open from another network keeps the
+        // server page from drawing, so invite and member controls never appear.
+        if matches!(mode, Mode::Network(Network::Tiny)) {
+            self.open = None;
+            if let Some(snapshot) = &mut self.snapshot {
+                snapshot.open = None;
+            }
+        }
         if self.sidebar_state.mode == mode {
             let state = &mut self.sidebar_state;
             // Clicking the lit place leaves a drill and scrolls its list to the top.

@@ -297,8 +297,13 @@ impl Shell {
         let Some((open, mode)) = self.restore.take() else {
             return;
         };
-        if mode != self.sidebar_state.mode {
+        // A restored chat would cover the server page. Tiny opens on its own window.
+        let tiny = matches!(&mode, super::sidebar::Mode::Network(protocol::Network::Tiny));
+        if tiny || mode != self.sidebar_state.mode {
             self.go(mode, cx);
+        }
+        if tiny {
+            return;
         }
         if let Some((key, title)) = open {
             if self.open.is_none() {
