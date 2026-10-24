@@ -439,6 +439,8 @@ mod tests {
         assert!(!hands_off("https://discord.com/channels/@me"));
         assert!(!hands_off("https://discord.com/app"));
         assert!(!hands_off("https://slack.com/signin"));
+        assert!(DISCORD.probe.contains("iframe"));
+        assert!(DISCORD.probe.contains("localStorage.getItem('token')"));
     }
 
     #[test]

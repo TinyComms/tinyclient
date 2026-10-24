@@ -47,7 +47,7 @@ async function check(main, frame, expected, expectFrame, status = 200) {
   await new Promise(resolve => setImmediate(resolve));
   const result = status === 200 ? runInNewContext(probe, context) : first;
   assert.deepEqual(result === null ? null : JSON.parse(result), expected);
-  assert.equal(appended, expectFrame ? (status === 200 ? 2 : 1) : 0);
+  assert.equal(appended, expectFrame ? (status === 200 || status === 401 ? 2 : 1) : 0);
   assert.equal(removed, appended, 'temporary frames must be removed');
   assert.equal(cleared, status === 401);
   assert.equal(redirected, status === 401 ? 'https://discord.com/login' : null);
@@ -71,6 +71,8 @@ for (const value of ['""', '{', 'null', '42', '{}']) {
 
 test('a revoked token resets the browser login instead of closing the window', () =>
   check('"revoked-token"', null, null, false, 401));
+test('a revoked token read through a frame resets the browser login too', () =>
+  check(null, '"revoked-token"', null, true, 401));
 test('a server error keeps the browser login for another attempt', () =>
   check('"revoked-token"', null, null, false, 503));
 test('a connection failure keeps the browser login for another attempt', () =>
