@@ -225,8 +225,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    env:
-      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
     steps:
       - uses: actions/checkout@v5
       - name: Name the files
@@ -261,7 +259,12 @@ jobs:
       # the DISCORD_WEBHOOK_URL secret (an admin sets it). Nothing posts while it is unset, and
       # a Discord hiccup does not fail a published release.
       - name: Post the release to Discord
-        if: steps.release.outputs.url != '' && env.DISCORD_WEBHOOK_URL != ''
+        if: steps.release.outputs.url != ''
+        continue-on-error: true
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          RELEASE_URL: ${{ steps.release.outputs.url }}
         run: |
-          payload=$(jq -n --arg content "**tinyclient $VERSION is out.** Download: ${{ steps.release.outputs.url }} Checksums are in SHA256SUMS on the release page." '{content: $content}')
+          [ -n "$DISCORD_WEBHOOK_URL" ] || exit 0
+          payload=$(jq -n --arg content "**tinyclient $VERSION is out.** Download: $RELEASE_URL Checksums are in SHA256SUMS on the release page." '{content: $content}')
           curl -fsS -H "Content-Type: application/json" -d "$payload" "$DISCORD_WEBHOOK_URL"
