@@ -144,9 +144,13 @@ anything that hides presence on Telegram.
   notarization, a downloaded copy is blocked until the person allows it in System Settings.
 - **Why the bundle matters for behavior, not looks.** Notifications need a bundle identifier; a
   bare binary cannot post one with our name and icon. Keychain items are tied to the code
-  signature of the process that wrote them: with a stable Developer ID signature chatd reads its
-  sessions silently forever; with an unsigned or ad-hoc build, every new build is a new identity
-  and macOS asks for the login password per item. Login Items shows the bundle's name and icon.
+  signature of the process that wrote them. This release is ad-hoc, and an ad-hoc signature's
+  designated requirement is only its cdhash, so the next release would otherwise be a different
+  app and macOS would ask for the login password once per network. After chatd has read or written
+  an item, its access list allows any app on this Mac to read it without asking. That is what
+  keeps an update from prompting. The login keychain is still locked when the person is logged
+  out. A Developer ID signature can limit the list to chatd. Login Items shows the bundle's name
+  and icon.
 - **Open at login** registers chatd as a login agent from inside the bundle (`SMAppService`,
   macOS 13+), so it can be switched off in System Settings and goes when the app is deleted.
 - **Updates:** while the window is open, tinyclient asks GitHub's public latest release about

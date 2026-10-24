@@ -149,6 +149,10 @@ pub fn network_asset(network: Network, points: f32) -> SharedString {
 }
 
 /// The same SVG, declaring a size that fits `points` square and keeps its shape.
+///
+/// A source that already has `width` and `height` cannot be given a second pair. The parser
+/// rejects the duplicate and the rail draws an empty button, which is how the Tiny server mark
+/// disappeared.
 fn sized(bytes: &'static [u8], points: f32) -> Cow<'static, [u8]> {
     let Ok(text) = std::str::from_utf8(bytes) else {
         return Cow::Borrowed(bytes);
@@ -156,19 +160,46 @@ fn sized(bytes: &'static [u8], points: f32) -> Cow<'static, [u8]> {
     let Some(open) = text.find("<svg") else {
         return Cow::Borrowed(bytes);
     };
+    let Some(end) = text[open..].find('>') else {
+        return Cow::Borrowed(bytes);
+    };
+    let tag_end = open + end;
     let (wide, tall) = view_box(text).unwrap_or((1., 1.));
     let scale = points / wide.max(tall);
-    let at = open + "<svg".len();
+    let tag = without_size(&text[open..tag_end]);
     Cow::Owned(
         format!(
-            "{} width=\"{}\" height=\"{}\"{}",
-            &text[..at],
+            "{}{} width=\"{}\" height=\"{}\">{}",
+            &text[..open],
+            tag,
             wide * scale,
             tall * scale,
-            &text[at..]
+            &text[tag_end + 1..]
         )
         .into_bytes(),
     )
+}
+
+/// Removes root `width` and `height` so [`sized`] can set the drawn size once.
+fn without_size(tag: &str) -> String {
+    let mut out = String::with_capacity(tag.len());
+    let mut rest = tag;
+    loop {
+        let width_at = rest.find(" width=\"");
+        let height_at = rest.find(" height=\"");
+        let Some(at) = width_at.into_iter().chain(height_at).min() else {
+            out.push_str(rest);
+            return out;
+        };
+        let key = if width_at == Some(at) { " width=\"" } else { " height=\"" };
+        out.push_str(&rest[..at]);
+        let value = at + key.len();
+        let Some(end) = rest[value..].find('"') else {
+            out.push_str(&rest[at..]);
+            return out;
+        };
+        rest = &rest[value + end + 1..];
+    }
 }
 
 fn view_box(text: &str) -> Option<(f32, f32)> {
@@ -194,4 +225,25 @@ fn stroked(bytes: &'static [u8], points: f32) -> Cow<'static, [u8]> {
     };
     let width = format!("stroke-width=\"{}\"", 1.5 * 24. / points.max(1.));
     Cow::Owned(text.replacen("stroke-width=\"2\"", &width, 1).into_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sized;
+
+    fn root(bytes: &[u8]) -> String {
+        let text = std::str::from_utf8(bytes).unwrap();
+        text[..text.find('>').unwrap()].to_owned()
+    }
+
+    #[test]
+    fn a_sized_icon_declares_its_drawn_size_once() {
+        let tiny = root(&sized(include_bytes!("../../assets/networks/tiny.svg"), 24.));
+        assert_eq!(tiny.matches("width=").count(), 1, "{tiny}");
+        assert_eq!(tiny.matches("height=").count(), 1, "{tiny}");
+        assert!(tiny.contains("width=\"24\""), "{tiny}");
+        let discord = root(&sized(include_bytes!("../../assets/networks/discord.svg"), 24.));
+        assert_eq!(discord.matches("width=").count(), 1, "{discord}");
+        assert_eq!(discord.matches("height=").count(), 1, "{discord}");
+    }
 }

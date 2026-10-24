@@ -71,6 +71,14 @@ rand = { version = "0.9", optional = true }
 default = ["signal"]
 signal = ["dep:presage", "dep:aes-gcm-siv", "dep:futures", "dep:async-trait", "dep:chrono", "dep:rand", "tokio/rt"]
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# macOS reads the login keychain here so an ad-hoc update does not ask for the password again.
+# See `session::apple`.
+security-framework = { version = "3", features = ["OSX_10_15"] }
+security-framework-sys = "2"
+core-foundation = "0.10"
+core-foundation-sys = "0.8"
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Networking_WinSock"] }
 
