@@ -33,8 +33,8 @@ use crate::store::{
 };
 use protocol::{
     AccountKey, Activity, CallFailure, CallState, Capabilities, CatalogItem, CatalogKind, Change,
-    Contact, Group, Key, Link, MediaFile, MemberSection, Message, Network, Notify, Occupant,
-    Occupants, Outgoing, Participant, Person, Presence, Reaction, RelateAction, Relation,
+    Contact, Group, Key, Link, MediaFile, MemberSection, Message, MessageHit, Network, Notify,
+    Occupant, Occupants, Outgoing, Participant, Person, Presence, Reaction, RelateAction, Relation,
     SendState, SharedItem, SharedKind, Typist, VoiceJoin, Warning, Watching,
 };
 use std::collections::{HashMap, VecDeque};
@@ -61,6 +61,13 @@ pub type Reply<T> = Sender<Result<T, Refusal>>;
 pub struct Download {
     pub url: String,
     pub headers: Vec<(String, String)>,
+}
+
+/// What the search's ask names: a Space's own search, or one conversation's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SearchScope {
+    Space(String),
+    Conversation(String),
 }
 
 /// One window of a member list.
@@ -305,6 +312,15 @@ pub enum Command {
     },
     /// A registered file is wanted: answer with where and how to fetch it now.
     Download { id: String, url: String, reply: Reply<Download> },
+    /// The pane's search asked the network itself: a Space's own search, or one conversation's.
+    /// Answer with the hits, mapped like the cache's, or why not. `at` is when the shell
+    /// asked: one queued past the shell's patience does not ask the network at all.
+    Search {
+        query: String,
+        scope: SearchScope,
+        at: Instant,
+        reply: Reply<Vec<MessageHit>>,
+    },
     /// The shell asked for these files and the media cache knows none of them. An adapter that
     /// fetches files over its own session (Telegram) fetches those that are its own, such as the
     /// original a picture's viewer opened, and records each as the cache would. Others ignore it.
@@ -356,6 +372,7 @@ impl Command {
             // Nothing to end on the network: the session is simply forgotten.
             Command::SignOut(reply) => drop(reply.send(Ok(()))),
             Command::Download { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Search { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Send { conversation_id, client_id, .. } => {
                 ctx.sent(&conversation_id, &client_id, Err("Sending is not built for this network.".to_owned()));
             }
@@ -431,6 +448,13 @@ impl Context {
 
     pub fn key(&self, id: &str) -> Key {
         Key::new(&self.account, id)
+    }
+
+    /// Whether a conversation may appear where the user asked for what is listed: hidden
+    /// conversations and message requests stay out of it, as they stay out of the cache's own
+    /// search. A conversation the store does not know is not listed.
+    pub fn listable(&self, conversation_id: &str) -> bool {
+        self.hub.store().conversation_listed(&self.key(conversation_id)).unwrap_or_default()
     }
 
     // The account.

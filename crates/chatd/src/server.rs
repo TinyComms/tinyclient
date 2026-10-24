@@ -1,4 +1,4 @@
-use crate::adapters::{self, About, Adapter, Command, Refusal, Reply};
+use crate::adapters::{self, About, Adapter, Command, Refusal, Reply, SearchScope};
 use crate::blobs::Blobs;
 use crate::hub::{lock, now, Hub, KEYCHAIN_PROMPT};
 use crate::media::CallError;
@@ -1420,6 +1420,24 @@ impl Chat {
                 match found {
                     Ok(hits) => Response::MessageHits { hits },
                     Err(err) => internal(err),
+                }
+            }
+            Request::SearchNetwork { conversation, space, query } => {
+                let query = query.trim().to_owned();
+                if query.is_empty() {
+                    Response::MessageHits { hits: Vec::new() }
+                } else {
+                    let (account, scope) = match (&conversation, &space) {
+                        (Some(key), _) => (key.account(), SearchScope::Conversation(key.id.clone())),
+                        (None, Some(key)) => (key.account(), SearchScope::Space(key.id.clone())),
+                        (None, None) => {
+                            return error(ErrorCode::Unsupported, "a search on the network names a conversation or a Space")
+                        }
+                    };
+                    match self.ask(&account, |reply| Command::Search { query, scope, at: std::time::Instant::now(), reply }) {
+                        Ok(hits) => Response::MessageHits { hits },
+                        Err(refused) => *refused,
+                    }
                 }
             }
             Request::SetDraft { conversation, text } => match self.hub.store().set_draft(&conversation, &text) {

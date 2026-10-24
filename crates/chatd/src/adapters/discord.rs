@@ -41,6 +41,9 @@ use std::time::{Duration, Instant};
 
 /// The pause after a history fetch.
 const PACE: Duration = Duration::from_millis(700);
+/// A search asked and not answered within this does not reach Discord at all: the shell has
+/// already been told the network did not answer.
+const SEARCH_PATIENCE: Duration = Duration::from_secs(25);
 /// Unread conversations fetched ahead of being opened, once per run.
 const WARM: usize = 5;
 /// A page of history, as the web client asks for it.
@@ -210,6 +213,9 @@ struct Discord {
     refused_sessions: Mutex<(u32, String)>,
     /// No session is asked for until the user does something (`gateway.rs::hold`).
     held: AtomicBool,
+    /// This account's message searches: one in flight at a time, paced from when the last
+    /// finished, with recent answers kept in memory.
+    message_search: Mutex<info::MessageSearch>,
 }
 
 /// The user id a token starts with (its first part is the id in base64), so the account is named
@@ -253,6 +259,7 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
         sequence: AtomicU64::new(0),
         refused_sessions: Mutex::new((0, String::new())),
         held: AtomicBool::new(false),
+        message_search: Mutex::new(info::MessageSearch::default()),
     });
     let socket = discord.clone();
     std::thread::spawn(move || keep_connected(&socket.ctx, || socket.connect()));
@@ -282,6 +289,17 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
                 upload::spawn(&discord.ctx, &conversation_id, &client_id, &with.files.clone(), move |up| {
                     sending.send_with(&channel, &client, &text, reply_to.as_deref(), &with, up)
                 });
+            }
+            // A search can wait on Discord's tight search limits: it runs on a thread of its
+            // own, so the sends and reactions behind it are not held up, and one queued past
+            // the shell's patience does not ask at all.
+            Command::Search { query, scope, at, reply } => {
+                discord.asked();
+                if at.elapsed() < SEARCH_PATIENCE {
+                    Discord::search_queued(&discord, query, scope, at, reply);
+                } else {
+                    drop(reply);
+                }
             }
             // A profile waits its turn (one per 3 s) on a thread of its own, so a send behind it
             // is never held up, and one superseded while it waits is dropped.
@@ -984,6 +1002,7 @@ impl Discord {
             Command::SearchShared { conversation_id, kind, before, limit, reply } => {
                 answer(reply, self.search_shared(&conversation_id, kind, before.as_deref(), limit))
             }
+            Command::Search { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Catalog { kind, space_id, query, cursor, reply } => {
                 answer(reply, self.catalog(kind, space_id.as_deref(), &query, cursor.as_deref()))
             }

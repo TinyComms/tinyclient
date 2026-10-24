@@ -269,14 +269,29 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
         }
         ("GET", ["guilds", _, "messages", "search"]) | ("GET", ["channels", _, "messages", "search"]) => {
             let channel = if parts[0] == "channels" { parts[1].to_owned() } else { "4101".to_owned() };
-            let hit = json!({
-                "id": "1300000000000000600", "channel_id": channel, "type": 0, "author": me(), "content": "the map",
-                "timestamp": "2026-10-13T08:15:00.000000+00:00", "edited_timestamp": null, "mentions": [], "mention_roles": [],
-                "mention_everyone": false, "embeds": [], "pinned": false,
-                "attachments": [{"id": "9001", "filename": "map.png", "size": 2048, "url": "https://cdn.discordapp.com/attachments/1/9001/map.png",
-                                 "proxy_url": "https://media.discordapp.net/attachments/1/9001/map.png", "width": 640, "height": 480, "content_type": "image/png"}],
-            });
-            (200, json!({"analytics_id": "a", "doing_deep_historical_index": false, "total_results": 37, "messages": [[hit]]}))
+            // The pane's words: text hits, and a 202 while the words ask for one being indexed.
+            if seen.path.contains("content=") {
+                if seen.path.contains("index") {
+                    return (202, json!({"code": 110000, "message": "Index not yet available"}));
+                }
+                let hit = json!({
+                    "id": "1300000000000000600", "channel_id": channel, "type": 0,
+                    "author": {"id": "200000000000000001", "username": "Ines Marchetti", "global_name": "Ines Marchetti", "discriminator": "0", "avatar": null},
+                    "content": "read the rules, they are short",
+                    "timestamp": "2026-10-13T08:15:00.000000+00:00", "edited_timestamp": null, "mentions": [], "mention_roles": [],
+                    "mention_everyone": false, "embeds": [], "pinned": false, "attachments": [],
+                });
+                (200, json!({"analytics_id": "a", "doing_deep_historical_index": false, "total_results": 1, "messages": [[hit]]}))
+            } else {
+                let hit = json!({
+                    "id": "1300000000000000600", "channel_id": channel, "type": 0, "author": me(), "content": "the map",
+                    "timestamp": "2026-10-13T08:15:00.000000+00:00", "edited_timestamp": null, "mentions": [], "mention_roles": [],
+                    "mention_everyone": false, "embeds": [], "pinned": false,
+                    "attachments": [{"id": "9001", "filename": "map.png", "size": 2048, "url": "https://cdn.discordapp.com/attachments/1/9001/map.png",
+                                     "proxy_url": "https://media.discordapp.net/attachments/1/9001/map.png", "width": 640, "height": 480, "content_type": "image/png"}],
+                });
+                (200, json!({"analytics_id": "a", "doing_deep_historical_index": false, "total_results": 37, "messages": [[hit]]}))
+            }
         }
         ("GET", ["guilds", guild]) => (
             200,
@@ -2866,6 +2881,54 @@ fn info_mute_leave_pins_and_the_shared_search_ask_discord_once_each_and_only_whe
     let (_, _, total) = shared(true, Some("1300000000000000600"));
     assert_eq!(total, None, "a later page has no total");
     assert!(world.discord.requests_to("GET", "/guilds/4000/messages/search")[1].path.contains("max_id=1300000000000000599"));
+}
+
+#[test]
+fn search_asks_discord_itself_for_a_space_and_a_conversation_and_tells_of_an_index_still_building() {
+    let world = polished();
+    // A Space's own search: the server's, one request, the hits mapped like the cache's.
+    let hits = match world.ask(Request::SearchNetwork { conversation: None, space: Some(world.key("4000")), query: "rules".into() }) {
+        Response::MessageHits { hits } => hits,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(hits.len(), 1);
+    assert_eq!(
+        (hits[0].message_id.as_str(), hits[0].sender.as_str(), hits[0].snippet.as_str()),
+        ("1300000000000000600", "Ines Marchetti", "read the rules, they are short")
+    );
+    assert_eq!(hits[0].conversation, world.key("4101"));
+    assert!(!hits[0].outgoing);
+    let asked = world.discord.requests_to("GET", "/guilds/4000/messages/search");
+    assert!(asked[0].path.contains("content=rules"), "{}", asked[0].path);
+
+    // The searches are paced per account, as people search is: a scope switch waits its gap.
+    sleep(Duration::from_millis(400));
+
+    // A server channel as the conversation: the server's search narrowed to the channel.
+    let before = world.discord.requests_to("GET", "/guilds/4000/messages/search").len();
+    let answer = world.ask(Request::SearchNetwork { conversation: Some(world.key("4101")), space: None, query: "hello".into() });
+    assert!(matches!(answer, Response::MessageHits { .. }), "{answer:?}");
+    let asked = world.discord.requests_to("GET", "/guilds/4000/messages/search");
+    assert_eq!(asked.len(), before + 1, "the channel search is asked");
+    assert!(asked[asked.len() - 1].path.contains("channel_id=4101") && asked[asked.len() - 1].path.contains("content=hello"), "{}", asked[asked.len() - 1].path);
+
+    // One conversation: the DM's own channel search.
+    sleep(Duration::from_millis(400));
+    let before = world.discord.requests_to("GET", "/channels/3001/messages/search").len();
+    let answer = world.ask(Request::SearchNetwork { conversation: Some(world.key("3001")), space: None, query: "hello".into() });
+    assert!(matches!(answer, Response::MessageHits { .. }), "{answer:?}");
+    let asked = world.discord.requests_to("GET", "/channels/3001/messages/search");
+    assert_eq!(asked.len(), before + 1, "the DM's channel search is asked");
+    assert!(asked[asked.len() - 1].path.contains("content=hello"), "{}", asked[asked.len() - 1].path);
+
+    // A 202: the index is still building, and the words say so.
+    sleep(Duration::from_millis(400));
+    let not_ready = world.ask(Request::SearchNetwork { conversation: None, space: Some(world.key("4000")), query: "index".into() });
+    assert!(matches!(&not_ready, Response::Error { detail, .. } if detail.contains("isn't ready")), "{not_ready:?}");
+
+    // Paced: Enter again at once is refused in words, so no client can turn it into a burst.
+    let paced = world.ask(Request::SearchNetwork { conversation: None, space: Some(world.key("4000")), query: "again".into() });
+    assert!(matches!(&paced, Response::Error { detail, .. } if detail.contains("paced")), "{paced:?}");
 }
 
 /// A file of `size` bytes beside the world's directory: chatd never sends from its own.
