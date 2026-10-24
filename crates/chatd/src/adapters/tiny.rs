@@ -701,8 +701,12 @@ pub(crate) mod tests {
         let session = format!(
             r#"{{"base_url":{base:?},"token":"t","user_id":{user_id:?},"email":"ada@example.com","display_name":"Ada","role":{role:?}}}"#
         );
-        std::env::set_var("TINYCLIENT_DIR", std::env::temp_dir());
-        std::env::set_var(&name, &session);
+        // Not the temp root. A file there is one the user picked, and anything under
+        // TINYCLIENT_DIR is refused. These tests share a process with that check.
+        let scratch = std::env::temp_dir().join(format!("tinyclient-tiny-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&scratch);
+        let _dir = Restore::set("TINYCLIENT_DIR", &scratch);
+        let _session = Restore::set(&name, &session);
         match crate::session::read(Network::Tiny) {
             crate::session::Stored::Found(_) => {}
             crate::session::Stored::Absent => panic!("tiny session was absent ({name})"),
@@ -712,6 +716,40 @@ pub(crate) mod tests {
             network: Network::Tiny,
             account: user_id.to_owned(),
         });
+    }
+
+    /// Puts one environment variable back when the test ends, including on a panic.
+    struct Restore {
+        key: String,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl Restore {
+        fn set(key: &str, value: impl AsRef<std::ffi::OsStr>) -> Restore {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Restore { key: key.to_owned(), previous }
+        }
+    }
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var(&self.key, value),
+                None => std::env::remove_var(&self.key),
+            }
+        }
+    }
+
+    #[test]
+    fn a_session_scratch_does_not_hide_a_file_the_user_picked() {
+        let picked = std::env::temp_dir().join(format!("tinyclient-beside-{}.txt", std::process::id()));
+        std::fs::write(&picked, b"hello").unwrap();
+        with_session("http://127.0.0.1:9", "member", |_| {
+            let answer = crate::blobs::upload::allowed(&picked.to_string_lossy());
+            assert!(answer.is_ok(), "{answer:?}");
+        });
+        let _ = std::fs::remove_file(&picked);
     }
 
     #[test]
@@ -887,6 +925,23 @@ pub(crate) mod tests {
         .into_bytes()
     }
 
+    /// One read. A timeout is not the end of the request: the body can arrive in a later packet.
+    fn read_some(stream: &mut std::net::TcpStream, got: &mut Vec<u8>, deadline: std::time::Instant) -> bool {
+        let mut buf = [0u8; 2048];
+        while std::time::Instant::now() < deadline {
+            match std::io::Read::read(stream, &mut buf) {
+                Ok(0) => return false,
+                Err(err) if err.kind() == std::io::ErrorKind::TimedOut || err.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(_) => return false,
+                Ok(read) => {
+                    got.extend_from_slice(&buf[..read]);
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     pub(crate) fn serve(handler: impl Fn(&str) -> Vec<u8> + Send + 'static) -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("addr").port();
@@ -899,14 +954,12 @@ pub(crate) mod tests {
                         let _ = stream.set_nonblocking(false);
                         let _ = stream.set_read_timeout(Some(Duration::from_millis(300)));
                         let mut got = Vec::new();
-                        let mut buf = [0u8; 2048];
                         let header_end = loop {
                             if let Some(at) = got.windows(4).position(|window| window == b"\r\n\r\n") {
                                 break Some(at + 4);
                             }
-                            match std::io::Read::read(&mut stream, &mut buf) {
-                                Ok(0) | Err(_) => break None,
-                                Ok(read) => got.extend_from_slice(&buf[..read]),
+                            if !read_some(&mut stream, &mut got, deadline) {
+                                break None;
                             }
                         };
                         if let Some(header_end) = header_end {
@@ -920,12 +973,7 @@ pub(crate) mod tests {
                                 }
                             });
                             if let Some(length) = length {
-                                while got.len() < header_end + length {
-                                    match std::io::Read::read(&mut stream, &mut buf) {
-                                        Ok(0) | Err(_) => break,
-                                        Ok(read) => got.extend_from_slice(&buf[..read]),
-                                    }
-                                }
+                                while got.len() < header_end + length && read_some(&mut stream, &mut got, deadline) {}
                             }
                         }
                         let request = String::from_utf8_lossy(&got).into_owned();
