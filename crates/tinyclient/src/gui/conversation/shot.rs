@@ -353,7 +353,7 @@ pub fn steps(cx: &mut gpui::Context<crate::gui::state::Shell>) {
                         "details" => shell.toggle_details(cx),
                         "back" => shell.travel(true, cx),
                         "forward" => shell.travel(false, cx),
-                        "close" => shell.close_right(cx),
+                        "close" => shell.close_right(None, cx),
                         // Escape in the composer with nothing of its own to close.
                         "escape" => shell.composer_escaped(cx),
                         "members-on" => shell.members_switch_on(cx),

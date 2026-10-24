@@ -6,9 +6,9 @@
 // disabled until those views register them with `.on_action`: Attach File (`AttachFile`,
 // composer), Show Details (`ShowDetails`, pane), Mute… (`Mute`, profile), Start Call
 // (`StartCall`, call) and Open in <network> (`OpenInNetwork`, handoff). Items with nothing built
-// behind them are left out rather than shown dead: Find (⌘F, ⇧⌘F), Mark as
-// Unread, Mark Server as Read, Copy Link, Release Notes and Report a Problem…. They come back
-// with what they do. Check for Updates… is here; it becomes Restart to Update once a build is staged.
+// behind them are left out rather than shown dead: Mark as Unread, Mark Server as Read,
+// Copy Link, Release Notes and Report a Problem…. They come back with what they do, as Find
+// (⌘F, ⇧⌘F) did. Check for Updates… is here; it becomes Restart to Update once a build is staged.
 
 use super::super::settings;
 use super::super::sidebar::Mode;
@@ -82,6 +82,11 @@ pub fn menus(places: &[(String, usize)], open_network: Option<Network>, update_i
             MenuItem::os_action("Paste", input::Paste, OsAction::Paste),
             MenuItem::action("Paste and Match Style", input::Paste),
             MenuItem::os_action("Select All", input::SelectAll, OsAction::SelectAll),
+            MenuItem::separator(),
+            MenuItem::Submenu(Menu::new("Find").items([
+                MenuItem::action("Search in Conversation", SearchConversation),
+                MenuItem::action("Search Everywhere", SearchEverywhere),
+            ])),
             // macOS adds Emoji & Symbols, Dictation and AutoFill itself.
         ]),
         Menu::new("View").items(view),
@@ -126,6 +131,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-n", NewMessage, None),
         KeyBinding::new("secondary-u", AttachFile, None),
         KeyBinding::new("secondary-w", CloseWindow, None),
+        KeyBinding::new("secondary-f", SearchConversation, None),
+        KeyBinding::new("secondary-shift-f", SearchEverywhere, None),
         KeyBinding::new("secondary-=", BiggerText, None),
         KeyBinding::new("secondary-+", BiggerText, None),
         KeyBinding::new("secondary--", SmallerText, None),
@@ -246,21 +253,27 @@ mod tests {
         let names: Vec<&str> = bar.iter().map(|menu| menu.name.as_ref()).collect();
         assert_eq!(names, ["tinyclient", "File", "Edit", "View", "Conversation", "Window", "Help"]);
         let items = |menu: &Menu| -> Vec<String> {
-            menu.items
-                .iter()
-                .filter_map(|item| match item {
-                    MenuItem::Action { name, .. } => Some(name.to_string()),
-                    _ => None,
-                })
-                .collect()
+            fn walk(item: &MenuItem, names: &mut Vec<String>) {
+                match item {
+                    MenuItem::Action { name, .. } => names.push(name.to_string()),
+                    MenuItem::Submenu(menu) => menu.items.iter().for_each(|item| walk(item, names)),
+                    _ => {}
+                }
+            }
+            let mut names = Vec::new();
+            menu.items.iter().for_each(|item| walk(item, &mut names));
+            names
         };
         assert!(items(&bar[4]).contains(&"Open in Slack".to_owned()));
         // The rail's places after Inbox and People, in its order; no second Inbox.
         assert_eq!(items(&bar[3])[..4], ["Inbox", "People", "Discord", "Moss & Lichen"]);
         assert!(items(&bar[1]).contains(&"Close Window".to_owned()));
+        // Find's two searches work: their pane and keys are built.
+        assert!(items(&bar[2]).contains(&"Search in Conversation".to_owned()));
+        assert!(items(&bar[2]).contains(&"Search Everywhere".to_owned()));
         // Nothing is offered that does nothing.
         let all: Vec<String> = bar.iter().flat_map(items).collect();
-        for dead in ["Search in Conversation", "Search Everywhere", "Release Notes", "Report a Problem…", "Mark as Unread", "Copy Link"] {
+        for dead in ["Release Notes", "Report a Problem…", "Mark as Unread", "Copy Link"] {
             assert!(!all.contains(&dead.to_owned()), "{dead} is offered");
         }
         assert!(all.contains(&"Check for Updates…".to_owned()));

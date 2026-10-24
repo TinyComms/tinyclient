@@ -9,12 +9,13 @@ use crate::gui::pane::{self, Layer, Showing, Stack, Step};
 use super::{Pane, PaneEvent};
 use crate::client::ask;
 use crate::gui::components::{empty_state, glyph};
+use crate::gui::input::{InputEvent, InputKey, TextInput};
 use crate::gui::layout::{RightKind, RightPane};
 use crate::gui::state::Shell;
 use crate::gui::theme::{self, Type};
 use crate::gui::time;
 use crate::view::{age, now};
-use gpui::{div, prelude::*, px, AnyElement, Context, Entity, FontWeight, HighlightStyle, MouseButton, SharedString, StyledText, Window};
+use gpui::{div, prelude::*, px, AnyElement, Context, Entity, Focusable, FontWeight, HighlightStyle, MouseButton, SharedString, StyledText, Window};
 use protocol::{ConversationKind, Key, Link, Message, MessageHit, Request, Response};
 use std::ops::Range;
 use std::rc::Rc;
@@ -28,6 +29,8 @@ pub struct Side {
     threads: pane::Memory<Rc<Message>>,
     /// The message search's page: what was typed, and what the cache holds for it.
     pub search: Option<SearchPage>,
+    /// The search pane's field and its wiring, alive while the pane is.
+    search_input: Option<SearchField>,
     /// The conversation the stack was last fitted to.
     fitted: Option<Key>,
     /// The kind this view last put in the layout's slot, so another view's change can be told
@@ -46,14 +49,64 @@ pub struct Side {
     room: std::cell::Cell<f32>,
 }
 
-/// One message search's page: what was typed, and what the cache holds for it.
+/// One message search's page: the scope asked, what was typed, and what the cache holds for it.
 #[derive(Default)]
 pub struct SearchPage {
+    pub scope: Scope,
     pub words: String,
     /// What the cache answered: `None` while the read is outstanding or failed.
     pub hits: Option<Vec<MessageHit>>,
     /// The cache could not be asked.
     pub failed: bool,
+    /// The hit the keyboard is on: drawn lit, opened on Enter.
+    pub picked: Option<usize>,
+    /// How often the cache was asked, so an older answer never lands over a newer one.
+    asked: u32,
+}
+
+/// How far a search asks: the conversation open now, its Space, or the whole cache.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Scope {
+    #[default]
+    Everywhere,
+    Conversation,
+    Space,
+}
+
+impl Scope {
+    fn label(self) -> &'static str {
+        match self {
+            Scope::Conversation => "This conversation",
+            Scope::Space => "This space",
+            Scope::Everywhere => "Everywhere",
+        }
+    }
+}
+
+/// A scope's filters for `SearchMessages`: the one conversation, or the Space's key, or neither.
+/// A scope about the conversation falls back to everywhere with nothing open, as the switcher's
+/// own search row does.
+fn scope_filters(scope: Scope, open: Option<(&Key, Option<&str>)>) -> (Option<Key>, Option<Key>) {
+    match (scope, open) {
+        (Scope::Conversation, Some((key, _))) => (Some(key.clone()), None),
+        (Scope::Space, Some((key, Some(space)))) => {
+            (None, Some(Key { network: key.network, account: key.account.clone(), id: space.to_owned() }))
+        }
+        _ => (None, None),
+    }
+}
+
+/// The search pane's field and the subscriptions that carry its keys to the shell.
+struct SearchField {
+    input: Entity<TextInput>,
+    _subscriptions: Vec<gpui::Subscription>,
+}
+
+/// The page a fresh search opens with: the scope, and the words it starts asked for. The
+/// switcher's row seeds its words here, so the first ask carries them without relying on the
+/// field's `set_text`, which is not an edit and emits nothing.
+fn fresh_page(scope: Scope, words: &str) -> SearchPage {
+    SearchPage { scope, words: words.to_owned(), ..SearchPage::default() }
 }
 
 /// The letters of the query inside a hit's text, for the heavier drawing.
@@ -222,7 +275,7 @@ impl Shell {
             }
             None => {
                 if self.conversation_state.side.installed.take().is_some() && self.right_kind().is_some() {
-                    self.close_right(cx);
+                    self.close_right(None, cx);
                 }
             }
         }
@@ -262,6 +315,10 @@ impl Shell {
                 side.switches = pane::close(&side.stack, side.switches);
                 side.stack = Stack::default();
                 side.installed = None;
+                // A search pane the ✕ closed goes with its stack, exactly as Esc's closing
+                // does: no page behind, no field holding the keys.
+                side.search = None;
+                side.search_input = None;
                 self.conversation_state.thread.borrow_mut().take();
             }
             Some(RightKind::Info) => {
@@ -353,31 +410,195 @@ impl Shell {
         self.install(cx);
     }
 
-    /// The switcher's "Search messages" row: the pane opens at once and the cache is asked.
-    pub(in crate::gui) fn open_message_search(&mut self, words: String, cx: &mut Context<Self>) {
-        let side = &mut self.conversation_state.side;
-        side.search = Some(SearchPage { words: words.clone(), hits: None, failed: false });
-        side.stack = pane::open(&side.stack, Layer::Search);
+    /// The switcher's "Search messages" row: the pane opens with the words already asked for.
+    /// The field is filled to match, whose `set_text` is not an edit and emits nothing - the
+    /// ask carries the words, so nothing depends on it emitting.
+    pub(in crate::gui) fn open_message_search(&mut self, words: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.new_search_with(Scope::Everywhere, &words, window, cx);
+    }
+
+    /// Search in the conversation, or everywhere: the pane opens with its field focused, or,
+    /// standing already, the scope switches and the asking starts again.
+    pub(in crate::gui) fn open_search(&mut self, scope: Scope, window: &mut Window, cx: &mut Context<Self>) {
+        // When another layer sits on top of Search, starting a search starts over. And a
+        // conversation scope with nothing open names nothing — it asks everywhere, as the
+        // switcher's row does, so a chip is lit.
+        let scope = if scope == Scope::Conversation && self.open_key().is_none() {
+            Scope::Everywhere
+        } else {
+            scope
+        };
+        if !matches!(self.conversation_state.side.stack.top(), Some(Layer::Search)) {
+            self.conversation_state.side.search = None;
+            self.conversation_state.side.search_input = None;
+            self.new_search_with(scope, "", window, cx);
+            return;
+        }
+        if let Some(page) = self.conversation_state.side.search.as_mut() {
+            page.scope = scope;
+            page.hits = None;
+            page.picked = None;
+        }
+        self.reask_search(cx);
+        if let Some(field) = &self.conversation_state.side.search_input {
+            window.focus(&field.input.focus_handle(cx), cx);
+        }
+        cx.notify();
+    }
+
+    /// The Edit menu's two finds.
+    pub(in crate::gui) fn search_here(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_search(Scope::Conversation, window, cx);
+    }
+
+    pub(in crate::gui) fn search_everywhere(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_search(Scope::Everywhere, window, cx);
+    }
+
+    /// A fresh search, seeded with the words it starts asked for. `open_search` and the
+    /// switcher's row both come through here.
+    fn new_search_with(&mut self, scope: Scope, words: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let input = cx.new(|cx| TextInput::new("Search messages", cx));
+        let changed = cx.subscribe_in(&input, window, |this, _, event: &InputEvent, _, cx| match event {
+            InputEvent::Changed => this.search_typed(cx),
+            InputEvent::Submit => this.open_picked_hit(cx),
+        });
+        let keys = cx.subscribe_in(&input, window, |this, _, event: &InputKey, window, cx| match event {
+            InputKey::Escape => this.close_search(window, cx),
+            InputKey::Up => this.move_search_pick(false, cx),
+            InputKey::Down => this.move_search_pick(true, cx),
+        });
+        {
+            let side = &mut self.conversation_state.side;
+            side.search_input = Some(SearchField { input, _subscriptions: vec![changed, keys] });
+            side.search = Some(fresh_page(scope, words));
+            side.stack = pane::open(&side.stack, Layer::Search);
+        }
         self.install(cx);
+        if let Some(field) = &self.conversation_state.side.search_input {
+            window.focus(&field.input.focus_handle(cx), cx);
+        }
+        if !words.is_empty() {
+            // The field is filled to match the ask. `set_text` is not an edit and emits
+            // nothing, which is why the ask above carries the words itself.
+            if let Some(field) = &self.conversation_state.side.search_input {
+                field.input.update(cx, |input, cx| input.set_text(words, cx));
+            }
+        }
+        self.reask_search(cx);
+    }
+
+    /// Esc in the field: the pane closes and the conversation's keys come back.
+    fn close_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let side = &mut self.conversation_state.side;
+        if side.search.take().is_none() {
+            return;
+        }
+        side.stack = Stack { base: None, push: None };
+        side.search_input = None;
+        self.install(cx);
+        self.composer_focus(window, cx);
+    }
+
+    /// What the field holds now is what the cache is asked for.
+    fn search_typed(&mut self, cx: &mut Context<Self>) {
+        let words = self
+            .conversation_state
+            .side
+            .search_input
+            .as_ref()
+            .map(|field| field.input.read(cx).text().to_owned())
+            .unwrap_or_default();
+        let Some(page) = self.conversation_state.side.search.as_mut() else {
+            return;
+        };
+        if words == page.words {
+            return;
+        }
+        page.words = words;
+        page.hits = None;
+        page.picked = None;
+        self.reask_search(cx);
+    }
+
+    /// Asks the cache for the page's words within its scope. The pane's scopes name the
+    /// conversation open now, so a switch of conversation re-resolves the next ask.
+    fn reask_search(&mut self, cx: &mut Context<Self>) {
+        let (words, scope, asked) = {
+            let Some(page) = self.conversation_state.side.search.as_mut() else {
+                return;
+            };
+            page.failed = false;
+            page.asked += 1;
+            (page.words.clone(), page.scope, page.asked)
+        };
+        if words.trim().is_empty() {
+            if let Some(page) = self.conversation_state.side.search.as_mut() {
+                page.hits = None;
+            }
+            cx.notify();
+            return;
+        }
+        let open = self.open_with_space();
+        let (conversation, space) = scope_filters(scope, open.as_ref().map(|(key, space)| (key, space.as_deref())));
+        let request = Request::SearchMessages { conversation, network: None, space, query: words, limit: protocol::PAGE_LIMIT };
         self.off_thread(
             cx,
-            {
-                let asked = words.clone();
-                move || ask(&Request::SearchMessages { conversation: None, network: None, query: asked, limit: protocol::PAGE_LIMIT })
-            },
+            move || ask(&request),
             move |this, answer, cx| {
-                let Some(page) = this.conversation_state.side.search.as_mut().filter(|page| page.words == words) else {
+                let Some(page) = this.conversation_state.side.search.as_mut().filter(|page| page.asked == asked) else {
                     return;
                 };
                 match answer {
                     Ok(Response::MessageHits { hits }) => page.hits = Some(hits),
-                    // Another answer is not this request's; the read failing is the pane's word.
-                    Ok(_) => {}
-                    Err(_) => page.failed = true,
+                    Ok(_) | Err(_) => page.failed = true,
                 }
                 cx.notify();
             },
         );
+    }
+
+    /// The conversation open now, with the Space it sits in: what the pane's scopes name.
+    fn open_with_space(&self) -> Option<(Key, Option<String>)> {
+        let key = self.open_key()?.clone();
+        let mut held = self
+            .sidebar_state
+            .held()
+            .cloned()
+            .chain(self.trees.values().flat_map(|tree| tree.conversations.iter().cloned()));
+        let space = held.find(|conversation| conversation.key == key).and_then(|conversation| conversation.space.clone());
+        Some((key, space))
+    }
+
+    /// The keyboard moves over the hits; Enter opens the one it is on, or the first.
+    fn move_search_pick(&mut self, down: bool, cx: &mut Context<Self>) {
+        let Some(page) = self.conversation_state.side.search.as_mut() else {
+            return;
+        };
+        let Some(hits) = page.hits.as_ref() else {
+            return;
+        };
+        if hits.is_empty() {
+            return;
+        }
+        page.picked = Some(match page.picked {
+            Some(at) if down => (at + 1).min(hits.len() - 1),
+            Some(at) => at.saturating_sub(1),
+            None if down => 0,
+            None => hits.len() - 1,
+        });
+        cx.notify();
+    }
+
+    fn open_picked_hit(&mut self, cx: &mut Context<Self>) {
+        let page = self.conversation_state.side.search.as_ref();
+        let picked = page
+            .and_then(|page| page.hits.as_ref())
+            .and_then(|hits| hits.get(page.and_then(|page| page.picked).unwrap_or(0)))
+            .cloned();
+        if let Some(hit) = picked {
+            self.open_search_hit(&hit, cx);
+        }
     }
 
     /// A search hit was clicked: its conversation opens on the message, or, being open already,
@@ -507,6 +728,8 @@ impl Shell {
             Step::ClosePane => {
                 let side = &mut self.conversation_state.side;
                 side.stack = Stack { base: None, push: None };
+                side.search = None;
+                side.search_input = None;
                 self.install(cx);
                 // The thread's composer may have had the keys: they go back to the conversation's.
                 if let Some(window) = window {
@@ -516,7 +739,7 @@ impl Shell {
             Step::Latest => {
                 // A pane this view did not put there (search results, a sheet) closes first.
                 if self.conversation_state.side.installed.is_none() && self.right_kind().is_some() {
-                    self.close_right(cx);
+                    self.close_right(window, cx);
                     return true;
                 }
                 if let Some(pane) = self.conversation_state.pane.get().cloned() {
@@ -595,7 +818,7 @@ fn draw_side(shell: &Shell, window: &mut Window, cx: &mut Context<Shell>) -> Any
         Layer::Members(_) => shell.pane_members(window, cx),
         Layer::Thread { conversation, .. } => draw_thread(shell, conversation, cx),
         Layer::Pinned(conversation) => draw_pins(shell, conversation, cx),
-        Layer::Search => draw_search(shell, cx),
+        Layer::Search => draw_search(shell, window, cx),
     };
     let crumb = stack.push.as_ref().and(stack.base.as_ref()).map(|base| crumb(base.title(), cx));
     div()
@@ -642,10 +865,11 @@ fn crumb(base: &'static str, cx: &mut Context<Shell>) -> AnyElement {
 
 /// The message search's pane: what was asked, and the cache's hits, newest first. Every hit is
 /// the cache's word for it, so a row says "cached"; the networks are a later ask.
-fn draw_search(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
-    let Some(page) = &shell.conversation_state.side.search else {
+fn draw_search(shell: &Shell, _window: &mut Window, cx: &mut Context<Shell>) -> AnyElement {
+    let Some(page) = shell.conversation_state.side.search.as_ref() else {
         return div().into_any_element();
     };
+    let field = shell.conversation_state.side.search_input.as_ref().map(|field| field.input.clone());
     let head = div()
         .h(px(44.))
         .flex_none()
@@ -656,9 +880,45 @@ fn draw_search(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
         .border_b_1()
         .border_color(theme::hairline())
         .child(glyph("icons/search.svg", 14., theme::text_soft()))
-        .child(div().flex_1().min_w_0().truncate().type_ui().text_color(theme::text()).child(page.words.clone()))
-        .child(div().type_small().text_color(theme::text_soft()).child("cached"));
-    let body = if page.failed {
+        .child(match field {
+            Some(field) => div().flex_1().min_w_0().child(field).into_any_element(),
+            None => div().flex_1().min_w_0().truncate().type_ui().text_color(theme::text()).child(page.words.clone()).into_any_element(),
+        });
+    // The scope's chips: the conversation open now, its Space, or the whole cache. One is the
+    // scope asked; a chip about no conversation open is not drawn, for it cannot be asked.
+    let open = shell.open_with_space();
+    let in_space = open.as_ref().and_then(|(_, space)| space.as_deref()).is_some();
+    let mut chips = div().flex_none().px(px(8.)).pt(px(8.)).pb(px(2.)).flex().flex_wrap().gap(px(6.));
+    for candidate in [Scope::Conversation, Scope::Space, Scope::Everywhere] {
+        let available = match candidate {
+            Scope::Conversation => open.is_some(),
+            Scope::Space => in_space,
+            Scope::Everywhere => true,
+        };
+        if !available {
+            continue;
+        }
+        let lit = candidate == page.scope;
+        chips = chips.child(
+            div()
+                .id(("search-scope", candidate as usize))
+                .px(px(10.))
+                .h(px(24.))
+                .rounded(px(theme::R_CONTROL))
+                .flex()
+                .items_center()
+                .type_small()
+                .cursor_pointer()
+                .text_color(if lit { theme::text() } else { theme::text_soft() })
+                .when(lit, |chip| chip.bg(theme::selected()))
+                .hover(|style| style.bg(theme::hover()))
+                .on_click(cx.listener(move |this, _, window, cx| this.open_search(candidate, window, cx)))
+                .child(candidate.label()),
+        );
+    }
+    let body = if page.words.trim().is_empty() {
+        empty_state("icons/search.svg", "Search the cache.", "What was said in what tinyclient has read.").into_any_element()
+    } else if page.failed {
         empty_state("icons/search.svg", "tinyclient isn't answering.", "The cache could not be asked. Try again in a moment.")
             .into_any_element()
     } else if page.hits.is_none() {
@@ -670,6 +930,7 @@ fn draw_search(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
         let mut rows = div().id("search-hits").flex_1().min_h_0().overflow_y_scroll().flex().flex_col().p(px(4.));
         for (ix, hit) in hits.iter().enumerate() {
             let clicked = hit.clone();
+            let picked = page.picked == Some(ix);
             rows = rows.child(
                 div()
                     .id(("hit", ix))
@@ -681,8 +942,14 @@ fn draw_search(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
                     .flex_col()
                     .gap(px(2.))
                     .cursor_pointer()
+                    .when(picked, |row| row.bg(theme::selected()))
                     .hover(|style| style.bg(theme::hover()))
-                    .on_click(cx.listener(move |this, _, _, cx| this.open_search_hit(&clicked, cx)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(page) = this.conversation_state.side.search.as_mut() {
+                            page.picked = Some(ix);
+                        }
+                        this.open_search_hit(&clicked, cx);
+                    }))
                     .child(
                         div()
                             .flex()
@@ -719,6 +986,7 @@ fn draw_search(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
         .flex_col()
         .bg(theme::canvas())
         .child(head)
+        .child(chips)
         .child(body)
         .into_any_element()
 }
@@ -799,5 +1067,34 @@ mod tests {
         assert!(thread_belongs(&key("C_a"), Some(&key("C_a"))));
         assert!(!thread_belongs(&key("C_a"), Some(&key("C_b"))));
         assert!(!thread_belongs(&key("C_a"), None));
+    }
+
+    #[test]
+    fn a_scope_names_what_is_open_and_falls_back_to_everywhere() {
+        let channel = key("C_a");
+        let space = Key::new(&AccountKey { network: Network::Slack, account: "T1".into() }, "guild");
+
+        // Everywhere asks for the whole cache, whatever is open.
+        assert_eq!(scope_filters(Scope::Everywhere, None), (None, None));
+        assert_eq!(scope_filters(Scope::Everywhere, Some((&channel, Some("guild")))), (None, None));
+
+        // The conversation and its Space name what is open now.
+        assert_eq!(scope_filters(Scope::Conversation, Some((&channel, Some("guild")))), (Some(channel.clone()), None));
+        assert_eq!(scope_filters(Scope::Space, Some((&channel, Some("guild")))), (None, Some(space)));
+
+        // A direct conversation has no Space, and with nothing open both name nothing: the
+        // cache answers as a whole, as the switcher's row does.
+        assert_eq!(scope_filters(Scope::Space, Some((&channel, None))), (None, None));
+        assert_eq!(scope_filters(Scope::Conversation, None), (None, None));
+        assert_eq!(scope_filters(Scope::Space, None), (None, None));
+    }
+
+    #[test]
+    fn the_switcher_s_words_start_asked_for() {
+        // The switcher's row seeds its words into the page, so the first ask carries them
+        // without relying on the field's `set_text`, which is not an edit and emits nothing.
+        let page = fresh_page(Scope::Everywhere, "rules");
+        assert_eq!((page.scope, page.words.as_str()), (Scope::Everywhere, "rules"));
+        assert!(page.hits.is_none() && page.picked.is_none());
     }
 }

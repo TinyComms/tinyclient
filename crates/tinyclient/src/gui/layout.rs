@@ -58,7 +58,7 @@ pub struct Slots {
     /// `typing…` in place of a direct row's preview, while someone is.
     pub typing: Option<fn(&Shell, &Key) -> Option<SharedString>>,
     /// The switcher's last row: search messages for these words.
-    pub search: Option<fn(&mut Shell, String, &mut Context<Shell>)>,
+    pub search: Option<fn(&mut Shell, String, &mut Window, &mut Context<Shell>)>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -67,8 +67,7 @@ pub enum RightKind {
     Members,
     /// One person: who they are and what was shared with them.
     Info,
-    // For the search results, which are not built yet.
-    #[allow(dead_code)]
+    /// The search pane: the field, its scopes, the cache's hits.
     Search,
 }
 
@@ -195,8 +194,14 @@ impl Shell {
         cx.notify();
     }
 
-    pub(super) fn close_right(&mut self, cx: &mut Context<Self>) {
-        self.layout_state.right = None;
+    pub(super) fn close_right(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
+        let was_open = self.layout_state.right.take().is_some();
+        // The keys go back to the composer when a pane was open, as Esc's closing of it does.
+        if was_open {
+            if let Some(window) = window {
+                self.composer_focus(window, cx);
+            }
+        }
         cx.notify();
     }
 
@@ -420,7 +425,7 @@ impl Shell {
                         .child(glyph("icons/chevron-left.svg", 16., theme::text_soft()))
                         .flex_row_reverse()
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .on_click(cx.listener(|this, _, _, cx| this.close_right(cx))),
+                        .on_click(cx.listener(|this, _, window, cx| this.close_right(Some(window), cx))),
                 )
             })
             .child(
@@ -439,7 +444,7 @@ impl Shell {
                 icon_button("right-close", "icons/x.svg", false)
                     .tooltip(tip("Close", Some("⌘.")))
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_click(cx.listener(|this, _, _, cx| this.close_right(cx))),
+                    .on_click(cx.listener(|this, _, window, cx| this.close_right(Some(window), cx))),
             );
         let resizable = !replaces;
         Some(

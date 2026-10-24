@@ -495,7 +495,7 @@ impl Shell {
             Target::Person(person) => self.open_person(&person, cx),
             Target::Search(words) => {
                 if let Some(search) = self.slots.search {
-                    search(self, words, cx);
+                    search(self, words, window, cx);
                 }
             }
             Target::Asking(_) => {}

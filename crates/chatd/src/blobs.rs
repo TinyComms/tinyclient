@@ -141,6 +141,9 @@ struct Job {
     file: FileKey,
     /// The account's sign-out count when this was asked for.
     epoch: u64,
+    /// The picker session's generation when this was asked for. 0 for anything that is not a
+    /// picker's preview; a close ends exactly the generations it closed.
+    picker_generation: u64,
     adapter: Option<Sender<Command>>,
     /// Asked for as the picture of a row on screen: it waits while that row is scrolled away.
     row: bool,
@@ -179,8 +182,18 @@ struct Queue {
     epochs: HashMap<AccountKey, u64>,
     /// Rows' pictures asked for and since scrolled away, newest last.
     parked: Vec<Job>,
-    /// Accounts whose picker is open, with when it last asked for a preview.
-    picked: HashMap<AccountKey, Instant>,
+    /// Accounts whose picker is open, with when it last asked for a preview and the picker
+    /// session's generation: a close ends exactly the generations it closed.
+    picked: HashMap<AccountKey, Picker>,
+    /// The highest picker generation each account's sweep has closed.
+    picker_closed: HashMap<AccountKey, u64>,
+}
+
+/// A picker session: the ask that opened it, and the generation its close will end.
+#[derive(Clone, Copy)]
+struct Picker {
+    asked: Instant,
+    generation: u64,
 }
 
 struct Cache {
@@ -297,7 +310,7 @@ impl Blobs {
     // yet; until it can (a `Request::PickerClosed { account }`, or `Watching.picker`), a picker
     // counts as closed after `PICK_IDLE` with no `Fetch` of a preview.
     pub fn picker_closed(&self, account: &AccountKey) {
-        self.cache.close_picker(account);
+        self.cache.close_picker(account, false);
     }
 
     /// Brings the cache back under its cap. Runs after a fetch lands and at start.
@@ -402,9 +415,16 @@ impl Cache {
             for file in &files {
                 let key = (account.clone(), file.id.clone());
                 queue.asked.insert(key.clone(), at);
-                // The picker asking for a preview is the picker being open.
+                // The picker asking for a preview is the picker being open. Its session's
+                // generation stands above whatever a sweep has closed, so its jobs land while
+                // a job of the closed session is dropped.
+                let mut picker_generation = 0;
                 if is_pick(&file.id) {
-                    queue.picked.insert(account.clone(), at);
+                    picker_generation = next_generation(
+                        queue.picker_closed.get(account).copied().unwrap_or(0),
+                        queue.picked.get(account).map(|picker| picker.generation),
+                    );
+                    queue.picked.insert(account.clone(), Picker { asked: at, generation: picker_generation });
                     picking = true;
                 }
                 // A failure stands until `Fetch` says `retry` (the server clears it before
@@ -420,6 +440,7 @@ impl Cache {
                     row: screen.rows.contains(&key),
                     file: key,
                     epoch,
+                    picker_generation,
                     adapter: adapter.clone(),
                 });
                 if queue.waiting.len() > WAITING {
@@ -484,16 +505,20 @@ impl Cache {
         let mut queue = crate::hub::lock(&self.queue);
         loop {
             let at = Instant::now();
-            let closed: Vec<AccountKey> = queue.picked.iter().filter(|(_, asked)| at.duration_since(**asked) >= self.pick_idle).map(|(account, _)| account.clone()).collect();
+            let closed = stale(&queue.picked, at, self.pick_idle);
             if !closed.is_empty() {
                 drop(queue);
                 for account in &closed {
-                    self.close_picker(account);
+                    self.close_picker(account, true);
                 }
                 queue = crate::hub::lock(&self.queue);
                 continue;
             }
-            let next = queue.picked.values().map(|asked| self.pick_idle.saturating_sub(at.duration_since(*asked))).min();
+            let next = queue
+                .picked
+                .values()
+                .map(|picker| self.pick_idle.saturating_sub(at.duration_since(picker.asked)))
+                .min();
             queue = match next {
                 Some(wait) => self.picks.wait_timeout(queue, wait).map_or_else(|err| err.into_inner().0, |(queue, _)| queue),
                 None => self.picks.wait(queue).unwrap_or_else(std::sync::PoisonError::into_inner),
@@ -501,10 +526,22 @@ impl Cache {
         }
     }
 
-    /// A picker closed: its previews go, on disk and in the store, and none waits to be fetched.
-    fn close_picker(&self, account: &AccountKey) {
+    /// A picker closed: its previews go, on disk and in the store, and none waits to be
+    /// fetched. The sweeper asks `only_if_idle`: an ask that re-registered the picker while
+    /// the sweep was waking opened the next session, which keeps its registration, its jobs,
+    /// and its files.
+    fn close_picker(&self, account: &AccountKey, only_if_idle: bool) {
         {
             let mut queue = crate::hub::lock(&self.queue);
+            if only_if_idle && !queue.picked.get(account).is_none_or(|picker| picker.asked.elapsed() >= self.pick_idle) {
+                return;
+            }
+            // The close ends this session's generation: a job of it is dropped unless a new
+            // session reopens the picker, narrowing the window against the directory removal
+            // below.
+            if let Some(generation) = queue.picked.get(account).map(|picker| picker.generation) {
+                queue.picker_closed.insert(account.clone(), generation);
+            }
             queue.picked.remove(account);
             let gone = |file: &FileKey| file.0 == *account && is_pick(&file.1);
             queue.waiting.retain(|job| !gone(&job.file));
@@ -520,6 +557,13 @@ impl Cache {
         let _ = std::fs::remove_dir_all(&dir);
         // The network's directory of pickers goes too once no account's is left.
         let _ = std::fs::remove_dir(dir.parent().unwrap_or(&dir));
+    }
+
+    /// True when this picker generation has been closed and no newer session is open.
+    fn closed_since(&self, account: &AccountKey, generation: u64) -> bool {
+        let queue = crate::hub::lock(&self.queue);
+        let closed = queue.picker_closed.get(account).copied().unwrap_or(0);
+        generation <= closed && !queue.picked.contains_key(account)
     }
 
     /// Fetches each account's own picture (the rail's) when the account signs in or starts,
@@ -736,11 +780,6 @@ impl Cache {
         }
     }
 
-    /// The account's picker is open.
-    fn picking(&self, account: &AccountKey) -> bool {
-        crate::hub::lock(&self.queue).picked.contains_key(account)
-    }
-
     fn signed_out_since(&self, job: &Job) -> bool {
         let queue = crate::hub::lock(&self.queue);
         queue.epochs.get(&job.file.0).copied().unwrap_or(0) != job.epoch
@@ -774,6 +813,11 @@ impl Cache {
             if self.signed_out_since(job) {
                 return None;
             }
+            // A job of a picker session the sweep closed (with no newer session open): its
+            // files went with the close, and the bytes are not fetched only to be thrown away.
+            if is_pick(id) && self.closed_since(account, job.picker_generation) {
+                return None;
+            }
             if file.path.is_some() {
                 return Some(Ok(file));
             }
@@ -791,9 +835,17 @@ impl Cache {
             };
             let (bytes, from) = match fetch::download(&self.hosts, agent, &want, buffer) {
                 Ok(fetched) => fetched,
-                Err(why) => return failed(&file, why),
+                Err(why) => {
+                    if is_pick(id) && self.closed_since(account, job.picker_generation) {
+                        return None;
+                    }
+                    if is_pick(id) && !last && !dir.exists() {
+                        continue;
+                    }
+                    return failed(&file, why);
+                }
             };
-            if self.signed_out_since(job) || (is_pick(id) && !self.picking(account)) {
+            if self.signed_out_since(job) || (is_pick(id) && self.closed_since(account, job.picker_generation)) {
                 let _ = std::fs::remove_file(&part);
                 return None;
             }
@@ -808,8 +860,13 @@ impl Cache {
             if let Err(err) = std::fs::rename(&part, &path) {
                 let _ = std::fs::remove_file(&part);
                 // The picker closed and took its directory while this arrived: nobody wants it.
-                if is_pick(id) && !self.picking(account) {
+                if is_pick(id) && self.closed_since(account, job.picker_generation) {
                     return None;
+                }
+                // A picker reopened as the sweep took its directory: the second pass makes
+                // the directory again and fetches once more.
+                if is_pick(id) && !last && err.kind() == std::io::ErrorKind::NotFound {
+                    continue;
                 }
                 return failed(&file, format!("The file could not be kept: {err}."));
             }
@@ -844,5 +901,55 @@ impl Cache {
         if let Some(before) = before.filter(|before| *before != path) {
             let _ = std::fs::remove_file(before);
         }
+    }
+}
+
+/// The generation the picker session after this ask stands at: one above whatever a sweep has
+/// closed, and above whatever the last ask opened. A job of the closed generation is below
+/// every session that follows, and is dropped before its bytes are kept.
+fn next_generation(closed: u64, open: Option<u64>) -> u64 {
+    closed.max(open.unwrap_or(0)) + 1
+}
+
+/// The pickers whose idle ran out: the accounts whose close ends their generation.
+fn stale(picked: &HashMap<AccountKey, Picker>, at: Instant, idle: Duration) -> Vec<AccountKey> {
+    picked
+        .iter()
+        .filter(|(_, picker)| at.duration_since(picker.asked) >= idle)
+        .map(|(account, _)| account.clone())
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_close_ends_one_picker_generation_and_an_ask_opens_the_next() {
+        // The first session stands above no close at all.
+        assert_eq!(next_generation(0, None), 1);
+        // An ask while the sweep is closing generation 1 opens generation 2, whose jobs land
+        // where the close's removals cannot reach. A job of the closed generation stands at 1,
+        // meets `picker_closed` = 1, and is dropped before its bytes are kept.
+        assert_eq!(next_generation(1, Some(1)), 2);
+        assert!(1 < next_generation(1, Some(1)));
+    }
+
+    #[test]
+    fn the_sweep_closes_only_what_stood_idle_and_a_reopened_picker_is_never_stale() {
+        let account = AccountKey { network: Network::Discord, account: "1".into() };
+        let at = Instant::now();
+        let idle = Duration::from_secs(2);
+        let mut picked = HashMap::new();
+        // Open long enough: the sweep closes it.
+        picked.insert(account.clone(), Picker { asked: at - Duration::from_secs(3), generation: 1 });
+        assert_eq!(stale(&picked, at, idle), std::slice::from_ref(&account));
+        // Re-asked a moment ago — the next session's generation: never stale, whatever the
+        // generation's number.
+        picked.insert(account.clone(), Picker { asked: at, generation: next_generation(1, Some(1)) });
+        assert!(stale(&picked, at, idle).is_empty());
+        // With no picker open, nothing is closed.
+        picked.clear();
+        assert!(stale(&picked, at, idle).is_empty());
     }
 }

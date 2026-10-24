@@ -37,8 +37,8 @@ pub enum Layer {
     Pinned(Key),
     /// A Space's own details, opened from its name in the sidebar.
     Space(Key),
-    /// Search results, which never follow.
-    #[allow(dead_code)]
+    /// The search pane: the field, its scopes, the cache's hits. It never follows a
+    /// conversation switch, for it is how the user moves.
     Search,
 }
 

@@ -1501,6 +1501,7 @@ impl Store {
         &self,
         conversation: Option<&Key>,
         network: Option<Network>,
+        space: Option<&Key>,
         query: &str,
         limit: u32,
     ) -> rusqlite::Result<Vec<MessageHit>> {
@@ -1511,11 +1512,12 @@ impl Store {
                    FROM message m
                    JOIN conversation c ON c.network = m.network AND c.account = m.account
                       AND c.id = m.conversation
-                  WHERE m.pending = 0 AND m.text LIKE ?5 ESCAPE '\\'
+                  WHERE m.pending = 0 AND m.text LIKE ?8 ESCAPE '\\'
                     AND (?1 IS NULL OR m.network = ?1)
                     AND (?2 IS NULL OR (m.network = ?2 AND m.account = ?3 AND m.conversation = ?4))
+                    AND (?5 IS NULL OR (c.network = ?5 AND c.account = ?6 AND c.space = ?7))
                     AND NOT c.hidden AND c.special != 'request'
-                  ORDER BY m.sent DESC, length(m.id) DESC, m.id DESC LIMIT ?6",
+                  ORDER BY m.sent DESC, length(m.id) DESC, m.id DESC LIMIT ?9",
             )?
             .query_map(
                 params![
@@ -1523,6 +1525,9 @@ impl Store {
                     conversation.map(|key| word(&key.network)),
                     conversation.map(|key| key.account.as_str()),
                     conversation.map(|key| key.id.as_str()),
+                    space.map(|key| word(&key.network)),
+                    space.map(|key| key.account.as_str()),
+                    space.map(|key| key.id.as_str()),
                     pattern,
                     limit,
                 ],
@@ -2575,35 +2580,58 @@ mod tests {
             .unwrap();
         store.ingest(&request, &said("5", "world of tickets", 50), true).unwrap();
 
-        let hits = store.search_messages(None, None, "world", 10).unwrap();
+        let hits = store.search_messages(None, None, None, "world", 10).unwrap();
         assert_eq!(hits.iter().map(|hit| hit.message_id.as_str()).collect::<Vec<_>>(), ["2", "1"]);
         assert_eq!((hits[0].sender.as_str(), hits[0].snippet.as_str()), ("mara", "WORLD peace"));
         assert!(!hits[0].outgoing && hits[0].title == "#general");
         assert_eq!(hits[0].conversation, key);
 
         // Named conversation and network narrow; a hidden conversation answers nothing at all.
-        assert_eq!(store.search_messages(Some(&key), None, "world", 10).unwrap().len(), 2);
-        assert!(store.search_messages(Some(&hidden), None, "world", 10).unwrap().is_empty());
-        assert_eq!(store.search_messages(None, Some(Network::Slack), "world", 10).unwrap().len(), 0);
-        assert_eq!(store.search_messages(None, Some(Network::Discord), "world", 10).unwrap().len(), 2);
+        assert_eq!(store.search_messages(Some(&key), None, None, "world", 10).unwrap().len(), 2);
+        assert!(store.search_messages(Some(&hidden), None, None, "world", 10).unwrap().is_empty());
+        assert_eq!(store.search_messages(None, Some(Network::Slack), None, "world", 10).unwrap().len(), 0);
+        assert_eq!(store.search_messages(None, Some(Network::Discord), None, "world", 10).unwrap().len(), 2);
 
         // Case goes for nothing, a longer cut carries the marker, and an empty query finds none.
-        let cut = store.search_messages(None, None, "peace", 1).unwrap();
+        let cut = store.search_messages(None, None, None, "peace", 1).unwrap();
         assert_eq!(cut.len(), 1);
-        assert!(store.search_messages(None, None, "  ", 10).unwrap().is_empty());
+        assert!(store.search_messages(None, None, None, "  ", 10).unwrap().is_empty());
 
         // What the user typed means itself: a percent is not a wildcard.
         store.ingest(&key, &said("5", "we matched 50% there", 50), false).unwrap();
-        assert_eq!(store.search_messages(None, None, "50%", 10).unwrap().len(), 1);
-        assert_eq!(store.search_messages(None, None, "0%_t", 10).unwrap().len(), 0);
+        assert_eq!(store.search_messages(None, None, None, "50%", 10).unwrap().len(), 1);
+        assert_eq!(store.search_messages(None, None, None, "0%_t", 10).unwrap().len(), 0);
 
         // A match far into a long message is still the hit's window, marked on both ends.
         let long = format!("{} the needle turns up here {}", "filler ".repeat(60), "and the text goes on".repeat(20));
         store.ingest(&key, &said("6", &long, 60), false).unwrap();
-        let far = store.search_messages(None, None, "needle", 1).unwrap();
+        let far = store.search_messages(None, None, None, "needle", 1).unwrap();
         assert_eq!(far.len(), 1);
         assert!(far[0].snippet.starts_with("...") && far[0].snippet.ends_with("..."), "{}", far[0].snippet);
         assert!(far[0].snippet.contains("needle turns up"), "{}", far[0].snippet);
+    }
+
+    #[test]
+    fn a_message_search_narrows_to_one_space() {
+        let (mut store, key) = store();
+        let account = key.account();
+        for (id, title, space) in [("guilded", "#in the space", Some("guild")), ("loose", "#no space", None)] {
+            let mut row = ConversationRow::new(id, ConversationKind::Channel, title);
+            row.space = space.map(|space| space.to_owned());
+            store.upsert_conversation(&account, &row).unwrap();
+        }
+        store.ingest(&Key::new(&account, "guilded"), &said("1", "world of the guild", 10), false).unwrap();
+        store.ingest(&Key::new(&account, "loose"), &said("2", "world outside", 20), false).unwrap();
+
+        let space = Key::new(&account, "guild");
+        let hits = store.search_messages(None, None, Some(&space), "world", 10).unwrap();
+        assert_eq!(hits.iter().map(|hit| hit.message_id.as_str()).collect::<Vec<_>>(), ["1"]);
+        assert_eq!(hits[0].title, "#in the space");
+        // The same space id on another network or account holds other rows: nothing answers.
+        let elsewhere = Key::new(&AccountKey { network: Network::Slack, account: "me".into() }, "guild");
+        assert!(store.search_messages(None, None, Some(&elsewhere), "world", 10).unwrap().is_empty());
+        // With no space named, the cache answers as a whole.
+        assert_eq!(store.search_messages(None, None, None, "world", 10).unwrap().len(), 2);
     }
 
     #[test]

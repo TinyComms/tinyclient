@@ -206,6 +206,8 @@ pub const SHORTCUTS: &[Shortcut] = &[
     key("Edit", "Copy", "⌘C"),
     key("Edit", "Paste", "⌘V"),
     key("Edit", "Select All", "⌘A"),
+    key("Edit", "Search in Conversation", "⌘F"),
+    key("Edit", "Search Everywhere", "⇧⌘F"),
     key("View", "Inbox", "⌘1"),
     key("View", "People", "⌘2"),
     key("View", "Quick Switcher", "⌘K"),
@@ -318,13 +320,18 @@ mod tests {
     fn every_shortcut_names_a_menu_item_that_exists_and_every_keyed_item_is_listed() {
         use crate::gui::app::menubar::menus;
         use gpui::MenuItem;
+        // A submenu's items belong to their parent menu, as they are drawn.
+        fn names(item: &MenuItem) -> impl Iterator<Item = &str> {
+            match item {
+                MenuItem::Action { name, .. } => Box::new(std::iter::once(name.as_ref())) as Box<dyn Iterator<Item = &str>>,
+                MenuItem::Submenu(menu) => Box::new(menu.items.iter().flat_map(names)) as Box<dyn Iterator<Item = &str>>,
+                _ => Box::new(std::iter::empty()) as Box<dyn Iterator<Item = &str>>,
+            }
+        }
         let bar = menus(&[], None, "Check for Updates…");
         for shortcut in SHORTCUTS.iter().filter(|s| s.menu != "Calls") {
             let menu = bar.iter().find(|menu| menu.name.as_ref() == shortcut.menu).unwrap_or_else(|| panic!("no {} menu", shortcut.menu));
-            let found = menu.items.iter().any(|item| match item {
-                MenuItem::Action { name, .. } => name.as_ref() == shortcut.command,
-                _ => false,
-            });
+            let found = menu.items.iter().any(|item| names(item).any(|name| name == shortcut.command));
             assert!(found, "{} is not in {}", shortcut.command, shortcut.menu);
         }
         // The menu items bound in `menubar::bind_keys` and `gui::bind_keys`.
