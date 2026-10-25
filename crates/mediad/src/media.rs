@@ -67,19 +67,197 @@ pub struct Setup {
 }
 
 /// One sender's audio on its way to the mix.
-struct Stream {
-    jitter: Jitter,
+pub(crate) struct Stream {
+    pub(crate) jitter: Jitter,
     decoder: Decoder,
     /// Decoded and not yet played.
     pcm: VecDeque<i16>,
     speaking: bool,
     quiet: u32,
     /// A packet that was not silence arrived since the last tick.
-    heard: bool,
-    last_packet: Instant,
+    pub(crate) heard: bool,
+    pub(crate) last_packet: Instant,
     undecodable: u64,
     /// Lost frames rebuilt from the packet after them.
-    rebuilt: u64,
+    pub(crate) rebuilt: u64,
+}
+
+impl Stream {
+    pub(crate) fn new() -> Option<Stream> {
+        Some(Stream {
+            jitter: Jitter::default(),
+            decoder: Decoder::new()?,
+            pcm: VecDeque::new(),
+            speaking: false,
+            quiet: 0,
+            heard: false,
+            last_packet: Instant::now(),
+            undecodable: 0,
+            rebuilt: 0,
+        })
+    }
+
+    /// Deafened: nothing is played, and nothing is kept to play later.
+    pub(crate) fn drop_audio(&mut self) {
+        self.jitter.clear();
+        self.pcm.clear();
+    }
+
+    /// The next 20 ms, decoded, or `None` while nothing is due. `who` names the sender in the
+    /// log.
+    pub(crate) fn pull(&mut self, who: &dyn std::fmt::Display) -> Option<Vec<i16>> {
+        let mut pcm = [0i16; MAX_FRAME * CHANNELS];
+        while self.pcm.len() < FRAME_SAMPLES {
+            let decoded = match self.jitter.pop() {
+                Pop::Packet(packet) => self.decoder.decode(Some(&packet), 0, &mut pcm),
+                Pop::Lost => {
+                    // The packet after the hole may carry a copy of what was lost.
+                    let rebuilt = self.jitter.next().and_then(|next| self.decoder.recover(next, &mut pcm));
+                    self.rebuilt += u64::from(rebuilt.is_some());
+                    rebuilt.or_else(|| self.decoder.decode(None, FRAME, &mut pcm))
+                }
+                Pop::Empty => break,
+            };
+            match decoded {
+                Some(samples) => self.pcm.extend(&pcm[..samples * CHANNELS]),
+                None => {
+                    self.undecodable += 1;
+                    if self.undecodable == 1 {
+                        eprintln!("mediad: a frame from {who} did not decode");
+                    }
+                }
+            }
+        }
+        (self.pcm.len() >= FRAME_SAMPLES).then(|| self.pcm.drain(..FRAME_SAMPLES).collect())
+    }
+
+    /// The end of a tick: whether this sender started or stopped speaking.
+    pub(crate) fn hear(&mut self, loud: bool) -> Option<bool> {
+        self.heard = false;
+        if loud {
+            self.quiet = 0;
+            if !self.speaking {
+                self.speaking = true;
+                return Some(true);
+            }
+        } else if self.speaking {
+            self.quiet += 1;
+            if self.quiet >= HOLD {
+                self.speaking = false;
+                return Some(false);
+            }
+        }
+        None
+    }
+
+    pub(crate) fn speaking(&self) -> bool {
+        self.speaking
+    }
+}
+
+/// What the microphone's 20 ms turns into.
+pub(crate) enum Send {
+    Frame([i16; FRAME_SAMPLES]),
+    /// One of the silence frames that end a talk spurt.
+    Silence,
+}
+
+/// One tick of the speech gate.
+pub(crate) struct Step {
+    /// We started or stopped talking.
+    pub speaking: Option<bool>,
+    /// Frames heard just before the gate opened, oldest first, to go out ahead of `send`
+    /// stamped with the times they were heard at.
+    pub early: Vec<[i16; FRAME_SAMPLES]>,
+    pub send: Option<Send>,
+}
+
+/// The microphone's gate: sent while we talk, then a trail of silence, then nothing.
+#[derive(Default)]
+pub(crate) struct Gate {
+    /// The last frames heard while the gate was shut and nothing was being sent.
+    preroll: VecDeque<[i16; FRAME_SAMPLES]>,
+    talking: bool,
+    quiet: u32,
+    /// Silence frames still owed after the last talk spurt.
+    trail: u32,
+}
+
+impl Gate {
+    pub(crate) fn talking(&self) -> bool {
+        self.talking
+    }
+
+    /// `heard` is the frame's [`level`], `gate` the level that counts as speech.
+    pub(crate) fn step(&mut self, frame: &[i16; FRAME_SAMPLES], captured: bool, muted: bool, heard: u8, gate: u8) -> Step {
+        let mut step = Step { speaking: None, early: Vec::new(), send: None };
+        let mut opened = false;
+        if captured && !muted && heard >= gate {
+            self.quiet = 0;
+            if !self.talking {
+                self.talking = true;
+                opened = true;
+                step.speaking = Some(true);
+            }
+        } else if self.talking {
+            self.quiet += 1;
+            if muted || self.quiet >= HOLD {
+                self.talking = false;
+                self.trail = TRAIL;
+                step.speaking = Some(false);
+            }
+        }
+        if muted {
+            self.preroll.clear();
+        }
+        if self.talking && captured {
+            if opened && self.trail == 0 {
+                // Nothing was sent while these were heard, so their times are free.
+                step.early = self.preroll.drain(..).collect();
+            }
+            self.trail = 0;
+            self.preroll.clear();
+            step.send = Some(Send::Frame(*frame));
+        } else if self.trail > 0 {
+            self.trail -= 1;
+            self.preroll.clear();
+            step.send = Some(Send::Silence);
+        } else if captured && !muted {
+            if self.preroll.len() == PREROLL {
+                self.preroll.pop_front();
+            }
+            self.preroll.push_back(*frame);
+        } else {
+            // A tick with no frame is a hole in what was heard.
+            self.preroll.clear();
+        }
+        step
+    }
+}
+
+/// Everyone's voices summed, to the speaker: the user's voice level, then a cue on top. Gives
+/// the level of the voices alone, for the meter.
+pub(crate) fn mixdown(mix: &[i32; FRAME_SAMPLES], controls: &Controls, cue: &mut Option<Playing>, audio: &mut Audio) -> u8 {
+    let tuning = controls.tuning();
+    let mut mixed = [0i16; FRAME_SAMPLES];
+    for (out, &sum) in mixed.iter_mut().zip(mix) {
+        // V5: everyone's voice, before anything else is added.
+        let sum = sum * i32::from(tuning.voice.min(100)) / 100;
+        *out = sum.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
+    }
+    // The meter in the device menu measures voices, not our own cues.
+    let heard = level(&mixed);
+    // A cue goes on after deafen: undeafening is heard, as is the test sound.
+    if let Some(next) = controls.take_cue() {
+        *cue = Some(Playing::new(next, f32::from(tuning.cues.min(100)) / 100.));
+    }
+    if let Some(playing) = cue {
+        if !playing.mix(&mut mixed) {
+            *cue = None;
+        }
+    }
+    audio.play(&mixed);
+    heard
 }
 
 pub const NO_MICROPHONE: &str =
@@ -110,21 +288,14 @@ struct Loop {
     setup: Setup,
     encoder: Encoder,
     streams: HashMap<u32, Stream>,
-    /// The last frames heard while the gate was shut and nothing was being sent.
-    preroll: VecDeque<[i16; FRAME_SAMPLES]>,
-    talking: bool,
-    quiet: u32,
-    /// Silence frames still owed after the last talk spurt.
-    trail: u32,
+    gate: Gate,
     ticks: u64,
     keepalive: u32,
     levels: (u8, u8),
     /// The cue being played under the voices.
     cue: Option<Playing>,
     /// Opens devices away from this thread.
-    devices: DeviceDesk,
-    /// Housekeeping asked for a reopen. The tick posts it; it does not open anything itself.
-    reopen_wanted: bool,
+    devices: Devices,
 }
 
 impl Loop {
@@ -141,20 +312,10 @@ impl Loop {
         let stream = match self.streams.entry(packet.ssrc) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::hash_map::Entry::Vacant(entry) => {
-                let Some(decoder) = Decoder::new() else {
+                let Some(stream) = Stream::new() else {
                     return;
                 };
-                entry.insert(Stream {
-                    jitter: Jitter::default(),
-                    decoder,
-                    pcm: VecDeque::new(),
-                    speaking: false,
-                    quiet: 0,
-                    heard: false,
-                    last_packet: Instant::now(),
-                    undecodable: 0,
-                    rebuilt: 0,
-                })
+                entry.insert(stream)
             }
         };
         stream.last_packet = Instant::now();
@@ -220,52 +381,21 @@ impl Loop {
         let mut frame = [0i16; FRAME_SAMPLES];
         let captured = self.setup.audio.capture(&mut frame);
         let heard = if captured { level(&frame) } else { 0 };
-        let gate = controls.tuning().gate;
-        let mut opened = false;
-        if captured && !muted && heard >= gate {
-            self.quiet = 0;
-            if !self.talking {
-                self.talking = true;
-                opened = true;
-                self.say(true);
-            }
-        } else if self.talking {
-            self.quiet += 1;
-            if muted || self.quiet >= HOLD {
-                self.talking = false;
-                self.trail = TRAIL;
-                self.say(false);
-            }
+        let step = self.gate.step(&frame, captured, muted, heard, controls.tuning().gate);
+        if let Some(speaking) = step.speaking {
+            self.say(speaking);
         }
-        if muted {
-            self.preroll.clear();
+        // What was heard just before the gate opened goes first, stamped with the times it
+        // was heard at.
+        self.setup.sender.rewind((step.early.len() * FRAME) as u32);
+        for early in &step.early {
+            self.encode(early);
+            self.setup.sender.advance(FRAME as u32);
         }
-        if self.talking && captured {
-            if opened && self.trail == 0 {
-                // What was heard just before the gate opened goes first, stamped with the
-                // times it was heard at: nothing was sent then, so those times are free.
-                let early: Vec<_> = self.preroll.drain(..).collect();
-                self.setup.sender.rewind((early.len() * FRAME) as u32);
-                for frame in &early {
-                    self.encode(frame);
-                    self.setup.sender.advance(FRAME as u32);
-                }
-            }
-            self.trail = 0;
-            self.preroll.clear();
-            self.encode(&frame);
-        } else if self.trail > 0 {
-            self.trail -= 1;
-            self.preroll.clear();
-            self.send(&SILENCE);
-        } else if captured && !muted {
-            if self.preroll.len() == PREROLL {
-                self.preroll.pop_front();
-            }
-            self.preroll.push_back(frame);
-        } else {
-            // A tick with no frame is a hole in what was heard.
-            self.preroll.clear();
+        match step.send {
+            Some(Send::Frame(frame)) => self.encode(&frame),
+            Some(Send::Silence) => self.send(&SILENCE),
+            None => {}
         }
         self.setup.sender.advance(FRAME as u32);
         heard
@@ -275,61 +405,24 @@ impl Loop {
     fn play(&mut self) -> u8 {
         let deafened = self.setup.controls.deafened.load(Ordering::Relaxed);
         let mut mix = [0i32; FRAME_SAMPLES];
-        let mut pcm = [0i16; MAX_FRAME * CHANNELS];
         let mut changed = Vec::new();
         for (&ssrc, stream) in &mut self.streams {
             let loud = if deafened {
-                stream.jitter.clear();
-                stream.pcm.clear();
+                stream.drop_audio();
                 stream.heard
             } else {
-                while stream.pcm.len() < FRAME_SAMPLES {
-                    let decoded = match stream.jitter.pop() {
-                        Pop::Packet(packet) => stream.decoder.decode(Some(&packet), 0, &mut pcm),
-                        Pop::Lost => {
-                            // The packet after the hole may carry a copy of what was lost.
-                            let rebuilt = stream
-                                .jitter
-                                .next()
-                                .and_then(|next| stream.decoder.recover(next, &mut pcm));
-                            stream.rebuilt += u64::from(rebuilt.is_some());
-                            rebuilt.or_else(|| stream.decoder.decode(None, FRAME, &mut pcm))
+                match stream.pull(&format_args!("ssrc {ssrc}")) {
+                    Some(frame) => {
+                        for (sum, &sample) in mix.iter_mut().zip(&frame) {
+                            *sum += i32::from(sample);
                         }
-                        Pop::Empty => break,
-                    };
-                    match decoded {
-                        Some(samples) => stream.pcm.extend(&pcm[..samples * CHANNELS]),
-                        None => {
-                            stream.undecodable += 1;
-                            if stream.undecodable == 1 {
-                                eprintln!("mediad: a frame from ssrc {ssrc} did not decode");
-                            }
-                        }
+                        level(&frame) >= VOICE
                     }
-                }
-                if stream.pcm.len() >= FRAME_SAMPLES {
-                    let frame: Vec<i16> = stream.pcm.drain(..FRAME_SAMPLES).collect();
-                    for (sum, &sample) in mix.iter_mut().zip(&frame) {
-                        *sum += i32::from(sample);
-                    }
-                    level(&frame) >= VOICE
-                } else {
-                    false
+                    None => false,
                 }
             };
-            stream.heard = false;
-            if loud {
-                stream.quiet = 0;
-                if !stream.speaking {
-                    stream.speaking = true;
-                    changed.push((ssrc, true));
-                }
-            } else if stream.speaking {
-                stream.quiet += 1;
-                if stream.quiet >= HOLD {
-                    stream.speaking = false;
-                    changed.push((ssrc, false));
-                }
+            if let Some(speaking) = stream.hear(loud) {
+                changed.push((ssrc, speaking));
             }
         }
         if !changed.is_empty() {
@@ -340,131 +433,14 @@ impl Loop {
                 }
             }
         }
-        let tuning = self.setup.controls.tuning();
-        let mut mixed = [0i16; FRAME_SAMPLES];
-        for (out, sum) in mixed.iter_mut().zip(mix) {
-            // V5: everyone's voice, before anything else is added.
-            let sum = sum * i32::from(tuning.voice.min(100)) / 100;
-            *out = sum.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
-        }
-        // The meter in the device menu measures voices, not our own cues.
-        let heard = level(&mixed);
-        // A cue goes on after deafen: undeafening is heard, as is the test sound.
-        if let Some(cue) = self.setup.controls.take_cue() {
-            self.cue = Some(Playing::new(cue, f32::from(tuning.cues.min(100)) / 100.));
-        }
-        if let Some(cue) = &mut self.cue {
-            if !cue.mix(&mut mixed) {
-                self.cue = None;
-            }
-        }
-        self.setup.audio.play(&mixed);
-        heard
-    }
-
-    fn devices(&self) {
-        let (input, output) = (
-            self.setup.audio.input.clone(),
-            self.setup.audio.output.clone(),
-        );
-        out::send(&MediaResponse::Devices { input, output });
-    }
-
-    /// Takes a finished reopen, if one is ready, and posts the next one. Never opens a device
-    /// itself: that work is already running, or is posted here and finishes on a later tick.
-    fn service_devices(&mut self) -> bool {
-        loop {
-            let note = match self.devices.notes.try_recv() {
-                Ok(note) => note,
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => return false,
-            };
-            self.devices.busy = false;
-            if !self.apply_devices(note) {
-                return false;
-            }
-            if let Some(ask) = self.devices.queued.take() {
-                let _ = self.devices.orders.send(Order::Open(ask));
-                self.devices.busy = true;
-            }
-        }
-        if self.devices.busy {
-            return true;
-        }
-        let chosen = self.setup.controls.devices.lock().unwrap().take();
-        if let Some((input, output)) = chosen {
-            self.setup.audio.want_input = input;
-            self.setup.audio.want_output = output;
-            self.reopen_wanted = true;
-        }
-        if self.setup.audio.device_broken() {
-            self.reopen_wanted = true;
-        }
-        let poll_route = self.ticks.is_multiple_of(SECOND) && self.setup.audio.on_devices();
-        if self.reopen_wanted || poll_route {
-            let audio = &self.setup.audio;
-            let ask = OpenAsk {
-                want_input: audio.want_input.clone(),
-                want_output: audio.want_output.clone(),
-                current_input: audio.input.clone(),
-                current_output: audio.output.clone(),
-                sides: audio.sides(),
-                broken: audio.device_broken(),
-                force: self.reopen_wanted,
-                mic_running: audio.mic_running(),
-                simulated: !audio.on_devices(),
-                pause: Duration::ZERO,
-            };
-            self.reopen_wanted = false;
-            let _ = self.devices.orders.send(Order::Open(ask));
-            self.devices.busy = true;
-        }
-        true
-    }
-
-    fn apply_devices(&mut self, note: Note) -> bool {
-        match note {
-            Note::Fresh { fresh, fell_back } => {
-                if fell_back {
-                    self.setup.audio.want_input = None;
-                    self.setup.audio.want_output = None;
-                }
-                let retired = self.setup.audio.install(fresh);
-                let _ = self.devices.orders.send(Order::Retire(retired));
-                self.devices();
-                true
-            }
-            Note::Same => {
-                self.devices();
-                true
-            }
-            Note::Quiet => true,
-            Note::Failed(err) => {
-                let (reason, detail) = failure(err);
-                let _ = self.setup.report.send(FromMedia::Fatal(reason, detail));
-                false
-            }
-        }
+        mixdown(&mix, &self.setup.controls, &mut self.cue, &mut self.setup.audio)
     }
 
     /// Once a second: what does not need 20 ms timing. Device reopen is not in here.
     fn housekeeping(&mut self) -> bool {
-        if self.setup.microphone_unasked {
-            match microphone() {
-                Some(Microphone::Denied) => {
-                    let fatal = FromMedia::Fatal(CallFailure::Audio, MICROPHONE_DENIED.to_owned());
-                    let _ = self.setup.report.send(fatal);
-                    return false;
-                }
-                Some(Microphone::Unasked) => {}
-                _ => {
-                    // Allowed while we were running. A stream opened before the answer may go
-                    // on hearing silence, so the devices are opened afresh.
-                    self.setup.microphone_unasked = false;
-                    eprintln!("mediad: microphone access was granted");
-                    self.reopen_wanted = true;
-                }
-            }
+        if let Err((reason, detail)) = self.devices.permission() {
+            let _ = self.setup.report.send(FromMedia::Fatal(reason, detail));
+            return false;
         }
         if self.ticks.is_multiple_of(5 * SECOND) {
             // Keeps the NAT mapping open while nobody talks. The server echoes it.
@@ -481,7 +457,7 @@ impl Loop {
     }
 
     fn run(&mut self) {
-        self.devices();
+        announce(&self.setup.audio);
         let mut datagram = [0u8; 2048];
         let mut next = Instant::now() + TICK;
         while !self.setup.stop.load(Ordering::Relaxed) {
@@ -518,11 +494,12 @@ impl Loop {
             if self.ticks.is_multiple_of(SECOND) && !self.housekeeping() {
                 break;
             }
-            if !self.service_devices() {
+            if let Err((reason, detail)) = self.devices.service(&mut self.setup.audio, &self.setup.controls, self.ticks) {
+                let _ = self.setup.report.send(FromMedia::Fatal(reason, detail));
                 break;
             }
         }
-        if self.talking {
+        if self.gate.talking() {
             for _ in 0..TRAIL {
                 self.send(&SILENCE);
             }
@@ -538,6 +515,11 @@ impl Loop {
     }
 }
 
+/// Tells chatd which devices the call is using.
+pub(crate) fn announce(audio: &Audio) {
+    out::send(&MediaResponse::Devices { input: audio.input.clone(), output: audio.output.clone() });
+}
+
 /// Runs until `setup.stop` is set. Gives the devices back, still open, for the connection that
 /// follows a move to another voice server.
 pub fn run(setup: Setup) -> Audio {
@@ -550,24 +532,124 @@ pub fn run(setup: Setup) -> Audio {
         let _ = setup.report.send(fatal);
         return setup.audio;
     };
+    let devices = Devices::start(setup.microphone_unasked);
     let mut state = Loop {
         setup,
         encoder,
         streams: HashMap::new(),
-        preroll: VecDeque::with_capacity(PREROLL),
-        talking: false,
-        quiet: 0,
-        trail: 0,
+        gate: Gate::default(),
         ticks: 0,
         keepalive: 0,
         levels: (0, 0),
         cue: None,
-        devices: DeviceDesk::start(),
-        reopen_wanted: false,
+        devices,
     };
     state.run();
     state.devices.stop();
     state.setup.audio
+}
+
+/// The devices of a running call: reopened away from the 20 ms thread when the user picks
+/// another, when one breaks or the system default moves, and when the microphone is allowed.
+pub(crate) struct Devices {
+    desk: DeviceDesk,
+    /// Housekeeping asked for a reopen. The tick posts it; it does not open anything itself.
+    reopen_wanted: bool,
+    /// The system has not yet been asked about the microphone: watch for the answer.
+    microphone_unasked: bool,
+}
+
+impl Devices {
+    pub(crate) fn start(microphone_unasked: bool) -> Devices {
+        Devices { desk: DeviceDesk::start(), reopen_wanted: false, microphone_unasked }
+    }
+
+    pub(crate) fn stop(&mut self) {
+        self.desk.stop();
+    }
+
+    /// Once a second, while the system has not said whether we may hear the microphone. A
+    /// refusal ends the call.
+    pub(crate) fn permission(&mut self) -> Result<(), (CallFailure, String)> {
+        if !self.microphone_unasked {
+            return Ok(());
+        }
+        match microphone() {
+            Some(Microphone::Denied) => Err((CallFailure::Audio, MICROPHONE_DENIED.to_owned())),
+            Some(Microphone::Unasked) => Ok(()),
+            _ => {
+                // Allowed while we were running. A stream opened before the answer may go on
+                // hearing silence, so the devices are opened afresh.
+                self.microphone_unasked = false;
+                eprintln!("mediad: microphone access was granted");
+                self.reopen_wanted = true;
+                Ok(())
+            }
+        }
+    }
+
+    /// Takes a finished reopen, if one is ready, and posts the next one. Never opens a device
+    /// itself: that work is already running, or is posted here and finishes on a later tick.
+    pub(crate) fn service(&mut self, audio: &mut Audio, controls: &Controls, ticks: u64) -> Result<(), (CallFailure, String)> {
+        let desk = &mut self.desk;
+        loop {
+            let note = match desk.notes.try_recv() {
+                Ok(note) => note,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => return Err((CallFailure::Engine, "The call engine could not start. Try again.".to_owned())),
+            };
+            desk.busy = false;
+            match note {
+                Note::Fresh { fresh, fell_back } => {
+                    if fell_back {
+                        audio.want_input = None;
+                        audio.want_output = None;
+                    }
+                    let retired = audio.install(fresh);
+                    let _ = desk.orders.send(Order::Retire(retired));
+                    announce(audio);
+                }
+                Note::Same => announce(audio),
+                Note::Quiet => {}
+                Note::Failed(err) => return Err(failure(err)),
+            }
+            if let Some(ask) = desk.queued.take() {
+                let _ = desk.orders.send(Order::Open(ask));
+                desk.busy = true;
+            }
+        }
+        if desk.busy {
+            return Ok(());
+        }
+        let chosen = controls.devices.lock().unwrap().take();
+        if let Some((input, output)) = chosen {
+            audio.want_input = input;
+            audio.want_output = output;
+            self.reopen_wanted = true;
+        }
+        if audio.device_broken() {
+            self.reopen_wanted = true;
+        }
+        let poll_route = ticks.is_multiple_of(SECOND) && audio.on_devices();
+        if self.reopen_wanted || poll_route {
+            let ask = OpenAsk {
+                want_input: audio.want_input.clone(),
+                want_output: audio.want_output.clone(),
+                current_input: audio.input.clone(),
+                current_output: audio.output.clone(),
+                sides: audio.sides(),
+                broken: audio.device_broken(),
+                force: self.reopen_wanted,
+                mic_running: audio.mic_running(),
+                simulated: !audio.on_devices(),
+                pause: Duration::ZERO,
+            };
+            self.reopen_wanted = false;
+            let _ = desk.orders.send(Order::Open(ask));
+            desk.busy = true;
+        }
+        Ok(())
+    }
 }
 
 /// What the call thread asks the device thread to do.

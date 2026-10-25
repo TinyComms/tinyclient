@@ -1363,9 +1363,30 @@ impl Chat {
         }
     }
 
+    /// A seat in a Tiny room. With audio, chatd's call holds it, and the server hears of the
+    /// mute or deafen the call joined with (V4) once the seat is taken.
+    fn tiny_join(&self, account: AccountKey, room_id: String) -> Response {
+        let ids = [room_id.clone()];
+        let room = Key::new(&account, &room_id);
+        let answer = self.tiny_call(&account, "community.calls.join", &ids, |reply| adapters::tiny::live::Ask::Join { room_id, reply });
+        if answer == Response::Ok {
+            if let Some(call) = self.hub.calls.describe().0.filter(|call| call.conversation == room && (call.muted || call.deafened)) {
+                self.command(&account, Command::CallAudio { muted: call.muted, deafened: call.deafened });
+            }
+        }
+        answer
+    }
+
     /// Only a conversation tinyclient can carry a call for starts one. Anything else is refused
     /// before mediad is spawned or the network hears a thing.
     fn call_start(&self, conversation: Key) -> Response {
+        // A Tiny room is no stored conversation: its call is a seat taken over the live socket.
+        if conversation.network == Network::Tiny {
+            return match self.tiny_join(conversation.account(), conversation.id) {
+                Response::Ok => self.status(),
+                refused => refused,
+            };
+        }
         match self.hub.store().conversation(&conversation) {
             Ok(Some(row)) if row.call == CallSupport::Native => {}
             Ok(Some(row)) if row.call == CallSupport::Handoff => {
@@ -1747,10 +1768,7 @@ impl Chat {
             Request::TinyRoomCreate { account, name } => adapters::tiny::create_room(account, name),
             Request::TinyRoomRename { account, room_id, name } => adapters::tiny::rename_room(account, room_id, name),
             Request::TinyRoomDelete { account, room_id } => adapters::tiny::delete_room(account, room_id),
-            Request::TinyCallJoin { account, room_id } => {
-                let ids = [room_id.clone()];
-                self.tiny_call(&account, "community.calls.join", &ids, |reply| adapters::tiny::live::Ask::Join { room_id, reply })
-            }
+            Request::TinyCallJoin { account, room_id } => self.tiny_join(account, room_id),
             Request::TinyCallLeave { account } => self.tiny_call(&account, "community.calls.join", &[], |reply| adapters::tiny::live::Ask::Leave { reply }),
             Request::TinyCallKick { account, room_id, user_id } => {
                 let ids = [room_id.clone(), user_id.clone()];

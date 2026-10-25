@@ -1,5 +1,5 @@
 //! A Tiny server's members, invites, audit, and rooms. No messages. A room is a voice channel:
-//! joining takes a seat in its call, and there is no sound yet.
+//! joining takes a seat in its call, with audio when the server's audio is up.
 
 use serde::{Deserialize, Serialize};
 
@@ -65,6 +65,9 @@ pub struct TinySeat {
     pub muted: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub deafened: bool,
+    /// Heard right now. Only known while we are in the same call.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub speaking: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,7 +86,7 @@ pub struct TinyCommunity {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub online: Vec<String>,
     /// The server's audio, as its `/health` says: `off`, `up` or `down`. Empty when it did not
-    /// say. tinyclient joins a call only while it is off: it has no audio of its own yet.
+    /// say. With `up` a join carries audio; with `off` or empty it takes a seat alone.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub media: String,
 }

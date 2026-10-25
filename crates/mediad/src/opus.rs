@@ -5,16 +5,23 @@ use crate::{CHANNELS, FRAME, RATE};
 use unsafe_libopus::{
     opus_decode, opus_decoder_create, opus_decoder_destroy, opus_encode, opus_encoder_create,
     opus_encoder_ctl, opus_encoder_destroy, opus_packet_get_nb_samples, OpusDecoder, OpusEncoder,
-    OPUS_APPLICATION_AUDIO, OPUS_SET_BITRATE_REQUEST, OPUS_SET_INBAND_FEC_REQUEST,
-    OPUS_SET_PACKET_LOSS_PERC_REQUEST,
+    OPUS_APPLICATION_AUDIO, OPUS_APPLICATION_VOIP, OPUS_SET_BITRATE_REQUEST, OPUS_SET_DTX_REQUEST,
+    OPUS_SET_INBAND_FEC_REQUEST, OPUS_SET_PACKET_LOSS_PERC_REQUEST,
 };
 
 /// The longest frame Opus defines is 120 ms.
 pub const MAX_FRAME: usize = FRAME * 6;
 /// Discord's ceiling for voice outside boosted servers.
 const BITRATE: i32 = 64_000;
+/// What a Tiny server's SFU expects of each speaker (tinyserver's `docs/calls.md`), and forwards
+/// up to twice of.
+const VOICE_BITRATE: i32 = 32_000;
 
-pub struct Encoder(*mut OpusEncoder);
+pub struct Encoder {
+    state: *mut OpusEncoder,
+    /// One channel: each stereo frame is folded to mono before it is encoded.
+    mono: bool,
+}
 
 // One thread owns each codec; the pointer is to plain heap state.
 unsafe impl Send for Encoder {}
@@ -27,9 +34,19 @@ impl Encoder {
     /// An encoder at `bitrate` bits a second. Low rates make libopus choose its speech (SILK)
     /// modes, which is how tests get such packets.
     pub fn at(bitrate: i32) -> Option<Encoder> {
+        Encoder::made(CHANNELS, OPUS_APPLICATION_AUDIO, bitrate, false)
+    }
+
+    /// Mono speech at 32 kbit/s, with in-band FEC and DTX, for a Tiny server call. DTX makes
+    /// the encoder say "nothing to send" (a packet of two bytes or less) in silence.
+    pub fn voice() -> Option<Encoder> {
+        Encoder::made(1, OPUS_APPLICATION_VOIP, VOICE_BITRATE, true)
+    }
+
+    fn made(channels: usize, application: i32, bitrate: i32, dtx: bool) -> Option<Encoder> {
         let mut error = 0;
         // SAFETY: libopus allocates and initializes the state, or returns null.
-        let state = unsafe { opus_encoder_create(RATE as i32, CHANNELS as i32, OPUS_APPLICATION_AUDIO, &mut error) };
+        let state = unsafe { opus_encoder_create(RATE as i32, channels as i32, application, &mut error) };
         if state.is_null() || error != 0 {
             return None;
         }
@@ -38,15 +55,25 @@ impl Encoder {
             opus_encoder_ctl!(state, OPUS_SET_BITRATE_REQUEST, bitrate);
             opus_encoder_ctl!(state, OPUS_SET_INBAND_FEC_REQUEST, 1);
             opus_encoder_ctl!(state, OPUS_SET_PACKET_LOSS_PERC_REQUEST, 10);
+            opus_encoder_ctl!(state, OPUS_SET_DTX_REQUEST, i32::from(dtx));
         }
-        Some(Encoder(state))
+        Some(Encoder { state, mono: channels == 1 })
     }
 
     /// One 20 ms frame of interleaved stereo in, one Opus packet out.
     pub fn encode(&mut self, pcm: &[i16], packet: &mut [u8]) -> Option<usize> {
         assert_eq!(pcm.len(), FRAME * CHANNELS);
+        let mut mono = [0i16; FRAME];
+        let pcm = if self.mono {
+            for (out, pair) in mono.iter_mut().zip(pcm.chunks_exact(CHANNELS)) {
+                *out = ((i32::from(pair[0]) + i32::from(pair[1])) / 2) as i16;
+            }
+            &mono[..]
+        } else {
+            pcm
+        };
         // SAFETY: `pcm` holds FRAME samples per channel and `packet` is ours to fill.
-        let written = unsafe { opus_encode(self.0, pcm.as_ptr(), FRAME as i32, packet.as_mut_ptr(), packet.len() as i32) };
+        let written = unsafe { opus_encode(self.state, pcm.as_ptr(), FRAME as i32, packet.as_mut_ptr(), packet.len() as i32) };
         usize::try_from(written).ok()
     }
 }
@@ -54,7 +81,7 @@ impl Encoder {
 impl Drop for Encoder {
     fn drop(&mut self) {
         // SAFETY: created by `opus_encoder_create` and dropped once.
-        unsafe { opus_encoder_destroy(self.0) }
+        unsafe { opus_encoder_destroy(self.state) }
     }
 }
 
@@ -212,6 +239,33 @@ mod tests {
         // Past the codec's start-up, the level is the tone's (8000 peak is about 5657 RMS).
         let level = energy(&heard[4 * FRAME * CHANNELS..]);
         assert!((4500. ..6800.).contains(&level), "level {level}");
+    }
+
+    #[test]
+    fn mono_speech_decodes_on_both_channels_and_goes_quiet_in_silence() {
+        let (mut encoder, mut decoder) = (Encoder::voice().unwrap(), Decoder::new().unwrap());
+        let mut heard = Vec::new();
+        for frame in tone(10).chunks(FRAME * CHANNELS) {
+            let mut packet = [0u8; 1500];
+            let len = encoder.encode(frame, &mut packet).unwrap();
+            assert!(len > 2 && len < 120, "{len} bytes for 20 ms at 32 kbit/s");
+            assert_eq!(packet[0] & 4, 0, "a mono packet");
+            let mut pcm = vec![0i16; MAX_FRAME * CHANNELS];
+            let decoded = decoder.decode(Some(&packet[..len]), 0, &mut pcm).unwrap();
+            heard.extend_from_slice(&pcm[..decoded * CHANNELS]);
+        }
+        let level = energy(&heard[4 * FRAME * CHANNELS..]);
+        assert!((4000. ..7000.).contains(&level), "level {level}");
+        assert!(heard.chunks(2).all(|pair| pair[0] == pair[1]), "the same voice in both ears");
+        // A second of silence: DTX says there is nothing to send most of the time.
+        let quiet = vec![0i16; FRAME * CHANNELS];
+        let skipped = (0..50)
+            .filter(|_| {
+                let mut packet = [0u8; 1500];
+                encoder.encode(&quiet, &mut packet).unwrap() <= 2
+            })
+            .count();
+        assert!(skipped > 30, "{skipped} of 50 silent frames had nothing to send");
     }
 
     #[test]

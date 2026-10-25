@@ -613,19 +613,188 @@ fn joining_leaving_and_kicking_get_the_servers_answer_in_words() {
 }
 
 #[test]
-fn a_server_with_audio_up_or_down_is_sent_no_join_it_would_refuse() {
-    for (media, words) in [("up", AUDIO_SOON), ("down", AUDIO_DOWN)] {
-        let fake = fake_with(media, &[], |_, mut conn| {
-            conn.send(ready(1, &[ME], json!([])));
-            let asked = conn.next(Duration::from_secs(2));
-            assert!(asked.is_none(), "no join without an offer reaches a server with audio: {asked:?}");
-            conn.idle(Duration::from_secs(5));
-        });
-        let running = run(&fake.base, QUICK);
-        until("connected", || running.link().0 == Link::Connected);
-        until("the health read", || !running.live.seats_only());
-        assert_eq!(running.ask(|reply| Ask::Join { room_id: ROOM.into(), reply }), Err(words.to_owned()));
+fn a_server_with_audio_down_is_sent_no_join() {
+    let fake = fake_with("down", &[], |_, mut conn| {
+        conn.send(ready(1, &[ME], json!([])));
+        let asked = conn.next(Duration::from_secs(2));
+        assert!(asked.is_none(), "no join reaches a server whose audio is down: {asked:?}");
+        conn.idle(Duration::from_secs(5));
+    });
+    let running = run(&fake.base, QUICK);
+    until("connected", || running.link().0 == Link::Connected);
+    until("the health read", || !running.live.seats_only());
+    assert_eq!(running.ask(|reply| Ask::Join { room_id: ROOM.into(), reply }), Err(AUDIO_DOWN.to_owned()));
+}
+
+/// The real mediad, for the joins with audio. It hears a tone, so it opens no device.
+fn with_mediad() {
+    static BUILT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    BUILT.get_or_init(|| {
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+        let built = std::process::Command::new(cargo).args(["build", "-p", "mediad", "--bin", "mediad"]).status().expect("cargo runs");
+        assert!(built.success(), "mediad builds");
+        // target/debug/deps/chatd-… is beside target/debug/mediad.
+        let deps = std::env::current_exe().expect("the test's path");
+        let mediad = deps.parent().and_then(|deps| deps.parent()).expect("target/debug").join(format!("mediad{}", std::env::consts::EXE_SUFFIX));
+        std::env::set_var("TINYCLIENT_MEDIAD", mediad);
+        std::env::set_var("TINYCLIENT_MEDIAD_AUDIO", "tone");
+    });
+}
+
+/// An answer to mediad's real offer, worded as an ICE-lite SFU would, for an address nothing
+/// listens on: mediad takes it, and waits to connect.
+fn answer_for(offer: &str) -> String {
+    let mut lines = vec![];
+    let mut candidate = true;
+    for line in offer.lines() {
+        if ["a=candidate:", "a=ice-options", "a=ssrc:", "a=msid:"].iter().any(|skip| line.starts_with(skip)) {
+            continue;
+        }
+        let line = match line {
+            line if line.starts_with("a=ice-ufrag:") => "a=ice-ufrag:fakeufrag",
+            line if line.starts_with("a=ice-pwd:") => "a=ice-pwd:fakepasswordfakepassword12",
+            "a=setup:actpass" => "a=setup:passive",
+            "a=sendonly" => "a=recvonly",
+            "a=recvonly" => "a=sendonly",
+            line => line,
+        };
+        lines.push(line.to_owned());
+        if line == "t=0 0" {
+            lines.push("a=ice-lite".to_owned());
+        }
+        if line.starts_with("c=") && candidate {
+            lines.push("a=candidate:1 1 udp 2130706431 127.0.0.1 9 typ host".to_owned());
+            candidate = false;
+        }
     }
+    lines.join("\r\n") + "\r\n"
+}
+
+/// The mids of an offer's receive slots, in order.
+fn slot_mids(offer: &str) -> Vec<String> {
+    offer.split("m=audio").skip(1).filter(|section| section.contains("a=recvonly")).filter_map(|section| section.lines().find_map(|line| line.strip_prefix("a=mid:")).map(str::to_owned)).collect()
+}
+
+fn the_call(running: &Running) -> Option<protocol::Call> {
+    running.hub.calls.describe().0.filter(|call| call.conversation == running.key(ROOM))
+}
+
+/// The server's side of a join with audio: the answer, the seat, the slots and who speaks.
+fn answer_join(conn: &mut Conn, call_id: &str) -> Value {
+    let join = conn.next(Duration::from_secs(10)).expect("a join");
+    assert_eq!(join["type"], "call.join");
+    let sdp = join["sdp"].as_str().expect("a join to a server with audio carries an offer");
+    conn.send(json!({"type": "call.answer", "ref": join["ref"], "call_id": call_id, "sdp": answer_for(sdp)}));
+    conn.send(json!({"type": "call.joined", "room_id": ROOM, "user_id": ME}));
+    conn.send(json!({"type": "call.slots", "call_id": "c-stale", "audio": [], "video": null}));
+    conn.send(json!({"type": "call.slots", "call_id": call_id, "audio": [{"mid": slot_mids(sdp)[0], "user_id": BEA}], "video": null}));
+    join
+}
+
+#[test]
+fn a_join_with_audio_carries_mediads_offer_out_and_the_answer_back() {
+    with_mediad();
+    let (said, heard) = channel();
+    let fake = fake_with("up", &[], move |_, mut conn| {
+        conn.send(ready(1, &[ME, BEA], json!([{"room_id": ROOM, "participants": [{"user_id": BEA}]}])));
+        let join = answer_join(&mut conn, "c-1");
+        let _ = said.send(join["sdp"].as_str().unwrap_or("").to_owned());
+        conn.send(json!({"type": "call.speaking", "room_id": ROOM, "user_ids": [BEA]}));
+        // Muting is told to the server.
+        let state = conn.next(Duration::from_secs(5)).expect("call.state");
+        assert_eq!((state["type"].as_str(), state["muted"].as_bool(), state["deafened"].as_bool()), (Some("call.state"), Some(true), Some(false)));
+        conn.send(json!({"type": "ok", "ref": state["ref"]}));
+        // Hanging up in chatd leaves the room.
+        let leave = conn.next(Duration::from_secs(5)).expect("call.leave");
+        assert_eq!(leave["type"], "call.leave");
+        conn.send(json!({"type": "ok", "ref": leave["ref"]}));
+        conn.send(json!({"type": "call.left", "room_id": ROOM, "user_id": ME, "reason": "left"}));
+        // Joined again, and the server loses the audio.
+        answer_join(&mut conn, "c-2");
+        conn.idle(Duration::from_millis(300));
+        conn.send(json!({"type": "call.left", "room_id": ROOM, "user_id": ME, "reason": "media_lost"}));
+        // chatd hangs up after a failure; we are out of the room already, so nothing is sent.
+        let after = conn.next(Duration::from_millis(800));
+        assert!(after.is_none(), "nothing to leave: {after:?}");
+        conn.idle(Duration::from_secs(5));
+    });
+    let running = run(&fake.base, QUICK);
+    until("connected", || running.link().0 == Link::Connected);
+    until("the health read", || !running.live.seats_only());
+
+    assert_eq!(running.ask(|reply| Ask::Join { room_id: ROOM.into(), reply }), Ok(()));
+    let offer = heard.recv_timeout(Duration::from_secs(5)).expect("the offer");
+    assert_eq!(offer.matches("m=audio").count(), ROOM_CAP as usize, "a microphone and a slot for each other seat");
+    assert_eq!(offer.matches("a=sendonly").count(), 1);
+    let call = the_call(&running).expect("chatd holds the call");
+    assert!(call.engine_linked);
+    assert_eq!(call.state, protocol::CallState::Connecting, "connecting until media flows");
+    until("Bea speaking in the room", || running.hub.occupants(&running.key(ROOM)).is_some_and(|inside| inside.people.iter().any(|who| who.name == "Bea" && who.speaking)));
+
+    running.live.ask(Ask::State { muted: true, deafened: false });
+    // What chatd does on CallEnd: its call goes, and the adapter is told to hang up.
+    assert!(running.hub.calls.end(&running.hub).is_some());
+    running.live.ask(Ask::Hangup { room_id: ROOM.into() });
+    until("my seat gone", || running.hub.occupants(&running.key(ROOM)).is_some_and(|inside| inside.people.iter().all(|who| who.name != "Ada")));
+
+    assert_eq!(running.ask(|reply| Ask::Join { room_id: ROOM.into(), reply }), Ok(()));
+    until("the call failed in words", || the_call(&running).is_some_and(|call| call.state == protocol::CallState::Failed { reason: CallFailure::Lost, detail: MEDIA_LOST.to_owned() }));
+    running.live.ask(Ask::Hangup { room_id: ROOM.into() });
+    std::thread::sleep(Duration::from_millis(1000));
+}
+
+#[test]
+fn a_join_with_audio_the_server_refuses_says_why_and_stops_mediad() {
+    with_mediad();
+    let fake = fake_with("up", &[], |_, mut conn| {
+        conn.send(ready(1, &[ME], json!([])));
+        for code in ["bad_sdp", "media_unavailable"] {
+            let join = conn.next(Duration::from_secs(10)).expect("a join");
+            assert!(join["sdp"].is_string());
+            conn.send(json!({"type": "error", "ref": join["ref"], "code": code}));
+        }
+        conn.idle(Duration::from_secs(5));
+    });
+    let running = run(&fake.base, QUICK);
+    until("connected", || running.link().0 == Link::Connected);
+    until("the health read", || !running.live.seats_only());
+    for words in ["The server couldn't use tinyclient's audio setup.", "This server's audio isn't available. Try again later."] {
+        assert_eq!(running.ask(|reply| Ask::Join { room_id: ROOM.into(), reply }), Err(words.to_owned()));
+        until("no call left behind", || running.hub.calls.describe().0.is_none());
+    }
+}
+
+#[test]
+fn after_a_restart_a_call_with_audio_joins_again_with_a_fresh_offer() {
+    with_mediad();
+    let (said, heard) = channel();
+    let fake = fake_with("up", &[], move |n, mut conn| {
+        conn.send(ready(1, &[ME], json!([])));
+        match n {
+            0 => {
+                let join = answer_join(&mut conn, "c-1");
+                let _ = said.send(join["sdp"].as_str().unwrap_or("").to_owned());
+                conn.idle(Duration::from_millis(200));
+                conn.close(1012);
+            }
+            _ => {
+                let join = answer_join(&mut conn, "c-2");
+                let _ = said.send(join["sdp"].as_str().unwrap_or("").to_owned());
+                conn.idle(Duration::from_secs(5));
+            }
+        }
+    });
+    let running = run(&fake.base, QUICK);
+    until("connected", || running.link().0 == Link::Connected);
+    until("the health read", || !running.live.seats_only());
+    assert_eq!(running.ask(|reply| Ask::Join { room_id: ROOM.into(), reply }), Ok(()));
+    let first = heard.recv_timeout(Duration::from_secs(5)).expect("the first offer");
+    let again = heard.recv_timeout(Duration::from_secs(10)).expect("the offer after the restart");
+    let ufrag = |sdp: &str| sdp.lines().find(|line| line.starts_with("a=ice-ufrag:")).map(str::to_owned);
+    assert_ne!(ufrag(&first), ufrag(&again), "a new media session");
+    until("the seat again", || running.in_room(ROOM) == ["Ada"]);
+    let call = the_call(&running).expect("the same call goes on");
+    assert!(!matches!(call.state, protocol::CallState::Failed { .. }), "{:?}", call.state);
 }
 
 #[test]

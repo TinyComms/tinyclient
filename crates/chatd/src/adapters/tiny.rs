@@ -7,7 +7,9 @@
 //!
 //! Each account holds one live socket (`live`): presence, who is in each room's call, and the
 //! events that keep the server page current. A room is a voice channel, and joining it takes a
-//! seat over that socket. There is no sound yet: no conversations, no media, no WebRTC stack.
+//! seat over that socket. On a server whose audio is up the seat carries audio: chatd's one call
+//! runs mediad, which holds the WebRTC stack, and the socket carries its offer and answer. There
+//! are no conversations.
 
 pub(crate) mod live;
 pub mod signin;
@@ -600,7 +602,7 @@ pub(crate) fn community(hub: &Hub, account: AccountKey) -> Response {
             room.participants = inside
                 .people
                 .into_iter()
-                .map(|occupant| TinySeat { user_id: occupant.person.id, muted: occupant.muted, deafened: occupant.deafened })
+                .map(|occupant| TinySeat { user_id: occupant.person.id, muted: occupant.muted, deafened: occupant.deafened, speaking: occupant.speaking })
                 .collect();
         }
     }
@@ -881,6 +883,9 @@ pub(crate) fn start_with(ctx: Context, session: &str, inbox: Receiver<Command>, 
                 |_| {},
                 |command| match command {
                     Command::Tiny(ask) => live.ask(ask),
+                    // chatd's call in a room ended (hung up, or failed), or its mute changed.
+                    Command::CallLeave(room_id) => live.ask(live::Ask::Hangup { room_id }),
+                    Command::CallAudio { muted, deafened } => live.ask(live::Ask::State { muted, deafened }),
                     Command::SignOut(reply) => {
                         delete_session(&saved);
                         let _ = reply.send(Ok(()));
@@ -1286,14 +1291,14 @@ pub(crate) mod tests {
         });
         let hub = test_hub();
         with_session(&base, "owner", |account| {
-            let seat = protocol::Occupant { person: Key::new(&account, BEA), name: "Bea".into(), muted: true, deafened: false, streaming: false };
+            let seat = protocol::Occupant { person: Key::new(&account, BEA), name: "Bea".into(), muted: true, deafened: false, speaking: false, streaming: false };
             hub.set_occupants(Key::new(&account, LOBBY), protocol::Occupants { people: vec![seat], total: 1 });
             hub.set_presence(Key::new(&account, BEA), Presence::Online, "", true);
             match community(&hub, account) {
                 Response::TinyCommunity { community } => {
                     assert_eq!(community.rooms.len(), 2);
                     assert_eq!(community.rooms[0].name, "Lobby");
-                    assert_eq!(community.rooms[0].participants, [TinySeat { user_id: BEA.into(), muted: true, deafened: false }]);
+                    assert_eq!(community.rooms[0].participants, [TinySeat { user_id: BEA.into(), muted: true, deafened: false, speaking: false }]);
                     assert_eq!(community.media, "up");
                     assert!(community.rooms[1].participants.is_empty());
                     assert_eq!(community.online, [BEA]);

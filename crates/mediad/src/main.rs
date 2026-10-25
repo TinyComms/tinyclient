@@ -1,5 +1,5 @@
 use mediad::session::{self, Controls};
-use mediad::{audio, out, permission};
+use mediad::{audio, out, permission, tiny};
 use protocol::{
     media_process_needed, read_frame, Content, Direction, MediaRequest, MediaResponse, VideoStream,
     DEVICES_LIMIT,
@@ -19,6 +19,7 @@ const ENGINE_LINKED: bool = true;
 const DEVICES_EVERY: Duration = Duration::from_secs(2);
 
 const NO_VIDEO: &str = "Screen sharing and video are not built yet. This call carries voice only.";
+const ENGINE: &str = "The call engine could not start. Try again.";
 
 /// macOS reads the reason for the microphone prompt from the Info.plist of the process it holds
 /// responsible. Inside `tinyclient.app` that is the app, whose Info.plist says it. When mediad is
@@ -66,6 +67,10 @@ struct Call {
     video: Video,
     controls: Arc<Controls>,
     voice: Option<JoinHandle<()>>,
+    /// A Tiny server call's offer, out with the server and not yet answered.
+    offer: Option<tiny::Offer>,
+    /// Our user id on that server, and whether the call running is one.
+    tiny: Option<String>,
 }
 
 impl Call {
@@ -106,7 +111,7 @@ impl Call {
                     Ok(voice) => self.voice = Some(voice),
                     Err(err) => {
                         eprintln!("mediad: the voice thread did not start: {err}");
-                        return MediaResponse::Refused { detail: "The call engine could not start. Try again.".to_owned() };
+                        return MediaResponse::Refused { detail: ENGINE.to_owned() };
                     }
                 }
                 return MediaResponse::Done;
@@ -134,6 +139,64 @@ impl Call {
             }
             MediaRequest::Cue { cue } => {
                 self.controls.cue(cue);
+                return MediaResponse::Done;
+            }
+            // A fresh offer for a Tiny call already running is its rejoin: the call keeps its
+            // devices and carries on with the new connection once the answer comes.
+            MediaRequest::TinyOffer(spec) => {
+                if self.voice.is_some() && self.tiny.is_none() {
+                    return MediaResponse::Refused { detail: "This call is already connecting.".to_owned() };
+                }
+                if self.voice.is_none() {
+                    self.controls.muted.store(spec.muted, Ordering::Relaxed);
+                    self.controls.deafened.store(spec.deafened, Ordering::Relaxed);
+                }
+                return match tiny::Offer::new(&spec) {
+                    Ok(offer) => {
+                        let sdp = offer.sdp().to_owned();
+                        self.offer = Some(offer);
+                        self.tiny = Some(spec.user_id);
+                        MediaResponse::Offer { sdp }
+                    }
+                    Err(err) => {
+                        eprintln!("mediad: the offer could not be made: {err}");
+                        MediaResponse::Refused { detail: ENGINE.to_owned() }
+                    }
+                };
+            }
+            MediaRequest::TinyAnswer { sdp } => {
+                let Some(offer) = self.offer.take() else {
+                    return MediaResponse::Refused { detail: "No offer is waiting for an answer.".to_owned() };
+                };
+                let link = match offer.accept(&sdp) {
+                    Ok(link) => link,
+                    Err(err) => {
+                        eprintln!("mediad: the server's answer was refused: {err}");
+                        return MediaResponse::Refused { detail: "The server's audio setup didn't work with tinyclient. Try again.".to_owned() };
+                    }
+                };
+                if self.voice.is_some() {
+                    self.controls.tiny_rejoin(link);
+                    return MediaResponse::Done;
+                }
+                self.video = Video::default();
+                let (controls, user_id) = (self.controls.clone(), self.tiny.clone().unwrap_or_default());
+                let spawned = std::thread::Builder::new().name("tiny".to_owned()).spawn(move || {
+                    tiny::run(link, user_id, controls);
+                    eprintln!("mediad: call over, exiting");
+                    std::process::exit(0);
+                });
+                match spawned {
+                    Ok(voice) => self.voice = Some(voice),
+                    Err(err) => {
+                        eprintln!("mediad: the call thread did not start: {err}");
+                        return MediaResponse::Refused { detail: ENGINE.to_owned() };
+                    }
+                }
+                return MediaResponse::Done;
+            }
+            MediaRequest::TinySlots { audio } => {
+                self.controls.tiny_slots(audio);
                 return MediaResponse::Done;
             }
             MediaRequest::Devices { input, output } => {

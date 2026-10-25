@@ -290,6 +290,7 @@ impl Discord {
                     muted: heard.muted,
                     deafened: heard.deafened,
                     streaming: heard.streaming,
+                    speaking: false,
                 });
                 let people: Vec<Occupant> = people.collect();
                 state.voice.told.insert(channel.clone(), guild);

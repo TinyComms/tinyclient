@@ -12,7 +12,7 @@ use crate::hub::{now, Hub};
 use protocol::settings::{INPUT, JOIN_MUTED, OUTPUT};
 use protocol::{
     clip, read_frame, write_frame, Call, CallFailure, CallState, Change, Cue, Key, MediaRequest,
-    MediaResponse, Participant, VoiceJoin, DEVICES_LIMIT, OCCUPANTS_LIMIT,
+    MediaResponse, Participant, TinyOffer, TinySlot, VoiceJoin, DEVICES_LIMIT, OCCUPANTS_LIMIT,
 };
 use std::io::{self, BufReader};
 use std::path::PathBuf;
@@ -50,6 +50,8 @@ pub const NO_ANSWER: &str = "Nobody picked up.";
 const ENGINE_STOPPED: &str = "The call engine stopped.";
 const ENGINE_SILENT: &str = "The call engine stopped answering. Try again.";
 const ENGINE_MISSING: &str = "The call engine could not start. Reinstall tinyclient, then try again.";
+/// A Tiny server call asked for while another network's call is up.
+pub const IN_ANOTHER_CALL: &str = "Leave the call you're in first.";
 
 /// Why starting or asking the call engine failed. Debug, so a test can name one.
 #[derive(Debug)]
@@ -312,9 +314,11 @@ impl Live {
                 self.call.outputs = outputs;
             }
             MediaResponse::Source { .. } => return false,
-            MediaResponse::Ready { .. } | MediaResponse::Streams { .. } | MediaResponse::Done | MediaResponse::Refused { .. } => {
-                return false
-            }
+            MediaResponse::Ready { .. }
+            | MediaResponse::Streams { .. }
+            | MediaResponse::Done
+            | MediaResponse::Offer { .. }
+            | MediaResponse::Refused { .. } => return false,
         }
         true
     }
@@ -896,6 +900,91 @@ impl Calls {
             let detail = if err.kind() == io::ErrorKind::Other { err.to_string() } else { ENGINE_SILENT.to_owned() };
             self.set_state(hub, conversation, failed(CallFailure::Engine, detail));
         }
+    }
+}
+
+impl Calls {
+    /// A Tiny server call: mediad makes the offer for the room `conversation` names, started
+    /// first if it is not running for that room. The same room again is a rejoin, and keeps the
+    /// call. A Tiny call in another room of the same account gives way, since the server moves
+    /// the seat; any other call is in the way. What failed is said in words.
+    pub fn tiny_offer(&self, hub: &Arc<Hub>, conversation: &Key, mut offer: TinyOffer) -> Result<String, String> {
+        let (call, running) = self.describe();
+        let here = call.as_ref().is_some_and(|call| call.conversation == *conversation) && running;
+        if !here {
+            match call {
+                Some(call) if running && call.conversation.account() != conversation.account() => return Err(IN_ANOTHER_CALL.to_owned()),
+                Some(call) if running => drop(self.end_if(hub, &call.conversation)),
+                _ => {}
+            }
+            self.start(hub, conversation.clone()).map_err(|err| match err {
+                CallError::Active => IN_ANOTHER_CALL.to_owned(),
+                CallError::NoCall => ENGINE_STOPPED.to_owned(),
+                CallError::Media(err) => err.to_string(),
+            })?;
+        }
+        self.update(hub, conversation, |live| {
+            offer.muted = live.call.muted;
+            offer.deafened = live.call.deafened;
+            live.me = offer.user_id.clone();
+        });
+        match self.request(hub, &MediaRequest::TinyOffer(offer)) {
+            Ok(MediaResponse::Offer { sdp }) => Ok(sdp),
+            answer => {
+                eprintln!("chatd: mediad made no offer: {answer:?}");
+                if !here {
+                    self.end_if(hub, conversation);
+                }
+                Err(match answer {
+                    Err(CallError::Media(err)) if err.kind() == io::ErrorKind::Other => err.to_string(),
+                    _ => ENGINE_SILENT.to_owned(),
+                })
+            }
+        }
+    }
+
+    /// The server's answer to the last offer. From here the wait is for mediad to connect.
+    pub fn tiny_answer(&self, hub: &Hub, conversation: &Key, sdp: String) {
+        let known = self.update(hub, conversation, |live| {
+            live.joining = true;
+            live.since = Instant::now();
+        });
+        if !known {
+            return;
+        }
+        if let Err(CallError::Media(err)) = self.request(hub, &MediaRequest::TinyAnswer { sdp }) {
+            eprintln!("chatd: mediad did not take the answer: {err}");
+            let detail = if err.kind() == io::ErrorKind::Other { err.to_string() } else { ENGINE_SILENT.to_owned() };
+            self.set_state(hub, conversation, failed(CallFailure::Engine, detail));
+        }
+    }
+
+    /// Who each receive slot carries, for the call in `conversation`.
+    pub fn tiny_slots(&self, hub: &Hub, conversation: &Key, audio: Vec<TinySlot>) {
+        let (call, running) = self.describe();
+        if running && call.is_some_and(|call| call.conversation == *conversation) {
+            let _ = self.request(hub, &MediaRequest::TinySlots { audio });
+        }
+    }
+
+    /// Ends the call if it is in `conversation`, in whatever state, without telling the
+    /// adapter: the network already knows. True if there was one.
+    pub fn end_if(&self, hub: &Hub, conversation: &Key) -> bool {
+        let ended = {
+            let mut slot = crate::hub::lock(&self.slot);
+            let here = match &*slot {
+                Slot::Idle => false,
+                Slot::Shown(live) => live.call.conversation == *conversation,
+                Slot::Active(active) => crate::hub::lock(&active.live).call.conversation == *conversation,
+            };
+            if !here {
+                return false;
+            }
+            std::mem::take(&mut *slot)
+        };
+        drop(ended);
+        self.tell(hub);
+        true
     }
 }
 

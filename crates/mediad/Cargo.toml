@@ -24,6 +24,13 @@ unsafe-libopus = "=0.2.0"
 # CoreAudio capture and playback, and device enumeration.
 cpal = "0.18"
 rand = "0.8"
+# Tiny server calls: WebRTC (ICE, DTLS-SRTP, RTP) as a sans-IO library this process drives from
+# its own loop. Pinned to the version tinyserver's SFU runs, and bumped with it. RustCrypto, so
+# the same pure-Rust code on every platform: no OpenSSL, no C toolchain, no second TLS stack.
+str0m = { version = "=0.24.1", default-features = false, features = ["rust-crypto"] }
+# Readiness on the call's UDP socket and its ICE-TCP streams. No runtime; already in the tree
+# through chatd's tokio.
+mio = { version = "1", features = ["os-poll", "net"] }
 # Reading voice messages and audio files for `--play`: the containers (Ogg, WebM, MP4, WAV) and
 # every codec but Opus, which goes to the libopus above. Pure Rust, so no system library and
 # the same on every platform; it lives here so neither the window nor chatd links a codec.

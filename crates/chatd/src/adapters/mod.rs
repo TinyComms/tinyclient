@@ -918,6 +918,33 @@ impl Context {
         self.hub.calls.set_participants(&self.hub, &self.key(conversation_id), participants);
     }
 
+    /// A Tiny server call: mediad's offer for this room, with mediad started for it first. A
+    /// rejoin of the room the call is in keeps the call.
+    pub fn tiny_offer(&self, conversation_id: &str, offer: protocol::TinyOffer) -> Result<String, String> {
+        self.hub.calls.tiny_offer(&self.hub, &self.key(conversation_id), offer)
+    }
+
+    /// The server's answer to that offer: mediad connects with it.
+    pub fn tiny_answer(&self, conversation_id: &str, sdp: String) {
+        self.hub.calls.tiny_answer(&self.hub, &self.key(conversation_id), sdp);
+    }
+
+    /// Whose voice each receive slot carries.
+    pub fn tiny_slots(&self, conversation_id: &str, audio: Vec<protocol::TinySlot>) {
+        self.hub.calls.tiny_slots(&self.hub, &self.key(conversation_id), audio);
+    }
+
+    /// The call in this room is over and the network already knows: mediad goes, quietly.
+    pub fn call_over(&self, conversation_id: &str) -> bool {
+        self.hub.calls.end_if(&self.hub, &self.key(conversation_id))
+    }
+
+    /// The call is up for this conversation, with its mediad.
+    pub fn in_call(&self, conversation_id: &str) -> bool {
+        let (call, running) = self.hub.calls.describe();
+        running && call.is_some_and(|call| call.conversation == self.key(conversation_id))
+    }
+
     pub fn call_failed(&self, conversation_id: &str, reason: CallFailure, detail: &str) {
         let failed = CallState::Failed {
             reason,
