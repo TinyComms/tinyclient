@@ -328,6 +328,14 @@ impl Shell {
 
     /// Goes to a mode, remembering where the user was.
     pub(super) fn go(&mut self, mode: Mode, cx: &mut Context<Self>) {
+        // Tiny has no chats. A conversation left open from another network keeps the
+        // server page from drawing, so invite and member controls never appear.
+        if matches!(mode, Mode::Network(Network::Tiny)) {
+            self.open = None;
+            if let Some(snapshot) = &mut self.snapshot {
+                snapshot.open = None;
+            }
+        }
         if self.sidebar_state.mode == mode {
             let state = &mut self.sidebar_state;
             // Clicking the lit place leaves a drill and scrolls its list to the top.
@@ -1371,24 +1379,9 @@ impl Shell {
         match &state.mode {
             Mode::People => div().into_any_element(),
             Mode::Inbox => self.inbox_list(window, cx),
-            // No rooms. People on this server are drawn in the window, not as channels.
+            // No rooms. The people are this list. The pane is the invite or the person you pick.
             Mode::Network(Network::Tiny) => match snapshot.link(Network::Tiny) {
-                Link::Connected => div()
-                    .size_full()
-                    .px(px(24.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        div()
-                            .max_w(px(220.))
-                            .text_center()
-                            .whitespace_normal()
-                            .type_ui()
-                            .text_color(theme::text_soft())
-                            .child("People on this server are in the window."),
-                    )
-                    .into_any_element(),
+                Link::Connected => self.tiny_directory(cx),
                 Link::Offline => empty("icons/wifi-off.svg", "Tiny server is offline", "It shows up here once it connects."),
                 _ => empty("icons/users.svg", "Tiny server", "Sign in to see who's here."),
             },

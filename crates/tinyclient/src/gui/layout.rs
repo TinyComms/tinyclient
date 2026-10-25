@@ -867,13 +867,19 @@ impl Render for Shell {
                 self.sidebar(snapshot, width, window, cx).child(self.resize_handle(Edge::Sidebar, cx))
             }))
             .when(list_alone, |root| {
-                root.child(self.sidebar(snapshot, width - RAIL_WIDTH, window, cx))
+                // A narrow window has no pane beside the list. Tiny draws its people in the
+                // page, since the sidebar is not there.
+                if matches!(self.sidebar_state.mode, super::sidebar::Mode::Network(Network::Tiny)) && self.tiny_open() {
+                    root.child(div().flex_1().min_w_0().h_full().child(self.tiny_page(false, window, cx)))
+                } else {
+                    root.child(self.sidebar(snapshot, width - RAIL_WIDTH, window, cx))
+                }
             })
             .when(!replaced && !list_alone, |root| {
                 let pane = match (&snapshot.open, self.keychain_state(window, cx)) {
                     (_, Some(waiting)) => waiting,
                     (Some(_), None) => self.conversation(snapshot, window, cx),
-                    (None, None) if self.tiny_open() => self.tiny_page(window, cx),
+                    (None, None) if self.tiny_open() => self.tiny_page(plan.sidebar.is_some() || floating, window, cx),
                     (None, None) => self.nothing_open(window, cx),
                 };
                 root.child(div().flex_1().min_w_0().h_full().child(pane))

@@ -450,6 +450,7 @@ pub(crate) fn community(account: AccountKey) -> Response {
             members,
             invites,
             audit,
+            origin: saved.base_url,
         },
     }
 }
@@ -470,7 +471,11 @@ pub(crate) fn invite(account: AccountKey, role: String) -> Response {
     ) {
         Err(detail) => refused(detail),
         Ok((201, body)) => match serde_json::from_value::<TinyCode>(body) {
-            Ok(code) => Response::TinyCode { code },
+            Ok(mut code) => {
+                // The server's token stays raw. The origin is what the other tinyclient unpacks.
+                code.origin = saved.base_url;
+                Response::TinyCode { code }
+            }
             Err(_) => refused(UNREADABLE),
         },
         Ok((status, body)) => refused(explain(status, &body, Missing::Plain)),
@@ -771,6 +776,7 @@ pub(crate) mod tests {
         with_session(&base, "member", |account| match community(account) {
             Response::TinyCommunity { community } => {
                 assert_eq!(community.role, "member");
+                assert_eq!(community.origin, base);
                 assert_eq!(community.members.len(), 1);
                 assert_eq!(community.members[0].display_name, "Ada");
                 assert_eq!(community.members[0].email, "ada@example.com");
@@ -878,6 +884,7 @@ pub(crate) mod tests {
             match invite(account.clone(), "member".into()) {
                 Response::TinyCode { code } => {
                     assert_eq!(code.token, "invite-token");
+                    assert_eq!(code.origin, base);
                     assert_eq!(code.id, "inv1");
                     assert_eq!(code.role, "member");
                     assert_eq!(code.expires_at, "2026-01-01T00:00:00Z");

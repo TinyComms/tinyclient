@@ -1,6 +1,8 @@
-//! Signing in to a Tiny server the owner already runs: the address, then the email, then the
-//! password. Nothing is kept until `POST /v1/session` answers 200. The password and the bearer
-//! are not logged. One sign-in at a time, in memory; closing the sheet drops it.
+//! Signing in to a Tiny server. A new person pastes one code: it carries the server, then they
+//! choose a name, an email, and a password (`POST /v1/invites/accept`). Someone who already has
+//! an account types the host, the email, and the password (`POST /v1/session`). Nothing is kept
+//! until that answer is 200. The password, the code, and the bearer are not logged. One sign-in
+//! at a time, in memory; closing the sheet drops it.
 
 use super::{post_accept, post_session, Fault};
 use crate::hub::Hub;
@@ -16,6 +18,8 @@ struct Flow {
     code: String,
     display_name: String,
     joining: bool,
+    /// The address was typed before the code. Back from that code returns to the address.
+    address_first: bool,
     step: SignInStep,
     adopt: Adopt,
 }
@@ -110,6 +114,14 @@ fn port_ok(port: &str) -> bool {
     port.parse::<u16>().is_ok_and(|port| port > 0)
 }
 
+/// Shown on the password step while a code is creating the account.
+const JOIN_PASSWORD: &str = "Choose a password of 12 to 128 characters. This creates your account.";
+
+/// A server token on its own: no origin wrapped around it.
+fn bare_token(raw: &str) -> bool {
+    !raw.is_empty() && raw.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 /// One `@`, something on each side, and no whitespace.
 pub(crate) fn email_ok(raw: &str) -> bool {
     let email = raw.trim();
@@ -137,14 +149,18 @@ pub fn step(
                 code: String::new(),
                 display_name: String::new(),
                 joining: false,
-                step: SignInStep::Server { problem: None },
+                address_first: false,
+                step: SignInStep::Invite {
+                    server: String::new(),
+                    problem: None,
+                },
                 adopt,
             });
         }
-        return Ok(held
-            .as_ref()
-            .map(|flow| flow.step.clone())
-            .unwrap_or(SignInStep::Server { problem: None }));
+        return Ok(held.as_ref().map(|flow| flow.step.clone()).unwrap_or(SignInStep::Invite {
+            server: String::new(),
+            problem: None,
+        }));
     };
     let Some(flow) = held.as_mut() else {
         return Ok(SignInStep::Failed {
@@ -166,11 +182,13 @@ pub fn cancel() {
 impl Flow {
     fn answer(&mut self, input: SignInInput) -> SignInStep {
         let joining = self.joining;
-        let next = match (&self.step, input) {
+        let step = self.step.clone();
+        let next = match (step, input) {
             (SignInStep::Server { .. }, SignInInput::Server { url }) => match base_url(&url) {
                 Some(server) => {
                     self.server = server.clone();
                     self.joining = false;
+                    self.address_first = true;
                     SignInStep::Email {
                         server,
                         problem: None,
@@ -180,10 +198,13 @@ impl Flow {
                     problem: Some(SignInProblem::UrlInvalid),
                 },
             },
+            (SignInStep::Server { .. }, SignInInput::Back) => self.fresh_code(),
+            (SignInStep::Server { .. }, SignInInput::HaveCode { url }) if url.trim().is_empty() => self.fresh_code(),
             (SignInStep::Server { .. }, SignInInput::HaveCode { url }) => match base_url(&url) {
                 Some(server) => {
                     self.server = server.clone();
                     self.joining = true;
+                    self.address_first = true;
                     SignInStep::Invite {
                         server,
                         problem: None,
@@ -193,24 +214,21 @@ impl Flow {
                     problem: Some(SignInProblem::UrlInvalid),
                 },
             },
-            (SignInStep::Invite { .. }, SignInInput::Invite { code }) => {
-                let code = code.trim();
-                if code.is_empty() {
-                    SignInStep::Invite {
-                        server: self.server.clone(),
-                        problem: Some(SignInProblem::Other {
-                            reason: "Paste the code you were given.".to_owned(),
-                        }),
-                    }
+            (SignInStep::Invite { .. }, SignInInput::HaveCode { url }) if url.trim().is_empty() => {
+                self.joining = false;
+                self.code.clear();
+                SignInStep::Server { problem: None }
+            }
+            (SignInStep::Invite { .. }, SignInInput::Invite { code }) => self.take_code(&code),
+            (SignInStep::Invite { .. }, SignInInput::Back) => {
+                if self.address_first {
+                    self.code.clear();
+                    self.joining = false;
+                    SignInStep::Server { problem: None }
                 } else {
-                    self.code = code.to_owned();
-                    SignInStep::Name {
-                        server: self.server.clone(),
-                        problem: None,
-                    }
+                    self.fresh_code()
                 }
             }
-            (SignInStep::Invite { .. }, SignInInput::Back) => SignInStep::Server { problem: None },
             (SignInStep::Name { .. }, SignInInput::Name { name }) => {
                 let name = name.trim();
                 if name.is_empty() || name.chars().count() > 80 {
@@ -236,7 +254,7 @@ impl Flow {
                 if email_ok(&email) {
                     self.email = email.trim().to_owned();
                     SignInStep::Password {
-                        hint: String::new(),
+                        hint: if joining { JOIN_PASSWORD.to_owned() } else { String::new() },
                         problem: None,
                     }
                 } else {
@@ -268,6 +286,59 @@ impl Flow {
         next
     }
 
+    fn fresh_code(&mut self) -> SignInStep {
+        self.server.clear();
+        self.code.clear();
+        self.joining = false;
+        self.address_first = false;
+        SignInStep::Invite {
+            server: String::new(),
+            problem: None,
+        }
+    }
+
+    fn take_code(&mut self, raw: &str) -> SignInStep {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return self.bad_code("Paste the code you were given.");
+        }
+        let compact: String = trimmed.chars().filter(|c| !c.is_whitespace()).collect();
+        if let Some((origin, token)) = protocol::unpack_join(&compact) {
+            return match base_url(&origin) {
+                Some(server) => {
+                    self.server = server.clone();
+                    self.code = token;
+                    self.joining = true;
+                    self.address_first = false;
+                    SignInStep::Name {
+                        server,
+                        problem: None,
+                    }
+                }
+                None => self.bad_code("That code doesn't work. Ask for a new one."),
+            };
+        }
+        if !self.server.is_empty() && bare_token(trimmed) {
+            self.code = trimmed.to_owned();
+            self.joining = true;
+            return SignInStep::Name {
+                server: self.server.clone(),
+                problem: None,
+            };
+        }
+        if bare_token(&compact) {
+            return self.bad_code("That code has no server in it. Ask for a new one.");
+        }
+        self.bad_code("That code doesn't work. Ask for a new one.")
+    }
+
+    fn bad_code(&self, reason: &str) -> SignInStep {
+        SignInStep::Invite {
+            server: self.server.clone(),
+            problem: Some(SignInProblem::Other { reason: reason.to_owned() }),
+        }
+    }
+
     fn submit(&self, password: &str) -> SignInStep {
         let again = |problem| SignInStep::Password {
             hint: String::new(),
@@ -286,7 +357,7 @@ impl Flow {
 
     fn accept(&self, password: &str) -> SignInStep {
         let again = |problem| SignInStep::Password {
-            hint: String::new(),
+            hint: JOIN_PASSWORD.to_owned(),
             problem: Some(problem),
         };
         let length = password.chars().count();
@@ -387,6 +458,18 @@ mod tests {
         let hub = hub();
         assert_eq!(
             step(&hub, None, adopt()).unwrap(),
+            SignInStep::Invite {
+                server: String::new(),
+                problem: None
+            }
+        );
+        assert_eq!(
+            step(
+                &hub,
+                Some(SignInInput::HaveCode { url: String::new() }),
+                adopt()
+            )
+            .unwrap(),
             SignInStep::Server { problem: None }
         );
         assert_eq!(
@@ -612,6 +695,18 @@ mod tests {
                 }),
             )
             .unwrap(),
+            SignInStep::Invite {
+                server: String::new(),
+                problem: None
+            }
+        );
+        assert_eq!(
+            step(
+                &hub,
+                Some(SignInInput::HaveCode { url: String::new() }),
+                adopt()
+            )
+            .unwrap(),
             SignInStep::Server { problem: None }
         );
         assert_eq!(
@@ -626,6 +721,22 @@ mod tests {
             SignInStep::Server {
                 problem: Some(SignInProblem::UrlInvalid)
             }
+        );
+        assert_eq!(
+            step(
+                &hub,
+                Some(SignInInput::HaveCode { url: base.clone() }),
+                adopt()
+            )
+            .unwrap(),
+            SignInStep::Invite {
+                server: base.clone(),
+                problem: None
+            }
+        );
+        assert_eq!(
+            step(&hub, Some(SignInInput::Back), adopt()).unwrap(),
+            SignInStep::Server { problem: None }
         );
         assert_eq!(
             step(
@@ -728,7 +839,7 @@ mod tests {
             )
             .unwrap(),
             SignInStep::Password {
-                hint: String::new(),
+                hint: JOIN_PASSWORD.to_owned(),
                 problem: None
             }
         );
@@ -743,7 +854,7 @@ mod tests {
             )
             .unwrap(),
             SignInStep::Password {
-                hint: String::new(),
+                hint: JOIN_PASSWORD.to_owned(),
                 problem: Some(SignInProblem::Other {
                     reason: "Use 12 to 128 characters.".into()
                 })
@@ -780,6 +891,137 @@ mod tests {
         assert_eq!(saved["role"], "member");
         assert_eq!(saved["base_url"], base);
         assert_eq!(saved["display_name"], "Ada");
+        cancel();
+    }
+
+    #[test]
+    fn a_pasted_code_opens_the_server_it_carries_and_the_server_gets_only_the_token() {
+        let _one = one_sheet();
+        cancel();
+        let hits = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = hits.clone();
+        let base = super::super::tests::serve(move |request| {
+            seen.lock().unwrap().push(request.to_owned());
+            if request.lines().next().unwrap_or("").starts_with("POST /v1/invites/accept ") {
+                return super::super::tests::http(
+                    200,
+                    "OK",
+                    r#"{"token":"tok_join","user_id":"22222222-2222-2222-2222-222222222222","email":"bea@example.com","display_name":"Bea","role":"admin"}"#,
+                );
+            }
+            super::super::tests::http(500, "Internal Server Error", r#"{"error":"no"}"#)
+        });
+        let token = "abcdefghijklmnopqrstuvwxyz0123456789-_ABC";
+        let packed = protocol::pack_join(&base, token).unwrap();
+        let wrapped = format!(" {packed}\n");
+        let hub = hub();
+        assert_eq!(
+            step(&hub, None, adopt()).unwrap(),
+            SignInStep::Invite {
+                server: String::new(),
+                problem: None
+            }
+        );
+        assert_eq!(
+            step(
+                &hub,
+                Some(SignInInput::Invite { code: token.to_owned() }),
+                adopt()
+            )
+            .unwrap(),
+            SignInStep::Invite {
+                server: String::new(),
+                problem: Some(SignInProblem::Other {
+                    reason: "That code has no server in it. Ask for a new one.".into()
+                })
+            }
+        );
+        assert_eq!(
+            step(
+                &hub,
+                Some(SignInInput::Invite {
+                    code: "https://example.com".into()
+                }),
+                adopt()
+            )
+            .unwrap(),
+            SignInStep::Invite {
+                server: String::new(),
+                problem: Some(SignInProblem::Other {
+                    reason: "That code doesn't work. Ask for a new one.".into()
+                })
+            }
+        );
+        assert_eq!(
+            step(&hub, Some(SignInInput::Invite { code: wrapped }), adopt()).unwrap(),
+            SignInStep::Name {
+                server: base.clone(),
+                problem: None
+            }
+        );
+        assert_eq!(
+            step(&hub, Some(SignInInput::Back), adopt()).unwrap(),
+            SignInStep::Invite {
+                server: base.clone(),
+                problem: None
+            }
+        );
+        assert_eq!(
+            step(&hub, Some(SignInInput::Back), adopt()).unwrap(),
+            SignInStep::Invite {
+                server: String::new(),
+                problem: None
+            }
+        );
+        assert_eq!(
+            step(
+                &hub,
+                Some(SignInInput::Invite {
+                    code: packed.clone()
+                }),
+                adopt()
+            )
+            .unwrap(),
+            SignInStep::Name {
+                server: base.clone(),
+                problem: None
+            }
+        );
+        step(
+            &hub,
+            Some(SignInInput::Name { name: "Bea".into() }),
+            adopt(),
+        )
+        .unwrap();
+        step(
+            &hub,
+            Some(SignInInput::Email {
+                email: "bea@example.com".into()
+            }),
+            adopt(),
+        )
+        .unwrap();
+        assert_eq!(
+            step(
+                &hub,
+                Some(SignInInput::Password {
+                    password: "correct-horse".into()
+                }),
+                adopt()
+            )
+            .unwrap(),
+            SignInStep::Done {
+                account: Some(AccountKey {
+                    network: Network::Tiny,
+                    account: "22222222-2222-2222-2222-222222222222".into(),
+                })
+            }
+        );
+        let sent = hits.lock().unwrap();
+        let body: serde_json::Value = serde_json::from_str(sent[0].split("\r\n\r\n").nth(1).unwrap_or("")).unwrap();
+        assert_eq!(body["token"], token);
+        assert!(!body["token"].as_str().unwrap_or("").contains("tc1."));
+        assert_eq!(body["display_name"], "Bea");
         cancel();
     }
 }
