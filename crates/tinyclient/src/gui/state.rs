@@ -330,6 +330,12 @@ impl Shell {
         call: Option<Call>,
         cx: &mut Context<Self>,
     ) {
+        let had = self.snapshot.is_some();
+        let known: Vec<AccountKey> = self
+            .snapshot
+            .iter()
+            .flat_map(|snapshot| snapshot.accounts.iter().map(|account| account.key.clone()))
+            .collect();
         let open = self.snapshot.take().and_then(|snapshot| snapshot.open);
         let links_before: Vec<(AccountKey, Link)> =
             self.snapshot.iter().flat_map(|s| s.accounts.iter().map(|a| (a.key.clone(), a.link))).collect();
@@ -347,7 +353,17 @@ impl Shell {
             }
         }
         let links_changed = links_before != accounts.iter().map(|a| (a.key.clone(), a.link)).collect::<Vec<_>>();
+        let arrived = had.then(|| {
+            accounts
+                .iter()
+                .filter(|account| account.key.network == Network::Tiny && !known.iter().any(|key| key == &account.key))
+                .map(|account| account.key.clone())
+                .last()
+        });
         self.snapshot = Some(Snapshot { networks, accounts, call, open });
+        if let Some(Some(account)) = arrived {
+            self.prefer_tiny(account, cx);
+        }
         if links_changed {
             self.composer_links_changed(cx);
         }

@@ -159,7 +159,7 @@ pub struct NetworkStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountStatus {
     pub key: AccountKey,
-    /// The workspace's name, or the user's own name where an account is a person.
+    /// The workspace's name, a Tiny server's host, or the user's own name where an account is a person.
     pub name: String,
     pub link: Link,
     /// Why the link is what it is, in words, when the network said.
