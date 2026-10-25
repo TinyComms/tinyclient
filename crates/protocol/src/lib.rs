@@ -1364,10 +1364,31 @@ pub enum Request {
         user_id: String,
         role: String,
     },
-    /// Removes one member.
+    /// Removes one member. The server ends their sessions.
     TinyRemove {
         account: AccountKey,
         user_id: String,
+    },
+    /// Revokes one invite nobody has accepted.
+    TinyRevoke {
+        account: AccountKey,
+        invite_id: String,
+    },
+    /// Changes this account's own display name on the server. The account stays named by its host.
+    TinyRename {
+        account: AccountKey,
+        display_name: String,
+    },
+    /// Changes this account's password. The server ends every other session; this one stays.
+    TinyPassword {
+        account: AccountKey,
+        current_password: TinySecret,
+        new_password: TinySecret,
+    },
+    /// Ends every session of this account on the server, this one too, then forgets it here as
+    /// `SignOut` does. Answers `Status`.
+    TinySignOutEverywhere {
+        account: AccountKey,
     },
 }
 

@@ -2,16 +2,17 @@
 //! one keychain item: a single object until a second server is added, then an array of them.
 //! Each account is started from its own object. Sign-in is the sheet's (`signin`), never
 //! `tinyclient-login`. This slice has no conversations, calls, or media, and does not load a
-//! WebRTC stack. A signed-in account can list members, invite, change a role, remove a member,
-//! and read the audit.
+//! WebRTC stack. A signed-in account can list members, invite, revoke an invite, change a role,
+//! remove a member, and read the audit. It can rename itself, change its password, and end every
+//! one of its sessions.
 
 pub mod signin;
 
 use super::{serve_commands, Command, Context, Signed};
 use crate::session;
 use protocol::{
-    join_host, tiny_can, AccountKey, ErrorCode, Link, Network, Response, TinyAudit, TinyCode,
-    TinyCommunity, TinyInvite, TinyMember,
+    join_host, tiny_can, tiny_name, tiny_password_fits, AccountKey, ErrorCode, Link, Network,
+    Response, TinyAudit, TinyCode, TinyCommunity, TinyInvite, TinyMember,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -375,11 +376,16 @@ fn delete_session(saved: &Saved) {
 const CHECK: &str = "That didn't work. Check it and try again.";
 const UNREADABLE: &str = "The server's answer could not be read.";
 const UNREACHABLE: &str = "Couldn't reach that server. Check the address and your connection.";
+const SIGNED_OUT: &str = "Tiny server signed you out.";
+const WRONG_PASSWORD: &str = "Your current password isn't right.";
+const PASSWORD_SIZE: &str = "A new password is 12 to 128 characters.";
+const NAME_SIZE: &str = "A name is 1 to 80 characters.";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Missing {
     Member,
     Code,
+    Invite,
     Plain,
 }
 
@@ -397,7 +403,7 @@ fn refused(detail: &str) -> Response {
 fn explain(status: u16, body: &Value, missing: Missing) -> &'static str {
     let code = body.get("error").and_then(Value::as_str).unwrap_or("");
     match (status, code) {
-        (401, _) => "Tiny server signed you out.",
+        (401, _) => SIGNED_OUT,
         (403, _) => "You can't do that.",
         (409, "last_owner") => "This server needs an owner. Make someone else the owner first.",
         (409, "already_member") => "That person is already on this server.",
@@ -406,6 +412,7 @@ fn explain(status: u16, body: &Value, missing: Missing) -> &'static str {
         (404, _) if missing == Missing::Code => {
             "That code doesn't work. It may have expired or already been used."
         }
+        (404, _) if missing == Missing::Invite => "That invite is gone or was already used.",
         (400, _) => CHECK,
         (429, _) => "Too many tries. Wait a minute, then try again.",
         (500..=599, _) => "The server had a problem. Try again in a moment.",
@@ -612,6 +619,90 @@ pub(crate) fn remove(account: AccountKey, user_id: String) -> Response {
         Err(detail) => refused(detail),
         Ok((204, _)) => Response::Ok,
         Ok((status, body)) => refused(explain(status, &body, Missing::Member)),
+    }
+}
+
+pub(crate) fn revoke(account: AccountKey, invite_id: String) -> Response {
+    let saved = match open(&account) {
+        Ok(saved) => saved,
+        Err(error) => return error,
+    };
+    if !tiny_can(&saved.role, "community.invites.revoke") {
+        return refused("You can't do that.");
+    }
+    if !safe_id(&invite_id) {
+        return refused(CHECK);
+    }
+    let path = format!("/v1/invites/{invite_id}");
+    match asked("DELETE", &saved, &path, None) {
+        Err(detail) => refused(detail),
+        Ok((204, _)) => Response::Ok,
+        Ok((status, body)) => refused(explain(status, &body, Missing::Invite)),
+    }
+}
+
+/// The display name others on the server see. The account itself stays named by its host.
+pub(crate) fn rename(account: AccountKey, display_name: String) -> Response {
+    let saved = match open(&account) {
+        Ok(saved) => saved,
+        Err(error) => return error,
+    };
+    let Some(name) = tiny_name(&display_name) else {
+        return refused(NAME_SIZE);
+    };
+    match asked(
+        "PATCH",
+        &saved,
+        "/v1/me",
+        Some(serde_json::json!({ "display_name": name })),
+    ) {
+        Err(detail) => refused(detail),
+        Ok((200, body)) => match serde_json::from_value::<MeAnswer>(body) {
+            Ok(me) if !me.display_name.is_empty() => Response::Ok,
+            _ => refused(UNREADABLE),
+        },
+        Ok((400, _)) => refused(NAME_SIZE),
+        Ok((status, body)) => refused(explain(status, &body, Missing::Plain)),
+    }
+}
+
+/// The server ends every other session. This one is kept, so nothing is forgotten here.
+pub(crate) fn change_password(account: AccountKey, current: String, new: String) -> Response {
+    let saved = match open(&account) {
+        Ok(saved) => saved,
+        Err(error) => return error,
+    };
+    if current.is_empty() {
+        return refused(WRONG_PASSWORD);
+    }
+    if !tiny_password_fits(&new) {
+        return refused(PASSWORD_SIZE);
+    }
+    match asked(
+        "POST",
+        &saved,
+        "/v1/me/password",
+        Some(serde_json::json!({ "current_password": current, "new_password": new })),
+    ) {
+        Err(detail) => refused(detail),
+        Ok((204, _)) => Response::Ok,
+        // A wrong current password is a 401 too. That one is not a sign-out.
+        Ok((401, body)) if body.get("error").and_then(Value::as_str) == Some("invalid_credentials") => {
+            refused(WRONG_PASSWORD)
+        }
+        Ok((400, _)) => refused(PASSWORD_SIZE),
+        Ok((status, body)) => refused(explain(status, &body, Missing::Plain)),
+    }
+}
+
+/// Ends every session of this account on the server. A 401 is already the same thing: the
+/// caller forgets the session either way.
+pub(crate) fn end_sessions(account: &AccountKey) -> Result<(), Response> {
+    let saved = open(account)?;
+    match asked("DELETE", &saved, "/v1/sessions", None) {
+        Err(detail) => Err(refused(detail)),
+        Ok((204, _)) | Ok((401, _)) => Ok(()),
+        Ok((status, body)) => Err(refused(explain(status, &body, Missing::Plain))),
     }
 }
 
@@ -829,20 +920,63 @@ pub(crate) mod tests {
         assert!(matches!(get_me(&saved), Err(Fault::Unauthorized)));
     }
 
+    /// The account routes against a tinyserver that is already serving, with the same three
+    /// variables. The name and the password are put back. It ends every session of that account.
+    #[test]
+    #[ignore]
+    fn live_account_round_trip() {
+        let base = std::env::var("TINY_LIVE_BASE").expect("TINY_LIVE_BASE");
+        let email = std::env::var("TINY_LIVE_EMAIL").expect("TINY_LIVE_EMAIL");
+        let password = std::env::var("TINY_LIVE_PASSWORD").expect("TINY_LIVE_PASSWORD");
+        let saved = match post_session(&base, &email, &password) {
+            Ok(saved) => saved,
+            Err(_) => panic!("open failed"),
+        };
+        let session = serde_json::to_string(&saved).unwrap();
+        let name = saved.display_name.clone();
+        let user_id = saved.user_id.clone();
+        with_saved(&session, &user_id, |account| {
+            assert_eq!(rename(account.clone(), "tinyclient live test".into()), Response::Ok);
+            assert_eq!(rename(account.clone(), name.clone()), Response::Ok);
+            assert_eq!(rename(account.clone(), "a".repeat(81)), refused(NAME_SIZE));
+
+            let wrong = change_password(account.clone(), "not the password".into(), "tinyclient-live-1".into());
+            assert_eq!(wrong, refused(WRONG_PASSWORD));
+            let temporary = "tinyclient-live-temporary";
+            assert_eq!(change_password(account.clone(), password.clone(), temporary.into()), Response::Ok);
+            assert_eq!(change_password(account.clone(), temporary.into(), password.clone()), Response::Ok);
+
+            let code = match invite(account.clone(), "member".into()) {
+                Response::TinyCode { code } => code,
+                other => panic!("invite: {other:?}"),
+            };
+            assert_eq!(revoke(account.clone(), code.id.clone()), Response::Ok);
+            assert_eq!(revoke(account.clone(), code.id), refused("That invite is gone or was already used."));
+
+            assert!(end_sessions(&account).is_ok());
+        });
+        assert!(matches!(get_me(&saved), Err(Fault::Unauthorized)));
+        assert!(post_session(&base, &email, &password).is_ok(), "the password was put back");
+    }
+
     fn with_session(base: &str, role: &str, run: impl FnOnce(AccountKey)) {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let name = format!("TINYCLIENT_SESSION_{}", Network::Tiny.label().to_uppercase());
         let user_id = "11111111-1111-1111-1111-111111111111";
         let session = format!(
             r#"{{"base_url":{base:?},"token":"t","user_id":{user_id:?},"email":"ada@example.com","display_name":"Ada","role":{role:?}}}"#
         );
+        with_saved(&session, user_id, run);
+    }
+
+    fn with_saved(session: &str, user_id: &str, run: impl FnOnce(AccountKey)) {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let name = format!("TINYCLIENT_SESSION_{}", Network::Tiny.label().to_uppercase());
         // Not the temp root. A file there is one the user picked, and anything under
         // TINYCLIENT_DIR is refused. These tests share a process with that check.
         let scratch = std::env::temp_dir().join(format!("tinyclient-tiny-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&scratch);
         let _dir = Restore::set("TINYCLIENT_DIR", &scratch);
-        let _session = Restore::set(&name, &session);
+        let _session = Restore::set(&name, session);
         match crate::session::read(Network::Tiny) {
             crate::session::Stored::Found(_) => {}
             crate::session::Stored::Absent => panic!("tiny session was absent ({name})"),
@@ -1047,6 +1181,142 @@ pub(crate) mod tests {
                 refused("That didn't work. Check it and try again.")
             );
             assert_eq!(quiet(), before);
+        });
+    }
+
+    /// Revoke, rename, password, and every session, with each error the server can give.
+    #[test]
+    fn the_account_routes_and_what_their_errors_say() {
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = log.clone();
+        let base = serve(move |request| {
+            seen.lock().unwrap().push(request.to_owned());
+            let first = request.lines().next().unwrap_or("");
+            let body = request.split("\r\n\r\n").nth(1).unwrap_or("");
+            if first.starts_with("DELETE /v1/invites/gone ") {
+                return http(404, "Not Found", r#"{"error":"not_found"}"#);
+            }
+            if first.starts_with("DELETE /v1/invites/theirs ") {
+                return http(403, "Forbidden", r#"{"error":"forbidden"}"#);
+            }
+            if first.starts_with("DELETE /v1/invites/") {
+                return http(204, "No Content", "");
+            }
+            if first.starts_with("PATCH /v1/me ") {
+                if body.contains("Long") {
+                    return http(400, "Bad Request", r#"{"error":"invalid"}"#);
+                }
+                if body.contains("Late") {
+                    return http(401, "Unauthorized", r#"{"error":"unauthorized"}"#);
+                }
+                return http(
+                    200,
+                    "OK",
+                    r#"{"user_id":"11111111-1111-1111-1111-111111111111","email":"ada@example.com","display_name":"Ada L","role":"owner"}"#,
+                );
+            }
+            if first.starts_with("POST /v1/me/password ") {
+                if body.contains("wrong-current") {
+                    return http(401, "Unauthorized", r#"{"error":"invalid_credentials"}"#);
+                }
+                if body.contains("ended-session") {
+                    return http(401, "Unauthorized", r#"{"error":"unauthorized"}"#);
+                }
+                if body.contains("server-says-no") {
+                    return http(400, "Bad Request", r#"{"error":"invalid"}"#);
+                }
+                if body.contains("too-many-tries") {
+                    return http(429, "Too Many Requests", r#"{"error":"slow_down"}"#);
+                }
+                return http(204, "No Content", "");
+            }
+            if first.starts_with("DELETE /v1/sessions ") {
+                return http(204, "No Content", "");
+            }
+            http(500, "Internal Server Error", r#"{"error":"no"}"#)
+        });
+        let refused = |detail: &str| Response::Error {
+            code: ErrorCode::Refused,
+            detail: detail.to_owned(),
+        };
+        let last = || log.lock().unwrap().last().cloned().unwrap_or_default();
+        let count = || log.lock().unwrap().len();
+        with_session(&base, "owner", |account| {
+            let id = "33333333-3333-3333-3333-333333333333";
+            assert_eq!(revoke(account.clone(), id.into()), Response::Ok);
+            assert!(last().starts_with(&format!("DELETE /v1/invites/{id} ")), "{}", last());
+            assert!(last().contains("Bearer t"));
+            assert_eq!(
+                revoke(account.clone(), "gone".into()),
+                refused("That invite is gone or was already used.")
+            );
+            assert_eq!(revoke(account.clone(), "theirs".into()), refused("You can't do that."));
+            let before = count();
+            assert_eq!(revoke(account.clone(), "a/b".into()), refused(CHECK));
+            assert_eq!(count(), before);
+
+            assert_eq!(rename(account.clone(), "  Ada L  ".into()), Response::Ok);
+            assert!(last().starts_with("PATCH /v1/me "));
+            assert_eq!(json_body(&last())["display_name"], "Ada L");
+            assert_eq!(rename(account.clone(), "Long".into()), refused(NAME_SIZE));
+            assert_eq!(rename(account.clone(), "Late".into()), refused(SIGNED_OUT));
+            let before = count();
+            assert_eq!(rename(account.clone(), "   ".into()), refused(NAME_SIZE));
+            assert_eq!(rename(account.clone(), "a".repeat(81)), refused(NAME_SIZE));
+            assert_eq!(count(), before);
+
+            let new = "a new password".to_owned();
+            assert_eq!(change_password(account.clone(), "old password!".into(), new.clone()), Response::Ok);
+            let posted = json_body(&last());
+            assert_eq!(posted["current_password"], "old password!");
+            assert_eq!(posted["new_password"], "a new password");
+            // The one 401 that is not a sign-out.
+            let wrong = change_password(account.clone(), "wrong-current".into(), new.clone());
+            assert_eq!(wrong, refused("Your current password isn't right."));
+            assert_ne!(wrong, refused(SIGNED_OUT));
+            assert_eq!(
+                change_password(account.clone(), "ended-session".into(), new.clone()),
+                refused(SIGNED_OUT)
+            );
+            assert_eq!(
+                change_password(account.clone(), "server-says-no".into(), new.clone()),
+                refused(PASSWORD_SIZE)
+            );
+            assert_eq!(
+                change_password(account.clone(), "too-many-tries".into(), new.clone()),
+                refused("Too many tries. Wait a minute, then try again.")
+            );
+            let before = count();
+            assert_eq!(change_password(account.clone(), "old password!".into(), "short".into()), refused(PASSWORD_SIZE));
+            assert_eq!(change_password(account.clone(), "old password!".into(), "x".repeat(129)), refused(PASSWORD_SIZE));
+            assert_eq!(change_password(account.clone(), String::new(), new.clone()), refused(WRONG_PASSWORD));
+            assert_eq!(count(), before);
+
+            assert!(end_sessions(&account).is_ok());
+            assert!(last().starts_with("DELETE /v1/sessions "));
+            assert!(last().contains("Bearer t"));
+        });
+        with_session(&base, "member", |account| {
+            let before = count();
+            assert_eq!(revoke(account.clone(), "33333333".into()), refused("You can't do that."));
+            assert_eq!(count(), before);
+        });
+    }
+
+    /// A session the server already ended is still forgotten; a failure is not.
+    #[test]
+    fn signing_out_everywhere_forgets_an_ended_session_and_keeps_one_on_a_failure() {
+        let ended = serve(|_| http(401, "Unauthorized", r#"{"error":"unauthorized"}"#));
+        with_session(&ended, "member", |account| assert!(end_sessions(&account).is_ok()));
+        let broken = serve(|_| http(500, "Internal Server Error", r#"{"error":"no"}"#));
+        with_session(&broken, "member", |account| {
+            assert_eq!(
+                end_sessions(&account).unwrap_err(),
+                refused("The server had a problem. Try again in a moment.")
+            );
+        });
+        with_session("http://127.0.0.1:9", "member", |account| {
+            assert_eq!(end_sessions(&account).unwrap_err(), refused(UNREACHABLE));
         });
     }
 
