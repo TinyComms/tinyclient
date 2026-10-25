@@ -70,6 +70,7 @@ struct Member {
 }
 
 struct OpenInvite {
+    id: String,
     role: String,
     expires: String,
 }
@@ -87,6 +88,7 @@ struct Ready {
     confirm: Option<String>,
     members: Vec<Member>,
     invites: Vec<OpenInvite>,
+    can_revoke: bool,
     /// `None` when this account cannot read the audit.
     audit: Option<Vec<String>>,
 }
@@ -312,7 +314,7 @@ impl Shell {
                 .invites
                 .iter()
                 .filter(|invite| invite.accepted_at.is_none())
-                .map(|invite| OpenInvite { role: role_word(&invite.role), expires: invite.expires_at.to_string() })
+                .map(|invite| OpenInvite { id: invite.id.clone(), role: role_word(&invite.role), expires: invite.expires_at.to_string() })
                 .collect()
         } else {
             Vec::new()
@@ -336,6 +338,7 @@ impl Shell {
             confirm: state.confirm.clone(),
             members,
             invites,
+            can_revoke: protocol::tiny_can(caller, "community.invites.revoke"),
             audit,
         })
     }
@@ -508,6 +511,13 @@ impl Shell {
         self.act(Request::TinyRemove { account, user_id }, cx);
     }
 
+    fn send_revoke(&mut self, invite_id: String, cx: &mut Context<Self>) {
+        let Some(account) = self.tiny_state.account.clone() else {
+            return;
+        };
+        self.act(Request::TinyRevoke { account, invite_id }, cx);
+    }
+
     fn copy_code(&mut self, cx: &mut Context<Self>) {
         let Some(token) = self.tiny_state.token.clone() else {
             return;
@@ -673,7 +683,7 @@ fn server_view(ready: &Ready, cx: &mut Context<Shell>) -> AnyElement {
         });
     let mut column = div().flex().flex_col().child(head);
     if !ready.invites.is_empty() {
-        column = column.child(invite_section(&ready.invites));
+        column = column.child(invite_section(&ready.invites, ready.can_revoke && !ready.busy, cx));
     }
     if let Some(rows) = &ready.audit {
         if !rows.is_empty() {
@@ -906,7 +916,7 @@ fn confirm_remove(name: &str, user_id: &str, cx: &mut Context<Shell>) -> Div {
         .flex_wrap()
         .items_center()
         .gap(px(8.))
-        .child(div().whitespace_normal().type_ui().text_color(theme::text()).child(format!("Remove {name} from this server?")))
+        .child(div().whitespace_normal().type_ui().text_color(theme::text()).child(format!("Remove {name} from this server? They are signed out at once.")))
         .child(
             button(format!("tiny-remove-yes-{user_id}"), ButtonKind::Danger, "Remove")
                 .on_click(cx.listener(move |this, _, _, cx| this.send_remove(remove_id.clone(), cx))),
@@ -914,8 +924,10 @@ fn confirm_remove(name: &str, user_id: &str, cx: &mut Context<Shell>) -> Div {
         .child(button(format!("tiny-remove-no-{user_id}"), ButtonKind::Secondary, "Cancel").on_click(cx.listener(|this, _, _, cx| this.cancel_remove(cx))))
 }
 
-fn invite_section(invites: &[OpenInvite]) -> Div {
+/// The invites nobody has used. Revoke is there for whoever may revoke, and quiet while busy.
+fn invite_section(invites: &[OpenInvite], revoke: bool, cx: &mut Context<Shell>) -> Div {
     div().mt(px(8.)).flex().flex_col().child(section_header("Invites", false)).children(invites.iter().map(|invite| {
+        let id = invite.id.clone();
         div()
             .px(px(theme::PANE_PAD))
             .h(px(theme::ROW_ONE))
@@ -923,7 +935,13 @@ fn invite_section(invites: &[OpenInvite]) -> Div {
             .items_center()
             .gap(px(8.))
             .child(div().type_ui().text_color(theme::text()).child(invite.role.clone()))
-            .child(div().type_small().text_color(theme::text_soft()).child(format!("Expires {}", short_day(&invite.expires))))
+            .child(div().flex_1().type_small().text_color(theme::text_soft()).child(format!("Expires {}", short_day(&invite.expires))))
+            .when(revoke, |row| {
+                row.child(
+                    button(format!("tiny-revoke-{}", invite.id), ButtonKind::Ghost, "Revoke")
+                        .on_click(cx.listener(move |this, _, _, cx| this.send_revoke(id.clone(), cx))),
+                )
+            })
     }))
 }
 

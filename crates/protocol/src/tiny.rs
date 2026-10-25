@@ -57,6 +57,33 @@ pub struct TinyCommunity {
     pub origin: String,
 }
 
+/// A password on its way to chatd. On the wire it is a plain string; it is never printed.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TinySecret(pub String);
+
+impl std::fmt::Debug for TinySecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("..")
+    }
+}
+
+/// The fewest and most bytes a Tiny server takes for a password.
+pub const TINY_PASSWORD: std::ops::RangeInclusive<usize> = 12..=128;
+/// The most characters in a display name, after trimming.
+pub const TINY_NAME_MAX: usize = 80;
+
+/// Whether the server would take `password` as a new one. It counts bytes.
+pub fn tiny_password_fits(password: &str) -> bool {
+    TINY_PASSWORD.contains(&password.len())
+}
+
+/// The name the server would keep, or `None` when it would refuse it.
+pub fn tiny_name(name: &str) -> Option<&str> {
+    let name = name.trim();
+    (!name.is_empty() && name.chars().count() <= TINY_NAME_MAX).then_some(name)
+}
+
 /// One paste for the other tinyclient: `tc1.` then the origin in hex, then the server's token.
 /// The server never sees this string. Accepting still sends only `token`.
 pub fn pack_join(origin: &str, token: &str) -> Option<String> {
@@ -143,7 +170,11 @@ pub fn tiny_can(role: &str, id: &str) -> bool {
         | "community.invites.create"
         | "community.members.role"
         | "community.members.remove"
+        | "community.invites.revoke"
         | "community.audit.read" => matches!(role, "owner" | "admin"),
+        "account.name.edit" | "account.password.change" | "account.sessions.end" => {
+            matches!(role, "owner" | "admin" | "member")
+        }
         _ => false,
     }
 }
@@ -161,6 +192,7 @@ mod tests {
         for id in [
             "community.invites.read",
             "community.invites.create",
+            "community.invites.revoke",
             "community.members.role",
             "community.members.remove",
             "community.audit.read",
@@ -173,6 +205,40 @@ mod tests {
         assert!(!tiny_can("owner", "community.nope"));
         assert!(!tiny_can("admin", ""));
         assert!(!tiny_can("member", "community.invites.create"));
+        for id in ["account.name.edit", "account.password.change", "account.sessions.end"] {
+            for role in ["owner", "admin", "member"] {
+                assert!(tiny_can(role, id), "{role} {id}");
+            }
+            assert!(!tiny_can("guest", id), "{id}");
+        }
+    }
+
+    #[test]
+    fn a_password_is_counted_in_bytes_and_never_printed() {
+        assert!(!tiny_password_fits("short"));
+        assert!(tiny_password_fits("twelve chars"));
+        assert!(tiny_password_fits(&"x".repeat(128)));
+        assert!(!tiny_password_fits(&"x".repeat(129)));
+        // Eleven characters, but more than twelve bytes: the server takes it.
+        assert!(tiny_password_fits("ééééééééééé"));
+        assert_eq!(tiny_name("  Ada  "), Some("Ada"));
+        assert_eq!(tiny_name("   "), None);
+        assert!(tiny_name(&"é".repeat(80)).is_some());
+        assert_eq!(tiny_name(&"a".repeat(81)), None);
+        let secret = TinySecret("hunter2-hunter2".into());
+        assert!(!format!("{secret:?}").contains("hunter2"));
+        assert_eq!(serde_json::to_string(&secret).unwrap(), r#""hunter2-hunter2""#);
+        let request = crate::Request::TinyPassword {
+            account: crate::AccountKey { network: crate::Network::Tiny, account: "u".into() },
+            current_password: TinySecret("old-password-1".into()),
+            new_password: secret,
+        };
+        assert!(!format!("{request:?}").contains("hunter2"));
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["op"], "tiny_password");
+        assert_eq!(json["new_password"], "hunter2-hunter2");
+        let back: crate::Request = serde_json::from_value(json).unwrap();
+        assert_eq!(back, request);
     }
 
     #[test]

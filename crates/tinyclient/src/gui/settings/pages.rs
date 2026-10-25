@@ -142,7 +142,7 @@ impl SettingsWindow {
     pub(super) fn page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let column = div().w(px(controls::COLUMN)).flex().flex_col();
         let groups: Vec<Div> = match self.section {
-            Section::Accounts => return column.child(self.accounts(cx)),
+            Section::Accounts => return column.child(self.accounts(window, cx)),
             Section::General => vec![
                 self.group(&["G2"], None, window, cx).child(caption(self.keep_running_caption())),
                 self.group(&["G4"], None, window, cx).child(caption(self.updates_caption())),
@@ -909,9 +909,11 @@ impl SettingsWindow {
         cx.notify();
     }
 
-    pub(super) fn modal(&mut self, confirm: &Confirm, cx: &mut Context<Self>) -> Div {
+    pub(super) fn modal(&mut self, confirm: &Confirm, window: &mut Window, cx: &mut Context<Self>) -> Div {
         match confirm.clone() {
             Confirm::SignOut(account) => self.sign_out_modal(&account, cx),
+            Confirm::TinyPassword(_) => self.tiny_password_modal(window, cx),
+            Confirm::TinyEverywhere(account) => self.tiny_everywhere_modal(&account, cx),
             Confirm::Retention { days, prunable } => modal_panel(
                 format!("Delete messages older than {days} days?"),
                 vec![retention_words(prunable)],
