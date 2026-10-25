@@ -49,7 +49,16 @@ struct Conn {
 
 impl Conn {
     fn send(&mut self, frame: Value) {
-        let _ = self.ws.send(Message::text(frame.to_string()));
+        let mut sent = self.ws.send(Message::text(frame.to_string()));
+        for _ in 0..200 {
+            match sent {
+                Err(tungstenite::Error::Io(err)) if err.kind() == ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    sent = self.ws.flush();
+                }
+                _ => return,
+            }
+        }
     }
 
     fn close(mut self, code: u16) {
@@ -57,7 +66,7 @@ impl Conn {
         let deadline = Instant::now() + Duration::from_secs(1);
         while Instant::now() < deadline {
             match self.ws.read() {
-                Err(tungstenite::Error::Io(err)) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+                Err(tungstenite::Error::Io(err)) if err.kind() == ErrorKind::WouldBlock => std::thread::sleep(Duration::from_millis(5)),
                 Err(_) => break,
                 Ok(_) => {}
             }
@@ -82,7 +91,7 @@ impl Conn {
                     return Some(frame);
                 }
                 Ok(_) => {}
-                Err(tungstenite::Error::Io(err)) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+                Err(tungstenite::Error::Io(err)) if err.kind() == ErrorKind::WouldBlock => std::thread::sleep(Duration::from_millis(5)),
                 Err(_) => return None,
             }
         }
@@ -189,7 +198,8 @@ fn upgrade(n: usize, stream: TcpStream, refuse: &[(usize, u16)], seen: &Sender<S
     .ok();
     let _ = seen.send(Seen::Live { since: asked.0, bearer: asked.1, at: Instant::now() });
     let Some(ws) = accepted else { return };
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(20)));
+    // Not a read timeout: on Windows a socket whose read timed out is not to be used again.
+    let _ = stream.set_nonblocking(true);
     script(n, Conn { ws, seen: seen.clone(), pong: true });
 }
 
