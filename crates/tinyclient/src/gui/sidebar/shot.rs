@@ -46,6 +46,7 @@ impl Shell {
             Some("teams") => self.go(Mode::Network(Network::Teams), cx),
             Some("signal") => self.go(Mode::Network(Network::Signal), cx),
             Some("messages") => self.go(Mode::Network(Network::Messages), cx),
+            Some("tiny") => self.go(Mode::Network(Network::Tiny), cx),
             _ => self.show_mode(cx),
         }
         if has("--friends") {

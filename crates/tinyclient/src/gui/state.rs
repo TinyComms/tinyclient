@@ -171,7 +171,8 @@ impl Dirty {
             | Change::Upload { .. }
             | Change::Playback { .. }
             | Change::Settings
-            | Change::Meter { .. } => {}
+            | Change::Meter { .. }
+            | Change::Tiny { .. } => {}
             Change::Folders { .. } => self.spaces = true,
         }
     }
@@ -283,7 +284,7 @@ impl Shell {
             composer_state: composer::State::default(),
             call_state: call::State::default(),
             playing_state: super::playing::State::default(),
-            tiny_state: super::tiny::State::default(),
+            tiny_state: super::tiny::State::new(cx),
             service: Service::new(!cfg!(feature = "gui-shot") || std::env::args().any(|arg| arg == "--start-chatd")),
             crashed: app::crash::relaunched_after(),
             restore: Some((prefs.open.clone(), prefs.mode.clone())),
@@ -472,6 +473,7 @@ impl Shell {
             self.conversation_changed(change, cx);
             self.people_changed(change, cx);
             self.call_changed(change, cx);
+            self.tiny_changed(change, cx);
         }
         self.reload(dirty, cx);
     }
