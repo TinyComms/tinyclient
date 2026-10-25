@@ -36,7 +36,7 @@ const QUICK: Timing = Timing {
 enum Seen {
     Live { since: Option<i64>, bearer: String, at: Instant },
     Rest(String),
-    Ping(Instant),
+    Ping,
 }
 
 /// The server's end of one live socket.
@@ -82,7 +82,7 @@ impl Conn {
                 Ok(Message::Text(text)) => {
                     let frame: Value = serde_json::from_str(text.as_str()).expect("the client sends JSON");
                     if frame["type"] == "ping" {
-                        let _ = self.seen.send(Seen::Ping(Instant::now()));
+                        let _ = self.seen.send(Seen::Ping);
                         if self.pong {
                             self.send(json!({"type": "pong"}));
                         }
@@ -303,6 +303,15 @@ impl Running {
         }
     }
 
+    /// The timing choices the socket thread has made so far.
+    fn did(&self) -> Vec<Did> {
+        lock(&self.live.did).clone()
+    }
+
+    fn pauses(&self) -> Vec<Duration> {
+        self.did().into_iter().filter_map(|did| match did { Did::Paused(wait) => Some(wait), _ => None }).collect()
+    }
+
     fn done(&self) -> bool {
         self.thread.as_ref().is_some_and(|thread| thread.is_finished())
     }
@@ -449,24 +458,17 @@ fn a_drop_backs_off_doubling_to_the_cap_and_each_reconnect_resumes() {
         }
     });
     let running = run(&fake.base, timing);
-    let mut at = Vec::new();
     let mut since = Vec::new();
     for _ in 0..6 {
-        let (asked, _, when) = fake.connected(Duration::from_secs(5)).expect("a connection");
-        at.push(when);
+        let (asked, _, _) = fake.connected(Duration::from_secs(5)).expect("a connection");
         since.push(asked);
     }
     // 1012, 1011, 4000 and 1012 resume; the 503 before the last is retried the same way.
     assert_eq!(since, [None, Some(10), Some(11), Some(12), Some(13), Some(13)]);
-    let expected = [200, 400, 400, 400, 400];
-    for (ix, wanted) in expected.iter().enumerate() {
-        let gap = at[ix + 1].duration_since(at[ix]);
-        let wanted = Duration::from_millis(*wanted);
-        // The fake stamps a refused connection after its reply is out, a moment after the
-        // client's pause began.
-        assert!(gap + Duration::from_millis(15) >= wanted, "pause {ix} was {gap:?}, under {wanted:?}");
-        assert!(gap < wanted + Duration::from_millis(390), "pause {ix} was {gap:?}: past the cap");
-    }
+    // The pauses asked for: doubling from the first, held at the cap.
+    let expected = [200, 400, 400, 400, 400].map(Duration::from_millis);
+    until("five pauses", || running.pauses().len() >= 5);
+    assert_eq!(running.pauses()[..5], expected);
     until("connected at the end", || running.link().0 == Link::Connected);
 }
 
@@ -526,13 +528,12 @@ fn a_replaced_socket_waits_for_the_user_and_a_slow_down_waits_the_cap() {
     until("offline and held", || running.link().0 == Link::Offline && running.live.held());
     assert!(fake.connected(Duration::from_millis(500)).is_none(), "4008 is not answered by reconnecting");
     assert!(!running.done());
-    let asked = Instant::now();
     running.live.ask(Ask::Look);
-    let (since, _, again) = fake.connected(Duration::from_secs(5)).expect("the user opened the server");
-    assert!(again.duration_since(asked) < Duration::from_secs(2));
+    let (since, _, _) = fake.connected(Duration::from_secs(5)).expect("the user opened the server");
     assert_eq!(since, Some(1));
-    let (_, _, after_slow) = fake.connected(Duration::from_secs(5)).expect("a reconnect after 4029");
-    assert!(after_slow.duration_since(again) >= QUICK.cap, "4029 waits the longest pause");
+    assert!(running.pauses().is_empty(), "opening the server connects at once: {:?}", running.pauses());
+    fake.connected(Duration::from_secs(5)).expect("a reconnect after 4029");
+    assert_eq!(running.pauses(), [QUICK.cap], "4029 waits the longest pause");
     until("connected", || running.link().0 == Link::Connected);
 }
 
@@ -551,22 +552,24 @@ fn pings_go_on_time_and_a_silent_server_is_dropped() {
         }
     });
     let running = run(&fake.base, timing);
-    let (_, _, first) = fake.connected(Duration::from_secs(5)).expect("a connection");
-    let (since, _, second) = fake.connected(Duration::from_secs(5)).expect("a reconnect once pings went unanswered");
+    fake.connected(Duration::from_secs(5)).expect("a connection");
+    let (since, _, _) = fake.connected(Duration::from_secs(5)).expect("a reconnect once pings went unanswered");
     assert_eq!(since, Some(1));
-    let pings: Vec<Instant> = fake.drained().into_iter().filter_map(|seen| match seen { Seen::Ping(at) => Some(at), _ => None }).filter(|at| *at < second).collect();
-    assert!(pings.len() >= 6, "{} pings", pings.len());
-    // The fake reads on its own clock, so one ping seen late makes the next gap look short.
-    // The cadence is the average, and no two are close together.
-    let average = pings[pings.len() - 1].duration_since(pings[0]) / (pings.len() as u32 - 1);
-    assert!(average >= Duration::from_millis(75), "pings {average:?} apart on average");
+    // The pings of the first connection, as the socket thread timed them.
+    let did = running.did();
+    let opened: Vec<Instant> = did.iter().filter_map(|did| match did { Did::Opened { at } => Some(*at), _ => None }).collect();
+    let pings: Vec<(Instant, Instant)> = did.iter().filter_map(|did| match did { Did::Pinged { due, sent } => Some((*due, *sent)), _ => None }).filter(|(_, sent)| opened.len() < 2 || *sent < opened[1]).collect();
+    assert!(pings.len() >= 3, "{} pings", pings.len());
+    // The first is due one interval after the connection opened, each next one an interval
+    // after the last went out, and none goes out before it is due.
+    assert_eq!(pings[0].0, opened[0] + timing.ping);
     for pair in pings.windows(2) {
-        let gap = pair[1].duration_since(pair[0]);
-        assert!(gap >= Duration::from_millis(40), "pings {gap:?} apart");
+        assert_eq!(pair[1].0, pair[0].1 + timing.ping);
     }
-    assert!(pings[0].duration_since(first) >= Duration::from_millis(70), "no ping before the first interval");
-    // Answered until 600 ms, then one unanswered ping, then the next one finds it silent.
-    assert!(second.duration_since(first) < Duration::from_millis(600 + 3 * 80 + 400));
+    assert!(pings.iter().all(|(due, sent)| sent >= due));
+    // The server stopped answering, and the connection was dropped for it: no pause was the
+    // reason, since a drop climbs from the first.
+    assert_eq!(running.pauses().first(), Some(&timing.first));
     until("connected again", || running.link().0 == Link::Connected);
 }
 

@@ -132,6 +132,21 @@ impl Ask {
 pub struct Live {
     wake: WakePair,
     inner: Mutex<Inner>,
+    /// What the socket thread chose to wait for, so tests read the choices, not a clock.
+    #[cfg(test)]
+    did: Mutex<Vec<Did>>,
+}
+
+/// One timing choice of the socket thread.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum Did {
+    /// A connection is up, and its first ping is due a ping interval from `at`.
+    Opened { at: Instant },
+    /// A ping went out at `sent`, due at `due`.
+    Pinged { due: Instant, sent: Instant },
+    /// The pause asked for before the next connection.
+    Paused(Duration),
 }
 
 #[derive(Default)]
@@ -147,7 +162,12 @@ struct Inner {
 
 impl Live {
     pub fn new() -> io::Result<Live> {
-        Ok(Live { wake: WakePair::new()?, inner: Mutex::new(Inner::default()) })
+        Ok(Live {
+            wake: WakePair::new()?,
+            inner: Mutex::new(Inner::default()),
+            #[cfg(test)]
+            did: Mutex::default(),
+        })
     }
 
     /// From the command thread. A request while the socket is down is refused at once.
@@ -172,6 +192,14 @@ impl Live {
             }
         }
     }
+
+    #[cfg(test)]
+    fn note(&self, did: Did) {
+        lock(&self.did).push(did);
+    }
+
+    #[cfg(not(test))]
+    fn note(&self, _: Did) {}
 
     /// Wakes the socket thread, to notice it was stopped.
     pub fn wake(&self) {
@@ -390,6 +418,7 @@ pub(super) fn keep_live(ctx: &Context, saved: &Saved, live: &Live, timing: &Timi
         if !absent_here || ctx.hub.link(&ctx.account) != Link::Connected {
             ctx.hub.set_offline(&ctx.account, wait <= RECONNECTING);
         }
+        live.note(Did::Paused(wait));
         match ctx.reconnect_pause(wait, generation) {
             ReconnectWait::Stopped => return,
             ReconnectWait::Elapsed => {}
@@ -484,7 +513,9 @@ fn connect(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, timing: &
 #[allow(clippy::too_many_arguments)]
 fn serve(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, timing: &Timing, wire: &mut Wire, pending: &mut Vec<Pending>) -> End {
     let wake = live.wake.poll_read();
-    let mut next_ping = Instant::now() + timing.ping;
+    let opened = Instant::now();
+    live.note(Did::Opened { at: opened });
+    let mut next_ping = opened + timing.ping;
     // Something arrived since the last ping. A server that answers nothing is gone.
     let mut heard = true;
     let mut ready = false;
@@ -592,6 +623,7 @@ fn serve(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, timing: &Ti
             if let Err(err) = wire.send(json!({"type": "ping"}).to_string()) {
                 return End::Dropped(err.to_string());
             }
+            live.note(Did::Pinged { due: next_ping, sent: now });
             heard = false;
             next_ping = now + timing.ping;
         }
