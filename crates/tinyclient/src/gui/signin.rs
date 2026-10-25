@@ -243,10 +243,10 @@ fn waiting() -> SignInStep {
     SignInStep::Qr { link: String::new(), expires: 0, problem: None }
 }
 
-/// What the sheet draws before chatd has answered. Tiny starts on the address, not a code.
+/// What the sheet draws before chatd has answered. Tiny starts on the code.
 fn waiting_for(network: Network) -> SignInStep {
     if network == Network::Tiny {
-        SignInStep::Server { problem: None }
+        SignInStep::Invite { server: String::new(), problem: None }
     } else {
         waiting()
     }
@@ -273,7 +273,7 @@ impl Sheet {
         let password = cx.new(|cx| TextInput::new("", cx));
         let url = cx.new(|cx| TextInput::new("tiny.example.com", cx));
         let email = cx.new(|cx| TextInput::new("Email", cx));
-        let invite = cx.new(|cx| TextInput::new("Invite code", cx));
+        let invite = cx.new(|cx| TextInput::new("Paste the code", cx));
         let name = cx.new(|cx| TextInput::new("Name", cx));
         for input in [&country, &number] {
             cx.subscribe(input, |this, _, event: &InputEvent, cx| match event {
@@ -738,13 +738,13 @@ impl Sheet {
         self.answer(SignInInput::Email { email }, cx);
     }
 
+    /// From the address, back to the code. The address is not required.
     fn send_have_code(&mut self, cx: &mut Context<Sheet>) {
         if self.busy {
             return;
         }
-        let url = self.url.read(cx).text().to_owned();
         self.dismiss();
-        self.answer(SignInInput::HaveCode { url }, cx);
+        self.answer(SignInInput::Back, cx);
     }
 
     fn send_invite(&mut self, cx: &mut Context<Sheet>) {
@@ -1025,7 +1025,8 @@ impl Sheet {
         let tiny = self.network == Network::Tiny;
         let heading = if tiny { self.header("Password", true, cx) } else { self.header("Two-step verification password", true, cx) };
         let aside = if tiny {
-            div().type_ui().text_color(theme::text_soft()).child("A password of 12 to 128 characters.")
+            let words = if hint.is_empty() { "A password of 12 to 128 characters." } else { hint };
+            div().type_ui().text_color(theme::text_soft()).child(words.to_owned())
         } else {
             // Words in a link's color, not a link: the reset happens in Telegram's own app.
             div().type_ui().text_color(theme::accent_text()).child("Forgot it? Reset it in the Telegram app.")
@@ -1047,15 +1048,21 @@ impl Sheet {
         div()
             .flex()
             .flex_col()
-            .child(self.header("Server", false, cx))
-            .child(div().mt(px(6.)).mb(px(16.)).text_color(theme::text_soft()).child("The host of a server you already run. https is added for you."))
+            .child(self.header("Server", true, cx))
+            .child(
+                div()
+                    .mt(px(6.))
+                    .mb(px(16.))
+                    .whitespace_normal()
+                    .text_color(theme::text_soft())
+                    .child("A server you already have an account on. Type the host. Add a port when it is not the usual one."),
+            )
             .child(input)
             .children(problem.map(|problem| error_line(problem_words(self.network, problem)).mt(px(6.))))
-            .child(footer(22.).child(div()).child(buttons().child(self.cancel("Cancel", cx)).child(self.primary("Continue", Sheet::send_url, cx))))
-            .child(div().mt(px(12.)).child(self.have_code(cx)))
+            .child(footer(22.).child(self.have_code(cx)).child(buttons().child(self.cancel("Cancel", cx)).child(self.primary("Continue", Sheet::send_url, cx))))
     }
 
-    /// "I have a code" reads the address already typed. `answer_link` cannot see the field.
+    /// Back to the code. The address field is not read.
     fn have_code(&self, cx: &Context<Sheet>) -> Stateful<Div> {
         link("signin-have-code", "I have a code").on_click(cx.listener(|this, _, _, cx| this.send_have_code(cx)))
     }
@@ -1063,11 +1070,12 @@ impl Sheet {
     fn email_step(&self, server: &str, problem: Option<&SignInProblem>, window: &mut Window, cx: &Context<Sheet>) -> Div {
         let focused = self.email.focus_handle(cx).is_focused(window);
         let input = tall_field(focused, problem.is_some()).child(self.email.clone());
+        let host = protocol::join_host(server);
         div()
             .flex()
             .flex_col()
             .child(self.header("Email", true, cx))
-            .child(div().mt(px(6.)).mb(px(16.)).text_color(theme::text_soft()).child(server.to_owned()))
+            .child(div().mt(px(6.)).mb(px(16.)).text_color(theme::text_soft()).child(if host.is_empty() { server.to_owned() } else { host }))
             .child(input)
             .children(problem.map(|problem| error_line(problem_words(self.network, problem)).mt(px(6.))))
             .child(footer(22.).child(div()).child(buttons().child(self.cancel("Cancel", cx)).child(self.primary("Continue", Sheet::send_email, cx))))
@@ -1076,24 +1084,51 @@ impl Sheet {
     fn invite_step(&self, server: &str, problem: Option<&SignInProblem>, window: &mut Window, cx: &Context<Sheet>) -> Div {
         let focused = self.invite.focus_handle(cx).is_focused(window);
         let input = tall_field(focused, problem.is_some()).child(self.invite.clone());
+        let fresh = server.is_empty();
+        let host = protocol::join_host(server);
+        let aside = if fresh {
+            "Paste the code you were given. It has the server in it, so you don't type an address."
+        } else {
+            ""
+        };
+        let account = fresh.then(|| {
+            self.answer_link("signin-have-account", "I already have an account", || SignInInput::HaveCode { url: String::new() }, cx)
+        });
         div()
             .flex()
             .flex_col()
-            .child(self.header("Code", true, cx))
-            .child(div().mt(px(6.)).mb(px(16.)).text_color(theme::text_soft()).child(server.to_owned()))
+            .child(self.header(if fresh { "Join a server" } else { "Code" }, !fresh, cx))
+            .child(
+                div()
+                    .mt(px(6.))
+                    .mb(px(16.))
+                    .whitespace_normal()
+                    .text_color(theme::text_soft())
+                    .child(if fresh { aside.to_owned() } else { host }),
+            )
             .child(input)
             .children(problem.map(|problem| error_line(problem_words(self.network, problem)).mt(px(6.))))
-            .child(footer(22.).child(div()).child(buttons().child(self.cancel("Cancel", cx)).child(self.primary("Continue", Sheet::send_invite, cx))))
+            .child(
+                footer(22.)
+                    .child(account.map_or_else(|| div().into_any_element(), IntoElement::into_any_element))
+                    .child(buttons().child(self.cancel("Cancel", cx)).child(self.primary("Continue", Sheet::send_invite, cx))),
+            )
     }
 
-    fn name_step(&self, problem: Option<&SignInProblem>, window: &mut Window, cx: &Context<Sheet>) -> Div {
+    fn name_step(&self, server: &str, problem: Option<&SignInProblem>, window: &mut Window, cx: &Context<Sheet>) -> Div {
         let focused = self.name.focus_handle(cx).is_focused(window);
         let input = tall_field(focused, problem.is_some()).child(self.name.clone());
+        let host = protocol::join_host(server);
+        let line = if host.is_empty() {
+            "The name people on that server will see.".to_owned()
+        } else {
+            format!("The name people on {host} will see.")
+        };
         div()
             .flex()
             .flex_col()
             .child(self.header("Name", true, cx))
-            .child(div().mt(px(6.)).mb(px(16.)).text_color(theme::text_soft()).child("The name people on that server will see."))
+            .child(div().mt(px(6.)).mb(px(16.)).whitespace_normal().text_color(theme::text_soft()).child(line))
             .child(input)
             .children(problem.map(|problem| error_line(problem_words(self.network, problem)).mt(px(6.))))
             .child(footer(22.).child(div()).child(buttons().child(self.cancel("Cancel", cx)).child(self.primary("Continue", Sheet::send_name, cx))))
@@ -1315,7 +1350,7 @@ impl Render for Sheet {
                     SignInStep::Server { .. } => self.server_step(problem, window, cx),
                     SignInStep::Email { server, .. } => self.email_step(server, problem, window, cx),
                     SignInStep::Invite { server, .. } => self.invite_step(server, problem, window, cx),
-                    SignInStep::Name { .. } => self.name_step(problem, window, cx),
+                    SignInStep::Name { server, .. } => self.name_step(server, problem, window, cx),
                     SignInStep::Failed { reason } => self.failed_step(reason, cx),
                     SignInStep::Done { .. } => div(),
                 }

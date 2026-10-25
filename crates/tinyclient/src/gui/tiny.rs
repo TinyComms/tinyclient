@@ -11,6 +11,9 @@ use gpui::{div, prelude::*, px, AnyElement, ClipboardItem, Context, Div, MouseBu
 use protocol::{AccountKey, Key, Link, Network, Request, Response};
 use std::io;
 
+/// Shown when the server's token cannot be wrapped with this server's address.
+const UNMADE: &str = "The invite could not be made into a code.";
+
 /// What the server window is holding. The invite token stays until Done and is never logged.
 pub struct State {
     seen: bool,
@@ -22,7 +25,11 @@ pub struct State {
     error: Option<String>,
     /// `"member"` or `"admin"`. Never owner.
     invite_role: String,
+    /// The paste code, shown once. It carries the server. The raw token is not shown alone.
     token: Option<String>,
+    /// The server packed into `token`.
+    origin: Option<String>,
+    copied: bool,
     busy: bool,
     confirm: Option<String>,
     /// A person on show. None is the invite.
@@ -41,6 +48,8 @@ impl Default for State {
             error: None,
             invite_role: "member".into(),
             token: None,
+            origin: None,
+            copied: false,
             busy: false,
             confirm: None,
             picked: None,
@@ -67,6 +76,10 @@ struct OpenInvite {
 struct Ready {
     error: Option<String>,
     token: Option<String>,
+    origin: Option<String>,
+    /// The signed-in server, before a code exists.
+    home: String,
+    copied: bool,
     invite_role: String,
     can_invite: bool,
     busy: bool,
@@ -277,6 +290,9 @@ impl Shell {
         Page::Ready(Ready {
             error: state.error.clone().filter(|detail| !detail.is_empty()),
             token: state.token.clone(),
+            origin: state.origin.clone(),
+            home: community.origin.clone(),
+            copied: state.copied,
             invite_role: state.invite_role.clone(),
             can_invite,
             busy: state.busy,
@@ -293,6 +309,8 @@ impl Shell {
         if switched {
             self.tiny_state.community = None;
             self.tiny_state.token = None;
+            self.tiny_state.origin = None;
+            self.tiny_state.copied = false;
             self.tiny_state.confirm = None;
             self.tiny_state.picked = None;
             self.tiny_state.error = None;
@@ -326,7 +344,12 @@ impl Shell {
                     if this.tiny_state.picked.as_ref().is_some_and(|id| community.members.iter().all(|member| &member.user_id != id)) {
                         this.tiny_state.picked = None;
                     }
-                    this.tiny_state.error = None;
+                    // A code that could not be packed stays on screen. A good load would hide it.
+                    let unpacked = this.tiny_state.token.is_none()
+                        && this.tiny_state.error.as_deref() == Some(UNMADE);
+                    if !unpacked {
+                        this.tiny_state.error = None;
+                    }
                     this.tiny_state.community = Some(community);
                 }
                 Ok(Response::Error { detail, .. }) => this.tiny_state.error = Some(detail),
@@ -369,8 +392,20 @@ impl Shell {
                 cx.notify();
             }
             Ok(Response::TinyCode { code }) => {
-                self.tiny_state.token = Some(code.token);
-                self.tiny_state.error = None;
+                match protocol::pack_join(&code.origin, &code.token) {
+                    Some(paste) => {
+                        self.tiny_state.token = Some(paste);
+                        self.tiny_state.origin = Some(code.origin);
+                        self.tiny_state.copied = false;
+                        self.tiny_state.error = None;
+                    }
+                    None => {
+                        self.tiny_state.token = None;
+                        self.tiny_state.origin = None;
+                        self.tiny_state.copied = false;
+                        self.tiny_state.error = Some(UNMADE.to_owned());
+                    }
+                }
                 self.fetch(account, Some(epoch), cx);
                 cx.notify();
             }
@@ -441,10 +476,14 @@ impl Shell {
             return;
         };
         cx.write_to_clipboard(ClipboardItem::new_string(token));
+        self.tiny_state.copied = true;
+        cx.notify();
     }
 
     fn done_code(&mut self, cx: &mut Context<Self>) {
         self.tiny_state.token = None;
+        self.tiny_state.origin = None;
+        self.tiny_state.copied = false;
         cx.notify();
     }
 
@@ -560,26 +599,19 @@ fn server_view(ready: &Ready, cx: &mut Context<Shell>) -> AnyElement {
     if !ready.can_invite {
         return note_line("Nobody is on this server.", false).into_any_element();
     }
+    let told = ready.origin.as_deref().filter(|origin| !origin.is_empty()).unwrap_or(ready.home.as_str());
     let head = div()
         .px(px(theme::PANE_PAD))
         .pt(px(20.))
         .flex()
         .flex_col()
-        .gap(px(12.))
-        .child(div().type_title().text_color(theme::text()).child("Invite someone"))
-        .when(ready.token.is_none(), |column| {
-            column.child(
-                div()
-                    .max_w(px(360.))
-                    .whitespace_normal()
-                    .type_ui()
-                    .text_color(theme::text_soft())
-                    .child("They paste the code into their own tinyclient."),
-            )
-        })
-        .children(ready.error.as_ref().map(|detail| div().type_small().text_color(theme::danger()).child(detail.clone())))
-        .children(ready.token.as_ref().map(|token| code_panel(token, cx)))
-        .when(ready.token.is_none(), |column| column.child(invite_row(&ready.invite_role, ready.busy, cx)));
+        .gap(px(16.))
+        .max_w(px(440.))
+        .children(ready.error.as_ref().map(|detail| div().whitespace_normal().type_small().text_color(theme::danger()).child(detail.clone())))
+        .child(match ready.token.as_deref() {
+            Some(paste) => handoff(paste, told, &ready.invite_role, ready.copied, cx).into_any_element(),
+            None => invite_form(told, &ready.invite_role, ready.busy, cx).into_any_element(),
+        });
     let mut column = div().flex().flex_col().child(head);
     if !ready.invites.is_empty() {
         column = column.child(invite_section(&ready.invites));
@@ -629,6 +661,131 @@ fn person_view(member: &Member, mine: bool, confirm: Option<&str>, cx: &mut Cont
         .into_any_element()
 }
 
+fn invite_form(origin: &str, role: &str, busy: bool, cx: &mut Context<Shell>) -> Div {
+    let host = protocol::join_host(origin);
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(16.))
+        .child(div().type_title().text_color(theme::text()).child("Invite someone"))
+        .child(
+            div()
+                .whitespace_normal()
+                .type_ui()
+                .text_color(theme::text_soft())
+                .child("They paste one code into their own tinyclient. The code has this server in it, so they never type an address. The first time, they choose a name, an email, and a password."),
+        )
+        .when(!host.is_empty(), |column| {
+            column.child(div().whitespace_normal().type_ui().text_color(theme::text()).child(format!("It will open {host}.")))
+        })
+        .child(div().type_small().text_color(theme::text_soft()).child("They join as"))
+        .child(invite_row(role, busy, cx))
+}
+
+fn handoff(paste: &str, origin: &str, role: &str, copied: bool, cx: &mut Context<Shell>) -> Div {
+    let (opens, makes) = handoff_facts(origin, role);
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(16.))
+        .child(div().type_title().text_color(theme::text()).child("Give them this code"))
+        .child(div().whitespace_normal().type_ui().text_color(theme::text_soft()).child("Copy it and send it to them. They do the rest in their own tinyclient."))
+        .child(
+            div()
+                .p(px(16.))
+                .rounded(px(theme::R_CARD))
+                .bg(theme::raised())
+                .flex()
+                .flex_col()
+                .gap(px(10.))
+                .child(handoff_step(1, "Open tinyclient"))
+                .child(handoff_step(2, "Choose Tiny server"))
+                .child(handoff_step(3, "Paste this code"))
+                .child(handoff_step(4, "Choose a name, an email, and a password")),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .child(div().type_micro().text_color(theme::text_faint()).child("Code"))
+                .child(
+                    div()
+                        .w_full()
+                        .px(px(16.))
+                        .py(px(12.))
+                        .rounded(px(theme::R_CARD))
+                        .bg(theme::raised())
+                        .border_1()
+                        .border_color(theme::border())
+                        .whitespace_normal()
+                        .type_code()
+                        .text_color(theme::text())
+                        .child(paste.to_owned()),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .child(div().whitespace_normal().type_ui().text_color(theme::text()).child(opens))
+                .child(div().whitespace_normal().type_ui().text_color(theme::text_soft()).child(makes))
+                .child(div().whitespace_normal().type_ui().text_color(theme::text_soft()).child("It works once, for 7 days, and will not be shown again.")),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_wrap()
+                .gap(px(8.))
+                .child(
+                    button("tiny-copy", ButtonKind::Primary, if copied { "Copied" } else { "Copy code" })
+                        .on_click(cx.listener(|this, _, _, cx| this.copy_code(cx))),
+                )
+                .child(button("tiny-done", ButtonKind::Secondary, "Done").on_click(cx.listener(|this, _, _, cx| this.done_code(cx)))),
+        )
+}
+
+fn handoff_step(number: usize, words: &'static str) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(10.))
+        .child(
+            div()
+                .flex_none()
+                .size(px(18.))
+                .rounded(px(9.))
+                .bg(theme::selected())
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(11.))
+                .line_height(px(14.))
+                .font_weight(theme::SEMIBOLD)
+                .text_color(theme::text())
+                .child(number.to_string()),
+        )
+        .child(div().type_ui().text_color(theme::text()).child(words))
+}
+
+/// Where the code opens, and who it makes. The host is plain: they do not type it.
+fn handoff_facts(origin: &str, role: &str) -> (String, String) {
+    let host = protocol::join_host(origin);
+    let opens = if host.is_empty() {
+        "It opens this server. They don't type that.".to_owned()
+    } else {
+        format!("It opens {host}. They don't type that.")
+    };
+    let place = role_place(role);
+    let makes = if place.is_empty() {
+        "This code makes them a member.".to_owned()
+    } else {
+        format!("This code makes them {place}.")
+    };
+    (opens, makes)
+}
+
 fn invite_row(role: &str, busy: bool, cx: &mut Context<Shell>) -> Div {
     let invite = if busy {
         button_disabled("Invite someone").into_any_element()
@@ -648,34 +805,6 @@ fn invite_row(role: &str, busy: bool, cx: &mut Context<Shell>) -> Div {
                 .child(segment("tiny-as-admin", "Admin", role == "admin").on_click(cx.listener(|this, _, _, cx| this.pick_role("admin", cx)))),
         )
         .child(invite)
-}
-
-fn code_panel(token: &str, cx: &mut Context<Shell>) -> Div {
-    div()
-        .flex()
-        .flex_col()
-        .gap(px(8.))
-        .child(div().whitespace_normal().type_ui().text_color(theme::text_soft()).child("Copy this code. It works for 7 days and will not be shown again."))
-        .child(
-            div()
-                .px(px(12.))
-                .py(px(8.))
-                .rounded(px(theme::R_CONTROL))
-                .bg(theme::field())
-                .border_1()
-                .border_color(theme::border())
-                .whitespace_normal()
-                .type_code()
-                .child(token.to_owned()),
-        )
-        .child(
-            div()
-                .flex()
-                .flex_wrap()
-                .gap(px(8.))
-                .child(button("tiny-copy", ButtonKind::Primary, "Copy code").on_click(cx.listener(|this, _, _, cx| this.copy_code(cx))))
-                .child(button("tiny-done", ButtonKind::Secondary, "Done").on_click(cx.listener(|this, _, _, cx| this.done_code(cx)))),
-        )
 }
 
 fn member_actions(member: &Member, cx: &mut Context<Shell>) -> Div {
@@ -893,5 +1022,18 @@ mod tests {
         assert_eq!(audit_line("nope", "membership", |_| None), None);
         assert_eq!(short_day("2026-11-01T00:00:00Z"), "Nov 1, 2026");
         assert_eq!(short_day("soon"), "soon");
+    }
+
+    #[test]
+    fn a_code_says_where_it_opens_and_who_it_makes() {
+        let (opens, makes) = handoff_facts("https://private.tinyclient.io", "member");
+        assert_eq!(opens, "It opens private.tinyclient.io. They don't type that.");
+        assert_eq!(makes, "This code makes them a member.");
+        let (opens, makes) = handoff_facts("http://127.0.0.1:8080", "admin");
+        assert_eq!(opens, "It opens 127.0.0.1:8080. They don't type that.");
+        assert_eq!(makes, "This code makes them an admin.");
+        let (opens, makes) = handoff_facts("", "nope");
+        assert_eq!(opens, "It opens this server. They don't type that.");
+        assert_eq!(makes, "This code makes them a member.");
     }
 }
