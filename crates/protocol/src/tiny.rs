@@ -1,4 +1,5 @@
-//! A Tiny server's members, invites, and audit. No rooms and no messages.
+//! A Tiny server's members, invites, audit, and rooms. No messages. A room is a voice channel:
+//! joining takes a seat in its call, and there is no sound yet.
 
 use serde::{Deserialize, Serialize};
 
@@ -46,6 +47,26 @@ pub struct TinyAudit {
     pub created_at: String,
 }
 
+/// One room, and who is in its call now, in the order they joined.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TinyRoom {
+    pub id: String,
+    pub name: String,
+    /// Filled in by chatd from the live socket; the server's room list has none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub participants: Vec<TinySeat>,
+}
+
+/// Someone in a room's call, and whether they muted or deafened themselves.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TinySeat {
+    pub user_id: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub muted: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deafened: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TinyCommunity {
     pub role: String,
@@ -55,6 +76,16 @@ pub struct TinyCommunity {
     /// The signed-in server, filled in by chatd. Empty when an older answer had none.
     #[serde(default)]
     pub origin: String,
+    /// The server's rooms, in its order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rooms: Vec<TinyRoom>,
+    /// Members online now, as the live socket last said. Empty while it is not connected.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub online: Vec<String>,
+    /// The server's audio, as its `/health` says: `off`, `up` or `down`. Empty when it did not
+    /// say. tinyclient joins a call only while it is off: it has no audio of its own yet.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub media: String,
 }
 
 /// A password on its way to chatd. On the wire it is a plain string; it is never printed.
@@ -172,8 +203,11 @@ pub fn tiny_can(role: &str, id: &str) -> bool {
         | "community.members.remove"
         | "community.invites.revoke"
         | "community.audit.read" => matches!(role, "owner" | "admin"),
-        "account.name.edit" | "account.password.change" | "account.sessions.end" => {
+        "account.name.edit" | "account.password.change" | "account.sessions.end" | "community.calls.join" => {
             matches!(role, "owner" | "admin" | "member")
+        }
+        "community.rooms.create" | "community.rooms.rename" | "community.rooms.delete" | "community.calls.kick" => {
+            matches!(role, "owner" | "admin")
         }
         _ => false,
     }
@@ -196,6 +230,10 @@ mod tests {
             "community.members.role",
             "community.members.remove",
             "community.audit.read",
+            "community.rooms.create",
+            "community.rooms.rename",
+            "community.rooms.delete",
+            "community.calls.kick",
         ] {
             assert!(!tiny_can("member", id), "{id}");
             assert!(tiny_can("admin", id), "{id}");
@@ -205,7 +243,7 @@ mod tests {
         assert!(!tiny_can("owner", "community.nope"));
         assert!(!tiny_can("admin", ""));
         assert!(!tiny_can("member", "community.invites.create"));
-        for id in ["account.name.edit", "account.password.change", "account.sessions.end"] {
+        for id in ["account.name.edit", "account.password.change", "account.sessions.end", "community.calls.join"] {
             for role in ["owner", "admin", "member"] {
                 assert!(tiny_can(role, id), "{role} {id}");
             }
@@ -266,6 +304,13 @@ mod tests {
         assert_eq!(old.origin, "");
         let community: TinyCommunity = serde_json::from_str(r#"{"role":"owner","members":[],"invites":[],"audit":[]}"#).unwrap();
         assert_eq!(community.origin, "");
+        assert!(community.rooms.is_empty() && community.online.is_empty() && community.media.is_empty());
+        // Nothing new is written while it is empty, so an older shell reads the same frame.
+        let json = serde_json::to_string(&community).unwrap();
+        assert!(!json.contains("rooms") && !json.contains("online") && !json.contains("media"), "{json}");
+        let room: TinyRoom = serde_json::from_str(r#"{"id":"r","name":"Lobby"}"#).unwrap();
+        assert!(room.participants.is_empty());
+        assert!(!serde_json::to_string(&room).unwrap().contains("participants"));
     }
 
     #[test]

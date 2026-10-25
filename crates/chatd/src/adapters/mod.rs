@@ -336,6 +336,9 @@ pub enum Command {
     CallLeave(String),
     /// Our mute and deafen changed; the network shows them to others.
     CallAudio { muted: bool, deafened: bool },
+    /// A Tiny server's live socket: take or leave a seat in a room's call, remove someone from
+    /// one, or hear that the user opened the server.
+    Tiny(tiny::live::Ask),
     /// The user signed out: end the session on the network, best effort, then answer. chatd
     /// waits five seconds for the answer and forgets the account either way.
     SignOut(Reply<()>),
@@ -377,6 +380,7 @@ impl Command {
             Command::Send { conversation_id, client_id, .. } => {
                 ctx.sent(&conversation_id, &client_id, Err("Sending is not built for this network.".to_owned()));
             }
+            Command::Tiny(ask) => ask.unsupported(),
             Command::CallJoin(conversation_id) => {
                 let detail = format!("{} calls are not built yet.", ctx.account.network.label());
                 ctx.call_failed(&conversation_id, CallFailure::Refused, &detail);
@@ -808,6 +812,11 @@ impl Context {
             account: self.account.clone(),
             query: query.to_owned(),
         });
+    }
+
+    /// A Tiny server's people, roles, invites or rooms changed: the shell reads them again.
+    pub fn community_changed(&self) {
+        self.hub.changed(Change::Tiny { account: self.account.clone() });
     }
 
     /// Rows of a conversation's member list were added, removed or moved.

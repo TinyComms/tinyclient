@@ -1,19 +1,26 @@
 //! A Tiny server the owner already runs. Every server joined on this Mac shares this network's
 //! one keychain item: a single object until a second server is added, then an array of them.
 //! Each account is started from its own object. Sign-in is the sheet's (`signin`), never
-//! `tinyclient-login`. This slice has no conversations, calls, or media, and does not load a
-//! WebRTC stack. A signed-in account can list members, invite, revoke an invite, change a role,
-//! remove a member, and read the audit. It can rename itself, change its password, and end every
-//! one of its sessions.
+//! `tinyclient-login`. A signed-in account can list members, invite, revoke an invite, change a
+//! role, remove a member, and read the audit. It can rename itself, change its password, and end
+//! every one of its sessions. An owner or an admin can make, rename and delete rooms.
+//!
+//! Each account holds one live socket (`live`): presence, who is in each room's call, and the
+//! events that keep the server page current. A room is a voice channel, and joining it takes a
+//! seat over that socket. There is no sound yet: no conversations, no media, no WebRTC stack.
 
+pub(crate) mod live;
 pub mod signin;
 
 use super::{serve_commands, Command, Context, Signed};
+use crate::hub::Hub;
 use crate::session;
 use protocol::{
-    join_host, tiny_can, tiny_name, tiny_password_fits, AccountKey, ErrorCode, Link, Network,
-    Response, TinyAudit, TinyCode, TinyCommunity, TinyInvite, TinyMember,
+    join_host, tiny_can, tiny_name, tiny_password_fits, AccountKey, ErrorCode, Key, Network,
+    Presence, Response, TinyAudit, TinyCode, TinyCommunity, TinyInvite, TinyMember, TinyRoom,
+    TinySeat,
 };
+use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::mpsc::Receiver;
@@ -177,6 +184,20 @@ pub(crate) fn combine(existing: &str, fresh: &str) -> Result<String, String> {
     }
     kept.push(fresh_saved);
     serde_json::to_string(&kept).map_err(|_| "the Tiny server session is unreadable".to_owned())
+}
+
+/// The session with one server's role replaced, in the shape it was stored. `None` when that
+/// server is not in it or already has the role.
+pub(crate) fn with_role(session: &str, user_id: &str, role: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(session).ok()?;
+    let mut rows = saved_rows(session).ok()?;
+    let saved = rows.iter_mut().find(|saved| saved.user_id == user_id && saved.role != role)?;
+    saved.role = role.to_owned();
+    if value.is_array() {
+        serde_json::to_string(&rows).ok()
+    } else {
+        serde_json::to_string(&rows[0]).ok()
+    }
 }
 
 fn saved_for(session: &str, user_id: &str) -> Result<Saved, String> {
@@ -380,12 +401,15 @@ const SIGNED_OUT: &str = "Tiny server signed you out.";
 const WRONG_PASSWORD: &str = "Your current password isn't right.";
 const PASSWORD_SIZE: &str = "A new password is 12 to 128 characters.";
 const NAME_SIZE: &str = "A name is 1 to 80 characters.";
+const ROOM_NAME_SIZE: &str = "A room name is 1 to 80 characters.";
+const NOT_YOURS: &str = "You can't do that.";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Missing {
     Member,
     Code,
     Invite,
+    Room,
     Plain,
 }
 
@@ -413,6 +437,7 @@ fn explain(status: u16, body: &Value, missing: Missing) -> &'static str {
             "That code doesn't work. It may have expired or already been used."
         }
         (404, _) if missing == Missing::Invite => "That invite is gone or was already used.",
+        (404, _) if missing == Missing::Room => "That room is gone.",
         (400, _) => CHECK,
         (429, _) => "Too many tries. Wait a minute, then try again.",
         (500..=599, _) => "The server had a problem. Try again in a moment.",
@@ -475,6 +500,25 @@ fn members_of(saved: &Saved) -> Result<Vec<TinyMember>, &'static str> {
     }
 }
 
+#[derive(Deserialize)]
+struct RoomWire {
+    id: String,
+    name: String,
+}
+
+/// A server older than rooms answers 404: it has none.
+fn rooms_of(saved: &Saved) -> Listed<Vec<TinyRoom>> {
+    match asked("GET", saved, "/v1/rooms", None) {
+        Err(detail) => Listed::Failed(detail),
+        Ok((403 | 404, _)) => Listed::Empty,
+        Ok((200, body)) => match serde_json::from_value::<Vec<RoomWire>>(body) {
+            Ok(rows) => Listed::Rows(rows.into_iter().map(|row| TinyRoom { id: row.id, name: row.name, participants: Vec::new() }).collect()),
+            Err(_) => Listed::Failed(UNREADABLE),
+        },
+        Ok((status, body)) => Listed::Failed(explain(status, &body, Missing::Plain)),
+    }
+}
+
 fn invites_of(saved: &Saved) -> Listed<Vec<TinyInvite>> {
     listed(saved, "/v1/invites", |body| serde_json::from_value(body).map_err(|_| ()))
 }
@@ -515,7 +559,9 @@ fn audit_of(saved: &Saved) -> Listed<Vec<TinyAudit>> {
     })
 }
 
-pub(crate) fn community(account: AccountKey) -> Response {
+/// The page: members, invites and the audit over REST, then the rooms with who is in each
+/// call and who is online, as the live socket last told the hub.
+pub(crate) fn community(hub: &Hub, account: AccountKey) -> Response {
     let saved = match open(&account) {
         Ok(saved) => saved,
         Err(error) => return error,
@@ -544,6 +590,26 @@ pub(crate) fn community(account: AccountKey) -> Response {
     } else {
         Vec::new()
     };
+    let mut rooms = match rooms_of(&saved) {
+        Listed::Rows(rows) => rows,
+        Listed::Empty => Vec::new(),
+        Listed::Failed(detail) => return refused(detail),
+    };
+    for room in &mut rooms {
+        if let Some(inside) = hub.occupants(&Key::new(&account, &room.id)) {
+            room.participants = inside
+                .people
+                .into_iter()
+                .map(|occupant| TinySeat { user_id: occupant.person.id, muted: occupant.muted, deafened: occupant.deafened })
+                .collect();
+        }
+    }
+    let online = members
+        .iter()
+        .filter(|member| hub.presence(&Key::new(&account, &member.user_id)) == Presence::Online)
+        .map(|member| member.user_id.clone())
+        .collect();
+    let media = media_of(&saved.base_url);
     Response::TinyCommunity {
         community: TinyCommunity {
             role: saved.role,
@@ -551,8 +617,92 @@ pub(crate) fn community(account: AccountKey) -> Response {
             invites,
             audit,
             origin: saved.base_url,
+            rooms,
+            online,
+            media,
         },
     }
+}
+
+/// What `/health` says of the server's audio: `off`, `up` or `down`. Empty when it did not say,
+/// as an older server does not. A 503 still says it.
+pub(crate) fn media_of(base: &str) -> String {
+    match call("GET", &endpoint(base, "/health"), None, None) {
+        Ok((_, body)) => body.get("media").and_then(Value::as_str).filter(|media| matches!(*media, "off" | "up" | "down")).unwrap_or("").to_owned(),
+        Err(_) => String::new(),
+    }
+}
+
+/// The signed-in session, when its role may do `id`. Nothing is asked of the server here.
+pub(crate) fn may(account: &AccountKey, id: &str) -> Result<Saved, Response> {
+    let saved = open(account)?;
+    if !tiny_can(&saved.role, id) {
+        return Err(refused(NOT_YOURS));
+    }
+    Ok(saved)
+}
+
+pub(crate) fn create_room(account: AccountKey, name: String) -> Response {
+    let saved = match may(&account, "community.rooms.create") {
+        Ok(saved) => saved,
+        Err(error) => return error,
+    };
+    let Some(name) = tiny_name(&name) else {
+        return refused(ROOM_NAME_SIZE);
+    };
+    match asked("POST", &saved, "/v1/rooms", Some(serde_json::json!({ "name": name }))) {
+        Err(detail) => refused(detail),
+        Ok((201, _)) => Response::Ok,
+        Ok((400, _)) => refused(ROOM_NAME_SIZE),
+        Ok((status, body)) => refused(explain(status, &body, Missing::Room)),
+    }
+}
+
+pub(crate) fn rename_room(account: AccountKey, room_id: String, name: String) -> Response {
+    let saved = match may(&account, "community.rooms.rename") {
+        Ok(saved) => saved,
+        Err(error) => return error,
+    };
+    if !safe_id(&room_id) {
+        return refused(CHECK);
+    }
+    let Some(name) = tiny_name(&name) else {
+        return refused(ROOM_NAME_SIZE);
+    };
+    let path = format!("/v1/rooms/{room_id}");
+    match asked("PATCH", &saved, &path, Some(serde_json::json!({ "name": name }))) {
+        Err(detail) => refused(detail),
+        Ok((200, _)) => Response::Ok,
+        Ok((400, _)) => refused(ROOM_NAME_SIZE),
+        Ok((status, body)) => refused(explain(status, &body, Missing::Room)),
+    }
+}
+
+/// Anyone in the room's call leaves it; the server says so over the live socket.
+pub(crate) fn delete_room(account: AccountKey, room_id: String) -> Response {
+    let saved = match may(&account, "community.rooms.delete") {
+        Ok(saved) => saved,
+        Err(error) => return error,
+    };
+    if !safe_id(&room_id) {
+        return refused(CHECK);
+    }
+    let path = format!("/v1/rooms/{room_id}");
+    match asked("DELETE", &saved, &path, None) {
+        Err(detail) => refused(detail),
+        Ok((204, _)) => Response::Ok,
+        Ok((status, body)) => refused(explain(status, &body, Missing::Room)),
+    }
+}
+
+/// A call request's account and ids, checked before it reaches the live socket. Kicking is for
+/// an owner or an admin; the server checks it again.
+pub(crate) fn call_allowed(account: &AccountKey, id: &str, ids: &[&str]) -> Result<(), Response> {
+    may(account, id)?;
+    if ids.iter().any(|id| !safe_id(id)) {
+        return Err(refused(CHECK));
+    }
+    Ok(())
 }
 
 pub(crate) fn invite(account: AccountKey, role: String) -> Response {
@@ -707,27 +857,19 @@ pub(crate) fn end_sessions(account: &AccountKey) -> Result<(), Response> {
 }
 
 pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<(), String> {
+    start_with(ctx, session, inbox, live::SERVER)
+}
+
+pub(crate) fn start_with(ctx: Context, session: &str, inbox: Receiver<Command>, timing: live::Timing) -> Result<(), String> {
     let saved = parse(session)?;
     if saved.user_id != ctx.account.account {
         return Err("the Tiny server session is for another account".to_owned());
     }
-    let (probe, probe_ctx) = (saved.clone(), ctx.clone());
+    let live = Arc::new(live::Live::new().map_err(|err| err.to_string())?);
+    let (socket, socket_ctx, socket_live) = (saved.clone(), ctx.clone(), live.clone());
     std::thread::Builder::new()
-        .name("tiny-link".into())
-        .spawn(move || match get_me(&probe) {
-            Ok(me) => {
-                let _ = probe_ctx.describe(&join_host(&probe.base_url), &me.email);
-                probe_ctx.link(Link::Connected);
-            }
-            Err(Fault::Unauthorized) => probe_ctx.link(Link::Expired),
-            Err(_) => {
-                eprintln!(
-                    "chatd: {}: could not reach the server",
-                    probe_ctx.account.network.label()
-                );
-                probe_ctx.link(Link::Offline);
-            }
-        })
+        .name("tiny-live".into())
+        .spawn(move || live::keep_live(&socket_ctx, &socket, &socket_live, &timing))
         .map_err(|err| err.to_string())?;
     std::thread::Builder::new()
         .name("tiny-commands".into())
@@ -738,6 +880,7 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
                 Duration::from_millis(200),
                 |_| {},
                 |command| match command {
+                    Command::Tiny(ask) => live.ask(ask),
                     Command::SignOut(reply) => {
                         delete_session(&saved);
                         let _ = reply.send(Ok(()));
@@ -745,6 +888,8 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
                     other => other.unsupported(&ctx),
                 },
             );
+            // The socket thread sleeps on the socket; this is how it hears the adapter stopped.
+            live.wake();
         })
         .map_err(|err| err.to_string())?;
     Ok(())
@@ -1036,9 +1181,12 @@ pub(crate) mod tests {
                     r#"[{"user_id":"11111111-1111-1111-1111-111111111111","email":"ada@example.com","display_name":"Ada","role":"owner","created_at":"2020-01-01T00:00:00Z"}]"#,
                 );
             }
+            if first.starts_with("GET /v1/rooms ") {
+                return http(200, "OK", "[]");
+            }
             http(500, "Internal Server Error", r#"{"error":"no"}"#)
         });
-        with_session(&base, "member", |account| match community(account) {
+        with_session(&base, "member", |account| match community(&test_hub(), account) {
             Response::TinyCommunity { community } => {
                 assert_eq!(community.role, "member");
                 assert_eq!(community.origin, base);
@@ -1082,9 +1230,12 @@ pub(crate) mod tests {
                     r#"[{"id":7,"actor_id":"11111111-1111-1111-1111-111111111111","action":"member.role","subject":"22222222-2222-2222-2222-222222222222","detail":{"to":"admin"},"created_at":"2020-01-02T00:00:00Z"},{"id":8,"actor_id":null,"action":"member.remove","subject":"x","detail":null,"created_at":"2020-01-03T00:00:00Z"}]"#,
                 );
             }
+            if first.starts_with("GET /v1/rooms ") {
+                return http(200, "OK", "[]");
+            }
             http(500, "Internal Server Error", r#"{"error":"no"}"#)
         });
-        with_session(&base, "admin", |account| match community(account) {
+        with_session(&base, "admin", |account| match community(&test_hub(), account) {
             Response::TinyCommunity { community } => {
                 assert_eq!(community.role, "admin");
                 assert_eq!(community.members.len(), 1);
@@ -1102,6 +1253,141 @@ pub(crate) mod tests {
         assert!(lines.iter().any(|line| line.contains("GET /v1/members ")));
         assert!(lines.iter().any(|line| line.contains("GET /v1/invites ")));
         assert!(lines.iter().any(|line| line.contains("GET /v1/audit?limit=50")));
+    }
+
+    fn test_hub() -> Arc<Hub> {
+        Arc::new(Hub::new(crate::store::Store::open(std::path::Path::new(":memory:")).expect("a store in memory")))
+    }
+
+    const BEA: &str = "22222222-2222-2222-2222-222222222222";
+    const LOBBY: &str = "33333333-3333-3333-3333-333333333333";
+
+    /// The rooms come from REST; who sits in each and who is online come from the hub, where
+    /// the live socket put them.
+    #[test]
+    fn the_page_lists_rooms_with_who_is_in_each_call_and_who_is_online() {
+        let members = format!(
+            r#"[{{"user_id":"11111111-1111-1111-1111-111111111111","email":"ada@example.com","display_name":"Ada","role":"owner","created_at":"2020-01-01T00:00:00Z"}},{{"user_id":"{BEA}","email":"bea@example.com","display_name":"Bea","role":"member","created_at":"2020-01-01T00:00:00Z"}}]"#
+        );
+        let rooms = format!(r#"[{{"id":"{LOBBY}","name":"Lobby","created_by":"x","created_at":"t"}},{{"id":"44444444-4444-4444-4444-444444444444","name":"Quiet","created_by":"x","created_at":"t"}}]"#);
+        let base = serve(move |request| {
+            let first = request.lines().next().unwrap_or("");
+            if first.starts_with("GET /v1/members ") {
+                return http(200, "OK", &members);
+            }
+            if first.starts_with("GET /v1/rooms ") {
+                return http(200, "OK", &rooms);
+            }
+            if first.starts_with("GET /health ") {
+                assert!(!request.contains("Bearer"), "health is asked without the session");
+                return http(200, "OK", r#"{"ok":true,"media":"up"}"#);
+            }
+            http(200, "OK", "[]")
+        });
+        let hub = test_hub();
+        with_session(&base, "owner", |account| {
+            let seat = protocol::Occupant { person: Key::new(&account, BEA), name: "Bea".into(), muted: true, deafened: false, streaming: false };
+            hub.set_occupants(Key::new(&account, LOBBY), protocol::Occupants { people: vec![seat], total: 1 });
+            hub.set_presence(Key::new(&account, BEA), Presence::Online, "", true);
+            match community(&hub, account) {
+                Response::TinyCommunity { community } => {
+                    assert_eq!(community.rooms.len(), 2);
+                    assert_eq!(community.rooms[0].name, "Lobby");
+                    assert_eq!(community.rooms[0].participants, [TinySeat { user_id: BEA.into(), muted: true, deafened: false }]);
+                    assert_eq!(community.media, "up");
+                    assert!(community.rooms[1].participants.is_empty());
+                    assert_eq!(community.online, [BEA]);
+                }
+                other => panic!("load: {other:?}"),
+            }
+        });
+        // A server older than rooms answers 404: no rooms, and the page still loads.
+        let older = serve(|request| {
+            let first = request.lines().next().unwrap_or("");
+            if first.starts_with("GET /v1/rooms ") {
+                return http(404, "Not Found", "{}");
+            }
+            http(200, "OK", "[]")
+        });
+        with_session(&older, "member", |account| match community(&test_hub(), account) {
+            Response::TinyCommunity { community } => {
+                assert!(community.rooms.is_empty());
+                assert_eq!(community.media, "", "an older server says nothing of audio");
+            }
+            other => panic!("load: {other:?}"),
+        });
+    }
+
+    #[test]
+    fn an_owner_or_an_admin_makes_renames_and_deletes_rooms_and_a_member_cannot() {
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = log.clone();
+        let base = serve(move |request| {
+            seen.lock().unwrap().push(request.to_owned());
+            let first = request.lines().next().unwrap_or("");
+            let body = request.split("\r\n\r\n").nth(1).unwrap_or("");
+            if first.starts_with("POST /v1/rooms ") {
+                if body.contains("Refused") {
+                    return http(400, "Bad Request", r#"{"error":"invalid"}"#);
+                }
+                return http(201, "Created", &format!(r#"{{"id":"{LOBBY}","name":"Lobby","created_by":"x","created_at":"t"}}"#));
+            }
+            if first.starts_with(&format!("PATCH /v1/rooms/{LOBBY} ")) {
+                return http(200, "OK", &format!(r#"{{"id":"{LOBBY}","name":"Den","created_by":"x","created_at":"t"}}"#));
+            }
+            if first.starts_with(&format!("DELETE /v1/rooms/{LOBBY} ")) {
+                return http(204, "No Content", "");
+            }
+            http(404, "Not Found", r#"{"error":"not_found"}"#)
+        });
+        let last = || log.lock().unwrap().last().cloned().unwrap_or_default();
+        let count = || log.lock().unwrap().len();
+        with_session(&base, "admin", |account| {
+            assert_eq!(create_room(account.clone(), "  Lobby  ".into()), Response::Ok);
+            assert!(last().starts_with("POST /v1/rooms "));
+            assert_eq!(json_body(&last())["name"], "Lobby");
+            assert!(last().contains("Bearer t"));
+            assert_eq!(create_room(account.clone(), "Refused".into()), refused(ROOM_NAME_SIZE));
+            assert_eq!(rename_room(account.clone(), LOBBY.into(), "Den".into()), Response::Ok);
+            assert!(last().starts_with(&format!("PATCH /v1/rooms/{LOBBY} ")));
+            assert_eq!(json_body(&last())["name"], "Den");
+            assert_eq!(rename_room(account.clone(), "44444444".into(), "Den".into()), refused("That room is gone."));
+            assert_eq!(delete_room(account.clone(), LOBBY.into()), Response::Ok);
+            assert!(last().starts_with(&format!("DELETE /v1/rooms/{LOBBY} ")));
+            assert_eq!(delete_room(account.clone(), "44444444".into()), refused("That room is gone."));
+            let before = count();
+            assert_eq!(create_room(account.clone(), "   ".into()), refused(ROOM_NAME_SIZE));
+            assert_eq!(rename_room(account.clone(), LOBBY.into(), "a".repeat(81)), refused(ROOM_NAME_SIZE));
+            assert_eq!(rename_room(account.clone(), "a/b".into(), "Den".into()), refused(CHECK));
+            assert_eq!(delete_room(account.clone(), "../x".into()), refused(CHECK));
+            assert_eq!(count(), before);
+            assert!(call_allowed(&account, "community.calls.kick", &[LOBBY, BEA]).is_ok());
+            assert_eq!(call_allowed(&account, "community.calls.join", &["a/b"]).unwrap_err(), refused(CHECK));
+        });
+        with_session(&base, "member", |account| {
+            let before = count();
+            assert_eq!(create_room(account.clone(), "Lobby".into()), refused(NOT_YOURS));
+            assert_eq!(rename_room(account.clone(), LOBBY.into(), "Den".into()), refused(NOT_YOURS));
+            assert_eq!(delete_room(account.clone(), LOBBY.into()), refused(NOT_YOURS));
+            assert_eq!(call_allowed(&account, "community.calls.kick", &[LOBBY, BEA]).unwrap_err(), refused(NOT_YOURS));
+            assert!(call_allowed(&account, "community.calls.join", &[LOBBY]).is_ok());
+            assert_eq!(count(), before, "nothing a member may not do is asked of the server");
+        });
+    }
+
+    #[test]
+    fn a_new_role_is_written_into_the_session_it_came_from() {
+        let changed = with_role(session(), "11111111-1111-1111-1111-111111111111", "admin").unwrap();
+        assert!(!changed.starts_with('['));
+        assert_eq!(parse(&changed).unwrap().role, "admin");
+        assert_eq!(parse(&changed).unwrap().token, "t");
+        assert_eq!(with_role(session(), "11111111-1111-1111-1111-111111111111", "owner"), None, "the same role writes nothing");
+        assert_eq!(with_role(session(), "someone-else", "admin"), None);
+        let both = combine(session(), other()).unwrap();
+        let changed = with_role(&both, "22222222-2222-2222-2222-222222222222", "admin").unwrap();
+        assert!(changed.starts_with('['));
+        assert_eq!(saved_for(&changed, "22222222-2222-2222-2222-222222222222").unwrap().role, "admin");
+        assert_eq!(saved_for(&changed, "11111111-1111-1111-1111-111111111111").unwrap().role, "owner");
     }
 
     #[test]

@@ -143,7 +143,7 @@ pub struct Pollable {
 }
 
 impl Pollable {
-    fn from_tcp(tcp: &TcpStream) -> Pollable {
+    pub(crate) fn from_tcp(tcp: &TcpStream) -> Pollable {
         #[cfg(unix)]
         {
             Pollable { fd: tcp.as_raw_fd() }
@@ -156,16 +156,16 @@ impl Pollable {
 }
 
 #[cfg(unix)]
-const POLL_IN: libc::c_short = libc::POLLIN;
+pub(crate) const POLL_IN: libc::c_short = libc::POLLIN;
 #[cfg(unix)]
-const POLL_OUT: libc::c_short = libc::POLLOUT;
+pub(crate) const POLL_OUT: libc::c_short = libc::POLLOUT;
 
 #[cfg(windows)]
-const POLL_IN: i16 = windows_sys::Win32::Networking::WinSock::POLLRDNORM as i16;
+pub(crate) const POLL_IN: i16 = windows_sys::Win32::Networking::WinSock::POLLRDNORM as i16;
 #[cfg(windows)]
-const POLL_OUT: i16 = windows_sys::Win32::Networking::WinSock::POLLWRNORM as i16;
+pub(crate) const POLL_OUT: i16 = windows_sys::Win32::Networking::WinSock::POLLWRNORM as i16;
 
-fn wait_sockets(until: Instant, sockets: &[(Pollable, i16)]) {
+pub(crate) fn wait_sockets(until: Instant, sockets: &[(Pollable, i16)]) {
     let ms = until.saturating_duration_since(Instant::now()).as_millis().min(60_000) as i32;
     if ms <= 0 {
         return;
