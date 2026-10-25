@@ -3,9 +3,12 @@
 //! sheet, and a second server is kept beside this one. A control the account cannot use is
 //! absent, never disabled.
 //!
-//! A room is drawn as a voice channel is: its name, then who is in its call. Joining takes a
-//! seat and nothing more, and the room says so: there is no sound yet. Changes arrive from
-//! chatd's live socket (`Change::Tiny`, `Occupants`, `Presence`); nothing here polls.
+//! A room is drawn as a voice channel is: its name, then who is in its call, ringed while they
+//! speak. On a server whose audio is up, joining is a call: the call dock at the foot of the
+//! sidebar carries it, with mute, deafen, devices and Leave, as for a Discord voice channel. On
+//! one without audio, joining takes a seat and nothing more, the room says so, and a strip at the
+//! foot of the sidebar keeps the seat in sight. Changes arrive from chatd's live socket
+//! (`Change::Tiny`, `Occupants`, `Presence`); nothing here polls.
 
 use super::components::{button, button_disabled, field, glyph, list_row, pane_title, section_header, segment, segmented, Avatar, ButtonKind};
 use super::input::{InputEvent, InputKey, TextInput};
@@ -21,8 +24,10 @@ use std::io;
 
 /// Shown when the server's token cannot be wrapped with this server's address.
 const UNMADE: &str = "The invite could not be made into a code.";
-/// Said wherever a seat is: the room is a call, and the call has no sound yet.
-const NO_SOUND: &str = "There's no sound yet. Audio isn't built for Tiny servers, so joining only takes a seat.";
+/// Said wherever a seat is on a server without audio: the room is a call with no sound.
+const NO_SOUND: &str = "This server has no audio turned on, so joining only takes a seat.";
+/// Said in a room on a server with audio. tinyclient cancels no echo yet.
+const HEADPHONES: &str = "Wear headphones: tinyclient doesn't cancel echo yet, so others would hear your speakers.";
 const ROOM_NAME_SIZE: &str = "A room name is 1 to 80 characters.";
 
 /// What the server window is holding. The invite token stays until Done and is never logged.
@@ -137,6 +142,7 @@ struct Seated {
     deafened: bool,
     /// Remove from call is drawn for them.
     kick: bool,
+    speaking: bool,
 }
 
 struct Room {
@@ -183,6 +189,10 @@ struct Ready {
     call_error: Option<String>,
     /// What stands in the way of Join, in words. `None` when a seat can be taken.
     join_blocked: Option<&'static str>,
+    /// The server's audio is up: a join is a call with sound.
+    audio: bool,
+    /// The room whose call the call dock carries now, which takes the seat strip's place.
+    docked: Option<String>,
 }
 
 /// What the pane shows.
@@ -259,12 +269,10 @@ fn can_remove(caller: &str, target: &str, owners: usize) -> bool {
     protocol::tiny_can(caller, "community.members.remove") && remove_legal(caller, target, owners)
 }
 
-/// Why Join cannot be pressed now. A server with audio wants an offer tinyclient cannot make
-/// yet, so it is not asked at all.
+/// Why Join cannot be pressed now.
 fn join_blocked(live: bool, media: &str) -> Option<&'static str> {
     match media {
         _ if !live => Some("Tiny server isn't connected. Join once it is."),
-        "up" => Some("This server has audio, and tinyclient can't join with audio yet. It's coming soon."),
         "down" => Some("This server's audio is down. Try again later."),
         _ => None,
     }
@@ -389,6 +397,12 @@ impl Shell {
             .child(body)
     }
 
+    /// The name of the Tiny room `key` names, for the call dock.
+    pub(super) fn tiny_room(&self, key: &Key) -> Option<String> {
+        let community = self.tiny_state.community.as_ref().filter(|_| self.tiny_state.account.as_ref() == Some(&key.account()))?;
+        community.rooms.iter().find(|room| room.id == key.id).map(|room| room.name.clone())
+    }
+
     fn page(&self) -> Page {
         let state = &self.tiny_state;
         let live = state.account.as_ref().is_some_and(|account| {
@@ -463,6 +477,7 @@ impl Shell {
                         muted: seat.muted,
                         deafened: seat.deafened,
                         kick: can_kick(caller, role_of(&seat.user_id), me.as_deref() == Some(seat.user_id.as_str())),
+                        speaking: seat.speaking,
                     })
                     .collect(),
                 mine: me.as_ref().is_some_and(|me| room.participants.iter().any(|seat| &seat.user_id == me)),
@@ -481,6 +496,8 @@ impl Shell {
             call_busy: state.call_busy,
             call_error: state.call_error.clone(),
             join_blocked: join_blocked(live, &community.media),
+            audio: community.media == "up",
+            docked: self.snapshot.as_ref().and_then(|snapshot| snapshot.call.as_ref()).filter(|call| state.account.as_ref() == Some(&call.conversation.account())).map(|call| call.conversation.id.clone()),
             error: state.error.clone().filter(|detail| !detail.is_empty()),
             token: state.token.clone(),
             origin: state.origin.clone(),
@@ -860,7 +877,7 @@ impl Shell {
                 room.participants = occupants
                     .people
                     .iter()
-                    .map(|occupant| protocol::TinySeat { user_id: occupant.person.id.clone(), muted: occupant.muted, deafened: occupant.deafened })
+                    .map(|occupant| protocol::TinySeat { user_id: occupant.person.id.clone(), muted: occupant.muted, deafened: occupant.deafened, speaking: occupant.speaking })
                     .collect();
                 cx.notify();
             }
@@ -1049,8 +1066,9 @@ fn directory(ready: &Ready, shown: Shown, in_pane: bool, cx: &mut Context<Shell>
     if in_pane {
         return column.into_any_element();
     }
-    // The sidebar keeps the seat in sight, as the call dock does for a voice channel.
-    let seated = ready.rooms.iter().find(|room| room.mine);
+    // The sidebar keeps the seat in sight, as the call dock does for a voice channel. A call
+    // with audio is the dock's to show.
+    let seated = ready.rooms.iter().find(|room| room.mine && ready.docked.as_deref() != Some(room.id.as_str()));
     div().size_full().flex().flex_col().child(column).children(seated.map(|room| seat_strip(room, ready.call_busy, cx))).into_any_element()
 }
 
@@ -1086,7 +1104,7 @@ fn seat_row(room_id: &str, who: &Seated) -> gpui::Stateful<Div> {
     let content = div()
         .child(div().flex_none().w(px(8.)))
         .gap(px(8.))
-        .child(Avatar::new(&key, &who.name, 20.).build())
+        .child(super::call::ringed(Avatar::new(&key, &who.name, 20.).build(), 20., who.speaking))
         .child(div().flex_1().min_w_0().truncate().type_ui().text_color(theme::text_soft()).child(who.name.clone()))
         .children(quiet_glyph(who));
     list_row(gpui::ElementId::from(format!("tiny-seat-{room_id}-{}", who.user_id)), theme::row_height(theme::ROW_ONE), false, false, content).cursor_default()
@@ -1163,14 +1181,14 @@ fn room_view(ready: &Ready, room: &Room, name: (&Entity<TextInput>, bool), cx: &
                     .flex()
                     .items_start()
                     .gap(px(10.))
-                    .child(glyph("icons/volume-x.svg", 16., theme::text_soft()))
+                    .child(glyph(if ready.audio { "icons/headphones.svg" } else { "icons/volume-x.svg" }, 16., theme::text_soft()))
                     .child(
                         div()
                             .flex()
                             .flex_col()
                             .gap(px(4.))
-                            .child(div().type_ui().text_color(theme::text()).child("You're in this room, with no sound."))
-                            .child(div().whitespace_normal().type_small().text_color(theme::text_soft()).child(NO_SOUND)),
+                            .child(div().type_ui().text_color(theme::text()).child(if ready.audio { "You're in this room." } else { "You're in this room, with no sound." }))
+                            .child(div().whitespace_normal().type_small().text_color(theme::text_soft()).child(if ready.audio { HEADPHONES } else { NO_SOUND })),
                     ),
             )
             .child(div().flex().child(leave))
@@ -1178,7 +1196,6 @@ fn room_view(ready: &Ready, room: &Room, name: (&Entity<TextInput>, bool), cx: &
     } else {
         let blocked = ready.join_blocked;
         let button = match blocked {
-            Some(_) if blocked == join_blocked(true, "up") => button_disabled("Audio coming soon").into_any_element(),
             Some(_) => button_disabled("Join").into_any_element(),
             None if ready.call_busy => button_disabled("Join").into_any_element(),
             None => {
@@ -1190,7 +1207,7 @@ fn room_view(ready: &Ready, room: &Room, name: (&Entity<TextInput>, bool), cx: &
             .flex()
             .flex_col()
             .gap(px(12.))
-            .child(div().whitespace_normal().type_ui().text_color(theme::text_soft()).child(blocked.unwrap_or(NO_SOUND)))
+            .child(div().whitespace_normal().type_ui().text_color(theme::text_soft()).child(blocked.unwrap_or(if ready.audio { HEADPHONES } else { NO_SOUND })))
             .child(div().flex().child(button))
             .into_any_element()
     };
@@ -1247,7 +1264,7 @@ fn room_view(ready: &Ready, room: &Room, name: (&Entity<TextInput>, bool), cx: &
                 .flex()
                 .items_center()
                 .gap(px(8.))
-                .child(Avatar::new(&key, &who.name, 20.).build())
+                .child(super::call::ringed(Avatar::new(&key, &who.name, 20.).build(), 20., who.speaking))
                 .child(div().min_w_0().truncate().type_ui().text_color(theme::text()).child(who.name.clone()))
                 .when(mine, |row| row.child(div().type_small().text_color(theme::text_faint()).child("You")))
                 .children(quiet_glyph(who))
@@ -1762,7 +1779,7 @@ mod tests {
         assert!(!can_kick("owner", "owner", true), "Leave is for yourself");
         assert_eq!(join_blocked(true, "off"), None);
         assert_eq!(join_blocked(true, ""), None, "an older server has no audio to ask for");
-        assert!(join_blocked(true, "up").is_some_and(|words| words.contains("coming soon")));
+        assert_eq!(join_blocked(true, "up"), None, "a server with audio takes a join with audio");
         assert!(join_blocked(true, "down").is_some_and(|words| words.contains("down")));
         assert!(join_blocked(false, "off").is_some_and(|words| words.contains("connected")));
     }

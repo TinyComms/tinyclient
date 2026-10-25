@@ -14,6 +14,7 @@ mod shot;
 
 #[allow(unused_imports)]
 pub(super) use people::occupants;
+pub(super) use people::ringed;
 
 use super::components::{glyph, network_icon, tip};
 use super::state::{Shell, Snapshot};
@@ -242,6 +243,12 @@ impl Subject {
                 found.map(|space| space.name.clone())
             });
             return Subject { title: row.title, kind: row.kind, avatar: row.avatar, space };
+        }
+        // A Tiny room is no conversation: its name is on the server's page.
+        if key.network == Network::Tiny {
+            if let Some(room) = shell.tiny_room(key) {
+                return Subject { title: room, kind: ConversationKind::Voice, avatar: None, space: None };
+            }
         }
         // Not on the first page of the Inbox and not open: say who, from the call itself.
         let title = match (&call.state, call.participants.first()) {
@@ -875,6 +882,7 @@ mod tests {
             muted: false,
             deafened: false,
             streaming: false,
+            speaking: false,
         };
         Occupants { people: names.iter().map(person).collect(), total }
     }

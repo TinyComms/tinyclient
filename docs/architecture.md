@@ -62,7 +62,7 @@ How the processes fit together and who may edit what. The contract itself is the
 | `CallStart`, `CallAccept`, `CallDecline`, `CallEnd`, `CallSet`, `Media(..)` | `Status` | `media::Calls`; `Command::Call*` |
 | `Play(Start {account, file, path, conversation, message, title, at, rate, output} \| Pause \| Seek {at} \| Rate {rate} \| Stop)` | `Ok`; then `Change::Playback` | `playback::Player`; `mediad --play` |
 | `TinyCommunity`, `TinyInvite`, `TinyRole`, `TinyRemove`, `TinyRevoke`, `TinyRename`, `TinyPassword`, `TinySignOutEverywhere`, `TinyRoomCreate`, `TinyRoomRename`, `TinyRoomDelete` | `TinyCommunity` (members, invites, audit, rooms with who sits in each, online, the server's `media`); `TinyCode`; `Ok` | `adapters::tiny` over the server's REST; seats and presence from the hub |
-| `TinyCallJoin`, `TinyCallLeave`, `TinyCallKick` | `Ok` once the server took it, or its refusal in words | `Command::Tiny`, sent on the account's live socket (`adapters/tiny/live.rs`). A seat only: no sound, no `mediad` |
+| `TinyCallJoin`, `TinyCallLeave`, `TinyCallKick` | `Ok` once the server took it, or its refusal in words | `Command::Tiny`, sent on the account's live socket (`adapters/tiny/live.rs`). On a server whose `/health` says media is `up`, a join is a call with `mediad` (below); otherwise a seat only. `CallStart` on a Tiny room key is the same join |
 
 - **Rows**: a `Conversation` carries its Space's and Group's titles and its topic
   (`Conversation::subtitle()` is the header's second line: `Space > group · topic`), `read_only`,
@@ -282,6 +282,18 @@ dismissed, mediad is gone, and the adapter is sent `Command::CallLeave` so the n
 showing us in the channel or ringing the other side. That covers a failure the adapter reported,
 one mediad reported, a deadline here (10 s for the session, 35 s to connect, 60 s of ringing),
 and mediad dying at any point, before the session arrived included.
+
+A Tiny server call is offered from our side, so the order is turned round. The live socket
+thread has chatd's call start mediad (`Context::tiny_offer`), which answers `TinyOffer` with
+`Offer {sdp}`: str0m's offer, one `sendonly` audio m-line and one `recvonly` per other seat. It
+goes out as `call.join` `sdp`; `call.answer` comes back as `TinyAnswer` (from here the call is
+joining, with the 35 s deadline), and each `call.slots` for that `call_id` as `TinySlots`.
+`Connected` makes it `Joined` as for Discord. Mute and deafen go out as `call.state`, a hang-up
+or a failure as `call.leave` (only while the socket still sees us in the room), and `call.left`
+for us with `media_timeout`, `media_lost`, `kicked`, `room_deleted` or `joined_elsewhere` fails
+the call in words. After a server restart the live socket sends a fresh `TinyOffer` to the same
+mediad and joins again; mediad keeps its devices and takes up the new connection. str0m, its
+sockets and every packet stay in mediad (`mediad/src/tiny.rs`).
 
 The device menu: the shell sends `Media(Meter {on})` when it opens and closes. While on, mediad
 sends `Levels` and chatd passes our input level on as `Call.level`; `Call.inputs` and

@@ -285,9 +285,18 @@ impl Running {
 
     /// Asks the socket thread, as the command thread would, and waits for the answer.
     fn ask(&self, ask: impl FnOnce(Reply<()>) -> Ask) -> Result<(), String> {
+        self.ask_within(Duration::from_secs(5), ask)
+    }
+
+    /// As `ask`, for a join with audio, which starts mediad first: a loaded machine is slow at it.
+    fn join_with_audio(&self, room: &str) -> Result<(), String> {
+        self.ask_within(Duration::from_secs(30), |reply| Ask::Join { room_id: room.into(), reply })
+    }
+
+    fn ask_within(&self, wait: Duration, ask: impl FnOnce(Reply<()>) -> Ask) -> Result<(), String> {
         let (reply, answer) = channel();
         self.live.ask(ask(reply));
-        match answer.recv_timeout(Duration::from_secs(5)).expect("an answer") {
+        match answer.recv_timeout(wait).expect("an answer") {
             Ok(()) => Ok(()),
             Err(Refusal::Refused(words)) => Err(words),
             Err(Refusal::Unsupported) => Err("unsupported".to_owned()),
@@ -681,7 +690,7 @@ fn the_call(running: &Running) -> Option<protocol::Call> {
 
 /// The server's side of a join with audio: the answer, the seat, the slots and who speaks.
 fn answer_join(conn: &mut Conn, call_id: &str) -> Value {
-    let join = conn.next(Duration::from_secs(10)).expect("a join");
+    let join = conn.next(Duration::from_secs(30)).expect("a join");
     assert_eq!(join["type"], "call.join");
     let sdp = join["sdp"].as_str().expect("a join to a server with audio carries an offer");
     conn.send(json!({"type": "call.answer", "ref": join["ref"], "call_id": call_id, "sdp": answer_for(sdp)}));
@@ -722,7 +731,7 @@ fn a_join_with_audio_carries_mediads_offer_out_and_the_answer_back() {
     until("connected", || running.link().0 == Link::Connected);
     until("the health read", || !running.live.seats_only());
 
-    assert_eq!(running.ask(|reply| Ask::Join { room_id: ROOM.into(), reply }), Ok(()));
+    assert_eq!(running.join_with_audio(ROOM), Ok(()));
     let offer = heard.recv_timeout(Duration::from_secs(5)).expect("the offer");
     assert_eq!(offer.matches("m=audio").count(), ROOM_CAP as usize, "a microphone and a slot for each other seat");
     assert_eq!(offer.matches("a=sendonly").count(), 1);
@@ -737,7 +746,7 @@ fn a_join_with_audio_carries_mediads_offer_out_and_the_answer_back() {
     running.live.ask(Ask::Hangup { room_id: ROOM.into() });
     until("my seat gone", || running.hub.occupants(&running.key(ROOM)).is_some_and(|inside| inside.people.iter().all(|who| who.name != "Ada")));
 
-    assert_eq!(running.ask(|reply| Ask::Join { room_id: ROOM.into(), reply }), Ok(()));
+    assert_eq!(running.join_with_audio(ROOM), Ok(()));
     until("the call failed in words", || the_call(&running).is_some_and(|call| call.state == protocol::CallState::Failed { reason: CallFailure::Lost, detail: MEDIA_LOST.to_owned() }));
     running.live.ask(Ask::Hangup { room_id: ROOM.into() });
     std::thread::sleep(Duration::from_millis(1000));
@@ -749,7 +758,7 @@ fn a_join_with_audio_the_server_refuses_says_why_and_stops_mediad() {
     let fake = fake_with("up", &[], |_, mut conn| {
         conn.send(ready(1, &[ME], json!([])));
         for code in ["bad_sdp", "media_unavailable"] {
-            let join = conn.next(Duration::from_secs(10)).expect("a join");
+            let join = conn.next(Duration::from_secs(30)).expect("a join");
             assert!(join["sdp"].is_string());
             conn.send(json!({"type": "error", "ref": join["ref"], "code": code}));
         }
@@ -759,7 +768,7 @@ fn a_join_with_audio_the_server_refuses_says_why_and_stops_mediad() {
     until("connected", || running.link().0 == Link::Connected);
     until("the health read", || !running.live.seats_only());
     for words in ["The server couldn't use tinyclient's audio setup.", "This server's audio isn't available. Try again later."] {
-        assert_eq!(running.ask(|reply| Ask::Join { room_id: ROOM.into(), reply }), Err(words.to_owned()));
+        assert_eq!(running.join_with_audio(ROOM), Err(words.to_owned()));
         until("no call left behind", || running.hub.calls.describe().0.is_none());
     }
 }
@@ -787,9 +796,9 @@ fn after_a_restart_a_call_with_audio_joins_again_with_a_fresh_offer() {
     let running = run(&fake.base, QUICK);
     until("connected", || running.link().0 == Link::Connected);
     until("the health read", || !running.live.seats_only());
-    assert_eq!(running.ask(|reply| Ask::Join { room_id: ROOM.into(), reply }), Ok(()));
+    assert_eq!(running.join_with_audio(ROOM), Ok(()));
     let first = heard.recv_timeout(Duration::from_secs(5)).expect("the first offer");
-    let again = heard.recv_timeout(Duration::from_secs(10)).expect("the offer after the restart");
+    let again = heard.recv_timeout(Duration::from_secs(30)).expect("the offer after the restart");
     let ufrag = |sdp: &str| sdp.lines().find(|line| line.starts_with("a=ice-ufrag:")).map(str::to_owned);
     assert_ne!(ufrag(&first), ufrag(&again), "a new media session");
     until("the seat again", || running.in_room(ROOM) == ["Ada"]);
@@ -830,7 +839,7 @@ fn a_seat_lost_with_the_socket_is_taken_again_and_one_left_on_purpose_is_not() {
     });
     let running = run(&fake.base, QUICK);
     until("connected", || running.link().0 == Link::Connected);
-    assert_eq!(running.ask(|reply| Ask::Join { room_id: ROOM.into(), reply }), Ok(()));
+    assert_eq!(running.join_with_audio(ROOM), Ok(()));
     for _ in 0..2 {
         fake.connected(Duration::from_secs(5)).expect("a connection");
     }
@@ -912,4 +921,195 @@ fn live_socket_round_trip() {
     until("the seat gone", || running.hub.occupants(&running.key(&room)).is_none());
     drop(running);
     super::super::delete_session(&saved);
+}
+
+/// One side of a call played by hand, as a second tinyclient would: its own live socket and its
+/// own mediad, with the offer and answer carried between them here.
+struct Hand {
+    ws: WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>,
+    mediad: std::process::Child,
+    stdin: Option<std::process::ChildStdin>,
+    frames: Receiver<protocol::MediaResponse>,
+}
+
+impl Hand {
+    fn join(saved: &Saved, room: &str, ice: &str, sink: &std::path::Path) -> Hand {
+        let url = live_url(&saved.base_url, None).expect("a live address");
+        let mut request = url.into_client_request().expect("a request");
+        request.headers_mut().insert("Authorization", HeaderValue::from_str(&format!("Bearer {}", saved.token)).expect("a header"));
+        let (ws, _) = tungstenite::connect(request).expect("the second live socket");
+        if let tungstenite::stream::MaybeTlsStream::Plain(tcp) = ws.get_ref() {
+            tcp.set_read_timeout(Some(Duration::from_millis(200))).expect("a read timeout");
+        }
+        let mut mediad = std::process::Command::new(std::env::var_os("TINYCLIENT_MEDIAD").expect("mediad"))
+            .arg("1")
+            .env("TINYCLIENT_MEDIAD_AUDIO", "tone")
+            .env("TINYCLIENT_MEDIAD_SINK", sink)
+            .env("TINYCLIENT_MEDIAD_ICE", ice)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("the second mediad");
+        let stdin = mediad.stdin.take();
+        let mut stdout = mediad.stdout.take().expect("stdout");
+        let (found, frames) = channel();
+        std::thread::spawn(move || {
+            while let Ok(frame) = protocol::read_frame::<protocol::MediaResponse>(&mut stdout) {
+                if found.send(frame).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut hand = Hand { ws, mediad, stdin, frames };
+        assert!(matches!(hand.frames.recv_timeout(Duration::from_secs(10)), Ok(protocol::MediaResponse::Ready { .. })));
+        let host = tungstenite::http::Uri::try_from(saved.base_url.as_str()).expect("an address").host().unwrap_or("").to_owned();
+        let offer = TinyOffer { user_id: saved.user_id.clone(), host, slots: ROOM_CAP - 1, muted: false, deafened: false };
+        let protocol::MediaResponse::Offer { sdp } = hand.ask(protocol::MediaRequest::TinyOffer(offer)) else {
+            panic!("no offer");
+        };
+        hand.send(json!({"type": "call.join", "ref": "join", "room_id": room, "sdp": sdp}));
+        let answer = hand.until("call.answer", |frame| frame["type"] == "call.answer");
+        let call_id = answer["call_id"].as_str().expect("a call id").to_owned();
+        assert_eq!(hand.ask(protocol::MediaRequest::TinyAnswer { sdp: answer["sdp"].as_str().expect("an answer").to_owned() }), protocol::MediaResponse::Done);
+        let slots = hand.until("call.slots", |frame| frame["type"] == "call.slots" && frame["call_id"] == call_id.as_str());
+        let audio = slots["audio"].as_array().into_iter().flatten().map(|slot| TinySlot { mid: slot["mid"].as_str().unwrap_or("").into(), user_id: slot["user_id"].as_str().unwrap_or("").into() });
+        assert_eq!(hand.ask(protocol::MediaRequest::TinySlots { audio: audio.collect() }), protocol::MediaResponse::Done);
+        hand
+    }
+
+    fn send(&mut self, frame: Value) {
+        self.ws.send(Message::text(frame.to_string())).expect("sent");
+    }
+
+    fn ask(&mut self, request: protocol::MediaRequest) -> protocol::MediaResponse {
+        protocol::write_frame(self.stdin.as_mut().expect("stdin"), &request).expect("written");
+        loop {
+            let frame = self.frames.recv_timeout(Duration::from_secs(10)).expect("mediad answered");
+            if frame.is_reply() {
+                return frame;
+            }
+        }
+    }
+
+    /// The first frame from the server that matches, pinging meanwhile.
+    fn until(&mut self, what: &str, matches: impl Fn(&Value) -> bool) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            assert!(Instant::now() < deadline, "no {what}");
+            match self.ws.read() {
+                Ok(Message::Text(text)) => {
+                    let frame: Value = serde_json::from_str(text.as_str()).expect("JSON");
+                    if matches(&frame) {
+                        return frame;
+                    }
+                }
+                Ok(_) => {}
+                Err(tungstenite::Error::Io(err)) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+                Err(err) => panic!("the second live socket: {err}"),
+            }
+        }
+    }
+
+    fn leave(mut self) {
+        self.send(json!({"type": "call.leave", "ref": "leave"}));
+        self.until("its leave answered", |frame| frame["ref"] == "leave");
+        self.stdin.take();
+        let _ = self.mediad.wait();
+        let _ = self.ws.close(None);
+    }
+}
+
+/// The level of the last half second a mediad played into `sink`. The tone is about 5657.
+fn played_level(sink: &std::path::Path) -> f64 {
+    let bytes = std::fs::read(sink).unwrap_or_default();
+    let pcm: Vec<i16> = bytes.chunks_exact(2).map(|pair| i16::from_le_bytes([pair[0], pair[1]])).collect();
+    let tail = &pcm[pcm.len().saturating_sub(48_000)..];
+    (tail.iter().map(|&s| f64::from(s).powi(2)).sum::<f64>() / tail.len().max(1) as f64).sqrt()
+}
+
+/// A call with audio against a real tinyserver with media on, over UDP and then over ICE-TCP
+/// alone. Not part of `cargo test`: it needs the server running. From tinyserver's checkout:
+///
+/// ```sh
+/// TINYSERVER_PUBLIC_IP=127.0.0.1 cargo run -- serve
+/// ```
+///
+/// and from this one, with the owner's sign-in:
+///
+/// ```sh
+/// TINY_LIVE_BASE=http://127.0.0.1:8080 TINY_LIVE_EMAIL=… TINY_LIVE_PASSWORD=… \
+///   cargo test -p chatd --lib tiny_server_call -- --ignored --nocapture
+/// ```
+///
+/// Ada is the owner, through chatd's own live socket and call, as the app runs it. Bea is a
+/// member it invites for the test, played by hand. Each must hear the other's tone. The room
+/// and Bea are removed afterwards.
+#[test]
+#[ignore]
+fn tiny_server_call() {
+    with_mediad();
+    let base = std::env::var("TINY_LIVE_BASE").expect("TINY_LIVE_BASE");
+    let email = std::env::var("TINY_LIVE_EMAIL").expect("TINY_LIVE_EMAIL");
+    let password = std::env::var("TINY_LIVE_PASSWORD").expect("TINY_LIVE_PASSWORD");
+    let Ok(owner) = super::super::post_session(&base, &email, &password) else {
+        panic!("the owner's sign-in failed");
+    };
+    let made = super::super::call("POST", &format!("{base}/v1/rooms"), Some(&owner.token), Some(json!({"name": "tinyclient audio test"})));
+    let Ok((201, room)) = made else { panic!("the room was not made") };
+    let room = room["id"].as_str().expect("a room id").to_owned();
+    let invited = super::super::call("POST", &format!("{base}/v1/invites"), Some(&owner.token), Some(json!({"role": "member"})));
+    let Ok((201, invite)) = invited else { panic!("the invite was not made") };
+    let bea_email = format!("tinyclient-audio-{}@example.invalid", std::process::id());
+    let Ok(bea) = super::super::post_accept(&base, invite["token"].as_str().expect("a token"), &bea_email, "tinyclient-audio-test", "Bea") else {
+        panic!("Bea could not join");
+    };
+
+    let outcome = std::panic::catch_unwind(|| {
+        for ice in ["udp", "tcp"] {
+            let (ada_sink, bea_sink) = (std::env::temp_dir().join(format!("tc-call-{ice}-ada.pcm")), std::env::temp_dir().join(format!("tc-call-{ice}-bea.pcm")));
+            std::env::set_var("TINYCLIENT_MEDIAD_ICE", ice);
+            std::env::set_var("TINYCLIENT_MEDIAD_SINK", &ada_sink);
+            let hub = Arc::new(Hub::new(Store::open(std::path::Path::new(":memory:")).expect("a store in memory")));
+            let account = AccountKey { network: Network::Tiny, account: owner.user_id.clone() };
+            let (adapter, ctx, _inbox) = local(account.clone(), hub.clone());
+            ctx.link(Link::Offline);
+            let live = Arc::new(Live::new().expect("a wake pair"));
+            let (socket, socket_live) = (owner.clone(), live.clone());
+            let thread = std::thread::spawn(move || keep_live(&ctx, &socket, &socket_live, &SERVER));
+            let ada = Running { hub, account, live, adapter: Some(adapter), thread: Some(thread) };
+            until("the live socket", || ada.link().0 == Link::Connected);
+            until("the server's audio is up", || !ada.live.seats_only());
+
+            assert_eq!(ada.join_with_audio(&room), Ok(()));
+            let bea_hand = Hand::join(&bea, &room, ice, &bea_sink);
+            let joined = Instant::now();
+            let call = || ada.hub.calls.describe().0.filter(|call| call.conversation == ada.key(&room));
+            while call().is_none_or(|call| call.state != protocol::CallState::Joined) {
+                assert!(joined.elapsed() < Duration::from_secs(15), "Ada's call is up over {ice}: {:?}", call());
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            while !((3000. ..7000.).contains(&played_level(&ada_sink)) && (3000. ..7000.).contains(&played_level(&bea_sink))) {
+                assert!(joined.elapsed() < Duration::from_secs(20), "each hears the other over {ice}: {} {}", played_level(&ada_sink), played_level(&bea_sink));
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            eprintln!("over {ice}: Ada hears {:.0}, Bea hears {:.0}", played_level(&ada_sink), played_level(&bea_sink));
+            assert!(call().is_some_and(|call| call.participants.iter().any(|who| who.id == bea.user_id)), "Bea is on Ada's roster");
+            bea_hand.leave();
+            assert_eq!(ada.ask(|reply| Ask::Leave { reply }), Ok(()));
+            until("Ada's call over", || call().is_none());
+            drop(ada);
+            let _ = std::fs::remove_file(&ada_sink);
+            let _ = std::fs::remove_file(&bea_sink);
+        }
+    });
+    std::env::remove_var("TINYCLIENT_MEDIAD_ICE");
+    std::env::remove_var("TINYCLIENT_MEDIAD_SINK");
+    let gone = super::super::call("DELETE", &format!("{base}/v1/rooms/{room}"), Some(&owner.token), None);
+    let removed = super::super::call("DELETE", &format!("{base}/v1/members/{}", bea.user_id), Some(&owner.token), None);
+    super::super::delete_session(&owner);
+    assert!(matches!(gone, Ok((204, _))), "the room was put back");
+    assert!(matches!(removed, Ok((204, _))), "Bea was removed");
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
 }

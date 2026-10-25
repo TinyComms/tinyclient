@@ -19,7 +19,7 @@ use super::super::discord::gateway::{wait_sockets, Pollable, WakePair, POLL_IN, 
 use super::super::{net, Context, Refusal, Reply, ReconnectWait, PANIC_PAUSE, RECONNECTING};
 use crate::hub::lock;
 use super::{members_of, Saved};
-use protocol::{join_host, CallFailure, Link, Occupant, Presence, TinyOffer, TinySlot};
+use protocol::{join_host, CallFailure, Link, Occupant, Participant, Presence, TinyOffer, TinySlot};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -799,14 +799,21 @@ fn ready_heard(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, heard
     ctx.community_changed();
 }
 
-/// Who is in one room's call, with their names, as a voice channel's occupants.
+/// Who is in one room's call, with their names, as a voice channel's occupants. A call chatd
+/// holds in that room gets everyone but us as its roster.
 fn tell(ctx: &Context, seat: &Seat, room: &str) {
     let people = seat.calls.get(room).map(Vec::as_slice).unwrap_or_default();
+    let name = |user: &str| seat.names.get(user).filter(|name| !name.is_empty()).cloned().unwrap_or_else(|| "Someone".to_owned());
+    if ctx.in_call(room) {
+        let others = people.iter().filter(|who| who.user != seat.me);
+        let roster = others.map(|who| Participant { id: who.user.clone(), name: name(&who.user), speaking: false, muted: who.muted, deafened: who.deafened });
+        ctx.participants(room, roster.collect());
+    }
     let occupants = people
         .iter()
         .map(|who| Occupant {
             person: ctx.key(&who.user),
-            name: seat.names.get(&who.user).filter(|name| !name.is_empty()).cloned().unwrap_or_else(|| "Someone".to_owned()),
+            name: name(&who.user),
             muted: who.muted,
             deafened: who.deafened,
             streaming: false,

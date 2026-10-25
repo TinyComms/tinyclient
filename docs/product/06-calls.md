@@ -135,6 +135,15 @@ official app is not installed, the row says "Teams isn't installed" and offers t
 - **Size:** Slack and Telegram each bring a WebRTC-class engine. That lands in mediad, never in
   chatd, but it is tens of MB on disk and real RSS during a call.
 
+- **Echo:** mediad cancels no echo, on Discord calls or Tiny server calls. Discord's own clients
+  cancel it on their side; tinyclient relies on nothing but the speech gate, which keeps the
+  speaker out only while it is quieter than speech. With open speakers the others hear
+  themselves. Until there is echo cancellation the Tiny room says to wear headphones. The next
+  step, measured against the 40 MB mediad budget before it is taken: a pure-Rust port of
+  WebRTC's AEC3 fed the mix as the far end (`sonora-aec3` or `aec3` on crates.io, both young), or
+  the system's voice processing (macOS VoiceProcessingIO, Windows communications mode), which
+  cpal does not open today.
+
 ## Open questions for the owner
 
 1. Is the Discord account you use day to day one you accept losing? If not, Discord calls stay
