@@ -10,6 +10,7 @@ mod accounts;
 mod controls;
 mod pages;
 pub mod rows;
+mod tiny;
 
 use super::app::prefs;
 use super::app::service::Phase;
@@ -131,6 +132,9 @@ pub(super) enum Confirm {
     Retention { days: u32, prunable: Option<(u64, u64)> },
     Clear,
     Reset,
+    /// The Tiny account's password: three fields in the question.
+    TinyPassword(protocol::AccountKey),
+    TinyEverywhere(Box<AccountStatus>),
 }
 
 /// Which device menu is open.
@@ -299,6 +303,8 @@ pub struct SettingsWindow {
     pub(super) copied: Option<Instant>,
     /// A row opened from search, lit for 1.5 s.
     pub(super) highlight: Option<&'static str>,
+    /// The Tiny server account's name and password fields.
+    tiny: tiny::TinyAccount,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -319,9 +325,16 @@ impl SettingsWindow {
                 }
             }),
         ];
+        let (tiny, typed) = tiny::TinyAccount::new(window, cx);
+        subscriptions.extend(typed);
         // The shell's snapshot changing is what redraws the accounts and the call's meter.
         if let Some(shell) = shell.upgrade() {
-            subscriptions.push(cx.observe(&shell, |_, _, cx| cx.notify()));
+            subscriptions.push(cx.observe(&shell, |this, _, cx| {
+                if this.section == Section::Accounts {
+                    this.read_tiny_names(cx);
+                }
+                cx.notify();
+            }));
         }
         let mut this = SettingsWindow {
             shell,
@@ -348,6 +361,7 @@ impl SettingsWindow {
             playing: None,
             copied: None,
             highlight: None,
+            tiny,
             _subscriptions: subscriptions,
         };
         window.focus(&this.focus, cx);
@@ -362,7 +376,7 @@ impl SettingsWindow {
             self.stop_test(cx);
         }
         self.section = section;
-        self.confirm = None;
+        self.close_modal(cx);
         self.picker = None;
         self.highlight = None;
         window.set_window_title(section.name());
@@ -376,10 +390,21 @@ impl SettingsWindow {
         cx.notify();
     }
 
+    /// Closes the question on show. Typed passwords go with it.
+    pub(super) fn close_modal(&mut self, cx: &mut Context<Self>) {
+        self.confirm = None;
+        self.tiny.forget_typed(cx);
+        cx.notify();
+    }
+
     fn entered(&mut self, section: Section, cx: &mut Context<Self>) {
         match section {
             Section::Audio => self.list_devices(cx),
             Section::Storage => self.read_storage(cx),
+            Section::Accounts => {
+                self.tiny.forget_names();
+                self.read_tiny_names(cx);
+            }
             _ => {}
         }
     }
@@ -671,8 +696,8 @@ impl SettingsWindow {
     fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.picker.is_some() {
             self.close_picker(window, cx);
-        } else if self.confirm.take().is_some() {
-            cx.notify();
+        } else if self.confirm.is_some() {
+            self.close_modal(cx);
         } else if !self.query.is_empty() {
             self.query.clear();
             self.search.update(cx, |input, cx| input.set_text("", cx));
@@ -859,12 +884,14 @@ pub(super) fn modal_panel(title: impl Into<SharedString>, words: Vec<String>, ac
                 .flex()
                 .justify_end()
                 .gap(px(8.))
-                .child(button("modal-cancel", ButtonKind::Secondary, "Cancel").on_click(cx.listener(|this, _, _, cx| {
-                    this.confirm = None;
-                    cx.notify();
-                })))
+                .child(button("modal-cancel", ButtonKind::Secondary, "Cancel").on_click(cx.listener(|this, _, _, cx| this.close_modal(cx))))
                 .child(action),
         );
+    modal_layer(panel, cx)
+}
+
+/// A panel over the whole window. A click on the scrim closes it.
+pub(super) fn modal_layer(panel: Div, cx: &mut Context<SettingsWindow>) -> Div {
     div()
         .absolute()
         .inset_0()
@@ -875,10 +902,7 @@ pub(super) fn modal_panel(title: impl Into<SharedString>, words: Vec<String>, ac
                 .inset_0()
                 .bg(theme::scrim())
                 .occlude()
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.confirm = None;
-                    cx.notify();
-                })),
+                .on_click(cx.listener(|this, _, _, cx| this.close_modal(cx))),
         )
         .child(
             div()
@@ -893,7 +917,7 @@ pub(super) fn modal_panel(title: impl Into<SharedString>, words: Vec<String>, ac
 
 impl Render for SettingsWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let modal = self.confirm.clone().map(|confirm| self.modal(&confirm, cx));
+        let modal = self.confirm.clone().map(|confirm| self.modal(&confirm, window, cx));
         let menu = self.picker.and_then(|picker| self.device_menu(picker, window, cx));
         let toast = self.copied.filter(|at| at.elapsed() < Duration::from_secs(4)).map(|_| {
             div().absolute().bottom(px(16.)).left_0().right_0().flex().justify_center().child(
@@ -960,7 +984,7 @@ impl Render for SettingsWindow {
 
 /// `--settings <section> --settings-shot out.png`, with `--shot`: opens Settings on a section
 /// once the shell has its first answer and writes that window's frame. `--settings-search
-/// <words>` types into the search; `--settings-confirm sign-out|clear|reset|retention` opens
+/// <words>` types into the search; `--settings-confirm sign-out|clear|reset|retention|tiny-password|tiny-everywhere` opens
 /// that question.
 #[cfg(feature = "gui-shot")]
 pub fn shot(cx: &mut App) {
@@ -987,6 +1011,12 @@ pub fn shot(cx: &mut App) {
             }
             settings.confirm = match flag("--settings-confirm").as_deref() {
                 Some("sign-out") => settings.shell.upgrade().and_then(|shell| shell.read(cx).snapshot.as_ref()?.accounts.first().cloned()).map(|account| Confirm::SignOut(Box::new(account))),
+                Some("tiny-password") => settings.tiny_accounts(cx).into_iter().next().map(Confirm::TinyPassword),
+                Some("tiny-everywhere") => settings
+                    .shell
+                    .upgrade()
+                    .and_then(|shell| shell.read(cx).snapshot.as_ref()?.accounts.iter().find(|a| a.key.network == protocol::Network::Tiny).cloned())
+                    .map(|account| Confirm::TinyEverywhere(Box::new(account))),
                 Some("clear") => Some(Confirm::Clear),
                 Some("reset") => Some(Confirm::Reset),
                 Some("retention") => Some(Confirm::Retention { days: 7, prunable: Some((41_210, 12 * 1024 * 1024)) }),
