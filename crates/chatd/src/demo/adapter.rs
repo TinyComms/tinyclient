@@ -690,6 +690,8 @@ impl Demo {
                     demo.occupy(&conversation_id, |people, me| people.push(Occupant { muted: muted || deafened, deafened, ..me }));
                 }
             }
+            // The demo has no Tiny server.
+            Command::Tiny(ask) => ask.unsupported(),
             Command::SignOut(reply) => {
                 demo.ctx.pause(millis("TINYCLIENT_DEMO_SIGN_OUT_MS", 150));
                 let _ = reply.send(Ok(()));

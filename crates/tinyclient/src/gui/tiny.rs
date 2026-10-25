@@ -1,19 +1,29 @@
-//! The Tiny server window. People are the sidebar. The pane is the invite, or the one person
-//! you picked. Join a server is always there: it opens the same paste sheet, and a second
-//! server is kept beside this one. A control the account cannot use is absent, never disabled.
+//! The Tiny server window. Rooms and people are the sidebar. The pane is the invite, the one
+//! person you picked, or one room. Join a server is always there: it opens the same paste
+//! sheet, and a second server is kept beside this one. A control the account cannot use is
+//! absent, never disabled.
+//!
+//! A room is drawn as a voice channel is: its name, then who is in its call. Joining takes a
+//! seat and nothing more, and the room says so: there is no sound yet. Changes arrive from
+//! chatd's live socket (`Change::Tiny`, `Occupants`, `Presence`); nothing here polls.
 
-use super::components::{button, button_disabled, glyph, list_row, pane_title, section_header, segment, segmented, Avatar, ButtonKind};
+use super::components::{button, button_disabled, field, glyph, list_row, pane_title, section_header, segment, segmented, Avatar, ButtonKind};
+use super::input::{InputEvent, InputKey, TextInput};
 use super::layout::{drags_window, TOP_BAR};
 use super::sidebar::Mode;
 use super::state::Shell;
 use super::theme::{self, Type};
 use crate::client::ask;
-use gpui::{div, prelude::*, px, AnyElement, ClipboardItem, Context, Div, MouseButton, Window};
-use protocol::{AccountKey, Key, Link, Network, Request, Response};
+use gpui::{div, prelude::*, px, AnyElement, ClipboardItem, Context, Div, Entity, Focusable, MouseButton, Window};
+use protocol::{AccountKey, Change, Key, Link, Network, Presence, Request, Response};
+use std::collections::HashSet;
 use std::io;
 
 /// Shown when the server's token cannot be wrapped with this server's address.
 const UNMADE: &str = "The invite could not be made into a code.";
+/// Said wherever a seat is: the room is a call, and the call has no sound yet.
+const NO_SOUND: &str = "There's no sound yet. Audio isn't built for Tiny servers, so joining only takes a seat.";
+const ROOM_NAME_SIZE: &str = "A room name is 1 to 80 characters.";
 
 /// What the server window is holding. The invite token stays until Done and is never logged.
 pub struct State {
@@ -35,10 +45,38 @@ pub struct State {
     confirm: Option<String>,
     /// A person on show. None is the invite.
     picked: Option<String>,
+    /// A room on show, over the person or the invite.
+    room: Option<String>,
+    /// The room name field is open: for a new room (`None`), or to rename one.
+    naming: Option<Option<String>>,
+    room_name: Entity<TextInput>,
+    /// The room the delete question is open for.
+    confirm_room: Option<String>,
+    /// A join, leave or remove-from-call is with the server. It has its own quiet.
+    call_busy: bool,
+    call_epoch: u64,
+    /// What the server said no to, under the room.
+    call_error: Option<String>,
 }
 
-impl Default for State {
-    fn default() -> State {
+impl State {
+    pub(super) fn new(cx: &mut Context<Shell>) -> State {
+        let room_name = cx.new(|cx| TextInput::new("Room name", cx));
+        cx.subscribe(&room_name, |this, _, event: &InputEvent, cx| match event {
+            InputEvent::Submit => this.save_room(cx),
+            InputEvent::Changed => {
+                this.tiny_state.error = None;
+                cx.notify();
+            }
+        })
+        .detach();
+        cx.subscribe(&room_name, |this, _, event: &InputKey, cx| {
+            if *event == InputKey::Escape {
+                this.tiny_state.naming = None;
+                cx.notify();
+            }
+        })
+        .detach();
         State {
             seen: false,
             account: None,
@@ -54,7 +92,29 @@ impl Default for State {
             busy: false,
             confirm: None,
             picked: None,
+            room: None,
+            naming: None,
+            room_name,
+            confirm_room: None,
+            call_busy: false,
+            call_epoch: 0,
+            call_error: None,
         }
+    }
+
+    /// Everything that belongs to one server's page, when another is shown.
+    fn forget_page(&mut self) {
+        self.community = None;
+        self.token = None;
+        self.origin = None;
+        self.copied = false;
+        self.confirm = None;
+        self.picked = None;
+        self.error = None;
+        self.room = None;
+        self.naming = None;
+        self.confirm_room = None;
+        self.call_error = None;
     }
 }
 
@@ -67,6 +127,24 @@ struct Member {
     make_member: bool,
     make_owner: bool,
     remove: bool,
+}
+
+/// Someone in a room's call.
+struct Seated {
+    user_id: String,
+    name: String,
+    muted: bool,
+    deafened: bool,
+    /// Remove from call is drawn for them.
+    kick: bool,
+}
+
+struct Room {
+    id: String,
+    name: String,
+    people: Vec<Seated>,
+    /// I am in this room's call.
+    mine: bool,
 }
 
 struct OpenInvite {
@@ -91,6 +169,29 @@ struct Ready {
     can_revoke: bool,
     /// `None` when this account cannot read the audit.
     audit: Option<Vec<String>>,
+    rooms: Vec<Room>,
+    can_make_room: bool,
+    can_rename_room: bool,
+    can_delete_room: bool,
+    /// The live socket is up: presence and seats are current.
+    live: bool,
+    online: HashSet<String>,
+    me: Option<String>,
+    naming: Option<Option<String>>,
+    confirm_room: Option<String>,
+    call_busy: bool,
+    call_error: Option<String>,
+    /// What stands in the way of Join, in words. `None` when a seat can be taken.
+    join_blocked: Option<&'static str>,
+}
+
+/// What the pane shows.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Shown<'a> {
+    Invite,
+    Person(&'a str),
+    Room(&'a str),
+    NewRoom,
 }
 
 enum Page {
@@ -156,6 +257,22 @@ fn can_make(caller: &str, target: &str, next: &str, owners: usize) -> bool {
 
 fn can_remove(caller: &str, target: &str, owners: usize) -> bool {
     protocol::tiny_can(caller, "community.members.remove") && remove_legal(caller, target, owners)
+}
+
+/// Why Join cannot be pressed now. A server with audio wants an offer tinyclient cannot make
+/// yet, so it is not asked at all.
+fn join_blocked(live: bool, media: &str) -> Option<&'static str> {
+    match media {
+        _ if !live => Some("Tiny server isn't connected. Join once it is."),
+        "up" => Some("This server has audio, and tinyclient can't join with audio yet. It's coming soon."),
+        "down" => Some("This server's audio is down. Try again later."),
+        _ => None,
+    }
+}
+
+/// Remove from call: an owner, or an admin for anyone but an owner. Never yourself; Leave is.
+fn can_kick(caller: &str, target: &str, mine: bool) -> bool {
+    !mine && protocol::tiny_can(caller, "community.calls.kick") && (same_role(caller, "owner") || !same_role(target, "owner"))
 }
 
 fn role_word(role: &str) -> String {
@@ -230,13 +347,7 @@ impl Shell {
         } else {
             self.tiny_state.account = Some(account);
             self.tiny_state.seen = false;
-            self.tiny_state.community = None;
-            self.tiny_state.token = None;
-            self.tiny_state.origin = None;
-            self.tiny_state.copied = false;
-            self.tiny_state.confirm = None;
-            self.tiny_state.picked = None;
-            self.tiny_state.error = None;
+            self.tiny_state.forget_page();
         }
     }
 
@@ -247,12 +358,17 @@ impl Shell {
             Page::Loading => ("Tiny server".to_owned(), note_line("Loading this server.", false).into_any_element()),
             Page::Failed(detail) => ("Tiny server".to_owned(), note_line(detail, true).into_any_element()),
             Page::Ready(ready) => {
-                let shown = shown_id(self.tiny_state.picked.as_deref(), ready.can_invite, &ready.members);
-                let title = shown
-                    .and_then(|id| ready.members.iter().find(|member| member.user_id == id))
-                    .map(|member| member.name.clone())
-                    .unwrap_or_else(|| "Invite".to_owned());
-                (title, ready_view(ready, shown, me, people_beside, cx))
+                let shown = shown(&self.tiny_state, &ready);
+                let title = match shown {
+                    Shown::Person(id) => ready.members.iter().find(|member| member.user_id == id).map(|member| member.name.clone()),
+                    Shown::Room(id) => ready.rooms.iter().find(|room| room.id == id).map(|room| room.name.clone()),
+                    Shown::NewRoom => Some("New room".to_owned()),
+                    Shown::Invite => None,
+                }
+                .unwrap_or_else(|| "Invite".to_owned());
+                let input = self.tiny_state.room_name.clone();
+                let focused = input.focus_handle(cx).is_focused(window);
+                (title, ready_view(&ready, shown, me, people_beside, (&input, focused), cx))
             }
         };
         div()
@@ -275,6 +391,9 @@ impl Shell {
 
     fn page(&self) -> Page {
         let state = &self.tiny_state;
+        let live = state.account.as_ref().is_some_and(|account| {
+            self.snapshot.as_ref().is_some_and(|snapshot| snapshot.accounts.iter().any(|status| &status.key == account && status.link == Link::Connected))
+        });
         if state.loading && state.community.is_none() {
             return Page::Loading;
         }
@@ -326,7 +445,42 @@ impl Shell {
                 .filter_map(|row| audit_line(&row.action, &row.detail, |id| members.iter().find(|member| member.user_id == id).map(|member| member.name.as_str())))
                 .collect()
         });
+        let me = state.account.as_ref().map(|account| account.account.clone());
+        let role_of = |id: &str| community.members.iter().find(|member| member.user_id == id).map_or("member", |member| member.role.as_str());
+        let name_of = |id: &str| members.iter().find(|member| member.user_id == id).map_or_else(|| "Someone".to_owned(), |member| member.name.clone());
+        let rooms = community
+            .rooms
+            .iter()
+            .map(|room| Room {
+                id: room.id.clone(),
+                name: room.name.clone(),
+                people: room
+                    .participants
+                    .iter()
+                    .map(|seat| Seated {
+                        user_id: seat.user_id.clone(),
+                        name: name_of(&seat.user_id),
+                        muted: seat.muted,
+                        deafened: seat.deafened,
+                        kick: can_kick(caller, role_of(&seat.user_id), me.as_deref() == Some(seat.user_id.as_str())),
+                    })
+                    .collect(),
+                mine: me.as_ref().is_some_and(|me| room.participants.iter().any(|seat| &seat.user_id == me)),
+            })
+            .collect();
         Page::Ready(Ready {
+            rooms,
+            can_make_room: protocol::tiny_can(caller, "community.rooms.create"),
+            can_rename_room: protocol::tiny_can(caller, "community.rooms.rename"),
+            can_delete_room: protocol::tiny_can(caller, "community.rooms.delete"),
+            live,
+            online: if live { community.online.iter().cloned().collect() } else { HashSet::new() },
+            me,
+            naming: state.naming.clone(),
+            confirm_room: state.confirm_room.clone(),
+            call_busy: state.call_busy,
+            call_error: state.call_error.clone(),
+            join_blocked: join_blocked(live, &community.media),
             error: state.error.clone().filter(|detail| !detail.is_empty()),
             token: state.token.clone(),
             origin: state.origin.clone(),
@@ -347,16 +501,12 @@ impl Shell {
     fn fetch(&mut self, account: AccountKey, clear_busy: Option<u64>, cx: &mut Context<Self>) {
         let switched = self.tiny_state.account.as_ref() != Some(&account);
         if switched {
-            self.tiny_state.community = None;
-            self.tiny_state.token = None;
-            self.tiny_state.origin = None;
-            self.tiny_state.copied = false;
-            self.tiny_state.confirm = None;
-            self.tiny_state.picked = None;
-            self.tiny_state.error = None;
+            self.tiny_state.forget_page();
             self.tiny_state.invite_role = "member".into();
             self.tiny_state.action_epoch += 1;
             self.tiny_state.busy = false;
+            self.tiny_state.call_epoch += 1;
+            self.tiny_state.call_busy = false;
         }
         self.tiny_state.account = Some(account.clone());
         if self.tiny_state.community.is_none() {
@@ -383,6 +533,18 @@ impl Shell {
                     }
                     if this.tiny_state.picked.as_ref().is_some_and(|id| community.members.iter().all(|member| &member.user_id != id)) {
                         this.tiny_state.picked = None;
+                    }
+                    // A room deleted from elsewhere takes its pane and its questions with it.
+                    let gone = |id: &String| community.rooms.iter().all(|room| &room.id != id);
+                    if this.tiny_state.room.as_ref().is_some_and(gone) {
+                        this.tiny_state.room = None;
+                        this.tiny_state.call_error = None;
+                    }
+                    if this.tiny_state.confirm_room.as_ref().is_some_and(gone) {
+                        this.tiny_state.confirm_room = None;
+                    }
+                    if matches!(&this.tiny_state.naming, Some(Some(id)) if gone(id)) {
+                        this.tiny_state.naming = None;
                     }
                     // A code that could not be packed stays on screen. A good load would hide it.
                     let unpacked = this.tiny_state.token.is_none()
@@ -427,6 +589,8 @@ impl Shell {
         match answer {
             Ok(Response::Ok) => {
                 self.tiny_state.confirm = None;
+                self.tiny_state.confirm_room = None;
+                self.tiny_state.naming = None;
                 self.tiny_state.error = None;
                 self.fetch(account, Some(epoch), cx);
                 cx.notify();
@@ -536,14 +700,187 @@ impl Shell {
 
     fn pick_invite(&mut self, cx: &mut Context<Self>) {
         self.tiny_state.picked = None;
-        self.tiny_state.confirm = None;
+        self.leave_room_pane();
         cx.notify();
     }
 
     fn pick_person(&mut self, user_id: String, cx: &mut Context<Self>) {
         self.tiny_state.picked = Some(user_id);
-        self.tiny_state.confirm = None;
+        self.leave_room_pane();
         cx.notify();
+    }
+
+    fn pick_room(&mut self, room_id: String, cx: &mut Context<Self>) {
+        if self.tiny_state.room.as_ref() != Some(&room_id) {
+            self.leave_room_pane();
+        }
+        self.tiny_state.room = Some(room_id);
+        cx.notify();
+    }
+
+    /// The room's questions and words go with its pane. The name typed is dropped too.
+    fn leave_room_pane(&mut self) {
+        self.tiny_state.confirm = None;
+        self.tiny_state.room = None;
+        self.tiny_state.naming = None;
+        self.tiny_state.confirm_room = None;
+        self.tiny_state.call_error = None;
+    }
+
+    /// Opens the name field: for a new room, or to rename `room`.
+    fn name_room(&mut self, room: Option<(String, String)>, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tiny_state.busy {
+            return;
+        }
+        let (id, name) = match room {
+            Some((id, name)) => (Some(id), name),
+            None => {
+                self.leave_room_pane();
+                (None, String::new())
+            }
+        };
+        self.tiny_state.error = None;
+        self.tiny_state.confirm_room = None;
+        self.tiny_state.naming = Some(id);
+        self.tiny_state.room_name.update(cx, |input, cx| input.set_text(&name, cx));
+        window.focus(&self.tiny_state.room_name.focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    fn cancel_naming(&mut self, cx: &mut Context<Self>) {
+        self.tiny_state.naming = None;
+        self.tiny_state.error = None;
+        cx.notify();
+    }
+
+    fn save_room(&mut self, cx: &mut Context<Self>) {
+        let Some(naming) = self.tiny_state.naming.clone() else {
+            return;
+        };
+        let Some(account) = self.tiny_state.account.clone() else {
+            return;
+        };
+        let typed = self.tiny_state.room_name.read(cx).text().to_owned();
+        let Some(name) = protocol::tiny_name(&typed).map(str::to_owned) else {
+            self.tiny_state.error = Some(ROOM_NAME_SIZE.to_owned());
+            cx.notify();
+            return;
+        };
+        let request = match naming {
+            None => Request::TinyRoomCreate { account, name },
+            Some(room_id) => Request::TinyRoomRename { account, room_id, name },
+        };
+        self.act(request, cx);
+    }
+
+    fn ask_delete_room(&mut self, room_id: String, cx: &mut Context<Self>) {
+        if self.tiny_state.busy {
+            return;
+        }
+        self.tiny_state.naming = None;
+        self.tiny_state.confirm_room = Some(room_id);
+        cx.notify();
+    }
+
+    fn cancel_delete_room(&mut self, cx: &mut Context<Self>) {
+        self.tiny_state.confirm_room = None;
+        cx.notify();
+    }
+
+    fn send_delete_room(&mut self, room_id: String, cx: &mut Context<Self>) {
+        let Some(account) = self.tiny_state.account.clone() else {
+            return;
+        };
+        self.act(Request::TinyRoomDelete { account, room_id }, cx);
+    }
+
+    fn join_room(&mut self, room_id: String, cx: &mut Context<Self>) {
+        let Some(account) = self.tiny_state.account.clone() else {
+            return;
+        };
+        self.call(Request::TinyCallJoin { account, room_id }, cx);
+    }
+
+    fn leave_call(&mut self, cx: &mut Context<Self>) {
+        let Some(account) = self.tiny_state.account.clone() else {
+            return;
+        };
+        self.call(Request::TinyCallLeave { account }, cx);
+    }
+
+    fn kick(&mut self, room_id: String, user_id: String, cx: &mut Context<Self>) {
+        let Some(account) = self.tiny_state.account.clone() else {
+            return;
+        };
+        self.call(Request::TinyCallKick { account, room_id, user_id }, cx);
+    }
+
+    /// A call request. Nothing is read again on success: the seats arrive as `Occupants`.
+    fn call(&mut self, request: Request, cx: &mut Context<Self>) {
+        if self.tiny_state.call_busy {
+            return;
+        }
+        self.tiny_state.call_busy = true;
+        self.tiny_state.call_error = None;
+        self.tiny_state.call_epoch += 1;
+        let epoch = self.tiny_state.call_epoch;
+        cx.notify();
+        self.off_thread(cx, move || ask(&request), move |this, answer, cx| {
+            if this.tiny_state.call_epoch != epoch {
+                return;
+            }
+            this.tiny_state.call_busy = false;
+            this.tiny_state.call_error = match answer {
+                Ok(Response::Ok) => None,
+                Ok(Response::Error { detail, .. }) => Some(detail),
+                Ok(_) => Some(crate::client::OTHER_ANSWER.to_owned()),
+                Err(err) => Some(crate::client::trouble_words(&err)),
+            };
+            cx.notify();
+        });
+    }
+
+    /// What chatd's live socket says about the server on show. Seats and presence change the
+    /// page where it is; anything else is read again.
+    pub(super) fn tiny_changed(&mut self, change: &Change, cx: &mut Context<Self>) {
+        let Some(account) = self.tiny_state.account.clone() else {
+            return;
+        };
+        match change {
+            Change::Tiny { account: changed } if *changed == account => {
+                // A page not on show reads again when it is shown.
+                if self.tiny_state.seen && self.tiny_state.community.is_some() {
+                    self.fetch(account, None, cx);
+                }
+            }
+            Change::Occupants { conversation, occupants } if conversation.account() == account => {
+                let Some(room) = self.tiny_state.community.as_mut().and_then(|community| community.rooms.iter_mut().find(|room| room.id == conversation.id)) else {
+                    return;
+                };
+                room.participants = occupants
+                    .people
+                    .iter()
+                    .map(|occupant| protocol::TinySeat { user_id: occupant.person.id.clone(), muted: occupant.muted, deafened: occupant.deafened })
+                    .collect();
+                cx.notify();
+            }
+            Change::Presence { person, presence, .. } if person.account() == account => {
+                let Some(community) = self.tiny_state.community.as_mut() else {
+                    return;
+                };
+                let online = *presence == Presence::Online;
+                let known = community.online.iter().position(|id| *id == person.id);
+                match (online, known) {
+                    (true, None) => community.online.push(person.id.clone()),
+                    (false, Some(at)) => {
+                        community.online.remove(at);
+                    }
+                    _ => return,
+                }
+                cx.notify();
+            }
+            _ => {}
+        }
     }
 
     /// The sidebar's list: the invite, then the people. The pane draws the same list only when
@@ -553,10 +890,24 @@ impl Shell {
             Page::Loading => join_column(directory_note("Loading this server.", false), cx),
             Page::Failed(detail) => join_column(directory_note(&detail, true), cx),
             Page::Ready(ready) => {
-                let shown = shown_id(self.tiny_state.picked.as_deref(), ready.can_invite, &ready.members);
+                let shown = shown(&self.tiny_state, &ready);
                 directory(&ready, shown, false, cx)
             }
         }
+    }
+}
+
+/// The room or the form over everything; then the person picked, or the invite.
+fn shown<'a>(state: &'a State, ready: &'a Ready) -> Shown<'a> {
+    if state.naming == Some(None) && ready.can_make_room {
+        return Shown::NewRoom;
+    }
+    if let Some(room) = state.room.as_deref().filter(|id| ready.rooms.iter().any(|room| room.id == *id)) {
+        return Shown::Room(room);
+    }
+    match shown_id(state.picked.as_deref(), ready.can_invite, &ready.members) {
+        Some(id) => Shown::Person(id),
+        None => Shown::Invite,
     }
 }
 
@@ -582,10 +933,18 @@ fn shown_id<'a>(picked: Option<&'a str>, can_invite: bool, members: &'a [Member]
     None
 }
 
-fn ready_view(ready: &Ready, shown: Option<&str>, me: Option<&str>, people_beside: bool, cx: &mut Context<Shell>) -> AnyElement {
-    let detail = match shown.and_then(|id| ready.members.iter().find(|member| member.user_id == id)) {
-        Some(member) => person_view(member, me == Some(member.user_id.as_str()), ready.confirm.as_deref(), cx),
-        None => server_view(ready, cx),
+fn ready_view(ready: &Ready, shown: Shown, me: Option<&str>, people_beside: bool, name: (&Entity<TextInput>, bool), cx: &mut Context<Shell>) -> AnyElement {
+    let detail = match shown {
+        Shown::Person(id) => match ready.members.iter().find(|member| member.user_id == id) {
+            Some(member) => person_view(member, me == Some(member.user_id.as_str()), ready.confirm.as_deref(), cx),
+            None => server_view(ready, cx),
+        },
+        Shown::Room(id) => match ready.rooms.iter().find(|room| room.id == id) {
+            Some(room) => room_view(ready, room, name, cx),
+            None => server_view(ready, cx),
+        },
+        Shown::NewRoom => new_room_view(ready, name, cx),
+        Shown::Invite => server_view(ready, cx),
     };
     let column = div()
         .w_full()
@@ -624,10 +983,10 @@ fn join_column(note: AnyElement, cx: &mut Context<Shell>) -> AnyElement {
         .into_any_element()
 }
 
-fn directory(ready: &Ready, shown: Option<&str>, in_pane: bool, cx: &mut Context<Shell>) -> AnyElement {
-    let mut column = div().id(if in_pane { "tiny-people-pane" } else { "tiny-people" }).w_full().when(!in_pane, |column| column.size_full().overflow_y_scroll()).flex().flex_col();
+fn directory(ready: &Ready, shown: Shown, in_pane: bool, cx: &mut Context<Shell>) -> AnyElement {
+    let mut column = div().id(if in_pane { "tiny-people-pane" } else { "tiny-people" }).w_full().when(!in_pane, |column| column.flex_1().min_h_0().overflow_y_scroll()).flex().flex_col();
     if ready.can_invite {
-        let selected = shown.is_none();
+        let selected = shown == Shown::Invite;
         let content = div()
             .gap(px(8.))
             .child(glyph("icons/plus.svg", 16., if selected { theme::text() } else { theme::text_soft() }))
@@ -638,14 +997,40 @@ fn directory(ready: &Ready, shown: Option<&str>, in_pane: bool, cx: &mut Context
         );
     }
     column = column.child(join_row(cx));
+    if !ready.rooms.is_empty() || ready.can_make_room {
+        column = column.child(section_header("Rooms", false));
+        for (ix, room) in ready.rooms.iter().enumerate() {
+            column = column.child(room_row(ix, room, shown == Shown::Room(&room.id), cx));
+            for who in &room.people {
+                column = column.child(seat_row(&room.id, who));
+            }
+        }
+        if ready.can_make_room {
+            let selected = shown == Shown::NewRoom;
+            let content = div()
+                .gap(px(8.))
+                .child(div().size(px(20.)).flex_none().flex().items_center().justify_center().child(glyph("icons/plus.svg", 16., if selected { theme::text() } else { theme::text_faint() })))
+                .child(div().min_w_0().truncate().type_ui().text_color(theme::text_soft()).child("New room"));
+            column = column.child(
+                list_row("tiny-new-room-row", theme::row_height(theme::ROW_ONE), selected, false, content)
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| this.name_room(None, window, cx))),
+            );
+        }
+    }
     if !ready.members.is_empty() {
         column = column.child(section_header("People", false));
         for (ix, member) in ready.members.iter().enumerate() {
-            let selected = shown == Some(member.user_id.as_str());
+            let selected = shown == Shown::Person(member.user_id.as_str());
             let key = Key { network: Network::Tiny, account: member.user_id.clone(), id: member.user_id.clone() };
+            let mut avatar = Avatar::new(&key, &member.name, theme::row_avatar());
+            // Presence only while the live socket is up: otherwise it is not known.
+            if ready.live {
+                let presence = if ready.online.contains(&member.user_id) { Presence::Online } else { Presence::Offline };
+                avatar = avatar.presence(presence, theme::row_surface(selected));
+            }
             let content = div()
                 .gap(px(10.))
-                .child(Avatar::new(&key, &member.name, theme::row_avatar()).build())
+                .child(avatar.build())
                 .child(
                     div()
                         .min_w_0()
@@ -661,7 +1046,254 @@ fn directory(ready: &Ready, shown: Option<&str>, in_pane: bool, cx: &mut Context
             );
         }
     }
-    column.into_any_element()
+    if in_pane {
+        return column.into_any_element();
+    }
+    // The sidebar keeps the seat in sight, as the call dock does for a voice channel.
+    let seated = ready.rooms.iter().find(|room| room.mine);
+    div().size_full().flex().flex_col().child(column).children(seated.map(|room| seat_strip(room, ready.call_busy, cx))).into_any_element()
+}
+
+/// A room, as a voice channel's row: 28, its glyph, its name, then how many are in it.
+fn room_row(ix: usize, room: &Room, selected: bool, cx: &mut Context<Shell>) -> gpui::Stateful<Div> {
+    let empty = room.people.is_empty();
+    // An empty room rests at a muted row's weight, as an empty voice channel does.
+    let tone = if empty && !selected { theme::text_faint() } else { theme::text() };
+    let content = div()
+        .gap(px(8.))
+        .child(div().size(px(20.)).flex_none().flex().items_center().justify_center().child(glyph("icons/volume-2.svg", 16., if empty { theme::text_faint() } else { theme::text_soft() })))
+        .child(div().min_w_0().truncate().type_ui().text_color(tone).child(room.name.clone()))
+        .child(div().flex_1())
+        .when(!empty, |row| {
+            row.child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(2.))
+                    .child(glyph("icons/volume-2.svg", 12., theme::text_faint()))
+                    .child(div().type_micro().text_color(theme::text_faint()).child(room.people.len().to_string())),
+            )
+        });
+    let room_id = room.id.clone();
+    list_row(("tiny-room", ix), theme::row_height(theme::ROW_ONE), selected, false, content)
+        .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| this.pick_room(room_id.clone(), cx)))
+}
+
+/// Someone in a room, under it, as a voice channel's occupant.
+fn seat_row(room_id: &str, who: &Seated) -> gpui::Stateful<Div> {
+    let key = Key { network: Network::Tiny, account: who.user_id.clone(), id: who.user_id.clone() };
+    let content = div()
+        .child(div().flex_none().w(px(8.)))
+        .gap(px(8.))
+        .child(Avatar::new(&key, &who.name, 20.).build())
+        .child(div().flex_1().min_w_0().truncate().type_ui().text_color(theme::text_soft()).child(who.name.clone()))
+        .children(quiet_glyph(who));
+    list_row(gpui::ElementId::from(format!("tiny-seat-{room_id}-{}", who.user_id)), theme::row_height(theme::ROW_ONE), false, false, content).cursor_default()
+}
+
+/// Muted or deafened, as an occupant shows it. Deafened says both.
+fn quiet_glyph(who: &Seated) -> Option<gpui::Svg> {
+    if who.deafened {
+        Some(glyph("icons/headphone-off.svg", 14., theme::danger()))
+    } else if who.muted {
+        Some(glyph("icons/mic-off.svg", 14., theme::danger()))
+    } else {
+        None
+    }
+}
+
+/// Where I am sitting, at the foot of the sidebar, with Leave.
+fn seat_strip(room: &Room, busy: bool, cx: &mut Context<Shell>) -> Div {
+    let leave = if busy {
+        button_disabled("Leave").into_any_element()
+    } else {
+        button("tiny-strip-leave", ButtonKind::Secondary, "Leave").on_click(cx.listener(|this, _, _, cx| this.leave_call(cx))).into_any_element()
+    };
+    let room_id = room.id.clone();
+    div()
+        .flex_none()
+        .border_t_1()
+        .border_color(theme::border())
+        .px(px(theme::PANE_PAD))
+        .py(px(8.))
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .child(glyph("icons/volume-x.svg", 16., theme::text_soft()))
+        .child(
+            div()
+                .id("tiny-strip-room")
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .cursor_pointer()
+                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| this.pick_room(room_id.clone(), cx)))
+                .child(div().min_w_0().truncate().type_ui().text_color(theme::text()).child(room.name.clone()))
+                .child(div().min_w_0().truncate().type_small().text_color(theme::text_soft()).child("Seated, no sound yet")),
+        )
+        .child(leave)
+}
+
+/// One room: who is in it, Join or Leave, and for an owner or an admin, rename and delete.
+fn room_view(ready: &Ready, room: &Room, name: (&Entity<TextInput>, bool), cx: &mut Context<Shell>) -> AnyElement {
+    let renaming = matches!(&ready.naming, Some(Some(id)) if *id == room.id);
+    let confirming = ready.confirm_room.as_deref() == Some(room.id.as_str());
+    let count = match room.people.len() {
+        0 => "Nobody is in this room.".to_owned(),
+        1 => "1 person is in this room.".to_owned(),
+        n => format!("{n} people are in this room."),
+    };
+    let join = if room.mine {
+        let leave = if ready.call_busy {
+            button_disabled("Leave").into_any_element()
+        } else {
+            button("tiny-leave", ButtonKind::Secondary, "Leave").on_click(cx.listener(|this, _, _, cx| this.leave_call(cx))).into_any_element()
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(12.))
+            .child(
+                div()
+                    .p(px(16.))
+                    .rounded(px(theme::R_CARD))
+                    .bg(theme::raised())
+                    .flex()
+                    .items_start()
+                    .gap(px(10.))
+                    .child(glyph("icons/volume-x.svg", 16., theme::text_soft()))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(4.))
+                            .child(div().type_ui().text_color(theme::text()).child("You're in this room, with no sound."))
+                            .child(div().whitespace_normal().type_small().text_color(theme::text_soft()).child(NO_SOUND)),
+                    ),
+            )
+            .child(div().flex().child(leave))
+            .into_any_element()
+    } else {
+        let blocked = ready.join_blocked;
+        let button = match blocked {
+            Some(_) if blocked == join_blocked(true, "up") => button_disabled("Audio coming soon").into_any_element(),
+            Some(_) => button_disabled("Join").into_any_element(),
+            None if ready.call_busy => button_disabled("Join").into_any_element(),
+            None => {
+                let room_id = room.id.clone();
+                button("tiny-join", ButtonKind::Primary, "Join").on_click(cx.listener(move |this, _, _, cx| this.join_room(room_id.clone(), cx))).into_any_element()
+            }
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(12.))
+            .child(div().whitespace_normal().type_ui().text_color(theme::text_soft()).child(blocked.unwrap_or(NO_SOUND)))
+            .child(div().flex().child(button))
+            .into_any_element()
+    };
+    let mut column = div()
+        .px(px(theme::PANE_PAD))
+        .pt(px(20.))
+        .flex()
+        .flex_col()
+        .gap(px(16.))
+        .max_w(px(440.))
+        .child(div().type_ui().text_color(theme::text()).child(count))
+        .child(join)
+        .children(ready.call_error.as_ref().map(|detail| div().whitespace_normal().type_small().text_color(theme::danger()).child(detail.clone())))
+        .children(ready.error.as_ref().map(|detail| div().whitespace_normal().type_small().text_color(theme::danger()).child(detail.clone())));
+    let manage = ready.can_rename_room || ready.can_delete_room;
+    if renaming {
+        column = column.child(name_form(name, "Save", ready.busy, cx));
+    } else if confirming {
+        let room_id = room.id.clone();
+        column = column.child(
+            div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap(px(8.))
+                .child(div().whitespace_normal().type_ui().text_color(theme::text()).child(format!("Delete {}? Anyone in it leaves the call.", room.name)))
+                .child(button("tiny-room-delete-yes", ButtonKind::Danger, "Delete").on_click(cx.listener(move |this, _, _, cx| this.send_delete_room(room_id.clone(), cx))))
+                .child(button("tiny-room-delete-no", ButtonKind::Secondary, "Cancel").on_click(cx.listener(|this, _, _, cx| this.cancel_delete_room(cx)))),
+        );
+    } else if manage && !ready.busy {
+        let mut actions = div().flex().flex_wrap().gap(px(4.));
+        if ready.can_rename_room {
+            let (id, now) = (room.id.clone(), room.name.clone());
+            actions = actions.child(
+                button("tiny-room-rename", ButtonKind::Secondary, "Rename…").on_click(cx.listener(move |this, _, window, cx| this.name_room(Some((id.clone(), now.clone())), window, cx))),
+            );
+        }
+        if ready.can_delete_room {
+            let id = room.id.clone();
+            actions = actions.child(button("tiny-room-delete", ButtonKind::Danger, "Delete room").on_click(cx.listener(move |this, _, _, cx| this.ask_delete_room(id.clone(), cx))));
+        }
+        column = column.child(actions);
+    }
+    let mut page = div().flex().flex_col().child(column);
+    if !room.people.is_empty() {
+        let room_id = room.id.clone();
+        page = page.child(div().mt(px(8.)).flex().flex_col().child(section_header("In this room", false)).children(room.people.iter().map(|who| {
+            let key = Key { network: Network::Tiny, account: who.user_id.clone(), id: who.user_id.clone() };
+            let mine = ready.me.as_deref() == Some(who.user_id.as_str());
+            let (room_id, user_id) = (room_id.clone(), who.user_id.clone());
+            div()
+                .px(px(theme::PANE_PAD))
+                .h(px(theme::ROW_ONE))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .child(Avatar::new(&key, &who.name, 20.).build())
+                .child(div().min_w_0().truncate().type_ui().text_color(theme::text()).child(who.name.clone()))
+                .when(mine, |row| row.child(div().type_small().text_color(theme::text_faint()).child("You")))
+                .children(quiet_glyph(who))
+                .child(div().flex_1())
+                .when(who.kick && !ready.call_busy, |row| {
+                    row.child(
+                        button(gpui::ElementId::from(format!("tiny-kick-{user_id}")), ButtonKind::Ghost, "Remove from call")
+                            .on_click(cx.listener(move |this, _, _, cx| this.kick(room_id.clone(), user_id.clone(), cx))),
+                    )
+                })
+        })));
+    }
+    page.into_any_element()
+}
+
+fn new_room_view(ready: &Ready, name: (&Entity<TextInput>, bool), cx: &mut Context<Shell>) -> AnyElement {
+    div()
+        .px(px(theme::PANE_PAD))
+        .pt(px(20.))
+        .flex()
+        .flex_col()
+        .gap(px(16.))
+        .max_w(px(440.))
+        .child(div().type_title().text_color(theme::text()).child("New room"))
+        .child(div().whitespace_normal().type_ui().text_color(theme::text_soft()).child("A room is a voice channel. People join and leave it as they like."))
+        .children(ready.error.as_ref().map(|detail| div().whitespace_normal().type_small().text_color(theme::danger()).child(detail.clone())))
+        .child(name_form(name, "Create", ready.busy, cx))
+        .into_any_element()
+}
+
+/// The room name field, its button, and Cancel.
+fn name_form(name: (&Entity<TextInput>, bool), save: &'static str, busy: bool, cx: &mut Context<Shell>) -> Div {
+    let (input, focused) = name;
+    let save = if busy {
+        button_disabled(save).into_any_element()
+    } else {
+        button("tiny-room-save", ButtonKind::Primary, save).on_click(cx.listener(|this, _, _, cx| this.save_room(cx))).into_any_element()
+    };
+    div()
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .gap(px(8.))
+        .child(field(focused).w(px(220.)).child(input.clone()))
+        .child(save)
+        .child(button("tiny-room-cancel", ButtonKind::Secondary, "Cancel").on_click(cx.listener(|this, _, _, cx| this.cancel_naming(cx))))
 }
 
 fn server_view(ready: &Ready, cx: &mut Context<Shell>) -> AnyElement {
@@ -1118,6 +1750,21 @@ mod tests {
         assert_eq!(audit_line("nope", "membership", |_| None), None);
         assert_eq!(short_day("2026-11-01T00:00:00Z"), "Nov 1, 2026");
         assert_eq!(short_day("soon"), "soon");
+    }
+
+    #[test]
+    fn remove_from_call_follows_the_servers_rule_and_join_says_what_stands_in_its_way() {
+        assert!(can_kick("owner", "owner", false));
+        assert!(can_kick("owner", "member", false));
+        assert!(can_kick("admin", "admin", false));
+        assert!(!can_kick("admin", "owner", false), "an admin may not remove an owner from a call");
+        assert!(!can_kick("member", "member", false));
+        assert!(!can_kick("owner", "owner", true), "Leave is for yourself");
+        assert_eq!(join_blocked(true, "off"), None);
+        assert_eq!(join_blocked(true, ""), None, "an older server has no audio to ask for");
+        assert!(join_blocked(true, "up").is_some_and(|words| words.contains("coming soon")));
+        assert!(join_blocked(true, "down").is_some_and(|words| words.contains("down")));
+        assert!(join_blocked(false, "off").is_some_and(|words| words.contains("connected")));
     }
 
     #[test]

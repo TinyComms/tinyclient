@@ -61,6 +61,8 @@ How the processes fit together and who may edit what. The contract itself is the
 | `SignIn {network, at}`, `SignOut {account}` | `Status` | server |
 | `CallStart`, `CallAccept`, `CallDecline`, `CallEnd`, `CallSet`, `Media(..)` | `Status` | `media::Calls`; `Command::Call*` |
 | `Play(Start {account, file, path, conversation, message, title, at, rate, output} \| Pause \| Seek {at} \| Rate {rate} \| Stop)` | `Ok`; then `Change::Playback` | `playback::Player`; `mediad --play` |
+| `TinyCommunity`, `TinyInvite`, `TinyRole`, `TinyRemove`, `TinyRevoke`, `TinyRename`, `TinyPassword`, `TinySignOutEverywhere`, `TinyRoomCreate`, `TinyRoomRename`, `TinyRoomDelete` | `TinyCommunity` (members, invites, audit, rooms with who sits in each, online, the server's `media`); `TinyCode`; `Ok` | `adapters::tiny` over the server's REST; seats and presence from the hub |
+| `TinyCallJoin`, `TinyCallLeave`, `TinyCallKick` | `Ok` once the server took it, or its refusal in words | `Command::Tiny`, sent on the account's live socket (`adapters/tiny/live.rs`). A seat only: no sound, no `mediad` |
 
 - **Rows**: a `Conversation` carries its Space's and Group's titles and its topic
   (`Conversation::subtitle()` is the header's second line: `Space > group · topic`), `read_only`,
@@ -198,6 +200,10 @@ changing again replaces its entry, so the list is bounded (256) by how many thin
   mute, deafen and streaming flags, and the true total. It never announces the tree. The current
   value rides on the row whenever `Tree`, `Conversation` or `Inbox` is read; an emptied channel
   is told once with a total of 0. Held for 256 channels at most, never stored.
+- `Tiny {account}` says a Tiny server's people, roles, invites or rooms changed: read
+  `TinyCommunity` again. Its live socket sends it for each room, member and invite event, and
+  after each `ready`. Who sits in a room is `Occupants` under the room's id, and who is online
+  `Presence`, as for a voice channel.
 - `reset: true` means read everything on screen again: `seq` starts from the clock at each chatd
   start, so a shell that outlived a restart or fell more than 256 things behind is told so.
 - Presence is kept only for owned lists and for `Watching.people` (500 at most, 2,000 entries in

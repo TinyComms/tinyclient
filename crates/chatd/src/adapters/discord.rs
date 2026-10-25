@@ -12,7 +12,8 @@
 
 mod content;
 mod events;
-mod gateway;
+/// Its socket waits are shared with the Tiny server's live socket.
+pub(super) mod gateway;
 mod info;
 mod members;
 mod model;

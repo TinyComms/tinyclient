@@ -72,7 +72,7 @@ Current release: [v0.2.14](https://github.com/itz4blitz/tinyclient/releases/tag/
 | **Telegram** | QR code from your phone, or a phone number and code, plus a 2FA password | Chats, folders, topics, photos, pins | Text, files, reactions, edit, delete, mute, leave | Calls open in Telegram |
 | **Signal** | Linked as a device. Scan a QR code from your phone. | Direct and group chats, replies, mentions, reactions, edits, deletes. Photos and files appear as a labelled line. Nothing from before the link. Your own chat is **Note to Self**, including messages sent from your phone. | Text, replies, reactions, edit and delete your own | Not built |
 | **Messages** | Paired from the Android phone, the way [messages.google.com](https://messages.google.com) is. The phone stays the account and has to stay online. | Texts in the chats the phone already has. Photos are shown. Other files are named and can be opened. | Text, one file at a time, reactions. A large photo may be sent as a smaller copy. | Opens in Messages |
-| **Tiny server** | Server address, email, and password, in the app. One server. | Not yet: no conversations | Not yet | Not yet |
+| **Tiny server** | Server address, email, and password, in the app, or a code from an invite. More than one server. | Its rooms and who is in each, its people with presence, invites and the activity for an owner or an admin, all kept current over its live socket. No conversations. | Make, rename and delete rooms, invite, change roles, remove people, remove someone from a call | Join and leave a room's call, but only to take a seat: there is no sound yet. A server with audio turned on is not joined until tinyclient has audio. |
 
 A few behaviours that are easy to miss:
 

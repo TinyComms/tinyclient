@@ -1390,6 +1390,38 @@ pub enum Request {
     TinySignOutEverywhere {
         account: AccountKey,
     },
+    /// Makes a room, for an owner or an admin. Its call is empty until someone joins.
+    TinyRoomCreate {
+        account: AccountKey,
+        name: String,
+    },
+    /// Renames one room, for an owner or an admin.
+    TinyRoomRename {
+        account: AccountKey,
+        room_id: String,
+        name: String,
+    },
+    /// Deletes one room, for an owner or an admin. Anyone in its call leaves it.
+    TinyRoomDelete {
+        account: AccountKey,
+        room_id: String,
+    },
+    /// Takes a seat in a room's call, leaving any other first. There is no sound yet: the
+    /// seat is all it is. Answers `Ok` once the server took it.
+    TinyCallJoin {
+        account: AccountKey,
+        room_id: String,
+    },
+    /// Leaves the call this account is in. Not being in one is not an error.
+    TinyCallLeave {
+        account: AccountKey,
+    },
+    /// Removes someone from a room's call, for an owner or an admin.
+    TinyCallKick {
+        account: AccountKey,
+        room_id: String,
+        user_id: String,
+    },
 }
 
 /// One thing that changed. The shell asks again for exactly that; the ephemeral kinds carry their
@@ -1447,6 +1479,9 @@ pub enum Change {
     Settings,
     /// Ephemeral. The microphone test's level, 0 to 100; `None` once the test is over.
     Meter { level: Option<u8> },
+    /// A Tiny server's people, roles, invites or rooms changed: ask `TinyCommunity`. Who is in
+    /// a room's call is `Occupants`, and who is online `Presence`.
+    Tiny { account: AccountKey },
 }
 
 impl Change {
@@ -1472,7 +1507,8 @@ impl Change {
             (Change::Spaces { account: a }, Change::Spaces { account: b })
             | (Change::Folders { account: a }, Change::Folders { account: b })
             | (Change::Searched { account: a, .. }, Change::Searched { account: b, .. })
-            | (Change::People { account: a }, Change::People { account: b }) => a == b,
+            | (Change::People { account: a }, Change::People { account: b })
+            | (Change::Tiny { account: a }, Change::Tiny { account: b }) => a == b,
             (Change::Media { account: a, file: x }, Change::Media { account: b, file: y }) => {
                 a == b && x.id == y.id
             }
