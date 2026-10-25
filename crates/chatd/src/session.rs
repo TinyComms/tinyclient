@@ -1,7 +1,7 @@
 //! Signed-in sessions, kept in the login keychain and nowhere else.
 //!
 //! One item per network, holding what that network's sign-in produced. A sign-in that yields
-//! several accounts (Slack workspaces) is still one item; `adapters::accounts` splits it.
+//! several accounts (Slack workspaces, Tiny servers) is still one item; `adapters::accounts` splits it.
 
 use keyring::Entry;
 use protocol::Network;

@@ -5,7 +5,7 @@
 
 use super::components::{
     button, button_disabled, divider, empty_state, fade_in, glyph, icon_button, menu, menu_item,
-    menu_item_danger, menu_label, menu_separator, network_icon, place, placed, popover, scrim, tip,
+    menu_item_check, menu_item_danger, menu_label, menu_separator, network_icon, place, placed, popover, scrim, tip,
     toast, ButtonKind, Layer, Place, NO_GLYPH,
 };
 use super::state::{Shell, Snapshot};
@@ -620,15 +620,39 @@ impl Shell {
             Menu::Network(network) => {
                 let network = *network;
                 let mut items = menu().w(px(220.));
+                let current = self.tiny_account().cloned();
+                let many = network == Network::Tiny && snapshot.accounts_of(network) > 1;
                 for account in snapshot.accounts.iter().filter(|a| a.key.network == network) {
                     let key = account.key.clone();
-                    items = items.child(menu_label(account.name.clone())).child(
+                    if many {
+                        let on = current.as_ref() == Some(&account.key);
+                        let show = key.clone();
+                        items = items.child(
+                            menu_item_check(("show-server", items_id(&account.key.account)), on, account.name.clone(), None).on_click(
+                                cx.listener(move |this, _, _, cx| {
+                                    this.close_menu(cx);
+                                    this.prefer_tiny(show.clone(), cx);
+                                }),
+                            ),
+                        );
+                    } else {
+                        items = items.child(menu_label(account.name.clone()));
+                    }
+                    items = items.child(
                         menu_item_danger(("sign-out", items_id(&account.key.account)), Some("icons/log-out.svg"), "Sign out")
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.close_menu(cx);
                                 this.sign_out(key.clone(), cx);
                             })),
                     );
+                }
+                if network == Network::Tiny {
+                    items = items
+                        .child(menu_separator())
+                        .child(menu_item("join-server", Some("icons/log-in.svg"), "Join a server", None).on_click(cx.listener(|this, _, _, cx| {
+                            this.close_menu(cx);
+                            this.sign_in(Network::Tiny, cx);
+                        })));
                 }
                 placed("menu-network-at", Place::Below(strip_button), Layer::Menu, window, fade_in("menu-network", 120, items))
             }
@@ -698,7 +722,8 @@ impl Shell {
         )
     }
 
-    /// The add popover: networks not signed in, another Slack workspace, then what comes later.
+    /// The add popover: networks not signed in, another Slack workspace, another Tiny server,
+    /// then what comes later.
     fn add_menu(&self, snapshot: &Snapshot, cx: &mut Context<Self>) -> Div {
         let row = |ix: usize, network: Network, title: SharedString, line: SharedString, available: bool| {
             let waiting = self.signing_in == Some(network);
@@ -747,6 +772,8 @@ impl Shell {
                 list = add(list, network, network.label(), "Sign in", true);
             } else if network == Network::Slack {
                 list = add(list, network, "Add a Slack workspace", "Sign in to another workspace", true);
+            } else if network == Network::Tiny {
+                list = add(list, network, "Add a Tiny server", "Join with a code", true);
             }
         }
         for network in NETWORK_ORDER.into_iter().filter(|network| !AVAILABLE.contains(network)) {

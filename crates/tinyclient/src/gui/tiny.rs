@@ -1,10 +1,11 @@
 //! The Tiny server window. People are the sidebar. The pane is the invite, or the one person
-//! you picked. A control the account cannot use is absent, never disabled.
+//! you picked. Join a server is always there: it opens the same paste sheet, and a second
+//! server is kept beside this one. A control the account cannot use is absent, never disabled.
 
 use super::components::{button, button_disabled, glyph, list_row, pane_title, section_header, segment, segmented, Avatar, ButtonKind};
 use super::layout::{drags_window, TOP_BAR};
 use super::sidebar::Mode;
-use super::state::{Shell, Snapshot};
+use super::state::Shell;
 use super::theme::{self, Type};
 use crate::client::ask;
 use gpui::{div, prelude::*, px, AnyElement, ClipboardItem, Context, Div, MouseButton, Window};
@@ -96,12 +97,20 @@ enum Page {
     Ready(Ready),
 }
 
-fn connected(snapshot: &Snapshot) -> Option<AccountKey> {
-    snapshot
-        .accounts
+/// The server on show. The one already open stays, including while it is still connecting.
+/// Otherwise the first connected server, then any Tiny server that is still signed in.
+fn preferred_tiny(accounts: &[(AccountKey, Link)], current: Option<&AccountKey>) -> Option<AccountKey> {
+    let signed_in = |key: &AccountKey, link: Link| key.network == Network::Tiny && link != Link::SignedOut;
+    if let Some(current) = current {
+        if accounts.iter().any(|(key, link)| key == current && signed_in(key, *link)) {
+            return Some(current.clone());
+        }
+    }
+    accounts
         .iter()
-        .find(|status| status.key.network == Network::Tiny && status.link == Link::Connected)
-        .map(|status| status.key.clone())
+        .find(|(key, link)| key.network == Network::Tiny && *link == Link::Connected)
+        .or_else(|| accounts.iter().find(|(key, link)| signed_in(key, *link)))
+        .map(|(key, _)| key.clone())
 }
 
 fn same_role(role: &str, name: &str) -> bool {
@@ -187,6 +196,11 @@ impl Shell {
         self.tiny_state.seen
     }
 
+    /// The server the page is showing, when one has been chosen.
+    pub(super) fn tiny_account(&self) -> Option<&AccountKey> {
+        self.tiny_state.account.as_ref()
+    }
+
     fn tiny_shown(&self) -> Option<AccountKey> {
         if self.shown().empty_state().is_some() {
             return None;
@@ -198,7 +212,30 @@ impl Shell {
         if snapshot.open.is_some() {
             return None;
         }
-        connected(snapshot)
+        let accounts: Vec<(AccountKey, Link)> = snapshot.accounts.iter().map(|status| (status.key.clone(), status.link)).collect();
+        preferred_tiny(&accounts, self.tiny_state.account.as_ref())
+    }
+
+    /// Remembers which server the page shows. When the page is up, it loads that server now.
+    pub(super) fn prefer_tiny(&mut self, account: AccountKey, cx: &mut Context<Self>) {
+        if self.tiny_state.account.as_ref() == Some(&account) && (self.tiny_state.community.is_some() || self.tiny_state.loading) {
+            return;
+        }
+        let showing = matches!(self.sidebar_state.mode, Mode::Network(Network::Tiny)) && self.snapshot.as_ref().is_some_and(|snapshot| snapshot.open.is_none());
+        if showing {
+            self.tiny_state.seen = true;
+            self.fetch(account, None, cx);
+        } else {
+            self.tiny_state.account = Some(account);
+            self.tiny_state.seen = false;
+            self.tiny_state.community = None;
+            self.tiny_state.token = None;
+            self.tiny_state.origin = None;
+            self.tiny_state.copied = false;
+            self.tiny_state.confirm = None;
+            self.tiny_state.picked = None;
+            self.tiny_state.error = None;
+        }
     }
 
     pub(super) fn tiny_page(&self, people_beside: bool, window: &Window, cx: &mut Context<Self>) -> Div {
@@ -503,8 +540,8 @@ impl Shell {
     /// the sidebar is not beside it.
     pub(super) fn tiny_directory(&self, cx: &mut Context<Self>) -> AnyElement {
         match self.page() {
-            Page::Loading => directory_note("Loading this server.", false),
-            Page::Failed(detail) => directory_note(&detail, true),
+            Page::Loading => join_column(directory_note("Loading this server.", false), cx),
+            Page::Failed(detail) => join_column(directory_note(&detail, true), cx),
             Page::Ready(ready) => {
                 let shown = shown_id(self.tiny_state.picked.as_deref(), ready.can_invite, &ready.members);
                 directory(&ready, shown, false, cx)
@@ -556,6 +593,27 @@ fn directory_note(words: &str, bad: bool) -> AnyElement {
     line.child(words.to_owned()).into_any_element()
 }
 
+fn join_row(cx: &mut Context<Shell>) -> gpui::Stateful<Div> {
+    let content = div()
+        .gap(px(8.))
+        .child(glyph("icons/log-in.svg", 16., theme::text_soft()))
+        .child(div().min_w_0().truncate().type_ui().text_color(theme::text()).child("Join a server"));
+    list_row("tiny-join-row", theme::row_height(theme::ROW_ONE), false, false, content)
+        .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| this.sign_in(Network::Tiny, cx)))
+}
+
+fn join_column(note: AnyElement, cx: &mut Context<Shell>) -> AnyElement {
+    div()
+        .id("tiny-people")
+        .size_full()
+        .overflow_y_scroll()
+        .flex()
+        .flex_col()
+        .child(join_row(cx))
+        .child(note)
+        .into_any_element()
+}
+
 fn directory(ready: &Ready, shown: Option<&str>, in_pane: bool, cx: &mut Context<Shell>) -> AnyElement {
     let mut column = div().id(if in_pane { "tiny-people-pane" } else { "tiny-people" }).w_full().when(!in_pane, |column| column.size_full().overflow_y_scroll()).flex().flex_col();
     if ready.can_invite {
@@ -569,8 +627,9 @@ fn directory(ready: &Ready, shown: Option<&str>, in_pane: bool, cx: &mut Context
                 .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| this.pick_invite(cx))),
         );
     }
+    column = column.child(join_row(cx));
     if !ready.members.is_empty() {
-        column = column.child(section_header("People", !ready.can_invite));
+        column = column.child(section_header("People", false));
         for (ix, member) in ready.members.iter().enumerate() {
             let selected = shown == Some(member.user_id.as_str());
             let key = Key { network: Network::Tiny, account: member.user_id.clone(), id: member.user_id.clone() };
@@ -699,7 +758,7 @@ fn handoff(paste: &str, origin: &str, role: &str, copied: bool, cx: &mut Context
                 .flex_col()
                 .gap(px(10.))
                 .child(handoff_step(1, "Open tinyclient"))
-                .child(handoff_step(2, "Choose Tiny server"))
+                .child(handoff_step(2, "Choose Tiny server, or Join a server"))
                 .child(handoff_step(3, "Paste this code"))
                 .child(handoff_step(4, "Choose a name, an email, and a password")),
         )
@@ -990,6 +1049,25 @@ mod tests {
             make_owner: false,
             remove: false,
         }
+    }
+
+    fn tiny_key(account: &str) -> AccountKey {
+        AccountKey { network: Network::Tiny, account: account.to_owned() }
+    }
+
+    #[test]
+    fn the_open_server_stays_and_a_new_one_is_reachable() {
+        let first = tiny_key("one");
+        let second = tiny_key("two");
+        let accounts = [(first.clone(), Link::Connected), (second.clone(), Link::Connected)];
+        assert_eq!(preferred_tiny(&accounts, None).as_ref(), Some(&first));
+        assert_eq!(preferred_tiny(&accounts, Some(&second)).as_ref(), Some(&second));
+        let offline = [(first.clone(), Link::Offline), (second.clone(), Link::Connected)];
+        assert_eq!(preferred_tiny(&offline, Some(&first)).as_ref(), Some(&first));
+        assert_eq!(preferred_tiny(&offline, None).as_ref(), Some(&second));
+        let gone = [(second.clone(), Link::Connected)];
+        assert_eq!(preferred_tiny(&gone, Some(&first)).as_ref(), Some(&second));
+        assert_eq!(preferred_tiny(&[(first.clone(), Link::SignedOut)], Some(&first)), None);
     }
 
     #[test]

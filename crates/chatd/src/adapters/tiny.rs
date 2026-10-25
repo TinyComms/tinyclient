@@ -1,15 +1,17 @@
-//! A Tiny server the owner already runs. One account lives in this network's keychain item.
-//! Sign-in is the sheet's (`signin`), never `tinyclient-login`. This slice has no conversations,
-//! calls, or media, and does not load a WebRTC stack. A signed-in account can list members,
-//! invite, change a role, remove a member, and read the audit.
+//! A Tiny server the owner already runs. Every server joined on this Mac shares this network's
+//! one keychain item: a single object until a second server is added, then an array of them.
+//! Each account is started from its own object. Sign-in is the sheet's (`signin`), never
+//! `tinyclient-login`. This slice has no conversations, calls, or media, and does not load a
+//! WebRTC stack. A signed-in account can list members, invite, change a role, remove a member,
+//! and read the audit.
 
 pub mod signin;
 
 use super::{serve_commands, Command, Context, Signed};
 use crate::session;
 use protocol::{
-    tiny_can, AccountKey, ErrorCode, Link, Network, Response, TinyAudit, TinyCode, TinyCommunity,
-    TinyInvite, TinyMember,
+    join_host, tiny_can, AccountKey, ErrorCode, Link, Network, Response, TinyAudit, TinyCode,
+    TinyCommunity, TinyInvite, TinyMember,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -31,6 +33,8 @@ pub(crate) struct Saved {
 }
 
 struct Me {
+    /// The session tests read this. The account is named by the server's host.
+    #[cfg_attr(not(test), allow(dead_code))]
     display_name: String,
     email: String,
 }
@@ -72,20 +76,113 @@ pub fn supported() -> bool {
     true
 }
 
-pub fn accounts(session: &str) -> Result<Vec<Signed>, String> {
-    let saved = parse(session)?;
-    Ok(vec![Signed {
-        account: saved.user_id.clone(),
-        name: saved.display_name,
-        session: session.to_owned(),
-    }])
+/// One saved server, or every server in an array. A single object is not re-encoded.
+fn saved_rows(session: &str) -> Result<Vec<Saved>, String> {
+    let value: Value = serde_json::from_str(session)
+        .map_err(|_| "the Tiny server session is unreadable".to_owned())?;
+    match value {
+        Value::Array(rows) => {
+            if rows.is_empty() {
+                return Err("the Tiny server session is incomplete".to_owned());
+            }
+            let mut saved = Vec::with_capacity(rows.len());
+            for row in rows {
+                let text = serde_json::to_string(&row)
+                    .map_err(|_| "the Tiny server session is unreadable".to_owned())?;
+                saved.push(parse(&text)?);
+            }
+            Ok(saved)
+        }
+        _ => Ok(vec![parse(session)?]),
+    }
 }
 
-pub fn without(session: &str, account: &str) -> Option<String> {
-    match parse(session) {
-        Ok(saved) if saved.user_id == account => None,
-        _ => Some(session.to_owned()),
+pub fn accounts(session: &str) -> Result<Vec<Signed>, String> {
+    let value: Value = serde_json::from_str(session)
+        .map_err(|_| "the Tiny server session is unreadable".to_owned())?;
+    // The name is the host. Two servers can share a display name, and the page switches by it.
+    if !value.is_array() {
+        let saved = parse(session)?;
+        return Ok(vec![Signed {
+            account: saved.user_id,
+            name: join_host(&saved.base_url),
+            session: session.to_owned(),
+        }]);
     }
+    let mut found = Vec::new();
+    for saved in saved_rows(session)? {
+        if found.iter().any(|signed: &Signed| signed.account == saved.user_id) {
+            continue;
+        }
+        let one = serde_json::to_string(&saved)
+            .map_err(|_| "the Tiny server session is unreadable".to_owned())?;
+        found.push(Signed {
+            account: saved.user_id,
+            name: join_host(&saved.base_url),
+            session: one,
+        });
+    }
+    if found.is_empty() {
+        return Err("the Tiny server session is incomplete".to_owned());
+    }
+    Ok(found)
+}
+
+/// The session with one server removed. `None` only when that was the last one. An account that
+/// is not in the blob leaves the original string untouched.
+pub fn without(session: &str, account: &str) -> Option<String> {
+    let Ok(value) = serde_json::from_str::<Value>(session) else {
+        return Some(session.to_owned());
+    };
+    if !value.is_array() {
+        return match parse(session) {
+            Ok(saved) if saved.user_id == account => None,
+            _ => Some(session.to_owned()),
+        };
+    }
+    let Some(rows) = value.as_array() else {
+        return Some(session.to_owned());
+    };
+    let mut kept = Vec::new();
+    let mut removed = false;
+    for row in rows {
+        let Ok(text) = serde_json::to_string(row) else {
+            return Some(session.to_owned());
+        };
+        match parse(&text) {
+            Ok(saved) if saved.user_id == account => removed = true,
+            Ok(saved) => kept.push(saved),
+            Err(_) => return Some(session.to_owned()),
+        }
+    }
+    if !removed {
+        return Some(session.to_owned());
+    }
+    match kept.len() {
+        0 => None,
+        1 => serde_json::to_string(&kept[0]).ok(),
+        _ => serde_json::to_string(&kept).ok(),
+    }
+}
+
+/// Drops a server with the same user or the same address, then appends `fresh`. One server stays
+/// a single object, and a replacement of the only server keeps `fresh` as it was given.
+pub(crate) fn combine(existing: &str, fresh: &str) -> Result<String, String> {
+    let fresh_saved = parse(fresh)?;
+    let mut kept = saved_rows(existing)?;
+    kept.retain(|saved| saved.user_id != fresh_saved.user_id && saved.base_url != fresh_saved.base_url);
+    if kept.is_empty() {
+        return Ok(fresh.to_owned());
+    }
+    kept.push(fresh_saved);
+    serde_json::to_string(&kept).map_err(|_| "the Tiny server session is unreadable".to_owned())
+}
+
+fn saved_for(session: &str, user_id: &str) -> Result<Saved, String> {
+    saved_rows(session)?
+        .into_iter()
+        .find(|saved| saved.user_id == user_id)
+        .ok_or_else(|| "the Tiny server session is for another account".to_owned())
 }
 
 fn agent() -> ureq::Agent {
@@ -331,14 +428,10 @@ fn open(account: &AccountKey) -> Result<Saved, Response> {
             ));
         }
     };
-    let saved = match parse(&session) {
-        Ok(saved) => saved,
-        Err(_) => return Err(refused("You can't do that.")),
-    };
-    if saved.user_id != account.account {
-        return Err(refused("You can't do that."));
+    match saved_for(&session, &account.account) {
+        Ok(saved) => Ok(saved),
+        Err(_) => Err(refused("You can't do that.")),
     }
-    Ok(saved)
 }
 
 fn asked(method: &str, saved: &Saved, path: &str, body: Option<Value>) -> Result<(u16, Value), &'static str> {
@@ -532,7 +625,7 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
         .name("tiny-link".into())
         .spawn(move || match get_me(&probe) {
             Ok(me) => {
-                let _ = probe_ctx.describe(&me.display_name, &me.email);
+                let _ = probe_ctx.describe(&join_host(&probe.base_url), &me.email);
                 probe_ctx.link(Link::Connected);
             }
             Err(Fault::Unauthorized) => probe_ctx.link(Link::Expired),
@@ -579,7 +672,7 @@ pub(crate) mod tests {
         let signed = accounts(session()).unwrap();
         assert_eq!(signed.len(), 1);
         assert_eq!(signed[0].account, "11111111-1111-1111-1111-111111111111");
-        assert_eq!(signed[0].name, "Ada");
+        assert_eq!(signed[0].name, "127.0.0.1:8080");
         assert_eq!(signed[0].session, session());
         assert!(without(session(), &signed[0].account).is_none());
         assert_eq!(
@@ -592,6 +685,44 @@ pub(crate) mod tests {
         assert_eq!(saved.role, "owner");
         assert_eq!(saved.base_url, "http://127.0.0.1:8080");
         assert_eq!(saved.email, "ada@example.com");
+    }
+
+    fn other() -> &'static str {
+        r#"{"base_url":"https://other.example","token":"u","user_id":"22222222-2222-2222-2222-222222222222","email":"bea@example.com","display_name":"Bea","role":"member"}"#
+    }
+
+    #[test]
+    fn a_second_server_stays_beside_the_first_and_the_same_one_replaces() {
+        let both = combine(session(), other()).unwrap();
+        assert!(both.starts_with('['));
+        let signed = accounts(&both).unwrap();
+        assert_eq!(signed.len(), 2);
+        assert_eq!(signed[0].account, "11111111-1111-1111-1111-111111111111");
+        assert_eq!(signed[0].name, "127.0.0.1:8080");
+        assert_eq!(signed[0].session, session());
+        assert_eq!(signed[1].account, "22222222-2222-2222-2222-222222222222");
+        assert_eq!(signed[1].name, "other.example");
+        assert_eq!(signed[1].session, other());
+        let second = saved_for(&both, "22222222-2222-2222-2222-222222222222").unwrap();
+        assert_eq!(second.base_url, "https://other.example");
+        assert!(saved_for(&both, "no-such-person").is_err());
+
+        assert_eq!(without(&both, "someone-else").as_deref(), Some(both.as_str()));
+        assert_eq!(
+            without(&both, "22222222-2222-2222-2222-222222222222").as_deref(),
+            Some(session())
+        );
+        assert!(without(session(), "11111111-1111-1111-1111-111111111111").is_none());
+
+        let moved = r#"{"base_url":"http://127.0.0.1:8080","token":"n","user_id":"33333333-3333-3333-3333-333333333333","email":"cy@example.com","display_name":"Cy","role":"admin"}"#;
+        assert_eq!(combine(session(), moved).as_deref(), Ok(moved));
+        assert_eq!(combine(session(), session()).as_deref(), Ok(session()));
+        let replaced = combine(&both, session()).unwrap();
+        let signed = accounts(&replaced).unwrap();
+        assert_eq!(signed.len(), 2);
+        assert_eq!(signed[0].account, "22222222-2222-2222-2222-222222222222");
+        assert_eq!(signed[1].session, session());
+        assert!(combine("not json", other()).is_err());
     }
 
     /// Speaks the session routes on a local socket: wrong password, open, me, delete, and a

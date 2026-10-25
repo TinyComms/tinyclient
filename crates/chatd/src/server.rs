@@ -1802,16 +1802,33 @@ impl Chat {
     }
 }
 
+/// Tiny keeps every server in the one item. A second sign-in is folded in before anything is
+/// saved, so it does not replace the server already there. Other networks still replace.
+fn merged(network: Network, session: &str) -> Result<String, String> {
+    if network != Network::Tiny || !session::enabled() {
+        return Ok(session.to_owned());
+    }
+    match session::read(Network::Tiny) {
+        session::Stored::Absent => Ok(session.to_owned()),
+        session::Stored::Unreadable(why) => {
+            Err(format!("The session could not be read from {}: {why}", session::STORE))
+        }
+        session::Stored::Found(existing) => adapters::tiny::combine(&existing, session),
+    }
+}
+
 /// Keeps the session a sign-in drawn by the shell ended with and starts its accounts, as
 /// `Chat::sign_in` does with a helper's. Answers the accounts it started.
 fn adopt(hub: &Arc<Hub>, adapters: &Adapters, network: Network, session: &str) -> Result<Vec<AccountKey>, String> {
+    // Read and fold before stopping the adapters. A failed read leaves the signed-in server up.
+    let session = merged(network, session)?;
     // A scratch directory keeps no session. The account still starts there, for a test.
     if session::enabled() {
-        session::save(network, session)?;
+        session::save(network, &session)?;
     }
     lock(adapters).retain(|account, _| account.network != network);
     let mut started = Vec::new();
-    for signed in adapters::accounts(network, session)? {
+    for signed in adapters::accounts(network, &session)? {
         let account = AccountKey {
             network,
             account: signed.account,

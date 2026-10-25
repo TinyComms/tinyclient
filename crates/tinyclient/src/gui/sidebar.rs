@@ -1155,6 +1155,28 @@ impl Shell {
                 let network = *network;
                 let strip = strip.child(network_icon(network, 20.));
                 match network {
+                    Network::Tiny if self.snapshot.as_ref().is_some_and(|snapshot| snapshot.accounts_of(Network::Tiny) > 1) => {
+                        let name = self
+                            .tiny_account()
+                            .and_then(|key| self.snapshot.as_ref().and_then(|snapshot| snapshot.account(key).map(|account| account.name.clone())))
+                            .filter(|name| !name.is_empty())
+                            .unwrap_or_else(|| network.label().to_owned());
+                        strip.child(
+                            div()
+                                .id("network-name")
+                                .flex_1()
+                                .min_w_0()
+                                .h(px(28.))
+                                .flex()
+                                .items_center()
+                                .gap(px(4.))
+                                .cursor_pointer()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_click(cx.listener(move |this, _, _, cx| this.open_menu(Menu::Network(network), cx)))
+                                .child(div().min_w_0().truncate().type_title().text_color(theme::text()).child(name))
+                                .child(glyph("icons/chevron-down.svg", 12., theme::text_faint())),
+                        )
+                    }
                     Network::Discord => {
                         let unread = self.sidebar_state.home_unread;
                         let choices = [("home-all", "All", 0, !unread), ("home-unread", "Unread", self.sidebar_state.home_news, unread)];
