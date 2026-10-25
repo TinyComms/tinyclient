@@ -462,7 +462,9 @@ fn a_drop_backs_off_doubling_to_the_cap_and_each_reconnect_resumes() {
     for (ix, wanted) in expected.iter().enumerate() {
         let gap = at[ix + 1].duration_since(at[ix]);
         let wanted = Duration::from_millis(*wanted);
-        assert!(gap >= wanted, "pause {ix} was {gap:?}, under {wanted:?}");
+        // The fake stamps a refused connection after its reply is out, a moment after the
+        // client's pause began.
+        assert!(gap + Duration::from_millis(15) >= wanted, "pause {ix} was {gap:?}, under {wanted:?}");
         assert!(gap < wanted + Duration::from_millis(390), "pause {ix} was {gap:?}: past the cap");
     }
     until("connected at the end", || running.link().0 == Link::Connected);
