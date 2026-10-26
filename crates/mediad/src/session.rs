@@ -14,7 +14,7 @@ use crate::media::{self, FromMedia, MICROPHONE_DENIED};
 use crate::permission::{microphone, Microphone};
 use crate::rtp::{self, Cipher, Sender};
 use crate::out;
-use protocol::{CallFailure, Cue, MediaResponse, Tuning, VoiceJoin};
+use protocol::{CallFailure, Cue, MediaResponse, TinySlot, Tuning, VoiceJoin};
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap};
 use std::net::UdpSocket;
@@ -52,7 +52,7 @@ const UNUSABLE: &str = "Discord sent a voice session this tinyclient can't use. 
 const NO_CIPHER: &str = "Discord and this tinyclient share no way to encrypt call audio. Update tinyclient, or take this call in Discord.";
 const ENGINE: &str = "The call engine could not start. Try again.";
 
-type Devices = (Option<String>, Option<String>);
+pub(crate) type Devices = (Option<String>, Option<String>);
 
 /// What chatd's requests set, read by the threads of the call.
 #[derive(Default)]
@@ -76,6 +76,11 @@ pub struct Controls {
     tuning: Mutex<Tuning>,
     /// The cue to play next, taken by whatever plays (the media loop, or a test).
     cue: Mutex<Option<Cue>>,
+    /// A Tiny server call's next connection, answered and not yet taken up: the server
+    /// restarted and the call joined again.
+    pub(crate) tiny_link: Mutex<Option<crate::tiny::Link>>,
+    /// A Tiny server's newest slot map, not yet applied.
+    pub(crate) tiny_slots: Mutex<Option<Vec<TinySlot>>>,
 }
 
 impl Controls {
@@ -104,6 +109,23 @@ impl Controls {
         let relist = self.relist.lock().unwrap();
         let (mut relist, _) = self.wake.wait_timeout_while(relist, every, |asked| !*asked).unwrap();
         std::mem::take(&mut *relist)
+    }
+
+    /// A Tiny server call joined again: its loop takes up this connection next.
+    pub fn tiny_rejoin(&self, link: crate::tiny::Link) {
+        *self.tiny_link.lock().unwrap() = Some(link);
+    }
+
+    /// A Tiny server's new slot map, for its loop to apply.
+    pub fn tiny_slots(&self, map: Vec<TinySlot>) {
+        *self.tiny_slots.lock().unwrap() = Some(map);
+    }
+
+    /// The devices chosen so far, for a call that opens them now. Any choice waiting for the
+    /// media loop is part of it.
+    pub(crate) fn take_chosen(&self) -> Devices {
+        self.devices.lock().unwrap().take();
+        self.chosen.lock().unwrap().clone()
     }
 
     pub fn tune(&self, tuning: Tuning) {
@@ -356,8 +378,7 @@ impl Call {
         let audio = match self.audio.take() {
             Some(audio) => audio,
             None => {
-                let (input, output) = self.controls.chosen.lock().unwrap().clone();
-                self.controls.devices.lock().unwrap().take();
+                let (input, output) = self.controls.take_chosen();
                 Audio::open(input, output).map_err(|err| {
                     let (reason, detail) = media::failure(err);
                     End::Fatal(reason, detail)

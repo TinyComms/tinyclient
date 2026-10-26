@@ -145,6 +145,28 @@ pub struct VoiceJoin {
     pub deafened: bool,
 }
 
+/// What mediad needs to make an offer to a Tiny server's SFU (tinyserver's `docs/calls.md`).
+/// chatd carries the offer to the server's live socket and the answer and slots back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TinyOffer {
+    /// Our user id on the server. Our own speaking is reported under it.
+    pub user_id: String,
+    /// The server's host, without a scheme or port. The local address that reaches it is the
+    /// one offered.
+    pub host: String,
+    /// Receive slots: one for each other person the room can hold.
+    pub slots: u16,
+    pub muted: bool,
+    pub deafened: bool,
+}
+
+/// Whose voice one receive slot carries, as the server's `call.slots` says.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TinySlot {
+    pub mid: String,
+    pub user_id: String,
+}
+
 /// chatd to mediad, over mediad's stdin. Closing stdin ends the call. Each request gets exactly
 /// one reply (`Streams`, `Done` or `Refused`), in order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -176,6 +198,15 @@ pub enum MediaRequest {
     /// Plays one cue now, on the call's speaker, under the voices. Outside a call (a test
     /// mediad) it opens the speaker for the cue alone.
     Cue { cue: Cue },
+    /// A Tiny server call: make an offer. Answered `Offer`. Sent again for a call that is
+    /// already up (the server restarted), it is a fresh offer, and the call carries on with it
+    /// once its answer arrives.
+    TinyOffer(TinyOffer),
+    /// The server's answer to the last offer. Answered `Done`; then `Connected` once media
+    /// flows.
+    TinyAnswer { sdp: String },
+    /// The server's whole map of receive slots, whenever it changes.
+    TinySlots { audio: Vec<TinySlot> },
 }
 
 /// What the user chose for a call's sound. Percentages, 0 to 100.
@@ -225,6 +256,8 @@ pub enum MediaResponse {
     Ready { engine_linked: bool },
     Streams { video: Vec<VideoStream> },
     Done,
+    /// The SDP offer for a Tiny server call, in answer to `TinyOffer`.
+    Offer { sdp: String },
     /// This mediad cannot do what was asked.
     Refused { detail: String },
 
@@ -260,7 +293,7 @@ impl MediaResponse {
     pub fn is_reply(&self) -> bool {
         matches!(
             self,
-            MediaResponse::Streams { .. } | MediaResponse::Done | MediaResponse::Refused { .. }
+            MediaResponse::Streams { .. } | MediaResponse::Done | MediaResponse::Offer { .. } | MediaResponse::Refused { .. }
         )
     }
 }

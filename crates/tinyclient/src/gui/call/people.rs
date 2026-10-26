@@ -15,7 +15,7 @@ const LISTED: usize = 10;
 
 /// An avatar in its speaking-ring slot: a 2 px gap and a 2 px border around it, always laid out
 /// and transparent when off, so a ring switching on moves nothing.
-pub(super) fn ringed(avatar: Div, size: f32, speaking: bool) -> Div {
+pub(in crate::gui) fn ringed(avatar: Div, size: f32, speaking: bool) -> Div {
     let ring: Hsla = if speaking { theme::positive().into() } else { gpui::transparent_black() };
     div().relative().size(px(size)).flex_none().child(avatar).child(
         div()

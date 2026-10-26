@@ -500,6 +500,7 @@ impl Demo {
             muted: false,
             deafened: false,
             streaming: false,
+            speaking: false,
         });
         change(&mut occupants.people, me);
         let total = occupants.people.len() as u32 + hidden;

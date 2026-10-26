@@ -328,6 +328,10 @@ pub struct Occupant {
     /// Sharing a screen or a camera.
     #[serde(default, skip_serializing_if = "is_false")]
     pub streaming: bool,
+    /// Heard right now, where the network says so to someone in the call (a Tiny server's
+    /// `call.speaking`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub speaking: bool,
 }
 
 /// Who is in a voice channel, whether or not we are. Never stored: it arrives as
@@ -1406,7 +1410,8 @@ pub enum Request {
         account: AccountKey,
         room_id: String,
     },
-    /// Takes a seat in a room's call, leaving any other first. There is no sound yet: the
+    /// Takes a seat in a room's call, leaving any other first. On a server whose audio is up
+    /// it starts mediad and joins with audio, as `CallStart` does; on one without audio the
     /// seat is all it is. Answers `Ok` once the server took it.
     TinyCallJoin {
         account: AccountKey,

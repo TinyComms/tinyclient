@@ -1,9 +1,13 @@
-//! The call process: one Discord voice connection, from "connecting" until chatd closes our stdin.
+//! The call process: one call, from "connecting" until chatd closes our stdin.
 //!
-//! `voice` holds the pieces that need no network or device and are tested on their own (`rtp`,
-//! `jitter`, `opus`, `dave`); `gateway` speaks the voice websocket; `media` is the 20 ms loop that
-//! moves audio between the devices in `audio` and the UDP socket; `session` ties them to the
-//! frames chatd sends.
+//! A Discord call: `voice` holds the pieces that need no network or device and are tested on
+//! their own (`rtp`, `jitter`, `opus`, `dave`); `gateway` speaks the voice websocket; `media` is
+//! the 20 ms loop that moves audio between the devices in `audio` and the UDP socket; `session`
+//! ties them to the frames chatd sends.
+//!
+//! A Tiny server call: `tiny` is WebRTC to the server's SFU through str0m, in a 20 ms loop of its
+//! own built from the same jitter buffer, codecs, gate, mixer and devices; `framing` is its
+//! ICE-TCP. chatd carries the offer and answer over the server's live socket.
 //!
 //! `mediad --play` is the other mode: one voice message or audio file (`play`, reading it with
 //! `decode` and speeding it up with `stretch`), the speaker only, until playing stops.
@@ -12,6 +16,7 @@ pub mod audio;
 pub mod cue;
 pub mod dave;
 pub mod decode;
+pub mod framing;
 pub mod gateway;
 pub mod jitter;
 pub mod media;
@@ -23,6 +28,7 @@ pub mod probe;
 pub mod rtp;
 pub mod session;
 pub mod stretch;
+pub mod tiny;
 
 /// Samples a second, on the wire and in every buffer between the codec and the devices.
 pub const RATE: u32 = 48_000;
