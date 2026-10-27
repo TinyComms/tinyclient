@@ -414,6 +414,10 @@ pub struct Conversation {
     /// Who is in it, for a voice channel someone is in. `None` when it is empty or unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub occupants: Option<Occupants>,
+    /// How many may be in a voice channel at once, 0 when it has no limit. Filled by the
+    /// network's adapter from the channel; the shell draws `4/12` on an occupied voice row.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub limit: u32,
     /// I may read it but not post in it.
     #[serde(default, skip_serializing_if = "is_false")]
     pub read_only: bool,
@@ -504,6 +508,7 @@ impl Conversation {
             last_read: None,
             call: CallSupport::None,
             occupants: None,
+            limit: 0,
             read_only: false,
             private: false,
             draft: String::new(),

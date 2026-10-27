@@ -19,7 +19,7 @@ use serde::Serialize;
 use std::path::Path;
 
 /// Raise this when a table changes. `open` then drops the cache and starts over.
-const SCHEMA: i32 = 4;
+const SCHEMA: i32 = 5;
 
 /// Retention: the newest messages kept per conversation.
 pub const KEEP_MESSAGES: u32 = 2_000;
@@ -97,6 +97,8 @@ const TABLES: &str = "
         avatar    TEXT NOT NULL DEFAULT '',
         peer      TEXT NOT NULL DEFAULT '',
         call      TEXT NOT NULL DEFAULT 'none',
+        -- A voice channel's occupant limit, 0 when it has none.
+        voice_limit INTEGER NOT NULL DEFAULT 0,
         -- The adapter wants it in the Inbox whatever its kind.
         listed    INTEGER NOT NULL DEFAULT 0,
         unread    INTEGER NOT NULL DEFAULT 0,
@@ -235,7 +237,8 @@ const CONVERSATION: &str = "
            c.opted_out, c.preview_from, c.preview_mine,
            (c.preview_mine AND c.seen_to != '' AND (length(c.seen_to), c.seen_to) >= (length(c.preview_id), c.preview_id)),
            (c.updated < CAST(strftime('%s', 'now') AS INTEGER) - 2592000 AND c.unread = 0 AND c.mentions = 0
-            AND NOT c.starred AND c.draft = '')
+            AND NOT c.starred AND c.draft = ''),
+           c.voice_limit
     FROM conversation c
     LEFT JOIN media m ON m.network = c.network AND m.account = c.account AND m.id = c.avatar
     LEFT JOIN space s ON s.network = c.network AND s.account = c.account AND s.id = c.space
@@ -289,6 +292,8 @@ pub struct ConversationRow {
     pub avatar: Option<String>,
     pub peer: Option<String>,
     pub call: CallSupport,
+    /// The most who may be in a voice channel at once, 0 when it has none.
+    pub limit: u32,
     /// Show it in the Inbox even though it is a channel nobody mentioned me in.
     pub listed: bool,
     /// One line on what it is for. Cut to 300 characters.
@@ -385,6 +390,7 @@ impl ConversationRow {
             avatar: None,
             peer: None,
             call: CallSupport::None,
+            limit: 0,
             listed: false,
             topic: String::new(),
             parent: None,
@@ -594,6 +600,7 @@ fn conversation_from(row: &Row) -> rusqlite::Result<Conversation> {
         private: row.get(30)?,
         draft: row.get(31)?,
         occupants: None,
+        limit: row.get(46)?,
         folders: from_id_list(&row.get::<_, String>(32)?),
         archived: row.get(33)?,
         pin: row.get(34)?,
@@ -719,9 +726,9 @@ fn upsert_conversation(tx: &Transaction, account: &AccountKey, row: &Conversatio
         "INSERT INTO conversation
              (network, account, id, kind, title, space, section, position, avatar, peer, call, listed,
               topic, parent, root, read_only, private, bot, meeting, special, mark, opted_out,
-              folders, archived, pin, hidden, followed)
+              folders, archived, pin, hidden, followed, voice_limit)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
-                 ?20, ?21, ?22, ?24, ?25, ?26, ?27, ?28)
+                 ?20, ?21, ?22, ?24, ?25, ?26, ?27, ?28, ?29)
          ON CONFLICT (network, account, id) DO UPDATE SET
              kind = excluded.kind, title = excluded.title, space = excluded.space,
              section = excluded.section, position = excluded.position, avatar = excluded.avatar,
@@ -729,7 +736,7 @@ fn upsert_conversation(tx: &Transaction, account: &AccountKey, row: &Conversatio
              topic = excluded.topic, parent = excluded.parent, root = excluded.root,
              read_only = excluded.read_only, private = excluded.private, bot = excluded.bot,
              meeting = excluded.meeting, special = excluded.special, mark = excluded.mark,
-             opted_out = excluded.opted_out,
+             opted_out = excluded.opted_out, voice_limit = excluded.voice_limit,
              folders = CASE WHEN ?23 THEN excluded.folders ELSE folders END,
              archived = CASE WHEN ?23 THEN excluded.archived ELSE archived END,
              pin = CASE WHEN ?23 THEN excluded.pin ELSE pin END,
@@ -764,6 +771,7 @@ fn upsert_conversation(tx: &Transaction, account: &AccountKey, row: &Conversatio
             filing.pin,
             filing.hidden,
             filing.followed,
+            row.limit,
         ],
     )?;
     Ok(())

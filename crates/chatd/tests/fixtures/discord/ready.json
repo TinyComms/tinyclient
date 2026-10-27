@@ -137,7 +137,7 @@
           {"id": "4010", "type": 0, "allow": "1024", "deny": "0"}
         ]},
         {"id": "4106", "type": 15, "name": "help", "position": 4, "parent_id": "4100", "last_message_id": "1300000000000000600", "permission_overwrites": []},
-        {"id": "4201", "type": 2, "name": "Lounge", "position": 0, "parent_id": "4200", "bitrate": 64000, "user_limit": 0, "permission_overwrites": []},
+        {"id": "4201", "type": 2, "name": "Lounge", "position": 0, "parent_id": "4200", "bitrate": 64000, "user_limit": 12, "permission_overwrites": []},
         {"id": "4105", "type": 0, "name": "rules", "position": 0, "parent_id": null, "last_message_id": "1300000000000000400", "permission_overwrites": []},
         {"id": "4301", "type": 0, "name": "roadmap", "position": 5, "parent_id": "4300", "last_message_id": "1300000000000000700", "permission_overwrites": [
           {"id": "4000", "type": 0, "allow": "0", "deny": "1024"},
