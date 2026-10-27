@@ -1971,9 +1971,6 @@ fn a_stage_channel_lists_who_is_on_it_and_leaves_the_join_to_discord() {
     });
     assert_eq!(gone, [("2003".to_owned(), true), ("2006".to_owned(), false)]);
 }
-
-#[test]
-fn a_stage_arriving_with_a_guild_create_counts_who_is_on_it_at_once() {
     let world = World::start();
     // A server arrives whole, stage and all: its channels are planted before its voice
     // states are read, so the first report already knows who the platform holds back.
