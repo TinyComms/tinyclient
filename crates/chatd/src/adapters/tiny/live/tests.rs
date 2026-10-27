@@ -249,7 +249,7 @@ fn run(base: &str, timing: Timing) -> Running {
         base_url: base.to_owned(),
         token: "t".to_owned(),
         user_id: ME.to_owned(),
-        email: "ada@example.com".to_owned(),
+        email: Some("ada@example.com".to_owned()),
         display_name: "Ada".to_owned(),
         role: "owner".to_owned(),
     };
@@ -882,19 +882,16 @@ fn every_refusal_has_words_and_every_address_has_a_socket() {
     }
 }
 
-/// Against a tinyserver that is already serving, as the owner. Not part of `cargo test`: it
-/// needs `TINY_LIVE_BASE`, `TINY_LIVE_EMAIL`, and `TINY_LIVE_PASSWORD`. It makes one room, sits
-/// in it, leaves, and deletes the room again.
+/// Against a tinyserver that is already serving, as an owner or an admin. Not part of
+/// `cargo test`: it needs `TINY_LIVE_SESSION`, one saved session (sign in once with the sheet,
+/// then copy it). It makes one room, sits in it, leaves, and deletes the room again. The session
+/// is left signed in.
 #[test]
 #[ignore]
 fn live_socket_round_trip() {
-    let base = std::env::var("TINY_LIVE_BASE").expect("TINY_LIVE_BASE");
-    let email = std::env::var("TINY_LIVE_EMAIL").expect("TINY_LIVE_EMAIL");
-    let password = std::env::var("TINY_LIVE_PASSWORD").expect("TINY_LIVE_PASSWORD");
-    let saved = match super::super::post_session(&base, &email, &password) {
-        Ok(saved) => saved,
-        Err(_) => panic!("open failed"),
-    };
+    let session = std::env::var("TINY_LIVE_SESSION").expect("TINY_LIVE_SESSION");
+    let saved = super::super::parse(&session).expect("a saved Tiny session");
+    let base = saved.base_url.clone();
     assert!(matches!(saved.role.as_str(), "owner" | "admin"), "the room is made by an owner or an admin");
     let hub = Arc::new(Hub::new(Store::open(std::path::Path::new(":memory:")).expect("a store in memory")));
     let account = AccountKey { network: Network::Tiny, account: saved.user_id.clone() };
@@ -925,7 +922,6 @@ fn live_socket_round_trip() {
     assert_eq!(left, Some(Ok(())));
     until("the seat gone", || running.hub.occupants(&running.key(&room)).is_none());
     drop(running);
-    super::super::delete_session(&saved);
 }
 
 /// One side of a call played by hand, as a second tinyclient would: its own live socket and its
@@ -1039,35 +1035,31 @@ fn played_level(sink: &std::path::Path) -> f64 {
 /// TINYSERVER_PUBLIC_IP=127.0.0.1 cargo run -- serve
 /// ```
 ///
-/// and from this one, with the owner's sign-in:
+/// and from this one, with two saved sessions (sign in once with the sheet for each, then copy
+/// them): an owner's or an admin's, and a member's on the same server.
 ///
 /// ```sh
-/// TINY_LIVE_BASE=http://127.0.0.1:8080 TINY_LIVE_EMAIL=… TINY_LIVE_PASSWORD=… \
+/// TINY_LIVE_SESSION='{…}' TINY_LIVE_SESSION_BEA='{…}' \
 ///   cargo test -p chatd --lib tiny_server_call -- --ignored --nocapture
 /// ```
 ///
-/// Ada is the owner, through chatd's own live socket and call, as the app runs it. Bea is a
-/// member it invites for the test, played by hand. Each must hear the other's tone. The room
-/// and Bea are removed afterwards.
+/// Ada is the first, through chatd's own live socket and call, as the app runs it. Bea is the
+/// second, played by hand. Each must hear the other's tone. The room is removed afterwards and
+/// both sessions are left signed in.
 #[test]
 #[ignore]
 fn tiny_server_call() {
     with_mediad();
-    let base = std::env::var("TINY_LIVE_BASE").expect("TINY_LIVE_BASE");
-    let email = std::env::var("TINY_LIVE_EMAIL").expect("TINY_LIVE_EMAIL");
-    let password = std::env::var("TINY_LIVE_PASSWORD").expect("TINY_LIVE_PASSWORD");
-    let Ok(owner) = super::super::post_session(&base, &email, &password) else {
-        panic!("the owner's sign-in failed");
-    };
+    let session = std::env::var("TINY_LIVE_SESSION").expect("TINY_LIVE_SESSION");
+    let owner = super::super::parse(&session).expect("a saved Tiny session");
+    let base = owner.base_url.clone();
+    assert!(matches!(owner.role.as_str(), "owner" | "admin"), "the room is made by an owner or an admin");
     let made = super::super::call("POST", &format!("{base}/v1/rooms"), Some(&owner.token), Some(json!({"name": "tinyclient audio test"})));
     let Ok((201, room)) = made else { panic!("the room was not made") };
     let room = room["id"].as_str().expect("a room id").to_owned();
-    let invited = super::super::call("POST", &format!("{base}/v1/invites"), Some(&owner.token), Some(json!({"role": "member"})));
-    let Ok((201, invite)) = invited else { panic!("the invite was not made") };
-    let bea_email = format!("tinyclient-audio-{}@example.invalid", std::process::id());
-    let Ok(bea) = super::super::post_accept(&base, invite["token"].as_str().expect("a token"), &bea_email, "tinyclient-audio-test", "Bea") else {
-        panic!("Bea could not join");
-    };
+    let bea = std::env::var("TINY_LIVE_SESSION_BEA").expect("TINY_LIVE_SESSION_BEA");
+    let bea = super::super::parse(&bea).expect("Bea's saved Tiny session");
+    assert_eq!(bea.base_url, base, "both sessions are on the same server");
 
     let outcome = std::panic::catch_unwind(|| {
         for ice in ["udp", "tcp"] {
@@ -1110,10 +1102,7 @@ fn tiny_server_call() {
     std::env::remove_var("TINYCLIENT_MEDIAD_ICE");
     std::env::remove_var("TINYCLIENT_MEDIAD_SINK");
     let gone = super::super::call("DELETE", &format!("{base}/v1/rooms/{room}"), Some(&owner.token), None);
-    let removed = super::super::call("DELETE", &format!("{base}/v1/members/{}", bea.user_id), Some(&owner.token), None);
-    super::super::delete_session(&owner);
     assert!(matches!(gone, Ok((204, _))), "the room was put back");
-    assert!(matches!(removed, Ok((204, _))), "Bea was removed");
     if let Err(panic) = outcome {
         std::panic::resume_unwind(panic);
     }

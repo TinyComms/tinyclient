@@ -1,27 +1,63 @@
-//! Signing in to a Tiny server. A new person pastes one code: it carries the server, then they
-//! choose a name, an email, and a password (`POST /v1/invites/accept`). Someone who already has
-//! an account types the host, the email, and the password (`POST /v1/session`). Nothing is kept
-//! until that answer is 200. The password, the code, and the bearer are not logged. One sign-in
-//! at a time, in memory; closing the sheet drops it.
+//! Signing in to a Tiny server, in the system browser. A new person pastes one code: it carries
+//! the server and the invite. Someone who already has an account types the host. Either way chatd
+//! asks the server for its provider (`GET /v1/auth/config`), listens on 127.0.0.1, makes a PKCE
+//! pair and a state, asks the server where to send the browser (`POST /v1/auth/start`, with the
+//! invite when there is one), and opens it there. The browser comes back once, to this computer,
+//! with a one-time code; chatd trades it and its verifier for a session (`POST /v1/auth/token`)
+//! and keeps that exactly as a password once did. No name, email or password is asked here: the
+//! provider has them.
+//!
+//! Nothing is kept until that answer is 200. The invite, the codes, the verifier, the state, and
+//! the bearer are not logged. One sign-in at a time, in memory; closing the sheet drops it and
+//! closes the listener.
 
-use super::{post_accept, post_session, Fault};
+use super::browser::{self, Back, Opener};
+use super::{auth_config, auth_start, auth_token, Fault};
 use crate::hub::Hub;
-use protocol::{AccountKey, Network, SignInInput, SignInProblem, SignInStep};
+use protocol::{AccountKey, Change, Network, SignInInput, SignInProblem, SignInStep};
+use std::net::TcpListener;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 /// Keeps a finished session and starts its account.
 pub type Adopt = Box<dyn Fn(&str) -> Result<Vec<AccountKey>, String> + Send + Sync>;
 
+/// How long the browser has to come back.
+const PATIENCE: Duration = Duration::from_secs(5 * 60);
+
+/// The browser a sign-in opens, and how long it waits for it. Tests bring their own.
+#[derive(Clone)]
+pub(crate) struct Browser {
+    pub open: Opener,
+    pub patience: Duration,
+}
+
+impl Browser {
+    fn system() -> Browser {
+        Browser { open: browser::system(), patience: PATIENCE }
+    }
+}
+
 struct Flow {
+    hub: Arc<Hub>,
     server: String,
-    email: String,
+    /// The invite token, bare. Empty when signing in to an account that already exists.
     code: String,
-    display_name: String,
-    joining: bool,
     /// The address was typed before the code. Back from that code returns to the address.
     address_first: bool,
+    /// The provider's name, as the server gave it.
+    provider: String,
     step: SignInStep,
-    adopt: Adopt,
+    adopt: Arc<Adopt>,
+    browser: Browser,
+    /// The browser is out: the page it was sent to, and the switch that stops listening for it.
+    out: Option<Out>,
+}
+
+struct Out {
+    authorize_url: String,
+    stop: Arc<AtomicBool>,
 }
 
 static FLOW: Mutex<Option<Flow>> = Mutex::new(None);
@@ -46,7 +82,6 @@ pub(crate) fn base_url(raw: &str) -> Option<String> {
     }) {
         return None;
     }
-    // A user in the address would carry a password. A backslash is not part of a host.
     if rest.contains(['@', '\\']) || rest.is_empty() {
         return None;
     }
@@ -114,85 +149,79 @@ fn port_ok(port: &str) -> bool {
     port.parse::<u16>().is_ok_and(|port| port > 0)
 }
 
-/// Shown on the password step while a code is creating the account.
-const JOIN_PASSWORD: &str = "Choose a password of 12 to 128 characters. This creates your account.";
-
 /// A server token on its own: no origin wrapped around it.
 fn bare_token(raw: &str) -> bool {
     !raw.is_empty() && raw.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
-/// One `@`, something on each side, and no whitespace.
-pub(crate) fn email_ok(raw: &str) -> bool {
-    let email = raw.trim();
-    if email.is_empty() || email.chars().any(char::is_whitespace) {
-        return false;
-    }
-    let Some((local, domain)) = email.split_once('@') else {
-        return false;
-    };
-    !local.is_empty() && !domain.is_empty() && !domain.contains('@')
-}
+const OVER: &str = "That sign-in is over. Start again.";
+const DENIED: &str = "The sign-in was turned down in your browser.";
+const FAILED: &str = "The server couldn't finish the sign-in. Try again.";
+const TIMED_OUT: &str = "Your browser didn't come back within 5 minutes. Try again.";
+const NO_LISTEN: &str = "tinyclient couldn't listen for your browser on this computer.";
+const BAD_PAGE: &str = "The server sent the browser somewhere tinyclient won't open.";
 
 /// Begins a sign-in, or with `input` answers the step on show.
-pub fn step(
-    _hub: &Arc<Hub>,
+pub fn step(hub: &Arc<Hub>, input: Option<SignInInput>, adopt: Adopt) -> Result<SignInStep, String> {
+    step_with(hub, input, adopt, Browser::system)
+}
+
+/// `step`, with the browser a new sign-in will open.
+pub(crate) fn step_with(
+    hub: &Arc<Hub>,
     input: Option<SignInInput>,
     adopt: Adopt,
+    browser: impl FnOnce() -> Browser,
 ) -> Result<SignInStep, String> {
     let mut held = current();
     let Some(input) = input else {
-        if held.is_none() {
-            *held = Some(Flow {
-                server: String::new(),
-                email: String::new(),
-                code: String::new(),
-                display_name: String::new(),
-                joining: false,
-                address_first: false,
-                step: SignInStep::Invite {
-                    server: String::new(),
-                    problem: None,
-                },
-                adopt,
-            });
-        }
-        return Ok(held.as_ref().map(|flow| flow.step.clone()).unwrap_or(SignInStep::Invite {
+        let flow = held.get_or_insert_with(|| Flow {
+            hub: hub.clone(),
             server: String::new(),
-            problem: None,
-        }));
+            code: String::new(),
+            address_first: false,
+            provider: String::new(),
+            step: SignInStep::Invite {
+                server: String::new(),
+                problem: None,
+            },
+            adopt: Arc::new(adopt),
+            browser: browser(),
+            out: None,
+        });
+        return Ok(flow.step.clone());
     };
     let Some(flow) = held.as_mut() else {
         return Ok(SignInStep::Failed {
-            reason: "That sign-in is over. Start again.".to_owned(),
+            reason: OVER.to_owned(),
         });
     };
     let next = flow.answer(input);
     if matches!(next, SignInStep::Done { .. } | SignInStep::Failed { .. }) {
-        *held = None;
+        if let Some(flow) = held.take() {
+            flow.stop();
+        }
     }
     Ok(next)
 }
 
-/// The user closed the sheet. Nothing was kept.
+/// The user closed the sheet. Nothing was kept, and the browser is no longer listened for.
 pub fn cancel() {
-    *current() = None;
+    if let Some(flow) = current().take() {
+        flow.stop();
+    }
 }
 
 impl Flow {
     fn answer(&mut self, input: SignInInput) -> SignInStep {
-        let joining = self.joining;
         let step = self.step.clone();
         let next = match (step, input) {
             (SignInStep::Server { .. }, SignInInput::Server { url }) => match base_url(&url) {
                 Some(server) => {
-                    self.server = server.clone();
-                    self.joining = false;
+                    self.server = server;
+                    self.code.clear();
                     self.address_first = true;
-                    SignInStep::Email {
-                        server,
-                        problem: None,
-                    }
+                    self.begin_browser()
                 }
                 None => SignInStep::Server {
                     problem: Some(SignInProblem::UrlInvalid),
@@ -203,7 +232,7 @@ impl Flow {
             (SignInStep::Server { .. }, SignInInput::HaveCode { url }) => match base_url(&url) {
                 Some(server) => {
                     self.server = server.clone();
-                    self.joining = true;
+                    self.code.clear();
                     self.address_first = true;
                     SignInStep::Invite {
                         server,
@@ -215,7 +244,6 @@ impl Flow {
                 },
             },
             (SignInStep::Invite { .. }, SignInInput::HaveCode { url }) if url.trim().is_empty() => {
-                self.joining = false;
                 self.code.clear();
                 SignInStep::Server { problem: None }
             }
@@ -223,62 +251,16 @@ impl Flow {
             (SignInStep::Invite { .. }, SignInInput::Back) => {
                 if self.address_first {
                     self.code.clear();
-                    self.joining = false;
                     SignInStep::Server { problem: None }
                 } else {
                     self.fresh_code()
                 }
             }
-            (SignInStep::Name { .. }, SignInInput::Name { name }) => {
-                let name = name.trim();
-                if name.is_empty() || name.chars().count() > 80 {
-                    SignInStep::Name {
-                        server: self.server.clone(),
-                        problem: Some(SignInProblem::Other {
-                            reason: "Type the name people should see.".to_owned(),
-                        }),
-                    }
-                } else {
-                    self.display_name = name.to_owned();
-                    SignInStep::Email {
-                        server: self.server.clone(),
-                        problem: None,
-                    }
-                }
-            }
-            (SignInStep::Name { .. }, SignInInput::Back) => SignInStep::Invite {
-                server: self.server.clone(),
-                problem: None,
-            },
-            (SignInStep::Email { .. }, SignInInput::Email { email }) => {
-                if email_ok(&email) {
-                    self.email = email.trim().to_owned();
-                    SignInStep::Password {
-                        hint: if joining { JOIN_PASSWORD.to_owned() } else { String::new() },
-                        problem: None,
-                    }
-                } else {
-                    SignInStep::Email {
-                        server: self.server.clone(),
-                        problem: Some(SignInProblem::EmailInvalid),
-                    }
-                }
-            }
-            (SignInStep::Email { .. }, SignInInput::Back) if joining => SignInStep::Name {
-                server: self.server.clone(),
-                problem: None,
-            },
-            (SignInStep::Email { .. }, SignInInput::Back) => SignInStep::Server { problem: None },
-            (SignInStep::Password { .. }, SignInInput::Back) => SignInStep::Email {
-                server: self.server.clone(),
-                problem: None,
-            },
-            (SignInStep::Password { .. }, SignInInput::Password { password }) => {
-                if joining {
-                    self.accept(&password)
-                } else {
-                    self.submit(&password)
-                }
+            (SignInStep::Browser { waiting: true, .. }, SignInInput::OpenBrowser) => self.open_again(),
+            (SignInStep::Browser { .. }, SignInInput::OpenBrowser) => self.begin_browser(),
+            (SignInStep::Browser { .. }, SignInInput::Back) => {
+                self.stop();
+                self.asking(None)
             }
             _ => self.step.clone(),
         };
@@ -286,10 +268,25 @@ impl Flow {
         next
     }
 
+    /// The step that asked for what led to the browser: the code, or the address.
+    fn asking(&mut self, problem: Option<SignInProblem>) -> SignInStep {
+        if self.code.is_empty() {
+            return SignInStep::Server { problem };
+        }
+        if !self.address_first {
+            // The pasted code is not kept: it is pasted again.
+            self.server.clear();
+            self.code.clear();
+        }
+        SignInStep::Invite {
+            server: self.server.clone(),
+            problem,
+        }
+    }
+
     fn fresh_code(&mut self) -> SignInStep {
         self.server.clear();
         self.code.clear();
-        self.joining = false;
         self.address_first = false;
         SignInStep::Invite {
             server: String::new(),
@@ -306,25 +303,17 @@ impl Flow {
         if let Some((origin, token)) = protocol::unpack_join(&compact) {
             return match base_url(&origin) {
                 Some(server) => {
-                    self.server = server.clone();
+                    self.server = server;
                     self.code = token;
-                    self.joining = true;
                     self.address_first = false;
-                    SignInStep::Name {
-                        server,
-                        problem: None,
-                    }
+                    self.begin_browser()
                 }
                 None => self.bad_code("That code doesn't work. Ask for a new one."),
             };
         }
         if !self.server.is_empty() && bare_token(trimmed) {
             self.code = trimmed.to_owned();
-            self.joining = true;
-            return SignInStep::Name {
-                server: self.server.clone(),
-                problem: None,
-            };
+            return self.begin_browser();
         }
         if bare_token(&compact) {
             return self.bad_code("That code has no server in it. Ask for a new one.");
@@ -339,59 +328,177 @@ impl Flow {
         }
     }
 
-    fn submit(&self, password: &str) -> SignInStep {
-        let again = |problem| SignInStep::Password {
-            hint: String::new(),
-            problem: Some(problem),
-        };
-        match post_session(&self.server, &self.email, password) {
-            Ok(saved) => self.kept(saved),
-            Err(fault) => match password_outcome(fault) {
-                Ok(problem) => again(problem),
-                Err(reason) => SignInStep::Failed {
-                    reason: reason.to_owned(),
-                },
-            },
+    fn browser_step(&self, waiting: bool, problem: Option<SignInProblem>) -> SignInStep {
+        SignInStep::Browser {
+            server: self.server.clone(),
+            provider: self.provider.clone(),
+            waiting,
+            problem,
         }
     }
 
-    fn accept(&self, password: &str) -> SignInStep {
-        let again = |problem| SignInStep::Password {
-            hint: JOIN_PASSWORD.to_owned(),
+    /// Stops listening for the browser, if it was.
+    fn stop(&self) {
+        if let Some(out) = &self.out {
+            out.stop.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Asks the server for the provider and where to send the browser, listens for it, and
+    /// opens it. A problem before the browser is out shows on the step that asked.
+    fn begin_browser(&mut self) -> SignInStep {
+        self.stop();
+        self.out = None;
+        let (stay, failed) = match auth_config(&self.server) {
+            Ok(provider) => {
+                self.provider = provider;
+                (None, None)
+            }
+            Err(fault) => outcome(fault),
+        };
+        if let Some(reason) = failed {
+            return SignInStep::Failed { reason };
+        }
+        if let Some(problem) = stay {
+            return self.stay(problem);
+        }
+        let listener = match TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(_) => return SignInStep::Failed { reason: NO_LISTEN.to_owned() },
+        };
+        let port = match listener.local_addr() {
+            Ok(addr) => addr.port(),
+            Err(_) => return SignInStep::Failed { reason: NO_LISTEN.to_owned() },
+        };
+        let (verifier, state) = match (browser::random(), browser::random()) {
+            (Ok(verifier), Ok(state)) => (verifier, state),
+            (Err(reason), _) | (_, Err(reason)) => return SignInStep::Failed { reason },
+        };
+        let redirect_uri = format!("http://127.0.0.1:{port}/callback");
+        let invite = (!self.code.is_empty()).then_some(self.code.as_str());
+        let authorize_url = match auth_start(&self.server, &redirect_uri, &browser::challenge(&verifier), &state, invite) {
+            Ok(url) if browser::web_link(&url) => url,
+            Ok(_) => return SignInStep::Failed { reason: BAD_PAGE.to_owned() },
+            Err(fault) => {
+                return match outcome(fault) {
+                    (_, Some(reason)) => SignInStep::Failed { reason },
+                    (problem, None) => self.stay(problem.unwrap_or(SignInProblem::Unreachable)),
+                }
+            }
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let wait = Wait {
+            hub: self.hub.clone(),
+            server: self.server.clone(),
+            provider: self.provider.clone(),
+            state,
+            verifier,
+            patience: self.browser.patience,
+            stop: stop.clone(),
+            adopt: self.adopt.clone(),
+        };
+        let spawned = std::thread::Builder::new()
+            .name("tiny-signin".into())
+            .spawn(move || wait.run(listener));
+        if spawned.is_err() {
+            return SignInStep::Failed { reason: NO_LISTEN.to_owned() };
+        }
+        self.out = Some(Out { authorize_url, stop });
+        self.open_again()
+    }
+
+    /// A problem before the browser is out. The first try stays on the step that asked; a try
+    /// again stays on the browser's.
+    fn stay(&mut self, problem: SignInProblem) -> SignInStep {
+        if matches!(self.step, SignInStep::Browser { .. }) {
+            self.browser_step(false, Some(problem))
+        } else {
+            self.asking(Some(problem))
+        }
+    }
+
+    /// The page the browser was sent to, once more. It is the same sign-in.
+    fn open_again(&self) -> SignInStep {
+        let Some(out) = &self.out else {
+            return self.browser_step(false, None);
+        };
+        let problem = (self.browser.open)(&out.authorize_url)
+            .err()
+            .map(|reason| SignInProblem::Other { reason });
+        self.browser_step(true, problem)
+    }
+}
+
+/// A failure, as the sheet shows it. `.1` ends the sheet: the answer could not be read.
+fn outcome(fault: Fault) -> (Option<SignInProblem>, Option<String>) {
+    let problem = match fault {
+        Fault::SlowDown => SignInProblem::TooMany {
+            until: unix_now() + 60,
+        },
+        Fault::Unavailable => SignInProblem::Other {
+            reason: "The server had a problem. Try again in a moment.".to_owned(),
+        },
+        Fault::Unreachable | Fault::Unauthorized => SignInProblem::Unreachable,
+        Fault::BadAnswer => return (None, Some("The server's answer could not be read.".to_owned())),
+        Fault::Words(reason) => SignInProblem::Other {
+            reason: reason.to_owned(),
+        },
+    };
+    (Some(problem), None)
+}
+
+/// One wait for the browser, on a thread of its own. It owns the listener.
+struct Wait {
+    hub: Arc<Hub>,
+    server: String,
+    provider: String,
+    state: String,
+    verifier: String,
+    patience: Duration,
+    stop: Arc<AtomicBool>,
+    adopt: Arc<Adopt>,
+}
+
+impl Wait {
+    fn run(self, listener: TcpListener) {
+        let back = browser::wait(listener, &self.state, self.patience, &self.stop);
+        let stopped = |problem| SignInStep::Browser {
+            server: self.server.clone(),
+            provider: self.provider.clone(),
+            waiting: false,
             problem: Some(problem),
         };
-        let length = password.chars().count();
-        if !(12..=128).contains(&length) {
-            return again(SignInProblem::Other {
-                reason: "Use 12 to 128 characters.".to_owned(),
-            });
-        }
-        match post_accept(
-            &self.server,
-            &self.code,
-            &self.email,
-            password,
-            &self.display_name,
-        ) {
-            Ok(saved) => self.kept(saved),
-            Err(fault) => match password_outcome(fault) {
-                Ok(problem) => again(problem),
-                Err(reason) => SignInStep::Failed {
-                    reason: reason.to_owned(),
+        let next = match back {
+            Back::Stopped => return,
+            Back::TimedOut => stopped(SignInProblem::Other { reason: TIMED_OUT.to_owned() }),
+            Back::Error(error) => stopped(match error.as_str() {
+                "not_member" => SignInProblem::NotMember,
+                "denied" => SignInProblem::Other { reason: DENIED.to_owned() },
+                _ => SignInProblem::Other { reason: FAILED.to_owned() },
+            }),
+            Back::Code(_) if self.stop.load(Ordering::Relaxed) => return,
+            Back::Code(code) => match auth_token(&self.server, &code, &self.verifier) {
+                Ok(saved) => self.kept(saved),
+                Err(fault) => match outcome(fault) {
+                    (_, Some(reason)) => SignInStep::Failed { reason },
+                    (problem, None) => SignInStep::Browser {
+                        server: self.server.clone(),
+                        provider: self.provider.clone(),
+                        waiting: false,
+                        problem,
+                    },
                 },
             },
-        }
+        };
+        self.show(next);
     }
 
     fn kept(&self, saved: super::Saved) -> SignInStep {
         let account = saved.user_id.clone();
-        let session = match serde_json::to_string(&saved) {
-            Ok(session) => session,
-            Err(_) => {
-                return SignInStep::Failed {
-                    reason: "The server's answer could not be kept.".to_owned(),
-                }
-            }
+        let Ok(session) = serde_json::to_string(&saved) else {
+            return SignInStep::Failed {
+                reason: "The server's answer could not be kept.".to_owned(),
+            };
         };
         match (self.adopt)(&session) {
             Ok(_) => SignInStep::Done {
@@ -405,23 +512,27 @@ impl Flow {
             },
         }
     }
-}
 
-/// A failed password step stays on that step. `Err` ends the sheet: the answer could not be read.
-fn password_outcome(fault: Fault) -> Result<SignInProblem, &'static str> {
-    match fault {
-        Fault::Unauthorized => Ok(SignInProblem::PasswordInvalid),
-        Fault::SlowDown => Ok(SignInProblem::TooMany {
-            until: unix_now() + 60,
-        }),
-        Fault::Unavailable => Ok(SignInProblem::Other {
-            reason: "The server had a problem. Try again in a moment.".to_owned(),
-        }),
-        Fault::Unreachable => Ok(SignInProblem::Unreachable),
-        Fault::BadAnswer => Err("The server's answer could not be read."),
-        Fault::Words(reason) => Ok(SignInProblem::Other {
-            reason: reason.to_owned(),
-        }),
+    /// Tells the sheet, when this is still the sign-in on show.
+    fn show(&self, step: SignInStep) {
+        let mut held = current();
+        let Some(flow) = held.as_mut() else {
+            return;
+        };
+        if !flow.out.as_ref().is_some_and(|out| Arc::ptr_eq(&out.stop, &self.stop)) || self.stop.load(Ordering::Relaxed) {
+            return;
+        }
+        flow.out = None;
+        if matches!(step, SignInStep::Done { .. } | SignInStep::Failed { .. }) {
+            *held = None;
+        } else {
+            flow.step = step.clone();
+        }
+        drop(held);
+        self.hub.changed(Change::SignIn {
+            network: Network::Tiny,
+            step,
+        });
     }
 }
 
@@ -433,8 +544,11 @@ fn unix_now() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use super::super::tests::{http, serve};
     use super::*;
     use crate::store::Store;
+    use std::io::{Read, Write};
+    use std::time::Instant;
 
     fn hub() -> Arc<Hub> {
         Arc::new(Hub::new(
@@ -451,577 +565,358 @@ mod tests {
         LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    const ADA: &str = "22222222-2222-2222-2222-222222222222";
+
+    /// What the fake server heard, and what its browser was sent to.
+    #[derive(Default)]
+    struct Heard {
+        requests: Vec<String>,
+        /// From each `POST /v1/auth/start`: the redirect and the client's state.
+        starts: Vec<(String, String)>,
+        opened: Vec<String>,
+    }
+
+    fn body(request: &str) -> serde_json::Value {
+        serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap_or("")).unwrap_or(serde_json::Value::Null)
+    }
+
+    /// A tinyserver that speaks the `/v1/auth/*` routes of the contract. Its token route answers
+    /// only the code it handed out, with the verifier whose challenge came to `start`.
+    fn server(heard: Arc<Mutex<Heard>>) -> String {
+        let challenge = Arc::new(Mutex::new(String::new()));
+        serve(move |request| {
+            let mut heard = heard.lock().unwrap();
+            heard.requests.push(request.to_owned());
+            let first = request.lines().next().unwrap_or("");
+            let sent = body(request);
+            if first.starts_with("GET /v1/auth/config ") {
+                return http(200, "OK", r#"{"methods":["oidc"],"provider_name":"Tinyauth"}"#);
+            }
+            if first.starts_with("POST /v1/auth/start ") {
+                let redirect = sent["redirect_uri"].as_str().unwrap_or("").to_owned();
+                let state = sent["state"].as_str().unwrap_or("").to_owned();
+                *challenge.lock().unwrap() = sent["code_challenge"].as_str().unwrap_or("").to_owned();
+                heard.starts.push((redirect, state));
+                return http(200, "OK", r#"{"authorize_url":"https://auth.example/authorize?client_id=tinyserver&state=server-state"}"#);
+            }
+            if first.starts_with("POST /v1/auth/token ") {
+                let verifier = sent["code_verifier"].as_str().unwrap_or("");
+                if sent["code"] != "one-time-code" || browser::challenge(verifier) != *challenge.lock().unwrap() {
+                    return http(400, "Bad Request", r#"{"error":"invalid_grant"}"#);
+                }
+                return http(
+                    200,
+                    "OK",
+                    &format!(r#"{{"token":"tok_join","user_id":"{ADA}","email":null,"display_name":"Ada","role":"member"}}"#),
+                );
+            }
+            http(404, "Not Found", r#"{"error":"not_found"}"#)
+        })
+    }
+
+    /// The browser: it goes to the provider, and the provider sends it back with `query`, which
+    /// may name `{state}`. Only the first time it is opened; after that it stays on the page.
+    /// What the loopback answered is kept.
+    fn browser_that(heard: Arc<Mutex<Heard>>, query: &'static str, pages: Arc<Mutex<Vec<String>>>) -> Browser {
+        Browser {
+            open: Arc::new(move |url: &str| {
+                let mut seen = heard.lock().unwrap();
+                seen.opened.push(url.to_owned());
+                if seen.opened.len() > 1 {
+                    return Ok(());
+                }
+                let (redirect, state) = seen.starts.last().cloned().unwrap_or_default();
+                let pages = pages.clone();
+                std::thread::spawn(move || {
+                    let page = get(&redirect, &query.replace("{state}", &state));
+                    pages.lock().unwrap().push(page);
+                });
+                Ok(())
+            }),
+            patience: Duration::from_secs(5),
+        }
+    }
+
+    /// The browser's one request to the loopback, and what it answered.
+    fn get(redirect: &str, query: &str) -> String {
+        let rest = redirect.strip_prefix("http://").unwrap_or(redirect);
+        let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+        let Ok(mut stream) = std::net::TcpStream::connect(host) else {
+            return String::new();
+        };
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+        let _ = write!(stream, "GET /{path}?{query} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+        let mut answer = String::new();
+        let _ = stream.read_to_string(&mut answer);
+        answer
+    }
+
+    /// What the loopback answered the browser. The browser may still be reading it when the
+    /// sign-in has already moved on.
+    fn first_page(pages: &Mutex<Vec<String>>) -> String {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(page) = pages.lock().unwrap().first() {
+                return page.clone();
+            }
+            assert!(Instant::now() < deadline, "the browser got no page");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// The next step the sign-in shows by itself.
+    fn next_step(hub: &Hub, since: &mut u64) -> SignInStep {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while Instant::now() < deadline {
+            let (seq, _, changes) = hub.wait(*since, Duration::from_millis(200));
+            *since = seq;
+            for change in changes {
+                if let Change::SignIn { network: Network::Tiny, step } = change {
+                    return step;
+                }
+            }
+        }
+        panic!("the sign-in did not move");
+    }
+
     #[test]
-    fn a_bad_address_stays_on_the_server_step_and_a_bad_email_stays_on_email() {
+    fn a_bad_address_stays_on_the_server_step() {
         let _one = one_sheet();
         cancel();
         let hub = hub();
         assert_eq!(
             step(&hub, None, adopt()).unwrap(),
-            SignInStep::Invite {
-                server: String::new(),
-                problem: None
-            }
+            SignInStep::Invite { server: String::new(), problem: None }
         );
         assert_eq!(
-            step(
-                &hub,
-                Some(SignInInput::HaveCode { url: String::new() }),
-                adopt()
-            )
-            .unwrap(),
+            step(&hub, Some(SignInInput::HaveCode { url: String::new() }), adopt()).unwrap(),
             SignInStep::Server { problem: None }
         );
+        for bad in ["not a url", "http://user:pw@127.0.0.1:8080", "ftp://127.0.0.1"] {
+            assert_eq!(
+                step(&hub, Some(SignInInput::Server { url: bad.into() }), adopt()).unwrap(),
+                SignInStep::Server { problem: Some(SignInProblem::UrlInvalid) }
+            );
+        }
+        // A server that cannot be reached stays on the address, saying so.
         assert_eq!(
-            step(
-                &hub,
-                Some(SignInInput::Server {
-                    url: "not a url".into()
-                }),
-                adopt()
-            )
-            .unwrap(),
-            SignInStep::Server {
-                problem: Some(SignInProblem::UrlInvalid)
-            }
-        );
-        assert_eq!(
-            step(
-                &hub,
-                Some(SignInInput::Server {
-                    url: "http://user:pw@127.0.0.1:8080".into()
-                }),
-                adopt()
-            )
-            .unwrap(),
-            SignInStep::Server {
-                problem: Some(SignInProblem::UrlInvalid)
-            }
-        );
-        assert_eq!(
-            step(
-                &hub,
-                Some(SignInInput::Server {
-                    url: "http://127.0.0.1:8080/v1".into()
-                }),
-                adopt()
-            )
-            .unwrap(),
-            SignInStep::Email {
-                server: "http://127.0.0.1:8080".into(),
-                problem: None
-            }
-        );
-        assert_eq!(
-            step(
-                &hub,
-                Some(SignInInput::Email {
-                    email: "not an email".into()
-                }),
-                adopt()
-            )
-            .unwrap(),
-            SignInStep::Email {
-                server: "http://127.0.0.1:8080".into(),
-                problem: Some(SignInProblem::EmailInvalid)
-            }
-        );
-        assert_eq!(
-            step(
-                &hub,
-                Some(SignInInput::Email {
-                    email: "ada@example.com".into()
-                }),
-                adopt()
-            )
-            .unwrap(),
-            SignInStep::Password {
-                hint: String::new(),
-                problem: None
-            }
+            step(&hub, Some(SignInInput::Server { url: "http://127.0.0.1:9".into() }), adopt()).unwrap(),
+            SignInStep::Server { problem: Some(SignInProblem::Unreachable) }
         );
         assert_eq!(
             step(&hub, Some(SignInInput::Back), adopt()).unwrap(),
-            SignInStep::Email {
-                server: "http://127.0.0.1:8080".into(),
-                problem: None
-            }
-        );
-        assert_eq!(
-            step(&hub, Some(SignInInput::Back), adopt()).unwrap(),
-            SignInStep::Server { problem: None }
+            SignInStep::Invite { server: String::new(), problem: None }
         );
         cancel();
     }
 
     #[test]
-    fn a_slow_or_broken_server_stays_on_the_password() {
-        let before = unix_now();
-        let SignInProblem::TooMany { until } = password_outcome(Fault::SlowDown).unwrap() else {
-            panic!("a pause");
-        };
-        assert!((before + 60..=before + 61).contains(&until));
-        assert_eq!(
-            password_outcome(Fault::Unavailable).unwrap(),
-            SignInProblem::Other {
-                reason: "The server had a problem. Try again in a moment.".into()
-            }
-        );
-        assert!(matches!(
-            password_outcome(Fault::Unauthorized),
-            Ok(SignInProblem::PasswordInvalid)
-        ));
-        assert!(matches!(
-            password_outcome(Fault::Unreachable),
-            Ok(SignInProblem::Unreachable)
-        ));
-        assert_eq!(
-            password_outcome(Fault::BadAnswer),
-            Err("The server's answer could not be read.")
-        );
-    }
-
-    #[test]
-    fn the_address_is_an_origin_and_the_email_has_one_at() {
-        assert_eq!(
-            base_url("  https://Example.com/  ").as_deref(),
-            Some("https://Example.com")
-        );
-        assert_eq!(
-            base_url("private.tinyclient.io").as_deref(),
-            Some("https://private.tinyclient.io")
-        );
-        assert_eq!(
-            base_url("127.0.0.1:8080").as_deref(),
-            Some("http://127.0.0.1:8080")
-        );
+    fn the_address_is_an_origin() {
+        assert_eq!(base_url("  https://Example.com/  ").as_deref(), Some("https://Example.com"));
+        assert_eq!(base_url("private.tinyclient.io").as_deref(), Some("https://private.tinyclient.io"));
+        assert_eq!(base_url("127.0.0.1:8080").as_deref(), Some("http://127.0.0.1:8080"));
         assert_eq!(base_url("localhost").as_deref(), Some("http://localhost"));
-        assert_eq!(
-            base_url("http://[::1]:8080").as_deref(),
-            Some("http://[::1]:8080")
-        );
-        assert_eq!(
-            base_url("http://127.0.0.1:8080?x=1").as_deref(),
-            Some("http://127.0.0.1:8080")
-        );
-        assert_eq!(
-            base_url("http://127.0.0.1:8080#top").as_deref(),
-            Some("http://127.0.0.1:8080")
-        );
-        assert_eq!(
-            base_url("https://chat.example/rooms?x=1#y").as_deref(),
-            Some("https://chat.example")
-        );
-        assert_eq!(
-            base_url("chat.example/health").as_deref(),
-            Some("https://chat.example")
-        );
-        assert_eq!(
-            base_url("localhost:8080/health").as_deref(),
-            Some("http://localhost:8080")
-        );
+        assert_eq!(base_url("http://[::1]:8080").as_deref(), Some("http://[::1]:8080"));
+        assert_eq!(base_url("http://127.0.0.1:8080?x=1").as_deref(), Some("http://127.0.0.1:8080"));
+        assert_eq!(base_url("http://127.0.0.1:8080#top").as_deref(), Some("http://127.0.0.1:8080"));
+        assert_eq!(base_url("https://chat.example/rooms?x=1#y").as_deref(), Some("https://chat.example"));
+        assert_eq!(base_url("chat.example/health").as_deref(), Some("https://chat.example"));
+        assert_eq!(base_url("localhost:8080/health").as_deref(), Some("http://localhost:8080"));
         assert_eq!(base_url("ftp://127.0.0.1:8080"), None);
         assert_eq!(base_url("http://127.0.0.1:0"), None);
-        assert!(email_ok("ada@example.com"));
-        assert!(email_ok(" a@b "));
-        assert!(!email_ok("ada"));
-        assert!(!email_ok("a@b@c"));
-        assert!(!email_ok("a @b.co"));
-        assert!(!email_ok("@b.co"));
-        assert!(!format!(
-            "{:?}",
-            SignInInput::Server {
-                url: "http://secret.example".into()
-            }
-        )
-        .contains("secret"));
-        assert!(!format!(
-            "{:?}",
-            SignInInput::Email {
-                email: "ada@example.com".into()
-            }
-        )
-        .contains("ada"));
-        assert!(!format!(
-            "{:?}",
-            SignInInput::Password {
-                password: "hunter2".into()
-            }
-        )
-        .contains("hunter2"));
-        assert!(!format!(
-            "{:?}",
-            SignInInput::Invite {
-                code: "secret-code".into()
-            }
-        )
-        .contains("secret"));
-        assert!(!format!(
-            "{:?}",
-            SignInInput::Name {
-                name: "Ada Lovelace".into()
-            }
-        )
-        .contains("Ada"));
+        assert!(!format!("{:?}", SignInInput::Server { url: "http://secret.example".into() }).contains("secret"));
+        assert!(!format!("{:?}", SignInInput::Invite { code: "secret-code".into() }).contains("secret"));
     }
 
+    /// The whole join: a pasted code, the browser out and back, and the session kept as before.
     #[test]
-    fn a_code_joins_from_the_same_sheet() {
+    fn a_code_signs_in_through_the_browser_and_the_server_gets_only_the_token() {
         let _one = one_sheet();
         cancel();
-        let hits = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-        let seen = hits.clone();
-        let base = super::super::tests::serve(move |request| {
-            seen.lock().unwrap().push(request.to_owned());
-            if request.lines().next().unwrap_or("").starts_with("POST /v1/invites/accept ") {
-                return super::super::tests::http(
-                    200,
-                    "OK",
-                    r#"{"token":"tok_join","user_id":"22222222-2222-2222-2222-222222222222","email":"ada@example.com","display_name":"Ada","role":"member"}"#,
-                );
-            }
-            super::super::tests::http(500, "Internal Server Error", r#"{"error":"no"}"#)
-        });
-        let kept = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let kept_step = kept.clone();
-        let hub = hub();
-        assert_eq!(
-            step(
-                &hub,
-                None,
-                Box::new(move |session| {
-                    *kept_step.lock().unwrap() = Some(session.to_owned());
-                    Ok(Vec::new())
-                }),
-            )
-            .unwrap(),
-            SignInStep::Invite {
-                server: String::new(),
-                problem: None
-            }
-        );
-        assert_eq!(
-            step(
-                &hub,
-                Some(SignInInput::HaveCode { url: String::new() }),
-                adopt()
-            )
-            .unwrap(),
-            SignInStep::Server { problem: None }
-        );
-        assert_eq!(
-            step(
-                &hub,
-                Some(SignInInput::HaveCode {
-                    url: "not a url".into()
-                }),
-                adopt()
-            )
-            .unwrap(),
-            SignInStep::Server {
-                problem: Some(SignInProblem::UrlInvalid)
-            }
-        );
-        assert_eq!(
-            step(
-                &hub,
-                Some(SignInInput::HaveCode { url: base.clone() }),
-                adopt()
-            )
-            .unwrap(),
-            SignInStep::Invite {
-                server: base.clone(),
-                problem: None
-            }
-        );
-        assert_eq!(
-            step(&hub, Some(SignInInput::Back), adopt()).unwrap(),
-            SignInStep::Server { problem: None }
-        );
-        assert_eq!(
-            step(
-                &hub,
-                Some(SignInInput::HaveCode { url: base.clone() }),
-                adopt()
-            )
-            .unwrap(),
-            SignInStep::Invite {
-                server: base.clone(),
-                problem: None
-            }
-        );
-        assert_eq!(
-            step(
-                &hub,
-                Some(SignInInput::Invite {
-                    code: "   ".into()
-                }),
-                adopt()
-            )
-            .unwrap(),
-            SignInStep::Invite {
-                server: base.clone(),
-                problem: Some(SignInProblem::Other {
-                    reason: "Paste the code you were given.".into()
-                })
-            }
-        );
-        assert_eq!(
-            step(
-                &hub,
-                Some(SignInInput::Invite {
-                    code: " join-code ".into()
-                }),
-                adopt()
-            )
-            .unwrap(),
-            SignInStep::Name {
-                server: base.clone(),
-                problem: None
-            }
-        );
-        assert_eq!(
-            step(
-                &hub,
-                Some(SignInInput::Name {
-                    name: "n".repeat(81)
-                }),
-                adopt()
-            )
-            .unwrap(),
-            SignInStep::Name {
-                server: base.clone(),
-                problem: Some(SignInProblem::Other {
-                    reason: "Type the name people should see.".into()
-                })
-            }
-        );
-        assert_eq!(
-            step(
-                &hub,
-                Some(SignInInput::Name {
-                    name: " Ada ".into()
-                }),
-                adopt()
-            )
-            .unwrap(),
-            SignInStep::Email {
-                server: base.clone(),
-                problem: None
-            }
-        );
-        assert_eq!(
-            step(&hub, Some(SignInInput::Back), adopt()).unwrap(),
-            SignInStep::Name {
-                server: base.clone(),
-                problem: None
-            }
-        );
-        assert_eq!(
-            step(
-                &hub,
-                Some(SignInInput::Name { name: "Ada".into() }),
-                adopt()
-            )
-            .unwrap(),
-            SignInStep::Email {
-                server: base.clone(),
-                problem: None
-            }
-        );
-        assert_eq!(
-            step(
-                &hub,
-                Some(SignInInput::Email {
-                    email: "ada@example.com".into()
-                }),
-                adopt()
-            )
-            .unwrap(),
-            SignInStep::Password {
-                hint: JOIN_PASSWORD.to_owned(),
-                problem: None
-            }
-        );
-        assert_eq!(hits.lock().unwrap().len(), 0);
-        assert_eq!(
-            step(
-                &hub,
-                Some(SignInInput::Password {
-                    password: "short".into()
-                }),
-                adopt()
-            )
-            .unwrap(),
-            SignInStep::Password {
-                hint: JOIN_PASSWORD.to_owned(),
-                problem: Some(SignInProblem::Other {
-                    reason: "Use 12 to 128 characters.".into()
-                })
-            }
-        );
-        assert_eq!(hits.lock().unwrap().len(), 0);
-        assert_eq!(
-            step(
-                &hub,
-                Some(SignInInput::Password {
-                    password: "correct-horse".into()
-                }),
-                adopt()
-            )
-            .unwrap(),
-            SignInStep::Done {
-                account: Some(AccountKey {
-                    network: Network::Tiny,
-                    account: "22222222-2222-2222-2222-222222222222".into(),
-                })
-            }
-        );
-        let sent = hits.lock().unwrap();
-        assert_eq!(sent.len(), 1);
-        assert!(sent[0].lines().next().unwrap_or("").starts_with("POST /v1/invites/accept "));
-        let body: serde_json::Value = serde_json::from_str(sent[0].split("\r\n\r\n").nth(1).unwrap_or("")).unwrap();
-        assert_eq!(body["token"], "join-code");
-        assert_eq!(body["email"], "ada@example.com");
-        assert_eq!(body["display_name"], "Ada");
-        assert_eq!(body["password"], "correct-horse");
-        let session = kept.lock().unwrap().clone().expect("adopted");
-        let saved: serde_json::Value = serde_json::from_str(&session).unwrap();
-        assert_eq!(saved["user_id"], "22222222-2222-2222-2222-222222222222");
-        assert_eq!(saved["role"], "member");
-        assert_eq!(saved["base_url"], base);
-        assert_eq!(saved["display_name"], "Ada");
-        cancel();
-    }
-
-    #[test]
-    fn a_pasted_code_opens_the_server_it_carries_and_the_server_gets_only_the_token() {
-        let _one = one_sheet();
-        cancel();
-        let hits = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-        let seen = hits.clone();
-        let base = super::super::tests::serve(move |request| {
-            seen.lock().unwrap().push(request.to_owned());
-            if request.lines().next().unwrap_or("").starts_with("POST /v1/invites/accept ") {
-                return super::super::tests::http(
-                    200,
-                    "OK",
-                    r#"{"token":"tok_join","user_id":"22222222-2222-2222-2222-222222222222","email":"bea@example.com","display_name":"Bea","role":"admin"}"#,
-                );
-            }
-            super::super::tests::http(500, "Internal Server Error", r#"{"error":"no"}"#)
-        });
+        let heard = Arc::new(Mutex::new(Heard::default()));
+        let base = server(heard.clone());
         let token = "abcdefghijklmnopqrstuvwxyz0123456789-_ABC";
         let packed = protocol::pack_join(&base, token).unwrap();
-        let wrapped = format!(" {packed}\n");
+        let kept = Arc::new(Mutex::new(None::<String>));
+        let keep = kept.clone();
+        let pages = Arc::new(Mutex::new(Vec::new()));
+        let opens = browser_that(heard.clone(), "code=one-time-code&state={state}", pages.clone());
         let hub = hub();
-        assert_eq!(
-            step(&hub, None, adopt()).unwrap(),
-            SignInStep::Invite {
-                server: String::new(),
-                problem: None
-            }
-        );
-        assert_eq!(
-            step(
-                &hub,
-                Some(SignInInput::Invite { code: token.to_owned() }),
-                adopt()
-            )
-            .unwrap(),
-            SignInStep::Invite {
-                server: String::new(),
-                problem: Some(SignInProblem::Other {
-                    reason: "That code has no server in it. Ask for a new one.".into()
-                })
-            }
-        );
-        assert_eq!(
-            step(
-                &hub,
-                Some(SignInInput::Invite {
-                    code: "https://example.com".into()
-                }),
-                adopt()
-            )
-            .unwrap(),
-            SignInStep::Invite {
-                server: String::new(),
-                problem: Some(SignInProblem::Other {
-                    reason: "That code doesn't work. Ask for a new one.".into()
-                })
-            }
-        );
-        assert_eq!(
-            step(&hub, Some(SignInInput::Invite { code: wrapped }), adopt()).unwrap(),
-            SignInStep::Name {
-                server: base.clone(),
-                problem: None
-            }
-        );
-        assert_eq!(
-            step(&hub, Some(SignInInput::Back), adopt()).unwrap(),
-            SignInStep::Invite {
-                server: base.clone(),
-                problem: None
-            }
-        );
-        assert_eq!(
-            step(&hub, Some(SignInInput::Back), adopt()).unwrap(),
-            SignInStep::Invite {
-                server: String::new(),
-                problem: None
-            }
-        );
-        assert_eq!(
-            step(
-                &hub,
-                Some(SignInInput::Invite {
-                    code: packed.clone()
-                }),
-                adopt()
-            )
-            .unwrap(),
-            SignInStep::Name {
-                server: base.clone(),
-                problem: None
-            }
-        );
-        step(
+        let mut since = hub.seq();
+        let begun = step_with(
             &hub,
-            Some(SignInInput::Name { name: "Bea".into() }),
-            adopt(),
-        )
-        .unwrap();
-        step(
-            &hub,
-            Some(SignInInput::Email {
-                email: "bea@example.com".into()
+            None,
+            Box::new(move |session| {
+                *keep.lock().unwrap() = Some(session.to_owned());
+                Ok(Vec::new())
             }),
-            adopt(),
-        )
-        .unwrap();
+            || opens,
+        );
+        assert_eq!(begun.unwrap(), SignInStep::Invite { server: String::new(), problem: None });
+        // A bare token has no server in it, and nothing is asked of any.
         assert_eq!(
-            step(
-                &hub,
-                Some(SignInInput::Password {
-                    password: "correct-horse".into()
-                }),
-                adopt()
-            )
-            .unwrap(),
-            SignInStep::Done {
-                account: Some(AccountKey {
-                    network: Network::Tiny,
-                    account: "22222222-2222-2222-2222-222222222222".into(),
-                })
+            step(&hub, Some(SignInInput::Invite { code: token.to_owned() }), adopt()).unwrap(),
+            SignInStep::Invite {
+                server: String::new(),
+                problem: Some(SignInProblem::Other { reason: "That code has no server in it. Ask for a new one.".into() })
             }
         );
-        let sent = hits.lock().unwrap();
-        let body: serde_json::Value = serde_json::from_str(sent[0].split("\r\n\r\n").nth(1).unwrap_or("")).unwrap();
-        assert_eq!(body["token"], token);
-        assert!(!body["token"].as_str().unwrap_or("").contains("tc1."));
-        assert_eq!(body["display_name"], "Bea");
+        assert!(heard.lock().unwrap().requests.is_empty());
+        assert_eq!(
+            step(&hub, Some(SignInInput::Invite { code: format!(" {packed}\n") }), adopt()).unwrap(),
+            SignInStep::Browser { server: base.clone(), provider: "Tinyauth".into(), waiting: true, problem: None }
+        );
+        assert_eq!(
+            next_step(&hub, &mut since),
+            SignInStep::Done { account: Some(AccountKey { network: Network::Tiny, account: ADA.into() }) }
+        );
+
+        let heard = heard.lock().unwrap();
+        assert_eq!(heard.opened, ["https://auth.example/authorize?client_id=tinyserver&state=server-state"]);
+        let firsts: Vec<&str> = heard.requests.iter().map(|request| request.lines().next().unwrap_or("")).collect();
+        assert!(firsts[0].starts_with("GET /v1/auth/config "));
+        assert!(firsts[1].starts_with("POST /v1/auth/start "));
+        assert!(firsts[2].starts_with("POST /v1/auth/token "));
+        assert_eq!(firsts.len(), 3);
+        let start = body(&heard.requests[1]);
+        assert_eq!(start["invite"], token, "the bare token, never the pasted code");
+        assert_eq!(start["code_challenge_method"], "S256");
+        let redirect = start["redirect_uri"].as_str().unwrap();
+        let port = redirect.strip_prefix("http://127.0.0.1:").and_then(|rest| rest.strip_suffix("/callback")).unwrap();
+        assert!(port.parse::<u16>().is_ok_and(|port| port > 0), "{redirect}");
+        let state = start["state"].as_str().unwrap();
+        assert!((16..=128).contains(&state.len()));
+        let exchanged = body(&heard.requests[2]);
+        assert_eq!(exchanged["code"], "one-time-code");
+        let verifier = exchanged["code_verifier"].as_str().unwrap();
+        assert_eq!(verifier.len(), 43);
+        assert_eq!(browser::challenge(verifier), start["code_challenge"]);
+        assert!(!heard.requests[1].contains(verifier), "the verifier stays here until the code is back");
+
+        let page = first_page(&pages);
+        assert!(page.starts_with("HTTP/1.1 200 "), "{page}");
+        assert!(page.contains("You can close this tab and return to tinyclient."));
+        let saved: serde_json::Value = serde_json::from_str(&kept.lock().unwrap().clone().expect("adopted")).unwrap();
+        assert_eq!(saved["base_url"], base);
+        assert_eq!(saved["token"], "tok_join");
+        assert_eq!(saved["user_id"], ADA);
+        assert_eq!(saved["email"], serde_json::Value::Null);
+        assert_eq!(saved["display_name"], "Ada");
+        assert_eq!(saved["role"], "member");
+        // Over: the next answer starts nothing.
+        assert_eq!(step(&hub, Some(SignInInput::OpenBrowser), adopt()).unwrap(), SignInStep::Failed { reason: OVER.into() });
+        cancel();
+    }
+
+    /// An account with no code sends no invite. A provider account that is not a member is told
+    /// so, and trying again begins a new sign-in that a page from another one cannot finish.
+    #[test]
+    fn an_account_with_no_code_is_told_when_it_is_not_a_member_and_can_try_again() {
+        let _one = one_sheet();
+        cancel();
+        let heard = Arc::new(Mutex::new(Heard::default()));
+        let base = server(heard.clone());
+        let pages = Arc::new(Mutex::new(Vec::new()));
+        let not_member = browser_that(heard.clone(), "error=not_member&state={state}", pages.clone());
+        let hub = hub();
+        let mut since = hub.seq();
+        step_with(&hub, None, adopt(), || not_member).unwrap();
+        step(&hub, Some(SignInInput::HaveCode { url: String::new() }), adopt()).unwrap();
+        assert_eq!(
+            step(&hub, Some(SignInInput::Server { url: base.clone() }), adopt()).unwrap(),
+            SignInStep::Browser { server: base.clone(), provider: "Tinyauth".into(), waiting: true, problem: None }
+        );
+        let told = SignInStep::Browser { server: base.clone(), provider: "Tinyauth".into(), waiting: false, problem: Some(SignInProblem::NotMember) };
+        assert_eq!(next_step(&hub, &mut since), told);
+        assert_eq!(step(&hub, None, adopt()).unwrap(), told, "the sheet opened again reads where it stands");
+        assert!(first_page(&pages).contains("You&#39;re not a member of this server yet."));
+        assert!(body(&heard.lock().unwrap().requests[1]).get("invite").is_none());
+
+        // Again: a page with the first sign-in's state is turned away and does not end this one.
+        let first_state = heard.lock().unwrap().starts[0].1.clone();
+        let again = step(&hub, Some(SignInInput::OpenBrowser), adopt()).unwrap();
+        assert!(matches!(again, SignInStep::Browser { waiting: true, problem: None, .. }), "{again:?}");
+        let (redirect, state) = heard.lock().unwrap().starts[1].clone();
+        assert_ne!(state, first_state);
+        let stale = get(&redirect, &format!("code=one-time-code&state={first_state}"));
+        assert!(stale.starts_with("HTTP/1.1 400 "), "{stale}");
+        let favicon = get(&redirect.replace("/callback", "/favicon.ico"), "");
+        assert!(favicon.starts_with("HTTP/1.1 404 "), "{favicon}");
+        assert!(get(&redirect, &format!("code=one-time-code&state={state}")).contains("You can close this tab"));
+        assert_eq!(
+            next_step(&hub, &mut since),
+            SignInStep::Done { account: Some(AccountKey { network: Network::Tiny, account: ADA.into() }) }
+        );
+        cancel();
+    }
+
+    /// Open the page again while waiting shows the same page. Closing the sheet closes the
+    /// listener, and a browser that never comes back ends the wait.
+    #[test]
+    fn cancel_closes_the_listener_and_a_browser_that_never_returns_runs_out() {
+        let _one = one_sheet();
+        cancel();
+        let heard = Arc::new(Mutex::new(Heard::default()));
+        let base = server(heard.clone());
+        let opened = heard.clone();
+        let quiet = move |patience| Browser {
+            open: Arc::new({
+                let opened = opened.clone();
+                move |url: &str| {
+                    opened.lock().unwrap().opened.push(url.to_owned());
+                    Ok(())
+                }
+            }),
+            patience,
+        };
+        let hub = hub();
+        let wait = quiet(Duration::from_secs(60));
+        step_with(&hub, None, adopt(), || wait).unwrap();
+        step(&hub, Some(SignInInput::HaveCode { url: String::new() }), adopt()).unwrap();
+        step(&hub, Some(SignInInput::Server { url: base.clone() }), adopt()).unwrap();
+        let again = step(&hub, Some(SignInInput::OpenBrowser), adopt()).unwrap();
+        assert!(matches!(again, SignInStep::Browser { waiting: true, .. }));
+        assert_eq!(heard.lock().unwrap().opened.len(), 2);
+        assert_eq!(heard.lock().unwrap().starts.len(), 1, "the same sign-in, not a new one");
+        let (redirect, _) = heard.lock().unwrap().starts[0].clone();
+        let host = redirect.strip_prefix("http://").and_then(|rest| rest.strip_suffix("/callback")).unwrap().to_owned();
+        assert!(std::net::TcpStream::connect(&host).is_ok(), "listening while it waits");
+        cancel();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while std::net::TcpStream::connect(&host).is_ok() {
+            assert!(Instant::now() < deadline, "the listener is still open after cancel");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let mut since = hub.seq();
+        let short = quiet(Duration::from_millis(300));
+        step_with(&hub, None, adopt(), || short).unwrap();
+        step(&hub, Some(SignInInput::HaveCode { url: String::new() }), adopt()).unwrap();
+        step(&hub, Some(SignInInput::Server { url: base.clone() }), adopt()).unwrap();
+        assert_eq!(
+            next_step(&hub, &mut since),
+            SignInStep::Browser {
+                server: base.clone(),
+                provider: "Tinyauth".into(),
+                waiting: false,
+                problem: Some(SignInProblem::Other { reason: TIMED_OUT.into() })
+            }
+        );
+        cancel();
+    }
+
+    #[test]
+    fn a_server_from_before_the_browser_sign_in_says_so_on_the_code() {
+        let _one = one_sheet();
+        cancel();
+        let older = serve(|_| http(404, "Not Found", r#"{"error":"not_found"}"#));
+        let hub = hub();
+        step(&hub, None, adopt()).unwrap();
+        let packed = protocol::pack_join(&older, "join-code").unwrap();
+        assert_eq!(
+            step(&hub, Some(SignInInput::Invite { code: packed }), adopt()).unwrap(),
+            SignInStep::Invite { server: String::new(), problem: Some(SignInProblem::Other { reason: super::super::NO_BROWSER.into() }) }
+        );
         cancel();
     }
 }

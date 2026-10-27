@@ -137,7 +137,16 @@ pub fn install_into() -> Option<PathBuf> {
     }
     let dir = exe.parent()?.to_owned();
     let sibling = |name: &str| dir.join(program(name)).is_file();
-    (sibling("chatd") && sibling("mediad") && sibling("tinyclient-login")).then_some(dir)
+    (sibling("chatd") && sibling("mediad") && sibling("tinyclient-login") && writable(&dir)).then_some(dir)
+}
+
+/// Whether this user can put files in `dir`. A copy installed for everyone (Program Files, a
+/// system package) is not: it is updated by downloading the installer, not in place.
+fn writable(dir: &Path) -> bool {
+    let probe = dir.join(format!(".tinyclient-write-probe-{}", std::process::id()));
+    let made = fs::OpenOptions::new().write(true).create_new(true).open(&probe).is_ok();
+    let _ = fs::remove_file(&probe);
+    made
 }
 
 /// A tree under Cargo's `target/` is a development build and is never replaced. Neither is a copy
@@ -176,6 +185,16 @@ fn work_dir() -> PathBuf {
 /// Reads a download left from the last run, so the dot is there before the check answers.
 pub fn recall() {
     let saved = read_state(&work_dir().join("state"));
+    // What the last swap did, left by the script that ran after we quit.
+    let swapped = fs::read_to_string(work_dir().join(SWAP_RESULT)).unwrap_or_default();
+    let _ = fs::remove_file(work_dir().join(SWAP_RESULT));
+    if let Some(version) = failed_swap(&swapped) {
+        let mut memory = memory();
+        memory.checked = saved.checked;
+        memory.shown = Shown::Failed { version };
+        let _ = write_state(&work_dir(), &memory.shown, &saved.page, memory.checked);
+        return;
+    }
     let mut memory = memory();
     memory.checked = saved.checked;
     memory.shown = match saved.shown {
@@ -242,7 +261,7 @@ pub fn discard_download() {
 /// Starts the swap, which waits until this process has exited. Does nothing when no download
 /// is waiting. Called at the start of quit, before chatd is asked to stop.
 pub fn apply_on_quit() {
-    let Shown::Ready { .. } = shown() else {
+    let Shown::Ready { version } = shown() else {
         return;
     };
     let Some(dest) = install_into() else {
@@ -254,7 +273,7 @@ pub fn apply_on_quit() {
     if cfg!(target_os = "macos") && dest.extension().and_then(|ext| ext.to_str()) != Some("app") {
         return;
     }
-    let _ = spawn_swap(std::process::id(), &payload, &dest);
+    let _ = spawn_swap(std::process::id(), &payload, &dest, &version);
 }
 
 enum Outcome {
@@ -407,12 +426,14 @@ fn codesign_ok(app: &Path) -> bool {
         .is_ok_and(|status| status.success())
 }
 
-fn spawn_swap(pid: u32, payload: &Path, dest: &Path) -> io::Result<()> {
+fn spawn_swap(pid: u32, payload: &Path, dest: &Path, version: &str) -> io::Result<()> {
     let dir = work_dir();
     fs::create_dir_all(&dir)?;
     if cfg!(windows) {
         let script = dir.join("apply.ps1");
-        fs::write(&script, windows_script(pid, payload, dest))?;
+        let result = dir.join(SWAP_RESULT);
+        let _ = fs::remove_file(&result);
+        fs::write(&script, windows_script(pid, payload, dest, version, &result))?;
         Command::new("cmd")
             .args([
                 "/C",
@@ -473,18 +494,59 @@ fn unix_script(pid: u32, payload: &Path, dest: &Path) -> String {
     format!("#!/bin/sh\nset -eu\nwhile kill -0 {pid} 2>/dev/null; do sleep 0.2; done\nsleep 0.5\n{moves}{relaunch} >/dev/null 2>&1 &\n")
 }
 
-fn windows_script(pid: u32, payload: &Path, dest: &Path) -> String {
-    let src = payload.display().to_string().replace('\'', "''");
-    let dest = dest.display().to_string().replace('\'', "''");
-    format!(
-        "$ErrorActionPreference = 'Stop'\n\
-         Wait-Process -Id {pid} -ErrorAction SilentlyContinue\n\
-         Start-Sleep -Milliseconds 500\n\
-         foreach ($name in 'tinyclient','chatd','mediad','tinyclient-login') {{\n\
-           Move-Item -Force (Join-Path '{src}' ($name + '.exe')) (Join-Path '{dest}' ($name + '.exe'))\n\
-         }}\n\
-         Start-Process (Join-Path '{dest}' 'tinyclient.exe')\n"
-    )
+/// The file the Windows swap leaves: `updated <version>`, or `failed <version> <why>`.
+const SWAP_RESULT: &str = "swap-result";
+
+/// The uninstall entry of the Inno Setup AppId in `packaging/windows/tinyclient.iss`. Windows
+/// shows its version under Installed apps.
+const WINDOWS_APP_KEY: &str =
+    r"HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{8C1B5E0A-4F3D-4C1E-9B7A-2D6E5F1A7C3B}_is1";
+
+/// The version a failed swap was for, from [`SWAP_RESULT`].
+fn failed_swap(result: &str) -> Option<String> {
+    let mut words = result.split_whitespace();
+    (words.next() == Some("failed")).then(|| words.next().map(str::to_owned)).flatten()
+}
+
+/// Runs after the window has quit. chatd, mediad and a sign-in window outlive it by a moment, and
+/// Windows will not replace a running program, so it waits for everything started from this
+/// folder and stops what is still there after 15 s. The old programs are moved aside first and
+/// put back if any step fails, so a failure never leaves two versions side by side. Whatever
+/// happened, tinyclient opens again.
+fn windows_script(pid: u32, payload: &Path, dest: &Path, version: &str, result: &Path) -> String {
+    let quoted = |text: &str| format!("'{}'", text.replace('\'', "''"));
+    r#"$ErrorActionPreference = 'Stop'
+$dest = @DEST@
+$src = @SRC@
+$result = @RESULT@
+$names = 'tinyclient','chatd','mediad','tinyclient-login'
+function Running { Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -and ((Split-Path $_.Path) -eq $dest) } }
+Wait-Process -Id @PID@ -Timeout 30 -ErrorAction SilentlyContinue
+$until = (Get-Date).AddSeconds(15)
+while ((Running) -and ((Get-Date) -lt $until)) { Start-Sleep -Milliseconds 200 }
+Running | Stop-Process -Force -ErrorAction SilentlyContinue
+Start-Sleep -Milliseconds 300
+try {
+  foreach ($n in $names) { $d = Join-Path $dest "$n.exe"; if (Test-Path $d) { Move-Item -Force $d "$d.old" } }
+  foreach ($n in $names) { Move-Item -Force (Join-Path $src "$n.exe") (Join-Path $dest "$n.exe") }
+  foreach ($n in $names) { Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $dest "$n.exe.old") }
+  if (Test-Path @KEY@) { Set-ItemProperty -Path @KEY@ -Name DisplayVersion -Value @VERSION@ -ErrorAction SilentlyContinue }
+  Set-Content -Path $result -Value ('updated ' + @VERSION@)
+} catch {
+  foreach ($n in $names) {
+    $d = Join-Path $dest "$n.exe"
+    if (Test-Path "$d.old") { Remove-Item -Force -ErrorAction SilentlyContinue $d; Move-Item -Force "$d.old" $d -ErrorAction SilentlyContinue }
+  }
+  Set-Content -Path $result -Value ('failed ' + @VERSION@ + ' ' + $_.Exception.Message)
+}
+Start-Process (Join-Path $dest 'tinyclient.exe')
+"#
+    .replace("@DEST@", &quoted(&dest.display().to_string()))
+    .replace("@SRC@", &quoted(&payload.display().to_string()))
+    .replace("@RESULT@", &quoted(&result.display().to_string()))
+    .replace("@KEY@", &quoted(WINDOWS_APP_KEY))
+    .replace("@VERSION@", &quoted(version))
+    .replace("@PID@", &pid.to_string())
 }
 
 fn shell_quote(text: &str) -> String {
@@ -829,6 +891,44 @@ mod tests {
         assert!(replaceable(Path::new(
             "/home/me/.local/lib/tinyclient/tinyclient"
         )));
+    }
+
+    #[test]
+    fn the_windows_swap_waits_for_the_folder_rolls_back_and_always_reopens() {
+        let script = windows_script(
+            42,
+            Path::new(r"C:\Users\o'brien\AppData\Roaming\tinyclient\update\staged"),
+            Path::new(r"C:\Users\o'brien\AppData\Local\Programs\tinyclient"),
+            "0.9.0",
+            Path::new(r"C:\Users\o'brien\AppData\Roaming\tinyclient\update\swap-result"),
+        );
+        assert!(script.contains("Wait-Process -Id 42 "));
+        assert!(script.contains(r"$dest = 'C:\Users\o''brien\AppData\Local\Programs\tinyclient'"));
+        // What still runs from the folder is stopped before anything is moved.
+        assert!(script.find("Stop-Process").unwrap() < script.find("Move-Item").unwrap());
+        assert!(script.contains(r#""$d.old""#));
+        assert!(script.contains("'failed ' + '0.9.0'"));
+        assert!(script.contains("{8C1B5E0A-4F3D-4C1E-9B7A-2D6E5F1A7C3B}_is1"));
+        // Reopening is outside the try, so it happens after a failure too.
+        assert!(script.trim_end().ends_with("Start-Process (Join-Path $dest 'tinyclient.exe')"));
+        assert!(!script.contains('@'));
+    }
+
+    #[test]
+    fn a_failed_swap_is_read_back_and_a_good_one_is_not() {
+        assert_eq!(failed_swap("failed 0.9.0 Access is denied."), Some("0.9.0".into()));
+        assert_eq!(failed_swap("updated 0.9.0"), None);
+        assert_eq!(failed_swap(""), None);
+    }
+
+    #[test]
+    fn a_folder_this_user_can_write_is_writable_and_the_probe_is_gone() {
+        let dir = std::env::temp_dir().join(format!("tinyclient-writable-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        assert!(writable(&dir));
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+        let _ = fs::remove_dir_all(&dir);
+        assert!(!writable(&dir));
     }
 
     #[test]

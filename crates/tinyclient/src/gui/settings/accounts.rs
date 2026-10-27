@@ -1,6 +1,6 @@
 //! Settings › Accounts (08 §5 and §6, with 01's sizes): one card per network, a row per
 //! account with its state in words, Sign in, Sign in again and Sign out… A connected Tiny server
-//! account also has its name, its password, and Sign out everywhere (`tiny.rs`).
+//! account also has its name and Sign out everywhere (`tiny.rs`).
 
 use super::controls::{caption, card, group_label, rule};
 use super::{Confirm, SettingsWindow};

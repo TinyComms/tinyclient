@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.14"
+version = "0.2.15"
 edition = "2021"
 license = "MIT"
 publish = false
@@ -18,6 +18,12 @@ publish = false
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 protocol = { path = "crates/protocol" }
+
+# Dependencies build optimized in dev too. Unoptimized GPUI cannot draw a frame inside one
+# monitor refresh, so a debug window stutters when dragged or scrolled. Our own crates stay at
+# opt-level 0, so a rebuild after an edit is as quick as before; only the first build is longer.
+[profile.dev.package."*"]
+opt-level = 2
 
 # chatd's optional `signal` feature pins libsignal v0.94, which builds only against Signal's fork of
 # curve25519-dalek; a patch here is the only way a git dependency gets it. The fork is upstream

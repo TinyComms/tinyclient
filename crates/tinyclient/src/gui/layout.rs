@@ -4,15 +4,16 @@
 //! slots the other slices fill.
 
 use super::components::{
-    button, button_disabled, divider, empty_state, fade_in, glyph, icon_button, menu, menu_item,
+    brand_mark, brand_state, button, button_disabled, divider, fade_in, glyph, icon_button, menu, menu_item,
     menu_item_check, menu_item_danger, menu_label, menu_separator, network_icon, place, placed, popover, scrim, tip,
     toast, ButtonKind, Layer, Place, NO_GLYPH,
 };
+use super::chrome::{self, End};
 use super::state::{Shell, Snapshot};
 use super::theme::{self, Type};
 use gpui::{
-    div, prelude::*, px, AnyElement, Context, Div, MouseButton, MouseMoveEvent, Pixels, Point, Rgba,
-    SharedString, Window,
+    div, prelude::*, px, AnyElement, App, Context, Div, MouseButton, MouseMoveEvent, Pixels, Point, Rgba,
+    SharedString, Window, WindowControlArea,
 };
 use protocol::{Conversation, Key, Link, Network, Presence};
 use std::rc::Rc;
@@ -34,9 +35,21 @@ pub const NETWORK_ORDER: [Network; 7] = [Network::Discord, Network::Slack, Netwo
 /// The networks tinyclient signs in to today. The others are shown as coming later.
 pub const AVAILABLE: [Network; 7] = NETWORK_ORDER;
 
-/// Lets a strip of chrome move the window, as a title bar would.
+/// Lets a strip of chrome move the window, as a title bar would. Windows does it all itself
+/// from the drag area: move, snap, double-click to maximize, the window menu. Elsewhere a press
+/// moves it and a double click does what the title bar's would.
 pub fn drags_window(strip: Div) -> Div {
-    strip.on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move())
+    let strip = strip.window_control_area(WindowControlArea::Drag);
+    if cfg!(windows) {
+        return strip;
+    }
+    strip
+        .on_mouse_down(MouseButton::Left, |event, window, _| match event.click_count {
+            2 if cfg!(target_os = "macos") => window.titlebar_double_click(),
+            2 => window.zoom_window(),
+            _ => window.start_window_move(),
+        })
+        .on_mouse_down(MouseButton::Right, |event, window, _| window.show_window_menu(event.position))
 }
 
 /// What another slice draws into one of this slice's frames. `None` draws nothing.
@@ -285,7 +298,7 @@ impl Shell {
                     .items_center()
                     .child(self.strip_controls(window, cx)),
             )
-            .child(empty_state("icons/message-circle.svg", "Pick a conversation", "⌘K jumps anywhere."))
+            .child(brand_state("Pick a conversation", "⌘K jumps anywhere."))
     }
 
     /// Says the result of something the user just did that is not visible where they look.
@@ -406,7 +419,7 @@ impl Shell {
             .h(px(TOP_BAR))
             .flex_none()
             .pl(px(theme::PANE_PAD))
-            .pr(px(12.))
+            .pr(px(chrome::end_pad(End::Right, 12.)))
             .flex()
             .items_center()
             .gap(px(8.))
@@ -556,7 +569,7 @@ impl Shell {
                     .flex_col()
                     .items_center()
                     .justify_center()
-                    .child(glyph("icons/message-circle.svg", 20., theme::text_faint()))
+                    .child(brand_mark(theme::BRAND_MARK))
                     .child(div().mt(px(16.)).type_headline().child("Welcome to tinyclient"))
                     .child(
                         div()
@@ -867,7 +880,7 @@ impl Render for Shell {
         // first-launch screen waits until it is done.
         let settled = !self.service.keychain.reading && self.shown().empty_state().is_none();
         if self.snapshot.is_some() && snapshot.signed_in().is_empty() && settled {
-            return root.child(self.first_run(snapshot, cx));
+            return root.child(self.first_run(snapshot, cx)).children(window_chrome(window));
         }
 
         let state = &self.layout_state;
@@ -887,6 +900,13 @@ impl Render for Shell {
         // something on screen always offers it.
         let list_alone = snapshot.open.is_none() && plan.sidebar.is_none() && !state.sidebar_hidden && !floating && !replaced;
         let _ = tall;
+        // Where the window's own buttons sit, on Windows and a Linux that leaves them to us.
+        let end = match () {
+            _ if plan.right.is_some() => End::Right,
+            _ if list_alone && !(matches!(self.sidebar_state.mode, super::sidebar::Mode::Network(Network::Tiny)) && self.tiny_open()) => End::List,
+            _ => End::Conversation,
+        };
+        chrome::set_end(end, window);
 
         root.child(self.rail(snapshot, window, cx))
             .when(overview > 0., |root| root.child(self.discord_overview(snapshot, overview, window, cx)))
@@ -938,7 +958,15 @@ impl Render for Shell {
             .children(self.switcher(window, cx))
             .children(self.menu_layer(snapshot, plan.sidebar.unwrap_or(state.sidebar_width), overview, window, cx))
             .children(self.toast_layer(width, cx))
+            .children(window_chrome(window))
     }
+}
+
+/// The window's own buttons and resize edges, where the platform leaves them to the window.
+fn window_chrome(window: &Window) -> impl Iterator<Item = AnyElement> {
+    let edges = chrome::edges(window).map(IntoElement::into_any_element);
+    let buttons = chrome::buttons(window, |_, _, cx: &mut App| super::app::menubar::close_window(cx));
+    edges.into_iter().chain(buttons)
 }
 
 impl Shell {

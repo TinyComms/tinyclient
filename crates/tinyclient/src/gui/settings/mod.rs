@@ -132,8 +132,6 @@ pub(super) enum Confirm {
     Retention { days: u32, prunable: Option<(u64, u64)> },
     Clear,
     Reset,
-    /// The Tiny account's password: three fields in the question.
-    TinyPassword(protocol::AccountKey),
     TinyEverywhere(Box<AccountStatus>),
 }
 
@@ -244,6 +242,7 @@ fn open_now(section: Section, cx: &mut App) {
             appears_transparent: true,
             traffic_light_position: Some(point(px(12.), px(16.))),
         }),
+        window_decorations: Some(gpui::WindowDecorations::Server),
         is_resizable: false,
         is_minimizable: false,
         app_id: Some(super::APP_ID.into()),
@@ -303,7 +302,7 @@ pub struct SettingsWindow {
     pub(super) copied: Option<Instant>,
     /// A row opened from search, lit for 1.5 s.
     pub(super) highlight: Option<&'static str>,
-    /// The Tiny server account's name and password fields.
+    /// The Tiny server account's name field.
     tiny: tiny::TinyAccount,
     _subscriptions: Vec<Subscription>,
 }
@@ -390,10 +389,9 @@ impl SettingsWindow {
         cx.notify();
     }
 
-    /// Closes the question on show. Typed passwords go with it.
+    /// Closes the question on show.
     pub(super) fn close_modal(&mut self, cx: &mut Context<Self>) {
         self.confirm = None;
-        self.tiny.forget_typed(cx);
         cx.notify();
     }
 
@@ -917,7 +915,7 @@ pub(super) fn modal_layer(panel: Div, cx: &mut Context<SettingsWindow>) -> Div {
 
 impl Render for SettingsWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let modal = self.confirm.clone().map(|confirm| self.modal(&confirm, window, cx));
+        let modal = self.confirm.clone().map(|confirm| self.modal(&confirm, cx));
         let menu = self.picker.and_then(|picker| self.device_menu(picker, window, cx));
         let toast = self.copied.filter(|at| at.elapsed() < Duration::from_secs(4)).map(|_| {
             div().absolute().bottom(px(16.)).left_0().right_0().flex().justify_center().child(
@@ -974,17 +972,28 @@ impl Render for SettingsWindow {
                 }),
             );
         let root = section_keys!(root, Place1 => 0, Place2 => 1, Place3 => 2, Place4 => 3, Place5 => 4, Place6 => 5, Place7 => 6, Place8 => 7, Place9 => 8);
-        root.child(self.list(window, cx))
+        // The top strip moves the window: drawn first, it takes only the presses nothing above it does.
+        let strip = super::layout::drags_window(div().absolute().top_0().left_0().w_full().h(px(theme::STRIP)));
+        let close = super::chrome::buttons(
+            window,
+            cx.listener(|this, _: &gpui::ClickEvent, window, cx| {
+                this.stop_test(cx);
+                window.remove_window();
+            }),
+        );
+        root.child(strip)
+            .child(self.list(window, cx))
             .child(self.pane(window, cx))
             .children(menu)
             .children(toast)
             .children(modal)
+            .children(close)
     }
 }
 
 /// `--settings <section> --settings-shot out.png`, with `--shot`: opens Settings on a section
 /// once the shell has its first answer and writes that window's frame. `--settings-search
-/// <words>` types into the search; `--settings-confirm sign-out|clear|reset|retention|tiny-password|tiny-everywhere` opens
+/// <words>` types into the search; `--settings-confirm sign-out|clear|reset|retention|tiny-everywhere` opens
 /// that question.
 #[cfg(feature = "gui-shot")]
 pub fn shot(cx: &mut App) {
@@ -1011,7 +1020,6 @@ pub fn shot(cx: &mut App) {
             }
             settings.confirm = match flag("--settings-confirm").as_deref() {
                 Some("sign-out") => settings.shell.upgrade().and_then(|shell| shell.read(cx).snapshot.as_ref()?.accounts.first().cloned()).map(|account| Confirm::SignOut(Box::new(account))),
-                Some("tiny-password") => settings.tiny_accounts(cx).into_iter().next().map(Confirm::TinyPassword),
                 Some("tiny-everywhere") => settings
                     .shell
                     .upgrade()

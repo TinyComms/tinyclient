@@ -9,6 +9,7 @@ use super::tokens;
 use super::Pane;
 use crate::gui::anim::{self, Play};
 use crate::gui::components::{tip, Avatar};
+use crate::gui::chrome;
 use crate::gui::layout::TOP_BAR;
 use crate::gui::theme::{self, Type};
 use crate::gui::time;
@@ -441,7 +442,7 @@ impl Pane {
             .flex_none()
             // Clear of the window's own buttons.
             .pl(px(84.))
-            .pr(px(12.))
+            .pr(px(chrome::corner_pad(window, 12.)))
             .flex()
             .items_center()
             .gap(px(8.))

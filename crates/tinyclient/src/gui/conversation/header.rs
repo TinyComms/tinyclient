@@ -3,6 +3,7 @@
 
 use crate::gui::pane::Layer;
 use crate::gui::components::{glyph, icon_button, network_icon, tip, Avatar, Shape};
+use crate::gui::chrome::{self, End};
 use crate::gui::layout::{drags_window, TOP_BAR};
 use crate::gui::state::Shell;
 use crate::gui::theme::{self, Type};
@@ -125,7 +126,7 @@ impl Shell {
             .h(px(TOP_BAR))
             .flex_none()
             .pl(px(theme::PANE_PAD))
-            .pr(px(12.))
+            .pr(px(chrome::end_pad(End::Conversation, 12.)))
             .flex()
             .items_center()
             .border_b_1()

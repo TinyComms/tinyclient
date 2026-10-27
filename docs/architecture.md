@@ -61,7 +61,7 @@ How the processes fit together and who may edit what. The contract itself is the
 | `SignIn {network, at}`, `SignOut {account}` | `Status` | server |
 | `CallStart`, `CallAccept`, `CallDecline`, `CallEnd`, `CallSet`, `Media(..)` | `Status` | `media::Calls`; `Command::Call*` |
 | `Play(Start {account, file, path, conversation, message, title, at, rate, output} \| Pause \| Seek {at} \| Rate {rate} \| Stop)` | `Ok`; then `Change::Playback` | `playback::Player`; `mediad --play` |
-| `TinyCommunity`, `TinyInvite`, `TinyRole`, `TinyRemove`, `TinyRevoke`, `TinyRename`, `TinyPassword`, `TinySignOutEverywhere`, `TinyRoomCreate`, `TinyRoomRename`, `TinyRoomDelete` | `TinyCommunity` (members, invites, audit, rooms with who sits in each, online, the server's `media`); `TinyCode`; `Ok` | `adapters::tiny` over the server's REST; seats and presence from the hub |
+| `TinyCommunity`, `TinyInvite`, `TinyRole`, `TinyRemove`, `TinyRevoke`, `TinyRename`, `TinySignOutEverywhere`, `TinyRoomCreate`, `TinyRoomRename`, `TinyRoomDelete` | `TinyCommunity` (members, invites, audit, rooms with who sits in each, online, the server's `media`); `TinyCode`; `Ok` | `adapters::tiny` over the server's REST; seats and presence from the hub |
 | `TinyCallJoin`, `TinyCallLeave`, `TinyCallKick` | `Ok` once the server took it, or its refusal in words | `Command::Tiny`, sent on the account's live socket (`adapters/tiny/live.rs`). On a server whose `/health` says media is `up`, a join is a call with `mediad` (below); otherwise a seat only. `CallStart` on a Tiny room key is the same join |
 
 - **Rows**: a `Conversation` carries its Space's and Group's titles and its topic
@@ -121,6 +121,13 @@ How the processes fit together and who may edit what. The contract itself is the
   sends `Command::SignOut(reply)` and waits up to 5 s for the adapter to end the session on the
   network before it drops the adapter and forgets the account. A session part a network reissues
   while in use (Slack's rotated `d` cookie) is saved with `Context::save_session`.
+- **Tiny server sign-in** is the sheet's (`SignInBegin`, `SignInAnswer`), and it ends in the
+  system browser, not in `tinyclient-login`: chatd reads the server's provider
+  (`GET /v1/auth/config`), listens on `127.0.0.1:0`, sends a PKCE S256 challenge, its state and the
+  invite to `POST /v1/auth/start`, opens the page it gets back, and waits up to 5 minutes for one
+  `GET /callback`. The one-time code and the verifier go to `POST /v1/auth/token`, whose answer is
+  saved as every Tiny session is. The sheet shows `SignInStep::Browser` meanwhile; Cancel closes
+  the listener (`adapters/tiny/signin.rs`, `adapters/tiny/browser.rs`).
 - **People search** is debounced in the server: a query of at least 2 characters goes to the
   connected accounts of the request's network 400 ms after it last changed, the newest only, and
   the same query is not sent to an account twice within a minute. The adapter says

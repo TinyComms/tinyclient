@@ -8,6 +8,7 @@ mod anim;
 mod app;
 mod assets;
 mod call;
+mod chrome;
 mod components;
 mod composer;
 mod conversation;
@@ -26,7 +27,7 @@ mod theme;
 mod tiny;
 mod time;
 
-use gpui::{point, prelude::*, px, size, App, Bounds, Context, Div, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions};
+use gpui::{point, prelude::*, px, size, App, Bounds, Context, Div, KeyBinding, TitlebarOptions, WindowBounds, WindowDecorations, WindowOptions};
 use state::Shell;
 
 /// The windows' Wayland app id and X11 class: a desktop matches them to `dev.tinyclient.app.desktop`
@@ -649,6 +650,8 @@ pub fn run() {
                     // Centered on the 52 pt strips, inside the rail.
                     traffic_light_position: Some(point(px(10.), px(20.))),
                 }),
+                // A compositor's own title bar where it draws one; `chrome` draws the rest.
+                window_decorations: Some(WindowDecorations::Server),
                 app_id: Some(APP_ID.into()),
                 ..Default::default()
             };
