@@ -73,7 +73,8 @@ How the processes fit together and who may edit what. The contract itself is the
 - **Rows**: a `Conversation` carries its Space's and Group's titles and its topic
   (`Conversation::subtitle()` is the header's second line: `Space > group · topic`), `read_only`,
   `private`, the user's `draft`, and for a `Thread` its `parent` conversation and `root` message.
-  A voice channel's row carries `occupants` when anyone is in it.
+  A voice channel's row carries `occupants` when anyone is in it, and `limit`, how many it
+  seats (0 when Discord sets none).
 - **Messages** are one model: `text` plus `spans` (byte ranges on character boundaries: styles,
   links, mentions, custom emoji), `attachments` (file and thumbnail, dimensions known, `spoiler`,
   `sticker`, a voice message's `waveform` and `duration`), `previews`, `reactions`, `reply_to`

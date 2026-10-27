@@ -233,6 +233,8 @@ impl GuildInfo {
             group: parent.filter(|_| category.is_some()).map(str::to_owned),
             position: place(category, channel.is_voice(), channel.position),
             call: super::voice::support(channel.kind),
+            // A voice or stage channel's occupant limit, for the tree's `4/12`.
+            limit: (kind == ConversationKind::Voice).then_some(channel.user_limit).unwrap_or(0),
             topic: one_line(channel.topic.as_deref()),
             read_only: written && self.permissions(guild, me, channel) & SEND_MESSAGES == 0,
             private: self.private(guild, channel),

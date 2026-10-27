@@ -1005,7 +1005,7 @@ impl Shell {
             .and_then(|peer| self.people_state.hub().person(&Key { id: peer.clone(), ..c.key.clone() }))
             .map(|person| person.emoji)
             .filter(|emoji| !emoji.is_empty());
-        let limit = occupied.map(|inside| inside.total.to_string());
+        let count = occupied.and_then(|inside| voice_count(inside.total, c.limit));
         let draft = (!self.draft_of(c).is_empty() && !selected).then(|| glyph("icons/pencil.svg", 14., theme::text_faint()));
         let (picked, menu_row) = (c.clone(), c.clone());
         let content = div()
@@ -1026,7 +1026,7 @@ impl Shell {
             .children(chat::name_mark(c).filter(|_| c.kind.is_direct()))
             .child(div().flex_1())
             .children(draft)
-            .children(limit.map(|total| div().flex_none().flex().items_center().gap(px(2.)).child(glyph("icons/volume-2.svg", 12., theme::text_faint())).child(div().type_micro().text_color(theme::text_faint()).child(total))))
+            .children(count.map(|(count, soft)| div().flex_none().flex().items_center().gap(px(2.)).child(glyph("icons/volume-2.svg", 12., theme::text_faint())).child(div().type_micro().text_color(if soft { theme::text_soft() } else { theme::text_faint() }).child(count))))
             .children(row_badge(c));
         list_row(row_id("tree", &c.key), theme::row_height(theme::ROW_ONE), selected, focused, content)
             .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| this.pick_row(&picked, cx)))
@@ -1477,6 +1477,15 @@ impl Shell {
     }
 }
 
+/// An occupied voice row's trailing count: `4/12` when the channel has a user limit, else just
+/// `4` (`02` §4), and whether the number is drawn `text_soft`. `None` for an empty channel.
+fn voice_count(total: u32, limit: u32) -> Option<(String, bool)> {
+    (total > 0).then(|| {
+        let limited = limit > 0;
+        (if limited { format!("{total}/{limit}") } else { total.to_string() }, limited)
+    })
+}
+
 /// A tree row's name: a channel without its `#`; a Slack group DM by first names, "Mara,
 /// Dev, +2", which would otherwise truncate to nothing.
 fn tree_title(c: &Conversation) -> String {
@@ -1581,6 +1590,14 @@ pub(crate) mod tests {
         assert_eq!(say(&status(Link::Offline, true, ""), false, true, true).as_deref(), Some("Slack is reconnecting"));
         let wanted = "Discord wants you to verify your account in its app.";
         assert_eq!(say(&status(Link::Connected, false, wanted), false, true, false).as_deref(), Some(wanted));
+    }
+
+    #[test]
+    fn an_occupied_voice_row_counts_4_of_12_when_limited_and_bare_without() {
+        assert_eq!(voice_count(4, 12), Some(("4/12".to_owned(), true)));
+        assert_eq!(voice_count(4, 0), Some(("4".to_owned(), false)));
+        // An empty channel has nothing trailing, limit or not.
+        assert_eq!(voice_count(0, 12), None);
     }
 
     #[test]
