@@ -1811,6 +1811,33 @@ fn calls_ring_in_and_voice_channels_are_joined_on_the_gateway() {
     assert_eq!(left["d"]["guild_id"], "4000");
 }
 
+#[test]
+fn a_voice_channel_lists_its_people_friends_first_then_by_name() {
+    let world = World::start();
+    let in_voice = || match world.ask(Request::InVoice { network: Some(Network::Discord) }) {
+        Response::Conversations { conversations, .. } => conversations,
+        other => panic!("{other:?}"),
+    };
+    // Dev (a friend) sits in Lounge from the connect's voice states, so the friend rule tells
+    // the channel wherever it is.
+    let told = wait("the friend's channel", || {
+        in_voice().into_iter().find(|row| row.key.id == "4201").and_then(|row| row.occupants).filter(|inside| inside.total == 1 && inside.people[0].person.id == "2002")
+    });
+    assert_eq!((told.people[0].person.id.as_str(), told.people[0].name.as_str(), told.people[0].muted), ("2002", "Dev Patel", true));
+
+    // A stranger joins whose name sorts before the friend's: name order alone would list her
+    // first, friends first keeps Dev at the top.
+    let stranger = json!({"guild_id": "4000", "channel_id": "4201", "user_id": "2099", "session_id": "voice-ann",
+                          "self_mute": false, "self_deaf": false, "mute": false, "deaf": false,
+                          "member": {"user": {"id": "2099", "username": "ann", "global_name": "Ann Earlier"}, "roles": []}});
+    world.discord.push("VOICE_STATE_UPDATE", stranger);
+    let both = wait("the stranger", || {
+        in_voice().into_iter().find(|row| row.key.id == "4201").and_then(|row| row.occupants).filter(|inside| inside.total == 2)
+    });
+    let order: Vec<(&str, &str)> = both.people.iter().map(|who| (who.person.id.as_str(), who.name.as_str())).collect();
+    assert_eq!(order, [("2002", "Dev Patel"), ("2099", "Ann Earlier")], "friends first, then by name");
+}
+
 /// Waits until everything pushed so far has been handled: a marker message sent after it is
 /// stored only once the events before it were.
 fn settled(world: &World) {
