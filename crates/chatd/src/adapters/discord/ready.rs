@@ -966,8 +966,10 @@ impl Discord {
         };
         let member = guild.members.iter().find(|member| member.id() == me);
         let mut info = self.guild_info(&guild, member, &me, position, quiet);
-        self.voice_states(Some(&guild.id), &guild.voice_states);
+        // The channels are planted before the voice states are read, as at READY: a state's
+        // stage is known from the rows the tree just planted.
         self.plant(&guild, &mut info, &me, &HashMap::new())?;
+        self.voice_states(Some(&guild.id), &guild.voice_states);
         self.state.lock().unwrap().guilds.insert(guild.id.clone(), info);
         Ok(self.spaces()?)
     }
