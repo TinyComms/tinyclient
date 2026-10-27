@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TinyMember {
     pub user_id: String,
+    /// Empty when the server has none for them.
+    #[serde(default, deserialize_with = "text_or_null")]
     pub email: String,
     pub display_name: String,
     pub role: String,
@@ -91,25 +93,12 @@ pub struct TinyCommunity {
     pub media: String,
 }
 
-/// A password on its way to chatd. On the wire it is a plain string; it is never printed.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct TinySecret(pub String);
-
-impl std::fmt::Debug for TinySecret {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("..")
-    }
-}
-
-/// The fewest and most bytes a Tiny server takes for a password.
-pub const TINY_PASSWORD: std::ops::RangeInclusive<usize> = 12..=128;
 /// The most characters in a display name, after trimming.
 pub const TINY_NAME_MAX: usize = 80;
 
-/// Whether the server would take `password` as a new one. It counts bytes.
-pub fn tiny_password_fits(password: &str) -> bool {
-    TINY_PASSWORD.contains(&password.len())
+/// A string the server may send as `null`: someone whose provider gave no email has none.
+pub fn text_or_null<'de, D: serde::Deserializer<'de>>(from: D) -> Result<String, D::Error> {
+    Ok(Option::<String>::deserialize(from)?.unwrap_or_default())
 }
 
 /// The name the server would keep, or `None` when it would refuse it.
@@ -119,7 +108,7 @@ pub fn tiny_name(name: &str) -> Option<&str> {
 }
 
 /// One paste for the other tinyclient: `tc1.` then the origin in hex, then the server's token.
-/// The server never sees this string. Accepting still sends only `token`.
+/// The server never sees this string. Signing in still sends only `token`, as the invite.
 pub fn pack_join(origin: &str, token: &str) -> Option<String> {
     if origin.is_empty() || token.is_empty() {
         return None;
@@ -206,7 +195,7 @@ pub fn tiny_can(role: &str, id: &str) -> bool {
         | "community.members.remove"
         | "community.invites.revoke"
         | "community.audit.read" => matches!(role, "owner" | "admin"),
-        "account.name.edit" | "account.password.change" | "account.sessions.end" | "community.calls.join" => {
+        "account.name.edit" | "account.sessions.end" | "community.calls.join" => {
             matches!(role, "owner" | "admin" | "member")
         }
         "community.rooms.create" | "community.rooms.rename" | "community.rooms.delete" | "community.calls.kick" => {
@@ -246,7 +235,7 @@ mod tests {
         assert!(!tiny_can("owner", "community.nope"));
         assert!(!tiny_can("admin", ""));
         assert!(!tiny_can("member", "community.invites.create"));
-        for id in ["account.name.edit", "account.password.change", "account.sessions.end", "community.calls.join"] {
+        for id in ["account.name.edit", "account.sessions.end", "community.calls.join"] {
             for role in ["owner", "admin", "member"] {
                 assert!(tiny_can(role, id), "{role} {id}");
             }
@@ -255,31 +244,18 @@ mod tests {
     }
 
     #[test]
-    fn a_password_is_counted_in_bytes_and_never_printed() {
-        assert!(!tiny_password_fits("short"));
-        assert!(tiny_password_fits("twelve chars"));
-        assert!(tiny_password_fits(&"x".repeat(128)));
-        assert!(!tiny_password_fits(&"x".repeat(129)));
-        // Eleven characters, but more than twelve bytes: the server takes it.
-        assert!(tiny_password_fits("ééééééééééé"));
+    fn a_name_is_trimmed_and_an_email_may_be_null() {
         assert_eq!(tiny_name("  Ada  "), Some("Ada"));
         assert_eq!(tiny_name("   "), None);
         assert!(tiny_name(&"é".repeat(80)).is_some());
         assert_eq!(tiny_name(&"a".repeat(81)), None);
-        let secret = TinySecret("hunter2-hunter2".into());
-        assert!(!format!("{secret:?}").contains("hunter2"));
-        assert_eq!(serde_json::to_string(&secret).unwrap(), r#""hunter2-hunter2""#);
-        let request = crate::Request::TinyPassword {
-            account: crate::AccountKey { network: crate::Network::Tiny, account: "u".into() },
-            current_password: TinySecret("old-password-1".into()),
-            new_password: secret,
-        };
-        assert!(!format!("{request:?}").contains("hunter2"));
-        let json = serde_json::to_value(&request).unwrap();
-        assert_eq!(json["op"], "tiny_password");
-        assert_eq!(json["new_password"], "hunter2-hunter2");
-        let back: crate::Request = serde_json::from_value(json).unwrap();
-        assert_eq!(back, request);
+        let member: TinyMember = serde_json::from_str(
+            r#"{"user_id":"u","email":null,"display_name":"Ada","role":"member","created_at":"t"}"#,
+        )
+        .unwrap();
+        assert_eq!(member.email, "");
+        let member: TinyMember = serde_json::from_str(r#"{"user_id":"u","display_name":"Ada","role":"member","created_at":"t"}"#).unwrap();
+        assert_eq!(member.email, "");
     }
 
     #[test]

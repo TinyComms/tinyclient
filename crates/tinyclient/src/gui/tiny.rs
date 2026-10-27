@@ -1391,7 +1391,7 @@ fn invite_form(origin: &str, role: &str, busy: bool, cx: &mut Context<Shell>) ->
                 .whitespace_normal()
                 .type_ui()
                 .text_color(theme::text_soft())
-                .child("They paste one code into their own tinyclient. The code has this server in it, so they never type an address. The first time, they choose a name, an email, and a password."),
+                .child("They paste one code into their own tinyclient. The code has this server in it, so they never type an address. Then they sign in through their browser, with the account this server uses."),
         )
         .when(!host.is_empty(), |column| {
             column.child(div().whitespace_normal().type_ui().text_color(theme::text()).child(format!("It will open {host}.")))
@@ -1419,7 +1419,7 @@ fn handoff(paste: &str, origin: &str, role: &str, copied: bool, cx: &mut Context
                 .child(handoff_step(1, "Open tinyclient"))
                 .child(handoff_step(2, "Choose Tiny server, or Join a server"))
                 .child(handoff_step(3, "Paste this code"))
-                .child(handoff_step(4, "Choose a name, an email, and a password")),
+                .child(handoff_step(4, "Continue in the browser that opens")),
         )
         .child(
             div()

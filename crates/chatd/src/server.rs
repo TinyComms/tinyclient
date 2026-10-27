@@ -1779,9 +1779,6 @@ impl Chat {
             Request::TinyRemove { account, user_id } => adapters::tiny::remove(account, user_id),
             Request::TinyRevoke { account, invite_id } => adapters::tiny::revoke(account, invite_id),
             Request::TinyRename { account, display_name } => adapters::tiny::rename(account, display_name),
-            Request::TinyPassword { account, current_password, new_password } => {
-                adapters::tiny::change_password(account, current_password.0, new_password.0)
-            }
             // Ended on the server first, then forgotten here exactly as one sign-out is.
             Request::TinySignOutEverywhere { account } => match adapters::tiny::end_sessions(&account) {
                 Ok(()) => self.sign_out(account),

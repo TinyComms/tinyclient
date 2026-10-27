@@ -249,7 +249,7 @@ fn run(base: &str, timing: Timing) -> Running {
         base_url: base.to_owned(),
         token: "t".to_owned(),
         user_id: ME.to_owned(),
-        email: "ada@example.com".to_owned(),
+        email: Some("ada@example.com".to_owned()),
         display_name: "Ada".to_owned(),
         role: "owner".to_owned(),
     };
@@ -882,19 +882,16 @@ fn every_refusal_has_words_and_every_address_has_a_socket() {
     }
 }
 
-/// Against a tinyserver that is already serving, as the owner. Not part of `cargo test`: it
-/// needs `TINY_LIVE_BASE`, `TINY_LIVE_EMAIL`, and `TINY_LIVE_PASSWORD`. It makes one room, sits
-/// in it, leaves, and deletes the room again.
+/// Against a tinyserver that is already serving, as an owner or an admin. Not part of
+/// `cargo test`: it needs `TINY_LIVE_SESSION`, one saved session (sign in once with the sheet,
+/// then copy it). It makes one room, sits in it, leaves, and deletes the room again. The session
+/// is left signed in.
 #[test]
 #[ignore]
 fn live_socket_round_trip() {
-    let base = std::env::var("TINY_LIVE_BASE").expect("TINY_LIVE_BASE");
-    let email = std::env::var("TINY_LIVE_EMAIL").expect("TINY_LIVE_EMAIL");
-    let password = std::env::var("TINY_LIVE_PASSWORD").expect("TINY_LIVE_PASSWORD");
-    let saved = match super::super::post_session(&base, &email, &password) {
-        Ok(saved) => saved,
-        Err(_) => panic!("open failed"),
-    };
+    let session = std::env::var("TINY_LIVE_SESSION").expect("TINY_LIVE_SESSION");
+    let saved = super::super::parse(&session).expect("a saved Tiny session");
+    let base = saved.base_url.clone();
     assert!(matches!(saved.role.as_str(), "owner" | "admin"), "the room is made by an owner or an admin");
     let hub = Arc::new(Hub::new(Store::open(std::path::Path::new(":memory:")).expect("a store in memory")));
     let account = AccountKey { network: Network::Tiny, account: saved.user_id.clone() };
@@ -925,7 +922,6 @@ fn live_socket_round_trip() {
     assert_eq!(left, Some(Ok(())));
     until("the seat gone", || running.hub.occupants(&running.key(&room)).is_none());
     drop(running);
-    super::super::delete_session(&saved);
 }
 
 /// One side of a call played by hand, as a second tinyclient would: its own live socket and its

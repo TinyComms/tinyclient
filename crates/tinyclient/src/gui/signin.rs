@@ -3,8 +3,8 @@
 //! scan, or a phone number, the code Telegram sends and, for accounts that have one, the two-step
 //! password. Signal: only the code to scan from the phone, which links this computer as one more
 //! device; a number typed here would take the account from the phone, so none is asked. A Tiny
-//! server asks for its address, then an email, then a password of 12 to 128 characters.
-//! A code from someone already on that server is its own step, then the name people there will see.
+//! server takes the code someone on it gave, or the address of one you already belong to; the
+//! rest happens in the system browser, at the server's sign-in provider, while the sheet waits.
 //!
 //! chatd owns the sign-in. The sheet asks it to begin, draws the step it is told
 //! (`protocol::SignInStep`) and answers it; while the sheet is open its own loop asks `Wait` and
@@ -88,12 +88,8 @@ pub struct Sheet {
     password: Entity<TextInput>,
     /// A Tiny server's address.
     url: Entity<TextInput>,
-    /// The email on that server.
-    email: Entity<TextInput>,
     /// An invite code for that server.
     invite: Entity<TextInput>,
-    /// The name people on that server will see.
-    name: Entity<TextInput>,
     /// Has the keys when no field does, so Escape still closes the sheet.
     focus: FocusHandle,
     /// The step changed: put the keys where typing goes, on the next frame.
@@ -163,10 +159,9 @@ fn problem_words(network: Network, problem: &SignInProblem) -> String {
         SignInProblem::PhoneBanned => format!("{name} has blocked this number."),
         SignInProblem::CodeInvalid => "That code isn't right. Check it and type it again.".to_owned(),
         SignInProblem::CodeExpired => "That code has expired.".to_owned(),
-        SignInProblem::PasswordInvalid if tiny => "That email or password isn't right.".to_owned(),
         SignInProblem::PasswordInvalid => "That password isn't right.".to_owned(),
         SignInProblem::UrlInvalid => "Type a host, like tiny.example.com.".to_owned(),
-        SignInProblem::EmailInvalid => "Type an email address, like name@example.com.".to_owned(),
+        SignInProblem::NotMember => "You're not a member of this server yet. Ask for an invite.".to_owned(),
         SignInProblem::TooMany { .. } if tiny => "Too many tries. Wait a minute, then try again.".to_owned(),
         SignInProblem::TooMany { until } => format!("Too many tries. {name} allows another at {}.", clock(*until)),
         SignInProblem::Other { reason } => reason.clone(),
@@ -232,9 +227,8 @@ fn step_problem(step: &SignInStep) -> Option<&SignInProblem> {
         | SignInStep::Code { problem, .. }
         | SignInStep::Password { problem, .. }
         | SignInStep::Server { problem }
-        | SignInStep::Email { problem, .. }
         | SignInStep::Invite { problem, .. }
-        | SignInStep::Name { problem, .. } => problem.as_ref(),
+        | SignInStep::Browser { problem, .. } => problem.as_ref(),
         SignInStep::Done { .. } | SignInStep::Failed { .. } => None,
     }
 }
@@ -272,9 +266,7 @@ impl Sheet {
         let digits = cx.new(|cx| TextInput::new("", cx));
         let password = cx.new(|cx| TextInput::new("", cx));
         let url = cx.new(|cx| TextInput::new("tiny.example.com", cx));
-        let email = cx.new(|cx| TextInput::new("Email", cx));
         let invite = cx.new(|cx| TextInput::new("Paste the code", cx));
-        let name = cx.new(|cx| TextInput::new("Name", cx));
         for input in [&country, &number] {
             cx.subscribe(input, |this, _, event: &InputEvent, cx| match event {
                 InputEvent::Submit => this.send_phone(cx),
@@ -307,14 +299,6 @@ impl Sheet {
             }
         })
         .detach();
-        cx.subscribe(&email, |this, _, event: &InputEvent, cx| match event {
-            InputEvent::Submit => this.send_email(cx),
-            InputEvent::Changed => {
-                this.dismiss();
-                cx.notify();
-            }
-        })
-        .detach();
         cx.subscribe(&invite, |this, _, event: &InputEvent, cx| match event {
             InputEvent::Submit => this.send_invite(cx),
             InputEvent::Changed => {
@@ -323,16 +307,8 @@ impl Sheet {
             }
         })
         .detach();
-        cx.subscribe(&name, |this, _, event: &InputEvent, cx| match event {
-            InputEvent::Submit => this.send_name(cx),
-            InputEvent::Changed => {
-                this.dismiss();
-                cx.notify();
-            }
-        })
-        .detach();
         // Escape in a field is the field's key; it hands it on.
-        for input in [&country, &number, &digits, &password, &url, &email, &invite, &name] {
+        for input in [&country, &number, &digits, &password, &url, &invite] {
             cx.subscribe(input, |this, _, event: &InputKey, cx| {
                 if matches!(event, InputKey::Escape) {
                     this.close(true, cx);
@@ -354,9 +330,7 @@ impl Sheet {
             digits,
             password,
             url,
-            email,
             invite,
-            name,
             focus: cx.focus_handle(),
             refocus: false,
             before: None,
@@ -434,9 +408,7 @@ impl Sheet {
         self.number.update(cx, |input, cx| input.set_text("", cx));
         self.country.update(cx, |input, cx| input.set_text("+1", cx));
         self.url.update(cx, |input, cx| input.set_text("", cx));
-        self.email.update(cx, |input, cx| input.set_text("", cx));
         self.invite.update(cx, |input, cx| input.set_text("", cx));
-        self.name.update(cx, |input, cx| input.set_text("", cx));
     }
 
     /// Drops a typed code and password. They live nowhere else.
@@ -454,9 +426,7 @@ impl Sheet {
         match step {
             SignInStep::Phone { problem }
             | SignInStep::Server { problem }
-            | SignInStep::Email { problem, .. }
             | SignInStep::Invite { problem, .. }
-            | SignInStep::Name { problem, .. }
             | SignInStep::Password { problem, .. } => *problem = None,
             _ => {}
         }
@@ -726,18 +696,6 @@ impl Sheet {
         self.answer(SignInInput::Server { url }, cx);
     }
 
-    fn send_email(&mut self, cx: &mut Context<Sheet>) {
-        if self.busy {
-            return;
-        }
-        let email = self.email.read(cx).text().to_owned();
-        if email.trim().is_empty() {
-            return;
-        }
-        self.dismiss();
-        self.answer(SignInInput::Email { email }, cx);
-    }
-
     /// From the address, back to the code. The address is not required.
     fn send_have_code(&mut self, cx: &mut Context<Sheet>) {
         if self.busy {
@@ -759,15 +717,6 @@ impl Sheet {
         self.answer(SignInInput::Invite { code }, cx);
     }
 
-    fn send_name(&mut self, cx: &mut Context<Sheet>) {
-        if self.busy {
-            return;
-        }
-        let name = self.name.read(cx).text().to_owned();
-        self.dismiss();
-        self.answer(SignInInput::Name { name }, cx);
-    }
-
     /// Where typing goes on the step on show.
     fn target(&self, cx: &App) -> FocusHandle {
         match &self.face {
@@ -775,9 +724,7 @@ impl Sheet {
             Some(Face::Step(SignInStep::Code { .. })) => self.digits.focus_handle(cx),
             Some(Face::Step(SignInStep::Password { .. })) => self.password.focus_handle(cx),
             Some(Face::Step(SignInStep::Server { .. })) => self.url.focus_handle(cx),
-            Some(Face::Step(SignInStep::Email { .. })) => self.email.focus_handle(cx),
             Some(Face::Step(SignInStep::Invite { .. })) => self.invite.focus_handle(cx),
-            Some(Face::Step(SignInStep::Name { .. })) => self.name.focus_handle(cx),
             _ => self.focus.clone(),
         }
     }
@@ -827,7 +774,7 @@ impl Sheet {
     }
 
     /// A dialog's main action, off while an answer is awaited.
-    fn primary(&self, label: &'static str, act: fn(&mut Sheet, &mut Context<Sheet>), cx: &Context<Sheet>) -> gpui::AnyElement {
+    fn primary(&self, label: impl Into<SharedString>, act: fn(&mut Sheet, &mut Context<Sheet>), cx: &Context<Sheet>) -> gpui::AnyElement {
         if self.busy {
             return button_disabled(label).h(px(32.)).into_any_element();
         }
@@ -855,7 +802,7 @@ impl Sheet {
         let steps = match self.network {
             Network::Signal => ["Open Signal on your phone.", "Go to Settings > Linked devices > Link new device.", "Point the phone at this code."],
             Network::Messages => ["Open Messages on your Android phone.", "Go to Settings > Device pairing > QR code scanner.", "Point the phone at this code."],
-            Network::Tiny => ["The address of a server you already run.", "Then the email on that account.", "Then the password."],
+            Network::Tiny => ["Paste the code you were given.", "Continue in your browser.", "Come back here when it's done."],
             Network::Telegram | Network::Discord | Network::Slack | Network::Teams => ["Open Telegram on your phone.", "Go to Settings > Devices > Link Desktop Device.", "Point the phone at this code."],
         };
         // Signal and Messages link a computer only from the phone: there is no other way in to offer.
@@ -1022,23 +969,16 @@ impl Sheet {
             )
             .child(hidden(&self.password, 12., 10., 64.))
             .child(bullets);
-        let tiny = self.network == Network::Tiny;
-        let heading = if tiny { self.header("Password", true, cx) } else { self.header("Two-step verification password", true, cx) };
-        let aside = if tiny {
-            let words = if hint.is_empty() { "A password of 12 to 128 characters." } else { hint };
-            div().type_ui().text_color(theme::text_soft()).child(words.to_owned())
-        } else {
-            // Words in a link's color, not a link: the reset happens in Telegram's own app.
-            div().type_ui().text_color(theme::accent_text()).child("Forgot it? Reset it in the Telegram app.")
-        };
+        // Words in a link's color, not a link: the reset happens in Telegram's own app.
+        let aside = div().type_ui().text_color(theme::accent_text()).child("Forgot it? Reset it in the Telegram app.");
         div()
             .flex()
             .flex_col()
-            .child(heading)
+            .child(self.header("Two-step verification password", true, cx))
             .child(div().mt(px(16.)).child(secret))
             .children(problem.map(|problem| error_line(problem_words(self.network, problem)).mt(px(6.))))
             // `text_faint` does not sit on `overlay` (`01-system.md`, rule 7): one level up.
-            .children((!tiny && !hint.is_empty()).then(|| div().mt(px(6.)).type_small().text_color(theme::text_soft()).child(format!("Hint from Telegram: {hint}"))))
+            .children((!hint.is_empty()).then(|| div().mt(px(6.)).type_small().text_color(theme::text_soft()).child(format!("Hint from Telegram: {hint}"))))
             .child(footer(22.).child(aside).child(buttons().child(self.cancel("Cancel", cx)).child(self.primary("Continue", Sheet::send_password, cx))))
     }
 
@@ -1059,26 +999,16 @@ impl Sheet {
             )
             .child(input)
             .children(problem.map(|problem| error_line(problem_words(self.network, problem)).mt(px(6.))))
-            .child(footer(22.).child(self.have_code(cx)).child(buttons().child(self.cancel("Cancel", cx)).child(self.primary("Continue", Sheet::send_url, cx))))
+            .child(
+                footer(22.)
+                    .child(self.have_code(cx))
+                    .child(buttons().child(self.cancel("Cancel", cx)).child(self.primary("Continue in your browser", Sheet::send_url, cx))),
+            )
     }
 
     /// Back to the code. The address field is not read.
     fn have_code(&self, cx: &Context<Sheet>) -> Stateful<Div> {
         link("signin-have-code", "I have a code").on_click(cx.listener(|this, _, _, cx| this.send_have_code(cx)))
-    }
-
-    fn email_step(&self, server: &str, problem: Option<&SignInProblem>, window: &mut Window, cx: &Context<Sheet>) -> Div {
-        let focused = self.email.focus_handle(cx).is_focused(window);
-        let input = tall_field(focused, problem.is_some()).child(self.email.clone());
-        let host = protocol::join_host(server);
-        div()
-            .flex()
-            .flex_col()
-            .child(self.header("Email", true, cx))
-            .child(div().mt(px(6.)).mb(px(16.)).text_color(theme::text_soft()).child(if host.is_empty() { server.to_owned() } else { host }))
-            .child(input)
-            .children(problem.map(|problem| error_line(problem_words(self.network, problem)).mt(px(6.))))
-            .child(footer(22.).child(div()).child(buttons().child(self.cancel("Cancel", cx)).child(self.primary("Continue", Sheet::send_email, cx))))
     }
 
     fn invite_step(&self, server: &str, problem: Option<&SignInProblem>, window: &mut Window, cx: &Context<Sheet>) -> Div {
@@ -1108,6 +1038,7 @@ impl Sheet {
             )
             .child(input)
             .children(problem.map(|problem| error_line(problem_words(self.network, problem)).mt(px(6.))))
+            .children(fresh.then(run_your_own))
             .child(
                 footer(22.)
                     .child(account.map_or_else(|| div().into_any_element(), IntoElement::into_any_element))
@@ -1115,23 +1046,32 @@ impl Sheet {
             )
     }
 
-    fn name_step(&self, server: &str, problem: Option<&SignInProblem>, window: &mut Window, cx: &Context<Sheet>) -> Div {
-        let focused = self.name.focus_handle(cx).is_focused(window);
-        let input = tall_field(focused, problem.is_some()).child(self.name.clone());
-        let host = protocol::join_host(server);
-        let line = if host.is_empty() {
-            "The name people on that server will see.".to_owned()
+    /// The rest is in the browser. While chatd waits: what to do there, and the page again.
+    /// After it stopped: why, and a way to begin again with the same provider.
+    fn browser_step(&self, server: &str, provider: &str, waiting: bool, problem: Option<&SignInProblem>, cx: &Context<Sheet>) -> Div {
+        let (title, line) = if waiting {
+            ("Waiting for your browser…", waiting_words(server, provider))
         } else {
-            format!("The name people on {host} will see.")
+            ("Continue in your browser", stopped_words(server, provider))
+        };
+        let footer = if waiting {
+            footer(22.)
+                .child(self.answer_link("signin-open-again", "Open the page again", || SignInInput::OpenBrowser, cx))
+                .child(self.cancel("Cancel", cx))
+        } else {
+            footer(22.).child(div()).child(
+                buttons()
+                    .child(self.cancel("Cancel", cx))
+                    .child(self.primary(continue_words(provider), |this, cx| this.answer(SignInInput::OpenBrowser, cx), cx)),
+            )
         };
         div()
             .flex()
             .flex_col()
-            .child(self.header("Name", true, cx))
-            .child(div().mt(px(6.)).mb(px(16.)).whitespace_normal().text_color(theme::text_soft()).child(line))
-            .child(input)
-            .children(problem.map(|problem| error_line(problem_words(self.network, problem)).mt(px(6.))))
-            .child(footer(22.).child(div()).child(buttons().child(self.cancel("Cancel", cx)).child(self.primary("Continue", Sheet::send_name, cx))))
+            .child(self.header(title, true, cx))
+            .child(div().mt(px(6.)).whitespace_normal().text_color(theme::text_soft()).child(line))
+            .children(problem.map(|problem| error_line(problem_words(self.network, problem)).mt(px(12.))))
+            .child(footer)
     }
 
     fn title(&self) -> &'static str {
@@ -1178,6 +1118,55 @@ fn link(id: &'static str, words: impl Into<SharedString>) -> Stateful<Div> {
         .cursor_pointer()
         .hover(|style| style.underline())
         .child(words.into())
+}
+
+/// Where someone with no server and no code finds out how to run one.
+const TINYSERVER_URL: &str = "https://github.com/itz4blitz/tinyserver";
+
+/// Under the code field on the first Tiny step: a way out for someone who was given no code.
+fn run_your_own() -> Div {
+    div()
+        .mt(px(10.))
+        .flex()
+        .gap(px(4.))
+        .type_small()
+        .text_color(theme::text_faint())
+        .child("Don't have a server?")
+        .child(link("signin-tinyserver", "Run your own with tinyserver").type_small().on_click(|_, _, _| {
+            if let Err(why) = super::call::open(TINYSERVER_URL) {
+                eprintln!("tinyclient: {why}");
+            }
+        }))
+}
+
+/// The browser step's button after it stopped: the provider by name, when the server gave one.
+fn continue_words(provider: &str) -> String {
+    match provider.trim() {
+        "" => "Continue in your browser".to_owned(),
+        provider => format!("Continue with {provider}"),
+    }
+}
+
+fn shown_host(server: &str) -> String {
+    let host = protocol::join_host(server);
+    if host.is_empty() { server.to_owned() } else { host }
+}
+
+/// What to do in the browser while the sheet waits.
+fn waiting_words(server: &str, provider: &str) -> String {
+    let with = match provider.trim() {
+        "" => String::new(),
+        provider => format!(" with {provider}"),
+    };
+    format!("Sign in to {}{with} in the page that opened. This moves on by itself when you're done.", shown_host(server))
+}
+
+/// Above the problem, once the browser is no longer waited for.
+fn stopped_words(server: &str, provider: &str) -> String {
+    match provider.trim() {
+        "" => format!("{} signs you in through your browser.", shown_host(server)),
+        provider => format!("{} signs you in with {provider}, in your browser.", shown_host(server)),
+    }
 }
 
 /// A problem, in the sheet's words: 12 in `danger`.
@@ -1348,9 +1337,8 @@ impl Render for Sheet {
                     }
                     SignInStep::Password { hint, .. } => self.password_step(hint, problem, window, cx),
                     SignInStep::Server { .. } => self.server_step(problem, window, cx),
-                    SignInStep::Email { server, .. } => self.email_step(server, problem, window, cx),
                     SignInStep::Invite { server, .. } => self.invite_step(server, problem, window, cx),
-                    SignInStep::Name { server, .. } => self.name_step(server, problem, window, cx),
+                    SignInStep::Browser { server, provider, waiting, .. } => self.browser_step(server, provider, *waiting, problem, cx),
                     SignInStep::Failed { reason } => self.failed_step(reason, cx),
                     SignInStep::Done { .. } => div(),
                 }
@@ -1444,8 +1432,7 @@ mod tests {
         // Signal is named for itself.
         assert_eq!(problem_words(Network::Signal, &SignInProblem::Unreachable), "Couldn't reach Signal. Check your connection.");
         assert_eq!(problem_words(Network::Tiny, &SignInProblem::UrlInvalid), "Type a host, like tiny.example.com.");
-        assert_eq!(problem_words(Network::Tiny, &SignInProblem::EmailInvalid), "Type an email address, like name@example.com.");
-        assert_eq!(problem_words(Network::Tiny, &SignInProblem::PasswordInvalid), "That email or password isn't right.");
+        assert_eq!(problem_words(Network::Tiny, &SignInProblem::NotMember), "You're not a member of this server yet. Ask for an invite.");
         assert_eq!(problem_words(Network::Tiny, &SignInProblem::Unreachable), "Couldn't reach that server. Check the address and your connection.");
         assert_eq!(problem_words(Network::Tiny, &SignInProblem::TooMany { until }), "Too many tries. Wait a minute, then try again.");
         assert_eq!(asked_network("tiny"), Some(Network::Tiny));
@@ -1482,5 +1469,22 @@ mod tests {
         assert_eq!(step_problem(&code), problem.as_ref());
         assert_eq!(step_problem(&waiting()), None);
         assert_eq!(step_problem(&SignInStep::Failed { reason: "no".into() }), None);
+        let told = SignInStep::Browser { server: "https://chat.example".into(), provider: "Tinyauth".into(), waiting: false, problem: Some(SignInProblem::NotMember) };
+        assert_eq!(step_problem(&told), Some(&SignInProblem::NotMember));
+    }
+
+    #[test]
+    fn the_browser_step_names_the_provider_when_the_server_does() {
+        assert_eq!(continue_words("Tinyauth"), "Continue with Tinyauth");
+        assert_eq!(continue_words("  "), "Continue in your browser");
+        assert_eq!(
+            waiting_words("https://chat.example", "Tinyauth"),
+            "Sign in to chat.example with Tinyauth in the page that opened. This moves on by itself when you're done."
+        );
+        assert_eq!(
+            waiting_words("http://127.0.0.1:8080", ""),
+            "Sign in to 127.0.0.1:8080 in the page that opened. This moves on by itself when you're done."
+        );
+        assert_eq!(stopped_words("https://chat.example", "Tinyauth"), "chat.example signs you in with Tinyauth, in your browser.");
     }
 }

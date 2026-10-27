@@ -1,9 +1,10 @@
 //! A Tiny server the owner already runs. Every server joined on this Mac shares this network's
 //! one keychain item: a single object until a second server is added, then an array of them.
 //! Each account is started from its own object. Sign-in is the sheet's (`signin`), never
-//! `tinyclient-login`. A signed-in account can list members, invite, revoke an invite, change a
-//! role, remove a member, and read the audit. It can rename itself, change its password, and end
-//! every one of its sessions. An owner or an admin can make, rename and delete rooms.
+//! `tinyclient-login`; it goes through the system browser and the server's OpenID provider. A
+//! signed-in account can list members, invite, revoke an invite, change a role, remove a member,
+//! and read the audit. It can rename itself and end every one of its sessions. An owner or an
+//! admin can make, rename and delete rooms.
 //!
 //! Each account holds one live socket (`live`): presence, who is in each room's call, and the
 //! events that keep the server page current. A room is a voice channel, and joining it takes a
@@ -12,13 +13,14 @@
 //! are no conversations.
 
 pub(crate) mod live;
+mod browser;
 pub mod signin;
 
 use super::{serve_commands, Command, Context, Signed};
 use crate::hub::Hub;
 use crate::session;
 use protocol::{
-    join_host, tiny_can, tiny_name, tiny_password_fits, AccountKey, ErrorCode, Key, Network,
+    join_host, text_or_null, tiny_can, tiny_name, AccountKey, ErrorCode, Key, Network,
     Presence, Response, TinyAudit, TinyCode, TinyCommunity, TinyInvite, TinyMember, TinyRoom,
     TinySeat,
 };
@@ -37,7 +39,9 @@ pub(crate) struct Saved {
     base_url: String,
     token: String,
     user_id: String,
-    email: String,
+    /// `null` when the provider gave the server none.
+    #[serde(default)]
+    email: Option<String>,
     display_name: String,
     role: String,
 }
@@ -52,12 +56,12 @@ struct Me {
 enum Fault {
     Unauthorized,
     Unreachable,
-    /// The server asked for a pause. The password was not checked.
+    /// The server asked for a pause. Nothing was checked.
     SlowDown,
     /// The server answered, and the answer was a failure of its own.
     Unavailable,
     BadAnswer,
-    /// Words for the sheet, already chosen. Not a password failure.
+    /// Words for the sheet, already chosen.
     Words(&'static str),
 }
 
@@ -225,7 +229,7 @@ fn agent() -> ureq::Agent {
         .into()
 }
 
-/// One request. A 3xx is a failure: the password and the bearer stay on the host that was asked.
+/// One request. A 3xx is a failure: a sign-in code and the bearer stay on the host that was asked.
 fn call(
     method: &str,
     url: &str,
@@ -288,16 +292,63 @@ fn endpoint(base: &str, path: &str) -> String {
     format!("{base}{path}")
 }
 
-fn post_session(base: &str, email: &str, password: &str) -> Result<Saved, Fault> {
+/// The provider's name, from `GET /v1/auth/config`. A server that does not sign in through a
+/// provider (a tinyserver from before it did) is told apart from one that cannot be reached.
+fn auth_config(base: &str) -> Result<String, Fault> {
+    let (status, body) = call("GET", &endpoint(base, "/v1/auth/config"), None, None)?;
+    match status {
+        200 => {
+            let answer: ConfigAnswer = serde_json::from_value(body).map_err(|_| Fault::BadAnswer)?;
+            if !answer.methods.iter().any(|method| method == "oidc") {
+                return Err(Fault::Words(NO_BROWSER));
+            }
+            Ok(answer.provider_name.trim().chars().take(60).collect())
+        }
+        404 | 405 => Err(Fault::Words(NO_BROWSER)),
+        429 => Err(Fault::SlowDown),
+        500..=599 => Err(Fault::Unavailable),
+        _ => Err(Fault::Unreachable),
+    }
+}
+
+/// Where to send the browser: `POST /v1/auth/start`. Only the challenge goes; the verifier stays
+/// here until the code comes back. The invite is the bare token, never the pasted code.
+fn auth_start(base: &str, redirect_uri: &str, challenge: &str, state: &str, invite: Option<&str>) -> Result<String, Fault> {
+    let mut body = serde_json::json!({
+        "redirect_uri": redirect_uri,
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+        "state": state,
+    });
+    if let Some(invite) = invite {
+        body["invite"] = Value::String(invite.to_owned());
+    }
+    let (status, body) = call("POST", &endpoint(base, "/v1/auth/start"), None, Some(body))?;
+    match status {
+        200 => body
+            .get("authorize_url")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or(Fault::BadAnswer),
+        400 => Err(Fault::Words(CHECK)),
+        429 => Err(Fault::SlowDown),
+        500..=599 => Err(Fault::Unavailable),
+        _ => Err(Fault::Unreachable),
+    }
+}
+
+/// The one-time code the browser brought back, and the verifier it was made for, for a session:
+/// `POST /v1/auth/token`. The same answer, and the same saved session, as a password once gave.
+fn auth_token(base: &str, code: &str, verifier: &str) -> Result<Saved, Fault> {
     let (status, body) = call(
         "POST",
-        &endpoint(base, "/v1/session"),
+        &endpoint(base, "/v1/auth/token"),
         None,
-        Some(serde_json::json!({ "email": email, "password": password })),
+        Some(serde_json::json!({ "code": code, "code_verifier": verifier })),
     )?;
     match status {
         200 => saved_from(base, body),
-        401 => Err(Fault::Unauthorized),
+        400 | 401 => Err(Fault::Words(RAN_OUT)),
         429 => Err(Fault::SlowDown),
         500..=599 => Err(Fault::Unavailable),
         _ => Err(Fault::Unreachable),
@@ -316,54 +367,36 @@ fn saved_from(base: &str, body: Value) -> Result<Saved, Fault> {
         base_url: base.to_owned(),
         token: answer.token,
         user_id: answer.user_id,
-        email: answer.email,
+        email: answer.email.filter(|email| !email.is_empty()),
         display_name: answer.display_name,
         role: answer.role,
     })
 }
 
-/// Joining with a code. The same session shape as `post_session`. No bearer is sent.
-fn post_accept(
-    base: &str,
-    token: &str,
-    email: &str,
-    password: &str,
-    display_name: &str,
-) -> Result<Saved, Fault> {
-    let (status, body) = call(
-        "POST",
-        &endpoint(base, "/v1/invites/accept"),
-        None,
-        Some(serde_json::json!({
-            "token": token,
-            "email": email,
-            "password": password,
-            "display_name": display_name,
-        })),
-    )?;
-    match status {
-        200 => saved_from(base, body),
-        401 => Err(Fault::Unauthorized),
-        429 => Err(Fault::SlowDown),
-        500..=599 => Err(Fault::Unavailable),
-        _ => Err(Fault::Words(explain(status, &body, Missing::Code))),
-    }
+#[derive(Deserialize)]
+struct ConfigAnswer {
+    #[serde(default)]
+    methods: Vec<String>,
+    #[serde(default)]
+    provider_name: String,
 }
 
 #[derive(Deserialize)]
 struct SessionAnswer {
     token: String,
     user_id: String,
-    email: String,
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default, deserialize_with = "text_or_null")]
     display_name: String,
     role: String,
 }
 
 #[derive(Deserialize, Default)]
 struct MeAnswer {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "text_or_null")]
     display_name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "text_or_null")]
     email: String,
 }
 
@@ -400,8 +433,8 @@ const CHECK: &str = "That didn't work. Check it and try again.";
 const UNREADABLE: &str = "The server's answer could not be read.";
 const UNREACHABLE: &str = "Couldn't reach that server. Check the address and your connection.";
 const SIGNED_OUT: &str = "Tiny server signed you out.";
-const WRONG_PASSWORD: &str = "Your current password isn't right.";
-const PASSWORD_SIZE: &str = "A new password is 12 to 128 characters.";
+const NO_BROWSER: &str = "This server doesn't sign in through a browser yet. Ask its owner to update tinyserver.";
+const RAN_OUT: &str = "This sign-in ran out before it finished. Try again.";
 const NAME_SIZE: &str = "A name is 1 to 80 characters.";
 const ROOM_NAME_SIZE: &str = "A room name is 1 to 80 characters.";
 const NOT_YOURS: &str = "You can't do that.";
@@ -409,7 +442,6 @@ const NOT_YOURS: &str = "You can't do that.";
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Missing {
     Member,
-    Code,
     Invite,
     Room,
     Plain,
@@ -433,11 +465,7 @@ fn explain(status: u16, body: &Value, missing: Missing) -> &'static str {
         (403, _) => "You can't do that.",
         (409, "last_owner") => "This server needs an owner. Make someone else the owner first.",
         (409, "already_member") => "That person is already on this server.",
-        (409, "email_taken") => "That email is already on this server.",
         (404, _) if missing == Missing::Member => "That person is no longer on this server.",
-        (404, _) if missing == Missing::Code => {
-            "That code doesn't work. It may have expired or already been used."
-        }
         (404, _) if missing == Missing::Invite => "That invite is gone or was already used.",
         (404, _) if missing == Missing::Room => "That room is gone.",
         (400, _) => CHECK,
@@ -818,35 +846,6 @@ pub(crate) fn rename(account: AccountKey, display_name: String) -> Response {
     }
 }
 
-/// The server ends every other session. This one is kept, so nothing is forgotten here.
-pub(crate) fn change_password(account: AccountKey, current: String, new: String) -> Response {
-    let saved = match open(&account) {
-        Ok(saved) => saved,
-        Err(error) => return error,
-    };
-    if current.is_empty() {
-        return refused(WRONG_PASSWORD);
-    }
-    if !tiny_password_fits(&new) {
-        return refused(PASSWORD_SIZE);
-    }
-    match asked(
-        "POST",
-        &saved,
-        "/v1/me/password",
-        Some(serde_json::json!({ "current_password": current, "new_password": new })),
-    ) {
-        Err(detail) => refused(detail),
-        Ok((204, _)) => Response::Ok,
-        // A wrong current password is a 401 too. That one is not a sign-out.
-        Ok((401, body)) if body.get("error").and_then(Value::as_str) == Some("invalid_credentials") => {
-            refused(WRONG_PASSWORD)
-        }
-        Ok((400, _)) => refused(PASSWORD_SIZE),
-        Ok((status, body)) => refused(explain(status, &body, Missing::Plain)),
-    }
-}
-
 /// Ends every session of this account on the server. A 401 is already the same thing: the
 /// caller forgets the session either way.
 pub(crate) fn end_sessions(account: &AccountKey) -> Result<(), Response> {
@@ -925,7 +924,11 @@ pub(crate) mod tests {
         let saved = parse(session()).unwrap();
         assert_eq!(saved.role, "owner");
         assert_eq!(saved.base_url, "http://127.0.0.1:8080");
-        assert_eq!(saved.email, "ada@example.com");
+        assert_eq!(saved.email.as_deref(), Some("ada@example.com"));
+        // Someone whose provider gave no email: the session still reads, and says so.
+        let none = r#"{"base_url":"http://127.0.0.1:8080","token":"t","user_id":"u1","email":null,"display_name":"Ada","role":"member"}"#;
+        assert_eq!(parse(none).unwrap().email, None);
+        assert!(serde_json::to_string(&parse(none).unwrap()).unwrap().contains(r#""email":null"#));
     }
 
     fn other() -> &'static str {
@@ -966,26 +969,37 @@ pub(crate) mod tests {
         assert!(combine("not json", other()).is_err());
     }
 
-    /// Speaks the session routes on a local socket: wrong password, open, me, delete, and a
-    /// redirect that must not be followed.
+    /// Speaks the sign-in and session routes on a local socket: the provider's name, where to
+    /// send the browser, the code for a session, me, delete, and a redirect that must not be
+    /// followed.
     #[test]
     fn session_routes_against_a_local_server() {
         let base = serve(|request| {
             let first = request.lines().next().unwrap_or("");
-            if first.starts_with("POST /v1/session ") {
-                if request.contains("\"password\": \"slow\"") {
+            let body = request.split("\r\n\r\n").nth(1).unwrap_or("");
+            if first.starts_with("GET /v1/auth/config ") {
+                return http(200, "OK", r#"{"methods":["oidc"],"provider_name":"Tinyauth"}"#);
+            }
+            if first.starts_with("POST /v1/auth/start ") {
+                if body.contains("slow") {
                     return http(429, "Too Many Requests", r#"{"error":"slow_down"}"#);
                 }
-                if request.contains("\"password\": \"boom\"") {
+                if body.contains("boom") {
                     return http(500, "Internal Server Error", r#"{"error":"unavailable"}"#);
                 }
-                if request.contains("\"password\": \"nope\"") {
-                    return http(401, "Unauthorized", r#"{"error":"invalid_credentials"}"#);
+                if body.contains("bad") {
+                    return http(400, "Bad Request", r#"{"error":"bad_request"}"#);
+                }
+                return http(200, "OK", r#"{"authorize_url":"https://auth.example/authorize?state=s"}"#);
+            }
+            if first.starts_with("POST /v1/auth/token ") {
+                if body.contains("used") {
+                    return http(400, "Bad Request", r#"{"error":"invalid_grant"}"#);
                 }
                 return http(
                     200,
                     "OK",
-                    r#"{"token":"tok_value","user_id":"11111111-1111-1111-1111-111111111111","email":"ada@example.com","display_name":"Ada","role":"owner"}"#,
+                    r#"{"token":"tok_value","user_id":"11111111-1111-1111-1111-111111111111","email":null,"display_name":"Ada","role":"owner"}"#,
                 );
             }
             if first.starts_with("GET /v1/me ") {
@@ -993,7 +1007,7 @@ pub(crate) mod tests {
                     return http(
                         200,
                         "OK",
-                        r#"{"user_id":"11111111-1111-1111-1111-111111111111","email":"ada@example.com","display_name":"Ada","role":"owner"}"#,
+                        r#"{"user_id":"11111111-1111-1111-1111-111111111111","email":null,"display_name":"Ada","role":"owner"}"#,
                     );
                 }
                 return http(401, "Unauthorized", r#"{"error":"unauthorized"}"#);
@@ -1008,25 +1022,20 @@ pub(crate) mod tests {
             }
         });
 
-        assert!(matches!(
-            post_session(&base, "ada@example.com", "nope"),
-            Err(Fault::Unauthorized)
-        ));
-        assert!(matches!(
-            post_session(&base, "ada@example.com", "slow"),
-            Err(Fault::SlowDown)
-        ));
-        assert!(matches!(
-            post_session(&base, "ada@example.com", "boom"),
-            Err(Fault::Unavailable)
-        ));
-        let saved = match post_session(&base, "ada@example.com", "correct-password") {
+        assert_eq!(auth_config(&base).ok().as_deref(), Some("Tinyauth"));
+        let start = |state: &str| auth_start(&base, "http://127.0.0.1:5/callback", "challenge", state, None);
+        assert!(matches!(start("slow"), Err(Fault::SlowDown)));
+        assert!(matches!(start("boom"), Err(Fault::Unavailable)));
+        assert!(matches!(start("bad"), Err(Fault::Words(CHECK))));
+        assert_eq!(start("fine").ok().as_deref(), Some("https://auth.example/authorize?state=s"));
+        assert!(matches!(auth_token(&base, "used", "verifier"), Err(Fault::Words(RAN_OUT))));
+        let saved = match auth_token(&base, "one-time", "verifier") {
             Ok(saved) => saved,
-            Err(_) => panic!("open failed"),
+            Err(_) => panic!("token failed"),
         };
         assert_eq!(saved.user_id, "11111111-1111-1111-1111-111111111111");
         assert_eq!(saved.role, "owner");
-        assert_eq!(saved.email, "ada@example.com");
+        assert_eq!(saved.email, None);
         assert_eq!(saved.base_url, base);
         assert_eq!(saved.token, "tok_value");
 
@@ -1035,53 +1044,49 @@ pub(crate) mod tests {
             Err(_) => panic!("me failed"),
         };
         assert_eq!(me.display_name, "Ada");
-        assert_eq!(me.email, "ada@example.com");
+        assert_eq!(me.email, "");
         delete_session(&saved);
 
         let bounced = call(
             "POST",
             &endpoint(&base, "/v1/bounce"),
             None,
-            Some(serde_json::json!({"email": "ada@example.com", "password": "correct-password"})),
+            Some(serde_json::json!({"code": "one-time", "code_verifier": "verifier"})),
         );
         assert!(matches!(bounced, Err(Fault::Unreachable)));
+
+        // A tinyserver from before the browser sign-in has no config route.
+        let older = serve(|_| http(404, "Not Found", r#"{"error":"not_found"}"#));
+        assert!(matches!(auth_config(&older), Err(Fault::Words(NO_BROWSER))));
+        let passwords = serve(|_| http(200, "OK", r#"{"methods":["password"]}"#));
+        assert!(matches!(auth_config(&passwords), Err(Fault::Words(NO_BROWSER))));
     }
 
-    /// Against a tinyserver that is already serving. Not part of `cargo test`: it needs
-    /// `TINY_LIVE_BASE`, `TINY_LIVE_EMAIL`, and `TINY_LIVE_PASSWORD`.
+    /// A session from a tinyserver that is already serving: `TINY_LIVE_SESSION` holds one saved
+    /// session (sign in once with the sheet, then copy it). Not part of `cargo test`.
+    fn live_session() -> Saved {
+        let session = std::env::var("TINY_LIVE_SESSION").expect("TINY_LIVE_SESSION");
+        parse(&session).expect("a saved Tiny session")
+    }
+
     #[test]
     #[ignore]
     fn live_owner_round_trip() {
-        let base = std::env::var("TINY_LIVE_BASE").expect("TINY_LIVE_BASE");
-        let email = std::env::var("TINY_LIVE_EMAIL").expect("TINY_LIVE_EMAIL");
-        let password = std::env::var("TINY_LIVE_PASSWORD").expect("TINY_LIVE_PASSWORD");
-        let saved = match post_session(&base, &email, &password) {
-            Ok(saved) => saved,
-            Err(_) => panic!("open failed"),
-        };
-        assert_eq!(saved.role, "owner");
-        assert_eq!(saved.email, email.trim().to_ascii_lowercase());
+        let saved = live_session();
         let me = match get_me(&saved) {
             Ok(me) => me,
             Err(_) => panic!("me failed"),
         };
-        assert_eq!(me.email, saved.email);
-        delete_session(&saved);
-        assert!(matches!(get_me(&saved), Err(Fault::Unauthorized)));
+        assert_eq!(Some(me.email).filter(|email| !email.is_empty()), saved.email);
+        assert!(auth_config(&saved.base_url).is_ok(), "the server signs in through a browser");
     }
 
-    /// The account routes against a tinyserver that is already serving, with the same three
-    /// variables. The name and the password are put back. It ends every session of that account.
+    /// The account routes against a tinyserver that is already serving, with the same variable.
+    /// The name is put back. It ends every session of that account, this one too.
     #[test]
     #[ignore]
     fn live_account_round_trip() {
-        let base = std::env::var("TINY_LIVE_BASE").expect("TINY_LIVE_BASE");
-        let email = std::env::var("TINY_LIVE_EMAIL").expect("TINY_LIVE_EMAIL");
-        let password = std::env::var("TINY_LIVE_PASSWORD").expect("TINY_LIVE_PASSWORD");
-        let saved = match post_session(&base, &email, &password) {
-            Ok(saved) => saved,
-            Err(_) => panic!("open failed"),
-        };
+        let saved = live_session();
         let session = serde_json::to_string(&saved).unwrap();
         let name = saved.display_name.clone();
         let user_id = saved.user_id.clone();
@@ -1089,12 +1094,6 @@ pub(crate) mod tests {
             assert_eq!(rename(account.clone(), "tinyclient live test".into()), Response::Ok);
             assert_eq!(rename(account.clone(), name.clone()), Response::Ok);
             assert_eq!(rename(account.clone(), "a".repeat(81)), refused(NAME_SIZE));
-
-            let wrong = change_password(account.clone(), "not the password".into(), "tinyclient-live-1".into());
-            assert_eq!(wrong, refused(WRONG_PASSWORD));
-            let temporary = "tinyclient-live-temporary";
-            assert_eq!(change_password(account.clone(), password.clone(), temporary.into()), Response::Ok);
-            assert_eq!(change_password(account.clone(), temporary.into(), password.clone()), Response::Ok);
 
             let code = match invite(account.clone(), "member".into()) {
                 Response::TinyCode { code } => code,
@@ -1106,7 +1105,6 @@ pub(crate) mod tests {
             assert!(end_sessions(&account).is_ok());
         });
         assert!(matches!(get_me(&saved), Err(Fault::Unauthorized)));
-        assert!(post_session(&base, &email, &password).is_ok(), "the password was put back");
     }
 
     fn with_session(base: &str, role: &str, run: impl FnOnce(AccountKey)) {
@@ -1475,7 +1473,7 @@ pub(crate) mod tests {
         });
     }
 
-    /// Revoke, rename, password, and every session, with each error the server can give.
+    /// Revoke, rename, and every session, with each error the server can give.
     #[test]
     fn the_account_routes_and_what_their_errors_say() {
         let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
@@ -1505,21 +1503,6 @@ pub(crate) mod tests {
                     "OK",
                     r#"{"user_id":"11111111-1111-1111-1111-111111111111","email":"ada@example.com","display_name":"Ada L","role":"owner"}"#,
                 );
-            }
-            if first.starts_with("POST /v1/me/password ") {
-                if body.contains("wrong-current") {
-                    return http(401, "Unauthorized", r#"{"error":"invalid_credentials"}"#);
-                }
-                if body.contains("ended-session") {
-                    return http(401, "Unauthorized", r#"{"error":"unauthorized"}"#);
-                }
-                if body.contains("server-says-no") {
-                    return http(400, "Bad Request", r#"{"error":"invalid"}"#);
-                }
-                if body.contains("too-many-tries") {
-                    return http(429, "Too Many Requests", r#"{"error":"slow_down"}"#);
-                }
-                return http(204, "No Content", "");
             }
             if first.starts_with("DELETE /v1/sessions ") {
                 return http(204, "No Content", "");
@@ -1554,33 +1537,6 @@ pub(crate) mod tests {
             let before = count();
             assert_eq!(rename(account.clone(), "   ".into()), refused(NAME_SIZE));
             assert_eq!(rename(account.clone(), "a".repeat(81)), refused(NAME_SIZE));
-            assert_eq!(count(), before);
-
-            let new = "a new password".to_owned();
-            assert_eq!(change_password(account.clone(), "old password!".into(), new.clone()), Response::Ok);
-            let posted = json_body(&last());
-            assert_eq!(posted["current_password"], "old password!");
-            assert_eq!(posted["new_password"], "a new password");
-            // The one 401 that is not a sign-out.
-            let wrong = change_password(account.clone(), "wrong-current".into(), new.clone());
-            assert_eq!(wrong, refused("Your current password isn't right."));
-            assert_ne!(wrong, refused(SIGNED_OUT));
-            assert_eq!(
-                change_password(account.clone(), "ended-session".into(), new.clone()),
-                refused(SIGNED_OUT)
-            );
-            assert_eq!(
-                change_password(account.clone(), "server-says-no".into(), new.clone()),
-                refused(PASSWORD_SIZE)
-            );
-            assert_eq!(
-                change_password(account.clone(), "too-many-tries".into(), new.clone()),
-                refused("Too many tries. Wait a minute, then try again.")
-            );
-            let before = count();
-            assert_eq!(change_password(account.clone(), "old password!".into(), "short".into()), refused(PASSWORD_SIZE));
-            assert_eq!(change_password(account.clone(), "old password!".into(), "x".repeat(129)), refused(PASSWORD_SIZE));
-            assert_eq!(change_password(account.clone(), String::new(), new.clone()), refused(WRONG_PASSWORD));
             assert_eq!(count(), before);
 
             assert!(end_sessions(&account).is_ok());

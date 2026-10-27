@@ -801,7 +801,7 @@ fn ready_heard(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, heard
         if let Ok(members) = members_of(saved) {
             seat.names = members.iter().take(NAMES).map(|member| (member.user_id.clone(), member.display_name.clone())).collect();
             if !seat.described {
-                let email = members.iter().find(|member| member.user_id == seat.me).map_or(saved.email.as_str(), |member| member.email.as_str());
+                let email = members.iter().find(|member| member.user_id == seat.me).map_or(saved.email.as_deref().unwrap_or(""), |member| member.email.as_str());
                 let _ = ctx.describe(&join_host(&saved.base_url), email);
                 seat.described = true;
             }

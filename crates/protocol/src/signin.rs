@@ -1,6 +1,7 @@
 //! A sign-in tinyclient draws itself, one step at a time, for a network that has no web page to
 //! show (Telegram). The shell asks chatd to begin, draws the step it is told, and answers it;
-//! chatd tells the step again whenever it moves on its own (`Change::SignIn`).
+//! chatd tells the step again whenever it moves on its own (`Change::SignIn`). A Tiny server signs
+//! in through the system browser: the sheet only says it is waiting (`SignInStep::Browser`).
 //!
 //! What the user types (a number, a code, a password) crosses the local socket once, inside
 //! [`SignInInput`], and is never stored or logged by either side.
@@ -36,8 +37,8 @@ pub enum SignInProblem {
     PasswordInvalid,
     /// Not an http or https host. A user in the address is refused. A path, query, or fragment is dropped.
     UrlInvalid,
-    /// Not one address: missing `@`, more than one, or whitespace.
-    EmailInvalid,
+    /// Signed in on the provider, but not a member of the Tiny server, and no invite came with it.
+    NotMember,
     /// The network will not take another try before `until` (unix seconds).
     TooMany { until: i64 },
     /// Anything else, in words the user can read.
@@ -79,7 +80,6 @@ pub enum SignInStep {
         problem: Option<SignInProblem>,
     },
     /// The account has a second password. `hint` is the user's own, as the network keeps it.
-    /// A Tiny server uses this step for the account password; `hint` is empty there.
     Password {
         #[serde(default, skip_serializing_if = "String::is_empty")]
         hint: String,
@@ -91,21 +91,21 @@ pub enum SignInStep {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         problem: Option<SignInProblem>,
     },
-    /// Ask for the email on that server. `server` is the address that was accepted.
-    Email {
-        server: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        problem: Option<SignInProblem>,
-    },
     /// Ask for an invite code for `server`.
     Invite {
         server: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         problem: Option<SignInProblem>,
     },
-    /// Ask for the name people should see.
-    Name {
+    /// The rest happens in the system browser, at `provider` (its name, as `server` gives it).
+    /// `waiting`: chatd is listening for the browser to come back. Not waiting, with a problem:
+    /// it stopped, and `OpenBrowser` begins again.
+    Browser {
         server: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        provider: String,
+        #[serde(default)]
+        waiting: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         problem: Option<SignInProblem>,
     },
@@ -131,14 +131,12 @@ pub enum SignInInput {
     Password { password: String },
     /// A Tiny server's address, as typed.
     Server { url: String },
-    /// The email on that server, as typed.
-    Email { email: String },
     /// A Tiny server's address, to join it with a code.
     HaveCode { url: String },
     /// The invite code, as pasted.
     Invite { code: String },
-    /// The name people should see.
-    Name { name: String },
+    /// Show the browser's page again while chatd waits; after it stopped, begin it again.
+    OpenBrowser,
     /// Send the code again, the way `SignInStep::Code::next` says.
     Resend,
     /// One step back: from the code to the number, from the number to the QR code.
@@ -155,10 +153,9 @@ impl fmt::Debug for SignInInput {
             SignInInput::Code { .. } => "Code { .. }",
             SignInInput::Password { .. } => "Password { .. }",
             SignInInput::Server { .. } => "Server { .. }",
-            SignInInput::Email { .. } => "Email { .. }",
             SignInInput::HaveCode { .. } => "HaveCode { .. }",
             SignInInput::Invite { .. } => "Invite { .. }",
-            SignInInput::Name { .. } => "Name { .. }",
+            SignInInput::OpenBrowser => "OpenBrowser",
             SignInInput::Resend => "Resend",
             SignInInput::Back => "Back",
         })
@@ -175,23 +172,20 @@ mod tests {
         assert!(!format!("{typed:?}").contains("hunter2"));
         assert!(!format!("{:?}", SignInInput::Code { code: "12345".into() }).contains("12345"));
         let url = SignInInput::Server { url: "http://127.0.0.1:8080".into() };
-        let email = SignInInput::Email { email: "ada@example.com".into() };
         assert_eq!(format!("{url:?}"), "Server { .. }");
-        assert_eq!(format!("{email:?}"), "Email { .. }");
         assert!(!format!("{url:?}").contains("127.0.0.1"));
-        assert!(!format!("{email:?}").contains("ada@"));
-        assert!(!format!("{email:?}").contains("example.com"));
         let invite = SignInInput::Invite { code: "secret-code".into() };
-        let name = SignInInput::Name { name: "Ada Lovelace".into() };
         assert_eq!(format!("{invite:?}"), "Invite { .. }");
-        assert_eq!(format!("{name:?}"), "Name { .. }");
         assert!(!format!("{invite:?}").contains("secret-code"));
-        assert!(!format!("{name:?}").contains("Ada"));
-        assert!(!format!("{name:?}").contains("Lovelace"));
+        assert_eq!(serde_json::to_string(&SignInInput::OpenBrowser).unwrap(), r#"{"input":"open_browser"}"#);
         // A step with nothing but its name still reads: every other field is optional.
         assert_eq!(serde_json::from_str::<SignInStep>(r#"{"step":"server"}"#).unwrap(), SignInStep::Server { problem: None });
-        let email_step = SignInStep::Email { server: "http://127.0.0.1:8080".into(), problem: None };
-        assert_eq!(serde_json::to_string(&email_step).unwrap(), r#"{"step":"email","server":"http://127.0.0.1:8080"}"#);
+        let browser = SignInStep::Browser { server: "http://127.0.0.1:8080".into(), provider: "Tinyauth".into(), waiting: true, problem: None };
+        assert_eq!(serde_json::to_string(&browser).unwrap(), r#"{"step":"browser","server":"http://127.0.0.1:8080","provider":"Tinyauth","waiting":true}"#);
+        let not_member = SignInStep::Browser { server: "https://chat.example".into(), provider: String::new(), waiting: false, problem: Some(SignInProblem::NotMember) };
+        let json = serde_json::to_string(&not_member).unwrap();
+        assert_eq!(json, r#"{"step":"browser","server":"https://chat.example","waiting":false,"problem":{"problem":"not_member"}}"#);
+        assert_eq!(serde_json::from_str::<SignInStep>(&json).unwrap(), not_member);
         assert_eq!(serde_json::from_str::<SignInStep>(r#"{"step":"phone"}"#).unwrap(), SignInStep::Phone { problem: None });
         assert_eq!(
             serde_json::from_str::<SignInStep>(r#"{"step":"qr"}"#).unwrap(),

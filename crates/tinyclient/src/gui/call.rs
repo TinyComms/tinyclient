@@ -349,7 +349,7 @@ fn handoff_label(network: Network) -> String {
 }
 
 /// Hands a link to the system. Only something with a scheme, never an option.
-fn open(url: &str) -> Result<(), String> {
+pub(in crate::gui) fn open(url: &str) -> Result<(), String> {
     if url.starts_with('-') || !url.contains(':') {
         return Err(format!("Not a link: {url}"));
     }

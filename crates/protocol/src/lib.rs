@@ -1383,12 +1383,6 @@ pub enum Request {
         account: AccountKey,
         display_name: String,
     },
-    /// Changes this account's password. The server ends every other session; this one stays.
-    TinyPassword {
-        account: AccountKey,
-        current_password: TinySecret,
-        new_password: TinySecret,
-    },
     /// Ends every session of this account on the server, this one too, then forgets it here as
     /// `SignOut` does. Answers `Status`.
     TinySignOutEverywhere {

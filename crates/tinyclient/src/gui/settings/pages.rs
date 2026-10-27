@@ -909,10 +909,9 @@ impl SettingsWindow {
         cx.notify();
     }
 
-    pub(super) fn modal(&mut self, confirm: &Confirm, window: &mut Window, cx: &mut Context<Self>) -> Div {
+    pub(super) fn modal(&mut self, confirm: &Confirm, cx: &mut Context<Self>) -> Div {
         match confirm.clone() {
             Confirm::SignOut(account) => self.sign_out_modal(&account, cx),
-            Confirm::TinyPassword(_) => self.tiny_password_modal(window, cx),
             Confirm::TinyEverywhere(account) => self.tiny_everywhere_modal(&account, cx),
             Confirm::Retention { days, prunable } => modal_panel(
                 format!("Delete messages older than {days} days?"),
