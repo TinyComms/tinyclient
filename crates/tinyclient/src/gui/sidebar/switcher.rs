@@ -561,9 +561,10 @@ impl Shell {
         let shift = hit.title.len() - title.len();
         let highlights: Vec<(Range<usize>, HighlightStyle)> =
             hit.matched.iter().filter(|range| range.start >= shift).map(|range| (range.start - shift..range.end - shift, lit)).collect();
-        let channel = matches!(&hit.target, Target::Conversation(c) if !c.kind.is_direct() && c.key.network != Network::Telegram && c.key.network != Network::Teams);
+        let (channel, voice) = prefix(&hit.target);
         let shown_title = if channel { format!("#{title}") } else { title.to_owned() };
         let highlights = if channel { highlights.into_iter().map(|(r, s)| (r.start + 1..r.end + 1, s)).collect() } else { highlights };
+        let word = if hit.matched.is_empty() { theme::text() } else { theme::text_soft() };
         div()
             .id(("hit", ix))
             .h(px(ROW))
@@ -582,10 +583,19 @@ impl Shell {
                 div()
                     .flex_none()
                     .max_w(px(240.))
-                    .truncate()
-                    .type_ui()
-                    .text_color(if hit.matched.is_empty() { theme::text() } else { theme::text_soft() })
-                    .child(StyledText::new(SharedString::from(shown_title)).with_highlights(highlights)),
+                    .flex()
+                    .min_w_0()
+                    .items_center()
+                    .gap(px(3.))
+                    .children(voice.then(|| glyph("icons/volume-2.svg", 12., word)))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .type_ui()
+                            .text_color(word)
+                            .child(StyledText::new(SharedString::from(shown_title)).with_highlights(highlights)),
+                    ),
             )
             .child(
                 div()
@@ -688,6 +698,18 @@ impl Shell {
     }
 }
 
+/// How a hit reads: a text channel takes `#` before its title, a voice channel takes its volume
+/// glyph there, and everything else reads plain.
+fn prefix(target: &Target) -> (bool, bool) {
+    match target {
+        Target::Conversation(c) if c.kind == ConversationKind::Voice => (false, true),
+        Target::Conversation(c) => {
+            (!c.kind.is_direct() && c.key.network != Network::Telegram && c.key.network != Network::Teams, false)
+        }
+        _ => (false, false),
+    }
+}
+
 fn name_is_empty(input: &Entity<TextInput>, cx: &gpui::App) -> bool {
     narrowed(input.read(cx).text().trim()).1.trim_start_matches(['#', '@']).is_empty()
 }
@@ -768,6 +790,20 @@ mod tests {
             assert!(matches!(found[0].target, Target::Conversation(_)));
             assert!(found[0].matched.is_empty());
         }
+    }
+
+    #[test]
+    fn a_text_channel_reads_with_a_hash_a_voice_channel_with_its_glyph_and_the_rest_plain() {
+        use ConversationKind::{Channel, Direct, Voice};
+        let on = |network: Network, id: &str, kind: ConversationKind| {
+            Target::Conversation(Rc::new(Conversation::new(Key { network, account: "me".into(), id: id.into() }, kind, id)))
+        };
+        assert_eq!(prefix(&on(Network::Discord, "general", Channel)), (true, false));
+        assert_eq!(prefix(&on(Network::Discord, "lounge", Voice)), (false, true));
+        assert_eq!(prefix(&on(Network::Discord, "ada", Direct)), (false, false));
+        assert_eq!(prefix(&on(Network::Telegram, "chat", Channel)), (false, false));
+        assert_eq!(prefix(&on(Network::Teams, "chat", Channel)), (false, false));
+        assert_eq!(prefix(&Target::Person(Box::new(person("bea")))), (false, false));
     }
 
     #[test]

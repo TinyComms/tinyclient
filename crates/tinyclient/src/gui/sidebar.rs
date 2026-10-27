@@ -29,12 +29,15 @@ use super::state::{Shell, Snapshot, SpaceTree, TROUBLE_SHOWN};
 use super::theme::{self, Type};
 use crate::client::ask;
 use gpui::{
-    div, prelude::*, px, uniform_list, Context, Div, FocusHandle, ListAlignment, ListState, MouseButton,
+    div, prelude::*, px, uniform_list, Context, Div, FocusHandle, FontWeight, ListAlignment, ListState, MouseButton,
     ScrollStrategy, SharedString, Stateful, UniformListScrollHandle, Window,
 };
 use history::History;
 use pages::Pages;
-use protocol::{AccountKey, Badge, CallSupport, Conversation, ConversationKind, InboxCounts, InboxFilter, Key, Link, Network, Request, Response, PAGE_LIMIT};
+use protocol::{
+    AccountKey, Badge, CallSupport, Conversation, ConversationKind, InboxCounts, InboxFilter, Key, Link, Network,
+    Request, Response, PAGE_LIMIT,
+};
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::rc::Rc;
@@ -257,7 +260,7 @@ impl State {
 /// The glyph of a conversation in a tree. A channel only invited people see shows a lock.
 pub fn kind_glyph(kind: ConversationKind, private: bool, call: CallSupport) -> &'static str {
     match kind {
-        ConversationKind::Channel if private => "icons/lock.svg",
+        ConversationKind::Channel | ConversationKind::Voice if private => "icons/lock.svg",
         ConversationKind::Direct => "icons/user.svg",
         ConversationKind::Group => "icons/users.svg",
         ConversationKind::Channel => "icons/hash.svg",
@@ -268,6 +271,12 @@ pub fn kind_glyph(kind: ConversationKind, private: bool, call: CallSupport) -> &
         ConversationKind::Forum => "icons/messages-square.svg",
         ConversationKind::Thread => "icons/corner-down-right.svg",
     }
+}
+
+/// A voice row the server list lets you join from: a native voice channel, never a stage,
+/// which opens in Discord instead (07 §1).
+pub fn joins_from_list(c: &Conversation) -> bool {
+    c.kind == ConversationKind::Voice && c.call == CallSupport::Native
 }
 
 fn row_id(prefix: &'static str, key: &Key) -> gpui::ElementId {
@@ -981,6 +990,36 @@ impl Shell {
         }
     }
 
+    /// The hover Join pill of a voice row: the header pill's look, shrunk to the row (07 §1).
+    /// Invisible until the row is hovered, so a plain view of the list stays quiet.
+    pub(super) fn join_pill(&self, key: &Key, cx: &mut Context<Self>) -> Stateful<Div> {
+        let key = key.clone();
+        div()
+            .id(row_id("join", &key))
+            .flex_none()
+            .h(px(20.))
+            .px(px(8.))
+            .rounded(px(10.))
+            .border_1()
+            .flex()
+            .items_center()
+            .gap(px(5.))
+            .text_size(px(11.))
+            .font_weight(FontWeight::MEDIUM)
+            .cursor_pointer()
+            .bg(theme::raised())
+            .border_color(theme::hairline())
+            .text_color(theme::text())
+            .hover(|style| style.bg(theme::selected()))
+            .invisible()
+            .group_hover("voice", |style| style.visible())
+            // The press belongs to the pill: the row's open must not fire with it.
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(move |this, _, _, cx| this.call_start(key.clone(), cx)))
+            .child(glyph("icons/volume-2.svg", 12., theme::text()))
+            .child("Join")
+    }
+
     /// A conversation in a tree, 28: glyph or avatar 20, the name, then what is going on.
     fn place_row(&self, c: &Rc<Conversation>, depth: u8, focused: bool, cx: &mut Context<Self>) -> Stateful<Div> {
         let selected = self.open.as_ref() == Some(&c.key);
@@ -1008,6 +1047,7 @@ impl Shell {
         let limit = occupied.map(|inside| inside.total.to_string());
         let draft = (!self.draft_of(c).is_empty() && !selected).then(|| glyph("icons/pencil.svg", 14., theme::text_faint()));
         let (picked, menu_row) = (c.clone(), c.clone());
+        let join = joins_from_list(c);
         let content = div()
             // 16 a level less the gap after it (none at the top), as the tree's other rows.
             .children((depth > 0).then(|| div().flex_none().w(px(16. * f32::from(depth) - 8.))))
@@ -1025,11 +1065,23 @@ impl Shell {
             .children(status.map(|emoji| div().flex_none().type_small().child(emoji)))
             .children(chat::name_mark(c).filter(|_| c.kind.is_direct()))
             .child(div().flex_1())
+            .children(join.then(|| self.join_pill(&c.key, cx)))
             .children(draft)
             .children(limit.map(|total| div().flex_none().flex().items_center().gap(px(2.)).child(glyph("icons/volume-2.svg", 12., theme::text_faint())).child(div().type_micro().text_color(theme::text_faint()).child(total))))
-            .children(row_badge(c));
+            .children(row_badge(c))
+            .when(join, |row| row.group("voice"));
         list_row(row_id("tree", &c.key), theme::row_height(theme::ROW_ONE), selected, focused, content)
-            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| this.pick_row(&picked, cx)))
+            .on_mouse_down(
+                MouseButton::Left,
+                // A voice row joins on a double-click; a single click only opens its chat.
+                cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                    if join && event.click_count > 1 {
+                        this.call_start(picked.key.clone(), cx);
+                    } else {
+                        this.pick_row(&picked, cx);
+                    }
+                }),
+            )
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
@@ -1607,5 +1659,21 @@ pub(crate) mod tests {
         assert_eq!(kind_glyph(stage.kind, stage.private, stage.call), "icons/radio.svg");
         assert_eq!(kind_glyph(voice.kind, voice.private, voice.call), "icons/volume-2.svg");
         assert_eq!(kind_glyph(ConversationKind::Channel, false, CallSupport::None), "icons/hash.svg");
+    }
+
+    #[test]
+    fn a_native_voice_row_joins_from_the_list_and_nothing_else_does() {
+        let voice = |call| {
+            let mut c = row("lounge", ConversationKind::Voice);
+            c.call = call;
+            c
+        };
+        assert!(joins_from_list(&voice(CallSupport::Native)));
+        // A stage opens in Discord instead, and an empty channel's pill cannot join either.
+        assert!(!joins_from_list(&voice(CallSupport::Handoff)));
+        assert!(!joins_from_list(&voice(CallSupport::None)));
+        // A text channel's click only opens, and a DM call joins from its header.
+        assert!(!joins_from_list(&row("general", ConversationKind::Channel)));
+        assert!(!joins_from_list(&row("mara", ConversationKind::Direct)));
     }
 }
