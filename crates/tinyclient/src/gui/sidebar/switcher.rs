@@ -136,8 +136,11 @@ fn narrowed(query: &str) -> (Option<Network>, &str) {
     let typed = query.trim_start();
     for network in Network::ALL {
         let word = network.label();
-        if typed.len() > word.len() && typed[..word.len()].eq_ignore_ascii_case(word) && typed[word.len()..].starts_with(' ') {
-            return (Some(network), typed[word.len()..].trim_start());
+        let Some((prefix, rest)) = typed.split_at_checked(word.len()) else {
+            continue;
+        };
+        if prefix.eq_ignore_ascii_case(word) && rest.starts_with(' ') {
+            return (Some(network), rest.trim_start());
         }
     }
     (None, typed)
@@ -678,6 +681,20 @@ impl super::State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn network_narrowing_handles_unicode_queries() {
+        for query in ["Вал", "Валерій", "你好世界", "😀😀", "Вал name", "slackВал"] {
+            assert_eq!(narrowed(query), (None, query));
+        }
+        for network in Network::ALL {
+            let query = format!("  {}   Вал", network.label().to_ascii_uppercase());
+            assert_eq!(narrowed(&query), (Some(network), "Вал"));
+            assert_eq!(narrowed(network.label()), (None, network.label()));
+        }
+        assert_eq!(narrowed("slack "), (Some(Network::Slack), ""));
+        assert_eq!(narrowed("slack\tВал"), (None, "slack\tВал"));
+    }
 
     fn key(id: &str) -> Key {
         Key { network: Network::Discord, account: "me".into(), id: id.into() }
