@@ -1242,6 +1242,16 @@ impl World {
         }
         if let Some(request) = asked::<f::contacts::ResolveUsername>(body) {
             self.log(&format!("ResolveUsername {}", request.username));
+            if request.username.eq_ignore_ascii_case("forest_wren") {
+                let found = tl::types::contacts::ResolvedPeer {
+                    peer: Who::User(7_011).peer(), chats: Vec::new(),
+                    users: vec![user(7_011, "Robin", "Vale", "forest_wren").into()],
+                };
+                return Some(answer(tl::enums::contacts::ResolvedPeer::Peer(found)));
+            }
+            if request.username != "gif" {
+                return Some(Err(rpc(400, "USERNAME_NOT_OCCUPIED", None)));
+            }
             let found = tl::types::contacts::ResolvedPeer { peer: Who::User(GIF_BOT).peer(), chats: Vec::new(), users: vec![user(GIF_BOT, "GIF Search", "", "gif").into()] };
             return Some(answer(tl::enums::contacts::ResolvedPeer::Peer(found)));
         }

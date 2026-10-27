@@ -503,6 +503,15 @@ fn serve(account: &Arc<Account>, command: Command) {
         }
         Command::Typing(conversation_id) => typing(account, &conversation_id),
         Command::SearchPeople(query) => {
+            // Global search is ranked and limited. Resolve a complete username as well so a
+            // public user outside our contacts can be found even when absent from that list.
+            let username = query.trim().trim_start_matches('@');
+            if !username.is_empty() && username.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_') {
+                let request = tl::functions::contacts::ResolveUsername { username: username.to_owned(), referer: None };
+                if let Ok(tl::enums::contacts::ResolvedPeer::Peer(found)) = account.ask(&request) {
+                    account.learn(&found.users, &found.chats);
+                }
+            }
             let request = tl::functions::contacts::Search { broadcasts: false, bots: false, q: query.clone(), limit: 25 };
             if let Ok(tl::enums::contacts::Found::Found(found)) = account.ask(&request) {
                 account.learn(&found.users, &[]);

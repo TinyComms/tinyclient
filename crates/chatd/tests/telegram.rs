@@ -670,6 +670,25 @@ fn sending_editing_deleting_and_reacting_wait_for_telegram() {
 }
 
 #[test]
+fn a_public_username_resolves_a_person_outside_contacts_and_global_search_results() {
+    let world = World::signed_in();
+    world.connected();
+    let request = || Request::People {
+        network: Some(Network::Telegram), relation: None, query: Some("forest_wren".into()), offset: 0, limit: 20,
+    };
+    let Response::People { people, .. } = world.ask(request()) else { panic!("no people response") };
+    assert!(people.is_empty());
+    let person = world.until("the public username to resolve", || match world.ask(request()) {
+        Response::People { people, .. } => people.into_iter().find(|p| p.key.id == "u7011"),
+        _ => None,
+    });
+    assert_eq!((person.name.as_str(), person.handle.as_str(), person.relation), ("Robin Vale", "@forest_wren", Relation::None));
+    assert!(world.calls().contains(&"ResolveUsername forest_wren".to_owned()));
+    let Response::Conversation { conversation } = world.ask(Request::StartDirect { person: person.key }) else { panic!("no direct chat") };
+    assert_eq!(conversation.key.id, "u7011");
+}
+
+#[test]
 fn a_flood_wait_is_slept_in_full_and_a_long_one_is_told_not_retried() {
     let world = World::signed_in();
     world.connected();
