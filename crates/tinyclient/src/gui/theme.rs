@@ -122,6 +122,8 @@ pub const R_MODAL: f32 = 12.;
 // Density.
 /// Controls and one-line rows.
 pub const CONTROL: f32 = 28.;
+/// The app's mark where the window has nothing open, and on the first launch.
+pub const BRAND_MARK: f32 = 56.;
 /// Place rows: channels, servers, folders, menu items.
 pub const ROW_ONE: f32 = 28.;
 /// Person rows inside a pane: members, switcher, a menu's header. Avatar 24.

@@ -19,7 +19,7 @@ pub use overlay::*;
 #[allow(unused_imports)]
 pub use place::{placed, Layer, Place};
 
-use super::assets::{glyph_asset, network_asset};
+use super::assets::{brand_asset, glyph_asset, network_asset};
 use super::theme::{self, Type};
 use gpui::{
     div, img, prelude::*, px, svg, Div, ElementId, Hsla, Img, Rgba, SharedString, Stateful, Svg,
@@ -554,7 +554,18 @@ pub fn empty_state_with(icon: &'static str, title: &str, detail: &str, action: i
     centered_high(column)
 }
 
-fn empty_state_body(icon: Svg, title: &str, detail: &str) -> Div {
+/// The app's own mark in its own colors. Only where the window speaks as tinyclient: nothing
+/// open, and the first launch.
+pub fn brand_mark(size: f32) -> Img {
+    img(brand_asset(size)).size(px(size)).flex_none()
+}
+
+/// [`empty_state`] with the app's mark in place of the glyph, for the window with nothing open.
+pub fn brand_state(title: &str, detail: &str) -> Div {
+    centered_high(empty_state_body(brand_mark(theme::BRAND_MARK), title, detail))
+}
+
+fn empty_state_body(icon: impl IntoElement, title: &str, detail: &str) -> Div {
     div()
         .flex_none()
         .px(px(theme::PANE_PAD))

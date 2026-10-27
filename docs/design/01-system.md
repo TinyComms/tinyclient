@@ -138,7 +138,7 @@ States are rest / hover / pressed / focus / disabled unless listed. Every hover 
 - **Switch, checkbox.** 32 × 18 with a 14 knob; 16 square, radius 4. On is `accent`.
 - **Divider.** 1 pt `hairline`. Day: 11/500 `text_faint` label, centered, 12 from the rules. New: 1 pt `accent` rule with "New" 11/600 `accent_text` at its right end.
 - **Loading.** Skeleton blocks are static `hover`-filled rectangles (radius 4, 10 high for a title, 8 for a preview) in the row's final geometry, shown only after 150 ms. An image is its final box in `raised`. Known progress is a 4 pt bar (white 10% track, `accent` fill). Unknown progress is a sentence.
-- **Empty state.** Centered: glyph 20 `text_faint`, 12, title 16/600, 4, one line 13 `text_soft` (max 320), 16, at most one secondary button. No disc, no illustration.
+- **Empty state.** Centered: glyph 20 `text_faint`, 12, title 16/600, 4, one line 13 `text_soft` (max 320), 16, at most one secondary button. No disc, no illustration. The one exception is where the window speaks as tinyclient itself, with nothing open and on the first launch: the app's mark in its own colors at 56 (`brand_mark`, `assets/brand/tinyclient.svg`) in place of the glyph.
 
 ## 4. Craft rules
 1. **One baseline per line.** Sender 14/600, time 11 and body 14 all sit on 20 pt lines; name and time align on the baseline. The 36 avatar starts 2 below the name line's top so it centers on the first two lines. *Misaligned small text is the first thing that reads as amateur.*

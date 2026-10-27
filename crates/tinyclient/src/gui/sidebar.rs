@@ -23,6 +23,7 @@ use super::components::{
     badge_dot, badge_mention, banner, banner_action, empty_state, glyph, icon_button, keycap, list_row, network_icon,
     pane_title, rollup_badge, row_badge, row_tone, segment, segmented, skeleton, tip, Avatar, Shape, Tone,
 };
+use super::chrome::{self, End};
 use super::layout::{drags_window, Menu};
 use super::state::{Shell, Snapshot, SpaceTree, TROUBLE_SHOWN};
 use super::theme::{self, Type};
@@ -1111,7 +1112,7 @@ impl Shell {
     }
 
     fn title_strip(&self, mode: &Mode, cx: &mut Context<Self>) -> Div {
-        let strip = drags_window(div()).h(px(theme::STRIP)).flex_none().pl(px(theme::PANE_PAD)).pr(px(12.)).flex().items_center().gap(px(8.));
+        let strip = drags_window(div()).h(px(theme::STRIP)).flex_none().pl(px(theme::PANE_PAD)).pr(px(chrome::end_pad(End::List, 12.))).flex().items_center().gap(px(8.));
         let quiet = |button: Stateful<Div>| button.on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
         let back = |id: &'static str, words: String, cx: &mut Context<Self>| {
             quiet(icon_button(id, "icons/chevron-left.svg", false))

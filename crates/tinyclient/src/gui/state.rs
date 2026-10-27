@@ -6,7 +6,7 @@ use super::layout::{self, Slots};
 use super::sidebar::{self, pages::PAGE, Mode};
 use super::{call, composer, conversation, people};
 use crate::client::ask;
-use gpui::{Context, FocusHandle, Subscription, Window};
+use gpui::{Context, FocusHandle, Subscription, Task, Window};
 use protocol::{
     AccountKey, AccountStatus, Call, Change, Conversation, ErrorCode, Group, Key, Link,
     MediaFile, Network, NetworkStatus, Occupants, Page, Request, Response, Space,
@@ -232,6 +232,9 @@ pub struct Shell {
     pub(super) frame: Cell<Option<(f32, f32, f32, f32)>>,
     /// The prefs as last written, so a frame that changed nothing writes nothing.
     pub(super) saved_prefs: RefCell<String>,
+    /// The save waiting for the window to settle. Each change replaces it, which cancels the
+    /// last: a drag waits on one timer, not one per frame.
+    pub(super) settling: Option<Task<()>>,
     /// What the menu bar was last set for.
     pub(super) menus_set: RefCell<String>,
     /// Lines of `shell.prefs` this build does not know, written back as they were.
@@ -242,7 +245,7 @@ pub struct Shell {
     /// `--components`: the component sheet over the whole window.
     #[cfg(feature = "gui-shot")]
     pub(super) sheet: bool,
-    _subscriptions: [Subscription; 1],
+    _subscriptions: [Subscription; 2],
 }
 
 impl Shell {
@@ -250,10 +253,14 @@ impl Shell {
         Self::watch(cx);
         Self::watch_updates(cx);
         Self::wake_at_thresholds(cx);
-        let subscriptions = [cx.observe_window_activation(window, |this, window, cx| {
-            this.active = window.is_window_active();
-            cx.notify();
-        })];
+        let subscriptions = [
+            cx.observe_window_activation(window, |this, window, cx| {
+                this.active = window.is_window_active();
+                cx.notify();
+            }),
+            // A move draws nothing, so render never sees it: the frame is noted here.
+            cx.observe_window_bounds(window, |this, window, cx| this.note_place(window, cx)),
+        ];
         let mut shell = Shell {
             snapshot: None,
             refused: None,
@@ -290,6 +297,7 @@ impl Shell {
             restore: Some((prefs.open.clone(), prefs.mode.clone())),
             frame: Cell::new(prefs.frame),
             saved_prefs: RefCell::new(String::new()),
+            settling: None,
             menus_set: RefCell::new(String::new()),
             prefs_kept: prefs.kept.clone(),
             #[cfg(feature = "gui-shot")]

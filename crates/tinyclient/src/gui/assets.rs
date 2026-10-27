@@ -11,6 +11,7 @@ macro_rules! assets {
 }
 
 assets!(
+    "brand/tinyclient.svg",
     "networks/telegram.svg",
     "networks/discord.svg",
     "networks/slack.svg",
@@ -68,6 +69,7 @@ assets!(
     "icons/messages-square.svg",
     "icons/mic-off.svg",
     "icons/mic.svg",
+    "icons/minus.svg",
     "icons/monitor-up.svg",
     "icons/panel-left.svg",
     "icons/paperclip.svg",
@@ -146,6 +148,12 @@ pub fn network_asset(network: Network, points: f32) -> SharedString {
         Network::Tiny => "tiny",
     };
     format!("networks/{name}.svg@{}", points.ceil()).into()
+}
+
+/// tinyclient's own mark, to be drawn `points` across. Its own file, not the Tiny server's
+/// `networks/tiny.svg`, so the two can part.
+pub fn brand_asset(points: f32) -> SharedString {
+    format!("brand/tinyclient.svg@{}", points.ceil()).into()
 }
 
 /// The same SVG, declaring a size that fits `points` square and keeps its shape.

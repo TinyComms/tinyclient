@@ -583,16 +583,13 @@ impl Shell {
         let text = prefs::write(&self.current_prefs());
         if *self.saved_prefs.borrow() != text {
             self.saved_prefs.replace(text);
-            let seen = self.frame.get();
-            cx.spawn(async move |this, cx| {
+            self.settling = Some(cx.spawn(async move |this, cx| {
                 cx.background_executor().timer(FRAME_SETTLE).await;
                 let _ = this.update(cx, |this, cx| {
-                    if this.frame.get() == seen {
-                        this.save_prefs(cx);
-                    }
+                    this.settling = None;
+                    this.save_prefs(cx);
                 });
-            })
-            .detach();
+            }));
         }
     }
 
