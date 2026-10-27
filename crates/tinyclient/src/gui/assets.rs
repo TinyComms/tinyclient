@@ -83,6 +83,7 @@ assets!(
     "icons/pin.svg",
     "icons/play.svg",
     "icons/plus.svg",
+    "icons/radio.svg",
     "icons/refresh-cw.svg",
     "icons/reply.svg",
     "icons/rotate-ccw.svg",

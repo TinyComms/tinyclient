@@ -217,7 +217,7 @@ impl Shell {
                     Avatar::new(&space.key, &space.name, size).shape(Shape::Place).image_at(icon).build()
                 }
                 None if c.key.network == Network::Telegram => Avatar::new(&c.key, &c.title, size).shape(Shape::Place).build(),
-                None => Avatar::channel(super::kind_glyph(kind, c.private), size).build(),
+                None => Avatar::channel(super::kind_glyph(kind, c.private, c.call), size).build(),
             },
             _ => Avatar::new(&c.key, &c.title, size).shape(Shape::Place).image_at(picture).build(),
         }

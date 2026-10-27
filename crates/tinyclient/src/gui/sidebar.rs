@@ -34,7 +34,7 @@ use gpui::{
 };
 use history::History;
 use pages::Pages;
-use protocol::{AccountKey, Badge, Conversation, ConversationKind, InboxCounts, InboxFilter, Key, Link, Network, Request, Response, PAGE_LIMIT};
+use protocol::{AccountKey, Badge, CallSupport, Conversation, ConversationKind, InboxCounts, InboxFilter, Key, Link, Network, Request, Response, PAGE_LIMIT};
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::rc::Rc;
@@ -255,13 +255,15 @@ impl State {
 }
 
 /// The glyph of a conversation in a tree. A channel only invited people see shows a lock.
-pub fn kind_glyph(kind: ConversationKind, private: bool) -> &'static str {
+pub fn kind_glyph(kind: ConversationKind, private: bool, call: CallSupport) -> &'static str {
     match kind {
         ConversationKind::Channel if private => "icons/lock.svg",
         ConversationKind::Direct => "icons/user.svg",
         ConversationKind::Group => "icons/users.svg",
         ConversationKind::Channel => "icons/hash.svg",
         ConversationKind::Announcement => "icons/megaphone.svg",
+        // A stage is a voice row handed to Discord (`02` §4): radio, not speaker.
+        ConversationKind::Voice if call == CallSupport::Handoff => "icons/radio.svg",
         ConversationKind::Voice => "icons/volume-2.svg",
         ConversationKind::Forum => "icons/messages-square.svg",
         ConversationKind::Thread => "icons/corner-down-right.svg",
@@ -992,7 +994,7 @@ impl Shell {
             ConversationKind::Direct | ConversationKind::Group => self.conversation_avatar(c, 20., surface, cx).into_any_element(),
             kind => {
                 let icon_color = if c.muted || empty_voice { theme::text_faint() } else { theme::text_soft() };
-                let icon = if c.key.network == Network::Teams && kind == ConversationKind::Channel && !c.private { None } else { Some(kind_glyph(kind, c.private)) };
+                let icon = if c.key.network == Network::Teams && kind == ConversationKind::Channel && !c.private { None } else { Some(kind_glyph(kind, c.private, c.call)) };
                 div().size(px(20.)).flex_none().flex().items_center().justify_center().children(icon.map(|icon| glyph(icon, if kind == ConversationKind::Thread { 14. } else { 16. }, icon_color))).into_any_element()
             }
         };
@@ -1591,5 +1593,14 @@ pub(crate) mod tests {
         assert_eq!(on_screen(&list, 40, |_| 48.), 0..19);
         list.scroll_to(gpui::ListOffset { item_ix: 5, offset_in_item: px(10.) });
         assert_eq!(on_screen(&list, 40, |_| 100.).start, 5);
+    }
+
+    #[test]
+    fn a_stage_row_reads_as_a_radio_and_a_voice_channel_as_a_speaker() {
+        let stage = Conversation { call: CallSupport::Handoff, ..row("stage", ConversationKind::Voice) };
+        let voice = row("voice", ConversationKind::Voice);
+        assert_eq!(kind_glyph(stage.kind, stage.private, stage.call), "icons/radio.svg");
+        assert_eq!(kind_glyph(voice.kind, voice.private, voice.call), "icons/volume-2.svg");
+        assert_eq!(kind_glyph(ConversationKind::Channel, false, CallSupport::None), "icons/hash.svg");
     }
 }
