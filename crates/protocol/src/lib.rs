@@ -331,7 +331,8 @@ pub struct Occupant {
     #[serde(default, skip_serializing_if = "is_false")]
     pub streaming: bool,
     /// Heard right now, where the network says so to someone in the call (a Tiny server's
-    /// `call.speaking`).
+    /// `call.speaking`), or on stage: a stage channel's platform holds whoever Discord does
+    /// not suppress.
     #[serde(default, skip_serializing_if = "is_false")]
     pub speaking: bool,
 }
