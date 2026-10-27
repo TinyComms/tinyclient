@@ -34,7 +34,7 @@ use gpui::{
 };
 use history::History;
 use pages::Pages;
-use protocol::{AccountKey, Badge, Conversation, ConversationKind, InboxCounts, InboxFilter, Key, Link, Network, Request, Response, PAGE_LIMIT};
+use protocol::{AccountKey, Badge, CallSupport, Conversation, ConversationKind, InboxCounts, InboxFilter, Key, Link, Network, Occupants, Request, Response, PAGE_LIMIT};
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::rc::Rc;
@@ -984,9 +984,13 @@ impl Shell {
         let selected = self.open.as_ref() == Some(&c.key);
         let tone = row_tone(c, selected, true);
         let surface = theme::row_surface(selected);
-        let occupied = c.occupants.as_ref().filter(|inside| inside.total > 0);
-        // An empty voice channel rests at a muted row's weight (`02` §4).
-        let empty_voice = c.kind == ConversationKind::Voice && occupied.is_none() && !selected;
+        let inside = c.occupants.as_ref().filter(|row| row.total > 0);
+        // A stage is Discord's: its row counts who is on stage, not who is in it.
+        let stage = c.key.network == Network::Discord && c.kind == ConversationKind::Voice && c.call == CallSupport::Handoff;
+        let live = stage.then(|| inside.and_then(stage_line)).flatten();
+        // An empty voice channel rests at a muted row's weight, and a stage with nobody on
+        // stage reads as one (`02` §4).
+        let empty_voice = c.kind == ConversationKind::Voice && (inside.is_none() || (stage && live.is_none())) && !selected;
         let title_color = if empty_voice { theme::text_faint() } else { tone.title };
         let leading = match c.kind {
             ConversationKind::Direct | ConversationKind::Group => self.conversation_avatar(c, 20., surface, cx).into_any_element(),
@@ -1003,7 +1007,7 @@ impl Shell {
             .and_then(|peer| self.people_state.hub().person(&Key { id: peer.clone(), ..c.key.clone() }))
             .map(|person| person.emoji)
             .filter(|emoji| !emoji.is_empty());
-        let limit = occupied.map(|inside| inside.total.to_string());
+        let limit = if stage { None } else { inside.map(|row| row.total.to_string()) };
         let draft = (!self.draft_of(c).is_empty() && !selected).then(|| glyph("icons/pencil.svg", 14., theme::text_faint()));
         let (picked, menu_row) = (c.clone(), c.clone());
         let content = div()
@@ -1025,6 +1029,7 @@ impl Shell {
             .child(div().flex_1())
             .children(draft)
             .children(limit.map(|total| div().flex_none().flex().items_center().gap(px(2.)).child(glyph("icons/volume-2.svg", 12., theme::text_faint())).child(div().type_micro().text_color(theme::text_faint()).child(total))))
+            .children(live.map(|line| div().flex_none().type_micro().text_color(theme::text_faint()).child(line)))
             .children(row_badge(c));
         list_row(row_id("tree", &c.key), theme::row_height(theme::ROW_ONE), selected, focused, content)
             .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| this.pick_row(&picked, cx)))
@@ -1470,6 +1475,13 @@ impl Shell {
     }
 }
 
+/// A stage channel's trailing words: only who is on stage counts, the audience does not.
+/// Nobody on stage reads as an empty channel, so nothing (`02` §4).
+fn stage_line(occupants: &Occupants) -> Option<String> {
+    let speaking = occupants.people.iter().filter(|occupant| occupant.speaking).count();
+    (speaking > 0).then(|| format!("Live · {speaking} speaking"))
+}
+
 /// A tree row's name: a channel without its `#`; a Slack group DM by first names, "Mara,
 /// Dev, +2", which would otherwise truncate to nothing.
 fn tree_title(c: &Conversation) -> String {
@@ -1591,5 +1603,25 @@ pub(crate) mod tests {
         assert_eq!(on_screen(&list, 40, |_| 48.), 0..19);
         list.scroll_to(gpui::ListOffset { item_ix: 5, offset_in_item: px(10.) });
         assert_eq!(on_screen(&list, 40, |_| 100.).start, 5);
+    }
+
+    fn on_stage(speaking: &[bool]) -> Occupants {
+        let person = row("2001", ConversationKind::Voice).key;
+        Occupants {
+            people: speaking
+                .iter()
+                .map(|live| protocol::Occupant { person: person.clone(), name: "Mara O".into(), muted: false, deafened: false, streaming: false, speaking: *live })
+                .collect(),
+            total: speaking.len() as u32,
+        }
+    }
+
+    #[test]
+    fn a_stage_row_says_who_is_live_and_an_audience_only_one_reads_as_empty() {
+        assert_eq!(stage_line(&on_stage(&[false, true, true])).as_deref(), Some("Live · 2 speaking"));
+        assert_eq!(stage_line(&on_stage(&[true])).as_deref(), Some("Live · 1 speaking"));
+        // Only the audience: the design's empty stage, so no words trail.
+        assert_eq!(stage_line(&on_stage(&[false, false])), None);
+        assert_eq!(stage_line(&Occupants::default()), None);
     }
 }

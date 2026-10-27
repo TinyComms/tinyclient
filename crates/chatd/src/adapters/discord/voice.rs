@@ -127,6 +127,9 @@ pub struct Heard {
     muted: bool,
     deafened: bool,
     streaming: bool,
+    /// On a stage's platform (`suppress` false there): who the channel hears. A voice
+    /// channel's states never have it true, whatever `suppress` says there.
+    live: bool,
 }
 
 impl Heard {
@@ -290,7 +293,7 @@ impl Discord {
                     muted: heard.muted,
                     deafened: heard.deafened,
                     streaming: heard.streaming,
-                    speaking: false,
+                    speaking: heard.live,
                 });
                 let people: Vec<Occupant> = people.collect();
                 state.voice.told.insert(channel.clone(), guild);
@@ -346,6 +349,14 @@ impl Discord {
         if states.is_empty() {
             return;
         }
+        // The stages among the channels touched: `suppress` there picks the audience from the
+        // platform. In a voice channel it is Discord's server mute instead, and nobody in one
+        // is ever counted as on stage.
+        let touched: HashSet<&str> = states.iter().filter_map(|voice| voice.channel_id.as_deref()).collect();
+        let stages: HashSet<&str> = touched
+            .into_iter()
+            .filter(|channel| self.ctx.known(channel).ok().flatten().is_some_and(|row| row.call == CallSupport::Handoff))
+            .collect();
         let mut changed = BTreeSet::new();
         {
             let mut state = self.state.lock().unwrap();
@@ -371,6 +382,7 @@ impl Discord {
                     muted: voice.self_mute || voice.mute,
                     deafened: voice.self_deaf || voice.deaf,
                     streaming: voice.self_stream || voice.self_video,
+                    live: stages.contains(channel.as_str()) && !voice.suppress,
                 };
                 changed.insert(channel.clone());
                 state.voice.states.insert(voice.user_id.clone(), heard);

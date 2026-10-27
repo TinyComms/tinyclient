@@ -719,6 +719,10 @@ pub struct VoiceState {
     pub mute: bool,
     #[serde(default, deserialize_with = "nullable")]
     pub deaf: bool,
+    /// An audience seat on a stage. In a voice channel the word means Discord's server mute,
+    /// so it is only read for stages.
+    #[serde(default, deserialize_with = "nullable")]
+    pub suppress: bool,
     #[serde(default, deserialize_with = "nullable")]
     pub self_stream: bool,
     #[serde(default, deserialize_with = "nullable")]
