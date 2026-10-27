@@ -105,7 +105,7 @@ Costs that shape the design:
 ## 5. Search
 
 Two layers, one result list.
-- **Local (every keystroke):** SQLite FTS5 over cached message bodies and all names. Offline,
+- **Local (every keystroke):** the cached message bodies, searched as text. Offline,
   instant, covers only what has been opened or received. Rows are labelled "cached".
 - **Network (on Enter):** the server search above, merged by message id. A line says what was
   searched: "Searched Slack · acme", or "Discord search isn't ready for this server yet" (the `202`).
