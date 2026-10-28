@@ -544,6 +544,8 @@ impl Shell {
             choices: prefs::choices(),
             kept: self.prefs_kept.clone(),
             autoplay: super::anim::autoplay(),
+            tiny_gains: self.tiny_state.gains_kept(),
+            tiny_members: self.tiny_state.members_open(),
         }
     }
 

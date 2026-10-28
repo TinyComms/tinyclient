@@ -103,6 +103,11 @@ pub struct Prefs {
     /// Lines this build does not know, as they were.
     pub kept: Vec<String>,
     pub autoplay: Autoplay,
+    /// Each Tiny server person's volume and mute for me: server, user, percent, muted. Only
+    /// those away from 100 % and heard.
+    pub tiny_gains: Vec<(String, String, u16, bool)>,
+    /// The Tiny server's member list is shown beside the pane.
+    pub tiny_members: bool,
 }
 
 impl Default for Prefs {
@@ -120,6 +125,8 @@ impl Default for Prefs {
             choices: Choices::default(),
             kept: Vec::new(),
             autoplay: Autoplay::Always,
+            tiny_gains: Vec::new(),
+            tiny_members: true,
         }
     }
 }
@@ -207,6 +214,15 @@ pub fn parse(text: &str) -> Prefs {
             "emoticons" => prefs.choices.emoticons = fields.next() == Some("on"),
             "images" => prefs.choices.images = fields.next() != Some("click"),
             "updates" => prefs.choices.updates = fields.next() != Some("off"),
+            "tiny_gain" => {
+                let fields: Vec<&str> = fields.collect();
+                if let [server, user, percent, muted] = fields[..] {
+                    if let Ok(percent) = percent.parse::<u16>() {
+                        prefs.tiny_gains.push((server.to_owned(), user.to_owned(), percent.min(protocol::GAIN_MAX), muted == "muted"));
+                    }
+                }
+            }
+            "tiny_members" => prefs.tiny_members = fields.next() != Some("off"),
             "settings_section" => prefs.choices.section = fields.next().and_then(Section::from_word).unwrap_or(Section::Accounts),
             _ if !line.trim().is_empty() => prefs.kept.push(line.to_owned()),
             _ => {}
@@ -261,6 +277,12 @@ pub fn write(prefs: &Prefs) -> String {
         text.push_str(line);
         text.push('\n');
     }
+    for (server, user, percent, muted) in &prefs.tiny_gains {
+        text.push_str(&format!("tiny_gain\t{}\t{}\t{percent}\t{}\n", clean(server), clean(user), if *muted { "muted" } else { "heard" }));
+    }
+    if !prefs.tiny_members {
+        text.push_str("tiny_members\toff\n");
+    }
     if prefs.autoplay != Autoplay::default() {
         text.push_str(&format!("autoplay\t{}\n", prefs.autoplay.word()));
     }
@@ -305,6 +327,8 @@ mod tests {
             choices: Choices { compact: true, previews: false, command_return: true, newest: true, typing: false, emoticons: true, images: false, updates: false, section: Section::Audio },
             kept: Vec::new(),
             autoplay: Autoplay::Hover,
+            tiny_gains: vec![("srv".into(), "u1".into(), 150, false), ("srv".into(), "u2".into(), 100, true)],
+            tiny_members: false,
         };
         let read = parse(&write(&saved));
         assert_eq!(read, Prefs { open: Some((key(Network::Discord, "c1"), "#general with a tab".into())), ..saved.clone() });

@@ -771,14 +771,18 @@ impl Shell {
         cx.notify();
     }
 
-    pub(super) fn tiny_hover_card(&mut self, card: Option<(String, f32)>, cx: &mut Context<Self>) {
-        if self.tiny_state.float.is_some() && card.is_some() {
+    /// The pointer came onto a member's row, or left it. Leaving one row for the next may be
+    /// told after arriving, so only the card of the row left is put away.
+    pub(super) fn tiny_hover_card(&mut self, user_id: &str, over: bool, y: f32, cx: &mut Context<Self>) {
+        let card = &mut self.tiny_state.card;
+        if over && self.tiny_state.float.is_none() {
+            *card = Some((user_id.to_owned(), y));
+        } else if !over && card.as_ref().is_some_and(|(shown, _)| shown == user_id) {
+            *card = None;
+        } else {
             return;
         }
-        if self.tiny_state.card != card {
-            self.tiny_state.card = card;
-            cx.notify();
-        }
+        cx.notify();
     }
 
     /// Escape, from the window's keys: the top layer here closes first. False when nothing here

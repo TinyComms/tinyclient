@@ -216,7 +216,10 @@ fn shell_bindings() -> Vec<KeyBinding> {
 /// menu opened at the window's edges), `--text-step N`, `--start-chatd` (let the shot start
 /// chatd when it is not running; off by default so a shot leaves no process behind),
 /// `--autoplay always|hover|never` (when GIFs play), `--frames N` (N frames 150 ms apart, as
-/// `out-1.png` …, to see moving pictures move).
+/// `out-1.png` …, to see moving pictures move). On a Tiny server (`--mode tiny`): `--tiny-room
+/// N` (the Nth channel), `--tiny-menu header|channel|person:N` (N: the Nth seat, `:sub` adds its
+/// Move submenu), `--tiny-modal invite|code|kick|ban|profile`, `--tiny-settings`, `--tiny-card N`
+/// (the Nth member's hover card).
 #[cfg(feature = "gui-shot")]
 mod shot {
     use super::layout::{Menu, RightKind, RightPane};
@@ -261,6 +264,7 @@ mod shot {
                     Some("people") => shell.go(Mode::People, cx),
                     Some("discord") => shell.go(Mode::Network(Network::Discord), cx),
                     Some("slack") => shell.go(Mode::Network(Network::Slack), cx),
+                    Some("tiny") => shell.go(Mode::Network(Network::Tiny), cx),
                     Some("space") => {
                         if let Some(space) = shell.spaces.get(space) {
                             shell.go(Mode::Space(space.key.clone()), cx);
@@ -350,6 +354,7 @@ mod shot {
                 if has("--components") {
                     shell.sheet = true;
                 }
+                shell.tiny_shot(flag, window, cx);
                 cx.notify();
             }
         }

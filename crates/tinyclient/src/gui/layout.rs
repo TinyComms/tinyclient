@@ -344,6 +344,8 @@ impl Shell {
             self.close_switcher(window, cx);
         } else if self.layout_state.menu.is_some() {
             self.layout_state.menu = None;
+        } else if self.tiny_escape(cx) {
+            return true;
         } else if self.layout_state.floating {
             self.layout_state.floating = false;
         } else {
@@ -956,6 +958,7 @@ impl Render for Shell {
                 )
             })
             .children(self.switcher(window, cx))
+            .children(self.tiny_layer(window, cx))
             .children(self.menu_layer(snapshot, plan.sidebar.unwrap_or(state.sidebar_width), overview, window, cx))
             .children(self.toast_layer(width, cx))
             .children(window_chrome(window))
