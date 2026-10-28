@@ -34,7 +34,7 @@ fn build(user_agent: &str) -> Option<u64> {
         return None;
     }
     let agent: ureq::Agent = ureq::Agent::config_builder()
-        .tls_config(TlsConfig::builder().provider(TlsProvider::NativeTls).build())
+        .tls_config(TlsConfig::builder().provider(TlsProvider::NativeTls).root_certs(ureq::tls::RootCerts::PlatformVerifier).build())
         .timeout_global(Some(BUILD_PATIENCE))
         .http_status_as_error(false)
         .user_agent(user_agent)

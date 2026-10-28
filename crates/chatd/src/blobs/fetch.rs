@@ -113,7 +113,7 @@ pub fn cap(file: &MediaFile, cache: u64) -> u64 {
 
 pub fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
-        .tls_config(TlsConfig::builder().provider(TlsProvider::NativeTls).build())
+        .tls_config(TlsConfig::builder().provider(TlsProvider::NativeTls).root_certs(ureq::tls::RootCerts::PlatformVerifier).build())
         .timeout_connect(Some(Duration::from_secs(10)))
         .timeout_recv_response(Some(Duration::from_secs(30)))
         // A large file on a slow line is still one download, so no limit on the whole call.
