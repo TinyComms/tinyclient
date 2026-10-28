@@ -13,7 +13,8 @@
 //! her own number); Tobin Reyes (7003); a group "Trail crew" (8001); a channel "Field Notes"
 //! (9001, muted, with a sponsored message); a forum "Workshop" (9002) with topics General and
 //! "Tools" (31). The phone +1 555 010 0142 signs in with the code 24680; +1 555 010 0199 also
-//! wants the password "correct horse".
+//! wants the password "correct horse". Username resolution serves only `gif` and `forest_wren`;
+//! `flood_wait` returns a flood wait, and every other name returns USERNAME_NOT_OCCUPIED.
 
 use super::peers::Who;
 use super::wire::{Event, Fault, Wire};
@@ -435,6 +436,25 @@ fn asked<R: RemoteCall + Identifiable + Deserializable>(body: &[u8]) -> Option<R
 
 fn answer<T: Serializable>(value: T) -> Result<Vec<u8>, Fault> {
     Ok(value.to_bytes())
+}
+
+// Keep these large schema values off the upload thread's small request-handler stack.
+#[inline(never)]
+fn resolve_username(username: &str) -> Result<Vec<u8>, Fault> {
+    if username == "flood_wait" {
+        return Err(rpc(420, "FLOOD_WAIT", Some(60)));
+    }
+    let (id, first, last, handle) = if username.eq_ignore_ascii_case("forest_wren") {
+        (7_011, "Robin", "Vale", "forest_wren")
+    } else if username == "gif" {
+        (GIF_BOT, "GIF Search", "", "gif")
+    } else {
+        return Err(rpc(400, "USERNAME_NOT_OCCUPIED", None));
+    };
+    let found = tl::types::contacts::ResolvedPeer {
+        peer: Who::User(id).peer(), chats: Vec::new(), users: vec![user(id, first, last, handle).into()],
+    };
+    answer(tl::enums::contacts::ResolvedPeer::Peer(found))
 }
 
 fn input_who(peer: &tl::enums::InputPeer) -> Who {
@@ -1242,18 +1262,7 @@ impl World {
         }
         if let Some(request) = asked::<f::contacts::ResolveUsername>(body) {
             self.log(&format!("ResolveUsername {}", request.username));
-            if request.username.eq_ignore_ascii_case("forest_wren") {
-                let found = tl::types::contacts::ResolvedPeer {
-                    peer: Who::User(7_011).peer(), chats: Vec::new(),
-                    users: vec![user(7_011, "Robin", "Vale", "forest_wren").into()],
-                };
-                return Some(answer(tl::enums::contacts::ResolvedPeer::Peer(found)));
-            }
-            if request.username != "gif" {
-                return Some(Err(rpc(400, "USERNAME_NOT_OCCUPIED", None)));
-            }
-            let found = tl::types::contacts::ResolvedPeer { peer: Who::User(GIF_BOT).peer(), chats: Vec::new(), users: vec![user(GIF_BOT, "GIF Search", "", "gif").into()] };
-            return Some(answer(tl::enums::contacts::ResolvedPeer::Peer(found)));
+            return Some(resolve_username(&request.username));
         }
         if let Some(request) = asked::<f::messages::GetInlineBotResults>(body) {
             self.log(&format!("GetInlineBotResults {} {}", request.query, request.offset));

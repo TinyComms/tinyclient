@@ -429,6 +429,8 @@ impl Shell {
             return;
         }
         let network = narrowed(&query).0;
+        // Keep an explicit @ for networks that resolve complete usernames separately.
+        let name = narrowed(&query).1.to_owned();
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(PAUSE).await;
             let _ = this.update(cx, |this, cx| {

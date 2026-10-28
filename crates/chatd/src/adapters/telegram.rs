@@ -503,18 +503,20 @@ fn serve(account: &Arc<Account>, command: Command) {
         }
         Command::Typing(conversation_id) => typing(account, &conversation_id),
         Command::SearchPeople(query) => {
-            // Global search is ranked and limited. Resolve a complete username as well so a
-            // public user outside our contacts can be found even when absent from that list.
-            let username = query.trim().trim_start_matches('@');
-            if !username.is_empty() && username.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_') {
-                let request = tl::functions::contacts::ResolveUsername { username: username.to_owned(), referer: None };
-                if let Ok(tl::enums::contacts::ResolvedPeer::Peer(found)) = account.ask(&request) {
-                    account.learn(&found.users, &found.chats);
-                }
-            }
             let request = tl::functions::contacts::Search { broadcasts: false, bots: false, q: query.clone(), limit: 25 };
             if let Ok(tl::enums::contacts::Found::Found(found)) = account.ask(&request) {
                 account.learn(&found.users, &[]);
+            }
+            // Resolving is tightly flood-limited: only an explicit, complete @username asks
+            // for it, after ranked search. Never hold queued sends up waiting out a flood.
+            if let Some(username) = query.trim().strip_prefix('@').filter(|name| {
+                (5..=32).contains(&name.len()) && name.as_bytes()[0].is_ascii_alphabetic()
+                    && name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
+            }) {
+                let request = tl::functions::contacts::ResolveUsername { username: username.to_owned(), referer: None };
+                if let Ok(tl::enums::contacts::ResolvedPeer::Peer(found)) = wire::call(account.wire.as_ref(), &request) {
+                    account.learn(&found.users, &[]);
+                }
             }
             ctx.searched(&query);
         }
