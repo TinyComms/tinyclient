@@ -19,6 +19,8 @@ pub const ME: &str = "phone-ada";
 pub const GRACE: &str = "phone-grace";
 pub const ALAN: &str = "phone-alan";
 pub const CLUB: &str = "phone-club";
+/// Grace as a participant of her chat: whose picture the phone is asked for.
+pub const GRACE_PARTICIPANT: &str = "participant-grace";
 pub const LINK: &str = "https://support.google.com/messages/?p=web_computer#?c=ZmFrZS0x";
 pub const LINK_AGAIN: &str = "https://support.google.com/messages/?p=web_computer#?c=ZmFrZS0y";
 
@@ -51,6 +53,7 @@ impl Fake {
                 group: false,
                 unread: false,
                 mine: ME.into(),
+                peer: GRACE_PARTICIPANT.into(),
             },
             Chat {
                 id: CLUB.into(),
@@ -58,6 +61,7 @@ impl Fake {
                 group: true,
                 unread: true,
                 mine: ME.into(),
+                peer: String::new(),
             },
         ]));
         let fake = Fake {
@@ -351,6 +355,14 @@ impl Drive for Fake {
     ) -> Result<Vec<u8>, String> {
         record(&format!("fetch {message} {media_id}"));
         Ok(png())
+    }
+    fn thumbnails(&self, participants: &[String]) -> Result<Vec<(String, Vec<u8>)>, String> {
+        record(&format!("thumbnails {}", participants.join(" ")));
+        Ok(participants
+            .iter()
+            .filter(|participant| *participant == GRACE_PARTICIPANT)
+            .map(|participant| (participant.clone(), png()))
+            .collect())
     }
     fn mark_read(&self, conversation: &str, message: &str) -> Result<(), String> {
         record(&format!("read {conversation} {message}"));

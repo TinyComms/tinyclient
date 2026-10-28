@@ -251,6 +251,14 @@ impl Wire for Fake {
         Ok(())
     }
 
+    /// Grace has a profile picture (one pixel); nobody else has one.
+    fn picture(&self, of: &Peer) -> Result<Option<Vec<u8>>, Fault> {
+        record(&format!("picture {}", describe(of)));
+        const PNG: &str = "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de0000000c4944415408d763f8cfc0000000020001e221bc330000000049454e44ae426082";
+        let png = (0..PNG.len()).step_by(2).filter_map(|at| u8::from_str_radix(&PNG[at..at + 2], 16).ok()).collect();
+        Ok((*of == Peer::Direct(GRACE.to_owned())).then_some(png))
+    }
+
     fn close(&self) {
         // The reader sees it within 20 ms and stops.
         self.closed.store(true, Ordering::Relaxed);
