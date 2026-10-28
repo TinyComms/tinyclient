@@ -475,6 +475,22 @@ pub struct Conversation {
     /// My newest message has been read by the other side (Telegram's ✓✓, Teams' "Seen").
     #[serde(default, skip_serializing_if = "is_false")]
     pub seen: bool,
+    /// My newest message has reached the other side's device (Signal's and Google Messages'
+    /// second tick). `seen` implies it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub delivered: bool,
+    /// My newest message is still going.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sending: bool,
+}
+
+/// What became of my newest message, as its mark says it (`design/06-live-signals.md` §4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Receipt {
+    Sending,
+    Sent,
+    Delivered,
+    Read,
 }
 
 impl Conversation {
@@ -521,6 +537,23 @@ impl Conversation {
             preview_from: String::new(),
             preview_mine: false,
             seen: false,
+            delivered: false,
+            sending: false,
+        }
+    }
+
+    /// The mark on my newest message. `None` when the newest is not mine.
+    pub fn receipt(&self) -> Option<Receipt> {
+        if !self.preview_mine {
+            None
+        } else if self.sending {
+            Some(Receipt::Sending)
+        } else if self.seen {
+            Some(Receipt::Read)
+        } else if self.delivered {
+            Some(Receipt::Delivered)
+        } else {
+            Some(Receipt::Sent)
         }
     }
 
@@ -1803,6 +1836,26 @@ mod tests {
             muted,
             ..Conversation::new(key, kind, "#platform")
         }
+    }
+
+    #[test]
+    fn my_newest_message_says_sending_sent_delivered_or_read_and_an_old_row_still_decodes() {
+        let mut c = row(ConversationKind::Direct, 0, 0, false);
+        assert_eq!(c.receipt(), None);
+        c.preview_mine = true;
+        assert_eq!(c.receipt(), Some(Receipt::Sent));
+        c.delivered = true;
+        assert_eq!(c.receipt(), Some(Receipt::Delivered));
+        c.seen = true;
+        assert_eq!(c.receipt(), Some(Receipt::Read));
+        c.sending = true;
+        assert_eq!(c.receipt(), Some(Receipt::Sending));
+        // A chatd from before the second tick says neither.
+        let mut old = serde_json::to_value(row(ConversationKind::Direct, 0, 0, false)).unwrap();
+        old["preview_mine"] = serde_json::json!(true);
+        assert!(old.get("delivered").is_none() && old.get("sending").is_none());
+        let old: Conversation = serde_json::from_value(old).unwrap();
+        assert_eq!(old.receipt(), Some(Receipt::Sent));
     }
 
     #[test]

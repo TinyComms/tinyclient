@@ -55,8 +55,9 @@ invents a Space (03 §2.1, 04 §2.1).
 | Telegram 777000 | Telegram icon 32 | `badge-check` | codes in full; read-only, no Call, never muted |
 | Scam / Fake | as its kind | danger tag `Scam` / `Fake`, always | outranks verified |
 
-- **Ticks** lead line 2, so the right side keeps two marks (C3): `check` (sent, `text_faint`) or `check-check` (read,
-  `text_soft`) 14, then 4; pending is `clock` 12. Only on my last message, in person and group chats.
+- **Ticks** lead line 2, so the right side keeps two marks (C3): `check` (sent, `text_faint`) or `check-check` (delivered,
+  `text_faint`; read, `text_soft`) 14, then 4; pending is `clock` 12. Only on my last message, in person and group chats,
+  on every network and in the Inbox; Discord and Slack stop at `check`.
 - **Unread reaction (P2):** `heart` 10 `accent_text` in a 16 `accent_soft` disc, in the badge slot only when it is empty.
 - **Tags:** 16 high, radius 4, padding 0 4, 11/500. Neutral (`quiet_fill` + `text_soft`): `bot`, `App`, `External`,
   `Guest`. Danger (`danger_soft` + `danger` 600): `Scam`, `Fake`.

@@ -626,6 +626,31 @@ fn typing_request(conversation: &str) -> Vec<u8> {
     buf.0
 }
 
+/// GetThumbnailRequest: the participants whose pictures are wanted (field 1, repeated).
+fn thumbnail_request(participants: &[String]) -> Vec<u8> {
+    let mut req = Buf::new();
+    for participant in participants {
+        req.text(1, participant);
+    }
+    req.0
+}
+
+/// GetThumbnailResponse: field 1 is repeated Thumbnail, each its participant (1) and its data
+/// (2), whose field 3 is the picture's bytes. Only what reads as a picture is kept: a phone
+/// with no picture for someone leaves them out or sends nothing.
+fn decode_thumbnails(bytes: &[u8]) -> Vec<(String, Vec<u8>)> {
+    fields(bytes)
+        .iter()
+        .filter(|field| field.number == 1)
+        .filter_map(|thumbnail| {
+            let thumbnail = fields(&thumbnail.bytes);
+            let participant = field_text(&thumbnail, 1);
+            let picture = field_bytes(&fields(&field_bytes(&thumbnail, 2)), 3);
+            (!participant.is_empty() && crate::blobs::is_picture(&picture)).then_some((participant, picture))
+        })
+        .collect()
+}
+
 /// Unix seconds from a Bugle timestamp, which arrives in microseconds.
 fn unix_seconds(raw: i64) -> i64 {
     if raw > 10_000_000_000_000_000 {
@@ -644,6 +669,9 @@ pub struct Chat {
     pub group: bool,
     pub unread: bool,
     pub mine: String,
+    /// The other side of a one-to-one chat, by participant id: whose picture the row shows.
+    /// Empty for a group.
+    pub peer: String,
 }
 
 /// One photo or file on a message. Bytes are already opened when the phone sent them inline.
@@ -680,6 +708,26 @@ pub struct Note {
     pub file: bool,
     pub pieces: Vec<Piece>,
     pub reactions: Vec<Mark>,
+    /// The phone's word on the message (`MessageStatus.status`, field 4.2).
+    pub status: u64,
+}
+
+/// What the other side did with one of my messages, as far as the phone knows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Receipt {
+    Delivered,
+    Read,
+}
+
+/// Bugle's `MessageStatusType` for my messages: 2 is OUTGOING_DELIVERED, 11 OUTGOING_DISPLAYED
+/// (read). 1 is OUTGOING_COMPLETE, sent and no more; the failures (8, 9, 13, 17–19, 21, 22, 24,
+/// 27) are left as sent, since a retry here could not reach the phone's copy.
+pub fn receipt(status: u64) -> Option<Receipt> {
+    match status {
+        2 => Some(Receipt::Delivered),
+        11 => Some(Receipt::Read),
+        _ => None,
+    }
 }
 
 struct Live {
@@ -1171,6 +1219,13 @@ impl Session {
         Err("Messages couldn't fetch that file. Keep the phone online.".into())
     }
 
+    /// The pictures the phone keeps for these participants (GetParticipantsThumbnail, as
+    /// messages.google.com asks), as (participant, bytes). Someone with no picture is left out.
+    pub fn thumbnails(&self, participants: &[String]) -> Result<Vec<(String, Vec<u8>)>, String> {
+        let bytes = self.rpc(37, &thumbnail_request(participants), 2)?;
+        Ok(decode_thumbnails(&bytes))
+    }
+
     fn upload(&self, packed: &[u8], mime: &str) -> Result<String, String> {
         let (payload, cookies) = {
             let live = self
@@ -1626,6 +1681,7 @@ fn decode_chats(bytes: &[u8]) -> Vec<Chat> {
         let group = field_int(&conv, 10) != 0;
         let unread = field_int(&conv, 6) != 0;
         let mut mine = field_text(&conv, 11);
+        let mut peer = String::new();
         for person in conv.iter().filter(|field| field.number == 20) {
             let participant = fields(&person.bytes);
             let info = fields(&field_bytes(&participant, 1));
@@ -1639,6 +1695,9 @@ fn decode_chats(bytes: &[u8]) -> Vec<Chat> {
                 }
             };
             let is_me = field_int(&participant, 6) != 0;
+            if !is_me && !group && peer.is_empty() {
+                peer = pid.clone();
+            }
             if is_me && !pid.is_empty() {
                 mine = pid;
             } else if title.is_empty() && !name.is_empty() && !group {
@@ -1663,6 +1722,7 @@ fn decode_chats(bytes: &[u8]) -> Vec<Chat> {
             group,
             unread,
             mine,
+            peer,
         });
     }
     chats
@@ -1870,6 +1930,7 @@ fn decode_messages(bytes: &[u8]) -> Vec<Note> {
             file,
             pieces,
             reactions,
+            status,
         });
     }
     notes
@@ -1924,5 +1985,68 @@ mod tests {
         assert_eq!(notes[0].pieces[0].action_id, "part-1");
         assert_eq!(notes[0].reactions[0].emoji, "👍");
         assert_eq!(notes[0].reactions[0].who, ["phone-grace"]);
+    }
+
+    #[test]
+    fn my_message_says_whether_it_was_delivered_or_read() {
+        let mine = |id: &str, code: u64| {
+            let mut status = Buf::new();
+            status.int(2, code);
+            let mut message = Buf::new();
+            message.text(1, id);
+            message.text(7, "c1");
+            message.msg(4, &status.0);
+            message
+        };
+        let mut wrap = Buf::new();
+        for (id, code) in [("m1", 1), ("m2", 2), ("m3", 11), ("m4", 8)] {
+            wrap.msg(1, &mine(id, code).0);
+        }
+        let notes = decode_messages(&wrap.0);
+        let said: Vec<Option<Receipt>> = notes.iter().map(|note| receipt(note.status)).collect();
+        assert_eq!(said, [None, Some(Receipt::Delivered), Some(Receipt::Read), None]);
+    }
+
+    #[test]
+    fn a_chat_names_the_other_side_and_their_picture_decodes() {
+        let participant = |pid: &str, name: &str, me: bool| {
+            let mut info = Buf::new();
+            info.int(1, 2);
+            info.text(3, pid);
+            let mut person = Buf::new();
+            person.msg(1, &info.0);
+            person.text(3, name);
+            person.int(6, u64::from(me));
+            person.0
+        };
+        let mut conv = Buf::new();
+        conv.text(1, "c1");
+        conv.msg(20, &participant("p-me", "Ada", true));
+        conv.msg(20, &participant("p-grace", "Grace", false));
+        let mut list = Buf::new();
+        list.msg(2, &conv.0);
+        let chats = decode_chats(&list.0);
+        assert_eq!((chats[0].peer.as_str(), chats[0].mine.as_str(), chats[0].title.as_str()), ("p-grace", "p-me", "Grace"));
+        assert_eq!(thumbnail_request(&["p-grace".to_owned()]), {
+            let mut req = Buf::new();
+            req.text(1, "p-grace");
+            req.0
+        });
+
+        let thumbnail = |pid: &str, picture: &[u8]| {
+            let mut data = Buf::new();
+            data.bytes(3, picture);
+            let mut one = Buf::new();
+            one.text(1, pid);
+            one.msg(2, &data.0);
+            one.0
+        };
+        let jpeg = [0xff, 0xd8, 0xff, 0xe0, 1, 2, 3];
+        let mut answer = Buf::new();
+        answer.msg(1, &thumbnail("p-grace", &jpeg));
+        // Someone the phone has no picture for, and something that is not a picture.
+        answer.msg(1, &thumbnail("p-alan", &[]));
+        answer.msg(1, &thumbnail("p-odd", b"<html>"));
+        assert_eq!(decode_thumbnails(&answer.0), [("p-grace".to_owned(), jpeg.to_vec())]);
     }
 }

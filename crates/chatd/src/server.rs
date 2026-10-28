@@ -1733,6 +1733,9 @@ impl Chat {
                 if let Err(err) = prepared {
                     return internal(err);
                 }
+                if retry {
+                    self.blobs.retried(&account, ids);
+                }
                 match self.blobs.request(&account, ids, adapter.clone()) {
                     Ok(files) => {
                         // What the cache has never heard of may be the adapter's to fetch itself.

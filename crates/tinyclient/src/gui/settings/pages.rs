@@ -1066,7 +1066,11 @@ impl SettingsWindow {
     }
 
     fn about(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
-        let version = format!("Version {}", env!("CARGO_PKG_VERSION"));
+        // The commit tells two builds of the same version apart.
+        let version = match crate::update::short_commit() {
+            Some(commit) => format!("Version {} ({commit})", env!("CARGO_PKG_VERSION")),
+            None => format!("Version {}", env!("CARGO_PKG_VERSION")),
+        };
         let plate = div()
             .size(px(96.))
             .rounded(px(22.))
