@@ -116,8 +116,8 @@ pub enum Event {
     Reacted { peer: Peer, by: String, author: String, target: u64, emoji: String, removed: bool },
     /// The user read these messages (author, sent) on another device.
     ReadElsewhere(Vec<(String, u64)>),
-    /// `by` read our messages sent at these times.
-    Seen { by: String, sent: Vec<u64> },
+    /// `by`'s phone received our messages sent at these times, or `by` read them (`read`).
+    Receipt { by: String, sent: Vec<u64>, read: bool },
     Typing { peer: Peer, by: String, name: String, started: bool },
     /// The user's own settings, as the phone shares them.
     Settings { read_receipts: bool, typing: bool },

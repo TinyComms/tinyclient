@@ -680,6 +680,26 @@ pub struct Note {
     pub file: bool,
     pub pieces: Vec<Piece>,
     pub reactions: Vec<Mark>,
+    /// The phone's word on the message (`MessageStatus.status`, field 4.2).
+    pub status: u64,
+}
+
+/// What the other side did with one of my messages, as far as the phone knows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Receipt {
+    Delivered,
+    Read,
+}
+
+/// Bugle's `MessageStatusType` for my messages: 2 is OUTGOING_DELIVERED, 11 OUTGOING_DISPLAYED
+/// (read). 1 is OUTGOING_COMPLETE, sent and no more; the failures (8, 9, 13, 17–19, 21, 22, 24,
+/// 27) are left as sent, since a retry here could not reach the phone's copy.
+pub fn receipt(status: u64) -> Option<Receipt> {
+    match status {
+        2 => Some(Receipt::Delivered),
+        11 => Some(Receipt::Read),
+        _ => None,
+    }
 }
 
 struct Live {
@@ -1870,6 +1890,7 @@ fn decode_messages(bytes: &[u8]) -> Vec<Note> {
             file,
             pieces,
             reactions,
+            status,
         });
     }
     notes
@@ -1924,5 +1945,25 @@ mod tests {
         assert_eq!(notes[0].pieces[0].action_id, "part-1");
         assert_eq!(notes[0].reactions[0].emoji, "👍");
         assert_eq!(notes[0].reactions[0].who, ["phone-grace"]);
+    }
+
+    #[test]
+    fn my_message_says_whether_it_was_delivered_or_read() {
+        let mine = |id: &str, code: u64| {
+            let mut status = Buf::new();
+            status.int(2, code);
+            let mut message = Buf::new();
+            message.text(1, id);
+            message.text(7, "c1");
+            message.msg(4, &status.0);
+            message
+        };
+        let mut wrap = Buf::new();
+        for (id, code) in [("m1", 1), ("m2", 2), ("m3", 11), ("m4", 8)] {
+            wrap.msg(1, &mine(id, code).0);
+        }
+        let notes = decode_messages(&wrap.0);
+        let said: Vec<Option<Receipt>> = notes.iter().map(|note| receipt(note.status)).collect();
+        assert_eq!(said, [None, Some(Receipt::Delivered), Some(Receipt::Read), None]);
     }
 }

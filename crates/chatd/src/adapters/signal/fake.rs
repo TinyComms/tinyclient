@@ -186,11 +186,11 @@ fn steer(line: &str) -> Vec<Event> {
             };
             vec![Event::ReadElsewhere(vec![(author.into(), next().parse().unwrap_or(0))])]
         }
-        "seen" => {
+        "seen" | "delivered" => {
             let Some((by, _)) = who(next()) else {
                 return Vec::new();
             };
-            vec![Event::Seen { by: by.into(), sent: vec![next().parse().unwrap_or(0)] }]
+            vec![Event::Receipt { by: by.into(), sent: vec![next().parse().unwrap_or(0)], read: command == "seen" }]
         }
         "typing" | "typing-stop" => {
             let Some((by, name)) = who(next()) else {

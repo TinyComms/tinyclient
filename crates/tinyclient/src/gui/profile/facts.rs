@@ -844,6 +844,8 @@ mod tests {
             preview_from: String::new(),
             preview_mine: false,
             seen: false,
+            delivered: false,
+            sending: false,
         }
     }
 

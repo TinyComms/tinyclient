@@ -407,6 +407,7 @@ fn apply(account: &Account, event: Event) {
             let _ = account
                 .ctx
                 .message(&note.conversation, &message(account, &note));
+            receipt(account, &note.conversation, &note);
         }
         Event::Typing {
             conversation,
@@ -763,11 +764,24 @@ fn outgoing(account: &Account, id: String, text: String) -> Message {
     message
 }
 
+/// The second tick or the read mark, when the phone says one of my messages has it.
+fn receipt(account: &Account, conversation: &str, note: &bugle::Note) {
+    if !(note.outgoing || note.author == account.me) {
+        return;
+    }
+    let _ = match bugle::receipt(note.status) {
+        Some(bugle::Receipt::Delivered) => account.ctx.delivered(conversation, &note.id),
+        Some(bugle::Receipt::Read) => account.ctx.seen(conversation, &note.id),
+        None => Ok(()),
+    };
+}
+
 fn backfill(account: &Account, conversation: &str) {
     match account.drive.history(conversation) {
         Ok(notes) => {
             for note in notes {
                 let _ = account.ctx.message(conversation, &message(account, &note));
+                receipt(account, conversation, &note);
             }
         }
         Err(why) => eprintln!("chatd: Messages: {why}"),

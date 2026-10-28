@@ -508,7 +508,7 @@ fn apply(account: &Account, event: Event) {
             let _ = ctx.reacted(&conversation, &id, &Reaction { emoji, file: None, count: 1, mine }, !removed);
         }
         Event::ReadElsewhere(read) => read_elsewhere(account, &read),
-        Event::Seen { by, sent } => {
+        Event::Receipt { by, sent, read } => {
             let Some(newest) = sent.iter().max().copied() else {
                 return;
             };
@@ -518,7 +518,8 @@ fn apply(account: &Account, event: Event) {
             };
             let conversation = conversation.unwrap_or_else(|| Peer::Direct(by).conversation());
             if let Ok(Some(_)) = ctx.known(&conversation) {
-                let _ = ctx.seen(&conversation, &wire::message_id(newest, &account.me));
+                let id = wire::message_id(newest, &account.me);
+                let _ = if read { ctx.seen(&conversation, &id) } else { ctx.delivered(&conversation, &id) };
             }
         }
         Event::Typing { peer, by, name, started } => {

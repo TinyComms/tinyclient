@@ -120,6 +120,7 @@ fn note(
         file,
         pieces,
         reactions,
+        status: 0,
     }
 }
 

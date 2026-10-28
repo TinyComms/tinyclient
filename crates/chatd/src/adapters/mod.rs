@@ -640,6 +640,16 @@ impl Context {
         Ok(())
     }
 
+    /// My messages up to this one reached the other side's device (Signal's and Google
+    /// Messages' second tick).
+    pub fn delivered(&self, conversation_id: &str, message_id: &str) -> Stores {
+        let conversation = self.key(conversation_id);
+        if self.hub.store().set_delivered(&conversation, message_id)? {
+            self.hub.changed(Change::Conversation { conversation });
+        }
+        Ok(())
+    }
+
     fn row_changed(&self, conversation_id: &str, space: Option<&str>) {
         self.hub.changed(Change::Conversation { conversation: self.key(conversation_id) });
         if let Some(space) = space {
