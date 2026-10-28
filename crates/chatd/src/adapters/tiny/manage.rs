@@ -59,6 +59,8 @@ pub(crate) struct Known {
     pub rooms: Vec<TinyRoom>,
     /// Who sits in each room's call with what the server says of them, from the live socket.
     pub seats: HashMap<String, Vec<TinySeat>>,
+    /// The sign-in provider's name, once asked (empty when the server did not say).
+    pub provider: Option<String>,
 }
 
 static KNOWN: Mutex<BTreeMap<String, Known>> = Mutex::new(BTreeMap::new());

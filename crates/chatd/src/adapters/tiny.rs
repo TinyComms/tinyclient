@@ -724,6 +724,16 @@ pub(crate) fn community(hub: &Hub, account: AccountKey) -> Response {
         .map(|member| member.user_id.clone())
         .collect();
     let media = media_of(&saved.base_url);
+    // The provider's name is asked once per server and kept: it changes only with the server's
+    // own setup.
+    let provider = match known.provider.clone() {
+        Some(provider) => provider,
+        None => {
+            let provider = auth_config(&saved.base_url).unwrap_or_default();
+            manage::remember(&saved, |kept| kept.provider = Some(provider.clone()));
+            provider
+        }
+    };
     let (server, roles, categories, bans) = match extras {
         Some(extras) => (extras.server, extras.roles, extras.categories, extras.bans),
         None => (None, Vec::new(), Vec::new(), Vec::new()),
@@ -745,6 +755,7 @@ pub(crate) fn community(hub: &Hub, account: AccountKey) -> Response {
             roles,
             categories,
             bans,
+            provider,
         },
     }
 }

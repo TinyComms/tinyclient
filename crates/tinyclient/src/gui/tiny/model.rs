@@ -568,6 +568,7 @@ mod tests {
             roles: vec![],
             categories: vec![],
             bans: vec![],
+            provider: String::new(),
         }
     }
 

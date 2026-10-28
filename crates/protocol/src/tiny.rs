@@ -259,6 +259,10 @@ pub struct TinyCommunity {
     /// Only for an account that may ban.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bans: Vec<TinyBan>,
+    /// The sign-in provider's name, as the server's `/v1/auth/config` gives it, filled in by
+    /// chatd. Empty when the server did not say.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub provider: String,
 }
 
 impl TinyCommunity {
