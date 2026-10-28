@@ -1017,9 +1017,14 @@ fn a_voice_server_that_goes_silent_is_given_up_within_ten_seconds() {
     mediad.join(&fake.endpoint(), NO_DAVE);
     // Held open and never answered, not even with TLS.
     let held: Vec<TcpStream> = (0..3).map(|_| fake.accept_tcp(PATIENCE).expect("a try")).collect();
-    let (reason, detail) = match mediad.frames.recv_timeout(Duration::from_secs(11)) {
-        Ok(MediaResponse::Failed { reason, detail }) => (reason, detail),
-        other => panic!("no failure within ten seconds of the join: {other:?} after {:?}", began.elapsed()),
+    // The device watcher may speak up at any moment; only the failure matters here.
+    let (reason, detail) = loop {
+        let left = Duration::from_secs(11).saturating_sub(began.elapsed());
+        match mediad.frames.recv_timeout(left) {
+            Ok(MediaResponse::Failed { reason, detail }) => break (reason, detail),
+            Ok(MediaResponse::DeviceList { .. }) => continue,
+            other => panic!("no failure within ten seconds of the join: {other:?} after {:?}", began.elapsed()),
+        }
     };
     let took = began.elapsed();
     assert!(took < Duration::from_millis(10_300), "{took:?}");
