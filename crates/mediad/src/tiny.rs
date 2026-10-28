@@ -17,14 +17,19 @@
 //!    afresh, since the new speaker's RTP times are not the last one's.
 //!
 //! The devices open only once media flows, so a join that fails never lights the microphone
-//! indicator. Echo is not cancelled, here or in a Discord call: the speaker's sound reaches the
-//! microphone unless the user wears headphones, and the gate only keeps it out while it is
-//! quieter than speech.
+//! indicator. The microphone goes through the same processing as a Discord call (`process`):
+//! the mix played is the echo canceller's reference. Each voice is played at the volume the
+//! user chose for that person, ducked under a priority speaker (`hear`); the encoder runs at the
+//! room's bitrate; and str0m's statistics, once a second, give the round trip and the path for
+//! `Stats`.
 
 use crate::audio::{level, Audio};
 use crate::cue::Playing;
 use crate::framing::Conn;
-use crate::media::{self, announce, mixdown, Devices, Gate, Send, Stream, MICROPHONE_DENIED};
+use crate::hear::Ear;
+use crate::media::{self, announce, finish_cue, listen, mixdown, Devices, Gate, Send, Stream, MICROPHONE_DENIED};
+use crate::process::Processor;
+use crate::stats::Meter;
 use crate::opus::Encoder;
 use crate::permission::{microphone, Microphone};
 use crate::rtp::SILENCE;
@@ -32,7 +37,7 @@ use crate::session::Controls;
 use crate::{out, FRAME, FRAME_SAMPLES};
 use mio::net::{TcpStream, UdpSocket};
 use mio::{Events, Interest, Poll, Token};
-use protocol::{CallFailure, Cue, MediaResponse, TinyOffer, TinySlot};
+use protocol::{CallFailure, CallPath, Cue, MediaResponse, TinyOffer, TinySlot};
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, ErrorKind};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
@@ -116,7 +121,7 @@ impl Offer {
     pub fn new(spec: &TinyOffer) -> io::Result<Offer> {
         let ip = local_ip(&spec.host);
         let (udp, tcp) = transports();
-        let mut rtc = RtcConfig::new().clear_codecs().enable_opus(true, false).build(Instant::now());
+        let mut rtc = RtcConfig::new().clear_codecs().enable_opus(true, false).set_stats_interval(Some(Duration::from_secs(1))).build(Instant::now());
         let candidate = |made: Result<Candidate, str0m::error::IceError>| made.map_err(|err| io::Error::other(format!("candidate: {err:?}")));
         let (mut socket, mut local_udp, mut local_tcp) = (None, None, None);
         if udp {
@@ -209,6 +214,8 @@ struct Call {
     ticks: u64,
     levels: (u8, u8),
     cue: Option<Playing>,
+    processor: Processor,
+    meter: Meter,
 }
 
 /// The RFC 6464 level of a frame, in dBov: 0 is the loudest, -127 silence.
@@ -302,6 +309,17 @@ impl Call {
             Event::Connected => self.up(),
             Event::IceConnectionStateChange(IceConnectionState::Disconnected) => self.down(),
             Event::IceConnectionStateChange(IceConnectionState::Connected | IceConnectionState::Completed) if self.lost.is_some() && self.audio.is_some() => self.up(),
+            Event::PeerStats(stats) => {
+                let pair = stats.selected_candidate_pair.as_ref();
+                self.meter.round_trip(stats.rtt.or_else(|| pair.and_then(|pair| pair.current_round_trip_time)));
+                // Only host candidates are offered: the path is UDP or ICE-TCP, never a relay.
+                if let Some(pair) = pair {
+                    self.meter.path = match pair.protocol {
+                        Protocol::Udp => CallPath::Udp,
+                        _ => CallPath::Tcp,
+                    };
+                }
+            }
             Event::MediaData(data) => {
                 let mid = data.mid.to_string();
                 if !self.slots.contains_key(&mid) {
@@ -319,6 +337,8 @@ impl Call {
                 };
                 let stream = &mut slot.stream;
                 stream.last_packet = Instant::now();
+                // The RTP clock is 48 kHz, as ours.
+                stream.arrivals.arrived(data.time.numer() as u32, data.network_time);
                 stream.heard |= data.data[..] != SILENCE[..];
                 if !self.controls.deafened.load(Ordering::Relaxed) {
                     stream.jitter.insert(**data.seq_range.start() as u16, data.data.to_vec());
@@ -370,7 +390,9 @@ impl Call {
             Protocol::Udp => {
                 if let Some(udp) = &self.link.udp {
                     // A send that fails is a lost packet; ICE notices a dead path.
-                    let _ = udp.send_to(packet, to);
+                    if udp.send_to(packet, to).is_ok() {
+                        self.meter.sent(packet.len());
+                    }
                 }
             }
             Protocol::Tcp => {
@@ -389,6 +411,8 @@ impl Call {
                 let failed = self.link.tcp.get_mut(&to).is_some_and(|(_, conn)| conn.send(packet).is_err());
                 if failed {
                     self.drop_stream(to);
+                } else {
+                    self.meter.sent(packet.len());
                 }
             }
             _ => {}
@@ -410,7 +434,10 @@ impl Call {
             let mut buf = [0; 2000];
             loop {
                 match udp.recv_from(&mut buf) {
-                    Ok((n, source)) => self.packets.push_back((Protocol::Udp, source, buf[..n].to_vec())),
+                    Ok((n, source)) => {
+                        self.meter.received(n);
+                        self.packets.push_back((Protocol::Udp, source, buf[..n].to_vec()));
+                    }
                     Err(err) if err.kind() == ErrorKind::Interrupted => {}
                     // WouldBlock, or an ICMP error for something we sent: nothing more now.
                     Err(_) => break,
@@ -428,8 +455,12 @@ impl Call {
             self.drop_stream(server);
             return;
         }
-        let packets = &mut self.packets;
-        if !conn.read(|frame| packets.push_back((Protocol::Tcp, server, frame))) {
+        let (packets, meter) = (&mut self.packets, &mut self.meter);
+        let read = conn.read(|frame| {
+            meter.received(frame.len());
+            packets.push_back((Protocol::Tcp, server, frame));
+        });
+        if !read {
             self.drop_stream(server);
         }
     }
@@ -472,15 +503,14 @@ impl Call {
         }
     }
 
-    /// The microphone's 20 ms, through the gate. Muted, nothing goes out at all.
+    /// The microphone's 20 ms, through the processing and the gate. Muted, nothing goes out at
+    /// all.
     fn capture(&mut self, audio: &mut Audio) -> u8 {
         let controls = self.controls.clone();
+        self.encoder.set_bitrate(controls.bitrate());
         let muted = controls.muted.load(Ordering::Relaxed);
-        audio.listen(!muted || controls.metering());
         let mut frame = [0i16; FRAME_SAMPLES];
-        let captured = audio.capture(&mut frame);
-        let heard = if captured { level(&frame) } else { 0 };
-        let step = self.gate.step(&frame, captured, muted, heard, controls.tuning().gate);
+        let (step, heard) = listen(&controls, audio, &mut self.processor, &mut self.gate, &mut frame);
         if let Some(speaking) = step.speaking {
             out::send(&MediaResponse::Speaking { user_id: self.user_id.clone(), speaking });
         }
@@ -502,6 +532,8 @@ impl Call {
     /// Everyone's 20 ms, mixed.
     fn play(&mut self, audio: &mut Audio) -> u8 {
         let deafened = self.controls.deafened.load(Ordering::Relaxed);
+        let ear: Ear = self.controls.ear();
+        let ducked = ear.ducking(self.slots.values().map(|slot| (slot.user.as_str(), slot.stream.speaking())));
         let mut mix = [0i32; FRAME_SAMPLES];
         for (mid, slot) in &mut self.slots {
             let loud = if deafened {
@@ -510,9 +542,7 @@ impl Call {
             } else {
                 match slot.stream.pull(&format_args!("slot {mid}")) {
                     Some(frame) => {
-                        for (sum, &sample) in mix.iter_mut().zip(&frame) {
-                            *sum += i32::from(sample);
-                        }
+                        slot.stream.mix_into(&mut mix, &frame, ear.factor(&slot.user, ducked));
                         level(&frame) >= VOICE
                     }
                     None => false,
@@ -524,7 +554,7 @@ impl Call {
                 }
             }
         }
-        mixdown(&mix, &self.controls, &mut self.cue, audio)
+        mixdown(&mix, &self.controls, &mut self.cue, audio, &mut self.processor)
     }
 
     /// The 20 ms of a call whose devices are open. False when the call cannot go on.
@@ -538,6 +568,10 @@ impl Call {
         if self.ticks.is_multiple_of(5) && self.controls.metering() && (input, output) != self.levels {
             self.levels = (input, output);
             out::send(&MediaResponse::Levels { input, output });
+        }
+        if self.ticks.is_multiple_of(SECOND) && self.connected {
+            let stats = self.meter.second(self.slots.values().map(|slot| slot.stream.counts()));
+            self.controls.publish_stats(stats);
         }
         if let Some(devices) = &mut self.devices {
             if self.ticks.is_multiple_of(SECOND) {
@@ -620,6 +654,9 @@ impl Call {
         if self.gate.talking() {
             out::send(&MediaResponse::Speaking { user_id: self.user_id.clone(), speaking: false });
         }
+        if let Some(audio) = &mut self.audio {
+            finish_cue(&self.controls, &mut self.cue, audio);
+        }
         for (mid, slot) in &self.slots {
             let jitter = &slot.stream.jitter;
             eprintln!("mediad: slot {mid}: {} lost ({} rebuilt), {} late", jitter.lost, slot.stream.rebuilt, jitter.late);
@@ -662,6 +699,8 @@ pub fn run(link: Link, user_id: String, controls: Arc<Controls>) {
         ticks: 0,
         levels: (0, 0),
         cue: None,
+        processor: Processor::new(),
+        meter: Meter::new(CallPath::Unknown),
     };
     if let Err(err) = call.register() {
         eprintln!("mediad: the call's socket: {err}");

@@ -1,13 +1,18 @@
 //! `mediad test`: Settings' microphone test (V3) and test sound (S12) when there is no call.
 //!
-//! chatd sends the same frames as to a call (`Tune`, `Devices`, `Meter`, `Cue`), each answered
-//! `Done`. The microphone is open only while the meter is on, the speaker only while a cue
-//! plays, and the process exits once neither has happened for [`IDLE`], when chatd closes our
-//! stdin, or [`METER_LIMIT`] after the meter was turned on.
+//! chatd sends the same frames as to a call (`Tune`, `Devices`, `Processing`, `Meter`, `Cue`),
+//! each answered `Done`. The meter is of the microphone after the call's processing, so the
+//! threshold drawn over it is the one a call would use. `Loopback` also plays the microphone
+//! back on the speaker as others would hear it, with the echo canceller hearing what is played,
+//! so a test on speakers does not howl. The microphone is open only while the meter is on, the
+//! speaker only while a cue or the loopback plays, and the process exits once neither has
+//! happened for [`IDLE`], when chatd closes our stdin, or [`METER_LIMIT`] after the meter was
+//! turned on.
 
 use crate::audio::{level, Audio};
 use crate::cue::Playing;
 use crate::permission::{microphone as microphone_access, Microphone};
+use crate::process::Processor;
 use crate::session::Controls;
 use crate::{media, out, FRAME_SAMPLES};
 use protocol::{read_frame, MediaRequest, MediaResponse};
@@ -53,6 +58,8 @@ pub fn run() {
     let mut metering: Option<Instant> = None;
     let (mut microphone, mut speaker): (Option<Audio>, Option<Audio>) = (None, None);
     let mut playing: Option<Playing> = None;
+    let mut processor = Processor::new();
+    let mut loopback = false;
     let mut drained = Instant::now();
     let mut busy = Instant::now();
     let (mut ticks, mut loudest) = (0u64, 0u8);
@@ -67,7 +74,13 @@ pub fn run() {
                             // A choice made while a device is open takes effect on the next open.
                             (want_input, want_output) = (input, output);
                         }
-                        MediaRequest::Meter { on } => metering = on.then(Instant::now),
+                        MediaRequest::Meter { on } => {
+                            metering = on.then(Instant::now);
+                            loopback &= on;
+                        }
+                        MediaRequest::Loopback { on } => loopback = on,
+                        MediaRequest::Processing(processing) => controls.set_processing(processing),
+                        MediaRequest::Input(mode) => controls.set_input(mode),
                         MediaRequest::Cue { cue } => controls.cue(cue),
                         _ => {
                             out::send(&MediaResponse::Refused { detail: "There is no call.".to_owned() });
@@ -87,6 +100,10 @@ pub fn run() {
             metering = None;
         }
 
+        // What the speaker plays this tick: the microphone, for the loopback, and a cue on top.
+        let mut played = [0i16; FRAME_SAMPLES];
+        let mut play = false;
+        processor.set(controls.processing());
         if metering.is_some() {
             if microphone.is_none() && !Audio::simulated() && microphone_access() == Some(Microphone::Denied) {
                 out::fail(protocol::CallFailure::Audio, media::MICROPHONE_DENIED);
@@ -97,7 +114,12 @@ pub fn run() {
             };
             let mut frame = [0i16; FRAME_SAMPLES];
             if audio.capture(&mut frame) {
+                processor.capture(&mut frame);
                 loudest = loudest.max(level(&frame));
+                if loopback {
+                    played = frame;
+                    play = true;
+                }
             }
             ticks += 1;
             // Ten a second, as in a call.
@@ -114,15 +136,20 @@ pub fn run() {
             playing = Some(Playing::new(cue, f32::from(controls.tuning().cues.min(100)) / 100.));
         }
         if let Some(cue) = &mut playing {
+            play = true;
+            if !cue.mix(&mut played) {
+                playing = None;
+                drained = now + DRAIN;
+            }
+        }
+        if play {
             let audio = match &mut speaker {
                 Some(audio) => audio,
                 None => speaker.insert(Audio::open_sides(None, want_output.clone(), (false, true)).unwrap_or_else(|err| give_up(err))),
             };
-            let mut frame = [0i16; FRAME_SAMPLES];
-            let more = cue.mix(&mut frame);
-            audio.play(&frame);
-            if !more {
-                playing = None;
+            audio.play(&played);
+            processor.render(&played);
+            if loopback {
                 drained = now + DRAIN;
             }
         } else if speaker.is_some() && now > drained {

@@ -993,6 +993,26 @@ impl Context {
         self.hub.calls.end_if(&self.hub, &self.key(conversation_id))
     }
 
+    /// A Tiny server moved us from one room to another: the call there, its mediad, devices,
+    /// mute and deafen, now belong to the new room. False when no call was in `from`.
+    pub fn tiny_moved(&self, from: &str, to: &str) -> bool {
+        self.hub.calls.retarget(&self.hub, &self.key(from), self.key(to))
+    }
+
+    /// A Tiny room's bitrate and whether it requires push-to-talk, for the call in it.
+    pub fn tiny_room(&self, conversation_id: &str, kbps: u32, push_to_talk: bool) {
+        if self.in_call(conversation_id) {
+            self.hub.calls.tiny_room(&self.hub, &self.key(conversation_id), kbps, push_to_talk);
+        }
+    }
+
+    /// Tells the call's mediad, if there is one: who holds priority speech.
+    pub fn tell_media(&self, conversation_id: &str, request: protocol::MediaRequest) {
+        if self.in_call(conversation_id) {
+            let _ = self.hub.calls.request(&self.hub, &request);
+        }
+    }
+
     /// The call is up for this conversation, with its mediad.
     pub fn in_call(&self, conversation_id: &str) -> bool {
         let (call, running) = self.hub.calls.describe();

@@ -21,6 +21,9 @@ pub struct Encoder {
     state: *mut OpusEncoder,
     /// One channel: each stereo frame is folded to mono before it is encoded.
     mono: bool,
+    /// The bitrate it was made at, and the one it encodes at now.
+    default: i32,
+    bitrate: i32,
 }
 
 // One thread owns each codec; the pointer is to plain heap state.
@@ -57,7 +60,24 @@ impl Encoder {
             opus_encoder_ctl!(state, OPUS_SET_PACKET_LOSS_PERC_REQUEST, 10);
             opus_encoder_ctl!(state, OPUS_SET_DTX_REQUEST, i32::from(dtx));
         }
-        Some(Encoder { state, mono: channels == 1 })
+        Some(Encoder { state, mono: channels == 1, default: bitrate, bitrate })
+    }
+
+    /// Encodes at `bitrate` bits a second from the next frame on (a Tiny room's, `Bitrate`);
+    /// `None` goes back to the rate it was made at.
+    pub fn set_bitrate(&mut self, bitrate: Option<i32>) {
+        let wanted = bitrate.unwrap_or(self.default);
+        if wanted != self.bitrate {
+            // SAFETY: `state` is a live encoder and the request takes one i32.
+            unsafe {
+                opus_encoder_ctl!(self.state, OPUS_SET_BITRATE_REQUEST, wanted);
+            }
+            self.bitrate = wanted;
+        }
+    }
+
+    pub fn bitrate(&self) -> i32 {
+        self.bitrate
     }
 
     /// One 20 ms frame of interleaved stereo in, one Opus packet out.

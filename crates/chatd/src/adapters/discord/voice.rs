@@ -241,6 +241,7 @@ impl Discord {
                     speaking: false,
                     muted: heard.muted,
                     deafened: heard.deafened,
+                    ..Participant::default()
                 })
                 .collect();
             let answered = call.ring && !call.answered && !participants.is_empty();

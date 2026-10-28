@@ -69,7 +69,7 @@ pub enum CallState {
     Failed { reason: CallFailure, detail: String },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Participant {
     /// The person's id on the call's account.
     pub id: String,
@@ -80,6 +80,17 @@ pub struct Participant {
     pub muted: bool,
     #[serde(default)]
     pub deafened: bool,
+    /// A Tiny server's moderators muted or deafened them in this room.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub server_muted: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub server_deafened: bool,
+    /// They may not speak in this room: nothing of theirs is heard.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub suppressed: bool,
+    /// Holding priority speech: while they talk, everyone else is quieter.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub priority: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -207,6 +218,105 @@ pub enum MediaRequest {
     TinyAnswer { sdp: String },
     /// The server's whole map of receive slots, whenever it changes.
     TinySlots { audio: Vec<TinySlot> },
+
+    // What the shell and the room decide about the sound, for mediad to apply. Each is answered
+    // `Done`, and each holds until sent again.
+    /// One participant's voice for us alone: `percent` from 0 to [`GAIN_MAX`] (100 is as
+    /// decoded), and `muted` drops it entirely. Sent for each participant whose choice is not
+    /// the default; a participant never named is at 100 and heard.
+    Gain { user_id: String, percent: u16, muted: bool },
+    /// How our microphone opens: by voice activation, or only while push-to-talk is held.
+    Input(InputMode),
+    /// The push-to-talk key (`priority` false) or the priority key (`priority` true) is down
+    /// or up; each is tracked on its own, so letting go of one while the other is held keeps
+    /// the microphone open. In voice activation the plain key does nothing; the priority key
+    /// opens the microphone in either mode, since speaking over everyone is its point.
+    Talk { held: bool, priority: bool },
+    /// Who in the call holds priority speech now. While any of them is speaking, everyone else
+    /// is played [`PRIORITY_DUCK_DB`] quieter.
+    Priority { user_ids: Vec<String> },
+    /// Echo cancellation, noise suppression and automatic gain on the microphone.
+    Processing(AudioProcessing),
+    /// What our voice is encoded at, in kb/s (a Tiny room's bitrate, 16 to 128).
+    Bitrate { kbps: u32 },
+    /// How the connection is doing. Answered `Stats`, or `Refused` before media flows.
+    Stats,
+    /// Settings' microphone test plays the microphone back on the speaker, through the same
+    /// processing a call uses. Only in `mediad test`; a call refuses it.
+    Loopback { on: bool },
+}
+
+/// The loudest one participant may be set, in percent.
+pub const GAIN_MAX: u16 = 200;
+/// How much quieter everyone else is while a priority speaker talks.
+pub const PRIORITY_DUCK_DB: u8 = 12;
+
+/// How the microphone opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum InputMode {
+    /// Open while our level is at `threshold` (0 to 100, as `Tuning::gate` and the meter) or
+    /// above.
+    Voice { threshold: u8 },
+    /// Open only while the key is held, and `release_ms` after it is let go, so the last word
+    /// is not cut.
+    PushToTalk { release_ms: u16 },
+}
+
+impl Default for InputMode {
+    fn default() -> InputMode {
+        InputMode::Voice { threshold: Tuning::default().gate }
+    }
+}
+
+/// The microphone's processing. All on unless the user turned one off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AudioProcessing {
+    pub echo_cancellation: bool,
+    pub noise_suppression: bool,
+    pub auto_gain: bool,
+}
+
+impl Default for AudioProcessing {
+    fn default() -> AudioProcessing {
+        AudioProcessing { echo_cancellation: true, noise_suppression: true, auto_gain: true }
+    }
+}
+
+/// How the media gets to the server.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CallPath {
+    #[default]
+    Unknown,
+    /// Straight over UDP: the best there is.
+    Udp,
+    /// Over TCP (ICE-TCP), when UDP is blocked.
+    Tcp,
+    /// Through a relay.
+    Relay,
+}
+
+/// The connection as it is now, over the last few seconds.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallStats {
+    /// Round trip, in milliseconds. 0 until measured.
+    #[serde(default)]
+    pub rtt_ms: u32,
+    #[serde(default)]
+    pub jitter_ms: u32,
+    /// Packets lost of every thousand received.
+    #[serde(default)]
+    pub loss_permille: u16,
+    #[serde(default)]
+    pub send_kbps: u32,
+    #[serde(default)]
+    pub receive_kbps: u32,
+    #[serde(default)]
+    pub path: CallPath,
+    /// As `opus`. Empty when not known.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub codec: String,
 }
 
 /// What the user chose for a call's sound. Percentages, 0 to 100.
@@ -244,6 +354,10 @@ pub enum Cue {
     Undeafened,
     Lost,
     Back,
+    /// A moderator moved us to another room (S7, with joins and leaves).
+    Moved,
+    /// We were put out of the call: kicked, banned, timed out, or the room went (S9).
+    Disconnected,
     /// "Play test sound": the join cue, whatever the switches say.
     Test,
 }
@@ -258,6 +372,8 @@ pub enum MediaResponse {
     Done,
     /// The SDP offer for a Tiny server call, in answer to `TinyOffer`.
     Offer { sdp: String },
+    /// The connection as it is now, in answer to `Stats`.
+    Stats(CallStats),
     /// This mediad cannot do what was asked.
     Refused { detail: String },
 
@@ -293,7 +409,11 @@ impl MediaResponse {
     pub fn is_reply(&self) -> bool {
         matches!(
             self,
-            MediaResponse::Streams { .. } | MediaResponse::Done | MediaResponse::Offer { .. } | MediaResponse::Refused { .. }
+            MediaResponse::Streams { .. }
+                | MediaResponse::Done
+                | MediaResponse::Offer { .. }
+                | MediaResponse::Stats(_)
+                | MediaResponse::Refused { .. }
         )
     }
 }

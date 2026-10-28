@@ -12,9 +12,11 @@ use crate::gui::components::{button, glyph, keycap, menu, menu_item_check, menu_
 use crate::gui::layout::NETWORK_ORDER;
 use crate::gui::theme::{self, Type};
 use gpui::{canvas, div, prelude::*, px, AnyElement, ClipboardItem, Context, Div, MouseButton, SharedString, Window};
+use crate::gui::hotkeys::{self, Action, Reach};
 use protocol::settings::{
-    self as keys, account_scope, Values, CACHE_MB, CACHE_MB_CHOICES, CUE_CONNECTION, CUE_JOINS, CUE_MINE, CUE_VOLUME, GLOBAL,
-    INPUT, JOIN_MUTED, KEEP_DAYS, KEEP_DAYS_CHOICES, KEEP_RUNNING, OUTPUT, RECEIPTS, SENSITIVITY, SOUNDS, TYPING, VOICE_VOLUME,
+    self as keys, account_scope, Values, AUTO_GAIN, CACHE_MB, CACHE_MB_CHOICES, CUE_CONNECTION, CUE_JOINS, CUE_MINE, CUE_VOLUME,
+    ECHO_CANCELLATION, GLOBAL, INPUT, JOIN_MUTED, KEEP_DAYS, KEEP_DAYS_CHOICES, KEEP_RUNNING, NOISE_SUPPRESSION, OUTPUT, PTT_RELEASE_CHOICES,
+    PTT_RELEASE_MS, PUSH_TO_TALK, RECEIPTS, SENSITIVITY, SOUNDS, TYPING, VOICE_VOLUME,
 };
 use protocol::{AccountStatus, Link, Network, Request, Response};
 use std::rc::Rc;
@@ -37,6 +39,8 @@ pub fn slider(id: &str) -> Slider {
         // Narrower than the others: its row also carries the test sound's button.
         "S10" => Slider { range: (0, 100), default: 50, read: || prefs::values().number(CUE_VOLUME), stops: None, width: 160., words: percent },
         "V5" => Slider { range: (0, 100), default: 100, read: || prefs::values().number(VOICE_VOLUME), stops: None, width: controls::TRACK, words: percent },
+        // Release delay: one stop for each of the six choices.
+        "V14" => Slider { range: (0, 5), default: 2, read: release_stop, stops: Some(6), width: controls::TRACK, words: release_words },
         _ => Slider { range: (0, 100), default: 25, read: || prefs::values().number(SENSITIVITY), stops: None, width: controls::METER, words: |v| v.to_string() },
     }
 }
@@ -46,11 +50,50 @@ pub fn store_slider(window: &mut SettingsWindow, id: &'static str, value: u32, c
         "A2" => return window.set_text_step(value as i32 - 1, cx),
         "S10" => CUE_VOLUME,
         "V5" => VOICE_VOLUME,
+        "V14" => {
+            let ms = PTT_RELEASE_CHOICES[(value as usize).min(PTT_RELEASE_CHOICES.len() - 1)];
+            let stored = (ms != Values::default_number(PTT_RELEASE_MS)).then(|| ms.to_string());
+            return window.set(id, GLOBAL.into(), PTT_RELEASE_MS, stored, cx);
+        }
         _ => SENSITIVITY,
     };
     // Only what differs from the default is stored.
     let stored = (value != Values::default_number(key)).then(|| value.to_string());
     window.set(id, GLOBAL.into(), key, stored, cx);
+}
+
+/// V14's stop for the release delay stored.
+fn release_stop() -> u32 {
+    let ms = prefs::values().number(PTT_RELEASE_MS);
+    PTT_RELEASE_CHOICES.iter().position(|choice| *choice == ms).unwrap_or(2) as u32
+}
+
+fn release_words(stop: u32) -> String {
+    match PTT_RELEASE_CHOICES.get(stop as usize) {
+        Some(1000) => "1 s".to_owned(),
+        Some(ms) => format!("{ms} ms"),
+        None => String::new(),
+    }
+}
+
+/// The key action a key row records.
+pub fn key_action(id: &str) -> Option<Action> {
+    Some(match id {
+        "V13" => Action::Talk,
+        "V15" => Action::Priority,
+        "V16" => Action::Mute,
+        "V17" => Action::Deafen,
+        _ => return None,
+    })
+}
+
+/// What the Keys group says the keys can reach on this system.
+fn keys_caption() -> &'static str {
+    match hotkeys::reach() {
+        Reach::Everywhere => "These keys work in any app, even with tinyclient in the background.",
+        Reach::Permission => "To work in other apps, these keys need Input Monitoring in System Settings › Privacy & Security.",
+        Reach::Window => "This system shows keys only to the app in front: they work while tinyclient's window is, and push to talk needs an X11 session.",
+    }
 }
 
 /// The length of the test sound (`Cue::Test`), for its button's playing state.
@@ -147,11 +190,7 @@ impl SettingsWindow {
                 self.group(&["G2"], None, window, cx).child(caption(self.keep_running_caption())),
                 self.group(&["G4"], None, window, cx).child(caption(self.updates_caption())),
             ],
-            Section::Sounds => vec![
-                self.group(&["S1"], None, window, cx),
-                self.group(&["S7", "S8", "S9", "S10"], Some("In calls"), window, cx)
-                    .child(caption("Call sounds play on your call speaker, quieter than voices. Voice volume is in Audio & video.")),
-            ],
+            Section::Sounds => vec![self.group(&["S1"], None, window, cx).child(caption("Which call sounds play, and how loud, is in Voice."))],
             Section::Appearance => vec![
                 self.group(&["A2", "A3", "A4"], None, window, cx)
                     .child(caption(crate::host::APPEARANCE_CAPTION)),
@@ -167,11 +206,34 @@ impl SettingsWindow {
                 groups
             }
             Section::Audio => vec![
-                self.group(&["V1", "V3"], Some("Microphone"), window, cx),
+                self.group(&["V1"], Some("Microphone"), window, cx).child(caption("How your microphone opens, its level and its processing are in Voice.")),
                 self.group(&["V2", "V5"], Some("Speaker"), window, cx)
                     .child(caption("Picking a device in a call's menu changes that call only. These are the defaults.")),
                 self.group(&["V4"], Some("Joining"), window, cx),
             ],
+            Section::Voice => {
+                let values = prefs::values();
+                let push = values.on(PUSH_TO_TALK);
+                let mut input = vec!["V8", "V3", "V18"];
+                let mode = if push {
+                    input.push("V14");
+                    if values.hotkey(keys::PTT_KEY).is_none() {
+                        "Pick a push-to-talk key below: until then your microphone never opens."
+                    } else {
+                        "Your microphone opens while the key is held. A room that requires push to talk uses it, whatever you pick here."
+                    }
+                } else {
+                    "A room that requires push to talk uses it, whatever you pick here."
+                };
+                vec![
+                    self.group(&input, None, window, cx).child(caption(mode)),
+                    self.group(&["V13", "V15", "V16", "V17"], Some("Keys"), window, cx).child(caption(keys_caption())),
+                    self.group(&["V10", "V11", "V12"], Some("Processing"), window, cx)
+                        .child(caption("Echo cancellation takes out what your speakers play, so others don't hear themselves when you talk without headphones.")),
+                    self.group(&["S7", "S8", "S9", "S10"], Some("Call sounds"), window, cx)
+                        .child(caption("Call sounds play on your call speaker, quieter than voices. Voice volume is in Audio & video.")),
+                ]
+            }
             Section::Storage => vec![self.group(&["D1", "D2", "D3"], None, window, cx).child(caption("Sign-ins, drafts and settings are not part of this."))],
             Section::Shortcuts => return column.child(self.shortcuts("")),
             Section::About => return column.child(self.about(window, cx)),
@@ -182,8 +244,9 @@ impl SettingsWindow {
 
     /// A banner over sections whose rows chatd keeps, when chatd does not answer.
     fn banner(&self, cx: &mut Context<Self>) -> Option<Div> {
-        let chatd = matches!(self.section, Section::General | Section::Sounds | Section::Privacy | Section::Audio | Section::Storage);
+        let chatd = matches!(self.section, Section::General | Section::Sounds | Section::Privacy | Section::Audio | Section::Voice | Section::Storage);
         let denied = self.section == Section::Audio && self.devices.as_ref().is_some_and(|d| d.microphone == "denied");
+        let unwatched = self.section == Section::Voice && hotkeys::reach() == Reach::Permission;
         let (icon, words, action): (&'static str, &'static str, Option<(&'static str, &'static str)>) = if chatd && !self.reachable(cx) {
             ("icons/wifi-off.svg", "Can't reach tinyclient's background service. These settings return when it does.", None)
         } else if denied {
@@ -191,6 +254,12 @@ impl SettingsWindow {
                 "icons/mic-off.svg",
                 "tinyclient can't use the microphone. Allow it in System Settings › Privacy & Security › Microphone.",
                 Some(("Open System Settings", "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")),
+            )
+        } else if unwatched {
+            (
+                "icons/key.svg",
+                "Your voice keys work only in tinyclient until you allow Input Monitoring for it.",
+                Some(("Open System Settings", "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent")),
             )
         } else {
             return None;
@@ -361,6 +430,31 @@ impl SettingsWindow {
             "P1" | "P2" => return self.per_account_rows(id, cx),
             "V1" | "V2" => self.device_row(id, cx),
             "V3" => self.meter_row(cx),
+            "V8" => {
+                let push = values.on(PUSH_TO_TALK);
+                self.segmented_row(id, &["Voice activation", "Push to talk"], usize::from(push), 0, None, move |this, ix, cx| this.set_switch(id, PUSH_TO_TALK, ix == 1, false, cx), cx)
+            }
+            "V14" => row(label, None, self.slider_control(id, cx)),
+            "V18" => {
+                let second = Some("Plays your microphone back as others would hear it. Not during a call.".to_owned());
+                self.switch_row(id, self.loopback, false, second, |this, on, cx| this.set_loopback(on, cx), cx)
+            }
+            "V10" | "V11" | "V12" => {
+                let key = match id {
+                    "V10" => ECHO_CANCELLATION,
+                    "V11" => NOISE_SUPPRESSION,
+                    _ => AUTO_GAIN,
+                };
+                let on = values.on(key);
+                let second = match (id, on) {
+                    ("V10", false) => Some("Wear headphones, or others hear themselves when you talk."),
+                    ("V11", false) => Some("Fans, typing and traffic go through as they are."),
+                    ("V12", false) => Some("Your voice is sent at the level your microphone gives."),
+                    _ => None,
+                };
+                self.switch_row(id, on, true, second.map(str::to_owned), move |this, on, cx| this.set_switch(id, key, on, true, cx), cx)
+            }
+            "V13" | "V15" | "V16" | "V17" => return self.key_row(id, cx),
             "V6" => row(label, None, self.slider_control(id, cx)),
             "V5" => row(label, None, self.slider_control(id, cx)),
             "V4" => {
@@ -820,7 +914,13 @@ impl SettingsWindow {
                     this.toggle_test(cx);
                 }
             }));
-        let second = if testing { "Speak normally. Green is what others would hear." } else { "Below the line nothing is sent and your speaking ring stays off." };
+        let push = prefs::values().on(PUSH_TO_TALK);
+        let second = match (testing, push) {
+            (true, false) => "Speak normally. Green is what others would hear.",
+            (true, true) => "Speak normally. In push to talk the key opens your microphone, not the line.",
+            (false, false) => "Below the line nothing is sent and your speaking ring stays off.",
+            (false, true) => "In push to talk the line does nothing; it is used when you go back to voice activation.",
+        };
         let label = |words: &'static str| div().w(px(96.)).type_ui().text_color(theme::text()).child(words);
         let meter = div()
             .id("V3-meter")
@@ -839,6 +939,109 @@ impl SettingsWindow {
             // sits under the meter and the value ends where every other value does.
             .child(div().flex().items_center().child(label("Sensitivity")).child(div().flex_1()).child(self.slider_control("V6", cx)))
             .child(div().pt(px(2.)).type_small().text_color(theme::text_soft()).child(second))
+    }
+
+    /// V13, V15 to V17: a key recorder (design 3.8). Click, then press a key, a key with
+    /// modifiers, a modifier alone, or the middle or a side mouse button; Esc cancels and ⌫
+    /// clears. A key another action has is refused in words and the old one stays.
+    fn key_row(&mut self, id: &'static str, cx: &mut Context<Self>) -> Div {
+        let label = label_of(id);
+        let Some(action) = key_action(id) else {
+            return div();
+        };
+        let bound = prefs::values().hotkey(action.key());
+        let recording = self.recording == Some(id);
+        let shown: AnyElement = match (recording, bound) {
+            (true, _) => div().type_ui().text_color(theme::text()).child("Press a key…").into_any_element(),
+            (false, Some(binding)) => keycap(binding.label()).into_any_element(),
+            (false, None) => div().type_ui().text_color(theme::text_faint()).child("Click to record").into_any_element(),
+        };
+        let mut field = div()
+            .id(SharedString::from(format!("{id}-key")))
+            .w(px(140.))
+            .h(px(28.))
+            .px(px(8.))
+            .rounded(px(theme::R_CONTROL))
+            .border_1()
+            .border_color(if recording { theme::accent() } else { theme::border() })
+            .flex()
+            .items_center()
+            .cursor_pointer()
+            .tab_index(0)
+            .role(gpui::Role::Button)
+            .aria_label(SharedString::from(format!("{label}: {}", bound.map_or("none".to_owned(), |b| b.label()))))
+            .focus_visible(|style| style.shadow(theme::focus_ring()))
+            .child(shown)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                if this.recording == Some(id) {
+                    this.stop_recording(cx);
+                } else {
+                    this.start_recording(id, window, cx);
+                }
+            }));
+        if recording {
+            field = field
+                .track_focus(&self.recorder_focus)
+                .on_key_down(cx.listener(move |this, event: &gpui::KeyDownEvent, _, cx| {
+                    if this.recording != Some(id) {
+                        return;
+                    }
+                    cx.stop_propagation();
+                    match event.keystroke.key.as_str() {
+                        "escape" => this.stop_recording(cx),
+                        "backspace" if !event.keystroke.modifiers.modified() => this.recorded(None, cx),
+                        _ => {
+                            if let Some(binding) = hotkeys::binding_of(&event.keystroke) {
+                                this.recorded(Some(binding), cx);
+                            }
+                        }
+                    }
+                }))
+                .on_modifiers_changed(cx.listener(move |this, event: &gpui::ModifiersChangedEvent, _, cx| {
+                    if this.recording != Some(id) {
+                        return;
+                    }
+                    let now = event.modifiers;
+                    if now.modified() {
+                        let held = &mut this.held_modifiers;
+                        held.control |= now.control;
+                        held.alt |= now.alt;
+                        held.shift |= now.shift;
+                        held.platform |= now.platform;
+                    } else {
+                        // Let go with no other key: the modifier alone is the key.
+                        let alone = hotkeys::modifier_binding(std::mem::take(&mut this.held_modifiers));
+                        if alone.is_some() {
+                            this.recorded(alone, cx);
+                        }
+                    }
+                }));
+        }
+        let reset = bound.map(|_| {
+            reset_button(SharedString::from(format!("{id}-reset")), format!("Clear {label}").into()).on_click(cx.listener(move |this, _, _, cx| {
+                this.stop_recording(cx);
+                this.set(id, GLOBAL.into(), action.key(), None, cx);
+            }))
+        });
+        let side = bound.is_some_and(|b| matches!(b.key, protocol::hotkey::Key::Mouse4 | protocol::hotkey::Key::Mouse5)) && !hotkeys::side_buttons();
+        let second = match action {
+            Action::Priority => Some("Push to talk that also asks to be heard over everyone, where you hold priority speech."),
+            _ if side => Some("This system doesn't show the mouse's side buttons to apps. Pick a key."),
+            _ => None,
+        };
+        let clash = self.clash.as_ref().filter(|(row, _)| *row == id).map(|(_, words)| div().px(px(12.)).pb(px(8.)).type_small().text_color(theme::danger()).child(words.clone()));
+        let failed = self.failed.filter(|row| *row == id).map(|row| div().px(px(12.)).pb(px(8.)).type_small().text_color(theme::danger()).child(failure_words(row, self.reachable(cx))));
+        let waiting = self.waits_on_chatd(id, cx);
+        let lit = self.highlight == Some(id);
+        div()
+            .flex()
+            .flex_col()
+            .rounded(px(theme::R_CARD))
+            .when(lit, |row| row.bg(theme::selected()))
+            .when(waiting, |row| row.opacity(0.4))
+            .child(row(label, second.map(SharedString::from), div().flex().items_center().child(reset_slot(reset)).child(field)))
+            .children(clash)
+            .children(failed)
     }
 
     /// D1: what tinyclient keeps on this Mac, as a two-part bar.

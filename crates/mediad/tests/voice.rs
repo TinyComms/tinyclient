@@ -20,7 +20,7 @@ use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::Aes256Gcm;
 use chacha20poly1305::XChaCha20Poly1305;
 use mediad::opus::{Decoder, Encoder, MAX_FRAME};
-use protocol::{read_frame, write_frame, CallFailure, Cue, Dave, MediaRequest, MediaResponse, Network, Tuning, VoiceJoin};
+use protocol::{read_frame, write_frame, CallFailure, CallPath, Cue, Dave, MediaRequest, MediaResponse, Network, Tuning, VoiceJoin};
 use serde_json::{json, Value};
 use native_tls::{Identity, TlsAcceptor, TlsStream};
 use std::io::{ErrorKind, Read, Write};
@@ -776,6 +776,42 @@ fn another_member_is_announced_decoded_and_seen_speaking() {
     let _ = std::fs::remove_file(played_to);
 }
 
+/// V9 on a Discord call: someone set to 50 % is played at half the level, and the connection
+/// can be asked how it is doing once media flows, but not before.
+#[test]
+fn a_member_is_played_at_the_volume_chosen_for_them_and_the_connection_reports_itself() {
+    let mut fake = Fake::new();
+    let played_to = sink("gain");
+    let mut mediad = Mediad::start("null", Some(&played_to));
+    let refused = mediad.ask(MediaRequest::Stats);
+    assert!(matches!(&refused, MediaResponse::Refused { detail } if !detail.is_empty()), "{refused:?}");
+    assert_eq!(mediad.ask(MediaRequest::Gain { user_id: THEM.into(), percent: 50, muted: false }), MediaResponse::Done);
+    mediad.join(&fake.endpoint(), NO_DAVE);
+    let mut peer = fake.accept();
+    fake.handshake(&mut peer, &[AES], 0, 30_000);
+    mediad.connected();
+    peer.send(11, json!({ "user_ids": [THEM] }));
+    peer.send(5, json!({ "user_id": THEM, "ssrc": THEIR_SSRC, "speaking": 1 }));
+    mediad.event("Source", |e| matches!(e, MediaResponse::Source { .. }));
+
+    let frames = tone_frames(100);
+    let tone: Vec<(u16, &[u8])> = frames.iter().enumerate().map(|(n, frame)| (n as u16, &frame[..])).collect();
+    fake.talk(&tone);
+    mediad.speaking(THEM, true);
+    let stats = match mediad.ask(MediaRequest::Stats) {
+        MediaResponse::Stats(stats) => stats,
+        other => panic!("no stats: {other:?}"),
+    };
+    assert_eq!((stats.path, stats.codec.as_str()), (CallPath::Udp, "opus"));
+    assert!(stats.receive_kbps > 10, "{stats:?}");
+    assert_eq!(stats.loss_permille, 0, "{stats:?}");
+
+    assert_eq!(mediad.hang_up().0.code(), Some(0));
+    let loudest = played(&played_to).chunks(960 * 2 * 20).map(rms).fold(0., f64::max);
+    assert!((2000. ..3500.).contains(&loudest), "at 50 % the tone plays at {loudest}");
+    let _ = std::fs::remove_file(played_to);
+}
+
 #[test]
 fn mute_sends_a_trail_of_silence_and_then_nothing_and_deafen_plays_nothing() {
     let mut fake = Fake::new();
@@ -981,9 +1017,14 @@ fn a_voice_server_that_goes_silent_is_given_up_within_ten_seconds() {
     mediad.join(&fake.endpoint(), NO_DAVE);
     // Held open and never answered, not even with TLS.
     let held: Vec<TcpStream> = (0..3).map(|_| fake.accept_tcp(PATIENCE).expect("a try")).collect();
-    let (reason, detail) = match mediad.frames.recv_timeout(Duration::from_secs(11)) {
-        Ok(MediaResponse::Failed { reason, detail }) => (reason, detail),
-        other => panic!("no failure within ten seconds of the join: {other:?} after {:?}", began.elapsed()),
+    // The device watcher may speak up at any moment; only the failure matters here.
+    let (reason, detail) = loop {
+        let left = Duration::from_secs(11).saturating_sub(began.elapsed());
+        match mediad.frames.recv_timeout(left) {
+            Ok(MediaResponse::Failed { reason, detail }) => break (reason, detail),
+            Ok(MediaResponse::DeviceList { .. }) => continue,
+            other => panic!("no failure within ten seconds of the join: {other:?} after {:?}", began.elapsed()),
+        }
     };
     let took = began.elapsed();
     assert!(took < Duration::from_millis(10_300), "{took:?}");

@@ -1154,6 +1154,10 @@ impl Shell {
             }
             Mode::People => strip.child(pane_title("People")),
             Mode::Network(Network::Slack) => self.slack_title(strip, cx),
+            // A Tiny server's strip is its header: its icon and name, which open its menu.
+            Mode::Network(Network::Tiny) if self.snapshot.as_ref().is_some_and(|snapshot| snapshot.link(Network::Tiny) == Link::Connected) => {
+                strip.child(self.tiny_header(cx))
+            }
             Mode::Network(network) => {
                 let network = *network;
                 let strip = strip.child(network_icon(network, 20.));
@@ -1468,6 +1472,7 @@ impl Shell {
             .child(div().id("sidebar-list").flex_1().min_h_0().track_focus(&self.sidebar_state.focus).key_context("Sidebar").child(body))
             .children(super::playing::draw(self, window, cx))
             .children(self.slots.call_dock.and_then(|draw| draw(self, window, cx)))
+            .children(tiny.then(|| self.tiny_user_panel(cx)).flatten())
             .children(self.slack_menu(cx))
     }
 }

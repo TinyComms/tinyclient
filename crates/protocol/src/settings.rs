@@ -38,8 +38,28 @@ pub const OUTPUT: &str = "output";
 pub const JOIN_MUTED: &str = "join_muted";
 /// V5. Everyone's voice, 0 to 100.
 pub const VOICE_VOLUME: &str = "voice_volume";
-/// V6. The level, 0 to 100, from which our microphone counts as speech.
+/// V6. The level, 0 to 100, from which our microphone counts as speech, and in voice
+/// activation opens.
 pub const SENSITIVITY: &str = "sensitivity";
+/// V8. On: the microphone opens only while the push-to-talk key is held.
+pub const PUSH_TO_TALK: &str = "push_to_talk";
+/// V8. How long the microphone stays open after push-to-talk is let go, in milliseconds.
+pub const PTT_RELEASE_MS: &str = "ptt_release_ms";
+/// V10, V11, V12. The microphone's processing.
+pub const ECHO_CANCELLATION: &str = "echo_cancellation";
+pub const NOISE_SUPPRESSION: &str = "noise_suppression";
+pub const AUTO_GAIN: &str = "auto_gain";
+/// V8, V13, V14, V15. The shell's global keys, as [`crate::hotkey::Binding`] writes them:
+/// push-to-talk, push-to-talk with priority, toggle mute, toggle deafen. Absent is no key.
+/// Read by the shell; chatd only keeps them.
+pub const PTT_KEY: &str = "ptt_key";
+pub const PRIORITY_KEY: &str = "priority_key";
+pub const MUTE_KEY: &str = "mute_key";
+pub const DEAFEN_KEY: &str = "deafen_key";
+/// V9, per account: one person's volume for me, keyed `gain:<their user id>` ([`gain_key`]).
+/// The value is the percent, 0 to [`crate::GAIN_MAX`], then ` muted` when I muted them; 100
+/// and heard is the default and is not stored.
+pub const GAIN_PREFIX: &str = "gain:";
 /// P1, per account. Off: the adapter sends no typing signal.
 pub const TYPING: &str = "typing";
 /// P2, per Teams account. Off: no read horizon is sent.
@@ -53,6 +73,7 @@ pub const VERSION: &str = "version";
 
 pub const KEEP_DAYS_CHOICES: [u32; 3] = [7, 30, 90];
 pub const CACHE_MB_CHOICES: [u32; 4] = [250, 500, 1000, 2000];
+pub const PTT_RELEASE_CHOICES: [u32; 6] = [0, 100, 200, 300, 500, 1000];
 
 /// What a key's values look like.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,16 +82,22 @@ enum Kind {
     Percent(u8),
     Choice(&'static [u32], u32),
     Device,
+    Hotkey,
+    Gain,
 }
 
 fn kind(key: &str) -> Option<Kind> {
     Some(match key {
         KEEP_RUNNING | SOUNDS | CUE_JOINS | CUE_MINE | CUE_CONNECTION => Kind::Switch(true),
-        JOIN_MUTED => Kind::Switch(false),
+        ECHO_CANCELLATION | NOISE_SUPPRESSION | AUTO_GAIN => Kind::Switch(true),
+        JOIN_MUTED | PUSH_TO_TALK => Kind::Switch(false),
+        PTT_RELEASE_MS => Kind::Choice(&PTT_RELEASE_CHOICES, 200),
         CUE_VOLUME => Kind::Percent(50),
         VOICE_VOLUME => Kind::Percent(100),
         SENSITIVITY => Kind::Percent(25),
         INPUT | OUTPUT => Kind::Device,
+        PTT_KEY | PRIORITY_KEY | MUTE_KEY | DEAFEN_KEY => Kind::Hotkey,
+        _ if gain_user(key).is_some() => Kind::Gain,
         KEEP_DAYS => Kind::Choice(&KEEP_DAYS_CHOICES, 90),
         CACHE_MB => Kind::Choice(&CACHE_MB_CHOICES, 500),
         // Per account; the default is the network's (`typing_default`).
@@ -84,6 +111,7 @@ fn scoped(key: &str, scope: &str) -> bool {
     match key {
         TYPING => account_of(scope).is_some_and(|account| typing_choice(account.network)),
         RECEIPTS => account_of(scope).is_some_and(|account| account.network == Network::Teams),
+        _ if gain_user(key).is_some() => account_of(scope).is_some(),
         _ => scope == GLOBAL,
     }
 }
@@ -99,7 +127,38 @@ pub fn valid(scope: &str, key: &str, value: &str) -> bool {
         Some(Kind::Percent(_)) => value.parse::<u8>().is_ok_and(|n| n <= 100),
         Some(Kind::Choice(choices, _)) => value.parse::<u32>().is_ok_and(|n| choices.contains(&n)),
         Some(Kind::Device) => !value.is_empty() && value.len() <= 200 && !value.contains(['\n', '\0']),
+        Some(Kind::Hotkey) => crate::hotkey::Binding::parse(value).is_some(),
+        Some(Kind::Gain) => parse_gain(value).is_some(),
         None => false,
+    }
+}
+
+/// The setting that keeps one person's volume for me (V9), in their account's scope.
+pub fn gain_key(user_id: &str) -> String {
+    format!("{GAIN_PREFIX}{user_id}")
+}
+
+/// The user a `gain:` key names. Ids are short and have no spaces.
+fn gain_user(key: &str) -> Option<&str> {
+    key.strip_prefix(GAIN_PREFIX).filter(|id| !id.is_empty() && id.len() <= 128 && !id.contains(char::is_whitespace))
+}
+
+/// A stored gain: `150`, or `0 muted`. Percent above [`crate::GAIN_MAX`] is refused.
+fn parse_gain(value: &str) -> Option<(u16, bool)> {
+    let (percent, muted) = match value.strip_suffix(" muted") {
+        Some(percent) => (percent, true),
+        None => (value, false),
+    };
+    percent.parse::<u16>().ok().filter(|p| *p <= crate::GAIN_MAX).map(|p| (p, muted))
+}
+
+/// How a gain is stored: `None` for the default (100 % and heard), which is not.
+pub fn gain_value(percent: u16, muted: bool) -> Option<String> {
+    let percent = percent.min(crate::GAIN_MAX);
+    match (percent, muted) {
+        (100, false) => None,
+        (_, false) => Some(percent.to_string()),
+        (_, true) => Some(format!("{percent} muted")),
     }
 }
 
@@ -220,6 +279,47 @@ impl Values {
         }
     }
 
+    /// How the microphone opens, as the user chose. A room that requires push-to-talk asks
+    /// for [`Values::push_to_talk`] instead.
+    pub fn input_mode(&self) -> crate::InputMode {
+        if self.on(PUSH_TO_TALK) {
+            self.push_to_talk()
+        } else {
+            crate::InputMode::Voice { threshold: self.number(SENSITIVITY).min(100) as u8 }
+        }
+    }
+
+    /// Push-to-talk with the user's release delay, whatever the mode chosen.
+    pub fn push_to_talk(&self) -> crate::InputMode {
+        crate::InputMode::PushToTalk { release_ms: self.number(PTT_RELEASE_MS).min(1000) as u16 }
+    }
+
+    pub fn processing(&self) -> crate::AudioProcessing {
+        crate::AudioProcessing {
+            echo_cancellation: self.on(ECHO_CANCELLATION),
+            noise_suppression: self.on(NOISE_SUPPRESSION),
+            auto_gain: self.on(AUTO_GAIN),
+        }
+    }
+
+    /// A global key binding (V8, V13 to V15), if one is set.
+    pub fn hotkey(&self, key: &str) -> Option<crate::hotkey::Binding> {
+        self.stored(GLOBAL, key).and_then(crate::hotkey::Binding::parse)
+    }
+
+    /// Everyone on `account` whose volume for me is not the default: user id, percent, muted.
+    pub fn gains(&self, account: &AccountKey) -> Vec<(String, u16, bool)> {
+        let scope = account_scope(account);
+        self.0
+            .iter()
+            .filter(|((at, _), _)| *at == scope)
+            .filter_map(|((_, key), value)| {
+                let (percent, muted) = parse_gain(value)?;
+                Some((gain_user(key)?.to_owned(), percent, muted))
+            })
+            .collect()
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = Setting> + '_ {
         self.0.iter().map(|((scope, key), value)| Setting { scope: scope.clone(), key: key.clone(), value: value.clone() })
     }
@@ -272,6 +372,43 @@ mod tests {
         assert!(values.typing(&discord) && !values.typing(&slack));
         assert_eq!(account_of(&account_scope(&slack)), Some(slack));
         assert_eq!(account_of("account:myspace:1"), None);
+    }
+
+    #[test]
+    fn the_microphone_opens_by_voice_until_push_to_talk_is_chosen_and_processing_is_on() {
+        let mut values = Values::default();
+        assert_eq!(values.input_mode(), crate::InputMode::Voice { threshold: 25 });
+        assert_eq!(values.processing(), crate::AudioProcessing::default());
+        assert!(valid(GLOBAL, PTT_RELEASE_MS, "300") && !valid(GLOBAL, PTT_RELEASE_MS, "250"));
+        values.set(GLOBAL, PUSH_TO_TALK, Some("on".into()));
+        assert_eq!(values.input_mode(), crate::InputMode::PushToTalk { release_ms: 200 });
+        values.set(GLOBAL, PTT_RELEASE_MS, Some("0".into()));
+        values.set(GLOBAL, NOISE_SUPPRESSION, Some("off".into()));
+        assert_eq!(values.input_mode(), crate::InputMode::PushToTalk { release_ms: 0 });
+        assert!(!values.processing().noise_suppression && values.processing().echo_cancellation);
+    }
+
+    #[test]
+    fn keys_are_bindings_and_a_gain_is_kept_per_account_and_person() {
+        assert!(valid(GLOBAL, PTT_KEY, "mouse4") && valid(GLOBAL, MUTE_KEY, "ctrl+shift+m"));
+        assert!(!valid(GLOBAL, PTT_KEY, "hyper+q") && !valid(GLOBAL, PTT_KEY, ""));
+        let tiny = account_scope(&account(Network::Tiny));
+        let key = gain_key("u42");
+        assert!(valid(&tiny, &key, "150") && valid(&tiny, &key, "0 muted") && valid(&tiny, &key, "200"));
+        assert!(!valid(&tiny, &key, "201") && !valid(&tiny, &key, "loud") && !valid(GLOBAL, &key, "50"));
+        assert!(!valid(&tiny, "gain:", "50") && !valid(&tiny, "gain:a b", "50"));
+        assert!(known(&tiny, &key));
+        assert_eq!((gain_value(100, false), gain_value(250, false), gain_value(30, true)), (None, Some("200".into()), Some("30 muted".into())));
+        let mut values = Values::default();
+        values.set(&tiny, &key, Some("30 muted".into()));
+        values.set(&tiny, &gain_key("u7"), Some("180".into()));
+        values.set(&account_scope(&account(Network::Discord)), &gain_key("u9"), Some("50".into()));
+        let mut gains = values.gains(&account(Network::Tiny));
+        gains.sort();
+        assert_eq!(gains, [("u42".to_owned(), 30, true), ("u7".to_owned(), 180, false)]);
+        values.set(GLOBAL, PTT_KEY, Some("f13".into()));
+        assert_eq!(values.hotkey(PTT_KEY).map(|b| b.to_string()), Some("f13".into()));
+        assert_eq!(values.hotkey(DEAFEN_KEY), None);
     }
 
     #[test]

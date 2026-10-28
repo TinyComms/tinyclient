@@ -311,6 +311,7 @@ impl Shell {
         shell.layout_state.details_channels = prefs.details_channels;
         shell.layout_state.details_directs = prefs.details_directs;
         shell.sidebar_state.pins = prefs.pins;
+        shell.tiny_state.set_members_open(prefs.tiny_members);
         shell.saved_prefs.replace(app::prefs::write(&shell.current_prefs()));
         if crate::update::announce().is_some() {
             shell.layout_state.update_alert = true;

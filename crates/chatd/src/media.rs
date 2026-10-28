@@ -79,6 +79,9 @@ struct Live {
     metering: bool,
     /// Our own user id in the voice session, to tell our own speaking from everyone else's.
     me: String,
+    /// The room requires push-to-talk (a Tiny room's `ptt_only`, or no voice activation
+    /// there), whatever the user chose.
+    push_to_talk: bool,
 }
 
 /// The running mediad and the call it exists for. Dropping it ends the call.
@@ -203,6 +206,16 @@ fn new_call(conversation: Key, state: CallState) -> Live {
         answered: false,
         metering: false,
         me: String::new(),
+        push_to_talk: false,
+    }
+}
+
+/// How the microphone opens: the user's choice, unless the room requires push-to-talk.
+fn input_mode(settings: &protocol::settings::Values, push_to_talk: bool) -> protocol::InputMode {
+    if push_to_talk {
+        settings.push_to_talk()
+    } else {
+        settings.input_mode()
     }
 }
 
@@ -318,6 +331,7 @@ impl Live {
             | MediaResponse::Streams { .. }
             | MediaResponse::Done
             | MediaResponse::Offer { .. }
+            | MediaResponse::Stats(_)
             | MediaResponse::Refused { .. } => return false,
         }
         true
@@ -538,9 +552,10 @@ impl Calls {
             drop(tester);
             hub.changed(Change::Meter { level: None });
         }
-        let (tuning, input, output, muted) = {
+        let (tuning, input, output, muted, mode, processing) = {
             let settings = hub.settings();
-            (settings.tuning(), settings.device(INPUT), settings.device(OUTPUT), settings.on(JOIN_MUTED))
+            let mode = input_mode(&settings, false);
+            (settings.tuning(), settings.device(INPUT), settings.device(OUTPUT), settings.on(JOIN_MUTED), mode, settings.processing())
         };
         {
             let mut slot = crate::hub::lock(&self.slot);
@@ -550,11 +565,18 @@ impl Calls {
             // The old mediad, if any, is reaped before the new one starts.
             *slot = Slot::Idle;
             let id = self.next.fetch_add(1, Ordering::Relaxed);
-            let mut active = ActiveCall::start(hub, id, conversation).map_err(CallError::Media)?;
+            let mut active = ActiveCall::start(hub, id, conversation.clone()).map_err(CallError::Media)?;
             // The user's defaults, before the voice session arrives: mediad opens the devices
             // only once it holds one. A mediad that refuses them still carries the call.
             crate::hub::lock(&active.live).call.muted = muted;
             let _ = active.request(&MediaRequest::Tune(tuning));
+            let _ = active.request(&MediaRequest::Input(mode));
+            let _ = active.request(&MediaRequest::Processing(processing));
+            // V9: everyone on this account whose volume for me is not the default.
+            let gains = hub.settings().gains(&conversation.account());
+            for (user_id, percent, muted) in gains {
+                let _ = active.request(&MediaRequest::Gain { user_id, percent, muted });
+            }
             if input.is_some() || output.is_some() {
                 let _ = active.request(&MediaRequest::Devices { input, output });
             }
@@ -571,12 +593,27 @@ impl Calls {
 
     /// The tuning changed in Settings: the call's mediad, or the test's, takes it at once.
     pub fn retune(&self, hub: &Hub) {
-        let tuning = hub.settings().tuning();
+        let (tuning, settings) = {
+            let settings = hub.settings();
+            (settings.tuning(), settings.clone())
+        };
         if let Some(active) = crate::hub::lock(&self.slot).running() {
+            let push_to_talk = crate::hub::lock(&active.live).push_to_talk;
             let _ = active.request(&MediaRequest::Tune(tuning));
+            let _ = active.request(&MediaRequest::Input(input_mode(&settings, push_to_talk)));
+            let _ = active.request(&MediaRequest::Processing(settings.processing()));
         }
         if let Some(tester) = crate::hub::lock(&self.tester).as_mut() {
             let _ = tester.send(&MediaRequest::Tune(tuning));
+            let _ = tester.send(&MediaRequest::Processing(settings.processing()));
+        }
+    }
+
+    /// One person's volume for me (V9), for the call if it is on `account`.
+    pub fn gain(&self, hub: &Hub, account: &protocol::AccountKey, user_id: String, percent: u16, muted: bool) {
+        let (call, running) = self.describe();
+        if running && call.is_some_and(|call| call.conversation.account() == *account) {
+            let _ = self.request(hub, &MediaRequest::Gain { user_id, percent, muted });
         }
     }
 
@@ -588,11 +625,15 @@ impl Calls {
                 eprintln!("chatd: the test mediad did not start: {err}");
                 CallError::Media(io::Error::other(ENGINE_MISSING))
             })?;
-            let (tuning, input, output) = {
+            let (tuning, input, output, processing) = {
                 let settings = hub.settings();
-                (settings.tuning(), settings.device(INPUT), settings.device(OUTPUT))
+                (settings.tuning(), settings.device(INPUT), settings.device(OUTPUT), settings.processing())
             };
-            let told = tester.send(&MediaRequest::Tune(tuning)).and_then(|()| tester.send(&MediaRequest::Devices { input, output }));
+            // The meter is of the microphone as a call would send it: processed.
+            let told = tester
+                .send(&MediaRequest::Tune(tuning))
+                .and_then(|()| tester.send(&MediaRequest::Devices { input, output }))
+                .and_then(|()| tester.send(&MediaRequest::Processing(processing)));
             told.map_err(CallError::Media)?;
             *held = Some(tester);
         }
@@ -600,8 +641,9 @@ impl Calls {
     }
 
     /// Settings' microphone test. In a call it is the call's own meter; otherwise a test mediad
-    /// carries it, and stops it after 30 s by itself.
-    pub fn test_microphone(&self, hub: &Arc<Hub>, on: bool) -> Result<(), CallError> {
+    /// carries it, and stops it after 30 s by itself. `loopback` also plays the microphone back,
+    /// processed, on the speaker; only outside a call, where nobody else is listening.
+    pub fn test_microphone(&self, hub: &Arc<Hub>, on: bool, loopback: bool) -> Result<(), CallError> {
         if self.in_call() {
             return self.meter(hub, on);
         }
@@ -613,12 +655,12 @@ impl Calls {
             }
             return Ok(());
         }
+        let ask = |tester: &mut Tester| tester.send(&MediaRequest::Meter { on: true }).and_then(|()| tester.send(&MediaRequest::Loopback { on: loopback }));
         let tester = self.tester(hub, &mut held)?;
-        let asked = tester.send(&MediaRequest::Meter { on: true });
-        if asked.is_err() {
+        if ask(tester).is_err() {
             // It had just exited: start it again.
             *held = None;
-            self.tester(hub, &mut held)?.send(&MediaRequest::Meter { on: true }).map_err(CallError::Media)?;
+            ask(self.tester(hub, &mut held)?).map_err(CallError::Media)?;
         }
         Ok(())
     }
@@ -967,6 +1009,39 @@ impl Calls {
         }
     }
 
+    /// What a Tiny room asks of the call in it: the bitrate to encode at, and whether only
+    /// push-to-talk opens the microphone there. Sent when the call joins the room and whenever
+    /// the room changes.
+    pub fn tiny_room(&self, hub: &Hub, conversation: &Key, kbps: u32, push_to_talk: bool) {
+        let mut changed = false;
+        if !self.update(hub, conversation, |live| {
+            changed = live.push_to_talk != push_to_talk;
+            live.push_to_talk = push_to_talk;
+        }) {
+            return;
+        }
+        let _ = self.request(hub, &MediaRequest::Bitrate { kbps });
+        if changed {
+            let mode = input_mode(&hub.settings(), push_to_talk);
+            let _ = self.request(hub, &MediaRequest::Input(mode));
+        }
+    }
+
+    /// The call in `from` is now the call in `to`, with the same mediad, devices, mute and
+    /// deafen: a Tiny server moved us. Its roster is the new room's, which the adapter tells.
+    /// False when the call was not in `from`.
+    pub fn retarget(&self, hub: &Hub, from: &Key, to: Key) -> bool {
+        let moved = self.update(hub, from, |live| {
+            live.call.conversation = to;
+            live.call.participants.clear();
+        });
+        if moved {
+            self.tell(hub);
+            let _ = self.request(hub, &MediaRequest::Cue { cue: Cue::Moved });
+        }
+        moved
+    }
+
     /// Ends the call if it is in `conversation`, in whatever state, without telling the
     /// adapter: the network already knows. True if there was one.
     pub fn end_if(&self, hub: &Hub, conversation: &Key) -> bool {
@@ -1020,13 +1095,7 @@ mod tests {
     }
 
     fn person(id: &str) -> Participant {
-        Participant {
-            id: id.into(),
-            name: id.to_uppercase(),
-            speaking: false,
-            muted: false,
-            deafened: false,
-        }
+        Participant { id: id.into(), name: id.to_uppercase(), ..Participant::default() }
     }
 
     #[test]
