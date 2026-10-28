@@ -102,7 +102,7 @@ impl Shell {
             .on_click(cx.listener(|this, _, _, cx| this.tiny_toggle_deafen(cx)));
         let cog = panel_button("tiny-panel-settings", "icons/settings.svg", false)
             .tooltip(tip("Voice settings", None))
-            .on_click(|_, _, cx| crate::gui::settings::open(crate::gui::settings::Section::Audio, cx));
+            .on_click(|_, _, cx| crate::gui::settings::open(crate::gui::settings::Section::Voice, cx));
         Some(
             div()
                 .flex_none()

@@ -54,10 +54,10 @@ or move; Kick removes, Roles is Owner / Admin / Member.
   the link: `positive`, `warning` over 120 ms or 1.5 % loss, `danger` over 250 ms or 5 %),
   `Seated in Lounge`, `Online` or `Connecting…`. Three 32 buttons: mic, headphones (each struck
   and on `danger_soft` when off; without a call they choose what the next call starts with),
-  and a cog that opens Settings › Audio & video. A click on the connection line opens a
+  and a cog that opens Settings › Voice. A click on the connection line opens a
   popover above it: channel, channel bitrate, ping, jitter, loss, sent and received kb/s, path
-  (Direct UDP, Direct TCP, Relayed) and codec, read every 3 s from `CallStats` while the call is
-  up; until mediad measures, it says what mediad said.
+  (Direct UDP, Direct TCP, Relayed) and codec, read about once a second from `CallStats` while
+  the call is up; until media flows, it says what mediad said instead.
 
 ## 2. The pane
 
@@ -81,7 +81,8 @@ or move; Kick removes, Roles is Owner / Admin / Member.
   seat glyphs repeat in the tile's corner. Right-click a tile for the person menu.
 - **Call bar,** floating 20 above the bottom: a pill on `overlay` holding round 44 buttons for
   mute, deafen and devices (Settings › Audio & video), then Leave (`danger_fill`, phone-off
-  glyph). Under it, while mediad cancels no echo, "Wear headphones…". Not in the call: Join
+  glyph). Under it, only while echo cancellation is switched off in Settings › Voice, "Echo
+  cancellation is off: wear headphones…". Not in the call: Join
   channel (primary, 36) and which microphone and speaker it will use; a full channel says so.
   An empty channel is an empty state with the same Join.
 - **Member list,** 248, `sidebar` fill, hairline at its left: a search field, then groups with
@@ -101,9 +102,9 @@ Opens on right-click wherever a person is drawn: a seat, a tile, the member list
 
 - Profile (a modal with the hover card's facts, wider).
 - **For you** (anyone but me): volume, a slider 0 to 200 % with a tick at 100 that it snaps to
-  within 4 %, its value at the right; Mute for me (check). Kept per server and person in
-  `shell.prefs` (`tiny_gain`), sent as `MediaRequest::Gain` while a call is up and again when
-  one starts.
+  within 4 %, its value at the right; Mute for me (check). Sent as `CallGain` when let go:
+  chatd keeps it per account (`gain:<user id>`) and applies it to every call on that account,
+  this one at once; the menu reads chatd's kept values back.
 - **Moderation** (each where the account outranks them and holds the bit in that room):
   Server mute and Server deafen (checks), Move to ▸ (rooms with their occupancy), Disconnect
   from call, Timeout ▸ (60 s, 5 min, 10 min, 1 h, 1 day, 1 week; Remove timeout when timed

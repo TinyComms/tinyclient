@@ -33,7 +33,7 @@ use super::sidebar::Mode;
 use super::state::Shell;
 use crate::client::ask;
 use gpui::{prelude::*, Bounds, ClipboardItem, Context, Entity, Focusable, Pixels, Point, Task, Window};
-use protocol::{AccountKey, CallStats, Change, Key, Link, MediaRequest, Network, Presence, Request, Response, TinyCommunity};
+use protocol::{AccountKey, CallStats, Change, Key, Link, Network, Presence, Request, Response, TinyCommunity};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -44,7 +44,7 @@ use std::time::Duration;
 const UNMADE: &str = "The invite could not be made into a code.";
 const ROOM_NAME_SIZE: &str = "A name is 1 to 80 characters.";
 /// How often the connection's numbers are read while a call is up.
-const STATS_EVERY: Duration = Duration::from_secs(3);
+const STATS_EVERY: Duration = Duration::from_secs(1);
 
 /// What floats over the window: one at a time.
 #[derive(Clone, Debug, PartialEq)]
@@ -143,11 +143,12 @@ pub struct State {
     ban_days: Option<u32>,
     copied: bool,
 
-    /// Each person's volume and mute for me, by server and user: what the prefs keep.
+    /// Each person's volume and mute for me as last set here, by server and user, until chatd's
+    /// settings (which keep it, `CallGain`) are read again with it.
     gains: Gains,
     /// Mute and deafen chosen while not in a call, for the next one.
     preset: (bool, bool),
-    /// The call these gains and presets were last sent to.
+    /// The call the presets were last sent to.
     applied: Option<Key>,
     /// The volume slider's track, as last drawn, and whose volume is being dragged.
     slider: Rc<Cell<Option<Bounds<Pixels>>>>,
@@ -252,19 +253,16 @@ impl State {
         self.settings = None;
     }
 
-    /// The volume and mute for me kept for someone, else 100 % and heard.
+    /// The volume and mute for me kept for someone, else 100 % and heard: what was just set
+    /// here, else what chatd keeps for this account.
     pub(super) fn gain(&self, user_id: &str) -> (u16, bool) {
-        let server = self.account.as_ref().map(|account| account.account.clone()).unwrap_or_default();
-        self.gains.get(&(server, user_id.to_owned())).copied().unwrap_or((100, false))
-    }
-
-    /// What the prefs keep: server, user, percent and mute, for everyone not at the default.
-    pub(super) fn gains_kept(&self) -> Vec<(String, String, u16, bool)> {
-        kept_gains(&self.gains)
-    }
-
-    pub(super) fn keep_gains(&mut self, kept: &[(String, String, u16, bool)]) {
-        self.gains = kept.iter().map(|(server, user, percent, muted)| ((server.clone(), user.clone()), (*percent, *muted))).collect();
+        let Some(account) = self.account.as_ref() else {
+            return (100, false);
+        };
+        if let Some(set) = self.gains.get(&(account.account.clone(), user_id.to_owned())) {
+            return *set;
+        }
+        kept_gain(&crate::gui::app::prefs::values().gains(account), user_id)
     }
 
     pub(super) fn members_open(&self) -> bool {
@@ -278,10 +276,9 @@ impl State {
 
 type Gains = HashMap<(String, String), (u16, bool)>;
 
-fn kept_gains(gains: &Gains) -> Vec<(String, String, u16, bool)> {
-    let mut kept: Vec<_> = gains.iter().filter(|(_, (percent, muted))| *percent != 100 || *muted).map(|((server, user), (percent, muted))| (server.clone(), user.clone(), *percent, *muted)).collect();
-    kept.sort();
-    kept
+/// Someone's volume and mute among what chatd keeps, else 100 % and heard.
+fn kept_gain(kept: &[(String, u16, bool)], user_id: &str) -> (u16, bool) {
+    kept.iter().find(|(id, _, _)| id == user_id).map_or((100, false), |(_, percent, muted)| (*percent, *muted))
 }
 
 /// The server on show. The one already open stays, including while it is still connecting.
@@ -657,8 +654,8 @@ impl Shell {
         }
     }
 
-    /// A call that just began on this server gets everyone's volume and the mute chosen before
-    /// it; the connection's numbers are read while it lasts.
+    /// A call that just began on this server gets the mute chosen before it (everyone's volume
+    /// it has from chatd); the connection's numbers are read about once a second while it lasts.
     fn note_tiny_call(&mut self, cx: &mut Context<Self>) {
         let call = self.tiny_call().map(|call| call.conversation.clone());
         if call.is_none() {
@@ -673,20 +670,9 @@ impl Shell {
             return;
         }
         self.tiny_state.applied = call;
-        let server = self.tiny_state.account.as_ref().map(|account| account.account.clone()).unwrap_or_default();
-        let mut requests: Vec<Request> = self
-            .tiny_state
-            .gains
-            .iter()
-            .filter(|((of, _), _)| *of == server)
-            .map(|((_, user_id), (percent, muted))| Request::Media(MediaRequest::Gain { user_id: user_id.clone(), percent: *percent, muted: *muted }))
-            .collect();
         let (muted, deafened) = std::mem::take(&mut self.tiny_state.preset);
         if muted || deafened {
-            requests.push(Request::CallSet { muted, deafened });
-        }
-        if !requests.is_empty() {
-            self.off_thread(cx, move || requests.iter().for_each(|request| drop(ask(request))), |_, _, _| {});
+            self.off_thread(cx, move || ask(&Request::CallSet { muted, deafened }), |_, _, _| {});
         }
         self.tiny_state.stats_task = Some(cx.spawn(async move |this, cx| loop {
             let answer = cx.background_executor().spawn(async { ask(&Request::CallStats) }).await;
@@ -696,7 +682,11 @@ impl Shell {
                         this.tiny_state.stats = Some(stats);
                         this.tiny_state.stats_note = None;
                     }
-                    Ok(Response::Error { detail, .. }) => this.tiny_state.stats_note = Some(detail),
+                    // Before media flows mediad says why there is nothing to measure yet.
+                    Ok(Response::Error { detail, .. }) => {
+                        this.tiny_state.stats = None;
+                        this.tiny_state.stats_note = Some(detail);
+                    }
                     _ => {}
                 }
                 cx.notify();
@@ -708,7 +698,9 @@ impl Shell {
         }));
     }
 
-    /// One person's volume and mute for me: kept, and sent to the call when one is up.
+    /// One person's volume and mute for me. With `send`, chatd keeps it for this account and
+    /// applies it to the call at once (`CallGain`); without, it is only drawn (a slider being
+    /// dragged).
     pub(super) fn tiny_set_gain(&mut self, user_id: &str, percent: u16, muted: bool, send: bool, cx: &mut Context<Self>) {
         let Some(account) = self.tiny_state.account.clone() else {
             return;
@@ -716,11 +708,12 @@ impl Shell {
         let percent = percent.min(protocol::GAIN_MAX);
         self.tiny_state.gains.insert((account.account.clone(), user_id.to_owned()), (percent, muted));
         if send {
-            if self.tiny_call().is_some() {
-                let request = Request::Media(MediaRequest::Gain { user_id: user_id.to_owned(), percent, muted });
-                self.off_thread(cx, move || ask(&request), |_, _, _| {});
-            }
-            self.save_prefs(cx);
+            let request = Request::CallGain { account, user_id: user_id.to_owned(), percent, muted };
+            self.off_thread(cx, move || ask(&request), |this, answer, cx| {
+                if let Ok(Response::Error { detail, .. }) = answer {
+                    this.toast(Some(("icons/circle-alert.svg", super::theme::danger())), detail, cx);
+                }
+            });
         }
         cx.notify();
     }
@@ -1180,11 +1173,10 @@ mod tests {
     }
 
     #[test]
-    fn gains_are_kept_per_server_and_person_and_only_away_from_the_default() {
-        let mut gains = HashMap::new();
-        gains.insert(("s1".to_owned(), "a".to_owned()), (150u16, false));
-        gains.insert(("s1".to_owned(), "b".to_owned()), (100u16, false));
-        gains.insert(("s2".to_owned(), "a".to_owned()), (100u16, true));
-        assert_eq!(kept_gains(&gains), [("s1".to_owned(), "a".to_owned(), 150, false), ("s2".to_owned(), "a".to_owned(), 100, true)]);
+    fn a_volume_is_what_chatd_keeps_else_the_default() {
+        let kept = [("a".to_owned(), 150u16, false), ("b".to_owned(), 100u16, true)];
+        assert_eq!(kept_gain(&kept, "a"), (150, false));
+        assert_eq!(kept_gain(&kept, "b"), (100, true));
+        assert_eq!(kept_gain(&kept, "c"), (100, false));
     }
 }

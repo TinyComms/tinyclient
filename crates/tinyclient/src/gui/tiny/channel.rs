@@ -12,8 +12,8 @@ use gpui::{div, prelude::*, px, AnyElement, Context, Div, MouseButton, MouseDown
 use protocol::{TinyRoom, TinySeat};
 
 const TILE_W: f32 = 196.;
-/// Said under the call while mediad cancels no echo.
-const HEADPHONES: &str = "Wear headphones: tinyclient doesn't cancel echo yet, so others would hear your speakers.";
+/// Said under the call while echo cancellation is switched off in Settings → Voice.
+const HEADPHONES: &str = "Echo cancellation is off: wear headphones, or others hear themselves.";
 const TILE_H: f32 = 148.;
 
 /// A chip of words: `Push to talk`, `96 kb/s`.
@@ -254,9 +254,9 @@ impl Shell {
                 .child(leave),
         )
         .when(no_sound, |bar| bar.child(div().type_small().text_color(theme::text_faint()).child("This server has no audio turned on, so you have a seat and no sound.")))
-        // CONTRACT: mediad takes `Processing` and does nothing with it yet. Until it cancels
-        // echo, the call says to wear headphones, as `docs/product/06-calls.md` asks.
-        .when(page.audio, |bar| bar.child(div().type_small().text_color(theme::text_faint()).child(HEADPHONES)))
+        // mediad cancels echo unless it was switched off (V10); only then does the call say to
+        // wear headphones.
+        .when(page.audio && !crate::gui::app::prefs::values().processing().echo_cancellation, |bar| bar.child(div().type_small().text_color(theme::text_faint()).child(HEADPHONES)))
         .children(self.tiny_state.call_error.clone().map(|detail| div().type_small().text_color(theme::danger()).child(detail)))
     }
 }
