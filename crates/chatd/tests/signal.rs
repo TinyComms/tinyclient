@@ -346,7 +346,10 @@ fn reactions_edits_deletes_and_receipts_land_on_the_right_message() {
     assert!(world.messages(GRACE).iter().any(|m| m.id == ours.id && m.edited && m.text == "Sure!"));
     let refused = world.ask(Request::Edit { conversation: key(GRACE), message_id: again.id.clone(), text: "Not mine".into() });
     assert!(matches!(&refused, Response::Error { detail, .. } if detail.contains("own messages")), "{refused:?}");
-    // Grace read ours.
+    // Grace's phone has ours, then Grace read it.
+    assert!(!world.conversation(GRACE).unwrap().delivered);
+    world.steer(&format!("delivered grace {FIRST_SENT}"));
+    world.until("delivered", || world.conversation(GRACE)?.delivered.then_some(()));
     world.steer(&format!("seen grace {FIRST_SENT}"));
     world.until("seen", || world.conversation(GRACE)?.seen.then_some(()));
     assert_eq!(world.ask(Request::Delete { conversation: key(GRACE), message_id: ours.id.clone() }), Response::Ok);

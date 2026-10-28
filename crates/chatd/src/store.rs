@@ -19,7 +19,7 @@ use serde::Serialize;
 use std::path::Path;
 
 /// Raise this when a table changes. `open` then drops the cache and starts over.
-const SCHEMA: i32 = 4;
+const SCHEMA: i32 = 5;
 
 /// Retention: the newest messages kept per conversation.
 pub const KEEP_MESSAGES: u32 = 2_000;
@@ -137,8 +137,9 @@ const TABLES: &str = "
         preview_from TEXT NOT NULL DEFAULT '',
         preview_mine INTEGER NOT NULL DEFAULT 0,
         preview_id   TEXT NOT NULL DEFAULT '',
-        -- The newest of my messages the other side has read.
+        -- The newest of my messages the other side has read, and has received.
         seen_to   TEXT NOT NULL DEFAULT '',
+        delivered_to TEXT NOT NULL DEFAULT '',
         PRIMARY KEY (network, account, id)
     ) WITHOUT ROWID;
     CREATE INDEX conversation_threads ON conversation (network, account, parent) WHERE parent != '';
@@ -235,7 +236,10 @@ const CONVERSATION: &str = "
            c.opted_out, c.preview_from, c.preview_mine,
            (c.preview_mine AND c.seen_to != '' AND (length(c.seen_to), c.seen_to) >= (length(c.preview_id), c.preview_id)),
            (c.updated < CAST(strftime('%s', 'now') AS INTEGER) - 2592000 AND c.unread = 0 AND c.mentions = 0
-            AND NOT c.starred AND c.draft = '')
+            AND NOT c.starred AND c.draft = ''),
+           (c.preview_mine AND c.delivered_to != '' AND (length(c.delivered_to), c.delivered_to) >= (length(c.preview_id), c.preview_id)),
+           (c.preview_mine AND EXISTS (SELECT 1 FROM message f WHERE f.network = c.network AND f.account = c.account
+                                         AND f.conversation = c.id AND f.id = c.preview_id AND f.pending = 1))
     FROM conversation c
     LEFT JOIN media m ON m.network = c.network AND m.account = c.account AND m.id = c.avatar
     LEFT JOIN space s ON s.network = c.network AND s.account = c.account AND s.id = c.space
@@ -608,6 +612,8 @@ fn conversation_from(row: &Row) -> rusqlite::Result<Conversation> {
         preview_mine: row.get(43)?,
         seen: row.get(44)?,
         quiet: row.get(45)?,
+        delivered: row.get(46)?,
+        sending: row.get(47)?,
     })
 }
 
@@ -1498,6 +1504,17 @@ impl Store {
             "UPDATE conversation SET seen_to = ?4
               WHERE network = ?1 AND account = ?2 AND id = ?3
                 AND (seen_to = '' OR (length(seen_to), seen_to) < (length(?4), ?4))",
+            params![word(&conversation.network), conversation.account, conversation.id, message_id],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// My messages up to `message_id` reached the other side's device. True if the row changed.
+    pub fn set_delivered(&mut self, conversation: &Key, message_id: &str) -> rusqlite::Result<bool> {
+        let changed = self.db.execute(
+            "UPDATE conversation SET delivered_to = ?4
+              WHERE network = ?1 AND account = ?2 AND id = ?3
+                AND (delivered_to = '' OR (length(delivered_to), delivered_to) < (length(?4), ?4))",
             params![word(&conversation.network), conversation.account, conversation.id, message_id],
         )?;
         Ok(changed == 1)
@@ -2572,7 +2589,7 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use protocol::Badge;
+    use protocol::{Badge, Receipt};
 
     const NOW: i64 = 1_800_000_000;
 
@@ -2885,6 +2902,38 @@ mod tests {
         assert_eq!(ids(&store, Some("work"), Shelf::Main), ["ben", "ana"]);
         assert!(store.set_filing(&Key::new(&account, "ben"), &Filing::default()).unwrap());
         assert_eq!(ids(&store, Some("work"), Shelf::Main), ["ana"]);
+    }
+
+    #[test]
+    fn my_newest_message_goes_from_sending_to_sent_delivered_and_read_and_never_back() {
+        let (mut store, key) = store();
+        let receipt = |store: &Store| store.conversation(&key).unwrap().unwrap().receipt();
+        let mut going = Message::plain("c-1", "me", "on its way", 100, true);
+        going.state = SendState::Pending;
+        store.ingest(&key, &going, false).unwrap();
+        assert_eq!(receipt(&store), Some(Receipt::Sending));
+
+        store.ingest(&key, &Message::plain("12", "me", "there", 200, true), false).unwrap();
+        assert_eq!(receipt(&store), Some(Receipt::Sent));
+        // Received up to an older one of mine says nothing of this one.
+        assert!(store.set_delivered(&key, "9").unwrap());
+        assert_eq!(receipt(&store), Some(Receipt::Sent));
+        assert!(store.set_delivered(&key, "12").unwrap());
+        assert_eq!(receipt(&store), Some(Receipt::Delivered));
+        // A receipt that arrives late never moves the mark back.
+        assert!(!store.set_delivered(&key, "10").unwrap());
+        assert_eq!(receipt(&store), Some(Receipt::Delivered));
+        assert!(store.set_seen(&key, "12").unwrap());
+        assert_eq!(receipt(&store), Some(Receipt::Read));
+        // Read before the delivery receipt came: read it stays.
+        store.ingest(&key, &Message::plain("13", "me", "again", 300, true), false).unwrap();
+        assert!(store.set_seen(&key, "13").unwrap());
+        assert!(!store.set_delivered(&key, "12").unwrap());
+        assert_eq!(receipt(&store), Some(Receipt::Read));
+
+        // Someone else's newest has no mark.
+        store.ingest(&key, &said("14", "ok", 400), true).unwrap();
+        assert_eq!(receipt(&store), None);
     }
 
     #[test]

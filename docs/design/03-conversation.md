@@ -167,8 +167,9 @@ One list, top-aligned: the root message in full as item 0 (it scrolls away; a pi
 - **Waiting (offline, first 60 s):** as pending, plus an 18 px status line under the body: clock glyph 13 and "Waiting for Slack…" 12 in `warning`.
 - **Failed:** body back to full opacity, `danger` row bar, status line under the body: alert glyph, "Not sent · Slow mode: 8 s" 12 `danger`, then
   "Retry" (semibold `link`) and "Delete" (`text_soft`).
-- **Sent / read (Telegram and Teams direct chats):** on my newest message only, a 14 px check (`text_faint`, sent) or double check (`accent`, read) at
-  the row's right edge, on the first line.
+- **Sent / delivered / read (every network):** on my newest message only, a 12 px check (`text_faint`, sent) or double check (`text_faint`,
+  delivered; `accent`, read) after the time; on a grouped row without a header, at the row's right edge, on the first line. Discord and Slack
+  stop at sent (`06-live-signals.md` §4).
 
 ## New tokens
 `row_hover` ffffff08 · `mention_row` 7f8cff14 · `hairline_strong` ffffff24 · `code_bg` 0e0f14 · `code_inline` ffffff14 · `media_fill` 1d1f27 (opaque)

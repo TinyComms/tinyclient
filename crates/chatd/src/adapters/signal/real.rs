@@ -453,8 +453,10 @@ impl Session {
             }
             ContentBody::SynchronizeMessage(sync) => self.sync(sync).await,
             ContentBody::ReceiptMessage(ReceiptMessage { r#type, timestamp }) => {
-                if r#type == Some(receipt_message::Type::Read.into()) {
-                    self.tell(Event::Seen { by: sender, sent: timestamp });
+                // A viewed receipt (a voice message or a video played) is read and more.
+                let read = [receipt_message::Type::Read, receipt_message::Type::Viewed].map(|kind| Some(kind.into())).contains(&r#type);
+                if read || r#type == Some(receipt_message::Type::Delivery.into()) {
+                    self.tell(Event::Receipt { by: sender, sent: timestamp, read });
                 }
             }
             ContentBody::TypingMessage(TypingMessage { action, group_id, .. }) => {
