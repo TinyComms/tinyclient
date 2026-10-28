@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
+pub mod browser;
 mod call;
 pub mod crash;
 mod info;
