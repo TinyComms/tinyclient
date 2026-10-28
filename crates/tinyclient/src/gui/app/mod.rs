@@ -111,6 +111,8 @@ impl Shell {
     pub(in crate::gui) fn watch(cx: &mut Context<Self>) {
         // The Settings window reads the accounts from this shell.
         super::settings::attach(cx.entity().downgrade(), cx);
+        // The voice keys work in any app for as long as the window lives.
+        super::hotkeys::start(cx.entity().downgrade(), cx);
         cx.spawn(async move |this, cx| loop {
             let status = cx.background_executor().spawn(async { ask_within(&Request::Status, Some(service::SLOW)) }).await;
             match status {
