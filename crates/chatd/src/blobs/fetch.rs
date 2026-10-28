@@ -275,6 +275,26 @@ fn get(hosts: &Hosts, agent: &ureq::Agent, want: &Want, from: &Download, buffer:
     }
 }
 
+/// True for a failure that says nothing about the file itself: the line, the host, the session
+/// or the disk let us down a moment (no connection, a certificate that could not be checked, a
+/// timeout, a 5xx or 429). Such a failure is tried again later and never recorded; one that is
+/// about the file (gone, refused, the wrong kind, too large, a host not on the list) stands.
+pub fn passing(why: &str) -> bool {
+    const PASSING: [&str; 6] = [
+        "The download failed:",
+        "The network did not answer.",
+        "The account is not connected.",
+        "The cache directory could not be made:",
+        "The file could not be kept:",
+        "The file could not be recorded:",
+    ];
+    if PASSING.iter().any(|start| why.starts_with(start)) {
+        return true;
+    }
+    let status = why.strip_prefix("The server answered ").and_then(|rest| rest.strip_suffix('.')).and_then(|code| code.parse::<u16>().ok());
+    status.is_some_and(|status| status >= 500 || status == 429 || status == 408)
+}
+
 /// Fetches one file into `want.part` and answers its size and the address it came from, or why
 /// it could not be fetched, in words the user can read. Whatever a failure left of the part
 /// file is removed.
@@ -555,6 +575,31 @@ mod tests {
         assert!(fetched(&hosts, Network::Slack, &itself, None).is_err());
         assert_eq!(redirected("https://ca.slack-edge.com/T1-U1-72", "/avatars/a.png").as_deref(), Some("https://ca.slack-edge.com/avatars/a.png"));
         assert_eq!(redirected("https://ca.slack-edge.com/T1-U1-72", "a.png"), None);
+    }
+
+    #[test]
+    fn a_failure_of_the_line_passes_and_one_about_the_file_stands() {
+        // What a host that is down, or a certificate that could not be checked, looks like.
+        assert!(passing("The download failed: io: Connection refused (os error 10061)."));
+        assert!(passing("The download failed: tls: invalid peer certificate: UnknownIssuer."));
+        assert!(passing("The network did not answer."));
+        assert!(passing("The account is not connected."));
+        assert!(passing("The server answered 503."));
+        assert!(passing("The server answered 429."));
+        assert!(!passing("The file is no longer there (404)."));
+        assert!(!passing("The file is no longer there (403)."));
+        assert!(!passing("The server answered 410."));
+        assert!(!passing("The server answered 302."));
+        assert!(!passing("The server sent \"text/html\", not the file."));
+        assert!(!passing("The file is larger than 1 MB."));
+        assert!(!passing("Discord does not serve files from that address."));
+        // A host that refuses to connect is the line, not the file: it is not recorded.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = closed.local_addr().unwrap().port();
+        drop(closed);
+        let hosts = Hosts { local: vec![("127.0.0.1".to_owned(), Trust::Open)] };
+        let why = fetched(&hosts, Network::Discord, &format!("http://127.0.0.1:{port}/a.png"), None).unwrap_err();
+        assert!(passing(&why), "{why}");
     }
 
     #[test]

@@ -884,6 +884,50 @@ impl Context {
         self.hub.store().media_refreshed(&self.account, id, url)
     }
 
+    /// A file the adapter fetched over its own session, where the cache could not (Signal's
+    /// and Messages' pictures), kept as the cache keeps what it fetched: written under the
+    /// account's directory, registered, recorded as landed, and announced. `address` only names
+    /// where it came from; nothing fetches it. Answers the file with its path.
+    pub fn landed(&self, file: &MediaFile, address: &str, bytes: &[u8]) -> Option<MediaFile> {
+        let media = protocol::support_dir().join("media");
+        let path = crate::blobs::path_of(&media, &self.account, &file.id);
+        let part = path.with_extension("part");
+        std::fs::create_dir_all(crate::blobs::dir_under(&media, &self.account)).ok()?;
+        std::fs::write(&part, bytes).ok()?;
+        if std::fs::rename(&part, &path).is_err() {
+            let _ = std::fs::remove_file(&part);
+            return None;
+        }
+        let landed = {
+            let mut store = self.hub.store();
+            store.register_media(&self.account, &[(file.clone(), address.to_owned())]).ok()?;
+            store.media_landed(&self.account, &file.id, &path.to_string_lossy(), bytes.len() as u64, now()).ok()??
+        };
+        self.hub.changed(Change::Media { account: self.account.clone(), file: landed.clone() });
+        Some(landed)
+    }
+
+    /// A picture kept with [`Context::landed`] is the avatar of the row and of the person this
+    /// id names, whichever are recorded. Rows and people the adapter records later should name
+    /// it too, or they take it away again.
+    pub fn avatar(&self, id: &str, avatar: &str) -> Stores {
+        let (row, person) = self.hub.store().set_avatar(&self.account, id, avatar)?;
+        if row {
+            self.row_changed(id, None);
+        }
+        if person {
+            self.hub.changed(Change::People { account: self.account.clone() });
+        }
+        Ok(())
+    }
+
+    /// The avatar the row or the person of this id names now, so a row recorded again keeps it.
+    pub fn avatar_of(&self, id: &str) -> Option<String> {
+        let store = self.hub.store();
+        let row = store.conversation(&self.key(id)).ok().flatten().and_then(|row| row.avatar);
+        row.or_else(|| store.person(&self.key(id)).ok().flatten().and_then(|person| person.avatar)).map(|file| file.id)
+    }
+
     // Calls. Signalling only; mediad carries the media.
 
     /// Someone is calling us in a conversation.

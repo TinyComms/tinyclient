@@ -2265,6 +2265,21 @@ impl Store {
         )
     }
 
+    /// A picture the adapter fetched itself is the row's and the person's of this id, whichever
+    /// are recorded; nothing else of either changes. Answers (row, person): which were.
+    pub fn set_avatar(&mut self, account: &AccountKey, id: &str, avatar: &str) -> rusqlite::Result<(bool, bool)> {
+        let at = params![word(&account.network), account.account, id, avatar];
+        let row = self.db.execute(
+            "UPDATE conversation SET avatar = ?4 WHERE network = ?1 AND account = ?2 AND id = ?3 AND avatar != ?4",
+            at,
+        )?;
+        let person = self.db.execute(
+            "UPDATE person SET avatar = ?4 WHERE network = ?1 AND account = ?2 AND id = ?3 AND avatar != ?4",
+            at,
+        )?;
+        Ok((row > 0, person > 0))
+    }
+
     // Media.
 
     /// Files the network can serve and where from. A file already on disk stays there; a fresh
@@ -2323,9 +2338,9 @@ impl Store {
         Ok(self.media(account, &[id.to_owned()])?.pop().map(|(file, _)| file))
     }
 
-    /// The fetch failed, and why in plain words. Until `media_retry`, or a fresh address from
-    /// the adapter, the file is answered with this reason and not fetched. `None` when no such
-    /// file was registered.
+    /// The fetch failed because of the file, and why in plain words. Until `media_retry`, or a
+    /// fresh address from the adapter, the file is answered with this reason and not fetched.
+    /// `None` when no such file was registered. A failure of the line is not recorded here.
     pub fn media_failed(&mut self, account: &AccountKey, id: &str, reason: &str) -> rusqlite::Result<Option<MediaFile>> {
         self.db.execute(
             "UPDATE media SET failed = ?4 WHERE network = ?1 AND account = ?2 AND id = ?3 AND path IS NULL",
@@ -2347,6 +2362,26 @@ impl Store {
         }
         tx.commit()?;
         Ok(cleared)
+    }
+
+    /// Forgets every recorded failure that `passing` says was a moment's trouble rather than
+    /// the file's own: an older chatd recorded those too, and a file is not left unfetched for
+    /// them. Answers how many were forgotten.
+    pub fn media_forgive(&mut self, passing: impl Fn(&str) -> bool) -> rusqlite::Result<usize> {
+        let tx = self.db.transaction()?;
+        let failed: Vec<(String, String, String, String)> = tx
+            .prepare("SELECT network, account, id, failed FROM media WHERE failed IS NOT NULL")?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut forgiven = 0;
+        for (network, account, id, why) in failed.iter().filter(|(.., why)| passing(why)) {
+            forgiven += tx.execute(
+                "UPDATE media SET failed = NULL WHERE network = ?1 AND account = ?2 AND id = ?3 AND failed = ?4",
+                params![network, account, id, why],
+            )?;
+        }
+        tx.commit()?;
+        Ok(forgiven)
     }
 
     /// The adapter exchanged an expired address for a fresh one (`Command::Download`): keep it,
@@ -3006,6 +3041,27 @@ mod tests {
         store.forget(&account).unwrap();
         assert!(store.conversation(&key).unwrap().is_none());
         assert_eq!(store.media_bytes().unwrap(), 0);
+    }
+
+    #[test]
+    fn a_failure_of_the_line_is_forgiven_and_one_about_the_file_stands() {
+        let (mut store, key) = store();
+        let account = key.account();
+        let avatar = |id: &str| (MediaFile::new(id, protocol::MediaKind::Avatar), format!("https://cdn.example/{id}.png"));
+        store.register_media(&account, &[avatar("a"), avatar("b"), avatar("c")]).unwrap();
+        store.media_failed(&account, "a", "The download failed: tls: invalid peer certificate.").unwrap();
+        store.media_failed(&account, "b", "The file is no longer there (404).").unwrap();
+        // Registered again at the same address, a failure stands: only a fresh address clears it.
+        store.register_media(&account, &[avatar("a"), avatar("b")]).unwrap();
+        let failed = |store: &Store, id: &str| store.media(&account, &[id.to_owned()]).unwrap().pop().unwrap().0.failed;
+        assert!(failed(&store, "a").is_some());
+
+        let passing = |why: &str| why.starts_with("The download failed:");
+        assert_eq!(store.media_forgive(passing).unwrap(), 1);
+        assert_eq!(failed(&store, "a"), None);
+        assert_eq!(failed(&store, "b").as_deref(), Some("The file is no longer there (404)."));
+        assert_eq!(failed(&store, "c"), None);
+        assert_eq!(store.media_forgive(passing).unwrap(), 0);
     }
 
     #[test]

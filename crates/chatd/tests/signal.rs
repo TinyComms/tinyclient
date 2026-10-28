@@ -230,6 +230,39 @@ fn a_linked_account_connects_with_its_contacts_and_groups() {
 }
 
 #[test]
+fn a_person_on_screen_shows_their_profile_picture_and_keeps_it() {
+    let world = World::linked();
+    world.connected();
+    world.steer(&format!("incoming grace {} Hello", T0 + 5_000));
+    world.arrived(GRACE, &id(T0 + 5_000, GRACE));
+    assert!(world.conversation(GRACE).unwrap().avatar.is_none());
+    let watching = protocol::Watching { rows: vec![key(GRACE), key(CLUB)], people: vec![key(ALAN)], ..Default::default() };
+    world.ask(Request::Watch(watching.clone()));
+    world.heard(&format!("picture {GRACE}"));
+    world.heard(&format!("picture {CLUB}"));
+    world.heard(&format!("picture {ALAN}"));
+    let avatar = world.until("Grace's picture", || world.conversation(GRACE).and_then(|row| row.avatar).filter(|file| file.path.is_some()));
+    assert_eq!(avatar.kind, protocol::MediaKind::Avatar);
+    assert_eq!(&std::fs::read(avatar.path.as_deref().unwrap()).unwrap()[..4], b"\x89PNG");
+    // Her person has it too; who has none, and the group, keep the drawn face.
+    let Response::People { people, .. } = world.ask(Request::People { network: Some(Network::Signal), relation: Some(Relation::Contact), query: None, offset: 0, limit: 50 }) else {
+        panic!("no people");
+    };
+    let grace = people.iter().find(|person| person.key.id == GRACE).unwrap();
+    assert_eq!(grace.avatar.as_ref().map(|file| &file.id), Some(&avatar.id));
+    assert!(people.iter().find(|person| person.key.id == ALAN).unwrap().avatar.is_none());
+    assert!(world.conversation(CLUB).unwrap().avatar.is_none());
+
+    // Another message leaves it, and it is asked for once a connection.
+    world.steer(&format!("incoming grace {} Again", T0 + 6_000));
+    world.arrived(GRACE, &id(T0 + 6_000, GRACE));
+    world.ask(Request::Watch(watching));
+    sleep(Duration::from_millis(300));
+    assert_eq!(world.calls().iter().filter(|call| call.starts_with("picture")).count(), 3);
+    assert_eq!(world.conversation(GRACE).unwrap().avatar.map(|file| file.id), Some(avatar.id));
+}
+
+#[test]
 fn text_is_received_sent_answered_and_a_refusal_is_told() {
     let world = World::linked();
     world.connected();

@@ -182,6 +182,9 @@ pub trait Wire: Send + Sync {
     fn read(&self, read: &[(String, u64)], receipts: bool) -> Result<(), Fault>;
     /// Removes this device from the account, and what it kept here with it.
     fn unlink(&self) -> Result<(), Fault>;
+    /// A person's profile picture or a group's, opened: `None` when they have none, or we hold
+    /// no key to their profile.
+    fn picture(&self, of: &Peer) -> Result<Option<Vec<u8>>, Fault>;
     /// Ends the connection: the events end, and every later request fails.
     fn close(&self);
 }

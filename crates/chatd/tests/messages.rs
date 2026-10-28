@@ -324,6 +324,35 @@ fn a_paired_phone_lists_its_chats_and_a_text_arrives() {
 }
 
 #[test]
+fn a_chat_on_screen_shows_the_picture_the_phone_keeps_for_its_person() {
+    let world = World::linked();
+    world.connected();
+    world.until("Grace's chat", || world.conversation(GRACE).map(drop));
+    assert!(world.conversation(GRACE).unwrap().avatar.is_none());
+    let watching = protocol::Watching {
+        rows: vec![key(GRACE), key(CLUB)],
+        ..Default::default()
+    };
+    world.ask(Request::Watch(watching.clone()));
+    // Only the one-to-one chat's person is asked about; a group has no picture of its own.
+    world.heard("thumbnails participant-grace");
+    let avatar = world.until("Grace's picture", || {
+        world.conversation(GRACE).and_then(|row| row.avatar).filter(|file| file.path.is_some())
+    });
+    assert_eq!(avatar.kind, MediaKind::Avatar);
+    assert_eq!(&std::fs::read(avatar.path.unwrap()).unwrap()[..4], b"\x89PNG");
+    assert!(world.conversation(CLUB).unwrap().avatar.is_none());
+
+    // It is not asked for twice on one connection.
+    world.ask(Request::Watch(protocol::Watching { rows: vec![key(GRACE)], ..Default::default() }));
+    world.ask(Request::Watch(watching));
+    sleep(Duration::from_millis(300));
+    let asked = world.calls().iter().filter(|call| call.starts_with("thumbnails")).count();
+    assert_eq!(asked, 1);
+    assert!(world.conversation(GRACE).unwrap().avatar.is_some());
+}
+
+#[test]
 fn a_named_file_stays_a_line_a_caption_keeps_the_photo_and_a_later_file_is_fetched() {
     let world = World::linked();
     world.connected();
