@@ -1,18 +1,18 @@
 //! A QR code from bytes, with nothing borrowed: byte mode, error-correction level M, versions 1
-//! to 10 (up to 213 bytes; a Telegram login link is about 60 and lands on version 4, 33 modules
-//! a side). ISO/IEC 18004: Reed-Solomon over GF(256), the eight masks scored by the four
+//! to 15 (up to 412 bytes; a Telegram login link is about 60 and lands on version 4, 33 modules
+//! a side, and a Messages pairing link is about 230 and lands on version 11). ISO/IEC 18004: Reed-Solomon over GF(256), the eight masks scored by the four
 //! penalties, format and version information.
 //!
 //! The sheet draws what `encode` returns as filled squares; nothing here knows about pixels.
 
 /// The largest version made here. Past it a code is too fine for the 200 pt it is drawn in.
-const MAX_VERSION: usize = 10;
+const MAX_VERSION: usize = 15;
 
 /// Codewords in the whole symbol, data and correction together, by version.
-const TOTAL: [usize; MAX_VERSION] = [26, 44, 70, 100, 134, 172, 196, 242, 292, 346];
+const TOTAL: [usize; MAX_VERSION] = [26, 44, 70, 100, 134, 172, 196, 242, 292, 346, 404, 466, 532, 581, 655];
 /// Level M: correction codewords in each block, and how many blocks, by version.
-const CORRECTION: [usize; MAX_VERSION] = [10, 16, 26, 18, 24, 16, 18, 22, 22, 26];
-const BLOCKS: [usize; MAX_VERSION] = [1, 1, 1, 2, 2, 4, 4, 4, 5, 5];
+const CORRECTION: [usize; MAX_VERSION] = [10, 16, 26, 18, 24, 16, 18, 22, 22, 26, 30, 22, 22, 24, 24];
+const BLOCKS: [usize; MAX_VERSION] = [1, 1, 1, 2, 2, 4, 4, 4, 5, 5, 5, 8, 9, 9, 10];
 
 /// The two bits that name level M in the format information. L is `0b01`.
 const LEVEL_M: u32 = 0b00;
@@ -36,7 +36,7 @@ impl Qr {
     }
 }
 
-/// The smallest symbol that holds `text`, or `None` when it is longer than version 10 takes.
+/// The smallest symbol that holds `text`, or `None` when it is longer than version 15 takes.
 pub fn encode(text: &[u8]) -> Option<Qr> {
     let version = (1..=MAX_VERSION).find(|version| text.len() <= capacity(*version))?;
     let codewords = interleave(version, &data_codewords(version, text));
@@ -222,6 +222,11 @@ fn alignment(version: usize) -> &'static [usize] {
         8 => &[6, 24, 42],
         9 => &[6, 26, 46],
         10 => &[6, 28, 50],
+        11 => &[6, 30, 54],
+        12 => &[6, 32, 58],
+        13 => &[6, 34, 62],
+        14 => &[6, 26, 46, 66],
+        15 => &[6, 26, 48, 70],
         _ => &[],
     }
 }
@@ -659,8 +664,8 @@ mod tests {
         let odd: Vec<u8> = (0..=255).rev().collect();
         assert_eq!(decode(&encode(&odd[..200]).unwrap()), &odd[..200]);
         assert_eq!(decode(&encode(b"").unwrap()), b"");
-        // Past version 10 there is no code.
-        assert!(encode(&[b'a'; 214]).is_none());
+        // Past version 15 there is no code.
+        assert!(encode(&[b'a'; 413]).is_none());
     }
 
     #[test]
@@ -670,6 +675,17 @@ mod tests {
         // 200 / 33 is 6 points a module: 198 across, inside the 200 the tile leaves.
         assert_eq!(200 / qr.size(), 6);
         assert!(!qr.dark(33, 0) && !qr.dark(0, 33));
+    }
+
+    #[test]
+    fn a_messages_pairing_link_is_drawn() {
+        // The shape Google Messages answers with: its help page, then the pairing data.
+        let link = "https://support.google.com/messages/?p=web_computer#?c=Cj0AfykVEmKirgiiArHB50PkhjgeYDOpTt3b6WA6sMcvlBjKSqO01t0U9seRD9JEr/guOhSjXdDmBdNdjjQgEiB6eK1NUJBpBl8gdj5IKoYsNDZXZWn013SzCK4ATZgSHRogkLrgDh0lXYS9fgIdnhMyVLbHGS7DSb6qTdQnjF2cVt4=";
+        let qr = encode(link.as_bytes()).unwrap();
+        assert_eq!(qr.size(), 61);
+        assert_eq!(decode(&qr), link.as_bytes());
+        // 200 / 61 is 3 points a module.
+        assert_eq!(200 / qr.size(), 3);
     }
 
     #[test]

@@ -588,6 +588,10 @@ impl Sheet {
             SignInStep::Qr { link, .. } => {
                 if self.code.as_ref().is_none_or(|(old, _)| old != link) {
                     self.code = qr::encode(link.as_bytes()).map(|code| (link.clone(), Rc::new(code)));
+                    // Said, not left at "Getting a code" for good.
+                    if self.code.is_none() {
+                        self.local = Some(SignInProblem::Other { reason: "This code is too long to draw. Try again.".to_owned() });
+                    }
                 }
             }
             _ => self.code = None,
