@@ -36,10 +36,6 @@ pub const ROWS: &[Row] = &[
     row("G2", General, "", "Keep receiving when the window is closed", &[], &["background", "quit", "close", "run", "daemon"]),
     row("G4", General, "", "Install updates automatically", &[], &["update", "upgrade", "version", "install", "automatic"]),
     row("S1", Sounds, "", "Play sounds", &[], &["sound", "audio", "mute", "silent", "ding", "chime", "beep"]),
-    row("S7", Sounds, "In calls", "Someone joins or leaves", &[], &["sound", "chime", "ding", "join", "leave", "cue"]),
-    row("S8", Sounds, "In calls", "I mute, unmute or deafen", &[], &["sound", "ding", "tick", "cue", "deafen"]),
-    row("S9", Sounds, "In calls", "Connection lost or back", &[], &["sound", "ding", "cue", "disconnect", "reconnect"]),
-    row("S10", Sounds, "In calls", "Call sound volume", &[], &["volume", "loud", "quiet", "sound", "test sound", "play"]),
     row("A2", Appearance, "", "Text size", &["13 pt", "14 pt", "15 pt", "16 pt", "17 pt"], &["font", "bigger", "smaller", "zoom", "large"]),
     row("A3", Appearance, "", "Density", &["Comfortable", "Compact"], &["rows", "dense", "spacing", "compact"]),
     row("A4", Appearance, "", "Show message previews in the list", &[], &["preview", "screen sharing", "privacy", "list"]),
@@ -53,11 +49,25 @@ pub const ROWS: &[Row] = &[
     row("P3", Privacy, "", "Load images and link previews automatically", &[], &["images", "pictures", "previews", "data", "tracking"]),
     row("P4", Privacy, "", crate::host::KEEP_MESSAGES, &["7 days", "30 days", "90 days"], &["retention", "history", "delete", "days"]),
     row("V1", Audio, "Microphone", "Microphone", &[], &["input", "mic", "device", "headset"]),
-    row("V3", Audio, "Microphone", "Input level", &[], &["test", "meter", "mic", "level"]),
-    row("V6", Audio, "Microphone", "Sensitivity", &[], &["gate", "threshold", "noise", "voice activity"]),
     row("V2", Audio, "Speaker", "Speaker", &[], &["output", "headphones", "device", "speakers"]),
     row("V5", Audio, "Speaker", "Call volume", &[], &["volume", "loud", "quiet", "voices"]),
     row("V4", Audio, "Joining", "Join calls with my microphone muted", &[], &["mute", "muted", "join"]),
+    row("V8", Voice, "", "Microphone opens by", &["Voice activation", "Push to talk"], &["ptt", "push to talk", "voice activity", "vad", "open mic"]),
+    row("V3", Voice, "", "Input level", &[], &["test", "meter", "mic", "level"]),
+    row("V6", Voice, "", "Sensitivity", &[], &["gate", "threshold", "noise", "voice activity", "vad"]),
+    row("V18", Voice, "", "Hear yourself while testing", &[], &["loopback", "test", "listen", "monitor", "echo test"]),
+    row("V14", Voice, "", "Release delay", &["0 ms", "100 ms", "200 ms", "300 ms", "500 ms", "1 s"], &["ptt", "push to talk", "delay", "hold", "cut off"]),
+    row("V13", Voice, "Keys", "Push to talk", &[], &["ptt", "key", "hotkey", "shortcut", "global", "mouse"]),
+    row("V15", Voice, "Keys", "Priority push to talk", &[], &["priority", "speaker", "ptt", "hotkey", "global"]),
+    row("V16", Voice, "Keys", "Toggle mute", &[], &["mute", "hotkey", "shortcut", "global"]),
+    row("V17", Voice, "Keys", "Toggle deafen", &[], &["deafen", "hotkey", "shortcut", "global"]),
+    row("V10", Voice, "Processing", "Echo cancellation", &[], &["echo", "aec", "speakers", "feedback"]),
+    row("V11", Voice, "Processing", "Noise suppression", &[], &["noise", "background", "fan", "keyboard", "denoise"]),
+    row("V12", Voice, "Processing", "Automatic gain", &[], &["agc", "gain", "loudness", "quiet", "volume"]),
+    row("S7", Voice, "Call sounds", "Someone joins, leaves or I'm moved", &[], &["sound", "chime", "ding", "join", "leave", "move", "cue"]),
+    row("S8", Voice, "Call sounds", "I mute, unmute or deafen", &[], &["sound", "ding", "tick", "cue", "deafen"]),
+    row("S9", Voice, "Call sounds", "Connection lost, back or ended", &[], &["sound", "ding", "cue", "disconnect", "reconnect", "kicked"]),
+    row("S10", Voice, "Call sounds", "Call sound volume", &[], &["volume", "loud", "quiet", "sound", "test sound", "play"]),
     row("D1", Storage, "", "Storage used", &[], &["disk", "space", "size", "cache", "usage"]),
     row("D2", Storage, "", "Keep images and files up to", &["250 MB", "500 MB", "1 GB", "2 GB"], &["cache", "disk", "space", "limit"]),
     row("D3", Storage, "", "Clear saved messages and files", &[], &["clear", "delete", "cache", "free space"]),
@@ -93,7 +103,6 @@ pub const NOT_YET: &[(&str, &str)] = &[
     ("spell", "tinyclient has no spell checking yet."),
     ("touch id", "tinyclient has no lock yet."),
     ("camera", "tinyclient has no camera yet."),
-    ("push to talk", "tinyclient has no push to talk yet."),
     ("menu bar", crate::host::NO_TRAY_ICON),
     ("accent", "tinyclient keeps one accent colour."),
     ("font", "tinyclient keeps the system font. Text size is in Appearance."),
@@ -172,7 +181,10 @@ pub fn draws_label(id: &str) -> bool {
 /// The rows whose value chatd keeps or whose action chatd carries out: drawn disabled, and
 /// taking no change, while chatd cannot be reached.
 pub fn kept_by_chatd(id: &str) -> bool {
-    matches!(id, "G2" | "S1" | "S7" | "S8" | "S9" | "S10" | "P1" | "P2" | "P4" | "V1" | "V2" | "V3" | "V4" | "V5" | "V6" | "D1" | "D2" | "D3")
+    matches!(
+        id,
+        "G2" | "S1" | "S7" | "S8" | "S9" | "S10" | "P1" | "P2" | "P4" | "V1" | "V2" | "V3" | "V4" | "V5" | "V6" | "V8" | "V10" | "V11" | "V12" | "V13" | "V14" | "V15" | "V16" | "V17" | "D1" | "D2" | "D3"
+    )
 }
 
 pub fn find(id: &str) -> Option<&'static Row> {
@@ -260,6 +272,9 @@ mod tests {
         let ids = |query: &str| search(query).into_iter().map(|row| row.id).collect::<Vec<_>>();
         assert_eq!(ids("text size")[0], "A2");
         assert!(ids("ding").starts_with(&["S1", "S7", "S8", "S9"]));
+        assert_eq!(ids("push to talk")[0], "V13");
+        assert!(ids("push to talk").contains(&"V8"));
+        assert!(ids("echo").contains(&"V10"));
         assert!(ids("Enter").contains(&"M1"));
         assert!(ids("receipts").contains(&"P2"));
         assert!(ids("cache").contains(&"D2"));

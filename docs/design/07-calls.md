@@ -17,6 +17,7 @@ ringing_in  ──Decline / caller stops / answered elsewhere──▶ idle (+ r
 connecting  ──Cancel──▶ idle            ──refused / 10 s without a reply / mic denied──▶ failed
 in_call ──Leave──▶ idle   ──other side ends──▶ ended (4 s) ──▶ idle
 in_call ──packets stop──▶ reconnecting ──back──▶ in_call   ──30 s──▶ failed ("Connection lost")
+in_call ──Tiny server lost our media──▶ reconnecting ──fresh offer, same room──▶ in_call   (3 times in 2 min, then failed)
 in_call ──ring arrives──▶ in_call + incoming strip ──Accept──▶ confirm ──▶ leave, then connecting
 failed ──Try again──▶ ringing_out / connecting      ──Dismiss / any new call──▶ idle
 ```
@@ -103,6 +104,45 @@ Ringing shows who, an elapsed counter and Cancel, in the dock; the header pill b
 
 Popover above the devices button, 300 wide, radius 12, 6 px padding, `popover` fill, 1 px border, one shadow. MICROPHONE: radio rows 30 px (14 px radio, `accent` when chosen), "System default *MacBook Pro Microphone*" first. Then a level meter: twelve 4 px segments, 2 px gaps, `positive` when lit, labelled "Input level"; it stays live while muted so the mic can be tested, with "Muted: others can't hear you" as the label. SPEAKER: the same rows, then **Play test sound** and a link, **Call settings…** (defaults live in Settings). A device unplugged mid-call: the call continues on the system default and the sub-line reads "Now using MacBook Pro Microphone" for 4 s.
 
+## 7a. Voice controls (TeamSpeak and Mumble's bar)
+
+What a call's sound does, all in mediad and the same for a Discord and a Tiny call except where
+said. Settings › Voice (09 §4) holds the choices; the dock and the participant list show them.
+
+- **Input mode.** Voice activation opens the microphone at the V6 threshold, measured after
+  processing, and holds 260 ms through pauses. Push to talk opens it while the key is held and for
+  the release delay after (0 to 1 s, 200 ms default), then shuts at once. A Tiny room that requires
+  push to talk, or where voice activation is not allowed, is push to talk whatever the setting. The
+  priority key is push to talk that also asks the server for priority speech; it opens the
+  microphone in either mode. Our own speaking ring is lit exactly while we transmit.
+- **Keys.** Push to talk, priority push to talk, toggle mute and toggle deafen work in any app
+  (`gui/hotkeys.rs`): the shell polls the key state every 10 ms on its own thread, with no hook into
+  other apps and no administrator. Windows: any key or the middle and side mouse buttons. macOS:
+  any key or mouse button, once Input Monitoring is allowed; until then Settings says so. Linux
+  X11: any key and the middle button; the side buttons are not visible to apps there. Wayland: no
+  app may watch another's keys, so the mute and deafen keys work while tinyclient's window is in
+  front and push to talk needs an X11 session; Settings says so. Mute and deafen keys do what ⌘⇧M
+  and ⌘⇧D do.
+- **Processing.** Echo cancellation (WebRTC's AEC3), noise suppression and automatic gain (AGC2)
+  on the microphone, each a switch (V10 to V12), all on by default. The canceller hears what the
+  speaker plays, cues included. This retires the headphones advice: on speakers, others no longer
+  hear themselves.
+- **Per-person volume.** 0 to 200 % for one person, or muted for me alone, kept per account
+  (`CallGain`, V9) and applied at once. A person muted for me still lights up when they speak. For
+  the participant list's row menu: a slider 0 to 200 % with a tick at 100, and "Mute for me".
+- **Priority speech.** While someone holding priority (`Participant.priority`) speaks, everyone
+  else is played 12 dB quieter for every listener.
+- **Bitrate.** A Tiny call encodes at its room's bitrate.
+- **Connection.** `CallStats` answers with the last second: round trip, jitter, loss (per mille),
+  send and receive kb/s, the path (UDP, TCP, relay) and the codec. For a connection panel in the
+  dock, asked about once a second while it is open; refused in words before media flows.
+- **Cues.** As 09 §8, plus Moved (a moderator moved us) and Disconnected (kicked, banned, timed out,
+  or the room went), which plays out as the call ends.
+- **Reconnect.** A Tiny server that stops hearing our media while its live socket stays up takes
+  us back to the same room with a fresh offer, silently but for the Lost and Back cues, three times
+  in two minutes before the call fails in words. A server restart already did; a Discord call
+  resumes its voice session.
+
 ## 8. Ending and what remains (frames 4, 8, 9)
 
 Leave removes the bar at once. The other side ending shows "Call ended · 12:04" with Dismiss for 4 s. Each DM or group call leaves one **system row** in the conversation: 36 px, a 30 px disc with a 14 px glyph in the avatar column, 13 px `text_soft` text, the clock time, an optional 24 px pill.
@@ -134,4 +174,4 @@ Voice channels leave no rows. A failed call leaves its card in the dock, not a r
 
 ## Deliberately absent
 
-A gallery or grid; a self-view; any control over the picture; a ringtone or call sounds of our own; a pulsing ring, waveform or animated meter; a full-window call screen; a card for voice-only calls; greyed-out buttons for things not built; a second simultaneous call; per-person volume (later, as a row menu in the participant list); noise suppression, soundboard, recording, captions, reactions; a menu-bar item; a custom screen picker with thumbnails; connection-quality bars; auto-rejoin after a failure; auto-opening a share; any in-call state before the network confirms the join.
+A gallery or grid; a self-view; any control over the picture; a ringtone or call sounds of our own; a pulsing ring, waveform or animated meter; a full-window call screen; a card for voice-only calls; greyed-out buttons for things not built; a second simultaneous call; soundboard, recording, captions, reactions; a menu-bar item; a custom screen picker with thumbnails; connection-quality bars (the numbers, in words, are `CallStats`); auto-rejoin after a failure, as opposed to a blip (§7a); auto-opening a share; any in-call state before the network confirms the join.

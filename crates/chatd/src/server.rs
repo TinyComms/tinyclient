@@ -329,7 +329,12 @@ impl Chat {
             | settings::CUE_CONNECTION
             | settings::CUE_VOLUME
             | settings::VOICE_VOLUME
-            | settings::SENSITIVITY => self.hub.calls.retune(&self.hub),
+            | settings::SENSITIVITY
+            | settings::PUSH_TO_TALK
+            | settings::PTT_RELEASE_MS
+            | settings::ECHO_CANCELLATION
+            | settings::NOISE_SUPPRESSION
+            | settings::AUTO_GAIN => self.hub.calls.retune(&self.hub),
             _ => {}
         }
         Response::Ok
@@ -1858,6 +1863,21 @@ impl Chat {
                 }
                 Err(err) => call_error(err),
             },
+            // Kept per account and person, and applied to the call at once if it is on that
+            // account. A call that is not up is no reason to refuse: the choice is kept.
+            Request::CallGain { account, user_id, percent, muted } => {
+                let key = settings::gain_key(&user_id);
+                let (scope, value) = (settings::account_scope(&account), settings::gain_value(percent, muted));
+                let allowed = value.as_deref().map_or_else(|| settings::known(&scope, &key), |value| settings::valid(&scope, &key, value));
+                if !allowed {
+                    return error(ErrorCode::Refused, "That volume can't be kept for them.");
+                }
+                if let Err(err) = self.hub.set_setting(&scope, &key, value) {
+                    return internal(err);
+                }
+                self.hub.calls.gain(&self.hub, &account, user_id, percent, muted);
+                Response::Ok
+            }
             Request::CallStats => match self.hub.calls.request(&self.hub, &MediaRequest::Stats) {
                 Ok(protocol::MediaResponse::Stats(stats)) => Response::CallStats { stats },
                 Ok(protocol::MediaResponse::Refused { detail }) => error(ErrorCode::Unsupported, detail),
@@ -1927,7 +1947,7 @@ impl Chat {
                 Ok((messages, bytes)) => Response::Prunable { messages, bytes },
                 Err(err) => internal(err),
             },
-            Request::TestMicrophone { on } => match self.hub.calls.test_microphone(&self.hub, on) {
+            Request::TestMicrophone { on, loopback } => match self.hub.calls.test_microphone(&self.hub, on, loopback) {
                 Ok(()) => Response::Ok,
                 Err(err) => call_error(err),
             },

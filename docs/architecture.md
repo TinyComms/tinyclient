@@ -60,7 +60,9 @@ How the processes fit together and who may edit what. The contract itself is the
 | `Fetch {account, ids, size, retry}` | `Media {files}` | store (size, retry); `blobs` |
 | `SignIn {network, at}`, `SignOut {account}` | `Status` | server |
 | `CallStart`, `CallAccept`, `CallDecline`, `CallEnd`, `CallSet`, `Media(..)` | `Status` | `media::Calls`; `Command::Call*` |
-| `CallTalk {held, priority}`, `CallStats` | `Ok`; `CallStats {stats}` | `media::Calls` to mediad (`Talk`, `Stats`); a priority key on a Tiny call is also `call.state` `priority` |
+| `CallTalk {held, priority}`, `CallStats` | `Ok`; `CallStats {stats}` | `media::Calls` to mediad (`Talk`, `Stats`); a priority key on a Tiny call is also `call.state` `priority`. The shell's global keys (`gui/hotkeys.rs`) send `CallTalk` |
+| `CallGain {account, user_id, percent, muted}` | `Ok` | kept as the setting `gain:<user id>` in the account's scope; the call on that account gets `Gain` at once, and every call starts with its account's |
+| `TestMicrophone {on, loopback}` | `Ok` | the test mediad (`Meter`, `Loopback`, with `Processing` so its meter is the call's); in a call, the call's meter |
 | `Play(Start {account, file, path, conversation, message, title, at, rate, output} \| Pause \| Seek {at} \| Rate {rate} \| Stop)` | `Ok`; then `Change::Playback` | `playback::Player`; `mediad --play` |
 | `TinyCommunity`, `TinyInvite`, `TinyRole`, `TinyRemove`, `TinyRevoke`, `TinyRename`, `TinySignOutEverywhere`, `TinyRoomCreate`, `TinyRoomRename`, `TinyRoomDelete` | `TinyCommunity` (members, invites, audit, rooms with who sits in each, online, the server's `media`); `TinyCode`; `Ok` | `adapters::tiny` over the server's REST; seats and presence from the hub |
 | `TinyCallJoin`, `TinyCallLeave`, `TinyCallKick` | `Ok` once the server took it, or its refusal in words | `Command::Tiny`, sent on the account's live socket (`adapters/tiny/live.rs`). On a server whose `/health` says media is `up`, a join is a call with `mediad` (below); otherwise a seat only. `CallStart` on a Tiny room key is the same join |
@@ -301,13 +303,22 @@ goes out as `call.join` `sdp`; `call.answer` comes back as `TinyAnswer` (from he
 joining, with the 35 s deadline), and each `call.slots` for that `call_id` as `TinySlots`.
 `Connected` makes it `Joined` as for Discord. Mute and deafen go out as `call.state`, a hang-up
 or a failure as `call.leave` (only while the socket still sees us in the room), and `call.left`
-for us with `media_timeout`, `media_lost`, `kicked`, `room_deleted`, `joined_elsewhere`,
-`banned` or `timed_out` fails the call in words. `call.moved` (a moderator moved us) carries the
+for us with `media_timeout`, `kicked`, `room_deleted`, `joined_elsewhere`, `banned` or
+`timed_out` fails the call in words (the four that put us out play the Disconnected cue first).
+`media_lost` while the socket is up is a blip: the seat is taken again with a fresh offer, as
+after a restart, up to three times in two minutes before it fails in words too. `call.moved` (a moderator moved us) carries the
 call to the new room: the same mediad, devices, mute and deafen, a fresh `TinyOffer`, and a
 `call.join` there; the `call.left` with `moved` that goes with it ends nothing. The room's bitrate
 and push-to-talk requirement go to mediad as `Bitrate` and `Input` once the offer is made. After a server restart the live socket sends a fresh `TinyOffer` to the same
 mediad and joins again; mediad keeps its devices and takes up the new connection. str0m, its
 sockets and every packet stay in mediad (`mediad/src/tiny.rs`).
+
+The sound of a call is mediad's, the same in both kinds of call. The microphone goes through
+`process` (WebRTC's AEC3, noise suppression and AGC2, ported to Rust by `sonora`) with the mix
+played as the echo canceller's reference, then the gate as `Input` and `Talk` say (`talk`); the
+mix plays each voice at its `Gain` and ducks everyone else 12 dB under a `Priority` holder who is
+speaking (`hear`); the encoder takes `Bitrate`. `Stats` answers from what the call's loop measured
+over the last second (`stats`): round trip, jitter, loss, both rates, the ICE path.
 
 The device menu: the shell sends `Media(Meter {on})` when it opens and closes. While on, mediad
 sends `Levels` and chatd passes our input level on as `Call.level`; `Call.inputs` and

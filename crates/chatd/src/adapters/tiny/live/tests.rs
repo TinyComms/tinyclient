@@ -723,8 +723,15 @@ fn a_join_with_audio_carries_mediads_offer_out_and_the_answer_back() {
         assert_eq!(leave["type"], "call.leave");
         conn.send(json!({"type": "ok", "ref": leave["ref"]}));
         conn.send(json!({"type": "call.left", "room_id": ROOM, "user_id": ME, "reason": "left"}));
-        // Joined again, and the server loses the audio.
+        // Joined again, and the server loses the audio: a blip, so the call joins again by
+        // itself with a fresh offer, as after a restart. Three times; the fourth is the end.
         answer_join(&mut conn, "c-2");
+        for n in 0..3 {
+            conn.idle(Duration::from_millis(300));
+            conn.send(json!({"type": "call.left", "room_id": ROOM, "user_id": ME, "reason": "media_lost"}));
+            let again = answer_join(&mut conn, &format!("c-again-{n}"));
+            assert!(again["sdp"].is_string(), "a fresh offer: {again}");
+        }
         conn.idle(Duration::from_millis(300));
         conn.send(json!({"type": "call.left", "room_id": ROOM, "user_id": ME, "reason": "media_lost"}));
         // chatd hangs up after a failure; we are out of the room already, so nothing is sent.
@@ -755,6 +762,17 @@ fn a_join_with_audio_carries_mediads_offer_out_and_the_answer_back() {
     until("the call failed in words", || the_call(&running).is_some_and(|call| call.state == protocol::CallState::Failed { reason: CallFailure::Lost, detail: MEDIA_LOST.to_owned() }));
     running.live.ask(Ask::Hangup { room_id: ROOM.into() });
     std::thread::sleep(Duration::from_millis(1000));
+}
+
+#[test]
+fn a_call_that_keeps_losing_its_media_stops_joining_again() {
+    let start = Instant::now();
+    let mut recovered = Vec::new();
+    for n in 0..3 {
+        assert!(super::recovering(&mut recovered, start + Duration::from_secs(n)), "try {n}");
+    }
+    assert!(!super::recovering(&mut recovered, start + Duration::from_secs(10)), "a fourth within two minutes is given up");
+    assert!(super::recovering(&mut recovered, start + Duration::from_secs(121)), "the first has aged out");
 }
 
 #[test]

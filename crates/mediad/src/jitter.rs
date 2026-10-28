@@ -31,6 +31,8 @@ pub struct Jitter {
     idle: u32,
     pub late: u64,
     pub lost: u64,
+    /// Packets taken in time to be played.
+    pub received: u64,
 }
 
 impl Jitter {
@@ -46,7 +48,7 @@ impl Jitter {
     pub fn insert(&mut self, sequence: u16, payload: Vec<u8>) {
         let mut unwrapped = self.unwrap(sequence);
         if self.newest.is_some_and(|newest| (unwrapped - newest).abs() > RESTART) {
-            *self = Jitter { late: self.late, lost: self.lost, ..Jitter::default() };
+            *self = Jitter { late: self.late, lost: self.lost, received: self.received, ..Jitter::default() };
             unwrapped = i64::from(sequence);
         }
         if self.due.is_some_and(|due| unwrapped < due) {
@@ -54,6 +56,7 @@ impl Jitter {
             return;
         }
         self.newest = Some(self.newest.map_or(unwrapped, |newest| newest.max(unwrapped)));
+        self.received += 1;
         self.packets.insert(unwrapped, payload);
         while self.packets.len() > CAPACITY {
             let (oldest, _) = self.packets.pop_first().unwrap();

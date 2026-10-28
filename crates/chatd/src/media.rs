@@ -565,13 +565,18 @@ impl Calls {
             // The old mediad, if any, is reaped before the new one starts.
             *slot = Slot::Idle;
             let id = self.next.fetch_add(1, Ordering::Relaxed);
-            let mut active = ActiveCall::start(hub, id, conversation).map_err(CallError::Media)?;
+            let mut active = ActiveCall::start(hub, id, conversation.clone()).map_err(CallError::Media)?;
             // The user's defaults, before the voice session arrives: mediad opens the devices
             // only once it holds one. A mediad that refuses them still carries the call.
             crate::hub::lock(&active.live).call.muted = muted;
             let _ = active.request(&MediaRequest::Tune(tuning));
             let _ = active.request(&MediaRequest::Input(mode));
             let _ = active.request(&MediaRequest::Processing(processing));
+            // V9: everyone on this account whose volume for me is not the default.
+            let gains = hub.settings().gains(&conversation.account());
+            for (user_id, percent, muted) in gains {
+                let _ = active.request(&MediaRequest::Gain { user_id, percent, muted });
+            }
             if input.is_some() || output.is_some() {
                 let _ = active.request(&MediaRequest::Devices { input, output });
             }
@@ -600,6 +605,15 @@ impl Calls {
         }
         if let Some(tester) = crate::hub::lock(&self.tester).as_mut() {
             let _ = tester.send(&MediaRequest::Tune(tuning));
+            let _ = tester.send(&MediaRequest::Processing(settings.processing()));
+        }
+    }
+
+    /// One person's volume for me (V9), for the call if it is on `account`.
+    pub fn gain(&self, hub: &Hub, account: &protocol::AccountKey, user_id: String, percent: u16, muted: bool) {
+        let (call, running) = self.describe();
+        if running && call.is_some_and(|call| call.conversation.account() == *account) {
+            let _ = self.request(hub, &MediaRequest::Gain { user_id, percent, muted });
         }
     }
 
@@ -611,11 +625,15 @@ impl Calls {
                 eprintln!("chatd: the test mediad did not start: {err}");
                 CallError::Media(io::Error::other(ENGINE_MISSING))
             })?;
-            let (tuning, input, output) = {
+            let (tuning, input, output, processing) = {
                 let settings = hub.settings();
-                (settings.tuning(), settings.device(INPUT), settings.device(OUTPUT))
+                (settings.tuning(), settings.device(INPUT), settings.device(OUTPUT), settings.processing())
             };
-            let told = tester.send(&MediaRequest::Tune(tuning)).and_then(|()| tester.send(&MediaRequest::Devices { input, output }));
+            // The meter is of the microphone as a call would send it: processed.
+            let told = tester
+                .send(&MediaRequest::Tune(tuning))
+                .and_then(|()| tester.send(&MediaRequest::Devices { input, output }))
+                .and_then(|()| tester.send(&MediaRequest::Processing(processing)));
             told.map_err(CallError::Media)?;
             *held = Some(tester);
         }
@@ -623,8 +641,9 @@ impl Calls {
     }
 
     /// Settings' microphone test. In a call it is the call's own meter; otherwise a test mediad
-    /// carries it, and stops it after 30 s by itself.
-    pub fn test_microphone(&self, hub: &Arc<Hub>, on: bool) -> Result<(), CallError> {
+    /// carries it, and stops it after 30 s by itself. `loopback` also plays the microphone back,
+    /// processed, on the speaker; only outside a call, where nobody else is listening.
+    pub fn test_microphone(&self, hub: &Arc<Hub>, on: bool, loopback: bool) -> Result<(), CallError> {
         if self.in_call() {
             return self.meter(hub, on);
         }
@@ -636,12 +655,12 @@ impl Calls {
             }
             return Ok(());
         }
+        let ask = |tester: &mut Tester| tester.send(&MediaRequest::Meter { on: true }).and_then(|()| tester.send(&MediaRequest::Loopback { on: loopback }));
         let tester = self.tester(hub, &mut held)?;
-        let asked = tester.send(&MediaRequest::Meter { on: true });
-        if asked.is_err() {
+        if ask(tester).is_err() {
             // It had just exited: start it again.
             *held = None;
-            self.tester(hub, &mut held)?.send(&MediaRequest::Meter { on: true }).map_err(CallError::Media)?;
+            ask(self.tester(hub, &mut held)?).map_err(CallError::Media)?;
         }
         Ok(())
     }
@@ -1018,6 +1037,7 @@ impl Calls {
         });
         if moved {
             self.tell(hub);
+            let _ = self.request(hub, &MediaRequest::Cue { cue: Cue::Moved });
         }
         moved
     }

@@ -227,7 +227,10 @@ pub enum MediaRequest {
     Gain { user_id: String, percent: u16, muted: bool },
     /// How our microphone opens: by voice activation, or only while push-to-talk is held.
     Input(InputMode),
-    /// The push-to-talk key is down or up. In voice activation it does nothing.
+    /// The push-to-talk key (`priority` false) or the priority key (`priority` true) is down
+    /// or up; each is tracked on its own, so letting go of one while the other is held keeps
+    /// the microphone open. In voice activation the plain key does nothing; the priority key
+    /// opens the microphone in either mode, since speaking over everyone is its point.
     Talk { held: bool, priority: bool },
     /// Who in the call holds priority speech now. While any of them is speaking, everyone else
     /// is played [`PRIORITY_DUCK_DB`] quieter.
@@ -236,8 +239,11 @@ pub enum MediaRequest {
     Processing(AudioProcessing),
     /// What our voice is encoded at, in kb/s (a Tiny room's bitrate, 16 to 128).
     Bitrate { kbps: u32 },
-    /// How the connection is doing. Answered `Stats`.
+    /// How the connection is doing. Answered `Stats`, or `Refused` before media flows.
     Stats,
+    /// Settings' microphone test plays the microphone back on the speaker, through the same
+    /// processing a call uses. Only in `mediad test`; a call refuses it.
+    Loopback { on: bool },
 }
 
 /// The loudest one participant may be set, in percent.
@@ -348,6 +354,10 @@ pub enum Cue {
     Undeafened,
     Lost,
     Back,
+    /// A moderator moved us to another room (S7, with joins and leaves).
+    Moved,
+    /// We were put out of the call: kicked, banned, timed out, or the room went (S9).
+    Disconnected,
     /// "Play test sound": the join cue, whatever the switches say.
     Test,
 }

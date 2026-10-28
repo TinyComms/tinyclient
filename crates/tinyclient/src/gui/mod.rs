@@ -12,6 +12,7 @@ mod chrome;
 mod components;
 mod composer;
 mod conversation;
+mod hotkeys;
 mod input;
 mod layout;
 mod pane;

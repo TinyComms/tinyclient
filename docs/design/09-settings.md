@@ -83,8 +83,8 @@ A dropdown (3.4), fixed 160 wide, then 4, then an icon-only ghost button 28 × 2
 
 The play button plays the selected sound once; while it plays the glyph is `square` 14 and the tooltip "Stop". Picking a new sound from the menu plays it once too, as macOS Sound settings do; moving through the open menu does not. One sound at a time: a new play stops the last. With "None" selected, the play button is absent and its 32 stays reserved. Tooltip: "Play Pebble". These buttons and the play-on-pick exist only if S11 ships (product: alert-device routing); otherwise the picker sits alone, right-aligned. Role `Button`, label "Play Pebble".
 
-### 3.8 Shortcut recorder (not in v1)
-Specified for V8 push to talk, which is Later; no recorder is in the v1 build, and the Shortcuts section is read-only. An input 140 × 28, showing the shortcut as keycaps (18 high, radius 4, `border`, 11/500 `text_soft`, padding 0 4, 2 apart) or "Click to record" in `text_faint`. Click or Return: border `focus`, text "Press a key…". The first key with or without modifiers is taken; Esc cancels; ⌫ clears to none. A clash: 12 `danger` line below, "⌘⇧M is already Mute.", and the old value stays. A global key that needs Input Monitoring shows the banner of §6 when recorded.
+### 3.8 Key recorder
+For the voice keys (V13, V15 to V17); the Shortcuts section stays read-only. An input 140 × 28, showing the key as one keycap (18 high, radius 4, `border`, 11/500, padding 0 4) or "Click to record" in `text_faint`. Click or Return: border `accent`, text "Press a key…", and the global keys stop until it is done. The first key with or without modifiers is taken; a modifier pressed and let go alone is taken alone (a whole Ctrl key for push to talk); the middle and side mouse buttons are taken anywhere in the window. Esc cancels; ⌫ clears to none, as does the reset slot ("Clear Push to talk"). A clash: 12 `danger` line below, "F13 is already Toggle mute.", and the old value stays. On macOS, recording asks for Input Monitoring once, and the Voice section shows the §6 banner until it is allowed.
 
 ### 3.9 Per-network override row
 One row per signed-in account, in rail order, grouped under a label such as "Each account". Leading: the network's mark 16 in full color (01 Icons), 8 gap, then the account name 13/18 `text` ("Lumen Labs", "mira.k"). Two accounts on one network show the network in a second line: "Slack · mira@halden.example". Trailing: the same control as the global row, as an inheriting dropdown (3.4), or a switch where the setting has no global value (P1, P2). Accounts that are signed out keep their row, mark at 40% opacity. No accounts: the group is absent.
@@ -143,12 +143,7 @@ Captions. Under the first group: "Conversations you muted never notify." Under E
 | Notification sounds | "Ring" (S4) | Sound picker: "Soft ring" / "Classic ring" / "System alert sound" / "None" | |
 | Each account | One row per account (S5) | Sound picker, inheriting | |
 | Conversations | One row per conversation with its own sound (S6): avatar 20, title 13/18 | Sound picker, inheriting; reset removes the row | |
-| In calls | "Someone joins or leaves" (S7) | Switch | |
-| In calls | "I mute, unmute or deafen" (S8) | Switch | |
-| In calls | "Connection lost or back" (S9) | Switch | |
-| In calls | "Call sound volume" (S10) | Slider 0 to 100 %, ticks none, default 50 %, then the play button (S12) | |
-
-Captions. Under Notification sounds: "Notification sounds use the alert volume in System Settings › Sound." with the link "Open Sound Settings". Under Conversations: "Give one conversation its own sound from its Notifications… menu." When no conversation has one, the Conversations group is absent and this caption sits under Each account instead. Under In calls: "Call sounds play on your call speaker, quieter than voices. Voice volume is in Audio & video." S12's tooltip names the device: "Play test sound on AirPods Pro".
+Captions. Under Notification sounds: "Notification sounds use the alert volume in System Settings › Sound." with the link "Open Sound Settings". Under Conversations: "Give one conversation its own sound from its Notifications… menu." When no conversation has one, the Conversations group is absent and this caption sits under Each account instead. The call sounds (S7 to S10, S12) are in Voice; the last caption here says so.
 
 ### Appearance
 | Row | Control | Second line |
@@ -186,14 +181,30 @@ Captions. Under the read group: "Discord and Slack have no read receipts." If no
 | Group | Row | Control | Second line |
 |---|---|---|---|
 | Microphone | "Microphone" (V1) | Device picker | |
-| Microphone | "Input level" (V3) and "Sensitivity" (V6), one row | Level meter, then secondary button "Test" (while on: "Stop"); under the meter, the V6 slider 0 to 100, default tick at 25, value "25" | "Below the line nothing is sent and your speaking ring stays off." While testing: "Speak normally. Green is what others would hear." |
 | Speaker | "Speaker" (V2) | Device picker | |
 | Speaker | "Call volume" (V5) | Slider 0 to 100 %, default 100 % | |
 | Joining | "Join calls with my microphone muted" (V4) | Switch | |
 
 The meter row is min 96 tall (8, 28, 6, 28, 2, 16, 8): "Input level" left of the meter and "Test" on the first line, "Sensitivity" left of the slider on the second, the second line under both. Without the meter (§6), Sensitivity is an ordinary slider row. **Test is a toggle, not a hold** (product said held): holding a key or button is impossible for many keyboard and switch users. A test stops on "Stop", after 30 s, when the section changes or the window closes; mediad then exits within 3 s as specified. During a call, Test uses the running mediad and starts nothing.
 
-Caption under Speaker: "Picking a device in a call's menu changes that call only. These are the defaults." Echo cancellation has no row; it is always on.
+Caption under Microphone: "How your microphone opens, its level and its processing are in Voice." Caption under Speaker: "Picking a device in a call's menu changes that call only. These are the defaults."
+
+### Voice
+How the microphone opens, the voice keys, the processing and the call sounds (07 §7a).
+
+| Group | Row | Control | Second line |
+|---|---|---|---|
+| | "Microphone opens by" (V8) | Segmented: "Voice activation" / "Push to talk" | |
+| | "Input level" (V3) and "Sensitivity" (V6), one row | Level meter, then secondary button "Test" (while on: "Stop"); under the meter, the V6 slider 0 to 100, default tick at 25, value "25". The slider is the threshold: dragging it moves the line over the meter | "Below the line nothing is sent and your speaking ring stays off." While testing: "Speak normally. Green is what others would hear." In push to talk the line does nothing, and the second line says so |
+| | "Hear yourself while testing" (V18) | Switch, the window's own, off | "Plays your microphone back as others would hear it. Not during a call." |
+| | "Release delay" (V14), push to talk only | Stepped slider, six stops: 0, 100, 200 (default), 300, 500 ms, 1 s | |
+| Keys | "Push to talk" (V13), "Priority push to talk" (V15), "Toggle mute" (V16), "Toggle deafen" (V17) | Key recorder (3.8) | V15: "Push to talk that also asks to be heard over everyone, where you hold priority speech." A side button where the system hides them: "This system doesn't show the mouse's side buttons to apps. Pick a key." |
+| Processing | "Echo cancellation" (V10), "Noise suppression" (V11), "Automatic gain" (V12) | Switch, on | Each when off: "Wear headphones, or others hear themselves when you talk." / "Fans, typing and traffic go through as they are." / "Your voice is sent at the level your microphone gives." |
+| Call sounds | S7 "Someone joins, leaves or I'm moved", S8, S9 "Connection lost, back or ended", S10 | As they were in Sounds | |
+
+Captions. Under the first group: "A room that requires push to talk uses it, whatever you pick here."; in push to talk with no key: "Pick a push-to-talk key below: until then your microphone never opens." Under Keys, by what the system allows: "These keys work in any app, even with tinyclient in the background." / on macOS without Input Monitoring, the §6 banner over the section with "Open System Settings" (Privacy › Input Monitoring) / on Wayland: "This system shows keys only to the app in front: they work while tinyclient's window is, and push to talk needs an X11 session." Under Processing: "Echo cancellation takes out what your speakers play, so others don't hear themselves when you talk without headphones." Under Call sounds: as Sounds' In calls caption was.
+
+The meter during a test outside a call is of the microphone as a call would send it (processed); in a call it is the call's own meter. Test with V18 on plays the processed microphone back, with the echo canceller hearing what is played, so a test on speakers does not howl.
 
 ### Storage
 | Row | Control |
@@ -286,6 +297,8 @@ All are generated from code by one synthesiser, so the licence is the repository
 | Cue | Recipe | Length |
 |---|---|---|
 | Someone joins / leaves | Two sines, E5 → A5 (659 → 880 Hz) / A5 → E5, 90 ms each | 180 ms |
+| I'm moved (with S7) | Three sines, A5 → E5 → A5, 70 ms each | 210 ms |
+| I'm put out: kicked, banned, timed out, the room deleted (with S9) | E4 for 100 ms, then A3 (220 Hz) for 200 ms; plays out as the call ends | 300 ms |
 | I mute / unmute | One tick, sine 440 / 880 Hz, 60 ms decay | 60 ms |
 | I deafen / undeafen | Two ticks, one after the other (60 ms each), 440 / 880 Hz | 120 ms |
 | Connection lost / back | Two sines, A4 → E4 (440 → 330 Hz) / E4 → A4, 125 ms each | 250 ms |
@@ -351,13 +364,13 @@ New Lucide glyphs: `sun-moon`, `hard-drive`, `command`, `play`, `rotate-ccw`, at
 
 ## In this build (2026-10-14)
 
-The window has Accounts, General, Sounds, Appearance, Messages, Privacy, Audio & video, Storage, Shortcuts and About; ⌘1 to ⌘9 reach the first nine in that order. Notifications is absent, and so are Sounds' notification groups, S11's play buttons and the Theme row (product: Built so far). Sounds therefore holds S1 and In calls, and S1's second line says it silences calls. The pieces live in `crates/tinyclient/src/gui/settings/`: `rows.rs` (the row table, search, Shortcuts), `controls.rs` (card, row, switch, slider, meter, reset slot), `pages.rs` (sections, results, modals, device menus). Device pickers are as wide as their words, 120 to 240, and say "System default" alone; the menu, up to 440 wide, names the default device and takes ↑ ↓ Return Space and letters. The section list is one Tab stop. Two-line rows grow 2 a text step. The Accounts row's ⋯ menu, the time field and the conversation popover (§5) wait on Notifications.
+The window has Accounts, General, Sounds, Appearance, Messages, Privacy, Audio & video, Voice, Storage, Shortcuts and About; ⌘1 to ⌘9 reach the first nine in that order. Notifications is absent, and so are Sounds' notification groups, S11's play buttons and the Theme row (product: Built so far). Sounds therefore holds S1 alone (the call sounds are in Voice), and S1's second line says it silences calls. The pieces live in `crates/tinyclient/src/gui/settings/`: `rows.rs` (the row table, search, Shortcuts), `controls.rs` (card, row, switch, slider, meter, reset slot), `pages.rs` (sections, results, modals, device menus). Device pickers are as wide as their words, 120 to 240, and say "System default" alone; the menu, up to 440 wide, names the default device and takes ↑ ↓ Return Space and letters. The section list is one Tab stop. Two-line rows grow 2 a text step. The Accounts row's ⋯ menu, the time field and the conversation popover (§5) wait on Notifications.
 
 ## Deliberately absent
 
 - Disabled rows for unbuilt features, "coming soon", "beta" or "experimental" labels.
-- A key editor (Shortcuts is read-only; the recorder in 3.8 exists only for V8, Later).
-- A slider for notification volume; toggles for echo cancellation, gain or noise suppression.
+- A key editor (Shortcuts is read-only; the recorder in 3.8 exists only for the voice keys).
+- A slider for notification volume.
 - Previewing sounds while moving through an open menu; any looping preview; a waveform.
 - Per-row "changed" dots or accent marks; color for inherited values beyond grey.
 - Animation of switches, sliders, the meter or section changes; a sliding sidebar of sections.

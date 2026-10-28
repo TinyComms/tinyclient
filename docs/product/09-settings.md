@@ -143,9 +143,9 @@ The full sound design is in the next section. The controls:
 | S4 | Ring | Picker: 2 bundled rings, "System alert sound", "None" | "Soft ring" | G | d | The sound on the incoming-call notification | v1 |
 | S5 | Per account: Message sound | Menu: "Default", the 5 sounds, "System alert sound", "None" | Default | A | d | Overrides S2 and S3 for one account, so work and friends sound different | v1 |
 | S6 | Per conversation: Sound | In Conversation › Notifications…: "Default", the 5 sounds, "System alert sound", "None" | Default | C | d | Overrides S5 for one conversation. Local only; the network never sees it | v1 |
-| S7 | In calls: someone joins or leaves | Switch | On | G | d | mediad plays the join or leave cue | v1 |
+| S7 | In calls: someone joins or leaves, or I am moved | Switch | On | G | d | mediad plays the join, leave or moved cue | v1 |
 | S8 | In calls: I mute, unmute, deafen or undeafen | Switch | On | G | d | mediad plays the matching cue | v1 |
-| S9 | In calls: connection lost or back | Switch | On | G | d | mediad plays the matching cue | v1 |
+| S9 | In calls: connection lost, back or ended | Switch | On | G | d | mediad plays the matching cue; "ended" is being kicked, banned, timed out or the room deleted | v1 |
 | S10 | Call sound volume | Slider 0 to 100 % | 50 % | G | d | Gain on the cues in S7 to S9 only. Voices are not affected | v1 |
 | S11 | Play | A small play button beside S2, S3, S4, S5 | | | | Plays that sound once, on the device the notification would use (below) | v1 |
 | S12 | Play test sound | Button beside S10 | | | | mediad plays the join cue at S10's volume on the call speaker (V2) | v1 |
@@ -201,11 +201,17 @@ no control.
 | V5 | Call volume | Slider 0 to 100 % | 100 % | G | d | Gain on everyone's voice in mediad's mix. 100 % is today's level | v1 |
 | V6 | Microphone sensitivity | Slider over the live meter, with "Default" mark | 25 (today's `VOICE`) | G | d | The voice gate threshold in mediad: below it, nothing is sent and no speaking ring shows | v1 |
 | V7 | Camera | Menu | | G | d | | Later, with camera |
-| V8 | Push to talk | Switch, key, and release delay (0, 100, 200, 300, 500 or 1000 ms) | Off, 200 ms | G | d | `push_to_talk`, `ptt_release_ms`: mediad's `Input` is push-to-talk with that delay instead of the V6 gate. A Tiny room that requires it (or where voice activation is not allowed) is push-to-talk whatever this says. The key itself is the shell's (`CallTalk`) | Protocol and chatd done; mediad and the key later |
-| V9 | Per-person volume | Row menu in the participant list | | C | d | mediad's `Gain {user_id, percent, muted}`, 0 to 200 % | Protocol done; later (07) |
-| V10 | Echo cancellation | Switch | On | G | d | `echo_cancellation`, in mediad's `Processing` | Protocol and chatd done; mediad later |
-| V11 | Noise suppression | Switch | On | G | d | `noise_suppression`, as V10 | As V10 |
-| V12 | Automatic gain | Switch | On | G | d | `auto_gain`, as V10 | As V10 |
+| V8 | Microphone opens by | Segmented: Voice activation / Push to talk (Settings › Voice) | Voice activation | G | d | `push_to_talk`: mediad's `Input` is push-to-talk with the V14 delay instead of the V6 gate. A Tiny room that requires it (or where voice activation is not allowed) is push-to-talk whatever this says | v1 |
+| V9 | Per-person volume | Row menu in the participant list | 100 %, heard | A | d | `CallGain {account, user_id, percent, muted}`, kept as `gain:<user id>` in the account's scope and sent to mediad as `Gain`, 0 to 200 % | chatd and mediad done; the row menu is the participant list's (07 §7a) |
+| V10 | Echo cancellation | Switch | On | G | d | `echo_cancellation`, in mediad's `Processing`: WebRTC AEC3 (sonora) with the call's mix as its reference | v1 |
+| V11 | Noise suppression | Switch | On | G | d | `noise_suppression`, as V10 | v1 |
+| V12 | Automatic gain | Switch | On | G | d | `auto_gain`, as V10 (AGC2, adaptive digital) | v1 |
+| V13 | Push-to-talk key | Key recorder | None | G | s | `ptt_key`, a `hotkey::Binding` (`f13`, `ctrl+shift+t`, `mouse4`, `ctrl`). The shell watches it in any app and sends `CallTalk` | v1 |
+| V14 | Release delay | Stepped slider: 0, 100, 200, 300, 500 or 1000 ms | 200 ms | G | d | `ptt_release_ms` | v1 |
+| V15 | Priority push-to-talk key | Key recorder | None | G | s | `priority_key`; `CallTalk {priority}`, and `call.state` `priority` on a Tiny server | v1 |
+| V16 | Toggle mute key | Key recorder | None | G | s | `mute_key`; does what ⌘⇧M does, in any app | v1 |
+| V17 | Toggle deafen key | Key recorder | None | G | s | `deafen_key`; as ⌘⇧D | v1 |
+| V18 | Hear yourself while testing | Switch | Off | | | The window's own: V3's test plays the processed microphone back (`TestMicrophone {loopback}`, mediad `Loopback`), outside a call | v1 |
 
 The device menu in the call dock gains "Play test sound" (S12) and "Call settings…", which opens
 this section. Picking a device in the dock changes the call and not the default; the dock marks

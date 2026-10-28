@@ -14,7 +14,7 @@
 use mediad::framing::Conn;
 use mio::net::{TcpListener, UdpSocket};
 use mio::{Events, Interest, Poll, Token};
-use protocol::{read_frame, write_frame, MediaRequest, MediaResponse, TinyOffer, TinySlot};
+use protocol::{read_frame, write_frame, CallPath, Cue, InputMode, MediaRequest, MediaResponse, TinyOffer, TinySlot};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -69,9 +69,15 @@ struct Sfu {
 
 impl Sfu {
     fn start() -> Sfu {
-        let mut udp = UdpSocket::bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        let addr = udp.local_addr().unwrap();
-        let mut listener = TcpListener::bind(addr).unwrap();
+        // One port for both. The system may hold the port UDP got for TCP (Windows reserves
+        // ranges of them, refusing with "access denied"): then another is tried.
+        let (mut udp, addr, mut listener) = (0..50)
+            .find_map(|_| {
+                let udp = UdpSocket::bind("127.0.0.1:0".parse().unwrap()).ok()?;
+                let addr = udp.local_addr().ok()?;
+                Some((udp, addr, TcpListener::bind(addr).ok()?))
+            })
+            .expect("a port free for both UDP and TCP");
         let poll = Poll::new().unwrap();
         poll.registry().register(&mut udp, UDP, Interest::READABLE).unwrap();
         poll.registry().register(&mut listener, LISTENER, Interest::READABLE).unwrap();
@@ -468,4 +474,174 @@ fn an_answer_with_no_offer_out_and_a_bad_answer_are_refused_in_words() {
     mediad.offer("ada");
     assert!(refused(mediad.ask(MediaRequest::TinyAnswer { sdp: "not an answer".into() })));
     mediad.hang_up();
+}
+
+// ---- the voice controls ----
+
+/// Everyone in `names` joins one room through `sfu`, over UDP, each told the slot map the fake
+/// keeps (each listener's slots carry the others in the order they joined), and each connected.
+fn room(sfu: &Sfu, tag: &str, names: &[&str]) -> (Vec<Mediad>, Vec<PathBuf>) {
+    let sinks: Vec<PathBuf> = names.iter().map(|name| sink(&format!("{tag}-{name}"))).collect();
+    let mut people: Vec<Mediad> = sinks.iter().map(|sink| Mediad::start("udp", sink)).collect();
+    let mut slots = Vec::new();
+    for (name, mediad) in names.iter().zip(&mut people) {
+        let offer = mediad.offer(name);
+        let (answer, mids) = sfu.join(name, &offer);
+        assert_eq!(mediad.ask(MediaRequest::TinyAnswer { sdp: answer }), MediaResponse::Done);
+        slots.push(mids);
+    }
+    for (at, mediad) in people.iter_mut().enumerate() {
+        let others = names.iter().enumerate().filter(|(other, _)| *other != at).map(|(_, name)| *name);
+        let map = others.zip(&slots[at]).map(|(user, mid)| TinySlot { mid: mid.clone(), user_id: user.into() }).collect();
+        assert_eq!(mediad.ask(MediaRequest::TinySlots { audio: map }), MediaResponse::Done);
+        mediad.event("Connected", |event| matches!(event, MediaResponse::Connected { .. }));
+    }
+    (people, sinks)
+}
+
+fn done(mediad: &mut Mediad, request: MediaRequest) {
+    assert_eq!(mediad.ask(request), MediaResponse::Done);
+}
+
+fn leave(people: Vec<Mediad>, sinks: Vec<PathBuf>) {
+    for mediad in people {
+        mediad.hang_up();
+    }
+    for sink in sinks {
+        let _ = std::fs::remove_file(sink);
+    }
+}
+
+/// Whether `name`'s frames stop reaching the SFU: none in the half second after a pause long
+/// enough for a release delay and the trail of silence after it.
+fn stays_silent(sfu: &Sfu, name: &str) -> bool {
+    sleep(Duration::from_millis(700));
+    let before = sfu.frames(name);
+    sleep(Duration::from_millis(500));
+    sfu.frames(name) == before
+}
+
+fn keeps_talking(sfu: &Sfu, name: &str) -> bool {
+    let before = sfu.frames(name);
+    sleep(Duration::from_millis(500));
+    sfu.frames(name) > before + 15
+}
+
+/// V9: one person's volume for me, and muting them for me alone. The others hear them as before.
+#[test]
+fn each_voice_plays_at_the_volume_chosen_for_it_and_a_muted_one_not_at_all() {
+    let sfu = Sfu::start();
+    let (mut people, sinks) = room(&sfu, "gain", &["ada", "bea"]);
+    wait_for("Ada hears Bea's tone", || (4000. ..7000.).contains(&played_level(&sinks[0], 0.5)));
+    done(&mut people[0], MediaRequest::Gain { user_id: "bea".into(), percent: 50, muted: false });
+    wait_for("at 50 % Bea is half as loud", || (2200. ..3500.).contains(&played_level(&sinks[0], 0.4)));
+    done(&mut people[0], MediaRequest::Gain { user_id: "bea".into(), percent: 200, muted: false });
+    wait_for("at 200 % twice as loud", || (8800. ..14_000.).contains(&played_level(&sinks[0], 0.4)));
+    done(&mut people[0], MediaRequest::Gain { user_id: "bea".into(), percent: 200, muted: true });
+    wait_for("muted for Ada, Bea is not played", || played_level(&sinks[0], 0.3) < 1.);
+    // Bea still speaks, Ada still sees it, and Bea still hears Ada.
+    people[0].event("Bea speaking", |event| matches!(event, MediaResponse::Speaking { user_id, speaking: true } if user_id == "bea"));
+    assert!((4000. ..7000.).contains(&played_level(&sinks[1], 0.5)));
+    done(&mut people[0], MediaRequest::Gain { user_id: "bea".into(), percent: 100, muted: false });
+    wait_for("back to as decoded", || (4000. ..7000.).contains(&played_level(&sinks[0], 0.4)));
+    leave(people, sinks);
+}
+
+/// While someone holding priority speech talks, everyone else is 12 dB quieter for the listener.
+/// Ada mutes Cy for herself so that only Bea is played, and Cy is still heard speaking.
+#[test]
+fn a_priority_speaker_ducks_everyone_else_by_twelve_db() {
+    let sfu = Sfu::start();
+    let (mut people, sinks) = room(&sfu, "duck", &["ada", "bea", "cy"]);
+    done(&mut people[0], MediaRequest::Gain { user_id: "cy".into(), percent: 100, muted: true });
+    wait_for("Ada hears Bea alone", || (4000. ..7000.).contains(&played_level(&sinks[0], 0.5)));
+    sleep(Duration::from_millis(500));
+    let alone = played_level(&sinks[0], 0.3);
+    done(&mut people[0], MediaRequest::Priority { user_ids: vec!["cy".into()] });
+    wait_for("Bea is ducked under Cy", || played_level(&sinks[0], 0.3) < alone / 2.);
+    sleep(Duration::from_millis(300));
+    let ducked = played_level(&sinks[0], 0.3);
+    let db = 20. * (ducked / alone).log10();
+    assert!((-13.5..-10.5).contains(&db), "ducked by {db:.1} dB");
+    // Bea's own priority is no reason to duck Bea.
+    done(&mut people[0], MediaRequest::Priority { user_ids: vec!["bea".into()] });
+    wait_for("Bea is back", || played_level(&sinks[0], 0.3) > alone * 0.8);
+    leave(people, sinks);
+}
+
+/// V8: push-to-talk sends only while the key is held and its release delay after; voice
+/// activation sends from its threshold up. The tone's level is about 74.
+#[test]
+fn push_to_talk_and_the_voice_threshold_decide_what_is_sent() {
+    let sfu = Sfu::start();
+    let (mut people, sinks) = room(&sfu, "ptt", &["ada", "bea"]);
+    let ada = &mut people[0];
+    assert!(keeps_talking(&sfu, "ada"), "voice activation at the default sends the tone");
+    done(ada, MediaRequest::Input(InputMode::Voice { threshold: 90 }));
+    assert!(stays_silent(&sfu, "ada"), "under a threshold of 90 nothing is sent");
+    done(ada, MediaRequest::Input(InputMode::Voice { threshold: 60 }));
+    assert!(keeps_talking(&sfu, "ada"));
+
+    done(ada, MediaRequest::Input(InputMode::PushToTalk { release_ms: 300 }));
+    assert!(stays_silent(&sfu, "ada"), "push-to-talk with no key held sends nothing");
+    ada.event("Ada stopped", |event| matches!(event, MediaResponse::Speaking { user_id, speaking: false } if user_id == "ada"));
+    ada.seen.clear();
+    done(ada, MediaRequest::Talk { held: true, priority: false });
+    assert!(keeps_talking(&sfu, "ada"), "held, it sends");
+    ada.event("Ada speaking", |event| matches!(event, MediaResponse::Speaking { user_id, speaking: true } if user_id == "ada"));
+    ada.seen.clear();
+    done(ada, MediaRequest::Talk { held: false, priority: false });
+    let let_go = Instant::now();
+    ada.event("Ada stopped", |event| matches!(event, MediaResponse::Speaking { user_id, speaking: false } if user_id == "ada"));
+    let after = let_go.elapsed();
+    assert!(after >= Duration::from_millis(250) && after < Duration::from_millis(800), "stopped {after:?} after the key");
+    assert!(stays_silent(&sfu, "ada"));
+    // The priority key opens it too.
+    done(ada, MediaRequest::Talk { held: true, priority: true });
+    assert!(keeps_talking(&sfu, "ada"));
+    done(ada, MediaRequest::Talk { held: false, priority: true });
+    assert!(stays_silent(&sfu, "ada"));
+    leave(people, sinks);
+}
+
+/// Stats once media flows: the path, the codec, both rates, and a bitrate that follows the
+/// room's.
+#[test]
+fn the_connection_reports_itself_and_the_bitrate_follows_the_room() {
+    let sfu = Sfu::start();
+    let (mut people, sinks) = room(&sfu, "stats", &["ada", "bea"]);
+    let stats = |mediad: &mut Mediad| match mediad.ask(MediaRequest::Stats) {
+        MediaResponse::Stats(stats) => Some(stats),
+        _ => None,
+    };
+    let ada = &mut people[0];
+    let deadline = Instant::now() + PATIENCE;
+    while !stats(ada).is_some_and(|now| now.send_kbps > 0 && now.receive_kbps > 0) {
+        assert!(Instant::now() < deadline, "Ada never measured a second both ways");
+        sleep(Duration::from_millis(100));
+    }
+    sleep(Duration::from_millis(1100));
+    let before = stats(ada).unwrap();
+    assert_eq!((before.path, before.codec.as_str()), (CallPath::Udp, "opus"), "{before:?}");
+    assert!(before.loss_permille < 50 && before.jitter_ms < 40, "{before:?}");
+    done(ada, MediaRequest::Bitrate { kbps: 16 });
+    sleep(Duration::from_millis(2200));
+    let after = stats(ada).unwrap();
+    assert!(after.send_kbps + 8 < before.send_kbps, "16 kb/s sends less: {} then {}", before.send_kbps, after.send_kbps);
+    leave(people, sinks);
+}
+
+/// The cue for being put out of the call plays out after the hang-up, before the devices go.
+#[test]
+fn the_disconnected_cue_is_heard_after_the_hang_up() {
+    let sfu = Sfu::start();
+    let (mut people, sinks) = room(&sfu, "cue", &["ada", "bea"]);
+    done(&mut people[0], MediaRequest::Audio { muted: false, deafened: true });
+    wait_for("deafened, Ada plays nothing", || played_level(&sinks[0], 0.3) < 1.);
+    let mut ada = people.remove(0);
+    done(&mut ada, MediaRequest::Cue { cue: Cue::Disconnected });
+    ada.hang_up();
+    let level = played_level(&sinks[0], 0.3);
+    assert!(level > 100., "the last of what Ada played is the cue: {level}");
+    leave(people, sinks);
 }
