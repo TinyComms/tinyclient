@@ -60,6 +60,8 @@ Hover on any rest state: `selected` fill, `text` glyph. Disabled: 40 % opacity, 
 
 **Shortcuts** work in any tinyclient window: ⌘⇧M mute, ⌘⇧D deafen, ⌘⇧H leave or cancel, ⌘⇧A accept, ⌘⇧R decline, ⌘⇧J jump to the call's conversation. Mute can also be system-wide: off by default, a Settings switch ("Mute works while tinyclient is in the background"), registered only while a call exists. Layout and navigation arbitrates any clash with these.
 
+**On a Tiny server** the dock stays, and the user panel sits under it (`10-tiny-server.md` §1): mic, headphones and the voice settings cog, and the connection line that opens ping, jitter, loss, bitrate and path. The channel's own stage carries a second set of controls, a floating pill of round buttons with Leave, under the people in the call. Volume and Mute for me are per person, in the person menu.
+
 ## 3. Outgoing and failed (frames 2, 8)
 
 Ringing shows who, an elapsed counter and Cancel, in the dock; the header pill becomes Cancel and the conversation's row preview reads "Ringing…" in `positive`. Ringing ends when the network says so; with no word from it, after 60 s as "No answer". A failure replaces the card (auto height: 28 px `warning_soft` disc with a glyph, 13 px semibold title, wrapped 11.5 px reason, a button row, a 20 px dismiss ×) and stays until dismissed or the next call.

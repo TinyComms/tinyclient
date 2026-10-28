@@ -376,14 +376,17 @@ WebM: stills.
 ## The demo (`chatd --seed-demo`, `chatd/src/demo*`)
 
 Invented data in a scratch `TINYCLIENT_DIR`, and an adapter with no network behind it
-(`demo/adapter.rs`) that answers for the six demo accounts (Discord, two Slack workspaces,
-Telegram, Teams, Signal): a send is accepted, files "upload" from their paths with progress and can be
+(`demo/adapter.rs`) that answers for the seven demo accounts (Discord, two Slack workspaces,
+Telegram, Teams, Signal, a Tiny server): a send is accepted, files "upload" from their paths with progress and can be
 cancelled, a reaction toggles, edit and delete work, a friend request can be answered, our
 presence set, a typed profile, a conversation's and a Space's info, a member list, pinned
 messages, a shared-media search and the pickers' catalogs read, a mute set, a group left, a DM
 closed, rows with no preview filled when on screen, and a call in a voice channel puts us among
 its occupants. What each account holds is listed at the top of `demo.rs` (`demo/telegram.rs`,
-`demo/teams.rs`, `demo/signal.rs`, `demo/polish.rs` for this round). Its portraits, icons and
+`demo/teams.rs`, `demo/signal.rs`, `demo/polish.rs` for this round). The Tiny server, "Night
+Shift" (`demo/tiny.rs`), has no HTTP behind it: `Chat::handle` lets the demo answer that
+account's Tiny requests first (`demo::tiny_answer`), applies what they change to the page it
+keeps, and tells the shell `Change::Tiny`. Its portraits, icons and
 photographs are files in `demo/photos/`, read when seeding and credited in `demo/photos/CREDITS.md`. The server's own tests use it as their network
 (`tests/e2e.rs`, `tests/calls.rs`, `tests/polish.rs`). Variants, comma separated: `live`,
 `expired`, `many` (50 Discord servers), `attention`, `reconnecting`. `TINYCLIENT_DEMO_VOICE` hands
