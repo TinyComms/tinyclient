@@ -141,6 +141,74 @@ unsaved changes." (or the server's refusal in `danger`), Reset, Save changes.
 **Overview:** icon 96 with Upload image (the system's file panel; sent at once, as Discord
 does) and Remove; server name with a count of 80; description (500) and welcome message (2000)
 as multi-line fields; default channel and AFK channel as pickers; the AFK timeout as `Off · 1
-min · 5 min · 15 min · 30 min · 1 hour`. Read-only cards for those who may not change it. The
-other pages are drawn by `settings/<page>.rs`, one function each, and say "Coming in this
-branch" until they are.
+min · 5 min · 15 min · 30 min · 1 hour`. Read-only cards for those who may not change it.
+
+Every page is one function in `settings/<page>.rs`; what they share (field, card, table head and
+52 rows, role chip, 28 colour swatch, check box, switch row, the allow / inherit / deny cell, a
+picker's face) is `settings/kit.rs`. A list opened from a picker is a `menu` below it. A
+confirmation is a tiny modal over the overlay; the dangerous ones ask for the server's name to
+be typed (`Type “Night Shift” to go on.`) before their action lights. A refusal shows in the
+unsaved-changes bar for a save, in the modal for a modal, else as a toast. Each page opens at
+its top.
+
+- **Roles** (manage_roles, a server with roles): a 232 column — Create role (primary, makes
+  "New role" just below my rank and picks it), then the roles most senior first, each a 36 row
+  with a grip (only below my rank), its colour dot, name, a lock when it is at or above me, and
+  its member count; @everyone last, under a hairline. Drag a role onto another to take its
+  place (`TinyRoleOrder`, drawn at once). The editor: colour dot, name and count; for a locked
+  role a `warning` note; name (not for @everyone); colour as eleven swatches (none and ten) and
+  a hex field; "Show separately in the member list"; then the permissions in five cards —
+  General, Membership, Voice, Moderation, Advanced — each row a name, one line of what it lets
+  people do, and a switch. A bit I don't hold myself is faint and can't be switched on. Delete
+  role (`danger`, asks, says how many lose it). Name, colour, hoist and permissions wait for
+  Save.
+- **Members:** search (name or email), a role filter and `n of m`; a table — check box, avatar
+  32 with presence, name in role colour (crown, `You`, `Timed out`, `Sign-in group` chips),
+  email under it for those who manage people, up to two role chips and `+n`, joined, last seen
+  (`Online` in `positive`), and `…` for the person menu (right-click works too). Only people I
+  outrank can be ticked; the head box ticks every one listed. With some ticked, a bar on
+  `accent_wash`: `n selected`, Add role ▾ and Remove role ▾ (each role with how many it would
+  change), Kick (one reason for all), Clear.
+- **Invites:** a note that a code is shown once; Create invite (the same modal as the header
+  menu), `n invites open`, Revoke all (asks). Table: label (or "No label") and when it was last
+  used, made by ("Server setup" for the owner invite printed at setup), roles, `uses / max`
+  (`∞` without a limit), expires (relative), Revoke — anyone's with manage_invites, my own with
+  create_invites.
+- **Bans:** search; table — avatar, name and email, the reason (wrapping), banned when and by
+  whom, until (`For good` or relative), Unban (asks).
+- **Channels:** Create channel (in the picked one's category) and Create category; a tree —
+  `NO CATEGORY` (a drop target), then each category (grip, name in capitals, room count) and its
+  rooms (volume glyph, name, push-to-talk and lock glyphs when they have overrides). Drag as in
+  the column (`TinyLayout`). A channel's editor: name, topic, user limit as `−  8  +` with No
+  limit, bitrate as a 280 slider 16–128 in steps of 8 with a tick at 64 and words for it
+  (`Clear speech`, `Voice, the default`, `Music`), Video and Push to talk required switches, then
+  **Permissions:** a chip per role (a dot on those with an override here) and, for the chosen
+  role, each channel permission with what someone holding only that role ends up with here
+  (`Can` in `positive`, `Can't`) and a three-cell control: deny (cross, `danger_soft`),
+  inherit (minus), allow (check, `positive_soft`). Editable where the account has manage_roles
+  and manage_channels and the role is below its rank. Delete channel / category (asks). On a
+  server older than categories, a channel has only its name. Opened from a channel's "Edit
+  channel", that channel is picked.
+- **Voice & media,** read-only: server health (audio up / down / off from `/health`, the address,
+  tinyserver's version, who is in voice), reaching the server (UDP, else TCP, port 50000; my
+  own call's path when I'm in one), each channel's limit, bitrate and talk mode, and my own
+  connection's numbers while I'm in a call here.
+- **Audit log:** Anyone ▾ and Everything ▾ (Members, Roles, Invites, Channels, Categories,
+  Voice moderation, Server) filters; a card of rows — a 32 round glyph by kind (ban, kick,
+  timeout, crown, move, mic-off, shield, user-plus, volume, server), the sentence with names
+  ("Mara Okafor changed Leila Haddad's roles."; "Server setup" when the server did it), the
+  reason when given, then `13 h ago · Oct 28, 2026 at 4:04 AM`. The setup's run of `bootstrap`
+  rows reads as one ("The server was set up, and 3 owner invites were printed."). Load older
+  entries reads the next 50 (`TinyAudit`, `before` the last row) until a short page says that's
+  everything. An older server shows the rows it sent with the page, unfiltered.
+- **Sign-in:** the provider (its name from `/v1/auth/config`, kept by chatd as
+  `TinyCommunity::provider`), the server, how many joined by sign-in group, and a note that
+  group mapping is set on the server; me — avatar, name, "Signed in through Tinyauth", email,
+  member since, user ID with Copy; Sign out everywhere (`danger`, asks; `TinySignOutEverywhere`).
+- **Danger zone** (owners): Transfer ownership — pick a member (not an owner), "Then stop being
+  an owner myself", Transfer ownership… (typed confirmation; makes them an owner first, then
+  unmakes me); Revoke every invite (typed confirmation).
+
+`--tiny-settings <page>` opens a page for a screenshot, with `--tiny-pick n` (the nth role,
+channel, or n members ticked), `--tiny-override <role>`, `--tiny-scroll <px>`, `--tiny-owner`
+and `--tiny-confirm transfer`. The demo's Night Shift has data for every page.
