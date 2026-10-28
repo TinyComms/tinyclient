@@ -374,7 +374,7 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
     }
     let api = address("TINYCLIENT_TEAMS_API", TEAMS).trim_end_matches('/').to_owned();
     let agent = ureq::Agent::config_builder()
-        .tls_config(ureq::tls::TlsConfig::builder().provider(ureq::tls::TlsProvider::NativeTls).build())
+        .tls_config(ureq::tls::TlsConfig::builder().provider(ureq::tls::TlsProvider::NativeTls).root_certs(ureq::tls::RootCerts::PlatformVerifier).build())
         .timeout_global(Some(Duration::from_secs(30)))
         .http_status_as_error(false)
         .max_redirects(0)
