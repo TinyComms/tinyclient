@@ -267,7 +267,6 @@ impl Shell {
             Item::Chat(c) => {
                 let look = match network {
                     Some(Network::Discord) if self.sidebar_state.drill.is_none() => Look { status: true, ..Look::default() },
-                    Some(Network::Telegram | Network::Teams | Network::Signal | Network::Messages) => Look { time: true, ticks: true, ..Look::default() },
                     _ => Look { time: true, context: false, ..Look::default() },
                 };
                 self.chat_row("home", &c, look, focused, cx).into_any_element()

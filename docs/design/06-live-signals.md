@@ -77,11 +77,14 @@ One 12 px glyph after the timestamp of **my newest message only**; older ones ar
 |---|---|---|
 | Pending | none; row at opacity 0.55 | all |
 | Waiting (link down, under 60 s) | none; line under the body `Waiting for Slack…`, `text_faint` | all |
-| Sent | `check`, `text_faint` | Telegram, Teams, direct chats |
-| Read | `check-check`, `accent`; tooltip `Read 9:41 AM`, or `Read` | Telegram, Teams, direct chats |
+| Sent | `check`, `text_faint`; tooltip `Sent` | all |
+| Delivered | `check-check`, `text_faint`; tooltip `Delivered` | Signal, Google Messages |
+| Read | `check-check`, `accent`; tooltip `Read 9:41 AM`, or `Read` | Telegram, Teams, Signal, Google Messages |
 | Failed | `circle-alert`, `danger`; line `Not sent · Retry · Delete · <reason>` | all |
 
-Discord and Slack have no receipts, so a sent message there shows nothing. Groups show nothing.
+Discord and Slack have no receipts, so a sent message there keeps the one `check`: it says the network has it. The
+mark is on my newest message only while it is the newest in the conversation; a grouped row without a header carries
+it at the row's right edge, on the first line (`03-conversation.md` §9).
 
 ## 5. Connection states
 Rail link dot: 7 px in an 11 px `rail` ring at the icon's bottom right. Sidebar strip: 28 px, radius 8, under the
