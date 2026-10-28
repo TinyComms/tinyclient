@@ -1426,6 +1426,10 @@ impl Chat {
     }
 
     pub fn handle(&self, request: Request) -> Response {
+        // A seeded demo's Tiny server has no HTTP behind it: the demo answers for it.
+        if let Some(answer) = crate::demo::tiny_answer(&self.hub, &request) {
+            return answer;
+        }
         match request {
             Request::Ping => Response::Pong,
             Request::Status => self.status(),

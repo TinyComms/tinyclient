@@ -1,0 +1,734 @@
+//! The demo's Tiny server, "Night Shift": a small voice community with an icon, a welcome,
+//! roles in colour, three categories of voice channels, and people seated in two calls with
+//! every state a seat can be in (speaking, muted, deafened, server-muted, suppressed, holding
+//! priority). We are Robin Vale, an admin: everything a moderator can do shows, and the owner
+//! is above us, so what the hierarchy hides shows too.
+//!
+//! A real Tiny server is read over HTTP (`adapters::tiny`); there is none behind the demo, so
+//! the server answers the Tiny requests for this account from here ([`answer`]). Each change
+//! is applied to the page kept here and told to the shell as `Change::Tiny`, so the window can
+//! be driven by hand.
+
+use super::{Fallible, Seeder, Who};
+use crate::hub::Hub;
+use protocol::{
+    AccountKey, Change, MediaKind, Network, Request, Response, TinyAccess, TinyAudit, TinyBan,
+    TinyCapabilities, TinyCategory, TinyCode, TinyCommunity, TinyInvite, TinyMember, TinyRole,
+    TinyRoom, TinySeat, TinyServerInfo, TINY_ALL, TINY_BAN_MEMBERS, TINY_CREATE_INVITES,
+    TINY_DEAFEN_MEMBERS, TINY_DISCONNECT_MEMBERS, TINY_EVERYONE_DEFAULT, TINY_KICK_MEMBERS,
+    TINY_MOVE_MEMBERS, TINY_MUTE_MEMBERS, TINY_PRIORITY_SPEAKER, TINY_TIMEOUT_MEMBERS,
+    TINY_VIEW_AUDIT_LOG,
+};
+use std::sync::Mutex;
+
+/// Our user id on the server, which is also the account's id.
+pub const ME: &str = "tiny-robin";
+const ORIGIN: &str = "https://nightshift.example";
+
+pub fn account() -> AccountKey {
+    AccountKey {
+        network: Network::Tiny,
+        account: ME.to_owned(),
+    }
+}
+
+/// The page as the demo keeps it. Set by [`seed`], changed by [`answer`].
+static PAGE: Mutex<Option<TinyCommunity>> = Mutex::new(None);
+
+const OWNER: &str = "tiny-mara";
+const DEV: &str = "tiny-dev";
+const LEILA: &str = "tiny-leila";
+const THEO: &str = "tiny-theo";
+const SAM: &str = "tiny-sam";
+const LENA: &str = "tiny-lena";
+const KOFI: &str = "tiny-kofi";
+const INES: &str = "tiny-ines";
+const PRIYA: &str = "tiny-priya";
+const PAVEL: &str = "tiny-pavel";
+
+const ADMIN: &str = "role-admin";
+const MODERATOR: &str = "role-moderator";
+const RAID: &str = "role-raid";
+const EVERYONE: &str = "role-everyone";
+
+fn member(
+    user_id: &str,
+    name: &str,
+    email: &str,
+    joined: &str,
+    roles: &[&str],
+    owner: bool,
+    last_seen: Option<&str>,
+) -> TinyMember {
+    let role = if owner {
+        "owner"
+    } else if roles.contains(&ADMIN) {
+        "admin"
+    } else {
+        "member"
+    };
+    TinyMember {
+        user_id: user_id.to_owned(),
+        email: email.to_owned(),
+        display_name: name.to_owned(),
+        role: role.to_owned(),
+        created_at: joined.to_owned(),
+        owner,
+        roles: roles.iter().map(|role| (*role).to_owned()).collect(),
+        last_seen_at: last_seen.map(str::to_owned),
+        timeout_until: None,
+        joined_via: Some("invite".to_owned()),
+    }
+}
+
+fn room(
+    id: &str,
+    name: &str,
+    category: &str,
+    position: i32,
+    topic: &str,
+    limit: u32,
+    bitrate: u32,
+    ptt: bool,
+) -> TinyRoom {
+    TinyRoom {
+        category_id: Some(category.to_owned()),
+        position,
+        topic: topic.to_owned(),
+        user_limit: limit,
+        bitrate_kbps: bitrate,
+        ptt_only: ptt,
+        ..TinyRoom::new(id, name)
+    }
+}
+
+fn seat(user_id: &str) -> TinySeat {
+    TinySeat {
+        user_id: user_id.to_owned(),
+        ..TinySeat::default()
+    }
+}
+
+fn role(
+    id: &str,
+    name: &str,
+    color: Option<&str>,
+    position: i32,
+    permissions: u64,
+    hoist: bool,
+    count: u32,
+) -> TinyRole {
+    TinyRole {
+        id: id.to_owned(),
+        name: name.to_owned(),
+        color: color.map(str::to_owned),
+        position,
+        permissions,
+        hoist,
+        default: id == EVERYONE,
+        member_count: count,
+    }
+}
+
+fn audit(
+    id: i64,
+    actor: &str,
+    actor_name: &str,
+    action: &str,
+    subject: Option<(&str, &str)>,
+    at: &str,
+    reason: &str,
+) -> TinyAudit {
+    TinyAudit {
+        id,
+        actor_id: Some(actor.to_owned()),
+        action: action.to_owned(),
+        subject: String::new(),
+        detail: String::new(),
+        created_at: at.to_owned(),
+        actor_name: actor_name.to_owned(),
+        subject_user_id: subject.map(|(id, _)| id.to_owned()),
+        subject_name: subject.map(|(_, name)| name.to_owned()).unwrap_or_default(),
+        reason: reason.to_owned(),
+    }
+}
+
+/// The page, its icon on disk, and us.
+pub fn seed(s: &mut Seeder) -> Fallible<Who> {
+    let account = account();
+    s.store.set_account(&account, "Night Shift", ME)?;
+    let look = s.look(super::png::Art::Badge);
+    let icon = s.photo(
+        &account,
+        "tiny-night-shift-icon",
+        MediaKind::Avatar,
+        "icon-night-shift.webp",
+        look,
+        128,
+        128,
+    )?;
+    let icon_path = crate::blobs::path_of(&s.media, &account, &icon.id)
+        .to_string_lossy()
+        .into_owned();
+    let me = Who {
+        id: ME.to_owned(),
+        name: "Robin Vale".to_owned(),
+        avatar: None,
+        bot: false,
+        me: true,
+    };
+    s.myself(&account, &me)?;
+
+    let members = vec![
+        member(
+            OWNER,
+            "Mara Okafor",
+            "mara@nightshift.example",
+            "2025-11-02T18:00:00Z",
+            &[],
+            true,
+            None,
+        ),
+        member(
+            ME,
+            "Robin Vale",
+            "robin@nightshift.example",
+            "2025-11-02T18:20:00Z",
+            &[ADMIN],
+            false,
+            None,
+        ),
+        member(
+            DEV,
+            "Dev Patel",
+            "dev@nightshift.example",
+            "2025-11-03T20:11:00Z",
+            &[MODERATOR, RAID],
+            false,
+            None,
+        ),
+        member(
+            LEILA,
+            "Leila Haddad",
+            "leila@nightshift.example",
+            "2025-12-14T09:30:00Z",
+            &[MODERATOR],
+            false,
+            None,
+        ),
+        member(
+            THEO,
+            "Theo Marchetti",
+            "theo@nightshift.example",
+            "2026-01-08T21:45:00Z",
+            &[RAID],
+            false,
+            None,
+        ),
+        member(
+            SAM,
+            "Sam Achterberg",
+            "sam@nightshift.example",
+            "2026-02-19T19:05:00Z",
+            &[RAID],
+            false,
+            None,
+        ),
+        member(
+            LENA,
+            "Lena Brandt",
+            "lena@nightshift.example",
+            "2026-04-02T17:40:00Z",
+            &[],
+            false,
+            None,
+        ),
+        member(
+            KOFI,
+            "Kofi Asante",
+            "kofi@nightshift.example",
+            "2026-06-21T22:10:00Z",
+            &[],
+            false,
+            None,
+        ),
+        member(
+            INES,
+            "Ines Marchetti",
+            "ines@nightshift.example",
+            "2026-07-30T16:00:00Z",
+            &[RAID],
+            false,
+            Some("2026-10-27T23:52:00Z"),
+        ),
+        member(
+            PRIYA,
+            "Priya Raman",
+            "priya@nightshift.example",
+            "2026-08-12T12:30:00Z",
+            &[],
+            false,
+            Some("2026-10-21T19:15:00Z"),
+        ),
+        TinyMember {
+            timeout_until: Some("2026-11-04T18:00:00Z".to_owned()),
+            ..member(
+                PAVEL,
+                "Pavel Orlov",
+                "pavel@nightshift.example",
+                "2026-09-03T20:20:00Z",
+                &[],
+                false,
+                Some("2026-10-28T08:03:00Z"),
+            )
+        },
+    ];
+
+    let moderation = TINY_KICK_MEMBERS
+        | TINY_TIMEOUT_MEMBERS
+        | TINY_MUTE_MEMBERS
+        | TINY_DEAFEN_MEMBERS
+        | TINY_MOVE_MEMBERS
+        | TINY_DISCONNECT_MEMBERS
+        | TINY_VIEW_AUDIT_LOG
+        | TINY_CREATE_INVITES
+        | TINY_PRIORITY_SPEAKER;
+    let roles = vec![
+        role(ADMIN, "Admin", Some("#E5484D"), 3, TINY_ALL, true, 1),
+        role(
+            MODERATOR,
+            "Moderator",
+            Some("#3FBF7A"),
+            2,
+            TINY_EVERYONE_DEFAULT | moderation | TINY_BAN_MEMBERS,
+            true,
+            2,
+        ),
+        role(
+            RAID,
+            "Raid crew",
+            Some("#A97CF8"),
+            1,
+            TINY_EVERYONE_DEFAULT | TINY_PRIORITY_SPEAKER,
+            false,
+            4,
+        ),
+        role(
+            EVERYONE,
+            "@everyone",
+            None,
+            0,
+            TINY_EVERYONE_DEFAULT,
+            false,
+            11,
+        ),
+    ];
+    let categories = vec![
+        TinyCategory {
+            id: "cat-hangout".into(),
+            name: "Hangout".into(),
+            position: 0,
+        },
+        TinyCategory {
+            id: "cat-games".into(),
+            name: "Games".into(),
+            position: 1,
+        },
+        TinyCategory {
+            id: "cat-away".into(),
+            name: "Away".into(),
+            position: 2,
+        },
+    ];
+    let mut lounge = room(
+        "room-lounge",
+        "Lounge",
+        "cat-hangout",
+        0,
+        "Come say hi. Music on Fridays.",
+        12,
+        64,
+        false,
+    );
+    lounge.participants = vec![
+        TinySeat {
+            speaking: true,
+            ..seat(OWNER)
+        },
+        seat(ME),
+        TinySeat {
+            muted: true,
+            ..seat(THEO)
+        },
+        TinySeat {
+            muted: true,
+            deafened: true,
+            ..seat(LENA)
+        },
+    ];
+    let mut music = room(
+        "room-music",
+        "Music room",
+        "cat-hangout",
+        1,
+        "High bitrate for listening together.",
+        0,
+        128,
+        false,
+    );
+    music.participants = vec![seat(LEILA)];
+    let mut raid = room(
+        "room-raid",
+        "Raid night",
+        "cat-games",
+        0,
+        "Tuesday raid. Push to talk, please.",
+        8,
+        96,
+        true,
+    );
+    raid.participants = vec![
+        TinySeat {
+            speaking: true,
+            priority: true,
+            ..seat(DEV)
+        },
+        TinySeat {
+            server_muted: true,
+            ..seat(SAM)
+        },
+        TinySeat {
+            suppressed: true,
+            ..seat(KOFI)
+        },
+    ];
+    let squad = room("room-squad", "Squad 2", "cat-games", 1, "", 4, 64, false);
+    let afk = room(
+        "room-afk",
+        "AFK",
+        "cat-away",
+        0,
+        "Quiet. People who stepped away land here.",
+        0,
+        32,
+        false,
+    );
+
+    let community = TinyCommunity {
+        role: "admin".to_owned(),
+        members,
+        invites: vec![
+            TinyInvite {
+                id: "inv-1".into(),
+                role: "member".into(),
+                created_by: ME.into(),
+                created_by_name: "Robin Vale".into(),
+                expires_at: "2026-11-03T18:00:00Z".into(),
+                label: "For Kofi's brother".into(),
+                max_uses: Some(1),
+                ..TinyInvite::default()
+            },
+            TinyInvite {
+                id: "inv-2".into(),
+                role: "member".into(),
+                created_by: OWNER.into(),
+                created_by_name: "Mara Okafor".into(),
+                expires_at: "2026-11-30T18:00:00Z".into(),
+                label: "Raid recruits".into(),
+                max_uses: Some(10),
+                uses: 3,
+                role_ids: vec![RAID.into()],
+                ..TinyInvite::default()
+            },
+        ],
+        audit: vec![
+            audit(12, ME, "Robin Vale", "member.timeout", Some((PAVEL, "Pavel Orlov")), "2026-10-28T08:04:00Z", "Spamming the raid channel"),
+            audit(11, DEV, "Dev Patel", "call.server_mute", Some((SAM, "Sam Achterberg")), "2026-10-27T21:12:00Z", "Open mic"),
+            audit(10, OWNER, "Mara Okafor", "member.roles", Some((LEILA, "Leila Haddad")), "2026-10-20T17:00:00Z", ""),
+            audit(9, OWNER, "Mara Okafor", "server.update", None, "2026-10-19T15:22:00Z", ""),
+        ],
+        origin: ORIGIN.to_owned(),
+        rooms: vec![lounge, music, raid, squad, afk],
+        online: vec![OWNER, ME, DEV, LEILA, THEO, SAM, LENA, KOFI].into_iter().map(str::to_owned).collect(),
+        media: "up".to_owned(),
+        capabilities: TinyCapabilities {
+            version: "0.4.0".to_owned(),
+            features: ["server", "roles", "categories", "bans", "timeouts", "invite_options", "audit_query", "voice_moderation"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        },
+        access: Some(TinyAccess { owner: false, roles: vec![ADMIN.into()], permissions: TINY_ALL, rank: 3 }),
+        me: ME.to_owned(),
+        server: Some(TinyServerInfo {
+            name: "Night Shift".to_owned(),
+            description: "A late-night voice hangout for a few friends who game, make music and stay up too late.".to_owned(),
+            welcome: "Welcome in. Grab a seat in the Lounge, say hi, and use push to talk in Raid night. Be kind; the mods are friendly.".to_owned(),
+            icon: Some("d3m0".to_owned()),
+            default_room_id: Some("room-lounge".to_owned()),
+            afk_room_id: Some("room-afk".to_owned()),
+            afk_timeout_secs: 900,
+            created_at: "2025-11-02T18:00:00Z".to_owned(),
+            icon_path,
+        }),
+        roles,
+        categories,
+        bans: vec![TinyBan {
+            user_id: "tiny-gone".into(),
+            display_name: "Rook".into(),
+            email: "rook@elsewhere.example".into(),
+            reason: "Harassment in voice".into(),
+            banned_by: Some(OWNER.into()),
+            banned_by_name: "Mara Okafor".into(),
+            created_at: "2026-09-30T22:00:00Z".into(),
+            expires_at: None,
+        }],
+    };
+    *PAGE.lock().unwrap() = Some(community);
+    Ok(me)
+}
+
+/// What the demo says to a Tiny request for its own account. `None` for anything else, which
+/// goes on to the real server's code.
+pub fn answer(hub: &Hub, request: &Request) -> Option<Response> {
+    let mut page = PAGE.lock().unwrap();
+    let community = page.as_mut()?;
+    let account = account();
+    let ours = |key: &AccountKey| *key == account;
+    let changed = |_: &mut TinyCommunity| {
+        hub.changed(Change::Tiny {
+            account: account.clone(),
+        });
+        Some(Response::Ok)
+    };
+    match request {
+        Request::TinyCommunity { account } if ours(account) => Some(Response::TinyCommunity {
+            community: community.clone(),
+        }),
+        Request::TinyInvite { account, role } if ours(account) => Some(code(role)),
+        Request::TinyInviteWith { account, .. } if ours(account) => Some(code("member")),
+        Request::TinyCallJoin { account, room_id } if ours(account) => {
+            for room in &mut community.rooms {
+                room.participants.retain(|seat| seat.user_id != ME);
+            }
+            if let Some(room) = community.rooms.iter_mut().find(|room| room.id == *room_id) {
+                room.participants.push(seat(ME));
+            }
+            changed(community)
+        }
+        Request::TinyCallLeave { account } if ours(account) => {
+            for room in &mut community.rooms {
+                room.participants.retain(|seat| seat.user_id != ME);
+            }
+            changed(community)
+        }
+        Request::TinyCallKick {
+            account, user_id, ..
+        } if ours(account) => {
+            for room in &mut community.rooms {
+                room.participants.retain(|seat| seat.user_id != *user_id);
+            }
+            changed(community)
+        }
+        Request::TinyCallModerate {
+            account,
+            room_id,
+            user_id,
+            server_muted,
+            server_deafened,
+        } if ours(account) => {
+            let seat = community
+                .rooms
+                .iter_mut()
+                .filter(|room| room.id == *room_id)
+                .flat_map(|room| room.participants.iter_mut())
+                .find(|seat| seat.user_id == *user_id);
+            if let Some(seat) = seat {
+                seat.server_muted = server_muted.unwrap_or(seat.server_muted);
+                seat.server_deafened = server_deafened.unwrap_or(seat.server_deafened);
+            }
+            changed(community)
+        }
+        Request::TinyCallMove {
+            account,
+            user_id,
+            room_id,
+        } if ours(account) => {
+            let mut moved = None;
+            for room in &mut community.rooms {
+                if let Some(at) = room
+                    .participants
+                    .iter()
+                    .position(|seat| seat.user_id == *user_id)
+                {
+                    moved = Some(room.participants.remove(at));
+                }
+            }
+            if let (Some(seat), Some(room)) = (
+                moved,
+                community.rooms.iter_mut().find(|room| room.id == *room_id),
+            ) {
+                room.participants.push(seat);
+            }
+            changed(community)
+        }
+        Request::TinyServerUpdate { account, edit } if ours(account) => {
+            if let Some(server) = community.server.as_mut() {
+                if let Some(name) = &edit.name {
+                    server.name = name.clone();
+                }
+                if let Some(description) = &edit.description {
+                    server.description = description.clone();
+                }
+                if let Some(welcome) = &edit.welcome {
+                    server.welcome = welcome.clone();
+                }
+                if let Some(room) = &edit.default_room_id {
+                    server.default_room_id = Some(room.clone()).filter(|room| !room.is_empty());
+                }
+                if let Some(room) = &edit.afk_room_id {
+                    server.afk_room_id = Some(room.clone()).filter(|room| !room.is_empty());
+                }
+                if let Some(secs) = edit.afk_timeout_secs {
+                    server.afk_timeout_secs = secs;
+                }
+            }
+            changed(community)
+        }
+        Request::TinyMemberRoles {
+            account,
+            user_id,
+            role_ids,
+        } if ours(account) => {
+            if let Some(member) = community
+                .members
+                .iter_mut()
+                .find(|member| member.user_id == *user_id)
+            {
+                member.roles = role_ids.clone();
+            }
+            changed(community)
+        }
+        Request::TinyTimeout {
+            account,
+            user_id,
+            until,
+            ..
+        } if ours(account) => {
+            if let Some(member) = community
+                .members
+                .iter_mut()
+                .find(|member| member.user_id == *user_id)
+            {
+                member.timeout_until = until.clone();
+            }
+            changed(community)
+        }
+        Request::TinyKick {
+            account, user_id, ..
+        }
+        | Request::TinyBan {
+            account, user_id, ..
+        }
+        | Request::TinyRemove { account, user_id }
+            if ours(account) =>
+        {
+            community
+                .members
+                .retain(|member| member.user_id != *user_id);
+            for room in &mut community.rooms {
+                room.participants.retain(|seat| seat.user_id != *user_id);
+            }
+            changed(community)
+        }
+        Request::TinyLayout { account, groups } if ours(account) => {
+            for group in groups {
+                for (position, room_id) in group.room_ids.iter().enumerate() {
+                    if let Some(room) = community.rooms.iter_mut().find(|room| room.id == *room_id)
+                    {
+                        room.category_id = group.category_id.clone();
+                        room.position = position as i32;
+                    }
+                }
+            }
+            for (position, group) in groups
+                .iter()
+                .filter_map(|group| group.category_id.as_ref())
+                .enumerate()
+            {
+                if let Some(category) = community
+                    .categories
+                    .iter_mut()
+                    .find(|category| category.id == *group)
+                {
+                    category.position = position as i32;
+                }
+            }
+            changed(community)
+        }
+        Request::TinyCategoryCreate { account, name } if ours(account) => {
+            let id = format!("cat-{}", community.categories.len() + 1);
+            let position = community.categories.len() as i32;
+            community.categories.push(TinyCategory {
+                id,
+                name: name.clone(),
+                position,
+            });
+            changed(community)
+        }
+        Request::TinyRoomCreate { account, name } if ours(account) => {
+            let id = format!("room-{}", community.rooms.len() + 1);
+            community.rooms.push(TinyRoom::new(&id, name));
+            changed(community)
+        }
+        Request::TinyRoomCreateWith { account, room } if ours(account) => {
+            let id = format!("room-{}", community.rooms.len() + 1);
+            community.rooms.push(TinyRoom {
+                category_id: room.category_id.clone(),
+                ..TinyRoom::new(&id, room.name.as_deref().unwrap_or("New channel"))
+            });
+            changed(community)
+        }
+        Request::TinyRoomDelete { account, room_id } if ours(account) => {
+            community.rooms.retain(|room| room.id != *room_id);
+            changed(community)
+        }
+        // Anything else asked of the demo server is taken and changes nothing.
+        Request::TinyRole { account, .. }
+        | Request::TinyRevoke { account, .. }
+        | Request::TinyRename { account, .. }
+        | Request::TinyRoomRename { account, .. }
+        | Request::TinyServerIcon { account, .. }
+        | Request::TinyRoleCreate { account, .. }
+        | Request::TinyRoleUpdate { account, .. }
+        | Request::TinyRoleDelete { account, .. }
+        | Request::TinyRoleOrder { account, .. }
+        | Request::TinyMemberOwner { account, .. }
+        | Request::TinyUnban { account, .. }
+        | Request::TinyCategoryRename { account, .. }
+        | Request::TinyCategoryDelete { account, .. }
+        | Request::TinyRoomUpdate { account, .. }
+        | Request::TinyOverrideSet { account, .. }
+        | Request::TinyOverrideClear { account, .. }
+            if ours(account) =>
+        {
+            Some(Response::Ok)
+        }
+        Request::TinyAudit { account, .. } if ours(account) => Some(Response::TinyAudit {
+            audit: community.audit.clone(),
+        }),
+        _ => None,
+    }
+}
+
+fn code(role: &str) -> Response {
+    Response::TinyCode {
+        code: TinyCode {
+            id: "inv-demo".to_owned(),
+            token: "Nf3kQ8xLw2pZ7rT1".to_owned(),
+            role: role.to_owned(),
+            expires_at: "2026-11-04T18:00:00Z".to_owned(),
+            origin: ORIGIN.to_owned(),
+        },
+    }
+}

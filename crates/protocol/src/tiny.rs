@@ -770,6 +770,59 @@ pub fn tiny_rows<T: DeserializeOwned>(list: Value) -> Option<(Vec<T>, usize)> {
 }
 
 /// The name the server would keep, or `None` when it would refuse it.
+/// Unix seconds as an RFC 3339 time in UTC, the form the server takes (a timeout's end).
+pub fn tiny_time(unix: i64) -> String {
+    let (days, secs) = (unix.div_euclid(86_400), unix.rem_euclid(86_400));
+    // Howard Hinnant's civil_from_days.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z", secs / 3_600, secs % 3_600 / 60, secs % 60)
+}
+
+/// An RFC 3339 time as unix seconds, offset applied. `None` when it does not read as one.
+pub fn tiny_unix(stamp: &str) -> Option<i64> {
+    let bytes = stamp.as_bytes();
+    if bytes.len() < 19 || bytes[4] != b'-' || bytes[7] != b'-' || !matches!(bytes[10], b'T' | b't' | b' ') || bytes[13] != b':' || bytes[16] != b':' {
+        return None;
+    }
+    let number = |range: std::ops::Range<usize>| stamp.get(range)?.parse::<i64>().ok();
+    let (year, month, day) = (number(0..4)?, number(5..7)?, number(8..10)?);
+    let (hour, minute, second) = (number(11..13)?, number(14..16)?, number(17..19)?);
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    let mut rest = &stamp[19..];
+    if let Some(fraction) = rest.strip_prefix('.') {
+        rest = fraction.trim_start_matches(|c: char| c.is_ascii_digit());
+    }
+    let offset = match rest {
+        "" | "Z" | "z" => 0,
+        zone if zone.len() == 6 && matches!(zone.as_bytes()[0], b'+' | b'-') && zone.as_bytes()[3] == b':' => {
+            let hours: i64 = zone[1..3].parse().ok()?;
+            let minutes: i64 = zone[4..6].parse().ok()?;
+            let sign = if zone.starts_with('-') { -1 } else { 1 };
+            sign * (hours * 3_600 + minutes * 60)
+        }
+        _ => return None,
+    };
+    // Howard Hinnant's days_from_civil.
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(days * 86_400 + hour * 3_600 + minute * 60 + second - offset)
+}
+
 pub fn tiny_name(name: &str) -> Option<&str> {
     let name = name.trim();
     (!name.is_empty() && name.chars().count() <= TINY_NAME_MAX).then_some(name)
@@ -875,6 +928,17 @@ pub fn tiny_can(role: &str, id: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_time_goes_to_rfc_3339_and_back() {
+        assert_eq!(super::tiny_time(0), "1970-01-01T00:00:00Z");
+        assert_eq!(super::tiny_time(1_793_210_400), "2026-10-28T18:00:00Z");
+        assert_eq!(super::tiny_unix("2026-10-28T18:00:00Z"), Some(1_793_210_400));
+        assert_eq!(super::tiny_unix("2026-10-28T20:00:00.123+02:00"), Some(1_793_210_400));
+        assert_eq!(super::tiny_unix("2024-02-29T00:00:00Z").map(super::tiny_time).as_deref(), Some("2024-02-29T00:00:00Z"));
+        assert_eq!(super::tiny_unix("soon"), None);
+        assert_eq!(super::tiny_unix("2026-13-01T00:00:00Z"), None);
+    }
+
     use super::*;
 
     #[test]
