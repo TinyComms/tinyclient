@@ -11,5 +11,6 @@ serde.workspace = true
 serde_json.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-# Already in the build through interprocess. A pipe's waiting bytes, for read timeouts.
-windows-sys = { version = "0.61", features = ["Win32_System_Pipes"] }
+# Already in the build through interprocess. A pipe's waiting bytes, for read timeouts, and the
+# installed WebView2's version (`browser`).
+windows-sys = { version = "0.61", features = ["Win32_System_Pipes", "Win32_System_Registry"] }

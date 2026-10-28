@@ -33,35 +33,11 @@ pub fn address(var: &str, default: &str) -> String {
     std::env::var(var).unwrap_or_else(|_| default.to_owned())
 }
 
-/// Who every request says it is: the Safari that is installed, which is what the sign-in window
-/// presented. One identity for a session, on the API, the socket and every media fetch alike.
+/// Who every request says it is: the browser the sign-in window presented (`protocol::browser`).
+/// One identity for a session, on the API, the socket and every media fetch alike.
 pub fn browser() -> &'static str {
-    #[cfg(target_os = "macos")]
-    {
-        static BROWSER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-        return BROWSER.get_or_init(|| {
-            let installed = std::process::Command::new("/usr/bin/defaults")
-                .args(["read", "/Applications/Safari.app/Contents/Info", "CFBundleShortVersionString"])
-                .output()
-                .ok()
-                .and_then(|out| String::from_utf8(out.stdout).ok())
-                .map(|version| version.trim().to_owned())
-                .filter(|version| !version.is_empty() && version.chars().all(|c| c.is_ascii_digit() || c == '.'));
-            format!(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 \
-                 (KHTML, like Gecko) Version/{} Safari/605.1.15",
-                installed.as_deref().unwrap_or("26.0")
-            )
-        });
-    }
-    #[cfg(target_os = "windows")]
-    {
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-    }
+    static BROWSER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    BROWSER.get_or_init(protocol::browser::user_agent)
 }
 
 /// Takes anything that could be a credential out of text that is about to be logged. One rule
