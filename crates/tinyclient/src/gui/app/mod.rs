@@ -615,8 +615,9 @@ impl Shell {
 
     pub(in crate::gui) fn diagnostics(&self) -> String {
         let mut text = format!(
-            "tinyclient {}\n{} {}\nservice: {:?}{}, keychain: {:?}, started {}\n",
+            "tinyclient {}{}\n{} {}\nservice: {:?}{}, keychain: {:?}, started {}\n",
             env!("CARGO_PKG_VERSION"),
+            crate::update::short_commit().map(|commit| format!(" ({commit})")).unwrap_or_default(),
             std::env::consts::OS,
             std::env::consts::ARCH,
             self.service.phase,
