@@ -1293,6 +1293,18 @@ pub fn answer(hub: &Hub, request: &Request) -> Option<Response> {
     }
 }
 
+fn code(role: &str) -> Response {
+    Response::TinyCode {
+        code: TinyCode {
+            id: "inv-demo".to_owned(),
+            token: "Nf3kQ8xLw2pZ7rT1".to_owned(),
+            role: role.to_owned(),
+            expires_at: "2026-11-04T18:00:00Z".to_owned(),
+            origin: ORIGIN.to_owned(),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1316,17 +1328,5 @@ mod tests {
         assert!(audit_page(&rows, &filter(None, None, "role.", 50))
             .iter()
             .all(|row| row.action.starts_with("role.")));
-    }
-}
-
-fn code(role: &str) -> Response {
-    Response::TinyCode {
-        code: TinyCode {
-            id: "inv-demo".to_owned(),
-            token: "Nf3kQ8xLw2pZ7rT1".to_owned(),
-            role: role.to_owned(),
-            expires_at: "2026-11-04T18:00:00Z".to_owned(),
-            origin: ORIGIN.to_owned(),
-        },
     }
 }
