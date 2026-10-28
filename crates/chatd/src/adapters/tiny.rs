@@ -20,7 +20,7 @@ use super::{serve_commands, Command, Context, Signed};
 use crate::hub::Hub;
 use crate::session;
 use protocol::{
-    join_host, text_or_null, tiny_can, tiny_name, AccountKey, ErrorCode, Key, Network,
+    join_host, text_or_null, tiny_can, tiny_name, tiny_rows, AccountKey, ErrorCode, Key, Network,
     Presence, Response, TinyAudit, TinyCode, TinyCommunity, TinyInvite, TinyMember, TinyRoom,
     TinySeat,
 };
@@ -522,18 +522,23 @@ fn listed<T>(saved: &Saved, path: &str, parse: impl FnOnce(Value) -> Result<T, (
     }
 }
 
+/// The rows of one list the server sent. A row that cannot be read is left out and noted, so
+/// one odd row (an invite the server made itself, a field from a newer server) never empties
+/// the page. Not a list at all is unreadable.
+pub(crate) fn rows<T: serde::de::DeserializeOwned>(body: Value, what: &str) -> Result<Vec<T>, ()> {
+    let (rows, skipped) = tiny_rows(body).ok_or(())?;
+    if skipped > 0 {
+        eprintln!("chatd: Tiny server: left out {skipped} {what} that could not be read");
+    }
+    Ok(rows)
+}
+
 fn members_of(saved: &Saved) -> Result<Vec<TinyMember>, &'static str> {
     match asked("GET", saved, "/v1/members", None) {
         Err(detail) => Err(detail),
-        Ok((200, body)) => serde_json::from_value(body).map_err(|_| UNREADABLE),
+        Ok((200, body)) => rows(body, "members").map_err(|()| UNREADABLE),
         Ok((status, body)) => Err(explain(status, &body, Missing::Plain)),
     }
-}
-
-#[derive(Deserialize)]
-struct RoomWire {
-    id: String,
-    name: String,
 }
 
 /// A server older than rooms answers 404: it has none.
@@ -541,16 +546,17 @@ fn rooms_of(saved: &Saved) -> Listed<Vec<TinyRoom>> {
     match asked("GET", saved, "/v1/rooms", None) {
         Err(detail) => Listed::Failed(detail),
         Ok((403 | 404, _)) => Listed::Empty,
-        Ok((200, body)) => match serde_json::from_value::<Vec<RoomWire>>(body) {
-            Ok(rows) => Listed::Rows(rows.into_iter().map(|row| TinyRoom { id: row.id, name: row.name, participants: Vec::new() }).collect()),
-            Err(_) => Listed::Failed(UNREADABLE),
+        // Who sits in each call comes from the live socket, never from this list.
+        Ok((200, body)) => match rows::<TinyRoom>(body, "rooms") {
+            Ok(rooms) => Listed::Rows(rooms.into_iter().map(|room| TinyRoom { participants: Vec::new(), ..room }).collect()),
+            Err(()) => Listed::Failed(UNREADABLE),
         },
         Ok((status, body)) => Listed::Failed(explain(status, &body, Missing::Plain)),
     }
 }
 
 fn invites_of(saved: &Saved) -> Listed<Vec<TinyInvite>> {
-    listed(saved, "/v1/invites", |body| serde_json::from_value(body).map_err(|_| ()))
+    listed(saved, "/v1/invites", |body| rows(body, "invites"))
 }
 
 #[derive(Deserialize)]
@@ -558,10 +564,13 @@ struct AuditWire {
     id: i64,
     #[serde(default)]
     actor_id: Option<String>,
+    #[serde(default, deserialize_with = "text_or_null")]
     action: String,
+    #[serde(default, deserialize_with = "text_or_null")]
     subject: String,
     #[serde(default)]
     detail: Option<Value>,
+    #[serde(default, deserialize_with = "text_or_null")]
     created_at: String,
 }
 
@@ -574,8 +583,8 @@ fn detail_text(detail: Option<Value>) -> String {
 
 fn audit_of(saved: &Saved) -> Listed<Vec<TinyAudit>> {
     listed(saved, "/v1/audit?limit=50", |body| {
-        let rows: Vec<AuditWire> = serde_json::from_value(body).map_err(|_| ())?;
-        Ok(rows
+        let read: Vec<AuditWire> = rows(body, "audit rows")?;
+        Ok(read
             .into_iter()
             .map(|row| TinyAudit {
                 id: row.id,
@@ -1256,6 +1265,48 @@ pub(crate) mod tests {
         assert!(lines.iter().any(|line| line.contains("GET /v1/members ")));
         assert!(lines.iter().any(|line| line.contains("GET /v1/invites ")));
         assert!(lines.iter().any(|line| line.contains("GET /v1/audit?limit=50")));
+    }
+
+    /// The server's own owner invite has no creator, and a newer server sends fields this
+    /// client does not know. Neither fails the page; a row that cannot be read is left out.
+    #[test]
+    fn an_invite_without_a_creator_and_one_bad_row_still_load_the_page() {
+        let base = serve(move |request| {
+            let first = request.lines().next().unwrap_or("");
+            if first.starts_with("GET /v1/members ") {
+                return http(
+                    200,
+                    "OK",
+                    r#"[{"user_id":"11111111-1111-1111-1111-111111111111","email":null,"display_name":"Ada","role":"owner","created_at":"2020-01-01T00:00:00Z","owner":true,"roles":[],"last_seen_at":null},{"display_name":"No id"}]"#,
+                );
+            }
+            if first.starts_with("GET /v1/invites ") {
+                return http(
+                    200,
+                    "OK",
+                    r#"[{"id":"inv1","role":"owner","created_by":null,"created_by_name":null,"expires_at":"2030-01-01T00:00:00Z","label":null,"uses":0},{"id":7},{"role":"member"},{"id":"inv2","role":"member","created_by":"11111111-1111-1111-1111-111111111111","expires_at":"2030-01-01T00:00:00Z"}]"#,
+                );
+            }
+            if first.starts_with("GET /v1/audit") {
+                return http(200, "OK", r#"[{"id":1,"actor_id":null,"action":"server.bootstrap","subject":null,"detail":null,"created_at":"t","actor_name":null},{"id":"two"}]"#);
+            }
+            if first.starts_with("GET /v1/rooms ") {
+                return http(200, "OK", r#"[{"id":"r1","name":"Lobby","position":0,"topic":null},{"name":"No id"}]"#);
+            }
+            http(404, "Not Found", r#"{"error":"not_found"}"#)
+        });
+        with_session(&base, "owner", |account| match community(&test_hub(), account) {
+            Response::TinyCommunity { community } => {
+                assert_eq!(community.members.len(), 1);
+                assert_eq!(community.members[0].email, "");
+                assert_eq!(community.invites.iter().map(|invite| invite.id.as_str()).collect::<Vec<_>>(), ["inv1", "inv2"]);
+                assert_eq!(community.invites[0].created_by, "", "the server's own invite has no creator");
+                assert_eq!(community.audit.len(), 1);
+                assert_eq!(community.audit[0].subject, "");
+                assert_eq!(community.rooms.len(), 1);
+            }
+            other => panic!("load: {other:?}"),
+        });
     }
 
     fn test_hub() -> Arc<Hub> {

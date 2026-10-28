@@ -1,7 +1,14 @@
 //! A Tiny server's members, invites, audit, and rooms. No messages. A room is a voice channel:
 //! joining takes a seat in its call, with audio when the server's audio is up.
+//!
+//! The server and this client ship apart, so everything read from it is read tolerantly: a field
+//! that is missing or `null` takes its default, a field this client does not know is ignored, and
+//! a row that cannot be read at all is left out of its list ([`tiny_rows`]) rather than failing
+//! the page. Only a row's own id is required.
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TinyMember {
@@ -9,16 +16,24 @@ pub struct TinyMember {
     /// Empty when the server has none for them.
     #[serde(default, deserialize_with = "text_or_null")]
     pub email: String,
+    #[serde(default, deserialize_with = "text_or_null")]
     pub display_name: String,
+    #[serde(default, deserialize_with = "text_or_null")]
     pub role: String,
+    #[serde(default, deserialize_with = "text_or_null")]
     pub created_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TinyInvite {
     pub id: String,
+    #[serde(default, deserialize_with = "text_or_null")]
     pub role: String,
+    /// Who made it. Empty for the server itself: the owner invite printed at setup has no
+    /// creator, and the page says "Server setup".
+    #[serde(default, deserialize_with = "text_or_null")]
     pub created_by: String,
+    #[serde(default, deserialize_with = "text_or_null")]
     pub expires_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accepted_at: Option<String>,
@@ -32,7 +47,9 @@ pub struct TinyInvite {
 pub struct TinyCode {
     pub id: String,
     pub token: String,
+    #[serde(default, deserialize_with = "text_or_null")]
     pub role: String,
+    #[serde(default, deserialize_with = "text_or_null")]
     pub expires_at: String,
     #[serde(default)]
     pub origin: String,
@@ -41,11 +58,16 @@ pub struct TinyCode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TinyAudit {
     pub id: i64,
+    #[serde(default)]
     pub actor_id: Option<String>,
+    #[serde(default, deserialize_with = "text_or_null")]
     pub action: String,
+    #[serde(default, deserialize_with = "text_or_null")]
     pub subject: String,
     /// The server's detail object, as JSON text. Empty when the server sent none.
+    #[serde(default, deserialize_with = "text_or_null")]
     pub detail: String,
+    #[serde(default, deserialize_with = "text_or_null")]
     pub created_at: String,
 }
 
@@ -53,6 +75,7 @@ pub struct TinyAudit {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TinyRoom {
     pub id: String,
+    #[serde(default, deserialize_with = "text_or_null")]
     pub name: String,
     /// Filled in by chatd from the live socket; the server's room list has none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -99,6 +122,31 @@ pub const TINY_NAME_MAX: usize = 80;
 /// A string the server may send as `null`: someone whose provider gave no email has none.
 pub fn text_or_null<'de, D: serde::Deserializer<'de>>(from: D) -> Result<String, D::Error> {
     Ok(Option::<String>::deserialize(from)?.unwrap_or_default())
+}
+
+/// Any value the server may send as `null` or leave out: it takes its default.
+pub fn or_default<'de, D: serde::Deserializer<'de>, T: Deserialize<'de> + Default>(from: D) -> Result<T, D::Error> {
+    Ok(Option::<T>::deserialize(from)?.unwrap_or_default())
+}
+
+/// A list the server sent, with each row that cannot be read left out, and how many were. Not a
+/// list at all is `None`: the answer as a whole is unreadable.
+pub fn tiny_rows<T: DeserializeOwned>(list: Value) -> Option<(Vec<T>, usize)> {
+    let Value::Array(rows) = list else {
+        return None;
+    };
+    let mut skipped = 0;
+    let read = rows
+        .into_iter()
+        .filter_map(|row| match serde_json::from_value(row) {
+            Ok(row) => Some(row),
+            Err(_) => {
+                skipped += 1;
+                None
+            }
+        })
+        .collect();
+    Some((read, skipped))
 }
 
 /// The name the server would keep, or `None` when it would refuse it.
@@ -290,6 +338,33 @@ mod tests {
         let room: TinyRoom = serde_json::from_str(r#"{"id":"r","name":"Lobby"}"#).unwrap();
         assert!(room.participants.is_empty());
         assert!(!serde_json::to_string(&room).unwrap().contains("participants"));
+    }
+
+    /// The owner invite the server prints at setup has no creator. It once failed the whole
+    /// list, and with it the page.
+    #[test]
+    fn an_invite_the_server_made_itself_reads_and_one_bad_row_is_left_out() {
+        let setup: TinyInvite = serde_json::from_str(r#"{"id":"1","role":"owner","created_by":null,"expires_at":"t"}"#).unwrap();
+        assert_eq!(setup.created_by, "");
+        let newer: TinyInvite = serde_json::from_str(
+            r#"{"id":"2","role":null,"created_by":"a","created_by_name":"Ada","label":"for Bea","uses":0,"max_uses":null,"expires_at":"t","shiny":{"x":1}}"#,
+        )
+        .unwrap();
+        assert_eq!((newer.role.as_str(), newer.created_by.as_str()), ("", "a"));
+        let list = serde_json::json!([
+            {"id":"1","role":"owner","created_by":null,"expires_at":"t"},
+            {"role":"member","created_by":"a","expires_at":"t"},
+            {"id":"3","role":"member","created_by":"a","expires_at":"t","extra":true},
+            "not a row"
+        ]);
+        let (rows, skipped) = tiny_rows::<TinyInvite>(list).unwrap();
+        assert_eq!(rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(), ["1", "3"]);
+        assert_eq!(skipped, 2);
+        assert!(tiny_rows::<TinyInvite>(serde_json::json!({"error": "no"})).is_none());
+        let member: TinyMember = serde_json::from_str(r#"{"user_id":"u","display_name":null,"role":null,"created_at":null,"owner":true}"#).unwrap();
+        assert_eq!((member.display_name.as_str(), member.role.as_str()), ("", ""));
+        let audit: TinyAudit = serde_json::from_str(r#"{"id":4,"actor_id":null,"action":"server.bootstrap","subject":null,"detail":null,"created_at":"t","actor_name":null}"#).unwrap();
+        assert_eq!((audit.subject.as_str(), audit.detail.as_str()), ("", ""));
     }
 
     #[test]

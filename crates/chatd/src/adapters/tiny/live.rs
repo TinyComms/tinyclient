@@ -687,15 +687,18 @@ fn seated_in(seat: &Seat, room: &str) -> bool {
 #[derive(Deserialize)]
 struct ReadyFrame {
     seq: i64,
+    #[serde(default)]
     me: MeFrame,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "protocol::or_default")]
     online: Vec<String>,
+    /// Read row by row (`calls_of`): one call this client cannot read leaves the others.
     #[serde(default)]
-    calls: Vec<CallFrame>,
+    calls: Value,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 struct MeFrame {
+    #[serde(default, deserialize_with = "protocol::text_or_null")]
     role: String,
 }
 
@@ -703,15 +706,15 @@ struct MeFrame {
 struct CallFrame {
     room_id: String,
     #[serde(default)]
-    participants: Vec<ParticipantFrame>,
+    participants: Value,
 }
 
 #[derive(Deserialize)]
 struct ParticipantFrame {
     user_id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "protocol::or_default")]
     muted: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "protocol::or_default")]
     deafened: bool,
 }
 
@@ -811,12 +814,13 @@ fn ready_heard(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, heard
         ctx.presence(user, Presence::Online, "", true);
     }
     let before: Vec<String> = seat.calls.keys().cloned().collect();
-    seat.calls = heard
-        .calls
+    let calls: Vec<CallFrame> = super::rows(heard.calls, "calls").unwrap_or_default();
+    seat.calls = calls
         .into_iter()
         .take(ROOMS)
         .map(|call| {
-            let people = call.participants.into_iter().take(SEATS).map(|who| Sitting { user: who.user_id, muted: who.muted, deafened: who.deafened });
+            let people: Vec<ParticipantFrame> = super::rows(call.participants, "call seats").unwrap_or_default();
+            let people = people.into_iter().take(SEATS).map(|who| Sitting { user: who.user_id, muted: who.muted, deafened: who.deafened });
             (call.room_id, people.collect::<Vec<_>>())
         })
         .filter(|(_, people)| !people.is_empty())
