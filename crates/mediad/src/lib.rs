@@ -18,16 +18,20 @@ pub mod dave;
 pub mod decode;
 pub mod framing;
 pub mod gateway;
+pub mod hear;
 pub mod jitter;
 pub mod media;
 pub mod opus;
 pub mod out;
 pub mod permission;
 pub mod play;
+pub mod process;
 pub mod probe;
 pub mod rtp;
 pub mod session;
+pub mod stats;
 pub mod stretch;
+pub mod talk;
 pub mod tiny;
 
 /// Samples a second, on the wire and in every buffer between the codec and the devices.

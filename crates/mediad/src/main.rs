@@ -20,6 +20,7 @@ const DEVICES_EVERY: Duration = Duration::from_secs(2);
 
 const NO_VIDEO: &str = "Screen sharing and video are not built yet. This call carries voice only.";
 const ENGINE: &str = "The call engine could not start. Try again.";
+const NOT_YET: &str = "The call isn't connected yet, so there's nothing to measure.";
 
 /// macOS reads the reason for the microphone prompt from the Info.plist of the process it holds
 /// responsible. Inside `tinyclient.app` that is the app, whose Info.plist says it. When mediad is
@@ -203,21 +204,43 @@ impl Call {
                 self.controls.choose(input, output);
                 return MediaResponse::Done;
             }
-            // TODO(mediad): the voice controls below are chatd's protocol already
-            // (`protocol::call`), and chatd sends them; mediad takes them and does nothing yet.
-            // Gain: a per-participant gain and local mute on the receive mix, keyed by user id
-            // (Tiny: through the slot map). Input: voice activation at `threshold` or
-            // push-to-talk with `release_ms`; Talk opens the microphone while held. Priority:
-            // duck everyone else by PRIORITY_DUCK_DB while a listed user speaks. Processing:
-            // AEC, noise suppression, auto gain. Bitrate: the Opus encoder's target.
-            MediaRequest::Gain { .. }
-            | MediaRequest::Input(_)
-            | MediaRequest::Talk { .. }
-            | MediaRequest::Priority { .. }
-            | MediaRequest::Processing(_)
-            | MediaRequest::Bitrate { .. } => return MediaResponse::Done,
-            // TODO(mediad): round trip, jitter, loss, bitrates and the ICE path from str0m.
-            MediaRequest::Stats => return MediaResponse::Refused { detail: "This call can't report its connection yet.".to_owned() },
+            // The sound of the call, as the shell and the room decide it. Each holds until sent
+            // again, through a reconnect or a move, and is read by whichever loop carries the
+            // call: Gain and Priority in its mix (`hear`; a Tiny call names voices through the
+            // slot map), Input and Talk at its gate (`talk`), Processing on the microphone
+            // (`process`), Bitrate at its encoder.
+            MediaRequest::Gain { user_id, percent, muted } => {
+                self.controls.gain(user_id, percent, muted);
+                return MediaResponse::Done;
+            }
+            MediaRequest::Input(mode) => {
+                self.controls.set_input(mode);
+                return MediaResponse::Done;
+            }
+            MediaRequest::Talk { held, priority } => {
+                self.controls.talk(held, priority);
+                return MediaResponse::Done;
+            }
+            MediaRequest::Priority { user_ids } => {
+                self.controls.priority(user_ids);
+                return MediaResponse::Done;
+            }
+            MediaRequest::Processing(processing) => {
+                self.controls.set_processing(processing);
+                return MediaResponse::Done;
+            }
+            MediaRequest::Bitrate { kbps } => {
+                self.controls.set_bitrate(kbps);
+                return MediaResponse::Done;
+            }
+            // Measured once a second by the call's loop (`stats`).
+            MediaRequest::Stats => {
+                return match self.controls.stats() {
+                    Some(stats) if self.voice.is_some() => MediaResponse::Stats(stats),
+                    _ => MediaResponse::Refused { detail: NOT_YET.to_owned() },
+                };
+            }
+            MediaRequest::Loopback { .. } => return MediaResponse::Refused { detail: "A call can't play your microphone back to you.".to_owned() },
         }
         MediaResponse::Streams { video: self.video.streams() }
     }

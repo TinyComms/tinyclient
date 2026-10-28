@@ -5,6 +5,9 @@
 
 use crate::audio::{level, open_fresh, route_moved, Audio, AudioError, Fresh, Retired};
 use crate::cue::Playing;
+use crate::hear::{self, Ear};
+use crate::process::Processor;
+use crate::stats::{Arrivals, Counts, Meter};
 use crate::dave::{Dave, Outgoing};
 use crate::jitter::{Jitter, Pop};
 use crate::opus::{Decoder, Encoder, MAX_FRAME};
@@ -12,7 +15,7 @@ use crate::permission::{microphone, Microphone};
 use crate::rtp::{Cipher, Sender, PAYLOAD_TYPE, SILENCE};
 use crate::session::Controls;
 use crate::{out, CHANNELS, FRAME, FRAME_SAMPLES};
-use protocol::{CallFailure, MediaResponse};
+use protocol::{CallFailure, CallPath, MediaResponse};
 use std::collections::{HashMap, VecDeque};
 use std::io::ErrorKind;
 use std::net::UdpSocket;
@@ -27,7 +30,7 @@ const TICK: Duration = Duration::from_millis(20);
 /// Our own gate is the user's (V6, `Tuning::gate`), this by default.
 const VOICE: u8 = 25;
 /// Quiet ticks before speaking is over: 260 ms, so a ring cannot flicker between words.
-const HOLD: u32 = 13;
+pub(crate) const HOLD: u32 = 13;
 /// Silence frames sent after the last frame of speech, and then nothing at all. This is what
 /// Discord's voice documentation asks for ("Voice Data Interpolation": five frames of
 /// `0xF8 0xFF 0xFE` before a break, so the far decoder does not interpolate across it); muting
@@ -80,6 +83,9 @@ pub(crate) struct Stream {
     undecodable: u64,
     /// Lost frames rebuilt from the packet after them.
     pub(crate) rebuilt: u64,
+    /// The gain the last frame ended at (`hear`), so the next one starts from it.
+    gain: Option<f32>,
+    pub(crate) arrivals: Arrivals,
 }
 
 impl Stream {
@@ -94,7 +100,20 @@ impl Stream {
             last_packet: Instant::now(),
             undecodable: 0,
             rebuilt: 0,
+            gain: None,
+            arrivals: Arrivals::default(),
         })
+    }
+
+    /// Adds this tick's frame to the mix at `to`, from where the last frame ended.
+    pub(crate) fn mix_into(&mut self, mix: &mut [i32; FRAME_SAMPLES], frame: &[i16], to: f32) {
+        hear::add(mix, frame, self.gain.unwrap_or(to), to);
+        self.gain = Some(to);
+    }
+
+    /// What the connection meter needs of this voice.
+    pub(crate) fn counts(&self) -> Counts {
+        Counts { received: self.jitter.received, lost: self.jitter.lost, jitter_ms: self.arrivals.ms() }
     }
 
     /// Deafened: nothing is played, and nothing is kept to play later.
@@ -188,11 +207,13 @@ impl Gate {
         self.talking
     }
 
-    /// `heard` is the frame's [`level`], `gate` the level that counts as speech.
-    pub(crate) fn step(&mut self, frame: &[i16; FRAME_SAMPLES], captured: bool, muted: bool, heard: u8, gate: u8) -> Step {
+    /// `open` is whether the microphone is to be open now (`talk::opening`: voice activation
+    /// at its threshold, or a push-to-talk key), and `hold` how many quiet ticks it then stays
+    /// open for.
+    pub(crate) fn step(&mut self, frame: &[i16; FRAME_SAMPLES], captured: bool, muted: bool, open: bool, hold: u32) -> Step {
         let mut step = Step { speaking: None, early: Vec::new(), send: None };
         let mut opened = false;
-        if captured && !muted && heard >= gate {
+        if captured && !muted && open {
             self.quiet = 0;
             if !self.talking {
                 self.talking = true;
@@ -201,7 +222,7 @@ impl Gate {
             }
         } else if self.talking {
             self.quiet += 1;
-            if muted || self.quiet >= HOLD {
+            if muted || self.quiet >= hold.max(1) {
                 self.talking = false;
                 self.trail = TRAIL;
                 step.speaking = Some(false);
@@ -235,9 +256,10 @@ impl Gate {
     }
 }
 
-/// Everyone's voices summed, to the speaker: the user's voice level, then a cue on top. Gives
-/// the level of the voices alone, for the meter.
-pub(crate) fn mixdown(mix: &[i32; FRAME_SAMPLES], controls: &Controls, cue: &mut Option<Playing>, audio: &mut Audio) -> u8 {
+/// Everyone's voices summed, to the speaker: the user's voice level, then a cue on top. What is
+/// played is also the echo canceller's reference. Gives the level of the voices alone, for the
+/// meter.
+pub(crate) fn mixdown(mix: &[i32; FRAME_SAMPLES], controls: &Controls, cue: &mut Option<Playing>, audio: &mut Audio, processor: &mut Processor) -> u8 {
     let tuning = controls.tuning();
     let mut mixed = [0i16; FRAME_SAMPLES];
     for (out, &sum) in mixed.iter_mut().zip(mix) {
@@ -257,7 +279,41 @@ pub(crate) fn mixdown(mix: &[i32; FRAME_SAMPLES], controls: &Controls, cue: &mut
         }
     }
     audio.play(&mixed);
+    processor.render(&mixed);
     heard
+}
+
+/// The longest a hang-up waits for a cue to finish: the one that says we were put out.
+const CUE_DRAIN: Duration = Duration::from_millis(400);
+
+/// After hanging up: plays out a cue asked for at the end (`Disconnected`), and nothing else,
+/// before the devices go.
+pub(crate) fn finish_cue(controls: &Controls, cue: &mut Option<Playing>, audio: &mut Audio) {
+    if !controls.hangup.load(Ordering::Relaxed) {
+        return;
+    }
+    let until = Instant::now() + CUE_DRAIN;
+    let mut processor = Processor::new();
+    while (cue.is_some() || controls.cue_waiting()) && Instant::now() < until {
+        mixdown(&[0; FRAME_SAMPLES], controls, cue, audio, &mut processor);
+        thread::sleep(TICK);
+    }
+}
+
+/// The microphone's 20 ms, made ready to send: processed, measured, and through the gate as the
+/// input mode says. Gives the gate's step and the level heard.
+pub(crate) fn listen(controls: &Controls, audio: &mut Audio, processor: &mut Processor, gate: &mut Gate, frame: &mut [i16; FRAME_SAMPLES]) -> (Step, u8) {
+    let muted = controls.muted.load(Ordering::Relaxed);
+    // The meter in the device menu stays live while muted, so the microphone can be tried.
+    audio.listen(!muted || controls.metering());
+    let captured = audio.capture(frame);
+    processor.set(controls.processing());
+    if captured {
+        processor.capture(frame);
+    }
+    let heard = if captured { level(frame) } else { 0 };
+    let (open, hold) = crate::talk::opening(controls.input(), &controls.keys(), heard, Instant::now());
+    (gate.step(frame, captured, muted, open, hold), heard)
 }
 
 pub const NO_MICROPHONE: &str =
@@ -296,10 +352,18 @@ struct Loop {
     cue: Option<Playing>,
     /// Opens devices away from this thread.
     devices: Devices,
+    processor: Processor,
+    meter: Meter,
 }
 
 impl Loop {
     fn receive(&mut self, datagram: &[u8]) {
+        self.meter.received(datagram.len());
+        if let Ok(echo) = <[u8; 8]>::try_from(datagram) {
+            // Our keepalive, back from the voice server: the round trip.
+            self.meter.echoed(u32::from_be_bytes([echo[0], echo[1], echo[2], echo[3]]));
+            return;
+        }
         if datagram.len() < 2 || datagram[1] & 0x7f != PAYLOAD_TYPE {
             return;
         }
@@ -319,6 +383,7 @@ impl Loop {
             }
         };
         stream.last_packet = Instant::now();
+        stream.arrivals.arrived(packet.timestamp, stream.last_packet);
         if self.setup.controls.deafened.load(Ordering::Relaxed) {
             // Deafened: nothing is decrypted or decoded. That packets flow is all we know.
             stream.heard |= packet.payload != SILENCE;
@@ -353,7 +418,9 @@ impl Loop {
         };
         if let Some(datagram) = self.setup.sender.seal(&frame) {
             // A send that fails is a lost packet; the heartbeat notices a dead path.
-            let _ = self.setup.socket.send(&datagram);
+            if self.setup.socket.send(&datagram).is_ok() {
+                self.meter.sent(datagram.len());
+            }
         }
     }
 
@@ -375,13 +442,9 @@ impl Loop {
     /// The microphone's 20 ms: sent while we talk, then a trail of silence, then nothing.
     fn capture(&mut self) -> u8 {
         let controls = self.setup.controls.clone();
-        let muted = controls.muted.load(Ordering::Relaxed);
-        // The meter in the device menu stays live while muted, so the microphone can be tried.
-        self.setup.audio.listen(!muted || controls.metering());
+        self.encoder.set_bitrate(controls.bitrate());
         let mut frame = [0i16; FRAME_SAMPLES];
-        let captured = self.setup.audio.capture(&mut frame);
-        let heard = if captured { level(&frame) } else { 0 };
-        let step = self.gate.step(&frame, captured, muted, heard, controls.tuning().gate);
+        let (step, heard) = listen(&controls, &mut self.setup.audio, &mut self.processor, &mut self.gate, &mut frame);
         if let Some(speaking) = step.speaking {
             self.say(speaking);
         }
@@ -401,39 +464,40 @@ impl Loop {
         heard
     }
 
-    /// Everyone's 20 ms, mixed.
+    /// Everyone's 20 ms, mixed, each at their own volume for us.
     fn play(&mut self) -> u8 {
         let deafened = self.setup.controls.deafened.load(Ordering::Relaxed);
+        let ear: Ear = self.setup.controls.ear();
+        let held = self.setup.users.clone();
+        let users = held.lock().unwrap();
+        let who = |ssrc: &u32| users.get(ssrc).map_or("", String::as_str);
+        let ducked = ear.ducking(self.streams.iter().map(|(ssrc, stream)| (who(ssrc), stream.speaking())));
         let mut mix = [0i32; FRAME_SAMPLES];
         let mut changed = Vec::new();
-        for (&ssrc, stream) in &mut self.streams {
+        for (ssrc, stream) in &mut self.streams {
             let loud = if deafened {
                 stream.drop_audio();
                 stream.heard
             } else {
                 match stream.pull(&format_args!("ssrc {ssrc}")) {
                     Some(frame) => {
-                        for (sum, &sample) in mix.iter_mut().zip(&frame) {
-                            *sum += i32::from(sample);
-                        }
+                        stream.mix_into(&mut mix, &frame, ear.factor(who(ssrc), ducked));
                         level(&frame) >= VOICE
                     }
                     None => false,
                 }
             };
             if let Some(speaking) = stream.hear(loud) {
-                changed.push((ssrc, speaking));
+                changed.push((*ssrc, speaking));
             }
         }
-        if !changed.is_empty() {
-            let users = self.setup.users.lock().unwrap();
-            for (ssrc, speaking) in changed {
-                if let Some(user_id) = users.get(&ssrc).cloned() {
-                    out::send(&MediaResponse::Speaking { user_id, speaking });
-                }
+        for (ssrc, speaking) in changed {
+            if let Some(user_id) = users.get(&ssrc).cloned() {
+                out::send(&MediaResponse::Speaking { user_id, speaking });
             }
         }
-        mixdown(&mix, &self.setup.controls, &mut self.cue, &mut self.setup.audio)
+        drop(users);
+        mixdown(&mix, &self.setup.controls, &mut self.cue, &mut self.setup.audio, &mut self.processor)
     }
 
     /// Once a second: what does not need 20 ms timing. Device reopen is not in here.
@@ -447,8 +511,12 @@ impl Loop {
             self.keepalive = self.keepalive.wrapping_add(1);
             let mut probe = [0u8; 8];
             probe[..4].copy_from_slice(&self.keepalive.to_be_bytes());
-            let _ = self.setup.socket.send(&probe);
+            if self.setup.socket.send(&probe).is_ok() {
+                self.meter.probe(self.keepalive);
+            }
         }
+        let stats = self.meter.second(self.streams.values().map(Stream::counts));
+        self.setup.controls.publish_stats(stats);
         let users = self.setup.users.lock().unwrap();
         self.streams.retain(|ssrc, stream| {
             users.contains_key(ssrc) || stream.last_packet.elapsed() < Duration::from_secs(60)
@@ -505,6 +573,7 @@ impl Loop {
             }
             self.say(false);
         }
+        finish_cue(&self.setup.controls, &mut self.cue, &mut self.setup.audio);
         for (ssrc, stream) in &self.streams {
             let (jitter, rebuilt) = (&stream.jitter, stream.rebuilt);
             eprintln!(
@@ -543,6 +612,8 @@ pub fn run(setup: Setup) -> Audio {
         levels: (0, 0),
         cue: None,
         devices,
+        processor: Processor::new(),
+        meter: Meter::new(CallPath::Udp),
     };
     state.run();
     state.devices.stop();

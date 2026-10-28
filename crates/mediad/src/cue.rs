@@ -273,6 +273,7 @@ fn notes(cue: Cue) -> (&'static [(f64, f64, f64)], bool) {
     const A5: f64 = 880.;
     const A4: f64 = 440.;
     const E4: f64 = 329.63;
+    const A3: f64 = 220.;
     match cue {
         Cue::Joined | Cue::Test => (&[(0., 0.09, E5), (0.09, 0.09, A5)], false),
         Cue::Left => (&[(0., 0.09, A5), (0.09, 0.09, E5)], false),
@@ -282,6 +283,10 @@ fn notes(cue: Cue) -> (&'static [(f64, f64, f64)], bool) {
         Cue::Undeafened => (&[(0., 0.06, A5), (0.06, 0.06, A5)], true),
         Cue::Lost => (&[(0., 0.125, A4), (0.125, 0.125, E4)], false),
         Cue::Back => (&[(0., 0.125, E4), (0.125, 0.125, A4)], false),
+        // Up, down and up again: somewhere else, and still in a call.
+        Cue::Moved => (&[(0., 0.07, A5), (0.07, 0.07, E5), (0.14, 0.07, A5)], false),
+        // Down to the lowest note any cue has, held longest: out, and not coming back by itself.
+        Cue::Disconnected => (&[(0., 0.1, E4), (0.1, 0.2, A3)], false),
     }
 }
 
@@ -488,6 +493,8 @@ mod tests {
             (Cue::Undeafened, 0.12),
             (Cue::Lost, 0.25),
             (Cue::Back, 0.25),
+            (Cue::Moved, 0.21),
+            (Cue::Disconnected, 0.3),
             (Cue::Test, 0.18),
         ];
         for (cue, length) in lengths {
