@@ -13,7 +13,7 @@ use gpui::{div, prelude::*, px, AnyElement, Context, Div, MouseButton, MouseDown
 use protocol::{TinyRoom, TinySeat};
 
 /// What is drawn under the pointer while something is dragged.
-pub(super) struct Ghost(SharedString);
+pub(super) struct Ghost(pub(super) SharedString);
 
 impl Render for Ghost {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
@@ -35,11 +35,12 @@ impl Render for Ghost {
 }
 
 impl Dragged {
-    fn label(&self) -> SharedString {
+    pub(super) fn label(&self) -> SharedString {
         match self {
             Dragged::Person { name, .. } => name.clone().into(),
             Dragged::Room { name, .. } => name.clone().into(),
             Dragged::Category { name, .. } => name.clone().into(),
+            Dragged::Role { name, .. } => name.clone().into(),
         }
     }
 }
@@ -309,7 +310,7 @@ impl Shell {
         row.into_any_element()
     }
 
-    fn tiny_dropped_on_room(&mut self, room_id: String, dragged: &Dragged, cx: &mut Context<Self>) {
+    pub(super) fn tiny_dropped_on_room(&mut self, room_id: String, dragged: &Dragged, cx: &mut Context<Self>) {
         let Some(community) = self.tiny_state.community.as_ref() else {
             return;
         };
@@ -329,7 +330,7 @@ impl Shell {
         }
     }
 
-    fn tiny_dropped_on_category(&mut self, category: Option<String>, dragged: &Dragged, cx: &mut Context<Self>) {
+    pub(super) fn tiny_dropped_on_category(&mut self, category: Option<String>, dragged: &Dragged, cx: &mut Context<Self>) {
         let Some(community) = self.tiny_state.community.as_ref() else {
             return;
         };
@@ -344,7 +345,7 @@ impl Shell {
                     self.tiny_layout(groups, cx);
                 }
             }
-            Dragged::Person { .. } => {}
+            Dragged::Person { .. } | Dragged::Role { .. } => {}
         }
     }
 }

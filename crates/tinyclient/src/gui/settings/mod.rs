@@ -7,7 +7,7 @@
 //! snapshot, read each frame.
 
 mod accounts;
-mod controls;
+pub(in crate::gui) mod controls;
 mod pages;
 pub mod rows;
 mod tiny;

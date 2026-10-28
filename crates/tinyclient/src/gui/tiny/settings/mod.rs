@@ -5,20 +5,22 @@
 //! Each page is one function in its own file, `settings/<page>.rs`, with the same signature:
 //!
 //! ```ignore
-//! pub(in crate::gui::tiny) fn <page>(shell: &Shell, page: &Page, window: &mut Window, cx: &mut Context<Shell>) -> AnyElement
+//! pub(in crate::gui::tiny) fn <page>(shell: &Shell, facts: &Facts, window: &mut Window, cx: &mut Context<Shell>) -> AnyElement
 //! ```
 //!
-//! A page that edits also gives `dirty`, `save` and `reset` (see `overview.rs`), which the frame
-//! calls from [`Shell::tiny_settings_dirty`], [`Shell::tiny_settings_save`] and
+//! A page that edits also gives `dirty`, `save` and `reset` (Overview, Roles, Channels), which the
+//! frame calls from [`Shell::tiny_settings_dirty`], [`Shell::tiny_settings_save`] and
 //! [`Shell::tiny_settings_reset`]. Its draft lives in [`Overlay`] (and text fields, which need a
-//! window context to make, in [`Fields`]). A page is listed only where `visible` says this
-//! account may see it.
+//! window context to make, in [`Fields`]). What goes at once (a role made, a new order, a revoke)
+//! is sent from the page. A page is listed only where `visible` says this account may see it.
+//! The pieces the pages share are in `kit`.
 
 mod audit;
 mod bans;
 mod channels;
 mod danger;
 mod invites;
+mod kit;
 mod members;
 mod overview;
 mod roles;
@@ -32,6 +34,20 @@ use crate::gui::input::TextInput;
 use crate::gui::state::Shell;
 use crate::gui::theme::{self, Type};
 use gpui::{div, prelude::*, px, AnyElement, Context, Div, Entity, SharedString, Window};
+
+pub(in crate::gui) use bans::banned_name;
+#[cfg(feature = "gui-shot")]
+pub(in crate::gui) use channels::Sel;
+pub(in crate::gui) use danger::confirmed;
+pub(in crate::gui) use invites::revocable;
+#[cfg(feature = "gui-shot")]
+pub(in crate::gui) use members::selectable as tickable;
+
+/// The roles' ids, most senior first: what `--tiny-pick` counts in.
+#[cfg(feature = "gui-shot")]
+pub(in crate::gui) fn roles_in_order(community: &protocol::TinyCommunity) -> Vec<String> {
+    roles::ordered(community).into_iter().map(|role| role.id.clone()).collect()
+}
 
 /// The pages, in the order the column lists them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -112,9 +128,7 @@ impl Page {
     }
 }
 
-/// Server Settings while it is open: the page on show and each page's draft. The drafts of the
-/// pages still to be drawn are read by nobody yet.
-#[allow(dead_code)]
+/// Server Settings while it is open: the page on show and each page's draft.
 pub(in crate::gui) struct Overlay {
     pub page: Page,
     /// The channel the Channels page opens on, when it was opened from one.
@@ -122,12 +136,8 @@ pub(in crate::gui) struct Overlay {
     pub overview: overview::Draft,
     pub roles: roles::Draft,
     pub members: members::Draft,
-    pub invites: invites::Draft,
-    pub bans: bans::Draft,
     pub channels: channels::Draft,
-    pub voice: voice::Draft,
     pub audit: audit::Draft,
-    pub signin: signin::Draft,
     pub danger: danger::Draft,
     /// A save is with the server.
     pub saving: bool,
@@ -135,6 +145,8 @@ pub(in crate::gui) struct Overlay {
     pub error: Option<String>,
     /// Shown for a moment after a save went through.
     pub saved: bool,
+    /// The page's scroll: each page opens at its top.
+    pub scroll: gpui::ScrollHandle,
 }
 
 impl Overlay {
@@ -145,16 +157,13 @@ impl Overlay {
             overview: Default::default(),
             roles: Default::default(),
             members: Default::default(),
-            invites: Default::default(),
-            bans: Default::default(),
             channels: Default::default(),
-            voice: Default::default(),
             audit: Default::default(),
-            signin: Default::default(),
             danger: Default::default(),
             saving: false,
             error: None,
             saved: false,
+            scroll: gpui::ScrollHandle::new(),
         }
     }
 }
@@ -164,6 +173,15 @@ pub(in crate::gui) struct Fields {
     pub name: Entity<TextInput>,
     pub description: Entity<TextInput>,
     pub welcome: Entity<TextInput>,
+    pub role_name: Entity<TextInput>,
+    pub role_color: Entity<TextInput>,
+    pub member_search: Entity<TextInput>,
+    pub ban_search: Entity<TextInput>,
+    pub room_name: Entity<TextInput>,
+    pub room_topic: Entity<TextInput>,
+    pub category_name: Entity<TextInput>,
+    /// What a dangerous modal asks to be typed.
+    pub confirm: Entity<TextInput>,
 }
 
 impl Fields {
@@ -171,7 +189,15 @@ impl Fields {
         let name = cx.new(|cx| TextInput::new("Server name", cx));
         let description = cx.new(|cx| TextInput::multiline("What this server is, in a sentence or two", cx));
         let welcome = cx.new(|cx| TextInput::multiline("What new members read on the server's home", cx));
-        for input in [&name, &description, &welcome] {
+        let role_name = cx.new(|cx| TextInput::new("Role name", cx));
+        let role_color = cx.new(|cx| TextInput::new("#RRGGBB", cx));
+        let member_search = cx.new(|cx| TextInput::new("Search by name or email", cx));
+        let ban_search = cx.new(|cx| TextInput::new("Search bans", cx));
+        let room_name = cx.new(|cx| TextInput::new("Channel name", cx));
+        let room_topic = cx.new(|cx| TextInput::new("What the channel is for", cx));
+        let category_name = cx.new(|cx| TextInput::new("Category name", cx));
+        let confirm = cx.new(|cx| TextInput::new("Type the server's name", cx));
+        for input in [&name, &description, &welcome, &role_name, &role_color, &member_search, &ban_search, &room_name, &room_topic, &category_name, &confirm] {
             cx.subscribe(input, |_, _, _: &crate::gui::input::InputEvent, cx| cx.notify()).detach();
             // Escape in a field leaves Server Settings, as it does anywhere else in it.
             cx.subscribe(input, |this, _, key: &crate::gui::input::InputKey, cx| {
@@ -181,7 +207,7 @@ impl Fields {
             })
             .detach();
         }
-        Fields { name, description, welcome }
+        Fields { name, description, welcome, role_name, role_color, member_search, ban_search, room_name, room_topic, category_name, confirm }
     }
 }
 
@@ -198,36 +224,6 @@ pub(in crate::gui::tiny) fn page_head(title: &'static str, about: &'static str) 
 /// A labelled section of a page.
 pub(in crate::gui::tiny) fn section(label: &'static str) -> Div {
     div().flex().flex_col().gap(px(8.)).child(div().type_micro().text_color(theme::text_faint()).child(label.to_uppercase()))
-}
-
-/// What a page that is still to be built says. Its function is in place for whoever builds it.
-pub(in crate::gui::tiny) fn coming(page: Page, what: &'static str) -> AnyElement {
-    div()
-        .flex()
-        .flex_col()
-        .gap(px(24.))
-        .child(page_head(page.label(), what))
-        .child(
-            div()
-                .p(px(20.))
-                .rounded(px(theme::R_CARD))
-                .border_1()
-                .border_color(theme::border())
-                .border_dashed()
-                .flex()
-                .items_center()
-                .gap(px(12.))
-                .child(glyph(page.icon(), 20., theme::text_faint()))
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap(px(2.))
-                        .child(div().type_ui().font_weight(theme::SEMIBOLD).text_color(theme::text()).child("Coming in this branch"))
-                        .child(div().type_small().text_color(theme::text_soft()).child("This page is drawn next; its place and its requests are ready.")),
-                ),
-        )
-        .into_any_element()
 }
 
 /// The unsaved-changes bar at the foot of an edited page.
@@ -269,8 +265,17 @@ impl Shell {
         self.tiny_state.modal = None;
         self.tiny_state.card = None;
         self.tiny_state.settings = Some(Overlay::new(page, channel));
-        self.tiny_overview_reset(cx);
+        self.tiny_settings_reset_all(cx);
+        self.tiny_settings_refreshed(cx);
+        self.tiny_settings_enter(page, cx);
         cx.notify();
+    }
+
+    /// A page comes on show: the audit reads its first page the first time.
+    fn tiny_settings_enter(&mut self, page: Page, cx: &mut Context<Self>) {
+        if page == Page::Audit && self.tiny_state.settings.as_ref().is_some_and(|overlay| !overlay.audit.asked) {
+            self.tiny_audit_load(false, cx);
+        }
     }
 
     pub(in crate::gui) fn tiny_close_settings(&mut self, cx: &mut Context<Self>) {
@@ -283,8 +288,18 @@ impl Shell {
             overlay.page = page;
             overlay.error = None;
             overlay.saved = false;
+            overlay.scroll.set_offset(gpui::point(px(0.), px(0.)));
         }
+        // What was typed on the page left is put back: a page's changes don't follow to another.
+        self.tiny_settings_reset_all(cx);
+        self.tiny_settings_enter(page, cx);
         cx.notify();
+    }
+
+    fn tiny_settings_reset_all(&mut self, cx: &mut Context<Self>) {
+        self.tiny_overview_reset(cx);
+        self.tiny_roles_reset(cx);
+        self.tiny_channels_reset(cx);
     }
 
     /// The page on show has changes not yet saved.
@@ -294,6 +309,8 @@ impl Shell {
         };
         match overlay.page {
             Page::Overview => self.tiny_overview_dirty(cx),
+            Page::Roles => self.tiny_roles_dirty(cx),
+            Page::Channels => self.tiny_channels_dirty(cx),
             _ => false,
         }
     }
@@ -305,8 +322,11 @@ impl Shell {
         if let Some(overlay) = self.tiny_state.settings.as_mut() {
             overlay.error = None;
         }
-        if page == Page::Overview {
-            self.tiny_overview_save(cx);
+        match page {
+            Page::Overview => self.tiny_overview_save(cx),
+            Page::Roles => self.tiny_roles_save(cx),
+            Page::Channels => self.tiny_channels_save(cx),
+            _ => {}
         }
     }
 
@@ -317,8 +337,11 @@ impl Shell {
         if let Some(overlay) = self.tiny_state.settings.as_mut() {
             overlay.error = None;
         }
-        if page == Page::Overview {
-            self.tiny_overview_reset(cx);
+        match page {
+            Page::Overview => self.tiny_overview_reset(cx),
+            Page::Roles => self.tiny_roles_reset(cx),
+            Page::Channels => self.tiny_channels_reset(cx),
+            _ => {}
         }
         cx.notify();
     }
@@ -326,8 +349,20 @@ impl Shell {
     /// The first read of a server: the fields start from what it holds.
     pub(in crate::gui::tiny) fn tiny_settings_loaded(&mut self, cx: &mut Context<Self>) {
         if self.tiny_state.settings.is_some() {
-            self.tiny_overview_reset(cx);
+            self.tiny_settings_reset_all(cx);
         }
+    }
+
+    /// Every read of the server: what each page picked is checked against it (a role or a
+    /// channel gone is let go of, one just made is picked).
+    pub(in crate::gui::tiny) fn tiny_settings_refreshed(&mut self, cx: &mut Context<Self>) {
+        if self.tiny_state.settings.is_none() {
+            return;
+        }
+        self.tiny_roles_refreshed(cx);
+        self.tiny_channels_refreshed(cx);
+        self.tiny_members_refreshed();
+        self.tiny_danger_refreshed();
     }
 
     /// A save went through: the draft is what the server holds now.
@@ -339,6 +374,11 @@ impl Shell {
             overlay.saving = false;
             overlay.saved = true;
             overlay.overview = Default::default();
+            overlay.roles.hoist = None;
+            overlay.roles.permissions = None;
+            let channels = &mut overlay.channels;
+            (channels.limit, channels.bitrate, channels.video, channels.ptt) = (None, None, None, None);
+            channels.overrides.clear();
             let _ = cx;
         }
     }
@@ -442,7 +482,9 @@ impl Shell {
             .h_full()
             .relative()
             .bg(theme::canvas())
-            .child(div().id("tiny-settings-scroll").size_full().overflow_y_scroll().child(div().w_full().max_w(px(740.)).px(px(40.)).pt(px(48.)).pb(px(120.)).child(body)))
+            .child(
+                div().id("tiny-settings-scroll").size_full().overflow_y_scroll().track_scroll(&overlay.scroll).child(div().w_full().max_w(px(740.)).px(px(40.)).pt(px(48.)).pb(px(120.)).child(body)),
+            )
             .child(div().absolute().top(px(44.)).right(px(chrome::corner_pad(window, 28.))).child(close))
             .when(dirty || overlay.error.is_some(), |content| {
                 content.child(div().absolute().bottom(px(20.)).left(px(40.)).right(px(40.)).flex().child(unsaved_bar(overlay.saving, overlay.error.clone(), cx)))
@@ -455,6 +497,15 @@ impl Shell {
             .size_full()
             .bg(theme::canvas())
             .occlude()
+            // A slider's thumb follows the pointer anywhere over Server Settings while it is held.
+            .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
+                if event.pressed_button == Some(gpui::MouseButton::Left) {
+                    this.tiny_channels_slide(f32::from(event.position.x), cx);
+                } else {
+                    this.tiny_channels_slide_end();
+                }
+            }))
+            .on_mouse_up(gpui::MouseButton::Left, cx.listener(|this, _, _, _| this.tiny_channels_slide_end()))
             .flex()
             .font_family(theme::FONT)
             .text_color(theme::text())
@@ -467,6 +518,31 @@ impl Shell {
 #[cfg(test)]
 mod tests {
     use super::Page;
+    use crate::gui::tiny::{model, Page as Facts};
+    use protocol::{AccountKey, Network, TinyAccess, TinyCommunity, TINY_ALL, TINY_KICK_MEMBERS, TINY_VIEW_AUDIT_LOG};
+
+    fn shown(community: &TinyCommunity) -> Vec<&'static str> {
+        let account = AccountKey { network: Network::Tiny, account: "me".into() };
+        let facts = Facts { community, account: &account, may: model::may(community), live: true, me: "me", mine: None, audio: false, name: String::new() };
+        Page::ALL.into_iter().filter(|page| page.visible(&facts)).map(Page::label).collect()
+    }
+
+    #[test]
+    fn a_page_is_listed_only_where_the_account_may_use_it_and_the_server_has_it() {
+        let legacy = |role: &str| -> TinyCommunity { serde_json::from_value(serde_json::json!({"role": role, "members": [], "invites": [], "audit": [], "me": "me"})).unwrap() };
+        assert_eq!(shown(&legacy("member")), ["Overview"]);
+        let admin = shown(&legacy("admin"));
+        assert!(admin.contains(&"Members") && admin.contains(&"Invites") && admin.contains(&"Audit log"), "{admin:?}");
+        assert!(!admin.contains(&"Roles") && !admin.contains(&"Bans") && !admin.contains(&"Danger zone"), "an older server has no roles or bans: {admin:?}");
+        let mut modern = legacy("member");
+        modern.capabilities.features = ["server", "roles", "categories", "bans", "timeouts", "invite_options", "audit_query", "voice_moderation"].map(String::from).to_vec();
+        modern.access = Some(TinyAccess { permissions: TINY_KICK_MEMBERS | TINY_VIEW_AUDIT_LOG, ..TinyAccess::default() });
+        assert_eq!(shown(&modern), ["Overview", "Members", "Audit log"], "a moderator sees what they moderate");
+        modern.access = Some(TinyAccess { permissions: TINY_ALL, rank: 3, ..TinyAccess::default() });
+        assert!(!shown(&modern).contains(&"Danger zone"), "only owners see the danger zone");
+        modern.access = Some(TinyAccess { owner: true, ..TinyAccess::default() });
+        assert_eq!(shown(&modern).len(), Page::ALL.len());
+    }
 
     #[test]
     fn every_page_has_a_label_an_icon_and_a_group_and_each_group_is_together() {

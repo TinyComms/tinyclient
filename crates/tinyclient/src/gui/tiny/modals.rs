@@ -1,6 +1,8 @@
 //! The modals: inviting people (and the code that comes of it, shown once), kicking and banning
 //! with a reason, deleting a channel or a category, naming a channel or a category, someone's
-//! profile, and signing out of the server. Each is the system's modal (`components::modal`):
+//! profile, and signing out of the server; and Server Settings' confirmations: deleting a role,
+//! kicking several people, unbanning, revoking invites, handing over the server and signing out
+//! everywhere. The most dangerous ask for the server's name to be typed. Each is the system's modal (`components::modal`):
 //! a title, what it does in words, Cancel and the action last.
 
 use super::{model, Modal, Page};
@@ -157,7 +159,86 @@ impl Shell {
             Modal::SignOut => modal(format!("Sign out of {}?", page.name))
                 .child(words("Your sign-in here is forgotten on this computer, with everything tinyclient saved for it. You can join again with an invite or by signing in."))
                 .child(self.buttons("Sign out", ButtonKind::Danger, cx, |this, cx| this.tiny_sign_out(cx))),
+            Modal::DeleteRole(role_id) => {
+                let role = page.community.roles.iter().find(|role| role.id == *role_id);
+                let name = role.map(|role| role.name.clone()).unwrap_or_default();
+                let count = role.map_or(0, |role| role.member_count);
+                let id = role_id.clone();
+                modal(format!("Delete {name}?"))
+                    .child(words(match count {
+                        0 => "Nobody has this role. This can't be undone.".to_owned(),
+                        1 => "1 person has this role and loses it, with what it allowed them. This can't be undone.".to_owned(),
+                        n => format!("{n} people have this role and lose it, with what it allowed them. This can't be undone."),
+                    }))
+                    .children(self.modal_error())
+                    .child(self.buttons("Delete role", ButtonKind::Danger, cx, move |this, cx| this.tiny_delete_role(id.clone(), cx)))
+            }
+            Modal::KickMany(user_ids) => {
+                let ids = user_ids.clone();
+                let names: Vec<String> = user_ids.iter().map(|id| model::name_by_id(page.community, id)).collect();
+                modal(format!("Kick {} people?", user_ids.len()))
+                    .child(words(format!("{} are signed out of {} and leave its calls. They can come back with a new invite.", list_names(&names), page.name)))
+                    .child(label("Reason"))
+                    .child(self.input_box(&self.tiny_state.reason_input, window, cx))
+                    .children(self.modal_error())
+                    .child(self.buttons("Kick them", ButtonKind::Danger, cx, move |this, cx| this.tiny_send_kicks(ids.clone(), cx)))
+            }
+            Modal::Unban(user_id) => {
+                let name = page.community.bans.iter().find(|ban| ban.user_id == *user_id).map(super::settings::banned_name).unwrap_or_else(|| "them".to_owned());
+                let id = user_id.clone();
+                modal(format!("Unban {name}?"))
+                    .child(words(format!("{name} can join again with an invite, or through sign-in groups. They don't come back on their own.")))
+                    .children(self.modal_error())
+                    .child(self.buttons("Unban", ButtonKind::Primary, cx, move |this, cx| this.tiny_unban(id.clone(), cx)))
+            }
+            Modal::RevokeInvites { typed } => {
+                let count = page.community.invites.iter().filter(|invite| super::settings::revocable(page.community, invite)).count();
+                let panel = modal(format!("Revoke {count} invites?")).child(words("Every code still out there stops working at once. People who already joined stay."));
+                if *typed {
+                    self.tiny_typed_confirm(panel, page, "Revoke all", window, cx, |this, cx| this.tiny_revoke_all(cx))
+                } else {
+                    panel.children(self.modal_error()).child(self.buttons("Revoke all", ButtonKind::Danger, cx, |this, cx| this.tiny_revoke_all(cx)))
+                }
+            }
+            Modal::Transfer(user_id) => {
+                let name = model::name_by_id(page.community, user_id);
+                let step_down = self.tiny_state.settings.as_ref().is_some_and(|overlay| overlay.danger.step_down);
+                let panel = modal(format!("Make {name} an owner?")).child(words(if step_down {
+                    format!("{name} can do everything on {}, including taking ownership from others. Then you stop being an owner, and only another owner can make you one again.", page.name)
+                } else {
+                    format!("{name} can do everything on {}, including taking ownership from others. You stay an owner too.", page.name)
+                }));
+                self.tiny_typed_confirm(panel, page, "Transfer ownership", window, cx, |this, cx| this.tiny_transfer(cx))
+            }
+            Modal::SignOutEverywhere => modal("Sign out everywhere?")
+                .child(words(format!("Every session of yours on {} ends, on every computer, this one too. Sign in again with your provider when you want back in.", page.name)))
+                .children(self.modal_error())
+                .child(self.buttons("Sign out everywhere", ButtonKind::Danger, cx, |this, cx| this.tiny_sign_out_everywhere(cx))),
         }
+    }
+
+    /// A dangerous modal's end: the server's name to type, and the action quiet until it is.
+    fn tiny_typed_confirm(&self, panel: Div, page: &Page, verb: &'static str, window: &Window, cx: &mut Context<Self>, act: impl Fn(&mut Shell, &mut Context<Shell>) + 'static) -> Div {
+        let confirm = &self.tiny_state.settings_fields.confirm;
+        let ready = super::settings::confirmed(confirm.read(cx).text(), &page.name);
+        let action = if self.tiny_state.busy || !ready {
+            button_disabled(verb).h(px(32.)).into_any_element()
+        } else {
+            button("tiny-modal-do", ButtonKind::Danger, verb).h(px(32.)).on_click(cx.listener(move |this, _, _, cx| act(this, cx))).into_any_element()
+        };
+        panel
+            .child(div().mt(px(16.)).mb(px(6.)).type_small().text_color(theme::text_soft()).child(format!("Type “{}” to go on.", page.name)))
+            .child(self.input_box(confirm, window, cx))
+            .children(self.modal_error())
+            .child(
+                div()
+                    .mt(px(20.))
+                    .flex()
+                    .justify_end()
+                    .gap(px(8.))
+                    .child(button("tiny-modal-cancel", ButtonKind::Secondary, "Cancel").h(px(32.)).on_click(cx.listener(|this, _, _, cx| this.close_modal(cx))))
+                    .child(action),
+            )
     }
 
     fn invite_modal(&self, page: &Page, window: &Window, cx: &mut Context<Self>) -> Div {
@@ -313,6 +394,17 @@ impl Shell {
     }
 }
 
+/// Names as a sentence lists them: `Ann`, `Ann and Bea`, `Ann, Bea and 3 others`.
+fn list_names(names: &[String]) -> String {
+    match names {
+        [] => "They".to_owned(),
+        [one] => one.clone(),
+        [a, b] => format!("{a} and {b}"),
+        [a, b, c] => format!("{a}, {b} and {c}"),
+        [a, b, rest @ ..] => format!("{a}, {b} and {} others", rest.len()),
+    }
+}
+
 /// Where a code opens, and who it makes. The host is plain: they do not type it. A newer
 /// server's invite carries roles instead of a word, so only an admin invite is said.
 fn handoff_facts(origin: &str, role: &str, legacy: bool) -> (String, Option<&'static str>) {
@@ -361,7 +453,15 @@ pub(super) fn layer(panel: Div, cx: &mut Context<Shell>) -> AnyElement {
 
 #[cfg(test)]
 mod tests {
-    use super::handoff_facts;
+    use super::{handoff_facts, list_names};
+
+    #[test]
+    fn several_names_read_as_a_sentence() {
+        let names = |list: &[&str]| list.iter().map(|name| (*name).to_owned()).collect::<Vec<_>>();
+        assert_eq!(list_names(&names(&["Ann"])), "Ann");
+        assert_eq!(list_names(&names(&["Ann", "Bea"])), "Ann and Bea");
+        assert_eq!(list_names(&names(&["Ann", "Bea", "Cy", "Di", "Ed"])), "Ann, Bea and 3 others");
+    }
 
     #[test]
     fn a_code_says_where_it_opens_and_who_it_makes() {

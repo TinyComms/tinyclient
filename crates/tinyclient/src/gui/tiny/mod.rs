@@ -17,7 +17,7 @@
 //! numbers while a call is up.
 
 mod channel;
-mod column;
+pub(super) mod column;
 mod home;
 mod layer;
 mod members;
@@ -83,6 +83,17 @@ pub(super) enum Modal {
     NewCategory,
     Profile(String),
     SignOut,
+    /// Server Settings' confirmations.
+    DeleteRole(String),
+    KickMany(Vec<String>),
+    Unban(String),
+    /// Every invite this account may revoke; `typed` asks for the server's name first.
+    RevokeInvites {
+        typed: bool,
+    },
+    /// Ownership to this member, the server's name typed first.
+    Transfer(String),
+    SignOutEverywhere,
 }
 
 /// The invite being made.
@@ -104,9 +115,23 @@ impl Default for InviteDraft {
 /// Something dragged in the channel list.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum Dragged {
-    Person { user_id: String, name: String },
-    Room { room_id: String, name: String },
-    Category { category_id: String, name: String },
+    Person {
+        user_id: String,
+        name: String,
+    },
+    Room {
+        room_id: String,
+        name: String,
+    },
+    Category {
+        category_id: String,
+        name: String,
+    },
+    /// A role in Server Settings › Roles.
+    Role {
+        role_id: String,
+        name: String,
+    },
 }
 
 /// What the server page holds. An invite's token stays until Done and is never logged.
@@ -509,6 +534,7 @@ impl Shell {
         if first {
             self.tiny_settings_loaded(cx);
         }
+        self.tiny_settings_refreshed(cx);
     }
 
     /// Sends one request whose answer is `Ok` or a code, then reads the page again.
@@ -569,14 +595,87 @@ impl Shell {
         };
         if let Some(detail) = refused {
             self.tiny_state.busy = false;
+            // A save refused is said in the unsaved-changes bar, a modal's in the modal, anything
+            // else in a toast.
+            let saving = self.tiny_state.settings.as_ref().is_some_and(|overlay| overlay.saving);
             self.tiny_settings_failed(&detail);
             if self.tiny_state.modal.is_some() {
                 self.tiny_state.modal_error = Some(detail);
-            } else if self.tiny_state.settings.is_none() {
+            } else if !saving {
                 self.toast(Some(("icons/circle-alert.svg", super::theme::danger())), detail, cx);
             }
         }
         cx.notify();
+    }
+
+    /// Several requests, one after another, as one action: the first refusal stops the rest and is
+    /// said as `act` says one. The page is read again either way.
+    fn act_all(&mut self, requests: Vec<Request>, cx: &mut Context<Self>) {
+        if requests.is_empty() {
+            self.tiny_settings_saved(cx);
+            cx.notify();
+            return;
+        }
+        if self.tiny_state.busy {
+            return;
+        }
+        let Some(account) = self.tiny_state.account.clone() else {
+            return;
+        };
+        self.tiny_state.busy = true;
+        self.tiny_state.modal_error = None;
+        self.tiny_state.action_epoch += 1;
+        let epoch = self.tiny_state.action_epoch;
+        cx.notify();
+        self.off_thread(
+            cx,
+            move || {
+                for request in &requests {
+                    match ask(request) {
+                        Ok(Response::Ok) => {}
+                        other => return other,
+                    }
+                }
+                Ok(Response::Ok)
+            },
+            move |this, answer, cx| {
+                let failed = !matches!(answer, Ok(Response::Ok));
+                this.acted(epoch, account.clone(), answer, cx);
+                // Some may have gone through before the refusal: read what the server holds now.
+                if failed && this.tiny_state.action_epoch == epoch {
+                    this.fetch(account, None, cx);
+                }
+            },
+        );
+    }
+
+    /// Ends every session of this account on the server, then forgets it here, as signing out does.
+    pub(super) fn tiny_sign_out_everywhere(&mut self, cx: &mut Context<Self>) {
+        let Some(account) = self.with_account() else {
+            return;
+        };
+        if self.tiny_state.busy {
+            return;
+        }
+        self.tiny_state.busy = true;
+        self.tiny_state.modal_error = None;
+        cx.notify();
+        self.off_thread(
+            cx,
+            move || ask(&Request::TinySignOutEverywhere { account }),
+            |this, answer, cx| {
+                this.tiny_state.busy = false;
+                match answer {
+                    Ok(Response::Error { detail, .. }) => this.tiny_state.modal_error = Some(detail),
+                    Ok(_) => {
+                        this.tiny_state.modal = None;
+                        this.tiny_state.settings = None;
+                    }
+                    Err(err) => this.tiny_state.modal_error = Some(crate::client::trouble_words(&err)),
+                }
+                cx.notify();
+            },
+        );
     }
 
     /// A call request. Nothing is read again on success: the seats arrive as `Occupants`.
@@ -991,6 +1090,15 @@ impl Shell {
                 self.tiny_state.name_input.update(cx, |input, cx| input.set_text(&now, cx));
                 Some(self.tiny_state.name_input.clone())
             }
+            Modal::Transfer(_) | Modal::RevokeInvites { typed: true } => {
+                let confirm = self.tiny_state.settings_fields.confirm.clone();
+                confirm.update(cx, |input, cx| input.set_text("", cx));
+                Some(confirm)
+            }
+            Modal::KickMany(_) => {
+                self.tiny_state.reason_input.update(cx, |input, cx| input.set_text("", cx));
+                Some(self.tiny_state.reason_input.clone())
+            }
             Modal::Kick(_) | Modal::Ban(_) => {
                 self.tiny_state.reason_input.update(cx, |input, cx| input.set_text("", cx));
                 self.tiny_state.ban_days = Some(7);
@@ -1042,6 +1150,26 @@ impl Shell {
         let reason = self.tiny_state.reason_input.read(cx).text().trim().to_owned();
         let request = if modern { Request::TinyKick { account, user_id, reason } } else { Request::TinyRemove { account, user_id } };
         self.act(request, cx);
+    }
+
+    /// Kicks everyone listed, with one reason for all of them.
+    pub(super) fn tiny_send_kicks(&mut self, user_ids: Vec<String>, cx: &mut Context<Self>) {
+        let Some(account) = self.with_account() else {
+            return;
+        };
+        let reason = self.tiny_state.reason_input.read(cx).text().trim().to_owned();
+        let requests = user_ids.into_iter().map(|user_id| Request::TinyKick { account: account.clone(), user_id, reason: reason.clone() }).collect();
+        if let Some(overlay) = self.tiny_state.settings.as_mut() {
+            overlay.members.selected.clear();
+        }
+        self.act_all(requests, cx);
+    }
+
+    pub(super) fn tiny_delete_role(&mut self, role_id: String, cx: &mut Context<Self>) {
+        let Some(account) = self.with_account() else {
+            return;
+        };
+        self.act(Request::TinyRoleDelete { account, role_id }, cx);
     }
 
     pub(super) fn tiny_send_ban(&mut self, user_id: String, cx: &mut Context<Self>) {
@@ -1122,6 +1250,14 @@ impl Shell {
             Some("profile") => self.tiny_open_modal(Modal::Profile(target), window, cx),
             _ => {}
         }
+        if std::env::args().any(|arg| arg == "--tiny-owner") {
+            if let Some(community) = self.tiny_state.community.as_mut() {
+                community.access = Some(protocol::TinyAccess { owner: true, ..community.access.clone().unwrap_or_default() });
+                if let Some(me) = community.members.iter_mut().find(|member| member.user_id == community.me) {
+                    me.owner = true;
+                }
+            }
+        }
         if std::env::args().any(|arg| arg == "--tiny-settings") {
             let asked = flag("--tiny-settings").unwrap_or_default();
             let page = settings::Page::ALL.into_iter().find(|page| page.label().to_lowercase().starts_with(&asked)).filter(|_| !asked.is_empty() && asked != "dirty");
@@ -1129,6 +1265,39 @@ impl Shell {
             if asked == "dirty" {
                 let name = self.tiny_state.settings_fields.name.clone();
                 name.update(cx, |input, cx| input.set_text("Night Shift HQ", cx));
+            }
+            if let Some(ix) = flag("--tiny-pick").and_then(|n| n.parse::<usize>().ok()) {
+                let roles: Vec<String> = settings::roles_in_order(&community);
+                match self.tiny_state.settings.as_ref().map(|overlay| overlay.page) {
+                    Some(settings::Page::Roles) => self.tiny_roles_select(roles.get(ix).cloned(), cx),
+                    Some(settings::Page::Channels) => self.tiny_channels_select(rooms.get(ix).cloned().map(settings::Sel::Room), cx),
+                    Some(settings::Page::Members) => {
+                        if let Some(overlay) = self.tiny_state.settings.as_mut() {
+                            overlay.members.selected = community.members.iter().filter(|member| settings::tickable(&community, member)).take(ix).map(|member| member.user_id.clone()).collect();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if flag("--tiny-confirm").as_deref() == Some("transfer") {
+                let heir = community.members.iter().find(|member| member.user_id != community.me && !model::is_owner(member)).map(|member| member.user_id.clone());
+                if let (Some(heir), Some(overlay)) = (heir, self.tiny_state.settings.as_mut()) {
+                    overlay.danger.heir = Some(heir.clone());
+                    overlay.danger.step_down = true;
+                    self.tiny_open_modal(Modal::Transfer(heir), window, cx);
+                    let confirm = self.tiny_state.settings_fields.confirm.clone();
+                    confirm.update(cx, |input, cx| input.set_text("Night Shift", cx));
+                }
+            }
+            if let Some(down) = flag("--tiny-scroll").and_then(|n| n.parse::<f32>().ok()) {
+                if let Some(overlay) = self.tiny_state.settings.as_ref() {
+                    overlay.scroll.set_offset(Point::new(gpui::px(0.), gpui::px(-down)));
+                }
+            }
+            if let Some(role) = flag("--tiny-override") {
+                if let Some(overlay) = self.tiny_state.settings.as_mut() {
+                    overlay.channels.role = community.roles.iter().find(|known| known.name.eq_ignore_ascii_case(&role)).map(|known| known.id.clone());
+                }
             }
         }
         if let Some(ix) = flag("--tiny-card").and_then(|n| n.parse::<usize>().ok()) {
