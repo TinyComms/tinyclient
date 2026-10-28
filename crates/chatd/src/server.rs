@@ -1787,6 +1787,17 @@ impl Chat {
                 Ok(()) => self.sign_out(account),
                 Err(answer) => answer,
             },
+            // The key is the mediad's to act on.
+            Request::CallTalk { held, priority } => match self.hub.calls.request(&self.hub, &MediaRequest::Talk { held, priority }) {
+                Ok(_) => Response::Ok,
+                Err(err) => call_error(err),
+            },
+            Request::CallStats => match self.hub.calls.request(&self.hub, &MediaRequest::Stats) {
+                Ok(protocol::MediaResponse::Stats(stats)) => Response::CallStats { stats },
+                Ok(protocol::MediaResponse::Refused { detail }) => error(ErrorCode::Unsupported, detail),
+                Ok(_) => error(ErrorCode::Unsupported, "This call can't report its connection."),
+                Err(err) => call_error(err),
+            },
 
             Request::CallStart { conversation } => self.call_start(conversation),
             Request::CallAccept => match self.hub.calls.accept(&self.hub) {

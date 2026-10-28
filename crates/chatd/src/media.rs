@@ -79,6 +79,9 @@ struct Live {
     metering: bool,
     /// Our own user id in the voice session, to tell our own speaking from everyone else's.
     me: String,
+    /// The room requires push-to-talk (a Tiny room's `ptt_only`, or no voice activation
+    /// there), whatever the user chose.
+    push_to_talk: bool,
 }
 
 /// The running mediad and the call it exists for. Dropping it ends the call.
@@ -203,6 +206,16 @@ fn new_call(conversation: Key, state: CallState) -> Live {
         answered: false,
         metering: false,
         me: String::new(),
+        push_to_talk: false,
+    }
+}
+
+/// How the microphone opens: the user's choice, unless the room requires push-to-talk.
+fn input_mode(settings: &protocol::settings::Values, push_to_talk: bool) -> protocol::InputMode {
+    if push_to_talk {
+        settings.push_to_talk()
+    } else {
+        settings.input_mode()
     }
 }
 
@@ -318,6 +331,7 @@ impl Live {
             | MediaResponse::Streams { .. }
             | MediaResponse::Done
             | MediaResponse::Offer { .. }
+            | MediaResponse::Stats(_)
             | MediaResponse::Refused { .. } => return false,
         }
         true
@@ -538,9 +552,10 @@ impl Calls {
             drop(tester);
             hub.changed(Change::Meter { level: None });
         }
-        let (tuning, input, output, muted) = {
+        let (tuning, input, output, muted, mode, processing) = {
             let settings = hub.settings();
-            (settings.tuning(), settings.device(INPUT), settings.device(OUTPUT), settings.on(JOIN_MUTED))
+            let mode = input_mode(&settings, false);
+            (settings.tuning(), settings.device(INPUT), settings.device(OUTPUT), settings.on(JOIN_MUTED), mode, settings.processing())
         };
         {
             let mut slot = crate::hub::lock(&self.slot);
@@ -555,6 +570,8 @@ impl Calls {
             // only once it holds one. A mediad that refuses them still carries the call.
             crate::hub::lock(&active.live).call.muted = muted;
             let _ = active.request(&MediaRequest::Tune(tuning));
+            let _ = active.request(&MediaRequest::Input(mode));
+            let _ = active.request(&MediaRequest::Processing(processing));
             if input.is_some() || output.is_some() {
                 let _ = active.request(&MediaRequest::Devices { input, output });
             }
@@ -571,9 +588,15 @@ impl Calls {
 
     /// The tuning changed in Settings: the call's mediad, or the test's, takes it at once.
     pub fn retune(&self, hub: &Hub) {
-        let tuning = hub.settings().tuning();
+        let (tuning, settings) = {
+            let settings = hub.settings();
+            (settings.tuning(), settings.clone())
+        };
         if let Some(active) = crate::hub::lock(&self.slot).running() {
+            let push_to_talk = crate::hub::lock(&active.live).push_to_talk;
             let _ = active.request(&MediaRequest::Tune(tuning));
+            let _ = active.request(&MediaRequest::Input(input_mode(&settings, push_to_talk)));
+            let _ = active.request(&MediaRequest::Processing(settings.processing()));
         }
         if let Some(tester) = crate::hub::lock(&self.tester).as_mut() {
             let _ = tester.send(&MediaRequest::Tune(tuning));
@@ -967,6 +990,24 @@ impl Calls {
         }
     }
 
+    /// What a Tiny room asks of the call in it: the bitrate to encode at, and whether only
+    /// push-to-talk opens the microphone there. Sent when the call joins the room and whenever
+    /// the room changes.
+    pub fn tiny_room(&self, hub: &Hub, conversation: &Key, kbps: u32, push_to_talk: bool) {
+        let mut changed = false;
+        if !self.update(hub, conversation, |live| {
+            changed = live.push_to_talk != push_to_talk;
+            live.push_to_talk = push_to_talk;
+        }) {
+            return;
+        }
+        let _ = self.request(hub, &MediaRequest::Bitrate { kbps });
+        if changed {
+            let mode = input_mode(&hub.settings(), push_to_talk);
+            let _ = self.request(hub, &MediaRequest::Input(mode));
+        }
+    }
+
     /// Ends the call if it is in `conversation`, in whatever state, without telling the
     /// adapter: the network already knows. True if there was one.
     pub fn end_if(&self, hub: &Hub, conversation: &Key) -> bool {
@@ -1020,13 +1061,7 @@ mod tests {
     }
 
     fn person(id: &str) -> Participant {
-        Participant {
-            id: id.into(),
-            name: id.to_uppercase(),
-            speaking: false,
-            muted: false,
-            deafened: false,
-        }
+        Participant { id: id.into(), name: id.to_uppercase(), ..Participant::default() }
     }
 
     #[test]

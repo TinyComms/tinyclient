@@ -842,7 +842,7 @@ fn tell(ctx: &Context, seat: &Seat, room: &str) {
     let name = |user: &str| seat.names.get(user).filter(|name| !name.is_empty()).cloned().unwrap_or_else(|| "Someone".to_owned());
     if ctx.in_call(room) {
         let others = people.iter().filter(|who| who.user != seat.me);
-        let roster = others.map(|who| Participant { id: who.user.clone(), name: name(&who.user), speaking: false, muted: who.muted, deafened: who.deafened });
+        let roster = others.map(|who| Participant { id: who.user.clone(), name: name(&who.user), speaking: false, muted: who.muted, deafened: who.deafened, ..Participant::default() });
         ctx.participants(room, roster.collect());
     }
     let occupants = people

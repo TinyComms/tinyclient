@@ -993,6 +993,13 @@ impl Context {
         self.hub.calls.end_if(&self.hub, &self.key(conversation_id))
     }
 
+    /// A Tiny room's bitrate and whether it requires push-to-talk, for the call in it.
+    pub fn tiny_room(&self, conversation_id: &str, kbps: u32, push_to_talk: bool) {
+        if self.in_call(conversation_id) {
+            self.hub.calls.tiny_room(&self.hub, &self.key(conversation_id), kbps, push_to_talk);
+        }
+    }
+
     /// The call is up for this conversation, with its mediad.
     pub fn in_call(&self, conversation_id: &str) -> bool {
         let (call, running) = self.hub.calls.describe();

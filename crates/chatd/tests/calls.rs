@@ -253,13 +253,7 @@ fn a_join_is_drawn_as_a_call_only_once_the_voice_server_admits_us_and_a_refusal_
     assert_eq!(mediads(), 1);
     // Muted before the network has answered: it must survive the join.
     assert!(hub.calls.set_audio(&hub, true, false).is_ok());
-    let alice = Participant {
-        id: "222".into(),
-        name: "Alice".into(),
-        speaking: false,
-        muted: false,
-        deafened: false,
-    };
+    let alice = Participant { id: "222".into(), name: "Alice".into(), ..Participant::default() };
     hub.calls.set_participants(&hub, &lounge(), vec![alice]);
 
     // The adapter has both gateway events and hands the session over.
@@ -427,13 +421,7 @@ fn a_second_voice_session_for_a_call_that_is_up_moves_the_call_and_keeps_it() {
     let (hub, dir) = hub();
     let (old, new) = (Voice::new(), Voice::new());
     assert!(hub.calls.start(&hub, lounge()).is_ok());
-    let alice = Participant {
-        id: "222".into(),
-        name: "Alice".into(),
-        speaking: false,
-        muted: false,
-        deafened: false,
-    };
+    let alice = Participant { id: "222".into(), name: "Alice".into(), ..Participant::default() };
     hub.calls.set_participants(&hub, &lounge(), vec![alice]);
     hub.calls.join(&hub, &lounge(), old.join());
     let (mut first, _) = old.identified();

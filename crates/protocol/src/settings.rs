@@ -38,8 +38,17 @@ pub const OUTPUT: &str = "output";
 pub const JOIN_MUTED: &str = "join_muted";
 /// V5. Everyone's voice, 0 to 100.
 pub const VOICE_VOLUME: &str = "voice_volume";
-/// V6. The level, 0 to 100, from which our microphone counts as speech.
+/// V6. The level, 0 to 100, from which our microphone counts as speech, and in voice
+/// activation opens.
 pub const SENSITIVITY: &str = "sensitivity";
+/// V7. On: the microphone opens only while the push-to-talk key is held.
+pub const PUSH_TO_TALK: &str = "push_to_talk";
+/// V8. How long the microphone stays open after push-to-talk is let go, in milliseconds.
+pub const PTT_RELEASE_MS: &str = "ptt_release_ms";
+/// V9, V10, V11. The microphone's processing.
+pub const ECHO_CANCELLATION: &str = "echo_cancellation";
+pub const NOISE_SUPPRESSION: &str = "noise_suppression";
+pub const AUTO_GAIN: &str = "auto_gain";
 /// P1, per account. Off: the adapter sends no typing signal.
 pub const TYPING: &str = "typing";
 /// P2, per Teams account. Off: no read horizon is sent.
@@ -53,6 +62,7 @@ pub const VERSION: &str = "version";
 
 pub const KEEP_DAYS_CHOICES: [u32; 3] = [7, 30, 90];
 pub const CACHE_MB_CHOICES: [u32; 4] = [250, 500, 1000, 2000];
+pub const PTT_RELEASE_CHOICES: [u32; 6] = [0, 100, 200, 300, 500, 1000];
 
 /// What a key's values look like.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,7 +76,9 @@ enum Kind {
 fn kind(key: &str) -> Option<Kind> {
     Some(match key {
         KEEP_RUNNING | SOUNDS | CUE_JOINS | CUE_MINE | CUE_CONNECTION => Kind::Switch(true),
-        JOIN_MUTED => Kind::Switch(false),
+        ECHO_CANCELLATION | NOISE_SUPPRESSION | AUTO_GAIN => Kind::Switch(true),
+        JOIN_MUTED | PUSH_TO_TALK => Kind::Switch(false),
+        PTT_RELEASE_MS => Kind::Choice(&PTT_RELEASE_CHOICES, 200),
         CUE_VOLUME => Kind::Percent(50),
         VOICE_VOLUME => Kind::Percent(100),
         SENSITIVITY => Kind::Percent(25),
@@ -220,6 +232,29 @@ impl Values {
         }
     }
 
+    /// How the microphone opens, as the user chose. A room that requires push-to-talk asks
+    /// for [`Values::push_to_talk`] instead.
+    pub fn input_mode(&self) -> crate::InputMode {
+        if self.on(PUSH_TO_TALK) {
+            self.push_to_talk()
+        } else {
+            crate::InputMode::Voice { threshold: self.number(SENSITIVITY).min(100) as u8 }
+        }
+    }
+
+    /// Push-to-talk with the user's release delay, whatever the mode chosen.
+    pub fn push_to_talk(&self) -> crate::InputMode {
+        crate::InputMode::PushToTalk { release_ms: self.number(PTT_RELEASE_MS).min(1000) as u16 }
+    }
+
+    pub fn processing(&self) -> crate::AudioProcessing {
+        crate::AudioProcessing {
+            echo_cancellation: self.on(ECHO_CANCELLATION),
+            noise_suppression: self.on(NOISE_SUPPRESSION),
+            auto_gain: self.on(AUTO_GAIN),
+        }
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = Setting> + '_ {
         self.0.iter().map(|((scope, key), value)| Setting { scope: scope.clone(), key: key.clone(), value: value.clone() })
     }
@@ -272,6 +307,20 @@ mod tests {
         assert!(values.typing(&discord) && !values.typing(&slack));
         assert_eq!(account_of(&account_scope(&slack)), Some(slack));
         assert_eq!(account_of("account:myspace:1"), None);
+    }
+
+    #[test]
+    fn the_microphone_opens_by_voice_until_push_to_talk_is_chosen_and_processing_is_on() {
+        let mut values = Values::default();
+        assert_eq!(values.input_mode(), crate::InputMode::Voice { threshold: 25 });
+        assert_eq!(values.processing(), crate::AudioProcessing::default());
+        assert!(valid(GLOBAL, PTT_RELEASE_MS, "300") && !valid(GLOBAL, PTT_RELEASE_MS, "250"));
+        values.set(GLOBAL, PUSH_TO_TALK, Some("on".into()));
+        assert_eq!(values.input_mode(), crate::InputMode::PushToTalk { release_ms: 200 });
+        values.set(GLOBAL, PTT_RELEASE_MS, Some("0".into()));
+        values.set(GLOBAL, NOISE_SUPPRESSION, Some("off".into()));
+        assert_eq!(values.input_mode(), crate::InputMode::PushToTalk { release_ms: 0 });
+        assert!(!values.processing().noise_suppression && values.processing().echo_cancellation);
     }
 
     #[test]

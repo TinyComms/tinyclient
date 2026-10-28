@@ -1455,6 +1455,17 @@ pub enum Request {
         room_id: String,
         user_id: String,
     },
+
+    /// The push-to-talk key went down or up, from the shell's global hotkey. `priority` is the
+    /// priority key: on a Tiny server it also asks to be heard over everyone else, which the
+    /// server honours only with priority_speaker. Refused with no call.
+    CallTalk {
+        held: bool,
+        #[serde(default, skip_serializing_if = "is_false")]
+        priority: bool,
+    },
+    /// How the call's connection is doing now. Answers `CallStats`.
+    CallStats,
 }
 
 /// One thing that changed. The shell asks again for exactly that; the ephemeral kinds carry their
@@ -1733,6 +1744,9 @@ pub enum Response {
     /// An invite that was just created. `code.token` is not kept.
     TinyCode {
         code: TinyCode,
+    },
+    CallStats {
+        stats: CallStats,
     },
 }
 

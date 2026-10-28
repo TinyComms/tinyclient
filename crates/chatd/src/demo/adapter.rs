@@ -525,6 +525,7 @@ impl Demo {
                 speaking: false,
                 muted: occupant.muted,
                 deafened: occupant.deafened,
+                ..Participant::default()
             });
             demo.ctx.participants(conversation_id, roster.collect());
         }
@@ -558,7 +559,7 @@ impl Demo {
             demo.ctx.answered(&conversation_id);
             let peer = demo.ctx.known(&conversation_id).ok().flatten().and_then(|row| Some((row.peer?, row.title)));
             if let Some((id, name)) = peer {
-                let them = Participant { id, name, speaking: false, muted: false, deafened: false };
+                let them = Participant { id, name, ..Participant::default() };
                 demo.ctx.participants(&conversation_id, vec![them]);
             }
         });

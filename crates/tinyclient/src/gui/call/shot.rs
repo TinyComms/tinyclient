@@ -22,7 +22,7 @@ fn channel(name: &str) -> bool {
 }
 
 fn person(name: &str, speaking: bool, muted: bool, deafened: bool) -> Participant {
-    Participant { id: name.to_lowercase().replace(' ', "-"), name: name.to_owned(), speaking, muted, deafened }
+    Participant { id: name.to_lowercase().replace(' ', "-"), name: name.to_owned(), speaking, muted, deafened, ..Participant::default() }
 }
 
 fn key(id: &str) -> Key {
