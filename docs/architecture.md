@@ -60,9 +60,12 @@ How the processes fit together and who may edit what. The contract itself is the
 | `Fetch {account, ids, size, retry}` | `Media {files}` | store (size, retry); `blobs` |
 | `SignIn {network, at}`, `SignOut {account}` | `Status` | server |
 | `CallStart`, `CallAccept`, `CallDecline`, `CallEnd`, `CallSet`, `Media(..)` | `Status` | `media::Calls`; `Command::Call*` |
+| `CallTalk {held, priority}`, `CallStats` | `Ok`; `CallStats {stats}` | `media::Calls` to mediad (`Talk`, `Stats`); a priority key on a Tiny call is also `call.state` `priority` |
 | `Play(Start {account, file, path, conversation, message, title, at, rate, output} \| Pause \| Seek {at} \| Rate {rate} \| Stop)` | `Ok`; then `Change::Playback` | `playback::Player`; `mediad --play` |
 | `TinyCommunity`, `TinyInvite`, `TinyRole`, `TinyRemove`, `TinyRevoke`, `TinyRename`, `TinySignOutEverywhere`, `TinyRoomCreate`, `TinyRoomRename`, `TinyRoomDelete` | `TinyCommunity` (members, invites, audit, rooms with who sits in each, online, the server's `media`); `TinyCode`; `Ok` | `adapters::tiny` over the server's REST; seats and presence from the hub |
 | `TinyCallJoin`, `TinyCallLeave`, `TinyCallKick` | `Ok` once the server took it, or its refusal in words | `Command::Tiny`, sent on the account's live socket (`adapters/tiny/live.rs`). On a server whose `/health` says media is `up`, a join is a call with `mediad` (below); otherwise a seat only. `CallStart` on a Tiny room key is the same join |
+| `TinyServerUpdate`, `TinyServerIcon`, `TinyRole{Create,Update,Delete,Order}`, `TinyMemberRoles`, `TinyMemberOwner`, `TinyTimeout`, `TinyKick`, `TinyBan`, `TinyUnban`, `TinyCategory{Create,Rename,Delete}`, `TinyLayout`, `TinyRoomCreateWith`, `TinyRoomUpdate`, `TinyOverride{Set,Clear}`, `TinyInviteWith`, `TinyAudit` | `Ok`; `TinyCode`; `TinyAudit {audit}` | `adapters::tiny::manage` over the server's REST, each only where `GET /v1/capabilities` lists its feature; an older server (404 there) is refused in words and nothing is sent |
+| `TinyCallModerate`, `TinyCallMove` | as `TinyCallKick` | `call.moderate`, `call.move` on the live socket, with the `voice_moderation` feature |
 
 - **Rows**: a `Conversation` carries its Space's and Group's titles and its topic
   (`Conversation::subtitle()` is the header's second line: `Space > group · topic`), `read_only`,
@@ -208,7 +211,8 @@ changing again replaces its entry, so the list is bounded (256) by how many thin
   value rides on the row whenever `Tree`, `Conversation` or `Inbox` is read; an emptied channel
   is told once with a total of 0. Held for 256 channels at most, never stored.
 - `Tiny {account}` says a Tiny server's people, roles, invites or rooms changed: read
-  `TinyCommunity` again. Its live socket sends it for each room, member and invite event, and
+  `TinyCommunity` again. Its live socket sends it for each server, role, category, layout, room,
+  member and invite event, when someone's server mute, deafen or suppression changes, and
   after each `ready`. Who sits in a room is `Occupants` under the room's id, and who is online
   `Presence`, as for a voice channel.
 - `reset: true` means read everything on screen again: `seq` starts from the clock at each chatd
@@ -297,8 +301,11 @@ goes out as `call.join` `sdp`; `call.answer` comes back as `TinyAnswer` (from he
 joining, with the 35 s deadline), and each `call.slots` for that `call_id` as `TinySlots`.
 `Connected` makes it `Joined` as for Discord. Mute and deafen go out as `call.state`, a hang-up
 or a failure as `call.leave` (only while the socket still sees us in the room), and `call.left`
-for us with `media_timeout`, `media_lost`, `kicked`, `room_deleted` or `joined_elsewhere` fails
-the call in words. After a server restart the live socket sends a fresh `TinyOffer` to the same
+for us with `media_timeout`, `media_lost`, `kicked`, `room_deleted`, `joined_elsewhere`,
+`banned` or `timed_out` fails the call in words. `call.moved` (a moderator moved us) carries the
+call to the new room: the same mediad, devices, mute and deafen, a fresh `TinyOffer`, and a
+`call.join` there; the `call.left` with `moved` that goes with it ends nothing. The room's bitrate
+and push-to-talk requirement go to mediad as `Bitrate` and `Input` once the offer is made. After a server restart the live socket sends a fresh `TinyOffer` to the same
 mediad and joins again; mediad keeps its devices and takes up the new connection. str0m, its
 sockets and every packet stay in mediad (`mediad/src/tiny.rs`).
 

@@ -201,8 +201,11 @@ no control.
 | V5 | Call volume | Slider 0 to 100 % | 100 % | G | d | Gain on everyone's voice in mediad's mix. 100 % is today's level | v1 |
 | V6 | Microphone sensitivity | Slider over the live meter, with "Default" mark | 25 (today's `VOICE`) | G | d | The voice gate threshold in mediad: below it, nothing is sent and no speaking ring shows | v1 |
 | V7 | Camera | Menu | | G | d | | Later, with camera |
-| V8 | Push to talk | Switch and key | | G | d | | Later |
-| V9 | Per-person volume | Row menu in the participant list | | C | d | | Later (07) |
+| V8 | Push to talk | Switch, key, and release delay (0, 100, 200, 300, 500 or 1000 ms) | Off, 200 ms | G | d | `push_to_talk`, `ptt_release_ms`: mediad's `Input` is push-to-talk with that delay instead of the V6 gate. A Tiny room that requires it (or where voice activation is not allowed) is push-to-talk whatever this says. The key itself is the shell's (`CallTalk`) | Protocol and chatd done; mediad and the key later |
+| V9 | Per-person volume | Row menu in the participant list | | C | d | mediad's `Gain {user_id, percent, muted}`, 0 to 200 % | Protocol done; later (07) |
+| V10 | Echo cancellation | Switch | On | G | d | `echo_cancellation`, in mediad's `Processing` | Protocol and chatd done; mediad later |
+| V11 | Noise suppression | Switch | On | G | d | `noise_suppression`, as V10 | As V10 |
+| V12 | Automatic gain | Switch | On | G | d | `auto_gain`, as V10 | As V10 |
 
 The device menu in the call dock gains "Play test sound" (S12) and "Call settings…", which opens
 this section. Picking a device in the dock changes the call and not the default; the dock marks

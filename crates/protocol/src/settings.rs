@@ -41,11 +41,11 @@ pub const VOICE_VOLUME: &str = "voice_volume";
 /// V6. The level, 0 to 100, from which our microphone counts as speech, and in voice
 /// activation opens.
 pub const SENSITIVITY: &str = "sensitivity";
-/// V7. On: the microphone opens only while the push-to-talk key is held.
+/// V8. On: the microphone opens only while the push-to-talk key is held.
 pub const PUSH_TO_TALK: &str = "push_to_talk";
 /// V8. How long the microphone stays open after push-to-talk is let go, in milliseconds.
 pub const PTT_RELEASE_MS: &str = "ptt_release_ms";
-/// V9, V10, V11. The microphone's processing.
+/// V10, V11, V12. The microphone's processing.
 pub const ECHO_CANCELLATION: &str = "echo_cancellation";
 pub const NOISE_SUPPRESSION: &str = "noise_suppression";
 pub const AUTO_GAIN: &str = "auto_gain";
