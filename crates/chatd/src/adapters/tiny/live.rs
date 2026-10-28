@@ -19,7 +19,7 @@ use super::super::discord::gateway::{wait_sockets, Pollable, WakePair, POLL_IN, 
 use super::super::{net, Context, Refusal, Reply, ReconnectWait, PANIC_PAUSE, RECONNECTING};
 use crate::hub::lock;
 use super::{members_of, Saved};
-use protocol::{join_host, CallFailure, Link, MediaRequest, Occupant, Participant, Presence, TinyOffer, TinySeat, TinySlot};
+use protocol::{join_host, CallFailure, Cue, Link, MediaRequest, Occupant, Participant, Presence, TinyOffer, TinySeat, TinySlot};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -267,6 +267,11 @@ struct Seat {
     last: Option<String>,
     /// The server moved us here (`call.moved`): join it once the frame is read.
     move_to: Option<String>,
+    /// The server stopped hearing our media (`media_lost`) on a socket that is still up: take
+    /// the seat again with a fresh offer once the frame is read, as after a restart.
+    recover: Option<String>,
+    /// When the call last came back that way, so a link that keeps failing is let go.
+    recovered: Vec<Instant>,
     /// Our own mute, deafen and priority, as last told to the server.
     muted: bool,
     deafened: bool,
@@ -385,6 +390,8 @@ pub(super) fn keep_live(ctx: &Context, saved: &Saved, live: &Live, timing: &Timi
         speaking: Vec::new(),
         last: None,
         move_to: None,
+        recover: None,
+        recovered: Vec::new(),
         muted: false,
         deafened: false,
         priority: false,
@@ -598,6 +605,13 @@ fn serve(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, timing: &Ti
                     if let Some(room) = seat.move_to.take() {
                         refs += 1;
                         if let Err(err) = move_with(ctx, saved, live, seat, wire, pending, refs, room, timing) {
+                            return End::Dropped(err.to_string());
+                        }
+                    }
+                    if let Some(room) = seat.recover.take() {
+                        refs += 1;
+                        eprintln!("chatd: Tiny server: the call's media was lost; joining again");
+                        if let Err(err) = rejoin_with(ctx, saved, live, seat, wire, pending, refs, room, timing) {
                             return End::Dropped(err.to_string());
                         }
                     }
@@ -1118,6 +1132,12 @@ fn left(ctx: &Context, seat: &mut Seat, room: &str, reason: &str) {
     if !ctx.in_call(room) {
         return;
     }
+    // A network blip the server noticed before we did: the call joins again by itself, a few
+    // times, before it is given up in words.
+    if reason == "media_lost" && seat.wanted.as_deref() == Some(room) && recovering(&mut seat.recovered, Instant::now()) {
+        seat.recover = Some(room.to_owned());
+        return;
+    }
     let words = match reason {
         "media_timeout" => Some((CallFailure::Lost, MEDIA_TIMEOUT)),
         "media_lost" => Some((CallFailure::Lost, MEDIA_LOST)),
@@ -1128,11 +1148,29 @@ fn left(ctx: &Context, seat: &mut Seat, room: &str, reason: &str) {
         "timed_out" => Some((CallFailure::Refused, TIMED_OUT)),
         _ => None,
     };
+    // Put out by someone: the cue that says so plays out as the call ends.
+    if matches!(reason, "kicked" | "banned" | "timed_out" | "room_deleted") {
+        ctx.tell_media(room, MediaRequest::Cue { cue: Cue::Disconnected });
+    }
     match words {
         // chatd then has the adapter hang up, which sends nothing: we are not in the room.
         Some((reason, detail)) => ctx.call_failed(room, reason, detail),
         None => drop(ctx.call_over(room)),
     }
+}
+
+/// Times a call whose media the server lost joins again by itself within [`RECOVER_WINDOW`].
+const RECOVERIES: usize = 3;
+const RECOVER_WINDOW: Duration = Duration::from_secs(120);
+
+/// Whether a call that lost its media may join again now, counting this time if so.
+fn recovering(recovered: &mut Vec<Instant>, now: Instant) -> bool {
+    recovered.retain(|at| now.saturating_duration_since(*at) < RECOVER_WINDOW);
+    if recovered.len() >= RECOVERIES {
+        return false;
+    }
+    recovered.push(now);
+    true
 }
 
 fn answered(ctx: &Context, seat: &mut Seat, pending: &mut Vec<Pending>, frame: &Value, ok: bool) {

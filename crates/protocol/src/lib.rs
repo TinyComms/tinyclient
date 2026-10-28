@@ -14,6 +14,7 @@ use std::path::PathBuf;
 pub mod browser;
 mod call;
 pub mod crash;
+pub mod hotkey;
 mod info;
 pub mod ipc;
 pub mod launch;
@@ -1384,6 +1385,10 @@ pub enum Request {
     /// off, 30 s, or a call starts. In a call it is the call's own meter.
     TestMicrophone {
         on: bool,
+        /// Also play the microphone back on the speaker, processed as a call would send it.
+        /// Outside a call only.
+        #[serde(default, skip_serializing_if = "is_false")]
+        loopback: bool,
     },
     /// Plays the test sound on the call speaker (V2): in the call's mediad, or one started for it.
     TestSound,
@@ -1621,6 +1626,17 @@ pub enum Request {
     },
     /// How the call's connection is doing now. Answers `CallStats`.
     CallStats,
+    /// One person's volume for me alone, 0 to [`GAIN_MAX`] percent, and whether I muted them
+    /// (V9). Kept per account (`settings::gain_key`), so it holds in every call on that
+    /// account, and applied by the call's mediad at once. Answers `Ok`, with or without a
+    /// call.
+    CallGain {
+        account: AccountKey,
+        user_id: String,
+        percent: u16,
+        #[serde(default, skip_serializing_if = "is_false")]
+        muted: bool,
+    },
 }
 
 /// One thing that changed. The shell asks again for exactly that; the ephemeral kinds carry their
