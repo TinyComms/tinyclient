@@ -1456,6 +1456,161 @@ pub enum Request {
         user_id: String,
     },
 
+    // Server management. Each needs the server to list the feature in its capabilities
+    // (`TinyCommunity::capabilities`); an older server answers that it can't. Each answers `Ok`
+    // unless it says otherwise; the server then tells every page over its live socket, which is
+    // a `Change::Tiny`.
+    /// Changes the server's name, description, welcome text, default room, or AFK room and
+    /// timeout (`server`, manage_server).
+    TinyServerUpdate {
+        account: AccountKey,
+        edit: TinyServerEdit,
+    },
+    /// Sets the server's icon from a picture on this computer (PNG, JPEG or WebP, at most
+    /// [`TINY_ICON_MAX`] bytes), or with no `path` removes it (`server`, manage_server).
+    TinyServerIcon {
+        account: AccountKey,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+    },
+    /// Makes a role just below this account's own rank (`roles`, manage_roles).
+    TinyRoleCreate {
+        account: AccountKey,
+        role: TinyRoleEdit,
+    },
+    TinyRoleUpdate {
+        account: AccountKey,
+        role_id: String,
+        role: TinyRoleEdit,
+    },
+    /// @everyone can't be deleted.
+    TinyRoleDelete {
+        account: AccountKey,
+        role_id: String,
+    },
+    /// Every role but @everyone, most senior first.
+    TinyRoleOrder {
+        account: AccountKey,
+        role_ids: Vec<String>,
+    },
+    /// The roles one member has, all of them (`roles`, manage_roles).
+    TinyMemberRoles {
+        account: AccountKey,
+        user_id: String,
+        role_ids: Vec<String>,
+    },
+    /// Makes someone an owner or takes it away. Owners only; the last owner stays.
+    TinyMemberOwner {
+        account: AccountKey,
+        user_id: String,
+        owner: bool,
+    },
+    /// Times someone out until `until` (RFC 3339, at most 28 days away), or with `None` ends
+    /// it. A timed-out member can't be in calls (`timeouts`, timeout_members).
+    TinyTimeout {
+        account: AccountKey,
+        user_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        until: Option<String>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        reason: String,
+    },
+    /// Removes one member, as `TinyRemove`, with a reason for the audit.
+    TinyKick {
+        account: AccountKey,
+        user_id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        reason: String,
+    },
+    /// Bans someone: they leave, their sessions end, and they can't come back by invite, by
+    /// sign-in groups or by signing in again. `None` is for good (`bans`, ban_members).
+    TinyBan {
+        account: AccountKey,
+        user_id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expires_at: Option<String>,
+    },
+    TinyUnban {
+        account: AccountKey,
+        user_id: String,
+    },
+    /// Categories (`categories`, manage_channels). Deleting one leaves its rooms uncategorized.
+    TinyCategoryCreate {
+        account: AccountKey,
+        name: String,
+    },
+    TinyCategoryRename {
+        account: AccountKey,
+        category_id: String,
+        name: String,
+    },
+    TinyCategoryDelete {
+        account: AccountKey,
+        category_id: String,
+    },
+    /// The whole channel list's order: categories in the order given (the uncategorized group,
+    /// `category_id: None`, is always first), and each one's rooms top first.
+    TinyLayout {
+        account: AccountKey,
+        groups: Vec<TinyLayoutGroup>,
+    },
+    /// Makes a room with its settings, as `TinyRoomCreate` with more.
+    TinyRoomCreateWith {
+        account: AccountKey,
+        room: TinyRoomEdit,
+    },
+    /// Changes a room's name, category, place, topic, limit, bitrate, push-to-talk or video.
+    TinyRoomUpdate {
+        account: AccountKey,
+        room_id: String,
+        room: TinyRoomEdit,
+    },
+    /// One role's allow and deny bits in one room (manage_roles and manage_channels). Only
+    /// [`TINY_CHANNEL_SCOPED`] bits mean anything here.
+    TinyOverrideSet {
+        account: AccountKey,
+        room_id: String,
+        role_id: String,
+        allow: u64,
+        deny: u64,
+    },
+    TinyOverrideClear {
+        account: AccountKey,
+        room_id: String,
+        role_id: String,
+    },
+    /// An invite with roles, a label, a use limit and an expiry (`invite_options`). Answers
+    /// `TinyCode`, as `TinyInvite` does.
+    TinyInviteWith {
+        account: AccountKey,
+        options: TinyInviteOptions,
+    },
+    /// One page of the audit. Answers `TinyAudit`.
+    TinyAudit {
+        account: AccountKey,
+        #[serde(default)]
+        filter: TinyAuditFilter,
+    },
+    /// Server-mutes or server-deafens someone in a room's call, or undoes it; `None` leaves
+    /// that one as it is (`voice_moderation`, mute_members / deafen_members).
+    TinyCallModerate {
+        account: AccountKey,
+        room_id: String,
+        user_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        server_muted: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        server_deafened: Option<bool>,
+    },
+    /// Moves someone in a call to another room (`voice_moderation`, move_members in both).
+    TinyCallMove {
+        account: AccountKey,
+        user_id: String,
+        room_id: String,
+    },
+
     /// The push-to-talk key went down or up, from the shell's global hotkey. `priority` is the
     /// priority key: on a Tiny server it also asks to be heard over everyone else, which the
     /// server honours only with priority_speaker. Refused with no call.
@@ -1744,6 +1899,10 @@ pub enum Response {
     /// An invite that was just created. `code.token` is not kept.
     TinyCode {
         code: TinyCode,
+    },
+    /// One page of a Tiny server's audit, newest first. Fewer rows than the limit: the end.
+    TinyAudit {
+        audit: Vec<TinyAudit>,
     },
     CallStats {
         stats: CallStats,

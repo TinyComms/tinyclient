@@ -1354,6 +1354,19 @@ impl Chat {
         if let Err(answer) = adapters::tiny::call_allowed(account, may, &ids) {
             return answer;
         }
+        self.tiny_ask(account, ask)
+    }
+
+    /// Server mute, deafen or move, on a server with voice moderation, over its live socket.
+    fn tiny_moderate(&self, account: &AccountKey, needs: &[&str], ids: &[&str], ask: impl FnOnce(Reply<()>) -> adapters::tiny::live::Ask) -> Response {
+        let feature = protocol::TINY_FEATURE_VOICE_MODERATION;
+        if let Err(answer) = adapters::tiny::manage::call_allowed(account, feature, needs, ids) {
+            return answer;
+        }
+        self.tiny_ask(account, ask)
+    }
+
+    fn tiny_ask(&self, account: &AccountKey, ask: impl FnOnce(Reply<()>) -> adapters::tiny::live::Ask) -> Response {
         if let Err(refused) = self.online(account) {
             return *refused;
         }
@@ -1787,9 +1800,58 @@ impl Chat {
                 Ok(()) => self.sign_out(account),
                 Err(answer) => answer,
             },
-            // The key is the mediad's to act on.
+            Request::TinyServerUpdate { account, edit } => adapters::tiny::manage::server_update(account, edit),
+            Request::TinyServerIcon { account, path } => adapters::tiny::manage::server_icon(account, path),
+            Request::TinyRoleCreate { account, role } => adapters::tiny::manage::role_create(account, role),
+            Request::TinyRoleUpdate { account, role_id, role } => adapters::tiny::manage::role_update(account, role_id, role),
+            Request::TinyRoleDelete { account, role_id } => adapters::tiny::manage::role_delete(account, role_id),
+            Request::TinyRoleOrder { account, role_ids } => adapters::tiny::manage::role_order(account, role_ids),
+            Request::TinyMemberRoles { account, user_id, role_ids } => adapters::tiny::manage::member_roles(account, user_id, role_ids),
+            Request::TinyMemberOwner { account, user_id, owner } => adapters::tiny::manage::member_owner(account, user_id, owner),
+            Request::TinyTimeout { account, user_id, until, reason } => adapters::tiny::manage::timeout(account, user_id, until, reason),
+            Request::TinyKick { account, user_id, reason } => adapters::tiny::manage::kick(account, user_id, reason),
+            Request::TinyBan { account, user_id, reason, expires_at } => adapters::tiny::manage::ban(account, user_id, reason, expires_at),
+            Request::TinyUnban { account, user_id } => adapters::tiny::manage::unban(account, user_id),
+            Request::TinyCategoryCreate { account, name } => adapters::tiny::manage::category_create(account, name),
+            Request::TinyCategoryRename { account, category_id, name } => adapters::tiny::manage::category_rename(account, category_id, name),
+            Request::TinyCategoryDelete { account, category_id } => adapters::tiny::manage::category_delete(account, category_id),
+            Request::TinyLayout { account, groups } => adapters::tiny::manage::layout(account, groups),
+            Request::TinyRoomCreateWith { account, room } => adapters::tiny::manage::room_create(account, room),
+            Request::TinyRoomUpdate { account, room_id, room } => adapters::tiny::manage::room_update(account, room_id, room),
+            Request::TinyOverrideSet { account, room_id, role_id, allow, deny } => adapters::tiny::manage::override_set(account, room_id, role_id, allow, deny),
+            Request::TinyOverrideClear { account, room_id, role_id } => adapters::tiny::manage::override_clear(account, room_id, role_id),
+            Request::TinyInviteWith { account, options } => adapters::tiny::manage::invite_with(account, options),
+            Request::TinyAudit { account, filter } => adapters::tiny::manage::audit(account, filter),
+            Request::TinyCallModerate { account, room_id, user_id, server_muted, server_deafened } => {
+                let mut needs = Vec::new();
+                if server_muted.is_some() {
+                    needs.push("community.calls.mute");
+                }
+                if server_deafened.is_some() {
+                    needs.push("community.calls.deafen");
+                }
+                if needs.is_empty() {
+                    return Response::Ok;
+                }
+                let ids = [room_id.as_str(), user_id.as_str()];
+                let ask = |reply| adapters::tiny::live::Ask::Moderate { room_id: room_id.clone(), user_id: user_id.clone(), server_muted, server_deafened, reply };
+                self.tiny_moderate(&account, &needs, &ids, ask)
+            }
+            Request::TinyCallMove { account, user_id, room_id } => {
+                let ids = [room_id.as_str(), user_id.as_str()];
+                let ask = |reply| adapters::tiny::live::Ask::Move { user_id: user_id.clone(), room_id: room_id.clone(), reply };
+                self.tiny_moderate(&account, &["community.calls.move"], &ids, ask)
+            }
+            // The key is the mediad's to act on; a priority key on a Tiny call is also the
+            // server's to hear, as `call.state`.
             Request::CallTalk { held, priority } => match self.hub.calls.request(&self.hub, &MediaRequest::Talk { held, priority }) {
-                Ok(_) => Response::Ok,
+                Ok(_) => {
+                    if let Some(call) = self.hub.calls.describe().0.filter(|call| call.conversation.network == Network::Tiny) {
+                        let on = held && priority;
+                        self.command(&call.conversation.account(), Command::Tiny(adapters::tiny::live::Ask::Priority { on }));
+                    }
+                    Response::Ok
+                }
                 Err(err) => call_error(err),
             },
             Request::CallStats => match self.hub.calls.request(&self.hub, &MediaRequest::Stats) {

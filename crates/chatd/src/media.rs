@@ -1008,6 +1008,20 @@ impl Calls {
         }
     }
 
+    /// The call in `from` is now the call in `to`, with the same mediad, devices, mute and
+    /// deafen: a Tiny server moved us. Its roster is the new room's, which the adapter tells.
+    /// False when the call was not in `from`.
+    pub fn retarget(&self, hub: &Hub, from: &Key, to: Key) -> bool {
+        let moved = self.update(hub, from, |live| {
+            live.call.conversation = to;
+            live.call.participants.clear();
+        });
+        if moved {
+            self.tell(hub);
+        }
+        moved
+    }
+
     /// Ends the call if it is in `conversation`, in whatever state, without telling the
     /// adapter: the network already knows. True if there was one.
     pub fn end_if(&self, hub: &Hub, conversation: &Key) -> bool {

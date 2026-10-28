@@ -874,10 +874,16 @@ impl Shell {
                 let Some(room) = self.tiny_state.community.as_mut().and_then(|community| community.rooms.iter_mut().find(|room| room.id == conversation.id)) else {
                     return;
                 };
+                // Occupants carry only mute and deafen; what the server says of a seat beyond that
+                // (server mute, priority) stays as the last read of the page had it.
+                let before = std::mem::take(&mut room.participants);
                 room.participants = occupants
                     .people
                     .iter()
-                    .map(|occupant| protocol::TinySeat { user_id: occupant.person.id.clone(), muted: occupant.muted, deafened: occupant.deafened, speaking: occupant.speaking })
+                    .map(|occupant| {
+                        let was = before.iter().find(|seat| seat.user_id == occupant.person.id).cloned().unwrap_or_default();
+                        protocol::TinySeat { user_id: occupant.person.id.clone(), muted: occupant.muted, deafened: occupant.deafened, speaking: occupant.speaking, ..was }
+                    })
                     .collect();
                 cx.notify();
             }

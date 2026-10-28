@@ -855,9 +855,125 @@ fn a_seat_lost_with_the_socket_is_taken_again_and_one_left_on_purpose_is_not() {
     assert!(running.hub.occupants(&running.key(ROOM)).is_none());
 }
 
+fn saved_for(base: &str) -> Saved {
+    Saved { base_url: base.to_owned(), token: "t".to_owned(), user_id: ME.to_owned(), email: None, display_name: "Ada".to_owned(), role: "owner".to_owned() }
+}
+
+/// What the page reads of one seat beyond mute and deafen.
+fn flags_of(base: &str, room: &str, user: &str) -> Option<protocol::TinySeat> {
+    let known = super::super::manage::known(&saved_for(base));
+    known.seats.get(room).and_then(|seats| seats.iter().find(|seat| seat.user_id == user)).cloned()
+}
+
+#[test]
+fn moderation_and_moves_reach_the_server_and_its_flags_reach_the_page() {
+    let fake = fake(&[], |_, mut conn| {
+        conn.send(ready(1, &[ME, BEA], json!([{"room_id": OTHER_ROOM, "participants": [{"user_id": BEA, "server_muted": true, "suppressed": true}]}])));
+        while let Some(frame) = conn.next(Duration::from_secs(10)) {
+            let reference = frame["ref"].clone();
+            match frame["type"].as_str().unwrap_or("") {
+                "call.moderate" => {
+                    assert_eq!((frame["room_id"].as_str(), frame["user_id"].as_str()), (Some(OTHER_ROOM), Some(BEA)));
+                    assert_eq!(frame["server_deafened"], true);
+                    assert!(frame.get("server_muted").is_none(), "what was not asked is not sent");
+                    conn.send(json!({"type": "ok", "ref": reference}));
+                    conn.send(json!({"type": "call.state", "room_id": OTHER_ROOM, "user_id": BEA, "muted": false, "deafened": false, "server_muted": true, "server_deafened": true, "suppressed": true, "priority": false}));
+                }
+                "call.move" if frame["user_id"] == "owner" => conn.send(json!({"type": "error", "ref": reference, "code": "hierarchy"})),
+                "call.move" => {
+                    assert_eq!(frame["room_id"], ROOM);
+                    conn.send(json!({"type": "ok", "ref": reference}));
+                    conn.send(json!({"type": "call.left", "room_id": OTHER_ROOM, "user_id": BEA, "reason": "moved"}));
+                    conn.send(json!({"type": "call.joined", "room_id": ROOM, "user_id": BEA, "participant": {"user_id": BEA, "server_muted": true}}));
+                }
+                "call.join" if frame["room_id"] == "crowded" => conn.send(json!({"type": "error", "ref": reference, "code": "room_full"})),
+                "call.join" => {
+                    let room = frame["room_id"].as_str().unwrap_or("").to_owned();
+                    conn.send(json!({"type": "ok", "ref": reference}));
+                    conn.send(json!({"type": "call.joined", "room_id": room, "user_id": ME}));
+                    if room == ROOM {
+                        // A moderator moves us: the old seat goes, and we are told where to.
+                        conn.idle(Duration::from_millis(100));
+                        conn.send(json!({"type": "call.left", "room_id": ROOM, "user_id": ME, "reason": "moved"}));
+                        conn.send(json!({"type": "call.moved", "room_id": OTHER_ROOM}));
+                    }
+                }
+                _ => conn.send(json!({"type": "error", "ref": reference, "code": "unknown_type"})),
+            }
+        }
+    });
+    let running = run(&fake.base, QUICK);
+    until("connected", || running.link().0 == Link::Connected);
+    until("Bea's seat as the server describes it", || flags_of(&fake.base, OTHER_ROOM, BEA).is_some_and(|seat| seat.server_muted && seat.suppressed && !seat.server_deafened));
+
+    let since = running.hub.seq();
+    let moderate = |reply| Ask::Moderate { room_id: OTHER_ROOM.into(), user_id: BEA.into(), server_muted: None, server_deafened: Some(true), reply };
+    assert_eq!(running.ask(moderate), Ok(()));
+    until("Bea server-deafened", || flags_of(&fake.base, OTHER_ROOM, BEA).is_some_and(|seat| seat.server_deafened));
+    until("the page told", || running.told_tiny(since));
+
+    assert_eq!(running.ask(|reply| Ask::Move { user_id: "owner".into(), room_id: ROOM.into(), reply }), Err(crate::adapters::tiny::HIERARCHY.to_owned()));
+    assert_eq!(running.ask(|reply| Ask::Move { user_id: BEA.into(), room_id: ROOM.into(), reply }), Ok(()));
+    until("Bea moved, still server-muted", || running.in_room(ROOM) == ["Bea"] && flags_of(&fake.base, ROOM, BEA).is_some_and(|seat| seat.server_muted));
+    assert!(running.hub.occupants(&running.key(OTHER_ROOM)).is_none());
+
+    assert_eq!(running.ask(|reply| Ask::Join { room_id: "crowded".into(), reply }), Err("That room is full.".to_owned()));
+    // Moved by a moderator, we join where we were sent without being asked.
+    assert_eq!(running.ask(|reply| Ask::Join { room_id: ROOM.into(), reply }), Ok(()));
+    until("in the room we were moved to", || running.in_room(OTHER_ROOM) == ["Ada"]);
+    assert_eq!(running.in_room(ROOM), ["Bea"]);
+}
+
+#[test]
+fn a_moved_call_with_audio_goes_along_muted_and_priority_reaches_the_server() {
+    with_mediad();
+    let (said, heard) = channel();
+    let fake = fake_with("up", &[], move |_, mut conn| {
+        conn.send(ready(1, &[ME, BEA], json!([{"room_id": ROOM, "participants": [{"user_id": BEA, "priority": true}]}])));
+        answer_join(&mut conn, "c-1");
+        let state = conn.next(Duration::from_secs(5)).expect("call.state with priority");
+        assert_eq!((state["type"].as_str(), state["muted"].as_bool(), state["priority"].as_bool()), (Some("call.state"), Some(false), Some(true)));
+        conn.send(json!({"type": "ok", "ref": state["ref"]}));
+        let state = conn.next(Duration::from_secs(5)).expect("call.state without priority");
+        assert!(state.get("priority").is_none(), "{state}");
+        conn.send(json!({"type": "ok", "ref": state["ref"]}));
+        conn.send(json!({"type": "call.moved", "room_id": OTHER_ROOM}));
+        conn.send(json!({"type": "call.left", "room_id": ROOM, "user_id": ME, "reason": "moved"}));
+        let join = conn.next(Duration::from_secs(30)).expect("a join where we were moved");
+        assert_eq!(join["room_id"], OTHER_ROOM);
+        let sdp = join["sdp"].as_str().expect("a fresh offer");
+        conn.send(json!({"type": "call.answer", "ref": join["ref"], "call_id": "c-2", "sdp": answer_for(sdp)}));
+        conn.send(json!({"type": "call.joined", "room_id": OTHER_ROOM, "user_id": ME}));
+        let _ = said.send(());
+        conn.idle(Duration::from_secs(5));
+    });
+    let running = run(&fake.base, QUICK);
+    until("connected", || running.link().0 == Link::Connected);
+    until("the health read", || !running.live.seats_only());
+    assert_eq!(running.join_with_audio(ROOM), Ok(()));
+    until("the call", || the_call(&running).is_some());
+    running.hub.calls.set_audio(&running.hub, true, false).expect("mute in the call");
+    until("Bea holds priority in the roster", || the_call(&running).is_some_and(|call| call.participants.iter().any(|who| who.id == BEA && who.priority)));
+    running.live.ask(Ask::Priority { on: true });
+    running.live.ask(Ask::Priority { on: true });
+    running.live.ask(Ask::Priority { on: false });
+    heard.recv_timeout(Duration::from_secs(30)).expect("the moved join answered");
+    let moved = running.key(OTHER_ROOM);
+    until("the same call, in the new room", || running.hub.calls.describe().0.is_some_and(|call| call.conversation == moved));
+    let call = running.hub.calls.describe().0.expect("the call");
+    assert!(call.muted, "mute goes along");
+    assert!(!matches!(call.state, protocol::CallState::Failed { .. }), "{:?}", call.state);
+    until("in the new room", || running.in_room(OTHER_ROOM) == ["Ada"]);
+    running.live.ask(Ask::Hangup { room_id: OTHER_ROOM.into() });
+}
+
 #[test]
 fn every_refusal_has_words_and_every_address_has_a_socket() {
     assert_eq!(words(false, "full"), "That room is full.");
+    assert_eq!(words(false, "room_full"), "That room is full.");
+    assert_eq!(words(false, "banned"), "You're banned from this server.");
+    assert_eq!(words(false, "timed_out"), "You're timed out on this server, so you can't join calls for now.");
+    assert_eq!(words(true, "hierarchy"), crate::adapters::tiny::HIERARCHY);
     assert_eq!(words(false, "server_full"), "Every seat on this server is taken. Try again later.");
     assert_eq!(words(false, "not_found"), "That room is gone.");
     assert_eq!(words(true, "not_found"), "They're not in that room's call.");

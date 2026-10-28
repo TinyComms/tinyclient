@@ -13,6 +13,7 @@
 //! are no conversations.
 
 pub(crate) mod live;
+pub(crate) mod manage;
 mod browser;
 pub mod signin;
 
@@ -20,7 +21,7 @@ use super::{serve_commands, Command, Context, Signed};
 use crate::hub::Hub;
 use crate::session;
 use protocol::{
-    join_host, text_or_null, tiny_can, tiny_name, tiny_rows, AccountKey, ErrorCode, Key, Network,
+    join_host, text_or_null, tiny_allowed, tiny_name, tiny_rows, AccountKey, ErrorCode, Key, Network,
     Presence, Response, TinyAudit, TinyCode, TinyCommunity, TinyInvite, TinyMember, TinyRoom,
     TinySeat,
 };
@@ -273,6 +274,16 @@ fn call(
                 None => request.send_empty(),
             }
         }
+        "PUT" => {
+            let mut request = agent.put(url);
+            if let Some(bearer) = bearer.as_deref() {
+                request = request.header("Authorization", bearer);
+            }
+            match body {
+                Some(body) => request.send_json(body),
+                None => request.send_empty(),
+            }
+        }
         _ => return Err(Fault::Unreachable),
     };
     let mut response = sent.map_err(|_| Fault::Unreachable)?;
@@ -330,11 +341,17 @@ fn auth_start(base: &str, redirect_uri: &str, challenge: &str, state: &str, invi
             .and_then(Value::as_str)
             .map(str::to_owned)
             .ok_or(Fault::BadAnswer),
+        _ if banned(&body) => Err(Fault::Words(BANNED)),
         400 => Err(Fault::Words(CHECK)),
         429 => Err(Fault::SlowDown),
         500..=599 => Err(Fault::Unavailable),
         _ => Err(Fault::Unreachable),
     }
+}
+
+/// A server with bans refuses a banned person's invite, provider groups and sign-in alike.
+fn banned(body: &Value) -> bool {
+    body.get("error").and_then(Value::as_str) == Some("banned")
 }
 
 /// The one-time code the browser brought back, and the verifier it was made for, for a session:
@@ -348,6 +365,7 @@ fn auth_token(base: &str, code: &str, verifier: &str) -> Result<Saved, Fault> {
     )?;
     match status {
         200 => saved_from(base, body),
+        _ if banned(&body) => Err(Fault::Words(BANNED)),
         400 | 401 => Err(Fault::Words(RAN_OUT)),
         429 => Err(Fault::SlowDown),
         500..=599 => Err(Fault::Unavailable),
@@ -435,15 +453,20 @@ const UNREACHABLE: &str = "Couldn't reach that server. Check the address and you
 const SIGNED_OUT: &str = "Tiny server signed you out.";
 const NO_BROWSER: &str = "This server doesn't sign in through a browser yet. Ask its owner to update tinyserver.";
 const RAN_OUT: &str = "This sign-in ran out before it finished. Try again.";
+const BANNED: &str = "You're banned from this server.";
 const NAME_SIZE: &str = "A name is 1 to 80 characters.";
 const ROOM_NAME_SIZE: &str = "A room name is 1 to 80 characters.";
 const NOT_YOURS: &str = "You can't do that.";
+pub(crate) const HIERARCHY: &str = "You can only do that to people whose roles are below yours.";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Missing {
     Member,
     Invite,
     Room,
+    Role,
+    Category,
+    Ban,
     Plain,
 }
 
@@ -462,12 +485,22 @@ fn explain(status: u16, body: &Value, missing: Missing) -> &'static str {
     let code = body.get("error").and_then(Value::as_str).unwrap_or("");
     match (status, code) {
         (401, _) => SIGNED_OUT,
+        (_, "hierarchy") => HIERARCHY,
+        (_, "default_role") => "@everyone can't be deleted or moved.",
+        (_, "room_full") => "That room is full.",
+        (_, "banned") => BANNED,
+        (_, "timed_out") => "You're timed out on this server for now.",
+        (_, "too_large") => "That picture is too big. The most is 256 KB.",
+        (_, "unsupported_media") => "That picture isn't a PNG, JPEG or WebP.",
         (403, _) => "You can't do that.",
         (409, "last_owner") => "This server needs an owner. Make someone else the owner first.",
         (409, "already_member") => "That person is already on this server.",
         (404, _) if missing == Missing::Member => "That person is no longer on this server.",
         (404, _) if missing == Missing::Invite => "That invite is gone or was already used.",
         (404, _) if missing == Missing::Room => "That room is gone.",
+        (404, _) if missing == Missing::Role => "That role is gone.",
+        (404, _) if missing == Missing::Category => "That category is gone.",
+        (404, _) if missing == Missing::Ban => "That person isn't banned.",
         (400, _) => CHECK,
         (429, _) => "Too many tries. Wait a minute, then try again.",
         (500..=599, _) => "The server had a problem. Try again in a moment.",
@@ -572,6 +605,14 @@ struct AuditWire {
     detail: Option<Value>,
     #[serde(default, deserialize_with = "text_or_null")]
     created_at: String,
+    #[serde(default, deserialize_with = "text_or_null")]
+    actor_name: String,
+    #[serde(default)]
+    subject_user_id: Option<String>,
+    #[serde(default, deserialize_with = "text_or_null")]
+    subject_name: String,
+    #[serde(default, deserialize_with = "text_or_null")]
+    reason: String,
 }
 
 fn detail_text(detail: Option<Value>) -> String {
@@ -581,21 +622,28 @@ fn detail_text(detail: Option<Value>) -> String {
     }
 }
 
+/// Audit rows, each detail object kept as its JSON text.
+fn audit_rows(body: Value) -> Result<Vec<TinyAudit>, ()> {
+    let read: Vec<AuditWire> = rows(body, "audit rows")?;
+    Ok(read
+        .into_iter()
+        .map(|row| TinyAudit {
+            id: row.id,
+            actor_id: row.actor_id,
+            action: row.action,
+            subject: row.subject,
+            detail: detail_text(row.detail),
+            created_at: row.created_at,
+            actor_name: row.actor_name,
+            subject_user_id: row.subject_user_id,
+            subject_name: row.subject_name,
+            reason: row.reason,
+        })
+        .collect())
+}
+
 fn audit_of(saved: &Saved) -> Listed<Vec<TinyAudit>> {
-    listed(saved, "/v1/audit?limit=50", |body| {
-        let read: Vec<AuditWire> = rows(body, "audit rows")?;
-        Ok(read
-            .into_iter()
-            .map(|row| TinyAudit {
-                id: row.id,
-                actor_id: row.actor_id,
-                action: row.action,
-                subject: row.subject,
-                detail: detail_text(row.detail),
-                created_at: row.created_at,
-            })
-            .collect())
-    })
+    listed(saved, "/v1/audit?limit=50", audit_rows)
 }
 
 /// The page: members, invites and the audit over REST, then the rooms with who is in each
@@ -609,9 +657,12 @@ pub(crate) fn community(hub: &Hub, account: AccountKey) -> Response {
         Ok(members) => members,
         Err(detail) => return refused(detail),
     };
+    // What the server can do and what this account may, read afresh with each load. An older
+    // server has no features and no access; the saved legacy role then decides, as it did.
+    let known = manage::learn(&saved);
+    let may = |id| tiny_allowed(known.access.as_ref(), &saved.role, id);
     // A 403 on invites or the audit is an empty list. Any other failure fails the load.
-    // The role is the one that was saved, not a role from the member list.
-    let invites = if tiny_can(&saved.role, "community.invites.read") {
+    let invites = if may("community.invites.read") {
         match invites_of(&saved) {
             Listed::Rows(rows) => rows,
             Listed::Empty => Vec::new(),
@@ -620,7 +671,7 @@ pub(crate) fn community(hub: &Hub, account: AccountKey) -> Response {
     } else {
         Vec::new()
     };
-    let audit = if tiny_can(&saved.role, "community.audit.read") {
+    let audit = if may("community.audit.read") {
         match audit_of(&saved) {
             Listed::Rows(rows) => rows,
             Listed::Empty => Vec::new(),
@@ -634,21 +685,49 @@ pub(crate) fn community(hub: &Hub, account: AccountKey) -> Response {
         Listed::Empty => Vec::new(),
         Listed::Failed(detail) => return refused(detail),
     };
+    manage::remember(&saved, |kept| kept.rooms = rooms.clone());
+    // A call in one of these rooms follows a change to its bitrate or push-to-talk.
+    if let Some(call) = hub.calls.describe().0.filter(|call| call.conversation.account() == account) {
+        if rooms.iter().any(|room| room.id == call.conversation.id) {
+            let (kbps, push_to_talk) = manage::room_audio(&saved, &call.conversation.id);
+            hub.calls.tiny_room(hub, &call.conversation, kbps, push_to_talk);
+        }
+    }
+    // Who sits where is the hub's, as the live socket put it; what the server says of each seat
+    // beyond mute and deafen is kept beside it.
     for room in &mut rooms {
         if let Some(inside) = hub.occupants(&Key::new(&account, &room.id)) {
+            let flagged = known.seats.get(&room.id);
             room.participants = inside
                 .people
                 .into_iter()
-                .map(|occupant| TinySeat { user_id: occupant.person.id, muted: occupant.muted, deafened: occupant.deafened, speaking: occupant.speaking })
+                .map(|occupant| {
+                    let flags = flagged.and_then(|seats| seats.iter().find(|seat| seat.user_id == occupant.person.id)).cloned().unwrap_or_default();
+                    TinySeat {
+                        user_id: occupant.person.id,
+                        muted: occupant.muted,
+                        deafened: occupant.deafened,
+                        speaking: occupant.speaking,
+                        server_muted: flags.server_muted,
+                        server_deafened: flags.server_deafened,
+                        suppressed: flags.suppressed,
+                        priority: flags.priority,
+                    }
+                })
                 .collect();
         }
     }
+    let extras = if known.capabilities.features.is_empty() { None } else { Some(manage::extras(&saved, &account, &known)) };
     let online = members
         .iter()
         .filter(|member| hub.presence(&Key::new(&account, &member.user_id)) == Presence::Online)
         .map(|member| member.user_id.clone())
         .collect();
     let media = media_of(&saved.base_url);
+    let (server, roles, categories, bans) = match extras {
+        Some(extras) => (extras.server, extras.roles, extras.categories, extras.bans),
+        None => (None, Vec::new(), Vec::new(), Vec::new()),
+    };
     Response::TinyCommunity {
         community: TinyCommunity {
             role: saved.role,
@@ -659,6 +738,13 @@ pub(crate) fn community(hub: &Hub, account: AccountKey) -> Response {
             rooms,
             online,
             media,
+            capabilities: known.capabilities,
+            access: known.access,
+            me: saved.user_id,
+            server,
+            roles,
+            categories,
+            bans,
         },
     }
 }
@@ -672,10 +758,11 @@ pub(crate) fn media_of(base: &str) -> String {
     }
 }
 
-/// The signed-in session, when its role may do `id`. Nothing is asked of the server here.
+/// The signed-in session, when it may do `id`: by its permissions on a server with roles, as
+/// last read, else by its saved role. Nothing is asked of the server here.
 pub(crate) fn may(account: &AccountKey, id: &str) -> Result<Saved, Response> {
     let saved = open(account)?;
-    if !tiny_can(&saved.role, id) {
+    if !tiny_allowed(manage::known(&saved).access.as_ref(), &saved.role, id) {
         return Err(refused(NOT_YOURS));
     }
     Ok(saved)
@@ -816,7 +903,7 @@ pub(crate) fn revoke(account: AccountKey, invite_id: String) -> Response {
         Ok(saved) => saved,
         Err(error) => return error,
     };
-    if !tiny_can(&saved.role, "community.invites.revoke") {
+    if !tiny_allowed(manage::known(&saved).access.as_ref(), &saved.role, "community.invites.revoke") {
         return refused("You can't do that.");
     }
     if !safe_id(&invite_id) {
@@ -1065,6 +1152,9 @@ pub(crate) mod tests {
         assert!(matches!(bounced, Err(Fault::Unreachable)));
 
         // A tinyserver from before the browser sign-in has no config route.
+        let barred = serve(|_| http(403, "Forbidden", r#"{"error":"banned"}"#));
+        assert!(matches!(auth_start(&barred, "http://127.0.0.1:5/callback", "c", "s", Some("invite")), Err(Fault::Words(BANNED))));
+        assert!(matches!(auth_token(&barred, "code", "verifier"), Err(Fault::Words(BANNED))));
         let older = serve(|_| http(404, "Not Found", r#"{"error":"not_found"}"#));
         assert!(matches!(auth_config(&older), Err(Fault::Words(NO_BROWSER))));
         let passwords = serve(|_| http(200, "OK", r#"{"methods":["password"]}"#));
@@ -1116,7 +1206,7 @@ pub(crate) mod tests {
         assert!(matches!(get_me(&saved), Err(Fault::Unauthorized)));
     }
 
-    fn with_session(base: &str, role: &str, run: impl FnOnce(AccountKey)) {
+    pub(crate) fn with_session(base: &str, role: &str, run: impl FnOnce(AccountKey)) {
         let user_id = "11111111-1111-1111-1111-111111111111";
         let session = format!(
             r#"{{"base_url":{base:?},"token":"t","user_id":{user_id:?},"email":"ada@example.com","display_name":"Ada","role":{role:?}}}"#
@@ -1309,7 +1399,7 @@ pub(crate) mod tests {
         });
     }
 
-    fn test_hub() -> Arc<Hub> {
+    pub(crate) fn test_hub() -> Arc<Hub> {
         Arc::new(Hub::new(crate::store::Store::open(std::path::Path::new(":memory:")).expect("a store in memory")))
     }
 
@@ -1347,7 +1437,7 @@ pub(crate) mod tests {
                 Response::TinyCommunity { community } => {
                     assert_eq!(community.rooms.len(), 2);
                     assert_eq!(community.rooms[0].name, "Lobby");
-                    assert_eq!(community.rooms[0].participants, [TinySeat { user_id: BEA.into(), muted: true, deafened: false, speaking: false }]);
+                    assert_eq!(community.rooms[0].participants, [TinySeat { user_id: BEA.into(), muted: true, ..TinySeat::default() }]);
                     assert_eq!(community.media, "up");
                     assert!(community.rooms[1].participants.is_empty());
                     assert_eq!(community.online, [BEA]);
@@ -1618,7 +1708,7 @@ pub(crate) mod tests {
         });
     }
 
-    fn json_body(request: &str) -> serde_json::Value {
+    pub(crate) fn json_body(request: &str) -> serde_json::Value {
         let body = request.split("\r\n\r\n").nth(1).unwrap_or("");
         serde_json::from_str(body).unwrap_or_else(|err| panic!("body {err}"))
     }
@@ -1652,7 +1742,8 @@ pub(crate) mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("addr").port();
         std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            // Long enough for a test that waits its turn for the session lock.
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
             listener.set_nonblocking(true).expect("nonblocking");
             while std::time::Instant::now() < deadline {
                 match listener.accept() {
