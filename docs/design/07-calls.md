@@ -135,7 +135,17 @@ said. Settings › Voice (09 §4) holds the choices; the dock and the participan
 - **Bitrate.** A Tiny call encodes at its room's bitrate.
 - **Connection.** `CallStats` answers with the last second: round trip, jitter, loss (per mille),
   send and receive kb/s, the path (UDP, TCP, relay) and the codec. For a connection panel in the
-  dock, asked about once a second while it is open; refused in words before media flows.
+  dock, asked about once a second while it is open; refused in words before media flows. It also
+  carries the call's audio health so far: device glitches the system reported, microphone audio
+  dropped or missing (overruns, gaps), the speaker running dry (underruns), and lost frames from
+  others made up (concealed) or rebuilt from the next packet (FEC). A clean call keeps the first
+  four at 0.
+- **Audio path.** Device callbacks only move samples through lock-free rings (MMCSS "Pro Audio" on
+  Windows); processing and codecs run on the call's 20 ms tick, which holds the 1 ms system timer.
+  Each side resamples a hair off nominal to follow its device's clock, so nothing is spliced. A
+  device glitch is counted, never a reason to reopen the device. A lost packet is rebuilt from the
+  next one's FEC copy or made up from the last pitch period, faded, and crossfaded back. The mix
+  goes through a look-ahead limiter, never a clamp.
 - **Cues.** As 09 §8, plus Moved (a moderator moved us) and Disconnected (kicked, banned, timed out,
   or the room went), which plays out as the call ends.
 - **Reconnect.** A Tiny server that stops hearing our media while its live socket stays up takes
