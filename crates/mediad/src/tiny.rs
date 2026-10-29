@@ -799,8 +799,8 @@ mod tests {
         }
         assert!(matches!(jitter.pop(), Pop::Packet(_)));
         assert!(matches!(jitter.pop(), Pop::Packet(_)));
-        assert_eq!(jitter.pop(), Pop::Lost);
-        assert_eq!(jitter.pop(), Pop::Lost);
+        assert_eq!(jitter.pop(), Pop::Hold);
+        assert_eq!(jitter.pop(), Pop::Hold);
         assert_eq!(jitter.pop(), Pop::Lost);
         assert_eq!(jitter.next(), Some(&[4u8][..]));
     }

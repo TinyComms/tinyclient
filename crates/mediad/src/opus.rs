@@ -191,6 +191,23 @@ impl Decoder {
         Some(samples)
     }
 
+    /// One playout tick while a packet may still be out of order. The last pitch period continues
+    /// and the decoder is left where the last real frame put it: counting this wait as a loss
+    /// makes [`Decoder::forget`] drop that state, and the frames after a real loss come out loud.
+    pub(crate) fn bridge(&mut self, samples: usize, pcm: &mut [i16]) -> usize {
+        if !self.concealing {
+            self.pitch = pitch(&self.last);
+            self.cursor = 0;
+            self.gain = 1.;
+            self.concealing = true;
+        }
+        let out = &mut pcm[..samples * CHANNELS];
+        for pair in out.as_chunks_mut::<CHANNELS>().0 {
+            *pair = self.extend();
+        }
+        samples
+    }
+
     /// Stands in for a lost packet when the one after it cannot rebuild it ([`Decoder::recover`]).
     /// After CELT, libopus conceals it. After a SILK or hybrid packet it may not:
     /// `unsafe-libopus` 0.2.0 saturates there (a test below holds it to that, so a fixed library

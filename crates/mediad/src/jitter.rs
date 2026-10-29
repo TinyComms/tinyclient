@@ -10,9 +10,10 @@ const CAPACITY: usize = 50;
 /// give-up (the old 100 ms) cuts a sentence off while a packet is still on a long link, and
 /// the next words then wait to fill the buffer again.
 const IDLE: u32 = 20;
-/// Ticks a missing packet is concealed while a later one is already here: 40 ms. That is
-/// enough for one packet to arrive out of order. After it, the gap is skipped so the packet
-/// that follows can carry a copy of the lost frame.
+/// Ticks a missing packet is waited out while a later one is already here: 40 ms. That is
+/// enough for one packet to arrive out of order. The wait is not a loss: concealing it makes
+/// the decoder drop its state, and the frames after a real loss then come out too loud. After
+/// the wait, the gap is skipped so the packet that follows can carry a copy of the lost frame.
 const REORDER: u32 = 2;
 /// A jump this large in sequence numbers is a new stream on the same SSRC.
 const RESTART: i64 = 1000;
@@ -20,6 +21,10 @@ const RESTART: i64 = 1000;
 #[derive(Debug, PartialEq, Eq)]
 pub enum Pop {
     Packet(Vec<u8>),
+    /// A later packet is already here and the missing one may still arrive. Keep the voice
+    /// going without touching the decoder, so a copy in the next packet can still rebuild a
+    /// real loss.
+    Hold,
     /// The packet due now never came: the decoder conceals it.
     Lost,
     /// Nothing is due: the sender is not talking, or we are still filling.
@@ -35,7 +40,7 @@ pub struct Jitter {
     /// The sequence number due next, once playing.
     due: Option<i64>,
     idle: u32,
-    /// Concealed ticks of the current hole, while a later packet is already queued.
+    /// Ticks spent waiting on the current hole, while a later packet is already queued.
     grace: u32,
     pub late: u64,
     pub lost: u64,
@@ -98,7 +103,7 @@ impl Jitter {
             // the missing one; skipping is what lets the next packet rebuild it.
             if self.grace < REORDER {
                 self.grace += 1;
-                return Pop::Lost;
+                return Pop::Hold;
             }
             self.grace = 0;
             self.due = Some(due + 1);
@@ -170,8 +175,8 @@ mod tests {
         assert_eq!(jitter.next(), Some(&packet(2)[..]));
         assert_eq!(jitter.pop(), Pop::Packet(packet(2)));
         assert_eq!(jitter.next(), None, "3 is missing");
-        assert_eq!(jitter.pop(), Pop::Lost, "still waiting on a reorder");
-        assert_eq!(jitter.pop(), Pop::Lost, "still waiting on a reorder");
+        assert_eq!(jitter.pop(), Pop::Hold, "still waiting on a reorder");
+        assert_eq!(jitter.pop(), Pop::Hold, "still waiting on a reorder");
         assert_eq!(jitter.pop(), Pop::Lost);
         assert_eq!(jitter.next(), Some(&packet(4)[..]), "the packet after the hole, for its copy of 3");
         fill(&mut jitter, &[3]);
@@ -209,7 +214,7 @@ mod tests {
         fill(&mut jitter, &[1, 2, 4]);
         assert_eq!(jitter.pop(), Pop::Packet(packet(1)));
         assert_eq!(jitter.pop(), Pop::Packet(packet(2)));
-        assert_eq!(jitter.pop(), Pop::Lost, "3 is not here yet");
+        assert_eq!(jitter.pop(), Pop::Hold, "3 is not here yet");
         fill(&mut jitter, &[3]);
         assert_eq!(jitter.late, 0);
         assert_eq!(jitter.pop(), Pop::Packet(packet(3)));
