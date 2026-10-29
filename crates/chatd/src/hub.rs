@@ -7,7 +7,7 @@ use protocol::{
 };
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Changes remembered for a shell that is behind. One entry per thing that changed, so this is
@@ -165,6 +165,9 @@ pub struct Hub {
     /// Retention runs when this is set, and once a day.
     prune_now: Mutex<bool>,
     prune_wake: Condvar,
+    /// The notification thread (`notify::start`), once it runs. Told of new messages, rows
+    /// that may have been read, and the call.
+    notifier: OnceLock<crate::notify::Line>,
 }
 
 impl Hub {
@@ -203,6 +206,7 @@ impl Hub {
             settings: Mutex::new(settings),
             prune_now: Mutex::new(false),
             prune_wake: Condvar::new(),
+            notifier: OnceLock::new(),
         }
     }
 
@@ -416,10 +420,33 @@ impl Hub {
         lock(&self.links).iter().find(|linked| linked.account == *account).map_or_else(Capabilities::default, |linked| linked.can)
     }
 
+    // Notifications.
+
+    pub fn set_notifier(&self, line: std::sync::mpsc::Sender<crate::notify::Event>) {
+        let _ = self.notifier.set(Mutex::new(line));
+    }
+
+    /// Tells the notification thread, if there is one.
+    pub fn notify(&self, event: crate::notify::Event) {
+        if let Some(line) = self.notifier.get() {
+            let _ = lock(line).send(event);
+        }
+    }
+
+    /// When a shell last asked `Wait`: one asking within its long poll is up.
+    pub fn shell_asked(&self) -> Instant {
+        lock(&self.live).asked
+    }
+
     // Changes.
 
     /// Call after anything the shell draws has changed, naming what.
     pub fn changed(&self, change: Change) {
+        match &change {
+            Change::Conversation { conversation } => self.notify(crate::notify::Event::Row(conversation.clone())),
+            Change::Call { call } => self.notify(crate::notify::Event::Call(call.clone())),
+            _ => {}
+        }
         let mut changes = lock(&self.changes);
         changes.seq += 1;
         let seq = changes.seq;

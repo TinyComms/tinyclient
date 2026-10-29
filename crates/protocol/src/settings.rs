@@ -79,6 +79,61 @@ pub const CACHE_MB: &str = "cache_mb";
 /// The schema of these rows, for migrations. Not a setting anyone changes.
 pub const VERSION: &str = "version";
 
+// Notifications (N1 to N13) and their sounds (S2 to S6), all kept and acted on by chatd.
+
+/// N1. Off: chatd posts no message notification. Counts and the badge keep working.
+pub const NOTIFY: &str = "notify";
+/// N2 globally (`mentions`, `all`), N3 per account (also `off`), and per conversation
+/// (`all`, `mentions`, `off`). Absent in an account or a conversation follows the level above.
+pub const NOTIFY_ABOUT: &str = "notify_about";
+/// Which kinds of message may notify at all: one-to-one, group chats, mentions in channels,
+/// and anything on a Tiny server (its rooms, and a call ringing there).
+pub const NOTIFY_DIRECT: &str = "notify_direct";
+pub const NOTIFY_GROUPS: &str = "notify_groups";
+pub const NOTIFY_MENTIONS: &str = "notify_mentions";
+pub const NOTIFY_TINY: &str = "notify_tiny";
+/// N4. What a notification shows: `full`, `sender` or `nothing`.
+pub const PREVIEW: &str = "preview";
+/// N4 while the screen is locked. Windows and Linux; macOS has its own "when unlocked".
+pub const PREVIEW_LOCKED: &str = "preview_locked";
+/// N5. `ring`, `silent` or `off`.
+pub const CALLS: &str = "calls";
+/// N6. What message notifications do in a call: `banners`, `sounds` or `nothing`.
+pub const IN_CALL: &str = "in_call";
+/// N7. Unix seconds until which nothing is posted, or `resume` for until I resume.
+pub const PAUSED_UNTIL: &str = "paused_until";
+/// N8. Quiet hours, every day, as minutes after local midnight; the window may cross midnight.
+pub const QUIET_HOURS: &str = "quiet_hours";
+pub const QUIET_FROM: &str = "quiet_from";
+pub const QUIET_TO: &str = "quiet_to";
+/// N9. A call still rings during a pause or quiet hours.
+pub const CALLS_THROUGH: &str = "calls_through";
+/// N10. Flash the taskbar button (Windows) or bounce the Dock icon when something notifies
+/// while the window is in the background.
+pub const FLASH: &str = "flash";
+/// N11. The number on the taskbar button or the Dock icon.
+pub const BADGE: &str = "badge";
+/// S2, S3, S4: the sounds by [`SOUND_CHOICES`] word. S3 may also be `same`.
+pub const MESSAGE_SOUND: &str = "message_sound";
+pub const MENTION_SOUND: &str = "mention_sound";
+pub const RING_SOUND: &str = "ring_sound";
+/// S5 per account and S6 per conversation: overrides S2 and S3. Absent follows the level above.
+pub const SOUND: &str = "sound";
+/// How loud tinyclient plays notification sounds, 0 to 100. Windows and Linux play them
+/// itself, so there is no system alert volume to follow there.
+pub const ALERT_VOLUME: &str = "alert_volume";
+
+/// The message sounds, by the word stored, then `none`.
+pub const SOUND_CHOICES: [&str; 6] = ["pebble", "drop", "tap", "chime", "glass", "none"];
+pub const MENTION_SOUND_CHOICES: [&str; 7] = ["same", "pebble", "drop", "tap", "chime", "glass", "none"];
+pub const RING_CHOICES: [&str; 3] = ["soft_ring", "classic_ring", "none"];
+pub const PREVIEW_CHOICES: [&str; 3] = ["full", "sender", "nothing"];
+pub const CALLS_CHOICES: [&str; 3] = ["ring", "silent", "off"];
+pub const IN_CALL_CHOICES: [&str; 3] = ["banners", "sounds", "nothing"];
+pub const ABOUT_CHOICES: [&str; 2] = ["mentions", "all"];
+pub const ACCOUNT_ABOUT_CHOICES: [&str; 3] = ["mentions", "all", "off"];
+pub const CONVERSATION_ABOUT_CHOICES: [&str; 3] = ["all", "mentions", "off"];
+
 pub const KEEP_DAYS_CHOICES: [u32; 3] = [7, 30, 90];
 pub const CACHE_MB_CHOICES: [u32; 4] = [250, 500, 1000, 2000];
 pub const PTT_RELEASE_CHOICES: [u32; 6] = [0, 100, 200, 300, 500, 1000];
@@ -92,11 +147,34 @@ enum Kind {
     Device,
     Hotkey,
     Gain,
+    /// One of these words, and the default.
+    Word(&'static [&'static str], &'static str),
+    /// Minutes after midnight, 0 to 1439.
+    Minute(u32),
+    /// Unix seconds, or `resume`.
+    Until,
 }
 
 fn kind(key: &str) -> Option<Kind> {
     Some(match key {
         KEEP_RUNNING | SOUNDS | CUE_JOINS | CUE_MINE | CUE_CONNECTION => Kind::Switch(true),
+        NOTIFY | NOTIFY_DIRECT | NOTIFY_GROUPS | NOTIFY_MENTIONS | NOTIFY_TINY | CALLS_THROUGH | FLASH | BADGE => Kind::Switch(true),
+        QUIET_HOURS => Kind::Switch(false),
+        QUIET_FROM => Kind::Minute(22 * 60),
+        QUIET_TO => Kind::Minute(8 * 60),
+        PAUSED_UNTIL => Kind::Until,
+        ALERT_VOLUME => Kind::Percent(70),
+        PREVIEW => Kind::Word(&PREVIEW_CHOICES, "full"),
+        PREVIEW_LOCKED => Kind::Word(&PREVIEW_CHOICES, "sender"),
+        CALLS => Kind::Word(&CALLS_CHOICES, "ring"),
+        IN_CALL => Kind::Word(&IN_CALL_CHOICES, "banners"),
+        MESSAGE_SOUND => Kind::Word(&SOUND_CHOICES, "pebble"),
+        MENTION_SOUND => Kind::Word(&MENTION_SOUND_CHOICES, "same"),
+        RING_SOUND => Kind::Word(&RING_CHOICES, "soft_ring"),
+        // The words differ by scope (`about_choices`); these inherit, so the default is moot
+        // outside the global scope.
+        NOTIFY_ABOUT => Kind::Word(&ABOUT_CHOICES, "mentions"),
+        SOUND => Kind::Word(&SOUND_CHOICES, "pebble"),
         ECHO_CANCELLATION | NOISE_SUPPRESSION | AUTO_GAIN => Kind::Switch(true),
         JOIN_MUTED | PUSH_TO_TALK => Kind::Switch(false),
         MUTED_TALK => Kind::Switch(true),
@@ -121,6 +199,8 @@ fn scoped(key: &str, scope: &str) -> bool {
         TYPING => account_of(scope).is_some_and(|account| typing_choice(account.network)),
         RECEIPTS => account_of(scope).is_some_and(|account| account.network == Network::Teams),
         _ if gain_user(key).is_some() => account_of(scope).is_some(),
+        NOTIFY_ABOUT => scope == GLOBAL || account_of(scope).is_some() || conversation_of(scope).is_some(),
+        SOUND => account_of(scope).is_some() || conversation_of(scope).is_some(),
         _ => scope == GLOBAL,
     }
 }
@@ -138,7 +218,22 @@ pub fn valid(scope: &str, key: &str, value: &str) -> bool {
         Some(Kind::Device) => !value.is_empty() && value.len() <= 400 && !value.contains(['\n', '\0']),
         Some(Kind::Hotkey) => crate::hotkey::Binding::parse(value).is_some(),
         Some(Kind::Gain) => parse_gain(value).is_some(),
+        Some(Kind::Word(_, _)) if key == NOTIFY_ABOUT => about_choices(scope).contains(&value),
+        Some(Kind::Word(words, _)) => words.contains(&value),
+        Some(Kind::Minute(_)) => value.parse::<u32>().is_ok_and(|n| n < 24 * 60),
+        Some(Kind::Until) => value == "resume" || value.parse::<u64>().is_ok(),
         None => false,
+    }
+}
+
+/// What `notify_about` may be in a scope: the global one has no `off`, which is N1's.
+pub fn about_choices(scope: &str) -> &'static [&'static str] {
+    if scope == GLOBAL {
+        &ABOUT_CHOICES
+    } else if account_of(scope).is_some() {
+        &ACCOUNT_ABOUT_CHOICES
+    } else {
+        &CONVERSATION_ABOUT_CHOICES
     }
 }
 
@@ -194,6 +289,14 @@ pub fn account_scope(account: &AccountKey) -> String {
 
 pub fn conversation_scope(conversation: &Key) -> String {
     format!("conv:{}:{}:{}", network_word(conversation.network), conversation.account, conversation.id)
+}
+
+/// The network of a conversation's scope, `conv:<network>:<account>:<id>` with every part.
+pub fn conversation_of(scope: &str) -> Option<Network> {
+    let (word, rest) = scope.strip_prefix("conv:")?.split_once(':')?;
+    let network = Network::ALL.into_iter().find(|n| network_word(*n) == word)?;
+    let (account, id) = rest.split_once(':')?;
+    (!account.is_empty() && !id.is_empty()).then_some(network)
 }
 
 /// The account an `account:` scope names.
@@ -415,6 +518,33 @@ impl Values {
             .collect()
     }
 
+    /// A word-valued setting in a scope, or its default when nothing valid is stored there.
+    /// A scope that inherits asks [`Values::stored`] instead.
+    pub fn word(&self, scope: &str, key: &str) -> &str {
+        let default = match kind(key) {
+            Some(Kind::Word(_, default)) => default,
+            _ => "",
+        };
+        self.stored(scope, key).unwrap_or(default)
+    }
+
+    /// A time of day (N8), in minutes after midnight.
+    pub fn minute(&self, key: &str) -> u32 {
+        let default = match kind(key) {
+            Some(Kind::Minute(n)) => n,
+            _ => 0,
+        };
+        self.stored(GLOBAL, key).and_then(|value| value.parse().ok()).unwrap_or(default)
+    }
+
+    /// N7 at `now`: `None` when not paused, `Some(None)` until I resume, else until when.
+    pub fn paused(&self, now: i64) -> Option<Option<i64>> {
+        match self.stored(GLOBAL, PAUSED_UNTIL)? {
+            "resume" => Some(None),
+            until => until.parse::<i64>().ok().filter(|until| *until > now).map(Some),
+        }
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = Setting> + '_ {
         self.0.iter().map(|((scope, key), value)| Setting { scope: scope.clone(), key: key.clone(), value: value.clone() })
     }
@@ -504,6 +634,38 @@ mod tests {
         values.set(GLOBAL, PTT_KEY, Some("f13".into()));
         assert_eq!(values.hotkey(PTT_KEY).map(|b| b.to_string()), Some("f13".into()));
         assert_eq!(values.hotkey(DEAFEN_KEY), None);
+    }
+
+    #[test]
+    fn notification_settings_default_and_take_their_words_by_scope() {
+        let values = Values::default();
+        assert!(values.on(NOTIFY) && values.on(NOTIFY_DIRECT) && values.on(CALLS_THROUGH) && !values.on(QUIET_HOURS));
+        assert_eq!((values.word(GLOBAL, NOTIFY_ABOUT), values.word(GLOBAL, PREVIEW), values.word(GLOBAL, PREVIEW_LOCKED)), ("mentions", "full", "sender"));
+        assert_eq!((values.word(GLOBAL, MESSAGE_SOUND), values.word(GLOBAL, MENTION_SOUND), values.word(GLOBAL, RING_SOUND)), ("pebble", "same", "soft_ring"));
+        assert_eq!((values.minute(QUIET_FROM), values.minute(QUIET_TO), values.number(ALERT_VOLUME)), (1320, 480, 70));
+        let discord = account_scope(&account(Network::Discord));
+        let channel = conversation_scope(&Key { network: Network::Discord, account: "T1".into(), id: "C9".into() });
+        // `off` is a level of an account and a conversation, never the global one (that is N1).
+        assert!(!valid(GLOBAL, NOTIFY_ABOUT, "off") && valid(&discord, NOTIFY_ABOUT, "off") && valid(&channel, NOTIFY_ABOUT, "off"));
+        assert!(valid(&channel, NOTIFY_ABOUT, "all") && !valid(&channel, NOTIFY_ABOUT, "loud"));
+        assert!(valid(&channel, SOUND, "glass") && valid(&discord, SOUND, "none") && !valid(GLOBAL, SOUND, "glass"));
+        assert!(!valid(&channel, SOUND, "classic_ring") && valid(GLOBAL, RING_SOUND, "classic_ring"));
+        assert!(!valid("conv:discord:T1", SOUND, "tap") && !valid("conv:myspace:T1:C", SOUND, "tap"));
+        assert!(valid(GLOBAL, QUIET_FROM, "0") && valid(GLOBAL, QUIET_FROM, "1439") && !valid(GLOBAL, QUIET_FROM, "1440"));
+        assert!(!valid(&discord, PREVIEW, "full"), "preview is global");
+        assert!(known(&channel, SOUND) && !known(GLOBAL, SOUND));
+        assert_eq!(values.stored(&channel, NOTIFY_ABOUT), None);
+    }
+
+    #[test]
+    fn a_pause_lasts_until_its_time_or_until_resumed() {
+        let mut values = Values::default();
+        assert_eq!(values.paused(1_000), None);
+        values.set(GLOBAL, PAUSED_UNTIL, Some("2000".into()));
+        assert_eq!((values.paused(1_000), values.paused(2_000)), (Some(Some(2_000)), None));
+        values.set(GLOBAL, PAUSED_UNTIL, Some("resume".into()));
+        assert_eq!(values.paused(i64::MAX), Some(None));
+        assert!(!valid(GLOBAL, PAUSED_UNTIL, "soon"));
     }
 
     #[test]

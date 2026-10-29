@@ -60,6 +60,8 @@ pub struct WatchSet {
     conversation: Option<Key>,
     members: Option<(u32, u32)>,
     space: Option<Key>,
+    /// The window is the one being typed in.
+    focused: bool,
     sent: Option<Watching>,
     /// When the unsent changes began and when the last one came.
     changing: Option<(Instant, Instant)>,
@@ -96,6 +98,16 @@ impl WatchSet {
         } else {
             self.rows.insert(source, rows);
         }
+        self.touched(now);
+        true
+    }
+
+    /// Whether the window has focus: what arrives in the open conversation then is read.
+    pub fn focused(&mut self, focused: bool, now: Instant) -> bool {
+        if self.focused == focused {
+            return false;
+        }
+        self.focused = focused;
         self.touched(now);
         true
     }
@@ -144,6 +156,7 @@ impl WatchSet {
         Watching {
             space: self.space.clone(),
             conversation: self.conversation.clone(),
+            focused: self.focused,
             people,
             members: self.members,
             rows: {
@@ -178,6 +191,7 @@ impl WatchSet {
                 sent.conversation == wanted.conversation
                     && sent.members == wanted.members
                     && sent.space == wanted.space
+                    && sent.focused == wanted.focused
                     && sent.rows == wanted.rows
                     && same_people(sent)
             }
@@ -288,6 +302,13 @@ impl Hub {
     pub fn watch_rows(&self, source: &'static str, rows: impl IntoIterator<Item = Key>, cx: &mut App) {
         let rows = rows.into_iter().collect();
         if self.0.borrow_mut().watch.rows(source, rows, Instant::now()) {
+            self.schedule(cx);
+        }
+    }
+
+    /// Whether the window has focus, for chatd's notifications.
+    pub fn watch_focus(&self, focused: bool, cx: &mut App) {
+        if self.0.borrow_mut().watch.focused(focused, Instant::now()) {
             self.schedule(cx);
         }
     }

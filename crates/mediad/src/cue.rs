@@ -37,6 +37,20 @@ impl Sound {
         }
     }
 
+    /// The sound a settings word names (`protocol::settings::SOUND_CHOICES`, `RING_CHOICES`).
+    pub fn from_word(word: &str) -> Option<Sound> {
+        Some(match word {
+            "pebble" => Sound::Pebble,
+            "drop" => Sound::Drop,
+            "tap" => Sound::Tap,
+            "chime" => Sound::Chime,
+            "glass" => Sound::Glass,
+            "soft_ring" => Sound::SoftRing,
+            "classic_ring" => Sound::ClassicRing,
+            _ => return None,
+        })
+    }
+
     pub fn ring(self) -> bool {
         matches!(self, Sound::SoftRing | Sound::ClassicRing)
     }

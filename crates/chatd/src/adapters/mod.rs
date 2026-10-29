@@ -682,6 +682,8 @@ impl Context {
         let stored = self.hub.store().ingest(&conversation, message, true)?;
         if stored == Stored::New && !message.outgoing {
             self.typing_stopped(conversation_id, &message.sender.id);
+            // After the row counted it, so a notification's read check sees it unread.
+            self.hub.notify(crate::notify::Event::Message { conversation: conversation.clone(), message: Box::new(message.clone()) });
         }
         self.stored(&conversation, &[stored], true);
         Ok(())

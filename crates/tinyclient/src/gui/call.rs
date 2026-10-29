@@ -488,9 +488,6 @@ impl Shell {
                 if !call.deafened {
                     self.call_state.mute_before_deafen = None;
                 }
-                if matches!(call.state, CallState::RingingIn { .. }) {
-                    incoming(call);
-                }
                 self.call_watch_muted_talk(call, cx);
                 self.call_cue_join(call, cx);
                 if !in_call(call) {
@@ -1094,16 +1091,8 @@ pub(in crate::gui) fn shot_stats() -> Option<protocol::CallStats> {
     shot::stats()
 }
 
-/// A ring just arrived. Where the system notification of 07 §4 will be posted from.
-///
-/// Not built this round. What it needs: the process that posts must run inside the signed
-/// bundle (`packaging/bundle.sh` makes it; `UNUserNotificationCenter` refuses a bare binary),
-/// and by the design it is chatd that posts, so the ring arrives with the window closed. chatd
-/// is in the bundle now, started by the window (`ensure_daemon`); the matching place there is
-/// `Calls::ring` and `Calls::ring_stopped` in `chatd/src/media.rs`. Title: the caller, or the
-/// group. Subtitle: "Discord · Incoming call". Actions Accept and Decline map to `CallAccept`
-/// and `CallDecline`. The notification is withdrawn on `ring_stopped`.
-fn incoming(_call: &Call) {}
+// A ring's system notification, with Accept and Decline, is chatd's (`chatd/src/notify.rs`):
+// it is posted with the window closed too, and withdrawn when the ring stops.
 
 #[cfg(test)]
 mod tests {

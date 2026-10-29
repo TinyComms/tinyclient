@@ -108,6 +108,10 @@ search field, in Network and Space mode for that network; 12 px text, 14 px glyp
   `Slack signed you out` / `Open tinyclient to sign in again.`
 
 ## 6. Notifications
+Built (2026-10-28): chatd posts them (`chatd/src/notify.rs`, through `crates/notifier`). Windows shows them as toasts
+under the AppUserModelID the installer's shortcut carries; Reply and Mark as read are toast buttons, the reply a text
+field. Missed-call, after-reconnect and reply-failed notifications are not posted yet; Thread replies post as their
+thread's conversation.
 Posted for states 1 and 2 only. Never for state 3, my own messages, history at connect, or the conversation open in
 the key window. Key window on another conversation: banner without sound.
 

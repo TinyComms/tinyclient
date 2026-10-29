@@ -1093,7 +1093,7 @@ dependencies = [
 
 [[package]]
 name = "chatd"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "aes 0.8.4",
  "aes-gcm",
@@ -1120,6 +1120,7 @@ dependencies = [
  "keyring",
  "libc",
  "miniz_oxide 0.8.9",
+ "notifier",
  "p256",
  "presage",
  "protocol",
@@ -5129,7 +5130,7 @@ dependencies = [
 
 [[package]]
 name = "login"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "block2 0.6.2",
  "embed-resource",
@@ -5290,7 +5291,7 @@ checksum = "7ebb8d8732c6a6df3d8f032a82911cfc747e00efb95cc46e8d0acd5b5b88570c"
 
 [[package]]
 name = "mediad"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",
@@ -5554,6 +5555,19 @@ name = "noop_proc_macro"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0676bb32a98c1a483ce53e500a81ad9c3d5b3f7c920c28c24e9cb0980d0b5bc8"
+
+[[package]]
+name = "notifier"
+version = "0.2.20"
+dependencies = [
+ "block2 0.6.2",
+ "objc2 0.6.5",
+ "objc2-app-kit 0.3.2",
+ "objc2-foundation 0.3.2",
+ "objc2-user-notifications",
+ "windows 0.62.2",
+ "zbus",
+]
 
 [[package]]
 name = "notify-rust"
@@ -7226,7 +7240,7 @@ dependencies = [
 
 [[package]]
 name = "protocol"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "interprocess",
  "serde",
@@ -9464,13 +9478,14 @@ dependencies = [
 
 [[package]]
 name = "tinyclient"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "embed-resource",
  "gpui",
  "gpui_platform",
  "image",
  "libc",
+ "notifier",
  "protocol",
  "serde_json",
  "sha2 0.10.9",

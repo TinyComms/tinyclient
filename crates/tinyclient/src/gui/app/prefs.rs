@@ -357,7 +357,8 @@ mod tests {
         assert!(write(&Prefs { choices: Choices { section: Section::Privacy, ..Choices::default() }, ..Prefs::default() }).contains("settings_section\tprivacy\n"));
         assert_eq!(parse("settings_section\tstorage\n").choices.section, Section::Storage);
         assert_eq!(parse("settings_section\t6\n").choices.section, Section::Accounts);
-        assert_eq!(parse("settings_section\tnotifications\n").choices.section, Section::Accounts);
+        assert_eq!(parse("settings_section\tnotifications\n").choices.section, Section::Notifications);
+        assert_eq!(parse("settings_section\tintegrations\n").choices.section, Section::Accounts);
     }
 
     #[test]

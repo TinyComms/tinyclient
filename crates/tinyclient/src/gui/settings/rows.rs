@@ -35,7 +35,27 @@ use Section::*;
 pub const ROWS: &[Row] = &[
     row("G2", General, "", "Keep receiving when the window is closed", &[], &["background", "quit", "close", "run", "daemon"]),
     row("G4", General, "", "Install updates automatically", &[], &["update", "upgrade", "version", "install", "automatic"]),
+    row("N1", Notifications, "", "Show notifications", &[], &["notify", "notification", "alert", "banner", "toast", "popup"]),
+    row("N2", Notifications, "", "Notify me about", &["Direct messages and mentions", "All messages"], &["dm", "mention", "every message", "channel"]),
+    row("ND", Notifications, "Notify for", "Direct messages", &[], &["dm", "private", "notify"]),
+    row("NG", Notifications, "Notify for", "Group chats", &[], &["group", "notify"]),
+    row("NM", Notifications, "Notify for", "Mentions in channels", &[], &["mention", "@", "everyone", "here", "notify"]),
+    row("NT", Notifications, "Notify for", "Tiny servers", &[], &["tiny", "server", "room", "notify"]),
+    row("N4", Notifications, "Privacy", "Show in notifications", &["Sender and message", "Sender only", "Nothing"], &["preview", "privacy", "screen sharing", "hide", "text"]),
+    row("NL", Notifications, "Privacy", "When the screen is locked", &["Sender and message", "Sender only", "Nothing"], &["lock", "locked", "lock screen", "privacy"]),
+    row("N5", Notifications, "Calls", "Incoming calls", &["Ring", "Silently", "Don't notify"], &["ring", "ringtone", "call", "phone"]),
+    row("N6", Notifications, "Calls", "During a call", &["Banners only", "Banners and sounds", "Nothing"], &["call", "meeting", "busy"]),
+    row("N7", Notifications, "Quiet time", "Pause notifications", &["For 1 hour", "Until tomorrow", "Until I resume"], &["pause", "snooze", "dnd", "do not disturb", "mute", "silence"]),
+    row("N8", Notifications, "Quiet time", "Quiet hours", &[], &["quiet", "night", "sleep", "schedule", "dnd", "do not disturb"]),
+    row("N9", Notifications, "Quiet time", "Let calls ring during quiet hours and pauses", &[], &["call", "ring", "quiet", "pause"]),
+    row("N10", Notifications, "Attention", crate::host::FLASH_LABEL, &[], &["flash", "bounce", "dock", "taskbar", "attention"]),
+    row("N11", Notifications, "Attention", crate::host::BADGE_LABEL, &[], &["badge", "count", "number", "unread", "dock", "taskbar"]),
+    row("N13", Notifications, "Test", "Send a test notification", &[], &["test", "try", "check", "preview"]),
     row("S1", Sounds, "", "Play sounds", &[], &["sound", "audio", "mute", "silent", "ding", "chime", "beep"]),
+    row("S2", Sounds, "Notification sounds", "Message sound", &["Pebble", "Drop", "Tap", "Chime", "Glass", "None"], &["ding", "chime", "tone", "sound for messages", "message sound"]),
+    row("S3", Sounds, "Notification sounds", "Mention sound", &["Same", "Pebble", "Drop", "Tap", "Chime", "Glass", "None"], &["ding", "mention", "tone"]),
+    row("S4", Sounds, "Notification sounds", "Ring", &["Soft ring", "Classic ring", "None"], &["ringtone", "call", "phone"]),
+    row("SV", Sounds, "Notification sounds", "Notification volume", &[], &["volume", "loud", "quiet", "sound"]),
     row("A2", Appearance, "", "Text size", &["13 pt", "14 pt", "15 pt", "16 pt", "17 pt"], &["font", "bigger", "smaller", "zoom", "large"]),
     row("A3", Appearance, "", "Density", &["Comfortable", "Compact"], &["rows", "dense", "spacing", "compact"]),
     row("A4", Appearance, "", "Show message previews in the list", &[], &["preview", "screen sharing", "privacy", "list"]),
@@ -82,18 +102,9 @@ pub const ROWS: &[Row] = &[
 pub const NOT_YET: &[(&str, &str)] = &[
     ("proxy", "tinyclient has no proxy setting yet."),
     ("socks", "tinyclient has no proxy setting yet."),
-    ("message sound", "tinyclient plays no sound for messages yet. It comes with notifications."),
-    ("sound for messages", "tinyclient plays no sound for messages yet. It comes with notifications."),
-    ("notification", "tinyclient does not post notifications yet."),
-    ("notify", "tinyclient does not post notifications yet."),
-    ("alert", "tinyclient does not post notifications yet."),
-    ("dnd", "tinyclient does not post notifications yet. Do Not Disturb you set in Slack or Discord is shown on your status."),
-    ("focus", "tinyclient does not post notifications yet, so a Focus has nothing to hold back."),
-    ("banner", "tinyclient does not post notifications yet."),
-    ("do not disturb", "tinyclient does not post notifications yet. Do Not Disturb you set in Slack or Discord is shown on your status."),
-    ("quiet hours", "tinyclient does not post notifications yet."),
-    ("badge", crate::host::NO_BADGE),
-    ("ringtone", "tinyclient has no ring sound yet; calls ring in the window."),
+    ("reaction", "tinyclient does not notify about reactions yet."),
+    ("custom sound", "tinyclient plays only its own sounds for now."),
+    ("sound file", "tinyclient plays only its own sounds for now."),
     ("login", "tinyclient has no open-at-login setting yet."),
     ("startup", "tinyclient has no open-at-login setting yet."),
     ("launch", "tinyclient has no open-at-login setting yet."),
@@ -153,9 +164,21 @@ pub fn search(query: &str) -> Vec<&'static Row> {
             None
         }
     };
-    let mut found: Vec<(u8, usize, &Row)> = ROWS.iter().enumerate().filter_map(|(at, row)| rank(row).map(|rank| (rank, at, row))).collect();
+    let shown = ROWS.iter().enumerate().filter(|(_, row)| !absent(row.id));
+    let mut found: Vec<(u8, usize, &Row)> = shown.filter_map(|(at, row)| rank(row).map(|rank| (rank, at, row))).collect();
     found.sort_by_key(|(rank, at, _)| (*rank, *at));
     found.into_iter().map(|(_, _, row)| row).collect()
+}
+
+/// Rows this system cannot honour, so they are neither drawn nor found here: macOS plays
+/// sounds at its own alert volume and hides previews on a locked screen itself; Linux has no
+/// badge or flash here.
+pub fn absent(id: &str) -> bool {
+    match id {
+        "SV" | "NL" => cfg!(target_os = "macos"),
+        "N10" | "N11" => !cfg!(any(windows, target_os = "macos")),
+        _ => false,
+    }
 }
 
 /// The honest line for a search that found nothing, when it names something tinyclient lacks.
@@ -184,7 +207,8 @@ pub fn draws_label(id: &str) -> bool {
 pub fn kept_by_chatd(id: &str) -> bool {
     matches!(
         id,
-        "G2" | "S1" | "S7" | "S8" | "S9" | "S10" | "P1" | "P2" | "P4" | "V1" | "V2" | "V3" | "V4" | "V5" | "V6" | "V8" | "V10" | "V11" | "V12" | "V13" | "V14" | "V15" | "V16" | "V17" | "V19" | "D1" | "D2" | "D3"
+        "N1" | "N2" | "ND" | "NG" | "NM" | "NT" | "N4" | "NL" | "N5" | "N6" | "N7" | "N8" | "N9" | "N10" | "N11" | "N13" | "S2" | "S3" | "S4" | "SV"
+            | "G2" | "S1" | "S7" | "S8" | "S9" | "S10" | "P1" | "P2" | "P4" | "V1" | "V2" | "V3" | "V4" | "V5" | "V6" | "V8" | "V10" | "V11" | "V12" | "V13" | "V14" | "V15" | "V16" | "V17" | "V19" | "D1" | "D2" | "D3"
     )
 }
 
@@ -272,7 +296,7 @@ mod tests {
     fn a_search_finds_by_label_value_and_keyword_and_ranks_the_label_first() {
         let ids = |query: &str| search(query).into_iter().map(|row| row.id).collect::<Vec<_>>();
         assert_eq!(ids("text size")[0], "A2");
-        assert!(ids("ding").starts_with(&["S1", "S7", "S8", "S9"]));
+        assert!(ids("ding").starts_with(&["S1", "S2", "S3", "S7", "S8", "S9"]));
         assert_eq!(ids("push to talk")[0], "V13");
         assert!(ids("push to talk").contains(&"V8"));
         assert!(ids("echo").contains(&"V10"));
@@ -303,13 +327,27 @@ mod tests {
     fn a_search_for_what_is_not_built_says_so() {
         assert!(search("proxy").is_empty());
         assert_eq!(not_yet("proxy"), Some("tinyclient has no proxy setting yet."));
-        assert!(not_yet("Notifications").is_some());
         // The words people reach for, not only the names in the product doc.
-        for words in ["notify", "alert", "dnd", "focus", "launch", "start at login", "autostart", "sound for messages", "message sound"] {
+        for words in ["launch", "start at login", "autostart", "reactions", "custom sound"] {
             assert!(search(words).is_empty(), "{words} finds a row");
             assert!(not_yet(words).is_some(), "{words} gets no line");
         }
         assert_eq!(not_yet("zzz"), None);
+    }
+
+    #[test]
+    fn notifications_and_their_sounds_are_found_by_the_words_people_use() {
+        let ids = |query: &str| search(query).into_iter().map(|row| row.id).collect::<Vec<_>>();
+        assert_eq!(ids("Notifications")[0], "N1");
+        let asked = [("notify", "N1"), ("alert", "N1"), ("dnd", "N7"), ("do not disturb", "N7"), ("snooze", "N7"), ("quiet hours", "N8"), ("message sound", "S2"), ("ringtone", "S4"), ("lock screen", "NL"), ("test notification", "N13")];
+        for (words, id) in asked {
+            if absent(id) {
+                continue;
+            }
+            assert!(ids(words).contains(&id), "{words} does not find {id}");
+            assert_eq!(not_yet(words), None, "{words} is built");
+        }
+        assert_eq!(ids("badge").contains(&"N11"), !absent("N11"));
     }
 
     #[test]

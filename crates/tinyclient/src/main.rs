@@ -83,6 +83,16 @@ fn print_search(query: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// `--notify-test`: asks chatd to post the test notification (N13) and says what came of it.
+fn notify_test() -> io::Result<()> {
+    match ask(&Request::NotifyTest)? {
+        Response::NotifyTested { posted: true, .. } => println!("posted, and listed by the system"),
+        Response::NotifyTested { posted: false, detail } => println!("not posted: {detail}"),
+        other => return Err(unexpected(other)),
+    }
+    Ok(())
+}
+
 /// A windowed program starts with no console, so what it prints goes nowhere. When output is not
 /// already a pipe or a file, write to the console of the program that started it, if any.
 #[cfg(all(windows, feature = "gui"))]
@@ -122,7 +132,7 @@ fn main() -> ExitCode {
         None => None,
     };
     #[cfg(all(windows, feature = "gui"))]
-    if args.iter().any(|arg| arg == "--version" || arg == "--text") || query.is_some() {
+    if args.iter().any(|arg| arg == "--version" || arg == "--text" || arg == "--notify-test") || query.is_some() {
         borrow_console();
     }
     // Before the window opens: it is how an installed package proves it runs, with no display.
@@ -131,13 +141,14 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     #[cfg(feature = "gui")]
-    if !args.iter().any(|arg| arg == "--text") && query.is_none() {
+    if !args.iter().any(|arg| arg == "--text" || arg == "--notify-test") && query.is_none() {
         gui::run();
         return ExitCode::SUCCESS;
     }
 
     let done = match query {
         Some(query) => print_search(query),
+        None if args.iter().any(|arg| arg == "--notify-test") => notify_test(),
         None => print_status(),
     };
     match done {

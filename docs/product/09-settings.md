@@ -536,11 +536,40 @@ search:
 - **Sounds:** the seven bundled files are rendered and committed, checked against a manifest on
   macOS. They are not copied into the bundle until notifications post them.
 
+### Notifications built (2026-10-28)
+
+Step 6 is in, on Windows first. chatd posts (`chatd/src/notify.rs`), through the `notifier` crate:
+WinRT toasts on Windows, UNUserNotificationCenter on macOS (inside the bundle only), and
+org.freedesktop.Notifications on Linux.
+
+- **Notifications:** N1, N2, N4 (and its locked-screen twin, read from the session's WTS lock
+  state on Windows), N5, N6, N7 (1 hour, until 08:00, until resumed), N8 with its two times,
+  N9, N10 (taskbar flash on Windows, Dock bounce on macOS), N11 (the taskbar overlay or Dock
+  badge, the `ATTENTION` total), N13. Each kind has a switch of its own: direct messages, group
+  chats, mentions in channels, Tiny servers. N3 and the per-conversation level are honoured by
+  chatd (`notify_about` in the account's or conversation's scope); N3 has no row yet.
+- **Behaviour with no setting:** all of the list above the Sounds table: never the conversation
+  open in the focused window (`Watching.focused`), never mine, never history at connect (older
+  than 2 minutes when heard), never muted; one notification per conversation, its newest three
+  lines, replaced in place and withdrawn when the row is read anywhere; Reply and Mark as read;
+  a click opens the window there, starting it if it is closed; the network's Do Not Disturb (my
+  own presence `dnd`) holds it back. The ring is posted with Accept and Decline and withdrawn
+  when it stops.
+- **Sounds:** S1 now silences notifications too; S2, S3, S4 with S11's play buttons; S5 and S6
+  are honoured, and S6 is set in Details beside the conversation's notifications. Windows and
+  Linux post silent and chatd plays the sound itself (`mediad --sound`, rendered from the same
+  code as the files), at a notification volume of its own (`alert_volume`, shown where it
+  applies). The silence rules are applied in the order above.
+- A scratch directory (`TINYCLIENT_DIR`) posts nothing unless `TINYCLIENT_NOTIFY=on`, so tests
+  never do. `tinyclient --notify-test` posts N13 from a terminal.
+
 Not built yet, and so absent from the window: G1 (needs a login item that starts chatd alone, in
-the signed bundle), the whole Notifications section with N1 to N13, S2 to S6 and S11 (step 6: the
-notification spike), A1 (step 7: light tokens and contrast), the Accounts row menu that opens them,
-and VPIO with `OPUS_APPLICATION_VOIP` (V-notes). Search answers "notifications", "theme",
-"login" and the Later terms with a line saying so.
+the signed bundle), N3's rows, the permission banners of design 06, A1 (step 7: light tokens and
+contrast), the Accounts row menu, the menu bar's Notifications… popover (Details carries its two
+controls), and VPIO with `OPUS_APPLICATION_VOIP` (V-notes). "System alert sound" is not offered:
+an unpackaged Windows app could only name the system's sounds, and chatd plays ours.
+`packaging/bundle.sh` copies the seven CAF files into the bundle's Resources, where macOS finds
+them by name. Search answers "theme", "login" and the Later terms with a line saying so.
 
 ### v1, build now
 

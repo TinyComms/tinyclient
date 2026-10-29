@@ -11,9 +11,12 @@
 //! end-to-end encryption: the MLS group, through `davey` as for DAVE, and the frame transform
 //! between the codec and str0m.
 //!
+//! `mediad --sound` plays one notification sound (`alert`) and exits.
+//!
 //! `mediad --play` is the other mode: one voice message or audio file (`play`, reading it with
 //! `decode` and speeding it up with `stretch`), the speaker only, until playing stops.
 
+pub mod alert;
 pub mod audio;
 pub mod cue;
 pub mod dave;

@@ -84,7 +84,9 @@ A few behaviours that are easy to miss:
 - **Terminal.** `tinyclient --text`, or any build without the `gui` feature, prints account status and the inbox as lines of text. An interactive terminal UI is not built. The socket protocol is enough to write one.
 - **Platforms.** CI builds and tests macOS, Linux, and Windows on every push (`.github/workflows/ci.yml`). Most development happens on macOS, so reports and fixes from Linux and Windows are especially welcome. The main window closes cleanly on all three. Linux web sign-in, including Discord's session capture, works with WebKitGTK.
 
-Still not built, and not covered by an open pull request: notifications and a dock badge, Signal attachments and safety numbers, Teams personal accounts, and video or screen share (see [work in progress](#work-in-progress) for the Discord slice that is underway).
+- **Notifications.** chatd posts them with the window closed: direct messages and mentions by default, one per conversation with its newest lines, withdrawn once read, with Reply and Mark as read; calls ring with Accept and Decline. Settings › Notifications holds what notifies, previews (and on a locked screen), pauses and quiet hours; Sounds picks the message, mention and ring sounds. The taskbar button (Dock icon on macOS) shows the unread count and flashes for something new. Windows is the platform tested most; macOS needs the app bundle.
+
+Still not built, and not covered by an open pull request: Signal attachments and safety numbers, Teams personal accounts, and video or screen share (see [work in progress](#work-in-progress) for the Discord slice that is underway).
 
 ## Work in progress
 

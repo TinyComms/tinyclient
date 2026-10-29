@@ -8,6 +8,7 @@
 
 mod accounts;
 pub(in crate::gui) mod controls;
+mod notify;
 mod pages;
 pub mod rows;
 mod tiny;
@@ -42,6 +43,7 @@ gpui::actions!(settings, [Find, Dismiss, NextControl, PreviousControl]);
 pub enum Section {
     Accounts,
     General,
+    Notifications,
     Sounds,
     Appearance,
     Messages,
@@ -55,9 +57,10 @@ pub enum Section {
 
 impl Section {
     /// In list order; About is pinned to the bottom.
-    pub const ALL: [Section; 11] = [
+    pub const ALL: [Section; 12] = [
         Section::Accounts,
         Section::General,
+        Section::Notifications,
         Section::Sounds,
         Section::Appearance,
         Section::Messages,
@@ -73,6 +76,7 @@ impl Section {
         match self {
             Section::Accounts => "Accounts",
             Section::General => "General",
+            Section::Notifications => "Notifications",
             Section::Sounds => "Sounds",
             Section::Appearance => "Appearance",
             Section::Messages => "Messages",
@@ -89,6 +93,7 @@ impl Section {
         match self {
             Section::Accounts => "icons/users.svg",
             Section::General => "icons/settings.svg",
+            Section::Notifications => "icons/bell.svg",
             Section::Sounds => "icons/volume-2.svg",
             Section::Appearance => "icons/sun-moon.svg",
             Section::Messages => "icons/message-square.svg",
@@ -106,6 +111,7 @@ impl Section {
         match self {
             Section::Accounts => "accounts",
             Section::General => "general",
+            Section::Notifications => "notifications",
             Section::Sounds => "sounds",
             Section::Appearance => "appearance",
             Section::Messages => "messages",
@@ -329,6 +335,8 @@ pub struct SettingsWindow {
     pub(super) playing: Option<Instant>,
     /// "Copied", for 4 s after Copy diagnostics.
     pub(super) copied: Option<Instant>,
+    /// What the test notification came to, and when (N13).
+    pub(super) tested: Option<(Instant, String)>,
     /// A row opened from search, lit for 1.5 s.
     pub(super) highlight: Option<&'static str>,
     /// The Tiny server account's name field.
@@ -397,6 +405,7 @@ impl SettingsWindow {
             failed: None,
             playing: None,
             copied: None,
+            tested: None,
             highlight: None,
             tiny,
             recording: None,

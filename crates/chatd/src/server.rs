@@ -594,7 +594,11 @@ impl Chat {
             known.collect()
         };
         let typists = watching.conversation.as_ref().map_or_else(Vec::new, |open| self.hub.typists(open));
-        if self.hub.watch(watching) {
+        // Focus alone is chatd's own business (notifications): the networks are not told again.
+        let mut before = (*self.hub.watching()).clone();
+        before.focused = watching.focused;
+        let for_networks = before != watching;
+        if self.hub.watch(watching) && for_networks {
             let watching = self.hub.watching();
             for adapter in lock(&self.adapters).values() {
                 adapter.command(Command::Watch(watching.clone()));
@@ -1972,6 +1976,25 @@ impl Chat {
                 Ok(()) => Response::Ok,
                 Err(err) => call_error(err),
             },
+            Request::NotifyTest => {
+                if !crate::notify::enabled() {
+                    return Response::NotifyTested { posted: false, detail: crate::notify::DISABLED.to_owned() };
+                }
+                let (tell, told) = std::sync::mpsc::channel();
+                self.hub.notify(crate::notify::Event::Test(tell));
+                match told.recv_timeout(Duration::from_secs(5)) {
+                    Ok((posted, detail)) => Response::NotifyTested { posted, detail },
+                    Err(_) => Response::NotifyTested { posted: false, detail: "Notifications are not running in tinyclient's background service.".to_owned() },
+                }
+            }
+            Request::PlaySound { sound } => {
+                let known = settings::SOUND_CHOICES.iter().chain(&settings::RING_CHOICES).any(|word| *word == sound && sound != "none");
+                if !known {
+                    return error(ErrorCode::NotFound, "no such sound");
+                }
+                self.hub.notify(crate::notify::Event::Play(sound));
+                Response::Ok
+            }
         }
     }
 }
@@ -2050,6 +2073,7 @@ fn serve_connection(chat: &Chat, mut stream: ChatStream) -> io::Result<()> {
 pub fn serve(listener: ChatListener, chat: Chat) -> io::Result<()> {
     let chat = Arc::new(chat);
     let _ = chat.this.set(Arc::downgrade(&chat));
+    crate::notify::start(chat.hub.clone(), Arc::downgrade(&chat));
     Chat::read_sessions(&chat, Network::ALL.to_vec(), true);
     loop {
         let stream = match listener.accept() {
