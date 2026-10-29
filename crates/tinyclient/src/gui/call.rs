@@ -9,6 +9,7 @@ mod devices;
 mod dock;
 mod people;
 mod permission;
+mod security;
 #[cfg(feature = "gui-shot")]
 mod shot;
 
@@ -85,6 +86,8 @@ fn now() -> i64 {
 pub(super) enum Menu {
     Devices,
     People,
+    /// How the call is protected (`security`).
+    Security,
 }
 
 /// What a counter in the dock is counting.
@@ -707,6 +710,7 @@ impl Shell {
                             level: None,
                             inputs: Vec::new(),
                             outputs: Vec::new(),
+                            security: None,
                         });
                     }
                 }

@@ -583,6 +583,7 @@ impl Shell {
             .line_height(px(15.))
             .text_color(color)
             .child(network_icon(network, 11.))
+            .children(self.call_security_badge(call, cx))
             .child(div().min_w_0().truncate().child(refused.unwrap_or(words)))
             .children(counter);
         let right: Option<AnyElement> = match (live, direct) {
@@ -718,6 +719,7 @@ impl Shell {
         let popover = match menu {
             Some(Menu::Devices) => Some((300., self.call_devices_menu(call, cx).p(px(6.)))),
             Some(Menu::People) if joined => Some((280., people::list(call, subject).py(px(6.)))),
+            Some(Menu::Security) => Some((320., div().child(self.call_security_panel(call, cx)))),
             _ => None,
         };
         #[cfg(feature = "gui-shot")]
@@ -902,6 +904,7 @@ mod tests {
             level: None,
             inputs: Vec::new(),
             outputs: Vec::new(),
+            security: None,
         }
     }
 
