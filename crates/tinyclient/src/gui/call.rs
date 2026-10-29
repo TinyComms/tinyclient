@@ -743,6 +743,13 @@ impl Shell {
             // A made-up Tiny call is in the room I sit in on the server on show.
             let mut call = shot::call(snapshot)?;
             call.conversation = self.tiny_shot_room()?;
+            // Everyone else in the room's call is in its encrypted group, named as chatd names
+            // a Tiny call's roster.
+            let others = self.tiny_shot_others(&call.conversation.id);
+            call.security = shot::security(&others.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>());
+            if call.participants.is_empty() {
+                call.participants = others.into_iter().map(|(id, name)| protocol::Participant { id, name, ..Default::default() }).collect();
+            }
             return Some(call);
         }
         shown(snapshot).or_else(|| self.call_state.local.clone())

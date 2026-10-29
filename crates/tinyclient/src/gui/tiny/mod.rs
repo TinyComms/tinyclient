@@ -467,6 +467,16 @@ impl Shell {
         Some(Key { network: Network::Tiny, account: page.account.account.clone(), id: room })
     }
 
+    /// Everyone but me seated in `room`, with their names: a made-up call's roster.
+    #[cfg(feature = "gui-shot")]
+    pub(in crate::gui) fn tiny_shot_others(&self, room: &str) -> Vec<(String, String)> {
+        let Some(page) = self.tiny_page_facts() else {
+            return Vec::new();
+        };
+        let seats = page.community.rooms.iter().find(|r| r.id == room).map(|r| r.participants.as_slice()).unwrap_or_default();
+        seats.iter().filter(|seat| seat.user_id != page.me).map(|seat| (seat.user_id.clone(), model::name_by_id(page.community, &seat.user_id))).collect()
+    }
+
     /// The page, when it has loaded.
     pub(super) fn tiny_page_facts(&self) -> Option<Page<'_>> {
         let community = self.tiny_state.community.as_ref()?;

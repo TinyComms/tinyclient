@@ -12,11 +12,19 @@
 //! `tiny_joined_muted`, `tiny_muted_talking` (muted, and the meter hears speech),
 //! `tiny_joined_speaking`, `tiny_poor` (a bad link), `tiny_failed_kicked`, `tiny_failed_lost`,
 //! `tiny_failed_banned`, `tiny_ptt` (push to talk, key up) and `tiny_ptt_talking` (key held).
+//!
+//! A Tiny call is end-to-end encrypted, its group the room's seats. `tiny_e2ee_pending`,
+//! `tiny_transport` and `tiny_check` (someone's verified key changed) show the indicator's other
+//! faces; `tiny_security` opens the security panel from the channel's top bar,
+//! `tiny_security_bar` from the column's compact bar. `tiny_poor`'s numbers carry audio trouble
+//! too, for the health hints.
 
+use super::security::Place;
 use super::{now, Confirm, Ended, Menu, Subject};
 use crate::gui::state::Snapshot;
 use protocol::{
-    Call, CallFailure, CallState, ConversationKind, Key, Network, Occupant, Occupants, Participant,
+    Call, CallFailure, CallSecurity, CallState, ConversationKind, Key, Network, Occupant, Occupants, Participant, SecureMember,
+    SecurityMode, Trust,
 };
 
 fn asked() -> Option<String> {
@@ -60,7 +68,71 @@ pub(super) fn stats() -> Option<protocol::CallStats> {
         receive_kbps: 182,
         path: if poor { protocol::CallPath::Tcp } else { protocol::CallPath::Udp },
         codec: "opus".to_owned(),
+        // Counted over the call: drawn as the first poll, so as the last second's.
+        playout_underruns: if poor { 2 } else { 0 },
+        concealed_frames: if poor { 4 } else { 0 },
+        fec_recovered: if poor { 2 } else { 0 },
+        ..protocol::CallStats::default()
     })
+}
+
+/// How the made-up Tiny call is protected: end to end, with everyone else in the room's call in
+/// its group (`members` are their ids, from the room the shell puts the call in).
+pub(super) fn security(members: &[String]) -> Option<CallSecurity> {
+    if !tiny() {
+        return None;
+    }
+    let name = named()?;
+    let mode = match name.as_str() {
+        "e2ee_pending" => SecurityMode::Pending,
+        "transport" => SecurityMode::Transport,
+        _ => SecurityMode::EndToEnd,
+    };
+    let end_to_end = mode == SecurityMode::EndToEnd;
+    let digits = |seed: u64, count: usize| -> String {
+        let mut x = seed;
+        (0..count)
+            .map(|_| {
+                x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+                char::from(b'0' + (x >> 59) as u8 % 10)
+            })
+            .collect()
+    };
+    let members = if end_to_end {
+        members
+            .iter()
+            .enumerate()
+            .map(|(ix, user_id)| SecureMember {
+                user_id: user_id.clone(),
+                key: format!("{:064x}", ix + 1),
+                safety: digits(ix as u64 + 11, 45),
+                trust: match (ix, name.as_str()) {
+                    (0, "check") => Trust::Changed,
+                    (0, _) => Trust::Verified,
+                    _ => Trust::Unverified,
+                },
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    Some(CallSecurity {
+        mode,
+        code: if end_to_end { digits(7, 30) } else { String::new() },
+        epoch: if end_to_end { 4 } else { 0 },
+        members,
+        unsupported: Vec::new(),
+        server_lacks: mode == SecurityMode::Transport,
+    })
+}
+
+/// Which indicator the security panel is open from, when a shot opens it.
+pub(super) fn security_at() -> Option<Place> {
+    match named()?.as_str() {
+        "security" => Some(Place::TopBar),
+        "security_bar" => Some(Place::TinyBar),
+        _ => None,
+    }
 }
 
 fn channel(name: &str) -> bool {
@@ -148,6 +220,7 @@ pub(super) fn call(snapshot: &Snapshot) -> Option<Call> {
         _ => now() - 724,
     };
     let menu = name == "devices_menu";
+    let speaking = matches!(name.as_str(), "joined_speaking" | "devices_menu" | "people_menu" | "ptt_talking");
     // The first is the system default and what the automatic choice uses; a "Krisp" one is virtual.
     let listed = |names: &[&str]| -> Vec<protocol::AudioDevice> {
         let device = |(ix, name): (usize, &&str)| protocol::AudioDevice {
@@ -160,7 +233,7 @@ pub(super) fn call(snapshot: &Snapshot) -> Option<Call> {
         if menu { names.iter().enumerate().map(device).collect() } else { Vec::new() }
     };
     Some(Call {
-        speaking: matches!(name.as_str(), "joined_speaking" | "devices_menu" | "people_menu" | "ptt_talking"),
+        speaking,
         level: (menu || name == "muted_talking").then_some(62),
         output_level: menu.then_some(48),
         inputs: listed(&["MacBook Pro Microphone", "Studio headset", "Desk camera microphone", "Krisp Microphone (Krisp Audio)"]),
@@ -209,6 +282,7 @@ pub(super) fn menu() -> Option<Menu> {
     match named()?.as_str() {
         "devices_menu" => Some(Menu::Devices),
         "people_menu" => Some(Menu::People),
+        "security" | "security_bar" => Some(Menu::Security),
         _ => None,
     }
 }

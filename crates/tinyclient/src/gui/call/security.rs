@@ -259,6 +259,10 @@ impl Shell {
 
     /// The security panel is open, from the indicator at `place`.
     pub(in crate::gui) fn call_security_open(&self, place: Place) -> bool {
+        #[cfg(feature = "gui-shot")]
+        if let Some(at) = super::shot::security_at() {
+            return at == place;
+        }
         self.call_state.menu == Some(Menu::Security) && self.call_state.security_at == place
     }
 
