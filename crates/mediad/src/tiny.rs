@@ -12,9 +12,10 @@
 //!    every `call.slots`.
 //! 3. [`run`] is the call: a 20 ms tick as in `media`, with str0m's timers and packets in
 //!    between. The microphone goes through the same speech gate, as mono Opus with each frame's
-//!    RFC 6464 level, stamped n × 960 at 48 kHz. Muted, nothing is sent. Each frame that comes
-//!    in goes to its slot's jitter buffer and decoder; a slot that changes hands starts both
-//!    afresh, since the new speaker's RTP times are not the last one's.
+//!    RFC 6464 level, stamped n × 960 at 48 kHz. Muting sends the faded frame and the silence
+//!    trail, then nothing. Each frame that comes in goes to its slot's jitter buffer by its
+//!    RTP time, so a gap the SFU's new sequence numbers hide is still a missing frame. A slot
+//!    that changes hands starts both afresh, since the new speaker's RTP times are not the last one's.
 //!
 //! The devices open only once media flows, so a join that fails never lights the microphone
 //! indicator. The microphone goes through the same processing as a Discord call (`process`):
@@ -51,6 +52,32 @@ use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcConfig}
 
 const TICK: Duration = Duration::from_millis(20);
 const SECOND: u64 = 50;
+
+/// Opus, and no hold for a missing audio packet. str0m's default waits for 15 later packets
+/// or a second, and the talk spurt has already ended by then. Video keeps its own hold.
+fn rtc_config() -> RtcConfig {
+    RtcConfig::new()
+        .clear_codecs()
+        .enable_opus(true, false)
+        .set_stats_interval(Some(Duration::from_secs(1)))
+        .set_reordering_size_audio(0)
+        .set_reordering_timeout_audio(Some(Duration::from_millis(40)))
+}
+
+/// The jitter buffer's sequence for an RTP timestamp at 48 kHz. One 20 ms frame is 960.
+fn frame_sequence(timestamp: u64) -> u16 {
+    (timestamp / FRAME as u64) as u16
+}
+
+/// What actually goes out. A one- or two-byte DTX packet is not safe to send and not safe to
+/// drop, so the silence frame takes its place and the timestamp still moves one frame.
+fn outbound(packet: &[u8]) -> &[u8] {
+    if packet.len() > 2 {
+        packet
+    } else {
+        &SILENCE
+    }
+}
 /// The level from which someone else's frame counts as speech, as in a Discord call.
 const VOICE: u8 = 25;
 const UDP: Token = Token(0);
@@ -121,7 +148,7 @@ impl Offer {
     pub fn new(spec: &TinyOffer) -> io::Result<Offer> {
         let ip = local_ip(&spec.host);
         let (udp, tcp) = transports();
-        let mut rtc = RtcConfig::new().clear_codecs().enable_opus(true, false).set_stats_interval(Some(Duration::from_secs(1))).build(Instant::now());
+        let mut rtc = rtc_config().build(Instant::now());
         let candidate = |made: Result<Candidate, str0m::error::IceError>| made.map_err(|err| io::Error::other(format!("candidate: {err:?}")));
         let (mut socket, mut local_udp, mut local_tcp) = (None, None, None);
         if udp {
@@ -357,7 +384,9 @@ impl Call {
                 stream.arrivals.arrived(data.time.numer() as u32, data.network_time);
                 stream.heard |= opus[..] != SILENCE[..];
                 if !self.controls.deafened.load(Ordering::Relaxed) {
-                    stream.jitter.insert(**data.seq_range.start() as u16, opus);
+                    // The SFU writes a fresh sequence, so a lost frame is a hole in the RTP
+                    // time and not in `seq_range`. The jitter buffer only sees sequence numbers.
+                    stream.jitter.insert(frame_sequence(data.time.numer() as u64), opus);
                 }
             }
             _ => {}
@@ -517,14 +546,15 @@ impl Call {
         let Some(len) = self.encoder.encode(frame, &mut packet) else {
             return;
         };
-        // Two bytes or less is DTX saying there is nothing worth sending.
-        if len > 2 {
-            self.write(&packet[..len], tick, dbov(frame), voice);
-        }
+        // A packet of two bytes or less is DTX. Forwarding it is a full-scale pop on this
+        // libopus, and dropping it leaves a hole the receiver cannot see. Send silence instead.
+        let sending = outbound(&packet[..len]);
+        let (level, voice) = if sending.len() > 2 { (dbov(frame), voice) } else { (-127, false) };
+        self.write(sending, tick, level, voice);
     }
 
-    /// The microphone's 20 ms, through the processing and the gate. Muted, nothing goes out at
-    /// all.
+    /// The microphone's 20 ms, through the processing and the gate. Once the fade and the
+    /// silence trail have gone, a muted microphone sends nothing.
     fn capture(&mut self, audio: &mut Audio) -> u8 {
         let controls = self.controls.clone();
         self.encoder.set_bitrate(controls.bitrate());
@@ -534,7 +564,7 @@ impl Call {
         if let Some(speaking) = step.speaking {
             out::send(&MediaResponse::Speaking { user_id: self.user_id.clone(), speaking });
         }
-        if muted || !self.connected {
+        if !self.connected || (muted && step.send.is_none() && step.early.is_empty()) {
             return heard;
         }
         let early = step.early.len() as u64;
@@ -746,6 +776,33 @@ mod tests {
 
     fn slot(mid: &str, user: &str) -> TinySlot {
         TinySlot { mid: mid.into(), user_id: user.into() }
+    }
+
+    #[test]
+    fn a_lost_audio_packet_is_not_held_for_reordering() {
+        let config = rtc_config();
+        assert_eq!(config.reordering_size_audio(), 0);
+        assert_eq!(config.reordering_timeout_audio(), Some(Duration::from_millis(40)));
+    }
+
+    #[test]
+    fn a_timestamp_gap_is_a_missing_frame_and_a_tiny_packet_is_silence() {
+        use crate::jitter::{Jitter, Pop};
+        assert_eq!(frame_sequence(0), 0);
+        assert_eq!(frame_sequence(960), 1);
+        assert_eq!(frame_sequence(960 * 3), 3);
+        assert_eq!(outbound(&[0xf8]), &SILENCE[..]);
+        assert_eq!(outbound(&[1, 2, 3, 4]), &[1, 2, 3, 4]);
+        let mut jitter = Jitter::default();
+        for (stamp, byte) in [(0u64, 1u8), (960, 2), (960 * 3, 4)] {
+            jitter.insert(frame_sequence(stamp), vec![byte]);
+        }
+        assert!(matches!(jitter.pop(), Pop::Packet(_)));
+        assert!(matches!(jitter.pop(), Pop::Packet(_)));
+        assert_eq!(jitter.pop(), Pop::Hold);
+        assert_eq!(jitter.pop(), Pop::Hold);
+        assert_eq!(jitter.pop(), Pop::Lost);
+        assert_eq!(jitter.next(), Some(&[4u8][..]));
     }
 
     #[test]
