@@ -39,8 +39,8 @@ const PLAYOUT_MAX: f32 = 0.25;
 /// The microphone's, at 48 kHz, past which the oldest is dropped (with a crossfade).
 const CAPTURE_MAX: usize = FRAME_SAMPLES * 10;
 /// What each side's drift control keeps at the lowest point of each second, in ms: the
-/// microphone's before a frame is taken (a frame and 5 ms), the speaker's before one is added.
-const CAPTURE_LOW_MS: f64 = 25.;
+/// microphone's before a frame is taken (a frame and 10 ms), the speaker's before one is added.
+const CAPTURE_LOW_MS: f64 = 30.;
 const PLAYOUT_LOW_MS: f64 = 20.;
 
 /// What went wrong on a pair of devices, counted by their callbacks.
