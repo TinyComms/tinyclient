@@ -46,302 +46,88 @@
 <section class="hero ts-hero" aria-labelledby="title">
   <div class="wrap">
     <div class="hero-mark"><img class="hero-icon" src="assets/networks/tiny.svg" alt="" width="76" height="76"><h1 id="title">Tiny server</h1></div>
-    <p class="pitch">Your own voice server, with tinyclient as&nbsp;its&nbsp;app.</p>
-    <p class="lede">Voice channels in categories, laid out the way Discord lays out a server, with calls that are end-to-end encrypted. One server holds one community, and whoever runs it decides who&nbsp;joins.</p>
+    <p class="pitch">Your own voice server, in&nbsp;tinyclient.</p>
+    <p class="lede">Click a picture to see it&nbsp;larger.</p>
     <div class="actions">
       <a class="btn btn-primary" href="https://github.com/itz4blitz/tinyserver/blob/main/deploy/README.md"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="2" y="3" width="20" height="8" rx="2"/><rect x="2" y="13" width="20" height="8" rx="2"/><path d="M6 7h.01M6 17h.01"/></svg>Run your own</a>
       <a class="btn btn-secondary ts-dl" href="./#download"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/><path d="M12 15V3"/></svg>Download tinyclient</a>
     </div>
-    <p class="platforms">Self-hosted · <a href="https://github.com/itz4blitz/tinyserver">Open source</a>, MIT · One community per server · Voice, no text&nbsp;chat</p>
-    <figure class="ts-lead">
-      <a class="ts-frame" href="shots/tiny-server-1120.webp"><img src="shots/tiny-server-1120.webp" width="1120" height="700" alt="The Night Shift server in tinyclient. On the left, its voice channels in folding categories, Hangout, Games and Away, with people seated under each channel. In the middle, the server's home: its icon and description, a welcome message, an Invite people button, and who is in voice now. On the right, the member list grouped by role." fetchpriority="high" decoding="async"></a>
-      <figcaption class="ts-cap">The server&rsquo;s home: channels on the left, who is in voice in the middle, members by role on the right.</figcaption>
-    </figure>
-    <div class="ts-under">
-      <p>The server opens on its home: its name, description and welcome, who is in which voice channel, and who is&nbsp;online.</p>
-      <ul class="checks">
-        <li>Voice channels in categories that fold, each showing how many are in it and how many fit.</li>
-        <li>People seated under their channel, with a ring while they speak and a mark when they are muted or deafened.</li>
-        <li>Double-click a channel to join. Drag someone to another channel to move them, or drag channels to reorder.</li>
-        <li>The member list groups people by role, with presence and where each one sits.</li>
-      </ul>
-    </div>
-  </div>
-</section>
-
-<section class="section" id="server" aria-labelledby="server-title">
-  <div class="wrap">
-    <p class="kicker center reveal">In tinyclient</p>
-    <h2 id="server-title" class="center reveal">A server you already know how to&nbsp;use</h2>
-    <p class="lede center reveal">A Tiny server sits on tinyclient&rsquo;s rail beside your other networks, and everything about it happens in the same&nbsp;window.</p>
-    <div class="ts-rows">
-      <div class="ts-row reveal">
-        <div class="ts-copy">
-          <h3>Voice that sounds right</h3>
-          <p>A channel shows a tile for each person in the call. The bar at the bottom mutes, deafens, picks devices and shows how the connection is doing.</p>
-          <ul class="checks">
-            <li>Echo cancellation, noise suppression and automatic gain, on by default.</li>
-            <li>Voice activation with a threshold you can see, or push to talk. A channel can require push to talk.</li>
-            <li>Keys that work while tinyclient is in the background, on Windows, macOS and X11.</li>
-            <li>Your own volume for each person, 0 to 200&nbsp;%, or mute them just for you.</li>
-            <li>Call health in plain words: ping, jitter, loss and the path the call takes. A lost connection rejoins by itself.</li>
-            <li>Calls go over UDP, or over TCP on the same port where a network blocks UDP. Up to 12 people in a channel.</li>
-          </ul>
-        </div>
-        <a class="ts-frame" href="shots/tiny-call-1120.webp"><img src="shots/tiny-call-1120.webp" width="1120" height="700" alt="Robin Vale in the Lounge voice channel. Four tiles show who is in the call: Mara Okafor and Robin Vale with green speaking edges, Theo Marchetti marked Muted and Lena Brandt marked Deafened. The channel bar shows 4 of 12 and 64 kb/s, and a floating call bar holds mute, deafen, settings, signal bars and Leave." loading="lazy" decoding="async"></a>
-      </div>
-
-      <div class="ts-row flip reveal">
-        <div class="ts-copy">
-          <h3>End-to-end encrypted calls</h3>
-          <p>When every app in a call can, the call is end-to-end encrypted. The apps form an MLS group, the design Discord uses for its own calls, and the server forwards audio it cannot unlock.</p>
-          <ul class="checks">
-            <li>New keys whenever someone joins or leaves, so nobody hears what was said before they came or after they went.</li>
-            <li>A 30-digit call code everyone in the call sees. The same code means one encrypted group, not two halves joined by the server.</li>
-            <li>A safety number for each person, to compare and mark as verified. tinyclient warns when a verified person&rsquo;s key changes.</li>
-            <li>A channel can require encryption. Where an app can&rsquo;t encrypt, the call says &ldquo;Encrypted to the server&rdquo; and names who.</li>
-          </ul>
-        </div>
-        <a class="ts-frame" href="shots/tiny-e2ee-1120.webp"><img src="shots/tiny-e2ee-1120.webp" width="1120" height="700" alt="The security panel of a call, opened from the lock in the call bar. It reads End-to-end encrypted: only the people in this call can hear it, and the server passes along audio it cannot unlock. It lists what the server can still see, then a 30-digit call code and, under Safety numbers, Mara Okafor marked Verified." loading="lazy" decoding="async"></a>
-      </div>
-
-      <div class="ts-row reveal">
-        <div class="ts-copy">
-          <h3>Moderation where the person is</h3>
-          <p>Right-click anyone, on a seat, a tile, the member list or the home, for the same menu. It holds only what you may do to them.</p>
-          <ul class="checks">
-            <li>Server mute and server deafen, move to another channel, or disconnect from the call.</li>
-            <li>Time out for a minute up to a week. Kick or ban with a reason; a ban can end after a day, a week, a month, or never.</li>
-            <li>Give and take roles. You act only on people below your own highest role.</li>
-            <li>A ban covers every way that person signs in, and signs them out everywhere at once.</li>
-          </ul>
-        </div>
-        <a class="ts-frame" href="shots/tiny-moderation-1120.webp"><img src="shots/tiny-moderation-1120.webp" width="1120" height="700" alt="The menu for Lena Brandt, opened by right-clicking her tile. For you: a volume slider at 100 % and Mute for me. Moderation: Server mute, Server deafen, Move to with a list of channels and how many are in each, Disconnect from call and Timeout. Then Roles, Kick, Ban and Copy user ID." loading="lazy" decoding="async"></a>
-      </div>
-    </div>
-  </div>
-</section>
-
-<section class="section" id="settings" aria-labelledby="settings-title">
-  <div class="wrap">
-    <p class="kicker center reveal">Server Settings</p>
-    <h2 id="settings-title" class="center reveal">Run the whole server from&nbsp;tinyclient</h2>
-    <p class="lede center reveal">The server has no admin website. Its owners, and the roles they trust, manage it in tinyclient, and each page shows only what that person may&nbsp;change.</p>
-    <div class="ts-rows">
-      <div class="ts-row reveal">
-        <div class="ts-copy">
-          <h3>Roles and permissions</h3>
-          <p>Make roles, drag them into order, give each a colour, and switch on what it may do. Twenty permissions cover joining and speaking, video, priority speaker, invites, channels, roles, kicks, bans, timeouts, moving people and the audit log.</p>
-          <ul class="checks">
-            <li>A higher role outranks the ones below it.</li>
-            <li>Nobody can hand out a permission they don&rsquo;t hold.</li>
-            <li>Owners sit above every role, and the last owner can&rsquo;t be removed.</li>
-          </ul>
-        </div>
-        <a class="ts-frame" href="shots/tiny-roles-1120.webp"><img src="shots/tiny-roles-1120.webp" width="1120" height="700" alt="Server Settings, Roles page. Admin, Moderator and Raid crew are listed by rank above @everyone, with how many people hold each. Moderator is open: its name, a green colour picked from swatches with its hex code, a switch to show it separately in the member list, and permission switches such as View channels, Manage channels and View audit log." loading="lazy" decoding="async"></a>
-      </div>
-
-      <div class="ts-row flip reveal">
-        <div class="ts-copy">
-          <h3>Channels</h3>
-          <p>Create channels and categories and drag them into place. Each channel has a topic, a limit on how many can join, and a bitrate from 16 to 128&nbsp;kb/s.</p>
-          <ul class="checks">
-            <li>Push to talk required, per channel.</li>
-            <li>Per-role overrides: allow, deny or inherit each permission in this channel alone.</li>
-          </ul>
-        </div>
-        <a class="ts-frame" href="shots/tiny-channels-1120.webp"><img src="shots/tiny-channels-1120.webp" width="1120" height="700" alt="Server Settings, Channels page. On the left, the channel tree: Hangout with Lounge and Music room, Games with Raid night and Squad 2, and Away with AFK. Raid night is open: its name, its topic, a user limit of 8, a bitrate slider at 96 kb/s, and switches for Video and Push to talk required." loading="lazy" decoding="async"></a>
-      </div>
-
-      <div class="ts-row reveal">
-        <div class="ts-copy">
-          <h3>Members</h3>
-          <p>Everyone on the server, with their roles, when they joined and when they were last seen. Search by name or email, filter by role, and tick several people to change their roles or remove them together.</p>
-          <ul class="checks">
-            <li>Email shows only to those who manage people.</li>
-            <li>People who came in through a sign-in group are marked.</li>
-          </ul>
-        </div>
-        <a class="ts-frame" href="shots/tiny-members-1120.webp"><img src="shots/tiny-members-1120.webp" width="1120" height="700" alt="Server Settings, Members page: a search field, a role filter, and 11 of 11 people in a table with their roles, when they joined and when they were last seen. Mara Okafor has an owner's crown, Robin Vale is Admin, and Kofi Asante is marked Sign-in group." loading="lazy" decoding="async"></a>
-      </div>
-
-      <div class="ts-row flip reveal">
-        <div class="ts-copy">
-          <h3>Invites</h3>
-          <p>An invite is one code. It holds the server&rsquo;s address, so the person you send it to pastes it into tinyclient and never types an address.</p>
-          <ul class="checks">
-            <li>Choose the roles it gives, a label, how many times it works, and when it expires: 7 days and one use unless you say otherwise.</li>
-            <li>The code is shown once. Revoke any invite still open, or all of them.</li>
-          </ul>
-        </div>
-        <a class="ts-frame" href="shots/tiny-invites-1120.webp"><img src="shots/tiny-invites-1120.webp" width="1120" height="700" alt="Server Settings, Invites page. A note says a code is shown once. Four open invites are listed with a label, who made it, the roles it gives, uses such as 3 / 10, and when it expires, each with Revoke, and Revoke all at the top." loading="lazy" decoding="async"></a>
-      </div>
-    </div>
-
-    <div class="ts-pair reveal">
-      <figure>
-        <a class="ts-frame" href="shots/tiny-invite-1120.webp"><img src="shots/tiny-invite-1120.webp" width="1120" height="700" alt="The Invite people to Night Shift dialog: role chips for Moderator and Raid crew, an optional label, Max uses from 1 to No limit, Expires after from 30 minutes to Never with 7 days picked, and Create invite." loading="lazy" decoding="async"></a>
-        <figcaption class="ts-cap">Making an invite.</figcaption>
+    <p class="platforms">Self-hosted · <a href="https://github.com/itz4blitz/tinyserver">Open source</a>, MIT · Voice, no text&nbsp;chat</p>
+    <div class="ts-board" id="shots">
+      <figure class="ts-shot ts-shot-lead">
+        <a class="ts-frame" href="shots/tiny-server-1120.webp"><img src="shots/tiny-server-1120.webp" width="1120" height="700" alt="The Night Shift server. Channels on the left, who is in voice in the middle, members by role on the right." fetchpriority="high" decoding="async"></a>
+        <figcaption><strong>Home</strong><span>Channels, who&rsquo;s talking, people by&nbsp;role.</span></figcaption>
       </figure>
-      <figure>
-        <a class="ts-frame" href="shots/tiny-invite-code-1120.webp"><img src="shots/tiny-invite-code-1120.webp" width="1120" height="700" alt="The Give them this code dialog: four steps for the other person, from opening tinyclient to continuing in their browser, then the code, starting tc1., with a Copy button, and a note that it works 5 times, for 1 day, and will not be shown again." loading="lazy" decoding="async"></a>
-        <figcaption class="ts-cap">The code, shown once, with the steps for the person who gets it.</figcaption>
+      <figure class="ts-shot">
+        <a class="ts-frame" href="shots/tiny-call-1120.webp"><img src="shots/tiny-call-1120.webp" width="1120" height="700" alt="A voice channel with four people, mute, deafen and leave." loading="lazy" decoding="async"></a>
+        <figcaption><strong>Voice</strong><span>A tile each. Mute, deafen, echo cancellation.</span></figcaption>
+      </figure>
+      <figure class="ts-shot">
+        <a class="ts-frame" href="shots/tiny-e2ee-1120.webp"><img src="shots/tiny-e2ee-1120.webp" width="1120" height="700" alt="The call security panel with a call code and a verified safety number." loading="lazy" decoding="async"></a>
+        <figcaption><strong>Encrypted</strong><span>A call code and safety numbers. The server can&rsquo;t hear&nbsp;it.</span></figcaption>
+      </figure>
+      <figure class="ts-shot">
+        <a class="ts-frame" href="shots/tiny-moderation-1120.webp"><img src="shots/tiny-moderation-1120.webp" width="1120" height="700" alt="The menu on a person: volume, server mute, move, timeout, kick and ban." loading="lazy" decoding="async"></a>
+        <figcaption><strong>Moderation</strong><span>Right-click anyone. Mute, move, time out, kick,&nbsp;ban.</span></figcaption>
+      </figure>
+      <figure class="ts-shot">
+        <a class="ts-frame" href="shots/tiny-roles-1120.webp"><img src="shots/tiny-roles-1120.webp" width="1120" height="700" alt="Server Settings, Roles, with Moderator open and its permissions." loading="lazy" decoding="async"></a>
+        <figcaption><strong>Roles</strong><span>Drag them into order. Switch on what each may&nbsp;do.</span></figcaption>
+      </figure>
+      <figure class="ts-shot">
+        <a class="ts-frame" href="shots/tiny-channels-1120.webp"><img src="shots/tiny-channels-1120.webp" width="1120" height="700" alt="Server Settings, Channels, with Raid night open." loading="lazy" decoding="async"></a>
+        <figcaption><strong>Channels</strong><span>A topic, a limit, a bitrate, push to&nbsp;talk.</span></figcaption>
+      </figure>
+      <figure class="ts-shot">
+        <a class="ts-frame" href="shots/tiny-members-1120.webp"><img src="shots/tiny-members-1120.webp" width="1120" height="700" alt="Server Settings, Members, eleven people with their roles." loading="lazy" decoding="async"></a>
+        <figcaption><strong>Members</strong><span>Roles, when they joined, when they were last&nbsp;seen.</span></figcaption>
+      </figure>
+      <figure class="ts-shot">
+        <a class="ts-frame" href="shots/tiny-invites-1120.webp"><img src="shots/tiny-invites-1120.webp" width="1120" height="700" alt="Server Settings, Invites, four open codes with revoke." loading="lazy" decoding="async"></a>
+        <figcaption><strong>Invites</strong><span>One code. Uses, an expiry, revoke.</span></figcaption>
+      </figure>
+      <figure class="ts-shot">
+        <a class="ts-frame" href="shots/tiny-invite-1120.webp"><img src="shots/tiny-invite-1120.webp" width="1120" height="700" alt="The Invite people dialog, with a role, a label, uses and an expiry." loading="lazy" decoding="async"></a>
+        <figcaption><strong>New invite</strong><span>Role, label, how many uses, when it&nbsp;ends.</span></figcaption>
+      </figure>
+      <figure class="ts-shot">
+        <a class="ts-frame" href="shots/tiny-invite-code-1120.webp"><img src="shots/tiny-invite-code-1120.webp" width="1120" height="700" alt="The invite code, shown once, with a Copy button." loading="lazy" decoding="async"></a>
+        <figcaption><strong>The code</strong><span>Shown once. They paste it into&nbsp;tinyclient.</span></figcaption>
+      </figure>
+      <figure class="ts-shot">
+        <a class="ts-frame" href="shots/tiny-audit-1120.webp"><img src="shots/tiny-audit-1120.webp" width="1120" height="700" alt="Server Settings, Audit log, each change as a sentence." loading="lazy" decoding="async"></a>
+        <figcaption><strong>Audit log</strong><span>Who did what, and&nbsp;why.</span></figcaption>
+      </figure>
+      <figure class="ts-shot">
+        <a class="ts-frame" href="shots/tiny-settings-overview-1120.webp"><img src="shots/tiny-settings-overview-1120.webp" width="1120" height="700" alt="Server Settings, Overview: name, icon, description and welcome." loading="lazy" decoding="async"></a>
+        <figcaption><strong>Overview</strong><span>Name, icon, welcome, where people&nbsp;land.</span></figcaption>
+      </figure>
+      <figure class="ts-shot">
+        <a class="ts-frame" href="shots/tiny-voice-media-1120.webp"><img src="shots/tiny-voice-media-1120.webp" width="1120" height="700" alt="Server Settings, Voice and media: audio is up, port 50000." loading="lazy" decoding="async"></a>
+        <figcaption><strong>Voice &amp; media</strong><span>Whether audio is up, and the one port calls&nbsp;use.</span></figcaption>
+      </figure>
+      <figure class="ts-shot">
+        <a class="ts-frame" href="shots/tiny-join-1120.webp"><img src="shots/tiny-join-1120.webp" width="1120" height="700" alt="Join a server: one field for the invite code." loading="lazy" decoding="async"></a>
+        <figcaption><strong>Join</strong><span>Paste the code. No address to&nbsp;type.</span></figcaption>
+      </figure>
+      <figure class="ts-shot">
+        <a class="ts-frame" href="shots/tiny-browser-signin-1120.webp"><img src="shots/tiny-browser-signin-1120.webp" width="1120" height="700" alt="tinyclient waiting while you sign in with Pocket ID in the browser." loading="lazy" decoding="async"></a>
+        <figcaption><strong>Sign in</strong><span>Pocket ID in the browser. No password in the&nbsp;app.</span></figcaption>
+      </figure>
+      <figure class="ts-shot">
+        <a class="ts-frame" href="shots/tiny-account-720.webp"><img src="shots/tiny-account-720.webp" width="720" height="560" alt="Settings, Accounts: Night Shift, a name, and Sign out everywhere." loading="lazy" decoding="async"></a>
+        <figcaption><strong>Your name</strong><span>Change it, or sign out on every&nbsp;computer.</span></figcaption>
+      </figure>
+      <figure class="ts-shot">
+        <a class="ts-frame" href="shots/tiny-sign-out-everywhere-720.webp"><img src="shots/tiny-sign-out-everywhere-720.webp" width="720" height="560" alt="The question Sign out everywhere, with Cancel and Sign out everywhere." loading="lazy" decoding="async"></a>
+        <figcaption><strong>Sign out</strong><span>It asks before it signs every device&nbsp;out.</span></figcaption>
+      </figure>
+      <figure class="ts-shot">
+        <a class="ts-frame" href="shots/tiny-signin-settings-1120.webp"><img src="shots/tiny-signin-settings-1120.webp" width="1120" height="700" alt="Server Settings, Sign-in: Pocket ID, and who you are on this server." loading="lazy" decoding="async"></a>
+        <figcaption><strong>Sign-in settings</strong><span>Which provider, and who you are&nbsp;here.</span></figcaption>
       </figure>
     </div>
-
-    <div class="ts-rows">
-      <div class="ts-row reveal">
-        <div class="ts-copy">
-          <h3>Audit log</h3>
-          <p>What was done on the server, by whom, and why, in plain sentences. Filter by person and by kind of change, and read back as far as you need.</p>
-          <ul class="checks">
-            <li>Roles, members, invites, bans, timeouts, channels and voice moderation are all written down.</li>
-            <li>A kick, ban or timeout keeps its reason.</li>
-          </ul>
-        </div>
-        <a class="ts-frame" href="shots/tiny-audit-1120.webp"><img src="shots/tiny-audit-1120.webp" width="1120" height="700" alt="Server Settings, Audit log page, filtered by Anyone and Everything. Each entry is a sentence with names, a reason when one was given, and when it happened: Robin Vale timed out Pavel Orlov, Dev Patel server-muted Sam Achterberg, Dev Patel moved Theo Marchetti to Raid night, Robin Vale banned Jonas Weber." loading="lazy" decoding="async"></a>
-      </div>
-
-      <div class="ts-row flip reveal">
-        <div class="ts-copy">
-          <h3>Overview</h3>
-          <p>The name, icon, description and welcome message everyone sees on the home, and where people land: the default channel, and the AFK channel with its timeout.</p>
-        </div>
-        <a class="ts-frame" href="shots/tiny-settings-overview-1120.webp"><img src="shots/tiny-settings-overview-1120.webp" width="1120" height="700" alt="Server Settings, Overview page: the server's icon with Upload image and Remove, the server name Night Shift, a description and a welcome message, each with a count of the characters used." loading="lazy" decoding="async"></a>
-      </div>
-
-      <div class="ts-row reveal">
-        <div class="ts-copy">
-          <h3>Voice &amp; media</h3>
-          <p>Whether the server&rsquo;s audio is up, the address and port calls use, and each channel&rsquo;s limit, bitrate and talk mode, on one page. If people get a seat and hear nothing, it says which port to open.</p>
-        </div>
-        <a class="ts-frame" href="shots/tiny-voice-media-1120.webp"><img src="shots/tiny-voice-media-1120.webp" width="1120" height="700" alt="Server Settings, Voice and media page. Server health reads Audio is up, with the server's address and how many are in voice now. Reaching the server says calls connect on port 50000, over UDP when they can and else over TCP. A table lists each channel's people limit, bitrate and whether it uses voice activity or push to talk." loading="lazy" decoding="async"></a>
-      </div>
-    </div>
-  </div>
-</section>
-
-<section class="section" id="joining" aria-labelledby="joining-title">
-  <div class="wrap">
-    <p class="kicker center reveal">Joining</p>
-    <h2 id="joining-title" class="center reveal">Paste a code, sign in in your&nbsp;browser</h2>
-    <p class="lede center reveal">No password to make. tinyclient opens your browser at the server&rsquo;s sign-in provider, Pocket ID with a passkey unless the owner chose another, and the browser hands tinyclient back a one-time code. tinyclient never sees a&nbsp;password.</p>
-    <div class="ts-pair reveal">
-      <figure>
-        <a class="ts-frame" href="shots/tiny-join-1120.webp"><img src="shots/tiny-join-1120.webp" width="1120" height="700" alt="The Join a server sheet in tinyclient: a code pasted into one field, a link to run your own server with tinyserver, I already have an account, Cancel and Continue." loading="lazy" decoding="async"></a>
-        <figcaption class="ts-cap">Join a server: one field for the code.</figcaption>
-      </figure>
-      <figure>
-        <a class="ts-frame" href="shots/tiny-browser-signin-1120.webp"><img src="shots/tiny-browser-signin-1120.webp" width="1120" height="700" alt="tinyclient waiting for the browser: sign in to nightshift.example in the page that opened, and this moves on by itself when you are done. Open the page again, and Cancel." loading="lazy" decoding="async"></a>
-        <figcaption class="ts-cap">The rest happens in your browser.</figcaption>
-      </figure>
-    </div>
-    <ul class="points reveal">
-      <li class="spot"><span class="pt-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M15 7h3a5 5 0 0 1 0 10h-3M9 17H6A5 5 0 0 1 6 7h3M8 12h8"/></svg></span><strong>One code</strong><span>The invite holds the server, so nobody types an&nbsp;address.</span></li>
-      <li class="spot"><span class="pt-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="8" cy="15" r="4"/><path d="M10.8 12.2 20 3M17 6l3 3M14 9l2 2"/></svg></span><strong>Passkeys</strong><span>New people make their account from the invite, with a&nbsp;passkey.</span></li>
-      <li class="spot"><span class="pt-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg></span><strong>Groups</strong><span>An owner can let a provider&rsquo;s groups in, or make them admins. Never&nbsp;owners.</span></li>
-      <li class="spot"><span class="pt-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="8" rx="2"/><rect x="2" y="13" width="20" height="8" rx="2"/><path d="M6 7h.01M6 17h.01"/></svg></span><strong>Several servers</strong><span>Join as many as you like; each keeps its own&nbsp;sign-in.</span></li>
-    </ul>
-  </div>
-</section>
-
-<section class="section" id="account" aria-labelledby="account-title">
-  <div class="wrap">
-    <p class="kicker center reveal">Your account</p>
-    <h2 id="account-title" class="center reveal">Your name, and every&nbsp;session</h2>
-    <p class="lede center reveal">Settings &rsaquo; Accounts lists each server you joined. Change the name people there see, or sign out on every computer at once. A sign-in lasts 30 days unless the owner sets another&nbsp;length.</p>
-    <div class="ts-pair small reveal">
-      <figure>
-        <a class="ts-frame" href="shots/tiny-account-720.webp"><img src="shots/tiny-account-720.webp" width="720" height="560" alt="Settings, Accounts in tinyclient. Under Tiny server, Night Shift is connected, with a Name row reading Robin Vale and a Change button, and a Sign out everywhere row: every device signed in as you, this one too." loading="lazy" decoding="async"></a>
-        <figcaption class="ts-cap">Name and Sign out everywhere, under the server.</figcaption>
-      </figure>
-      <figure>
-        <a class="ts-frame" href="shots/tiny-sign-out-everywhere-720.webp"><img src="shots/tiny-sign-out-everywhere-720.webp" width="720" height="560" alt="The question Sign out everywhere? Every device signed in to Night Shift as you is signed out, this one too. Sign in again in your browser. Cancel, and Sign out everywhere." loading="lazy" decoding="async"></a>
-        <figcaption class="ts-cap">It asks first.</figcaption>
-      </figure>
-    </div>
-    <div class="ts-rows">
-      <div class="ts-row reveal">
-        <div class="ts-copy">
-          <h3>Sign-in, in Server Settings</h3>
-          <p>Which provider the server signs in through, how many people came in through its groups, and who you are signed in as, with your user ID and Sign out everywhere.</p>
-        </div>
-        <a class="ts-frame" href="shots/tiny-signin-settings-1120.webp"><img src="shots/tiny-signin-settings-1120.webp" width="1120" height="700" alt="Server Settings, Sign-in page. Provider: signs in through Pocket ID, the server nightshift.example, and 2 people joined by sign-in group, with a note that people sign in in their own browser and tinyclient never sees a password. You: Robin Vale, email, member since and user ID with Copy. Sessions: Sign out everywhere." loading="lazy" decoding="async"></a>
-      </div>
-    </div>
-  </div>
-</section>
-
-<section class="section" id="hosting" aria-labelledby="hosting-title">
-  <div class="wrap">
-    <p class="kicker center reveal">Hosting it</p>
-    <h2 id="hosting-title" class="center reveal">One Compose file, one open&nbsp;port</h2>
-    <p class="lede center reveal">tinyserver is written in Rust and runs with Docker Compose on a machine you own. The repository builds the image; there is no hosted&nbsp;version.</p>
-    <div class="ts-host reveal">
-      <div>
-        <h3>What runs</h3>
-        <ul class="ts-stack">
-          <li><strong>tinyserver</strong><span>The API, the live connection each app keeps open, and the voice relay. A read-only container with no added privileges.</span></li>
-          <li><strong>Postgres 17</strong><span>The server&rsquo;s data. Permissions are checked in the database itself.</span></li>
-          <li><strong>Pocket ID</strong><span>Sign-in with passkeys. Any OpenID Connect provider works instead: Authentik, Keycloak, Zitadel, Google.</span></li>
-          <li><strong>Cloudflare Tunnel</strong><span>Carries the web traffic for two hostnames, one for the server and one for sign-in. No web port opens on the host.</span></li>
-          <li><strong>Port 50000</strong><span>UDP and TCP, forwarded on the router, for call audio. The only port published.</span></li>
-        </ul>
-      </div>
-      <div>
-        <h3>Start it</h3>
-<div class="code"><pre><code><span class="c"># in deploy/, with the environment file filled in</span>
-sh pocket-id/setup.sh your-username
-docker compose up -d
-docker compose logs tinyserver | grep -A2 'Owner invite'</code></pre></div>
-        <p>The first start prints an owner invite, good once and for 24 hours. Paste it into tinyclient&rsquo;s <strong>Join a server</strong>: whoever signs in with it owns the server. Lost it? <code>tinyserver bootstrap --owner-invite</code> makes a new one.</p>
-        <p>For calls, set <code>TINYSERVER_PUBLIC_IP</code> to your public address and forward port 50000, UDP and TCP. <code>GET /health</code> should then say <code>"media": "up"</code> with <code>"transports": ["udp", "tcp"]</code>. Without a public address the server runs, but calls have no sound.</p>
-        <p class="more"><a href="https://github.com/itz4blitz/tinyserver/blob/main/deploy/README.md">The full guide →</a></p>
-      </div>
-    </div>
-  </div>
-</section>
-
-<section class="section" id="honest" aria-labelledby="honest-title">
-  <div class="wrap">
-    <p class="kicker center reveal">What the server can see</p>
-    <h2 id="honest-title" class="center reveal">Encrypted calls, and what is still&nbsp;visible</h2>
-    <p class="lede center reveal">End-to-end encryption keeps what is said from the server. It does not hide that a call happened. tinyclient&rsquo;s call panel says the&nbsp;same.</p>
-    <div class="cols reveal">
-      <div>
-        <h3>The server cannot</h3>
-        <ul class="checks">
-          <li><strong>Hear an encrypted call.</strong> It forwards audio it has no key for.</li>
-          <li><strong>Join a call unseen.</strong> Anyone added appears in the call&rsquo;s list, with a safety number.</li>
-          <li><strong>Swap a verified person&rsquo;s key</strong> without tinyclient warning that it changed.</li>
-          <li><strong>Read a password.</strong> It keeps none; signing in is the provider&rsquo;s job.</li>
-        </ul>
-      </div>
-      <div>
-        <h3>The server can see</h3>
-        <ul class="checks never">
-          <li>Who is in which call, and when.</li>
-          <li>Who is speaking and how loudly, for the speaking ring.</li>
-          <li>Roughly how much audio each person sends.</li>
-          <li>Each member&rsquo;s network address. Members see the server&rsquo;s.</li>
-          <li>Who is on the server, their roles, and the audit log.</li>
-        </ul>
-      </div>
-    </div>
-    <p class="fine-note center">Whoever runs the server could also add someone nobody has verified, or turn a call to encrypted-to-the-server by claiming an app can&rsquo;t encrypt. tinyclient shows both. <a href="https://github.com/itz4blitz/tinyserver/blob/main/docs/calls.md#end-to-end-encryption">The threat model →</a></p>
-  </div>
-</section>
-
-<section class="section" id="next" aria-labelledby="next-title">
-  <div class="wrap">
-    <p class="kicker center reveal">Coming next</p>
-    <h2 id="next-title" class="center reveal">Not built&nbsp;yet</h2>
-    <ul class="ts-next reveal">
-      <li><strong>Camera and screen share in tinyclient</strong><span>The server already forwards cameras and screen shares. tinyclient does not send or show them yet, so calls are voice only.</span></li>
-      <li><strong>A relay for closed networks</strong><span>Today the host has to open one port. A relay mode, for a server that can&rsquo;t, comes later.</span></li>
-      <li><strong>Text chat</strong><span>A Tiny server has voice channels and no messages. Chat with the same people on the networks tinyclient already has.</span></li>
-      <li><strong>Hands-on testing</strong><span>Voice keys on macOS and Linux, and real servers on home connections. <a href="https://discord.gg/kJHK7BNvJP">Tell us</a> what breaks.</span></li>
-    </ul>
+    <p class="fine-note center ts-note">Calls are end-to-end encrypted. Camera, screen share and text chat are not in the app yet. <a href="https://github.com/itz4blitz/tinyserver/blob/main/deploy/README.md">How to run a server&nbsp;&rarr;</a></p>
   </div>
 </section>
 
