@@ -144,6 +144,9 @@ pub struct State {
     community: Option<TinyCommunity>,
     error: Option<String>,
     busy: bool,
+    /// The action whose buttons stay quiet until a read started after it returns. Any such read
+    /// will do: a live update's read can overtake the action's own and drop its answer.
+    clears_busy: Option<u64>,
     /// A join or leave is with the server. It has its own quiet.
     call_busy: bool,
     call_epoch: u64,
@@ -232,6 +235,7 @@ impl State {
             community: None,
             error: None,
             busy: false,
+            clears_busy: None,
             call_busy: false,
             call_epoch: 0,
             call_error: None,
@@ -459,7 +463,7 @@ impl Shell {
         })
     }
 
-    /// `clear_busy` is the action whose button stays quiet until this read returns.
+    /// `clear_busy` is the action whose button stays quiet until this read, or a later one, returns.
     fn fetch(&mut self, account: AccountKey, clear_busy: Option<u64>, cx: &mut Context<Self>) {
         let switched = self.tiny_state.account.as_ref() != Some(&account);
         if switched {
@@ -467,6 +471,7 @@ impl Shell {
             self.tiny_state.invite = InviteDraft::default();
             self.tiny_state.action_epoch += 1;
             self.tiny_state.busy = false;
+            self.tiny_state.clears_busy = None;
             self.tiny_state.call_epoch += 1;
             self.tiny_state.call_busy = false;
         }
@@ -475,6 +480,9 @@ impl Shell {
             self.tiny_state.loading = true;
             self.tiny_state.error = None;
         }
+        if clear_busy.is_some() {
+            self.tiny_state.clears_busy = clear_busy;
+        }
         self.tiny_state.load_epoch += 1;
         let epoch = self.tiny_state.load_epoch;
         self.off_thread(cx, move || ask(&Request::TinyCommunity { account }), move |this, answer, cx| {
@@ -482,7 +490,7 @@ impl Shell {
                 return;
             }
             this.tiny_state.loading = false;
-            if let Some(action) = clear_busy {
+            if let Some(action) = this.tiny_state.clears_busy.take() {
                 if this.tiny_state.action_epoch == action {
                     this.tiny_state.busy = false;
                 }
