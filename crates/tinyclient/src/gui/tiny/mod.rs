@@ -438,10 +438,18 @@ impl Shell {
         })
     }
 
-    /// The Tiny call on show, if this server has one up: its room.
-    fn tiny_call(&self) -> Option<&protocol::Call> {
+    /// The Tiny call on show, if this server has one, in whatever state: its room.
+    pub(super) fn tiny_call(&self) -> Option<protocol::Call> {
         let account = self.tiny_state.account.as_ref()?;
-        self.snapshot.as_ref()?.call.as_ref().filter(|call| call.conversation.account() == *account)
+        self.call_shown(self.snapshot.as_ref()?).filter(|call| call.conversation.account() == *account)
+    }
+
+    /// Where a made-up call of `--shot` goes: the room I sit in, else the first.
+    #[cfg(feature = "gui-shot")]
+    pub(super) fn tiny_shot_room(&self) -> Option<Key> {
+        let page = self.tiny_page_facts()?;
+        let room = page.mine.map(str::to_owned).or_else(|| page.community.rooms.first().map(|room| room.id.clone()))?;
+        Some(Key { network: Network::Tiny, account: page.account.account.clone(), id: room })
     }
 
     /// The page, when it has loaded.
@@ -777,6 +785,11 @@ impl Shell {
             return;
         }
         self.tiny_state.applied = call;
+        #[cfg(feature = "gui-shot")]
+        if let Some(stats) = crate::gui::call::shot_stats() {
+            self.tiny_state.stats = Some(stats);
+            return;
+        }
         let (muted, deafened) = std::mem::take(&mut self.tiny_state.preset);
         if muted || deafened {
             self.off_thread(cx, move || ask(&Request::CallSet { muted, deafened }), |_, _, _| {});

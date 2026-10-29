@@ -536,6 +536,13 @@ impl Shell {
 
     /// The call the dock draws: chatd's, else the one that could not even be asked for.
     pub(super) fn call_shown(&self, snapshot: &Snapshot) -> Option<Call> {
+        #[cfg(feature = "gui-shot")]
+        if shot::tiny() {
+            // A made-up Tiny call is in the room I sit in on the server on show.
+            let mut call = shot::call(snapshot)?;
+            call.conversation = self.tiny_shot_room()?;
+            return Some(call);
+        }
         shown(snapshot).or_else(|| self.call_state.local.clone())
     }
 
@@ -749,7 +756,7 @@ impl Shell {
         ensure_daemon();
         let open = snapshot.open.as_ref()?;
         let key = open.key.clone();
-        let mine = shown(snapshot).filter(|call| {
+        let mine = self.call_shown(snapshot).filter(|call| {
             call.conversation == key && !matches!(call.state, CallState::Failed { .. })
         });
         let pill = div()
@@ -857,6 +864,12 @@ impl Shell {
             ),
         }
     }
+}
+
+/// The connection's numbers of a made-up Tiny call, under `--shot`.
+#[cfg(feature = "gui-shot")]
+pub(in crate::gui) fn shot_stats() -> Option<protocol::CallStats> {
+    shot::stats()
 }
 
 /// A ring just arrived. Where the system notification of 07 §4 will be posted from.
