@@ -1,0 +1,51 @@
+[package]
+name = "notifier"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The system's notifications, the screen lock and the taskbar or Dock, behind one small API so
+# chatd's rules are tested against a fake (`Fake`). Pure Rust on every platform, so
+# `cargo check -p notifier --target aarch64-apple-darwin` (or a Linux target) checks the other
+# backends from any machine.
+
+[target.'cfg(windows)'.dependencies]
+# WinRT toasts, the session's lock state and the taskbar. Already in the tree through GPUI.
+windows = { version = "0.62", features = [
+    "Data_Xml_Dom",
+    "Foundation",
+    "Foundation_Collections",
+    "UI_Notifications",
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Com",
+    "Win32_System_Registry",
+    "Win32_System_RemoteDesktop",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# UNUserNotificationCenter, and the Dock tile. All already in the tree through GPUI.
+objc2 = "0.6"
+block2 = "0.6"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString", "NSSet", "NSArray", "NSError", "NSBundle", "NSDictionary", "NSEnumerator"] }
+objc2-user-notifications = { version = "0.3", default-features = false, features = [
+    "std",
+    "block2",
+    "UNNotification",
+    "UNNotificationAction",
+    "UNNotificationCategory",
+    "UNNotificationContent",
+    "UNNotificationRequest",
+    "UNNotificationResponse",
+    "UNNotificationSound",
+    "UNNotificationTrigger",
+    "UNUserNotificationCenter",
+] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSDockTile", "NSResponder"] }
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+# org.freedesktop.Notifications on the session bus. Already in the tree through GPUI.
+zbus = "5"
