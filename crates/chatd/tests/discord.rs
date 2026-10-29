@@ -5,7 +5,7 @@
 use base64::Engine;
 use protocol::{
     read_frame, write_frame, AccountKey, Call, CallState, CallSupport, Change, Conversation, ConversationKind,
-    ErrorCode, Key, Link, MediaKind, MentionKind, Message, MessageKind, Network, Page, Person,
+    ErrorCode, Key, Link, MediaKind, MentionKind, Message, MessageKind, Network, Occupants, Page, Person,
     Presence, ReactionSet, EmojiScope, RelateAction, Relation, Request, Response, SendState, Style, Watching,
 };
 use serde_json::{json, Value};
@@ -1998,6 +1998,31 @@ fn a_stage_arriving_with_a_guild_create_counts_who_is_on_it_at_once() {
         }
     });
     assert_eq!(on_stage, (CallSupport::Handoff, vec![("2001".to_owned(), true)]));
+}
+
+#[test]
+fn a_stage_with_more_than_a_row_of_occupants_keeps_its_speakers_visible() {
+    let world = World::start();
+    world.ask(Request::Watch(Watching { space: Some(world.key("4000")), ..Watching::default() }));
+    // Two speakers whose names sort last, plus an audience whose name sorts first.
+    world.discord.push("VOICE_STATE_UPDATE", json!({"guild_id": "4000", "channel_id": "4202", "user_id": "2001", "session_id": "voice-2001",
+        "self_mute": false, "self_deaf": false, "mute": false, "deaf": false, "suppress": false}));
+    world.discord.push("VOICE_STATE_UPDATE", json!({"guild_id": "4000", "channel_id": "4202", "user_id": "2003", "session_id": "voice-2003",
+        "self_mute": false, "self_deaf": false, "mute": false, "deaf": false, "suppress": false}));
+    world.discord.push("VOICE_STATE_UPDATE", json!({"guild_id": "4000", "channel_id": "4202", "user_id": "2006", "session_id": "voice-2006",
+        "self_mute": false, "self_deaf": true, "mute": false, "deaf": false, "suppress": true,
+        "member": {"user": {"id": "2006", "username": "sam", "global_name": "AAA Early"}, "nick": null, "roles": []}}));
+    let on_stage = wait("the stage's occupants", || {
+        match world.ask(Request::InVoice { network: Some(Network::Discord) }) {
+            Response::Conversations { conversations, .. } => {
+                let row = conversations.iter().find(|row| row.key.id == "4202")?;
+                let occupants = row.occupants.as_ref()?;
+                (occupants.people.iter().filter(|p| p.speaking).count() == 2).then(|| occupants.people.iter().filter(|p| p.speaking).count())
+            }
+            other => panic!("{other:?}"),
+        }
+    });
+    assert_eq!(on_stage, 2);
 }
 
 /// Waits until everything pushed so far has been handled: a marker message sent after it is

@@ -250,7 +250,9 @@ changing again replaces its entry, so the list is bounded (256) by how many thin
 - **Calls**: set `call: Native` only on what tinyclient can carry itself. A stage channel, and
   anything else a listener cannot simply join and speak in, is not `Native`.
 - **Voice occupancy**: `Context::occupants(conversation, people, total)` for every voice channel
-  of a Space on screen, whenever it changes, us included when we are in it.
+  of a Space on screen, whenever it changes, us included when we are in it. An `Occupant`'s
+  `speaking` flag is overloaded: on a Tiny room it is who holds the floor, on a Discord stage
+  it is who is on stage (the audience is not).
 - **Idle**: `serve_commands` blocks on the inbox with no timer, and `Context::pause` is the one
   interruptible wait. No loop of short sleeps: the whole process has a budget of about one idle
   wakeup a second.

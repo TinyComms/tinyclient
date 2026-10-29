@@ -258,8 +258,9 @@ impl Discord {
     }
 
     /// Tells chatd who is in each of `channels`, for those it is to know (see
-    /// [`Voice::watched`]): at most a row's worth of people, friends first then in name order,
-    /// us included, and the true count. A channel that emptied is told once.
+    /// [`Voice::watched`]): at most a row's worth of people, on-stage (live) first then
+    /// friends then in name order, us included, and the true count. A channel that emptied
+    /// is told once.
     fn occupancy(&self, channels: BTreeSet<String>) {
         let mut reports = Vec::new();
         {
@@ -286,8 +287,11 @@ impl Discord {
                     }
                     continue;
                 }
-                // Friends first (`02` §4), then by name, so the cap never hides a friend.
-                there.sort_by_cached_key(|(id, heard)| (state.relations.get(*id) != Some(&Relation::Friend), heard.name.to_lowercase(), (*id).clone()));
+                // On-stage (live) people first, then friends, then by name, so the capped
+                // list never hides a speaker or a friend behind a crowd whose names sort earlier.
+                there.sort_by_cached_key(|(id, heard)| {
+                    (!heard.live, state.relations.get(*id) != Some(&Relation::Friend), heard.name.to_lowercase(), (*id).clone())
+                });
                 let total = there.len() as u32;
                 let people = there.into_iter().take(protocol::OCCUPANTS_LIMIT).map(|(id, heard)| Occupant {
                     person: self.ctx.key(id),
@@ -376,7 +380,7 @@ impl Discord {
                 }
                 let named = voice.member.as_ref().map(|member| member.name().to_owned()).filter(|name| !name.is_empty());
                 let named = named.or_else(|| state.users.get(&voice.user_id).cloned());
-                let me = (voice.user_id == state.me).then(|| "You".to_owned());
+                let me = (voice.user_id == state.me).then_some("You".to_owned());
                 let heard = Heard {
                     guild: voice.guild_id.clone().or_else(|| guild.map(str::to_owned)),
                     channel: channel.clone(),
