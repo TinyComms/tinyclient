@@ -1005,7 +1005,9 @@ impl Shell {
             .and_then(|peer| self.people_state.hub().person(&Key { id: peer.clone(), ..c.key.clone() }))
             .map(|person| person.emoji)
             .filter(|emoji| !emoji.is_empty());
-        let count = occupied.and_then(|inside| voice_count(inside.total, c.limit));
+        // The `4/12` (a user limit) is a native voice channel's treatment; stages are Handoff
+        // and keep their own trailing treatment, so they never get the limited form.
+        let count = occupied.and_then(|inside| voice_count(inside.total, if c.call == CallSupport::Native { c.limit } else { 0 }));
         let draft = (!self.draft_of(c).is_empty() && !selected).then(|| glyph("icons/pencil.svg", 14., theme::text_faint()));
         let (picked, menu_row) = (c.clone(), c.clone());
         let content = div()
