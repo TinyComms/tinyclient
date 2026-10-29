@@ -82,6 +82,8 @@ struct Live {
     /// The room requires push-to-talk (a Tiny room's `ptt_only`, or no voice activation
     /// there), whatever the user chose.
     push_to_talk: bool,
+    /// How mediad last said the call is protected, before whom the user verified is applied.
+    secured: Option<protocol::CallSecurity>,
 }
 
 /// The running mediad and the call it exists for. Dropping it ends the call.
@@ -107,6 +109,8 @@ enum Slot {
 
 /// Told the conversation of a call that just failed.
 type Failed = Box<dyn Fn(&Key) + Send + Sync>;
+/// Told a frame mediad has for the network's socket, and the conversation of its call.
+type Signal = Box<dyn Fn(&Key, String) + Send + Sync>;
 
 /// At most one call, across every network.
 #[derive(Default)]
@@ -114,6 +118,7 @@ pub struct Calls {
     slot: Mutex<Slot>,
     next: AtomicU64,
     failed: Mutex<Option<Failed>>,
+    signal: Mutex<Option<Signal>>,
     /// The mediad started for Settings' microphone test or test sound, outside a call.
     tester: Mutex<Option<Tester>>,
 }
@@ -196,6 +201,7 @@ fn new_call(conversation: Key, state: CallState) -> Live {
         level: None,
         inputs: Vec::new(),
         outputs: Vec::new(),
+        security: None,
     };
     Live {
         call,
@@ -207,6 +213,7 @@ fn new_call(conversation: Key, state: CallState) -> Live {
         metering: false,
         me: String::new(),
         push_to_talk: false,
+        secured: None,
     }
 }
 
@@ -326,7 +333,18 @@ impl Live {
                 self.call.inputs = inputs;
                 self.call.outputs = outputs;
             }
-            MediaResponse::Source { .. } => return false,
+            // Whom the user verified is chatd's to know; a call that is not a Tiny one never
+            // hears this.
+            MediaResponse::TinySecurity(security) => {
+                let account = self.call.conversation.account();
+                self.secured = Some(security.clone());
+                let security = Some(crate::verified::trusted(&account, security));
+                if self.call.security == security {
+                    return false;
+                }
+                self.call.security = security;
+            }
+            MediaResponse::Source { .. } | MediaResponse::TinyE2ee { .. } => return false,
             MediaResponse::Ready { .. }
             | MediaResponse::Streams { .. }
             | MediaResponse::Done
@@ -408,6 +426,12 @@ impl ActiveCall {
             while let Ok(frame) = read_frame::<MediaResponse>(&mut stdout) {
                 if frame.is_reply() {
                     let _ = reply.send(frame);
+                    continue;
+                }
+                // A frame for the server: the adapter of the call's account sends it.
+                if let MediaResponse::TinyE2ee { frame } = frame {
+                    let conversation = crate::hub::lock(&seen).call.conversation.clone();
+                    reader.calls.signal(&conversation, frame);
                     continue;
                 }
                 let mut live = crate::hub::lock(&seen);
@@ -525,6 +549,30 @@ impl Calls {
     /// Who hears of a call that failed: the server, which has the adapter leave on the network.
     pub fn on_failure(&self, told: impl Fn(&Key) + Send + Sync + 'static) {
         *crate::hub::lock(&self.failed) = Some(Box::new(told));
+    }
+
+    /// Who sends what mediad has for a network's socket: the server, through the adapter.
+    pub fn on_signal(&self, told: impl Fn(&Key, String) + Send + Sync + 'static) {
+        *crate::hub::lock(&self.signal) = Some(Box::new(told));
+    }
+
+    fn signal(&self, conversation: &Key, frame: String) {
+        if let Some(told) = &*crate::hub::lock(&self.signal) {
+            told(conversation, frame);
+        }
+    }
+
+    /// The user verified someone, or took it back: the call on `account` shows it at once.
+    pub fn reverify(&self, hub: &Hub, account: &protocol::AccountKey) {
+        let Some(call) = self.describe().0.filter(|call| call.conversation.account() == *account) else {
+            return;
+        };
+        let refreshed = self.update(hub, &call.conversation, |live| {
+            live.call.security = live.secured.clone().map(|security| crate::verified::trusted(account, security));
+        });
+        if refreshed {
+            self.tell(hub);
+        }
     }
 
     /// A call with a mediad just turned into a failure. Drops the mediad, which waits for it to

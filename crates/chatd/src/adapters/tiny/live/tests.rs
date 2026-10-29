@@ -217,7 +217,11 @@ fn rest(mut stream: TcpStream, seen: &Sender<Seen>, media: &str) {
     let (status, body) = if line.starts_with("GET /v1/members ") {
         ("200 OK", members())
     } else if line.starts_with("GET /health ") {
+        // `e2ee` is a server whose audio is up and that encrypts calls end to end.
+        let media = if media == "e2ee" { "up" } else { media };
         ("200 OK", format!(r#"{{"ok":true,"database":"ok","media":"{media}"}}"#))
+    } else if line.starts_with("GET /v1/capabilities ") && media == "e2ee" {
+        ("200 OK", r#"{"version":"0.4.0","features":["server","roles","e2ee_calls"]}"#.to_owned())
     } else if line.starts_with("GET /v1/me ") {
         ("200 OK", format!(r#"{{"user_id":"{ME}","email":"ada@example.com","display_name":"Ada","role":"owner"}}"#))
     } else {
@@ -796,6 +800,65 @@ fn a_join_with_audio_the_server_refuses_says_why_and_stops_mediad() {
     }
 }
 
+/// A TLS `ExternalSender`, as tinyserver sends it in `start`: a P-256 key (not checked until a
+/// proposal is) and a basic credential.
+fn external_sender() -> String {
+    use base64::Engine;
+    let mut sender = vec![0x40, 0x41, 0x04];
+    sender.extend([7u8; 64]);
+    sender.extend([0x00, 0x01, 10]);
+    sender.extend(b"tinyserver");
+    base64::engine::general_purpose::STANDARD.encode(sender)
+}
+
+/// On a server that encrypts calls end to end, the join says so, the server's `call.e2ee`
+/// frames reach mediad in order, what mediad answers reaches the server, and the call says how
+/// it is protected: never end to end before the group has keys, and transport-only, naming who
+/// cannot, when the server turns it off.
+#[test]
+fn an_end_to_end_encrypted_join_carries_mediads_key_package_and_says_how_the_call_is_protected() {
+    with_mediad();
+    let (said, heard) = channel();
+    let fake = fake_with("e2ee", &[], move |_, mut conn| {
+        conn.send(ready(1, &[ME, BEA], json!([{"room_id": ROOM, "participants": [{"user_id": BEA, "e2ee": true}]}])));
+        let join = conn.next(Duration::from_secs(30)).expect("a join");
+        assert_eq!(join["e2ee"], 1, "the join offers end-to-end encryption: {join}");
+        let sdp = join["sdp"].as_str().expect("an offer");
+        conn.send(json!({"type": "call.answer", "ref": join["ref"], "call_id": "c-1", "sdp": answer_for(sdp)}));
+        conn.send(json!({"type": "call.e2ee", "room_id": ROOM, "op": "start", "version": 1, "external_sender": external_sender()}));
+        conn.send(json!({"type": "call.joined", "room_id": ROOM, "user_id": ME, "e2ee": true}));
+        let package = conn.next(Duration::from_secs(10)).expect("mediad's key package");
+        let _ = said.send(package);
+        // Someone without end-to-end encryption joins: the server turns it off for the room.
+        conn.send(json!({"type": "call.joined", "room_id": ROOM, "user_id": "55555555-5555-5555-5555-555555555555", "e2ee": false}));
+        conn.send(json!({"type": "call.e2ee", "room_id": ROOM, "op": "off", "user_ids": ["55555555-5555-5555-5555-555555555555"]}));
+        conn.idle(Duration::from_secs(5));
+    });
+    let running = run(&fake.base, QUICK);
+    // What chatd's server does: mediad's frames for the server go to this account's socket.
+    let socket = running.live.clone();
+    running.hub.calls.on_signal(move |_, frame| socket.ask(Ask::E2ee { frame }));
+    until("connected", || running.link().0 == Link::Connected);
+    until("the health read", || !running.live.seats_only());
+    assert_eq!(running.join_with_audio(ROOM), Ok(()));
+    let package = heard.recv_timeout(Duration::from_secs(15)).expect("the key package reached the server");
+    assert_eq!((package["type"].as_str(), package["op"].as_str()), (Some("call.e2ee"), Some("key_package")), "{package}");
+    assert!(package["data"].as_str().is_some_and(|data| data.len() > 100));
+    let security = || the_call(&running).and_then(|call| call.security);
+    let off = Instant::now() + Duration::from_secs(10);
+    while security().is_none_or(|security| security.mode != protocol::SecurityMode::Transport) {
+        assert!(Instant::now() < off, "the call says it is transport-only: {:?}", security());
+        // Until then it is being set up, and never end to end without a group.
+        assert_ne!(security().map(|security| security.mode), Some(protocol::SecurityMode::EndToEnd));
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let security = security().expect("said");
+    assert_eq!(security.unsupported, ["55555555-5555-5555-5555-555555555555"]);
+    assert!(!security.server_lacks && security.code.is_empty() && security.members.is_empty());
+    assert!(running.hub.calls.end(&running.hub).is_some());
+    running.live.ask(Ask::Hangup { room_id: ROOM.into() });
+}
+
 #[test]
 fn after_a_restart_a_call_with_audio_joins_again_with_a_fresh_offer() {
     with_mediad();
@@ -1098,7 +1161,7 @@ impl Hand {
         let mut hand = Hand { ws, mediad, stdin, frames };
         assert!(matches!(hand.frames.recv_timeout(Duration::from_secs(10)), Ok(protocol::MediaResponse::Ready { .. })));
         let host = tungstenite::http::Uri::try_from(saved.base_url.as_str()).expect("an address").host().unwrap_or("").to_owned();
-        let offer = TinyOffer { user_id: saved.user_id.clone(), host, slots: ROOM_CAP - 1, muted: false, deafened: false };
+        let offer = TinyOffer { user_id: saved.user_id.clone(), host, slots: ROOM_CAP - 1, muted: false, deafened: false, e2ee: None };
         let protocol::MediaResponse::Offer { sdp } = hand.ask(protocol::MediaRequest::TinyOffer(offer)) else {
             panic!("no offer");
         };

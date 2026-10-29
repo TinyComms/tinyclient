@@ -172,6 +172,14 @@ impl Chat {
                 adapter.command(Command::CallLeave(conversation.id.clone()));
             }
         });
+        // What mediad has for a Tiny server's live socket (its end-to-end encryption) goes out
+        // through that account's adapter.
+        let adapters = chat.adapters.clone();
+        chat.hub.calls.on_signal(move |conversation, frame| {
+            if let Some(adapter) = lock(&adapters).get(&conversation.account()) {
+                adapter.command(Command::Tiny(adapters::tiny::live::Ask::E2ee { frame }));
+            }
+        });
         let (searches, adapters) = (chat.searches.clone(), chat.adapters.clone());
         let spawned = std::thread::Builder::new().name("search".into()).stack_size(256 * 1024).spawn(move || searches.run(&adapters));
         if let Err(err) = spawned {
@@ -1799,6 +1807,13 @@ impl Chat {
                 let ids = [room_id.clone(), user_id.clone()];
                 self.tiny_call(&account, "community.calls.kick", &ids, |reply| adapters::tiny::live::Ask::Kick { room_id, user_id, reply })
             }
+            Request::TinyVerify { account, user_id, key, verified } => match crate::verified::set(&account, &user_id, &key, verified) {
+                Ok(()) => {
+                    self.hub.calls.reverify(&self.hub, &account);
+                    Response::Ok
+                }
+                Err(err) => error(ErrorCode::Refused, format!("That key couldn't be remembered: {err}")),
+            },
             Request::TinyInvite { account, role } => adapters::tiny::invite(account, role),
             Request::TinyRole { account, user_id, role } => adapters::tiny::set_role(account, user_id, role),
             Request::TinyRemove { account, user_id } => adapters::tiny::remove(account, user_id),
