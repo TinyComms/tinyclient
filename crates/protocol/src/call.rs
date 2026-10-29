@@ -317,6 +317,26 @@ pub struct CallStats {
     /// As `opus`. Empty when not known.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub codec: String,
+    /// The call's audio health, counted over the whole call rather than the last second, so the
+    /// UI can tell a clean call from one that glitched. Glitches the system reported on the
+    /// microphone or the speaker (a buffer underrun or overrun on the device).
+    #[serde(default)]
+    pub device_glitches: u32,
+    /// Microphone audio dropped because the call fell too far behind it.
+    #[serde(default)]
+    pub capture_overruns: u32,
+    /// 20 ms ticks that found no microphone audio: a hole in what was sent.
+    #[serde(default)]
+    pub capture_gaps: u32,
+    /// The speaker ran dry and had to refill: a gap in what was heard.
+    #[serde(default)]
+    pub playout_underruns: u32,
+    /// Lost frames from others that were made up (packet loss concealment).
+    #[serde(default)]
+    pub concealed_frames: u32,
+    /// Lost frames from others rebuilt from the copy in the next packet (Opus in-band FEC).
+    #[serde(default)]
+    pub fec_recovered: u32,
 }
 
 /// What the user chose for a call's sound. Percentages, 0 to 100.

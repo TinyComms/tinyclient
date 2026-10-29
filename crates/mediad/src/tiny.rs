@@ -34,7 +34,7 @@ use crate::opus::Encoder;
 use crate::permission::{microphone, Microphone};
 use crate::rtp::SILENCE;
 use crate::session::Controls;
-use crate::{out, FRAME, FRAME_SAMPLES};
+use crate::{out, rt, FRAME, FRAME_SAMPLES};
 use mio::net::{TcpStream, UdpSocket};
 use mio::{Events, Interest, Poll, Token};
 use protocol::{CallFailure, CallPath, Cue, MediaResponse, TinyOffer, TinySlot};
@@ -570,6 +570,10 @@ impl Call {
             self.levels = (input, output);
             out::send(&MediaResponse::Levels { input, output });
         }
+        if self.ticks.is_multiple_of(SECOND) {
+            audio.log_glitches();
+            self.meter.troubles = audio.troubles();
+        }
         if self.ticks.is_multiple_of(SECOND) && self.connected {
             let stats = self.meter.second(self.slots.values().map(|slot| slot.stream.counts()));
             self.controls.publish_stats(stats);
@@ -662,6 +666,9 @@ impl Call {
             let jitter = &slot.stream.jitter;
             eprintln!("mediad: slot {mid}: {} lost ({} rebuilt), {} late", jitter.lost, slot.stream.rebuilt, jitter.late);
         }
+        if let Some(audio) = &self.audio {
+            media::sign_off(audio);
+        }
         if let Some(devices) = &mut self.devices {
             devices.stop();
         }
@@ -678,6 +685,9 @@ pub fn run(link: Link, user_id: String, controls: Arc<Controls>) {
             Some(Microphone::Allowed) | None => {}
         }
     }
+    // The tick is woken by the system timer: at 1 ms, not Windows' default 15.6 ms.
+    let _timer = rt::FineTimer::hold();
+    rt::tick_thread();
     let (Some(encoder), Ok(poll)) = (Encoder::voice(), Poll::new()) else {
         eprintln!("mediad: the Opus encoder or the poller could not be made");
         out::fail(CallFailure::Engine, ENGINE);

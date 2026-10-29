@@ -29,6 +29,8 @@ pub mod permission;
 pub mod play;
 pub mod process;
 pub mod probe;
+pub mod ring;
+pub mod rt;
 pub mod rtp;
 pub mod session;
 pub mod stats;

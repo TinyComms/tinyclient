@@ -42,6 +42,11 @@ symphonia = { version = "0.5", default-features = false, features = ["ogg", "mkv
 # echo cancellers is WebRTC's. Pinned: a port moves fast, and a new version must be heard first.
 sonora = "=0.2.0"
 
+[target.'cfg(windows)'.dependencies]
+# MMCSS scheduling for the device callbacks and the call's tick, and the 1 ms system timer a
+# call's 20 ms tick needs (`rt`). Already in the tree through cpal and mio.
+windows-sys = { version = "0.61", features = ["Win32_Media", "Win32_System_Threading", "Win32_Foundation"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 # AVCaptureDevice's microphone authorization, which CoreAudio does not report.
 objc2 = "0.6"

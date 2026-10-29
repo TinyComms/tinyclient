@@ -113,7 +113,7 @@ impl Stream {
 
     /// What the connection meter needs of this voice.
     pub(crate) fn counts(&self) -> Counts {
-        Counts { received: self.jitter.received, lost: self.jitter.lost, jitter_ms: self.arrivals.ms() }
+        Counts { received: self.jitter.received, lost: self.jitter.lost, rebuilt: self.rebuilt, jitter_ms: self.arrivals.ms() }
     }
 
     /// Deafened: nothing is played, and nothing is kept to play later.
@@ -517,6 +517,8 @@ impl Loop {
                 self.meter.probe(self.keepalive);
             }
         }
+        self.setup.audio.log_glitches();
+        self.meter.troubles = self.setup.audio.troubles();
         let stats = self.meter.second(self.streams.values().map(Stream::counts));
         self.setup.controls.publish_stats(stats);
         let users = self.setup.users.lock().unwrap();
@@ -583,7 +585,22 @@ impl Loop {
                 jitter.lost, jitter.late
             );
         }
+        sign_off(&self.setup.audio);
     }
+}
+
+/// The call's audio in one line of the log, at its end: what went wrong on the devices and how
+/// far their clocks were from ours.
+pub(crate) fn sign_off(audio: &Audio) {
+    if !audio.on_devices() {
+        return;
+    }
+    let troubles = audio.troubles();
+    let (mic, speaker) = audio.drift_ppm();
+    eprintln!(
+        "mediad: call audio: {} microphone and {} speaker glitches, {} overruns, {} gaps, {} underruns, {} skips; clocks: microphone {mic:+} ppm, speaker {speaker:+} ppm",
+        troubles.mic_glitches, troubles.speaker_glitches, troubles.overruns, troubles.gaps, troubles.underruns, troubles.skips
+    );
 }
 
 /// Tells chatd which devices the call is using.
@@ -594,6 +611,9 @@ pub(crate) fn announce(audio: &Audio) {
 /// Runs until `setup.stop` is set. Gives the devices back, still open, for the connection that
 /// follows a move to another voice server.
 pub fn run(setup: Setup) -> Audio {
+    // The tick is woken by the system timer: at 1 ms, not Windows' default 15.6 ms.
+    let _timer = crate::rt::FineTimer::hold();
+    crate::rt::tick_thread();
     let Some(encoder) = Encoder::new() else {
         eprintln!("mediad: the Opus encoder could not be created");
         let fatal = FromMedia::Fatal(

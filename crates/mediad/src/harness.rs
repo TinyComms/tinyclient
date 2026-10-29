@@ -216,7 +216,42 @@ mod tests {
         assert_eq!(clicks(&tone, 48_000), 1);
     }
 
+    /// Steady state on the shapes devices come in, on a machine as busy as this one was and with
+    /// clocks far apart: nothing dropped, repeated, spliced or run dry, and a glitch report
+    /// breaks nothing. (Before: up to 7 underruns, 238 spliced places and 3 holes in ten
+    /// minutes, and a reopen of both devices for each glitch report.)
     #[test]
+    fn steady_state_is_clean_whatever_the_devices() {
+        let busy = Spec { timer_ms: 15.625, stall_ms: 30., seconds: 20., xrun_every: Some(0.7), ..Spec::default() };
+        for (name, spec) in [
+            ("48k stereo", Spec { mic_ppm: 300., speaker_ppm: -300., ..busy }),
+            ("44.1k mono mic, 48k speaker", Spec { mic: (44_100, 1), speaker: (48_000, 2), mic_ppm: -300., speaker_ppm: 300., ..busy }),
+            ("44.1k stereo, 5 ms periods", Spec { mic: (44_100, 2), speaker: (44_100, 2), period_ms: 5., ..busy }),
+            ("96k, 1 ms timer", Spec { mic: (96_000, 2), speaker: (96_000, 6), timer_ms: 1., ..busy }),
+        ] {
+            let report = measure(name, spec);
+            assert_eq!((report.capture_gaps, report.capture_clicks, report.broken), (0, 0, 0), "{name}: {report:?}");
+            assert_eq!((report.underruns, report.playout_clicks, report.silence_ms), (0, 0, 0.), "{name}: {report:?}");
+            assert!(report.capture_backlog_ms < 60. && report.playout_backlog_ms < 120., "{name}: {report:?}");
+        }
+    }
+
+    /// Real threads, real time, the call's processing and codecs on the tick: after the first
+    /// second, no overrun, gap, underrun or skip.
+    #[test]
+    fn real_time_with_processing_on_runs_clean() {
+        for (mic, speaker) in [((48_000, 2), (48_000, 2)), ((44_100, 1), (48_000, 2))] {
+            let (warm, end) = realtime(mic, speaker, 4.);
+            println!("{mic:?} {speaker:?}: after warm-up {warm:?}, at the end {end:?}");
+            assert_eq!(end.overruns, warm.overruns, "{end:?}");
+            assert_eq!(end.gaps, warm.gaps, "{end:?}");
+            assert_eq!(end.underruns, warm.underruns, "{end:?}");
+            assert_eq!(end.skips, warm.skips, "{end:?}");
+        }
+    }
+
+    #[test]
+    #[ignore = "ten simulated minutes of each; run for the numbers (--nocapture)"]
     fn measurements() {
         let windows = Spec { timer_ms: 15.625, ..Spec::default() };
         measure("48k, exact timer", Spec::default());
@@ -233,10 +268,103 @@ mod tests {
     }
 }
 
-/// The tick as the system really wakes it: `mio`'s poll with a timeout, as the Tiny call's loop
-/// waits. Gives how late each of `ticks` 20 ms ticks came, in ms, sorted.
-pub fn real_ticks(ticks: usize) -> Vec<f64> {
+
+/// The same path in real time, on threads, under a call's real load: a microphone thread and a
+/// speaker thread at their device's pace, and the tick doing what a call's does (echo
+/// cancellation, noise suppression and automatic gain on, the Opus encoder, a decoder, the
+/// limiter) with the 1 ms timer a call holds. Gives the troubles counted after the first second.
+pub fn realtime(mic: (u32, usize), speaker: (u32, usize), seconds: f64) -> (crate::audio::Troubles, crate::audio::Troubles) {
+    use crate::hear::Limiter;
+    use crate::opus::{Decoder, Encoder, MAX_FRAME};
+    use crate::process::Processor;
+    use protocol::AudioProcessing;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    let _timer = crate::rt::FineTimer::hold();
+    let (mut audio, mut mic_end, mut speaker_end) = Audio::virtual_devices(mic, speaker);
+    let stop = Arc::new(AtomicBool::new(false));
+    let start = Instant::now();
+    // A device thread: every 10 ms of its clock, one period through its callback.
+    let device = |rate: u32, mut period: Box<dyn FnMut() + Send>, stop: Arc<AtomicBool>| {
+        std::thread::spawn(move || {
+            crate::rt::device_thread();
+            let every = Duration::from_secs_f64(f64::from(rate / 100) / f64::from(rate));
+            let mut next = Instant::now() + every;
+            while !stop.load(Ordering::Relaxed) {
+                let now = Instant::now();
+                if now < next {
+                    std::thread::sleep(next - now);
+                    continue;
+                }
+                period();
+                next += every;
+            }
+        })
+    };
+    let mut phase = 0f64;
+    let mic_frames = (mic.0 / 100) as usize;
+    let mut buffer = vec![0f32; mic_frames * mic.1];
+    let mic_thread = device(
+        mic.0,
+        Box::new(move || {
+            for frame in buffer.chunks_exact_mut(mic.1) {
+                frame.fill((phase.sin() * 0.3) as f32);
+                phase = (phase + 220. * std::f64::consts::TAU / f64::from(mic.0)) % std::f64::consts::TAU;
+            }
+            mic_end.deliver(&buffer);
+        }),
+        stop.clone(),
+    );
+    let mut played = vec![0f32; (speaker.0 / 100) as usize * speaker.1];
+    let speaker_thread = device(speaker.0, Box::new(move || speaker_end.render(&mut played)), stop.clone());
+
+    crate::rt::tick_thread();
+    let mut processor = Processor::new();
+    processor.set(Some(AudioProcessing { echo_cancellation: true, noise_suppression: true, auto_gain: true }));
+    let (mut encoder, mut decoder) = (Encoder::voice().unwrap(), Decoder::new().unwrap());
+    let mut limiter = Limiter::default();
+    let mut warm = None;
+    let mut next = Instant::now() + Duration::from_millis(20);
+    while start.elapsed().as_secs_f64() < seconds {
+        let now = Instant::now();
+        if now < next {
+            std::thread::sleep(next - now);
+            continue;
+        }
+        next += Duration::from_millis(20);
+        let mut frame = [0i16; FRAME_SAMPLES];
+        if audio.capture(&mut frame) {
+            processor.capture(&mut frame);
+        }
+        let mut packet = [0u8; 1275];
+        let len = encoder.encode(&frame, &mut packet).unwrap_or(0);
+        let mut pcm = vec![0i16; MAX_FRAME * CHANNELS];
+        let decoded = decoder.decode(Some(&packet[..len.max(1)]), 0, &mut pcm).unwrap_or(0);
+        let mut mix = [0i32; FRAME_SAMPLES];
+        for (sum, &sample) in mix.iter_mut().zip(&pcm[..decoded * CHANNELS]) {
+            *sum = i32::from(sample);
+        }
+        let mut mixed = [0i16; FRAME_SAMPLES];
+        limiter.run(&mix, &mut mixed);
+        audio.play(&mixed);
+        processor.render(&mixed);
+        if warm.is_none() && start.elapsed() > Duration::from_secs(1) {
+            warm = Some(audio.troubles());
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    let _ = (mic_thread.join(), speaker_thread.join());
+    (warm.unwrap_or_default(), audio.troubles())
+}
+
+/// The tick as the system really wakes it: `mio`'s poll with a timeout, as the Tiny call's loop
+/// waits. Gives how late each of `ticks` 20 ms ticks came, in ms, sorted. `fine` holds the 1 ms
+/// timer a call holds.
+pub fn real_ticks(ticks: usize, fine: bool) -> Vec<f64> {
+    use std::time::{Duration, Instant};
+    let _timer = fine.then(crate::rt::FineTimer::hold);
     let mut poll = mio::Poll::new().unwrap();
     let mut events = mio::Events::with_capacity(4);
     let start = Instant::now();
@@ -262,8 +390,10 @@ mod timing {
     #[test]
     #[ignore = "a measurement of this machine, not a check"]
     fn how_late_the_tick_comes() {
-        let late = super::real_ticks(100);
-        let at = |q: f64| late[((late.len() - 1) as f64 * q) as usize];
-        println!("tick lateness ms: median {:.2}, p90 {:.2}, p99 {:.2}, max {:.2}", at(0.5), at(0.9), at(0.99), at(1.));
+        for fine in [false, true] {
+            let late = super::real_ticks(250, fine);
+            let at = |q: f64| late[((late.len() - 1) as f64 * q) as usize];
+            println!("tick lateness ms, 1 ms timer {fine}: median {:.2}, p90 {:.2}, p99 {:.2}, max {:.2}", at(0.5), at(0.9), at(0.99), at(1.));
+        }
     }
 }

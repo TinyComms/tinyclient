@@ -5311,6 +5311,7 @@ dependencies = [
  "symphonia",
  "tungstenite 0.30.0",
  "unsafe-libopus",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
