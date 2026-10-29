@@ -143,6 +143,41 @@ said. Settings › Voice (09 §4) holds the choices; the dock and the participan
   in two minutes before the call fails in words. A server restart already did; a Discord call
   resumes its voice session.
 
+## 7b. Who can hear it (Tiny server calls)
+
+A Tiny server call is end-to-end encrypted when the server can do it (`e2ee_calls`) and everyone
+in the room's call has an app that can (tinyserver's `docs/calls.md`, "End-to-end encryption";
+`SECURITY.md` for the threat model). The dock says which, on the title's second line beside the
+network glyph, and never more than holds (`gui/call/security.rs`):
+
+| `security.mode` | Badge | Means |
+|---|---|---|
+| `end_to_end` | lock, "End-to-end encrypted" | Only the people in the call hold the keys. The SFU forwards what it cannot open. |
+| `pending` | clock, "Setting up encryption…" | The group is being made, or we are alone in it. Our microphone sends nothing meanwhile. |
+| `transport` | faint shield, "Encrypted to the server" | DTLS-SRTP to the server only: it could hear the call. Not alarming; it is what every Tiny call was before. |
+| any member `changed`, one the server does not list, or one person twice | warning, "Check security" | A key changed since it was verified, someone holds the keys who is not in the call, or one name holds two places (another key under it). Comparing the call code does not catch an extra member; the list does. |
+
+The lock and the words "end to end" appear only with `end_to_end`. Clicking the badge opens a
+320 px popover:
+
+- **What the server can and cannot see**, in plain words: who is in the call and when, who is
+  speaking and how loud (the speaking ring), roughly how much audio each person sends, network
+  addresses. It cannot hear what is said. Transport-only says why: who in the call cannot encrypt
+  end to end, or that the server cannot.
+- **The call code**: 30 digits in six groups of five, monospace, from the MLS group's epoch
+  authenticator. Everyone in the call sees the same code; reading it out loud proves everyone is
+  in one group, not split into two the server relays between. It does not show an extra member:
+  the list below does. It changes whenever someone joins or leaves.
+- **Each other member**: their name (someone in the group the server does not list in the call is
+  "Someone the server doesn't list", in the warning color), their 45-digit safety number for
+  your key and theirs (nine groups of five, the same on both sides), and "Mark as verified" or
+  "Unmark" (`TinyVerify`), remembered per server and person. A verified person shows a check; a
+  verified person whose key is now another says so loudly: verify again before trusting the call.
+
+A room can require it: Server settings › Channels › Privacy, "Require end-to-end encryption",
+only on a server with `e2ee_calls` and for someone who may edit the channel. The server then
+refuses apps that cannot; one already in the call stays.
+
 ## 8. Ending and what remains (frames 4, 8, 9)
 
 Leave removes the bar at once. The other side ending shows "Call ended · 12:04" with Dismiss for 4 s. Each DM or group call leaves one **system row** in the conversation: 36 px, a 30 px disc with a 14 px glyph in the avatar column, 13 px `text_soft` text, the clock time, an optional 24 px pill.

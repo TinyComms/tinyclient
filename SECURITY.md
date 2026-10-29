@@ -39,7 +39,9 @@ Only the latest release and `main` receive security fixes.
 - **The local socket and the mediad pipe.** A frame that crashes chatd or mediad, or escapes the
   1 MiB frame limit.
 - **Voice.** Weaknesses in mediad's handling of RTP, transport encryption or DAVE (Discord's
-  end-to-end encryption).
+  end-to-end encryption), and in a Tiny server call's end-to-end encryption: anything that lets
+  the server, or anyone who is not in the call, hear it while the call says "End-to-end
+  encrypted", or that makes the lock claim more than holds.
 - **Signal.** Anything that weakens what Signal's protocol promises, in the adapter or the sealed
   state store (`crates/chatd/src/adapters/signal/vault.rs`).
 - **The release pipeline.** `.github/workflows/` and `packaging/`.
@@ -102,6 +104,27 @@ authorization headers, signed URL parameters and Signal's passwords and keys
 (`crates/protocol/src/crash.rs`). There is no telemetry and no crash upload: "Copy report" in the
 window copies the last entry to your clipboard and nothing more.
 
+**Tiny server calls** are end-to-end encrypted when the server lists `e2ee_calls` and everyone in
+the room's call has an app that can do it (`crates/mediad/src/e2ee.rs`). The apps in the call form
+an MLS group (RFC 9420, ciphersuite `MLS_128_DHKEMP256_AES128GCM_SHA256_P256`, through `davey`,
+the library behind Discord's DAVE); the server is only the group's external sender and delivery
+service: it proposes adding whoever joins and removing whoever leaves and orders the commits,
+but holds no key that opens a frame. Each Opus frame is sealed with the sender's key for the
+current epoch (AES-128-GCM, 8-byte tag), so the SFU forwards ciphertext; the RTP header and the
+RFC 6464 audio level stay in clear for it to route and to show who speaks. Every join and leave
+is a new epoch with new keys. Each account has an identity key (P-256), made on its first call and
+kept in `e2ee/<account>/identity.key` in the data directory (`0600` on Unix); it signs the
+member's MLS credential, which names its user id on the server. Until the group has keys the
+microphone sends nothing, and a frame that arrives in clear during an end-to-end call is dropped.
+
+What you can check: everyone in the call sees the same 30-digit **call code**, derived from the
+group's epoch authenticator; reading it aloud to each other proves you are all in one group,
+and not in two groups the server relays between. Each other member has a 45-digit **safety number** for your key and theirs;
+"Mark as verified" remembers their key (`e2ee/<account>/verified.json`), and a later different
+key for them is shown as changed, loudly. Someone in the group the server does not list in the
+call, or one person holding two places in it, is flagged too: the call code cannot catch an extra
+member, who holds the epoch's keys like everyone else.
+
 **Frames** on the socket and between chatd and mediad are length-prefixed JSON, at most 1 MiB
 either way; larger frames are refused before they are read or written.
 
@@ -123,6 +146,25 @@ Stated plainly so nobody relies on what is not there:
   in the data directory elsewhere.
 - **Signal safety numbers are not shown**, and a contact's new identity key is trusted
   automatically, as presage's own stores do. A key change is not surfaced to you yet.
+- **A Tiny server sees the shape of a call**, end-to-end encrypted or not: who is in it and when,
+  who is speaking and how loud (the audio level is in clear), each frame's size and timing (Opus
+  frames vary with what is said), and every address. It cannot hear the words.
+- **A Tiny server can turn end-to-end encryption off** by saying someone in the room cannot do
+  it, or by ignoring a room's "require end-to-end encryption"; the call then says "Encrypted to
+  the server" and names who it says cannot. Nothing stops a malicious server from doing so; the
+  lock only promises not to hide it.
+- **Unverified people can be impersonated by the server.** As the group's external sender it
+  could add a member of its own, or put its own key under someone's name. A member it adds shows
+  in the call's security panel; a key it swaps is caught by comparing safety numbers or the call
+  code, and is flagged once you marked the real key verified. Until you compare, you trust the
+  server's word for who is who.
+- **Everyone in the call can open everyone's frames**, as in DAVE: sender keys come from the
+  group's shared secret, so a member could forge audio as another member. Frames are not signed.
+- **The identity key is not sealed** in the credential store; it is a file in the data directory,
+  protected by its permissions, like the cache. A key read off the disk lets someone pose as you
+  in later calls until you are verified again.
+- **Video and screen share on a Tiny server are not end-to-end encrypted**: tinyclient does not
+  send them yet, and this release seals only audio.
 - **macOS releases are signed ad hoc**, not with a Developer ID, and not notarized. Check that a
   download came from this repository's Releases page.
 - **The window decodes images** sent by other people (PNG, JPEG, GIF, WebP, BMP through the
