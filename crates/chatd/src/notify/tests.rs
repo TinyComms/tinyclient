@@ -232,7 +232,7 @@ fn a_sound_is_not_repeated_within_ten_seconds_here_or_three_anywhere() {
     let mut notes = Notes::new(Box::new(fake.clone()));
     let verdict = decide(&values, &dm(), &hi, &moment()).unwrap();
     let start = Instant::now();
-    assert_eq!(notes.message(&dm(), &hi, &verdict, start).as_deref(), Some("pebble"));
+    assert_eq!(notes.message(&dm(), &hi, &verdict, start).as_deref(), ours("pebble"));
     assert_eq!(notes.quiet(&dm().key, start + Duration::from_secs(2)), (true, true));
     assert_eq!(notes.quiet(&channel().key, start + Duration::from_secs(4)), (false, false));
     assert_eq!(notes.quiet(&dm().key, start + Duration::from_secs(9)), (true, false));
@@ -368,7 +368,7 @@ fn a_ring_is_posted_once_with_accept_and_decline_and_withdrawn_when_it_stops() {
     let room = key(Network::Discord, "D7");
     let call = ringing(&room, "Ines Varga");
     let verdict = || decide_ring(&Values::default(), &room, &moment());
-    assert_eq!(notes.call(Some(&call), verdict(), "", "Discord").as_deref(), Some("soft_ring"));
+    assert_eq!(notes.call(Some(&call), verdict(), "", "Discord").as_deref(), ours("soft_ring"));
     assert_eq!(notes.call(Some(&call), verdict(), "", "Discord"), None, "the same ring");
     let shown: Vec<Note> = fake.log().shown.values().cloned().collect();
     assert_eq!(shown.len(), 1);
@@ -403,4 +403,9 @@ fn the_bundled_files_are_named_as_the_bundle_carries_them() {
     assert_eq!(sound_file("none"), None);
     let minute = local_minute(NOW);
     assert!(minute < 24 * 60);
+}
+
+/// The sound chatd plays itself: none where the system plays the notification's own (macOS).
+fn ours(sound: &str) -> Option<&str> {
+    (!notifier::SYSTEM_PLAYS_SOUND).then_some(sound)
 }
