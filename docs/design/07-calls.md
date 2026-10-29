@@ -63,7 +63,7 @@ Hover on any rest state: `selected` fill, `text` glyph. Disabled: 40 % opacity, 
 
 **On a Tiny server** the user panel sits under the dock (`10-tiny-server.md` §1) and holds mic, headphones and the voice settings cog, so over the server's own column the dock is the **compact bar**, as Discord's "Voice Connected": card height 54, signal bars (24, they open Call health), a 13/600 line `Voice connected` (`positive`, or the link's `warning`/`danger` when it is fair or poor; `Connecting… 0:03` and `Reconnecting… 0:22 left` in `warning`; `You're muted` in `danger` with a mic-off glyph while §2a holds), under it `Lounge / Night Shift` 11.5 `text_soft` (the move notice in its place for 4 s); the whole is a button to the channel (⌘⇧J); then the security slot and a 36 × 32 Leave. Anywhere else (another network, the Inbox) the same call is the full 96 card, with the signal bars before the avatar stack, so a call is always one glance and one click from Leave wherever I am. The channel's own stage carries a second set of controls, a floating pill of round buttons with Leave, under the people in the call. Volume and Mute for me are per person, in the person menu and a tile's hover.
 
-**Security slot.** The dock's title row, the compact bar and a Tiny channel's top bar (while I am in its call) each leave a 24 × 24 place for the call's security indicator: `Shell::call_security(call, Place, cx)` in `gui/call/security.rs`, `None` until end-to-end encryption fills it.
+**Security slot.** The dock's title row, the compact bar and a Tiny channel's top bar (while I am in its call) each leave a 24 × 24 place for the call's security indicator: `Shell::call_security(call, Place, cx)` in `gui/call/security.rs`. It is the one indicator a call has (§7b), drawn the same in all three, and nothing for a call that says nothing about its protection (every network but a Tiny server).
 
 ### 2a. You're muted
 
@@ -108,7 +108,7 @@ Ringing shows who, an elapsed counter and Cancel, in the dock; the header pill b
 
 ## 7. Device menu (frame 7)
 
-Popover above the devices button, 300 wide, radius 12, 6 px padding, `popover` fill, 1 px border, one shadow. MICROPHONE: radio rows 30 px (14 px radio, `accent` when chosen), "System default *MacBook Pro Microphone*" first. Then a level meter: twelve 4 px segments, 2 px gaps, `positive` when lit, labelled "Input level"; it stays live while muted so the mic can be tested, with "Muted: others can't hear you" as the label. SPEAKER: the same rows, then **Play test sound** and a link, **Call settings…** (defaults live in Settings). A device unplugged mid-call: the call continues on the system default and the sub-line reads "Now using MacBook Pro Microphone" for 4 s.
+Popover above the devices button, 300 wide, radius 12, 6 px padding, `popover` fill, 1 px border, one shadow. A pick here is the user's choice of device: it is Settings' V1 and V2 (09), so it holds on every join and across restarts. MICROPHONE: radio rows 30 px (14 px radio, `accent` when chosen), "Automatic *MacBook Pro Microphone*" and "System default *MacBook Pro Microphone*" first (each naming the device it means now), then the hardware, then virtual devices (Krisp, VB-Cable, Voicemeeter, ...) under "VIRTUAL · only when picked" with a "virtual" tag: Automatic never lands on one. A chosen device that is gone keeps its row as "not connected", and the stand-in says "in use for now". Then a level meter: twelve 4 px segments, 2 px gaps, `positive` when lit, labelled "Speak to test your microphone"; it stays live while muted so the mic can be tested, with "Muted: others can't hear you" as the label. SPEAKER: the same rows and a meter of what is played ("What you hear"), then **Test speakers** and a link, **Call settings…**. What mediad says is not as chosen (`Call::device_notice`: the device is missing, would not start, or is standing in) heads the menu and shows under the call's title for a few seconds: "Studio headset isn't connected. Using MacBook Pro Microphone until it's back." The device is retried with backoff (3 s, doubling to 30 s) and switched back to within about 2 s of its return. A stream that opens and never runs is rebuilt once; still silent, the line stays, turns `warning` with a **Switch device** link, and opens this menu.
 
 ## 7a. Voice controls (TeamSpeak and Mumble's bar)
 
@@ -182,8 +182,9 @@ said. Settings › Voice (09 §4) holds the choices; the dock and the participan
 
 A Tiny server call is end-to-end encrypted when the server can do it (`e2ee_calls`) and everyone
 in the room's call has an app that can (tinyserver's `docs/calls.md`, "End-to-end encryption";
-`SECURITY.md` for the threat model). The dock says which, on the title's second line beside the
-network glyph, and never more than holds (`gui/call/security.rs`):
+`SECURITY.md` for the threat model). The call header's security slot says which (the dock's
+title row, the Tiny column's compact bar and the channel's top bar, each a 24 × 24 button beside
+the call health bars), and never more than holds (`gui/call/security.rs`):
 
 | `security.mode` | Badge | Means |
 |---|---|---|
@@ -193,7 +194,8 @@ network glyph, and never more than holds (`gui/call/security.rs`):
 | any member `changed`, one the server does not list, or one person twice | warning, "Check security" | A key changed since it was verified, someone holds the keys who is not in the call, or one name holds two places (another key under it). Comparing the call code does not catch an extra member; the list does. |
 
 The lock and the words "end to end" appear only with `end_to_end`. Clicking the badge opens a
-320 px popover:
+320 px popover beside the badge clicked: over the dock's card, up from the compact bar, down from
+the top bar:
 
 - **What the server can and cannot see**, in plain words: who is in the call and when, who is
   speaking and how loud (the speaking ring), roughly how much audio each person sends, network
