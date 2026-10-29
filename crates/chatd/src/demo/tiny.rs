@@ -29,6 +29,12 @@ use std::sync::Mutex;
 pub const ME: &str = "tiny-robin";
 const ORIGIN: &str = "https://nightshift.example";
 
+/// `hours` from now, as the server writes a time: what runs out (an invite, a timeout, a ban)
+/// has not, whenever the demo is seeded.
+fn from_now(hours: i64) -> String {
+    protocol::tiny_time(crate::hub::now() + hours * 3_600)
+}
+
 pub fn account() -> AccountKey {
     AccountKey {
         network: Network::Tiny,
@@ -297,7 +303,7 @@ pub fn seed(s: &mut Seeder) -> Fallible<Who> {
             )
         },
         TinyMember {
-            timeout_until: Some("2026-11-04T18:00:00Z".to_owned()),
+            timeout_until: Some(from_now(6 * 24)),
             ..member(
                 PAVEL,
                 "Pavel Orlov",
@@ -478,7 +484,7 @@ pub fn seed(s: &mut Seeder) -> Fallible<Who> {
                 role: "member".into(),
                 created_by: ME.into(),
                 created_by_name: "Robin Vale".into(),
-                expires_at: "2026-11-03T18:00:00Z".into(),
+                expires_at: from_now(5 * 24),
                 label: "For Kofi's brother".into(),
                 max_uses: Some(1),
                 ..TinyInvite::default()
@@ -488,7 +494,7 @@ pub fn seed(s: &mut Seeder) -> Fallible<Who> {
                 role: "member".into(),
                 created_by: OWNER.into(),
                 created_by_name: "Mara Okafor".into(),
-                expires_at: "2026-11-30T18:00:00Z".into(),
+                expires_at: from_now(32 * 24),
                 label: "Raid recruits".into(),
                 max_uses: Some(10),
                 uses: 3,
@@ -500,7 +506,7 @@ pub fn seed(s: &mut Seeder) -> Fallible<Who> {
                 role: "member".into(),
                 created_by: LEILA.into(),
                 created_by_name: "Leila Haddad".into(),
-                expires_at: "2026-10-29T02:00:00Z".into(),
+                expires_at: from_now(11),
                 label: "Friday music night".into(),
                 max_uses: Some(25),
                 uses: 7,
@@ -510,7 +516,7 @@ pub fn seed(s: &mut Seeder) -> Fallible<Who> {
             TinyInvite {
                 id: "inv-setup".into(),
                 role: "owner".into(),
-                expires_at: "2026-11-09T18:00:00Z".into(),
+                expires_at: from_now(11 * 24),
                 label: "Owner".into(),
                 max_uses: Some(1),
                 ..TinyInvite::default()
@@ -572,10 +578,10 @@ pub fn seed(s: &mut Seeder) -> Fallible<Who> {
                 banned_by: Some(ME.into()),
                 banned_by_name: "Robin Vale".into(),
                 created_at: "2026-10-25T23:40:00Z".into(),
-                expires_at: Some("2026-11-01T23:40:00Z".into()),
+                expires_at: Some(from_now(3 * 24)),
             },
         ],
-        provider: "Tinyauth".to_owned(),
+        provider: "Pocket ID".to_owned(),
     };
     *PAGE.lock().unwrap() = Some(community);
     Ok(me)
@@ -1302,7 +1308,7 @@ fn code(role: &str) -> Response {
             id: "inv-demo".to_owned(),
             token: "Nf3kQ8xLw2pZ7rT1".to_owned(),
             role: role.to_owned(),
-            expires_at: "2026-11-04T18:00:00Z".to_owned(),
+            expires_at: from_now(7 * 24),
             origin: ORIGIN.to_owned(),
         },
     }
