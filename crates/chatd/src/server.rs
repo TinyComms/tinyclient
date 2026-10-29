@@ -335,6 +335,7 @@ impl Chat {
             | settings::ECHO_CANCELLATION
             | settings::NOISE_SUPPRESSION
             | settings::AUTO_GAIN => self.hub.calls.retune(&self.hub),
+            settings::INPUT | settings::OUTPUT => self.hub.calls.redevice(&self.hub),
             _ => {}
         }
         Response::Ok
@@ -348,6 +349,7 @@ impl Chat {
         self.blobs.cap_changed();
         self.hub.prune_soon();
         self.hub.calls.retune(&self.hub);
+        self.hub.calls.redevice(&self.hub);
         Response::Ok
     }
 

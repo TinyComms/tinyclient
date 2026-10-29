@@ -20,7 +20,7 @@ use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::Aes256Gcm;
 use chacha20poly1305::XChaCha20Poly1305;
 use mediad::opus::{Decoder, Encoder, MAX_FRAME};
-use protocol::{read_frame, write_frame, CallFailure, CallPath, Cue, Dave, MediaRequest, MediaResponse, Network, Tuning, VoiceJoin};
+use protocol::{read_frame, write_frame, AudioDevice, CallFailure, CallPath, Cue, Dave, MediaRequest, MediaResponse, Network, Tuning, VoiceJoin};
 use serde_json::{json, Value};
 use native_tls::{Identity, TlsAcceptor, TlsStream};
 use std::io::{ErrorKind, Read, Write};
@@ -682,7 +682,7 @@ fn the_handshake_completes_and_the_tone_arrives_as_opus_over_aes_gcm() {
 
     assert_eq!(mediad.connected(), (OUR_SSRC, 0));
     let devices = mediad.event("Devices", |e| matches!(e, MediaResponse::Devices { .. }));
-    assert_eq!(devices, MediaResponse::Devices { input: "tone".into(), output: "null".into() });
+    assert_eq!(devices, stand_ins());
     mediad.speaking(ME, true);
 
     // Our SSRC is announced, then speaking is told to the gateway.
@@ -1223,7 +1223,7 @@ fn a_call_that_moves_to_another_voice_server_keeps_its_devices_and_goes_on() {
 
     assert_eq!(mediad.hang_up().0.code(), Some(0));
     // Each connection says which devices it uses; they are the same ones throughout.
-    let same = MediaResponse::Devices { input: "tone".into(), output: "null".into() };
+    let same = stand_ins();
     assert!(mediad.seen.iter().all(|e| !matches!(e, MediaResponse::Failed { .. })), "{:?}", mediad.seen);
     assert!(mediad.seen.iter().filter(|e| matches!(e, MediaResponse::Devices { .. })).all(|e| *e == same));
     // One sink file for the whole call: what was heard before the move is still in it.
@@ -1304,12 +1304,18 @@ fn a_move_before_the_first_join_finished_is_followed() {
 
 // ---- devices, the meter, our own voice ----
 
+/// The devices a call with `TINYCLIENT_MEDIAD_AUDIO=tone` says it uses: as chosen, all running.
+fn stand_ins() -> MediaResponse {
+    MediaResponse::Devices { input: "tone".into(), output: "null".into(), input_id: "tone".into(), output_id: "null".into(), notice: None, stuck: false }
+}
+
 #[test]
 fn devices_are_listed_at_start_and_the_meter_runs_only_while_asked_for() {
     let mut fake = Fake::new();
     let mut mediad = Mediad::start("tone", None);
     // Before any join: the device menu can be opened while a call still rings.
-    let listed = MediaResponse::DeviceList { inputs: vec!["tone".into()], outputs: vec!["null".into()] };
+    let stand_in = |name: &str| AudioDevice { id: name.into(), name: name.into(), default: true, auto: true, ..AudioDevice::default() };
+    let listed = MediaResponse::DeviceList { inputs: vec![stand_in("tone")], outputs: vec![stand_in("null")] };
     mediad.event("DeviceList", |e| *e == listed);
     mediad.join(&fake.endpoint(), NO_DAVE);
     let mut peer = fake.accept();

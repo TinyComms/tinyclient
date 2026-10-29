@@ -24,6 +24,7 @@ pub mod media;
 pub mod opus;
 pub mod out;
 pub mod permission;
+pub mod pick;
 pub mod play;
 pub mod process;
 pub mod probe;

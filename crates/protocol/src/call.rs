@@ -93,6 +93,26 @@ pub struct Participant {
     pub priority: bool,
 }
 
+/// One microphone or speaker the system lists.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AudioDevice {
+    /// The system's id for it: a WASAPI endpoint id, a CoreAudio UID, an ALSA name. What a
+    /// choice (`settings::DeviceChoice`) finds it by first.
+    pub id: String,
+    /// As the system names it, which on Windows includes the driver in brackets.
+    pub name: String,
+    /// Software, not hardware (Krisp, VB-Cable, Voicemeeter, NVIDIA Broadcast, ...): never
+    /// used unless picked.
+    #[serde(default, rename = "virtual", skip_serializing_if = "is_false")]
+    pub is_virtual: bool,
+    /// The system default now.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub default: bool,
+    /// What a call uses when nothing was chosen (`DeviceChoice::Auto`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub auto: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Call {
     pub conversation: Key,
@@ -109,6 +129,18 @@ pub struct Call {
     pub input: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub output: String,
+    /// The system's ids for them (`AudioDevice::id`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub input_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub output_id: String,
+    /// In words, why a device in use is not the one chosen, or that one is not working: shown
+    /// until it is put right. `None` while everything is as chosen and running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_notice: Option<String>,
+    /// A device stays silent after it was rebuilt: the notice asks the user to switch device.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub device_stuck: bool,
     /// False until mediad links a real media engine. The lifecycle runs either way.
     pub engine_linked: bool,
     pub video: Vec<VideoStream>,
@@ -120,12 +152,15 @@ pub struct Call {
     /// nobody is adjusting sends no changes for it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub level: Option<u8>,
+    /// The level of what our speaker plays, 0 to 100, on the same terms as `level`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_level: Option<u8>,
     /// Every microphone and speaker the system lists, at most [`DEVICES_LIMIT`] of each. Empty
     /// until mediad says.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub inputs: Vec<String>,
+    pub inputs: Vec<AudioDevice>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub outputs: Vec<String>,
+    pub outputs: Vec<AudioDevice>,
 }
 
 /// What Discord's end-to-end encryption needs from mediad.
@@ -201,7 +236,8 @@ pub enum MediaRequest {
     Meter { on: bool },
     /// Muted: capture nothing and send nothing. Deafened: play nothing.
     Audio { muted: bool, deafened: bool },
-    /// Device names as the system lists them. `None` follows the system default.
+    /// The microphone and speaker to use, as V1 and V2 store them (`settings::DeviceChoice`):
+    /// `None` is the automatic choice. Sent at start and whenever either setting changes.
     Devices { input: Option<String>, output: Option<String> },
     /// Gains, the speech gate and which cues play (Settings › Sounds and Audio & video). Sent
     /// at start and whenever one changes.
@@ -393,11 +429,26 @@ pub enum MediaResponse {
     /// Our microphone's level and the mix being played, 0 to 100. At most ten a second, only
     /// while they change, and only while `Meter` is on.
     Levels { input: u8, output: u8 },
-    /// The devices in use, at start and whenever the system moves them.
-    Devices { input: String, output: String },
-    /// Every device the system lists, by the names `MediaRequest::Devices` takes. Sent at start,
-    /// when `Meter` turns on, and whenever one is plugged in or removed.
-    DeviceList { inputs: Vec<String>, outputs: Vec<String> },
+    /// The devices in use, at start and whenever they change: a pick, a device coming or going,
+    /// the system default moving, a device that broke and was opened again.
+    Devices {
+        input: String,
+        output: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        input_id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        output_id: String,
+        /// In words: a device in use that stands in for the one chosen, or one that is not
+        /// working. `None` when all is as chosen.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        notice: Option<String>,
+        /// A device stayed silent after it was rebuilt: the user should switch device.
+        #[serde(default, skip_serializing_if = "is_false")]
+        stuck: bool,
+    },
+    /// Every device the system lists. Sent at start, when `Meter` turns on, and whenever one is
+    /// plugged in or removed, or the default moves.
+    DeviceList { inputs: Vec<AudioDevice>, outputs: Vec<AudioDevice> },
     /// Media stopped and mediad is reconnecting on its own.
     Interrupted,
     /// The call cannot go on. mediad exits after sending this.

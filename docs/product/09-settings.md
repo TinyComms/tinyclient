@@ -194,8 +194,8 @@ no control.
 
 | # | Setting | Type | Default | Scope | Home | What it changes | Rel |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| V1 | Microphone | Menu: "System default (name)" then devices | System default | G | d | chatd sends it to mediad right after `Join`. Shown by name; a missing device falls back to the default and the menu says "(not connected)" | v1 |
-| V2 | Speaker | Menu, as V1 | System default | G | d | As V1, for output. Also where S12 plays | v1 |
+| V1 | Microphone | Menu: "Automatic (name)", "System default (name)", hardware, then virtual devices marked "(virtual)" | Automatic | G | d | The same choice as the call's device menu, stored by name and the system's id (WASAPI endpoint id, CoreAudio UID). chatd sends it to mediad at start and whenever it changes, mid-call too. Automatic is the system default unless that is a virtual device (Krisp, VB-Cable, Voicemeeter, NVIDIA Broadcast, Steam Streaming), then a headset or speakers; System default follows the system live. A missing or failing device is stood in for, said in words, and switched back to when it returns; the menu says "(not connected)" | v1 |
+| V2 | Speaker | Menu, as V1 | Automatic | G | d | As V1, for output. Also where S12 plays | v1 |
 | V3 | Test microphone | Button, "Test" / "Stop" (a toggle, design 09 §4) | | | | While on, the 20-segment meter is live, for at most 30 s. Outside a call, mediad starts for it (`mediad test`) and exits within 3 s of Stop | v1 |
 | V4 | Join calls with my microphone muted | Switch | Off | G | d | On: every join and every Accept starts muted, and the dock shows it | v1 |
 | V5 | Call volume | Slider 0 to 100 % | 100 % | G | d | Gain on everyone's voice in mediad's mix. 100 % is today's level | v1 |
@@ -485,8 +485,10 @@ notification delivered by the system, read with `log stream --predicate 'subsyst
 - P4: 7 days: rows older than 7 days are gone within 1 min (`sqlite3` count is 0).
 
 **Audio & video**
-- V1, V2: set a device, start a call: `status` names it; unplug it: the call moves to the
-  default, the menu says "(not connected)", the setting is unchanged.
+- V1, V2: set a device, start a call: `status` names it; unplug it: the call moves to a
+  stand-in (never a virtual device), the dock and menu say so, the setting is unchanged; plug it
+  back in: the call moves back within 2 s. Pick a device in the call's menu, leave, quit,
+  rejoin: the call uses it.
 - V3: outside a call, hold: the meter moves; release: no mediad within 3 s.
 - V4: on, join: mediad sends no audio packets until unmuted; the dock shows muted.
 - V5: at 50 %, a tone from the peer plays at −6 dB ±1 dB relative to 100 %.

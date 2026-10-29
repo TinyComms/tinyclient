@@ -4,6 +4,7 @@
 //! device happens on another thread. The tick only swaps in a device that is already open.
 
 use crate::audio::{level, open_fresh, route_moved, Audio, AudioError, Fresh, Retired};
+use crate::pick::{Backoff, Verdict, Watch};
 use crate::cue::Playing;
 use crate::hear::{self, Ear};
 use crate::process::Processor;
@@ -584,9 +585,17 @@ impl Loop {
     }
 }
 
-/// Tells chatd which devices the call is using.
+/// Tells chatd which devices the call is using, and what is not as chosen.
 pub(crate) fn announce(audio: &Audio) {
-    out::send(&MediaResponse::Devices { input: audio.input.clone(), output: audio.output.clone() });
+    let (notice, stuck) = audio.notice();
+    out::send(&MediaResponse::Devices {
+        input: audio.input.name.clone(),
+        output: audio.output.name.clone(),
+        input_id: audio.input.id.clone(),
+        output_id: audio.output.id.clone(),
+        notice,
+        stuck,
+    });
 }
 
 /// Runs until `setup.stop` is set. Gives the devices back, still open, for the connection that
@@ -621,18 +630,33 @@ pub fn run(setup: Setup) -> Audio {
 }
 
 /// The devices of a running call: reopened away from the 20 ms thread when the user picks
-/// another, when one breaks or the system default moves, and when the microphone is allowed.
+/// another, when one breaks, when the device a choice means changes (the chosen one came back,
+/// the system default moved), when one opened and never ran, and when the microphone is allowed.
+/// Only the side that needs it is reopened: a microphone glitch does not stop the speaker.
 pub(crate) struct Devices {
     desk: DeviceDesk,
-    /// Housekeeping asked for a reopen. The tick posts it; it does not open anything itself.
-    reopen_wanted: bool,
+    /// Sides housekeeping asked to reopen. The tick posts it; it does not open anything itself.
+    reopen_wanted: (bool, bool),
+    /// Of those, the sides reopened because they never ran: a second time is reported instead.
+    rebuild: (bool, bool),
+    /// A rebuild asked for and not yet installed: the side is not judged meanwhile.
+    rebuilding: (bool, bool),
     /// The system has not yet been asked about the microphone: watch for the answer.
     microphone_unasked: bool,
+    /// Whether each stream runs, checked a moment after it opens. Set on the first tick.
+    watch: Option<[Watch; 2]>,
 }
 
 impl Devices {
     pub(crate) fn start(microphone_unasked: bool) -> Devices {
-        Devices { desk: DeviceDesk::start(), reopen_wanted: false, microphone_unasked }
+        Devices {
+            desk: DeviceDesk::start(),
+            reopen_wanted: (false, false),
+            rebuild: (false, false),
+            rebuilding: (false, false),
+            microphone_unasked,
+            watch: None,
+        }
     }
 
     pub(crate) fn stop(&mut self) {
@@ -653,71 +677,155 @@ impl Devices {
                 // hearing silence, so the devices are opened afresh.
                 self.microphone_unasked = false;
                 eprintln!("mediad: microphone access was granted");
-                self.reopen_wanted = true;
+                self.reopen_wanted = (true, true);
                 Ok(())
             }
         }
     }
 
+    /// Judges each stream from its count: the microphone's frames, the speaker's callbacks.
+    /// A side not expected to run (a paused microphone, a side this call does not open) is
+    /// left alone. Gives what to do about each.
+    fn judge(&mut self, now: Instant, counts: (u64, u64), running: (bool, bool)) -> [Verdict; 2] {
+        let watch = self.watch.get_or_insert_with(|| [Watch::new(now, counts.0), Watch::new(now, counts.1)]);
+        let mut verdicts = [Verdict::Fine; 2];
+        for (side, (count, running, rebuilding)) in [(counts.0, running.0, self.rebuilding.0), (counts.1, running.1, self.rebuilding.1)].into_iter().enumerate() {
+            if !running {
+                watch[side].idle(now, count);
+            } else if !rebuilding {
+                verdicts[side] = watch[side].check(now, count);
+            }
+        }
+        verdicts
+    }
+
+    /// Sides just opened are watched afresh; a rebuild is remembered, so failing again is
+    /// reported rather than rebuilt forever.
+    fn rewatch(&mut self, now: Instant, counts: (u64, u64), sides: (bool, bool), rebuild: (bool, bool)) {
+        let Some(watch) = &mut self.watch else {
+            return;
+        };
+        if sides.0 {
+            watch[0].reopened(now, counts.0, rebuild.0);
+            self.rebuilding.0 = false;
+        }
+        if sides.1 {
+            watch[1].reopened(now, counts.1, rebuild.1);
+            self.rebuilding.1 = false;
+        }
+    }
+
+    /// The self-check: a stream that opened without error and does not run is rebuilt once,
+    /// then the user is told and asked to switch device. True when what the user is told changed.
+    fn self_check(&mut self, audio: &mut Audio) -> bool {
+        let sides = audio.sides();
+        let running = (sides.0 && audio.mic_running(), sides.1);
+        let verdicts = self.judge(Instant::now(), audio.counts(), running);
+        let mut told = false;
+        for (side, verdict) in verdicts.into_iter().enumerate() {
+            let stuck = if side == 0 { &mut audio.stuck.0 } else { &mut audio.stuck.1 };
+            match verdict {
+                Verdict::Rebuild => {
+                    let name = if side == 0 { &audio.input.name } else { &audio.output.name };
+                    eprintln!("mediad: {name:?} opened and is not running; opening it again");
+                    if side == 0 {
+                        (self.reopen_wanted.0, self.rebuild.0, self.rebuilding.0) = (true, true, true);
+                    } else {
+                        (self.reopen_wanted.1, self.rebuild.1, self.rebuilding.1) = (true, true, true);
+                    }
+                }
+                Verdict::Stuck if !*stuck => {
+                    *stuck = true;
+                    told = true;
+                }
+                Verdict::Fine if *stuck && self.watch.as_ref().is_some_and(|w| w[side].proven()) => {
+                    *stuck = false;
+                    told = true;
+                }
+                _ => {}
+            }
+        }
+        told
+    }
+
     /// Takes a finished reopen, if one is ready, and posts the next one. Never opens a device
     /// itself: that work is already running, or is posted here and finishes on a later tick.
     pub(crate) fn service(&mut self, audio: &mut Audio, controls: &Controls, ticks: u64) -> Result<(), (CallFailure, String)> {
-        let desk = &mut self.desk;
         loop {
-            let note = match desk.notes.try_recv() {
+            let note = match self.desk.notes.try_recv() {
                 Ok(note) => note,
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return Err((CallFailure::Engine, "The call engine could not start. Try again.".to_owned())),
             };
-            desk.busy = false;
+            self.desk.busy = false;
             match note {
-                Note::Fresh { fresh, fell_back } => {
-                    if fell_back {
-                        audio.want_input = None;
-                        audio.want_output = None;
-                    }
+                Note::Fresh { fresh, rebuild } => {
+                    let sides = fresh.sides();
                     let retired = audio.install(fresh);
-                    let _ = desk.orders.send(Order::Retire(retired));
+                    let _ = self.desk.orders.send(Order::Retire(retired));
+                    self.rewatch(Instant::now(), audio.counts(), sides, rebuild);
                     announce(audio);
                 }
                 Note::Same => announce(audio),
                 Note::Quiet => {}
-                Note::Failed(err) => return Err(failure(err)),
-            }
-            if let Some(ask) = desk.queued.take() {
-                let _ = desk.orders.send(Order::Open(ask));
-                desk.busy = true;
+                Note::Failed { err, fatal, backoff } => {
+                    audio.backoff = backoff;
+                    if fatal {
+                        return Err(failure(err));
+                    }
+                    // What was asked for would not open and nothing stood in: the devices in
+                    // use carry on, and the one asked for is tried again on a later check.
+                    let (side, words) = match err {
+                        AudioError::NoMicrophone | AudioError::Microphone(_) => (0, format!("The microphone you chose didn't start. Still using {}.", audio.input.name)),
+                        AudioError::NoSpeaker | AudioError::Speaker(_) => (1, format!("The speaker you chose didn't start. Still using {}.", audio.output.name)),
+                    };
+                    eprintln!("mediad: {words}");
+                    if side == 0 {
+                        audio.input.notice = Some(words);
+                    } else {
+                        audio.output.notice = Some(words);
+                    }
+                    announce(audio);
+                }
             }
         }
-        if desk.busy {
+        if self.desk.busy {
             return Ok(());
         }
         let chosen = controls.devices.lock().unwrap().take();
         if let Some((input, output)) = chosen {
+            // Picking the same device again is how a stuck one is tried once more.
+            self.reopen_wanted.0 |= input != audio.want_input || audio.stuck.0;
+            self.reopen_wanted.1 |= output != audio.want_output || audio.stuck.1;
             audio.want_input = input;
             audio.want_output = output;
-            self.reopen_wanted = true;
         }
-        if audio.device_broken() {
-            self.reopen_wanted = true;
+        let broken = audio.device_broken();
+        self.reopen_wanted.0 |= broken.0;
+        self.reopen_wanted.1 |= broken.1;
+        if audio.on_devices() && self.self_check(audio) {
+            announce(audio);
         }
         let poll_route = ticks.is_multiple_of(SECOND) && audio.on_devices();
-        if self.reopen_wanted || poll_route {
+        if self.reopen_wanted.0 || self.reopen_wanted.1 || poll_route {
             let ask = OpenAsk {
                 want_input: audio.want_input.clone(),
                 want_output: audio.want_output.clone(),
-                current_input: audio.input.clone(),
-                current_output: audio.output.clone(),
+                current_input: audio.input.id.clone(),
+                current_output: audio.output.id.clone(),
                 sides: audio.sides(),
-                broken: audio.device_broken(),
+                broken,
                 force: self.reopen_wanted,
+                rebuild: self.rebuild,
                 mic_running: audio.mic_running(),
                 simulated: !audio.on_devices(),
                 pause: Duration::ZERO,
+                backoff: audio.backoff.clone(),
             };
-            self.reopen_wanted = false;
-            let _ = desk.orders.send(Order::Open(ask));
-            desk.busy = true;
+            self.reopen_wanted = (false, false);
+            self.rebuild = (false, false);
+            let _ = self.desk.orders.send(Order::Open(ask));
+            self.desk.busy = true;
         }
         Ok(())
     }
@@ -733,67 +841,71 @@ enum Order {
 struct OpenAsk {
     want_input: Option<String>,
     want_output: Option<String>,
+    /// The ids of the devices open now.
     current_input: String,
     current_output: String,
     sides: (bool, bool),
-    broken: bool,
-    /// The user picked a device, the callback reported a failure, or permission was just granted.
-    force: bool,
+    broken: (bool, bool),
+    /// Sides to open whatever the route says: the user picked a device, the callback reported a
+    /// failure, the stream never ran, or permission was just granted.
+    force: (bool, bool),
+    /// Of those, the sides reopened because they never ran.
+    rebuild: (bool, bool),
     mic_running: bool,
     simulated: bool,
     /// Test-only wait before the open, so the caller can show the tick is not inside it.
     pause: Duration,
+    backoff: Backoff,
 }
 
 enum Note {
     Fresh {
         fresh: Fresh,
-        fell_back: bool,
+        rebuild: (bool, bool),
     },
     /// Stand-in devices: nothing was opened, and the call should say which names it is using.
     Same,
     /// The route was checked and it has not moved.
     Quiet,
-    Failed(AudioError),
+    /// Nothing would open. Fatal when the side it was for is broken: the call has no device left.
+    Failed {
+        err: AudioError,
+        fatal: bool,
+        backoff: Backoff,
+    },
 }
 
 fn satisfy(ask: OpenAsk) -> Note {
     if !ask.pause.is_zero() {
         thread::sleep(ask.pause);
     }
+    let forced = ask.force.0 || ask.force.1;
     if ask.simulated {
-        return if ask.force { Note::Same } else { Note::Quiet };
+        return if forced { Note::Same } else { Note::Quiet };
     }
-    let moved = ask.broken
-        || route_moved(
-            &ask.want_input,
-            &ask.current_input,
-            &ask.want_output,
-            &ask.current_output,
-            ask.sides,
-        );
-    if !ask.force && !moved {
+    let moved = route_moved(
+        (ask.want_input.as_deref(), ask.want_output.as_deref()),
+        (&ask.current_input, &ask.current_output),
+        ask.sides,
+        &ask.backoff,
+    );
+    let which = (
+        ask.sides.0 && (ask.force.0 || ask.broken.0 || moved.0),
+        ask.sides.1 && (ask.force.1 || ask.broken.1 || moved.1),
+    );
+    if !which.0 && !which.1 {
         return Note::Quiet;
     }
-    match open_fresh(
-        ask.want_input.as_deref(),
-        ask.want_output.as_deref(),
-        ask.sides,
-        ask.mic_running,
-    ) {
-        Ok(fresh) => Note::Fresh {
-            fresh,
-            fell_back: false,
-        },
+    let mut backoff = ask.backoff;
+    match open_fresh(ask.want_input.as_deref(), ask.want_output.as_deref(), which, ask.mic_running, &mut backoff) {
+        Ok(fresh) => {
+            let keep = (ask.force.0 || ask.broken.0, ask.force.1 || ask.broken.1);
+            let fresh = fresh.unless_same((&ask.current_input, &ask.current_output), keep);
+            Note::Fresh { fresh, rebuild: ask.rebuild }
+        }
         Err(err) => {
-            eprintln!("mediad: {err:?}; falling back to the system default devices");
-            match open_fresh(None, None, ask.sides, ask.mic_running) {
-                Ok(fresh) => Note::Fresh {
-                    fresh,
-                    fell_back: true,
-                },
-                Err(err) => Note::Failed(err),
-            }
+            let fatal = (which.0 && ask.broken.0) || (which.1 && ask.broken.1);
+            Note::Failed { err, fatal, backoff }
         }
     }
 }
@@ -802,7 +914,6 @@ struct DeviceDesk {
     orders: mpsc::Sender<Order>,
     notes: mpsc::Receiver<Note>,
     busy: bool,
-    queued: Option<OpenAsk>,
     join: Option<thread::JoinHandle<()>>,
 }
 
@@ -828,7 +939,6 @@ impl DeviceDesk {
             orders: orders_tx,
             notes: notes_rx,
             busy: false,
-            queued: None,
             join: Some(join),
         }
     }
@@ -850,6 +960,7 @@ impl Drop for DeviceDesk {
 #[cfg(test)]
 mod device_tests {
     use super::*;
+    use crate::pick::GRACE;
 
     #[test]
     fn reopening_a_device_does_not_block_the_caller() {
@@ -862,11 +973,13 @@ mod device_tests {
                 current_input: String::new(),
                 current_output: String::new(),
                 sides: (true, true),
-                broken: false,
-                force: true,
+                broken: (false, false),
+                force: (true, true),
+                rebuild: (false, false),
                 mic_running: true,
                 simulated: true,
                 pause: Duration::from_millis(200),
+                backoff: Backoff::default(),
             }))
             .unwrap();
         assert!(desk.notes.try_recv().is_err(), "the open has not finished");
@@ -880,5 +993,38 @@ mod device_tests {
             .expect("the open finished");
         assert!(matches!(note, Note::Same));
         drop(desk);
+    }
+
+    #[test]
+    fn a_speaker_that_opens_and_never_plays_is_rebuilt_once_then_reported() {
+        let mut devices = Devices::start(false);
+        let start = Instant::now();
+        // The microphone delivers; the speaker's callback never runs.
+        assert_eq!(devices.judge(start, (0, 0), (true, true)), [Verdict::Fine; 2]);
+        let late = start + GRACE;
+        assert_eq!(devices.judge(late, (960, 0), (true, true)), [Verdict::Fine, Verdict::Rebuild]);
+        // The rebuild is asked for; while it is under way the speaker is not judged again.
+        devices.rebuilding.1 = true;
+        assert_eq!(devices.judge(late + GRACE, (1920, 0), (true, true)), [Verdict::Fine; 2]);
+        // Installed, watched afresh as a rebuild: silent again means stuck, not another rebuild.
+        let rebuilt = late + GRACE;
+        devices.rewatch(rebuilt, (1920, 0), (false, true), (false, true));
+        assert!(!devices.rebuilding.1);
+        assert_eq!(devices.judge(rebuilt + GRACE, (2880, 0), (true, true)), [Verdict::Fine, Verdict::Stuck]);
+        // It starts after all.
+        assert_eq!(devices.judge(rebuilt + GRACE * 2, (3840, 4), (true, true)), [Verdict::Fine; 2]);
+    }
+
+    #[test]
+    fn a_muted_microphone_is_never_counted_as_broken() {
+        let mut devices = Devices::start(false);
+        let start = Instant::now();
+        devices.judge(start, (0, 0), (false, true));
+        // Muted for a long time: paused on purpose, so no frames, and no verdict.
+        assert_eq!(devices.judge(start + GRACE * 10, (0, 500), (false, true)), [Verdict::Fine; 2]);
+        // Unmuted: it has its grace time from now.
+        let unmuted = start + GRACE * 10;
+        assert_eq!(devices.judge(unmuted + GRACE / 2, (0, 600), (true, true)), [Verdict::Fine; 2]);
+        assert_eq!(devices.judge(unmuted + GRACE * 2, (0, 700), (true, true))[0], Verdict::Rebuild);
     }
 }
