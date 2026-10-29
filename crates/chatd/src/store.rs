@@ -619,7 +619,7 @@ fn conversation_from(row: &Row) -> rusqlite::Result<Conversation> {
         preview_mine: row.get(43)?,
         seen: row.get(44)?,
         quiet: row.get(45)?,
-        delivered: row.get(48)?,
+        delivered: row.get(46)?,
         sending: row.get(47)?,
     })
 }
