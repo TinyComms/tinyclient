@@ -687,6 +687,15 @@ fn a_public_username_resolves_a_person_outside_contacts_and_global_search_result
     let search = calls.iter().position(|call| call == "contacts.Search @forest_wren").unwrap();
     let resolve = calls.iter().position(|call| call == "ResolveUsername forest_wren").unwrap();
     assert!(search < resolve);
+    assert_eq!(calls.iter().filter(|call| *call == "contacts.Search @forest_wren").count(), 1);
+    // Cache lookup strips the explicit lookup marker, matching both handles and names.
+    for query in ["@rob", "@forest_wren"] {
+        let Response::People { people, total } = world.ask(Request::People {
+            network: Some(Network::Telegram), relation: None, query: Some(query.into()), offset: 0, limit: 20,
+        }) else { panic!("no people response") };
+        assert_eq!(total, 1);
+        assert_eq!(people[0].key.id, "u7011");
+    }
     let Response::Conversation { conversation } = world.ask(Request::StartDirect { person: person.key }) else { panic!("no direct chat") };
     assert_eq!(conversation.key.id, "u7011");
 }

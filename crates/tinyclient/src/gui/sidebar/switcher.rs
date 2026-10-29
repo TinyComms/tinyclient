@@ -155,6 +155,12 @@ fn narrowed(query: &str) -> (Option<Network>, &str) {
     (None, typed)
 }
 
+/// Only a search narrowed to Telegram carries an explicit username lookup request.
+fn people_query(query: &str) -> (Option<Network>, &str) {
+    let (network, name) = narrowed(query);
+    (network, if network == Some(Network::Telegram) { name.trim_start_matches('#') } else { name.trim_start_matches(['#', '@']) })
+}
+
 fn conversation_hit(c: &Rc<Conversation>, matched: Vec<Range<usize>>, section: Option<&'static str>) -> Hit {
     Hit { title: c.title.clone(), context: context(c), matched, target: Target::Conversation(c.clone()), section, trailing: None }
 }
@@ -428,9 +434,8 @@ impl Shell {
         if name.chars().count() < SEARCH_MIN_CHARS || query.starts_with('#') {
             return;
         }
-        let network = narrowed(&query).0;
-        // Keep an explicit @ for networks that resolve complete usernames separately.
-        let name = narrowed(&query).1.to_owned();
+        let (network, name) = people_query(&query);
+        let name = name.to_owned();
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(PAUSE).await;
             let _ = this.update(cx, |this, cx| {
@@ -470,8 +475,8 @@ impl Shell {
         }
         switcher.asking.retain(|n| *n != network);
         let query = switcher.input.read(cx).text().trim().to_owned();
-        let (narrow, name) = narrowed(&query);
-        let (name, asked) = (name.trim_start_matches(['#', '@']).to_owned(), switcher.people_asked);
+        let (narrow, name) = people_query(&query);
+        let (name, asked) = (name.to_owned(), switcher.people_asked);
         self.ask_people(name, narrow, asked, cx);
     }
 
@@ -712,6 +717,20 @@ mod tests {
 
     fn person(id: &str) -> Person {
         Person { relation: Relation::Friend, ..Person::new(key(id), id) }
+    }
+
+    #[test]
+    fn people_filter_searches_cached_names_and_only_telegram_keeps_the_prefix() {
+        let mut robin = person("robin");
+        robin.name = "Robin Vale".into();
+        robin.handle = "@forest_wren".into();
+        for query in ["@rob", "discord @rob", "slack @rob", "teams @rob"] {
+            assert_eq!(people_query(query).1, "rob");
+        }
+        assert_eq!(people_query("telegram @forest_wren"), (Some(Network::Telegram), "@forest_wren"));
+        let found = hits("@rob", &[], &[], &[robin], &[], false, 100);
+        assert_eq!(titles(&found), ["[People] Robin Vale"]);
+        assert!(!found[0].matched.is_empty());
     }
 
     #[test]
