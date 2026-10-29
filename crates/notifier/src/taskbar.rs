@@ -12,10 +12,10 @@ pub fn badge_words(count: u32) -> Option<String> {
 }
 
 #[cfg(windows)]
-pub use self::windows::{badge, flash};
+pub use self::windows::{badge, flash, raise};
 
 #[cfg(target_os = "macos")]
-pub use self::macos::{badge, flash};
+pub use self::macos::{badge, flash, raise};
 
 #[cfg(windows)]
 mod windows {
@@ -31,8 +31,8 @@ mod windows {
     use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED};
     use windows::Win32::UI::Shell::{ITaskbarList3, TaskbarList};
     use windows::Win32::UI::WindowsAndMessaging::{
-        CreateIconIndirect, DestroyIcon, EnumWindows, FlashWindowEx, GetWindow, GetWindowThreadProcessId, IsWindowVisible, FLASHWINFO,
-        FLASHW_TIMERNOFG, FLASHW_TRAY, GW_OWNER, HICON, ICONINFO,
+        CreateIconIndirect, DestroyIcon, EnumWindows, FlashWindowEx, GetWindow, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
+        SetForegroundWindow, ShowWindow, FLASHWINFO, FLASHW_TIMERNOFG, FLASHW_TRAY, GW_OWNER, HICON, ICONINFO, SW_RESTORE,
     };
 
     /// The overlay is drawn at 32 px and scaled by the taskbar; 16 is what it shows at 100 %.
@@ -63,6 +63,20 @@ mod windows {
         // SAFETY: the callback only writes `found`, which outlives the call.
         let _ = unsafe { EnumWindows(Some(each), LPARAM(&mut found as *mut Option<HWND> as isize)) };
         found
+    }
+
+    /// Brings the window to the front, restored if it was minimised. Windows lets it only when
+    /// the process that the user clicked (chatd, for a notification) allowed it first
+    /// ([`crate::allow_foreground`]).
+    pub fn raise() {
+        let Some(window) = own_window() else { return };
+        // SAFETY: plain calls on our own window.
+        unsafe {
+            if IsIconic(window).as_bool() {
+                let _ = ShowWindow(window, SW_RESTORE);
+            }
+            let _ = SetForegroundWindow(window);
+        }
     }
 
     /// Flashes the taskbar button until the window comes to the front.
@@ -174,6 +188,13 @@ mod macos {
     use objc2::MainThreadMarker;
     use objc2_app_kit::{NSApplication, NSRequestUserAttentionType};
     use objc2_foundation::NSString;
+
+    /// The app comes forward. GPUI's `activate` does it too; this is for symmetry.
+    pub fn raise() {
+        let Some(main) = MainThreadMarker::new() else { return };
+        #[allow(deprecated)]
+        NSApplication::sharedApplication(main).activateIgnoringOtherApps(true);
+    }
 
     /// Bounces the Dock icon once, if the app is not active.
     pub fn flash() {

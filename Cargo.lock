@@ -1120,6 +1120,7 @@ dependencies = [
  "keyring",
  "libc",
  "miniz_oxide 0.8.9",
+ "notifier",
  "p256",
  "presage",
  "protocol",

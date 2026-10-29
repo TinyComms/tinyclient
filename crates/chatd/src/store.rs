@@ -666,6 +666,11 @@ fn message_from(row: &Row) -> rusqlite::Result<Message> {
 }
 
 /// The row's second line: the text, or what was attached, in words.
+/// A message in a few words, as a row's preview or a notification shows it.
+pub fn preview_text(message: &Message) -> String {
+    preview_of(message)
+}
+
 fn preview_of(message: &Message) -> String {
     if !message.text.is_empty() {
         return message.text.chars().take(120).collect();

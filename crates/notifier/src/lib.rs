@@ -128,6 +128,13 @@ pub fn system(app: &App, tell: Tell) -> Box<dyn Sink> {
     }
 }
 
+/// Lets another process (the window, raised for a clicked notification) take the foreground,
+/// which Windows allows only to the process the user just acted in. Nothing elsewhere.
+pub fn allow_foreground() {
+    #[cfg(windows)]
+    windows::allow_foreground();
+}
+
 /// Whether the session's screen is locked now. False where it cannot be told.
 pub fn screen_locked() -> bool {
     #[cfg(windows)]

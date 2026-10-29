@@ -76,6 +76,11 @@ pub fn register(app: &App, replace: bool) -> Result<(), String> {
     Ok(())
 }
 
+pub fn allow_foreground() {
+    // SAFETY: a plain call.
+    let _ = unsafe { windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(windows::Win32::UI::WindowsAndMessaging::ASFW_ANY) };
+}
+
 /// Whether this session's screen is locked, as Terminal Services reports it.
 pub fn locked() -> bool {
     let mut buffer = windows::core::PWSTR::null();
