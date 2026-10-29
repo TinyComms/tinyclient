@@ -92,16 +92,24 @@ pub fn build(messages: &[Rc<Message>], build: &Build) -> Vec<Item> {
         None if build.older => items.push(Item::Older),
         None => items.push(Item::Start),
     }
+    // Slack's reply page includes the parent. It is already the root row, so it is not a reply.
+    let root_id = build.root.as_ref().map(|(root, _)| root.id.as_str());
+    let replies: Vec<&Rc<Message>> = messages.iter().filter(|message| root_id != Some(message.id.as_str())).collect();
     // The divider goes above the first message after the marker, and only if someone else
-    // wrote something there.
+    // wrote something there. The marker may be the parent, which is not among the replies.
     let first_new = build
         .last_read
         .and_then(|read| messages.iter().position(|message| message.id == read))
-        .map(|read| read + 1)
-        .filter(|first| messages[*first..].iter().any(|message| !message.outgoing));
+        .and_then(|read| {
+            messages[read + 1..]
+                .iter()
+                .find(|message| root_id != Some(message.id.as_str()))
+                .and_then(|next| replies.iter().position(|message| message.id == next.id))
+        })
+        .filter(|first| replies[*first..].iter().any(|message| !message.outgoing));
 
-    for (ix, message) in messages.iter().enumerate() {
-        let before = ix.checked_sub(1).map(|ix| &messages[ix]);
+    for (ix, message) in replies.iter().copied().enumerate() {
+        let before = ix.checked_sub(1).map(|prev| replies[prev]);
         let new = first_new == Some(ix);
         let new_day = match before {
             Some(before) => !(build.same_day)(before.sent, message.sent),
@@ -252,6 +260,25 @@ mod tests {
             same_day: utc_day,
         });
         assert_eq!(shape(&items), "R#Hc");
+    }
+
+    #[test]
+    fn a_thread_does_not_repeat_its_root_among_the_replies() {
+        let t = 10 * DAY;
+        let root = said("r", "Mara", t);
+        let replies = [root.clone(), said("1", "Dev", t + 5)];
+        let items = build(&replies, &Build { last_read: None, older: false, root: Some((root.clone(), 0)), same_day: utc_day });
+        assert_eq!(shape(&items), "R#H");
+
+        // The parent is not a reply, so the first reply stays a head even from the same person,
+        // and the ones after it still group.
+        let grouped = [root.clone(), said("1", "Mara", t + 5), said("2", "Mara", t + 6)];
+        let items = build(&grouped, &Build { last_read: None, older: false, root: Some((root.clone(), 2)), same_day: utc_day });
+        assert_eq!(shape(&items), "R#Hc");
+
+        // Read up through the parent: the new line stays above the replies.
+        let items = build(&grouped, &Build { last_read: Some("r"), older: false, root: Some((root, 2)), same_day: utc_day });
+        assert_eq!(shape(&items), "R#NHc");
     }
 
     #[test]
