@@ -11,7 +11,7 @@
 //! on the demo's server instead: `tiny_joined`, `tiny_connecting`, `tiny_reconnecting`,
 //! `tiny_joined_muted`, `tiny_muted_talking` (muted, and the meter hears speech),
 //! `tiny_joined_speaking`, `tiny_poor` (a bad link), `tiny_failed_kicked`, `tiny_failed_lost`,
-//! `tiny_failed_banned`.
+//! `tiny_failed_banned`, `tiny_ptt` (push to talk, key up) and `tiny_ptt_talking` (key held).
 
 use super::{now, Confirm, Ended, Menu, Subject};
 use crate::gui::state::Snapshot;
@@ -31,6 +31,20 @@ fn named() -> Option<String> {
 /// The made-up call is in a Tiny room: the shell puts it in the one I sit in.
 pub(super) fn tiny() -> bool {
     asked().is_some_and(|name| name.starts_with("tiny_"))
+}
+
+/// Push to talk is on, and whether its key is held: `ptt` and `ptt_talking`.
+pub(super) fn ptt() -> Option<bool> {
+    match named()?.as_str() {
+        "ptt" => Some(false),
+        "ptt_talking" => Some(true),
+        _ => None,
+    }
+}
+
+/// I am talking into a muted microphone.
+pub(super) fn muted_talking() -> bool {
+    named().is_some_and(|name| name == "muted_talking")
 }
 
 /// The connection's numbers for a made-up Tiny call: a good link, or with `tiny_poor` a bad
@@ -136,7 +150,7 @@ pub(super) fn call(snapshot: &Snapshot) -> Option<Call> {
     let menu = name == "devices_menu";
     let listed = |names: &[&str]| if menu { names.iter().map(|name| (*name).to_owned()).collect() } else { Vec::new() };
     Some(Call {
-        speaking: matches!(name.as_str(), "joined_speaking" | "devices_menu" | "people_menu"),
+        speaking: matches!(name.as_str(), "joined_speaking" | "devices_menu" | "people_menu" | "ptt_talking"),
         level: (menu || name == "muted_talking").then_some(62),
         inputs: listed(&["MacBook Pro Microphone", "Studio headset", "Desk camera microphone"]),
         outputs: listed(&["MacBook Pro Speakers", "Studio headset"]),

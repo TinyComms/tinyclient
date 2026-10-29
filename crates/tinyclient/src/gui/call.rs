@@ -7,8 +7,10 @@
 
 mod devices;
 mod dock;
+pub(in crate::gui) mod health;
 mod people;
 mod permission;
+pub(in crate::gui) mod security;
 #[cfg(feature = "gui-shot")]
 mod shot;
 
@@ -24,6 +26,7 @@ use gpui::{
     div, prelude::*, px, Action, AnyElement, App, Context, Div, Entity, FontWeight, Global, KeyBinding,
     MouseButton, Rgba, Stateful, Svg, Task, WeakEntity, Window,
 };
+use protocol::settings::MUTED_TALK;
 use protocol::{
     Call, CallFailure, CallState, CallSupport, Change, ConversationKind, Key, MediaFile, Network,
     Occupants, Request, Response,
@@ -91,8 +94,12 @@ pub(super) enum Menu {
 #[derive(Clone, PartialEq, Eq)]
 enum Counting {
     Ring,
+    Connect,
     Joined,
+    /// Counts down: what is left before a Tiny call's reconnect is given up.
     Reconnect,
+    /// Counts up: how long another network's call has been reconnecting.
+    Recover,
 }
 
 /// The one number in the dock that moves: how long the call has rung, run or been reconnecting.
@@ -109,13 +116,14 @@ pub(super) struct Counter {
 }
 
 impl Counter {
-    /// Says what to count. A ring and a reconnect count from when the shell first saw them.
-    fn follow(&mut self, what: Option<(Counting, Key)>, joined: i64, cx: &mut Context<Self>) {
+    /// Says what to count. A ring, a join and a reconnect count from `since`, when the shell
+    /// first saw that state, so every counter of one call says the same.
+    fn follow(&mut self, what: Option<(Counting, Key)>, joined: i64, since: i64, cx: &mut Context<Self>) {
         if self.what != what {
             let from_join = matches!(what, Some((Counting::Joined, _))) && joined > 0;
             // The fabricated calls of `--shot` also give a ring a start, to draw `0:12`.
             let from_join = from_join || (cfg!(feature = "gui-shot") && joined > 0);
-            self.base = if from_join { joined } else { now() };
+            self.base = if from_join { joined } else { since };
             self.what = what;
             cx.notify();
         }
@@ -145,9 +153,13 @@ impl Render for Counter {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         self.seen = true;
         let seconds = (now() - self.base).max(0);
-        let words = match seconds / 3600 {
+        let clock = |seconds: i64| match seconds / 3600 {
             0 => format!("{}:{:02}", seconds / 60, seconds % 60),
             hours => format!("{hours}:{:02}:{:02}", seconds / 60 % 60, seconds % 60),
+        };
+        let words = match &self.what {
+            Some((Counting::Reconnect, _)) => format!("{} left", clock(health::reconnect_left(seconds))),
+            _ => clock(seconds),
         };
         div().flex_none().child(words)
     }
@@ -155,6 +167,23 @@ impl Render for Counter {
 
 /// How long "Call ended" and "Now using ..." stay.
 const BRIEFLY: Duration = Duration::from_secs(4);
+/// A room change this soon after a join was asked for here is that join, not a move.
+const MOVE_ASKED: Duration = Duration::from_secs(10);
+/// How often the meter is asked for again while muted, should something have turned it off.
+const METER_AGAIN: Duration = Duration::from_secs(2);
+/// The call went from one room of a Tiny server to another of the same server.
+fn moved(from: &Key, to: &Key) -> bool {
+    from != to && from.network == Network::Tiny && to.network == Network::Tiny && from.account == to.account
+}
+
+/// Turns the call's microphone meter on or off. Nothing is shown if it is refused.
+fn meter(on: bool, cx: &mut Context<Shell>) {
+    cx.background_executor()
+        .spawn(async move {
+            let _ = ask(&Request::Media(protocol::MediaRequest::Meter { on }));
+        })
+        .detach();
+}
 
 /// A call that was up, as it was when last heard of: what "Call ended" is written from.
 struct Was {
@@ -189,6 +218,18 @@ pub(super) struct Confirm {
 pub struct State {
     /// Made the first time the dock is drawn.
     counter: OnceCell<Entity<Counter>>,
+    /// The same count, for a Tiny channel's stage: a second text, ticking on its own.
+    stage_counter: OnceCell<Entity<Counter>>,
+    /// Talking while muted: what the meter heard, and the redraw that takes the pill away.
+    muted_talk: health::MutedTalk,
+    muted_talk_task: Option<Task<()>>,
+    /// The meter was turned on here to hear talking while muted (not by the device menu), and
+    /// when it was last asked for.
+    metering: Option<Instant>,
+    /// When a call or join was last asked for here.
+    asked: Option<Instant>,
+    /// The call whose joining was chimed: a move or a reconnect does not chime it again.
+    cued: Option<Key>,
     menu: Option<Menu>,
     /// When a click outside closed the menu, so the same click on its button does not reopen it.
     menu_closed: Option<Instant>,
@@ -202,6 +243,8 @@ pub struct State {
     error: Option<String>,
     /// The call and state `error` is about; it goes when either changes.
     last: Option<(Key, Discriminant<CallState>)>,
+    /// Unix seconds `last` began: where a ring, a connect or a reconnect counts from.
+    since: i64,
     was: Option<Was>,
     /// Leaving was asked for here, so the call going away is not the other side ending it.
     leaving: bool,
@@ -246,8 +289,8 @@ impl Subject {
         }
         // A Tiny room is no conversation: its name is on the server's page.
         if key.network == Network::Tiny {
-            if let Some(room) = shell.tiny_room(key) {
-                return Subject { title: room, kind: ConversationKind::Voice, avatar: None, space: None };
+            if let Some((room, server)) = shell.tiny_room(key) {
+                return Subject { title: room, kind: ConversationKind::Voice, avatar: None, space: Some(server) };
             }
         }
         // Not on the first page of the Inbox and not open: say who, from the call itself.
@@ -409,6 +452,7 @@ impl Shell {
         let last = call.as_ref().map(|call| (call.conversation.clone(), discriminant(&call.state)));
         if self.call_state.last != last {
             self.call_state.last = last;
+            self.call_state.since = now();
             self.call_state.error = None;
         }
         match call {
@@ -421,6 +465,10 @@ impl Shell {
                 state.mute_before_deafen = None;
                 state.confirm = None;
                 state.notice = None;
+                state.muted_talk = health::MutedTalk::default();
+                state.muted_talk_task = None;
+                state.metering = None;
+                state.cued = None;
                 // A call that was up and went without our asking: the other side ended it.
                 let was = state.was.take();
                 if let Some(was) = was.filter(|_| !std::mem::take(&mut state.leaving)) {
@@ -451,6 +499,8 @@ impl Shell {
                 if matches!(call.state, CallState::RingingIn { .. }) {
                     incoming(call);
                 }
+                self.call_watch_muted_talk(call, cx);
+                self.call_cue_join(call, cx);
                 if !in_call(call) {
                     // Ringing, connecting or failed: not a call that can end.
                     self.call_state.was = None;
@@ -460,6 +510,7 @@ impl Shell {
                 let Some(subject) = subject else {
                     return;
                 };
+                self.call_note_moved(call, &subject, cx);
                 let before = self.call_state.was.take().filter(|was| was.conversation == call.conversation);
                 // The system moved us to another microphone (the headset was unplugged): said
                 // for a few seconds, unless it is the device picked here a moment ago.
@@ -493,6 +544,135 @@ impl Shell {
             });
         }));
         cx.notify();
+    }
+
+    /// A Tiny server moved the call to another room without my asking: said where to, as a
+    /// toast that is seen whatever is on screen, and for a few seconds in the dock.
+    fn call_note_moved(&mut self, call: &Call, subject: &Subject, cx: &mut Context<Self>) {
+        let Some(was) = self.call_state.was.as_ref() else {
+            return;
+        };
+        let asked = self.call_state.asked.is_some_and(|at| at.elapsed() < MOVE_ASKED);
+        if !moved(&was.conversation, &call.conversation) || asked {
+            return;
+        }
+        let words = format!("Moved to {} by a moderator", subject.title);
+        self.call_state.notice = Some(words.clone());
+        self.call_briefly(cx);
+        self.toast(Some(("icons/arrow-right-left.svg", theme::text_soft())), words, cx);
+    }
+
+    /// Talking while muted (07 §2a): while I am muted in a call, the meter stays on so the
+    /// microphone's level can be heard, and "You're muted" shows when it hears a sentence. The
+    /// device menu turns the meter off when it closes, so it is asked for again here.
+    fn call_watch_muted_talk(&mut self, call: &Call, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        let values = super::app::prefs::values();
+        let watching = call.state == CallState::Joined && call.muted && !call.deafened && values.on(MUTED_TALK);
+        let menu = self.call_state.menu == Some(Menu::Devices);
+        if watching && !menu && call.level.is_none() {
+            if self.call_state.metering.is_none_or(|at| now.duration_since(at) > METER_AGAIN) {
+                self.call_state.metering = Some(now);
+                meter(true, cx);
+            }
+        } else if !watching && !menu && self.call_state.metering.take().is_some() {
+            meter(false, cx);
+        }
+        if self.call_state.muted_talk.feed(watching, call.level, values.tuning().gate, now) {
+            // Gone by itself once nothing more is heard.
+            self.call_state.muted_talk_task = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(health::MUTED_TALK_HOLD + Duration::from_millis(50)).await;
+                let _ = this.update(cx, |_, cx| cx.notify());
+            }));
+        }
+    }
+
+    /// The join cue (S7), when I am first in a call: the same chime others hear when I arrive.
+    /// mediad plays it only if Settings › Voice allows join sounds. A move plays its own.
+    fn call_cue_join(&mut self, call: &Call, cx: &mut Context<Self>) {
+        // A failed call is over: Rejoin is a new arrival, and chimes.
+        if matches!(call.state, CallState::Failed { .. }) {
+            self.call_state.cued = None;
+        }
+        if call.state != CallState::Joined || cfg!(feature = "gui-shot") {
+            return;
+        }
+        if self.call_state.cued.replace(call.conversation.clone()).is_none() {
+            cx.background_executor()
+                .spawn(async move {
+                    let _ = ask(&Request::Media(protocol::MediaRequest::Cue { cue: protocol::Cue::Joined }));
+                })
+                .detach();
+        }
+    }
+
+    /// "You're muted": I seem to be talking into a muted microphone.
+    pub(in crate::gui) fn call_muted_talking(&self, call: &Call) -> bool {
+        #[cfg(feature = "gui-shot")]
+        if shot::muted_talking() {
+            return true;
+        }
+        call.muted && !call.deafened && self.call_state.muted_talk.showing(Instant::now())
+    }
+
+    /// The time on a Tiny stage's banner: how long it has been connecting, or what is left of
+    /// a reconnect. Ticks on its own, apart from the dock's.
+    pub(in crate::gui) fn call_stage_clock(&self, call: &Call, cx: &mut Context<Self>) -> Option<AnyElement> {
+        self.call_clock(&self.call_state.stage_counter, call, cx)
+    }
+
+    /// The dock's ticking text.
+    fn call_dock_clock(&self, call: &Call, cx: &mut Context<Self>) -> Option<AnyElement> {
+        self.call_clock(&self.call_state.counter, call, cx)
+    }
+
+    /// A ticking text for `call`'s state, in the counter `cell` holds.
+    fn call_clock(&self, cell: &OnceCell<Entity<Counter>>, call: &Call, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let counting = match call.state {
+            CallState::RingingOut => Counting::Ring,
+            CallState::Connecting => Counting::Connect,
+            CallState::Joined => Counting::Joined,
+            CallState::Reconnecting if call.conversation.network == Network::Tiny => Counting::Reconnect,
+            CallState::Reconnecting => Counting::Recover,
+            _ => return None,
+        };
+        let counter = cell.get_or_init(|| cx.new(|_| Counter::default())).clone();
+        let what = Some((counting, call.conversation.clone()));
+        let joined = call.joined;
+        let since = match self.call_state.since {
+            0 => now(),
+            since => since,
+        };
+        counter.update(cx, |counter, cx| counter.follow(what, joined, since, cx));
+        Some(counter.into_any_element())
+    }
+
+    /// A failed call in words, as the dock says it: its title, the line under it, and whether
+    /// it can be joined again with one click.
+    pub(in crate::gui) fn call_failure(&self, call: &Call) -> Option<(String, String, bool)> {
+        let CallState::Failed { reason, detail } = &call.state else {
+            return None;
+        };
+        let subject = Subject::of(self, self.snapshot.as_ref()?, call);
+        let failure = dock::failure(call, &subject, *reason, detail);
+        let again = failure.acts.iter().any(|act| matches!(act, dock::Act::Again(_)));
+        Some((failure.title, failure.line, again))
+    }
+
+    /// Goes where the call is: its conversation, or for a Tiny room the server's page on it.
+    pub(in crate::gui) fn call_go(&mut self, key: Key, title: &str, cx: &mut Context<Self>) {
+        if key.network != Network::Tiny {
+            self.select(key, title, cx);
+            return;
+        }
+        self.go(super::sidebar::Mode::Network(Network::Tiny), cx);
+        self.prefer_tiny(key.account(), cx);
+        self.tiny_pick_channel(Some(key.id), cx);
+    }
+
+    /// A join was asked for here: a new room that follows is not a moderator's move.
+    pub(in crate::gui) fn call_asked(&mut self) {
+        self.call_state.asked = Some(Instant::now());
     }
 
     /// The name of whoever was in this call with me and is not any more.
@@ -625,7 +805,7 @@ impl Shell {
             return;
         };
         let title = Subject::of(self, snapshot, &call).title;
-        self.select(call.conversation, &title, cx);
+        self.call_go(call.conversation, &title, cx);
     }
 
     /// Rings or joins. A failed call in the dock is replaced by the new one. A call that is up
@@ -668,6 +848,7 @@ impl Shell {
     /// Makes sure the microphone may be used, then asks chatd for `requests` in order. All of
     /// it off the main thread: the system's prompt can stay up as long as the user likes.
     fn call_begin(&mut self, requests: Vec<Request>, conversation: Key, cx: &mut Context<Self>) {
+        self.call_asked();
         let state = &mut self.call_state;
         (state.error, state.local, state.ended) = (None, None, None);
         cx.notify();
@@ -866,6 +1047,12 @@ impl Shell {
     }
 }
 
+/// Push to talk on, and its key held or not, for a made-up call under `--shot`.
+#[cfg(feature = "gui-shot")]
+pub(in crate::gui) fn shot_ptt() -> Option<bool> {
+    shot::ptt()
+}
+
 /// The connection's numbers of a made-up Tiny call, under `--shot`.
 #[cfg(feature = "gui-shot")]
 pub(in crate::gui) fn shot_stats() -> Option<protocol::CallStats> {
@@ -898,6 +1085,15 @@ mod tests {
             speaking: false,
         };
         Occupants { people: names.iter().map(person).collect(), total }
+    }
+
+    #[test]
+    fn only_a_room_change_on_one_tiny_server_is_a_move() {
+        let room = |network, account: &str, id: &str| Key { network, account: account.into(), id: id.into() };
+        assert!(moved(&room(Network::Tiny, "a", "lounge"), &room(Network::Tiny, "a", "raid")));
+        assert!(!moved(&room(Network::Tiny, "a", "lounge"), &room(Network::Tiny, "a", "lounge")));
+        assert!(!moved(&room(Network::Tiny, "a", "lounge"), &room(Network::Tiny, "b", "raid")), "another server");
+        assert!(!moved(&room(Network::Discord, "a", "1"), &room(Network::Discord, "a", "2")), "Discord calls are not moved");
     }
 
     #[test]
