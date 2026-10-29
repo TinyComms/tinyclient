@@ -359,6 +359,17 @@ fn main() -> ExitCode {
                 }
             };
         }
+        // One notification sound, for chatd: the word, the volume, the speaker (`alert`).
+        Some("--sound") => {
+            let args: Vec<String> = env::args().skip(2).collect();
+            return match mediad::alert::run(&args) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(err) => {
+                    eprintln!("mediad: {err}");
+                    ExitCode::from(1)
+                }
+            };
+        }
         // Settings' microphone test and test sound, with no call (`probe`).
         Some("test") => {
             mediad::probe::run();
