@@ -604,7 +604,7 @@ fn conversation_from(row: &Row) -> rusqlite::Result<Conversation> {
         private: row.get(30)?,
         draft: row.get(31)?,
         occupants: None,
-        limit: row.get(46)?,
+        limit: row.get(48)?,
         folders: from_id_list(&row.get::<_, String>(32)?),
         archived: row.get(33)?,
         pin: row.get(34)?,
@@ -619,7 +619,7 @@ fn conversation_from(row: &Row) -> rusqlite::Result<Conversation> {
         preview_mine: row.get(43)?,
         seen: row.get(44)?,
         quiet: row.get(45)?,
-        delivered: row.get(46)?,
+        delivered: row.get(48)?,
         sending: row.get(47)?,
     })
 }
