@@ -56,6 +56,7 @@ pub const ROWS: &[Row] = &[
     row("V3", Voice, "", "Input level", &[], &["test", "meter", "mic", "level"]),
     row("V6", Voice, "", "Sensitivity", &[], &["gate", "threshold", "noise", "voice activity", "vad"]),
     row("V18", Voice, "", "Hear yourself while testing", &[], &["loopback", "test", "listen", "monitor", "echo test"]),
+    row("V19", Voice, "", "Tell me when I talk while muted", &[], &["muted", "talking", "warning", "mute", "speak"]),
     row("V14", Voice, "", "Release delay", &["0 ms", "100 ms", "200 ms", "300 ms", "500 ms", "1 s"], &["ptt", "push to talk", "delay", "hold", "cut off"]),
     row("V13", Voice, "Keys", "Push to talk", &[], &["ptt", "key", "hotkey", "shortcut", "global", "mouse"]),
     row("V15", Voice, "Keys", "Priority push to talk", &[], &["priority", "speaker", "ptt", "hotkey", "global"]),
@@ -183,7 +184,7 @@ pub fn draws_label(id: &str) -> bool {
 pub fn kept_by_chatd(id: &str) -> bool {
     matches!(
         id,
-        "G2" | "S1" | "S7" | "S8" | "S9" | "S10" | "P1" | "P2" | "P4" | "V1" | "V2" | "V3" | "V4" | "V5" | "V6" | "V8" | "V10" | "V11" | "V12" | "V13" | "V14" | "V15" | "V16" | "V17" | "D1" | "D2" | "D3"
+        "G2" | "S1" | "S7" | "S8" | "S9" | "S10" | "P1" | "P2" | "P4" | "V1" | "V2" | "V3" | "V4" | "V5" | "V6" | "V8" | "V10" | "V11" | "V12" | "V13" | "V14" | "V15" | "V16" | "V17" | "V19" | "D1" | "D2" | "D3"
     )
 }
 
