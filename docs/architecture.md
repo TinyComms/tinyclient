@@ -468,6 +468,8 @@ Tests go in your own files or a new `tests/<slice>.rs`. A gap in the contract is
 - Slices F, G and H share the `chatd` crate, and A to E the `tinyclient` crate: someone else's
   half-written file can break your build. Check with `cargo check -p chatd` (or `-p tinyclient
   --features gui`) and say so; do not fix it.
-- Left for later, with room kept: message search, notifications, settings, inline video
+- Notifications (2026-10-28): chatd decides and posts (`notify.rs`, rules tested against `notifier::Fake`), the
+  window only reports its focus and draws the taskbar or Dock count. Sounds play through `mediad --sound`.
+- Left for later, with room kept: message search, settings, inline video
   (videos play in the system's player), Discord's per-server file limit (boosts) and Telegram's boosted packs in
   `Capabilities`, picker recents in SQLite.
