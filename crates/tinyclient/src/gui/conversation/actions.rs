@@ -65,20 +65,34 @@ pub struct Can {
     pub unsent: bool,
 }
 
+/// What the menu and the toolbar call this message's thread.
+pub fn thread_label(message: &Message) -> &'static str {
+    if message.thread.is_some() { "Open thread" } else { "Reply in thread" }
+}
+
+/// A Slack message a first reply can hang off. Slack names that thread `{channel}:{message id}`.
+/// A reply already shown in the channel belongs to its parent's thread, which this row does not name.
+pub(super) fn slack_thread_root(message: &Message) -> bool {
+    message.state == SendState::Sent
+        && message.reply_to.is_none()
+        && !message.deleted
+        && matches!(message.kind, MessageKind::Normal | MessageKind::Unsupported { .. })
+}
+
 /// `in_thread`: the row is in the thread pane, where a thread cannot be opened again.
 pub fn can(message: &Message, network: Network, in_thread: bool) -> Can {
     let sent = message.state == SendState::Sent;
     let said = matches!(message.kind, MessageKind::Normal | MessageKind::Unsupported { .. }) && !message.deleted;
     let act = sent && said;
     let own = message.outgoing && message.kind == MessageKind::Normal && !message.deleted;
+    // Slack names a thread by the parent message, so one can be started before any reply exists.
+    // Discord's thread is a channel of its own, named only once one exists.
+    let starts = network == Network::Slack && slack_thread_root(message);
     Can {
         act,
         // Slack has no inline reply: its reply is the thread.
         reply: act && network != Network::Slack,
-        // CONTRACT: a thread can only be opened where one exists. A message with no replies has
-        // no `ThreadSummary`, so nothing names the thread a first reply would start, and
-        // "Reply in thread" cannot be offered on it.
-        thread: sent && message.thread.is_some() && !in_thread,
+        thread: !in_thread && ((sent && message.thread.is_some()) || starts),
         // CONTRACT: nothing says how long a network lets a message be edited, so Edit is offered
         // on every message of mine and a refusal is the network's answer.
         edit: sent && own,
@@ -301,7 +315,7 @@ impl Pane {
             let root = message.clone();
             bar = bar.child(
                 tool("thread", icon(Icon::Thread, 16., theme::text_soft()))
-                    .tooltip(tip("Open thread", None))
+                    .tooltip(tip(thread_label(message), None))
                     .on_click(cx.listener(move |_, _, _, cx| cx.emit(PaneEvent::OpenThread(root.clone())))),
             );
         }
@@ -513,7 +527,7 @@ impl Pane {
                 items = items.child(menu_item("reply", Some("icons/corner-up-left.svg"), "Reply", None).on_click(then(|this, message, _, window, cx| this.reply(message, window, cx))));
             }
             if can.thread {
-                items = items.child(menu_item("thread", Some("icons/message-square.svg"), "Open thread", None).on_click(then(
+                items = items.child(menu_item("thread", Some("icons/message-square.svg"), thread_label(message), None).on_click(then(
                     |_, message, _, _, cx| cx.emit(PaneEvent::OpenThread(message.clone())),
                 )));
             }
@@ -774,14 +788,35 @@ mod tests {
         let theirs = Message::plain("1", "Mara", "hello", 1, false);
         let on = can(&theirs, Network::Discord, false);
         assert_eq!((on.act, on.reply, on.edit, on.delete, on.thread), (true, true, false, false, false));
-        // Slack answers in a thread, never inline.
-        assert!(!can(&theirs, Network::Slack, false).reply);
+        // Slack answers in a thread, never inline. The thread can be started before any reply exists:
+        // Slack names it by the parent message.
+        let slack = can(&theirs, Network::Slack, false);
+        assert!(!slack.reply);
+        assert!(slack.thread);
+        assert_eq!(thread_label(&theirs), "Reply in thread");
+        assert!(!can(&theirs, Network::Slack, true).thread, "a thread does not open inside a thread");
+        let mut broadcast = theirs.clone();
+        broadcast.reply_to = Some(protocol::ReplyTo {
+            id: "parent".into(),
+            sender: "Ana".into(),
+            snippet: "earlier".into(),
+            person: None,
+            deleted: false,
+        });
+        assert!(!can(&broadcast, Network::Slack, false).thread, "a channel copy of a reply belongs to its parent's thread");
+        let mut pending = theirs.clone();
+        pending.state = SendState::Pending;
+        assert!(!can(&pending, Network::Slack, false).thread);
+        let mut joined = theirs.clone();
+        joined.kind = MessageKind::System;
+        assert!(!can(&joined, Network::Slack, false).thread);
 
         let mut mine = Message::plain("2", "Robin", "on it", 2, true);
         let own = can(&mine, Network::Discord, false);
         assert!(own.edit && own.delete && !own.unsent);
         mine.thread = Some(protocol::ThreadSummary { id: "t".into(), replies: 1, last: 3, participants: Vec::new(), unread: 0 });
         assert!(can(&mine, Network::Discord, false).thread);
+        assert_eq!(thread_label(&mine), "Open thread");
         assert!(!can(&mine, Network::Discord, true).thread, "a thread does not open inside a thread");
 
         // Not on the network yet: no toolbar, nothing to edit, and deleting is local.

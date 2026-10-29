@@ -150,7 +150,11 @@ fn new_line(metrics: Metrics) -> Div {
 }
 
 fn replies_line(count: u32, metrics: Metrics) -> Div {
-    let words = if count == 1 { "1 reply".to_owned() } else { format!("{count} replies") };
+    let words = match count {
+        0 => "No replies yet".to_owned(),
+        1 => "1 reply".to_owned(),
+        count => format!("{count} replies"),
+    };
     div()
         .h(px(32.))
         .px(px(metrics.inset))

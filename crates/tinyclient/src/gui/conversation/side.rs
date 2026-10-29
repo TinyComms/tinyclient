@@ -270,8 +270,20 @@ fn pane_open(open: &protocol::Conversation) -> pane::Open {
 }
 
 /// The key a thread is read and posted under: its own id, on its conversation's account.
+/// Slack's is `{channel}:{root}` even before the first reply, which is the `thread_ts` a send uses.
 fn thread_key(conversation: &Key, root: &Message) -> Option<Key> {
-    root.thread.as_ref().map(|thread| Key { id: thread.id.clone(), ..conversation.clone() })
+    let id = if let Some(thread) = &root.thread {
+        thread.id.clone()
+    } else if conversation.network == Network::Slack
+        && super::actions::slack_thread_root(root)
+        && !conversation.id.contains(':')
+        && !root.id.contains(':')
+    {
+        format!("{}:{}", conversation.id, root.id)
+    } else {
+        return None;
+    };
+    Some(Key { id, ..conversation.clone() })
 }
 
 /// Whether a thread of `conversation` may be drawn, composer and all, beside `open`. The one
@@ -456,7 +468,7 @@ impl Shell {
     /// The reply line under a message of the open conversation was clicked.
     pub(in crate::gui) fn open_thread_of(&mut self, conversation: Key, root: Rc<Message>, cx: &mut Context<Self>) {
         // A click that raced a switch belongs to a conversation no longer open.
-        if self.open_key() != Some(&conversation) || root.thread.is_none() {
+        if self.open_key() != Some(&conversation) || thread_key(&conversation, &root).is_none() {
             return;
         }
         let side = &mut self.conversation_state.side;
@@ -1273,7 +1285,7 @@ fn said_at(hit: &MessageHit) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use protocol::{AccountKey, Network, ThreadSummary};
+    use protocol::{AccountKey, Network, ReplyTo, ThreadSummary};
 
     fn key(id: &str) -> Key {
         Key::new(&AccountKey { network: Network::Slack, account: "T1".into() }, id)
@@ -1282,7 +1294,14 @@ mod tests {
     #[test]
     fn a_thread_posts_under_its_own_key_and_only_beside_its_conversation() {
         let mut root = Message::plain("m1", "Ines", "root", 0, false);
-        assert_eq!(thread_key(&key("C_a"), &root), None);
+        // Slack names the thread a first reply would start: the channel and this message.
+        let started = thread_key(&key("C_a"), &root).unwrap();
+        assert_eq!((started.id.as_str(), started.account()), ("C_a:m1", key("C_a").account()));
+        let discord = Key::new(&AccountKey { network: Network::Discord, account: "1".into() }, "C_a");
+        assert_eq!(thread_key(&discord, &root), None, "Discord's thread id is a channel that does not exist yet");
+        let mut broadcast = root.clone();
+        broadcast.reply_to = Some(ReplyTo { id: "parent".into(), sender: "Ana".into(), snippet: "earlier".into(), person: None, deleted: false });
+        assert_eq!(thread_key(&key("C_a"), &broadcast), None);
         root.thread = Some(ThreadSummary { id: "C_a:m1".into(), replies: 2, last: 0, participants: Vec::new(), unread: 0 });
         let thread = thread_key(&key("C_a"), &root).unwrap();
         assert_eq!((thread.id.as_str(), thread.account()), ("C_a:m1", key("C_a").account()));
