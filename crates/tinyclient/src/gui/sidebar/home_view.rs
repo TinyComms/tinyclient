@@ -4,7 +4,7 @@ use super::chat::Look;
 use super::home::{self, Act, Drill, Item};
 use super::{on_screen, respliced, Mode};
 use crate::client::ask;
-use crate::gui::components::{badge_dot, empty_state, glyph, list_row, pair, rollup_badge, section_header, Avatar, Shape};
+use crate::gui::components::{badge_dot, empty_state, glyph, icon_button, list_row, pair, rollup_badge, section_header, Avatar, Shape};
 use crate::gui::state::{Shell, Snapshot};
 use crate::gui::theme::{self, Type};
 use crate::view::now;
@@ -428,7 +428,6 @@ impl Shell {
             .flex_none()
             .h(px(32.))
             .px(px(8.))
-            .mb(px(4.))
             .flex()
             .items_center()
             .gap(px(4.))
@@ -440,50 +439,38 @@ impl Shell {
             tabs = tabs.child(tab(Some(folder.key.id.clone()), folder.name.clone(), folder.unread, folder.mentions, cx));
         }
 
+        let max = scroll.max_offset().x;
         let can_left = scroll.offset().x < px(0.);
-        let can_right = scroll.offset().x > scroll.max_offset().x;
+        let can_right = scroll.offset().x > -max;
 
-        let arrow = |icon: &'static str, enabled: bool, on_click: Box<dyn Fn(&mut Shell, &mut Context<Shell>) + 'static>| {
-            div()
-                .flex_none()
-                .w(px(24.))
-                .h(px(32.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .when(enabled, |d| {
-                    d.cursor_pointer()
-                        .child(glyph(icon, 14., theme::text_soft()))
-                        .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| on_click(this, cx)))
-                })
-                .when(!enabled, |d| {
-                    d.child(glyph(icon, 14., theme::text_faint())).opacity(0.3)
+        if max <= px(0.) {
+            return Some(div().flex().items_center().mb(px(4.)).child(tabs));
+        }
+
+        let arrow = |icon: &'static str, enabled: bool, direction: i32, cx: &mut Context<Shell>| {
+            let id = if direction < 0 { "folder-tabs-scroll-left" } else { "folder-tabs-scroll-right" };
+            icon_button(id, icon, false)
+                .size(px(24.))
+                .when(!enabled, |b| b.opacity(0.35).cursor_default())
+                .when(enabled, |b| {
+                    b.on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                        let scroll = this.sidebar_state.folder_tabs_scroll.clone();
+                        let current = scroll.offset().x;
+                        let new_x = (current - px(120. * direction as f32)).clamp(-max, px(0.));
+                        scroll.set_offset(gpui::point(new_x, px(0.)));
+                        cx.notify();
+                    }))
                 })
         };
-
-        let scroll_left = Box::new(move |this: &mut Shell, cx: &mut Context<Shell>| {
-            let scroll = this.sidebar_state.folder_tabs_scroll.clone();
-            let current = scroll.offset().x;
-            let new_x = (current + px(120.)).min(px(0.));
-            scroll.set_offset(gpui::point(new_x, px(0.)));
-            cx.notify();
-        });
-        let scroll_right = Box::new(move |this: &mut Shell, cx: &mut Context<Shell>| {
-            let scroll = this.sidebar_state.folder_tabs_scroll.clone();
-            let current = scroll.offset().x;
-            let max = scroll.max_offset().x;
-            let new_x = (current - px(120.)).max(max);
-            scroll.set_offset(gpui::point(new_x, px(0.)));
-            cx.notify();
-        });
 
         Some(
             div()
                 .flex()
                 .items_center()
-                .child(arrow("icons/chevron-left.svg", can_left, scroll_left))
+                .mb(px(4.))
+                .child(arrow("icons/chevron-left.svg", can_left, -1, cx))
                 .child(div().flex_1().min_w_0().child(tabs))
-                .child(arrow("icons/chevron-right.svg", can_right, scroll_right)),
+                .child(arrow("icons/chevron-right.svg", can_right, 1, cx)),
         )
     }
 
