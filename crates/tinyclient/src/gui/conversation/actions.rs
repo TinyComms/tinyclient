@@ -17,7 +17,7 @@ use gpui::{
     anchored, deferred, div, point, prelude::*, px, AnyElement, Bounds, ClipboardItem, Context, Div, ElementId, Entity,
     KeyDownEvent, MouseButton, Pixels, Point, SharedString, Stateful, Subscription, Window,
 };
-use protocol::{ErrorCode, Message, MessageKind, Network, ReactionRules, Request, Response, SendState};
+use protocol::{ConversationKind, ErrorCode, Message, MessageKind, Network, ReactionRules, Request, Response, SendState};
 use std::rc::Rc;
 
 /// How far the toolbar rises above its row, and how wide the strip it can occupy is.
@@ -70,29 +70,41 @@ pub fn thread_label(message: &Message) -> &'static str {
     if message.thread.is_some() { "Open thread" } else { "Reply in thread" }
 }
 
-/// A Slack message a first reply can hang off. Slack names that thread `{channel}:{message id}`.
-/// A reply already shown in the channel belongs to its parent's thread, which this row does not name.
-pub(super) fn slack_thread_root(message: &Message) -> bool {
+/// A message a first reply can hang off. A reply already shown in the channel belongs to its
+/// parent's thread, which this row does not name.
+fn thread_root(message: &Message) -> bool {
     message.state == SendState::Sent
         && message.reply_to.is_none()
         && !message.deleted
         && matches!(message.kind, MessageKind::Normal | MessageKind::Unsupported { .. })
 }
 
+/// Whether this message can start a thread that does not exist yet. Slack names one in a
+/// channel or a direct message. Teams and Discord do, in a channel. A thread, a voice channel
+/// and a forum do not start another. Telegram topics, Signal, Messages and Tiny have no such
+/// thread.
+pub(super) fn starts_thread(message: &Message, network: Network, kind: ConversationKind) -> bool {
+    if !thread_root(message) || matches!(kind, ConversationKind::Thread | ConversationKind::Voice | ConversationKind::Forum) {
+        return false;
+    }
+    match network {
+        Network::Slack => true,
+        Network::Teams | Network::Discord => matches!(kind, ConversationKind::Channel | ConversationKind::Announcement),
+        Network::Telegram | Network::Signal | Network::Messages | Network::Tiny => false,
+    }
+}
+
 /// `in_thread`: the row is in the thread pane, where a thread cannot be opened again.
-pub fn can(message: &Message, network: Network, in_thread: bool) -> Can {
+pub fn can(message: &Message, network: Network, kind: ConversationKind, in_thread: bool) -> Can {
     let sent = message.state == SendState::Sent;
     let said = matches!(message.kind, MessageKind::Normal | MessageKind::Unsupported { .. }) && !message.deleted;
     let act = sent && said;
     let own = message.outgoing && message.kind == MessageKind::Normal && !message.deleted;
-    // Slack names a thread by the parent message, so one can be started before any reply exists.
-    // Discord's thread is a channel of its own, named only once one exists.
-    let starts = network == Network::Slack && slack_thread_root(message);
     Can {
         act,
         // Slack has no inline reply: its reply is the thread.
         reply: act && network != Network::Slack,
-        thread: !in_thread && ((sent && message.thread.is_some()) || starts),
+        thread: !in_thread && ((sent && message.thread.is_some()) || starts_thread(message, network, kind)),
         // CONTRACT: nothing says how long a network lets a message be edited, so Edit is offered
         // on every message of mine and a refusal is the network's answer.
         edit: sent && own,
@@ -154,7 +166,9 @@ impl Pane {
     }
 
     pub(super) fn can(&self, message: &Message) -> Can {
-        can(message, self.network(), self.is_thread())
+        // No open conversation is not a place a thread can be started from.
+        let kind = self.open.as_ref().map(|open| open.kind).unwrap_or(ConversationKind::Thread);
+        can(message, self.network(), kind, self.is_thread())
     }
 
     // Reactions.
@@ -785,16 +799,23 @@ mod tests {
 
     #[test]
     fn what_a_message_offers_follows_whose_it_is_and_whether_it_left() {
+        let channel = ConversationKind::Channel;
         let theirs = Message::plain("1", "Mara", "hello", 1, false);
-        let on = can(&theirs, Network::Discord, false);
-        assert_eq!((on.act, on.reply, on.edit, on.delete, on.thread), (true, true, false, false, false));
+        let on = can(&theirs, Network::Discord, channel, false);
+        assert_eq!((on.act, on.reply, on.edit, on.delete, on.thread), (true, true, false, false, true));
+        assert_eq!(thread_label(&theirs), "Reply in thread");
+        let discord_dm = can(&theirs, Network::Discord, ConversationKind::Direct, false);
+        assert!(discord_dm.reply && !discord_dm.thread, "a Discord direct message stays an inline reply");
+        assert!(!can(&theirs, Network::Discord, ConversationKind::Voice, false).thread);
+        assert!(!can(&theirs, Network::Discord, ConversationKind::Forum, false).thread);
         // Slack answers in a thread, never inline. The thread can be started before any reply exists:
-        // Slack names it by the parent message.
-        let slack = can(&theirs, Network::Slack, false);
+        // Slack names it by the parent message, in a channel and in a direct message.
+        let slack = can(&theirs, Network::Slack, channel, false);
         assert!(!slack.reply);
         assert!(slack.thread);
-        assert_eq!(thread_label(&theirs), "Reply in thread");
-        assert!(!can(&theirs, Network::Slack, true).thread, "a thread does not open inside a thread");
+        assert!(can(&theirs, Network::Slack, ConversationKind::Direct, false).thread);
+        assert!(!can(&theirs, Network::Slack, channel, true).thread, "a thread does not open inside a thread");
+        assert!(!can(&theirs, Network::Slack, ConversationKind::Thread, false).thread);
         let mut broadcast = theirs.clone();
         broadcast.reply_to = Some(protocol::ReplyTo {
             id: "parent".into(),
@@ -803,33 +824,44 @@ mod tests {
             person: None,
             deleted: false,
         });
-        assert!(!can(&broadcast, Network::Slack, false).thread, "a channel copy of a reply belongs to its parent's thread");
+        assert!(!can(&broadcast, Network::Slack, channel, false).thread, "a channel copy of a reply belongs to its parent's thread");
         let mut pending = theirs.clone();
         pending.state = SendState::Pending;
-        assert!(!can(&pending, Network::Slack, false).thread);
+        assert!(!can(&pending, Network::Slack, channel, false).thread);
         let mut joined = theirs.clone();
         joined.kind = MessageKind::System;
-        assert!(!can(&joined, Network::Slack, false).thread);
+        assert!(!can(&joined, Network::Slack, channel, false).thread);
+
+        // Teams channels thread. A chat stays an inline reply.
+        let teams = can(&theirs, Network::Teams, channel, false);
+        assert!(teams.reply && teams.thread);
+        assert!(can(&theirs, Network::Teams, ConversationKind::Announcement, false).thread);
+        assert!(!can(&theirs, Network::Teams, ConversationKind::Direct, false).thread);
+        assert!(!can(&theirs, Network::Teams, ConversationKind::Group, false).thread);
+        for network in [Network::Telegram, Network::Signal, Network::Messages, Network::Tiny] {
+            assert!(!can(&theirs, network, channel, false).thread, "{network:?} has no thread to start");
+        }
 
         let mut mine = Message::plain("2", "Robin", "on it", 2, true);
-        let own = can(&mine, Network::Discord, false);
+        let own = can(&mine, Network::Discord, channel, false);
         assert!(own.edit && own.delete && !own.unsent);
         mine.thread = Some(protocol::ThreadSummary { id: "t".into(), replies: 1, last: 3, participants: Vec::new(), unread: 0 });
-        assert!(can(&mine, Network::Discord, false).thread);
+        assert!(can(&mine, Network::Discord, channel, false).thread);
         assert_eq!(thread_label(&mine), "Open thread");
-        assert!(!can(&mine, Network::Discord, true).thread, "a thread does not open inside a thread");
+        assert!(can(&mine, Network::Discord, ConversationKind::Direct, false).thread, "a thread that exists still opens");
+        assert!(!can(&mine, Network::Discord, channel, true).thread, "a thread does not open inside a thread");
 
         // Not on the network yet: no toolbar, nothing to edit, and deleting is local.
         mine.state = SendState::Failed { reason: "Slow mode".into() };
-        let failed = can(&mine, Network::Discord, false);
+        let failed = can(&mine, Network::Discord, channel, false);
         assert_eq!((failed.act, failed.edit, failed.delete, failed.unsent), (false, false, true, true));
 
         // A tombstone and a system line say nothing that can be acted on.
         let mut gone = Message::plain("3", "Wren", "", 4, true);
         gone.tombstone();
-        assert_eq!(can(&gone, Network::Discord, false), Can { thread: false, ..Can::default() });
+        assert_eq!(can(&gone, Network::Discord, channel, false), Can { thread: false, ..Can::default() });
         let mut joined = Message::plain("4", "Wren", "joined", 5, false);
         joined.kind = MessageKind::System;
-        assert!(!can(&joined, Network::Discord, false).act);
+        assert!(!can(&joined, Network::Discord, channel, false).act);
     }
 }

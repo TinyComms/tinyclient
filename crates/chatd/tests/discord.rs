@@ -371,6 +371,25 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
             shared.push("MESSAGE_CREATE", message.clone());
             (200, message)
         }
+        ("POST", ["channels", channel, "messages", _message, "threads"]) => {
+            let id = shared.snowflake();
+            let name = seen.body["name"].as_str().unwrap_or("Thread");
+            (
+                200,
+                json!({
+                    "id": id,
+                    "type": 11,
+                    "name": name,
+                    "parent_id": channel,
+                    "guild_id": "4000",
+                    "owner_id": "1000",
+                    "message_count": 0,
+                    "member_count": 1,
+                    "thread_metadata": {"archived": false, "locked": false},
+                    "newly_created": true,
+                }),
+            )
+        }
         ("POST", ["channels", _, "messages", _, "ack"]) => (200, json!({"token": null})),
         ("POST", ["channels", _, "typing"]) => (204, Value::Null),
         ("POST", ["channels", _, "call", "stop-ringing"]) => (204, Value::Null),
@@ -1173,6 +1192,52 @@ fn messages_map_to_the_one_model_and_follow_live_events() {
     let kept = world.messages("4102");
     assert_eq!(kept.iter().map(|message| message.id.as_str()).collect::<Vec<_>>(), [id.as_str()]);
     assert!(kept[0].mentions_me);
+}
+
+#[test]
+fn a_channel_message_can_start_a_thread_and_a_direct_message_cannot() {
+    let world = World::start();
+    let general = wait("the channel's history", || Some(world.messages("4101")).filter(|messages| messages.len() == 3));
+    let starter = "1300000000000000094";
+    assert!(general.iter().any(|message| message.id == starter && message.thread.is_none()));
+
+    // One that already has a thread answers with it and does not create another.
+    let existing = "1300000000000000100";
+    let opened = world.ask(Request::StartThread { conversation: world.key("4101"), message: existing.to_owned() });
+    let Response::Conversation { conversation } = opened else { panic!("{opened:?}") };
+    assert_eq!(conversation.key.id, "4500");
+    assert!(world.discord.requests_to("POST", "/channels/4101/messages/1300000000000000100/threads").is_empty());
+
+    let started = world.ask(Request::StartThread { conversation: world.key("4101"), message: starter.to_owned() });
+    let Response::Conversation { conversation } = started else { panic!("{started:?}") };
+    assert_eq!(conversation.kind, ConversationKind::Thread);
+    assert_eq!((conversation.parent.as_deref(), conversation.root.as_deref()), (Some("4101"), Some(starter)));
+    let posts = world.discord.requests_to("POST", &format!("/channels/4101/messages/{starter}/threads"));
+    assert_eq!(posts.len(), 1);
+    let name = posts[0].body["name"].as_str().unwrap_or("");
+    assert!(!name.is_empty() && name.chars().count() <= 100, "{name}");
+    let hung = world.messages("4101").into_iter().find(|message| message.id == starter).unwrap();
+    assert_eq!(hung.thread.as_ref().map(|thread| thread.id.as_str()), Some(conversation.key.id.as_str()));
+
+    // The same click again is the thread that now exists, not a second channel.
+    let again = world.ask(Request::StartThread { conversation: world.key("4101"), message: starter.to_owned() });
+    let Response::Conversation { conversation: again } = again else { panic!("{again:?}") };
+    assert_eq!(again.key.id, conversation.key.id);
+    assert_eq!(world.discord.requests_to("POST", &format!("/channels/4101/messages/{starter}/threads")).len(), 1);
+
+    let system = world.ask(Request::StartThread {
+        conversation: world.key("4101"),
+        message: "1300000000000000095".to_owned(),
+    });
+    assert!(matches!(system, Response::Error { code: ErrorCode::Refused, .. }), "{system:?}");
+
+    wait("the direct conversation", || Some(world.messages("3001")).filter(|messages| !messages.is_empty()));
+    let direct = world.ask(Request::StartThread {
+        conversation: world.key("3001"),
+        message: "1300000010000000010".to_owned(),
+    });
+    assert!(matches!(direct, Response::Error { code: ErrorCode::Refused, .. }), "{direct:?}");
+    assert!(world.discord.requests_to("POST", "/channels/3001/messages/").iter().all(|seen| !seen.path.contains("/threads")));
 }
 
 #[test]

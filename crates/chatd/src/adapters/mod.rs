@@ -249,6 +249,14 @@ pub enum Command {
     },
     /// The id of the direct conversation with a person, created if there is none.
     StartDirect { person_id: String, reply: Reply<String> },
+    /// The id of the thread a channel message starts. Discord only: create the thread channel,
+    /// record it, and answer with its id. `name` is already one line, at most 100 characters.
+    StartThread {
+        conversation_id: String,
+        message_id: String,
+        name: String,
+        reply: Reply<String>,
+    },
     /// One person's card. One request to the network, and only because the user opened it.
     Profile { person_id: String, reply: Reply<About> },
     /// The same, opened from inside a Space: add the nickname, roles and join date there. An
@@ -351,7 +359,7 @@ impl Command {
     pub fn unsupported(self, ctx: &Context) {
         match self {
             Command::Members { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
-            Command::StartDirect { reply, .. } | Command::Handoff { reply, .. } => {
+            Command::StartDirect { reply, .. } | Command::StartThread { reply, .. } | Command::Handoff { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }
             Command::Profile { reply, .. } | Command::ProfileIn { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),

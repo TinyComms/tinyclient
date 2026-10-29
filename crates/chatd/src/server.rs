@@ -8,7 +8,7 @@ use protocol::settings;
 use protocol::{
     clip, read_frame_bytes, support_dir, write_frame, CatalogKind, ConversationInfo, MediaFile, MediaKind, Outgoing, SharedKind, SpaceInfo, AccountKey, AccountStatus, CallSupport, Capabilities,
     Change, ChatListener, ChatStream, Conversation, ConversationKind, ErrorCode, InboxCounts, Key,
-    Link, Media, MediaRequest, Message, Network, NetworkStatus, Page, Person, Presence,
+    Link, Media, MediaRequest, Message, MessageKind, Network, NetworkStatus, Page, Person, Presence,
     Profile, Reaction, RelateAction, Relation, Request, Response, SendState, Watching,
     MUTUAL_SPACES, PAGE_LIMIT, SEARCH_MIN_CHARS, WATCH_LIMIT,
 };
@@ -631,6 +631,101 @@ impl Chat {
         }
     }
 
+    /// A Slack or Teams thread id names its parent, so the conversation can exist before the
+    /// network has a reply in it. Opening or sending is what records it. Discord's thread is a
+    /// new channel (`StartThread`) and is not derived from the id.
+    fn ensure_thread(&self, conversation: &Key) -> rusqlite::Result<()> {
+        let mut store = self.hub.store();
+        if store.conversation(conversation)?.is_some() {
+            return Ok(());
+        }
+        let Some((parent_id, root_id)) = derivable_thread(conversation) else {
+            return Ok(());
+        };
+        let parent_key = Key { id: parent_id.clone(), ..conversation.clone() };
+        let Some(parent) = store.conversation(&parent_key)? else {
+            return Ok(());
+        };
+        if parent.kind == ConversationKind::Thread {
+            return Ok(());
+        }
+        // A Teams chat quotes. Only a channel's reply chain is a thread.
+        if conversation.network == Network::Teams
+            && !matches!(parent.kind, ConversationKind::Channel | ConversationKind::Announcement)
+        {
+            return Ok(());
+        }
+        let title = match conversation.network {
+            Network::Teams => {
+                let text = store.message(&parent_key, &root_id)?.map(|message| message.text).unwrap_or_default();
+                let title = first_line(&text, 40);
+                if title.is_empty() { "Replies".to_owned() } else { title }
+            }
+            Network::Slack => {
+                if parent.kind.is_direct() {
+                    format!("Thread with {}", parent.title)
+                } else {
+                    format!("Thread in {}", parent.title)
+                }
+            }
+            _ => return Ok(()),
+        };
+        let mut row = crate::store::ConversationRow::new(&conversation.id, ConversationKind::Thread, title);
+        row.parent = Some(parent_id);
+        row.root = Some(root_id);
+        row.private = parent.private;
+        row.read_only = parent.read_only;
+        let account = conversation.account();
+        store.upsert_conversation(&account, &row)?;
+        drop(store);
+        self.hub.changed(Change::Conversation { conversation: conversation.clone() });
+        Ok(())
+    }
+
+    /// Discord creates the thread channel. The name comes from the message, so the click does
+    /// not ask for one. The adapter records the conversation before it answers.
+    fn start_thread(&self, conversation: Key, message: String) -> Response {
+        if conversation.network != Network::Discord {
+            return error(ErrorCode::Unsupported, format!("{} cannot do this yet", conversation.network.label()));
+        }
+        if let Err(refused) = self.online(&conversation.account()) {
+            return *refused;
+        }
+        let parent = match self.hub.store().conversation(&conversation) {
+            Ok(Some(parent)) => parent,
+            Ok(None) => return error(ErrorCode::NotFound, "no such conversation"),
+            Err(err) => return internal(err),
+        };
+        if !matches!(parent.kind, ConversationKind::Channel | ConversationKind::Announcement) {
+            return error(ErrorCode::Refused, "A thread starts from a channel message.");
+        }
+        let stored = match self.hub.store().message(&conversation, &message) {
+            Ok(Some(stored)) => stored,
+            Ok(None) => return error(ErrorCode::NotFound, "no such message"),
+            Err(err) => return internal(err),
+        };
+        if stored.deleted || matches!(stored.kind, MessageKind::System) {
+            return error(ErrorCode::Refused, "That message cannot start a thread.");
+        }
+        let name = thread_name(&stored.text);
+        let conversation_id = conversation.id.clone();
+        let started = self.ask(&conversation.account(), |reply| Command::StartThread {
+            conversation_id,
+            message_id: message,
+            name,
+            reply,
+        });
+        let id = match started {
+            Ok(id) => id,
+            Err(refused) => return *refused,
+        };
+        match self.hub.store().conversation(&Key::new(&conversation.account(), id)) {
+            Ok(Some(thread)) => Response::Conversation { conversation: self.row(thread) },
+            Ok(None) => error(ErrorCode::Internal, "the thread started, but was not recorded"),
+            Err(err) => internal(err),
+        }
+    }
+
     fn messages(&self, conversation: Key, page: Page, limit: u32) -> Response {
         if !self.shows(&conversation.account()) {
             return Response::Messages {
@@ -640,6 +735,10 @@ impl Chat {
                 older: false,
                 newer: false,
             };
+        }
+        // A Slack or Teams thread is named by its parent, so the row can exist before any reply.
+        if let Err(err) = self.ensure_thread(&conversation) {
+            return internal(err);
         }
         let read = {
             let mut store = self.hub.store();
@@ -717,6 +816,9 @@ impl Chat {
         }
         if let Err(refused) = self.allowed(&account, &with) {
             return *refused;
+        }
+        if let Err(err) = self.ensure_thread(&conversation) {
+            return internal(err);
         }
         let client_id = message.id.clone();
         message.state = SendState::Pending;
@@ -1686,6 +1788,7 @@ impl Chat {
                     Err(err) => internal(err),
                 }
             }
+            Request::StartThread { conversation, message } => self.start_thread(conversation, message),
             Request::Profile { person, space } => self.profile(person, space),
             Request::ConversationInfo { conversation } => self.conversation_info(conversation),
             Request::SpaceInfo { space } => self.space_info(space),
@@ -2213,6 +2316,46 @@ fn typed_profile(person: Person, mut about: About) -> Profile {
     profile
 }
 
+/// Slack `{channel}:{ts}` and Teams `{channel};messageid={root}`, when neither part is itself
+/// a thread id. A Discord id is a channel and is not derived.
+fn derivable_thread(conversation: &Key) -> Option<(String, String)> {
+    match conversation.network {
+        Network::Slack => {
+            let (channel, root) = conversation.id.split_once(':')?;
+            if channel.is_empty() || root.is_empty() || root.contains(':') {
+                return None;
+            }
+            Some((channel.to_owned(), root.to_owned()))
+        }
+        Network::Teams => {
+            let (channel, root) = conversation.id.split_once(";messageid=")?;
+            if channel.is_empty() || root.is_empty() || root.contains(";messageid=") {
+                return None;
+            }
+            Some((channel.to_owned(), root.to_owned()))
+        }
+        _ => None,
+    }
+}
+
+/// The first non-empty line, cut to `most` characters with an ellipsis when it ran over.
+fn first_line(text: &str, most: usize) -> String {
+    let first = text.lines().map(str::trim).find(|line| !line.is_empty()).unwrap_or("");
+    if first.chars().count() > most {
+        format!("{}…", first.chars().take(most).collect::<String>().trim_end())
+    } else {
+        first.to_owned()
+    }
+}
+
+/// A Discord thread name: whitespace flattened, at most 100 characters, never empty.
+fn thread_name(text: &str) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let name: String = flat.chars().take(100).collect();
+    let name = name.trim().to_owned();
+    if name.is_empty() { "Thread".to_owned() } else { name }
+}
+
 /// The link the shell uses to decide a network is on the rail. A live connection wins. When the
 /// adapter has not reported one, an account kept on screen (its session is unread, refused, or
 /// still in the keychain) stays as offline instead of disappearing.
@@ -2238,5 +2381,28 @@ mod tests {
         assert_eq!(published_link(Link::SignedOut, std::iter::empty()), Link::SignedOut);
         assert_eq!(published_link(Link::Connected, [Link::Offline]), Link::Connected);
         assert_eq!(published_link(Link::Expired, [Link::Offline]), Link::Expired);
+    }
+
+    #[test]
+    fn a_thread_id_names_its_parent_and_a_discord_name_is_one_line() {
+        use protocol::{AccountKey, Key, Network};
+        let key = |network, id: &str| Key::new(&AccountKey { network, account: "a".into() }, id);
+        assert_eq!(
+            super::derivable_thread(&key(Network::Slack, "C0:1.2")).as_ref().map(|(parent, root)| (parent.as_str(), root.as_str())),
+            Some(("C0", "1.2"))
+        );
+        assert_eq!(
+            super::derivable_thread(&key(Network::Teams, "19:c@thread.tacv2;messageid=9"))
+                .as_ref()
+                .map(|(parent, root)| (parent.as_str(), root.as_str())),
+            Some(("19:c@thread.tacv2", "9"))
+        );
+        assert_eq!(super::derivable_thread(&key(Network::Slack, "C0:1.2:3")), None);
+        assert_eq!(super::derivable_thread(&key(Network::Discord, "4101")), None);
+        assert_eq!(super::thread_name("  Hello\nthere"), "Hello there");
+        assert_eq!(super::thread_name("   "), "Thread");
+        assert_eq!(super::thread_name(&"x".repeat(150)).chars().count(), 100);
+        assert_eq!(super::first_line("Release train\nWho drives", 40), "Release train");
+        assert!(super::first_line("A post with no subject that goes on for quite a while", 40).ends_with('…'));
     }
 }
