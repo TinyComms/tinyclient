@@ -137,6 +137,9 @@ pub struct TinyRoom {
     pub ptt_only: bool,
     #[serde(default = "yes", deserialize_with = "true_or_null", skip_serializing_if = "is_true")]
     pub video_enabled: bool,
+    /// Only apps that encrypt end to end may join this room's call.
+    #[serde(default, deserialize_with = "or_default", skip_serializing_if = "crate::is_false")]
+    pub e2ee_required: bool,
     #[serde(default, deserialize_with = "or_default", skip_serializing_if = "Vec::is_empty")]
     pub overrides: Vec<TinyOverride>,
     /// What this account may do in this room. `None` from an older server.
@@ -157,6 +160,7 @@ impl TinyRoom {
             user_limit: 0,
             bitrate_kbps: 0,
             ptt_only: false,
+            e2ee_required: false,
             video_enabled: true,
             overrides: Vec::new(),
             my_permissions: None,
@@ -315,6 +319,8 @@ pub const TINY_FEATURE_TIMEOUTS: &str = "timeouts";
 pub const TINY_FEATURE_INVITE_OPTIONS: &str = "invite_options";
 pub const TINY_FEATURE_AUDIT_QUERY: &str = "audit_query";
 pub const TINY_FEATURE_VOICE_MODERATION: &str = "voice_moderation";
+/// Calls can be end-to-end encrypted: MLS between the apps, which the server only relays.
+pub const TINY_FEATURE_E2EE_CALLS: &str = "e2ee_calls";
 
 impl TinyCapabilities {
     pub fn has(&self, feature: &str) -> bool {
@@ -688,6 +694,8 @@ pub struct TinyRoomEdit {
     pub ptt_only: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub e2ee_required: Option<bool>,
 }
 
 /// The lowest and highest bitrate a room may have, and what one has unless set.

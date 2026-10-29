@@ -126,6 +126,77 @@ pub struct Call {
     pub inputs: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub outputs: Vec<String>,
+    /// How the call's media is protected, for the lock in the call's header. `None` for a call
+    /// that says nothing about it (every network but a Tiny server today).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security: Option<CallSecurity>,
+}
+
+/// A Tiny server call's protection (tinyserver's `docs/calls.md`, "End-to-end encryption").
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallSecurity {
+    pub mode: SecurityMode,
+    /// The call code: 30 digits from the group's epoch authenticator, the same for everyone in
+    /// the call, new whenever someone joins or leaves. Empty until the group has keys.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub code: String,
+    /// The group's epoch. It moves on every join and leave.
+    #[serde(default)]
+    pub epoch: u64,
+    /// Everyone else in the encrypted group, as its members' credentials say.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<SecureMember>,
+    /// People in the call whose app cannot encrypt end to end: why the call is
+    /// [`SecurityMode::Transport`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unsupported: Vec<String>,
+    /// Only with [`SecurityMode::Transport`]: the server itself has no end-to-end encryption.
+    #[serde(default, skip_serializing_if = "crate::is_false")]
+    pub server_lacks: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecurityMode {
+    /// Encrypted between each app and the server (DTLS-SRTP) only. The server could hear it.
+    #[default]
+    Transport,
+    /// End-to-end encryption is being set up. Our microphone is held back until it is.
+    Pending,
+    /// Only the people in the call hold the keys. The server forwards what it cannot read.
+    EndToEnd,
+}
+
+/// One other person in the encrypted group.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecureMember {
+    pub user_id: String,
+    /// Their identity key (hex), what "Mark as verified" remembers.
+    pub key: String,
+    /// The safety number both of us see for the pair of our keys: 45 digits.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub safety: String,
+    #[serde(default)]
+    pub trust: Trust,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Trust {
+    #[default]
+    Unverified,
+    /// Marked verified, and they still hold that key.
+    Verified,
+    /// Marked verified once, and the key they hold now is not that key.
+    Changed,
+}
+
+/// End-to-end encryption for a Tiny call: the room (whose id names the MLS group) and the file
+/// that holds this account's identity key, made there on first use.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TinyE2ee {
+    pub room_id: String,
+    pub identity: String,
 }
 
 /// What Discord's end-to-end encryption needs from mediad.
@@ -169,6 +240,10 @@ pub struct TinyOffer {
     pub slots: u16,
     pub muted: bool,
     pub deafened: bool,
+    /// The server can encrypt calls end to end (`e2ee_calls`): offer it. `None` on an older
+    /// server, and the call is encrypted to the server only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub e2ee: Option<TinyE2ee>,
 }
 
 /// Whose voice one receive slot carries, as the server's `call.slots` says.
@@ -218,6 +293,11 @@ pub enum MediaRequest {
     TinyAnswer { sdp: String },
     /// The server's whole map of receive slots, whenever it changes.
     TinySlots { audio: Vec<TinySlot> },
+    /// One `call.e2ee` frame from the server, as its JSON text, in the order it arrived.
+    TinyE2ee { frame: String },
+    /// Everyone in the room's call, us included, whenever it changes: whom the MLS group may
+    /// hold.
+    TinyRoster { user_ids: Vec<String> },
 
     // What the shell and the room decide about the sound, for mediad to apply. Each is answered
     // `Done`, and each holds until sent again.
@@ -402,6 +482,11 @@ pub enum MediaResponse {
     Interrupted,
     /// The call cannot go on. mediad exits after sending this.
     Failed { reason: CallFailure, detail: String },
+    /// A `call.e2ee` frame for the server, as its JSON text.
+    TinyE2ee { frame: String },
+    /// How the Tiny call is protected now. Every member's `trust` is `Unverified`: chatd knows
+    /// whom the user verified.
+    TinySecurity(CallSecurity),
 }
 
 impl MediaResponse {
