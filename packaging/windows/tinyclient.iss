@@ -66,9 +66,18 @@ Source: "tinyclient.ico"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\LICENSE"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreversion
 Source: "..\AGPL-3.0.txt"; DestDir: "{app}"; Flags: ignoreversion
 
+; The Start menu shortcut carries the AppUserModelID chatd posts notifications under
+; (chatd/src/notify.rs `app`): an unpackaged program's toasts are shown by the shortcut that
+; names its ID. Never change it, or notifications already allowed in Windows Settings are lost.
 [Icons]
-Name: "{autoprograms}\tinyclient"; Filename: "{app}\tinyclient.exe"; IconFilename: "{app}\tinyclient.ico"
-Name: "{autodesktop}\tinyclient"; Filename: "{app}\tinyclient.exe"; IconFilename: "{app}\tinyclient.ico"; Tasks: desktopicon
+Name: "{autoprograms}\tinyclient"; Filename: "{app}\tinyclient.exe"; IconFilename: "{app}\tinyclient.ico"; AppUserModelID: "dev.tinyclient.app"
+Name: "{autodesktop}\tinyclient"; Filename: "{app}\tinyclient.exe"; IconFilename: "{app}\tinyclient.ico"; AppUserModelID: "dev.tinyclient.app"; Tasks: desktopicon
+
+; The same ID's name and icon for the notification centre, so toasts show "tinyclient" and its
+; icon whichever way it was started. Removed with the program.
+[Registry]
+Root: HKA; Subkey: "Software\Classes\AppUserModelId\dev.tinyclient.app"; ValueType: string; ValueName: "DisplayName"; ValueData: "tinyclient"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\AppUserModelId\dev.tinyclient.app"; ValueType: string; ValueName: "IconUri"; ValueData: "{app}\tinyclient.ico"
 
 [Run]
 Filename: "{app}\tinyclient.exe"; Description: "{cm:LaunchProgram,tinyclient}"; Flags: nowait postinstall skipifsilent
