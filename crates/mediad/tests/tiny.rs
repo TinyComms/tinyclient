@@ -320,9 +320,14 @@ struct Mediad {
 
 impl Mediad {
     fn start(ice: &str, sink: &PathBuf) -> Mediad {
+        Mediad::saying("tone", ice, sink)
+    }
+
+    /// A mediad whose microphone is `audio` (`TINYCLIENT_MEDIAD_AUDIO`).
+    fn saying(audio: &str, ice: &str, sink: &PathBuf) -> Mediad {
         let mut child = Command::new(env!("CARGO_BIN_EXE_mediad"))
             .arg("1")
-            .env("TINYCLIENT_MEDIAD_AUDIO", "tone")
+            .env("TINYCLIENT_MEDIAD_AUDIO", audio)
             .env("TINYCLIENT_MEDIAD_SINK", sink)
             .env("TINYCLIENT_MEDIAD_ICE", ice)
             .stdin(Stdio::piped())
@@ -408,7 +413,8 @@ fn sink(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("tc-tiny-{}-{name}.pcm", std::process::id()))
 }
 
-/// The level of the last `seconds` of what a mediad played. The tone is about 5657.
+/// The level of the last `seconds` of what a mediad played. The tone is about 5657, and two
+/// tones of different pitches about 8000.
 fn played_level(sink: &PathBuf, seconds: f64) -> f64 {
     let bytes = std::fs::read(sink).unwrap_or_default();
     let pcm: Vec<i16> = bytes.as_chunks::<2>().0.iter().map(|&pair| i16::from_le_bytes(pair)).collect();
@@ -751,7 +757,10 @@ fn an_end_to_end_encrypted_room_is_heard_through_frames_the_sfu_cannot_read() {
     let names = ["ada", "bea", "cy"];
     let sinks: Vec<PathBuf> = names.iter().map(|name| sink(&format!("e2ee-{name}"))).collect();
     let keys = std::env::temp_dir().join(format!("tc-tiny-e2ee-{}", std::process::id()));
-    let mut people: Vec<Mediad> = sinks.iter().map(|sink| Mediad::start("udp", sink)).collect();
+    // Each says a tone of its own: two of one pitch, a whole number of 20 ms frames apart, can
+    // all but cancel in the mix of whoever hears both.
+    let tones = ["tone:440", "tone:550", "tone:660"];
+    let mut people: Vec<Mediad> = sinks.iter().zip(tones).map(|(sink, tone)| Mediad::saying(tone, "udp", sink)).collect();
     let mut slots = Vec::new();
     for (name, mediad) in names.iter().zip(&mut people) {
         let e2ee = TinyE2ee { room_id: ROOM.into(), identity: keys.join(name).to_string_lossy().into_owned() };
@@ -809,7 +818,8 @@ fn an_end_to_end_encrypted_room_is_heard_through_frames_the_sfu_cannot_read() {
         done(mediad, map(at, 3));
     }
     cy.event("Connected", |event| matches!(event, MediaResponse::Connected { .. }));
-    wait_for("Cy hears the others", || played_level(&sinks[2], 0.5) > 4000.);
+    // One tone alone is about 5657; both, at their two pitches, about 8000.
+    wait_for("Cy hears both the others", || played_level(&sinks[2], 0.5) > 7000.);
     // Cy leaves the group (leaf 2) and the call's map, though its mediad still runs and the
     // SFU still sends it what the others say: the rest move on with keys Cy never gets. (A
     // hung-up mediad's port answers the fake's UDP with resets Windows reports on the fake's

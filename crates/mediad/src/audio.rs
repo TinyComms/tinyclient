@@ -16,7 +16,7 @@
 //! stand-in said in words.
 //!
 //! `TINYCLIENT_MEDIAD_AUDIO` replaces the devices for tests: `null` hears silence, `tone` hears a
-//! 440 Hz tone, `onset` hears that tone once a second, each time led in by 40 ms too quiet to
+//! 440 Hz tone (`tone:550` another pitch, so two tones in one mix cannot cancel), `onset` hears that tone once a second, each time led in by 40 ms too quiet to
 //! count as speech, and none of them opens a device. `TINYCLIENT_MEDIAD_SINK` names a file that then takes
 //! what would have been played, as raw 48 kHz stereo `i16`.
 
@@ -609,6 +609,8 @@ enum Source {
     Silence,
     Tone {
         phase: f64,
+        /// How far the phase moves each sample.
+        step: f64,
     },
     /// A word a second: half a second of nothing, 40 ms of a faint tone, then the tone.
     Onset {
@@ -931,9 +933,12 @@ impl Audio {
     pub fn open_sides(want_input: Option<String>, want_output: Option<String>, sides: (bool, bool)) -> Result<Audio, AudioError> {
         let mut audio = Audio::empty(want_input, want_output, sides);
         if let Ok(kind) = std::env::var("TINYCLIENT_MEDIAD_AUDIO") {
-            audio.source = match kind.as_str() {
-                "tone" => Source::Tone { phase: 0. },
-                "onset" => Source::Onset { at: 0 },
+            let tone = |hz: f64| Source::Tone { phase: 0., step: hz * std::f64::consts::TAU / f64::from(RATE) };
+            let pitch = kind.strip_prefix("tone:").and_then(|hz| hz.parse().ok());
+            audio.source = match (kind.as_str(), pitch) {
+                ("tone", _) => tone(440.),
+                (_, Some(hz)) => tone(hz),
+                ("onset", _) => Source::Onset { at: 0 },
                 _ => Source::Silence,
             };
             audio.sink = match std::env::var_os("TINYCLIENT_MEDIAD_SINK") {
@@ -1077,10 +1082,10 @@ impl Audio {
                 frame.fill(0);
                 true
             }
-            Source::Tone { phase } => {
+            Source::Tone { phase, step } => {
                 for pair in frame.as_chunks_mut::<CHANNELS>().0 {
                     pair.fill((phase.sin() * 8000.) as i16);
-                    *phase = (*phase + 440. * std::f64::consts::TAU / f64::from(RATE)) % std::f64::consts::TAU;
+                    *phase = (*phase + *step) % std::f64::consts::TAU;
                 }
                 true
             }
