@@ -42,6 +42,8 @@ pub const OUTPUT: &str = "output";
 pub const SYSTEM_DEFAULT: &str = "@system";
 /// V4. Every join and every Accept starts muted.
 pub const JOIN_MUTED: &str = "join_muted";
+/// V19: "You're muted" shows when the microphone hears speech while I am muted in a call.
+pub const MUTED_TALK: &str = "muted_talk";
 /// V5. Everyone's voice, 0 to 100.
 pub const VOICE_VOLUME: &str = "voice_volume";
 /// V6. The level, 0 to 100, from which our microphone counts as speech, and in voice
@@ -97,6 +99,7 @@ fn kind(key: &str) -> Option<Kind> {
         KEEP_RUNNING | SOUNDS | CUE_JOINS | CUE_MINE | CUE_CONNECTION => Kind::Switch(true),
         ECHO_CANCELLATION | NOISE_SUPPRESSION | AUTO_GAIN => Kind::Switch(true),
         JOIN_MUTED | PUSH_TO_TALK => Kind::Switch(false),
+        MUTED_TALK => Kind::Switch(true),
         PTT_RELEASE_MS => Kind::Choice(&PTT_RELEASE_CHOICES, 200),
         CUE_VOLUME => Kind::Percent(50),
         VOICE_VOLUME => Kind::Percent(100),

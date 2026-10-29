@@ -58,7 +58,8 @@ impl Shell {
                 .child(glyph("icons/chevron-right.svg", 14., theme::text_faint()))
                 .child(glyph("icons/volume-2.svg", 18., if page.mine == Some(room.id.as_str()) { theme::positive() } else { theme::text_soft() }))
                 .child(div().flex_none().max_w(px(240.)).truncate().type_title().text_color(theme::text()).child(room.name.clone()))
-                .child(self.tiny_channel_facts(room)),
+                .child(self.tiny_channel_facts(room))
+                .children(self.tiny_channel_security(room, cx)),
             None => div()
                 .flex_1()
                 .min_w_0()

@@ -89,6 +89,19 @@ pub fn side_buttons() -> bool {
 
 /// Set while Settings records a key, so pressing it there does not also talk or mute.
 static PAUSED: AtomicBool = AtomicBool::new(false);
+/// The push-to-talk keys held right now: talk, and talk with priority. Set by the watching
+/// thread, read by the call views to light their push-to-talk pill.
+static TALK_HELD: [AtomicBool; 2] = [AtomicBool::new(false), AtomicBool::new(false)];
+
+/// Whether a push-to-talk key is held, and whether it is the priority one.
+pub fn talk_held() -> Option<bool> {
+    let [talk, priority] = &TALK_HELD;
+    if priority.load(Ordering::Relaxed) {
+        Some(true)
+    } else {
+        talk.load(Ordering::Relaxed).then_some(false)
+    }
+}
 
 pub fn pause(on: bool) {
     PAUSED.store(on, Ordering::Relaxed);
@@ -157,9 +170,15 @@ fn watch(toggles: &Sender<Action>) {
             held[at] = down;
             match action {
                 Action::Talk | Action::Priority => {
-                    let talk = Request::CallTalk { held: down, priority: action == Action::Priority };
+                    let priority = action == Action::Priority;
+                    let talk = Request::CallTalk { held: down, priority };
                     // No call: chatd says so, and there is nothing to do about it.
                     let _ = crate::client::ask(&talk);
+                    TALK_HELD[usize::from(priority)].store(down, Ordering::Relaxed);
+                    // The shell redraws its push-to-talk pill.
+                    if toggles.send(action).is_err() {
+                        return;
+                    }
                 }
                 // The shell is gone: so is the app.
                 Action::Mute | Action::Deafen if down && toggles.send(action).is_err() => return,
@@ -236,7 +255,8 @@ impl Shell {
         match action {
             Action::Mute => self.call_mute(cx),
             Action::Deafen => self.call_deafen(cx),
-            Action::Talk | Action::Priority => {}
+            // Held or let go: the push-to-talk pill lights or goes out.
+            Action::Talk | Action::Priority => cx.notify(),
         }
     }
 }

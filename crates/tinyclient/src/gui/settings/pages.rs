@@ -225,6 +225,7 @@ impl SettingsWindow {
                 } else {
                     "A room that requires push to talk uses it, whatever you pick here."
                 };
+                input.push("V19");
                 vec![
                     self.group(&input, None, window, cx).child(caption(mode)),
                     self.group(&["V13", "V15", "V16", "V17"], Some("Keys"), window, cx).child(caption(keys_caption())),
@@ -436,6 +437,11 @@ impl SettingsWindow {
                 self.segmented_row(id, &["Voice activation", "Push to talk"], usize::from(push), 0, None, move |this, ix, cx| this.set_switch(id, PUSH_TO_TALK, ix == 1, false, cx), cx)
             }
             "V14" => row(label, None, self.slider_control(id, cx)),
+            "V19" => {
+                let on = values.on(keys::MUTED_TALK);
+                let second = Some("Your microphone listens while you're muted, only to say so. Nothing is sent.".to_owned());
+                self.switch_row(id, on, true, second, move |this, on, cx| this.set_switch(id, keys::MUTED_TALK, on, true, cx), cx)
+            }
             "V18" => {
                 let second = Some("Plays your microphone back as others would hear it. Not during a call.".to_owned());
                 self.switch_row(id, self.loopback, false, second, |this, on, cx| this.set_loopback(on, cx), cx)

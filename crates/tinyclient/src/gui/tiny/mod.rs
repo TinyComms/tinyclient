@@ -155,6 +155,8 @@ pub struct State {
 
     /// The channel on show. None is the server's home.
     channel: Option<String>,
+    /// The person drawn large on the stage, pinned by a click on their tile.
+    focus: Option<String>,
     /// Categories folded, by key ([`model::LOOSE`] for the rooms in none).
     folded: HashSet<String>,
     members_open: bool,
@@ -240,6 +242,7 @@ impl State {
             call_epoch: 0,
             call_error: None,
             channel: None,
+            focus: None,
             folded: HashSet::new(),
             members_open: true,
             float: None,
@@ -411,7 +414,7 @@ impl Shell {
     }
 
     /// Remembers which server the page shows. When the page is up, it loads that server now.
-    pub(super) fn prefer_tiny(&mut self, account: AccountKey, cx: &mut Context<Self>) {
+    pub(in crate::gui) fn prefer_tiny(&mut self, account: AccountKey, cx: &mut Context<Self>) {
         if self.tiny_state.account.as_ref() == Some(&account) && (self.tiny_state.community.is_some() || self.tiny_state.loading) {
             return;
         }
@@ -426,10 +429,18 @@ impl Shell {
         }
     }
 
-    /// The name of the Tiny room `key` names, for the call dock.
-    pub(super) fn tiny_room(&self, key: &Key) -> Option<String> {
+    /// The name of the Tiny room `key` names, and its server's, for the call dock.
+    pub(super) fn tiny_room(&self, key: &Key) -> Option<(String, String)> {
         let community = self.tiny_state.community.as_ref().filter(|_| self.tiny_state.account.as_ref() == Some(&key.account()))?;
-        community.rooms.iter().find(|room| room.id == key.id).map(|room| room.name.clone())
+        let room = community.rooms.iter().find(|room| room.id == key.id)?;
+        let account = self.snapshot.as_ref().and_then(|snapshot| snapshot.account(&key.account()).map(|status| status.name.clone())).unwrap_or_default();
+        Some((room.name.clone(), model::server_name(community, &account)))
+    }
+
+    /// The Tiny server's column is on show with this call's server: its user panel holds mute
+    /// and deafen, so the dock above it need only say where the call is.
+    pub(in crate::gui) fn tiny_column_has(&self, key: &Key) -> bool {
+        matches!(self.sidebar_state.mode, Mode::Network(Network::Tiny)) && self.tiny_state.account.as_ref() == Some(&key.account()) && self.tiny_state.community.is_some()
     }
 
     fn tiny_live(&self) -> bool {
@@ -438,10 +449,18 @@ impl Shell {
         })
     }
 
-    /// The Tiny call on show, if this server has one up: its room.
-    fn tiny_call(&self) -> Option<&protocol::Call> {
+    /// The Tiny call on show, if this server has one, in whatever state: its room.
+    pub(super) fn tiny_call(&self) -> Option<protocol::Call> {
         let account = self.tiny_state.account.as_ref()?;
-        self.snapshot.as_ref()?.call.as_ref().filter(|call| call.conversation.account() == *account)
+        self.call_shown(self.snapshot.as_ref()?).filter(|call| call.conversation.account() == *account)
+    }
+
+    /// Where a made-up call of `--shot` goes: the room I sit in, else the first.
+    #[cfg(feature = "gui-shot")]
+    pub(super) fn tiny_shot_room(&self) -> Option<Key> {
+        let page = self.tiny_page_facts()?;
+        let room = page.mine.map(str::to_owned).or_else(|| page.community.rooms.first().map(|room| room.id.clone()))?;
+        Some(Key { network: Network::Tiny, account: page.account.account.clone(), id: room })
     }
 
     /// The page, when it has loaded.
@@ -720,6 +739,7 @@ impl Shell {
             return;
         };
         self.tiny_state.channel = Some(room_id.clone());
+        self.call_asked();
         self.call(Request::TinyCallJoin { account, room_id }, cx);
     }
 
@@ -764,7 +784,9 @@ impl Shell {
     /// A call that just began on this server gets the mute chosen before it (everyone's volume
     /// it has from chatd); the connection's numbers are read about once a second while it lasts.
     fn note_tiny_call(&mut self, cx: &mut Context<Self>) {
-        let call = self.tiny_call().map(|call| call.conversation.clone());
+        // A call that failed or only rings has no connection to measure.
+        let live = |call: &protocol::Call| !matches!(call.state, protocol::CallState::Failed { .. } | protocol::CallState::RingingIn { .. });
+        let call = self.tiny_call().filter(live).map(|call| call.conversation.clone());
         if call.is_none() {
             self.tiny_state.applied = None;
             if self.tiny_state.stats_task.take().is_some() {
@@ -777,6 +799,11 @@ impl Shell {
             return;
         }
         self.tiny_state.applied = call;
+        #[cfg(feature = "gui-shot")]
+        if let Some(stats) = crate::gui::call::shot_stats() {
+            self.tiny_state.stats = Some(stats);
+            return;
+        }
         let (muted, deafened) = std::mem::take(&mut self.tiny_state.preset);
         if muted || deafened {
             self.off_thread(cx, move || ask(&Request::CallSet { muted, deafened }), |_, _, _| {});
@@ -830,9 +857,10 @@ impl Shell {
         self.toast(Some(("icons/check.svg", super::theme::text_soft())), words, cx);
     }
 
-    pub(super) fn tiny_pick_channel(&mut self, room_id: Option<String>, cx: &mut Context<Self>) {
+    pub(in crate::gui) fn tiny_pick_channel(&mut self, room_id: Option<String>, cx: &mut Context<Self>) {
         if self.tiny_state.channel != room_id {
             self.tiny_state.call_error = None;
+            self.tiny_state.focus = None;
         }
         self.tiny_state.channel = room_id;
         cx.notify();
@@ -1227,8 +1255,13 @@ impl Shell {
         if let Some(ix) = flag("--tiny-room").and_then(|n| n.parse::<usize>().ok()) {
             self.tiny_state.channel = rooms.get(ix).cloned();
         }
+        if let Some(ix) = flag("--tiny-focus").and_then(|n| n.parse::<usize>().ok()) {
+            let room = self.tiny_state.channel.as_ref().and_then(|id| community.rooms.iter().find(|room| room.id == *id));
+            self.tiny_state.focus = room.and_then(|room| room.participants.get(ix)).map(|seat| seat.user_id.clone());
+        }
         match flag("--tiny-menu").as_deref() {
             Some("header") => self.tiny_open_float(Float::Header, cx),
+            Some("stats") => self.tiny_open_float(Float::Stats, cx),
             Some("channel") => {
                 if let Some(room_id) = self.tiny_state.channel.clone().or_else(|| rooms.first().cloned()) {
                     self.tiny_open_float(Float::Channel { room_id, at }, cx);
