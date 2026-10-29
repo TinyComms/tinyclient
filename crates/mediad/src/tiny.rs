@@ -26,7 +26,7 @@
 use crate::audio::{level, Audio};
 use crate::cue::Playing;
 use crate::framing::Conn;
-use crate::hear::Ear;
+use crate::hear::{Ear, Limiter};
 use crate::media::{self, announce, finish_cue, listen, mixdown, Devices, Gate, Send, Stream, MICROPHONE_DENIED};
 use crate::process::Processor;
 use crate::stats::Meter;
@@ -34,7 +34,7 @@ use crate::opus::Encoder;
 use crate::permission::{microphone, Microphone};
 use crate::rtp::SILENCE;
 use crate::session::Controls;
-use crate::{out, FRAME, FRAME_SAMPLES};
+use crate::{out, rt, FRAME, FRAME_SAMPLES};
 use mio::net::{TcpStream, UdpSocket};
 use mio::{Events, Interest, Poll, Token};
 use protocol::{CallFailure, CallPath, Cue, MediaResponse, TinyOffer, TinySlot};
@@ -215,6 +215,7 @@ struct Call {
     levels: (u8, u8),
     cue: Option<Playing>,
     processor: Processor,
+    limiter: Limiter,
     meter: Meter,
 }
 
@@ -256,8 +257,12 @@ impl Call {
             eprintln!("mediad: the new connection's socket: {err}");
         }
         self.packets.clear();
+        // Still connected as far as we could tell (the server stopped hearing us, or restarted
+        // before ICE noticed): this is the loss, and it gets its cue as `down` gives one. The
+        // Back cue follows when media flows on the new link (`up`).
         if self.connected {
             self.connected = false;
+            self.controls.cue(Cue::Lost);
             out::send(&MediaResponse::Interrupted);
         }
         self.lost.get_or_insert_with(Instant::now);
@@ -320,6 +325,12 @@ impl Call {
                     };
                 }
             }
+            // What the server sees of our microphone: its FEC is planned for that loss.
+            Event::MediaEgressStats(stats) if stats.mid == self.link.microphone => {
+                if let Some(loss) = stats.loss {
+                    self.encoder.set_loss(loss);
+                }
+            }
             Event::MediaData(data) => {
                 let mid = data.mid.to_string();
                 if !self.slots.contains_key(&mid) {
@@ -335,13 +346,18 @@ impl Call {
                 let Some(slot) = self.slots.get_mut(&mid) else {
                     return;
                 };
+                // End-to-end encryption's half of the frame transform: what does not open with
+                // its sender's key is dropped here, before the jitter buffer.
+                let Some(opus) = self.controls.e2ee(|e2ee| e2ee.open(&slot.user, &data.data)) else {
+                    return;
+                };
                 let stream = &mut slot.stream;
                 stream.last_packet = Instant::now();
                 // The RTP clock is 48 kHz, as ours.
                 stream.arrivals.arrived(data.time.numer() as u32, data.network_time);
-                stream.heard |= data.data[..] != SILENCE[..];
+                stream.heard |= opus[..] != SILENCE[..];
                 if !self.controls.deafened.load(Ordering::Relaxed) {
-                    stream.jitter.insert(**data.seq_range.start() as u16, data.data.to_vec());
+                    stream.jitter.insert(**data.seq_range.start() as u16, opus);
                 }
             }
             _ => {}
@@ -488,8 +504,12 @@ impl Call {
         let Some(pt) = writer.payload_params().next().map(|params| params.pt()) else {
             return;
         };
+        // The other half: sealed for the room's group, or held back while it has no keys.
+        let Some(payload) = self.controls.e2ee(|e2ee| e2ee.seal(opus)) else {
+            return;
+        };
         let time = MediaTime::new(tick * FRAME as u64, Frequency::FORTY_EIGHT_KHZ);
-        let _ = writer.audio_level(level, voice).write(pt, Instant::now(), time, opus.to_vec());
+        let _ = writer.audio_level(level, voice).write(pt, Instant::now(), time, payload);
     }
 
     fn encode(&mut self, frame: &[i16; FRAME_SAMPLES], tick: u64, voice: bool) {
@@ -554,7 +574,7 @@ impl Call {
                 }
             }
         }
-        mixdown(&mix, &self.controls, &mut self.cue, audio, &mut self.processor)
+        mixdown(&mix, &self.controls, &mut self.cue, audio, &mut self.processor, &mut self.limiter)
     }
 
     /// The 20 ms of a call whose devices are open. False when the call cannot go on.
@@ -568,6 +588,10 @@ impl Call {
         if self.ticks.is_multiple_of(5) && self.controls.metering() && (input, output) != self.levels {
             self.levels = (input, output);
             out::send(&MediaResponse::Levels { input, output });
+        }
+        if self.ticks.is_multiple_of(SECOND) {
+            audio.log_glitches();
+            self.meter.troubles = audio.troubles();
         }
         if self.ticks.is_multiple_of(SECOND) && self.connected {
             let stats = self.meter.second(self.slots.values().map(|slot| slot.stream.counts()));
@@ -661,6 +685,9 @@ impl Call {
             let jitter = &slot.stream.jitter;
             eprintln!("mediad: slot {mid}: {} lost ({} rebuilt), {} late", jitter.lost, slot.stream.rebuilt, jitter.late);
         }
+        if let Some(audio) = &self.audio {
+            media::sign_off(audio);
+        }
         if let Some(devices) = &mut self.devices {
             devices.stop();
         }
@@ -677,6 +704,9 @@ pub fn run(link: Link, user_id: String, controls: Arc<Controls>) {
             Some(Microphone::Allowed) | None => {}
         }
     }
+    // The tick is woken by the system timer: at 1 ms, not Windows' default 15.6 ms.
+    let _timer = rt::FineTimer::hold();
+    rt::tick_thread();
     let (Some(encoder), Ok(poll)) = (Encoder::voice(), Poll::new()) else {
         eprintln!("mediad: the Opus encoder or the poller could not be made");
         out::fail(CallFailure::Engine, ENGINE);
@@ -700,6 +730,7 @@ pub fn run(link: Link, user_id: String, controls: Arc<Controls>) {
         levels: (0, 0),
         cue: None,
         processor: Processor::new(),
+        limiter: Limiter::default(),
         meter: Meter::new(CallPath::Unknown),
     };
     if let Err(err) = call.register() {
@@ -754,7 +785,7 @@ mod tests {
     }
 
     fn spec(slots: u16) -> TinyOffer {
-        TinyOffer { user_id: "me".into(), host: "127.0.0.1".into(), slots, muted: false, deafened: false }
+        TinyOffer { user_id: "me".into(), host: "127.0.0.1".into(), slots, muted: false, deafened: false, e2ee: None }
     }
 
     /// One microphone and `slots` receive slots, Opus only, and both kinds of candidate.

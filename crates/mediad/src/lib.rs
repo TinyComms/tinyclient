@@ -7,7 +7,9 @@
 //!
 //! A Tiny server call: `tiny` is WebRTC to the server's SFU through str0m, in a 20 ms loop of its
 //! own built from the same jitter buffer, codecs, gate, mixer and devices; `framing` is its
-//! ICE-TCP. chatd carries the offer and answer over the server's live socket.
+//! ICE-TCP. chatd carries the offer and answer over the server's live socket. `e2ee` is its
+//! end-to-end encryption: the MLS group, through `davey` as for DAVE, and the frame transform
+//! between the codec and str0m.
 //!
 //! `mediad --play` is the other mode: one voice message or audio file (`play`, reading it with
 //! `decode` and speeding it up with `stretch`), the speaker only, until playing stops.
@@ -16,17 +18,23 @@ pub mod audio;
 pub mod cue;
 pub mod dave;
 pub mod decode;
+pub mod e2ee;
 pub mod framing;
 pub mod gateway;
+#[cfg(test)]
+mod harness;
 pub mod hear;
 pub mod jitter;
 pub mod media;
 pub mod opus;
 pub mod out;
 pub mod permission;
+pub mod pick;
 pub mod play;
 pub mod process;
 pub mod probe;
+pub mod ring;
+pub mod rt;
 pub mod rtp;
 pub mod session;
 pub mod stats;

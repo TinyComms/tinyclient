@@ -5293,6 +5293,7 @@ name = "mediad"
 version = "0.2.19"
 dependencies = [
  "aes-gcm",
+ "base64 0.22.1",
  "chacha20poly1305",
  "cpal",
  "davey",
@@ -5311,6 +5312,7 @@ dependencies = [
  "symphonia",
  "tungstenite 0.30.0",
  "unsafe-libopus",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

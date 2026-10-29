@@ -50,14 +50,20 @@ or move; Kick removes, Roles is Owner / Admin / Member.
   header to that category's end; a category onto a category puts it above. Drop targets light
   `accent_soft`. The new order is drawn at once and sent whole (`TinyLayout`).
 - **User panel,** 52 at the column's foot on `rail`, under the call dock when a call is up:
-  avatar 32 with presence, my name 13/600, then a line: `Voice connected · 38 ms` (coloured by
-  the link: `positive`, `warning` over 120 ms or 1.5 % loss, `danger` over 250 ms or 5 %),
-  `Seated in Lounge`, `Online` or `Connecting…`. Three 32 buttons: mic, headphones (each struck
-  and on `danger_soft` when off; without a call they choose what the next call starts with),
-  and a cog that opens Settings › Voice. A click on the connection line opens a
-  popover above it: channel, channel bitrate, ping, jitter, loss, sent and received kb/s, path
-  (Direct UDP, Direct TCP, Relayed) and codec, read about once a second from `CallStats` while
-  the call is up; until media flows, it says what mediad said instead.
+  avatar 32 with presence, my name 13/600, then a line: while the call is up, four 10 signal
+  bars and `Voice connected · 38 ms` (coloured by the link's grade, 07 §7a: `positive`,
+  `warning` at Fair, `danger` at Poor); `Connecting…` and `Reconnecting…` in `warning` while it
+  is; else `Seated in Lounge`, `Online` or `Connecting…` (the socket). A failed call is the
+  dock's to tell, never "Voice connected". Three 32 buttons, each focusable with a ring: mic,
+  headphones (each struck and on `danger_soft` when off; without a call they choose what the
+  next call starts with), and a cog that opens Settings › Voice. A click on the line opens
+  **Call health**, 288 wide, above it: the bars, "Call health" and the grade in words at the
+  right in its colour, up to three hints (glyph by level: alert in `danger` or `warning`, info,
+  check in `positive`) over a hairline, then channel, channel bitrate, ping, jitter, loss, sent
+  and received kb/s, path (Direct UDP, Direct TCP, Relayed) and codec, read about once a second
+  from `CallStats` while the call is up; until media flows, it says what mediad said instead.
+- **Call dock** over the panel, while a call of this server is up: the compact bar of 07 §2
+  (bars, `Voice connected`, `Lounge / Night Shift`, the security slot, Leave).
 
 ## 2. The pane
 
@@ -76,15 +82,45 @@ or move; Kick removes, Roles is Owner / Admin / Member.
   role colour and `You`; right-click is the person menu.
 - **Channel:** the stage holds a tile per person, 196 × 148, radius 12, `raised`, centred and
   wrapping: avatar 64, name 13/600 in the role colour, `You` chip, then the most serious state
-  as a chip (`Server muted` and `Can't speak here` in `danger`, else `text_soft`), and
-  `Muted for you` or the volume I set for them. A speaker's tile has a 2 `positive` edge. The
-  seat glyphs repeat in the tile's corner. Right-click a tile for the person menu.
-- **Call bar,** floating 20 above the bottom: a pill on `overlay` holding round 44 buttons for
-  mute, deafen and devices (Settings › Audio & video), then Leave (`danger_fill`, phone-off
-  glyph). Under it, only while echo cancellation is switched off in Settings › Voice, "Echo
-  cancellation is off: wear headphones…". Not in the call: Join
-  channel (primary, 36) and which microphone and speaker it will use; a full channel says so.
-  An empty channel is an empty state with the same Join.
+  as a chip (`Server muted` and `Can't speak here` in `danger`, `Priority speaker` in
+  `accent_soft`, else `text_soft`), and `Muted for you` or the volume I set for them. A
+  speaker's tile has a 2 `positive` edge and a 12 px glow of it at 25 % (`accent_text` while a
+  priority speaker talks). My own tile follows my call at once (mute, deafen, and my ring lit
+  exactly while I am heard), not the server's echo, and carries my signal bars, top left, which
+  open Call health; anyone else's ring lights on mediad's speaking edge or the server's,
+  whichever comes first. The seat glyphs repeat in the tile's corner, with `volume-x` in
+  `warning` when I muted them for me. **Hover** a tile: at its foot, round 28 buttons on
+  `overlay`, Volume (anyone but me: the person menu, slider first) and Focus. **Click** a
+  tile (or Enter on it; tiles are in the tab order with a focus ring) to focus it: that person
+  is drawn 420 × 300 with avatar 112 and the name 16/600, the rest below in a wrapping row;
+  click again, or its ✕, to go back. Changing channel unfocuses. Right-click a tile for the
+  person menu.
+- **Banner,** over the stage, 640 at most, radius 10, while my call here is not simply up:
+  `Connecting to Lounge… 0:03` (`accent_wash`, Cancel); `Connection lost. Reconnecting… 0:22
+  left` (`warning_soft`, "Your seat is kept while the call finds its way back.", Leave); or
+  the failure as the dock words it (`danger_soft`, Rejoin where one may come back, and ✕).
+  Removed from the call, a lost connection and "In a call on another device" offer Rejoin (or
+  Join here); a ban, a timeout, a deleted channel and removal from the server do not, and
+  nothing on a Tiny server offers to "open in" another app.
+- **Call bar,** floating 20 above the bottom: a pill on `overlay` holding round 44 buttons
+  (each in the tab order with a focus ring) for mute, deafen, devices (Settings › Audio &
+  video) and Call health (the signal bars), then Leave (`danger_fill`, phone-off glyph; Cancel
+  while connecting). The mute button rings `positive` while I am heard. A moderator's mute or
+  deafen, or a channel where I can't speak, holds its button on `danger_soft` at 55 % and says
+  so in its tooltip and in a pill over the bar ("A moderator muted you here", "You can't speak
+  in this channel"). **Pills** over the bar, 30 high: "You're muted · ⌘⇧M to talk"
+  (`danger_fill`, 07 §2a); push to talk, when V8 or the room asks for it, `Push to talk ·
+  hold F` on `overlay` (with no key: "pick a key in Settings › Voice", in `warning`, opening
+  it), lit `Talking` on `positive` while the key is held and `Priority speaking` on `accent`
+  for the priority key; and Call health's most serious hint, when it is `Bad`, in `warning`,
+  opening Call health. Under it, only while echo cancellation is switched off in Settings ›
+  Voice, "Echo cancellation is off: wear headphones…". Not in the call: Join channel
+  (primary, 36) and which microphone and speaker it will use; a full channel says "Lounge is
+  full · 12 of 12" and "Someone has to leave before you can join." An empty channel is an
+  empty state with the same Join.
+- **Moved by a moderator:** the call goes on in the new room, a toast says "Moved to Raid night
+  by a moderator" wherever I am, and the dock says it for 4 s. (`call.moved` does not say who;
+  when it does, the name goes in place of "a moderator".)
 - **Member list,** 248, `sidebar` fill, hairline at its left: a search field, then groups with
   a header `MODERATOR — 2` (a dot in the role colour): owners, then the roles shown
   separately by rank, then everyone else online, then Offline at 45 % opacity. Rows 44: avatar
@@ -209,6 +245,8 @@ its top.
   an owner myself", Transfer ownership… (typed confirmation; makes them an owner first, then
   unmakes me); Revoke every invite (typed confirmation).
 
+`TINYCLIENT_SHOT_CALL=tiny_<state>` (`gui/call/shot.rs`) draws a made-up call in the room I
+sit in, `--tiny-menu stats` opens Call health and `--tiny-focus n` focuses the nth tile.
 `--tiny-settings <page>` opens a page for a screenshot, with `--tiny-pick n` (the nth role,
 channel, or n members ticked), `--tiny-override <role>`, `--tiny-scroll <px>`, `--tiny-owner`
 and `--tiny-confirm transfer`. The demo's Night Shift has data for every page.

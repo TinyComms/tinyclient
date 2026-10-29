@@ -6,15 +6,133 @@
 //! call is running), `devices_menu`, `people_menu`, and the failures `failed_noanswer`,
 //! `failed_declined`, `failed_refused`, `failed_lost`, `failed_unreachable`, `failed_udp`,
 //! `failed_mic`, `failed_nomic`, `failed_speaker`, `failed_engine`, `failed_dave`.
+//!
+//! On a Tiny server (`--mode tiny`), `tiny_` before a state puts the call in the room I sit in
+//! on the demo's server instead: `tiny_joined`, `tiny_connecting`, `tiny_reconnecting`,
+//! `tiny_joined_muted`, `tiny_muted_talking` (muted, and the meter hears speech),
+//! `tiny_joined_speaking`, `tiny_poor` (a bad link), `tiny_failed_kicked`, `tiny_failed_lost`,
+//! `tiny_failed_banned`, `tiny_ptt` (push to talk, key up) and `tiny_ptt_talking` (key held).
+//!
+//! A Tiny call is end-to-end encrypted, its group the room's seats. `tiny_e2ee_pending`,
+//! `tiny_transport` and `tiny_check` (someone's verified key changed) show the indicator's other
+//! faces; `tiny_security` opens the security panel from the channel's top bar,
+//! `tiny_security_bar` from the column's compact bar. `tiny_poor`'s numbers carry audio trouble
+//! too, for the health hints.
 
+use super::security::Place;
 use super::{now, Confirm, Ended, Menu, Subject};
 use crate::gui::state::Snapshot;
 use protocol::{
-    Call, CallFailure, CallState, ConversationKind, Key, Network, Occupant, Occupants, Participant,
+    Call, CallFailure, CallSecurity, CallState, ConversationKind, Key, Network, Occupant, Occupants, Participant, SecureMember,
+    SecurityMode, Trust,
 };
 
-fn named() -> Option<String> {
+fn asked() -> Option<String> {
     std::env::var("TINYCLIENT_SHOT_CALL").ok().filter(|name| !name.is_empty())
+}
+
+/// The state asked for, without the `tiny_` that says where.
+fn named() -> Option<String> {
+    asked().map(|name| name.strip_prefix("tiny_").map_or_else(|| name.clone(), str::to_owned))
+}
+
+/// The made-up call is in a Tiny room: the shell puts it in the one I sit in.
+pub(super) fn tiny() -> bool {
+    asked().is_some_and(|name| name.starts_with("tiny_"))
+}
+
+/// Push to talk is on, and whether its key is held: `ptt` and `ptt_talking`.
+pub(super) fn ptt() -> Option<bool> {
+    match named()?.as_str() {
+        "ptt" => Some(false),
+        "ptt_talking" => Some(true),
+        _ => None,
+    }
+}
+
+/// I am talking into a muted microphone.
+pub(super) fn muted_talking() -> bool {
+    named().is_some_and(|name| name == "muted_talking")
+}
+
+/// The connection's numbers for a made-up Tiny call: a good link, or with `tiny_poor` a bad
+/// one over TCP.
+pub(super) fn stats() -> Option<protocol::CallStats> {
+    let name = asked().filter(|name| name.starts_with("tiny_"))?;
+    let poor = name == "tiny_poor";
+    Some(protocol::CallStats {
+        rtt_ms: if poor { 184 } else { 38 },
+        jitter_ms: if poor { 41 } else { 4 },
+        loss_permille: if poor { 62 } else { 2 },
+        send_kbps: 66,
+        receive_kbps: 182,
+        path: if poor { protocol::CallPath::Tcp } else { protocol::CallPath::Udp },
+        codec: "opus".to_owned(),
+        // Counted over the call: drawn as the first poll, so as the last second's.
+        playout_underruns: if poor { 2 } else { 0 },
+        concealed_frames: if poor { 4 } else { 0 },
+        fec_recovered: if poor { 2 } else { 0 },
+        ..protocol::CallStats::default()
+    })
+}
+
+/// How the made-up Tiny call is protected: end to end, with everyone else in the room's call in
+/// its group (`members` are their ids, from the room the shell puts the call in).
+pub(super) fn security(members: &[String]) -> Option<CallSecurity> {
+    if !tiny() {
+        return None;
+    }
+    let name = named()?;
+    let mode = match name.as_str() {
+        "e2ee_pending" => SecurityMode::Pending,
+        "transport" => SecurityMode::Transport,
+        _ => SecurityMode::EndToEnd,
+    };
+    let end_to_end = mode == SecurityMode::EndToEnd;
+    let digits = |seed: u64, count: usize| -> String {
+        let mut x = seed;
+        (0..count)
+            .map(|_| {
+                x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+                char::from(b'0' + (x >> 59) as u8 % 10)
+            })
+            .collect()
+    };
+    let members = if end_to_end {
+        members
+            .iter()
+            .enumerate()
+            .map(|(ix, user_id)| SecureMember {
+                user_id: user_id.clone(),
+                key: format!("{:064x}", ix + 1),
+                safety: digits(ix as u64 + 11, 45),
+                trust: match (ix, name.as_str()) {
+                    (0, "check") => Trust::Changed,
+                    (0, _) => Trust::Verified,
+                    _ => Trust::Unverified,
+                },
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    Some(CallSecurity {
+        mode,
+        code: if end_to_end { digits(7, 30) } else { String::new() },
+        epoch: if end_to_end { 4 } else { 0 },
+        members,
+        unsupported: Vec::new(),
+        server_lacks: mode == SecurityMode::Transport,
+    })
+}
+
+/// Which indicator the security panel is open from, when a shot opens it.
+pub(super) fn security_at() -> Option<Place> {
+    match named()?.as_str() {
+        "security" => Some(Place::TopBar),
+        "security_bar" => Some(Place::TinyBar),
+        _ => None,
+    }
 }
 
 fn channel(name: &str) -> bool {
@@ -63,6 +181,8 @@ pub(super) fn call(snapshot: &Snapshot) -> Option<Call> {
             "The speaker didn't start. Reconnect it or choose another in Microphone and speaker, then try again.",
         ),
         "failed_engine" => failed(CallFailure::Engine, "The call engine stopped."),
+        "failed_kicked" => failed(CallFailure::Refused, "You were removed from the call."),
+        "failed_banned" => failed(CallFailure::Refused, "You were banned from this server."),
         "failed_dave" => failed(
             CallFailure::Encryption,
             "Discord raised its encryption requirement. Update tinyclient, or take this call in Discord.",
@@ -71,8 +191,11 @@ pub(super) fn call(snapshot: &Snapshot) -> Option<Call> {
     };
     // The open conversation's, so the header pill reads Leave or Cancel as it would.
     let conversation = snapshot.open.as_ref().map_or_else(|| key("shot"), |open| open.key.clone());
-    let muted = name == "joined_muted";
-    let participants = if channel(&name) {
+    let muted = matches!(name.as_str(), "joined_muted" | "muted_talking");
+    let participants = if tiny() {
+        // A Tiny stage draws the room's seats, not the call's roster.
+        Vec::new()
+    } else if channel(&name) {
         vec![
             person("Dev Patel", false, false, false),
             person("Iris Navarro", false, true, true),
@@ -90,19 +213,35 @@ pub(super) fn call(snapshot: &Snapshot) -> Option<Call> {
     let joined = match name.as_str() {
         "ringing_out" => now() - 12,
         "reconnecting" => now() - 8,
-        "failed_lost" => now() - 900,
+        "failed_lost" | "failed_kicked" | "failed_banned" => now() - 900,
         "incoming" | "connecting" => 0,
         name if name.starts_with("failed") => 0,
         name if channel(name) => now() - 271,
         _ => now() - 724,
     };
     let menu = name == "devices_menu";
-    let listed = |names: &[&str]| if menu { names.iter().map(|name| (*name).to_owned()).collect() } else { Vec::new() };
+    let speaking = matches!(name.as_str(), "joined_speaking" | "devices_menu" | "people_menu" | "ptt_talking");
+    // The first is the system default and what the automatic choice uses; a "Krisp" one is virtual.
+    let listed = |names: &[&str]| -> Vec<protocol::AudioDevice> {
+        let device = |(ix, name): (usize, &&str)| protocol::AudioDevice {
+            id: format!("shot-{name}"),
+            name: (*name).to_owned(),
+            is_virtual: name.starts_with("Krisp"),
+            default: ix == 0,
+            auto: ix == 0,
+        };
+        if menu { names.iter().enumerate().map(device).collect() } else { Vec::new() }
+    };
     Some(Call {
-        speaking: matches!(name.as_str(), "joined_speaking" | "devices_menu" | "people_menu"),
-        level: menu.then_some(62),
-        inputs: listed(&["MacBook Pro Microphone", "Studio headset", "Desk camera microphone"]),
+        speaking,
+        level: (menu || name == "muted_talking").then_some(62),
+        output_level: menu.then_some(48),
+        inputs: listed(&["MacBook Pro Microphone", "Studio headset", "Desk camera microphone", "Krisp Microphone (Krisp Audio)"]),
         outputs: listed(&["MacBook Pro Speakers", "Studio headset"]),
+        input_id: "shot-MacBook Pro Microphone".to_owned(),
+        output_id: "shot-MacBook Pro Speakers".to_owned(),
+        device_notice: None,
+        device_stuck: false,
         conversation,
         state,
         participants,
@@ -113,6 +252,7 @@ pub(super) fn call(snapshot: &Snapshot) -> Option<Call> {
         output: "MacBook Pro Speakers".to_owned(),
         engine_linked: true,
         video: Vec::new(),
+        security: None,
     })
 }
 
@@ -123,6 +263,9 @@ fn mara() -> Subject {
 /// Who the made-up call is with, or the voice channel of the channel shots. `None` with a
 /// conversation open: the call is in it, and its row says who.
 pub(super) fn subject(snapshot: &Snapshot) -> Option<Subject> {
+    if tiny() {
+        return None;
+    }
     if channel(&named()?) {
         let space = Some("tinyclient-dev".to_owned());
         return Some(Subject { title: "Lounge".to_owned(), kind: ConversationKind::Voice, avatar: None, space });
@@ -139,6 +282,7 @@ pub(super) fn menu() -> Option<Menu> {
     match named()?.as_str() {
         "devices_menu" => Some(Menu::Devices),
         "people_menu" => Some(Menu::People),
+        "security" | "security_bar" => Some(Menu::Security),
         _ => None,
     }
 }

@@ -14,7 +14,7 @@ use crate::gui::theme::{self, Type};
 use gpui::{canvas, div, prelude::*, px, AnyElement, ClipboardItem, Context, Div, MouseButton, SharedString, Window};
 use crate::gui::hotkeys::{self, Action, Reach};
 use protocol::settings::{
-    self as keys, account_scope, Values, AUTO_GAIN, CACHE_MB, CACHE_MB_CHOICES, CUE_CONNECTION, CUE_JOINS, CUE_MINE, CUE_VOLUME,
+    self as keys, account_scope, DeviceChoice, Values, AUTO_GAIN, CACHE_MB, CACHE_MB_CHOICES, CUE_CONNECTION, CUE_JOINS, CUE_MINE, CUE_VOLUME,
     ECHO_CANCELLATION, GLOBAL, INPUT, JOIN_MUTED, KEEP_DAYS, KEEP_DAYS_CHOICES, KEEP_RUNNING, NOISE_SUPPRESSION, OUTPUT, PTT_RELEASE_CHOICES,
     PTT_RELEASE_MS, PUSH_TO_TALK, RECEIPTS, SENSITIVITY, SOUNDS, TYPING, VOICE_VOLUME,
 };
@@ -225,6 +225,7 @@ impl SettingsWindow {
                 } else {
                     "A room that requires push to talk uses it, whatever you pick here."
                 };
+                input.push("V19");
                 vec![
                     self.group(&input, None, window, cx).child(caption(mode)),
                     self.group(&["V13", "V15", "V16", "V17"], Some("Keys"), window, cx).child(caption(keys_caption())),
@@ -359,8 +360,9 @@ impl SettingsWindow {
                 self.switch_row(id, on, true, None, move |this, on, cx| this.set_switch(id, key, on, true, cx), cx)
             }
             "S10" => {
-                let output = self.devices.as_ref().map(|d| d.default_output.clone()).unwrap_or_default();
-                let device = values.device(OUTPUT).unwrap_or(output);
+                let choice = values.device_choice(OUTPUT);
+                let listed = self.devices.as_ref().and_then(|d| d.means(&choice, Picker::Output)).map(|d| d.name.clone());
+                let device = listed.or_else(|| choice.name().map(str::to_owned)).unwrap_or_default();
                 let playing = self.playing.is_some();
                 let tip = match (playing, device.is_empty()) {
                     (true, _) => "Playing test sound".to_owned(),
@@ -435,6 +437,11 @@ impl SettingsWindow {
                 self.segmented_row(id, &["Voice activation", "Push to talk"], usize::from(push), 0, None, move |this, ix, cx| this.set_switch(id, PUSH_TO_TALK, ix == 1, false, cx), cx)
             }
             "V14" => row(label, None, self.slider_control(id, cx)),
+            "V19" => {
+                let on = values.on(keys::MUTED_TALK);
+                let second = Some("Your microphone listens while you're muted, only to say so. Nothing is sent.".to_owned());
+                self.switch_row(id, on, true, second, move |this, on, cx| this.set_switch(id, keys::MUTED_TALK, on, true, cx), cx)
+            }
             "V18" => {
                 let second = Some("Plays your microphone back as others would hear it. Not during a call.".to_owned());
                 self.switch_row(id, self.loopback, false, second, |this, on, cx| this.set_loopback(on, cx), cx)
@@ -788,19 +795,32 @@ impl SettingsWindow {
     /// whole name is in its tooltip and in the menu.
     fn device_row(&mut self, id: &'static str, cx: &mut Context<Self>) -> Div {
         let (key, picker, noun) = if id == "V1" { (INPUT, Picker::Input, "microphone") } else { (OUTPUT, Picker::Output, "speaker") };
-        let stored = prefs::values().device(key);
+        let choice = prefs::values().device_choice(key);
+        let stored = (choice != DeviceChoice::Auto).then_some(());
         let devices = self.devices.clone().unwrap_or_default();
-        let (listed, default) = if id == "V1" { (&devices.inputs, &devices.default_input) } else { (&devices.outputs, &devices.default_output) };
-        let gone = stored.as_ref().is_some_and(|name| self.devices.is_some() && !listed.contains(name));
-        let (shown, whole) = match &stored {
-            Some(name) if gone => (format!("{name} (not connected)"), format!("{name} (not connected)")),
-            Some(name) => (name.clone(), name.clone()),
-            None if listed.is_empty() && self.devices.is_some() => (format!("No {noun} found"), format!("No {noun} found")),
-            None if default.is_empty() => ("System default".to_owned(), "System default".to_owned()),
-            // The device the default is now is the menu's to say: here it only crowds the name.
-            None => ("System default".to_owned(), format!("System default: {default}")),
+        let listed = devices.listed(picker);
+        let means = devices.means(&choice, picker).map(|d| d.name.clone());
+        let gone = matches!(choice, DeviceChoice::Device { .. }) && self.devices.is_some() && means.is_none();
+        let virtual_picked = devices.means(&choice, picker).is_some_and(|d| d.is_virtual);
+        let (shown, whole) = match &choice {
+            DeviceChoice::Device { name, .. } if gone => (format!("{name} (not connected)"), format!("{name} (not connected)")),
+            DeviceChoice::Device { name, .. } => {
+                let name = means.clone().unwrap_or_else(|| name.clone());
+                (name.clone(), if virtual_picked { format!("{name} (virtual)") } else { name })
+            }
+            _ if listed.is_empty() && self.devices.is_some() => (format!("No {noun} found"), format!("No {noun} found")),
+            // The device it means now is the menu's to say: here it only crowds the name.
+            DeviceChoice::System => ("System default".to_owned(), means.map_or("System default".to_owned(), |name| format!("System default: {name}"))),
+            DeviceChoice::Auto => ("Automatic".to_owned(), means.map_or("Automatic".to_owned(), |name| format!("Automatic: {name}"))),
         };
-        let second = gone.then(|| "Calls use the system default until it is back.".into());
+        let stand_in = devices.means(&DeviceChoice::Auto, picker).map_or("another device".to_owned(), |d| d.name.clone());
+        let second = if gone {
+            Some(format!("Calls use {stand_in} until it is back, then switch back by themselves.").into())
+        } else if choice == DeviceChoice::Auto && listed.iter().any(|d| d.default && d.is_virtual) {
+            Some("The system default is a virtual device, so calls use your hardware. Pick it to use it.".into())
+        } else {
+            None
+        };
         let anchors = self.anchors.clone();
         let anchor: &'static str = if id == "V1" { "V1-menu" } else { "V2-menu" };
         let label = label_of(id);
@@ -837,36 +857,63 @@ impl SettingsWindow {
                 }
             }));
         let reset = stored.as_ref().map(|_| {
-            reset_button(SharedString::from(format!("{id}-reset")), format!("Reset {label} to the system default").into())
+            reset_button(SharedString::from(format!("{id}-reset")), format!("Reset {label} to automatic").into())
                 .on_click(cx.listener(move |this, _, _, cx| this.set(id, GLOBAL.into(), key, None, cx)))
         });
         row(label, second, div().flex().items_center().child(reset_slot(reset)).child(picker_button))
     }
 
-    /// A picker's choices in menu order, by the value stored and the words shown: the system
-    /// default first, then every device listed, then the stored one if it is not connected.
+    /// A picker's choices in menu order, by the value stored and the words shown: Automatic,
+    /// System default, the hardware, the virtual devices, then the chosen one if it is not
+    /// connected.
     pub(super) fn picker_choices(&self, picker: Picker) -> Vec<(Option<String>, String)> {
         let devices = self.devices.clone().unwrap_or_default();
-        let (listed, default, key) = match picker {
-            Picker::Input => (devices.inputs, devices.default_input, INPUT),
-            Picker::Output => (devices.outputs, devices.default_output, OUTPUT),
+        let listed = devices.listed(picker);
+        let key = if picker == Picker::Input { INPUT } else { OUTPUT };
+        let now = |choice: DeviceChoice, words: &str| match devices.means(&choice, picker) {
+            Some(device) => format!("{words} ({})", device.name),
+            None => words.to_owned(),
         };
-        let system = if default.is_empty() { "System default".to_owned() } else { format!("System default ({default})") };
-        let mut choices = vec![(None, system)];
-        let stored = prefs::values().device(key);
-        let missing = stored.filter(|name| !listed.contains(name));
-        choices.extend(listed.into_iter().map(|name| (Some(name.clone()), name)));
-        choices.extend(missing.map(|name| (Some(name.clone()), format!("{name} (not connected)"))));
+        let mut choices = vec![(None, now(DeviceChoice::Auto, "Automatic")), (DeviceChoice::System.value(), now(DeviceChoice::System, "System default"))];
+        let device = |d: &protocol::AudioDevice| {
+            let words = if d.is_virtual { format!("{} (virtual)", d.name) } else { d.name.clone() };
+            (DeviceChoice::device(&d.name, &d.id).value(), words)
+        };
+        choices.extend(listed.iter().filter(|d| !d.is_virtual).map(device));
+        choices.extend(listed.iter().filter(|d| d.is_virtual).map(device));
+        let choice = prefs::values().device_choice(key);
+        if let DeviceChoice::Device { name, .. } = &choice {
+            if devices.means(&choice, picker).is_none() {
+                choices.push((choice.value(), format!("{name} (not connected)")));
+            }
+        }
         choices
     }
 
+    /// Which of [`Self::picker_choices`] is the one chosen.
+    pub(super) fn picker_checked(&self, picker: Picker) -> usize {
+        let key = if picker == Picker::Input { INPUT } else { OUTPUT };
+        let choice = prefs::values().device_choice(key);
+        let devices = self.devices.clone().unwrap_or_default();
+        let listed = devices.listed(picker);
+        match &choice {
+            DeviceChoice::Auto => 0,
+            DeviceChoice::System => 1,
+            DeviceChoice::Device { .. } => {
+                let ordered = listed.iter().filter(|d| !d.is_virtual).chain(listed.iter().filter(|d| d.is_virtual));
+                let found = ordered.clone().position(|d| choice.is(d, listed));
+                2 + found.unwrap_or(ordered.count())
+            }
+        }
+    }
+
     pub(super) fn device_menu(&mut self, picker: Picker, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let (key, anchor) = match picker {
-            Picker::Input => (INPUT, "V1-menu"),
-            Picker::Output => (OUTPUT, "V2-menu"),
+        let anchor = match picker {
+            Picker::Input => "V1-menu",
+            Picker::Output => "V2-menu",
         };
         let bounds = self.anchors.borrow().get(anchor).copied()?;
-        let stored = prefs::values().device(key);
+        let checked = self.picker_checked(picker);
         let choices = self.picker_choices(picker);
         let cursor = self.menu_cursor.min(choices.len().saturating_sub(1));
         // As wide as the system's names, up to 440, so two devices that differ only at the end
@@ -876,7 +923,7 @@ impl SettingsWindow {
             if ix == 1 {
                 items = items.child(menu_separator());
             }
-            let item = menu_item_check(("device", ix), stored == value, words, None)
+            let item = menu_item_check(("device", ix), ix == checked, words, None)
                 .when(ix == cursor, |item| item.bg(theme::selected()))
                 .on_click(cx.listener(move |this, _, window, cx| this.pick_device(picker, value.clone(), window, cx)));
             items = items.child(item);

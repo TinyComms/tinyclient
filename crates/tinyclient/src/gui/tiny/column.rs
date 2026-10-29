@@ -278,6 +278,9 @@ impl Shell {
     fn seat_row(&self, page: &Page, room_id: &str, seat: &TinySeat, cx: &mut Context<Self>) -> AnyElement {
         let name = model::name_by_id(page.community, &seat.user_id);
         let me = seat.user_id == page.me;
+        // My mute and my ring as my call has them, before the server echoes them back.
+        let call = self.tiny_call().filter(|call| call.conversation.id == room_id);
+        let seat = &super::channel::as_heard(seat, me, call.as_ref());
         let avatar = super::super::call::ringed(Avatar::new(&page.key(&seat.user_id), &name, 20.).build(), 20., seat.speaking && !seat.server_muted);
         let glyphs = seat_glyphs(seat);
         let content = div()

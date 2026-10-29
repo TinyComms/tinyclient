@@ -9,9 +9,9 @@
 //! server has the adapter leave on the network, so nobody is left ringing or shown in a channel.
 
 use crate::hub::{now, Hub};
-use protocol::settings::{INPUT, JOIN_MUTED, OUTPUT};
+use protocol::settings::{GLOBAL, INPUT, JOIN_MUTED, OUTPUT};
 use protocol::{
-    clip, read_frame, write_frame, Call, CallFailure, CallState, Change, Cue, Key, MediaRequest,
+    clip, read_frame, write_frame, AudioDevice, Call, CallFailure, CallState, Change, Cue, Key, MediaRequest,
     MediaResponse, Participant, TinyOffer, TinySlot, VoiceJoin, DEVICES_LIMIT, OCCUPANTS_LIMIT,
 };
 use std::io::{self, BufReader};
@@ -82,6 +82,8 @@ struct Live {
     /// The room requires push-to-talk (a Tiny room's `ptt_only`, or no voice activation
     /// there), whatever the user chose.
     push_to_talk: bool,
+    /// How mediad last said the call is protected, before whom the user verified is applied.
+    secured: Option<protocol::CallSecurity>,
 }
 
 /// The running mediad and the call it exists for. Dropping it ends the call.
@@ -107,6 +109,8 @@ enum Slot {
 
 /// Told the conversation of a call that just failed.
 type Failed = Box<dyn Fn(&Key) + Send + Sync>;
+/// Told a frame mediad has for the network's socket, and the conversation of its call.
+type Signal = Box<dyn Fn(&Key, String) + Send + Sync>;
 
 /// At most one call, across every network.
 #[derive(Default)]
@@ -114,6 +118,7 @@ pub struct Calls {
     slot: Mutex<Slot>,
     next: AtomicU64,
     failed: Mutex<Option<Failed>>,
+    signal: Mutex<Option<Signal>>,
     /// The mediad started for Settings' microphone test or test sound, outside a call.
     tester: Mutex<Option<Tester>>,
 }
@@ -194,8 +199,14 @@ fn new_call(conversation: Key, state: CallState) -> Live {
         video: Vec::new(),
         speaking: false,
         level: None,
+        output_level: None,
+        input_id: String::new(),
+        output_id: String::new(),
+        device_notice: None,
+        device_stuck: false,
         inputs: Vec::new(),
         outputs: Vec::new(),
+        security: None,
     };
     Live {
         call,
@@ -207,6 +218,7 @@ fn new_call(conversation: Key, state: CallState) -> Live {
         metering: false,
         me: String::new(),
         push_to_talk: false,
+        secured: None,
     }
 }
 
@@ -299,25 +311,41 @@ impl Live {
             MediaResponse::Speaking { user_id, speaking } => return self.speaking(&user_id, speaking),
             // The roster is the adapter's to change. Someone who left is no longer speaking.
             MediaResponse::Gone { user_id } => return self.speaking(&user_id, false),
-            MediaResponse::Devices { input, output } => {
-                if (&self.call.input, &self.call.output) == (&input, &output) {
+            MediaResponse::Devices { mut input, mut output, mut input_id, mut output_id, notice, stuck } => {
+                for text in [&mut input, &mut output, &mut input_id, &mut output_id] {
+                    clip(text, 400);
+                }
+                let notice = notice.map(|mut words| {
+                    clip(&mut words, 600);
+                    words
+                });
+                let call = &self.call;
+                if (&call.input, &call.output, &call.input_id, &call.output_id, &call.device_notice, call.device_stuck) == (&input, &output, &input_id, &output_id, &notice, stuck) {
                     return false;
                 }
                 self.call.input = input;
                 self.call.output = output;
+                self.call.input_id = input_id;
+                self.call.output_id = output_id;
+                self.call.device_notice = notice;
+                self.call.device_stuck = stuck;
             }
-            // Levels are for the device menu's meter, and stop here unless it is open.
-            MediaResponse::Levels { input, .. } => {
-                if !self.metering || self.call.level == Some(input) {
+            // Levels are for the device menu's meters, and stop here unless it is open.
+            MediaResponse::Levels { input, output } => {
+                let levels = (Some(input.min(100)), Some(output.min(100)));
+                if !self.metering || (self.call.level, self.call.output_level) == levels {
                     return false;
                 }
-                self.call.level = Some(input.min(100));
+                (self.call.level, self.call.output_level) = levels;
             }
             MediaResponse::DeviceList { inputs, outputs } => {
-                let bounded = |mut names: Vec<String>| {
-                    names.truncate(DEVICES_LIMIT);
-                    names.iter_mut().for_each(|name| clip(name, 200));
-                    names
+                let bounded = |mut devices: Vec<AudioDevice>| {
+                    devices.truncate(DEVICES_LIMIT);
+                    for device in &mut devices {
+                        clip(&mut device.name, 200);
+                        clip(&mut device.id, 400);
+                    }
+                    devices
                 };
                 let (inputs, outputs) = (bounded(inputs), bounded(outputs));
                 if (&self.call.inputs, &self.call.outputs) == (&inputs, &outputs) {
@@ -326,7 +354,18 @@ impl Live {
                 self.call.inputs = inputs;
                 self.call.outputs = outputs;
             }
-            MediaResponse::Source { .. } => return false,
+            // Whom the user verified is chatd's to know; a call that is not a Tiny one never
+            // hears this.
+            MediaResponse::TinySecurity(security) => {
+                let account = self.call.conversation.account();
+                self.secured = Some(security.clone());
+                let security = Some(crate::verified::trusted(&account, security));
+                if self.call.security == security {
+                    return false;
+                }
+                self.call.security = security;
+            }
+            MediaResponse::Source { .. } | MediaResponse::TinyE2ee { .. } => return false,
             MediaResponse::Ready { .. }
             | MediaResponse::Streams { .. }
             | MediaResponse::Done
@@ -408,6 +447,15 @@ impl ActiveCall {
             while let Ok(frame) = read_frame::<MediaResponse>(&mut stdout) {
                 if frame.is_reply() {
                     let _ = reply.send(frame);
+                    continue;
+                }
+                if let MediaResponse::DeviceList { inputs, outputs } = &frame {
+                    learn_devices(&reader, inputs, outputs);
+                }
+                // A frame for the server: the adapter of the call's account sends it.
+                if let MediaResponse::TinyE2ee { frame } = frame {
+                    let conversation = crate::hub::lock(&seen).call.conversation.clone();
+                    reader.calls.signal(&conversation, frame);
                     continue;
                 }
                 let mut live = crate::hub::lock(&seen);
@@ -527,6 +575,30 @@ impl Calls {
         *crate::hub::lock(&self.failed) = Some(Box::new(told));
     }
 
+    /// Who sends what mediad has for a network's socket: the server, through the adapter.
+    pub fn on_signal(&self, told: impl Fn(&Key, String) + Send + Sync + 'static) {
+        *crate::hub::lock(&self.signal) = Some(Box::new(told));
+    }
+
+    fn signal(&self, conversation: &Key, frame: String) {
+        if let Some(told) = &*crate::hub::lock(&self.signal) {
+            told(conversation, frame);
+        }
+    }
+
+    /// The user verified someone, or took it back: the call on `account` shows it at once.
+    pub fn reverify(&self, hub: &Hub, account: &protocol::AccountKey) {
+        let Some(call) = self.describe().0.filter(|call| call.conversation.account() == *account) else {
+            return;
+        };
+        let refreshed = self.update(hub, &call.conversation, |live| {
+            live.call.security = live.secured.clone().map(|security| crate::verified::trusted(account, security));
+        });
+        if refreshed {
+            self.tell(hub);
+        }
+    }
+
     /// A call with a mediad just turned into a failure. Drops the mediad, which waits for it to
     /// exit, and says so; both outside the slot's lock.
     fn stopped(&self, hub: &Hub, stopped: Option<ActiveCall>) {
@@ -606,6 +678,22 @@ impl Calls {
         if let Some(tester) = crate::hub::lock(&self.tester).as_mut() {
             let _ = tester.send(&MediaRequest::Tune(tuning));
             let _ = tester.send(&MediaRequest::Processing(settings.processing()));
+        }
+    }
+
+    /// V1 or V2 changed: the call's mediad, or the test's, opens the new choice at once, and
+    /// the next call starts with it too.
+    pub fn redevice(&self, hub: &Hub) {
+        let (input, output) = {
+            let settings = hub.settings();
+            (settings.device(INPUT), settings.device(OUTPUT))
+        };
+        let devices = MediaRequest::Devices { input, output };
+        if let Some(active) = crate::hub::lock(&self.slot).running() {
+            let _ = active.request(&devices);
+        }
+        if let Some(tester) = crate::hub::lock(&self.tester).as_mut() {
+            let _ = tester.send(&devices);
         }
     }
 
@@ -790,6 +878,7 @@ impl Calls {
             live.metering = on;
             if !on {
                 live.call.level = None;
+                live.call.output_level = None;
             }
         });
         match self.request(hub, &MediaRequest::Meter { on }) {
@@ -1080,6 +1169,20 @@ fn arrival(call: &Call, roster: &[Participant], now: i64) -> Option<Cue> {
     }
 }
 
+/// The devices the system lists, against V1 and V2: a choice stored by name alone (before ids
+/// were kept) gains the id of the device of that name, and a device the system renamed keeps
+/// being found under its new name. Stored at once, so the choice survives a restart either way.
+fn learn_devices(hub: &Hub, inputs: &[AudioDevice], outputs: &[AudioDevice]) {
+    for (key, listed) in [(INPUT, inputs), (OUTPUT, outputs)] {
+        let better = hub.settings().device_choice(key).upgrade(listed);
+        if let Some(better) = better {
+            if let Err(err) = hub.set_setting(GLOBAL, key, better.value()) {
+                eprintln!("chatd: {key}: {err}");
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1167,18 +1270,50 @@ mod tests {
     }
 
     #[test]
+    fn a_device_saved_by_name_learns_its_id_and_survives_a_restart() {
+        let dir = std::env::temp_dir().join(format!("tc-media-devices-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("chat.sqlite");
+        const HEADSET: &str = "Headset Microphone (CORSAIR HS55 Wireless Core Receiver)";
+        let id = "wasapi:{0.0.1.00000000}.{e1332b3d-ea19-49ca-a920-d17e2523f4ee}";
+        {
+            let hub = Hub::new(crate::store::Store::open(&path).unwrap());
+            // As 0.2.19 stored it: the name alone. The speaker was never chosen.
+            hub.set_setting(GLOBAL, INPUT, Some(HEADSET.into())).unwrap();
+            let device = |id: &str, name: &str| AudioDevice { id: id.into(), name: name.into(), ..AudioDevice::default() };
+            let inputs = [device("k", "Krisp Microphone (Krisp Audio)"), device(id, HEADSET)];
+            learn_devices(&hub, &inputs, &[device("s", "Speakers")]);
+            assert_eq!(hub.settings().device_choice(INPUT), protocol::settings::DeviceChoice::device(HEADSET, id));
+            assert_eq!(hub.settings().device(OUTPUT), None, "nothing chosen is nothing stored");
+        }
+        let hub = Hub::new(crate::store::Store::open(&path).unwrap());
+        assert_eq!(hub.settings().device(INPUT), Some(format!("{HEADSET}\t{id}")));
+        drop(hub);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn devices_and_failures_reach_the_call_and_levels_do_not() {
         let mut live = live(CallState::Joined);
-        let devices = MediaResponse::Devices { input: "Mic".into(), output: "Speakers".into() };
+        let devices = MediaResponse::Devices { input: "Mic".into(), output: "Speakers".into(), input_id: "m".into(), output_id: "s".into(), notice: None, stuck: false };
         assert!(live.apply(devices.clone()));
         assert!(!live.apply(devices));
         assert_eq!((live.call.input.as_str(), live.call.output.as_str()), ("Mic", "Speakers"));
+        assert_eq!((live.call.input_id.as_str(), live.call.output_id.as_str()), ("m", "s"));
+        // A stand-in is said in words until the chosen device is back.
+        let notice = Some("Headset isn't connected. Using Mic until it's back.".to_owned());
+        let standing_in = MediaResponse::Devices { input: "Mic".into(), output: "Speakers".into(), input_id: "m".into(), output_id: "s".into(), notice: notice.clone(), stuck: false };
+        assert!(live.apply(standing_in));
+        assert_eq!(live.call.device_notice, notice);
         assert!(!live.apply(MediaResponse::Levels { input: 40, output: 10 }), "nobody has the device menu open");
         live.metering = true;
         assert!(live.apply(MediaResponse::Levels { input: 40, output: 10 }));
-        assert!(!live.apply(MediaResponse::Levels { input: 40, output: 90 }), "only our own level is drawn");
-        assert_eq!(live.call.level, Some(40));
-        let listed = MediaResponse::DeviceList { inputs: vec!["Mic".into(); 40], outputs: vec!["Speakers".into()] };
+        assert!(!live.apply(MediaResponse::Levels { input: 40, output: 10 }), "nothing changed");
+        assert!(live.apply(MediaResponse::Levels { input: 40, output: 90 }), "the speaker has a meter too");
+        assert_eq!((live.call.level, live.call.output_level), (Some(40), Some(90)));
+        let device = |name: &str| AudioDevice { id: format!("id-{name}"), name: name.into(), ..AudioDevice::default() };
+        let listed = MediaResponse::DeviceList { inputs: vec![device("Mic"); 40], outputs: vec![device("Speakers")] };
         assert!(live.apply(listed.clone()));
         assert!(!live.apply(listed));
         assert_eq!((live.call.inputs.len(), live.call.outputs.len()), (DEVICES_LIMIT, 1));

@@ -1140,6 +1140,9 @@ pub fn answer(hub: &Hub, request: &Request) -> Option<Response> {
                 if let Some(video) = edit.video_enabled {
                     room.video_enabled = video;
                 }
+                if let Some(e2ee) = edit.e2ee_required {
+                    room.e2ee_required = e2ee;
+                }
             }
             changed(community)
         }

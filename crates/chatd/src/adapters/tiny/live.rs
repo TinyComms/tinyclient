@@ -19,7 +19,7 @@ use super::super::discord::gateway::{wait_sockets, Pollable, WakePair, POLL_IN, 
 use super::super::{net, Context, Refusal, Reply, ReconnectWait, PANIC_PAUSE, RECONNECTING};
 use crate::hub::lock;
 use super::{members_of, Saved};
-use protocol::{join_host, CallFailure, Cue, Link, MediaRequest, Occupant, Participant, Presence, TinyOffer, TinySeat, TinySlot};
+use protocol::{join_host, CallFailure, Cue, Link, MediaRequest, Occupant, Participant, Presence, TinyE2ee, TinyOffer, TinySeat, TinySlot};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -113,13 +113,15 @@ pub enum Ask {
     Move { user_id: String, room_id: String, reply: Reply<()> },
     /// The priority key is held, or let go: told to the server with our mute and deafen.
     Priority { on: bool },
+    /// A `call.e2ee` frame from mediad, for the server as it is.
+    E2ee { frame: String },
 }
 
 impl Ask {
     fn into_reply(self) -> Option<Reply<()>> {
         match self {
             Ask::Join { reply, .. } | Ask::Leave { reply } | Ask::Kick { reply, .. } | Ask::Moderate { reply, .. } | Ask::Move { reply, .. } => Some(reply),
-            Ask::Look | Ask::Hangup { .. } | Ask::State { .. } | Ask::Priority { .. } => None,
+            Ask::Look | Ask::Hangup { .. } | Ask::State { .. } | Ask::Priority { .. } | Ask::E2ee { .. } => None,
         }
     }
 
@@ -278,6 +280,10 @@ struct Seat {
     priority: bool,
     /// Who holds priority speech in our room's call, as mediad was last told.
     ducking: Vec<String>,
+    /// The server encrypts calls end to end (`e2ee_calls`), read at each fresh `ready`.
+    e2ee: bool,
+    /// Everyone in our room's call, as mediad was last told: whom its MLS group may hold.
+    rostered: Vec<String>,
 }
 
 /// Someone in a call: the mute and deafen they set, and what the server says of them.
@@ -360,6 +366,7 @@ fn words(someone: bool, code: &str) -> &'static str {
         "bad_frame" => "The server couldn't read that request.",
         "bad_sdp" => "The server couldn't use tinyclient's audio setup.",
         "media_unavailable" => "This server's audio isn't available. Try again later.",
+        "e2ee_required" => "This room only takes calls encrypted end to end, and this one couldn't be. Try again.",
         _ => "That didn't work. Try again.",
     }
 }
@@ -396,6 +403,8 @@ pub(super) fn keep_live(ctx: &Context, saved: &Saved, live: &Live, timing: &Timi
         deafened: false,
         priority: false,
         ducking: Vec::new(),
+        e2ee: false,
+        rostered: Vec::new(),
     };
     let mut pause = timing.first;
     while !ctx.stopped() {
@@ -664,6 +673,9 @@ fn serve(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, timing: &Ti
                         state(wire, pending, refs, seat, timing)
                     }
                     Ask::Priority { .. } => Ok(()),
+                    // Only for the seat that has media; one from a call that has gone is stale.
+                    Ask::E2ee { frame } if seat.call_id.is_some() => wire.send(frame),
+                    Ask::E2ee { .. } => Ok(()),
                     Ask::Moderate { room_id, user_id, server_muted, server_deafened, reply } => {
                         let reference = refs.to_string();
                         pending.push(Pending { reference: reference.clone(), asked: Asked::Moderate, until: Instant::now() + timing.answer, reply: Some(reply) });
@@ -768,26 +780,43 @@ fn move_with(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, wire: &
     }
 }
 
+/// The offer, and whether it comes with end-to-end encryption.
+type Offered = (String, bool);
+
+/// The version of the server's `call.e2ee` mediad speaks.
+const E2EE_VERSION: u16 = 1;
+
 #[allow(clippy::too_many_arguments)]
-fn ask_join(wire: &mut Wire, pending: &mut Vec<Pending>, refs: u64, room_id: String, sdp: Option<String>, reply: Option<Reply<()>>, timing: &Timing) -> io::Result<()> {
+fn ask_join(wire: &mut Wire, pending: &mut Vec<Pending>, refs: u64, room_id: String, sdp: Option<Offered>, reply: Option<Reply<()>>, timing: &Timing) -> io::Result<()> {
     let reference = refs.to_string();
     let mut frame = json!({"type": "call.join", "ref": reference, "room_id": room_id});
     let media = sdp.is_some();
-    if let Some(sdp) = sdp {
+    if let Some((sdp, e2ee)) = sdp {
         frame["sdp"] = json!(sdp);
+        // An older server ignores the field; a newer one says after its answer what the call is.
+        if e2ee {
+            frame["e2ee"] = json!(E2EE_VERSION);
+        }
     }
     pending.push(Pending { reference, asked: Asked::Join(room_id, media), until: Instant::now() + timing.answer, reply });
     wire.send(frame.to_string())
 }
 
 /// mediad's offer for a room, with mediad started for it, then what the room asks of the call.
-fn offer(ctx: &Context, saved: &Saved, seat: &Seat, room: &str) -> Result<String, String> {
+/// On a server that encrypts calls end to end, the offer says so, with the room that names the
+/// group and where this account keeps its identity key; mediad then hears who is in the call.
+fn offer(ctx: &Context, saved: &Saved, seat: &mut Seat, room: &str) -> Result<Offered, String> {
     let host = tungstenite::http::Uri::try_from(saved.base_url.as_str()).ok().and_then(|uri| uri.host().map(|host| host.trim_matches(['[', ']']).to_owned()));
-    let offer = TinyOffer { user_id: seat.me.clone(), host: host.unwrap_or_default(), slots: ROOM_CAP - 1, muted: false, deafened: false };
+    let identity = || crate::verified::identity_path(&ctx.account).to_string_lossy().into_owned();
+    let e2ee = seat.e2ee.then(|| TinyE2ee { room_id: room.to_owned(), identity: identity() });
+    let offered = e2ee.is_some();
+    let offer = TinyOffer { user_id: seat.me.clone(), host: host.unwrap_or_default(), slots: ROOM_CAP - 1, muted: false, deafened: false, e2ee };
     let sdp = ctx.tiny_offer(room, offer)?;
     let (kbps, push_to_talk) = super::manage::room_audio(saved, room);
     ctx.tiny_room(room, kbps, push_to_talk);
-    Ok(sdp)
+    seat.rostered.clear();
+    roster(ctx, seat, room);
+    Ok((sdp, offered))
 }
 
 /// The room to take again after `ready`, when the user's seat went with the old socket.
@@ -912,6 +941,13 @@ fn heard_frame(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, pendi
             }
         }
         "call.answer" => answered(ctx, seat, pending, frame, true),
+        // The room's end-to-end encryption, for mediad alone: str0m's keys and the group's
+        // never leave it. Only for the seat that has media, in the order it came.
+        "call.e2ee" => {
+            if let (true, Some(room)) = (seat.call_id.is_some(), seat.wanted.clone()) {
+                ctx.tell_media(&room, MediaRequest::TinyE2ee { frame: frame.to_string() });
+            }
+        }
         "call.slots" => {
             let current = seat.call_id.is_some() && text(frame, "call_id") == seat.call_id.as_deref();
             if let (true, Some(room)) = (current, seat.wanted.clone()) {
@@ -954,6 +990,7 @@ fn ready_heard(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, heard
     let fresh = seat.since.is_none();
     if fresh {
         live.set_media(super::media_of(&saved.base_url));
+        seat.e2ee = super::manage::capabilities_of(saved).has(protocol::TINY_FEATURE_E2EE_CALLS);
     }
     seat.since = Some(heard.seq);
     if heard.me.role != seat.role && matches!(heard.me.role.as_str(), "owner" | "admin" | "member") {
@@ -1063,9 +1100,23 @@ fn tell(ctx: &Context, seat: &Seat, room: &str) {
     ctx.occupants(room, occupants, people.len() as u32);
 }
 
+/// Everyone in our room's call, us included, told to mediad when it changes: its MLS group
+/// takes in only people the call has, and names its members by them.
+fn roster(ctx: &Context, seat: &mut Seat, room: &str) {
+    if !seat.e2ee || !ctx.in_call(room) {
+        return;
+    }
+    let people: Vec<String> = seat.calls.get(room).into_iter().flatten().map(|who| who.user.clone()).collect();
+    if people != seat.rostered {
+        seat.rostered = people.clone();
+        ctx.tell_media(room, MediaRequest::TinyRoster { user_ids: people });
+    }
+}
+
 /// Who in our room's call holds priority speech, told to mediad when it changes, so it ducks
 /// everyone else while they talk.
 fn duck(ctx: &Context, seat: &mut Seat, room: &str) {
+    roster(ctx, seat, room);
     if !ctx.in_call(room) {
         return;
     }

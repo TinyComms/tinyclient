@@ -93,6 +93,26 @@ pub struct Participant {
     pub priority: bool,
 }
 
+/// One microphone or speaker the system lists.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AudioDevice {
+    /// The system's id for it: a WASAPI endpoint id, a CoreAudio UID, an ALSA name. What a
+    /// choice (`settings::DeviceChoice`) finds it by first.
+    pub id: String,
+    /// As the system names it, which on Windows includes the driver in brackets.
+    pub name: String,
+    /// Software, not hardware (Krisp, VB-Cable, Voicemeeter, NVIDIA Broadcast, ...): never
+    /// used unless picked.
+    #[serde(default, rename = "virtual", skip_serializing_if = "is_false")]
+    pub is_virtual: bool,
+    /// The system default now.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub default: bool,
+    /// What a call uses when nothing was chosen (`DeviceChoice::Auto`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub auto: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Call {
     pub conversation: Key,
@@ -109,6 +129,18 @@ pub struct Call {
     pub input: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub output: String,
+    /// The system's ids for them (`AudioDevice::id`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub input_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub output_id: String,
+    /// In words, why a device in use is not the one chosen, or that one is not working: shown
+    /// until it is put right. `None` while everything is as chosen and running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_notice: Option<String>,
+    /// A device stays silent after it was rebuilt: the notice asks the user to switch device.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub device_stuck: bool,
     /// False until mediad links a real media engine. The lifecycle runs either way.
     pub engine_linked: bool,
     pub video: Vec<VideoStream>,
@@ -120,12 +152,86 @@ pub struct Call {
     /// nobody is adjusting sends no changes for it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub level: Option<u8>,
+    /// The level of what our speaker plays, 0 to 100, on the same terms as `level`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_level: Option<u8>,
     /// Every microphone and speaker the system lists, at most [`DEVICES_LIMIT`] of each. Empty
     /// until mediad says.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub inputs: Vec<String>,
+    pub inputs: Vec<AudioDevice>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub outputs: Vec<String>,
+    pub outputs: Vec<AudioDevice>,
+    /// How the call's media is protected, for the lock in the call's header. `None` for a call
+    /// that says nothing about it (every network but a Tiny server today).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security: Option<CallSecurity>,
+}
+
+/// A Tiny server call's protection (tinyserver's `docs/calls.md`, "End-to-end encryption").
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallSecurity {
+    pub mode: SecurityMode,
+    /// The call code: 30 digits from the group's epoch authenticator, the same for everyone in
+    /// the call, new whenever someone joins or leaves. Empty until the group has keys.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub code: String,
+    /// The group's epoch. It moves on every join and leave.
+    #[serde(default)]
+    pub epoch: u64,
+    /// Everyone else in the encrypted group, as its members' credentials say.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<SecureMember>,
+    /// People in the call whose app cannot encrypt end to end: why the call is
+    /// [`SecurityMode::Transport`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unsupported: Vec<String>,
+    /// Only with [`SecurityMode::Transport`]: the server itself has no end-to-end encryption.
+    #[serde(default, skip_serializing_if = "crate::is_false")]
+    pub server_lacks: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecurityMode {
+    /// Encrypted between each app and the server (DTLS-SRTP) only. The server could hear it.
+    #[default]
+    Transport,
+    /// End-to-end encryption is being set up. Our microphone is held back until it is.
+    Pending,
+    /// Only the people in the call hold the keys. The server forwards what it cannot read.
+    EndToEnd,
+}
+
+/// One other person in the encrypted group.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecureMember {
+    pub user_id: String,
+    /// Their identity key (hex), what "Mark as verified" remembers.
+    pub key: String,
+    /// The safety number both of us see for the pair of our keys: 45 digits.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub safety: String,
+    #[serde(default)]
+    pub trust: Trust,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Trust {
+    #[default]
+    Unverified,
+    /// Marked verified, and they still hold that key.
+    Verified,
+    /// Marked verified once, and the key they hold now is not that key.
+    Changed,
+}
+
+/// End-to-end encryption for a Tiny call: the room (whose id names the MLS group) and the file
+/// that holds this account's identity key, made there on first use.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TinyE2ee {
+    pub room_id: String,
+    pub identity: String,
 }
 
 /// What Discord's end-to-end encryption needs from mediad.
@@ -169,6 +275,10 @@ pub struct TinyOffer {
     pub slots: u16,
     pub muted: bool,
     pub deafened: bool,
+    /// The server can encrypt calls end to end (`e2ee_calls`): offer it. `None` on an older
+    /// server, and the call is encrypted to the server only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub e2ee: Option<TinyE2ee>,
 }
 
 /// Whose voice one receive slot carries, as the server's `call.slots` says.
@@ -201,7 +311,8 @@ pub enum MediaRequest {
     Meter { on: bool },
     /// Muted: capture nothing and send nothing. Deafened: play nothing.
     Audio { muted: bool, deafened: bool },
-    /// Device names as the system lists them. `None` follows the system default.
+    /// The microphone and speaker to use, as V1 and V2 store them (`settings::DeviceChoice`):
+    /// `None` is the automatic choice. Sent at start and whenever either setting changes.
     Devices { input: Option<String>, output: Option<String> },
     /// Gains, the speech gate and which cues play (Settings › Sounds and Audio & video). Sent
     /// at start and whenever one changes.
@@ -218,6 +329,11 @@ pub enum MediaRequest {
     TinyAnswer { sdp: String },
     /// The server's whole map of receive slots, whenever it changes.
     TinySlots { audio: Vec<TinySlot> },
+    /// One `call.e2ee` frame from the server, as its JSON text, in the order it arrived.
+    TinyE2ee { frame: String },
+    /// Everyone in the room's call, us included, whenever it changes: whom the MLS group may
+    /// hold.
+    TinyRoster { user_ids: Vec<String> },
 
     // What the shell and the room decide about the sound, for mediad to apply. Each is answered
     // `Done`, and each holds until sent again.
@@ -317,6 +433,26 @@ pub struct CallStats {
     /// As `opus`. Empty when not known.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub codec: String,
+    /// The call's audio health, counted over the whole call rather than the last second, so the
+    /// UI can tell a clean call from one that glitched. Glitches the system reported on the
+    /// microphone or the speaker (a buffer underrun or overrun on the device).
+    #[serde(default)]
+    pub device_glitches: u32,
+    /// Microphone audio dropped because the call fell too far behind it.
+    #[serde(default)]
+    pub capture_overruns: u32,
+    /// 20 ms ticks that found no microphone audio: a hole in what was sent.
+    #[serde(default)]
+    pub capture_gaps: u32,
+    /// The speaker ran dry and had to refill: a gap in what was heard.
+    #[serde(default)]
+    pub playout_underruns: u32,
+    /// Lost frames from others that were made up (packet loss concealment).
+    #[serde(default)]
+    pub concealed_frames: u32,
+    /// Lost frames from others rebuilt from the copy in the next packet (Opus in-band FEC).
+    #[serde(default)]
+    pub fec_recovered: u32,
 }
 
 /// What the user chose for a call's sound. Percentages, 0 to 100.
@@ -393,15 +529,35 @@ pub enum MediaResponse {
     /// Our microphone's level and the mix being played, 0 to 100. At most ten a second, only
     /// while they change, and only while `Meter` is on.
     Levels { input: u8, output: u8 },
-    /// The devices in use, at start and whenever the system moves them.
-    Devices { input: String, output: String },
-    /// Every device the system lists, by the names `MediaRequest::Devices` takes. Sent at start,
-    /// when `Meter` turns on, and whenever one is plugged in or removed.
-    DeviceList { inputs: Vec<String>, outputs: Vec<String> },
+    /// The devices in use, at start and whenever they change: a pick, a device coming or going,
+    /// the system default moving, a device that broke and was opened again.
+    Devices {
+        input: String,
+        output: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        input_id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        output_id: String,
+        /// In words: a device in use that stands in for the one chosen, or one that is not
+        /// working. `None` when all is as chosen.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        notice: Option<String>,
+        /// A device stayed silent after it was rebuilt: the user should switch device.
+        #[serde(default, skip_serializing_if = "is_false")]
+        stuck: bool,
+    },
+    /// Every device the system lists. Sent at start, when `Meter` turns on, and whenever one is
+    /// plugged in or removed, or the default moves.
+    DeviceList { inputs: Vec<AudioDevice>, outputs: Vec<AudioDevice> },
     /// Media stopped and mediad is reconnecting on its own.
     Interrupted,
     /// The call cannot go on. mediad exits after sending this.
     Failed { reason: CallFailure, detail: String },
+    /// A `call.e2ee` frame for the server, as its JSON text.
+    TinyE2ee { frame: String },
+    /// How the Tiny call is protected now. Every member's `trust` is `Unverified`: chatd knows
+    /// whom the user verified.
+    TinySecurity(CallSecurity),
 }
 
 impl MediaResponse {
