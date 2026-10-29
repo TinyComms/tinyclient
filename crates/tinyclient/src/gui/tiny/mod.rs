@@ -185,6 +185,9 @@ pub struct State {
     sliding: Option<String>,
 
     stats: Option<CallStats>,
+    /// The poll before `stats`, so the audio counters (counts over the whole call) can be read
+    /// as what grew in the last second.
+    stats_before: Option<CallStats>,
     /// Why there are no numbers, when mediad said.
     stats_note: Option<String>,
     stats_task: Option<Task<()>>,
@@ -260,6 +263,7 @@ impl State {
             slider: Rc::default(),
             sliding: None,
             stats: None,
+            stats_before: None,
             stats_note: None,
             stats_task: None,
             name_input,
@@ -791,6 +795,7 @@ impl Shell {
             self.tiny_state.applied = None;
             if self.tiny_state.stats_task.take().is_some() {
                 self.tiny_state.stats = None;
+                self.tiny_state.stats_before = None;
                 self.tiny_state.stats_note = None;
             }
             return;
@@ -813,12 +818,13 @@ impl Shell {
             let going = this.update(cx, |this, cx| {
                 match answer {
                     Ok(Response::CallStats { stats }) => {
-                        this.tiny_state.stats = Some(stats);
+                        this.tiny_state.stats_before = this.tiny_state.stats.replace(stats);
                         this.tiny_state.stats_note = None;
                     }
                     // Before media flows mediad says why there is nothing to measure yet.
                     Ok(Response::Error { detail, .. }) => {
                         this.tiny_state.stats = None;
+                        this.tiny_state.stats_before = None;
                         this.tiny_state.stats_note = Some(detail);
                     }
                     _ => {}

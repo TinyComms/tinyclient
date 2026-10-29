@@ -152,7 +152,8 @@ impl Shell {
 
     /// How this server's call is doing, while it has one.
     pub(in crate::gui) fn tiny_health(&self) -> Option<Health> {
-        self.tiny_state.stats.as_ref().map(Health::from_stats)
+        let before = self.tiny_state.stats_before.as_ref();
+        self.tiny_state.stats.as_ref().map(|stats| Health::from_polls(before, stats))
     }
 
     /// Call health, over the panel: the link graded, what to do about it in words, then the

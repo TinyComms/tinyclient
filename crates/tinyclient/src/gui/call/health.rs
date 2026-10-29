@@ -3,8 +3,9 @@
 //! from `CallStats` (about once a second while a call is up) and never measured here.
 //!
 //! The audio pipeline's own counters (the microphone dropping audio, the speaker running dry,
-//! audio concealed or recovered) are [`Health`] fields that stay `None` until `CallStats`
-//! carries them; each hint that needs one is simply not given without it.
+//! audio concealed or recovered) come in `CallStats` as counts over the whole call; [`Health`]
+//! takes what each grew by since the poll before, so a hint speaks of the last second and goes
+//! when the trouble does. A field is `None` only when nothing was polled.
 //!
 //! Also here, because it is the same kind of judgement: whether I seem to be talking while
 //! muted ([`MutedTalk`]), and how long a reconnect has left before the call is given up.
@@ -25,7 +26,8 @@ pub(in crate::gui) struct Health {
     pub jitter_ms: Option<u32>,
     pub loss_permille: Option<u16>,
     pub path: CallPath,
-    /// Microphone audio dropped before it was sent (capture overruns), over the stats window.
+    /// Microphone audio dropped or missing before it was sent (capture overruns and gaps), over
+    /// the stats window.
     pub overruns: Option<u32>,
     /// Times playback ran dry (output underruns), over the stats window.
     pub underruns: Option<u32>,
@@ -36,20 +38,40 @@ pub(in crate::gui) struct Health {
 }
 
 impl Health {
-    /// What `stats` says. The fields `CallStats` does not carry yet stay `None`.
-    // CONTRACT: when the audio pipeline adds `overruns`, `underruns`, `concealed_permille` and
-    // `fec_permille` to `CallStats` (counts over the same window as `loss_permille`), set them
-    // here with `Some(stats.field)`; nothing else in the shell changes.
+    /// What one poll says, its audio counters taken as grown from nothing: the first poll of a
+    /// call, or where only the link is wanted.
     pub fn from_stats(stats: &CallStats) -> Health {
+        Health::from_polls(None, stats)
+    }
+
+    /// What `now` says, the audio counters as grown since `before` (the poll a second ago). A
+    /// counter that went down started again (mediad reconnected): it counts from nothing.
+    pub fn from_polls(before: Option<&CallStats>, now: &CallStats) -> Health {
         let measured = |value: u32| (value > 0).then_some(value);
         // A link with a round trip has measured its loss and jitter too, even when they are 0.
-        let link = stats.rtt_ms > 0 || stats.loss_permille > 0 || stats.jitter_ms > 0;
+        let link = now.rtt_ms > 0 || now.loss_permille > 0 || now.jitter_ms > 0;
+        let grew = |field: fn(&CallStats) -> u32| {
+            let (then, now) = (before.map_or(0, field), field(now));
+            if now >= then { now - then } else { now }
+        };
+        let overruns = grew(|s| s.capture_overruns).saturating_add(grew(|s| s.capture_gaps));
+        let underruns = grew(|s| s.playout_underruns);
+        // The window's lost frames were each either rebuilt (FEC) or made up: `loss_permille`
+        // is shared out between the two as they grew.
+        let (concealed, recovered) = (grew(|s| s.concealed_frames), grew(|s| s.fec_recovered));
+        let share = |part: u32| {
+            let lost = u64::from(concealed) + u64::from(recovered);
+            (u64::from(now.loss_permille) * u64::from(part)).checked_div(lost).map_or(0, |n| n.min(1000) as u16)
+        };
         Health {
-            rtt_ms: measured(stats.rtt_ms),
-            jitter_ms: link.then_some(stats.jitter_ms),
-            loss_permille: link.then_some(stats.loss_permille),
-            path: stats.path,
-            ..Health::default()
+            rtt_ms: measured(now.rtt_ms),
+            jitter_ms: link.then_some(now.jitter_ms),
+            loss_permille: link.then_some(now.loss_permille),
+            path: now.path,
+            overruns: Some(overruns),
+            underruns: Some(underruns),
+            concealed_permille: Some(share(concealed)),
+            fec_permille: Some(share(recovered)),
         }
     }
 
@@ -303,6 +325,35 @@ mod tests {
         assert!(repaired.hints().iter().any(|hint| hint.words.starts_with("Error correction")));
         let filled = Health { concealed_permille: Some(60), ..link(40, 0, 2) };
         assert!(filled.hints().iter().any(|hint| hint.words.contains("filled in")));
+    }
+
+    #[test]
+    fn the_audio_counters_speak_of_the_last_second_not_the_whole_call() {
+        let poll = |overruns, gaps, underruns, concealed, recovered, loss_permille| CallStats {
+            rtt_ms: 40,
+            loss_permille,
+            capture_overruns: overruns,
+            capture_gaps: gaps,
+            playout_underruns: underruns,
+            concealed_frames: concealed,
+            fec_recovered: recovered,
+            ..CallStats::default()
+        };
+        let first = poll(2, 1, 0, 3, 1, 40);
+        let health = Health::from_polls(None, &first);
+        assert_eq!((health.overruns, health.underruns), (Some(3), Some(0)), "the first poll counts from nothing");
+        assert_eq!((health.concealed_permille, health.fec_permille), (Some(30), Some(10)), "loss shared as it grew");
+        // A second later nothing more went wrong: the hints go, though the call's totals stay.
+        let quiet = Health::from_polls(Some(&first), &poll(2, 1, 0, 3, 1, 0));
+        assert_eq!((quiet.overruns, quiet.underruns, quiet.concealed_permille, quiet.fec_permille), (Some(0), Some(0), Some(0), Some(0)));
+        assert_eq!(quiet.hints(), [Hint { level: Level::Good, words: "Your connection is good.".into() }]);
+        // The speaker ran dry twice this second.
+        let dry = Health::from_polls(Some(&first), &poll(2, 1, 2, 3, 1, 0));
+        assert_eq!(dry.underruns, Some(2));
+        assert!(dry.hints()[0].words.starts_with("Your speaker"));
+        // mediad reconnected and counts from nothing again.
+        let again = Health::from_polls(Some(&first), &poll(1, 0, 0, 0, 0, 0));
+        assert_eq!(again.overruns, Some(1));
     }
 
     #[test]
