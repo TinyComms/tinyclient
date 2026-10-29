@@ -878,6 +878,7 @@ impl Shell {
         let popover = match menu {
             Some(Menu::Devices) => Some((300., self.call_devices_menu(call, cx).p(px(6.)))),
             Some(Menu::People) if joined => Some((280., people::list(call, subject).py(px(6.)))),
+            Some(Menu::Security) if self.call_security_open(Place::Dock) => Some((320., div().child(self.call_security_panel(call, cx)))),
             _ => None,
         };
         #[cfg(feature = "gui-shot")]
@@ -1067,6 +1068,7 @@ mod tests {
             device_stuck: false,
             inputs: Vec::new(),
             outputs: Vec::new(),
+            security: None,
         }
     }
 

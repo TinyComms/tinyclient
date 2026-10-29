@@ -61,6 +61,8 @@ pub(in crate::gui) struct Draft {
     pub bitrate: Option<u32>,
     pub video: Option<bool>,
     pub ptt: Option<bool>,
+    /// Only apps that encrypt end to end may join (`e2ee_required`).
+    pub e2ee: Option<bool>,
     /// Overrides changed here, by role: allow and deny.
     pub overrides: BTreeMap<String, (u64, u64)>,
     /// The role whose overrides are shown.
@@ -131,6 +133,7 @@ pub(in crate::gui) fn room_edit(room: &TinyRoom, draft: &Draft, name: &str, topi
         bitrate_kbps: draft.bitrate.filter(|kbps| *kbps != room.bitrate()),
         ptt_only: draft.ptt.filter(|ptt| *ptt != room.ptt_only),
         video_enabled: draft.video.filter(|video| *video != room.video_enabled),
+        e2ee_required: draft.e2ee.filter(|e2ee| *e2ee != room.e2ee_required),
         ..TinyRoomEdit::default()
     }
 }
@@ -234,6 +237,7 @@ impl Shell {
             draft.bitrate = None;
             draft.video = None;
             draft.ptt = None;
+            draft.e2ee = None;
             draft.overrides.clear();
             draft.sliding = false;
         }
@@ -588,6 +592,25 @@ fn room_editor(shell: &Shell, facts: &Facts, room: &TinyRoom, window: &mut Windo
                     ),
             ),
         );
+        // Only a server that encrypts calls end to end can hold a room to it.
+        if community.has(TINY_FEATURE_E2EE_CALLS) {
+            let e2ee = draft.e2ee.unwrap_or(room.e2ee_required);
+            column = column.child(
+                section("Privacy").child(
+                    card().child(
+                        switch_row(
+                            "tiny-channels-e2ee",
+                            "Require end-to-end encryption",
+                            "Only apps that encrypt calls end to end may join, so the server can never hear this room. Older apps are turned away.",
+                            e2ee,
+                            edits,
+                        )
+                        .border_b_0()
+                        .when(edits, |row| row.on_click(cx.listener(move |this, _, _, cx| this.tiny_channels_draft(cx, |draft| draft.e2ee = Some(!e2ee))))),
+                    ),
+                ),
+            );
+        }
         if community.has(TINY_FEATURE_ROLES) {
             column = column.child(overrides(facts, room, draft, cx));
         }
@@ -761,6 +784,9 @@ mod tests {
         assert_eq!(sent.name.as_deref(), Some("Den"));
         assert_eq!(sent.topic.as_deref(), Some(""));
         assert_eq!((sent.user_limit, sent.bitrate_kbps, sent.ptt_only, sent.video_enabled), (Some(0), Some(96), Some(true), Some(false)));
+        assert_eq!(sent.e2ee_required, None, "untouched, not sent");
+        assert_eq!(room_edit(&room, &Draft { e2ee: Some(true), ..Draft::default() }, "Lounge", "Hi").e2ee_required, Some(true));
+        assert_eq!(room_edit(&room, &Draft { e2ee: Some(false), ..Draft::default() }, "Lounge", "Hi").e2ee_required, None, "as the server has it");
     }
 
     #[test]

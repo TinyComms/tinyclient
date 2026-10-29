@@ -179,6 +179,7 @@ pub(super) fn call(snapshot: &Snapshot) -> Option<Call> {
         output: "MacBook Pro Speakers".to_owned(),
         engine_linked: true,
         video: Vec::new(),
+        security: None,
     })
 }
 

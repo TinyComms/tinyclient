@@ -152,6 +152,10 @@ impl Call {
                     self.controls.muted.store(spec.muted, Ordering::Relaxed);
                     self.controls.deafened.store(spec.deafened, Ordering::Relaxed);
                 }
+                // A fresh seat starts its encryption afresh; the server says after its answer
+                // whether this call is end to end.
+                self.controls.e2ee(|e2ee| e2ee.offer(&spec.user_id, spec.e2ee.as_ref()));
+                self.controls.e2ee_report();
                 return match tiny::Offer::new(&spec) {
                     Ok(offer) => {
                         let sdp = offer.sdp().to_owned();
@@ -198,6 +202,16 @@ impl Call {
             }
             MediaRequest::TinySlots { audio } => {
                 self.controls.tiny_slots(audio);
+                return MediaResponse::Done;
+            }
+            MediaRequest::TinyE2ee { frame } => {
+                self.controls.e2ee(|e2ee| e2ee.frame(&frame));
+                self.controls.e2ee_report();
+                return MediaResponse::Done;
+            }
+            MediaRequest::TinyRoster { user_ids } => {
+                self.controls.e2ee(|e2ee| e2ee.roster(user_ids));
+                self.controls.e2ee_report();
                 return MediaResponse::Done;
             }
             MediaRequest::Devices { input, output } => {

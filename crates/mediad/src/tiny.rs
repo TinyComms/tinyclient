@@ -346,13 +346,18 @@ impl Call {
                 let Some(slot) = self.slots.get_mut(&mid) else {
                     return;
                 };
+                // End-to-end encryption's half of the frame transform: what does not open with
+                // its sender's key is dropped here, before the jitter buffer.
+                let Some(opus) = self.controls.e2ee(|e2ee| e2ee.open(&slot.user, &data.data)) else {
+                    return;
+                };
                 let stream = &mut slot.stream;
                 stream.last_packet = Instant::now();
                 // The RTP clock is 48 kHz, as ours.
                 stream.arrivals.arrived(data.time.numer() as u32, data.network_time);
-                stream.heard |= data.data[..] != SILENCE[..];
+                stream.heard |= opus[..] != SILENCE[..];
                 if !self.controls.deafened.load(Ordering::Relaxed) {
-                    stream.jitter.insert(**data.seq_range.start() as u16, data.data.to_vec());
+                    stream.jitter.insert(**data.seq_range.start() as u16, opus);
                 }
             }
             _ => {}
@@ -499,8 +504,12 @@ impl Call {
         let Some(pt) = writer.payload_params().next().map(|params| params.pt()) else {
             return;
         };
+        // The other half: sealed for the room's group, or held back while it has no keys.
+        let Some(payload) = self.controls.e2ee(|e2ee| e2ee.seal(opus)) else {
+            return;
+        };
         let time = MediaTime::new(tick * FRAME as u64, Frequency::FORTY_EIGHT_KHZ);
-        let _ = writer.audio_level(level, voice).write(pt, Instant::now(), time, opus.to_vec());
+        let _ = writer.audio_level(level, voice).write(pt, Instant::now(), time, payload);
     }
 
     fn encode(&mut self, frame: &[i16; FRAME_SAMPLES], tick: u64, voice: bool) {
@@ -776,7 +785,7 @@ mod tests {
     }
 
     fn spec(slots: u16) -> TinyOffer {
-        TinyOffer { user_id: "me".into(), host: "127.0.0.1".into(), slots, muted: false, deafened: false }
+        TinyOffer { user_id: "me".into(), host: "127.0.0.1".into(), slots, muted: false, deafened: false, e2ee: None }
     }
 
     /// One microphone and `slots` receive slots, Opus only, and both kinds of candidate.

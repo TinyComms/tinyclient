@@ -16,6 +16,12 @@ native-tls = "0.2"
 # Discord's end-to-end encryption (DAVE, MLS on OpenMLS). Pinned: Discord moves the floor, and a
 # new version must be read before it is taken.
 davey = "=0.1.5"
+# A Tiny server call's members and their keys, read from the group davey keeps (`e2ee`). The
+# version davey links, so nothing is built twice.
+openmls = { version = "0.8.1", features = ["js"] }
+# `call.e2ee` payloads, and the MLS ids of users and rooms. Both already in the tree.
+base64 = "0.22"
+sha2 = "0.10"
 # Transport encryption of RTP. Both share `aead`, `aes` and `ghash` with davey.
 aes-gcm = "0.10"
 chacha20poly1305 = "0.10"
@@ -52,9 +58,6 @@ windows-sys = { version = "0.61", features = ["Win32_Media", "Win32_System_Threa
 objc2 = "0.6"
 
 [dev-dependencies]
-# The bundled sounds' manifest (`tests/sounds.rs`). Already in the tree through davey.
-sha2 = "0.10"
 # The fake voice server acts as Discord's MLS external sender. Same version davey links.
-openmls = { version = "0.8.1", features = ["js"] }
 openmls_basic_credential = "0.5.0"
 openmls_rust_crypto = "0.5.1"

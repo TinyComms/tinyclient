@@ -66,6 +66,7 @@ How the processes fit together and who may edit what. The contract itself is the
 | `Play(Start {account, file, path, conversation, message, title, at, rate, output} \| Pause \| Seek {at} \| Rate {rate} \| Stop)` | `Ok`; then `Change::Playback` | `playback::Player`; `mediad --play` |
 | `TinyCommunity`, `TinyInvite`, `TinyRole`, `TinyRemove`, `TinyRevoke`, `TinyRename`, `TinySignOutEverywhere`, `TinyRoomCreate`, `TinyRoomRename`, `TinyRoomDelete` | `TinyCommunity` (members, invites, audit, rooms with who sits in each, online, the server's `media`); `TinyCode`; `Ok` | `adapters::tiny` over the server's REST; seats and presence from the hub |
 | `TinyCallJoin`, `TinyCallLeave`, `TinyCallKick` | `Ok` once the server took it, or its refusal in words | `Command::Tiny`, sent on the account's live socket (`adapters/tiny/live.rs`). On a server whose `/health` says media is `up`, a join is a call with `mediad` (below); otherwise a seat only. `CallStart` on a Tiny room key is the same join |
+| `TinyVerify {account, user_id, key, verified}` | `Ok` | `verified::set`: the key the user compared, kept per account in `e2ee/<account>/verified.json`; the call's `security` is read again (`Calls::reverify`) |
 | `TinyServerUpdate`, `TinyServerIcon`, `TinyRole{Create,Update,Delete,Order}`, `TinyMemberRoles`, `TinyMemberOwner`, `TinyTimeout`, `TinyKick`, `TinyBan`, `TinyUnban`, `TinyCategory{Create,Rename,Delete}`, `TinyLayout`, `TinyRoomCreateWith`, `TinyRoomUpdate`, `TinyOverride{Set,Clear}`, `TinyInviteWith`, `TinyAudit` | `Ok`; `TinyCode`; `TinyAudit {audit}` | `adapters::tiny::manage` over the server's REST, each only where `GET /v1/capabilities` lists its feature; an older server (404 there) is refused in words and nothing is sent |
 | `TinyCallModerate`, `TinyCallMove` | as `TinyCallKick` | `call.moderate`, `call.move` on the live socket, with the `voice_moderation` feature |
 
@@ -312,6 +313,24 @@ call to the new room: the same mediad, devices, mute and deafen, a fresh `TinyOf
 and push-to-talk requirement go to mediad as `Bitrate` and `Input` once the offer is made. After a server restart the live socket sends a fresh `TinyOffer` to the same
 mediad and joins again; mediad keeps its devices and takes up the new connection. str0m, its
 sockets and every packet stay in mediad (`mediad/src/tiny.rs`).
+
+On a server whose `GET /v1/capabilities` lists `e2ee_calls`, a Tiny call is end-to-end encrypted
+(tinyserver's `docs/calls.md`, "End-to-end encryption"). `TinyOffer` then carries the room and
+the path of the account's identity key (`chatd::verified`, beside `verified.json` in
+`e2ee/<account>/` of the data directory), and `call.join` says `e2ee: 1`. The server's
+`call.e2ee` frames go to mediad as `TinyE2ee`, in the order they came, and everyone in the
+room's call as `TinyRoster` whenever that changes; what mediad answers (`TinyE2ee` events: its
+key package, commits, `invalid`) goes back out through `Calls::on_signal` to the account's
+adapter, as `Ask::E2ee`, and onto the socket untouched. chatd never parses or keeps any of it.
+mediad holds the MLS group (`mediad/src/e2ee.rs`, through `davey` as for DAVE: the server is
+the group's external sender) and seals each Opus frame between the encoder and str0m, and opens
+each one between str0m and the slot's jitter buffer: AES-128-GCM with DAVE's 8-byte tag, keyed
+per sender from the epoch's exporter, the RTP header and audio level left in clear. Until the
+group has keys the microphone is held back, and a clear frame in an end-to-end call is dropped,
+never played. mediad reports how the call is protected with `TinySecurity` (the mode, the call
+code, each member's key and safety number); chatd fills in whom the user verified
+(`verified::trusted`) and puts it on the call as `security`. `TinyVerify` remembers a key, or
+forgets it, and the call shows it at once (`Calls::reverify`).
 
 The sound of a call is mediad's, the same in both kinds of call. The microphone goes through
 `process` (WebRTC's AEC3, noise suppression and AGC2, ported to Rust by `sonora`) with the mix

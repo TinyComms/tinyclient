@@ -1460,6 +1460,15 @@ pub enum Request {
         room_id: String,
         user_id: String,
     },
+    /// Marks someone's identity key verified on this account (the user compared the safety
+    /// number), or takes that back. Remembered per server and person; a later key that is not
+    /// `key` shows as `Trust::Changed`. Answers `Ok`.
+    TinyVerify {
+        account: AccountKey,
+        user_id: String,
+        key: String,
+        verified: bool,
+    },
 
     // Server management. Each needs the server to list the feature in its capabilities
     // (`TinyCommunity::capabilities`); an older server answers that it can't. Each answers `Ok`

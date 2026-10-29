@@ -88,6 +88,8 @@ fn now() -> i64 {
 pub(super) enum Menu {
     Devices,
     People,
+    /// How the call is protected (`security`).
+    Security,
 }
 
 /// What a counter in the dock is counting.
@@ -231,6 +233,8 @@ pub struct State {
     /// The call whose joining was chimed: a move or a reconnect does not chime it again.
     cued: Option<Key>,
     menu: Option<Menu>,
+    /// Which security indicator opened `Menu::Security`: the panel opens beside it.
+    security_at: security::Place,
     /// When a click outside closed the menu, so the same click on its button does not reopen it.
     menu_closed: Option<Instant>,
     /// What mediad last said is not as chosen (`Call::device_notice`), so a new one is shown.
@@ -918,6 +922,7 @@ impl Shell {
                             device_stuck: false,
                             inputs: Vec::new(),
                             outputs: Vec::new(),
+                            security: None,
                         });
                     }
                 }
