@@ -26,7 +26,7 @@
 use crate::audio::{level, Audio};
 use crate::cue::Playing;
 use crate::framing::Conn;
-use crate::hear::Ear;
+use crate::hear::{Ear, Limiter};
 use crate::media::{self, announce, finish_cue, listen, mixdown, Devices, Gate, Send, Stream, MICROPHONE_DENIED};
 use crate::process::Processor;
 use crate::stats::Meter;
@@ -215,6 +215,7 @@ struct Call {
     levels: (u8, u8),
     cue: Option<Playing>,
     processor: Processor,
+    limiter: Limiter,
     meter: Meter,
 }
 
@@ -554,7 +555,7 @@ impl Call {
                 }
             }
         }
-        mixdown(&mix, &self.controls, &mut self.cue, audio, &mut self.processor)
+        mixdown(&mix, &self.controls, &mut self.cue, audio, &mut self.processor, &mut self.limiter)
     }
 
     /// The 20 ms of a call whose devices are open. False when the call cannot go on.
@@ -700,6 +701,7 @@ pub fn run(link: Link, user_id: String, controls: Arc<Controls>) {
         levels: (0, 0),
         cue: None,
         processor: Processor::new(),
+        limiter: Limiter::default(),
         meter: Meter::new(CallPath::Unknown),
     };
     if let Err(err) = call.register() {

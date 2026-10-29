@@ -5,7 +5,7 @@
 
 use crate::audio::{level, open_fresh, route_moved, Audio, AudioError, Fresh, Retired};
 use crate::cue::Playing;
-use crate::hear::{self, Ear};
+use crate::hear::{self, Ear, Limiter};
 use crate::process::Processor;
 use crate::stats::{Arrivals, Counts, Meter};
 use crate::dave::{Dave, Outgoing};
@@ -259,14 +259,15 @@ impl Gate {
 /// Everyone's voices summed, to the speaker: the user's voice level, then a cue on top. What is
 /// played is also the echo canceller's reference. Gives the level of the voices alone, for the
 /// meter.
-pub(crate) fn mixdown(mix: &[i32; FRAME_SAMPLES], controls: &Controls, cue: &mut Option<Playing>, audio: &mut Audio, processor: &mut Processor) -> u8 {
+pub(crate) fn mixdown(mix: &[i32; FRAME_SAMPLES], controls: &Controls, cue: &mut Option<Playing>, audio: &mut Audio, processor: &mut Processor, limiter: &mut Limiter) -> u8 {
     let tuning = controls.tuning();
-    let mut mixed = [0i16; FRAME_SAMPLES];
-    for (out, &sum) in mixed.iter_mut().zip(mix) {
-        // V5: everyone's voice, before anything else is added.
-        let sum = sum * i32::from(tuning.voice.min(100)) / 100;
-        *out = sum.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
+    // V5: everyone's voice, before anything else is added; then held under full scale.
+    let mut scaled = [0i32; FRAME_SAMPLES];
+    for (out, &sum) in scaled.iter_mut().zip(mix) {
+        *out = sum * i32::from(tuning.voice.min(100)) / 100;
     }
+    let mut mixed = [0i16; FRAME_SAMPLES];
+    limiter.run(&scaled, &mut mixed);
     // The meter in the device menu measures voices, not our own cues.
     let heard = level(&mixed);
     // A cue goes on after deafen: undeafening is heard, as is the test sound.
@@ -293,9 +294,9 @@ pub(crate) fn finish_cue(controls: &Controls, cue: &mut Option<Playing>, audio: 
         return;
     }
     let until = Instant::now() + CUE_DRAIN;
-    let mut processor = Processor::new();
+    let (mut processor, mut limiter) = (Processor::new(), Limiter::default());
     while (cue.is_some() || controls.cue_waiting()) && Instant::now() < until {
-        mixdown(&[0; FRAME_SAMPLES], controls, cue, audio, &mut processor);
+        mixdown(&[0; FRAME_SAMPLES], controls, cue, audio, &mut processor, &mut limiter);
         thread::sleep(TICK);
     }
 }
@@ -353,6 +354,7 @@ struct Loop {
     /// Opens devices away from this thread.
     devices: Devices,
     processor: Processor,
+    limiter: Limiter,
     meter: Meter,
 }
 
@@ -497,7 +499,7 @@ impl Loop {
             }
         }
         drop(users);
-        mixdown(&mix, &self.setup.controls, &mut self.cue, &mut self.setup.audio, &mut self.processor)
+        mixdown(&mix, &self.setup.controls, &mut self.cue, &mut self.setup.audio, &mut self.processor, &mut self.limiter)
     }
 
     /// Once a second: what does not need 20 ms timing. Device reopen is not in here.
@@ -613,6 +615,7 @@ pub fn run(setup: Setup) -> Audio {
         cue: None,
         devices,
         processor: Processor::new(),
+        limiter: Limiter::default(),
         meter: Meter::new(CallPath::Udp),
     };
     state.run();
