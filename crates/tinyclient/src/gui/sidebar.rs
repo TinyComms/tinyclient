@@ -990,8 +990,9 @@ impl Shell {
 
     /// The hover Join pill of a voice row: the header pill's look, shrunk to the row (07 §1).
     /// Invisible until the row is hovered, so a plain view of the list stays quiet.
-    pub(super) fn join_pill(&self, key: &Key, cx: &mut Context<Self>) -> Stateful<Div> {
-        let key = key.clone();
+    pub(super) fn join_pill(&self, conversation: &Conversation, cx: &mut Context<Self>) -> Stateful<Div> {
+        let key = conversation.key.clone();
+        let title = conversation.title.clone();
         div()
             .id(row_id("join", &key))
             .flex_none()
@@ -1009,6 +1010,10 @@ impl Shell {
             .border_color(theme::hairline())
             .text_color(theme::text())
             .hover(|style| style.bg(theme::selected()))
+            .tooltip(tip(
+                format!("Join {}. People there will see you arrive.", title),
+                None,
+            ))
             .invisible()
             .group_hover("voice", |style| style.visible())
             // The press belongs to the pill: the row's open must not fire with it.
@@ -1045,7 +1050,15 @@ impl Shell {
         let limit = occupied.map(|inside| inside.total.to_string());
         let draft = (!self.draft_of(c).is_empty() && !selected).then(|| glyph("icons/pencil.svg", 14., theme::text_faint()));
         let (picked, menu_row) = (c.clone(), c.clone());
-        let join = joins_from_list(c);
+        let ours = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.call.as_ref())
+            .map_or(false, |call| {
+                call.conversation == c.key
+                    && !matches!(call.state, protocol::CallState::Failed { .. })
+            });
+        let join = joins_from_list(c) && !ours;
         let content = div()
             // 16 a level less the gap after it (none at the top), as the tree's other rows.
             .children((depth > 0).then(|| div().flex_none().w(px(16. * f32::from(depth) - 8.))))
@@ -1063,7 +1076,7 @@ impl Shell {
             .children(status.map(|emoji| div().flex_none().type_small().child(emoji)))
             .children(chat::name_mark(c).filter(|_| c.kind.is_direct()))
             .child(div().flex_1())
-            .children(join.then(|| self.join_pill(&c.key, cx)))
+            .children(join.then(|| self.join_pill(c, cx)))
             .children(draft)
             .children(limit.map(|total| div().flex_none().flex().items_center().gap(px(2.)).child(glyph("icons/volume-2.svg", 12., theme::text_faint())).child(div().type_micro().text_color(theme::text_faint()).child(total))))
             .children(row_badge(c))
@@ -1073,7 +1086,7 @@ impl Shell {
                 MouseButton::Left,
                 // A voice row joins on a double-click; a single click only opens its chat.
                 cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
-                    if join && event.click_count > 1 {
+                    if join && event.click_count == 2 {
                         this.call_start(picked.key.clone(), cx);
                     } else {
                         this.pick_row(&picked, cx);

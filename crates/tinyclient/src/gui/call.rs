@@ -624,6 +624,12 @@ impl Shell {
     /// Rings or joins. A failed call in the dock is replaced by the new one. A call that is up
     /// somewhere else is not left without a word: the dock asks first.
     pub(super) fn call_start(&mut self, conversation: Key, cx: &mut Context<Self>) {
+        if let Some(call) = self.call_now() {
+            if call.conversation == conversation && !matches!(call.state, CallState::Failed { .. })
+            {
+                return;
+            }
+        }
         let busy = self.call_now().filter(|call| {
             call.conversation != conversation && !matches!(call.state, CallState::Failed { .. } | CallState::RingingIn { .. })
         });

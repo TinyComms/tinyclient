@@ -363,7 +363,15 @@ impl Shell {
             more => format!("{} +{more}", firsts.join(", ")),
         };
         let (title, glyph_name) = if c.kind.is_direct() { ("Call in your DMs".to_owned(), "icons/phone.svg") } else { (c.title.trim_start_matches('#').to_owned(), "icons/volume-2.svg") };
-        let join = joins_from_list(c);
+        let ours = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.call.as_ref())
+            .map_or(false, |call| {
+                call.conversation == c.key
+                    && !matches!(call.state, protocol::CallState::Failed { .. })
+            });
+        let join = joins_from_list(c) && !ours;
         let content = div()
             .gap(px(10.))
             .child(faces)
@@ -385,7 +393,7 @@ impl Shell {
                     )
                     .child(div().h(px(16.)).truncate().type_small().text_color(theme::text_soft()).child(who)),
             )
-            .children(join.then(|| self.join_pill(&c.key, cx)))
+            .children(join.then(|| self.join_pill(c, cx)))
             .when(join, |row| row.group("voice"));
         let picked = c.clone();
         list_row(super::row_id("voice", &c.key), theme::row_height(theme::ROW_TWO), selected, focused, content)
@@ -393,7 +401,7 @@ impl Shell {
                 MouseButton::Left,
                 // A voice channel joins on a double-click here too; a single click only opens.
                 cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
-                    if join && event.click_count > 1 {
+                    if join && event.click_count == 2 {
                         this.call_start(picked.key.clone(), cx);
                     } else {
                         this.pick_row(&picked, cx);
