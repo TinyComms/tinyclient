@@ -1,6 +1,6 @@
 # 06 — Calls
 
-Voice, video and screen share on Discord, Slack, Telegram and Teams, and room calls with sound on a Tiny server you run. Researched 2026-10-13.
+Voice, video and screen share on Discord, Slack, Telegram and Teams, and room calls with sound on a Tiny server you run. Researched 2026-10-13. Updated 2026-10-27 for Tiny room calls.
 Fixed and not reopened here: media engines never load into chatd; mediad exists only during a
 call; one video surface (active speaker or one share); one hardware H.264 encode for a share.
 
@@ -20,7 +20,7 @@ never again produces a card with nobody on the other end.
 | Telegram 1:1 | **Feasible and sanctioned. Heavy.** | TDLib does signalling only; media is tgcalls on tg_owt (Telegram's WebRTC fork), a large C++ build. | A TDLib client added 1:1 voice+video this way and interoperates with official clients; build time doubled, ~30k symbols, software VP8/VP9 only [9]. Hardware H.264 through tgcalls on macOS is *unverified*. |
 | Telegram group | **Hard.** | tgcalls group instance; new encrypted conference calls also need the tde2e chain and per-packet encryption. | [10]. The client in [9] shipped no group calls. |
 | Teams | **Hard, not impossible. Hand-off for now.** | Trouter signalling + SRTP media against Microsoft's relays, on a work tenant. | Correction to our earlier assumption: a non-Microsoft client *has* interoperated. `eisbaw/ost` (Rust) lists audio calls as working and video as WIP [11]; Better Teams (SwiftUI over that core) claims 1:1 audio/video and meeting join [12]. Both are README claims, *not verified by us*. Microsoft supports no third-party media endpoint [13]. |
-| Tiny server room | **Shipped, audio only.** | We run the server, so nothing is reverse engineered: str0m in mediad (`mediad/src/tiny.rs`), one send-only Opus m-line plus one receive slot per other seat, a UDP host candidate and an active ICE-TCP candidate (RFC 6544 [14]); UDP preferred, TCP where UDP is blocked. | [15]. No echo cancellation yet; the room says to wear headphones. |
+| Tiny server room | **Shipped, audio only.** | We run the server, so nothing is reverse engineered: str0m in mediad (`mediad/src/tiny.rs`), one send-only Opus m-line plus one receive slot per other seat, a UDP host candidate and an active ICE-TCP candidate (RFC 6544 [14]); UDP preferred, TCP where UDP is blocked. | [15]. No echo cancellation yet; wear headphones (the README and a mediad comment say so, not the GUI). |
 
 Dependencies outside calls: Telegram and Teams have no adapter at all yet, so their calls cannot
 come before their text. Discord and Slack text exist but are not yet run against real accounts.
@@ -143,7 +143,7 @@ official app is not installed, the row says "Teams isn't installed" and offers t
 - **Echo:** mediad cancels no echo, on Discord calls or Tiny server calls. Discord's own clients
   cancel it on their side; tinyclient relies on nothing but the speech gate, which keeps the
   speaker out only while it is quieter than speech. With open speakers the others hear
-  themselves. Until there is echo cancellation the Tiny room says to wear headphones. The next
+  themselves. Until there is echo cancellation, the README and a mediad comment note to wear headphones. The next
   step, measured against the 40 MB mediad budget before it is taken: a pure-Rust port of
   WebRTC's AEC3 fed the mix as the far end (`sonora-aec3` or `aec3` on crates.io, both young), or
   the system's voice processing (macOS VoiceProcessingIO, Windows communications mode), which
