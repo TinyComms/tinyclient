@@ -453,6 +453,7 @@ fn offline(ctx: &Context, command: Command) {
         Command::SetMute { reply, .. } | Command::Leave { reply, .. } => drop(reply.send(Err(down()))),
         Command::Pinned { reply, .. } => drop(reply.send(Err(down()))),
         Command::SearchShared { reply, .. } => drop(reply.send(Err(down()))),
+        Command::Search { reply, .. } => drop(reply.send(Err(down()))),
         Command::Catalog { reply, .. } => drop(reply.send(Err(down()))),
         Command::SendWith { conversation_id, client_id, .. } => ctx.sent(&conversation_id, &client_id, Err("Telegram is offline.".to_owned())),
         Command::StartDirect { reply, .. } | Command::Handoff { reply, .. } => drop(reply.send(Err(down()))),
@@ -548,6 +549,13 @@ fn serve(account: &Arc<Account>, command: Command) {
         }
         Command::Pinned { conversation_id, reply } => {
             let _ = reply.send(info::pinned(account, &conversation_id).map_err(refused));
+        }
+        Command::Search { query, scope, reply, .. } => {
+            let result = match scope {
+                super::SearchScope::Conversation(id) => info::search_messages(account, &id, &query).map_err(refused),
+                super::SearchScope::Space(_) => Err(Refusal::Unsupported),
+            };
+            let _ = reply.send(result);
         }
         Command::SearchShared { conversation_id, kind, before, limit, reply } => {
             let _ = reply.send(info::shared(account, &conversation_id, kind, before.as_deref(), limit).map_err(refused));

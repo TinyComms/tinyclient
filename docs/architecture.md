@@ -38,7 +38,7 @@ How the processes fit together and who may edit what. The contract itself is the
 | `InVoice {network}`, `Around {network}` | `Conversations`; `Around {requests, in_call, online, recent}` | hub (occupants, presence, activity) and store |
 | `Find {network, query, limit}` | `Conversations` (title contains, newest first, cache only) | store |
 | `SearchMessages {conversation, network, space, query, limit}` | `MessageHits {hits (where, snippet, sender, title)}` (text contains, newest first, cache only) | store |
-| `SearchNetwork {conversation, space, query}` | `MessageHits` (the network's own hits, mapped like the cache's) | `Command::Search` (`Unsupported` until built; Discord: the server's search for a Space, the channel's for one conversation, 202 while indexing) |
+| `SearchNetwork {conversation, space, query}` | `MessageHits` (the network's own hits, mapped like the cache's) | `Command::Search` (`Unsupported` until built; Discord: the server's search for a Space, the channel's for one conversation, 202 while indexing; Telegram: text search in one conversation or forum topic) |
 | `Spaces {network}`, `Tree {space, offset, limit, peek}` | `Spaces`; `Tree {groups (kind, count), conversations, total}` | store; `Command::OpenSpace` |
 | `Conversation`, `Collapse`, `Star`, `SetDraft` | `Conversation`; `Ok` | store (local only) |
 | `People {network, relation, query, offset, limit}` | `People {people, total}` | store; `Command::SearchPeople`, debounced |

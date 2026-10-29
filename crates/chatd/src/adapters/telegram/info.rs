@@ -176,11 +176,11 @@ pub(super) fn leave(account: &Account, conversation: &str) -> Result<(), Fault> 
     Ok(())
 }
 
-fn search(account: &Account, conversation: &str, filter: tl::enums::MessagesFilter, offset_id: i32, limit: i32) -> Result<(Vec<Message>, Option<u32>), Fault> {
+fn search(account: &Account, conversation: &str, query: &str, filter: tl::enums::MessagesFilter, offset_id: i32, limit: i32) -> Result<(Vec<Message>, Option<u32>), Fault> {
     let (who, topic) = Who::parse(conversation).ok_or_else(|| invalid("PEER_ID_INVALID"))?;
     let request = tl::functions::messages::Search {
         peer: account.input(who)?,
-        q: String::new(),
+        q: query.chars().take(1024).collect(),
         from_id: None,
         saved_peer_id: None,
         saved_reaction: None,
@@ -201,9 +201,25 @@ fn search(account: &Account, conversation: &str, filter: tl::enums::MessagesFilt
     Ok((messages, count))
 }
 
+/// Text matches from Telegram, bounded to one page and mapped like cached search hits.
+pub(super) fn search_messages(account: &Account, conversation: &str, query: &str) -> Result<Vec<protocol::MessageHit>, Fault> {
+    let (messages, _) = search(account, conversation, query, tl::enums::MessagesFilter::InputMessagesFilterEmpty, 0, 100)?;
+    let known = account.ctx.known(conversation).ok().flatten();
+    Ok(messages.into_iter().take(100).map(|message| protocol::MessageHit {
+        conversation: account.ctx.key(conversation),
+        message_id: message.id,
+        sent: message.sent,
+        sender: message.sender.name,
+        snippet: crate::store::snippet(&message.text, query),
+        title: known.as_ref().map(|row| row.title.clone()).unwrap_or_default(),
+        space_title: known.as_ref().map(|row| row.space_title.clone()).unwrap_or_default(),
+        outgoing: message.outgoing,
+    }).collect())
+}
+
 /// The pinned messages, newest first.
 pub(super) fn pinned(account: &Account, conversation: &str) -> Result<Vec<Message>, Fault> {
-    Ok(search(account, conversation, tl::enums::MessagesFilter::InputMessagesFilterPinned, 0, protocol::PINNED_LIMIT as i32)?.0)
+    Ok(search(account, conversation, "", tl::enums::MessagesFilter::InputMessagesFilterPinned, 0, protocol::PINNED_LIMIT as i32)?.0)
 }
 
 /// What was shared, from Telegram's own search, with Telegram's count of it as the total.
@@ -215,7 +231,7 @@ pub(super) fn shared(account: &Account, conversation: &str, kind: SharedKind, be
     };
     let limit = limit.clamp(1, 100);
     let offset = before.and_then(|id| id.parse::<i32>().ok()).unwrap_or(0);
-    let (messages, total) = search(account, conversation, filter, offset, limit as i32)?;
+    let (messages, total) = search(account, conversation, "", filter, offset, limit as i32)?;
     let more = messages.len() as u32 >= limit;
     let mut items = Vec::new();
     for message in messages {

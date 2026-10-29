@@ -1064,3 +1064,38 @@ fn cancelling_keeps_nothing_and_a_build_without_an_app_id_says_so() {
     };
     assert!(networks.iter().any(|network| network.network == Network::Telegram && network.link == Link::SignedOut));
 }
+
+#[test]
+fn conversation_search_asks_telegram_with_the_query_and_maps_its_hits() {
+    let world = World::signed_in();
+    world.connected();
+    let search = |query: &str| match world.ask(Request::SearchNetwork {
+        conversation: Some(key("g8001")), space: None, query: query.into(),
+    }) {
+        Response::MessageHits { hits } => hits,
+        other => panic!("{other:?}"),
+    };
+    let hits = search("Maps");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].conversation, key("g8001"));
+    assert_eq!(hits[0].message_id, "20");
+    assert!(hits[0].snippet.contains("Maps"));
+    assert!(!hits[0].sender.is_empty());
+    assert!(!hits[0].title.is_empty());
+    assert_eq!(world.called("SearchText g8001 Maps topic=None"), 1);
+    assert!(search("no-such-telegram-message").is_empty());
+    assert!(search(" ").is_empty());
+}
+
+#[test]
+fn conversation_search_keeps_the_telegram_forum_topic_scope() {
+    let world = World::signed_in();
+    world.connected();
+    let Response::MessageHits { hits } = world.ask(Request::SearchNetwork {
+        conversation: Some(key("c9002_31")), space: None, query: "wrench".into(),
+    }) else { panic!("no search hits") };
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].conversation, key("c9002_31"));
+    assert_eq!(hits[0].message_id, "41");
+    assert_eq!(world.called("SearchText c9002 wrench topic=Some(31)"), 1);
+}
