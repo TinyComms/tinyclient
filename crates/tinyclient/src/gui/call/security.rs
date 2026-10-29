@@ -29,10 +29,20 @@ pub(super) enum Badge {
 }
 
 /// Something in the encrypted group is not as it should be: a key changed since it was
-/// verified, or a member the server does not list in the call.
+/// verified, a member the server does not list in the call, or one person in it twice (the
+/// server could add a key of its own under someone's name).
 pub(super) fn alarming(security: &CallSecurity) -> bool {
-    security.mode == SecurityMode::EndToEnd
-        && security.members.iter().any(|member| member.trust == Trust::Changed || member.user_id.is_empty())
+    security.mode == SecurityMode::EndToEnd && security.members.iter().any(|member| suspect(security, member))
+}
+
+/// This member is a reason to look twice.
+pub(super) fn suspect(security: &CallSecurity, member: &SecureMember) -> bool {
+    member.trust == Trust::Changed || member.user_id.is_empty() || twice(security, member)
+}
+
+/// The same person holds more than one place in the group.
+fn twice(security: &CallSecurity, member: &SecureMember) -> bool {
+    security.members.iter().filter(|other| other.user_id == member.user_id).count() > 1
 }
 
 pub(super) fn badge(security: &CallSecurity) -> Badge {
@@ -123,8 +133,9 @@ pub(super) fn why_transport(call: &Call, security: &CallSecurity) -> Vec<String>
 
 /// What a member's row says about their key.
 pub(super) fn trust_words(member: &SecureMember) -> &'static str {
+    // Comparing the call code does not find them: they hold this call's keys like anyone else.
     if member.user_id.is_empty() {
-        return "Not in the call's list. Ask everyone to compare the call code.";
+        return "Holds this call's keys but isn't in the call's list. Leave if nobody knows who it is.";
     }
     match member.trust {
         Trust::Verified => "Verified",
@@ -262,7 +273,7 @@ impl Shell {
                     .child(label("CALL CODE"))
                     .child(digits(grouped_lines(&security.code, 5, 3)))
                     .child(words(
-                        "Everyone in the call sees the same code. Compare it out loud to be sure no one is listening in. It changes whenever someone joins or leaves."
+                        "Everyone in the call sees the same code. Read it out loud: the same code means you are all in one encrypted group, not split by the server. Check the list below for anyone you don't expect. It changes whenever someone joins or leaves."
                             .to_owned(),
                         theme::text_faint(),
                     )),
@@ -276,7 +287,7 @@ impl Shell {
         for (ix, member) in security.members.iter().enumerate() {
             let name = member_name(call, &member.user_id);
             let ghost = member.user_id.is_empty();
-            let loud = ghost || member.trust == Trust::Changed;
+            let loud = suspect(&security, member);
             let state_color = match member.trust {
                 _ if loud => theme::warning(),
                 Trust::Verified => theme::positive(),
@@ -397,6 +408,8 @@ mod tests {
         assert_eq!(badge(&secure(vec![member("bea", Trust::Changed)])), Badge::Check);
         assert_eq!(badge(&secure(vec![member("", Trust::Unverified)])), Badge::Check);
         assert_eq!(badge_words(Badge::Check), "Check security");
+        // One person twice in the group: someone else's key under their name.
+        assert_eq!(badge(&secure(vec![member("bea", Trust::Unverified), member("bea", Trust::Unverified)])), Badge::Check);
         // A transport-only call has no group to be wrong about.
         let transport = CallSecurity { mode: SecurityMode::Transport, members: vec![member("", Trust::Changed)], ..CallSecurity::default() };
         assert_eq!(badge(&transport), Badge::Transport);
