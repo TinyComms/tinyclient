@@ -23,6 +23,13 @@
 /demo.js
   Cache-Control: public, max-age=0, must-revalidate
 
+/invite
+  Cache-Control: no-store
+  X-Robots-Tag: noindex, nofollow
+/invite/*
+  Cache-Control: no-store
+  X-Robots-Tag: noindex, nofollow
+
 # Discovery documents. Link is repeated by the Pages function so a cached HTML
 # response still advertises the catalog.
 /

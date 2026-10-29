@@ -80,6 +80,7 @@
 /* Base ------------------------------------------------------------------ */
 
 *, *::before, *::after { box-sizing: border-box; }
+[hidden] { display: none !important; }
 
 html {
   -webkit-text-size-adjust: 100%;
@@ -1651,6 +1652,18 @@ caption {
 .faq details p code { white-space: nowrap; }
 
 .feat-text h3 { font-size: 18px; }
+
+/* Invite link: the same card and code field as the rest of the site, under the hero buttons. */
+.hero .invite-more { margin: 28px 0 0; max-width: 640px; }
+.hero .invite-more .invite-code { margin: 0 22px 20px; }
+.hero .invite-more .invite-code input {
+  display: block; width: 100%; border: 0; background: transparent; color: var(--text);
+  font-family: var(--mono); font-size: 13.5px; line-height: 1.5;
+  padding: 14px 108px 14px 16px;
+}
+.hero .invite-more .copy { opacity: 1; }
+.hero .invite-more .invite-status:empty { display: none; }
+.hero .invite-more .invite-status { padding-top: 0; }
 
 /* The second hero button wraps after site.js names the system; stack them first on phones. */
 @media (max-width: 480px) { .hero .actions .btn { flex: 1 1 100%; } }
