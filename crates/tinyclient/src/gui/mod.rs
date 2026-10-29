@@ -6,6 +6,7 @@
 
 mod anim;
 mod app;
+mod attention;
 mod assets;
 mod call;
 mod chrome;
@@ -628,6 +629,7 @@ pub fn run() {
     LAUNCHED.get_or_init(std::time::Instant::now);
     app::crash::install();
     app::read_reduce_motion();
+    attention::read_launch();
     time::read_clock_preference();
     // Read before the window opens, so its first frame draws where the user was.
     let prefs = app::prefs::read();

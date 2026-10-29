@@ -553,9 +553,10 @@ impl Shell {
     /// Reads chatd's settings: at start, after a restart, and whenever one changes. Every
     /// window draws again with them.
     pub(in crate::gui) fn load_settings(&mut self, cx: &mut Context<Self>) {
-        self.off_thread(cx, || ask(&Request::Settings), |_, answer, cx| {
+        self.off_thread(cx, || ask(&Request::Settings), |this, answer, cx| {
             if let Ok(Response::Settings { values }) = answer {
                 prefs::set_values(protocol::settings::Values::new(values));
+                this.badge_setting_changed();
                 cx.refresh_windows();
             }
         });
