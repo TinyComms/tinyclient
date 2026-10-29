@@ -36,6 +36,7 @@ pub fn slider(id: &str) -> Slider {
     match id {
         // Text size: five stops, −1 to +3, stored as 0 to 4.
         "A2" => Slider { range: (0, 4), default: 1, read: || (theme::text_step() + 1) as u32, stops: Some(5), width: controls::TRACK, words: |v| format!("{} pt", 13 + v) },
+        "SV" => Slider { range: (0, 100), default: 70, read: || prefs::values().number(keys::ALERT_VOLUME), stops: None, width: controls::TRACK, words: percent },
         // Narrower than the others: its row also carries the test sound's button.
         "S10" => Slider { range: (0, 100), default: 50, read: || prefs::values().number(CUE_VOLUME), stops: None, width: 160., words: percent },
         "V5" => Slider { range: (0, 100), default: 100, read: || prefs::values().number(VOICE_VOLUME), stops: None, width: controls::TRACK, words: percent },
@@ -49,6 +50,7 @@ pub fn store_slider(window: &mut SettingsWindow, id: &'static str, value: u32, c
     let key = match id {
         "A2" => return window.set_text_step(value as i32 - 1, cx),
         "S10" => CUE_VOLUME,
+        "SV" => keys::ALERT_VOLUME,
         "V5" => VOICE_VOLUME,
         "V14" => {
             let ms = PTT_RELEASE_CHOICES[(value as usize).min(PTT_RELEASE_CHOICES.len() - 1)];
@@ -190,7 +192,12 @@ impl SettingsWindow {
                 self.group(&["G2"], None, window, cx).child(caption(self.keep_running_caption())),
                 self.group(&["G4"], None, window, cx).child(caption(self.updates_caption())),
             ],
-            Section::Sounds => vec![self.group(&["S1"], None, window, cx).child(caption("Which call sounds play, and how loud, is in Voice."))],
+            Section::Notifications => self.notifications_page(window, cx),
+            Section::Sounds => {
+                let mut groups = vec![self.group(&["S1"], None, window, cx).child(caption("Which call sounds play, and how loud, is in Voice."))];
+                groups.extend(self.sound_groups(window, cx));
+                groups
+            }
             Section::Appearance => vec![
                 self.group(&["A2", "A3", "A4"], None, window, cx)
                     .child(caption(crate::host::APPEARANCE_CAPTION)),
@@ -245,7 +252,7 @@ impl SettingsWindow {
 
     /// A banner over sections whose rows chatd keeps, when chatd does not answer.
     fn banner(&self, cx: &mut Context<Self>) -> Option<Div> {
-        let chatd = matches!(self.section, Section::General | Section::Sounds | Section::Privacy | Section::Audio | Section::Voice | Section::Storage);
+        let chatd = matches!(self.section, Section::General | Section::Notifications | Section::Sounds | Section::Privacy | Section::Audio | Section::Voice | Section::Storage);
         let denied = self.section == Section::Audio && self.devices.as_ref().is_some_and(|d| d.microphone == "denied");
         let unwatched = self.section == Section::Voice && hotkeys::reach() == Reach::Permission;
         let (icon, words, action): (&'static str, &'static str, Option<(&'static str, &'static str)>) = if chatd && !self.reachable(cx) {
@@ -347,7 +354,7 @@ impl SettingsWindow {
             }
             "S1" => {
                 let on = values.on(SOUNDS);
-                let second = (!on).then(|| "Calls make no sounds. Your choices below are kept.".to_owned());
+                let second = (!on).then(|| "Notifications arrive silently and calls make no sounds. Your choices below are kept.".to_owned());
                 self.switch_row(id, on, true, second, move |this, on, cx| this.set_switch(id, SOUNDS, on, true, cx), cx)
             }
             "S7" | "S8" | "S9" => {
@@ -512,7 +519,7 @@ impl SettingsWindow {
                     cx.notify();
                 })),
             ),
-            _ => div(),
+            _ => self.notify_row(id, cx).unwrap_or_else(div),
         };
         let _ = window;
         let lit = self.highlight == Some(id);
@@ -555,13 +562,13 @@ impl SettingsWindow {
         });
     }
 
-    fn set_switch(&mut self, row: &'static str, key: &'static str, on: bool, default: bool, cx: &mut Context<Self>) {
+    pub(super) fn set_switch(&mut self, row: &'static str, key: &'static str, on: bool, default: bool, cx: &mut Context<Self>) {
         let stored = (on != default).then(|| if on { "on" } else { "off" }.to_owned());
         self.set(row, GLOBAL.into(), key, stored, cx);
     }
 
     /// A row whose whole width toggles its switch, with the reset slot before it.
-    fn switch_row(
+    pub(super) fn switch_row(
         &mut self,
         id: &'static str,
         on: bool,
@@ -597,7 +604,7 @@ impl SettingsWindow {
 
     /// Two to four choices, ← → moving between them when it has the keys.
     #[allow(clippy::too_many_arguments)]
-    fn segmented_row(
+    pub(super) fn segmented_row(
         &mut self,
         id: &'static str,
         choices: &[&'static str],
@@ -649,7 +656,7 @@ impl SettingsWindow {
     }
 
     /// The track, its value and its reset, for slider `id`.
-    fn slider_control(&mut self, id: &'static str, cx: &mut Context<Self>) -> Div {
+    pub(super) fn slider_control(&mut self, id: &'static str, cx: &mut Context<Self>) -> Div {
         let spec = slider(id);
         let stored = (spec.read)();
         let value = self.pending.get(id).copied().unwrap_or(stored);

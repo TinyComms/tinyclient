@@ -99,13 +99,28 @@ pub const SHORTCUTS_CAPTION: &str = if cfg!(target_os = "macos") {
     "Shortcuts cannot be changed yet."
 };
 
-/// Settings search, when someone looks for a badge.
-pub const NO_BADGE: &str = if cfg!(target_os = "macos") {
-    "tinyclient has no Dock badge setting yet."
+/// Settings › Notifications, N10: what draws attention to something new in the background.
+pub const FLASH_LABEL: &str = if cfg!(target_os = "macos") { "Bounce the Dock icon" } else { "Flash the taskbar button" };
+
+/// Settings › Notifications, N11: where the unread number is drawn.
+pub const BADGE_LABEL: &str = if cfg!(target_os = "macos") { "Show the unread count on the Dock icon" } else { "Show the unread count on the taskbar button" };
+
+/// Settings › Notifications, N13, after the test notification was posted.
+pub const TEST_SENT: &str = if cfg!(target_os = "macos") {
+    "Sent. If nothing appeared, check Focus and System Settings › Notifications."
 } else if cfg!(windows) {
-    "tinyclient has no taskbar badge setting yet."
+    "Sent. If nothing appeared, check Do not disturb in Windows Settings › System › Notifications."
 } else {
-    "tinyclient has no unread badge setting yet."
+    "Sent. If nothing appeared, check your desktop's Do Not Disturb."
+};
+
+/// Settings › Notifications, under Quiet time: where a system-wide schedule lives.
+pub const FOCUS_CAPTION: &str = if cfg!(target_os = "macos") {
+    "For schedules by place or app, use Focus in System Settings. tinyclient follows it."
+} else if cfg!(windows) {
+    "Do not disturb in Windows Settings › System › Notifications holds tinyclient's notifications too."
+} else {
+    "Your desktop's Do Not Disturb holds tinyclient's notifications too."
 };
 
 /// Settings search, when someone looks for a menu bar icon.
@@ -238,7 +253,8 @@ mod tests {
             assert_eq!(FOLLOWS_LANGUAGE, "tinyclient follows the language of macOS.");
             assert!(APPEARANCE_CAPTION.ends_with("Reduce Motion follows System Settings."));
             assert!(SHORTCUTS_CAPTION.contains("App Shortcuts"));
-            assert_eq!(NO_BADGE, "tinyclient has no Dock badge setting yet.");
+            assert_eq!(FLASH_LABEL, "Bounce the Dock icon");
+            assert!(FOCUS_CAPTION.contains("Focus"));
             assert_eq!(NO_TRAY_ICON, "tinyclient has no menu bar icon yet.");
         } else {
             let shown = [
@@ -252,7 +268,10 @@ mod tests {
                 DIAGNOSTICS,
                 APPEARANCE_CAPTION,
                 SHORTCUTS_CAPTION,
-                NO_BADGE,
+                FLASH_LABEL,
+                BADGE_LABEL,
+                FOCUS_CAPTION,
+                TEST_SENT,
                 NO_TRAY_ICON,
                 COULD_NOT_OPEN,
                 HERE,
