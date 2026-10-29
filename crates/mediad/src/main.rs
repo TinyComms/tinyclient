@@ -294,12 +294,16 @@ fn watch_devices(controls: &Controls) {
 
 /// `--devices`: every device, the defaults, whether macOS lets this process hear the
 /// microphone, and which process macOS holds responsible for it, as one JSON object. Nothing is
-/// opened and nobody is asked for permission.
+/// opened and nobody is asked for permission. `inputs` and `outputs` are the names alone, as
+/// older shells read them; `input_devices` and `output_devices` are `AudioDevice`s, with ids.
 fn list_devices() {
     let listing = audio::listing();
+    let names = |devices: &[protocol::AudioDevice]| devices.iter().map(|d| d.name.clone()).collect::<Vec<_>>();
     let json = serde_json::json!({
-        "inputs": listing.inputs,
-        "outputs": listing.outputs,
+        "inputs": names(&listing.inputs),
+        "outputs": names(&listing.outputs),
+        "input_devices": listing.inputs,
+        "output_devices": listing.outputs,
         "default_input": listing.default_input,
         "default_output": listing.default_output,
         // The answer is about whoever `responsible` names, not about mediad as such.

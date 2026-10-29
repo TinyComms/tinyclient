@@ -31,9 +31,15 @@ pub const CUE_MINE: &str = "cue_mine";
 pub const CUE_CONNECTION: &str = "cue_connection";
 /// S10. The cues' volume, 0 to 100.
 pub const CUE_VOLUME: &str = "cue_volume";
-/// V1, V2. A device by the name the system gives it; absent follows the system default.
+/// V1, V2. The microphone and the speaker, as [`DeviceChoice::value`] writes them: absent is
+/// [`DeviceChoice::Auto`], [`SYSTEM_DEFAULT`] follows the system default, anything else is one
+/// device by name, then a tab and the system's id for it. A value with no tab is a name alone,
+/// as builds before 0.2.20 stored it; chatd adds the id once the device is listed
+/// ([`DeviceChoice::upgrade`]).
 pub const INPUT: &str = "input";
 pub const OUTPUT: &str = "output";
+/// The stored value of "System default" in V1 and V2.
+pub const SYSTEM_DEFAULT: &str = "@system";
 /// V4. Every join and every Accept starts muted.
 pub const JOIN_MUTED: &str = "join_muted";
 /// V5. Everyone's voice, 0 to 100.
@@ -126,7 +132,7 @@ pub fn valid(scope: &str, key: &str, value: &str) -> bool {
         Some(Kind::Switch(_)) => matches!(value, "on" | "off"),
         Some(Kind::Percent(_)) => value.parse::<u8>().is_ok_and(|n| n <= 100),
         Some(Kind::Choice(choices, _)) => value.parse::<u32>().is_ok_and(|n| choices.contains(&n)),
-        Some(Kind::Device) => !value.is_empty() && value.len() <= 200 && !value.contains(['\n', '\0']),
+        Some(Kind::Device) => !value.is_empty() && value.len() <= 400 && !value.contains(['\n', '\0']),
         Some(Kind::Hotkey) => crate::hotkey::Binding::parse(value).is_some(),
         Some(Kind::Gain) => parse_gain(value).is_some(),
         None => false,
@@ -205,6 +211,86 @@ pub fn typing_default(network: Network) -> bool {
     network != Network::Discord
 }
 
+/// Which microphone or speaker the user chose (V1, V2).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum DeviceChoice {
+    /// Never chosen: the system default when that is hardware, else a headset or speakers. A
+    /// virtual device (Krisp, VB-Cable, ...) is never picked this way.
+    #[default]
+    Auto,
+    /// "System default": wherever the system default goes, virtual or not, live.
+    System,
+    /// One device. The id is the system's (a WASAPI endpoint id, a CoreAudio UID) and is tried
+    /// first; the name finds it when the id is unknown or no longer listed.
+    Device { name: String, id: Option<String> },
+}
+
+impl DeviceChoice {
+    /// A stored value, or `MediaRequest::Devices`' field. `None` is [`DeviceChoice::Auto`].
+    pub fn parse(value: Option<&str>) -> DeviceChoice {
+        match value {
+            None | Some("") => DeviceChoice::Auto,
+            Some(SYSTEM_DEFAULT) => DeviceChoice::System,
+            Some(value) => match value.split_once('\t') {
+                Some((name, id)) if !id.is_empty() => DeviceChoice::Device { name: name.to_owned(), id: Some(id.to_owned()) },
+                Some((name, _)) => DeviceChoice::Device { name: name.to_owned(), id: None },
+                None => DeviceChoice::Device { name: value.to_owned(), id: None },
+            },
+        }
+    }
+
+    /// What is stored for it. `None` for [`DeviceChoice::Auto`].
+    pub fn value(&self) -> Option<String> {
+        match self {
+            DeviceChoice::Auto => None,
+            DeviceChoice::System => Some(SYSTEM_DEFAULT.to_owned()),
+            DeviceChoice::Device { name, id: None } => Some(name.clone()),
+            DeviceChoice::Device { name, id: Some(id) } => Some(format!("{name}\t{id}")),
+        }
+    }
+
+    /// One device, by its name and id as listed.
+    pub fn device(name: &str, id: &str) -> DeviceChoice {
+        let id = (!id.is_empty()).then(|| id.replace(['\t', '\n', '\0'], ""));
+        DeviceChoice::Device { name: name.replace(['\t', '\n', '\0'], " "), id }
+    }
+
+    /// True when `device` is the one chosen: by id when the choice has one that is listed, else
+    /// by name (the first of that name, as a call would open).
+    pub fn is(&self, device: &crate::AudioDevice, listed: &[crate::AudioDevice]) -> bool {
+        let DeviceChoice::Device { name, id } = self else {
+            return false;
+        };
+        match id.as_ref().filter(|id| listed.iter().any(|d| &d.id == *id)) {
+            Some(id) => &device.id == id,
+            None => listed.iter().find(|d| &d.name == name).is_some_and(|d| d.id == device.id),
+        }
+    }
+
+    /// The choice with the id and name a listed device has now, when it lacks or differs from
+    /// them: a name stored by an older build gains its id, a renamed device its new name.
+    /// `None` when nothing needs storing.
+    pub fn upgrade(&self, listed: &[crate::AudioDevice]) -> Option<DeviceChoice> {
+        let DeviceChoice::Device { name, id } = self else {
+            return None;
+        };
+        let found = match id {
+            Some(id) => listed.iter().find(|d| &d.id == id),
+            None => listed.iter().find(|d| &d.name == name && !d.id.is_empty()),
+        }?;
+        let better = DeviceChoice::device(&found.name, &found.id);
+        (better != *self).then_some(better)
+    }
+
+    /// The device's name, for words. `None` for the two that follow the system.
+    pub fn name(&self) -> Option<&str> {
+        match self {
+            DeviceChoice::Device { name, .. } => Some(name),
+            _ => None,
+        }
+    }
+}
+
 /// Every stored value, read with defaults.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Values(BTreeMap<(String, String), String>);
@@ -248,8 +334,14 @@ impl Values {
         Values::default().number(key)
     }
 
+    /// The stored value of V1 or V2, as `MediaRequest::Devices` carries it.
     pub fn device(&self, key: &str) -> Option<String> {
         self.stored(GLOBAL, key).map(str::to_owned)
+    }
+
+    /// V1 or V2, read.
+    pub fn device_choice(&self, key: &str) -> DeviceChoice {
+        DeviceChoice::parse(self.stored(GLOBAL, key))
     }
 
     /// P1 for one account.
@@ -422,5 +514,48 @@ mod tests {
         assert!(!tuning.joins && !tuning.mine && !tuning.connection);
         assert_eq!((tuning.voice, tuning.gate, tuning.cues), (100, 25, 50));
         assert_eq!(values.stored(GLOBAL, CUE_MINE), Some("off"));
+    }
+
+    fn listed(id: &str, name: &str) -> crate::AudioDevice {
+        crate::AudioDevice { id: id.into(), name: name.into(), ..Default::default() }
+    }
+
+    #[test]
+    fn a_device_choice_round_trips_and_a_name_stored_before_ids_still_reads() {
+        const HEADSET: &str = "Headset Microphone (CORSAIR HS55 Wireless Core Receiver)";
+        let id = "wasapi:{0.0.1.00000000}.{7f1c0d2e-0000-4000-8000-0123456789ab}";
+        for choice in [DeviceChoice::Auto, DeviceChoice::System, DeviceChoice::device(HEADSET, id), DeviceChoice::device(HEADSET, "")] {
+            let value = choice.value();
+            assert!(value.as_deref().is_none_or(|value| valid(GLOBAL, INPUT, value)), "{value:?}");
+            assert_eq!(DeviceChoice::parse(value.as_deref()), choice);
+        }
+        let mut values = Values::default();
+        assert_eq!(values.device_choice(INPUT), DeviceChoice::Auto, "never chosen");
+        values.set(GLOBAL, INPUT, Some(HEADSET.into()));
+        assert_eq!(values.device_choice(INPUT), DeviceChoice::Device { name: HEADSET.into(), id: None });
+        values.set(GLOBAL, OUTPUT, Some(SYSTEM_DEFAULT.into()));
+        assert_eq!(values.device_choice(OUTPUT), DeviceChoice::System);
+    }
+
+    #[test]
+    fn a_name_alone_gains_its_id_once_listed_and_an_id_follows_a_rename() {
+        let legacy = DeviceChoice::Device { name: "Mic".into(), id: None };
+        assert_eq!(legacy.upgrade(&[]), None, "not listed: nothing to learn");
+        let list = [listed("a", "Other"), listed("b", "Mic")];
+        assert_eq!(legacy.upgrade(&list), Some(DeviceChoice::device("Mic", "b")));
+        let current = DeviceChoice::device("Mic", "b");
+        assert_eq!(current.upgrade(&list), None, "already current");
+        let renamed = [listed("b", "Mic (2- USB)")];
+        assert_eq!(current.upgrade(&renamed), Some(DeviceChoice::device("Mic (2- USB)", "b")));
+        assert_eq!(DeviceChoice::System.upgrade(&list), None);
+    }
+
+    #[test]
+    fn the_chosen_row_is_found_by_id_and_by_name_when_the_id_is_not_listed() {
+        let list = [listed("a", "Mic"), listed("b", "Mic")];
+        assert!(DeviceChoice::device("Mic", "b").is(&list[1], &list));
+        assert!(!DeviceChoice::device("Mic", "b").is(&list[0], &list), "two of one model: the id tells");
+        assert!(DeviceChoice::device("Mic", "gone").is(&list[0], &list), "the first of that name");
+        assert!(!DeviceChoice::Auto.is(&list[0], &list));
     }
 }
