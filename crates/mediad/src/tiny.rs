@@ -321,6 +321,12 @@ impl Call {
                     };
                 }
             }
+            // What the server sees of our microphone: its FEC is planned for that loss.
+            Event::MediaEgressStats(stats) if stats.mid == self.link.microphone => {
+                if let Some(loss) = stats.loss {
+                    self.encoder.set_loss(loss);
+                }
+            }
             Event::MediaData(data) => {
                 let mid = data.mid.to_string();
                 if !self.slots.contains_key(&mid) {

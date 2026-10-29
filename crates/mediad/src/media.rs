@@ -905,3 +905,94 @@ mod device_tests {
         drop(desk);
     }
 }
+
+/// Loss on the way in, through the real receive path: the jitter buffer, FEC from the next
+/// packet, and concealment.
+#[cfg(test)]
+mod loss_tests {
+    use super::*;
+    use crate::opus::Encoder;
+
+    /// Two seconds and more of a voiced vowel: 140 Hz and ten harmonics, swelling and fading
+    /// three times a second, as a Tiny call's encoder sends it.
+    fn vowel_packets(frames: usize) -> Vec<Vec<u8>> {
+        let mut encoder = Encoder::voice().unwrap();
+        (0..frames)
+            .map(|f| {
+                let mut pcm = [0i16; FRAME_SAMPLES];
+                for (n, pair) in pcm.as_chunks_mut::<CHANNELS>().0.iter_mut().enumerate() {
+                    let t = (f * FRAME + n) as f64 / 48_000.;
+                    let swell = 0.6 + 0.4 * (t * 3. * std::f64::consts::TAU).sin();
+                    let voice: f64 = (1..=10).map(|k| (t * 140. * k as f64 * std::f64::consts::TAU).sin() / k as f64).sum();
+                    pair.fill((voice * swell * 4_000.) as i16);
+                }
+                let mut packet = [0u8; 1275];
+                let len = encoder.encode(&pcm, &mut packet).unwrap();
+                packet[..len].to_vec()
+            })
+            .collect()
+    }
+
+    /// Plays `packets` through a receive stream, losing those `lost` says, one tick each.
+    fn heard(packets: &[Vec<u8>], lost: impl Fn(usize) -> bool) -> (Vec<i16>, Stream) {
+        let mut stream = Stream::new().unwrap();
+        let mut out = Vec::new();
+        for (n, packet) in packets.iter().enumerate() {
+            if !lost(n) {
+                stream.jitter.insert(n as u16, packet.clone());
+            }
+            if let Some(frame) = stream.pull(&"test") {
+                out.extend(frame.iter().step_by(CHANNELS));
+            }
+        }
+        (out, stream)
+    }
+
+    /// The biggest step from one sample to the next, past the codec's start.
+    fn steepest(pcm: &[i16]) -> i32 {
+        pcm[FRAME * 4..].windows(2).map(|w| (i32::from(w[1]) - i32::from(w[0])).abs()).max().unwrap()
+    }
+
+    /// Steps over `limit`, counted once per 10 ms.
+    fn clicks(pcm: &[i16], limit: i32) -> usize {
+        let mut last = None;
+        let mut count = 0;
+        for (n, w) in pcm[FRAME * 4..].windows(2).enumerate() {
+            if (i32::from(w[1]) - i32::from(w[0])).abs() > limit && last.is_none_or(|at| n - at > 480) {
+                count += 1;
+                last = Some(n);
+            }
+        }
+        count
+    }
+
+    /// Before: concealment repeated the whole last frame at half level, and the decoder went on
+    /// from the speech before the gap; this test counted 21 clicks in ten seconds, the worst a
+    /// step of 4007 where the voice itself steps 690 at most.
+    #[test]
+    fn five_percent_random_loss_and_fifty_ms_bursts_are_covered_without_clicks() {
+        let packets = vowel_packets(500);
+        let (clean, _) = heard(&packets, |_| false);
+        let natural = steepest(&clean);
+        let mut seed = 7u32;
+        let random: Vec<bool> = (0..packets.len())
+            .map(|_| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                seed >> 8 < (1 << 24) / 20
+            })
+            .collect();
+        // 5 % at random, and 60 ms gone at once every second.
+        let (lossy, stream) = heard(&packets, |n| random[n] || (n % 50 >= 30 && n % 50 < 33));
+        let lost = stream.jitter.lost;
+        println!(
+            "natural step {natural}, worst with loss {}, clicks {}, lost {lost}, rebuilt {}",
+            steepest(&lossy),
+            clicks(&lossy, natural * 3 / 2),
+            stream.rebuilt
+        );
+        assert!(lost > 40, "{lost} lost");
+        assert!(stream.rebuilt > 10, "FEC rebuilt {}", stream.rebuilt);
+        assert_eq!(lossy.len(), clean.len(), "every tick had a frame");
+        assert_eq!(clicks(&lossy, natural * 3 / 2), 0, "steps past the voice's own {natural}");
+    }
+}
