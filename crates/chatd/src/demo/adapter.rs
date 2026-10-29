@@ -672,6 +672,7 @@ impl Demo {
             Command::Previews(ids) => demo.previews(&ids),
             Command::Members { conversation_id, offset, limit, reply } => drop(reply.send(demo.members(&conversation_id, offset, limit))),
             Command::StartDirect { person_id, reply } => drop(reply.send(demo.start_direct(&person_id))),
+            Command::StartThread { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SearchPeople(query) => demo.ctx.searched(&query),
             Command::Download { url, reply, .. } => drop(reply.send(Ok(Download { url, headers: Vec::new() }))),
             Command::Handoff { conversation_id, reply } => {

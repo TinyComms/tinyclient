@@ -1369,6 +1369,30 @@ fn a_thread_is_a_conversation_that_can_be_read_and_answered() {
 }
 
 #[test]
+fn a_message_with_no_replies_can_start_its_thread() {
+    let world = World::start();
+    world.ready();
+    world.general();
+    let thread = alpha("C0GEN:1760000300.000300");
+    // Looking the conversation up does not invent the row. Sending does.
+    assert!(matches!(
+        world.ask(Request::Conversation { conversation: thread.clone() }),
+        Response::Error { code: ErrorCode::NotFound, .. }
+    ));
+    let pending = world.send(&thread, "1760400000999999", "In the thread.");
+    assert_eq!(pending.state, SendState::Pending);
+    let row = world.conversation(&thread).expect("the thread row");
+    assert_eq!((row.kind, row.title.as_str()), (ConversationKind::Thread, "Thread in #general"));
+    assert_eq!((row.parent.as_deref(), row.root.as_deref()), (Some("C0GEN"), Some("1760000300.000300")));
+    let posted = world.until("the first reply to reach Slack", || {
+        world.fake.calls(ALPHA, "chat.postMessage").into_iter().find(|call| {
+            call.params.get("thread_ts").map(String::as_str) == Some("1760000300.000300")
+        })
+    });
+    assert_eq!(posted.params.get("channel").map(String::as_str), Some("C0GEN"));
+}
+
+#[test]
 fn sending_typing_presence_and_people_go_through_slack() {
     let world = World::start();
     world.ready();

@@ -1135,6 +1135,13 @@ pub enum Request {
     StartDirect {
         person: Key,
     },
+    /// The thread a channel message starts. Discord only: its thread is a new channel, so this
+    /// creates it and answers with that conversation. Slack and Teams name a thread from the
+    /// message, and opening or sending there is enough.
+    StartThread {
+        conversation: Key,
+        message: String,
+    },
     /// One person's card, asked of the network when the card opens and kept five minutes.
     /// `space` is where it was opened from, for the nickname, roles and join date there.
     Profile {

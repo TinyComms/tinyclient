@@ -30,7 +30,7 @@ use crate::store::ConversationRow;
 use base64::Engine;
 use content::{Files, Names, Place};
 use model::{number, Posted, User};
-use protocol::{Conversation, ConversationKind, Message, Presence, RelateAction, Relation, SendState};
+use protocol::{Conversation, ConversationKind, Message, MessageKind, Presence, RelateAction, Relation, SendState, ThreadSummary};
 use rest::{Refused, Rest};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -821,6 +821,72 @@ impl Discord {
         Ok(channel.id)
     }
 
+    /// The thread a channel message starts. One request, and only when the user asked: Discord
+    /// watches thread creation. A message that already has a thread answers with that channel.
+    fn start_thread(&self, channel: &str, message_id: &str, name: &str) -> Result<String, Refusal> {
+        let refuse = |why: String| Refusal::Refused(why);
+        let parent = self
+            .ctx
+            .known(channel)
+            .map_err(|err| refuse(err.to_string()))?
+            .ok_or_else(|| refuse("This conversation is gone.".to_owned()))?;
+        if !matches!(parent.kind, ConversationKind::Channel | ConversationKind::Announcement) {
+            return Err(refuse("A thread starts from a channel message.".to_owned()));
+        }
+        let stored = self
+            .ctx
+            .stored_message(channel, message_id)
+            .map_err(|err| refuse(err.to_string()))?
+            .ok_or_else(|| refuse("That message is not here.".to_owned()))?;
+        if stored.deleted || matches!(stored.kind, MessageKind::System) {
+            return Err(refuse("That message cannot start a thread.".to_owned()));
+        }
+        let name = thread_name(name);
+        if let Some(existing) = stored.thread.as_ref() {
+            self.record_thread(&parent, &existing.id, message_id, &name)?;
+            return Ok(existing.id.clone());
+        }
+        let created = self
+            .call(
+                "POST",
+                &format!("/channels/{channel}/messages/{message_id}/threads"),
+                Some(json!({ "name": name })),
+            )
+            .map_err(refusal)?;
+        let thread: model::Channel = serde_json::from_str(&created)
+            .map_err(|err| refuse(format!("Discord's answer was unreadable: {err}")))?;
+        let title = thread.name.clone().filter(|title| !title.trim().is_empty()).unwrap_or_else(|| name.clone());
+        self.record_thread(&parent, &thread.id, message_id, &title)?;
+        let mut message = stored;
+        message.thread = Some(ThreadSummary {
+            id: thread.id.clone(),
+            replies: thread.message_count.unwrap_or(0),
+            last: 0,
+            participants: Vec::new(),
+            unread: 0,
+        });
+        self.ctx.history(channel, &[message]).map_err(|err| refuse(err.to_string()))?;
+        Ok(thread.id)
+    }
+
+    /// The thread's conversation, when it is not recorded yet. Its root is the message it hangs
+    /// off. A thread kept outside the tree still needs its server, which `guild_of` reads back.
+    fn record_thread(&self, parent: &Conversation, thread_id: &str, root: &str, title: &str) -> Result<(), Refusal> {
+        let refuse = |err: rusqlite::Error| Refusal::Refused(err.to_string());
+        if self.ctx.known(thread_id).map_err(refuse)?.is_some() {
+            return Ok(());
+        }
+        if let Some(guild) = self.guild_of(parent) {
+            self.ctx.set_note(&format!("guild:{thread_id}"), &guild);
+        }
+        let mut row = ConversationRow::new(thread_id, ConversationKind::Thread, title);
+        row.parent = Some(parent.key.id.clone());
+        row.root = Some(root.to_owned());
+        row.private = parent.private;
+        row.read_only = parent.read_only;
+        self.ctx.conversation(&row).map_err(refuse)
+    }
+
     /// Where a registered file is fetched now. Attachment addresses are signed and run out
     /// (`ex` is the hex time); one that has is put aside to be exchanged for a fresh one.
     ///
@@ -1022,6 +1088,9 @@ impl Discord {
                 self.members(conversation_id, offset, limit, reply)
             }
             Command::StartDirect { person_id, reply } => drop(reply.send(self.start_direct(&person_id))),
+            Command::StartThread { conversation_id, message_id, name, reply } => {
+                drop(reply.send(self.start_thread(&conversation_id, &message_id, &name)))
+            }
             Command::Download { id, url, reply } => self.download(id, url, reply),
             Command::Handoff { conversation_id, reply } => drop(reply.send(self.handoff(&conversation_id))),
             Command::CallJoin(conversation_id) => self.call_join(&conversation_id),
@@ -1039,6 +1108,14 @@ impl Discord {
             command => command.unsupported(&self.ctx),
         }
     }
+}
+
+/// Discord's thread name: one line, at most 100 characters. Empty becomes "Thread".
+fn thread_name(text: &str) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let name: String = flat.chars().take(100).collect();
+    let name = name.trim().to_owned();
+    if name.is_empty() { "Thread".to_owned() } else { name }
 }
 
 /// Sends the answer to a command the shell is waiting on.
