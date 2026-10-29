@@ -18,6 +18,8 @@ pub mod dave;
 pub mod decode;
 pub mod framing;
 pub mod gateway;
+#[cfg(test)]
+mod harness;
 pub mod hear;
 pub mod jitter;
 pub mod media;

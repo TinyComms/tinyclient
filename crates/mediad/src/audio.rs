@@ -284,14 +284,15 @@ pub fn level(pcm: &[i16]) -> u8 {
 }
 
 struct Input {
-    stream: cpal::Stream,
+    /// `None` for a harness's virtual device, driven by a test instead of the system.
+    stream: Option<cpal::Stream>,
     ring: Ring,
     resampler: Resampler,
     running: bool,
 }
 
 struct Output {
-    _stream: cpal::Stream,
+    _stream: Option<cpal::Stream>,
     playout: Arc<Mutex<Playout>>,
     resampler: Resampler,
     /// Samples the ring may hold, and how many it is cut back to when it is over.
@@ -390,7 +391,9 @@ pub(crate) fn open_fresh(
         let microphone = find(&host, want_input, true).ok_or(AudioError::NoMicrophone)?;
         let mut input = open_input(&microphone, &broken)?;
         if !mic_running {
-            let _ = input.stream.pause();
+            if let Some(stream) = &input.stream {
+                let _ = stream.pause();
+            }
             input.running = false;
         }
         input_name = name(&microphone).unwrap_or_default();
@@ -433,6 +436,39 @@ fn find(host: &cpal::Host, wanted: Option<&str>, input: bool) -> Option<cpal::De
     }
 }
 
+/// The microphone callback: the device's frames, as stereo, onto the ring.
+fn on_capture(filled: &Mutex<VecDeque<f32>>, data: &[f32], channels: usize, room: usize) {
+    let mut ring = filled.lock().unwrap();
+    for frame in data.chunks_exact(channels) {
+        // Mono is heard in both ears; of more than two channels the first two count.
+        ring.push_back(frame[0]);
+        ring.push_back(frame[if channels > 1 { 1 } else { 0 }]);
+    }
+    let over = ring.len().saturating_sub(room);
+    ring.drain(..over);
+}
+
+/// The speaker callback: what is held, or silence while filling.
+fn on_play(drained: &Mutex<Playout>, data: &mut [f32], channels: usize, fill: usize, fade: usize) {
+    let mut playout = drained.lock().unwrap();
+    for frame in data.chunks_exact_mut(channels) {
+        let (left, right) = playout.next(fill, fade);
+        frame.fill(0.);
+        if channels > 1 {
+            frame[0] = left;
+            frame[1] = right;
+        } else {
+            frame[0] = (left + right) / 2.;
+        }
+    }
+}
+
+/// A device reported trouble: the call reopens its devices.
+fn on_error(side: &str, err: &cpal::Error, flag: &AtomicBool) {
+    eprintln!("mediad: {side}: {err}");
+    flag.store(true, Ordering::Relaxed);
+}
+
 fn open_input(device: &cpal::Device, broken: &Arc<AtomicBool>) -> Result<Input, AudioError> {
     let supported = device
         .default_input_config()
@@ -445,20 +481,8 @@ fn open_input(device: &cpal::Device, broken: &Arc<AtomicBool>) -> Result<Input, 
     let stream = device
         .build_input_stream(
             config,
-            move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                let mut ring = filled.lock().unwrap();
-                for frame in data.chunks_exact(channels) {
-                    // Mono is heard in both ears; of more than two channels the first two count.
-                    ring.push_back(frame[0]);
-                    ring.push_back(frame[if channels > 1 { 1 } else { 0 }]);
-                }
-                let over = ring.len().saturating_sub(room);
-                ring.drain(..over);
-            },
-            move |err| {
-                eprintln!("mediad: microphone: {err}");
-                flag.store(true, Ordering::Relaxed);
-            },
+            move |data: &[f32], _: &cpal::InputCallbackInfo| on_capture(&filled, data, channels, room),
+            move |err| on_error("microphone", &err, &flag),
             None,
         )
         .map_err(|e| AudioError::Microphone(e.to_string()))?;
@@ -466,7 +490,7 @@ fn open_input(device: &cpal::Device, broken: &Arc<AtomicBool>) -> Result<Input, 
         .play()
         .map_err(|e| AudioError::Microphone(e.to_string()))?;
     Ok(Input {
-        stream,
+        stream: Some(stream),
         ring,
         resampler: Resampler::new(rate, RATE),
         running: true,
@@ -486,23 +510,8 @@ fn open_output(device: &cpal::Device, broken: &Arc<AtomicBool>) -> Result<Output
     let stream = device
         .build_output_stream(
             config,
-            move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                let mut playout = drained.lock().unwrap();
-                for frame in data.chunks_exact_mut(channels) {
-                    let (left, right) = playout.next(fill, fade);
-                    frame.fill(0.);
-                    if channels > 1 {
-                        frame[0] = left;
-                        frame[1] = right;
-                    } else {
-                        frame[0] = (left + right) / 2.;
-                    }
-                }
-            },
-            move |err| {
-                eprintln!("mediad: speaker: {err}");
-                flag.store(true, Ordering::Relaxed);
-            },
+            move |data: &mut [f32], _: &cpal::OutputCallbackInfo| on_play(&drained, data, channels, fill, fade),
+            move |err| on_error("speaker", &err, &flag),
             None,
         )
         .map_err(|e| AudioError::Speaker(e.to_string()))?;
@@ -511,7 +520,7 @@ fn open_output(device: &cpal::Device, broken: &Arc<AtomicBool>) -> Result<Output
         .map_err(|e| AudioError::Speaker(e.to_string()))?;
     let room = (rate as f32 * BACKLOG) as usize * CHANNELS;
     Ok(Output {
-        _stream: stream,
+        _stream: Some(stream),
         playout,
         resampler: Resampler::new(RATE, rate),
         room,
@@ -641,13 +650,11 @@ impl Audio {
     pub fn listen(&mut self, on: bool) {
         if let Source::Device(Some(input)) = &mut self.source {
             if input.running != on {
-                let changed = if on {
-                    input.stream.play()
-                } else {
-                    input.stream.pause()
-                };
-                if let Err(err) = changed {
-                    eprintln!("mediad: microphone: {err}");
+                if let Some(stream) = &input.stream {
+                    let changed = if on { stream.play() } else { stream.pause() };
+                    if let Err(err) = changed {
+                        eprintln!("mediad: microphone: {err}");
+                    }
                 }
                 input.running = on;
                 input.ring.lock().unwrap().clear();
@@ -834,6 +841,96 @@ impl Speaker {
     /// The device stopped or went away.
     pub fn broken(&self) -> bool {
         self.broken.load(Ordering::Relaxed)
+    }
+}
+
+/// A harness's stand-ins for the system's devices: the same callbacks a device stream runs,
+/// driven by a test at a device's rate and period, with its clock off by as much as it likes.
+#[cfg(test)]
+pub(crate) struct VirtualMic {
+    ring: Ring,
+    channels: usize,
+    room: usize,
+    broken: Arc<AtomicBool>,
+}
+
+#[cfg(test)]
+impl VirtualMic {
+    /// One device period of interleaved samples, as the system's callback hands them over.
+    pub(crate) fn deliver(&mut self, data: &[f32]) {
+        on_capture(&self.ring, data, self.channels, self.room);
+    }
+
+    /// The system flagged a glitch (WASAPI's data discontinuity).
+    pub(crate) fn xrun(&mut self) {
+        on_error("microphone", &cpal::Error::new(cpal::ErrorKind::Xrun), &self.broken);
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct VirtualSpeaker {
+    playout: Arc<Mutex<Playout>>,
+    channels: usize,
+    fill: usize,
+    fade: usize,
+}
+
+#[cfg(test)]
+impl VirtualSpeaker {
+    pub(crate) fn render(&mut self, data: &mut [f32]) {
+        on_play(&self.playout, data, self.channels, self.fill, self.fade);
+    }
+
+    pub(crate) fn underruns(&self) -> u64 {
+        self.playout.lock().unwrap().underruns
+    }
+}
+
+#[cfg(test)]
+impl Audio {
+    /// A call's audio on virtual devices: `(rate, channels)` of the microphone and the speaker.
+    pub(crate) fn virtual_devices(mic: (u32, usize), speaker: (u32, usize)) -> (Audio, VirtualMic, VirtualSpeaker) {
+        let broken: Arc<AtomicBool> = Arc::default();
+        let ring: Ring = Arc::default();
+        let room = (mic.0 as f32 * BACKLOG) as usize * CHANNELS;
+        let input = Input { stream: None, ring: ring.clone(), resampler: Resampler::new(mic.0, RATE), running: true };
+        let playout: Arc<Mutex<Playout>> = Arc::default();
+        let fill = (speaker.0 as f32 * PREBUFFER) as usize * CHANNELS;
+        let fade = ((speaker.0 as f32 * FADE) as usize).max(1);
+        let room_out = (speaker.0 as f32 * BACKLOG) as usize * CHANNELS;
+        let output = Output { _stream: None, playout: playout.clone(), resampler: Resampler::new(RATE, speaker.0), room: room_out, fill, fade };
+        let audio = Audio {
+            source: Source::Device(Some(input)),
+            sink: Sink::Device(Some(output)),
+            captured: Vec::new(),
+            scratch: Vec::new(),
+            broken: broken.clone(),
+            want_input: None,
+            want_output: None,
+            input: "virtual".to_owned(),
+            output: "virtual".to_owned(),
+            sides: (true, true),
+        };
+        (audio, VirtualMic { ring, channels: mic.1, room, broken }, VirtualSpeaker { playout, channels: speaker.1, fill, fade })
+    }
+
+    /// Frames held now between the microphone and the tick (at 48 kHz), and between the tick and
+    /// the speaker (at its rate).
+    pub(crate) fn backlog(&self) -> (usize, usize) {
+        let capture = match &self.source {
+            Source::Device(Some(input)) => self.captured.len() / CHANNELS + ((input.ring.lock().unwrap().len() / CHANNELS) as f64 / input.resampler.step) as usize,
+            _ => 0,
+        };
+        let playout = match &self.sink {
+            Sink::Device(Some(output)) => output.playout.lock().unwrap().ring.len() / CHANNELS,
+            _ => 0,
+        };
+        (capture, playout)
+    }
+
+    /// Takes the device's report of trouble, as a reopen would.
+    pub(crate) fn take_broken(&mut self) -> bool {
+        self.broken.swap(false, Ordering::Relaxed)
     }
 }
 
