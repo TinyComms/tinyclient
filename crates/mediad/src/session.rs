@@ -81,6 +81,9 @@ pub struct Controls {
     pub(crate) tiny_link: Mutex<Option<crate::tiny::Link>>,
     /// A Tiny server's newest slot map, not yet applied.
     pub(crate) tiny_slots: Mutex<Option<Vec<TinySlot>>>,
+    /// A Tiny server call's end-to-end encryption (`e2ee`), shared by chatd's requests and the
+    /// call's loop.
+    pub(crate) tiny_e2ee: Mutex<crate::e2ee::E2ee>,
     /// How the microphone opens. `None` until chatd says: voice activation at the tuning's gate.
     input: Mutex<Option<InputMode>>,
     /// The push-to-talk keys.
