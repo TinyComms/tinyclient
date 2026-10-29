@@ -942,6 +942,11 @@ pub struct Watching {
     /// the preview of those that have none, paced, on every network but Discord.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rows: Vec<Key>,
+    /// The window is the one the user is typing in (key on macOS, foreground on Windows).
+    /// With `conversation`, what arrives there is being read: chatd posts no notification for
+    /// it, and plays no sound for any other. Lapses with the rest.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub focused: bool,
 }
 
 /// One hit of a message search: where the message is, and enough of it to choose by.
@@ -1392,6 +1397,14 @@ pub enum Request {
     },
     /// Plays the test sound on the call speaker (V2): in the call's mediad, or one started for it.
     TestSound,
+    /// N13: posts one real notification, "This is how messages will look and sound", with the
+    /// preview and sound chosen. Answers `NotifyTested` with what the system said.
+    NotifyTest,
+    /// S11: plays one notification sound once, by its settings word (`pebble`, `soft_ring`), at
+    /// the alert volume, as a notification would. Plays even when sounds are off.
+    PlaySound {
+        sound: String,
+    },
     /// Who is on this Tiny server. An owner or an admin also gets the invites and the audit.
     TinyCommunity {
         account: AccountKey,
@@ -1701,6 +1714,8 @@ pub enum Change {
     Playback { playback: Option<Playback> },
     /// A setting was stored or reset: ask `Settings`.
     Settings,
+    /// Ephemeral. A notification was clicked: bring the window forward on this conversation.
+    Open { conversation: Key },
     /// Ephemeral. The microphone test's level, 0 to 100; `None` once the test is over.
     Meter { level: Option<u8> },
     /// A Tiny server's people, roles, invites or rooms changed: ask `TinyCommunity`. Who is in
@@ -1716,6 +1731,7 @@ impl Change {
             | (Change::Call { .. }, Change::Call { .. })
             | (Change::Playback { .. }, Change::Playback { .. })
             | (Change::Settings, Change::Settings)
+            | (Change::Open { .. }, Change::Open { .. })
             | (Change::Meter { .. }, Change::Meter { .. }) => true,
             (Change::SignIn { network: a, .. }, Change::SignIn { network: b, .. }) => a == b,
             (Change::Conversation { conversation: a }, Change::Conversation { conversation: b })
@@ -1754,6 +1770,7 @@ impl Change {
                 | Change::Upload { .. }
                 | Change::Playback { .. }
                 | Change::Meter { .. }
+                | Change::Open { .. }
         )
     }
 }
@@ -1764,6 +1781,13 @@ pub enum Response {
     Pong,
     /// Done, with nothing to say.
     Ok,
+    /// `NotifyTest`: whether the system took the notification, and its words when it did not
+    /// (notifications turned off for tinyclient, no notification service).
+    NotifyTested {
+        posted: bool,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        detail: String,
+    },
     Status {
         networks: Vec<NetworkStatus>,
         accounts: Vec<AccountStatus>,
