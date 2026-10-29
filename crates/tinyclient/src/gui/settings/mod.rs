@@ -147,14 +147,35 @@ pub(super) enum Picker {
     Output,
 }
 
-/// What `mediad --devices` said: every device by name, the defaults, the microphone permission.
+/// What `mediad --devices` said: every device with its id, the defaults, the microphone
+/// permission.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(super) struct Devices {
-    pub inputs: Vec<String>,
-    pub outputs: Vec<String>,
+    pub inputs: Vec<protocol::AudioDevice>,
+    pub outputs: Vec<protocol::AudioDevice>,
     pub default_input: String,
     pub default_output: String,
     pub microphone: String,
+}
+
+impl Devices {
+    pub fn listed(&self, picker: Picker) -> &[protocol::AudioDevice] {
+        match picker {
+            Picker::Input => &self.inputs,
+            Picker::Output => &self.outputs,
+        }
+    }
+
+    /// The device `choice` means now, as far as the list says. `None` when it is not listed.
+    pub fn means(&self, choice: &protocol::settings::DeviceChoice, picker: Picker) -> Option<&protocol::AudioDevice> {
+        use protocol::settings::DeviceChoice;
+        let listed = self.listed(picker);
+        match choice {
+            DeviceChoice::Auto => listed.iter().find(|d| d.auto),
+            DeviceChoice::System => listed.iter().find(|d| d.default),
+            DeviceChoice::Device { .. } => listed.iter().find(|d| choice.is(d, listed)),
+        }
+    }
 }
 
 /// The shell the window reads, and the window once it is open.
@@ -670,9 +691,23 @@ impl SettingsWindow {
         self.off_thread(cx, read_devices, |this, devices, cx| {
             if devices.is_some() && this.devices != devices {
                 this.devices = devices;
+                this.learn_devices(cx);
                 cx.notify();
             }
         });
+    }
+
+    /// A device chosen by name alone (as builds before ids stored it) is stored again with its
+    /// id once it is listed, so it is found when Windows renames it.
+    fn learn_devices(&mut self, cx: &mut Context<Self>) {
+        let Some(devices) = self.devices.clone() else {
+            return;
+        };
+        for (row, key, picker) in [("V1", protocol::settings::INPUT, Picker::Input), ("V2", protocol::settings::OUTPUT, Picker::Output)] {
+            if let Some(better) = prefs::values().device_choice(key).upgrade(devices.listed(picker)) {
+                self.set(row, protocol::settings::GLOBAL.into(), key, better.value(), cx);
+            }
+        }
     }
 
     pub(super) fn read_storage(&mut self, cx: &mut Context<Self>) {
@@ -686,12 +721,7 @@ impl SettingsWindow {
 
     /// Opens a device menu with the keys on the item that is checked.
     pub(super) fn open_picker(&mut self, picker: Picker, window: &mut Window, cx: &mut Context<Self>) {
-        let key = match picker {
-            Picker::Input => protocol::settings::INPUT,
-            Picker::Output => protocol::settings::OUTPUT,
-        };
-        let stored = prefs::values().device(key);
-        self.menu_cursor = self.picker_choices(picker).iter().position(|(value, _)| *value == stored).unwrap_or(0);
+        self.menu_cursor = self.picker_checked(picker);
         self.picker = Some(picker);
         window.focus(&self.menu_focus, cx);
         // The list is read again as the menu opens: a device may have come or gone.
@@ -941,13 +971,24 @@ fn mediad_path() -> std::path::PathBuf {
 fn read_devices() -> Option<Devices> {
     let output = protocol::launch::no_console(std::process::Command::new(mediad_path()).arg("--devices")).stderr(std::process::Stdio::null()).output().ok()?;
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
-    let names = |key: &str| -> Vec<String> {
-        json[key].as_array().into_iter().flatten().filter_map(|name| name.as_str().map(str::to_owned)).take(protocol::DEVICES_LIMIT).collect()
+    // With ids; a mediad from before ids had names alone, which stand in for both.
+    let devices = |key: &str, names: &str| -> Vec<protocol::AudioDevice> {
+        match serde_json::from_value::<Vec<protocol::AudioDevice>>(json[key].clone()) {
+            Ok(devices) => devices.into_iter().take(protocol::DEVICES_LIMIT).collect(),
+            Err(_) => json[names]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|name| name.as_str())
+                .take(protocol::DEVICES_LIMIT)
+                .map(|name| protocol::AudioDevice { id: name.to_owned(), name: name.to_owned(), ..Default::default() })
+                .collect(),
+        }
     };
     let text = |key: &str| json[key].as_str().unwrap_or_default().to_owned();
     Some(Devices {
-        inputs: names("inputs"),
-        outputs: names("outputs"),
+        inputs: devices("input_devices", "inputs"),
+        outputs: devices("output_devices", "outputs"),
         default_input: text("default_input"),
         default_output: text("default_output"),
         microphone: text("microphone"),

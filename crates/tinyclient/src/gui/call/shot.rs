@@ -97,12 +97,27 @@ pub(super) fn call(snapshot: &Snapshot) -> Option<Call> {
         _ => now() - 724,
     };
     let menu = name == "devices_menu";
-    let listed = |names: &[&str]| if menu { names.iter().map(|name| (*name).to_owned()).collect() } else { Vec::new() };
+    // The first is the system default and what the automatic choice uses; a "Krisp" one is virtual.
+    let listed = |names: &[&str]| -> Vec<protocol::AudioDevice> {
+        let device = |(ix, name): (usize, &&str)| protocol::AudioDevice {
+            id: format!("shot-{name}"),
+            name: (*name).to_owned(),
+            is_virtual: name.starts_with("Krisp"),
+            default: ix == 0,
+            auto: ix == 0,
+        };
+        if menu { names.iter().enumerate().map(device).collect() } else { Vec::new() }
+    };
     Some(Call {
         speaking: matches!(name.as_str(), "joined_speaking" | "devices_menu" | "people_menu"),
         level: menu.then_some(62),
-        inputs: listed(&["MacBook Pro Microphone", "Studio headset", "Desk camera microphone"]),
+        output_level: menu.then_some(48),
+        inputs: listed(&["MacBook Pro Microphone", "Studio headset", "Desk camera microphone", "Krisp Microphone (Krisp Audio)"]),
         outputs: listed(&["MacBook Pro Speakers", "Studio headset"]),
+        input_id: "shot-MacBook Pro Microphone".to_owned(),
+        output_id: "shot-MacBook Pro Speakers".to_owned(),
+        device_notice: None,
+        device_stuck: false,
         conversation,
         state,
         participants,

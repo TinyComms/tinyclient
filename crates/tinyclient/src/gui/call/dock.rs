@@ -572,7 +572,7 @@ impl Shell {
         let notice = self.call_state.notice.clone().filter(|_| live);
         let refused = self.call_state.error.clone();
         let reconnecting = call.state == CallState::Reconnecting;
-        let color = if reconnecting || refused.is_some() { theme::warning() } else { theme::text_soft() };
+        let color = if reconnecting || refused.is_some() || (live && call.device_stuck) { theme::warning() } else { theme::text_soft() };
         let counter = if refused.is_some() || notice.is_some() { None } else { self.call_counter(call, cx) };
         let refused = refused.or(notice);
         let sub = div()
@@ -584,7 +584,8 @@ impl Shell {
             .text_color(color)
             .child(network_icon(network, 11.))
             .child(div().min_w_0().truncate().child(refused.unwrap_or(words)))
-            .children(counter);
+            .children(counter)
+            .children(self.call_switch_device(call, live, cx));
         let right: Option<AnyElement> = match (live, direct) {
             (false, _) => None,
             (true, true) => call
@@ -900,6 +901,11 @@ mod tests {
             video: Vec::new(),
             speaking: false,
             level: None,
+            output_level: None,
+            input_id: String::new(),
+            output_id: String::new(),
+            device_notice: None,
+            device_stuck: false,
             inputs: Vec::new(),
             outputs: Vec::new(),
         }

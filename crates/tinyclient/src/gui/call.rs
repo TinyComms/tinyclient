@@ -192,10 +192,8 @@ pub struct State {
     menu: Option<Menu>,
     /// When a click outside closed the menu, so the same click on its button does not reopen it.
     menu_closed: Option<Instant>,
-    /// The device this call uses as far as this window knows: the Settings default it started
-    /// with, or what was picked in its menu since. The outer `None` is "no call yet".
-    input: Option<Option<String>>,
-    output: Option<Option<String>>,
+    /// What mediad last said is not as chosen (`Call::device_notice`), so a new one is shown.
+    device_notice: Option<String>,
     /// Whether I was muted when I deafened, to go back to on undeafen.
     mute_before_deafen: Option<bool>,
     /// What chatd or the adapter said about the last thing asked of the call.
@@ -210,7 +208,8 @@ pub struct State {
     /// A call that could not be asked for at all: the microphone is not allowed. Drawn as any
     /// failed call is, and gone when dismissed or when the next call starts.
     local: Option<Call>,
-    /// "Now using ...", after the system moved the call to another device.
+    /// "Now using ...", after the system moved the call to another device; or why a device in
+    /// use is not the one chosen, or is not working (`Call::device_notice`).
     notice: Option<String>,
     /// Clears `ended` or `notice` when its few seconds are up.
     brief: Option<Task<()>>,
@@ -391,13 +390,10 @@ pub(super) fn dock(shell: &Shell, _: &mut Window, cx: &mut Context<Shell>) -> Op
 }
 
 impl Shell {
-    /// The speaker picked in the call's device menu in this window, else Settings' speaker (V2),
-    /// which a voice message plays through too. `None` follows the system default.
+    /// The speaker chosen (V2), in the call's menu or in Settings, which a voice message plays
+    /// through too. `None` is the automatic choice.
     pub(super) fn chosen_output(&self) -> Option<String> {
-        match &self.call_state.output {
-            Some(picked) => picked.clone(),
-            None => super::app::prefs::values().device(protocol::settings::OUTPUT),
-        }
+        super::app::prefs::values().device(protocol::settings::OUTPUT)
     }
 
     /// Offered every change chatd reports, after `Shell` has applied its own part.
@@ -415,9 +411,7 @@ impl Shell {
             None => {
                 self.call_menu_set(None, cx);
                 let state = &mut self.call_state;
-                // A pick in the device menu was for that call; the next starts from Settings.
-                state.input = None;
-                state.output = None;
+                state.device_notice = None;
                 state.mute_before_deafen = None;
                 state.confirm = None;
                 state.notice = None;
@@ -437,14 +431,8 @@ impl Shell {
                 let menus = matches!(call.state, CallState::RingingOut | CallState::Connecting | CallState::Joined);
                 if !menus {
                     self.call_menu_set(None, cx);
-                } else {
-                    // chatd gave mediad the Settings defaults when it started the call, and
-                    // changes there are for the next call: the menu marks what this call uses.
-                    let values = super::app::prefs::values();
-                    let state = &mut self.call_state;
-                    state.input.get_or_insert_with(|| values.device(protocol::settings::INPUT));
-                    state.output.get_or_insert_with(|| values.device(protocol::settings::OUTPUT));
                 }
+                self.call_device_notice(call, cx);
                 if !call.deafened {
                     self.call_state.mute_before_deafen = None;
                 }
@@ -466,7 +454,8 @@ impl Shell {
                 let moved = before.as_ref().is_some_and(|was| {
                     !was.input.is_empty() && was.input != call.input && !call.input.is_empty()
                 });
-                if moved && self.call_state.input.clone().flatten().as_deref() != Some(call.input.as_str()) {
+                let picked = super::app::prefs::values().device_choice(protocol::settings::INPUT).name() == Some(call.input.as_str());
+                if moved && !picked && call.device_notice.is_none() {
                     self.call_state.notice = Some(format!("Now using {}", call.input));
                     self.call_briefly(cx);
                 }
@@ -478,6 +467,35 @@ impl Shell {
                     input: call.input.clone(),
                     peer: peer.or(before.and_then(|was| was.peer)),
                 });
+            }
+        }
+    }
+
+    /// A device in use that is not the one chosen, or one that is not working, is said under
+    /// the call's title: for a few seconds when something stands in for the chosen device (the
+    /// device menu keeps saying it), and until it is fixed when a device stays silent, with the
+    /// device menu opened so another can be picked at once.
+    fn call_device_notice(&mut self, call: &Call, cx: &mut Context<Self>) {
+        if self.call_state.device_notice == call.device_notice {
+            return;
+        }
+        self.call_state.device_notice = call.device_notice.clone();
+        match &call.device_notice {
+            Some(words) if call.device_stuck => {
+                self.call_state.notice = Some(words.clone());
+                self.call_state.brief = None;
+                if in_call(call) {
+                    self.call_menu_set(Some(Menu::Devices), cx);
+                }
+                cx.notify();
+            }
+            Some(words) => {
+                self.call_state.notice = Some(words.clone());
+                self.call_briefly(cx);
+            }
+            None => {
+                self.call_state.notice = None;
+                cx.notify();
             }
         }
     }
@@ -705,6 +723,11 @@ impl Shell {
                             video: Vec::new(),
                             speaking: false,
                             level: None,
+                            output_level: None,
+                            input_id: String::new(),
+                            output_id: String::new(),
+                            device_notice: None,
+                            device_stuck: false,
                             inputs: Vec::new(),
                             outputs: Vec::new(),
                         });
