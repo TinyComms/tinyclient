@@ -422,13 +422,69 @@ impl Shell {
                 .children(count)
                 .children(on.then(|| div().absolute().bottom_0().left(px(8.)).right(px(8.)).h(px(2.)).rounded(px(1.)).bg(theme::text())))
         };
-        let mut tabs = div().id("folder-tabs").flex_none().h(px(32.)).px(px(8.)).mb(px(4.)).flex().items_center().gap(px(4.)).overflow_x_scroll();
+        let scroll = state.folder_tabs_scroll.clone();
+        let mut tabs = div()
+            .id("folder-tabs")
+            .flex_none()
+            .h(px(32.))
+            .px(px(8.))
+            .mb(px(4.))
+            .flex()
+            .items_center()
+            .gap(px(4.))
+            .overflow_x_scroll()
+            .track_scroll(&scroll);
         tabs = tabs.child(tab(None, "All".into(), 0, 0, cx));
         let folders = state.home.folders.clone();
         for folder in folders {
             tabs = tabs.child(tab(Some(folder.key.id.clone()), folder.name.clone(), folder.unread, folder.mentions, cx));
         }
-        Some(div().child(tabs))
+
+        let can_left = scroll.offset().x < px(0.);
+        let can_right = scroll.offset().x > scroll.max_offset().x;
+
+        let arrow = |icon: &'static str, enabled: bool, on_click: Box<dyn Fn(&mut Shell, &mut Context<Shell>) + 'static>| {
+            div()
+                .flex_none()
+                .w(px(24.))
+                .h(px(32.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .when(enabled, |d| {
+                    d.cursor_pointer()
+                        .child(glyph(icon, 14., theme::text_soft()))
+                        .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| on_click(this, cx)))
+                })
+                .when(!enabled, |d| {
+                    d.child(glyph(icon, 14., theme::text_faint())).opacity(0.3)
+                })
+        };
+
+        let scroll_left = Box::new(move |this: &mut Shell, cx: &mut Context<Shell>| {
+            let scroll = this.sidebar_state.folder_tabs_scroll.clone();
+            let current = scroll.offset().x;
+            let new_x = (current + px(120.)).min(px(0.));
+            scroll.set_offset(gpui::point(new_x, px(0.)));
+            cx.notify();
+        });
+        let scroll_right = Box::new(move |this: &mut Shell, cx: &mut Context<Shell>| {
+            let scroll = this.sidebar_state.folder_tabs_scroll.clone();
+            let current = scroll.offset().x;
+            let max = scroll.max_offset().x;
+            let new_x = (current - px(120.)).max(max);
+            scroll.set_offset(gpui::point(new_x, px(0.)));
+            cx.notify();
+        });
+
+        Some(
+            div()
+                .flex()
+                .items_center()
+                .child(arrow("icons/chevron-left.svg", can_left, scroll_left))
+                .child(div().flex_1().min_w_0().child(tabs))
+                .child(arrow("icons/chevron-right.svg", can_right, scroll_right)),
+        )
     }
 
     fn home_empty(&self) -> Div {

@@ -119,6 +119,7 @@ pub struct State {
     /// The tree on show, flat. Rebuilt on collapse and when its data changes.
     pub rows: Rc<Vec<Row>>,
     tree_scroll: UniformListScrollHandle,
+    folder_tabs_scroll: gpui::ScrollHandle,
     /// The row the keyboard is on. Moving it opens nothing.
     pub cursor: Option<usize>,
     pub focus: FocusHandle,
@@ -185,6 +186,7 @@ impl State {
             opted_shown: HashSet::new(),
             rows: Rc::new(Vec::new()),
             tree_scroll: UniformListScrollHandle::new(),
+            folder_tabs_scroll: gpui::ScrollHandle::new(),
             cursor: None,
             focus: cx.focus_handle(),
             pins: Vec::new(),
