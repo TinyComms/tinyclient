@@ -498,6 +498,8 @@ fn dnd(hub: &Hub, conversation: &Key) -> bool {
     me.filter(|me| !me.is_empty()).is_some_and(|me| hub.presence(&Key::new(&conversation.account(), &me)) == protocol::Presence::Dnd)
 }
 
+/// What is true now. Do Not Disturb is left out: it reads every account, so it is asked only of a
+/// message that would otherwise notify.
 fn moment(hub: &Hub, conversation: &Key, notes: &Notes, at: Instant) -> Moment {
     let now = now();
     let (sounded_here, sounded_any) = notes.quiet(conversation, at);
@@ -505,7 +507,7 @@ fn moment(hub: &Hub, conversation: &Key, notes: &Notes, at: Instant) -> Moment {
     Moment {
         now,
         minute: local_minute(now),
-        dnd: dnd(hub, conversation),
+        dnd: false,
         in_call,
         watching: (*hub.watching()).clone(),
         locked: notifier::screen_locked(),
@@ -533,13 +535,27 @@ fn run(hub: &Arc<Hub>, chat: &Weak<Chat>, mut notes: Notes, told: &Receiver<Even
     let mut playing: Vec<Child> = Vec::new();
     while let Ok(event) = told.recv() {
         playing.retain_mut(|child| matches!(child.try_wait(), Ok(None)));
+        // Rows and calls change many times a second; most need no settings at all.
+        let busy = match &event {
+            Event::Row(conversation) => !notes.has(conversation),
+            Event::Call(call) => notes.ringing.is_none() && !call.as_ref().is_some_and(|call| matches!(call.state, CallState::RingingIn { .. })),
+            _ => false,
+        };
+        if busy {
+            continue;
+        }
         let values = hub.settings().clone();
         let volume = values.number(settings::ALERT_VOLUME);
         match event {
             Event::Message { conversation, message } => {
                 let Ok(Some(row)) = hub.store().conversation(&conversation) else { continue };
                 let at = Instant::now();
-                let Some(verdict) = decide(&values, &row, &message, &moment(hub, &conversation, &notes, at)) else { continue };
+                let mut moment = moment(hub, &conversation, &notes, at);
+                if decide(&values, &row, &message, &moment).is_none() {
+                    continue;
+                }
+                moment.dnd = dnd(hub, &conversation);
+                let Some(verdict) = decide(&values, &row, &message, &moment) else { continue };
                 if let Some(word) = notes.message(&row, &message, &verdict, at) {
                     playing.extend(play(&word, volume));
                 }
@@ -559,7 +575,8 @@ fn run(hub: &Arc<Hub>, chat: &Weak<Chat>, mut notes: Notes, told: &Receiver<Even
                     Some(key) => {
                         let row = hub.store().conversation(key).ok().flatten();
                         let place = row.filter(|row| row.kind != ConversationKind::Direct).map(|row| place(&row)).unwrap_or_default();
-                        (decide_ring(&values, key, &moment(hub, key, &notes, Instant::now())), place)
+                        let moment = Moment { dnd: dnd(hub, key), ..moment(hub, key, &notes, Instant::now()) };
+                        (decide_ring(&values, key, &moment), place)
                     }
                     None => (None, String::new()),
                 };

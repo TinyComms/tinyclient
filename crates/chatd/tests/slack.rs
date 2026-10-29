@@ -1449,7 +1449,7 @@ fn sending_typing_presence_and_people_go_through_slack() {
     assert_eq!((typist.id.as_str(), typist.name.as_str()), ("U0ANA", "Ana"));
     let left = typist.until - now();
     assert!((1..=6).contains(&left), "the line lasts as long as Slack's own: {left} s");
-    let watching = |people: Vec<Key>| match world.ask(Request::Watch(Watching { space: None, conversation: Some(general.clone()), people, members: None, rows: Vec::new() })) {
+    let watching = |people: Vec<Key>| match world.ask(Request::Watch(Watching { space: None, conversation: Some(general.clone()), people, members: None, rows: Vec::new(), focused: false })) {
         Response::Watching { people, typists } => (people, typists),
         other => panic!("{other:?}"),
     };

@@ -316,7 +316,7 @@ fn a_refused_notification_plays_no_sound() {
     let mut notes = Notes::new(Box::new(fake.clone()));
     let verdict = Verdict { banner: true, sound: Some("pebble".into()), preview: Preview::Full, mention: false };
     assert_eq!(notes.message(&dm(), &message("Ines", "hi"), &verdict, Instant::now()), None);
-    assert_eq!(notes.test(&Values::default(), false).0, false);
+    assert!(!notes.test(&Values::default(), false).0);
 }
 
 fn ringing(conversation: &Key, from: &str) -> Call {
