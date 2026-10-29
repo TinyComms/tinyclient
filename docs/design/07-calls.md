@@ -46,7 +46,7 @@ Dock: full sidebar width (316), 8 px padding, 1 px `hairline` top border, presen
 - **Row 1, 36 px, the title row.** 28 px avatar (person: round, in a 4 px speaking-ring slot; voice channel: 28 px square, radius 8, `positive_soft` fill, `volume` glyph in `positive`). Title 13 px semibold. Sub-line 11.5 px `text_soft`: network icon 11 px + context + state. Right side: the peer's `mic-off` glyph (DM), or an avatar stack (group, channel): up to three 20 px avatars overlapping 6 px, then "+N". Click the row: open that conversation ("Go to Lounge"). Click the stack: participant list.
 - **Row 2, 32 px, controls.** Icon buttons 40 × 32, radius 8, 4 px gap, 16 px glyphs, left to right: mute, deafen, share, camera, devices. A flexible gap, then Leave, 48 × 32, at the right edge. Controls a stage or a network cannot do are absent, not greyed: stage 2 shows mute, deafen, devices, Leave.
 
-Sub-line wording: `Ringing… 0:12` · `Connecting…` · `Discord · 12:04` (DM) · `tinyclient-dev · 4:31` (channel: server name) · `Reconnecting… 0:08` (`warning`) · `Call ended · 12:04`. The sub-line's tooltip in a Discord call: "End-to-end encrypted by Discord". Left alone in a DM call: `Mara left · 12:40`; tinyclient does not hang up for me.
+Sub-line wording: `Ringing… 0:12` · `Connecting… 0:03` · `Discord · 12:04` (DM) · `tinyclient-dev · 4:31` (channel: server name; a Tiny room's is its server's name) · `Reconnecting… 0:08` (`warning`; a Tiny call counts down what is left of mediad's 30 s, `Reconnecting… 0:22 left`) · `Call ended · 12:04` · `You're muted. Press ⌘⇧M to talk` (`danger`, §2a) · `Moved to Raid night by a moderator` (4 s, `warning`). Every counter of one call counts from the moment the shell first saw that state, so the dock and a Tiny stage say the same. The sub-line's tooltip in a Discord call: "End-to-end encrypted by Discord". Left alone in a DM call: `Mara left · 12:40`; tinyclient does not hang up for me.
 
 | Control | Rest | On | Tooltip / shortcut |
 |---|---|---|---|
@@ -61,7 +61,13 @@ Hover on any rest state: `selected` fill, `text` glyph. Disabled: 40 % opacity, 
 
 **Shortcuts** work in any tinyclient window: ⌘⇧M mute, ⌘⇧D deafen, ⌘⇧H leave or cancel, ⌘⇧A accept, ⌘⇧R decline, ⌘⇧J jump to the call's conversation. Mute can also be system-wide: off by default, a Settings switch ("Mute works while tinyclient is in the background"), registered only while a call exists. Layout and navigation arbitrates any clash with these.
 
-**On a Tiny server** the dock stays, and the user panel sits under it (`10-tiny-server.md` §1): mic, headphones and the voice settings cog, and the connection line that opens ping, jitter, loss, bitrate and path. The channel's own stage carries a second set of controls, a floating pill of round buttons with Leave, under the people in the call. Volume and Mute for me are per person, in the person menu.
+**On a Tiny server** the user panel sits under the dock (`10-tiny-server.md` §1) and holds mic, headphones and the voice settings cog, so over the server's own column the dock is the **compact bar**, as Discord's "Voice Connected": card height 54, signal bars (24, they open Call health), a 13/600 line `Voice connected` (`positive`, or the link's `warning`/`danger` when it is fair or poor; `Connecting… 0:03` and `Reconnecting… 0:22 left` in `warning`; `You're muted` in `danger` with a mic-off glyph while §2a holds), under it `Lounge / Night Shift` 11.5 `text_soft` (the move notice in its place for 4 s); the whole is a button to the channel (⌘⇧J); then the security slot and a 36 × 32 Leave. Anywhere else (another network, the Inbox) the same call is the full 96 card, with the signal bars before the avatar stack, so a call is always one glance and one click from Leave wherever I am. The channel's own stage carries a second set of controls, a floating pill of round buttons with Leave, under the people in the call. Volume and Mute for me are per person, in the person menu and a tile's hover.
+
+**Security slot.** The dock's title row, the compact bar and a Tiny channel's top bar (while I am in its call) each leave a 24 × 24 place for the call's security indicator: `Shell::call_security(call, Place, cx)` in `gui/call/security.rs`, `None` until end-to-end encryption fills it.
+
+### 2a. You're muted
+
+While I am muted (not deafened) in a call that is up, the shell keeps the microphone meter on (`Media(Meter)`, asked again every 2 s should the device menu turn it off) and watches the level: speech at the V6 sensitivity or above, for 300 ms, shows **You're muted** for 3 s after the last of it. On a Tiny stage it is a `danger_fill` pill over the call bar, "You're muted · ⌘⇧M to talk", that unmutes on click; in the dock it replaces the sub-line; in the compact bar the state line. The microphone listens only on this machine; nothing is sent. Settings › Voice V19 "Tell me when I talk while muted" (on) turns it off, and with it the meter. A moderator's mute is said instead ("A moderator muted you here"), never "press ⌘⇧M".
 
 ## 3. Outgoing and failed (frames 2, 8)
 
@@ -134,10 +140,26 @@ said. Settings › Voice (09 §4) holds the choices; the dock and the participan
   else is played 12 dB quieter for every listener.
 - **Bitrate.** A Tiny call encodes at its room's bitrate.
 - **Connection.** `CallStats` answers with the last second: round trip, jitter, loss (per mille),
-  send and receive kb/s, the path (UDP, TCP, relay) and the codec. For a connection panel in the
-  dock, asked about once a second while it is open; refused in words before media flows.
+  send and receive kb/s, the path (UDP, TCP, relay) and the codec, asked about once a second
+  while a Tiny call is up; refused in words before media flows. `gui/call/health.rs` grades it:
+  **Excellent** (≤ 60 ms, ≤ 0.5 % loss, ≤ 15 ms jitter), **Good** (≤ 120, ≤ 1.5 %, ≤ 30),
+  **Fair** (≤ 250, ≤ 5 %, ≤ 60), else **Poor**, drawn as four signal bars (`positive`,
+  `warning` at Fair, `danger` at Poor, unlit bars `selected`) and turned into plain-English
+  hints, most serious first: loss over 5 % "Your connection is losing 6.2 % of the audio. Move
+  closer to Wi-Fi, or use a cable."; over 1.5 % "Some audio is lost on the way"; jitter over
+  30 ms "Audio is arriving unevenly…"; a round trip over 250 ms "The server is far away…"; TCP
+  and relay paths say why; a healthy call says "Your connection is good." The audio pipeline's
+  own counters, when `CallStats` carries them (capture overruns, playback underruns, concealed
+  and FEC-recovered frames per mille), add "Your microphone is dropping audio. Try another
+  microphone…", "Your speaker is running dry…", "Parts of what others say are being filled
+  in…" and "Error correction is repairing some lost audio."; without them those hints are
+  simply not given. **Call health** (the panel's line, the dock's bars, the stage's bars
+  button, my tile's bars) is the place for all of it; a `Bad` hint also stands as a pill over
+  the stage's call bar until it clears.
 - **Cues.** As 09 §8, plus Moved (a moderator moved us) and Disconnected (kicked, banned, timed out,
-  or the room went), which plays out as the call ends.
+  or the room went), which plays out as the call ends. Joining chimes for me too: the shell asks
+  mediad for the Joined cue (`Media(Cue)`, still subject to S7) the first time a call is up, not
+  again on a move or a reconnect.
 - **Reconnect.** A Tiny server that stops hearing our media while its live socket stays up takes
   us back to the same room with a fresh offer, silently but for the Lost and Back cues, three times
   in two minutes before the call fails in words. A server restart already did; a Discord call
@@ -174,4 +196,4 @@ Voice channels leave no rows. A failed call leaves its card in the dock, not a r
 
 ## Deliberately absent
 
-A gallery or grid; a self-view; any control over the picture; a ringtone or call sounds of our own; a pulsing ring, waveform or animated meter; a full-window call screen; a card for voice-only calls; greyed-out buttons for things not built; a second simultaneous call; soundboard, recording, captions, reactions; a menu-bar item; a custom screen picker with thumbnails; connection-quality bars (the numbers, in words, are `CallStats`); auto-rejoin after a failure, as opposed to a blip (§7a); auto-opening a share; any in-call state before the network confirms the join.
+A gallery or grid outside a Tiny stage; a self-view; any control over the picture; a ringtone or call sounds of our own; a pulsing ring, waveform or animated meter; a full-window call screen; a card for voice-only calls; greyed-out buttons for things not built; a second simultaneous call; soundboard, recording, captions, reactions; a menu-bar item; a custom screen picker with thumbnails; signal bars for anyone but me (nothing measures another person's link); a pop-out mini window for a voice call (GPUI can open one, but a second always-on-top window needs the platform work video's pop-out does first); auto-rejoin after a failure, as opposed to a blip (§7a) — a failure offers one-click Rejoin instead; auto-opening a share; any in-call state before the network confirms the join.
