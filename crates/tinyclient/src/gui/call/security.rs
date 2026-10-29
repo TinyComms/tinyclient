@@ -435,6 +435,11 @@ mod tests {
             level: None,
             inputs: Vec::new(),
             outputs: Vec::new(),
+            output_level: None,
+            input_id: String::new(),
+            output_id: String::new(),
+            device_notice: None,
+            device_stuck: false,
             security: Some(security),
         }
     }
