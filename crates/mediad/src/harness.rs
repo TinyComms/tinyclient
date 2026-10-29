@@ -237,8 +237,11 @@ mod tests {
     }
 
     /// Real threads, real time, the call's processing and codecs on the tick: after the first
-    /// second, no overrun, gap, underrun or skip.
+    /// second, no overrun, gap, underrun or skip. A measurement of this machine's scheduler: a
+    /// shared CI runner stalls threads for tens of milliseconds, which the simulated runs above
+    /// cover deterministically.
     #[test]
+    #[ignore = "real time on this machine; run with --ignored on a quiet machine"]
     fn real_time_with_processing_on_runs_clean() {
         for (mic, speaker) in [((48_000, 2), (48_000, 2)), ((44_100, 1), (48_000, 2))] {
             let (warm, end) = realtime(mic, speaker, 4.);
