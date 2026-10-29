@@ -257,8 +257,12 @@ impl Call {
             eprintln!("mediad: the new connection's socket: {err}");
         }
         self.packets.clear();
+        // Still connected as far as we could tell (the server stopped hearing us, or restarted
+        // before ICE noticed): this is the loss, and it gets its cue as `down` gives one. The
+        // Back cue follows when media flows on the new link (`up`).
         if self.connected {
             self.connected = false;
+            self.controls.cue(Cue::Lost);
             out::send(&MediaResponse::Interrupted);
         }
         self.lost.get_or_insert_with(Instant::now);
