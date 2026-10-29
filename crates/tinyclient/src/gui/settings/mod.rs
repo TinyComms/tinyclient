@@ -350,6 +350,9 @@ pub struct SettingsWindow {
     pub(super) clash: Option<(&'static str, String)>,
     /// V18: the microphone test also plays the microphone back. The window's alone.
     pub(super) loopback: bool,
+    /// The section's pane, so a shot can draw it scrolled (`--settings-scroll`).
+    #[cfg(feature = "gui-shot")]
+    pane_scroll: gpui::ScrollHandle,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -413,6 +416,8 @@ impl SettingsWindow {
             held_modifiers: gpui::Modifiers::default(),
             clash: None,
             loopback: false,
+            #[cfg(feature = "gui-shot")]
+            pane_scroll: gpui::ScrollHandle::new(),
             _subscriptions: subscriptions,
         };
         window.focus(&this.focus, cx);
@@ -938,6 +943,9 @@ impl SettingsWindow {
         let searching = !self.query.trim().is_empty();
         let heading = if searching { "Results" } else { self.section.name() };
         let body = if searching { self.results(window, cx) } else { self.page(window, cx) };
+        let scroller = div().id(SharedString::from(format!("pane-{}", self.section.name()))).flex_1().min_h_0().overflow_y_scroll();
+        #[cfg(feature = "gui-shot")]
+        let scroller = scroller.track_scroll(&self.pane_scroll);
         div()
             .flex_1()
             .min_w_0()
@@ -956,14 +964,7 @@ impl SettingsWindow {
                     .text_color(theme::text())
                     .child(heading),
             )
-            .child(
-                div()
-                    .id(SharedString::from(format!("pane-{}", self.section.name())))
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .child(div().w(px(controls::COLUMN + 56.)).px(px(28.)).pb(px(28.)).child(body)),
-            )
+            .child(scroller.child(div().w(px(controls::COLUMN + 56.)).px(px(28.)).pb(px(28.)).child(body)))
     }
 }
 
@@ -1141,7 +1142,7 @@ impl Render for SettingsWindow {
 /// `--settings <section> --settings-shot out.png`, with `--shot`: opens Settings on a section
 /// once the shell has its first answer and writes that window's frame. `--settings-search
 /// <words>` types into the search; `--settings-confirm sign-out|clear|reset|retention|tiny-everywhere` opens
-/// that question.
+/// that question. `--settings-scroll <points>` draws the section scrolled down that far.
 #[cfg(feature = "gui-shot")]
 pub fn shot(cx: &mut App) {
     let flag = |name: &str| std::env::args().skip_while(|arg| arg != name).nth(1);
@@ -1179,6 +1180,9 @@ pub fn shot(cx: &mut App) {
             };
             if flag("--settings-menu").as_deref() == Some("input") {
                 settings.picker = Some(Picker::Input);
+            }
+            if let Some(down) = flag("--settings-scroll").and_then(|n| n.parse::<f32>().ok()) {
+                settings.pane_scroll.set_offset(point(px(0.), px(-down)));
             }
             cx.notify();
         });
