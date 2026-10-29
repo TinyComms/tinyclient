@@ -2217,7 +2217,8 @@ impl Store {
              AND CASE WHEN ?2 IS NOT NULL THEN p.relation = ?2
                       WHEN ?3 IS NULL THEN p.relation NOT IN ('none', 'blocked')
                       ELSE 1 END
-             AND (?3 IS NULL OR p.name LIKE ?3 ESCAPE '\\' OR p.handle LIKE ?3 ESCAPE '\\')";
+             AND (?3 IS NULL OR p.name LIKE ?3 ESCAPE '\\' OR p.handle LIKE ?3 ESCAPE '\\'
+                  OR LTRIM(p.handle, '@') LIKE ?3 ESCAPE '\\')";
         let network = network.map(|network| word(&network));
         let relation = relation.map(|relation| word(&relation));
         let pattern = query.map(like_prefix);

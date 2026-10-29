@@ -563,7 +563,9 @@ impl Chat {
         limit: u32,
     ) -> Response {
         let query = query.map(|query| query.trim().to_owned()).filter(|query| !query.is_empty());
-        let found = self.hub.store().people(network, relation, query.as_deref(), offset, limit.min(PAGE_LIMIT));
+        // An explicit Telegram username lookup still searches cached display names/handles.
+        let cached_query = query.as_deref().map(|query| query.trim_start_matches('@'));
+        let found = self.hub.store().people(network, relation, cached_query, offset, limit.min(PAGE_LIMIT));
         if let (Some(query), 0) = (&query, offset) {
             // The cache answers at once; the network's own search lands as a `People` change,
             // once the typing has paused and only for a query long enough to mean something.

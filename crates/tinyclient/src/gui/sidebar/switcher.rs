@@ -120,6 +120,18 @@ pub fn context(c: &Conversation) -> String {
     }
 }
 
+/// Handle matches rank too, but their byte ranges do not belong to the displayed name.
+fn match_person(query: &str, name: &str, handle: &str) -> Option<(u32, Vec<Range<usize>>)> {
+    let named = rank::matches(query, name);
+    let handled = (!handle.is_empty()).then(|| rank::matches(query, handle.trim_start_matches('@'))).flatten();
+    match (named, handled) {
+        (Some(named), Some((score, _))) if score > named.0 => Some((score, Vec::new())),
+        (Some(named), _) => Some(named),
+        (None, Some((score, _))) => Some((score, Vec::new())),
+        (None, None) => None,
+    }
+}
+
 fn space_word(network: Network) -> &'static str {
     match network {
         Network::Discord => "Server",
@@ -144,6 +156,12 @@ fn narrowed(query: &str) -> (Option<Network>, &str) {
         }
     }
     (None, typed)
+}
+
+/// Only a search narrowed to Telegram carries an explicit username lookup request.
+fn people_query(query: &str) -> (Option<Network>, &str) {
+    let (network, name) = narrowed(query);
+    (network, if network == Some(Network::Telegram) { name.trim_start_matches('#') } else { name.trim_start_matches(['#', '@']) })
 }
 
 fn conversation_hit(c: &Rc<Conversation>, matched: Vec<Range<usize>>, section: Option<&'static str>) -> Hit {
@@ -197,7 +215,10 @@ pub fn hits(query: &str, conversations: &[Rc<Conversation>], spaces: &[Space], p
         if (only_channels && c.kind.is_direct()) || (only_people && !c.kind.is_direct()) || c.kind == ConversationKind::Thread {
             continue;
         }
-        if let Some((score, matched)) = rank::matches(typed, &c.title) {
+        let peer = people.iter().find(|p| {
+            c.peer.as_deref() == Some(&p.key.id) && c.key.account == p.key.account && c.key.network == p.key.network
+        });
+        if let Some((score, matched)) = match_person(typed, &c.title, peer.map_or("", |p| p.handle.as_str())) {
             let badge = c.badge();
             let lift = rank::boost(matches!(badge, Badge::Count(_)), badge != Badge::None, c.kind.is_direct(), c.updated, now);
             chats.push((score + lift, c.updated, conversation_hit(c, matched, None)));
@@ -221,7 +242,7 @@ pub fn hits(query: &str, conversations: &[Rc<Conversation>], spaces: &[Space], p
             if known {
                 continue;
             }
-            let Some((score, matched)) = rank::matches(typed, &person.name) else {
+            let Some((score, matched)) = match_person(typed, &person.name, &person.handle) else {
                 continue;
             };
             let relation = match person.relation {
@@ -416,7 +437,8 @@ impl Shell {
         if name.chars().count() < SEARCH_MIN_CHARS || query.starts_with('#') {
             return;
         }
-        let network = narrowed(&query).0;
+        let (network, name) = people_query(&query);
+        let name = name.to_owned();
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(PAUSE).await;
             let _ = this.update(cx, |this, cx| {
@@ -456,8 +478,8 @@ impl Shell {
         }
         switcher.asking.retain(|n| *n != network);
         let query = switcher.input.read(cx).text().trim().to_owned();
-        let (narrow, name) = narrowed(&query);
-        let (name, asked) = (name.trim_start_matches(['#', '@']).to_owned(), switcher.people_asked);
+        let (narrow, name) = people_query(&query);
+        let (name, asked) = (name.to_owned(), switcher.people_asked);
         self.ask_people(name, narrow, asked, cx);
     }
 
@@ -712,6 +734,40 @@ mod tests {
 
     fn person(id: &str) -> Person {
         Person { relation: Relation::Friend, ..Person::new(key(id), id) }
+    }
+
+    #[test]
+    fn people_filter_searches_cached_names_and_only_telegram_keeps_the_prefix() {
+        let mut robin = person("robin");
+        robin.name = "Robin Vale".into();
+        robin.handle = "@forest_wren".into();
+        for query in ["@rob", "discord @rob", "slack @rob", "teams @rob"] {
+            assert_eq!(people_query(query).1, "rob");
+        }
+        assert_eq!(people_query("telegram @forest_wren"), (Some(Network::Telegram), "@forest_wren"));
+        let found = hits("@rob", &[], &[], &[robin], &[], false, 100);
+        assert_eq!(titles(&found), ["[People] Robin Vale"]);
+        assert!(!found[0].matched.is_empty());
+    }
+
+    #[test]
+    fn usernames_find_people_and_their_existing_direct_conversations() {
+        let mut user = person("7002");
+        user.key.network = Network::Telegram;
+        user.name = "Robin Vale".into();
+        user.handle = "@forest_wren".into();
+        let mut dm = Conversation::new(Key { id: "u7002".into(), ..user.key.clone() }, ConversationKind::Direct, "Robin Vale");
+        dm.peer = Some(user.key.id.clone());
+        for query in ["@FOREST_wren", "forest_wren", "telegram @forest_wren"] {
+            let found = hits(query, &[], &[], &[user.clone()], &[], false, 100);
+            assert_eq!(found.len(), 1);
+            assert!(matches!(found[0].target, Target::Person(_)));
+            assert!(found[0].matched.is_empty());
+            let found = hits(query, &[Rc::new(dm.clone())], &[], &[user.clone()], &[], false, 100);
+            assert_eq!(found.len(), 1);
+            assert!(matches!(found[0].target, Target::Conversation(_)));
+            assert!(found[0].matched.is_empty());
+        }
     }
 
     #[test]
