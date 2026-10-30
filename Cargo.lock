@@ -9481,6 +9481,8 @@ name = "tinyclient"
 version = "0.2.22"
 dependencies = [
  "embed-resource",
+ "futures-channel",
+ "futures-lite",
  "gpui",
  "gpui_platform",
  "image",

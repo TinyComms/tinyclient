@@ -19,7 +19,7 @@ use super::components::{banner, banner_action, button, empty_state_with, glyph, 
 use super::layout::{self, drags_window};
 use super::state::Shell;
 use super::theme;
-use crate::client::{ask, ask_within, is_gone, is_other_version, is_slow};
+use crate::client::{ask, is_gone, is_other_version, is_slow};
 use gpui::{div, prelude::*, px, AnyElement, ClipboardItem, Context, Div, Window};
 use protocol::{Request, Response};
 use service::{Phase, Shown, Stopped};
@@ -114,7 +114,7 @@ impl Shell {
         // The voice keys work in any app for as long as the window lives.
         super::hotkeys::start(cx.entity().downgrade(), cx);
         cx.spawn(async move |this, cx| loop {
-            let status = cx.background_executor().spawn(async { ask_within(&Request::Status, Some(service::SLOW)) }).await;
+            let status = crate::client::ask_within_async(Request::Status, Some(service::SLOW)).await;
             match status {
                 Ok(Response::Status { networks, accounts, call, seq, keychain, started, .. }) => {
                     let applied = this.update(cx, |this, cx| {
@@ -133,8 +133,7 @@ impl Shell {
                     }
                     let mut since = seq;
                     loop {
-                        let wait = async move { ask(&Request::Wait { since }) };
-                        match cx.background_executor().spawn(wait).await {
+                        match crate::client::ask_async(Request::Wait { since }).await {
                             Ok(Response::Changes { seq, reset, changes }) => {
                                 since = seq;
                                 let applied = this.update(cx, |this, cx| {
