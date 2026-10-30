@@ -33,6 +33,8 @@ pub mod taskbar;
 pub enum Kind {
     /// Reply, with a text field, and Mark as read.
     Message,
+    /// Mark as read, and no reply. The conversation does not take posts.
+    ReadOnly,
     /// Accept and Decline, shown as a call.
     Call,
     /// No buttons: the test notification, a sign-out.
@@ -239,6 +241,9 @@ fn toast_xml(note: &Note) -> String {
              <action content=\"Mark as read\" arguments=\"read:{id}\" activationType=\"foreground\"/></actions>",
             escape(&note.reply_hint)
         )),
+        Kind::ReadOnly => xml.push_str(&format!(
+            "<actions><action content=\"Mark as read\" arguments=\"read:{id}\" activationType=\"foreground\"/></actions>"
+        )),
         Kind::Call => xml.push_str(&format!(
             "<actions><action content=\"Accept\" arguments=\"accept:{id}\" activationType=\"foreground\"/>\
              <action content=\"Decline\" arguments=\"decline:{id}\" activationType=\"foreground\"/></actions>"
@@ -297,6 +302,9 @@ mod tests {
         let call = toast_xml(&note(Kind::Call));
         assert!(call.contains("scenario=\"incomingCall\"") && call.contains("accept:m:1") && call.contains("decline:m:1"));
         assert!(!toast_xml(&note(Kind::Plain)).contains("<actions>"));
+        let locked = toast_xml(&note(Kind::ReadOnly));
+        assert!(locked.contains("arguments=\"read:m:1\""), "{locked}");
+        assert!(!locked.contains("<input") && !locked.contains("reply:"), "{locked}");
     }
 
     #[test]

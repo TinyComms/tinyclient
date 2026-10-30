@@ -275,13 +275,18 @@ impl Notes {
             Preview::Nothing => (key.network.label().to_owned(), String::new(), what.to_owned()),
         };
         let id = note_id(key);
+        let can_reply = !conversation.read_only;
         let note = Note {
             id: id.clone(),
             title,
             subtitle,
             body,
-            kind: Kind::Message,
-            reply_hint: format!("Reply to {}", if conversation.kind.is_direct() { first_name(&newest) } else { &conversation.title }),
+            kind: if can_reply { Kind::Message } else { Kind::ReadOnly },
+            reply_hint: if can_reply {
+                format!("Reply to {}", if conversation.kind.is_direct() { first_name(&newest) } else { &conversation.title })
+            } else {
+                String::new()
+            },
             sound: verdict.sound.as_deref().and_then(sound_file).filter(|_| notifier::SYSTEM_PLAYS_SOUND),
             locked_body: what.to_owned(),
         };
@@ -646,6 +651,13 @@ fn act(hub: &Hub, chat: &Weak<Chat>, notes: &Notes, done: Activation) {
         Activation::Open(_) => open(hub, &conversation),
         Activation::MarkRead(_) => read(&chat),
         Activation::Reply { text, .. } => {
+            if let Response::Conversation { conversation: row } = chat.handle(Request::Conversation { conversation: conversation.clone() }) {
+                if row.read_only {
+                    eprintln!("chatd: reply from a notification not sent: you can read {} but not post in it", row.title);
+                    open(hub, &conversation);
+                    return;
+                }
+            }
             let client_id = format!("notify-{}-{}", now(), std::process::id());
             let sent = chat.handle(Request::Send { conversation: conversation.clone(), client_id, text, reply_to: None, with: Default::default() });
             if let Response::Error { detail, .. } = sent {
