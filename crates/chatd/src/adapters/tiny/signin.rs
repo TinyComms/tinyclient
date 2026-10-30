@@ -197,9 +197,29 @@ pub(crate) fn step_with(
         });
     };
     let next = flow.answer(input);
+    // Opening the system browser can block on a cold start. Never hold FLOW while
+    // doing it: the callback and cancellation must be able to finish meanwhile.
+    let opening = if matches!(next, SignInStep::Browser { waiting: true, .. }) {
+        flow.out.as_ref().map(|out| (flow.browser.open.clone(), out.authorize_url.clone(), out.stop.clone()))
+    } else {
+        None
+    };
     if matches!(next, SignInStep::Done { .. } | SignInStep::Failed { .. }) {
         if let Some(flow) = held.take() {
             flow.stop();
+        }
+    }
+    drop(held);
+    if let Some((open, url, stop)) = opening {
+        let problem = open(&url).err().map(|reason| SignInProblem::Other { reason });
+        let mut held = current();
+        if let Some(flow) = held.as_mut() {
+            if !stop.load(Ordering::Relaxed)
+                && flow.out.as_ref().is_some_and(|out| Arc::ptr_eq(&out.stop, &stop))
+            {
+                flow.step = flow.browser_step(true, problem);
+                return Ok(flow.step.clone());
+            }
         }
     }
     Ok(next)
@@ -419,13 +439,7 @@ impl Flow {
 
     /// The page the browser was sent to, once more. It is the same sign-in.
     fn open_again(&self) -> SignInStep {
-        let Some(out) = &self.out else {
-            return self.browser_step(false, None);
-        };
-        let problem = (self.browser.open)(&out.authorize_url)
-            .err()
-            .map(|reason| SignInProblem::Other { reason });
-        self.browser_step(true, problem)
+        self.browser_step(self.out.is_some(), None)
     }
 }
 
@@ -478,6 +492,7 @@ impl Wait {
             }),
             Back::Code(_) if self.stop.load(Ordering::Relaxed) => return,
             Back::Code(code) => match auth_token(&self.server, &code, &self.verifier) {
+                Ok(_) if self.stop.load(Ordering::Relaxed) => return,
                 Ok(saved) => self.kept(saved),
                 Err(fault) => match outcome(fault) {
                     (_, Some(reason)) => SignInStep::Failed { reason },
@@ -677,6 +692,37 @@ mod tests {
             }
         }
         panic!("the sign-in did not move");
+    }
+
+    #[test]
+    fn a_slow_browser_does_not_block_cancellation() {
+        let _one = one_sheet();
+        cancel();
+        let hub = hub();
+        let heard = Arc::new(Mutex::new(Heard::default()));
+        let base = server(heard);
+        let packed = protocol::pack_join(&base, "invite").unwrap();
+        let (entered, entering) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let released = Mutex::new(released);
+        step_with(&hub, None, adopt(), || Browser {
+            open: Arc::new(move |_| {
+                entered.send(()).unwrap();
+                released.lock().unwrap().recv().unwrap();
+                Ok(())
+            }),
+            patience: Duration::from_secs(5),
+        }).unwrap();
+        let worker = std::thread::spawn(move || {
+            step(&hub, Some(SignInInput::Invite { code: packed }), adopt()).unwrap()
+        });
+        entering.recv_timeout(Duration::from_secs(5)).unwrap();
+        // try_lock makes a regression fail immediately instead of deadlocking the test.
+        assert!(FLOW.try_lock().is_ok(), "browser launch held the sign-in lock");
+        cancel();
+        release.send(()).unwrap();
+        worker.join().unwrap();
+        assert!(current().is_none(), "a stale launcher restored a cancelled flow");
     }
 
     #[test]

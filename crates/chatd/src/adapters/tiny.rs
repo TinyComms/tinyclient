@@ -34,6 +34,8 @@ use ureq::tls::{TlsConfig, TlsProvider};
 
 /// How long one request may take. A redirect is not followed, so this is one host.
 const TIMEOUT: Duration = Duration::from_secs(10);
+/// Cold DNS/TLS setup on slower computers needs more time during authentication.
+const AUTH_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct Saved {
@@ -215,13 +217,17 @@ fn saved_for(session: &str, user_id: &str) -> Result<Saved, String> {
 }
 
 fn agent() -> ureq::Agent {
+    agent_with_timeout(TIMEOUT)
+}
+
+fn agent_with_timeout(timeout: Duration) -> ureq::Agent {
     ureq::Agent::config_builder()
         .tls_config(
             TlsConfig::builder()
                 .provider(TlsProvider::NativeTls).root_certs(ureq::tls::RootCerts::PlatformVerifier)
                 .build(),
         )
-        .timeout_global(Some(TIMEOUT))
+        .timeout_global(Some(timeout))
         .http_status_as_error(false)
         .max_redirects(0)
         .max_redirects_will_error(false)
@@ -237,7 +243,17 @@ fn call(
     token: Option<&str>,
     body: Option<Value>,
 ) -> Result<(u16, Value), Fault> {
-    let agent = agent();
+    call_with_timeout(method, url, token, body, TIMEOUT)
+}
+
+fn call_with_timeout(
+    method: &str,
+    url: &str,
+    token: Option<&str>,
+    body: Option<Value>,
+    timeout: Duration,
+) -> Result<(u16, Value), Fault> {
+    let agent = agent_with_timeout(timeout);
     let bearer = token.map(|token| format!("Bearer {token}"));
     let sent = match method {
         "GET" => {
@@ -306,7 +322,7 @@ fn endpoint(base: &str, path: &str) -> String {
 /// The provider's name, from `GET /v1/auth/config`. A server that does not sign in through a
 /// provider (a tinyserver from before it did) is told apart from one that cannot be reached.
 fn auth_config(base: &str) -> Result<String, Fault> {
-    let (status, body) = call("GET", &endpoint(base, "/v1/auth/config"), None, None)?;
+    let (status, body) = call_with_timeout("GET", &endpoint(base, "/v1/auth/config"), None, None, AUTH_TIMEOUT)?;
     match status {
         200 => {
             let answer: ConfigAnswer = serde_json::from_value(body).map_err(|_| Fault::BadAnswer)?;
@@ -334,7 +350,7 @@ fn auth_start(base: &str, redirect_uri: &str, challenge: &str, state: &str, invi
     if let Some(invite) = invite {
         body["invite"] = Value::String(invite.to_owned());
     }
-    let (status, body) = call("POST", &endpoint(base, "/v1/auth/start"), None, Some(body))?;
+    let (status, body) = call_with_timeout("POST", &endpoint(base, "/v1/auth/start"), None, Some(body), AUTH_TIMEOUT)?;
     match status {
         200 => body
             .get("authorize_url")
@@ -357,16 +373,18 @@ fn banned(body: &Value) -> bool {
 /// The one-time code the browser brought back, and the verifier it was made for, for a session:
 /// `POST /v1/auth/token`. The same answer, and the same saved session, as a password once gave.
 fn auth_token(base: &str, code: &str, verifier: &str) -> Result<Saved, Fault> {
-    let (status, body) = call(
+    let (status, body) = call_with_timeout(
         "POST",
         &endpoint(base, "/v1/auth/token"),
         None,
         Some(serde_json::json!({ "code": code, "code_verifier": verifier })),
+        AUTH_TIMEOUT,
     )?;
     match status {
         200 => saved_from(base, body),
         _ if banned(&body) => Err(Fault::Words(BANNED)),
-        400 | 401 => Err(Fault::Words(RAN_OUT)),
+        400 | 401 if body.get("error").and_then(Value::as_str) == Some("invalid_grant") => Err(Fault::Words(RAN_OUT)),
+        400 | 401 => Err(Fault::Words("The server rejected this sign-in. Open the sign-in page again to try again.")),
         429 => Err(Fault::SlowDown),
         500..=599 => Err(Fault::Unavailable),
         _ => Err(Fault::Unreachable),
@@ -452,7 +470,7 @@ const UNREADABLE: &str = "The server's answer could not be read.";
 const UNREACHABLE: &str = "Couldn't reach that server. Check the address and your connection.";
 const SIGNED_OUT: &str = "Tiny server signed you out.";
 const NO_BROWSER: &str = "This server doesn't sign in through a browser yet. Ask its owner to update tinyserver.";
-const RAN_OUT: &str = "This sign-in ran out before it finished. Try again.";
+const RAN_OUT: &str = "The server no longer accepts this sign-in code. Open the sign-in page again to try again.";
 const BANNED: &str = "You're banned from this server.";
 const NAME_SIZE: &str = "A name is 1 to 80 characters.";
 const ROOM_NAME_SIZE: &str = "A room name is 1 to 80 characters.";
@@ -1076,6 +1094,15 @@ pub(crate) mod tests {
         assert!(combine("not json", other()).is_err());
     }
 
+    #[test]
+    fn authentication_allows_a_server_slower_than_ten_seconds() {
+        let base = serve(|_| {
+            std::thread::sleep(Duration::from_secs(11));
+            http(200, "OK", r#"{"methods":["oidc"],"provider_name":"Slow provider"}"#)
+        });
+        assert_eq!(auth_config(&base).ok().as_deref(), Some("Slow provider"));
+    }
+
     /// Speaks the sign-in and session routes on a local socket: the provider's name, where to
     /// send the browser, the code for a session, me, delete, and a redirect that must not be
     /// followed.
@@ -1100,6 +1127,9 @@ pub(crate) mod tests {
                 return http(200, "OK", r#"{"authorize_url":"https://auth.example/authorize?state=s"}"#);
             }
             if first.starts_with("POST /v1/auth/token ") {
+                if body.contains("rejected") {
+                    return http(401, "Unauthorized", r#"{"error":"invalid_client"}"#);
+                }
                 if body.contains("used") {
                     return http(400, "Bad Request", r#"{"error":"invalid_grant"}"#);
                 }
@@ -1136,6 +1166,7 @@ pub(crate) mod tests {
         assert!(matches!(start("bad"), Err(Fault::Words(CHECK))));
         assert_eq!(start("fine").ok().as_deref(), Some("https://auth.example/authorize?state=s"));
         assert!(matches!(auth_token(&base, "used", "verifier"), Err(Fault::Words(RAN_OUT))));
+        assert!(matches!(auth_token(&base, "rejected", "verifier"), Err(Fault::Words(words)) if words != RAN_OUT));
         let saved = match auth_token(&base, "one-time", "verifier") {
             Ok(saved) => saved,
             Err(_) => panic!("token failed"),
