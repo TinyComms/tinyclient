@@ -38,10 +38,12 @@ The `STRIP` of `polish/01` (52, hairline below, buttons 28 four apart, 12 from t
 
 ## 2. The right pane: one frame, many kinds (frames B, C)
 - **One width for every kind: 300, drag 260–420**, double-click the 6 hit strip resets, remembered. `MEMBERS_WIDTH` goes.
-- **Title strip** (`STRIP`): close `x` 28 leads it, then `[‹ crumb]` title 16/600, no count beside it
+- **Title strip** (`STRIP`): close `x` 28 leads it, then title 16/600, no count beside it
   (`polish/01`). The close never trails the title: the window's own buttons end the strip at the
-  right, and an `x` beside minimize reads as another window button. When the crumb is drawn it is
-  the way out, so the close is not drawn twice. Hairline below; fill `sidebar`, hairline left.
+  right, and an `x` beside minimize reads as another window button. When the pane stands in for the
+  conversation there is no close at all: a bare `<` 28 leads the strip and the conversation's name
+  is centred over the body, 13/500 `text_soft`, so the pane reads as a page with a heading rather
+  than a path, and the chevron is the way out. Hairline below; fill `sidebar`, hairline left.
 
   | Kind | Title | Opened by | Base or push |
   |---|---|---|---|
@@ -52,8 +54,9 @@ The `STRIP` of `polish/01` (52, hairline below, buttons 28 four apart, 12 from t
   | Thread | "Thread"; its root message heads the body | a reply line | base, or push from Threads |
   | Search | the field replaces the title | `cmd-F` | base |
 
-- **Crumb**: a ghost button 28, chevron-left 16 + the base's name 13/500 `text_soft` ("Members", "Thread",
-  "Threads"), 8 before the title. At most 2 deep, so one crumb. It is not window history.
+- **Back**: when the pane replaces the conversation, a bare chevron 28 is the way out and the
+  conversation's name is the centred heading above, not a second label beside the title. At most one
+  pane deep. It is not window history.
 - **A profile from a thread** (frame C): an avatar in the thread opens the card (as built); the card's "View profile",
   or a name in the thread's strip, pushes the profile over the thread with `‹ Thread`. Closing the pane closes both.
 - **Before data lands**: the frame and title are drawn in the same frame as the switch. The profile head (picture,
@@ -119,8 +122,9 @@ A lit header button always equals the kind on screen; the pane never changes wid
 ## 7. Narrow windows (frame F)
 Defaults rail 72, sidebar 316, pane 300, conversation min 392. The order regions give way:
 1. The conversation shrinks to 392. 2. **Details hides** below 1081: its switch stays on, its button draws unlit
-(it shows what is on screen), and a click opens it once, replacing the conversation, with `‹ #general`. 3. Thread,
-Threads, Search and a push replace the conversation with the same crumb (`esc` or the crumb returns). 4. Below
+(it shows what is on screen), and a click opens it once, replacing the conversation, with `‹ #general` centred
+over it. 3. Thread, Threads, Search and a push replace the conversation the same way (`esc` or the chevron
+returns). 4. Below
 781 the sidebar leaves the row and the 28 panel button leads the strip in **every** replacing view, including the
 pane's, so the floating sidebar is always one click away. Picking a row in it closes it (a thread is put away).
 

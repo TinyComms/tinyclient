@@ -4,7 +4,7 @@
 //! slots the other slices fill.
 
 use super::components::{
-    brand_mark, brand_state, button, button_disabled, divider, fade_in, glyph, icon_button, menu, menu_item,
+    brand_mark, brand_state, button, button_disabled, divider, fade_in, icon_button, menu, menu_item,
     menu_item_check, menu_item_danger, menu_label, menu_separator, network_icon, place, placed, popover, scrim, tip,
     toast, ButtonKind, Layer, Place, NO_GLYPH,
 };
@@ -436,37 +436,63 @@ impl Shell {
             .children(pane.count.map(|count| {
                 div().flex_none().type_ui().text_color(theme::text_faint()).child(count.to_string())
             }));
-        let strip = drags_window(div())
-            .h(px(TOP_BAR))
-            .flex_none()
+        // Over the conversation it stands for, the pane is a page with a heading: the person or
+        // channel it belongs to is centred over the body, not tucked into the crumb beside the
+        // title, where it reads as a path instead of a name.
+        let heading = back_to.filter(|_| replaces).map(|name| {
+            div()
+                .absolute()
+                .left_0()
+                .right_0()
+                .top_0()
+                .h(px(TOP_BAR))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .min_w_0()
+                        .max_w(px((width * 0.5).max(80.)))
+                        .truncate()
+                        .type_ui()
+                        .font_weight(theme::MEDIUM)
+                        .text_color(theme::text_soft())
+                        .child(name),
+                )
+        });
+        // The strip's own padding sits on an inner row, so a heading can centre on the whole pane
+        // rather than on what the window's buttons leave of it.
+        let row = div()
+            .h_full()
             .pl(px(theme::PANE_PAD))
             .pr(px(chrome::end_pad(End::Right, 12.)))
             .flex()
             .items_center()
             .gap(px(8.))
-            .border_b_1()
-            .border_color(theme::hairline())
             // With the sidebar out of the row too, the floating sidebar is one click away here
             // as in the conversation's strip.
-            .when(replaces, |strip| strip.children(self.panel_button(window, cx)))
-            // With the conversation gone from the row, this crumb is the way back to it, and so
+            .when(replaces, |row| row.children(self.panel_button(window, cx)))
+            // With the conversation gone from the row, this chevron is the way back to it, and so
             // the way out of the pane: it leads in the close's place, and there is no second one.
-            .when(replaces, |strip| {
-                strip.child(
-                    button("right-back", ButtonKind::Ghost, back_to.unwrap_or_default())
-                        .h(px(24.))
-                        .pl(px(4.))
-                        .pr(px(8.))
+            .when(replaces, |row| {
+                row.child(
+                    icon_button("right-back", "icons/chevron-left.svg", false)
                         .tooltip(tip(close_words, Some("⌘.")))
-                        .child(glyph("icons/chevron-left.svg", 16., theme::text_soft()))
-                        .flex_row_reverse()
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .on_click(cx.listener(|this, _, window, cx| this.close_right(Some(window), cx))),
                 )
             })
             // Beside the conversation nothing leads the strip, so the close does.
-            .when(!replaces, |strip| strip.child(close))
+            .when(!replaces, |row| row.child(close))
             .child(title);
+        let strip = drags_window(div())
+            .relative()
+            .h(px(TOP_BAR))
+            .flex_none()
+            .border_b_1()
+            .border_color(theme::hairline())
+            .child(row)
+            .children(heading);
         let resizable = !replaces;
         Some(
             div()
