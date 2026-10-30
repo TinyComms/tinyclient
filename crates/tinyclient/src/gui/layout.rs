@@ -417,6 +417,25 @@ impl Shell {
     fn right_pane(&self, width: f32, replaces: bool, window: &mut Window, cx: &mut Context<Self>) -> Option<Div> {
         let pane = self.layout_state.right.as_ref()?;
         let back_to = self.snapshot.as_ref().and_then(|s| s.open.as_ref()).map(|open| open.title.clone());
+        // The window's own buttons end this strip at the window's right edge, on Windows and a
+        // client-drawn Linux frame. The close dismisses the pane, which is an app action, so it
+        // leads the strip, at the other end from that cluster, and never trails the title: there
+        // it would sit beside minimize and read as another window button.
+        let close_words = if pane.kind == RightKind::Thread { "Close thread" } else { "Close" };
+        let close = icon_button("right-close", "icons/x.svg", false)
+            .tooltip(tip(close_words, Some("⌘.")))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(|this, _, window, cx| this.close_right(Some(window), cx)));
+        let title = div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .items_baseline()
+            .gap(px(8.))
+            .child(div().min_w_0().truncate().type_title().child(pane.title.clone()))
+            .children(pane.count.map(|count| {
+                div().flex_none().type_ui().text_color(theme::text_faint()).child(count.to_string())
+            }));
         let strip = drags_window(div())
             .h(px(TOP_BAR))
             .flex_none()
@@ -430,37 +449,24 @@ impl Shell {
             // With the sidebar out of the row too, the floating sidebar is one click away here
             // as in the conversation's strip.
             .when(replaces, |strip| strip.children(self.panel_button(window, cx)))
-            // With the conversation gone from the row, this is the way back to it.
+            // With the conversation gone from the row, this crumb is the way back to it, and so
+            // the way out of the pane: it leads in the close's place, and there is no second one.
             .when(replaces, |strip| {
                 strip.child(
                     button("right-back", ButtonKind::Ghost, back_to.unwrap_or_default())
                         .h(px(24.))
                         .pl(px(4.))
                         .pr(px(8.))
+                        .tooltip(tip(close_words, Some("⌘.")))
                         .child(glyph("icons/chevron-left.svg", 16., theme::text_soft()))
                         .flex_row_reverse()
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .on_click(cx.listener(|this, _, window, cx| this.close_right(Some(window), cx))),
                 )
             })
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .items_baseline()
-                    .gap(px(8.))
-                    .child(div().min_w_0().truncate().type_title().child(pane.title.clone()))
-                    .children(pane.count.map(|count| {
-                        div().flex_none().type_ui().text_color(theme::text_faint()).child(count.to_string())
-                    })),
-            )
-            .child(
-                icon_button("right-close", "icons/x.svg", false)
-                    .tooltip(tip("Close", Some("⌘.")))
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_click(cx.listener(|this, _, window, cx| this.close_right(Some(window), cx))),
-            );
+            // Beside the conversation nothing leads the strip, so the close does.
+            .when(!replaces, |strip| strip.child(close))
+            .child(title);
         let resizable = !replaces;
         Some(
             div()

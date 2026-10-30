@@ -38,8 +38,10 @@ The `STRIP` of `polish/01` (52, hairline below, buttons 28 four apart, 12 from t
 
 ## 2. The right pane: one frame, many kinds (frames B, C)
 - **One width for every kind: 300, drag 260–420**, double-click the 6 hit strip resets, remembered. `MEMBERS_WIDTH` goes.
-- **Title strip** (`STRIP`): `[‹ crumb]` title 16/600, no count beside it (`polish/01`), close `x` 28 at 12 from the
-  right. Hairline below; fill `sidebar`, hairline left.
+- **Title strip** (`STRIP`): close `x` 28 leads it, then `[‹ crumb]` title 16/600, no count beside it
+  (`polish/01`). The close never trails the title: the window's own buttons end the strip at the
+  right, and an `x` beside minimize reads as another window button. When the crumb is drawn it is
+  the way out, so the close is not drawn twice. Hairline below; fill `sidebar`, hairline left.
 
   | Kind | Title | Opened by | Base or push |
   |---|---|---|---|
