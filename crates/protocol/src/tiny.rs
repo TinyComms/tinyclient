@@ -1,4 +1,4 @@
-//! A Tiny server's members, invites, audit, and rooms. No messages. A room is a voice channel:
+//! A Tiny server's members, invites, audit, rooms, text channels, and direct messages. A room is a voice channel:
 //! joining takes a seat in its call, with audio when the server's audio is up.
 
 use serde::{Deserialize, Serialize};

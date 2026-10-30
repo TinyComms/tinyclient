@@ -1,7 +1,8 @@
-//! The Tiny server window. Rooms and people are the sidebar. The pane is the invite, the one
-//! person you picked, or one room. Join a server is always there: it opens the same paste
-//! sheet, and a second server is kept beside this one. A control the account cannot use is
-//! absent, never disabled.
+//! The Tiny server window. Rooms, text channels, direct messages, and people are the sidebar.
+//! Picking a channel or a direct message opens the conversation pane. The server pane is the
+//! invite, the one person you picked, or one room. Join a server is always there: it opens the
+//! same paste sheet, and a second server is kept beside this one. A control the account cannot
+//! use is absent, never disabled.
 //!
 //! A room is drawn as a voice channel is: its name, then who is in its call, ringed while they
 //! speak. On a server whose audio is up, joining is a call: the call dock at the foot of the
@@ -18,9 +19,10 @@ use super::state::Shell;
 use super::theme::{self, Type};
 use crate::client::ask;
 use gpui::{div, prelude::*, px, AnyElement, ClipboardItem, Context, Div, Entity, Focusable, MouseButton, Window};
-use protocol::{AccountKey, Change, Key, Link, Network, Presence, Request, Response};
+use protocol::{AccountKey, Change, Conversation, ConversationKind, Key, Link, Network, Presence, Request, Response};
 use std::collections::HashSet;
 use std::io;
+use std::rc::Rc;
 
 /// Shown when the server's token cannot be wrapped with this server's address.
 const UNMADE: &str = "The invite could not be made into a code.";
@@ -376,7 +378,9 @@ impl Shell {
                 .unwrap_or_else(|| "Invite".to_owned());
                 let input = self.tiny_state.room_name.clone();
                 let focused = input.focus_handle(cx).is_focused(window);
-                (title, ready_view(&ready, shown, me, people_beside, (&input, focused), cx))
+                let chats = self.tiny_chats();
+                let open = self.open.clone();
+                (title, ready_view(&ready, shown, me, people_beside, (&input, focused), &chats, open.as_ref(), cx))
             }
         };
         div()
@@ -900,17 +904,33 @@ impl Shell {
         }
     }
 
-    /// The sidebar's list: the invite, then the people. The pane draws the same list only when
-    /// the sidebar is not beside it.
+    /// The sidebar's list: the invite, channels, direct messages, rooms, then the people. The pane
+    /// draws the same list only when the sidebar is not beside it.
     pub(super) fn tiny_directory(&self, cx: &mut Context<Self>) -> AnyElement {
         match self.page() {
             Page::Loading => join_column(directory_note("Loading this server.", false), cx),
             Page::Failed(detail) => join_column(directory_note(&detail, true), cx),
             Page::Ready(ready) => {
                 let shown = shown(&self.tiny_state, &ready);
-                directory(&ready, shown, false, cx)
+                let chats = self.tiny_chats();
+                directory(&ready, shown, &chats, self.open.as_ref(), false, cx)
             }
         }
+    }
+
+    /// Text channels and direct messages in this server's space, in the tree's order.
+    fn tiny_chats(&self) -> Vec<Rc<Conversation>> {
+        let Some(account) = self.tiny_state.account.as_ref() else {
+            return Vec::new();
+        };
+        let Some(tree) = self.trees.get(&Key::new(account, "server")) else {
+            return Vec::new();
+        };
+        tree.conversations
+            .iter()
+            .filter(|chat| matches!(chat.kind, ConversationKind::Channel | ConversationKind::Direct))
+            .cloned()
+            .collect()
     }
 }
 
@@ -950,7 +970,7 @@ fn shown_id<'a>(picked: Option<&'a str>, can_invite: bool, members: &'a [Member]
     None
 }
 
-fn ready_view(ready: &Ready, shown: Shown, me: Option<&str>, people_beside: bool, name: (&Entity<TextInput>, bool), cx: &mut Context<Shell>) -> AnyElement {
+fn ready_view(ready: &Ready, shown: Shown, me: Option<&str>, people_beside: bool, name: (&Entity<TextInput>, bool), chats: &[Rc<Conversation>], open: Option<&Key>, cx: &mut Context<Shell>) -> AnyElement {
     let detail = match shown {
         Shown::Person(id) => match ready.members.iter().find(|member| member.user_id == id) {
             Some(member) => person_view(member, me == Some(member.user_id.as_str()), ready.confirm.as_deref(), cx),
@@ -968,7 +988,7 @@ fn ready_view(ready: &Ready, shown: Shown, me: Option<&str>, people_beside: bool
         .pb(px(24.))
         .flex()
         .flex_col()
-        .when(!people_beside, |column| column.child(directory(ready, shown, true, cx)))
+        .when(!people_beside, |column| column.child(directory(ready, shown, chats, open, true, cx)))
         .child(detail);
     div().id("tiny-page").flex_1().min_h_0().overflow_y_scroll().child(column).into_any_element()
 }
@@ -1000,7 +1020,7 @@ fn join_column(note: AnyElement, cx: &mut Context<Shell>) -> AnyElement {
         .into_any_element()
 }
 
-fn directory(ready: &Ready, shown: Shown, in_pane: bool, cx: &mut Context<Shell>) -> AnyElement {
+fn directory(ready: &Ready, shown: Shown, chats: &[Rc<Conversation>], open: Option<&Key>, in_pane: bool, cx: &mut Context<Shell>) -> AnyElement {
     let mut column = div().id(if in_pane { "tiny-people-pane" } else { "tiny-people" }).w_full().when(!in_pane, |column| column.flex_1().min_h_0().overflow_y_scroll()).flex().flex_col();
     if ready.can_invite {
         let selected = shown == Shown::Invite;
@@ -1014,6 +1034,8 @@ fn directory(ready: &Ready, shown: Shown, in_pane: bool, cx: &mut Context<Shell>
         );
     }
     column = column.child(join_row(cx));
+    column = chat_section(column, "Channels", chats, ConversationKind::Channel, open, cx);
+    column = chat_section(column, "Direct messages", chats, ConversationKind::Direct, open, cx);
     if !ready.rooms.is_empty() || ready.can_make_room {
         column = column.child(section_header("Rooms", false));
         for (ix, room) in ready.rooms.iter().enumerate() {
@@ -1070,6 +1092,33 @@ fn directory(ready: &Ready, shown: Shown, in_pane: bool, cx: &mut Context<Shell>
     // with audio is the dock's to show.
     let seated = ready.rooms.iter().find(|room| room.mine && ready.docked.as_deref() != Some(room.id.as_str()));
     div().size_full().flex().flex_col().child(column).children(seated.map(|room| seat_strip(room, ready.call_busy, cx))).into_any_element()
+}
+
+/// Channels, or direct messages, after Join and before Rooms. The header is omitted when empty.
+fn chat_section(mut column: gpui::Stateful<Div>, label: &str, chats: &[Rc<Conversation>], kind: ConversationKind, open: Option<&Key>, cx: &mut Context<Shell>) -> gpui::Stateful<Div> {
+    let rows: Vec<&Rc<Conversation>> = chats.iter().filter(|chat| chat.kind == kind).collect();
+    if rows.is_empty() {
+        return column;
+    }
+    column = column.child(section_header(label, false));
+    for chat in rows {
+        column = column.child(chat_row(chat, open, cx));
+    }
+    column
+}
+
+/// A text channel or a direct message. Picking it opens the conversation pane.
+fn chat_row(chat: &Conversation, open: Option<&Key>, cx: &mut Context<Shell>) -> gpui::Stateful<Div> {
+    let selected = open.is_some_and(|open| open == &chat.key);
+    let icon = if chat.kind == ConversationKind::Direct { "icons/user.svg" } else { "icons/hash.svg" };
+    let content = div()
+        .gap(px(8.))
+        .child(glyph(icon, 16., if selected { theme::text() } else { theme::text_soft() }))
+        .child(div().min_w_0().truncate().type_ui().text_color(theme::text()).child(chat.title.clone()));
+    let key = chat.key.clone();
+    let title = chat.title.clone();
+    list_row(gpui::ElementId::from(format!("tiny-chat-{}", key.id)), theme::row_height(theme::ROW_ONE), selected, false, content)
+        .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| this.select(key.clone(), &title, cx)))
 }
 
 /// A room, as a voice channel's row: 28, its glyph, its name, then how many are in it.

@@ -41,6 +41,12 @@ pub(super) fn under(host: &str, name: &str) -> bool {
 impl Hosts {
     pub(super) fn trust(&self, network: Network, url: &str) -> Option<Trust> {
         let (secure, host) = host_of(url)?;
+        // Files on a Tiny server are fetched with that server's bearer. This is before the
+        // local-host shortcut, so a test server on 127.0.0.1 still asks Download. The adapter
+        // attaches the bearer only when the address is its own.
+        if network == Network::Tiny {
+            return Some(Trust::Session);
+        }
         if let Some((_, trust)) = self.local.iter().find(|(local, _)| *local == host) {
             return Some(*trust);
         }
@@ -61,7 +67,7 @@ impl Hosts {
             Network::Signal => (&[], &[]),
             // Media is encrypted for the phone. The adapter fetches it itself, later.
             Network::Messages => (&[], &[]),
-            // A Tiny server has no files in this slice.
+            // Already returned above, before the local-host shortcut. Kept so the match is complete.
             Network::Tiny => (&[], &[]),
         };
         if session.iter().any(|name| under(&host, name)) {
@@ -513,6 +519,10 @@ mod tests {
         // A test's own server, and nothing else on plain HTTP.
         assert_eq!(trust(Discord, "http://127.0.0.1:4000/a.png"), Some(Trust::Open));
         assert_eq!(trust(Discord, "http://localhost:4000/a.png"), None);
+        // A Tiny file asks Download even on a local test server. A user part is not a host.
+        assert_eq!(trust(Network::Tiny, "https://chat.example/v1/media/a"), Some(Trust::Session));
+        assert_eq!(trust(Network::Tiny, "http://127.0.0.1:9/v1/media/a"), Some(Trust::Session));
+        assert_eq!(trust(Network::Tiny, "https://chat.example@evil.example/v1/media/a"), None);
     }
 
     #[test]

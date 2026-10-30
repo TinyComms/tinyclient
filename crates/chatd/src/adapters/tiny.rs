@@ -9,11 +9,13 @@
 //! Each account holds one live socket (`live`): presence, who is in each room's call, and the
 //! events that keep the server page current. A room is a voice channel, and joining it takes a
 //! seat over that socket. On a server whose audio is up the seat carries audio: chatd's one call
-//! runs mediad, which holds the WebRTC stack, and the socket carries its offer and answer. There
-//! are no conversations.
+//! runs mediad, which holds the WebRTC stack, and the socket carries its offer and answer.
+//! Text channels and direct messages are conversations (`messages`): the shell's own pane
+//! draws them.
 
 pub(crate) mod live;
 mod browser;
+mod messages;
 pub mod signin;
 
 use super::{serve_commands, Command, Context, Signed};
@@ -251,7 +253,10 @@ fn call(
             if let Some(bearer) = bearer.as_deref() {
                 request = request.header("Authorization", bearer);
             }
-            request.call()
+            match body {
+                Some(body) => request.force_send_body().send_json(body),
+                None => request.call(),
+            }
         }
         "POST" => {
             let mut request = agent.post(url);
@@ -265,6 +270,16 @@ fn call(
         }
         "PATCH" => {
             let mut request = agent.patch(url);
+            if let Some(bearer) = bearer.as_deref() {
+                request = request.header("Authorization", bearer);
+            }
+            match body {
+                Some(body) => request.send_json(body),
+                None => request.send_empty(),
+            }
+        }
+        "PUT" => {
+            let mut request = agent.put(url);
             if let Some(bearer) = bearer.as_deref() {
                 request = request.header("Authorization", bearer);
             }
@@ -875,6 +890,7 @@ pub(crate) fn start_with(ctx: Context, session: &str, inbox: Receiver<Command>, 
     std::thread::Builder::new()
         .name("tiny-commands".into())
         .spawn(move || {
+            messages::refresh(&ctx, &saved);
             serve_commands(
                 &ctx,
                 inbox,
@@ -889,7 +905,7 @@ pub(crate) fn start_with(ctx: Context, session: &str, inbox: Receiver<Command>, 
                         delete_session(&saved);
                         let _ = reply.send(Ok(()));
                     }
-                    other => other.unsupported(&ctx),
+                    other => messages::serve(&ctx, &saved, &live, other),
                 },
             );
             // The socket thread sleeps on the socket; this is how it hears the adapter stopped.

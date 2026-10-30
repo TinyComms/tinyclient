@@ -698,8 +698,8 @@ fn uploads_to(network: Network, url: &str) -> bool {
         // Encrypted before it leaves, by the adapter: nothing goes through this helper.
         Network::Signal => &[],
         Network::Messages => &[],
-        // Nothing is uploaded to a Tiny server in this slice.
-        Network::Tiny => &[],
+        // The adapter only posts to that server's /v1/media.
+        Network::Tiny => return true,
     };
     hosts.iter().any(|name| super::fetch::under(&host, name))
 }
@@ -816,6 +816,8 @@ mod tests {
         assert!(!uploads_to(Network::Slack, "http://files.slack.com/upload/v1/abc"));
         assert!(!uploads_to(Network::Slack, "https://files.slack.com.example.org/upload"));
         assert!(!uploads_to(Network::Telegram, "https://core.telegram.org/x"));
+        assert!(uploads_to(Network::Tiny, "https://chat.example/v1/media"));
+        assert!(!uploads_to(Network::Tiny, "https://chat.example@evil.example/v1/media"));
     }
 
     #[test]
