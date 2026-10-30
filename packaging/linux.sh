@@ -12,15 +12,17 @@
 #     libwebkit2gtk-4.1-dev libsoup-3.0-dev libvulkan-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
 #     libx11-dev libxcb1-dev libfontconfig1-dev protobuf-compiler
 #
-# Packaging needs librsvg2-bin, binutils and dpkg-dev, and nfpm (github.com/goreleaser/nfpm) and
-# appimagetool (github.com/AppImage/appimagetool) on the PATH. APPIMAGE_RUNTIME names a type2
+# Packaging needs librsvg2-bin, binutils, dpkg-dev and patchelf, and nfpm (github.com/goreleaser/nfpm)
+# and appimagetool (github.com/AppImage/appimagetool) on the PATH. APPIMAGE_RUNTIME names a type2
 # runtime file for appimagetool to use instead of downloading the newest.
 #
 # Every package installs the four programs side by side (/usr/lib/tinyclient in the .deb and .rpm,
 # usr/bin in the AppImage): each finds the others beside itself (`current_exe().with_file_name(..)`).
 # Libraries are the system's. The .deb's Depends come from dpkg-shlibdeps; the .rpm's Requires are
-# sonames, as rpmbuild would write them, so one .rpm suits Fedora and openSUSE alike. Nothing is
-# bundled into the AppImage either: WebKitGTK and GTK must match the system they run on.
+# sonames, as rpmbuild would write them, so one .rpm suits Fedora and openSUSE alike. The AppImage
+# carries only the keyboard libraries the window links (`bundled` below), since a system without
+# them still has X and should still open the window; WebKitGTK and GTK, which only
+# tinyclient-login links, must match the system they run on and stay the system's.
 set -eu
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -241,6 +243,21 @@ cp "$root/packaging/linux/AppRun" "$app/AppRun"
 cp "$usr/share/applications/$id.desktop" "$app/"
 cp "$icons/256x256/apps/$id.png" "$app/$id.png"
 ln -s "$id.png" "$app/.DirIcon"
+# The window's keyboard libraries, which a desktop without GTK or a keyboard stack may lack (the
+# AppImage catalog's test system is one): libxkbcommon-x11 and what it needs beyond libxcb, which X
+# itself provides. They go in usr/lib, found through an RPATH on tinyclient alone: an RPATH reaches
+# the libraries tinyclient loads too, and leaves chatd and tinyclient-login, whose GTK must take the
+# system's libxkbcommon, as they were. The ABI has been stable since 0.5, so a newer system's
+# keymaps still load.
+bundled="libxkbcommon.so.0 libxkbcommon-x11.so.0 libxcb-xkb.so.1"
+mkdir -p "$app/usr/lib"
+for soname in $bundled; do
+    path=$(ldconfig -p | awk -v so="$soname" '$1 == so && $0 ~ /x86-64|AArch64/ { print $NF; exit }')
+    [ -n "$path" ] || { echo "linux.sh: $soname is not installed here" >&2; exit 1; }
+    cp -L "$path" "$app/usr/lib/$soname"
+done
+# shellcheck disable=SC2016
+patchelf --force-rpath --set-rpath '$ORIGIN/../lib' "$app/usr/bin/tinyclient"
 runtime=
 [ -n "${APPIMAGE_RUNTIME:-}" ] && runtime="--runtime-file $APPIMAGE_RUNTIME"
 # shellcheck disable=SC2086
