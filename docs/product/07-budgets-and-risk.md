@@ -61,7 +61,7 @@ Per-item costs behind the heavy-account row (decoded pixels are 4 bytes each, at
 | Discord READY | Keep parsing into a struct that names only used fields. Add fields per feature; never keep the raw payload or a `Value` tree. Budget the peak. | A `Value` tree is 3 to 5 times the JSON size. |
 | Slack boot | Keep `client.counts` as the only listing call. Page channel lists on demand when the browser is opened. No `client.userBoot`, no `users.list`. | Boot payloads are MBs on large workspaces *(unverified size)*. |
 | Emoji | Unicode emoji come from the system font. Custom emoji are fetched when first drawn, at 48 px, into the avatar-style cache. The picker loads one server's set at a time. | A bundled emoji set is 10+ MB on disk and in memory. |
-| Search | Search asks the network. Local search is SQLite FTS5 over cached messages only if the owner wants it (question 3). | An FTS index adds roughly 30 to 50% to the message table. |
+| Search | Search reads the local cache first: `tinyclient --text --search` and the search pane's field, over cached messages. Asking a network is an explicit act — Enter in the pane — and Discord is the one asked. There is no FTS index. | The cache is already on disk, so a search costs no request until the person presses Enter. |
 | SQLite growth | Keep the newest 2,000 messages per conversation and nothing older than 90 days unless the conversation was opened in that time. Prune at start and daily. | At about 300 B a row, 1,000 conversations x 2,000 = 600 MB without the age rule; with it, under 200 MB. |
 | TDLib | Give it its own row above and measure first. If it exceeds 50 MB, run it as its own process that starts only when Telegram is signed in. | It is the single largest cost in chatd and has its own database. |
 | Message window | The shell holds at most 300 messages; older ones page in 50 at a time from chatd and fall off the other end. | 5,000 shaped messages would otherwise cost tens of MB. |
@@ -175,10 +175,9 @@ Rules:
    to stand behind in a public release. Decide before avatars and presence ship, and never mix.
 2. **Slack identity.** Should chatd present the helper's Safari string (consistent, but hidden from
    a work admin), or should both say `tinyclient`? Google and Okta sign-in may refuse the second.
-3. **Local search.** Is the network's own search enough, or is an offline index worth the disk?
-4. **Five Slack workspaces** conflicts with "multiple accounts per network" being cut in
+3. **Five Slack workspaces** conflicts with "multiple accounts per network" being cut in
    `stories.md`. Which stands?
-5. **TDLib.** If it measures above 50 MB, is a separate Telegram process acceptable?
+4. **TDLib.** If it measures above 50 MB, is a separate Telegram process acceptable?
 
 Sources: Discord Userdoccers ([reference](https://docs.discord.food/reference), [rate limits](https://docs.discord.food/topics/rate-limits), [gateway](https://docs.discord.food/topics/gateway)), [Abaddon README](https://github.com/uowuo/abaddon), Slack ([rate limits](https://docs.slack.dev/apis/web-api/rate-limits), [anomaly events](https://docs.slack.dev/reference/audit-logs-api/anomalous-events-reference)).
 

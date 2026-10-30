@@ -62,7 +62,7 @@ Sizes of a macOS arm64 release build, 2026-10-14:
 
 ## What works today
 
-Current release: [v0.2.14](https://github.com/itz4blitz/tinyclient/releases/tag/v0.2.14). This is what `main` does. The goal is full parity with each official app. Every gap is a place to help.
+Current release: [v0.2.24](https://github.com/itz4blitz/tinyclient/releases/tag/v0.2.24). This is what `main` does. The goal is full parity with each official app. Every gap is a place to help.
 
 | Network | Sign-in | Reading and media | Writing | Calls |
 | --- | --- | --- | --- | --- |
@@ -90,16 +90,15 @@ Still not built, and not covered by an open pull request: Signal attachments and
 
 ## Work in progress
 
-Look at [open pull requests](https://github.com/itz4blitz/tinyclient/pulls) before you start something large. This is the queue as of 17 October 2026. Say which area you want on [Discord](https://discord.gg/kJHK7BNvJP) so two people do not build the same thing.
+Look at [open pull requests](https://github.com/itz4blitz/tinyclient/pulls) before you start something large. This is the queue as of 27 October 2026. Say which area you want on [Discord](https://discord.gg/kJHK7BNvJP) so two people do not build the same thing.
 
 | Work | Where it stands |
 | --- | --- |
-| **Cached network sidebars** | [#10](https://github.com/itz4blitz/tinyclient/pull/10) keeps each network's home in memory for the GUI session, so switching away and back does not show "Getting your chats…" while the local daemon is reread. It conflicts with `main` after the Discord loading fix and needs a rebase that keeps both. |
 | **Discord voice channels in the server list** | The server list shows voice channels with who is in them, and you can join one from there: a hover Join pill on the row, a double-click, or "Join voice" in the row's menu. Stage channels still open in Discord, and the list promises nothing beyond that. |
-| **Call audio** | Discord calls are Opus at 48 kHz. An underrun fades to silence and an over-full playback buffer fades across the samples it drops, so neither end hears a click from that buffer. Reopening the audio device runs off the 20 ms tick. Slack, Teams, Telegram, and Signal still hand the call to the official app. |
+| **Call audio** | Discord calls are Opus at 48 kHz. An underrun fades to silence and an over-full playback buffer fades across the samples it drops, so neither end hears a click from that buffer. Reopening the audio device runs off the 20 ms tick. Neither cancels echo yet: wear headphones. Slack, Teams, Telegram, and Signal still hand the call to the official app. |
 | **Camera and screen share** | Calls are audio only. The protocol already names video streams, and a voice occupant can show a monitor glyph when Discord says they are streaming or on camera. mediad does not decode or send video yet. Receive-only screen share is the first slice; sending a camera, then guild "Go Live", comes after. |
 
-Recently merged, and already in the sections above: cached message search from `tinyclient --text --search`, installable packages, in-app updates, Android Messages, animated images, an optional systemd user service for `chatd`, Signal's Note to Self, recovery when the Linux keyring unlocks late, native shortcut labels, and sidebar previews that stay inside their row.
+Recently merged, and already in the sections above: a Tiny server you run - adding it from an invite code or an address, its rooms, people, roles, and invites kept current over a live socket, and joining a room's call with sound, over UDP or ICE-TCP (#63, #65-#71); Tiny sign-in in the browser, the window's own controls, and a sturdier Windows update (#72); search in the pane, a live field over the cached messages with scopes, and Enter asking Discord's own search (#55, #57, #58); cached network sidebars (#10); cached message search from `tinyclient --text --search`; installable packages; in-app updates; Android Messages; animated images; an optional systemd user service for `chatd`; Signal's Note to Self; recovery when the Linux keyring unlocks late; native shortcut labels; and sidebar previews that stay inside their row.
 
 ## Install
 
@@ -266,7 +265,7 @@ flowchart LR
     db[("chat.sqlite<br/>media/")]
     keys[("system<br/>credential store")]
     nets(["Slack · Discord · Teams<br/>Telegram · Signal · Messages<br/>a Tiny server you run"])
-    voice(["Discord voice"])
+    voice(["Discord voice,<br/>a Tiny room's calls"])
 
     shell <-->|"local socket<br/>length-prefixed JSON"| chatd
     chatd -->|"spawns, reads session<br/>from stdout"| login
@@ -274,15 +273,15 @@ flowchart LR
     chatd --- db
     chatd --- keys
     chatd <-->|TLS| nets
-    mediad <-->|"UDP, DAVE"| voice
+    mediad <-->|"UDP, DAVE,<br/>ICE-TCP"| voice
 ```
 
 | Crate | Binary | Role |
 | --- | --- | --- |
 | [`protocol`](crates/protocol) | | The contract: every request, answer, and change, as serde types. Frames are a 4-byte length, then JSON, at most 1 MiB, over a Unix socket (a named pipe on Windows). Also the panic hook, credential redaction, and how the shell starts chatd. |
 | [`chatd`](crates/chatd) | `chatd` | Always on, one per data directory. One adapter per account speaks that network's protocol. Everything lands in SQLite and the media cache. Spawns `tinyclient-login` for a sign-in and `mediad` for a call. Never decodes media and never fetches a link from a message. |
-| [`mediad`](crates/mediad) | `mediad` | Voice: Discord's voice gateway, RTP over UDP, Opus, DAVE, audio devices through cpal. Speaks only to chatd over stdin and stdout, and exits when the call ends or chatd closes its stdin. |
-| [`login`](crates/login) | `tinyclient-login` | The sign-in page for Slack, Discord, and Teams in a native web view (WKWebView on macOS, wry elsewhere). Prints the session on stdout and exits. Signal, Telegram, Messages, and a Tiny server sign in in the main window. |
+| [`mediad`](crates/mediad) | `mediad` | Voice: Discord's voice gateway, RTP over UDP, Opus, DAVE, and a Tiny server's room calls through str0m — UDP, or ICE-TCP where UDP is blocked — audio devices through cpal. Speaks only to chatd over stdin and stdout, and exits when the call ends or chatd closes its stdin. |
+| [`login`](crates/login) | `tinyclient-login` | The sign-in page for Slack, Discord, and Teams in a native web view (WKWebView on macOS, wry elsewhere). Prints the session on stdout and exits. Signal, Telegram, and Messages sign in in the main window. A Tiny server signs in in the system browser, driven by chatd. |
 | [`tinyclient`](crates/tinyclient) | `tinyclient` | The shell. Draws what chatd reports and decodes images for rows on screen. GPUI is behind the `gui` feature so tests and the daemons never build a GPU stack. Never talks to a network or reads the database. |
 
 The shell learns about changes by long-polling. `Wait {since}` blocks for up to 30 seconds and answers every change newer than `since`. The full contract, the data each process may hold, and what an adapter must do are in [`docs/architecture.md`](docs/architecture.md).
