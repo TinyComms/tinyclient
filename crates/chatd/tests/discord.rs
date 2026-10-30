@@ -1968,7 +1968,6 @@ fn a_stage_channel_lists_who_is_on_it_and_leaves_the_join_to_discord() {
         }
     });
     assert_eq!(gone, [("2003".to_owned(), true), ("2006".to_owned(), false)]);
->>>>>>> 58ee2e4 (A stage channel's row says who is live on it, and still hands the join to Discord)
 }
 
 #[test]
