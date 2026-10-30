@@ -38,7 +38,7 @@ How the processes fit together and who may edit what. The contract itself is the
 | `InVoice {network}`, `Around {network}` | `Conversations`; `Around {requests, in_call, online, recent}` | hub (occupants, presence, activity) and store |
 | `Find {network, query, limit}` | `Conversations` (title contains, newest first, cache only) | store |
 | `SearchMessages {conversation, network, space, query, limit}` | `MessageHits {hits (where, snippet, sender, title)}` (text contains, newest first, cache only) | store |
-| `SearchNetwork {conversation, space, query}` | `MessageHits` (the network's own hits, mapped like the cache's) | `Command::Search` (`Unsupported` until built; Discord: the server's search for a Space, the channel's for one conversation, 202 while indexing) |
+| `SearchNetwork {conversation, space, query}` | `MessageHits` (the network's own hits, mapped like the cache's) | `Command::Search` (`Unsupported` until built; Discord: the server's search for a Space, the channel's for one conversation, 202 while indexing; Telegram: text search in one conversation or forum topic) |
 | `Spaces {network}`, `Tree {space, offset, limit, peek}` | `Spaces`; `Tree {groups (kind, count), conversations, total}` | store; `Command::OpenSpace` |
 | `Conversation`, `Collapse`, `Star`, `SetDraft` | `Conversation`; `Ok` | store (local only) |
 | `People {network, relation, query, offset, limit}` | `People {people, total}` | store; `Command::SearchPeople`, debounced |
@@ -251,7 +251,9 @@ changing again replaces its entry, so the list is bounded (256) by how many thin
 - **Calls**: set `call: Native` only on what tinyclient can carry itself. A stage channel, and
   anything else a listener cannot simply join and speak in, is not `Native`.
 - **Voice occupancy**: `Context::occupants(conversation, people, total)` for every voice channel
-  of a Space on screen, whenever it changes, us included when we are in it.
+  of a Space on screen, whenever it changes, us included when we are in it. An `Occupant`'s
+  `speaking` flag is overloaded: on a Tiny room it is who holds the floor, on a Discord stage
+  it is who is on stage (the audience is not).
 - **Idle**: `serve_commands` blocks on the inbox with no timer, and `Context::pause` is the one
   interruptible wait. No loop of short sleeps: the whole process has a budget of about one idle
   wakeup a second.

@@ -1,7 +1,7 @@
 # 08. Getting in and staying in
 
-Sign-in for the networks, first run, accounts, settings, sign-out, packaging. Researched
-2026-10-13. **[V]** = checked against a source this session (listed at the end). **[U]** = not
+Sign-in for the networks and for a Tiny server you run, first run, accounts, settings, sign-out,
+packaging. Researched 2026-10-13. **[V]** = checked against a source this session (listed at the end). **[U]** = not
 verified; from memory or a single report, test before relying on it.
 
 ## Verdict per network
@@ -14,6 +14,7 @@ verified; from memory or a single report, test before relying on it.
 | Teams, personal account | Microsoft login page; client id `8ec6bc83-…`, tenant `consumers`, skype token from `teams.live.com/api/auth/v1.0/authz/consumer`. | Probably yes. | Constants from purple-teams `teams_login.c` [V]. Not run by us [U]. |
 | Teams, work or school | Microsoft login page, signing in as Teams' own client id `1fec8e78-…`, scope `api.spaces.skype.com`, skype token from `teams.microsoft.com/api/authsvc/v1.0/authz`, push over trouter. | **No.** Expected to work in tenants with default policy [U, not run by us]. Fails wherever the tenant requires a managed or compliant device, an approved app, or blocks the flow. The user cannot fix that; only their admin can. | purple-teams issues #28 (conditional access block, open since 2022) and #78 (AADSTS 53003, Apr 2026, 27 comments, fixed Jun 2026 by adding request headers and a browser user agent) [V]. Microsoft now ships a managed policy that blocks device-code flow [V]. |
 | Messages (Android) | Native QR. The phone scans it from Messages › Device pairing. No Google account in this app, and no phone number to type. | The pairing itself is what messages.google.com does [U, not run by us against a phone]. Google does not publish the protocol and can change it. The phone stays the account and has to stay online. | Field layout of the Bugle relay as published by third-party clients [V for the field numbers used in code]. A scripted phone covers the adapter. A real pair has not been run [U]. |
+| Tiny server | In the system browser, driven by chatd: paste an invite code (server and invite together) or type the server's host, then the server's provider — Tinyauth or any OIDC provider — in your browser. PKCE, one-shot loopback callback. No name, email or password is asked in the app. A second server is added beside the first. | Only whoever the server's owner invited, or the person running it. | Repo state (PRs #63, #65, #67–#69, #72) [V]. |
 
 ### Telegram, in detail
 
@@ -78,6 +79,23 @@ Grid org is one account whose channels span its workspaces. "Add another workspa
 window on the same cookie. SSO is the page's own; the user agent fix already exists for Google
 and Okta.
 
+### The Tiny server
+
+- **You bring the server.** It is one you already run, added from the account menu, and the
+  sign-in talks only to that server: no cookie and no network in between, but it now happens in
+  your system browser rather than in the app. Another server is added the same way and stays
+  beside the first.
+- **Sign-up is an invite.** The owner hands an invite over as one code; pasting it fills in the
+  server and its token, and chatd asks the server where to send the browser. The account itself is
+  created at the provider, so no name, email or password is asked in the app. The owner can revoke
+  the invite afterwards.
+- **Sign-in for an account that exists** is the server's host, typed in the app (it can be a
+  plain hostname); the provider is then opened in your system browser. chatd makes a PKCE pair and
+  a state, listens once on 127.0.0.1 for the one-shot loopback callback, and trades the returned
+  code for a session. No name, email or password is asked in the app.
+- **Sign out everywhere** ends that account on every device that holds it, next to the ordinary
+  per-account sign-out. The password is kept by the provider, so it is not changed in the app.
+
 ## Stories
 
 | # | P | Story | Observable check |
@@ -102,7 +120,7 @@ and Okta.
 | 18 | P1 | tinyclient updates itself. | An older build offers the new version and relaunches into it with sessions intact. |
 | 19 | P1 | I add a Slack workspace that was not in my browser session. | "Add workspace" yields one more Slack account; existing ones do not reconnect. |
 | 20 | P2 | I use two Discord or Telegram accounts, or a Teams account that is a guest in other tenants. | Two accounts on one network in `status`, each with its own unread. |
-| cut | | Creating an account on any network; pasting a token; importing a session from Chrome or the official app; a risk-acknowledgement screen (the README carries it). | |
+| cut | | Creating an account on any network (a Tiny server's is created at its provider, in the browser, not in tinyclient); pasting a session token; importing a session from Chrome or the official app; a risk-acknowledgement screen (the README carries it). | |
 
 ## Session lifetime
 

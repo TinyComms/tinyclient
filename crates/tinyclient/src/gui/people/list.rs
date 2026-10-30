@@ -825,8 +825,8 @@ impl PeopleList {
                 .text_color(theme::text_soft())
                 .hover(|style| style.text_color(theme::text()))
                 .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
-                    if network == Network::Discord {
-                        this.pick_scope(Some(Network::Discord), Some(Chip::All), cx);
+                    if matches!(network, Network::Discord | Network::Telegram) {
+                        this.pick_scope(Some(network), Some(Chip::All), cx);
                     } else {
                         let _ = shell.update(cx, |shell, cx| shell.go(Mode::Network(network), cx));
                     }

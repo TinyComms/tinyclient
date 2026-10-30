@@ -10,6 +10,8 @@ protocol.workspace = true
 # The taskbar button's or Dock icon's number and flash (`gui/attention.rs`).
 notifier = { path = "../notifier", optional = true }
 sha2 = "0.10"
+# Socket requests block; deliver their thread results without occupying GUI workers.
+futures-channel = "0.3"
 
 # GPUI is the shell. It is behind `gui` so `cargo test` and the daemons never pull the GPU stack.
 #   cargo run -p tinyclient --features gui
@@ -32,6 +34,7 @@ url = { version = "2", optional = true }
 tlottie = { git = "https://github.com/dkaraush/tlottie", rev = "92df98dc209bc39b1e567ec74a8c86a0af5239de", optional = true }
 
 [dev-dependencies]
+futures-lite = "2"
 # The frame decoder's tests run without the window.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 

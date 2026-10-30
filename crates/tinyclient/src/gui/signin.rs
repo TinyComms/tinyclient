@@ -27,7 +27,7 @@ use super::input::{InputEvent, InputKey, TextInput};
 use super::state::Shell;
 use super::theme::{self, Type};
 use super::time::clock;
-use crate::client::ask;
+use crate::client::ask_async;
 use gpui::{
     canvas, deferred, div, fill, point, prelude::*, px, rgb, size, App, Bounds, Context, Deferred, Div, Entity,
     FocusHandle, Focusable, Global, MouseButton, Rgba, SharedString, Stateful, Task, Window,
@@ -74,6 +74,10 @@ pub struct Sheet {
     local: Option<SignInProblem>,
     /// Counts opens and restarts, so an answer to an earlier one is dropped.
     epoch: u64,
+    /// Changes from the listener supersede a submission still awaiting its reply.
+    revision: u64,
+    /// A closed sheet must finish cancelling before another sign-in begins.
+    cancellation: Option<Task<()>>,
     /// The code on show and the link it was made from: encoded once, redrawn only on rotation.
     code: Option<(String, Rc<qr::Qr>)>,
     /// Hears `Change::SignIn` while the sheet is open. Dropping it stops the loop.
@@ -322,6 +326,8 @@ impl Sheet {
             busy: false,
             local: None,
             epoch: 0,
+            revision: 0,
+            cancellation: None,
             code: None,
             listener: None,
             resend_timer: None,
@@ -400,7 +406,7 @@ impl Sheet {
         self.clear_fields(cx);
         if cancel && !self.canned {
             let request = Request::SignInCancel { network: self.network };
-            cx.background_executor().spawn(async move { drop(ask(&request)) }).detach();
+            self.cancellation = Some(cx.spawn(async move |_, _| { drop(ask_async(request).await) }));
         }
         cx.notify();
     }
@@ -443,17 +449,23 @@ impl Sheet {
             return;
         }
         self.epoch += 1;
-        self.busy = false;
+        // The initial Tiny face already contains an invite field. Do not let it
+        // submit before SignInBegin has created the flow on a slow computer.
+        self.busy = true;
         let (epoch, network) = (self.epoch, self.network);
+        let cancellation = self.cancellation.take();
         self.listener = Some(cx.spawn(async move |this, cx| {
+            if let Some(cancellation) = cancellation {
+                cancellation.await;
+            }
             let background = cx.background_executor().clone();
             let seq = || async {
-                match background.spawn(async { ask(&Request::Status) }).await {
+                match ask_async(Request::Status).await {
                     Ok(Response::Status { seq, .. }) => Some(seq),
                     _ => None,
                 }
             };
-            let begin = || background.spawn(async move { ask(&Request::SignInBegin { network }) });
+            let begin = || ask_async(Request::SignInBegin { network });
             let mut since = seq().await;
             let begun = begin().await;
             if !this.update(cx, |this, cx| this.begun(epoch, begun, cx)).unwrap_or(false) {
@@ -465,7 +477,7 @@ impl Sheet {
                     since = seq().await;
                     continue;
                 };
-                let Ok(Response::Changes { seq, reset, changes }) = background.spawn(async move { ask(&Request::Wait { since: from }) }).await else {
+                let Ok(Response::Changes { seq, reset, changes }) = ask_async(Request::Wait { since: from }).await else {
                     since = None;
                     continue;
                 };
@@ -505,6 +517,7 @@ impl Sheet {
         if epoch != self.epoch || self.face.is_none() {
             return false;
         }
+        self.busy = false;
         cx.notify();
         match answer {
             Ok(Response::SignIn { step, .. }) => {
@@ -539,21 +552,26 @@ impl Sheet {
         self.busy = true;
         self.local = None;
         let epoch = self.epoch;
+        let revision = self.revision;
         let request = Request::SignInAnswer { network: self.network, input };
         cx.spawn(async move |this, cx| {
             // The request holds what was typed. It is moved into the call and dropped there.
-            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
-            let _ = this.update(cx, |this, cx| this.answered(epoch, answer, cx));
+            let answer = ask_async(request).await;
+            let _ = this.update(cx, |this, cx| this.answered(epoch, revision, answer, cx));
         })
         .detach();
         cx.notify();
     }
 
-    fn answered(&mut self, epoch: u64, answer: io::Result<Response>, cx: &mut Context<Sheet>) {
+    fn answered(&mut self, epoch: u64, revision: u64, answer: io::Result<Response>, cx: &mut Context<Sheet>) {
         if epoch != self.epoch || self.face.is_none() {
             return;
         }
         self.busy = false;
+        if revision != self.revision {
+            cx.notify();
+            return;
+        }
         self.refocus = true;
         cx.notify();
         match answer {
@@ -566,6 +584,7 @@ impl Sheet {
 
     /// Draws a step, whoever said it: an answer, or the sign-in moving by itself.
     fn show(&mut self, step: SignInStep, cx: &mut Context<Sheet>) {
+        self.revision += 1;
         if matches!(step, SignInStep::Done { .. }) {
             // The shell's own loop hears the new account and draws it.
             self.close(false, cx);
@@ -617,6 +636,7 @@ impl Sheet {
         if self.canned {
             return;
         }
+        self.busy = true;
         self.local = None;
         self.code = None;
         self.clear_typed(cx);
@@ -626,11 +646,12 @@ impl Sheet {
         self.epoch += 1;
         self.listener = None;
         let network = self.network;
-        let cancel = cx.background_executor().spawn(async move { drop(ask(&Request::SignInCancel { network })) });
+        let epoch = self.epoch;
+        let cancel = cx.spawn(async move |_, _| { drop(ask_async(Request::SignInCancel { network }).await) });
         cx.spawn(async move |this, cx| {
             cancel.await;
             let _ = this.update(cx, |this, cx| {
-                if this.face.is_some() {
+                if this.epoch == epoch && this.face.is_some() {
                     this.begin(cx);
                 }
             });
@@ -782,7 +803,7 @@ impl Sheet {
     /// A dialog's main action, off while an answer is awaited.
     fn primary(&self, label: impl Into<SharedString>, act: fn(&mut Sheet, &mut Context<Sheet>), cx: &Context<Sheet>) -> gpui::AnyElement {
         if self.busy {
-            return button_disabled(label).h(px(32.)).into_any_element();
+            return button_disabled("Please wait…").h(px(32.)).into_any_element();
         }
         button("signin-primary", ButtonKind::Primary, label)
             .h(px(32.))

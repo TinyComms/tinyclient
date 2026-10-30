@@ -30,13 +30,17 @@ pub struct Side {
     threads: pane::Memory<Rc<Message>>,
     /// The message search's page: what was typed, and what the cache holds for it.
     pub search: Option<SearchPage>,
+    /// The pane search temporarily replaced, including any pushed layer.
+    before_search: Option<Stack>,
     /// The search pane's field and its wiring, alive while the pane is.
     search_input: Option<SearchField>,
+    /// The search box in the conversation header, replaced when its key changes.
+    conversation_search: std::cell::RefCell<Option<(Key, SearchField)>>,
     /// How often the cache was asked for the search pane, counted across pages: a page remade
     /// starts at nothing, and its number must never meet an older ask's.
     search_asks: u32,
-    /// The conversation the stack was last fitted to.
-    fitted: Option<Key>,
+    /// The conversation and resolved partner the stack was last fitted to.
+    fitted: Option<pane::Open>,
     /// The kind this view last put in the layout's slot, so another view's change can be told
     /// from its own.
     installed: Option<RightKind>,
@@ -317,15 +321,17 @@ impl Shell {
     fn follow_open(&mut self, cx: &mut Context<Self>) {
         self.restore_switches();
         let open = self.snapshot.as_ref().and_then(|snapshot| snapshot.open.as_ref());
-        let key = open.map(|open| open.key.clone());
-        if key == self.conversation_state.side.fitted {
+        let to = open.map(pane_open);
+        if to == self.conversation_state.side.fitted {
             self.take_in(cx);
             return;
         }
-        let to = open.map(pane_open);
         let side = &mut self.conversation_state.side;
+        if let Some(previous) = side.before_search.as_mut() {
+            *previous = pane::follow(previous, side.switches, to.as_ref(), &mut side.threads, side.narrow.get());
+        }
         side.stack = pane::follow(&side.stack, side.switches, to.as_ref(), &mut side.threads, side.narrow.get());
-        side.fitted = key;
+        side.fitted = to;
         side.asked = false;
         self.install(cx);
     }
@@ -354,6 +360,9 @@ impl Shell {
 
     /// Puts what the stack says in the layout's slot, and builds the views it needs.
     fn install(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.conversation_state.side.stack.base, Some(Layer::Search)) {
+            self.conversation_state.side.before_search = None;
+        }
         self.remember_switches(cx);
         let stack = self.conversation_state.side.stack.clone();
         match stack.thread() {
@@ -401,6 +410,10 @@ impl Shell {
                     self.install(cx);
                 }
             }
+            return;
+        }
+        if slot.is_none() && matches!(self.conversation_state.side.stack.top(), Some(Layer::Search)) {
+            self.dismiss_search(cx);
             return;
         }
         let side = &mut self.conversation_state.side;
@@ -610,6 +623,60 @@ impl Shell {
         cx.notify();
     }
 
+    /// A discoverable entry point into the same scoped cache and network search as Find.
+    pub(super) fn conversation_search_box(&self, key: &Key, window: &mut Window, cx: &mut Context<Self>) -> gpui::Div {
+        let mut field = self.conversation_state.side.conversation_search.borrow_mut();
+        if field.as_ref().map(|(held, _)| held) != Some(key) {
+            let input = cx.new(|cx| TextInput::new("Search conversation", cx));
+            let changed = cx.subscribe_in(&input, window, |this, input, event: &InputEvent, window, cx| {
+                let words = input.read(cx).text().to_owned();
+                this.conversation_search_typed(&words, window, cx);
+                if matches!(event, InputEvent::Submit) {
+                    this.enter_search(cx);
+                }
+                window.focus(&input.focus_handle(cx), cx);
+            });
+            let keys = cx.subscribe_in(&input, window, |this, input, event: &InputKey, window, cx| match event {
+                InputKey::Escape => {
+                    input.update(cx, |input, cx| input.set_text("", cx));
+                    this.close_search(window, cx);
+                    this.composer_focus(window, cx);
+                }
+                InputKey::Up => this.move_search_pick(false, cx),
+                InputKey::Down => this.move_search_pick(true, cx),
+            });
+            *field = Some((key.clone(), SearchField {
+                input, _subscriptions: vec![changed, keys],
+            }));
+        }
+        let input = field.as_ref().unwrap().1.input.clone();
+        let focused = input.focus_handle(cx).is_focused(window);
+        div()
+            .flex_initial()
+            .min_w(px(100.))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(crate::gui::components::search_field(focused)
+                .h(px(28.))
+                .child(div().flex_1().min_w_0().child(input)))
+    }
+
+    fn conversation_search_typed(&mut self, words: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if words.trim().is_empty() {
+            if matches!(self.conversation_state.side.stack.top(), Some(Layer::Search)) {
+                self.close_search(window, cx);
+            }
+            return;
+        }
+        let active = matches!(self.conversation_state.side.stack.top(), Some(Layer::Search))
+            && self.conversation_state.side.search.as_ref().is_some_and(|page| page.scope == Scope::Conversation);
+        if !active {
+            self.new_search_with(Scope::Conversation, words, window, cx);
+        } else if let Some(field) = &self.conversation_state.side.search_input {
+            field.input.update(cx, |input, cx| input.set_text(words, cx));
+            self.search_typed(cx);
+        }
+    }
+
     /// The Edit menu's two finds.
     pub(in crate::gui) fn search_here(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.open_search(Scope::Conversation, window, cx);
@@ -636,6 +703,9 @@ impl Shell {
             let side = &mut self.conversation_state.side;
             side.search_input = Some(SearchField { input, _subscriptions: vec![changed, keys] });
             side.search = Some(fresh_page(scope, words));
+            if !matches!(side.stack.base, Some(Layer::Search)) {
+                side.before_search = Some(side.stack.clone());
+            }
             side.stack = pane::open(&side.stack, Layer::Search);
         }
         self.install(cx);
@@ -652,15 +722,21 @@ impl Shell {
         self.reask_search(cx);
     }
 
-    /// Esc in the field: the pane closes and the conversation's keys come back.
-    fn close_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Restore the pane search replaced, whether closed by its button, Escape or clearing.
+    fn dismiss_search(&mut self, cx: &mut Context<Self>) {
         let side = &mut self.conversation_state.side;
-        if side.search.take().is_none() {
+        side.search = None;
+        side.search_input = None;
+        side.stack = side.before_search.take().unwrap_or_default();
+        self.install(cx);
+    }
+
+    /// Esc in the field: restore the previous pane and return the conversation's keys.
+    fn close_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !matches!(self.conversation_state.side.stack.top(), Some(Layer::Search)) {
             return;
         }
-        side.stack = Stack { base: None, push: None };
-        side.search_input = None;
-        self.install(cx);
+        self.dismiss_search(cx);
         self.composer_focus(window, cx);
     }
 
@@ -763,7 +839,8 @@ impl Shell {
             return;
         }
         let can_ask_network = scope != Scope::Everywhere
-            && self.open_key().is_some_and(|key| key.network == Network::Discord);
+            && self.open_key().is_some_and(|key| key.network == Network::Discord
+                || (key.network == Network::Telegram && scope == Scope::Conversation));
         if !can_ask_network {
             if let Some(hit) = first {
                 self.open_search_hit(&hit, cx);
@@ -985,6 +1062,13 @@ impl Shell {
             }
             Step::Pop => self.pop(cx),
             Step::ClosePane => {
+                if matches!(self.conversation_state.side.stack.top(), Some(Layer::Search)) {
+                    self.dismiss_search(cx);
+                    if let Some(window) = window {
+                        self.composer_focus(window, cx);
+                    }
+                    return true;
+                }
                 let side = &mut self.conversation_state.side;
                 side.stack = Stack { base: None, push: None };
                 side.search = None;

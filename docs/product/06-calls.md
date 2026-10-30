@@ -1,6 +1,6 @@
 # 06 — Calls
 
-Voice, video and screen share on Discord, Slack, Telegram and Teams. Researched 2026-10-13.
+Voice, video and screen share on Discord, Slack, Telegram and Teams, and room calls with sound on a Tiny server you run. Researched 2026-10-13. Updated 2026-10-27 for Tiny room calls.
 Fixed and not reopened here: media engines never load into chatd; mediad exists only during a
 call; one video surface (active speaker or one share); one hardware H.264 encode for a share.
 
@@ -20,27 +20,28 @@ never again produces a card with nobody on the other end.
 | Telegram 1:1 | **Feasible and sanctioned. Heavy.** | TDLib does signalling only; media is tgcalls on tg_owt (Telegram's WebRTC fork), a large C++ build. | A TDLib client added 1:1 voice+video this way and interoperates with official clients; build time doubled, ~30k symbols, software VP8/VP9 only [9]. Hardware H.264 through tgcalls on macOS is *unverified*. |
 | Telegram group | **Hard.** | tgcalls group instance; new encrypted conference calls also need the tde2e chain and per-packet encryption. | [10]. The client in [9] shipped no group calls. |
 | Teams | **Hard, not impossible. Hand-off for now.** | Trouter signalling + SRTP media against Microsoft's relays, on a work tenant. | Correction to our earlier assumption: a non-Microsoft client *has* interoperated. `eisbaw/ost` (Rust) lists audio calls as working and video as WIP [11]; Better Teams (SwiftUI over that core) claims 1:1 audio/video and meeting join [12]. Both are README claims, *not verified by us*. Microsoft supports no third-party media endpoint [13]. |
+| Tiny server room | **Shipped, audio only.** | We run the server, so nothing is reverse engineered: str0m in mediad (`mediad/src/tiny.rs`), one send-only Opus m-line plus one receive slot per other seat, a UDP host candidate and an active ICE-TCP candidate (RFC 6544 [14]); UDP preferred, TCP where UDP is blocked. | [15]. No echo cancellation yet; wear headphones (the README and a mediad comment say so, not the GUI). |
 
 Dependencies outside calls: Telegram and Teams have no adapter at all yet, so their calls cannot
 come before their text. Discord and Slack text exist but are not yet run against real accounts.
 
 ## Priority
 
-| | Discord | Slack | Telegram | Teams |
-| --- | --- | --- | --- | --- |
-| Voice in/out, mute, deafen, devices, leave, roster, speaking | **P0** | P1 after spike | P2 (1:1) | hand-off |
-| Ring out / ring in (DM, group DM) | **P0** | P1 (huddle invite) | P2 | hand-off |
-| Watch one share | P1 | P1 | P2 | hand-off |
-| Send one share (one hardware H.264 encode) | P1 | P2 | P2 | hand-off |
-| Camera, send and active-speaker receive | P2 | P2 | P2 | hand-off |
-| Group calls beyond the above | n/a | n/a | hand-off | hand-off |
-| Gallery, recording, captions, noise suppression UI, soundboard, stage channels, activities, lobby, breakout rooms | cut | cut | cut | cut |
+| | Discord | Slack | Telegram | Teams | Tiny server |
+| --- | --- | --- | --- | --- | --- |
+| Voice in/out, mute, deafen, devices, leave, roster, speaking | **P0** | P1 after spike | P2 (1:1) | hand-off | **shipped, audio only** |
+| Ring out / ring in (DM, group DM) | **P0** | P1 (huddle invite) | P2 | hand-off | n/a (rooms are joined, not rung) |
+| Watch one share | P1 | P1 | P2 | hand-off | future |
+| Send one share (one hardware H.264 encode) | P1 | P2 | P2 | hand-off | future |
+| Camera, send and active-speaker receive | P2 | P2 | P2 | hand-off | future |
+| Group calls beyond the above | n/a | n/a | hand-off | hand-off | n/a |
+| Gallery, recording, captions, noise suppression UI, soundboard, stage channels, activities, lobby, breakout rooms | cut | cut | cut | cut | cut |
 
 ## Stages
 
 1. **Honest button (days).** Every call button is a hand-off labelled with the official app; no
    mediad, no in-call card. Incoming rings are shown and notified (signalling only, in chatd).
-2. **Discord voice — the first shippable call.** Join a server voice channel; call a DM and be
+2. **Discord voice.** Join a server voice channel; call a DM and be
    called. Chosen because the adapter exists and the whole path is Rust with no WebRTC stack:
    gateway voice state, voice gateway v8, UDP, Opus, `davey`. Small mediad.
 3. **Discord watch one share, then send one.** One H.264 decode; then one VideoToolbox encode.
@@ -48,6 +49,10 @@ come before their text. Discord and Slack text exist but are not yet run against
    puts a WebRTC stack in mediad; pick one that Telegram can share or accept two.
 5. **Telegram 1:1** after the Telegram text adapter, with tgcalls loaded only once a call starts.
 6. **Teams** stays hand-off until the Teams adapter exists; then re-evaluate against [11].
+7. **Tiny server room calls — shipped.** Join a room's call with sound where the server has audio
+   turned on: str0m in mediad, one send-only Opus m-line plus receive slots, UDP preferred and
+   ICE-TCP where UDP is blocked. Mute, deafen, speaking rings, join and leave cues. Screen share
+   and a camera there are future.
 
 ## Stories
 
@@ -138,7 +143,7 @@ official app is not installed, the row says "Teams isn't installed" and offers t
 - **Echo:** mediad cancels no echo, on Discord calls or Tiny server calls. Discord's own clients
   cancel it on their side; tinyclient relies on nothing but the speech gate, which keeps the
   speaker out only while it is quieter than speech. With open speakers the others hear
-  themselves. Until there is echo cancellation the Tiny room says to wear headphones. The next
+  themselves. Until there is echo cancellation, the README and a mediad comment note to wear headphones. The next
   step, measured against the 40 MB mediad budget before it is taken: a pure-Rust port of
   WebRTC's AEC3 fed the mix as the far end (`sonora-aec3` or `aec3` on crates.io, both young), or
   the system's voice processing (macOS VoiceProcessingIO, Windows communications mode), which
@@ -172,3 +177,5 @@ official app is not installed, the row says "Teams isn't installed" and offers t
 11. `eisbaw/ost`, Teams protocol in Rust — https://github.com/eisbaw/ost
 12. Better Teams — https://github.com/mrowlinson/better-teams
 13. Microsoft, Teams call flows — https://learn.microsoft.com/en-us/MicrosoftTeams/microsoft-teams-online-call-flows
+14. RFC 6544, TCP Candidates with Interactive Connectivity Establishment — https://www.rfc-editor.org/rfc/rfc6544
+15. PR #71, "Join a Tiny room with sound, over UDP or ICE-TCP" — https://github.com/itz4blitz/tinyclient/pull/71
