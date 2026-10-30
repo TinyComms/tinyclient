@@ -36,7 +36,7 @@ use history::History;
 use pages::Pages;
 use protocol::{
     AccountKey, Badge, CallSupport, Conversation, ConversationKind, InboxCounts, InboxFilter, Key, Link, Network,
-    Request, Response, PAGE_LIMIT,
+    Occupants, Request, Response, PAGE_LIMIT,
 };
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -1033,9 +1033,13 @@ impl Shell {
         let selected = self.open.as_ref() == Some(&c.key);
         let tone = row_tone(c, selected, true);
         let surface = theme::row_surface(selected);
-        let occupied = c.occupants.as_ref().filter(|inside| inside.total > 0);
-        // An empty voice channel rests at a muted row's weight (`02` §4).
-        let empty_voice = c.kind == ConversationKind::Voice && occupied.is_none() && !selected;
+        let inside = c.occupants.as_ref().filter(|row| row.total > 0);
+        // A stage is Discord's: its row counts who is on stage, not who is in it.
+        let stage = c.key.network == Network::Discord && c.kind == ConversationKind::Voice && c.call == CallSupport::Handoff;
+        let live = stage.then(|| inside.and_then(stage_line)).flatten();
+        // An empty voice channel rests at a muted row's weight, and a stage with nobody on
+        // stage reads as one (`02` §4).
+        let empty_voice = empty_voice_row(c.kind, stage, selected, inside.is_some(), live.is_some());
         let title_color = if empty_voice { theme::text_faint() } else { tone.title };
         let leading = match c.kind {
             ConversationKind::Direct | ConversationKind::Group => self.conversation_avatar(c, 20., surface, cx).into_any_element(),
@@ -1052,9 +1056,12 @@ impl Shell {
             .and_then(|peer| self.people_state.hub().person(&Key { id: peer.clone(), ..c.key.clone() }))
             .map(|person| person.emoji)
             .filter(|emoji| !emoji.is_empty());
-        // The `4/12` (a user limit) is a native voice channel's treatment; stages are Handoff
-        // and keep their own trailing treatment, so they never get the limited form.
-        let count = occupied.and_then(|inside| voice_count(inside.total, if c.call == CallSupport::Native { c.limit } else { 0 }));
+        // The `4/12` is a native voice channel. A stage trails "Live · n speaking" instead.
+        let count = if stage {
+            None
+        } else {
+            inside.and_then(|row| voice_count(row.total, if c.call == CallSupport::Native { c.limit } else { 0 }))
+        };
         let draft = (!self.draft_of(c).is_empty() && !selected).then(|| glyph("icons/pencil.svg", 14., theme::text_faint()));
         let (picked, menu_row) = (c.clone(), c.clone());
         let ours = self
@@ -1086,6 +1093,7 @@ impl Shell {
             .children(join.then(|| self.join_pill(c, cx)))
             .children(draft)
             .children(count.map(|(count, soft)| div().flex_none().flex().items_center().gap(px(2.)).child(glyph("icons/volume-2.svg", 12., theme::text_faint())).child(div().type_micro().text_color(if soft { theme::text_soft() } else { theme::text_faint() }).child(count))))
+            .children(live.map(|line| div().flex_none().type_micro().text_color(theme::text_faint()).child(line)))
             .children(row_badge(c))
             .when(join, |row| row.group("voice"));
         list_row(row_id("tree", &c.key), theme::row_height(theme::ROW_ONE), selected, focused, content)
@@ -1556,6 +1564,26 @@ fn voice_count(total: u32, limit: u32) -> Option<(String, bool)> {
     })
 }
 
+/// A stage channel's trailing words: only who is on stage counts, the audience does not.
+/// Nobody on stage reads as an empty channel, so nothing (`02` §4).
+fn stage_line(occupants: &Occupants) -> Option<String> {
+    let speaking = occupants.people.iter().filter(|occupant| occupant.speaking).count();
+    (speaking > 0).then(|| format!("Live · {speaking} speaking"))
+}
+
+/// Whether a voice row draws its title faint: an empty voice channel, or a stage with
+/// nobody on stage. An audience-only stage is therefore faint, even though its people
+/// are still listed.
+fn empty_voice_row(kind: ConversationKind, stage: bool, selected: bool, has_occupants: bool, has_live: bool) -> bool {
+    kind == ConversationKind::Voice && !selected && (!has_occupants || (stage && !has_live))
+}
+
+/// The count a row trails: a normal voice channel shows how many are in it; a stage
+/// shows none, since its trailing words are the live count instead.
+fn row_count(stage: bool, inside: Option<&Occupants>) -> Option<String> {
+    if stage { None } else { inside.map(|row| row.total.to_string()) }
+}
+
 /// A tree row's name: a channel without its `#`; a Slack group DM by first names, "Mara,
 /// Dev, +2", which would otherwise truncate to nothing.
 fn tree_title(c: &Conversation) -> String {
@@ -1710,5 +1738,48 @@ pub(crate) mod tests {
         // A text channel's click only opens, and a DM call joins from its header.
         assert!(!joins_from_list(&row("general", ConversationKind::Channel)));
         assert!(!joins_from_list(&row("mara", ConversationKind::Direct)));
+    }
+
+    fn on_stage(speaking: &[bool]) -> Occupants {
+        let person = row("2001", ConversationKind::Voice).key;
+        Occupants {
+            people: speaking
+                .iter()
+                .map(|live| protocol::Occupant { person: person.clone(), name: "Mara O".into(), muted: false, deafened: false, streaming: false, speaking: *live })
+                .collect(),
+            total: speaking.len() as u32,
+        }
+    }
+
+    #[test]
+    fn a_stage_row_says_who_is_live_and_an_audience_only_one_reads_as_empty() {
+        assert_eq!(stage_line(&on_stage(&[false, true, true])).as_deref(), Some("Live · 2 speaking"));
+        assert_eq!(stage_line(&on_stage(&[true])).as_deref(), Some("Live · 1 speaking"));
+        // Only the audience: the design's empty stage, so no words trail.
+        assert_eq!(stage_line(&on_stage(&[false, false])), None);
+        assert_eq!(stage_line(&Occupants::default()), None);
+    }
+
+    #[test]
+    fn a_stage_row_carries_no_count_and_faints_when_only_the_audience_is_present() {
+        let occupants = on_stage(&[false, false]);
+        let inside = Some(&occupants);
+        // A stage never trails a total: its trailing words are the live count.
+        assert_eq!(row_count(true, inside), None);
+        assert_eq!(row_count(true, None), None);
+        // A normal voice channel still trails its total.
+        assert_eq!(row_count(false, inside), Some("2".to_owned()));
+        assert_eq!(row_count(false, None), None);
+
+        // An audience-only stage reads as empty, so its title is faint.
+        assert!(empty_voice_row(ConversationKind::Voice, true, false, true, false));
+        // A stage with someone on it is not faint.
+        assert!(!empty_voice_row(ConversationKind::Voice, true, false, true, true));
+        // An empty voice channel is faint too.
+        assert!(empty_voice_row(ConversationKind::Voice, false, false, false, false));
+        // A selected row is never faint, even when empty.
+        assert!(!empty_voice_row(ConversationKind::Voice, true, true, true, false));
+        // Non-voice rows are untouched.
+        assert!(!empty_voice_row(ConversationKind::Channel, true, false, true, false));
     }
 }

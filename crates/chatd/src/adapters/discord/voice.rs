@@ -127,6 +127,9 @@ pub struct Heard {
     muted: bool,
     deafened: bool,
     streaming: bool,
+    /// On a stage's platform (`suppress` false there): who the channel hears. A voice
+    /// channel's states never have it true, whatever `suppress` says there.
+    live: bool,
 }
 
 impl Heard {
@@ -255,8 +258,9 @@ impl Discord {
     }
 
     /// Tells chatd who is in each of `channels`, for those it is to know (see
-    /// [`Voice::watched`]): at most a row's worth of people, friends first then in name order,
-    /// us included, and the true count. A channel that emptied is told once.
+    /// [`Voice::watched`]): at most a row's worth of people, on-stage (live) first then
+    /// friends then in name order, us included, and the true count. A channel that emptied
+    /// is told once.
     fn occupancy(&self, channels: BTreeSet<String>) {
         let mut reports = Vec::new();
         {
@@ -283,8 +287,11 @@ impl Discord {
                     }
                     continue;
                 }
-                // Friends first (`02` §4), then by name, so the cap never hides a friend.
-                there.sort_by_cached_key(|(id, heard)| (state.relations.get(*id) != Some(&Relation::Friend), heard.name.to_lowercase(), (*id).clone()));
+                // On-stage (live) people first, then friends, then by name, so the capped
+                // list never hides a speaker or a friend behind a crowd whose names sort earlier.
+                there.sort_by_cached_key(|(id, heard)| {
+                    (!heard.live, state.relations.get(*id) != Some(&Relation::Friend), heard.name.to_lowercase(), (*id).clone())
+                });
                 let total = there.len() as u32;
                 let people = there.into_iter().take(protocol::OCCUPANTS_LIMIT).map(|(id, heard)| Occupant {
                     person: self.ctx.key(id),
@@ -292,7 +299,7 @@ impl Discord {
                     muted: heard.muted,
                     deafened: heard.deafened,
                     streaming: heard.streaming,
-                    speaking: false,
+                    speaking: heard.live,
                 });
                 let people: Vec<Occupant> = people.collect();
                 state.voice.told.insert(channel.clone(), guild);
@@ -348,6 +355,14 @@ impl Discord {
         if states.is_empty() {
             return;
         }
+        // The stages among the channels touched: `suppress` there picks the audience from the
+        // platform. In a voice channel it is Discord's server mute instead, and nobody in one
+        // is ever counted as on stage.
+        let touched: HashSet<&str> = states.iter().filter_map(|voice| voice.channel_id.as_deref()).collect();
+        let stages: HashSet<&str> = touched
+            .into_iter()
+            .filter(|channel| self.ctx.known(channel).ok().flatten().is_some_and(|row| row.call == CallSupport::Handoff))
+            .collect();
         let mut changed = BTreeSet::new();
         {
             let mut state = self.state.lock().unwrap();
@@ -365,7 +380,7 @@ impl Discord {
                 }
                 let named = voice.member.as_ref().map(|member| member.name().to_owned()).filter(|name| !name.is_empty());
                 let named = named.or_else(|| state.users.get(&voice.user_id).cloned());
-                let me = (voice.user_id == state.me).then(|| "You".to_owned());
+                let me = (voice.user_id == state.me).then_some("You".to_owned());
                 let heard = Heard {
                     guild: voice.guild_id.clone().or_else(|| guild.map(str::to_owned)),
                     channel: channel.clone(),
@@ -373,6 +388,7 @@ impl Discord {
                     muted: voice.self_mute || voice.mute,
                     deafened: voice.self_deaf || voice.deaf,
                     streaming: voice.self_stream || voice.self_video,
+                    live: stages.contains(channel.as_str()) && !voice.suppress,
                 };
                 changed.insert(channel.clone());
                 state.voice.states.insert(voice.user_id.clone(), heard);
