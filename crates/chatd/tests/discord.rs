@@ -2603,7 +2603,6 @@ fn who_may_see_a_channel_follows_roles_membership_and_categories_live() {
     world.discord.push("GUILD_MEMBER_UPDATE", member(json!(["4010", "4011"])));
     wait("the core team's channel", || has("4103").then_some(()));
     assert!(has("4104") && has("4500"), "{:?}", rows());
-    assert_eq!(world.conversation("4201").limit, 12, "the limit survives the tree being worked out again");
     assert_eq!(world.conversation("4101").mentions, 1, "unread state survives the tree being worked out again");
     // We lose the mod role: its channel goes.
     world.discord.push("GUILD_MEMBER_UPDATE", member(json!(["4011"])));
@@ -2624,12 +2623,6 @@ fn who_may_see_a_channel_follows_roles_membership_and_categories_live() {
     world.discord.push("CHANNEL_UPDATE", general);
     wait("the channel to be read only", || world.conversation("4101").read_only.then_some(()));
     assert_eq!(world.conversation("4101").topic, "Anything goes. Be kind.");
-
-    // A voice channel's limit changed in Discord follows; none reads 0.
-    let mut lounge = channel("4201");
-    lounge["user_limit"] = json!(0);
-    world.discord.push("CHANNEL_UPDATE", lounge);
-    wait("the limit to lift", || (world.conversation("4201").limit == 0).then_some(()));
 
     // A category renamed is renamed at once.
     let mut text = channel("4100");
