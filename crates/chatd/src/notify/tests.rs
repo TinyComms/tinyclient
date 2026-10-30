@@ -283,6 +283,19 @@ fn one_notification_per_conversation_with_its_newest_three_lines() {
 }
 
 #[test]
+fn a_read_only_group_is_posted_without_a_reply() {
+    let fake = Fake::default();
+    let mut notes = Notes::new(Box::new(fake.clone()));
+    let mut group = row(Network::Telegram, "c9", ConversationKind::Group, "/g/'s Tech Memes Chat");
+    group.read_only = true;
+    post(&mut notes, &group, &message("Graw", "emacs"), Preview::Full);
+    let shown = &fake.log().shown[&note_id(&group.key)];
+    assert_eq!(shown.subtitle, "/g/'s Tech Memes Chat");
+    assert!(shown.reply_hint.is_empty(), "reply hint was {}", shown.reply_hint);
+    assert_eq!(shown.kind, Kind::ReadOnly);
+}
+
+#[test]
 fn sender_only_and_nothing_keep_the_text_off_the_screen() {
     let fake = Fake::default();
     let mut notes = Notes::new(Box::new(fake.clone()));

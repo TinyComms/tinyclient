@@ -162,6 +162,22 @@ fn chat_photo(photo: &tl::enums::ChatPhoto) -> (i64, i32) {
     }
 }
 
+/// `send_messages` is on, and the ban has not expired. `until_date` of 0 does not expire.
+fn send_banned(rights: &tl::enums::ChatBannedRights) -> bool {
+    let tl::enums::ChatBannedRights::Rights(rights) = rights;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|age| age.as_secs()).unwrap_or(0);
+    rights.send_messages && (rights.until_date == 0 || u64::try_from(rights.until_date).unwrap_or(0) > now)
+}
+
+/// A member cannot post. The creator always can. A personal ban stops that one member. The
+/// group's own ban stops everyone who is not an admin.
+fn member_cannot_send(creator: bool, admin: bool, default_banned: Option<&tl::enums::ChatBannedRights>, personal: Option<&tl::enums::ChatBannedRights>) -> bool {
+    if creator {
+        return false;
+    }
+    personal.is_some_and(send_banned) || (!admin && default_banned.is_some_and(send_banned))
+}
+
 fn of_chat(chat: &tl::enums::Chat) -> Option<(Who, Known)> {
     use tl::enums::Chat;
     Some(match chat {
@@ -170,7 +186,7 @@ fn of_chat(chat: &tl::enums::Chat) -> Option<(Who, Known)> {
             let (photo, photo_dc) = chat_photo(&chat.photo);
             let known = Known {
                 name: chat.title.clone(),
-                read_only: chat.left || chat.deactivated,
+                read_only: chat.left || chat.deactivated || member_cannot_send(chat.creator, chat.admin_rights.is_some(), chat.default_banned_rights.as_ref(), None),
                 photo,
                 photo_dc,
                 ..Known::default()
@@ -183,16 +199,22 @@ fn of_chat(chat: &tl::enums::Chat) -> Option<(Who, Known)> {
         }
         Chat::Channel(channel) => {
             let (photo, photo_dc) = chat_photo(&channel.photo);
-            // In a channel proper only its owners and admins with the right post.
+            // In a channel proper only its owners and admins with the right post. A megagroup
+            // is a channel too: members cannot post when the group, or their own rights, say so.
             let may_post = channel.creator
                 || matches!(&channel.admin_rights, Some(tl::enums::ChatAdminRights::Rights(rights)) if rights.post_messages);
+            let restricted = if channel.broadcast {
+                !may_post
+            } else {
+                member_cannot_send(channel.creator, channel.admin_rights.is_some(), channel.default_banned_rights.as_ref(), channel.banned_rights.as_ref())
+            };
             let known = Known {
                 hash: channel.access_hash.filter(|_| !channel.min),
                 name: channel.title.clone(),
                 handle: first_username(&channel.username, &channel.usernames),
                 broadcast: channel.broadcast,
                 forum: channel.forum,
-                read_only: channel.left || (channel.broadcast && !may_post),
+                read_only: channel.left || restricted,
                 photo,
                 photo_dc,
                 mark: mark(channel.verified, channel.scam, channel.fake),
@@ -375,6 +397,99 @@ pub fn message_link(who: Who, known: Option<&Known>, message: i32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use grammers_tl_types::{Deserializable, Serializable};
+
+    type Field<'a> = &'a dyn Fn(&mut Vec<u8>);
+
+    fn blank<T: Deserializable>(fields: &[Field]) -> T {
+        let mut bytes = Vec::new();
+        fields.iter().for_each(|field| field(&mut bytes));
+        T::from_bytes(&bytes).expect("a blank value reads back")
+    }
+
+    fn put<T: Serializable>(value: T) -> impl Fn(&mut Vec<u8>) {
+        move |bytes| value.serialize(bytes)
+    }
+
+    /// A megagroup. Flags off, so every optional field is absent.
+    fn megagroup(title: &str) -> tl::types::Channel {
+        let mut channel: tl::types::Channel =
+            blank(&[&put(0u32), &put(0u32), &put(9i64), &put(title.to_owned()), &put(tl::enums::ChatPhoto::Empty), &put(1i32)]);
+        channel.megagroup = true;
+        channel
+    }
+
+    /// `send_messages` banned until `until`. Zero does not expire.
+    fn ban_send(until: i32) -> tl::enums::ChatBannedRights {
+        let rights: tl::types::ChatBannedRights = blank(&[&put(2u32), &put(until)]);
+        rights.into()
+    }
+
+    fn admin(post_messages: bool) -> tl::enums::ChatAdminRights {
+        let rights: tl::types::ChatAdminRights = blank(&[&put(if post_messages { 2u32 } else { 0 })]);
+        rights.into()
+    }
+
+    fn read_only(chat: tl::enums::Chat) -> bool {
+        of_chat(&chat).expect("a chat").1.read_only
+    }
+
+    #[test]
+    fn a_megagroup_members_cannot_post_in_is_read_only_and_its_admins_still_can() {
+        let mut members = megagroup("/g/'s Tech Memes Chat");
+        members.default_banned_rights = Some(ban_send(0));
+        assert!(read_only(members.clone().into()));
+
+        let mut creator = members.clone();
+        creator.creator = true;
+        assert!(!read_only(creator.into()));
+
+        let mut admin_of = members.clone();
+        admin_of.admin_rights = Some(admin(false));
+        assert!(!read_only(admin_of.into()));
+
+        // A ban that already ended does not lock the chat.
+        members.default_banned_rights = Some(ban_send(1));
+        assert!(!read_only(members.into()));
+    }
+
+    #[test]
+    fn a_personal_send_ban_locks_that_member_until_it_ends() {
+        let mut channel = megagroup("memes");
+        channel.banned_rights = Some(ban_send(0));
+        assert!(read_only(channel.clone().into()));
+
+        channel.creator = true;
+        assert!(!read_only(channel.clone().into()));
+        channel.creator = false;
+
+        channel.banned_rights = Some(ban_send(1));
+        assert!(!read_only(channel.into()));
+    }
+
+    #[test]
+    fn a_basic_group_members_cannot_post_in_is_read_only() {
+        let chat = tl::types::Chat {
+            creator: false,
+            left: false,
+            deactivated: false,
+            call_active: false,
+            call_not_empty: false,
+            noforwards: false,
+            id: 7,
+            title: "crew".into(),
+            photo: tl::enums::ChatPhoto::Empty,
+            participants_count: 3,
+            date: 1,
+            version: 1,
+            migrated_to: None,
+            admin_rights: None,
+            default_banned_rights: Some(ban_send(0)),
+        };
+        assert!(read_only(chat.clone().into()));
+        let creator = tl::types::Chat { creator: true, ..chat };
+        assert!(!read_only(creator.into()));
+    }
 
     #[test]
     fn ids_go_both_ways_and_a_topic_needs_a_channel() {

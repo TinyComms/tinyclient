@@ -826,6 +826,7 @@ impl Chat {
         let stored = {
             let mut store = self.hub.store();
             match store.conversation(&conversation) {
+                Ok(Some(row)) if row.read_only => return error(ErrorCode::Refused, format!("You can read {} but not post in it.", row.title)),
                 Ok(Some(_)) => store.ingest(&conversation, &message, false),
                 Ok(None) => return error(ErrorCode::NotFound, "no such conversation"),
                 Err(err) => Err(err),

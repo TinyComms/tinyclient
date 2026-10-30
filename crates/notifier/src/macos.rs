@@ -22,6 +22,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 const MESSAGE: &str = "message";
+const READONLY: &str = "readonly";
 const CALL: &str = "call";
 
 define_class!(
@@ -112,12 +113,15 @@ impl Center {
             &NSString::from_str("Send"),
             &NSString::from_str("Reply"),
         );
-        let read = UNNotificationAction::actionWithIdentifier_title_options(&NSString::from_str("read"), &NSString::from_str("Mark as Read"), UNNotificationActionOptions::empty());
+        let read = || {
+            UNNotificationAction::actionWithIdentifier_title_options(&NSString::from_str("read"), &NSString::from_str("Mark as Read"), UNNotificationActionOptions::empty())
+        };
         let accept = UNNotificationAction::actionWithIdentifier_title_options(&NSString::from_str("accept"), &NSString::from_str("Accept"), UNNotificationActionOptions::Foreground);
         let decline = UNNotificationAction::actionWithIdentifier_title_options(&NSString::from_str("decline"), &NSString::from_str("Decline"), UNNotificationActionOptions::Destructive);
-        let message = category(MESSAGE, &[Retained::into_super(reply), read], "New message");
+        let message = category(MESSAGE, &[Retained::into_super(reply), read()], "New message");
+        let readonly = category(READONLY, &[read()], "New message");
         let call = category(CALL, &[accept, decline], "Incoming call");
-        center.setNotificationCategories(&NSSet::from_retained_slice(&[message, call]));
+        center.setNotificationCategories(&NSSet::from_retained_slice(&[message, readonly, call]));
         let asked = RcBlock::new(|granted: Bool, error: *mut NSError| {
             if !granted.as_bool() {
                 // SAFETY: the framework passes a valid error or null.
@@ -142,6 +146,7 @@ impl Sink for Center {
         content.setThreadIdentifier(&NSString::from_str(&note.id));
         match note.kind {
             Kind::Message => content.setCategoryIdentifier(&NSString::from_str(MESSAGE)),
+            Kind::ReadOnly => content.setCategoryIdentifier(&NSString::from_str(READONLY)),
             Kind::Call => content.setCategoryIdentifier(&NSString::from_str(CALL)),
             Kind::Plain => {}
         }

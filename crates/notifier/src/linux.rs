@@ -72,6 +72,7 @@ impl Sink for Bus {
         let replaces = lock(&self.ids).server.get(&note.id).copied().unwrap_or(0);
         let actions: Vec<&str> = match note.kind {
             Kind::Message => vec!["default", "Open", "inline-reply", "Reply", "read", "Mark as read"],
+            Kind::ReadOnly => vec!["default", "Open", "read", "Mark as read"],
             Kind::Call => vec!["default", "Open", "accept", "Accept", "decline", "Decline"],
             Kind::Plain => vec!["default", "Open"],
         };
@@ -79,7 +80,9 @@ impl Sink for Bus {
         hints.insert("suppress-sound", Value::from(true));
         hints.insert("desktop-entry", Value::from(self.app.id.as_str()));
         hints.insert("category", Value::from(if note.kind == Kind::Call { "call.incoming" } else { "im.received" }));
-        hints.insert("x-kde-reply-placeholder-text", Value::from(note.reply_hint.as_str()));
+        if note.kind == Kind::Message {
+            hints.insert("x-kde-reply-placeholder-text", Value::from(note.reply_hint.as_str()));
+        }
         if note.kind == Kind::Call {
             hints.insert("urgency", Value::from(2u8));
         }
