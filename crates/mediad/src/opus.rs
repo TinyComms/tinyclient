@@ -240,6 +240,32 @@ impl Decoder {
         samples
     }
 
+    /// The talk spurt ended. Ramp from the last sample that was actually played down to zero.
+    /// Starting a pitch repeat here jumps, and that jump is the pop at the end of a sentence.
+    /// The decoder is left alone for one frame, so a packet that was only late still continues
+    /// it; a longer gap counts as concealment and the next real frame starts clean.
+    pub(crate) fn release(&mut self, samples: usize, pcm: &mut [i16]) -> usize {
+        let out = &mut pcm[..samples * CHANNELS];
+        let from = if self.last.len() >= CHANNELS {
+            let at = self.last.len() - CHANNELS;
+            [self.last[at], self.last[at + 1]]
+        } else {
+            [0, 0]
+        };
+        let steps = samples.max(1) as f32;
+        for (n, pair) in out.chunks_mut(CHANNELS).enumerate() {
+            let gain = 1. - (n as f32 + 1.) / steps;
+            for (sample, &start) in pair.iter_mut().zip(&from) {
+                *sample = (f32::from(start) * gain) as i16;
+            }
+        }
+        self.last.clear();
+        self.gain = 0.;
+        self.concealing = true;
+        self.misses = self.misses.saturating_add(1);
+        samples
+    }
+
     /// After we concealed frames the decoder never saw, its state is the speech of before the
     /// gap; going on from it puts a burst in the first frame back. It starts afresh instead,
     /// and [`Decoder::resume`] fades from the concealment into what it makes.

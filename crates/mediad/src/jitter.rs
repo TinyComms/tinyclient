@@ -122,6 +122,11 @@ impl Jitter {
         Pop::Lost
     }
 
+    /// A later packet is already queued. A loss with nothing behind it is the end of the spurt.
+    pub fn has_later(&self) -> bool {
+        !self.packets.is_empty()
+    }
+
     /// The packet due next, if it is here. After a [`Pop::Lost`] this is the one that may carry
     /// a copy of the frame that was lost.
     pub fn next(&self) -> Option<&[u8]> {
