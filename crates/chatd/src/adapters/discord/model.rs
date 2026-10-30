@@ -275,6 +275,9 @@ pub struct Channel {
     pub name: Option<String>,
     #[serde(default, deserialize_with = "nullable")]
     pub position: i32,
+    /// The most who may be in it at once (a voice channel), 0 when it has no limit.
+    #[serde(default, deserialize_with = "nullable")]
+    pub user_limit: u32,
     #[serde(default)]
     pub parent_id: Option<String>,
     #[serde(default)]
@@ -320,12 +323,20 @@ pub struct Kept {
     pub name: Option<String>,
     #[serde(rename = "p", default)]
     pub position: i32,
+    /// A voice channel's occupant limit, 0 when it has none.
+    #[serde(rename = "l", default, skip_serializing_if = "no_limit")]
+    pub limit: u32,
     #[serde(rename = "u", default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
     #[serde(rename = "t", default, skip_serializing_if = "Option::is_none")]
     pub topic: Option<String>,
     #[serde(rename = "o", default, skip_serializing_if = "Vec::is_empty")]
     pub overwrites: Vec<(String, bool, u64, u64)>,
+}
+
+/// A count that means "none" stays off a note.
+fn no_limit(limit: &u32) -> bool {
+    *limit == 0
 }
 
 impl Kept {
@@ -336,6 +347,7 @@ impl Kept {
             kind: channel.kind,
             name: channel.name.clone(),
             position: channel.position,
+            limit: channel.user_limit,
             parent: channel.parent_id.clone(),
             topic: channel.topic.clone().filter(|topic| !topic.is_empty()),
             overwrites: overwrites.map(|over| (over.id.clone(), over.member, over.allow, over.deny)).collect(),
@@ -349,6 +361,7 @@ impl Kept {
             kind: self.kind,
             name: self.name,
             position: self.position,
+            user_limit: self.limit,
             parent_id: self.parent,
             topic: self.topic,
             permission_overwrites: overwrites.collect(),

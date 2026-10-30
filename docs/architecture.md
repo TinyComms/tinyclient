@@ -73,7 +73,8 @@ How the processes fit together and who may edit what. The contract itself is the
 - **Rows**: a `Conversation` carries its Space's and Group's titles and its topic
   (`Conversation::subtitle()` is the header's second line: `Space > group · topic`), `read_only`,
   `private`, the user's `draft`, and for a `Thread` its `parent` conversation and `root` message.
-  A voice channel's row carries `occupants` when anyone is in it.
+  A voice channel's row carries `occupants` when anyone is in it, and `limit`, how many it
+  seats (0 when Discord sets none).
 - **Messages** are one model: `text` plus `spans` (byte ranges on character boundaries: styles,
   links, mentions, custom emoji), `attachments` (file and thumbnail, dimensions known, `spoiler`,
   `sticker`, a voice message's `waveform` and `duration`), `previews`, `reactions`, `reply_to`
@@ -231,7 +232,7 @@ changing again replaces its entry, so the list is bounded (256) by how many thin
 | Data | Where |
 |---|---|
 | Sessions | Keychain, service `tinyclient`, one item per network. Never in chat.sqlite. Signal's item holds the account id and the key to `signal/<account>.state`, where its ratchets, keys, contacts and groups live, each value sealed with that key (`adapters/signal/vault.rs`, built with the `signal` feature only). |
-| Accounts, Spaces (muted, hide muted), folders, groups (kind, muted, unread only), conversations (unread, mentions, muted, read marker, star, topic, thread parent and root, draft, filing, kind flags, preview parts, seen, when it last mentioned me), people and relationships (title, time zone, mark), messages (rich fields as JSON in `message.body`), media rows with their failure and size variants, adapter notes | `chat.sqlite`, schema version in `PRAGMA user_version` (now 4), page cache 1 MB. A version change drops and refills the cache: the 3 → 4 change does, once. |
+| Accounts, Spaces (muted, hide muted), folders, groups (kind, muted, unread only), conversations (unread, mentions, muted, read marker, star, topic, thread parent and root, draft, filing, kind flags, preview parts, seen, when it last mentioned me, voice limit), people and relationships (title, time zone, mark), messages (rich fields as JSON in `message.body`), media rows with their failure and size variants, adapter notes | `chat.sqlite`, schema version in `PRAGMA user_version` (now 5), page cache 1 MB. A version change drops and refills the cache: the 4 → 5 change does, once. |
 | Media bytes | `media/<network>/<account>/` under the support directory, 500 MB, least recently used first. |
 | Presence and activity, typing, voice occupants, what the shell watches, links and capabilities, the change list, the call, upload progress, previews asked, and five minutes of profiles, info panes and catalog pages (64 / 64 / 16 / 32 at most) | chatd memory, bounded, gone at restart. |
 | Files opened in another app under their own names | `open/` in the support directory: hard links into the cache, emptied when the shell starts. |
