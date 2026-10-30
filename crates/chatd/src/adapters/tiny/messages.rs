@@ -21,8 +21,6 @@ use std::collections::{HashMap, HashSet};
 const SPACE: &str = "server";
 const PAGE: u32 = 50;
 const PAGE_MAX: u32 = 100;
-/// What the shell may attach. The server is asked with the file itself.
-const FILE_BYTES: u64 = 100 * 1024 * 1024;
 const DIRECTS_AT: i32 = 500_000;
 const ROOMS_AT: i32 = 1_000_000;
 const TYPING_FOR: i64 = 8;
@@ -34,8 +32,9 @@ pub(crate) fn refresh(ctx: &Context, saved: &Saved) {
 
 /// The same as [`refresh`], with names the caller already loaded (a fresh `ready` has them).
 pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, String>) {
+    let limits = upload_limits(saved);
     ctx.capabilities(Capabilities {
-        max_file_bytes: FILE_BYTES,
+        max_file_bytes: limits.image.max(limits.file),
         max_files: protocol::ATTACHMENTS_LIMIT as u32,
         ..Capabilities::default()
     });
@@ -170,6 +169,14 @@ pub(crate) fn on_live(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
         }
         "reaction.updated" => merge_reaction(ctx, saved, frame),
         "read.updated" => read_updated(ctx, saved, frame),
+        "server.updated" => {
+            let limits = upload_limits(saved);
+            ctx.capabilities(Capabilities {
+                max_file_bytes: limits.image.max(limits.file),
+                max_files: protocol::ATTACHMENTS_LIMIT as u32,
+                ..Capabilities::default()
+            });
+        }
         _ => {}
     }
 }
@@ -491,6 +498,15 @@ fn send_with(ctx: &Context, saved: &Saved, conversation_id: String, client_id: S
         ctx.sent(&conversation_id, &client_id, Err("Too many files.".to_owned()));
         return;
     }
+    let limits = upload_limits(saved);
+    for file in &outgoing.files {
+        let cap = cap_for(file, &limits);
+        let len = std::fs::metadata(&file.path).map(|meta| meta.len()).unwrap_or(0);
+        if len > cap {
+            ctx.sent(&conversation_id, &client_id, Err("That file is too big for this server.".to_owned()));
+            return;
+        }
+    }
     let saved = saved.clone();
     let posting = ctx.clone();
     let files = outgoing.files;
@@ -715,6 +731,37 @@ fn unicode_emoji(emoji: &str) -> bool {
 fn same_server(base: &str, url: &str) -> bool {
     let base = base.trim_end_matches('/');
     !base.is_empty() && (url == base || url.starts_with(&format!("{base}/")))
+}
+
+struct UploadLimits {
+    image: u64,
+    file: u64,
+}
+
+/// The caps `GET /v1/server` reports. An older server, or one that does not answer, keeps the original 8 MiB and 25 MiB.
+fn upload_limits(saved: &Saved) -> UploadLimits {
+    let fallback = UploadLimits { image: protocol::TINY_IMAGE_MAX_DEFAULT as u64, file: protocol::TINY_FILE_MAX_DEFAULT as u64 };
+    let Ok((200, body)) = super::asked("GET", saved, "/v1/server", None) else {
+        return fallback;
+    };
+    UploadLimits { image: byte_cap(&body, "image_max_bytes", fallback.image), file: byte_cap(&body, "file_max_bytes", fallback.file) }
+}
+
+fn byte_cap(body: &Value, key: &str, fallback: u64) -> u64 {
+    let Some(bytes) = body.get(key).and_then(Value::as_i64).and_then(|bytes| u64::try_from(bytes).ok()) else {
+        return fallback;
+    };
+    let ceiling = protocol::TINY_UPLOAD_MAX as u64;
+    if (1..=ceiling).contains(&bytes) { bytes } else { fallback }
+}
+
+fn cap_for(file: &protocol::OutgoingFile, limits: &UploadLimits) -> u64 {
+    let named = if file.name.is_empty() { file.path.as_str() } else { file.name.as_str() };
+    let ext = named.rsplit(['/', '\\', '.']).next().unwrap_or("").to_ascii_lowercase();
+    match ext.as_str() {
+        "png" | "jpg" | "jpeg" | "webp" | "gif" => limits.image,
+        _ => limits.file,
+    }
 }
 
 fn member_names(saved: &Saved) -> HashMap<String, String> {
@@ -1098,6 +1145,20 @@ mod tests {
         assert_eq!(room.call, CallSupport::Native);
         let (rows, _) = ctx.hub.store().inbox(Some(Network::Tiny), InboxFilter::All, 0, 20, &[]).unwrap();
         assert!(rows.iter().any(|row| row.key.id == "direct-1"));
+    }
+
+    #[test]
+    fn the_composer_uses_the_servers_upload_caps() {
+        let (_adapter, ctx, saved) = fixture(|request| {
+            if request.starts_with("GET /v1/server ") {
+                return Some(http(200, "OK", r#"{"name":"Tiny","image_max_bytes":1048576,"file_max_bytes":2097152}"#));
+            }
+            None
+        });
+        // Caps are stored only once the account is linked, which start does before refresh.
+        ctx.link(protocol::Link::Offline);
+        refresh(&ctx, &saved);
+        assert_eq!(ctx.hub.capabilities(&ctx.account).max_file_bytes, 2_097_152);
     }
 
     #[test]

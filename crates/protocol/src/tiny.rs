@@ -321,6 +321,14 @@ pub const TINY_FEATURE_AUDIT_QUERY: &str = "audit_query";
 pub const TINY_FEATURE_VOICE_MODERATION: &str = "voice_moderation";
 /// Calls can be end-to-end encrypted: MLS between the apps, which the server only relays.
 pub const TINY_FEATURE_E2EE_CALLS: &str = "e2ee_calls";
+/// An admin can set how large an upload may be.
+pub const TINY_FEATURE_UPLOAD_LIMITS: &str = "upload_limits";
+/// Images and GIFs, until an admin changes it.
+pub const TINY_IMAGE_MAX_DEFAULT: i64 = 8 * 1024 * 1024;
+/// Video and every other file, until an admin changes it.
+pub const TINY_FILE_MAX_DEFAULT: i64 = 25 * 1024 * 1024;
+/// The most either cap may be.
+pub const TINY_UPLOAD_MAX: i64 = 100 * 1024 * 1024;
 
 impl TinyCapabilities {
     pub fn has(&self, feature: &str) -> bool {
@@ -398,7 +406,7 @@ pub const TINY_PERMISSIONS: [(u64, &str); 20] = [
 ];
 
 /// The server's identity and settings, from `GET /v1/server`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TinyServerInfo {
     #[serde(default, deserialize_with = "text_or_null")]
     pub name: String,
@@ -417,12 +425,52 @@ pub struct TinyServerInfo {
     /// 0 is off.
     #[serde(default, deserialize_with = "or_default")]
     pub afk_timeout_secs: i32,
+    /// Images and GIFs, in bytes. Missing on an older server: 8 MiB.
+    #[serde(default = "image_max_default", deserialize_with = "image_max_bytes")]
+    pub image_max_bytes: i64,
+    /// Video and every other file, in bytes. Missing on an older server: 25 MiB.
+    #[serde(default = "file_max_default", deserialize_with = "file_max_bytes")]
+    pub file_max_bytes: i64,
     #[serde(default, deserialize_with = "text_or_null")]
     pub created_at: String,
     /// The icon as a file on this computer, filled in by chatd. Empty while there is none or it
     /// could not be fetched.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub icon_path: String,
+}
+
+impl Default for TinyServerInfo {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            description: String::new(),
+            welcome: String::new(),
+            icon: None,
+            default_room_id: None,
+            afk_room_id: None,
+            afk_timeout_secs: 0,
+            image_max_bytes: TINY_IMAGE_MAX_DEFAULT,
+            file_max_bytes: TINY_FILE_MAX_DEFAULT,
+            created_at: String::new(),
+            icon_path: String::new(),
+        }
+    }
+}
+
+fn image_max_default() -> i64 {
+    TINY_IMAGE_MAX_DEFAULT
+}
+
+fn file_max_default() -> i64 {
+    TINY_FILE_MAX_DEFAULT
+}
+
+fn image_max_bytes<'de, D: serde::Deserializer<'de>>(from: D) -> Result<i64, D::Error> {
+    Ok(Option::<i64>::deserialize(from)?.filter(|bytes| *bytes > 0).unwrap_or(TINY_IMAGE_MAX_DEFAULT))
+}
+
+fn file_max_bytes<'de, D: serde::Deserializer<'de>>(from: D) -> Result<i64, D::Error> {
+    Ok(Option::<i64>::deserialize(from)?.filter(|bytes| *bytes > 0).unwrap_or(TINY_FILE_MAX_DEFAULT))
 }
 
 /// Longest server name, description and welcome text the server keeps.
@@ -656,6 +704,12 @@ pub struct TinyServerEdit {
     pub afk_room_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub afk_timeout_secs: Option<i32>,
+    /// Images and GIFs, in bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_max_bytes: Option<i64>,
+    /// Video and every other file, in bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_max_bytes: Option<i64>,
 }
 
 /// A role to make, or a change to one. Only what is `Some` is sent; `color: Some("")` clears
@@ -1161,6 +1215,7 @@ mod tests {
         assert!(!json.contains("access") && !json.contains("capabilities") && !json.contains("roles"), "{json}");
         let info: TinyServerInfo = serde_json::from_str(r#"{"name":"AtomicStudio","description":null,"icon":null,"afk_timeout_secs":null,"new":1}"#).unwrap();
         assert_eq!((info.name.as_str(), info.icon, info.afk_timeout_secs), ("AtomicStudio", None, 0));
+        assert_eq!((info.image_max_bytes, info.file_max_bytes), (TINY_IMAGE_MAX_DEFAULT, TINY_FILE_MAX_DEFAULT));
         let roles: Vec<TinyRole> = serde_json::from_str(r##"[{"id":"e","name":"@everyone","color":null,"position":0,"permissions":63,"hoist":false,"default":true,"member_count":4}]"##).unwrap();
         assert!(roles[0].default && roles[0].permissions == TINY_EVERYONE_DEFAULT);
         let capabilities: TinyCapabilities = serde_json::from_str(r#"{"version":"0.3.0","features":["server","bans"]}"#).unwrap();

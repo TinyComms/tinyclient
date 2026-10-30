@@ -173,6 +173,10 @@ pub(in crate::gui) struct Fields {
     pub name: Entity<TextInput>,
     pub description: Entity<TextInput>,
     pub welcome: Entity<TextInput>,
+    /// Images and GIFs, as mebibytes, or the current byte count when that is not a whole mebibyte.
+    pub image_max: Entity<TextInput>,
+    /// Video and every other file, in the same form as `image_max`.
+    pub file_max: Entity<TextInput>,
     pub role_name: Entity<TextInput>,
     pub role_color: Entity<TextInput>,
     pub member_search: Entity<TextInput>,
@@ -189,6 +193,8 @@ impl Fields {
         let name = cx.new(|cx| TextInput::new("Server name", cx));
         let description = cx.new(|cx| TextInput::multiline("What this server is, in a sentence or two", cx));
         let welcome = cx.new(|cx| TextInput::multiline("What new members read on the server's home", cx));
+        let image_max = cx.new(|cx| TextInput::new("MiB", cx));
+        let file_max = cx.new(|cx| TextInput::new("MiB", cx));
         let role_name = cx.new(|cx| TextInput::new("Role name", cx));
         let role_color = cx.new(|cx| TextInput::new("#RRGGBB", cx));
         let member_search = cx.new(|cx| TextInput::new("Search by name or email", cx));
@@ -197,7 +203,7 @@ impl Fields {
         let room_topic = cx.new(|cx| TextInput::new("What the channel is for", cx));
         let category_name = cx.new(|cx| TextInput::new("Category name", cx));
         let confirm = cx.new(|cx| TextInput::new("Type the server's name", cx));
-        for input in [&name, &description, &welcome, &role_name, &role_color, &member_search, &ban_search, &room_name, &room_topic, &category_name, &confirm] {
+        for input in [&name, &description, &welcome, &image_max, &file_max, &role_name, &role_color, &member_search, &ban_search, &room_name, &room_topic, &category_name, &confirm] {
             cx.subscribe(input, |_, _, _: &crate::gui::input::InputEvent, cx| cx.notify()).detach();
             // Escape in a field leaves Server Settings, as it does anywhere else in it.
             cx.subscribe(input, |this, _, key: &crate::gui::input::InputKey, cx| {
@@ -207,7 +213,7 @@ impl Fields {
             })
             .detach();
         }
-        Fields { name, description, welcome, role_name, role_color, member_search, ban_search, room_name, room_topic, category_name, confirm }
+        Fields { name, description, welcome, image_max, file_max, role_name, role_color, member_search, ban_search, room_name, room_topic, category_name, confirm }
     }
 }
 

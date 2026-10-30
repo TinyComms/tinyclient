@@ -20,7 +20,7 @@ use protocol::{
     TinyInviteOptions, TinyLayoutGroup, TinyRole, TinyRoleEdit, TinyRoom, TinyRoomEdit, TinySeat, TinyServerEdit, TinyServerInfo,
     TINY_ALL, TINY_BITRATE_MAX, TINY_BITRATE_MIN, TINY_DESCRIPTION_MAX, TINY_FEATURE_AUDIT_QUERY, TINY_FEATURE_BANS,
     TINY_FEATURE_CATEGORIES, TINY_FEATURE_INVITE_OPTIONS, TINY_FEATURE_ROLES, TINY_FEATURE_SERVER, TINY_FEATURE_TIMEOUTS,
-    TINY_ICON_MAX, TINY_SERVER_NAME_MAX, TINY_WELCOME_MAX,
+    TINY_FEATURE_UPLOAD_LIMITS, TINY_ICON_MAX, TINY_SERVER_NAME_MAX, TINY_UPLOAD_MAX, TINY_WELCOME_MAX,
 };
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashMap};
@@ -39,6 +39,7 @@ const BITRATE: &str = "A room's bitrate is 16 to 128 kb/s.";
 const USES: &str = "An invite can be used 1 to 1000 times.";
 const EXPIRY: &str = "An invite lasts from a minute to 30 days.";
 const AFK: &str = "The AFK timeout is 0 (off) up to a day.";
+const UPLOAD_LIMIT: &str = "An upload limit is 1 byte to 100 MiB.";
 const REASON_SIZE: &str = "A reason is at most 500 characters.";
 const ICON_SIZE: &str = "That picture is too big. The most is 256 KB.";
 const ICON_KIND: &str = "That picture isn't a PNG, JPEG or WebP.";
@@ -334,6 +335,19 @@ pub(crate) fn server_update(account: AccountKey, edit: TinyServerEdit) -> Respon
             return refused(AFK);
         }
         body.insert("afk_timeout_secs".into(), json!(secs));
+    }
+    if edit.image_max_bytes.is_some() || edit.file_max_bytes.is_some() {
+        if let Err(answer) = allowed(&account, Some(TINY_FEATURE_UPLOAD_LIMITS), "community.server.edit") {
+            return answer;
+        }
+    }
+    for (field, bytes) in [("image_max_bytes", edit.image_max_bytes), ("file_max_bytes", edit.file_max_bytes)] {
+        if let Some(bytes) = bytes {
+            if !(1..=TINY_UPLOAD_MAX).contains(&bytes) {
+                return refused(UPLOAD_LIMIT);
+            }
+            body.insert(field.into(), json!(bytes));
+        }
     }
     if body.is_empty() {
         return Response::Ok;
