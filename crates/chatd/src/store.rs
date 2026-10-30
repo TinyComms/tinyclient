@@ -19,7 +19,9 @@ use serde::Serialize;
 use std::path::Path;
 
 /// Raise this when a table changes. `open` then drops the cache and starts over.
-const SCHEMA: i32 = 5;
+/// 6 rebuilds caches written at 5 before `conversation.voice_limit` existed. That column
+/// was added without a version change, so Win+K died with `no such column: c.voice_limit`.
+const SCHEMA: i32 = 6;
 
 /// Retention: the newest messages kept per conversation.
 pub const KEEP_MESSAGES: u32 = 2_000;
@@ -3203,6 +3205,35 @@ mod tests {
         assert!(!read(&store).iter().any(|(_, key, _)| key == "keep_days"), "reset to the default is no row");
         store.reset_settings().unwrap();
         assert_eq!(read(&store), [(String::new(), VERSION.to_owned(), "1".to_owned())]);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_cache_from_before_the_voice_limit_column_is_rebuilt() {
+        let path = scratch("voice-limit");
+        let mut store = Store::open(&path).unwrap();
+        store.set_setting("", "keep_days", Some("14")).unwrap();
+        store
+            .db
+            .execute_batch(
+                "DROP TABLE conversation;
+                 CREATE TABLE conversation (
+                     network TEXT NOT NULL,
+                     account TEXT NOT NULL,
+                     id TEXT NOT NULL,
+                     PRIMARY KEY (network, account, id)
+                 ) WITHOUT ROWID;
+                 PRAGMA user_version = 5;",
+            )
+            .unwrap();
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        let version: i32 = store.db.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap();
+        assert_eq!(version, SCHEMA);
+        let mut info = store.db.prepare("PRAGMA table_info(conversation)").unwrap();
+        let names: Vec<String> = info.query_map([], |row| row.get::<_, String>(1)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert!(names.iter().any(|name| name == "voice_limit"), "{names:?}");
+        assert!(store.settings().unwrap().iter().any(|setting| setting.key == "keep_days" && setting.value == "14"));
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
