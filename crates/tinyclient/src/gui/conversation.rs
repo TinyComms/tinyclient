@@ -1299,7 +1299,7 @@ impl Shell {
         }
     }
 
-    pub(super) fn conversation(&self, snapshot: &Snapshot, window: &Window, cx: &mut Context<Self>) -> Div {
+    pub(super) fn conversation(&self, snapshot: &Snapshot, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let Some(open) = snapshot.open.as_ref() else {
             return div()
                 .size_full()

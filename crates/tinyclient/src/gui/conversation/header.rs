@@ -29,7 +29,7 @@ impl Shell {
 
     /// The strip above the messages (07 §1): panel, back and forward, picture, title and the
     /// line after it on one baseline, the call, then the pane's buttons with Details last.
-    pub(super) fn strip(&self, open: &Conversation, link: Link, window: &Window, cx: &mut Context<Self>) -> Div {
+    pub(super) fn strip(&self, open: &Conversation, link: Link, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let direct = open.kind == ConversationKind::Direct;
         let picture = match open.kind {
             ConversationKind::Direct | ConversationKind::Group => Avatar::new(&open.key, &open.title, 24.),
@@ -64,6 +64,11 @@ impl Shell {
         // of conversation it keeps only its glyph, and the tooltip keeps the words (07 §1).
         let room = self.conversation_room();
         let compact = room > 0. && room < 600.;
+        let search = matches!(open.key.network, protocol::Network::Discord | protocol::Network::Telegram).then(|| {
+            self.conversation_search_box(&open.key, window, cx)
+                .w(px(if compact { 120. } else { 200. }))
+                .ml(px(8.))
+        });
         let call = self.snapshot.as_ref().and_then(|snapshot| self.call_pill(snapshot, cx)).map(|call| {
             let call = call.h(px(28.)).rounded(px(theme::R_CONTROL)).whitespace_nowrap();
             if compact {
@@ -149,6 +154,7 @@ impl Shell {
                     .children(line)
                     .children(trouble.map(|words| div().flex_none().type_small().text_color(theme::text_faint()).child(words))),
             )
+            .children(search)
             .children(call.map(|call| div().flex_none().ml(px(8.)).child(call)))
             .child(div().flex_none().ml(px(8.)).flex().gap(px(4.)).children(members).child(details))
     }

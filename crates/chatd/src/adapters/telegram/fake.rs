@@ -1164,6 +1164,20 @@ impl World {
             self.log(&format!("Search {} {name} {}", peer.text(), request.offset_id));
             let held = self.messages.get(&peer.text());
             let mut messages: Vec<tl::enums::Message> = ids.iter().filter_map(|id| held.and_then(|held| held.get(id)).cloned()).collect();
+            if matches!(request.filter, tl::enums::MessagesFilter::InputMessagesFilterEmpty) {
+                self.log(&format!("SearchText {} {} topic={:?}", peer.text(), request.q, request.top_msg_id));
+                let query = request.q.to_lowercase();
+                let held = self.messages.get(&key(peer, request.top_msg_id));
+                messages = held.into_iter().flat_map(|held| held.values()).filter(|message| match message {
+                    tl::enums::Message::Message(message) => message.message.to_lowercase().contains(&query),
+                    _ => false,
+                }).cloned().collect();
+                messages.sort_by_key(|message| std::cmp::Reverse(match message {
+                    tl::enums::Message::Message(message) => message.id,
+                    _ => 0,
+                }));
+                messages.truncate(request.limit.max(0) as usize);
+            }
             if name == "links" {
                 let mut linked = message(peer, 17, ODALYS, T0 - 30, "Route map");
                 linked.entities = Some(vec![tl::types::MessageEntityTextUrl { offset: 0, length: 5, url: "https://example.org/route".to_owned() }.into()]);
