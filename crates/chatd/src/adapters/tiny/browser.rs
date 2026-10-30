@@ -74,15 +74,26 @@ fn system_open(url: &str) -> Result<(), String> {
 
 #[cfg(unix)]
 fn run_opener(program: &str, url: &str) -> Result<(), String> {
-    match std::process::Command::new(program)
+    let mut child = std::process::Command::new(program)
         .arg(url)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status()
-    {
-        Ok(status) if status.success() => Ok(()),
-        _ => Err(NOT_OPENED.to_owned()),
+        .spawn()
+        .map_err(|_| NOT_OPENED.to_owned())?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return if status.success() { Ok(()) } else { Err(NOT_OPENED.to_owned()) },
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(TICK),
+            result => {
+                let failed = result.is_err();
+                // Some handlers remain alive for the browser's entire lifetime.
+                // Reap them in the background and keep listening for the callback.
+                std::thread::spawn(move || { let _ = child.wait(); });
+                return if failed { Err(NOT_OPENED.to_owned()) } else { Ok(()) };
+            }
+        }
     }
 }
 
