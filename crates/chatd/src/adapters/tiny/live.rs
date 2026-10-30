@@ -107,6 +107,8 @@ pub enum Ask {
     Hangup { room_id: String },
     /// Our mute and deafen changed in a call with audio.
     State { muted: bool, deafened: bool },
+    /// The draft in this conversation is changing. The shell already paces it.
+    Type { conversation_id: String },
     /// Server-mute or server-deafen someone in a room's call, or undo it. `None` leaves it.
     Moderate { room_id: String, user_id: String, server_muted: Option<bool>, server_deafened: Option<bool>, reply: Reply<()> },
     /// Move someone in a call to another room.
@@ -121,7 +123,7 @@ impl Ask {
     fn into_reply(self) -> Option<Reply<()>> {
         match self {
             Ask::Join { reply, .. } | Ask::Leave { reply } | Ask::Kick { reply, .. } | Ask::Moderate { reply, .. } | Ask::Move { reply, .. } => Some(reply),
-            Ask::Look | Ask::Hangup { .. } | Ask::State { .. } | Ask::Priority { .. } | Ask::E2ee { .. } => None,
+            Ask::Look | Ask::Hangup { .. } | Ask::State { .. } | Ask::Type { .. } | Ask::Priority { .. } | Ask::E2ee { .. } => None,
         }
     }
 
@@ -699,6 +701,7 @@ fn serve(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, timing: &Ti
                         wire.send(json!({"type": "call.kick", "ref": reference, "room_id": room_id, "user_id": user_id}).to_string())
                     }
                     Ask::Look => Ok(()),
+                    Ask::Type { conversation_id } => wire.send(json!({"type": "typing", "conversation_id": conversation_id}).to_string()),
                 };
                 if let Err(err) = sent {
                     return End::Dropped(err.to_string());
@@ -978,7 +981,13 @@ fn heard_frame(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, pendi
             }
         }
         "ok" | "error" => answered(ctx, seat, pending, frame, kind == "ok"),
-        _ if frame.get("seq").is_some() => durable(ctx, seat, kind, frame),
+        "typing" => {
+            let user = text(frame, "user_id").unwrap_or("");
+            let named = text(frame, "display_name").or_else(|| seat.names.get(user).map(String::as_str));
+            super::messages::heard_typing(ctx, named, frame);
+        }
+        _ if frame.get("seq").is_some() => durable(ctx, saved, seat, kind, frame),
+        _ if super::messages::live_kind(kind) => super::messages::on_live(ctx, saved, &seat.names, kind, frame),
         // A type this client does not know yet, from a newer server.
         _ => {}
     }
@@ -1043,6 +1052,11 @@ fn ready_heard(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, heard
     }
     // Who went offline while the socket was down is never told; the page reads it all again.
     ctx.community_changed();
+    // A fresh ready has the member names already. Channels and directs are published from those,
+    // without another members read: a resume is not fresh and reads nothing here.
+    if fresh {
+        super::messages::publish(ctx, saved, &seat.names);
+    }
 }
 
 /// Who is in one room's call, with their names, as a voice channel's occupants. A call chatd
@@ -1285,7 +1299,7 @@ fn answered(ctx: &Context, seat: &mut Seat, pending: &mut Vec<Pending>, frame: &
 
 /// Room, member and invite events, in order. One already heard (a replay overlapping what
 /// arrived before the drop) is skipped.
-fn durable(ctx: &Context, seat: &mut Seat, kind: &str, frame: &Value) {
+fn durable(ctx: &Context, saved: &super::Saved, seat: &mut Seat, kind: &str, frame: &Value) {
     let seq = frame.get("seq").and_then(Value::as_i64);
     if let (Some(seq), Some(since)) = (seq, seat.since) {
         if seq <= since {
@@ -1333,7 +1347,7 @@ fn durable(ctx: &Context, seat: &mut Seat, kind: &str, frame: &Value) {
                 }
             }
         }
-        _ => {}
+        _ => super::messages::on_live(ctx, saved, &seat.names, kind, frame),
     }
     // Anything the page shows: the server, its roles, categories and order, rooms, members
     // and invites. `role.*` and `member.roles` can also change what this account may do; the

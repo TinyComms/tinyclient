@@ -1499,8 +1499,8 @@ pub enum Request {
     // (`TinyCommunity::capabilities`); an older server answers that it can't. Each answers `Ok`
     // unless it says otherwise; the server then tells every page over its live socket, which is
     // a `Change::Tiny`.
-    /// Changes the server's name, description, welcome text, default room, or AFK room and
-    /// timeout (`server`, manage_server).
+    /// Changes the server's name, description, welcome text, default room, AFK room and
+    /// timeout, or upload caps (`server`, manage_server; `upload_limits` for the caps).
     TinyServerUpdate {
         account: AccountKey,
         edit: TinyServerEdit,

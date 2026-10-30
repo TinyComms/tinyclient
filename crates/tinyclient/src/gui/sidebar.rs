@@ -342,8 +342,8 @@ impl Shell {
 
     /// Goes to a mode, remembering where the user was.
     pub(super) fn go(&mut self, mode: Mode, cx: &mut Context<Self>) {
-        // Tiny has no chats. A conversation left open from another network keeps the
-        // server page from drawing, so invite and member controls never appear.
+        // Text channels and direct messages open in the conversation pane. A chat left open
+        // from another network would hide the server page, so it is closed on the way in.
         if matches!(mode, Mode::Network(Network::Tiny)) {
             self.open = None;
             if let Some(snapshot) = &mut self.snapshot {
@@ -472,6 +472,7 @@ impl Shell {
                 .filter(|s| s.attention > 0 || s.unread || self.sidebar_state.home.opened.contains(&s.key.id) || self.open.as_ref().is_some_and(|open| open.account() == s.key.account() && self.trees.get(&s.key).is_some_and(|t| t.conversations.iter().any(|c| &c.key == open))))
                 .map(|s| s.key.clone())
                 .collect(),
+            Mode::Network(Network::Tiny) => self.spaces.iter().filter(|space| space.key.network == Network::Tiny).map(|space| space.key.clone()).collect(),
             Mode::Network(_) | Mode::Inbox | Mode::People => Vec::new(),
         };
         // One Space's live subscription at a time: the one on show.
@@ -1477,7 +1478,7 @@ impl Shell {
         match &state.mode {
             Mode::People => div().into_any_element(),
             Mode::Inbox => self.inbox_list(window, cx),
-            // No rooms. The people are this list. The pane is the invite or the person you pick.
+            // Channels, direct messages, rooms, and people. The pane is the invite, a person, or a room.
             Mode::Network(Network::Tiny) => match snapshot.link(Network::Tiny) {
                 Link::Connected => self.tiny_directory(cx),
                 Link::Offline => empty("icons/wifi-off.svg", "Tiny server is offline", "It shows up here once it connects."),

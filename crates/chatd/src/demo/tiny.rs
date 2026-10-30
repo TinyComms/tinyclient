@@ -529,7 +529,7 @@ pub fn seed(s: &mut Seeder) -> Fallible<Who> {
         media: "up".to_owned(),
         capabilities: TinyCapabilities {
             version: "0.4.0".to_owned(),
-            features: ["server", "roles", "categories", "bans", "timeouts", "invite_options", "audit_query", "voice_moderation"]
+            features: ["server", "roles", "categories", "bans", "timeouts", "invite_options", "audit_query", "voice_moderation", "upload_limits"]
                 .into_iter()
                 .map(str::to_owned)
                 .collect(),
@@ -544,6 +544,8 @@ pub fn seed(s: &mut Seeder) -> Fallible<Who> {
             default_room_id: Some("room-lounge".to_owned()),
             afk_room_id: Some("room-afk".to_owned()),
             afk_timeout_secs: 900,
+            image_max_bytes: protocol::TINY_IMAGE_MAX_DEFAULT,
+            file_max_bytes: protocol::TINY_FILE_MAX_DEFAULT,
             created_at: "2025-11-02T18:00:00Z".to_owned(),
             icon_path,
         }),
@@ -1010,6 +1012,12 @@ pub fn answer(hub: &Hub, request: &Request) -> Option<Response> {
                 }
                 if let Some(secs) = edit.afk_timeout_secs {
                     server.afk_timeout_secs = secs;
+                }
+                if let Some(bytes) = edit.image_max_bytes {
+                    server.image_max_bytes = bytes;
+                }
+                if let Some(bytes) = edit.file_max_bytes {
+                    server.file_max_bytes = bytes;
                 }
             }
             changed(community)

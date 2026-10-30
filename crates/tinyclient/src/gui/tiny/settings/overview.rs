@@ -1,6 +1,6 @@
 //! Overview: the server's name, icon, description and welcome, the channel new members land in,
-//! and the AFK channel with how long until someone idle is moved there. Read-only to whoever
-//! may not change the server (and on a server too old to have these, it says so).
+//! the AFK channel with how long until someone idle is moved there, and how large an upload may
+//! be. Read-only to whoever may not change the server (and on a server too old to have these, it says so).
 //!
 //! The icon is sent the moment a picture is chosen (or removed), as Discord does; the rest waits
 //! for Save.
@@ -41,8 +41,15 @@ fn server_of(facts: &Facts) -> TinyServerInfo {
 }
 
 /// The edit Save sends: only what differs from the server.
-pub(in crate::gui) fn edit(server: &TinyServerInfo, draft: &Draft, name: &str, description: &str, welcome: &str) -> TinyServerEdit {
+pub(in crate::gui) fn edit(server: &TinyServerInfo, draft: &Draft, name: &str, description: &str, welcome: &str, limits: bool, image: &str, file: &str) -> TinyServerEdit {
     let changed = |now: &str, typed: &str| (now != typed).then(|| typed.to_owned());
+    let cap = |now: i64, typed: &str| {
+        if !limits {
+            return None;
+        }
+        let bytes = limit_bytes(typed, now).ok()?;
+        (bytes != now).then_some(bytes)
+    };
     TinyServerEdit {
         name: changed(&server.name, name.trim()),
         description: changed(&server.description, description.trim()),
@@ -51,11 +58,49 @@ pub(in crate::gui) fn edit(server: &TinyServerInfo, draft: &Draft, name: &str, d
         default_room_id: draft.default_room.clone().filter(|room| *room != server.default_room_id).map(Option::unwrap_or_default),
         afk_room_id: draft.afk_room.clone().filter(|room| *room != server.afk_room_id).map(Option::unwrap_or_default),
         afk_timeout_secs: draft.afk_timeout.filter(|secs| *secs != server.afk_timeout_secs),
+        image_max_bytes: cap(server.image_max_bytes, image),
+        file_max_bytes: cap(server.file_max_bytes, file),
     }
+}
+
+/// What the upload field shows. A whole number of mebibytes when that is exact, otherwise the bytes.
+fn limit_text(bytes: i64) -> String {
+    let unit = 1024 * 1024;
+    if bytes > 0 && bytes % unit == 0 && (1..=100).contains(&(bytes / unit)) { (bytes / unit).to_string() } else { bytes.to_string() }
+}
+
+/// `1` to `100` are mebibytes. The current byte count, when it is not a whole mebibyte, is left as it is.
+fn limit_bytes(text: &str, now: i64) -> Result<i64, ()> {
+    let n: i64 = text.trim().parse().map_err(|_| ())?;
+    let unit = 1024 * 1024;
+    if (1..=100).contains(&n) {
+        return Ok(n * unit);
+    }
+    if n == now && (1..=protocol::TINY_UPLOAD_MAX).contains(&n) {
+        return Ok(n);
+    }
+    Err(())
+}
+
+fn size_words(bytes: i64) -> String {
+    let unit = 1024 * 1024;
+    if bytes > 0 && bytes % unit == 0 { format!("{} MiB", bytes / unit) } else { format!("{bytes} bytes") }
 }
 
 fn empty(edit: &TinyServerEdit) -> bool {
     *edit == TinyServerEdit::default()
+}
+
+fn facts_limits_invalid(shell: &Shell, cx: &App) -> bool {
+    let Some(facts) = shell.tiny_page_facts() else {
+        return false;
+    };
+    if !facts.community.has(protocol::TINY_FEATURE_UPLOAD_LIMITS) {
+        return false;
+    }
+    let server = server_of(&facts);
+    let fields = &shell.tiny_state.settings_fields;
+    limit_bytes(&fields.image_max.read(cx).text(), server.image_max_bytes).is_err() || limit_bytes(&fields.file_max.read(cx).text(), server.file_max_bytes).is_err()
 }
 
 impl Shell {
@@ -64,17 +109,44 @@ impl Shell {
         let overlay = self.tiny_state.settings.as_ref()?;
         let fields = &self.tiny_state.settings_fields;
         let text = |input: &Entity<TextInput>| input.read(cx).text().to_owned();
-        Some(edit(&server_of(&facts), &overlay.overview, &text(&fields.name), &text(&fields.description), &text(&fields.welcome)))
+        let limits = facts.community.has(protocol::TINY_FEATURE_UPLOAD_LIMITS);
+        Some(edit(&server_of(&facts), &overlay.overview, &text(&fields.name), &text(&fields.description), &text(&fields.welcome), limits, &text(&fields.image_max), &text(&fields.file_max)))
     }
 
     pub(in crate::gui) fn tiny_overview_dirty(&self, cx: &App) -> bool {
-        self.tiny_page_facts().is_some_and(|facts| facts.may.edit_server) && self.tiny_overview_edit(cx).is_some_and(|edit| !empty(&edit))
+        let Some(facts) = self.tiny_page_facts() else {
+            return false;
+        };
+        if !facts.may.edit_server {
+            return false;
+        }
+        self.tiny_overview_edit(cx).is_some_and(|edit| !empty(&edit)) || self.tiny_limits_dirty(&facts, cx)
+    }
+
+    fn tiny_limits_dirty(&self, facts: &Facts, cx: &App) -> bool {
+        if !facts.community.has(protocol::TINY_FEATURE_UPLOAD_LIMITS) {
+            return false;
+        }
+        let server = server_of(facts);
+        let fields = &self.tiny_state.settings_fields;
+        let off = |text: &str, now: i64| match limit_bytes(text, now) {
+            Ok(bytes) => bytes != now,
+            Err(()) => true,
+        };
+        off(&fields.image_max.read(cx).text(), server.image_max_bytes) || off(&fields.file_max.read(cx).text(), server.file_max_bytes)
     }
 
     pub(in crate::gui) fn tiny_overview_save(&mut self, cx: &mut Context<Self>) {
         let (Some(edit), Some(account)) = (self.tiny_overview_edit(cx), self.tiny_state.account.clone()) else {
             return;
         };
+        if facts_limits_invalid(self, cx) {
+            if let Some(overlay) = self.tiny_state.settings.as_mut() {
+                overlay.error = Some("An upload limit is 1 to 100 MiB.".to_owned());
+            }
+            cx.notify();
+            return;
+        }
         if edit.name.as_deref().is_some_and(|name| name.is_empty() || name.chars().count() > protocol::TINY_SERVER_NAME_MAX) {
             if let Some(overlay) = self.tiny_state.settings.as_mut() {
                 overlay.error = Some("A server name is 1 to 80 characters.".to_owned());
@@ -96,6 +168,10 @@ impl Shell {
         name.update(cx, |input, cx| input.set_text(&server.name, cx));
         description.update(cx, |input, cx| input.set_text(&server.description, cx));
         welcome.update(cx, |input, cx| input.set_text(&server.welcome, cx));
+        let image = limit_text(server.image_max_bytes);
+        let file = limit_text(server.file_max_bytes);
+        fields.image_max.update(cx, |input, cx| input.set_text(&image, cx));
+        fields.file_max.update(cx, |input, cx| input.set_text(&file, cx));
         if let Some(overlay) = self.tiny_state.settings.as_mut() {
             overlay.overview = Default::default();
         }
@@ -162,6 +238,10 @@ fn input(input: &Entity<TextInput>, tall: bool, window: &Window, cx: &mut Contex
 fn counter(text: &str, max: usize) -> Div {
     let used = text.chars().count();
     div().type_small().text_color(if used > max { theme::danger() } else { theme::text_faint() }).child(format!("{used} / {max}"))
+}
+
+fn limit_field(label: &'static str, input_entity: &Entity<TextInput>, window: &Window, cx: &mut Context<Shell>) -> Div {
+    div().flex_1().flex().flex_col().gap(px(6.)).child(div().type_small().text_color(theme::text_faint()).child(label)).child(input(input_entity, false, window, cx))
 }
 
 fn read_only(words: &str) -> Div {
@@ -291,6 +371,15 @@ pub(in crate::gui::tiny) fn overview(shell: &Shell, facts: &Facts, window: &mut 
     } else {
         section("Welcome message").child(read_only(&server.welcome))
     });
+    if facts.community.has(protocol::TINY_FEATURE_UPLOAD_LIMITS) {
+        page = page.child(if editable {
+            section("Uploads")
+                .child(div().type_small().text_color(theme::text_soft()).child("Images and GIFs, then video and other files. Each is 1 to 100 MiB."))
+                .child(div().flex().gap(px(16.)).child(limit_field("Images and GIFs", &fields.image_max, window, cx)).child(limit_field("Video and other files", &fields.file_max, window, cx)))
+        } else {
+            section("Uploads").child(read_only(&format!("Images and GIFs up to {}. Video and other files up to {}.", size_words(server.image_max_bytes), size_words(server.file_max_bytes))))
+        });
+    }
 
     let default_room = draft.default_room.clone().unwrap_or(server.default_room_id.clone());
     let afk_room = draft.afk_room.clone().unwrap_or(server.afk_room_id.clone());
@@ -333,14 +422,23 @@ mod tests {
     fn save_sends_only_what_changed() {
         let server = TinyServerInfo { name: "Night Shift".into(), description: "Hi".into(), afk_timeout_secs: 300, default_room_id: Some("a".into()), ..TinyServerInfo::default() };
         let draft = Draft::default();
-        assert!(empty(&edit(&server, &draft, "Night Shift ", "Hi", "")));
+        assert!(empty(&edit(&server, &draft, "Night Shift ", "Hi", "", false, "", "")));
         let draft = Draft { default_room: Some(None), afk_timeout: Some(300), afk_room: Some(Some("b".into())), ..Draft::default() };
-        let sent = edit(&server, &draft, "Day Shift", "Hi", "Welcome");
+        let sent = edit(&server, &draft, "Day Shift", "Hi", "Welcome", false, "", "");
         assert_eq!(sent.name.as_deref(), Some("Day Shift"));
         assert_eq!(sent.description, None);
         assert_eq!(sent.welcome.as_deref(), Some("Welcome"));
         assert_eq!(sent.default_room_id.as_deref(), Some(""), "no default channel is sent as an empty id");
         assert_eq!(sent.afk_room_id.as_deref(), Some("b"));
         assert_eq!(sent.afk_timeout_secs, None, "unchanged");
+        assert_eq!(sent.image_max_bytes, None);
+        assert_eq!(sent.file_max_bytes, None);
+        let raised = edit(&server, &Draft::default(), "Night Shift", "Hi", "", true, "12", "25");
+        assert_eq!(raised.image_max_bytes, Some(12 * 1024 * 1024));
+        assert_eq!(raised.file_max_bytes, None, "25 MiB is already the file cap");
+        let odd = TinyServerInfo { image_max_bytes: 1_500, ..server.clone() };
+        let kept = edit(&odd, &Draft::default(), "Night Shift", "Hi", "", true, "1500", "25");
+        assert_eq!(kept.image_max_bytes, None, "the current byte count is left as it is");
+        assert!(empty(&edit(&server, &Draft::default(), "Night Shift", "Hi", "", true, "0", "101")));
     }
 }

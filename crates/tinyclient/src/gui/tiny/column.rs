@@ -10,7 +10,46 @@ use crate::gui::components::{glyph, list_row, tip, Avatar, Shape as AvatarShape}
 use crate::gui::state::Shell;
 use crate::gui::theme::{self, Type};
 use gpui::{div, prelude::*, px, AnyElement, Context, Div, MouseButton, MouseDownEvent, Render, SharedString, Stateful, Window};
-use protocol::{TinyRoom, TinySeat};
+use protocol::{Conversation, ConversationKind, Key, TinyRoom, TinySeat};
+use std::rc::Rc;
+
+/// Channels, or direct messages, above the voice rooms. The header is omitted when empty.
+fn text_section(mut list: Stateful<Div>, label: &str, chats: &[Rc<Conversation>], kind: ConversationKind, open: Option<&Key>, cx: &mut Context<Shell>) -> Stateful<Div> {
+    let rows: Vec<&Rc<Conversation>> = chats.iter().filter(|chat| chat.kind == kind).collect();
+    if rows.is_empty() {
+        return list;
+    }
+    list = list.child(
+        div()
+            .px(px(theme::INSET + 2.))
+            .pt(px(10.))
+            .pb(px(2.))
+            .text_size(px(11. + theme::text_step() as f32))
+            .line_height(px(14. + theme::text_step() as f32))
+            .font_weight(theme::SEMIBOLD)
+            .text_color(theme::text_faint())
+            .child(label.to_uppercase()),
+    );
+    for chat in rows {
+        list = list.child(text_row(chat, open, cx));
+    }
+    list
+}
+
+/// A text channel or a direct message. Picking it opens the conversation pane.
+fn text_row(chat: &Conversation, open: Option<&Key>, cx: &mut Context<Shell>) -> Stateful<Div> {
+    let selected = open.is_some_and(|open| open == &chat.key);
+    let icon = if chat.kind == ConversationKind::Direct { "icons/user.svg" } else { "icons/hash.svg" };
+    let tone = if selected { theme::text() } else { theme::text_soft() };
+    let content = div()
+        .gap(px(8.))
+        .child(glyph(icon, 16., tone))
+        .child(div().flex_1().min_w_0().truncate().type_ui().text_color(theme::text()).child(chat.title.clone()));
+    let key = chat.key.clone();
+    let title = chat.title.clone();
+    list_row(SharedString::from(format!("tiny-chat-{}", key.id)), theme::row_height(theme::ROW_ONE), selected, false, content)
+        .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| this.select(key.clone(), &title, cx)))
+}
 
 /// What is drawn under the pointer while something is dragged.
 pub(super) struct Ghost(pub(super) SharedString);
@@ -116,7 +155,10 @@ impl Shell {
         };
         let lines = model::lines(page.community, &self.tiny_state.folded, page.mine);
         let mut list = div().id("tiny-channels").size_full().overflow_y_scroll().pt(px(4.)).pb(px(12.)).flex().flex_col();
-        if page.community.rooms.is_empty() {
+        let chats = self.tiny_chats();
+        list = text_section(list, "Text channels", &chats, ConversationKind::Channel, self.open.as_ref(), cx);
+        list = text_section(list, "Direct messages", &chats, ConversationKind::Direct, self.open.as_ref(), cx);
+        if page.community.rooms.is_empty() && chats.is_empty() {
             list = list.child(
                 div()
                     .px(px(theme::PANE_PAD))
@@ -150,6 +192,21 @@ impl Shell {
             list = list.child(row);
         }
         list.into_any_element()
+    }
+
+    /// Text channels and direct messages in this server's space, in the tree's order.
+    fn tiny_chats(&self) -> Vec<Rc<Conversation>> {
+        let Some(account) = self.tiny_state.account.as_ref() else {
+            return Vec::new();
+        };
+        let Some(tree) = self.trees.get(&Key::new(account, "server")) else {
+            return Vec::new();
+        };
+        tree.conversations
+            .iter()
+            .filter(|chat| matches!(chat.kind, ConversationKind::Channel | ConversationKind::Direct))
+            .cloned()
+            .collect()
     }
 
     #[allow(clippy::too_many_arguments)]
