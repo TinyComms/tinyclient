@@ -44,6 +44,7 @@ enum Ask {
     Typing { to: Peer, started: bool },
     Read { read: Vec<(String, u64)>, receipts: bool, answer: Sender<Result<(), Fault>> },
     Unlink { answer: Sender<Result<(), Fault>> },
+    Picture { of: Peer, answer: Sender<Result<Option<Vec<u8>>, Fault>> },
 }
 
 pub struct Real {
@@ -213,6 +214,10 @@ impl Wire for Real {
 
     fn unlink(&self) -> Result<(), Fault> {
         self.ask(|answer| Ask::Unlink { answer })
+    }
+
+    fn picture(&self, of: &Peer) -> Result<Option<Vec<u8>>, Fault> {
+        self.ask(|answer| Ask::Picture { of: of.clone(), answer })
     }
 
     fn close(&self) {
@@ -453,8 +458,10 @@ impl Session {
             }
             ContentBody::SynchronizeMessage(sync) => self.sync(sync).await,
             ContentBody::ReceiptMessage(ReceiptMessage { r#type, timestamp }) => {
-                if r#type == Some(receipt_message::Type::Read.into()) {
-                    self.tell(Event::Seen { by: sender, sent: timestamp });
+                // A viewed receipt (a voice message or a video played) is read and more.
+                let read = [receipt_message::Type::Read, receipt_message::Type::Viewed].map(|kind| Some(kind.into())).contains(&r#type);
+                if read || r#type == Some(receipt_message::Type::Delivery.into()) {
+                    self.tell(Event::Receipt { by: sender, sent: timestamp, read });
                 }
             }
             ContentBody::TypingMessage(TypingMessage { action, group_id, .. }) => {
@@ -518,6 +525,30 @@ impl Session {
             Ask::Unlink { answer } => {
                 let _ = answer.send(self.unlink().await);
             }
+            Ask::Picture { of, answer } => {
+                let _ = answer.send(self.picture(&of).await);
+            }
+        }
+    }
+
+    /// A person's profile picture, fetched from Signal's CDN and opened with their profile key
+    /// (which their messages or the phone's contact sync gave us), or a group's, opened with
+    /// its master key.
+    async fn picture(&mut self, of: &Peer) -> Result<Option<Vec<u8>>, Fault> {
+        match of {
+            Peer::Direct(aci) => {
+                let Ok(uuid) = Uuid::parse_str(aci) else {
+                    return Ok(None);
+                };
+                let Ok(Some(key)) = self.manager.store().profile_key(&ServiceId::Aci(Aci::from(uuid))).await else {
+                    return Ok(None);
+                };
+                self.manager.retrieve_profile_avatar_by_uuid(uuid, key).await.map_err(fault)
+            }
+            Peer::Group(_) => match self.group_context(of) {
+                Ok(Some(context)) => self.manager.retrieve_group_avatar(context).await.map_err(fault),
+                Ok(None) | Err(_) => Ok(None),
+            },
         }
     }
 

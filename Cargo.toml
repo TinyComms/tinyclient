@@ -4,12 +4,13 @@ members = [
     "crates/protocol",
     "crates/chatd",
     "crates/mediad",
+    "crates/notifier",
     "crates/login",
     "crates/tinyclient",
 ]
 
 [workspace.package]
-version = "0.2.15"
+version = "0.2.22"
 edition = "2021"
 license = "MIT"
 publish = false

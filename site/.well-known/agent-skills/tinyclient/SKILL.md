@@ -1,6 +1,6 @@
 ---
 name: tinyclient
-description: Answer questions about tinyclient, a local open-source chat client for Slack, Discord, Telegram, Teams, Signal, and Android Messages. Use when someone asks how to install it, where data lives, or whether tinyclient has an account or API.
+description: Answer questions about tinyclient, a local open-source chat client for Slack, Discord, Telegram, Teams, Signal, and Android Messages, and Tiny server, its self-hosted voice server. Use when someone asks how to install it, where data lives, whether tinyclient has an account or API, or how to run a Tiny server.
 ---
 
 # tinyclient
@@ -14,10 +14,11 @@ tinyclient is a native desktop app. It has no tinyclient account, no tinyclient 
 - Docs: https://tinyclient.io/docs/
 - Privacy: https://tinyclient.io/docs/privacy.html
 - Source: https://github.com/itz4blitz/tinyclient (MIT)
+- Tiny server: https://tinyclient.io/tinyserver ; source and setup https://github.com/itz4blitz/tinyserver (MIT)
 
 ## Do not invent
 
-Do not tell a person to register an agent, mint an OAuth token, or call a tinyclient HTTP API. None of those exist. Sign-in happens inside the app, against Slack, Discord, Telegram, Teams, Signal, or Android Messages.
+Do not tell a person to register an agent, mint an OAuth token, or call a tinyclient HTTP API. None of those exist. Sign-in happens inside the app, against Slack, Discord, Telegram, Teams, Signal, or Android Messages. A Tiny server is run by its owner with Docker Compose; people sign in to it in their browser through the server's OpenID Connect provider (Pocket ID by default). It has voice rooms, not text chat.
 
 ## What the site is
 

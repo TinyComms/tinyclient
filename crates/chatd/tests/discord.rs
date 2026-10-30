@@ -371,6 +371,25 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
             shared.push("MESSAGE_CREATE", message.clone());
             (200, message)
         }
+        ("POST", ["channels", channel, "messages", _message, "threads"]) => {
+            let id = shared.snowflake();
+            let name = seen.body["name"].as_str().unwrap_or("Thread");
+            (
+                200,
+                json!({
+                    "id": id,
+                    "type": 11,
+                    "name": name,
+                    "parent_id": channel,
+                    "guild_id": "4000",
+                    "owner_id": "1000",
+                    "message_count": 0,
+                    "member_count": 1,
+                    "thread_metadata": {"archived": false, "locked": false},
+                    "newly_created": true,
+                }),
+            )
+        }
         ("POST", ["channels", _, "messages", _, "ack"]) => (200, json!({"token": null})),
         ("POST", ["channels", _, "typing"]) => (204, Value::Null),
         ("POST", ["channels", _, "call", "stop-ringing"]) => (204, Value::Null),
@@ -926,6 +945,8 @@ fn ready_fills_spaces_trees_people_and_unread_state() {
     assert_eq!(row("4500").group.as_deref(), Some("4100"), "a thread sits under its channel");
     assert_eq!(row("4201").group.as_deref(), Some("4200"));
     assert_eq!(row("4201").call, CallSupport::Native);
+    assert_eq!(row("4201").limit, 12, "the Lounge's user limit");
+    assert_eq!(row("4101").limit, 0, "a channel without a limit has none");
     // #staff is denied to everyone and allowed to a role we lack; #mods-only to one we hold.
     assert!(!ids(&rows).contains(&"4103") && !ids(&rows).contains(&"4301"));
     let state = |id: &str| (row(id).unread, row(id).mentions, row(id).muted);
@@ -1173,6 +1194,52 @@ fn messages_map_to_the_one_model_and_follow_live_events() {
     let kept = world.messages("4102");
     assert_eq!(kept.iter().map(|message| message.id.as_str()).collect::<Vec<_>>(), [id.as_str()]);
     assert!(kept[0].mentions_me);
+}
+
+#[test]
+fn a_channel_message_can_start_a_thread_and_a_direct_message_cannot() {
+    let world = World::start();
+    let general = wait("the channel's history", || Some(world.messages("4101")).filter(|messages| messages.len() == 3));
+    let starter = "1300000000000000094";
+    assert!(general.iter().any(|message| message.id == starter && message.thread.is_none()));
+
+    // One that already has a thread answers with it and does not create another.
+    let existing = "1300000000000000100";
+    let opened = world.ask(Request::StartThread { conversation: world.key("4101"), message: existing.to_owned() });
+    let Response::Conversation { conversation } = opened else { panic!("{opened:?}") };
+    assert_eq!(conversation.key.id, "4500");
+    assert!(world.discord.requests_to("POST", "/channels/4101/messages/1300000000000000100/threads").is_empty());
+
+    let started = world.ask(Request::StartThread { conversation: world.key("4101"), message: starter.to_owned() });
+    let Response::Conversation { conversation } = started else { panic!("{started:?}") };
+    assert_eq!(conversation.kind, ConversationKind::Thread);
+    assert_eq!((conversation.parent.as_deref(), conversation.root.as_deref()), (Some("4101"), Some(starter)));
+    let posts = world.discord.requests_to("POST", &format!("/channels/4101/messages/{starter}/threads"));
+    assert_eq!(posts.len(), 1);
+    let name = posts[0].body["name"].as_str().unwrap_or("");
+    assert!(!name.is_empty() && name.chars().count() <= 100, "{name}");
+    let hung = world.messages("4101").into_iter().find(|message| message.id == starter).unwrap();
+    assert_eq!(hung.thread.as_ref().map(|thread| thread.id.as_str()), Some(conversation.key.id.as_str()));
+
+    // The same click again is the thread that now exists, not a second channel.
+    let again = world.ask(Request::StartThread { conversation: world.key("4101"), message: starter.to_owned() });
+    let Response::Conversation { conversation: again } = again else { panic!("{again:?}") };
+    assert_eq!(again.key.id, conversation.key.id);
+    assert_eq!(world.discord.requests_to("POST", &format!("/channels/4101/messages/{starter}/threads")).len(), 1);
+
+    let system = world.ask(Request::StartThread {
+        conversation: world.key("4101"),
+        message: "1300000000000000095".to_owned(),
+    });
+    assert!(matches!(system, Response::Error { code: ErrorCode::Refused, .. }), "{system:?}");
+
+    wait("the direct conversation", || Some(world.messages("3001")).filter(|messages| !messages.is_empty()));
+    let direct = world.ask(Request::StartThread {
+        conversation: world.key("3001"),
+        message: "1300000010000000010".to_owned(),
+    });
+    assert!(matches!(direct, Response::Error { code: ErrorCode::Refused, .. }), "{direct:?}");
+    assert!(world.discord.requests_to("POST", "/channels/3001/messages/").iter().all(|seen| !seen.path.contains("/threads")));
 }
 
 #[test]
@@ -1811,6 +1878,33 @@ fn calls_ring_in_and_voice_channels_are_joined_on_the_gateway() {
     assert_eq!(left["d"]["guild_id"], "4000");
 }
 
+#[test]
+fn a_voice_channel_lists_its_people_friends_first_then_by_name() {
+    let world = World::start();
+    let in_voice = || match world.ask(Request::InVoice { network: Some(Network::Discord) }) {
+        Response::Conversations { conversations, .. } => conversations,
+        other => panic!("{other:?}"),
+    };
+    // Dev (a friend) sits in Lounge from the connect's voice states, so the friend rule tells
+    // the channel wherever it is.
+    let told = wait("the friend's channel", || {
+        in_voice().into_iter().find(|row| row.key.id == "4201").and_then(|row| row.occupants).filter(|inside| inside.total == 1 && inside.people[0].person.id == "2002")
+    });
+    assert_eq!((told.people[0].person.id.as_str(), told.people[0].name.as_str(), told.people[0].muted), ("2002", "Dev Patel", true));
+
+    // A stranger joins whose name sorts before the friend's: name order alone would list her
+    // first, friends first keeps Dev at the top.
+    let stranger = json!({"guild_id": "4000", "channel_id": "4201", "user_id": "2099", "session_id": "voice-ann",
+                          "self_mute": false, "self_deaf": false, "mute": false, "deaf": false,
+                          "member": {"user": {"id": "2099", "username": "ann", "global_name": "Ann Earlier"}, "roles": []}});
+    world.discord.push("VOICE_STATE_UPDATE", stranger);
+    let both = wait("the stranger", || {
+        in_voice().into_iter().find(|row| row.key.id == "4201").and_then(|row| row.occupants).filter(|inside| inside.total == 2)
+    });
+    let order: Vec<(&str, &str)> = both.people.iter().map(|who| (who.person.id.as_str(), who.name.as_str())).collect();
+    assert_eq!(order, [("2002", "Dev Patel"), ("2099", "Ann Earlier")], "friends first, then by name");
+}
+
 /// Waits until everything pushed so far has been handled: a marker message sent after it is
 /// stored only once the events before it were.
 fn settled(world: &World) {
@@ -2337,6 +2431,7 @@ fn who_may_see_a_channel_follows_roles_membership_and_categories_live() {
     world.discord.push("GUILD_MEMBER_UPDATE", member(json!(["4010", "4011"])));
     wait("the core team's channel", || has("4103").then_some(()));
     assert!(has("4104") && has("4500"), "{:?}", rows());
+    assert_eq!(world.conversation("4201").limit, 12, "the limit survives the tree being worked out again");
     assert_eq!(world.conversation("4101").mentions, 1, "unread state survives the tree being worked out again");
     // We lose the mod role: its channel goes.
     world.discord.push("GUILD_MEMBER_UPDATE", member(json!(["4011"])));
@@ -2357,6 +2452,12 @@ fn who_may_see_a_channel_follows_roles_membership_and_categories_live() {
     world.discord.push("CHANNEL_UPDATE", general);
     wait("the channel to be read only", || world.conversation("4101").read_only.then_some(()));
     assert_eq!(world.conversation("4101").topic, "Anything goes. Be kind.");
+
+    // A voice channel's limit changed in Discord follows; none reads 0.
+    let mut lounge = channel("4201");
+    lounge["user_limit"] = json!(0);
+    world.discord.push("CHANNEL_UPDATE", lounge);
+    wait("the limit to lift", || (world.conversation("4201").limit == 0).then_some(()));
 
     // A category renamed is renamed at once.
     let mut text = channel("4100");

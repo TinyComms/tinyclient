@@ -11,7 +11,7 @@ use crate::gui::theme::{self, Type};
 use crate::gui::time;
 use crate::view::now;
 use gpui::{div, prelude::*, px, Context, Div, MouseButton, Rgba, SharedString, Stateful};
-use protocol::{Badge, Conversation, ConversationKind, Key, Mark, Network, Special};
+use protocol::{Badge, Conversation, ConversationKind, Key, Mark, Network, Receipt, Special};
 use std::rc::Rc;
 
 /// How a list draws its two-line rows.
@@ -23,8 +23,6 @@ pub struct Look {
     pub context: bool,
     /// The time column is drawn at rest (Discord's DM list shows it only on hover).
     pub time: bool,
-    /// The network's read ticks on my last message (Telegram, Teams).
-    pub ticks: bool,
     /// A DM's line two says what the person is doing before what they said (Discord).
     pub status: bool,
 }
@@ -88,6 +86,18 @@ pub fn sender(c: &Conversation) -> Option<String> {
     let group = !matches!(c.kind, ConversationKind::Direct) && !matches!(c.kind, ConversationKind::Announcement);
     let from = c.preview_from.split_whitespace().next().unwrap_or_default();
     (group && !from.is_empty()).then(|| from.to_owned())
+}
+
+/// The tick that leads line two when my message is the newest (`polish/03-telegram-teams.md`):
+/// a clock while it goes, one check once sent, two once delivered, two brighter once read. A
+/// network that tells neither (Discord, Slack) stays at one check.
+pub fn tick(receipt: Receipt) -> (&'static str, f32, Rgba) {
+    match receipt {
+        Receipt::Sending => ("icons/clock.svg", 12., theme::text_faint()),
+        Receipt::Sent => ("icons/check.svg", 14., theme::text_faint()),
+        Receipt::Delivered => ("icons/check-check.svg", 14., theme::text_faint()),
+        Receipt::Read => ("icons/check-check.svg", 14., theme::text_soft()),
+    }
 }
 
 /// The tag after a name: a bot or app, a guest, another organization, a warning.
@@ -217,7 +227,7 @@ impl Shell {
                     Avatar::new(&space.key, &space.name, size).shape(Shape::Place).image_at(icon).build()
                 }
                 None if c.key.network == Network::Telegram => Avatar::new(&c.key, &c.title, size).shape(Shape::Place).build(),
-                None => Avatar::channel(super::kind_glyph(kind, c.private), size).build(),
+                None => Avatar::channel(super::kind_glyph(kind, c.private, c.call), size).build(),
             },
             _ => Avatar::new(&c.key, &c.title, size).shape(Shape::Place).image_at(picture).build(),
         }
@@ -256,8 +266,10 @@ impl Shell {
         }
         let names = self.my_names(c);
         let preview = names.iter().map(|me| strip_me(&c.preview, me)).find(|stripped| stripped.len() != c.preview.len()).unwrap_or(&c.preview);
-        let ticks = (look.ticks && c.preview_mine && matches!(c.kind, ConversationKind::Direct | ConversationKind::Group) && c.special == Special::None)
-            .then(|| if c.seen { glyph("icons/check-check.svg", 14., quiet(theme::text_soft())) } else { glyph("icons/check.svg", 14., quiet(theme::text_faint())) });
+        let ticks = c.receipt().filter(|_| matches!(c.kind, ConversationKind::Direct | ConversationKind::Group) && c.special == Special::None).map(|receipt| {
+            let (icon, size, color) = tick(receipt);
+            glyph(icon, size, quiet(color))
+        });
         let who = sender(c).map(|name| div().flex_none().child(format!("{name}:")));
         let attached = attachment_glyph(preview).map(|icon| glyph(icon, 12., quiet(theme::text_faint())));
         line.text_color(color)
@@ -426,6 +438,21 @@ mod tests {
         assert_eq!(attachment_glyph("Photo"), Some("icons/image.svg"));
         assert_eq!(attachment_glyph("Voice message"), Some("icons/mic.svg"));
         assert_eq!(attachment_glyph("Photos of the trail"), None);
+    }
+
+    #[test]
+    fn my_newest_message_leads_with_its_tick_on_every_network() {
+        let mut c = crate::gui::sidebar::tests::row("d", ConversationKind::Direct);
+        assert_eq!(c.receipt(), None);
+        c.preview_mine = true;
+        // Discord and Slack tell no more than sent: one check.
+        assert_eq!(tick(c.receipt().unwrap()).0, "icons/check.svg");
+        c.delivered = true;
+        assert!(tick(c.receipt().unwrap()) == ("icons/check-check.svg", 14., theme::text_faint()));
+        c.seen = true;
+        assert!(tick(c.receipt().unwrap()) == ("icons/check-check.svg", 14., theme::text_soft()));
+        c.sending = true;
+        assert_eq!(tick(c.receipt().unwrap()).0, "icons/clock.svg");
     }
 
     #[test]

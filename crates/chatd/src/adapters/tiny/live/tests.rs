@@ -217,7 +217,11 @@ fn rest(mut stream: TcpStream, seen: &Sender<Seen>, media: &str) {
     let (status, body) = if line.starts_with("GET /v1/members ") {
         ("200 OK", members())
     } else if line.starts_with("GET /health ") {
+        // `e2ee` is a server whose audio is up and that encrypts calls end to end.
+        let media = if media == "e2ee" { "up" } else { media };
         ("200 OK", format!(r#"{{"ok":true,"database":"ok","media":"{media}"}}"#))
+    } else if line.starts_with("GET /v1/capabilities ") && media == "e2ee" {
+        ("200 OK", r#"{"version":"0.4.0","features":["server","roles","e2ee_calls"]}"#.to_owned())
     } else if line.starts_with("GET /v1/me ") {
         ("200 OK", format!(r#"{{"user_id":"{ME}","email":"ada@example.com","display_name":"Ada","role":"owner"}}"#))
     } else {
@@ -723,8 +727,15 @@ fn a_join_with_audio_carries_mediads_offer_out_and_the_answer_back() {
         assert_eq!(leave["type"], "call.leave");
         conn.send(json!({"type": "ok", "ref": leave["ref"]}));
         conn.send(json!({"type": "call.left", "room_id": ROOM, "user_id": ME, "reason": "left"}));
-        // Joined again, and the server loses the audio.
+        // Joined again, and the server loses the audio: a blip, so the call joins again by
+        // itself with a fresh offer, as after a restart. Three times; the fourth is the end.
         answer_join(&mut conn, "c-2");
+        for n in 0..3 {
+            conn.idle(Duration::from_millis(300));
+            conn.send(json!({"type": "call.left", "room_id": ROOM, "user_id": ME, "reason": "media_lost"}));
+            let again = answer_join(&mut conn, &format!("c-again-{n}"));
+            assert!(again["sdp"].is_string(), "a fresh offer: {again}");
+        }
         conn.idle(Duration::from_millis(300));
         conn.send(json!({"type": "call.left", "room_id": ROOM, "user_id": ME, "reason": "media_lost"}));
         // chatd hangs up after a failure; we are out of the room already, so nothing is sent.
@@ -758,6 +769,17 @@ fn a_join_with_audio_carries_mediads_offer_out_and_the_answer_back() {
 }
 
 #[test]
+fn a_call_that_keeps_losing_its_media_stops_joining_again() {
+    let start = Instant::now();
+    let mut recovered = Vec::new();
+    for n in 0..3 {
+        assert!(super::recovering(&mut recovered, start + Duration::from_secs(n)), "try {n}");
+    }
+    assert!(!super::recovering(&mut recovered, start + Duration::from_secs(10)), "a fourth within two minutes is given up");
+    assert!(super::recovering(&mut recovered, start + Duration::from_secs(121)), "the first has aged out");
+}
+
+#[test]
 fn a_join_with_audio_the_server_refuses_says_why_and_stops_mediad() {
     with_mediad();
     let fake = fake_with("up", &[], |_, mut conn| {
@@ -776,6 +798,65 @@ fn a_join_with_audio_the_server_refuses_says_why_and_stops_mediad() {
         assert_eq!(running.join_with_audio(ROOM), Err(words.to_owned()));
         until("no call left behind", || running.hub.calls.describe().0.is_none());
     }
+}
+
+/// A TLS `ExternalSender`, as tinyserver sends it in `start`: a P-256 key (not checked until a
+/// proposal is) and a basic credential.
+fn external_sender() -> String {
+    use base64::Engine;
+    let mut sender = vec![0x40, 0x41, 0x04];
+    sender.extend([7u8; 64]);
+    sender.extend([0x00, 0x01, 10]);
+    sender.extend(b"tinyserver");
+    base64::engine::general_purpose::STANDARD.encode(sender)
+}
+
+/// On a server that encrypts calls end to end, the join says so, the server's `call.e2ee`
+/// frames reach mediad in order, what mediad answers reaches the server, and the call says how
+/// it is protected: never end to end before the group has keys, and transport-only, naming who
+/// cannot, when the server turns it off.
+#[test]
+fn an_end_to_end_encrypted_join_carries_mediads_key_package_and_says_how_the_call_is_protected() {
+    with_mediad();
+    let (said, heard) = channel();
+    let fake = fake_with("e2ee", &[], move |_, mut conn| {
+        conn.send(ready(1, &[ME, BEA], json!([{"room_id": ROOM, "participants": [{"user_id": BEA, "e2ee": true}]}])));
+        let join = conn.next(Duration::from_secs(30)).expect("a join");
+        assert_eq!(join["e2ee"], 1, "the join offers end-to-end encryption: {join}");
+        let sdp = join["sdp"].as_str().expect("an offer");
+        conn.send(json!({"type": "call.answer", "ref": join["ref"], "call_id": "c-1", "sdp": answer_for(sdp)}));
+        conn.send(json!({"type": "call.e2ee", "room_id": ROOM, "op": "start", "version": 1, "external_sender": external_sender()}));
+        conn.send(json!({"type": "call.joined", "room_id": ROOM, "user_id": ME, "e2ee": true}));
+        let package = conn.next(Duration::from_secs(10)).expect("mediad's key package");
+        let _ = said.send(package);
+        // Someone without end-to-end encryption joins: the server turns it off for the room.
+        conn.send(json!({"type": "call.joined", "room_id": ROOM, "user_id": "55555555-5555-5555-5555-555555555555", "e2ee": false}));
+        conn.send(json!({"type": "call.e2ee", "room_id": ROOM, "op": "off", "user_ids": ["55555555-5555-5555-5555-555555555555"]}));
+        conn.idle(Duration::from_secs(5));
+    });
+    let running = run(&fake.base, QUICK);
+    // What chatd's server does: mediad's frames for the server go to this account's socket.
+    let socket = running.live.clone();
+    running.hub.calls.on_signal(move |_, frame| socket.ask(Ask::E2ee { frame }));
+    until("connected", || running.link().0 == Link::Connected);
+    until("the health read", || !running.live.seats_only());
+    assert_eq!(running.join_with_audio(ROOM), Ok(()));
+    let package = heard.recv_timeout(Duration::from_secs(15)).expect("the key package reached the server");
+    assert_eq!((package["type"].as_str(), package["op"].as_str()), (Some("call.e2ee"), Some("key_package")), "{package}");
+    assert!(package["data"].as_str().is_some_and(|data| data.len() > 100));
+    let security = || the_call(&running).and_then(|call| call.security);
+    let off = Instant::now() + Duration::from_secs(10);
+    while security().is_none_or(|security| security.mode != protocol::SecurityMode::Transport) {
+        assert!(Instant::now() < off, "the call says it is transport-only: {:?}", security());
+        // Until then it is being set up, and never end to end without a group.
+        assert_ne!(security().map(|security| security.mode), Some(protocol::SecurityMode::EndToEnd));
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let security = security().expect("said");
+    assert_eq!(security.unsupported, ["55555555-5555-5555-5555-555555555555"]);
+    assert!(!security.server_lacks && security.code.is_empty() && security.members.is_empty());
+    assert!(running.hub.calls.end(&running.hub).is_some());
+    running.live.ask(Ask::Hangup { room_id: ROOM.into() });
 }
 
 #[test]
@@ -855,9 +936,125 @@ fn a_seat_lost_with_the_socket_is_taken_again_and_one_left_on_purpose_is_not() {
     assert!(running.hub.occupants(&running.key(ROOM)).is_none());
 }
 
+fn saved_for(base: &str) -> Saved {
+    Saved { base_url: base.to_owned(), token: "t".to_owned(), user_id: ME.to_owned(), email: None, display_name: "Ada".to_owned(), role: "owner".to_owned() }
+}
+
+/// What the page reads of one seat beyond mute and deafen.
+fn flags_of(base: &str, room: &str, user: &str) -> Option<protocol::TinySeat> {
+    let known = super::super::manage::known(&saved_for(base));
+    known.seats.get(room).and_then(|seats| seats.iter().find(|seat| seat.user_id == user)).cloned()
+}
+
+#[test]
+fn moderation_and_moves_reach_the_server_and_its_flags_reach_the_page() {
+    let fake = fake(&[], |_, mut conn| {
+        conn.send(ready(1, &[ME, BEA], json!([{"room_id": OTHER_ROOM, "participants": [{"user_id": BEA, "server_muted": true, "suppressed": true}]}])));
+        while let Some(frame) = conn.next(Duration::from_secs(10)) {
+            let reference = frame["ref"].clone();
+            match frame["type"].as_str().unwrap_or("") {
+                "call.moderate" => {
+                    assert_eq!((frame["room_id"].as_str(), frame["user_id"].as_str()), (Some(OTHER_ROOM), Some(BEA)));
+                    assert_eq!(frame["server_deafened"], true);
+                    assert!(frame.get("server_muted").is_none(), "what was not asked is not sent");
+                    conn.send(json!({"type": "ok", "ref": reference}));
+                    conn.send(json!({"type": "call.state", "room_id": OTHER_ROOM, "user_id": BEA, "muted": false, "deafened": false, "server_muted": true, "server_deafened": true, "suppressed": true, "priority": false}));
+                }
+                "call.move" if frame["user_id"] == "owner" => conn.send(json!({"type": "error", "ref": reference, "code": "hierarchy"})),
+                "call.move" => {
+                    assert_eq!(frame["room_id"], ROOM);
+                    conn.send(json!({"type": "ok", "ref": reference}));
+                    conn.send(json!({"type": "call.left", "room_id": OTHER_ROOM, "user_id": BEA, "reason": "moved"}));
+                    conn.send(json!({"type": "call.joined", "room_id": ROOM, "user_id": BEA, "participant": {"user_id": BEA, "server_muted": true}}));
+                }
+                "call.join" if frame["room_id"] == "crowded" => conn.send(json!({"type": "error", "ref": reference, "code": "room_full"})),
+                "call.join" => {
+                    let room = frame["room_id"].as_str().unwrap_or("").to_owned();
+                    conn.send(json!({"type": "ok", "ref": reference}));
+                    conn.send(json!({"type": "call.joined", "room_id": room, "user_id": ME}));
+                    if room == ROOM {
+                        // A moderator moves us: the old seat goes, and we are told where to.
+                        conn.idle(Duration::from_millis(100));
+                        conn.send(json!({"type": "call.left", "room_id": ROOM, "user_id": ME, "reason": "moved"}));
+                        conn.send(json!({"type": "call.moved", "room_id": OTHER_ROOM}));
+                    }
+                }
+                _ => conn.send(json!({"type": "error", "ref": reference, "code": "unknown_type"})),
+            }
+        }
+    });
+    let running = run(&fake.base, QUICK);
+    until("connected", || running.link().0 == Link::Connected);
+    until("Bea's seat as the server describes it", || flags_of(&fake.base, OTHER_ROOM, BEA).is_some_and(|seat| seat.server_muted && seat.suppressed && !seat.server_deafened));
+
+    let since = running.hub.seq();
+    let moderate = |reply| Ask::Moderate { room_id: OTHER_ROOM.into(), user_id: BEA.into(), server_muted: None, server_deafened: Some(true), reply };
+    assert_eq!(running.ask(moderate), Ok(()));
+    until("Bea server-deafened", || flags_of(&fake.base, OTHER_ROOM, BEA).is_some_and(|seat| seat.server_deafened));
+    until("the page told", || running.told_tiny(since));
+
+    assert_eq!(running.ask(|reply| Ask::Move { user_id: "owner".into(), room_id: ROOM.into(), reply }), Err(crate::adapters::tiny::HIERARCHY.to_owned()));
+    assert_eq!(running.ask(|reply| Ask::Move { user_id: BEA.into(), room_id: ROOM.into(), reply }), Ok(()));
+    until("Bea moved, still server-muted", || running.in_room(ROOM) == ["Bea"] && flags_of(&fake.base, ROOM, BEA).is_some_and(|seat| seat.server_muted));
+    assert!(running.hub.occupants(&running.key(OTHER_ROOM)).is_none());
+
+    assert_eq!(running.ask(|reply| Ask::Join { room_id: "crowded".into(), reply }), Err("That room is full.".to_owned()));
+    // Moved by a moderator, we join where we were sent without being asked.
+    assert_eq!(running.ask(|reply| Ask::Join { room_id: ROOM.into(), reply }), Ok(()));
+    until("in the room we were moved to", || running.in_room(OTHER_ROOM) == ["Ada"]);
+    assert_eq!(running.in_room(ROOM), ["Bea"]);
+}
+
+#[test]
+fn a_moved_call_with_audio_goes_along_muted_and_priority_reaches_the_server() {
+    with_mediad();
+    let (said, heard) = channel();
+    let fake = fake_with("up", &[], move |_, mut conn| {
+        conn.send(ready(1, &[ME, BEA], json!([{"room_id": ROOM, "participants": [{"user_id": BEA, "priority": true}]}])));
+        answer_join(&mut conn, "c-1");
+        let state = conn.next(Duration::from_secs(5)).expect("call.state with priority");
+        assert_eq!((state["type"].as_str(), state["muted"].as_bool(), state["priority"].as_bool()), (Some("call.state"), Some(false), Some(true)));
+        conn.send(json!({"type": "ok", "ref": state["ref"]}));
+        let state = conn.next(Duration::from_secs(5)).expect("call.state without priority");
+        assert!(state.get("priority").is_none(), "{state}");
+        conn.send(json!({"type": "ok", "ref": state["ref"]}));
+        conn.send(json!({"type": "call.moved", "room_id": OTHER_ROOM}));
+        conn.send(json!({"type": "call.left", "room_id": ROOM, "user_id": ME, "reason": "moved"}));
+        let join = conn.next(Duration::from_secs(30)).expect("a join where we were moved");
+        assert_eq!(join["room_id"], OTHER_ROOM);
+        let sdp = join["sdp"].as_str().expect("a fresh offer");
+        conn.send(json!({"type": "call.answer", "ref": join["ref"], "call_id": "c-2", "sdp": answer_for(sdp)}));
+        conn.send(json!({"type": "call.joined", "room_id": OTHER_ROOM, "user_id": ME}));
+        let _ = said.send(());
+        conn.idle(Duration::from_secs(5));
+    });
+    let running = run(&fake.base, QUICK);
+    until("connected", || running.link().0 == Link::Connected);
+    until("the health read", || !running.live.seats_only());
+    assert_eq!(running.join_with_audio(ROOM), Ok(()));
+    until("the call", || the_call(&running).is_some());
+    running.hub.calls.set_audio(&running.hub, true, false).expect("mute in the call");
+    until("Bea holds priority in the roster", || the_call(&running).is_some_and(|call| call.participants.iter().any(|who| who.id == BEA && who.priority)));
+    running.live.ask(Ask::Priority { on: true });
+    running.live.ask(Ask::Priority { on: true });
+    running.live.ask(Ask::Priority { on: false });
+    heard.recv_timeout(Duration::from_secs(30)).expect("the moved join answered");
+    let moved = running.key(OTHER_ROOM);
+    until("the same call, in the new room", || running.hub.calls.describe().0.is_some_and(|call| call.conversation == moved));
+    let call = running.hub.calls.describe().0.expect("the call");
+    assert!(call.muted, "mute goes along");
+    assert!(!matches!(call.state, protocol::CallState::Failed { .. }), "{:?}", call.state);
+    until("in the new room", || running.in_room(OTHER_ROOM) == ["Ada"]);
+    running.live.ask(Ask::Hangup { room_id: OTHER_ROOM.into() });
+}
+
 #[test]
 fn every_refusal_has_words_and_every_address_has_a_socket() {
     assert_eq!(words(false, "full"), "That room is full.");
+    assert_eq!(words(false, "room_full"), "That room is full.");
+    assert_eq!(words(false, "banned"), "You're banned from this server.");
+    assert_eq!(words(false, "timed_out"), "You're timed out on this server, so you can't join calls for now.");
+    assert_eq!(words(true, "hierarchy"), crate::adapters::tiny::HIERARCHY);
     assert_eq!(words(false, "server_full"), "Every seat on this server is taken. Try again later.");
     assert_eq!(words(false, "not_found"), "That room is gone.");
     assert_eq!(words(true, "not_found"), "They're not in that room's call.");
@@ -964,7 +1161,7 @@ impl Hand {
         let mut hand = Hand { ws, mediad, stdin, frames };
         assert!(matches!(hand.frames.recv_timeout(Duration::from_secs(10)), Ok(protocol::MediaResponse::Ready { .. })));
         let host = tungstenite::http::Uri::try_from(saved.base_url.as_str()).expect("an address").host().unwrap_or("").to_owned();
-        let offer = TinyOffer { user_id: saved.user_id.clone(), host, slots: ROOM_CAP - 1, muted: false, deafened: false };
+        let offer = TinyOffer { user_id: saved.user_id.clone(), host, slots: ROOM_CAP - 1, muted: false, deafened: false, e2ee: None };
         let protocol::MediaResponse::Offer { sdp } = hand.ask(protocol::MediaRequest::TinyOffer(offer)) else {
             panic!("no offer");
         };

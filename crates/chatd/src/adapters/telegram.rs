@@ -507,6 +507,17 @@ fn serve(account: &Arc<Account>, command: Command) {
             if let Ok(tl::enums::contacts::Found::Found(found)) = account.ask(&request) {
                 account.learn(&found.users, &[]);
             }
+            // Resolving is tightly flood-limited: only an explicit, complete @username asks
+            // for it, after ranked search. Never hold queued sends up waiting out a flood.
+            if let Some(username) = query.trim().strip_prefix('@').filter(|name| {
+                (5..=32).contains(&name.len()) && name.as_bytes()[0].is_ascii_alphabetic()
+                    && name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
+            }) {
+                let request = tl::functions::contacts::ResolveUsername { username: username.to_owned(), referer: None };
+                if let Ok(tl::enums::contacts::ResolvedPeer::Peer(found)) = wire::call(account.wire.as_ref(), &request) {
+                    account.learn(&found.users, &[]);
+                }
+            }
             ctx.searched(&query);
         }
         Command::Members { conversation_id, offset, limit, reply } => {

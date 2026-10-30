@@ -10,6 +10,7 @@ name = "tinyclient-login"
 path = "src/main.rs"
 
 [dependencies]
+protocol.workspace = true
 serde_json.workspace = true
 ureq = { version = "3", default-features = false, features = ["native-tls", "json"] }
 

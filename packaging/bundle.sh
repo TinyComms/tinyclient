@@ -49,6 +49,8 @@ mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 for binary in tinyclient chatd mediad tinyclient-login; do
     cp "$target/$profile/$binary" "$app/Contents/MacOS/$binary"
 done
+# The notification sounds: UNNotificationSound looks for them by name in Resources.
+cp "$root"/packaging/sounds/*.caf "$app/Contents/Resources/"
 sed "s/@VERSION@/$version/g" "$root/packaging/Info.plist" > "$app/Contents/Info.plist"
 plutil -lint "$app/Contents/Info.plist" >/dev/null
 

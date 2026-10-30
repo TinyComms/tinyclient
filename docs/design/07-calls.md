@@ -17,6 +17,7 @@ ringing_in  ──Decline / caller stops / answered elsewhere──▶ idle (+ r
 connecting  ──Cancel──▶ idle            ──refused / 10 s without a reply / mic denied──▶ failed
 in_call ──Leave──▶ idle   ──other side ends──▶ ended (4 s) ──▶ idle
 in_call ──packets stop──▶ reconnecting ──back──▶ in_call   ──30 s──▶ failed ("Connection lost")
+in_call ──Tiny server lost our media──▶ reconnecting ──fresh offer, same room──▶ in_call   (3 times in 2 min, then failed)
 in_call ──ring arrives──▶ in_call + incoming strip ──Accept──▶ confirm ──▶ leave, then connecting
 failed ──Try again──▶ ringing_out / connecting      ──Dismiss / any new call──▶ idle
 ```
@@ -36,7 +37,7 @@ One pill in the conversation header, 30 px high, radius 15, 12 px side padding, 
 | Hand-off | no fill, 1 px `hairline_strong` border, `text_soft`; the **network's own icon** 14 px, then label, then `arrow-up-right` 12 px `text_faint` | **Open in Teams** · **Open huddle in Slack** · **Open in Telegram** · **Open in Discord** | "Teams calls open in the Teams app. tinyclient doesn't carry them." / "Huddles open in Slack. Press the headphones there to join." |
 | None (a Discord text channel) | no button | | |
 
-The hand-off reads as deliberate because it is a different object: outlined, branded, with an out-arrow and a destination in its name. It never says "Call". If the official app is missing, a 32 px line appears under the header: "Teams isn't installed. **Open in browser ↗**". There is no separate video or share button in the header: camera and share are turned on inside a call. Pressing Call while in another call asks in the dock first ("Leave Lounge and call Mara Okafor?"). A voice channel joins from its header pill, its hover **Join** pill, or a double-click; a single click only opens its chat, because joining is seen by everyone there.
+The hand-off reads as deliberate because it is a different object: outlined, branded, with an out-arrow and a destination in its name. It never says "Call". If the official app is missing, a 32 px line appears under the header: "Teams isn't installed. **Open in browser ↗**". There is no separate video or share button in the header: camera and share are turned on inside a call. Pressing Call while in another call asks in the dock first ("Leave Lounge and call Mara Okafor?"). A voice channel joins from its header pill, its hover **Join** pill, its row menu's **Join voice**, or a double-click; a single click only opens its chat, because joining is seen by everyone there.
 
 ## 2. The call dock and bar (frames 2–5, 7)
 
@@ -45,7 +46,7 @@ Dock: full sidebar width (316), 8 px padding, 1 px `hairline` top border, presen
 - **Row 1, 36 px, the title row.** 28 px avatar (person: round, in a 4 px speaking-ring slot; voice channel: 28 px square, radius 8, `positive_soft` fill, `volume` glyph in `positive`). Title 13 px semibold. Sub-line 11.5 px `text_soft`: network icon 11 px + context + state. Right side: the peer's `mic-off` glyph (DM), or an avatar stack (group, channel): up to three 20 px avatars overlapping 6 px, then "+N". Click the row: open that conversation ("Go to Lounge"). Click the stack: participant list.
 - **Row 2, 32 px, controls.** Icon buttons 40 × 32, radius 8, 4 px gap, 16 px glyphs, left to right: mute, deafen, share, camera, devices. A flexible gap, then Leave, 48 × 32, at the right edge. Controls a stage or a network cannot do are absent, not greyed: stage 2 shows mute, deafen, devices, Leave.
 
-Sub-line wording: `Ringing… 0:12` · `Connecting…` · `Discord · 12:04` (DM) · `tinyclient-dev · 4:31` (channel: server name) · `Reconnecting… 0:08` (`warning`) · `Call ended · 12:04`. The sub-line's tooltip in a Discord call: "End-to-end encrypted by Discord". Left alone in a DM call: `Mara left · 12:40`; tinyclient does not hang up for me.
+Sub-line wording: `Ringing… 0:12` · `Connecting… 0:03` · `Discord · 12:04` (DM) · `tinyclient-dev · 4:31` (channel: server name; a Tiny room's is its server's name) · `Reconnecting… 0:08` (`warning`; a Tiny call counts down what is left of mediad's 30 s, `Reconnecting… 0:22 left`) · `Call ended · 12:04` · `You're muted. Press ⌘⇧M to talk` (`danger`, §2a) · `Moved to Raid night by a moderator` (4 s, `warning`). Every counter of one call counts from the moment the shell first saw that state, so the dock and a Tiny stage say the same. The sub-line's tooltip in a Discord call: "End-to-end encrypted by Discord". Left alone in a DM call: `Mara left · 12:40`; tinyclient does not hang up for me.
 
 | Control | Rest | On | Tooltip / shortcut |
 |---|---|---|---|
@@ -59,6 +60,14 @@ Sub-line wording: `Ringing… 0:12` · `Connecting…` · `Discord · 12:04` (DM
 Hover on any rest state: `selected` fill, `text` glyph. Disabled: 40 % opacity, no hover; used while reconnecting (all but Leave) and for a moderator's mute ("Muted by a moderator in Lounge"). Ringing and connecting show only mute and devices (both may be preset) and a text **Cancel** button (32 high, `danger_soft`).
 
 **Shortcuts** work in any tinyclient window: ⌘⇧M mute, ⌘⇧D deafen, ⌘⇧H leave or cancel, ⌘⇧A accept, ⌘⇧R decline, ⌘⇧J jump to the call's conversation. Mute can also be system-wide: off by default, a Settings switch ("Mute works while tinyclient is in the background"), registered only while a call exists. Layout and navigation arbitrates any clash with these.
+
+**On a Tiny server** the user panel sits under the dock (`10-tiny-server.md` §1) and holds mic, headphones and the voice settings cog, so over the server's own column the dock is the **compact bar**, as Discord's "Voice Connected": card height 54, signal bars (24, they open Call health), a 13/600 line `Voice connected` (`positive`, or the link's `warning`/`danger` when it is fair or poor; `Connecting… 0:03` and `Reconnecting… 0:22 left` in `warning`; `You're muted` in `danger` with a mic-off glyph while §2a holds), under it `Lounge / Night Shift` 11.5 `text_soft` (the move notice in its place for 4 s); the whole is a button to the channel (⌘⇧J); then the security slot and a 36 × 32 Leave. Anywhere else (another network, the Inbox) the same call is the full 96 card, with the signal bars before the avatar stack, so a call is always one glance and one click from Leave wherever I am. The channel's own stage carries a second set of controls, a floating pill of round buttons with Leave, under the people in the call. Volume and Mute for me are per person, in the person menu and a tile's hover.
+
+**Security slot.** The dock's title row, the compact bar and a Tiny channel's top bar (while I am in its call) each leave a 24 × 24 place for the call's security indicator: `Shell::call_security(call, Place, cx)` in `gui/call/security.rs`. It is the one indicator a call has (§7b), drawn the same in all three, and nothing for a call that says nothing about its protection (every network but a Tiny server).
+
+### 2a. You're muted
+
+While I am muted (not deafened) in a call that is up, the shell keeps the microphone meter on (`Media(Meter)`, asked again every 2 s should the device menu turn it off) and watches the level: speech at the V6 sensitivity or above, for 300 ms, shows **You're muted** for 3 s after the last of it. On a Tiny stage it is a `danger_fill` pill over the call bar, "You're muted · ⌘⇧M to talk", that unmutes on click; in the dock it replaces the sub-line; in the compact bar the state line. The microphone listens only on this machine; nothing is sent. Settings › Voice V19 "Tell me when I talk while muted" (on) turns it off, and with it the meter. A moderator's mute is said instead ("A moderator muted you here"), never "press ⌘⇧M".
 
 ## 3. Outgoing and failed (frames 2, 8)
 
@@ -85,7 +94,7 @@ Ringing shows who, an elapsed counter and Cancel, in the dock; the header pill b
 ## 5. Participants (frames 5, 7)
 
 - **DM:** no list. The bar's avatar carries the peer's speaking ring; a `mic-off` after the name if they are muted.
-- **Voice channel, in the tree.** Channel row at the tree's row height (30 px assumed): `volume` 15 px, name 13.5 px, count at the right ("5", or "2/4" with a limit). The joined channel: glyph `positive`, name `text` semibold. Under it, one row per person: **28 px**, 38 px left indent, 20 px avatar in a 4 px ring slot, 10 px gap, name 12.5 px `text_soft`, then 13 px status glyphs at the right, 5 px apart: `mic-off`, `headphone-off` (`text_faint`), `monitor-up` (`accent`; clicking it is Watch), `video`. Speaking: the ring turns `positive` and the name turns `text`. Order: me first, then by name; it never reorders on speech. At most 12 rows per channel, then "+ 9 more", which opens the participant list. Rows exist only for channels with people in them.
+- **Voice channel, in the tree.** Channel row at the tree's row height (30 px assumed): `volume` 15 px, name 13.5 px, count at the right ("5", or "2/4" with a limit). The joined channel: glyph `positive`, name `text` semibold. Under it, one row per person: **28 px**, 38 px left indent, 20 px avatar in a 4 px ring slot, 10 px gap, name 12.5 px `text_soft`, then 13 px status glyphs at the right, 5 px apart: `mic-off`, `headphone-off` (`text_faint`), `monitor-up` (`accent`; clicking it is Watch), `video`. Speaking: the ring turns `positive` and the name turns `text`. Order: friends first, then by name, the joined channel no exception; it never reorders on speech. At most 12 rows per channel, then "+ 9 more", which opens the participant list. Rows exist only for channels with people in them.
 - **Honest limit:** Discord reports speaking only on the voice connection I joined. Other channels show who is there and their mute, deafen, share and camera state, never a ring.
 - **Participant list** (popover from the avatar stack; the roster for group calls and whenever the tree is not on screen): 280 wide, 32 px rows, 22 px avatars, the same glyphs and ring, header "LOUNGE · 21 PEOPLE", ten rows visible then it scrolls as a virtual list.
 
@@ -99,7 +108,112 @@ Ringing shows who, an elapsed counter and Cancel, in the dock; the header pill b
 
 ## 7. Device menu (frame 7)
 
-Popover above the devices button, 300 wide, radius 12, 6 px padding, `popover` fill, 1 px border, one shadow. MICROPHONE: radio rows 30 px (14 px radio, `accent` when chosen), "System default *MacBook Pro Microphone*" first. Then a level meter: twelve 4 px segments, 2 px gaps, `positive` when lit, labelled "Input level"; it stays live while muted so the mic can be tested, with "Muted: others can't hear you" as the label. SPEAKER: the same rows, then **Play test sound** and a link, **Call settings…** (defaults live in Settings). A device unplugged mid-call: the call continues on the system default and the sub-line reads "Now using MacBook Pro Microphone" for 4 s.
+Popover above the devices button, 300 wide, radius 12, 6 px padding, `popover` fill, 1 px border, one shadow. A pick here is the user's choice of device: it is Settings' V1 and V2 (09), so it holds on every join and across restarts. MICROPHONE: radio rows 30 px (14 px radio, `accent` when chosen), "Automatic *MacBook Pro Microphone*" and "System default *MacBook Pro Microphone*" first (each naming the device it means now), then the hardware, then virtual devices (Krisp, VB-Cable, Voicemeeter, ...) under "VIRTUAL · only when picked" with a "virtual" tag: Automatic never lands on one. A chosen device that is gone keeps its row as "not connected", and the stand-in says "in use for now". Then a level meter: twelve 4 px segments, 2 px gaps, `positive` when lit, labelled "Speak to test your microphone"; it stays live while muted so the mic can be tested, with "Muted: others can't hear you" as the label. SPEAKER: the same rows and a meter of what is played ("What you hear"), then **Test speakers** and a link, **Call settings…**. What mediad says is not as chosen (`Call::device_notice`: the device is missing, would not start, or is standing in) heads the menu and shows under the call's title for a few seconds: "Studio headset isn't connected. Using MacBook Pro Microphone until it's back." The device is retried with backoff (3 s, doubling to 30 s) and switched back to within about 2 s of its return. A stream that opens and never runs is rebuilt once; still silent, the line stays, turns `warning` with a **Switch device** link, and opens this menu.
+
+## 7a. Voice controls (TeamSpeak and Mumble's bar)
+
+What a call's sound does, all in mediad and the same for a Discord and a Tiny call except where
+said. Settings › Voice (09 §4) holds the choices; the dock and the participant list show them.
+
+- **Input mode.** Voice activation opens the microphone at the V6 threshold, measured after
+  processing, and holds 260 ms through pauses. Push to talk opens it while the key is held and for
+  the release delay after (0 to 1 s, 200 ms default), then shuts at once. A Tiny room that requires
+  push to talk, or where voice activation is not allowed, is push to talk whatever the setting. The
+  priority key is push to talk that also asks the server for priority speech; it opens the
+  microphone in either mode. Our own speaking ring is lit exactly while we transmit.
+- **Keys.** Push to talk, priority push to talk, toggle mute and toggle deafen work in any app
+  (`gui/hotkeys.rs`): the shell polls the key state every 10 ms on its own thread, with no hook into
+  other apps and no administrator. Windows: any key or the middle and side mouse buttons. macOS:
+  any key or mouse button, once Input Monitoring is allowed; until then Settings says so. Linux
+  X11: any key and the middle button; the side buttons are not visible to apps there. Wayland: no
+  app may watch another's keys, so the mute and deafen keys work while tinyclient's window is in
+  front and push to talk needs an X11 session; Settings says so. Mute and deafen keys do what ⌘⇧M
+  and ⌘⇧D do.
+- **Processing.** Echo cancellation (WebRTC's AEC3), noise suppression and automatic gain (AGC2)
+  on the microphone, each a switch (V10 to V12), all on by default. The canceller hears what the
+  speaker plays, cues included. This retires the headphones advice: on speakers, others no longer
+  hear themselves.
+- **Per-person volume.** 0 to 200 % for one person, or muted for me alone, kept per account
+  (`CallGain`, V9) and applied at once. A person muted for me still lights up when they speak. For
+  the participant list's row menu: a slider 0 to 200 % with a tick at 100, and "Mute for me".
+- **Priority speech.** While someone holding priority (`Participant.priority`) speaks, everyone
+  else is played 12 dB quieter for every listener.
+- **Bitrate.** A Tiny call encodes at its room's bitrate.
+- **Connection.** `CallStats` answers with the last second: round trip, jitter, loss (per mille),
+  send and receive kb/s, the path (UDP, TCP, relay) and the codec, asked about once a second
+  while a Tiny call is up; refused in words before media flows. It also carries the call's audio
+  health, counted over the whole call: device glitches the system reported, microphone audio
+  dropped or missing (`capture_overruns`, `capture_gaps`), the speaker running dry
+  (`playout_underruns`), and lost frames from others made up (`concealed_frames`) or rebuilt from
+  the next packet (`fec_recovered`). A clean call keeps the first four at 0.
+  `gui/call/health.rs` grades it: **Excellent** (≤ 60 ms, ≤ 0.5 % loss, ≤ 15 ms jitter),
+  **Good** (≤ 120, ≤ 1.5 %, ≤ 30), **Fair** (≤ 250, ≤ 5 %, ≤ 60), else **Poor**, drawn as four
+  signal bars (`positive`, `warning` at Fair, `danger` at Poor, unlit bars `selected`) and turned
+  into plain-English hints, most serious first: loss over 5 % "Your connection is losing 6.2 % of
+  the audio. Move closer to Wi-Fi, or use a cable."; over 1.5 % "Some audio is lost on the way";
+  jitter over 30 ms "Audio is arriving unevenly…"; a round trip over 250 ms "The server is far
+  away…"; TCP and relay paths say why; a healthy call says "Your connection is good." The audio
+  counters are read as what grew since the poll a second before (a counter that went down means
+  mediad started again, and counts from nothing): overruns or gaps add "Your microphone is
+  dropping audio. Try another microphone…", underruns "Your speaker is running dry…", and the
+  second's loss, shared between made-up and rebuilt frames as they grew, "Parts of what others say
+  are being filled in…" (over 3 % made up) and "Error correction is repairing some lost audio.".
+  Device glitches are logged, not hinted: a virtual microphone reports them many times a second
+  and plays on. **Call health** (the panel's line, the dock's bars, the stage's bars button, my
+  tile's bars) is the place for all of it; a `Bad` hint also stands as a pill over the stage's
+  call bar until it clears.
+- **Audio path.** Device callbacks only move samples through lock-free rings (MMCSS "Pro Audio" on
+  Windows); processing and codecs run on the call's 20 ms tick, which holds the 1 ms system timer.
+  Each side resamples a hair off nominal to follow its device's clock, so nothing is spliced. A
+  device glitch is counted, never a reason to reopen the device; only a side whose device stopped,
+  went away or never ran is reopened, and the other side plays on. A lost packet is rebuilt from
+  the next one's FEC copy or made up from the last pitch period, faded, and crossfaded back. The
+  mix goes through a look-ahead limiter, never a clamp.
+- **Cues.** As 09 §8, plus Moved (a moderator moved us) and Disconnected (kicked, banned, timed out,
+  or the room went), which plays out as the call ends. Joining chimes for me too: the shell asks
+  mediad for the Joined cue (`Media(Cue)`, still subject to S7) the first time a call is up, not
+  again on a move or a reconnect.
+- **Reconnect.** A Tiny server that stops hearing our media while its live socket stays up takes
+  us back to the same room with a fresh offer, silently but for the Lost and Back cues, three times
+  in two minutes before the call fails in words. A server restart already did; a Discord call
+  resumes its voice session.
+
+## 7b. Who can hear it (Tiny server calls)
+
+A Tiny server call is end-to-end encrypted when the server can do it (`e2ee_calls`) and everyone
+in the room's call has an app that can (tinyserver's `docs/calls.md`, "End-to-end encryption";
+`SECURITY.md` for the threat model). The call header's security slot says which (the dock's
+title row, the Tiny column's compact bar and the channel's top bar, each a 24 × 24 button beside
+the call health bars), and never more than holds (`gui/call/security.rs`):
+
+| `security.mode` | Badge | Means |
+|---|---|---|
+| `end_to_end` | lock, "End-to-end encrypted" | Only the people in the call hold the keys. The SFU forwards what it cannot open. |
+| `pending` | clock, "Setting up encryption…" | The group is being made, or we are alone in it. Our microphone sends nothing meanwhile. |
+| `transport` | faint shield, "Encrypted to the server" | DTLS-SRTP to the server only: it could hear the call. Not alarming; it is what every Tiny call was before. |
+| any member `changed`, one the server does not list, or one person twice | warning, "Check security" | A key changed since it was verified, someone holds the keys who is not in the call, or one name holds two places (another key under it). Comparing the call code does not catch an extra member; the list does. |
+
+The lock and the words "end to end" appear only with `end_to_end`. Clicking the badge opens a
+320 px popover beside the badge clicked: over the dock's card, up from the compact bar, down from
+the top bar:
+
+- **What the server can and cannot see**, in plain words: who is in the call and when, who is
+  speaking and how loud (the speaking ring), roughly how much audio each person sends, network
+  addresses. It cannot hear what is said. Transport-only says why: who in the call cannot encrypt
+  end to end, or that the server cannot.
+- **The call code**: 30 digits in six groups of five, monospace, from the MLS group's epoch
+  authenticator. Everyone in the call sees the same code; reading it out loud proves everyone is
+  in one group, not split into two the server relays between. It does not show an extra member:
+  the list below does. It changes whenever someone joins or leaves.
+- **Each other member**: their name (someone in the group the server does not list in the call is
+  "Someone the server doesn't list", in the warning color), their 45-digit safety number for
+  your key and theirs (nine groups of five, the same on both sides), and "Mark as verified" or
+  "Unmark" (`TinyVerify`), remembered per server and person. A verified person shows a check; a
+  verified person whose key is now another says so loudly: verify again before trusting the call.
+
+A room can require it: Server settings › Channels › Privacy, "Require end-to-end encryption",
+only on a server with `e2ee_calls` and for someone who may edit the channel. The server then
+refuses apps that cannot; one already in the call stays.
 
 ## 8. Ending and what remains (frames 4, 8, 9)
 
@@ -132,4 +246,4 @@ Voice channels leave no rows. A failed call leaves its card in the dock, not a r
 
 ## Deliberately absent
 
-A gallery or grid; a self-view; any control over the picture; a ringtone or call sounds of our own; a pulsing ring, waveform or animated meter; a full-window call screen; a card for voice-only calls; greyed-out buttons for things not built; a second simultaneous call; per-person volume (later, as a row menu in the participant list); noise suppression, soundboard, recording, captions, reactions; a menu-bar item; a custom screen picker with thumbnails; connection-quality bars; auto-rejoin after a failure; auto-opening a share; any in-call state before the network confirms the join.
+A gallery or grid outside a Tiny stage; a self-view; any control over the picture; a ringtone or call sounds of our own; a pulsing ring, waveform or animated meter; a full-window call screen; a card for voice-only calls; greyed-out buttons for things not built; a second simultaneous call; soundboard, recording, captions, reactions; a menu-bar item; a custom screen picker with thumbnails; signal bars for anyone but me (nothing measures another person's link); a pop-out mini window for a voice call (GPUI can open one, but a second always-on-top window needs the platform work video's pop-out does first); auto-rejoin after a failure, as opposed to a blip (§7a) — a failure offers one-click Rejoin instead; auto-opening a share; any in-call state before the network confirms the join.

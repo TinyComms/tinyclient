@@ -2,9 +2,9 @@
 
 use super::chat::Look;
 use super::home::{self, Act, Drill, Item};
-use super::{on_screen, respliced, Mode};
+use super::{joins_from_list, on_screen, respliced, Mode};
 use crate::client::ask;
-use crate::gui::components::{badge_dot, empty_state, glyph, list_row, pair, rollup_badge, section_header, Avatar, Shape};
+use crate::gui::components::{badge_dot, empty_state, glyph, icon_button, list_row, pair, rollup_badge, section_header, Avatar, Shape};
 use crate::gui::state::{Shell, Snapshot};
 use crate::gui::theme::{self, Type};
 use crate::view::now;
@@ -267,7 +267,6 @@ impl Shell {
             Item::Chat(c) => {
                 let look = match network {
                     Some(Network::Discord) if self.sidebar_state.drill.is_none() => Look { status: true, ..Look::default() },
-                    Some(Network::Telegram | Network::Teams | Network::Signal | Network::Messages) => Look { time: true, ticks: true, ..Look::default() },
                     _ => Look { time: true, context: false, ..Look::default() },
                 };
                 self.chat_row("home", &c, look, focused, cx).into_any_element()
@@ -363,6 +362,15 @@ impl Shell {
             more => format!("{} +{more}", firsts.join(", ")),
         };
         let (title, glyph_name) = if c.kind.is_direct() { ("Call in your DMs".to_owned(), "icons/phone.svg") } else { (c.title.trim_start_matches('#').to_owned(), "icons/volume-2.svg") };
+        let ours = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.call.as_ref())
+            .map_or(false, |call| {
+                call.conversation == c.key
+                    && !matches!(call.state, protocol::CallState::Failed { .. })
+            });
+        let join = joins_from_list(c) && !ours;
         let content = div()
             .gap(px(10.))
             .child(faces)
@@ -383,10 +391,22 @@ impl Shell {
                             .children((!c.space_title.is_empty()).then(|| div().flex_1().min_w_0().truncate().type_ui().text_color(theme::text_faint()).child(c.space_title.clone()))),
                     )
                     .child(div().h(px(16.)).truncate().type_small().text_color(theme::text_soft()).child(who)),
-            );
+            )
+            .children(join.then(|| self.join_pill(c, cx)))
+            .when(join, |row| row.group("voice"));
         let picked = c.clone();
         list_row(super::row_id("voice", &c.key), theme::row_height(theme::ROW_TWO), selected, focused, content)
-            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| this.pick_row(&picked, cx)))
+            .on_mouse_down(
+                MouseButton::Left,
+                // A voice channel joins on a double-click here too; a single click only opens.
+                cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                    if join && event.click_count == 2 {
+                        this.call_start(picked.key.clone(), cx);
+                    } else {
+                        this.pick_row(&picked, cx);
+                    }
+                }),
+            )
     }
 
     /// Telegram's folder tabs under the jump strip: All, then each folder with its count.
@@ -423,13 +443,56 @@ impl Shell {
                 .children(count)
                 .children(on.then(|| div().absolute().bottom_0().left(px(8.)).right(px(8.)).h(px(2.)).rounded(px(1.)).bg(theme::text())))
         };
-        let mut tabs = div().id("folder-tabs").flex_none().h(px(32.)).px(px(8.)).mb(px(4.)).flex().items_center().gap(px(4.)).overflow_x_scroll();
+        let scroll = state.folder_tabs_scroll.clone();
+        let mut tabs = div()
+            .id("folder-tabs")
+            .flex_none()
+            .h(px(32.))
+            .px(px(8.))
+            .flex()
+            .items_center()
+            .gap(px(4.))
+            .overflow_x_scroll()
+            .track_scroll(&scroll);
         tabs = tabs.child(tab(None, "All".into(), 0, 0, cx));
         let folders = state.home.folders.clone();
         for folder in folders {
             tabs = tabs.child(tab(Some(folder.key.id.clone()), folder.name.clone(), folder.unread, folder.mentions, cx));
         }
-        Some(div().child(tabs))
+
+        let max = scroll.max_offset().x;
+        let can_left = scroll.offset().x < px(0.);
+        let can_right = scroll.offset().x > -max;
+
+        if max <= px(0.) {
+            return Some(div().flex().items_center().mb(px(4.)).child(tabs));
+        }
+
+        let arrow = |icon: &'static str, enabled: bool, direction: i32, cx: &mut Context<Shell>| {
+            let id = if direction < 0 { "folder-tabs-scroll-left" } else { "folder-tabs-scroll-right" };
+            icon_button(id, icon, false)
+                .size(px(24.))
+                .when(!enabled, |b| b.opacity(0.35).cursor_default())
+                .when(enabled, |b| {
+                    b.on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                        let scroll = this.sidebar_state.folder_tabs_scroll.clone();
+                        let current = scroll.offset().x;
+                        let new_x = (current - px(120. * direction as f32)).clamp(-max, px(0.));
+                        scroll.set_offset(gpui::point(new_x, px(0.)));
+                        cx.notify();
+                    }))
+                })
+        };
+
+        Some(
+            div()
+                .flex()
+                .items_center()
+                .mb(px(4.))
+                .child(arrow("icons/chevron-left.svg", can_left, -1, cx))
+                .child(div().flex_1().min_w_0().child(tabs))
+                .child(arrow("icons/chevron-right.svg", can_right, 1, cx)),
+        )
     }
 
     fn home_empty(&self) -> Div {

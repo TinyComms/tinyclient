@@ -34,6 +34,7 @@
     <a class="brand" href="./" aria-label="tinyclient home"><img src="favicon.svg" alt="" width="28" height="28">tinyclient</a>
     <nav class="site-nav" aria-label="Site">
       <a href="docs/">Docs</a>
+      <a href="tinyserver.html">Tiny server</a>
       <a class="hide-sm" href="docs/privacy.html">Privacy</a>
       <a class="dc" href="https://discord.gg/kJHK7BNvJP" aria-label="Discord"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20.317 4.37a19.791 19.791 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028 14.09 14.09 0 0 0 1.226-1.994.076.076 0 0 0-.041-.106 13.107 13.107 0 0 1-1.872-.892.077.077 0 0 1-.008-.128 10.2 10.2 0 0 0 .372-.292.074.074 0 0 1 .077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 0 1 .078.01c.12.098.246.198.373.292a.077.077 0 0 1-.006.127 12.299 12.299 0 0 1-1.873.892.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.839 19.839 0 0 0 6.002-3.03.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.03zM8.02 15.33c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42.019 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42.019 1.333-.946 2.418-2.157 2.418z"/></svg><span class="nav-label">Discord</span></a>
       <a class="gh" href="https://github.com/itz4blitz/tinyclient"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>GitHub</a>
@@ -45,7 +46,7 @@
 
 <section class="hero" aria-labelledby="title">
   <div class="wrap">
-    <a class="hero-badge" href="docs/networks.html"><span class="hb-new">New</span>Android Messages, paired from your phone<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg></a>
+    <a class="hero-badge" href="tinyserver.html"><span class="hb-new">New</span>Tiny server: run your own voice server<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg></a>
     <div class="hero-mark"><img class="hero-icon" src="icon.svg" alt="" width="76" height="76"><h1 id="title">tinyclient</h1></div>
     <p class="pitch">One tiny, private app for all your chats.</p>
     <div class="actions">
@@ -152,7 +153,7 @@
       </li>
       <li class="feat-card spot">
         <div class="crop side"><img src="shots/tile-call-1.webp" alt="" width="630" height="627" loading="lazy" decoding="async"></div>
-        <div class="feat-text"><h3>Voice calls</h3><p>Discord voice in DMs and channels, with Discord&rsquo;s end-to-end&nbsp;encryption.</p></div>
+        <div class="feat-text"><h3>Voice calls</h3><p>Discord voice, and voice rooms on a Tiny server you run, end-to-end encrypted. Echo cancellation&nbsp;built&nbsp;in.</p></div>
       </li>
       <li class="feat-card spot">
         <div class="crop pane top"><img src="shots/tile-thread-1.webp" alt="" width="591" height="510" loading="lazy" decoding="async"></div>
@@ -176,7 +177,7 @@
     <h2 id="principles-title" class="center reveal">Small on purpose</h2>
     <ul class="points reveal">
       <li class="spot"><span class="pt-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 14h6v6M20 10h-6V4M14 10l7-7M3 21l7-7"/></svg></span><strong>Tiny</strong><span>Native. Not a browser in a&nbsp;box.</span></li>
-      <li class="spot"><span class="pt-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M9.9 4.2A10.4 10.4 0 0 1 12 4c7 0 10 8 10 8a17.6 17.6 0 0 1-3.2 4.2M6.6 6.6A17.4 17.4 0 0 0 2 12s3 8 10 8a9.7 9.7 0 0 0 5.4-1.6M2 2l20 20M9.9 9.9a3 3 0 0 0 4.2 4.2"/></svg></span><strong>Private</strong><span>No servers, no&nbsp;accounts, no&nbsp;telemetry.</span></li>
+      <li class="spot"><span class="pt-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M9.9 4.2A10.4 10.4 0 0 1 12 4c7 0 10 8 10 8a17.6 17.6 0 0 1-3.2 4.2M6.6 6.6A17.4 17.4 0 0 0 2 12s3 8 10 8a9.7 9.7 0 0 0 5.4-1.6M2 2l20 20M9.9 9.9a3 3 0 0 0 4.2 4.2"/></svg></span><strong>Private</strong><span>No tinyclient server or account. No&nbsp;telemetry.</span></li>
       <li class="spot"><span class="pt-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg></span><strong>Secure</strong><span>Sessions live in your OS&nbsp;keychain.</span></li>
       <li class="spot"><span class="pt-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m16 18 6-6-6-6M8 6l-6 6 6 6"/></svg></span><strong>Open</strong><span>MIT licensed. Built in&nbsp;public.</span></li>
     </ul>
@@ -187,7 +188,7 @@
   <div class="wrap">
     <p class="kicker center reveal">Size</p>
     <h2 id="memory-title" class="center reveal">Five apps, or one.</h2>
-    <p class="lede center reveal"><span class="nowrap-s">The official apps use 1.4&nbsp;GB of RAM and 3.1&nbsp;GB of disk.</span> <span class="nowrap-s">tinyclient uses 57&nbsp;MB and 55&nbsp;MB.</span></p>
+    <p class="lede center reveal"><span class="nowrap-s">The official apps use 1.4&nbsp;GB of RAM and 3.1&nbsp;GB of disk.</span> <span class="nowrap-s">tinyclient 0.2.0 used 57&nbsp;MB and 55&nbsp;MB.</span></p>
     <h3 class="vs-head reveal">In memory</h3>
     <div class="vs mem reveal" role="img" aria-label="RAM in use while signed in: Teams 374 MB, Slack 370 MB, Discord 370 MB, Signal 225 MB, Telegram 90 MB, tinyclient 0.2.0 57 MB.">
       <div class="vs-row">
@@ -221,7 +222,7 @@
         <span class="vs-val">57 MB</span>
       </div>
     </div>
-    <p class="fine-note center">RAM in use while signed in, measured together on an M3 Pro, 14&nbsp;October 2026. tinyclient is 0.2.0. Activity Monitor&rsquo;s Memory column, which also counts compressed memory, is 3.9&nbsp;GB for the five and 91&nbsp;MB for tinyclient. <a href="docs/performance.html#memory">How we measure →</a></p>
+    <p class="fine-note center">RAM in use while signed in, measured together on an M3 Pro, 14&nbsp;October 2026. tinyclient is 0.2.0. Activity Monitor&rsquo;s Memory column, which also counts compressed memory, is 3.9&nbsp;GB for the five and 91&nbsp;MB for tinyclient. Later releases have not been measured again yet. <a href="docs/performance.html#memory">How we measure →</a></p>
     <h3 class="vs-head reveal">On disk</h3>
     <div class="vs reveal" role="img" aria-label="The five official apps take 3.1 GB on disk together; tinyclient takes 55 MB.">
       <div class="vs-row">
@@ -241,7 +242,7 @@
         <span class="vs-val">55 MB</span>
       </div>
     </div>
-    <p class="fine-note center">App size on disk, macOS, from each vendor&rsquo;s installer, October 2026. Slack and Telegram ship one app for Apple silicon and Intel; tinyclient&rsquo;s figure is its Apple silicon build. <a href="docs/performance.html">How we measure →</a></p>
+    <p class="fine-note center">App size on disk, macOS, from each vendor&rsquo;s installer, 14&nbsp;October 2026. Slack and Telegram ship one app for Apple silicon and Intel; tinyclient&rsquo;s figure is its Apple silicon build of 0.2.0, not yet measured again for later releases. <a href="docs/performance.html">How we measure →</a></p>
   </div>
 </section>
 
@@ -275,7 +276,7 @@
       <svg class="fl-defs" width="0" height="0" aria-hidden="true" focusable="false"><defs><symbol id="fl-lock" viewBox="0 0 14 16"><path class="fl-lock-shackle" d="M3.5 7V4.8a3.5 3.5 0 0 1 7 0V7"/><rect class="fl-lock-body" x="1.5" y="7" width="11" height="8" rx="2"/></symbol></defs></svg>
 <svg class="fl fl-wide" viewBox="0 0 960 500" role="img" aria-labelledby="fl-title fl-desc">
 <title id="fl-title">Where your messages go</title>
-<desc id="fl-desc">On your computer, the tinyclient window talks to chatd over a local socket. chatd is always on, keeps messages and media on your disk and sessions in the system keychain, and connects directly, over encrypted connections, to Slack, Discord, Telegram, Microsoft Teams, Signal and Android Messages. mediad starts only during a call and connects to Discord's voice servers; tinyclient-login starts only to sign in and shows the network's own sign-in page. There is no tinyclient server in between.</desc>
+<desc id="fl-desc">On your computer, the tinyclient window talks to chatd over a local socket. chatd is always on, keeps messages and media on your disk and sessions in the system keychain, and connects directly, over encrypted connections, to Slack, Discord, Telegram, Microsoft Teams, Signal and Android Messages. mediad starts only during a call, or to play a sound, and connects to Discord's voice servers or to a Tiny server you run; tinyclient-login starts only to sign in and shows the network's own sign-in page. There is no tinyclient server in between.</desc>
 <g class="fl-ghost"><rect x="628" y="6" width="190" height="40" rx="10"/><text class="fl-s" x="723" y="31" text-anchor="middle">tinyclient server</text><path class="fl-strike" d="M640 40 L806 12"/></g>
 <text class="fl-f fl-ghost-note" x="723" y="60" text-anchor="middle">NONE. NOTHING IN BETWEEN.</text>
 <rect class="fl-zone" x="16" y="74" width="680" height="410" rx="18"/><text class="fl-f" x="38" y="102">YOUR COMPUTER</text>
@@ -342,7 +343,7 @@
 </svg>
 <svg class="fl fl-narrow" viewBox="0 0 360 726" role="img" aria-labelledby="fl-title-n fl-desc-n">
 <title id="fl-title-n">Where your messages go</title>
-<desc id="fl-desc-n">The tinyclient window talks to chatd on your computer. chatd keeps your messages on your disk and your sessions in the keychain, and connects directly and encrypted to Slack, Discord, Telegram, Microsoft Teams, Signal and Android Messages. A call starts mediad; a sign-in starts tinyclient-login. There is no tinyclient server in between.</desc>
+<desc id="fl-desc-n">The tinyclient window talks to chatd on your computer. chatd keeps your messages on your disk and your sessions in the keychain, and connects directly and encrypted to Slack, Discord, Telegram, Microsoft Teams, Signal and Android Messages. A call starts mediad; a sign-in starts tinyclient-login. A Tiny server is yours, if you add one. There is no tinyclient server in between.</desc>
 <g class="fl-ghost"><rect x="96" y="6" width="168" height="36" rx="10"/><text class="fl-s" x="180" y="29" text-anchor="middle">tinyclient server</text><path class="fl-strike" d="M108 36 L252 12"/></g>
 <rect class="fl-zone" x="6" y="58" width="348" height="420" rx="16"/><text class="fl-f" x="24" y="84">YOUR COMPUTER</text>
 <path class="fl-wire" d="M98 168 V204"/>
@@ -385,7 +386,7 @@
       <figcaption class="flow-cap"><span class="fl-key"><i class="k-solid"></i>always running</span><span class="fl-key"><i class="k-dash"></i>only while needed</span><span class="fl-key"><svg viewBox="0 0 14 16" aria-hidden="true"><use href="#fl-lock"/></svg>encrypted to the network</span></figcaption>
     </figure>
     <ul class="trio">
-      <li><span class="tico" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/><path d="M2 2l20 20"/></svg></span>No servers</li>
+      <li><span class="tico" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/><path d="M2 2l20 20"/></svg></span>No tinyclient server</li>
       <li><span class="tico" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M3 12h4l3-8 4 16 3-8h4"/><path d="M2 2l20 20"/></svg></span>No telemetry</li>
       <li><span class="tico" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="8" cy="15" r="4"/><path d="M10.8 12.2 20 3M17 6l3 3M14 9l2 2"/></svg></span>Keys in your keychain</li>
     </ul>
@@ -462,11 +463,36 @@
           <td data-label="Video"><span class="tag">On the phone</span></td>
           <td data-label="Screen share"><span class="tag none">Not offered</span></td>
         </tr>
+        <tr>
+          <th scope="row"><span class="th-net"><img src="assets/networks/tiny.svg" alt="" width="20" height="20">Tiny server</span></th>
+          <td data-label="Sign in">In your browser</td>
+          <td data-label="Reactions"><span class="tag none">No text chat</span></td>
+          <td data-label="Edit, delete"><span class="tag none">No text chat</span></td>
+          <td data-label="Files"><span class="tag none">No text chat</span></td>
+          <td data-label="Voice"><span class="tag yes">In tinyclient</span></td>
+          <td data-label="Video"><span class="tag warn">Not yet</span></td>
+          <td data-label="Screen share"><span class="tag warn">Not yet</span></td>
+        </tr>
         </tbody>
       </table>
     </div>
-    <p class="fine-note center">Not built yet: message search in the window, video and screen share, voice messages, Signal photos, files and calls, and Teams personal accounts.</p>
+    <p class="fine-note center">Not built yet: video and screen share, Signal photos, files and calls, and Teams personal accounts. A <a href="tinyserver.html">Tiny server</a> is voice only: it has no text chat.</p>
     <p class="more center"><a href="docs/networks.html">The details, and each network&rsquo;s terms →</a></p>
+  </div>
+</section>
+
+<section class="section" id="tinyserver" aria-labelledby="tinyserver-title">
+  <div class="wrap">
+    <p class="kicker center reveal">Your own server</p>
+    <h2 id="tinyserver-title" class="center reveal">Tiny server</h2>
+    <p class="lede center reveal">A voice server you run for your own community, laid out like a Discord server, with tinyclient as its app. Open source, MIT.</p>
+    <ul class="points reveal">
+      <li class="spot"><span class="pt-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M11 4.7a.7.7 0 0 0-1.2-.5L6.4 7.6A1.4 1.4 0 0 1 5.4 8H3a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2.4a1.4 1.4 0 0 1 1 .4l3.4 3.4a.7.7 0 0 0 1.2-.5z"/><path d="M16 9a5 5 0 0 1 0 6"/><path d="M19.4 18.4a9 9 0 0 0 0-12.8"/></svg></span><strong>Voice rooms</strong><span>Categories, channels and seats, with echo&nbsp;cancellation.</span></li>
+      <li class="spot"><span class="pt-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg></span><strong>Encrypted</strong><span>Calls are end-to-end encrypted, with safety&nbsp;numbers.</span></li>
+      <li class="spot"><span class="pt-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M20 13c0 5-3.5 7.5-7.7 9a1 1 0 0 1-.7 0C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.2-2.7a1.2 1.2 0 0 1 1.5 0C14.5 3.8 17 5 19 5a1 1 0 0 1 1 1z"/></svg></span><strong>Moderated</strong><span>Roles, permissions, invites, bans and an audit&nbsp;log.</span></li>
+      <li class="spot"><span class="pt-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="8" rx="2"/><rect x="2" y="13" width="20" height="8" rx="2"/><path d="M6 7h.01M6 17h.01"/></svg></span><strong>Yours</strong><span>Docker Compose, passkeys through Pocket&nbsp;ID, one open&nbsp;port.</span></li>
+    </ul>
+    <p class="more center"><a href="tinyserver.html">Everything a Tiny server does →</a></p>
   </div>
 </section>
 
@@ -477,7 +503,7 @@
     <div class="faq reveal">
       <details>
         <summary>Will my computer warn me the first time?</summary>
-        <p>Yes. The macOS app is signed ad hoc, not notarized by Apple: open System Settings &rsaquo; Privacy &amp; Security and choose Open Anyway. The Windows installer is Authenticode-signed. SmartScreen names the publisher and may still stop a new certificate: choose More info &rsaquo; Run anyway. <a href="docs/#macos">Installing →</a></p>
+        <p>Yes. The macOS app is signed ad hoc, not notarized by Apple: open System Settings &rsaquo; Privacy &amp; Security and choose Open Anyway. The Windows installer is not code-signed, so SmartScreen may say Windows protected your PC: choose More info &rsaquo; Run anyway. <a href="docs/#macos">Installing →</a></p>
       </details>
       <details>
         <summary>Do the networks allow it?</summary>
@@ -485,15 +511,19 @@
       </details>
       <details>
         <summary>Does it connect to anything besides the networks?</summary>
-        <p>One update check. About once an hour while the window is open, it asks GitHub whether a newer release exists, and sends only <code>tinyclient/&lt;version&gt;</code>. No analytics, no crash upload. <a href="docs/privacy.html">Privacy &amp; security →</a></p>
+        <p>One update check. About once an hour while the window is open, it asks GitHub whether a newer release exists, and sends only <code>tinyclient/&lt;version&gt;</code>. If you add a Tiny server, it also talks to that server, and your browser to the server&rsquo;s sign-in page. No analytics, no crash upload. <a href="docs/privacy.html">Privacy &amp; security →</a></p>
       </details>
       <details>
         <summary>Is what it stores encrypted?</summary>
         <p>Sessions live in your system&rsquo;s keychain, and Signal&rsquo;s keys are sealed with a key held only there. The message and media cache is not encrypted by tinyclient, so keep your disk encryption on: FileVault, BitLocker or LUKS.</p>
       </details>
       <details>
+        <summary>Will it notify me?</summary>
+        <p>Yes, for direct messages and mentions by default, even with the window closed. One notification per conversation, taken away once you read it. Calls ring with Accept and Decline. Settings &rsaquo; Notifications chooses what notifies, how much it shows, its sounds and quiet hours. The taskbar button or Dock icon shows the count. <a href="docs/using.html#notifications">Notifications →</a></p>
+      </details>
+      <details>
         <summary>How does it update?</summary>
-        <p>While the window is open, it asks GitHub about once an hour whether a newer release exists, and tells you when one does. With automatic install on, it downloads the release, checks it against that release&rsquo;s checksums, and replaces itself when you quit. The Linux packages are not in a repository, so install a newer download the same way. <a href="docs/using.html#updates">Updates →</a></p>
+        <p>While the window is open, it asks GitHub about once an hour whether a newer release exists, and tells you when one does. With automatic install on, it downloads the release, checks it against that release&rsquo;s checksums, and replaces itself when you quit. On Windows, a failed swap is rolled back and reported in About. The Linux packages are not in a repository, so install a newer download the same way. <a href="docs/using.html#updates">Updates →</a></p>
       </details>
       <details>
         <summary>I want another network added.</summary>
@@ -573,6 +603,7 @@
           <li><a href="https://discord.gg/kJHK7BNvJP">Discord</a></li>
           <li><a href="https://github.com/itz4blitz/tinyclient">Source on GitHub</a></li>
           <li><a href="https://github.com/itz4blitz/tinyclient/releases">Releases</a></li>
+          <li><a href="tinyserver.html">Tiny server</a></li>
           <li><a href="docs/contributing.html">Contributing</a></li>
         </ul>
       </nav>

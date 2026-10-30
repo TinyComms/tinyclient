@@ -39,6 +39,17 @@
       ]
     },
     {
+      "identifier": "urn:air:tinyclient.io:page:tinyserver",
+      "displayName": "Tiny server",
+      "type": "text/html",
+      "url": "https://tinyclient.io/tinyserver",
+      "representativeQueries": [
+        "what is a Tiny server",
+        "how do I host my own voice server for tinyclient",
+        "are Tiny server calls end-to-end encrypted"
+      ]
+    },
+    {
       "identifier": "urn:air:tinyclient.io:docs:privacy",
       "displayName": "Privacy and security",
       "type": "text/html",

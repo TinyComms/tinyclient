@@ -15,7 +15,7 @@ use gpui::{
     div, prelude::*, px, AnyElement, App, Context, Div, MouseButton, MouseMoveEvent, Pixels, Point, Rgba,
     SharedString, Window, WindowControlArea,
 };
-use protocol::{Conversation, Key, Link, Network, Presence};
+use protocol::{CallState, Conversation, Key, Link, Network, Presence};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -344,6 +344,8 @@ impl Shell {
             self.close_switcher(window, cx);
         } else if self.layout_state.menu.is_some() {
             self.layout_state.menu = None;
+        } else if self.tiny_escape(cx) {
+            return true;
         } else if self.layout_state.floating {
             self.layout_state.floating = false;
         } else {
@@ -694,9 +696,26 @@ impl Shell {
             Menu::Row(conversation, position) => {
                 let (key, starred) = (conversation.key.clone(), conversation.starred);
                 let unpinned = conversation.clone();
+                let join = conversation.clone();
                 let space = conversation.space.as_ref().map(|space| Key { id: space.clone(), ..conversation.key.clone() });
+                let ours = self
+                    .snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.call.as_ref())
+                    .map_or(false, |call| {
+                        call.conversation == conversation.key
+                            && !matches!(call.state, CallState::Failed { .. })
+                    });
+                let joinable = super::sidebar::joins_from_list(&*conversation) && !ours;
                 let items = menu()
                     .w(px(220.))
+                    // A native voice channel joins from its menu too; a stage never does (07 §1).
+                     .children(joinable.then(|| {
+                        menu_item("join", Some("icons/volume-2.svg"), "Join voice", None).on_click(cx.listener(move |this, _, _, cx| {
+                            this.close_menu(cx);
+                            this.call_start(join.key.clone(), cx);
+                        }))
+                    }))
                     .child(
                         menu_item("star", Some("icons/pin.svg"), if starred { "Unpin from Inbox" } else { "Pin to top of Inbox" }, None)
                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -956,6 +975,7 @@ impl Render for Shell {
                 )
             })
             .children(self.switcher(window, cx))
+            .children(self.tiny_layer(window, cx))
             .children(self.menu_layer(snapshot, plan.sidebar.unwrap_or(state.sidebar_width), overview, window, cx))
             .children(self.toast_layer(width, cx))
             .children(window_chrome(window))

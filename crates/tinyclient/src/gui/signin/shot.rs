@@ -1,12 +1,13 @@
 //! `--shot` only: a made-up step for design review, so every face of the sheet can be drawn
 //! with no Telegram and no sign-in begun. `TINYCLIENT_SIGNIN_SHOT` names the state: `qr-waiting`,
 //! `qr`, `qr-offline`, `phone`, `phone-error`, `code`, `code-sms`, `code-wrong`, `code-expired`,
-//! `code-toomany`, `code-later`, `password`, `password-wrong`, `failed`, `unsupported`.
+//! `code-toomany`, `code-later`, `password`, `password-wrong`, `failed`, `unsupported`, and on a
+//! Tiny server's sheet `tiny-invite` (a code pasted) and `tiny-browser` (waiting on the browser).
 //! chatd is never asked about the sign-in while one is on show.
 
 use super::{now, Face};
 use crate::gui::time::clock;
-use protocol::{CodeVia, SignInProblem, SignInStep};
+use protocol::{CodeVia, Network, SignInProblem, SignInStep};
 
 /// What to draw, and what the fields hold as if it had been typed.
 pub(super) struct Canned {
@@ -15,7 +16,14 @@ pub(super) struct Canned {
     pub digits: &'static str,
     pub password: &'static str,
     pub local: Option<SignInProblem>,
+    /// Whose sheet: Telegram's, unless the state is a Tiny one.
+    pub network: Network,
+    /// The invite code, as if pasted.
+    pub invite: String,
 }
+
+/// The demo's Tiny server, as its invites name it.
+const TINY: &str = "https://nightshift.example";
 
 /// A link of the shape Telegram issues: the scheme, then 43 letters of base64url. It signs
 /// nobody in.
@@ -38,7 +46,7 @@ pub(super) fn canned() -> Option<Canned> {
     let qr = |link: &str, problem| SignInStep::Qr { link: link.to_owned(), expires: 0, problem };
     let password = |problem| SignInStep::Password { hint: "the old street".to_owned(), problem };
     let sms = Some(CodeVia::Sms);
-    let mut canned = Canned { face: Face::Step(qr("", None)), number: "", digits: "", password: "", local: None };
+    let mut canned = Canned { face: Face::Step(qr("", None)), number: "", digits: "", password: "", local: None, network: Network::Telegram, invite: String::new() };
     let step = match name.as_str() {
         "qr-waiting" => qr("", None),
         "qr" => qr(LINK, None),
@@ -70,6 +78,15 @@ pub(super) fn canned() -> Option<Canned> {
             password(None)
         }
         "password-wrong" => password(Some(SignInProblem::PasswordInvalid)),
+        "tiny-invite" => {
+            canned.network = Network::Tiny;
+            canned.invite = protocol::pack_join(TINY, "Nf3kQ8xLw2pZ7rT1").unwrap_or_default();
+            SignInStep::Invite { server: String::new(), problem: None }
+        }
+        "tiny-browser" => {
+            canned.network = Network::Tiny;
+            SignInStep::Browser { server: TINY.to_owned(), provider: "Pocket ID".to_owned(), waiting: true, problem: None }
+        }
         "failed" => SignInStep::Failed { reason: "Telegram ended this sign-in. Start again to get a new code.".to_owned() },
         "unsupported" => {
             canned.face = Face::Unsupported("This build of tinyclient has no Telegram app id, so it can't sign in to Telegram.".to_owned());

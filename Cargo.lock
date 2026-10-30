@@ -1093,7 +1093,7 @@ dependencies = [
 
 [[package]]
 name = "chatd"
-version = "0.2.15"
+version = "0.2.22"
 dependencies = [
  "aes 0.8.4",
  "aes-gcm",
@@ -1120,6 +1120,7 @@ dependencies = [
  "keyring",
  "libc",
  "miniz_oxide 0.8.9",
+ "notifier",
  "p256",
  "presage",
  "protocol",
@@ -5129,7 +5130,7 @@ dependencies = [
 
 [[package]]
 name = "login"
-version = "0.2.15"
+version = "0.2.22"
 dependencies = [
  "block2 0.6.2",
  "embed-resource",
@@ -5138,6 +5139,7 @@ dependencies = [
  "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",
  "objc2-web-kit",
+ "protocol",
  "serde_json",
  "sha2 0.10.9",
  "tao",
@@ -5289,9 +5291,10 @@ checksum = "7ebb8d8732c6a6df3d8f032a82911cfc747e00efb95cc46e8d0acd5b5b88570c"
 
 [[package]]
 name = "mediad"
-version = "0.2.15"
+version = "0.2.22"
 dependencies = [
  "aes-gcm",
+ "base64 0.22.1",
  "chacha20poly1305",
  "cpal",
  "davey",
@@ -5305,10 +5308,12 @@ dependencies = [
  "rand 0.8.8",
  "serde_json",
  "sha2 0.10.9",
+ "sonora",
  "str0m",
  "symphonia",
  "tungstenite 0.30.0",
  "unsafe-libopus",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5550,6 +5555,19 @@ name = "noop_proc_macro"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0676bb32a98c1a483ce53e500a81ad9c3d5b3f7c920c28c24e9cb0980d0b5bc8"
+
+[[package]]
+name = "notifier"
+version = "0.2.22"
+dependencies = [
+ "block2 0.6.2",
+ "objc2 0.6.5",
+ "objc2-app-kit 0.3.2",
+ "objc2-foundation 0.3.2",
+ "objc2-user-notifications",
+ "windows 0.62.2",
+ "zbus",
+]
 
 [[package]]
 name = "notify-rust"
@@ -7222,7 +7240,7 @@ dependencies = [
 
 [[package]]
 name = "protocol"
-version = "0.2.15"
+version = "0.2.22"
 dependencies = [
  "interprocess",
  "serde",
@@ -8596,6 +8614,79 @@ dependencies = [
 ]
 
 [[package]]
+name = "sonora"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e1ce442ab5cb392c4067b8f2cced20be4cf12e479f6dfbf44acbe9b14ac9250"
+dependencies = [
+ "sonora-aec3",
+ "sonora-agc2",
+ "sonora-common-audio",
+ "sonora-ns",
+ "sonora-simd",
+ "tracing",
+]
+
+[[package]]
+name = "sonora-aec3"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "50280e31256d09f7838aff6715ed4b7640e514dc1092a1e14013c01e552380db"
+dependencies = [
+ "sonora-common-audio",
+ "sonora-fft",
+ "sonora-simd",
+]
+
+[[package]]
+name = "sonora-agc2"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9a93a9fa8373a33e61a7fb441d8a9e725ac6024079d2c77a845cf6abe1790b9f"
+dependencies = [
+ "bytemuck",
+ "derive_more",
+ "sonora-common-audio",
+ "sonora-fft",
+ "sonora-simd",
+ "tracing",
+]
+
+[[package]]
+name = "sonora-common-audio"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6635bc61b24807ceac93ad0807b1292b6b0620caa6cd360d3be89fc616b833cc"
+dependencies = [
+ "derive_more",
+ "sonora-simd",
+]
+
+[[package]]
+name = "sonora-fft"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "27e272c70f34363afb5382dd1818c05f8f63ef6785635736a14e9ccbbb5ba012"
+
+[[package]]
+name = "sonora-ns"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d511feef19302c716d245c4555087d161ba91c178735ea11107dcce0d0b7a86f"
+dependencies = [
+ "sonora-fft",
+]
+
+[[package]]
+name = "sonora-simd"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7cf0804e4752a5562262e143014f53043080ead4cd5a98f9278d3ceaf32d868"
+dependencies = [
+ "cpufeatures 0.3.1",
+]
+
+[[package]]
 name = "sorted-vec"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9387,13 +9478,14 @@ dependencies = [
 
 [[package]]
 name = "tinyclient"
-version = "0.2.15"
+version = "0.2.22"
 dependencies = [
  "embed-resource",
  "gpui",
  "gpui_platform",
  "image",
  "libc",
+ "notifier",
  "protocol",
  "serde_json",
  "sha2 0.10.9",

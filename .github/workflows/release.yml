@@ -17,6 +17,10 @@ on:
         description: Publish a GitHub release. Only when run on a v* tag.
         type: boolean
         default: false
+      announce:
+        description: Post this version to Discord, such as 0.2.21. Does not build.
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -26,6 +30,19 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  note:
+    if: github.event_name == 'workflow_dispatch' && inputs.announce != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Post the release to Discord
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          VERSION: ${{ inputs.announce }}
+          RELEASE_URL: https://github.com/${{ github.repository }}/releases/tag/v${{ inputs.announce }}
+        run: packaging/release-note.sh
+
+
   macos:
     runs-on: macos-latest
     steps:
@@ -264,7 +281,4 @@ jobs:
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           RELEASE_URL: ${{ steps.release.outputs.url }}
-        run: |
-          [ -n "$DISCORD_WEBHOOK_URL" ] || exit 0
-          payload=$(jq -n --arg content "**tinyclient $VERSION is out.** Download: $RELEASE_URL Checksums are in SHA256SUMS on the release page." '{content: $content}')
-          curl -fsS -H "Content-Type: application/json" -d "$payload" "$DISCORD_WEBHOOK_URL"
+        run: packaging/release-note.sh

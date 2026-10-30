@@ -827,6 +827,7 @@ mod tests {
             last_read: None,
             call: CallSupport::None,
             occupants: None,
+            limit: 0,
             read_only: false,
             private: false,
             draft: String::new(),
@@ -844,6 +845,8 @@ mod tests {
             preview_from: String::new(),
             preview_mine: false,
             seen: false,
+            delivered: false,
+            sending: false,
         }
     }
 

@@ -670,6 +670,59 @@ fn sending_editing_deleting_and_reacting_wait_for_telegram() {
 }
 
 #[test]
+fn a_public_username_resolves_a_person_outside_contacts_and_global_search_results() {
+    let world = World::signed_in();
+    world.connected();
+    let request = || Request::People {
+        network: Some(Network::Telegram), relation: None, query: Some("@forest_wren".into()), offset: 0, limit: 20,
+    };
+    let Response::People { people, .. } = world.ask(request()) else { panic!("no people response") };
+    assert!(people.is_empty());
+    let person = world.until("the public username to resolve", || match world.ask(request()) {
+        Response::People { people, .. } => people.into_iter().find(|p| p.key.id == "u7011"),
+        _ => None,
+    });
+    assert_eq!((person.name.as_str(), person.handle.as_str(), person.relation), ("Robin Vale", "@forest_wren", Relation::None));
+    let calls = world.calls();
+    let search = calls.iter().position(|call| call == "contacts.Search @forest_wren").unwrap();
+    let resolve = calls.iter().position(|call| call == "ResolveUsername forest_wren").unwrap();
+    assert!(search < resolve);
+    assert_eq!(calls.iter().filter(|call| *call == "contacts.Search @forest_wren").count(), 1);
+    // Cache lookup strips the explicit lookup marker, matching both handles and names.
+    for query in ["@rob", "@forest_wren"] {
+        let Response::People { people, total } = world.ask(Request::People {
+            network: Some(Network::Telegram), relation: None, query: Some(query.into()), offset: 0, limit: 20,
+        }) else { panic!("no people response") };
+        assert_eq!(total, 1);
+        assert_eq!(people[0].key.id, "u7011");
+    }
+    let Response::Conversation { conversation } = world.ask(Request::StartDirect { person: person.key }) else { panic!("no direct chat") };
+    assert_eq!(conversation.key.id, "u7011");
+}
+
+#[test]
+fn username_resolution_requires_an_explicit_valid_handle_and_skips_flood_waits() {
+    let world = World::signed_in();
+    world.connected();
+    for query in ["ro", "rob", "robin", "forest_wren", "@ro", "@robin-vale", "@1robin", "@@robin", "@abcdefghijklmnopqrstuvwxyzabcdefg", "@flood_wait", "@missing_user"] {
+        world.ask(Request::People {
+            network: Some(Network::Telegram), relation: None, query: Some(query.into()), offset: 0, limit: 20,
+        });
+        world.within(Duration::from_secs(5), "search without waiting out a flood", || {
+            world.calls().contains(&format!("contacts.Search {query}")).then_some(())
+        });
+    }
+    // A later send proves the optional lookup did not stall the command thread.
+    world.send("u7002", "6099", "after lookup", None);
+    world.within(Duration::from_secs(5), "send after lookup", || {
+        world.messages("u7002").into_iter().find(|m| m.text == "after lookup" && m.state == SendState::Sent)
+    });
+    let calls = world.calls();
+    let resolves: Vec<_> = calls.iter().filter(|call| call.starts_with("ResolveUsername ")).map(String::as_str).collect();
+    assert_eq!(resolves, ["ResolveUsername flood_wait", "ResolveUsername missing_user"]);
+}
+
+#[test]
 fn a_flood_wait_is_slept_in_full_and_a_long_one_is_told_not_retried() {
     let world = World::signed_in();
     world.connected();

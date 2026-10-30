@@ -525,6 +525,7 @@ impl Demo {
                 speaking: false,
                 muted: occupant.muted,
                 deafened: occupant.deafened,
+                ..Participant::default()
             });
             demo.ctx.participants(conversation_id, roster.collect());
         }
@@ -558,7 +559,7 @@ impl Demo {
             demo.ctx.answered(&conversation_id);
             let peer = demo.ctx.known(&conversation_id).ok().flatten().and_then(|row| Some((row.peer?, row.title)));
             if let Some((id, name)) = peer {
-                let them = Participant { id, name, speaking: false, muted: false, deafened: false };
+                let them = Participant { id, name, ..Participant::default() };
                 demo.ctx.participants(&conversation_id, vec![them]);
             }
         });
@@ -671,6 +672,7 @@ impl Demo {
             Command::Previews(ids) => demo.previews(&ids),
             Command::Members { conversation_id, offset, limit, reply } => drop(reply.send(demo.members(&conversation_id, offset, limit))),
             Command::StartDirect { person_id, reply } => drop(reply.send(demo.start_direct(&person_id))),
+            Command::StartThread { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SearchPeople(query) => demo.ctx.searched(&query),
             Command::Download { url, reply, .. } => drop(reply.send(Ok(Download { url, headers: Vec::new() }))),
             Command::Handoff { conversation_id, reply } => {

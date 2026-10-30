@@ -143,9 +143,9 @@ The full sound design is in the next section. The controls:
 | S4 | Ring | Picker: 2 bundled rings, "System alert sound", "None" | "Soft ring" | G | d | The sound on the incoming-call notification | v1 |
 | S5 | Per account: Message sound | Menu: "Default", the 5 sounds, "System alert sound", "None" | Default | A | d | Overrides S2 and S3 for one account, so work and friends sound different | v1 |
 | S6 | Per conversation: Sound | In Conversation › Notifications…: "Default", the 5 sounds, "System alert sound", "None" | Default | C | d | Overrides S5 for one conversation. Local only; the network never sees it | v1 |
-| S7 | In calls: someone joins or leaves | Switch | On | G | d | mediad plays the join or leave cue | v1 |
+| S7 | In calls: someone joins or leaves, or I am moved | Switch | On | G | d | mediad plays the join, leave or moved cue | v1 |
 | S8 | In calls: I mute, unmute, deafen or undeafen | Switch | On | G | d | mediad plays the matching cue | v1 |
-| S9 | In calls: connection lost or back | Switch | On | G | d | mediad plays the matching cue | v1 |
+| S9 | In calls: connection lost, back or ended | Switch | On | G | d | mediad plays the matching cue; "ended" is being kicked, banned, timed out or the room deleted | v1 |
 | S10 | Call sound volume | Slider 0 to 100 % | 50 % | G | d | Gain on the cues in S7 to S9 only. Voices are not affected | v1 |
 | S11 | Play | A small play button beside S2, S3, S4, S5 | | | | Plays that sound once, on the device the notification would use (below) | v1 |
 | S12 | Play test sound | Button beside S10 | | | | mediad plays the join cue at S10's volume on the call speaker (V2) | v1 |
@@ -194,15 +194,24 @@ no control.
 
 | # | Setting | Type | Default | Scope | Home | What it changes | Rel |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| V1 | Microphone | Menu: "System default (name)" then devices | System default | G | d | chatd sends it to mediad right after `Join`. Shown by name; a missing device falls back to the default and the menu says "(not connected)" | v1 |
-| V2 | Speaker | Menu, as V1 | System default | G | d | As V1, for output. Also where S12 plays | v1 |
+| V1 | Microphone | Menu: "Automatic (name)", "System default (name)", hardware, then virtual devices marked "(virtual)" | Automatic | G | d | The same choice as the call's device menu, stored by name and the system's id (WASAPI endpoint id, CoreAudio UID). chatd sends it to mediad at start and whenever it changes, mid-call too. Automatic is the system default unless that is a virtual device (Krisp, VB-Cable, Voicemeeter, NVIDIA Broadcast, Steam Streaming), then a headset or speakers; System default follows the system live. A missing or failing device is stood in for, said in words, and switched back to when it returns; the menu says "(not connected)" | v1 |
+| V2 | Speaker | Menu, as V1 | Automatic | G | d | As V1, for output. Also where S12 plays | v1 |
 | V3 | Test microphone | Button, "Test" / "Stop" (a toggle, design 09 §4) | | | | While on, the 20-segment meter is live, for at most 30 s. Outside a call, mediad starts for it (`mediad test`) and exits within 3 s of Stop | v1 |
 | V4 | Join calls with my microphone muted | Switch | Off | G | d | On: every join and every Accept starts muted, and the dock shows it | v1 |
 | V5 | Call volume | Slider 0 to 100 % | 100 % | G | d | Gain on everyone's voice in mediad's mix. 100 % is today's level | v1 |
 | V6 | Microphone sensitivity | Slider over the live meter, with "Default" mark | 25 (today's `VOICE`) | G | d | The voice gate threshold in mediad: below it, nothing is sent and no speaking ring shows | v1 |
 | V7 | Camera | Menu | | G | d | | Later, with camera |
-| V8 | Push to talk | Switch and key | | G | d | | Later |
-| V9 | Per-person volume | Row menu in the participant list | | C | d | | Later (07) |
+| V8 | Microphone opens by | Segmented: Voice activation / Push to talk (Settings › Voice) | Voice activation | G | d | `push_to_talk`: mediad's `Input` is push-to-talk with the V14 delay instead of the V6 gate. A Tiny room that requires it (or where voice activation is not allowed) is push-to-talk whatever this says | v1 |
+| V9 | Per-person volume | Row menu in the participant list | 100 %, heard | A | d | `CallGain {account, user_id, percent, muted}`, kept as `gain:<user id>` in the account's scope and sent to mediad as `Gain`, 0 to 200 % | chatd and mediad done; the row menu is the participant list's (07 §7a) |
+| V10 | Echo cancellation | Switch | On | G | d | `echo_cancellation`, in mediad's `Processing`: WebRTC AEC3 (sonora) with the call's mix as its reference | v1 |
+| V11 | Noise suppression | Switch | On | G | d | `noise_suppression`, as V10 | v1 |
+| V12 | Automatic gain | Switch | On | G | d | `auto_gain`, as V10 (AGC2, adaptive digital) | v1 |
+| V13 | Push-to-talk key | Key recorder | None | G | s | `ptt_key`, a `hotkey::Binding` (`f13`, `ctrl+shift+t`, `mouse4`, `ctrl`). The shell watches it in any app and sends `CallTalk` | v1 |
+| V14 | Release delay | Stepped slider: 0, 100, 200, 300, 500 or 1000 ms | 200 ms | G | d | `ptt_release_ms` | v1 |
+| V15 | Priority push-to-talk key | Key recorder | None | G | s | `priority_key`; `CallTalk {priority}`, and `call.state` `priority` on a Tiny server | v1 |
+| V16 | Toggle mute key | Key recorder | None | G | s | `mute_key`; does what ⌘⇧M does, in any app | v1 |
+| V17 | Toggle deafen key | Key recorder | None | G | s | `deafen_key`; as ⌘⇧D | v1 |
+| V18 | Hear yourself while testing | Switch | Off | | | The window's own: V3's test plays the processed microphone back (`TestMicrophone {loopback}`, mediad `Loopback`), outside a call | v1 |
 
 The device menu in the call dock gains "Play test sound" (S12) and "Call settings…", which opens
 this section. Picking a device in the dock changes the call and not the default; the dock marks
@@ -476,8 +485,10 @@ notification delivered by the system, read with `log stream --predicate 'subsyst
 - P4: 7 days: rows older than 7 days are gone within 1 min (`sqlite3` count is 0).
 
 **Audio & video**
-- V1, V2: set a device, start a call: `status` names it; unplug it: the call moves to the
-  default, the menu says "(not connected)", the setting is unchanged.
+- V1, V2: set a device, start a call: `status` names it; unplug it: the call moves to a
+  stand-in (never a virtual device), the dock and menu say so, the setting is unchanged; plug it
+  back in: the call moves back within 2 s. Pick a device in the call's menu, leave, quit,
+  rejoin: the call uses it.
 - V3: outside a call, hold: the meter moves; release: no mediad within 3 s.
 - V4: on, join: mediad sends no audio packets until unmuted; the dock shows muted.
 - V5: at 50 %, a tone from the peer plays at −6 dB ±1 dB relative to 100 %.
@@ -525,11 +536,40 @@ search:
 - **Sounds:** the seven bundled files are rendered and committed, checked against a manifest on
   macOS. They are not copied into the bundle until notifications post them.
 
+### Notifications built (2026-10-28)
+
+Step 6 is in, on Windows first. chatd posts (`chatd/src/notify.rs`), through the `notifier` crate:
+WinRT toasts on Windows, UNUserNotificationCenter on macOS (inside the bundle only), and
+org.freedesktop.Notifications on Linux.
+
+- **Notifications:** N1, N2, N4 (and its locked-screen twin, read from the session's WTS lock
+  state on Windows), N5, N6, N7 (1 hour, until 08:00, until resumed), N8 with its two times,
+  N9, N10 (taskbar flash on Windows, Dock bounce on macOS), N11 (the taskbar overlay or Dock
+  badge, the `ATTENTION` total), N13. Each kind has a switch of its own: direct messages, group
+  chats, mentions in channels, Tiny servers. N3 and the per-conversation level are honoured by
+  chatd (`notify_about` in the account's or conversation's scope); N3 has no row yet.
+- **Behaviour with no setting:** all of the list above the Sounds table: never the conversation
+  open in the focused window (`Watching.focused`), never mine, never history at connect (older
+  than 2 minutes when heard), never muted; one notification per conversation, its newest three
+  lines, replaced in place and withdrawn when the row is read anywhere; Reply and Mark as read;
+  a click opens the window there, starting it if it is closed; the network's Do Not Disturb (my
+  own presence `dnd`) holds it back. The ring is posted with Accept and Decline and withdrawn
+  when it stops.
+- **Sounds:** S1 now silences notifications too; S2, S3, S4 with S11's play buttons; S5 and S6
+  are honoured, and S6 is set in Details beside the conversation's notifications. Windows and
+  Linux post silent and chatd plays the sound itself (`mediad --sound`, rendered from the same
+  code as the files), at a notification volume of its own (`alert_volume`, shown where it
+  applies). The silence rules are applied in the order above.
+- A scratch directory (`TINYCLIENT_DIR`) posts nothing unless `TINYCLIENT_NOTIFY=on`, so tests
+  never do. `tinyclient --notify-test` posts N13 from a terminal.
+
 Not built yet, and so absent from the window: G1 (needs a login item that starts chatd alone, in
-the signed bundle), the whole Notifications section with N1 to N13, S2 to S6 and S11 (step 6: the
-notification spike), A1 (step 7: light tokens and contrast), the Accounts row menu that opens them,
-and VPIO with `OPUS_APPLICATION_VOIP` (V-notes). Search answers "notifications", "theme",
-"login" and the Later terms with a line saying so.
+the signed bundle), N3's rows, the permission banners of design 06, A1 (step 7: light tokens and
+contrast), the Accounts row menu, the menu bar's Notifications… popover (Details carries its two
+controls), and VPIO with `OPUS_APPLICATION_VOIP` (V-notes). "System alert sound" is not offered:
+an unpackaged Windows app could only name the system's sounds, and chatd plays ours.
+`packaging/bundle.sh` copies the seven CAF files into the bundle's Resources, where macOS finds
+them by name. Search answers "theme", "login" and the Later terms with a line saying so.
 
 ### v1, build now
 

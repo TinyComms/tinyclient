@@ -159,6 +159,52 @@ pub fn menu_item_danger(
     menu_row(id, icon, label, None, theme::danger(), theme::danger(), theme::danger_soft())
 }
 
+/// An item that opens a submenu beside it: its label, then a chevron. `open` keeps it lit
+/// while the submenu shows.
+pub fn menu_item_more(
+    id: impl Into<ElementId>,
+    icon: Option<&'static str>,
+    label: impl Into<SharedString>,
+    open: bool,
+) -> Stateful<Div> {
+    menu_row(id, icon, label, None, theme::text(), theme::text_soft(), theme::selected())
+        .when(open, |row| row.bg(theme::selected()))
+        .child(glyph("icons/chevron-right.svg", 14., theme::text_faint()))
+}
+
+/// A slider's track and knob, `width` wide, filled to `at` (0 to 1). `mark` draws a tick
+/// under the track where the default is. The caller takes the pointer and turns its position
+/// into a value with [`slider_value`].
+pub fn slider(at: f32, width: f32, mark: Option<f32>) -> Div {
+    let at = at.clamp(0., 1.) * width;
+    div()
+        .relative()
+        .flex_none()
+        .w(px(width))
+        .h(px(24.))
+        .child(div().absolute().top(px(10.)).left_0().w(px(width)).h(px(4.)).rounded(px(2.)).bg(theme::border_strong()))
+        .child(div().absolute().top(px(10.)).left_0().w(px(at)).h(px(4.)).rounded(px(2.)).bg(theme::accent()))
+        .children(mark.map(|mark| div().absolute().top(px(17.)).left(px(mark.clamp(0., 1.) * width - 1.)).w(px(2.)).h(px(6.)).bg(theme::text_faint())))
+        .child(
+            div()
+                .absolute()
+                .top(px(4.))
+                .left(px(at - 8.))
+                .size(px(16.))
+                .rounded_full()
+                .bg(gpui::rgb(0xf4f4f6))
+                .shadow(theme::shadow_tooltip()),
+        )
+}
+
+/// Where along a slider `x` falls, 0 to 1, given the track's left edge and width.
+pub fn slider_value(x: f32, left: f32, width: f32) -> f32 {
+    if width <= 0. {
+        return 0.;
+    }
+    ((x - left) / width).clamp(0., 1.)
+}
+
 pub fn menu_separator() -> Div {
     div().flex_none().my(px(4.)).h(px(1.)).bg(theme::hairline())
 }

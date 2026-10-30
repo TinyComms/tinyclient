@@ -357,6 +357,7 @@ impl Sheet {
     #[cfg(feature = "gui-shot")]
     fn show_canned(&mut self, canned: shot::Canned, cx: &mut Context<Sheet>) {
         self.canned = true;
+        self.network = canned.network;
         self.clear_fields(cx);
         match canned.face {
             Face::Step(step) => self.show(step, cx),
@@ -366,6 +367,7 @@ impl Sheet {
         self.number.update(cx, |input, cx| input.set_text(canned.number, cx));
         self.digits.update(cx, |input, cx| input.set_text(canned.digits, cx));
         self.password.update(cx, |input, cx| input.set_text(canned.password, cx));
+        self.invite.update(cx, |input, cx| input.set_text(&canned.invite, cx));
         self.local = canned.local;
         self.refocus = true;
         cx.notify();
@@ -588,6 +590,10 @@ impl Sheet {
             SignInStep::Qr { link, .. } => {
                 if self.code.as_ref().is_none_or(|(old, _)| old != link) {
                     self.code = qr::encode(link.as_bytes()).map(|code| (link.clone(), Rc::new(code)));
+                    // Said, not left at "Getting a code" for good.
+                    if self.code.is_none() {
+                        self.local = Some(SignInProblem::Other { reason: "This code is too long to draw. Try again.".to_owned() });
+                    }
                 }
             }
             _ => self.code = None,

@@ -77,11 +77,14 @@ One 12 px glyph after the timestamp of **my newest message only**; older ones ar
 |---|---|---|
 | Pending | none; row at opacity 0.55 | all |
 | Waiting (link down, under 60 s) | none; line under the body `Waiting for Slack…`, `text_faint` | all |
-| Sent | `check`, `text_faint` | Telegram, Teams, direct chats |
-| Read | `check-check`, `accent`; tooltip `Read 9:41 AM`, or `Read` | Telegram, Teams, direct chats |
+| Sent | `check`, `text_faint`; tooltip `Sent` | all |
+| Delivered | `check-check`, `text_faint`; tooltip `Delivered` | Signal, Google Messages |
+| Read | `check-check`, `accent`; tooltip `Read 9:41 AM`, or `Read` | Telegram, Teams, Signal, Google Messages |
 | Failed | `circle-alert`, `danger`; line `Not sent · Retry · Delete · <reason>` | all |
 
-Discord and Slack have no receipts, so a sent message there shows nothing. Groups show nothing.
+Discord and Slack have no receipts, so a sent message there keeps the one `check`: it says the network has it. The
+mark is on my newest message only while it is the newest in the conversation; a grouped row without a header carries
+it at the row's right edge, on the first line (`03-conversation.md` §9).
 
 ## 5. Connection states
 Rail link dot: 7 px in an 11 px `rail` ring at the icon's bottom right. Sidebar strip: 28 px, radius 8, under the
@@ -105,6 +108,10 @@ search field, in Network and Space mode for that network; 12 px text, 14 px glyp
   `Slack signed you out` / `Open tinyclient to sign in again.`
 
 ## 6. Notifications
+Built (2026-10-28): chatd posts them (`chatd/src/notify.rs`, through `crates/notifier`). Windows shows them as toasts
+under the AppUserModelID the installer's shortcut carries; Reply and Mark as read are toast buttons, the reply a text
+field. Missed-call, after-reconnect and reply-failed notifications are not posted yet; Thread replies post as their
+thread's conversation.
 Posted for states 1 and 2 only. Never for state 3, my own messages, history at connect, or the conversation open in
 the key window. Key window on another conversation: banner without sound.
 

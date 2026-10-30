@@ -33,9 +33,8 @@ invents a Space (03 §2.1, 04 §2.1).
 - **Folder tabs:** system `Tabs` (13/500 `text_soft`, padding 0 8, 4 apart; selected `text` with a 2 pt bar).
   - The count is Telegram's: unread unmuted *chats*, unfilled; an accent pill when a mention is inside; none at 0.
     `All` has no count, because the rail holds it.
-  - Overflow: the strip scrolls sideways and keeps the selection in view. A 28 `chevron-down` on an opaque `sidebar`
-    patch opens every folder with its count, plus "Edit folders in Telegram".
-  - Right-click a tab: Mark all read · Pin to rail · Open in Telegram. The choice is remembered per account; with no
+   - Overflow: the strip scrolls sideways and keeps the selection in view. 24 chevron arrows flank the tab bar; they dim to
+     0.35 opacity when the scroll position is at an edge and are hidden entirely when there is no horizontal overflow.
     folders there is no strip.
 - **Folder on the rail (P2):** a 40 tile, radius 10, `raised`, holding the folder's emoji or `folder` 20, with a 16
   Telegram badge as pinned Spaces have. A click opens the home on that tab.
@@ -55,8 +54,9 @@ invents a Space (03 §2.1, 04 §2.1).
 | Telegram 777000 | Telegram icon 32 | `badge-check` | codes in full; read-only, no Call, never muted |
 | Scam / Fake | as its kind | danger tag `Scam` / `Fake`, always | outranks verified |
 
-- **Ticks** lead line 2, so the right side keeps two marks (C3): `check` (sent, `text_faint`) or `check-check` (read,
-  `text_soft`) 14, then 4; pending is `clock` 12. Only on my last message, in person and group chats.
+- **Ticks** lead line 2, so the right side keeps two marks (C3): `check` (sent, `text_faint`) or `check-check` (delivered,
+  `text_faint`; read, `text_soft`) 14, then 4; pending is `clock` 12. Only on my last message, in person and group chats,
+  on every network and in the Inbox; Discord and Slack stop at `check`.
 - **Unread reaction (P2):** `heart` 10 `accent_text` in a 16 `accent_soft` disc, in the badge slot only when it is empty.
 - **Tags:** 16 high, radius 4, padding 0 4, 11/500. Neutral (`quiet_fill` + `text_soft`): `bot`, `App`, `External`,
   `Guest`. Danger (`danger_soft` + `danger` 600): `Scam`, `Fake`.
@@ -175,8 +175,10 @@ have no Space, so they are 48 rows; Discord and Slack channels are 28 rows in a 
 ## GPUI notes
 - Home lists mix 48 and 28 rows plus 24/28 headers: `list` with known heights and a prefix-sum offset table, as People
   does; never measure. Collapse, drill-in and paging rebuild the flat `Vec`.
-- Tabs: `overflow_x_scroll` + `ScrollHandle`; widths from `text_system().layout_line` decide the overflow button; the
-  bar is a 2 pt child div. Busy is the online disc div in `busy`. Ticks are 14 SVGs inline before the preview.
+- Tabs: `overflow_x_scroll` + `ScrollHandle`; `ScrollHandle::max_offset().x` is the positive overflow amount and
+  `offset().x` ranges from `-max_offset.x` to `0`, so `can_right = offset.x > -max`. Arrows are hidden when
+  `max_offset().x <= px(0.)`. Widths from `text_system().layout_line` decide the overflow; the bar is a 2 pt child
+  div. Busy is the online disc div in `busy`. Ticks are 14 SVGs inline before the preview.
 - Paging: when the last visible index passes len − 30 and chatd has more, one `more` request; ignore while in flight.
 - Sponsored view: the card's bounds from `on_prepaint` against the viewport; once per `random_id` per open. Posts vary
   in height, so they use the conversation's `list`.

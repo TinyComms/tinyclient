@@ -17,7 +17,7 @@ use crate::gui::theme::{self, Type};
 use crate::gui::time;
 use crate::view::{age, now};
 use gpui::{div, prelude::*, px, AnyElement, Context, Entity, Focusable, FontWeight, HighlightStyle, MouseButton, SharedString, StyledText, Window};
-use protocol::{ConversationKind, Key, Link, Message, MessageHit, Network, Request, Response};
+use protocol::{ConversationKind, Key, Link, Message, MessageHit, Network, Request, Response, ThreadSummary};
 use std::ops::Range;
 use std::rc::Rc;
 
@@ -270,8 +270,25 @@ fn pane_open(open: &protocol::Conversation) -> pane::Open {
 }
 
 /// The key a thread is read and posted under: its own id, on its conversation's account.
-fn thread_key(conversation: &Key, root: &Message) -> Option<Key> {
-    root.thread.as_ref().map(|thread| Key { id: thread.id.clone(), ..conversation.clone() })
+/// Slack's is `{channel}:{root}` and Teams' is `{channel};messageid={root}`, even before the
+/// first reply. Discord's does not exist until the thread channel is created.
+fn thread_key(conversation: &Key, kind: ConversationKind, root: &Message) -> Option<Key> {
+    let id = if let Some(thread) = &root.thread {
+        thread.id.clone()
+    } else if super::actions::starts_thread(root, conversation.network, kind) {
+        match conversation.network {
+            Network::Slack if !conversation.id.contains(':') && !root.id.contains(':') => {
+                format!("{}:{}", conversation.id, root.id)
+            }
+            Network::Teams if !conversation.id.contains(";messageid=") && !root.id.contains(";messageid=") => {
+                format!("{};messageid={}", conversation.id, root.id)
+            }
+            _ => return None,
+        }
+    } else {
+        return None;
+    };
+    Some(Key { id, ..conversation.clone() })
 }
 
 /// Whether a thread of `conversation` may be drawn, composer and all, beside `open`. The one
@@ -432,9 +449,20 @@ impl Shell {
         }
     }
 
+    /// The open conversation's kind, when this thread still belongs to it. Anything else is
+    /// treated as a thread, which does not synthesize a new one.
+    fn open_kind(&self, conversation: &Key) -> ConversationKind {
+        self.snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.open.as_ref())
+            .filter(|open| open.key == *conversation)
+            .map(|open| open.kind)
+            .unwrap_or(ConversationKind::Thread)
+    }
+
     /// The thread view for this root, made once and kept while the stack holds it.
     fn keep_thread(&mut self, conversation: &Key, root: &Rc<Message>, cx: &mut Context<Self>) {
-        let Some(key) = thread_key(conversation, root) else {
+        let Some(key) = thread_key(conversation, self.open_kind(conversation), root) else {
             return;
         };
         let held = self.conversation_state.thread.borrow().as_ref().and_then(|thread| thread.read(cx).key().cloned());
@@ -456,13 +484,62 @@ impl Shell {
     /// The reply line under a message of the open conversation was clicked.
     pub(in crate::gui) fn open_thread_of(&mut self, conversation: Key, root: Rc<Message>, cx: &mut Context<Self>) {
         // A click that raced a switch belongs to a conversation no longer open.
-        if self.open_key() != Some(&conversation) || root.thread.is_none() {
+        if self.open_key() != Some(&conversation) {
+            return;
+        }
+        let kind = self.open_kind(&conversation);
+        if thread_key(&conversation, kind, &root).is_some() {
+            self.reveal_thread(conversation, root, cx);
+            return;
+        }
+        // Discord's thread id is a channel that does not exist yet. Creating it is the click.
+        if conversation.network == Network::Discord && super::actions::starts_thread(&root, Network::Discord, kind) {
+            self.start_discord_thread(conversation, root, cx);
+        }
+    }
+
+    /// Puts the thread pane up. The root already names the thread, so the pane can load it.
+    fn reveal_thread(&mut self, conversation: Key, root: Rc<Message>, cx: &mut Context<Self>) {
+        if self.open_key() != Some(&conversation) {
             return;
         }
         let side = &mut self.conversation_state.side;
         side.threads.forget(&conversation);
         side.stack = pane::open(&side.stack, Layer::Thread { conversation, root });
         self.install(cx);
+    }
+
+    /// Asks Discord to create the thread, then opens it. The layer waits until the channel id
+    /// is known: opening before that finds nothing to mount and would ask again.
+    fn start_discord_thread(&mut self, conversation: Key, root: Rc<Message>, cx: &mut Context<Self>) {
+        let request = Request::StartThread { conversation: conversation.clone(), message: root.id.clone() };
+        cx.spawn(async move |this, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+            let _ = this.update(cx, |shell, cx| {
+                if shell.open_key() != Some(&conversation) {
+                    return;
+                }
+                let id = match answer {
+                    Ok(Response::Conversation { conversation: started }) => started.key.id,
+                    Ok(Response::Error { detail, .. }) => {
+                        shell.toast(Some(("icons/circle-alert.svg", theme::danger())), detail, cx);
+                        return;
+                    }
+                    Ok(_) => {
+                        shell.toast(Some(("icons/circle-alert.svg", theme::danger())), "The thread could not be started.", cx);
+                        return;
+                    }
+                    Err(err) => {
+                        shell.toast(Some(("icons/circle-alert.svg", theme::danger())), crate::client::trouble_words(&err), cx);
+                        return;
+                    }
+                };
+                let mut message = (*root).clone();
+                message.thread = Some(ThreadSummary { id, replies: 0, last: 0, participants: Vec::new(), unread: 0 });
+                shell.reveal_thread(conversation, Rc::new(message), cx);
+            });
+        })
+        .detach();
     }
 
     /// The header's Details button.
@@ -1273,7 +1350,7 @@ fn said_at(hit: &MessageHit) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use protocol::{AccountKey, Network, ThreadSummary};
+    use protocol::{AccountKey, Network, ReplyTo, ThreadSummary};
 
     fn key(id: &str) -> Key {
         Key::new(&AccountKey { network: Network::Slack, account: "T1".into() }, id)
@@ -1282,9 +1359,21 @@ mod tests {
     #[test]
     fn a_thread_posts_under_its_own_key_and_only_beside_its_conversation() {
         let mut root = Message::plain("m1", "Ines", "root", 0, false);
-        assert_eq!(thread_key(&key("C_a"), &root), None);
+        let channel = ConversationKind::Channel;
+        // Slack names the thread a first reply would start: the channel and this message.
+        let started = thread_key(&key("C_a"), channel, &root).unwrap();
+        assert_eq!((started.id.as_str(), started.account()), ("C_a:m1", key("C_a").account()));
+        let discord = Key::new(&AccountKey { network: Network::Discord, account: "1".into() }, "C_a");
+        assert_eq!(thread_key(&discord, channel, &root), None, "Discord's thread id is a channel that does not exist yet");
+        let teams = Key::new(&AccountKey { network: Network::Teams, account: "1".into() }, "19:general@thread.tacv2");
+        let chain = thread_key(&teams, channel, &root).unwrap();
+        assert_eq!(chain.id, "19:general@thread.tacv2;messageid=m1");
+        assert_eq!(thread_key(&teams, ConversationKind::Direct, &root), None, "a Teams chat does not start a thread");
+        let mut broadcast = root.clone();
+        broadcast.reply_to = Some(ReplyTo { id: "parent".into(), sender: "Ana".into(), snippet: "earlier".into(), person: None, deleted: false });
+        assert_eq!(thread_key(&key("C_a"), channel, &broadcast), None);
         root.thread = Some(ThreadSummary { id: "C_a:m1".into(), replies: 2, last: 0, participants: Vec::new(), unread: 0 });
-        let thread = thread_key(&key("C_a"), &root).unwrap();
+        let thread = thread_key(&key("C_a"), channel, &root).unwrap();
         assert_eq!((thread.id.as_str(), thread.account()), ("C_a:m1", key("C_a").account()));
         // Drawn, composer and all, only while its conversation is the one open.
         assert!(thread_belongs(&key("C_a"), Some(&key("C_a"))));

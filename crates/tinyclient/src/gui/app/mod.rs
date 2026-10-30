@@ -111,6 +111,8 @@ impl Shell {
     pub(in crate::gui) fn watch(cx: &mut Context<Self>) {
         // The Settings window reads the accounts from this shell.
         super::settings::attach(cx.entity().downgrade(), cx);
+        // The voice keys work in any app for as long as the window lives.
+        super::hotkeys::start(cx.entity().downgrade(), cx);
         cx.spawn(async move |this, cx| loop {
             let status = cx.background_executor().spawn(async { ask_within(&Request::Status, Some(service::SLOW)) }).await;
             match status {
@@ -544,15 +546,17 @@ impl Shell {
             choices: prefs::choices(),
             kept: self.prefs_kept.clone(),
             autoplay: super::anim::autoplay(),
+            tiny_members: self.tiny_state.members_open(),
         }
     }
 
     /// Reads chatd's settings: at start, after a restart, and whenever one changes. Every
     /// window draws again with them.
     pub(in crate::gui) fn load_settings(&mut self, cx: &mut Context<Self>) {
-        self.off_thread(cx, || ask(&Request::Settings), |_, answer, cx| {
+        self.off_thread(cx, || ask(&Request::Settings), |this, answer, cx| {
             if let Ok(Response::Settings { values }) = answer {
                 prefs::set_values(protocol::settings::Values::new(values));
+                this.badge_setting_changed();
                 cx.refresh_windows();
             }
         });
@@ -615,8 +619,9 @@ impl Shell {
 
     pub(in crate::gui) fn diagnostics(&self) -> String {
         let mut text = format!(
-            "tinyclient {}\n{} {}\nservice: {:?}{}, keychain: {:?}, started {}\n",
+            "tinyclient {}{}\n{} {}\nservice: {:?}{}, keychain: {:?}, started {}\n",
             env!("CARGO_PKG_VERSION"),
+            crate::update::short_commit().map(|commit| format!(" ({commit})")).unwrap_or_default(),
             std::env::consts::OS,
             std::env::consts::ARCH,
             self.service.phase,

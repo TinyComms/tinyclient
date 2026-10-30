@@ -76,12 +76,13 @@ Three parts, the same in every mode, 96 px above the list:
 | Collapsed Group | n/a | chevron right; label turns `text` with a dot or the summed pill; the open conversation's row stays visible |
 
 - **Inbox pins** carry a pin glyph and the last one draws a hairline under itself. No header row.
-- **Voice channels** list who is in them as sub-rows (six, then `+4 more`) with a `text_faint` count. No speaking rings here. A click opens the channel's text and offers Join in the strip; it never joins, because Discord's join-on-click puts everyone in a room by accident.
+- **A Tiny server** is the exception, laid out as Discord lays out a server (`10-tiny-server.md`): the title strip is the server's header and menu, the list its folding categories of voice channels with every seat under its channel (speaking rings and state glyphs), a user panel at the foot, and the pane its home or a channel's stage with the member list beside it. A double click joins there, since a Tiny server is voice first.
+- **Voice channels** list who is in them as sub-rows (six, then `+4 more`) with a `text_faint` count. No speaking rings here. A click opens the channel's text and offers Join in the strip; a double-click (or the Join pill) joins; see `07-calls.md` §1.
 - **Threads** you follow sit under their channel (five, then `3 more threads`, opening the list in the right pane). A **forum** is a row with the forum glyph; the conversation area draws its post list.
 
 ## 4. Opening things
 
-- **Single click** opens in the conversation region. `cmd-click` / `cmd-Enter` opens without marking read. No double-click, no second window.
+- **Single click** opens in the conversation region. `cmd-click` / `cmd-Enter` opens without marking read. No double-click opens a second window; a voice row joins on double-click (07 §1).
 - **The sidebar does not follow.** Opening an Inbox mention, a switcher result or a search hit leaves the sidebar where it is; the row is selected if it is in the current list. Reveal is one click on the conversation subtitle. Otherwise triage from the Inbox drops you into a new server tree on every click. Exceptions: picking a Space in the switcher, and walking unread by keyboard.
 - **Thread** opens in the right pane from a message's reply line; the channel keeps its scroll. The **member list** toggles from the conversation strip into the same slot.
 - **Back / forward** replay 50 locations: sidebar mode, conversation, scroll anchor, right pane.

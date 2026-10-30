@@ -477,7 +477,7 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
         }
         let moved = api != session.url;
         let agent = ureq::Agent::config_builder()
-            .tls_config(TlsConfig::builder().provider(TlsProvider::NativeTls).build())
+            .tls_config(TlsConfig::builder().provider(TlsProvider::NativeTls).root_certs(ureq::tls::RootCerts::PlatformVerifier).build())
             .timeout_global(Some(Duration::from_secs(30)))
             .http_status_as_error(false)
             .user_agent(&session.user_agent)

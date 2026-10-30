@@ -11,8 +11,10 @@ use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
+pub mod browser;
 mod call;
 pub mod crash;
+pub mod hotkey;
 mod info;
 pub mod ipc;
 pub mod launch;
@@ -414,6 +416,10 @@ pub struct Conversation {
     /// Who is in it, for a voice channel someone is in. `None` when it is empty or unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub occupants: Option<Occupants>,
+    /// How many may be in a voice channel at once, 0 when it has no limit. Filled by the
+    /// network's adapter from the channel; the shell draws `4/12` on an occupied voice row.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub limit: u32,
     /// I may read it but not post in it.
     #[serde(default, skip_serializing_if = "is_false")]
     pub read_only: bool,
@@ -475,6 +481,22 @@ pub struct Conversation {
     /// My newest message has been read by the other side (Telegram's ✓✓, Teams' "Seen").
     #[serde(default, skip_serializing_if = "is_false")]
     pub seen: bool,
+    /// My newest message has reached the other side's device (Signal's and Google Messages'
+    /// second tick). `seen` implies it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub delivered: bool,
+    /// My newest message is still going.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sending: bool,
+}
+
+/// What became of my newest message, as its mark says it (`design/06-live-signals.md` §4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Receipt {
+    Sending,
+    Sent,
+    Delivered,
+    Read,
 }
 
 impl Conversation {
@@ -504,6 +526,7 @@ impl Conversation {
             last_read: None,
             call: CallSupport::None,
             occupants: None,
+            limit: 0,
             read_only: false,
             private: false,
             draft: String::new(),
@@ -521,6 +544,23 @@ impl Conversation {
             preview_from: String::new(),
             preview_mine: false,
             seen: false,
+            delivered: false,
+            sending: false,
+        }
+    }
+
+    /// The mark on my newest message. `None` when the newest is not mine.
+    pub fn receipt(&self) -> Option<Receipt> {
+        if !self.preview_mine {
+            None
+        } else if self.sending {
+            Some(Receipt::Sending)
+        } else if self.seen {
+            Some(Receipt::Read)
+        } else if self.delivered {
+            Some(Receipt::Delivered)
+        } else {
+            Some(Receipt::Sent)
         }
     }
 
@@ -907,6 +947,11 @@ pub struct Watching {
     /// the preview of those that have none, paced, on every network but Discord.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rows: Vec<Key>,
+    /// The window is the one the user is typing in (key on macOS, foreground on Windows).
+    /// With `conversation`, what arrives there is being read: chatd posts no notification for
+    /// it, and plays no sound for any other. Lapses with the rest.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub focused: bool,
 }
 
 /// One hit of a message search: where the message is, and enough of it to choose by.
@@ -1094,6 +1139,13 @@ pub enum Request {
     /// person until a message is sent.
     StartDirect {
         person: Key,
+    },
+    /// The thread a channel message starts. Discord only: its thread is a new channel, so this
+    /// creates it and answers with that conversation. Slack and Teams name a thread from the
+    /// message, and opening or sending there is enough.
+    StartThread {
+        conversation: Key,
+        message: String,
     },
     /// One person's card, asked of the network when the card opens and kept five minutes.
     /// `space` is where it was opened from, for the nickname, roles and join date there.
@@ -1350,9 +1402,21 @@ pub enum Request {
     /// off, 30 s, or a call starts. In a call it is the call's own meter.
     TestMicrophone {
         on: bool,
+        /// Also play the microphone back on the speaker, processed as a call would send it.
+        /// Outside a call only.
+        #[serde(default, skip_serializing_if = "is_false")]
+        loopback: bool,
     },
     /// Plays the test sound on the call speaker (V2): in the call's mediad, or one started for it.
     TestSound,
+    /// N13: posts one real notification, "This is how messages will look and sound", with the
+    /// preview and sound chosen. Answers `NotifyTested` with what the system said.
+    NotifyTest,
+    /// S11: plays one notification sound once, by its settings word (`pebble`, `soft_ring`), at
+    /// the alert volume, as a notification would. Plays even when sounds are off.
+    PlaySound {
+        sound: String,
+    },
     /// Who is on this Tiny server. An owner or an admin also gets the invites and the audit.
     TinyCommunity {
         account: AccountKey,
@@ -1421,6 +1485,192 @@ pub enum Request {
         room_id: String,
         user_id: String,
     },
+    /// Marks someone's identity key verified on this account (the user compared the safety
+    /// number), or takes that back. Remembered per server and person; a later key that is not
+    /// `key` shows as `Trust::Changed`. Answers `Ok`.
+    TinyVerify {
+        account: AccountKey,
+        user_id: String,
+        key: String,
+        verified: bool,
+    },
+
+    // Server management. Each needs the server to list the feature in its capabilities
+    // (`TinyCommunity::capabilities`); an older server answers that it can't. Each answers `Ok`
+    // unless it says otherwise; the server then tells every page over its live socket, which is
+    // a `Change::Tiny`.
+    /// Changes the server's name, description, welcome text, default room, or AFK room and
+    /// timeout (`server`, manage_server).
+    TinyServerUpdate {
+        account: AccountKey,
+        edit: TinyServerEdit,
+    },
+    /// Sets the server's icon from a picture on this computer (PNG, JPEG or WebP, at most
+    /// [`TINY_ICON_MAX`] bytes), or with no `path` removes it (`server`, manage_server).
+    TinyServerIcon {
+        account: AccountKey,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+    },
+    /// Makes a role just below this account's own rank (`roles`, manage_roles).
+    TinyRoleCreate {
+        account: AccountKey,
+        role: TinyRoleEdit,
+    },
+    TinyRoleUpdate {
+        account: AccountKey,
+        role_id: String,
+        role: TinyRoleEdit,
+    },
+    /// @everyone can't be deleted.
+    TinyRoleDelete {
+        account: AccountKey,
+        role_id: String,
+    },
+    /// Every role but @everyone, most senior first.
+    TinyRoleOrder {
+        account: AccountKey,
+        role_ids: Vec<String>,
+    },
+    /// The roles one member has, all of them (`roles`, manage_roles).
+    TinyMemberRoles {
+        account: AccountKey,
+        user_id: String,
+        role_ids: Vec<String>,
+    },
+    /// Makes someone an owner or takes it away. Owners only; the last owner stays.
+    TinyMemberOwner {
+        account: AccountKey,
+        user_id: String,
+        owner: bool,
+    },
+    /// Times someone out until `until` (RFC 3339, at most 28 days away), or with `None` ends
+    /// it. A timed-out member can't be in calls (`timeouts`, timeout_members).
+    TinyTimeout {
+        account: AccountKey,
+        user_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        until: Option<String>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        reason: String,
+    },
+    /// Removes one member, as `TinyRemove`, with a reason for the audit.
+    TinyKick {
+        account: AccountKey,
+        user_id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        reason: String,
+    },
+    /// Bans someone: they leave, their sessions end, and they can't come back by invite, by
+    /// sign-in groups or by signing in again. `None` is for good (`bans`, ban_members).
+    TinyBan {
+        account: AccountKey,
+        user_id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expires_at: Option<String>,
+    },
+    TinyUnban {
+        account: AccountKey,
+        user_id: String,
+    },
+    /// Categories (`categories`, manage_channels). Deleting one leaves its rooms uncategorized.
+    TinyCategoryCreate {
+        account: AccountKey,
+        name: String,
+    },
+    TinyCategoryRename {
+        account: AccountKey,
+        category_id: String,
+        name: String,
+    },
+    TinyCategoryDelete {
+        account: AccountKey,
+        category_id: String,
+    },
+    /// The whole channel list's order: categories in the order given (the uncategorized group,
+    /// `category_id: None`, is always first), and each one's rooms top first.
+    TinyLayout {
+        account: AccountKey,
+        groups: Vec<TinyLayoutGroup>,
+    },
+    /// Makes a room with its settings, as `TinyRoomCreate` with more.
+    TinyRoomCreateWith {
+        account: AccountKey,
+        room: TinyRoomEdit,
+    },
+    /// Changes a room's name, category, place, topic, limit, bitrate, push-to-talk or video.
+    TinyRoomUpdate {
+        account: AccountKey,
+        room_id: String,
+        room: TinyRoomEdit,
+    },
+    /// One role's allow and deny bits in one room (manage_roles and manage_channels). Only
+    /// [`TINY_CHANNEL_SCOPED`] bits mean anything here.
+    TinyOverrideSet {
+        account: AccountKey,
+        room_id: String,
+        role_id: String,
+        allow: u64,
+        deny: u64,
+    },
+    TinyOverrideClear {
+        account: AccountKey,
+        room_id: String,
+        role_id: String,
+    },
+    /// An invite with roles, a label, a use limit and an expiry (`invite_options`). Answers
+    /// `TinyCode`, as `TinyInvite` does.
+    TinyInviteWith {
+        account: AccountKey,
+        options: TinyInviteOptions,
+    },
+    /// One page of the audit. Answers `TinyAudit`.
+    TinyAudit {
+        account: AccountKey,
+        #[serde(default)]
+        filter: TinyAuditFilter,
+    },
+    /// Server-mutes or server-deafens someone in a room's call, or undoes it; `None` leaves
+    /// that one as it is (`voice_moderation`, mute_members / deafen_members).
+    TinyCallModerate {
+        account: AccountKey,
+        room_id: String,
+        user_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        server_muted: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        server_deafened: Option<bool>,
+    },
+    /// Moves someone in a call to another room (`voice_moderation`, move_members in both).
+    TinyCallMove {
+        account: AccountKey,
+        user_id: String,
+        room_id: String,
+    },
+
+    /// The push-to-talk key went down or up, from the shell's global hotkey. `priority` is the
+    /// priority key: on a Tiny server it also asks to be heard over everyone else, which the
+    /// server honours only with priority_speaker. Refused with no call.
+    CallTalk {
+        held: bool,
+        #[serde(default, skip_serializing_if = "is_false")]
+        priority: bool,
+    },
+    /// How the call's connection is doing now. Answers `CallStats`.
+    CallStats,
+    /// One person's volume for me alone, 0 to [`GAIN_MAX`] percent, and whether I muted them
+    /// (V9). Kept per account (`settings::gain_key`), so it holds in every call on that
+    /// account, and applied by the call's mediad at once. Answers `Ok`, with or without a
+    /// call.
+    CallGain {
+        account: AccountKey,
+        user_id: String,
+        percent: u16,
+        #[serde(default, skip_serializing_if = "is_false")]
+        muted: bool,
+    },
 }
 
 /// One thing that changed. The shell asks again for exactly that; the ephemeral kinds carry their
@@ -1476,6 +1726,8 @@ pub enum Change {
     Playback { playback: Option<Playback> },
     /// A setting was stored or reset: ask `Settings`.
     Settings,
+    /// Ephemeral. A notification was clicked: bring the window forward on this conversation.
+    Open { conversation: Key },
     /// Ephemeral. The microphone test's level, 0 to 100; `None` once the test is over.
     Meter { level: Option<u8> },
     /// A Tiny server's people, roles, invites or rooms changed: ask `TinyCommunity`. Who is in
@@ -1491,6 +1743,7 @@ impl Change {
             | (Change::Call { .. }, Change::Call { .. })
             | (Change::Playback { .. }, Change::Playback { .. })
             | (Change::Settings, Change::Settings)
+            | (Change::Open { .. }, Change::Open { .. })
             | (Change::Meter { .. }, Change::Meter { .. }) => true,
             (Change::SignIn { network: a, .. }, Change::SignIn { network: b, .. }) => a == b,
             (Change::Conversation { conversation: a }, Change::Conversation { conversation: b })
@@ -1529,6 +1782,7 @@ impl Change {
                 | Change::Upload { .. }
                 | Change::Playback { .. }
                 | Change::Meter { .. }
+                | Change::Open { .. }
         )
     }
 }
@@ -1539,6 +1793,13 @@ pub enum Response {
     Pong,
     /// Done, with nothing to say.
     Ok,
+    /// `NotifyTest`: whether the system took the notification, and its words when it did not
+    /// (notifications turned off for tinyclient, no notification service).
+    NotifyTested {
+        posted: bool,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        detail: String,
+    },
     Status {
         networks: Vec<NetworkStatus>,
         accounts: Vec<AccountStatus>,
@@ -1700,6 +1961,13 @@ pub enum Response {
     TinyCode {
         code: TinyCode,
     },
+    /// One page of a Tiny server's audit, newest first. Fewer rows than the limit: the end.
+    TinyAudit {
+        audit: Vec<TinyAudit>,
+    },
+    CallStats {
+        stats: CallStats,
+    },
 }
 
 /// `TINYCLIENT_DIR` moves the socket and database, for tests and the demo seed.
@@ -1803,6 +2071,26 @@ mod tests {
             muted,
             ..Conversation::new(key, kind, "#platform")
         }
+    }
+
+    #[test]
+    fn my_newest_message_says_sending_sent_delivered_or_read_and_an_old_row_still_decodes() {
+        let mut c = row(ConversationKind::Direct, 0, 0, false);
+        assert_eq!(c.receipt(), None);
+        c.preview_mine = true;
+        assert_eq!(c.receipt(), Some(Receipt::Sent));
+        c.delivered = true;
+        assert_eq!(c.receipt(), Some(Receipt::Delivered));
+        c.seen = true;
+        assert_eq!(c.receipt(), Some(Receipt::Read));
+        c.sending = true;
+        assert_eq!(c.receipt(), Some(Receipt::Sending));
+        // A chatd from before the second tick says neither.
+        let mut old = serde_json::to_value(row(ConversationKind::Direct, 0, 0, false)).unwrap();
+        old["preview_mine"] = serde_json::json!(true);
+        assert!(old.get("delivered").is_none() && old.get("sending").is_none());
+        let old: Conversation = serde_json::from_value(old).unwrap();
+        assert_eq!(old.receipt(), Some(Receipt::Sent));
     }
 
     #[test]

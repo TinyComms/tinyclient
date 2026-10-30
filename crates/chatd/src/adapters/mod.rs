@@ -249,6 +249,14 @@ pub enum Command {
     },
     /// The id of the direct conversation with a person, created if there is none.
     StartDirect { person_id: String, reply: Reply<String> },
+    /// The id of the thread a channel message starts. Discord only: create the thread channel,
+    /// record it, and answer with its id. `name` is already one line, at most 100 characters.
+    StartThread {
+        conversation_id: String,
+        message_id: String,
+        name: String,
+        reply: Reply<String>,
+    },
     /// One person's card. One request to the network, and only because the user opened it.
     Profile { person_id: String, reply: Reply<About> },
     /// The same, opened from inside a Space: add the nickname, roles and join date there. An
@@ -351,7 +359,7 @@ impl Command {
     pub fn unsupported(self, ctx: &Context) {
         match self {
             Command::Members { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
-            Command::StartDirect { reply, .. } | Command::Handoff { reply, .. } => {
+            Command::StartDirect { reply, .. } | Command::StartThread { reply, .. } | Command::Handoff { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }
             Command::Profile { reply, .. } | Command::ProfileIn { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -640,6 +648,16 @@ impl Context {
         Ok(())
     }
 
+    /// My messages up to this one reached the other side's device (Signal's and Google
+    /// Messages' second tick).
+    pub fn delivered(&self, conversation_id: &str, message_id: &str) -> Stores {
+        let conversation = self.key(conversation_id);
+        if self.hub.store().set_delivered(&conversation, message_id)? {
+            self.hub.changed(Change::Conversation { conversation });
+        }
+        Ok(())
+    }
+
     fn row_changed(&self, conversation_id: &str, space: Option<&str>) {
         self.hub.changed(Change::Conversation { conversation: self.key(conversation_id) });
         if let Some(space) = space {
@@ -672,6 +690,8 @@ impl Context {
         let stored = self.hub.store().ingest(&conversation, message, true)?;
         if stored == Stored::New && !message.outgoing {
             self.typing_stopped(conversation_id, &message.sender.id);
+            // After the row counted it, so a notification's read check sees it unread.
+            self.hub.notify(crate::notify::Event::Message { conversation: conversation.clone(), message: Box::new(message.clone()) });
         }
         self.stored(&conversation, &[stored], true);
         Ok(())
@@ -884,6 +904,50 @@ impl Context {
         self.hub.store().media_refreshed(&self.account, id, url)
     }
 
+    /// A file the adapter fetched over its own session, where the cache could not (Signal's
+    /// and Messages' pictures), kept as the cache keeps what it fetched: written under the
+    /// account's directory, registered, recorded as landed, and announced. `address` only names
+    /// where it came from; nothing fetches it. Answers the file with its path.
+    pub fn landed(&self, file: &MediaFile, address: &str, bytes: &[u8]) -> Option<MediaFile> {
+        let media = protocol::support_dir().join("media");
+        let path = crate::blobs::path_of(&media, &self.account, &file.id);
+        let part = path.with_extension("part");
+        std::fs::create_dir_all(crate::blobs::dir_under(&media, &self.account)).ok()?;
+        std::fs::write(&part, bytes).ok()?;
+        if std::fs::rename(&part, &path).is_err() {
+            let _ = std::fs::remove_file(&part);
+            return None;
+        }
+        let landed = {
+            let mut store = self.hub.store();
+            store.register_media(&self.account, &[(file.clone(), address.to_owned())]).ok()?;
+            store.media_landed(&self.account, &file.id, &path.to_string_lossy(), bytes.len() as u64, now()).ok()??
+        };
+        self.hub.changed(Change::Media { account: self.account.clone(), file: landed.clone() });
+        Some(landed)
+    }
+
+    /// A picture kept with [`Context::landed`] is the avatar of the row and of the person this
+    /// id names, whichever are recorded. Rows and people the adapter records later should name
+    /// it too, or they take it away again.
+    pub fn avatar(&self, id: &str, avatar: &str) -> Stores {
+        let (row, person) = self.hub.store().set_avatar(&self.account, id, avatar)?;
+        if row {
+            self.row_changed(id, None);
+        }
+        if person {
+            self.hub.changed(Change::People { account: self.account.clone() });
+        }
+        Ok(())
+    }
+
+    /// The avatar the row or the person of this id names now, so a row recorded again keeps it.
+    pub fn avatar_of(&self, id: &str) -> Option<String> {
+        let store = self.hub.store();
+        let row = store.conversation(&self.key(id)).ok().flatten().and_then(|row| row.avatar);
+        row.or_else(|| store.person(&self.key(id)).ok().flatten().and_then(|person| person.avatar)).map(|file| file.id)
+    }
+
     // Calls. Signalling only; mediad carries the media.
 
     /// Someone is calling us in a conversation.
@@ -937,6 +1001,26 @@ impl Context {
     /// The call in this room is over and the network already knows: mediad goes, quietly.
     pub fn call_over(&self, conversation_id: &str) -> bool {
         self.hub.calls.end_if(&self.hub, &self.key(conversation_id))
+    }
+
+    /// A Tiny server moved us from one room to another: the call there, its mediad, devices,
+    /// mute and deafen, now belong to the new room. False when no call was in `from`.
+    pub fn tiny_moved(&self, from: &str, to: &str) -> bool {
+        self.hub.calls.retarget(&self.hub, &self.key(from), self.key(to))
+    }
+
+    /// A Tiny room's bitrate and whether it requires push-to-talk, for the call in it.
+    pub fn tiny_room(&self, conversation_id: &str, kbps: u32, push_to_talk: bool) {
+        if self.in_call(conversation_id) {
+            self.hub.calls.tiny_room(&self.hub, &self.key(conversation_id), kbps, push_to_talk);
+        }
+    }
+
+    /// Tells the call's mediad, if there is one: who holds priority speech.
+    pub fn tell_media(&self, conversation_id: &str, request: protocol::MediaRequest) {
+        if self.in_call(conversation_id) {
+            let _ = self.hub.calls.request(&self.hub, &request);
+        }
     }
 
     /// The call is up for this conversation, with its mediad.

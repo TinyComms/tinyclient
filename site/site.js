@@ -245,7 +245,8 @@ function registerSiteTools() {
     { path: "/docs/performance.html", title: "Size and performance", about: "Disk and memory next to the official apps, and how each number was measured." },
     { path: "/docs/privacy.html", title: "Privacy and security", about: "What tinyclient stores, which connections it makes, and what it never does." },
     { path: "/docs/networks.html", title: "Networks and terms", about: "Support on Slack, Discord, Telegram, Teams, Signal and Android Messages." },
-    { path: "/docs/contributing.html", title: "Contributing", about: "Roadmap and the rules every change keeps." }
+    { path: "/docs/contributing.html", title: "Contributing", about: "Roadmap and the rules every change keeps." },
+    { path: "/tinyserver", title: "Tiny server", about: "The self-hosted voice server for tinyclient, and how to run one." }
   ];
 
   var tools = [
@@ -326,3 +327,132 @@ function registerSiteTools() {
 
   for (var i = 0; i < tools.length; i++) register(tools[i]);
 }
+
+// Screenshot viewer for the Tiny server page. Each picture is already a link to
+// the file, so with no script (or no <dialog>) it still opens. With script, a
+// click shows it large, and arrows, swipe and Escape move through the set.
+(function () {
+  if (!window.HTMLDialogElement) return;
+  var links = document.querySelectorAll("a.ts-frame");
+  if (!links.length) return;
+  var frames = Array.prototype.slice.call(links);
+  var index = 0;
+  var opener = null;
+  var startX = null;
+
+  function svg(path, box) {
+    var el = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    el.setAttribute("viewBox", box || "0 0 24 24");
+    el.setAttribute("aria-hidden", "true");
+    var p = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    p.setAttribute("d", path);
+    el.appendChild(p);
+    return el;
+  }
+
+  function button(className, label, path) {
+    var el = document.createElement("button");
+    el.type = "button";
+    el.className = className;
+    el.setAttribute("aria-label", label);
+    el.appendChild(svg(path));
+    return el;
+  }
+
+  var dialog = document.createElement("dialog");
+  dialog.className = "viewer";
+  dialog.setAttribute("aria-label", "Screenshot");
+  var close = button("viewer-close", "Close", "M18 6 6 18M6 6l12 12");
+  var prev = button("viewer-btn viewer-prev", "Previous screenshot", "m15 18-6-6 6-6");
+  var next = button("viewer-btn viewer-next", "Next screenshot", "m9 18 6-6-6-6");
+  var stage = document.createElement("div");
+  stage.className = "viewer-stage";
+  var img = document.createElement("img");
+  img.alt = "";
+  var cap = document.createElement("p");
+  cap.className = "viewer-cap";
+  cap.setAttribute("aria-live", "polite");
+  var title = document.createElement("strong");
+  var line = document.createElement("span");
+  var count = document.createElement("em");
+  count.className = "viewer-count";
+  cap.appendChild(title);
+  cap.appendChild(line);
+  cap.appendChild(count);
+  stage.appendChild(img);
+  stage.appendChild(cap);
+  dialog.appendChild(close);
+  dialog.appendChild(prev);
+  dialog.appendChild(next);
+  dialog.appendChild(stage);
+  document.body.appendChild(dialog);
+
+  function captionOf(link) {
+    var figure = link.closest("figure");
+    var strong = figure && figure.querySelector("figcaption strong");
+    var span = figure && figure.querySelector("figcaption span");
+    return {
+      title: strong ? strong.textContent : "",
+      line: span ? span.textContent : (link.querySelector("img") || {}).alt || ""
+    };
+  }
+
+  function show(i) {
+    index = (i + frames.length) % frames.length;
+    var link = frames[index];
+    var shot = link.querySelector("img");
+    var words = captionOf(link);
+    img.src = link.getAttribute("href");
+    img.width = shot ? shot.width : 1120;
+    img.height = shot ? shot.height : 700;
+    img.alt = shot && shot.alt ? shot.alt : words.line;
+    title.textContent = words.title;
+    line.textContent = words.line;
+    count.textContent = (index + 1) + " of " + frames.length;
+    var ahead = frames[(index + 1) % frames.length];
+    if (ahead) { var warm = new Image(); warm.src = ahead.getAttribute("href"); }
+  }
+
+  function open(i, from) {
+    opener = from || null;
+    show(i);
+    if (!dialog.open) dialog.showModal();
+  }
+
+  close.addEventListener("click", function () { dialog.close(); });
+  prev.addEventListener("click", function () { show(index - 1); });
+  next.addEventListener("click", function () { show(index + 1); });
+  dialog.addEventListener("click", function (event) {
+    if (event.target.closest("img, .viewer-cap, button")) return;
+    dialog.close();
+  });
+  dialog.addEventListener("close", function () {
+    if (opener) opener.focus();
+  });
+  dialog.addEventListener("keydown", function (event) {
+    if (event.key === "ArrowRight") { event.preventDefault(); show(index + 1); }
+    else if (event.key === "ArrowLeft") { event.preventDefault(); show(index - 1); }
+  });
+  dialog.addEventListener("pointerdown", function (event) {
+    if (event.pointerType === "mouse" && event.button !== 0) return;
+    startX = event.clientX;
+  });
+  dialog.addEventListener("pointerup", function (event) {
+    if (startX == null) return;
+    var dx = event.clientX - startX;
+    startX = null;
+    if (Math.abs(dx) < 48) return;
+    if (event.target.closest("button")) return;
+    show(index + (dx < 0 ? 1 : -1));
+  });
+
+  frames.forEach(function (link, i) {
+    var words = captionOf(link);
+    if (words.title) link.setAttribute("aria-label", "Enlarge: " + words.title);
+    link.addEventListener("click", function (event) {
+      if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+      event.preventDefault();
+      open(i, link);
+    });
+  });
+})();

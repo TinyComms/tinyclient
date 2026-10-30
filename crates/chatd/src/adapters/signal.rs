@@ -44,7 +44,7 @@ use crate::session;
 use crate::store::{ConversationRow, PersonRow};
 use protocol::{ConversationKind, Link, Message, MessageKind, Reaction, Relation, ReplyTo};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -67,6 +67,8 @@ const SENT_KEPT: usize = 1_024;
 const REACTIONS_KEPT: usize = 4_096;
 /// What a person with no name we know is called.
 const NO_NAME: &str = "Signal user";
+/// Most pictures asked of Signal for one change to what is on screen.
+const PICTURES: usize = 25;
 
 /// A test in a scratch directory asked for the scripted wire.
 fn scripted() -> bool {
@@ -252,6 +254,8 @@ struct Account {
     me: String,
     name: String,
     live: Arc<Mutex<Live>>,
+    /// Conversations whose picture has been asked of Signal on this connection.
+    pictured: Mutex<HashSet<String>>,
 }
 
 impl Account {
@@ -319,7 +323,7 @@ fn connect(ctx: &Context, saved: &Saved, live: &Arc<Mutex<Live>>, current: &Mute
     };
     let (me, name) = wire.me();
     let name = if name.is_empty() { saved.name.clone() } else { name };
-    let account = Arc::new(Account { ctx: ctx.clone(), wire, me, name, live: live.clone() });
+    let account = Arc::new(Account { ctx: ctx.clone(), wire, me, name, live: live.clone(), pictured: Mutex::default() });
     let _ = ctx.describe(if account.name.is_empty() { "Signal" } else { &account.name }, &account.me);
     *current.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(account.clone());
     // Dropped while connecting: the command thread has gone and will not close this wire.
@@ -356,7 +360,8 @@ fn ensure_row(account: &Account, peer: &Peer, title: &str) {
     let id = peer.conversation();
     match account.ctx.known(&id) {
         Ok(Some(known)) if title.is_empty() || known.title == title => {}
-        Ok(Some(_)) | Ok(None) => drop(account.ctx.conversation(&row(peer, title))),
+        // A picture fetched earlier stays the row's.
+        Ok(Some(_)) | Ok(None) => drop(account.ctx.conversation(&ConversationRow { avatar: account.ctx.avatar_of(&id), ..row(peer, title) })),
         Err(err) => eprintln!("chatd: Signal: {err}"),
     }
 }
@@ -428,7 +433,7 @@ fn apply(account: &Account, event: Event) {
                     id: contact.id.clone(),
                     name: if contact.name.is_empty() { NO_NAME.to_owned() } else { contact.name.clone() },
                     handle: String::new(),
-                    avatar: None,
+                    avatar: ctx.avatar_of(&contact.id),
                     bot: false,
                     status: String::new(),
                     link: String::new(),
@@ -455,6 +460,7 @@ fn apply(account: &Account, event: Event) {
                 let peer = Peer::Group(group.id.clone());
                 let mut row = row(&peer, &group.title);
                 row.topic = group.description.chars().take(300).collect();
+                row.avatar = ctx.avatar_of(&row.id);
                 let _ = ctx.conversation(&row);
             }
         }
@@ -508,7 +514,7 @@ fn apply(account: &Account, event: Event) {
             let _ = ctx.reacted(&conversation, &id, &Reaction { emoji, file: None, count: 1, mine }, !removed);
         }
         Event::ReadElsewhere(read) => read_elsewhere(account, &read),
-        Event::Seen { by, sent } => {
+        Event::Receipt { by, sent, read } => {
             let Some(newest) = sent.iter().max().copied() else {
                 return;
             };
@@ -518,7 +524,8 @@ fn apply(account: &Account, event: Event) {
             };
             let conversation = conversation.unwrap_or_else(|| Peer::Direct(by).conversation());
             if let Ok(Some(_)) = ctx.known(&conversation) {
-                let _ = ctx.seen(&conversation, &wire::message_id(newest, &account.me));
+                let id = wire::message_id(newest, &account.me);
+                let _ = if read { ctx.seen(&conversation, &id) } else { ctx.delivered(&conversation, &id) };
             }
         }
         Event::Typing { peer, by, name, started } => {
@@ -621,6 +628,7 @@ fn serve(account: &Arc<Account>, command: Command) {
         }
         // Signal has no directory to search: the people known are the contacts already stored.
         Command::SearchPeople(query) => ctx.searched(&query),
+        Command::Watch(watching) => pictures(account, &watching),
         Command::SignOut(reply) => {
             if let Err(fault) = account.wire.unlink() {
                 eprintln!("chatd: Signal: unlinking: {}", super::net::redact(&fault.to_string()));
@@ -628,6 +636,49 @@ fn serve(account: &Arc<Account>, command: Command) {
             let _ = reply.send(Ok(()));
         }
         other => other.unsupported(ctx),
+    }
+}
+
+/// The pictures of the people and groups on screen (rows, people, the open conversation): each
+/// asked of Signal once a connection, one after another, off the command thread since each is a
+/// trip to Signal's CDN. What lands is the row's and the person's avatar.
+fn pictures(account: &Arc<Account>, watching: &protocol::Watching) {
+    let on_screen = watching.rows.iter().chain(&watching.people).chain(&watching.conversation);
+    let wanted: Vec<Peer> = {
+        let mut pictured = account.pictured.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        on_screen
+            .filter(|key| key.account() == account.ctx.account)
+            .filter_map(|key| Peer::parse(&key.id))
+            .filter(|peer| pictured.insert(peer.conversation()))
+            .take(PICTURES)
+            .collect()
+    };
+    if wanted.is_empty() {
+        return;
+    }
+    let account = account.clone();
+    let spawned = std::thread::Builder::new().name("signal-pictures".into()).spawn(move || {
+        for peer in wanted {
+            let bytes = match account.wire.picture(&peer) {
+                Ok(Some(bytes)) if crate::blobs::is_picture(&bytes) => bytes,
+                Ok(_) => continue,
+                // Asked again on the next connection.
+                Err(fault) => {
+                    eprintln!("chatd: Signal: picture: {}", super::net::redact(&fault.to_string()));
+                    continue;
+                }
+            };
+            let conversation = peer.conversation();
+            // A new picture is a new id, so the shell never draws the old one in its place.
+            let id = format!("signal:avatar:{conversation}:{:016x}", crate::blobs::fnv_bytes(&bytes));
+            let file = protocol::MediaFile::new(id.clone(), protocol::MediaKind::Avatar);
+            if account.ctx.landed(&file, &format!("signal://avatar/{conversation}"), &bytes).is_some() {
+                let _ = account.ctx.avatar(&conversation, &id);
+            }
+        }
+    });
+    if let Err(err) = spawned {
+        eprintln!("chatd: Signal: {err}");
     }
 }
 

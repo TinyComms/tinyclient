@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self'; style-src 'self'; script-src 'self'; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<title>Tiny server: your own voice server for tinyclient</title>
+<meta name="description" content="A self-hosted voice server for tinyclient: voice channels laid out like Discord, end-to-end encrypted calls, roles, invites and moderation, run with Docker Compose. Open source, MIT.">
+<meta name="robots" content="index, follow">
+<link rel="canonical" href="https://tinyclient.io/tinyserver">
+<link rel="ai-catalog" href="/.well-known/ai-catalog.json">
+<meta property="og:url" content="https://tinyclient.io/tinyserver">
+<meta property="og:image" content="https://tinyclient.io/shots/tiny-server-1120.webp">
+<meta name="color-scheme" content="dark light">
+<meta name="theme-color" content="#121315" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<meta property="og:type" content="website">
+<meta property="og:title" content="Tiny server">
+<meta property="og:description" content="Your own voice server, with tinyclient as its app. Self-hosted, end-to-end encrypted calls, open source.">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+<script src="site.js" defer></script>
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"SoftwareApplication","name":"tinyserver","applicationCategory":"CommunicationApplication","operatingSystem":"Linux (Docker)","url":"https://tinyclient.io/tinyserver","description":"A self-hosted voice server for tinyclient: voice channels, end-to-end encrypted calls, roles, invites and moderation. One community per server.","license":"https://opensource.org/licenses/MIT","codeRepository":"https://github.com/itz4blitz/tinyserver","offers":{"@type":"Offer","price":"0","priceCurrency":"USD"}}
+</script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="./" aria-label="tinyclient home"><img src="favicon.svg" alt="" width="28" height="28">tinyclient</a>
+    <nav class="site-nav" aria-label="Site">
+      <a href="docs/">Docs</a>
+      <a href="tinyserver.html" aria-current="page">Tiny server</a>
+      <a class="hide-sm" href="docs/privacy.html">Privacy</a>
+      <a class="dc" href="https://discord.gg/kJHK7BNvJP" aria-label="Discord"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20.317 4.37a19.791 19.791 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028 14.09 14.09 0 0 0 1.226-1.994.076.076 0 0 0-.041-.106 13.107 13.107 0 0 1-1.872-.892.077.077 0 0 1-.008-.128 10.2 10.2 0 0 0 .372-.292.074.074 0 0 1 .077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 0 1 .078.01c.12.098.246.198.373.292a.077.077 0 0 1-.006.127 12.299 12.299 0 0 1-1.873.892.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.839 19.839 0 0 0 6.002-3.03.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.03zM8.02 15.33c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42.019 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42.019 1.333-.946 2.418-2.157 2.418z"/></svg><span class="nav-label">Discord</span></a>
+      <a class="gh" href="https://github.com/itz4blitz/tinyclient"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+
+<section class="hero ts-hero" aria-labelledby="title">
+  <div class="wrap">
+    <div class="hero-mark"><img class="hero-icon" src="assets/networks/tiny.svg" alt="" width="76" height="76"><h1 id="title">Tiny server</h1></div>
+    <p class="pitch">Your own voice server, in&nbsp;tinyclient.</p>
+    <p class="lede">Click a picture to see it&nbsp;larger.</p>
+    <div class="actions">
+      <a class="btn btn-primary" href="https://github.com/itz4blitz/tinyserver/blob/main/deploy/README.md"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="2" y="3" width="20" height="8" rx="2"/><rect x="2" y="13" width="20" height="8" rx="2"/><path d="M6 7h.01M6 17h.01"/></svg>Run your own</a>
+      <a class="btn btn-secondary ts-dl" href="./#download"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/><path d="M12 15V3"/></svg>Download tinyclient</a>
+    </div>
+    <p class="platforms">Self-hosted · <a href="https://github.com/itz4blitz/tinyserver">Open source</a>, MIT · Voice, no text&nbsp;chat</p>
+    <div class="ts-board" id="shots">
+      <figure class="ts-shot ts-shot-lead">
+        <a class="ts-frame" href="shots/tiny-server-1120.webp"><img src="shots/tiny-server-1120.webp" width="1120" height="700" alt="The Night Shift server. Channels on the left, who is in voice in the middle, members by role on the right." fetchpriority="high" decoding="async"></a>
+        <figcaption><strong>Home</strong><span>Channels, who&rsquo;s talking, people by&nbsp;role.</span></figcaption>
+      </figure>
+      <figure class="ts-shot">
+        <a class="ts-frame" href="shots/tiny-call-1120.webp"><img src="shots/tiny-call-1120.webp" width="1120" height="700" alt="A voice channel with four people, mute, deafen and leave." loading="lazy" decoding="async"></a>
+        <figcaption><strong>Voice</strong><span>A tile each. Mute, deafen, echo cancellation.</span></figcaption>
+      </figure>
+      <figure class="ts-shot">
+        <a class="ts-frame" href="shots/tiny-e2ee-1120.webp"><img src="shots/tiny-e2ee-1120.webp" width="1120" height="700" alt="The call security panel with a call code and a verified safety number." loading="lazy" decoding="async"></a>
+        <figcaption><strong>Encrypted</strong><span>A call code and safety numbers. The server can&rsquo;t hear&nbsp;it.</span></figcaption>
+      </figure>
+      <figure class="ts-shot">
+        <a class="ts-frame" href="shots/tiny-moderation-1120.webp"><img src="shots/tiny-moderation-1120.webp" width="1120" height="700" alt="The menu on a person: volume, server mute, move, timeout, kick and ban." loading="lazy" decoding="async"></a>
+        <figcaption><strong>Moderation</strong><span>Right-click anyone. Mute, move, time out, kick,&nbsp;ban.</span></figcaption>
+      </figure>
+      <figure class="ts-shot">
+        <a class="ts-frame" href="shots/tiny-roles-1120.webp"><img src="shots/tiny-roles-1120.webp" width="1120" height="700" alt="Server Settings, Roles, with Moderator open and its permissions." loading="lazy" decoding="async"></a>
+        <figcaption><strong>Roles</strong><span>Drag them into order. Switch on what each may&nbsp;do.</span></figcaption>
+      </figure>
+      <figure class="ts-shot">
+        <a class="ts-frame" href="shots/tiny-channels-1120.webp"><img src="shots/tiny-channels-1120.webp" width="1120" height="700" alt="Server Settings, Channels, with Raid night open." loading="lazy" decoding="async"></a>
+        <figcaption><strong>Channels</strong><span>A topic, a limit, a bitrate, push to&nbsp;talk.</span></figcaption>
+      </figure>
+      <figure class="ts-shot">
+        <a class="ts-frame" href="shots/tiny-members-1120.webp"><img src="shots/tiny-members-1120.webp" width="1120" height="700" alt="Server Settings, Members, eleven people with their roles." loading="lazy" decoding="async"></a>
+        <figcaption><strong>Members</strong><span>Roles, when they joined, when they were last&nbsp;seen.</span></figcaption>
+      </figure>
+      <figure class="ts-shot">
+        <a class="ts-frame" href="shots/tiny-invites-1120.webp"><img src="shots/tiny-invites-1120.webp" width="1120" height="700" alt="Server Settings, Invites, four open codes with revoke." loading="lazy" decoding="async"></a>
+        <figcaption><strong>Invites</strong><span>One code. Uses, an expiry, revoke.</span></figcaption>
+      </figure>
+      <figure class="ts-shot">
+        <a class="ts-frame" href="shots/tiny-invite-1120.webp"><img src="shots/tiny-invite-1120.webp" width="1120" height="700" alt="The Invite people dialog, with a role, a label, uses and an expiry." loading="lazy" decoding="async"></a>
+        <figcaption><strong>New invite</strong><span>Role, label, how many uses, when it&nbsp;ends.</span></figcaption>
+      </figure>
+      <figure class="ts-shot">
+        <a class="ts-frame" href="shots/tiny-invite-code-1120.webp"><img src="shots/tiny-invite-code-1120.webp" width="1120" height="700" alt="The invite code, shown once, with a Copy button." loading="lazy" decoding="async"></a>
+        <figcaption><strong>The code</strong><span>Shown once. They paste it into&nbsp;tinyclient.</span></figcaption>
+      </figure>
+      <figure class="ts-shot">
+        <a class="ts-frame" href="shots/tiny-audit-1120.webp"><img src="shots/tiny-audit-1120.webp" width="1120" height="700" alt="Server Settings, Audit log, each change as a sentence." loading="lazy" decoding="async"></a>
+        <figcaption><strong>Audit log</strong><span>Who did what, and&nbsp;why.</span></figcaption>
+      </figure>
+      <figure class="ts-shot">
+        <a class="ts-frame" href="shots/tiny-settings-overview-1120.webp"><img src="shots/tiny-settings-overview-1120.webp" width="1120" height="700" alt="Server Settings, Overview: name, icon, description and welcome." loading="lazy" decoding="async"></a>
+        <figcaption><strong>Overview</strong><span>Name, icon, welcome, where people&nbsp;land.</span></figcaption>
+      </figure>
+      <figure class="ts-shot">
+        <a class="ts-frame" href="shots/tiny-voice-media-1120.webp"><img src="shots/tiny-voice-media-1120.webp" width="1120" height="700" alt="Server Settings, Voice and media: audio is up, port 50000." loading="lazy" decoding="async"></a>
+        <figcaption><strong>Voice &amp; media</strong><span>Whether audio is up, and the one port calls&nbsp;use.</span></figcaption>
+      </figure>
+      <figure class="ts-shot">
+        <a class="ts-frame" href="shots/tiny-join-1120.webp"><img src="shots/tiny-join-1120.webp" width="1120" height="700" alt="Join a server: one field for the invite code." loading="lazy" decoding="async"></a>
+        <figcaption><strong>Join</strong><span>Paste the code. No address to&nbsp;type.</span></figcaption>
+      </figure>
+      <figure class="ts-shot">
+        <a class="ts-frame" href="shots/tiny-browser-signin-1120.webp"><img src="shots/tiny-browser-signin-1120.webp" width="1120" height="700" alt="tinyclient waiting while you sign in with Pocket ID in the browser." loading="lazy" decoding="async"></a>
+        <figcaption><strong>Sign in</strong><span>Pocket ID in the browser. No password in the&nbsp;app.</span></figcaption>
+      </figure>
+      <figure class="ts-shot">
+        <a class="ts-frame" href="shots/tiny-account-720.webp"><img src="shots/tiny-account-720.webp" width="720" height="560" alt="Settings, Accounts: Night Shift, a name, and Sign out everywhere." loading="lazy" decoding="async"></a>
+        <figcaption><strong>Your name</strong><span>Change it, or sign out on every&nbsp;computer.</span></figcaption>
+      </figure>
+      <figure class="ts-shot">
+        <a class="ts-frame" href="shots/tiny-sign-out-everywhere-720.webp"><img src="shots/tiny-sign-out-everywhere-720.webp" width="720" height="560" alt="The question Sign out everywhere, with Cancel and Sign out everywhere." loading="lazy" decoding="async"></a>
+        <figcaption><strong>Sign out</strong><span>It asks before it signs every device&nbsp;out.</span></figcaption>
+      </figure>
+      <figure class="ts-shot">
+        <a class="ts-frame" href="shots/tiny-signin-settings-1120.webp"><img src="shots/tiny-signin-settings-1120.webp" width="1120" height="700" alt="Server Settings, Sign-in: Pocket ID, and who you are on this server." loading="lazy" decoding="async"></a>
+        <figcaption><strong>Sign-in settings</strong><span>Which provider, and who you are&nbsp;here.</span></figcaption>
+      </figure>
+    </div>
+    <p class="fine-note center ts-note">Calls are end-to-end encrypted. Camera, screen share and text chat are not in the app yet. <a href="https://github.com/itz4blitz/tinyserver/blob/main/deploy/README.md">How to run a server&nbsp;&rarr;</a></p>
+  </div>
+</section>
+
+<section class="section center join" id="get" aria-labelledby="get-title">
+  <div class="wrap">
+   <div class="join-card reveal">
+    <img class="join-icon" src="assets/networks/tiny.svg" alt="" width="64" height="64">
+    <h2 id="get-title">Start a server for your&nbsp;people.</h2>
+    <p class="lede center">tinyserver is MIT licensed and early. Run it, break it, and help shape&nbsp;it.</p>
+    <div class="actions center">
+      <a class="btn btn-primary" href="https://github.com/itz4blitz/tinyserver"><svg class="fill" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>tinyserver on GitHub</a>
+      <a class="btn btn-secondary ts-dl" href="./#download"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/><path d="M12 15V3"/></svg>Download tinyclient</a>
+    </div>
+   </div>
+  </div>
+</section>
+
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="foot">
+      <div>
+        <a class="brand" href="./"><img src="favicon.svg" alt="" width="28" height="28">tinyclient</a>
+        <p>Open source, MIT.</p>
+      </div>
+      <nav aria-labelledby="f-docs">
+        <h2 id="f-docs">Docs</h2>
+        <ul>
+          <li><a href="docs/">Getting started</a></li>
+          <li><a href="docs/build.html">Build from source</a></li>
+          <li><a href="docs/architecture.html">Architecture</a></li>
+        </ul>
+      </nav>
+      <nav aria-labelledby="f-trust">
+        <h2 id="f-trust">Trust</h2>
+        <ul>
+          <li><a href="docs/privacy.html">Privacy &amp; security</a></li>
+          <li><a href="docs/networks.html">Networks &amp; terms</a></li>
+          <li><a href="https://github.com/itz4blitz/tinyclient/blob/main/SECURITY.md">Security policy</a></li>
+        </ul>
+      </nav>
+      <nav aria-labelledby="f-project">
+        <h2 id="f-project">Project</h2>
+        <ul>
+          <li><a href="https://discord.gg/kJHK7BNvJP">Discord</a></li>
+          <li><a href="https://github.com/itz4blitz/tinyclient">Source on GitHub</a></li>
+          <li><a href="https://github.com/itz4blitz/tinyclient/releases">Releases</a></li>
+          <li><a href="tinyserver.html">Tiny server</a></li>
+          <li><a href="docs/contributing.html">Contributing</a></li>
+        </ul>
+      </nav>
+    </div>
+  </div>
+</footer>
+</body>
+</html>

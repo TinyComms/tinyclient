@@ -118,7 +118,8 @@ Two layers, one result list.
 ## 6. Quick switcher (`cmd-K`)
 
 - **Matches** conversations at every level in every Space (opened or not), people, and Spaces, by
-  subsequence on "space title". `#` limits to channels, `@` to people, a leading network name to it.
+  subsequence on "space title" and people's handles (including existing DMs). `#` limits to
+  channels, `@` to people, a leading network name to it.
 - **Empty query:** unread mentions, then the eight most recent places. `cmd-K, Enter` toggles
   between the last two conversations.
 - **Ranking:** exact-prefix > word-prefix > subsequence; then mention > unread > frecency (visits

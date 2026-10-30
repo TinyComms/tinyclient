@@ -118,6 +118,8 @@ struct Open {
     /// What it takes as reactions, once chatd said. `None` until then, or from a chatd that
     /// does not say: everything is offered, as before there were rules.
     reactions: Option<protocol::ReactionRules>,
+    /// What became of my newest message, from the conversation's row.
+    receipt: Option<protocol::Receipt>,
     #[cfg_attr(not(feature = "gui-shot"), allow(dead_code))]
     started: Instant,
 }
@@ -357,13 +359,16 @@ impl Pane {
         self.metrics == Metrics::DENSE
     }
 
-    /// Shows this conversation. The same one again only takes its new title and picture.
+    /// Shows this conversation. The same one again only takes its new title, picture and the
+    /// mark on my newest message.
     /// `typing`: it has a composer, which takes the focus; otherwise the messages do.
     fn show(&mut self, conversation: &Conversation, me: &str, picture: Option<MediaFile>, typing: bool, cx: &mut Context<Self>) {
+        let receipt = conversation.receipt();
         if let Some(open) = self.open.as_mut().filter(|open| open.key == conversation.key) {
-            if open.title != conversation.title || open.picture != picture {
+            if open.title != conversation.title || open.picture != picture || open.receipt != receipt {
                 open.title.clone_from(&conversation.title);
                 open.picture = picture;
+                open.receipt = receipt;
                 cx.notify();
             }
             return;
@@ -378,6 +383,7 @@ impl Pane {
         self.wants_focus = !typing;
         if let Some(open) = self.open.as_mut() {
             open.picture = picture;
+            open.receipt = receipt;
         }
     }
 
@@ -412,6 +418,7 @@ impl Pane {
             marker_known: false,
             root,
             reactions: None,
+            receipt: None,
             started: Instant::now(),
         });
         self.window = pages::Window::default();

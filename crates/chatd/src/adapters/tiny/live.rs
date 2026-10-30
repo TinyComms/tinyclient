@@ -19,7 +19,7 @@ use super::super::discord::gateway::{wait_sockets, Pollable, WakePair, POLL_IN, 
 use super::super::{net, Context, Refusal, Reply, ReconnectWait, PANIC_PAUSE, RECONNECTING};
 use crate::hub::lock;
 use super::{members_of, Saved};
-use protocol::{join_host, CallFailure, Link, Occupant, Participant, Presence, TinyOffer, TinySlot};
+use protocol::{join_host, CallFailure, Cue, Link, MediaRequest, Occupant, Participant, Presence, TinyE2ee, TinyOffer, TinySeat, TinySlot};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -89,6 +89,8 @@ const MEDIA_LOST: &str = "The server stopped hearing this call's audio, so you'v
 const KICKED: &str = "You were removed from the call.";
 const ROOM_GONE: &str = "The room was deleted, so the call ended.";
 const ELSEWHERE: &str = "You joined a call on another device.";
+const BANNED: &str = "You were banned from this server.";
+const TIMED_OUT: &str = "You were timed out on this server, so you've left the call.";
 pub(crate) const ENDED: &str = "Tiny server signed you out. Sign in again.";
 pub(crate) const REMOVED: &str = "You were removed from this server.";
 pub(crate) const REPLACED: &str = "This account connected on another device, so this one stopped. Open the server to connect again.";
@@ -107,13 +109,21 @@ pub enum Ask {
     State { muted: bool, deafened: bool },
     /// The draft in this conversation is changing. The shell already paces it.
     Type { conversation_id: String },
+    /// Server-mute or server-deafen someone in a room's call, or undo it. `None` leaves it.
+    Moderate { room_id: String, user_id: String, server_muted: Option<bool>, server_deafened: Option<bool>, reply: Reply<()> },
+    /// Move someone in a call to another room.
+    Move { user_id: String, room_id: String, reply: Reply<()> },
+    /// The priority key is held, or let go: told to the server with our mute and deafen.
+    Priority { on: bool },
+    /// A `call.e2ee` frame from mediad, for the server as it is.
+    E2ee { frame: String },
 }
 
 impl Ask {
     fn into_reply(self) -> Option<Reply<()>> {
         match self {
-            Ask::Join { reply, .. } | Ask::Leave { reply } | Ask::Kick { reply, .. } => Some(reply),
-            Ask::Look | Ask::Hangup { .. } | Ask::State { .. } | Ask::Type { .. } => None,
+            Ask::Join { reply, .. } | Ask::Leave { reply } | Ask::Kick { reply, .. } | Ask::Moderate { reply, .. } | Ask::Move { reply, .. } => Some(reply),
+            Ask::Look | Ask::Hangup { .. } | Ask::State { .. } | Ask::Type { .. } | Ask::Priority { .. } | Ask::E2ee { .. } => None,
         }
     }
 
@@ -241,6 +251,8 @@ impl Live {
 
 /// What is known across connections. Ephemeral: gone at restart, and `ready` replaces it.
 struct Seat {
+    /// The server and user, for what the page reads of each seat (`manage::Known::seats`).
+    saved: Saved,
     since: Option<i64>,
     me: String,
     role: String,
@@ -255,19 +267,56 @@ struct Seat {
     call_id: Option<String>,
     /// Who is speaking in our room's call, from `call.speaking`.
     speaking: Vec<String>,
+    /// The room our seat was last taken in. A move carries the call from there.
+    last: Option<String>,
+    /// The server moved us here (`call.moved`): join it once the frame is read.
+    move_to: Option<String>,
+    /// The server stopped hearing our media (`media_lost`) on a socket that is still up: take
+    /// the seat again with a fresh offer once the frame is read, as after a restart.
+    recover: Option<String>,
+    /// When the call last came back that way, so a link that keeps failing is let go.
+    recovered: Vec<Instant>,
+    /// Our own mute, deafen and priority, as last told to the server.
+    muted: bool,
+    deafened: bool,
+    priority: bool,
+    /// Who holds priority speech in our room's call, as mediad was last told.
+    ducking: Vec<String>,
+    /// The server encrypts calls end to end (`e2ee_calls`), read at each fresh `ready`.
+    e2ee: bool,
+    /// Everyone in our room's call, as mediad was last told: whom its MLS group may hold.
+    rostered: Vec<String>,
 }
 
-/// Someone in a call, and the mute and deafen they set.
-#[derive(Clone)]
+/// Someone in a call: the mute and deafen they set, and what the server says of them.
+#[derive(Clone, Default, PartialEq)]
 struct Sitting {
     user: String,
     muted: bool,
     deafened: bool,
+    server_muted: bool,
+    server_deafened: bool,
+    suppressed: bool,
+    priority: bool,
 }
 
 impl Sitting {
     fn new(user: &str) -> Sitting {
-        Sitting { user: user.to_owned(), muted: false, deafened: false }
+        Sitting { user: user.to_owned(), ..Sitting::default() }
+    }
+
+    /// The flags a participant object carries, on the frame itself or in its `participant`.
+    /// An older server sends none: all off.
+    fn heard(&mut self, frame: &Value) {
+        let from = frame.get("participant").filter(|inner| inner.is_object()).unwrap_or(frame);
+        let flag = |field| from.get(field).and_then(Value::as_bool).unwrap_or(false);
+        (self.muted, self.deafened) = (flag("muted"), flag("deafened"));
+        (self.server_muted, self.server_deafened, self.suppressed, self.priority) = (flag("server_muted"), flag("server_deafened"), flag("suppressed"), flag("priority"));
+    }
+
+    /// What the server enforces changed: the page reads it again.
+    fn moderated(&self, before: &Sitting) -> bool {
+        (self.server_muted, self.server_deafened, self.suppressed) != (before.server_muted, before.server_deafened, before.suppressed)
     }
 }
 
@@ -302,12 +351,15 @@ fn closed(code: u16, reason: &str) -> End {
     }
 }
 
-/// What a refused call request says.
-fn words(kick: bool, code: &str) -> &'static str {
+/// What a refused call request says. `someone`: the request was about another person.
+fn words(someone: bool, code: &str) -> &'static str {
     match code {
-        "full" => "That room is full.",
+        "full" | "room_full" => "That room is full.",
         "server_full" => "Every seat on this server is taken. Try again later.",
-        "not_found" if kick => "They're not in that room's call.",
+        "banned" => "You're banned from this server.",
+        "timed_out" => "You're timed out on this server, so you can't join calls for now.",
+        "hierarchy" => super::HIERARCHY,
+        "not_found" if someone => "They're not in that room's call.",
         "not_found" => "That room is gone.",
         "forbidden" => "You can't do that.",
         "slow_down" => "Too many tries. Wait a moment, then try again.",
@@ -316,6 +368,7 @@ fn words(kick: bool, code: &str) -> &'static str {
         "bad_frame" => "The server couldn't read that request.",
         "bad_sdp" => "The server couldn't use tinyclient's audio setup.",
         "media_unavailable" => "This server's audio isn't available. Try again later.",
+        "e2ee_required" => "This room only takes calls encrypted end to end, and this one couldn't be. Try again.",
         _ => "That didn't work. Try again.",
     }
 }
@@ -334,6 +387,7 @@ fn live_url(base: &str, since: Option<i64>) -> Option<String> {
 /// Keeps the socket up until the adapter stops, the session ends, or the account is removed.
 pub(super) fn keep_live(ctx: &Context, saved: &Saved, live: &Live, timing: &Timing) {
     let mut seat = Seat {
+        saved: saved.clone(),
         since: None,
         me: saved.user_id.clone(),
         role: saved.role.clone(),
@@ -343,6 +397,16 @@ pub(super) fn keep_live(ctx: &Context, saved: &Saved, live: &Live, timing: &Timi
         described: false,
         call_id: None,
         speaking: Vec::new(),
+        last: None,
+        move_to: None,
+        recover: None,
+        recovered: Vec::new(),
+        muted: false,
+        deafened: false,
+        priority: false,
+        ducking: Vec::new(),
+        e2ee: false,
+        rostered: Vec::new(),
     };
     let mut pause = timing.first;
     while !ctx.stopped() {
@@ -365,7 +429,9 @@ pub(super) fn keep_live(ctx: &Context, saved: &Saved, live: &Live, timing: &Timi
         // Nothing heard while down is true any more; `ready` brings it all back.
         seat.calls.clear();
         seat.speaking.clear();
+        seat.move_to = None;
         ctx.hub.forget_live(&ctx.account);
+        super::manage::remember(saved, |known| known.seats.clear());
         if began.elapsed() >= timing.held {
             pause = timing.first;
         }
@@ -482,6 +548,8 @@ enum Asked {
     Leave,
     Kick,
     State,
+    /// Server mute or deafen, or a move: about someone else.
+    Moderate,
 }
 
 fn connect(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, timing: &Timing) -> End {
@@ -545,6 +613,19 @@ fn serve(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, timing: &Ti
                             }
                         }
                     }
+                    if let Some(room) = seat.move_to.take() {
+                        refs += 1;
+                        if let Err(err) = move_with(ctx, saved, live, seat, wire, pending, refs, room, timing) {
+                            return End::Dropped(err.to_string());
+                        }
+                    }
+                    if let Some(room) = seat.recover.take() {
+                        refs += 1;
+                        eprintln!("chatd: Tiny server: the call's media was lost; joining again");
+                        if let Err(err) = rejoin_with(ctx, saved, live, seat, wire, pending, refs, room, timing) {
+                            return End::Dropped(err.to_string());
+                        }
+                    }
                 }
                 Ok(None) => break,
                 Err(Lost::Closed(code, reason)) => return closed(code, &reason),
@@ -585,12 +666,35 @@ fn serve(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, timing: &Ti
                             Ok(())
                         }
                     }
-                    Ask::State { muted, deafened } if seat.call_id.is_some() => {
-                        let reference = refs.to_string();
-                        pending.push(Pending { reference: reference.clone(), asked: Asked::State, until: Instant::now() + timing.answer, reply: None });
-                        wire.send(json!({"type": "call.state", "ref": reference, "muted": muted, "deafened": deafened}).to_string())
+                    Ask::State { muted, deafened } => {
+                        (seat.muted, seat.deafened) = (muted, deafened);
+                        state(wire, pending, refs, seat, timing)
                     }
-                    Ask::State { .. } => Ok(()),
+                    Ask::Priority { on } if on != seat.priority => {
+                        seat.priority = on;
+                        state(wire, pending, refs, seat, timing)
+                    }
+                    Ask::Priority { .. } => Ok(()),
+                    // Only for the seat that has media; one from a call that has gone is stale.
+                    Ask::E2ee { frame } if seat.call_id.is_some() => wire.send(frame),
+                    Ask::E2ee { .. } => Ok(()),
+                    Ask::Moderate { room_id, user_id, server_muted, server_deafened, reply } => {
+                        let reference = refs.to_string();
+                        pending.push(Pending { reference: reference.clone(), asked: Asked::Moderate, until: Instant::now() + timing.answer, reply: Some(reply) });
+                        let mut frame = json!({"type": "call.moderate", "ref": reference, "room_id": room_id, "user_id": user_id});
+                        if let Some(muted) = server_muted {
+                            frame["server_muted"] = json!(muted);
+                        }
+                        if let Some(deafened) = server_deafened {
+                            frame["server_deafened"] = json!(deafened);
+                        }
+                        wire.send(frame.to_string())
+                    }
+                    Ask::Move { user_id, room_id, reply } => {
+                        let reference = refs.to_string();
+                        pending.push(Pending { reference: reference.clone(), asked: Asked::Moderate, until: Instant::now() + timing.answer, reply: Some(reply) });
+                        wire.send(json!({"type": "call.move", "ref": reference, "user_id": user_id, "room_id": room_id}).to_string())
+                    }
                     Ask::Kick { room_id, user_id, reply } => {
                         let reference = refs.to_string();
                         pending.push(Pending { reference: reference.clone(), asked: Asked::Kick, until: Instant::now() + timing.answer, reply: Some(reply) });
@@ -636,23 +740,86 @@ fn serve(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, timing: &Ti
     }
 }
 
+/// Our mute, deafen and priority, in a call with audio. `priority` goes only while held, so an
+/// older server never sees the field.
+fn state(wire: &mut Wire, pending: &mut Vec<Pending>, refs: u64, seat: &Seat, timing: &Timing) -> io::Result<()> {
+    if seat.call_id.is_none() {
+        return Ok(());
+    }
+    let reference = refs.to_string();
+    pending.push(Pending { reference: reference.clone(), asked: Asked::State, until: Instant::now() + timing.answer, reply: None });
+    let mut frame = json!({"type": "call.state", "ref": reference, "muted": seat.muted, "deafened": seat.deafened});
+    if seat.priority {
+        frame["priority"] = json!(true);
+    }
+    wire.send(frame.to_string())
+}
+
+/// The server moved us to `room` (`call.moved`): join it with no confirmation. A call with
+/// audio goes along, with its mediad, devices, mute and deafen, and a fresh offer.
 #[allow(clippy::too_many_arguments)]
-fn ask_join(wire: &mut Wire, pending: &mut Vec<Pending>, refs: u64, room_id: String, sdp: Option<String>, reply: Option<Reply<()>>, timing: &Timing) -> io::Result<()> {
+fn move_with(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, wire: &mut Wire, pending: &mut Vec<Pending>, refs: u64, room: String, timing: &Timing) -> io::Result<()> {
+    let from = seat.last.clone().or_else(|| seat.wanted.clone());
+    seat.call_id = None;
+    seat.speaking.clear();
+    if live.seats_only() {
+        seat.wanted = Some(room.clone());
+        return ask_join(wire, pending, refs, room, None, None, timing);
+    }
+    let carried = from.as_deref().is_some_and(|from| from == room || ctx.tiny_moved(from, &room));
+    if !carried {
+        // No call of ours was in that room here: there is nothing to carry.
+        seat.wanted = None;
+        return Ok(());
+    }
+    seat.wanted = Some(room.clone());
+    match offer(ctx, saved, seat, &room) {
+        Ok(sdp) => ask_join(wire, pending, refs, room, Some(sdp), None, timing),
+        Err(words) => {
+            seat.wanted = None;
+            ctx.call_failed(&room, CallFailure::Lost, &words);
+            Ok(())
+        }
+    }
+}
+
+/// The offer, and whether it comes with end-to-end encryption.
+type Offered = (String, bool);
+
+/// The version of the server's `call.e2ee` mediad speaks.
+const E2EE_VERSION: u16 = 1;
+
+#[allow(clippy::too_many_arguments)]
+fn ask_join(wire: &mut Wire, pending: &mut Vec<Pending>, refs: u64, room_id: String, sdp: Option<Offered>, reply: Option<Reply<()>>, timing: &Timing) -> io::Result<()> {
     let reference = refs.to_string();
     let mut frame = json!({"type": "call.join", "ref": reference, "room_id": room_id});
     let media = sdp.is_some();
-    if let Some(sdp) = sdp {
+    if let Some((sdp, e2ee)) = sdp {
         frame["sdp"] = json!(sdp);
+        // An older server ignores the field; a newer one says after its answer what the call is.
+        if e2ee {
+            frame["e2ee"] = json!(E2EE_VERSION);
+        }
     }
     pending.push(Pending { reference, asked: Asked::Join(room_id, media), until: Instant::now() + timing.answer, reply });
     wire.send(frame.to_string())
 }
 
-/// mediad's offer for a room, with mediad started for it.
-fn offer(ctx: &Context, saved: &Saved, seat: &Seat, room: &str) -> Result<String, String> {
+/// mediad's offer for a room, with mediad started for it, then what the room asks of the call.
+/// On a server that encrypts calls end to end, the offer says so, with the room that names the
+/// group and where this account keeps its identity key; mediad then hears who is in the call.
+fn offer(ctx: &Context, saved: &Saved, seat: &mut Seat, room: &str) -> Result<Offered, String> {
     let host = tungstenite::http::Uri::try_from(saved.base_url.as_str()).ok().and_then(|uri| uri.host().map(|host| host.trim_matches(['[', ']']).to_owned()));
-    let offer = TinyOffer { user_id: seat.me.clone(), host: host.unwrap_or_default(), slots: ROOM_CAP - 1, muted: false, deafened: false };
-    ctx.tiny_offer(room, offer)
+    let identity = || crate::verified::identity_path(&ctx.account).to_string_lossy().into_owned();
+    let e2ee = seat.e2ee.then(|| TinyE2ee { room_id: room.to_owned(), identity: identity() });
+    let offered = e2ee.is_some();
+    let offer = TinyOffer { user_id: seat.me.clone(), host: host.unwrap_or_default(), slots: ROOM_CAP - 1, muted: false, deafened: false, e2ee };
+    let sdp = ctx.tiny_offer(room, offer)?;
+    let (kbps, push_to_talk) = super::manage::room_audio(saved, room);
+    ctx.tiny_room(room, kbps, push_to_talk);
+    seat.rostered.clear();
+    roster(ctx, seat, room);
+    Ok((sdp, offered))
 }
 
 /// The room to take again after `ready`, when the user's seat went with the old socket.
@@ -690,15 +857,18 @@ fn seated_in(seat: &Seat, room: &str) -> bool {
 #[derive(Deserialize)]
 struct ReadyFrame {
     seq: i64,
+    #[serde(default)]
     me: MeFrame,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "protocol::or_default")]
     online: Vec<String>,
+    /// Read row by row (`calls_of`): one call this client cannot read leaves the others.
     #[serde(default)]
-    calls: Vec<CallFrame>,
+    calls: Value,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 struct MeFrame {
+    #[serde(default, deserialize_with = "protocol::text_or_null")]
     role: String,
 }
 
@@ -706,16 +876,24 @@ struct MeFrame {
 struct CallFrame {
     room_id: String,
     #[serde(default)]
-    participants: Vec<ParticipantFrame>,
+    participants: Value,
 }
 
 #[derive(Deserialize)]
 struct ParticipantFrame {
     user_id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "protocol::or_default")]
     muted: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "protocol::or_default")]
     deafened: bool,
+    #[serde(default, deserialize_with = "protocol::or_default")]
+    server_muted: bool,
+    #[serde(default, deserialize_with = "protocol::or_default")]
+    server_deafened: bool,
+    #[serde(default, deserialize_with = "protocol::or_default")]
+    suppressed: bool,
+    #[serde(default, deserialize_with = "protocol::or_default")]
+    priority: bool,
 }
 
 fn text<'a>(frame: &'a Value, field: &str) -> Option<&'a str> {
@@ -744,7 +922,8 @@ fn heard_frame(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, pendi
         }
         "call.joined" => {
             if let (Some(room), Some(user)) = (text(frame, "room_id"), text(frame, "user_id")) {
-                seated(ctx, seat, room, user);
+                seated(ctx, seat, room, user, frame);
+                duck(ctx, seat, room);
             }
         }
         // Whatever the reason, `media_timeout` and `media_lost` among them.
@@ -754,9 +933,24 @@ fn heard_frame(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, pendi
                 if user == seat.me {
                     left(ctx, seat, room, text(frame, "reason").unwrap_or(""));
                 }
+                duck(ctx, seat, room);
+            }
+        }
+        // A moderator moved us. Joining the new room needs the socket, so it happens once this
+        // frame is read (`move_with`).
+        "call.moved" => {
+            if let Some(room) = text(frame, "room_id").filter(|room| !room.is_empty()) {
+                seat.move_to = Some(room.to_owned());
             }
         }
         "call.answer" => answered(ctx, seat, pending, frame, true),
+        // The room's end-to-end encryption, for mediad alone: str0m's keys and the group's
+        // never leave it. Only for the seat that has media, in the order it came.
+        "call.e2ee" => {
+            if let (true, Some(room)) = (seat.call_id.is_some(), seat.wanted.clone()) {
+                ctx.tell_media(&room, MediaRequest::TinyE2ee { frame: frame.to_string() });
+            }
+        }
         "call.slots" => {
             let current = seat.call_id.is_some() && text(frame, "call_id") == seat.call_id.as_deref();
             if let (true, Some(room)) = (current, seat.wanted.clone()) {
@@ -774,10 +968,15 @@ fn heard_frame(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, pendi
         }
         "call.state" => {
             if let (Some(room), Some(user)) = (text(frame, "room_id"), text(frame, "user_id")) {
-                let flag = |field| frame.get(field).and_then(Value::as_bool).unwrap_or(false);
                 if let Some(who) = seat.calls.get_mut(room).and_then(|people| people.iter_mut().find(|who| who.user == user)) {
-                    (who.muted, who.deafened) = (flag("muted"), flag("deafened"));
+                    let before = who.clone();
+                    who.heard(frame);
+                    let moderated = who.moderated(&before);
                     tell(ctx, seat, room);
+                    duck(ctx, seat, room);
+                    if moderated {
+                        ctx.community_changed();
+                    }
                 }
             }
         }
@@ -800,6 +999,7 @@ fn ready_heard(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, heard
     let fresh = seat.since.is_none();
     if fresh {
         live.set_media(super::media_of(&saved.base_url));
+        seat.e2ee = super::manage::capabilities_of(saved).has(protocol::TINY_FEATURE_E2EE_CALLS);
     }
     seat.since = Some(heard.seq);
     if heard.me.role != seat.role && matches!(heard.me.role.as_str(), "owner" | "admin" | "member") {
@@ -820,12 +1020,21 @@ fn ready_heard(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, heard
         ctx.presence(user, Presence::Online, "", true);
     }
     let before: Vec<String> = seat.calls.keys().cloned().collect();
-    seat.calls = heard
-        .calls
+    let calls: Vec<CallFrame> = super::rows(heard.calls, "calls").unwrap_or_default();
+    seat.calls = calls
         .into_iter()
         .take(ROOMS)
         .map(|call| {
-            let people = call.participants.into_iter().take(SEATS).map(|who| Sitting { user: who.user_id, muted: who.muted, deafened: who.deafened });
+            let people: Vec<ParticipantFrame> = super::rows(call.participants, "call seats").unwrap_or_default();
+            let people = people.into_iter().take(SEATS).map(|who| Sitting {
+                user: who.user_id,
+                muted: who.muted,
+                deafened: who.deafened,
+                server_muted: who.server_muted,
+                server_deafened: who.server_deafened,
+                suppressed: who.suppressed,
+                priority: who.priority,
+            });
             (call.room_id, people.collect::<Vec<_>>())
         })
         .filter(|(_, people)| !people.is_empty())
@@ -833,8 +1042,13 @@ fn ready_heard(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, heard
     for room in before.iter().filter(|room| !seat.calls.contains_key(*room)) {
         ctx.occupants(room, Vec::new(), 0);
     }
+    super::manage::remember(saved, |known| known.seats.clear());
     for room in seat.calls.keys() {
         tell(ctx, seat, room);
+    }
+    let ours: Vec<String> = seat.calls.keys().filter(|room| ctx.in_call(room)).cloned().collect();
+    for room in ours {
+        duck(ctx, seat, &room);
     }
     // Who went offline while the socket was down is never told; the page reads it all again.
     ctx.community_changed();
@@ -852,9 +1066,40 @@ fn tell(ctx: &Context, seat: &Seat, room: &str) {
     let name = |user: &str| seat.names.get(user).filter(|name| !name.is_empty()).cloned().unwrap_or_else(|| "Someone".to_owned());
     if ctx.in_call(room) {
         let others = people.iter().filter(|who| who.user != seat.me);
-        let roster = others.map(|who| Participant { id: who.user.clone(), name: name(&who.user), speaking: false, muted: who.muted, deafened: who.deafened });
+        let roster = others.map(|who| Participant {
+            id: who.user.clone(),
+            name: name(&who.user),
+            speaking: false,
+            muted: who.muted,
+            deafened: who.deafened,
+            server_muted: who.server_muted,
+            server_deafened: who.server_deafened,
+            suppressed: who.suppressed,
+            priority: who.priority,
+        });
         ctx.participants(room, roster.collect());
     }
+    // The page reads each seat's moderation from here; the hub's occupants carry only mute.
+    let flagged: Vec<TinySeat> = people
+        .iter()
+        .map(|who| TinySeat {
+            user_id: who.user.clone(),
+            muted: who.muted,
+            deafened: who.deafened,
+            speaking: seat.speaking.contains(&who.user),
+            server_muted: who.server_muted,
+            server_deafened: who.server_deafened,
+            suppressed: who.suppressed,
+            priority: who.priority,
+        })
+        .collect();
+    super::manage::remember(&seat.saved, |known| {
+        if flagged.is_empty() {
+            known.seats.remove(room);
+        } else {
+            known.seats.insert(room.to_owned(), flagged);
+        }
+    });
     let occupants = people
         .iter()
         .map(|who| Occupant {
@@ -869,8 +1114,35 @@ fn tell(ctx: &Context, seat: &Seat, room: &str) {
     ctx.occupants(room, occupants, people.len() as u32);
 }
 
+/// Everyone in our room's call, us included, told to mediad when it changes: its MLS group
+/// takes in only people the call has, and names its members by them.
+fn roster(ctx: &Context, seat: &mut Seat, room: &str) {
+    if !seat.e2ee || !ctx.in_call(room) {
+        return;
+    }
+    let people: Vec<String> = seat.calls.get(room).into_iter().flatten().map(|who| who.user.clone()).collect();
+    if people != seat.rostered {
+        seat.rostered = people.clone();
+        ctx.tell_media(room, MediaRequest::TinyRoster { user_ids: people });
+    }
+}
+
+/// Who in our room's call holds priority speech, told to mediad when it changes, so it ducks
+/// everyone else while they talk.
+fn duck(ctx: &Context, seat: &mut Seat, room: &str) {
+    roster(ctx, seat, room);
+    if !ctx.in_call(room) {
+        return;
+    }
+    let holders: Vec<String> = seat.calls.get(room).into_iter().flatten().filter(|who| who.priority && who.user != seat.me).map(|who| who.user.clone()).collect();
+    if holders != seat.ducking {
+        seat.ducking = holders.clone();
+        ctx.tell_media(room, MediaRequest::Priority { user_ids: holders });
+    }
+}
+
 /// One seat a person: joining a room leaves any other.
-fn seated(ctx: &Context, seat: &mut Seat, room: &str, user: &str) {
+fn seated(ctx: &Context, seat: &mut Seat, room: &str, user: &str, frame: &Value) {
     let left: Vec<String> = seat.calls.iter().filter(|(other, people)| other.as_str() != room && people.iter().any(|who| who.user == user)).map(|(other, _)| other.clone()).collect();
     for other in &left {
         unseat(seat, other, user);
@@ -881,10 +1153,13 @@ fn seated(ctx: &Context, seat: &mut Seat, room: &str, user: &str) {
     }
     let people = seat.calls.entry(room.to_owned()).or_default();
     if !people.iter().any(|who| who.user == user) && people.len() < SEATS {
-        people.push(Sitting::new(user));
+        let mut who = Sitting::new(user);
+        who.heard(frame);
+        people.push(who);
     }
     if user == seat.me {
         seat.wanted = Some(room.to_owned());
+        seat.last = Some(room.to_owned());
     }
     tell(ctx, seat, room);
 }
@@ -910,11 +1185,22 @@ fn unseat(seat: &mut Seat, room: &str, user: &str) {
 /// We left a room's call on the server. If chatd's call is in it, it ends: in words when
 /// something took it from us, quietly when we left it ourselves somewhere.
 fn left(ctx: &Context, seat: &mut Seat, room: &str, reason: &str) {
+    // Moved by a moderator: `call.moved` carries the call on to the new room, before this
+    // frame or after it.
+    if reason == "moved" {
+        return;
+    }
     if seat.wanted.is_none() || seat.wanted.as_deref() == Some(room) {
         seat.call_id = None;
         seat.speaking.clear();
     }
     if !ctx.in_call(room) {
+        return;
+    }
+    // A network blip the server noticed before we did: the call joins again by itself, a few
+    // times, before it is given up in words.
+    if reason == "media_lost" && seat.wanted.as_deref() == Some(room) && recovering(&mut seat.recovered, Instant::now()) {
+        seat.recover = Some(room.to_owned());
         return;
     }
     let words = match reason {
@@ -923,13 +1209,33 @@ fn left(ctx: &Context, seat: &mut Seat, room: &str, reason: &str) {
         "kicked" => Some((CallFailure::Refused, KICKED)),
         "room_deleted" => Some((CallFailure::Refused, ROOM_GONE)),
         "joined_elsewhere" => Some((CallFailure::Refused, ELSEWHERE)),
+        "banned" => Some((CallFailure::Refused, BANNED)),
+        "timed_out" => Some((CallFailure::Refused, TIMED_OUT)),
         _ => None,
     };
+    // Put out by someone: the cue that says so plays out as the call ends.
+    if matches!(reason, "kicked" | "banned" | "timed_out" | "room_deleted") {
+        ctx.tell_media(room, MediaRequest::Cue { cue: Cue::Disconnected });
+    }
     match words {
         // chatd then has the adapter hang up, which sends nothing: we are not in the room.
         Some((reason, detail)) => ctx.call_failed(room, reason, detail),
         None => drop(ctx.call_over(room)),
     }
+}
+
+/// Times a call whose media the server lost joins again by itself within [`RECOVER_WINDOW`].
+const RECOVERIES: usize = 3;
+const RECOVER_WINDOW: Duration = Duration::from_secs(120);
+
+/// Whether a call that lost its media may join again now, counting this time if so.
+fn recovering(recovered: &mut Vec<Instant>, now: Instant) -> bool {
+    recovered.retain(|at| now.saturating_duration_since(*at) < RECOVER_WINDOW);
+    if recovered.len() >= RECOVERIES {
+        return false;
+    }
+    recovered.push(now);
+    true
 }
 
 fn answered(ctx: &Context, seat: &mut Seat, pending: &mut Vec<Pending>, frame: &Value, ok: bool) {
@@ -951,6 +1257,7 @@ fn answered(ctx: &Context, seat: &mut Seat, pending: &mut Vec<Pending>, frame: &
         match &pending.asked {
             Asked::Join(room, media) => {
                 seat.wanted = Some(room.clone());
+                seat.last = Some(room.clone());
                 // With audio the answer is `call.answer`, and it goes to mediad first.
                 if let (true, Some(sdp)) = (*media, text(frame, "sdp")) {
                     seat.call_id = text(frame, "call_id").map(str::to_owned);
@@ -961,12 +1268,12 @@ fn answered(ctx: &Context, seat: &mut Seat, pending: &mut Vec<Pending>, frame: &
                 seat.wanted = None;
                 seat.call_id = None;
             }
-            Asked::Kick | Asked::State => {}
+            Asked::Kick | Asked::State | Asked::Moderate => {}
         }
         Ok(())
     } else {
         let code = text(frame, "code").unwrap_or("");
-        let said = words(matches!(pending.asked, Asked::Kick), code);
+        let said = words(matches!(pending.asked, Asked::Kick | Asked::Moderate), code);
         if let Asked::Join(room, true) = &pending.asked {
             // A join with audio the server refused: its mediad goes. A rejoin that fails is
             // shown as the end of the call; the user asked for the first join, and is told.
@@ -1003,7 +1310,7 @@ fn durable(ctx: &Context, saved: &super::Saved, seat: &mut Seat, kind: &str, fra
         seat.since = Some(seq);
     }
     match kind {
-        "member.joined" | "member.renamed" | "member.role" => {
+        "member.joined" | "member.renamed" | "member.role" | "member.roles" => {
             let Some(member) = frame.get("member") else {
                 return;
             };
@@ -1024,7 +1331,7 @@ fn durable(ctx: &Context, saved: &super::Saved, seat: &mut Seat, kind: &str, fra
                 tell(ctx, seat, &room);
             }
         }
-        "member.removed" => {
+        "member.removed" | "member.banned" => {
             if let Some(user) = text(frame, "user_id") {
                 seat.names.remove(user);
             }
@@ -1042,7 +1349,11 @@ fn durable(ctx: &Context, saved: &super::Saved, seat: &mut Seat, kind: &str, fra
         }
         _ => super::messages::on_live(ctx, saved, &seat.names, kind, frame),
     }
-    if kind.starts_with("room.") || kind.starts_with("member.") || kind.starts_with("invite.") {
+    // Anything the page shows: the server, its roles, categories and order, rooms, members
+    // and invites. `role.*` and `member.roles` can also change what this account may do; the
+    // page's next read learns it.
+    let shown = ["server.", "role.", "roles.", "category.", "layout.", "room.", "member.", "invite."];
+    if shown.iter().any(|prefix| kind.starts_with(prefix)) {
         ctx.community_changed();
     }
 }

@@ -241,6 +241,7 @@ impl Discord {
                     speaking: false,
                     muted: heard.muted,
                     deafened: heard.deafened,
+                    ..Participant::default()
                 })
                 .collect();
             let answered = call.ring && !call.answered && !participants.is_empty();
@@ -254,8 +255,8 @@ impl Discord {
     }
 
     /// Tells chatd who is in each of `channels`, for those it is to know (see
-    /// [`Voice::watched`]): at most a row's worth of people in name order, us included, and the
-    /// true count. A channel that emptied is told once.
+    /// [`Voice::watched`]): at most a row's worth of people, friends first then in name order,
+    /// us included, and the true count. A channel that emptied is told once.
     fn occupancy(&self, channels: BTreeSet<String>) {
         let mut reports = Vec::new();
         {
@@ -282,7 +283,8 @@ impl Discord {
                     }
                     continue;
                 }
-                there.sort_by_cached_key(|(id, heard)| (heard.name.to_lowercase(), (*id).clone()));
+                // Friends first (`02` §4), then by name, so the cap never hides a friend.
+                there.sort_by_cached_key(|(id, heard)| (state.relations.get(*id) != Some(&Relation::Friend), heard.name.to_lowercase(), (*id).clone()));
                 let total = there.len() as u32;
                 let people = there.into_iter().take(protocol::OCCUPANTS_LIMIT).map(|(id, heard)| Occupant {
                     person: self.ctx.key(id),

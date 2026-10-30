@@ -60,14 +60,21 @@ How the processes fit together and who may edit what. The contract itself is the
 | `Fetch {account, ids, size, retry}` | `Media {files}` | store (size, retry); `blobs` |
 | `SignIn {network, at}`, `SignOut {account}` | `Status` | server |
 | `CallStart`, `CallAccept`, `CallDecline`, `CallEnd`, `CallSet`, `Media(..)` | `Status` | `media::Calls`; `Command::Call*` |
+| `CallTalk {held, priority}`, `CallStats` | `Ok`; `CallStats {stats}` | `media::Calls` to mediad (`Talk`, `Stats`); a priority key on a Tiny call is also `call.state` `priority`. The shell's global keys (`gui/hotkeys.rs`) send `CallTalk` |
+| `CallGain {account, user_id, percent, muted}` | `Ok` | kept as the setting `gain:<user id>` in the account's scope; the call on that account gets `Gain` at once, and every call starts with its account's |
+| `TestMicrophone {on, loopback}` | `Ok` | the test mediad (`Meter`, `Loopback`, with `Processing` so its meter is the call's); in a call, the call's meter |
 | `Play(Start {account, file, path, conversation, message, title, at, rate, output} \| Pause \| Seek {at} \| Rate {rate} \| Stop)` | `Ok`; then `Change::Playback` | `playback::Player`; `mediad --play` |
 | `TinyCommunity`, `TinyInvite`, `TinyRole`, `TinyRemove`, `TinyRevoke`, `TinyRename`, `TinySignOutEverywhere`, `TinyRoomCreate`, `TinyRoomRename`, `TinyRoomDelete` | `TinyCommunity` (members, invites, audit, rooms with who sits in each, online, the server's `media`); `TinyCode`; `Ok` | `adapters::tiny` over the server's REST; seats and presence from the hub |
 | `TinyCallJoin`, `TinyCallLeave`, `TinyCallKick` | `Ok` once the server took it, or its refusal in words | `Command::Tiny`, sent on the account's live socket (`adapters/tiny/live.rs`). On a server whose `/health` says media is `up`, a join is a call with `mediad` (below); otherwise a seat only. `CallStart` on a Tiny room key is the same join |
+| `TinyVerify {account, user_id, key, verified}` | `Ok` | `verified::set`: the key the user compared, kept per account in `e2ee/<account>/verified.json`; the call's `security` is read again (`Calls::reverify`) |
+| `TinyServerUpdate`, `TinyServerIcon`, `TinyRole{Create,Update,Delete,Order}`, `TinyMemberRoles`, `TinyMemberOwner`, `TinyTimeout`, `TinyKick`, `TinyBan`, `TinyUnban`, `TinyCategory{Create,Rename,Delete}`, `TinyLayout`, `TinyRoomCreateWith`, `TinyRoomUpdate`, `TinyOverride{Set,Clear}`, `TinyInviteWith`, `TinyAudit` | `Ok`; `TinyCode`; `TinyAudit {audit}` | `adapters::tiny::manage` over the server's REST, each only where `GET /v1/capabilities` lists its feature; an older server (404 there) is refused in words and nothing is sent |
+| `TinyCallModerate`, `TinyCallMove` | as `TinyCallKick` | `call.moderate`, `call.move` on the live socket, with the `voice_moderation` feature |
 
 - **Rows**: a `Conversation` carries its Space's and Group's titles and its topic
   (`Conversation::subtitle()` is the header's second line: `Space > group · topic`), `read_only`,
   `private`, the user's `draft`, and for a `Thread` its `parent` conversation and `root` message.
-  A voice channel's row carries `occupants` when anyone is in it.
+  A voice channel's row carries `occupants` when anyone is in it, and `limit`, how many it
+  seats (0 when Discord sets none).
 - **Messages** are one model: `text` plus `spans` (byte ranges on character boundaries: styles,
   links, mentions, custom emoji), `attachments` (file and thumbnail, dimensions known, `spoiler`,
   `sticker`, a voice message's `waveform` and `duration`), `previews`, `reactions`, `reply_to`
@@ -208,7 +215,8 @@ changing again replaces its entry, so the list is bounded (256) by how many thin
   value rides on the row whenever `Tree`, `Conversation` or `Inbox` is read; an emptied channel
   is told once with a total of 0. Held for 256 channels at most, never stored.
 - `Tiny {account}` says a Tiny server's people, roles, invites or rooms changed: read
-  `TinyCommunity` again. Its live socket sends it for each room, member and invite event, and
+  `TinyCommunity` again. Its live socket sends it for each server, role, category, layout, room,
+  member and invite event, when someone's server mute, deafen or suppression changes, and
   after each `ready`. Who sits in a room is `Occupants` under the room's id, and who is online
   `Presence`, as for a voice channel.
 - `reset: true` means read everything on screen again: `seq` starts from the clock at each chatd
@@ -224,7 +232,7 @@ changing again replaces its entry, so the list is bounded (256) by how many thin
 | Data | Where |
 |---|---|
 | Sessions | Keychain, service `tinyclient`, one item per network. Never in chat.sqlite. Signal's item holds the account id and the key to `signal/<account>.state`, where its ratchets, keys, contacts and groups live, each value sealed with that key (`adapters/signal/vault.rs`, built with the `signal` feature only). |
-| Accounts, Spaces (muted, hide muted), folders, groups (kind, muted, unread only), conversations (unread, mentions, muted, read marker, star, topic, thread parent and root, draft, filing, kind flags, preview parts, seen, when it last mentioned me), people and relationships (title, time zone, mark), messages (rich fields as JSON in `message.body`), media rows with their failure and size variants, adapter notes | `chat.sqlite`, schema version in `PRAGMA user_version` (now 4), page cache 1 MB. A version change drops and refills the cache: the 3 → 4 change does, once. |
+| Accounts, Spaces (muted, hide muted), folders, groups (kind, muted, unread only), conversations (unread, mentions, muted, read marker, star, topic, thread parent and root, draft, filing, kind flags, preview parts, seen, when it last mentioned me, voice limit), people and relationships (title, time zone, mark), messages (rich fields as JSON in `message.body`), media rows with their failure and size variants, adapter notes | `chat.sqlite`, schema version in `PRAGMA user_version` (now 5), page cache 1 MB. A version change drops and refills the cache: the 4 → 5 change does, once. |
 | Media bytes | `media/<network>/<account>/` under the support directory, 500 MB, least recently used first. |
 | Presence and activity, typing, voice occupants, what the shell watches, links and capabilities, the change list, the call, upload progress, previews asked, and five minutes of profiles, info panes and catalog pages (64 / 64 / 16 / 32 at most) | chatd memory, bounded, gone at restart. |
 | Files opened in another app under their own names | `open/` in the support directory: hard links into the cache, emptied when the shell starts. |
@@ -297,10 +305,40 @@ goes out as `call.join` `sdp`; `call.answer` comes back as `TinyAnswer` (from he
 joining, with the 35 s deadline), and each `call.slots` for that `call_id` as `TinySlots`.
 `Connected` makes it `Joined` as for Discord. Mute and deafen go out as `call.state`, a hang-up
 or a failure as `call.leave` (only while the socket still sees us in the room), and `call.left`
-for us with `media_timeout`, `media_lost`, `kicked`, `room_deleted` or `joined_elsewhere` fails
-the call in words. After a server restart the live socket sends a fresh `TinyOffer` to the same
+for us with `media_timeout`, `kicked`, `room_deleted`, `joined_elsewhere`, `banned` or
+`timed_out` fails the call in words (the four that put us out play the Disconnected cue first).
+`media_lost` while the socket is up is a blip: the seat is taken again with a fresh offer, as
+after a restart, up to three times in two minutes before it fails in words too. `call.moved` (a moderator moved us) carries the
+call to the new room: the same mediad, devices, mute and deafen, a fresh `TinyOffer`, and a
+`call.join` there; the `call.left` with `moved` that goes with it ends nothing. The room's bitrate
+and push-to-talk requirement go to mediad as `Bitrate` and `Input` once the offer is made. After a server restart the live socket sends a fresh `TinyOffer` to the same
 mediad and joins again; mediad keeps its devices and takes up the new connection. str0m, its
 sockets and every packet stay in mediad (`mediad/src/tiny.rs`).
+
+On a server whose `GET /v1/capabilities` lists `e2ee_calls`, a Tiny call is end-to-end encrypted
+(tinyserver's `docs/calls.md`, "End-to-end encryption"). `TinyOffer` then carries the room and
+the path of the account's identity key (`chatd::verified`, beside `verified.json` in
+`e2ee/<account>/` of the data directory), and `call.join` says `e2ee: 1`. The server's
+`call.e2ee` frames go to mediad as `TinyE2ee`, in the order they came, and everyone in the
+room's call as `TinyRoster` whenever that changes; what mediad answers (`TinyE2ee` events: its
+key package, commits, `invalid`) goes back out through `Calls::on_signal` to the account's
+adapter, as `Ask::E2ee`, and onto the socket untouched. chatd never parses or keeps any of it.
+mediad holds the MLS group (`mediad/src/e2ee.rs`, through `davey` as for DAVE: the server is
+the group's external sender) and seals each Opus frame between the encoder and str0m, and opens
+each one between str0m and the slot's jitter buffer: AES-128-GCM with DAVE's 8-byte tag, keyed
+per sender from the epoch's exporter, the RTP header and audio level left in clear. Until the
+group has keys the microphone is held back, and a clear frame in an end-to-end call is dropped,
+never played. mediad reports how the call is protected with `TinySecurity` (the mode, the call
+code, each member's key and safety number); chatd fills in whom the user verified
+(`verified::trusted`) and puts it on the call as `security`. `TinyVerify` remembers a key, or
+forgets it, and the call shows it at once (`Calls::reverify`).
+
+The sound of a call is mediad's, the same in both kinds of call. The microphone goes through
+`process` (WebRTC's AEC3, noise suppression and AGC2, ported to Rust by `sonora`) with the mix
+played as the echo canceller's reference, then the gate as `Input` and `Talk` say (`talk`); the
+mix plays each voice at its `Gain` and ducks everyone else 12 dB under a `Priority` holder who is
+speaking (`hear`); the encoder takes `Bitrate`. `Stats` answers from what the call's loop measured
+over the last second (`stats`): round trip, jitter, loss, both rates, the ICE path.
 
 The device menu: the shell sends `Media(Meter {on})` when it opens and closes. While on, mediad
 sends `Levels` and chatd passes our input level on as `Call.level`; `Call.inputs` and
@@ -369,14 +407,17 @@ WebM: stills.
 ## The demo (`chatd --seed-demo`, `chatd/src/demo*`)
 
 Invented data in a scratch `TINYCLIENT_DIR`, and an adapter with no network behind it
-(`demo/adapter.rs`) that answers for the six demo accounts (Discord, two Slack workspaces,
-Telegram, Teams, Signal): a send is accepted, files "upload" from their paths with progress and can be
+(`demo/adapter.rs`) that answers for the seven demo accounts (Discord, two Slack workspaces,
+Telegram, Teams, Signal, a Tiny server): a send is accepted, files "upload" from their paths with progress and can be
 cancelled, a reaction toggles, edit and delete work, a friend request can be answered, our
 presence set, a typed profile, a conversation's and a Space's info, a member list, pinned
 messages, a shared-media search and the pickers' catalogs read, a mute set, a group left, a DM
 closed, rows with no preview filled when on screen, and a call in a voice channel puts us among
 its occupants. What each account holds is listed at the top of `demo.rs` (`demo/telegram.rs`,
-`demo/teams.rs`, `demo/signal.rs`, `demo/polish.rs` for this round). Its portraits, icons and
+`demo/teams.rs`, `demo/signal.rs`, `demo/polish.rs` for this round). The Tiny server, "Night
+Shift" (`demo/tiny.rs`), has no HTTP behind it: `Chat::handle` lets the demo answer that
+account's Tiny requests first (`demo::tiny_answer`), applies what they change to the page it
+keeps, and tells the shell `Change::Tiny`. Its portraits, icons and
 photographs are files in `demo/photos/`, read when seeding and credited in `demo/photos/CREDITS.md`. The server's own tests use it as their network
 (`tests/e2e.rs`, `tests/calls.rs`, `tests/polish.rs`). Variants, comma separated: `live`,
 `expired`, `many` (50 Discord servers), `attention`, `reconnecting`. `TINYCLIENT_DEMO_VOICE` hands
@@ -428,6 +469,8 @@ Tests go in your own files or a new `tests/<slice>.rs`. A gap in the contract is
 - Slices F, G and H share the `chatd` crate, and A to E the `tinyclient` crate: someone else's
   half-written file can break your build. Check with `cargo check -p chatd` (or `-p tinyclient
   --features gui`) and say so; do not fix it.
-- Left for later, with room kept: message search, notifications, settings, inline video
+- Notifications (2026-10-28): chatd decides and posts (`notify.rs`, rules tested against `notifier::Fake`), the
+  window only reports its focus and draws the taskbar or Dock count. Sounds play through `mediad --sound`.
+- Left for later, with room kept: message search, settings, inline video
   (videos play in the system's player), Discord's per-server file limit (boosts) and Telegram's boosted packs in
   `Capabilities`, picker recents in SQLite.
