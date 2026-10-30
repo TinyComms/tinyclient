@@ -134,10 +134,16 @@ impl Stream {
                 // after a real gap can still rebuild it.
                 Pop::Hold => Some(self.decoder.bridge(FRAME, &mut pcm)),
                 Pop::Lost => {
-                    // The packet after the hole may carry a copy of what was lost.
-                    let rebuilt = self.jitter.next().and_then(|next| self.decoder.recover(next, &mut pcm));
-                    self.rebuilt += u64::from(rebuilt.is_some());
-                    rebuilt.or_else(|| self.decoder.decode(None, FRAME, &mut pcm))
+                    if self.jitter.has_later() {
+                        // The packet after the hole may carry a copy of what was lost.
+                        let rebuilt = self.jitter.next().and_then(|next| self.decoder.recover(next, &mut pcm));
+                        self.rebuilt += u64::from(rebuilt.is_some());
+                        rebuilt.or_else(|| self.decoder.decode(None, FRAME, &mut pcm))
+                    } else {
+                        // Nothing is behind this frame. Pitch-repeating it jumps to the middle
+                        // of the last frame, which is the pop at the end of a sentence.
+                        Some(self.decoder.release(FRAME, &mut pcm))
+                    }
                 }
                 Pop::Empty => break,
             };
@@ -1217,6 +1223,42 @@ mod loss_tests {
         assert_eq!(stream.jitter.lost, 1, "one skipped packet");
         assert_eq!(stream.jitter.late, 0, "the swapped packet arrived inside the wait");
         assert_eq!(clicks(&played, steepest(&clean) * 3 / 2), 0, "a reorder wait must not click");
+    }
+}
+
+#[cfg(test)]
+mod receive_tests {
+    use super::*;
+
+    #[test]
+    fn the_end_of_a_spurt_ramps_to_silence_instead_of_stepping() {
+        let mut stream = Stream::new().expect("decoder");
+        let mut encoder = Encoder::new().expect("encoder");
+        let mut packet = [0u8; 1500];
+        let mut pcm = [0i16; FRAME_SAMPLES];
+        for n in 0..8u16 {
+            for (i, sample) in pcm.chunks_mut(CHANNELS).enumerate() {
+                let t = (n as usize * FRAME + i) as f32;
+                let tone = (t / 48_000. * 440. * std::f32::consts::TAU).sin();
+                sample.fill((tone * 8_000.) as i16);
+            }
+            let len = encoder.encode(&pcm, &mut packet).unwrap();
+            stream.jitter.insert(n, packet[..len].to_vec());
+        }
+        let mut last = None;
+        for _ in 0..8 {
+            last = stream.pull(&format_args!("speaker"));
+        }
+        let last = last.expect("the spurt plays");
+        let tail = stream.pull(&format_args!("speaker")).expect("the ending frame");
+        let from = last[last.len() - CHANNELS];
+        assert!(
+            (i32::from(tail[0]) - i32::from(from)).abs() < 1_500,
+            "the tail steps from {from} to {}",
+            tail[0]
+        );
+        assert_eq!(tail[tail.len() - 1], 0, "the tail ends at silence");
+        assert_eq!(tail[tail.len() - 2], 0, "the tail ends at silence");
     }
 }
 
