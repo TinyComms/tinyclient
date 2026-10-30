@@ -702,6 +702,7 @@ mod tests {
             last_read: None,
             call: protocol::CallSupport::None,
             occupants: None,
+            limit: 0,
             read_only: false,
             private: false,
             draft: String::new(),

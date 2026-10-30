@@ -130,6 +130,9 @@ impl Stream {
         while self.pcm.len() < FRAME_SAMPLES {
             let decoded = match self.jitter.pop() {
                 Pop::Packet(packet) => self.decoder.decode(Some(&packet), 0, &mut pcm),
+                // Not a loss yet. Pitch carries the voice; the decoder stays put so the packet
+                // after a real gap can still rebuild it.
+                Pop::Hold => Some(self.decoder.bridge(FRAME, &mut pcm)),
                 Pop::Lost => {
                     // The packet after the hole may carry a copy of what was lost.
                     let rebuilt = self.jitter.next().and_then(|next| self.decoder.recover(next, &mut pcm));
@@ -201,6 +204,8 @@ pub(crate) struct Gate {
     quiet: u32,
     /// Silence frames still owed after the last talk spurt.
     trail: u32,
+    /// The frame that closed the gate still has to go out, ramped to silence, before the trail.
+    fade_out: bool,
 }
 
 impl Gate {
@@ -226,6 +231,9 @@ impl Gate {
             if muted || self.quiet >= hold.max(1) {
                 self.talking = false;
                 self.trail = TRAIL;
+                // This frame is still the voice. A silence packet here is a step from that
+                // sample to zero, which is the click at the end of a word and on mute.
+                self.fade_out = captured;
                 step.speaking = Some(false);
             }
         }
@@ -238,8 +246,14 @@ impl Gate {
                 step.early = self.preroll.drain(..).collect();
             }
             self.trail = 0;
+            self.fade_out = false;
             self.preroll.clear();
             step.send = Some(Send::Frame(*frame));
+        } else if self.fade_out {
+            self.fade_out = false;
+            let mut faded = *frame;
+            fade_down(&mut faded);
+            step.send = Some(Send::Frame(faded));
         } else if self.trail > 0 {
             self.trail -= 1;
             self.preroll.clear();
@@ -254,6 +268,16 @@ impl Gate {
             self.preroll.clear();
         }
         step
+    }
+}
+
+/// Ramps one frame down to silence. The first sample stays, the last is zero, so the trail of
+/// silence packets that follows does not start from a loud sample.
+fn fade_down(frame: &mut [i16; FRAME_SAMPLES]) {
+    let last = FRAME_SAMPLES.max(1) as f32;
+    for (n, sample) in frame.iter_mut().enumerate() {
+        let gain = 1. - (n as f32 + 1.) / last;
+        *sample = (f32::from(*sample) * gain) as i16;
     }
 }
 
@@ -1140,9 +1164,79 @@ mod loss_tests {
             clicks(&lossy, natural * 3 / 2),
             stream.rebuilt
         );
-        assert!(lost > 40, "{lost} lost");
+        // Counted when a hole is skipped, not during the two ticks a reorder may still fill it.
+        assert!(lost > 25, "{lost} lost");
         assert!(stream.rebuilt > 10, "FEC rebuilt {}", stream.rebuilt);
         assert_eq!(lossy.len(), clean.len(), "every tick had a frame");
         assert_eq!(clicks(&lossy, natural * 3 / 2), 0, "steps past the voice's own {natural}");
+    }
+
+    /// The Discord playback test: one second of a 440 Hz tone, packet 20 lost, and sequences
+    /// 29 and 30 swapped. The loudest 400 ms has to stay the tone. Waiting out that reorder
+    /// used to conceal, the decoder then forgot its state, and the frames after the real loss
+    /// came back near 7800.
+    #[test]
+    fn a_lost_tone_and_a_swapped_pair_stay_at_the_tones_level() {
+        let mut encoder = Encoder::new().unwrap();
+        let frames: Vec<Vec<u8>> = (0..50)
+            .map(|frame| {
+                let mut pcm = [0i16; FRAME_SAMPLES];
+                for (n, pair) in pcm.as_chunks_mut::<CHANNELS>().0.iter_mut().enumerate() {
+                    let t = (frame * FRAME + n) as f64 / 48_000.;
+                    pair.fill(((t * 440. * std::f64::consts::TAU).sin() * 8000.) as i16);
+                }
+                let mut packet = [0u8; 1275];
+                let len = encoder.encode(&pcm, &mut packet).unwrap();
+                packet[..len].to_vec()
+            })
+            .collect();
+        let (clean, _) = heard(&frames, |_| false);
+        let mut order: Vec<usize> = (0..50).filter(|&n| n != 20).collect();
+        order.swap(28, 29);
+        let mut stream = Stream::new().unwrap();
+        let mut played = Vec::new();
+        for n in order {
+            stream.jitter.insert(n as u16, frames[n].clone());
+            if let Some(frame) = stream.pull(&"test") {
+                played.extend(frame);
+            }
+        }
+        for _ in 0..8 {
+            if let Some(frame) = stream.pull(&"test") {
+                played.extend(frame);
+            } else {
+                break;
+            }
+        }
+        let rms = |pcm: &[i16]| (pcm.iter().map(|&s| f64::from(s).powi(2)).sum::<f64>() / pcm.len().max(1) as f64).sqrt();
+        let loudest = |pcm: &[i16]| pcm.chunks(FRAME_SAMPLES * 20).map(rms).fold(0., f64::max);
+        let (clean_level, played_level) = (loudest(&clean), loudest(&played));
+        assert!((4000. ..7000.).contains(&clean_level), "clean level {clean_level}");
+        assert!((4000. ..7000.).contains(&played_level), "played level {played_level}");
+        assert!(played_level < clean_level * 1.15, "played {played_level} against clean {clean_level}");
+        assert_eq!(stream.jitter.lost, 1, "one skipped packet");
+        assert_eq!(stream.jitter.late, 0, "the swapped packet arrived inside the wait");
+        assert_eq!(clicks(&played, steepest(&clean) * 3 / 2), 0, "a reorder wait must not click");
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+
+    #[test]
+    fn muting_fades_the_last_frame_out_before_the_silence_trail() {
+        let mut gate = Gate::default();
+        let loud = [8_000i16; FRAME_SAMPLES];
+        let opened = gate.step(&loud, true, false, true, 13);
+        assert!(matches!(opened.send, Some(Send::Frame(_))));
+        let closing = gate.step(&loud, true, true, false, 13);
+        let Some(Send::Frame(frame)) = closing.send else {
+            panic!("the last frame should fade out, not cut");
+        };
+        assert!(frame[0] > 7_000, "the fade starts at the voice, at {}", frame[0]);
+        assert_eq!(frame[FRAME_SAMPLES - 1], 0, "the fade ends at silence");
+        let trail = gate.step(&loud, true, true, false, 13);
+        assert!(matches!(trail.send, Some(Send::Silence)));
     }
 }
