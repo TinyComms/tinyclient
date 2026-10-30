@@ -95,7 +95,7 @@ Look at [open pull requests](https://github.com/itz4blitz/tinyclient/pulls) befo
 | Work | Where it stands |
 | --- | --- |
 | **Cached network sidebars** | [#10](https://github.com/itz4blitz/tinyclient/pull/10) keeps each network's home in memory for the GUI session, so switching away and back does not show "Getting your chats…" while the local daemon is reread. It conflicts with `main` after the Discord loading fix and needs a rebase that keeps both. |
-| **Discord voice channels in the server list** | Voice works in a DM and in a channel you are already in. The server list does not yet show public or private voice channels, or let you join one from there. That is being built on top of `main`. |
+| **Discord voice channels in the server list** | The server list shows voice channels with who is in them, and you can join one from there: a hover Join pill on the row, a double-click, or "Join voice" in the row's menu. Stage channels still open in Discord, and the list promises nothing beyond that. |
 | **Call audio** | Discord calls are Opus at 48 kHz. An underrun fades to silence and an over-full playback buffer fades across the samples it drops, so neither end hears a click from that buffer. Reopening the audio device runs off the 20 ms tick. Slack, Teams, Telegram, and Signal still hand the call to the official app. |
 | **Camera and screen share** | Calls are audio only. The protocol already names video streams, and a voice occupant can show a monitor glyph when Discord says they are streaming or on camera. mediad does not decode or send video yet. Receive-only screen share is the first slice; sending a camera, then guild "Go Live", comes after. |
 
