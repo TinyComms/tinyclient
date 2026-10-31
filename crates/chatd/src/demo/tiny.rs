@@ -88,6 +88,8 @@ fn member(
         last_seen_at: last_seen.map(str::to_owned),
         timeout_until: None,
         joined_via: Some("invite".to_owned()),
+        avatar: None,
+        avatar_path: String::new(),
     }
 }
 
@@ -1299,6 +1301,7 @@ pub fn answer(hub: &Hub, request: &Request) -> Option<Response> {
         Request::TinyRole { account, .. }
         | Request::TinyRename { account, .. }
         | Request::TinyServerIcon { account, .. }
+        | Request::TinyAvatar { account, .. }
             if ours(account) =>
         {
             Some(Response::Ok)

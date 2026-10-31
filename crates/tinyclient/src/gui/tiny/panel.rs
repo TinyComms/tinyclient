@@ -71,7 +71,7 @@ impl Shell {
         let page = self.tiny_page_facts()?;
         let me = page.community.member(page.me);
         let name = me.map(super::model::name_of).unwrap_or_else(|| "You".to_owned());
-        let mut avatar = Avatar::new(&page.key(page.me), &name, 32.);
+        let mut avatar = Avatar::new(&page.key(page.me), &name, 32.).image_at(page.picture(page.me));
         if page.live {
             avatar = avatar.presence(Presence::Online, theme::rail());
         }
@@ -126,7 +126,15 @@ impl Shell {
                 .flex()
                 .items_center()
                 .gap(px(8.))
-                .child(avatar.build())
+                .child(
+                    div()
+                        .id("tiny-my-avatar")
+                        .flex_none()
+                        .cursor_pointer()
+                        .tooltip(tip("Change your picture", None))
+                        .on_click(cx.listener(|this, _, _, cx| this.tiny_pick_avatar(cx)))
+                        .child(avatar.build()),
+                )
                 .child(
                     div()
                         .flex_1()

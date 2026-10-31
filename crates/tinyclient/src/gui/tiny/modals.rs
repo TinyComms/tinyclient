@@ -150,10 +150,28 @@ impl Shell {
                 .children(self.modal_error())
                 .child(self.buttons("Create category", ButtonKind::Primary, cx, |this, cx| this.tiny_create_category(cx))),
             Modal::Profile(user_id) => match page.community.member(user_id) {
-                Some(member) => modal("Profile")
-                    .w(px(400.))
-                    .child(div().mt(px(16.)).child(self.tiny_person_card(page, member, true)))
-                    .child(div().mt(px(20.)).flex().justify_end().child(button("tiny-profile-close", ButtonKind::Secondary, "Close").h(px(32.)).on_click(cx.listener(|this, _, _, cx| this.close_modal(cx))))),
+                Some(member) => {
+                    let mine = user_id == page.me;
+                    let id = user_id.clone();
+                    let pictured = member.avatar.is_some();
+                    let mut actions = div().mt(px(20.)).flex().justify_end().gap(px(8.));
+                    if mine {
+                        actions = actions.child(button("tiny-profile-picture", ButtonKind::Secondary, "Change picture").h(px(32.)).on_click(cx.listener(|this, _, _, cx| {
+                            this.close_modal(cx);
+                            this.tiny_pick_avatar(cx);
+                        })));
+                        if pictured {
+                            actions = actions.child(button("tiny-profile-picture-remove", ButtonKind::Ghost, "Remove picture").h(px(32.)).on_click(cx.listener(|this, _, _, cx| {
+                                this.close_modal(cx);
+                                this.tiny_send_avatar(None, cx);
+                            })));
+                        }
+                    } else {
+                        actions = actions.child(button("tiny-profile-message", ButtonKind::Primary, "Message").h(px(32.)).on_click(cx.listener(move |this, _, _, cx| this.tiny_message(id.clone(), cx))));
+                    }
+                    actions = actions.child(button("tiny-profile-close", ButtonKind::Secondary, "Close").h(px(32.)).on_click(cx.listener(|this, _, _, cx| this.close_modal(cx))));
+                    modal("Profile").w(px(400.)).child(div().mt(px(16.)).child(self.tiny_person_card(page, member, true))).child(actions)
+                }
                 None => modal("Profile").child(words("They are no longer on this server.")),
             },
             Modal::SignOut => modal(format!("Sign out of {}?", page.name))

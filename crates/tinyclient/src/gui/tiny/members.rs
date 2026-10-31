@@ -67,7 +67,7 @@ impl Shell {
     fn tiny_member_row(&self, page: &Page, member: &TinyMember, offline: bool, cx: &mut Context<Self>) -> AnyElement {
         let name = model::name_of(member);
         let me = member.user_id == page.me;
-        let mut avatar = Avatar::new(&page.key(&member.user_id), &name, 32.);
+        let mut avatar = Avatar::new(&page.key(&member.user_id), &name, 32.).image_at(page.picture(&member.user_id));
         if let Some(presence) = page.online(&member.user_id) {
             avatar = avatar.presence(presence, theme::sidebar());
         }
@@ -80,13 +80,14 @@ impl Shell {
             _ => None,
         };
         let hovered = self.tiny_state.card.as_ref().is_some_and(|(id, _)| *id == member.user_id);
-        let (hover_id, menu_id) = (member.user_id.clone(), member.user_id.clone());
+        let (hover_id, menu_id, open_id) = (member.user_id.clone(), member.user_id.clone(), member.user_id.clone());
         div()
             .id(SharedString::from(format!("tiny-member-{}", member.user_id)))
             .flex_none()
             .w_full()
             .h(px(theme::row_height(44.)))
             .px(px(theme::INSET))
+            .cursor_pointer()
             .child(
                 div()
                     .size_full()
@@ -120,6 +121,7 @@ impl Shell {
                 let y = f32::from(window.mouse_position().y);
                 this.tiny_hover_card(&hover_id, *over, y, cx);
             }))
+            .on_click(cx.listener(move |this, _, window, cx| this.tiny_open_modal(super::Modal::Profile(open_id.clone()), window, cx)))
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &MouseDownEvent, _, cx| this.tiny_open_float(Float::Person { user_id: menu_id.clone(), at: event.position }, cx)),
@@ -130,7 +132,7 @@ impl Shell {
     /// The card beside a hovered member: who they are here.
     pub(super) fn tiny_person_card(&self, page: &Page, member: &TinyMember, wide: bool) -> Div {
         let name = model::name_of(member);
-        let mut avatar = Avatar::new(&page.key(&member.user_id), &name, if wide { 72. } else { 56. });
+        let mut avatar = Avatar::new(&page.key(&member.user_id), &name, if wide { 72. } else { 56. }).image_at(page.picture(&member.user_id));
         if let Some(presence) = page.online(&member.user_id) {
             avatar = avatar.presence(presence, theme::overlay());
         }

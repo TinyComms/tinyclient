@@ -5,7 +5,7 @@
 //! them, and channels and categories are dragged into a new order.
 
 use super::model::{self, Line};
-use super::{Dragged, Float, Page};
+use super::{Dragged, Float, Modal, Page};
 use crate::gui::components::{glyph, list_row, tip, Avatar, Shape as AvatarShape};
 use crate::gui::state::Shell;
 use crate::gui::theme::{self, Type};
@@ -13,7 +13,13 @@ use gpui::{div, prelude::*, px, AnyElement, Context, Div, MouseButton, MouseDown
 use protocol::{Conversation, ConversationKind, Key, TinyRoom, TinySeat};
 use std::rc::Rc;
 
-/// Channels, or direct messages, above the voice rooms. The header is omitted when empty.
+/// Text channels only. A direct message is a People chat, not a row in the server.
+fn in_the_server(chats: &[Rc<Conversation>]) -> Vec<Rc<Conversation>> {
+    chats.iter().filter(|chat| chat.kind == ConversationKind::Channel).cloned().collect()
+}
+
+/// Text channels above the voice rooms. The header is omitted when empty. Direct messages are
+/// not channels of the server; they live in People.
 fn text_section(mut list: Stateful<Div>, label: &str, chats: &[Rc<Conversation>], kind: ConversationKind, open: Option<&Key>, cx: &mut Context<Shell>) -> Stateful<Div> {
     let rows: Vec<&Rc<Conversation>> = chats.iter().filter(|chat| chat.kind == kind).collect();
     if rows.is_empty() {
@@ -157,7 +163,6 @@ impl Shell {
         let mut list = div().id("tiny-channels").size_full().overflow_y_scroll().pt(px(4.)).pb(px(12.)).flex().flex_col();
         let chats = self.tiny_chats();
         list = text_section(list, "Text channels", &chats, ConversationKind::Channel, self.open.as_ref(), cx);
-        list = text_section(list, "Direct messages", &chats, ConversationKind::Direct, self.open.as_ref(), cx);
         if page.community.rooms.is_empty() && chats.is_empty() {
             list = list.child(
                 div()
@@ -194,7 +199,8 @@ impl Shell {
         list.into_any_element()
     }
 
-    /// Text channels and direct messages in this server's space, in the tree's order.
+    /// Text channels in this server's space, in the tree's order. Direct messages are kept in
+    /// the store for People and are not drawn here.
     fn tiny_chats(&self) -> Vec<Rc<Conversation>> {
         let Some(account) = self.tiny_state.account.as_ref() else {
             return Vec::new();
@@ -202,11 +208,7 @@ impl Shell {
         let Some(tree) = self.trees.get(&Key::new(account, "server")) else {
             return Vec::new();
         };
-        tree.conversations
-            .iter()
-            .filter(|chat| matches!(chat.kind, ConversationKind::Channel | ConversationKind::Direct))
-            .cloned()
-            .collect()
+        in_the_server(&tree.conversations)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -338,7 +340,7 @@ impl Shell {
         // My mute and my ring as my call has them, before the server echoes them back.
         let call = self.tiny_call().filter(|call| call.conversation.id == room_id);
         let seat = &super::channel::as_heard(seat, me, call.as_ref());
-        let avatar = super::super::call::ringed(Avatar::new(&page.key(&seat.user_id), &name, 20.).build(), 20., seat.speaking && !seat.server_muted);
+        let avatar = super::super::call::ringed(Avatar::new(&page.key(&seat.user_id), &name, 20.).image_at(page.picture(&seat.user_id)).build(), 20., seat.speaking && !seat.server_muted);
         let glyphs = seat_glyphs(seat);
         let content = div()
             .pl(px(24.))
@@ -357,12 +359,14 @@ impl Shell {
             .child(div().flex_none().flex().items_center().gap(px(4.)).children(glyphs.into_iter().map(|(icon, color, words)| {
                 div().id(SharedString::from(format!("tiny-seat-glyph-{}-{icon}", seat.user_id))).tooltip(tip(words, None)).child(glyph(icon, 14., color))
             })));
-        let user_id = seat.user_id.clone();
+        let menu_id = seat.user_id.clone();
+        let open_id = seat.user_id.clone();
         let mut row = list_row(SharedString::from(format!("tiny-seat-{room_id}-{}", seat.user_id)), theme::row_height(theme::ROW_ONE), false, false, content)
-            .cursor_default()
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, window, cx| this.tiny_open_modal(Modal::Profile(open_id.clone()), window, cx)))
             .on_mouse_down(
                 MouseButton::Right,
-                cx.listener(move |this, event: &MouseDownEvent, _, cx| this.tiny_open_float(Float::Person { user_id: user_id.clone(), at: event.position }, cx)),
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| this.tiny_open_float(Float::Person { user_id: menu_id.clone(), at: event.position }, cx)),
             );
         if !model::person_menu(page.community, &seat.user_id).move_to.is_empty() {
             row = row.cursor_grab().on_drag(Dragged::Person { user_id: seat.user_id.clone(), name }, |dragged, _, _, cx| cx.new(|_| Ghost(dragged.label())));
@@ -407,5 +411,23 @@ impl Shell {
             }
             Dragged::Person { .. } | Dragged::Role { .. } => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use protocol::AccountKey;
+    use protocol::Network;
+
+    #[test]
+    fn direct_messages_are_not_rows_of_the_server() {
+        let account = AccountKey { network: Network::Tiny, account: "host".into() };
+        let channel = Rc::new(Conversation::new(Key::new(&account, "c"), ConversationKind::Channel, "general"));
+        let direct = Rc::new(Conversation::new(Key::new(&account, "d"), ConversationKind::Direct, "Ada"));
+        let voice = Rc::new(Conversation::new(Key::new(&account, "v"), ConversationKind::Voice, "Lobby"));
+        let shown = in_the_server(&[channel, direct, voice]);
+        assert_eq!(shown.len(), 1);
+        assert_eq!(shown[0].title, "general");
     }
 }

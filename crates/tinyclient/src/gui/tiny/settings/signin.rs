@@ -5,7 +5,7 @@
 
 use super::kit::{card, note};
 use super::{page_head, section};
-use crate::gui::components::{button, glyph, Avatar, ButtonKind};
+use crate::gui::components::{button, glyph, tip, Avatar, ButtonKind};
 use crate::gui::state::Shell;
 use crate::gui::theme::{self, Type};
 use crate::gui::tiny::model;
@@ -79,7 +79,15 @@ pub(in crate::gui::tiny) fn signin(shell: &Shell, facts: &Facts, window: &mut Wi
                         .gap(px(12.))
                         .border_b_1()
                         .border_color(theme::hairline())
-                        .child(Avatar::new(&facts.key(facts.me), &name, 40.).build())
+                        .child(
+                            div()
+                                .id("tiny-signin-avatar")
+                                .flex_none()
+                                .cursor_pointer()
+                                .tooltip(tip("Change your picture", None))
+                                .on_click(cx.listener(|this, _, _, cx| this.tiny_pick_avatar(cx)))
+                                .child(Avatar::new(&facts.key(facts.me), &name, 40.).image_at(facts.picture(facts.me)).build()),
+                        )
                         .child(div().flex_1().min_w_0().flex().flex_col().child(div().type_title().text_color(theme::text()).child(name.clone())).child(
                             div().type_small().text_color(theme::text_soft()).child(if unknown {
                                 "Signed in through the server's provider".to_owned()

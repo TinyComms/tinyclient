@@ -238,6 +238,51 @@ fn fetch_icon(saved: &Saved) -> Option<Vec<u8>> {
     (bytes.len() <= TINY_ICON_MAX && image_kind(&bytes).is_some()).then_some(bytes)
 }
 
+/// Fetches each member's picture once per hash, beside the server icon, and names the file on
+/// the member. A hash already on disk is not fetched again.
+pub(crate) fn remember_avatars(saved: &Saved, account: &AccountKey, members: &mut [protocol::TinyMember]) {
+    for member in members {
+        let Some(hash) = member.avatar.as_deref().filter(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())) else {
+            member.avatar_path.clear();
+            continue;
+        };
+        if !safe_id(&member.user_id) {
+            continue;
+        }
+        if let Some(path) = avatar_file(saved, account, &member.user_id, hash) {
+            member.avatar_path = path.to_string_lossy().into_owned();
+        }
+    }
+}
+
+fn avatar_file(saved: &Saved, account: &AccountKey, user_id: &str, hash: &str) -> Option<PathBuf> {
+    let path = crate::blobs::path_of(&protocol::support_dir().join("media"), account, &format!("tiny-avatar-{user_id}-{hash}"));
+    if path.is_file() {
+        return Some(path);
+    }
+    let bytes = fetch_avatar(saved, user_id)?;
+    std::fs::create_dir_all(path.parent()?).ok()?;
+    let partial = path.with_extension("part");
+    std::fs::write(&partial, &bytes).ok()?;
+    std::fs::rename(&partial, &path).ok()?;
+    Some(path)
+}
+
+fn fetch_avatar(saved: &Saved, user_id: &str) -> Option<Vec<u8>> {
+    let response = super::agent()
+        .get(&endpoint(&saved.base_url, &format!("/v1/users/{user_id}/avatar")))
+        .header("Authorization", &format!("Bearer {}", saved.token))
+        .call()
+        .ok()?;
+    if response.status().as_u16() != 200 {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    let mut body = response.into_body();
+    body.as_reader().take(TINY_ICON_MAX as u64 + 1).read_to_end(&mut bytes).ok()?;
+    (bytes.len() <= TINY_ICON_MAX && image_kind(&bytes).is_some()).then_some(bytes)
+}
+
 /// The type of a picture the server takes, by its first bytes.
 fn image_kind(bytes: &[u8]) -> Option<&'static str> {
     if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
@@ -383,6 +428,44 @@ pub(crate) fn server_icon(account: AccountKey, path: Option<String>) -> Response
     match put_bytes(&saved, "/v1/server/icon", kind, &bytes) {
         Err(detail) => refused(detail),
         Ok((200..=299, _)) => Response::Ok,
+        Ok((status, body)) => refused(explain(status, &body, Missing::Plain)),
+    }
+}
+
+/// This account's own picture, or with `None` no picture. Any member may set their own.
+/// A server from before pictures answers 404, which is said in words.
+pub(crate) fn user_avatar(account: AccountKey, path: Option<String>) -> Response {
+    let saved = match open(&account) {
+        Ok(saved) => saved,
+        Err(answer) => return answer,
+    };
+    let Some(path) = path else {
+        return match asked("DELETE", &saved, "/v1/me/avatar", None) {
+            Err(detail) => refused(detail),
+            Ok((200..=299, _)) => Response::Ok,
+            Ok((404, _)) => refused(OLDER),
+            Ok((status, body)) => refused(explain(status, &body, Missing::Plain)),
+        };
+    };
+    let real = match crate::blobs::upload::allowed(&path) {
+        Ok((real, _)) => real,
+        Err(why) => return refused(&format!("That picture {why}")),
+    };
+    let mut bytes = Vec::new();
+    let read = std::fs::File::open(&real).and_then(|file| file.take(TINY_ICON_MAX as u64 + 1).read_to_end(&mut bytes));
+    if read.is_err() {
+        return refused("That picture couldn't be read.");
+    }
+    if bytes.len() > TINY_ICON_MAX {
+        return refused(ICON_SIZE);
+    }
+    let Some(kind) = image_kind(&bytes) else {
+        return refused(ICON_KIND);
+    };
+    match put_bytes(&saved, "/v1/me/avatar", kind, &bytes) {
+        Err(detail) => refused(detail),
+        Ok((200..=299, _)) => Response::Ok,
+        Ok((404, _)) => refused(OLDER),
         Ok((status, body)) => refused(explain(status, &body, Missing::Plain)),
     }
 }

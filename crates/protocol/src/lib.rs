@@ -1513,6 +1513,13 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         path: Option<String>,
     },
+    /// Sets this account's picture from a file on this computer (PNG, JPEG or WebP, at most
+    /// [`TINY_ICON_MAX`] bytes), or with no `path` removes it. Any member may set their own.
+    TinyAvatar {
+        account: AccountKey,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+    },
     /// Makes a role just below this account's own rank (`roles`, manage_roles).
     TinyRoleCreate {
         account: AccountKey,

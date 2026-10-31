@@ -112,7 +112,7 @@ impl Shell {
                 .flex()
                 .items_center()
                 .gap(px(10.))
-                .child(Avatar::new(&page.key(user_id), &name, 28.).build())
+                .child(Avatar::new(&page.key(user_id), &name, 28.).image_at(page.picture(user_id)).build())
                 .child(
                     div()
                         .flex_1()
@@ -129,6 +129,15 @@ impl Shell {
         );
         let id = user_id.to_owned();
         items = items.child(menu_separator()).child(self.plain(menu_item("tiny-person-profile", Some("icons/user.svg"), "Profile", None), cx).on_click(cx.listener(move |this, _, window, cx| this.tiny_open_modal(Modal::Profile(id.clone()), window, cx))));
+        if facts.me {
+            items = items.child(self.plain(menu_item("tiny-person-picture", Some("icons/upload.svg"), "Change picture", None), cx).on_click(cx.listener(|this, _, _, cx| {
+                this.tiny_close_float(cx);
+                this.tiny_pick_avatar(cx);
+            })));
+        } else {
+            let message_id = user_id.to_owned();
+            items = items.child(self.plain(menu_item("tiny-person-message", Some("icons/message-square.svg"), "Message", None), cx).on_click(cx.listener(move |this, _, _, cx| this.tiny_message(message_id.clone(), cx))));
+        }
         if facts.local {
             let (percent, muted) = self.tiny_state.gain(user_id);
             let slide_id = user_id.to_owned();

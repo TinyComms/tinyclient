@@ -36,6 +36,12 @@ pub struct TinyMember {
     /// `invite` or `groups` (the sign-in provider's groups let them in). `None` when not known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub joined_via: Option<String>,
+    /// SHA-256 of their picture, when they have set one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<String>,
+    /// Where that picture is on disk. chatd fills this; the server does not send it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub avatar_path: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
