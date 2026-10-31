@@ -774,8 +774,10 @@ impl SettingsWindow {
             "home" => self.menu_cursor = 0,
             "end" => self.menu_cursor = last,
             "enter" | "space" => {
-                if let Some((value, _)) = choices.into_iter().nth(self.menu_cursor) {
-                    self.pick_device(picker, value, window, cx);
+                if let Some((value, words)) = choices.into_iter().nth(self.menu_cursor) {
+                    if !words.starts_with("No ") {
+                        self.pick_device(picker, value, window, cx);
+                    }
                 }
                 return true;
             }

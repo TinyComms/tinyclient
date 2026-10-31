@@ -586,7 +586,10 @@ impl Conversation {
     /// a number only for a mention.
     pub fn badge(&self) -> Badge {
         let quiet = self.bot || self.archived || self.special == Special::Request;
-        let needs_me = if self.kind.is_direct() && !self.muted && !quiet {
+        // Teams stores a boolean unread as 1. A count is only honest for a mention.
+        let needs_me = if self.key.network == Network::Teams {
+            self.mentions
+        } else if self.kind.is_direct() && !self.muted && !quiet {
             self.unread.max(self.mentions)
         } else {
             self.mentions
@@ -1413,6 +1416,8 @@ pub enum Request {
     /// N13: posts one real notification, "This is how messages will look and sound", with the
     /// preview and sound chosen. Answers `NotifyTested` with what the system said.
     NotifyTest,
+    /// Saved Tiny server origins, read locally without contacting servers.
+    TinyLocalServers,
     /// S11: plays one notification sound once, by its settings word (`pebble`, `soft_ring`), at
     /// the alert volume, as a notification would. Plays even when sounds are off.
     PlaySound {
@@ -1961,6 +1966,10 @@ pub enum Response {
         messages: u64,
         bytes: u64,
     },
+    /// Saved Tiny account keys and their server origins; no credentials.
+    TinyLocalServers {
+        servers: Vec<(AccountKey, String)>,
+    },
     /// Who is on this Tiny server, plus the invites and the audit when this account may see them.
     TinyCommunity {
         community: TinyCommunity,
@@ -2124,6 +2133,12 @@ mod tests {
         assert_eq!(Conversation { mentions: 1, ..app }.badge(), Badge::Count(1));
         let archived = Conversation { archived: true, ..row(Direct, 4, 0, false) };
         assert_eq!(archived.badge(), Badge::Dot);
+        // Teams' unread is a boolean stored as 1: a dot, and a count only for a mention.
+        let mut teams = row(Direct, 1, 0, false);
+        teams.key.network = Network::Teams;
+        assert_eq!(teams.badge(), Badge::Dot);
+        teams.mentions = 2;
+        assert_eq!(teams.badge(), Badge::Count(2));
     }
 
     #[test]

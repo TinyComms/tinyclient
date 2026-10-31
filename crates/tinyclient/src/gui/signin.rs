@@ -33,7 +33,7 @@ use gpui::{
     canvas, deferred, div, fill, point, prelude::*, px, rgb, size, App, Bounds, Context, Deferred, Div, Entity,
     FocusHandle, Focusable, Global, MouseButton, Rgba, SharedString, Stateful, Task, Window,
 };
-use protocol::{Change, CodeVia, ErrorCode, Network, Request, Response, SignInInput, SignInProblem, SignInStep};
+use protocol::{AccountKey, Change, CodeVia, ErrorCode, Network, Request, Response, SignInInput, SignInProblem, SignInStep};
 use std::io;
 use std::rc::Rc;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
@@ -55,6 +55,22 @@ const BOX: (f32, f32) = (48., 56.);
 const RETRY: Duration = Duration::from_secs(2);
 /// Above the popovers and menus of the shell, which use 1 to 3.
 const PRIORITY: usize = 8;
+
+/// The invite, when present, is authoritative even if another server was typed first.
+fn invite_notice(input: &str, server: &str) -> String {
+    if let Some((origin, _)) = protocol::parse_invite_link(input) {
+        let transport = if origin.starts_with("http://") {
+            " This server uses an unencrypted HTTP connection."
+        } else {
+            ""
+        };
+        format!("Join {origin}?{transport} Continue only if you trust this server. If you already signed in to it, signing in again will replace that account on this device.")
+    } else if server.is_empty() {
+        "Paste the invite link or code you were given.".to_owned()
+    } else {
+        format!("{} — signing in again will replace any existing account for this server on this device.", protocol::join_host(server))
+    }
+}
 
 /// What the sheet shows.
 #[derive(Clone, PartialEq, Eq)]
@@ -96,6 +112,9 @@ pub struct Sheet {
     url: Entity<TextInput>,
     /// An invite code for that server.
     invite: Entity<TextInput>,
+    /// None while local saved servers are being read; Err if they could not be checked.
+    local_servers: Option<Result<Vec<(AccountKey, String)>, ()>>,
+    open_existing: Option<AccountKey>,
     /// Has the keys when no field does, so Escape still closes the sheet.
     focus: FocusHandle,
     /// The step changed: put the keys where typing goes, on the next frame.
@@ -132,6 +151,18 @@ pub fn open(network: Network, cx: &mut Context<Shell>) -> bool {
     true
 }
 
+/// Prepare an invite for explicit confirmation, without contacting its server.
+pub fn open_invite(link: &str, cx: &mut App) -> bool {
+    let Some((origin, token)) = protocol::parse_invite_link(link) else { return false; };
+    let Some(code) = protocol::pack_join(&origin, &token) else { return false; };
+    holder(cx).update(cx, |sheet, cx| {
+        if sheet.face.is_some() { return false; }
+        sheet.open(Network::Tiny, cx);
+        sheet.invite.update(cx, |input, cx| input.set_text(&code, cx));
+        true
+    })
+}
+
 /// The sheet, when it is open: drawn after everything else in the window, so it covers the
 /// first-run screen and the full shell alike.
 pub fn layer(window: &mut Window, cx: &mut App) -> Option<Deferred> {
@@ -147,6 +178,20 @@ pub fn layer(window: &mut Window, cx: &mut App) -> Option<Deferred> {
         window.defer(cx, move |window, cx| window.focus(&before, cx));
     }
     open.then(|| deferred(sheet).with_priority(PRIORITY))
+}
+
+pub(super) fn take_open_existing(cx: &mut App) -> Option<AccountKey> {
+    holder(cx).update(cx, |sheet, _| sheet.open_existing.take())
+}
+
+fn matching_server(input: &str, servers: &[(AccountKey, String)]) -> Option<AccountKey> {
+    let (origin, _) = protocol::parse_invite_link(input)?;
+    servers.iter().find_map(|(account, saved)| {
+        let normalized = protocol::invite_url(saved, "x")
+            .and_then(|link| protocol::parse_invite_link(&link))
+            .map(|(origin, _)| origin);
+        (normalized.as_deref() == Some(origin.as_str())).then(|| account.clone())
+    })
 }
 
 fn now() -> i64 {
@@ -341,6 +386,8 @@ impl Sheet {
             password,
             url,
             invite,
+            local_servers: None,
+            open_existing: None,
             focus: cx.focus_handle(),
             refocus: false,
             before: None,
@@ -388,11 +435,26 @@ impl Sheet {
             return;
         }
         self.network = network;
+        self.local_servers = None;
         self.clear_fields(cx);
         // The tile is up at once, saying a code is on its way.
         self.face = Some(Face::Step(waiting_for(network)));
         self.refocus = true;
         self.begin(cx);
+        if network == Network::Tiny {
+            let epoch = self.epoch;
+            cx.spawn(async move |this, cx| {
+                let answer = cx.background_executor().spawn(async { crate::ask(&Request::TinyLocalServers) }).await;
+                let _ = this.update(cx, |this, cx| {
+                    if this.epoch != epoch || this.face.is_none() { return; }
+                    this.local_servers = Some(match answer {
+                        Ok(Response::TinyLocalServers { servers }) => Ok(servers),
+                        _ => Err(()),
+                    });
+                    cx.notify();
+                });
+            }).detach();
+        }
         cx.notify();
     }
 
@@ -743,10 +805,37 @@ impl Sheet {
     }
 
     fn send_invite(&mut self, cx: &mut Context<Sheet>) {
+        if self.local_servers.is_none() || self.existing_invite(cx).is_some() {
+            return;
+        }
+        self.send_invite_confirmed(cx);
+    }
+
+    fn existing_invite(&self, cx: &Context<Sheet>) -> Option<AccountKey> {
+        let servers = self.local_servers.as_ref()?.as_ref().ok()?;
+        let code = self.invite.read(cx).text();
+        if protocol::parse_invite_link(code).is_some() { return matching_server(code, servers); }
+        let Some(Face::Step(SignInStep::Invite { server, .. })) = &self.face else { return None; };
+        let link = protocol::invite_url(server, "x")?;
+        matching_server(&link, servers)
+    }
+
+    fn open_existing_invite(&mut self, cx: &mut Context<Sheet>) {
+        if let Some(account) = self.existing_invite(cx) {
+            self.open_existing = Some(account);
+            self.close(true, cx);
+            cx.refresh_windows();
+        }
+    }
+
+    fn send_invite_confirmed(&mut self, cx: &mut Context<Sheet>) {
         if self.busy {
             return;
         }
         let code = self.invite.read(cx).text().to_owned();
+        let code = protocol::parse_invite_link(&code)
+            .and_then(|(origin, token)| protocol::pack_join(&origin, &token))
+            .unwrap_or(code);
         // A code is not kept in the field after it is sent. An empty one still goes to chatd,
         // which stays on this step and says to paste the code.
         self.invite.update(cx, |input, cx| input.set_text("", cx));
@@ -1055,15 +1144,11 @@ impl Sheet {
         let focused = self.invite.focus_handle(cx).is_focused(window);
         let input = tall_field(focused, problem.is_some()).child(self.invite.clone());
         let fresh = server.is_empty();
-        let host = protocol::join_host(server);
-        let aside = if fresh {
-            "Paste the code you were given. It has the server in it, so you don't type an address."
-        } else {
-            ""
-        };
+        let aside = invite_notice(self.invite.read(cx).text(), server);
         let account = fresh.then(|| {
             self.answer_link("signin-have-account", "I already have an account", || SignInInput::HaveCode { url: String::new() }, cx)
         });
+        let existing = self.existing_invite(cx).is_some();
         div()
             .flex()
             .flex_col()
@@ -1074,15 +1159,24 @@ impl Sheet {
                     .mb(px(16.))
                     .whitespace_normal()
                     .text_color(theme::text_soft())
-                    .child(if fresh { aside.to_owned() } else { host }),
+                    .child(aside),
             )
             .child(input)
+            .children(existing.then(|| div().mt(px(8.)).type_small().text_color(theme::text_soft())
+                .child("You already have this server. Open it, or choose Sign in again to replace the saved account.")))
+            .children(self.local_servers.is_none().then(|| div().mt(px(8.)).type_small().child("Checking saved servers…")))
             .children(problem.map(|problem| error_line(problem_words(self.network, problem)).mt(px(6.))))
             .children(fresh.then(run_your_own))
             .child(
                 footer(22.)
                     .child(account.map_or_else(|| div().into_any_element(), IntoElement::into_any_element))
-                    .child(buttons().child(self.cancel("Cancel", cx)).child(self.primary("Continue", Sheet::send_invite, cx))),
+                    .child(if existing {
+                        buttons().child(self.cancel("Cancel", cx))
+                            .child(self.primary("Open existing server", Sheet::open_existing_invite, cx))
+                            .child(self.primary("Sign in again", Sheet::send_invite_confirmed, cx))
+                    } else {
+                        buttons().child(self.cancel("Cancel", cx)).child(self.primary("Continue", Sheet::send_invite, cx))
+                    }),
             )
     }
 
@@ -1551,3 +1645,22 @@ mod tests {
         assert_eq!(stopped_words("https://chat.example", "Tinyauth"), "chat.example signs you in with Tinyauth, in your browser.");
     }
 }
+    #[test]
+    fn invite_notice_names_actual_destination_and_warns_about_replacement() {
+        let link = protocol::invite_url("http://other.example:8080", "token").unwrap();
+        let notice = invite_notice(&link, "https://first.example");
+        assert!(notice.contains("http://other.example:8080"));
+        assert!(notice.contains("unencrypted HTTP"));
+        assert!(notice.contains("replace"));
+        assert!(!notice.contains("first.example"));
+    }
+
+    #[test]
+    fn existing_server_match_uses_the_exact_normalized_origin() {
+        let account = AccountKey { network: Network::Tiny, account: "member".into() };
+        let servers = vec![(account.clone(), "https://Example.com:443".into())];
+        let link = protocol::invite_url("https://example.com", "token").unwrap();
+        assert_eq!(matching_server(&link, &servers), Some(account));
+        let other = protocol::invite_url("http://example.com", "token").unwrap();
+        assert_eq!(matching_server(&other, &servers), None);
+    }

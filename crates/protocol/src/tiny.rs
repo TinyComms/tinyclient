@@ -941,6 +941,61 @@ pub fn unpack_join(pasted: &str) -> Option<(String, String)> {
     Some((origin, token.to_owned()))
 }
 
+/// The maximum length of an invite payload. Invite links are bearer credentials.
+pub const INVITE_PAYLOAD_MAX: usize = 2048;
+const INVITE_ORIGIN_MAX: usize = 512;
+const INVITE_TOKEN_MAX: usize = 256;
+const INVITE_SITE_PREFIX: &str = "https://tinyclient.io/invite#";
+const INVITE_APP_PREFIX: &str = "tinyclient://join#";
+
+/// Normalize an HTTP(S) server origin without accepting credentials or URL components.
+fn invite_origin(origin: &str) -> Option<String> {
+    if origin.len() > INVITE_ORIGIN_MAX || origin.chars().any(|c| c.is_whitespace() || c.is_control() || c == '\\') {
+        return None;
+    }
+    let (_, authority) = origin.split_once("://")?;
+    if authority.is_empty() || authority.contains(['/', '?', '#', '@']) || authority.ends_with(':') || authority.ends_with('.') {
+        return None;
+    }
+    let parsed = url::Url::parse(origin).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none_or(|host| host.ends_with('.'))
+        || parsed.port() == Some(0)
+    {
+        return None;
+    }
+    Some(parsed.origin().ascii_serialization())
+}
+
+/// Create a shareable link. Its fragment contains a secret; don't log the returned value.
+pub fn invite_url(origin: &str, token: &str) -> Option<String> {
+    let origin = invite_origin(origin)?;
+    if token.is_empty() || token.len() > INVITE_TOKEN_MAX || !token.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+        return None;
+    }
+    let payload = pack_join(&origin, token)?;
+    (payload.len() <= INVITE_PAYLOAD_MAX).then(|| format!("{INVITE_SITE_PREFIX}{payload}"))
+}
+
+/// Read a canonical site link, app link or legacy code and validate its destination.
+/// Returned HTTP origins require a user-visible warning before connecting.
+pub fn parse_invite_link(input: &str) -> Option<(String, String)> {
+    if input.len() > INVITE_PAYLOAD_MAX + INVITE_SITE_PREFIX.len() {
+        return None;
+    }
+    let payload = input.strip_prefix(INVITE_SITE_PREFIX)
+        .or_else(|| input.strip_prefix(INVITE_APP_PREFIX))
+        .unwrap_or(input);
+    if payload.len() > INVITE_PAYLOAD_MAX || payload.bytes().any(|b| b.is_ascii_whitespace()) {
+        return None;
+    }
+    let (origin, token) = unpack_join(payload)?;
+    if token.len() > INVITE_TOKEN_MAX {
+        return None;
+    }
+    Some((invite_origin(&origin)?, token))
+}
+
 /// The host, and a port when it is not the usual one. `https://private.tinyclient.io` is
 /// `private.tinyclient.io`. `http://127.0.0.1:8080` keeps the port.
 pub fn join_host(origin: &str) -> String {
@@ -1012,6 +1067,33 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn invite_links_round_trip_site_app_and_legacy_payload() {
+        let url = invite_url("https://Chat.Example:8443", "tok-en_1").unwrap();
+        assert!(url.starts_with("https://tinyclient.io/invite#tc1."));
+        let payload = url.split_once('#').unwrap().1;
+        let expected = Some(("https://chat.example:8443".to_owned(), "tok-en_1".to_owned()));
+        assert_eq!(parse_invite_link(&url), expected);
+        assert_eq!(parse_invite_link(&format!("tinyclient://join#{payload}")), expected);
+        assert_eq!(parse_invite_link(payload), expected);
+        let local = invite_url("http://[::1]:8080", "a").unwrap();
+        assert_eq!(parse_invite_link(&local), Some(("http://[::1]:8080".into(), "a".into())));
+    }
+
+    #[test]
+    fn invite_links_reject_unsafe_origins_and_untrusted_wrappers() {
+        for origin in ["ftp://host", "https://user@host", "https://host/path", "https://host?x=1", "https://host#x", "https://host:0", "https://host:99999", "https://[bad]:80", "https://host\\evil", "https://host:", "https://host."] {
+            assert!(invite_url(origin, "token").is_none(), "{origin}");
+        }
+        assert!(invite_url("https://host", "has.dot").is_none());
+        assert!(invite_url("https://host", &"a".repeat(257)).is_none());
+        let code = pack_join("https://host", "token").unwrap();
+        assert!(parse_invite_link(&format!("https://evil.example/invite#{code}")).is_none());
+        assert!(parse_invite_link(&format!("https://tinyclient.io/invite?x=1#{code}")).is_none());
+        assert!(parse_invite_link(&"a".repeat(2049)).is_none());
+        assert!(parse_invite_link("tc1.zz.token").is_none());
+    }
 
     #[test]
     fn tiny_can_matrix() {

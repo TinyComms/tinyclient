@@ -188,10 +188,14 @@ impl SettingsWindow {
         let column = div().w(px(controls::COLUMN)).flex().flex_col();
         let groups: Vec<Div> = match self.section {
             Section::Accounts => return column.child(self.accounts(window, cx)),
-            Section::General => vec![
-                self.group(&["G2"], None, window, cx).child(caption(self.keep_running_caption())),
-                self.group(&["G4"], None, window, cx).child(caption(self.updates_caption())),
-            ],
+            Section::General => {
+                let mut groups = Vec::new();
+                if cfg!(target_os = "macos") {
+                    groups.push(self.group(&["G2"], None, window, cx).child(caption(self.keep_running_caption())));
+                }
+                groups.push(self.group(&["G4"], None, window, cx).child(caption(self.updates_caption())));
+                groups
+            }
             Section::Notifications => self.notifications_page(window, cx),
             Section::Sounds => {
                 let mut groups = vec![self.group(&["S1"], None, window, cx).child(caption("Which call sounds play, and how loud, is in Voice."))];
@@ -243,7 +247,7 @@ impl SettingsWindow {
                 ]
             }
             Section::Storage => vec![self.group(&["D1", "D2", "D3"], None, window, cx).child(caption("Sign-ins, drafts and settings are not part of this."))],
-            Section::Shortcuts => return column.child(self.shortcuts("")),
+            Section::Shortcuts => return column.child(self.shortcuts("", cx)),
             Section::About => return column.child(self.about(window, cx)),
         };
         let banner = self.banner(cx);
@@ -258,11 +262,8 @@ impl SettingsWindow {
         let (icon, words, action): (&'static str, &'static str, Option<(&'static str, &'static str)>) = if chatd && !self.reachable(cx) {
             ("icons/wifi-off.svg", "Can't reach tinyclient's background service. These settings return when it does.", None)
         } else if denied {
-            (
-                "icons/mic-off.svg",
-                "tinyclient can't use the microphone. Allow it in System Settings › Privacy & Security › Microphone.",
-                Some(("Open System Settings", "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")),
-            )
+            let (words, action) = Self::microphone_denied();
+            ("icons/mic-off.svg", words, action)
         } else if unwatched {
             (
                 "icons/key.svg",
@@ -318,6 +319,22 @@ impl SettingsWindow {
             );
         } else {
             crate::update::discard_download();
+        }
+    }
+
+    fn microphone_denied() -> (&'static str, Option<(&'static str, &'static str)>) {
+        if cfg!(target_os = "macos") {
+            (
+                "tinyclient can't use the microphone. Allow it in System Settings › Privacy & Security › Microphone.",
+                Some(("Open System Settings", "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")),
+            )
+        } else if cfg!(windows) {
+            (
+                "tinyclient can't use the microphone. Allow it in Settings › Privacy & security › Microphone.",
+                Some(("Open Settings", "ms-settings:privacy-microphone")),
+            )
+        } else {
+            ("tinyclient can't use the microphone. Allow it for tinyclient in your system's privacy settings.", None)
         }
     }
 
@@ -407,8 +424,8 @@ impl SettingsWindow {
                 self.switch_row(id, choices.previews, true, second, |this, on, cx| this.choose(|c| c.previews = on, cx), cx)
             }
             "M1" => {
-                let second = if choices.command_return { "Return adds a line." } else { "⇧Return adds a line." };
-                self.segmented_row(id, &["Return", "⌘Return"], usize::from(choices.command_return), 0, Some(second.to_owned()), |this, ix, cx| this.choose(|c| c.command_return = ix == 1, cx), cx)
+                let second = crate::gui::shortcuts::label(if choices.command_return { "Return adds a line." } else { "⇧Return adds a line." });
+                self.segmented_row(id, &["Return", "⌘Return"], usize::from(choices.command_return), 0, Some(second), |this, ix, cx| this.choose(|c| c.command_return = ix == 1, cx), cx)
             }
             "M2" => self.segmented_row(id, &["First unread", "Newest message"], usize::from(choices.newest), 0, None, |this, ix, cx| this.choose(|c| c.newest = ix == 1, cx), cx),
             "M3" => self.switch_row(id, choices.typing, true, None, |this, on, cx| this.choose(|c| c.typing = on, cx), cx),
@@ -436,7 +453,7 @@ impl SettingsWindow {
                 let at = KEEP_DAYS_CHOICES.iter().position(|d| *d == days).unwrap_or(2);
                 self.segmented_row(id, &["7 days", "30 days", "90 days"], at, 2, None, move |this, ix, cx| this.pick_retention(KEEP_DAYS_CHOICES[ix], cx), cx)
             }
-            "P1" | "P2" => return self.per_account_rows(id, cx),
+            "P1" | "P2" => return self.per_account_rows(id, cx).unwrap_or_else(div),
             "V1" | "V2" => self.device_row(id, cx),
             "V3" => self.meter_row(cx),
             "V8" => {
@@ -711,18 +728,34 @@ impl SettingsWindow {
             return vec![div().flex().flex_col().child(group_label("Let others see")).child(caption("Sign in to an account to choose what it shares.").pt(px(0.)))];
         }
         let _ = window;
-        let typing = div().flex().flex_col().child(group_label(label_of("P1"))).child(self.per_account_rows("P1", cx));
-        let receipts = div()
-            .pt(px(20.))
-            .flex()
-            .flex_col()
-            .child(group_label(label_of("P2")))
-            .child(self.per_account_rows("P2", cx))
-            .child(caption("Discord and Slack have no read receipts."));
-        vec![typing, receipts]
+        let mut groups = Vec::new();
+        if let Some(rows) = self.per_account_rows("P1", cx) {
+            groups.push(div().flex().flex_col().child(group_label(label_of("P1"))).child(rows));
+        }
+        let receipts = self.per_account_rows("P2", cx);
+        let gap = if groups.is_empty() { 0. } else { 20. };
+        match receipts {
+            Some(rows) => groups.push(
+                div()
+                    .pt(px(gap))
+                    .flex()
+                    .flex_col()
+                    .child(group_label(label_of("P2")))
+                    .child(rows)
+                    .child(caption("Discord and Slack have no read receipts.")),
+            ),
+            None if accounts.iter().any(|account| matches!(account.key.network, Network::Discord | Network::Slack)) => {
+                groups.push(div().pt(px(gap)).flex().flex_col().child(group_label(label_of("P2"))).child(caption("Discord and Slack have no read receipts.")));
+            }
+            None if accounts.iter().all(|account| account.key.network == Network::Tiny) => {
+                groups.push(div().flex().flex_col().child(caption("Tiny does not share typing or read receipts from tinyclient.").pt(px(0.))));
+            }
+            None => {}
+        }
+        groups
     }
 
-    fn per_account_rows(&mut self, id: &'static str, cx: &mut Context<Self>) -> Div {
+    fn per_account_rows(&mut self, id: &'static str, cx: &mut Context<Self>) -> Option<Div> {
         let values = prefs::values();
         let accounts = accounts(self, cx);
         let several = |network: Network| accounts.iter().filter(|a| a.key.network == network).count() > 1;
@@ -735,6 +768,7 @@ impl SettingsWindow {
                 ("P1", Network::Telegram) | ("P2", Network::Telegram) => (Some("Always on"), Some("Telegram does not let an app turn this off.")),
                 ("P1", Network::Signal) | ("P2", Network::Signal) => (Some("Set on your phone"), Some("Signal takes this from your phone's settings.")),
                 ("P1", Network::Messages) => (Some("Sent to the phone"), Some("Messages shows typing on your other devices.")),
+                ("P2", Network::Messages) => (Some("On your devices"), Some("Messages does not let tinyclient change read receipts.")),
                 ("P2", Network::Discord | Network::Slack) | ("P1" | "P2", Network::Tiny) => continue,
                 _ => (None, None),
             };
@@ -794,8 +828,11 @@ impl SettingsWindow {
             card = card.when(drawn > 0, |card| card.child(rule())).child(line);
             drawn += 1;
         }
+        if drawn == 0 {
+            return None;
+        }
         let failed = (self.failed == Some(id)).then(|| div().px(px(12.)).pb(px(8.)).type_small().text_color(theme::danger()).child(failure_words(id, true)));
-        card.when(self.waits_on_chatd(id, cx), |card| card.opacity(0.4)).children(failed)
+        Some(card.when(self.waits_on_chatd(id, cx), |card| card.opacity(0.4)).children(failed))
     }
 
     /// The menu button of a device picker (V1, V2). As wide as what it says, 120 to 240; the
@@ -1246,11 +1283,28 @@ impl SettingsWindow {
     }
 
     /// The Shortcuts section, or its lines that match `query`.
-    pub(super) fn shortcuts(&self, query: &str) -> Div {
+    pub(super) fn shortcuts(&self, query: &str, cx: &gpui::App) -> Div {
         let mut column = div().flex().flex_col();
         if query.is_empty() {
             column = column.child(caption(crate::host::SHORTCUTS_CAPTION).pt(px(0.)).pb(px(14.)));
         }
+        let (open_in, places) = self.shell.upgrade().map(|shell| {
+            let shell = shell.read(cx);
+            let open_in = shell.open.as_ref().map(|key| format!("Open in {}", key.network.label()));
+            let modes = shell.places();
+            let names = modes
+                .into_iter()
+                .skip(2)
+                .take(7)
+                .map(|mode| match mode {
+                    crate::gui::sidebar::Mode::Network(network) => network.label().to_owned(),
+                    crate::gui::sidebar::Mode::Space(key) => shell.spaces.iter().find(|space| space.key == key).map(|space| space.name.clone()).unwrap_or(key.id),
+                    crate::gui::sidebar::Mode::Inbox => "Inbox".to_owned(),
+                    crate::gui::sidebar::Mode::People => "People".to_owned(),
+                })
+                .collect::<Vec<_>>();
+            (open_in, rows::place_keys(&names))
+        }).unwrap_or_else(|| (None, Vec::new()));
         let found = rows::shortcuts(query);
         let mut menus: Vec<&str> = Vec::new();
         for shortcut in &found {
@@ -1258,13 +1312,27 @@ impl SettingsWindow {
                 menus.push(shortcut.menu);
             }
         }
+        let query_folded = query.trim().to_lowercase();
+        let place_hits: Vec<&rows::PlaceKey> = places.iter().filter(|place| !query_folded.is_empty() && place.command.to_lowercase().contains(&query_folded)).collect();
         for (ix, name) in menus.iter().enumerate() {
             let mut card = card();
-            for (n, shortcut) in found.iter().filter(|s| s.menu == *name).enumerate() {
+            let mut n = 0;
+            for shortcut in found.iter().filter(|s| s.menu == *name) {
+                if *name == "View" && shortcut.command == "Quick Switcher" {
+                    for place in places.iter().filter(|place| query_folded.is_empty() || place.command.to_lowercase().contains(&query_folded)) {
+                        let keys = div().flex().gap(px(2.)).child(keycap(place.keys));
+                        card = card.when(n > 0, |card| card.child(rule())).child(
+                            div().h(px(32.)).px(px(12.)).flex().items_center().child(div().flex_1().type_ui().text_color(theme::text()).child(place.command.clone())).child(keys),
+                        );
+                        n += 1;
+                    }
+                }
+                let command = if shortcut.command == "Open in App" { open_in.clone().unwrap_or_else(|| shortcut.command.to_owned()) } else { shortcut.command.to_owned() };
                 let keys = div().flex().gap(px(2.)).child(keycap(shortcut.keys));
                 card = card.when(n > 0, |card| card.child(rule())).child(
-                    div().h(px(32.)).px(px(12.)).flex().items_center().child(div().flex_1().type_ui().text_color(theme::text()).child(shortcut.command)).child(keys),
+                    div().h(px(32.)).px(px(12.)).flex().items_center().child(div().flex_1().type_ui().text_color(theme::text()).child(command)).child(keys),
                 );
+                n += 1;
             }
             // In search results each group says where it is, as every other result does.
             let label = if query.is_empty() {
@@ -1274,6 +1342,18 @@ impl SettingsWindow {
             };
             let gap = if query.is_empty() { 20. } else { 12. };
             column = column.child(div().when(ix > 0, |group| group.pt(px(gap))).flex().flex_col().child(label).child(card));
+        }
+        // A rail place is not a static shortcut row. A search for its name still lists it.
+        if !place_hits.is_empty() && !found.iter().any(|shortcut| shortcut.menu == "View" && shortcut.command == "Quick Switcher") {
+            let mut card = card();
+            for (n, place) in place_hits.iter().enumerate() {
+                let keys = div().flex().gap(px(2.)).child(keycap(place.keys));
+                card = card.when(n > 0, |card| card.child(rule())).child(
+                    div().h(px(32.)).px(px(12.)).flex().items_center().child(div().flex_1().type_ui().text_color(theme::text()).child(place.command.clone())).child(keys),
+                );
+            }
+            let label = div().pl(px(12.)).pb(px(4.)).type_small().text_color(theme::text_faint()).child("Shortcuts › View");
+            column = column.child(div().flex().flex_col().child(label).child(card));
         }
         column
     }
@@ -1372,8 +1452,21 @@ impl SettingsWindow {
         let query = self.query.clone();
         let found: Vec<&'static Row> = rows::search(&query);
         let keys = rows::shortcuts(&query);
+        let folded = query.trim().to_lowercase();
+        let place_hit = folded.len() >= 2 && self.shell.upgrade().is_some_and(|shell| {
+            let shell = shell.read(cx);
+            shell.places().into_iter().skip(2).take(7).any(|mode| {
+                let name = match mode {
+                    crate::gui::sidebar::Mode::Network(network) => network.label().to_owned(),
+                    crate::gui::sidebar::Mode::Space(key) => shell.spaces.iter().find(|space| space.key == key).map(|space| space.name.clone()).unwrap_or(key.id),
+                    crate::gui::sidebar::Mode::Inbox => "Inbox".to_owned(),
+                    crate::gui::sidebar::Mode::People => "People".to_owned(),
+                };
+                name.to_lowercase().contains(&folded)
+            })
+        });
         let mut column = div().w(px(controls::COLUMN)).flex().flex_col().gap(px(12.));
-        if found.is_empty() && (keys.is_empty() || query.trim().len() < 2) {
+        if found.is_empty() && !place_hit && (keys.is_empty() || query.trim().len() < 2) {
             let honest = rows::not_yet(&query);
             return column.child(
                 div()
@@ -1387,6 +1480,7 @@ impl SettingsWindow {
                     .children(honest.map(|line| div().type_ui().text_color(theme::text_soft()).child(line))),
             );
         }
+        let honest = (!found.is_empty()).then(|| rows::not_yet(&query)).flatten();
         for row in found {
             let breadcrumb = div()
                 .id(SharedString::from(format!("crumb-{}", row.id)))
@@ -1401,10 +1495,10 @@ impl SettingsWindow {
             let live = if rows::draws_label(row.id) { card().child(self.control_row(row.id, window, cx)) } else { self.control_row(row.id, window, cx) };
             column = column.child(div().flex().flex_col().gap(px(4.)).child(breadcrumb).child(live));
         }
-        if !keys.is_empty() && query.trim().len() >= 2 {
-            column = column.child(self.shortcuts(&query));
+        if place_hit || (!keys.is_empty() && query.trim().len() >= 2) {
+            column = column.child(self.shortcuts(&query, cx));
         }
-        column
+        column.children(honest.map(|line| div().px(px(12.)).type_ui().text_color(theme::text_soft()).child(line)))
     }
 }
 

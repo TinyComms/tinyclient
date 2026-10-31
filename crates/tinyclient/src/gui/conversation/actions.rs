@@ -106,9 +106,10 @@ pub fn can(message: &Message, network: Network, kind: ConversationKind, in_threa
         reply: act && network != Network::Slack,
         thread: !in_thread && ((sent && message.thread.is_some()) || starts_thread(message, network, kind)),
         // CONTRACT: nothing says how long a network lets a message be edited, so Edit is offered
-        // on every message of mine and a refusal is the network's answer.
-        edit: sent && own,
-        delete: own,
+        // on every message of mine and a refusal is the network's answer. Messages never edits
+        // or deletes, so those items stay off.
+        edit: sent && own && network != Network::Messages,
+        delete: own && network != Network::Messages,
         unsent: !sent && message.outgoing,
     }
 }

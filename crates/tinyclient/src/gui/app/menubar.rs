@@ -50,21 +50,37 @@ pub fn menus(places: &[(String, usize)], open_network: Option<Network>, update_i
         MenuItem::separator(),
         MenuItem::action("Enter Full Screen", FullScreen),
     ]);
-    vec![
-        Menu::new("tinyclient").items([
-            MenuItem::action("About tinyclient", About),
-            MenuItem::action(update_item, CheckForUpdates),
-            MenuItem::separator(),
-            MenuItem::action("Settings…", Settings),
+    let mut app = vec![
+        MenuItem::action("About tinyclient", About),
+        MenuItem::action(update_item, CheckForUpdates),
+        MenuItem::separator(),
+        MenuItem::action("Settings…", Settings),
+    ];
+    // Services, Hide and Zoom are macOS menu commands. GPUI panics at Hide Others on Windows.
+    if cfg!(target_os = "macos") {
+        app.extend([
             MenuItem::separator(),
             MenuItem::os_submenu("Services", SystemMenuType::Services),
             MenuItem::separator(),
             MenuItem::action("Hide tinyclient", Hide),
             MenuItem::action("Hide Others", HideOthers),
             MenuItem::action("Show All", ShowAll),
+        ]);
+    }
+    app.extend([MenuItem::separator(), MenuItem::action("Quit tinyclient", Quit)]);
+    let window = if cfg!(target_os = "macos") {
+        vec![
+            MenuItem::action("Minimize", Minimize),
+            MenuItem::action("Zoom", Zoom),
             MenuItem::separator(),
-            MenuItem::action("Quit tinyclient", Quit),
-        ]),
+            MenuItem::action("tinyclient", ShowWindow),
+            MenuItem::action("Bring All to Front", ShowWindow),
+        ]
+    } else {
+        vec![MenuItem::action("Minimize", Minimize), MenuItem::action("tinyclient", ShowWindow)]
+    };
+    vec![
+        Menu::new("tinyclient").items(app),
         Menu::new("File").items([
             MenuItem::action("New Message", NewMessage),
             MenuItem::action("Add Account…", AddAccount),
@@ -80,7 +96,6 @@ pub fn menus(places: &[(String, usize)], open_network: Option<Network>, update_i
             MenuItem::os_action("Cut", input::Cut, OsAction::Cut),
             MenuItem::os_action("Copy", input::Copy, OsAction::Copy),
             MenuItem::os_action("Paste", input::Paste, OsAction::Paste),
-            MenuItem::action("Paste and Match Style", input::Paste),
             MenuItem::os_action("Select All", input::SelectAll, OsAction::SelectAll),
             MenuItem::separator(),
             MenuItem::Submenu(Menu::new("Find").items([
@@ -109,13 +124,7 @@ pub fn menus(places: &[(String, usize)], open_network: Option<Network>, update_i
             MenuItem::action("Start Call", StartCall),
             MenuItem::action(open_in, OpenInNetwork),
         ]),
-        Menu::new("Window").items([
-            MenuItem::action("Minimize", Minimize),
-            MenuItem::action("Zoom", Zoom),
-            MenuItem::separator(),
-            MenuItem::action("tinyclient", ShowWindow),
-            MenuItem::action("Bring All to Front", ShowWindow),
-        ]),
+        Menu::new("Window").items(window),
         Menu::new("Help").items([
             MenuItem::action("Keyboard Shortcuts", KeyboardShortcuts),
             MenuItem::action("Copy Diagnostics", CopyDiagnostics),

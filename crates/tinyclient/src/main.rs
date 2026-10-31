@@ -14,6 +14,11 @@ mod frames;
 mod gui;
 #[cfg(feature = "gui")]
 mod lottie;
+#[cfg(all(feature = "gui", target_os = "linux"))]
+mod invite_ipc;
+#[cfg(all(feature = "gui", windows))]
+#[path = "invite_ipc_windows.rs"]
+mod invite_ipc;
 mod view;
 
 use client::ask;
@@ -23,6 +28,11 @@ use std::process::ExitCode;
 
 fn unexpected(response: Response) -> io::Error {
     io::Error::other(format!("unexpected {response:?}"))
+}
+
+/// Only a valid Tiny app link is accepted from the operating system.
+fn launch_invite(args: &[String]) -> Option<String> {
+    args.iter().find(|arg| arg.starts_with("tinyclient://join#") && protocol::parse_invite_link(arg).is_some()).cloned()
 }
 
 /// The shell without a window: the same states, as lines.
@@ -142,7 +152,16 @@ fn main() -> ExitCode {
     }
     #[cfg(feature = "gui")]
     if !args.iter().any(|arg| arg == "--text" || arg == "--notify-test") && query.is_none() {
-        gui::run();
+        let invite = launch_invite(&args);
+        #[cfg(any(target_os = "linux", windows))]
+        let incoming = match invite_ipc::start(invite.as_deref()) {
+            invite_ipc::Handoff::Delivered => return ExitCode::SUCCESS,
+            invite_ipc::Handoff::Primary(receiver) => Some(receiver),
+            invite_ipc::Handoff::Unavailable => None,
+        };
+        #[cfg(not(any(target_os = "linux", windows)))]
+        let incoming = None;
+        gui::run(invite, incoming);
         return ExitCode::SUCCESS;
     }
 
@@ -162,5 +181,18 @@ fn main() -> ExitCode {
             eprintln!("{err}");
             ExitCode::from(1)
         }
+    }
+}
+
+#[cfg(test)]
+mod invite_launch_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_only_valid_app_invites() {
+        let link = protocol::invite_url("https://example.org", "token").unwrap();
+        let app = link.replacen("https://tinyclient.io/invite#", "tinyclient://join#", 1);
+        assert_eq!(launch_invite(&[app.clone()]), Some(app));
+        assert_eq!(launch_invite(&[link, "tinyclient://join#broken".into()]), None);
     }
 }

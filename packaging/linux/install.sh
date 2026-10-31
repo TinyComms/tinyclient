@@ -80,7 +80,7 @@ cp "$here/LICENSE" "$here/AGPL-3.0.txt" "$lib/"
 ln -sf "$lib/tinyclient" "$bin/tinyclient"
 
 # The menu entry names the program by its full path: ~/.local/bin is not on every session's PATH.
-sed "s|^Exec=.*|Exec=$lib/tinyclient|" "$here/share/applications/$id.desktop" > "$share/applications/$id.desktop"
+sed "s|^Exec=.*|Exec=$lib/tinyclient %u|" "$here/share/applications/$id.desktop" > "$share/applications/$id.desktop"
 cp "$here/share/metainfo/$id.metainfo.xml" "$share/metainfo/"
 (cd "$here/share" && find icons -type f) | while read -r icon; do
     mkdir -p "$share/$(dirname "$icon")"

@@ -99,11 +99,12 @@ pub enum Scope {
 }
 
 impl Scope {
-    fn label(self) -> &'static str {
-        match self {
-            Scope::Conversation => "This conversation",
-            Scope::Space => "This space",
-            Scope::Everywhere => "Everywhere",
+    fn label(self, network: Option<Network>) -> &'static str {
+        match (self, network) {
+            (Scope::Conversation, _) => "This conversation",
+            (Scope::Space, Some(Network::Discord)) => "This server",
+            (Scope::Space, _) => "This space",
+            (Scope::Everywhere, _) => "Everywhere",
         }
     }
 }
@@ -1230,6 +1231,7 @@ fn draw_search(shell: &Shell, _window: &mut Window, cx: &mut Context<Shell>) -> 
     // The scope's chips: the conversation open now, its Space, or the whole cache. One is the
     // scope asked; a chip about no conversation open is not drawn, for it cannot be asked.
     let open = shell.open_with_space();
+    let network = open.as_ref().map(|(key, _)| key.network);
     let in_space = open.as_ref().and_then(|(_, space)| space.as_deref()).is_some();
     let mut chips = div().flex_none().px(px(8.)).pt(px(8.)).pb(px(2.)).flex().flex_wrap().gap(px(6.));
     for candidate in [Scope::Conversation, Scope::Space, Scope::Everywhere] {
@@ -1256,7 +1258,7 @@ fn draw_search(shell: &Shell, _window: &mut Window, cx: &mut Context<Shell>) -> 
                 .when(lit, |chip| chip.bg(theme::selected()))
                 .hover(|style| style.bg(theme::hover()))
                 .on_click(cx.listener(move |this, _, window, cx| this.open_search(candidate, window, cx)))
-                .child(candidate.label()),
+                .child(candidate.label(network)),
         );
     }
     // What the network said on Enter: a line that names what is being searched, what was

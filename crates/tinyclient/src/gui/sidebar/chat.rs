@@ -220,6 +220,11 @@ impl Shell {
                     None => pair_or(&c.key, &c.title, &c.title, size, surface, shape),
                 }
             }
+            // A Slack channel keeps its hash or lock. The workspace photo stays on the workspace.
+            kind if picture.is_none() && c.key.network == Network::Slack => {
+                let glyph = if c.mark == Some(Mark::External) { "icons/building-2.svg" } else { super::kind_glyph(kind, c.private, c.call) };
+                Avatar::channel(glyph, size).build()
+            }
             kind if picture.is_none() => match c.space.as_ref().and_then(|id| self.spaces.iter().find(|s| s.key.id == *id && s.key.account == c.key.account)) {
                 // A channel is drawn as where it is: its Space's icon.
                 Some(space) => {
