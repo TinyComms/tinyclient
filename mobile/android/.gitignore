@@ -1,0 +1,8 @@
+# Built by cargo-ndk and by Gradle; never committed.
+app/src/main/jniLibs/
+app/build/
+build/
+.gradle/
+local.properties
+*.iml
+.idea/
