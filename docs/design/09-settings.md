@@ -26,11 +26,14 @@ A separate window, 720 × 560, not resizable, not minimizable, transparent title
 | 6 | Messages | `message-square` | |
 | 7 | Privacy | `lock` | |
 | 8 | Audio & video | `mic` | |
-| 9 | Storage | `hard-drive` | new |
+| 9 | Voice | `headphones` | |
+| | Storage | `hard-drive` | new |
 | | Shortcuts | `command` | new |
 | | About | `info` | |
 
-Height check: 52 + 28 + 8 + 10 × 30 = 388, and About ends at 548. A section whose rows are all out of this build (none in v1) is absent from the list; it is never shown empty.
+⌘1 through ⌘9 reach Accounts through Voice. Storage, Shortcuts, and About have no digit.
+
+Height check: 52 + 28 + 8 + 11 × 30 = 418. About stays pinned 12 from the list's bottom. A section whose rows are all out of this build (none in v1) is absent from the list; it is never shown empty.
 
 ## 2. Page anatomy
 
@@ -73,7 +76,7 @@ A popup button: 01 secondary button look, 28 high, radius 6, padding 10 left and
 **Inherited versus set.** In an override row (§3.9) the first item is "Default (Direct messages and mentions)", naming what it inherits, then a separator, then the values. While the row inherits, the button shows the inherited value in `text_soft`; once set here, the label is `text` and the reset slot shows. Grey means "comes from above"; white means "chosen here".
 
 ### 3.5 Device picker
-A dropdown (3.4) of audio devices, the same choice as the call's device menu (07 §7). First "Automatic (MacBook Pro Microphone)" (the default: the system default unless that is a virtual device, then a headset or speakers), then "System default (MacBook Pro Microphone)", naming today's default; separator; each hardware device by its system name; then virtual devices marked "(virtual)". A pick is stored by name and the system's id. A stored device that is unplugged stays in its place as "Studio Display Microphone (not connected)" in `text_soft`, and the button shows the same words; the row's second line reads "Calls use MacBook Pro Microphone until it is back, then switch back by themselves." No devices at all: the button reads "No microphone found" and its menu has that one disabled item. The list updates live while the menu is open.
+A dropdown (3.4) of audio devices. First item "System default (MacBook Pro Microphone)", naming today's default; separator; each device by its system name. A stored device that is unplugged stays in its place as "Studio Display Microphone (not connected)" in `text_soft`, and the button shows the same words; the row's second line reads "Calls use the system default until it is back." No devices at all: the button reads "No microphone found" and its menu has that one disabled item. The list updates live while the menu is open.
 
 ### 3.6 Level meter
 20 segments, 10 × 8, radius 2, 2 apart: 238 wide. Unlit `switch_off`. Lit below the sensitivity line `text_faint`; lit at or above it `positive`, so the meter shows what would be sent. The sensitivity line is a 2 × 14 `text` bar at the threshold, centred on the meter. The V6 slider sits 6 below at the same width, so its thumb is under the line. Levels arrive at 10 Hz only while a test runs; nothing smooths them and there is no peak hold. Not running: all segments unlit, the line still drawn. Role `Meter`, value = level 0 to 100.
@@ -83,8 +86,8 @@ A dropdown (3.4), fixed 160 wide, then 4, then an icon-only ghost button 28 × 2
 
 The play button plays the selected sound once; while it plays the glyph is `square` 14 and the tooltip "Stop". Picking a new sound from the menu plays it once too, as macOS Sound settings do; moving through the open menu does not. One sound at a time: a new play stops the last. With "None" selected, the play button is absent and its 32 stays reserved. Tooltip: "Play Pebble". These buttons and the play-on-pick exist only if S11 ships (product: alert-device routing); otherwise the picker sits alone, right-aligned. Role `Button`, label "Play Pebble".
 
-### 3.8 Key recorder
-For the voice keys (V13, V15 to V17); the Shortcuts section stays read-only. An input 140 × 28, showing the key as one keycap (18 high, radius 4, `border`, 11/500, padding 0 4) or "Click to record" in `text_faint`. Click or Return: border `accent`, text "Press a key…", and the global keys stop until it is done. The first key with or without modifiers is taken; a modifier pressed and let go alone is taken alone (a whole Ctrl key for push to talk); the middle and side mouse buttons are taken anywhere in the window. Esc cancels; ⌫ clears to none, as does the reset slot ("Clear Push to talk"). A clash: 12 `danger` line below, "F13 is already Toggle mute.", and the old value stays. On macOS, recording asks for Input Monitoring once, and the Voice section shows the §6 banner until it is allowed.
+### 3.8 Shortcut recorder (not in v1)
+Specified for V8 push to talk, which is Later; no recorder is in the v1 build, and the Shortcuts section is read-only. An input 140 × 28, showing the shortcut as keycaps (18 high, radius 4, `border`, 11/500 `text_soft`, padding 0 4, 2 apart) or "Click to record" in `text_faint`. Click or Return: border `focus`, text "Press a key…". The first key with or without modifiers is taken; Esc cancels; ⌫ clears to none. A clash: 12 `danger` line below, "⌘⇧M is already Mute.", and the old value stays. A global key that needs Input Monitoring shows the banner of §6 when recorded.
 
 ### 3.9 Per-network override row
 One row per signed-in account, in rail order, grouped under a label such as "Each account". Leading: the network's mark 16 in full color (01 Icons), 8 gap, then the account name 13/18 `text` ("Lumen Labs", "mira.k"). Two accounts on one network show the network in a second line: "Slack · mira@halden.example". Trailing: the same control as the global row, as an inheriting dropdown (3.4), or a switch where the setting has no global value (P1, P2). Accounts that are signed out keep their row, mark at 40% opacity. No accounts: the group is absent.
@@ -110,10 +113,10 @@ As 08 §5 and §6 with 01 sizes: one group per network labelled with the network
 ### General
 | Row | Control | Second line |
 |---|---|---|
-| "Open at login" (G1) | Switch | On: "Receives messages from login. The window opens when you click the Dock icon." |
-| "Keep receiving when the window is closed" (G2) | Switch | |
+| "Keep receiving when the window is closed" (G2) | Switch, on. macOS only. | On: "Closing the window leaves tinyclient running. Quit with ⌘Q to stop it." |
+| "Install updates automatically" (G4) | Switch, on | On: a newer version downloads while the app is open and installs when you quit. |
 
-Caption: on, "Closing the window leaves tinyclient running. Quit with ⌘Q to stop it."; off, "Closing the window quits tinyclient. Nothing arrives until you open it again." If macOS reports that login needs approval, G1's second line becomes, in `warning` with `triangle-alert` 14: "Waiting for approval in System Settings › General › Login Items." and a link "Open Login Items".
+Caption, when G2 is off: "Closing the window quits tinyclient. Nothing arrives until you open it again." Elsewhere the G2 row is absent and closing quits (`06` §8).
 
 ### Notifications
 | Group | Row | Control | Second line |
@@ -143,12 +146,17 @@ Captions. Under the first group: "Conversations you muted never notify." Under E
 | Notification sounds | "Ring" (S4) | Sound picker: "Soft ring" / "Classic ring" / "System alert sound" / "None" | |
 | Each account | One row per account (S5) | Sound picker, inheriting | |
 | Conversations | One row per conversation with its own sound (S6): avatar 20, title 13/18 | Sound picker, inheriting; reset removes the row | |
-Captions. Under Notification sounds: "Notification sounds use the alert volume in System Settings › Sound." with the link "Open Sound Settings". Under Conversations: "Give one conversation its own sound from its Notifications… menu." When no conversation has one, the Conversations group is absent and this caption sits under Each account instead. The call sounds (S7 to S10, S12) are in Voice; the last caption here says so.
+| In calls | "Someone joins or leaves" (S7) | Switch | |
+| In calls | "I mute, unmute or deafen" (S8) | Switch | |
+| In calls | "Connection lost or back" (S9) | Switch | |
+| In calls | "Call sound volume" (S10) | Slider 0 to 100 %, ticks none, default 50 %, then the play button (S12) | |
+
+Captions. Under Notification sounds: "Notification sounds use the alert volume in System Settings › Sound." with the link "Open Sound Settings". Under Conversations: "Give one conversation its own sound from its Notifications… menu." When no conversation has one, the Conversations group is absent and this caption sits under Each account instead. Under In calls: "Call sounds play on your call speaker, quieter than voices. Voice volume is in Audio & video." S12's tooltip names the device: "Play test sound on AirPods Pro".
 
 ### Appearance
 | Row | Control | Second line |
 |---|---|---|
-| "Theme" (A1) | Segmented: "Match system" / "Dark" / "Light" | |
+| "Theme" (A1) | Absent. Search says "tinyclient is dark only for now." | The segmented control is specified for when light values are checked. It is not drawn. |
 | "Text size" (A2) | Stepped slider, five stops (−1 to +3), value "13 pt" … "17 pt", "Default" at 14 | |
 | "Density" (A3) | Segmented: "Comfortable" / "Compact" | Compact: "List rows are 40 instead of 48." |
 | "Show message previews in the list" (A4) | Switch | Off: "Rows show names and times only." |
@@ -181,31 +189,17 @@ Captions. Under the read group: "Discord and Slack have no read receipts." If no
 | Group | Row | Control | Second line |
 |---|---|---|---|
 | Microphone | "Microphone" (V1) | Device picker | |
+| Microphone | "Input level" (V3) and "Sensitivity" (V6), one row | Level meter, then secondary button "Test" (while on: "Stop"); under the meter, the V6 slider 0 to 100, default tick at 25, value "25" | "Below the line nothing is sent and your speaking ring stays off." While testing: "Speak normally. Green is what others would hear." |
 | Speaker | "Speaker" (V2) | Device picker | |
 | Speaker | "Call volume" (V5) | Slider 0 to 100 %, default 100 % | |
 | Joining | "Join calls with my microphone muted" (V4) | Switch | |
 
 The meter row is min 96 tall (8, 28, 6, 28, 2, 16, 8): "Input level" left of the meter and "Test" on the first line, "Sensitivity" left of the slider on the second, the second line under both. Without the meter (§6), Sensitivity is an ordinary slider row. **Test is a toggle, not a hold** (product said held): holding a key or button is impossible for many keyboard and switch users. A test stops on "Stop", after 30 s, when the section changes or the window closes; mediad then exits within 3 s as specified. During a call, Test uses the running mediad and starts nothing.
 
-Caption under Microphone: "How your microphone opens, its level and its processing are in Voice." Caption under Speaker: "Picking a device in a call's menu changes that call only. These are the defaults."
+Caption under Speaker: "Picking a device in a call's menu changes that call only. These are the defaults." There is no Camera row. Search for camera answers "tinyclient has no camera yet." A Tiny call can still send a camera on Windows (`07`).
 
 ### Voice
-How the microphone opens, the voice keys, the processing and the call sounds (07 §7a).
-
-| Group | Row | Control | Second line |
-|---|---|---|---|
-| | "Microphone opens by" (V8) | Segmented: "Voice activation" / "Push to talk" | |
-| | "Input level" (V3) and "Sensitivity" (V6), one row | Level meter, then secondary button "Test" (while on: "Stop"); under the meter, the V6 slider 0 to 100, default tick at 25, value "25". The slider is the threshold: dragging it moves the line over the meter | "Below the line nothing is sent and your speaking ring stays off." While testing: "Speak normally. Green is what others would hear." In push to talk the line does nothing, and the second line says so |
-| | "Hear yourself while testing" (V18) | Switch, the window's own, off | "Plays your microphone back as others would hear it. Not during a call." |
-| | "Tell me when I talk while muted" (V19) | Switch, on | "Your microphone listens while you're muted, only to say so. Nothing is sent." (07 §2a) |
-| | "Release delay" (V14), push to talk only | Stepped slider, six stops: 0, 100, 200 (default), 300, 500 ms, 1 s | |
-| Keys | "Push to talk" (V13), "Priority push to talk" (V15), "Toggle mute" (V16), "Toggle deafen" (V17) | Key recorder (3.8) | V15: "Push to talk that also asks to be heard over everyone, where you hold priority speech." A side button where the system hides them: "This system doesn't show the mouse's side buttons to apps. Pick a key." |
-| Processing | "Echo cancellation" (V10), "Noise suppression" (V11), "Automatic gain" (V12) | Switch, on | Each when off: "Wear headphones, or others hear themselves when you talk." / "Fans, typing and traffic go through as they are." / "Your voice is sent at the level your microphone gives." |
-| Call sounds | S7 "Someone joins, leaves or I'm moved", S8, S9 "Connection lost, back or ended", S10 | As they were in Sounds | |
-
-Captions. Under the first group: "A room that requires push to talk uses it, whatever you pick here."; in push to talk with no key: "Pick a push-to-talk key below: until then your microphone never opens." Under Keys, by what the system allows: "These keys work in any app, even with tinyclient in the background." / on macOS without Input Monitoring, the §6 banner over the section with "Open System Settings" (Privacy › Input Monitoring) / on Wayland: "This system shows keys only to the app in front: they work while tinyclient's window is, and push to talk needs an X11 session." Under Processing: "Echo cancellation takes out what your speakers play, so others don't hear themselves when you talk without headphones." Under Call sounds: as Sounds' In calls caption was.
-
-The meter during a test outside a call is of the microphone as a call would send it (processed); in a call it is the call's own meter. Test with V18 on plays the processed microphone back, with the echo canceller hearing what is played, so a test on speakers does not howl.
+Echo cancellation (V10), noise suppression (V11), and automatic gain (V12) are switches. Each defaults on. While echo cancellation is off, a Tiny channel still says to wear headphones (`07` §7a, `10`).
 
 ### Storage
 | Row | Control |
@@ -220,7 +214,7 @@ Caption: "Sign-ins, drafts and settings are not part of this."
 Read-only. One card per menu (tinyclient, File, Edit, View, Conversation, Window, Help), labelled with the menu's name, then a "Calls" card for the 07 §2 call keys (⌘⇧M, ⌘⇧D, ⌘⇧H, ⌘⇧A, ⌘⇧R, ⌘⇧J). Those are in no menu today, so App Shortcuts cannot rebind them; they need a menu (Conversation or a new Call menu) before the caption below is true for them. Rows: 32 high, command 13/18 `text`, keys at the right as keycaps (3.8). The search field filters this list too. Caption at the top: "To change a shortcut, add it in System Settings › Keyboard › Keyboard Shortcuts › App Shortcuts." with the link "Open Keyboard Shortcuts". ⌘/ opens this section.
 
 ### About
-As 08 §7, with "One small app for Slack, Discord, Telegram, Teams and Signal." Below the acknowledgements, one card:
+As 08 §7, with "One small app for Slack, Discord, Telegram, Teams, Signal, and Messages, and for Tiny servers you run." The window still draws "One small app for Slack, Discord, Telegram, Teams and Signal." until that copy is updated. Below the acknowledgements, one card:
 
 | Row | Control |
 |---|---|
@@ -250,7 +244,7 @@ Per-conversation settings live with the conversation and are mirrored in Sounds 
 |---|---|---|
 | Notification permission denied | Notifications, Sounds | Banner, `circle-alert` `warning`: "Notifications are turned off for tinyclient in System Settings." · "Open System Settings". Rows stay live; their values apply once it is allowed |
 | Permission not asked yet | Notifications, Sounds | Banner, `bell` `text_soft`: "tinyclient hasn't asked to send notifications yet." · "Allow" (the system prompt) |
-| Notifications turned off for tinyclient by the system | Notifications | N13's line says so with the system's own words ("Notifications are turned off for tinyclient in Windows Settings › System › Notifications.") |
+| Notifications from chatd not built (product gate) | | Notifications and Sounds' notification groups are absent; Sounds keeps In calls. Nothing says "coming soon" |
 | Microphone permission denied | Audio & video | Banner, `mic-off` `warning`: "tinyclient can't use the microphone. Allow it in System Settings › Privacy & Security › Microphone." · "Open System Settings". The Input level row is absent; Sensitivity stays |
 | No microphone | Audio & video | Picker reads "No microphone found"; Input level row absent |
 | Chosen device unplugged | Audio & video | "(not connected)" as in 3.5; the stored choice is kept |
@@ -260,7 +254,6 @@ Per-conversation settings live with the conversation and are mirrored in Sounds 
 | chatd unreachable | Every section with chatd rows | Banner, `wifi-off` `warning`: "Can't reach tinyclient's background service. These settings return when it does." · "Restart it". Rows homed in chatd are disabled with their last known value; shell rows stay live |
 | A write fails | The row | Value returns to the stored one; 12/16 `danger` line in the row: "Couldn't save. Try again." Cleared by the next change |
 | Same From and To | Quiet hours | 01 input error: `danger` border, "Start and end can't be the same." Not stored |
-| Login item needs approval | General | G1 line in §4 |
 | Search, no match | Pane | 01 empty state, glyph `search`: "No settings match “proxy”." For a Later or Never term a line follows, 13 `text_soft`: "tinyclient has no proxy setting yet." |
 
 ## 7. Search
@@ -298,8 +291,6 @@ All are generated from code by one synthesiser, so the licence is the repository
 | Cue | Recipe | Length |
 |---|---|---|
 | Someone joins / leaves | Two sines, E5 → A5 (659 → 880 Hz) / A5 → E5, 90 ms each | 180 ms |
-| I'm moved (with S7) | Three sines, A5 → E5 → A5, 70 ms each | 210 ms |
-| I'm put out: kicked, banned, timed out, the room deleted (with S9) | E4 for 100 ms, then A3 (220 Hz) for 200 ms; plays out as the call ends | 300 ms |
 | I mute / unmute | One tick, sine 440 / 880 Hz, 60 ms decay | 60 ms |
 | I deafen / undeafen | Two ticks, one after the other (60 ms each), 440 / 880 Hz | 120 ms |
 | Connection lost / back | Two sines, A4 → E4 (440 → 330 Hz) / E4 → A4, 125 ms each | 250 ms |
@@ -365,13 +356,13 @@ New Lucide glyphs: `sun-moon`, `hard-drive`, `command`, `play`, `rotate-ccw`, at
 
 ## In this build (2026-10-14)
 
-The window has Accounts, General, Notifications, Sounds, Appearance, Messages, Privacy, Audio & video, Voice, Storage, Shortcuts and About; ⌘1 to ⌘9 reach the first nine in that order. Notifications (2026-10-28) has N1 and N2, a "Notify for" card of four switches (direct messages, group chats, mentions in channels, Tiny servers), Privacy (N4 and "When the screen is locked", absent on macOS), Calls (N5, N6), Quiet time (N7 as three secondary buttons or "Paused until 3:00 PM" with Resume, N8 with a From row of two steppers in 30-minute steps while it is on, N9), Attention (N10, N11, absent on Linux) and Test (N13, its result on the second line for 8 s). Sounds holds S1, then Notification sounds: S2 to S4 as segmented choices with S11's play button at the row's end, and the notification volume (absent on macOS, which uses the alert volume). Details shows a conversation's own sound (S6) under its Notifications row, as chips: "Default (Pebble)", the five sounds, None. The Theme row is still absent (product: Built so far). The pieces live in `crates/tinyclient/src/gui/settings/`: `rows.rs` (the row table, search, Shortcuts), `controls.rs` (card, row, switch, slider, meter, reset slot), `pages.rs` (sections, results, modals, device menus). Device pickers are as wide as their words, 120 to 240, and say "System default" alone; the menu, up to 440 wide, names the default device and takes ↑ ↓ Return Space and letters. The section list is one Tab stop. Two-line rows grow 2 a text step. The Accounts row's ⋯ menu, N3's per-account rows and the menu bar's conversation popover (§5) are still to come; `notify.rs` beside `pages.rs` draws the notification rows.
+Section order is Accounts, General, Notifications, Sounds, Appearance, Messages, Privacy, Audio & video, Voice, Storage, Shortcuts, About. ⌘1 through ⌘9 reach Accounts through Voice. Storage, Shortcuts, and About have no digit. The Theme row is absent. There is no Camera row. The Accounts row's ⋯ menu, N3's per-account rows, the time field, and the conversation notification popover (§5) are still absent. The pieces live in `crates/tinyclient/src/gui/settings/`: `rows.rs` (the row table, search, Shortcuts), `controls.rs` (card, row, switch, slider, meter, reset slot), `pages.rs` (sections, results, modals, device menus). Device pickers are as wide as their words, 120 to 240, and say "System default" alone; the menu, up to 440 wide, names the default device and takes ↑ ↓ Return Space and letters. The section list is one Tab stop. Two-line rows grow 2 a text step.
 
 ## Deliberately absent
 
 - Disabled rows for unbuilt features, "coming soon", "beta" or "experimental" labels.
-- A key editor (Shortcuts is read-only; the recorder in 3.8 exists only for the voice keys).
-- A slider for notification volume.
+- A key editor (Shortcuts is read-only; the recorder in 3.8 exists only for V8, Later).
+- A notification-volume slider on macOS. Windows and Linux have "Notification volume" (SV). macOS uses the alert volume, and the row is absent there.
 - Previewing sounds while moving through an open menu; any looping preview; a waveform.
 - Per-row "changed" dots or accent marks; color for inherited values beyond grey.
 - Animation of switches, sliders, the meter or section changes; a sliding sidebar of sections.

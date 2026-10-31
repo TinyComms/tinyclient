@@ -1,9 +1,6 @@
 # Polish 02 · The Discord home and the Slack home
 
-Every list a Discord or Slack user lives in. Requirements: `docs/product/polish/00-rulings.md`, `01-discord.md`, `02-slack.md`, `05` §6, `07`. Mockup: `mockups/02-discord-slack.html` (frames 1–11, 1120 × 720, including before/after against `--seed-demo` shots of the current build). Tokens, type, radii and components are `docs/design/01-system.md` as amended by `polish/01-system.md` (C1–C11 followed here). Row heights are 28 and 48 (ruling 3 of `docs/design.md`); the 32/64 rows of `02-layout-navigation.md` §3 are overruled here.
-
-## 1. What the current build gets wrong (shots `discord`, `discord-many`, `slack`, `space0`)
-One weight for everything: DMs are one-line 28 rows with no status, capped at 6, while 50 servers get all the room. Every server row has a chevron that opens a tree inside the list. Folders are gone. Slack expands every workspace at once and lists threads as tree rows ("↳ Thread in eng-platform", "↳ Deleted message"). Mentions read "@2", "5" or a grey "@1"; muted rows carry a bell in the badge column. Nobody in voice is visible until you scroll a server.
+Every list a Discord or Slack user lives in. Requirements: `docs/product/polish/00-rulings.md`, `01-discord.md`, `02-slack.md`, `05` §6, `07`. Mockup: `mockups/02-discord-slack.html` (frames 1–11, 1120 × 720, including before/after against `--seed-demo` shots of pre-polish). Tokens, type, radii and components are `docs/design/01-system.md` as amended by `polish/01-system.md` (C1–C11 followed here). Row heights are 28 and 48 (ruling 3 of `docs/design.md`); the 32/64 rows of `02-layout-navigation.md` §3 are overruled here.
 
 ## 2. Shared metrics (both homes, the server tree, Threads)
 | Part | Spec |
@@ -23,7 +20,7 @@ Row states (one-line and two-line alike): **rest** `text_soft` · **hover** `hov
 Top to bottom, one scroll:
 1. **Friends** (28): users glyph, "Friends", trailing "6 online" 12 `text_faint` and incoming requests as a count badge. Opens People scoped to Discord, Online tab.
 2. **Message requests** (28, only when non-empty): mail glyph, trailing a bare `text_faint` number. Never a badge, never counted anywhere.
-3. **In voice** header + rows (48, only while a friend is in voice or a DM call, at most 3 then "n more"). Lead: two faces stacked (group avatar). Line 1: speaker glyph 14 `accent_text`, channel name, then " · Server" `text_faint` (the server truncates first). Line 2: "Ines, Tomasz, Yusuf" or "Ines, Tomasz +3". Hover: a small secondary **Join** button (24) in the trailing slot. Click opens the channel; Join or a double-click joins (07 §1). A DM call row: the person's avatar, phone glyph, "Call in your DMs".
+3. **In voice** header + rows (48, only while a friend is in voice or a DM call, at most 3 then "n more"). Lead: two faces stacked (group avatar). Line 1: speaker glyph 14 `accent_text`, channel name, then " · Server" `text_faint` (the server truncates first). Line 2: "Ines, Tomasz, Yusuf" or "Ines, Tomasz +3". Hover: a small secondary **Join** button (24) in the trailing slot. Click opens the channel; only Join joins. A DM call row: the person's avatar, phone glyph, "Call in your DMs".
 4. **Direct messages** header + DM rows (48), Discord's order. Every DM with a number, then the newest up to 10, then "Show n more" (28 action row, expands in place for the session).
 5. **Servers** header + server and folder rows (28) in the user's order.
 

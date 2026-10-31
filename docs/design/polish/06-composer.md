@@ -1,8 +1,7 @@
 # Polish 06 · The composer and everything you send
 
 Mockup `mockups/06-composer.html`. From product `09`, `00` ruling 9, `08-audit`, `07` R4/R10/R12; changes `design/04` where
-it says so; tokens and fit from `01-system.md` and `polish/01-system.md` (**P1§**). Sizes in pt. The build today
-(`--seed-demo`): a field and a send square, nothing else; the picker runs off the window bottom at 1120 and 900 wide.
+it says so; tokens and fit from `01-system.md` and `polish/01-system.md` (**P1§**). Sizes in pt.
 
 ## 1. The card (frames 1–2)
 
@@ -10,7 +9,7 @@ One row, bottom-aligned, inside the dock (`px 20`, `pb 16`, the 20 typing slot a
 
 | Part | Spec |
 |---|---|
-| Card | `raised`, 1 `border`, radius 10, min height 40, pad 5 (controls sit 5 in from every edge). Focused: `focus` border + 3 halo (S§2 field). |
+| Card | `raised`, 1 `border`, radius 10, min height 40, pad 5 (controls sit 5 in from every edge). Focused: `border_strong`. No accent border and no halo. The caret is the focus. |
 | Attach | Icon button 28, paperclip 16 `text_soft`, radius 6. Tooltip "Attach files  ⌘U". Gap 4 to the field. |
 | Field | 14/20 `text`, py 4 (so one line = 28 = a control), grows to 8 lines then scrolls (04). Placeholder "Message #showcase". |
 | GIF | Icon button 28, new glyph `gif-16` (rounded 16 × 12 outline with "GIF", stroke 1.5). Tooltip "GIFs  ⇧⌘G". |
@@ -21,13 +20,19 @@ One row, bottom-aligned, inside the dock (`px 20`, `pb 16`, the 20 typing slot a
 
 | | Attach | GIF | Emoji | Send | Picker tabs | Per-chip options | Silent ⌥↩ | Reply ping | Link chip |
 |---|---|---|---|---|---|---|---|---|---|
-| Discord | yes | yes | yes | yes | Emoji · GIFs (Stickers at P2) | Spoiler; Send original (HEIC) | yes | yes | yes |
-| Slack | yes | — | yes | yes | Emoji | Send original | — | no reply mode | yes |
-| Telegram | yes | yes | yes | yes (voice P2 swaps it while empty) | Emoji · GIFs · Stickers | Spoiler (photo/video); Send as file; Send original | yes | — | yes |
-| Teams | yes | — | yes | yes | Emoji | Send original | — | — | — |
+| Discord | yes | catalog | yes | yes | Emoji · GIFs · Stickers | Spoiler; Send original (HEIC) | yes | yes | yes |
+| Slack | yes | hidden (client call not captured) | yes | yes | Emoji | Send original | new line | no reply mode | yes |
+| Telegram | yes | catalog | yes | yes (voice note still P2) | Emoji · GIFs · Stickers | Spoiler (photo/video); Send as file; Send original | yes | — | yes |
+| Teams | absent until a file can be shared with the chat's members only | hidden | yes | yes | Emoji | — | new line | — | absent |
+| Signal | absent (the adapter does not report capabilities) | absent | yes | yes | Emoji | — | new line | — | absent |
+| Messages | one file, 100 MB | absent | yes | yes | Emoji | — | new line | — | absent |
+| Tiny server | when the server reports `max_file_bytes` | button sends a `.gif` file; no catalog | yes | yes | Emoji | — | new line | — | absent unless the server reports `suppress_embeds` |
 
-Slack/Teams GIFs wait for their client calls (`00`); Teams importance is cut; edit removes Attach and GIF (§6); signed
-out, read-only and slow mode replace the card (`04`).
+Edit is text only on every network: Attach and GIF are absent, and draft chips are stashed. Teams has no "Needs OneDrive" chip. Slack can report `schedule: true` and Telegram does too; the card still sends `schedule: None`. Schedule stays P2.
+
+On a Tiny server that advertises `file_scan`, Send stays blocked in that conversation until the upload and the message settle. One file: "Scanning that file before it sends." More than one: "Scanning those files before they send." Other conversations can still send. A scanning server that does not allow archives refuses them with "This server doesn't take archives."
+
+Spoiler, send-original, and reply-ping stay as the Discord, Telegram, and Slack rows above. Signed out, read-only, and slow mode replace the card (`04`). Teams importance is cut.
 
 ## 2. Attachments
 
@@ -61,8 +66,7 @@ albums" or "Sends as 2 messages: photos, then files". Caption = the typed text; 
 says "The text goes as its own message first."
 
 **Chip keys.** ⇧Tab, or ← at the field's start, focuses the last chip (2 inset `focus`); ←/→ move, Backspace removes,
-Space opens options, ↓/Tab/Esc return. **Teams:** a non-image file's chip says "Needs OneDrive access" + ghost
-"Allow…" (sign-in sheet, second token, `00`); a tenant refusal makes it refused: "Your organization blocks file sharing".
+Space opens options, ↓/Tab/Esc return. Teams has no "Needs OneDrive" chip.
 
 **Sending (frame 5, ruling 9).** Return makes a pending row and frees the composer at once. Row: body 55%, files in
 final boxes from the local paths, `media_dim` until each lands; then a 4 bar (white 10% track, `accent`, 240), 8,
@@ -148,7 +152,7 @@ edit, Esc or leaving disarms. ⌥Return on the armed message sends silently and 
 
 ## 6. Edit and reply with attachments
 
-Card order: mode bar 32, tray, input row. **Reply**: everything as usual. **Edit**: text only on all four; Attach and
+Card order: mode bar 32, tray, input row. **Reply**: everything as usual. **Edit**: text only on every network; Attach and
 GIF are absent, draft chips stashed and restored (04). Caption edits work everywhere (Telegram `editMessageCaption`);
 removing a file (Discord) and replacing a photo (Telegram) are P2.
 
@@ -162,7 +166,9 @@ removing a file (Discord) and replacing a photo (Telegram) are P2.
 | `GIF_ROW` | 96 | Justified GIF row height |
 | Glyphs | `gif-16`, `file-text`, `file-archive`, `file-video`, `file-audio`, `file-code`, `leaf`, `coffee`, `volleyball`, `car`, `lightbulb`, `heart`, `flag` (14/16 each) | |
 
-## GPUI notes (rev `cb13b37`)
+## GPUI notes
+
+GIF and sticker frames follow `crates/tinyclient/src/gui/anim.rs` and the Messages autoplay setting. The notes below are about drop, clipboard, and paste.
 
 - **Drop**: `on_drop::<ExternalPaths>` on the pane, and `drag_over::<ExternalPaths>(|style, paths, …|)` for the frame;
   the platform delivers paths on `FileDropEvent::Entered`, so folders are known before the drop. The frame is a

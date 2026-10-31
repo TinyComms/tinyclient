@@ -15,7 +15,7 @@ Every conversation is in exactly one state. First match wins.
 | 1 | Mention | unmuted channel, `mentions > 0` | 600 `text` | `text` | `accent` | pill `@3`, `accent` fill |
 | 2 | Direct | unmuted DM or group DM, `unread > 0` | 600 `text` | `text` | `accent` | pill `3`, `accent` fill |
 | 3 | Muted mention | muted, `mentions > 0` | 400 `text_faint` | `text_faint` | `text_faint` | pill `@1`, `quiet_fill` fill, `text_soft` text |
-| 4 | Unread | unmuted channel, `unread > 0`, no mention | 600 `text` | `text_soft` | `text_soft` | dot 8 px, `accent` |
+| 4 | Unread | unmuted channel, `unread > 0`, no mention | 600 `text` | `text_soft` | `text_soft` | dot 8 px, `unread` (`text`) |
 | 5 | Muted | muted, anything else | 400 `text_faint` | `text_faint` | `text_faint` | glyph `bell-off` 12 px, `text_faint` |
 | 6 | Read | everything else | 400 `text` | `text_soft` | `text_faint` | empty |
 
@@ -77,30 +77,27 @@ One 12 px glyph after the timestamp of **my newest message only**; older ones ar
 |---|---|---|
 | Pending | none; row at opacity 0.55 | all |
 | Waiting (link down, under 60 s) | none; line under the body `Waiting for Slack…`, `text_faint` | all |
-| Sent | `check`, `text_faint`; tooltip `Sent` | all |
-| Delivered | `check-check`, `text_faint`; tooltip `Delivered` | Signal, Google Messages |
-| Read | `check-check`, `accent`; tooltip `Read 9:41 AM`, or `Read` | Telegram, Teams, Signal, Google Messages |
+| Sent | `check`, `text_faint` | Telegram, Teams, direct chats |
+| Read | `check-check`, `accent`; tooltip `Read 9:41 AM`, or `Read` | Telegram, Teams, direct chats |
 | Failed | `circle-alert`, `danger`; line `Not sent · Retry · Delete · <reason>` | all |
 
-Discord and Slack have no receipts, so a sent message there keeps the one `check`: it says the network has it. The
-mark is on my newest message only while it is the newest in the conversation; a grouped row without a header carries
-it at the row's right edge, on the first line (`03-conversation.md` §9).
+Discord and Slack have no receipts, so a sent message there shows nothing. Groups show nothing.
 
 ## 5. Connection states
-Rail link dot: 7 px in an 11 px `rail` ring at the icon's bottom right. Sidebar strip: 28 px, radius 8, under the
+The rail icon has no link dot. Connected shows nothing on it. Trouble is named in the rail tooltip. Sidebar strip: 28 px, radius 8, under the
 search field, in Network and Space mode for that network; 12 px text, 14 px glyph. Composer line: the existing
 12 px line under the field.
 
 | State | Rail | Sidebar strip | Composer | Action |
 |---|---|---|---|---|
-| Connecting (first 5 s) | icon at 0.55, no dot | none | none | none |
+| Connecting (first 5 s) | icon at 0.55, no link dot | none | none | none |
 | Connected | **nothing** | none | none | none |
-| Reconnecting | at once: hollow dot, 1.5 px `warning` border | after 5 s: `Reconnecting…`, `warning` on `warning_soft` | after 5 s: `Discord is reconnecting…`, `warning`, `wifi-off`. Return still works | none |
-| Offline (60 s, Mac online) | solid `warning` dot | `Can't reach Discord` | `Can't reach Discord. Messages won't send.` | `Retry now` |
-| Session expired | solid `danger` dot, icon at 0.55 | `Slack signed you out`, `danger` on `danger_soft` | replaced by a 46 px bar: `Slack signed you out. Your messages are still here.` | `Sign in again` |
-| Signed out (never, or by me) | icon at 0.4, no dot, no badge | none; the list is the sign-in prompt | n/a | `Sign in` |
+| Reconnecting | no link dot | after 5 s: `Reconnecting…`, `warning` on `warning_soft` | after 5 s: `Discord is reconnecting…`, `warning`, `wifi-off`. Return still works | none |
+| Offline (60 s, Mac online) | no link dot | `Can't reach Discord` | `Can't reach Discord. Messages won't send.` | `Retry now` |
+| Session expired | icon at 0.55, no link dot | `Slack signed you out`, `danger` on `danger_soft` | replaced by a 46 px bar: `Slack signed you out. Your messages are still here.` | `Sign in again` |
+| Signed out (never, or by me) | icon at 0.4, no link dot, no badge | none; the list is the sign-in prompt | n/a | `Sign in` |
 | Rate-limited | nothing | none | only if a send waits over 2 s: `Discord is slowing things down. Sending in a moment.`, `text_soft` | none |
-| Mac offline | every network: hollow dot, `text_faint` | one strip in every mode: `No internet connection`, `text_soft` on `raised` | `No internet connection` | none; automatic |
+| Mac offline | no link dot | one strip in every mode: `No internet connection`, `text_soft` on `raised` | `No internet connection` | none; automatic |
 
 - Mac offline replaces all per-network lines. Recovery removes the line; there is no "Back online". No countdowns:
   a ticking second is a repaint for no information. Last known counts stay visible in every state.
@@ -108,10 +105,6 @@ search field, in Network and Space mode for that network; 12 px text, 14 px glyp
   `Slack signed you out` / `Open tinyclient to sign in again.`
 
 ## 6. Notifications
-Built (2026-10-28): chatd posts them (`chatd/src/notify.rs`, through `crates/notifier`). Windows shows them as toasts
-under the AppUserModelID the installer's shortcut carries; Reply and Mark as read are toast buttons, the reply a text
-field. Missed-call, after-reconnect and reply-failed notifications are not posted yet; Thread replies post as their
-thread's conversation.
 Posted for states 1 and 2 only. Never for state 3, my own messages, history at connect, or the conversation open in
 the key window. Key window on another conversation: banner without sound.
 
@@ -154,18 +147,11 @@ screen (a row changed, a message appeared, a strip is showing), there is no toas
 - **One at a time.** A new toast replaces the current one; an identical one restarts its timer. Hover holds it.
   Window not key: no toast; if it matters (send failed, signed out), it is a notification instead.
 
-## 8. Dock badge and menu bar
-- **Dock badge** = `N` over all networks. No dot for plain unread: the API takes numbers only, and "any unread
-  channel" would never reach zero. Set by chatd, so it is right with the window closed.
-- **A menu-bar item exists**, on by default, hideable in Settings. It answers "is it still running, and how do I
-  stop it". Hosted by the always-running process, not the shell.
-  - Icon: one static 16 px template glyph (`message-circle`): plain; with a 6 px dot when `N > 0`; with a slash
-    when a network is Offline or Expired. No number.
-  - Menu: `Open tinyclient` · one disabled line per network (`Slack · Connected`, `Discord · Reconnecting`) ·
-    `Pause Notifications` ▸ `For 1 Hour` / `Until Tomorrow` / `Resume` · `Settings…` · `Quit tinyclient Completely`.
-- **cmd-Q** closes the window and keeps receiving. **opt-cmd-Q** stops chatd too. The first cmd-Q shows one alert,
-  once: `tinyclient keeps receiving messages` / `Notifications still arrive while the window is closed. To stop
-  completely, choose Quit tinyclient Completely from the menu bar.` Buttons `OK`, `Quit Completely`.
+## 8. Dock badge and quit
+
+- **Dock badge** = `N` over all networks. No dot for plain unread: the API takes numbers only. Set by chatd, so it is right with the window closed.
+- **No status item.** Settings search says the menu-bar icon (macOS) or tray icon (Windows and Linux) is not built. The application menus are a separate bar.
+- **Quit.** On macOS, with "Keep receiving when the window is closed" on, closing hides the window and leaves chatd receiving. Elsewhere, closing quits. ⌘Q stops an application-managed chatd. A systemd user unit is left running.
 
 ## New tokens
 - `quiet_fill` `rgba(0xffffff1f)`: muted-mention pill and quiet roll-up pill; visible on `selected` too.
@@ -181,9 +167,9 @@ New Lucide glyphs: `bell-off`, `check`, `check-check`, `circle-alert`, `download
   only: 2.5 frames a second for an 18 x 6 px change. Do not use `with_animation`; it asks for a frame at display
   rate. The timer exists only while the set is non-empty, the window is key, and under 30 s have passed.
 - The typing set travels beside the snapshot and must not bump the list `version`. A badge change is one `notify`
-  and one frame. Every state fits the 64 px `uniform_list` row.
+  and one frame. Every state fits the 48 px `uniform_list` row (40 when compact).
 - The 5 s and 60 s thresholds and toast dismissal are one-shot timers, not polls. Held reorder: keep the drawn
-  order as view state and re-sort in `on_hover(false)`. Hollow dot: a 7 px div, 1.5 px border, no fill.
+  order as view state and re-sort in `on_hover(false)`.
 
 ## Deliberately absent
 - Risk or "unofficial client" wording anywhere in the client (README only). A green "connected" dot, "Back online",

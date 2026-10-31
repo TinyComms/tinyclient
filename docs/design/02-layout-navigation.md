@@ -32,11 +32,10 @@ Zones 2–3 scroll together with no scrollbar; 1 and 4 never move. **Fifty Disco
 
 | State | Drawn as |
 | --- | --- |
-| Current sidebar mode | `selected` fill and a 4 × 20 `accent` bar at the window edge; exactly one item |
-| Mentions and DMs | `unread_pill` top right with a 2 px `rail` ring; muted rows count only when they mention you |
-| Unread, no mention | 8 px `text` dot, top right |
-| Link not connected | 7 px dot in an 11 px ring, bottom right: `warning` offline, `text_faint` signed out. Nothing when connected. |
-| Hover | `hover` fill; tooltip `Discord · 2 mentions · ⌘3` |
+| Current sidebar mode | `selected` fill on exactly one rail button |
+| Mentions and DMs | the unread dot, or the Inbox count, in accent; muted rows count only when they mention you |
+| Unread, no mention | 8 px dot in `unread` (`text`), top right |
+| Hover | `hover` fill; tooltip `Discord · 2 mentions · ⌘3`. Link trouble is words in that tooltip (`Discord · Reconnecting`). |
 
 A network click opens its home in the sidebar; a pin opens its Space; clicking the lit item scrolls its list to the top. **The rail and sidebar never change the open conversation.**
 
@@ -45,27 +44,27 @@ A network click opens its home in the sidebar; a pin opens its Space; clicking t
 Three parts, the same in every mode, 96 px above the list:
 - **Title strip (52):** where you are on the left, that mode's one control on the right.
 - **Jump strip (44):** a 32 px button drawn as a field, `Jump to…  ⌘K`, and a 32 px compose button (the switcher with `@`). It opens the switcher and does not filter: the switcher already filters everything, and one field should mean one thing. In People it is a real `Find people` field.
-- **List:** one `uniform_list`. Rows are **64 px** where a preview earns the space, **32 px** in trees.
+- **List:** one `uniform_list`. Rows are **48 px** where a preview earns the space (40 when Density is Compact), **28 px** (`ROW_ONE`) in trees.
 
 | Mode | Title strip | List |
 | --- | --- | --- |
-| Inbox | `Inbox` · segmented `All · Unread n · Mentions n` (counts dropped under 300 px) | 64 px rows by recency; pinned first |
-| Network home | network icon 20, name · `…` · link state in words when not connected | 32 px tree: `Direct messages` (six newest, then `Show 76 more`, which expands in place), then Spaces in the network's order. Discord folders and Telegram folders are Groups. |
-| Space | `‹` 26, squared avatar 24, name · `…` (Mark all read, Pin to rail, Open in Discord) | 32 px tree: Groups › conversations › sub-rows, network order |
-| People | `People` · four 24 px network toggles | Frame for the people area: 316 × (height − 96), 64 px rows, optional 36 px tab row |
+| Inbox | `Inbox` · segmented `All · Unread n · Mentions n` (counts dropped under 300 px) | 48 px rows by recency; pinned first |
+| Network home | network icon 20, name · `…` · link state in words when not connected | 28 px tree: `Direct messages` (six newest, then `Show 76 more`, which expands in place), then Spaces in the network's order. Discord folders and Telegram folders are Groups. |
+| Space | `‹` 26, squared avatar 24, name · `…` (Mark all read, Pin to rail, Open in Discord) | 28 px tree: Groups › conversations › sub-rows, network order |
+| People | `People` · 24 px toggles, one per signed-in network | Frame for the people area: 316 × (height − 96), 48 px rows (40 when compact), optional 36 px tab row |
 
 **Network home is a tree of Spaces** (frame c). A Space row has two targets: the chevron opens it in place, the name focuses the sidebar on it (Space mode). A network with three or fewer Spaces starts open, so two Slack workspaces are both simply there; fifty servers start closed and read as a list. **Up a level:** `‹`, `cmd-up`, or the network's rail button.
 
 | Row | Height | Anatomy (8 px inset each side; fill radius 10 or 7; 12 px indent per level) |
 | --- | --- | --- |
-| Conversation, Inbox | 64 | avatar 44 with network badge · title 14, presence dot 7 after it · pin 11, bell-off 11, time 11.5 · preview 12.5 `text_soft` · pill or dot. Channel: squared, `Space › #channel`. Thread: `#parent › thread`. |
-| Space | 32 | chevron 12 (home only) · squared avatar 22 · name 14/650 · link word · pill or dot |
-| Group header | 32 | chevron 12 · label 11.5/600 `text_faint` resting on the bottom 6 px, so there is air above it |
-| Conversation, tree | 32 | glyph 16 (hash, megaphone, lock, forum, volume) or avatar 20 with presence for a DM · title 14 `text_soft` · trailing |
-| Sub-row | 32 | 28 px further in · thread: corner glyph 14, title 13 · voice occupant: avatar 20, name 13, mic-off 13 |
-| Action row | 32 | glyph 15 and a `text_faint` label: `Show 76 more`, `Browse channels`, `Add a workspace` |
+| Conversation, Inbox | 48 | avatar 44 with network badge · title 14, presence dot 7 after it · pin 11, bell-off 11, time 11.5 · preview 12.5 `text_soft` · pill or dot. Channel: squared, `Space › #channel`. Thread: `#parent › thread`. |
+| Space | 28 | chevron 12 (home only) · squared avatar 22 · name 14/650 · link word · pill or dot |
+| Group header | 28 | chevron 12 · label 11.5/600 `text_faint` resting on the bottom 6 px, so there is air above it |
+| Conversation, tree | 28 | glyph 16 (hash, megaphone, lock, forum, volume) or avatar 20 with presence for a DM · title 14 `text_soft` · trailing |
+| Sub-row | 28 | 28 px further in · thread: corner glyph 14, title 13 · voice occupant: avatar 20, name 13, mic-off 13 |
+| Action row | 28 | glyph 15 and a `text_faint` label: `Show 76 more`, `Browse channels`, `Add a workspace` |
 
-| State | 64 px row | 32 px row |
+| State | 48 px row | 28 px row |
 | --- | --- | --- |
 | Unread | title 650, time `accent`, 8 px `text` dot | title `text` 600, dot |
 | Mention or DM | title 650, `unread_pill` with the count | title `text` 600, pill |
@@ -76,13 +75,13 @@ Three parts, the same in every mode, 96 px above the list:
 | Collapsed Group | n/a | chevron right; label turns `text` with a dot or the summed pill; the open conversation's row stays visible |
 
 - **Inbox pins** carry a pin glyph and the last one draws a hairline under itself. No header row.
-- **A Tiny server** is the exception, laid out as Discord lays out a server (`10-tiny-server.md`): the title strip is the server's header and menu, the list its folding categories of voice channels with every seat under its channel (speaking rings and state glyphs), a user panel at the foot, and the pane its home or a channel's stage with the member list beside it. A double click joins there, since a Tiny server is voice first.
-- **Voice channels** list who is in them as sub-rows (six, then `+4 more`) with a `text_faint` count. No speaking rings here. A click opens the channel's text and offers Join in the strip; a double-click (or the Join pill) joins; see `07-calls.md` §1.
+- **A Tiny server** uses the column in `10-tiny-server.md`. Text channels are hash rows above the voice rooms; a click opens the conversation. Direct messages are not rows in the server. Voice rooms still list seats and join on double-click. Several Tiny servers are one rail button; the server's own menu switches among them.
+- **Voice channels** list who is in them as sub-rows (six, then `+4 more`) with a `text_faint` count. No speaking rings here. A click opens the channel's text and offers Join in the strip; it never joins, because Discord's join-on-click puts everyone in a room by accident.
 - **Threads** you follow sit under their channel (five, then `3 more threads`, opening the list in the right pane). A **forum** is a row with the forum glyph; the conversation area draws its post list.
 
 ## 4. Opening things
 
-- **Single click** opens in the conversation region. `cmd-click` / `cmd-Enter` opens without marking read. No double-click opens a second window; a voice row joins on double-click (07 §1).
+- **Single click** opens in the conversation region. `cmd-click` / `cmd-Enter` opens without marking read. No double-click opens a second window. A Tiny voice room joins on double-click.
 - **The sidebar does not follow.** Opening an Inbox mention, a switcher result or a search hit leaves the sidebar where it is; the row is selected if it is in the current list. Reveal is one click on the conversation subtitle. Otherwise triage from the Inbox drops you into a new server tree on every click. Exceptions: picking a Space in the switcher, and walking unread by keyboard.
 - **Thread** opens in the right pane from a message's reply line; the channel keeps its scroll. The **member list** toggles from the conversation strip into the same slot.
 - **Back / forward** replay 50 locations: sidebar mode, conversation, scroll anchor, right pane.
@@ -132,7 +131,7 @@ All static, using the empty-state component centred in the list. The tree is dra
 | --- | --- | --- |
 | Inbox | `No conversations yet` · `Sign in to a network to see your chats.` With a chip: `Nothing unread`, `No mentions` | `Syncing Discord…` in the strip; rows appear as they arrive |
 | Network home | `No servers yet` · `Servers you join in Discord show up here.` | `Discord is offline` · `Showing what was saved at 10:42.` Saved rows stay usable. |
-| Space | `No channels you can read` | `Loading Driftwood…` over six 32 px rows of `raised` bars (60/45/70/50/65/40% wide), no shimmer |
+| Space | `No channels you can read` | `Loading Driftwood…` over six 28 px rows of `raised` bars (60/45/70/50/65/40% wide), no shimmer |
 | Search | `No messages match “xyz”` · `Try Everywhere.` | footer line; cached rows stay |
 | Thread pane | `No replies yet` | `Loading thread…` |
 | No conversation open | `Pick a conversation` · `⌘K jumps anywhere.` | `chatd isn't running` |
@@ -147,12 +146,12 @@ All static, using the empty-state component centred in the list. The tree is dra
 | `shadow_overlay` / `shadow_pane` | `0 24 64 #000000a6` / `16 0 48 #00000099` | Switcher and menus / floating sidebar |
 
 Sizes: `STRIP 52`, `RAIL 72`, `SIDEBAR 316`, `RIGHT 340`, `MEMBERS 240`, `CONVERSATION_MIN 392`,
-`ROW 64`, `TREE_ROW 32`, `SWITCH_ROW 44`, `RESULT_ROW 80`, `ICON_BUTTON 30` and `26`.
+`ROW 48`, `TREE_ROW 28` (`ROW_ONE`), `SWITCH_ROW 44`, `RESULT_ROW 80`, `ICON_BUTTON 30` and `26`.
 New Lucide glyphs: users, plus, hash, volume-2, megaphone, lock, messages-square, corner-down-right, chevron-left/right/down, arrow-left/right, panel-left, pin, bell-off, mic-off, square-pen, x, ellipsis.
 
 ## GPUI notes
 
-- Every navigation list is a `uniform_list`: Inbox and People (64), network home and Space (32), search results (80), rail zones 2–3 (54). Nothing here needs variable-height `list`; Group headers were made 32 and the Inbox header removed for exactly that reason.
+- Every navigation list is a `uniform_list`: Inbox and People (48, or 40 when compact), network home and Space (28), search results (80), rail zones 2–3 (54). Nothing here needs variable-height `list`; Group headers are 28 (`ROW_ONE`) and the Inbox header was removed for exactly that reason.
 - The tree is a flat `Vec` of visible rows for one Space or one network home, rebuilt on collapse. chatd holds the rest, so fifty servers cost the shell one Space.
 - The switcher is a plain flex column of at most twenty rows, queried from chatd per keystroke.
 - Overlays are an opaque fill, a shadow and a flat scrim. No blur. Nothing in this area animates: collapse, pane open and the floating sidebar are instant.
@@ -162,7 +161,7 @@ New Lucide glyphs: users, plus, hash, volume-2, megaphone, lock, messages-square
 
 - **A server-icon column.** Only pinned Spaces reach the rail.
 - **A filter box in the sidebar.** The switcher does it across everything.
-- **64 px rows inside a Space, the 28 px Group header, the Inbox "Pinned" header.** These differ from `05-navigation.md` section 1. A 100-channel server at 64 px is 6,400 px tall; a tree is for finding a name, and one row height per list keeps it a `uniform_list`.
+- **64 px rows inside a Space, and the Inbox "Pinned" header.** These differ from `05-navigation.md` section 1. A 100-channel server at 64 px is 6,400 px tall; a tree is for finding a name. One-line rows are 28, and one row height per list keeps it a `uniform_list`.
 - **Search on the rail** (differs from section 2): it has two keys, a strip button and a switcher row.
 - **Rail buttons as filters.** A network button is a place; Inbox and People filter in their own strips.
 - **Hover-only row buttons, speaking rings, shimmer, slide or fade transitions.**

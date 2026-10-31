@@ -85,9 +85,7 @@ Secret chats are device-bound and never reach us. Rule: when Telegram tells us s
 ## 5. Contacts and People
 
 - People for Telegram = **contacts** (held whole, one `GetContacts`). Chat partners who are not
-  contacts are not People; they are chats. Search adds my chats, then global username lookup for
-  an explicit `@username` (5–32 characters, starting with a letter). In the quick switcher,
-  narrow to Telegram (`telegram @username`) to request this lookup; `@` alone filters people.
+  contacts are not People; they are chats. Search adds my chats, then global @username (on Enter).
 - **Presence**: `online` → dot; `offline(at)` → no dot, "last seen at" on row 2 and profile;
   `recently / within a week / within a month / hidden` → `Unknown`, worded as Telegram words it.
   Never draw Telegram unknown as offline (terms: last seen must display correctly [V]).
