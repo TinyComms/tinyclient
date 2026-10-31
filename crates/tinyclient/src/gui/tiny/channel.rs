@@ -2,18 +2,20 @@
 //! bar, then the stage, one tile per person in the call, ringed while they speak and labelled
 //! with what is true of them ("Server muted"). Click a tile to focus it, drawn large; hover it
 //! for its volume. Right-click a tile for the person menu. Over the stage, while my call here is
-//! connecting, reconnecting or has failed, a banner says so with the time and what to do. Under
-//! the stage, Join, or while I am in it the call's own controls and Leave, with "You're muted"
-//! and push-to-talk pills above them. A channel nobody is in says so, with Join and which
-//! devices it will use.
+//! connecting, reconnecting or has failed, a banner says so with the time and what to do. A
+//! picture being watched sits above the stage. Under the stage, Join, or while I am in it the
+//! call's own controls — mute, deafen, share, camera, and Leave — with "You're muted",
+//! push-to-talk, and a watch strip above them. A channel nobody is in says so, with Join and
+//! which devices it will use.
 
 use super::{join_blocked, model, Float, Page};
 use crate::gui::call::health::{self, Grade};
 use crate::gui::components::{button_disabled, button_with_icon, glyph, tip, Avatar, ButtonKind};
 use crate::gui::state::Shell;
 use crate::gui::theme::{self, Type};
-use gpui::{div, prelude::*, px, AnyElement, Context, Div, MouseButton, MouseDownEvent, SharedString, Stateful};
-use protocol::{Call, CallState, TinyRoom, TinySeat};
+use gpui::{div, img, prelude::*, px, AnyElement, Context, Div, MouseButton, MouseDownEvent, ObjectFit, SharedString, Stateful};
+use protocol::{Call, CallPicture, CallState, Content, Direction, MediaRequest, PictureKind, Request, TinyRoom, TinySeat};
+use std::path::PathBuf;
 
 const TILE_W: f32 = 196.;
 const TILE_H: f32 = 148.;
@@ -36,6 +38,8 @@ enum Look {
     Off,
     /// The server holds it off: shown, not pressable.
     Held,
+    /// Share or camera is on.
+    On,
 }
 
 /// The round button of the call bar.
@@ -43,6 +47,7 @@ fn bar_button(id: &'static str, icon: &'static str, look: Look) -> Stateful<Div>
     let (fill, color) = match look {
         Look::Rest => (theme::selected(), theme::text()),
         Look::Off | Look::Held => (theme::danger_soft(), theme::danger()),
+        Look::On => (theme::accent_soft(), theme::accent()),
     };
     div()
         .id(id)
@@ -101,6 +106,35 @@ fn talk(push: bool, held: Option<bool>, key: Option<String>) -> Talk {
     }
 }
 
+/// Our own encode of this picture is on.
+fn sending(call: &Call, content: Content) -> bool {
+    call.video.iter().any(|stream| stream.direction == Direction::Encode && stream.content == content)
+}
+
+/// A decode of this person was asked for, or their picture is on screen.
+fn watching(call: &Call, user_id: &str) -> bool {
+    call.video.iter().any(|stream| stream.direction == Direction::Decode && stream.content == Content::Share && stream.source == user_id)
+        || call.picture.as_ref().is_some_and(|picture| !picture.path.is_empty() && picture.user_id == user_id)
+}
+
+/// Who the watch strip offers: someone else's share, else someone else's camera. A room with
+/// video turned off offers neither, and our own seat is never it.
+struct Shown {
+    user_id: String,
+    share: bool,
+}
+
+fn pictured(room: &TinyRoom, me: &str) -> Option<Shown> {
+    if !room.video_enabled {
+        return None;
+    }
+    let others: Vec<&TinySeat> = room.participants.iter().filter(|seat| seat.user_id != me).collect();
+    if let Some(seat) = others.iter().find(|seat| seat.sharing) {
+        return Some(Shown { user_id: seat.user_id.clone(), share: true });
+    }
+    others.iter().find(|seat| seat.camera).map(|seat| Shown { user_id: seat.user_id.clone(), share: false })
+}
+
 impl Shell {
     /// What the top bar says of a channel after its name.
     pub(super) fn tiny_channel_facts(&self, room: &TinyRoom) -> Div {
@@ -145,8 +179,9 @@ impl Shell {
             self.tiny_stage(page, room, call.as_ref(), cx)
         };
         let up = call.as_ref().is_some_and(|call| !matches!(call.state, CallState::Failed { .. }));
+        let picture = call.as_ref().and_then(|call| self.tiny_picture(page, room, call, cx));
         let bar = if room.participants.is_empty() && !mine && !up { None } else { Some(self.tiny_call_bar(page, room, mine || up, call.as_ref(), cx)) };
-        div().size_full().flex().flex_col().children(banner).child(stage).children(bar).into_any_element()
+        div().size_full().flex().flex_col().children(banner).children(picture).child(stage).children(bar).into_any_element()
     }
 
     /// Over the stage while my call here is not simply up: connecting with how long it has
@@ -242,6 +277,106 @@ impl Shell {
                     .children(action)
                     .children(dismiss),
             ),
+        )
+    }
+
+    /// The one picture being watched: 16:9 above the stage, with who it is and Stop watching.
+    /// My own share is never drawn here.
+    fn tiny_picture(&self, page: &Page, room: &TinyRoom, call: &Call, cx: &mut Context<Self>) -> Option<Div> {
+        let picture: &CallPicture = call.picture.as_ref().filter(|picture| !picture.path.is_empty() && picture.user_id != page.me)?;
+        let name = model::name_by_id(page.community, &picture.user_id);
+        let kind = match picture.kind {
+            PictureKind::Share => "screen",
+            PictureKind::Camera => "camera",
+        };
+        let caption = format!("{name}'s {kind} · {}", room.name);
+        let path = PathBuf::from(&picture.path);
+        Some(
+            div().flex_none().px(px(20.)).pt(px(16.)).child(
+                div()
+                    .w_full()
+                    .rounded(px(12.))
+                    .bg(gpui::rgb(0x000000))
+                    .border_1()
+                    .border_color(theme::hairline())
+                    .overflow_hidden()
+                    .flex()
+                    .flex_col()
+                    .child(div().w_full().aspect_ratio(16. / 9.).max_h(px(420.)).min_h(px(160.)).p(px(6.)).child(img(path).size_full().object_fit(ObjectFit::Contain)))
+                    .child(
+                        div()
+                            .h(px(32.))
+                            .px(px(10.))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .bg(theme::raised())
+                            .child(Avatar::named(&name, 18.).build())
+                            .child(div().flex_1().min_w_0().truncate().type_small().text_color(theme::text()).child(caption))
+                            .child(
+                                div()
+                                    .id("tiny-picture-stop")
+                                    .flex_none()
+                                    .h(px(24.))
+                                    .px(px(8.))
+                                    .rounded(px(6.))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(4.))
+                                    .cursor_pointer()
+                                    .tab_index(0)
+                                    .hover(|style| style.bg(theme::hover()))
+                                    .focus_visible(|style| style.shadow(theme::focus_ring()))
+                                    .tooltip(tip("Stop watching", None))
+                                    .on_click(cx.listener(|this, _, _, cx| this.call_ask(Request::Media(MediaRequest::ShareWatch { source: None }), cx)))
+                                    .child(glyph("icons/x.svg", 12., theme::text_soft()))
+                                    .child(div().type_micro().text_color(theme::text_soft()).child("Stop watching")),
+                            ),
+                    ),
+            ),
+        )
+    }
+
+    /// The strip over the controls: my share, with Stop, or someone else's picture, with Watch.
+    fn tiny_watch(&self, page: &Page, room: &TinyRoom, call: &Call, cx: &mut Context<Self>) -> Option<Div> {
+        let (words, action, ours, ask) = if sending(call, Content::Share) {
+            ("You're sharing".to_owned(), "Stop", true, Request::Media(MediaRequest::ShareSend { on: false }))
+        } else {
+            let shown = pictured(room, page.me)?;
+            let name = model::name_by_id(page.community, &shown.user_id);
+            let words = if shown.share { format!("{name} is sharing") } else { format!("{name}'s camera is on") };
+            let on = watching(call, &shown.user_id);
+            let source = (!on).then_some(shown.user_id);
+            (words, if on { "Stop watching" } else { "Watch" }, false, Request::Media(MediaRequest::ShareWatch { source }))
+        };
+        Some(
+            div()
+                .h(px(32.))
+                .px(px(12.))
+                .rounded_full()
+                .bg(if ours { theme::accent_soft() } else { theme::overlay() })
+                .border_1()
+                .border_color(if ours { theme::accent() } else { theme::overlay_edge() })
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .child(div().type_small().text_color(theme::text()).child(words))
+                .child(
+                    div()
+                        .id("tiny-watch")
+                        .h(px(22.))
+                        .px(px(10.))
+                        .rounded_full()
+                        .bg(theme::selected())
+                        .flex()
+                        .items_center()
+                        .cursor_pointer()
+                        .tab_index(0)
+                        .hover(|style| style.bg(theme::pressed()))
+                        .focus_visible(|style| style.shadow(theme::focus_ring()))
+                        .on_click(cx.listener(move |this, _, _, cx| this.call_ask(ask.clone(), cx)))
+                        .child(div().type_micro().font_weight(theme::SEMIBOLD).text_color(theme::text()).child(action)),
+                ),
         )
     }
 
@@ -634,6 +769,22 @@ impl Shell {
                 .tooltip(tip(if deafened { "Undeafen" } else { "Deafen" }, Some("⌘⇧D")))
                 .on_click(cx.listener(|this, _, _, cx| this.tiny_toggle_deafen(cx)))
         };
+        let joined = call.is_some_and(|call| call.state == CallState::Joined);
+        let pictures = joined && room.video_enabled;
+        let share_on = call.is_some_and(|call| sending(call, Content::Share));
+        let camera_on = call.is_some_and(|call| sending(call, Content::Camera));
+        let share = pictures.then(|| {
+            bar_button("tiny-bar-share", "icons/monitor-up.svg", if share_on { Look::On } else { Look::Rest })
+                .tooltip(tip(if share_on { "Stop sharing" } else { "Share your screen" }, None))
+                .on_click(cx.listener(move |this, _, _, cx| this.call_ask(Request::Media(MediaRequest::ShareSend { on: !share_on }), cx)))
+        });
+        let camera = pictures.then(|| {
+            bar_button("tiny-bar-camera", "icons/video.svg", if camera_on { Look::On } else { Look::Rest })
+                .tooltip(tip(if camera_on { "Turn camera off" } else { "Turn camera on" }, None))
+                .on_click(cx.listener(move |this, _, _, cx| this.call_ask(Request::Media(MediaRequest::Camera { on: !camera_on }), cx)))
+        });
+        let watch = call.filter(|_| pictures).and_then(|call| self.tiny_watch(page, room, call, cx));
+        let refused = self.call_refused().map(str::to_owned).or_else(|| call.and_then(|call| call.device_notice.clone()));
         let health = call.filter(|call| call.state == CallState::Joined).and_then(|_| self.tiny_health()).map(|health| {
             let grade = health.grade();
             let words = match health.rtt_ms {
@@ -658,6 +809,7 @@ impl Shell {
         });
         let no_sound = !page.audio && !page.community.media.is_empty();
         bar.children(self.tiny_call_pills(room, call, held, cx))
+            .children(watch)
             .child(
                 div()
                     .p(px(6.))
@@ -671,6 +823,8 @@ impl Shell {
                     .gap(px(8.))
                     .child(mute)
                     .child(deafen)
+                    .children(share)
+                    .children(camera)
                     .child(
                         bar_button("tiny-bar-devices", "icons/settings.svg", Look::Rest)
                             .tooltip(tip("Microphone and speaker", None))
@@ -683,6 +837,7 @@ impl Shell {
             // mediad cancels echo unless it was switched off (V10); only then does the call say to
             // wear headphones.
             .when(page.audio && !crate::gui::app::prefs::values().processing().echo_cancellation, |bar| bar.child(div().type_small().text_color(theme::text_faint()).child(HEADPHONES)))
+            .children(refused.map(|detail| div().max_w(px(520.)).whitespace_normal().type_small().text_color(theme::warning()).child(detail)))
             .children(self.tiny_state.call_error.clone().map(|detail| div().type_small().text_color(theme::danger()).child(detail)))
     }
 }
@@ -714,6 +869,7 @@ mod tests {
             device_notice: None,
             device_stuck: false,
             security: None,
+            picture: None,
         }
     }
 
@@ -732,6 +888,42 @@ mod tests {
         assert!(!as_heard(&seat("dev"), false, Some(&joined(false, false, false))).speaking);
         let connecting = Call { state: CallState::Connecting, ..joined(true, false, true) };
         assert_eq!(as_heard(&seat("robin"), true, Some(&connecting)), seat("robin"), "only a call that is up speaks for me");
+    }
+
+    #[test]
+    fn a_share_is_offered_ahead_of_a_camera_and_never_our_own() {
+        let room = TinyRoom {
+            participants: vec![
+                TinySeat { user_id: "me".into(), sharing: true, camera: true, ..TinySeat::default() },
+                TinySeat { user_id: "ada".into(), camera: true, ..TinySeat::default() },
+                TinySeat { user_id: "bev".into(), sharing: true, ..TinySeat::default() },
+            ],
+            ..TinyRoom::new("lounge", "Lounge")
+        };
+        let shown = pictured(&room, "me").expect("bev's share");
+        assert_eq!(shown.user_id, "bev");
+        assert!(shown.share);
+        let cameras = TinyRoom {
+            participants: vec![TinySeat { user_id: "ada".into(), camera: true, ..TinySeat::default() }],
+            ..TinyRoom::new("lounge", "Lounge")
+        };
+        let shown = pictured(&cameras, "me").expect("ada's camera");
+        assert_eq!((shown.user_id.as_str(), shown.share), ("ada", false));
+        let quiet = TinyRoom { video_enabled: false, ..cameras };
+        assert!(pictured(&quiet, "me").is_none(), "a room with video off offers nothing");
+    }
+
+    #[test]
+    fn sending_is_our_encode_and_watching_is_that_person() {
+        let mut call = joined(false, false, false);
+        assert!(!sending(&call, Content::Share));
+        call.video.push(protocol::VideoStream { direction: Direction::Encode, content: Content::Camera, source: String::new() });
+        assert!(sending(&call, Content::Camera));
+        assert!(!sending(&call, Content::Share));
+        assert!(!watching(&call, "ada"));
+        call.video.push(protocol::VideoStream { direction: Direction::Decode, content: Content::Share, source: "ada".into() });
+        assert!(watching(&call, "ada"));
+        assert!(!watching(&call, "bev"));
     }
 
     #[test]

@@ -253,6 +253,7 @@ pub(super) fn call(snapshot: &Snapshot) -> Option<Call> {
         engine_linked: true,
         video: Vec::new(),
         security: None,
+        picture: None,
     })
 }
 

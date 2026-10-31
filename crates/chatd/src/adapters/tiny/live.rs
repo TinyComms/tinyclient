@@ -19,7 +19,7 @@ use super::super::discord::gateway::{wait_sockets, Pollable, WakePair, POLL_IN, 
 use super::super::{net, Context, Refusal, Reply, ReconnectWait, PANIC_PAUSE, RECONNECTING};
 use crate::hub::lock;
 use super::{members_of, Saved};
-use protocol::{join_host, CallFailure, Cue, Link, MediaRequest, Occupant, Participant, Presence, TinyE2ee, TinyOffer, TinySeat, TinySlot};
+use protocol::{join_host, CallFailure, Cue, Link, MediaRequest, Occupant, Participant, PictureKind, Presence, TinyE2ee, TinyOffer, TinyPicture, TinySeat, TinySlot};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -117,13 +117,15 @@ pub enum Ask {
     Priority { on: bool },
     /// A `call.e2ee` frame from mediad, for the server as it is.
     E2ee { frame: String },
+    /// A renegotiation offer from mediad, for `call.offer`.
+    Offer { sdp: String },
 }
 
 impl Ask {
     fn into_reply(self) -> Option<Reply<()>> {
         match self {
             Ask::Join { reply, .. } | Ask::Leave { reply } | Ask::Kick { reply, .. } | Ask::Moderate { reply, .. } | Ask::Move { reply, .. } => Some(reply),
-            Ask::Look | Ask::Hangup { .. } | Ask::State { .. } | Ask::Type { .. } | Ask::Priority { .. } | Ask::E2ee { .. } => None,
+            Ask::Look | Ask::Hangup { .. } | Ask::State { .. } | Ask::Type { .. } | Ask::Priority { .. } | Ask::E2ee { .. } | Ask::Offer { .. } => None,
         }
     }
 
@@ -298,6 +300,8 @@ struct Sitting {
     server_deafened: bool,
     suppressed: bool,
     priority: bool,
+    camera: bool,
+    sharing: bool,
 }
 
 impl Sitting {
@@ -312,6 +316,7 @@ impl Sitting {
         let flag = |field| from.get(field).and_then(Value::as_bool).unwrap_or(false);
         (self.muted, self.deafened) = (flag("muted"), flag("deafened"));
         (self.server_muted, self.server_deafened, self.suppressed, self.priority) = (flag("server_muted"), flag("server_deafened"), flag("suppressed"), flag("priority"));
+        (self.camera, self.sharing) = (flag("camera"), flag("sharing"));
     }
 
     /// What the server enforces changed: the page reads it again.
@@ -550,6 +555,8 @@ enum Asked {
     State,
     /// Server mute or deafen, or a move: about someone else.
     Moderate,
+    /// A `call.offer`. The answer is `call.answer`, or `share_taken`.
+    Offer,
 }
 
 fn connect(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, timing: &Timing) -> End {
@@ -678,6 +685,12 @@ fn serve(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, timing: &Ti
                     // Only for the seat that has media; one from a call that has gone is stale.
                     Ask::E2ee { frame } if seat.call_id.is_some() => wire.send(frame),
                     Ask::E2ee { .. } => Ok(()),
+                    Ask::Offer { sdp } if seat.call_id.is_some() => {
+                        let reference = refs.to_string();
+                        pending.push(Pending { reference: reference.clone(), asked: Asked::Offer, until: Instant::now() + timing.answer, reply: None });
+                        wire.send(json!({"type": "call.offer", "ref": reference, "sdp": sdp}).to_string())
+                    }
+                    Ask::Offer { .. } => Ok(()),
                     Ask::Moderate { room_id, user_id, server_muted, server_deafened, reply } => {
                         let reference = refs.to_string();
                         pending.push(Pending { reference: reference.clone(), asked: Asked::Moderate, until: Instant::now() + timing.answer, reply: Some(reply) });
@@ -712,6 +725,11 @@ fn serve(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, timing: &Ti
         let (late, waiting): (Vec<Pending>, Vec<Pending>) = std::mem::take(pending).into_iter().partition(|pending| pending.until <= now);
         *pending = waiting;
         for late in late {
+            if let Asked::Offer = &late.asked {
+                if let Some(room) = seat.wanted.clone() {
+                    ctx.tell_media(&room, MediaRequest::TinyRenegotiation { sdp: String::new() });
+                }
+            }
             if let Asked::Join(room, true) = &late.asked {
                 if late.reply.is_some() {
                     ctx.call_over(room);
@@ -894,6 +912,10 @@ struct ParticipantFrame {
     suppressed: bool,
     #[serde(default, deserialize_with = "protocol::or_default")]
     priority: bool,
+    #[serde(default, deserialize_with = "protocol::or_default")]
+    camera: bool,
+    #[serde(default, deserialize_with = "protocol::or_default")]
+    sharing: bool,
 }
 
 fn text<'a>(frame: &'a Value, field: &str) -> Option<&'a str> {
@@ -957,6 +979,15 @@ fn heard_frame(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, pendi
                 let audio = frame.get("audio").and_then(Value::as_array).into_iter().flatten().take(SEATS);
                 let audio = audio.filter_map(|slot| Some(TinySlot { mid: text(slot, "mid")?.to_owned(), user_id: text(slot, "user_id")?.to_owned() }));
                 ctx.tiny_slots(&room, audio.collect());
+                let video = frame.get("video").filter(|video| !video.is_null());
+                let picture = video.and_then(|video| {
+                    Some(TinyPicture {
+                        mid: text(video, "mid")?.to_owned(),
+                        user_id: text(video, "user_id")?.to_owned(),
+                        kind: if text(video, "kind") == Some("share") { PictureKind::Share } else { PictureKind::Camera },
+                    })
+                });
+                ctx.tell_media(&room, MediaRequest::TinyPicture { picture });
             }
         }
         "call.speaking" => {
@@ -972,6 +1003,12 @@ fn heard_frame(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, pendi
                     let before = who.clone();
                     who.heard(frame);
                     let moderated = who.moderated(&before);
+                    if user == seat.me && before.sharing && !who.sharing {
+                        ctx.tell_media(room, MediaRequest::ShareSend { on: false });
+                    }
+                    if user == seat.me && before.camera && !who.camera {
+                        ctx.tell_media(room, MediaRequest::Camera { on: false });
+                    }
                     tell(ctx, seat, room);
                     duck(ctx, seat, room);
                     if moderated {
@@ -1034,6 +1071,8 @@ fn ready_heard(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, heard
                 server_deafened: who.server_deafened,
                 suppressed: who.suppressed,
                 priority: who.priority,
+                camera: who.camera,
+                sharing: who.sharing,
             });
             (call.room_id, people.collect::<Vec<_>>())
         })
@@ -1076,6 +1115,8 @@ fn tell(ctx: &Context, seat: &Seat, room: &str) {
             server_deafened: who.server_deafened,
             suppressed: who.suppressed,
             priority: who.priority,
+            camera: who.camera,
+            sharing: who.sharing,
         });
         ctx.participants(room, roster.collect());
     }
@@ -1091,6 +1132,8 @@ fn tell(ctx: &Context, seat: &Seat, room: &str) {
             server_deafened: who.server_deafened,
             suppressed: who.suppressed,
             priority: who.priority,
+            camera: who.camera,
+            sharing: who.sharing,
         })
         .collect();
     super::manage::remember(&seat.saved, |known| {
@@ -1107,7 +1150,7 @@ fn tell(ctx: &Context, seat: &Seat, room: &str) {
             name: name(&who.user),
             muted: who.muted,
             deafened: who.deafened,
-            streaming: false,
+            streaming: who.camera || who.sharing,
             speaking: seat.speaking.contains(&who.user),
         })
         .collect();
@@ -1269,6 +1312,11 @@ fn answered(ctx: &Context, seat: &mut Seat, pending: &mut Vec<Pending>, frame: &
                 seat.call_id = None;
             }
             Asked::Kick | Asked::State | Asked::Moderate => {}
+            Asked::Offer => {
+                if let (Some(sdp), Some(room)) = (text(frame, "sdp"), seat.wanted.clone()) {
+                    ctx.tell_media(&room, MediaRequest::TinyRenegotiation { sdp: sdp.to_owned() });
+                }
+            }
         }
         Ok(())
     } else {
@@ -1286,8 +1334,14 @@ fn answered(ctx: &Context, seat: &mut Seat, pending: &mut Vec<Pending>, frame: &
         if matches!(pending.asked, Asked::State) {
             eprintln!("chatd: Tiny server: call.state refused ({code})");
         }
-        // A rejoin nobody asked for that fails is not tried again.
-        if pending.reply.is_none() {
+        if let Asked::Offer = &pending.asked {
+            if let Some(room) = seat.wanted.clone() {
+                ctx.tell_media(&room, MediaRequest::TinyRenegotiation { sdp: String::new() });
+            }
+        }
+        // A rejoin nobody asked for that fails is not tried again. A refused renegotiation
+        // leaves the seat where it is.
+        if pending.reply.is_none() && !matches!(pending.asked, Asked::Offer) {
             seat.wanted = None;
         }
         Err(Refusal::Refused(said.to_owned()))

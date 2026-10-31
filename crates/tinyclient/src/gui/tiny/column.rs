@@ -109,6 +109,12 @@ pub(super) fn seat_glyphs(seat: &TinySeat) -> Vec<(&'static str, gpui::Rgba, &'s
     } else if seat.muted && !seat.deafened {
         out.push(("icons/mic-off.svg", theme::text_faint(), "Muted"));
     }
+    if seat.sharing {
+        out.push(("icons/monitor-up.svg", theme::accent(), "Sharing their screen"));
+    }
+    if seat.camera {
+        out.push(("icons/video.svg", theme::accent(), "Camera on"));
+    }
     out
 }
 

@@ -47,15 +47,35 @@ symphonia = { version = "0.5", default-features = false, features = ["ogg", "mkv
 # (`webrtc-audio-processing`) needs meson and ninja to build, and none of the other pure-Rust
 # echo cancellers is WebRTC's. Pinned: a port moves fast, and a new version must be heard first.
 sonora = "=0.2.0"
+# Cisco's OpenH264 2.6.0 binary, loaded at runtime (`libloading`). The `source` feature
+# compiles the codec from C, which this tree does not. The binary is downloaded from Cisco
+# the first time a picture is encoded, and checked against the crate's known hashes.
+openh264 = { version = "0.9.9", default-features = false, features = ["libloading"] }
+# The watched picture is a JPEG on disk. The jpeg encoder is pure Rust.
+image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
+# The Cisco binary is bz2. Pure Rust, so the release image needs no libbz2.
+bzip2-rs = "0.1.2"
+# The download of that binary. native-tls is already linked.
+ureq = { version = "2.12.1", default-features = false, features = ["native-tls"] }
 
 [target.'cfg(windows)'.dependencies]
 # MMCSS scheduling for the device callbacks and the call's tick, and the 1 ms system timer a
 # call's 20 ms tick needs (`rt`). Already in the tree through cpal and mio.
-windows-sys = { version = "0.61", features = ["Win32_Media", "Win32_System_Threading", "Win32_Foundation"] }
+windows-sys = { version = "0.61", features = ["Win32_Media", "Win32_System_Threading", "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging"] }
+# The first camera, through Media Foundation. Pure Rust bindings. A machine with no camera
+# says so, and the call stays a voice call.
+nokhwa = { version = "0.10.10", default-features = false, features = ["input-native"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # AVCaptureDevice's microphone authorization, which CoreAudio does not report.
 objc2 = "0.6"
+# A screen grab for a share. CoreGraphics is on the system; this does not compile C.
+core-graphics = "0.24"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# A screen grab over the X11 protocol. Pure Rust, so the release image needs no X11 headers.
+# A Wayland session with no XWayland says so in words and the call stays a voice call.
+x11rb = "0.13"
 
 [dev-dependencies]
 # The fake voice server acts as Discord's MLS external sender. Same version davey links.

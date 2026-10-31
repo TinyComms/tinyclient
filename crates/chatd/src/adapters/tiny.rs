@@ -754,6 +754,8 @@ pub(crate) fn community(hub: &Hub, account: AccountKey) -> Response {
                         server_deafened: flags.server_deafened,
                         suppressed: flags.suppressed,
                         priority: flags.priority,
+                        camera: flags.camera,
+                        sharing: flags.sharing,
                     }
                 })
                 .collect();

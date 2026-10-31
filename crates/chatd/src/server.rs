@@ -180,6 +180,12 @@ impl Chat {
                 adapter.command(Command::Tiny(adapters::tiny::live::Ask::E2ee { frame }));
             }
         });
+        let adapters = chat.adapters.clone();
+        chat.hub.calls.on_offer(move |conversation, sdp| {
+            if let Some(adapter) = lock(&adapters).get(&conversation.account()) {
+                adapter.command(Command::Tiny(adapters::tiny::live::Ask::Offer { sdp }));
+            }
+        });
         let (searches, adapters) = (chat.searches.clone(), chat.adapters.clone());
         let spawned = std::thread::Builder::new().name("search".into()).stack_size(256 * 1024).spawn(move || searches.run(&adapters));
         if let Err(err) = spawned {
