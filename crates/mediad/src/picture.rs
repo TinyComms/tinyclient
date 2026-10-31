@@ -5,6 +5,9 @@
 //! OpenH264 is Cisco's binary, downloaded from Cisco and loaded when the first picture is
 //! encoded, so this crate still builds with no C toolchain. A capture that fails is said in
 //! words and the voice call stays.
+//!
+//! `TINYCLIENT_CALL_FIXTURE` names a directory of Annex B clips (`camera-h.h264`, `camera-l.h264`,
+//! `share.h264`). While it is set, the camera and the share are those clips and nothing is captured.
 
 use openh264::decoder::{Decoder, DecoderConfig};
 use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate, Level, Profile, UsageType};
@@ -183,17 +186,98 @@ pub struct Pictures {
     low: Option<Coded>,
     decoder: Option<Decoder>,
     camera: Camera,
+    fixture: Option<FixtureClips>,
 }
 
 impl Default for Pictures {
     fn default() -> Self {
-        Self { share: None, high: None, low: None, decoder: None, camera: Camera::default() }
+        Self { share: None, high: None, low: None, decoder: None, camera: Camera::default(), fixture: None }
     }
 }
 
+struct Clip {
+    frames: Vec<Vec<u8>>,
+    at: usize,
+}
+
+struct FixtureClips {
+    high: Clip,
+    low: Clip,
+    share: Clip,
+}
+
+fn call_fixture() -> Option<PathBuf> {
+    std::env::var_os("TINYCLIENT_CALL_FIXTURE").map(PathBuf::from)
+}
+
+/// Access units of an Annex B stream: parameter sets stay with the slice that follows them.
+fn annex_frames(stream: &[u8]) -> Vec<Vec<u8>> {
+    let mut starts = Vec::new();
+    let mut at = 0;
+    while let Some(found) = stream.get(at..).and_then(|rest| rest.windows(3).position(|window| window == [0, 0, 1])) {
+        starts.push(at + found + 3);
+        at += found + 3;
+    }
+    let units: Vec<&[u8]> = starts
+        .iter()
+        .enumerate()
+        .filter_map(|(n, &start)| {
+            let end = match starts.get(n + 1) {
+                Some(&next) => {
+                    let end = next - 3;
+                    if end > start && stream.get(end - 1) == Some(&0) { end - 1 } else { end }
+                }
+                None => stream.len(),
+            };
+            stream.get(start..end).filter(|unit| !unit.is_empty())
+        })
+        .collect();
+    let mut frames = Vec::new();
+    let mut frame = Vec::new();
+    for unit in units {
+        frame.extend_from_slice(&[0, 0, 0, 1]);
+        frame.extend_from_slice(unit);
+        if matches!(unit.first().map(|header| header & 0x1f), Some(1 | 5)) {
+            frames.push(std::mem::take(&mut frame));
+        }
+    }
+    frames
+}
+
+fn read_clip(dir: &Path, name: &str) -> Result<Clip, String> {
+    let bytes = std::fs::read(dir.join(name)).map_err(|err| format!("{name}: {err}"))?;
+    let frames = annex_frames(&bytes);
+    if frames.is_empty() {
+        return Err(format!("{name} has no picture."));
+    }
+    Ok(Clip { frames, at: 0 })
+}
+
+fn next_clip(clip: &mut Clip) -> Vec<u8> {
+    let frame = clip.frames[clip.at % clip.frames.len()].clone();
+    clip.at += 1;
+    frame
+}
+
 impl Pictures {
+    fn ensure_fixture(&mut self, dir: &Path) -> Result<(), String> {
+        if self.fixture.is_some() {
+            return Ok(());
+        }
+        self.fixture = Some(FixtureClips {
+            high: read_clip(dir, "camera-h.h264")?,
+            low: read_clip(dir, "camera-l.h264")?,
+            share: read_clip(dir, "share.h264")?,
+        });
+        Ok(())
+    }
+
     /// One share frame, Annex B, or why the screen could not be read.
     pub fn share(&mut self, key: bool) -> Result<Vec<u8>, String> {
+        if let Some(dir) = call_fixture() {
+            self.ensure_fixture(&dir)?;
+            return Ok(next_clip(&mut self.fixture.as_mut().unwrap().share));
+        }
         // The download must not sit on the call thread, and a capture is wasted until it loads.
         if self.share.is_none() {
             load_api()?;
@@ -213,6 +297,11 @@ impl Pictures {
 
     /// The camera's two layers, high then low, or why the camera could not be read.
     pub fn camera(&mut self, key: bool) -> Result<(Vec<u8>, Vec<u8>), String> {
+        if let Some(dir) = call_fixture() {
+            self.ensure_fixture(&dir)?;
+            let clips = self.fixture.as_mut().unwrap();
+            return Ok((next_clip(&mut clips.high), next_clip(&mut clips.low)));
+        }
         if self.high.is_none() || self.low.is_none() {
             load_api()?;
         }
@@ -275,6 +364,9 @@ impl Pictures {
 
 /// One try of the screen, so a button can say no before the call claims to be sharing.
 pub fn probe_screen() -> Result<(), String> {
+    if call_fixture().is_some() {
+        return Ok(());
+    }
     capture_screen().map(|_| ())
 }
 
@@ -598,6 +690,9 @@ fn download(path: &Path) -> Result<(), String> {
 
 /// Whether a camera can be opened, said before the button claims it is on.
 pub fn probe_camera() -> Result<(), String> {
+    if call_fixture().is_some() {
+        return Ok(());
+    }
     let mut camera = Camera::default();
     camera.frame().map(|_| ())?;
     camera.close();
@@ -627,6 +722,40 @@ mod tests {
         assert_eq!(width % 2, 0);
         assert_eq!(height % 2, 0);
         assert!(width <= 1280 && height <= 720);
+    }
+
+    fn average_rgb(annex_b: &[u8]) -> (f64, f64, f64) {
+        let path = library_path().expect("openh264 path");
+        if !path.exists() {
+            download(&path).expect("openh264 downloads");
+        }
+        let api = OpenH264API::from_blob_path(&path).expect("openh264 opens");
+        let mut decoder = Decoder::with_api_config(api, DecoderConfig::new()).expect("decoder");
+        let decoded = decoder.decode(annex_b).expect("decode").expect("a picture");
+        let (width, height) = decoded.dimensions();
+        let planes = Planes { width, height, y: decoded.y().to_vec(), u: decoded.u().to_vec(), v: decoded.v().to_vec() };
+        let colors = rgb(&planes);
+        let pixels = colors.len() / 3;
+        let (mut r, mut g, mut b) = (0.0, 0.0, 0.0);
+        for pixel in colors.chunks_exact(3) {
+            r += pixel[0] as f64;
+            g += pixel[1] as f64;
+            b += pixel[2] as f64;
+        }
+        (r / pixels as f64, g / pixels as f64, b / pixels as f64)
+    }
+
+    #[test]
+    fn the_share_clip_is_not_the_camera_bars() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/call");
+        let camera = std::fs::read(dir.join("camera-h.h264")).expect("camera-h.h264");
+        let share = std::fs::read(dir.join("share.h264")).expect("share.h264");
+        let camera = super::annex_frames(&camera).into_iter().next().expect("camera frame");
+        let share = super::annex_frames(&share).into_iter().next().expect("share frame");
+        let (cr, cg, cb) = average_rgb(&camera);
+        let (sr, sg, sb) = average_rgb(&share);
+        let distance = ((cr - sr).powi(2) + (cg - sg).powi(2) + (cb - sb).powi(2)).sqrt();
+        assert!(distance > 20.0, "camera avg ({cr:.1},{cg:.1},{cb:.1}) share avg ({sr:.1},{sg:.1},{sb:.1}) distance {distance:.1}");
     }
 
     #[test]

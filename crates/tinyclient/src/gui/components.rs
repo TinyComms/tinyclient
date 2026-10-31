@@ -306,7 +306,8 @@ fn button_shell(label: impl Into<SharedString>) -> Div {
 
 /// A 28 pt button. `.h(px(24.))` makes it small, `.h(px(32.))` a dialog's main action.
 pub fn button(id: impl Into<ElementId>, kind: ButtonKind, label: impl Into<SharedString>) -> Stateful<Div> {
-    let shell = button_shell(label).id(id).cursor_pointer().tab_index(0);
+    let label = label.into();
+    let shell = button_shell(label.clone()).id(id).cursor_pointer().tab_index(0).role(gpui::Role::Button).aria_label(label);
     match kind {
         ButtonKind::Primary => shell
             .bg(theme::accent())
@@ -349,7 +350,7 @@ pub fn button_with_icon(
         ButtonKind::Secondary | ButtonKind::Ghost => theme::text_soft(),
     };
     let label: SharedString = label.into();
-    button(id, kind, "").pl(px(10.)).child(glyph(icon, 16., color)).child(label)
+    button(id, kind, "").pl(px(10.)).aria_label(label.clone()).child(glyph(icon, 16., color)).child(label)
 }
 
 /// Disabled, and also busy: a busy button says so in words ("Sending…") in this look.
@@ -620,7 +621,37 @@ pub fn link_word(link: Link) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::Element;
     use protocol::Key;
+
+    fn accessible_name(element: &impl Element) -> Option<String> {
+        let role = element.a11y_role().unwrap_or(gpui::Role::Unknown);
+        let mut node = gpui::accesskit::Node::new(role);
+        element.write_a11y_info(&mut node);
+        node.label().map(str::to_owned)
+    }
+
+    #[test]
+    fn a_button_is_named_with_the_label_a_person_sees() {
+        let join = button("tiny-join", ButtonKind::Primary, "Join channel");
+        assert_eq!(join.a11y_role(), Some(gpui::Role::Button));
+        assert_eq!(accessible_name(&join).as_deref(), Some("Join channel"));
+    }
+
+    #[test]
+    fn an_icon_button_is_named_with_the_label_a_person_sees() {
+        let join = button_with_icon("tiny-join-empty", ButtonKind::Primary, "icons/volume-2.svg", "Join channel");
+        assert_eq!(join.a11y_role(), Some(gpui::Role::Button));
+        assert_eq!(accessible_name(&join).as_deref(), Some("Join channel"));
+    }
+
+    #[test]
+    fn a_disabled_button_has_no_accessible_name_and_no_click() {
+        let disabled = button_disabled("Join channel");
+        assert_eq!(disabled.a11y_role(), None);
+        assert!(Element::id(&disabled).is_none(), "a disabled button is not a click target");
+        assert_eq!(accessible_name(&disabled), None);
+    }
 
     fn row(kind: ConversationKind, unread: u32, mentions: u32, muted: bool) -> Conversation {
         let key = Key { network: Network::Telegram, account: "me".into(), id: "c".into() };

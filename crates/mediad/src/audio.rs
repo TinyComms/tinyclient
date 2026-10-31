@@ -19,6 +19,10 @@
 //! 440 Hz tone (`tone:550` another pitch, so two tones in one mix cannot cancel), `onset` hears that tone once a second, each time led in by 40 ms too quiet to
 //! count as speech, and none of them opens a device. `TINYCLIENT_MEDIAD_SINK` names a file that then takes
 //! what would have been played, as raw 48 kHz stereo `i16`.
+//!
+//! `TINYCLIENT_CALL_FIXTURE` names a directory whose `speech.pcm` (48 kHz stereo `i16`) is the
+//! microphone, looped one 20 ms frame at a time, and no device is opened. `TINYCLIENT_MEDIAD_AUDIO`
+//! still replaces that when both are set.
 
 use crate::pick::{self, Backoff, Endpoint, Host, Pick};
 use crate::ring::{ring, Consumer, Producer};
@@ -432,6 +436,15 @@ pub fn listing() -> Listing {
             default_output: "null".to_owned(),
         };
     }
+    if std::env::var_os("TINYCLIENT_CALL_FIXTURE").is_some() {
+        let stand_in = |name: &str| AudioDevice { id: name.to_owned(), name: name.to_owned(), default: true, auto: true, ..AudioDevice::default() };
+        return Listing {
+            inputs: vec![stand_in("fixture")],
+            outputs: vec![stand_in("null")],
+            default_input: "fixture".to_owned(),
+            default_output: "null".to_owned(),
+        };
+    }
     let system = System::new();
     let (inputs, default_input) = devices_of(&system, true);
     let (outputs, default_output) = devices_of(&system, false);
@@ -617,6 +630,11 @@ enum Source {
     /// A word a second: half a second of nothing, 40 ms of a faint tone, then the tone.
     Onset {
         at: u32,
+    },
+    /// `speech.pcm` from `TINYCLIENT_CALL_FIXTURE`, looped.
+    Speech {
+        pcm: Vec<i16>,
+        at: usize,
     },
     Device(Option<Input>),
 }
@@ -903,7 +921,7 @@ fn trim_front(samples: &mut Vec<f32>, keep: usize, fade: usize) {
 impl Audio {
     /// True when the environment replaced the devices, so no permission applies.
     pub fn simulated() -> bool {
-        std::env::var_os("TINYCLIENT_MEDIAD_AUDIO").is_some()
+        std::env::var_os("TINYCLIENT_MEDIAD_AUDIO").is_some() || std::env::var_os("TINYCLIENT_CALL_FIXTURE").is_some()
     }
 
     /// Opens the microphone and speaker, or their stand-ins.
@@ -948,6 +966,22 @@ impl Audio {
                 None => Sink::Null,
             };
             audio.input = InUse { name: kind.clone(), id: kind, notice: None };
+            audio.output = InUse { name: "null".to_owned(), id: "null".to_owned(), notice: None };
+            return Ok(audio);
+        }
+        if let Some(dir) = std::env::var_os("TINYCLIENT_CALL_FIXTURE") {
+            let path = std::path::PathBuf::from(dir).join("speech.pcm");
+            let bytes = std::fs::read(&path).map_err(|err| AudioError::Microphone(err.to_string()))?;
+            if bytes.len() < 2 || bytes.len() % 2 != 0 {
+                return Err(AudioError::Microphone("The fixture speech is not 16-bit audio.".into()));
+            }
+            let pcm = bytes.chunks_exact(2).map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]])).collect();
+            audio.source = Source::Speech { pcm, at: 0 };
+            audio.sink = match std::env::var_os("TINYCLIENT_MEDIAD_SINK") {
+                Some(path) => Sink::File(File::create(path).map_err(|err| AudioError::Speaker(err.to_string()))?),
+                None => Sink::Null,
+            };
+            audio.input = InUse { name: "fixture".to_owned(), id: "fixture".to_owned(), notice: None };
             audio.output = InUse { name: "null".to_owned(), id: "null".to_owned(), notice: None };
             return Ok(audio);
         }
@@ -1101,6 +1135,17 @@ impl Audio {
                     let angle = f64::from(*at) * 440. * std::f64::consts::TAU / f64::from(RATE);
                     pair.fill((angle.sin() * peak) as i16);
                     *at = at.wrapping_add(1);
+                }
+                true
+            }
+            Source::Speech { pcm, at } => {
+                if pcm.is_empty() {
+                    frame.fill(0);
+                    return true;
+                }
+                for sample in frame.iter_mut() {
+                    *sample = pcm[*at % pcm.len()];
+                    *at += 1;
                 }
                 true
             }

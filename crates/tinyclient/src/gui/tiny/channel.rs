@@ -42,8 +42,8 @@ enum Look {
     On,
 }
 
-/// The round button of the call bar.
-fn bar_button(id: &'static str, icon: &'static str, look: Look) -> Stateful<Div> {
+/// The round button of the call bar. `name` is the tooltip, which a driver reads.
+fn bar_button(id: &'static str, icon: &'static str, look: Look, name: impl Into<SharedString>) -> Stateful<Div> {
     let (fill, color) = match look {
         Look::Rest => (theme::selected(), theme::text()),
         Look::Off | Look::Held => (theme::danger_soft(), theme::danger()),
@@ -51,6 +51,8 @@ fn bar_button(id: &'static str, icon: &'static str, look: Look) -> Stateful<Div>
     };
     div()
         .id(id)
+        .role(gpui::Role::Button)
+        .aria_label(name.into())
         .relative()
         .size(px(44.))
         .rounded_full()
@@ -122,6 +124,45 @@ fn watching(call: &Call, user_id: &str) -> bool {
 struct Shown {
     user_id: String,
     share: bool,
+}
+
+fn mute_words(held: Option<&str>, muted: bool) -> &str {
+    match held {
+        Some(words) => words,
+        None if muted => "Unmute",
+        None => "Mute",
+    }
+}
+
+fn deafen_words(held: bool, deafened: bool) -> &'static str {
+    if held {
+        "A moderator deafened you here"
+    } else if deafened {
+        "Undeafen"
+    } else {
+        "Deafen"
+    }
+}
+
+fn share_words(on: bool) -> &'static str {
+    if on { "Stop sharing" } else { "Share your screen" }
+}
+
+fn camera_words(on: bool) -> &'static str {
+    if on { "Turn camera off" } else { "Turn camera on" }
+}
+
+const DEVICES_WORDS: &str = "Microphone and speaker";
+
+fn leave_words(connecting: bool) -> &'static str {
+    if connecting { "Cancel joining" } else { "Leave the call" }
+}
+
+fn health_words(grade: Grade, rtt_ms: Option<u32>) -> String {
+    match rtt_ms {
+        Some(ms) if grade != Grade::Unknown => format!("Call health: {} · {ms} ms", grade.words().to_lowercase()),
+        _ => "Call health".to_owned(),
+    }
 }
 
 fn pictured(room: &TinyRoom, me: &str) -> Option<Shown> {
@@ -751,11 +792,14 @@ impl Shell {
         let connecting = call.is_some_and(|call| matches!(call.state, CallState::Connecting | CallState::RingingOut));
         let speaking = call.is_some_and(|call| call.state == CallState::Joined && call.speaking) && !muted && held.is_none();
         let leave_word = if connecting { "Cancel" } else { "Leave" };
+        let leave_name = leave_words(connecting);
         let leave = if self.tiny_state.call_busy {
             button_disabled(leave_word).h(px(44.)).px(px(20.)).rounded_full().into_any_element()
         } else {
             div()
                 .id("tiny-leave")
+                .role(gpui::Role::Button)
+                .aria_label(leave_name)
                 .h(px(44.))
                 .px(px(20.))
                 .rounded_full()
@@ -767,51 +811,54 @@ impl Shell {
                 .cursor_pointer()
                 .tab_index(0)
                 .focus_visible(|style| style.shadow(theme::focus_ring_gap(theme::overlay())))
-                .tooltip(tip(if connecting { "Cancel joining" } else { "Leave the call" }, Some("⌘⇧H")))
+                .tooltip(tip(leave_name, Some("⌘⇧H")))
                 .on_click(cx.listener(|this, _, _, cx| this.tiny_leave(cx)))
                 .child(glyph("icons/phone-off.svg", 18., theme::on_accent()))
                 .child(div().type_ui().font_weight(theme::SEMIBOLD).text_color(theme::on_accent()).child(leave_word))
                 .into_any_element()
         };
+        let mute_name = mute_words(held, muted);
         let mute = match held {
-            Some(words) => bar_button("tiny-bar-mute", "icons/mic-off.svg", Look::Held).tooltip(tip(words, None)),
-            None => bar_button("tiny-bar-mute", if muted { "icons/mic-off.svg" } else { "icons/mic.svg" }, if muted { Look::Off } else { Look::Rest })
-                .tooltip(tip(if muted { "Unmute" } else { "Mute" }, Some("⌘⇧M")))
+            Some(_) => bar_button("tiny-bar-mute", "icons/mic-off.svg", Look::Held, mute_name).tooltip(tip(mute_name, None)),
+            None => bar_button("tiny-bar-mute", if muted { "icons/mic-off.svg" } else { "icons/mic.svg" }, if muted { Look::Off } else { Look::Rest }, mute_name)
+                .tooltip(tip(mute_name, Some("⌘⇧M")))
                 .on_click(cx.listener(|this, _, _, cx| this.tiny_toggle_mute(cx))),
         }
         // While I am heard: a ring on the button, the same green as a speaking tile's.
         .when(speaking, |mute| mute.child(div().absolute().top_0().left_0().size_full().rounded_full().border_2().border_color(theme::positive())));
+        let deafen_name = deafen_words(held_ears, deafened);
         let deafen = if held_ears {
-            bar_button("tiny-bar-deafen", "icons/headphone-off.svg", Look::Held).tooltip(tip("A moderator deafened you here", None))
+            bar_button("tiny-bar-deafen", "icons/headphone-off.svg", Look::Held, deafen_name).tooltip(tip(deafen_name, None))
         } else {
-            bar_button("tiny-bar-deafen", if deafened { "icons/headphone-off.svg" } else { "icons/headphones.svg" }, if deafened { Look::Off } else { Look::Rest })
-                .tooltip(tip(if deafened { "Undeafen" } else { "Deafen" }, Some("⌘⇧D")))
+            bar_button("tiny-bar-deafen", if deafened { "icons/headphone-off.svg" } else { "icons/headphones.svg" }, if deafened { Look::Off } else { Look::Rest }, deafen_name)
+                .tooltip(tip(deafen_name, Some("⌘⇧D")))
                 .on_click(cx.listener(|this, _, _, cx| this.tiny_toggle_deafen(cx)))
         };
         let joined = call.is_some_and(|call| call.state == CallState::Joined);
         let pictures = joined && room.video_enabled;
         let share_on = call.is_some_and(|call| sending(call, Content::Share));
         let camera_on = call.is_some_and(|call| sending(call, Content::Camera));
+        let share_name = share_words(share_on);
         let share = pictures.then(|| {
-            bar_button("tiny-bar-share", "icons/monitor-up.svg", if share_on { Look::On } else { Look::Rest })
-                .tooltip(tip(if share_on { "Stop sharing" } else { "Share your screen" }, None))
+            bar_button("tiny-bar-share", "icons/monitor-up.svg", if share_on { Look::On } else { Look::Rest }, share_name)
+                .tooltip(tip(share_name, None))
                 .on_click(cx.listener(move |this, _, _, cx| this.call_ask(Request::Media(MediaRequest::ShareSend { on: !share_on }), cx)))
         });
+        let camera_name = camera_words(camera_on);
         let camera = pictures.then(|| {
-            bar_button("tiny-bar-camera", "icons/video.svg", if camera_on { Look::On } else { Look::Rest })
-                .tooltip(tip(if camera_on { "Turn camera off" } else { "Turn camera on" }, None))
+            bar_button("tiny-bar-camera", "icons/video.svg", if camera_on { Look::On } else { Look::Rest }, camera_name)
+                .tooltip(tip(camera_name, None))
                 .on_click(cx.listener(move |this, _, _, cx| this.call_ask(Request::Media(MediaRequest::Camera { on: !camera_on }), cx)))
         });
         let watch = call.filter(|_| pictures).and_then(|call| self.tiny_watch(page, room, call, cx));
         let refused = self.call_refused().map(str::to_owned).or_else(|| call.and_then(|call| call.device_notice.clone()));
         let health = call.filter(|call| call.state == CallState::Joined).and_then(|_| self.tiny_health()).map(|health| {
             let grade = health.grade();
-            let words = match health.rtt_ms {
-                Some(ms) if grade != Grade::Unknown => format!("Call health: {} · {ms} ms", grade.words().to_lowercase()),
-                _ => "Call health".to_owned(),
-            };
+            let words = health_words(grade, health.rtt_ms);
             div()
                 .id("tiny-bar-health")
+                .role(gpui::Role::Button)
+                .aria_label(words.clone())
                 .size(px(44.))
                 .rounded_full()
                 .bg(theme::selected())
@@ -848,8 +895,8 @@ impl Shell {
                     .children(share)
                     .children(camera)
                     .child(
-                        bar_button("tiny-bar-devices", "icons/settings.svg", Look::Rest)
-                            .tooltip(tip("Microphone and speaker", None))
+                        bar_button("tiny-bar-devices", "icons/settings.svg", Look::Rest, DEVICES_WORDS)
+                            .tooltip(tip(DEVICES_WORDS, None))
                             .on_click(|_, _, cx| crate::gui::settings::open(crate::gui::settings::Section::Audio, cx)),
                     )
                     .children(health)
@@ -867,7 +914,45 @@ impl Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::Element;
     use protocol::{Key, Network, Participant};
+
+    fn accessible_name(element: &impl Element) -> Option<String> {
+        let role = element.a11y_role().unwrap_or(gpui::Role::Unknown);
+        let mut node = gpui::accesskit::Node::new(role);
+        element.write_a11y_info(&mut node);
+        node.label().map(str::to_owned)
+    }
+
+    #[test]
+    fn a_call_bar_button_is_a_button_named_for_a_driver() {
+        let mute = bar_button("tiny-bar-mute", "icons/mic.svg", Look::Rest, "Mute");
+        assert_eq!(mute.a11y_role(), Some(gpui::Role::Button));
+        assert_eq!(accessible_name(&mute).as_deref(), Some("Mute"));
+        let held = bar_button("tiny-bar-mute", "icons/mic-off.svg", Look::Held, "A moderator muted you here");
+        assert_eq!(accessible_name(&held).as_deref(), Some("A moderator muted you here"));
+    }
+
+    #[test]
+    fn call_controls_use_the_tooltip_words() {
+        assert_eq!(mute_words(None, false), "Mute");
+        assert_eq!(mute_words(None, true), "Unmute");
+        assert_eq!(mute_words(Some("A moderator muted you here"), false), "A moderator muted you here");
+        assert_eq!(mute_words(Some("You can't speak in this channel"), true), "You can't speak in this channel");
+        assert_eq!(deafen_words(false, false), "Deafen");
+        assert_eq!(deafen_words(false, true), "Undeafen");
+        assert_eq!(deafen_words(true, false), "A moderator deafened you here");
+        assert_eq!(share_words(false), "Share your screen");
+        assert_eq!(share_words(true), "Stop sharing");
+        assert_eq!(camera_words(false), "Turn camera on");
+        assert_eq!(camera_words(true), "Turn camera off");
+        assert_eq!(DEVICES_WORDS, "Microphone and speaker");
+        assert_eq!(leave_words(false), "Leave the call");
+        assert_eq!(leave_words(true), "Cancel joining");
+        assert_eq!(health_words(Grade::Unknown, Some(40)), "Call health");
+        assert_eq!(health_words(Grade::Good, None), "Call health");
+        assert_eq!(health_words(Grade::Good, Some(40)), "Call health: good connection · 40 ms");
+    }
 
     fn joined(muted: bool, deafened: bool, speaking: bool) -> Call {
         Call {
