@@ -3,14 +3,15 @@ import { promisify } from "node:util";
 import type { Host, HostTarget } from "../host.js";
 import { startAppium } from "./appium.js";
 import { requireCommand } from "./command.js";
+import { appiumBin, ffmpegBin, present } from "./tools.js";
 import { attach, driverHost } from "./desktop.js";
 import { ffmpeg, muxArgs, RECORD_SECONDS } from "./ffmpeg.js";
 
 const exec = promisify(execFile);
 
 export async function prepare(): Promise<{ stop(): Promise<void> }> {
-  await requireCommand("ffmpeg");
-  await requireCommand("appium");
+  if (!(await present(ffmpegBin()))) await requireCommand("ffmpeg");
+  if (!(await present(appiumBin()))) await requireCommand("appium");
   return startAppium();
 }
 

@@ -14,6 +14,15 @@ use gpui::{
 };
 use protocol::{Link, Network};
 
+/// The name a driver presses. A network is its own label, so a second workspace does not
+/// rename the button. The tooltip still carries the longer status.
+fn rail_name(mode: &Mode, name: &str) -> String {
+    match mode {
+        Mode::Network(network) => network.label().to_owned(),
+        _ => name.to_owned(),
+    }
+}
+
 /// What a rail button's tooltip says after its name.
 fn waiting(attention: u32, unread: bool) -> String {
     match (attention, unread) {
@@ -63,6 +72,8 @@ impl Shell {
             .items_center()
             .justify_center()
             .cursor_pointer()
+            .role(gpui::Role::Button)
+            .aria_label(rail_name(&mode, &name))
             .when(lit, |button| button.bg(theme::selected()))
             .when(!lit, |button| button.hover(|style| style.bg(theme::hover())))
             .tooltip(tip(format!("{name}{}", waiting(attention, unread)), KEYS.get(place).copied()))
@@ -192,6 +203,8 @@ impl Shell {
                 .items_center()
                 .justify_center()
                 .cursor_pointer()
+                .role(gpui::Role::Button)
+                .aria_label(words)
                 .when(lit, |button| button.bg(theme::selected()))
                 .hover(|style| style.bg(theme::hover()))
                 .tooltip(tip(words, None))
@@ -260,6 +273,8 @@ impl Shell {
             .justify_center()
             .occlude()
             .cursor_pointer()
+            .role(gpui::Role::Button)
+            .aria_label("Settings")
             .bg(theme::overlay())
             .border_2()
             .border_color(theme::rail())

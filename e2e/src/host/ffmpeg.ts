@@ -1,4 +1,5 @@
-import { execCommand, requireCommand } from "./command.js";
+import { execCommand } from "./command.js";
+import { ffmpegBin } from "./tools.js";
 
 /** Long enough that a successful grab is past the one-second pass rule. */
 export const RECORD_SECONDS = "2";
@@ -26,8 +27,7 @@ export function muxArgs(pcmPath: string, mp4Path: string, videoFilters: string[]
 }
 
 export async function ffmpeg(args: string[], allowFailure = false): Promise<{ stdout: Buffer; stderr: string }> {
-  await requireCommand("ffmpeg");
-  return execCommand("ffmpeg", args, allowFailure);
+  return execCommand(ffmpegBin(), args, allowFailure);
 }
 
 export async function grabFrame(mp4Path: string, pngPath: string): Promise<void> {

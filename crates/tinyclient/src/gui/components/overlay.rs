@@ -90,12 +90,15 @@ fn menu_row(
     icon_color: Rgba,
     highlight: Rgba,
 ) -> Stateful<Div> {
+    let label = label.into();
     let lead = icon.map(|icon| match icon {
         NO_GLYPH => div().flex_none().size(px(16.)).into_any_element(),
         icon => glyph(icon, 16., icon_color).into_any_element(),
     });
     div()
         .id(id)
+        .role(gpui::Role::MenuItem)
+        .aria_label(label.clone())
         .group("menu-item")
         .flex_none()
         .h(px(theme::row_height(theme::ROW_ONE)))
@@ -109,7 +112,7 @@ fn menu_row(
         .hover(move |style| style.bg(highlight))
         .focus_visible(|style| style.shadow(theme::focus_ring_inset()))
         .children(lead)
-        .child(div().flex_1().min_w_0().truncate().child(label.into()))
+        .child(div().flex_1().min_w_0().truncate().child(label))
         .children(shortcut.map(|keys| {
             div()
                 .flex_none()

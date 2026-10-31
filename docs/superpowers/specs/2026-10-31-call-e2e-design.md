@@ -37,6 +37,10 @@ These controls get `.role(gpui::Role::Button)` and a name a driver can read, usi
 
 `button` and `button_with_icon` set `Role::Button` and the accessible name from the label. `bar_button` takes the name and sets the role. Disabled buttons stay unnamed-free of a click action.
 
+## Catalog
+
+`npm run all` walks every demo surface, then the call. `npm run doctor` names what this machine still lacks. The demo scenarios are `inbox`, `people`, `discord`, `slack`, `telegram`, `teams`, `signal`, and `settings`. Each one starts `chatd --seed-demo` and the shell, presses the accessible names in `e2e/src/catalog.ts`, and stores an mp4. The rail, each conversation row, each menu item, and Settings publish those names. A network button's name is the network label (`Discord`, `Slack`), so a second workspace does not rename it.
+
 ## The TypeScript application
 
 Replace nothing that is not in this worktree. `desktop-e2e` is not on this branch. Add `e2e/` as a strict TypeScript package (`"type": "module"`, `strict` true). No CommonJS.

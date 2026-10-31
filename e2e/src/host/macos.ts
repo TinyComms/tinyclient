@@ -4,6 +4,7 @@ import type { Host, HostTarget, Rect } from "../host.js";
 import { stringEnv } from "../proc.js";
 import { startAppium } from "./appium.js";
 import { requireCommand } from "./command.js";
+import { appiumBin, ffmpegBin, present } from "./tools.js";
 import { attach, driverHost } from "./desktop.js";
 import { even, ffmpeg, muxArgs, RECORD_SECONDS } from "./ffmpeg.js";
 
@@ -12,8 +13,8 @@ const exec = promisify(execFile);
 const BUNDLE_ID = "dev.tinyclient.app";
 
 export async function prepare(): Promise<{ stop(): Promise<void> }> {
-  await requireCommand("ffmpeg");
-  await requireCommand("appium");
+  if (!(await present(ffmpegBin()))) await requireCommand("ffmpeg");
+  if (!(await present(appiumBin()))) await requireCommand("appium");
   return startAppium();
 }
 

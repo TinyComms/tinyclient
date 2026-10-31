@@ -1,5 +1,7 @@
+import { spawn } from "node:child_process";
 import net from "node:net";
-import { drain, exited, spawnCommand, stopProcessTree } from "../proc.js";
+import { drain, exited, stopProcessTree } from "../proc.js";
+import { appiumBin, present } from "./tools.js";
 
 export const APPIUM_HOST = "127.0.0.1";
 export const APPIUM_PORT = 4723;
@@ -26,7 +28,13 @@ export async function startAppium(): Promise<{ stop(): Promise<void> }> {
   if (await portOpen(APPIUM_PORT)) {
     return { async stop() {} };
   }
-  const child = spawnCommand("appium", ["--address", APPIUM_HOST, "--port", String(APPIUM_PORT)], process.env, false);
+  const entry = appiumBin();
+  if (!(await present(entry))) throw new Error("the run needs the command: appium");
+  const child = spawn(process.execPath, [entry, "--address", APPIUM_HOST, "--port", String(APPIUM_PORT)], {
+    env: process.env,
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
+  });
   const output = drain(child);
   const deadline = Date.now() + 30_000;
   while (Date.now() < deadline) {

@@ -386,6 +386,8 @@ impl Shell {
             );
         let (picked, menu_row) = (c.clone(), c.clone());
         list_row(row_id(id, &c.key), theme::row_height(theme::ROW_TWO), selected, focused, content)
+            .role(gpui::Role::ListItem)
+            .aria_label(SharedString::from(title))
             .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| this.pick_row(&picked, cx)))
             .on_mouse_down(
                 MouseButton::Right,
@@ -408,10 +410,12 @@ impl Shell {
                     .type_ui()
                     .font_weight(if lit { theme::SEMIBOLD } else { theme::REGULAR })
                     .text_color(if lit { theme::text() } else { theme::text_soft() })
-                    .child(words),
+                    .child(words.clone()),
             )
             .children(trailing);
         list_row(id, theme::row_height(theme::ROW_ONE), false, focused, content)
+            .role(gpui::Role::Button)
+            .aria_label(words)
     }
 }
 

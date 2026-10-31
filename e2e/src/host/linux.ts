@@ -1,6 +1,7 @@
 import type { Host, HostTarget, Rect } from "../host.js";
 import { startAppium } from "./appium.js";
 import { execCommand, requireCommand } from "./command.js";
+import { appiumBin, ffmpegBin, present } from "./tools.js";
 import { attach, driverHost } from "./desktop.js";
 import { even, ffmpeg, muxArgs, RECORD_SECONDS } from "./ffmpeg.js";
 
@@ -8,8 +9,8 @@ import { even, ffmpeg, muxArgs, RECORD_SECONDS } from "./ffmpeg.js";
 const LINUX_DRIVER = "@itsmeaj/appium-linux-driver";
 
 export async function prepare(): Promise<{ stop(): Promise<void> }> {
-  await requireCommand("ffmpeg");
-  await requireCommand("appium");
+  if (!(await present(ffmpegBin()))) await requireCommand("ffmpeg");
+  if (!(await present(appiumBin()))) await requireCommand("appium");
   return startAppium();
 }
 

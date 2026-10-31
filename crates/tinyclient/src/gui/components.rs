@@ -646,6 +646,13 @@ mod tests {
     }
 
     #[test]
+    fn a_menu_item_is_named_with_the_label_a_person_sees() {
+        let settings = menu_item("own-settings", Some("icons/settings.svg"), "Settings…", Some("⌘,"));
+        assert_eq!(settings.a11y_role(), Some(gpui::Role::MenuItem));
+        assert_eq!(accessible_name(&settings).as_deref(), Some("Settings…"));
+    }
+
+    #[test]
     fn a_disabled_button_has_no_accessible_name_and_no_click() {
         let disabled = button_disabled("Join channel");
         assert_eq!(disabled.a11y_role(), None);
