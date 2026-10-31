@@ -8,16 +8,12 @@
 //! when the trouble does. A field is `None` only when nothing was polled.
 //!
 //! Also here, because it is the same kind of judgement: whether I seem to be talking while
-//! muted ([`MutedTalk`]), and how long a reconnect has left before the call is given up.
+//! muted ([`MutedTalk`]).
 
 use crate::gui::theme;
 use gpui::{div, prelude::*, px, Div, Rgba};
 use protocol::{CallPath, CallStats};
 use std::time::{Duration, Instant};
-
-/// How long a Tiny call may be reconnecting before mediad gives it up as lost (its
-/// `COME_BACK`, 07's state chart). A Discord call resumes a few times instead, with no clock.
-pub(in crate::gui) const RECONNECT_LIMIT: i64 = 30;
 
 /// The link and the sound, as far as `CallStats` says. `None` is "not measured", never zero.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -230,11 +226,6 @@ pub(in crate::gui) fn bars(grade: Grade, size: f32) -> Div {
     }))
 }
 
-/// "Reconnecting… gives up in 0:22": the seconds left of [`RECONNECT_LIMIT`].
-pub(in crate::gui) fn reconnect_left(elapsed: i64) -> i64 {
-    (RECONNECT_LIMIT - elapsed.max(0)).max(0)
-}
-
 /// How long speech must last while muted before "You're muted" shows, and how long it stays.
 const MUTED_TALK_AFTER: Duration = Duration::from_millis(300);
 pub(in crate::gui) const MUTED_TALK_HOLD: Duration = Duration::from_secs(3);
@@ -360,14 +351,6 @@ mod tests {
         // mediad reconnected and counts from nothing again.
         let again = Health::from_polls(Some(&first), &poll(1, 0, 0, 0, 0, 0));
         assert_eq!(again.overruns, Some(1));
-    }
-
-    #[test]
-    fn a_reconnect_counts_down_to_the_limit_and_stops_at_zero() {
-        assert_eq!(reconnect_left(0), 30);
-        assert_eq!(reconnect_left(8), 22);
-        assert_eq!(reconnect_left(45), 0);
-        assert_eq!(reconnect_left(-3), 30);
     }
 
     #[test]

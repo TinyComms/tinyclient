@@ -98,9 +98,7 @@ enum Counting {
     Ring,
     Connect,
     Joined,
-    /// Counts down: what is left before a Tiny call's reconnect is given up.
-    Reconnect,
-    /// Counts up: how long another network's call has been reconnecting.
+    /// Counts up: how long the call has been reconnecting.
     Recover,
 }
 
@@ -159,11 +157,7 @@ impl Render for Counter {
             0 => format!("{}:{:02}", seconds / 60, seconds % 60),
             hours => format!("{hours}:{:02}:{:02}", seconds / 60 % 60, seconds % 60),
         };
-        let words = match &self.what {
-            Some((Counting::Reconnect, _)) => format!("{} left", clock(health::reconnect_left(seconds))),
-            _ => clock(seconds),
-        };
-        div().flex_none().child(words)
+        div().flex_none().child(clock(seconds))
     }
 }
 
@@ -634,8 +628,8 @@ impl Shell {
         call.muted && !call.deafened && self.call_state.muted_talk.showing(Instant::now())
     }
 
-    /// The time on a Tiny stage's banner: how long it has been connecting, or what is left of
-    /// a reconnect. Ticks on its own, apart from the dock's.
+    /// The time on a Tiny stage's banner: how long it has been connecting or reconnecting.
+    /// Ticks on its own, apart from the dock's.
     pub(in crate::gui) fn call_stage_clock(&self, call: &Call, cx: &mut Context<Self>) -> Option<AnyElement> {
         self.call_clock(&self.call_state.stage_counter, call, cx)
     }
@@ -651,7 +645,6 @@ impl Shell {
             CallState::RingingOut => Counting::Ring,
             CallState::Connecting => Counting::Connect,
             CallState::Joined => Counting::Joined,
-            CallState::Reconnecting if call.conversation.network == Network::Tiny => Counting::Reconnect,
             CallState::Reconnecting => Counting::Recover,
             _ => return None,
         };

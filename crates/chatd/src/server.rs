@@ -186,6 +186,26 @@ impl Chat {
                 adapter.command(Command::Tiny(adapters::tiny::live::Ask::Offer { sdp }));
             }
         });
+        // Tiny media dropped, or came back, while the call is still up. The live socket joins
+        // again, or notes that the link held. A Discord call does this inside mediad.
+        let adapters = chat.adapters.clone();
+        chat.hub.calls.on_tiny_down(move |conversation| {
+            if conversation.network != Network::Tiny {
+                return;
+            }
+            if let Some(adapter) = lock(&adapters).get(&conversation.account()) {
+                adapter.command(Command::Tiny(adapters::tiny::live::Ask::Resume));
+            }
+        });
+        let adapters = chat.adapters.clone();
+        chat.hub.calls.on_tiny_up(move |conversation| {
+            if conversation.network != Network::Tiny {
+                return;
+            }
+            if let Some(adapter) = lock(&adapters).get(&conversation.account()) {
+                adapter.command(Command::Tiny(adapters::tiny::live::Ask::Settled));
+            }
+        });
         let (searches, adapters) = (chat.searches.clone(), chat.adapters.clone());
         let spawned = std::thread::Builder::new().name("search".into()).stack_size(256 * 1024).spawn(move || searches.run(&adapters));
         if let Err(err) = spawned {

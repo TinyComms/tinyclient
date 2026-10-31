@@ -184,8 +184,8 @@ impl Shell {
         div().size_full().flex().flex_col().children(banner).children(picture).child(stage).children(bar).into_any_element()
     }
 
-    /// Over the stage while my call here is not simply up: connecting with how long it has
-    /// taken, reconnecting with what is left before it gives up, or what ended it, with Rejoin.
+    /// Over the stage while my call here is not simply up: connecting or reconnecting with how
+    /// long it has been, or what ended it, with Rejoin.
     fn tiny_call_banner(&self, room: &TinyRoom, call: &Call, cx: &mut Context<Self>) -> Option<Div> {
         let (icon, color, fill, title, line): (&'static str, gpui::Rgba, gpui::Rgba, String, Option<String>) = match &call.state {
             CallState::Connecting => ("icons/refresh-cw.svg", theme::accent_text(), theme::accent_wash(), format!("Connecting to {}…", room.name), None),

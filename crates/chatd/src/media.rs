@@ -121,6 +121,9 @@ pub struct Calls {
     signal: Mutex<Option<Signal>>,
     /// Who sends a Tiny renegotiation offer. The same shape as `signal`.
     offer: Mutex<Option<Signal>>,
+    /// Tiny media dropped, or came back. The live socket resumes the call; the same shape as `failed`.
+    tiny_down: Mutex<Option<Failed>>,
+    tiny_up: Mutex<Option<Failed>>,
     /// The mediad started for Settings' microphone test or test sound, outside a call.
     tester: Mutex<Option<Tester>>,
 }
@@ -493,10 +496,27 @@ impl ActiveCall {
                     reader.calls.offer(&conversation, sdp.clone());
                     continue;
                 }
+                let notify = match &frame {
+                    MediaResponse::Interrupted => Some(false),
+                    MediaResponse::Connected { .. } => Some(true),
+                    _ => None,
+                };
                 let mut live = crate::hub::lock(&seen);
-                if live.apply(frame) {
-                    let call = live.call.clone();
-                    drop(live);
+                let conversation = live.call.conversation.clone();
+                let draw = live.apply(frame);
+                let call = draw.then(|| live.call.clone());
+                let state_now = live.call.state.clone();
+                drop(live);
+                // Outside the call lock. A drop while already reconnecting does not redraw, and
+                // still has to be resumed; the first connect is not one.
+                if conversation.network == protocol::Network::Tiny {
+                    match notify {
+                        Some(false) if matches!(state_now, CallState::Reconnecting) => reader.calls.tiny_down(&conversation),
+                        Some(true) => reader.calls.tiny_up(&conversation),
+                        _ => {}
+                    }
+                }
+                if let Some(call) = call {
                     reader.changed(Change::Call { call: Some(call) });
                 }
             }
@@ -620,6 +640,16 @@ impl Calls {
         *crate::hub::lock(&self.offer) = Some(Box::new(told));
     }
 
+    /// Who hears that a Tiny call's media dropped, so the live socket can join again.
+    pub fn on_tiny_down(&self, told: impl Fn(&Key) + Send + Sync + 'static) {
+        *crate::hub::lock(&self.tiny_down) = Some(Box::new(told));
+    }
+
+    /// Who hears that a Tiny call's media is flowing again.
+    pub fn on_tiny_up(&self, told: impl Fn(&Key) + Send + Sync + 'static) {
+        *crate::hub::lock(&self.tiny_up) = Some(Box::new(told));
+    }
+
     fn signal(&self, conversation: &Key, frame: String) {
         if let Some(told) = &*crate::hub::lock(&self.signal) {
             told(conversation, frame);
@@ -629,6 +659,18 @@ impl Calls {
     fn offer(&self, conversation: &Key, sdp: String) {
         if let Some(told) = &*crate::hub::lock(&self.offer) {
             told(conversation, sdp);
+        }
+    }
+
+    fn tiny_down(&self, conversation: &Key) {
+        if let Some(told) = &*crate::hub::lock(&self.tiny_down) {
+            told(conversation);
+        }
+    }
+
+    fn tiny_up(&self, conversation: &Key) {
+        if let Some(told) = &*crate::hub::lock(&self.tiny_up) {
+            told(conversation);
         }
     }
 
@@ -1271,6 +1313,12 @@ mod tests {
         assert!(live.apply(MediaResponse::Connected { ssrc: 1, dave_version: 1 }));
         assert_eq!((live.call.state.clone(), live.call.joined), (CallState::Joined, joined));
         assert!(!live.apply(MediaResponse::Connected { ssrc: 1, dave_version: 1 }), "nothing new to draw");
+
+        // A second drop while already reconnecting stays there. It is not a failure, and not drawn again.
+        assert!(live.apply(MediaResponse::Interrupted));
+        assert_eq!(live.call.state, CallState::Reconnecting);
+        assert!(!live.apply(MediaResponse::Interrupted), "already reconnecting is not drawn again");
+        assert!(matches!(live.call.state, CallState::Reconnecting), "the call is still up");
     }
 
     #[test]
@@ -1405,5 +1453,9 @@ mod tests {
         live.join();
         ago(&mut live, Duration::from_secs(3600));
         assert_eq!(live.overdue(), None);
+
+        live.enter(CallState::Reconnecting);
+        ago(&mut live, Duration::from_secs(3600));
+        assert_eq!(live.overdue(), None, "reconnecting has no clock");
     }
 }
