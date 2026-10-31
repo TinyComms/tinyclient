@@ -295,7 +295,7 @@ fn open_now(section: Section, cx: &mut App) {
     });
     match opened {
         Ok(window) => cx.default_global::<Host>().window = Some(window),
-        Err(err) => eprintln!("tinyclient: the Settings window could not open: {err}"),
+        Err(err) => tracing::warn!("tinyclient: the Settings window could not open: {err}"),
     }
 }
 
@@ -335,6 +335,8 @@ pub struct SettingsWindow {
     pub(super) playing: Option<Instant>,
     /// "Copied", for 4 s after Copy diagnostics.
     pub(super) copied: Option<Instant>,
+    /// Where a debug bundle was written, or that export is off. Shown for 4 s.
+    pub(super) log_note: Option<(Instant, String)>,
     /// What the test notification came to, and when (N13).
     pub(super) tested: Option<(Instant, String)>,
     /// A row opened from search, lit for 1.5 s.
@@ -408,6 +410,7 @@ impl SettingsWindow {
             failed: None,
             playing: None,
             copied: None,
+            log_note: None,
             tested: None,
             highlight: None,
             tiny,
@@ -1052,10 +1055,16 @@ impl Render for SettingsWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let modal = self.confirm.clone().map(|confirm| self.modal(&confirm, cx));
         let menu = self.picker.and_then(|picker| self.device_menu(picker, window, cx));
-        let toast = self.copied.filter(|at| at.elapsed() < Duration::from_secs(4)).map(|_| {
+        let toast = self.log_note.as_ref().filter(|(at, _)| at.elapsed() < Duration::from_secs(4)).map(|(_, note)| {
             div().absolute().bottom(px(16.)).left_0().right_0().flex().justify_center().child(
-                super::components::toast(Some(("icons/check.svg", theme::text_soft())), "Copied").w(px(200.)),
+                super::components::toast(Some(("icons/check.svg", theme::text_soft())), note.clone()).w(px(360.)),
             )
+        }).or_else(|| {
+            self.copied.filter(|at| at.elapsed() < Duration::from_secs(4)).map(|_| {
+                div().absolute().bottom(px(16.)).left_0().right_0().flex().justify_center().child(
+                    super::components::toast(Some(("icons/check.svg", theme::text_soft())), "Copied").w(px(200.)),
+                )
+            })
         });
         macro_rules! section_keys {
             ($root:expr, $($action:ident => $ix:expr),*) => {
@@ -1196,7 +1205,7 @@ pub fn shot(cx: &mut App) {
         cx.background_executor().timer(std::time::Duration::from_millis(200)).await;
         match window.update(cx, |_, window, _| window.render_to_image()) {
             Ok(Ok(image)) => image.save(&path).expect("the Settings shot is written"),
-            _ => eprintln!("tinyclient: no Settings shot"),
+            _ => tracing::warn!("tinyclient: no Settings shot"),
         }
     })
     .detach();

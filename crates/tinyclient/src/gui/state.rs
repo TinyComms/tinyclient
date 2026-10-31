@@ -595,7 +595,7 @@ impl Shell {
             #[cfg(feature = "gui-shot")]
             if let (true, Some(launched)) = (this.sidebar_state.inbox.fresh, super::LAUNCHED.get()) {
                 // The rows are in hand here and drawn on the next frame.
-                eprintln!("tinyclient: first list after {} ms", launched.elapsed().as_millis());
+                tracing::warn!("tinyclient: first list after {} ms", launched.elapsed().as_millis());
             }
             this.inbox_read(epoch, rows, total, counts, cx);
         });

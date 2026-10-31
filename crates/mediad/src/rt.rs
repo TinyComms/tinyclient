@@ -70,7 +70,7 @@ mod windows {
         let handle = unsafe { AvSetMmThreadCharacteristicsW(name.as_ptr(), &mut task) };
         if handle.is_null() {
             // Not fatal: the call plays on at normal priority, and the log says why it may glitch.
-            eprintln!("mediad: the {class} thread could not get MMCSS scheduling");
+            tracing::warn!("mediad: the {class} thread could not get MMCSS scheduling");
         }
     }
 

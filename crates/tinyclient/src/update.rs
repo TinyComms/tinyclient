@@ -302,6 +302,7 @@ enum Outcome {
 fn fetch(download: bool) -> Outcome {
     let now = unix_now();
     let Some(body) = http_text(FEED, true) else {
+        tracing::warn!(phase = "check", "updater failed");
         return Outcome::Unchanged;
     };
     let Some(release) = parse_release(&body) else {
@@ -373,7 +374,10 @@ fn stage(release: &Release) -> Result<(), ()> {
     fs::create_dir_all(&dir).map_err(|_| ())?;
     let incoming = dir.join("incoming.part");
     let _ = fs::remove_file(&incoming);
-    http_file(&release.archive_url, &incoming)?;
+    if http_file(&release.archive_url, &incoming).is_err() {
+        tracing::warn!(phase = "download", "updater failed");
+        return Err(());
+    }
     let len = fs::metadata(&incoming).map_err(|_| ())?.len();
     if len == 0 || len > ARCHIVE_LIMIT {
         let _ = fs::remove_file(&incoming);
@@ -384,6 +388,7 @@ fn stage(release: &Release) -> Result<(), ()> {
     let got = sha256_file(&incoming).map_err(|_| ())?;
     if !got.eq_ignore_ascii_case(want) {
         let _ = fs::remove_file(&incoming);
+        tracing::warn!(phase = "verify", "updater failed");
         return Err(());
     }
     let staged = dir.join("staged");

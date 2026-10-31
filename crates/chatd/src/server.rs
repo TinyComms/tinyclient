@@ -209,7 +209,7 @@ impl Chat {
         let (searches, adapters) = (chat.searches.clone(), chat.adapters.clone());
         let spawned = std::thread::Builder::new().name("search".into()).stack_size(256 * 1024).spawn(move || searches.run(&adapters));
         if let Err(err) = spawned {
-            eprintln!("chatd: people search: {err}");
+            tracing::warn!("chatd: people search: {err}");
         }
         // A seeded demo serves its own accounts.
         lock(&chat.adapters).extend(crate::demo::attach(&chat.hub));
@@ -223,7 +223,7 @@ impl Chat {
             match hub.store().prune(now(), days) {
                 Ok(0) | Err(_) => {}
                 Ok(gone) => {
-                    eprintln!("chatd: pruned {gone} old messages");
+                    tracing::warn!("chatd: pruned {gone} old messages");
                     // What is on screen may be gone.
                     hub.reset();
                 }
@@ -251,7 +251,7 @@ impl Chat {
                     session::Stored::Found(session) => {
                         match chat.connect(network, &session) {
                             Ok(()) => settled.push(network),
-                            Err(err) => eprintln!("chatd: {}: {err}; keeping its cache", network.label()),
+                            Err(err) => tracing::warn!("chatd: {}: {err}; keeping its cache", network.label()),
                         }
                         chat.hub.read_now(network, false, false);
                     }
@@ -262,7 +262,7 @@ impl Chat {
                     // A refused keychain prompt is not a sign-out. What was cached stays, and
                     // `ReadSessions` (or the next start) asks again.
                     session::Stored::Unreadable(why) => {
-                        eprintln!("chatd: {}: the keychain did not hand over the session ({why}); keeping its cache", network.label());
+                        tracing::warn!("chatd: {}: the keychain did not hand over the session ({why}); keeping its cache", network.label());
                         chat.hub.read_now(network, false, true);
                     }
                 }
@@ -272,7 +272,7 @@ impl Chat {
             }
         });
         if let Err(err) = spawned {
-            eprintln!("chatd: sessions: {err}");
+            tracing::warn!("chatd: sessions: {err}");
         }
     }
 
@@ -336,7 +336,7 @@ impl Chat {
         self.hub.player.forget(&self.hub, account);
         self.blobs.forget(account);
         if let Err(err) = self.hub.store().forget(account) {
-            eprintln!("chatd: {}: {err}", account.network.label());
+            tracing::warn!("chatd: {}: {err}", account.network.label());
         }
         self.hub.reload_settings();
         self.hub.forget_live(account);
@@ -414,7 +414,7 @@ impl Chat {
         let spawned = std::thread::Builder::new().name("shutdown".into()).stack_size(64 * 1024).spawn(|| {
             // Time for this answer to be written and the adapter to say goodbye.
             std::thread::sleep(Duration::from_millis(300));
-            eprintln!("chatd: asked to stop, exiting");
+            tracing::warn!("chatd: asked to stop, exiting");
             std::process::exit(0);
         });
         if spawned.is_err() {
@@ -518,6 +518,7 @@ impl Chat {
             seq: self.hub.seq(),
             keychain,
             started: self.hub.started,
+            session: protocol::log_policy::session_id().to_owned(),
         }
     }
 
@@ -1413,6 +1414,7 @@ impl Chat {
         }
         let helper = login_path().and_then(|path| {
             let mut helper = std::process::Command::new(path);
+            protocol::log_policy::share_session(&mut helper);
             protocol::launch::no_console(&mut helper).arg(network.label().to_lowercase());
             if let Some((x, y)) = at {
                 helper.args(["--at", &format!("{x},{y}")]);
@@ -2121,6 +2123,25 @@ impl Chat {
                     Err(_) => Response::NotifyTested { posted: false, detail: "Notifications are not running in tinyclient's background service.".to_owned() },
                 }
             }
+            Request::SaveLogs => {
+                let mut paths = Vec::new();
+                let Some(guard) = protocol::log_policy::current() else {
+                    return Response::LogsSaved { paths };
+                };
+                let policy = guard.policy();
+                if !policy.export_enabled() || !policy.ring_enabled() {
+                    return Response::LogsSaved { paths };
+                }
+                if let Ok(Some(path)) = guard.export_bundle() {
+                    paths.push(path.display().to_string());
+                }
+                if let Ok(protocol::MediaResponse::LogsSaved { path }) = self.hub.calls.request(&self.hub, &protocol::MediaRequest::SaveLogs) {
+                    if !path.is_empty() {
+                        paths.push(path);
+                    }
+                }
+                Response::LogsSaved { paths }
+            }
             Request::PlaySound { sound } => {
                 let known = settings::SOUND_CHOICES.iter().chain(&settings::RING_CHOICES).any(|word| *word == sound && sound != "none");
                 if !known {
@@ -2213,7 +2234,7 @@ pub fn serve(listener: ChatListener, chat: Chat) -> io::Result<()> {
         let stream = match listener.accept() {
             Ok(stream) => stream,
             Err(err) => {
-                eprintln!("chatd: accept: {err}");
+                tracing::warn!("chatd: accept: {err}");
                 std::thread::sleep(Duration::from_millis(100));
                 continue;
             }
@@ -2221,11 +2242,11 @@ pub fn serve(listener: ChatListener, chat: Chat) -> io::Result<()> {
         let chat = chat.clone();
         let spawned = std::thread::Builder::new().name("connection".into()).stack_size(256 * 1024).spawn(move || {
             if let Err(err) = serve_connection(&chat, stream) {
-                eprintln!("chatd: connection: {err}");
+                tracing::warn!("chatd: connection: {err}");
             }
         });
         if let Err(err) = spawned {
-            eprintln!("chatd: connection thread: {err}");
+            tracing::warn!("chatd: connection thread: {err}");
             std::thread::sleep(Duration::from_millis(100));
         }
     }

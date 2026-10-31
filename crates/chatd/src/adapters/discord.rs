@@ -375,7 +375,7 @@ fn refusal(refused: Refused) -> Refusal {
 
 impl Discord {
     fn log(&self, what: &str, why: impl std::fmt::Display) {
-        eprintln!("chatd: Discord: {what}: {why}");
+        tracing::warn!("chatd: Discord: {what}: {why}");
     }
 
     fn me(&self) -> String {

@@ -1,7 +1,7 @@
 use chatd::server::{serve, Chat};
 use chatd::store::Store;
 use protocol::{chat_sock_path, support_dir, ChatListener};
-use std::io;
+use std::io::{self, Write};
 
 fn main() -> io::Result<()> {
     // Before the support directory is touched: the packages' smoke tests run it on a bare system.
@@ -9,6 +9,7 @@ fn main() -> io::Result<()> {
         println!("chatd {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
+    let _log = protocol::log_policy::install("chatd", protocol::log_policy::LogPolicy::from_env());
     protocol::crash::install_panic_hook("chatd");
     let dir = support_dir();
     std::fs::create_dir_all(&dir)?;
@@ -17,14 +18,17 @@ fn main() -> io::Result<()> {
     // Held until the process exits.
     let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join("chatd.lock"))?;
     if let Err(err) = lock.try_lock() {
-        eprintln!("chatd: another chatd is already running for {} ({err})", dir.display());
+        // The operator file gets the path. Stderr always gets the short line: this process
+        // is about to exit, and the launcher reads stderr even when it is not a terminal.
+        tracing::warn!("chatd: another chatd is already running for {} ({err})", dir.display());
+        let _ = writeln!(io::stderr(), "chatd: another chatd is already running");
         return Ok(());
     }
     let mut store = Store::open(&dir.join("chat.sqlite")).map_err(io::Error::other)?;
 
     if let Some(mode) = chatd::demo::requested(std::env::args()) {
         if std::env::var_os("TINYCLIENT_DIR").is_none() {
-            eprintln!("chatd: --seed-demo needs TINYCLIENT_DIR so it cannot write to the real store");
+            tracing::warn!("chatd: --seed-demo needs TINYCLIENT_DIR so it cannot write to the real store");
             std::process::exit(64);
         }
         chatd::demo::seed(&mut store, &dir, mode).map_err(io::Error::other)?;
@@ -32,6 +36,6 @@ fn main() -> io::Result<()> {
 
     let path = chat_sock_path();
     let listener = ChatListener::bind(&path)?;
-    eprintln!("chatd listening on {}", path.display());
+    tracing::warn!("chatd listening on {}", path.display());
     serve(listener, Chat::new(store))
 }

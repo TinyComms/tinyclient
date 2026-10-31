@@ -301,7 +301,7 @@ impl Blobs {
             let cache = cache.clone();
             let spawned = std::thread::Builder::new().name(name.into()).stack_size(256 * 1024).spawn(move || helper(&cache));
             if let Err(err) = spawned {
-                eprintln!("chatd: media: {err}");
+                tracing::warn!("chatd: media: {err}");
             }
         }
         for worker in 0..IN_FLIGHT {
@@ -318,7 +318,7 @@ impl Blobs {
                 cache.work(worker == 0);
             });
             if let Err(err) = spawned {
-                eprintln!("chatd: media: {err}");
+                tracing::warn!("chatd: media: {err}");
             }
         }
         Blobs { cache }
@@ -377,7 +377,7 @@ impl Blobs {
         let cache = self.cache.clone();
         let spawned = std::thread::Builder::new().name("media-evict".into()).stack_size(256 * 1024).spawn(move || cache.evict());
         if let Err(err) = spawned {
-            eprintln!("chatd: media: {err}");
+            tracing::warn!("chatd: media: {err}");
         }
     }
 
@@ -676,7 +676,7 @@ impl Cache {
                     continue;
                 }
                 if let Err(err) = self.request(account, &[avatar.id], None) {
-                    eprintln!("chatd: {}: own picture: {err}", account.network.label());
+                    tracing::warn!("chatd: {}: own picture: {err}", account.network.label());
                 }
             }
         }
@@ -687,8 +687,8 @@ impl Cache {
     fn reconcile(&self) {
         match self.hub.store().media_forgive(fetch::passing) {
             Ok(0) => {}
-            Ok(forgiven) => eprintln!("chatd: media: {forgiven} files that failed for a moment's trouble will be fetched again"),
-            Err(err) => eprintln!("chatd: media: {err}"),
+            Ok(forgiven) => tracing::warn!("chatd: media: {forgiven} files that failed for a moment's trouble will be fetched again"),
+            Err(err) => tracing::warn!("chatd: media: {err}"),
         }
         for network in Network::ALL {
             let Ok(accounts) = std::fs::read_dir(self.dir.join(network.label().to_lowercase())) else {
@@ -830,14 +830,14 @@ impl Cache {
                     self.evict();
                 }
                 Some(Err((mut file, reason))) if fetch::passing(&reason) => {
-                    eprintln!("chatd: {}: media {id}: {}", account.network.label(), crate::adapters::net::redact(&reason));
+                    tracing::warn!("chatd: {}: media {id}: {}", account.network.label(), crate::adapters::net::redact(&reason));
                     // Not recorded: it rests, and is fetched again when asked for after that.
                     self.rest(&job.file, &reason);
                     file.failed = Some(reason);
                     self.announce(account, file);
                 }
                 Some(Err((mut file, reason))) => {
-                    eprintln!("chatd: {}: media {id}: {}", account.network.label(), crate::adapters::net::redact(&reason));
+                    tracing::warn!("chatd: {}: media {id}: {}", account.network.label(), crate::adapters::net::redact(&reason));
                     crate::hub::lock(&self.queue).resting.remove(&job.file);
                     // Recorded, so asking again answers with the reason and fetches nothing.
                     match self.hub.store().media_failed(account, id, &reason) {

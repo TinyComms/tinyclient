@@ -115,7 +115,7 @@ pub fn persistent() -> bool {
         let persistence = keyring::default::default_credential_builder().persistence();
         let kept = matches!(persistence, CredentialPersistence::UntilDelete);
         if !kept {
-            eprintln!("chatd: the keyring does not keep sign-ins past a restart; refusing to read or save any");
+            tracing::warn!("chatd: the keyring does not keep sign-ins past a restart; refusing to read or save any");
         }
         kept
     })
@@ -355,13 +355,13 @@ mod apple {
                 drop(password);
                 trust_item(name, &item);
             }
-            Err(err) => eprintln!("chatd: {name}: could not open the saved sign-in to keep it ({err})"),
+            Err(err) => tracing::warn!("chatd: {name}: could not open the saved sign-in to keep it ({err})"),
         }
     }
 
     fn trust_item(name: &str, item: &SecKeychainItem) {
         if let Err(err) = allow_anyone(item) {
-            eprintln!("chatd: {name}: the sign-in will ask again after the next update ({err})");
+            tracing::warn!("chatd: {name}: the sign-in will ask again after the next update ({err})");
         }
     }
 

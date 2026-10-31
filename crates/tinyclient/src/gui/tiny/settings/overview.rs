@@ -216,7 +216,7 @@ impl Shell {
                 Ok(Response::Ok) => None,
                 Ok(Response::Error { detail, .. }) => Some(detail),
                 Ok(_) => Some(crate::client::OTHER_ANSWER.to_owned()),
-                Err(err) => Some(crate::client::trouble_words(&err)),
+                Err(err) => Some(crate::client::trouble_words("tiny", &err)),
             };
             if let Some(overlay) = this.tiny_state.settings.as_mut() {
                 overlay.overview.uploading = false;

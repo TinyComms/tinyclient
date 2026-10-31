@@ -134,7 +134,7 @@ pub fn requested(args: impl Iterator<Item = String>) -> Option<Mode> {
                 "many" => asked.many = true,
                 "attention" => asked.attention = true,
                 "reconnecting" => asked.reconnecting = true,
-                other => eprintln!("chatd: --seed-demo: no such variant {other:?} (expired, live, many, attention, reconnecting)"),
+                other => tracing::warn!("chatd: --seed-demo: no such variant {other:?} (expired, live, many, attention, reconnecting)"),
             }
         }
     }
@@ -581,7 +581,7 @@ pub fn attach(hub: &Arc<Hub>) -> Vec<(AccountKey, Adapter)> {
         if let (Link::Connected, Some(me)) = (link, me) {
             match adapter::start(account.clone(), hub.clone(), me) {
                 Ok(adapter) => adapters.push((account.clone(), adapter)),
-                Err(err) => eprintln!("chatd: demo: {err}"),
+                Err(err) => tracing::warn!("chatd: demo: {err}"),
             }
         }
     }
@@ -637,7 +637,7 @@ pub fn attach(hub: &Arc<Hub>) -> Vec<(AccountKey, Adapter)> {
         }
     });
     if let Err(err) = spawned {
-        eprintln!("chatd: demo: {err}");
+        tracing::warn!("chatd: demo: {err}");
     }
     adapters
 }

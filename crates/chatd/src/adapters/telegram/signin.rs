@@ -523,7 +523,7 @@ impl Flow {
         let step = match (self.adopt)(&session) {
             Ok(accounts) => SignInStep::Done { account: accounts.into_iter().next() },
             Err(why) => {
-                eprintln!("chatd: Telegram: the sign-in was not kept: {}", super::super::net::redact(&why));
+                tracing::warn!("chatd: Telegram: the sign-in was not kept: {}", super::super::net::redact(&why));
                 // The session exists on Telegram but not here: it is ended there, so the
                 // account's device list does not keep one nobody can use.
                 let _ = wire::call(self.wire.as_ref(), &tl::functions::auth::LogOut {});

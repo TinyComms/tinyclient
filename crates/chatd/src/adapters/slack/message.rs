@@ -125,7 +125,7 @@ impl Names for Slack {
         }
         let file = MediaFile::new(format!("emoji:{name}:{:x}", fnv(&known)), MediaKind::Emoji);
         if let Err(err) = self.ctx.media(&[(file.clone(), known)]) {
-            eprintln!("chatd: Slack: {err}");
+            tracing::warn!("chatd: Slack: {err}");
         }
         Some(Custom::File(file))
     }
@@ -611,7 +611,7 @@ impl Slack {
         let mut sized = variants.iter().filter(|(_, sizes)| !sizes.is_empty());
         let registered = self.ctx.media(&media).and_then(|()| sized.try_for_each(|(id, sizes)| self.ctx.media_variants(id, sizes)));
         if let Err(err) = registered {
-            eprintln!("chatd: Slack: {err}");
+            tracing::warn!("chatd: Slack: {err}");
         }
         Some(message)
     }

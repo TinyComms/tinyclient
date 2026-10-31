@@ -72,12 +72,12 @@ pub fn identity(path: &Path) -> (SigningKeyPair, bool) {
                 return (SigningKeyPair { private, public }, true);
             }
         }
-        eprintln!("mediad: e2ee: the identity key file could not be read; a new one is made");
+        tracing::warn!("mediad: e2ee: the identity key file could not be read; a new one is made");
     }
     let made = SigningKeyPair::generate();
     let kept = write_private(path, &format!("{}\n{}\n", hex(&made.private), hex(&made.public))).is_ok();
     if !kept {
-        eprintln!("mediad: e2ee: the identity key could not be kept; this call uses one of its own");
+        tracing::warn!("mediad: e2ee: the identity key could not be kept; this call uses one of its own");
     }
     (made, kept)
 }
@@ -225,7 +225,7 @@ impl E2ee {
                 let version = frame.get("version").and_then(Value::as_u64).unwrap_or(0);
                 match decode(&frame, "external_sender") {
                     Some(sender) if version == u64::from(VERSION) => self.start(&sender),
-                    _ => eprintln!("mediad: e2ee: a start this build cannot use (version {version})"),
+                    _ => tracing::warn!("mediad: e2ee: a start this build cannot use (version {version})"),
                 }
             }
             "off" => {
@@ -267,12 +267,12 @@ impl E2ee {
         let mut session = match made {
             Ok(session) => session,
             Err(err) => {
-                eprintln!("mediad: e2ee: no session: {err}");
+                tracing::warn!("mediad: e2ee: no session: {err}");
                 return;
             }
         };
         if let Err(err) = session.set_external_sender(sender) {
-            eprintln!("mediad: e2ee: the server's external sender was refused: {err}");
+            tracing::warn!("mediad: e2ee: the server's external sender was refused: {err}");
             return;
         }
         match session.create_key_package() {
@@ -280,7 +280,7 @@ impl E2ee {
                 self.session = Some(session);
                 self.send("key_package", json!({ "data": STANDARD.encode(package) }));
             }
-            Err(err) => eprintln!("mediad: e2ee: no key package: {err}"),
+            Err(err) => tracing::warn!("mediad: e2ee: no key package: {err}"),
         }
     }
 
@@ -305,7 +305,7 @@ impl E2ee {
                 self.send("commit", fields);
             }
             Ok(None) => {}
-            Err(err) => eprintln!("mediad: e2ee: proposals refused: {err}"),
+            Err(err) => tracing::warn!("mediad: e2ee: proposals refused: {err}"),
         }
     }
 
@@ -313,7 +313,7 @@ impl E2ee {
         match applied {
             Some(Ok(())) => self.failures = 0,
             Some(Err(err)) => {
-                eprintln!("mediad: e2ee: the {what} could not be applied: {err}");
+                tracing::warn!("mediad: e2ee: the {what} could not be applied: {err}");
                 self.recover();
             }
             None => {}
@@ -356,7 +356,7 @@ impl E2ee {
                 match self.session.as_mut()?.encrypt_opus(opus) {
                     Ok(sealed) => Some(sealed.into_owned()),
                     Err(err) => {
-                        eprintln!("mediad: e2ee: a frame was not sealed, and is dropped: {err}");
+                        tracing::warn!("mediad: e2ee: a frame was not sealed, and is dropped: {err}");
                         None
                     }
                 }
@@ -377,7 +377,7 @@ impl E2ee {
                 match self.session.as_mut()?.encrypt(MediaType::VIDEO, Codec::H264, frame) {
                     Ok(sealed) => Some(sealed.into_owned()),
                     Err(err) => {
-                        eprintln!("mediad: e2ee: a picture was not sealed, and is dropped: {err}");
+                        tracing::warn!("mediad: e2ee: a picture was not sealed, and is dropped: {err}");
                         None
                     }
                 }
@@ -407,7 +407,7 @@ impl E2ee {
                 self.failures += 1;
                 let calm = self.recovered.is_none_or(|at| at.elapsed() > RECOVER_EVERY);
                 if self.failures > TOLERANCE && calm {
-                    eprintln!("mediad: e2ee: pictures stopped opening; rebuilding our group");
+                    tracing::warn!("mediad: e2ee: pictures stopped opening; rebuilding our group");
                     self.recover();
                 }
                 None
@@ -443,7 +443,7 @@ impl E2ee {
                 self.failures += 1;
                 let calm = self.recovered.is_none_or(|at| at.elapsed() > RECOVER_EVERY);
                 if self.failures > TOLERANCE && calm {
-                    eprintln!("mediad: e2ee: frames stopped opening; rebuilding our group");
+                    tracing::warn!("mediad: e2ee: frames stopped opening; rebuilding our group");
                     self.recover();
                 }
                 None

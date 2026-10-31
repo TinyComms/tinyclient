@@ -247,7 +247,7 @@ impl Shell {
                     }
                     Ok(Response::Error { detail, .. }) => draft.error = Some(detail),
                     Ok(_) => draft.error = Some(crate::client::OTHER_ANSWER.to_owned()),
-                    Err(err) => draft.error = Some(crate::client::trouble_words(&err)),
+                    Err(err) => draft.error = Some(crate::client::trouble_words("tiny", &err)),
                 }
                 cx.notify();
             },

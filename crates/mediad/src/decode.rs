@@ -48,7 +48,7 @@ pub struct Source {
 }
 
 fn why(error: Error) -> String {
-    eprintln!("mediad: {error}");
+    tracing::warn!("mediad: {error}");
     UNREADABLE.to_owned()
 }
 
@@ -70,7 +70,7 @@ fn opus_head(head: &[u8]) -> Option<(usize, f32)> {
 impl Source {
     pub fn open(path: &Path) -> Result<Source, String> {
         let file = File::open(path).map_err(|err| {
-            eprintln!("mediad: {}: {err}", path.display());
+            tracing::warn!("mediad: {}: {err}", path.display());
             "The file is no longer on this computer.".to_owned()
         })?;
         let mut hint = Hint::new();
@@ -91,7 +91,7 @@ impl Source {
             .ok_or_else(|| UNREADABLE.to_owned())?;
         let (codec, rate, pre_skip, gain) = if params.codec == CODEC_TYPE_OPUS {
             let (pre_skip, gain) = params.extra_data.as_deref().and_then(opus_head).ok_or_else(|| {
-                eprintln!("mediad: an Opus stream this build cannot decode");
+                tracing::warn!("mediad: an Opus stream this build cannot decode");
                 UNREADABLE.to_owned()
             })?;
             let decoder = opus::Decoder::new().ok_or_else(|| UNREADABLE.to_owned())?;
@@ -157,7 +157,7 @@ impl Source {
                     let decoded = match decoder.decode(&packet) {
                         Ok(decoded) => decoded,
                         Err(Error::DecodeError(err)) => {
-                            eprintln!("mediad: skipped a packet: {err}");
+                            tracing::warn!("mediad: skipped a packet: {err}");
                             continue;
                         }
                         Err(err) => return Err(why(err)),

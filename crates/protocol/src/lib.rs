@@ -15,6 +15,7 @@ pub mod browser;
 mod call;
 pub mod crash;
 pub mod hotkey;
+pub mod log_policy;
 mod info;
 pub mod ipc;
 pub mod launch;
@@ -1684,6 +1685,8 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "is_false")]
         muted: bool,
     },
+    /// Write this process's debug ring to disk. The answer names files, never their text.
+    SaveLogs,
 }
 
 /// One thing that changed. The shell asks again for exactly that; the ephemeral kinds carry their
@@ -1827,6 +1830,9 @@ pub enum Response {
         /// everything on screen again.
         #[serde(default)]
         started: u64,
+        /// Shared by the window, chatd, and mediad for this run. Empty on an older chatd.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        session: String,
     },
     Changes {
         /// Pass this to the next `Wait`.
@@ -1984,6 +1990,10 @@ pub enum Response {
     },
     CallStats {
         stats: CallStats,
+    },
+    /// Paths of debug bundles just written. Empty when export is off.
+    LogsSaved {
+        paths: Vec<String>,
     },
 }
 

@@ -495,7 +495,7 @@ impl Context {
         match session::rewrite(self.account.network, rewrite) {
             Ok(saved) => saved,
             Err(why) => {
-                eprintln!("chatd: {}: the session was not saved: {}", self.account.network.label(), net::redact(&why));
+                tracing::warn!("chatd: {}: the session was not saved: {}", self.account.network.label(), net::redact(&why));
                 false
             }
         }
@@ -763,7 +763,7 @@ impl Context {
         };
         match stored {
             Ok(stored) => self.stored(&conversation, &[stored], true),
-            Err(err) => eprintln!("chatd: {}: {}", self.account.network.label(), net::redact(&err.to_string())),
+            Err(err) => tracing::warn!("chatd: {}: {}", self.account.network.label(), net::redact(&err.to_string())),
         }
     }
 
@@ -1090,7 +1090,7 @@ impl Context {
     /// account is offline with [`BROKEN`] until the user restarts tinyclient.
     fn panicked(&self, thread: &str) -> bool {
         let count = self.stop.panics.fetch_add(1, Ordering::Relaxed) + 1;
-        eprintln!("chatd: {}: the {thread} thread panicked ({count})", self.account.network.label());
+        tracing::warn!("chatd: {}: the {thread} thread panicked ({count})", self.account.network.label());
         self.hub.forget_live(&self.account);
         if count > 1 {
             self.stop.stopped.store(true, Ordering::Relaxed);
@@ -1146,6 +1146,7 @@ fn keep_connected(ctx: &Context, connect: impl FnMut() -> Failure) {
 
 fn keep_connected_with_backoff(ctx: &Context, mut connect: impl FnMut() -> Failure, mut pause: Duration) {
     let mut drops = Drops::default();
+    let mut attempt = 0u64;
     while !ctx.stopped() {
         let generation = ctx.stop.recovery.load(Ordering::Relaxed);
         let began = Instant::now();
@@ -1167,19 +1168,26 @@ fn keep_connected_with_backoff(ctx: &Context, mut connect: impl FnMut() -> Failu
         }
         match failure {
             Failure::SignedOut(why) => {
-                eprintln!("chatd: {}: signed out: {}", ctx.account.network.label(), net::redact(&why));
+                tracing::warn!("chatd: {}: signed out: {}", ctx.account.network.label(), net::redact(&why));
                 ctx.hub.forget_live(&ctx.account);
                 ctx.hub.set_link(&ctx.account, Link::Expired, &why);
                 return;
             }
             Failure::Dropped(why) => {
-                eprintln!("chatd: {}: {}", ctx.account.network.label(), net::redact(&why));
+                tracing::warn!("chatd: {}: {}", ctx.account.network.label(), net::redact(&why));
             }
         }
         // A connection that held for a while earns a quick retry, unless it has been dropping
         // often. One that never holds backs off to a quarter of an hour: unattended, that is
         // under a hundred sign-ons a day, not 1,400.
         pause = drops.next(Instant::now(), began.elapsed() > Duration::from_secs(60), pause);
+        attempt = attempt.saturating_add(1);
+        tracing::info!(
+            network = ctx.account.network.label(),
+            attempt,
+            pause_ms = u64::try_from(pause.as_millis()).unwrap_or(u64::MAX),
+            "reconnect scheduled"
+        );
         ctx.hub.forget_live(&ctx.account);
         ctx.hub.set_offline(&ctx.account, pause <= RECONNECTING);
         // Not on the second: many clients retrying in step is what a network watches for.
@@ -1193,7 +1201,7 @@ fn keep_connected_with_backoff(ctx: &Context, mut connect: impl FnMut() -> Failu
                 drops = Drops::default();
                 pause = Duration::from_secs(1);
                 ctx.hub.set_offline(&ctx.account, true);
-                eprintln!("chatd: {}: network changed or system resumed; retrying connection", ctx.account.network.label());
+                tracing::warn!("chatd: {}: network changed or system resumed; retrying connection", ctx.account.network.label());
                 // Consume bursts on the next iteration and never attempt more
                 // often than once per second, even if hints keep arriving.
                 if ctx.pause(Duration::from_secs(1).saturating_sub(began.elapsed())) { return; }

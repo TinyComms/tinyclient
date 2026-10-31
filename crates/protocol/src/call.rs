@@ -407,6 +407,8 @@ pub enum MediaRequest {
     /// Settings' microphone test plays the microphone back on the speaker, through the same
     /// processing a call uses. Only in `mediad test`; a call refuses it.
     Loopback { on: bool },
+    /// Write mediad's debug ring. Answered `LogsSaved`.
+    SaveLogs,
 }
 
 /// The loudest one participant may be set, in percent.
@@ -559,6 +561,8 @@ pub enum MediaResponse {
     Stats(CallStats),
     /// This mediad cannot do what was asked.
     Refused { detail: String },
+    /// The bundle mediad just wrote, or empty when export is off.
+    LogsSaved { path: String },
 
     /// Voice is up both ways: the network accepted us and the transport is encrypted.
     Connected {
@@ -623,6 +627,34 @@ pub enum MediaResponse {
 }
 
 impl MediaResponse {
+    /// The enum name only. Logs use this so a frame's SDP and paths stay out of the line.
+    pub fn name(&self) -> &'static str {
+        match self {
+            MediaResponse::Ready { .. } => "Ready",
+            MediaResponse::Streams { .. } => "Streams",
+            MediaResponse::Done => "Done",
+            MediaResponse::Offer { .. } => "Offer",
+            MediaResponse::Stats(_) => "Stats",
+            MediaResponse::Refused { .. } => "Refused",
+            MediaResponse::LogsSaved { .. } => "LogsSaved",
+            MediaResponse::Connected { .. } => "Connected",
+            MediaResponse::Source { .. } => "Source",
+            MediaResponse::Speaking { .. } => "Speaking",
+            MediaResponse::Gone { .. } => "Gone",
+            MediaResponse::Levels { .. } => "Levels",
+            MediaResponse::Devices { .. } => "Devices",
+            MediaResponse::DeviceList { .. } => "DeviceList",
+            MediaResponse::Interrupted => "Interrupted",
+            MediaResponse::Failed { .. } => "Failed",
+            MediaResponse::TinyE2ee { .. } => "TinyE2ee",
+            MediaResponse::TinySecurity(_) => "TinySecurity",
+            MediaResponse::TinyRenegotiate { .. } => "TinyRenegotiate",
+            MediaResponse::Picture { .. } => "Picture",
+            MediaResponse::Sending { .. } => "Sending",
+            MediaResponse::Notice { .. } => "Notice",
+        }
+    }
+
     /// True for the frames that answer a request.
     pub fn is_reply(&self) -> bool {
         matches!(
@@ -632,6 +664,7 @@ impl MediaResponse {
                 | MediaResponse::Offer { .. }
                 | MediaResponse::Stats(_)
                 | MediaResponse::Refused { .. }
+                | MediaResponse::LogsSaved { .. }
         )
     }
 }

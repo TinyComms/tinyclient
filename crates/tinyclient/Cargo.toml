@@ -7,6 +7,7 @@ publish.workspace = true
 
 [dependencies]
 protocol.workspace = true
+tracing.workspace = true
 # The taskbar button's or Dock icon's number and flash (`gui/attention.rs`).
 notifier = { path = "../notifier", optional = true }
 sha2 = "0.10"

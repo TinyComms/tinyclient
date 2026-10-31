@@ -122,7 +122,7 @@ impl Teams {
             };
             let registered = self.ctx.media(&[(file.clone(), at(AVATAR))]).and_then(|()| self.ctx.media_variants(&file.id, &[(AVATAR * 2, at(AVATAR * 2))]));
             if let Err(err) = registered {
-                eprintln!("chatd: Teams: {err}");
+                tracing::warn!("chatd: Teams: {err}");
             }
         }
         Some(file)
@@ -159,7 +159,7 @@ impl Teams {
         }
         let rows: Vec<PersonRow> = learned.iter().map(|(id, known)| self.row(id, known)).collect();
         if let Err(err) = self.ctx.people(&rows) {
-            eprintln!("chatd: Teams: {err}");
+            tracing::warn!("chatd: Teams: {err}");
         }
         let details: Vec<(String, PersonDetails)> = learned
             .iter()
@@ -169,7 +169,7 @@ impl Teams {
             })
             .collect();
         if let Err(err) = self.ctx.details(&details) {
-            eprintln!("chatd: Teams: {err}");
+            tracing::warn!("chatd: Teams: {err}");
         }
         let mut state = self.state();
         if state.people.len() + learned.len() > REMEMBERED {

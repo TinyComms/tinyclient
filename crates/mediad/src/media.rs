@@ -152,7 +152,7 @@ impl Stream {
                 None => {
                     self.undecodable += 1;
                     if self.undecodable == 1 {
-                        eprintln!("mediad: a frame from {who} did not decode");
+                        tracing::warn!("mediad: a frame from {who} did not decode");
                     }
                 }
             }
@@ -362,7 +362,7 @@ pub const SPEAKER_FAULT: &str =
 // microphone, no speaker, a device that would not start). The dock tells them apart by these
 // sentences, which is why they are constants.
 pub fn failure(err: AudioError) -> (CallFailure, String) {
-    eprintln!("mediad: audio: {err:?}");
+    tracing::warn!("mediad: audio: {err:?}");
     let detail = match err {
         AudioError::NoMicrophone => NO_MICROPHONE,
         AudioError::NoSpeaker => NO_SPEAKER,
@@ -611,7 +611,7 @@ impl Loop {
         finish_cue(&self.setup.controls, &mut self.cue, &mut self.setup.audio);
         for (ssrc, stream) in &self.streams {
             let (jitter, rebuilt) = (&stream.jitter, stream.rebuilt);
-            eprintln!(
+            tracing::warn!(
                 "mediad: ssrc {ssrc}: {} lost ({rebuilt} rebuilt), {} late",
                 jitter.lost, jitter.late
             );
@@ -628,7 +628,7 @@ pub(crate) fn sign_off(audio: &Audio) {
     }
     let troubles = audio.troubles();
     let (mic, speaker) = audio.drift_ppm();
-    eprintln!(
+    tracing::warn!(
         "mediad: call audio: {} microphone and {} speaker glitches, {} overruns, {} gaps, {} underruns, {} skips; clocks: microphone {mic:+} ppm, speaker {speaker:+} ppm",
         troubles.mic_glitches, troubles.speaker_glitches, troubles.overruns, troubles.gaps, troubles.underruns, troubles.skips
     );
@@ -654,7 +654,7 @@ pub fn run(setup: Setup) -> Audio {
     let _timer = crate::rt::FineTimer::hold();
     crate::rt::tick_thread();
     let Some(encoder) = Encoder::new() else {
-        eprintln!("mediad: the Opus encoder could not be created");
+        tracing::warn!("mediad: the Opus encoder could not be created");
         let fatal = FromMedia::Fatal(
             CallFailure::Engine,
             "The call engine could not start. Try again.".to_owned(),
@@ -729,7 +729,7 @@ impl Devices {
                 // Allowed while we were running. A stream opened before the answer may go on
                 // hearing silence, so the devices are opened afresh.
                 self.microphone_unasked = false;
-                eprintln!("mediad: microphone access was granted");
+                tracing::warn!("mediad: microphone access was granted");
                 self.reopen_wanted = (true, true);
                 Ok(())
             }
@@ -780,7 +780,7 @@ impl Devices {
             match verdict {
                 Verdict::Rebuild => {
                     let name = if side == 0 { &audio.input.name } else { &audio.output.name };
-                    eprintln!("mediad: {name:?} opened and is not running; opening it again");
+                    tracing::warn!("mediad: {name:?} opened and is not running; opening it again");
                     if side == 0 {
                         (self.reopen_wanted.0, self.rebuild.0, self.rebuilding.0) = (true, true, true);
                     } else {
@@ -832,7 +832,7 @@ impl Devices {
                         AudioError::NoMicrophone | AudioError::Microphone(_) => (0, format!("The microphone you chose didn't start. Still using {}.", audio.input.name)),
                         AudioError::NoSpeaker | AudioError::Speaker(_) => (1, format!("The speaker you chose didn't start. Still using {}.", audio.output.name)),
                     };
-                    eprintln!("mediad: {words}");
+                    tracing::warn!("mediad: {words}");
                     if side == 0 {
                         audio.input.notice = Some(words);
                     } else {

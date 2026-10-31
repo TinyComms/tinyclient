@@ -21,6 +21,7 @@ pub const CRASH_LOG_LIMIT: u64 = 256 * 1024;
 /// the account password in a socket address (`password=`) and as Basic credentials, the key in
 /// a device-link address (`pub_key=`), and the key to the account's state (`"vault"`).
 pub fn redact(text: &str) -> String {
+    let text = strip_userinfo(&strip_pem(text));
     let mut out = String::with_capacity(text.len());
     let mut at = 0;
     while at < text.len() {
@@ -47,9 +48,10 @@ const PREFIXED: [&str; 11] = ["xoxc-", "xoxd-", "xoxs-", "xoxp-", "xoxb-", "xoxe
 /// Headers whose value is a credential: the name stays, the value (scheme included) goes.
 const HEADERS: [&str; 5] = ["authorization:", "proxy-authorization:", "x-skypetoken:", "authentication:", "x-ms-skypetoken:"];
 /// URL or form parameters whose value is a credential or a signature: the name stays.
-const PARAMS: [&str; 15] = [
+const PARAMS: [&str; 17] = [
     "token=", "access_token=", "refresh_token=", "id_token=", "skypetoken=", "hm=", "tempauth=", "sig=",
     "x-amz-signature=", "x-amz-credential=", "x-amz-security-token=", "signature=", "code=", "password=", "pub_key=",
+    "a=ice-pwd:", "a=fingerprint:",
 ];
 /// JSON fields whose string value is a credential.
 const FIELDS: [&str; 8] = ["token", "access_token", "refresh_token", "id_token", "skypetoken", "authorization", "password", "vault"];
@@ -111,7 +113,77 @@ fn secret_at(text: &str) -> Option<(usize, usize)> {
             return (close > 0).then_some((keep, keep + close));
         }
     }
+    if text.starts_with("eyJ") {
+        if let Some(end) = jwt_at(text) {
+            return Some((0, end));
+        }
+    }
     dotted_token(text).map(|end| (0, end))
+}
+
+fn jwt_at(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut at = 0;
+    let mut parts = [0usize; 3];
+    for (ix, part) in parts.iter_mut().enumerate() {
+        let start = at;
+        while at < bytes.len() && base64url(bytes[at]) {
+            at += 1;
+        }
+        *part = at - start;
+        if ix < 2 {
+            if bytes.get(at) != Some(&b'.') {
+                return None;
+            }
+            at += 1;
+        }
+    }
+    let ends_clean = bytes.get(at).is_none_or(|c| !base64url(*c) && *c != b'.');
+    (parts[0] >= 10 && parts[1] >= 4 && parts[2] >= 4 && ends_clean).then_some(at)
+}
+
+fn strip_pem(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("-----BEGIN ") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start..];
+        if let Some(end_at) = after.find("-----END ") {
+            let tail = &after[end_at + "-----END ".len()..];
+            if let Some(close) = tail.find("-----") {
+                out.push_str(REDACTED);
+                rest = &tail[close + 5..];
+                continue;
+            }
+        }
+        out.push_str("-----BEGIN ");
+        rest = &after["-----BEGIN ".len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn strip_userinfo(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    while let Some(rel) = text[at..].find("://") {
+        let scheme_end = at + rel;
+        out.push_str(&text[at..scheme_end + 3]);
+        let auth = scheme_end + 3;
+        let rest = &text[auth..];
+        if let Some(at_sign) = rest.find('@') {
+            let userinfo = &rest[..at_sign];
+            if userinfo.contains(':') && !userinfo.contains('/') && !userinfo.contains(char::is_whitespace) {
+                out.push_str(REDACTED);
+                out.push('@');
+                at = auth + at_sign + 1;
+                continue;
+            }
+        }
+        at = auth;
+    }
+    out.push_str(&text[at..]);
+    out
 }
 
 /// A Discord token or a JWT: three base64url parts joined by dots, long enough that no version
@@ -170,6 +242,9 @@ mod tests {
         assert_eq!(redact("cookie d=xoxd-abc%2Fdef rejected"), "cookie d=[redacted] rejected");
         assert_eq!(redact("authorization: Bearer eyJabc.def rejected"), "authorization: [redacted] rejected");
         assert_eq!(redact("410 Gone"), "410 Gone");
+        assert_eq!(redact("a=ice-pwd:secret"), "a=ice-pwd:[redacted]");
+        assert!(!redact("-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----").contains("BEGIN"));
+        assert!(!redact("https://user:pass@host/").contains("user:pass"));
     }
 
     #[test]

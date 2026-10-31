@@ -19,6 +19,9 @@ publish = false
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 protocol = { path = "crates/protocol" }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+getrandom = "0.3"
 
 # Dependencies build optimized in dev too. Unoptimized GPUI cannot draw a frame inside one
 # monitor refresh, so a debug window stutters when dragged or scrolled. Our own crates stay at

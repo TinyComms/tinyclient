@@ -614,7 +614,7 @@ fn listed<T>(saved: &Saved, path: &str, parse: impl FnOnce(Value) -> Result<T, (
 pub(crate) fn rows<T: serde::de::DeserializeOwned>(body: Value, what: &str) -> Result<Vec<T>, ()> {
     let (rows, skipped) = tiny_rows(body).ok_or(())?;
     if skipped > 0 {
-        eprintln!("chatd: Tiny server: left out {skipped} {what} that could not be read");
+        tracing::warn!("chatd: Tiny server: left out {skipped} {what} that could not be read");
     }
     Ok(rows)
 }

@@ -2867,7 +2867,7 @@ impl Shell {
             let refused = match answer {
                 Ok(Response::Error { detail, .. }) => Some(detail),
                 Ok(_) => None,
-                Err(err) => Some(crate::client::trouble_words(&err)),
+                Err(err) => Some(crate::client::trouble_words("send", &err)),
             };
             let _ = shell.update(cx, |shell, cx| {
                 if let (None, Some(key)) = (&refused, refresh) {
@@ -3077,7 +3077,7 @@ mod tests {
         assert!(progress.len() >= 2, "{progress:?}");
         assert!(progress.windows(2).all(|pair| pair[0].0 <= pair[1].0), "{progress:?}");
         assert_eq!(progress.last().map(|(sent, total)| sent == total), Some(true));
-        eprintln!("upload progress: {progress:?}");
+        tracing::warn!("upload progress: {progress:?}");
         // Settled: the files the shell made for it may go.
         attach::delete_made(&outbox, std::slice::from_ref(&pasted));
         assert!(!pasted.exists());

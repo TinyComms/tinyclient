@@ -566,12 +566,12 @@ mod shot {
                 let image = window.update(cx, |_, window, _| window.render_to_image());
                 match image {
                     Ok(Ok(image)) => image.save(&named).expect("the screenshot is written"),
-                    other => eprintln!("tinyclient: no screenshot: {:?}", other.map(|r| r.map(|_| ()))),
+                    other => tracing::warn!("tinyclient: no screenshot: {:?}", other.map(|r| r.map(|_| ()))),
                 }
             }
             // `--hold 20` keeps the window up so its memory can be measured from outside.
             if let Some(seconds) = flag("--hold").and_then(|n| n.parse::<u64>().ok()) {
-                eprintln!("tinyclient: holding, pid {}", std::process::id());
+                tracing::warn!("tinyclient: holding, pid {}", std::process::id());
                 cx.background_executor().timer(Duration::from_secs(seconds)).await;
             }
             cx.update(|cx| cx.quit());
@@ -691,7 +691,7 @@ pub fn run(invite: Option<String>, incoming: Option<std::sync::mpsc::Receiver<St
                 Ok(window) => window,
                 Err(err) => {
                     // No window (no GPU, a headless session): say so and leave, never panic.
-                    eprintln!("tinyclient: the window could not open: {err}");
+                    tracing::warn!("tinyclient: the window could not open: {err}");
                     cx.quit();
                     return;
                 }

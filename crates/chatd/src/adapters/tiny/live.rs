@@ -476,18 +476,18 @@ pub(super) fn keep_live(ctx: &Context, saved: &Saved, live: &Live, timing: &Timi
         let wait = match end {
             End::Stopped => return,
             End::SignedOut => {
-                eprintln!("chatd: {}: the session ended", ctx.account.network.label());
+                tracing::warn!("chatd: {}: the session ended", ctx.account.network.label());
                 ctx.hub.set_link(&ctx.account, Link::Expired, ENDED);
                 return;
             }
             End::Removed => {
-                eprintln!("chatd: {}: removed from the server", ctx.account.network.label());
+                tracing::warn!("chatd: {}: removed from the server", ctx.account.network.label());
                 ctx.hub.set_link(&ctx.account, Link::Expired, REMOVED);
                 return;
             }
             End::Replaced => {
                 // Two devices that each reconnect at once would close each other forever.
-                eprintln!("chatd: {}: replaced by another device; waiting for the user", ctx.account.network.label());
+                tracing::warn!("chatd: {}: replaced by another device; waiting for the user", ctx.account.network.label());
                 ctx.hub.set_offline(&ctx.account, false);
                 ctx.attention(REPLACED);
                 if hold(ctx, live) {
@@ -511,7 +511,7 @@ pub(super) fn keep_live(ctx: &Context, saved: &Saved, live: &Live, timing: &Timi
                 timing.absent
             }
             End::Dropped(why) => {
-                eprintln!("chatd: {}: live socket: {}", ctx.account.network.label(), net::redact(&why));
+                tracing::warn!("chatd: {}: live socket: {}", ctx.account.network.label(), net::redact(&why));
                 pause
             }
         };
@@ -658,7 +658,7 @@ fn serve(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, timing: &Ti
                     }
                     if let Some(room) = seat.recover.take() {
                         refs += 1;
-                        eprintln!("chatd: Tiny server: the call's media was lost; joining again");
+                        tracing::warn!("chatd: Tiny server: the call's media was lost; joining again");
                         if let Err(err) = rejoin_with(ctx, saved, live, seat, wire, pending, refs, room, timing) {
                             return End::Dropped(err.to_string());
                         }
@@ -790,7 +790,7 @@ fn serve(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, timing: &Ti
             if let Some(room) = seat.wanted.clone() {
                 if ctx.in_call(&room) && !seat.rejoining && seat.recover.is_none() {
                     refs += 1;
-                    eprintln!("chatd: Tiny server: media dropped; joining again");
+                    tracing::warn!("chatd: Tiny server: media dropped; joining again");
                     if let Err(err) = rejoin_with(ctx, saved, live, seat, wire, pending, refs, room, timing) {
                         return End::Dropped(err.to_string());
                     }
@@ -1428,14 +1428,14 @@ fn resume_media(ctx: &Context, seat: &mut Seat, pending: &[Pending]) {
         Plan::GiveUp => {
             seat.resume_at = None;
             seat.up_at = None;
-            eprintln!("chatd: Tiny server: the connection dropped and didn't come back");
+            tracing::warn!("chatd: Tiny server: the connection dropped and didn't come back");
             ctx.call_failed(&room, CallFailure::Lost, DROPPED);
         }
         Plan::Resume { resumes, pause } => {
             seat.resumes = resumes;
             seat.up_at = None;
             seat.resume_at = Some(Instant::now() + pause);
-            eprintln!("chatd: Tiny server: media dropped; resume {resumes} of {RESUMES} in {}s", pause.as_secs());
+            tracing::warn!("chatd: Tiny server: media dropped; resume {resumes} of {RESUMES} in {}s", pause.as_secs());
         }
     }
 }
@@ -1465,7 +1465,7 @@ fn answered(ctx: &Context, seat: &mut Seat, pending: &mut Vec<Pending>, frame: &
         Some(Value::Number(reference)) => reference.to_string(),
         _ => {
             if !ok {
-                eprintln!("chatd: Tiny server: live socket error {}", text(frame, "code").unwrap_or("?"));
+                tracing::warn!("chatd: Tiny server: live socket error {}", text(frame, "code").unwrap_or("?"));
             }
             return;
         }
@@ -1513,7 +1513,7 @@ fn answered(ctx: &Context, seat: &mut Seat, pending: &mut Vec<Pending>, frame: &
             }
         }
         if matches!(pending.asked, Asked::State) {
-            eprintln!("chatd: Tiny server: call.state refused ({code})");
+            tracing::warn!("chatd: Tiny server: call.state refused ({code})");
         }
         if let Asked::Offer = &pending.asked {
             if let Some(room) = seat.wanted.clone() {

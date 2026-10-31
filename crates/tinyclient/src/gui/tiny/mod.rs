@@ -545,7 +545,7 @@ impl Shell {
                 }
                 Ok(Response::Error { detail, .. }) => this.tiny_state.error = Some(detail),
                 Ok(_) => this.tiny_state.error = Some(crate::client::OTHER_ANSWER.to_owned()),
-                Err(err) => this.tiny_state.error = Some(crate::client::trouble_words(&err)),
+                Err(err) => this.tiny_state.error = Some(crate::client::trouble_words("tiny", &err)),
             }
             cx.notify();
         });
@@ -643,7 +643,7 @@ impl Shell {
             }
             Ok(Response::Error { detail, .. }) => Some(detail),
             Ok(_) => Some(crate::client::OTHER_ANSWER.to_owned()),
-            Err(err) => Some(crate::client::trouble_words(&err)),
+            Err(err) => Some(crate::client::trouble_words("tiny", &err)),
         };
         if let Some(detail) = refused {
             self.tiny_state.busy = false;
@@ -730,7 +730,7 @@ impl Shell {
                         this.tiny_state.modal = None;
                         this.tiny_state.settings = None;
                     }
-                    Err(err) => this.tiny_state.modal_error = Some(crate::client::trouble_words(&err)),
+                    Err(err) => this.tiny_state.modal_error = Some(crate::client::trouble_words("tiny", &err)),
                 }
                 cx.notify();
             },
@@ -756,7 +756,7 @@ impl Shell {
                 Ok(Response::Ok) => None,
                 Ok(Response::Error { detail, .. }) => Some(detail),
                 Ok(_) => Some(crate::client::OTHER_ANSWER.to_owned()),
-                Err(err) => Some(crate::client::trouble_words(&err)),
+                Err(err) => Some(crate::client::trouble_words("tiny", &err)),
             };
             cx.notify();
         });
@@ -1248,7 +1248,7 @@ impl Shell {
                 Ok(Response::Ok) => None,
                 Ok(Response::Error { detail, .. }) => Some(detail),
                 Ok(_) => Some(crate::client::OTHER_ANSWER.to_owned()),
-                Err(err) => Some(crate::client::trouble_words(&err)),
+                Err(err) => Some(crate::client::trouble_words("tiny", &err)),
             };
             if let Some(detail) = failed {
                 this.toast(Some(("icons/circle-alert.svg", super::theme::danger())), detail, cx);

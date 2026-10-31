@@ -250,7 +250,7 @@ impl Slack {
             if std::env::var_os("TINYCLIENT_SHAPES").is_some() {
                 // Field names only, never values: for comparing what Slack sends with what is read.
                 let keys = |value: &Value| value.as_object().map(|map| map.keys().cloned().collect::<Vec<_>>().join(",")).unwrap_or_default();
-                eprintln!("chatd: Slack: user shape [{}] profile [{}]", keys(user), keys(profile));
+                tracing::warn!("chatd: Slack: user shape [{}] profile [{}]", keys(user), keys(profile));
             }
             // Slack's rule for the name it shows: the display name, else the real one.
             let names = [&profile["display_name"], &profile["real_name"], &user["real_name"], &user["name"]];
@@ -264,7 +264,7 @@ impl Slack {
             });
             if let Some(avatar) = &avatar {
                 if let Err(err) = self.register_avatar(avatar, &picture, &large) {
-                    eprintln!("chatd: Slack: {err}");
+                    tracing::warn!("chatd: Slack: {err}");
                 }
             }
             let status_emoji = profile["status_emoji"].as_str().unwrap_or("").trim_matches(':');
@@ -297,7 +297,7 @@ impl Slack {
             learned.push((id.to_owned(), known));
         }
         if let Err(err) = self.ctx.people(&rows).and_then(|()| self.ctx.details(&details)) {
-            eprintln!("chatd: Slack: {err}");
+            tracing::warn!("chatd: Slack: {err}");
         }
         // The status emoji and a huddle, kept like presence: only for people the user owns or
         // has on screen.
@@ -325,7 +325,7 @@ impl Slack {
         }
         if !kept.user.avatar.is_empty() {
             if let Err(err) = self.register_avatar(&kept.user.avatar, &kept.picture, &kept.large) {
-                eprintln!("chatd: Slack: {err}");
+                tracing::warn!("chatd: Slack: {err}");
             }
         }
         self.remember(id, &kept.user);

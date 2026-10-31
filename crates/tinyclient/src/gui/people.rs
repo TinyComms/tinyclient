@@ -522,7 +522,7 @@ impl Shell {
                 Ok(Response::Ok) => None,
                 Ok(Response::Error { detail, .. }) => Some(detail),
                 Ok(_) => Some(crate::client::OTHER_ANSWER.to_owned()),
-                Err(err) => Some(crate::client::trouble_words(&err)),
+                Err(err) => Some(crate::client::trouble_words("people", &err)),
             };
             shell.people_note(refused.map(|why| format!("Can't open {name}: {why}")), cx);
         });
@@ -571,7 +571,7 @@ impl Shell {
             let refused = match answer {
                 Ok(Response::Error { detail, .. }) => Some(detail),
                 Ok(_) => None,
-                Err(err) => Some(crate::client::trouble_words(&err)),
+                Err(err) => Some(crate::client::trouble_words("people", &err)),
             };
             if refused.is_none() {
                 hub.related(&key, action);

@@ -19,8 +19,8 @@ use std::time::Duration;
 
 /// Names the chatd binary to start, overriding the rule below.
 pub const CHATD_ENV: &str = "TINYCLIENT_CHATD";
-/// chatd's stderr, under [`crate::support_dir`]. Cut to nothing past [`CHATD_LOG_LIMIT`] at each
-/// start.
+/// The old single stderr file. New builds write `logs/chatd.log` from chatd itself and do not
+/// open, copy, or delete this one.
 pub const CHATD_LOG: &str = "chatd.log";
 pub const CHATD_LOG_LIMIT: u64 = 4 * 1024 * 1024;
 
@@ -82,11 +82,12 @@ fn start_systemd(mut command: std::process::Command) -> io::Result<()> {
     }
 }
 
-/// Starts chatd in its own process group, so it outlives the shell and a terminal's ^C, with its
-/// stderr appended to `chatd.log`. It inherits the environment (`TINYCLIENT_DIR` included). The
-/// child is reaped on a thread of its own. Answers its pid. With the optional user
-/// unit enabled, asks systemd to start it instead and returns no child pid. A failed
-/// service start never falls back to an unmanaged daemon.
+/// Starts chatd in its own process group, so it outlives the shell and a terminal's ^C.
+/// stderr is discarded: chatd writes its own capped log. The child inherits the environment
+/// (`TINYCLIENT_DIR` included) and receives `TINYCLIENT_SESSION` when this process has one and
+/// the variable is unset. The child is reaped on a thread of its own. Answers its pid. With the
+/// optional user unit enabled, asks systemd to start it instead and returns no child pid. A
+/// failed service start never falls back to an unmanaged daemon.
 pub fn start_chatd() -> io::Result<Option<u32>> {
     #[cfg(target_os = "linux")]
     if systemd_chatd() {
@@ -94,18 +95,14 @@ pub fn start_chatd() -> io::Result<Option<u32>> {
         return Ok(None);
     }
     let path = chatd_path().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "chatd is not beside tinyclient"))?;
-    let dir = crate::support_dir();
-    std::fs::create_dir_all(&dir)?;
-    let log = dir.join(CHATD_LOG);
-    if std::fs::metadata(&log).is_ok_and(|meta| meta.len() > CHATD_LOG_LIMIT) {
-        let _ = std::fs::remove_file(&log);
-    }
-    let log = std::fs::OpenOptions::new().create(true).append(true).open(log)?;
     let mut command = std::process::Command::new(path);
+    if std::env::var_os("TINYCLIENT_SESSION").is_none() {
+        command.env("TINYCLIENT_SESSION", crate::log_policy::session_id());
+    }
     command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(log);
+        .stderr(std::process::Stdio::null());
     // Own process group so the daemon outlives the shell and a terminal's ^C.
     #[cfg(unix)]
     {

@@ -373,7 +373,7 @@ impl Pane {
                 Ok(Response::Error { code: ErrorCode::Unsupported, .. }) => Some(format!("{refused}: not supported on this network yet.")),
                 Ok(Response::Error { detail, .. }) => Some(format!("{refused}: {detail}")),
                 Ok(_) => None,
-                Err(err) => Some(format!("{refused}: {}", crate::client::trouble_words(&err))),
+                Err(err) => Some(format!("{refused}: {}", crate::client::trouble_words("send", &err))),
             };
             if let Some(why) = why {
                 let _ = this.update(cx, |this, cx| {

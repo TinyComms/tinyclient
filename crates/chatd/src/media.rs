@@ -140,7 +140,11 @@ struct Tester {
 impl Tester {
     fn start(hub: &Arc<Hub>, id: u64) -> io::Result<Tester> {
         let path = mediad_path()?;
-        let mut child = protocol::launch::no_console(Command::new(&path).arg("test")).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
+        let mut command = Command::new(&path);
+        command.arg("test");
+        protocol::launch::no_console(&mut command);
+        protocol::log_policy::share_session(&mut command);
+        let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
         let stdin = child.stdin.take();
         let mut stdout = BufReader::new(child.stdout.take().expect("stdout is piped"));
         let reader = hub.clone();
@@ -237,6 +241,17 @@ fn input_mode(settings: &protocol::settings::Values, push_to_talk: bool) -> prot
     }
 }
 
+fn state_name(state: &CallState) -> &'static str {
+    match state {
+        CallState::RingingOut => "ringing_out",
+        CallState::RingingIn { .. } => "ringing_in",
+        CallState::Connecting => "connecting",
+        CallState::Joined => "joined",
+        CallState::Reconnecting => "reconnecting",
+        CallState::Failed { .. } => "failed",
+    }
+}
+
 fn failed(reason: CallFailure, detail: impl Into<String>) -> CallState {
     CallState::Failed {
         reason,
@@ -247,6 +262,12 @@ fn failed(reason: CallFailure, detail: impl Into<String>) -> CallState {
 impl Live {
     fn enter(&mut self, state: CallState) {
         if self.call.state != state {
+            tracing::info!(
+                network = self.call.conversation.network.label(),
+                from = state_name(&self.call.state),
+                to = state_name(&state),
+                "call state"
+            );
             self.call.state = state;
             self.since = Instant::now();
         }
@@ -404,7 +425,8 @@ impl Live {
             | MediaResponse::Done
             | MediaResponse::Offer { .. }
             | MediaResponse::Stats(_)
-            | MediaResponse::Refused { .. } => return false,
+            | MediaResponse::Refused { .. }
+            | MediaResponse::LogsSaved { .. } => return false,
         }
         true
     }
@@ -428,9 +450,13 @@ impl Live {
 impl ActiveCall {
     fn start(hub: &Arc<Hub>, id: u64, conversation: Key) -> io::Result<ActiveCall> {
         let path = mediad_path()?;
-        let spawned = protocol::launch::no_console(Command::new(&path).arg("1")).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn();
+        let mut command = Command::new(&path);
+        command.arg("1");
+        protocol::launch::no_console(&mut command);
+        protocol::log_policy::share_session(&mut command);
+        let spawned = command.stdin(Stdio::piped()).stdout(Stdio::piped()).spawn();
         let mut child = spawned.map_err(|err| {
-            eprintln!("chatd: could not run {}: {err}", path.display());
+            tracing::warn!("chatd: could not run {}: {err}", path.display());
             io::Error::other(ENGINE_MISSING)
         })?;
         let stdin = child.stdin.take();
@@ -447,7 +473,7 @@ impl ActiveCall {
         if let Err(err) = spawned {
             let _ = child.kill();
             let _ = child.wait();
-            eprintln!("chatd: the reader of {} did not start: {err}", path.display());
+            tracing::warn!("chatd: the reader of {} did not start: {err}", path.display());
             return Err(io::Error::other(ENGINE_MISSING));
         }
         let (frame, mut stdout) = match answered.recv_timeout(READY) {
@@ -455,7 +481,7 @@ impl ActiveCall {
             answer => {
                 let _ = child.kill();
                 let _ = child.wait();
-                eprintln!("chatd: {} did not say it was ready: {answer:?}", path.display());
+                tracing::warn!("mediad frame was not ready");
                 let silent = matches!(answer, Err(std::sync::mpsc::RecvTimeoutError::Timeout));
                 return Err(io::Error::other(if silent { ENGINE_SILENT } else { ENGINE_MISSING }));
             }
@@ -465,7 +491,11 @@ impl ActiveCall {
             other => {
                 let _ = child.kill();
                 let _ = child.wait();
-                eprintln!("chatd: {} did not start: {other:?}", path.display());
+                let variant = match &other {
+                    Ok(frame) => frame.name(),
+                    Err(_) => "error",
+                };
+                tracing::warn!(variant, "mediad frame was {variant}");
                 return Err(io::Error::other(ENGINE_MISSING));
             }
         };
@@ -798,7 +828,7 @@ impl Calls {
         if held.is_none() {
             let id = self.next.fetch_add(1, Ordering::Relaxed);
             let mut tester = Tester::start(hub, id).map_err(|err| {
-                eprintln!("chatd: the test mediad did not start: {err}");
+                tracing::warn!("chatd: the test mediad did not start: {err}");
                 CallError::Media(io::Error::other(ENGINE_MISSING))
             })?;
             let (tuning, input, output, processing) = {
@@ -1115,7 +1145,7 @@ impl Calls {
         let request = if again { MediaRequest::Rejoin(voice) } else { MediaRequest::Join(voice) };
         // What mediad refuses it refuses in words (`Refused`); a pipe that broke is not words.
         if let Err(CallError::Media(err)) = self.request(hub, &request) {
-            eprintln!("chatd: mediad did not take the voice session: {err}");
+            tracing::warn!("chatd: mediad did not take the voice session: {err}");
             let detail = if err.kind() == io::ErrorKind::Other { err.to_string() } else { ENGINE_SILENT.to_owned() };
             self.set_state(hub, conversation, failed(CallFailure::Engine, detail));
         }
@@ -1150,7 +1180,11 @@ impl Calls {
         match self.request(hub, &MediaRequest::TinyOffer(offer)) {
             Ok(MediaResponse::Offer { sdp }) => Ok(sdp),
             answer => {
-                eprintln!("chatd: mediad made no offer: {answer:?}");
+                let variant = match &answer {
+                    Ok(frame) => frame.name(),
+                    Err(_) => "error",
+                };
+                tracing::warn!(variant, "mediad frame was {variant}");
                 if !here {
                     self.end_if(hub, conversation);
                 }
@@ -1172,7 +1206,7 @@ impl Calls {
             return;
         }
         if let Err(CallError::Media(err)) = self.request(hub, &MediaRequest::TinyAnswer { sdp }) {
-            eprintln!("chatd: mediad did not take the answer: {err}");
+            tracing::warn!("chatd: mediad did not take the answer: {err}");
             let detail = if err.kind() == io::ErrorKind::Other { err.to_string() } else { ENGINE_SILENT.to_owned() };
             self.set_state(hub, conversation, failed(CallFailure::Engine, detail));
         }
@@ -1265,7 +1299,7 @@ fn learn_devices(hub: &Hub, inputs: &[AudioDevice], outputs: &[AudioDevice]) {
         let better = hub.settings().device_choice(key).upgrade(listed);
         if let Some(better) = better {
             if let Err(err) = hub.set_setting(GLOBAL, key, better.value()) {
-                eprintln!("chatd: {key}: {err}");
+                tracing::warn!("chatd: {key}: {err}");
             }
         }
     }

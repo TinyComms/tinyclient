@@ -116,7 +116,10 @@ impl Shell {
         cx.spawn(async move |this, cx| loop {
             let status = crate::client::ask_within_async(Request::Status, Some(service::SLOW)).await;
             match status {
-                Ok(Response::Status { networks, accounts, call, seq, keychain, started, .. }) => {
+                Ok(Response::Status { networks, accounts, call, seq, keychain, started, session, .. }) => {
+                    if !session.is_empty() {
+                        protocol::log_policy::adopt_session(&session);
+                    }
                     let applied = this.update(cx, |this, cx| {
                         let came_back = this.service.phase == Phase::Reconnecting;
                         let restarted = this.service.answered(started, keychain, unix_now());
@@ -554,7 +557,11 @@ impl Shell {
     pub(in crate::gui) fn load_settings(&mut self, cx: &mut Context<Self>) {
         self.off_thread(cx, || ask(&Request::Settings), |this, answer, cx| {
             if let Ok(Response::Settings { values }) = answer {
-                prefs::set_values(protocol::settings::Values::new(values));
+                let values = protocol::settings::Values::new(values);
+                if let Some(guard) = protocol::log_policy::current() {
+                    guard.apply(protocol::log_policy::LogPolicy::for_settings(&values));
+                }
+                prefs::set_values(values);
                 this.badge_setting_changed();
                 cx.refresh_windows();
             }

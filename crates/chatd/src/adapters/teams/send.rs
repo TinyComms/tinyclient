@@ -95,7 +95,7 @@ impl Teams {
         });
         let file = MediaFile { bytes, ..MediaFile::new(format!("file:sent:{}", escaped(id)), MediaKind::File) };
         if let Err(err) = self.ctx.media(&[(file.clone(), share)]) {
-            eprintln!("chatd: Teams: {err}");
+            tracing::warn!("chatd: Teams: {err}");
         }
         Ok((entry, Attachment::new(name, file)))
     }

@@ -291,7 +291,7 @@ impl Notes {
             locked_body: what.to_owned(),
         };
         if let Err(err) = self.sink.post(&note) {
-            eprintln!("chatd: notification not shown: {err}");
+            tracing::warn!("chatd: notification not shown: {err}");
             return None;
         }
         self.ids.insert(id, key.clone());
@@ -350,7 +350,7 @@ impl Notes {
                     locked_body: "Incoming call".to_owned(),
                 };
                 if let Err(err) = self.sink.post(&note) {
-                    eprintln!("chatd: ring not shown: {err}");
+                    tracing::warn!("chatd: ring not shown: {err}");
                 }
                 self.ids.insert(id, key);
                 sound
@@ -481,7 +481,7 @@ pub fn start(hub: Arc<Hub>, chat: Weak<Chat>) {
     let app = app();
     // A build that was never installed makes its ID known; an installed one is the installer's.
     if let Err(err) = app.register(cfg!(debug_assertions)) {
-        eprintln!("chatd: {err}");
+        tracing::warn!("chatd: {err}");
     }
     let back = Mutex::new(tell.clone());
     let activated: notifier::Tell = Arc::new(move |done| {
@@ -493,7 +493,7 @@ pub fn start(hub: Arc<Hub>, chat: Weak<Chat>) {
         run(&hub, &chat, Notes::new(sink), &told);
     });
     if let Err(err) = spawned {
-        eprintln!("chatd: notifications: {err}");
+        tracing::warn!("chatd: notifications: {err}");
     }
 }
 
@@ -532,7 +532,7 @@ fn play(word: &str, volume: u32) -> Option<Child> {
         // CREATE_NO_WINDOW: no console flashes up for it.
         command.creation_flags(0x0800_0000);
     }
-    command.spawn().map_err(|err| eprintln!("chatd: sound: {err}")).ok()
+    command.spawn().map_err(|err| tracing::warn!("chatd: sound: {err}")).ok()
 }
 
 fn run(hub: &Arc<Hub>, chat: &Weak<Chat>, mut notes: Notes, told: &Receiver<Event>) {
@@ -626,7 +626,7 @@ fn open(hub: &Hub, conversation: &Key) {
     let shell = exe.with_file_name(format!("tinyclient{}", std::env::consts::EXE_SUFFIX));
     let Ok(key) = serde_json::to_string(conversation) else { return };
     if let Err(err) = Command::new(&shell).arg(format!("--open={key}")).spawn() {
-        eprintln!("chatd: could not start {}: {err}", shell.display());
+        tracing::warn!("chatd: could not start {}: {err}", shell.display());
     }
 }
 
@@ -653,7 +653,7 @@ fn act(hub: &Hub, chat: &Weak<Chat>, notes: &Notes, done: Activation) {
         Activation::Reply { text, .. } => {
             if let Response::Conversation { conversation: row } = chat.handle(Request::Conversation { conversation: conversation.clone() }) {
                 if row.read_only {
-                    eprintln!("chatd: reply from a notification not sent: you can read {} but not post in it", row.title);
+                    tracing::warn!("chatd: reply from a notification not sent: you can read {} but not post in it", row.title);
                     open(hub, &conversation);
                     return;
                 }
@@ -661,7 +661,7 @@ fn act(hub: &Hub, chat: &Weak<Chat>, notes: &Notes, done: Activation) {
             let client_id = format!("notify-{}-{}", now(), std::process::id());
             let sent = chat.handle(Request::Send { conversation: conversation.clone(), client_id, text, reply_to: None, with: Default::default() });
             if let Response::Error { detail, .. } = sent {
-                eprintln!("chatd: reply from a notification not sent: {detail}");
+                tracing::warn!("chatd: reply from a notification not sent: {detail}");
                 open(hub, &conversation);
             } else {
                 read(&chat);
