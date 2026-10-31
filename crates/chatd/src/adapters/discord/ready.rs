@@ -693,6 +693,8 @@ impl Discord {
             suppress_embeds: true,
             reply_ping: true,
             edit_window: 0,
+            file_scan: false,
+            allow_archives: false,
         });
         self.state.lock().unwrap().premium = premium;
     }

@@ -319,6 +319,13 @@ pub struct Capabilities {
     /// Seconds after sending that an edit is still allowed. 0: no limit.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub edit_window: u32,
+    /// This Tiny server scans uploads before anyone can fetch them. False on every other
+    /// network and on an older Tiny server, which keeps today's upload.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub file_scan: bool,
+    /// This Tiny server takes archives. Ignored unless `file_scan` is set.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_archives: bool,
 }
 
 impl Capabilities {

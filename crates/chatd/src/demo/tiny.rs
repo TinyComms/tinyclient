@@ -548,6 +548,7 @@ pub fn seed(s: &mut Seeder) -> Fallible<Who> {
             afk_timeout_secs: 900,
             image_max_bytes: protocol::TINY_IMAGE_MAX_DEFAULT,
             file_max_bytes: protocol::TINY_FILE_MAX_DEFAULT,
+            allow_archives: false,
             created_at: "2025-11-02T18:00:00Z".to_owned(),
             icon_path,
         }),
@@ -1020,6 +1021,9 @@ pub fn answer(hub: &Hub, request: &Request) -> Option<Response> {
                 }
                 if let Some(bytes) = edit.file_max_bytes {
                     server.file_max_bytes = bytes;
+                }
+                if let Some(allow) = edit.allow_archives {
+                    server.allow_archives = allow;
                 }
             }
             changed(community)

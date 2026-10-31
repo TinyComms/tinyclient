@@ -10,6 +10,8 @@ mod host;
 mod update;
 #[cfg(any(feature = "gui", test))]
 mod frames;
+#[cfg(any(feature = "gui", test))]
+mod tiny_attach;
 #[cfg(feature = "gui")]
 mod gui;
 #[cfg(feature = "gui")]

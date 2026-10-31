@@ -393,6 +393,11 @@ impl Upload {
         let mut response = sent.map_err(|err| format!("{name} could not be sent: {}.", crate::adapters::net::redact(&err.to_string())))?;
         let status = response.status().as_u16();
         if !(200..300).contains(&status) {
+            let detail = response.body_mut().with_config().limit(ANSWER_KEPT).read_to_string().unwrap_or_default();
+            // Tiny's adapter reads the status and the JSON `error`. Other networks keep the status.
+            if network == Network::Tiny {
+                return Err(format!("tiny-media\n{status}\n{detail}"));
+            }
             return Err(format!("{name} could not be sent: the server answered {status}."));
         }
         let body = response.body_mut().with_config().limit(ANSWER_KEPT).read_to_string().unwrap_or_default();
@@ -672,11 +677,16 @@ mod windows_places {
 }
 
 /// Whether the network takes uploads at this address. Never plain HTTP, except a test's own
-/// server in a scratch directory.
+/// server in a scratch directory, and a Tiny server on this machine.
 fn uploads_to(network: Network, url: &str) -> bool {
     let Some((secure, host)) = super::fetch::host_of(url) else {
         return false;
     };
+    // The adapter posts only to that server. Loopback HTTP is a server on this machine,
+    // including the tests'. Anything else stays https.
+    if network == Network::Tiny {
+        return secure || host == "127.0.0.1" || host == "localhost";
+    }
     if !crate::session::enabled() {
         let local = std::env::var("TINYCLIENT_MEDIA_HOSTS").unwrap_or_default();
         if host == "127.0.0.1" || host == "localhost" || local.split(',').any(|named| named == host) {
@@ -698,8 +708,8 @@ fn uploads_to(network: Network, url: &str) -> bool {
         // Encrypted before it leaves, by the adapter: nothing goes through this helper.
         Network::Signal => &[],
         Network::Messages => &[],
-        // The adapter only posts to that server's /v1/media.
-        Network::Tiny => return true,
+        // Handled above, before the https check, so a loopback server can take a file.
+        Network::Tiny => return false,
     };
     hosts.iter().any(|name| super::fetch::under(&host, name))
 }

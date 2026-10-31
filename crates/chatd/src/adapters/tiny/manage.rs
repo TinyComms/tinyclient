@@ -20,7 +20,7 @@ use protocol::{
     TinyInviteOptions, TinyLayoutGroup, TinyRole, TinyRoleEdit, TinyRoom, TinyRoomEdit, TinySeat, TinyServerEdit, TinyServerInfo,
     TINY_ALL, TINY_BITRATE_MAX, TINY_BITRATE_MIN, TINY_DESCRIPTION_MAX, TINY_FEATURE_AUDIT_QUERY, TINY_FEATURE_BANS,
     TINY_FEATURE_CATEGORIES, TINY_FEATURE_INVITE_OPTIONS, TINY_FEATURE_ROLES, TINY_FEATURE_SERVER, TINY_FEATURE_TIMEOUTS,
-    TINY_FEATURE_UPLOAD_LIMITS, TINY_ICON_MAX, TINY_SERVER_NAME_MAX, TINY_UPLOAD_MAX, TINY_WELCOME_MAX,
+    TINY_FEATURE_FILE_SCAN, TINY_FEATURE_UPLOAD_LIMITS, TINY_ICON_MAX, TINY_SERVER_NAME_MAX, TINY_UPLOAD_MAX, TINY_WELCOME_MAX,
 };
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashMap};
@@ -393,6 +393,12 @@ pub(crate) fn server_update(account: AccountKey, edit: TinyServerEdit) -> Respon
             }
             body.insert(field.into(), json!(bytes));
         }
+    }
+    if let Some(allow) = edit.allow_archives {
+        if let Err(answer) = allowed(&account, Some(TINY_FEATURE_FILE_SCAN), "community.server.edit") {
+            return answer;
+        }
+        body.insert("allow_archives".into(), json!(allow));
     }
     if body.is_empty() {
         return Response::Ok;
