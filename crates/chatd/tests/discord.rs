@@ -1971,32 +1971,6 @@ fn a_stage_channel_lists_who_is_on_it_and_leaves_the_join_to_discord() {
     });
     assert_eq!(gone, [("2003".to_owned(), true), ("2006".to_owned(), false)]);
 }
-    let world = World::start();
-    // A server arrives whole, stage and all: its channels are planted before its voice
-    // states are read, so the first report already knows who the platform holds back.
-    world.discord.push("GUILD_CREATE", json!({
-        "id": "7000", "name": "Stage Place", "icon": null, "owner_id": "2001", "joined_at": "2026-10-13T08:00:00+00:00",
-        "roles": [{"id": "7000", "name": "@everyone", "permissions": "1024", "position": 0}],
-        "channels": [{"id": "7002", "type": 13, "name": "Assembly", "position": 0, "parent_id": null, "bitrate": 64000, "user_limit": 0, "permission_overwrites": []}],
-        "threads": [],
-        "voice_states": [{"user_id": "2001", "channel_id": "7002", "session_id": "voice-mara",
-                          "self_mute": false, "self_deaf": false, "mute": false, "deaf": false, "suppress": false}],
-        "members": [{"user": me(), "roles": [], "joined_at": "2026-10-13T08:00:00+00:00"}],
-    }));
-    let on_stage = wait("the stage planted and its speaker told", || {
-        match world.ask(Request::InVoice { network: Some(Network::Discord) }) {
-            Response::Conversations { conversations, .. } => {
-                let row = conversations.iter().find(|row| row.key.id == "7002")?;
-                let occupants = row.occupants.as_ref()?;
-                (occupants.people.len() == 1).then(|| {
-                    (row.call, occupants.people.iter().map(|person| (person.person.id.clone(), person.speaking)).collect::<Vec<_>>())
-                })
-            }
-            other => panic!("{other:?}"),
-        }
-    });
-    assert_eq!(on_stage, (CallSupport::Handoff, vec![("2001".to_owned(), true)]));
-}
 
 #[test]
 fn a_stage_with_more_than_a_row_of_occupants_keeps_its_speakers_visible() {
