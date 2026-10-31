@@ -91,11 +91,8 @@ const SLOTS: usize = 64;
 /// How long media has to start once the answer is in. The server gives up at 15 s
 /// (`media_timeout`); this says why first.
 const CONNECT: Duration = Duration::from_secs(12);
-/// How long a call that lost its media waits for it, or for a new connection, before it ends.
-const COME_BACK: Duration = Duration::from_secs(30);
 
 const NO_PATH: &str = "The server answered, but call audio couldn't get through. A VPN or firewall may be blocking it.";
-const DROPPED: &str = "The connection to the server dropped and didn't come back. You've left the call.";
 const ENGINE: &str = "The call engine could not start. Try again.";
 
 /// Which candidates to offer. `TINYCLIENT_MEDIAD_ICE` makes a test offer one kind alone: `udp`,
@@ -354,7 +351,10 @@ struct Call {
     packets: VecDeque<Packet>,
     /// Media flows on this link.
     connected: bool,
-    /// Lost media, and since when: the call ends if it does not come back.
+    /// This drop was already told to chatd. Cleared when media flows, or when a new link takes
+    /// over, so that link can tell of its own death.
+    announced: bool,
+    /// Lost media, and since when. chatd resumes the call; nothing here ends it on a clock.
     lost: Option<Instant>,
     audio: Option<Audio>,
     devices: Option<Devices>,
@@ -441,6 +441,8 @@ impl Call {
         self.offered = None;
         self.wait_key = true;
         self.shown = None;
+        // The new link has not been announced dead. A death of the one we just left already was.
+        self.announced = false;
         for (_, slot) in self.slots.drain() {
             if slot.stream.speaking() && !slot.user.is_empty() {
                 out::send(&MediaResponse::Speaking { user_id: slot.user, speaking: false });
@@ -487,7 +489,7 @@ impl Call {
     fn event(&mut self, event: Event) {
         match event {
             Event::Connected => self.up(),
-            Event::IceConnectionStateChange(IceConnectionState::Disconnected) => self.down(),
+            Event::IceConnectionStateChange(IceConnectionState::Disconnected) => self.fell(),
             Event::IceConnectionStateChange(IceConnectionState::Connected | IceConnectionState::Completed) if self.lost.is_some() && self.audio.is_some() => self.up(),
             Event::PeerStats(stats) => {
                 let pair = stats.selected_candidate_pair.as_ref();
@@ -566,17 +568,28 @@ impl Call {
             self.controls.cue(Cue::Back);
         }
         self.connected = true;
+        self.announced = false;
         self.lost = None;
         out::send(&MediaResponse::Connected { ssrc: 0, dave_version: 0 });
     }
 
-    fn down(&mut self) {
-        if !self.connected {
+    /// The link died, or never came up after we had already been in the call. Told once per
+    /// drop: chatd stays in the call and brings it back. A join that has not connected yet is
+    /// still the first-connect bound's to end.
+    fn fell(&mut self) {
+        if self.announced {
             return;
         }
-        self.connected = false;
-        self.lost = Some(Instant::now());
-        self.controls.cue(Cue::Lost);
+        let was_up = self.connected;
+        if !was_up && self.audio.is_none() {
+            return;
+        }
+        self.announced = true;
+        if was_up {
+            self.connected = false;
+            self.controls.cue(Cue::Lost);
+        }
+        self.lost.get_or_insert_with(Instant::now);
         out::send(&MediaResponse::Interrupted);
     }
 
@@ -990,13 +1003,13 @@ impl Call {
         self.audio = Some(audio);
     }
 
-    /// The bounds on waiting for media: to start after an answer, and to come back.
+    /// The bound on the first connect. A call that was up and then lost its media waits for
+    /// chatd to resume it; there is no wall-clock give-up here.
     fn overdue(&self) {
-        if let Some(lost) = self.lost {
-            if lost.elapsed() > COME_BACK {
-                out::fail(CallFailure::Lost, DROPPED);
-            }
-        } else if !self.connected && self.audio.is_none() && self.link.answered.elapsed() > CONNECT {
+        if self.lost.is_some() {
+            return;
+        }
+        if !self.connected && self.audio.is_none() && self.link.answered.elapsed() > CONNECT {
             out::fail(CallFailure::Lost, NO_PATH);
         }
     }
@@ -1018,8 +1031,7 @@ impl Call {
             let timeout = match self.drain() {
                 Some(at) => at,
                 None => {
-                    self.down();
-                    self.lost.get_or_insert_with(Instant::now);
+                    self.fell();
                     next
                 }
             };
@@ -1100,6 +1112,7 @@ pub fn run(link: Link, user_id: String, controls: Arc<Controls>) {
         next_token: 1,
         packets: VecDeque::new(),
         connected: false,
+        announced: false,
         lost: None,
         audio: None,
         devices: None,

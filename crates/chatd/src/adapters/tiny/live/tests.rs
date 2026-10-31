@@ -779,6 +779,107 @@ fn a_call_that_keeps_losing_its_media_stops_joining_again() {
     assert!(super::recovering(&mut recovered, start + Duration::from_secs(121)), "the first has aged out");
 }
 
+/// Discord's resume budget: three tries, pauses of 1s, 2s and 3s, and a link that held a minute starts over.
+#[test]
+fn a_link_that_held_for_a_minute_starts_the_resume_count_over() {
+    let start = Instant::now();
+    assert_eq!(super::plan(0, None, start), super::Plan::Resume { resumes: 1, pause: Duration::from_secs(1) });
+    assert_eq!(super::plan(1, None, start), super::Plan::Resume { resumes: 2, pause: Duration::from_secs(2) });
+    assert_eq!(super::plan(2, None, start), super::Plan::Resume { resumes: 3, pause: Duration::from_secs(3) });
+    assert_eq!(super::plan(3, None, start), super::Plan::GiveUp);
+    assert_eq!(super::plan(3, Some(start), start + Duration::from_secs(59)), super::Plan::GiveUp, "59s has not restored the budget");
+    let again = super::Plan::Resume { resumes: 1, pause: Duration::from_secs(1) };
+    assert_eq!(super::plan(3, Some(start), start + Duration::from_secs(60)), again, "60s starts the count over");
+    assert_eq!(super::plan(2, Some(start), start + Duration::from_secs(60)), again);
+}
+
+/// The server's answer to a resume, and a speaking bit the test can see once that answer is in.
+fn answer_resume(conn: &mut Conn, call_id: &str, speaking: bool) -> Value {
+    let join = conn.next(Duration::from_secs(8)).expect("a resume join");
+    assert_eq!(join["type"], "call.join", "a drop joins again: {join}");
+    let sdp = join["sdp"].as_str().expect("a fresh offer");
+    conn.send(json!({"type": "call.answer", "ref": join["ref"], "call_id": call_id, "sdp": answer_for(sdp)}));
+    let users: Vec<&str> = if speaking { vec![BEA] } else { vec![] };
+    conn.send(json!({"type": "call.speaking", "room_id": ROOM, "user_ids": users}));
+    join
+}
+
+fn bea_speaking(running: &Running) -> bool {
+    running.hub.occupants(&running.key(ROOM)).is_some_and(|inside| inside.people.iter().any(|who| who.name == "Bea" && who.speaking))
+}
+
+#[test]
+fn a_media_drop_while_the_socket_is_up_joins_again_until_the_budget_is_spent() {
+    with_mediad();
+    let (said, heard) = channel();
+    let fake = fake_with("up", &[], move |_, mut conn| {
+        conn.send(ready(1, &[ME, BEA], json!([{"room_id": ROOM, "participants": [{"user_id": BEA}]}])));
+        answer_join(&mut conn, "c-1");
+        for n in 0..3 {
+            let again = answer_resume(&mut conn, &format!("c-resume-{n}"), n % 2 == 0);
+            assert!(again["sdp"].as_str().is_some_and(|sdp| sdp.contains("a=ice-ufrag:")), "a fresh offer");
+            let _ = said.send(n);
+        }
+        let extra = conn.next(Duration::from_millis(1500));
+        assert!(extra.is_none(), "the budget sends no further join: {extra:?}");
+        let _ = said.send(3);
+        conn.idle(Duration::from_secs(3));
+    });
+    let running = run(&fake.base, QUICK);
+    until("connected", || running.link().0 == Link::Connected);
+    until("the health read", || !running.live.seats_only());
+    assert_eq!(running.join_with_audio(ROOM), Ok(()));
+    running.hub.calls.set_state(&running.hub, &running.key(ROOM), protocol::CallState::Reconnecting);
+    assert!(running.hub.calls.describe().1, "mediad is up before the drop is resumed");
+
+    for n in 0..3 {
+        running.live.ask(Ask::Resume);
+        assert_eq!(heard.recv_timeout(Duration::from_secs(10)).expect("the resume was answered"), n);
+        if n % 2 == 0 {
+            until("Bea speaking, so the answer is in", || bea_speaking(&running));
+        } else {
+            until("Bea quiet, so the answer is in", || !bea_speaking(&running));
+        }
+        let call = the_call(&running).expect("the call stays up");
+        assert!(!matches!(call.state, protocol::CallState::Failed { .. }), "resume {n} does not end the call: {:?}", call.state);
+        assert!(running.hub.calls.describe().1, "mediad stays up through resume {n}");
+    }
+
+    running.live.ask(Ask::Resume);
+    until("the budget is spent", || {
+        the_call(&running).is_some_and(|call| call.state == protocol::CallState::Failed { reason: CallFailure::Lost, detail: super::DROPPED.to_owned() })
+    });
+    assert!(!running.hub.calls.describe().1, "giving up stops mediad");
+    assert_eq!(heard.recv_timeout(Duration::from_secs(5)).expect("no further join"), 3);
+}
+
+#[test]
+fn hangup_during_a_reconnect_leaves_at_once() {
+    with_mediad();
+    let (said, heard) = channel();
+    let fake = fake_with("up", &[], move |_, mut conn| {
+        conn.send(ready(1, &[ME], json!([])));
+        answer_join(&mut conn, "c-1");
+        let leave = conn.next(Duration::from_secs(3)).expect("leave");
+        assert_eq!(leave["type"], "call.leave", "hangup leaves without joining again: {leave}");
+        conn.send(json!({"type": "ok", "ref": leave["ref"]}));
+        conn.send(json!({"type": "call.left", "room_id": ROOM, "user_id": ME, "reason": "left"}));
+        let extra = conn.next(Duration::from_millis(1500));
+        assert!(extra.is_none(), "no join after hangup: {extra:?}");
+        let _ = said.send(());
+        conn.idle(Duration::from_secs(2));
+    });
+    let running = run(&fake.base, QUICK);
+    until("connected", || running.link().0 == Link::Connected);
+    until("the health read", || !running.live.seats_only());
+    assert_eq!(running.join_with_audio(ROOM), Ok(()));
+    running.hub.calls.set_state(&running.hub, &running.key(ROOM), protocol::CallState::Reconnecting);
+    running.live.ask(Ask::Resume);
+    running.live.ask(Ask::Hangup { room_id: ROOM.into() });
+    heard.recv_timeout(Duration::from_secs(6)).expect("hung up without joining again");
+    until("the seat is gone", || running.hub.occupants(&running.key(ROOM)).is_none());
+}
+
 #[test]
 fn a_join_with_audio_the_server_refuses_says_why_and_stops_mediad() {
     with_mediad();
