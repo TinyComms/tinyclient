@@ -67,6 +67,70 @@ pub fn scan_caption(open: Option<&OpenScan>, here: &protocol::Key) -> Option<Str
     open.filter(|open| open.conversation == *here).map(|open| scanning_words(open.chips))
 }
 
+/// One chip hold per in-flight client id. Inserting a second id leaves the first in place.
+pub struct Holds<T> {
+    rows: Vec<(String, T)>,
+}
+
+impl<T> Default for Holds<T> {
+    fn default() -> Self {
+        Self { rows: Vec::new() }
+    }
+}
+
+impl<T> Holds<T> {
+    pub fn insert(&mut self, client_id: impl Into<String>, value: T) {
+        let client_id = client_id.into();
+        self.rows.retain(|(id, _)| id != &client_id);
+        self.rows.push((client_id, value));
+    }
+
+    pub fn remove(&mut self, client_id: &str) -> Option<T> {
+        let at = self.rows.iter().position(|(id, _)| id == client_id)?;
+        Some(self.rows.remove(at).1)
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = &T> {
+        self.rows.iter().map(|(_, value)| value)
+    }
+}
+
+/// Verdicts to record for a Tiny file send. An id that is not in flight yet is included when
+/// it is awaiting the send ack, so a Failed update that wins that race is not dropped.
+pub fn file_verdicts(
+    inflight: &[String],
+    awaiting: &[String],
+    settled: impl Fn(&str) -> Option<Result<(), String>>,
+) -> Vec<(String, Result<(), String>)> {
+    let mut seen = Vec::new();
+    let mut out = Vec::new();
+    for id in inflight.iter().chain(awaiting.iter()) {
+        if seen.iter().any(|kept: &String| kept == id) {
+            continue;
+        }
+        seen.push(id.clone());
+        if let Some(verdict) = settled(id) {
+            out.push((id.clone(), verdict));
+        }
+    }
+    out
+}
+
+/// Remember a verdict by client id. A later one for the same id replaces it. The hold reads
+/// this once, when it starts, including when the verdict arrived first.
+pub fn remember_verdict(queued: &mut Vec<(String, Result<(), String>)>, client_id: String, outcome: Result<(), String>) {
+    queued.retain(|(id, _)| id != &client_id);
+    queued.push((client_id, outcome));
+    if queued.len() > 32 {
+        let _ = queued.remove(0).1.ok();
+    }
+}
+
+pub fn take_verdict(queued: &mut Vec<(String, Result<(), String>)>, client_id: &str) -> Option<Result<(), String>> {
+    let at = queued.iter().position(|(id, _)| id == client_id)?;
+    Some(queued.remove(at).1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,5 +203,32 @@ mod tests {
         assert!(scan_caption(Some(&open), &other).is_none());
         let two = OpenScan { chips: 2, ..open };
         assert_eq!(scan_caption(Some(&two), &here).as_deref(), Some("Scanning those files before they send."));
+    }
+
+    #[test]
+    fn a_verdict_before_the_hold_is_applied_when_the_hold_starts() {
+        let failed = protocol::SendState::Failed { reason: "Tiny blocked that file".into() };
+        let state = |id: &str| (id == "early").then_some(&failed);
+        let got = file_verdicts(&[], &["early".into()], |id| scan_settled(state(id)));
+        assert_eq!(got, vec![("early".into(), Err("Tiny blocked that file".into()))]);
+        let mut queued = Vec::new();
+        let mut holds: Holds<&str> = Holds::default();
+        remember_verdict(&mut queued, got[0].0.clone(), got[0].1.clone());
+        match take_verdict(&mut queued, "early") {
+            Some(outcome) => assert_eq!(outcome, Err("Tiny blocked that file".into())),
+            None => holds.insert("early", "general"),
+        }
+        assert!(holds.values().next().is_none(), "Send must not stay on Scanning after an early Failed");
+        assert!(take_verdict(&mut queued, "early").is_none());
+    }
+
+    #[test]
+    fn a_second_channel_does_not_drop_the_first_hold() {
+        let mut holds: Holds<&str> = Holds::default();
+        holds.insert("one", "general");
+        holds.insert("two", "random");
+        assert_eq!(holds.remove("two"), Some("random"));
+        assert_eq!(holds.remove("one"), Some("general"), "the first conversation's hold is still there");
+        assert!(holds.remove("one").is_none());
     }
 }

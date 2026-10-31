@@ -771,14 +771,19 @@ fn media_failure(why: &str) -> String {
     super::explain_media(status, &body).to_owned()
 }
 
-/// The address the file is fetched from. The server's signed `url` when it names this server,
-/// otherwise the plain media path. The bearer is added when the file is fetched, not here.
+/// The address the file is fetched from. An absolute `url` on this server is kept. A path
+/// (`/v1/media/{id}?ex=&is=&hm=`, which is what mint returns) is joined onto the server base
+/// so the query is not dropped. Anything else uses the plain media path. The bearer is added
+/// when the file is fetched, not here.
 fn fetched_url(saved: &Saved, file: &WireFile) -> String {
     let offered = file.url.trim();
-    if !offered.is_empty() && same_server(&saved.base_url, offered) {
+    let base = saved.base_url.trim_end_matches('/');
+    if !offered.is_empty() && same_server(base, offered) {
         return offered.to_owned();
     }
-    let base = saved.base_url.trim_end_matches('/');
+    if let Some(path) = offered.strip_prefix('/').filter(|path| !path.starts_with('/')) {
+        return format!("{base}/{path}");
+    }
     format!("{base}/v1/media/{}", file.id)
 }
 
@@ -1391,6 +1396,37 @@ mod tests {
         serve(&ctx, &saved, &Live::new().unwrap(), Command::Download { id: "file-1".into(), url: url.into(), reply: tx });
         let download = rx.recv().unwrap().unwrap();
         assert_eq!(download.url, url);
+        assert_eq!(download.headers[0].0, "Authorization");
+        assert!(download.headers[0].1.starts_with("Bearer "));
+    }
+
+    #[test]
+    fn a_minted_media_path_is_joined_onto_the_server_and_keeps_the_bearer() {
+        let saved = saved("https://chat.example");
+        let path = "/v1/media/file-1?ex=1700086400&is=1700000000&hm=ab";
+        let wire: WireMessage = serde_json::from_value(json!({
+            "id": "m-1",
+            "author_id": ME,
+            "body": "",
+            "created_at": WHEN,
+            "attachments": [{
+                "id": "file-1",
+                "name": "a.png",
+                "mime": "image/png",
+                "kind": "image",
+                "url": path
+            }]
+        }))
+        .unwrap();
+        let mut media = Vec::new();
+        map_message(&saved, &HashMap::new(), &wire, &mut media).unwrap();
+        let joined = format!("https://chat.example{path}");
+        assert_eq!(media[0].1, joined);
+        let (_adapter, ctx) = open_ctx();
+        let (tx, rx) = std::sync::mpsc::channel();
+        serve(&ctx, &saved, &Live::new().unwrap(), Command::Download { id: "file-1".into(), url: joined.clone(), reply: tx });
+        let download = rx.recv().unwrap().unwrap();
+        assert_eq!(download.url, joined);
         assert_eq!(download.headers[0].0, "Authorization");
         assert!(download.headers[0].1.starts_with("Bearer "));
     }
