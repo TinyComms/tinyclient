@@ -35,7 +35,8 @@ use std::time::{Duration, Instant};
 /// Seconds either ring holds at most. Far more than the tick's lateness on a busy machine.
 const RING: f32 = 0.5;
 /// Seconds held before the speaker is given anything, when a call starts and after it ran dry.
-const PREBUFFER: f32 = 0.05;
+/// The same depth as the playout low point, so the start is not drier than the target.
+const PREBUFFER: f32 = 0.06;
 /// Seconds over which playing fades in when it starts, and out before the cushion runs dry or
 /// a backlog is skipped.
 const FADE: f32 = 0.005;
@@ -46,8 +47,9 @@ const PLAYOUT_MAX: f32 = 0.25;
 const CAPTURE_MAX: usize = FRAME_SAMPLES * 10;
 /// What each side's drift control keeps at the lowest point of each second, in ms: the
 /// microphone's before a frame is taken (a frame and 10 ms), the speaker's before one is added.
+/// Three 20 ms ticks, so one late tick cannot run the speaker dry.
 const CAPTURE_LOW_MS: f64 = 30.;
-const PLAYOUT_LOW_MS: f64 = 20.;
+const PLAYOUT_LOW_MS: f64 = 60.;
 
 /// What went wrong on a pair of devices, counted by their callbacks.
 #[derive(Debug, Default)]
@@ -1584,6 +1586,12 @@ mod tests {
         assert!(!broken.load(Ordering::Relaxed), "the stream plays on");
         on_error("microphone", &cpal::Error::new(cpal::ErrorKind::DeviceNotAvailable), &glitches, &broken);
         assert!(broken.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn the_speaker_keeps_three_ticks_of_slack() {
+        assert!(PLAYOUT_LOW_MS >= 60., "{PLAYOUT_LOW_MS}");
+        assert!(PREBUFFER * 1000. >= PLAYOUT_LOW_MS as f32, "prebuffer {PREBUFFER} is under the target");
     }
 
     #[test]

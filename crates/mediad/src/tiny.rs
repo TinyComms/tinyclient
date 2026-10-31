@@ -733,9 +733,17 @@ impl Call {
             self.painted = None;
         }
         self.watching = watching;
+        if self.controls.share() || self.controls.camera() || watching {
+            crate::picture::warm();
+        }
         if self.offered.is_none() && !self.link.pending() {
             let (want_share, want_camera) = (self.controls.share(), self.controls.camera());
             if want_share != self.sending_share {
+                if want_share {
+                    crate::picture::retry_codec();
+                } else {
+                    self.share_noted = false;
+                }
                 match self.link.offer_send(true, want_share) {
                     Ok(sdp) => {
                         self.offered = Some(true);
@@ -745,6 +753,11 @@ impl Call {
                     Err(err) => eprintln!("mediad: the share could not be offered: {err}"),
                 }
             } else if want_camera != self.sending_camera {
+                if want_camera {
+                    crate::picture::retry_codec();
+                } else {
+                    self.camera_noted = false;
+                }
                 match self.link.offer_send(false, want_camera) {
                     Ok(sdp) => {
                         self.offered = Some(false);
@@ -768,6 +781,7 @@ impl Call {
                     self.share_n += 1;
                     sent = true;
                 }
+                Err(words) if words == crate::picture::CODEC_LATER => {}
                 Err(words) => {
                     if !self.share_noted {
                         self.share_noted = true;
@@ -789,6 +803,7 @@ impl Call {
                     self.camera_n += 1;
                     sent = true;
                 }
+                Err(words) if words == crate::picture::CODEC_LATER => {}
                 Err(words) => {
                     if !self.camera_noted {
                         self.camera_noted = true;

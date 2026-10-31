@@ -12,6 +12,8 @@ use openh264::formats::YUVSource;
 use openh264::OpenH264API;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 /// A share is fitted inside this. Even, and inside level 3.1.
 pub const SHARE_MAX: (u32, u32) = (1280, 720);
@@ -192,6 +194,10 @@ impl Default for Pictures {
 impl Pictures {
     /// One share frame, Annex B, or why the screen could not be read.
     pub fn share(&mut self, key: bool) -> Result<Vec<u8>, String> {
+        // The download must not sit on the call thread, and a capture is wasted until it loads.
+        if self.share.is_none() {
+            load_api()?;
+        }
         let grabbed = capture_screen()?;
         let (width, height) = fit(grabbed.width, grabbed.height, SHARE_MAX.0, SHARE_MAX.1);
         let planes = i420(&grabbed.pixels, grabbed.width, grabbed.height, width, height, grabbed.bgra);
@@ -207,6 +213,9 @@ impl Pictures {
 
     /// The camera's two layers, high then low, or why the camera could not be read.
     pub fn camera(&mut self, key: bool) -> Result<(Vec<u8>, Vec<u8>), String> {
+        if self.high.is_none() || self.low.is_none() {
+            load_api()?;
+        }
         let grabbed = self.camera.frame()?;
         let (hw, hh) = fit(grabbed.width, grabbed.height, CAMERA_HIGH.0, CAMERA_HIGH.1);
         let (lw, lh) = fit(grabbed.width, grabbed.height, CAMERA_LOW.0, CAMERA_LOW.1);
@@ -436,17 +445,97 @@ fn capture_screen_linux() -> Result<Rgba, String> {
     Ok(Rgba { width: width as u32, height: height as u32, pixels: reply.data, bgra: true })
 }
 
-/// Cisco's OpenH264 2.6.0 for this machine, downloaded once and checked by the crate.
+/// Said while the binary is on its way, so a call does not treat the wait as a failure.
+pub const CODEC_LATER: &str = "OpenH264 is still downloading.";
+const DOWNLOAD_FAILED: &str = "OpenH264 could not be downloaded. The call stays a voice call.";
+
+enum Fetch {
+    Idle,
+    Busy,
+    Failed(String),
+}
+
+fn fetch() -> &'static Mutex<Fetch> {
+    static FETCH: OnceLock<Mutex<Fetch>> = OnceLock::new();
+    FETCH.get_or_init(|| Mutex::new(Fetch::Idle))
+}
+
+/// Starts the download when the binary is not here yet, and returns at once.
+pub fn warm() {
+    let Ok(path) = library_path() else {
+        return;
+    };
+    if path.exists() {
+        return;
+    }
+    start_download(path);
+}
+
+/// A failed download may be tried again, the next time share or camera is turned on.
+pub fn retry_codec() {
+    let Ok(mut state) = fetch().lock() else {
+        return;
+    };
+    if matches!(*state, Fetch::Failed(_)) {
+        *state = Fetch::Idle;
+    }
+}
+
+fn start_download(path: PathBuf) {
+    let Ok(mut state) = fetch().lock() else {
+        return;
+    };
+    if !matches!(*state, Fetch::Idle) {
+        return;
+    }
+    *state = Fetch::Busy;
+    drop(state);
+    let started = std::thread::Builder::new().name("openh264".into()).spawn(move || {
+        let result = download(&path);
+        if let Ok(mut state) = fetch().lock() {
+            *state = match result {
+                Ok(()) => Fetch::Idle,
+                Err(err) => Fetch::Failed(err),
+            };
+        }
+    });
+    if started.is_err() {
+        if let Ok(mut state) = fetch().lock() {
+            *state = Fetch::Failed(DOWNLOAD_FAILED.to_owned());
+        }
+    }
+}
+
+/// Cisco's OpenH264 2.6.0 for this machine. A download in progress is [`CODEC_LATER`], not a
+/// failure, and this never blocks on the network.
 fn load_api() -> Result<OpenH264API, String> {
     let path = library_path()?;
-    if path.exists() {
-        if let Ok(api) = OpenH264API::from_blob_path(&path) {
-            return Ok(api);
-        }
-        let _ = std::fs::remove_file(&path);
+    if let Some(api) = open_cached(&path) {
+        return Ok(api);
     }
-    download(&path)?;
-    OpenH264API::from_blob_path(&path).map_err(|err| format!("OpenH264 could not be loaded ({err})."))
+    match fetch().lock() {
+        Ok(state) => match &*state {
+            Fetch::Busy => return Err(CODEC_LATER.to_owned()),
+            Fetch::Failed(err) => return Err(err.clone()),
+            Fetch::Idle => {}
+        },
+        Err(_) => return Err(DOWNLOAD_FAILED.to_owned()),
+    }
+    start_download(path);
+    Err(CODEC_LATER.to_owned())
+}
+
+fn open_cached(path: &Path) -> Option<OpenH264API> {
+    if !path.exists() {
+        return None;
+    }
+    match OpenH264API::from_blob_path(path) {
+        Ok(api) => Some(api),
+        Err(_) => {
+            let _ = std::fs::remove_file(path);
+            None
+        }
+    }
 }
 
 fn library_path() -> Result<PathBuf, String> {
@@ -486,10 +575,17 @@ fn library_name() -> Option<&'static str> {
     }
 }
 
+fn library_url(name: &str) -> String {
+    format!("https://ciscobinary.openh264.org/{name}.bz2")
+}
+
 fn download(path: &Path) -> Result<(), String> {
     let name = path.file_name().and_then(|name| name.to_str()).ok_or_else(|| "OpenH264 has no name.".to_owned())?;
-    let url = format!("https://github.com/cisco/openh264/releases/download/v2.6.0/{name}.bz2");
-    let response = ureq::get(&url).call().map_err(|_| "OpenH264 could not be downloaded. The call stays a voice call.".to_owned())?;
+    let url = library_url(name);
+    let response = ureq::get(&url).timeout(Duration::from_secs(20)).call().map_err(|err| {
+        eprintln!("mediad: OpenH264 download failed: {err}");
+        DOWNLOAD_FAILED.to_owned()
+    })?;
     let mut packed = Vec::new();
     response.into_reader().read_to_end(&mut packed).map_err(|err| err.to_string())?;
     let mut plain = Vec::new();
@@ -511,6 +607,16 @@ pub fn probe_camera() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn openh264_is_fetched_from_cisco() {
+        let name = library_name().unwrap_or("openh264-2.6.0-win64.dll");
+        let url = library_url(name);
+        assert!(url.starts_with("https://ciscobinary.openh264.org/"), "{url}");
+        assert!(url.ends_with(".bz2"), "{url}");
+        assert!(url.contains(name), "{url}");
+        assert!(!url.contains("github.com"), "{url}");
+    }
 
     #[test]
     fn a_picture_fits_inside_the_cap_and_stays_even() {
