@@ -22,10 +22,6 @@ const SETTINGS: &str = "x-apple.systempreferences:com.apple.preference.security?
 /// Dock insets (8 + 8) plus the card's own padding (9 + 9). The name line is this much
 /// narrower than the sidebar, and nothing else sits on it.
 const CARD_INSET: f32 = 34.;
-/// One control, the gap before the next, and Leave. Video adds share and camera.
-const CONTROL: f32 = 40.;
-const CONTROL_GAP: f32 = 4.;
-const LEAVE: f32 = 48.;
 
 fn card() -> Div {
     div()
@@ -46,11 +42,6 @@ fn card() -> Div {
 /// Width left for words inside the call card at a sidebar width.
 fn card_inner(sidebar: f32) -> f32 {
     sidebar - CARD_INSET
-}
-
-/// The control row with `icons` square buttons plus Leave, including the gaps.
-fn controls_row(icons: u32) -> f32 {
-    icons as f32 * CONTROL + LEAVE + icons as f32 * CONTROL_GAP
 }
 
 /// How a 40 x 32 control looks.
@@ -781,8 +772,7 @@ impl Shell {
         let words = if talking { format!("You're muted. Press {} to talk", crate::gui::shortcuts::label("⌘⇧M")) } else { words };
         let counter = if refused.is_some() || notice.is_some() { None } else { self.call_counter(call, cx) };
         let refused = refused.or(notice);
-        // The server name, or the notice that replaces it, gets the whole card. The clock and
-        // "Switch device" sit beside it and wrap under it rather than stealing the line.
+        // Give the server name or notice the full line; status and clock have their own row.
         let place = div()
             .w_full()
             .flex()
@@ -796,12 +786,10 @@ impl Shell {
             .child(
                 div()
                     .flex_1()
-                    .min_w(px(96.))
+                    .min_w_0()
                     .whitespace_normal()
-                    .line_clamp(4)
                     .child(refused.unwrap_or(words)),
             )
-            .children(counter)
             .children(self.call_switch_device(call, live, cx));
         let right: Option<AnyElement> = match (live, direct) {
             (false, _) => None,
@@ -826,7 +814,7 @@ impl Shell {
         let title = subject.title.clone();
         let signal = self.call_signal(call, cx);
         let security = self.call_security(call, Place::Dock, cx);
-        let show_status = signal.is_some() || security.is_some() || right.is_some();
+        let show_status = signal.is_some() || security.is_some() || right.is_some() || counter.is_some();
         div()
             .id("call-title")
             .w_full()
@@ -848,7 +836,6 @@ impl Shell {
                             .flex_1()
                             .min_w_0()
                             .whitespace_normal()
-                            .line_clamp(2)
                             .text_size(px(13.))
                             .line_height(px(18.))
                             .font_weight(FontWeight::SEMIBOLD)
@@ -867,7 +854,8 @@ impl Shell {
                         .gap(px(2.))
                         .children(signal)
                         .children(security)
-                        .children(right),
+                        .children(right)
+                        .children(counter),
                 )
             })
     }
@@ -883,9 +871,9 @@ impl Shell {
             (CallState::Reconnecting, _) => "Reconnecting…".to_owned(),
             // Alone in a direct call: said, and left to me. tinyclient does not hang up for me.
             (_, Some(peer)) if subject.kind == ConversationKind::Direct => {
-                format!("{} left ·", peer.split_whitespace().next().unwrap_or(peer))
+                format!("{} left", peer.split_whitespace().next().unwrap_or(peer))
             }
-            _ => format!("{place} ·"),
+            _ => place.to_owned(),
         };
         let joined = call.state == CallState::Joined;
         // Reconnecting keeps the joined controls, dead; only Leave is live.
@@ -961,8 +949,7 @@ impl Shell {
                 .hover(|style| style.bg(theme::danger_fill()).text_color(theme::on_accent()))
                 .tooltip(tip("Cancel", Some("⌘⇧H")))
         };
-        // Leave stays at the right of whatever row it lands on. Video adds share and camera,
-        // which do not fit the narrowest sidebar, so that row wraps instead of overflowing.
+        // Joined controls share the width equally, including when video adds two buttons.
         let controls = div()
             .w_full()
             .min_h(px(32.))
@@ -971,13 +958,13 @@ impl Shell {
             .flex_wrap()
             .items_center()
             .gap(px(4.))
-            .child(mute)
+            .child(mute.when(in_call(call), |button| button.flex_1().min_w_0()))
             // Deafen is for a call that is up; before that only mute and devices can be preset.
-            .when(in_call(call), |row| row.child(deafen))
-            .children(share)
-            .children(camera)
-            .child(devices)
-            .child(end.ml_auto().on_click(cx.listener(|this, _, _, cx| this.call_leave(cx))));
+            .when(in_call(call), |row| row.child(deafen.flex_1().min_w_0()))
+            .children(share.map(|button| button.flex_1().min_w_0()))
+            .children(camera.map(|button| button.flex_1().min_w_0()))
+            .child(devices.when(in_call(call), |button| button.flex_1().min_w_0()))
+            .child(end.when(in_call(call), |button| button.flex_1().min_w_0()).on_click(cx.listener(|this, _, _, cx| this.call_leave(cx))));
 
         let popover = match menu {
             Some(Menu::Devices) => Some((300., self.call_devices_menu(call, cx).p(px(6.)))),
@@ -1292,10 +1279,6 @@ mod tests {
         // because signal, lock and people sit on a later row.
         let inner = card_inner(crate::gui::layout::SIDEBAR_RANGE.0);
         assert!(inner >= 200., "{inner}");
-        // Mute, deafen, devices and Leave fit on one row.
-        assert!(controls_row(3) <= inner, "voice controls need {}, the card has {inner}", controls_row(3));
-        // Share and camera join them, and that row has to wrap.
-        assert!(controls_row(5) > inner, "video controls need {}, the card has {inner}", controls_row(5));
     }
 
     #[test]
