@@ -843,7 +843,7 @@ impl Pane {
             }
             self.known.insert(file.id.clone(), path.clone());
             if let Some((then, name)) = self.then.remove(&file.id) {
-                draw::open_file(path, &name, then);
+                draw::open_file(path, &name, then, cx);
             }
             self.play_landed(&file.id, cx);
         } else if file.failed.is_some() {
@@ -928,7 +928,7 @@ impl Pane {
         let file = &attachment.file;
         let name = media::disk_name(attachment);
         if let Some(path) = file.path.clone().or_else(|| self.known.get(&file.id).cloned()) {
-            draw::open_file(&path, &name, then);
+            draw::open_file(&path, &name, then, cx);
             return;
         }
         self.then.insert(file.id.clone(), (then, name));

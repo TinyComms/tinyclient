@@ -74,7 +74,13 @@ fn named(path: &str, name: &str) -> std::path::PathBuf {
 /// Opens a cached file under its own name: in Quick Look, or in the system's app for it (a
 /// video in the system's player). Both are processes of their own; a thread waits for them so
 /// nothing of ours blocks, and makes the link off the main thread.
-pub fn open_file(path: &str, name: &str, then: Then) {
+pub fn open_file(path: &str, name: &str, then: Then, cx: &mut gpui::App) {
+    // A phone has no xdg-open: the file goes to GPUI's URL open, on this thread.
+    if super::super::links_through_gpui() {
+        let _ = then;
+        cx.open_url(&format!("file://{}", named(path, name).display()));
+        return;
+    }
     let (path, name) = (path.to_owned(), name.to_owned());
     std::thread::spawn(move || {
         let path = named(&path, &name);

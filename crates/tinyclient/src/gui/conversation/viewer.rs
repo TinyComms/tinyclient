@@ -312,7 +312,10 @@ impl Pane {
         let Some(path) = attachment.file.path else {
             return;
         };
-        if preview {
+        if preview && crate::gui::links_through_gpui() {
+            // A phone has no `xdg-open` or `open -a Preview`: GPUI opens the file's URL here.
+            cx.open_url(&format!("file://{path}"));
+        } else if preview {
             std::thread::spawn(move || {
                 let _ = {
                     #[cfg(target_os = "macos")]
@@ -329,13 +332,17 @@ impl Pane {
                         protocol::launch::no_console(command.args(["/C", "start", "", &path]));
                         command
                     }
+                    // Other targets (phones) take the GPUI branch above; this keeps them compiling.
+                    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+                    {
+                        std::process::Command::new("true")
+                    }
                 }
                 .status();
             });
         } else {
-            open_file(&path, &name, super::Then::QuickLook);
+            open_file(&path, &name, super::Then::QuickLook, cx);
         }
-        let _ = cx;
     }
 
     /// True when the key was the viewer's.

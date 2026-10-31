@@ -9420,6 +9420,7 @@ dependencies = [
  "gpui_platform",
  "image",
  "libc",
+ "log",
  "protocol",
  "serde_json",
  "sha2 0.10.9",

@@ -638,6 +638,19 @@ fn window_bounds(saved: Option<(f32, f32, f32, f32)>, cx: &App) -> Bounds<gpui::
     bounds
 }
 
+/// Whether chatd can run beside the window. True on desktop, where the shell starts and asks
+/// it. False on phones: there is no separate chatd there yet, so the shell runs with no service,
+/// which reads as zero signed-in accounts (`app::watch`). Replace with the in-process core.
+pub(crate) fn mobile_core_available() -> bool {
+    !cfg!(any(target_os = "android", target_os = "ios"))
+}
+
+/// Whether links and files open through GPUI (`cx.open_url`) rather than a desktop helper such
+/// as `xdg-open`. True on phones, where those helpers do not exist.
+pub(crate) fn links_through_gpui() -> bool {
+    cfg!(any(target_os = "android", target_os = "ios"))
+}
+
 pub fn run() {
     #[cfg(feature = "gui-shot")]
     LAUNCHED.get_or_init(std::time::Instant::now);
@@ -695,7 +708,13 @@ pub fn run() {
                 Ok(window) => window,
                 Err(err) => {
                     // No window (no GPU, a headless session): say so and leave, never panic.
-                    eprintln!("tinyclient: the window could not open: {err}");
+                    // Nothing can be drawn without a window, so the record is the only report.
+                    let message = format!("tinyclient: the window could not open: {err}");
+                    log::error!("{message}");
+                    // Desktop has no logger installed, so the terminal gets the line itself. On
+                    // Android stderr goes nowhere and the record above is the report.
+                    #[cfg(not(target_os = "android"))]
+                    eprintln!("{message}");
                     cx.quit();
                     return;
                 }

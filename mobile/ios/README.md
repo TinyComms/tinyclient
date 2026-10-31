@@ -1,8 +1,9 @@
 # tinyclient for iOS — host skeleton
 
 A three-file Swift shell around the Rust static library. Nothing here is a working app yet: the
-pinned GPUI revision has no iOS backend, so the build stops at `gpui_platform` (see
-`docs/mobile-build.md`). What this directory does is make the Xcode target, the plist and the
+pinned Zed GPUI revision (`Cargo.toml`) has no iOS backend, so the build stops at
+`gpui_platform` (see `docs/mobile-build.md`). The gpui-ce migration has not been made; it is
+what would add one. What this directory does is make the Xcode target, the plist and the
 call into Rust reviewable *before* that migration, so it is a configuration change afterwards.
 
 ## Files

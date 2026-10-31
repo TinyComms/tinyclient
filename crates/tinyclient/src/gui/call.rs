@@ -348,11 +348,18 @@ fn handoff_label(network: Network) -> String {
     }
 }
 
-/// Hands a link to the system. Only something with a scheme, never an option.
-pub(in crate::gui) fn open(url: &str) -> Result<(), String> {
+/// Only something with a scheme, never an option.
+fn checked_link(url: &str) -> Result<(), String> {
     if url.starts_with('-') || !url.contains(':') {
         return Err(format!("Not a link: {url}"));
     }
+    Ok(())
+}
+
+/// Hands a link to the system. Only something with a scheme, never an option. Not used on
+/// phones (`links_through_gpui`): there the caller opens it on the UI thread with `cx.open_url`.
+pub(in crate::gui) fn open(url: &str) -> Result<(), String> {
+    checked_link(url)?;
     system_open(url)
 }
 
@@ -721,19 +728,25 @@ impl Shell {
     pub(super) fn call_handoff(&mut self, conversation: Key, cx: &mut Context<Self>) {
         self.call_state.error = None;
         cx.spawn(async move |this, cx| {
+            // Ok(Some(url)): a phone opens it below, on the UI thread, through GPUI.
             let work = async move {
                 match ask(&Request::Handoff { conversation }) {
-                    Ok(Response::Link { url }) => open(&url),
+                    Ok(Response::Link { url }) if super::links_through_gpui() => checked_link(&url).map(|()| Some(url)),
+                    Ok(Response::Link { url }) => open(&url).map(|()| None),
                     Ok(Response::Error { detail, .. }) => Err(detail),
                     Ok(_) => Err(crate::client::OTHER_ANSWER.to_owned()),
                     Err(err) => Err(crate::client::trouble_words(&err)),
                 }
             };
-            let refused = cx.background_executor().spawn(work).await.err();
+            let outcome = cx.background_executor().spawn(work).await;
             let _ = this.update(cx, |this, cx| {
-                if refused.is_some() {
-                    this.call_state.error = refused.clone();
-                    this.refused = refused;
+                match outcome {
+                    Ok(Some(url)) => cx.open_url(&url),
+                    Ok(None) => {}
+                    Err(refused) => {
+                        this.call_state.error = Some(refused.clone());
+                        this.refused = Some(refused);
+                    }
                 }
                 cx.notify();
             });

@@ -169,10 +169,13 @@ The chain is `openssl-sys ← native-tls ← ureq ← tinyclient` (the Wikipedia
 `research_notes/mobile/core-portability-audit.md`: on Android `native-tls` means OpenSSL, not the
 platform store. The fix is rustls + `rustls-platform-verifier`, not a build flag.
 
-Behind that, from reading the pin: `gpui_platform::current_platform()` has arms for macOS,
-Windows, Linux/FreeBSD and wasm only, so an Android build would next fail there — and the pin has
-no `gpui_ios`/`gpui_android` crate at all. No amount of Cargo configuration fixes that; it is the
-gpui-ce / gpui-pre migration.
+Behind that, from reading the pin (`Cargo.toml`: Zed `cb13b37`): `gpui_platform` has arms for
+macOS, Windows, Linux/FreeBSD and wasm only, and the pin has no `gpui_ios`/`gpui_android` crate.
+An Android build would fail there next, and no amount of Cargo configuration fixes that. A
+platform backend exists off the pin: `gpui_ce_mobile` 0.3.0 on crates.io is an Android backend
+for `gpui-ce` 0.3.0. Adopting it is the gpui-ce migration, which this branch has not made. Its
+Java half (`dev.gpui.mobile.GpuiPlatformView`, `GpuiPathPicker`) is not in the crate and is not
+vendored either.
 
 **Not run at all** (so not claimed): a Gradle configuration parse or `assembleDebug`; any APK; any
 `cargo ndk` invocation; anything on macOS; any iOS compile, link, archive or simulator run. There
@@ -226,8 +229,12 @@ this needs a 16 KB emulator image or device.
 
 ## 7. Known gaps
 
-1. **No mobile backend.** The pin has no `gpui_ios`/`gpui_android`; `ios_main`/`android_main`
-   are seams that call `gui::run()`, which calls `gpui_platform::application()`.
+1. **No mobile backend on the pin.** The Zed pin has no `gpui_ios`/`gpui_android`;
+   `ios_main`/`android_main` are seams that call `gui::run()`, which calls
+   `gpui_platform::application()`. `gpui_ce_mobile` 0.3.0 (gpui-ce) is an Android backend that is
+   not adopted yet, and its Java classes must come with it (see "Feature gating" above).
+   Phones run with no chatd (`gui::mobile_core_available()` is false there) and open links and
+   files through GPUI (`gui::links_through_gpui()`); the in-process core replaces the first.
 2. **OpenSSL on Android**, above. Needs rustls before `mobile` can compile past the `gui`
    feature's `ureq` dependency.
 3. **No NDK/SDK/adb here**, so Android stops at the compiler and nothing is packaged.

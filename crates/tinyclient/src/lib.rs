@@ -37,10 +37,10 @@ mod view;
 
 /// Starts the window on iOS.
 ///
-/// Called by the Swift shell. At the pinned GPUI revision there is no iOS platform backend
-/// (`gpui_platform` has `gpui_apple|linux|macos|web|wgpu|windows` only), so this is the seam,
-/// not a working app: the gpui-ce / gpui-pre migration is what makes it link and run. Keep the
-/// body to one call so the migration changes one line.
+/// Called by the Swift shell. The pinned Zed GPUI revision (`Cargo.toml`) has no iOS platform
+/// backend: its `gpui_platform` has `gpui_apple|linux|macos|web|wgpu|windows` arms only, so this
+/// is a seam, not a working app. Moving to gpui-ce (`gpui-ce` 0.3.0 on crates.io) is what would
+/// add one; that migration is not made yet. Keep the body to one call so it changes one line.
 #[cfg(all(feature = "gui", target_os = "ios"))]
 pub fn ios_main() {
     gui::run();
@@ -61,11 +61,65 @@ pub extern "C" fn tinyclient_ios_main() {
 ///
 /// `android_activity` exports `ANativeActivity_onCreate` and calls this on the thread it owns;
 /// `AndroidManifest.xml` points NativeActivity at `libtinyclient.so` (`android.app.lib_name`).
-/// The `AndroidApp` handle is the shell's; the window itself is created by the platform layer,
-/// so it is not used here yet. Same caveat as [`ios_main`]: the pin has no Android backend.
+/// Before the window starts this points `TINYCLIENT_DIR` at the app's internal data directory:
+/// Android has no `HOME`, so `protocol::support_dir` would otherwise put the socket and database
+/// under `/tmp`. The pinned Zed GPUI has no Android backend (see [`ios_main`]), so this is still
+/// not a working app: `gpui_platform::application()` has no Android arm and the build stops there.
 #[cfg(all(feature = "mobile", target_os = "android"))]
 #[no_mangle]
 pub extern "C" fn android_main(app: android_activity::AndroidApp) {
-    let _ = app;
+    android_log::install();
+    match app.internal_data_path() {
+        // Set before any thread of ours starts, so nothing reads the environment concurrently.
+        Some(dir) => std::env::set_var("TINYCLIENT_DIR", dir),
+        None => log::error!("tinyclient: Android gave no internal data path; the data falls back to /tmp"),
+    }
     gui::run();
+}
+
+/// `log` records to logcat. NativeActivity discards stderr, so `eprintln!` is lost on a phone.
+#[cfg(all(feature = "mobile", target_os = "android"))]
+mod android_log {
+    use std::os::raw::{c_char, c_int};
+
+    #[link(name = "log")]
+    extern "C" {
+        fn __android_log_write(prio: c_int, tag: *const c_char, text: *const c_char) -> c_int;
+    }
+
+    struct Logcat;
+
+    static LOGCAT: Logcat = Logcat;
+
+    impl log::Log for Logcat {
+        fn enabled(&self, metadata: &log::Metadata) -> bool {
+            metadata.level() <= log::Level::Info
+        }
+
+        fn log(&self, record: &log::Record) {
+            if !self.enabled(record.metadata()) {
+                return;
+            }
+            // ANDROID_LOG_* priorities: ERROR 6, WARN 5, INFO 4, DEBUG 3, VERBOSE 2.
+            let prio = match record.level() {
+                log::Level::Error => 6,
+                log::Level::Warn => 5,
+                log::Level::Info => 4,
+                log::Level::Debug => 3,
+                log::Level::Trace => 2,
+            };
+            let tag = std::ffi::CString::new("tinyclient").unwrap_or_default();
+            let text = std::ffi::CString::new(record.args().to_string().replace('\0', "")).unwrap_or_default();
+            // SAFETY: both strings are NUL-terminated and live for the call.
+            unsafe { __android_log_write(prio, tag.as_ptr(), text.as_ptr()) };
+        }
+
+        fn flush(&self) {}
+    }
+
+    pub fn install() {
+        if log::set_logger(&LOGCAT).is_ok() {
+            log::set_max_level(log::LevelFilter::Info);
+        }
+    }
 }

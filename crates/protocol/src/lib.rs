@@ -1702,7 +1702,9 @@ pub enum Response {
     },
 }
 
-/// `TINYCLIENT_DIR` moves the socket and database, for tests and the demo seed.
+/// `TINYCLIENT_DIR` moves the socket and database, for tests and the demo seed. The Android shell
+/// sets it to the app's internal data directory before the window starts, because Android has no
+/// `HOME` and the fallback below would land in `/tmp`.
 pub fn support_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("TINYCLIENT_DIR") {
         return PathBuf::from(dir);
