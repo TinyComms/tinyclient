@@ -4,10 +4,7 @@ states that cannot share a screen). Requirements: `product/03-message-content.md
 px at 1x. Token names are from `theme.rs`; new ones are listed at the end.
 
 ## Decisions
-- **No bubbles, for anyone.** Every message, mine included, is a left-aligned row: avatar, name, time, body. Three of the four networks are
-  channel-first, and a 2,000-character post, a code block, a 400 px image grid and a bot card all fit a full-width column and fight a bubble. A bubble
-  layout would also need a second layout for channels, which breaks "one visual system". My own messages are marked by the name "You" and nothing
-  else.
+- **No bubbles, for anyone.** Every message, mine included, is a left-aligned row: avatar, name, time, body. Slack, Discord, Teams, and a Tiny server are channel-first. Telegram, Signal, and Messages are chat-first. A 2,000-character post, a code block, a 400 px image grid and a bot card all fit a full-width column and fight a bubble. A bubble layout would also need a second layout for channels, which breaks "one visual system". My own messages are marked by the name "You" and nothing else.
 - **One density.** No compact mode. Rows are measured by a virtual list; a second set of metrics doubles every state here for a setting few people
   touch. The thread pane uses one fixed dense variant because it is 380 px wide, not because the user chose it.
 - **Names are `text`.** No Discord role colors: the only brand or per-network color is the icon.
@@ -98,7 +95,7 @@ Stack under the body: 5 px above the first, 4 px between. `W` = min(400, body wi
   show their static thumbnail.
 
 ## 4. Link cards
-Only from the network's own preview data. At most **three** cards per message; further links stay as text. Card: min(440, body width) wide, radius 10,
+Only from the network's own preview data. A Wikipedia link that arrived with no preview is the exception: the window asks that language's Wikipedia REST summary and shows it as a card with the site name Wikipedia. No other website is fetched for a missing preview. At most **three** cards per message; further links stay as text. Card: min(440, body width) wide, radius 10,
 `raised`, 1 px `hairline`, padding 10 / 12. Site 11.5 `text_faint`; title 14 semibold, 2 lines; description 13 / 18 `text_soft`, 2 lines.
 - **Compact** (default): text left, 72 x 72 thumbnail right, radius 6, cover.
 - **Large**: only the first card, only when the preview image is at least 400 wide with aspect 1.3 or wider. Image under the text at 400 x 210 max,
@@ -167,9 +164,8 @@ One list, top-aligned: the root message in full as item 0 (it scrolls away; a pi
 - **Waiting (offline, first 60 s):** as pending, plus an 18 px status line under the body: clock glyph 13 and "Waiting for Slack…" 12 in `warning`.
 - **Failed:** body back to full opacity, `danger` row bar, status line under the body: alert glyph, "Not sent · Slow mode: 8 s" 12 `danger`, then
   "Retry" (semibold `link`) and "Delete" (`text_soft`).
-- **Sent / delivered / read (every network):** on my newest message only, a 12 px check (`text_faint`, sent) or double check (`text_faint`,
-  delivered; `accent`, read) after the time; on a grouped row without a header, at the row's right edge, on the first line. Discord and Slack
-  stop at sent (`06-live-signals.md` §4).
+- **Sent / read (Telegram and Teams direct chats):** on my newest message only, a 14 px check (`text_faint`, sent) or double check (`accent`, read) at
+  the row's right edge, on the first line.
 
 ## New tokens
 `row_hover` ffffff08 · `mention_row` 7f8cff14 · `hairline_strong` ffffff24 · `code_bg` 0e0f14 · `code_inline` ffffff14 · `media_fill` 1d1f27 (opaque)

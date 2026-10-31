@@ -13,7 +13,7 @@ already parses it, **[U]** from memory of the official client, confirm on a live
 | F2 | discord | Every server row has a disclosure chevron that expands its whole tree inline, so home is a tree of trees and there are two ways to open a server. |
 | F3 | discord-many | Folders are thrown away: `ready.rs` flattens `guild_folders` into one order. 50 servers are one undivided column. |
 | F4 | discord | A DM row is a name and a 20 px avatar: no status, no activity, no "in a call". A group DM is a generic icon with no members. |
-| F5 | discord, space | Nobody in voice is visible anywhere until I open a server and scroll to the bottom of its tree, the one thing that pulls him into calls. |
+| F5 | discord, space | Home shows friends who are in a voice channel or a DM call under In voice. A native voice channel joins from that list. |
 | F6 | discord | No Friends entry and no request count on the Discord home; friends are only in the cross-network People view. |
 | F7 | people | The status line says "Online" under a green dot under an "Online — 21" header: the same fact three times. Discord friends and Slack colleagues are interleaved. |
 | F8 | space | All 40 channels have equal weight; read threads and a thread titled "Deleted message" are listed; empty voice channels look like live ones; muted rows carry a bell glyph on every row (noise: dimming already says it). |

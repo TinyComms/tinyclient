@@ -9,7 +9,7 @@ departs from it, this list says which wins.
 | Unread count | Outlined, never filled (04 over 01's grey fill). The filled pill means a mention and nothing else. |
 | Inbox and People row height | Mixed heights with day headers: GPUI `list`, not `uniform_list` (04). The Discord home likewise (02). |
 | Slack DMs | One-line 28 rows inside the user's sections, as Slack draws them (02 over 01). Discord DMs are 48. |
-| Network marks | Monochrome in mixed lists, only with two or more networks signed in; none on pinned Spaces on the rail (04). New `*-mono.svg` assets. |
+| Network marks | In a mixed list, only while two or more networks are signed in. None on pinned Spaces on the rail (04). The color SVG is tinted; Telegram uses the send glyph (`icons/send-horizontal.svg`) because tinting its logo hides the plane. `networks/*-mono.svg` is not in the tree. |
 | Pane width | One width for every kind, 300, draggable 260–420 (07). |
 | Composer focus | No accent border: caret plus a stronger neutral border (07 over 01). |
 | Jumped-to message | Keeps its highlight until left or Escape; nothing fades (07). |
@@ -18,6 +18,6 @@ departs from it, this list says which wins.
 | Busy | A solid `danger` disc, distinct from do-not-disturb's bar (03). |
 | Red | Also for Teams' urgent mark and Telegram's Scam and Fake tags (03). |
 | Draft label | Plain text weight, not accent (03): accent stays "for you" and "will act". |
-| GIF playback | Only the hovered or keyboard-selected GIF plays, one at a time, never under Reduce Motion (06). |
+| GIF playback | Settings › Messages › Play GIFs and animated stickers: Automatically (default), On hover, or Never. Reduce Motion turns Automatically into on-hover. Never plays a picture only when it is opened (06). |
 | Upload cancel | Escape cancels only on a focused pending row (06): Escape never clears or discards typed work. |
-| Option-Return | Silent send on Discord and Telegram; a new line on Slack and Teams (06). |
+| Option-Return | Silent send where the account reports `Capabilities.silent` (Discord and Telegram). A new line on Slack, Teams, Signal, Messages, and Tiny server (06). |

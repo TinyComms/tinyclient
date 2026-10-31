@@ -1,9 +1,12 @@
 # Proposal: Anonymity transport (Tor, I2P) and overlay end-to-end encryption
 
 Status: **proposal**. Per [CONTRIBUTING.md](../../CONTRIBUTING.md), a choice the product documents leave
-open is settled by agreement before the code. This document is the agreement to settle. Nothing here
-is built; every claim about the world outside the repository is marked *verified* (checked October
-2026, source linked at the bottom) or *unverified* (known, not re-checked).
+open is settled by agreement before the code. This document is the agreement to settle. Nothing in this
+document is built: not the Tor or I2P dialer, not overlay MLS for text, and not a direct onion or I2P
+network. Call encryption is separate and already in the tree (`mediad`: Discord voice is DAVE, audio; a
+Tiny room seals Opus and H.264 when the server offers it). That does not implement this proposal. Claims
+about the world outside the repository stay marked *verified* (checked October 2026, source linked at the
+bottom) or *unverified* (known, not re-checked).
 
 ## 0. Summary
 
@@ -13,11 +16,11 @@ Three features, one foundation:
    account's traffic (messages, media, files, transfers) can go through Tor or an I2P router.
 2. **Overlay E2E** — MLS (RFC 9420, OpenMLS) between tinyclient users, riding as ciphertext through
    networks that have no end-to-end encryption of their own (Discord, Slack, Teams, Telegram cloud
-   chats, Messages), so nobody but the participants — not Discord, not Slack, not Microsoft — can
-   read or alter a message.
-3. **Direct transport** — a seventh "network": tinyclient talking to tinyclient directly over a Tor
-   onion service or an I2P destination. No third party carries the bytes at all; messages and file
-   transfers go peer to peer, end to end encrypted, behind an address that is itself the identity.
+   chats, Messages, and Tiny server text), so nobody but the participants — not Discord, not Slack,
+   not Microsoft, not that Tiny server — can read or alter a message.
+3. **Direct transport** — an eighth network: tinyclient talking to tinyclient over a Tor onion service
+   or an I2P destination. No third party carries the bytes. This network is not in `Network::ALL`.
+   The seven that are there stay Discord, Slack, Telegram, Teams, Signal, Messages, and Tiny server.
 
 The foundation is one module: a dialer that every adapter asks for its socket. Tor and I2P are two
 configurations of it, MLS sits on top of any transport, and the direct adapter is just another pair
@@ -36,14 +39,14 @@ weigh. That is why [`07-budgets-and-risk.md`](../product/07-budgets-and-risk.md)
 
 ## 1. Where the project stands (verified in this repository)
 
-- Release v0.2.5, branch `docs/windows-and-voice` (PR #59) is open against `main`; this proposal is
-  written from that checkout.
+- Read against `main` at `f97935e` (release 0.2.36). The v0.2.5 / `docs/windows-and-voice` / PR #59
+  checkout this section was written from is history.
 - **Proxy today: none, on purpose.** §5 rule 10 of the budgets document ("No proxying, and save
   Slack's `d` cookie when the server reissues it") protects accounts from IP/ASN anomalies.
   [`09-settings.md`](../product/09-settings.md) lists "Proxy (SOCKS5 for Telegram)" under **Later**,
   waits on nothing but the rule. The settings window answers a search for "proxy" with the honest
-  line "tinyclient has no proxy setting yet." (`tinyclient/src/gui/settings/rows.rs`,
-  `protocol/src/settings.rs` tests use `proxy` as the example of an unknown key.)
+  line "tinyclient has no proxy setting yet." (`crates/tinyclient/src/gui/settings/rows.rs`,
+  `crates/protocol/src/settings.rs` tests use `proxy` as the example of an unknown key.)
 - **No plugin system was ever planned.** The architecture has no adapter trait on purpose; an
   adapter is a module under `crates/chatd/src/adapters/` that exports three functions and speaks
   `Command`/`Context` ([architecture.md](../architecture.md), CONTRIBUTING). The ownership table's
@@ -51,14 +54,16 @@ weigh. That is why [`07-budgets-and-risk.md`](../product/07-budgets-and-risk.md)
   docs is a link to an unrelated third-party project (`product/06-calls.md`). If user-installable
   network plugins are ever wanted, that is a new decision with an ABI to design; this proposal does
   not need one — everything below is ordinary adapter work in-tree.
-- **The network layer is two functions and a struct.** `chatd/src/adapters/net.rs` builds one
-  `ureq::Agent` (system TLS) and one `Socket` (tungstenite, system TLS). `chatd/src/blobs/fetch.rs`
-  has its own agent and its host allow-list. Every HTTP request of Discord, Slack, Teams and
-  Messages goes through one of those two agents; both are built in one place each. That is the whole
-  integration surface for transport anonymity.
+- **The network layer is two functions and a struct.** `crates/chatd/src/adapters/net.rs` builds one
+  `ureq::Agent` (system TLS) and one `Socket` (tungstenite, system TLS). `crates/chatd/src/blobs/fetch.rs`
+  has its own agent and its host allow-list. Discord, Slack, Teams, and Messages HTTP in this tree go
+  through `net.rs` `agent()` or `blobs/fetch.rs` `agent()`. Tiny does not: `crates/chatd/src/adapters/tiny.rs`
+  builds its own `ureq::Agent`. A tunnel has to wrap that agent too. Signal's `reqwest` client is the
+  separate case in the Signal bullet.
 - **Telegram** runs on grammers; `adapters/telegram/real.rs` already constructs
-  `ConnectionParams`, which has a `proxy_url` field behind grammers' `proxy` feature (socks5,
-  *verified*).
+  `ConnectionParams`, which has a `proxy_url` field behind grammers' `proxy` feature (socks5).
+  That is a lead, not a shipped proxy. `crates/chatd/Cargo.toml` pins `grammers-client` 0.10 with
+  `default-features = false` and does not enable a `proxy` feature. This checkout does not set a proxy.
 - **Signal** runs on presage/libsignal-service; its `PushService` builds an internal
   `reqwest::Client` and exposes no proxy knob (*verified*; a small fork or an upstream patch is
   needed, §3.2).
@@ -110,6 +115,7 @@ supporting `socks4/4a/5`, and its SOCKS connector resolves at the proxy, not loc
 | Consumer | Today | Change |
 | --- | --- | --- |
 | `net::agent()` (Discord, Slack, Teams, Messages REST) | `ureq::Agent` | `.proxy(...)` on the config builder; one agent per tunnel instead of one global. |
+| `adapters/tiny.rs` `agent()` | `ureq::Agent` (native TLS, platform roots) | The same proxy wrap. A dialer that only wraps `net.rs` and `blobs/fetch.rs` misses Tiny. |
 | `blobs/fetch.rs::agent()` (all media) | `ureq::Agent` | Same; the allow-list in `Hosts::trust` stays in force — the tunnel changes *how* a host is reached, never *which* hosts. |
 | `net::Socket::connect` (Discord gateway, Slack socket mode) | `tungstenite::connect` | SOCKS5 CONNECT → TLS wrap (native-tls, same as today) → tungstenite handshake over the wrapped stream. |
 | Telegram (`grammers`) | `ConnectionParams` | Enable the `proxy` feature; set `proxy_url` from the account's tunnel. |
@@ -184,7 +190,7 @@ as it passes `--at` today.
 ### 3.4 Settings: the per-service control model
 
 The user decides per service, not globally. The settings store already has global and per-account
-scopes with validity-checked keys (verified: `protocol/src/settings.rs`), so the model is:
+scopes with validity-checked keys (verified: `crates/protocol/src/settings.rs`), so the model is:
 
 | Scope | Key | Values | Meaning |
 | --- | --- | --- | --- |
@@ -268,12 +274,11 @@ Presets in the UI name these honestly: `tor`, `i2p`, and one free-form `socks5:/
 | --- | --- | --- | --- |
 | Signal | E2E (libsignal, PQXDH) | E2E | E2E |
 | Telegram | cloud (TLS to Telegram) | cloud | cloud; secret chats E2E but device-bound and weakly supported in third-party libraries |
-| Discord | server-side | server-side; **voice is E2E (DAVE)** | server-side |
+| Discord | server-side | server-side; **voice is E2E (DAVE, audio)** | server-side |
 | Slack, Teams, Messages | server-side (Messages: phone relay) | server-side | server-side |
+| Tiny server | server-side (that server can read the text) | server-side | server-side; a room call seals Opus and H.264 when the server offers `e2ee_calls` |
 
-So the gap is real: on four of six networks, the network can read everything. The overlay closes
-it without touching the networks at all — the ciphertext is just message content as far as they
-are concerned.
+Servers can read text on Discord, Slack, Teams, Messages, Telegram cloud chats, and Tiny. Signal text is already end-to-end. Discord voice (DAVE, audio) and Tiny room calls are already end-to-end for the media they seal. The overlay in this proposal would cover the readable text. It is not built. It would not touch the networks: the ciphertext would be ordinary message content as far as they are concerned. Teams stays out of the Tor dialer by policy. That policy is not a claim that Teams text is encrypted.
 
 ### 4.2 The protocol: MLS, not a hand-rolled ratchet
 
@@ -296,8 +301,7 @@ Why MLS over reusing libsignal for the overlay:
 - **libsignal stays in the tree for Signal** (and mediad's DAVE), so we are not adding a second
   implementation of the *same* protocol — we are adding the protocol that fits the overlay's shape.
 
-Cost, honestly: OpenMLS is a new dependency (pure Rust; the binary grows — measure against §1 of
-the budgets document before merging, feature-gate as `e2e` until measured), and MLS group state
+Cost, honestly: `mediad` already depends on OpenMLS 0.8.1 because `davey` 0.1.5 does, for Discord DAVE and Tiny call encryption. An overlay that wants OpenMLS 0.9.0 (the August 2026 line in the audit note above) is a second version, or an upgrade `davey` has to accept. It is not a new crate. Measure the binary either way. Feature-gate the overlay until that measurement is done. MLS group state
 (ratchet trees, secrets) is more state than a DM ratchet. The state is sealed on disk like Signal's
 vault.
 
@@ -312,6 +316,10 @@ markup mangling. Two carriers, chosen per message at send time:
 2. **Attachment** for everything else — MLS application messages beyond the inline budget, and
    every file, image or voice note sent under the overlay (§4.5). Binary blob, no mangling, no
    fragmentation, no size games; the networks' existing upload path (SendWith) is reused as is.
+   Tiny is the exception already in the client: when the server advertises `file_scan`, the composer
+   holds Send until the scan settles ("Scanning that file before it sends."), and a server that
+   disallows archives refuses them in the client. Reusing SendWith on Tiny has to include that hold.
+   This does not build the overlay.
 
 The **protocol addition is all optional fields**, per the freeze rules:
 
@@ -377,8 +385,9 @@ unreadable.
 ### 4.6 At rest, and what chatd may keep
 
 - Sealed (keychain key, AES-256-GCM-SIV): MLS group state, identity keys, the plaintext message
-  cache of encrypted conversations. The plaintext cache follows the same retention caps (2,000
-  messages, 90 days) as everything else, and dies with sign-out.
+  cache of encrypted conversations. The plaintext cache follows the same retention as everything else:
+  the newest 2,000 messages per conversation, and `keep_days` (7, 30, or 90; the default is 90). The
+  file-cache size is a separate setting. The cache dies with sign-out.
 - Unsealed: ciphertexts in `chat.sqlite` (they are, from chatd's chair, ordinary message bodies),
   encrypted media in the media cache until rendered — both already covered by the disk-encryption
   footnote in the README, unchanged.
@@ -415,7 +424,7 @@ visible line.
 
 ## 5. Direct transport: tinyclient ↔ tinyclient over onion/I2P
 
-A seventh network, `direct`, for conversations that never touch a company's servers at all.
+An eighth network, `direct`, for conversations that never touch a company's servers at all. It is not in `Network::ALL`. The seven there stay Discord, Slack, Telegram, Teams, Signal, Messages, and Tiny server.
 
 - **Address = identity.** At first run of a direct account, chatd generates one Ed25519 identity
   (the MLS credential, §4.4) and one receive address: a Tor onion service v3 and/or an I2P
@@ -454,13 +463,15 @@ dependency lines added; frozen files touched only through their documented seams
 | --- | --- |
 | `crates/chatd/src/tunnel/*` | The dialer, the SOCKS5 handshake, the listener, per-account state machine (`off → connecting → on → unreachable`), reported through `Context::` notes as account `detail`. |
 | `crates/chatd/src/e2e/*` | MLS session lifecycle, envelope encode/decode, sealed state file, safety numbers, offer/commit handling behind `Command::Send`/`SendWith`. |
-| `crates/chatd/src/adapters/direct.rs` (+ dir) | The seventh adapter, speaking to `tunnel::serve` and the MLS layer; the demo gets a `direct` variant so the UI is testable without a network. |
+| `crates/chatd/src/adapters/direct.rs` (+ dir) | The eighth adapter, speaking to `tunnel::serve` and the MLS layer; the demo gets a `direct` variant so the UI is testable without a network. `direct` is not in `Network::ALL`. |
 | `crates/protocol` | Optional fields only: `Message.e2e`, `Conversation.e2e`, `Capabilities.e2e`, tunnel state in `AccountStatus`, `Settings` keys' documentation. Older shells read every frame unchanged. |
 | `crates/login` | Proxy args per platform (§3.3). |
-| `crates/chatd/src/adapters/net.rs`, `blobs/fetch.rs` | The two agents and the websocket connect gain the dialer — the seams the freeze rules call extension points; a `// CONTRACT:` note where integrator agreement is needed. |
+| `crates/chatd/src/adapters/net.rs`, `blobs/fetch.rs`, `tiny.rs` | Those agents and the websocket connect gain the dialer. Tiny builds its own `ureq::Agent` and has to be wrapped too. These are the seams the freeze rules call extension points; a `// CONTRACT:` note where integrator agreement is needed. |
 
 Dependencies added, all optional-feature-gated: `socks` (already in tree via ureq when enabled),
-OpenMLS + its provider (pure Rust), `yosemite` (I2P SAMv3, slice S8), optionally arti (S9).
+`yosemite` (I2P SAMv3, slice S8), optionally arti (S9). OpenMLS is already a `mediad` dependency at
+0.8.1 for calls. An overlay on 0.9.0 is a second version, or an upgrade `davey` has to accept, not a
+new crate.
 **No async runtime enters chatd** beyond the one tokio thread grammers already owns; arti, if ever,
 gets its own thread like Telegram has.
 
@@ -484,12 +495,12 @@ Slices, each shippable alone, smallest first. Every slice updates the docs it ma
 | # | Slice | Ships when |
 | --- | --- | --- |
 | S1 | Tunnel crate + settings keys + **Telegram** over SOCKS5 (grammers `proxy` feature) | A Telegram account with `tunnel: socks5://…` makes zero non-tunnel connections (verified by the SOCKS fake + connection accounting in tests). Rule 10 amendment merged. |
-| S2 | Tunnel under `net.rs` + `blobs/fetch.rs` + websocket connect; **Discord and Slack** opt-in with the risk row from §3.2 | Same proof for Discord REST/gateway/media and Slack; the per-account state machine shows in the rail. |
+| S2 | Tunnel under `net.rs` + `blobs/fetch.rs` + `tiny.rs` `agent()` + websocket connect; **Discord and Slack** opt-in with the risk row from §3.2 | Same proof for Discord REST/gateway/media and Slack, and for Tiny's own agent; the per-account state machine shows in the rail. |
 | S3 | **Signal**: first prove the environment-variable path presage likely already honors, then make it the explicit per-account key (upstream patch preferred, pinned fork accepted) | The Signal session — attachments included — is tunneled because the row in Settings says so, not because an environment variable leaked in. |
 | S4 | Sign-in webviews: Windows args, Linux resolver, macOS warning | Sign-in traffic demonstrably traverses the tunnel on Windows and Linux; macOS shows the honest notice. |
 | S5 | **E2E DMs**: OpenMLS, envelope inline carrier, offer/commit, safety number display, `e2e` protocol fields | Two tinyclients on one Discord DM exchange messages Discord cannot read, including out-of-order redelivery; `cargo test --workspace` passes with `e2e` off (default). |
 | S6 | **E2E groups** + attachment carrier (files/images/voice through §4.5) | A three-member Discord group encrypted end to end; a 100 MB file round-trips encrypted. |
-| S7 | **Direct over onion**: listener, seventh adapter, queued delivery, resumable transfers | Two fresh installs exchange messages and a file with no third-party server in the path (tcpdump in tests proves it). |
+| S7 | **Direct over onion**: listener, eighth adapter, queued delivery, resumable transfers | Two fresh installs exchange messages and a file with no third-party server in the path (tcpdump in tests proves it). `direct` stays out of `Network::ALL` until that slice. |
 | S8 | **I2P** listener (yosemite/SAMv3) and i2pd SOCKS preset | Same proof with an i2pd router in CI-optional tests. |
 | S9 | Optional `tor-embedded` (arti) feature | Only if demand shows; budgets re-measured; arti's exit-on-obsolete-consensus behaviour contained in its own thread. |
 

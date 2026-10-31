@@ -3,46 +3,19 @@
 Typing, read state, counts, notifications, send state, connection state. "Unverified" marks a
 protocol detail taken from memory or a single third-party source, not checked against a live session.
 
-## Where we are (from the code)
+## Where the code is (main, 0.2.35)
 
-- `Conversation.unread` is one number that mixes two things: both adapters store
-  `max(mention_count, has_unreads as 1)` (`discord.rs:274`, `slack.rs:245`). No mention flag, no mute flag.
-- Mute settings are never read. Discord `READY.user_guild_settings` is skipped while parsing, and
-  `mention_everyone` always counts as a mention (`discord.rs:319`). Slack prefs are not fetched.
-- The shell re-sends `Open` for the selected conversation on every change (`gui/mod.rs:84,142`) and
-  `Open` marks read. So a message is marked read on the network while the window is in the
-  background or hidden. The phone then stays silent for a message I never saw. This is a bug today.
-- Read state made on another device never comes back: `MESSAGE_ACK` (Discord) and the `*_marked`
-  events (Slack) are ignored, so counts only correct themselves on reconnect.
-- The Slack loop handles only `type == "message"`; Discord handles `READY`, `MESSAGE_CREATE`,
-  `CHANNEL_CREATE`. All typing events are dropped. Discord identify sends no `capabilities`.
-- `Send` blocks up to 30 s and the composer just holds the draft. No pending or failed row.
-- `Link` has `SignedOut | Offline | Connected`. A session the network revoked becomes `SignedOut`
-  and its keychain entry is deleted (`adapters/mod.rs`), so it looks the same as never signed in.
-- There is no app bundle and no `Info.plist`. Everything runs as bare `cargo` binaries.
+- A row carries `mentions`, `unread`, and `muted` separately. A channel with unread and no mention is a dot. A mention is a number. Muted draws dim and does not notify.
+- Read is `MarkRead`, and only when `may_mark_read` is true: the window is active, the conversation is open, and the message is on screen. Opening a conversation does not mark it read. A screenshot build never marks read.
+- `Link::Expired` is not `SignedOut`. The cache stays readable. Send is refused until the person signs in again.
+- Send returns immediately with `SendState::Pending` and a `client_id`. Failure is `Failed { reason }` with retry. If the network is down, the row says "Waiting for {network}…" and is given up after 60 seconds. It is not sent hours later on its own.
+- Notifications are posted by chatd through the `notifier` crate, including while the window is closed: WinRT toasts on Windows, `UNUserNotificationCenter` inside the macOS bundle, and `org.freedesktop.Notifications` on Linux. A bare `osascript` fallback is not the design. Counts and the badge follow the notification settings in `09-settings.md`.
+- Typing for the open conversation is drawn. Whether this client sends typing is Settings › Privacy, per account. Discord defaults off. Telegram cannot be turned off (the terms). Signal and Messages say the phone decides.
+- Discord `VIEW_CHANNEL` is computed. Mute and unread follow the visible tree.
 
-## Decision: who posts notifications
+The story tables below are the checks for that behavior. They are not a backlog.
 
-**chatd decides, a bundled identity posts.** Only chatd is always running and only chatd knows the
-mute rules, so the "should this notify" decision lives there and has tests. The posting API decides
-packaging:
-
-| API | Works from a bare binary | What you get |
-| --- | --- | --- |
-| `UNUserNotificationCenter` | No. Aborts with `bundleProxyForCurrentProcess is nil`. Needs a `.app` with a bundle id; an ad-hoc signature is reported to be enough (unverified). | Permission prompt, grouping (`threadIdentifier`), inline reply (`UNTextInputNotificationAction`), sounds, badge, Focus handled by the system. |
-| `osascript -e 'display notification'` | Yes | Banner attributed to Script Editor, click opens Script Editor, no reply, no grouping. Dev fallback only. |
-| `NSUserNotification` | Historically yes | Deprecated since macOS 11. Do not build on it. |
-| `CFUserNotification` | Yes | A modal alert, not a banner. Wrong tool. |
-
-So tinyclient ships as `tinyclient.app` (bundle id, `Info.plist`, signed). chatd lives at
-`tinyclient.app/Contents/MacOS/chatd` so its main bundle resolves to the app, and it posts with
-`UNUserNotificationCenter` directly. The 65 MB shell does not have to be running.
-**Spike before committing (unverified):** (a) a second executable in `Contents/MacOS` gets the
-app's notification permission; (b) it still does when started by launchd at login (Apple DTS says
-agents outside an app bundle cannot get the permission prompt); (c) which process receives the click
-when chatd is running and the shell is not. Fallback if (a) or (b) fails: a tiny `LSUIElement`
-helper app that chatd starts to post and that exits when the notification is dismissed.
-Time-sensitive delivery (breaks through Focus) needs an entitlement and a provisioning profile: cut.
+The macOS spike (a second binary in `Contents/MacOS`, launchd, who receives the click) is history. Do not treat it as work left to do. Ring delivery, in-call cues, and what a call does with media are `06-calls.md`. The settings that choose them are `09-settings.md`.
 
 ## Stories
 
@@ -52,7 +25,7 @@ Time-sensitive delivery (breaks through Focus) needs an entitlement and a provis
 | T1 | P0 | I see "Ana is typing…" under the messages of the open conversation, within a second, with names for up to two people and "Several people are typing" past that. | Fake adapter emits typing; a new `typing` field for that conversation lists the user; shell shows the line. |
 | T2 | P0 | The line goes away when their message arrives, when they stop, or after the network's timeout (table below), never later. | Emit typing, send nothing: gone at timeout. Emit typing then a message from the same user: gone at once. |
 | T3 | P1 | In the list, a direct message row shows "typing…" in place of its preview. Channels do not (too noisy). | Typing in a DM changes that row only; typing in a channel changes no row. |
-| T4 | P1 | Others see me typing while I type. I can turn this off per network in settings. Default: on for Telegram, Slack and Teams, **off for Discord** (see question 1). | With it on, the adapter sends one typing signal per interval while the draft changes, and none once the draft is empty or sent. With it off, zero. |
+| T4 | P1 | Others see me typing while I type. I can turn this off per account in Settings › Privacy. Discord defaults off. Telegram cannot be turned off. Signal and Messages say the phone decides. | With it on, the adapter sends one typing signal per interval while the draft changes, and none once the draft is empty or sent. With it off, zero. |
 | T5 | P2 | In a thread, typing shows only in that thread. | Depends on threads (area 02). |
 
 Typing is not stored and must not bump `version` in a way that makes the shell refetch the list.
@@ -64,7 +37,7 @@ Typing is not stored and must not bump `version` in a way that makes the shell r
 | R2 | P0 | If I read it on my phone, the count here clears within seconds, and its notification is withdrawn. | Inject the network's "read elsewhere" event; `list` shows 0; the delivered notification is removed. |
 | R3 | P0 | Scrolled up in an open conversation, new messages show a "3 new" pill and a divider at the first unread; reading to the bottom marks read. | Count stays until the bottom is reached. |
 | R4 | P1 | I can mark a conversation unread, and mark everything read for a network (Shift-Esc). | Ack to an older message id; the phone shows it unread. |
-| R5 | P1 | On Telegram and Teams, my sent messages show sent and read marks, in direct chats. | TDLib `updateChatReadOutbox` / Teams horizon moves the mark. |
+| R5 | P1 | On Telegram and Teams, my sent messages show sent and read marks, in direct chats. | The Telegram read-outbox update / Teams horizon moves the mark. Telegram here is grammers. |
 | R6 | P2 | "Don't send read receipts" on Telegram and Teams. Honest label: the chat also stays unread on my other devices, because on Telegram the read position and the receipt are the same call. | With it on, no `viewMessages` / horizon PUT is sent. |
 
 ### Counts
@@ -105,42 +78,30 @@ Typing is not stored and must not bump `version` in a way that makes the shell r
 | --- | --- | --- | --- |
 | K1 | P0 | When one network drops, its rail dot goes hollow and, after 5 s (no flicker for a blip), the open conversation shows one line: "Discord is reconnecting…". Other networks are unaffected. | Kill one socket: only that network changes. |
 | K2 | P0 | On reconnect the open conversation fills the gap, counts come from the network again, stale typing lines are gone, and nothing replays as a notification. | Messages sent during the gap appear in order. |
-| K3 | P0 | A session the network ended is its own state: "Slack signed you out. Sign in again." with the button, my cached messages still readable, and one notification if the shell is closed. | New `Link::Expired` distinct from `SignedOut`; Discord close 4004 / HTTP 401, Slack `invalid_auth` / `token_revoked`. |
-| K4 | P1 | With the machine offline, one line says "No internet connection" instead of four network errors, and retry is immediate when the network path returns. | Path monitor, not only backoff (today up to 60 s). |
+| K3 | P0 | A session the network ended is its own state: "Slack signed you out. Sign in again." with the button, my cached messages still readable, and one notification if the shell is closed. | `Link::Expired` distinct from `SignedOut`; Discord close 4004 / HTTP 401, Slack `invalid_auth` / `token_revoked`. |
+| K4 | P1 | With the machine offline, one line says "No internet connection" instead of one error per network, and retry is immediate when the network path returns. | Path monitor, not only backoff. |
 | K5 | P1 | Waking from sleep reconnects in under 3 s. | Wake notification resets the backoff. |
 
 ## What each network gives a user session
 
-| | Discord | Slack | Telegram (TDLib) | Teams |
+| | Discord | Slack | Telegram (schema; grammers in this client) | Teams |
 | --- | --- | --- | --- | --- |
 | Typing in | `TYPING_START` `{channel_id,user_id,timestamp}`. Always for DMs. Server channels only after subscribing to that guild with `typing: true` (op 14 / 37); subscribe for the open channel only. | `user_typing` `{channel,user}` on the socket we already hold. | `updateChatAction` (`chatActionTyping`, `chatActionCancel`). | Message with `messagetype: Control/Typing` / `Control/ClearTyping` on the event stream. |
-| Expiry | 10 s (official client) | ~5 s (unverified) | ~5 s; TDLib sends the cancel | ~8 s (unverified) |
+| Expiry | 10 s (official client) | ~5 s (unverified) | ~5 s; the session sends the cancel | ~8 s (unverified) |
 | Typing out | `POST /channels/{id}/typing` → 204, repeat every ~8 s (interval unverified) | `{"id":n,"type":"typing","channel":…}` on the socket, at most one per 3 s (documented for RTM; unverified on the web-client socket) | `sendChatAction`, every 5 s | `POST …/conversations/{id}/messages` with `Control/Typing` |
 | Mark read | `POST /channels/{c}/messages/{m}/ack` (built) | `conversations.mark` (built) | `viewMessages` | `PUT …/conversations/{id}/properties?name=consumptionhorizon`, body `"{id};{ms};{clientId}"` |
 | Read elsewhere | `MESSAGE_ACK` (fields unverified) | `channel_marked`, `im_marked`, `group_marked`, `mpim_marked` (unverified on this socket) | `updateChatReadInbox` | horizon in conversation properties / thread update (unverified) |
 | Receipts others see | None | None | Yes, always, in the protocol. Only the read *time* can be hidden (`readDatePrivacySettings`). | Yes, chats up to 20 people; user and tenant setting. Whether the server enforces "off" is unverified. |
 | Their receipts | None | None | `updateChatReadOutbox` | `…/threads/{id}/consumptionhorizons` (unverified) |
 | Counts | `READY.read_state` (`mention_count`, `last_message_id`); unread = channel `last_message_id` newer | `client.counts` (`has_unreads`, `mention_count`) | `chat.unread_count`, `unread_mention_count` | Computed from horizon vs last message (unverified) |
-| Mute source | `READY.user_guild_settings`: `muted`, `mute_config.end_time`, `suppress_everyone`, `suppress_roles`, `message_notifications`, `channel_overrides[]`; `guild_id: null` is DMs. Update: `USER_GUILD_SETTINGS_UPDATE`. Plus the guild default level. | Prefs `muted_channels`, `all_notifications_prefs` via `users.prefs.get`; `pref_change` event; `dnd.info`, `dnd_updated_user` (names unverified) | `chatNotificationSettings.mute_for`, `scopeNotificationSettings`; TDLib's own `updateNotificationGroup` already applies them | Conversation property `alerts` (format unverified) |
-| Send ack / dedupe | `nonce` echoed in `MESSAGE_CREATE`; 429 `retry_after` | `client_msg_id` (unverified here); `ok:false` + `error` | `updateMessageSendSucceeded` / `Failed`; TDLib queues offline itself | `clientmessageid`; HTTP 201 |
+| Mute source | `READY.user_guild_settings`: `muted`, `mute_config.end_time`, `suppress_everyone`, `suppress_roles`, `message_notifications`, `channel_overrides[]`; `guild_id: null` is DMs. Update: `USER_GUILD_SETTINGS_UPDATE`. Plus the guild default level. | Prefs `muted_channels`, `all_notifications_prefs` via `users.prefs.get`; `pref_change` event; `dnd.info`, `dnd_updated_user` (names unverified) | `chatNotificationSettings.mute_for`, `scopeNotificationSettings`; the notification-group update already applies them. Schema names, not a library we ship. | Conversation property `alerts` (format unverified) |
+| Send ack / dedupe | `nonce` echoed in `MESSAGE_CREATE`; 429 `retry_after` | `client_msg_id` (unverified here); `ok:false` + `error` | Send succeeded / failed updates. Offline queueing is this client's 60-second window, not a second library. | `clientmessageid`; HTTP 201 |
 | Signed out | Close 4004, HTTP 401 | `invalid_auth`, `token_revoked`, `account_inactive` | `authorizationStateLoggedOut` | HTTP 401 on token refresh |
 
-Discord risk note: subscribing to guilds, sending typing, and an identify whose `browser` is
-`"tinyclient"` are each visible to Discord. Sending the real client's `capabilities` is what makes
-`read_state` and `user_guild_settings` arrive in the shape the docs describe.
+Discord risk note: subscribing to guilds and sending typing are visible to Discord. Identify uses the web client's shape on API v9 (`07-budgets-and-risk.md`). Sending the real client's `capabilities` is what makes `read_state` and `user_guild_settings` arrive in the shape the docs describe.
 
-## Order of work
+Telegram in this client is grammers. TDLib names left in this table are the schema, not a library we ship. Signal, Messages, and Tiny are not in this table.
 
-1. Split `unread` into `mentions` / `unread` / `muted`; read mute settings; fix R1 (focus-gated read). Everything else depends on these being right.
-2. Typing in (T1, T2) for Discord DMs and Slack: the events already arrive and are thrown away.
-3. App bundle + the notification spike, then N1 to N5.
-4. Optimistic send with pending and failed rows (S1 to S3); `Link::Expired` (K3).
-5. Read-elsewhere sync (R2), typing out (T4), reply from notification (N7).
+## Settled
 
-## Open questions for the owner
-
-1. **Send typing on Discord by default?** It is the one network where a third-party client risks the account, and each typing POST is another request from a non-official client. Recommendation: receive always, send off by default on Discord, on elsewhere.
-2. **Dock badge: only "needs me" (DMs + mentions), as recommended, or also a dot for any unread channel like Slack?** The system badge API takes numbers only, so the dot works only while the shell is running.
-3. **Packaging: is a signed `tinyclient.app` with chatd inside acceptable now?** Real notifications are impossible without it. "For anyone who wants it" also implies a Developer ID and notarization (paid account).
-4. **Offline sends: the 60 s window in S3, or strict "nothing queues, ever"?**
-5. **Should chatd start at login** (launchd agent) so notifications arrive before the window is ever opened? It is the difference between replacing the official apps and sitting beside them.
+Sending typing on Discord defaults off. That is Settings › Privacy, not an open question. Telegram typing and read receipts stay on. The Dock badge defaults to direct messages and mentions (N11 in `09-settings.md`). All unread is a setting. The system badge is a number. Packaging ships from GitHub releases (`08-sign-in-accounts.md`). An offline send waits 60 seconds, then becomes "Not sent". There is no open-at-login switch. Launching the window starts chatd.

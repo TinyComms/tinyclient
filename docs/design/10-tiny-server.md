@@ -1,15 +1,17 @@
 # 10 · Tiny server
 
 A self-hosted Tiny server is laid out as Discord lays out a server, with voice controls as
-TeamSpeak has them. Code: `crates/tinyclient/src/gui/tiny/`. Wire contract and permissions:
+TeamSpeak has them. More than one Tiny server can be signed in. Each has text channels and
+direct messages as well as voice rooms. Code: `crates/tinyclient/src/gui/tiny/`. Wire contract
+and permissions:
 `docs/architecture.md` (Tiny requests) and the server-management contract. Every size and colour
 is a token of `01-system.md`.
 
 ```
 | rail 72 | server column (sidebar) | home or channel, flex          | members 248 |
 |         | ▾ header 52             | top bar 52, hairline under it                |
-|         | categories, channels,   | home: icon, name, welcome,     | search      |
-|         | seats under channels    |   who is in voice, who online  | role groups |
+|         | text channels, then     | home: icon, name, welcome,     | search      |
+|         | categories and seats    |   who is in voice, who online  | role groups |
 |         | call dock (in a call)   | channel: stage of tiles,       | Offline     |
 |         | user panel 52           |   call bar                     |             |
 ```
@@ -29,10 +31,12 @@ or move; Kick removes, Roles is Owner / Admin / Member.
   — · Servers (a check per signed-in server, when there are several) · Join another server ·
   Sign out of this server… (`danger`, asks first). Only what is allowed shows; Server settings
   always shows, its pages read-only where they must be.
-- **Categories** fold. Header 34 (24 for the first): a 12 chevron and the name in capitals,
+- **Text channels** come first, under a header "TEXT CHANNELS" (omitted when there are none).
+  A row is 28: hash glyph, name. A click opens that conversation in the ordinary pane. Direct
+  messages are not rows here. Message, in the person menu, opens one in People.
+- **Categories** fold, under the text channels. Header 34 (24 for the first): a 12 chevron and the name in capitals,
   11/600 `text_faint`, `text_soft` on hover; folded, the room count follows. A `+` on hover
-  creates a channel in it. Rooms in no category come first, unheaded. A server without
-  categories has one header, "Voice channels".
+  creates a channel in it. A server without categories has one header, "Voice channels", for its rooms.
 - **Voice channel row,** 28: volume glyph 16 (`positive` when I am in it), name 13
   (`text_soft` when empty, 500 when mine), a 12 radio glyph when push to talk is required, and
   occupancy as `3 / 12` (or `3`) in a chip that turns `warning` when full. Click shows the
@@ -40,11 +44,11 @@ or move; Kick removes, Roles is Owner / Admin / Member.
   Settings › Channels, at this channel; on an older server, Rename…) · Copy channel link ·
   Delete channel… (asks first).
 - **Seats** under their channel, 28, indented 24: avatar 20 in its speaking ring, name
-  (`text` while speaking), `You` on mine, then glyphs, each with a tooltip: priority speaker
+  (`text` while speaking), `You` on mine, then seat glyphs, each with a tooltip, in this order: priority speaker
   (megaphone, `accent_text`), server deafened / deafened (headphones off, `danger` /
   `text_faint`), server muted (mic off, `danger`), can't speak here (mic off, `warning`), muted
-  (mic off, `text_faint`). Right-click is the person menu. Video and sharing glyphs wait for
-  the server to say who shares (no seat field yet).
+  (mic off, `text_faint`), then "Sharing their screen" (`monitor-up`, accent) and "Camera on"
+  (`video`, accent) when the seat says so. Right-click is the person menu.
 - **Drag:** a seat onto another channel moves them (`TinyCallMove`, only where the person menu
   would offer Move to that channel); a channel onto a channel puts it above, onto a category
   header to that category's end; a category onto a category puts it above. Drop targets light
@@ -80,7 +84,7 @@ or move; Kick removes, Roles is Owner / Admin / Member.
   occupancy, up to eight ringed faces 28, `Mara, Robin and 2 others`, and Join (or `You're
   here`, or `Full`). **Online, not in voice:** chips of 36 with the avatar, the name in its
   role colour and `You`; right-click is the person menu.
-- **Channel:** the stage holds a tile per person, 196 × 148, radius 12, `raised`, centred and
+- **Channel:** the call sends and receives one H.264 picture here (the share, otherwise the active speaker's camera). It is not drawn on another network's conversation. The stage holds a tile per person, 196 × 148, radius 12, `raised`, centred and
   wrapping: avatar 64, name 13/600 in the role colour, `You` chip, then the most serious state
   as a chip (`Server muted` and `Can't speak here` in `danger`, `Priority speaker` in
   `accent_soft`, else `text_soft`), and `Muted for you` or the volume I set for them. A
@@ -96,14 +100,15 @@ or move; Kick removes, Roles is Owner / Admin / Member.
   click again, or its ✕, to go back. Changing channel unfocuses. Right-click a tile for the
   person menu.
 - **Banner,** over the stage, 640 at most, radius 10, while my call here is not simply up:
-  `Connecting to Lounge… 0:03` (`accent_wash`, Cancel); `Connection lost. Reconnecting… 0:22
-  left` (`warning_soft`, "Your seat is kept while the call finds its way back.", Leave); or
-  the failure as the dock words it (`danger_soft`, Rejoin where one may come back, and ✕).
+  `Connecting to Lounge…` (`accent_wash`, Cancel);
+  `Connection lost. Reconnecting…` (`warning_soft`, "Your seat is kept while the call finds its way back.", Leave);
+  or the failure as the dock words it (`danger_soft`, Rejoin where one may come back, and ✕).
+  The titles do not count elapsed seconds. Resume is three tries in two minutes, after 1 s, 2 s, and 3 s (`07` §7a).
   Removed from the call, a lost connection and "In a call on another device" offer Rejoin (or
   Join here); a ban, a timeout, a deleted channel and removal from the server do not, and
   nothing on a Tiny server offers to "open in" another app.
 - **Call bar,** floating 20 above the bottom: a pill on `overlay` holding round 44 buttons
-  (each in the tab order with a focus ring) for mute, deafen, devices (Settings › Audio &
+  (each in the tab order with a focus ring) for mute, deafen, share and camera when the room allows video, devices (Settings › Audio &
   video) and Call health (the signal bars), then Leave (`danger_fill`, phone-off glyph; Cancel
   while connecting). The mute button rings `positive` while I am heard. A moderator's mute or
   deafen, or a channel where I can't speak, holds its button on `danger_soft` at 55 % and says
@@ -242,7 +247,7 @@ its top.
   everything. An older server shows the rows it sent with the page, unfiltered.
 - **Sign-in:** the provider (its name from `/v1/auth/config`, kept by chatd as
   `TinyCommunity::provider`), the server, how many joined by sign-in group, and a note that
-  group mapping is set on the server; me — avatar, name, "Signed in through Tinyauth", email,
+  group mapping is set on the server; me — avatar, name, "Signed in through {provider}" (or "Signed in through the server's provider" when the name is missing), email,
   member since, user ID with Copy; Sign out everywhere (`danger`, asks; `TinySignOutEverywhere`).
 - **Danger zone** (owners): Transfer ownership — pick a member (not an owner), "Then stop being
   an owner myself", Transfer ownership… (typed confirmation; makes them an owner first, then

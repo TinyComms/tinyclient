@@ -4,10 +4,6 @@ Requirements: `product/polish/07-panes-selection.md` (R1–R19, table §1, ladde
 contents are `06-profile-info.md`'s. Mockup: `mockups/07-panes.html` (frames A–H). Sizes in pt; tokens from
 `theme.rs` / `design/01-system.md`. Where this file and `design/02-layout-navigation.md` differ, this one wins.
 
-**Seen in the build** (scratch daemon; `--open` and `--right` work): members 240 vs profile 340, so text reflows on a
-kind change; a 12-unread group opens at the bottom, divider off screen; `>` in the subtitle; a 700 window with a
-thread shows no way to the sidebar; the composer wears the accent focus border permanently.
-
 ## 1. Conversation header (frame A)
 The `STRIP` of `polish/01` (52, hairline below, buttons 28 four apart, 12 from the right). Left to right:
 
@@ -39,13 +35,11 @@ The `STRIP` of `polish/01` (52, hairline below, buttons 28 four apart, 12 from t
   subtitle goes before the title shrinks below 96. At `C` = 392 with the panel button the title gets 96.
 
 ## 2. The right pane: one frame, many kinds (frames B, C)
-- **One width for every kind: 300, drag 260–420**, double-click the 6 hit strip resets, remembered. `MEMBERS_WIDTH` goes.
-- **Title strip** (`STRIP`): close `x` 28 leads it, then title 16/600, no count beside it
+- **One width for every kind: 300, drag 260–420**, double-click the 6 hit strip resets, remembered. `layout.rs` `RIGHT_WIDTH` / `RIGHT_RANGE` are these numbers. A Tiny server page has its own members column; it is not this pane.
+- **Title strip** (`STRIP`): close `x` 28 leads it, then `[‹ crumb]` title 16/600, no count beside it
   (`polish/01`). The close never trails the title: the window's own buttons end the strip at the
-  right, and an `x` beside minimize reads as another window button. When the pane stands in for the
-  conversation there is no close at all: a bare `<` 28 leads the strip and the conversation's name
-  is centred over the body, 13/500 `text_soft`, so the pane reads as a page with a heading rather
-  than a path, and the chevron is the way out. Hairline below; fill `sidebar`, hairline left.
+  right, and an `x` beside minimize reads as another window button. When the crumb is drawn it is
+  the way out, so the close is not drawn twice. Hairline below; fill `sidebar`, hairline left.
 
   | Kind | Title | Opened by | Base or push |
   |---|---|---|---|
@@ -56,9 +50,8 @@ The `STRIP` of `polish/01` (52, hairline below, buttons 28 four apart, 12 from t
   | Thread | "Thread"; its root message heads the body | a reply line | base, or push from Threads |
   | Search | the field replaces the title | `cmd-F` | base |
 
-- **Back**: when the pane replaces the conversation, a bare chevron 28 is the way out and the
-  conversation's name is the centred heading above, not a second label beside the title. At most one
-  pane deep. It is not window history.
+- **Crumb**: a ghost button 28, chevron-left 16 + the base's name 13/500 `text_soft` ("Members", "Thread",
+  "Threads"), 8 before the title. At most 2 deep, so one crumb. It is not window history.
 - **A profile from a thread** (frame C): an avatar in the thread opens the card (as built); the card's "View profile",
   or a name in the thread's strip, pushes the profile over the thread with `‹ Thread`. Closing the pane closes both.
 - **Before data lands**: the frame and title are drawn in the same frame as the switch. The profile head (picture,
@@ -124,9 +117,8 @@ A lit header button always equals the kind on screen; the pane never changes wid
 ## 7. Narrow windows (frame F)
 Defaults rail 72, sidebar 316, pane 300, conversation min 392. The order regions give way:
 1. The conversation shrinks to 392. 2. **Details hides** below 1081: its switch stays on, its button draws unlit
-(it shows what is on screen), and a click opens it once, replacing the conversation, with `‹ #general` centred
-over it. 3. Thread, Threads, Search and a push replace the conversation the same way (`esc` or the chevron
-returns). 4. Below
+(it shows what is on screen), and a click opens it once, replacing the conversation, with `‹ #general`. 3. Thread,
+Threads, Search and a push replace the conversation with the same crumb (`esc` or the crumb returns). 4. Below
 781 the sidebar leaves the row and the 28 panel button leads the strip in **every** replacing view, including the
 pane's, so the floating sidebar is always one click away. Picking a row in it closes it (a thread is put away).
 
@@ -150,7 +142,7 @@ pane's, so the floating sidebar is always one click away. Picking a row in it cl
 ## New tokens
 | Name | Value | Use |
 |---|---|---|
-| `PANE` / `PANE_RANGE` | 300 / 260–420 | every right-pane kind; replaces `RIGHT_WIDTH` 340 and `MEMBERS_WIDTH` 240 |
+| `PANE` / `PANE_RANGE` | 300 / 260–420 | every conversation right pane. `layout.rs` `RIGHT_WIDTH` / `RIGHT_RANGE` are these numbers. A Tiny server page has its own members column; it is not this pane. |
 | `jump_target` | alias of `accent_soft` | the landed-on message |
 | `FLOAT_CHIP` | 24 high, radius 6 | the "3 new" chip (an in-pane float, `polish/01` §4 stacking) |
 | `composer_focus` | `border_strong` | the composer's focused border; an exception to `polish/01`'s field focus, for its owner to rule on |

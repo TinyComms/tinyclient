@@ -1,22 +1,6 @@
 # 01. Visual system
 The tokens and base components every screen is built from. Sheet: `mockups/01-system.html`. All sizes are points (1 pt = 2 device px on the target display). Token names are the functions in `gui/theme.rs`; existing names are kept, values change, new names are marked **new**.
 
-## 1. Audit of the current shell (`docs/shell.png`)
-| What reads as cheap | Evidence | Fix |
-|---|---|---|
-| Rainbow gradient initials are the loudest pixels on screen, and they are placeholders | `avatar()`: hashed hue, 62% saturation, 160° gradient | Flat low-chroma tint, real image over it |
-| The accent is Discord's hue, so the whole app looks like one network | `accent` #7F8CFF is hue 234; blurple is 235 | macOS-style blue, hue 219 |
-| Unread is said three times: bold title, accent time, accent pill; a mention looks the same as any unread | `row()` | Weight says unread; accent says "for you" only |
-| Hover and selection are nearly the same grey | 5% vs 9% white: 1.12:1 apart | 6% vs 12%, and selection also brightens text |
-| Faint text fails contrast | `text_faint` #676A7D on canvas: 3.4:1 | #858993: 5.0:1 |
-| Seven radii with no rule; pills everywhere | 9, 10, 13, 14, 15, 16, 17 | Four radii and a nesting rule |
-| No type scale | 11, 11.5, 12, 12.5, 13.5, 14, 14.5, 15, 16; BOLD and SEMIBOLD mixed | Six whole sizes, three weights |
-| Not dense | 64 pt rows, 44 pt avatars: 9 conversations in a 720 pt window | 48 pt and 28 pt rows: 13 to 22 |
-| Three stacked blue-black panes plus alpha fills that composite differently on each | `rail`, `sidebar`, `canvas`, `raised` 4% | Two surfaces, opaque `raised` |
-| A network plate glued to every avatar, where presence must go; rail icons carry a badge and a grey dot each | `network_avatar()`, `rail_button()` | Corner is presence only; see Icons |
-| Decoration: gradient call card with a giant avatar, glyph in a disc, amber sentence under the composer | `surface()`, `empty_state()`, `composer()` | Deleted; see section 6 |
-| Nothing floats, focuses or scrolls | no shadows, no focus ring, no scrollbar | Elevation, focus and scrollbar specs below |
-
 ## 2. Tokens
 ### Color. Dark ships first.
 Ratios are against `canvas` (dark). Light is in scope after increment 2 and follows the system appearance; it costs nothing later if components take color only from these functions, state fills stay tokens, and each theme carries its own shadow recipe. Light values not marked with a ratio are starting points to verify when it is built.
@@ -165,14 +149,6 @@ States are rest / hover / pressed / focus / disabled unless listed. Every hover 
 - **Scrollbar:** an absolutely positioned div read from the `ScrollHandle` / `ListState` offset; no built-in.
 - **Rows stay fixed height** (28 and 48) so both lists remain `uniform_list`.
 
-## 6. Delete
-- Hashed-hue gradient avatars, and `network_avatar()` with its corner plate.
-- Pills: `primary_button` radius 17, the call button, the 46 pt composer capsule, the round send button.
-- Sizes 11.5, 12.5, 13.5, 14.5 and `FontWeight::BOLD`.
-- The periwinkle accent with dark text on it; accent-colored timestamps on unread rows.
-- The third surface: `rail` takes the `sidebar` value.
-- The rail's 4 pt selection bar and the grey connection dot under each network icon.
-- The gradient call card and its 56 pt avatar; the 56 pt disc behind empty-state glyphs.
-- The amber sentence under the composer, replaced by the inline banner.
-- 64 pt conversation rows and 44 pt avatars.
-- "Slack · Offline" as a permanent header subtitle: say a state only while it is abnormal.
+## 6. Removed
+
+Gradient avatars, the rail selection bar, 64 pt rows, the third rail surface, and the other pieces this section used to list are already gone from the window.

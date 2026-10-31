@@ -1,24 +1,63 @@
 # 09. Settings and sound
 
-Every setting tinyclient offers, what each one changes, where it is kept, and which ship first.
-Written 2026-10-14 from a survey of Slack, Discord, Telegram, Signal, Teams, Messages and Zed, and
-an audit of this repo. This replaces the table in `docs/design/08-first-run-settings.md` §5; the
-window, sizes and components there still apply.
+The window on main (0.2.35) has twelve sections: Accounts, General, Notifications, Sounds, Appearance, Messages, Privacy, Audio & video, Voice, Storage, Shortcuts, About. About is pinned to the bottom. Search sits on the section list. A missing control is absent, not greyed out. Search for a known gap returns the line in `NOT_YET`.
 
-**The rule: a control exists only when it changes real behaviour.** A setting that is not built
-is left out of the window and listed under "Later" here. Nothing is greyed out, nothing says
-"coming soon".
+**A control exists only when it changes behavior.**
+
+The tables under "Information architecture" are the control design. A row marked "in" is in the window on main. A row marked "not in 0.2.35" is absent. The window size 720 × 560 was not re-checked against the layout constants.
+
+## Shipped rows
+
+| Section | Rows | Notes |
+| --- | --- | --- |
+| General | G2, G4 | G2 "Keep receiving when the window is closed" is in the window on macOS only. Linux uses the systemd user unit when that unit is enabled; quitting the GUI then leaves chatd up either way. G4 is automatic updates from the public GitHub release. |
+| Notifications | N1, N2, ND, NG, NM, NT, N4, NL, N5–N11, N13 | ND / NG / NM / NT are "Direct messages", "Group chats", "Mentions in channels", "Tiny servers". There is no N3 per-account menu. NL is the lock-screen preview and is hidden on macOS, where the OS does that. N10 and N11 use the host's flash and badge labels and are hidden on Linux. |
+| Sounds | S1–S4, SV | Five message sounds, two rings, or None. No "System alert sound". SV is notification volume and is hidden on macOS. |
+| Appearance | A2, A3, A4 | Text size, density, list previews. No theme control. The app is dark. |
+| Messages | M1–M5 | Send key, where a conversation opens, typing line, emoticons, GIF and sticker autoplay. |
+| Privacy | P1–P4 | Typing and read receipts per account, image loading, keep-for 7 / 30 / 90 days. Telegram typing and receipts are fixed on. Signal says the phone. Messages says the phone. |
+| Audio & video | V1, V2, V4, V5 | Microphone, speaker, join muted, call volume. |
+| Voice | V3, V6, V8, V10–V19, S7–S10 | Input level, sensitivity, voice activation or push-to-talk, echo cancellation, noise suppression, automatic gain, key recorders, release delay, call cues and their volume. |
+| Storage | D1–D3 | Usage, cap (default 500 MB), clear. Sign-ins, drafts, and settings stay. |
+| Shortcuts | read-only | Menu shortcuts. Voice keys are recorders in Voice, not this list. |
+| About | B1–B3 | Diagnostics, logs, reset. The tag line should name all seven networks. The string in the window still names five. |
+
+chatd keeps the notification, sound, privacy, voice, and storage values. The shell keeps theme-adjacent choices in `shell.prefs` (there is no theme value; the section word is stored). Unknown lines in `shell.prefs` are kept. `Request::Settings`, `Request::Set`, and `Change::Settings` are on main.
+
+## Not in the window
+
+| Gap | What search says, or what the code does |
+| --- | --- |
+| G1 Open at login | "tinyclient has no open-at-login setting yet." |
+| G3 Menu bar | No tray icon on this commit's search line. |
+| A1 Light theme | "tinyclient is dark only for now." |
+| N3 per-account notify menu | Not a row. ND, NG, NM, and NT are global. chatd can store an account-level notify word; the window does not show N3. |
+| N14, N15 | No reaction or thread-follow notify control. |
+| S5, S6 pickers | chatd will honor an account or conversation sound if one is stored. No row was found that writes them. |
+| S13 custom files, S14 ring-back | Not offered. |
+| M6 spellcheck, P5 screen-share hide, P6 Touch ID, P7 Signal relay | In `NOT_YET` or absent. |
+| V7 camera device | "tinyclient has no camera yet." A Tiny call can still toggle the camera from the call dock. That is `06-calls.md`. |
+| V9 per-person volume | `CallGain` on a Tiny participant row, not a Settings row. |
+| Proxy, accent, font, language, sync | `NOT_YET`. |
+
+## Never
+
+Accent colours, a font picker, per-network theme colours, an editor for ordinary menu shortcuts, in-app banner style, an in-app Reduce Motion, a hardware-acceleration switch, an experimental tab, a language picker, a cache-location picker, and a settings sync service.
+
+Voice processing and the push-to-talk keys are settings. They are not in this list.
+
+Written 2026-10-14 from a survey of Slack, Discord, Telegram, Signal, Teams, Messages and Zed, and an audit of this repo. The design tables below keep that survey. "in" means the row is in the window on main. "not in 0.2.35" means it is absent.
 
 ## Goals
 
-1. **Broad.** About 50 controls in v1, covering notifications, sound, appearance, messages,
-   privacy, calls, storage and startup. People who switch from Discord and Slack expect to tune
+1. **Broad.** The window has twelve sections, covering notifications, sound, appearance, messages,
+   privacy, audio, voice, storage and startup. People who switch from Discord and Slack expect to tune
    the client, and the owner wants that.
 2. **Real.** Every control has a check that someone can run from outside the process.
 3. **Calm by default.** Out of the box, tinyclient notifies about DMs and mentions only and
    plays one soft sound for those, a 4 s ring for a call, and short quiet cues inside a call.
    Nothing else makes a sound.
-4. **Local.** Settings live on this Mac. Nothing is fetched, synced, uploaded or reported.
+4. **Local.** Settings live on this computer. Nothing is fetched, synced, uploaded or reported.
 5. **Free when closed.** Settings costs nothing while its window is closed, and sound costs
    nothing while nothing is playing.
 
@@ -31,9 +70,9 @@ is left out of the window and listed under "Later" here. Nothing is greyed out, 
   the network reports (mutes, Do Not Disturb, `suppress_everyone`).
 - Settings sync across devices, cloud backup, import from the official apps, and an online
   settings store.
-- Toggles for echo cancellation, gain control or noise suppression. Echo cancellation is a
-  behaviour that calls must have; see V-notes.
 - "Experimental", "hardware acceleration" and debug switches.
+
+Echo cancellation, noise suppression, and automatic gain are V10, V11, and V12 in Voice, default on. Push-to-talk and the other voice keys are recorders in Voice. How a call uses the microphone, the echo canceller, and the camera toggle is `06-calls.md`.
 
 ## Rules this doc changes
 
@@ -43,11 +82,11 @@ The owner asked for sound and for breadth. These earlier rules change, on purpos
 | --- | --- | --- |
 | "In-app sounds" deliberately absent | design 06 §Deliberately absent | In-call cues play in mediad on the call's own output (S7 to S10). Message sounds still go through the system notification. |
 | "A ringtone or call sounds of our own" absent | design 07 §135 | One bundled ring, at most 4 s, played by the notification (S4). In-call cues as above. |
-| "Custom sounds" absent | design 08 §Deliberately absent | A choice of bundled sounds is in v1. Files of your own are Later, behind a spike. |
-| One sound, the system default | design 06 §6 | A sound picker per event, per network and per conversation. "System alert sound" stays a choice. |
+| "Custom sounds" absent | design 08 §Deliberately absent | A choice of bundled sounds is in the window. Files of your own are not offered. |
+| One sound, the system default | design 06 §6 | A sound picker: five message sounds, two rings, or None. "System alert sound" is not a choice in 0.2.35. |
 | Dock bounce absent | design 06 §Deliberately absent | An option, default Off (N10). |
 | Media cache default 1 GB | design 08 §5 | 500 MB, matching `07-budgets-and-risk.md` §6 and `CACHE_BYTES`. |
-| One switch per network | design 08 §5 | A per-account level that also includes Off (N3). |
+| One switch per network | design 08 §5 | ND, NG, NM, and NT are global. N3's per-account menu is not in the window. |
 
 ## Where settings live
 
@@ -57,42 +96,38 @@ Each setting has exactly one home. The Settings window reads and writes both.
 | --- | --- | --- |
 | chatd: table `settings(scope, key, value)` in `chat.sqlite` | Anything chatd acts on while the window may be closed: notifications, sounds, pause, quiet hours, privacy, call devices, storage, quit behaviour | chatd posts notifications and talks to the networks; the window may not be running |
 | Shell: `shell.prefs` | Anything only the window draws or reads: theme, text size, density, send key, list previews, last Settings section | It is read before the first frame, so the window opens looking right |
-| The OS | Open at login (`SMAppService` state), notification permission, Focus | The OS is the source of truth; tinyclient reads it, never caches a copy |
+| The OS | Notification permission, Focus. Open at login is not a setting (G1). | The OS is the source of truth; tinyclient reads it, never caches a copy |
 
 `scope` is `""` for global, `account:<network>:<id>` for one account (one Slack workspace is one
 account), and `conv:<network>:<id>` for one conversation.
 
-Protocol, before any chatd setting ships: `Request::Settings` returns every stored value,
-`Request::Set { scope, key, value: Option<String> }` stores one (`None` restores the default),
-and `Change::Settings` tells every window. About 150 lines, no new dependency.
+`Request::Settings` returns every stored value, `Request::Set { scope, key, value: Option<String> }` stores one (`None` restores the default), and `Change::Settings` tells every window. That store is on main. Unknown lines in `shell.prefs` are kept. There is no theme value; the section word is stored.
 
 ## Information architecture
 
-The Settings window is the one in 08 §5: 720 × 560, a section list on the left, a search field at
+The window is 720 × 560 in this design (not re-checked against the layout constants), a section list on the left, a search field at
 its top, About pinned to the bottom. Sections, in order:
 
 Accounts · General · Notifications · Sounds · Appearance · Messages · Privacy · Audio & video ·
-Storage · Shortcuts · About
+Voice · Storage · Shortcuts · About
 
 Columns below: **Type** is the control. **Scope** is G (global), A (per account), C (per
-conversation). **Home** is `d` (chatd) or `s` (shell). **Rel** is v1 or Later.
+conversation). **Home** is `d` (chatd) or `s` (shell). **Rel** is `in`, `not in 0.2.35`, or Later (also absent; see Later).
 
 ### Accounts
 
-As 08 §5: one group per network, a row per account with state in words, Sign out, Sign in again,
-Add, reorder. New: each account row has a link, "Notifications for this account", that opens
-Notifications scrolled to that account's row. No settings of its own.
+One group per network, a row per account with state in words, Sign out, Sign in again, Add. There is no N3 link from an account row to a per-account notify menu. ND, NG, NM, and NT are global.
 
 ### General
 
 | # | Setting | Type | Default | Scope | Home | What it changes | Rel |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| G1 | Open at login | Switch | Off until the first-load card (08 §6) asks | G | OS | Registers the bundle with `SMAppService`. At login only chatd starts; the window opens when the Dock icon or a notification is clicked | v1 |
-| G2 | Keep receiving when the window is closed | Switch | On | G | d | On: closing the window hides it and chatd keeps running. Off: closing the window quits the window and chatd | v1 |
+| G1 | Open at login | Switch | | G | OS | Not in 0.2.35. Search: "tinyclient has no open-at-login setting yet." | not in 0.2.35 |
+| G2 | Keep receiving when the window is closed | Switch | On | G | d | On: closing the window hides it and chatd keeps running. Off: closing the window quits the window and chatd. In the window on macOS only. Linux uses the systemd user unit when that unit is enabled. | in |
 | G3 | Show in menu bar | Switch | Off | G | s | | Later |
-| G4 | Install updates automatically | Switch | On | G | s | On: a newer GitHub release is downloaded while the window is open and replaces this copy on quit. Off: the notice still appears and nothing is downloaded until asked | v1 |
+| G4 | Install updates automatically | Switch | On | G | s | On: a newer GitHub release is downloaded while the window is open and replaces this copy on quit. Off: the notice still appears and nothing is downloaded until asked | in |
 
-Caption under G2, from 08 §6: "Closing the window leaves tinyclient running. Quit with ⌘Q to
+Caption under G2: "Closing the window leaves tinyclient running. Quit with ⌘Q to
 stop it." ⌘Q stops chatd and the window unless the optional Linux systemd user
 service is enabled; in that mode systemd owns the daemon's lifetime (see below).
 
@@ -103,19 +138,20 @@ tinyclient in System Settings." with "Open System Settings".
 
 | # | Setting | Type | Default | Scope | Home | What it changes | Rel |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| N1 | Show notifications | Switch | On | G | d | Off: chatd posts no message notifications. Counts and badge keep working. Calls follow N5 | v1 |
-| N2 | Notify me about | Segmented: "Direct messages and mentions" / "All messages" | DMs and mentions | G | d | Which arriving messages chatd posts. Muted conversations never notify (04 C2) | v1 |
-| N3 | Per account: Notify me about | Menu: "Default" / "Direct messages and mentions" / "All messages" / "Off" | Default | A | d | Overrides N2 for one account. Off silences that account without signing out | v1 |
-| N4 | Show in notifications | Segmented: "Sender and message" / "Sender only" / "Nothing" | Sender and message | G | d | Sender only: title is the sender, body "New message" or "New mention". Nothing: title is the network, body "New message". For screen sharing | v1 |
-| N5 | Incoming calls | Segmented: "Ring" / "Notify silently" / "Don't notify" | Ring | G | d | Ring posts the call notification with the ring sound (S4). Silently posts it with no sound. Don't notify posts nothing; the in-window card and the missed-call row still appear | v1 |
-| N6 | During a call | Segmented: "Banners only" / "Banners and sounds" / "Nothing" | Banners only | G | d | What message notifications do while I am in a call. Rings follow 07 §4 regardless | v1 |
-| N7 | Pause notifications | Button with menu: "For 1 hour" / "Until tomorrow" (08:00 local) / "Until I resume"; becomes "Resume" while paused | Not paused | G | d | Nothing is posted until the stored end time; counts and badge keep counting. Also in the rail bell and the tinyclient menu | v1 |
-| N8 | Quiet hours | Switch, then From and To time fields | Off; 22:00 to 08:00 | G | d | Inside the window nothing is posted except calls when N9 is on | v1 |
-| N9 | Let calls ring during quiet hours and pauses | Switch | On | G | d | On: a call still posts during N7 and N8 | v1 |
-| N10 | Bounce the Dock icon | Segmented: "Off" / "Once" / "Until I look" | Off | G | s | `requestUserAttention`, informational or critical, for anything that posts a notification while the window is not key | v1 |
-| N11 | Dock badge counts | Segmented: "Direct messages and mentions" / "All unread" / "Off" | DMs and mentions | G | d | The number on the Dock icon. Muted conversations never count | v1 |
-| N12 | Per conversation: Notifications | In Conversation › Notifications…: "Mute" (the existing network mute) | Network's state | C | network | Unchanged from today: written to the network with `SetMute` | v1 (exists) |
-| N13 | Send a test notification | Button | | | | Posts one real notification, "This is how messages will look and sound", using N4 and S2. Under Focus it is silenced like any other, and the caption says so | v1 |
+| N1 | Show notifications | Switch | On | G | d | Off: chatd posts no message notifications. Counts and badge keep working. Calls follow N5 | in |
+| N2 | Notify me about | ND, NG, NM, NT: "Direct messages", "Group chats", "Mentions in channels", "Tiny servers" | DMs, groups, and mentions | G | d | Which arriving messages chatd posts. Muted conversations never notify (04 C2). These are global, not per account. | in |
+| N3 | Per account: Notify me about | Menu | | A | d | Not a row. chatd can store an account-level notify word; the window does not show N3. | not in 0.2.35 |
+| N4 | Show in notifications | Segmented: "Sender and message" / "Sender only" / "Nothing" | Sender and message | G | d | Sender only: title is the sender, body "New message" or "New mention". Nothing: title is the network, body "New message". For screen sharing | in |
+| NL | Lock-screen preview | Switch | | G | d | Hidden on macOS, where the OS does that. | in |
+| N5 | Incoming calls | Segmented: "Ring" / "Notify silently" / "Don't notify" | Ring | G | d | Ring posts the call notification with the ring sound (S4). Silently posts it with no sound. Don't notify posts nothing; the in-window card and the missed-call row still appear | in |
+| N6 | During a call | Segmented: "Banners only" / "Banners and sounds" / "Nothing" | Banners only | G | d | What message notifications do while I am in a call. Rings follow 07 §4 regardless | in |
+| N7 | Pause notifications | Button with menu: "For 1 hour" / "Until tomorrow" (08:00 local) / "Until I resume"; becomes "Resume" while paused | Not paused | G | d | Nothing is posted until the stored end time; counts and badge keep counting. Also in the rail bell and the tinyclient menu | in |
+| N8 | Quiet hours | Switch, then From and To time fields | Off; 22:00 to 08:00 | G | d | Inside the window nothing is posted except calls when N9 is on | in |
+| N9 | Let calls ring during quiet hours and pauses | Switch | On | G | d | On: a call still posts during N7 and N8 | in |
+| N10 | Bounce the Dock icon | Segmented: "Off" / "Once" / "Until I look" | Off | G | s | The host's flash or bounce, for anything that posts a notification while the window is not key. Hidden on Linux. | in |
+| N11 | Dock badge counts | Segmented: "Direct messages and mentions" / "All unread" / "Off" | DMs and mentions | G | d | The number on the Dock icon. Muted conversations never count. Hidden on Linux. | in |
+| N12 | Per conversation: Notifications | In Conversation › Notifications…: "Mute" (the existing network mute) | Network's state | C | network | Unchanged from today: written to the network with `SetMute` | in |
+| N13 | Send a test notification | Button | | | | Posts one real notification, "This is how messages will look and sound", using N4 and S2. Under Focus it is silenced like any other, and the caption says so | in |
 | N14 | Notify about reactions to my messages | Switch | Off | G | d | | Later |
 | N15 | Notify about replies in threads I follow | Switch | On | G | d | | Later |
 | N16 | Focus filter (show only some accounts in a macOS Focus) | App Intents | | A | OS | | Later |
@@ -123,7 +159,7 @@ tinyclient in System Settings." with "Open System Settings".
 Caption under the group: "Do Not Disturb you set in Slack or Discord is followed here. For
 schedules by place or app, use Focus in System Settings; tinyclient follows it."
 
-Behaviour with no setting, all v1, all required before N1 ships (from 04 N1 to N7 and design 06
+Behaviour with no extra setting (from 04 N1 to N7 and design 06
 §6): no notification for the conversation open in the key window, my own messages from any
 device, muted conversations, or history at connect; one notification per conversation, replaced
 in place; withdrawn when read anywhere; Reply and Mark as Read actions; the network's own Do Not
@@ -137,32 +173,32 @@ The full sound design is in the next section. The controls:
 
 | # | Setting | Type | Default | Scope | Home | What it changes | Rel |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| S1 | Play sounds | Switch | On | G | d | Off: every notification posts with no sound and mediad plays no cues. The test buttons still play | v1 |
-| S2 | Message sound | Picker: 5 bundled sounds, "System alert sound", "None" | "Pebble" | G | d | The sound on a message notification | v1 |
-| S3 | Mention sound | Picker: "Same as messages", the 5 sounds, "System alert sound", "None" | Same as messages | G | d | The sound when the notification is for a mention, including in "All messages" mode, so a mention is heard apart from chatter | v1 |
-| S4 | Ring | Picker: 2 bundled rings, "System alert sound", "None" | "Soft ring" | G | d | The sound on the incoming-call notification | v1 |
-| S5 | Per account: Message sound | Menu: "Default", the 5 sounds, "System alert sound", "None" | Default | A | d | Overrides S2 and S3 for one account, so work and friends sound different | v1 |
-| S6 | Per conversation: Sound | In Conversation › Notifications…: "Default", the 5 sounds, "System alert sound", "None" | Default | C | d | Overrides S5 for one conversation. Local only; the network never sees it | v1 |
-| S7 | In calls: someone joins or leaves, or I am moved | Switch | On | G | d | mediad plays the join, leave or moved cue | v1 |
-| S8 | In calls: I mute, unmute, deafen or undeafen | Switch | On | G | d | mediad plays the matching cue | v1 |
-| S9 | In calls: connection lost, back or ended | Switch | On | G | d | mediad plays the matching cue; "ended" is being kicked, banned, timed out or the room deleted | v1 |
-| S10 | Call sound volume | Slider 0 to 100 % | 50 % | G | d | Gain on the cues in S7 to S9 only. Voices are not affected | v1 |
-| S11 | Play | A small play button beside S2, S3, S4, S5 | | | | Plays that sound once, on the device the notification would use (below) | v1 |
-| S12 | Play test sound | Button beside S10 | | | | mediad plays the join cue at S10's volume on the call speaker (V2) | v1 |
+| S1 | Play sounds | Switch | On | G | d | Off: every notification posts with no sound and mediad plays no cues. The test buttons still play | in |
+| S2 | Message sound | Picker: Pebble, Drop, Tap, Chime, Glass, None | "Pebble" | G | d | The sound on a message notification. No "System alert sound". | in |
+| S3 | Mention sound | Picker: "Same as messages", the 5 sounds, None | Same as messages | G | d | The sound when the notification is for a mention. No "System alert sound". | in |
+| S4 | Ring | Picker: 2 bundled rings, None | "Soft ring" | G | d | The sound on the incoming-call notification. No "System alert sound". | in |
+| S5 | Per account: Message sound | | | A | d | chatd will honor an account sound if one is stored. No row was found that writes it. | not in 0.2.35 |
+| S6 | Per conversation: Sound | | | C | d | chatd will honor a conversation sound if one is stored. No row was found in Settings or the conversation side pane that writes it. | not in 0.2.35 |
+| S7 | In calls: someone joins or leaves | Switch | On | G | d | mediad plays the join or leave cue | in |
+| S8 | In calls: I mute, unmute, deafen or undeafen | Switch | On | G | d | mediad plays the matching cue | in |
+| S9 | In calls: connection lost or back | Switch | On | G | d | mediad plays the matching cue | in |
+| S10 | Call sound volume | Slider 0 to 100 % | 50 % | G | d | Gain on the cues in S7 to S9 only. Voices are not affected | in |
+| S11 | Play | A small play button beside S2, S3, S4 | | | | Plays that sound once, on the device the notification would use (below). S5 is not a row. | in |
+| S12 | Play test sound | Button beside S10 | | | | mediad plays the join cue at S10's volume on the call speaker (V2) | in |
 | S13 | Add a sound file… | Picker entry | | G | d | | Later (spike) |
 | S14 | Ring-back while I am calling someone | Switch | | G | d | | Later |
 
-Caption under S2 to S4: "Notification sounds use the alert volume in System Settings › Sound."
+S7–S10 live in the Voice section of the window. SV, notification volume, is hidden on macOS, where the OS owns alert volume. Caption under S2 to S4: "Notification sounds use the alert volume in System Settings › Sound." There is no "System alert sound" choice.
 
 ### Appearance
 
 | # | Setting | Type | Default | Scope | Home | What it changes | Rel |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| A1 | Theme | Segmented: "Match system" / "Dark" / "Light" | Match system | G | s | The token set of `01-system.md` §2. Applies in the next frame, every window, no restart | v1 |
-| A2 | Text size | Five stops: −1 to +3 (body 13, 14, 15, 16, 17) | 0 (14) | G | s | Type sizes and `row_height`. Same state as ⌘+ ⌘− ⌘0, so the control never shows nothing selected | v1 |
-| A3 | Density | Segmented: "Comfortable" / "Compact" | Comfortable | G | s | Compact: list rows 48 → 40, avatars 28 → 24, 2 pt less between message groups | v1 |
-| A4 | Show message previews in the list | Switch | On | G | s | Off: list rows show the name and time only. For screen sharing | v1 |
-| A5 | Accent colour, fonts, chat backgrounds, per-network colour | | | | | | Never (08) |
+| A1 | Theme | | | G | s | Not in 0.2.35. Search: "tinyclient is dark only for now." | not in 0.2.35 |
+| A2 | Text size | Five stops: −1 to +3 (body 13, 14, 15, 16, 17) | 0 (14) | G | s | Type sizes and `row_height`. Same state as ⌘+ ⌘− ⌘0, so the control never shows nothing selected | in |
+| A3 | Density | Segmented: "Comfortable" / "Compact" | Comfortable | G | s | Compact: list rows 48 → 40, avatars 28 → 24, 2 pt less between message groups | in |
+| A4 | Show message previews in the list | Switch | On | G | s | Off: list rows show the name and time only. For screen sharing | in |
+| A5 | Accent colour, fonts, chat backgrounds, per-network colour | | | | | | Never |
 
 Reduce Motion, Increase Contrast and Reduce Transparency are read from macOS and honoured, with
 no control.
@@ -171,21 +207,21 @@ no control.
 
 | # | Setting | Type | Default | Scope | Home | What it changes | Rel |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| M1 | Send with | Segmented: "Return" / "⌘Return" | Return | G | s | Return: Return sends, ⇧Return adds a line. ⌘Return: Return adds a line, ⌘Return sends. ⌥Return still sends silently. Bindings change at once | v1 |
-| M2 | Open conversations at | Segmented: "First unread" / "Newest message" | First unread | G | s | Where the message list lands on open. First unread is today's behaviour (07 R3) | v1 |
-| M3 | Show when others are typing | Switch | On | G | s | Off: no typing line is drawn. What I send is P1 | v1 |
-| M4 | Convert typed emoticons to emoji | Switch | Off | G | s | On send, `:)` `:(` `:D` `;)` `<3` standing alone become 🙂 🙁 😀 😉 ❤️. Never inside code spans | v1 |
-| M5 | Play GIFs and animated stickers | Segmented: "Automatically" / "On hover" / "Never" | Automatically | G | s | Automatically: every GIF, animated WebP, APNG and animated emoji on screen plays while the window is key, within the 07 budgets. On hover: a still with a GIF badge, playing under the pointer. Never: a still with a badge and a play disc; a click opens it in the viewer, which plays it. Reduce Motion makes Automatically play under the pointer. Kept in `shell.prefs` | v1 |
+| M1 | Send with | Segmented: "Return" / "⌘Return" | Return | G | s | Return: Return sends, ⇧Return adds a line. ⌘Return: Return adds a line, ⌘Return sends. ⌥Return still sends silently. Bindings change at once | in |
+| M2 | Open conversations at | Segmented: "First unread" / "Newest message" | First unread | G | s | Where the message list lands on open. First unread is today's behaviour (07 R3) | in |
+| M3 | Show when others are typing | Switch | On | G | s | Off: no typing line is drawn. What I send is P1 | in |
+| M4 | Convert typed emoticons to emoji | Switch | Off | G | s | On send, `:)` `:(` `:D` `;)` `<3` standing alone become 🙂 🙁 😀 😉 ❤️. Never inside code spans | in |
+| M5 | Play GIFs and animated stickers | Segmented: "Automatically" / "On hover" / "Never" | Automatically | G | s | Automatically: every GIF, animated WebP, APNG and animated emoji on screen plays while the window is key, within the 07 budgets. On hover: a still with a GIF badge, playing under the pointer. Never: a still with a badge and a play disc; a click opens it in the viewer, which plays it. Reduce Motion makes Automatically play under the pointer. Kept in `shell.prefs` | in |
 | M6 | Check spelling | Switch | | G | s | | Later |
 
 ### Privacy
 
 | # | Setting | Type | Default | Scope | Home | What it changes | Rel |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| P1 | Let others see when I am typing | Per account switch; fixed rows for Telegram and Signal | Discord off, Slack on, Teams on. Telegram: "Always on", caption "Telegram does not let an app turn this off." Signal: "Set on your phone" | A | d | Off: the adapter sends no typing signal | v1 |
-| P2 | Let others see what I have read | Teams switch; fixed rows for Telegram and Signal | Teams on. Telegram "Always on". Signal "Set on your phone" | A | d | Teams off: no consumption-horizon update is sent; the chat is still marked read here. Caption: "Off also leaves chats unread on your other devices." Group caption: "Discord and Slack have no read receipts." | v1 |
-| P3 | Load images and link previews automatically | Switch | On | G | s | Off: each image or preview is one line with its size; a click loads it. Nothing is fetched until clicked | v1 |
-| P4 | Keep messages on this Mac for | Segmented: "7 days" / "30 days" / "90 days" | 90 days | G | d | The age half of the retention rule (`store.rs`); the 2,000 per conversation cap stays. Pruned within 1 min of the change and daily | v1 |
+| P1 | Let others see when I am typing | Per account switch; fixed rows for Telegram, Signal, and Messages | Discord off, Slack on, Teams on. Telegram: "Always on", caption "Telegram does not let an app turn this off." Signal: "Set on your phone". Messages: the phone decides. | A | d | Off: the adapter sends no typing signal | in |
+| P2 | Let others see what I have read | Teams switch; fixed rows for Telegram, Signal, and Messages | Teams on. Telegram "Always on". Signal "Set on your phone". Messages: the phone decides. | A | d | Teams off: no consumption-horizon update is sent; the chat is still marked read here. Caption: "Off also leaves chats unread on your other devices." Group caption: "Discord and Slack have no read receipts." | in |
+| P3 | Load images and link previews automatically | Switch | On | G | s | Off: each image or preview is one line with its size; a click loads it. Nothing is fetched until clicked | in |
+| P4 | Keep messages on this computer for | Segmented: "7 days" / "30 days" / "90 days" | 90 days | G | d | The age half of the retention rule (`store.rs`); the 2,000 per conversation cap stays. Pruned within 1 min of the change and daily | in |
 | P5 | Hide tinyclient from screen sharing and recordings | Switch | | G | s | | Later (spike: macOS 15 capture may ignore `sharingType`) |
 | P6 | Lock with Touch ID | Switch | | G | s | | Later |
 | P7 | Signal: always relay calls | Switch | | A | d | | Later, with Signal calls |
@@ -194,52 +230,42 @@ no control.
 
 | # | Setting | Type | Default | Scope | Home | What it changes | Rel |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| V1 | Microphone | Menu: "Automatic (name)", "System default (name)", hardware, then virtual devices marked "(virtual)" | Automatic | G | d | The same choice as the call's device menu, stored by name and the system's id (WASAPI endpoint id, CoreAudio UID). chatd sends it to mediad at start and whenever it changes, mid-call too. Automatic is the system default unless that is a virtual device (Krisp, VB-Cable, Voicemeeter, NVIDIA Broadcast, Steam Streaming), then a headset or speakers; System default follows the system live. A missing or failing device is stood in for, said in words, and switched back to when it returns; the menu says "(not connected)" | v1 |
-| V2 | Speaker | Menu, as V1 | Automatic | G | d | As V1, for output. Also where S12 plays | v1 |
-| V3 | Test microphone | Button, "Test" / "Stop" (a toggle, design 09 §4) | | | | While on, the 20-segment meter is live, for at most 30 s. Outside a call, mediad starts for it (`mediad test`) and exits within 3 s of Stop | v1 |
-| V4 | Join calls with my microphone muted | Switch | Off | G | d | On: every join and every Accept starts muted, and the dock shows it | v1 |
-| V5 | Call volume | Slider 0 to 100 % | 100 % | G | d | Gain on everyone's voice in mediad's mix. 100 % is today's level | v1 |
-| V6 | Microphone sensitivity | Slider over the live meter, with "Default" mark | 25 (today's `VOICE`) | G | d | The voice gate threshold in mediad: below it, nothing is sent and no speaking ring shows | v1 |
-| V7 | Camera | Menu | | G | d | | Later, with camera |
-| V8 | Microphone opens by | Segmented: Voice activation / Push to talk (Settings › Voice) | Voice activation | G | d | `push_to_talk`: mediad's `Input` is push-to-talk with the V14 delay instead of the V6 gate. A Tiny room that requires it (or where voice activation is not allowed) is push-to-talk whatever this says | v1 |
-| V9 | Per-person volume | Row menu in the participant list | 100 %, heard | A | d | `CallGain {account, user_id, percent, muted}`, kept as `gain:<user id>` in the account's scope and sent to mediad as `Gain`, 0 to 200 % | chatd and mediad done; the row menu is the participant list's (07 §7a) |
-| V10 | Echo cancellation | Switch | On | G | d | `echo_cancellation`, in mediad's `Processing`: WebRTC AEC3 (sonora) with the call's mix as its reference | v1 |
-| V11 | Noise suppression | Switch | On | G | d | `noise_suppression`, as V10 | v1 |
-| V12 | Automatic gain | Switch | On | G | d | `auto_gain`, as V10 (AGC2, adaptive digital) | v1 |
-| V13 | Push-to-talk key | Key recorder | None | G | s | `ptt_key`, a `hotkey::Binding` (`f13`, `ctrl+shift+t`, `mouse4`, `ctrl`). The shell watches it in any app and sends `CallTalk` | v1 |
-| V14 | Release delay | Stepped slider: 0, 100, 200, 300, 500 or 1000 ms | 200 ms | G | d | `ptt_release_ms` | v1 |
-| V15 | Priority push-to-talk key | Key recorder | None | G | s | `priority_key`; `CallTalk {priority}`, and `call.state` `priority` on a Tiny server | v1 |
-| V16 | Toggle mute key | Key recorder | None | G | s | `mute_key`; does what ⌘⇧M does, in any app | v1 |
-| V17 | Toggle deafen key | Key recorder | None | G | s | `deafen_key`; as ⌘⇧D | v1 |
-| V18 | Hear yourself while testing | Switch | Off | | | The window's own: V3's test plays the processed microphone back (`TestMicrophone {loopback}`, mediad `Loopback`), outside a call | v1 |
+| V1 | Microphone | Menu: "System default (name)" then devices | System default | G | d | chatd sends it to mediad right after `Join`. Shown by name; a missing device falls back to the default and the menu says "(not connected)". Audio & video is where the default device lives. | in |
+| V2 | Speaker | Menu, as V1 | System default | G | d | As V1, for output. Also where S12 plays | in |
+| V4 | Join calls with my microphone muted | Switch | Off | G | d | On: every join and every Accept starts muted, and the dock shows it | in |
+| V5 | Call volume | Slider 0 to 100 % | 100 % | G | d | Gain on everyone's voice in mediad's mix. | in |
 
-The device menu in the call dock gains "Play test sound" (S12) and "Call settings…", which opens
-this section. Picking a device in the dock changes the call and not the default; the dock marks
-what is in use and resets when the call ends (fixes the stale-device defect).
+### Voice
 
-V-notes, behaviour with no setting: on macOS, calls move to the VoiceProcessingIO audio unit for
-echo cancellation, gain and noise reduction, which also brings the system's Mic Mode. Opus moves
-to `OPUS_APPLICATION_VOIP`. V6's default may change after VPIO; the stored value is kept if the
-user moved it.
+| # | Setting | Type | Default | Scope | Home | What it changes | Rel |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| V3 | Input level | Test button and meter | | | | While on, the meter is live. Outside a call, mediad starts for it and exits after Stop. | in |
+| V6 | Microphone sensitivity | Slider over the live meter | | G | d | The voice gate threshold in mediad. | in |
+| V8 | Voice activation or push to talk | Switch and key recorder | | G | d | In the window. | in |
+| V10–V19 | Processing, keys, release delay | Switches and recorders | V10–V12 on | G | d | Echo cancellation, noise suppression, automatic gain (default on), key recorders (V13 and V15–V17: push-to-talk, priority, mute, deafen), and release delay. A downloaded noise-suppression model is not V11. | in |
+| S7–S10 | Call cues and their volume | Switches and a slider | Cues on | G | d | Join, leave, mute, deafen, connection, and their volume. Cue semantics during a call are `06-calls.md`. | in |
+| V7 | Camera device | | | G | d | Not in the window. Search: "tinyclient has no camera yet." A Tiny call dock can toggle the camera. That toggle is `06-calls.md`. | not in 0.2.35 |
+| V9 | Per-person volume | | | C | | `CallGain` on a Tiny participant row, not a Settings row. | not in 0.2.35 |
+
+"Call settings…" opens Audio & video. A device picked in the call dock lasts for that call and resets when the call ends. How a call uses the microphone, the echo canceller, and the camera toggle is `06-calls.md`.
 
 ### Storage
 
 | # | Setting | Type | Default | Scope | Home | What it changes | Rel |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| D1 | Usage | Total, two-part bar (Messages, Images and files), "Show in Finder" | | | | Read from `Store::media_on_disk` and the database file size | v1 |
-| D2 | Keep images and files up to | Segmented: 250 MB / 500 MB / 1 GB / 2 GB | 500 MB | G | d | `Blobs::evict`'s cap, oldest unused first; takes effect within 1 min | v1 |
-| D3 | Clear… | Button, then confirm (08 §5 copy) | | | | Deletes `media/` and message rows, then vacuums. Sessions, drafts and settings stay | v1 |
+| D1 | Usage | Total, two-part bar (Messages, Images and files), "Show in Finder" | | | | Read from `Store::media_on_disk` and the database file size | in |
+| D2 | Keep images and files up to | Segmented: 250 MB / 500 MB / 1 GB / 2 GB | 500 MB | G | d | `Blobs::evict`'s cap, oldest unused first; takes effect within 1 min | in |
+| D3 | Clear… | Button, then confirm (08 §5 copy) | | | | Deletes `media/` and message rows, then vacuums. Sessions, drafts and settings stay | in |
 
 ### Shortcuts
 
 A read-only list of every shortcut, grouped as the menus are, searchable. ⌘/ opens it. Caption:
 "To change a shortcut, add it in System Settings › Keyboard › Keyboard Shortcuts › App
-Shortcuts." Every command is in a menu, so that works for all of them. v1. A key editor is Never.
+Shortcuts." Every command is in a menu, so that works for all of them. An editor for ordinary menu shortcuts is Never. Voice keys are recorders in Voice, not this list.
 
 ### About
 
-As 08 §7, with the Signal fix: "One small app for Slack, Discord, Telegram, Teams and Signal."
-Added, all v1:
+The tag line should name Discord, Slack, Telegram, Teams, Signal, Messages, and Tiny. The string in the window still names five: "One small app for Slack, Discord, Telegram, Teams and Signal."
 
 | # | Control | What it does |
 | --- | --- | --- |
@@ -249,9 +275,7 @@ Added, all v1:
 
 ### Count
 
-v1: 50 controls in the window (G 2, N 12, S 12, A 4, M 4, P 4, V 6, D 3, B 3, Accounts and
-Shortcuts besides), plus per-account rows that multiply with accounts and per-conversation sound.
-Later: 18, listed below.
+The 2026-10-14 count of "30 of 50" is not the window on main. What 0.2.35 shows is the "Shipped rows" table at the top of this file. Gaps are "Not in the window".
 
 ## Sound design
 
@@ -259,7 +283,7 @@ Later: 18, listed below.
 
 | Path | Plays | How | Cost |
 | --- | --- | --- | --- |
-| The notification | Message, mention and ring sounds | chatd sets `UNNotificationContent.sound` to a named file in `tinyclient.app/Contents/Resources` (macOS looks in the main bundle), to `.default` for "System alert sound", or to nil | 0 bytes of audio code, 0 memory. macOS applies Focus, the alert volume, the alert device and its per-app "Play sound for notifications" switch |
+| The notification | Message, mention and ring sounds | chatd sets the notification sound to a named bundled file, or to nil for None. "System alert sound" is not a picker choice in 0.2.35. | 0 bytes of audio code, 0 memory. macOS applies Focus, the alert volume, the alert device and its per-app "Play sound for notifications" switch |
 | mediad | In-call cues and the test sound | Synthesised tones mixed into `play()` on the chosen output, after deafen | About 2 KB of code, no assets. mediad runs only in a call or a test |
 
 The window process gets one small exception: S11's preview plays the bundled file once with
@@ -307,8 +331,7 @@ from any conversation. The OS then applies Focus, its own mute and the app's sou
 
 ### Volume
 
-- Notification sounds: no slider. They follow the macOS alert volume, and a second slider would
-  disagree with it. The caption says where it is.
+- Notification sounds: on macOS they follow the alert volume, and SV is hidden there. SV is the notification-volume row on the platforms that show it.
 - Cues: S10, because they share the call's output and must sit under voices at the user's taste.
 - Voices: V5.
 
@@ -372,9 +395,8 @@ Where a platform cannot honour a control, the control is not shown on that platf
 - **chatd:** `settings` gets a `version` row. On start, before serving the socket, chatd runs any
   pending migration in one transaction (rename a key, convert a value). An unknown key is kept
   and ignored; a value that does not parse is treated as the default and logged once.
-- **Shell:** `shell.prefs` gains one line per setting (`theme`, `density`, `send`, `previews`,
-  `open_at`, `settings_section`, and so on). Today an unknown line is dropped when the file is
-  rewritten; that changes so unknown lines are kept, and an older build never erases a newer
+- **Shell:** `shell.prefs` keeps theme-adjacent choices (`density`, `send`, `previews`,
+  `settings_section`, and so on). There is no theme value; the section word is stored. Unknown lines are kept, so an older build does not erase a newer
   build's choices.
 - **First run of this release:** nothing to migrate. The existing `text` line keeps its meaning.
   The stale in-call device pick is not migrated.
@@ -408,9 +430,8 @@ item; mediad's in serde's internally tagged decoding of the new `MediaRequest` f
 `Cue`: about 70 KB of `ContentDeserializer` code), the test mode (`probe.rs`) and the cues. The
 notification sounds' synthesis is linked only into the example and the tests. Neither overrun
 has an easy cut: the shell's would need fewer, shared closures across the rows, mediad's a
-hand-written frame decoder. **The branch is not to merge past these budgets without the owner's
-sign-off recorded in `07-budgets-and-risk.md`.** The seven sound files are 114 KB. Idle memory was not measured in
-this pass.
+hand-written frame decoder. That measurement is history from the `settings` branch, which has merged. It is not a gate. The +400 KB shell line does not block anything on main. The seven sound files are 114 KB. Idle memory was not measured in
+this pass. Re-measure only if `07-budgets-and-risk.md` grows a new gate.
 
 What keeps idle at zero: pause and quiet hours are checked when a notification would be posted,
 not by a timer. The only timer is one one-shot at the pause's end, to redraw the rail bell. No
@@ -419,20 +440,19 @@ chatd never links audio, and mediad does not run. The settings index is static d
 
 ## Acceptance
 
-One check per v1 setting, run from outside the process unless it names a unit test. "Post" means a
+One check per shipped setting, run from outside the process unless it names a unit test. "Post" means a
 notification delivered by the system, read with `log stream --predicate 'subsystem ==
 "com.apple.usernotifications"'` or the e2e harness's capture.
 
 **General**
-- G1: switch on, log out and in: `chatd` is in the process table within 10 s and the shell is
-  not; System Settings › Login Items lists tinyclient. Off: neither after login.
+- G1: not in 0.2.35. There is no open-at-login switch and no Login Items row.
 - G2: off, ⌘W: no shell and no chatd within 2 s. On, ⌘W: chatd still answers `ping`; a DM
   posts. ⌘Q in both cases: no tinyclient process within 2 s.
 
 **Notifications**
 - N1: off, inject a DM: nothing posted; `list` shows unread 1; badge 1.
 - N2: DMs and mentions, inject a plain channel message: nothing posted. All messages: one post.
-- N3: account at Off, the same DM: nothing posted; another account's DM still posts.
+- N3: not in 0.2.35. There is no per-account notify menu. ND, NG, NM, and NT are global.
 - N4: each value, inject a DM from "Ines" with text "hi": title, subtitle and body match the
   table exactly.
 - N5: each value, inject a ring: Ring posts with the ring sound; Silently posts with nil sound;
@@ -453,8 +473,8 @@ notification delivered by the system, read with `log stream --predicate 'subsyst
 **Sounds**
 - S1: off: every post has nil sound; a join in a call produces no cue (mediad's mix log shows no
   cue frames).
-- S2 to S6: for each layer set, inject the matching DM or mention: the posted content's sound
-  name equals the expected file, resolved conversation over account over mention over message.
+- S2 to S4: the posted sound is one of Pebble, Drop, Tap, Chime, Glass, the two rings, or None. "System alert sound" is not a choice in 0.2.35.
+- S5 and S6: not in 0.2.35. No Settings row or conversation-side control was found that writes them. chatd will honor a stored account or conversation sound if one exists.
 - S7 to S9: each off, cause the event: no cue frames; on, exactly one cue of the right kind.
 - S10: at 0 % a cue produces silent frames; at 100 % its peak is −20 dBFS ±1 dB in the mix log.
 - S11: press: the sound plays once on the alert device (`AudioObjectGetPropertyData` on the
@@ -464,9 +484,7 @@ notification delivered by the system, read with `log stream --predicate 'subsyst
   1 s apart produce one sound.
 
 **Appearance**
-- A1: Match system, switch macOS to Light: the next frame uses light tokens (screenshot with
-  `--shot` in both); a grep finds no colour literal outside `theme.rs`; every text token meets the
-  ratios in `01-system.md` §2.
+- A1: not in 0.2.35. The app is dark. Search says "tinyclient is dark only for now."
 - A2: each of the five stops is selectable and lit; ⌘+ to +1 lights the +1 stop.
 - A3: Compact: list row height 40 in `--shot` layout dump; 720 pt window lists at least 16 rows.
 - A4: off: no preview text in any list row in `--shot`.
@@ -485,10 +503,8 @@ notification delivered by the system, read with `log stream --predicate 'subsyst
 - P4: 7 days: rows older than 7 days are gone within 1 min (`sqlite3` count is 0).
 
 **Audio & video**
-- V1, V2: set a device, start a call: `status` names it; unplug it: the call moves to a
-  stand-in (never a virtual device), the dock and menu say so, the setting is unchanged; plug it
-  back in: the call moves back within 2 s. Pick a device in the call's menu, leave, quit,
-  rejoin: the call uses it.
+- V1, V2: set a device, start a call: `status` names it; unplug it: the call moves to the
+  default, the menu says "(not connected)", the setting is unchanged.
 - V3: outside a call, hold: the meter moves; release: no mediad within 3 s.
 - V4: on, join: mediad sends no audio packets until unmuted; the dock shows muted.
 - V5: at 50 %, a tone from the peer plays at −6 dB ±1 dB relative to 100 %.
@@ -507,114 +523,41 @@ notification delivered by the system, read with `log stream --predicate 'subsyst
   are untouched.
 
 **Search and keyboard**
-- Searching "ding" lists S2, S3, S4; "dark" lists A1; "proxy" shows the honest line.
-- With the mouse unplugged, every v1 control can be reached and changed from ⌘, (scripted
+- Searching "ding" lists S2, S3, S4. "dark" and "login" return the `NOT_YET` line (A1 and G1 are not in 0.2.35). "proxy" shows the honest line. "System alert sound" is not a result.
+- With the mouse unplugged, every control that is in the window can be reached and changed from ⌘, (scripted
   keystrokes in the e2e harness).
 
 **Budgets**: each row of the budget table, measured before and after, in the release notes.
 
-## Release cut
+## Later
 
-### Built so far (2026-10-14)
-
-30 of the 50 v1 controls are in the window, each with its check, plus Accounts, Shortcuts and
-search:
-
-- **General:** G2, with `Request::Shutdown`. ⌘Q now stops chatd too.
-- **Sounds:** S1, S7 to S10, S12. The in-call cues are mixed in mediad; S1 governs the cues only
-  until notifications post sounds.
-- **Appearance:** A2 (five stops, the ⌘+ state), A3, A4.
-- **Messages:** M1 to M4.
-- **Privacy:** P1 and P2 per account, P3 (pictures, stickers and link-preview images in
-  messages; avatars and custom emoji still load), P4 with its count.
-- **Audio & video:** V1 to V6. The device menus list devices by running `mediad --devices`,
-  which opens nothing and exits; the shell links no audio code.
-- **Storage:** D1 to D3. **About:** B1 to B3.
-- **Defects fixed:** the stale call device (a pick in the call's menu ends with the call); Discord
-  typing now follows P1, off by default; Teams receipts follow P2; ⌘Q stops chatd; text size has
-  five lit stops; About names Signal.
-- **Sounds:** the seven bundled files are rendered and committed, checked against a manifest on
-  macOS. They are not copied into the bundle until notifications post them.
-
-### Notifications built (2026-10-28)
-
-Step 6 is in, on Windows first. chatd posts (`chatd/src/notify.rs`), through the `notifier` crate:
-WinRT toasts on Windows, UNUserNotificationCenter on macOS (inside the bundle only), and
-org.freedesktop.Notifications on Linux.
-
-- **Notifications:** N1, N2, N4 (and its locked-screen twin, read from the session's WTS lock
-  state on Windows), N5, N6, N7 (1 hour, until 08:00, until resumed), N8 with its two times,
-  N9, N10 (taskbar flash on Windows, Dock bounce on macOS), N11 (the taskbar overlay or Dock
-  badge, the `ATTENTION` total), N13. Each kind has a switch of its own: direct messages, group
-  chats, mentions in channels, Tiny servers. N3 and the per-conversation level are honoured by
-  chatd (`notify_about` in the account's or conversation's scope); N3 has no row yet.
-- **Behaviour with no setting:** all of the list above the Sounds table: never the conversation
-  open in the focused window (`Watching.focused`), never mine, never history at connect (older
-  than 2 minutes when heard), never muted; one notification per conversation, its newest three
-  lines, replaced in place and withdrawn when the row is read anywhere; Reply and Mark as read;
-  a click opens the window there, starting it if it is closed; the network's Do Not Disturb (my
-  own presence `dnd`) holds it back. The ring is posted with Accept and Decline and withdrawn
-  when it stops.
-- **Sounds:** S1 now silences notifications too; S2, S3, S4 with S11's play buttons; S5 and S6
-  are honoured, and S6 is set in Details beside the conversation's notifications. Windows and
-  Linux post silent and chatd plays the sound itself (`mediad --sound`, rendered from the same
-  code as the files), at a notification volume of its own (`alert_volume`, shown where it
-  applies). The silence rules are applied in the order above.
-- A scratch directory (`TINYCLIENT_DIR`) posts nothing unless `TINYCLIENT_NOTIFY=on`, so tests
-  never do. `tinyclient --notify-test` posts N13 from a terminal.
-
-Not built yet, and so absent from the window: G1 (needs a login item that starts chatd alone, in
-the signed bundle), N3's rows, the permission banners of design 06, A1 (step 7: light tokens and
-contrast), the Accounts row menu, the menu bar's Notifications… popover (Details carries its two
-controls), and VPIO with `OPUS_APPLICATION_VOIP` (V-notes). "System alert sound" is not offered:
-an unpackaged Windows app could only name the system's sounds, and chatd plays ours.
-`packaging/bundle.sh` copies the seven CAF files into the bundle's Resources, where macOS finds
-them by name. Search answers "theme", "login" and the Later terms with a line saying so.
-
-### v1, build now
-
-Order matters; each step ships the rows it makes real, and no row appears before its check passes.
-
-1. **Defects first.** Stale call device; Discord typing always sent; Teams receipts always sent;
-   ⌘Q not stopping chatd; text size showing nothing selected; About leaving out Signal.
-2. **Settings store and protocol** (`settings` table, `Settings`, `Set`, `Change::Settings`),
-   `shell.prefs` keeping unknown lines, search, keyboard, the Shortcuts section, About B1 to B3.
-3. **Cheap and fully real:** A2, A3, A4, M1 to M4, P1 to P4, D1 to D3.
-4. **Calls:** V1 to V6, S7 to S10, S12; VPIO and `OPUS_APPLICATION_VOIP` alongside.
-5. **General:** G2 (with `Request::Shutdown`), then G1 in the signed bundle.
-6. **Notifications and their sounds**, after the spike in `04-live-signals.md` §Decision: N1 to
-   N13, S1 to S6, S11, the seven bundled sounds. If the spike needs the helper app fallback, the
-   rows are the same; only the poster changes.
-7. **A1, light theme**, once the 23 hard-coded colours go through tokens and the light values
-   pass contrast.
-
-v1 is 50 controls. If a step slips, its rows stay out and the rest still ship.
-
-### Later
+Still absent, matching `NOT_YET` and the "Not in the window" table above. M5, V8, and V10–V19 are in the window. They are not in this list.
 
 | Item | Waits on |
 | --- | --- |
-| G3 Show in menu bar | Design of the menu; low demand while the Dock badge works |
-| N14 Reaction notifications, N15 thread replies | Adapters telling reactions to my messages and followed threads apart, per network |
+| G1 Open at login | A login item. Search says there is none yet. |
+| G3 Show in menu bar | No tray icon on this commit. |
+| A1 Light theme | Dark only. |
+| N3 per-account notify menu | Not a row. ND, NG, NM, and NT are global. |
+| N14 Reaction notifications, N15 thread replies | No reaction or thread-follow notify control. |
 | N16 Focus filter | App Intents in a Rust bundle; check cost |
-| S13 Custom sound files | The `~/Library/Sounds` spike |
-| S14 Ring-back tone, longer looping ring | mediad starting at ringing out; the withdrawal-stops-sound check |
-| M5 GIF playback choice | GIF playback |
-| M6 Spellcheck | About 300 lines on `NSSpellChecker`, macOS only |
-| P5 Hide from screen sharing | Proof it works on macOS 15 and later |
-| P6 Touch ID lock | Design of what is locked (window only; chatd keeps running) |
-| P7 Signal always relay | Signal calls |
-| V7 Camera, V8 push to talk, V9 per-person volume | Camera; Input Monitoring permission and a key recorder; participant list menu |
-| Proxy (SOCKS5 for Telegram) | Wanted in censored regions; TDLib supports it. Breaks rule 10 of `07-budgets-and-risk.md` §5 for the other networks, so Telegram only |
-| Keyword alerts of our own | The network's own keyword lists are honoured already |
-| Noise suppression model (`nnnoiseless`, about 100 KB) | Evidence that VPIO is not enough |
+| S5, S6 pickers | chatd reads the scopes. No writer was found in the window. |
+| S13 Custom sound files | Not offered. |
+| S14 Ring-back tone, longer looping ring | Not offered. |
+| M6 Spellcheck | `NOT_YET`. |
+| P5 Hide from screen sharing | `NOT_YET`. |
+| P6 Touch ID lock | `NOT_YET`. |
+| P7 Signal always relay | `NOT_YET`. |
+| V7 Camera device | "tinyclient has no camera yet." The call-dock camera toggle is `06-calls.md`. |
+| Proxy, accent, font, language, sync | `NOT_YET`. A proxy, if it is ever offered, is Telegram only. It is not a setting. |
+
+V9 is `CallGain` on a Tiny participant row, not a later Settings row.
 
 ### Never
 
-Accent colours, fonts, per-network colours, a keybinding editor, in-app banner style or alert
-volume, an in-app Reduce Motion, toggles for echo cancellation or gain, hardware acceleration,
-"experimental" options, language, cache location, notification rules editors beyond the levels
-above, a settings sync service.
+Accent colours, a font picker, per-network theme colours, an editor for ordinary menu shortcuts, in-app banner style, an in-app Reduce Motion, a hardware-acceleration switch, an experimental tab, a language picker, a cache-location picker, and a settings sync service.
+
+Voice processing and the push-to-talk keys are settings. They are not in this list.
 
 ### Optional Linux service management
 

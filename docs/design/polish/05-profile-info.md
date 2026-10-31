@@ -4,11 +4,6 @@ What the right pane (and its small version, the card) says about a person, a con
 `product/polish/06-profile-info.md`, ruled by `00-rulings.md`. Frame and following: `polish/07-panes.md`. Tokens and parts:
 `design/01-system.md` and `polish/01-system.md`. Mockup: `mockups/05-profile-info.html`. Sizes in pt.
 
-**Today** (seeded scratch daemon, `--open 2 --right info`, `TINYCLIENT_S6=profile-body`): a 340 pane on `canvas` with a grey
-72 band behind an 80 avatar even when the network gives no colour, a "Discord" chip, a lone "Friend" line, a Message button
-beside the DM it would open, tabs whose empty state claims "No pictures or videos shared here yet.", nothing for channels
-or group DMs (`--open 0|3 --right info` opens nothing). The card stacks 11 items before its body.
-
 ## 1. Pane frame
 300 wide (`PANE`), fill `sidebar`, hairline left. Strip 52 per `07-panes`: title "Profile" (person) or "Details"
 (conversation, Space), close `x`; `‹ Members` / `‹ Thread` crumb when pushed. Body scrolls under the strip; padding 16,
@@ -51,6 +46,14 @@ profile answers. A section is drawn only with a value: no label without a value,
 | In common | 3 servers | — | 4 groups ›(+1) | — |
 | Shared | cache + "Search all on Discord" | files complete on click; links cache | exact counts, full list | cache only, "Open in Teams" |
 | Foot | since / friends since / in server since | Open in Slack | Open in Telegram | Open in Teams |
+
+| | Signal | Messages | Tiny server |
+|---|---|---|---|
+| Notifications | "Set on your phone" | "Stays on your phone" | "Not available on Tiny" |
+
+The other rows for these three follow the same rule as the four: a section is drawn only with a value. Bands and role chips were not re-specified here.
+
+A Tiny server member's name in the server page menu opens `tiny/menus.rs` `Modal::Profile`. That modal is the server page. It is not this right-hand profile pane. Do not merge the two.
 
 **Bot / app** (P5): tag "App", no dot, no presence line unless it has a status; actions Message (if DM-able) and "…";
 About = its description; In common; foot "In Moss & Lichen since Apr 2024". No Call, no Contact, no Right now.
