@@ -169,7 +169,11 @@ impl Fake {
     }
 
     fn join(&mut self, join: Join) {
-        let mut rtc = RtcConfig::new().set_ice_lite(true).clear_codecs().enable_opus(true, false).build(Instant::now());
+        // The same H.264 the client offers. A video m-line with no payload type is an answer
+        // mediad refuses, and the call never starts. This fake still forwards only Opus.
+        let mut config = RtcConfig::new().set_ice_lite(true).clear_codecs().enable_opus(true, false);
+        config.codec_config().add_h264(108.into(), Some(109.into()), true, 0x42e01f);
+        let mut rtc = config.build(Instant::now());
         rtc.add_local_candidate(Candidate::host(self.addr, "udp").unwrap());
         rtc.add_local_candidate(Candidate::builder().tcp().host(self.addr).tcptype(TcpType::Passive).build().unwrap());
         let offer = SdpOffer::from_sdp_string(&join.offer).unwrap();
