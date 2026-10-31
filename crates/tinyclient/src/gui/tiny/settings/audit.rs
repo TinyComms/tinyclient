@@ -110,6 +110,7 @@ pub(in crate::gui) fn sentence(community: &TinyCommunity, row: &TinyAudit, count
         "bootstrap" => "The server was set up, and an owner invite was printed.".to_owned(),
         "server.update" => format!("{who} changed the server's settings."),
         "server.icon" => format!("{who} changed the server's icon."),
+        "account.avatar" => format!("{who} changed their picture."),
         "role.create" => format!("{who} created {}.", named("role")),
         "role.update" => format!("{who} changed {}.", named("role")),
         "role.delete" => format!("{who} deleted {}.", named("role")),

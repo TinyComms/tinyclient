@@ -676,10 +676,11 @@ pub(crate) fn community(hub: &Hub, account: AccountKey) -> Response {
         Ok(saved) => saved,
         Err(error) => return error,
     };
-    let members = match members_of(&saved) {
+    let mut members = match members_of(&saved) {
         Ok(members) => members,
         Err(detail) => return refused(detail),
     };
+    manage::remember_avatars(&saved, &account, &mut members);
     // What the server can do and what this account may, read afresh with each load. An older
     // server has no features and no access; the saved legacy role then decides, as it did.
     let known = manage::learn(&saved);

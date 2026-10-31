@@ -32,7 +32,7 @@ use super::input::{InputEvent, InputKey, TextInput};
 use super::sidebar::Mode;
 use super::state::Shell;
 use crate::client::ask;
-use gpui::{prelude::*, Bounds, ClipboardItem, Context, Entity, Focusable, Pixels, Point, Task, Window};
+use gpui::{prelude::*, Bounds, ClipboardItem, Context, Entity, Focusable, PathPromptOptions, Pixels, Point, Task, Window};
 use protocol::{AccountKey, CallStats, Change, Key, Link, Network, Presence, Request, Response, TinyCommunity};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -373,6 +373,11 @@ impl Page<'_> {
 
     pub fn icon(&self) -> Option<std::path::PathBuf> {
         self.community.server.as_ref().map(|server| server.icon_path.clone()).filter(|path| !path.is_empty()).map(std::path::PathBuf::from)
+    }
+
+    /// Their picture on disk, once chatd has fetched it.
+    pub fn picture(&self, user_id: &str) -> Option<std::path::PathBuf> {
+        self.community.member(user_id).map(|member| member.avatar_path.clone()).filter(|path| !path.is_empty()).map(std::path::PathBuf::from)
     }
 }
 
@@ -1174,6 +1179,59 @@ impl Shell {
         self.tiny_state.modal = None;
         self.tiny_state.modal_error = None;
         cx.notify();
+    }
+
+    /// Opens a direct message with someone on this server. The chat is a People conversation,
+    /// not a channel of the server.
+    pub(super) fn tiny_message(&mut self, user_id: String, cx: &mut Context<Self>) {
+        let Some(page) = self.tiny_page_facts() else {
+            return;
+        };
+        if user_id == page.me {
+            return;
+        }
+        let name = page.community.member(&user_id).map(model::name_of).unwrap_or_else(|| "Someone".to_owned());
+        let person = protocol::Person::new(page.key(&user_id), name);
+        drop(page);
+        self.close_modal(cx);
+        self.tiny_close_float(cx);
+        self.go(Mode::People, cx);
+        self.open_person(&person, cx);
+    }
+
+    /// The system's file panel. The picture chosen becomes this account's avatar.
+    pub(super) fn tiny_pick_avatar(&mut self, cx: &mut Context<Self>) {
+        let asked = cx.prompt_for_paths(PathPromptOptions { files: true, directories: false, multiple: false, prompt: Some("Use as your picture".into()) });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = asked.await {
+                if let Some(path) = paths.into_iter().next() {
+                    let _ = this.update(cx, |this, cx| this.tiny_send_avatar(Some(path.to_string_lossy().into_owned()), cx));
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Sends a picture, or with `None` removes the one this account has.
+    pub(super) fn tiny_send_avatar(&mut self, path: Option<String>, cx: &mut Context<Self>) {
+        let Some(account) = self.tiny_state.account.clone() else {
+            return;
+        };
+        self.off_thread(cx, move || ask(&Request::TinyAvatar { account, path }), |this, answer, cx| {
+            let failed = match answer {
+                Ok(Response::Ok) => None,
+                Ok(Response::Error { detail, .. }) => Some(detail),
+                Ok(_) => Some(crate::client::OTHER_ANSWER.to_owned()),
+                Err(err) => Some(crate::client::trouble_words(&err)),
+            };
+            if let Some(detail) = failed {
+                this.toast(Some(("icons/circle-alert.svg", super::theme::danger())), detail, cx);
+            }
+            if let Some(account) = this.tiny_state.account.clone() {
+                this.fetch(account, None, cx);
+            }
+            cx.notify();
+        });
     }
 
     pub(super) fn tiny_send_invite(&mut self, cx: &mut Context<Self>) {

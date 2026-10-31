@@ -413,7 +413,7 @@ impl Shell {
                 MouseButton::Right,
                 cx.listener(move |this, event: &MouseDownEvent, _, cx| this.tiny_open_float(Float::Person { user_id: user_id.clone(), at: event.position }, cx)),
             )
-            .child(Avatar::new(&page.key(&seat.user_id), &name, avatar).build())
+            .child(Avatar::new(&page.key(&seat.user_id), &name, avatar).image_at(page.picture(&seat.user_id)).build())
             .child(
                 div()
                     .max_w(px(w - 24.))

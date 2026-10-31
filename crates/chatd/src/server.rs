@@ -1938,6 +1938,7 @@ impl Chat {
             },
             Request::TinyServerUpdate { account, edit } => adapters::tiny::manage::server_update(account, edit),
             Request::TinyServerIcon { account, path } => adapters::tiny::manage::server_icon(account, path),
+            Request::TinyAvatar { account, path } => adapters::tiny::manage::user_avatar(account, path),
             Request::TinyRoleCreate { account, role } => adapters::tiny::manage::role_create(account, role),
             Request::TinyRoleUpdate { account, role_id, role } => adapters::tiny::manage::role_update(account, role_id, role),
             Request::TinyRoleDelete { account, role_id } => adapters::tiny::manage::role_delete(account, role_id),

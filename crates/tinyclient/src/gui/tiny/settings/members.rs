@@ -267,7 +267,7 @@ fn row(facts: &Facts, member: &TinyMember, on: bool, now: i64, cx: &mut Context<
     let community = facts.community;
     let name = model::name_of(member);
     let me = member.user_id == facts.me;
-    let mut avatar = Avatar::new(&facts.key(&member.user_id), &name, 32.);
+    let mut avatar = Avatar::new(&facts.key(&member.user_id), &name, 32.).image_at(facts.picture(&member.user_id));
     if let Some(presence) = facts.online(&member.user_id) {
         avatar = avatar.presence(presence, theme::raised());
     }

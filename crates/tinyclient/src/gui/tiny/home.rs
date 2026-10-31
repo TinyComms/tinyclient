@@ -115,7 +115,7 @@ impl Shell {
             let mine = page.mine == Some(room.id.as_str());
             let faces = div().flex().items_center().gap(px(6.)).children(room.participants.iter().take(8).map(|seat| {
                 let name = model::name_by_id(page.community, &seat.user_id);
-                crate::gui::call::ringed(Avatar::new(&page.key(&seat.user_id), &name, 28.).build(), 28., seat.speaking && !seat.server_muted)
+                crate::gui::call::ringed(Avatar::new(&page.key(&seat.user_id), &name, 28.).image_at(page.picture(&seat.user_id)).build(), 28., seat.speaking && !seat.server_muted)
             }));
             let more = room.participants.len().saturating_sub(8);
             let names: Vec<String> = room.participants.iter().take(3).map(|seat| model::name_by_id(page.community, &seat.user_id).split_whitespace().next().unwrap_or("").to_owned()).collect();
@@ -186,7 +186,8 @@ impl Shell {
         for member in &people {
             let name = model::name_of(member);
             let color = model::color_of(page.community, member).map(gpui::rgb).unwrap_or(theme::text());
-            let user_id = member.user_id.clone();
+            let menu_id = member.user_id.clone();
+            let open_id = member.user_id.clone();
             grid = grid.child(
                 div()
                     .id(SharedString::from(format!("tiny-home-person-{}", member.user_id)))
@@ -202,11 +203,12 @@ impl Shell {
                     .gap(px(8.))
                     .cursor_pointer()
                     .hover(|style| style.border_color(theme::border()))
+                    .on_click(cx.listener(move |this, _, window, cx| this.tiny_open_modal(Modal::Profile(open_id.clone()), window, cx)))
                     .on_mouse_down(
                         MouseButton::Right,
-                        cx.listener(move |this, event: &MouseDownEvent, _, cx| this.tiny_open_float(super::Float::Person { user_id: user_id.clone(), at: event.position }, cx)),
+                        cx.listener(move |this, event: &MouseDownEvent, _, cx| this.tiny_open_float(super::Float::Person { user_id: menu_id.clone(), at: event.position }, cx)),
                     )
-                    .child(Avatar::new(&page.key(&member.user_id), &name, 28.).build())
+                    .child(Avatar::new(&page.key(&member.user_id), &name, 28.).image_at(page.picture(&member.user_id)).build())
                     .child(div().type_ui().text_color(color).child(name))
                     .when(member.user_id == page.me, |chip| chip.child(div().type_micro().text_color(theme::text_faint()).child("You"))),
             );
