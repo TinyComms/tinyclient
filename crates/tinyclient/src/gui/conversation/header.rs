@@ -103,14 +103,34 @@ impl Shell {
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(|this, _, _, cx| this.toggle_member_list(cx)))
         });
-        let (glyph, words) = if direct { ("icons/user.svg", "Profile") } else { ("icons/info.svg", "Details") };
-        let details = icon_button("details", glyph, self.pane_shows(|layer| matches!(layer, Layer::Profile(_) | Layer::Details(_))))
-            .tooltip(tip(words, Some("⌘.")))
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(cx.listener(|this, _, _, cx| this.toggle_details(cx)));
+        // Beside a channel or group Details has a button; beside a direct conversation the title
+        // is the way to the person, a link that opens their profile, so no button is drawn there.
+        let details = (!direct).then(|| {
+            icon_button("details", "icons/info.svg", self.pane_shows(|layer| matches!(layer, Layer::Details(_))))
+                .tooltip(tip("Details", Some("⌘.")))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_details(cx)))
+        });
         // The title keeps 96 before the line after it gives up anything; that line truncates first.
         // The title truncates before anything to its right moves; the line after it goes first.
-        let title = div().id("conversation-title").flex_initial().min_w(px(96.)).truncate().type_title().tooltip(tip(open.title.clone(), None)).child(open.title.clone());
+        let title_tip = if direct { "Open profile".to_owned() } else { open.title.clone() };
+        let title = div()
+            .id("conversation-title")
+            .flex_initial()
+            .min_w(px(96.))
+            .truncate()
+            .type_title()
+            .tooltip(tip(title_tip, direct.then_some("⌘.")))
+            .child(open.title.clone());
+        let title = if direct {
+            title
+                .cursor_pointer()
+                .hover(|style| style.underline())
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_details(cx)))
+        } else {
+            title
+        };
         let space = open.space.clone().map(|id| Key { id, ..open.key.clone() });
         let line = (!subtitle.is_empty()).then(|| {
             div()
@@ -160,7 +180,7 @@ impl Shell {
             )
             .children(search)
             .children(call.map(|call| div().flex_none().ml(px(8.)).child(call)))
-            .child(div().flex_none().ml(px(8.)).flex().gap(px(4.)).children(members).child(details))
+            .child(div().flex_none().ml(px(8.)).flex().gap(px(4.)).children(members).children(details))
     }
 
     /// The line after the title (07 §1): beside a direct conversation the person's status or

@@ -81,15 +81,6 @@ fn frame_sequence(timestamp: u64) -> u16 {
     (timestamp / FRAME as u64) as u16
 }
 
-/// What actually goes out. A one- or two-byte DTX packet is not safe to send and not safe to
-/// drop, so the silence frame takes its place and the timestamp still moves one frame.
-fn outbound(packet: &[u8]) -> &[u8] {
-    if packet.len() > 2 {
-        packet
-    } else {
-        &SILENCE
-    }
-}
 /// The level from which someone else's frame counts as speech, as in a Discord call.
 const VOICE: u8 = 25;
 const UDP: Token = Token(0);
@@ -887,11 +878,12 @@ impl Call {
         let Some(len) = self.encoder.encode(frame, &mut packet) else {
             return;
         };
-        // A packet of two bytes or less is DTX. Forwarding it is a full-scale pop on this
-        // libopus, and dropping it leaves a hole the receiver cannot see. Send silence instead.
-        let sending = outbound(&packet[..len]);
-        let (level, voice) = if sending.len() > 2 { (dbov(frame), voice) } else { (-127, false) };
-        self.write(sending, tick, level, voice);
+        // DTX is off, so even a frame of silence is a real packet in the speech mode and carries
+        // the in-band copy of the frame before it. The canned CELT silence packet is not: a
+        // receiver splices 5 ms of concealment of the old mode onto it, which is the pop. A
+        // one- or two-byte packet would be DTX after all: send it as itself, not as that.
+        let (level, voice) = if len > 2 { (dbov(frame), voice) } else { (-127, false) };
+        self.write(&packet[..len], tick, level, voice);
     }
 
     /// The microphone's 20 ms, through the processing and the gate. Once the fade and the
@@ -914,7 +906,9 @@ impl Call {
         }
         match step.send {
             Some(Send::Frame(frame)) => self.encode(&frame, self.ticks, true),
-            Some(Send::Silence) => self.write(&SILENCE, self.ticks, -127, false),
+            // The trail is what ends a spurt for the far decoder: five frames of real silence
+            // in the encoder's mode, not the fixed CELT packet, so there is no mode switch.
+            Some(Send::Silence) => self.encode(&[0i16; FRAME_SAMPLES], self.ticks, false),
             None => {}
         }
         heard
@@ -1145,13 +1139,11 @@ mod tests {
     }
 
     #[test]
-    fn a_timestamp_gap_is_a_missing_frame_and_a_tiny_packet_is_silence() {
+    fn a_timestamp_gap_is_a_missing_frame() {
         use crate::jitter::{Jitter, Pop};
         assert_eq!(frame_sequence(0), 0);
         assert_eq!(frame_sequence(960), 1);
         assert_eq!(frame_sequence(960 * 3), 3);
-        assert_eq!(outbound(&[0xf8]), &SILENCE[..]);
-        assert_eq!(outbound(&[1, 2, 3, 4]), &[1, 2, 3, 4]);
         let mut jitter = Jitter::default();
         for (stamp, byte) in [(0u64, 1u8), (960, 2), (960 * 3, 4)] {
             jitter.insert(frame_sequence(stamp), vec![byte]);
