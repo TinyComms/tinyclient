@@ -6,7 +6,7 @@
     "description": "tinyclient is a local desktop application. This origin publishes documentation and download redirects only. There is no remote chat API, no account service, and no token endpoint. Paths is empty on purpose.",
     "license": {
       "name": "MIT",
-      "url": "https://github.com/itz4blitz/tinyclient/blob/main/LICENSE"
+      "url": "https://github.com/TinyComms/tinyclient/blob/main/LICENSE"
     }
   },
   "externalDocs": {
