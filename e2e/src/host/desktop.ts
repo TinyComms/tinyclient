@@ -1,0 +1,59 @@
+import { remote, type Browser } from "webdriverio";
+import type { Host, PlatformName } from "../host.js";
+import { APPIUM_HOST, APPIUM_PORT } from "./appium.js";
+
+const ELEMENT = "element-6066-11e4-a52e-4f735466cecf";
+
+export async function attach(capabilities: WebdriverIO.Capabilities): Promise<Browser> {
+  return remote({
+    protocol: "http",
+    hostname: APPIUM_HOST,
+    port: APPIUM_PORT,
+    path: "/",
+    logLevel: "silent",
+    automationProtocol: "webdriver",
+    connectionRetryCount: 2,
+    connectionRetryTimeout: 30_000,
+    capabilities: { ...capabilities, webSocketUrl: false },
+  });
+}
+
+async function elementId(browser: Browser, name: string): Promise<string | undefined> {
+  for (const using of ["name", "accessibility id"]) {
+    try {
+      const found = await browser.findElements(using, name);
+      const id = found[0]?.[ELEMENT];
+      if (id) return id;
+    } catch {
+      // This driver may not implement that locator. The other one can still hit.
+    }
+  }
+  return undefined;
+}
+
+export function driverHost(platform: PlatformName, browser: Browser, record: Host["record"]): Host {
+  return {
+    platform,
+    async find(name) {
+      return (await elementId(browser, name)) !== undefined;
+    },
+    async click(name) {
+      const deadline = Date.now() + 10_000;
+      for (;;) {
+        const id = await elementId(browser, name);
+        if (id) {
+          await browser.elementClick(id);
+          return;
+        }
+        if (Date.now() >= deadline) {
+          throw new Error(`no control named ${name}`);
+        }
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+    },
+    record,
+    async close() {
+      await browser.deleteSession();
+    },
+  };
+}
