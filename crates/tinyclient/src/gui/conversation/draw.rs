@@ -665,12 +665,10 @@ impl Pane {
                             .type_body()
                             .when(self.metrics == Metrics::PHONE, |name| name.text_size(px(tokens_phone::scaled(15.))).line_height(px(tokens_phone::scaled(20.))))
                             .font_weight(theme::SEMIBOLD)
-                            .child(name)
-                            // Mine, on a phone: 2 pt of amber under the label only. It sits at
-                            // the label's own box, so 200% text scales it with the words.
-                            .children(mine.then(|| {
-                                div().absolute().left_0().right_0().bottom_0().h(px(2.)).rounded(px(1.)).bg(tokens_phone::accent())
-                            })),
+                            // Mine, on a phone: the label itself turns amber. An underline read
+                            // as a link, and a rule beside the words read as chrome.
+                            .when(mine, |name| name.text_color(tokens_phone::accent_text()))
+                            .child(name),
                     )
                     .child(
                         div()
