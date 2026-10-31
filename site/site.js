@@ -244,9 +244,9 @@ function registerSiteTools() {
     { path: "/docs/architecture.html", title: "Architecture", about: "chatd, the window, mediad, the sign-in helper, and storage." },
     { path: "/docs/performance.html", title: "Size and performance", about: "Disk and memory next to the official apps, and how each number was measured." },
     { path: "/docs/privacy.html", title: "Privacy and security", about: "What tinyclient stores, which connections it makes, and what it never does." },
-    { path: "/docs/networks.html", title: "Networks and terms", about: "Support on Slack, Discord, Telegram, Teams, Signal and Android Messages." },
+    { path: "/docs/networks.html", title: "Networks and terms", about: "Support on Slack, Discord, Telegram, Teams, Signal, Android Messages and a Tiny server." },
     { path: "/docs/contributing.html", title: "Contributing", about: "Roadmap and the rules every change keeps." },
-    { path: "/tinyserver", title: "Tiny server", about: "The self-hosted voice server for tinyclient, and how to run one." }
+    { path: "/tinyserver", title: "Tiny server", about: "A self-hosted server for one community: text, voice, one picture, and how to run one." }
   ];
 
   var tools = [
