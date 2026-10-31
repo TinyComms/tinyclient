@@ -1,5 +1,5 @@
 use mediad::session::{self, Controls};
-use mediad::{audio, out, permission, tiny};
+use mediad::{audio, out, permission, picture, tiny};
 use protocol::{
     media_process_needed, read_frame, Content, Direction, MediaRequest, MediaResponse, VideoStream,
     DEVICES_LIMIT,
@@ -31,31 +31,31 @@ const NOT_YET: &str = "The call isn't connected yet, so there's nothing to measu
 #[link_section = "__TEXT,__info_plist"]
 static INFO_PLIST: [u8; include_bytes!("../Info.plist").len()] = *include_bytes!("../Info.plist");
 
-/// The video codec sessions of one call. Each field is one session, so a second share replaces
-/// the first instead of adding a tile. Bookkeeping only: video is not carried yet.
+/// The video sessions of one call. Each field is one session, so a second share replaces the
+/// first instead of adding a tile.
 #[derive(Default)]
 struct Video {
     share_encode: bool,
+    camera_encode: bool,
     share_decode: Option<String>,
     speaker_decode: Option<String>,
 }
 
 impl Video {
     fn streams(&self) -> Vec<VideoStream> {
-        let decode = |content, source: &Option<String>| {
+        let decode = |content: Content, source: &Option<String>| {
             source.clone().map(|source| VideoStream {
                 direction: Direction::Decode,
                 content,
                 source,
             })
         };
-        let encode = self.share_encode.then(|| VideoStream {
-            direction: Direction::Encode,
-            content: Content::Share,
-            source: String::new(),
-        });
-        encode
+        let encode = |on: bool, content: Content| {
+            on.then(|| VideoStream { direction: Direction::Encode, content, source: String::new() })
+        };
+        encode(self.share_encode, Content::Share)
             .into_iter()
+            .chain(encode(self.camera_encode, Content::Camera))
             .chain(decode(Content::Share, &self.share_decode))
             .chain(decode(Content::Speaker, &self.speaker_decode))
             .collect()
@@ -86,13 +86,46 @@ impl Call {
             MediaRequest::ShareSend { on: true }
             | MediaRequest::ShareWatch { source: Some(_) }
             | MediaRequest::Speaker { source: Some(_) }
-                if self.voice.is_some() =>
+            | MediaRequest::Camera { on: true }
+                if self.voice.is_some() && self.tiny.is_none() =>
             {
                 return MediaResponse::Refused { detail: NO_VIDEO.to_owned() };
             }
-            MediaRequest::ShareSend { on } => self.video.share_encode = on,
-            MediaRequest::ShareWatch { source } => self.video.share_decode = source,
-            MediaRequest::Speaker { source } => self.video.speaker_decode = source,
+            MediaRequest::ShareSend { on } => {
+                if self.tiny.is_some() && on {
+                    if let Err(words) = picture::probe_screen() {
+                        return MediaResponse::Refused { detail: words };
+                    }
+                }
+                self.video.share_encode = on;
+                if self.tiny.is_some() {
+                    self.controls.set_share(on);
+                }
+            }
+            MediaRequest::Camera { on } => {
+                if self.tiny.is_some() && on {
+                    if let Err(words) = picture::probe_camera() {
+                        return MediaResponse::Refused { detail: words };
+                    }
+                }
+                self.video.camera_encode = on;
+                if self.tiny.is_some() {
+                    self.controls.set_camera(on);
+                }
+            }
+            MediaRequest::ShareWatch { source } => {
+                self.video.share_decode = source.clone();
+                if self.tiny.is_some() {
+                    self.controls.set_watch(source.is_some());
+                }
+            }
+            // A Tiny room's SFU already follows the active speaker. The bookkeeping stays for a
+            // call that has no engine yet, which is what chatd's lifecycle test drives.
+            MediaRequest::Speaker { source } => {
+                if self.tiny.is_none() || self.voice.is_none() {
+                    self.video.speaker_decode = source;
+                }
+            }
             MediaRequest::Join(join) => {
                 if self.voice.is_some() {
                     return MediaResponse::Refused { detail: "This call is already connecting.".to_owned() };
@@ -202,6 +235,14 @@ impl Call {
             }
             MediaRequest::TinySlots { audio } => {
                 self.controls.tiny_slots(audio);
+                return MediaResponse::Done;
+            }
+            MediaRequest::TinyRenegotiation { sdp } => {
+                self.controls.picture_answer(sdp);
+                return MediaResponse::Done;
+            }
+            MediaRequest::TinyPicture { picture } => {
+                self.controls.set_picture(picture);
                 return MediaResponse::Done;
             }
             MediaRequest::TinyE2ee { frame } => {

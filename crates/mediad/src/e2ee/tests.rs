@@ -282,6 +282,24 @@ fn ids_are_the_contract_s_hashes() {
     assert_eq!(group_id("0b6f3d0e-1c2a-4d5e-8f90-123456789abc"), 0xff5f_ff38_49bf_c73d);
 }
 
+/// An H.264 picture is sealed with the same group as voice. The NAL header stays clear so
+/// the SFU can still see a keyframe, and the other side opens the same frame.
+#[test]
+fn a_sealed_picture_keeps_its_nal_header_and_opens() {
+    let (_, mut ada, mut bea, _) = three();
+    let frame = [
+        0, 0, 0, 1, 0x67, 0x42, 0xe0, 0x1f, 0, 0, 0, 1, 0x65, 0x88, 0x84, 0x21, 0xff, 0x10, 0x22, 0x33, 0x44, 0x55,
+    ];
+    let sealed = ada.seal_video(&frame).expect("sealed");
+    assert_ne!(sealed, frame);
+    assert_eq!(sealed[4], 0x67, "the SPS NAL header stays clear");
+    let idr = sealed.windows(5).position(|window| window == [0, 0, 0, 1, 0x65]).expect("idr start");
+    assert_eq!(sealed[idr + 4], 0x65, "the IDR NAL header stays clear");
+    assert_ne!(&sealed[idr + 5..], &frame[13..], "the slice body is not in clear");
+    assert_eq!(bea.open_video(ADA, &sealed).as_deref(), Some(&frame[..]));
+    assert_eq!(bea.open_video(ADA, &frame), None, "a clear picture is dropped in an end-to-end call");
+}
+
 #[test]
 fn what_is_told_is_told_once() {
     let mut e2ee = app(ADA);

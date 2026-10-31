@@ -23,6 +23,29 @@ pub enum Content {
     Share,
     /// The active speaker's camera.
     Speaker,
+    /// Our own camera.
+    Camera,
+}
+
+/// What the one received picture is, as `call.slots` `video.kind` says.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PictureKind {
+    #[default]
+    Camera,
+    Share,
+}
+
+/// The picture on screen: a JPEG written by mediad. The path's name includes `generation`,
+/// because the window caches an image by its path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallPicture {
+    pub path: String,
+    pub width: u32,
+    pub height: u32,
+    pub generation: u64,
+    pub user_id: String,
+    pub kind: PictureKind,
 }
 
 /// A video stream mediad holds a codec session for.
@@ -91,6 +114,12 @@ pub struct Participant {
     /// Holding priority speech: while they talk, everyone else is quieter.
     #[serde(default, skip_serializing_if = "is_false")]
     pub priority: bool,
+    /// Their camera is on.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub camera: bool,
+    /// They hold the room's share.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sharing: bool,
 }
 
 /// One microphone or speaker the system lists.
@@ -165,6 +194,9 @@ pub struct Call {
     /// that says nothing about it (every network but a Tiny server today).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub security: Option<CallSecurity>,
+    /// The one picture being watched. `None` while nothing is on screen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub picture: Option<CallPicture>,
 }
 
 /// A Tiny server call's protection (tinyserver's `docs/calls.md`, "End-to-end encryption").
@@ -288,6 +320,15 @@ pub struct TinySlot {
     pub user_id: String,
 }
 
+/// Who the one video slot carries, as `call.slots` `video` says.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TinyPicture {
+    pub mid: String,
+    pub user_id: String,
+    #[serde(default)]
+    pub kind: PictureKind,
+}
+
 /// chatd to mediad, over mediad's stdin. Closing stdin ends the call. Each request gets exactly
 /// one reply (`Streams`, `Done` or `Refused`), in order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -329,6 +370,12 @@ pub enum MediaRequest {
     TinyAnswer { sdp: String },
     /// The server's whole map of receive slots, whenever it changes.
     TinySlots { audio: Vec<TinySlot> },
+    /// The answer to a renegotiation, or an empty SDP when the server refused it (`share_taken`).
+    TinyRenegotiation { sdp: String },
+    /// Our camera, on or off. A Tiny call only; a voice call refuses it in words.
+    Camera { on: bool },
+    /// Who the one video slot carries now. `None` when the server sends `video: null`.
+    TinyPicture { picture: Option<TinyPicture> },
     /// One `call.e2ee` frame from the server, as its JSON text, in the order it arrived.
     TinyE2ee { frame: String },
     /// Everyone in the room's call, us included, whenever it changes: whom the MLS group may
@@ -558,6 +605,21 @@ pub enum MediaResponse {
     /// How the Tiny call is protected now. Every member's `trust` is `Unverified`: chatd knows
     /// whom the user verified.
     TinySecurity(CallSecurity),
+    /// A renegotiation offer for `call.offer`. Not a reply: it arrives while the call is up.
+    TinyRenegotiate { sdp: String },
+    /// The picture to draw, or an empty path when it should come off the screen.
+    Picture {
+        path: String,
+        width: u32,
+        height: u32,
+        generation: u64,
+        user_id: String,
+        kind: PictureKind,
+    },
+    /// What our camera and share are actually sending, after an answer or a refusal.
+    Sending { share: bool, camera: bool },
+    /// A picture that could not be captured, in words. The voice call stays.
+    Notice { detail: String },
 }
 
 impl MediaResponse {

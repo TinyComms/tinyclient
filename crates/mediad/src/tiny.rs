@@ -4,7 +4,9 @@
 //!
 //! 1. `TinyOffer` makes the offer ([`Offer::new`]): one UDP socket, a host candidate for it and
 //!    an active ICE-TCP candidate (RFC 6544) on the same address, then one `sendonly` audio
-//!    m-line for the microphone and one `recvonly` per receive slot. Opus only. We are the full
+//!    m-line for the microphone and one `recvonly` per receive slot. Audio is Opus. Video is
+//!    H.264 constrained baseline: a simulcast camera and one share, both inactive until asked,
+//!    and one `recvonly` picture. We are the full
 //!    ICE agent and the server is ICE-lite; no trickle and no STUN server, since the server
 //!    learns our address from our checks. A UDP pair outranks a TCP one, so TCP carries the call
 //!    only where UDP cannot get through, as on a network that blocks it.
@@ -29,16 +31,17 @@ use crate::cue::Playing;
 use crate::framing::Conn;
 use crate::hear::{Ear, Limiter};
 use crate::media::{self, announce, finish_cue, listen, mixdown, Devices, Gate, Send, Stream, MICROPHONE_DENIED};
-use crate::process::Processor;
-use crate::stats::Meter;
 use crate::opus::Encoder;
 use crate::permission::{microphone, Microphone};
+use crate::picture::Pictures;
+use crate::process::Processor;
 use crate::rtp::SILENCE;
 use crate::session::Controls;
+use crate::stats::Meter;
 use crate::{out, rt, FRAME, FRAME_SAMPLES};
 use mio::net::{TcpStream, UdpSocket};
 use mio::{Events, Interest, Poll, Token};
-use protocol::{CallFailure, CallPath, Cue, MediaResponse, TinyOffer, TinySlot};
+use protocol::{CallFailure, CallPath, Cue, MediaResponse, PictureKind, TinyOffer, TinyPicture, TinySlot};
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, ErrorKind};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
@@ -46,22 +49,31 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use str0m::change::{SdpAnswer, SdpPendingOffer};
-use str0m::media::{Direction, Frequency, MediaKind, MediaTime, Mid};
+use str0m::media::{Direction, Frequency, KeyframeRequestKind, MediaKind, MediaTime, Mid, Rid, Simulcast, SimulcastLayer};
 use str0m::net::{Protocol, Receive, TcpType};
 use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcConfig};
 
 const TICK: Duration = Duration::from_millis(20);
 const SECOND: u64 = 50;
 
-/// Opus, and no hold for a missing audio packet. str0m's default waits for 15 later packets
-/// or a second, and the talk spurt has already ended by then. Video keeps its own hold.
+/// H.264 constrained baseline, level 3.1, packetization mode 1. The SFU accepts this and
+/// nothing else on a video m-line.
+const H264_PROFILE: u32 = 0x42e01f;
+const H264_PT: u8 = 108;
+const H264_RTX_PT: u8 = 109;
+
+/// Opus for audio, H.264 for video, and no hold for a missing audio packet. str0m's default
+/// waits for 15 later packets or a second, and the talk spurt has already ended by then.
+/// Video keeps its own hold.
 fn rtc_config() -> RtcConfig {
-    RtcConfig::new()
+    let mut config = RtcConfig::new()
         .clear_codecs()
         .enable_opus(true, false)
         .set_stats_interval(Some(Duration::from_secs(1)))
         .set_reordering_size_audio(0)
-        .set_reordering_timeout_audio(Some(Duration::from_millis(40)))
+        .set_reordering_timeout_audio(Some(Duration::from_millis(40)));
+    config.codec_config().add_h264(H264_PT.into(), Some(H264_RTX_PT.into()), true, H264_PROFILE);
+    config
 }
 
 /// The jitter buffer's sequence for an RTP timestamp at 48 kHz. One 20 ms frame is 960.
@@ -124,6 +136,17 @@ pub struct Link {
     local_udp: Option<SocketAddr>,
     local_tcp: Option<SocketAddr>,
     microphone: Mid,
+    /// Camera, off until a renegotiation turns it sendonly. Simulcast rids `h` and `l`.
+    camera: Mid,
+    /// The one share, off until a renegotiation turns it sendonly. No rids.
+    share: Mid,
+    /// The one picture the room forwards: a share, or else the active speaker's camera.
+    screen: Mid,
+    /// A renegotiation offer that has not been answered. The join's offer lives on [`Offer`].
+    pending: Option<SdpPendingOffer>,
+    /// The m-line and direction the pending offer changed from, so a refusal can undo it.
+    /// str0m flips the m-line when it builds the offer.
+    flipped: Option<(Mid, Direction)>,
     /// When the answer was taken.
     answered: Instant,
 }
@@ -160,8 +183,27 @@ impl Offer {
         for _ in 0..spec.slots {
             change.add_media(MediaKind::Audio, Direction::RecvOnly, None, None, None);
         }
+        let mut layers = Simulcast::new();
+        layers.add_send_layer(SimulcastLayer::new("h"));
+        layers.add_send_layer(SimulcastLayer::new("l"));
+        let camera = change.add_media(MediaKind::Video, Direction::Inactive, None, None, Some(layers));
+        let share = change.add_media(MediaKind::Video, Direction::Inactive, None, None, None);
+        let screen = change.add_media(MediaKind::Video, Direction::RecvOnly, None, None, None);
         let (offer, pending) = change.apply().ok_or_else(|| io::Error::other("nothing to offer"))?;
-        let link = Link { rtc, udp: socket, tcp: HashMap::new(), local_udp, local_tcp, microphone, answered: Instant::now() };
+        let link = Link {
+            rtc,
+            udp: socket,
+            tcp: HashMap::new(),
+            local_udp,
+            local_tcp,
+            microphone,
+            camera,
+            share,
+            screen,
+            pending: None,
+            flipped: None,
+            answered: Instant::now(),
+        };
         Ok(Offer { link, pending, sdp: offer.to_sdp_string() })
     }
 
@@ -176,6 +218,97 @@ impl Offer {
         self.link.rtc.sdp_api().accept_answer(self.pending, answer).map_err(|err| format!("{err:?}"))?;
         self.link.answered = Instant::now();
         Ok(self.link)
+    }
+}
+
+impl Link {
+    pub fn microphone_mid(&self) -> Mid {
+        self.microphone
+    }
+
+    pub fn screen_mid(&self) -> Mid {
+        self.screen
+    }
+
+    pub fn camera_mid(&self) -> Mid {
+        self.camera
+    }
+
+    pub fn share_mid(&self) -> Mid {
+        self.share
+    }
+
+    /// A camera, share, or picture m-line. Those are not voice slots.
+    pub fn is_picture(&self, mid: Mid) -> bool {
+        mid == self.camera || mid == self.share || mid == self.screen
+    }
+
+    /// A renegotiation offer is out and has not been answered.
+    pub fn pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// `share` selects the share m-line; otherwise the camera.
+    pub fn direction(&self, share: bool) -> Direction {
+        let mid = if share { self.share } else { self.camera };
+        self.rtc.media(mid).map(|media| media.direction()).unwrap_or(Direction::Inactive)
+    }
+
+    /// One renegotiation: the camera or the share becomes `sendonly` or goes back to `inactive`.
+    /// The SDP is the offer for `call.offer`. Frames wait until [`Link::take_answer`].
+    pub fn offer_send(&mut self, share: bool, on: bool) -> Result<String, String> {
+        if self.pending.is_some() {
+            return Err("an offer is already out".to_owned());
+        }
+        let mid = if share { self.share } else { self.camera };
+        let direction = if on { Direction::SendOnly } else { Direction::Inactive };
+        self.flipped = self.rtc.media(mid).map(|media| (mid, media.direction()));
+        let mut change = self.rtc.sdp_api();
+        change.set_direction(mid, direction);
+        match change.apply() {
+            Some((offer, pending)) => {
+                self.pending = Some(pending);
+                Ok(offer.to_sdp_string())
+            }
+            None => {
+                self.flipped = None;
+                Err("nothing changed".to_owned())
+            }
+        }
+    }
+
+    /// The answer to the last [`Link::offer_send`]. An empty SDP is a refusal (`share_taken`):
+    /// the m-line goes back to the direction it had, and the offer is dropped.
+    pub fn take_answer(&mut self, sdp: &str) -> Result<(), String> {
+        let Some(pending) = self.pending.take() else {
+            return Err("no offer is out".to_owned());
+        };
+        if sdp.is_empty() {
+            self.undo();
+            return Err("refused".to_owned());
+        }
+        let answer = SdpAnswer::from_sdp_string(sdp).map_err(|err| format!("{err:?}"))?;
+        match self.rtc.sdp_api().accept_answer(pending, answer) {
+            Ok(()) => {
+                self.flipped = None;
+                Ok(())
+            }
+            Err(err) => {
+                self.undo();
+                Err(format!("{err:?}"))
+            }
+        }
+    }
+
+    /// Puts the m-line back. str0m already flipped it when the offer was made, and the server
+    /// kept the state from before that offer.
+    fn undo(&mut self) {
+        self.pending = None;
+        if let Some((mid, direction)) = self.flipped.take() {
+            let mut change = self.rtc.sdp_api();
+            change.set_direction(mid, direction);
+            let _ = change.apply();
+        }
     }
 }
 
@@ -235,6 +368,25 @@ struct Call {
     processor: Processor,
     limiter: Limiter,
     meter: Meter,
+    pictures: Pictures,
+    /// What the last accepted answer left sending. str0m's direction flips before the answer.
+    sending_share: bool,
+    sending_camera: bool,
+    /// `Some(true)` is a share offer still out; `Some(false)` is a camera offer.
+    offered: Option<bool>,
+    video_at: Option<Instant>,
+    camera_n: u64,
+    share_n: u64,
+    key_share: bool,
+    key_camera: bool,
+    wait_key: bool,
+    pli_at: Option<Instant>,
+    painted: Option<Instant>,
+    generation: u64,
+    shown: Option<TinyPicture>,
+    watching: bool,
+    share_noted: bool,
+    camera_noted: bool,
 }
 
 /// The RFC 6464 level of a frame, in dBov: 0 is the loudest, -127 silence.
@@ -284,6 +436,11 @@ impl Call {
             out::send(&MediaResponse::Interrupted);
         }
         self.lost.get_or_insert_with(Instant::now);
+        self.sending_share = false;
+        self.sending_camera = false;
+        self.offered = None;
+        self.wait_key = true;
+        self.shown = None;
         for (_, slot) in self.slots.drain() {
             if slot.stream.speaking() && !slot.user.is_empty() {
                 out::send(&MediaResponse::Speaking { user_id: slot.user, speaking: false });
@@ -349,6 +506,9 @@ impl Call {
                     self.encoder.set_loss(loss);
                 }
             }
+            Event::MediaData(data) if self.link.is_picture(data.mid) => self.picture_in(data),
+            Event::KeyframeRequest(request) if request.mid == self.link.share_mid() => self.key_share = true,
+            Event::KeyframeRequest(request) if request.mid == self.link.camera_mid() => self.key_camera = true,
             Event::MediaData(data) => {
                 let mid = data.mid.to_string();
                 if !self.slots.contains_key(&mid) {
@@ -532,6 +692,187 @@ impl Call {
         let _ = writer.audio_level(level, voice).write(pt, Instant::now(), time, payload);
     }
 
+    /// One renegotiation at a time, then frames on the lines whose answers are in.
+    fn picture_step(&mut self) {
+        if let Some(sdp) = self.controls.take_picture_answer() {
+            let refused = sdp.is_empty();
+            let offered_share = self.offered == Some(true);
+            let _ = self.link.take_answer(&sdp);
+            self.sending_share = self.link.direction(true) == Direction::SendOnly;
+            self.sending_camera = self.link.direction(false) == Direction::SendOnly;
+            self.offered = None;
+            if refused {
+                if offered_share {
+                    self.controls.set_share(self.sending_share);
+                    out::send(&MediaResponse::Notice { detail: "Someone else is already sharing.".to_owned() });
+                } else {
+                    self.controls.set_camera(self.sending_camera);
+                }
+            }
+            out::send(&MediaResponse::Sending { share: self.sending_share, camera: self.sending_camera });
+        }
+        if let Some(slot) = self.controls.take_picture() {
+            let changed = slot.as_ref().map(|pictured| (pictured.user_id.clone(), pictured.kind)) != self.shown.as_ref().map(|pictured| (pictured.user_id.clone(), pictured.kind));
+            self.shown = slot;
+            if changed {
+                self.wait_key = true;
+                self.pictures.reset_decoder();
+                self.ask_keyframe();
+            }
+        }
+        let watching = self.controls.watch();
+        if self.watching && !watching {
+            out::send(&MediaResponse::Picture {
+                path: String::new(),
+                width: 0,
+                height: 0,
+                generation: 0,
+                user_id: String::new(),
+                kind: PictureKind::Camera,
+            });
+            self.painted = None;
+        }
+        self.watching = watching;
+        if self.offered.is_none() && !self.link.pending() {
+            let (want_share, want_camera) = (self.controls.share(), self.controls.camera());
+            if want_share != self.sending_share {
+                match self.link.offer_send(true, want_share) {
+                    Ok(sdp) => {
+                        self.offered = Some(true);
+                        self.key_share = want_share;
+                        out::send(&MediaResponse::TinyRenegotiate { sdp });
+                    }
+                    Err(err) => eprintln!("mediad: the share could not be offered: {err}"),
+                }
+            } else if want_camera != self.sending_camera {
+                match self.link.offer_send(false, want_camera) {
+                    Ok(sdp) => {
+                        self.offered = Some(false);
+                        self.key_camera = want_camera;
+                        out::send(&MediaResponse::TinyRenegotiate { sdp });
+                    }
+                    Err(err) => eprintln!("mediad: the camera could not be offered: {err}"),
+                }
+            }
+        }
+        if !self.connected || self.video_at.is_some_and(|at| at.elapsed() < Duration::from_millis(66)) {
+            return;
+        }
+        let mut sent = false;
+        if self.sending_share && self.controls.share() {
+            match self.pictures.share(self.key_share || self.share_n == 0) {
+                Ok(frame) => {
+                    self.key_share = false;
+                    self.share_noted = false;
+                    self.write_video(self.link.share_mid(), None, &frame, self.share_n);
+                    self.share_n += 1;
+                    sent = true;
+                }
+                Err(words) => {
+                    if !self.share_noted {
+                        self.share_noted = true;
+                        self.controls.set_share(false);
+                        out::send(&MediaResponse::Notice { detail: words });
+                        out::send(&MediaResponse::Sending { share: false, camera: self.sending_camera });
+                    }
+                }
+            }
+        }
+        if self.sending_camera && self.controls.camera() {
+            match self.pictures.camera(self.key_camera || self.camera_n == 0) {
+                Ok((high, low)) => {
+                    self.key_camera = false;
+                    self.camera_noted = false;
+                    let n = self.camera_n;
+                    self.write_video(self.link.camera_mid(), Some("h"), &high, n);
+                    self.write_video(self.link.camera_mid(), Some("l"), &low, n);
+                    self.camera_n += 1;
+                    sent = true;
+                }
+                Err(words) => {
+                    if !self.camera_noted {
+                        self.camera_noted = true;
+                        self.controls.set_camera(false);
+                        out::send(&MediaResponse::Notice { detail: words });
+                        out::send(&MediaResponse::Sending { share: self.sending_share && self.controls.share(), camera: false });
+                    }
+                }
+            }
+        }
+        if sent {
+            self.video_at = Some(Instant::now());
+        }
+    }
+
+    fn write_video(&mut self, mid: Mid, rid: Option<&str>, annex_b: &[u8], n: u64) {
+        let Some(payload) = self.controls.e2ee(|e2ee| e2ee.seal_video(annex_b)) else {
+            return;
+        };
+        let Some(writer) = self.link.rtc.writer(mid) else {
+            return;
+        };
+        let Some(pt) = writer.payload_params().next().map(|params| params.pt()) else {
+            return;
+        };
+        let writer = match rid {
+            Some(rid) => writer.rid(Rid::from(rid)),
+            None => writer,
+        };
+        let time = MediaTime::new(n * 6000, Frequency::NINETY_KHZ);
+        let _ = writer.write(pt, Instant::now(), time, payload);
+    }
+
+    fn picture_in(&mut self, data: str0m::media::MediaData) {
+        if data.mid != self.link.screen_mid() || !self.controls.watch() {
+            return;
+        }
+        if !data.contiguous || (self.wait_key && !data.is_keyframe()) {
+            self.wait_key = true;
+            self.ask_keyframe();
+            return;
+        }
+        let user = self.shown.as_ref().map(|pictured| pictured.user_id.clone()).unwrap_or_default();
+        let kind = self.shown.as_ref().map(|pictured| pictured.kind).unwrap_or_default();
+        let Some(frame) = self.controls.e2ee(|e2ee| e2ee.open_video(&user, &data.data)) else {
+            self.wait_key = true;
+            self.ask_keyframe();
+            return;
+        };
+        if data.is_keyframe() {
+            self.wait_key = false;
+        }
+        if self.painted.is_some_and(|at| at.elapsed() < Duration::from_millis(100)) {
+            return;
+        }
+        self.generation = self.generation.wrapping_add(1);
+        let Some((path, width, height)) = self.pictures.decode(&frame, self.generation) else {
+            self.wait_key = true;
+            self.ask_keyframe();
+            return;
+        };
+        self.painted = Some(Instant::now());
+        out::send(&MediaResponse::Picture {
+            path: path.display().to_string(),
+            width,
+            height,
+            generation: self.generation,
+            user_id: user,
+            kind,
+        });
+    }
+
+    fn ask_keyframe(&mut self) {
+        let now = Instant::now();
+        if self.pli_at.is_some_and(|at| now.saturating_duration_since(at) < Duration::from_millis(300)) {
+            return;
+        }
+        self.pli_at = Some(now);
+        let screen = self.link.screen_mid();
+        if let Some(stream) = self.link.rtc.direct_api().stream_rx_by_mid(screen, None) {
+            stream.request_keyframe(KeyframeRequestKind::Pli);
+        }
+    }
+
     fn encode(&mut self, frame: &[i16; FRAME_SAMPLES], tick: u64, voice: bool) {
         let mut packet = [0u8; 1275];
         let Some(len) = self.encoder.encode(frame, &mut packet) else {
@@ -657,6 +998,7 @@ impl Call {
             if let Some(map) = map {
                 self.apply_slots(&map);
             }
+            self.picture_step();
             // A connection str0m has given up on waits for the next one, or for the bound.
             let timeout = match self.drain() {
                 Some(at) => at,
@@ -756,6 +1098,23 @@ pub fn run(link: Link, user_id: String, controls: Arc<Controls>) {
         processor: Processor::new(),
         limiter: Limiter::default(),
         meter: Meter::new(CallPath::Unknown),
+        pictures: Pictures::default(),
+        sending_share: false,
+        sending_camera: false,
+        offered: None,
+        video_at: None,
+        camera_n: 0,
+        share_n: 0,
+        key_share: false,
+        key_camera: false,
+        wait_key: true,
+        pli_at: None,
+        painted: None,
+        generation: 0,
+        shown: None,
+        watching: false,
+        share_noted: false,
+        camera_noted: false,
     };
     if let Err(err) = call.register() {
         eprintln!("mediad: the call's socket: {err}");
@@ -837,17 +1196,31 @@ mod tests {
         TinyOffer { user_id: "me".into(), host: "127.0.0.1".into(), slots, muted: false, deafened: false, e2ee: None }
     }
 
-    /// One microphone and `slots` receive slots, Opus only, and both kinds of candidate.
+    /// One microphone and `slots` receive slots, Opus on every audio line, then the three
+    /// video lines the SFU accepts: a simulcast camera and a share, both inactive until
+    /// asked, and one receive slot for the picture the room forwards.
     #[test]
     fn the_offer_is_one_microphone_then_a_receive_slot_for_each_other_seat() {
         let offer = Offer::new(&spec(11)).unwrap();
         let sdp = offer.sdp();
         assert_eq!(sdp.matches("m=audio").count(), 12, "{sdp}");
         assert_eq!(sdp.matches("a=sendonly").count(), 1);
-        assert_eq!(sdp.matches("a=recvonly").count(), 11);
-        assert!(!sdp.contains("m=video") && !sdp.contains("m=application"));
-        let codecs: Vec<&str> = sdp.lines().filter(|line| line.starts_with("a=rtpmap:")).collect();
-        assert!(codecs.iter().all(|line| line.contains("opus/48000/2")), "{codecs:?}");
+        assert_eq!(sdp.matches("a=recvonly").count(), 12, "eleven voices and one picture");
+        assert_eq!(sdp.matches("a=inactive").count(), 2, "camera and share stay off");
+        assert!(!sdp.contains("m=application"));
+        let video = video_sections(sdp);
+        assert_eq!(video.len(), 3, "{sdp}");
+        assert!(video[0].contains("a=inactive") && video[0].contains("a=rid:h") && video[0].contains("a=rid:l"), "camera simulcast, off: {}", video[0]);
+        assert!(video[0].contains("a=simulcast:"), "camera names its layers: {}", video[0]);
+        assert!(video[1].contains("a=inactive") && !video[1].contains("a=rid:"), "share is one layer and off: {}", video[1]);
+        assert!(video[2].contains("a=recvonly") && !video[2].contains("a=rid:"), "one picture in: {}", video[2]);
+        for section in &video {
+            assert!(section.to_ascii_lowercase().contains("profile-level-id=42e01f"), "constrained baseline: {section}");
+            assert!(section.contains("packetization-mode=1"), "{section}");
+            assert!(section.contains("H264/90000"), "{section}");
+        }
+        let audio: Vec<&str> = sdp.lines().filter(|line| line.starts_with("m=audio")).collect();
+        assert!(audio.iter().all(|line| !line.to_ascii_lowercase().contains("h264")), "{audio:?}");
         assert!(sdp.contains("ssrc-audio-level"), "the RFC 6464 extension is offered");
         assert!(sdp.contains(" udp ") || sdp.contains(" UDP "), "a UDP host candidate");
         assert!(sdp.contains("tcptype active"), "and an active ICE-TCP one");
@@ -856,9 +1229,66 @@ mod tests {
         assert!(!sdp.contains("ice-lite"), "we are the full ICE agent");
     }
 
+    /// Video m-line bodies, in offer order.
+    fn video_sections(sdp: &str) -> Vec<String> {
+        let mut sections = Vec::new();
+        let mut current: Option<String> = None;
+        for line in sdp.lines() {
+            if line.starts_with("m=") {
+                if let Some(done) = current.take() {
+                    sections.push(done);
+                }
+                if line.starts_with("m=video") {
+                    current = Some(String::new());
+                }
+            }
+            if let Some(section) = current.as_mut() {
+                section.push_str(line);
+                section.push('\n');
+            }
+        }
+        if let Some(done) = current {
+            sections.push(done);
+        }
+        sections
+    }
+
     #[test]
     fn an_answer_that_is_not_sdp_is_refused() {
         let offer = Offer::new(&spec(1)).unwrap();
         assert!(offer.accept("not sdp").is_err());
+    }
+
+    /// A peer that has taken our offer, so a later offer has an answer to accept.
+    fn linked(slots: u16) -> (Link, Rtc) {
+        let offer = Offer::new(&spec(slots)).unwrap();
+        let mut peer = rtc_config().build(Instant::now());
+        let incoming = str0m::change::SdpOffer::from_sdp_string(offer.sdp()).expect("offer");
+        let answer = peer.sdp_api().accept_offer(incoming).expect("answer");
+        let link = offer.accept(&answer.to_sdp_string()).expect("accept");
+        (link, peer)
+    }
+
+    /// The share stays inactive until its answer is in. An empty answer is a refusal
+    /// (`share_taken`): the m-line goes back, and the next offer can start it again.
+    #[test]
+    fn a_share_starts_only_once_its_answer_is_in_and_a_refusal_puts_it_back() {
+        let (mut link, mut peer) = linked(1);
+        assert_eq!(link.direction(true), Direction::Inactive);
+        assert_eq!(link.direction(false), Direction::Inactive);
+        let sdp = link.offer_send(true, true).unwrap();
+        let sections = video_sections(&sdp);
+        assert!(sections[1].contains("a=sendonly"), "the share is the second video line: {sdp}");
+        assert!(sections[0].contains("a=inactive"), "the camera is untouched");
+        assert!(link.take_answer("").is_err(), "an empty answer is a refusal");
+        assert_eq!(link.direction(true), Direction::Inactive, "the refusal puts the share back");
+        let sdp = link.offer_send(true, true).unwrap();
+        let incoming = str0m::change::SdpOffer::from_sdp_string(&sdp).unwrap();
+        let answer = peer.sdp_api().accept_offer(incoming).unwrap();
+        link.take_answer(&answer.to_sdp_string()).unwrap();
+        assert_eq!(link.direction(true), Direction::SendOnly);
+        assert_eq!(link.direction(false), Direction::Inactive);
+        assert!(link.is_picture(link.screen_mid()));
+        assert!(!link.is_picture(link.microphone_mid()));
     }
 }

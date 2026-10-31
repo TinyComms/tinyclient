@@ -16,7 +16,7 @@ use crate::gui::theme;
 use gpui::{
     deferred, div, prelude::*, px, AnyElement, Context, Div, FontWeight, Rgba, Stateful,
 };
-use protocol::{Call, CallFailure, CallState, ConversationKind, Key, Network};
+use protocol::{Call, CallFailure, CallState, Content, ConversationKind, Direction, Key, MediaRequest, Network, Request};
 
 /// The bar: two rows and the padding around them.
 const CARD: f32 = 96.;
@@ -48,6 +48,8 @@ enum Look {
     Off,
     /// Its menu is open.
     Open,
+    /// Share or camera is on.
+    On,
 }
 
 /// One control of the bar: 40 x 32, radius 8, a 16 px glyph. The card is `raised` already, so
@@ -57,6 +59,7 @@ fn control(id: &'static str, icon: &'static str, look: Look, enabled: bool) -> S
         Look::Rest => (theme::hover(), theme::text_soft()),
         Look::Off => (theme::danger_soft(), theme::danger()),
         Look::Open => (theme::selected(), theme::text()),
+        Look::On => (theme::accent_soft(), theme::accent()),
     };
     // Only a live control at rest brightens its glyph under the pointer.
     let lit = (enabled && look == Look::Rest).then(|| (id, theme::text()));
@@ -80,8 +83,14 @@ fn control(id: &'static str, icon: &'static str, look: Look, enabled: bool) -> S
             (true, Look::Rest) => control
                 .cursor_pointer()
                 .hover(|style| style.bg(theme::selected()).text_color(theme::text())),
+            (true, Look::On) => control.cursor_pointer().hover(|style| style.bg(theme::pressed())),
             (true, _) => control.cursor_pointer(),
         })
+}
+
+/// Our own encode of this picture is on.
+fn encoding(call: &Call, content: Content) -> bool {
+    call.video.iter().any(|stream| stream.direction == Direction::Encode && stream.content == content)
 }
 
 /// Leave, 48 x 32 at the right edge. It is live in every state that has it.
@@ -625,6 +634,18 @@ impl Shell {
         )
     }
 
+    /// Share and camera belong on a joined Tiny call whose room allows video. A room that has
+    /// not loaded yet still shows them: the server's default is that video is allowed.
+    fn tiny_pictures(&self, call: &Call) -> bool {
+        if call.conversation.network != Network::Tiny || call.state != CallState::Joined {
+            return false;
+        }
+        let Some(page) = self.tiny_page_facts().filter(|page| page.account == &call.conversation.account()) else {
+            return true;
+        };
+        page.community.rooms.iter().find(|room| room.id == call.conversation.id).is_none_or(|room| room.video_enabled)
+    }
+
     /// Over a Tiny server's column: "Voice connected", where, how well, and Disconnect. Mute,
     /// deafen and the voice settings are in the user panel right under it.
     fn call_compact(&self, call: &Call, subject: &Subject, cx: &mut Context<Self>) -> Div {
@@ -638,7 +659,7 @@ impl Shell {
             CallState::Reconnecting => ("Reconnecting…", theme::warning()),
             _ => ("Connecting…", theme::warning()),
         };
-        let notice = self.call_state.notice.clone().filter(|_| in_call(call));
+        let notice = self.call_state.error.clone().or_else(|| self.call_state.notice.clone().filter(|_| in_call(call)));
         let clock = if notice.is_some() || call.state == CallState::Joined { None } else { self.call_counter(call, cx) };
         let place = match &subject.space {
             Some(server) => format!("{} / {server}", subject.title),
@@ -844,6 +865,29 @@ impl Shell {
                 .tooltip(tip(if call.deafened { "Undeafen" } else { "Deafen" }, Some("⌘⇧D")))
                 .on_click(cx.listener(|this, _, _, cx| this.call_deafen(cx)))
         });
+        let pictures = self.tiny_pictures(call);
+        let share_on = encoding(call, Content::Share);
+        let camera_on = encoding(call, Content::Camera);
+        let share = pictures.then(|| {
+            control("call-share", "icons/monitor-up.svg", if share_on { Look::On } else { Look::Rest }, enabled)
+                .when(enabled, |share| {
+                    share
+                        .tooltip(tip(if share_on { "Stop sharing" } else { "Share your screen" }, None))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.call_ask(Request::Media(MediaRequest::ShareSend { on: !share_on }), cx)
+                        }))
+                })
+        });
+        let camera = pictures.then(|| {
+            control("call-camera", "icons/video.svg", if camera_on { Look::On } else { Look::Rest }, enabled)
+                .when(enabled, |camera| {
+                    camera
+                        .tooltip(tip(if camera_on { "Turn camera off" } else { "Turn camera on" }, None))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.call_ask(Request::Media(MediaRequest::Camera { on: !camera_on }), cx)
+                        }))
+                })
+        });
         let devices = control(
             "call-devices",
             "icons/settings.svg",
@@ -871,6 +915,8 @@ impl Shell {
             .child(mute)
             // Deafen is for a call that is up; before that only mute and devices can be preset.
             .when(in_call(call), |row| row.child(deafen))
+            .children(share)
+            .children(camera)
             .child(devices)
             .child(div().flex_1())
             .child(end.on_click(cx.listener(|this, _, _, cx| this.call_leave(cx))));
@@ -1069,6 +1115,7 @@ mod tests {
             inputs: Vec::new(),
             outputs: Vec::new(),
             security: None,
+            picture: None,
         }
     }
 

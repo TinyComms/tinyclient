@@ -1402,6 +1402,7 @@ fn video_is_refused_in_words_on_a_voice_call_and_reports_no_stream() {
         MediaRequest::ShareSend { on: true },
         MediaRequest::ShareWatch { source: Some(THEM.into()) },
         MediaRequest::Speaker { source: Some(THEM.into()) },
+        MediaRequest::Camera { on: true },
     ] {
         let MediaResponse::Refused { detail } = mediad.ask(request) else {
             panic!("video was accepted on a voice call");

@@ -169,7 +169,11 @@ impl Fake {
     }
 
     fn join(&mut self, join: Join) {
-        let mut rtc = RtcConfig::new().set_ice_lite(true).clear_codecs().enable_opus(true, false).build(Instant::now());
+        // The same H.264 the client offers. A video m-line with no payload type is an answer
+        // mediad refuses, and the call never starts. This fake still forwards only Opus.
+        let mut config = RtcConfig::new().set_ice_lite(true).clear_codecs().enable_opus(true, false);
+        config.codec_config().add_h264(108.into(), Some(109.into()), true, 0x42e01f);
+        let mut rtc = config.build(Instant::now());
         rtc.add_local_candidate(Candidate::host(self.addr, "udp").unwrap());
         rtc.add_local_candidate(Candidate::builder().tcp().host(self.addr).tcptype(TcpType::Passive).build().unwrap());
         let offer = SdpOffer::from_sdp_string(&join.offer).unwrap();
@@ -651,9 +655,17 @@ fn the_connection_reports_itself_and_the_bitrate_follows_the_room() {
     assert_eq!((before.path, before.codec.as_str()), (CallPath::Udp, "opus"), "{before:?}");
     assert!(before.loss_permille < 50 && before.jitter_ms < 40, "{before:?}");
     done(ada, MediaRequest::Bitrate { kbps: 16 });
-    sleep(Duration::from_millis(2200));
-    let after = stats(ada).unwrap();
-    assert!(after.send_kbps + 8 < before.send_kbps, "16 kb/s sends less: {} then {}", before.send_kbps, after.send_kbps);
+    // One published second can straddle the change. Wait until a later one is entirely at
+    // the room's rate, which a slow runner may not have by a fixed pause.
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        sleep(Duration::from_millis(200));
+        let now = stats(ada).unwrap();
+        if now.send_kbps + 8 < before.send_kbps {
+            break;
+        }
+        assert!(Instant::now() < deadline, "16 kb/s sends less: {} then {}", before.send_kbps, now.send_kbps);
+    }
     leave(people, sinks);
 }
 

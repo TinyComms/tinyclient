@@ -11,8 +11,8 @@
 use crate::hub::{now, Hub};
 use protocol::settings::{GLOBAL, INPUT, JOIN_MUTED, OUTPUT};
 use protocol::{
-    clip, read_frame, write_frame, AudioDevice, Call, CallFailure, CallState, Change, Cue, Key, MediaRequest,
-    MediaResponse, Participant, TinyOffer, TinySlot, VoiceJoin, DEVICES_LIMIT, OCCUPANTS_LIMIT,
+    clip, read_frame, write_frame, AudioDevice, Call, CallFailure, CallPicture, CallState, Change, Content, Cue, Direction, Key, MediaRequest,
+    MediaResponse, Participant, TinyOffer, TinySlot, VideoStream, VoiceJoin, DEVICES_LIMIT, OCCUPANTS_LIMIT,
 };
 use std::io::{self, BufReader};
 use std::path::PathBuf;
@@ -119,6 +119,8 @@ pub struct Calls {
     next: AtomicU64,
     failed: Mutex<Option<Failed>>,
     signal: Mutex<Option<Signal>>,
+    /// Who sends a Tiny renegotiation offer. The same shape as `signal`.
+    offer: Mutex<Option<Signal>>,
     /// The mediad started for Settings' microphone test or test sound, outside a call.
     tester: Mutex<Option<Tester>>,
 }
@@ -207,6 +209,7 @@ fn new_call(conversation: Key, state: CallState) -> Live {
         inputs: Vec::new(),
         outputs: Vec::new(),
         security: None,
+        picture: None,
     };
     Live {
         call,
@@ -365,7 +368,34 @@ impl Live {
                 }
                 self.call.security = security;
             }
-            MediaResponse::Source { .. } | MediaResponse::TinyE2ee { .. } => return false,
+            MediaResponse::Source { .. } | MediaResponse::TinyE2ee { .. } | MediaResponse::TinyRenegotiate { .. } => return false,
+            MediaResponse::Picture { path, width, height, generation, user_id, kind } => {
+                let picture = (!path.is_empty()).then(|| CallPicture { path, width, height, generation, user_id, kind });
+                if self.call.picture == picture {
+                    return false;
+                }
+                self.call.picture = picture;
+            }
+            MediaResponse::Sending { share, camera } => {
+                let mut video: Vec<VideoStream> = self.call.video.iter().filter(|stream| stream.direction != Direction::Encode).cloned().collect();
+                if camera {
+                    video.insert(0, VideoStream { direction: Direction::Encode, content: Content::Camera, source: String::new() });
+                }
+                if share {
+                    video.insert(0, VideoStream { direction: Direction::Encode, content: Content::Share, source: String::new() });
+                }
+                if video == self.call.video {
+                    return false;
+                }
+                self.call.video = video;
+            }
+            MediaResponse::Notice { detail } => {
+                let notice = Some(detail);
+                if self.call.device_notice == notice {
+                    return false;
+                }
+                self.call.device_notice = notice;
+            }
             MediaResponse::Ready { .. }
             | MediaResponse::Streams { .. }
             | MediaResponse::Done
@@ -453,9 +483,14 @@ impl ActiveCall {
                     learn_devices(&reader, inputs, outputs);
                 }
                 // A frame for the server: the adapter of the call's account sends it.
-                if let MediaResponse::TinyE2ee { frame } = frame {
+                if let MediaResponse::TinyE2ee { frame } = &frame {
                     let conversation = crate::hub::lock(&seen).call.conversation.clone();
-                    reader.calls.signal(&conversation, frame);
+                    reader.calls.signal(&conversation, frame.clone());
+                    continue;
+                }
+                if let MediaResponse::TinyRenegotiate { sdp } = &frame {
+                    let conversation = crate::hub::lock(&seen).call.conversation.clone();
+                    reader.calls.offer(&conversation, sdp.clone());
                     continue;
                 }
                 let mut live = crate::hub::lock(&seen);
@@ -580,9 +615,20 @@ impl Calls {
         *crate::hub::lock(&self.signal) = Some(Box::new(told));
     }
 
+    /// Who sends a renegotiation offer (`call.offer`) for the call's account.
+    pub fn on_offer(&self, told: impl Fn(&Key, String) + Send + Sync + 'static) {
+        *crate::hub::lock(&self.offer) = Some(Box::new(told));
+    }
+
     fn signal(&self, conversation: &Key, frame: String) {
         if let Some(told) = &*crate::hub::lock(&self.signal) {
             told(conversation, frame);
+        }
+    }
+
+    fn offer(&self, conversation: &Key, sdp: String) {
+        if let Some(told) = &*crate::hub::lock(&self.offer) {
+            told(conversation, sdp);
         }
     }
 

@@ -707,9 +707,14 @@ impl Shell {
         was.peer.clone()
     }
 
+    /// What the last request about the call was refused with, for the channel stage.
+    pub(in crate::gui) fn call_refused(&self) -> Option<&str> {
+        self.call_state.error.as_deref()
+    }
+
     /// One request about the call, asked off the main thread. chatd answers the outcome as a
     /// `Change::Call`; only a refusal is kept, to be shown in the dock and by the composer.
-    fn call_ask(&mut self, request: Request, cx: &mut Context<Self>) {
+    pub(in crate::gui) fn call_ask(&mut self, request: Request, cx: &mut Context<Self>) {
         self.call_state.error = None;
         cx.spawn(async move |this, cx| {
             let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
@@ -933,6 +938,7 @@ impl Shell {
                             inputs: Vec::new(),
                             outputs: Vec::new(),
                             security: None,
+                            picture: None,
                         });
                     }
                 }

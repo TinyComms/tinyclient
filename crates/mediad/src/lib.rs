@@ -30,6 +30,7 @@ pub mod hear;
 pub mod jitter;
 pub mod media;
 pub mod opus;
+pub mod picture;
 pub mod out;
 pub mod permission;
 pub mod pick;

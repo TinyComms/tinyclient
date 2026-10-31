@@ -441,6 +441,7 @@ mod tests {
             device_notice: None,
             device_stuck: false,
             security: Some(security),
+            picture: None,
         }
     }
 

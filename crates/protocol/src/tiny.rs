@@ -226,6 +226,12 @@ pub struct TinySeat {
     /// Holding priority speech now: listeners duck everyone else while they talk.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub priority: bool,
+    /// Their camera is on.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub camera: bool,
+    /// They hold the room's share.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sharing: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

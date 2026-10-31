@@ -14,7 +14,7 @@ use crate::media::{self, FromMedia, MICROPHONE_DENIED};
 use crate::permission::{microphone, Microphone};
 use crate::rtp::{self, Cipher, Sender};
 use crate::out;
-use protocol::{AudioProcessing, CallFailure, CallStats, Cue, InputMode, MediaResponse, TinySlot, Tuning, VoiceJoin};
+use protocol::{AudioProcessing, CallFailure, CallStats, Cue, InputMode, MediaResponse, TinyPicture, TinySlot, Tuning, VoiceJoin};
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap};
 use std::net::UdpSocket;
@@ -81,6 +81,14 @@ pub struct Controls {
     pub(crate) tiny_link: Mutex<Option<crate::tiny::Link>>,
     /// A Tiny server's newest slot map, not yet applied.
     pub(crate) tiny_slots: Mutex<Option<Vec<TinySlot>>>,
+    /// The camera and the share the user asked for, and whether the one picture is watched.
+    share: AtomicBool,
+    camera: AtomicBool,
+    watch: AtomicBool,
+    /// An answer to the renegotiation offer, or an empty SDP when the server refused it.
+    picture_answer: Mutex<Option<String>>,
+    /// Who the one video slot carries. `None` inside means the server sent no picture.
+    picture_slot: Mutex<Option<Option<TinyPicture>>>,
     /// A Tiny server call's end-to-end encryption (`e2ee`), shared by chatd's requests and the
     /// call's loop.
     pub(crate) tiny_e2ee: Mutex<crate::e2ee::E2ee>,
@@ -134,6 +142,49 @@ impl Controls {
     /// A Tiny server's new slot map, for its loop to apply.
     pub fn tiny_slots(&self, map: Vec<TinySlot>) {
         *self.tiny_slots.lock().unwrap() = Some(map);
+    }
+
+    pub fn set_share(&self, on: bool) {
+        self.share.store(on, Ordering::Relaxed);
+    }
+
+    pub fn share(&self) -> bool {
+        self.share.load(Ordering::Relaxed)
+    }
+
+    pub fn set_camera(&self, on: bool) {
+        self.camera.store(on, Ordering::Relaxed);
+    }
+
+    pub fn camera(&self) -> bool {
+        self.camera.load(Ordering::Relaxed)
+    }
+
+    pub fn set_watch(&self, on: bool) {
+        self.watch.store(on, Ordering::Relaxed);
+    }
+
+    pub fn watch(&self) -> bool {
+        self.watch.load(Ordering::Relaxed)
+    }
+
+    /// The answer to the last renegotiation, taken once by the call's loop.
+    pub fn picture_answer(&self, sdp: String) {
+        *self.picture_answer.lock().unwrap() = Some(sdp);
+    }
+
+    pub(crate) fn take_picture_answer(&self) -> Option<String> {
+        self.picture_answer.lock().unwrap().take()
+    }
+
+    /// Who the video slot carries now. The outer `Some` means the server said; the inner is
+    /// `None` when it sent `video: null`.
+    pub fn set_picture(&self, picture: Option<TinyPicture>) {
+        *self.picture_slot.lock().unwrap() = Some(picture);
+    }
+
+    pub(crate) fn take_picture(&self) -> Option<Option<TinyPicture>> {
+        self.picture_slot.lock().unwrap().take()
     }
 
     /// The devices chosen so far, for a call that opens them now. Any choice waiting for the

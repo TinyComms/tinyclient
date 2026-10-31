@@ -10,7 +10,9 @@
 //!
 //! Each Opus frame is sealed with our sender key from the group's current epoch (AES-128-GCM
 //! with an 8-byte tag, as DAVE does), so the RTP header and its RFC 6464 audio level stay in
-//! clear for the SFU to forward and to tell who speaks. A new epoch, on every join and leave,
+//! clear for the SFU to forward and to tell who speaks. An H.264 picture uses the same group
+//! and leaves the one-byte NAL header clear, so the SFU can still see a keyframe. A new epoch,
+//! on every join and leave,
 //! brings new keys: who left cannot open what is said after, and who joined cannot open what
 //! was said before.
 //!
@@ -21,7 +23,7 @@
 use crate::rtp::SILENCE;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use davey::{DaveSession, MediaType, ProposalsOperationType, SigningKeyPair};
+use davey::{Codec, DaveSession, MediaType, ProposalsOperationType, SigningKeyPair};
 use protocol::{CallSecurity, SecureMember, SecurityMode, TinyE2ee};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -358,6 +360,57 @@ impl E2ee {
                         None
                     }
                 }
+            }
+        }
+    }
+
+    /// One H.264 picture, Annex B, as it goes into RTP. The NAL header stays clear. `None`
+    /// holds it back while the call is to be end to end and has no keys yet.
+    pub fn seal_video(&mut self, frame: &[u8]) -> Option<Vec<u8>> {
+        match self.mode {
+            Mode::Transport => Some(frame.to_vec()),
+            Mode::Waiting => None,
+            Mode::Group => {
+                if !self.ready() {
+                    return None;
+                }
+                match self.session.as_mut()?.encrypt(MediaType::VIDEO, Codec::H264, frame) {
+                    Ok(sealed) => Some(sealed.into_owned()),
+                    Err(err) => {
+                        eprintln!("mediad: e2ee: a picture was not sealed, and is dropped: {err}");
+                        None
+                    }
+                }
+            }
+        }
+    }
+
+    /// `user`'s picture as the decoder wants it, or `None` to drop it. The same rules as
+    /// [`E2ee::open`]: clear media is dropped in an end-to-end call, and a sealed frame is
+    /// dropped in a transport-only call.
+    pub fn open_video(&mut self, user: &str, frame: &[u8]) -> Option<Vec<u8>> {
+        let sealed = frame.ends_with(&MARKER);
+        match self.mode {
+            Mode::Transport => return (!sealed).then(|| frame.to_vec()),
+            Mode::Waiting => return None,
+            Mode::Group => {}
+        }
+        if !sealed || user.is_empty() || !self.ready() {
+            return None;
+        }
+        match self.session.as_mut()?.decrypt(user_id(user), MediaType::VIDEO, frame) {
+            Ok(picture) => {
+                self.failures = 0;
+                Some(picture)
+            }
+            Err(_) => {
+                self.failures += 1;
+                let calm = self.recovered.is_none_or(|at| at.elapsed() > RECOVER_EVERY);
+                if self.failures > TOLERANCE && calm {
+                    eprintln!("mediad: e2ee: pictures stopped opening; rebuilding our group");
+                    self.recover();
+                }
+                None
             }
         }
     }
