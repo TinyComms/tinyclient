@@ -134,22 +134,25 @@ or move; Kick removes, Roles is Owner / Admin / Member.
 ## 3. Person menu
 
 Opens on right-click wherever a person is drawn: a seat, a tile, the member list, the home.
-260 wide. Head: avatar 28, name in role colour, their top role (or `You`). Then:
+260 wide. Head: avatar 28, name in role colour, their top role (or `You`). The name opens
+Profile, the same modal as a click on the row. There is no Profile row. Then:
 
-- Profile (a modal with the hover card's facts, wider).
+- Change picture, for me. Message, for anyone else.
 - **For you** (anyone but me): volume, a slider 0 to 200 % with a tick at 100 that it snaps to
-  within 4 %, its value at the right; Mute for me (check). Sent as `CallGain` when let go:
-  chatd keeps it per account (`gain:<user id>`) and applies it to every call on that account,
-  this one at once; the menu reads chatd's kept values back.
+  within 4 %, its value at the right; Mute for me, or Unmute for me once they are muted, with
+  the volume icon. Sent as `CallGain` when let go: chatd keeps it per account (`gain:<user id>`)
+  and applies it to every call on that account, this one at once; the menu reads chatd's kept
+  values back. The item stays open and the words flip at the click.
 - **Moderation** (each where the account outranks them and holds the bit in that room):
-  Server mute and Server deafen (checks), Move to ▸ (rooms with their occupancy), Disconnect
-  from call, Timeout ▸ (60 s, 5 min, 10 min, 1 h, 1 day, 1 week; Remove timeout when timed
-  out).
-- Roles ▸ (a check per role this account may assign, with its colour dot; on an older server
-  Owner, Admin, Member), Kick… and Ban… (`danger`, each a modal).
-- Copy user ID.
+  Server mute / Server unmute (mic) and Server deafen / Server undeafen (headphones). Each stays
+  open, and the words and icon flip at the click, before the server confirms. Move to ▸ (rooms
+  with their occupancy), Disconnect from call, Remove timeout when they are timed out, Timeout ▸
+  (60 s, 5 min, 10 min, 1 h, 1 day, 1 week; Remove timeout first when timed out).
+- Roles ▸ (a check per role this account may assign, with its colour dot; the check flips at the
+  click; on an older server Owner, Admin, Member), Kick… and Ban… (`danger`, each a modal).
+- Copy name, when they have one. Copy user ID.
 
-Submenus open beside their item on hover. Checks keep the menu open; everything else closes it.
+Submenus open beside their item on hover. A toggle keeps the menu open; everything else closes it.
 
 ## 4. Modals
 

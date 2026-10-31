@@ -162,6 +162,58 @@ pub fn seat_states(seat: &TinySeat) -> Vec<&'static str> {
     states
 }
 
+/// Icon and words for a voice item. Both name the action the click will take, so a second look
+/// shows the opposite of what is true now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VoiceWords {
+    pub icon: &'static str,
+    pub label: &'static str,
+}
+
+pub fn local_mute_words(muted: bool) -> VoiceWords {
+    if muted {
+        VoiceWords { icon: "icons/volume-2.svg", label: "Unmute for me" }
+    } else {
+        VoiceWords { icon: "icons/volume-x.svg", label: "Mute for me" }
+    }
+}
+
+pub fn server_mute_words(on: bool) -> VoiceWords {
+    if on {
+        VoiceWords { icon: "icons/mic.svg", label: "Server unmute" }
+    } else {
+        VoiceWords { icon: "icons/mic-off.svg", label: "Server mute" }
+    }
+}
+
+pub fn server_deafen_words(on: bool) -> VoiceWords {
+    if on {
+        VoiceWords { icon: "icons/headphones.svg", label: "Server undeafen" }
+    } else {
+        VoiceWords { icon: "icons/headphone-off.svg", label: "Server deafen" }
+    }
+}
+
+/// Draw a server mute or deafen on the seat before the page read that confirms it. A `None`
+/// leaves that flag as it was.
+pub fn draw_moderation(seat: &mut TinySeat, muted: Option<bool>, deafened: Option<bool>) {
+    if let Some(muted) = muted {
+        seat.server_muted = muted;
+    }
+    if let Some(deafened) = deafened {
+        seat.server_deafened = deafened;
+    }
+}
+
+/// Add `role_id` to the list, or take it off when it is already there.
+pub fn draw_role(roles: &mut Vec<String>, role_id: &str) {
+    if let Some(at) = roles.iter().position(|id| id == role_id) {
+        roles.remove(at);
+    } else {
+        roles.push(role_id.to_owned());
+    }
+}
+
 /// One row of the channel list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Line {
@@ -741,5 +793,28 @@ mod tests {
         assert_eq!(relative(1_000, 1_000 - 300), "5 min ago");
         assert_eq!(relative(0, 3 * 86_400), "in 3 days");
         assert_eq!(server_name(&legacy("member"), ""), "tiny.example");
+    }
+
+    #[test]
+    fn voice_menu_words_name_the_action_the_click_will_take() {
+        assert_eq!(local_mute_words(false), VoiceWords { icon: "icons/volume-x.svg", label: "Mute for me" });
+        assert_eq!(local_mute_words(true), VoiceWords { icon: "icons/volume-2.svg", label: "Unmute for me" });
+        assert_eq!(server_mute_words(false), VoiceWords { icon: "icons/mic-off.svg", label: "Server mute" });
+        assert_eq!(server_mute_words(true), VoiceWords { icon: "icons/mic.svg", label: "Server unmute" });
+        assert_eq!(server_deafen_words(false), VoiceWords { icon: "icons/headphone-off.svg", label: "Server deafen" });
+        assert_eq!(server_deafen_words(true), VoiceWords { icon: "icons/headphones.svg", label: "Server undeafen" });
+    }
+
+    #[test]
+    fn a_moderation_click_is_drawn_before_the_server_confirms_it() {
+        let mut seat = TinySeat { server_muted: false, server_deafened: true, ..TinySeat::default() };
+        draw_moderation(&mut seat, Some(true), None);
+        assert!(seat.server_muted && seat.server_deafened, "a mute leaves deafen as it was");
+        draw_moderation(&mut seat, None, Some(false));
+        assert!(seat.server_muted && !seat.server_deafened);
+        let mut roles = vec!["mod".to_owned()];
+        draw_role(&mut roles, "crew");
+        draw_role(&mut roles, "mod");
+        assert_eq!(roles, ["crew"]);
     }
 }
