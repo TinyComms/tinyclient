@@ -5,6 +5,13 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[lib]
+# iOS links a static library into the Xcode app (+ XCFramework in mobile/ios); Android loads a
+# cdylib from jniLibs. `rlib` keeps `cargo test` and any in-process caller working. The desktop
+# binary (src/main.rs) is untouched.
+name = "tinyclient"
+crate-type = ["rlib", "staticlib", "cdylib"]
+
 [dependencies]
 protocol.workspace = true
 sha2 = "0.10"
@@ -38,6 +45,17 @@ gui = ["dep:tlottie", "dep:ureq", "dep:url", "dep:gpui", "dep:gpui_platform", "d
 # Adds `--shot out.png`: render the window to a file and quit, for design review without
 # Screen Recording permission. Pulls GPUI's test support, so it is not part of `gui`.
 gui-shot = ["gui", "gpui/test-support", "gpui_platform/test-support"]
+# Entry points for the iOS and Android shells (src/lib.rs). `mobile` is `gui` plus the platform
+# entry symbol, and deliberately not `gui-shot`: the screenshot harness renders to a file and
+# pulls GPUI's test support, which has no meaning on a phone (device shots come from adb/simctl).
+# Desktop-only modules inside `gui/` (window chrome, menubar, settings window, self-update) still
+# compile on mobile for now; see docs/mobile-build.md, "Feature gating".
+mobile = ["gui", "dep:android-activity"]
+
+[target.'cfg(target_os = "android")'.dependencies]
+# Provides ANativeActivity_onCreate and calls our `android_main`. Only linked on Android, so a
+# host build never sees it. `native-activity` is the plain NativeActivity glue (no GameActivity).
+android-activity = { version = "0.6", optional = true, default-features = false, features = ["native-activity"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "cb13b37a6d80d034119888b534aa0d9067fb5aee", optional = true, default-features = false, features = ["font-kit", "runtime_shaders"] }

@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- The product talks to a hub over the network; the demo build does not need it but the
+         permission is harmless and avoids a manifest edit in the first real build. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <application
+        android:allowBackup="false"
+        android:hasCode="false"
+        android:label="Tiny"
+        android:supportsRtl="true"
+        android:theme="@android:style/Theme.Material.NoActionBar.Fullscreen">
+
+        <!-- NativeActivity, not a Kotlin subclass: the whole UI is the Rust library, so there
+             is no Java/Kotlin code to run (`hasCode="false"`). `android.app.lib_name` is the
+             cdylib's name without `lib`/`.so`; cargo builds `libtinyclient.so` from the
+             `tinyclient` package. `android_activity` provides `ANativeActivity_onCreate`,
+             which calls the `android_main` in src/lib.rs. -->
+        <activity
+            android:name="android.app.NativeActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode|density"
+            android:exported="true"
+            android:windowSoftInputMode="adjustResize">
+
+            <meta-data
+                android:name="android.app.lib_name"
+                android:value="tinyclient" />
+
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+
+</manifest>
