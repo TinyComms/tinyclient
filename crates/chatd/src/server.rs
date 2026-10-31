@@ -129,7 +129,7 @@ fn call_error(err: CallError) -> Response {
 }
 
 /// `TINYCLIENT_LOGIN`, or the `tinyclient-login` next to this binary.
-fn login_path() -> io::Result<PathBuf> {
+pub(crate) fn login_path() -> io::Result<PathBuf> {
     if let Some(path) = std::env::var_os("TINYCLIENT_LOGIN") {
         return Ok(PathBuf::from(path));
     }

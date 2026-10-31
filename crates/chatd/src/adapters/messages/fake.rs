@@ -1,6 +1,6 @@
 //! A scripted Messages account, so the adapter can be driven through chatd's socket with no phone.
 //!
-//! `messages.signin.ctl` while linking: `scan`, `expire`, `fail`.
+//! `messages.signin.ctl` while linking: `confirm`, `expire`, `fail`.
 //! `messages.ctl` once linked:
 //! `incoming WHO TEXT…`, `group WHO TEXT…`, `photo WHO`, `caption WHO TEXT…`,
 //! `file WHO NAME`, `remote WHO`, `react WHO TEXT`, `typing WHO`, `typing-stop WHO`,
@@ -21,8 +21,8 @@ pub const ALAN: &str = "phone-alan";
 pub const CLUB: &str = "phone-club";
 /// Grace as a participant of her chat: whose picture the phone is asked for.
 pub const GRACE_PARTICIPANT: &str = "participant-grace";
-pub const LINK: &str = "https://support.google.com/messages/?p=web_computer#?c=ZmFrZS0x";
-pub const LINK_AGAIN: &str = "https://support.google.com/messages/?p=web_computer#?c=ZmFrZS0y";
+pub const EMOJI: &str = "🐢";
+pub const EMOJI_AGAIN: &str = "🐈";
 
 fn record(line: &str) {
     let path = protocol::support_dir().join("messages.calls");
@@ -377,13 +377,13 @@ impl Drive for Fake {
     }
 }
 
-/// Links when the test says the phone scanned the code.
+/// Links when the test says the phone confirmed the matching emoji.
 pub struct FakeLinker;
 
 impl FakeLinker {
     pub fn link(show: &dyn Fn(String), cancelled: &AtomicBool) -> Result<String, String> {
         let control = script::control("messages.signin.ctl");
-        show(LINK.to_owned());
+        show(EMOJI.to_owned());
         let mut outcome = None;
         script::follow(&control, |line| {
             if cancelled.load(Ordering::Relaxed) {
@@ -391,13 +391,13 @@ impl FakeLinker {
                 return false;
             }
             match line.map(str::trim) {
-                Some("scan") => {
+                Some("confirm") => {
                     let session = serde_json::json!({ "account": ME, "name": "Ada Quill" });
                     outcome = Some(Ok(session.to_string()));
                     false
                 }
                 Some("expire") => {
-                    show(LINK_AGAIN.to_owned());
+                    show(EMOJI_AGAIN.to_owned());
                     true
                 }
                 Some("fail") => {
@@ -407,6 +407,7 @@ impl FakeLinker {
                 _ => true,
             }
         });
+        record("pairing stopped");
         outcome.unwrap_or_else(|| Err("the pairing was interrupted".into()))
     }
 }
