@@ -409,15 +409,21 @@ impl Demo {
         CatalogPage { items, cursor }
     }
 
-    /// Rows on screen with no preview: the "network" says what was said last.
+    /// Rows on screen with no preview. A stored message is that line. A chat with none
+    /// stays "No messages yet" instead of a line the network never sent.
     fn previews(&self, ids: &[String]) {
         for id in ids {
-            let line = PreviewLine {
-                id: format!("{}000", now()),
-                text: "Calendar invite: kickoff on Monday".to_owned(),
-                sender: "Ana Ruiz".to_owned(),
-                mine: false,
-                sent: self.ctx.known(id).ok().flatten().map_or_else(now, |row| row.updated.max(1)),
+            let sent = self.ctx.known(id).ok().flatten().map_or_else(now, |row| row.updated.max(1));
+            let line = match self.hub.store().newest_line(&self.key(id)) {
+                Ok(Some(mut line)) => {
+                    line.sent = line.sent.max(sent);
+                    line
+                }
+                Ok(None) => PreviewLine { id: String::new(), text: "No messages yet".to_owned(), sender: String::new(), mine: false, sent },
+                Err(err) => {
+                    eprintln!("chatd: demo: preview: {err}");
+                    continue;
+                }
             };
             if let Err(err) = self.ctx.preview(id, &line) {
                 eprintln!("chatd: demo: preview: {err}");

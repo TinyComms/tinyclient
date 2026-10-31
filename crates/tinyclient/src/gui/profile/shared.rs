@@ -67,7 +67,10 @@ pub fn source(network: Network, tab: Tab, page: &Page) -> Source {
     // CONTRACT: Teams has no confirmed route to a chat's files, so its list is never searched.
     match network {
         Network::Teams => Source { line, search: false, open_in: true },
-        Network::Tiny => Source { line, search: false, open_in: false },
+        // Tiny and Messages have no shared search. Slack has no links list, so that tab
+        // must not offer a search that the network refuses and then wipes the cache.
+        Network::Tiny | Network::Messages => Source { line, search: false, open_in: false },
+        Network::Slack if matches!(tab, Tab::Kind(SharedKind::Links)) => Source { line, search: false, open_in: false },
         _ => Source { line, search: true, open_in: false },
     }
 }
@@ -77,10 +80,10 @@ pub fn tab_count(page: &Page) -> Option<u32> {
     page.total
 }
 
-/// The tabs a network has: Pinned is hidden on Teams.
+/// The tabs a network has. Pinned is hidden where the network does not serve it.
 pub fn tabs(network: Network) -> Vec<Tab> {
     let mut tabs = vec![Tab::Kind(SharedKind::Media), Tab::Kind(SharedKind::Files), Tab::Kind(SharedKind::Links)];
-    if network != Network::Teams {
+    if !matches!(network, Network::Teams | Network::Messages | Network::Tiny) {
         tabs.push(Tab::Pinned);
     }
     tabs
@@ -202,6 +205,8 @@ impl Shared {
                     });
                     return;
                 }
+                // A refused search leaves the cache line in place.
+                _ if search => return,
                 // Nothing claimed: the honest empty line, from the cache.
                 _ => Page { read: true, ..Page::default() },
             };
@@ -501,7 +506,12 @@ mod tests {
         let none = Page { complete: true, total: Some(0), read: true, ..Page::default() };
         assert_eq!(source(Network::Telegram, links, &none).line, "No links in this chat");
         assert_eq!(tabs(Network::Teams).len(), 3);
+        assert_eq!(tabs(Network::Messages).len(), 3);
         assert_eq!(tabs(Network::Slack).last(), Some(&Tab::Pinned));
+        let slack_links = Page { items: vec![item()], read: true, ..Page::default() };
+        assert!(!source(Network::Slack, Tab::Kind(SharedKind::Links), &slack_links).search);
+        assert!(source(Network::Slack, Tab::Kind(SharedKind::Files), &slack_links).search);
+        assert!(!source(Network::Messages, Tab::Kind(SharedKind::Media), &slack_links).search);
     }
 
     #[test]

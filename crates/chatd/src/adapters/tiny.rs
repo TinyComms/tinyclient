@@ -147,6 +147,24 @@ pub fn accounts(session: &str) -> Result<Vec<Signed>, String> {
     Ok(found)
 }
 
+/// Exact server origins for locally saved accounts, without contacting any server or exposing tokens.
+fn local_origins(session: &str) -> Result<Vec<(AccountKey, String)>, String> {
+    Ok(saved_rows(session)?.into_iter().map(|saved| (
+        AccountKey { network: Network::Tiny, account: saved.user_id }, saved.base_url,
+    )).collect())
+}
+
+pub fn local_servers() -> Response {
+    match session::read(Network::Tiny) {
+        session::Stored::Found(session) => match local_origins(&session) {
+            Ok(servers) => Response::TinyLocalServers { servers },
+            Err(_) => error(ErrorCode::Internal, "The Tiny server session is unreadable.".to_owned()),
+        },
+        session::Stored::Absent => Response::TinyLocalServers { servers: Vec::new() },
+        session::Stored::Unreadable(_) => error(ErrorCode::Internal, "The Tiny server session is unreadable.".to_owned()),
+    }
+}
+
 /// The session with one server removed. `None` only when that was the last one. An account that
 /// is not in the blob leaves the original string untouched.
 pub fn without(session: &str, account: &str) -> Option<String> {
@@ -1065,6 +1083,18 @@ pub(crate) mod tests {
 
     fn other() -> &'static str {
         r#"{"base_url":"https://other.example","token":"u","user_id":"22222222-2222-2222-2222-222222222222","email":"bea@example.com","display_name":"Bea","role":"member"}"#
+    }
+
+    #[test]
+    fn local_servers_return_origins_without_session_credentials() {
+        let both = combine(session(), other()).unwrap();
+        let origins = local_origins(&both).unwrap();
+        assert_eq!(origins.len(), 2);
+        assert_eq!(origins[0].1, "http://127.0.0.1:8080");
+        assert_eq!(origins[1].1, "https://other.example");
+        let wire = serde_json::to_string(&origins).unwrap();
+        assert!(!wire.contains("\"token\""));
+        assert!(local_origins("not json").is_err());
     }
 
     #[test]

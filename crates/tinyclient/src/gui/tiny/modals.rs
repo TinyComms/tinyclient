@@ -359,9 +359,9 @@ impl Shell {
         let (opens, makes) = handoff_facts(if origin.is_empty() { &page.community.origin } else { origin }, role, !page.community.has(protocol::TINY_FEATURE_INVITE_OPTIONS));
         let copy = paste.to_owned();
         let copied = self.tiny_state.copied;
-        modal("Give them this code")
+        modal("Share this invite link")
             .w(px(480.))
-            .child(words("Copy it and send it to them. They do the rest in their own tinyclient."))
+            .child(words("Copy this link and send it to the person you want to invite. Anyone with it can use it."))
             .child(
                 div()
                     .mt(px(16.))
@@ -371,12 +371,12 @@ impl Shell {
                     .flex()
                     .flex_col()
                     .gap(px(10.))
-                    .child(step(1, "Open tinyclient"))
-                    .child(step(2, "Choose Tiny server, or Join a server"))
-                    .child(step(3, "Paste this code"))
+                    .child(step(1, "Open the invite link"))
+                    .child(step(2, "Install Tiny if needed, then return to the invite page"))
+                    .child(step(3, "Open Tiny and confirm the server"))
                     .child(step(4, "Continue in the browser that opens")),
             )
-            .child(label("Code"))
+            .child(label("Invite link"))
             .child(
                 div()
                     .w_full()

@@ -619,7 +619,7 @@ impl Shell {
                 None
             }
             Ok(Response::TinyCode { code }) => {
-                self.tiny_state.modal = Some(match protocol::pack_join(&code.origin, &code.token) {
+                self.tiny_state.modal = Some(match protocol::invite_url(&code.origin, &code.token) {
                     Some(paste) => {
                         let draft = &self.tiny_state.invite;
                         let legacy = self.tiny_state.community.as_ref().is_some_and(|community| !community.has(protocol::TINY_FEATURE_INVITE_OPTIONS));
@@ -1357,7 +1357,7 @@ impl Shell {
         match flag("--tiny-modal").as_deref() {
             Some("invite") => self.tiny_open_modal(Modal::Invite, window, cx),
             Some("code") => {
-                let paste = protocol::pack_join(&community.origin, "Nf3kQ8xLw2pZ7rT1").unwrap_or_default();
+                let paste = protocol::invite_url(&community.origin, "Nf3kQ8xLw2pZ7rT1").unwrap_or_default();
                 self.tiny_open_modal(Modal::Code { paste, origin: community.origin.clone(), terms: model::invite_terms(Some(5), Some(86_400)), role: "member".into() }, window, cx);
             }
             Some("kick") => self.tiny_open_modal(Modal::Kick(target), window, cx),

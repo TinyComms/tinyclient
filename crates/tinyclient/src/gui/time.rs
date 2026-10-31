@@ -97,26 +97,76 @@ pub fn style_for(locale: &str, force24: Option<bool>) -> Style {
     Style { hour24: force24.unwrap_or(!twelve), month_first: MONTH_FIRST.contains(&region) || region.is_empty() }
 }
 
-/// Reads macOS's clock and region once, off the main thread.
-pub fn read_clock_preference() {
-    let read = |key: &str| {
-        std::process::Command::new("/usr/bin/defaults")
-            .args(["read", "-g", key])
-            .stderr(std::process::Stdio::null())
-            .output()
-            .ok()
-            .filter(|out| out.status.success())
-            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+/// Locale name plus the Windows clock flags. `itime` is `"1"` for 24-hour and `"0"` for
+/// 12-hour. `idate` is `"0"` month-first, `"1"` day-first, `"2"` year-first.
+pub fn style_from_locale(locale: &str, itime: Option<&str>, idate: Option<&str>) -> Style {
+    let force = match itime {
+        Some("1") => Some(true),
+        Some("0") => Some(false),
+        _ => None,
     };
-    let _ = std::thread::Builder::new().name("clock-style".into()).stack_size(64 * 1024).spawn(move || {
+    let mut style = style_for(&locale.replace('-', "_"), force);
+    if let Some(idate) = idate {
+        style.month_first = idate == "0";
+    }
+    style
+}
+
+/// Reads the machine's clock and region once, off the main thread.
+pub fn read_clock_preference() {
+    let _ = std::thread::Builder::new().name("clock-style".into()).stack_size(64 * 1024).spawn(|| set_style(platform_clock()));
+}
+
+fn platform_clock() -> Style {
+    #[cfg(target_os = "macos")]
+    {
+        let read = |key: &str| {
+            std::process::Command::new("/usr/bin/defaults")
+                .args(["read", "-g", key])
+                .stderr(std::process::Stdio::null())
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+                .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+        };
         let locale = read("AppleLocale").unwrap_or_default();
         let force = match (read("AppleICUForce24HourTime").as_deref(), read("AppleICUForce12HourTime").as_deref()) {
             (Some("1"), _) => Some(true),
             (_, Some("1")) => Some(false),
             _ => None,
         };
-        set_style(style_for(&locale, force));
-    });
+        return style_for(&locale, force);
+    }
+    #[cfg(windows)]
+    {
+        return windows_clock();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let locale = std::env::var("LC_TIME").or_else(|_| std::env::var("LC_ALL")).or_else(|_| std::env::var("LANG")).unwrap_or_default();
+        return style_for(&locale, None);
+    }
+    #[allow(unreachable_code)]
+    style_for("", None)
+}
+
+#[cfg(windows)]
+fn windows_clock() -> Style {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetLocaleInfoW(locale: u32, kind: u32, buf: *mut u16, size: i32) -> i32;
+    }
+    fn info(kind: u32) -> Option<String> {
+        let mut buf = [0u16; 85];
+        // SAFETY: the buffer is writable and its length is passed. 0x400 is LOCALE_USER_DEFAULT.
+        let count = unsafe { GetLocaleInfoW(0x400, kind, buf.as_mut_ptr(), buf.len() as i32) };
+        if count <= 1 {
+            return None;
+        }
+        Some(String::from_utf16_lossy(&buf[..count as usize - 1]))
+    }
+    // 0x5c LOCALE_SNAME, 0x23 LOCALE_ITIME, 0x21 LOCALE_IDATE.
+    style_from_locale(&info(0x5c).unwrap_or_default(), info(0x23).as_deref(), info(0x21).as_deref())
 }
 
 fn clock_in(t: Local, style: Style) -> String {
@@ -263,6 +313,14 @@ mod tests {
     // Tuesday, October 13, 2026, 22:37.
     fn today() -> Local {
         at(2026, 285, 9, 13, 2, 22, 37)
+    }
+
+    #[test]
+    fn a_windows_locale_keeps_its_own_clock_instead_of_a_blank_us_default() {
+        assert_eq!(style_from_locale("de-DE", Some("1"), Some("1")), Style { hour24: true, month_first: false });
+        assert_eq!(style_from_locale("en-US", Some("0"), Some("0")), US);
+        assert_eq!(style_from_locale("en-US", Some("1"), Some("0")), Style { hour24: true, month_first: true });
+        assert_eq!(style_from_locale("en-GB", None, None), UK);
     }
 
     #[test]

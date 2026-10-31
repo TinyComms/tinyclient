@@ -4,7 +4,7 @@ use super::chat::Look;
 use super::home::{self, Act, Drill, Item};
 use super::{joins_from_list, on_screen, respliced, Mode};
 use crate::client::ask;
-use crate::gui::components::{badge_dot, empty_state, glyph, icon_button, list_row, pair, rollup_badge, section_header, Avatar, Shape};
+use crate::gui::components::{badge_dot, empty_state, glyph, icon_button, list_row, rollup_badge, section_header, Avatar, Shape};
 use crate::gui::state::{Shell, Snapshot};
 use crate::gui::theme::{self, Type};
 use crate::view::now;
@@ -228,6 +228,11 @@ impl Shell {
                 Act::MoreVoice => home.voice_all = true,
                 Act::MoreChats => home.chats_all = true,
                 Act::Meetings => home.meetings_open = !home.meetings_open,
+                Act::Hidden(id) => {
+                    if !home.hidden_shown.remove(&id) {
+                        home.hidden_shown.insert(id);
+                    }
+                }
             },
             Item::Folder { id, .. } => {
                 if !home.opened.remove(&id) {
@@ -272,6 +277,18 @@ impl Shell {
                 self.chat_row("home", &c, look, focused, cx).into_any_element()
             }
             Item::Voice(c) => self.voice_row(&c, focused, cx).into_any_element(),
+            Item::Action { act: Act::Meetings, icon, words, after, .. } => {
+                // The subjects use the row that remains after the label. The chevron says the fold is open.
+                let open = self.sidebar_state.home.meetings_open;
+                let chevron = if open { "icons/chevron-down.svg" } else { "icons/chevron-right.svg" };
+                let content = div()
+                    .gap(px(8.))
+                    .child(div().size(px(20.)).flex_none().flex().items_center().justify_center().child(glyph(icon, 16., theme::text_soft())))
+                    .child(div().flex_none().type_ui().text_color(theme::text_soft()).child(words))
+                    .child(div().flex_1().min_w_0().truncate().type_small().text_color(theme::text_faint()).child(after))
+                    .child(glyph(chevron, 12., theme::text_faint()));
+                click(list_row(("home-action", ix), theme::row_height(theme::ROW_ONE), false, focused, content), cx).into_any_element()
+            }
             Item::Action { act, icon, words, after, dot } => {
                 // Folds and drills keep their words quiet; a number or dot says what is inside.
                 let lit = act == Act::Friends && self.sidebar_state.home.friend_requests > 0;
@@ -283,7 +300,8 @@ impl Shell {
                     _ if after.is_empty() => None,
                     _ => Some(faint_words(after.clone())),
                 };
-                let chevron = matches!(act, Act::Archive | Act::Requests).then(|| glyph("icons/chevron-right.svg", 12., theme::text_faint()));
+                // Message requests is a mail glyph and a count. Archive is the row that drills.
+                let chevron = matches!(act, Act::Archive).then(|| glyph("icons/chevron-right.svg", 12., theme::text_faint()));
                 let trailing = match (trailing, chevron) {
                     (Some(trailing), Some(chevron)) => Some(div().flex().items_center().gap(px(6.)).child(trailing).child(chevron)),
                     (None, chevron) => chevron.map(|chevron| div().child(chevron)),
@@ -342,7 +360,41 @@ impl Shell {
             let color = if color == 0 { theme::text_faint() } else { gpui::rgb(color) };
             div().absolute().left(px(16.)).top_0().bottom_0().w(px(3.)).bg(color).opacity(0.7)
         });
-        list_row(super::row_id("space", &space.key), theme::row_height(theme::ROW_ONE), here, focused, content).relative().children(spine)
+        list_row(super::row_id("space", &space.key), theme::row_height(theme::ROW_ONE), here, focused, content)
+            .tooltip(crate::gui::components::tip(space.name.clone(), None))
+            .relative()
+            .children(spine)
+    }
+
+    /// The people in a voice row. Their photos come from the person keys, not the channel key.
+    fn voice_faces(&self, c: &Conversation, surface: gpui::Rgba, cx: &mut Context<Self>) -> Div {
+        let people = c.occupants.as_ref().map(|inside| inside.people.as_slice()).unwrap_or(&[]);
+        let size = 32.;
+        match people {
+            [] => self.conversation_avatar(c, size, surface, cx),
+            [one] => Avatar::new(&one.person, &one.name, size).image_at(self.person_picture(&one.person, cx)).build(),
+            [back, front, ..] => {
+                let small = (size * 0.66).round();
+                let face = |person: &protocol::Occupant, cx: &mut Context<Self>| {
+                    Avatar::new(&person.person, &person.name, small).image_at(self.person_picture(&person.person, cx)).build()
+                };
+                div()
+                    .relative()
+                    .size(px(size))
+                    .flex_none()
+                    .child(div().absolute().top_0().left_0().child(face(back, cx)))
+                    .child(
+                        div()
+                            .absolute()
+                            .right(px(-2.))
+                            .bottom(px(-2.))
+                            .rounded(px(small / 2. + 2.))
+                            .border_2()
+                            .border_color(surface)
+                            .child(face(front, cx)),
+                    )
+            }
+        }
     }
 
     /// Friends in a voice channel or a DM call: their faces, where, and who.
@@ -351,11 +403,7 @@ impl Shell {
         let surface = theme::row_surface(selected);
         let people: Vec<&str> = c.occupants.as_ref().map(|inside| inside.people.iter().map(|p| p.name.as_str()).collect()).unwrap_or_default();
         let total = c.occupants.as_ref().map_or(0, |inside| inside.total as usize);
-        let faces = match people.as_slice() {
-            [] => self.conversation_avatar(c, 32., surface, cx),
-            [one] => Avatar::new(&c.key, one, 32.).build(),
-            [one, two, ..] => pair(&c.key, &format!("{one}, {two}"), 32., surface),
-        };
+        let faces = self.voice_faces(c, surface, cx);
         let firsts: Vec<&str> = people.iter().take(3).map(|name| name.split_whitespace().next().unwrap_or(name)).collect();
         let who = match total.saturating_sub(firsts.len()) {
             0 => firsts.join(", "),

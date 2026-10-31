@@ -1905,6 +1905,7 @@ impl Chat {
                 Response::Ok
             }
             Request::SignOut { account } => self.sign_out(account),
+            Request::TinyLocalServers => adapters::tiny::local_servers(),
             Request::TinyCommunity { account } => {
                 // Opening the server is the user asking: a socket another device replaced connects again.
                 self.command(&account, Command::Tiny(adapters::tiny::live::Ask::Look));

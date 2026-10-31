@@ -2,7 +2,7 @@
 //! the drills, the home's Unread segment, folders and the Apps row open, the held Inbox.
 //!
 //! `--mode telegram|teams`, `--home-unread`, `--folder N` (a Telegram tab), `--drill
-//! archive|requests|threads`, `--apps-open`, `--open-folders`, `--held N` (the "n new" pill),
+//! archive|requests|threads`, `--apps-open`, `--open-folders`, `--open-teams`, `--held N` (the "n new" pill),
 //! `--friends` (People scoped to Discord), `--slack N` (the Nth workspace), `--people-search
 //! letters`.
 
@@ -56,6 +56,9 @@ impl Shell {
     }
 
     fn shot_inside(&mut self, cx: &mut Context<Self>) {
+        if flag("--menu").as_deref() == Some("workspace") {
+            self.sidebar_state.slack_menu = true;
+        }
         if let Some(text) = flag("--people-search") {
             self.people_search(&text, cx);
         }
@@ -68,6 +71,12 @@ impl Shell {
         }
         if has("--open-folders") {
             let ids: Vec<String> = self.sidebar_state.home.folders.iter().map(|f| f.key.id.clone()).collect();
+            self.sidebar_state.home.opened.extend(ids);
+            self.sidebar_state.home.meetings_open = true;
+            self.rebuild_home(cx);
+        }
+        if has("--open-teams") {
+            let ids: Vec<String> = self.spaces.iter().filter(|space| space.key.network == Network::Teams).map(|space| space.key.id.clone()).collect();
             self.sidebar_state.home.opened.extend(ids);
             self.sidebar_state.home.meetings_open = true;
             self.rebuild_home(cx);
