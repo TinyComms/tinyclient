@@ -1,7 +1,7 @@
 import { access, mkdir, readFile } from "node:fs/promises";
 import path from "node:path";
-import type { Host } from "../host.js";
-import { averageRgb, averagesApart, pcmRms, rmsAboveFloor, type Rgb } from "../oracle.js";
+import type { Host, Rect } from "../host.js";
+import { averageRgb, averagesApart, cropRgb, pcmRms, rmsAboveFloor, type Rgb } from "../oracle.js";
 
 /**
  * Four equal quadrants (red, green, blue, white) average to the midpoint.
@@ -34,7 +34,7 @@ export interface Runtime {
   startServer(env: NodeJS.ProcessEnv): Promise<{ stop(): Promise<void> }>;
   startClient(env: NodeJS.ProcessEnv): Promise<ClientHandle>;
   grabPng(mp4: string, png: string): Promise<void>;
-  pngRgb(): Promise<Uint8Array>;
+  pngRgb(): Promise<{ width: number; height: number; pixels: Uint8Array }>;
   mp4Seconds(): Promise<number>;
 }
 
@@ -50,9 +50,14 @@ export interface CallOptions {
   timeoutMs: number;
 }
 
+interface SavedSession {
+  token: string;
+  baseUrl: string;
+}
+
 export async function runCall(options: CallOptions): Promise<void> {
-  requireSession(options.sessionA, "TINY_E2E_SESSION_A");
-  requireSession(options.sessionBea, "TINY_E2E_SESSION_BEA");
+  const adaSession = readSession(options.sessionA, "TINY_E2E_SESSION_A");
+  readSession(options.sessionBea, "TINY_E2E_SESSION_BEA");
   await mkdir(options.dataDirA, { recursive: true });
   await mkdir(options.dataDirB, { recursive: true });
 
@@ -60,6 +65,7 @@ export async function runCall(options: CallOptions): Promise<void> {
   let ada: ClientHandle | undefined;
   let bea: ClientHandle | undefined;
   try {
+    await createRoom(adaSession);
     ada = await options.runtime.startClient(clientEnv(options.dataDirA, options.fixtureDir, options.sessionA));
     bea = await options.runtime.startClient(clientEnv(options.dataDirB, options.fixtureDir, options.sessionBea));
     await joinRoom(ada.host, bea.host, options.timeoutMs);
@@ -72,9 +78,10 @@ export async function runCall(options: CallOptions): Promise<void> {
     const sink = path.join(options.dataDirB, "played.pcm");
     const mp4 = path.join(options.dataDirB, "remote.mp4");
     const png = path.join(options.dataDirB, "frame.png");
+    const picture = await bea.host.bounds("Call picture");
     await bea.host.record(options.windowTitle, sink, mp4);
     await options.runtime.grabPng(mp4, png);
-    await assertCall(options.runtime, sink, mp4);
+    await assertCall(options.runtime, sink, mp4, picture);
   } finally {
     await stop(ada);
     await stop(bea);
@@ -82,8 +89,36 @@ export async function runCall(options: CallOptions): Promise<void> {
   }
 }
 
-function requireSession(value: string, name: string): void {
+function readSession(value: string, name: string): SavedSession {
   if (value.trim() === "") throw new Error(`${name} is required`);
+  let parsed: { token?: unknown; base_url?: unknown };
+  try {
+    parsed = JSON.parse(value) as { token?: unknown; base_url?: unknown };
+  } catch {
+    throw new Error(`${name} is not session JSON`);
+  }
+  if (typeof parsed.token !== "string" || parsed.token.trim() === "") {
+    throw new Error(`${name} has no token`);
+  }
+  if (typeof parsed.base_url !== "string" || parsed.base_url.trim() === "") {
+    throw new Error(`${name} has no base_url`);
+  }
+  return { token: parsed.token, baseUrl: parsed.base_url.replace(/\/$/, "") };
+}
+
+async function createRoom(session: SavedSession): Promise<void> {
+  const url = `${session.baseUrl}/v1/rooms`;
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${session.token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ name: "Proof" }),
+  });
+  if (!response.ok) {
+    throw new Error(`POST ${url} failed: ${response.status}`);
+  }
 }
 
 function serverEnv(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
@@ -106,6 +141,10 @@ function clientEnv(dir: string, fixtureDir: string, session: string): NodeJS.Pro
 }
 
 async function joinRoom(ada: Host, bea: Host, timeoutMs: number): Promise<void> {
+  await until(ada, "Proof", timeoutMs);
+  await until(bea, "Proof", timeoutMs);
+  await ada.click("Proof");
+  await bea.click("Proof");
   await until(ada, "Join channel", timeoutMs);
   await until(bea, "Join channel", timeoutMs);
   await ada.click("Join channel");
@@ -144,7 +183,7 @@ async function receiveShare(host: Host, timeoutMs: number): Promise<void> {
   }
 }
 
-async function assertCall(runtime: Runtime, sink: string, mp4: string): Promise<void> {
+async function assertCall(runtime: Runtime, sink: string, mp4: string, picture: Rect): Promise<void> {
   let pcm: Buffer;
   try {
     pcm = await readFile(sink);
@@ -154,7 +193,8 @@ async function assertCall(runtime: Runtime, sink: string, mp4: string): Promise<
   if (!rmsAboveFloor(pcmRms(pcm))) {
     throw new Error("remote PCM is not the speech clip");
   }
-  const frame = averageRgb(await runtime.pngRgb());
+  const image = await runtime.pngRgb();
+  const frame = averageRgb(cropRgb(image.pixels, image.width, picture));
   if (!averagesApart(frame, CAMERA_BARS) || averagesApart(frame, SHARE)) {
     throw new Error("recorded frame is not the share picture");
   }

@@ -34,6 +34,13 @@ export async function grabFrame(mp4Path: string, pngPath: string): Promise<void>
   await ffmpeg(["-y", "-i", mp4Path, "-frames:v", "1", pngPath]);
 }
 
+export function pngSize(png: Buffer): { width: number; height: number } {
+  if (png.length < 24 || png.toString("ascii", 12, 16) !== "IHDR") {
+    throw new Error("png has no IHDR");
+  }
+  return { width: png.readUInt32BE(16), height: png.readUInt32BE(20) };
+}
+
 export async function pngToRgb(pngPath: string): Promise<Uint8Array> {
   const { stdout } = await ffmpeg(["-i", pngPath, "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]);
   return new Uint8Array(stdout);

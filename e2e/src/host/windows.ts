@@ -23,16 +23,21 @@ export async function connect(target?: HostTarget): Promise<Host> {
     "appium:appTopLevelWindow": handle,
     "appium:newCommandTimeout": 180,
   });
-  return driverHost("windows", browser, async (title, pcmPath, mp4Path) => {
-    await ffmpeg([
-      "-y",
-      "-f", "gdigrab",
-      "-framerate", "30",
-      "-t", RECORD_SECONDS,
-      "-i", `title=${title}`,
-      ...muxArgs(pcmPath, mp4Path),
-    ]);
+  return driverHost("windows", browser, async (_title, pcmPath, mp4Path) => {
+    await ffmpeg(gdigrabArgs(handle, pcmPath, mp4Path));
   });
+}
+
+/** gdigrab input for the window handle already resolved from this client's pid. */
+export function gdigrabArgs(hwnd: string, pcmPath: string, mp4Path: string): string[] {
+  return [
+    "-y",
+    "-f", "gdigrab",
+    "-framerate", "30",
+    "-t", RECORD_SECONDS,
+    "-i", `hwnd=${hwnd}`,
+    ...muxArgs(pcmPath, mp4Path),
+  ];
 }
 
 async function topLevelWindow(target: HostTarget): Promise<string> {

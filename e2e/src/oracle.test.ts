@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { averageRgb, averagesApart, pcmRms, rmsAboveFloor } from "./oracle.js";
+import { averageRgb, averagesApart, cropRgb, pcmRms, rmsAboveFloor } from "./oracle.js";
 
 test("pcm rms is the root mean square of little-endian samples", () => {
   const pcm = Buffer.alloc(4);
@@ -29,6 +29,19 @@ test("rgb average of the four quadrants is the midpoint", () => {
     255, 255, 255,
   ]);
   assert.deepEqual(averageRgb(pixels), { r: 127.5, g: 127.5, b: 127.5 });
+});
+
+test("a crop is the Call picture, not the average of the whole window", () => {
+  const window = new Uint8Array([
+    255, 0, 0,
+    255, 255, 255,
+    0, 255, 0,
+    0, 0, 255,
+  ]);
+  assert.deepEqual(averageRgb(window), { r: 127.5, g: 127.5, b: 127.5 });
+  const picture = cropRgb(window, 4, { x: 0, y: 0, width: 1, height: 1 });
+  assert.deepEqual(averageRgb(picture), { r: 255, g: 0, b: 0 });
+  assert.equal(averagesApart(averageRgb(picture), averageRgb(window)), true);
 });
 
 test("colour averages more than twenty apart tell bars from quadrants", () => {

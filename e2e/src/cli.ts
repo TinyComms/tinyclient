@@ -1,10 +1,10 @@
-import { access, mkdir, mkdtemp } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import type { Host, HostTarget, PlatformName } from "./host.js";
 import { requireCommand } from "./host/command.js";
-import { grabFrame, mediaSeconds, pngToRgb } from "./host/ffmpeg.js";
+import { grabFrame, mediaSeconds, pngSize, pngToRgb } from "./host/ffmpeg.js";
 import { drain, spawnCommand, stopProcessTree } from "./proc.js";
 import { runCall, type Runtime } from "./scenario/call.js";
 import { startServer } from "./server.js";
@@ -121,7 +121,9 @@ function desktopRuntime(hostModule: HostModule): Runtime {
       mp4 = mp4Path;
     },
     async pngRgb() {
-      return pngToRgb(png);
+      const file = await readFile(png);
+      const size = pngSize(file);
+      return { ...size, pixels: await pngToRgb(png) };
     },
     async mp4Seconds() {
       return mediaSeconds(mp4);

@@ -18,6 +18,16 @@ export async function attach(capabilities: WebdriverIO.Capabilities): Promise<Br
   });
 }
 
+async function waitFor(browser: Browser, name: string): Promise<string> {
+  const deadline = Date.now() + 10_000;
+  for (;;) {
+    const id = await elementId(browser, name);
+    if (id) return id;
+    if (Date.now() >= deadline) throw new Error(`no control named ${name}`);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
+
 async function elementId(browser: Browser, name: string): Promise<string | undefined> {
   for (const using of ["name", "accessibility id"]) {
     try {
@@ -38,18 +48,19 @@ export function driverHost(platform: PlatformName, browser: Browser, record: Hos
       return (await elementId(browser, name)) !== undefined;
     },
     async click(name) {
-      const deadline = Date.now() + 10_000;
-      for (;;) {
-        const id = await elementId(browser, name);
-        if (id) {
-          await browser.elementClick(id);
-          return;
-        }
-        if (Date.now() >= deadline) {
-          throw new Error(`no control named ${name}`);
-        }
-        await new Promise((resolve) => setTimeout(resolve, 100));
-      }
+      const id = await waitFor(browser, name);
+      await browser.elementClick(id);
+    },
+    async bounds(name) {
+      const id = await waitFor(browser, name);
+      const element = await browser.getElementRect(id);
+      const window = await browser.getWindowRect();
+      return {
+        x: Math.round(element.x - window.x),
+        y: Math.round(element.y - window.y),
+        width: Math.round(element.width),
+        height: Math.round(element.height),
+      };
     },
     record,
     async close() {

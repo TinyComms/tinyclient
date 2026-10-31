@@ -30,6 +30,38 @@ export function rmsAboveFloor(rms: number): boolean {
   return rms > SPEECH_FLOOR;
 }
 
+export interface Rect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+/** The pixels inside `bounds` of a tightly packed RGB image of `width` pixels per row. */
+export function cropRgb(pixels: Uint8Array, width: number, bounds: Rect): Uint8Array {
+  if (width <= 0) return new Uint8Array();
+  const height = Math.floor(pixels.length / 3 / width);
+  const x0 = clamp(Math.floor(bounds.x), 0, width);
+  const y0 = clamp(Math.floor(bounds.y), 0, height);
+  const x1 = clamp(x0 + Math.floor(bounds.width), x0, width);
+  const y1 = clamp(y0 + Math.floor(bounds.height), y0, height);
+  const out = new Uint8Array((x1 - x0) * (y1 - y0) * 3);
+  let n = 0;
+  for (let y = y0; y < y1; y++) {
+    for (let x = x0; x < x1; x++) {
+      const i = (y * width + x) * 3;
+      out[n++] = pixels[i] ?? 0;
+      out[n++] = pixels[i + 1] ?? 0;
+      out[n++] = pixels[i + 2] ?? 0;
+    }
+  }
+  return out;
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
 /** Mean of tightly packed RGB triples. A trailing partial pixel is ignored. */
 export function averageRgb(pixels: Uint8Array): Rgb {
   const count = Math.floor(pixels.length / 3);

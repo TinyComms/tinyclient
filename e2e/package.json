@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "build": "tsc",
-    "test": "tsc && node --test dist/oracle.test.js dist/scenario/call.test.js dist/cli.test.js",
+    "test": "tsc && node --test dist/oracle.test.js dist/scenario/call.test.js dist/cli.test.js dist/host/capture.test.js",
     "call": "node dist/cli.js"
   },
   "dependencies": {
