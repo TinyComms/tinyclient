@@ -137,6 +137,8 @@ pub struct Decoder {
     state: *mut OpusDecoder,
     /// The last packet was CELT-only, the mode whose concealment libopus is trusted with here.
     celt: bool,
+    /// A packet has been decoded: the decoder has a mode, and a last sample to fade from.
+    started: bool,
     /// The last frame that came out, for concealing a loss ourselves.
     last: Vec<i16>,
     /// Losses concealed in a row.
@@ -156,7 +158,17 @@ impl Decoder {
         let mut error = 0;
         // SAFETY: as for the encoder.
         let state = unsafe { opus_decoder_create(RATE as i32, CHANNELS as i32, &mut error) };
-        (!state.is_null() && error == 0).then_some(Decoder { state, celt: false, last: Vec::new(), misses: 0, pitch: FRAME, cursor: 0, gain: 0., concealing: false })
+        (!state.is_null() && error == 0).then_some(Decoder {
+            state,
+            celt: false,
+            started: false,
+            last: Vec::new(),
+            misses: 0,
+            pitch: FRAME,
+            cursor: 0,
+            gain: 0.,
+            concealing: false,
+        })
     }
 
     /// Decodes one packet into `pcm` (room for [`MAX_FRAME`] samples per channel). `None` as the
@@ -167,12 +179,31 @@ impl Decoder {
             return Some(self.conceal(lost.min(room), pcm));
         };
         self.forget();
+        // After a SILK or hybrid packet, libopus builds a CELT-only one out of 5 ms of SILK
+        // packet-loss concealment. A packet from an encoder carries a redundant CELT frame to
+        // splice there; the fixed silence packet does not, and this build's concealment
+        // saturates. The mode change resets CELT anyway, so start from a clean state instead.
+        let celt = packet[0] >> 3 >= 16;
+        let switched = celt && !self.celt && self.started;
+        if switched {
+            // SAFETY: `state` is a live decoder; the request takes no argument.
+            unsafe {
+                opus_decoder_ctl!(self.state, OPUS_RESET_STATE);
+            }
+        }
         // SAFETY: `pcm` has room for `room` samples per channel.
         let decoded = unsafe { opus_decode(self.state, packet.as_ptr(), packet.len() as i32, pcm.as_mut_ptr(), room as i32, 0) };
         let samples = usize::try_from(decoded).ok()?;
         // The table-of-contents byte's top five bits are the configuration; 16 and up are CELT.
-        self.celt = packet[0] >> 3 >= 16;
-        self.resume(&mut pcm[..samples * CHANNELS]);
+        self.celt = celt;
+        self.started = true;
+        if switched {
+            // No waveform continues across the switch, so fade this frame in from the sample
+            // the speech ended on. A step there is the click.
+            self.start_afresh(&mut pcm[..samples * CHANNELS]);
+        } else {
+            self.resume(&mut pcm[..samples * CHANNELS]);
+        }
         Some(samples)
     }
 
@@ -187,6 +218,7 @@ impl Decoder {
         // SAFETY: `pcm` has room for FRAME samples per channel, the length of the lost frame.
         let decoded = unsafe { opus_decode(self.state, next.as_ptr(), next.len() as i32, pcm.as_mut_ptr(), FRAME as i32, 1) };
         let samples = usize::try_from(decoded).ok().filter(|&samples| samples > 0)?;
+        self.started = true;
         self.resume(&mut pcm[..samples * CHANNELS]);
         Some(samples)
     }
@@ -246,12 +278,7 @@ impl Decoder {
     /// it; a longer gap counts as concealment and the next real frame starts clean.
     pub(crate) fn release(&mut self, samples: usize, pcm: &mut [i16]) -> usize {
         let out = &mut pcm[..samples * CHANNELS];
-        let from = if self.last.len() >= CHANNELS {
-            let at = self.last.len() - CHANNELS;
-            [self.last[at], self.last[at + 1]]
-        } else {
-            [0, 0]
-        };
+        let from = self.ending();
         let steps = samples.max(1) as f32;
         for (n, pair) in out.chunks_mut(CHANNELS).enumerate() {
             let gain = 1. - (n as f32 + 1.) / steps;
@@ -307,6 +334,39 @@ impl Decoder {
             }
             self.concealing = false;
         }
+        self.record(pcm);
+    }
+
+    /// A frame in another mode came out of a decoder that was reset for it: no waveform
+    /// continues across the switch, so fade it in from the sample the last frame ended on.
+    /// Stepping from that sample to wherever the new mode starts is the click.
+    fn start_afresh(&mut self, pcm: &mut [i16]) {
+        let from = self.ending();
+        let frames = pcm.len() / CHANNELS;
+        let fade = RESUME.min(frames);
+        for n in 0..fade {
+            let toward = (n + 1) as f32 / (fade + 1) as f32;
+            for (channel, sample) in pcm[n * CHANNELS..(n + 1) * CHANNELS].iter_mut().enumerate() {
+                *sample = (f32::from(from[channel]) * (1. - toward) + f32::from(*sample) * toward) as i16;
+            }
+        }
+        self.concealing = false;
+        self.record(pcm);
+    }
+
+    /// The sample the last frame ended on: what a frame that does not continue it fades from.
+    fn ending(&self) -> [i16; CHANNELS] {
+        if self.last.len() >= CHANNELS {
+            let at = self.last.len() - CHANNELS;
+            [self.last[at], self.last[at + 1]]
+        } else {
+            [0; CHANNELS]
+        }
+    }
+
+    /// The frame just played: where the next fade or concealment starts, and the end of a run
+    /// of losses.
+    fn record(&mut self, pcm: &[i16]) {
         self.misses = 0;
         self.last.clear();
         self.last.extend_from_slice(pcm);
@@ -562,6 +622,59 @@ mod tests {
         let decoded = decoder.decode(Some(&SILENCE), 0, &mut pcm).unwrap();
         assert_eq!(decoded, FRAME);
         assert!(energy(&pcm[..FRAME * CHANNELS]) < 10.);
+    }
+
+    /// The canned silence packet is CELT-only, and the sentence before it is SILK or hybrid. The
+    /// decoder used to take that for a mode switch and splice 5 ms of SILK concealment onto the
+    /// front, which this build saturates: a full-scale tick at the start of "silence". It is
+    /// decoded from a clean state and faded in from the sample the speech ended on instead.
+    /// A decoder that never heard speech (`the_silence_frame_is_opus_and_decodes_to_quiet`)
+    /// cannot see this.
+    #[test]
+    fn a_silence_packet_after_speech_fades_in_instead_of_banging() {
+        let mut encoder = Encoder::voice().unwrap();
+        let mut decoder = Decoder::new().unwrap();
+        let mut pcm = vec![0i16; MAX_FRAME * CHANNELS];
+        for frame in tone(10).chunks(FRAME * CHANNELS) {
+            let mut packet = [0u8; 1500];
+            let len = encoder.encode(frame, &mut packet).unwrap();
+            assert!(packet[0] >> 3 < 16, "a speech-mode packet");
+            decoder.decode(Some(&packet[..len]), 0, &mut pcm).unwrap();
+        }
+        let before = pcm[FRAME * CHANNELS - CHANNELS];
+        let decoded = decoder.decode(Some(&SILENCE), 0, &mut pcm).unwrap();
+        assert_eq!(decoded, FRAME);
+        let level = peak(&pcm[..FRAME * CHANNELS]);
+        assert!(level < 12_000, "the silence after speech peaks at {level}");
+        let step = (i32::from(pcm[0]) - i32::from(before)).abs();
+        assert!(step < 1_000, "the silence steps {step} from the last sample");
+        let tail = energy(&pcm[RESUME * CHANNELS..FRAME * CHANNELS]);
+        assert!(tail < 10., "the rest of the silence is not quiet: {tail}");
+    }
+
+    /// What a Tiny call sends in place of the canned packet: real frames of silence in the mode
+    /// the encoder is in. They drain its lookahead, and the first carries the in-band copy of
+    /// the speech before it, so the far decoder never has to change mode at the end of a
+    /// sentence.
+    #[test]
+    fn silent_frames_stay_in_speech_mode_and_carry_the_frame_before() {
+        let mut encoder = Encoder::voice().unwrap();
+        for frame in tone(6).chunks(FRAME * CHANNELS) {
+            let mut packet = [0u8; 1500];
+            let len = encoder.encode(frame, &mut packet).unwrap();
+            assert!(len > 2, "speech is not a DTX packet");
+            assert!(packet[0] >> 3 < 16, "a speech-mode packet");
+        }
+        let quiet = vec![0i16; FRAME * CHANNELS];
+        for n in 0..5 {
+            let mut packet = [0u8; 1500];
+            let len = encoder.encode(&quiet, &mut packet).unwrap();
+            assert!(len > 2, "silence {n} is a DTX packet");
+            assert!(packet[0] >> 3 < 16, "silence {n} left the speech mode");
+            if n == 0 {
+                assert!(has_fec(&packet[..len]), "the first silence carries the copy of the speech before it");
+            }
+        }
     }
 
     #[test]
