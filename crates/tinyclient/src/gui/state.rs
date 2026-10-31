@@ -208,6 +208,8 @@ pub struct Shell {
     pub(super) slots: Slots,
     pub(super) layout_state: layout::State,
     pub(super) sidebar_state: sidebar::State,
+    /// The phone form: which tab, each tab's stack, the list's scope (`gui/phone`).
+    pub(super) phone_state: super::phone::State,
     // Each view's own state lives in its own file. They are only held here.
     #[allow(dead_code)]
     pub(super) conversation_state: conversation::State,
@@ -286,6 +288,7 @@ impl Shell {
             },
             layout_state: layout::State::default(),
             sidebar_state: sidebar::State::new(cx),
+            phone_state: super::phone::State::default(),
             conversation_state: conversation::State::default(),
             people_state: people::State::default(),
             composer_state: composer::State::default(),

@@ -27,7 +27,17 @@ pub const RIGHT_WIDTH: f32 = 300.;
 pub const RIGHT_RANGE: (f32, f32) = (260., 420.);
 /// The conversation is the only region that gives up width, down to this.
 pub const CONVERSATION_MIN: f32 = 392.;
-pub const WINDOW_MIN: (f32, f32) = (540., 440.);
+/// A window may be a phone: the minimum is the smallest phone in portrait, not a desktop
+/// window that happens to be narrow (`20-implementation-map.md` §1.2).
+pub const WINDOW_MIN: (f32, f32) = (360., 480.);
+/// Below this width a window is a phone: one full-screen surface and a tab bar, never a rail
+/// beside a list. Above every phone in portrait, below every tablet split.
+pub const PHONE: f32 = 600.;
+
+/// Whether this window is drawn as a phone.
+pub fn phone(window: f32) -> bool {
+    window < PHONE
+}
 /// Height of the strip that starts every region, level with the traffic lights.
 pub const TOP_BAR: f32 = 52.;
 /// Networks in the order the rail and first launch list them.
@@ -166,6 +176,11 @@ pub struct Plan {
 }
 
 pub fn plan(window: f32, sidebar: f32, hidden: bool, right: Option<f32>) -> Plan {
+    // A phone has no room for two columns: the sidebar never sits in the row, and the right
+    // pane always replaces the conversation it was opened from.
+    if phone(window) {
+        return Plan { sidebar: None, right: right.map(|_right| (window, true)) };
+    }
     let fits = window - RAIL_WIDTH - sidebar >= CONVERSATION_MIN;
     let sidebar = (fits && !hidden).then_some(sidebar);
     let left = RAIL_WIDTH + sidebar.unwrap_or(0.);
@@ -194,6 +209,9 @@ pub fn narrow(window: f32, sidebar: f32, hidden: bool, right: f32) -> bool {
 
 /// The conversation region's width as drawn, for what its strip can hold.
 pub fn conversation_width(window: f32, plan: &Plan) -> f32 {
+    if phone(window) {
+        return window;
+    }
     let beside = plan.right.filter(|(_, replaces)| !replaces).map_or(0., |(width, _)| width);
     window - RAIL_WIDTH - plan.sidebar.unwrap_or(0.) - beside
 }
@@ -542,7 +560,7 @@ impl Shell {
         };
         let _ = snapshot;
         let mut card = div()
-            .w(px(440.))
+            .w(px(if super::phone::active() { 326. } else { 440. }))
             .rounded(px(theme::R_CARD))
             .bg(theme::raised())
             .border_1()
@@ -879,12 +897,22 @@ impl Render for Shell {
         // While the keychain is still being read, accounts arrive one network at a time: the
         // first-launch screen waits until it is done.
         let settled = !self.service.keychain.reading && self.shown().empty_state().is_none();
+        let width = f32::from(window.viewport_size().width);
+        // One window, one form, noted before any component asks.
+        super::phone::set_active(phone(width));
+        self.phone_state.sync(self.snapshot.as_ref().and_then(|snapshot| snapshot.open.as_ref()));
+        if phone(width) {
+            if self.snapshot.is_some() && snapshot.signed_in().is_empty() && settled {
+                return root.child(self.first_run(snapshot, cx));
+            }
+            let screen = self.phone_screen(snapshot, window, cx);
+            return root.children(self.toast_layer(width, cx)).child(screen);
+        }
         if self.snapshot.is_some() && snapshot.signed_in().is_empty() && settled {
             return root.child(self.first_run(snapshot, cx)).children(window_chrome(window));
         }
 
         let state = &self.layout_state;
-        let (width, tall) = (f32::from(window.viewport_size().width), f32::from(window.viewport_size().height));
         // Where a sign-in window should open: over this one.
         let origin = window.bounds().origin;
         self.window_at.set(Some((f32::from(origin.x) as i32, f32::from(origin.y) as i32)));
@@ -896,10 +924,13 @@ impl Render for Shell {
         self.note_room(self.pane_narrow(), Some(conversation_width(width - overview, &plan)));
         let floating = plan.sidebar.is_none() && state.floating;
         let replaced = plan.right.is_some_and(|(_, replaces)| replaces);
-        // With nothing open in a window too narrow for the sidebar, the list is the main view:
-        // something on screen always offers it.
-        let list_alone = snapshot.open.is_none() && plan.sidebar.is_none() && !state.sidebar_hidden && !floating && !replaced;
-        let _ = tall;
+        // With nothing open on a phone, the list is the whole screen: there is no sidebar
+        // column to fall back to, and the conversation only exists when something is open.
+        let list_alone = if phone(width) {
+            snapshot.open.is_none()
+        } else {
+            snapshot.open.is_none() && plan.sidebar.is_none() && !state.sidebar_hidden && !floating && !replaced
+        };
         // Where the window's own buttons sit, on Windows and a Linux that leaves them to us.
         let end = match () {
             _ if plan.right.is_some() => End::Right,
@@ -1028,8 +1059,9 @@ mod tests {
         // 780 keeps the sidebar; one point less and it leaves the row.
         assert_eq!(plan(780., 316., false, None).sidebar, Some(316.));
         assert_eq!(plan(779., 316., false, None).sidebar, None);
-        // At the minimum window the right pane takes everything but the rail.
-        assert_eq!(plan(540., 316., false, Some(340.)), Plan { sidebar: None, right: Some((468., true)) });
+        // Below the phone boundary the right pane takes the whole window: there is no rail
+        // beside it to keep.
+        assert_eq!(plan(540., 316., false, Some(340.)), Plan { sidebar: None, right: Some((540., true)) });
         // A sidebar dragged narrow keeps its place in a narrower window.
         assert_eq!(plan(730., 260., false, None).sidebar, Some(260.));
         // Hidden by hand: the conversation takes its room.
@@ -1052,6 +1084,28 @@ mod tests {
             Some((_, true)) => "pane replaces",
         };
         (plan.sidebar, pane)
+    }
+
+    #[test]
+    fn a_phone_is_one_column_and_the_sidebar_never_sits_beside_it() {
+        assert!(phone(390.) && !phone(600.));
+        // 390 asks for a 316 sidebar and a 300 thread: both would leave nothing, so neither
+        // is beside the conversation. The right pane takes the whole window.
+        assert_eq!(plan(390., 316., false, None), Plan { sidebar: None, right: None });
+        assert_eq!(plan(390., 316., false, Some(300.)), Plan { sidebar: None, right: Some((390., true)) });
+        assert_eq!(conversation_width(390., &plan(390., 316., false, None)), 390.);
+        // A hidden sidebar and a floating one change nothing on a phone.
+        assert_eq!(plan(390., 316., true, None).sidebar, None);
+        // The first width that is not a phone is unchanged by the phone rule.
+        assert_eq!(plan(600., 316., false, None).sidebar, None);
+        assert_eq!(plan(780., 316., false, None).sidebar, Some(316.));
+    }
+
+    #[test]
+    fn the_window_can_be_a_phone() {
+        assert_eq!(WINDOW_MIN, (360., 480.));
+        assert!(WINDOW_MIN.0 < PHONE);
+        assert!(phone(WINDOW_MIN.0));
     }
 
     #[test]

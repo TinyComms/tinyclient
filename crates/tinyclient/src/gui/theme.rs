@@ -47,21 +47,78 @@ pub fn text_soft() -> Rgba { rgb(0xa8abb3) }
 pub fn text_faint() -> Rgba { rgb(0x858993) }
 pub fn text_disabled() -> Rgba { rgb(0x53565e) }
 
-// Accent: "for you" or "this will act". Never plain unread.
-pub fn accent() -> Rgba { rgb(0x2f6feb) }
-pub fn accent_hover() -> Rgba { rgb(0x3a77ee) }
-pub fn accent_pressed() -> Rgba { rgb(0x2861d3) }
+// Accent: "for you" or "this will act". Never plain unread. On a phone it is the one amber
+// of "Paper Signal"; the desktop keeps its blue.
+pub fn accent() -> Rgba {
+    if crate::gui::phone::active() {
+        crate::gui::phone::tokens::accent()
+    } else {
+        rgb(0x2f6feb)
+    }
+}
+pub fn accent_hover() -> Rgba {
+    if crate::gui::phone::active() {
+        rgb(0xf2b45c)
+    } else {
+        rgb(0x3a77ee)
+    }
+}
+pub fn accent_pressed() -> Rgba {
+    if crate::gui::phone::active() {
+        rgb(0xd08e2c)
+    } else {
+        rgb(0x2861d3)
+    }
+}
 /// Links, @mentions, the "New" label, the caret.
-pub fn accent_text() -> Rgba { rgb(0x8ab4ff) }
-pub fn focus() -> Rgba { accent_text() }
-pub fn accent_soft() -> Rgba { rgba(0x2f6feb2e) }
+pub fn accent_text() -> Rgba {
+    if crate::gui::phone::active() {
+        crate::gui::phone::tokens::accent_text()
+    } else {
+        rgb(0x8ab4ff)
+    }
+}
+pub fn focus() -> Rgba {
+    accent_text()
+}
+pub fn accent_soft() -> Rgba {
+    if crate::gui::phone::active() {
+        crate::gui::phone::tokens::accent_soft()
+    } else {
+        rgba(0x2f6feb2e)
+    }
+}
 /// A message that mentions me.
-pub fn accent_wash() -> Rgba { rgba(0x2f6feb1a) }
+pub fn accent_wash() -> Rgba {
+    if crate::gui::phone::active() {
+        rgba(0xe9a23b1a)
+    } else {
+        rgba(0x2f6feb1a)
+    }
+}
 /// The halo of a focused field.
-pub fn accent_halo() -> Rgba { rgba(0x2f6feb59) }
+pub fn accent_halo() -> Rgba {
+    if crate::gui::phone::active() {
+        rgba(0xe9a23b59)
+    } else {
+        rgba(0x2f6feb59)
+    }
+}
 /// Selected text in a field.
-pub fn selection() -> Rgba { rgba(0x2f6feb73) }
-pub fn on_accent() -> Rgba { rgb(0xffffff) }
+pub fn selection() -> Rgba {
+    if crate::gui::phone::active() {
+        rgba(0xe9a23b73)
+    } else {
+        rgba(0x2f6feb73)
+    }
+}
+pub fn on_accent() -> Rgba {
+    if crate::gui::phone::active() {
+        crate::gui::phone::tokens::on_accent()
+    } else {
+        rgb(0xffffff)
+    }
+}
 
 // Semantic.
 pub fn positive() -> Rgba { rgb(0x3fbf7a) }

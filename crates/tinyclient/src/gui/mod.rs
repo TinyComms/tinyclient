@@ -16,6 +16,7 @@ mod input;
 mod layout;
 mod pane;
 mod people;
+mod phone;
 mod playing;
 mod rail;
 mod settings;
@@ -104,7 +105,12 @@ impl Shell {
         root.track_focus(&self.focus)
             .key_context("Shell")
             .on_action(cx.listener(|this, _: &Switcher, window, cx| this.open_switcher("", window, cx)))
-            .on_action(cx.listener(|this, _: &Back, _, cx| this.travel(true, cx)))
+            .on_action(cx.listener(|this, _: &Back, _, cx| {
+                // On a phone back pops the tab's stack; at a tab root it is the platform's.
+                if !this.phone_back(cx) {
+                    this.travel(true, cx);
+                }
+            }))
             .on_action(cx.listener(|this, _: &Forward, _, cx| this.travel(false, cx)))
             .on_action(cx.listener(|this, _: &UpLevel, _, cx| this.up_level(cx)))
             .on_action(cx.listener(|this, _: &ToggleSidebar, window, cx| this.toggle_sidebar(window, cx)))
@@ -210,6 +216,7 @@ fn shell_bindings() -> Vec<KeyBinding> {
 /// `--cursor N`, `--switcher [letters]`, `--menu add|own|network|space|row`, `--float`,
 /// `--hide-sidebar`, `--right thread|members`, `--pin N`, `--toast`, `--components`,
 /// `--walk N` (N presses of the unread walk), `--back N` (N steps back in history),
+/// `--tab needs|inbox|search|you` (a phone tab), `--scope` (the phone's account sheet open),
 /// `--sign-in-failed closed|unreachable|blocked` (first launch, with nothing signed in),
 /// `--state starting|keychain|denied|reconnecting|failed` (a window state, forced),
 /// `--crash-toast` (the toast after a crash relaunch), `--menu row-right|row-bottom` (the row
@@ -272,6 +279,16 @@ mod shot {
                     Some("unread") => shell.set_filter(InboxFilter::Unread, cx),
                     Some("mentions") => shell.set_filter(InboxFilter::Mentions, cx),
                     _ => {}
+                }
+                match flag("--tab").as_deref() {
+                    Some("needs") => shell.phone_state.tab = super::phone::Tab::Needs,
+                    Some("inbox") => shell.phone_state.tab = super::phone::Tab::Inbox,
+                    Some("search") => shell.phone_state.tab = super::phone::Tab::Search,
+                    Some("you") => shell.phone_state.tab = super::phone::Tab::You,
+                    _ => {}
+                }
+                if has("--scope") {
+                    shell.phone_state.scope_open = true;
                 }
             }
             1 => {
@@ -643,7 +660,10 @@ pub fn run() {
 
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(window_bounds(prefs.frame, cx))),
-                window_min_size: Some(size(px(layout::WINDOW_MIN.0), px(layout::WINDOW_MIN.1))),
+                // A phone window asks for no minimum: folded and split-screen windows must be
+                // allowed to be smaller than the frame we chose.
+                window_min_size: (!layout::phone(window_size().0))
+                    .then_some(size(px(layout::WINDOW_MIN.0), px(layout::WINDOW_MIN.1))),
                 titlebar: Some(TitlebarOptions {
                     title: Some("tinyclient".into()),
                     appears_transparent: true,

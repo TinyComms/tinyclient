@@ -79,6 +79,24 @@ use typing::TypingRow;
 const DRAFTS: usize = 64;
 /// The card and the bars that replace it are the same height, so the layout never moves.
 const CARD: f32 = 40.;
+
+/// The card's height: 40 on the desktop, 48 on a phone, where a thumb needs the room.
+fn card_height() -> f32 {
+    if crate::gui::phone::active() {
+        48.
+    } else {
+        CARD
+    }
+}
+
+/// An icon button on the card: 28 on the desktop, 44 on a phone.
+fn card_control() -> f32 {
+    if crate::gui::phone::active() {
+        44.
+    } else {
+        theme::CONTROL
+    }
+}
 /// A draft goes to chatd once the keys have been still this long.
 const DRAFT_QUIET: Duration = Duration::from_millis(500);
 /// A completion is looked up once the keys have been still this long.
@@ -1564,7 +1582,7 @@ impl Composer {
         };
         let expired = action == Some("Sign in again");
         div()
-            .h(px(CARD))
+            .h(px(card_height()))
             .pl(px(12.))
             .pr(px(6.))
             .rounded(px(theme::R_FLOAT))
@@ -1699,7 +1717,7 @@ impl Composer {
             .id(id)
             .relative()
             .flex_none()
-            .size(px(theme::CONTROL))
+            .size(px(card_control()))
             .rounded(px(theme::R_CONTROL))
             .flex()
             .items_center()
@@ -1748,7 +1766,7 @@ impl Composer {
         let send = div()
             .id("send")
             .relative()
-            .size(px(theme::CONTROL))
+            .size(px(card_control()))
             .flex_none()
             .rounded(px(theme::R_CONTROL))
             .flex()
@@ -1773,7 +1791,7 @@ impl Composer {
             .child(glyph(send_icon, 16., if ready { theme::on_accent() } else { theme::text_disabled() }))
             .child(canvas(move |bounds, _, _| anchors.send.set(Some(bounds)), |_, _, _, _| {}).absolute().top_0().left_0().size_full());
         let row = div()
-            .min_h(px(CARD - 2.))
+            .min_h(px(card_height() - 2.))
             .pl(px(if controls.attach { 5. } else { 12. }))
             .pr(px(5.))
             .py(px(5.))
@@ -1796,7 +1814,7 @@ impl Composer {
             .child(send);
         let armed = self.armed.is_some();
         div()
-            .min_h(px(CARD))
+            .min_h(px(card_height()))
             .rounded(px(theme::R_FLOAT))
             .bg(theme::raised())
             .border_1()
@@ -2267,10 +2285,11 @@ impl Render for Composer {
         #[cfg(feature = "gui-shot")]
         self.stage_picker(window, cx);
 
+        let phone = crate::gui::phone::active();
         let dock = div()
             .flex_none()
-            .px(px(20.))
-            .pb(px(16.))
+            .px(px(if phone { 12. } else { 20. }))
+            .pb(px(if phone { 8. + crate::gui::phone::tokens::SAFE_BOTTOM } else { 16. }))
             .flex()
             .flex_col()
             .key_context("Composer")

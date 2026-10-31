@@ -388,10 +388,18 @@ impl Pane {
         let failed = matches!(message.state, SendState::Failed { .. });
         let pending = message.state == SendState::Pending;
         let mentioned = message.mentions_me && !failed;
+        // A phone shows my message on the right with the one accent rule (`10-visual-direction`
+        // §2.1): no bubble, no fill, one 3 pt seam.
+        let mine = metrics == Metrics::PHONE && message.outgoing;
         let bar = match (failed, message.mentions_me) {
             (true, _) => Some(theme::danger()),
             (false, true) => Some(theme::accent()),
             (false, false) => None,
+        };
+        let bar = if mine {
+            Some(crate::gui::phone::tokens::accent())
+        } else {
+            bar
         };
         let flashing = self.flash.as_deref() == Some(message.id.as_str());
         // The message in the composer for editing is marked, so it is plain which one is changing.
@@ -447,6 +455,7 @@ impl Pane {
             .min_w_0()
             .flex()
             .flex_col()
+            .when(mine, |column| column.items_end())
             .children(head.then(|| self.header(message)))
             .child(sent)
             .children(self.reactions(message, window, cx))
@@ -476,7 +485,16 @@ impl Pane {
                     }
                 }),
             )
-            .children(bar.map(|color| div().absolute().left_0().top_0().bottom_0().w(px(2.)).bg(color)))
+            .children(bar.map(|color| {
+                div()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .w(px(if mine { 3. } else { 2. }))
+                    .when(mine, |rule| rule.right(px(6.)).opacity(0.55))
+                    .when(!mine, |rule| rule.left_0())
+                    .bg(color)
+            }))
             .children(flashing.then(|| {
                 div()
                     .absolute()
@@ -485,7 +503,7 @@ impl Pane {
                     .with_animation(name_id("flash", &message.id), Animation::new(FLASH), |tint, done| tint.opacity(1. - done))
             }))
             .children(message.reply_to.as_ref().map(|reply| self.reply_line(reply, window, cx)))
-            .child(div().flex().gap(px(metrics.gap)).child(gutter).child(column))
+            .child(div().flex().gap(px(metrics.gap)).when(mine, |row| row.flex_row_reverse()).child(gutter).child(column))
             // Last, so it is over the row; it rises past the row's top edge, which nothing clips.
             .children(self.toolbar(message, cx));
         // The gap above a group is outside the row, so it does not light up on hover.
@@ -540,6 +558,7 @@ impl Pane {
 
     fn header(&self, message: &Message) -> Div {
         let name = if message.outgoing { "You".to_owned() } else { message.sender.name.clone() };
+        let mine = self.metrics == Metrics::PHONE && message.outgoing;
         let tag = |words: &'static str| {
             div()
                 .flex_none()
@@ -559,13 +578,14 @@ impl Pane {
             .flex()
             .items_center()
             .gap(px(8.))
+            .when(mine, |header| header.justify_end())
             .child(
                 div()
                     .min_w_0()
                     .flex()
                     .items_baseline()
                     .gap(px(8.))
-                    .child(div().min_w_0().truncate().type_body().font_weight(theme::SEMIBOLD).child(name))
+                    .child(div().min_w_0().truncate().type_body().when(self.metrics == Metrics::PHONE, |name| name.text_size(px(15.)).line_height(px(20.))).font_weight(theme::SEMIBOLD).child(name))
                     .child(
                         div()
                             .flex_none()
@@ -595,6 +615,8 @@ impl Pane {
 
     fn content(&mut self, message: &Rc<Message>, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let edited = || div().h(px(16.)).type_micro().text_color(theme::text_faint()).child("(edited)").into_any_element();
+        let phone = self.metrics == Metrics::PHONE;
+        let mine = phone && message.outgoing;
         if message.text.trim().is_empty() {
             return message.edited.then(edited).into_iter().collect();
         }
@@ -613,6 +635,8 @@ impl Pane {
                 Block::Text(inline) => div()
                     .max_w(px(MEASURE))
                     .type_body()
+                    .when(phone, |div| div.text_size(px(17.)).line_height(px(24.)))
+                    .when(mine, |div| div.text_align(gpui::TextAlign::Right))
                     .child(self.rich(message, ix, inline, theme::text().into(), window, cx))
                     .into_any_element(),
                 Block::Quote(inline) => div()
@@ -625,6 +649,8 @@ impl Pane {
                             .pl(px(12.))
                             .min_w_0()
                             .type_body()
+                            .when(phone, |div| div.text_size(px(17.)).line_height(px(24.)))
+                            .when(mine, |div| div.text_align(gpui::TextAlign::Right))
                             .child(self.rich(message, ix, inline, theme::text_soft().into(), window, cx)),
                     )
                     .into_any_element(),
@@ -635,6 +661,8 @@ impl Pane {
                         .pl(px(22. * f32::from(*depth)))
                         .flex()
                         .type_body()
+                        .when(phone, |div| div.text_size(px(17.)).line_height(px(24.)))
+                        .when(mine, |div| div.text_align(gpui::TextAlign::Right))
                         .child(div().w(px(22.)).flex_none().text_color(theme::text_faint()).child(marker))
                         .child(div().min_w_0().flex_1().child(self.rich(message, ix, text, theme::text().into(), window, cx)))
                         .into_any_element()
@@ -944,10 +972,11 @@ impl Pane {
     /// loads it.
     fn load_box(&self, holder: Stateful<Div>, file: &MediaFile, what: &str, bytes: u64, words: bool, cx: &mut Context<Self>) -> Stateful<Div> {
         let id = file.id.clone();
+        let tap = if crate::gui::phone::active() { "Tap to load" } else { "Click to load" };
         let line = match (words, bytes) {
             (false, _) => "Load".to_owned(),
-            (true, 0) => format!("{what} · Click to load"),
-            (true, bytes) => format!("{what} · {} · Click to load", media::size_label(bytes)),
+            (true, 0) => format!("{what} · {tap}"),
+            (true, bytes) => format!("{what} · {} · {tap}", media::size_label(bytes)),
         };
         holder
             .child(div().absolute().inset_0().flex().items_center().justify_center().type_small().text_color(theme::text_soft()).child(line))

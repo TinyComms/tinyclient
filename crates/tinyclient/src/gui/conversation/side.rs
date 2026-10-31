@@ -466,7 +466,7 @@ impl Shell {
     }
 
     /// The header's Details button.
-    pub(super) fn toggle_details(&mut self, cx: &mut Context<Self>) {
+    pub(in crate::gui) fn toggle_details(&mut self, cx: &mut Context<Self>) {
         self.restore_switches();
         let Some(open) = self.snapshot.as_ref().and_then(|snapshot| snapshot.open.as_ref()).map(pane_open) else {
             return;

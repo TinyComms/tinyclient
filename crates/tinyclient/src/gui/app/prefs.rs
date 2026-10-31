@@ -322,7 +322,7 @@ mod tests {
         assert_eq!(odd.right, layout::RIGHT_WIDTH);
         assert_eq!(odd.pins, vec![key(Network::Slack, "T1")]);
         // A frame below the minimum grows to it; the text step stops at +3.
-        assert_eq!(odd.frame, Some((1., 2., 540., 440.)));
+        assert_eq!(odd.frame, Some((1., 2., layout::WINDOW_MIN.0, layout::WINDOW_MIN.1)));
         assert_eq!((odd.text_step, odd.mode, odd.autoplay), (3, Mode::Inbox, Autoplay::Always));
         assert_eq!(parse(""), Prefs::default());
     }

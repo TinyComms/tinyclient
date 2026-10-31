@@ -21,6 +21,16 @@ use std::rc::Rc;
 /// Lines a multi-line field shows before it scrolls.
 pub const MAX_ROWS: usize = 8;
 
+/// A phone's field grows to five lines (120 pt) and then scrolls inside, as the dock in
+/// `01-ia-navigation.md` Q3 does.
+pub fn max_rows() -> usize {
+    if crate::gui::phone::active() {
+        5
+    } else {
+        MAX_ROWS
+    }
+}
+
 actions!(
     text_input,
     [
@@ -1172,7 +1182,7 @@ impl Element for TextElement {
                 Some(width) => measuring.lay_out(input.read(cx), Some(width), window).rows.len(),
                 None => 1,
             };
-            size(width.unwrap_or_default(), line_height * rows.clamp(1, MAX_ROWS) as f32)
+            size(width.unwrap_or_default(), line_height * rows.clamp(1, max_rows()) as f32)
         });
         (layout, shaping)
     }

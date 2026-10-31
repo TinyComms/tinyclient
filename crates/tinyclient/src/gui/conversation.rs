@@ -1231,7 +1231,8 @@ impl Shell {
             .pane
             .get_or_init(|| {
                 let shell = cx.weak_entity();
-                cx.new(|cx| Pane::new(Metrics::FULL, shell, cx))
+                let metrics = if super::phone::active() { Metrics::PHONE } else { Metrics::FULL };
+                cx.new(|cx| Pane::new(metrics, shell, cx))
             })
             .clone();
         self.subscribe_pane(&pane, cx);
@@ -1317,7 +1318,9 @@ impl Shell {
         let typing = open.special != Special::Service;
         pane.update(cx, |pane, cx| pane.show(open, &me, picture, typing, cx));
         let keys = pane.clone();
-        div()
+        let phone = super::phone::active();
+        let mut view = div()
+            .relative()
             .size_full()
             .flex()
             .flex_col()
@@ -1326,13 +1329,29 @@ impl Shell {
                 if matches!(event.keystroke.key.as_str(), "pageup" | "pagedown") {
                     keys.update(cx, |pane, cx| pane.key_down(event, window, cx));
                 }
-            })
-            .child(self.strip(open, link, window, cx))
-            .child(div().flex_1().min_h_0().child(pane))
-            .child(match open.special {
-                Special::Service => self.no_composer(open, cx),
-                _ => self.composer(open, link, cx),
-            })
+            });
+        if phone {
+            // The back gesture: a drag that began in the left 20 pt and passed 60 pops, as
+            // iOS's edge swipe does (`01-ia-navigation.md` §5.2).
+            view = view
+                .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
+                    if event.pressed_button == Some(MouseButton::Left) {
+                        this.phone_drag_back(f32::from(event.position.x), true, cx);
+                    }
+                }))
+                .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| this.phone_release_edge()));
+        }
+        view.child(if phone {
+            self.phone_strip(open, link, window, cx)
+        } else {
+            self.strip(open, link, window, cx)
+        })
+        .child(div().flex_1().min_h_0().child(pane))
+        .child(match open.special {
+            Special::Service => self.no_composer(open, cx),
+            _ => self.composer(open, link, cx),
+        })
+        .children(phone.then(|| self.phone_edge(cx)))
     }
 
     /// The network's own account (Telegram's service notifications) takes no messages: a line
