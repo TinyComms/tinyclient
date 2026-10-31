@@ -109,8 +109,8 @@ impl Shell {
         let mut ix = 0;
         for (at, (day, rows)) in groups.iter().enumerate() {
             list = list.child(phone_section(day.label(), at == 0));
-            for row in rows {
-                list = list.child(self.phone_row(ix, row, cx));
+            for (last, row) in rows.iter().enumerate().map(|(at, row)| (at + 1 == rows.len(), row)) {
+                list = list.child(self.phone_row(ix, row, last, cx));
                 ix += 1;
             }
         }
@@ -132,8 +132,9 @@ impl Shell {
     }
 
     /// One conversation, 56 pt: avatar 40, title 15, one preview line 13, one time 12 and one
-    /// count. Nothing else.
-    pub(super) fn phone_row(&self, ix: usize, conversation: &Rc<Conversation>, cx: &mut Context<Self>) -> Stateful<Div> {
+    /// count. Nothing else. `last` says it closes its section: the rule under a row is inset past
+    /// the avatar, and there is none after the last one.
+    pub(super) fn phone_row(&self, ix: usize, conversation: &Rc<Conversation>, last: bool, cx: &mut Context<Self>) -> Stateful<Div> {
         let c = conversation;
         let tone = row_tone(c, false, false);
         let avatar = self.conversation_avatar(c, 40., theme::row_surface(false), cx);
@@ -203,6 +204,9 @@ impl Shell {
             );
         let (key, title) = (c.key.clone(), c.title.clone());
         list_row(("phone-row", ix), tokens::row_height(), false, false, content)
+            .relative()
+            // 1 pt at 5.5% from x = 76 to the edge: the seam is between rows, not around them.
+            .children((!last).then(|| div().absolute().bottom_0().left(px(tokens::RULE_START)).right_0().h(px(1.)).bg(tokens::rule())))
             .active(|row| row.bg(tokens::pressed()))
             .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
                 this.select(key.clone(), &title, cx);

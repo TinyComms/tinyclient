@@ -283,6 +283,10 @@ pub struct Pane {
 
     /// How wide the list was when last drawn; 0 before the first draw.
     width: f32,
+    /// A phone's own clamp: the blank a short conversation leaves above its first row. It
+    /// becomes the list's bottom padding, so the rows sit at the top of the pane instead of
+    /// the bottom. Measured after layout; 0 on the desktop, which keeps its bottom alignment.
+    phone_pad: f32,
     /// Where each row drawn this frame is, for knowing what is on screen.
     seen: Seen,
     #[cfg(feature = "gui-shot")]
@@ -347,6 +351,7 @@ impl Pane {
             scrub_bounds: Rc::default(),
             play_after: None,
             width: 0.,
+            phone_pad: 0.,
             seen: Rc::default(),
             #[cfg(feature = "gui-shot")]
             script: if metrics == Metrics::DENSE { shot::Script::default() } else { shot::Script::from_env() },
@@ -971,6 +976,36 @@ impl Pane {
 
     /// Runs once the rows are laid out: asks for what they need, and notes how far the user
     /// has read. Nothing here draws.
+    /// A phone's list is bottom-aligned, so a conversation that fits is pushed down: its start
+    /// block opens half under the strip, and a very short one opens under a blank half a screen
+    /// tall. GPUI's list has no "start at the top when the rows fit" switch, so the phone adds
+    /// the blank as the list's own bottom padding — the rows then fill exactly one viewport and
+    /// land at the top. A conversation taller than the viewport keeps the bottom alignment,
+    /// which is where opening one should land. Measured after layout, so 200% text is the same
+    /// question and gets the same answer.
+    fn settle_phone(&mut self, seen: &[(usize, Bounds<Pixels>)], viewport: Bounds<Pixels>, cx: &mut Context<Self>) {
+        if self.metrics != Metrics::PHONE {
+            return;
+        }
+        let last = self.items.len().saturating_sub(1);
+        // Every row drawn, so the span between the ends is the whole content, wherever the
+        // list has put it.
+        let whole = !self.items.is_empty() && seen.iter().any(|(ix, _)| *ix == 0) && seen.iter().any(|(ix, _)| *ix == last);
+        let pad = if whole {
+            let top = seen.iter().map(|(_, bounds)| bounds.top()).min().unwrap_or(viewport.top());
+            let bottom = seen.iter().map(|(_, bounds)| bounds.bottom()).max().unwrap_or(viewport.bottom());
+            (viewport.size.height - (bottom - top)).max(px(0.))
+        } else {
+            px(0.)
+        };
+        // Half a point of slack: row heights are rounded, and a pad that only ever grew would
+        // twitch once a frame.
+        if (pad - self.phone_pad.into()).abs() > px(0.5) {
+            self.phone_pad = f32::from(pad);
+            cx.notify();
+        }
+    }
+
     fn after_layout(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.images.sweep(window, cx);
         let scale = window.scale_factor();
@@ -995,6 +1030,7 @@ impl Pane {
             cx.notify();
         }
         let seen = self.seen.borrow().clone();
+        self.settle_phone(&seen, viewport, cx);
         let on_screen = |bounds: &Bounds<Pixels>| bounds.bottom() > viewport.top() && bounds.top() < viewport.bottom();
 
         let built = |ix: usize| seen.iter().any(|(seen, _)| *seen == ix);
@@ -1169,7 +1205,10 @@ impl Render for Pane {
         self.seen.borrow_mut().clear();
         let this = cx.entity();
         let rows = gpui::list(self.list.clone(), cx.processor(|this: &mut Pane, ix: usize, window, cx| this.row(ix, window, cx)))
-            .size_full();
+            .size_full()
+            // A phone's clamp: see `settle_phone`. Zero on the desktop, so its bottom alignment
+            // and its own scroll position are untouched.
+            .pb(px(self.phone_pad));
         let after = gpui::canvas(
             |_, _, _| (),
             move |_, (), window, cx| {

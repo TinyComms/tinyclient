@@ -1790,28 +1790,48 @@ impl Composer {
             .on_click(cx.listener(|this, _, _, cx| this.send(false, cx)))
             .child(glyph(send_icon, if crate::gui::phone::active() { 18. } else { 16. }, if ready { theme::on_accent() } else { theme::text_disabled() }))
             .child(canvas(move |bounds, _, _| anchors.send.set(Some(bounds)), |_, _, _, _| {}).absolute().top_0().left_0().size_full());
-        let row = div()
-            .min_h(px(card_height() - 2.))
-            .pl(px(if controls.attach { 5. } else { 12. }))
-            .pr(px(5.))
-            .py(px(5.))
+        // The field: 44 pt at its shortest, growing to five lines at any text size, and never
+        // wider than the room the buttons leave it.
+        let field = div()
+            .flex_1()
+            .min_w_0()
             .flex()
-            .items_end()
-            .children(attach.map(|attach| attach.mr(px(4.))))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .py(px(4.))
-                    .mr(px(4.))
-                    .flex()
-                    .type_body()
-                    .text_color(theme::text())
-                    .child(self.input.clone()),
-            )
-            .children(gif.map(|gif| gif.mr(px(2.))))
-            .children(smile.map(|smile| smile.mr(px(4.))))
-            .child(send);
+            .items_center()
+            .when(crate::gui::phone::active(), |field| field.min_h(px(44.)).py(px(2.)))
+            .when(!crate::gui::phone::active(), |field| field.py(px(4.)).mr(px(4.)))
+            .type_body()
+            .text_color(theme::text())
+            .child(self.input.clone());
+        let row = if crate::gui::phone::active() {
+            // A real flex row: 44 | field | 44 | 44. Every button keeps its size; only the field
+            // gives way, so nothing can overlap at 100% or at 200%. GIFs and stickers are inside
+            // the emoji picker's own tabs, so the row has no fifth button.
+            div()
+                .min_h(px(56.))
+                .pl(px(6.))
+                .pr(px(6.))
+                .py(px(6.))
+                .flex()
+                .items_end()
+                .gap(px(2.))
+                .children(attach)
+                .child(field)
+                .children(smile)
+                .child(send)
+        } else {
+            div()
+                .min_h(px(card_height() - 2.))
+                .pl(px(if controls.attach { 5. } else { 12. }))
+                .pr(px(5.))
+                .py(px(5.))
+                .flex()
+                .items_end()
+                .children(attach.map(|attach| attach.mr(px(4.))))
+                .child(field)
+                .children(gif.map(|gif| gif.mr(px(2.))))
+                .children(smile.map(|smile| smile.mr(px(4.))))
+                .child(send)
+        };
         let armed = self.armed.is_some();
         div()
             .min_h(px(card_height()))
@@ -2291,6 +2311,15 @@ impl Render for Composer {
             .px(px(if phone { 12. } else { 20. }))
             .pt(px(if phone { 10. } else { 0. }))
             .pb(px(if phone { 12. + crate::gui::phone::tokens::SAFE_BOTTOM } else { 16. }))
+            // On a phone the composer is chrome: one step above the page, with the same 1 pt
+            // light and hairline every pinned strip wears. The desktop dock keeps no fill.
+            .when(phone, |dock| {
+                use crate::gui::phone::tokens as phone_tokens;
+                dock.bg(phone_tokens::surface())
+                    .border_t_1()
+                    .border_color(phone_tokens::hairline())
+                    .shadow(phone_tokens::top_highlight())
+            })
             .flex()
             .flex_col()
             .key_context("Composer")

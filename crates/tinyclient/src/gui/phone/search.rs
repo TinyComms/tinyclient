@@ -21,23 +21,25 @@ impl Shell {
             .flex()
             .flex_col();
         list = list.child(phone_section(format!("On this phone · {}", rows.len()), true));
-        for (ix, row) in rows.iter().take(12).enumerate() {
-            list = list.child(self.phone_row(ix, row, cx));
+        let shown = rows.iter().take(12).collect::<Vec<_>>();
+        for (ix, row) in shown.iter().enumerate() {
+            list = list.child(self.phone_row(ix, row, ix + 1 == shown.len(), cx));
         }
         let field = div()
             .mx(px(tokens::GUTTER))
             .mt(px(12.))
-            .h(px(tokens::TOUCH))
+            .min_h(px(tokens::TOUCH))
             .px(px(12.))
             .rounded(px(12.))
-            .bg(theme::field())
+            // The page's own ladder: a field is raised, where the list behind it is the page.
+            .bg(tokens::raised())
             .border_1()
-            .border_color(theme::border())
+            .border_color(tokens::hairline())
             .flex()
             .items_center()
             .gap(px(8.))
-            .child(glyph("icons/search.svg", 18., theme::text_faint()))
-            .child(div().phone_row().text_color(theme::text_faint()).child("Search messages"));
+            .child(glyph("icons/search.svg", 16., theme::text_faint()))
+            .child(div().flex_1().min_w_0().truncate().phone_row().text_color(theme::text_faint()).child("Search messages"));
         div()
             .size_full()
             .flex()

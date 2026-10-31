@@ -188,9 +188,9 @@ impl Shell {
         true
     }
 
-    /// The tab bar: 56 pt of cells plus the home indicator below them. Cells are fixed: 7 top,
-    /// a 22 pt icon, 3, a 16 x 2 indicator, 3, an 11/14 label, 5 bottom. The icon and its badge
-    /// never move, whatever the label does.
+    /// The tab bar: 56 pt of cells plus the home indicator below them. A cell is 8 above a 22 pt
+    /// icon, 10 between it and the label (the 2 pt indicator lives in that gap), 14 of label and
+    /// 2 under. The icon and its badge never move, whatever the label does.
     fn phone_tabs(&self, snapshot: &Snapshot, cx: &mut Context<Self>) -> Div {
         let needs = inbox::needing(self.sidebar_state.inbox.all());
         let unread = self.sidebar_state.inbox.all().iter().any(|row| row.unread > 0);
@@ -198,7 +198,8 @@ impl Shell {
         let account = snapshot.accounts.iter().find(|account| account.avatar.is_some()).or_else(|| snapshot.accounts.first());
         let cells = Tab::ALL.into_iter().enumerate().map(|(ix, tab)| {
             let on = self.phone_state.tab == tab;
-            let color = if on { theme::text() } else { theme::text_faint() };
+            // Selected #F2F3F5, unselected #8A909B: the one difference besides the bar.
+            let color = if on { tokens::text() } else { tokens::text_faint() };
             let badge = match tab {
                 Tab::Needs if needs > 0 => Some(self.tab_badge(needs)),
                 Tab::Inbox if unread => Some(
@@ -209,6 +210,7 @@ impl Shell {
                         .size(px(8.))
                         .rounded(px(4.))
                         .bg(if mentioned { tokens::accent() } else { theme::text_soft() })
+                        .shadow(tokens::ring(tokens::surface(), 2.))
                         .into_any_element(),
                 ),
                 _ => None,
@@ -240,9 +242,8 @@ impl Shell {
                 .flex_col()
                 .items_center()
                 .justify_start()
-                .pt(px(7.))
-                .pb(px(5.))
-                .gap(px(3.))
+                .pt(px(8.))
+                .pb(px(2.))
                 .cursor_pointer()
                 .active(|cell| cell.bg(tokens::pressed()))
                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -250,8 +251,16 @@ impl Shell {
                     cx.notify();
                 }))
                 .child(div().relative().h(px(22.)).w(px(22.)).flex().items_center().justify_center().child(icon).children(badge))
-                // A 2 pt bar above the label: the one selected-tab cue, and it does not move.
-                .child(div().h(px(2.)).w(px(16.)).rounded(px(1.)).bg(if on { tokens::accent() } else { gpui::rgba(0x00000000) }))
+                // The 10 pt between icon and label, with a 2 x 16 bar in it: the one
+                // selected-tab cue, and it does not move the label.
+                .child(
+                    div()
+                        .h(px(10.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(div().h(px(2.)).w(px(16.)).rounded(px(1.)).bg(if on { tokens::accent() } else { gpui::rgba(0x00000000) })),
+                )
                 .child(div().w_full().min_w_0().truncate().text_align(gpui::TextAlign::Center).phone_tab().text_color(color).child(tab.label()))
         });
         div()
@@ -277,6 +286,8 @@ impl Shell {
             .px(px(5.))
             .rounded(px(9.))
             .bg(tokens::accent())
+            // A 2 pt ring of chrome, so the badge reads as a thing on the icon, not a smear.
+            .shadow(tokens::ring(tokens::surface(), 2.))
             .flex()
             .items_center()
             .justify_center()
@@ -297,7 +308,7 @@ impl Shell {
                 .gap(px(6.))
                 .cursor_pointer()
                 .child(div().phone_title().child(title))
-                .child(glyph("icons/chevron-down.svg", 16., theme::text_faint()))
+                .child(glyph("icons/chevron-down.svg", 14., theme::text_faint()))
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.phone_state.scope_open = true;
                     cx.notify();
@@ -330,7 +341,7 @@ impl Shell {
             let pick = key.clone();
             div()
                 .id(id)
-                .h(px(56.))
+                .min_h(px(tokens::sheet_row()))
                 .px(px(12.))
                 .rounded(px(8.))
                 .flex()
@@ -340,7 +351,7 @@ impl Shell {
                 .active(|row| row.bg(tokens::pressed()))
                 .cursor_pointer()
                 .child(div().flex_1().min_w_0().truncate().phone_row().font_weight(if on { theme::SEMIBOLD } else { theme::REGULAR }).child(name))
-                .when(on, |row| row.child(glyph("icons/check.svg", 18., tokens::accent())))
+                .when(on, |row| row.child(glyph("icons/check.svg", 16., tokens::accent())))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.phone_state.scope = pick.clone();
                     this.phone_state.scope_open = false;

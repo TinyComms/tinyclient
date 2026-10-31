@@ -457,8 +457,8 @@ impl Pane {
         let bar = if editing { Some(theme::accent()) } else { bar };
         let owns = self.owns_overlay(&message.id);
 
-        let gutter = if head {
-            self.avatar(message, window, cx).into_any_element()
+        let mut gutter: Option<Div> = Some(if head {
+            self.avatar(message, window, cx)
         } else {
             div()
                 .w(px(metrics.avatar))
@@ -471,8 +471,7 @@ impl Pane {
                 .text_color(gpui::transparent_black())
                 .group_hover("row", |style| style.text_color(theme::text_faint()))
                 .child(short_clock(message.sent))
-                .into_any_element()
-        };
+        });
 
         let mut sent = div().flex().flex_col();
         if message.deleted {
@@ -499,13 +498,36 @@ impl Pane {
         if pending {
             sent = sent.opacity(0.55);
         }
+        // A phone's message of mine: the face rides in the head line and the words get the
+        // width, so the accent rule can sit at the words' own trailing edge — 8 clear of the
+        // words and 8 clear of the glass — instead of out in the page margin, where it read as
+        // a scrollbar. The wrapper reaches past the row's inset to the glass; its padding is
+        // what keeps the 8 + 3 + 8. The rule spans the words only: the head line is outside it.
+        let sent: AnyElement = if mine {
+            div()
+                .w_full()
+                .mr(px(-metrics.inset))
+                // 8 clear of the glass, the 3 pt rule, 8 clear of the words.
+                .pr(px(metrics.inset + 3.))
+                .flex()
+                .flex_col()
+                .items_end()
+                .child(sent)
+                .children(bar.map(|color| {
+                    div().absolute().top_0().bottom_0().right(px(8.)).w(px(3.)).rounded(px(1.5)).bg(color)
+                }))
+                .into_any_element()
+        } else {
+            sent.into_any_element()
+        };
+        let face = if mine { gutter.take() } else { None };
         let column = div()
             .flex_1()
             .min_w_0()
             .flex()
             .flex_col()
             .when(mine, |column| column.items_end())
-            .children(head.then(|| self.header(message)))
+            .children(head.then(|| self.header(message, face)))
             .child(sent)
             .children(self.reactions(message, window, cx))
             .children(self.thread_line(message, window, cx))
@@ -519,7 +541,9 @@ impl Pane {
             .relative()
             .px(px(metrics.inset))
             .when(head, |row| row.pt(px(3.)).pb(px(3.)))
-            .when(!head, |row| row.py(px(1.)))
+            // A phone gives messages of one group 12 pt of air (6 + 6); the desktop keeps its
+            // tighter paragraph flow.
+            .when(!head, |row| row.py(px(if metrics == Metrics::PHONE { 6. } else { 1. })))
             .when(editing, |row| row.bg(theme::accent_soft()))
             .when(mentioned && !editing, |row| row.bg(theme::accent_wash()))
             // The row that owns an open menu, picker or dialog keeps `selected` (polish/01 §2).
@@ -534,18 +558,9 @@ impl Pane {
                     }
                 }),
             )
-            .children(bar.map(|color| {
-                div()
-                    .absolute()
-                    .when(mine, |rule| {
-                        // The seam runs beside the words, below the name line: it is the text
-                        // block's rule, not the avatar's outline. 6 from the trailing edge keeps
-                        // it clear of the list's own scrollbar.
-                        rule.top(px(if head { 23. } else { 3. })).bottom(px(3.)).right(px(6.)).w(px(3.)).rounded(px(1.5))
-                    })
-                    .when(!mine, |rule| rule.top_0().bottom_0().w(px(2.)).left_0())
-                    .bg(color)
-            }))
+            // A phone's own message draws its accent seam beside its words, in `sent`; the
+            // others get the 2 pt edge at their left.
+            .children(bar.filter(|_| !mine).map(|color| div().absolute().top_0().bottom_0().w(px(2.)).left_0().bg(color)))
             .children(flashing.then(|| {
                 div()
                     .absolute()
@@ -554,7 +569,16 @@ impl Pane {
                     .with_animation(name_id("flash", &message.id), Animation::new(FLASH), |tint, done| tint.opacity(1. - done))
             }))
             .children(message.reply_to.as_ref().map(|reply| self.reply_line(reply, window, cx)))
-            .child(div().flex().gap(px(metrics.gap)).when(mine, |row| row.flex_row_reverse()).child(gutter).child(column))
+            // An outgoing phone message has no gutter: its face is in the head line and its
+            // words run to their own rule. Every other row keeps the face column.
+            .child(
+                div()
+                    .flex()
+                    .gap(px(metrics.gap))
+                    .when(mine, |row| row.flex_row_reverse())
+                    .children(gutter)
+                    .child(column),
+            )
             // Last, so it is over the row; it rises past the row's top edge, which nothing clips.
             .children(self.toolbar(message, cx));
         // The gap above a group is outside the row, so it does not light up on hover.
@@ -607,7 +631,9 @@ impl Pane {
         div().pt(px(2.)).flex_none().when(message.deleted, |avatar| avatar.opacity(0.4)).child(face)
     }
 
-    fn header(&self, message: &Message) -> Div {
+    /// The head line: who, when, and the marks a message carries. `face` is a phone's own
+    /// message: its picture rides at the end of this line, so the words below keep the width.
+    fn header(&self, message: &Message, face: Option<Div>) -> Div {
         let name = if message.outgoing { "You".to_owned() } else { message.sender.name.clone() };
         let mine = self.metrics == Metrics::PHONE && message.outgoing;
         let tag = |words: &'static str| {
@@ -625,7 +651,7 @@ impl Pane {
                 .child(words)
         };
         div()
-            .h(px(if self.metrics == Metrics::PHONE { tokens_phone::scaled(20.) } else { 20. }))
+            .h(px(if self.metrics == Metrics::PHONE { tokens_phone::scaled(20.).max(if face.is_some() { 32. } else { 0. }) } else { 20. }))
             .flex()
             .items_center()
             .gap(px(8.))
@@ -660,6 +686,7 @@ impl Pane {
                     .child(icon(Icon::Pin, 12., theme::text_faint()))
                     .child("Pinned")
             }))
+            .children(face)
     }
 
     // Words.

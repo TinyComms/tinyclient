@@ -15,12 +15,15 @@ pub const SAFE_TOP: f32 = 44.;
 pub const SAFE_BOTTOM: f32 = 34.;
 /// Chrome heights: the nav strip and the tab bar. The tab bar carries the safe area below it.
 pub const NAV: f32 = 52.;
+/// 8 above the icon, 22 of it, 10 between it and the label, 14 of label, 2 under: 56.
 pub const TAB: f32 = 56.;
 /// A conversation row. 64, not 56: a thumb can find it and the two lines breathe.
 pub const ROW: f32 = 64.;
 pub const TOUCH: f32 = 44.;
 /// The gutter every list row, header and message shares.
 pub const GUTTER: f32 = 16.;
+/// Where a row's rule starts: past the 40 pt avatar and its 16 + 12 of air.
+pub const RULE_START: f32 = 76.;
 
 // A 200% text run multiplies the phone's type, not the desktop's. 1 by default.
 static SCALE: AtomicU32 = AtomicU32::new(0);
@@ -50,34 +53,45 @@ pub fn row_height() -> f32 {
     ROW + (text_scale() - 1.) * 32.
 }
 
+/// A sheet's one-line choice: 56 at 100%, 68 at 200%, so a 40 pt line of type keeps its air.
+pub fn sheet_row() -> f32 {
+    56. + (text_scale() - 1.) * 12.
+}
+
 pub fn tab_height() -> f32 {
     TAB
 }
 
-// Surfaces.
+// Surfaces. A ladder, not one flat black: the page is the floor, chrome sits one step above
+// it, and anything that floats (a card, a field, a sheet) one above that.
 /// The page behind every phone screen.
 pub fn page() -> Rgba {
-    rgb(0x131418)
+    rgb(0x14151a)
 }
-/// Nav strips, tab bars, sheets' headers: anything pinned.
+/// Nav strips, tab bars, the composer's dock: anything pinned.
 pub fn surface() -> Rgba {
-    rgb(0x191b1f)
+    rgb(0x1b1d22)
 }
-/// Cards, fields, the composer card.
+/// Cards, fields, the composer card, sheets.
 pub fn raised() -> Rgba {
-    rgb(0x1f2227)
+    rgb(0x23262c)
 }
 
-// Lines. 0.07 and 0.12: a hairline reads as a seam, a strong hairline as an edge.
+// Lines. 0.07 and 0.12: a hairline reads as a seam, a strong hairline as an edge. A row's rule
+// is quieter than a seam (0.055) and starts past the avatar, so the column of faces stays whole.
 pub fn hairline() -> Rgba {
     rgba(0xffffff12)
+}
+/// Between two rows of a list: 1 pt at 5.5%, inset to x = 76.
+pub fn rule() -> Rgba {
+    rgba(0xffffff0e)
 }
 pub fn hairline_strong() -> Rgba {
     rgba(0xffffff1f)
 }
 /// The 1 pt light along the top of a bar: chrome catches the room, it does not glow.
 pub fn highlight() -> Rgba {
-    rgba(0xffffff0d)
+    rgba(0xffffff0f)
 }
 
 // Text.
@@ -142,6 +156,17 @@ pub fn top_highlight() -> Vec<BoxShadow> {
     }]
 }
 
+/// A ring painted outside a shape: what separates a badge from the icon under it.
+pub fn ring(color: Rgba, width: f32) -> Vec<BoxShadow> {
+    vec![BoxShadow {
+        color: color.into(),
+        offset: point(px(0.), px(0.)),
+        blur_radius: px(0.),
+        spread_radius: px(width),
+        inset: false,
+    }]
+}
+
 /// The phone's type scale: 17/24 body, 15/20 interface, 13/18 previews, 12/16 timestamps,
 /// 11/14 tab labels. One point larger than the desktop at every step, because the eye is 30 cm
 /// from the glass, not 60. Tab labels stay at 11 when the text scale rises: the icons and the
@@ -187,8 +212,18 @@ mod tests {
     }
 
     #[test]
-    fn the_tab_cell_is_seven_icon_gap_indicator_gap_label_and_five() {
-        // 7 pad + 22 icon + 3 + 2 indicator + 3 + 14 label + 5 pad = 56, nothing touching the rule.
-        assert_eq!(7. + 22. + 3. + 2. + 3. + 14. + 5., TAB);
+    fn the_tab_cell_is_eight_icon_ten_indicator_and_label() {
+        // 8 pad + 22 icon + 10 (the indicator lives in it) + 14 label + 2 pad = 56, nothing
+        // touching the rule.
+        assert_eq!(8. + 22. + 10. + 14. + 2., TAB);
+    }
+
+    #[test]
+    fn the_surfaces_are_a_ladder_with_the_page_lowest() {
+        let lum = |c: Rgba| c.r + c.g + c.b;
+        assert!(lum(page()) < lum(surface()));
+        assert!(lum(surface()) < lum(raised()));
+        // 6% white for a press, 5.5% for a row's rule: the rule is the quieter of the two.
+        assert!(rule().a < pressed().a);
     }
 }

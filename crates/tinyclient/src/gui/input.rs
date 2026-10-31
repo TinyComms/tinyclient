@@ -1026,7 +1026,9 @@ struct Shaping {
 
 impl Shaping {
     /// Shapes each hard line by itself, so a run never has to be split across a line break.
-    fn lay_out(&self, input: &TextInput, wrap: Option<Pixels>, window: &mut Window) -> Laid {
+    /// `room` is the width the field was given: a placeholder is one line and ends in an
+    /// ellipsis when it does not fit, where the text itself wraps.
+    fn lay_out(&self, input: &TextInput, room: Option<Pixels>, window: &mut Window) -> Laid {
         let content = input.editor.text();
         let (text, placeholder): (SharedString, bool) = if content.is_empty() {
             // A placeholder never wraps or breaks.
@@ -1053,8 +1055,15 @@ impl Shaping {
         let mut rows = Vec::new();
         let mut line_start = 0;
         for line in text.split('\n') {
+            // A phone's placeholder is a single line and the field clips it: end it in an
+            // ellipsis rather than a letter cut in half at the edge. The desktop keeps the
+            // clip it has always had, so its fields do not change.
+            let line = match (placeholder && crate::gui::phone::active(), room) {
+                (true, Some(room)) => fitted(line, room, self, window),
+                _ => line.to_owned(),
+            };
             // Cut points where the color or the underline changes.
-            let dim = if placeholder || !input.editor.is_multiline() { Vec::new() } else { markup(line) };
+            let dim = if placeholder || !input.editor.is_multiline() { Vec::new() } else { markup(&line) };
             let marked = marked.as_ref().map(|marked| {
                 marked.start.saturating_sub(line_start).min(line.len())
                     ..marked.end.saturating_sub(line_start).min(line.len())
@@ -1083,10 +1092,10 @@ impl Shaping {
                     run(cut[1] - cut[0], color, underlined)
                 })
                 .collect();
-            let wrap = wrap.filter(|_| !placeholder);
+            let wrap = room.filter(|_| !placeholder && input.editor.is_multiline());
             let shaped = window
                 .text_system()
-                .shape_text(SharedString::new(line), self.font_size, &runs, wrap, None)
+                .shape_text(SharedString::new(line.clone()), self.font_size, &runs, wrap, None)
                 .ok()
                 .and_then(|mut shaped| shaped.pop())
                 .unwrap_or_default();
@@ -1114,6 +1123,47 @@ impl Shaping {
             line_start += line.len() + 1;
         }
         Laid { lines, rows, text }
+    }
+}
+
+/// The longest start of a placeholder that still leaves room for an ellipsis. One extra
+/// shaping pass, and only when the placeholder overflows the field.
+fn fitted(line: &str, room: Pixels, shaping: &Shaping, window: &mut Window) -> String {
+    let measure = |text: &str| -> Option<std::sync::Arc<gpui::LineLayout>> {
+        let runs = [TextRun {
+            len: text.len(),
+            font: shaping.font.clone(),
+            color: shaping.color,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        }];
+        window
+            .text_system()
+            .shape_text(SharedString::from(text.to_owned()), shaping.font_size, &runs, None, None)
+            .ok()
+            .and_then(|mut shaped| shaped.pop())
+            .map(|shaped| shaped.unwrapped_layout.clone())
+    };
+    let Some(full) = measure(line) else {
+        return line.to_owned();
+    };
+    if full.width <= room {
+        return line.to_owned();
+    }
+    let dot = measure("…").map_or(px(0.), |layout| layout.width);
+    let mut cut = 0;
+    for run in &full.runs {
+        for glyph in &run.glyphs {
+            if glyph.position.x + dot > room {
+                break;
+            }
+            cut = glyph.index;
+        }
+    }
+    match line.get(..cut).map(str::trim_end) {
+        Some(head) if !head.is_empty() => format!("{head}…"),
+        _ => "…".to_owned(),
     }
 }
 
@@ -1199,7 +1249,7 @@ impl Element for TextElement {
         let line_height = window.line_height();
         let input = self.input.read(cx);
         let multiline = input.editor.is_multiline();
-        let laid = Rc::new(shaping.lay_out(input, multiline.then_some(bounds.size.width), window));
+        let laid = Rc::new(shaping.lay_out(input, Some(bounds.size.width), window));
         let empty = input.editor.text().is_empty();
         let selection = if empty { 0..0 } else { input.editor.selection() };
         let caret = if empty { 0 } else { input.editor.cursor() };

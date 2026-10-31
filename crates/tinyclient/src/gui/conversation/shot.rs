@@ -5,6 +5,7 @@
 //!   or `network/account/id` one of any account.
 //! - `TINYCLIENT_SHOT_AT=<message id>`: jump to it, as a reply quote would.
 //! - `TINYCLIENT_SHOT_UP=<points>`: scroll up this far from the bottom.
+//! - `TINYCLIENT_SHOT_BOTTOM=1`: after the open lands, scroll to the newest message.
 //! - `TINYCLIENT_SHOT_THREAD=<message id>`: open the thread under it.
 //! - `TINYCLIENT_SHOT_VIEW=<message id>`: open the viewer on its first picture.
 //! - `TINYCLIENT_SHOT_ZOOM=<percent>`: with `VIEW`, zoom the viewer to it (`100`, `250`).
@@ -47,6 +48,10 @@ pub struct Script {
     staged: bool,
     stats: bool,
     page_back: Option<usize>,
+    /// The open was asked to end at the newest message.
+    bottom: bool,
+    /// ... and has.
+    bottomed: bool,
     opened: bool,
     drawn: bool,
     /// Messages asked for so far while paging back.
@@ -90,6 +95,8 @@ impl Script {
             staged: false,
             stats: var("TINYCLIENT_SHOT_STATS").is_some(),
             page_back: var("TINYCLIENT_SHOT_PAGE_BACK").and_then(|messages| messages.parse().ok()),
+            bottom: var("TINYCLIENT_SHOT_BOTTOM").is_some(),
+            bottomed: false,
             opened: false,
             drawn: false,
             paged: 0,
@@ -206,6 +213,11 @@ pub fn opened(pane: &mut Pane, cx: &mut Context<Pane>) {
 pub fn drawn(pane: &mut Pane, window: &mut Window, cx: &mut Context<Pane>) {
     if pane.is_thread() || !pane.script.opened {
         return;
+    }
+    // The newest message, for a picture of the end of a conversation that opened on unread.
+    if pane.script.bottom && pane.script.opened && !pane.script.bottomed {
+        pane.script.bottomed = true;
+        pane.go_to_bottom(cx);
     }
     // A step at a time: the list only knows the heights of rows it has drawn.
     if let Some(left) = pane.script.up.filter(|left| *left > 0.) {
