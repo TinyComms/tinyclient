@@ -5,6 +5,7 @@
 //! The icon is sent the moment a picture is chosen (or removed), as Discord does; the rest waits
 //! for Save.
 
+use super::kit::switch_row;
 use super::{page_head, section, Overlay};
 use crate::gui::components::{button, button_disabled, button_with_icon, field, glyph, menu, menu_item_check, segment, segmented, Avatar, ButtonKind, Shape};
 use crate::gui::input::TextInput;
@@ -34,6 +35,8 @@ pub(in crate::gui) struct Draft {
     pub picking: Option<Pick>,
     pub uploading: bool,
     pub icon_error: Option<String>,
+    /// `None` is the server's flag. Set when the archives switch is moved.
+    pub allow_archives: Option<bool>,
 }
 
 fn server_of(facts: &Facts) -> TinyServerInfo {
@@ -41,7 +44,7 @@ fn server_of(facts: &Facts) -> TinyServerInfo {
 }
 
 /// The edit Save sends: only what differs from the server.
-pub(in crate::gui) fn edit(server: &TinyServerInfo, draft: &Draft, name: &str, description: &str, welcome: &str, limits: bool, image: &str, file: &str) -> TinyServerEdit {
+pub(in crate::gui) fn edit(server: &TinyServerInfo, draft: &Draft, name: &str, description: &str, welcome: &str, limits: bool, image: &str, file: &str, scans: bool) -> TinyServerEdit {
     let changed = |now: &str, typed: &str| (now != typed).then(|| typed.to_owned());
     let cap = |now: i64, typed: &str| {
         if !limits {
@@ -60,6 +63,7 @@ pub(in crate::gui) fn edit(server: &TinyServerInfo, draft: &Draft, name: &str, d
         afk_timeout_secs: draft.afk_timeout.filter(|secs| *secs != server.afk_timeout_secs),
         image_max_bytes: cap(server.image_max_bytes, image),
         file_max_bytes: cap(server.file_max_bytes, file),
+        allow_archives: scans.then(|| draft.allow_archives).flatten().filter(|on| *on != server.allow_archives),
     }
 }
 
@@ -110,7 +114,8 @@ impl Shell {
         let fields = &self.tiny_state.settings_fields;
         let text = |input: &Entity<TextInput>| input.read(cx).text().to_owned();
         let limits = facts.community.has(protocol::TINY_FEATURE_UPLOAD_LIMITS);
-        Some(edit(&server_of(&facts), &overlay.overview, &text(&fields.name), &text(&fields.description), &text(&fields.welcome), limits, &text(&fields.image_max), &text(&fields.file_max)))
+        let scans = facts.community.has(protocol::TINY_FEATURE_FILE_SCAN);
+        Some(edit(&server_of(&facts), &overlay.overview, &text(&fields.name), &text(&fields.description), &text(&fields.welcome), limits, &text(&fields.image_max), &text(&fields.file_max), scans))
     }
 
     pub(in crate::gui) fn tiny_overview_dirty(&self, cx: &App) -> bool {
@@ -371,14 +376,29 @@ pub(in crate::gui::tiny) fn overview(shell: &Shell, facts: &Facts, window: &mut 
     } else {
         section("Welcome message").child(read_only(&server.welcome))
     });
-    if facts.community.has(protocol::TINY_FEATURE_UPLOAD_LIMITS) {
-        page = page.child(if editable {
-            section("Uploads")
+    let limits = facts.community.has(protocol::TINY_FEATURE_UPLOAD_LIMITS);
+    let scans = facts.community.has(protocol::TINY_FEATURE_FILE_SCAN);
+    if limits || scans {
+        let mut uploads = section("Uploads");
+        if scans {
+            uploads = uploads.child(div().type_small().text_color(theme::text_soft()).child("Each file is scanned before anyone else can open it."));
+        }
+        if limits && editable {
+            uploads = uploads
                 .child(div().type_small().text_color(theme::text_soft()).child("Images and GIFs, then video and other files. Each is 1 to 100 MiB."))
-                .child(div().flex().gap(px(16.)).child(limit_field("Images and GIFs", &fields.image_max, window, cx)).child(limit_field("Video and other files", &fields.file_max, window, cx)))
-        } else {
-            section("Uploads").child(read_only(&format!("Images and GIFs up to {}. Video and other files up to {}.", size_words(server.image_max_bytes), size_words(server.file_max_bytes))))
-        });
+                .child(div().flex().gap(px(16.)).child(limit_field("Images and GIFs", &fields.image_max, window, cx)).child(limit_field("Video and other files", &fields.file_max, window, cx)));
+        } else if limits {
+            uploads = uploads.child(read_only(&format!("Images and GIFs up to {}. Video and other files up to {}.", size_words(server.image_max_bytes), size_words(server.file_max_bytes))));
+        }
+        if scans && editable {
+            let on = draft.allow_archives.unwrap_or(server.allow_archives);
+            uploads = uploads.child(
+                switch_row("tiny-allow-archives", "Allow archives", "Zip, 7z, rar, tar and gzip can be sent. Off, they are refused.", on, true).on_click(cx.listener(move |this, _, _, cx| {
+                    this.tiny_overview_draft(cx, move |overlay| overlay.overview.allow_archives = Some(!on));
+                })),
+            );
+        }
+        page = page.child(uploads);
     }
 
     let default_room = draft.default_room.clone().unwrap_or(server.default_room_id.clone());
@@ -422,9 +442,9 @@ mod tests {
     fn save_sends_only_what_changed() {
         let server = TinyServerInfo { name: "Night Shift".into(), description: "Hi".into(), afk_timeout_secs: 300, default_room_id: Some("a".into()), ..TinyServerInfo::default() };
         let draft = Draft::default();
-        assert!(empty(&edit(&server, &draft, "Night Shift ", "Hi", "", false, "", "")));
+        assert!(empty(&edit(&server, &draft, "Night Shift ", "Hi", "", false, "", "", false)));
         let draft = Draft { default_room: Some(None), afk_timeout: Some(300), afk_room: Some(Some("b".into())), ..Draft::default() };
-        let sent = edit(&server, &draft, "Day Shift", "Hi", "Welcome", false, "", "");
+        let sent = edit(&server, &draft, "Day Shift", "Hi", "Welcome", false, "", "", false);
         assert_eq!(sent.name.as_deref(), Some("Day Shift"));
         assert_eq!(sent.description, None);
         assert_eq!(sent.welcome.as_deref(), Some("Welcome"));
@@ -433,12 +453,16 @@ mod tests {
         assert_eq!(sent.afk_timeout_secs, None, "unchanged");
         assert_eq!(sent.image_max_bytes, None);
         assert_eq!(sent.file_max_bytes, None);
-        let raised = edit(&server, &Draft::default(), "Night Shift", "Hi", "", true, "12", "25");
+        let raised = edit(&server, &Draft::default(), "Night Shift", "Hi", "", true, "12", "25", false);
         assert_eq!(raised.image_max_bytes, Some(12 * 1024 * 1024));
         assert_eq!(raised.file_max_bytes, None, "25 MiB is already the file cap");
         let odd = TinyServerInfo { image_max_bytes: 1_500, ..server.clone() };
-        let kept = edit(&odd, &Draft::default(), "Night Shift", "Hi", "", true, "1500", "25");
+        let kept = edit(&odd, &Draft::default(), "Night Shift", "Hi", "", true, "1500", "25", false);
         assert_eq!(kept.image_max_bytes, None, "the current byte count is left as it is");
-        assert!(empty(&edit(&server, &Draft::default(), "Night Shift", "Hi", "", true, "0", "101")));
+        assert!(empty(&edit(&server, &Draft::default(), "Night Shift", "Hi", "", true, "0", "101", false)));
+        let archives = Draft { allow_archives: Some(true), ..Draft::default() };
+        assert_eq!(edit(&server, &archives, "Night Shift", "Hi", "", false, "", "", true).allow_archives, Some(true));
+        assert_eq!(edit(&server, &archives, "Night Shift", "Hi", "", false, "", "", false).allow_archives, None, "an older server does not send the toggle");
+        assert_eq!(edit(&server, &Draft::default(), "Night Shift", "Hi", "", false, "", "", true).allow_archives, None);
     }
 }

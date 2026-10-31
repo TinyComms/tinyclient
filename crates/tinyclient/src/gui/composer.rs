@@ -106,6 +106,9 @@ pub struct State {
     outbox: Vec<(Key, String, Vec<PathBuf>)>,
     /// How far each pending message's files have gone, in bytes: (sent, total).
     uploads: VecDeque<((Key, String), (u64, u64))>,
+    /// A Tiny file send that finished before the composer heard it was stored. The chip hold
+    /// reads this once, then it goes.
+    tiny_files: Vec<(String, Result<(), String>)>,
 }
 
 /// A message sent while its account was offline, for the conversation to draw as a row.
@@ -383,6 +386,8 @@ pub struct Composer {
     counts: HashMap<Key, (Option<u32>, Option<u32>)>,
     send_menu: bool,
     anchors: Rc<Anchors>,
+    /// A Tiny file send whose chips stay until the upload and the message have both settled.
+    held_files: Option<Outgoing>,
 }
 
 impl Composer {
@@ -460,6 +465,7 @@ impl Composer {
             counts: HashMap::new(),
             send_menu: false,
             anchors: Rc::new(Anchors::default()),
+            held_files: None,
         }
     }
 
@@ -677,7 +683,7 @@ impl Composer {
         let Some(target) = self.target.clone() else {
             return;
         };
-        if self.sending || target.locked().is_some() {
+        if self.sending || self.held_files.is_some() || target.locked().is_some() {
             return;
         }
         if self.editing.is_some() {
@@ -835,6 +841,7 @@ impl Composer {
 
     fn sent(&mut self, out: Outgoing, files: bool, answer: std::io::Result<Response>, cx: &mut Context<Self>) {
         self.sending = false;
+        let hold = files && self.target.as_ref().is_some_and(|target| crate::tiny_attach::hold_chips(target.key.network, true, &target.can));
         let refused = match answer {
             Ok(Response::Sent { .. }) => {
                 let (key, client_id, made) = (out.key.clone(), out.client_id.clone(), out.made.clone());
@@ -870,7 +877,60 @@ impl Composer {
         };
         match refused {
             Some(words) => self.caption = Some((words, Tone::Refused)),
+            None if hold => self.hold_tiny_files(out, cx),
             None => self.went(&out, cx),
+        }
+        cx.notify();
+    }
+
+    /// The pending row is stored, and the file is still with the server. The chips stay, named
+    /// once the verdict arrives. A verdict that arrived first is applied now.
+    fn hold_tiny_files(&mut self, out: Outgoing, cx: &mut Context<Self>) {
+        self.caption = Some((crate::tiny_attach::scanning_words(out.chips.len()), Tone::Note));
+        let settled = self.shell.update(cx, |shell, _| shell.take_tiny_file(&out.client_id)).ok().flatten();
+        match settled {
+            Some(Ok(())) => self.went(&out, cx),
+            Some(Err(reason)) => self.refuse_tiny_files(&out, &reason, cx),
+            None => self.held_files = Some(out),
+        }
+    }
+
+    /// The upload settled. True when this composer was holding that send.
+    fn tiny_file_settled(&mut self, client_id: &str, outcome: Result<(), String>, cx: &mut Context<Self>) -> bool {
+        let Some(out) = self.held_files.take() else {
+            return false;
+        };
+        if out.client_id != client_id {
+            self.held_files = Some(out);
+            return false;
+        }
+        match outcome {
+            Ok(()) => self.went(&out, cx),
+            Err(reason) => self.refuse_tiny_files(&out, &reason, cx),
+        }
+        true
+    }
+
+    /// A blocked file stays in the tray, with the server's reason on the chip.
+    fn refuse_tiny_files(&mut self, out: &Outgoing, reason: &str, cx: &mut Context<Self>) {
+        let Some(words) = crate::tiny_attach::blocked_reason(reason) else {
+            self.caption = Some((format!("Not sent. {reason}"), Tone::Refused));
+            cx.notify();
+            return;
+        };
+        let mark = |chips: &mut [Staged]| {
+            for chip in chips.iter_mut() {
+                if out.chips.contains(&chip.id) {
+                    chip.refused = Some(words.clone());
+                }
+            }
+        };
+        let here = self.target.as_ref().is_some_and(|now| now.key == out.key);
+        if here {
+            mark(&mut self.tray);
+            self.caption = Some((format!("Not sent. {words}"), Tone::Refused));
+        } else if let Some(draft) = self.drafts.get_mut(&out.key) {
+            mark(&mut draft.files);
         }
         cx.notify();
     }
@@ -1745,7 +1805,7 @@ impl Composer {
 
     fn card(&mut self, focused: bool, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let controls = self.controls();
-        let ready = !self.sending && (!self.input.read(cx).text().trim().is_empty() || !self.tray.is_empty());
+        let ready = !self.sending && self.held_files.is_none() && (!self.input.read(cx).text().trim().is_empty() || !self.tray.is_empty());
         let focus = self.input.focus_handle(cx);
         let open_tab = self.picking.as_ref().map(|picking| picking.picker.read(cx).tab());
         let send_icon = if self.editing.is_some() { "icons/check.svg" } else { "icons/send-horizontal.svg" };
@@ -2577,6 +2637,30 @@ impl Shell {
 
     // What became of a send.
 
+    /// A Tiny file send reached a verdict. The composer that is holding it applies that; otherwise
+    /// the verdict waits for the pending-row answer, which can arrive after the upload.
+    fn finish_tiny_file(&mut self, client_id: String, outcome: Result<(), String>, cx: &mut Context<Self>) {
+        let composers: Vec<_> = [self.composer_state.main.get().cloned(), self.composer_state.thread.get().cloned()].into_iter().flatten().collect();
+        let mut consumed = false;
+        for composer in composers {
+            let (id, outcome) = (client_id.clone(), outcome.clone());
+            consumed |= composer.update(cx, |composer, cx| composer.tiny_file_settled(&id, outcome, cx));
+        }
+        if consumed {
+            return;
+        }
+        self.composer_state.tiny_files.retain(|(id, _)| id != &client_id);
+        self.composer_state.tiny_files.push((client_id, outcome));
+        if self.composer_state.tiny_files.len() > 32 {
+            let _ = self.composer_state.tiny_files.remove(0).1.ok();
+        }
+    }
+
+    fn take_tiny_file(&mut self, client_id: &str) -> Option<Result<(), String>> {
+        let at = self.composer_state.tiny_files.iter().position(|(id, _)| id == client_id)?;
+        Some(self.composer_state.tiny_files.remove(at).1)
+    }
+
     /// chatd has stored the message as pending; it says so itself in a `Messages` change, which
     /// is what brings the row. From here its outcome is followed for the sidebar's mark.
     fn send_started(&mut self, conversation: &Key, client_id: &str, cx: &mut Context<Self>) {
@@ -2631,33 +2715,52 @@ impl Shell {
             let Ok(Response::Messages { messages, .. }) = answer else {
                 return;
             };
-            let outcome_of = |client_id: &str| {
+            let detail_of = |client_id: &str| {
                 let found = messages.iter().find(|message| message.client_id.as_deref() == Some(client_id) || message.id == client_id);
                 match found.map(|message| &message.state) {
-                    None => Outcome::Gone,
-                    Some(SendState::Pending) => Outcome::Pending,
-                    Some(SendState::Sent) => Outcome::Sent,
-                    Some(SendState::Failed { .. }) => Outcome::Failed,
+                    None => (Outcome::Gone, None),
+                    Some(SendState::Pending) => (Outcome::Pending, None),
+                    Some(SendState::Sent) => (Outcome::Sent, None),
+                    Some(SendState::Failed { reason }) => (Outcome::Failed, Some(reason.clone())),
                 }
             };
+            let outcome_of = |client_id: &str| detail_of(client_id).0;
             let _ = shell.update(cx, |shell, cx| {
                 // A send that went no longer needs the files made for it, nor its progress.
-                let state = &mut shell.composer_state;
-                let settled: Vec<String> = state
-                    .outbox
-                    .iter()
-                    .filter(|(held, id, _)| *held == key && matches!(outcome_of(id), Outcome::Sent | Outcome::Gone))
-                    .map(|(_, id, _)| id.clone())
-                    .collect();
-                for id in &settled {
-                    if let Some(at) = state.outbox.iter().position(|(held, held_id, _)| *held == key && held_id == id) {
-                        let (_, _, made) = state.outbox.remove(at);
-                        delete_later(made);
+                let inflight = shell.composer_state.flight.sending_ids(&key);
+                let changed = {
+                    let state = &mut shell.composer_state;
+                    let settled: Vec<String> = state
+                        .outbox
+                        .iter()
+                        .filter(|(held, id, _)| *held == key && matches!(outcome_of(id), Outcome::Sent | Outcome::Gone))
+                        .map(|(_, id, _)| id.clone())
+                        .collect();
+                    for id in &settled {
+                        if let Some(at) = state.outbox.iter().position(|(held, held_id, _)| *held == key && held_id == id) {
+                            let (_, _, made) = state.outbox.remove(at);
+                            delete_later(made);
+                        }
                     }
-                }
-                state.uploads.retain(|((held, id), _)| *held != key || outcome_of(id) == Outcome::Pending);
-                if state.flight.settle(&key, outcome_of) || !settled.is_empty() {
+                    state.uploads.retain(|((held, id), _)| *held != key || outcome_of(id) == Outcome::Pending);
+                    state.flight.settle(&key, outcome_of) || !settled.is_empty()
+                };
+                if changed {
                     cx.notify();
+                }
+                if key.network != Network::Tiny {
+                    return;
+                }
+                let finished: Vec<(String, Result<(), String>)> = inflight
+                    .into_iter()
+                    .filter_map(|id| match detail_of(&id) {
+                        (Outcome::Sent | Outcome::Gone, _) => Some((id, Ok(()))),
+                        (Outcome::Failed, reason) => Some((id, Err(reason.unwrap_or_else(|| "That file could not be sent.".to_owned())))),
+                        (Outcome::Pending, _) => None,
+                    })
+                    .collect();
+                for (id, outcome) in finished {
+                    shell.finish_tiny_file(id, outcome, cx);
                 }
             });
         });

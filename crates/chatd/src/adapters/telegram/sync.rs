@@ -180,6 +180,8 @@ fn capabilities(premium: bool) -> Capabilities {
         reply_ping: false,
         // Telegram lets a message be edited for 48 hours (unverified for every chat kind).
         edit_window: 48 * 3_600,
+        file_scan: false,
+        allow_archives: false,
     }
 }
 

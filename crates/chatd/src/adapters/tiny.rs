@@ -522,10 +522,22 @@ fn refused(detail: &str) -> Response {
     error(ErrorCode::Refused, detail)
 }
 
+/// A file upload's refusal. Picture uploads keep [`explain`]'s picture sentences.
+fn explain_media(status: u16, body: &Value) -> &'static str {
+    let code = body.get("error").and_then(Value::as_str).unwrap_or("");
+    match (status, code) {
+        (413, "too_large") => "That file is too big for this server.",
+        (415, "unsupported_media") => "That file isn't a kind this server takes.",
+        _ => explain(status, body, Missing::Plain),
+    }
+}
+
 fn explain(status: u16, body: &Value, missing: Missing) -> &'static str {
     let code = body.get("error").and_then(Value::as_str).unwrap_or("");
     match (status, code) {
         (401, _) => SIGNED_OUT,
+        (403, "blocked") => "Tiny blocked that file",
+        (503, "unavailable") => "Tiny couldn't scan that file",
         (_, "hierarchy") => HIERARCHY,
         (_, "default_role") => "@everyone can't be deleted or moved.",
         (_, "room_full") => "That room is full.",
@@ -1057,6 +1069,17 @@ pub(crate) mod tests {
 
     fn session() -> &'static str {
         r#"{"base_url":"http://127.0.0.1:8080","token":"t","user_id":"11111111-1111-1111-1111-111111111111","email":"ada@example.com","display_name":"Ada","role":"owner"}"#
+    }
+
+    #[test]
+    fn a_blocked_upload_and_a_missed_scan_are_said_in_words() {
+        let body = |code: &str| serde_json::json!({ "error": code });
+        assert_eq!(explain(403, &body("blocked"), Missing::Plain), "Tiny blocked that file");
+        assert_eq!(explain(503, &body("unavailable"), Missing::Plain), "Tiny couldn't scan that file");
+        assert_eq!(explain_media(413, &body("too_large")), "That file is too big for this server.");
+        assert_eq!(explain_media(415, &body("unsupported_media")), "That file isn't a kind this server takes.");
+        assert_eq!(explain(413, &body("too_large"), Missing::Plain), "That picture is too big. The most is 256 KB.");
+        assert_eq!(explain(415, &body("unsupported_media"), Missing::Plain), "That picture isn't a PNG, JPEG or WebP.");
     }
 
     #[test]
