@@ -14,15 +14,18 @@ use crate::gui::components::{glyph, network_icon, tip, Avatar};
 use crate::gui::state::{Shell, Snapshot};
 use crate::gui::theme;
 use gpui::{
-    deferred, div, prelude::*, px, AnyElement, Context, Div, FontWeight, Rgba, Stateful,
+    deferred, div, prelude::*, px, relative, AnyElement, Context, Div, FontWeight, Rgba, Stateful,
 };
 use protocol::{Call, CallFailure, CallState, Content, ConversationKind, Direction, Key, MediaRequest, Network, Request};
 
-/// The bar: two rows and the padding around them.
-const CARD: f32 = 96.;
-/// The compact bar over a Tiny server's user panel: two lines of words.
-const COMPACT: f32 = 54.;
 const SETTINGS: &str = "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone";
+/// Dock insets (8 + 8) plus the card's own padding (9 + 9). The name line is this much
+/// narrower than the sidebar, and nothing else sits on it.
+const CARD_INSET: f32 = 34.;
+/// One control, the gap before the next, and Leave. Video adds share and camera.
+const CONTROL: f32 = 40.;
+const CONTROL_GAP: f32 = 4.;
+const LEAVE: f32 = 48.;
 
 fn card() -> Div {
     div()
@@ -38,6 +41,16 @@ fn card() -> Div {
         .flex()
         .flex_col()
         .gap(px(8.))
+}
+
+/// Width left for words inside the call card at a sidebar width.
+fn card_inner(sidebar: f32) -> f32 {
+    sidebar - CARD_INSET
+}
+
+/// The control row with `icons` square buttons plus Leave, including the gaps.
+fn controls_row(icons: u32) -> f32 {
+    icons as f32 * CONTROL + LEAVE + icons as f32 * CONTROL_GAP
 }
 
 /// How a 40 x 32 control looks.
@@ -140,13 +153,13 @@ fn worded(id: &'static str, icon: Option<&'static str>, word: &'static str, fill
         .child(word)
 }
 
-/// A button of the failure card: equal widths, 28 high.
+/// A button of the failure card. As wide as its words, so a narrow sidebar wraps the row
+/// instead of squeezing "Open System Settings" down to nothing.
 fn plain(id: &'static str) -> Stateful<Div> {
     div()
         .id(id)
-        .flex_1()
-        .min_w_0()
-        .h(px(28.))
+        .flex_none()
+        .min_h(px(28.))
         .px(px(8.))
         .rounded(px(8.))
         .tab_index(0)
@@ -189,7 +202,7 @@ fn outlined(id: &'static str, network: Network) -> Stateful<Div> {
         .cursor_pointer()
         .hover(|style| style.bg(theme::hover()).text_color(theme::text()))
         .child(network_icon(network, 14.))
-        .child(div().min_w_0().truncate().child(handoff_label(network)))
+        .child(handoff_label(network))
         .child(glyph_in("icons/arrow-up-right.svg", 12., theme::text_faint(), None))
 }
 
@@ -364,8 +377,9 @@ fn question(confirm: &Confirm, here: &str) -> Question {
 }
 
 impl Shell {
-    /// The dock, for the end of the sidebar column as a flex-none child: full width, 112 high
-    /// while a call is up (a failure is as tall as its words). `None` when there is no call.
+    /// The dock, for the end of the sidebar column as a flex-none child: full width, as tall as
+    /// its rows. The narrowest sidebar still shows the server name on its own line. `None` when
+    /// there is no call.
     pub(in crate::gui) fn call_dock(&self, snapshot: &Snapshot, cx: &mut Context<Self>) -> Option<Div> {
         ensure_keys(cx);
         ensure_daemon();
@@ -437,8 +451,7 @@ impl Shell {
             .on_click(cx.listener(|this, _, _, cx| this.call_leave(cx)))
             .child("Dismiss");
         let title = div()
-            .h(px(36.))
-            .flex_none()
+            .w_full()
             .flex()
             .items_center()
             .gap(px(10.))
@@ -452,7 +465,7 @@ impl Shell {
                     .gap(px(1.))
                     .child(
                         div()
-                            .truncate()
+                            .line_clamp(2)
                             .text_size(px(13.))
                             .line_height(px(18.))
                             .font_weight(FontWeight::SEMIBOLD)
@@ -462,19 +475,17 @@ impl Shell {
                     .child(
                         div()
                             .flex()
+                            .flex_wrap()
                             .items_center()
                             .gap(px(4.))
                             .text_size(px(11.5))
                             .line_height(px(15.))
                             .text_color(theme::text_soft())
                             .child(network_icon(network, 11.))
-                            .child(format!("Call ended · {}", clock(ended.seconds))),
+                            .child(div().line_clamp(2).child(format!("Call ended · {}", clock(ended.seconds)))),
                     ),
             );
-        card()
-            .h(px(CARD))
-            .child(title)
-            .child(div().h(px(32.)).flex_none().flex().items_center().child(div().flex_1()).child(dismiss))
+        card().child(title).child(div().min_h(px(32.)).flex().flex_wrap().items_center().child(dismiss.ml_auto()))
     }
 
     /// "Leave Lounge and call Mara Okafor?": asked in the card, where the call is, before a
@@ -484,9 +495,10 @@ impl Shell {
             div()
                 .id(id)
                 .flex_1()
-                .min_w_0()
-                .h(px(32.))
+                .min_w(px(120.))
+                .min_h(px(32.))
                 .px(px(8.))
+                .py(px(6.))
                 .rounded(px(8.))
                 .flex()
                 .items_center()
@@ -494,7 +506,7 @@ impl Shell {
                 .text_size(px(12.5))
                 .font_weight(FontWeight::MEDIUM)
                 .cursor_pointer()
-                .child(div().min_w_0().truncate().child(word))
+                .child(div().line_clamp(2).child(word))
         };
         let stay = button("call-stay", question.stay.clone())
             .bg(theme::hover())
@@ -513,6 +525,7 @@ impl Shell {
                     .gap(px(2.))
                     .child(
                         div()
+                            .line_clamp(3)
                             .text_size(px(13.))
                             .line_height(px(18.))
                             .font_weight(FontWeight::SEMIBOLD)
@@ -527,7 +540,7 @@ impl Shell {
                             .child("You can be in one call at a time."),
                     ),
             )
-            .child(div().flex().gap(px(4.)).child(stay).child(go))
+            .child(div().flex().flex_wrap().gap(px(4.)).child(stay).child(go))
     }
 
     /// Someone is calling while a call is up: a 40 px strip on top of the bar, with who and
@@ -551,14 +564,16 @@ impl Shell {
         };
         let accept = ring.clone();
         div()
-            .h(px(40.))
+            .min_h(px(40.))
             .flex_none()
             // Out to the card's edges, over its padding.
             .mt(px(-9.))
             .mx(px(-9.))
             .pl(px(10.))
             .pr(px(8.))
+            .py(px(6.))
             .flex()
+            .flex_wrap()
             .items_center()
             .gap(px(8.))
             .border_b_1()
@@ -569,11 +584,20 @@ impl Shell {
             .child(
                 div()
                     .flex_1()
-                    .min_w_0()
+                    .min_w(px(120.))
                     .flex()
+                    .flex_wrap()
+                    .items_center()
                     .gap(px(4.))
-                    .child(div().flex_none().font_weight(FontWeight::SEMIBOLD).text_color(theme::text()).child(from.to_owned()))
-                    .child(div().min_w_0().truncate().child(if from == ring.title {
+                    .child(
+                        div()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::text())
+                            .whitespace_normal()
+                            .line_clamp(2)
+                            .child(from.to_owned()),
+                    )
+                    .child(div().whitespace_normal().line_clamp(2).child(if from == ring.title {
                         "is calling".to_owned()
                     } else {
                         format!("is calling · {}", ring.title)
@@ -694,7 +718,8 @@ impl Shell {
             )
             .child(
                 div()
-                    .truncate()
+                    .whitespace_normal()
+                    .line_clamp(4)
                     .text_size(px(11.5))
                     .line_height(px(15.))
                     .text_color(if notice.is_some() { theme::warning() } else { theme::text_soft() })
@@ -703,19 +728,24 @@ impl Shell {
         let disconnect = leave()
             .w(px(36.))
             .on_click(cx.listener(|this, _, _, cx| this.call_leave(cx)));
-        card()
-            .h(px(COMPACT))
-            .flex_row()
-            .items_center()
-            .gap(px(8.))
-            .children(self.call_signal(call, cx))
-            .child(words)
-            .children(self.call_security(call, Place::TinyBar, cx))
-            .child(disconnect)
+        // The name takes the card's width. Signal, lock and Leave sit on the row above it,
+        // and wrap under it when the column is the narrowest sidebar.
+        card().child(
+            div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap(px(8.))
+                .children(self.call_signal(call, cx))
+                .children(self.call_security(call, Place::TinyBar, cx))
+                .child(disconnect.ml_auto()),
+        )
+        .child(words)
     }
 
-    /// Row 1, 36 px: who or where, the state in words, and who else is there. A click on it
-    /// opens the call's conversation.
+    /// Who or where, then the server or notice on its own line, then signal, lock and who else
+    /// is there. Those icons used to share the name's row, which is what cut a server down to
+    /// "Tiny C…" at the narrowest sidebar. A click opens the call's conversation.
     fn call_title(&self, call: &Call, subject: &Subject, words: String, cx: &mut Context<Self>) -> Stateful<Div> {
         let network = call.conversation.network;
         let direct = subject.kind == ConversationKind::Direct;
@@ -751,15 +781,26 @@ impl Shell {
         let words = if talking { format!("You're muted. Press {} to talk", crate::gui::shortcuts::label("⌘⇧M")) } else { words };
         let counter = if refused.is_some() || notice.is_some() { None } else { self.call_counter(call, cx) };
         let refused = refused.or(notice);
-        let sub = div()
+        // The server name, or the notice that replaces it, gets the whole card. The clock and
+        // "Switch device" sit beside it and wrap under it rather than stealing the line.
+        let place = div()
+            .w_full()
             .flex()
+            .flex_wrap()
             .items_center()
             .gap(px(4.))
             .text_size(px(11.5))
             .line_height(px(15.))
             .text_color(color)
-            .child(network_icon(network, 11.))
-            .child(div().min_w_0().truncate().child(refused.unwrap_or(words)))
+            .child(div().flex_none().child(network_icon(network, 11.)))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(96.))
+                    .whitespace_normal()
+                    .line_clamp(4)
+                    .child(refused.unwrap_or(words)),
+            )
             .children(counter)
             .children(self.call_switch_device(call, live, cx));
         let right: Option<AnyElement> = match (live, direct) {
@@ -785,40 +826,54 @@ impl Shell {
         let title = subject.title.clone();
         let signal = self.call_signal(call, cx);
         let security = self.call_security(call, Place::Dock, cx);
+        let show_status = signal.is_some() || security.is_some() || right.is_some();
         div()
             .id("call-title")
-            .h(px(36.))
+            .w_full()
             .flex_none()
             .flex()
-            .items_center()
-            .gap(px(10.))
+            .flex_col()
+            .gap(px(4.))
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| this.call_go(key.clone(), &title, cx)))
-            .child(lead)
             .child(
                 div()
-                    .flex_1()
-                    .min_w_0()
+                    .w_full()
                     .flex()
-                    .flex_col()
-                    .gap(px(1.))
+                    .items_center()
+                    .gap(px(10.))
+                    .child(lead)
                     .child(
                         div()
-                            .truncate()
+                            .flex_1()
+                            .min_w_0()
+                            .whitespace_normal()
+                            .line_clamp(2)
                             .text_size(px(13.))
                             .line_height(px(18.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(theme::text())
                             .child(subject.title.clone()),
-                    )
-                    .child(sub),
+                    ),
             )
-            .children(signal)
-            .children(security)
-            .children(right)
+            .child(place)
+            .when(show_status, |column| {
+                column.child(
+                    div()
+                        .w_full()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap(px(2.))
+                        .children(signal)
+                        .children(security)
+                        .children(right),
+                )
+            })
     }
 
-    /// Ringing out, connecting, joined and reconnecting: the 96 px bar.
+    /// Ringing out, connecting, joined and reconnecting. As tall as the name, the server line
+    /// and the controls, which wrap when the sidebar is at its narrowest.
     fn call_bar(&self, call: &Call, subject: &Subject, cx: &mut Context<Self>) -> Div {
         let place = subject.space.as_deref().unwrap_or(call.conversation.network.label());
         let alone = self.call_left_alone(call);
@@ -906,10 +961,14 @@ impl Shell {
                 .hover(|style| style.bg(theme::danger_fill()).text_color(theme::on_accent()))
                 .tooltip(tip("Cancel", Some("⌘⇧H")))
         };
+        // Leave stays at the right of whatever row it lands on. Video adds share and camera,
+        // which do not fit the narrowest sidebar, so that row wraps instead of overflowing.
         let controls = div()
-            .h(px(32.))
+            .w_full()
+            .min_h(px(32.))
             .flex_none()
             .flex()
+            .flex_wrap()
             .items_center()
             .gap(px(4.))
             .child(mute)
@@ -918,8 +977,7 @@ impl Shell {
             .children(share)
             .children(camera)
             .child(devices)
-            .child(div().flex_1())
-            .child(end.on_click(cx.listener(|this, _, _, cx| this.call_leave(cx))));
+            .child(end.ml_auto().on_click(cx.listener(|this, _, _, cx| this.call_leave(cx))));
 
         let popover = match menu {
             Some(Menu::Devices) => Some((300., self.call_devices_menu(call, cx).p(px(6.)))),
@@ -931,20 +989,20 @@ impl Shell {
         let strip = super::shot::strip();
         #[cfg(not(feature = "gui-shot"))]
         let strip: Option<(Confirm, String)> = None;
-        let lifted = if strip.is_some() { 40. } else { 0. };
         card()
-            .h(px(CARD + lifted))
             .children(strip.map(|(ring, from)| self.call_strip(&ring, &from, cx)))
             .child(self.call_title(call, subject, words, cx))
             .child(controls)
             .children(popover.map(|(width, body)| {
                 // Above the card, level with its left edge, on top of whatever the list shows.
+                // The card is as tall as its rows, so the popover hangs off the top of it.
                 deferred(
                     div()
                         .id("call-popover")
                         .absolute()
                         .left(px(-1.))
-                        .bottom(px(CARD + lifted + 5.))
+                        .bottom(relative(1.))
+                        .pb(px(6.))
                         .w(px(width))
                         .rounded(px(12.))
                         .bg(theme::overlay())
@@ -988,10 +1046,18 @@ impl Shell {
         .tooltip(tip("Accept", Some("⌘⇧A")))
         .on_click(cx.listener(|this, _, _, cx| this.call_accept(cx)));
         card()
-            .h(px(CARD))
             .border_color(Rgba { a: 0.45, ..theme::positive() })
             .child(self.call_title(call, subject, words, cx))
-            .child(div().h(px(32.)).flex_none().flex().gap(px(4.)).child(decline).child(accept))
+            .child(
+                div()
+                    .min_h(px(32.))
+                    .flex_none()
+                    .flex()
+                    .flex_wrap()
+                    .gap(px(4.))
+                    .child(decline.min_w(px(100.)))
+                    .child(accept.min_w(px(100.))),
+            )
     }
 
     /// A call that did not happen, said in words. It stays until dismissed or the next call.
@@ -1069,6 +1135,8 @@ impl Shell {
                             .gap(px(2.))
                             .child(
                                 div()
+                                    .whitespace_normal()
+                                    .line_clamp(2)
                                     .text_size(px(13.))
                                     .line_height(px(18.))
                                     .font_weight(FontWeight::SEMIBOLD)
@@ -1077,6 +1145,8 @@ impl Shell {
                             )
                             .child(
                                 div()
+                                    .whitespace_normal()
+                                    .line_clamp(4)
                                     .text_size(px(11.5))
                                     .line_height(px(16.))
                                     .text_color(theme::text_soft())
@@ -1085,7 +1155,7 @@ impl Shell {
                     )
                     .child(dismiss),
             )
-            .child(div().flex().gap(px(4.)).children(buttons))
+            .child(div().flex().flex_wrap().gap(px(4.)).children(buttons))
     }
 }
 
@@ -1214,6 +1284,18 @@ mod tests {
             let card = failure(&tiny(0), &lounge(), reason, "");
             assert!(!card.acts.contains(&Act::Handoff), "a Tiny server has no app to hand off to: {reason:?}");
         }
+    }
+
+    #[test]
+    fn the_narrowest_sidebar_gives_the_server_name_its_own_line() {
+        // Sidebar 260, minus the dock inset and the card padding. The server line is this wide
+        // because signal, lock and people sit on a later row.
+        let inner = card_inner(crate::gui::layout::SIDEBAR_RANGE.0);
+        assert!(inner >= 200., "{inner}");
+        // Mute, deafen, devices and Leave fit on one row.
+        assert!(controls_row(3) <= inner, "voice controls need {}, the card has {inner}", controls_row(3));
+        // Share and camera join them, and that row has to wrap.
+        assert!(controls_row(5) > inner, "video controls need {}, the card has {inner}", controls_row(5));
     }
 
     #[test]

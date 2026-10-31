@@ -99,7 +99,8 @@ impl Health {
         if self.overruns.is_some_and(|n| n > 0) {
             say(Level::Bad, "Your microphone is dropping audio. Try another microphone, or close other apps using it.".to_owned());
         }
-        if self.underruns.is_some_and(|n| n > 0) {
+        // One late tick dries a short cushion. A headset is the cause only when it keeps happening.
+        if self.underruns.is_some_and(|n| n >= 3) {
             say(Level::Bad, "Your speaker is running dry, so voices break up. Try another speaker or headset.".to_owned());
         }
         match self.loss_permille {
@@ -319,7 +320,9 @@ mod tests {
         let dropping = Health { overruns: Some(3), ..link(40, 0, 2) };
         assert_eq!(dropping.hints()[0].level, Level::Bad);
         assert!(dropping.hints()[0].words.starts_with("Your microphone is dropping audio"));
-        let dry = Health { underruns: Some(1), overruns: Some(0), ..link(40, 0, 2) };
+        let blip = Health { underruns: Some(1), overruns: Some(0), ..link(40, 0, 2) };
+        assert!(blip.hints().iter().all(|hint| !hint.words.starts_with("Your speaker")));
+        let dry = Health { underruns: Some(3), overruns: Some(0), ..link(40, 0, 2) };
         assert!(dry.hints()[0].words.starts_with("Your speaker"));
         let repaired = Health { fec_permille: Some(12), ..link(40, 20, 2) };
         assert!(repaired.hints().iter().any(|hint| hint.words.starts_with("Error correction")));
@@ -347,9 +350,12 @@ mod tests {
         let quiet = Health::from_polls(Some(&first), &poll(2, 1, 0, 3, 1, 0));
         assert_eq!((quiet.overruns, quiet.underruns, quiet.concealed_permille, quiet.fec_permille), (Some(0), Some(0), Some(0), Some(0)));
         assert_eq!(quiet.hints(), [Hint { level: Level::Good, words: "Your connection is good.".into() }]);
-        // The speaker ran dry twice this second.
-        let dry = Health::from_polls(Some(&first), &poll(2, 1, 2, 3, 1, 0));
-        assert_eq!(dry.underruns, Some(2));
+        // Two dry moments in a second are a blip. Three is the speaker actually running out.
+        let blip = Health::from_polls(Some(&first), &poll(2, 1, 2, 3, 1, 0));
+        assert_eq!(blip.underruns, Some(2));
+        assert!(blip.hints().iter().all(|hint| !hint.words.starts_with("Your speaker")));
+        let dry = Health::from_polls(Some(&first), &poll(2, 1, 3, 3, 1, 0));
+        assert_eq!(dry.underruns, Some(3));
         assert!(dry.hints()[0].words.starts_with("Your speaker"));
         // mediad reconnected and counts from nothing again.
         let again = Health::from_polls(Some(&first), &poll(1, 0, 0, 0, 0, 0));

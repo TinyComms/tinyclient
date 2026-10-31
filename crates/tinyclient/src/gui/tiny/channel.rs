@@ -254,13 +254,14 @@ impl Shell {
                     .border_1()
                     .border_color(theme::hairline())
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .gap(px(12.))
                     .child(div().flex_none().size(px(30.)).rounded_full().bg(theme::hover()).flex().items_center().justify_center().child(glyph(icon, 15., color)))
                     .child(
                         div()
                             .flex_1()
-                            .min_w_0()
+                            .min_w(px(160.))
                             .flex()
                             .flex_col()
                             .gap(px(2.))
@@ -269,7 +270,17 @@ impl Shell {
                                     .flex()
                                     .items_center()
                                     .gap(px(8.))
-                                    .child(div().min_w_0().truncate().type_ui().font_weight(theme::SEMIBOLD).text_color(theme::text()).child(title))
+                                    .child(
+                                        div()
+                                            .min_w(px(120.))
+                                            .flex_1()
+                                            .whitespace_normal()
+                                            .line_clamp(2)
+                                            .type_ui()
+                                            .font_weight(theme::SEMIBOLD)
+                                            .text_color(theme::text())
+                                            .child(title),
+                                    )
                                     .children(clock.map(|clock| div().flex_none().type_small().text_color(color).child(clock))),
                             )
                             .children(line.map(|line| div().whitespace_normal().type_small().text_color(theme::text_soft()).child(line))),
@@ -305,14 +316,16 @@ impl Shell {
                     .child(div().w_full().aspect_ratio(16. / 9.).max_h(px(420.)).min_h(px(160.)).p(px(6.)).child(img(path).size_full().object_fit(ObjectFit::Contain)))
                     .child(
                         div()
-                            .h(px(32.))
+                            .min_h(px(32.))
                             .px(px(10.))
+                            .py(px(6.))
                             .flex()
+                            .flex_wrap()
                             .items_center()
                             .gap(px(8.))
                             .bg(theme::raised())
                             .child(Avatar::named(&name, 18.).build())
-                            .child(div().flex_1().min_w_0().truncate().type_small().text_color(theme::text()).child(caption))
+                            .child(div().flex_1().min_w(px(120.)).whitespace_normal().line_clamp(2).type_small().text_color(theme::text()).child(caption))
                             .child(
                                 div()
                                     .id("tiny-picture-stop")
@@ -351,16 +364,20 @@ impl Shell {
         };
         Some(
             div()
-                .h(px(32.))
+                .min_h(px(32.))
+                .max_w_full()
                 .px(px(12.))
-                .rounded_full()
+                .py(px(4.))
+                .rounded(px(16.))
                 .bg(if ours { theme::accent_soft() } else { theme::overlay() })
                 .border_1()
                 .border_color(if ours { theme::accent() } else { theme::overlay_edge() })
                 .flex()
+                .flex_wrap()
+                .justify_center()
                 .items_center()
                 .gap(px(10.))
-                .child(div().type_small().text_color(theme::text()).child(words))
+                .child(div().whitespace_normal().line_clamp(2).type_small().text_color(theme::text()).child(words))
                 .child(
                     div()
                         .id("tiny-watch")
@@ -620,9 +637,11 @@ impl Shell {
         let pill = |id: &'static str, icon: &'static str, words: String, color: gpui::Rgba, fill: gpui::Rgba| {
             div()
                 .id(id)
-                .h(px(30.))
+                .min_h(px(30.))
+                .max_w_full()
                 .px(px(12.))
-                .rounded_full()
+                .py(px(4.))
+                .rounded(px(15.))
                 .bg(fill)
                 .border_1()
                 .border_color(theme::hairline())
@@ -632,8 +651,8 @@ impl Shell {
                 .type_small()
                 .font_weight(theme::MEDIUM)
                 .text_color(color)
-                .child(glyph(icon, 14., color))
-                .child(div().min_w_0().truncate().child(words))
+                .child(div().flex_none().child(glyph(icon, 14., color)))
+                .child(div().min_w(px(80.)).whitespace_normal().line_clamp(3).child(words))
         };
         let muted = match held_by_server {
             Some(words) => Some(pill("tiny-pill-held", "icons/mic-off.svg", words.to_owned(), theme::danger(), theme::danger_soft()).into_any_element()),
@@ -687,13 +706,13 @@ impl Shell {
         if muted.is_none() && ptt.is_none() && trouble.is_none() {
             return None;
         }
-        Some(div().flex().flex_wrap().justify_center().items_center().gap(px(8.)).children(muted).children(ptt).children(trouble))
+        Some(div().w_full().flex().flex_wrap().justify_center().items_center().gap(px(8.)).children(muted).children(ptt).children(trouble))
     }
 
     /// Under the stage: Join for a channel I am not in, else mute, deafen, devices, call
     /// health and Leave.
     fn tiny_call_bar(&self, page: &Page, room: &TinyRoom, mine: bool, call: Option<&Call>, cx: &mut Context<Self>) -> Div {
-        let bar = div().flex_none().pb(px(20.)).pt(px(8.)).flex().flex_col().items_center().gap(px(8.));
+        let bar = div().w_full().flex_none().pb(px(20.)).pt(px(8.)).flex().flex_col().items_center().gap(px(8.));
         if !mine {
             let blocked = join_blocked(page.live, &page.community.media);
             let join: AnyElement = if !page.community.allowed("community.calls.join") {
@@ -812,13 +831,16 @@ impl Shell {
             .children(watch)
             .child(
                 div()
+                    .max_w_full()
                     .p(px(6.))
-                    .rounded_full()
+                    .rounded(px(24.))
                     .bg(theme::overlay())
                     .border_1()
                     .border_color(theme::overlay_edge())
                     .shadow(theme::shadow_popover())
                     .flex()
+                    .flex_wrap()
+                    .justify_center()
                     .items_center()
                     .gap(px(8.))
                     .child(mute)
