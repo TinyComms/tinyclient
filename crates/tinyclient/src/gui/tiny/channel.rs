@@ -71,6 +71,20 @@ fn bar_button(id: &'static str, icon: &'static str, look: Look, name: impl Into<
         .child(glyph(icon, 20., color))
 }
 
+/// Someone else's camera or share, as drawn. A driver finds it by the name "Call picture".
+fn remote_picture(path: PathBuf) -> Stateful<Div> {
+    div()
+        .id("tiny-call-picture")
+        .role(gpui::Role::Image)
+        .aria_label("Call picture")
+        .w_full()
+        .aspect_ratio(16. / 9.)
+        .max_h(px(420.))
+        .min_h(px(160.))
+        .p(px(6.))
+        .child(img(path).size_full().object_fit(ObjectFit::Contain))
+}
+
 /// What the person whose seat this is can be heard as, in my call: my own seat with what my
 /// call says right now (it knows before the server echoes it), anyone else's with mediad's
 /// speaking edge when it is quicker than the server's.
@@ -354,7 +368,7 @@ impl Shell {
                     .overflow_hidden()
                     .flex()
                     .flex_col()
-                    .child(div().w_full().aspect_ratio(16. / 9.).max_h(px(420.)).min_h(px(160.)).p(px(6.)).child(img(path).size_full().object_fit(ObjectFit::Contain)))
+                    .child(remote_picture(path))
                     .child(
                         div()
                             .min_h(px(32.))
@@ -952,6 +966,13 @@ mod tests {
         assert_eq!(health_words(Grade::Unknown, Some(40)), "Call health");
         assert_eq!(health_words(Grade::Good, None), "Call health");
         assert_eq!(health_words(Grade::Good, Some(40)), "Call health: good connection · 40 ms");
+    }
+
+    #[test]
+    fn a_remote_picture_is_named_call_picture() {
+        let picture = remote_picture(PathBuf::from("frame.png"));
+        assert_eq!(picture.a11y_role(), Some(gpui::Role::Image));
+        assert_eq!(accessible_name(&picture).as_deref(), Some("Call picture"));
     }
 
     fn joined(muted: bool, deafened: bool, speaking: bool) -> Call {
