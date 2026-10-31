@@ -1,8 +1,9 @@
 //! The Telegram, Signal, Messages, and Tiny server sign-in sheet (`docs/design/08-first-run-settings.md`, section 2).
-//! None of them has a web page to show, so tinyclient draws the sign-in itself. Telegram: a code to
+//! tinyclient draws each step and opens web sign-in where needed. Telegram: a code to
 //! scan, or a phone number, the code Telegram sends and, for accounts that have one, the two-step
 //! password. Signal: only the code to scan from the phone, which links this computer as one more
-//! device; a number typed here would take the account from the phone, so none is asked. A Tiny
+//! device; a number typed here would take the account from the phone, so none is asked.
+//! Messages uses Google account sign-in in a browser and an emoji confirmation on the phone. A Tiny
 //! server takes the code someone on it gave, or the address of one you already belong to; the
 //! rest happens in the system browser, at the server's sign-in provider, while the sheet waits.
 //!
@@ -35,6 +36,7 @@ use gpui::{
 use protocol::{AccountKey, Change, CodeVia, ErrorCode, Network, Request, Response, SignInInput, SignInProblem, SignInStep};
 use std::io;
 use std::rc::Rc;
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::time::Duration;
 
 /// The QR tile only: a phone reads dark on white, whatever the theme around it.
@@ -92,12 +94,12 @@ pub struct Sheet {
     epoch: u64,
     /// Changes from the listener supersede a submission still awaiting its reply.
     revision: u64,
-    /// A closed sheet must finish cancelling before another sign-in begins.
-    cancellation: Option<Task<()>>,
     /// The code on show and the link it was made from: encoded once, redrawn only on rotation.
     code: Option<(String, Rc<qr::Qr>)>,
     /// Hears `Change::SignIn` while the sheet is open. Dropping it stops the loop.
     listener: Option<Task<()>>,
+    /// Begin waits for preceding cancellation requests, including after immediate reopen.
+    pending_cancel: Option<Arc<AtomicBool>>,
     /// Fires once, when Telegram allows another code, to swap the link in.
     resend_timer: Option<Task<()>>,
     country: Entity<TextInput>,
@@ -278,7 +280,7 @@ fn step_problem(step: &SignInStep) -> Option<&SignInProblem> {
         | SignInStep::Server { problem }
         | SignInStep::Invite { problem, .. }
         | SignInStep::Browser { problem, .. } => problem.as_ref(),
-        SignInStep::Done { .. } | SignInStep::Failed { .. } => None,
+        SignInStep::Emoji { .. } | SignInStep::Done { .. } | SignInStep::Failed { .. } => None,
     }
 }
 
@@ -290,6 +292,8 @@ fn waiting() -> SignInStep {
 fn waiting_for(network: Network) -> SignInStep {
     if network == Network::Tiny {
         SignInStep::Invite { server: String::new(), problem: None }
+    } else if network == Network::Messages {
+        SignInStep::Browser { server: "https://messages.google.com".into(), provider: "Google".into(), waiting: false, problem: None }
     } else {
         waiting()
     }
@@ -372,9 +376,9 @@ impl Sheet {
             local: None,
             epoch: 0,
             revision: 0,
-            cancellation: None,
             code: None,
             listener: None,
+            pending_cancel: None,
             resend_timer: None,
             country,
             number,
@@ -467,10 +471,24 @@ impl Sheet {
         self.code = None;
         self.clear_fields(cx);
         if cancel && !self.canned {
-            let request = Request::SignInCancel { network: self.network };
-            self.cancellation = Some(cx.spawn(async move |_, _| { drop(ask_async(request).await) }));
+            self.request_cancel(cx);
         }
         cx.notify();
+    }
+
+    fn request_cancel(&mut self, cx: &mut Context<Sheet>) {
+        let previous = self.pending_cancel.take();
+        let complete = Arc::new(AtomicBool::new(false));
+        self.pending_cancel = Some(complete.clone());
+        let request = Request::SignInCancel { network: self.network };
+        cx.spawn(async move |_, cx| {
+            let timer = cx.background_executor().clone();
+            if let Some(previous) = previous {
+                while !previous.load(Ordering::Acquire) { timer.timer(Duration::from_millis(10)).await; }
+            }
+            drop(ask_async(request).await);
+            complete.store(true, Ordering::Release);
+        }).detach();
     }
 
     fn clear_fields(&mut self, cx: &mut Context<Sheet>) {
@@ -515,12 +533,13 @@ impl Sheet {
         // submit before SignInBegin has created the flow on a slow computer.
         self.busy = true;
         let (epoch, network) = (self.epoch, self.network);
-        let cancellation = self.cancellation.take();
+        let cancelled = self.pending_cancel.clone();
         self.listener = Some(cx.spawn(async move |this, cx| {
-            if let Some(cancellation) = cancellation {
-                cancellation.await;
-            }
             let background = cx.background_executor().clone();
+            if let Some(cancelled) = cancelled {
+                while !cancelled.load(Ordering::Acquire) { background.timer(Duration::from_millis(10)).await; }
+            }
+            if !this.update(cx, |this, _| this.epoch == epoch && this.face.is_some()).unwrap_or(false) { return; }
             let seq = || async {
                 match ask_async(Request::Status).await {
                     Ok(Response::Status { seq, .. }) => Some(seq),
@@ -529,6 +548,7 @@ impl Sheet {
             };
             let begin = || ask_async(Request::SignInBegin { network });
             let mut since = seq().await;
+            if !this.update(cx, |this, _| this.epoch == epoch && this.face.is_some()).unwrap_or(false) { return; }
             let begun = begin().await;
             if !this.update(cx, |this, cx| this.begun(epoch, begun, cx)).unwrap_or(false) {
                 return;
@@ -707,18 +727,8 @@ impl Sheet {
         // Bumped now, so an answer still on its way to the old sign-in is dropped.
         self.epoch += 1;
         self.listener = None;
-        let network = self.network;
-        let epoch = self.epoch;
-        let cancel = cx.spawn(async move |_, _| { drop(ask_async(Request::SignInCancel { network }).await) });
-        cx.spawn(async move |this, cx| {
-            cancel.await;
-            let _ = this.update(cx, |this, cx| {
-                if this.epoch == epoch && this.face.is_some() {
-                    this.begin(cx);
-                }
-            });
-        })
-        .detach();
+        self.request_cancel(cx);
+        self.begin(cx);
         cx.notify();
     }
 
@@ -906,6 +916,9 @@ impl Sheet {
     }
 
     fn qr_step(&self, problem: Option<&SignInProblem>, cx: &Context<Sheet>) -> Div {
+        if self.network == Network::Messages {
+            return self.browser_step("https://messages.google.com", "Google", false, problem, cx);
+        }
         let tile = match (problem, &self.code) {
             (Some(problem), _) => quiet_tile()
                 .gap(px(12.))
@@ -917,11 +930,11 @@ impl Sheet {
         let phone_only = matches!(self.network, Network::Signal | Network::Messages | Network::Tiny);
         let steps = match self.network {
             Network::Signal => ["Open Signal on your phone.", "Go to Settings > Linked devices > Link new device.", "Point the phone at this code."],
-            Network::Messages => ["Open Messages on your Android phone.", "Go to Settings > Device pairing > QR code scanner.", "Point the phone at this code."],
+            Network::Messages => unreachable!("Messages uses Google sign-in and emoji confirmation"),
             Network::Tiny => ["Paste the code you were given.", "Continue in your browser.", "Come back here when it's done."],
             Network::Telegram | Network::Discord | Network::Slack | Network::Teams => ["Open Telegram on your phone.", "Go to Settings > Devices > Link Desktop Device.", "Point the phone at this code."],
         };
-        // Signal and Messages link a computer only from the phone: there is no other way in to offer.
+        // Signal links a computer only from the phone.
         let other_way = (!phone_only).then(|| self.answer_link("signin-use-phone", "Use a phone number instead", || SignInInput::UsePhone, cx));
         div()
             .flex()
@@ -1170,6 +1183,23 @@ impl Sheet {
     /// The rest is in the browser. While chatd waits: what to do there, and the page again.
     /// After it stopped: why, and a way to begin again with the same provider.
     fn browser_step(&self, server: &str, provider: &str, waiting: bool, problem: Option<&SignInProblem>, cx: &Context<Sheet>) -> Div {
+        if self.network == Network::Messages {
+            return div().flex().flex_col()
+                .child(self.header(if waiting { "Sign in with Google" } else { "Continue in your browser" }, false, cx))
+                .child(div().mt(px(12.)).whitespace_normal().text_color(theme::text_soft())
+                    .child(if waiting {
+                        "Sign in in the browser window using the same Google account as Messages on your Android phone. Then return here to confirm the matching emoji on your phone."
+                    } else {
+                        "Sign in with the Google account used by Messages on your Android phone. Keep your phone online to pair this computer."
+                    }))
+                .children(problem.map(|problem| error_line(problem_words(self.network, problem)).mt(px(12.))))
+                .child(footer(22.).child(div()).child(if waiting {
+                    buttons().child(self.cancel("Cancel", cx))
+                } else {
+                    buttons().child(self.cancel("Cancel", cx))
+                        .child(self.primary("Continue with Google", |this, cx| this.answer(SignInInput::OpenBrowser, cx), cx))
+                }));
+        }
         let (title, line) = if waiting {
             ("Waiting for your browser…", waiting_words(server, provider))
         } else {
@@ -1460,6 +1490,12 @@ impl Render for Sheet {
                     SignInStep::Server { .. } => self.server_step(problem, window, cx),
                     SignInStep::Invite { server, .. } => self.invite_step(server, problem, window, cx),
                     SignInStep::Browser { server, provider, waiting, .. } => self.browser_step(server, provider, *waiting, problem, cx),
+                    SignInStep::Emoji { emoji } => div().flex().flex_col()
+                        .child(self.header("Confirm on your phone", false, cx))
+                        .child(div().mt(px(16.)).mb(px(16.)).text_size(px(64.)).text_center().child(emoji.clone()))
+                        .child(div().whitespace_normal().text_color(theme::text_soft())
+                            .child("Open Messages on your Android phone and select this matching emoji to finish pairing. Keep your phone online."))
+                        .child(footer(22.).child(div()).child(self.cancel("Cancel", cx))),
                     SignInStep::Failed { reason } => self.failed_step(reason, cx),
                     SignInStep::Done { .. } => div(),
                 }

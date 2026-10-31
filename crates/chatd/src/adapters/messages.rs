@@ -37,6 +37,16 @@ pub fn supported() -> bool {
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Saved {
+    #[serde(default)]
+    cookies: HashMap<String, String>,
+    #[serde(default)]
+    session_id: String,
+    #[serde(default)]
+    dest_reg_id: String,
+    #[serde(default)]
+    pairing_id: String,
+    #[serde(default)]
+    dest_phone_id: u64,
     account: String,
     #[serde(default)]
     name: String,
@@ -188,6 +198,11 @@ fn open(saved: &Saved) -> Result<Box<dyn Drive>, String> {
         return Ok(Box::new(fake::Fake::open(saved)));
     }
     let real = bugle::Saved {
+        cookies: saved.cookies.clone(),
+        session_id: saved.session_id.clone(),
+        dest_reg_id: saved.dest_reg_id.clone(),
+        pairing_id: saved.pairing_id.clone(),
+        dest_phone_id: saved.dest_phone_id,
         account: saved.account.clone(),
         name: saved.name.clone(),
         aes: saved.aes.clone(),

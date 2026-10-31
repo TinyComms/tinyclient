@@ -48,6 +48,9 @@ pub(super) fn canned() -> Option<Canned> {
     let sms = Some(CodeVia::Sms);
     let mut canned = Canned { face: Face::Step(qr("", None)), number: "", digits: "", password: "", local: None, network: Network::Telegram, invite: String::new() };
     let step = match name.as_str() {
+        "messages-browser" => SignInStep::Browser { server: "https://messages.google.com".into(), provider: "Google".into(), waiting: false, problem: None },
+        "messages-waiting" => SignInStep::Browser { server: "https://messages.google.com".into(), provider: "Google".into(), waiting: true, problem: None },
+        "messages-emoji" => SignInStep::Emoji { emoji: "🐢".into() },
         "qr-waiting" => qr("", None),
         "qr" => qr(LINK, None),
         "qr-offline" => qr("", Some(SignInProblem::Unreachable)),

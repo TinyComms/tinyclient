@@ -1093,7 +1093,7 @@ dependencies = [
 
 [[package]]
 name = "chatd"
-version = "0.2.28"
+version = "0.2.29"
 dependencies = [
  "aes 0.8.4",
  "aes-gcm",
@@ -1115,6 +1115,7 @@ dependencies = [
  "grammers-mtsender",
  "grammers-session",
  "grammers-tl-types",
+ "hkdf",
  "hmac 0.12.1",
  "iana-time-zone",
  "keyring",
@@ -1130,6 +1131,7 @@ dependencies = [
  "security-framework-sys",
  "serde",
  "serde_json",
+ "sha1 0.10.7",
  "sha2 0.10.9",
  "tokio",
  "tungstenite 0.30.0",
@@ -5130,7 +5132,7 @@ dependencies = [
 
 [[package]]
 name = "login"
-version = "0.2.28"
+version = "0.2.29"
 dependencies = [
  "block2 0.6.2",
  "embed-resource",
@@ -5143,6 +5145,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tao",
+ "tungstenite 0.28.0",
  "ureq",
  "wry",
 ]
@@ -5291,7 +5294,7 @@ checksum = "7ebb8d8732c6a6df3d8f032a82911cfc747e00efb95cc46e8d0acd5b5b88570c"
 
 [[package]]
 name = "mediad"
-version = "0.2.28"
+version = "0.2.29"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",
@@ -5558,7 +5561,7 @@ checksum = "0676bb32a98c1a483ce53e500a81ad9c3d5b3f7c920c28c24e9cb0980d0b5bc8"
 
 [[package]]
 name = "notifier"
-version = "0.2.28"
+version = "0.2.29"
 dependencies = [
  "block2 0.6.2",
  "objc2 0.6.5",
@@ -7240,7 +7243,7 @@ dependencies = [
 
 [[package]]
 name = "protocol"
-version = "0.2.28"
+version = "0.2.29"
 dependencies = [
  "interprocess",
  "serde",
@@ -9479,7 +9482,7 @@ dependencies = [
 
 [[package]]
 name = "tinyclient"
-version = "0.2.28"
+version = "0.2.29"
 dependencies = [
  "embed-resource",
  "futures-channel",
@@ -9824,6 +9827,23 @@ dependencies = [
  "rand 0.8.8",
  "sha1 0.10.7",
  "thiserror 1.0.69",
+ "utf-8",
+]
+
+[[package]]
+name = "tungstenite"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8628dcc84e5a09eb3d8423d6cb682965dea9133204e8fb3efee74c2a0c259442"
+dependencies = [
+ "bytes",
+ "data-encoding",
+ "http",
+ "httparse",
+ "log",
+ "rand 0.9.5",
+ "sha1 0.10.7",
+ "thiserror 2.0.21",
  "utf-8",
 ]
 

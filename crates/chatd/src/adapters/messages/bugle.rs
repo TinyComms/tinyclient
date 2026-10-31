@@ -3,9 +3,11 @@
 //! paired device, and every message goes through the phone. Nothing here is the official client.
 
 use aes::Aes256;
+mod google;
 use base64::Engine;
 use cipher::{KeyIvInit, StreamCipher};
 use ctr::Ctr128BE;
+pub use google::pair_google;
 use hmac::{Hmac, Mac};
 use p256::ecdsa::SigningKey;
 use p256::pkcs8::EncodePublicKey;
@@ -18,7 +20,6 @@ use std::time::{Duration, Instant};
 const API_KEY: &str = "AIzaSyCA4RsOZUFrm9whhtGosPlJLmVPnfSHKz8";
 const USER_AGENT: &str = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36";
 const ORIGIN: &str = "https://messages.google.com";
-const QR_BASE: &str = "https://support.google.com/messages/?p=web_computer#?c=";
 const RELAY: &str = "https://instantmessaging-pa.googleapis.com/$rpc/google.internal.communications.instantmessaging.v1";
 const UPLOAD: &str = "https://instantmessaging-pa.googleapis.com/upload";
 /// A guard for this client, not a limit Google publishes.
@@ -166,27 +167,6 @@ fn browser_details() -> Vec<u8> {
     buf.0
 }
 
-fn register_body(public_der: &[u8]) -> Vec<u8> {
-    let mut ecdsa = Buf::new();
-    ecdsa.int(1, 2);
-    ecdsa.bytes(2, public_der);
-    let mut keys = Buf::new();
-    keys.msg(6, &ecdsa.0);
-    let mut body = Buf::new();
-    body.msg(1, &auth_message(&uuid(), &[]));
-    body.msg(3, &browser_details());
-    body.msg(4, &keys.0);
-    body.0
-}
-
-fn url_data(pairing: &[u8], aes_key: &[u8], hmac_key: &[u8]) -> String {
-    let mut buf = Buf::new();
-    buf.bytes(1, pairing);
-    buf.bytes(2, aes_key);
-    buf.bytes(3, hmac_key);
-    format!("{QR_BASE}{}", b64(&buf.0))
-}
-
 fn uuid() -> String {
     let b = random(16);
     format!(
@@ -319,33 +299,20 @@ fn decode_token(bytes: &[u8]) -> (Vec<u8>, i64) {
     (field_bytes(&list, 1), field_int(&list, 2) as i64)
 }
 
-struct RelayReply {
-    browser: Device,
-    pairing: Vec<u8>,
-    token: Vec<u8>,
-    ttl: i64,
-}
-
-fn decode_register(bytes: &[u8]) -> Option<RelayReply> {
-    let list = fields(bytes);
-    let browser = decode_device(&field_bytes(&list, 2));
-    let pairing = field_bytes(&list, 3);
-    let (token, ttl) = decode_token(&field_bytes(&list, 5));
-    if pairing.is_empty() || token.is_empty() || browser.source.is_empty() {
-        return None;
-    }
-    Some(RelayReply {
-        browser,
-        pairing,
-        token,
-        ttl,
-    })
-}
-
-/// What the keychain holds after a phone has paired. `key` is the ECDSA signing key, hex PKCS#8,
+/// What the keychain holds after a phone has paired. `key` is the ECDSA signing key, hex scalar,
 /// kept so a later refresh can sign. Not `Debug`.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Saved {
+    #[serde(default)]
+    pub cookies: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub dest_reg_id: String,
+    #[serde(default)]
+    pub pairing_id: String,
+    #[serde(default)]
+    pub dest_phone_id: u64,
     pub account: String,
     #[serde(default)]
     pub name: String,
@@ -740,6 +707,7 @@ struct Live {
     session: String,
     chats: Vec<Chat>,
     cookies: String,
+    token_refreshed: Instant,
 }
 
 struct Waiter {
@@ -748,108 +716,14 @@ struct Waiter {
     reply: Sender<Vec<u8>>,
 }
 
-/// Speaks to Google until the phone scans the code, then returns the session.
-pub fn pair(
-    show: &dyn Fn(String),
-    cancel: &std::sync::atomic::AtomicBool,
-) -> Result<Saved, String> {
-    let signing = SigningKey::from_slice(&random(32))
-        .map_err(|_| "could not make a pairing key".to_owned())?;
-    let public = signing
-        .verifying_key()
-        .to_public_key_der()
-        .map_err(|_| "could not encode the pairing key".to_owned())?;
-    let aes_key = random(32);
-    let hmac_key = random(32);
-    let agent = agent(Duration::from_secs(30));
-    let mut cookies = String::new();
-    let body = register_body(public.as_bytes());
-    let response = post(
-        &agent,
-        &format!("{RELAY}.Pairing/RegisterPhoneRelay"),
-        "application/x-protobuf",
-        &body,
-        &cookies,
-    )?;
-    cookies = merge_cookies(&cookies, &response.cookies);
-    let registered = decode_register(&response.body)
-        .ok_or_else(|| "Messages did not start a pairing.".to_owned())?;
-    let qr = url_data(&registered.pairing, &aes_key, &hmac_key);
-    show(qr);
-    let (events, inbox) = channel();
-    let saved = Saved {
-        account: String::new(),
-        name: "Messages".into(),
-        aes: hex(&aes_key),
-        hmac: hex(&hmac_key),
-        token: b64(&registered.token),
-        ttl: registered.ttl,
-        mobile_user: 0,
-        mobile: String::new(),
-        browser_user: registered.browser.user,
-        browser: registered.browser.source.clone(),
-        key: hex(signing.to_bytes().as_slice()),
-    };
-    let live = Arc::new(Mutex::new(Live {
-        saved: saved.clone(),
-        aes: aes_key,
-        hmac: hmac_key,
-        token: registered.token,
-        ttl: registered.ttl,
-        session: uuid(),
-        chats: Vec::new(),
-        cookies,
-    }));
-    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let poll_live = live.clone();
-    let poll_stop = stop.clone();
-    let (paired_tx, paired_rx) = channel::<Saved>();
-    std::thread::Builder::new()
-        .name("messages-pair".into())
-        .spawn(move || {
-            poll(
-                poll_live,
-                events,
-                Arc::default(),
-                poll_stop,
-                false,
-                Some(paired_tx),
-            )
-        })
-        .map_err(|err| err.to_string())?;
-    let deadline = Instant::now() + Duration::from_secs(180);
-    loop {
-        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-            stop.store(true, std::sync::atomic::Ordering::Relaxed);
-            return Err("cancelled".into());
-        }
-        if Instant::now() > deadline {
-            stop.store(true, std::sync::atomic::Ordering::Relaxed);
-            return Err("The code expired before the phone scanned it.".into());
-        }
-        match paired_rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(saved) => {
-                // The phone needs a moment to store the pair before the next connection.
-                std::thread::sleep(Duration::from_secs(2));
-                stop.store(true, std::sync::atomic::Ordering::Relaxed);
-                let _ = inbox;
-                return Ok(saved);
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return Err("Messages closed the pairing connection.".into());
-            }
-        }
-    }
-}
-
 fn agent(timeout: Duration) -> ureq::Agent {
     // The same system TLS as the rest of chatd. ureq's default is rustls, which this crate does
     // not enable, and asking for it panics before a pairing code exists.
     ureq::Agent::config_builder()
         .tls_config(
             ureq::tls::TlsConfig::builder()
-                .provider(ureq::tls::TlsProvider::NativeTls).root_certs(ureq::tls::RootCerts::PlatformVerifier)
+                .provider(ureq::tls::TlsProvider::NativeTls)
+                .root_certs(ureq::tls::RootCerts::PlatformVerifier)
                 .build(),
         )
         .timeout_global(Some(timeout))
@@ -871,8 +745,17 @@ fn post(
     body: &[u8],
     cookies: &str,
 ) -> Result<Http, String> {
+    let google = google::authorization(cookies);
+    let url = if google.is_some() {
+        url.replace(
+            "instantmessaging-pa.googleapis.com/$rpc",
+            "instantmessaging-pa.clients6.google.com/$rpc",
+        )
+    } else {
+        url.to_owned()
+    };
     let mut request = agent
-        .post(url)
+        .post(&url)
         .header("Content-Type", content)
         .header("x-goog-api-key", API_KEY)
         .header("x-user-agent", "grpc-web-javascript/0.1")
@@ -884,6 +767,9 @@ fn post(
         );
     if !cookies.is_empty() {
         request = request.header("Cookie", cookies);
+    }
+    if let Some(auth) = google {
+        request = request.header("Authorization", &auth);
     }
     let mut response = request
         .send(body)
@@ -922,7 +808,17 @@ fn merge_cookies(old: &str, new: &str) -> String {
     if old.is_empty() {
         return new.to_owned();
     }
-    format!("{old}; {new}")
+    let mut cookies = std::collections::BTreeMap::new();
+    for pair in old.split(';').chain(new.split(';')) {
+        if let Some((name, value)) = pair.trim().split_once('=') {
+            cookies.insert(name, value);
+        }
+    }
+    cookies
+        .into_iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// A running session: the long-poll thread and the commands share `live`.
@@ -935,20 +831,24 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn open(saved: Saved) -> Result<Session, String> {
+    pub fn open(mut saved: Saved) -> Result<Session, String> {
+        if !saved.cookies.is_empty() {
+            google::refresh(&mut saved)?;
+        }
         let (aes, hmac, token) = saved
             .keys()
             .ok_or_else(|| "the Messages session is unreadable".to_owned())?;
         let (events, heard) = channel();
         let live = Arc::new(Mutex::new(Live {
             ttl: saved.ttl,
+            cookies: google::cookie_header(&saved.cookies),
+            token_refreshed: Instant::now(),
             saved,
             aes,
             hmac,
             token,
             session: uuid(),
             chats: Vec::new(),
-            cookies: String::new(),
         }));
         let session = Session {
             live,
@@ -1035,13 +935,25 @@ impl Session {
         plain: &[u8],
         message_type: u32,
     ) -> Result<Vec<u8>, String> {
+        self.rpc_as_cancel(request, action, plain, message_type, None)
+    }
+
+    fn rpc_as_cancel(
+        &self,
+        request: &str,
+        action: u32,
+        plain: &[u8],
+        message_type: u32,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<Vec<u8>, String> {
         let request = request.to_owned();
         let (session, body, cookies) = {
             let live = self
                 .live
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let encrypted = if plain.is_empty() {
+            let gaia_pairing = matches!(action, 44 | 45 | 47);
+            let encrypted = if plain.is_empty() || gaia_pairing {
                 Vec::new()
             } else {
                 seal(&live.aes, &live.hmac, plain)
@@ -1050,7 +962,7 @@ impl Session {
                 user: live.saved.mobile_user,
                 source: live.saved.mobile.clone(),
             };
-            let body = outgoing(
+            let mut body = outgoing(
                 &mobile,
                 &request,
                 &live.session,
@@ -1060,6 +972,22 @@ impl Session {
                 live.ttl,
                 message_type,
             );
+            if !live.saved.dest_reg_id.is_empty() {
+                body[0][2] = "GDitto".into();
+                body.as_array_mut()
+                    .unwrap()
+                    .resize(9, serde_json::Value::Null);
+                body[8] = serde_json::json!([b64(live.saved.dest_reg_id.as_bytes())]);
+            }
+            if gaia_pairing {
+                let mut data = Buf::new();
+                data.text(1, &request);
+                data.int(2, action as u64);
+                data.bytes(3, plain);
+                data.text(6, &live.session);
+                body[1][11] = b64(&data.0).into();
+                body[4] = "300000000".into();
+            }
             (
                 live.session.clone(),
                 serde_json::to_vec(&body).unwrap_or_default(),
@@ -1083,6 +1011,14 @@ impl Session {
             &body,
             &cookies,
         );
+        if let Ok(ref response) = sent {
+            let mut live = self.live.lock().unwrap_or_else(|p| p.into_inner());
+            live.cookies = merge_cookies(&live.cookies, &response.cookies);
+            if !live.saved.cookies.is_empty() {
+                let cookies = live.cookies.clone();
+                google::update_cookies(&mut live.saved, &cookies);
+            }
+        }
         if let Err(err) = sent {
             self.waiters
                 .lock()
@@ -1090,7 +1026,28 @@ impl Session {
                 .retain(|waiter| waiter.request != request);
             return Err(err);
         }
-        match rx.recv_timeout(PHONE) {
+        let deadline = Instant::now()
+            + if action == 45 {
+                Duration::from_secs(180)
+            } else {
+                PHONE
+            };
+        let received = loop {
+            if cancel.is_some_and(|cancel| cancel.load(std::sync::atomic::Ordering::Relaxed)) {
+                self.waiters
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .retain(|waiter| waiter.request != request);
+                return Err("cancelled".into());
+            }
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) if Instant::now() < deadline => {
+                    continue
+                }
+                result => break result,
+            }
+        };
+        match received {
             Ok(bytes) => Ok(bytes),
             Err(_) => {
                 self.waiters
@@ -1381,21 +1338,48 @@ fn poll(
     announce: bool,
     paired: Option<Sender<Saved>>,
 ) {
+    let refresh = {
+        let live = live.lock().unwrap_or_else(|p| p.into_inner());
+        let lifetime = if live.ttl > 0 {
+            Duration::from_micros(live.ttl as u64)
+        } else {
+            Duration::from_secs(86400)
+        };
+        (!live.saved.cookies.is_empty()
+            && live.token_refreshed.elapsed() >= lifetime.saturating_sub(Duration::from_secs(3600)))
+        .then(|| live.saved.clone())
+    };
+    if let Some(mut saved) = refresh {
+        if let Err(reason) = google::refresh(&mut saved) {
+            let _ = events.send(crate::adapters::messages::Event::Closed(reason));
+            return;
+        }
+        let mut live = live.lock().unwrap_or_else(|p| p.into_inner());
+        live.token = unb64(&saved.token).unwrap_or_default();
+        live.ttl = saved.ttl;
+        live.cookies = google::cookie_header(&saved.cookies);
+        live.saved = saved;
+        live.token_refreshed = Instant::now();
+    }
     let agent = agent(Duration::from_secs(90));
     let (request, token, cookies) = {
         let held = live.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         (uuid(), held.token.clone(), held.cookies.clone())
     };
     // field 4 is an empty wrapper the web client sends: [null, []].
-    let payload = serde_json::json!([
-        pblite_auth(&request, &token),
-        null,
-        null,
-        [null, serde_json::json!([])]
-    ]);
+    let mut auth = pblite_auth(&request, &token);
+    if google::authorization(&cookies).is_some() {
+        auth[2] = "GDitto".into();
+    }
+    let payload = serde_json::json!([auth, null, null, [null, serde_json::json!([])]]);
     let body = serde_json::to_vec(&payload).unwrap_or_default();
+    let relay = if google::authorization(&cookies).is_some() {
+        RELAY.replace("googleapis.com", "clients6.google.com")
+    } else {
+        RELAY.to_owned()
+    };
     let mut request = agent
-        .post(&format!("{RELAY}.Messaging/ReceiveMessages"))
+        .post(&format!("{relay}.Messaging/ReceiveMessages"))
         .header("Content-Type", "application/json+protobuf")
         .header("x-goog-api-key", API_KEY)
         .header("x-user-agent", "grpc-web-javascript/0.1")
@@ -1403,6 +1387,9 @@ fn poll(
         .header("Referer", &format!("{ORIGIN}/"));
     if !cookies.is_empty() {
         request = request.header("Cookie", &cookies);
+    }
+    if let Some(auth) = google::authorization(&cookies) {
+        request = request.header("Authorization", &auth);
     }
     let Ok(mut response) = request.send(&body) else {
         let _ = events.send(crate::adapters::messages::Event::Closed(
@@ -1416,6 +1403,18 @@ fn poll(
         ));
         return;
     }
+    {
+        let mut live = live.lock().unwrap_or_else(|p| p.into_inner());
+        for value in response.headers().get_all("set-cookie") {
+            if let Some(pair) = value.to_str().ok().and_then(|line| line.split(';').next()) {
+                live.cookies = merge_cookies(&live.cookies, pair);
+            }
+        }
+        if !live.saved.cookies.is_empty() {
+            let cookies = live.cookies.clone();
+            google::update_cookies(&mut live.saved, &cookies);
+        }
+    }
     // The long-poll is open. Commands (SetActiveSession, then the inbox) go out on another
     // request while this one stays up to carry the phone's answer.
     if announce {
@@ -1423,108 +1422,85 @@ fn poll(
     }
     let mut reader = response.body_mut().as_reader();
     let mut pending = Vec::new();
+    let mut opened = false;
     let mut buf = [0u8; 8192];
     while !stop.load(std::sync::atomic::Ordering::Relaxed) {
         match reader.read(&mut buf) {
             Ok(0) | Err(_) => break,
             Ok(n) => pending.extend_from_slice(&buf[..n]),
         }
-        consume(&pending, &live, &events, &waiters, &paired);
-        // Drop bytes already parsed as complete JSON values. `consume` returns how many.
-        let used = take_complete(&pending);
+        if !opened {
+            if pending.len() < 2 {
+                continue;
+            }
+            if !pending.starts_with(b"[[") {
+                break;
+            }
+            pending.drain(..2);
+            opened = true;
+        }
+        // Google leaves the two outer arrays open for the lifetime of the stream.
+        // Only the individual payload arrays are complete JSON values.
+        while pending
+            .first()
+            .is_some_and(|byte| byte.is_ascii_whitespace() || *byte == b',')
+        {
+            pending.remove(0);
+        }
+        if pending.starts_with(b"]]") {
+            break;
+        }
+        let (values, used) = complete_values(&pending);
+        for value in &values {
+            on_payload(value, &live, &events, &waiters, &paired);
+        }
+        google::acknowledge(&values, &live);
         pending.drain(..used);
     }
 }
 
-fn take_complete(bytes: &[u8]) -> usize {
-    let text = String::from_utf8_lossy(bytes);
-    let mut depth = 0i32;
-    let mut start = None;
-    let mut end = 0;
-    let mut in_string = false;
-    let mut escape = false;
-    for (at, ch) in text.char_indices() {
-        if in_string {
-            if escape {
-                escape = false;
-            } else if ch == '\\' {
-                escape = true;
-            } else if ch == '"' {
-                in_string = false;
+/// Decode completed payloads while the outer HTTP stream remains open.
+fn complete_values(bytes: &[u8]) -> (Vec<serde_json::Value>, usize) {
+    let mut values = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0;
+    let mut used = 0;
+    let mut quoted = false;
+    let mut escaped = false;
+    for (at, &byte) in bytes.iter().enumerate() {
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                quoted = false;
             }
             continue;
         }
-        match ch {
-            '"' => in_string = true,
-            '[' => {
+        match byte {
+            b'"' => quoted = true,
+            b'[' => {
                 if depth == 0 {
-                    start = Some(at);
+                    start = at;
                 }
                 depth += 1;
             }
-            ']' => {
+            b']' if depth == 0 => break,
+            b']' => {
                 depth -= 1;
                 if depth == 0 {
-                    end = at + 1;
-                }
-            }
-            _ => {}
-        }
-    }
-    if depth == 0 {
-        end
-    } else {
-        start.unwrap_or(0)
-    }
-}
-
-fn consume(
-    bytes: &[u8],
-    live: &Mutex<Live>,
-    events: &Sender<crate::adapters::messages::Event>,
-    waiters: &Mutex<Vec<Waiter>>,
-    paired: &Option<Sender<Saved>>,
-) {
-    let text = String::from_utf8_lossy(bytes);
-    let mut depth = 0i32;
-    let mut start = None;
-    let mut in_string = false;
-    let mut escape = false;
-    let chars: Vec<(usize, char)> = text.char_indices().collect();
-    for (index, (at, ch)) in chars.iter().enumerate() {
-        if in_string {
-            if escape {
-                escape = false;
-            } else if *ch == '\\' {
-                escape = true;
-            } else if *ch == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-        match ch {
-            '"' => in_string = true,
-            '[' => {
-                if depth == 0 {
-                    start = Some(*at);
-                }
-                depth += 1;
-            }
-            ']' => {
-                depth -= 1;
-                if depth == 0 {
-                    if let Some(from) = start.take() {
-                        let slice = &text[from..*at + 1];
-                        if let Ok(value) = serde_json::from_str::<serde_json::Value>(slice) {
-                            on_payload(&value, live, events, waiters, paired);
-                        }
+                    if let Ok(value) = serde_json::from_slice(&bytes[start..=at]) {
+                        values.push(value);
                     }
+                    used = at + 1;
                 }
             }
+            _ if depth == 0 => used = at + 1,
             _ => {}
         }
-        let _ = index;
     }
+    (values, used)
 }
 
 fn on_payload(

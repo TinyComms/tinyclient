@@ -5,7 +5,7 @@
 use protocol::{
     read_frame, write_frame, AccountKey, Change, ChatStream, ConversationKind, Key, Link,
     MediaKind, Message, MessageKind, Network, Outgoing, OutgoingFile, Page, ReactionSet, Request,
-    Response, SendState, SignInInput, SignInProblem, SignInStep,
+    Response, SendState, SignInInput, SignInStep,
 };
 use std::io::Write;
 use std::path::PathBuf;
@@ -531,7 +531,7 @@ fn a_file_we_send_is_read_and_shown_back() {
 }
 
 #[test]
-fn pairing_shows_a_code_replaces_it_and_scanning_it_signs_in() {
+fn pairing_uses_google_browser_then_phone_emoji_confirmation() {
     let world = World::start(None);
     assert!(world
         .status()
@@ -539,37 +539,34 @@ fn pairing_shows_a_code_replaces_it_and_scanning_it_signs_in() {
         .iter()
         .all(|status| status.key.network != Network::Messages || status.link == Link::SignedOut));
     let (_, seq) = world.status();
-    assert!(matches!(world.sign_in(None), SignInStep::Qr { .. }));
-    let first = world.until("a code", || match world.sign_in(None) {
-        SignInStep::Qr {
-            link,
-            problem: None,
-            ..
-        } if !link.is_empty() => Some(link),
+    assert!(matches!(world.sign_in(None), SignInStep::Browser { waiting: false, .. }));
+    world.sign_in(Some(SignInInput::OpenBrowser));
+    let first = world.until("an emoji", || match world.sign_in(None) {
+        SignInStep::Emoji { emoji } if !emoji.is_empty() => Some(emoji),
         _ => None,
     });
     assert!(
-        first.starts_with("https://support.google.com/messages/"),
+        !first.starts_with("https://"),
         "{first}"
     );
     let typed = world.sign_in(Some(SignInInput::UsePhone));
     assert!(
-        matches!(&typed, SignInStep::Qr { link, problem: Some(SignInProblem::Other { .. }), .. } if *link == first),
+        matches!(&typed, SignInStep::Emoji { emoji } if *emoji == first),
         "{typed:?}"
     );
     world.steer_link("expire");
-    let second = world.changed(seq, "a fresh code", |change| match change {
+    let second = world.changed(seq, "a fresh emoji", |change| match change {
         Change::SignIn {
             network: Network::Messages,
-            step: SignInStep::Qr { link, .. },
-        } if !link.is_empty() && *link != first => Some(link.clone()),
+            step: SignInStep::Emoji { emoji },
+        } if !emoji.is_empty() && *emoji != first => Some(emoji.clone()),
         _ => None,
     });
     assert_ne!(first, second);
 
     let (_, seq) = world.status();
-    world.steer_link("scan");
-    let done = world.changed(seq, "the scan", |change| match change {
+    world.steer_link("confirm");
+    let done = world.changed(seq, "the emoji confirmation", |change| match change {
         Change::SignIn {
             network: Network::Messages,
             step: SignInStep::Done { account },
@@ -578,4 +575,42 @@ fn pairing_shows_a_code_replaces_it_and_scanning_it_signs_in() {
     });
     assert_eq!(done, Some(account()));
     world.connected();
+}
+
+#[test]
+fn google_pairing_can_be_cancelled_and_restarted() {
+    let world = World::start(None);
+    assert!(matches!(world.sign_in(None), SignInStep::Browser { waiting: false, .. }));
+    // Legacy QR requests must never begin the obsolete pairing flow.
+    assert!(matches!(world.sign_in(Some(SignInInput::UseQr)), SignInStep::Browser { waiting: false, .. }));
+    world.sign_in(Some(SignInInput::OpenBrowser));
+    world.until("the emoji challenge", || matches!(world.sign_in(None), SignInStep::Emoji { .. }).then_some(()));
+    world.ask(Request::SignInCancel { network: Network::Messages });
+    assert!(matches!(world.sign_in(Some(SignInInput::OpenBrowser)), SignInStep::Failed { .. }));
+    assert!(matches!(world.sign_in(None), SignInStep::Browser { waiting: false, .. }));
+    world.heard("pairing stopped");
+    world.sign_in(Some(SignInInput::OpenBrowser));
+    world.until("the restarted emoji challenge", || matches!(world.sign_in(None), SignInStep::Emoji { .. }).then_some(()));
+    let (_, seq) = world.status();
+    world.steer_link("confirm");
+    world.changed(seq, "restarted pairing completion", |change| match change {
+        Change::SignIn { network: Network::Messages, step: SignInStep::Done { .. } } => Some(()),
+        _ => None,
+    });
+    world.connected();
+}
+
+#[test]
+fn google_pairing_failure_is_reported_without_adopting_an_account() {
+    let world = World::start(None);
+    world.sign_in(None);
+    world.sign_in(Some(SignInInput::OpenBrowser));
+    world.until("the emoji challenge", || matches!(world.sign_in(None), SignInStep::Emoji { .. }).then_some(()));
+    let (_, seq) = world.status();
+    world.steer_link("fail");
+    world.changed(seq, "pairing failure", |change| match change {
+        Change::SignIn { network: Network::Messages, step: SignInStep::Failed { reason } } => Some(reason.clone()),
+        _ => None,
+    });
+    assert!(world.status().0.iter().all(|status| status.key.network != Network::Messages || status.link == Link::SignedOut));
 }
