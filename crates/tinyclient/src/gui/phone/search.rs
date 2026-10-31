@@ -58,6 +58,7 @@ impl Shell {
                     .child(div().phone_title().child("Search")),
             )
             .child(field)
-            .child(list)
+            // Same clip as the inbox: the field and title stay above a scrolled row.
+            .child(div().flex_1().min_h_0().min_w_0().flex().flex_col().overflow_hidden().child(list))
     }
 }

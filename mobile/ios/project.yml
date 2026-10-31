@@ -11,7 +11,7 @@ name: Tiny
 options:
   bundleIdPrefix: dev.tinyclient
   deploymentTarget:
-    iOS: "17.0"
+    iOS: "16.0"
   createIntermediateGroups: true
   # Xcode 27.2 (2026-10-29) is the current toolchain; xcode-27 is a CI preview image.
   xcodeVersion: "27.0"
@@ -19,7 +19,7 @@ options:
 settings:
   base:
     SWIFT_VERSION: "6.0"
-    IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+    IPHONEOS_DEPLOYMENT_TARGET: "16.0"
     # Xcode 15+ sandboxes Run Script phases by default; the first build phase that calls cargo
     # gets an opaque "Sandbox: bash deny file-write" instead of a cargo error. This project
     # links a prebuilt xcframework instead of running cargo, but the setting is cheap insurance

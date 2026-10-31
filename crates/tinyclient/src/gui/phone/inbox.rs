@@ -127,7 +127,9 @@ impl Shell {
             .flex()
             .flex_col()
             .child(self.phone_nav(words, label, cx))
-            .child(list);
+            // The scroller clips its own rows: a row scrolled past the top must not paint over
+            // the nav strip. At 200% a row is 96 pt and the overflow is visible for a frame.
+            .child(div().flex_1().min_h_0().min_w_0().flex().flex_col().overflow_hidden().child(list));
         div().size_full().child(body)
     }
 

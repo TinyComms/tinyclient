@@ -34,7 +34,9 @@ are `lipo`'d into one universal slice first.
 
 ## Deployment target and toolchain
 
-* **iOS 17.0** floor. Xcode 27.2 supports 15–27; 17 is the pragmatic floor for a new 2026 app.
+* **iOS 16.0** floor, the product brief's v1 minimum. Xcode 27.2 supports 15–27; the Swift
+  shell uses only `UIWindowScene`/`UISceneSession` (iOS 13+), so 16 costs nothing. Unverified
+  until the gpui-ce spike links: a framework that demands 17 would raise it again.
 * Xcode 26.6 is fine today. From **April 2027** uploads need the iOS 27 SDK (Xcode 27), so the
   `macos-26` CI runner becomes `xcode-27` in Q1 2027.
 * Swift 6 language mode, per Xcode 27 defaults. The shell has no concurrency yet, so there is

@@ -9,8 +9,8 @@
 //! Features:
 //! * `gui`    — the window (GPUI), shared with the desktop binary.
 //! * `mobile` — adds the platform entry points. It implies `gui` and deliberately does not
-//!              imply `gui-shot`, which pulls GPUI's test support and renders to a file (a
-//!              desktop design-review tool; on a phone screenshots come from `adb`/`simctl`).
+//!   imply `gui-shot`, which pulls GPUI's test support and renders to a file (a desktop
+//!   design-review tool; on a phone screenshots come from `adb`/`simctl`).
 //!
 //! `mobile` + the desktop binary can be built together (`cargo check -p tinyclient --features
 //! "gui mobile"`); the entry points themselves are behind `cfg(target_os)`, so on a desktop

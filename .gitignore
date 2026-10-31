@@ -5,3 +5,6 @@
 /dist
 /.direnv/
 /.envrc.local
+
+# UAT and design screenshots are outputs, not sources.
+/reports/
