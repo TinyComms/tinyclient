@@ -1,12 +1,13 @@
 //! The menus: the server header's, a channel's, a category's, and the person menu, which opens
 //! wherever a person is drawn (a seat in the column, a tile, the member list, the home). The
-//! person menu holds what is mine to choose (their volume for me, 0 to 200 %, and Mute for me),
-//! then moderation, then membership. What this account may not do to them is absent (`model`).
+//! person menu's name opens their profile. Then what is mine to choose (their volume for me,
+//! 0 to 200 %, and Mute or Unmute for me), then moderation, then membership. A toggle names the
+//! action the click will take. What this account may not do to them is absent (`model`).
 
 use super::model::{self, PersonMenu};
 use super::{Modal, Page, Sub};
 use crate::gui::components::{
-    glyph, menu, menu_item, menu_item_check, menu_item_danger, menu_item_more, menu_label, menu_separator, slider, Avatar, NO_GLYPH,
+    glyph, menu, menu_item, menu_item_check, menu_item_danger, menu_item_more, menu_label, menu_separator, slider, Avatar,
 };
 use crate::gui::state::Shell;
 use crate::gui::theme::{self, Type};
@@ -105,6 +106,12 @@ impl Shell {
         let facts: PersonMenu = model::person_menu(page.community, user_id);
         let name = model::name_of(member);
         let color = model::color_of(page.community, member).map(gpui::rgb).unwrap_or(theme::text());
+        let open_name = user_id.to_owned();
+        let role_line = if facts.me {
+            "You".to_owned()
+        } else {
+            model::roles_of(page.community, member).first().map(|role| role.name.clone()).unwrap_or_else(|| model::role_word(&member.role).to_owned())
+        };
         let mut items = menu().w(px(260.)).child(
             div()
                 .h(px(44.))
@@ -119,16 +126,25 @@ impl Shell {
                         .min_w_0()
                         .flex()
                         .flex_col()
-                        .child(div().min_w_0().truncate().type_ui().font_weight(theme::SEMIBOLD).text_color(color).child(name.clone()))
-                        .child(div().min_w_0().truncate().type_small().text_color(theme::text_faint()).child(if facts.me {
-                            "You".to_owned()
-                        } else {
-                            model::roles_of(page.community, member).first().map(|role| role.name.clone()).unwrap_or_else(|| model::role_word(&member.role).to_owned())
-                        })),
+                        .child(
+                            div()
+                                .id("tiny-person-name")
+                                .min_w_0()
+                                .truncate()
+                                .cursor_pointer()
+                                .type_ui()
+                                .font_weight(theme::SEMIBOLD)
+                                .text_color(color)
+                                .tooltip(crate::gui::components::tip("Profile", None))
+                                .hover(|style| style.underline())
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_click(cx.listener(move |this, _, window, cx| this.tiny_open_modal(Modal::Profile(open_name.clone()), window, cx)))
+                                .child(name.clone()),
+                        )
+                        .child(div().min_w_0().truncate().type_small().text_color(theme::text_faint()).child(role_line)),
                 ),
         );
-        let id = user_id.to_owned();
-        items = items.child(menu_separator()).child(self.plain(menu_item("tiny-person-profile", Some("icons/user.svg"), "Profile", None), cx).on_click(cx.listener(move |this, _, window, cx| this.tiny_open_modal(Modal::Profile(id.clone()), window, cx))));
+        items = items.child(menu_separator());
         if facts.me {
             items = items.child(self.plain(menu_item("tiny-person-picture", Some("icons/upload.svg"), "Change picture", None), cx).on_click(cx.listener(|this, _, _, cx| {
                 this.tiny_close_float(cx);
@@ -156,6 +172,7 @@ impl Shell {
                 .child(slider(f32::from(percent) / f32::from(protocol::GAIN_MAX), SLIDER, Some(0.5)))
                 .child(canvas(move |at, _, _| bounds.set(Some(at)), |_, _, _, _| {}).absolute().top_0().left_0().size_full());
             let mute_id = user_id.to_owned();
+            let local = model::local_mute_words(muted);
             items = items
                 .child(menu_separator())
                 .child(menu_label("For you"))
@@ -170,7 +187,7 @@ impl Shell {
                         .child(track)
                         .child(div().flex_1().flex().justify_end().type_small().text_color(theme::text_soft()).child(format!("{percent} %"))),
                 )
-                .child(self.plain(menu_item_check("tiny-person-mute-local", muted, "Mute for me", None), cx).on_click(cx.listener(move |this, _, _, cx| {
+                .child(self.plain(menu_item("tiny-person-mute-local", Some(local.icon), local.label, None), cx).on_click(cx.listener(move |this, _, _, cx| {
                     let (percent, muted) = this.tiny_state.gain(&mute_id);
                     this.tiny_set_gain(&mute_id, percent, !muted, true, cx);
                 })));
@@ -179,11 +196,13 @@ impl Shell {
             items = items.child(menu_separator()).child(menu_label("Moderation"));
             if let Some(on) = facts.server_mute {
                 let id = user_id.to_owned();
-                items = items.child(self.plain(menu_item_check("tiny-person-server-mute", on, "Server mute", None), cx).on_click(cx.listener(move |this, _, _, cx| this.tiny_moderate(id.clone(), Some(!on), None, cx))));
+                let words = model::server_mute_words(on);
+                items = items.child(self.plain(menu_item("tiny-person-server-mute", Some(words.icon), words.label, None), cx).on_click(cx.listener(move |this, _, _, cx| this.tiny_moderate(id.clone(), Some(!on), None, cx))));
             }
             if let Some(on) = facts.server_deafen {
                 let id = user_id.to_owned();
-                items = items.child(self.plain(menu_item_check("tiny-person-server-deafen", on, "Server deafen", None), cx).on_click(cx.listener(move |this, _, _, cx| this.tiny_moderate(id.clone(), None, Some(!on), cx))));
+                let words = model::server_deafen_words(on);
+                items = items.child(self.plain(menu_item("tiny-person-server-deafen", Some(words.icon), words.label, None), cx).on_click(cx.listener(move |this, _, _, cx| this.tiny_moderate(id.clone(), None, Some(!on), cx))));
             }
             if !facts.move_to.is_empty() {
                 items = items.child(self.more("tiny-person-move", "icons/arrow-right-left.svg", "Move to", Sub::Move, cx));
@@ -196,7 +215,14 @@ impl Shell {
                 })));
             }
             if facts.timeout {
-                items = items.child(self.more("tiny-person-timeout", "icons/timer.svg", if facts.timed_out { "Timed out" } else { "Timeout" }, Sub::Timeout, cx));
+                if facts.timed_out {
+                    let id = user_id.to_owned();
+                    items = items.child(self.plain(menu_item("tiny-person-timeout-end", Some("icons/x.svg"), "Remove timeout", None), cx).on_click(cx.listener(move |this, _, _, cx| {
+                        this.tiny_close_float(cx);
+                        this.tiny_timeout(id.clone(), None, cx);
+                    })));
+                }
+                items = items.child(self.more("tiny-person-timeout", "icons/timer.svg", "Timeout", Sub::Timeout, cx));
             }
         }
         if facts.manages() {
@@ -214,7 +240,15 @@ impl Shell {
             }
         }
         let copy = user_id.to_owned();
-        items.child(menu_separator()).child(self.plain(menu_item("tiny-person-copy", Some("icons/copy.svg"), "Copy user ID", None), cx).on_click(cx.listener(move |this, _, _, cx| {
+        let copy_name = (name != "Someone").then(|| name.clone());
+        items = items.child(menu_separator());
+        if let Some(copy_name) = copy_name {
+            items = items.child(self.plain(menu_item("tiny-person-copy-name", Some("icons/copy.svg"), "Copy name", None), cx).on_click(cx.listener(move |this, _, _, cx| {
+                this.tiny_close_float(cx);
+                this.tiny_copy(copy_name.clone(), "Name copied", cx);
+            })));
+        }
+        items.child(self.plain(menu_item("tiny-person-copy", Some("icons/copy.svg"), "Copy user ID", None), cx).on_click(cx.listener(move |this, _, _, cx| {
             this.tiny_close_float(cx);
             this.tiny_copy(copy.clone(), "User ID copied", cx);
         })))
@@ -240,18 +274,18 @@ impl Shell {
                 }
             }
             Sub::Timeout => {
-                for (ix, (words, secs)) in model::TIMEOUTS.iter().enumerate() {
-                    let (user, secs) = (user_id.to_owned(), *secs);
-                    items = items.child(menu_item(("tiny-timeout", ix), Some(NO_GLYPH), *words, None).on_click(cx.listener(move |this, _, _, cx| {
-                        this.tiny_close_float(cx);
-                        this.tiny_timeout(user.clone(), Some(secs), cx);
-                    })));
-                }
                 if facts.timed_out {
                     let user = user_id.to_owned();
-                    items = items.child(menu_separator()).child(menu_item("tiny-timeout-end", Some("icons/x.svg"), "Remove timeout", None).on_click(cx.listener(move |this, _, _, cx| {
+                    items = items.child(menu_item("tiny-timeout-end-sub", Some("icons/x.svg"), "Remove timeout", None).on_click(cx.listener(move |this, _, _, cx| {
                         this.tiny_close_float(cx);
                         this.tiny_timeout(user.clone(), None, cx);
+                    }))).child(menu_separator());
+                }
+                for (ix, (words, secs)) in model::TIMEOUTS.iter().enumerate() {
+                    let (user, secs) = (user_id.to_owned(), *secs);
+                    items = items.child(menu_item(("tiny-timeout", ix), Some("icons/timer.svg"), *words, None).on_click(cx.listener(move |this, _, _, cx| {
+                        this.tiny_close_float(cx);
+                        this.tiny_timeout(user.clone(), Some(secs), cx);
                     })));
                 }
             }

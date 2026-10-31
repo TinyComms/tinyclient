@@ -147,6 +147,9 @@ pub struct State {
     /// The action whose buttons stay quiet until a read started after it returns. Any such read
     /// will do: a live update's read can overtake the action's own and drop its answer.
     clears_busy: Option<u64>,
+    /// A mute, deafen, or role was drawn on the page before the server confirmed it. A refusal
+    /// reads the page again so the draw does not stick.
+    drawn_ahead: bool,
     /// A join or leave is with the server. It has its own quiet.
     call_busy: bool,
     call_epoch: u64,
@@ -241,6 +244,7 @@ impl State {
             error: None,
             busy: false,
             clears_busy: None,
+            drawn_ahead: false,
             call_busy: false,
             call_epoch: 0,
             call_error: None,
@@ -281,6 +285,7 @@ impl State {
         self.error = None;
         self.channel = None;
         self.call_error = None;
+        self.drawn_ahead = false;
         self.float = None;
         self.sub = None;
         self.modal = None;
@@ -603,6 +608,7 @@ impl Shell {
         if self.tiny_state.action_epoch != epoch {
             return;
         }
+        let ahead = std::mem::take(&mut self.tiny_state.drawn_ahead);
         if self.tiny_state.account.as_ref() != Some(&account) {
             self.tiny_state.busy = false;
             cx.notify();
@@ -649,6 +655,13 @@ impl Shell {
                 self.tiny_state.modal_error = Some(detail);
             } else if !saving {
                 self.toast(Some(("icons/circle-alert.svg", super::theme::danger())), detail, cx);
+            }
+            // The click was drawn at once. The server said no, so the page is read again and the
+            // draw goes back to what the server still has.
+            if ahead {
+                if let Some(account) = self.tiny_state.account.clone() {
+                    self.fetch(account, None, cx);
+                }
             }
         }
         cx.notify();
@@ -1006,12 +1019,23 @@ impl Shell {
     // What the menus and modals send.
 
     pub(super) fn tiny_moderate(&mut self, user_id: String, muted: Option<bool>, deafened: Option<bool>, cx: &mut Context<Self>) {
+        if self.tiny_state.busy {
+            return;
+        }
         let Some(account) = self.with_account() else {
             return;
         };
         let Some(room_id) = self.tiny_state.community.as_ref().and_then(|community| model::seat_of(community, &user_id)).map(|(room, _)| room.id.clone()) else {
             return;
         };
+        let patched = self.tiny_state.community.as_mut().and_then(|community| {
+            let seat = community.rooms.iter_mut().find_map(|room| room.participants.iter_mut().find(|seat| seat.user_id == user_id))?;
+            model::draw_moderation(seat, muted, deafened);
+            Some(())
+        });
+        if patched.is_some() {
+            self.tiny_state.drawn_ahead = true;
+        }
         self.act(Request::TinyCallModerate { account, room_id, user_id, server_muted: muted, server_deafened: deafened }, cx);
     }
 
@@ -1043,18 +1067,20 @@ impl Shell {
     }
 
     pub(super) fn tiny_toggle_role(&mut self, user_id: String, role_id: String, cx: &mut Context<Self>) {
+        if self.tiny_state.busy {
+            return;
+        }
         let Some(account) = self.with_account() else {
             return;
         };
-        let Some(member) = self.tiny_state.community.as_ref().and_then(|community| community.member(&user_id)) else {
+        let Some(role_ids) = self.tiny_state.community.as_mut().and_then(|community| {
+            let member = community.members.iter_mut().find(|member| member.user_id == user_id)?;
+            model::draw_role(&mut member.roles, &role_id);
+            Some(member.roles.clone())
+        }) else {
             return;
         };
-        let mut role_ids = member.roles.clone();
-        if let Some(at) = role_ids.iter().position(|id| *id == role_id) {
-            role_ids.remove(at);
-        } else {
-            role_ids.push(role_id);
-        }
+        self.tiny_state.drawn_ahead = true;
         self.act(Request::TinyMemberRoles { account, user_id, role_ids }, cx);
     }
 
