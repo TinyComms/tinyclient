@@ -1,7 +1,7 @@
 use chatd::server::{serve, Chat};
 use chatd::store::Store;
 use protocol::{chat_sock_path, support_dir, ChatListener};
-use std::io;
+use std::io::{self, Write};
 
 fn main() -> io::Result<()> {
     // Before the support directory is touched: the packages' smoke tests run it on a bare system.
@@ -18,7 +18,10 @@ fn main() -> io::Result<()> {
     // Held until the process exits.
     let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join("chatd.lock"))?;
     if let Err(err) = lock.try_lock() {
+        // The operator file gets the path. Stderr always gets the short line: this process
+        // is about to exit, and the launcher reads stderr even when it is not a terminal.
         tracing::warn!("chatd: another chatd is already running for {} ({err})", dir.display());
+        let _ = writeln!(io::stderr(), "chatd: another chatd is already running");
         return Ok(());
     }
     let mut store = Store::open(&dir.join("chat.sqlite")).map_err(io::Error::other)?;
