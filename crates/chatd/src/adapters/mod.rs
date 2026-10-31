@@ -25,6 +25,7 @@ pub(crate) mod slack;
 pub(crate) mod teams;
 pub mod telegram;
 pub mod tiny;
+pub mod tiny_bots;
 
 use crate::hub::{lock, now, Hub};
 use crate::session;

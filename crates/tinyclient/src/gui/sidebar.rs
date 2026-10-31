@@ -369,6 +369,28 @@ impl Shell {
         self.set_mode(mode, cx);
     }
 
+    /// Show this conversation in its network home and scroll to the row. Slack stays on the
+    /// workspace home: Space mode drops the Threads row and the All / Unread segments.
+    pub(super) fn reveal_in_sidebar(&mut self, conversation: &Conversation, cx: &mut Context<Self>) {
+        if conversation.key.network == Network::Slack {
+            if let Some(id) = conversation.space.clone() {
+                self.sidebar_state.slack = Some(Key { id, ..conversation.key.clone() });
+            }
+            if matches!(self.sidebar_state.mode, Mode::Network(Network::Slack)) {
+                self.show_mode(cx);
+            } else {
+                self.go(Mode::Network(Network::Slack), cx);
+            }
+        } else if let Some(id) = conversation.space.clone() {
+            self.go(Mode::Space(Key { id, ..conversation.key.clone() }), cx);
+        }
+        let key = conversation.key.clone();
+        if let Some(ix) = self.sidebar_state.rows.iter().position(|row| row.conversation().is_some_and(|c| c.key == key)) {
+            self.sidebar_state.cursor = Some(ix);
+            self.scroll_to(ix);
+        }
+    }
+
     fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
         let state = &mut self.sidebar_state;
         if state.mode == Mode::Inbox && state.hold.release() {
@@ -1181,9 +1203,13 @@ impl Shell {
                 let words = if count > 99 { "99+".to_owned() } else { count.to_string() };
                 div().ml(px(5.)).text_size(px(11.)).font_weight(theme::MEDIUM).text_color(if on { theme::text() } else { theme::text_faint() }).child(words)
             });
+            let mention_tip = (label == "Mentions" && count > 0).then(|| {
+                if count == 1 { "1 conversation mentions you".to_owned() } else { format!("{count} conversations mention you") }
+            });
             out = out.child(
                 segment(id, label, on)
                     .children(counted)
+                    .when_some(mention_tip, |segment, words| segment.tooltip(tip(words, None)))
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(move |this, _, _, cx| pick(this, ix, cx))),
             );
@@ -1405,11 +1431,10 @@ impl Shell {
                         this.sidebar_state.slack_menu = false;
                         this.show_mode(cx);
                     }))
-                    .child(Avatar::new(&space.key, &space.name, 20.).shape(Shape::Place).build())
+                    .child(Avatar::new(&space.key, &space.name, 20.).shape(Shape::Place).image_at(self.media_path(&space.key, space.icon.as_ref())).build())
                     .child(div().flex_1().min_w_0().truncate().type_ui().text_color(theme::text()).child(space.name.clone()))
                     .children(words.map(|words| div().type_small().text_color(theme::text_soft()).child(words)))
-                    .children(rollup_badge(space.attention, space.unread))
-                    .child(div().type_small().text_color(theme::text_soft()).child(crate::gui::shortcuts::label(&format!("⌃{}", ix + 1))));
+                    .children(rollup_badge(space.attention, space.unread));
                 menu = menu.child(row);
             }
             menu = menu.child(super::components::menu_separator());
@@ -1522,6 +1547,8 @@ impl Shell {
     pub(super) fn sidebar(&self, snapshot: &Snapshot, width: f32, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let people = self.sidebar_state.mode == Mode::People;
         let tiny = matches!(self.sidebar_state.mode, Mode::Network(Network::Tiny));
+        // Messages has no StartDirect, so the compose button would open a switcher that cannot start a text.
+        let messages = matches!(self.sidebar_state.mode, Mode::Network(Network::Messages));
         if !matches!(&self.sidebar_state.mode, Mode::Space(space) if space.network == Network::Discord) {
             self.sidebar_state.width.set(width);
         }
@@ -1544,7 +1571,7 @@ impl Shell {
             .border_r_1()
             .border_color(theme::hairline())
             .child(self.title_strip(&self.sidebar_state.mode, cx))
-            .when(!people && !tiny, |sidebar| sidebar.child(self.jump_strip(cx)))
+            .when(!people && !tiny && !messages, |sidebar| sidebar.child(self.jump_strip(cx)))
             .children(tabs)
             .when(!banners.is_empty(), |sidebar| sidebar.child(div().flex_none().px(px(theme::INSET)).pb(px(8.)).flex().flex_col().gap(px(4.)).children(banners)))
             .child(div().id("sidebar-list").flex_1().min_h_0().track_focus(&self.sidebar_state.focus).key_context("Sidebar").child(body))

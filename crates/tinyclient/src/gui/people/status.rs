@@ -44,7 +44,8 @@ fn own_keys(scene: &Scene) -> Vec<Key> {
 /// other; Slack has two.
 pub fn states(network: Network) -> &'static [Presence] {
     match network {
-        Network::Discord | Network::Teams => &[Presence::Online, Presence::Idle, Presence::Dnd, Presence::Offline],
+        Network::Discord => &[Presence::Online, Presence::Idle, Presence::Dnd, Presence::Offline],
+        Network::Teams => &[Presence::Online, Presence::Idle, Presence::Busy, Presence::Dnd, Presence::Offline],
         Network::Slack => &[Presence::Online, Presence::Idle],
         // Signal shows no presence at all.
         Network::Telegram | Network::Signal | Network::Messages | Network::Tiny => &[],
@@ -272,7 +273,7 @@ impl StatusMenu {
                     .children(clear),
             )
             .when(unsent, |status| {
-                status.child(div().type_small().text_color(theme::text_faint()).child("Return sets it."))
+                status.child(div().type_small().text_color(theme::text_faint()).child(crate::gui::shortcuts::label("Return sets it.")))
             }),
         )
     }

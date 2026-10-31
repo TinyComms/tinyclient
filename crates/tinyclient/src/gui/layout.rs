@@ -653,6 +653,17 @@ impl Shell {
         let strip_left = RAIL_WIDTH + if matches!(open, Menu::Space(_)) { overview } else { 0. };
         let strip_width = if overview > 0. && matches!(open, Menu::Network(_)) { overview } else { sidebar };
         let strip_button = place::anchor(strip_left + strip_width - 12. - 28., 12., 28., 28.);
+        // Discord, a multi-server Tiny title, and a server name are the buttons on the left.
+        // The 28-point box at the strip's right is the ellipsis, and it sits under Unread.
+        let named = match open {
+            Menu::Network(Network::Discord) => true,
+            Menu::Network(Network::Tiny) => snapshot.accounts_of(Network::Tiny) > 1,
+            Menu::Space(_) => true,
+            _ => false,
+        };
+        let title_width = (strip_width * 0.55).clamp(140., 260.);
+        let title_anchor = place::anchor(strip_left + 8., 6., title_width, 32.);
+        let menu_anchor = if named { title_anchor } else { strip_button };
         let placed: AnyElement = match open {
             Menu::Add => {
                 let content = fade_in("menu-add", 120, self.add_menu(snapshot, cx));
@@ -701,7 +712,7 @@ impl Shell {
                             this.sign_in(Network::Tiny, cx);
                         })));
                 }
-                placed("menu-network-at", Place::Below(strip_button), Layer::Menu, window, fade_in("menu-network", 120, items))
+                placed("menu-network-at", Place::Below(menu_anchor), Layer::Menu, window, fade_in("menu-network", 120, items))
             }
             // CONTRACT: of the Space menu in `02-layout-navigation.md` only pinning has a
             // request behind it. Nothing marks a whole Space read or mutes it, and a Space
@@ -723,12 +734,13 @@ impl Shell {
                                 this.pin(key.clone(), !pinned, cx);
                             })),
                     );
-                placed("menu-space-at", Place::Below(strip_button), Layer::Menu, window, fade_in("menu-space", 120, items))
+                placed("menu-space-at", Place::Below(menu_anchor), Layer::Menu, window, fade_in("menu-space", 120, items))
             }
             Menu::Row(conversation, position) => {
                 let (key, starred) = (conversation.key.clone(), conversation.starred);
                 let unpinned = conversation.clone();
                 let join = conversation.clone();
+                let shown = conversation.clone();
                 let space = conversation.space.as_ref().map(|space| Key { id: space.clone(), ..conversation.key.clone() });
                 let ours = self
                     .snapshot
@@ -755,11 +767,11 @@ impl Shell {
                                 this.star(key.clone(), !starred, cx);
                             })),
                     )
-                    .children(space.map(|space| {
+                    .children(space.map(|_space| {
                         menu_item("reveal", Some("icons/corner-down-right.svg"), "Show in sidebar", None).on_click(
                             cx.listener(move |this, _, _, cx| {
                                 this.close_menu(cx);
-                                this.go(super::sidebar::Mode::Space(space.clone()), cx);
+                                this.reveal_in_sidebar(&shown, cx);
                             }),
                         )
                     }))
@@ -908,6 +920,10 @@ impl Render for Shell {
                     }
                 }),
             );
+        if let Some(account) = super::signin::take_open_existing(cx) {
+            self.go(super::sidebar::Mode::Network(protocol::Network::Tiny), cx);
+            self.prefer_tiny(account, cx);
+        }
         let root = root.children(super::signin::layer(window, cx));
         #[cfg(feature = "gui-shot")]
         if self.sheet {

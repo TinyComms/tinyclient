@@ -1065,22 +1065,28 @@ impl Shell {
                 )
             }
             // Never says "Call": it is a different object, and it starts nothing here.
-            CallSupport::Handoff => Some(
-                pill.border_color(theme::border())
+            // A Slack huddle stays an icon until something in the model says one is live.
+            CallSupport::Handoff => {
+                let quiet = network == Network::Slack;
+                let hint = if quiet {
+                    "Open huddle in Slack".to_owned()
+                } else {
+                    format!("{0} calls open in the {0} app. tinyclient doesn't carry them.", network.label())
+                };
+                let mut pill = pill
+                    .border_color(theme::border())
                     .text_color(theme::text_soft())
                     .hover(|style| style.bg(theme::hover()).text_color(theme::text()))
-                    .tooltip(tip(
-                        format!(
-                            "{0} calls open in the {0} app. tinyclient doesn't carry them.",
-                            network.label()
-                        ),
-                        None,
-                    ))
+                    .tooltip(tip(hint, None))
                     .on_click(cx.listener(move |this, _, _, cx| this.call_handoff(key.clone(), cx)))
-                    .child(network_icon(network, 14.))
-                    .child(handoff_label(network))
-                    .child(icon("icons/arrow-up-right.svg", 12., theme::text_faint(), None)),
-            ),
+                    .child(network_icon(network, 14.));
+                if quiet {
+                    pill = pill.px(px(7.)).size(px(28.)).rounded(px(theme::R_CONTROL)).justify_center();
+                } else {
+                    pill = pill.child(handoff_label(network)).child(icon("icons/arrow-up-right.svg", 12., theme::text_faint(), None));
+                }
+                Some(pill)
+            }
         }
     }
 }

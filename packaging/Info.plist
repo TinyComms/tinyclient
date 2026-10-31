@@ -4,6 +4,8 @@
 <dict>
 	<key>CFBundleIdentifier</key>
 	<string>dev.tinyclient.app</string>
+	<key>CFBundleURLTypes</key>
+	<array><dict><key>CFBundleURLName</key><string>dev.tinyclient.app.invite</string><key>CFBundleURLSchemes</key><array><string>tinyclient</string></array></dict></array>
 	<key>CFBundleName</key>
 	<string>tinyclient</string>
 	<key>CFBundleDisplayName</key>

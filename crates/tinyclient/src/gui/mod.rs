@@ -624,7 +624,7 @@ fn window_bounds(saved: Option<(f32, f32, f32, f32)>, cx: &App) -> Bounds<gpui::
     bounds
 }
 
-pub fn run() {
+pub fn run(invite: Option<String>, incoming: Option<std::sync::mpsc::Receiver<String>>) {
     #[cfg(feature = "gui-shot")]
     LAUNCHED.get_or_init(std::time::Instant::now);
     app::crash::install();
@@ -637,6 +637,18 @@ pub fn run() {
     app::prefs::set_choices(prefs.choices);
     anim::set_autoplay(prefs.autoplay);
     let application = gpui_platform::application().with_assets(assets::Assets);
+    // macOS delivers both launch and subsequent links as open-URL events. Keep them in
+    // memory until the current sign-in sheet closes; never discard an active flow.
+    let links = std::rc::Rc::new(std::cell::RefCell::new(std::collections::VecDeque::<String>::new()));
+    let received = links.clone();
+    application.on_open_urls(move |urls| {
+        for url in urls {
+            if url.starts_with("tinyclient://join#") && protocol::parse_invite_link(&url).is_some() {
+                let mut queue = received.borrow_mut();
+                if queue.len() < 8 && !queue.contains(&url) { queue.push_back(url); }
+            }
+        }
+    });
     // The Dock icon brings the hidden window back unchanged.
     application.on_reopen(|cx| cx.activate(true));
     application.run(move |cx: &mut App| {
@@ -684,6 +696,28 @@ pub fn run() {
                     return;
                 }
             };
+            if let Some(invite) = invite {
+                links.borrow_mut().push_back(invite);
+            }
+            cx.spawn(async move |cx| {
+                loop {
+                    cx.background_executor().timer(std::time::Duration::from_millis(500)).await;
+                    if let Some(incoming) = incoming.as_ref() {
+                        while links.borrow().len() < 8 {
+                            let Ok(link) = incoming.try_recv() else { break; };
+                            let mut queue = links.borrow_mut();
+                            if !queue.contains(&link) { queue.push_back(link); }
+                        }
+                    }
+                    let next = links.borrow().front().cloned();
+                    if let Some(next) = next {
+                        if cx.update(|cx| signin::open_invite(&next, cx)) {
+                            links.borrow_mut().pop_front();
+                            cx.update(|cx| { cx.refresh_windows(); cx.activate(true); });
+                        }
+                    }
+                }
+            }).detach();
             #[cfg(feature = "gui-shot")]
             shot::shot(window, cx);
             #[cfg(feature = "gui-shot")]

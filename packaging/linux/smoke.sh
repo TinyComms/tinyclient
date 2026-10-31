@@ -75,7 +75,7 @@ deb|deb-full)
             tar -xzf /tmp/tinyclient.tar.gz
             tinyclient/install.sh
             test \"\$(~/.local/bin/tinyclient --version)\" = 'tinyclient $VERSION'
-            grep -q '^Exec=/home/tester/.local/lib/tinyclient/tinyclient$' ~/.local/share/applications/$id.desktop
+            grep -q '^Exec=/home/tester/.local/lib/tinyclient/tinyclient %u$' ~/.local/share/applications/$id.desktop
             desktop-file-validate ~/.local/share/applications/$id.desktop
             test -f ~/.local/share/icons/hicolor/16x16/apps/$id.png
             ~/.local/lib/tinyclient/install.sh --uninstall

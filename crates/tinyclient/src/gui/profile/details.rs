@@ -52,17 +52,21 @@ fn sound_row(row: &Conversation, cx: &mut Context<InfoPane>) -> Div {
 
 /// Notifications' segmented choice for a channel.
 fn notify_segments(pane: &InfoPane, row: &Conversation, cx: &mut Context<InfoPane>) -> Div {
-    let now = pane.notify_shown(row);
+    let shown = pane.notify_shown(row);
+    // Teams stores anything other than All as muted, so Mentions would silence the channel.
+    let teams = row.key.network == Network::Teams;
+    let now = if teams && shown == Notify::Mentions { Notify::Nothing } else { shown };
     let choice = |ix: usize, words: &'static str, notify: Notify, cx: &mut Context<InfoPane>| {
         let key = row.key.clone();
         segment(("details-notify", ix), words, now == notify)
             .px(px(8.))
             .on_click(cx.listener(move |pane, _, _, cx| pane.notify_to(key.clone(), notify, cx)))
     };
-    segmented()
-        .child(choice(0, "All", Notify::All, cx))
-        .child(choice(1, "Mentions", Notify::Mentions, cx))
-        .child(choice(2, "Nothing", Notify::Nothing, cx))
+    let mut choices = segmented().child(choice(0, "All", Notify::All, cx));
+    if !teams {
+        choices = choices.child(choice(1, "Mentions", Notify::Mentions, cx));
+    }
+    choices.child(choice(2, "Nothing", Notify::Nothing, cx))
 }
 
 fn head_picture(pane: &InfoPane, row: &Conversation, cx: &mut Context<InfoPane>) -> Div {
@@ -154,6 +158,7 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
                 }))
                 .into_any_element(),
             NotifyControl::Segmented => notify_segments(pane, row, cx).into_any_element(),
+            NotifyControl::Held(words) => div().type_small().text_color(theme::text_soft()).child(words).into_any_element(),
         })
         .mt(px(12.)),
     );

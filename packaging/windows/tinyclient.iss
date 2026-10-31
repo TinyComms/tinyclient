@@ -79,6 +79,11 @@ Name: "{autodesktop}\tinyclient"; Filename: "{app}\tinyclient.exe"; IconFilename
 Root: HKA; Subkey: "Software\Classes\AppUserModelId\dev.tinyclient.app"; ValueType: string; ValueName: "DisplayName"; ValueData: "tinyclient"; Flags: uninsdeletekey
 Root: HKA; Subkey: "Software\Classes\AppUserModelId\dev.tinyclient.app"; ValueType: string; ValueName: "IconUri"; ValueData: "{app}\tinyclient.ico"
 
+[Registry]
+Root: HKA; Subkey: "Software\Classes\tinyclient"; ValueType: string; ValueName: ""; ValueData: "URL:tinyclient invitation"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\tinyclient"; ValueType: string; ValueName: "URL Protocol"; ValueData: ""
+Root: HKA; Subkey: "Software\Classes\tinyclient\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\tinyclient.exe"" ""%1"""
+
 [Run]
 Filename: "{app}\tinyclient.exe"; Description: "{cm:LaunchProgram,tinyclient}"; Flags: nowait postinstall skipifsilent
 

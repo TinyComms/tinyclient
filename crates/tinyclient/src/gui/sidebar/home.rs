@@ -42,6 +42,8 @@ pub enum Act {
     Archive,
     Meetings,
     MoreChats,
+    /// Show or hide a team's opted-out channels. The id is the team's.
+    Hidden(String),
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -115,6 +117,8 @@ pub struct Home {
     pub chats_all: bool,
     pub meetings_open: bool,
     pub opened: HashSet<String>,
+    /// Teams whose hidden channels are listed, by team id.
+    pub hidden_shown: HashSet<String>,
 }
 
 impl Home {
@@ -342,8 +346,20 @@ pub fn teams(home: &Home, spaces: &[Space], channels: &dyn Fn(&Key) -> Vec<Rc<Co
             let opened = home.opened.contains(&team.key.id);
             out.push(Item::Space { index, child: None, open: Some(opened) });
             let listed = channels(&team.key);
-            let shown = listed.into_iter().filter(|c| opened || c.badge() != Badge::None || open == Some(&c.key));
-            out.extend(shown.map(Item::Channel));
+            let hidden = listed.iter().filter(|c| c.opted_out).count();
+            let show_hidden = home.hidden_shown.contains(&team.key.id);
+            let shown = listed.iter().filter(|c| {
+                if c.opted_out {
+                    show_hidden && opened
+                } else {
+                    opened || c.badge() != Badge::None || open == Some(&c.key)
+                }
+            });
+            out.extend(shown.map(|c| Item::Channel(Rc::clone(c))));
+            if opened && hidden > 0 {
+                let words = if show_hidden { "Hide hidden channels".to_owned() } else { format!("Show hidden ({hidden})") };
+                out.push(Item::Action { act: Act::Hidden(team.key.id.clone()), icon: "icons/chevron-down.svg", words, after: String::new(), dot: None });
+            }
         }
     }
     out

@@ -1797,6 +1797,33 @@ impl Store {
         Ok(outcome)
     }
 
+    /// The newest stored message as a list line. Does not mark the conversation opened.
+    pub fn newest_line(&self, conversation: &Key) -> rusqlite::Result<Option<PreviewLine>> {
+        let message = self
+            .db
+            .query_row(
+                &format!(
+                    "SELECT id, text, body FROM message
+                      WHERE network = ?1 AND account = ?2 AND conversation = ?3 AND pending = 0
+                      {NEWEST_FIRST} LIMIT 1"
+                ),
+                params![word(&conversation.network), conversation.account, conversation.id],
+                message_from,
+            )
+            .optional()?;
+        Ok(message.map(|message| {
+            let text = preview_of(&message);
+            let mine = message.outgoing;
+            PreviewLine {
+                id: message.id,
+                text,
+                sender: if mine { String::new() } else { message.sender.name },
+                mine,
+                sent: message.sent,
+            }
+        }))
+    }
+
     pub fn message(&self, conversation: &Key, id: &str) -> rusqlite::Result<Option<Message>> {
         self.db
             .query_row(

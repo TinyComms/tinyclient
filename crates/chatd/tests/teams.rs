@@ -757,7 +757,8 @@ fn one_sign_in_is_a_tenant_each_with_teams_channels_chats_and_their_unread_state
         ]
     );
     assert!(rows.iter().all(|row| row.space.is_none()), "a chat is in no Space");
-    assert_eq!((rows[0].peer.as_deref(), rows[0].unread, rows[0].badge()), (Some(ANA), 1, Badge::Count(1)));
+    // Teams supplies a boolean unread flag; only mentions support a numeric badge.
+    assert_eq!((rows[0].peer.as_deref(), rows[0].unread, rows[0].badge()), (Some(ANA), 1, Badge::Dot));
     assert_eq!(rows[0].avatar.as_ref().map(|avatar| (avatar.kind, avatar.width)), Some((MediaKind::Avatar, 64)));
     assert_eq!((rows[0].preview.as_str(), rows[0].preview_from.as_str(), rows[0].preview_mine), ("Can you look at the deploy?", "Ana Ruiz", false));
     assert!(rows[2].muted && rows[2].unread == 0, "muted by me, and what I said last is not unread");

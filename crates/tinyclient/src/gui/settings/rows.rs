@@ -175,6 +175,7 @@ pub fn search(query: &str) -> Vec<&'static Row> {
 /// badge or flash here.
 pub fn absent(id: &str) -> bool {
     match id {
+        "G2" => !cfg!(target_os = "macos"),
         "SV" | "NL" => cfg!(target_os = "macos"),
         "N10" | "N11" => !cfg!(any(windows, target_os = "macos")),
         _ => false,
@@ -279,6 +280,18 @@ pub const SHORTCUTS: &[Shortcut] = &[
 /// Windows, so these keys are bound and listed on macOS only (`menubar::bind_keys`).
 const MAC_ONLY: &[&str] = &["Hide tinyclient", "Hide Others"];
 
+/// A rail place after Inbox and People, with the digit key the View menu gives it.
+pub struct PlaceKey {
+    pub command: String,
+    pub keys: &'static str,
+}
+
+const PLACE_KEYS: [&str; 7] = ["⌘3", "⌘4", "⌘5", "⌘6", "⌘7", "⌘8", "⌘9"];
+
+pub fn place_keys(names: &[String]) -> Vec<PlaceKey> {
+    names.iter().take(PLACE_KEYS.len()).enumerate().map(|(ix, name)| PlaceKey { command: name.clone(), keys: PLACE_KEYS[ix] }).collect()
+}
+
 pub fn shortcuts(query: &str) -> Vec<&'static Shortcut> {
     let query = fold(query.trim());
     SHORTCUTS
@@ -371,6 +384,19 @@ mod tests {
     }
 
     #[test]
+    fn rail_places_after_inbox_and_people_keep_their_digit() {
+        let rows = place_keys(&["Discord".into(), "Slack".into()]);
+        assert_eq!((rows[0].command.as_str(), rows[0].keys), ("Discord", "⌘3"));
+        assert_eq!((rows[1].command.as_str(), rows[1].keys), ("Slack", "⌘4"));
+        assert!(search("dnd").iter().any(|row| row.id == "N7"));
+    }
+
+    #[test]
+    fn keep_receiving_is_listed_only_where_closing_the_window_can_hide_the_app() {
+        assert_eq!(search("keep receiving").iter().any(|row| row.id == "G2"), cfg!(target_os = "macos"));
+    }
+
+    #[test]
     fn every_shortcut_names_a_menu_item_that_exists_and_every_keyed_item_is_listed() {
         use crate::gui::app::menubar::menus;
         use gpui::MenuItem;
@@ -383,7 +409,7 @@ mod tests {
             }
         }
         let bar = menus(&[], None, "Check for Updates…");
-        for shortcut in SHORTCUTS.iter().filter(|s| s.menu != "Calls") {
+        for shortcut in SHORTCUTS.iter().filter(|s| s.menu != "Calls" && (cfg!(target_os = "macos") || !MAC_ONLY.contains(&s.command))) {
             let menu = bar.iter().find(|menu| menu.name.as_ref() == shortcut.menu).unwrap_or_else(|| panic!("no {} menu", shortcut.menu));
             let found = menu.items.iter().any(|item| names(item).any(|name| name == shortcut.command));
             assert!(found, "{} is not in {}", shortcut.command, shortcut.menu);

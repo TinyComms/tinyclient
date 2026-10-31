@@ -40,6 +40,11 @@ fn native_label(source: &str, mac: bool) -> String {
             if modifiers.contains(&'⇧') {
                 out.push_str("Shift+");
             }
+            // `⌘+` is the plus key. Leaving `+` in place prints `Ctrl++`.
+            if chars.peek() == Some(&'+') {
+                chars.next();
+                out.push_str("Plus");
+            }
             if chars.peek().is_none() && out.ends_with('+') {
                 out.pop();
             }
@@ -56,7 +61,7 @@ fn native_label(source: &str, mac: bool) -> String {
             }
         }
     }
-    out.replace("Return", "Enter")
+    out.replace("UpDown", "Up Down").replace("Return", "Enter")
 }
 
 #[cfg(test)]
@@ -74,7 +79,13 @@ mod tests {
             ("⌥↑", "Alt+Up"),
             ("⌥", "Alt"),
             ("⌘Return", "Ctrl+Enter"),
+            ("↑↓", "Up Down"),
             ("⌘K jumps anywhere.", "Ctrl+K jumps anywhere."),
+            ("⌘+", "Ctrl+Plus"),
+            ("⌘+, ⌘− and ⌘0.", "Ctrl+Plus, Ctrl+- and Ctrl+0."),
+            ("⇧Return adds a line.", "Shift+Enter adds a line."),
+            ("Return adds a line.", "Enter adds a line."),
+            ("Return sets it.", "Enter sets it."),
         ] {
             assert_eq!(native_label(mac, false), native);
             assert_eq!(native_label(mac, true), mac);
