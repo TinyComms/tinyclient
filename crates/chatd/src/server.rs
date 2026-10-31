@@ -1414,6 +1414,7 @@ impl Chat {
         }
         let helper = login_path().and_then(|path| {
             let mut helper = std::process::Command::new(path);
+            protocol::log_policy::share_session(&mut helper);
             protocol::launch::no_console(&mut helper).arg(network.label().to_lowercase());
             if let Some((x, y)) = at {
                 helper.args(["--at", &format!("{x},{y}")]);
@@ -2124,10 +2125,15 @@ impl Chat {
             }
             Request::SaveLogs => {
                 let mut paths = Vec::new();
-                if let Some(guard) = protocol::log_policy::current() {
-                    if let Ok(Some(path)) = guard.export_bundle() {
-                        paths.push(path.display().to_string());
-                    }
+                let Some(guard) = protocol::log_policy::current() else {
+                    return Response::LogsSaved { paths };
+                };
+                let policy = guard.policy();
+                if !policy.export_enabled() || !policy.ring_enabled() {
+                    return Response::LogsSaved { paths };
+                }
+                if let Ok(Some(path)) = guard.export_bundle() {
+                    paths.push(path.display().to_string());
                 }
                 if let Ok(protocol::MediaResponse::LogsSaved { path }) = self.hub.calls.request(&self.hub, &protocol::MediaRequest::SaveLogs) {
                     if !path.is_empty() {

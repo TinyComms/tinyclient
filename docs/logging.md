@@ -12,7 +12,7 @@ Environment, read at process start:
 | `TINYCLIENT_LOG_RING` | `on` | `on` or `off` |
 | `TINYCLIENT_LOG_EXPORT` | `on` | `on` or `off` |
 
-The same three are settings `log_level`, `log_ring`, and `log_export`. A stored value replaces the environment after chatd opens its database. Garbage reads as the default. The subscriber admits our own crates up to `trace` from the start, and the render ceiling is what drops events, so raising the level takes effect for events after that change. `reqwest`, `hyper`, `h2`, `sqlx`, `tower`, and `str0m` stay at `warn` in the subscriber.
+The same three are settings `log_level`, `log_ring`, and `log_export`. A stored row replaces that one environment value after chatd opens its database, and again in the window when settings load. A missing row leaves the environment value. Garbage reads as the default. The subscriber admits our own crates up to `trace` from the start, and the render ceiling is what drops events, so raising the level takes effect for events after that change. `reqwest`, `hyper`, `h2`, `sqlx`, `tower`, and `str0m` stay at `warn` in the subscriber.
 
 `TINYCLIENT_SESSION` is 32 hex characters shared by the window, chatd, and mediad. The window adopts chatd's id from `Status.session` when that field is set.
 
@@ -31,7 +31,7 @@ Under the support directory (`TINYCLIENT_DIR`, otherwise the platform data dir):
 
 The old `chatd.log` at the top of the support directory is not opened, copied, or deleted.
 
-Save debug log in Settings › About writes the window ring and asks chatd, which also asks a live mediad. Export off writes nothing and the window says "Debug logs are turned off." Bundles older than 24 hours are removed on the next save. On Unix the bundle is mode `0600`.
+Save debug log in Settings › About writes the window ring and asks chatd, which also asks a live mediad. Export off writes nothing and the window says "Debug logs are turned off." Bundles older than 24 hours are removed on the next save. On Unix the log directory is mode `0700`, and the operator files and the bundle are mode `0600`.
 
 Stderr gets the same operator line when it is a terminal or `JOURNAL_STREAM` is set. chatd's stderr is otherwise discarded.
 

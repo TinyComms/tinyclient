@@ -298,7 +298,7 @@ impl Call {
             MediaRequest::Loopback { .. } => return MediaResponse::Refused { detail: "A call can't play your microphone back to you.".to_owned() },
             MediaRequest::SaveLogs => {
                 let path = protocol::log_policy::current()
-                    .and_then(|guard| guard.export_bundle().ok().flatten())
+                    .and_then(|guard| guard.export_requested().ok().flatten())
                     .map(|path| path.display().to_string())
                     .unwrap_or_default();
                 return MediaResponse::LogsSaved { path };

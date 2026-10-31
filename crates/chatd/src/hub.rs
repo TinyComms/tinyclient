@@ -174,13 +174,7 @@ fn apply_log_policy(values: &Values) {
     let Some(guard) = protocol::log_policy::current() else {
         return;
     };
-    let ring = if values.on(protocol::settings::LOG_RING) { "on" } else { "off" };
-    let export = if values.on(protocol::settings::LOG_EXPORT) { "on" } else { "off" };
-    guard.apply(protocol::log_policy::LogPolicy::apply_settings(
-        values.word(protocol::settings::GLOBAL, protocol::settings::LOG_LEVEL),
-        ring,
-        export,
-    ));
+    guard.apply(protocol::log_policy::LogPolicy::for_settings(values));
 }
 
 impl Hub {

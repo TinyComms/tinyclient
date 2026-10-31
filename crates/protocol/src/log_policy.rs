@@ -71,7 +71,7 @@ const DEPENDENCIES: &[&str] = &["reqwest", "hyper", "h2", "sqlx", "tower", "str0
 static SESSION: Mutex<Option<&'static str>> = Mutex::new(None);
 static GUARD: OnceLock<&'static LogGuard> = OnceLock::new();
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct LogPolicy {
     operator: Level,
     ring: bool,
@@ -110,6 +110,30 @@ impl LogPolicy {
             policy.export = export;
         }
         policy
+    }
+
+    /// Keeps this policy, then applies only the values that are present and recognised.
+    /// A missing settings row passes `None` and does not replace the environment.
+    pub fn overlay_stored(mut self, level: Option<&str>, ring: Option<&str>, export: Option<&str>) -> Self {
+        if let Some(level) = level.and_then(parse_level) {
+            self.operator = level;
+        }
+        if let Some(ring) = ring.and_then(parse_switch) {
+            self.ring = ring;
+        }
+        if let Some(export) = export.and_then(parse_switch) {
+            self.export = export;
+        }
+        self
+    }
+
+    /// Environment first. A stored `log_level`, `log_ring`, or `log_export` replaces that one knob.
+    pub fn for_settings(values: &crate::settings::Values) -> Self {
+        Self::from_env().overlay_stored(
+            values.stored(crate::settings::GLOBAL, crate::settings::LOG_LEVEL),
+            values.stored(crate::settings::GLOBAL, crate::settings::LOG_RING),
+            values.stored(crate::settings::GLOBAL, crate::settings::LOG_EXPORT),
+        )
     }
 
     /// A stored setting. Empty text and garbage are the defaults.
@@ -272,6 +296,12 @@ pub fn adopt_session(id: &str) {
     *slot = Some(leaked);
 }
 
+/// Puts this process's session on a child. chatd generates the id in memory when nothing
+/// set the variable, so inheritance alone would give mediad and login a different one.
+pub fn share_session(command: &mut std::process::Command) {
+    command.env("TINYCLIENT_SESSION", session_id());
+}
+
 fn load_session() -> String {
     if let Some(env) = env_nonempty("TINYCLIENT_SESSION") {
         if is_session(&env) {
@@ -330,15 +360,41 @@ fn rotate_log(path: &Path) -> io::Result<()> {
 
 /// Appends `bytes`. When the live file is non-empty and this write would pass 2 MiB, the live
 /// file becomes `.1`, the previous `.1` becomes `.2`, and the write starts a new live file.
+fn owner_dir(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+}
+
+fn owner_only(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+}
+
 pub fn append_rolled(path: &Path, bytes: &[u8]) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
+        owner_dir(parent);
     }
     let len = fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
     if len > 0 && len.saturating_add(bytes.len() as u64) > ROLL_BYTES {
         rotate_log(path)?;
     }
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    owner_only(path);
     file.write_all(bytes)?;
     Ok(())
 }
@@ -353,8 +409,10 @@ impl LogFile {
     fn open(path: PathBuf) -> io::Result<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
+            owner_dir(parent);
         }
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        owner_only(&path);
         let len = file.metadata().map(|meta| meta.len()).unwrap_or(0);
         Ok(Self {
             path,
@@ -371,12 +429,14 @@ impl LogFile {
             }
             rotate_log(&self.path)?;
             self.file = Some(OpenOptions::new().create(true).append(true).open(&self.path)?);
+            owner_only(&self.path);
             self.len = 0;
         }
         let file = match self.file.as_mut() {
             Some(file) => file,
             None => {
                 self.file = Some(OpenOptions::new().create(true).append(true).open(&self.path)?);
+                owner_only(&self.path);
                 self.len = 0;
                 match self.file.as_mut() {
                     Some(file) => file,
@@ -423,6 +483,7 @@ pub fn export_lines(dir: &Path, name: &str, lines: &str, enabled: bool) -> io::R
         return Ok(None);
     }
     fs::create_dir_all(dir)?;
+    owner_dir(dir);
     let path = dir.join(name);
     let mut file = OpenOptions::new().create_new(true).write(true).open(&path)?;
     file.write_all(lines.as_bytes())?;
@@ -566,12 +627,29 @@ impl LogGuard {
         *self.policy.lock().unwrap_or_else(|err| err.into_inner()) = policy;
     }
 
+    pub fn policy(&self) -> LogPolicy {
+        self.policy.lock().unwrap_or_else(|err| err.into_inner()).clone()
+    }
+
     /// Writes the ring when export is on. `Ok(None)` writes nothing.
     pub fn export_bundle(&self) -> io::Result<Option<PathBuf>> {
-        let policy = self.policy.lock().unwrap_or_else(|err| err.into_inner()).clone();
+        let policy = self.policy();
         if !policy.export || !policy.ring {
             return Ok(None);
         }
+        self.write_ring()
+    }
+
+    /// Writes the ring because the parent already decided export is on.
+    /// A mediad started with `TINYCLIENT_LOG_EXPORT=off` still saves when chatd asks.
+    pub fn export_requested(&self) -> io::Result<Option<PathBuf>> {
+        if !self.policy().ring {
+            return Ok(None);
+        }
+        self.write_ring()
+    }
+
+    fn write_ring(&self) -> io::Result<Option<PathBuf>> {
         let text = self.ring.lock().unwrap_or_else(|err| err.into_inner()).text();
         let dir = logs_dir().join("bundles");
         let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
@@ -720,6 +798,33 @@ mod tests {
         };
         assert!(render(&trace, Sink::Operator, &reqwest).is_none());
         assert!(render(&trace, Sink::Ring, &ice).is_none());
+    }
+
+    #[test]
+    fn stored_row_overrides_one_knob_and_a_missing_row_keeps_the_env() {
+        let env = LogPolicy::policy_from_values(Some("debug"), Some("off"), Some("off"));
+        let kept = env.overlay_stored(None, None, None);
+        assert_eq!(kept.operator_level(), Level::DEBUG);
+        assert!(!kept.ring_enabled());
+        assert!(!kept.export_enabled());
+        let stored = env.overlay_stored(Some("trace"), Some("on"), Some("on"));
+        assert_eq!(stored.operator_level(), Level::TRACE);
+        assert!(stored.ring_enabled());
+        assert!(stored.export_enabled());
+        let one = env.overlay_stored(None, None, Some("on"));
+        assert_eq!(one.operator_level(), Level::DEBUG);
+        assert!(!one.ring_enabled());
+        assert!(one.export_enabled());
+    }
+
+    #[test]
+    fn share_session_puts_the_id_on_the_child() {
+        let mut command = std::process::Command::new("tinyclient");
+        share_session(&mut command);
+        let found = command.get_envs().any(|(key, value)| {
+            key == "TINYCLIENT_SESSION" && value.is_some_and(|value| value.len() == 32)
+        });
+        assert!(found);
     }
 
     #[test]

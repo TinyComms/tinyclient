@@ -84,7 +84,7 @@ pub fn run() {
                         MediaRequest::Cue { cue } => controls.cue(cue),
                         MediaRequest::SaveLogs => {
                             let path = protocol::log_policy::current()
-                                .and_then(|guard| guard.export_bundle().ok().flatten())
+                                .and_then(|guard| guard.export_requested().ok().flatten())
                                 .map(|path| path.display().to_string())
                                 .unwrap_or_default();
                             out::send(&MediaResponse::LogsSaved { path });

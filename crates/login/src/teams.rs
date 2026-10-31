@@ -280,14 +280,14 @@ fn refuse(error: &str, description: &str) -> ! {
     let recorded = provider_failure(code);
     let class = recorded.split(' ').next().unwrap_or("provider");
     if organization(code) {
-        tracing::warn!(class, code, "login failed");
+        tracing::warn!(network = "teams", class, reason = code, "login failed");
         std::process::exit(super::BLOCKED);
     }
     // Declining the page's own prompt is closing the window by another button.
     if error == "access_denied" && aadsts(description).is_none() {
         std::process::exit(super::CLOSED);
     }
-    tracing::warn!(class, code, "login failed");
+    tracing::warn!(network = "teams", class, reason = code, "login failed");
     std::process::exit(REFUSED);
 }
 

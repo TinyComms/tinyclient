@@ -120,12 +120,13 @@ pub fn run(site: Site, at: Option<(f64, f64)>, network: &str) {
         })
         .with_on_page_load_handler({
             let state = state.clone();
+            let service = network.to_owned();
             move |event, url| {
                 if matches!(event, PageLoadEvent::Started) {
                     state.lock().unwrap().current_url = url.clone();
                 }
                 if matches!(event, PageLoadEvent::Finished) && load_failed_message(&url) {
-                    tracing::warn!(class = "network", "login failed");
+                    tracing::warn!(network = service.as_str(), class = "network", "login failed");
                     std::process::exit(LOAD_FAILED);
                 }
             }

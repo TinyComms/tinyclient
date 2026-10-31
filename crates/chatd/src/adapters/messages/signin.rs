@@ -135,6 +135,7 @@ impl Flow {
             return Err("Sign-in is off while TINYCLIENT_DIR is set.".into());
         }
         let mut command = std::process::Command::new(crate::server::login_path().map_err(|e| e.to_string())?);
+        protocol::log_policy::share_session(&mut command);
         protocol::launch::no_console(&mut command).arg("messages")
             .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::inherit());
         let mut child = command.spawn().map_err(|_| "Could not open the Google sign-in browser. Reinstall tinyclient and try again.")?;
