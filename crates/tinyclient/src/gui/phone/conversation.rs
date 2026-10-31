@@ -19,6 +19,15 @@ impl Shell {
         };
         let title = open.title.trim_start_matches('#').to_owned();
         let direct = matches!(open.kind, ConversationKind::Direct | ConversationKind::Group);
+        // The face the desktop strip draws, at 32: the conversation's own picture, never a
+        // generic person glyph. Channels keep their space mark and the info button.
+        let face = direct.then(|| {
+            div()
+                .flex_none()
+                .ml(px(4.))
+                .mr(px(2.))
+                .child(self.conversation_avatar(open, 32., tokens::surface(), cx))
+        });
         div()
             .flex_none()
             .h(px(tokens::NAV))
@@ -27,8 +36,10 @@ impl Shell {
             .flex()
             .items_center()
             .gap(px(4.))
+            .bg(tokens::surface())
+            .shadow(tokens::top_highlight())
             .border_b_1()
-            .border_color(tokens::strip_rule())
+            .border_color(tokens::hairline())
             .child(
                 icon_button("phone-back", "icons/chevron-left.svg", false)
                     .size(px(tokens::TOUCH))
@@ -37,6 +48,7 @@ impl Shell {
                         this.phone_back(cx);
                     })),
             )
+            .children(face)
             .child(
                 div()
                     .flex_1()

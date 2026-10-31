@@ -14,6 +14,7 @@ use super::when;
 use super::{Pane, PaneEvent, Selection, Then};
 use crate::gui::anim::{self, Play};
 use crate::gui::components::{glyph, tip, Avatar, Shape};
+use crate::gui::phone::tokens as tokens_phone;
 use crate::gui::theme::{self, Type};
 use crate::gui::time;
 use crate::view::{age, now};
@@ -118,6 +119,28 @@ fn short_clock(unix: i64) -> String {
 
 fn day_line(at: i64, metrics: Metrics) -> Div {
     let rule = || div().flex_1().h(px(1.)).bg(theme::hairline());
+    if metrics == Metrics::PHONE {
+        // 24 above, 12 below, a 12/16 label between two hairlines.
+        return div()
+            .w_full()
+            .pt(px(24.))
+            .pb(px(12.))
+            .px(px(metrics.inset))
+            .flex()
+            .items_center()
+            .gap(px(12.))
+            .child(rule())
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(px(tokens_phone::scaled(12.)))
+                    .line_height(px(tokens_phone::scaled(16.)))
+                    .font_weight(theme::MEDIUM)
+                    .text_color(theme::text_faint())
+                    .child(when::day_label(now(), at)),
+            )
+            .child(rule());
+    }
     div()
         .h(px(36.))
         .px(px(metrics.inset))
@@ -129,20 +152,23 @@ fn day_line(at: i64, metrics: Metrics) -> Div {
         .child(rule())
 }
 
-/// The line above the first unread message: accent, ending in a filled tab.
+/// The line above the first unread message: 2 pt of accent, 12 pt of air above it, no pill.
 fn new_line(metrics: Metrics) -> Div {
+    let phone = metrics == Metrics::PHONE;
     div()
-        .h(px(24.))
+        .w_full()
+        .when(phone, |line| line.pt(px(12.)).pb(px(6.)))
+        .when(!phone, |line| line.h(px(24.)))
         .px(px(metrics.inset))
         .flex()
         .items_center()
-        .gap(px(6.))
-        .child(div().flex_1().h(px(1.)).bg(theme::accent()))
+        .gap(px(8.))
+        .child(div().flex_1().h(px(if phone { 2. } else { 1. })).rounded(px(1.)).bg(theme::accent()))
         .child(
             div()
                 .flex_none()
-                .text_size(px(11.))
-                .line_height(px(14.))
+                .text_size(px(if phone { tokens_phone::scaled(12.) } else { 11. }))
+                .line_height(px(if phone { tokens_phone::scaled(16.) } else { 14. }))
                 .font_weight(theme::SEMIBOLD)
                 .text_color(theme::accent_text())
                 .child("New"),
@@ -278,27 +304,50 @@ impl Pane {
         let Some(open) = &self.open else {
             return div();
         };
-        const SIZE: f32 = 80.;
+        let phone = self.metrics == Metrics::PHONE;
+        // A phone's opening block is a note, not a cover: 48, 12 between the parts, muted.
+        let size: f32 = if phone { 48. } else { 80. };
         let direct = open.kind.is_direct();
         let words = if direct {
             format!("This is the start of your conversation with {}.", open.title)
         } else {
             format!("This is the start of #{}.", open.title.trim_start_matches('#'))
         };
-        let plate = if direct { Avatar::new(&open.key, &open.title, SIZE) } else { Avatar::channel("icons/hash.svg", SIZE) };
+        let plate = if direct { Avatar::new(&open.key, &open.title, size) } else { Avatar::channel("icons/hash.svg", size) };
         let shape = if direct { Shape::Person } else { Shape::Place };
         let (title, file) = (open.title.clone(), open.picture.clone());
-        let picture = self.face(plate.shape(shape), file.as_ref(), SIZE, shape, window, cx);
+        let picture = self.face(plate.shape(shape), file.as_ref(), size, shape, window, cx);
+        let gap = if phone { 12. } else { 8. };
+        let head: AnyElement = if phone {
+            div()
+                .text_size(px(tokens_phone::scaled(17.)))
+                .line_height(px(tokens_phone::scaled(22.)))
+                .font_weight(theme::SEMIBOLD)
+                .child(title)
+                .into_any_element()
+        } else {
+            div().type_headline().child(title).into_any_element()
+        };
+        let line: AnyElement = if phone {
+            div()
+                .text_size(px(tokens_phone::scaled(13.)))
+                .line_height(px(tokens_phone::scaled(18.)))
+                .text_color(theme::text_soft())
+                .child(words)
+                .into_any_element()
+        } else {
+            div().type_ui().text_color(theme::text_soft()).child(words).into_any_element()
+        };
         div()
             .px(px(self.metrics.inset))
-            .pt(px(32.))
+            .pt(px(if phone { 16. } else { 32. }))
             .pb(px(12.))
             .flex()
             .flex_col()
-            .gap(px(8.))
+            .gap(px(gap))
             .child(picture)
-            .child(div().type_headline().child(title))
-            .child(div().type_ui().text_color(theme::text_soft()).child(words))
+            .child(head)
+            .child(line)
     }
 
     /// An avatar with its picture drawn from this pane's own decodes, asked for at the size it
@@ -488,11 +537,13 @@ impl Pane {
             .children(bar.map(|color| {
                 div()
                     .absolute()
-                    .top_0()
-                    .bottom_0()
-                    .w(px(if mine { 3. } else { 2. }))
-                    .when(mine, |rule| rule.right(px(6.)).opacity(0.55))
-                    .when(!mine, |rule| rule.left_0())
+                    .when(mine, |rule| {
+                        // The seam runs beside the words, below the name line: it is the text
+                        // block's rule, not the avatar's outline. 6 from the trailing edge keeps
+                        // it clear of the list's own scrollbar.
+                        rule.top(px(if head { 23. } else { 3. })).bottom(px(3.)).right(px(6.)).w(px(3.)).rounded(px(1.5))
+                    })
+                    .when(!mine, |rule| rule.top_0().bottom_0().w(px(2.)).left_0())
                     .bg(color)
             }))
             .children(flashing.then(|| {
@@ -574,7 +625,7 @@ impl Pane {
                 .child(words)
         };
         div()
-            .h(px(20.))
+            .h(px(if self.metrics == Metrics::PHONE { tokens_phone::scaled(20.) } else { 20. }))
             .flex()
             .items_center()
             .gap(px(8.))
@@ -585,12 +636,12 @@ impl Pane {
                     .flex()
                     .items_baseline()
                     .gap(px(8.))
-                    .child(div().min_w_0().truncate().type_body().when(self.metrics == Metrics::PHONE, |name| name.text_size(px(15.)).line_height(px(20.))).font_weight(theme::SEMIBOLD).child(name))
+                    .child(div().min_w_0().truncate().type_body().when(self.metrics == Metrics::PHONE, |name| name.text_size(px(tokens_phone::scaled(15.))).line_height(px(tokens_phone::scaled(20.)))).font_weight(theme::SEMIBOLD).child(name))
                     .child(
                         div()
                             .flex_none()
-                            .text_size(px(11.))
-                            .line_height(px(20.))
+                            .text_size(px(if self.metrics == Metrics::PHONE { tokens_phone::scaled(11.) } else { 11. }))
+                            .line_height(px(if self.metrics == Metrics::PHONE { tokens_phone::scaled(20.) } else { 20. }))
                             .font_weight(theme::MEDIUM)
                             .text_color(theme::text_faint())
                             .child(time::clock(message.sent)),
@@ -635,7 +686,7 @@ impl Pane {
                 Block::Text(inline) => div()
                     .max_w(px(MEASURE))
                     .type_body()
-                    .when(phone, |div| div.text_size(px(17.)).line_height(px(24.)))
+                    .when(phone, |div| div.text_size(px(tokens_phone::scaled(17.))).line_height(px(tokens_phone::scaled(24.))))
                     .when(mine, |div| div.text_align(gpui::TextAlign::Right))
                     .child(self.rich(message, ix, inline, theme::text().into(), window, cx))
                     .into_any_element(),
@@ -649,7 +700,7 @@ impl Pane {
                             .pl(px(12.))
                             .min_w_0()
                             .type_body()
-                            .when(phone, |div| div.text_size(px(17.)).line_height(px(24.)))
+                            .when(phone, |div| div.text_size(px(tokens_phone::scaled(17.))).line_height(px(tokens_phone::scaled(24.))))
                             .when(mine, |div| div.text_align(gpui::TextAlign::Right))
                             .child(self.rich(message, ix, inline, theme::text_soft().into(), window, cx)),
                     )
@@ -661,7 +712,7 @@ impl Pane {
                         .pl(px(22. * f32::from(*depth)))
                         .flex()
                         .type_body()
-                        .when(phone, |div| div.text_size(px(17.)).line_height(px(24.)))
+                        .when(phone, |div| div.text_size(px(tokens_phone::scaled(17.))).line_height(px(tokens_phone::scaled(24.))))
                         .when(mine, |div| div.text_align(gpui::TextAlign::Right))
                         .child(div().w(px(22.)).flex_none().text_color(theme::text_faint()).child(marker))
                         .child(div().min_w_0().flex_1().child(self.rich(message, ix, text, theme::text().into(), window, cx)))

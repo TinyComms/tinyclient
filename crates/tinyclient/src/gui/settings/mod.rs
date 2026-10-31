@@ -82,7 +82,7 @@ impl Section {
         }
     }
 
-    fn icon(self) -> &'static str {
+    pub(super) fn icon(self) -> &'static str {
         match self {
             Section::Accounts => "icons/users.svg",
             Section::General => "icons/settings.svg",

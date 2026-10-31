@@ -1,7 +1,7 @@
 //! Needs me and Inbox on a phone: the same rows, 56 pt tall, unread first inside each day
 //! (`01-ia-navigation.md` Q2; `02-component-inventory.md` B1).
 
-use crate::gui::components::{empty_state, list_row, row_tone, section_header};
+use crate::gui::components::{empty_state, list_row, row_tone};
 use crate::gui::phone::tokens::{self, PhoneType};
 use crate::gui::phone::Route;
 use crate::gui::sidebar::chat::row_time;
@@ -12,6 +12,40 @@ use crate::view::now;
 use gpui::{div, prelude::*, px, Context, Div, MouseButton, SharedString, Stateful, Window};
 use protocol::{AccountKey, Conversation, ConversationKind, Network};
 use std::rc::Rc;
+
+/// GPUI has no letter-spacing value, so a hair space between letters stands in: the tracking
+/// reads at 12 pt and disappears in a screen reader, which still says "TODAY".
+fn tracked(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len() * 2);
+    for (ix, ch) in chars.iter().enumerate() {
+        out.push(*ch);
+        if ix + 1 < chars.len() && ch.is_alphabetic() && chars[ix + 1].is_alphabetic() {
+            out.push('\u{200a}');
+        }
+    }
+    out
+}
+
+/// A day heading on a phone: 20 above, 6 below, 12/16 tracked uppercase `text_faint`.
+pub fn phone_section(label: impl Into<SharedString>, first: bool) -> Div {
+    let _ = first;
+    let label: SharedString = label.into();
+    div()
+        .flex_none()
+        .w_full()
+        .pt(px(20.))
+        .pb(px(6.))
+        .px(px(tokens::GUTTER))
+        .child(
+            div()
+                .text_size(px(tokens::scaled(12.)))
+                .line_height(px(tokens::scaled(16.)))
+                .font_weight(theme::MEDIUM)
+                .text_color(theme::text_faint())
+                .child(tracked(&label.to_uppercase())),
+        )
+}
 
 /// "Needs me": an unread direct message, or anything that names me. A muted row counts only
 /// when it names me. Thread replies are not a field the row carries yet, so they are not here.
@@ -69,12 +103,12 @@ impl Shell {
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
-            .pb(px(tokens::SAFE_BOTTOM))
+            .pb(px(tokens::GUTTER))
             .flex()
             .flex_col();
         let mut ix = 0;
         for (at, (day, rows)) in groups.iter().enumerate() {
-            list = list.child(section_header(day.label(), at == 0));
+            list = list.child(phone_section(day.label(), at == 0));
             for row in rows {
                 list = list.child(self.phone_row(ix, row, cx));
                 ix += 1;
@@ -131,7 +165,7 @@ impl Shell {
                     .min_w_0()
                     .flex()
                     .flex_col()
-                    .gap(px(2.))
+                    .gap(px(3.))
                     .child(
                         div()
                             .flex()
@@ -168,7 +202,8 @@ impl Shell {
                     ),
             );
         let (key, title) = (c.key.clone(), c.title.clone());
-        list_row(("phone-row", ix), tokens::ROW, false, false, content)
+        list_row(("phone-row", ix), tokens::row_height(), false, false, content)
+            .active(|row| row.bg(tokens::pressed()))
             .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
                 this.select(key.clone(), &title, cx);
                 this.phone_state.push(Route::Conversation { key: key.clone(), title: title.clone() });

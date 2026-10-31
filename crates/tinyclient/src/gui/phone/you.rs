@@ -39,15 +39,17 @@ impl Shell {
         let rows = rows.into_iter().enumerate().map(|(ix, (section, words))| {
             div()
                 .id(("you-row", ix))
-                .h(px(tokens::ROW))
-                .px(px(16.))
+                .h(px(tokens::row_height()))
+                .px(px(tokens::GUTTER))
                 .flex()
                 .items_center()
                 .gap(px(12.))
                 .cursor_pointer()
-                .hover(|row| row.bg(theme::hover()))
+                .when(ix > 0, |row| row.border_t_1().border_color(tokens::hairline()))
+                .active(|row| row.bg(tokens::pressed()))
+                .child(glyph(section.icon(), 20., theme::text_soft()))
                 .child(div().flex_1().min_w_0().truncate().phone_row().text_color(theme::text()).child(words))
-                .child(glyph("icons/chevron-right.svg", 16., theme::text_faint()))
+                .child(glyph("icons/chevron-right.svg", 18., theme::text_faint()))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     let _ = this;
                     settings::open(section, cx);
@@ -61,16 +63,18 @@ impl Shell {
                 div()
                     .flex_none()
                     .h(px(tokens::NAV))
-                    .pl(px(16.))
+                    .pl(px(tokens::GUTTER))
                     .flex()
                     .items_center()
+                    .bg(tokens::surface())
+                    .shadow(tokens::top_highlight())
                     .border_b_1()
-                    .border_color(tokens::strip_rule())
+                    .border_color(tokens::hairline())
                     .child(div().phone_title().child("You")),
             )
             .child(
                 div()
-                    .px(px(16.))
+                    .px(px(tokens::GUTTER))
                     .py(px(24.))
                     .flex()
                     .items_center()
@@ -81,12 +85,13 @@ impl Shell {
                             .min_w_0()
                             .flex()
                             .flex_col()
-                            .gap(px(2.))
+                            .gap(px(3.))
                             .child(div().truncate().phone_title().child(name))
                             .child(div().phone_preview().text_color(theme::text_soft()).child(line)),
                     ),
             )
-            .child(div().h(px(1.)).mx(px(16.)).bg(tokens::strip_rule()))
+            .child(div().h(px(1.)).bg(tokens::hairline()))
             .children(rows)
+            .child(div().h(px(24.)))
     }
 }

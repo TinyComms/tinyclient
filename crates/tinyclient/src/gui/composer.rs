@@ -1694,7 +1694,7 @@ impl Composer {
     fn card_button(&self, id: &'static str, icon: Option<&'static str>, toggled: bool, slot: Option<Trigger>) -> gpui::Stateful<Div> {
         let anchors = self.anchors.clone();
         let content = match icon {
-            Some(icon) => glyph(icon, 16., if toggled { theme::text() } else { theme::text_soft() }).into_any_element(),
+            Some(icon) => glyph(icon, if crate::gui::phone::active() { 18. } else { 16. }, if toggled { theme::text() } else { theme::text_soft() }).into_any_element(),
             // CONTRACT: the design's `gif-16` glyph is not among slice A's assets; the word in a
             // 16 × 12 outline stands in for it.
             None => div()
@@ -1788,7 +1788,7 @@ impl Composer {
                 }),
             )
             .on_click(cx.listener(|this, _, _, cx| this.send(false, cx)))
-            .child(glyph(send_icon, 16., if ready { theme::on_accent() } else { theme::text_disabled() }))
+            .child(glyph(send_icon, if crate::gui::phone::active() { 18. } else { 16. }, if ready { theme::on_accent() } else { theme::text_disabled() }))
             .child(canvas(move |bounds, _, _| anchors.send.set(Some(bounds)), |_, _, _, _| {}).absolute().top_0().left_0().size_full());
         let row = div()
             .min_h(px(card_height() - 2.))
@@ -2289,7 +2289,8 @@ impl Render for Composer {
         let dock = div()
             .flex_none()
             .px(px(if phone { 12. } else { 20. }))
-            .pb(px(if phone { 8. + crate::gui::phone::tokens::SAFE_BOTTOM } else { 16. }))
+            .pt(px(if phone { 10. } else { 0. }))
+            .pb(px(if phone { 12. + crate::gui::phone::tokens::SAFE_BOTTOM } else { 16. }))
             .flex()
             .flex_col()
             .key_context("Composer")

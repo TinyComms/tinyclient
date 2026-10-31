@@ -1189,6 +1189,8 @@ impl Render for Pane {
         div()
             .id("messages")
             .size_full()
+            // A phone leaves 20 pt under the last row so it never touches the composer.
+            .when(self.metrics == Metrics::PHONE, |body| body.pb(px(20.)))
             .relative()
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::key_down))

@@ -217,6 +217,7 @@ fn shell_bindings() -> Vec<KeyBinding> {
 /// `--hide-sidebar`, `--right thread|members`, `--pin N`, `--toast`, `--components`,
 /// `--walk N` (N presses of the unread walk), `--back N` (N steps back in history),
 /// `--tab needs|inbox|search|you` (a phone tab), `--scope` (the phone's account sheet open),
+/// `--text-scale N` (the phone's type, 2 for a 200% run),
 /// `--sign-in-failed closed|unreachable|blocked` (first launch, with nothing signed in),
 /// `--state starting|keychain|denied|reconnecting|failed` (a window state, forced),
 /// `--crash-toast` (the toast after a crash relaunch), `--menu row-right|row-bottom` (the row
@@ -289,6 +290,9 @@ mod shot {
                 }
                 if has("--scope") {
                     shell.phone_state.scope_open = true;
+                }
+                if let Some(scale) = flag("--text-scale").and_then(|n| n.parse::<f32>().ok()) {
+                    super::phone::tokens::set_text_scale(scale);
                 }
             }
             1 => {
