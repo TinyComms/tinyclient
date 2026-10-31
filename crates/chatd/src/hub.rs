@@ -170,6 +170,19 @@ pub struct Hub {
     notifier: OnceLock<crate::notify::Line>,
 }
 
+fn apply_log_policy(values: &Values) {
+    let Some(guard) = protocol::log_policy::current() else {
+        return;
+    };
+    let ring = if values.on(protocol::settings::LOG_RING) { "on" } else { "off" };
+    let export = if values.on(protocol::settings::LOG_EXPORT) { "on" } else { "off" };
+    guard.apply(protocol::log_policy::LogPolicy::apply_settings(
+        values.word(protocol::settings::GLOBAL, protocol::settings::LOG_LEVEL),
+        ring,
+        export,
+    ));
+}
+
 impl Hub {
     pub fn new(store: Store) -> Hub {
         let settings = Values::new(store.settings().unwrap_or_default());
@@ -203,11 +216,17 @@ impl Hub {
             reactions: Recent::new(64),
             calls: Calls::default(),
             player: crate::playback::Player::default(),
-            settings: Mutex::new(settings),
+            settings: Mutex::new(settings.clone()),
             prune_now: Mutex::new(false),
             prune_wake: Condvar::new(),
             notifier: OnceLock::new(),
         }
+        .tap_settings(&settings)
+    }
+
+    fn tap_settings(self, values: &Values) -> Self {
+        apply_log_policy(values);
+        self
     }
 
     // Settings.
@@ -225,6 +244,7 @@ impl Hub {
         let mut store = self.store();
         store.set_setting(scope, key, value.as_deref())?;
         lock(&self.settings).set(scope, key, value);
+        apply_log_policy(&self.settings());
         drop(store);
         self.changed(Change::Settings);
         Ok(())
@@ -236,6 +256,7 @@ impl Hub {
         if let Ok(stored) = store.settings() {
             *lock(&self.settings) = Values::new(stored);
         }
+        apply_log_policy(&self.settings());
         drop(store);
         self.changed(Change::Settings);
     }
@@ -245,6 +266,7 @@ impl Hub {
         let mut store = self.store();
         store.reset_settings()?;
         *lock(&self.settings) = Values::new(store.settings()?);
+        apply_log_policy(&self.settings());
         drop(store);
         self.changed(Change::Settings);
         Ok(())

@@ -532,7 +532,7 @@ impl Teams {
             Err(Failure::SignedOut(why)) => {
                 self.state().expired.get_or_insert(why);
             }
-            Err(Failure::Dropped(why)) => eprintln!("chatd: Teams: {}", super::net::redact(&why)),
+            Err(Failure::Dropped(why)) => tracing::warn!("chatd: Teams: {}", super::net::redact(&why)),
         }
     }
 

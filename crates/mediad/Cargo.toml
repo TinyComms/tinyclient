@@ -7,6 +7,7 @@ publish.workspace = true
 
 [dependencies]
 protocol.workspace = true
+tracing.workspace = true
 serde_json.workspace = true
 # The voice gateway. Same versions and TLS (Security.framework) as chatd, so nothing is built twice.
 tungstenite = { version = "0.30", default-features = false, features = ["handshake", "native-tls"] }

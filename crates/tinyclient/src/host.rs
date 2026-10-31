@@ -77,11 +77,11 @@ pub const KEEP_MESSAGES: &str = if cfg!(target_os = "macos") {
 
 /// Settings › About, under Copy diagnostics.
 pub const DIAGNOSTICS: &str = if cfg!(target_os = "macos") {
-    "Version, macOS, memory and connection states. No messages, names or tokens."
+    "Version, macOS, memory and connection states. No messages, names, tokens, or log lines."
 } else if cfg!(windows) {
-    "Version, Windows, memory and connection states. No messages, names or tokens."
+    "Version, Windows, memory and connection states. No messages, names, tokens, or log lines."
 } else {
-    "Version, Linux, memory and connection states. No messages, names or tokens."
+    "Version, Linux, memory and connection states. No messages, names, tokens, or log lines."
 };
 
 /// Settings › Appearance, under text size. Reduce Motion is read from macOS only; `caption`

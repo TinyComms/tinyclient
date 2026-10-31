@@ -64,7 +64,7 @@ fn named(path: &str, name: &str) -> std::path::PathBuf {
     match made {
         Ok(()) => target,
         Err(err) => {
-            eprintln!("tinyclient: could not name {name} for opening: {err}");
+            tracing::warn!("tinyclient: could not name {name} for opening: {err}");
             std::path::PathBuf::from(path)
         }
     }

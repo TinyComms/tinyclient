@@ -20,6 +20,13 @@ pub struct Setting {
 
 /// The global scope.
 pub const GLOBAL: &str = "";
+/// Operator ceiling for this machine's logs: `error`, `warn`, `info`, `debug`, or `trace`.
+pub const LOG_LEVEL: &str = "log_level";
+pub const LOG_LEVEL_CHOICES: [&str; 5] = ["error", "warn", "info", "debug", "trace"];
+/// Whether the in-memory debug ring is kept.
+pub const LOG_RING: &str = "log_ring";
+/// Whether Save debug log may write that ring to disk.
+pub const LOG_EXPORT: &str = "log_export";
 
 /// G2. Closing the window leaves chatd running. Read by the shell.
 pub const KEEP_RUNNING: &str = "keep_running";
@@ -189,6 +196,8 @@ fn kind(key: &str) -> Option<Kind> {
         CACHE_MB => Kind::Choice(&CACHE_MB_CHOICES, 500),
         // Per account; the default is the network's (`typing_default`).
         TYPING | RECEIPTS => Kind::Switch(true),
+        LOG_LEVEL => Kind::Word(&LOG_LEVEL_CHOICES, "info"),
+        LOG_RING | LOG_EXPORT => Kind::Switch(true),
         _ => return None,
     })
 }

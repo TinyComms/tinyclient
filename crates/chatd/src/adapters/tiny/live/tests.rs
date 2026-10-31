@@ -1387,7 +1387,7 @@ fn tiny_server_call() {
                 assert!(joined.elapsed() < Duration::from_secs(20), "each hears the other over {ice}: {} {}", played_level(&ada_sink), played_level(&bea_sink));
                 std::thread::sleep(Duration::from_millis(100));
             }
-            eprintln!("over {ice}: Ada hears {:.0}, Bea hears {:.0}", played_level(&ada_sink), played_level(&bea_sink));
+            tracing::warn!("over {ice}: Ada hears {:.0}, Bea hears {:.0}", played_level(&ada_sink), played_level(&bea_sink));
             assert!(call().is_some_and(|call| call.participants.iter().any(|who| who.id == bea.user_id)), "Bea is on Ada's roster");
             bea_hand.leave();
             assert_eq!(ada.ask(|reply| Ask::Leave { reply }), Ok(()));

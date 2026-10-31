@@ -312,9 +312,9 @@ fn on_error(side: &str, err: &cpal::Error, glitches: &AtomicU64, broken: &Atomic
             glitches.fetch_add(1, Ordering::Relaxed);
         }
         // Rerouted by the system and still playing, or a scheduling refusal: neither stops it.
-        cpal::ErrorKind::DeviceChanged | cpal::ErrorKind::RealtimeDenied => eprintln!("mediad: {side}: {err}"),
+        cpal::ErrorKind::DeviceChanged | cpal::ErrorKind::RealtimeDenied => tracing::warn!("mediad: {side}: {err}"),
         _ => {
-            eprintln!("mediad: {side}: {err}; opening it again");
+            tracing::warn!("mediad: {side}: {err}; opening it again");
             broken.store(true, Ordering::Relaxed);
         }
     }
@@ -750,7 +750,7 @@ fn open_side<T>(
                 return Ok((stream, pick));
             }
             Err(err) => {
-                eprintln!("mediad: {:?} would not open: {err:?}", pick.endpoint.name);
+                tracing::warn!("mediad: {:?} would not open: {err:?}", pick.endpoint.name);
                 backoff.failed(&id, now);
                 avoid.push(id);
                 last = Some(err);
@@ -1064,7 +1064,7 @@ impl Audio {
                 if let Some(stream) = &input.stream {
                     let changed = if on { stream.play() } else { stream.pause() };
                     if let Err(err) = changed {
-                        eprintln!("mediad: microphone: {err}");
+                        tracing::warn!("mediad: microphone: {err}");
                     }
                 }
                 input.running = on;
@@ -1214,7 +1214,7 @@ impl Audio {
         let glitches = troubles.mic_glitches + troubles.speaker_glitches;
         let (logged, at) = self.logged;
         if glitches > logged && at.is_none_or(|at| at.elapsed() >= Duration::from_secs(60)) {
-            eprintln!(
+            tracing::warn!(
                 "mediad: {} device glitches (buffer underrun or overrun) since {} (microphone {}, speaker {} in all)",
                 glitches - logged,
                 if at.is_some() { "the last report" } else { "the call began" },
@@ -1648,7 +1648,7 @@ mod tests {
         }
         let audio = Audio::open(None, None).expect("the devices open");
         assert!(!audio.input.id.is_empty() && !audio.output.id.is_empty());
-        eprintln!("in: {:?}\nout: {:?}", audio.input, audio.output);
+        tracing::warn!("in: {:?}\nout: {:?}", audio.input, audio.output);
         let started = Instant::now();
         while audio.counts().0 == 0 || audio.counts().1 == 0 {
             assert!(started.elapsed() < crate::pick::GRACE, "not running: {:?}", audio.counts());

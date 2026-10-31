@@ -900,7 +900,7 @@ impl Render for Shell {
         if std::env::var_os("TINYCLIENT_FRAMES").is_some() {
             static FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let frame = FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            eprintln!("tinyclient: frame {frame} at {} ms", super::LAUNCHED.get().map_or(0, |at| at.elapsed().as_millis()));
+            tracing::warn!("tinyclient: frame {frame} at {} ms", super::LAUNCHED.get().map_or(0, |at| at.elapsed().as_millis()));
         }
         let root = self
             .keys(div(), cx)

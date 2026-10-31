@@ -514,15 +514,19 @@ impl SettingsWindow {
             "B1" => row(
                 label,
                 Some(crate::host::DIAGNOSTICS.into()),
-                button("B1", ButtonKind::Secondary, "Copy").on_click(cx.listener(|this, _, _, cx| this.copy_diagnostics(cx))),
+                div().flex().gap(px(8.)).child(
+                    button("B1", ButtonKind::Secondary, "Copy").on_click(cx.listener(|this, _, _, cx| this.copy_diagnostics(cx))),
+                ).child(
+                    button("B1-log", ButtonKind::Secondary, "Save debug log").on_click(cx.listener(|this, _, _, cx| this.save_debug_log(cx))),
+                ),
             ),
             "B2" => row(
                 label,
                 None,
                 button("B2", ButtonKind::Secondary, crate::host::REVEAL).on_click(cx.listener(|_, _, _, cx| {
-                    let log = protocol::support_dir().join(protocol::launch::CHATD_LOG);
-                    if log.exists() {
-                        cx.reveal_path(&log);
+                    let logs = protocol::log_policy::logs_dir();
+                    if logs.is_dir() {
+                        cx.reveal_path(&logs);
                     } else {
                         cx.open_with_system(&protocol::support_dir());
                     }
@@ -1262,6 +1266,34 @@ impl SettingsWindow {
             }
             let _ = this.shell.update(cx, |shell, cx| shell.load_settings(cx));
             cx.notify();
+        });
+    }
+
+    fn save_debug_log(&mut self, cx: &mut Context<Self>) {
+        self.off_thread(cx, || {
+            let mut paths = Vec::new();
+            if let Some(guard) = protocol::log_policy::current() {
+                if let Ok(Some(path)) = guard.export_bundle() {
+                    paths.push(path.display().to_string());
+                }
+            }
+            if let Ok(Response::LogsSaved { paths: more }) = crate::client::ask(&Request::SaveLogs) {
+                paths.extend(more);
+            }
+            paths
+        }, |this, paths, cx| {
+            let note = if paths.is_empty() {
+                "Debug logs are turned off.".to_owned()
+            } else {
+                protocol::log_policy::logs_dir().join("bundles").display().to_string()
+            };
+            this.log_note = Some((std::time::Instant::now(), note));
+            cx.notify();
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(std::time::Duration::from_secs(4)).await;
+                let _ = this.update(cx, |_, cx| cx.notify());
+            })
+            .detach();
         });
     }
 

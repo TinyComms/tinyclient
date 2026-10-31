@@ -583,7 +583,7 @@ fn download(path: &Path) -> Result<(), String> {
     let name = path.file_name().and_then(|name| name.to_str()).ok_or_else(|| "OpenH264 has no name.".to_owned())?;
     let url = library_url(name);
     let response = ureq::get(&url).timeout(Duration::from_secs(20)).call().map_err(|err| {
-        eprintln!("mediad: OpenH264 download failed: {err}");
+        tracing::warn!("mediad: OpenH264 download failed: {err}");
         DOWNLOAD_FAILED.to_owned()
     })?;
     let mut packed = Vec::new();

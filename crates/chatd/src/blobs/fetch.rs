@@ -233,7 +233,7 @@ fn get(hosts: &Hosts, agent: &ureq::Agent, want: &Want, from: &Download, buffer:
         let Some(trust) = hosts.trust(want.network, &url) else {
             // The host alone, for the log: it is how a wrong guess about a network gets found.
             let host = url.split("://").nth(1).and_then(|rest| rest.split(['/', '?', '#']).next()).unwrap_or("?");
-            eprintln!("chatd: {}: a file was at or moved to {host}, which is not on the list", want.network.label());
+            tracing::warn!("chatd: {}: a file was at or moved to {host}, which is not on the list", want.network.label());
             return Err(elsewhere());
         };
         let mut request = agent.get(&url);

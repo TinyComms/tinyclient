@@ -158,7 +158,7 @@ impl StatusMenu {
             let refused = match answer {
                 Ok(Response::Error { detail, .. }) => Some(detail),
                 Ok(_) => None,
-                Err(err) => Some(crate::client::trouble_words(&err)),
+                Err(err) => Some(crate::client::trouble_words("people", &err)),
             };
             let _ = this.update(cx, |this, cx| {
                 this.refused = refused;

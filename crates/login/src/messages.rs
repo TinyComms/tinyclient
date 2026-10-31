@@ -25,7 +25,7 @@ pub(super) fn run() -> ! {
             std::process::exit(0);
         }
         Err((code, why)) => {
-            eprintln!("tinyclient-login: {why}");
+            tracing::warn!("tinyclient-login: {why}");
             std::process::exit(code);
         }
     }

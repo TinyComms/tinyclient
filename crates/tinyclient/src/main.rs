@@ -28,8 +28,8 @@ use protocol::{chat_sock_path, InboxFilter, Request, Response, PAGE_LIMIT};
 use std::io::{self, ErrorKind};
 use std::process::ExitCode;
 
-fn unexpected(response: Response) -> io::Error {
-    io::Error::other(format!("unexpected {response:?}"))
+fn unexpected(_response: Response) -> io::Error {
+    io::Error::other("unexpected response")
 }
 
 /// Only a valid Tiny app link is accepted from the operating system.
@@ -137,7 +137,7 @@ fn main() -> ExitCode {
         Some(at) => match args.get(at + 1) {
             Some(query) => Some(query.as_str()),
             None => {
-                eprintln!("tinyclient: --search needs what to look for");
+                tracing::warn!("tinyclient: --search needs what to look for");
                 return ExitCode::from(64);
             }
         },
@@ -152,6 +152,7 @@ fn main() -> ExitCode {
         println!("tinyclient {}", env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;
     }
+    let _log = protocol::log_policy::install("tinyclient", protocol::log_policy::LogPolicy::from_env());
     #[cfg(feature = "gui")]
     if !args.iter().any(|arg| arg == "--text" || arg == "--notify-test") && query.is_none() {
         let invite = launch_invite(&args);
@@ -175,12 +176,12 @@ fn main() -> ExitCode {
     match done {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) if matches!(err.kind(), ErrorKind::NotFound | ErrorKind::ConnectionRefused) => {
-            eprintln!("chatd is not running at {}", chat_sock_path().display());
-            eprintln!("start it with: cargo run -p chatd");
+            tracing::warn!("chatd is not running at {}", chat_sock_path().display());
+            tracing::warn!("start it with: cargo run -p chatd");
             ExitCode::from(1)
         }
         Err(err) => {
-            eprintln!("{err}");
+            tracing::warn!("{err}");
             ExitCode::from(1)
         }
     }

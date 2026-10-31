@@ -138,13 +138,13 @@ impl Call {
                 let spawned = std::thread::Builder::new().name("voice".to_owned()).spawn(move || {
                     session::run(join, controls);
                     // The other side ended the call, or chatd hung up: either way we are done.
-                    eprintln!("mediad: call over, exiting");
+                    tracing::warn!("mediad: call over, exiting");
                     std::process::exit(0);
                 });
                 match spawned {
                     Ok(voice) => self.voice = Some(voice),
                     Err(err) => {
-                        eprintln!("mediad: the voice thread did not start: {err}");
+                        tracing::warn!("mediad: the voice thread did not start: {err}");
                         return MediaResponse::Refused { detail: ENGINE.to_owned() };
                     }
                 }
@@ -197,7 +197,7 @@ impl Call {
                         MediaResponse::Offer { sdp }
                     }
                     Err(err) => {
-                        eprintln!("mediad: the offer could not be made: {err}");
+                        tracing::warn!("mediad: the offer could not be made: {err}");
                         MediaResponse::Refused { detail: ENGINE.to_owned() }
                     }
                 };
@@ -209,7 +209,7 @@ impl Call {
                 let link = match offer.accept(&sdp) {
                     Ok(link) => link,
                     Err(err) => {
-                        eprintln!("mediad: the server's answer was refused: {err}");
+                        tracing::warn!("mediad: the server's answer was refused: {err}");
                         return MediaResponse::Refused { detail: "The server's audio setup didn't work with tinyclient. Try again.".to_owned() };
                     }
                 };
@@ -221,13 +221,13 @@ impl Call {
                 let (controls, user_id) = (self.controls.clone(), self.tiny.clone().unwrap_or_default());
                 let spawned = std::thread::Builder::new().name("tiny".to_owned()).spawn(move || {
                     tiny::run(link, user_id, controls);
-                    eprintln!("mediad: call over, exiting");
+                    tracing::warn!("mediad: call over, exiting");
                     std::process::exit(0);
                 });
                 match spawned {
                     Ok(voice) => self.voice = Some(voice),
                     Err(err) => {
-                        eprintln!("mediad: the call thread did not start: {err}");
+                        tracing::warn!("mediad: the call thread did not start: {err}");
                         return MediaResponse::Refused { detail: ENGINE.to_owned() };
                     }
                 }
@@ -296,6 +296,13 @@ impl Call {
                 };
             }
             MediaRequest::Loopback { .. } => return MediaResponse::Refused { detail: "A call can't play your microphone back to you.".to_owned() },
+            MediaRequest::SaveLogs => {
+                let path = protocol::log_policy::current()
+                    .and_then(|guard| guard.export_bundle().ok().flatten())
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default();
+                return MediaResponse::LogsSaved { path };
+            }
         }
         MediaResponse::Streams { video: self.video.streams() }
     }
@@ -374,13 +381,14 @@ fn list_devices() {
 }
 
 fn main() -> ExitCode {
-    protocol::crash::install_panic_hook("mediad");
     let first = env::args().nth(1);
+    if first.as_deref() == Some("--version") {
+        println!("mediad {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
+    let _log = protocol::log_policy::install("mediad", protocol::log_policy::LogPolicy::from_env());
+    protocol::crash::install_panic_hook("mediad");
     match first.as_deref() {
-        Some("--version") => {
-            println!("mediad {}", env!("CARGO_PKG_VERSION"));
-            return ExitCode::SUCCESS;
-        }
         Some("--devices") => {
             list_devices();
             return ExitCode::SUCCESS;
@@ -395,7 +403,7 @@ fn main() -> ExitCode {
             return match mediad::play::run() {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(err) => {
-                    eprintln!("mediad: {err}");
+                    tracing::warn!("mediad: {err}");
                     ExitCode::from(1)
                 }
             };
@@ -406,7 +414,7 @@ fn main() -> ExitCode {
             return match mediad::alert::run(&args) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(err) => {
-                    eprintln!("mediad: {err}");
+                    tracing::warn!("mediad: {err}");
                     ExitCode::from(1)
                 }
             };
@@ -414,23 +422,23 @@ fn main() -> ExitCode {
         // Settings' microphone test and test sound, with no call (`probe`).
         Some("test") => {
             mediad::probe::run();
-            eprintln!("mediad: test over, exiting");
+            tracing::warn!("mediad: test over, exiting");
             return ExitCode::SUCCESS;
         }
         _ => {}
     }
     let calls = first.and_then(|s| s.parse().ok()).unwrap_or(0);
     if !media_process_needed(calls) {
-        eprintln!("mediad: no active call, exiting");
+        tracing::warn!("mediad: no active call, exiting");
         return ExitCode::SUCCESS;
     }
     match serve() {
         Ok(()) => {
-            eprintln!("mediad: call ended, exiting");
+            tracing::warn!("mediad: call ended, exiting");
             ExitCode::SUCCESS
         }
         Err(err) => {
-            eprintln!("mediad: {err}");
+            tracing::warn!("mediad: {err}");
             ExitCode::from(1)
         }
     }

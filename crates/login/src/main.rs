@@ -38,27 +38,29 @@ pub(crate) use common::*;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("--version") {
+        println!("tinyclient-login {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+    let _log = protocol::log_policy::install("login", protocol::log_policy::LogPolicy::from_env());
+    protocol::crash::install_panic_hook("login");
     if args.first().map(String::as_str) == Some("--messages-browser-cleanup") {
         messages::cleanup_worker(&args);
         return;
     }
     let network = match args.first().map(String::as_str) {
-        Some("--version") => {
-            println!("tinyclient-login {}", env!("CARGO_PKG_VERSION"));
-            return;
-        }
         Some("slack") => "slack",
         Some("discord") => "discord",
         Some("teams") => "teams",
         Some("messages") => "messages",
         other => {
-            eprintln!("tinyclient-login: no web sign-in for {other:?}");
+            tracing::warn!("tinyclient-login: no web sign-in for {other:?}");
             std::process::exit(USAGE);
         }
     };
     if network == "messages" {
         if let Err(why) = parse_at(&args) {
-            eprintln!("tinyclient-login: {why}");
+            tracing::warn!("tinyclient-login: {why}");
             std::process::exit(USAGE);
         }
         messages::run();
@@ -70,7 +72,7 @@ fn main() {
         _ => unreachable!(),
     };
     let at = parse_at(&args).unwrap_or_else(|why| {
-        eprintln!("tinyclient-login: {why}");
+        tracing::warn!("tinyclient-login: {why}");
         std::process::exit(USAGE);
     });
     #[cfg(target_os = "macos")]

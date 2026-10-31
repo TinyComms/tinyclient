@@ -243,8 +243,8 @@ Added, all v1:
 
 | # | Control | What it does |
 | --- | --- | --- |
-| B1 | Copy diagnostics | Version, OS, each process's memory, account states, the last 20 error lines. No message text, names or tokens |
-| B2 | Show logs in Finder | Opens the folder holding `chatd.log` and `crash.log` |
+| B1 | Copy diagnostics | Version, OS, service state, and account connection states. No message text, names, tokens, or log lines. Save debug log writes the in-memory ring under `logs/bundles/` and shows that directory |
+| B2 | Show logs in Finder | Opens `logs/` (`tinyclient.log`, `chatd.log`, `mediad.log`, `login.log`, and `bundles/`) |
 | B3 | Reset all settings… | Confirm: "Reset every setting to its default? Accounts, messages and files are not touched." Deletes every row in `settings` with global or account scope and the settings lines in `shell.prefs`. Per-conversation sounds go too |
 
 ### Count
@@ -502,7 +502,7 @@ notification delivered by the system, read with `log stream --predicate 'subsyst
 **Shortcuts and About**
 - Shortcuts: every menu item with a key equivalent appears in the list (unit test against the
   menu table).
-- B1: the clipboard holds the listed fields and no string from the message table.
+- B1: Copy puts the short status blurb on the clipboard and no log line. Save debug log shows `logs/bundles` or "Debug logs are turned off." It does not copy a log.
 - B3: after reset, `settings` has only `version` and `conv:` rows are gone; accounts and cache
   are untouched.
 

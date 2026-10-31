@@ -202,7 +202,7 @@ impl Demo {
             crate::blobs::upload::discard(&with.files);
         });
         if let Err(err) = spawned {
-            eprintln!("chatd: demo: upload: {err}");
+            tracing::warn!("chatd: demo: upload: {err}");
         }
     }
 
@@ -421,12 +421,12 @@ impl Demo {
                 }
                 Ok(None) => PreviewLine { id: String::new(), text: "No messages yet".to_owned(), sender: String::new(), mine: false, sent },
                 Err(err) => {
-                    eprintln!("chatd: demo: preview: {err}");
+                    tracing::warn!("chatd: demo: preview: {err}");
                     continue;
                 }
             };
             if let Err(err) = self.ctx.preview(id, &line) {
-                eprintln!("chatd: demo: preview: {err}");
+                tracing::warn!("chatd: demo: preview: {err}");
             }
         }
     }

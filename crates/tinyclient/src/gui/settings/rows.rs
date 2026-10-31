@@ -92,7 +92,7 @@ pub const ROWS: &[Row] = &[
     row("D1", Storage, "", "Storage used", &[], &["disk", "space", "size", "cache", "usage"]),
     row("D2", Storage, "", "Keep images and files up to", &["250 MB", "500 MB", "1 GB", "2 GB"], &["cache", "disk", "space", "limit"]),
     row("D3", Storage, "", "Clear saved messages and files", &[], &["clear", "delete", "cache", "free space"]),
-    row("B1", About, "", "Copy diagnostics", &[], &["support", "bug", "report", "version"]),
+    row("B1", About, "", "Copy diagnostics", &[], &["support", "bug", "report", "version", "log"]),
     row("B2", About, "", "Logs", &[], &["log", "debug", "support"]),
     row("B3", About, "", "Reset all settings", &[], &["reset", "defaults", "factory"]),
 ];

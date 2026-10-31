@@ -685,7 +685,7 @@ fn pictures(account: &Arc<Account>, watching: &protocol::Watching) {
         let pictures = match account.drive.thumbnails(&participants) {
             Ok(pictures) => pictures,
             // Asked again on the next connection.
-            Err(why) => return eprintln!("chatd: Messages: pictures: {why}"),
+            Err(why) => return tracing::warn!("chatd: Messages: pictures: {why}"),
         };
         for (participant, bytes) in pictures {
             // A new picture is a new id, so the shell never draws the old one in its place.
@@ -700,7 +700,7 @@ fn pictures(account: &Arc<Account>, watching: &protocol::Watching) {
         }
     });
     if let Err(err) = spawned {
-        eprintln!("chatd: Messages: {err}");
+        tracing::warn!("chatd: Messages: {err}");
     }
 }
 
@@ -745,7 +745,7 @@ fn serve(account: &Arc<Account>, command: Command) {
             message_id,
         } => {
             if let Err(why) = account.drive.mark_read(&conversation_id, &message_id) {
-                eprintln!("chatd: Messages: {why}");
+                tracing::warn!("chatd: Messages: {why}");
             }
         }
         Command::Send {
@@ -871,6 +871,6 @@ fn backfill(account: &Account, conversation: &str) {
                 receipt(account, conversation, &note);
             }
         }
-        Err(why) => eprintln!("chatd: Messages: {why}"),
+        Err(why) => tracing::warn!("chatd: Messages: {why}"),
     }
 }

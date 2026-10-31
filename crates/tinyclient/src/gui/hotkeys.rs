@@ -119,7 +119,7 @@ pub fn start(shell: WeakEntity<Shell>, cx: &mut App) {
     } else {
         let spawned = std::thread::Builder::new().name("hotkeys".to_owned()).stack_size(256 * 1024).spawn(move || watch(&toggles));
         if let Err(err) = spawned {
-            eprintln!("tinyclient: the voice keys could not be watched: {err}");
+            tracing::warn!("tinyclient: the voice keys could not be watched: {err}");
             return;
         }
     }
@@ -146,7 +146,7 @@ fn bindings() -> [Option<Binding>; 4] {
 /// The watching thread. Never returns while the app runs.
 fn watch(toggles: &Sender<Action>) {
     let Some(mut keys) = platform::Keys::open() else {
-        eprintln!("tinyclient: the keyboard cannot be watched here; voice keys work in the window only");
+        tracing::warn!("tinyclient: the keyboard cannot be watched here; voice keys work in the window only");
         return;
     };
     let mut bound = bindings();

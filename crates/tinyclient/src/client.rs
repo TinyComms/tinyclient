@@ -70,8 +70,24 @@ pub fn is_other_version(err: &io::Error) -> bool {
 /// chatd of another version does that.
 pub const OTHER_ANSWER: &str = "Parts of tinyclient are different versions. Quit and reopen tinyclient.";
 
+/// `down`, `timeout`, `refused`, `invalid`, or `other`. The error's own text is not included.
+pub fn failure_class(err: &io::Error) -> &'static str {
+    match err.kind() {
+        io::ErrorKind::NotFound
+        | io::ErrorKind::ConnectionRefused
+        | io::ErrorKind::ConnectionAborted
+        | io::ErrorKind::BrokenPipe => "down",
+        io::ErrorKind::TimedOut => "timeout",
+        io::ErrorKind::PermissionDenied => "refused",
+        io::ErrorKind::InvalidData => "invalid",
+        _ => "other",
+    }
+}
+
 /// What a failed request says to the user, in place of the system's error text (C14).
-pub fn trouble_words(err: &io::Error) -> String {
+/// Logs `action failed` with `op` and [`failure_class`], never the error's display.
+pub fn trouble_words(op: &'static str, err: &io::Error) -> String {
+    tracing::warn!(op, class = failure_class(err), "action failed");
     if is_gone(err) {
         "tinyclient's background service isn't running. It is being started again; try again in a moment.".to_owned()
     } else if is_slow(err) {
@@ -131,9 +147,18 @@ mod tests {
         assert_eq!(refusal_words(ErrorCode::Refused, "Slow mode is on."), "Slow mode is on.");
         assert!(is_gone(&io::Error::from(io::ErrorKind::ConnectionRefused)));
         for kind in [io::ErrorKind::NotFound, io::ErrorKind::TimedOut, io::ErrorKind::InvalidData, io::ErrorKind::Other] {
-            let words = trouble_words(&io::Error::new(kind, "os error 61"));
+            let words = trouble_words("window", &io::Error::new(kind, "os error 61"));
             assert!(!words.contains("chatd") && !words.contains("os error") && words.ends_with('.'), "{words}");
         }
         assert!(is_slow(&io::Error::from(io::ErrorKind::WouldBlock)) && !is_gone(&io::Error::from(io::ErrorKind::TimedOut)));
+    }
+
+    #[test]
+    fn failure_class_maps_io_kinds() {
+        assert_eq!(failure_class(&io::Error::new(io::ErrorKind::TimedOut, "x")), "timeout");
+        assert_eq!(failure_class(&io::Error::new(io::ErrorKind::NotFound, "x")), "down");
+        assert_eq!(failure_class(&io::Error::new(io::ErrorKind::InvalidData, "body")), "invalid");
+        assert_eq!(failure_class(&io::Error::new(io::ErrorKind::PermissionDenied, "no")), "refused");
+        assert_eq!(failure_class(&io::Error::new(io::ErrorKind::Other, "os error 61")), "other");
     }
 }

@@ -1285,7 +1285,7 @@ fn run_your_own() -> Div {
         .child("Don't have a server?")
         .child(link("signin-tinyserver", "Run your own with tinyserver").type_small().on_click(|_, _, _| {
             if let Err(why) = super::call::open(TINYSERVER_URL) {
-                eprintln!("tinyclient: {why}");
+                tracing::warn!("tinyclient: {why}");
             }
         }))
 }

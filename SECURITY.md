@@ -98,11 +98,14 @@ turns off the credential store, so a stray variable cannot send a real session e
 **TLS** is the system's (Security.framework, SChannel, OpenSSL through `native-tls`), except for
 Signal, whose libraries use rustls pinned to Signal's own certificate authority.
 
-**Logs.** `chatd.log` and `crash.log` stay in the data directory. Panic reports and connection
-errors pass through `protocol::redact`, which removes Slack, Discord and Teams tokens, JWTs,
-authorization headers, signed URL parameters and Signal's passwords and keys
-(`crates/protocol/src/crash.rs`). There is no telemetry and no crash upload: "Copy report" in the
-window copies the last entry to your clipboard and nothing more.
+**Logs.** Each process writes `logs/tinyclient.log`, `logs/chatd.log`, `logs/mediad.log`, or
+`logs/login.log` under the support directory, rolling at 2 MiB with two older generations.
+`logs/bundles/` is written only when you choose Save debug log, and nothing uploads those files.
+Panic text still goes to `crash.log`. Every line passes through `protocol::redact`, which removes
+Slack, Discord and Teams tokens, JWTs, authorization headers, signed URL parameters, PEM blocks,
+ICE passwords, and Signal's passwords and keys (`crates/protocol/src/crash.rs`). There is no
+telemetry and no crash upload. Copy diagnostics copies a short status blurb, not log lines.
+"Copy report" copies the last panic entry to your clipboard and nothing more.
 
 **Tiny server calls** are end-to-end encrypted when the server lists `e2ee_calls` and everyone in
 the room's call has an app that can do it (`crates/mediad/src/e2ee.rs`). The apps in the call form

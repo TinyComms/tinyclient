@@ -596,7 +596,7 @@ impl Slack {
 
     fn report(&self, result: Result<(), Failure>) {
         if let Err(Failure::SignedOut(why) | Failure::Dropped(why)) = result {
-            eprintln!("chatd: Slack: {}", redact(&why));
+            tracing::warn!("chatd: Slack: {}", redact(&why));
         }
     }
 

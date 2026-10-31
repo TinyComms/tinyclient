@@ -544,7 +544,7 @@ impl Shell {
                         return;
                     }
                     Err(err) => {
-                        shell.toast(Some(("icons/circle-alert.svg", theme::danger())), crate::client::trouble_words(&err), cx);
+                        shell.toast(Some(("icons/circle-alert.svg", theme::danger())), crate::client::trouble_words("page", &err), cx);
                         return;
                     }
                 };
@@ -917,7 +917,7 @@ impl Shell {
                     Ok(Response::MessageHits { hits }) => Ok(hits),
                     Ok(Response::Error { code, detail }) => Err(asked_words(code, &detail)),
                     Ok(_) => Err(crate::client::OTHER_ANSWER.to_owned()),
-                    Err(err) => Err(crate::client::trouble_words(&err)),
+                    Err(err) => Err(crate::client::trouble_words("page", &err)),
                 };
                 if result.is_err() {
                     page.network_asked_for = None;
@@ -1113,7 +1113,7 @@ impl Shell {
                 Ok(Response::Pinned { messages, .. }) => Ok(messages.into_iter().map(Rc::new).collect()),
                 Ok(Response::Error { detail, .. }) => Err(detail),
                 Ok(_) => Err("The pins could not be read.".to_owned()),
-                Err(err) => Err(crate::client::trouble_words(&err)),
+                Err(err) => Err(crate::client::trouble_words("page", &err)),
             };
             let _ = this.update(cx, |shell, cx| {
                 if let Some(pins) = shell.conversation_state.side.pins.as_mut().filter(|pins| pins.conversation == conversation) {

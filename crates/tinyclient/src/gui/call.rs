@@ -360,7 +360,7 @@ fn ensure_daemon() {
                 command.stderr(out);
             }
             if let Err(err) = command.spawn() {
-                eprintln!("tinyclient: could not start chatd: {err}");
+                tracing::warn!("tinyclient: could not start chatd: {err}");
             }
         });
     });
@@ -714,7 +714,7 @@ impl Shell {
             let refused = match answer {
                 Ok(Response::Error { detail, .. }) => Some(detail),
                 Ok(_) => None,
-                Err(err) => Some(crate::client::trouble_words(&err)),
+                Err(err) => Some(crate::client::trouble_words("call", &err)),
             };
             let _ = this.update(cx, |this, cx| {
                 if refused.is_some() {
@@ -893,7 +893,7 @@ impl Shell {
                     match ask(request) {
                         Ok(Response::Error { detail, .. }) => return Err(Some(detail)),
                         Ok(_) => {}
-                        Err(err) => return Err(Some(crate::client::trouble_words(&err))),
+                        Err(err) => return Err(Some(crate::client::trouble_words("call", &err))),
                     }
                 }
                 Ok(())
@@ -951,7 +951,7 @@ impl Shell {
                     Ok(Response::Link { url }) => open(&url),
                     Ok(Response::Error { detail, .. }) => Err(detail),
                     Ok(_) => Err(crate::client::OTHER_ANSWER.to_owned()),
-                    Err(err) => Err(crate::client::trouble_words(&err)),
+                    Err(err) => Err(crate::client::trouble_words("call", &err)),
                 }
             };
             let refused = cx.background_executor().spawn(work).await.err();

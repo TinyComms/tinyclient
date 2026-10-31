@@ -47,7 +47,7 @@ pub fn run() {
                 }
                 Err(err) if err.kind() == ErrorKind::UnexpectedEof => return,
                 Err(err) => {
-                    eprintln!("mediad: {err}");
+                    tracing::warn!("mediad: {err}");
                     return;
                 }
             }
@@ -82,6 +82,14 @@ pub fn run() {
                         MediaRequest::Processing(processing) => controls.set_processing(processing),
                         MediaRequest::Input(mode) => controls.set_input(mode),
                         MediaRequest::Cue { cue } => controls.cue(cue),
+                        MediaRequest::SaveLogs => {
+                            let path = protocol::log_policy::current()
+                                .and_then(|guard| guard.export_bundle().ok().flatten())
+                                .map(|path| path.display().to_string())
+                                .unwrap_or_default();
+                            out::send(&MediaResponse::LogsSaved { path });
+                            continue;
+                        }
                         _ => {
                             out::send(&MediaResponse::Refused { detail: "There is no call.".to_owned() });
                             continue;
@@ -96,7 +104,7 @@ pub fn run() {
         }
         let now = Instant::now();
         if metering.is_some_and(|since| now - since > METER_LIMIT) {
-            eprintln!("mediad: the microphone test ran 30 s; stopping it");
+            tracing::warn!("mediad: the microphone test ran 30 s; stopping it");
             metering = None;
         }
 

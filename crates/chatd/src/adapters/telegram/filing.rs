@@ -180,7 +180,7 @@ pub(super) fn ask_rules(account: &Account) -> Result<Vec<Rule>, Fault> {
 pub(super) fn report(account: &Account) {
     let rows = account.live().filed.rows();
     if let Err(err) = account.ctx.folders(&rows) {
-        eprintln!("chatd: Telegram: folders: {err}");
+        tracing::warn!("chatd: Telegram: folders: {err}");
     }
 }
 
@@ -198,7 +198,7 @@ pub(super) fn refile(account: &Account, whos: impl IntoIterator<Item = Who>) {
     };
     for (id, filing) in filings {
         if let Err(err) = account.ctx.filing(&id, &filing) {
-            eprintln!("chatd: Telegram: filing: {err}");
+            tracing::warn!("chatd: Telegram: filing: {err}");
         }
     }
 }
@@ -250,7 +250,7 @@ pub(super) fn apply(account: &Account, update: &tl::enums::Update) -> bool {
                 None => match pinned(account, pins.folder_id.unwrap_or(0)) {
                     Ok(order) => order,
                     Err(fault) => {
-                        eprintln!("chatd: Telegram: pins: {fault}");
+                        tracing::warn!("chatd: Telegram: pins: {fault}");
                         return true;
                     }
                 },
@@ -309,7 +309,7 @@ pub(super) fn apply(account: &Account, update: &tl::enums::Update) -> bool {
             match ask_rules(account) {
                 Ok(rules) => account.live().filed.rules = rules,
                 Err(fault) => {
-                    eprintln!("chatd: Telegram: folders: {fault}");
+                    tracing::warn!("chatd: Telegram: folders: {fault}");
                     return true;
                 }
             }

@@ -109,7 +109,7 @@ impl Player {
         match self.spawn(hub, &slot, generation) {
             Ok(stdin) => slot.stdin = Some(stdin),
             Err(err) => {
-                eprintln!("chatd: the player did not start: {err}");
+                tracing::warn!("chatd: the player did not start: {err}");
                 if let Some(shown) = &mut slot.shown {
                     shown.state = PlayState::Failed { detail: NO_PLAYER.to_owned() };
                 }
@@ -196,7 +196,7 @@ impl Player {
         slot.stdin = None;
         if let Some(shown) = &mut slot.shown {
             if matches!(shown.state, PlayState::Loading | PlayState::Playing) {
-                eprintln!("chatd: the player exited (clean: {clean}) while playing");
+                tracing::warn!("chatd: the player exited (clean: {clean}) while playing");
                 shown.state = PlayState::Failed { detail: NO_PLAYER.to_owned() };
             }
         }

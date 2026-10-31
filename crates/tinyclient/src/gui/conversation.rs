@@ -563,7 +563,7 @@ impl Pane {
                     self.older_failed = Some(match other {
                         Ok(Response::Error { detail, .. }) => detail,
                         Ok(_) => crate::client::OTHER_ANSWER.to_owned(),
-                        Err(err) => crate::client::trouble_words(&err),
+                        Err(err) => crate::client::trouble_words("send", &err),
                     });
                     if purpose == Purpose::Open {
                         // Nothing is known about this conversation, least of all that it is

@@ -96,7 +96,7 @@ impl Files {
                 if let Err(fault) = fetch(&account, &want, &mut carried) {
                     // A reference that ran out is renewed by the next page that names the file.
                     if !fault.is("FILE_REFERENCE_EXPIRED") {
-                        eprintln!("chatd: Telegram: file {}: {fault}", want.file.id);
+                        tracing::warn!("chatd: Telegram: file {}: {fault}", want.file.id);
                     }
                     // The viewer is waiting on an original: it is told, and keeps the still.
                     if want.original {
@@ -109,7 +109,7 @@ impl Files {
             }
         });
         if let Err(err) = spawned {
-            eprintln!("chatd: Telegram: files: {err}");
+            tracing::warn!("chatd: Telegram: files: {err}");
         }
         Files { jobs, waiting, held: Mutex::default() }
     }

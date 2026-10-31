@@ -49,7 +49,7 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
         super::Listed::Rows(rows) => rows,
         super::Listed::Empty => Vec::new(),
         super::Listed::Failed(detail) => {
-            eprintln!("chatd: Tiny server: rooms: {detail}");
+            tracing::warn!("chatd: Tiny server: rooms: {detail}");
             return;
         }
     };
@@ -426,7 +426,7 @@ fn load_page(ctx: &Context, saved: &Saved, conversation_id: &str, before: Option
     let limit = limit.clamp(1, PAGE_MAX);
     let before = before.as_deref().filter(|id| super::safe_id(id));
     if let Err(detail) = fetch_page(ctx, saved, conversation_id, before, limit) {
-        eprintln!("chatd: Tiny server: {conversation_id}: {detail}");
+        tracing::warn!("chatd: Tiny server: {conversation_id}: {detail}");
     }
 }
 
@@ -579,8 +579,8 @@ fn mark_read(saved: &Saved, conversation_id: &str, message_id: &str) {
     let path = format!("/v1/conversations/{conversation_id}/read");
     match super::asked("POST", saved, &path, Some(json!({ "message_id": message_id }))) {
         Ok((200 | 204, _)) => {}
-        Ok((status, _)) => eprintln!("chatd: Tiny server: read answered {status}"),
-        Err(detail) => eprintln!("chatd: Tiny server: read: {detail}"),
+        Ok((status, _)) => tracing::warn!("chatd: Tiny server: read answered {status}"),
+        Err(detail) => tracing::warn!("chatd: Tiny server: read: {detail}"),
     }
 }
 
@@ -829,16 +829,16 @@ fn optional_list<T: serde::de::DeserializeOwned>(saved: &Saved, path: &str, key:
         Ok((200, body)) => match list_of(body, key) {
             Ok(rows) => Some(rows),
             Err(()) => {
-                eprintln!("chatd: Tiny server: {path} could not be read");
+                tracing::warn!("chatd: Tiny server: {path} could not be read");
                 None
             }
         },
         Ok((status, _)) => {
-            eprintln!("chatd: Tiny server: {path} answered {status}");
+            tracing::warn!("chatd: Tiny server: {path} answered {status}");
             None
         }
         Err(detail) => {
-            eprintln!("chatd: Tiny server: {path}: {detail}");
+            tracing::warn!("chatd: Tiny server: {path}: {detail}");
             None
         }
     }

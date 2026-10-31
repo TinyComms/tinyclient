@@ -125,7 +125,7 @@ pub fn run(site: Site, at: Option<(f64, f64)>, network: &str) {
                     state.lock().unwrap().current_url = url.clone();
                 }
                 if matches!(event, PageLoadEvent::Finished) && load_failed_message(&url) {
-                    eprintln!("tinyclient-login: the page did not load: {url}");
+                    tracing::warn!(class = "network", "login failed");
                     std::process::exit(LOAD_FAILED);
                 }
             }
@@ -202,7 +202,7 @@ fn tick(web: &WebView, site: Site, agent: &str, state: &Arc<Mutex<State>>) {
         }
         if hands_off(&at) {
             if std::env::var_os("TINYCLIENT_LOGIN_DEBUG").is_some() {
-                eprintln!("tinyclient-login: waiting for the login page to finish");
+                tracing::warn!("tinyclient-login: waiting for the login page to finish");
             }
             return;
         }
@@ -210,7 +210,7 @@ fn tick(web: &WebView, site: Site, agent: &str, state: &Arc<Mutex<State>>) {
         if web_client(&at) {
             let since = guard.on_client.get_or_insert_with(Instant::now);
             if since.elapsed() >= NO_TOKEN_AFTER {
-                eprintln!(
+                tracing::warn!(
                     "tinyclient-login: signed in to Slack, but the browser holds no token to read after \
                      {} seconds; Enterprise Grid organizations are known to do this",
                     NO_TOKEN_AFTER.as_secs()
@@ -233,7 +233,7 @@ fn tick(web: &WebView, site: Site, agent: &str, state: &Arc<Mutex<State>>) {
         let mut guard = state_page.lock().unwrap();
         if blocked(url, text) && !guard.refused {
             guard.refused = true;
-            eprintln!("tinyclient-login: the organization does not allow this sign-in");
+            tracing::warn!("tinyclient-login: the organization does not allow this sign-in");
         }
     });
 
@@ -246,7 +246,7 @@ fn tick(web: &WebView, site: Site, agent: &str, state: &Arc<Mutex<State>>) {
         if std::env::var_os("TINYCLIENT_LOGIN_DEBUG").is_some() {
             // Never print the JavaScript result: it may contain credentials.
             let received = !value.is_empty() && value != "null" && value != "undefined";
-            eprintln!("tinyclient-login: session probe completed; result present: {received}");
+            tracing::warn!("tinyclient-login: session probe completed; result present: {received}");
         }
         let Some(text) = js_return(&value) else {
             return;

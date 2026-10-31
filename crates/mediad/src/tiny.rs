@@ -424,7 +424,7 @@ impl Call {
         self.close();
         self.link = link;
         if let Err(err) = self.register() {
-            eprintln!("mediad: the new connection's socket: {err}");
+            tracing::warn!("mediad: the new connection's socket: {err}");
         }
         self.packets.clear();
         // Still connected as far as we could tell (the server stopped hearing us, or restarted
@@ -488,9 +488,20 @@ impl Call {
 
     fn event(&mut self, event: Event) {
         match event {
-            Event::Connected => self.up(),
+            Event::Connected => {
+                tracing::info!(state = "dtls_connected", "media state");
+                self.up();
+            }
+            Event::IceConnectionStateChange(IceConnectionState::Checking) => {
+                tracing::info!(state = "ice_checking", "media state");
+            }
             Event::IceConnectionStateChange(IceConnectionState::Disconnected) => self.fell(),
-            Event::IceConnectionStateChange(IceConnectionState::Connected | IceConnectionState::Completed) if self.lost.is_some() && self.audio.is_some() => self.up(),
+            Event::IceConnectionStateChange(IceConnectionState::Connected | IceConnectionState::Completed) => {
+                tracing::info!(state = "ice_connected", "media state");
+                if self.lost.is_some() && self.audio.is_some() {
+                    self.up();
+                }
+            }
             Event::PeerStats(stats) => {
                 let pair = stats.selected_candidate_pair.as_ref();
                 self.meter.round_trip(stats.rtt.or_else(|| pair.and_then(|pair| pair.current_round_trip_time)));
@@ -763,7 +774,7 @@ impl Call {
                         self.key_share = want_share;
                         out::send(&MediaResponse::TinyRenegotiate { sdp });
                     }
-                    Err(err) => eprintln!("mediad: the share could not be offered: {err}"),
+                    Err(err) => tracing::warn!("mediad: the share could not be offered: {err}"),
                 }
             } else if want_camera != self.sending_camera {
                 if want_camera {
@@ -777,7 +788,7 @@ impl Call {
                         self.key_camera = want_camera;
                         out::send(&MediaResponse::TinyRenegotiate { sdp });
                     }
-                    Err(err) => eprintln!("mediad: the camera could not be offered: {err}"),
+                    Err(err) => tracing::warn!("mediad: the camera could not be offered: {err}"),
                 }
             }
         }
@@ -1037,7 +1048,7 @@ impl Call {
             };
             if let Some(packet) = self.packets.pop_front() {
                 if !self.input(packet) {
-                    eprintln!("mediad: str0m refused a packet");
+                    tracing::warn!("mediad: str0m refused a packet");
                 }
                 continue;
             }
@@ -1057,7 +1068,7 @@ impl Call {
             let wait = timeout.min(next).saturating_duration_since(now).max(Duration::from_millis(1));
             if let Err(err) = self.poll.poll(&mut events, Some(wait)) {
                 if err.kind() != ErrorKind::Interrupted {
-                    eprintln!("mediad: waiting on the call's sockets: {err}");
+                    tracing::warn!("mediad: waiting on the call's sockets: {err}");
                     out::fail(CallFailure::Engine, ENGINE);
                 }
             }
@@ -1076,7 +1087,7 @@ impl Call {
         }
         for (mid, slot) in &self.slots {
             let jitter = &slot.stream.jitter;
-            eprintln!("mediad: slot {mid}: {} lost ({} rebuilt), {} late", jitter.lost, slot.stream.rebuilt, jitter.late);
+            tracing::warn!("mediad: slot {mid}: {} lost ({} rebuilt), {} late", jitter.lost, slot.stream.rebuilt, jitter.late);
         }
         if let Some(audio) = &self.audio {
             media::sign_off(audio);
@@ -1101,7 +1112,7 @@ pub fn run(link: Link, user_id: String, controls: Arc<Controls>) {
     let _timer = rt::FineTimer::hold();
     rt::tick_thread();
     let (Some(encoder), Ok(poll)) = (Encoder::voice(), Poll::new()) else {
-        eprintln!("mediad: the Opus encoder or the poller could not be made");
+        tracing::warn!("mediad: the Opus encoder or the poller could not be made");
         out::fail(CallFailure::Engine, ENGINE);
     };
     let mut call = Call {
@@ -1145,7 +1156,7 @@ pub fn run(link: Link, user_id: String, controls: Arc<Controls>) {
         camera_noted: false,
     };
     if let Err(err) = call.register() {
-        eprintln!("mediad: the call's socket: {err}");
+        tracing::warn!("mediad: the call's socket: {err}");
         out::fail(CallFailure::Engine, ENGINE);
     }
     call.run();

@@ -421,7 +421,7 @@ impl Call {
     /// connection starts DAVE from a fresh key package, whatever came before).
     fn move_to(&mut self, next: VoiceJoin) {
         self.stop_media();
-        eprintln!("mediad: the call moved to {}", next.endpoint);
+        tracing::warn!("mediad: the call moved to {}", next.endpoint);
         self.join = next;
         self.seq_ack = None;
         self.transport = None;
@@ -452,7 +452,7 @@ impl Call {
         let port = d["port"].as_u64().and_then(|n| u16::try_from(n).ok()).ok_or_else(malformed)?;
         let offered: Vec<String> = d["modes"].as_array().into_iter().flatten().filter_map(text).collect();
         let Some(mode) = rtp::choose_mode(&offered) else {
-            eprintln!("mediad: no transport mode in common; offered {offered:?}");
+            tracing::warn!("mediad: no transport mode in common; offered {offered:?}");
             return Err(End::Fatal(CallFailure::Encryption, NO_CIPHER.to_owned()));
         };
 
@@ -502,7 +502,7 @@ impl Call {
             .filter_map(|byte| byte.as_u64().and_then(|b| u8::try_from(b).ok()))
             .collect();
         let (Some(seal), Some(open)) = (Cipher::new(mode, &key), Cipher::new(mode, &key)) else {
-            eprintln!("mediad: the voice server chose {mode:?} with a {} byte key", key.len());
+            tracing::warn!("mediad: the voice server chose {mode:?} with a {} byte key", key.len());
             return Err(End::Fatal(CallFailure::Encryption, NO_CIPHER.to_owned()));
         };
         let version = number(&d["dave_protocol_version"]).unwrap_or(0) as u16;
@@ -546,7 +546,7 @@ impl Call {
             .name("media".to_owned())
             .spawn(move || media::run(setup))
             .map_err(|err| {
-                eprintln!("mediad: the media thread did not start: {err}");
+                tracing::warn!("mediad: the media thread did not start: {err}");
                 End::Fatal(CallFailure::Engine, ENGINE.to_owned())
             })?;
         self.media = Some(Media { stop, thread });
@@ -701,7 +701,7 @@ impl Call {
                 Ok(Incoming::Json { op, d }) => self.json(socket, op, d),
                 Ok(Incoming::Binary { op, payload }) => self.binary(socket, op, &payload),
                 Ok(Incoming::Closed(code)) => {
-                    eprintln!("mediad: the voice server closed the socket ({code:?})");
+                    tracing::warn!("mediad: the voice server closed the socket ({code:?})");
                     return match closed(code) {
                         Closed::Resume => End::Dropped(Why::Silent, format!("the voice server closed the connection ({code:?})")),
                         Closed::Ended => End::Ended,
@@ -785,7 +785,7 @@ impl Call {
 /// does not return (`out::fail` exits).
 pub fn run(join: VoiceJoin, controls: Arc<Controls>) {
     let (Ok(user), Ok(room)) = (join.user_id.parse::<u64>(), join.channel_id.parse::<u64>()) else {
-        eprintln!("mediad: the voice session's ids are not numbers ({:?}, {:?})", join.user_id, join.channel_id);
+        tracing::warn!("mediad: the voice session's ids are not numbers ({:?}, {:?})", join.user_id, join.channel_id);
         out::fail(CallFailure::Refused, UNUSABLE);
     };
     if join.dave.required && join.dave.max_version.min(dave::MAX_VERSION) == 0 {
@@ -841,7 +841,7 @@ pub fn run(join: VoiceJoin, controls: Arc<Controls>) {
                 out::fail(CallFailure::Lost, DROPPED);
             }
             resumes += 1;
-            eprintln!("mediad: resume {resumes} of {RESUMES}");
+            tracing::warn!("mediad: resume {resumes} of {RESUMES}");
             out::send(&MediaResponse::Interrupted);
             // Heard once per drop, not once per try.
             if resumes == 1 {
@@ -858,7 +858,7 @@ pub fn run(join: VoiceJoin, controls: Arc<Controls>) {
                 out::fail(CallFailure::Lost, words);
             }
             attempt += 1;
-            eprintln!("mediad: joining {}, try {attempt} of {ATTEMPTS}", call.join.endpoint);
+            tracing::warn!("mediad: joining {}, try {attempt} of {ATTEMPTS}", call.join.endpoint);
             BACKOFF * (attempt - 1)
         };
         match call.wait(pause, false) {
@@ -875,7 +875,7 @@ pub fn run(join: VoiceJoin, controls: Arc<Controls>) {
             End::Fatal(reason, detail) => out::fail(reason, detail),
             End::Moved => {}
             End::Removed => {
-                eprintln!("mediad: the voice server dropped us; waiting {MOVE:?} to hear where the call moved");
+                tracing::warn!("mediad: the voice server dropped us; waiting {MOVE:?} to hear where the call moved");
                 out::send(&MediaResponse::Interrupted);
                 match call.wait(MOVE, true) {
                     Waited::Moved => {}
@@ -884,7 +884,7 @@ pub fn run(join: VoiceJoin, controls: Arc<Controls>) {
                 }
             }
             End::Dropped(kind, detail) => {
-                eprintln!("mediad: connection dropped: {detail}");
+                tracing::warn!("mediad: connection dropped: {detail}");
                 if resume && began.elapsed() > HELD {
                     resumes = 0;
                 }

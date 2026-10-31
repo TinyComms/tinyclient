@@ -473,7 +473,7 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::OpenHome => {
             if std::mem::take(&mut account.live().stale) {
                 if let Err(fault) = sync::dialogs(account) {
-                    eprintln!("chatd: Telegram: chats: {fault}");
+                    tracing::warn!("chatd: Telegram: chats: {fault}");
                 }
             }
         }
@@ -607,7 +607,7 @@ fn mark_read(account: &Account, conversation: &str, message: &str) {
         }
     };
     if let Err(fault) = told {
-        eprintln!("chatd: Telegram: read: {fault}");
+        tracing::warn!("chatd: Telegram: read: {fault}");
     }
 }
 

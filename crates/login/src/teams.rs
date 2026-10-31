@@ -151,7 +151,7 @@ fn random(bytes: usize) -> String {
     let mut buffer = vec![0u8; bytes];
     let read = random_bytes(&mut buffer);
     if let Err(err) = read {
-        eprintln!("tinyclient-login: no randomness to sign in with: {err}");
+        tracing::warn!("tinyclient-login: no randomness to sign in with: {err}");
         std::process::exit(super::LOAD_FAILED);
     }
     encode(&buffer)
@@ -269,18 +269,25 @@ fn organization(code: &str) -> bool {
 }
 
 /// Ends the helper because Microsoft refused the sign-in, saying which way on stderr.
+/// Static class and the OAuth error code. Microsoft's sentence is not included.
+fn provider_failure(code: &str) -> String {
+    let class = if organization(code) { "policy" } else { "provider" };
+    format!("{class} {code}")
+}
+
 fn refuse(error: &str, description: &str) -> ! {
     let code = aadsts(description).unwrap_or(error);
-    let said = description.lines().next().unwrap_or("").chars().take(300).collect::<String>();
+    let recorded = provider_failure(code);
+    let class = recorded.split(' ').next().unwrap_or("provider");
     if organization(code) {
-        eprintln!("tinyclient-login: the organization does not allow this sign-in ({code}): {said}");
+        tracing::warn!(class, code, "login failed");
         std::process::exit(super::BLOCKED);
     }
     // Declining the page's own prompt is closing the window by another button.
     if error == "access_denied" && aadsts(description).is_none() {
         std::process::exit(super::CLOSED);
     }
-    eprintln!("tinyclient-login: Microsoft refused the sign-in ({code}): {said}");
+    tracing::warn!(class, code, "login failed");
     std::process::exit(REFUSED);
 }
 
@@ -298,7 +305,7 @@ fn read(found: &str) -> Option<serde_json::Value> {
             static SHOWN: OnceLock<Instant> = OnceLock::new();
             let code = aadsts(text).filter(|code| organization(code) && !super::blocked(url, text))?;
             let since = SHOWN.get_or_init(|| {
-                eprintln!("tinyclient-login: the organization does not allow this sign-in ({code})");
+                tracing::warn!("tinyclient-login: the organization does not allow this sign-in ({code})");
                 Instant::now()
             });
             if since.elapsed() >= READ_IT {
@@ -392,7 +399,7 @@ fn signed_in(code: &str, verifier: &str) -> serde_json::Value {
     let redeemed = match token(&agent, TENANT, &grant) {
         Ok(redeemed) => redeemed,
         Err(why) => {
-            eprintln!("tinyclient-login: Microsoft could not be reached to finish the sign-in: {why}");
+            tracing::warn!("tinyclient-login: Microsoft could not be reached to finish the sign-in: {why}");
             std::process::exit(super::LOAD_FAILED);
         }
     };
@@ -428,7 +435,7 @@ fn signed_in(code: &str, verifier: &str) -> serde_json::Value {
         let reached = token(&agent, &id, &[("grant_type", "refresh_token"), ("refresh_token", refresh.as_str())]);
         match reached.ok().filter(|reached| reached.status == 200).map(|reached| text(&reached.body["refresh_token"])) {
             Some(own) if !own.is_empty() => tenants.push((id, name, own)),
-            _ => eprintln!("tinyclient-login: guest tenant {name:?} did not accept this sign-in and is left out"),
+            _ => tracing::warn!("tinyclient-login: guest tenant {name:?} did not accept this sign-in and is left out"),
         }
     }
     session(&claims, &tenants)
@@ -498,6 +505,14 @@ mod tests {
         assert_eq!(aadsts("Sorry, but we're having trouble signing you in.\nAADSTS50105: Your administrator has configured the application"), Some("AADSTS50105"));
         assert_eq!(aadsts("Error code: AADSTS7000112 (application disabled)"), Some("AADSTS7000112"));
         assert_eq!((aadsts("Sign in to your account"), aadsts("AADSTS"), aadsts("AADSTS12 is too short")), (None, None, None));
+    }
+
+    #[test]
+    fn provider_failure_keeps_the_code_and_drops_the_description() {
+        let line = provider_failure("access_denied");
+        assert!(line.contains("access_denied"));
+        assert!(!line.contains("error_description"));
+        assert!(provider_failure("AADSTS53003").starts_with("policy "));
     }
 
     #[test]

@@ -362,7 +362,7 @@ fn ensure_row(account: &Account, peer: &Peer, title: &str) {
         Ok(Some(known)) if title.is_empty() || known.title == title => {}
         // A picture fetched earlier stays the row's.
         Ok(Some(_)) | Ok(None) => drop(account.ctx.conversation(&ConversationRow { avatar: account.ctx.avatar_of(&id), ..row(peer, title) })),
-        Err(err) => eprintln!("chatd: Signal: {err}"),
+        Err(err) => tracing::warn!("chatd: Signal: {err}"),
     }
 }
 
@@ -631,7 +631,7 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::Watch(watching) => pictures(account, &watching),
         Command::SignOut(reply) => {
             if let Err(fault) = account.wire.unlink() {
-                eprintln!("chatd: Signal: unlinking: {}", super::net::redact(&fault.to_string()));
+                tracing::warn!("chatd: Signal: unlinking: {}", super::net::redact(&fault.to_string()));
             }
             let _ = reply.send(Ok(()));
         }
@@ -664,7 +664,7 @@ fn pictures(account: &Arc<Account>, watching: &protocol::Watching) {
                 Ok(_) => continue,
                 // Asked again on the next connection.
                 Err(fault) => {
-                    eprintln!("chatd: Signal: picture: {}", super::net::redact(&fault.to_string()));
+                    tracing::warn!("chatd: Signal: picture: {}", super::net::redact(&fault.to_string()));
                     continue;
                 }
             };
@@ -678,7 +678,7 @@ fn pictures(account: &Arc<Account>, watching: &protocol::Watching) {
         }
     });
     if let Err(err) = spawned {
-        eprintln!("chatd: Signal: {err}");
+        tracing::warn!("chatd: Signal: {err}");
     }
 }
 
@@ -768,7 +768,7 @@ fn mark_read(account: &Account, conversation: &str, message_id: &str) {
         return;
     }
     if let Err(fault) = account.wire.read(&read, receipts) {
-        eprintln!("chatd: Signal: read: {}", super::net::redact(&fault.to_string()));
+        tracing::warn!("chatd: Signal: read: {}", super::net::redact(&fault.to_string()));
     }
 }
 
