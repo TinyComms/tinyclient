@@ -887,6 +887,13 @@ impl Render for Shell {
         self.follow_changes(cx);
         self.refresh_menus(cx);
         self.note_tiny_page(cx);
+        // The form is decided once per frame, with hysteresis (`phone::form`), and the phone's
+        // own entities exist before any of its screens is drawn.
+        let phone_form = super::phone::form(super::phone::active(), f32::from(window.viewport_size().width));
+        super::phone::set_active(phone_form);
+        if phone_form {
+            self.phone_prepare(cx);
+        }
         // Before the first answer the window is still drawn: rail, strips, an empty list, and
         // what it waits on. Never a blank canvas, never a developer message.
         let placeholder;
@@ -901,10 +908,8 @@ impl Render for Shell {
         // first-launch screen waits until it is done.
         let settled = !self.service.keychain.reading && self.shown().empty_state().is_none();
         let width = f32::from(window.viewport_size().width);
-        // One window, one form, noted before any component asks.
-        super::phone::set_active(phone(width));
         self.phone_state.sync(self.snapshot.as_ref().and_then(|snapshot| snapshot.open.as_ref()));
-        if phone(width) {
+        if phone_form {
             if self.snapshot.is_some() && snapshot.signed_in().is_empty() && settled {
                 return root.child(self.first_run(snapshot, cx));
             }

@@ -9,10 +9,14 @@
 use gpui::{hsla, point, px, rgb, rgba, BoxShadow, Rgba, Styled};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-/// The status bar. The pin has no `WindowInsets` getter (`20-implementation-map` §3.4), so the
-/// phone form reserves the iOS value rather than reading it.
+/// The fallback status bar and home indicator: the iOS values. The platform feeds the real ones
+/// through [`set_insets`]; until it does, these stand in (see there for what is still owed).
 pub const SAFE_TOP: f32 = 44.;
 pub const SAFE_BOTTOM: f32 = 34.;
+/// How far a press may travel before it is a scroll, not a tap. A thumb wobbles about 4 pt.
+pub const SLOP: f32 = 10.;
+/// A sheet may take this share of the window's height, and no more: the list behind stays visible.
+pub const SHEET_CAP: f32 = 0.6;
 /// Chrome heights: the nav strip and the tab bar. The tab bar carries the safe area below it.
 pub const NAV: f32 = 52.;
 /// 8 above the icon, 22 of it, 10 between it and the label, 14 of label, 2 under: 56.
@@ -25,7 +29,75 @@ pub const GUTTER: f32 = 16.;
 /// Where a row's rule starts: past the 40 pt avatar and its 16 + 12 of air.
 pub const RULE_START: f32 = 76.;
 
-// A 200% text run multiplies the phone's type, not the desktop's. 1 by default.
+// Insets. What the platform still owes: iOS `safeAreaInsets` and the keyboard frame, and on
+// Android the status and navigation bar insets and whether the IME is visible. It calls
+// `set_insets` whenever any of them change; nothing else in the phone reads a constant.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Insets {
+    /// The status bar, in points.
+    pub top: f32,
+    /// The home indicator or the navigation bar, in points.
+    pub bottom: f32,
+    /// The soft keyboard's height in points; 0 while it is down.
+    pub keyboard: f32,
+}
+
+static INSETS: std::sync::Mutex<Option<Insets>> = std::sync::Mutex::new(None);
+
+/// The one place the platform feeds real window insets into. Call it whenever they change; the
+/// phone reads them on every frame through [`safe_top`], [`safe_bottom`] and [`keyboard_open`].
+// Nothing calls it until a platform shell does (see the note above), so a build without one says
+// nothing about it.
+#[allow(dead_code)] // Nothing feeds it until a platform shell does.
+pub fn set_insets(insets: Insets) {
+    if let Ok(mut held) = INSETS.lock() {
+        *held = Some(insets);
+    }
+}
+
+fn insets() -> Option<Insets> {
+    INSETS.lock().ok().and_then(|held| *held)
+}
+
+/// The status bar's height now: the platform's when it has said, else [`SAFE_TOP`].
+pub fn safe_top() -> f32 {
+    insets().map_or(SAFE_TOP, |insets| insets.top)
+}
+
+/// The home indicator's height now: the platform's when it has said, else [`SAFE_BOTTOM`].
+pub fn safe_bottom() -> f32 {
+    insets().map_or(SAFE_BOTTOM, |insets| insets.bottom)
+}
+
+/// The soft keyboard's height now: 0 while it is down, or while the platform has not said.
+pub fn keyboard() -> f32 {
+    insets().map_or(0., |insets| insets.keyboard)
+}
+
+/// The bottom padding the composer keeps. While the keyboard is up the home indicator is behind
+/// it, so the composer sits on the keyboard's edge instead of reserving room it cannot show.
+pub fn bottom_padding(safe_bottom: f32, keyboard: f32) -> f32 {
+    if keyboard > 0. {
+        0.
+    } else {
+        safe_bottom
+    }
+}
+
+/// Whether a press that began at `from` and is now at `to` is still a tap.
+pub fn within_slop(from: (f32, f32), to: (f32, f32)) -> bool {
+    let (dx, dy) = (to.0 - from.0, to.1 - from.1);
+    dx * dx + dy * dy <= SLOP * SLOP
+}
+
+/// The tallest a sheet may be in a window `window_height` tall.
+pub fn sheet_cap(window_height: f32) -> f32 {
+    window_height * SHEET_CAP
+}
+
+// A 200% text run multiplies the phone's type, not the desktop's. 1 by default. The platform's
+// font scale is fed through `set_text_scale`; the desktop's own step (`theme::text_step`) is read
+// directly, so a step chosen in Settings reaches the phone too.
 static SCALE: AtomicU32 = AtomicU32::new(0);
 
 pub fn text_scale() -> f32 {
@@ -35,22 +107,36 @@ pub fn text_scale() -> f32 {
     }
 }
 
-/// Sets a text scale for the phone, clamped to something a screen can hold.
-#[cfg_attr(not(any(test, feature = "gui-shot")), allow(dead_code))]
+/// Sets the phone's text run, clamped to something a screen can hold. The platform calls this
+/// when its font scale changes (Android `fontScale`, iOS `preferredContentSizeCategory`); the
+/// screenshot harness calls it for `--text-scale`.
+#[allow(dead_code)] // Called by the screenshot harness and by the platform's font-scale hook.
 pub fn set_text_scale(scale: f32) -> f32 {
     let scale = if scale.is_finite() { scale.clamp(1., 3.) } else { 1. };
     SCALE.store(scale.to_bits(), Ordering::Relaxed);
     scale
 }
 
-/// A type size at the current phone scale.
-pub fn scaled(size: f32) -> f32 {
-    (size * text_scale() * 2.).round() / 2.
+/// A type size for a desktop step and a phone run: each step adds a point, then the run
+/// multiplies, rounded to a half point.
+pub fn type_size(size: f32, step: i32, scale: f32) -> f32 {
+    ((size + step as f32) * scale * 2.).round() / 2.
 }
 
-/// A row height at the current phone scale: rows grow with their text, so nothing clips.
+/// A type size at the current phone run and the current desktop step.
+pub fn scaled(size: f32) -> f32 {
+    type_size(size, crate::gui::theme::text_step(), text_scale())
+}
+
+/// A row height for a desktop step and a phone run. Rows grow with their text, so nothing clips.
+/// The step adds 4 a level, as the desktop's 48-point rows do.
+pub fn row_height_for(step: i32, scale: f32) -> f32 {
+    ROW + 4. * step as f32 + (scale - 1.) * 32.
+}
+
+/// A row height now: 64 at 100%, 96 at 200%, and the desktop step on top.
 pub fn row_height() -> f32 {
-    ROW + (text_scale() - 1.) * 32.
+    row_height_for(crate::gui::theme::text_step(), text_scale())
 }
 
 /// A sheet's one-line choice: 56 at 100%, 68 at 200%, so a 40 pt line of type keeps its air.
@@ -58,8 +144,24 @@ pub fn sheet_row() -> f32 {
     56. + (text_scale() - 1.) * 12.
 }
 
+/// Lines a tab label may take: one at 100%, two once the run is above it, so "Needs me" wraps
+/// at 200% instead of truncating.
+pub fn tab_lines(scale: f32) -> u32 {
+    if scale > 1. {
+        2
+    } else {
+        1
+    }
+}
+
+/// The tab cell's height: 56 with one 14 pt line of label under the icon, growing by the label's
+/// extra lines. The icon and its badge stay where they are at every scale.
+pub fn tab_height_for(lines: u32, label_line: f32) -> f32 {
+    TAB - 14. + lines as f32 * label_line
+}
+
 pub fn tab_height() -> f32 {
-    TAB
+    tab_height_for(tab_lines(text_scale()), scaled(14.))
 }
 
 // Surfaces. A ladder, not one flat black: the page is the floor, chrome sits one step above
@@ -79,6 +181,7 @@ pub fn raised() -> Rgba {
 
 // Lines. 0.07 and 0.12: a hairline reads as a seam, a strong hairline as an edge. A row's rule
 // is quieter than a seam (0.055) and starts past the avatar, so the column of faces stays whole.
+/// Chrome edges and section dividers.
 pub fn hairline() -> Rgba {
     rgba(0xffffff12)
 }
@@ -86,6 +189,7 @@ pub fn hairline() -> Rgba {
 pub fn rule() -> Rgba {
     rgba(0xffffff0e)
 }
+/// The edge of a floating surface: a sheet's top, a field's border.
 pub fn hairline_strong() -> Rgba {
     rgba(0xffffff1f)
 }
@@ -118,9 +222,29 @@ pub fn accent_text() -> Rgba {
 pub fn on_accent() -> Rgba {
     rgb(0x1a1204)
 }
-/// 18% amber, for the wash under a mention and the edit mark.
+/// 18% amber, for the edit mark.
 pub fn accent_soft() -> Rgba {
     rgba(0xe9a23b2e)
+}
+/// The accent under a hover, on the phone. The desktop's own is in `theme`.
+pub fn accent_hover() -> Rgba {
+    rgb(0xf2b45c)
+}
+/// The accent under a press.
+pub fn accent_pressed() -> Rgba {
+    rgb(0xd08e2c)
+}
+/// 10% amber under a message that mentions me.
+pub fn accent_wash() -> Rgba {
+    rgba(0xe9a23b1a)
+}
+/// The 35% amber halo of a focused field.
+pub fn accent_halo() -> Rgba {
+    rgba(0xe9a23b59)
+}
+/// Selected text in a field: 45% amber.
+pub fn selection() -> Rgba {
+    rgba(0xe9a23b73)
 }
 
 /// The 6% white a press leaves. No colour shift, no scale.
@@ -169,8 +293,8 @@ pub fn ring(color: Rgba, width: f32) -> Vec<BoxShadow> {
 
 /// The phone's type scale: 17/24 body, 15/20 interface, 13/18 previews, 12/16 timestamps,
 /// 11/14 tab labels. One point larger than the desktop at every step, because the eye is 30 cm
-/// from the glass, not 60. Tab labels stay at 11 when the text scale rises: the icons and the
-/// badge must not move, and a tab label may truncate.
+/// from the glass, not 60. Every size goes through [`scaled`], so the desktop step and the
+/// phone's run both reach it.
 pub trait PhoneType: Styled + Sized {
     fn phone_title(self) -> Self {
         self.text_size(px(scaled(17.))).line_height(px(scaled(22.))).font_weight(crate::gui::theme::SEMIBOLD)
@@ -184,8 +308,9 @@ pub trait PhoneType: Styled + Sized {
     fn phone_stamp(self) -> Self {
         self.text_size(px(scaled(12.))).line_height(px(scaled(16.))).font_weight(crate::gui::theme::MEDIUM)
     }
+    /// Tab labels: 11/14 at 100%, and they scale with the run. The icon and badge do not.
     fn phone_tab(self) -> Self {
-        self.text_size(px(11.)).line_height(px(14.)).font_weight(crate::gui::theme::MEDIUM)
+        self.text_size(px(scaled(11.))).line_height(px(scaled(14.))).font_weight(crate::gui::theme::MEDIUM)
     }
 }
 
@@ -203,19 +328,52 @@ mod tests {
     }
 
     #[test]
-    fn a_row_grows_with_a_bigger_text_scale_and_never_shrinks() {
-        set_text_scale(1.);
-        assert_eq!(row_height(), 64.);
-        set_text_scale(2.);
-        assert_eq!(row_height(), 96.);
-        set_text_scale(1.);
+    fn a_row_grows_with_the_phone_run_and_the_desktop_step_and_never_shrinks() {
+        assert_eq!(row_height_for(0, 1.), 64.);
+        assert_eq!(row_height_for(0, 2.), 96.);
+        assert_eq!(row_height_for(2, 1.), 72.);
+        assert_eq!(row_height_for(-1, 1.), 60.);
+        assert!(row_height_for(0, 1.5) > row_height_for(0, 1.));
     }
 
     #[test]
-    fn the_tab_cell_is_eight_icon_ten_indicator_and_label() {
-        // 8 pad + 22 icon + 10 (the indicator lives in it) + 14 label + 2 pad = 56, nothing
-        // touching the rule.
-        assert_eq!(8. + 22. + 10. + 14. + 2., TAB);
+    fn a_type_size_takes_the_desktop_step_then_the_run_and_rounds_to_half_points() {
+        assert_eq!(type_size(15., 0, 1.), 15.);
+        // One desktop step adds a point; the run doubles what is left.
+        assert_eq!(type_size(15., 1, 1.), 16.);
+        assert_eq!(type_size(15., 0, 2.), 30.);
+        assert_eq!(type_size(11., 0, 1.2), 13.);
+        assert_eq!(type_size(11., -1, 1.), 10.);
+    }
+
+    #[test]
+    fn the_tab_cell_is_56_at_one_line_and_grows_only_with_extra_lines() {
+        assert_eq!(tab_height_for(1, 14.), TAB);
+        assert_eq!(tab_height_for(2, 14.), 70.);
+        assert_eq!(tab_lines(1.), 1);
+        assert_eq!(tab_lines(2.), 2);
+    }
+
+    #[test]
+    fn a_press_stays_a_tap_within_the_slop_and_becomes_a_scroll_past_it() {
+        assert!(within_slop((10., 10.), (10., 10.)));
+        assert!(within_slop((10., 10.), (16., 16.)));
+        assert!(within_slop((0., 0.), (SLOP, 0.)));
+        assert!(!within_slop((0., 0.), (SLOP + 0.5, 0.)));
+        assert!(!within_slop((0., 0.), (0., 40.)));
+    }
+
+    #[test]
+    fn a_sheet_takes_sixty_percent_of_the_window_and_no_more() {
+        assert!((sheet_cap(800.) - 480.).abs() < 1e-3);
+        assert!(sheet_cap(640.) < 640.);
+    }
+
+    #[test]
+    fn the_bottom_padding_drops_while_the_keyboard_is_up() {
+        assert_eq!(bottom_padding(SAFE_BOTTOM, 0.), SAFE_BOTTOM);
+        assert_eq!(bottom_padding(SAFE_BOTTOM, 300.), 0.);
+        assert_eq!(bottom_padding(0., 0.), 0.);
     }
 
     #[test]

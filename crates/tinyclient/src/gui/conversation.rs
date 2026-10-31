@@ -250,6 +250,9 @@ pub struct Pane {
     viewer: Option<viewer::Viewer>,
     /// The message under the pointer, which shows the toolbar.
     hover: Option<String>,
+    /// A phone's press on a message, where it went down, and the timer that shows the toolbar
+    /// if it holds still (`actions::LONG_PRESS`). Dropping the task cancels it.
+    press: Option<(gpui::Task<()>, (f32, f32))>,
     menu: Option<actions::Menu>,
     picker: Option<actions::Picking>,
     /// The message the delete dialog asks about.
@@ -336,6 +339,7 @@ impl Pane {
             flash: None,
             viewer: None,
             hover: None,
+            press: None,
             menu: None,
             picker: None,
             confirm: None,

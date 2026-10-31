@@ -23,6 +23,9 @@ use std::rc::Rc;
 /// How far the toolbar rises above its row, and how wide the strip it can occupy is.
 const TOOLBAR_RISE: f32 = 14.;
 const TOOLBAR_REACH: f32 = 320.;
+/// How long a phone's press must hold still before the message's actions come up. Long enough
+/// that a scroll never reads as one, short enough that the actions feel like an answer.
+pub(super) const LONG_PRESS: std::time::Duration = std::time::Duration::from_millis(450);
 
 /// Hover ownership is geometric: the toolbar occludes the pane's hitbox, but
 /// crossing onto its buttons must keep the current hover owner.
@@ -201,8 +204,12 @@ impl Pane {
 
     // The pointer.
 
-    /// Notes which message the pointer is over. Drawn again only when that changes.
+    /// Notes which message the pointer is over. Drawn again only when that changes. On a phone
+    /// there is no resting pointer: a finger's movement never shows the toolbar, a long press does.
     pub(super) fn point_at(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        if crate::gui::phone::active() {
+            return;
+        }
         // A menu or the picker belongs to a message: the toolbar stays with it.
         if self.menu.is_some() || self.picker.is_some() || self.confirm.is_some() || self.viewer.is_some() {
             return;
@@ -242,6 +249,34 @@ impl Pane {
             || self.confirm.as_ref().is_some_and(|message| message.id == id)
     }
 
+    /// A phone's press on a message went down: the actions come up if it holds still for
+    /// [`LONG_PRESS`]. Any other press clears the ones showing, so a tap elsewhere dismisses them.
+    pub(super) fn press_message(&mut self, id: &str, at: Point<Pixels>, cx: &mut Context<Self>) {
+        self.hover = None;
+        let id = id.to_owned();
+        let task = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(LONG_PRESS).await;
+            let _ = this.update(cx, |this, cx| {
+                this.hover = Some(id);
+                cx.notify();
+            });
+        });
+        self.press = Some((task, (f32::from(at.x), f32::from(at.y))));
+    }
+
+    /// The pointer moved during a press. Past the slop it was a scroll, so nothing will show.
+    pub(super) fn drag_message(&mut self, at: Point<Pixels>) {
+        let to = (f32::from(at.x), f32::from(at.y));
+        if self.press.as_ref().is_some_and(|(_, from)| !crate::gui::phone::tokens::within_slop(*from, to)) {
+            self.press = None;
+        }
+    }
+
+    /// The finger lifted before the press became a long one.
+    pub(super) fn release_message(&mut self) {
+        self.press = None;
+    }
+
     /// The toolbar of the row under the pointer: one instance, straddling the row's top edge.
     pub(super) fn toolbar(&self, message: &Rc<Message>, cx: &mut Context<Self>) -> Option<AnyElement> {
         // Not while text is being selected: it would sit under the drag. Never over a menu or
@@ -253,6 +288,8 @@ impl Pane {
         if !can.act {
             return None;
         }
+        // On a touch screen a tooltip has no pointer to rest under: it is dropped there.
+        let phone = crate::gui::phone::active();
         let mut bar = div()
             .absolute()
             .top(px(-TOOLBAR_RISE))
@@ -283,7 +320,7 @@ impl Pane {
             let id = message.id.clone();
             bar = bar.child(
                 tool("add", icon(Icon::SmilePlus, 16., theme::text_soft()))
-                    .tooltip(tip("Add reaction", None))
+                    .when(!phone, |t| t.tooltip(tip("Add reaction", None)))
                     .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
                         this.open_picker(&id, event.position(), window, cx);
                     })),
@@ -293,7 +330,7 @@ impl Pane {
             let reply = message.clone();
             bar = bar.child(
                 tool("reply", icon(Icon::Reply, 16., theme::text_soft()))
-                    .tooltip(tip("Reply", None))
+                    .when(!phone, |t| t.tooltip(tip("Reply", None)))
                     .on_click(cx.listener(move |this, _, window, cx| this.reply(&reply, window, cx))),
             );
         }
@@ -301,7 +338,7 @@ impl Pane {
             let root = message.clone();
             bar = bar.child(
                 tool("thread", icon(Icon::Thread, 16., theme::text_soft()))
-                    .tooltip(tip("Open thread", None))
+                    .when(!phone, |t| t.tooltip(tip("Open thread", None)))
                     .on_click(cx.listener(move |_, _, _, cx| cx.emit(PaneEvent::OpenThread(root.clone())))),
             );
         }
@@ -309,14 +346,14 @@ impl Pane {
             let edit = message.clone();
             bar = bar.child(
                 tool("edit", icon(Icon::Pencil, 16., theme::text_soft()))
-                    .tooltip(tip("Edit", None))
+                    .when(!phone, |t| t.tooltip(tip("Edit", None)))
                     .on_click(cx.listener(move |this, _, window, cx| this.edit(&edit, window, cx))),
             );
         }
         let more = message.clone();
         bar = bar.child(
             tool("more", icon(Icon::More, 16., theme::text_soft()))
-                .tooltip(tip("More", None))
+                .when(!phone, |t| t.tooltip(tip("More", None)))
                 .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
                     this.open_menu(more.clone(), event.position(), cx);
                 })),

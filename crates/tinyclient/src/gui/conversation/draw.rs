@@ -574,6 +574,17 @@ impl Pane {
                     .children(gutter)
                     .child(column),
             )
+            // On a phone the actions come up on a long press that holds still (`press_message`),
+            // not on a hover a finger never makes. A press that moves past the slop is a scroll.
+            .when(metrics == Metrics::PHONE, |row| {
+                let down = message.id.clone();
+                row.on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| this.press_message(&down, event.position, cx)),
+                )
+                .on_mouse_up(MouseButton::Left, cx.listener(|this, _: &gpui::MouseUpEvent, _, _| this.release_message()))
+                .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, _| this.drag_message(event.position)))
+            })
             // Last, so it is over the row; it rises past the row's top edge, which nothing clips.
             .children(self.toolbar(message, cx));
         // The gap above a group is outside the row, so it does not light up on hover.

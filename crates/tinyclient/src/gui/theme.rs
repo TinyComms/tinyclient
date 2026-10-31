@@ -65,14 +65,14 @@ pub fn accent() -> Rgba {
 }
 pub fn accent_hover() -> Rgba {
     if crate::gui::phone::active() {
-        rgb(0xf2b45c)
+        phone_tokens::accent_hover()
     } else {
         rgb(0x3a77ee)
     }
 }
 pub fn accent_pressed() -> Rgba {
     if crate::gui::phone::active() {
-        rgb(0xd08e2c)
+        phone_tokens::accent_pressed()
     } else {
         rgb(0x2861d3)
     }
@@ -98,7 +98,7 @@ pub fn accent_soft() -> Rgba {
 /// A message that mentions me.
 pub fn accent_wash() -> Rgba {
     if crate::gui::phone::active() {
-        rgba(0xe9a23b1a)
+        phone_tokens::accent_wash()
     } else {
         rgba(0x2f6feb1a)
     }
@@ -106,7 +106,7 @@ pub fn accent_wash() -> Rgba {
 /// The halo of a focused field.
 pub fn accent_halo() -> Rgba {
     if crate::gui::phone::active() {
-        rgba(0xe9a23b59)
+        phone_tokens::accent_halo()
     } else {
         rgba(0x2f6feb59)
     }
@@ -114,7 +114,7 @@ pub fn accent_halo() -> Rgba {
 /// Selected text in a field.
 pub fn selection() -> Rgba {
     if crate::gui::phone::active() {
-        rgba(0xe9a23b73)
+        phone_tokens::selection()
     } else {
         rgba(0x2f6feb73)
     }
@@ -164,8 +164,20 @@ pub fn row_surface(selected: bool) -> Rgba {
     }
 }
 
+// The faces per platform. `.SystemUIFont` is the system face wherever GPUI maps it (macOS, iOS,
+// Windows, and the desktop Linux builds that already use it). Android has no such alias, so it
+// takes the platform's own sans and mono families; a face that is missing falls back in GPUI.
+#[cfg(not(target_os = "android"))]
 pub const FONT: &str = ".SystemUIFont";
+#[cfg(target_os = "android")]
+pub const FONT: &str = "sans-serif";
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub const MONO: &str = "Menlo";
+#[cfg(target_os = "windows")]
+pub const MONO: &str = "Consolas";
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "windows")))]
+pub const MONO: &str = "monospace";
 
 /// Weights: 400, 500 and 600 only.
 pub const REGULAR: FontWeight = FontWeight::NORMAL;

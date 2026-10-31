@@ -12,13 +12,14 @@ pub mod search;
 pub mod tokens;
 pub mod you;
 
-use crate::gui::components::{glyph, icon_button, scrim, Avatar};
+use crate::gui::components::{button, glyph, icon_button, scrim, Avatar, ButtonKind};
+use crate::gui::input::{InputEvent, TextInput};
 use crate::gui::people::presence;
 use crate::gui::state::{Shell, Snapshot};
 use crate::gui::theme;
 use crate::gui::phone::tokens::PhoneType;
-use gpui::{div, prelude::*, px, Context, Div, MouseButton, SharedString, Window};
-use protocol::{AccountKey, Conversation, Key};
+use gpui::{div, prelude::*, px, Context, Div, Entity, Focusable, MouseButton, SharedString, Window};
+use protocol::{AccountKey, Conversation, Key, Link, Network};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// This window is a phone, set once per frame from its width. One window, one form, read by
@@ -32,6 +33,28 @@ pub fn set_active(on: bool) {
 
 pub fn active() -> bool {
     ACTIVE.load(Ordering::Relaxed)
+}
+
+/// A count with its noun in the word the number asks for: "1 account", "2 accounts", "0 accounts".
+pub fn counted(count: usize, one: &str, many: &str) -> String {
+    if count == 1 {
+        format!("1 {one}")
+    } else {
+        format!("{count} {many}")
+    }
+}
+
+/// Whether a window `width` wide is a phone, given whether it was one a frame ago. A phone is
+/// under `layout::PHONE`; once a window is a phone it stays one until it is 40 pt wider than that,
+/// so a width that hovers at the edge (a split screen being dragged, a fold opening) does not
+/// flip the palette, the layout and the tab bar every frame.
+pub fn form(was_phone: bool, width: f32) -> bool {
+    let edge = crate::gui::layout::PHONE;
+    if was_phone {
+        width < edge + 40.
+    } else {
+        width < edge
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -80,15 +103,51 @@ pub struct State {
     pub scope_open: bool,
     /// Where a left-edge drag began, for the back gesture.
     edge: Option<f32>,
+    /// A press on a row that has not yet been released: it opens the row only if it ends where it
+    /// began. A press that travels past the slop is a scroll, and opens nothing.
+    press: Option<Press>,
+    /// The Search tab's field, made on the first frame (`Shell::phone_prepare`).
+    pub search: Option<Entity<TextInput>>,
+}
+
+/// A press on a row, and where it began.
+#[derive(Clone)]
+pub struct Press {
+    key: Key,
+    at: (f32, f32),
 }
 
 impl Default for State {
     fn default() -> Self {
-        State { tab: Tab::Needs, stacks: Default::default(), scope: None, scope_open: false, edge: None }
+        State { tab: Tab::Needs, stacks: Default::default(), scope: None, scope_open: false, edge: None, press: None, search: None }
     }
 }
 
 impl State {
+    /// A finger went down on a row.
+    pub fn press_down(&mut self, key: Key, at: (f32, f32)) {
+        self.press = Some(Press { key, at });
+    }
+
+    /// The pointer moved. Past the slop the press is a scroll, and it will not open anything.
+    pub fn press_move(&mut self, to: (f32, f32)) {
+        if self.press.as_ref().is_some_and(|press| !tokens::within_slop(press.at, to)) {
+            self.press = None;
+        }
+    }
+
+    /// The finger lifted. True when it lifted on the row it went down on, within the slop.
+    pub fn press_up(&mut self, key: &Key, to: (f32, f32)) -> bool {
+        match self.press.take() {
+            Some(press) => &press.key == key && tokens::within_slop(press.at, to),
+            None => false,
+        }
+    }
+
+    pub fn press_cancel(&mut self) {
+        self.press = None;
+    }
+
     fn at_mut(&mut self, tab: Tab) -> &mut Vec<Route> {
         &mut self.stacks[tab as usize]
     }
@@ -137,9 +196,51 @@ impl State {
 impl Shell {
     /// The phone, whole: a pushed conversation or the current tab's root, and the tab bar
     /// wherever it is not a conversation.
+    /// Makes what the phone holds across frames: the Search tab's field, once. Called before
+    /// the screen is drawn, so the entity exists when a tab asks for focus.
+    pub(super) fn phone_prepare(&mut self, cx: &mut Context<Self>) {
+        if self.phone_state.search.is_some() {
+            return;
+        }
+        let field = cx.new(|cx| TextInput::new("Search conversations", cx));
+        cx.subscribe(&field, |_, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Changed) {
+                cx.notify();
+            }
+        })
+        .detach();
+        self.phone_state.search = Some(field);
+    }
+
+    /// Moves the keyboard to the Search field: on entering the tab, so typing starts at once.
+    pub(super) fn phone_focus_search(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(field) = &self.phone_state.search {
+            let handle = field.read(cx).focus_handle(cx);
+            window.focus(&handle, cx);
+        }
+    }
+
+    /// The network a phone's "Sign in" opens: the first one this phone is not signed in to, in
+    /// the first-run order, so the first tap does what the first-run list's default does.
+    pub(super) fn phone_sign_in_network(snapshot: &Snapshot) -> Network {
+        crate::gui::layout::NETWORK_ORDER
+            .into_iter()
+            .find(|network| crate::gui::layout::AVAILABLE.contains(network) && snapshot.link(*network) == Link::SignedOut)
+            .unwrap_or(Network::Discord)
+    }
+
+    /// The one sign-in entry a phone button calls: the same `Shell::sign_in` the desktop's
+    /// first-run list, its rail's Add menu and its sidebar banners call.
+    pub(super) fn phone_sign_in_button(&self, id: &'static str, label: &'static str, snapshot: &Snapshot, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
+        let network = Self::phone_sign_in_network(snapshot);
+        button(id, ButtonKind::Primary, label).on_click(cx.listener(move |this, _, _, cx| this.sign_in(network, cx)))
+    }
+
+    /// Called from the window's render after [`Shell::phone_prepare`].
     pub(super) fn phone_screen(&self, snapshot: &Snapshot, window: &mut Window, cx: &mut Context<Self>) -> Div {
         // The status bar's room is part of every phone screen. 44 + 52 is the header band, so a
-        // title is never glued to y = 0 and the strip keeps its own 52 below it.
+        // title is never glued to y = 0 and the strip keeps its own 52 below it. A platform's
+        // real inset replaces the 44 (`tokens::set_insets`).
         let screen = div()
             .size_full()
             .flex()
@@ -150,7 +251,7 @@ impl Shell {
                 div()
                     .flex_none()
                     .w_full()
-                    .h(px(tokens::SAFE_TOP))
+                    .h(px(tokens::safe_top()))
                     .bg(tokens::surface())
                     .shadow(tokens::top_highlight()),
             );
@@ -167,7 +268,7 @@ impl Shell {
             .relative()
             .child(div().flex_1().min_h_0().pb(px(tokens::GUTTER)).child(body))
             .child(self.phone_tabs(snapshot, cx))
-            .children(self.phone_scope_sheet(snapshot, cx))
+            .children(self.phone_scope_sheet(snapshot, window, cx))
     }
 
     /// Back on a phone: pop the tab's stack, else leave the conversation that was opened from
@@ -246,8 +347,11 @@ impl Shell {
                 .pb(px(2.))
                 .cursor_pointer()
                 .active(|cell| cell.bg(tokens::pressed()))
-                .on_click(cx.listener(move |this, _, _, cx| {
+                .on_click(cx.listener(move |this, _, window, cx| {
                     this.phone_state.tab = tab;
+                    if tab == Tab::Search {
+                        this.phone_focus_search(window, cx);
+                    }
                     cx.notify();
                 }))
                 .child(div().relative().h(px(22.)).w(px(22.)).flex().items_center().justify_center().child(icon).children(badge))
@@ -261,7 +365,18 @@ impl Shell {
                         .justify_center()
                         .child(div().h(px(2.)).w(px(16.)).rounded(px(1.)).bg(if on { tokens::accent() } else { gpui::rgba(0x00000000) })),
                 )
-                .child(div().w_full().min_w_0().truncate().text_align(gpui::TextAlign::Center).phone_tab().text_color(color).child(tab.label()))
+                // A label may take two lines at a larger run (`tokens::tab_lines`); at 100% it is one.
+                .child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .h(px(tokens::tab_lines(tokens::text_scale()) as f32 * tokens::scaled(14.)))
+                        .overflow_hidden()
+                        .text_align(gpui::TextAlign::Center)
+                        .phone_tab()
+                        .text_color(color)
+                        .child(tab.label()),
+                )
         });
         div()
             .flex_none()
@@ -272,7 +387,7 @@ impl Shell {
             .border_t_1()
             .border_color(tokens::hairline())
             .child(div().h(px(tokens::tab_height())).flex().children(cells))
-            .child(div().h(px(tokens::SAFE_BOTTOM)))
+            .child(div().h(px(tokens::safe_bottom())))
     }
 
     fn tab_badge(&self, count: u32) -> gpui::AnyElement {
@@ -333,7 +448,7 @@ impl Shell {
 
     /// The account switcher, as a sheet over the list: every account, then all of them. 20 pt of
     /// inner padding, 8 between rows, 12 pt top corners, one hairline and a real shadow.
-    pub(super) fn phone_scope_sheet(&self, snapshot: &Snapshot, cx: &mut Context<Self>) -> Option<Div> {
+    pub(super) fn phone_scope_sheet(&self, snapshot: &Snapshot, window: &Window, cx: &mut Context<Self>) -> Option<Div> {
         if !self.phone_state.scope_open {
             return None;
         }
@@ -343,7 +458,7 @@ impl Shell {
                 .id(id)
                 .min_h(px(tokens::sheet_row()))
                 .px(px(12.))
-                .rounded(px(8.))
+                .rounded(px(theme::R_CARD))
                 .flex()
                 .items_center()
                 .gap(px(12.))
@@ -385,23 +500,26 @@ impl Shell {
                     ),
                 )
                 .child(
+                    // Capped at 60% of the window, so the list behind stays in view; the rows scroll
+                    // inside it. The title stays put above them.
                     div()
                         .absolute()
                         .left_0()
                         .right_0()
                         .bottom_0()
+                        .max_h(px(tokens::sheet_cap(f32::from(window.viewport_size().height))))
                         .bg(tokens::raised())
                         .shadow(tokens::shadow_sheet())
-                        .rounded_t(px(12.))
+                        .rounded_t(px(theme::R_MODAL))
                         .border_t_1()
                         .border_color(tokens::hairline_strong())
                         .px(px(20.))
                         .pt(px(20.))
-                        .pb(px(20. + tokens::SAFE_BOTTOM))
+                        .pb(px(20. + tokens::safe_bottom()))
                         .flex()
                         .flex_col()
                         .gap(px(8.))
-                        .child(div().h(px(44.)).flex().items_center().justify_between().child(div().phone_title().child("Accounts")).child(
+                        .child(div().flex_none().h(px(44.)).flex().items_center().justify_between().child(div().phone_title().child("Accounts")).child(
                             icon_button("scope-close", "icons/x.svg", false)
                                 .size(px(tokens::TOUCH))
                                 .on_click(cx.listener(|this, _, _, cx| {
@@ -409,7 +527,17 @@ impl Shell {
                                     cx.notify();
                                 })),
                         ))
-                        .children(rows),
+                        .child(
+                            div()
+                                .id("scope-rows")
+                                .flex_1()
+                                .min_h_0()
+                                .overflow_y_scroll()
+                                .flex()
+                                .flex_col()
+                                .gap(px(8.))
+                                .children(rows),
+                        ),
                 ),
         )
     }
@@ -432,14 +560,16 @@ impl Shell {
 
     /// The 20 pt strip the back gesture owns, over the conversation's left edge.
     pub(super) fn phone_edge(&self, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
+        // Not `occlude()`: the strip arms the back gesture on a press at its edge, and the presses
+        // it does not use (the composer's first control sits just past it) still reach what is
+        // under them. Only the drag that began here is a back swipe.
         div()
             .id("phone-edge")
             .absolute()
             .top(px(tokens::NAV))
-            .bottom(px(tokens::SAFE_BOTTOM))
+            .bottom(px(tokens::safe_bottom()))
             .left_0()
             .w(px(20.))
-            .occlude()
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
@@ -451,5 +581,29 @@ impl Shell {
 
     pub(super) fn phone_release_edge(&mut self) {
         self.phone_state.disarm_edge();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_form_flips_below_the_phone_width_and_back_only_past_the_band() {
+        let edge = crate::gui::layout::PHONE;
+        assert!(form(false, edge - 1.));
+        assert!(!form(false, edge));
+        // Once a phone, it stays one through the band above the edge ...
+        assert!(form(true, edge));
+        assert!(form(true, edge + 39.));
+        // ... and is a desktop again only past it.
+        assert!(!form(true, edge + 40.));
+    }
+
+    #[test]
+    fn counts_take_the_singular_only_for_one() {
+        assert_eq!(counted(1, "network", "networks"), "1 network");
+        assert_eq!(counted(3, "network", "networks"), "3 networks");
+        assert_eq!(counted(0, "network", "networks"), "0 networks");
     }
 }

@@ -2308,9 +2308,17 @@ impl Render for Composer {
         let phone = crate::gui::phone::active();
         let dock = div()
             .flex_none()
-            .px(px(if phone { 12. } else { 20. }))
+            // A phone dock starts its first control at 20 pt: 14 here and 6 inside the card. The
+            // back-swipe strip owns the left 20 pt of the conversation, and the control sits past it.
+            .pl(px(if phone { 14. } else { 20. }))
+            .pr(px(if phone { 12. } else { 20. }))
             .pt(px(if phone { 10. } else { 0. }))
-            .pb(px(if phone { 12. + crate::gui::phone::tokens::SAFE_BOTTOM } else { 16. }))
+            .pb(px(if phone {
+                use crate::gui::phone::tokens;
+                12. + tokens::bottom_padding(tokens::safe_bottom(), tokens::keyboard())
+            } else {
+                16.
+            }))
             // On a phone the composer is chrome: one step above the page, with the same 1 pt
             // light and hairline every pinned strip wears. The desktop dock keeps no fill.
             .when(phone, |dock| {

@@ -1,40 +1,27 @@
-//! Needs me and Inbox on a phone: the same rows, 56 pt tall, unread first inside each day
+//! Needs me and Inbox on a phone: the same rows, 64 pt tall, unread first inside each day
 //! (`01-ia-navigation.md` Q2; `02-component-inventory.md` B1).
 
-use crate::gui::components::{empty_state, list_row, row_tone};
+use crate::gui::components::{button, empty_state, empty_state_with, list_row, row_tone, ButtonKind};
 use crate::gui::phone::tokens::{self, PhoneType};
-use crate::gui::phone::Route;
+use crate::gui::phone::{Route, Tab};
 use crate::gui::sidebar::chat::row_time;
 use crate::gui::sidebar::inbox::{self, Day};
 use crate::gui::state::{Shell, Snapshot};
 use crate::gui::theme;
 use crate::view::now;
-use gpui::{div, prelude::*, px, Context, Div, MouseButton, SharedString, Stateful, Window};
+use gpui::{div, prelude::*, px, Context, Div, MouseButton, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Stateful, Window};
 use protocol::{AccountKey, Conversation, ConversationKind, Network};
 use std::rc::Rc;
 
-/// GPUI has no letter-spacing value, so a hair space between letters stands in: the tracking
-/// reads at 12 pt and disappears in a screen reader, which still says "TODAY".
-fn tracked(text: &str) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    let mut out = String::with_capacity(text.len() * 2);
-    for (ix, ch) in chars.iter().enumerate() {
-        out.push(*ch);
-        if ix + 1 < chars.len() && ch.is_alphabetic() && chars[ix + 1].is_alphabetic() {
-            out.push('\u{200a}');
-        }
-    }
-    out
-}
-
-/// A day heading on a phone: 20 above, 6 below, 12/16 tracked uppercase `text_faint`.
+/// A day heading on a phone: 20 above, 6 below, 12/16 uppercase `text_faint`. The first heading
+/// in a list sits 8 from its top, so the list starts where the strip ends. The label is plain
+/// caps: GPUI has no letter-spacing, and a hair space between letters read as noise.
 pub fn phone_section(label: impl Into<SharedString>, first: bool) -> Div {
-    let _ = first;
     let label: SharedString = label.into();
     div()
         .flex_none()
         .w_full()
-        .pt(px(20.))
+        .pt(px(if first { 8. } else { 20. }))
         .pb(px(6.))
         .px(px(tokens::GUTTER))
         .child(
@@ -43,7 +30,7 @@ pub fn phone_section(label: impl Into<SharedString>, first: bool) -> Div {
                 .line_height(px(tokens::scaled(16.)))
                 .font_weight(theme::MEDIUM)
                 .text_color(theme::text_faint())
-                .child(tracked(&label.to_uppercase())),
+                .child(label.to_uppercase()),
         )
 }
 
@@ -83,6 +70,11 @@ pub fn sections(rows: &[Rc<Conversation>], needs_only: bool, scope: Option<&Acco
     out
 }
 
+/// A pointer position as the two numbers the slop test wants.
+pub fn at(point: Point<Pixels>) -> (f32, f32) {
+    (f32::from(point.x), f32::from(point.y))
+}
+
 impl Shell {
     /// One of the two lists, whole: the nav strip whose title switches the scope, the rows, and
     /// the scope sheet over them.
@@ -97,7 +89,8 @@ impl Shell {
             },
         ));
         let words = if needs_only { "Needs me" } else { "Inbox" };
-        let groups = sections(self.sidebar_state.inbox.all(), needs_only, scope);
+        let inbox = &self.sidebar_state.inbox;
+        let groups = sections(inbox.all(), needs_only, scope);
         let mut list = div()
             .id("phone-list")
             .flex_1()
@@ -105,20 +98,44 @@ impl Shell {
             .overflow_y_scroll()
             .pb(px(tokens::GUTTER))
             .flex()
-            .flex_col();
+            .flex_col()
+            // A press that travels past the slop is a scroll: the rows check it on release.
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, _| this.phone_state.press_move(at(event.position))))
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, _: &MouseUpEvent, _, _| this.phone_state.press_cancel()));
         let mut ix = 0;
-        for (at, (day, rows)) in groups.iter().enumerate() {
-            list = list.child(phone_section(day.label(), at == 0));
-            for (last, row) in rows.iter().enumerate().map(|(at, row)| (at + 1 == rows.len(), row)) {
+        for (first, (day, rows)) in groups.iter().enumerate().map(|(n, group)| (n == 0, group)) {
+            list = list.child(phone_section(day.label(), first));
+            for (last, row) in rows.iter().enumerate().map(|(n, row)| (n + 1 == rows.len(), row)) {
                 list = list.child(self.phone_row(ix, row, last, cx));
                 ix += 1;
             }
         }
         if ix == 0 {
-            list = list.child(if needs_only {
-                empty_state("icons/check.svg", "You're clear", "Nothing needs you right now.").into_any_element()
+            // Nothing is empty until the first answer has come: a list that has not been read
+            // says it is loading, with a retry it can use at once, never "No conversations".
+            list = list.child(if inbox.fresh {
+                self.phone_loading(cx).into_any_element()
+            } else if needs_only {
+                empty_state_with(
+                    "icons/check.svg",
+                    "You're clear",
+                    "Nothing needs you right now.",
+                    button("phone-to-inbox", ButtonKind::Secondary, "Open Inbox").on_click(cx.listener(|this, _, _, cx| {
+                        this.phone_state.tab = Tab::Inbox;
+                        cx.notify();
+                    })),
+                )
+                .into_any_element()
+            } else if snapshot.signed_in().is_empty() {
+                empty_state_with(
+                    "icons/inbox.svg",
+                    "No conversations yet",
+                    "Sign in to a network to see your chats.",
+                    self.phone_sign_in_button("phone-sign-in", "Sign in", snapshot, cx),
+                )
+                .into_any_element()
             } else {
-                empty_state("icons/inbox.svg", "No conversations yet", "Sign in to a network to see your chats.").into_any_element()
+                empty_state("icons/inbox.svg", "No conversations yet", "Your chats will appear here.").into_any_element()
             });
         }
         let body = div()
@@ -133,9 +150,23 @@ impl Shell {
         div().size_full().child(body)
     }
 
-    /// One conversation, 56 pt: avatar 40, title 15, one preview line 13, one time 12 and one
+    /// The list before its first answer: a line that it is loading, and a retry that asks again.
+    /// Shown for as long as the answer is missing, so there is never a timeout to hit or miss.
+    pub(super) fn phone_loading(&self, cx: &mut Context<Self>) -> Div {
+        empty_state_with(
+            "icons/refresh-cw.svg",
+            "Loading your chats",
+            "This can take a moment. Still nothing? Try again.",
+            button("phone-retry", ButtonKind::Secondary, "Try again").on_click(cx.listener(|this, _, _, cx| this.reload_all(cx))),
+        )
+    }
+
+    /// One conversation, 64 pt: avatar 40, title 15, one preview line 13, one time 12 and one
     /// count. Nothing else. `last` says it closes its section: the rule under a row is inset past
     /// the avatar, and there is none after the last one.
+    ///
+    /// A row opens on release, not on press: a finger that goes down and then scrolls the list
+    /// opens nothing (`tokens::SLOP`).
     pub(super) fn phone_row(&self, ix: usize, conversation: &Rc<Conversation>, last: bool, cx: &mut Context<Self>) -> Stateful<Div> {
         let c = conversation;
         let tone = row_tone(c, false, false);
@@ -205,14 +236,21 @@ impl Shell {
                     ),
             );
         let (key, title) = (c.key.clone(), c.title.clone());
+        let (press_key, release_key) = (key.clone(), key.clone());
         list_row(("phone-row", ix), tokens::row_height(), false, false, content)
             .relative()
             // 1 pt at 5.5% from x = 76 to the edge: the seam is between rows, not around them.
             .children((!last).then(|| div().absolute().bottom_0().left(px(tokens::RULE_START)).right_0().h(px(1.)).bg(tokens::rule())))
             .active(|row| row.bg(tokens::pressed()))
-            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
-                this.select(key.clone(), &title, cx);
-                this.phone_state.push(Route::Conversation { key: key.clone(), title: title.clone() });
+            .on_mouse_down(MouseButton::Left, cx.listener(move |this, event: &gpui::MouseDownEvent, _, _| {
+                this.phone_state.press_down(press_key.clone(), at(event.position));
+            }))
+            .on_mouse_up(MouseButton::Left, cx.listener(move |this, event: &MouseUpEvent, _, cx| {
+                if this.phone_state.press_up(&release_key, at(event.position)) {
+                    this.select(key.clone(), &title, cx);
+                    this.phone_state.push(Route::Conversation { key: key.clone(), title: title.clone() });
+                    cx.notify();
+                }
             }))
     }
 
@@ -253,5 +291,11 @@ mod tests {
         assert!(needs(&row(ConversationKind::Channel, 0, 1, false)));
         assert!(needs(&row(ConversationKind::Channel, 0, 1, true)));
         assert!(!needs(&row(ConversationKind::Channel, 3, 0, false)));
+    }
+
+    #[test]
+    fn a_preview_is_one_line_with_its_breaks_as_spaces() {
+        assert_eq!(one_line("hi\n\n  there\tfriend").as_ref(), "hi there friend");
+        assert_eq!(one_line("  \n ").as_ref(), "");
     }
 }

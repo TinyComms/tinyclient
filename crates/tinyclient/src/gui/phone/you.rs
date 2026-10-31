@@ -2,6 +2,7 @@
 //! today; on a device they become pushed routes (`02-component-inventory.md` F9, E8).
 
 use crate::gui::components::{glyph, Avatar};
+use crate::gui::phone::counted;
 use crate::gui::phone::tokens::{self, PhoneType};
 use crate::gui::settings::{self, Section};
 use crate::gui::state::{Shell, Snapshot};
@@ -28,7 +29,11 @@ impl Shell {
             }
             None => ("tinyclient".to_owned(), Avatar::named("tinyclient", 64.).build()),
         };
-        let line = format!("{} accounts · {} networks", snapshot.accounts.len(), networks.len());
+        let line = format!(
+            "{} · {}",
+            counted(snapshot.accounts.len(), "account", "accounts"),
+            counted(networks.len(), "network", "networks"),
+        );
         let rows = [
             (Section::Accounts, "Accounts"),
             (Section::General, "Notifications"),
@@ -45,7 +50,7 @@ impl Shell {
                 .items_center()
                 .gap(px(12.))
                 .cursor_pointer()
-                .when(ix > 0, |row| row.border_t_1().border_color(tokens::hairline()))
+                .when(ix > 0, |row| row.border_t_1().border_color(tokens::rule()))
                 .active(|row| row.bg(tokens::pressed()))
                 .child(glyph(section.icon(), 20., theme::text_soft()))
                 .child(div().flex_1().min_w_0().truncate().phone_row().text_color(theme::text()).child(words))
@@ -54,6 +59,14 @@ impl Shell {
                     let _ = this;
                     settings::open(section, cx);
                 }))
+        }).collect::<Vec<_>>();
+        // With no account there is nothing to show about one: the page offers the first.
+        let add = snapshot.accounts.is_empty().then(|| {
+            div()
+                .px(px(tokens::GUTTER))
+                .pb(px(16.))
+                .flex()
+                .child(self.phone_sign_in_button("phone-add-account", "Add an account", snapshot, cx))
         });
         div()
             .size_full()
@@ -72,26 +85,53 @@ impl Shell {
                     .border_color(tokens::hairline())
                     .child(div().phone_title().child("You")),
             )
+            // The page below the strip scrolls: at 200% the rows are taller than a small screen.
             .child(
                 div()
-                    .px(px(tokens::GUTTER))
-                    .py(px(24.))
+                    .id("phone-you")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
                     .flex()
-                    .items_center()
-                    .gap(px(16.))
-                    .child(avatar)
+                    .flex_col()
                     .child(
                         div()
-                            .min_w_0()
+                            .px(px(tokens::GUTTER))
+                            .py(px(24.))
                             .flex()
-                            .flex_col()
-                            .gap(px(3.))
-                            .child(div().truncate().phone_title().child(name))
-                            .child(div().phone_preview().text_color(theme::text_soft()).child(line)),
-                    ),
+                            .items_center()
+                            .gap(px(16.))
+                            .child(avatar)
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(3.))
+                                    .child(div().truncate().phone_title().child(name))
+                                    .child(div().phone_preview().text_color(theme::text_soft()).child(line)),
+                            ),
+                    )
+                    .children(add)
+                    .child(div().h(px(1.)).bg(tokens::hairline()))
+                    .children(rows)
+                    .child(div().h(px(24.))),
             )
-            .child(div().h(px(1.)).bg(tokens::hairline()))
-            .children(rows)
-            .child(div().h(px(24.)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::gui::phone::counted;
+
+    #[test]
+    fn the_counts_on_you_are_pluralised_by_their_number() {
+        assert_eq!(counted(1, "account", "accounts"), "1 account");
+        assert_eq!(counted(0, "account", "accounts"), "0 accounts");
+        assert_eq!(counted(2, "account", "accounts"), "2 accounts");
+        assert_eq!(
+            format!("{} · {}", counted(1, "account", "accounts"), counted(1, "network", "networks")),
+            "1 account · 1 network"
+        );
     }
 }
