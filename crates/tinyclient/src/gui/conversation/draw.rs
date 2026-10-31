@@ -305,7 +305,6 @@ impl Pane {
             return div();
         };
         let phone = self.metrics == Metrics::PHONE;
-        // A phone's opening block is a note, not a cover: 48, 12 between the parts, muted.
         let size: f32 = if phone { 48. } else { 80. };
         let direct = open.kind.is_direct();
         let words = if direct {
@@ -313,6 +312,25 @@ impl Pane {
         } else {
             format!("This is the start of #{}.", open.title.trim_start_matches('#'))
         };
+        // A phone's header already carries the face and the name, so the opening is one quiet
+        // line, not a cover that floats in the middle of a short conversation.
+        if phone {
+            return div()
+                .px(px(self.metrics.inset))
+                .pt(px(16.))
+                .pb(px(12.))
+                .flex()
+                .justify_center()
+                .child(
+                    div()
+                        .max_w(px(300.))
+                        .text_align(gpui::TextAlign::Center)
+                        .text_size(px(tokens_phone::scaled(13.)))
+                        .line_height(px(tokens_phone::scaled(18.)))
+                        .text_color(theme::text_faint())
+                        .child(words),
+                );
+        }
         let plate = if direct { Avatar::new(&open.key, &open.title, size) } else { Avatar::channel("icons/hash.svg", size) };
         let shape = if direct { Shape::Person } else { Shape::Place };
         let (title, file) = (open.title.clone(), open.picture.clone());

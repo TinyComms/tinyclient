@@ -593,6 +593,9 @@ impl Shell {
                         div()
                             .mt(px(6.))
                             .mb(px(28.))
+                            .px(px(24.))
+                            .max_w(px(360.))
+                            .text_align(gpui::TextAlign::Center)
                             .type_body()
                             .text_color(theme::text_soft())
                             .child("Sign in to one network to start. Add the others whenever you like."),
