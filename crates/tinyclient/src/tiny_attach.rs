@@ -35,6 +35,38 @@ pub fn scanning_words(count: usize) -> String {
     if count <= 1 { "Scanning that file before it sends.".to_owned() } else { "Scanning those files before they send.".to_owned() }
 }
 
+/// A file still with the scanner, in the conversation it was sent from.
+pub struct OpenScan {
+    pub conversation: protocol::Key,
+    pub chips: usize,
+}
+
+/// What the newest page says about a file that is still scanning. Missing from that page is
+/// not a verdict: a busy channel can push the pending row off it before the upload finishes.
+pub fn scan_settled(state: Option<&protocol::SendState>) -> Option<Result<(), String>> {
+    match state {
+        Some(protocol::SendState::Sent) => Some(Ok(())),
+        Some(protocol::SendState::Failed { reason }) => Some(Err(reason.clone())),
+        Some(protocol::SendState::Pending) | None => None,
+    }
+}
+
+/// Keep asking after the row leaves the newest page, but only for the scan that is still open.
+pub fn stay_in_flight(watching: bool, state: Option<&protocol::SendState>) -> bool {
+    watching && scan_settled(state).is_none()
+}
+
+/// Send stays available in every conversation except the one whose file is still scanning.
+pub fn scan_blocks_send(open: Option<&OpenScan>, here: &protocol::Key) -> bool {
+    open.is_some_and(|open| open.conversation == *here)
+}
+
+/// The scanning sentence for the conversation on screen. Another conversation shows none,
+/// and coming back to the upload shows it again while the hold is open.
+pub fn scan_caption(open: Option<&OpenScan>, here: &protocol::Key) -> Option<String> {
+    open.filter(|open| open.conversation == *here).map(|open| scanning_words(open.chips))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -75,5 +107,37 @@ mod tests {
             assert!(archive_reason(Network::Tiny, &format!("pack.{extension}"), &off).is_some(), "{extension}");
         }
         assert!(archive_reason(Network::Tiny, "photo.png", &off).is_none());
+    }
+
+    fn key(id: &str) -> protocol::Key {
+        protocol::Key { network: Network::Tiny, account: "me".into(), id: id.into() }
+    }
+
+    #[test]
+    fn a_row_off_the_newest_page_is_not_a_clean_scan() {
+        assert!(scan_settled(None).is_none(), "missing from the newest page is not posted");
+        assert!(scan_settled(Some(&protocol::SendState::Pending)).is_none());
+        assert!(stay_in_flight(true, None), "the scan stays watched until it actually settles");
+        assert!(stay_in_flight(true, Some(&protocol::SendState::Pending)));
+        assert!(!stay_in_flight(false, None), "a row that was not a held scan can leave the page");
+        assert_eq!(scan_settled(Some(&protocol::SendState::Sent)), Some(Ok(())));
+        assert!(!stay_in_flight(true, Some(&protocol::SendState::Sent)));
+        let failed = protocol::SendState::Failed { reason: "Tiny blocked that file".into() };
+        assert_eq!(scan_settled(Some(&failed)), Some(Err("Tiny blocked that file".into())));
+        assert!(!stay_in_flight(true, Some(&failed)));
+    }
+
+    #[test]
+    fn a_scan_hold_blocks_only_the_conversation_that_is_uploading() {
+        let here = key("general");
+        let other = key("random");
+        let open = OpenScan { conversation: here.clone(), chips: 1 };
+        assert!(scan_blocks_send(Some(&open), &here));
+        assert!(!scan_blocks_send(Some(&open), &other), "another channel can still send");
+        assert!(!scan_blocks_send(None, &here));
+        assert_eq!(scan_caption(Some(&open), &here).as_deref(), Some("Scanning that file before it sends."));
+        assert!(scan_caption(Some(&open), &other).is_none());
+        let two = OpenScan { chips: 2, ..open };
+        assert_eq!(scan_caption(Some(&two), &here).as_deref(), Some("Scanning those files before they send."));
     }
 }
