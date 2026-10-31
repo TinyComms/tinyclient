@@ -655,9 +655,17 @@ fn the_connection_reports_itself_and_the_bitrate_follows_the_room() {
     assert_eq!((before.path, before.codec.as_str()), (CallPath::Udp, "opus"), "{before:?}");
     assert!(before.loss_permille < 50 && before.jitter_ms < 40, "{before:?}");
     done(ada, MediaRequest::Bitrate { kbps: 16 });
-    sleep(Duration::from_millis(2200));
-    let after = stats(ada).unwrap();
-    assert!(after.send_kbps + 8 < before.send_kbps, "16 kb/s sends less: {} then {}", before.send_kbps, after.send_kbps);
+    // One published second can straddle the change. Wait until a later one is entirely at
+    // the room's rate, which a slow runner may not have by a fixed pause.
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        sleep(Duration::from_millis(200));
+        let now = stats(ada).unwrap();
+        if now.send_kbps + 8 < before.send_kbps {
+            break;
+        }
+        assert!(Instant::now() < deadline, "16 kb/s sends less: {} then {}", before.send_kbps, now.send_kbps);
+    }
     leave(people, sinks);
 }
 
