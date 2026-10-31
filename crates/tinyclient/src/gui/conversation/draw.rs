@@ -445,11 +445,6 @@ impl Pane {
             (false, true) => Some(theme::accent()),
             (false, false) => None,
         };
-        let bar = if mine {
-            Some(crate::gui::phone::tokens::accent())
-        } else {
-            bar
-        };
         let flashing = self.flash.as_deref() == Some(message.id.as_str());
         // The message in the composer for editing is marked, so it is plain which one is changing.
         let editing = self.shell.upgrade().and_then(|shell| shell.read(cx).composer_editing(cx));
@@ -498,28 +493,10 @@ impl Pane {
         if pending {
             sent = sent.opacity(0.55);
         }
-        // A phone's message of mine: the face rides in the head line and the words get the
-        // width, so the accent rule can sit at the words' own trailing edge — 8 clear of the
-        // words and 8 clear of the glass — instead of out in the page margin, where it read as
-        // a scrollbar. The wrapper reaches past the row's inset to the glass; its padding is
-        // what keeps the 8 + 3 + 8. The rule spans the words only: the head line is outside it.
-        let sent: AnyElement = if mine {
-            div()
-                .w_full()
-                .mr(px(-metrics.inset))
-                // 8 clear of the glass, the 3 pt rule, 8 clear of the words.
-                .pr(px(metrics.inset + 3.))
-                .flex()
-                .flex_col()
-                .items_end()
-                .child(sent)
-                .children(bar.map(|color| {
-                    div().absolute().top_0().bottom_0().right(px(8.)).w(px(3.)).rounded(px(1.5)).bg(color)
-                }))
-                .into_any_element()
-        } else {
-            sent.into_any_element()
-        };
+        // A phone marks my message at its head: a 2 pt amber underline under "You" only. A rule
+        // beside the words (at the trailing glass, or at the block's leading edge) reads as
+        // chrome at one width and drifts away from the text when a wrapped block fills the
+        // column at 200% — see `header`.
         let face = if mine { gutter.take() } else { None };
         let column = div()
             .flex_1()
@@ -662,7 +639,21 @@ impl Pane {
                     .flex()
                     .items_baseline()
                     .gap(px(8.))
-                    .child(div().min_w_0().truncate().type_body().when(self.metrics == Metrics::PHONE, |name| name.text_size(px(tokens_phone::scaled(15.))).line_height(px(tokens_phone::scaled(20.)))).font_weight(theme::SEMIBOLD).child(name))
+                    .child(
+                        div()
+                            .relative()
+                            .min_w_0()
+                            .truncate()
+                            .type_body()
+                            .when(self.metrics == Metrics::PHONE, |name| name.text_size(px(tokens_phone::scaled(15.))).line_height(px(tokens_phone::scaled(20.))))
+                            .font_weight(theme::SEMIBOLD)
+                            .child(name)
+                            // Mine, on a phone: 2 pt of amber under the label only. It sits at
+                            // the label's own box, so 200% text scales it with the words.
+                            .children(mine.then(|| {
+                                div().absolute().left_0().right_0().bottom_0().h(px(2.)).rounded(px(1.)).bg(tokens_phone::accent())
+                            })),
+                    )
                     .child(
                         div()
                             .flex_none()
