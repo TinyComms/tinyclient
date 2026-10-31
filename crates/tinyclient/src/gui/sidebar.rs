@@ -1056,18 +1056,12 @@ impl Shell {
             .and_then(|peer| self.people_state.hub().person(&Key { id: peer.clone(), ..c.key.clone() }))
             .map(|person| person.emoji)
             .filter(|emoji| !emoji.is_empty());
-<<<<<<< HEAD
         // The `4/12` is a native voice channel. A stage trails "Live · n speaking" instead.
         let count = if stage {
             None
         } else {
             inside.and_then(|row| voice_count(row.total, if c.call == CallSupport::Native { c.limit } else { 0 }))
         };
-=======
-        // The `4/12` (a user limit) is a native voice channel's treatment; stages are Handoff
-        // and keep their own trailing treatment, so they never get the limited form.
-        let count = inside.and_then(|inside| voice_count(inside.total, if c.call == CallSupport::Native { c.limit } else { 0 }));
->>>>>>> e45b971 (Remove limit assertions after voice-limit PR)
         let draft = (!self.draft_of(c).is_empty() && !selected).then(|| glyph("icons/pencil.svg", 14., theme::text_faint()));
         let (picked, menu_row) = (c.clone(), c.clone());
         let ours = self
