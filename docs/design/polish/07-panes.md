@@ -18,13 +18,15 @@ The `STRIP` of `polish/01` (52, hairline below, buttons 28 four apart, 12 from t
 
   | Kind | Subtitle | Icon buttons (right edge last) |
   |---|---|---|
-  | DM | status text if set, else presence words ("Online", "last seen 2 h ago"), else `@handle` | search · **details `user`** |
+  | DM | status text if set, else presence words ("Online", "last seen 2 h ago"), else `@handle` | search · **title opens the profile** |
   | Group DM | "4 people · Ines, Dita, Haruto" | search · members · details `info` |
   | Channel (Discord, Telegram) | `Space › Group · topic` | search · members · details `info` |
   | Slack channel | `Workspace · topic` (+ `Shared` tag 11/500 for Slack Connect) | search · **threads** · members · details |
   | Teams channel | `Team › · description` | search · threads · members · details |
 
 - A conversation in no Space (reached from the Inbox) puts the network icon 14 before the title (6 gap).
+- **Beside a direct conversation the title is the way to the person.** Hover underlines it; a click opens their Profile
+  (as `⌘.` does), so the strip draws no `user` button there.
 - Path glyph is `›` everywhere. **Clicking the subtitle reveals the row in the sidebar**: hover `text_soft`, tooltip
   "Reveal in sidebar".
 - **Buttons**: glyph 16 `text_soft`; hover `hover`, held `pressed`, **lit = `selected` + `text` glyph** = "this kind is
@@ -47,7 +49,7 @@ The `STRIP` of `polish/01` (52, hairline below, buttons 28 four apart, 12 from t
 
   | Kind | Title | Opened by | Base or push |
   |---|---|---|---|
-  | Details · person | "Profile" | DM details button; a member row; "View profile" on a card | base in a DM; push elsewhere |
+  | Details · person | "Profile" | the DM's title; a member row; "View profile" on a card | base in a DM; push elsewhere |
   | Details · conversation | "Details" | details in a group or channel | base |
   | Members | "Members" (counts live in its section headers) | members button; Details' Members row | base, or push from Details |
   | Threads (Slack, Teams) | "Threads" | threads button; "3 more threads" in the sidebar | base |
