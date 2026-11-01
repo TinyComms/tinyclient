@@ -2227,7 +2227,10 @@ impl Chat {
                 Response::LogsSaved { paths }
             }
             Request::PlaySound { sound } => {
-                let known = settings::SOUND_CHOICES.iter().chain(&settings::RING_CHOICES).any(|word| *word == sound && sound != "none");
+                let known = sound != "none" && settings::sound_word(&sound) && match sound.strip_prefix("custom:") {
+                    Some(id) => self.hub.settings().custom_sound(id).is_some(),
+                    None => true,
+                };
                 if !known {
                     return error(ErrorCode::NotFound, "no such sound");
                 }

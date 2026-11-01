@@ -516,6 +516,10 @@ fn a_forum_topic_is_a_thread_under_the_forum() {
     // Opening the thread reads the topic's own history; a post in it names the topic.
     world.until("the topic's history", || world.message("c9002_31", "41"));
     assert_eq!(world.called("GetReplies c9002_31"), 1);
+    // Read in a topic is told for the topic. Before a reply: a reply moves the marker ahead
+    // of it, and a read of an older message is already covered by that.
+    world.ask(Request::MarkRead { conversation: key("c9002_31"), message_id: "42".into() });
+    world.until("the topic to be read", || world.calls().contains(&"ReadDiscussion c9002_31 42".to_owned()).then_some(()));
     world.send("c9002_31", "9001", "On my way", None);
     world.until("the post to be sent", || world.calls().contains(&"SendMessage c9002_31 On my way".to_owned()).then_some(()));
     world.until("it to be in the thread", || world.messages("c9002_31").into_iter().find(|message| message.text == "On my way" && message.state == SendState::Sent));
@@ -527,10 +531,6 @@ fn a_forum_topic_is_a_thread_under_the_forum() {
     world.rows_on_screen(&["u7002"]);
     sleep(Duration::from_millis(300));
     assert_eq!(world.called("GetHistory u7002"), 0);
-
-    // Read in a topic is told for the topic.
-    world.ask(Request::MarkRead { conversation: key("c9002_31"), message_id: "42".into() });
-    world.until("the topic to be read", || world.calls().contains(&"ReadDiscussion c9002_31 42".to_owned()).then_some(()));
 }
 
 #[test]

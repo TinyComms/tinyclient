@@ -138,11 +138,20 @@ pub const SOUND: &str = "sound";
 /// How loud tinyclient plays notification sounds, 0 to 100. Windows and Linux play them
 /// itself, so there is no system alert volume to follow there.
 pub const ALERT_VOLUME: &str = "alert_volume";
+/// S14. A ring back while I am calling someone, until they answer or I cancel.
+pub const RINGBACK: &str = "ringback";
+/// S13. One row per file the user added, in a `sound:<id>` scope. The value is the name shown
+/// in the pickers; the file is `<id>.wav` in the sounds directory (`sound_path`).
+pub const CUSTOM_SOUND: &str = "custom_sound";
+/// The scope a [`CUSTOM_SOUND`] row lives in.
+pub const SOUND_SCOPE_PREFIX: &str = "sound:";
 
-/// The message sounds, by the word stored, then `none`.
-pub const SOUND_CHOICES: [&str; 6] = ["pebble", "drop", "tap", "chime", "glass", "none"];
-pub const MENTION_SOUND_CHOICES: [&str; 7] = ["same", "pebble", "drop", "tap", "chime", "glass", "none"];
-pub const RING_CHOICES: [&str; 3] = ["soft_ring", "classic_ring", "none"];
+/// The message sounds, by the word stored, then `none`. A custom sound is `custom:<id>`.
+pub const SOUND_CHOICES: [&str; 8] = ["pebble", "drop", "tap", "chime", "glass", "marimba", "bell", "none"];
+pub const MENTION_SOUND_CHOICES: [&str; 9] = ["same", "pebble", "drop", "tap", "chime", "glass", "marimba", "bell", "none"];
+pub const RING_CHOICES: [&str; 4] = ["soft_ring", "classic_ring", "ripple", "none"];
+/// The most custom sounds a picker holds, so the menu stays one screen.
+pub const CUSTOM_SOUND_LIMIT: usize = 12;
 pub const PREVIEW_CHOICES: [&str; 3] = ["full", "sender", "nothing"];
 pub const CALLS_CHOICES: [&str; 3] = ["ring", "silent", "off"];
 pub const IN_CALL_CHOICES: [&str; 3] = ["banners", "sounds", "nothing"];
@@ -169,12 +178,14 @@ enum Kind {
     Minute(u32),
     /// Unix seconds, or `resume`.
     Until,
+    /// A custom sound's name, in its `sound:<id>` scope.
+    CustomSound,
 }
 
 fn kind(key: &str) -> Option<Kind> {
     Some(match key {
         KEEP_RUNNING | SOUNDS | CUE_JOINS | CUE_MINE | CUE_CONNECTION => Kind::Switch(true),
-        NOTIFY | NOTIFY_DIRECT | NOTIFY_GROUPS | NOTIFY_MENTIONS | NOTIFY_TINY | CALLS_THROUGH | FLASH | BADGE => Kind::Switch(true),
+        NOTIFY | NOTIFY_DIRECT | NOTIFY_GROUPS | NOTIFY_MENTIONS | NOTIFY_TINY | CALLS_THROUGH | FLASH | BADGE | RINGBACK => Kind::Switch(true),
         QUIET_HOURS => Kind::Switch(false),
         QUIET_FROM => Kind::Minute(22 * 60),
         QUIET_TO => Kind::Minute(8 * 60),
@@ -207,8 +218,24 @@ fn kind(key: &str) -> Option<Kind> {
         TYPING | RECEIPTS => Kind::Switch(true),
         LOG_LEVEL => Kind::Word(&LOG_LEVEL_CHOICES, "info"),
         LOG_RING | LOG_EXPORT => Kind::Switch(true),
+        CUSTOM_SOUND => Kind::CustomSound,
         _ => return None,
     })
+}
+
+/// Whether `id` names a custom sound: sixteen lower-case hexadecimal characters, the start of
+/// the file's SHA-256, so a name chosen by the user never reaches a path.
+pub fn sound_id(id: &str) -> bool {
+    id.len() == 16 && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Whether `value` is a sound word a picker may store: one of the bundled ones, `none`, and
+/// `custom:<id>` for a file the user added.
+pub fn sound_word(value: &str) -> bool {
+    if let Some(id) = value.strip_prefix("custom:") {
+        return sound_id(id);
+    }
+    SOUND_CHOICES.contains(&value) || RING_CHOICES.contains(&value)
 }
 
 /// The scopes a key may be stored in.
@@ -219,8 +246,24 @@ fn scoped(key: &str, scope: &str) -> bool {
         _ if gain_user(key).is_some() => account_of(scope).is_some(),
         NOTIFY_ABOUT => scope == GLOBAL || account_of(scope).is_some() || conversation_of(scope).is_some(),
         SOUND => account_of(scope).is_some() || conversation_of(scope).is_some(),
+        CUSTOM_SOUND => sound_scope(scope).is_some(),
         _ => scope == GLOBAL,
     }
+}
+
+/// The id a `sound:<id>` scope names.
+pub fn sound_scope(scope: &str) -> Option<&str> {
+    scope.strip_prefix(SOUND_SCOPE_PREFIX).filter(|id| sound_id(id))
+}
+
+/// The scope one custom sound's row lives in.
+pub fn sound_of(id: &str) -> String {
+    format!("{SOUND_SCOPE_PREFIX}{id}")
+}
+
+/// Where a custom sound's file is: `<id>.wav` in the sounds directory beside the database.
+pub fn sound_path(dir: &std::path::Path, id: &str) -> std::path::PathBuf {
+    dir.join("sounds").join(format!("{id}.wav"))
 }
 
 /// Whether `value` may be stored for `key` in `scope`. Anything else is refused, so the table
@@ -237,9 +280,13 @@ pub fn valid(scope: &str, key: &str, value: &str) -> bool {
         Some(Kind::Hotkey) => crate::hotkey::Binding::parse(value).is_some(),
         Some(Kind::Gain) => parse_gain(value).is_some(),
         Some(Kind::Word(_, _)) if key == NOTIFY_ABOUT => about_choices(scope).contains(&value),
+        Some(Kind::Word(words, _)) if matches!(key, MESSAGE_SOUND | MENTION_SOUND | RING_SOUND | SOUND) => {
+            words.contains(&value) || value.strip_prefix("custom:").is_some_and(sound_id) || value == "same"
+        }
         Some(Kind::Word(words, _)) => words.contains(&value),
         Some(Kind::Minute(_)) => value.parse::<u32>().is_ok_and(|n| n < 24 * 60),
         Some(Kind::Until) => value == "resume" || value.parse::<u64>().is_ok(),
+        Some(Kind::CustomSound) => !value.is_empty() && value.len() <= 48 && !value.chars().any(char::is_control),
         None => false,
     }
 }
@@ -568,6 +615,70 @@ impl Values {
     }
 }
 
+/// A sound file the user added (S13).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustomSound {
+    pub id: String,
+    pub name: String,
+}
+
+impl CustomSound {
+    /// The word a picker stores for it.
+    pub fn word(&self) -> String {
+        format!("custom:{}", self.id)
+    }
+}
+
+impl Values {
+    /// S13: every sound file added, by the name shown. An unreadable or duplicate name is left
+    /// out, so a damaged row cannot take a picker down.
+    pub fn custom_sounds(&self) -> Vec<CustomSound> {
+        let mut rows: Vec<CustomSound> = self
+            .0
+            .iter()
+            .filter(|((_, key), _)| key == CUSTOM_SOUND)
+            .filter_map(|((scope, _), value)| Some(CustomSound { id: sound_scope(scope)?.to_owned(), name: value.clone() }))
+            .filter(|sound| valid(&sound_of(&sound.id), CUSTOM_SOUND, &sound.name))
+            .collect();
+        rows.sort_by_key(|sound| sound.name.to_lowercase());
+        rows.dedup_by(|a, b| a.id == b.id);
+        rows.truncate(CUSTOM_SOUND_LIMIT);
+        rows
+    }
+
+    /// S13: one added sound, if its file is still registered.
+    pub fn custom_sound(&self, id: &str) -> Option<CustomSound> {
+        self.custom_sounds().into_iter().find(|sound| sound.id == id)
+    }
+
+    /// The name to show for a sound word: a bundled one's name, or a custom one's. `None` for
+    /// `none`, `same`, and a custom sound that is no longer registered.
+    pub fn sound_name(&self, word: &str) -> Option<String> {
+        let bundled = match word {
+            "pebble" => "Pebble",
+            "drop" => "Drop",
+            "tap" => "Tap",
+            "chime" => "Chime",
+            "glass" => "Glass",
+            "marimba" => "Marimba",
+            "bell" => "Bell",
+            "soft_ring" => "Soft ring",
+            "classic_ring" => "Classic ring",
+            "ripple" => "Ripple",
+            _ => "",
+        };
+        if !bundled.is_empty() {
+            return Some(bundled.to_owned());
+        }
+        self.custom_sound(word.strip_prefix("custom:")?).map(|sound| sound.name)
+    }
+
+    /// S14: ring back while I am calling someone.
+    pub fn ringback(&self) -> bool {
+        self.on(RINGBACK)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -606,8 +717,7 @@ mod tests {
     }
 
     #[test]
-    fn requiring_end_to_end_encrypted_calls_is_a_switch_that_is_off_until_chosen() {
-        // Off by default on purpose: a server or an app that cannot encrypt would stop working.
+    fn requiring_end_to_end_encrypted_calls_is_a_switch_that_is_off_until_chosen() {        // Off by default on purpose: a server or an app that cannot encrypt would stop working.
         assert!(!Values::default().on(REQUIRE_CALL_E2EE));
         assert!(valid(GLOBAL, REQUIRE_CALL_E2EE, "on") && valid(GLOBAL, REQUIRE_CALL_E2EE, "off"));
         assert!(!valid(GLOBAL, REQUIRE_CALL_E2EE, "yes") && !valid(GLOBAL, REQUIRE_CALL_E2EE, "1") && !valid(GLOBAL, REQUIRE_CALL_E2EE, ""));
@@ -717,8 +827,7 @@ mod tests {
     }
 
     #[test]
-    fn play_sounds_off_silences_every_cue_and_keeps_the_choices() {
-        let mut values = Values::default();
+    fn play_sounds_off_silences_every_cue_and_keeps_the_choices() {        let mut values = Values::default();
         values.set(GLOBAL, CUE_MINE, Some("off".into()));
         let tuning = values.tuning();
         assert!(tuning.joins && !tuning.mine && tuning.connection);
@@ -770,5 +879,50 @@ mod tests {
         assert!(!DeviceChoice::device("Mic", "b").is(&list[0], &list), "two of one model: the id tells");
         assert!(DeviceChoice::device("Mic", "gone").is(&list[0], &list), "the first of that name");
         assert!(!DeviceChoice::Auto.is(&list[0], &list));
+    }
+
+    #[test]
+    fn a_custom_sound_is_a_file_id_and_a_name_and_the_pickers_take_it() {
+        let id = "0123456789abcdef";
+        let scope = sound_of(id);
+        assert_eq!(sound_scope(&scope), Some(id));
+        assert!(valid(&scope, CUSTOM_SOUND, "My tone"));
+        assert!(!valid(&scope, CUSTOM_SOUND, ""), "a sound needs a name");
+        assert!(!valid(&scope, CUSTOM_SOUND, "two\nlines"), "and no control characters");
+        assert!(!valid(GLOBAL, CUSTOM_SOUND, "My tone"), "only in a sound scope");
+        assert!(!valid(&sound_of("nope"), CUSTOM_SOUND, "My tone"), "the id is the file's");
+        assert!(!valid(&sound_of("0123456789ABCDEF"), CUSTOM_SOUND, "My tone"), "lower case only");
+        assert!(!valid(&sound_of("../etc/passwd"), CUSTOM_SOUND, "My tone"));
+
+        let word = format!("custom:{id}");
+        for key in [MESSAGE_SOUND, MENTION_SOUND, RING_SOUND] {
+            assert!(valid(GLOBAL, key, &word), "{key}");
+        }
+        assert!(valid(&account_scope(&account(Network::Slack)), SOUND, &word));
+        assert!(!valid(GLOBAL, MENTION_SOUND, "custom:0"), "an id is sixteen characters");
+    }
+
+    #[test]
+    fn every_added_sound_is_listed_by_name_and_an_unregistered_one_by_nothing() {
+        let id = "0123456789abcdef";
+        let mut values = Values::default();
+        values.set(&sound_of(id), CUSTOM_SOUND, Some("Rain on the roof".into()));
+        values.set(&sound_of("fedcba9876543210"), CUSTOM_SOUND, Some("Air horn".into()));
+        let named: Vec<String> = values.custom_sounds().into_iter().map(|sound| sound.name).collect();
+        assert_eq!(named, ["Air horn", "Rain on the roof"], "sorted, whatever the order they were added");
+        assert_eq!(values.sound_name(&format!("custom:{id}")).as_deref(), Some("Rain on the roof"));
+        assert_eq!(values.sound_name("custom:ffffffffffffffff"), None);
+        assert_eq!(values.sound_name("none"), None);
+        assert_eq!(values.sound_name("soft_ring").as_deref(), Some("Soft ring"));
+        assert!(!values.custom_sound(id).is_some_and(|sound| sound.word() != format!("custom:{id}")));
+    }
+
+    #[test]
+    fn ringing_back_while_calling_is_on_until_it_is_turned_off() {
+        assert!(Values::default().ringback(), "someone who calls out expects to hear it ring");
+        assert!(valid(GLOBAL, RINGBACK, "on") && valid(GLOBAL, RINGBACK, "off"));
+        let mut values = Values::default();
+        values.set(GLOBAL, RINGBACK, Some("off".into()));
+        assert!(!values.ringback());
     }
 }

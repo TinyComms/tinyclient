@@ -17,16 +17,36 @@ pub enum Sound {
     Tap,
     Chime,
     Glass,
+    Marimba,
+    Bell,
     SoftRing,
     ClassicRing,
+    Ripple,
 }
 
 impl Sound {
-    pub const ALL: [Sound; 7] = [Sound::Pebble, Sound::Drop, Sound::Tap, Sound::Chime, Sound::Glass, Sound::SoftRing, Sound::ClassicRing];
+    pub const ALL: [Sound; 10] = [
+        Sound::Pebble,
+        Sound::Drop,
+        Sound::Tap,
+        Sound::Chime,
+        Sound::Glass,
+        Sound::Marimba,
+        Sound::Bell,
+        Sound::SoftRing,
+        Sound::ClassicRing,
+        Sound::Ripple,
+    ];
+
+    /// The ones shipped as files in the app bundle. The rest are newer synthesis that every
+    /// platform plays itself through `mediad --sound`, so they need no file and no macOS
+    /// notification sound; a picker may offer them anywhere.
+    pub const BUNDLED: [Sound; 7] = [Sound::Pebble, Sound::Drop, Sound::Tap, Sound::Chime, Sound::Glass, Sound::SoftRing, Sound::ClassicRing];
 
     /// The file stem: `tinyclient-<name>.caf`, prefixed so it cannot meet a system sound.
-    pub fn file(self) -> &'static str {
-        match self {
+    /// `None` for a sound with no bundled file.
+    pub fn file(self) -> Option<&'static str> {
+        Some(match self {
             Sound::Pebble => "tinyclient-pebble",
             Sound::Drop => "tinyclient-drop",
             Sound::Tap => "tinyclient-tap",
@@ -34,7 +54,8 @@ impl Sound {
             Sound::Glass => "tinyclient-glass",
             Sound::SoftRing => "tinyclient-soft-ring",
             Sound::ClassicRing => "tinyclient-classic-ring",
-        }
+            Sound::Marimba | Sound::Bell | Sound::Ripple => return None,
+        })
     }
 
     /// The sound a settings word names (`protocol::settings::SOUND_CHOICES`, `RING_CHOICES`).
@@ -45,14 +66,17 @@ impl Sound {
             "tap" => Sound::Tap,
             "chime" => Sound::Chime,
             "glass" => Sound::Glass,
+            "marimba" => Sound::Marimba,
+            "bell" => Sound::Bell,
             "soft_ring" => Sound::SoftRing,
             "classic_ring" => Sound::ClassicRing,
+            "ripple" => Sound::Ripple,
             _ => return None,
         })
     }
 
     pub fn ring(self) -> bool {
-        matches!(self, Sound::SoftRing | Sound::ClassicRing)
+        matches!(self, Sound::SoftRing | Sound::ClassicRing | Sound::Ripple)
     }
 
     /// Length in seconds and peak in dBFS. Half a decibel under the design's limits (-14 and
@@ -64,7 +88,9 @@ impl Sound {
             Sound::Tap => (0.12, -14.5),
             Sound::Chime => (0.5, -14.5),
             Sound::Glass => (0.45, -14.5),
-            Sound::SoftRing | Sound::ClassicRing => (4.0, -10.5),
+            Sound::Marimba => (0.42, -14.5),
+            Sound::Bell => (0.5, -14.5),
+            Sound::SoftRing | Sound::ClassicRing | Sound::Ripple => (4.0, -10.5),
         }
     }
 }
@@ -241,6 +267,31 @@ pub fn sound(sound: Sound, rate: u32) -> Vec<f32> {
                 *out = tone * rise(t, 0.003) * decay(t, 0.003, 0.4);
             }
         }
+        Sound::Marimba => {
+            // A rosewood bar struck once, then its octave: a warm mallet, not a bell. The
+            // second note lands under the first's tail so the two read as one gesture.
+            for (start, hertz) in [(0., 659.25), (0.11, 987.77)] {
+                for (n, out) in samples.iter_mut().enumerate() {
+                    let t = n as f64 / r - start;
+                    if t >= 0. {
+                        // Ratio 4 at a falling index: the bar's short, woody knock over the
+                        // fundamental. It reaches nothing above the band's ceiling.
+                        *out += fm(t, hertz, 4., (0.9, 0.08), 0.25) * rise(t, 0.002) * decay(t, 0.002, 0.26);
+                    }
+                }
+            }
+        }
+        Sound::Bell => {
+            // An FM bell: a soft strike, the index closing as the tail dies, and the hum an
+            // octave under the strike so it keeps its body on a laptop speaker.
+            let (mut hum, mut shimmer) = (Voice::new(), Voice::new());
+            for (n, out) in samples.iter_mut().enumerate() {
+                let t = n as f64 / r;
+                let strike = fm(t, 880., 1.41, (1.6, 0.1), 0.5);
+                let body = 0.22 * hum.next(440., r) + 0.08 * shimmer.next(1_320., r);
+                *out = (strike + body) * rise(t, 0.004) * decay(t, 0.004, 0.55);
+            }
+        }
         Sound::SoftRing => {
             for rise_at in [0., 2.] {
                 for (step, hertz) in [523.25, 659.25, 783.99].into_iter().enumerate() {
@@ -261,6 +312,21 @@ pub fn sound(sound: Sound, rate: u32) -> Vec<f32> {
                 // A trill at 20 Hz, 60 % deep: a phone's ring, not a buzz.
                 let trill = 1. - 0.6 * (0.5 + 0.5 * (TAU * 20. * t).cos());
                 *out = ((TAU * 440. * t).sin() + (TAU * 480. * t).sin()) * trill * burst;
+            }
+        }
+        Sound::Ripple => {
+            // Three soft drops into still water, each lower and each with a longer tail: a
+            // modern ring that does not say "telephone" and does not startle. The pattern
+            // repeats at 2.0 s, so it loops as an 8 s ring back without a seam.
+            for (start, hertz) in [(0., 880.), (0.55, 659.25), (1.1, 440.)] {
+                for (n, out) in samples.iter_mut().enumerate() {
+                    let t = n as f64 / r - start;
+                    if (0. ..2.9).contains(&t) {
+                        let ping = fm(t, hertz, 2., (0.5, 0.), 0.4);
+                        let water = 0.3 * (TAU * hertz * 2.76 * t).sin() * decay(t, 0., 0.5);
+                        *out += (ping + water) * rise(t, 0.008) * decay(t, 0.008, 2.2);
+                    }
+                }
             }
         }
     }
@@ -318,7 +384,11 @@ pub fn cue(cue: Cue, rate: u32) -> Vec<f32> {
                 continue;
             }
             let shape = if tick { rise(t, 0.002) * decay(t, 0.002, note) * edges(t, note, 0.002) } else { edges(t, note, 0.01) };
-            *out += (TAU * hertz * t).sin() * shape;
+            // A warm struck tone rather than a bare sine: a quiet octave that dies quickly
+            // gives the attack its body, and a whisper of the twelfth keeps it from sounding
+            // like a test signal.
+            let tone = (TAU * hertz * t).sin() + 0.22 * (TAU * 2. * hertz * t).sin() * decay(t, 0., 0.05) + 0.05 * (TAU * 3. * hertz * t).sin();
+            *out += tone * shape;
         }
     }
     normalise(&mut samples, CUE_PEAK_DB);
@@ -468,11 +538,12 @@ mod tests {
         let dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../packaging/sounds"));
         let scratch = std::env::temp_dir().join(format!("tinyclient-sounds-{}", std::process::id()));
         std::fs::create_dir_all(&scratch).unwrap();
-        for sound in Sound::ALL {
-            let wav = scratch.join(format!("{}.wav", sound.file()));
+        for sound in Sound::BUNDLED {
+            let stem = sound.file().expect("a bundled sound has a file");
+            let wav = scratch.join(format!("{stem}.wav"));
             let decoded = std::process::Command::new("afconvert")
                 .args(["-f", "WAVE", "-d", "LEI16"])
-                .arg(dir.join(format!("{}.caf", sound.file())))
+                .arg(dir.join(format!("{stem}.caf")))
                 .arg(&wav)
                 .status()
                 .expect("afconvert runs");

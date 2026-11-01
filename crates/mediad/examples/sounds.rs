@@ -44,8 +44,8 @@ fn main() {
     }
     let dir = std::env::args().nth(1).unwrap_or_else(|| "sounds".to_owned());
     std::fs::create_dir_all(&dir).expect("the directory is made");
-    for which in Sound::ALL {
-        let path = std::path::Path::new(&dir).join(format!("{}.wav", which.file()));
+    for which in Sound::BUNDLED {
+        let path = std::path::Path::new(&dir).join(format!("{}.wav", which.file().expect("bundled")));
         std::fs::write(&path, wav(&sound(which, FILE_RATE), FILE_RATE)).expect("the file is written");
         println!("{}", path.display());
     }

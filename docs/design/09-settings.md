@@ -82,7 +82,7 @@ A dropdown (3.4) of audio devices. First item "System default (MacBook Pro Micro
 20 segments, 10 × 8, radius 2, 2 apart: 238 wide. Unlit `switch_off`. Lit below the sensitivity line `text_faint`; lit at or above it `positive`, so the meter shows what would be sent. The sensitivity line is a 2 × 14 `text` bar at the threshold, centred on the meter. The V6 slider sits 6 below at the same width, so its thumb is under the line. Levels arrive at 10 Hz only while a test runs; nothing smooths them and there is no peak hold. Not running: all segments unlit, the line still drawn. Role `Meter`, value = level 0 to 100.
 
 ### 3.7 Sound picker with play
-A dropdown (3.4), fixed 160 wide, then 4, then an icon-only ghost button 28 × 28 with `play` 16. Menu items show the name and, right-aligned in the shortcut slot, a two-word character in 12 `text_soft` (`text_faint` may not sit on `overlay`): "Pebble   soft, low". Order: "Same as messages" (S3 only) or "Default (Pebble)" (override rows), separator, the five sounds (rings: two), separator, "System alert sound", "None".
+A dropdown (3.4), 120 to 240 wide, then 4, then an icon-only ghost button 28 × 28 with `play` 16. Menu items show the name and, right-aligned in the shortcut slot, a two-word character in 12 `text_soft` (`text_faint` may not sit on `overlay`): "Pebble   soft, low". Order: "Same as messages" (S3 only), the five older sounds, Marimba, Bell (rings: Soft ring, Classic ring, Ripple), the files under "Your sounds", separator, "Add a sound…", "None". The picker shows names, so a file of your own reads as the name of the file, and one whose file was removed reads "Missing sound".
 
 The play button plays the selected sound once; while it plays the glyph is `square` 14 and the tooltip "Stop". Picking a new sound from the menu plays it once too, as macOS Sound settings do; moving through the open menu does not. One sound at a time: a new play stops the last. With "None" selected, the play button is absent and its 32 stays reserved. Tooltip: "Play Pebble". These buttons and the play-on-pick exist only if S11 ships (product: alert-device routing); otherwise the picker sits alone, right-aligned. Role `Button`, label "Play Pebble".
 
@@ -266,7 +266,7 @@ Per-conversation settings live with the conversation and are mirrored in Sounds 
 
 ## 8. The sounds
 
-All are generated from code by one synthesiser, so the licence is the repository's (MIT): no samples, no third-party presets, no fonts of sounds. The synthesiser is `mediad`'s cue module: sine and two-operator FM voices, ADSR envelopes, a 4-pole (two 2-pole sections) 300 Hz high-pass and 6 kHz low-pass, all deterministic; one 2-pole section let Chime's upper FM sidebands through at 2 %. `cargo run -p mediad --example sounds -- <dir>` renders the seven bundled sounds to WAV; `afconvert -f caff -d ima4 -c 1` encodes them; `packaging/sounds/render.sh` does both. The CAF files are committed in `packaging/sounds` as `tinyclient-<name>.caf`, prefixed so they cannot collide with system sounds, and go into the app's Resources when notifications post them. A macOS test (`crates/mediad/tests/sounds.rs`) renders the WAVs again and compares their SHA-256 to `packaging/sounds/SHA256SUMS`, so the files cannot drift from the code; other platforms' maths libraries may round a sample differently. Nothing is rendered at build time.
+All are generated from code by one synthesiser, so the licence is the repository's (MIT): no samples, no third-party presets, no fonts of sounds. The synthesiser is `mediad`'s cue module: sine and two-operator FM voices, ADSR envelopes, a 4-pole (two 2-pole sections) 300 Hz high-pass and 6 kHz low-pass, all deterministic; one 2-pole section let Chime's upper FM sidebands through at 2 %. `cargo run -p mediad --example sounds -- <dir>` renders the seven bundled sounds to WAV; `afconvert -f caff -d ima4 -c 1` encodes them; `packaging/sounds/render.sh` does both. The CAF files are committed in `packaging/sounds` as `tinyclient-<name>.caf`, prefixed so they cannot collide with system sounds, and go into the app's Resources when notifications post them. A macOS test (`crates/mediad/tests/sounds.rs`) renders the WAVs again and compares their SHA-256 to `packaging/sounds/SHA256SUMS`, so the files cannot drift from the code; other platforms' maths libraries may round a sample differently. Nothing is rendered at build time. The three sounds added later (Marimba, Bell, Ripple) and every file a person adds are played by chatd through `mediad --sound`, not by a notification, so no file is committed for them.
 
 **Rate and size.** Every sound is 22.05 kHz mono IMA4, about 11.7 KB a second, because nothing is above 6 kHz. Correction to the product doc: at 44.1 kHz the 8 s of rings alone are about 187 KB, past the 160 KB budget. At 22.05 kHz, with afconvert's padding and info chunks stripped, the seven files total 114 KB.
 
@@ -279,13 +279,21 @@ All are generated from code by one synthesiser, so the licence is the repository
 | Tap | dry, short | FM, carrier 1,000 Hz, ratio 1.41, index 2 → 0 over 30 ms; 2 ms attack, 90 ms decay | 0.12 s |
 | Chime | bright, two notes | FM bell, ratio 1:3.5, index 1.5 → 0.2; G5 then C6 (784, 1,047 Hz) 90 ms apart, each decaying over 350 ms | 0.5 s |
 | Glass | clear, high | Sine A6 (1,760 Hz) plus an inharmonic partial at 2.76× (4,858 Hz, −10 dB), 3 ms attack, 400 ms decay | 0.45 s |
+| Marimba | warm, wooden | FM at E5 then B5, ratio 4 with the index closing 0.9 → 0.08 over 250 ms, 2 ms attack, 260 ms decay; the second note lands under the first's tail | 0.42 s |
+| Bell | deep, ringing | FM bell at A5, ratio 1.41, index 1.6 → 0.1 over 500 ms, over a quiet octave hum and a twelfth; 4 ms attack, 550 ms decay | 0.5 s |
 
-**Rings.** At most 4 s, peak −10 dBFS (rendered to −10.5), 300 Hz to 6 kHz, not looped (product: until withdrawal is proven to cut a playing sound).
+Marimba, Bell and Ripple have no committed file: chatd plays them through `mediad --sound`, so they
+are heard on every platform, including macOS, where the notification is posted silent for them.
+
+**Rings.** At most 4 s, peak −10 dBFS (rendered to −10.5), 300 Hz to 6 kHz, not looped by the
+notification itself (product: until withdrawal is proven to cut a playing sound). An incoming ring
+is repeated by chatd with a 1.5 s breath until it stops; the ring back repeats S4 with 2 s.
 
 | Name | Character | Recipe |
 |---|---|---|
 | Soft ring (default) | two gentle rises | C5, E5, G5 (523, 659, 784 Hz) sines 120 ms apart, each 10 ms attack and 600 ms decay; the rise at 0.0 and again at 2.0 s; silence to 4.0 s |
 | Classic ring | a phone, quieter | 440 + 480 Hz, amplitude-modulated at 20 Hz with 60% depth (a trill, not a buzz); bursts of 1.0 s at 0.0 and 2.0 s, 30 ms fades; 4.0 s |
+| Ripple | three soft drops | FM pings at A5, E5 and A4, 0.55 s apart, each with a 2.76× water partial and a 2.2 s decay; no file, played by chatd |
 
 **In-call cues.** Not files: generated in mediad's mix at call time, peak −20 dBFS at 100 % of S10, so a cue sits under speech. 10 ms raised-cosine fades so nothing clicks.
 
