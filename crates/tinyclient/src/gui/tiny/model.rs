@@ -124,6 +124,27 @@ pub fn is_owner(member: &TinyMember) -> bool {
     member.owner || member.role.eq_ignore_ascii_case("owner")
 }
 
+/// The role a direct conversation's header says. The most senior named role, else Owner, else
+/// the legacy word on a server that has no roles of its own. `@everyone` is not said, and the
+/// header never carries the member's email.
+pub struct HeaderRole {
+    pub name: String,
+    pub color: Option<u32>,
+}
+
+pub fn header_role(community: &TinyCommunity, member: &TinyMember) -> Option<HeaderRole> {
+    if let Some(role) = roles_of(community, member).into_iter().next() {
+        return Some(HeaderRole { name: role.name.clone(), color: role.color.as_deref().and_then(hex) });
+    }
+    if is_owner(member) {
+        return Some(HeaderRole { name: "Owner".to_owned(), color: None });
+    }
+    if community.roles.is_empty() {
+        return Some(HeaderRole { name: role_word(&member.role).to_owned(), color: None });
+    }
+    None
+}
+
 /// The room someone's seat is in, and the seat.
 pub fn seat_of<'a>(community: &'a TinyCommunity, user_id: &str) -> Option<(&'a TinyRoom, &'a TinySeat)> {
     community.rooms.iter().find_map(|room| room.participants.iter().find(|seat| seat.user_id == user_id).map(|seat| (room, seat)))
@@ -648,6 +669,20 @@ mod tests {
         ];
         community.online = vec!["own".into(), "me".into(), "mod".into(), "mem".into()];
         community
+    }
+
+    #[test]
+    fn the_header_names_the_senior_role_and_leaves_everyone_and_the_email_out() {
+        let community = modern();
+        let role = header_role(&community, community.member("mod").unwrap()).unwrap();
+        assert_eq!(role.name, "Moderator");
+        assert_eq!(role.color, Some(0x3FBF7A));
+        assert!(header_role(&community, community.member("mem").unwrap()).is_none());
+        let owner = header_role(&community, community.member("own").unwrap()).unwrap();
+        assert_eq!(owner.name, "Owner");
+        let old = legacy("member");
+        assert_eq!(header_role(&old, old.member("mem").unwrap()).unwrap().name, "Member");
+        assert_eq!(header_role(&old, old.member("adm").unwrap()).unwrap().name, "Admin");
     }
 
     #[test]

@@ -41,13 +41,14 @@ mod status;
 pub use hub::{ask_later, Hub};
 
 use super::anim::Play;
+use super::theme;
 use super::components::Avatar;
 use super::composer::typing_preview;
 use super::layout::{RightKind, RightPane};
 use super::sidebar::Mode;
 use super::state::Shell;
 use card::{Float, Floating};
-use gpui::{prelude::*, AnyElement, Context, Div, Entity, Pixels, Point, SharedString, Window};
+use gpui::{prelude::*, AnyElement, Context, Div, Entity, Pixels, Point, Rgba, SharedString, Window};
 use info::InfoPane;
 use list::PeopleList;
 use members::MemberList;
@@ -125,6 +126,26 @@ fn existing_direct<'a>(rows: impl IntoIterator<Item = &'a Conversation>, person:
             && row.key.network == person.network
             && row.key.account == person.account
     })
+}
+
+/// The presence word in the direct header, in its own color, then what they say.
+/// A call takes the place of both while it lasts. `None` when nothing is known.
+pub(super) struct PeerLine {
+    pub word: &'static str,
+    pub tone: Rgba,
+    pub extra: String,
+}
+
+pub(super) fn peer_words(presence: Presence, network: Network, status: &str, in_call: bool) -> Option<PeerLine> {
+    if in_call {
+        return Some(PeerLine { word: "In a call", tone: theme::online(), extra: String::new() });
+    }
+    let word = presence::word(presence, network);
+    let extra = status.trim();
+    if word.is_empty() && extra.is_empty() {
+        return None;
+    }
+    Some(PeerLine { word, tone: presence::tone(presence), extra: extra.to_owned() })
 }
 
 /// The line under a direct conversation's title: the word for their presence, then what they
@@ -380,10 +401,9 @@ impl Shell {
             || self.people_state.hub.in_voice(person)
     }
 
-    /// The line under the title of a direct conversation: `Online · heads down until 4`.
+    /// The line under the title of a direct conversation, with the presence word's color.
     /// `None` for anything that is not one, and when nothing is known of the other person.
-    #[allow(dead_code)]
-    pub(super) fn header_status(&self, conversation: &Key) -> Option<SharedString> {
+    pub(super) fn peer_line(&self, conversation: &Key) -> Option<PeerLine> {
         let row = self.held_rows().find(|row| &row.key == conversation)?;
         if row.kind != ConversationKind::Direct {
             return None;
@@ -399,7 +419,14 @@ impl Shell {
             status if status.is_empty() => known.map(|person| person.status).unwrap_or_default(),
             status => status,
         };
-        header_line(presence::word(presence, peer.network), &status, self.in_call(&peer)).map(SharedString::from)
+        peer_words(presence, peer.network, &status, self.in_call(&peer))
+    }
+
+    /// The same line as one string: `Online · heads down until 4`.
+    #[allow(dead_code)]
+    pub(super) fn header_status(&self, conversation: &Key) -> Option<SharedString> {
+        let line = self.peer_line(conversation)?;
+        header_line(line.word, &line.extra, false).map(SharedString::from)
     }
 
     /// Where a person's picture is on disk. When it is not there yet it is asked for, and the
@@ -746,5 +773,19 @@ mod tests {
         assert_eq!(header_line("", "On holiday", false).as_deref(), Some("On holiday"));
         assert_eq!(header_line("", "", false), None);
         assert_eq!(header_line("Do not disturb", "Presenting", true).as_deref(), Some("In a call"));
+    }
+
+    #[test]
+    fn online_is_green_and_a_call_replaces_the_status() {
+        let online = peer_words(Presence::Online, Network::Tiny, "", false).unwrap();
+        assert_eq!((online.word, online.tone, online.extra.as_str()), ("Online", theme::online(), ""));
+        let noted = peer_words(Presence::Online, Network::Tiny, "heads down until 4", false).unwrap();
+        assert_eq!(noted.extra, "heads down until 4");
+        assert_eq!(noted.tone, theme::online());
+        let calling = peer_words(Presence::Dnd, Network::Tiny, "Presenting", true).unwrap();
+        assert_eq!((calling.word, calling.extra.as_str()), ("In a call", ""));
+        assert_eq!(calling.tone, theme::online());
+        assert_eq!(peer_words(Presence::Offline, Network::Tiny, "", false).unwrap().tone, theme::text_faint());
+        assert!(peer_words(Presence::Unknown, Network::Tiny, "  ", false).is_none());
     }
 }

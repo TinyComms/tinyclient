@@ -160,6 +160,16 @@ pub fn inline(shape: Shape, diameter: f32, surface: Rgba) -> Div {
     }
 }
 
+/// The color of the word. Online is green; idle is amber; do-not-disturb and busy are red.
+pub fn tone(presence: Presence) -> Rgba {
+    match presence {
+        Presence::Online => theme::online(),
+        Presence::Idle => theme::idle(),
+        Presence::Dnd | Presence::Busy => theme::dnd(),
+        Presence::Offline | Presence::Unknown => theme::text_faint(),
+    }
+}
+
 /// The word that goes with the shape. Slack and Teams say "Away" where Discord says "Idle".
 pub fn word(presence: Presence, network: protocol::Network) -> &'static str {
     match (presence, network) {
@@ -198,7 +208,12 @@ mod tests {
     }
 
     #[test]
-    fn unknown_is_no_shape_at_all() {
+    fn online_is_green_and_unknown_is_no_shape_at_all() {
+        assert_eq!(tone(Presence::Online), theme::online());
+        assert_eq!(tone(Presence::Idle), theme::idle());
+        assert_eq!(tone(Presence::Dnd), theme::dnd());
+        assert_eq!(tone(Presence::Busy), theme::dnd());
+        assert_eq!(tone(Presence::Offline), theme::text_faint());
         assert_eq!(Shape::of(Presence::Unknown), None);
         assert_eq!(Shape::of(Presence::Offline), Some(Shape::Offline));
         assert_eq!(word(Presence::Idle, protocol::Network::Slack), "Away");
