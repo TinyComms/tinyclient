@@ -7978,6 +7978,7 @@ version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
@@ -9415,6 +9416,7 @@ name = "tinyclient"
 version = "0.2.15"
 dependencies = [
  "android-activity",
+ "chatd",
  "embed-resource",
  "gpui",
  "gpui_platform",
@@ -9772,8 +9774,11 @@ dependencies = [
  "log",
  "native-tls",
  "rand 0.10.3",
+ "rustls",
+ "rustls-pki-types",
  "sha1 0.11.0",
  "thiserror 2.0.21",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]
@@ -9916,12 +9921,14 @@ dependencies = [
  "log",
  "native-tls",
  "percent-encoding",
+ "rustls",
  "rustls-pki-types",
  "serde",
  "serde_json",
  "ureq-proto",
  "utf8-zero",
  "webpki-root-certs",
+ "webpki-roots 1.0.11",
 ]
 
 [[package]]
@@ -10374,6 +10381,24 @@ name = "webpki-root-certs"
 version = "1.0.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b96554aa2acc8ccdb7e1c9a58a7a68dd5d13bccc69cd124cb09406db612a1c9b"
+dependencies = [
+ "rustls-pki-types",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "0.26.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
+dependencies = [
+ "webpki-roots 1.0.11",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f5f280bbb2b287bc8e7de7e3852945a0ff50d1bbcb5ed42b6c7a568c546df171"
 dependencies = [
  "rustls-pki-types",
 ]

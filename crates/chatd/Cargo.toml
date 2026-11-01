@@ -11,14 +11,17 @@ protocol.workspace = true
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
-# Both use the system TLS (Security.framework), so no second TLS stack is linked or kept in memory.
-ureq = { version = "3", default-features = false, features = ["native-tls", "json"] }
-tungstenite = { version = "0.30", default-features = false, features = ["handshake", "native-tls"] }
+# Desktop and Apple use the system TLS (Security.framework), so no second TLS stack is linked or
+# kept in memory. Android has no such store and no OpenSSL here, so it gets rustls: see the target
+# tables below. The shared entries carry only what every target needs.
+ureq = { version = "3", default-features = false, features = ["json"] }
+tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 # Without a backend feature keyring quietly uses an in-memory mock and finds no sessions
 # (`session::persistent` refuses to run on it). On Linux the Secret Service keeps sign-ins on disk;
 # `linux-native` alone is the kernel keyring, emptied at every reboot. The sync flavour needs no
-# async runtime; `vendored` builds libdbus so no system headers are needed.
-keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native-sync-persistent", "vendored"] }
+# async runtime; `vendored` builds libdbus so no system headers are needed. Android keeps its
+# sign-ins in a file instead (`session::app_file`), so it links no platform keyring at all.
+keyring = { version = "3", default-features = false }
 iana-time-zone = "0.1"
 # Discord adapter: `poll` on the gateway socket and a wake pipe, local time for `<t:..>`; base64 for
 # the client properties header. Both are already in the tree through other dependencies.
@@ -70,6 +73,17 @@ rand = { version = "0.9", optional = true }
 [features]
 default = ["signal"]
 signal = ["dep:presage", "dep:aes-gcm-siv", "dep:futures", "dep:async-trait", "dep:chrono", "dep:rand", "tokio/rt"]
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+ureq = { version = "3", default-features = false, features = ["native-tls"] }
+tungstenite = { version = "0.30", default-features = false, features = ["native-tls"] }
+keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native-sync-persistent", "vendored"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+# rustls with ring and the bundled Mozilla roots: no OpenSSL to cross-build, and no system store
+# to read. ureq's `rustls` is ring plus webpki roots; tungstenite's matches it.
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+tungstenite = { version = "0.30", default-features = false, features = ["rustls-tls-webpki-roots"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # macOS reads the login keychain here so an ad-hoc update does not ask for the password again.

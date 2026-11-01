@@ -10,7 +10,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
-use ureq::tls::{TlsConfig, TlsProvider};
 
 /// The web client speaks v9.
 const API: &str = "https://discord.com/api/v9";
@@ -34,7 +33,7 @@ fn build(user_agent: &str) -> Option<u64> {
         return None;
     }
     let agent: ureq::Agent = ureq::Agent::config_builder()
-        .tls_config(TlsConfig::builder().provider(TlsProvider::NativeTls).build())
+        .tls_config(crate::tls::config())
         .timeout_global(Some(BUILD_PATIENCE))
         .http_status_as_error(false)
         .user_agent(user_agent)

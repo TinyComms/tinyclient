@@ -31,8 +31,8 @@ smallvec = { version = "1.6", optional = true }
 # Reads `mediad --devices` for Settings › Audio & video. Already in the tree through protocol.
 serde_json = { workspace = true, optional = true }
 
-# URL-only Wikipedia cards use the public summary API off the UI thread.
-ureq = { version = "3", default-features = false, features = ["native-tls"], optional = true }
+# URL-only Wikipedia cards use the public summary API off the UI thread. Its TLS is in the target
+# tables below: the system's on desktop, rustls on Android.
 url = { version = "2", optional = true }
 
 # Native CPU rendering of Discord Lottie stickers, pinned for reproducible builds.
@@ -52,12 +52,24 @@ gui-shot = ["gui", "gpui/test-support", "gpui_platform/test-support"]
 # pulls GPUI's test support, which has no meaning on a phone (device shots come from adb/simctl).
 # Desktop-only modules inside `gui/` (window chrome, menubar, settings window, self-update) still
 # compile on mobile for now; see docs/mobile-build.md, "Feature gating".
-mobile = ["gui", "dep:android-activity"]
+mobile = ["gui", "dep:android-activity", "dep:chatd"]
 
 [target.'cfg(target_os = "android")'.dependencies]
 # Provides ANativeActivity_onCreate and calls our `android_main`. Only linked on Android, so a
 # host build never sees it. `native-activity` is the plain NativeActivity glue (no GameActivity).
 android-activity = { version = "0.6", optional = true, default-features = false, features = ["native-activity"] }
+# The Wikipedia cards' HTTP client on Android: rustls (see the ureq note above).
+ureq = { version = "3", default-features = false, features = ["rustls"], optional = true }
+
+# The core, run inside the app on phones (`src/lib.rs`, `inprocess`). Without its default features,
+# which are `signal`: the phone build does not link libsignal.
+[target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
+chatd = { path = "../chatd", optional = true, default-features = false }
+
+# The Wikipedia cards' HTTP client (`gui` enables it). The system's TLS everywhere but Android,
+# which gets rustls: no OpenSSL to cross-build there. Same versions and features as before.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+ureq = { version = "3", default-features = false, features = ["native-tls"], optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "cb13b37a6d80d034119888b534aa0d9067fb5aee", optional = true, default-features = false, features = ["font-kit", "runtime_shaders"] }

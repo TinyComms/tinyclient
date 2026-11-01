@@ -40,9 +40,17 @@ mod view;
 /// Called by the Swift shell. The pinned Zed GPUI revision (`Cargo.toml`) has no iOS platform
 /// backend: its `gpui_platform` has `gpui_apple|linux|macos|web|wgpu|windows` arms only, so this
 /// is a seam, not a working app. Moving to gpui-ce (`gpui-ce` 0.3.0 on crates.io) is what would
-/// add one; that migration is not made yet. Keep the body to one call so it changes one line.
+/// add one; that migration is not made yet. The `mobile` build first starts chatd's core in the app.
 #[cfg(all(feature = "gui", target_os = "ios"))]
 pub fn ios_main() {
+    #[cfg(feature = "mobile")]
+    {
+        if let Some(home) = std::env::var_os("HOME") {
+            protocol::set_support_dir(std::path::PathBuf::from(home).join("Library/Application Support/tinyclient"));
+        }
+        inprocess::register();
+        inprocess::start_now();
+    }
     gui::run();
 }
 
@@ -61,20 +69,56 @@ pub extern "C" fn tinyclient_ios_main() {
 ///
 /// `android_activity` exports `ANativeActivity_onCreate` and calls this on the thread it owns;
 /// `AndroidManifest.xml` points NativeActivity at `libtinyclient.so` (`android.app.lib_name`).
-/// Before the window starts this points `TINYCLIENT_DIR` at the app's internal data directory:
-/// Android has no `HOME`, so `protocol::support_dir` would otherwise put the socket and database
-/// under `/tmp`. The pinned Zed GPUI has no Android backend (see [`ios_main`]), so this is still
-/// not a working app: `gpui_platform::application()` has no Android arm and the build stops there.
+/// Before the window starts this names the app's internal data directory for chatd's support
+/// directory (`protocol::set_support_dir`): Android has no `HOME`, so `protocol::support_dir` would
+/// otherwise put the socket and database under `/tmp`. Then chatd's core starts in this process.
+/// The pinned Zed GPUI has no Android backend (see [`ios_main`]), so this is still not a working
+/// app: `gpui_platform::application()` has no Android arm and the build stops there.
 #[cfg(all(feature = "mobile", target_os = "android"))]
 #[no_mangle]
 pub extern "C" fn android_main(app: android_activity::AndroidApp) {
     android_log::install();
     match app.internal_data_path() {
-        // Set before any thread of ours starts, so nothing reads the environment concurrently.
-        Some(dir) => std::env::set_var("TINYCLIENT_DIR", dir),
+        Some(dir) => protocol::set_support_dir(dir),
         None => log::error!("tinyclient: Android gave no internal data path; the data falls back to /tmp"),
     }
+    inprocess::register();
+    inprocess::start_now();
     gui::run();
+}
+
+/// chatd on a phone: the core runs in this process, on a thread of its own, over the socket in the
+/// app's data directory. The shell's start path (`protocol::launch::start_chatd`) calls the
+/// starter registered here instead of spawning a binary that a phone does not have.
+#[cfg(all(feature = "mobile", any(target_os = "android", target_os = "ios")))]
+mod inprocess {
+    use std::sync::Mutex;
+    use std::thread::JoinHandle;
+
+    /// The serving thread, while there is one. Replaced only once it has finished.
+    static CORE: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
+
+    pub fn register() {
+        protocol::launch::register_in_process(start);
+    }
+
+    /// Starts the core unless one is still serving: the shell may ask again while it waits.
+    fn start() -> std::io::Result<()> {
+        let mut core = CORE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if core.as_ref().is_some_and(|handle| !handle.is_finished()) {
+            return Ok(());
+        }
+        *core = Some(chatd::start_in_process(protocol::support_dir())?);
+        Ok(())
+    }
+
+    /// Starts the core before the window, so the first `Ping` already finds it. A failure is logged
+    /// and the shell's own start path tries again and reports it.
+    pub fn start_now() {
+        if let Err(err) = start() {
+            log::error!("tinyclient: chatd did not start in the app: {err}");
+        }
+    }
 }
 
 /// `log` records to logcat. NativeActivity discards stderr, so `eprintln!` is lost on a phone.

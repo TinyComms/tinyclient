@@ -74,8 +74,13 @@ fn summary(json: &str) -> Option<Summary> {
 }
 
 fn fetch(endpoint: &str) -> Option<Summary> {
+    // The system's TLS on desktop; rustls on Android, which has no OpenSSL here (Cargo.toml).
+    #[cfg(not(target_os = "android"))]
+    let provider = ureq::tls::TlsProvider::NativeTls;
+    #[cfg(target_os = "android")]
+    let provider = ureq::tls::TlsProvider::Rustls;
     let agent: ureq::Agent = ureq::Agent::config_builder()
-        .tls_config(ureq::tls::TlsConfig::builder().provider(ureq::tls::TlsProvider::NativeTls).build())
+        .tls_config(ureq::tls::TlsConfig::builder().provider(provider).build())
         .timeout_global(Some(Duration::from_secs(8)))
         .max_redirects(0)
         .build().into();
