@@ -36,7 +36,7 @@ use history::History;
 use pages::Pages;
 use protocol::{
     AccountKey, Badge, CallSupport, Conversation, ConversationKind, InboxCounts, InboxFilter, Key, Link, Network,
-    Occupants, Request, Response, PAGE_LIMIT,
+    Occupants, Page, Request, Response, PAGE_LIMIT,
 };
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -779,6 +779,14 @@ impl Shell {
         }
         if row.kind == ConversationKind::Forum && row.key.network == Network::Telegram {
             self.drill(home::Drill::Topics(Rc::new(row.clone())), cx);
+            // The topics drill reads what the store holds; opening the forum is what asks
+            // Telegram for its list, once per open, so a refreshed home does not ask again and
+            // cannot loop a change back into a request. chatd answers from its cache and lets
+            // the network catch up behind that.
+            let request = Request::Messages { conversation: row.key.clone(), page: Page::Newest, limit: 1 };
+            self.off_thread(cx, move || {
+                let _ = ask(&request);
+            }, |_, _, _| {});
             return;
         }
         self.select(row.key.clone(), &row.title, cx);
