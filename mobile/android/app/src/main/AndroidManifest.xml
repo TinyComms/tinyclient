@@ -23,6 +23,7 @@
             android:name="dev.gpui.mobile.GpuiInputActivity"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode|density"
             android:exported="true"
+            android:enableOnBackInvokedCallback="false"
             android:windowSoftInputMode="adjustResize">
 
             <meta-data

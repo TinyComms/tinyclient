@@ -44,4 +44,9 @@ debug-assertions = false
 # It can go when presage can move past libsignal v0.97: that waits on davey, whose MLS stack
 # pins hax-lib 0.3.6 where libsignal v0.98 wants 0.3.7.
 [patch.crates-io]
+# gpui_ce_wgpu 0.3.0 with one fix (vendor/gpui_ce_wgpu, `WgpuRenderer::destroy`, marked "tinyclient
+# patch"): it dropped the GPU resources but left the surface marked configured, so the next frame
+# after an Android app went to the background panicked ("GPU resources not available") and the
+# process aborted. Drop this when a gpui_ce_wgpu release resets `configured` in `destroy`.
+gpui_ce_wgpu = { path = "vendor/gpui_ce_wgpu" }
 curve25519-dalek = { git = "https://github.com/signalapp/curve25519-dalek", tag = "signal-curve25519-4.1.3" }
