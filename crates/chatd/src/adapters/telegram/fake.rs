@@ -249,6 +249,9 @@ struct World {
     revoked: bool,
     /// Tobin was added to the Family folder (`folder`).
     family_grew: bool,
+    /// A read of the group that no longer counts here, as one told during a dropped link. It
+    /// stays lost until that read is told again, and then it is heard.
+    lost_reads: bool,
     calls: PathBuf,
 }
 
@@ -272,6 +275,7 @@ impl World {
             flood_send: None,
             revoked: false,
             family_grew: false,
+            lost_reads: false,
             calls: protocol::support_dir().join("telegram.calls"),
         };
         let odalys = Who::User(ODALYS);
@@ -293,6 +297,15 @@ impl World {
         world
     }
 
+    /// The group's read state, as the last tell of it has reached this fake: a read that was not
+    /// heard keeps the unread it had before.
+    fn crew(&self) -> (i32, i32) {
+        match self.lost_reads {
+            true => (14, 7),
+            false => (20, 0),
+        }
+    }
+
     fn folder(&self, id: i32) -> tl::enums::DialogFilter {
         let none = Vec::<tl::enums::InputPeer>::new;
         let title = tl::enums::TextWithEntities::Entities(tl::types::TextWithEntities { text: String::new(), entities: Vec::new() });
@@ -303,7 +316,15 @@ impl World {
         match id {
             WORK => {
                 filter.title = named("Work");
-                filter.include_peers = vec![tl::types::InputPeerChannel { channel_id: WORKSHOP, access_hash: 0 }.into(), crew];
+                let channel: tl::enums::InputPeer =
+                    tl::types::InputPeerChannel { channel_id: WORKSHOP, access_hash: 0 }.into();
+                if lost_pin() {
+                    // A pin whose chat lies past the pages the test's dialogs pass carries.
+                    filter.pinned_peers = vec![crew.clone()];
+                    filter.include_peers = vec![channel];
+                } else {
+                    filter.include_peers = vec![channel, crew];
+                }
             }
             _ => {
                 filter.title = named("Family");
@@ -455,6 +476,12 @@ fn resolve_username(username: &str) -> Result<Vec<u8>, Fault> {
         peer: Who::User(id).peer(), chats: Vec::new(), users: vec![user(id, first, last, handle).into()],
     };
     answer(tl::enums::contacts::ResolvedPeer::Peer(found))
+}
+
+/// Whether the Work folder pins a chat that no dialog page carries, what Telegram looks like
+/// when a pin sits past the newest 500: its folder rule speaks of a chat nothing stored has.
+fn lost_pin() -> bool {
+    std::env::var_os("TINYCLIENT_TELEGRAM_LOST_PIN").is_some()
 }
 
 fn input_who(peer: &tl::enums::InputPeer) -> Who {
@@ -727,6 +754,20 @@ impl World {
                 self.flood_send = words.next().and_then(|seconds| seconds.parse().ok());
                 Vec::new()
             }
+            // The group's read never reached here, as when the tell went out while the link was
+            // down: its dialog counts unread again until that read is told again.
+            "lost-read" => {
+                self.lost_reads = true;
+                Vec::new()
+            }
+            // A default of the notify settings changed: what of it stands elsewhere stands, and
+            // the chats are read again only when the user opens them.
+            "notify-changed" => vec![update(
+                tl::types::UpdateNotifySettings { peer: tl::enums::NotifyPeer::NotifyBroadcasts, notify_settings: settings(None) }.into(),
+            )],
+            // The link goes down and chatd reconnects when it is back, without the session
+            // earning its end: what Telegram carried before stands on the list.
+            "drop" => vec![Event::Closed("closed".to_owned())],
             "revoke" => {
                 self.revoked = true;
                 vec![Event::Closed("the session was ended from another device".to_owned())]
@@ -859,7 +900,10 @@ impl World {
                 _ => {
                     let mut all = vec![
                         (dialog(Who::User(ODALYS), 12, 11, 1, true, None), Who::User(ODALYS), Who::User(ODALYS).text()),
-                        (dialog(Who::Group(CREW), 20, 20, 0, false, None), Who::Group(CREW), Who::Group(CREW).text()),
+                        {
+                            let (read, unread) = self.crew();
+                            (dialog(Who::Group(CREW), 20, read, unread, false, None), Who::Group(CREW), Who::Group(CREW).text())
+                        },
                         (dialog(Who::Channel(NOTES), 5, 0, 1, false, None), Who::Channel(NOTES), Who::Channel(NOTES).text()),
                         (dialog(Who::Channel(WORKSHOP), 41, 0, 1, false, None), Who::Channel(WORKSHOP), key(Who::Channel(WORKSHOP), Some(TOOLS))),
                         (dialog(Who::User(ME), 2, 2, 0, false, None), Who::User(ME), Who::User(ME).text()),
@@ -870,6 +914,10 @@ impl World {
                     for at in 0..crowd() {
                         let who = Who::User(CROWD + at);
                         all.push((dialog(who, 1, 1, 0, false, None), who, who.text()));
+                    }
+                    if lost_pin() {
+                        // The pinned chat is no longer in the pages at all.
+                        all.retain(|held| held.1 != Who::Group(CREW));
                     }
                     all
                 }
@@ -893,9 +941,34 @@ impl World {
         }
         if let Some(request) = asked::<f::messages::GetPinnedDialogs>(body) {
             self.log(&format!("GetPinnedDialogs {}", request.folder_id));
-            let dialogs = vec![dialog(Who::Group(CREW), 20, 20, 0, true, None), dialog(Who::User(ODALYS), 12, 11, 1, true, None)];
+            let (read, unread) = self.crew();
+            let dialogs = vec![dialog(Who::Group(CREW), 20, read, unread, true, None), dialog(Who::User(ODALYS), 12, 11, 1, true, None)];
             let state = tl::types::updates::State { pts: 1, qts: 0, date: T0, seq: 1, unread_count: 0 };
             return answer(tl::enums::messages::PeerDialogs::Dialogs(tl::types::messages::PeerDialogs { dialogs, messages: Vec::new(), chats: chats(), users: users(), state: state.into() }));
+        }
+        if let Some(request) = asked::<f::messages::GetPeerDialogs>(body) {
+            let peers: Vec<Who> = request.peers.iter().filter_map(|dialog| match dialog {
+                tl::enums::InputDialogPeer::Peer(dialog) => Some(input_who(&dialog.peer)),
+                _ => None,
+            }).collect();
+            let (read, unread) = self.crew();
+            let found = peers.iter().filter_map(|who| {
+                let dialog = match who {
+                    Who::Group(CREW) => dialog(*who, 20, read, unread, false, None),
+                    Who::User(ODALYS) => dialog(*who, 12, 11, 1, false, None),
+                    Who::User(TOBIN) => dialog(*who, 30, 30, 0, false, None),
+                    Who::Channel(NOTES) => dialog(*who, 5, 0, 1, false, None),
+                    _ => return None,
+                };
+                Some((who.clone().text(), dialog))
+            }).collect::<Vec<_>>();
+            self.log(&format!("GetPeerDialogs {}", found.iter().map(|(name, _)| name.clone()).collect::<Vec<_>>().join(" ")));
+            if !found.is_empty() {
+                let dialogs = found.into_iter().map(|(_, dialog)| dialog).collect();
+                let state = tl::types::updates::State { pts: 1, qts: 0, date: T0, seq: 1, unread_count: 0 };
+                return answer(tl::enums::messages::PeerDialogs::Dialogs(tl::types::messages::PeerDialogs { dialogs, messages: Vec::new(), chats: chats(), users: users(), state: state.into() }));
+            }
+            return Err(rpc(400, "PEER_ID_INVALID", None));
         }
         if let Some(request) = asked::<f::contacts::GetContacts>(body) {
             // As Telegram does: the list unchanged since the hash it was asked with is not sent.
@@ -1079,7 +1152,12 @@ impl World {
             return answer(updates(vec![reacted.into()]));
         }
         if let Some(request) = asked::<f::messages::ReadHistory>(body) {
-            self.log(&format!("ReadHistory {} {}", input_who(&request.peer).text(), request.max_id));
+            let who = input_who(&request.peer);
+            self.log(&format!("ReadHistory {} {}", who.text(), request.max_id));
+            // A read of the group that reaches this fake is heard: what was lost of it is told again.
+            if who == Who::Group(CREW) {
+                self.lost_reads = false;
+            }
             return answer(tl::enums::messages::AffectedMessages::Messages(tl::types::messages::AffectedMessages { pts: 3, pts_count: 1 }));
         }
         if let Some(request) = asked::<f::channels::ReadHistory>(body) {

@@ -5,3 +5,5 @@
 /dist
 /.direnv/
 /.envrc.local
+# Local build credentials (Telegram's app id and hash) for the release's own builds.
+/telegram.env

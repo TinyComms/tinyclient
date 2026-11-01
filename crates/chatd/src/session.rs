@@ -52,10 +52,59 @@ fn read_with_unlock_retry(
 }
 
 fn read_password(entry: &Entry, retry_timeouts: bool) -> keyring::Result<String> {
+    // A Windows credential holds the packed session as a secret, so the blob is read and
+    // unpacked; one stored as text before the packing comes back through the blob it always was.
     if !retry_timeouts {
-        return entry.get_password();
+        return secret_of(entry);
     }
-    read_with_unlock_retry(|| entry.get_password(), UNLOCK_RETRY_WINDOW, UNLOCK_RETRY_PAUSE)
+    read_with_unlock_retry(|| secret_of(entry), UNLOCK_RETRY_WINDOW, UNLOCK_RETRY_PAUSE)
+}
+
+fn secret_of(entry: &Entry) -> keyring::Result<String> {
+    #[cfg(target_os = "windows")]
+    {
+        entry.get_secret().and_then(|blob| unpack_secret(&blob))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        entry.get_password()
+    }
+}
+
+/// The session packed the way a Windows credential needs it: its blob holds at most 2560 bytes,
+/// and Telegram's keys in hex alone take more as text. Deflate keeps it in the Credential Manager.
+#[cfg(target_os = "windows")]
+const PACKED: u8 = b'z';
+
+#[cfg(target_os = "windows")]
+fn pack(session: &str) -> Vec<u8> {
+    let mut packed = vec![PACKED];
+    packed.extend(miniz_oxide::deflate::compress_to_vec(session.as_bytes(), 6));
+    packed
+}
+
+#[cfg(target_os = "windows")]
+fn unpack_secret(blob: &[u8]) -> keyring::Result<String> {
+    if blob.first() == Some(&PACKED) {
+        let inflated = miniz_oxide::inflate::decompress_to_vec(&blob[1..])
+            .map_err(|err| keyring::Error::PlatformFailure(Box::new(std::io::Error::other(err.to_string()))))?;
+        return Ok(String::from_utf8_lossy(&inflated).into_owned());
+    }
+    // A session kept as text before the packing: the blob is its UTF-16 characters.
+    let words: Vec<u16> = blob.chunks(2).map(|pair| u16::from_le_bytes([pair[0], pair.get(1).copied().unwrap_or(0)])).collect();
+    Ok(String::from_utf16_lossy(&words))
+}
+
+/// Stores the session, packed where a text would top out at the platform's limit.
+fn keep(entry: &Entry, session: &str) -> keyring::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        entry.set_secret(&pack(session))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        entry.set_password(session)
+    }
 }
 
 /// The keychain service before the product was renamed. A session found only there is moved to
@@ -211,7 +260,7 @@ fn moved(network: Network, entry: &Entry, retry_timeouts: bool) -> Stored {
     };
     match read_password(&old, retry_timeouts) {
         Ok(session) => {
-            if entry.set_password(&session).is_ok() {
+            if keep(entry, &session).is_ok() {
                 let _ = old.delete_credential();
                 #[cfg(target_os = "macos")]
                 apple::trust_account(account(network));
@@ -231,9 +280,8 @@ pub fn save(network: Network, session: &str) -> Result<(), String> {
         return Err(NO_STORE.to_owned());
     }
     let saved = Entry::new(SERVICE, account(network))
-        .map_err(|err| format!("keychain: {err}"))?
-        .set_password(session)
-        .map_err(|err| format!("keychain: {err}"));
+        .map_err(|err| format!("keychain: {err}"))
+        .and_then(|entry| keep(&entry, session).map_err(|err| format!("keychain: {err}")));
     // The item a sign-in just wrote trusts only this binary. Open it to later releases too.
     #[cfg(target_os = "macos")]
     if saved.is_ok() {
@@ -473,6 +521,27 @@ mod tests {
             );
             assert!(result.is_err());
         }
+    }
+
+    /// Telegram's session holds every datacenter's key in hex alone: as a password that is
+    /// longer than a Windows credential keeps, and it was silently refused. The packed blob
+    /// must take it, and what an earlier release stored as text must still come back.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn a_session_too_long_as_text_still_keeps_its_words() {
+        let key = "ab".repeat(256);
+        let keys: Vec<String> = (1..=5)
+            .map(|id| format!(r#"{{"id":{id},"v4":"149.154.167.{id}:443","v6":"[2001:67c:4e8:f004::a]:443","key":"{key}"}}"#))
+            .collect();
+        let session = format!(r#"{{"user":7001,"name":"Mira Kessler","home":2,"dcs":[{}]}}"#, keys.join(","));
+        // As UTF-16 the text itself is already over what a credential keeps.
+        assert!(session.len() > 1280, "the test session should not fit a Windows password");
+        let packed = super::pack(&session);
+        assert!(packed.len() <= 2560, "the packed session should fit a Windows credential");
+        assert_eq!(super::unpack_secret(&packed).unwrap(), session);
+        // What one stored as a text before the packing was its UTF-16 bytes.
+        let legacy: Vec<u8> = session.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        assert_eq!(super::unpack_secret(&legacy).unwrap(), session);
     }
 
     #[test]
