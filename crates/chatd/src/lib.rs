@@ -3,11 +3,13 @@ pub mod blobs;
 pub mod demo;
 pub mod hub;
 pub mod media;
+pub mod notify;
 pub mod playback;
 pub mod server;
 pub mod session;
 pub mod store;
 pub mod tls;
+pub mod verified;
 
 use protocol::{chat_sock_path_in, ChatListener};
 use std::fs::File;
@@ -50,7 +52,7 @@ pub fn spawn_core(
         // Held until serve ends: a second chatd for this directory finds it busy.
         let _lock = lock;
         if let Err(err) = server::serve(listener, chat) {
-            eprintln!("chatd: {err}");
+            tracing::warn!("chatd: {err}");
         }
     })?;
     match answer.recv() {
@@ -77,7 +79,7 @@ fn setup(dir: &Path, host: Host, seed: impl FnOnce(&mut store::Store) -> io::Res
     seed(&mut store)?;
     let path = chat_sock_path_in(dir);
     let listener = ChatListener::bind(&path)?;
-    eprintln!("chatd listening on {}", path.display());
+    tracing::warn!("chatd listening on {}", path.display());
     let chat = match host {
         Host::Process => server::Chat::new(store),
         Host::InProcess => server::Chat::in_process(store),

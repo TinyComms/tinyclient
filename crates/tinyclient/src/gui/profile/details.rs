@@ -9,21 +9,64 @@ use crate::gui::people::info::InfoPane;
 use crate::gui::people::presence::{self, Ring, Shape};
 use crate::gui::theme::{self, Type};
 use gpui::{div, prelude::*, px, Context, Div, MouseButton, Window};
-use protocol::{CallSupport, Conversation, ConversationKind, Key, Network, Notify, Presence};
+use protocol::{CallSupport, Conversation, ConversationKind, Key, Network, Notify, Presence, Request};
+
+/// S6: this conversation's own notification sound, kept here only (the network never sees it),
+/// over its account's and the global one. Picking one plays it.
+fn sound_row(row: &Conversation, cx: &mut Context<InfoPane>) -> Div {
+    use protocol::settings::{self, GLOBAL};
+    let values = crate::gui::app::prefs::values();
+    let scope = settings::conversation_scope(&row.key);
+    let own = values.stored(&scope, settings::SOUND).map(str::to_owned);
+    let inherited = values.stored(&settings::account_scope(&row.key.account()), settings::SOUND).unwrap_or_else(|| values.word(GLOBAL, settings::MESSAGE_SOUND)).to_owned();
+    let names = [("pebble", "Pebble"), ("drop", "Drop"), ("tap", "Tap"), ("chime", "Chime"), ("glass", "Glass"), ("none", "None")];
+    let inherited_name = names.iter().find(|(word, _)| *word == inherited).map_or("None", |(_, name)| *name);
+    let choice = |ix: usize, words: String, word: Option<&'static str>, cx: &mut Context<InfoPane>| {
+        let scope = scope.clone();
+        let heard = word.map_or_else(|| inherited.clone(), str::to_owned);
+        segment(("details-sound", ix), words, own.as_deref() == word)
+            .px(px(8.))
+            .on_click(cx.listener(move |_, _, _, cx| {
+                let mut values = crate::gui::app::prefs::values();
+                values.set(&scope, settings::SOUND, word.map(str::to_owned));
+                crate::gui::app::prefs::set_values(values);
+                cx.notify();
+                let set = Request::Set { scope: scope.clone(), key: settings::SOUND.to_owned(), value: word.map(str::to_owned) };
+                let heard = heard.clone();
+                crate::gui::people::ask_later(cx, set, move |_, cx| {
+                    if heard != "none" {
+                        crate::gui::people::ask_later(cx, Request::PlaySound { sound: heard }, |_, _| {});
+                    }
+                });
+            }))
+    };
+    let mut chips = div().flex().flex_wrap().gap(px(4.)).child(segmented().child(choice(0, format!("Default ({inherited_name})"), None, cx)));
+    let mut set = segmented();
+    for (ix, (word, name)) in names.iter().enumerate() {
+        set = set.child(choice(ix + 1, (*name).to_owned(), Some(*word), cx));
+    }
+    chips = chips.child(set);
+    let muted = (row.muted).then(|| div().type_small().text_color(theme::text_faint()).child("Muted conversations make no sound."));
+    div().flex().flex_col().gap(px(6.)).child(div().type_ui().child("Sound")).child(chips).children(muted)
+}
 
 /// Notifications' segmented choice for a channel.
 fn notify_segments(pane: &InfoPane, row: &Conversation, cx: &mut Context<InfoPane>) -> Div {
-    let now = pane.notify_shown(row);
+    let shown = pane.notify_shown(row);
+    // Teams stores anything other than All as muted, so Mentions would silence the channel.
+    let teams = row.key.network == Network::Teams;
+    let now = if teams && shown == Notify::Mentions { Notify::Nothing } else { shown };
     let choice = |ix: usize, words: &'static str, notify: Notify, cx: &mut Context<InfoPane>| {
         let key = row.key.clone();
         segment(("details-notify", ix), words, now == notify)
             .px(px(8.))
             .on_click(cx.listener(move |pane, _, _, cx| pane.notify_to(key.clone(), notify, cx)))
     };
-    segmented()
-        .child(choice(0, "All", Notify::All, cx))
-        .child(choice(1, "Mentions", Notify::Mentions, cx))
-        .child(choice(2, "Nothing", Notify::Nothing, cx))
+    let mut choices = segmented().child(choice(0, "All", Notify::All, cx));
+    if !teams {
+        choices = choices.child(choice(1, "Mentions", Notify::Mentions, cx));
+    }
+    choices.child(choice(2, "Nothing", Notify::Nothing, cx))
 }
 
 fn head_picture(pane: &InfoPane, row: &Conversation, cx: &mut Context<InfoPane>) -> Div {
@@ -115,9 +158,11 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
                 }))
                 .into_any_element(),
             NotifyControl::Segmented => notify_segments(pane, row, cx).into_any_element(),
+            NotifyControl::Held(words) => div().type_small().text_color(theme::text_soft()).child(words).into_any_element(),
         })
         .mt(px(12.)),
     );
+    top = top.child(sound_row(row, cx).mt(px(8.)));
     if !online {
         let words = facts::heads_up_words(&facts::HeadsUp::Offline, &row.title, network, crate::view::now());
         top = top.child(draw::heads_up_banner(&words, None).mt(px(12.)));

@@ -111,7 +111,7 @@ impl Stack {
 }
 
 /// The conversation now open, as far as the pane needs it.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Open {
     pub key: Key,
     /// A direct conversation: the other person, when known.
@@ -396,6 +396,21 @@ mod tests {
         // A DM whose partner is not known yet shows nothing rather than someone else.
         let unknown = Open { key: key("D_d"), direct: Some(None) };
         assert_eq!(follow(&a, both, Some(&unknown), &mut threads, false), Stack::default());
+    }
+
+    #[test]
+    fn a_resolved_direct_refits_the_profile_even_when_its_key_did_not_change() {
+        let switches = Switches { direct: true, ..Switches::default() };
+        let mut threads = Memory::default();
+        let placeholder = channel("D_a");
+        let unknown = Open { key: key("D_a"), direct: Some(None) };
+        let resolved = direct("D_a", "U1");
+        // Fitting compares the shape and partner as well as the key: both arrivals refit.
+        assert_ne!(placeholder, unknown);
+        assert_ne!(unknown, resolved);
+        let waiting = follow(&Stack::default(), switches, Some(&unknown), &mut threads, false);
+        assert_eq!(follow(&waiting, switches, Some(&resolved), &mut threads, false), base(Layer::Profile(key("U1"))));
+        assert_eq!(resolved, direct("D_a", "U1"));
     }
 
     #[test]

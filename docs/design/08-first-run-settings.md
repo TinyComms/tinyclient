@@ -4,21 +4,31 @@ Mockup: `mockups/08-first-run-settings.html`. Requirements: `docs/product/08-sig
 
 ## 1. First launch
 
-Main window 1120 × 720, minimum 880 × 560. With zero accounts there is no rail, sidebar or list: `canvas` fills the window and the top 52 still drags it. One centered column, 440 wide:
+Main window minimum 540 × 720 is not required; the window minimum is 540 × 440. With zero accounts there is no rail, sidebar or list: `canvas` fills the window and the top 52 still drags it. One centered column, 440 wide. The card has seven rows:
 
 | Element | Spec |
 |---|---|
 | App mark | 64, then 16 gap |
 | Headline | "Welcome to tinyclient", 22 semibold, `text` |
 | Line | "Sign in to one network to start. Add the others whenever you like." 14 `text_soft`; 6 above, 28 below |
-| Network card | 440 wide, `raised`, 1 `hairline` border, radius 14, four 64 rows split by hairlines |
+| Network card | 440 wide, `raised`, 1 `hairline` border, radius 14, seven rows split by hairlines |
 | Row | padding 0 16; network icon 32; 14 gap; name 14 semibold over a 12 `text_faint` line; quiet button "Sign in" (30 high, radius 15, `selected` fill) |
-| Footnote | "Your sign-in is kept in the macOS keychain on this Mac." 12 `text_faint`, 16 above |
+| Footnote | the platform sentence in `host::SIGN_IN_KEPT`, 12 `text_faint`, 16 above |
 
-Row second lines: Discord "Servers, direct messages and voice"; Slack "Every workspace from one sign-in"; Telegram "Scan a code with your phone"; Microsoft Teams "Personal, work or school accounts". Order is fixed: Discord, Slack, Telegram, Teams.
+| Network | Second line |
+|---|---|
+| Discord | Servers, direct messages and voice |
+| Slack | Every workspace from one sign-in |
+| Telegram | Scan a code with your phone, or use your number |
+| Microsoft Teams | Work and school accounts; calls open in Teams |
+| Signal | Link this computer from your phone; text for now |
+| Messages | Pair from your Android phone. It has to stay online. |
+| Tiny server | A server you already run |
+
+The footnote is the platform sentence in `host::SIGN_IN_KEPT` (macOS keychain, Windows Credential Manager, or the system keyring).
 
 - **Focus.** The first available row has keyboard focus at launch: 1.5 `accent` inset ring, `hover` fill, and its button turns accent. Up/Down move, Return signs in. The whole row is the click target. This is the only accent on the screen.
-- **Not available yet** (Telegram and Teams until release 5). Same row; icon at 55% opacity, name in `text_soft`, second line "Coming in a later version", and in place of the button the words "Not available yet" in 12 `text_faint`. No hover, no focus stop, no tooltip. Replaces "not implemented".
+- **Every row can sign in.** The "Not available yet" branch remains in the code and is unused while `AVAILABLE` lists all seven.
 - **Path to the first message:** launch, Return, the network's own login, then the inbox. The list has focus with the newest row highlighted; Return opens it and puts the caret in the composer. Nothing is opened automatically, because opening marks a conversation read.
 
 ## 2. Sign-in
@@ -46,11 +56,17 @@ Row second lines: Discord "Servers, direct messages and voice"; Slack "Every wor
 3. *Code.* "Enter the code". "Telegram sent a 5-digit code to the Telegram app on your other devices, for +1 555 010 0142." (or "by SMS to"). Five boxes 48 × 56, 8 gap, 24 semibold; it sends on the fifth digit; paste fills all. Link "Send the code by SMS". Errors, 12 `danger`, boxes get a `danger` border, clear and refocus: "That code isn't right. Check it and type it again." / "That code has expired." with link "Send a new code" / "Too many tries. Telegram allows another at 3:42 PM."
 4. *Password*, only for accounts with two-step verification, also after a QR scan. "Two-step verification password", one 40 field, "Hint from Telegram: the old street" in 12 `text_faint`, primary "Continue". Errors: "That password isn't right." Link "Forgot it? Reset it in the Telegram app." Back arrow (20, top left) on steps 2 to 4. Success closes the sheet into the same loading list.
 
-**Teams** uses the helper. If the split between personal and work accounts must be known first, the row's button opens a two-row choice in the same card ("Work or school" / "Personal"); prefer letting Microsoft's page decide. Blocked by policy: the helper closes and a sheet (440, centered text) shows the Teams icon 44 with a 24 `building-2` badge; title "Brightwater Logistics doesn't allow this app" ("Your organization doesn't allow this app" when the name is unknown); "Teams stays in the Teams app for this account. Signing in again will not change this."; an inset card, "WHAT YOU CAN DO": "Ask your IT admin whether other Teams clients are allowed. The policy is theirs to change." / "A personal Microsoft account is not affected and can be added." / "Microsoft's code: AADSTS53003" in 12 `text_faint`. Footer: link "Use a different account", quiet "Open Teams", primary "Done". There is no retry. Afterwards the Teams row reads "Blocked by Brightwater Logistics" and offers only "Use a different account". The same sheet is used when a working Teams account later fails renewal on policy.
+**Teams** uses the helper. Teams personal accounts are not built. The row says work and school accounts, and that calls open in Teams. Blocked by policy: the helper closes and a sheet (440, centered text) shows the Teams icon 44 with a 24 `building-2` badge; title "Brightwater Logistics doesn't allow this app" ("Your organization doesn't allow this app" when the name is unknown); "Teams stays in the Teams app for this account. Signing in again will not change this."; an inset card, "WHAT YOU CAN DO": "Ask your IT admin whether other Teams clients are allowed. The policy is theirs to change." / "Microsoft's code: AADSTS53003" in 12 `text_faint`. Footer: link "Use a different account", quiet "Open Teams", primary "Done". There is no retry. Afterwards the Teams row reads "Blocked by Brightwater Logistics" and offers only "Use a different account". The same sheet is used when a working Teams account later fails renewal on policy.
+
+**Signal** uses the same sheet as Telegram's QR step, with Signal's three steps, and no phone-number path.
+
+**Messages** opens the system browser for the Google account used by Messages on the Android phone, then asks you to confirm the matching emoji on the phone. The phone has to stay online.
+
+**Tiny server** asks for the invite code, then opens your browser against that server's OpenID Connect provider.
 
 ## 3. Adding and reordering
 
-- **Rail "+"** opens a popover to its right: 300 wide, `panel`, radius 12, 6 padding, 48 rows (icon 24, name, 12 second line). It lists networks not yet added, then, when Slack is signed in, "Add a Slack workspace". Not-yet-available networks appear last with "Not available yet". A row starts that network's sign-in at once; the popover stays open in the waiting state (section 2).
+- **Rail "+"** opens a popover to its right: 300 wide, `panel`, radius 12, 6 padding, 48 rows (icon 24, name, 12 second line). It lists networks that are signed out, then "Add a Slack workspace" when Slack is signed in, then "Add a Tiny server" ("Join with a code") when a Tiny server is signed in. A row starts that network's sign-in at once; the popover stays open in the waiting state (section 2).
 - **Add a Slack workspace** reopens the helper on the kept session. Workspaces already added are listed with "Added" in place of the switch. Existing workspaces do not reconnect.
 - **Reorder.** Drag a rail button, or drag the grip in Settings, Accounts. Keyboard: Option-Up and Option-Down on a focused account row. Slack workspaces reorder inside the Slack group; the same order sections the Slack list. A second account on one network (P2) is a second row in its group.
 
@@ -66,45 +82,19 @@ Cached messages stay visible and readable; only sending stops. Nothing about oth
 
 ## 5. Settings
 
-**A separate native window**, 720 × 560, not resizable, Cmd-comma, title bar transparent like the main window. A pane inside the 880-minimum main window would have to cover the conversation; a window can sit beside it and costs nothing when closed. Left: section list 184 wide on `sidebar`, items 32 high, radius 8, selected `selected`; About pinned to the bottom. Right: pane, padding 20 28, heading 17 semibold, groups on `raised` with radius 12 and 44 rows, captions 12 `text_faint`. Every control applies at once: no Save, no restart. It opens on Accounts.
-
-| Section | Control | Default | Reason |
-|---|---|---|---|
-| Accounts | One group per network; row: grip, avatar 32, name, network or address, state in words with a 7 dot, quiet "Sign out". Signed-out rows show primary "Sign in again". Slack group header has "Add workspace"; "Add" top right opens the add popover. | | Story 16 |
-| General | Open at login | On, asked once (section 6) | A chat app that is not running misses messages |
-| General | Keep receiving when the window is closed | On | Story 15. Off makes closing the window quit |
-| General | Show in menu bar | Off | The Dock badge already carries the count; the menu bar is crowded |
-| General | Install updates automatically | On | Section 8 |
-| Notifications | Notify me about: "Direct messages and mentions" / "All messages" | The first | Channels are noise; mutes from the official apps still apply |
-| Notifications | Show message text | On | Off shows sender and place only, for screen sharing |
-| Notifications | Play a sound | On | One sound for all networks; none during a call |
-| Notifications | Dock badge counts: "Direct messages and mentions" / "All unread" / "Off" | The first | The badge should mean "someone needs me" |
-| Notifications | One switch per signed-in network | On | Silence a network without signing out |
-| Appearance | Theme: "Match system" / "Dark" / "Light" | Match system | Light is in scope as a second value set of the same tokens. Until it exists the control is hidden and the app is dark |
-| Appearance | Density: "Comfortable" / "Compact" | Comfortable | Compact tightens list rows and message spacing |
-| Appearance | Text size: "Small" / "Default" / "Large" (13 / 14 / 16 body) | Default | Also Cmd-plus, Cmd-minus, Cmd-0 |
-| Privacy | Show others when I am typing, per network | Slack on, Teams on, **Discord off**, Telegram "Always on" | Telegram's terms forbid it; said under the row: "Telegram does not let an app turn this off." |
-| Privacy | Show others what I have read | Teams on (switch), Telegram "Always on" | Under Teams: "Off also leaves chats unread on your other devices." Caption: "Discord and Slack have no read receipts." |
-| Privacy | Load images and link previews automatically | On | Off draws one line with the size; click to load |
-| Audio & video | Microphone, Speaker, Camera: three menus | "System default" | Follows macOS when devices change. "Test microphone" shows a level bar only while held |
-| Storage | Total, a 8 high two-part bar (Messages `accent`, Images and files `positive`), "Show in Finder" | | Story 17 |
-| Storage | Keep images and files up to: 500 MB / 1 GB / 2 GB / 5 GB | 1 GB | Oldest unused go first |
-| Storage | "Clear…" | | Confirm: "Clear 496 MB of saved messages and files? You stay signed in. Conversations load again from the networks." "Cancel" / "Clear" |
-| About | Section 7 | | |
-
-If macOS notifications are denied, Notifications opens with one `warning` line: "Notifications are turned off for tinyclient in System Settings." and "Open System Settings".
+Withdrawn. The Settings window is `09-settings.md`.
 
 ## 6. Sign-out, and quit versus close
 
 **Sign-out sheet**, 420 wide, padding 24. Avatar 32 and "Sign out of Lumen Labs?" (17 semibold). "This removes from this Mac the saved sign-in, 18,204 saved messages and 212 MB of images and files for this workspace, and ends this session on Slack." Then "Nothing is deleted on Slack. Your other accounts are not touched." Buttons right-aligned: quiet "Cancel" (default, Return), `danger` "Sign out". Unknown counts are dropped from the sentence. If the network's own logout fails, the account still goes and one line stays in Accounts until dismissed: "Signed out here. Slack may still list this session; end it at slack.com." The header "Sign out" link in today's sidebar goes away.
 
-**Quit versus close, said once.** After the first inbox finishes loading, a card sits at the foot of the sidebar (284 wide, `raised`, radius 12, padding 14): "Messages keep arriving when this window is closed" (14 semibold); "Closing the window leaves tinyclient running. Quit with Cmd-Q to stop it." (12 `text_soft`); primary "Open at login", quiet "Not now". Either button removes it for good. The same two sentences are the caption under the General switches, which is where to find them again. Close (Cmd-W) hides the window and keeps receiving; Quit (Cmd-Q) stops everything until the next launch or login. The macOS notification prompt is the system's own and is requested when that first load ends.
+**Quit versus close, said once.** After the first inbox finishes loading, a card sits at the foot of the sidebar (284 wide, `raised`, radius 12, padding 14): "Messages keep arriving when this window is closed" (14 semibold); "Closing the window leaves tinyclient running. Quit with ⌘Q to stop it." (12 `text_soft`); quiet "Not now". The button removes it for good. On macOS, with "Keep receiving when the window is closed" on, closing hides the window and leaves chatd receiving. Elsewhere, closing quits. ⌘Q stops an application-managed chatd. A systemd user unit is left running (`06` §8). There is no Open at login control. The macOS notification prompt is the system's own and is requested when that first load ends.
 
 ## 7. Identity
 
-**Name:** "tinyclient", always lower case. **Icon:** 1024 canvas. Plate 824 square at 100,100, radius 186, vertical gradient `#4f8cff` to `#1f56d6` (the accent, lit from above), 4 inner stroke white at 10%. A white speech bubble 500 wide by 440 high at 262,282: three corners radius 160, the lower-left corner radius 18, and that sharp corner is the tail. "tc" is cut from it in the accent `#2f6feb`: round-capped strokes 64 wide, the t's stem curving into its foot, the c a circle open on the right. No network color or logo, and not a count of networks. For 32 and below the bubble and letters are drawn 24% larger with 74 strokes so the letters stay open. Menu bar item: the bubble with "tc" cut out, template image, 18.
+**Name:** "tinyclient", always lower case. **Icon:** 1024 canvas. Plate 824 square at 100,100, radius 186, vertical gradient `#4f8cff` to `#1f56d6` (the accent, lit from above), 4 inner stroke white at 10%. A white speech bubble 500 wide by 440 high at 262,282: three corners radius 160, the lower-left corner radius 18, and that sharp corner is the tail. "tc" is cut from it in the accent `#2f6feb`: round-capped strokes 64 wide, the t's stem curving into its foot, the c a circle open on the right. No network color or logo, and not a count of networks. For 32 and below the bubble and letters are drawn 24% larger with 74 strokes so the letters stay open. Menu bar item: the bubble with "tc" cut out, template image, 18. It is not drawn. The status item is not built (`06` §8).
 
-**About** is the last Settings section; "About tinyclient" in the menu opens it. Icon 96; "tinyclient" 22 semibold; "Version 0.4.0 (212)" 12 `text_faint`; "One small app for Slack, Discord, Telegram and Teams."; buttons "Website", "Release notes", "Copy version". Acknowledgements group: "Network icons: Dashboard Icons (homarr-labs/dashboard-icons), Apache-2.0. The logos are trademarks of their owners." / "Interface icons: Lucide, ISC." / "Open-source libraries" opens the bundled license list.
+**About** is the last Settings section; "About tinyclient" in the menu opens it. Icon 96; "tinyclient" 22 semibold; the running version, 12 `text_faint`; "One small app for Slack, Discord, Telegram, Teams, Signal, and Messages, and for Tiny servers you run."; buttons "Website", "Release notes", "Copy version". The window still draws "One small app for Slack, Discord, Telegram, Teams and Signal." until that copy is updated. Acknowledgements group: "Network icons: Dashboard Icons (homarr-labs/dashboard-icons), Apache-2.0. The logos are trademarks of their owners." / "Interface icons: Lucide, ISC." / "Open-source libraries" opens the bundled license list.
 
 **Menus.** Conversation and View shortcuts yield to the navigation spec where they differ.
 
@@ -113,7 +103,7 @@ If macOS notifications are denied, Notifications opens with one `warning` line: 
 | tinyclient | About tinyclient · Check for Updates… · Settings… ⌘, · Services · Hide tinyclient ⌘H · Hide Others ⌥⌘H · Show All · Quit tinyclient ⌘Q |
 | File | New Message ⌘N · Add Network… · Add Slack Workspace… · Attach File… ⌘U · Close Window ⌘W |
 | Edit | Undo ⌘Z · Redo ⇧⌘Z · Cut ⌘X · Copy ⌘C · Paste ⌘V · Paste and Match Style ⌥⇧⌘V · Select All ⌘A · Find in Conversation ⌘F · Search Everywhere ⇧⌘F · Emoji & Symbols ⌃⌘Space |
-| View | All Chats ⌘1 · one item per network in rail order ⌘2 to ⌘5 · Quick Switcher ⌘K · Hide Sidebar ⌃⌘S · Bigger ⌘+ · Smaller ⌘− · Actual Size ⌘0 · Enter Full Screen ⌃⌘F |
+| View | All Chats ⌘1 · one item per network in rail order ⌘2 to ⌘8 · Quick Switcher ⌘K · Hide Sidebar ⌃⌘S · Bigger ⌘+ · Smaller ⌘− · Actual Size ⌘0 · Enter Full Screen ⌃⌘F |
 | Conversation | Next ⌥↓ · Previous ⌥↑ · Next Unread ⌥⇧↓ · Previous Unread ⌥⇧↑ · Back ⌘[ · Forward ⌘] · Mark as Unread ⌥⌘U · Mute… · Start Call ⇧⌘C · Open in Slack ⌥⌘O (names the network) · Copy Link |
 | Window | Minimize ⌘M · Zoom · tinyclient (reopens the main window) · Bring All to Front |
 | Help | tinyclient Help · Keyboard Shortcuts ⌘/ · Release Notes · Report a Problem… · Copy Diagnostics (version, macOS, connection states; no message content) |
@@ -157,5 +147,5 @@ The visual-system spec wins where it names the same thing. New Lucide glyphs: `p
 ## Open points for the owner
 
 1. Light theme: specified as a control but hidden until the light values exist. Ship dark-only first?
-2. "Show in menu bar" defaults off, and Cmd-Q stops receiving. Both follow the "lightweight" brief; confirm.
+2. Settled in `06` §8. There is no status item. Quit is not "Cmd-Q stops receiving" on every platform.
 3. `04-live-signals.md` R6 wants a Telegram "don't send read receipts" option; `08` says Telegram's terms forbid it. This design follows `08` and offers it for Teams only.

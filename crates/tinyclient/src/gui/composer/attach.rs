@@ -92,7 +92,10 @@ impl Staged {
             Found::File(bytes) => bytes,
             _ => 0,
         };
-        let refused = refusal(found, can, network);
+        let mut refused = refusal(found, can, network);
+        if refused.is_none() {
+            refused = crate::tiny_attach::archive_reason(network, &name, can);
+        }
         let converting = refused.is_none() && Kind::is_heic(&name);
         Staged {
             id,

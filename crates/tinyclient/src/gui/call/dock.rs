@@ -1,22 +1,27 @@
 //! The call dock: one card at the bottom of the sidebar that is every state of a call. Ringing
 //! out, ringing in, connecting, in a call and failed are the same card with different children.
+//! Over a Tiny server's own column, whose user panel holds mute and deafen, a call that is up is
+//! the compact "Voice connected" bar instead: where, how well, and Disconnect.
 
+use super::health::{self, Grade};
 use super::people::{self, ringed};
+use super::security::Place;
 use super::{
-    ensure_daemon, ensure_keys, handoff_label, icon as glyph_in, in_call, open, Confirm, Counter, Counting, Ended, Menu,
+    ensure_daemon, ensure_keys, handoff_label, icon as glyph_in, in_call, open, Confirm, Ended, Menu,
     Subject,
 };
 use crate::gui::components::{glyph, network_icon, tip, Avatar};
 use crate::gui::state::{Shell, Snapshot};
 use crate::gui::theme;
 use gpui::{
-    deferred, div, prelude::*, px, AnyElement, Context, Div, FontWeight, Rgba, Stateful,
+    deferred, div, prelude::*, px, relative, AnyElement, Context, Div, FontWeight, Rgba, Stateful,
 };
-use protocol::{Call, CallFailure, CallState, ConversationKind, Key, Network};
+use protocol::{Call, CallFailure, CallState, Content, ConversationKind, Direction, Key, MediaRequest, Network, Request};
 
-/// The bar: two rows and the padding around them.
-const CARD: f32 = 96.;
 const SETTINGS: &str = "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone";
+/// Dock insets (8 + 8) plus the card's own padding (9 + 9). The name line is this much
+/// narrower than the sidebar, and nothing else sits on it.
+const CARD_INSET: f32 = 34.;
 
 fn card() -> Div {
     div()
@@ -34,6 +39,11 @@ fn card() -> Div {
         .gap(px(8.))
 }
 
+/// Width left for words inside the call card at a sidebar width.
+fn card_inner(sidebar: f32) -> f32 {
+    sidebar - CARD_INSET
+}
+
 /// How a 40 x 32 control looks.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Look {
@@ -42,6 +52,8 @@ enum Look {
     Off,
     /// Its menu is open.
     Open,
+    /// Share or camera is on.
+    On,
 }
 
 /// One control of the bar: 40 x 32, radius 8, a 16 px glyph. The card is `raised` already, so
@@ -51,6 +63,7 @@ fn control(id: &'static str, icon: &'static str, look: Look, enabled: bool) -> S
         Look::Rest => (theme::hover(), theme::text_soft()),
         Look::Off => (theme::danger_soft(), theme::danger()),
         Look::Open => (theme::selected(), theme::text()),
+        Look::On => (theme::accent_soft(), theme::accent()),
     };
     // Only a live control at rest brightens its glyph under the pointer.
     let lit = (enabled && look == Look::Rest).then(|| (id, theme::text()));
@@ -61,6 +74,8 @@ fn control(id: &'static str, icon: &'static str, look: Look, enabled: bool) -> S
         .w(px(40.))
         .h(px(32.))
         .rounded(px(8.))
+        .tab_index(0)
+        .focus_visible(|style| style.shadow(theme::focus_ring()))
         .bg(fill)
         .text_color(color)
         .flex()
@@ -72,8 +87,14 @@ fn control(id: &'static str, icon: &'static str, look: Look, enabled: bool) -> S
             (true, Look::Rest) => control
                 .cursor_pointer()
                 .hover(|style| style.bg(theme::selected()).text_color(theme::text())),
+            (true, Look::On) => control.cursor_pointer().hover(|style| style.bg(theme::pressed())),
             (true, _) => control.cursor_pointer(),
         })
+}
+
+/// Our own encode of this picture is on.
+fn encoding(call: &Call, content: Content) -> bool {
+    call.video.iter().any(|stream| stream.direction == Direction::Encode && stream.content == content)
 }
 
 /// Leave, 48 x 32 at the right edge. It is live in every state that has it.
@@ -86,6 +107,8 @@ fn leave() -> Stateful<Div> {
         .w(px(48.))
         .h(px(32.))
         .rounded(px(8.))
+        .tab_index(0)
+        .focus_visible(|style| style.shadow(theme::focus_ring()))
         .bg(theme::danger_soft())
         .flex()
         .items_center()
@@ -106,6 +129,8 @@ fn worded(id: &'static str, icon: Option<&'static str>, word: &'static str, fill
         .h(px(32.))
         .px(px(14.))
         .rounded(px(8.))
+        .tab_index(0)
+        .focus_visible(|style| style.shadow(theme::focus_ring()))
         .bg(fill)
         .text_color(color)
         .flex()
@@ -119,15 +144,17 @@ fn worded(id: &'static str, icon: Option<&'static str>, word: &'static str, fill
         .child(word)
 }
 
-/// A button of the failure card: equal widths, 28 high.
+/// A button of the failure card. As wide as its words, so a narrow sidebar wraps the row
+/// instead of squeezing "Open System Settings" down to nothing.
 fn plain(id: &'static str) -> Stateful<Div> {
     div()
         .id(id)
-        .flex_1()
-        .min_w_0()
-        .h(px(28.))
+        .flex_none()
+        .min_h(px(28.))
         .px(px(8.))
         .rounded(px(8.))
+        .tab_index(0)
+        .focus_visible(|style| style.shadow(theme::focus_ring()))
         .bg(theme::hover())
         .border_1()
         .border_color(theme::border())
@@ -166,13 +193,13 @@ fn outlined(id: &'static str, network: Network) -> Stateful<Div> {
         .cursor_pointer()
         .hover(|style| style.bg(theme::hover()).text_color(theme::text()))
         .child(network_icon(network, 14.))
-        .child(div().min_w_0().truncate().child(handoff_label(network)))
+        .child(handoff_label(network))
         .child(glyph_in("icons/arrow-up-right.svg", 12., theme::text_faint(), None))
 }
 
 /// What a failure card offers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Act {
+pub(super) enum Act {
     Again(&'static str),
     Message,
     Handoff,
@@ -181,11 +208,11 @@ enum Act {
 
 /// A failed call as the card says it.
 #[derive(Debug, PartialEq, Eq)]
-struct Failure {
-    title: String,
-    line: String,
-    icon: &'static str,
-    acts: Vec<Act>,
+pub(super) struct Failure {
+    pub title: String,
+    pub line: String,
+    pub icon: &'static str,
+    pub acts: Vec<Act>,
 }
 
 /// The first sentence of `text`, and what follows it.
@@ -199,7 +226,10 @@ fn sentence(text: &str) -> (&str, &str) {
 /// Every reason a call can fail for, as a title, one line that says what to do next, and the
 /// buttons. chatd, the adapter and mediad send `detail` in plain words (nothing of theirs that
 /// reaches here is a code or an error string), so it is the line when there is one.
-fn failure(call: &Call, subject: &Subject, reason: CallFailure, detail: &str) -> Failure {
+pub(super) fn failure(call: &Call, subject: &Subject, reason: CallFailure, detail: &str) -> Failure {
+    if call.conversation.network == Network::Tiny {
+        return tiny_failure(call, subject, reason, detail);
+    }
     let network = call.conversation.network.label();
     let alert = "icons/triangle-alert.svg";
     let said = |fallback: String| if detail.trim().is_empty() { fallback } else { detail.to_owned() };
@@ -276,6 +306,42 @@ fn failure(call: &Call, subject: &Subject, reason: CallFailure, detail: &str) ->
     }
 }
 
+/// A Tiny server's call that ended in words. There is no official app to hand off to, and
+/// what put me out says whether I may come back.
+// CONTRACT: the sentences are chatd's (`adapters/tiny/live.rs`: KICKED, BANNED, TIMED_OUT,
+// ROOM_GONE, ELSEWHERE, MEDIA_LOST, MEDIA_TIMEOUT); each is told apart by a phrase of it.
+fn tiny_failure(call: &Call, subject: &Subject, reason: CallFailure, detail: &str) -> Failure {
+    let alert = "icons/triangle-alert.svg";
+    let card = |title: &str, icon, acts: &[Act]| Failure { title: title.to_owned(), line: detail.to_owned(), icon, acts: acts.to_vec() };
+    let rejoin = Act::Again("Rejoin");
+    match reason {
+        _ if detail.contains("removed from the call") => card("Removed from the call", "icons/user-x.svg", &[rejoin]),
+        _ if detail.contains("banned") => card("Banned from this server", "icons/ban.svg", &[]),
+        _ if detail.contains("timed out") => card("Timed out", "icons/timer.svg", &[]),
+        _ if detail.contains("deleted") => card(&format!("{} was deleted", subject.title), alert, &[]),
+        _ if detail.contains("another device") => card("In a call on another device", "icons/phone-outgoing.svg", &[Act::Again("Join here")]),
+        _ if detail.contains("removed from this server") => card("Removed from this server", "icons/user-x.svg", &[]),
+        CallFailure::Lost if call.joined != 0 => Failure {
+            title: "Connection lost".to_owned(),
+            line: if detail.is_empty() { format!("The connection to {} dropped. You've left the call.", subject.title) } else { detail.to_owned() },
+            icon: "icons/wifi-off.svg",
+            acts: vec![rejoin],
+        },
+        CallFailure::Lost | CallFailure::Refused | CallFailure::Engine => Failure {
+            title: "Couldn't connect".to_owned(),
+            line: if detail.is_empty() { "The server didn't take the call. Try again in a moment.".to_owned() } else { detail.to_owned() },
+            icon: alert,
+            acts: vec![Act::Again("Try again")],
+        },
+        // The microphone and the rest read as on any network.
+        _ => {
+            let mut said = failure(&Call { conversation: Key { network: Network::Discord, ..call.conversation.clone() }, ..call.clone() }, subject, reason, detail);
+            said.acts.retain(|act| *act != Act::Handoff);
+            said
+        }
+    }
+}
+
 /// `12:04`, or `1:02:03` past the hour.
 fn clock(seconds: i64) -> String {
     match seconds / 3600 {
@@ -302,8 +368,9 @@ fn question(confirm: &Confirm, here: &str) -> Question {
 }
 
 impl Shell {
-    /// The dock, for the end of the sidebar column as a flex-none child: full width, 112 high
-    /// while a call is up (a failure is as tall as its words). `None` when there is no call.
+    /// The dock, for the end of the sidebar column as a flex-none child: full width, as tall as
+    /// its rows. The narrowest sidebar still shows the server name on its own line. `None` when
+    /// there is no call.
     pub(in crate::gui) fn call_dock(&self, snapshot: &Snapshot, cx: &mut Context<Self>) -> Option<Div> {
         ensure_keys(cx);
         ensure_daemon();
@@ -320,6 +387,7 @@ impl Shell {
                     (CallState::Failed { reason, detail }, _) => self.call_failed(&call, &subject, *reason, detail, cx),
                     (CallState::RingingIn { from }, _) => self.call_incoming(&call, &subject, from, cx),
                     (_, Some(confirm)) => self.call_question(&question(confirm, &subject.title), cx),
+                    _ if self.tiny_column_has(&call.conversation) => self.call_compact(&call, &subject, cx),
                     _ => self.call_bar(&call, &subject, cx),
                 }
             }
@@ -374,8 +442,7 @@ impl Shell {
             .on_click(cx.listener(|this, _, _, cx| this.call_leave(cx)))
             .child("Dismiss");
         let title = div()
-            .h(px(36.))
-            .flex_none()
+            .w_full()
             .flex()
             .items_center()
             .gap(px(10.))
@@ -389,7 +456,7 @@ impl Shell {
                     .gap(px(1.))
                     .child(
                         div()
-                            .truncate()
+                            .line_clamp(2)
                             .text_size(px(13.))
                             .line_height(px(18.))
                             .font_weight(FontWeight::SEMIBOLD)
@@ -399,19 +466,17 @@ impl Shell {
                     .child(
                         div()
                             .flex()
+                            .flex_wrap()
                             .items_center()
                             .gap(px(4.))
                             .text_size(px(11.5))
                             .line_height(px(15.))
                             .text_color(theme::text_soft())
                             .child(network_icon(network, 11.))
-                            .child(format!("Call ended · {}", clock(ended.seconds))),
+                            .child(div().line_clamp(2).child(format!("Call ended · {}", clock(ended.seconds)))),
                     ),
             );
-        card()
-            .h(px(CARD))
-            .child(title)
-            .child(div().h(px(32.)).flex_none().flex().items_center().child(div().flex_1()).child(dismiss))
+        card().child(title).child(div().min_h(px(32.)).flex().flex_wrap().items_center().child(dismiss.ml_auto()))
     }
 
     /// "Leave Lounge and call Mara Okafor?": asked in the card, where the call is, before a
@@ -421,9 +486,10 @@ impl Shell {
             div()
                 .id(id)
                 .flex_1()
-                .min_w_0()
-                .h(px(32.))
+                .min_w(px(120.))
+                .min_h(px(32.))
                 .px(px(8.))
+                .py(px(6.))
                 .rounded(px(8.))
                 .flex()
                 .items_center()
@@ -431,7 +497,7 @@ impl Shell {
                 .text_size(px(12.5))
                 .font_weight(FontWeight::MEDIUM)
                 .cursor_pointer()
-                .child(div().min_w_0().truncate().child(word))
+                .child(div().line_clamp(2).child(word))
         };
         let stay = button("call-stay", question.stay.clone())
             .bg(theme::hover())
@@ -450,6 +516,7 @@ impl Shell {
                     .gap(px(2.))
                     .child(
                         div()
+                            .line_clamp(3)
                             .text_size(px(13.))
                             .line_height(px(18.))
                             .font_weight(FontWeight::SEMIBOLD)
@@ -464,7 +531,7 @@ impl Shell {
                             .child("You can be in one call at a time."),
                     ),
             )
-            .child(div().flex().gap(px(4.)).child(stay).child(go))
+            .child(div().flex().flex_wrap().gap(px(4.)).child(stay).child(go))
     }
 
     /// Someone is calling while a call is up: a 40 px strip on top of the bar, with who and
@@ -488,14 +555,16 @@ impl Shell {
         };
         let accept = ring.clone();
         div()
-            .h(px(40.))
+            .min_h(px(40.))
             .flex_none()
             // Out to the card's edges, over its padding.
             .mt(px(-9.))
             .mx(px(-9.))
             .pl(px(10.))
             .pr(px(8.))
+            .py(px(6.))
             .flex()
+            .flex_wrap()
             .items_center()
             .gap(px(8.))
             .border_b_1()
@@ -506,11 +575,20 @@ impl Shell {
             .child(
                 div()
                     .flex_1()
-                    .min_w_0()
+                    .min_w(px(120.))
                     .flex()
+                    .flex_wrap()
+                    .items_center()
                     .gap(px(4.))
-                    .child(div().flex_none().font_weight(FontWeight::SEMIBOLD).text_color(theme::text()).child(from.to_owned()))
-                    .child(div().min_w_0().truncate().child(if from == ring.title {
+                    .child(
+                        div()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::text())
+                            .whitespace_normal()
+                            .line_clamp(2)
+                            .child(from.to_owned()),
+                    )
+                    .child(div().whitespace_normal().line_clamp(2).child(if from == ring.title {
                         "is calling".to_owned()
                     } else {
                         format!("is calling · {}", ring.title)
@@ -533,21 +611,132 @@ impl Shell {
 
     /// The counter's text, told what it counts. Nothing ticks unless this is on screen.
     fn call_counter(&self, call: &Call, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let counting = match call.state {
-            CallState::RingingOut => Counting::Ring,
-            CallState::Joined => Counting::Joined,
-            CallState::Reconnecting => Counting::Reconnect,
-            _ => return None,
-        };
-        let counter = self.call_state.counter.get_or_init(|| cx.new(|_| Counter::default())).clone();
-        let what = Some((counting, call.conversation.clone()));
-        let joined = call.joined;
-        counter.update(cx, |counter, cx| counter.follow(what, joined, cx));
-        Some(counter.into_any_element())
+        self.call_dock_clock(call, cx)
     }
 
-    /// Row 1, 36 px: who or where, the state in words, and who else is there. A click on it
-    /// opens the call's conversation.
+    /// The signal bars of a call whose connection is measured (a Tiny call), which open Call
+    /// health. Nothing for a call that is not up, or whose numbers are not read.
+    fn call_signal(&self, call: &Call, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if call.state != CallState::Joined {
+            return None;
+        }
+        let health = self.tiny_health().filter(|_| call.conversation.network == Network::Tiny)?;
+        let grade = health.grade();
+        let words = match (grade, health.rtt_ms) {
+            (Grade::Unknown, _) | (_, None) => grade.words().to_owned(),
+            (_, Some(ms)) => format!("{} · {ms} ms", grade.words()),
+        };
+        Some(
+            div()
+                .id("call-signal")
+                .flex_none()
+                .size(px(24.))
+                .rounded(px(theme::R_CONTROL))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .tab_index(0)
+                .hover(|style| style.bg(theme::hover()))
+                .focus_visible(|style| style.shadow(theme::focus_ring()))
+                .tooltip(tip(format!("{words}. Call health"), None))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.tiny_toggle_health(cx);
+                }))
+                .child(health::bars(grade, 12.))
+                .into_any_element(),
+        )
+    }
+
+    /// Share and camera belong on a joined Tiny call whose room allows video. A room that has
+    /// not loaded yet still shows them: the server's default is that video is allowed.
+    fn tiny_pictures(&self, call: &Call) -> bool {
+        if call.conversation.network != Network::Tiny || call.state != CallState::Joined {
+            return false;
+        }
+        let Some(page) = self.tiny_page_facts().filter(|page| page.account == &call.conversation.account()) else {
+            return true;
+        };
+        page.community.rooms.iter().find(|room| room.id == call.conversation.id).is_none_or(|room| room.video_enabled)
+    }
+
+    /// Over a Tiny server's column: "Voice connected", where, how well, and Disconnect. Mute,
+    /// deafen and the voice settings are in the user panel right under it.
+    fn call_compact(&self, call: &Call, subject: &Subject, cx: &mut Context<Self>) -> Div {
+        let (state, color) = match call.state {
+            CallState::Joined if self.call_muted_talking(call) => ("You're muted", theme::danger()),
+            // Coloured by the link, as the bars are: green, amber when fair, red when poor.
+            CallState::Joined => match self.tiny_health().map(|health| health.grade()) {
+                Some(grade @ (Grade::Fair | Grade::Poor)) => ("Voice connected", grade.color()),
+                _ => ("Voice connected", theme::positive()),
+            },
+            CallState::Reconnecting => ("Reconnecting…", theme::warning()),
+            _ => ("Connecting…", theme::warning()),
+        };
+        let notice = self.call_state.error.clone().or_else(|| self.call_state.notice.clone().filter(|_| in_call(call)));
+        let clock = if notice.is_some() || call.state == CallState::Joined { None } else { self.call_counter(call, cx) };
+        let place = match &subject.space {
+            Some(server) => format!("{} / {server}", subject.title),
+            None => subject.title.clone(),
+        };
+        let key = call.conversation.clone();
+        let title = subject.title.clone();
+        let words = div()
+            .id("call-compact-where")
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap(px(1.))
+            .cursor_pointer()
+            .tab_index(0)
+            .focus_visible(|style| style.shadow(theme::focus_ring()))
+            .tooltip(tip(format!("Go to {}", subject.title), Some("⌘⇧J")))
+            .on_click(cx.listener(move |this, _, _, cx| this.call_go(key.clone(), &title, cx)))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(5.))
+                    .text_size(px(13.))
+                    .line_height(px(18.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(color)
+                    .when(self.call_muted_talking(call), |row| row.child(glyph("icons/mic-off.svg", 13., theme::danger())))
+                    .child(div().flex_none().child(state))
+                    .children(clock.map(|clock| div().flex_none().font_weight(FontWeight::NORMAL).text_color(theme::text_soft()).child(clock))),
+            )
+            .child(
+                div()
+                    .whitespace_normal()
+                    .line_clamp(4)
+                    .text_size(px(11.5))
+                    .line_height(px(15.))
+                    .text_color(if notice.is_some() { theme::warning() } else { theme::text_soft() })
+                    .child(notice.unwrap_or(place)),
+            );
+        let disconnect = leave()
+            .w(px(36.))
+            .on_click(cx.listener(|this, _, _, cx| this.call_leave(cx)));
+        // The name takes the card's width. Signal, lock and Leave sit on the row above it,
+        // and wrap under it when the column is the narrowest sidebar.
+        card().child(
+            div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap(px(8.))
+                .children(self.call_signal(call, cx))
+                .children(self.call_security(call, Place::TinyBar, cx))
+                .child(disconnect.ml_auto()),
+        )
+        .child(words)
+    }
+
+    /// Who or where, then the server or notice on its own line, then signal, lock and who else
+    /// is there. Those icons used to share the name's row, which is what cut a server down to
+    /// "Tiny C…" at the narrowest sidebar. A click opens the call's conversation.
     fn call_title(&self, call: &Call, subject: &Subject, words: String, cx: &mut Context<Self>) -> Stateful<Div> {
         let network = call.conversation.network;
         let direct = subject.kind == ConversationKind::Direct;
@@ -572,19 +761,36 @@ impl Shell {
         let notice = self.call_state.notice.clone().filter(|_| live);
         let refused = self.call_state.error.clone();
         let reconnecting = call.state == CallState::Reconnecting;
-        let color = if reconnecting || refused.is_some() { theme::warning() } else { theme::text_soft() };
+        let talking = self.call_muted_talking(call);
+        let color = if talking {
+            theme::danger()
+        } else if reconnecting || refused.is_some() || (live && call.device_stuck) {
+            theme::warning()
+        } else {
+            theme::text_soft()
+        };
+        let words = if talking { format!("You're muted. Press {} to talk", crate::gui::shortcuts::label("⌘⇧M")) } else { words };
         let counter = if refused.is_some() || notice.is_some() { None } else { self.call_counter(call, cx) };
         let refused = refused.or(notice);
-        let sub = div()
+        // Give the server name or notice the full line; status and clock have their own row.
+        let place = div()
+            .w_full()
             .flex()
+            .flex_wrap()
             .items_center()
             .gap(px(4.))
             .text_size(px(11.5))
             .line_height(px(15.))
             .text_color(color)
-            .child(network_icon(network, 11.))
-            .child(div().min_w_0().truncate().child(refused.unwrap_or(words)))
-            .children(counter);
+            .child(div().flex_none().child(network_icon(network, 11.)))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .whitespace_normal()
+                    .child(refused.unwrap_or(words)),
+            )
+            .children(self.call_switch_device(call, live, cx));
         let right: Option<AnyElement> = match (live, direct) {
             (false, _) => None,
             (true, true) => call
@@ -606,38 +812,56 @@ impl Shell {
         };
         let key = call.conversation.clone();
         let title = subject.title.clone();
+        let signal = self.call_signal(call, cx);
+        let security = self.call_security(call, Place::Dock, cx);
+        let show_status = signal.is_some() || security.is_some() || right.is_some() || counter.is_some();
         div()
             .id("call-title")
-            .h(px(36.))
+            .w_full()
             .flex_none()
             .flex()
-            .items_center()
-            .gap(px(10.))
+            .flex_col()
+            .gap(px(4.))
             .cursor_pointer()
-            .on_click(cx.listener(move |this, _, _, cx| this.select(key.clone(), &title, cx)))
-            .child(lead)
+            .on_click(cx.listener(move |this, _, _, cx| this.call_go(key.clone(), &title, cx)))
             .child(
                 div()
-                    .flex_1()
-                    .min_w_0()
+                    .w_full()
                     .flex()
-                    .flex_col()
-                    .gap(px(1.))
+                    .items_center()
+                    .gap(px(10.))
+                    .child(lead)
                     .child(
                         div()
-                            .truncate()
+                            .flex_1()
+                            .min_w_0()
+                            .whitespace_normal()
                             .text_size(px(13.))
                             .line_height(px(18.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(theme::text())
                             .child(subject.title.clone()),
-                    )
-                    .child(sub),
+                    ),
             )
-            .children(right)
+            .child(place)
+            .when(show_status, |column| {
+                column.child(
+                    div()
+                        .w_full()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap(px(2.))
+                        .children(signal)
+                        .children(security)
+                        .children(right)
+                        .children(counter),
+                )
+            })
     }
 
-    /// Ringing out, connecting, joined and reconnecting: the 96 px bar.
+    /// Ringing out, connecting, joined and reconnecting. As tall as the name, the server line
+    /// and the controls, which wrap when the sidebar is at its narrowest.
     fn call_bar(&self, call: &Call, subject: &Subject, cx: &mut Context<Self>) -> Div {
         let place = subject.space.as_deref().unwrap_or(call.conversation.network.label());
         let alone = self.call_left_alone(call);
@@ -647,9 +871,9 @@ impl Shell {
             (CallState::Reconnecting, _) => "Reconnecting…".to_owned(),
             // Alone in a direct call: said, and left to me. tinyclient does not hang up for me.
             (_, Some(peer)) if subject.kind == ConversationKind::Direct => {
-                format!("{} left ·", peer.split_whitespace().next().unwrap_or(peer))
+                format!("{} left", peer.split_whitespace().next().unwrap_or(peer))
             }
-            _ => format!("{place} ·"),
+            _ => place.to_owned(),
         };
         let joined = call.state == CallState::Joined;
         // Reconnecting keeps the joined controls, dead; only Leave is live.
@@ -684,6 +908,29 @@ impl Shell {
                 .tooltip(tip(if call.deafened { "Undeafen" } else { "Deafen" }, Some("⌘⇧D")))
                 .on_click(cx.listener(|this, _, _, cx| this.call_deafen(cx)))
         });
+        let pictures = self.tiny_pictures(call);
+        let share_on = encoding(call, Content::Share);
+        let camera_on = encoding(call, Content::Camera);
+        let share = pictures.then(|| {
+            control("call-share", "icons/monitor-up.svg", if share_on { Look::On } else { Look::Rest }, enabled)
+                .when(enabled, |share| {
+                    share
+                        .tooltip(tip(if share_on { "Stop sharing" } else { "Share your screen" }, None))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.call_ask(Request::Media(MediaRequest::ShareSend { on: !share_on }), cx)
+                        }))
+                })
+        });
+        let camera = pictures.then(|| {
+            control("call-camera", "icons/video.svg", if camera_on { Look::On } else { Look::Rest }, enabled)
+                .when(enabled, |camera| {
+                    camera
+                        .tooltip(tip(if camera_on { "Turn camera off" } else { "Turn camera on" }, None))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.call_ask(Request::Media(MediaRequest::Camera { on: !camera_on }), cx)
+                        }))
+                })
+        });
         let devices = control(
             "call-devices",
             "icons/settings.svg",
@@ -702,42 +949,47 @@ impl Shell {
                 .hover(|style| style.bg(theme::danger_fill()).text_color(theme::on_accent()))
                 .tooltip(tip("Cancel", Some("⌘⇧H")))
         };
+        // Joined controls share the width equally, including when video adds two buttons.
         let controls = div()
-            .h(px(32.))
+            .w_full()
+            .min_h(px(32.))
             .flex_none()
             .flex()
+            .flex_wrap()
             .items_center()
             .gap(px(4.))
-            .child(mute)
+            .child(mute.when(in_call(call), |button| button.flex_1().min_w_0()))
             // Deafen is for a call that is up; before that only mute and devices can be preset.
-            .when(in_call(call), |row| row.child(deafen))
-            .child(devices)
-            .child(div().flex_1())
-            .child(end.on_click(cx.listener(|this, _, _, cx| this.call_leave(cx))));
+            .when(in_call(call), |row| row.child(deafen.flex_1().min_w_0()))
+            .children(share.map(|button| button.flex_1().min_w_0()))
+            .children(camera.map(|button| button.flex_1().min_w_0()))
+            .child(devices.when(in_call(call), |button| button.flex_1().min_w_0()))
+            .child(end.when(in_call(call), |button| button.flex_1().min_w_0()).on_click(cx.listener(|this, _, _, cx| this.call_leave(cx))));
 
         let popover = match menu {
             Some(Menu::Devices) => Some((300., self.call_devices_menu(call, cx).p(px(6.)))),
             Some(Menu::People) if joined => Some((280., people::list(call, subject).py(px(6.)))),
+            Some(Menu::Security) if self.call_security_open(Place::Dock) => Some((320., div().child(self.call_security_panel(call, cx)))),
             _ => None,
         };
         #[cfg(feature = "gui-shot")]
         let strip = super::shot::strip();
         #[cfg(not(feature = "gui-shot"))]
         let strip: Option<(Confirm, String)> = None;
-        let lifted = if strip.is_some() { 40. } else { 0. };
         card()
-            .h(px(CARD + lifted))
             .children(strip.map(|(ring, from)| self.call_strip(&ring, &from, cx)))
             .child(self.call_title(call, subject, words, cx))
             .child(controls)
             .children(popover.map(|(width, body)| {
                 // Above the card, level with its left edge, on top of whatever the list shows.
+                // The card is as tall as its rows, so the popover hangs off the top of it.
                 deferred(
                     div()
                         .id("call-popover")
                         .absolute()
                         .left(px(-1.))
-                        .bottom(px(CARD + lifted + 5.))
+                        .bottom(relative(1.))
+                        .pb(px(6.))
                         .w(px(width))
                         .rounded(px(12.))
                         .bg(theme::overlay())
@@ -781,10 +1033,18 @@ impl Shell {
         .tooltip(tip("Accept", Some("⌘⇧A")))
         .on_click(cx.listener(|this, _, _, cx| this.call_accept(cx)));
         card()
-            .h(px(CARD))
             .border_color(Rgba { alpha: 0.45, ..theme::positive() })
             .child(self.call_title(call, subject, words, cx))
-            .child(div().h(px(32.)).flex_none().flex().gap(px(4.)).child(decline).child(accept))
+            .child(
+                div()
+                    .min_h(px(32.))
+                    .flex_none()
+                    .flex()
+                    .flex_wrap()
+                    .gap(px(4.))
+                    .child(decline.min_w(px(100.)))
+                    .child(accept.min_w(px(100.))),
+            )
     }
 
     /// A call that did not happen, said in words. It stays until dismissed or the next call.
@@ -810,7 +1070,7 @@ impl Shell {
                     .on_click(cx.listener(move |this, _, _, cx| this.call_start(key.clone(), cx)))
                     .child(word),
                 Act::Message => plain("call-message")
-                    .on_click(cx.listener(move |this, _, _, cx| this.select(key.clone(), &name, cx)))
+                    .on_click(cx.listener(move |this, _, _, cx| this.call_go(key.clone(), &name, cx)))
                     .child("Message"),
                 Act::Handoff => outlined("call-handoff", network)
                     .on_click(cx.listener(move |this, _, _, cx| this.call_handoff(key.clone(), cx))),
@@ -862,6 +1122,8 @@ impl Shell {
                             .gap(px(2.))
                             .child(
                                 div()
+                                    .whitespace_normal()
+                                    .line_clamp(2)
                                     .text_size(px(13.))
                                     .line_height(px(18.))
                                     .font_weight(FontWeight::SEMIBOLD)
@@ -870,6 +1132,8 @@ impl Shell {
                             )
                             .child(
                                 div()
+                                    .whitespace_normal()
+                                    .line_clamp(4)
                                     .text_size(px(11.5))
                                     .line_height(px(16.))
                                     .text_color(theme::text_soft())
@@ -878,7 +1142,7 @@ impl Shell {
                     )
                     .child(dismiss),
             )
-            .child(div().flex().gap(px(4.)).children(buttons))
+            .child(div().flex().flex_wrap().gap(px(4.)).children(buttons))
     }
 }
 
@@ -900,8 +1164,15 @@ mod tests {
             video: Vec::new(),
             speaking: false,
             level: None,
+            output_level: None,
+            input_id: String::new(),
+            output_id: String::new(),
+            device_notice: None,
+            device_stuck: false,
             inputs: Vec::new(),
             outputs: Vec::new(),
+            security: None,
+            picture: None,
         }
     }
 
@@ -972,6 +1243,42 @@ mod tests {
         let ring = Confirm { answer: true, title: "Iris Navarro".into(), ..call };
         assert_eq!(question(&ring, "Lounge").title, "Leave Lounge and answer Iris Navarro?");
         assert_eq!(question(&ring, "Lounge").go, "Leave & answer");
+    }
+
+    fn tiny(joined: i64) -> Call {
+        Call { conversation: Key { network: Network::Tiny, account: "night".into(), id: "lounge".into() }, ..call(joined) }
+    }
+
+    fn lounge() -> Subject {
+        Subject { title: "Lounge".into(), kind: ConversationKind::Voice, avatar: None, space: Some("Night Shift".into()) }
+    }
+
+    #[test]
+    fn a_tiny_server_says_who_put_me_out_and_whether_i_may_come_back() {
+        let said = |reason, detail: &str| failure(&tiny(1_700_000_000), &lounge(), reason, detail);
+        let kicked = said(CallFailure::Refused, "You were removed from the call.");
+        assert_eq!((kicked.title.as_str(), kicked.acts.as_slice()), ("Removed from the call", &[Act::Again("Rejoin")][..]));
+        assert_eq!(kicked.line, "You were removed from the call.");
+        assert!(said(CallFailure::Refused, "You were banned from this server.").acts.is_empty(), "no way back from a ban");
+        assert_eq!(said(CallFailure::Refused, "You were timed out on this server, so you've left the call.").title, "Timed out");
+        assert_eq!(said(CallFailure::Refused, "The room was deleted, so the call ended.").title, "Lounge was deleted");
+        assert_eq!(said(CallFailure::Refused, "You joined a call on another device.").acts, [Act::Again("Join here")]);
+        let lost = said(CallFailure::Lost, "The server stopped hearing this call's audio, so you've left the call.");
+        assert_eq!((lost.title.as_str(), lost.acts.as_slice()), ("Connection lost", &[Act::Again("Rejoin")][..]));
+        let never = failure(&tiny(0), &lounge(), CallFailure::Lost, "");
+        assert_eq!(never.title, "Couldn't connect");
+        for reason in [CallFailure::Refused, CallFailure::Lost, CallFailure::Engine, CallFailure::Audio, CallFailure::Encryption] {
+            let card = failure(&tiny(0), &lounge(), reason, "");
+            assert!(!card.acts.contains(&Act::Handoff), "a Tiny server has no app to hand off to: {reason:?}");
+        }
+    }
+
+    #[test]
+    fn the_narrowest_sidebar_gives_the_server_name_its_own_line() {
+        // Sidebar 260, minus the dock inset and the card padding. The server line is this wide
+        // because signal, lock and people sit on a later row.
+        let inner = card_inner(crate::gui::layout::SIDEBAR_RANGE.0);
+        assert!(inner >= 200., "{inner}");
     }
 
     #[test]

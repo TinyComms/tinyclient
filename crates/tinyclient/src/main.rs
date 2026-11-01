@@ -10,10 +10,17 @@ mod host;
 mod update;
 #[cfg(any(feature = "gui", test))]
 mod frames;
+#[cfg(any(feature = "gui", test))]
+mod tiny_attach;
 #[cfg(feature = "gui")]
 mod gui;
 #[cfg(feature = "gui")]
 mod lottie;
+#[cfg(all(feature = "gui", target_os = "linux"))]
+mod invite_ipc;
+#[cfg(all(feature = "gui", windows))]
+#[path = "invite_ipc_windows.rs"]
+mod invite_ipc;
 mod view;
 
 use client::ask;
@@ -21,8 +28,13 @@ use protocol::{chat_sock_path, InboxFilter, Request, Response, PAGE_LIMIT};
 use std::io::{self, ErrorKind};
 use std::process::ExitCode;
 
-fn unexpected(response: Response) -> io::Error {
-    io::Error::other(format!("unexpected {response:?}"))
+fn unexpected(_response: Response) -> io::Error {
+    io::Error::other("unexpected response")
+}
+
+/// Only a valid Tiny app link is accepted from the operating system.
+fn launch_invite(args: &[String]) -> Option<String> {
+    args.iter().find(|arg| arg.starts_with("tinyclient://join#") && protocol::parse_invite_link(arg).is_some()).cloned()
 }
 
 /// The shell without a window: the same states, as lines.
@@ -83,6 +95,16 @@ fn print_search(query: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// `--notify-test`: asks chatd to post the test notification (N13) and says what came of it.
+fn notify_test() -> io::Result<()> {
+    match ask(&Request::NotifyTest)? {
+        Response::NotifyTested { posted: true, .. } => println!("posted, and listed by the system"),
+        Response::NotifyTested { posted: false, detail } => println!("not posted: {detail}"),
+        other => return Err(unexpected(other)),
+    }
+    Ok(())
+}
+
 /// A windowed program starts with no console, so what it prints goes nowhere. When output is not
 /// already a pipe or a file, write to the console of the program that started it, if any.
 #[cfg(all(windows, feature = "gui"))]
@@ -115,14 +137,14 @@ fn main() -> ExitCode {
         Some(at) => match args.get(at + 1) {
             Some(query) => Some(query.as_str()),
             None => {
-                eprintln!("tinyclient: --search needs what to look for");
+                tracing::warn!("tinyclient: --search needs what to look for");
                 return ExitCode::from(64);
             }
         },
         None => None,
     };
     #[cfg(all(windows, feature = "gui"))]
-    if args.iter().any(|arg| arg == "--version" || arg == "--text") || query.is_some() {
+    if args.iter().any(|arg| arg == "--version" || arg == "--text" || arg == "--notify-test") || query.is_some() {
         borrow_console();
     }
     // Before the window opens: it is how an installed package proves it runs, with no display.
@@ -130,26 +152,50 @@ fn main() -> ExitCode {
         println!("tinyclient {}", env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;
     }
+    let _log = protocol::log_policy::install("tinyclient", protocol::log_policy::LogPolicy::from_env());
     #[cfg(feature = "gui")]
-    if !args.iter().any(|arg| arg == "--text") && query.is_none() {
-        gui::run();
+    if !args.iter().any(|arg| arg == "--text" || arg == "--notify-test") && query.is_none() {
+        let invite = launch_invite(&args);
+        #[cfg(any(target_os = "linux", windows))]
+        let incoming = match invite_ipc::start(invite.as_deref()) {
+            invite_ipc::Handoff::Delivered => return ExitCode::SUCCESS,
+            invite_ipc::Handoff::Primary(receiver) => Some(receiver),
+            invite_ipc::Handoff::Unavailable => None,
+        };
+        #[cfg(not(any(target_os = "linux", windows)))]
+        let incoming = None;
+        gui::run(invite, incoming);
         return ExitCode::SUCCESS;
     }
 
     let done = match query {
         Some(query) => print_search(query),
+        None if args.iter().any(|arg| arg == "--notify-test") => notify_test(),
         None => print_status(),
     };
     match done {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) if matches!(err.kind(), ErrorKind::NotFound | ErrorKind::ConnectionRefused) => {
-            eprintln!("chatd is not running at {}", chat_sock_path().display());
-            eprintln!("start it with: cargo run -p chatd");
+            tracing::warn!("chatd is not running at {}", chat_sock_path().display());
+            tracing::warn!("start it with: cargo run -p chatd");
             ExitCode::from(1)
         }
         Err(err) => {
-            eprintln!("{err}");
+            tracing::warn!("{err}");
             ExitCode::from(1)
         }
+    }
+}
+
+#[cfg(test)]
+mod invite_launch_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_only_valid_app_invites() {
+        let link = protocol::invite_url("https://example.org", "token").unwrap();
+        let app = link.replacen("https://tinyclient.io/invite#", "tinyclient://join#", 1);
+        assert_eq!(launch_invite(&[app.clone()]), Some(app));
+        assert_eq!(launch_invite(&[link, "tinyclient://join#broken".into()]), None);
     }
 }

@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self'; style-src 'self'; script-src 'self'; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex, nofollow">
+<title>tinyclient</title>
+<meta name="description" content="Open this invitation in tinyclient. Sign-in continues in your browser, at that server.">
+<meta name="color-scheme" content="dark light">
+<meta name="theme-color" content="#121315" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script src="/site.js" defer></script>
+<script src="/invite/invite.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="/" aria-label="tinyclient home"><img src="/favicon.svg" alt="" width="28" height="28">tinyclient</a>
+    <nav class="site-nav" aria-label="Site">
+      <a href="/docs/">Docs</a>
+      <a class="hide-sm" href="/docs/privacy.html">Privacy</a>
+      <a class="dc" href="https://discord.gg/kJHK7BNvJP" aria-label="Discord"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20.317 4.37a19.791 19.791 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028 14.09 14.09 0 0 0 1.226-1.994.076.076 0 0 0-.041-.106 13.107 13.107 0 0 1-1.872-.892.077.077 0 0 1-.008-.128 10.2 10.2 0 0 0 .372-.292.074.074 0 0 1 .077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 0 1 .078.01c.12.098.246.198.373.292a.077.077 0 0 1-.006.127 12.299 12.299 0 0 1-1.873.892.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.839 19.839 0 0 0 6.002-3.03.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.03zM8.02 15.33c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42.019 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42.019 1.333-.946 2.418-2.157 2.418z"/></svg><span class="nav-label">Discord</span></a>
+      <a class="gh" href="https://github.com/TinyComms/tinyclient"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+
+<section class="hero" aria-labelledby="title">
+  <div class="wrap">
+    <div class="hero-mark"><img class="hero-icon" src="/icon.svg" alt="" width="76" height="76"><h1 id="title">tinyclient</h1></div>
+    <noscript><p class="pitch">Turn on JavaScript to open this invitation, or paste its link into Tiny.</p></noscript>
+    <p class="pitch" id="invite-error" hidden>This invitation is missing or invalid. Ask the person who invited you for a new link.</p>
+    <div id="invite-ready" hidden>
+      <p class="pitch">You’re invited to join <strong id="server-host"></strong>.</p>
+      <p class="notice" id="insecure-warning" hidden>This server uses an unencrypted HTTP connection. Only continue if you trust your network and server.</p>
+      <div class="actions">
+        <a class="btn btn-primary" id="open-tiny">Open Tiny</a>
+        <a class="btn btn-secondary" href="/download/macos"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/><path d="M12 15V3"/></svg><span data-download-label>Download</span></a>
+      </div>
+      <p class="platforms">Sign-in continues in your browser, at that server.</p>
+      <div class="faq invite-more">
+        <details>
+          <summary>Open Tiny didn’t work?</summary>
+          <p>Paste this into Join a server in Tiny. The server’s sign-in opens in your browser.</p>
+          <div class="code invite-code">
+            <label class="visually-hidden" for="invite-code">Invite code</label>
+            <input id="invite-code" type="text" readonly>
+            <button type="button" class="copy" id="copy-link">Copy link</button>
+          </div>
+          <p class="invite-status" id="copy-status" role="status"></p>
+        </details>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="section" id="download" aria-labelledby="download-title">
+  <div class="wrap">
+    <p class="kicker center">Download</p>
+    <h2 id="download-title" class="center">Free, with no account to&nbsp;make</h2>
+    <ul class="dl">
+      <li class="dl-card spot">
+        <h3>macOS</h3>
+        <p>Apple silicon, macOS 13 or later. A disk&nbsp;image.</p>
+        <a class="btn btn-primary" href="/download/macos"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/><path d="M12 15V3"/></svg>Download for macOS</a>
+      </li>
+      <li class="dl-card spot">
+        <h3>Linux</h3>
+        <p>x86_64 and arm64, as .deb, .rpm, AppImage or&nbsp;.tar.gz.</p>
+        <a class="btn btn-secondary" href="/download/linux"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/><path d="M12 15V3"/></svg>Download for Linux</a>
+      </li>
+      <li class="dl-card spot">
+        <h3>Windows</h3>
+        <p>x86_64. An installer that needs no&nbsp;administrator.</p>
+        <a class="btn btn-secondary" href="/download/windows"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/><path d="M12 15V3"/></svg>Download for Windows</a>
+      </li>
+    </ul>
+    <p class="fine-note center">Every release is built by GitHub Actions from the public source. <a href="/download/checksums">Checksums</a> · <a href="https://github.com/TinyComms/tinyclient/releases">All releases</a> · <a href="/docs/build.html">Build it yourself</a></p>
+  </div>
+</section>
+
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="foot">
+      <div>
+        <a class="brand" href="/"><img src="/favicon.svg" alt="" width="28" height="28">tinyclient</a>
+        <p>Open source, MIT.</p>
+      </div>
+      <nav aria-labelledby="f-docs">
+        <h2 id="f-docs">Docs</h2>
+        <ul>
+          <li><a href="/docs/">Getting started</a></li>
+          <li><a href="/docs/build.html">Build from source</a></li>
+          <li><a href="/docs/architecture.html">Architecture</a></li>
+        </ul>
+      </nav>
+      <nav aria-labelledby="f-trust">
+        <h2 id="f-trust">Trust</h2>
+        <ul>
+          <li><a href="/docs/privacy.html">Privacy &amp; security</a></li>
+          <li><a href="/docs/networks.html">Networks &amp; terms</a></li>
+          <li><a href="https://github.com/TinyComms/tinyclient/blob/main/SECURITY.md">Security policy</a></li>
+        </ul>
+      </nav>
+      <nav aria-labelledby="f-project">
+        <h2 id="f-project">Project</h2>
+        <ul>
+          <li><a href="https://discord.gg/kJHK7BNvJP">Discord</a></li>
+          <li><a href="https://github.com/TinyComms/tinyclient">Source on GitHub</a></li>
+          <li><a href="https://github.com/TinyComms/tinyclient/releases">Releases</a></li>
+          <li><a href="/docs/contributing.html">Contributing</a></li>
+        </ul>
+      </nav>
+    </div>
+  </div>
+</footer>
+</body>
+</html>

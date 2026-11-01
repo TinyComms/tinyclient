@@ -6,12 +6,14 @@
 
 mod anim;
 mod app;
+mod attention;
 mod assets;
 mod call;
 mod chrome;
 mod components;
 mod composer;
 mod conversation;
+mod hotkeys;
 mod input;
 mod layout;
 mod pane;
@@ -226,7 +228,10 @@ fn shell_bindings() -> Vec<KeyBinding> {
 /// menu opened at the window's edges), `--text-step N`, `--start-chatd` (let the shot start
 /// chatd when it is not running; off by default so a shot leaves no process behind),
 /// `--autoplay always|hover|never` (when GIFs play), `--frames N` (N frames 150 ms apart, as
-/// `out-1.png` …, to see moving pictures move).
+/// `out-1.png` …, to see moving pictures move). On a Tiny server (`--mode tiny`): `--tiny-room
+/// N` (the Nth channel), `--tiny-menu header|channel|person:N` (N: the Nth seat, `:sub` adds its
+/// Move submenu), `--tiny-modal invite|code|kick|ban|profile`, `--tiny-settings`, `--tiny-card N`
+/// (the Nth member's hover card).
 ///
 /// `--demo` draws made-up data instead of live data: a fake chatd answers every request
 /// (`shot_demo`), chatd is never started or asked, and nobody's real chats are read.
@@ -383,6 +388,7 @@ mod shot {
                 if let Some(words) = flag("--compose") {
                     shell.composer_type(&words, window, cx);
                 }
+                shell.tiny_shot(flag, window, cx);
                 cx.notify();
             }
         }
@@ -592,12 +598,12 @@ mod shot {
                 let image = window.update(cx, |_, window, _| window.render_to_image());
                 match image {
                     Ok(Ok(image)) => image.save(&named).expect("the screenshot is written"),
-                    other => eprintln!("tinyclient: no screenshot: {:?}", other.map(|r| r.map(|_| ()))),
+                    other => tracing::warn!("tinyclient: no screenshot: {:?}", other.map(|r| r.map(|_| ()))),
                 }
             }
             // `--hold 20` keeps the window up so its memory can be measured from outside.
             if let Some(seconds) = flag("--hold").and_then(|n| n.parse::<u64>().ok()) {
-                eprintln!("tinyclient: holding, pid {}", std::process::id());
+                tracing::warn!("tinyclient: holding, pid {}", std::process::id());
                 cx.background_executor().timer(Duration::from_secs(seconds)).await;
             }
             cx.update(|cx| cx.quit());
@@ -664,18 +670,21 @@ pub(crate) fn links_through_gpui() -> bool {
     cfg!(any(target_os = "android", target_os = "ios"))
 }
 
-pub fn run() {
-    run_with(gpui_platform::application());
+/// Opens the window. `invite` is a `tinyclient://join#…` link the launch carried; `incoming`
+/// delivers the links a second launch hands this one.
+pub fn run(invite: Option<String>, incoming: Option<std::sync::mpsc::Receiver<String>>) {
+    run_with(gpui_platform::application(), invite, incoming);
 }
 
 /// Runs the window on an application the caller built. Android builds its own (see
 /// `android_main`): `gpui_platform::application()` there has no NativeActivity session, so
 /// GPUI would open the window before the surface exists.
-pub(crate) fn run_with(application: gpui::Application) {
+pub(crate) fn run_with(application: gpui::Application, invite: Option<String>, incoming: Option<std::sync::mpsc::Receiver<String>>) {
     #[cfg(feature = "gui-shot")]
     LAUNCHED.get_or_init(std::time::Instant::now);
     app::crash::install();
     app::read_reduce_motion();
+    attention::read_launch();
     time::read_clock_preference();
     // Read before the window opens, so its first frame draws where the user was.
     let prefs = app::prefs::read();
@@ -686,6 +695,18 @@ pub(crate) fn run_with(application: gpui::Application) {
     app::prefs::set_choices(prefs.choices);
     anim::set_autoplay(prefs.autoplay);
     let application = application.with_assets(assets::Assets);
+    // macOS delivers both launch and subsequent links as open-URL events. Keep them in
+    // memory until the current sign-in sheet closes; never discard an active flow.
+    let links = std::rc::Rc::new(std::cell::RefCell::new(std::collections::VecDeque::<String>::new()));
+    let received = links.clone();
+    application.on_open_urls(move |urls| {
+        for url in urls {
+            if url.starts_with("tinyclient://join#") && protocol::parse_invite_link(&url).is_some() {
+                let mut queue = received.borrow_mut();
+                if queue.len() < 8 && !queue.contains(&url) { queue.push_back(url); }
+            }
+        }
+    });
     // The Dock icon brings the hidden window back unchanged.
     application.on_reopen(|cx| cx.activate(true));
     application.run(move |cx: &mut App| {
@@ -732,16 +753,36 @@ pub(crate) fn run_with(application: gpui::Application) {
                 Err(err) => {
                     // No window (no GPU, a headless session): say so and leave, never panic.
                     // Nothing can be drawn without a window, so the record is the only report.
-                    let message = format!("tinyclient: the window could not open: {err}");
-                    log::error!("{message}");
-                    // Desktop has no logger installed, so the terminal gets the line itself. On
-                    // Android stderr goes nowhere and the record above is the report.
-                    #[cfg(not(target_os = "android"))]
-                    eprintln!("{message}");
+                    tracing::warn!("tinyclient: the window could not open: {err}");
+                    // On Android the `log` records are what reach logcat (`lib.rs`, `android_log`).
+                    #[cfg(target_os = "android")]
+                    log::error!("tinyclient: the window could not open: {err}");
                     cx.quit();
                     return;
                 }
             };
+            if let Some(invite) = invite {
+                links.borrow_mut().push_back(invite);
+            }
+            cx.spawn(async move |cx| {
+                loop {
+                    cx.background_executor().timer(std::time::Duration::from_millis(500)).await;
+                    if let Some(incoming) = incoming.as_ref() {
+                        while links.borrow().len() < 8 {
+                            let Ok(link) = incoming.try_recv() else { break; };
+                            let mut queue = links.borrow_mut();
+                            if !queue.contains(&link) { queue.push_back(link); }
+                        }
+                    }
+                    let next = links.borrow().front().cloned();
+                    if let Some(next) = next {
+                        if cx.update(|cx| signin::open_invite(&next, cx)) {
+                            links.borrow_mut().pop_front();
+                            cx.update(|cx| { cx.refresh_windows(); cx.activate(true); });
+                        }
+                    }
+                }
+            }).detach();
             #[cfg(feature = "gui-shot")]
             shot::shot(window, cx);
             #[cfg(feature = "gui-shot")]

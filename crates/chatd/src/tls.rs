@@ -14,7 +14,15 @@ const PROVIDER: TlsProvider = TlsProvider::NativeTls;
 #[cfg(target_os = "android")]
 const PROVIDER: TlsProvider = TlsProvider::Rustls;
 
-/// The `ureq` TLS settings for a request.
+/// The `ureq` TLS settings for a request. On desktop the roots are the system's own (native-tls
+/// loads them), so a Windows machine that trusts a root Mozilla's list lacks still connects.
+#[cfg(not(target_os = "android"))]
+pub fn config() -> TlsConfig {
+    TlsConfig::builder().provider(PROVIDER).root_certs(ureq::tls::RootCerts::PlatformVerifier).build()
+}
+
+/// The `ureq` TLS settings for a request: rustls and its bundled WebPKI roots.
+#[cfg(target_os = "android")]
 pub fn config() -> TlsConfig {
     TlsConfig::builder().provider(PROVIDER).build()
 }

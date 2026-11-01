@@ -32,6 +32,9 @@
 //!   with replies, and people who are Busy, presenting or out of office.
 //! - Signal (connected): a linked device's flat chat list: direct chats and two groups, with
 //!   replies, a mention, reactions and an edited message, and no presence and no calls.
+//! - Tiny server (connected): "Night Shift", with an icon, roles in colour, categories of
+//!   voice channels and people seated in calls in every state (`tiny`). The server answers its
+//!   Tiny requests from the demo, since there is no HTTP server behind it.
 //! - Across them (`polish`): Discord server folders and friends in voice, playing and
 //!   listening; a message request; app DMs on Discord and Slack; a Slack section that shows
 //!   unread only and channels quiet for 30 days; titles, time zones and tags; what each
@@ -70,6 +73,7 @@ mod signal;
 mod slack;
 mod teams;
 mod telegram;
+mod tiny;
 
 use crate::adapters::Adapter;
 use crate::hub::Hub;
@@ -96,7 +100,7 @@ fn me_of(account: &AccountKey) -> &'static str {
         Network::Discord => discord::ME,
         Network::Signal => signal::ME,
         Network::Messages => "messages-me",
-        Network::Tiny => "tiny-me",
+        Network::Tiny => tiny::ME,
     }
 }
 
@@ -130,7 +134,7 @@ pub fn requested(args: impl Iterator<Item = String>) -> Option<Mode> {
                 "many" => asked.many = true,
                 "attention" => asked.attention = true,
                 "reconnecting" => asked.reconnecting = true,
-                other => eprintln!("chatd: --seed-demo: no such variant {other:?} (expired, live, many, attention, reconnecting)"),
+                other => tracing::warn!("chatd: --seed-demo: no such variant {other:?} (expired, live, many, attention, reconnecting)"),
             }
         }
     }
@@ -507,7 +511,7 @@ pub fn seed(store: &mut Store, dir: &Path, mode: Mode) -> Fallible<()> {
         occupants: Vec::new(),
     };
     // Whatever an earlier run seeded goes first, files included, so ids never collide.
-    for account in [discord::account(), slack::harbor(), slack::fernhill(), telegram::account(), teams::account(), signal::account()] {
+    for account in [discord::account(), slack::harbor(), slack::fernhill(), telegram::account(), teams::account(), signal::account(), tiny::account()] {
         seeder.store.forget(&account)?;
         let _ = std::fs::remove_dir_all(crate::blobs::dir_under(&media, &account));
     }
@@ -520,6 +524,7 @@ pub fn seed(store: &mut Store, dir: &Path, mode: Mode) -> Fallible<()> {
     polish::seed(&mut seeder, &discord)?;
     // Last, so every id the others drew is what it was before Signal was in the demo.
     me.push((signal::account(), signal::seed(&mut seeder)?));
+    me.push((tiny::account(), tiny::seed(&mut seeder)?));
 
     let fernhill = match (mode.expired, mode.reconnecting) {
         (true, _) => (Link::Expired, "Slack ended this session. Sign in again to send and receive."),
@@ -535,6 +540,7 @@ pub fn seed(store: &mut Store, dir: &Path, mode: Mode) -> Fallible<()> {
             (telegram::account(), Link::Connected, ""),
             (teams::account(), Link::Connected, ""),
             (signal::account(), Link::Connected, ""),
+            (tiny::account(), Link::Connected, ""),
         ],
         me,
         presence: seeder.presence,
@@ -545,6 +551,11 @@ pub fn seed(store: &mut Store, dir: &Path, mode: Mode) -> Fallible<()> {
         live: live::Plan::new(&discord, media, origin),
     });
     Ok(())
+}
+
+/// The demo's answer to a Tiny request for its own server, which has no HTTP behind it.
+pub fn tiny_answer(hub: &Hub, request: &protocol::Request) -> Option<protocol::Response> {
+    tiny::answer(hub, request)
 }
 
 /// True when a demo was seeded in this process and has not been attached yet, which is when
@@ -570,7 +581,7 @@ pub fn attach(hub: &Arc<Hub>) -> Vec<(AccountKey, Adapter)> {
         if let (Link::Connected, Some(me)) = (link, me) {
             match adapter::start(account.clone(), hub.clone(), me) {
                 Ok(adapter) => adapters.push((account.clone(), adapter)),
-                Err(err) => eprintln!("chatd: demo: {err}"),
+                Err(err) => tracing::warn!("chatd: demo: {err}"),
             }
         }
     }
@@ -626,7 +637,7 @@ pub fn attach(hub: &Arc<Hub>) -> Vec<(AccountKey, Adapter)> {
         }
     });
     if let Err(err) = spawned {
-        eprintln!("chatd: demo: {err}");
+        tracing::warn!("chatd: demo: {err}");
     }
     adapters
 }

@@ -253,13 +253,7 @@ fn a_join_is_drawn_as_a_call_only_once_the_voice_server_admits_us_and_a_refusal_
     assert_eq!(mediads(), 1);
     // Muted before the network has answered: it must survive the join.
     assert!(hub.calls.set_audio(&hub, true, false).is_ok());
-    let alice = Participant {
-        id: "222".into(),
-        name: "Alice".into(),
-        speaking: false,
-        muted: false,
-        deafened: false,
-    };
+    let alice = Participant { id: "222".into(), name: "Alice".into(), ..Participant::default() };
     hub.calls.set_participants(&hub, &lounge(), vec![alice]);
 
     // The adapter has both gateway events and hands the session over.
@@ -427,13 +421,7 @@ fn a_second_voice_session_for_a_call_that_is_up_moves_the_call_and_keeps_it() {
     let (hub, dir) = hub();
     let (old, new) = (Voice::new(), Voice::new());
     assert!(hub.calls.start(&hub, lounge()).is_ok());
-    let alice = Participant {
-        id: "222".into(),
-        name: "Alice".into(),
-        speaking: false,
-        muted: false,
-        deafened: false,
-    };
+    let alice = Participant { id: "222".into(), name: "Alice".into(), ..Participant::default() };
     hub.calls.set_participants(&hub, &lounge(), vec![alice]);
     hub.calls.join(&hub, &lounge(), old.join());
     let (mut first, _) = old.identified();
@@ -565,7 +553,7 @@ fn a_ring_we_placed_is_not_a_call_until_the_other_side_answers_whatever_our_medi
 fn the_microphone_test_outside_a_call_meters_ten_times_a_second_and_its_mediad_leaves_when_it_stops() {
     let _turn = alone();
     let (hub, dir) = hub();
-    assert!(hub.calls.test_microphone(&hub, true).is_ok());
+    assert!(hub.calls.test_microphone(&hub, true, false).is_ok());
     assert_eq!(mediads(), 1, "one mediad, for the test");
     // Counted from here: looking for mediad can take a second on Windows, and the levels told
     // meanwhile would make five seem to come at once.
@@ -586,7 +574,7 @@ fn the_microphone_test_outside_a_call_meters_ten_times_a_second_and_its_mediad_l
     assert!(began.elapsed() >= Duration::from_millis(350), "{:?} for five", began.elapsed());
 
     let stopped = Instant::now();
-    assert!(hub.calls.test_microphone(&hub, false).is_ok());
+    assert!(hub.calls.test_microphone(&hub, false, false).is_ok());
     until("the test mediad to exit", || mediads() == 0);
     assert!(stopped.elapsed() < Duration::from_secs(3), "gone {:?} after the test ended", stopped.elapsed());
     let (_, _, changes) = hub.wait(since, Duration::from_millis(10));
@@ -621,14 +609,14 @@ fn a_call_starts_muted_when_the_user_joins_muted_and_a_test_gives_way_to_it() {
     let _turn = alone();
     let (hub, dir) = hub();
     hub.set_setting("", protocol::settings::JOIN_MUTED, Some("on".into())).unwrap();
-    assert!(hub.calls.test_microphone(&hub, true).is_ok());
+    assert!(hub.calls.test_microphone(&hub, true, false).is_ok());
     assert_eq!(mediads(), 1);
     assert!(hub.calls.start(&hub, lounge()).is_ok());
     // The test's mediad went; the call's is the one left.
     until("one mediad", || mediads() == 1);
     assert!(hub.calls.describe().0.unwrap().muted, "joined muted");
     // In a call the microphone test is the call's own meter.
-    assert!(hub.calls.test_microphone(&hub, true).is_ok());
+    assert!(hub.calls.test_microphone(&hub, true, false).is_ok());
     assert_eq!(mediads(), 1);
     assert!(hub.calls.end(&hub).is_some());
     until("no mediad", || mediads() == 0);

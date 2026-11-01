@@ -23,7 +23,7 @@ use gpui::{
     canvas, div, prelude::*, px, Animation, AnimationExt, AnyElement, ClipboardItem, Context, Div, ElementId,
     Hsla, MouseButton, ObjectFit, SharedString, Stateful, Window,
 };
-use protocol::{Attachment, Card, Forwarded, Key, MediaFile, MentionKind, Message, MessageKind, Preview, SendState};
+use protocol::{Attachment, Card, Forwarded, Key, MediaFile, MentionKind, Message, MessageKind, Preview, Receipt, SendState};
 use std::process::{Command, Stdio};
 use std::rc::Rc;
 use std::time::Duration;
@@ -66,7 +66,7 @@ fn named(path: &str, name: &str) -> std::path::PathBuf {
     match made {
         Ok(()) => target,
         Err(err) => {
-            eprintln!("tinyclient: could not name {name} for opening: {err}");
+            tracing::warn!("tinyclient: could not name {name} for opening: {err}");
             std::path::PathBuf::from(path)
         }
     }
@@ -183,7 +183,11 @@ fn new_line(metrics: Metrics) -> Div {
 }
 
 fn replies_line(count: u32, metrics: Metrics) -> Div {
-    let words = if count == 1 { "1 reply".to_owned() } else { format!("{count} replies") };
+    let words = match count {
+        0 => "No replies yet".to_owned(),
+        1 => "1 reply".to_owned(),
+        count => format!("{count} replies"),
+    };
     div()
         .h(px(32.))
         .px(px(metrics.inset))
@@ -553,13 +557,17 @@ impl Pane {
             sent = sent.opacity(0.55);
         }
         // Mine reads as everyone's does, as on the desktop: left, face in the gutter, "You".
+        // My newest message's mark goes after its time, or at the row's right edge on its first
+        // line when it is grouped under an earlier one and has no header.
+        let receipt = self.receipt_on(message);
+        let (in_header, at_edge) = if head { (receipt, None) } else { (None, receipt) };
         let column = div()
             .flex_1()
             .min_w_0()
             .flex()
             .flex_col()
             .children(head.then(|| {
-                let header = self.header(message);
+                let header = self.header(message, in_header);
                 self.author_tap(header, "author-name", message, cx)
             }))
             .child(sent)
@@ -608,6 +616,9 @@ impl Pane {
                     .children(gutter)
                     .child(column),
             )
+            .children(at_edge.map(|receipt| {
+                div().absolute().top(px(1.)).right(px(metrics.inset)).h(px(20.)).flex().items_center().child(receipt_mark(&message.id, receipt))
+            }))
             // On a phone the actions come up on a long press that holds still (`press_message`),
             // not on a hover a finger never makes. A press that moves past the slop is a scroll.
             .when(metrics == Metrics::PHONE, |row| {
@@ -687,8 +698,15 @@ impl Pane {
         div().pt(px(2.)).flex_none().when(message.deleted, |avatar| avatar.opacity(0.4)).child(face)
     }
 
+    /// The mark this message carries: only my newest, once the network has it, and only while
+    /// it is the newest here, as the conversation's row says of it. A thread's replies carry none.
+    fn receipt_on(&self, message: &Message) -> Option<Receipt> {
+        let receipt = self.open.as_ref()?.receipt.filter(|_| !self.is_thread());
+        receipt_for(message, &self.window, receipt)
+    }
+
     /// The head line: who, when, and the marks a message carries.
-    fn header(&self, message: &Message) -> Div {
+    fn header(&self, message: &Message, receipt: Option<Receipt>) -> Div {
         let name = if message.outgoing { "You".to_owned() } else { message.sender.name.clone() };
         let phone = self.metrics == Metrics::PHONE;
         let tag = |words: &'static str| {
@@ -735,6 +753,7 @@ impl Pane {
                             .text_color(theme::text_faint())
                             .child(time::clock(message.sent)),
                     )
+                    .children(receipt.map(|receipt| receipt_mark(&message.id, receipt)))
                     .children(silent_mark(message)),
             )
             .children(message.sender.bot.then(|| tag("APP")))
@@ -1889,6 +1908,31 @@ fn uploading_words(sizes: &[u64], sent: u64, total: u64) -> String {
     format!("Uploading {} of {} · {amount}", at.map_or(sizes.len(), |at| at + 1), sizes.len())
 }
 
+/// The row's receipt, if this message is my newest and the newest of all, sent and not gone.
+fn receipt_for(message: &Message, window: &super::pages::Window, receipt: Option<Receipt>) -> Option<Receipt> {
+    let newest = window.messages.last().filter(|_| !window.newer)?;
+    let mine = message.outgoing && message.state == SendState::Sent && !message.deleted && newest.id == message.id;
+    receipt.filter(|receipt| mine && *receipt != Receipt::Sending)
+}
+
+/// The 12 px glyph on my newest message (`design/06-live-signals.md` §4): one check once sent,
+/// on every network; two once the other side's device has it; two in `accent` once read.
+fn receipt_mark(id: &str, receipt: Receipt) -> AnyElement {
+    let (icon, color, words) = match receipt {
+        Receipt::Read => ("icons/check-check.svg", theme::accent(), "Read"),
+        Receipt::Delivered => ("icons/check-check.svg", theme::text_faint(), "Delivered"),
+        Receipt::Sent | Receipt::Sending => ("icons/check.svg", theme::text_faint(), "Sent"),
+    };
+    div()
+        .id(name_id("receipt", id))
+        .flex_none()
+        .flex()
+        .items_center()
+        .tooltip(tip(words, None))
+        .child(glyph(icon, 12., color))
+        .into_any_element()
+}
+
 /// The bell-off after a message's time when it went without notification.
 fn silent_mark(message: &Message) -> Option<AnyElement> {
     let client_id = message.client_id.as_deref()?;
@@ -1994,6 +2038,25 @@ mod tests {
 
     fn face(message: &Message, messages: &[Rc<Message>], account: Option<&str>) -> Option<String> {
         own_face(message, None, messages, "me", || account.map(picture)).map(|file| file.id)
+    }
+
+    #[test]
+    fn only_my_newest_message_carries_the_mark_and_only_once_sent() {
+        let theirs = Rc::new(Message::plain("3", "mara", "hi", 30, false));
+        let window = |messages: Vec<Rc<Message>>, newer| super::super::pages::Window { messages, older: false, newer };
+        let all = window(vec![mine("1", None), mine("2", None)], false);
+        assert_eq!(receipt_for(&all.messages[1], &all, Some(Receipt::Read)), Some(Receipt::Read));
+        // Older ones are implied; the conversation says nothing of them.
+        assert_eq!(receipt_for(&all.messages[0], &all, Some(Receipt::Read)), None);
+        // Someone spoke after me, or newer messages are not loaded: nothing to mark here.
+        let answered = window(vec![mine("1", None), theirs.clone()], false);
+        assert_eq!(receipt_for(&answered.messages[0], &answered, Some(Receipt::Sent)), None);
+        let partial = window(vec![mine("1", None)], true);
+        assert_eq!(receipt_for(&partial.messages[0], &partial, Some(Receipt::Sent)), None);
+        // One still going says "Sending…" instead.
+        let going = window(vec![Rc::new(sending())], false);
+        assert_eq!(receipt_for(&going.messages[0], &going, Some(Receipt::Sent)), None);
+        assert_eq!(receipt_for(&all.messages[1], &all, Some(Receipt::Sending)), None);
     }
 
     #[test]

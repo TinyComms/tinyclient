@@ -125,7 +125,7 @@ impl Discord {
             let _ = reply.send(discord.profile(&person, space.as_deref()));
         };
         if let Err(err) = std::thread::Builder::new().name("discord-profile".into()).spawn(run) {
-            eprintln!("chatd: Discord: no thread for a profile: {err}");
+            tracing::warn!("chatd: Discord: no thread for a profile: {err}");
         }
     }
 
@@ -358,7 +358,7 @@ impl Discord {
             let _ = reply.send(searching.search_messages(&query, &scope, at));
         };
         if let Err(err) = std::thread::Builder::new().name("discord-search".into()).spawn(run) {
-            eprintln!("chatd: Discord: no thread for a search: {err}");
+            tracing::warn!("chatd: Discord: no thread for a search: {err}");
         }
     }
 

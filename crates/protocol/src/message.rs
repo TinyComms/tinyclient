@@ -56,8 +56,10 @@ pub struct MediaFile {
     /// Where the file is, once it is on disk. `None`: ask `Fetch` when it is on screen.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
-    /// Why the file could not be fetched, in plain words. While this is set chatd does not try
-    /// again and the shell should stop asking; `Fetch` with `retry` clears it.
+    /// Why the file could not be fetched, in plain words. A failure of the file itself stands:
+    /// chatd does not try again until `Fetch` with `retry` clears it. A failure of the line
+    /// (no connection, a timeout) is not kept, and chatd fetches the file again when the shell
+    /// asks after a while, so the shell asks again now and then rather than stopping for good.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failed: Option<String>,
 }

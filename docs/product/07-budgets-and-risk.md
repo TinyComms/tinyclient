@@ -1,8 +1,10 @@
 # 07. Budgets and account risk
 
-A feature is done when it passes its budget, measured from outside the process. Baseline on
-2026-10-13: `chatd` 10 MB RSS signed in to Discord, shell 64 MB RSS (77 MB earlier), no `mediad`.
-The apps being replaced idle at about 2.4 GB. **Whole product, idle, four networks: 150 MB.**
+A feature is done when it passes its budget, measured from outside the process. The 2026-10-13
+baseline was not re-measured on 0.2.35: `chatd` 10 MB RSS signed in to Discord, shell 64 MB RSS
+(77 MB earlier), no `mediad`. Those two figures are that day's baseline, not the current build.
+The apps being replaced idle at about 2.4 GB. **Whole product, idle, every signed-in network:
+150 MB.** That number is the gate, not a measurement of 0.2.35.
 
 Items marked *(unverified)* come from community sources or are estimates not yet measured here.
 
@@ -14,11 +16,11 @@ GPU textures and IOSurfaces that RSS misses. Read 60 s after the state is reache
 
 | Process and state | Budget | What it pays for |
 | --- | --- | --- |
-| chatd, idle, Discord + Slack + Teams | 20 MB RSS | 10 MB today; 3 TLS sockets, SQLite's 2 MB page cache |
-| chatd, idle, four networks | 70 MB RSS | the above plus TDLib, 30 to 50 MB *(unverified, must be measured before Telegram is designed in)* |
+| chatd, idle, Discord + Slack + Teams | 20 MB RSS | 10 MB on 2026-10-13; 3 TLS sockets, SQLite's 2 MB page cache |
+| chatd, idle, with Telegram | the chatd row above | grammers stays inside chatd. A comment in `telegram.rs` records about +0.2 MB footprint and +1.2 MB RSS over an empty process after the key exchange. Those figures are the comment's, not a 0.2.35 measurement. The old TDLib 30–50 MB row does not apply. |
 | chatd, 100 Discord servers + 5 Slack workspaces, settled | +10 MB over idle | see the per-item costs below; everything else lives in SQLite |
 | chatd, same account, peak while connecting | 64 MB `footprint` peak | READY is several MB of JSON *(unverified size)* and is held once as text while parsed |
-| shell, list visible, no conversation | 80 MB footprint | 64 MB today is GPUI, Metal, fonts; 16 MB of room for avatars and the friends list |
+| shell, list visible, no conversation | 80 MB footprint | 64 MB on 2026-10-13 is GPUI, Metal, fonts; 16 MB of room for avatars and the friends list |
 | shell, conversation full of images | 125 MB footprint | 80 + 32 MB decoded image cap + 6 MB avatar cap + text |
 | shell, after scrolling 5,000 messages | 125 MB, back to it within 10 s of stopping | the message window and both caches are capped, so history length costs nothing |
 | shell, one image opened full size | +35 MB, released on close | one 2880 x 1800 px decode is 21 MB; the 4K original (33 MB) is never decoded whole |
@@ -61,9 +63,9 @@ Per-item costs behind the heavy-account row (decoded pixels are 4 bytes each, at
 | Discord READY | Keep parsing into a struct that names only used fields. Add fields per feature; never keep the raw payload or a `Value` tree. Budget the peak. | A `Value` tree is 3 to 5 times the JSON size. |
 | Slack boot | Keep `client.counts` as the only listing call. Page channel lists on demand when the browser is opened. No `client.userBoot`, no `users.list`. | Boot payloads are MBs on large workspaces *(unverified size)*. |
 | Emoji | Unicode emoji come from the system font. Custom emoji are fetched when first drawn, at 48 px, into the avatar-style cache. The picker loads one server's set at a time. | A bundled emoji set is 10+ MB on disk and in memory. |
-| Search | Search asks the network. Local search is SQLite FTS5 over cached messages only if the owner wants it (question 3). | An FTS index adds roughly 30 to 50% to the message table. |
-| SQLite growth | Keep the newest 2,000 messages per conversation and nothing older than 90 days unless the conversation was opened in that time. Prune at start and daily. | At about 300 B a row, 1,000 conversations x 2,000 = 600 MB without the age rule; with it, under 200 MB. |
-| TDLib | Give it its own row above and measure first. If it exceeds 50 MB, run it as its own process that starts only when Telegram is signed in. | It is the single largest cost in chatd and has its own database. |
+| Search | Search on Enter asks the network (`SearchNetwork`). Local search is `SearchMessages` over the cache. There is no FTS index. | An FTS index would add roughly 30 to 50% to the message table. It is not in this commit. |
+| SQLite growth | Keep the newest 2,000 messages per conversation and nothing older than 90 days unless the conversation was opened in that time (`KEEP_MESSAGES`, `KEEP_DAYS`). Settings › Privacy can shorten the age. Prune at start and daily. | At about 300 B a row, 1,000 conversations x 2,000 = 600 MB without the age rule; with it, under 200 MB. |
+| grammers | Runs on the adapter's thread inside chatd, and only while a Telegram account exists or a sign-in has started. It does not keep a second database. If a later measurement blows the chatd budget, that is a new decision. It is not the current design. | The TDLib 30–50 MB row does not apply. The +0.2 MB / +1.2 MB figures are the comment in `telegram.rs`. |
 | Message window | The shell holds at most 300 messages; older ones page in 50 at a time from chatd and fall off the other end. | 5,000 shaped messages would otherwise cost tens of MB. |
 
 ## 3. Speed budgets
@@ -88,12 +90,12 @@ Measure with `top -l 5 -stats pid,command,cpu,idlew,power -pid PID` over 60 s wi
 
 | Process | Budget | Today |
 | --- | --- | --- |
-| chatd, four networks | 0.0% CPU, 1 wakeup/s or fewer | about 1.2 per adapter: `serve_commands` polls every 1 s, `Socket::read` every 5 s |
+| chatd, signed-in networks | 0.0% CPU, 1 wakeup/s or fewer | about 1.2 per adapter on 2026-10-13: `serve_commands` polls every 1 s, `Socket::read` every 5 s |
 | shell, window visible, nothing changing | 0 frames drawn, 2 wakeups/s or fewer | blocks in `wait` for 30 s, which is right |
 | shell, window hidden or occluded | 0 wakeups besides `wait` | |
 
 - Block until there is work; wake only for the network's heartbeat (Discord about 41 s, Slack
-  30 s). Reason: a 1 s poll in four adapters is 345,000 wakeups a day for nothing.
+  30 s). Reason: a 1 s poll in each adapter is a day's worth of wakeups for nothing.
 - No polling request to any network. Sockets push. Reason: energy, and rate limits.
 - Draw a frame only when state changed. The caret, typing dots and GIFs stop when the window is
   not key; relative times update on the minute. Reason: one animation holds the GPU awake.
@@ -114,23 +116,23 @@ What is known:
   or leaving servers, frequent reconnects, starting new DMs, managing friends, editing the profile.
   Ripcord users reported more false positives from 2021 *(anecdotal)*. Dissent and discordo are
   believed to imitate too *(unverified)*.
-- **tinyclient on Discord today is honest and anomalous:** User-Agent `tinyclient/x`, IDENTIFY browser
-  `tinyclient`, API v10, no super properties, no gateway RESUME (every drop is a fresh IDENTIFY), and
-  up to 20 history fetches at a fixed 600 ms after each connect.
 - **Slack** documents four tiers (1, 20, 50, 100 calls per minute per method), one message per
   second per channel, and 429 with `Retry-After`. Enterprise audit logs raise anomaly events
   including `unexpected_client`, `unexpected_user_agent`, `session_fingerprint` (stale cookie),
   `unexpected_scraping`, `unexpected_api_call_volume` and `excessive_downloads`, and admins can
   reset a user's sessions. Whether an anomaly signs the user out is an org setting *(unverified)*.
-- **tinyclient on Slack today changes User-Agent mid-session:** the sign-in helper presents Safari,
-  then chatd uses the same token as `tinyclient/x`. That is what `unexpected_user_agent` describes.
 
-Honest identification (`tinyclient` everywhere) deceives nobody and matches the README, but gives
-every user one fingerprint a single server rule can flag, without the fields Discord's system
-weighs. Imitative identification (the web client's User-Agent, properties, build number, API
-version, endpoint set) is what surviving Discord clients do; it is deliberate impersonation, a
-stale build number becomes a signal itself, and on a work Slack it hides the client from the
-employer's security team. A mix is worst: an inconsistent fingerprint is more suspicious than either.
+## Identity (decided)
+
+Discord and Slack use one browser identity for the whole session, from `protocol::browser`: installed Safari on macOS, installed WebView2's Chrome version on Windows, an estimated Chrome version on Linux. chatd does not switch to `tinyclient/x` after sign-in.
+
+Discord is the web client on API v9: `X-Super-Properties`, gateway identify properties, `client_build_number` (live from the login page when it answers, otherwise a remembered build), and gateway resume. A dropped socket is not a fresh identify when the session can resume.
+
+At connect, at most 5 unread direct conversations are fetched ahead, once per run, not again on resume.
+
+The rules below still hold: nothing on a timer, no bulk friend or join automation, no whole-server member crawl, history for an opened conversation, one retry on 429, stop on a captcha. Risk stays in the README. The client shows state, not a warning banner.
+
+A mix of identities is still the worst fingerprint. The session does not mix. Imitation is the choice this client ships, on purpose.
 
 Rules:
 
@@ -159,36 +161,29 @@ Rules:
 
 ## 6. Disk and privacy
 
-- Everything is under `~/Library/Application Support/tinyclient/`: `chat.sqlite` and
-  `media/<network>/` (avatars, thumbnails, custom emoji) as files named by content hash. Sessions
-  stay in the keychain. Nothing goes to temp directories; logs hold no message bodies or tokens.
-- Caps: media 500 MB, least recently used evicted; database by the retention rule in section 2.
-  Under 1 GB in total, checked with `du -sk`.
+| OS | Support directory |
+| --- | --- |
+| macOS | `~/Library/Application Support/tinyclient` |
+| Windows | `%APPDATA%\tinyclient` |
+| Linux | `$XDG_DATA_HOME/tinyclient` or `~/.local/share/tinyclient` |
+
+`TINYCLIENT_DIR` replaces it for tests. `chat.sqlite` and `media/<network>/` (avatars, thumbnails, custom emoji) live there, files named by content hash. Sessions stay in the keychain or the system keyring, one item per network. Slack workspaces and Tiny servers share that one item and are split by the adapter. Nothing goes to temp directories; logs hold no message bodies or tokens.
+
+- Caps: media 500 MB (`CACHE_BYTES`), least recently used evicted; messages default to 2,000 per conversation and 90 days (`KEEP_MESSAGES`, `KEEP_DAYS`), unless the conversation was opened in that window. Settings › Privacy can shorten the age. Under 1 GB in total, checked with `du -sk`.
 - Full-size images and files are fetched when opened and saved only where the user chooses.
-- Sign-out deletes that network's rows (true today), its `media/` directory and its session, then
-  vacuums so the bytes leave the file. e2e check: no row and no file for that network remains.
-- The cache is unencrypted and relies on FileVault. The README already says so.
+- Sign-out deletes that network's rows, its `media/` directory and its session, then vacuums so the bytes leave the file. e2e check: no row and no file for that network remains.
+- The cache is unencrypted and relies on the disk's own encryption. The README already says so.
 
-## Open questions for the owner
+## Multiple accounts
 
-1. **Discord identity: honest or imitative?** Imitation is safer for the account; honesty is easier
-   to stand behind in a public release. Decide before avatars and presence ship, and never mix.
-2. **Slack identity.** Should chatd present the helper's Safari string (consistent, but hidden from
-   a work admin), or should both say `tinyclient`? Google and Okta sign-in may refuse the second.
-3. **Local search.** Is the network's own search enough, or is an offline index worth the disk?
-4. **Five Slack workspaces** conflicts with "multiple accounts per network" being cut in
-   `stories.md`. Which stands?
-5. **TDLib.** If it measures above 50 MB, is a separate Telegram process acceptable?
+Slack workspaces and Tiny servers are multiple accounts. They are not cut. A second Discord or Telegram login is not a separate keychain account in this commit.
+
+## Telegram weight
+
+grammers runs on the adapter's thread inside chatd, and only while a Telegram account exists or a sign-in has started. It does not keep a second database. The TDLib 30–50 MB row does not apply. If a later measurement blows the chatd budget, that is a new decision. It is not the current design.
 
 Sources: Discord Userdoccers ([reference](https://docs.discord.food/reference), [rate limits](https://docs.discord.food/topics/rate-limits), [gateway](https://docs.discord.food/topics/gateway)), [Abaddon README](https://github.com/uowuo/abaddon), Slack ([rate limits](https://docs.slack.dev/apis/web-api/rate-limits), [anomaly events](https://docs.slack.dev/reference/audit-logs-api/anomalous-events-reference)).
 
-## Open overruns
+## Historical overruns
 
-Each waits on the owner: signed off here with a date, or won back before it merges.
-
-| Branch | What | Budget | Measured | Sign-off |
-|---|---|---|---|---|
-| `settings` | shell binary, stripped | +400 KB | +590,032 B | none yet |
-| `settings` | mediad binary, stripped | +20 KB | +118,592 B | none yet |
-
-Where the bytes go and what would cut them: `09-settings.md`, "Measured after the review fixes".
+The `settings` branch, before that work merged, measured a stripped shell at +590,032 B against a +400 KB budget and a stripped mediad at +118,592 B against +20 KB. Those rows are not a gate on main. The bytes are described as history in `09-settings.md`. Re-measure only if this file grows a new gate. The 2026-10-13 chatd 10 MB and shell 64 MB lines above are that day's baseline.

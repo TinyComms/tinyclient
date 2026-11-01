@@ -22,10 +22,16 @@
 //!   capped by kind, from the headers and again while it arrives.
 //! - [`CACHE_BYTES`] on disk in all; least recently used goes first (`Store::media_on_disk`),
 //!   except what was asked for in the last minute.
-//! - A fetch that fails is recorded with its reason (`Store::media_failed`) and announced once.
-//!   The file is not fetched again until `Fetch` says `retry` or the adapter registers a fresh
-//!   address, however often the shell asks: an expired address must not become a request to
-//!   the network on every frame.
+//! - A fetch that fails because of the file (gone, refused, the wrong kind, too large) is
+//!   recorded with its reason (`Store::media_failed`) and announced once. The file is not
+//!   fetched again until `Fetch` says `retry` or the adapter registers a fresh address, however
+//!   often the shell asks: an expired address must not become a request to the network on
+//!   every frame.
+//! - A fetch that fails because of the line (`fetch::passing`: no connection, a certificate
+//!   that could not be checked, a timeout, a 5xx) is announced but not recorded. The file rests
+//!   in memory, [`RETRY_FIRST`] at first and twice as long each time after up to
+//!   [`RETRY_MOST`], and is fetched again when asked for after that, when its account connects,
+//!   and at every start. Such failures an older chatd recorded are forgotten at start.
 //! - The size the shell draws at is the store's to choose (`Store::media_sized`, before
 //!   `request`): the cache fetches whatever address the row names now, and a file whose
 //!   address changed while it was arriving is fetched again rather than kept.
@@ -84,6 +90,10 @@ const PICK: &str = "pick:";
 const PARKED_LOOK: Duration = Duration::from_secs(1);
 /// A row's picture whose row has been away this long is no longer waited for.
 const PARKED_FOR: Duration = Duration::from_secs(600);
+/// How long a file whose fetch failed for a moment's trouble rests before it is fetched again
+/// on the next ask; each failure after doubles it, up to [`RETRY_MOST`].
+const RETRY_FIRST: Duration = Duration::from_secs(15);
+const RETRY_MOST: Duration = Duration::from_secs(600);
 
 /// The id an adapter registers a picker's preview under (a sticker's or GIF's still), so it
 /// lands in the picker's own directory and goes when the picker closes. Custom emoji keep their
@@ -115,7 +125,22 @@ pub fn dir_under(media: &Path, account: &AccountKey) -> PathBuf {
 }
 
 fn fnv(text: &str) -> u64 {
-    text.bytes().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| (hash ^ byte as u64).wrapping_mul(0x0100_0000_01b3))
+    fnv_bytes(text.as_bytes())
+}
+
+/// FNV-1a of some bytes: what an adapter names a picture it fetched itself by, so a changed
+/// picture is a new id.
+pub fn fnv_bytes(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| (hash ^ *byte as u64).wrapping_mul(0x0100_0000_01b3))
+}
+
+/// JPEG, PNG, WebP or GIF, by their first bytes: a picture an adapter fetched itself is kept
+/// only if it is one.
+pub fn is_picture(bytes: &[u8]) -> bool {
+    bytes.starts_with(&[0xff, 0xd8, 0xff])
+        || bytes.starts_with(b"\x89PNG")
+        || (bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP"))
+        || bytes.starts_with(b"GIF8")
 }
 
 /// A file's name on disk: FNV-1a of its id, so any id is a safe name of one length.
@@ -187,6 +212,22 @@ struct Queue {
     picked: HashMap<AccountKey, Picker>,
     /// The highest picker generation each account's sweep has closed.
     picker_closed: HashMap<AccountKey, u64>,
+    /// Files whose last fetch failed for a moment's trouble (`fetch::passing`), which are not
+    /// fetched again until their rest is over. Never in the store, so a start forgets them.
+    resting: HashMap<FileKey, Rest>,
+}
+
+/// A file resting after a failure that was the line's, not its own.
+struct Rest {
+    until: Instant,
+    /// Failures in a row, for how long the next rest is.
+    tries: u32,
+    why: String,
+}
+
+/// How long a file rests after its `tries`th failure in a row.
+fn rest_for(tries: u32) -> Duration {
+    RETRY_FIRST.saturating_mul(1 << tries.saturating_sub(1).min(16)).min(RETRY_MOST)
 }
 
 /// A picker session: the ask that opened it, and the generation its close will end.
@@ -260,7 +301,7 @@ impl Blobs {
             let cache = cache.clone();
             let spawned = std::thread::Builder::new().name(name.into()).stack_size(256 * 1024).spawn(move || helper(&cache));
             if let Err(err) = spawned {
-                eprintln!("chatd: media: {err}");
+                tracing::warn!("chatd: media: {err}");
             }
         }
         for worker in 0..IN_FLIGHT {
@@ -277,7 +318,7 @@ impl Blobs {
                 cache.work(worker == 0);
             });
             if let Err(err) = spawned {
-                eprintln!("chatd: media: {err}");
+                tracing::warn!("chatd: media: {err}");
             }
         }
         Blobs { cache }
@@ -304,6 +345,15 @@ impl Blobs {
         self.cache.request(account, ids, adapter)
     }
 
+    /// The user asked for these again (`Fetch` with `retry`): whatever rest they were taking
+    /// after a failure of the line is over too.
+    pub fn retried(&self, account: &AccountKey, ids: &[String]) {
+        let mut queue = crate::hub::lock(&self.cache.queue);
+        for id in ids {
+            queue.resting.remove(&(account.clone(), id.clone()));
+        }
+    }
+
     /// The picker closed: its previews' files go now, and whatever of them is still waiting is
     /// not fetched.
     // CONTRACT: nothing in the protocol says the picker closed, so the server cannot call this
@@ -327,7 +377,7 @@ impl Blobs {
         let cache = self.cache.clone();
         let spawned = std::thread::Builder::new().name("media-evict".into()).stack_size(256 * 1024).spawn(move || cache.evict());
         if let Err(err) = spawned {
-            eprintln!("chatd: media: {err}");
+            tracing::warn!("chatd: media: {err}");
         }
     }
 
@@ -349,6 +399,7 @@ impl Blobs {
             queue.parked.clear();
             queue.asked.clear();
             queue.landed.clear();
+            queue.resting.clear();
         }
         if let Ok(networks) = std::fs::read_dir(&self.cache.dir) {
             for network in networks.flatten() {
@@ -373,6 +424,7 @@ impl Blobs {
             queue.picked.remove(account);
             queue.asked.retain(|(of, _), _| of != account);
             queue.landed.retain(|(of, _), _| of != account);
+            queue.resting.retain(|(of, _), _| of != account);
         }
         let _ = std::fs::remove_dir_all(self.dir_of(account));
         let _ = std::fs::remove_dir_all(pick_dir(&self.cache.dir, account));
@@ -390,7 +442,7 @@ impl Cache {
 
     /// [`Blobs::request`].
     fn request(&self, account: &AccountKey, ids: &[String], adapter: Option<Sender<Command>>) -> rusqlite::Result<Vec<MediaFile>> {
-        let files: Vec<MediaFile> = {
+        let mut files: Vec<MediaFile> = {
             let mut store = self.hub.store();
             store.media_used(account, ids, now())?;
             let mut files = Vec::with_capacity(ids.len());
@@ -412,7 +464,7 @@ impl Cache {
             let at = Instant::now();
             queue.asked.retain(|_, asked| at.duration_since(*asked) < self.on_screen);
             let epoch = queue.epochs.get(account).copied().unwrap_or(0);
-            for file in &files {
+            for file in &mut files {
                 let key = (account.clone(), file.id.clone());
                 queue.asked.insert(key.clone(), at);
                 // The picker asking for a preview is the picker being open. Its session's
@@ -430,6 +482,11 @@ impl Cache {
                 // A failure stands until `Fetch` says `retry` (the server clears it before
                 // this) or the adapter registers a fresh address.
                 if file.path.is_some() || file.failed.is_some() || queue.fetching.contains(&key) {
+                    continue;
+                }
+                // A failure of the line rests a while, and is answered with why until then.
+                if let Some(rest) = queue.resting.get(&key).filter(|rest| rest.until > at) {
+                    file.failed = Some(rest.why.clone());
                     continue;
                 }
                 // Asked for again while waiting: it goes back to the front.
@@ -588,6 +645,8 @@ impl Cache {
                 let own = seen.entry(linked.account.clone()).or_insert(Own { connected, until: Some(at + OWN_FOR) });
                 if connected && !own.connected {
                     own.until = Some(at + OWN_FOR);
+                    // What failed while the line was down is worth asking for at once.
+                    crate::hub::lock(&self.queue).resting.retain(|(of, _), _| *of != linked.account);
                 }
                 own.connected = connected;
                 if own.until.is_some_and(|until| until < at) {
@@ -617,7 +676,7 @@ impl Cache {
                     continue;
                 }
                 if let Err(err) = self.request(account, &[avatar.id], None) {
-                    eprintln!("chatd: {}: own picture: {err}", account.network.label());
+                    tracing::warn!("chatd: {}: own picture: {err}", account.network.label());
                 }
             }
         }
@@ -626,6 +685,11 @@ impl Cache {
     /// Makes the directory and the store agree, once, at start. A file no row points to is
     /// removed, parts of interrupted downloads included; a row whose file is gone loses its path.
     fn reconcile(&self) {
+        match self.hub.store().media_forgive(fetch::passing) {
+            Ok(0) => {}
+            Ok(forgiven) => tracing::warn!("chatd: media: {forgiven} files that failed for a moment's trouble will be fetched again"),
+            Err(err) => tracing::warn!("chatd: media: {err}"),
+        }
         for network in Network::ALL {
             let Ok(accounts) = std::fs::read_dir(self.dir.join(network.label().to_lowercase())) else {
                 continue;
@@ -761,11 +825,20 @@ impl Cache {
             crate::hub::lock(&self.queue).fetching.retain(|file| file != &job.file);
             match outcome {
                 Some(Ok(file)) => {
+                    crate::hub::lock(&self.queue).resting.remove(&job.file);
                     self.announce(account, file);
                     self.evict();
                 }
+                Some(Err((mut file, reason))) if fetch::passing(&reason) => {
+                    tracing::warn!("chatd: {}: media {id}: {}", account.network.label(), crate::adapters::net::redact(&reason));
+                    // Not recorded: it rests, and is fetched again when asked for after that.
+                    self.rest(&job.file, &reason);
+                    file.failed = Some(reason);
+                    self.announce(account, file);
+                }
                 Some(Err((mut file, reason))) => {
-                    eprintln!("chatd: {}: media {id}: {}", account.network.label(), crate::adapters::net::redact(&reason));
+                    tracing::warn!("chatd: {}: media {id}: {}", account.network.label(), crate::adapters::net::redact(&reason));
+                    crate::hub::lock(&self.queue).resting.remove(&job.file);
                     // Recorded, so asking again answers with the reason and fetches nothing.
                     match self.hub.store().media_failed(account, id, &reason) {
                         Ok(Some(recorded)) => file = recorded,
@@ -778,6 +851,20 @@ impl Cache {
                 None => {}
             }
         }
+    }
+
+    /// A fetch failed for a moment's trouble: the file rests, longer each time in a row.
+    fn rest(&self, file: &FileKey, why: &str) {
+        let mut queue = crate::hub::lock(&self.queue);
+        let at = Instant::now();
+        if queue.resting.len() >= REMEMBERED && !queue.resting.contains_key(file) {
+            queue.resting.retain(|_, rest| rest.until > at);
+            if queue.resting.len() >= REMEMBERED {
+                queue.resting.clear();
+            }
+        }
+        let tries = queue.resting.get(file).map_or(0, |rest| rest.tries) + 1;
+        queue.resting.insert(file.clone(), Rest { until: at + rest_for(tries), tries, why: why.to_owned() });
     }
 
     fn signed_out_since(&self, job: &Job) -> bool {
@@ -923,6 +1010,15 @@ fn stale(picked: &HashMap<AccountKey, Picker>, at: Instant, idle: Duration) -> V
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failure_of_the_line_rests_longer_each_time_up_to_a_limit() {
+        assert_eq!(rest_for(1), RETRY_FIRST);
+        assert_eq!(rest_for(2), RETRY_FIRST * 2);
+        assert_eq!(rest_for(3), RETRY_FIRST * 4);
+        assert_eq!(rest_for(10), RETRY_MOST);
+        assert_eq!(rest_for(u32::MAX), RETRY_MOST);
+    }
 
     #[test]
     fn a_close_ends_one_picker_generation_and_an_ask_opens_the_next() {

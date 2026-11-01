@@ -87,8 +87,8 @@ impl Files {
     }
 
     /// `/bytes/N` is N bytes with a length; `/slow/N` the same after 600 ms; `/cdn/...` a small
-    /// picture; `/chunked/N` is N bytes without one; `/page` is a sign-in page; anything else is
-    /// not there.
+    /// picture; `/chunked/N` is N bytes without one; `/page` is a sign-in page; `/busy/...` is a
+    /// host that is down for now (503); anything else is not there.
     fn answer(stream: TcpStream, log: &Mutex<Vec<String>>) -> std::io::Result<()> {
         let mut reader = BufReader::new(stream);
         let mut request = String::new();
@@ -138,6 +138,7 @@ impl Files {
                 let page = "<html>Sign in</html>";
                 write!(stream, "{head} text/html\r\nContent-Length: {}\r\n\r\n{page}", page.len())
             }
+            "busy" => stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"),
             _ => stream.write_all(b"HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"),
         }
     }
@@ -316,6 +317,41 @@ fn a_file_is_answered_without_a_path_then_lands_with_the_bytes_served_and_is_fet
     assert_eq!(again[0].path.as_deref(), path.to_str());
     sleep(Duration::from_millis(300));
     assert_eq!(files.hits(), 1);
+}
+
+#[test]
+fn a_failure_of_the_line_is_not_kept_and_one_an_older_chatd_kept_is_forgotten_at_start() {
+    let files = Files::start();
+    let registered = [
+        (file("busy", MediaKind::Avatar), files.url("/busy/1")),
+        (file("old", MediaKind::Avatar), files.url("/bytes/300")),
+        (file("gone", MediaKind::Avatar), files.url("/gone")),
+    ];
+    let dir = Daemon::scratch_with(&registered, |store| {
+        // What a chatd that could not check certificates recorded, and a file that is gone.
+        store.media_failed(&account(), "old", "The download failed: tls: invalid peer certificate: UnknownIssuer.").unwrap();
+        store.media_failed(&account(), "gone", "The file is no longer there (404).").unwrap();
+    });
+    let chatd = Daemon::start_in(dir, &[]);
+    until("the old failure to be forgotten and the file fetched", || chatd.fetch(&["old"])[0].path.is_some());
+    // A failure of the file itself stands, and nothing is asked of the host for it.
+    let hits = files.hits();
+    assert_eq!(chatd.fetch(&["gone"])[0].failed.as_deref(), Some("The file is no longer there (404)."));
+
+    // A host that is down for now: the shell is told, and the file rests rather than being
+    // asked for again at once.
+    let busy = chatd.fetched("busy");
+    assert_eq!((busy.path, busy.failed.as_deref()), (None, Some("The server answered 503.")));
+    assert!(chatd.fetch(&["busy"])[0].failed.is_some());
+    sleep(Duration::from_millis(300));
+    assert_eq!(files.hits(), hits + 1);
+
+    // It was not recorded: the next start fetches it again. `retry` would have too.
+    let dir = chatd.stop();
+    assert_eq!(Store::open(&dir.join("chat.sqlite")).unwrap().media(&account(), &["busy".to_owned()]).unwrap()[0].0.failed, None);
+    let chatd = Daemon::start_in(dir, &[]);
+    assert!(chatd.fetched("busy").failed.is_some());
+    assert_eq!(files.hits(), hits + 2);
 }
 
 #[test]

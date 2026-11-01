@@ -8,17 +8,24 @@ How the processes fit together and who may edit what. The contract itself is the
 | Process | Does | Never |
 |---|---|---|
 | `chatd` | Always on, one per support directory (`chatd.lock`). Answers its socket first, then reads the sessions behind it. Holds the sessions, the network sockets, SQLite and the media cache. Call signalling. | Decode media, link a codec or audio code, hold a tree, a member list or history in memory, fetch a link from a message, send anything the user did not ask for. |
-| `mediad` | Exists from "connecting" to the end of one call. Voice gateway, UDP, Opus, DAVE, audio devices. `mediad --play` is its other mode: one voice message or audio file, from play until it ends or is paused (below). | Run with no call or nothing playing, touch SQLite, the keychain or the chat socket, open the microphone to play a file. It speaks only to chatd over stdin and stdout. |
-| `tinyclient` | The window. Draws what chatd reports; decodes images for rows on screen. Starts chatd when nothing answers (`protocol::launch`). Hands a video to the system's player. | Talk to a network, read the database or keychain, run a socket call, file read or decode on the main thread, run `mediad` itself, link an audio or video codec. |
+| `mediad` | One call, from "connecting" until it ends: Discord's voice gateway, UDP, Opus and DAVE, or a Tiny call's WebRTC (str0m) with Opus and H.264. Echo cancellation, noise suppression and automatic gain when the three voice switches are on (they default on). Also `mediad --play` (one voice message or audio file), `--sound` (one notification), `test` (microphone test, no call), and `--devices` (list devices and exit). Control frames are stdin and stdout. | Touch SQLite, the keychain or the chat socket. Open the microphone to play a file. |
+| `tinyclient` | The window. Draws what chatd reports, including a Tiny call's pictures. Decodes images and short animations for rows on screen. Starts chatd when nothing answers (`protocol::launch`). Hands a message video or an MP4 GIF to the system's player. Settings lists audio devices by running `mediad --devices`. While open, asks GitHub whether a newer release exists, and asks Wikipedia for a linked article's summary. | Read the database or keychain, run a socket call, file read or decode on the main thread, link Opus or H.264. |
 | `tinyclient-login` | One sign-in window, then exits with the session on stdout. | Stay running. |
+
+`notifier` (`crates/notifier`) is a library, not a process and not an adapter. chatd decides what to post (`chatd/src/notify.rs`) and the library shows it. The window reports focus and draws the taskbar or Dock count. Tests use `notifier::Fake`.
+
+Seven adapters ship, one per `Network::ALL`, started from `adapters::start`: Discord, Slack, Telegram, Teams, Signal, Messages (Google Messages paired from the phone), and Tiny. `adapters/tiny_bots.rs` is a REST helper an owner uses to create and revoke a Tiny server's application bots. It is not an adapter and has no `start`.
 
 ## Contract in brief (`crates/protocol`)
 
 - **Frames**: 4-byte length, then JSON, at most 1 MiB. One request, one response, per connection or in sequence.
 - **Identity**: an account is `AccountKey { network, account }`. A conversation, Space or person is a
-  `Key { network, account, id }`. A Space is a server, workspace or team. One Slack sign-in is one
-  keychain item that `adapters::accounts` splits into one account per workspace. An account id is
-  one plain file name (letters, digits, `.`, `_`, `-`; never `.` or `..`): it names a directory.
+  `Key { network, account, id }`. A Space is a server, workspace or team. The keychain holds one
+  item per network (`service` `tinyclient`). A sign-in that yields several accounts (Slack
+  workspaces, Tiny servers) is still that one item; `adapters::accounts` splits it. An item found
+  only under the old service name `tinychat` is moved to `tinyclient` the first time it is read.
+  An account id is one plain file name (letters, digits, `.`, `_`, `-`; never `.` or `..`): it
+  names a directory.
 - **Bounded**: rows are capped at `PAGE_LIMIT` 200 (a tree page at 500), and so is everything a
   network could make large: 3 thread faces, 25 occupants, 10 card fields, 256 waveform bytes, 32
   device names, 20 mutual Spaces, and a character cap on every string that is not a message's
@@ -38,7 +45,7 @@ How the processes fit together and who may edit what. The contract itself is the
 | `InVoice {network}`, `Around {network}` | `Conversations`; `Around {requests, in_call, online, recent}` | hub (occupants, presence, activity) and store |
 | `Find {network, query, limit}` | `Conversations` (title contains, newest first, cache only) | store |
 | `SearchMessages {conversation, network, space, query, limit}` | `MessageHits {hits (where, snippet, sender, title)}` (text contains, newest first, cache only) | store |
-| `SearchNetwork {conversation, space, query}` | `MessageHits` (the network's own hits, mapped like the cache's) | `Command::Search` (`Unsupported` until built; Discord: the server's search for a Space, the channel's for one conversation, 202 while indexing) |
+| `SearchNetwork {conversation, space, query}` | `MessageHits` (the network's own hits, mapped like the cache's) | `Command::Search`. Discord: the server's search for a Space, the channel's for one conversation, 202 while indexing. Telegram: text search in one conversation or forum topic; a Space scope is `Unsupported`. An adapter that cannot search answers `Unsupported`. |
 | `Spaces {network}`, `Tree {space, offset, limit, peek}` | `Spaces`; `Tree {groups (kind, count), conversations, total}` | store; `Command::OpenSpace` |
 | `Conversation`, `Collapse`, `Star`, `SetDraft` | `Conversation`; `Ok` | store (local only) |
 | `People {network, relation, query, offset, limit}` | `People {people, total}` | store; `Command::SearchPeople`, debounced |
@@ -48,21 +55,31 @@ How the processes fit together and who may edit what. The contract itself is the
 | `SetMute {conversation, notify}`, `Leave`, `CloseDirect` | `Ok` once the network accepted | `Command::SetMute` / `Leave` / `CloseDirect` |
 | `Pinned {conversation}` | `Pinned {conversation, messages}` (≤ 50) | `Command::Pinned` |
 | `Shared {conversation, kind, before, limit, search}` | `Shared {items, more, complete, total}` | store; with `search`, `Command::SearchShared` |
-| `Relate {person, action}`, `SetPresence {account, presence, status}` | `Ok` | `Command::Relate` / `SetPresence` (`Unsupported` until built) |
+| `Relate {person, action}`, `SetPresence {account, presence, status}` | `Ok` | `Command::Relate` / `SetPresence`. Discord does both. An adapter that does not answers `Unsupported`. |
 | `Watch(Watching)` | `Watching {people, typists}` | hub; `Command::Watch` |
 | `Messages {conversation, page, limit}` | `Messages {messages, last_read, older, newer}` | store; `Command::Backfill` / `History` / `HistoryAfter` / `HistoryAround` |
 | `MarkRead {conversation, message_id}` | `Ok` | store; `Command::MarkRead` |
 | `Send {.., with}`, `Retry`, `Discard`, `CancelSend`, `Typing` | `Sent {message}` (pending, files listed); `Ok` | store; `Command::Send`, or `SendWith` when `with` is not plain; `CancelSend`; `Typing` |
 | `Catalog {account, kind, space, query, cursor}` | `Catalog {items, cursor}` (≤ 200, kept 5 min) | `Command::Catalog` |
-| `React {conversation, message_id, emoji, on}` | `Ok` | refused by the rules first; store at once; `Command::React` (`Unsupported` until built) |
+| `React {conversation, message_id, emoji, on}` | `Ok` | refused by the rules first; store at once; `Command::React`. Discord, Telegram and Tiny do this. An adapter that does not answers `Unsupported`. |
 | `Reactions {conversation}` | `Reactions {conversation, rules}` (kept 5 min) | `Command::ReactionRules` |
-| `Edit {.., text}`, `Delete {..}` | `Ok` once the network accepted | `Command::Edit` / `Delete` (`Unsupported` until built) |
+| `Edit {.., text}`, `Delete {..}` | `Ok` once the network accepted | `Command::Edit` / `Delete`. Discord, Telegram and Tiny do this. An adapter that does not answers `Unsupported`. |
 | `Fetch {account, ids, size, retry}` | `Media {files}` | store (size, retry); `blobs` |
 | `SignIn {network, at}`, `SignOut {account}` | `Status` | server |
 | `CallStart`, `CallAccept`, `CallDecline`, `CallEnd`, `CallSet`, `Media(..)` | `Status` | `media::Calls`; `Command::Call*` |
 | `Play(Start {account, file, path, conversation, message, title, at, rate, output} \| Pause \| Seek {at} \| Rate {rate} \| Stop)` | `Ok`; then `Change::Playback` | `playback::Player`; `mediad --play` |
+| `Settings`, `Set {scope, key, value}`, `ResetSettings` | the stored settings, missing keys at their defaults; `Ok` | chatd. `Set` refuses a key `settings::valid` does not know. `Change::Settings` follows a write. |
+| `Storage`, `Clear`, `Prunable {days}` | bytes kept; `Ok`; `Prunable {messages, bytes}` | Settings › Storage. `Clear` deletes cached messages and files. Sessions, drafts and settings stay. |
+| `Shutdown` | `Ok`, then chatd exits | a call is left on the network first |
 | `TinyCommunity`, `TinyInvite`, `TinyRole`, `TinyRemove`, `TinyRevoke`, `TinyRename`, `TinySignOutEverywhere`, `TinyRoomCreate`, `TinyRoomRename`, `TinyRoomDelete` | `TinyCommunity` (members, invites, audit, rooms with who sits in each, online, the server's `media`); `TinyCode`; `Ok` | `adapters::tiny` over the server's REST; seats and presence from the hub |
+| `TinyAvatar` | `Ok` | Any member may set or clear their own picture (PNG, JPEG or WebP, at most `TINY_ICON_MAX` bytes). |
+| `TinyLocalServers` | `TinyLocalServers` (account keys and exact server origins; no session tokens) | Reads locally saved Tiny accounts without contacting a server; lets invite confirmation offer an already-added server. |
 | `TinyCallJoin`, `TinyCallLeave`, `TinyCallKick` | `Ok` once the server took it, or its refusal in words | `Command::Tiny`, sent on the account's live socket (`adapters/tiny/live.rs`). On a server whose `/health` says media is `up`, a join is a call with `mediad` (below); otherwise a seat only. `CallStart` on a Tiny room key is the same join |
+
+A Tiny server is more than its voice rooms. `adapters/tiny/messages.rs` lists text channels and
+direct messages in the Space's tree, sends and edits there, and follows `channel.*` and
+`direct.*` on the live socket. Several Tiny servers can be signed in at once: one keychain item
+for the network, one account per server, and `TinyLocalServers` reads those origins locally.
 
 - **Rows**: a `Conversation` carries its Space's and Group's titles and its topic
   (`Conversation::subtitle()` is the header's second line: `Space > group · topic`), `read_only`,
@@ -186,7 +203,13 @@ How the processes fit together and who may edit what. The contract itself is the
   (`Capabilities`) first and refuses in words ("trail.mov is too big for Discord (limit 10 MB)").
   The pending message lists the files from their paths at once; progress is `Change::Upload`,
   at most four a second; `CancelSend` ends it `Failed` ("Cancelled"), and `Retry` sends the files
-  again. Catalogs are asked when a picker tab opens, never before.
+  again. Catalogs are asked when a picker tab opens, never before. On a Tiny server whose
+  `GET /v1/capabilities` includes `file_scan`, the composer keeps the attach chips until that
+  send is `Sent` or `Failed` ("Scanning that file before it sends." / "Scanning those files
+  before they send."). Send in that conversation stays blocked while the scan is open. Archives
+  (`zip`, `7z`, `rar`, `tar`, `gz`, `tgz`, `bz2`) are refused with "This server doesn't take
+  archives." when `allow_archives` is false. A server that does not advertise `file_scan`, and
+  every other network, still clears the chips when the pending row is stored.
 - **Shell memory** (last conversation, sidebar mode, Details switches, pane width, scroll
   anchors, remembered threads) is the shell's own prefs file, not chatd's: nothing else needs it.
 
@@ -223,13 +246,13 @@ changing again replaces its entry, so the list is bounded (256) by how many thin
 
 | Data | Where |
 |---|---|
-| Sessions | Keychain, service `tinyclient`, one item per network. Never in chat.sqlite. Signal's item holds the account id and the key to `signal/<account>.state`, where its ratchets, keys, contacts and groups live, each value sealed with that key (`adapters/signal/vault.rs`, built with the `signal` feature only). |
+| Sessions | Keychain, service `tinyclient`, one item per network. Slack workspaces and Tiny servers are several accounts inside that item (`adapters::accounts`). An item still stored under the old service name `tinychat` is moved across on read. Never in chat.sqlite. Signal's item holds the account id and the key to `signal/<account>.state`, where its ratchets, keys, contacts and groups live, each value sealed with that key (`adapters/signal/vault.rs`, built with the `signal` feature only). |
 | Accounts, Spaces (muted, hide muted), folders, groups (kind, muted, unread only), conversations (unread, mentions, muted, read marker, star, topic, thread parent and root, draft, filing, kind flags, preview parts, seen, when it last mentioned me), people and relationships (title, time zone, mark), messages (rich fields as JSON in `message.body`), media rows with their failure and size variants, adapter notes | `chat.sqlite`, schema version in `PRAGMA user_version` (now 4), page cache 1 MB. A version change drops and refills the cache: the 3 → 4 change does, once. |
-| Media bytes | `media/<network>/<account>/` under the support directory, 500 MB, least recently used first. |
+| Media bytes | `media/<network>/<account>/` under the support directory, least recently used first. The cap defaults to 500 MB and is Settings' `cache_mb`: 250, 500, 1000 or 2000. |
 | Presence and activity, typing, voice occupants, what the shell watches, links and capabilities, the change list, the call, upload progress, previews asked, and five minutes of profiles, info panes and catalog pages (64 / 64 / 16 / 32 at most) | chatd memory, bounded, gone at restart. |
 | Files opened in another app under their own names | `open/` in the support directory: hard links into the cache, emptied when the shell starts. |
 | Panics, chatd's stderr | `crash.log` (cut at 256 KB), `chatd.log` (cut at 4 MB at start) in the support directory. |
-| Retention | Newest 2,000 messages per conversation; nothing older than 90 days unless the conversation was opened in that time. A thread row that names its parent goes when its parent goes, or when its root message has aged out and nobody opened the thread in 90 days. `Store::prune`, at start and daily. |
+| Retention | Newest 2,000 messages per conversation (`KEEP_MESSAGES`). Nothing older than the retention the user chose, 7, 30 or 90 days, default 90, unless the conversation was opened in that time. A thread row that names its parent goes when its parent goes, or when its root message has aged out and nobody opened the thread in that same window. `Store::prune`, at start and daily. |
 
 ## What an adapter must do
 
@@ -261,9 +284,6 @@ changing again replaces its entry, so the list is bounded (256) by how many thin
   `Command::SendWith` streams each file from its path in parts (one part in memory, 512 KB on
   Telegram, 8 MB elsewhere), calls `Context::upload` as it goes and `Context::sent` at the end
   (a failure names the file); `CancelSend` stops it.
-- **New commands**, all answered `Unsupported` until built: `ProfileIn`, `ConversationInfo`,
-  `SpaceInfo`, `SetMute` (report with `Context::muted`), `Leave`, `CloseDirect`, `Pinned`,
-  `SearchShared`, `Catalog`, `SendWith`, `CancelSend`, `Previews`, `OpenHome`, `OpenThreads`.
 
 ## chatd and mediad (`protocol/src/call.rs`)
 
@@ -287,20 +307,40 @@ says `Context::answered` (or lists someone else in the call). The roster comes f
 Every way a call can fail ends the same way: the failure stays on screen in words until it is
 dismissed, mediad is gone, and the adapter is sent `Command::CallLeave` so the network stops
 showing us in the channel or ringing the other side. That covers a failure the adapter reported,
-one mediad reported, a deadline here (10 s for the session, 35 s to connect, 60 s of ringing),
+one mediad reported, a deadline here (10 s for the session, 15 s to connect, 60 s of ringing),
 and mediad dying at any point, before the session arrived included.
 
 A Tiny server call is offered from our side, so the order is turned round. The live socket
 thread has chatd's call start mediad (`Context::tiny_offer`), which answers `TinyOffer` with
-`Offer {sdp}`: str0m's offer, one `sendonly` audio m-line and one `recvonly` per other seat. It
-goes out as `call.join` `sdp`; `call.answer` comes back as `TinyAnswer` (from here the call is
-joining, with the 35 s deadline), and each `call.slots` for that `call_id` as `TinySlots`.
+`Offer {sdp}`: one UDP socket, a host candidate and an active ICE-TCP candidate
+on the same address, one `sendonly` Opus m-line, one `recvonly` Opus m-line per other seat, then
+H.264 constrained baseline video: a simulcast camera and one screen share, both inactive until
+asked, and one `recvonly` picture. Camera send is Windows-only. Screen share is Windows, macOS
+and Linux X11. UDP is preferred; TCP is the path when UDP cannot get through. The offer goes out
+as `call.join` `sdp`; `call.answer` comes back as `TinyAnswer` (from here the call is joining,
+with the 15 s connect deadline), and each `call.slots` for that `call_id` as `TinySlots`.
 `Connected` makes it `Joined` as for Discord. Mute and deafen go out as `call.state`, a hang-up
 or a failure as `call.leave` (only while the socket still sees us in the room), and `call.left`
-for us with `media_timeout`, `media_lost`, `kicked`, `room_deleted` or `joined_elsewhere` fails
+for us with `media_timeout`, `kicked`, `room_deleted` or `joined_elsewhere` fails
 the call in words. After a server restart the live socket sends a fresh `TinyOffer` to the same
 mediad and joins again; mediad keeps its devices and takes up the new connection. str0m, its
 sockets and every packet stay in mediad (`mediad/src/tiny.rs`).
+
+`media_lost` while the socket is up is a blip: the seat is taken again with a fresh offer, as
+after a restart, up to three times in two minutes before it fails in words too. A link mediad
+itself drops is the other budget, the same shape as a Discord resume: three tries, waiting 1 s,
+then 2 s, then 3 s, and a link that stayed up for 60 s starts that count over. Past that budget
+the call fails in words and mediad is let go. A drop already on one of these paths does not
+start the other.
+
+On a server whose capabilities include `e2ee_calls`, the client seals Opus and the H.264
+picture. The one-byte NAL header stays clear. Discord's DAVE seals Opus only.
+
+The microphone goes through `process` (WebRTC's AEC3, noise suppression and AGC2, ported to Rust
+by `sonora`) when those switches are on. All three default on. The mix played is the echo
+canceller's reference, then the gate as `Input` and `Talk` say (`talk`); the mix plays each
+voice at its `Gain` and ducks everyone else 12 dB under a `Priority` holder who is speaking
+(`hear`); the encoder takes `Bitrate`.
 
 The device menu: the shell sends `Media(Meter {on})` when it opens and closes. While on, mediad
 sends `Levels` and chatd passes our input level on as `Call.level`; `Call.inputs` and
@@ -331,10 +371,12 @@ is the one picked in the call's device menu in this window, else the system defa
 is mediad's size: release mediad went from 5.4 MB to 7.5 MB (symphonia), the shell grew 0.15 MB
 and chatd nothing. Playing costs 5.3 MB of footprint and under 1% CPU (`07-budgets-and-risk.md`).
 
-Video is not decoded by tinyclient. A video or a GIF that is an MP4 plays in the system's
-player once fetched, through a hard link under the attachment's name in `open/` in the support
+A message's video, or a GIF that is an MP4, is not decoded by tinyclient. Once fetched it plays
+in the system's player, through a hard link under the attachment's name in `open/` in the support
 directory (emptied at the shell's start), since cached files are named by a hash with no
-extension. `Pane::moving` is the one place an inline, muted, looping player would go.
+extension. `Pane::moving` is the one place an inline, muted, looping player for that attachment
+would go. A Tiny call's camera and screen share are a different path: mediad decodes and encodes
+H.264, and the call view draws those pictures.
 
 GIFs, animated WebP and APNG are not video and play in the window itself (`tinyclient/src/frames.rs`
 decodes, `gui/anim.rs` plays). A file is sniffed by its header for canvas, frame count and play
@@ -369,8 +411,8 @@ WebM: stills.
 ## The demo (`chatd --seed-demo`, `chatd/src/demo*`)
 
 Invented data in a scratch `TINYCLIENT_DIR`, and an adapter with no network behind it
-(`demo/adapter.rs`) that answers for the six demo accounts (Discord, two Slack workspaces,
-Telegram, Teams, Signal): a send is accepted, files "upload" from their paths with progress and can be
+(`demo/adapter.rs`) that answers for the seven demo accounts (Discord, two Slack workspaces,
+Telegram, Teams, Signal, and one Tiny server, "Night Shift", with voice channels): a send is accepted, files "upload" from their paths with progress and can be
 cancelled, a reaction toggles, edit and delete work, a friend request can be answered, our
 presence set, a typed profile, a conversation's and a Space's info, a member list, pinned
 messages, a shared-media search and the pickers' catalogs read, a mute set, a group left, a DM
@@ -397,7 +439,7 @@ holds the store.
 | `chatd/src/adapters/mod.rs`, `adapters/net.rs` | Frozen. Serve a `Command`, call a `Context` method. Unserved commands go to `Command::unsupported`, which every adapter's `match` already ends in. |
 | `chatd/src/hub.rs`, `server.rs`, `session.rs`, `lib.rs`, `main.rs`, `media.rs`, `demo.rs`, `demo/*`, `tests/e2e.rs`, `tests/polish.rs`, `tests/calls.rs`, `crates/mediad/**` | Frozen. A demo answer a slice needs is a `// CONTRACT:` note for the integrator. |
 | `tinyclient/src/gui/state.rs` | Slice A, except the `load_*` list functions (`load_inbox`, `load_spaces`, `load_tree`, `load_directs`, `load_row`, `refresh_row`), which are slice B's. Other views keep their own `State` and take changes in their `*_changed` hook. |
-| `Cargo.toml` files | Add only your own dependency lines. No async runtime, no second TLS stack. |
+| `Cargo.toml` files | Add only your own dependency lines. Telegram owns one current-thread tokio runtime. Signal's feature links rustls for Signal's sockets. The other networks stay on the system TLS. |
 
 New files go in a directory named after your module and are declared from your own file
 (`adapters/discord/*.rs` from `discord.rs`, `gui/pane/*.rs` from `pane.rs`), so no shared `mod`
@@ -428,6 +470,5 @@ Tests go in your own files or a new `tests/<slice>.rs`. A gap in the contract is
 - Slices F, G and H share the `chatd` crate, and A to E the `tinyclient` crate: someone else's
   half-written file can break your build. Check with `cargo check -p chatd` (or `-p tinyclient
   --features gui`) and say so; do not fix it.
-- Left for later, with room kept: message search, notifications, settings, inline video
-  (videos play in the system's player), Discord's per-server file limit (boosts) and Telegram's boosted packs in
-  `Capabilities`, picker recents in SQLite.
+- Notifications: chatd decides and posts (`notify.rs`, through the `notifier` library; rules tested against `notifier::Fake`). The window reports its focus and draws the taskbar or Dock count. Sounds play through `mediad --sound`.
+- Left for later, with room kept: inline playback of a message video or MP4 GIF (those still open in the system's player), Discord's per-server file limit (boosts) and Telegram's boosted packs in `Capabilities`, picker recents in SQLite.

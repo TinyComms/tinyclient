@@ -233,6 +233,8 @@ impl GuildInfo {
             group: parent.filter(|_| category.is_some()).map(str::to_owned),
             position: place(category, channel.is_voice(), channel.position),
             call: super::voice::support(channel.kind),
+            // A voice channel's occupant limit, for the tree's `4/12`.
+            limit: (channel.kind == model::VOICE).then_some(channel.user_limit).unwrap_or(0),
             topic: one_line(channel.topic.as_deref()),
             read_only: written && self.permissions(guild, me, channel) & SEND_MESSAGES == 0,
             private: self.private(guild, channel),
@@ -691,6 +693,8 @@ impl Discord {
             suppress_embeds: true,
             reply_ping: true,
             edit_window: 0,
+            file_scan: false,
+            allow_archives: false,
         });
         self.state.lock().unwrap().premium = premium;
     }
@@ -966,8 +970,10 @@ impl Discord {
         };
         let member = guild.members.iter().find(|member| member.id() == me);
         let mut info = self.guild_info(&guild, member, &me, position, quiet);
-        self.voice_states(Some(&guild.id), &guild.voice_states);
+        // The channels are planted before the voice states are read, as at READY: a state's
+        // stage is known from the rows the tree just planted.
         self.plant(&guild, &mut info, &me, &HashMap::new())?;
+        self.voice_states(Some(&guild.id), &guild.voice_states);
         self.state.lock().unwrap().guilds.insert(guild.id.clone(), info);
         Ok(self.spaces()?)
     }

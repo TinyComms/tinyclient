@@ -29,8 +29,10 @@ impl Shell {
 
     /// The strip above the messages (07 §1): panel, back and forward, picture, title and the
     /// line after it on one baseline, the call, then the pane's buttons with Details last.
-    pub(super) fn strip(&self, open: &Conversation, link: Link, window: &Window, cx: &mut Context<Self>) -> Div {
+    pub(super) fn strip(&self, open: &Conversation, link: Link, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let direct = open.kind == ConversationKind::Direct;
+        let teams_channel = open.key.network == protocol::Network::Teams && open.kind == ConversationKind::Channel;
+        let saved = open.special == protocol::Special::Saved && open.key.network == protocol::Network::Telegram;
         let picture = match open.kind {
             ConversationKind::Direct | ConversationKind::Group => Avatar::new(&open.key, &open.title, 24.),
             ConversationKind::Voice => Avatar::channel("icons/volume-2.svg", 24.),
@@ -42,8 +44,10 @@ impl Shell {
         let shape = if open.kind.is_direct() { Shape::Person } else { Shape::Place };
         let picture = picture.shape(shape).image(self.conversation_picture(open, cx).as_ref());
         // A group has one face across the window: the same one its row and the switcher draw.
-        let face = if open.kind == ConversationKind::Group {
+        let face = if open.kind == ConversationKind::Group || teams_channel {
             self.conversation_avatar(open, 24., theme::canvas(), cx)
+        } else if saved {
+            Avatar::channel("icons/bookmark.svg", 24.).build()
         } else {
             picture.build()
         };
@@ -64,6 +68,11 @@ impl Shell {
         // of conversation it keeps only its glyph, and the tooltip keeps the words (07 §1).
         let room = self.conversation_room();
         let compact = room > 0. && room < 600.;
+        let search = matches!(open.key.network, protocol::Network::Discord | protocol::Network::Telegram).then(|| {
+            self.conversation_search_box(&open.key, window, cx)
+                .w(px(if compact { 120. } else { 200. }))
+                .ml(px(8.))
+        });
         let call = self.snapshot.as_ref().and_then(|snapshot| self.call_pill(snapshot, cx)).map(|call| {
             let call = call.h(px(28.)).rounded(px(theme::R_CONTROL)).whitespace_nowrap();
             if compact {
@@ -88,20 +97,40 @@ impl Shell {
             .child(travel("forward", "icons/chevron-right.svg", false, forward, "Forward", "⌘]"));
         // Lit means "this kind is in the pane now". In a channel, Members and Details are two
         // values of one switch; beside a direct conversation Details is the other person.
-        let members = (!direct).then(|| {
+        let members = (!direct && !teams_channel).then(|| {
             icon_button("members", "icons/users.svg", self.pane_shows(|layer| matches!(layer, Layer::Members(_))))
                 .tooltip(tip("Members", None))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(|this, _, _, cx| this.toggle_member_list(cx)))
         });
-        let (glyph, words) = if direct { ("icons/user.svg", "Profile") } else { ("icons/info.svg", "Details") };
-        let details = icon_button("details", glyph, self.pane_shows(|layer| matches!(layer, Layer::Profile(_) | Layer::Details(_))))
-            .tooltip(tip(words, Some("⌘.")))
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(cx.listener(|this, _, _, cx| this.toggle_details(cx)));
+        // Beside a channel or group Details has a button; beside a direct conversation the title
+        // is the way to the person, a link that opens their profile, so no button is drawn there.
+        let details = (!direct).then(|| {
+            icon_button("details", "icons/info.svg", self.pane_shows(|layer| matches!(layer, Layer::Details(_))))
+                .tooltip(tip("Details", Some("⌘.")))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_details(cx)))
+        });
         // The title keeps 96 before the line after it gives up anything; that line truncates first.
         // The title truncates before anything to its right moves; the line after it goes first.
-        let title = div().flex_initial().min_w(px(96.)).truncate().type_title().child(open.title.clone());
+        let title_tip = if direct { "Open profile".to_owned() } else { open.title.clone() };
+        let title = div()
+            .id("conversation-title")
+            .flex_initial()
+            .min_w(px(96.))
+            .truncate()
+            .type_title()
+            .tooltip(tip(title_tip, direct.then_some("⌘.")))
+            .child(open.title.clone());
+        let title = if direct {
+            title
+                .cursor_pointer()
+                .hover(|style| style.underline())
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_details(cx)))
+        } else {
+            title
+        };
         let space = open.space.clone().map(|id| Key { id, ..open.key.clone() });
         let line = (!subtitle.is_empty()).then(|| {
             div()
@@ -149,8 +178,9 @@ impl Shell {
                     .children(line)
                     .children(trouble.map(|words| div().flex_none().type_small().text_color(theme::text_faint()).child(words))),
             )
+            .children(search)
             .children(call.map(|call| div().flex_none().ml(px(8.)).child(call)))
-            .child(div().flex_none().ml(px(8.)).flex().gap(px(4.)).children(members).child(details))
+            .child(div().flex_none().ml(px(8.)).flex().gap(px(4.)).children(members).children(details))
     }
 
     /// The line after the title (07 §1): beside a direct conversation the person's status or

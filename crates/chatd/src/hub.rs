@@ -7,7 +7,7 @@ use protocol::{
 };
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Changes remembered for a shell that is behind. One entry per thing that changed, so this is
@@ -165,6 +165,16 @@ pub struct Hub {
     /// Retention runs when this is set, and once a day.
     prune_now: Mutex<bool>,
     prune_wake: Condvar,
+    /// The notification thread (`notify::start`), once it runs. Told of new messages, rows
+    /// that may have been read, and the call.
+    notifier: OnceLock<crate::notify::Line>,
+}
+
+fn apply_log_policy(values: &Values) {
+    let Some(guard) = protocol::log_policy::current() else {
+        return;
+    };
+    guard.apply(protocol::log_policy::LogPolicy::for_settings(values));
 }
 
 impl Hub {
@@ -200,10 +210,17 @@ impl Hub {
             reactions: Recent::new(64),
             calls: Calls::default(),
             player: crate::playback::Player::default(),
-            settings: Mutex::new(settings),
+            settings: Mutex::new(settings.clone()),
             prune_now: Mutex::new(false),
             prune_wake: Condvar::new(),
+            notifier: OnceLock::new(),
         }
+        .tap_settings(&settings)
+    }
+
+    fn tap_settings(self, values: &Values) -> Self {
+        apply_log_policy(values);
+        self
     }
 
     // Settings.
@@ -221,6 +238,7 @@ impl Hub {
         let mut store = self.store();
         store.set_setting(scope, key, value.as_deref())?;
         lock(&self.settings).set(scope, key, value);
+        apply_log_policy(&self.settings());
         drop(store);
         self.changed(Change::Settings);
         Ok(())
@@ -232,6 +250,7 @@ impl Hub {
         if let Ok(stored) = store.settings() {
             *lock(&self.settings) = Values::new(stored);
         }
+        apply_log_policy(&self.settings());
         drop(store);
         self.changed(Change::Settings);
     }
@@ -241,6 +260,7 @@ impl Hub {
         let mut store = self.store();
         store.reset_settings()?;
         *lock(&self.settings) = Values::new(store.settings()?);
+        apply_log_policy(&self.settings());
         drop(store);
         self.changed(Change::Settings);
         Ok(())
@@ -416,10 +436,33 @@ impl Hub {
         lock(&self.links).iter().find(|linked| linked.account == *account).map_or_else(Capabilities::default, |linked| linked.can)
     }
 
+    // Notifications.
+
+    pub fn set_notifier(&self, line: std::sync::mpsc::Sender<crate::notify::Event>) {
+        let _ = self.notifier.set(Mutex::new(line));
+    }
+
+    /// Tells the notification thread, if there is one.
+    pub fn notify(&self, event: crate::notify::Event) {
+        if let Some(line) = self.notifier.get() {
+            let _ = lock(line).send(event);
+        }
+    }
+
+    /// When a shell last asked `Wait`: one asking within its long poll is up.
+    pub fn shell_asked(&self) -> Instant {
+        lock(&self.live).asked
+    }
+
     // Changes.
 
     /// Call after anything the shell draws has changed, naming what.
     pub fn changed(&self, change: Change) {
+        match &change {
+            Change::Conversation { conversation } => self.notify(crate::notify::Event::Row(conversation.clone())),
+            Change::Call { call } => self.notify(crate::notify::Event::Call(call.clone())),
+            _ => {}
+        }
         let mut changes = lock(&self.changes);
         changes.seq += 1;
         let seq = changes.seq;
@@ -670,13 +713,26 @@ impl Hub {
         typists.filter(|typist| typist.until > now).cloned().collect()
     }
 
-    /// Drops what is known live about an account, for sign-out and for a dropped socket. A
-    /// voice channel that was shown as occupied is told to the shell as empty: nothing else
-    /// would ever take the people off its row.
+    /// Drops what is known live about an account when its socket drops. Our own presence is
+    /// kept: it is a setting the network keeps for us, and a resume does not say it again, so
+    /// dropping it would show the account with no state until the next full connect. A voice
+    /// channel that was shown as occupied is told to the shell as empty: nothing else would
+    /// ever take the people off its row.
     pub fn forget_live(&self, account: &AccountKey) {
+        let me = self.store().accounts().unwrap_or_default().into_iter().find(|row| row.key == *account).map(|row| row.me);
+        let own = me.filter(|me| !me.is_empty()).map(|me| Key::new(account, me));
+        self.drop_live(account, own.as_ref());
+    }
+
+    /// The same for an account that is signed out: our own presence goes too.
+    pub fn forget_all_live(&self, account: &AccountKey) {
+        self.drop_live(account, None);
+    }
+
+    fn drop_live(&self, account: &AccountKey, keep: Option<&Key>) {
         let emptied: Vec<Key> = {
             let mut live = lock(&self.live);
-            live.presence.retain(|person, _| person.account() != *account);
+            live.presence.retain(|person, _| person.account() != *account || Some(person) == keep);
             live.typing.retain(|conversation, _| conversation.account() != *account);
             let emptied = live.occupants.keys().filter(|conversation| conversation.account() == *account).cloned().collect();
             live.occupants.retain(|conversation, _| conversation.account() != *account);

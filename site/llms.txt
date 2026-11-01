@@ -1,8 +1,8 @@
 # tinyclient
 
-> A tiny, private, open-source desktop chat client for Slack, Discord, Telegram, Microsoft Teams, Signal, and Android Messages. Native. No tinyclient servers, no tinyclient accounts, no telemetry.
+> A tiny, private, open-source desktop chat client for Slack, Discord, Telegram, Microsoft Teams, Signal, and Android Messages, and for a Tiny server you run. Native. No tinyclient servers, no tinyclient accounts, no telemetry.
 
-tinyclient runs on the person's computer. chatd keeps messages on disk and sessions in the OS keychain, and connects directly to each network. There is no remote tinyclient API and nothing to authenticate against on tinyclient.io.
+tinyclient runs on the person's computer. chatd keeps messages on disk and sessions in the OS keychain, and connects directly to each network. There is no remote tinyclient API and nothing to authenticate against on tinyclient.io. A Tiny server (https://github.com/TinyComms/tinyserver) is run by its owner for one community, not by the project.
 
 ## Docs
 
@@ -12,8 +12,9 @@ tinyclient runs on the person's computer. chatd keeps messages on disk and sessi
 - [Architecture](https://tinyclient.io/docs/architecture.html): chatd, the window, mediad, and the sign-in helper
 - [Size and performance](https://tinyclient.io/docs/performance.html): disk and memory next to the official apps, and how each number was measured
 - [Privacy and security](https://tinyclient.io/docs/privacy.html): what is stored, which connections are made, and what the app never does
-- [Networks and terms](https://tinyclient.io/docs/networks.html): Slack, Discord, Telegram, Teams, Signal, and Messages, including what is not built yet
+- [Networks and terms](https://tinyclient.io/docs/networks.html): Slack, Discord, Telegram, Teams, Signal, Messages, and a Tiny server, including what is not built yet
 - [Contributing](https://tinyclient.io/docs/contributing.html): roadmap and the rules every change keeps
+- [Tiny server](https://tinyclient.io/tinyserver): a self-hosted server for one community: text channels, direct messages, voice rooms, one picture, roles and moderation, and how to run one. A call is end-to-end encrypted when that server offers it.
 
 ## Downloads
 
@@ -26,6 +27,7 @@ The latest release is always at these paths (they redirect to GitHub):
 
 ## Optional
 
-- [Source](https://github.com/itz4blitz/tinyclient)
-- [Security policy](https://github.com/itz4blitz/tinyclient/blob/main/SECURITY.md)
+- [Source](https://github.com/TinyComms/tinyclient)
+- [Security policy](https://github.com/TinyComms/tinyclient/blob/main/SECURITY.md)
+- [tinyserver source](https://github.com/TinyComms/tinyserver)
 - [Agent skill](https://tinyclient.io/.well-known/agent-skills/tinyclient/SKILL.md)

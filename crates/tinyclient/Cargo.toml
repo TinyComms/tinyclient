@@ -14,9 +14,14 @@ crate-type = ["rlib", "staticlib", "cdylib"]
 
 [dependencies]
 protocol.workspace = true
+tracing.workspace = true
+# The taskbar button's or Dock icon's number and flash (`gui/attention.rs`).
+notifier = { path = "../notifier", optional = true }
 sha2 = "0.10"
 # Init failures are logged here; on Android the records go to logcat (see lib.rs `android_log`).
 log = "0.4"
+# Socket requests block; deliver their thread results without occupying GUI workers.
+futures-channel = "0.3"
 
 # GPUI is the shell. It is behind `gui` so `cargo test` and the daemons never pull the GPU stack.
 #   cargo run -p tinyclient --features gui
@@ -41,11 +46,12 @@ url = { version = "2", optional = true }
 tlottie = { git = "https://github.com/dkaraush/tlottie", rev = "92df98dc209bc39b1e567ec74a8c86a0af5239de", optional = true }
 
 [dev-dependencies]
+futures-lite = "2"
 # The frame decoder's tests run without the window.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 
 [features]
-gui = ["dep:tlottie", "dep:ureq", "dep:url", "dep:gpui", "dep:gpui_platform", "dep:unicode-segmentation", "dep:libc", "dep:image", "dep:smallvec", "dep:serde_json", "dep:palette", "dep:windows-sys"]
+gui = ["dep:notifier", "dep:tlottie", "dep:ureq", "dep:url", "dep:gpui", "dep:gpui_platform", "dep:unicode-segmentation", "dep:libc", "dep:image", "dep:smallvec", "dep:serde_json", "dep:palette", "dep:windows-sys"]
 # Adds `--shot out.png`: render the window to a file and quit, for design review without
 # Screen Recording permission. Pulls GPUI's test support, so it is not part of `gui`.
 gui-shot = ["gui", "gpui/test-support", "gpui_platform/test-support"]
@@ -79,9 +85,9 @@ gpui_platform = { package = "gpui_ce_platform", version = "0.3.0", optional = tr
 
 [target.'cfg(windows)'.dependencies]
 gpui_platform = { package = "gpui_ce_platform", version = "0.3.0", optional = true, default-features = false, features = ["font-kit"] }
-# `--version` and `--text` print to the terminal from a windowed program, and a call's link
-# opens through ShellExecuteW. Already in the tree.
-windows-sys = { version = "0.61", optional = true, features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+# `--version` and `--text` print to the terminal from a windowed program, a call's link opens
+# through ShellExecuteW, and the voice keys are read with GetAsyncKeyState. Already in the tree.
+windows-sys = { version = "0.61", optional = true, features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_IO", "Win32_System_Pipes", "Win32_System_Threading", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 # The icon, in the .exe: Explorer, the taskbar and the window (GPUI loads resource 1) show it.
 # Already in the tree.

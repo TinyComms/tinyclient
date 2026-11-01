@@ -1,8 +1,9 @@
 //! The Telegram, Signal, Messages, and Tiny server sign-in sheet (`docs/design/08-first-run-settings.md`, section 2).
-//! None of them has a web page to show, so tinyclient draws the sign-in itself. Telegram: a code to
+//! tinyclient draws each step and opens web sign-in where needed. Telegram: a code to
 //! scan, or a phone number, the code Telegram sends and, for accounts that have one, the two-step
 //! password. Signal: only the code to scan from the phone, which links this computer as one more
-//! device; a number typed here would take the account from the phone, so none is asked. A Tiny
+//! device; a number typed here would take the account from the phone, so none is asked.
+//! Messages uses Google account sign-in in a browser and an emoji confirmation on the phone. A Tiny
 //! server takes the code someone on it gave, or the address of one you already belong to; the
 //! rest happens in the system browser, at the server's sign-in provider, while the sheet waits.
 //!
@@ -31,14 +32,15 @@ use super::phone::tokens::PhoneType;
 use super::state::Shell;
 use super::theme::{self, Type};
 use super::time::clock;
-use crate::client::ask;
+use crate::client::ask_async;
 use gpui::{
     canvas, deferred, div, fill, point, prelude::*, px, rgb, size, App, Bounds, Context, Deferred, Div, Entity,
     FocusHandle, Focusable, Global, MouseButton, Rgba, SharedString, Stateful, Task, WeakEntity, Window,
 };
-use protocol::{Change, CodeVia, ErrorCode, Network, Request, Response, SignInInput, SignInProblem, SignInStep};
+use protocol::{AccountKey, Change, CodeVia, ErrorCode, Network, Request, Response, SignInInput, SignInProblem, SignInStep};
 use std::io;
 use std::rc::Rc;
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::time::Duration;
 
 /// The QR tile only: a phone reads dark on white, whatever the theme around it.
@@ -57,6 +59,22 @@ const BOX: (f32, f32) = (48., 56.);
 const RETRY: Duration = Duration::from_secs(2);
 /// Above the popovers and menus of the shell, which use 1 to 3.
 const PRIORITY: usize = 8;
+
+/// The invite, when present, is authoritative even if another server was typed first.
+fn invite_notice(input: &str, server: &str) -> String {
+    if let Some((origin, _)) = protocol::parse_invite_link(input) {
+        let transport = if origin.starts_with("http://") {
+            " This server uses an unencrypted HTTP connection."
+        } else {
+            ""
+        };
+        format!("Join {origin}?{transport} Continue only if you trust this server. If you already signed in to it, signing in again will replace that account on this device.")
+    } else if server.is_empty() {
+        "Paste the invite link or code you were given.".to_owned()
+    } else {
+        format!("{} — signing in again will replace any existing account for this server on this device.", protocol::join_host(server))
+    }
+}
 
 /// What the sheet shows.
 #[derive(Clone, PartialEq, Eq)]
@@ -81,10 +99,14 @@ pub struct Sheet {
     local: Option<SignInProblem>,
     /// Counts opens and restarts, so an answer to an earlier one is dropped.
     epoch: u64,
+    /// Changes from the listener supersede a submission still awaiting its reply.
+    revision: u64,
     /// The code on show and the link it was made from: encoded once, redrawn only on rotation.
     code: Option<(String, Rc<qr::Qr>)>,
     /// Hears `Change::SignIn` while the sheet is open. Dropping it stops the loop.
     listener: Option<Task<()>>,
+    /// Begin waits for preceding cancellation requests, including after immediate reopen.
+    pending_cancel: Option<Arc<AtomicBool>>,
     /// Fires once, when Telegram allows another code, to swap the link in.
     resend_timer: Option<Task<()>>,
     country: Entity<TextInput>,
@@ -97,6 +119,9 @@ pub struct Sheet {
     url: Entity<TextInput>,
     /// An invite code for that server.
     invite: Entity<TextInput>,
+    /// None while local saved servers are being read; Err if they could not be checked.
+    local_servers: Option<Result<Vec<(AccountKey, String)>, ()>>,
+    open_existing: Option<AccountKey>,
     /// Has the keys when no field does, so Escape still closes the sheet.
     focus: FocusHandle,
     /// The step changed: put the keys where typing goes, on the next frame.
@@ -149,6 +174,18 @@ pub fn open(network: Network, cx: &mut Context<Shell>) -> bool {
     true
 }
 
+/// Prepare an invite for explicit confirmation, without contacting its server.
+pub fn open_invite(link: &str, cx: &mut App) -> bool {
+    let Some((origin, token)) = protocol::parse_invite_link(link) else { return false; };
+    let Some(code) = protocol::pack_join(&origin, &token) else { return false; };
+    holder(cx).update(cx, |sheet, cx| {
+        if sheet.face.is_some() { return false; }
+        sheet.open(Network::Tiny, cx);
+        sheet.invite.update(cx, |input, cx| input.set_text(&code, cx));
+        true
+    })
+}
+
 /// The sheet, when it is open: drawn after everything else in the window, so it covers the
 /// first-run screen and the full shell alike.
 pub fn layer(window: &mut Window, cx: &mut App) -> Option<Deferred> {
@@ -164,6 +201,20 @@ pub fn layer(window: &mut Window, cx: &mut App) -> Option<Deferred> {
         window.defer(cx, move |window, cx| window.focus(&before, cx));
     }
     open.then(|| deferred(sheet).priority(PRIORITY))
+}
+
+pub(super) fn take_open_existing(cx: &mut App) -> Option<AccountKey> {
+    holder(cx).update(cx, |sheet, _| sheet.open_existing.take())
+}
+
+fn matching_server(input: &str, servers: &[(AccountKey, String)]) -> Option<AccountKey> {
+    let (origin, _) = protocol::parse_invite_link(input)?;
+    servers.iter().find_map(|(account, saved)| {
+        let normalized = protocol::invite_url(saved, "x")
+            .and_then(|link| protocol::parse_invite_link(&link))
+            .map(|(origin, _)| origin);
+        (normalized.as_deref() == Some(origin.as_str())).then(|| account.clone())
+    })
 }
 
 fn now() -> i64 {
@@ -252,7 +303,7 @@ fn step_problem(step: &SignInStep) -> Option<&SignInProblem> {
         | SignInStep::Server { problem }
         | SignInStep::Invite { problem, .. }
         | SignInStep::Browser { problem, .. } => problem.as_ref(),
-        SignInStep::Done { .. } | SignInStep::Failed { .. } => None,
+        SignInStep::Emoji { .. } | SignInStep::Done { .. } | SignInStep::Failed { .. } => None,
     }
 }
 
@@ -264,6 +315,8 @@ fn waiting() -> SignInStep {
 fn waiting_for(network: Network) -> SignInStep {
     if network == Network::Tiny {
         SignInStep::Invite { server: String::new(), problem: None }
+    } else if network == Network::Messages {
+        SignInStep::Browser { server: "https://messages.google.com".into(), provider: "Google".into(), waiting: false, problem: None }
     } else {
         waiting()
     }
@@ -345,8 +398,10 @@ impl Sheet {
             busy: false,
             local: None,
             epoch: 0,
+            revision: 0,
             code: None,
             listener: None,
+            pending_cancel: None,
             resend_timer: None,
             country,
             number,
@@ -354,6 +409,8 @@ impl Sheet {
             password,
             url,
             invite,
+            local_servers: None,
+            open_existing: None,
             focus: cx.focus_handle(),
             refocus: false,
             before: None,
@@ -392,6 +449,7 @@ impl Sheet {
         self.number.update(cx, |input, cx| input.set_text(canned.number, cx));
         self.digits.update(cx, |input, cx| input.set_text(canned.digits, cx));
         self.password.update(cx, |input, cx| input.set_text(canned.password, cx));
+        self.invite.update(cx, |input, cx| input.set_text(&canned.invite, cx));
         self.local = canned.local;
         self.refocus = true;
         cx.notify();
@@ -402,6 +460,7 @@ impl Sheet {
             return;
         }
         self.network = network;
+        self.local_servers = None;
         self.clear_fields(cx);
         if !matches!(network, Network::Telegram | Network::Signal | Network::Messages | Network::Tiny) {
             self.face = Some(Face::Web { started: false });
@@ -413,6 +472,20 @@ impl Sheet {
         self.face = Some(Face::Step(waiting_for(network)));
         self.refocus = true;
         self.begin(cx);
+        if network == Network::Tiny {
+            let epoch = self.epoch;
+            cx.spawn(async move |this, cx| {
+                let answer = cx.background_executor().spawn(async { crate::client::ask(&Request::TinyLocalServers) }).await;
+                let _ = this.update(cx, |this, cx| {
+                    if this.epoch != epoch || this.face.is_none() { return; }
+                    this.local_servers = Some(match answer {
+                        Ok(Response::TinyLocalServers { servers }) => Ok(servers),
+                        _ => Err(()),
+                    });
+                    cx.notify();
+                });
+            }).detach();
+        }
         cx.notify();
     }
 
@@ -431,10 +504,24 @@ impl Sheet {
         self.code = None;
         self.clear_fields(cx);
         if cancel && !self.canned {
-            let request = Request::SignInCancel { network: self.network };
-            cx.background_executor().spawn(async move { drop(ask(&request)) }).detach();
+            self.request_cancel(cx);
         }
         cx.notify();
+    }
+
+    fn request_cancel(&mut self, cx: &mut Context<Sheet>) {
+        let previous = self.pending_cancel.take();
+        let complete = Arc::new(AtomicBool::new(false));
+        self.pending_cancel = Some(complete.clone());
+        let request = Request::SignInCancel { network: self.network };
+        cx.spawn(async move |_, cx| {
+            let timer = cx.background_executor().clone();
+            if let Some(previous) = previous {
+                while !previous.load(Ordering::Acquire) { timer.timer(Duration::from_millis(10)).await; }
+            }
+            drop(ask_async(request).await);
+            complete.store(true, Ordering::Release);
+        }).detach();
     }
 
     fn clear_fields(&mut self, cx: &mut Context<Sheet>) {
@@ -475,18 +562,26 @@ impl Sheet {
             return;
         }
         self.epoch += 1;
-        self.busy = false;
+        // The initial Tiny face already contains an invite field. Do not let it
+        // submit before SignInBegin has created the flow on a slow computer.
+        self.busy = true;
         let (epoch, network) = (self.epoch, self.network);
+        let cancelled = self.pending_cancel.clone();
         self.listener = Some(cx.spawn(async move |this, cx| {
             let background = cx.background_executor().clone();
+            if let Some(cancelled) = cancelled {
+                while !cancelled.load(Ordering::Acquire) { background.timer(Duration::from_millis(10)).await; }
+            }
+            if !this.update(cx, |this, _| this.epoch == epoch && this.face.is_some()).unwrap_or(false) { return; }
             let seq = || async {
-                match background.spawn(async { ask(&Request::Status) }).await {
+                match ask_async(Request::Status).await {
                     Ok(Response::Status { seq, .. }) => Some(seq),
                     _ => None,
                 }
             };
-            let begin = || background.spawn(async move { ask(&Request::SignInBegin { network }) });
+            let begin = || ask_async(Request::SignInBegin { network });
             let mut since = seq().await;
+            if !this.update(cx, |this, _| this.epoch == epoch && this.face.is_some()).unwrap_or(false) { return; }
             let begun = begin().await;
             if !this.update(cx, |this, cx| this.begun(epoch, begun, cx)).unwrap_or(false) {
                 return;
@@ -497,7 +592,7 @@ impl Sheet {
                     since = seq().await;
                     continue;
                 };
-                let Ok(Response::Changes { seq, reset, changes }) = background.spawn(async move { ask(&Request::Wait { since: from }) }).await else {
+                let Ok(Response::Changes { seq, reset, changes }) = ask_async(Request::Wait { since: from }).await else {
                     since = None;
                     continue;
                 };
@@ -537,6 +632,7 @@ impl Sheet {
         if epoch != self.epoch || self.face.is_none() {
             return false;
         }
+        self.busy = false;
         cx.notify();
         match answer {
             Ok(Response::SignIn { step, .. }) => {
@@ -571,21 +667,26 @@ impl Sheet {
         self.busy = true;
         self.local = None;
         let epoch = self.epoch;
+        let revision = self.revision;
         let request = Request::SignInAnswer { network: self.network, input };
         cx.spawn(async move |this, cx| {
             // The request holds what was typed. It is moved into the call and dropped there.
-            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
-            let _ = this.update(cx, |this, cx| this.answered(epoch, answer, cx));
+            let answer = ask_async(request).await;
+            let _ = this.update(cx, |this, cx| this.answered(epoch, revision, answer, cx));
         })
         .detach();
         cx.notify();
     }
 
-    fn answered(&mut self, epoch: u64, answer: io::Result<Response>, cx: &mut Context<Sheet>) {
+    fn answered(&mut self, epoch: u64, revision: u64, answer: io::Result<Response>, cx: &mut Context<Sheet>) {
         if epoch != self.epoch || self.face.is_none() {
             return;
         }
         self.busy = false;
+        if revision != self.revision {
+            cx.notify();
+            return;
+        }
         self.refocus = true;
         cx.notify();
         match answer {
@@ -598,6 +699,7 @@ impl Sheet {
 
     /// Draws a step, whoever said it: an answer, or the sign-in moving by itself.
     fn show(&mut self, step: SignInStep, cx: &mut Context<Sheet>) {
+        self.revision += 1;
         if matches!(step, SignInStep::Done { .. }) {
             // The shell's own loop hears the new account and draws it.
             self.close(false, cx);
@@ -622,6 +724,10 @@ impl Sheet {
             SignInStep::Qr { link, .. } => {
                 if self.code.as_ref().is_none_or(|(old, _)| old != link) {
                     self.code = qr::encode(link.as_bytes()).map(|code| (link.clone(), Rc::new(code)));
+                    // Said, not left at "Getting a code" for good.
+                    if self.code.is_none() {
+                        self.local = Some(SignInProblem::Other { reason: "This code is too long to draw. Try again.".to_owned() });
+                    }
                 }
             }
             _ => self.code = None,
@@ -645,6 +751,7 @@ impl Sheet {
         if self.canned {
             return;
         }
+        self.busy = true;
         self.local = None;
         self.code = None;
         self.clear_typed(cx);
@@ -653,17 +760,8 @@ impl Sheet {
         // Bumped now, so an answer still on its way to the old sign-in is dropped.
         self.epoch += 1;
         self.listener = None;
-        let network = self.network;
-        let cancel = cx.background_executor().spawn(async move { drop(ask(&Request::SignInCancel { network })) });
-        cx.spawn(async move |this, cx| {
-            cancel.await;
-            let _ = this.update(cx, |this, cx| {
-                if this.face.is_some() {
-                    this.begin(cx);
-                }
-            });
-        })
-        .detach();
+        self.request_cancel(cx);
+        self.begin(cx);
         cx.notify();
     }
 
@@ -740,10 +838,37 @@ impl Sheet {
     }
 
     fn send_invite(&mut self, cx: &mut Context<Sheet>) {
+        if self.local_servers.is_none() || self.existing_invite(cx).is_some() {
+            return;
+        }
+        self.send_invite_confirmed(cx);
+    }
+
+    fn existing_invite(&self, cx: &Context<Sheet>) -> Option<AccountKey> {
+        let servers = self.local_servers.as_ref()?.as_ref().ok()?;
+        let code = self.invite.read(cx).text();
+        if protocol::parse_invite_link(code).is_some() { return matching_server(code, servers); }
+        let Some(Face::Step(SignInStep::Invite { server, .. })) = &self.face else { return None; };
+        let link = protocol::invite_url(server, "x")?;
+        matching_server(&link, servers)
+    }
+
+    fn open_existing_invite(&mut self, cx: &mut Context<Sheet>) {
+        if let Some(account) = self.existing_invite(cx) {
+            self.open_existing = Some(account);
+            self.close(true, cx);
+            cx.refresh_windows();
+        }
+    }
+
+    fn send_invite_confirmed(&mut self, cx: &mut Context<Sheet>) {
         if self.busy {
             return;
         }
         let code = self.invite.read(cx).text().to_owned();
+        let code = protocol::parse_invite_link(&code)
+            .and_then(|(origin, token)| protocol::pack_join(&origin, &token))
+            .unwrap_or(code);
         // A code is not kept in the field after it is sent. An empty one still goes to chatd,
         // which stays on this step and says to paste the code.
         self.invite.update(cx, |input, cx| input.set_text("", cx));
@@ -818,7 +943,7 @@ impl Sheet {
     /// A dialog's main action, off while an answer is awaited.
     fn primary(&self, label: impl Into<SharedString>, act: fn(&mut Sheet, &mut Context<Sheet>), cx: &Context<Sheet>) -> gpui::AnyElement {
         if self.busy {
-            return page::wide(button_disabled(label).h(px(32.))).into_any_element();
+            return page::wide(button_disabled("Please wait…").h(px(32.))).into_any_element();
         }
         page::wide(button("signin-primary", ButtonKind::Primary, label).h(px(32.)))
             .on_click(cx.listener(move |this, _, _, cx| act(this, cx)))
@@ -831,6 +956,9 @@ impl Sheet {
     }
 
     fn qr_step(&self, problem: Option<&SignInProblem>, cx: &Context<Sheet>) -> Div {
+        if self.network == Network::Messages {
+            return self.browser_step("https://messages.google.com", "Google", false, problem, cx);
+        }
         let tile = match (problem, &self.code) {
             (Some(problem), _) => quiet_tile()
                 .gap(px(12.))
@@ -842,11 +970,11 @@ impl Sheet {
         let phone_only = matches!(self.network, Network::Signal | Network::Messages | Network::Tiny);
         let steps = match self.network {
             Network::Signal => ["Open Signal on your phone.", "Go to Settings > Linked devices > Link new device.", "Point the phone at this code."],
-            Network::Messages => ["Open Messages on your Android phone.", "Go to Settings > Device pairing > QR code scanner.", "Point the phone at this code."],
+            Network::Messages => unreachable!("Messages uses Google sign-in and emoji confirmation"),
             Network::Tiny => ["Paste the code you were given.", "Continue in your browser.", "Come back here when it's done."],
             Network::Telegram | Network::Discord | Network::Slack | Network::Teams => ["Open Telegram on your phone.", "Go to Settings > Devices > Link Desktop Device.", "Point the phone at this code."],
         };
-        // Signal and Messages link a computer only from the phone: there is no other way in to offer.
+        // Signal links a computer only from the phone: there is no other way in to offer.
         // On a phone the code cannot be scanned by the phone it is on: the number is the way in,
         // and the code is for linking from another device.
         if phone::active() && !phone_only {
@@ -1061,15 +1189,11 @@ impl Sheet {
         let focused = self.invite.focus_handle(cx).is_focused(window);
         let input = tall_field(focused, problem.is_some()).child(self.invite.clone());
         let fresh = server.is_empty();
-        let host = protocol::join_host(server);
-        let aside = if fresh {
-            "Paste the code you were given. It has the server in it, so you don't type an address."
-        } else {
-            ""
-        };
+        let aside = invite_notice(self.invite.read(cx).text(), server);
         let account = fresh.then(|| {
             self.answer_link("signin-have-account", "I already have an account", || SignInInput::HaveCode { url: String::new() }, cx)
         });
+        let existing = self.existing_invite(cx).is_some();
         div()
             .flex()
             .flex_col()
@@ -1080,21 +1204,47 @@ impl Sheet {
                     .mb(px(16.))
                     .whitespace_normal()
                     .text_color(theme::text_soft())
-                    .child(if fresh { aside.to_owned() } else { host }),
+                    .child(aside),
             )
             .child(input)
+            .children(existing.then(|| div().mt(px(8.)).type_small().text_color(theme::text_soft())
+                .child("You already have this server. Open it, or choose Sign in again to replace the saved account.")))
+            .children(self.local_servers.is_none().then(|| div().mt(px(8.)).type_small().child("Checking saved servers…")))
             .children(problem.map(|problem| error_line(problem_words(self.network, problem)).mt(px(6.))))
             .children(fresh.then(run_your_own))
             .child(
                 footer(22.)
                     .child(account.map_or_else(|| div().into_any_element(), IntoElement::into_any_element))
-                    .child(buttons().child(self.cancel("Cancel", cx)).child(self.primary("Continue", Sheet::send_invite, cx))),
+                    .child(if existing {
+                        buttons().child(self.cancel("Cancel", cx))
+                            .child(self.primary("Open existing server", Sheet::open_existing_invite, cx))
+                            .child(self.primary("Sign in again", Sheet::send_invite_confirmed, cx))
+                    } else {
+                        buttons().child(self.cancel("Cancel", cx)).child(self.primary("Continue", Sheet::send_invite, cx))
+                    }),
             )
     }
 
     /// The rest is in the browser. While chatd waits: what to do there, and the page again.
     /// After it stopped: why, and a way to begin again with the same provider.
     fn browser_step(&self, server: &str, provider: &str, waiting: bool, problem: Option<&SignInProblem>, cx: &Context<Sheet>) -> Div {
+        if self.network == Network::Messages {
+            return div().flex().flex_col()
+                .child(self.header(if waiting { "Sign in with Google" } else { "Continue in your browser" }, false, cx))
+                .child(div().mt(px(12.)).whitespace_normal().text_color(theme::text_soft())
+                    .child(if waiting {
+                        "Sign in in the browser window using the same Google account as Messages on your Android phone. Then return here to confirm the matching emoji on your phone."
+                    } else {
+                        "Sign in with the Google account used by Messages on your Android phone. Keep your phone online to pair this computer."
+                    }))
+                .children(problem.map(|problem| error_line(problem_words(self.network, problem)).mt(px(12.))))
+                .child(footer(22.).child(div()).child(if waiting {
+                    buttons().child(self.cancel("Cancel", cx))
+                } else {
+                    buttons().child(self.cancel("Cancel", cx))
+                        .child(self.primary("Continue with Google", |this, cx| this.answer(SignInInput::OpenBrowser, cx), cx))
+                }));
+        }
         let (title, line) = if waiting {
             ("Waiting for your browser…", waiting_words(server, provider))
         } else {
@@ -1182,7 +1332,7 @@ fn run_your_own() -> Div {
         .child("Don't have a server?")
         .child(link("signin-tinyserver", "Run your own with tinyserver").type_small().on_click(|_, _, _| {
             if let Err(why) = super::call::open(TINYSERVER_URL) {
-                eprintln!("tinyclient: {why}");
+                tracing::warn!("tinyclient: {why}");
             }
         }))
 }
@@ -1400,6 +1550,12 @@ impl Render for Sheet {
                     SignInStep::Server { .. } => self.server_step(problem, window, cx),
                     SignInStep::Invite { server, .. } => self.invite_step(server, problem, window, cx),
                     SignInStep::Browser { server, provider, waiting, .. } => self.browser_step(server, provider, *waiting, problem, cx),
+                    SignInStep::Emoji { emoji } => div().flex().flex_col()
+                        .child(self.header("Confirm on your phone", false, cx))
+                        .child(div().mt(px(16.)).mb(px(16.)).text_size(px(64.)).text_center().child(emoji.clone()))
+                        .child(div().whitespace_normal().text_color(theme::text_soft())
+                            .child("Open Messages on your Android phone and select this matching emoji to finish pairing. Keep your phone online."))
+                        .child(footer(22.).child(div()).child(self.cancel("Cancel", cx))),
                     SignInStep::Failed { reason } => self.failed_step(reason, cx),
                     SignInStep::Done { .. } => div(),
                 }
@@ -1552,3 +1708,22 @@ mod tests {
         assert_eq!(stopped_words("https://chat.example", "Tinyauth"), "chat.example signs you in with Tinyauth, in your browser.");
     }
 }
+    #[test]
+    fn invite_notice_names_actual_destination_and_warns_about_replacement() {
+        let link = protocol::invite_url("http://other.example:8080", "token").unwrap();
+        let notice = invite_notice(&link, "https://first.example");
+        assert!(notice.contains("http://other.example:8080"));
+        assert!(notice.contains("unencrypted HTTP"));
+        assert!(notice.contains("replace"));
+        assert!(!notice.contains("first.example"));
+    }
+
+    #[test]
+    fn existing_server_match_uses_the_exact_normalized_origin() {
+        let account = AccountKey { network: Network::Tiny, account: "member".into() };
+        let servers = vec![(account.clone(), "https://Example.com:443".into())];
+        let link = protocol::invite_url("https://example.com", "token").unwrap();
+        assert_eq!(matching_server(&link, &servers), Some(account));
+        let other = protocol::invite_url("http://example.com", "token").unwrap();
+        assert_eq!(matching_server(&other, &servers), None);
+    }

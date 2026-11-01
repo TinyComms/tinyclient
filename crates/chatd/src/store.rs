@@ -19,7 +19,9 @@ use serde::Serialize;
 use std::path::Path;
 
 /// Raise this when a table changes. `open` then drops the cache and starts over.
-const SCHEMA: i32 = 4;
+/// 6 rebuilds caches written at 5 before `conversation.voice_limit` existed. That column
+/// was added without a version change, so Win+K died with `no such column: c.voice_limit`.
+const SCHEMA: i32 = 6;
 
 /// Retention: the newest messages kept per conversation.
 pub const KEEP_MESSAGES: u32 = 2_000;
@@ -97,6 +99,8 @@ const TABLES: &str = "
         avatar    TEXT NOT NULL DEFAULT '',
         peer      TEXT NOT NULL DEFAULT '',
         call      TEXT NOT NULL DEFAULT 'none',
+        -- A voice channel's occupant limit, 0 when it has none.
+        voice_limit INTEGER NOT NULL DEFAULT 0,
         -- The adapter wants it in the Inbox whatever its kind.
         listed    INTEGER NOT NULL DEFAULT 0,
         unread    INTEGER NOT NULL DEFAULT 0,
@@ -137,8 +141,9 @@ const TABLES: &str = "
         preview_from TEXT NOT NULL DEFAULT '',
         preview_mine INTEGER NOT NULL DEFAULT 0,
         preview_id   TEXT NOT NULL DEFAULT '',
-        -- The newest of my messages the other side has read.
+        -- The newest of my messages the other side has read, and has received.
         seen_to   TEXT NOT NULL DEFAULT '',
+        delivered_to TEXT NOT NULL DEFAULT '',
         PRIMARY KEY (network, account, id)
     ) WITHOUT ROWID;
     CREATE INDEX conversation_threads ON conversation (network, account, parent) WHERE parent != '';
@@ -235,7 +240,11 @@ const CONVERSATION: &str = "
            c.opted_out, c.preview_from, c.preview_mine,
            (c.preview_mine AND c.seen_to != '' AND (length(c.seen_to), c.seen_to) >= (length(c.preview_id), c.preview_id)),
            (c.updated < CAST(strftime('%s', 'now') AS INTEGER) - 2592000 AND c.unread = 0 AND c.mentions = 0
-            AND NOT c.starred AND c.draft = '')
+            AND NOT c.starred AND c.draft = ''),
+           (c.preview_mine AND c.delivered_to != '' AND (length(c.delivered_to), c.delivered_to) >= (length(c.preview_id), c.preview_id)),
+           (c.preview_mine AND EXISTS (SELECT 1 FROM message f WHERE f.network = c.network AND f.account = c.account
+                                         AND f.conversation = c.id AND f.id = c.preview_id AND f.pending = 1)),
+           c.voice_limit
     FROM conversation c
     LEFT JOIN media m ON m.network = c.network AND m.account = c.account AND m.id = c.avatar
     LEFT JOIN space s ON s.network = c.network AND s.account = c.account AND s.id = c.space
@@ -289,6 +298,8 @@ pub struct ConversationRow {
     pub avatar: Option<String>,
     pub peer: Option<String>,
     pub call: CallSupport,
+    /// The most who may be in a voice channel at once, 0 when it has none.
+    pub limit: u32,
     /// Show it in the Inbox even though it is a channel nobody mentioned me in.
     pub listed: bool,
     /// One line on what it is for. Cut to 300 characters.
@@ -385,6 +396,7 @@ impl ConversationRow {
             avatar: None,
             peer: None,
             call: CallSupport::None,
+            limit: 0,
             listed: false,
             topic: String::new(),
             parent: None,
@@ -594,6 +606,7 @@ fn conversation_from(row: &Row) -> rusqlite::Result<Conversation> {
         private: row.get(30)?,
         draft: row.get(31)?,
         occupants: None,
+        limit: row.get(48)?,
         folders: from_id_list(&row.get::<_, String>(32)?),
         archived: row.get(33)?,
         pin: row.get(34)?,
@@ -608,6 +621,8 @@ fn conversation_from(row: &Row) -> rusqlite::Result<Conversation> {
         preview_mine: row.get(43)?,
         seen: row.get(44)?,
         quiet: row.get(45)?,
+        delivered: row.get(46)?,
+        sending: row.get(47)?,
     })
 }
 
@@ -660,6 +675,11 @@ fn message_from(row: &Row) -> rusqlite::Result<Message> {
 }
 
 /// The row's second line: the text, or what was attached, in words.
+/// A message in a few words, as a row's preview or a notification shows it.
+pub fn preview_text(message: &Message) -> String {
+    preview_of(message)
+}
+
 fn preview_of(message: &Message) -> String {
     if !message.text.is_empty() {
         return message.text.chars().take(120).collect();
@@ -719,9 +739,9 @@ fn upsert_conversation(tx: &Transaction, account: &AccountKey, row: &Conversatio
         "INSERT INTO conversation
              (network, account, id, kind, title, space, section, position, avatar, peer, call, listed,
               topic, parent, root, read_only, private, bot, meeting, special, mark, opted_out,
-              folders, archived, pin, hidden, followed)
+              folders, archived, pin, hidden, followed, voice_limit)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
-                 ?20, ?21, ?22, ?24, ?25, ?26, ?27, ?28)
+                 ?20, ?21, ?22, ?24, ?25, ?26, ?27, ?28, ?29)
          ON CONFLICT (network, account, id) DO UPDATE SET
              kind = excluded.kind, title = excluded.title, space = excluded.space,
              section = excluded.section, position = excluded.position, avatar = excluded.avatar,
@@ -729,7 +749,7 @@ fn upsert_conversation(tx: &Transaction, account: &AccountKey, row: &Conversatio
              topic = excluded.topic, parent = excluded.parent, root = excluded.root,
              read_only = excluded.read_only, private = excluded.private, bot = excluded.bot,
              meeting = excluded.meeting, special = excluded.special, mark = excluded.mark,
-             opted_out = excluded.opted_out,
+             opted_out = excluded.opted_out, voice_limit = excluded.voice_limit,
              folders = CASE WHEN ?23 THEN excluded.folders ELSE folders END,
              archived = CASE WHEN ?23 THEN excluded.archived ELSE archived END,
              pin = CASE WHEN ?23 THEN excluded.pin ELSE pin END,
@@ -764,6 +784,7 @@ fn upsert_conversation(tx: &Transaction, account: &AccountKey, row: &Conversatio
             filing.pin,
             filing.hidden,
             filing.followed,
+            row.limit,
         ],
     )?;
     Ok(())
@@ -1503,6 +1524,17 @@ impl Store {
         Ok(changed == 1)
     }
 
+    /// My messages up to `message_id` reached the other side's device. True if the row changed.
+    pub fn set_delivered(&mut self, conversation: &Key, message_id: &str) -> rusqlite::Result<bool> {
+        let changed = self.db.execute(
+            "UPDATE conversation SET delivered_to = ?4
+              WHERE network = ?1 AND account = ?2 AND id = ?3
+                AND (delivered_to = '' OR (length(delivered_to), delivered_to) < (length(?4), ?4))",
+            params![word(&conversation.network), conversation.account, conversation.id, message_id],
+        )?;
+        Ok(changed == 1)
+    }
+
     /// Of these rows, the ones with no preview line yet.
     pub fn previewless(&self, rows: &[Key]) -> rusqlite::Result<Vec<Key>> {
         let mut query = self.db.prepare(
@@ -1763,6 +1795,33 @@ impl Store {
         }
         tx.commit()?;
         Ok(outcome)
+    }
+
+    /// The newest stored message as a list line. Does not mark the conversation opened.
+    pub fn newest_line(&self, conversation: &Key) -> rusqlite::Result<Option<PreviewLine>> {
+        let message = self
+            .db
+            .query_row(
+                &format!(
+                    "SELECT id, text, body FROM message
+                      WHERE network = ?1 AND account = ?2 AND conversation = ?3 AND pending = 0
+                      {NEWEST_FIRST} LIMIT 1"
+                ),
+                params![word(&conversation.network), conversation.account, conversation.id],
+                message_from,
+            )
+            .optional()?;
+        Ok(message.map(|message| {
+            let text = preview_of(&message);
+            let mine = message.outgoing;
+            PreviewLine {
+                id: message.id,
+                text,
+                sender: if mine { String::new() } else { message.sender.name },
+                mine,
+                sent: message.sent,
+            }
+        }))
     }
 
     pub fn message(&self, conversation: &Key, id: &str) -> rusqlite::Result<Option<Message>> {
@@ -2195,7 +2254,8 @@ impl Store {
              AND CASE WHEN ?2 IS NOT NULL THEN p.relation = ?2
                       WHEN ?3 IS NULL THEN p.relation NOT IN ('none', 'blocked')
                       ELSE 1 END
-             AND (?3 IS NULL OR p.name LIKE ?3 ESCAPE '\\' OR p.handle LIKE ?3 ESCAPE '\\')";
+             AND (?3 IS NULL OR p.name LIKE ?3 ESCAPE '\\' OR p.handle LIKE ?3 ESCAPE '\\'
+                  OR LTRIM(p.handle, '@') LIKE ?3 ESCAPE '\\')";
         let network = network.map(|network| word(&network));
         let relation = relation.map(|relation| word(&relation));
         let pattern = query.map(like_prefix);
@@ -2265,6 +2325,21 @@ impl Store {
         )
     }
 
+    /// A picture the adapter fetched itself is the row's and the person's of this id, whichever
+    /// are recorded; nothing else of either changes. Answers (row, person): which were.
+    pub fn set_avatar(&mut self, account: &AccountKey, id: &str, avatar: &str) -> rusqlite::Result<(bool, bool)> {
+        let at = params![word(&account.network), account.account, id, avatar];
+        let row = self.db.execute(
+            "UPDATE conversation SET avatar = ?4 WHERE network = ?1 AND account = ?2 AND id = ?3 AND avatar != ?4",
+            at,
+        )?;
+        let person = self.db.execute(
+            "UPDATE person SET avatar = ?4 WHERE network = ?1 AND account = ?2 AND id = ?3 AND avatar != ?4",
+            at,
+        )?;
+        Ok((row > 0, person > 0))
+    }
+
     // Media.
 
     /// Files the network can serve and where from. A file already on disk stays there; a fresh
@@ -2323,9 +2398,9 @@ impl Store {
         Ok(self.media(account, &[id.to_owned()])?.pop().map(|(file, _)| file))
     }
 
-    /// The fetch failed, and why in plain words. Until `media_retry`, or a fresh address from
-    /// the adapter, the file is answered with this reason and not fetched. `None` when no such
-    /// file was registered.
+    /// The fetch failed because of the file, and why in plain words. Until `media_retry`, or a
+    /// fresh address from the adapter, the file is answered with this reason and not fetched.
+    /// `None` when no such file was registered. A failure of the line is not recorded here.
     pub fn media_failed(&mut self, account: &AccountKey, id: &str, reason: &str) -> rusqlite::Result<Option<MediaFile>> {
         self.db.execute(
             "UPDATE media SET failed = ?4 WHERE network = ?1 AND account = ?2 AND id = ?3 AND path IS NULL",
@@ -2347,6 +2422,26 @@ impl Store {
         }
         tx.commit()?;
         Ok(cleared)
+    }
+
+    /// Forgets every recorded failure that `passing` says was a moment's trouble rather than
+    /// the file's own: an older chatd recorded those too, and a file is not left unfetched for
+    /// them. Answers how many were forgotten.
+    pub fn media_forgive(&mut self, passing: impl Fn(&str) -> bool) -> rusqlite::Result<usize> {
+        let tx = self.db.transaction()?;
+        let failed: Vec<(String, String, String, String)> = tx
+            .prepare("SELECT network, account, id, failed FROM media WHERE failed IS NOT NULL")?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut forgiven = 0;
+        for (network, account, id, why) in failed.iter().filter(|(.., why)| passing(why)) {
+            forgiven += tx.execute(
+                "UPDATE media SET failed = NULL WHERE network = ?1 AND account = ?2 AND id = ?3 AND failed = ?4",
+                params![network, account, id, why],
+            )?;
+        }
+        tx.commit()?;
+        Ok(forgiven)
     }
 
     /// The adapter exchanged an expired address for a fresh one (`Command::Download`): keep it,
@@ -2572,7 +2667,7 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use protocol::Badge;
+    use protocol::{Badge, Receipt};
 
     const NOW: i64 = 1_800_000_000;
 
@@ -2888,6 +2983,38 @@ mod tests {
     }
 
     #[test]
+    fn my_newest_message_goes_from_sending_to_sent_delivered_and_read_and_never_back() {
+        let (mut store, key) = store();
+        let receipt = |store: &Store| store.conversation(&key).unwrap().unwrap().receipt();
+        let mut going = Message::plain("c-1", "me", "on its way", 100, true);
+        going.state = SendState::Pending;
+        store.ingest(&key, &going, false).unwrap();
+        assert_eq!(receipt(&store), Some(Receipt::Sending));
+
+        store.ingest(&key, &Message::plain("12", "me", "there", 200, true), false).unwrap();
+        assert_eq!(receipt(&store), Some(Receipt::Sent));
+        // Received up to an older one of mine says nothing of this one.
+        assert!(store.set_delivered(&key, "9").unwrap());
+        assert_eq!(receipt(&store), Some(Receipt::Sent));
+        assert!(store.set_delivered(&key, "12").unwrap());
+        assert_eq!(receipt(&store), Some(Receipt::Delivered));
+        // A receipt that arrives late never moves the mark back.
+        assert!(!store.set_delivered(&key, "10").unwrap());
+        assert_eq!(receipt(&store), Some(Receipt::Delivered));
+        assert!(store.set_seen(&key, "12").unwrap());
+        assert_eq!(receipt(&store), Some(Receipt::Read));
+        // Read before the delivery receipt came: read it stays.
+        store.ingest(&key, &Message::plain("13", "me", "again", 300, true), false).unwrap();
+        assert!(store.set_seen(&key, "13").unwrap());
+        assert!(!store.set_delivered(&key, "12").unwrap());
+        assert_eq!(receipt(&store), Some(Receipt::Read));
+
+        // Someone else's newest has no mark.
+        store.ingest(&key, &said("14", "ok", 400), true).unwrap();
+        assert_eq!(receipt(&store), None);
+    }
+
+    #[test]
     fn a_row_says_who_spoke_last_and_whether_they_read_mine() {
         let (mut store, key) = store();
         store.ingest(&key, &said("10", "ok", 100), true).unwrap();
@@ -3009,6 +3136,27 @@ mod tests {
     }
 
     #[test]
+    fn a_failure_of_the_line_is_forgiven_and_one_about_the_file_stands() {
+        let (mut store, key) = store();
+        let account = key.account();
+        let avatar = |id: &str| (MediaFile::new(id, protocol::MediaKind::Avatar), format!("https://cdn.example/{id}.png"));
+        store.register_media(&account, &[avatar("a"), avatar("b"), avatar("c")]).unwrap();
+        store.media_failed(&account, "a", "The download failed: tls: invalid peer certificate.").unwrap();
+        store.media_failed(&account, "b", "The file is no longer there (404).").unwrap();
+        // Registered again at the same address, a failure stands: only a fresh address clears it.
+        store.register_media(&account, &[avatar("a"), avatar("b")]).unwrap();
+        let failed = |store: &Store, id: &str| store.media(&account, &[id.to_owned()]).unwrap().pop().unwrap().0.failed;
+        assert!(failed(&store, "a").is_some());
+
+        let passing = |why: &str| why.starts_with("The download failed:");
+        assert_eq!(store.media_forgive(passing).unwrap(), 1);
+        assert_eq!(failed(&store, "a"), None);
+        assert_eq!(failed(&store, "b").as_deref(), Some("The file is no longer there (404)."));
+        assert_eq!(failed(&store, "c"), None);
+        assert_eq!(store.media_forgive(passing).unwrap(), 0);
+    }
+
+    #[test]
     fn pruning_keeps_the_newest_and_what_was_opened_lately() {
         let (mut store, key) = store();
         let account = key.account();
@@ -3084,6 +3232,35 @@ mod tests {
         assert!(!read(&store).iter().any(|(_, key, _)| key == "keep_days"), "reset to the default is no row");
         store.reset_settings().unwrap();
         assert_eq!(read(&store), [(String::new(), VERSION.to_owned(), "1".to_owned())]);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_cache_from_before_the_voice_limit_column_is_rebuilt() {
+        let path = scratch("voice-limit");
+        let mut store = Store::open(&path).unwrap();
+        store.set_setting("", "keep_days", Some("14")).unwrap();
+        store
+            .db
+            .execute_batch(
+                "DROP TABLE conversation;
+                 CREATE TABLE conversation (
+                     network TEXT NOT NULL,
+                     account TEXT NOT NULL,
+                     id TEXT NOT NULL,
+                     PRIMARY KEY (network, account, id)
+                 ) WITHOUT ROWID;
+                 PRAGMA user_version = 5;",
+            )
+            .unwrap();
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        let version: i32 = store.db.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap();
+        assert_eq!(version, SCHEMA);
+        let mut info = store.db.prepare("PRAGMA table_info(conversation)").unwrap();
+        let names: Vec<String> = info.query_map([], |row| row.get::<_, String>(1)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert!(names.iter().any(|name| name == "voice_limit"), "{names:?}");
+        assert!(store.settings().unwrap().iter().any(|setting| setting.key == "keep_days" && setting.value == "14"));
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

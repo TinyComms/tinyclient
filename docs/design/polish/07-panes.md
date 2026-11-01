@@ -4,10 +4,6 @@ Requirements: `product/polish/07-panes-selection.md` (R1–R19, table §1, ladde
 contents are `06-profile-info.md`'s. Mockup: `mockups/07-panes.html` (frames A–H). Sizes in pt; tokens from
 `theme.rs` / `design/01-system.md`. Where this file and `design/02-layout-navigation.md` differ, this one wins.
 
-**Seen in the build** (scratch daemon; `--open` and `--right` work): members 240 vs profile 340, so text reflows on a
-kind change; a 12-unread group opens at the bottom, divider off screen; `>` in the subtitle; a 700 window with a
-thread shows no way to the sidebar; the composer wears the accent focus border permanently.
-
 ## 1. Conversation header (frame A)
 The `STRIP` of `polish/01` (52, hairline below, buttons 28 four apart, 12 from the right). Left to right:
 
@@ -18,13 +14,15 @@ The `STRIP` of `polish/01` (52, hairline below, buttons 28 four apart, 12 from t
 
   | Kind | Subtitle | Icon buttons (right edge last) |
   |---|---|---|
-  | DM | status text if set, else presence words ("Online", "last seen 2 h ago"), else `@handle` | search · **details `user`** |
+  | DM | status text if set, else presence words ("Online", "last seen 2 h ago"), else `@handle` | search · **title opens the profile** |
   | Group DM | "4 people · Ines, Dita, Haruto" | search · members · details `info` |
   | Channel (Discord, Telegram) | `Space › Group · topic` | search · members · details `info` |
   | Slack channel | `Workspace · topic` (+ `Shared` tag 11/500 for Slack Connect) | search · **threads** · members · details |
   | Teams channel | `Team › · description` | search · threads · members · details |
 
 - A conversation in no Space (reached from the Inbox) puts the network icon 14 before the title (6 gap).
+- **Beside a direct conversation the title is the way to the person.** Hover underlines it; a click opens their Profile
+  (as `⌘.` does), so the strip draws no `user` button there.
 - Path glyph is `›` everywhere. **Clicking the subtitle reveals the row in the sidebar**: hover `text_soft`, tooltip
   "Reveal in sidebar".
 - **Buttons**: glyph 16 `text_soft`; hover `hover`, held `pressed`, **lit = `selected` + `text` glyph** = "this kind is
@@ -37,13 +35,15 @@ The `STRIP` of `polish/01` (52, hairline below, buttons 28 four apart, 12 from t
   subtitle goes before the title shrinks below 96. At `C` = 392 with the panel button the title gets 96.
 
 ## 2. The right pane: one frame, many kinds (frames B, C)
-- **One width for every kind: 300, drag 260–420**, double-click the 6 hit strip resets, remembered. `MEMBERS_WIDTH` goes.
-- **Title strip** (`STRIP`): `[‹ crumb]` title 16/600, no count beside it (`polish/01`), close `x` 28 at 12 from the
-  right. Hairline below; fill `sidebar`, hairline left.
+- **One width for every kind: 300, drag 260–420**, double-click the 6 hit strip resets, remembered. `layout.rs` `RIGHT_WIDTH` / `RIGHT_RANGE` are these numbers. A Tiny server page has its own members column; it is not this pane.
+- **Title strip** (`STRIP`): close `x` 28 leads it, then `[‹ crumb]` title 16/600, no count beside it
+  (`polish/01`). The close never trails the title: the window's own buttons end the strip at the
+  right, and an `x` beside minimize reads as another window button. When the crumb is drawn it is
+  the way out, so the close is not drawn twice. Hairline below; fill `sidebar`, hairline left.
 
   | Kind | Title | Opened by | Base or push |
   |---|---|---|---|
-  | Details · person | "Profile" | DM details button; a member row; "View profile" on a card | base in a DM; push elsewhere |
+  | Details · person | "Profile" | the DM's title; a member row; "View profile" on a card | base in a DM; push elsewhere |
   | Details · conversation | "Details" | details in a group or channel | base |
   | Members | "Members" (counts live in its section headers) | members button; Details' Members row | base, or push from Details |
   | Threads (Slack, Teams) | "Threads" | threads button; "3 more threads" in the sidebar | base |
@@ -142,7 +142,7 @@ pane's, so the floating sidebar is always one click away. Picking a row in it cl
 ## New tokens
 | Name | Value | Use |
 |---|---|---|
-| `PANE` / `PANE_RANGE` | 300 / 260–420 | every right-pane kind; replaces `RIGHT_WIDTH` 340 and `MEMBERS_WIDTH` 240 |
+| `PANE` / `PANE_RANGE` | 300 / 260–420 | every conversation right pane. `layout.rs` `RIGHT_WIDTH` / `RIGHT_RANGE` are these numbers. A Tiny server page has its own members column; it is not this pane. |
 | `jump_target` | alias of `accent_soft` | the landed-on message |
 | `FLOAT_CHIP` | 24 high, radius 6 | the "3 new" chip (an in-pane float, `polish/01` §4 stacking) |
 | `composer_focus` | `border_strong` | the composer's focused border; an exception to `polish/01`'s field focus, for its owner to rule on |

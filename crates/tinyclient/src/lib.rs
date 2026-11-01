@@ -31,6 +31,8 @@ mod host;
 #[cfg(all(feature = "gui", any(target_os = "ios", target_os = "android")))]
 mod lottie;
 #[cfg(all(feature = "gui", any(target_os = "ios", target_os = "android")))]
+mod tiny_attach;
+#[cfg(all(feature = "gui", any(target_os = "ios", target_os = "android")))]
 mod update;
 #[cfg(all(feature = "gui", any(target_os = "ios", target_os = "android")))]
 mod view;
@@ -51,7 +53,7 @@ pub fn ios_main() {
         inprocess::register();
         inprocess::start_now();
     }
-    gui::run();
+    gui::run(None, None);
 }
 
 /// The C symbol the Swift target declares in `Tiny-Bridging-Header.h`.
@@ -97,7 +99,7 @@ pub extern "C" fn android_main(app: android_activity::AndroidApp) {
         log::error!("tinyclient: the NativeActivity session has no platform");
         return;
     };
-    gui::run_with(gpui::Application::with_platform(platform.into_rc()));
+    gui::run_with(gpui::Application::with_platform(platform.into_rc()), None, None);
 }
 
 /// chatd on a phone: the core runs in this process, on a thread of its own, over the socket in the

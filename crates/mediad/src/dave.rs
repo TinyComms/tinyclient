@@ -113,7 +113,7 @@ impl Dave {
                 .map_err(|e| e.to_string()),
         };
         if let Err(err) = made {
-            eprintln!("mediad: dave: could not start a session at version {version}: {err}");
+            tracing::warn!("mediad: dave: could not start a session at version {version}: {err}");
             return Vec::new();
         }
         if let Some(sender) = self.early_sender.take() {
@@ -122,7 +122,7 @@ impl Dave {
         match self.session.as_mut().unwrap().create_key_package() {
             Ok(payload) => vec![Outgoing::Binary { op: KEY_PACKAGE, payload }],
             Err(err) => {
-                eprintln!("mediad: dave: no key package: {err}");
+                tracing::warn!("mediad: dave: no key package: {err}");
                 Vec::new()
             }
         }
@@ -135,7 +135,7 @@ impl Dave {
             return;
         };
         if let Err(err) = session.set_external_sender(payload) {
-            eprintln!("mediad: dave: external sender refused: {err}");
+            tracing::warn!("mediad: dave: external sender refused: {err}");
         }
     }
 
@@ -211,7 +211,7 @@ impl Dave {
             0 => ProposalsOperationType::APPEND,
             1 => ProposalsOperationType::REVOKE,
             other => {
-                eprintln!("mediad: dave: unknown proposals operation {other}");
+                tracing::warn!("mediad: dave: unknown proposals operation {other}");
                 return Vec::new();
             }
         };
@@ -223,7 +223,7 @@ impl Dave {
             }
             Ok(None) => Vec::new(),
             Err(err) => {
-                eprintln!("mediad: dave: proposals refused: {err}");
+                tracing::warn!("mediad: dave: proposals refused: {err}");
                 Vec::new()
             }
         }
@@ -250,7 +250,7 @@ impl Dave {
         match session.process_commit(commit) {
             Ok(()) => self.joined_epoch(transition),
             Err(err) => {
-                eprintln!("mediad: dave: commit for transition {transition} refused: {err}");
+                tracing::warn!("mediad: dave: commit for transition {transition} refused: {err}");
                 self.recover(transition)
             }
         }
@@ -265,7 +265,7 @@ impl Dave {
         match session.process_welcome(welcome) {
             Ok(()) => self.joined_epoch(transition),
             Err(err) => {
-                eprintln!("mediad: dave: welcome for transition {transition} refused: {err}");
+                tracing::warn!("mediad: dave: welcome for transition {transition} refused: {err}");
                 self.recover(transition)
             }
         }
@@ -280,7 +280,7 @@ impl Dave {
         match self.session.as_mut()?.encrypt_opus(frame) {
             Ok(sealed) => Some(sealed.into_owned()),
             Err(err) => {
-                eprintln!("mediad: dave: frame not encrypted, dropped: {err}");
+                tracing::warn!("mediad: dave: frame not encrypted, dropped: {err}");
                 None
             }
         }

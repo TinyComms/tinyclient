@@ -332,7 +332,7 @@ impl MemberList {
             }
             Ok(Response::Error { detail, .. }) => self.failed(page, detail),
             Ok(_) => self.failed(page, crate::client::OTHER_ANSWER.to_owned()),
-            Err(err) => self.failed(page, crate::client::trouble_words(&err)),
+            Err(err) => self.failed(page, crate::client::trouble_words("people", &err)),
         }
         if retryable && self.requests.failed.contains(&page) {
             // Transient gateway congestion must not leave a stationary viewport

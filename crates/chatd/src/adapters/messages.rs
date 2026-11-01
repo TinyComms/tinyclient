@@ -18,12 +18,14 @@ use protocol::{
     Reaction, ReactionSet, Relation,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 
 /// Others are shown as typing for this long after the phone says they started.
 const TYPING_SHOWN: i64 = 15;
+/// Most participants whose pictures are asked of the phone in one request.
+const PICTURES: usize = 25;
 
 fn scripted() -> bool {
     !session::enabled() && std::env::var_os("TINYCLIENT_MESSAGES_FAKE").is_some()
@@ -35,6 +37,16 @@ pub fn supported() -> bool {
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Saved {
+    #[serde(default)]
+    cookies: HashMap<String, String>,
+    #[serde(default)]
+    session_id: String,
+    #[serde(default)]
+    dest_reg_id: String,
+    #[serde(default)]
+    pairing_id: String,
+    #[serde(default)]
+    dest_phone_id: u64,
     account: String,
     #[serde(default)]
     name: String,
@@ -93,6 +105,8 @@ trait Drive: Send + Sync {
         message: &str,
         action: &str,
     ) -> Result<Vec<u8>, String>;
+    /// The pictures the phone keeps for these participants, as (participant, bytes).
+    fn thumbnails(&self, participants: &[String]) -> Result<Vec<(String, Vec<u8>)>, String>;
     fn mark_read(&self, conversation: &str, message: &str) -> Result<(), String>;
     fn typing(&self, conversation: &str) -> Result<(), String>;
     fn close(&self);
@@ -139,6 +153,9 @@ impl Drive for LiveDrive {
     ) -> Result<Vec<u8>, String> {
         self.inner.fetch(media_id, key, message, action)
     }
+    fn thumbnails(&self, participants: &[String]) -> Result<Vec<(String, Vec<u8>)>, String> {
+        self.inner.thumbnails(participants)
+    }
     fn mark_read(&self, conversation: &str, message: &str) -> Result<(), String> {
         self.inner.mark_read(conversation, message)
     }
@@ -181,6 +198,11 @@ fn open(saved: &Saved) -> Result<Box<dyn Drive>, String> {
         return Ok(Box::new(fake::Fake::open(saved)));
     }
     let real = bugle::Saved {
+        cookies: saved.cookies.clone(),
+        session_id: saved.session_id.clone(),
+        dest_reg_id: saved.dest_reg_id.clone(),
+        pairing_id: saved.pairing_id.clone(),
+        dest_phone_id: saved.dest_phone_id,
         account: saved.account.clone(),
         name: saved.name.clone(),
         aes: saved.aes.clone(),
@@ -227,6 +249,10 @@ struct Account {
     me: String,
     name: String,
     held: Mutex<HashMap<String, Held>>,
+    /// Each one-to-one chat's other side, by participant id: whose picture its row shows.
+    peers: Mutex<HashMap<String, String>>,
+    /// Participants whose picture has been asked of the phone on this connection.
+    pictured: Mutex<HashSet<String>>,
 }
 
 pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<(), String> {
@@ -294,6 +320,8 @@ fn connect(ctx: &Context, saved: &Saved, current: &Mutex<Option<Arc<Account>>>) 
         me,
         name,
         held: Mutex::default(),
+        peers: Mutex::default(),
+        pictured: Mutex::default(),
     });
     ctx.capabilities(Capabilities {
         max_file_bytes: 100 * 1024 * 1024,
@@ -361,8 +389,16 @@ fn apply(account: &Account, event: Event) {
     match event {
         Event::Chats(chats) => {
             let mut people = Vec::new();
+            {
+                let mut peers = account.peers.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                for chat in chats.iter().filter(|chat| !chat.peer.is_empty()) {
+                    peers.insert(chat.id.clone(), chat.peer.clone());
+                }
+            }
             for chat in &chats {
-                let _ = account.ctx.conversation(&row(chat));
+                // A picture fetched earlier stays the row's when the row is recorded again.
+                let avatar = account.ctx.avatar_of(&chat.id);
+                let _ = account.ctx.conversation(&ConversationRow { avatar: avatar.clone(), ..row(chat) });
                 if chat.unread {
                     let _ = account.ctx.counts(&chat.id, 1, 0, None, 0);
                 }
@@ -371,7 +407,7 @@ fn apply(account: &Account, event: Event) {
                         id: chat.id.clone(),
                         name: chat.title.clone(),
                         handle: String::new(),
-                        avatar: None,
+                        avatar,
                         bot: false,
                         status: String::new(),
                         link: String::new(),
@@ -401,12 +437,14 @@ fn apply(account: &Account, event: Event) {
                     group: false,
                     unread: false,
                     mine: String::new(),
+                    peer: String::new(),
                 };
                 let _ = account.ctx.conversation(&row(&chat));
             }
             let _ = account
                 .ctx
                 .message(&note.conversation, &message(account, &note));
+            receipt(account, &note.conversation, &note);
         }
         Event::Typing {
             conversation,
@@ -617,6 +655,55 @@ fn wanted(account: &Account, ids: &[String]) {
     }
 }
 
+/// The pictures of the people whose chats are on screen (rows, people, the open conversation):
+/// each asked of the phone once a connection, together, off the command thread since the phone
+/// may be slow to answer. What lands is the row's and the person's avatar. Groups have none:
+/// the shell draws their faces.
+fn pictures(account: &Arc<Account>, watching: &protocol::Watching) {
+    let on_screen = watching.rows.iter().chain(&watching.people).chain(&watching.conversation);
+    let ours: Vec<String> = on_screen.filter(|key| key.account() == account.ctx.account).map(|key| key.id.clone()).collect();
+    let wanted: Vec<(String, String)> = {
+        let peers = account.peers.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut pictured = account.pictured.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut wanted = Vec::new();
+        for id in ours {
+            let Some(peer) = peers.get(&id) else {
+                continue;
+            };
+            if wanted.len() < PICTURES && pictured.insert(peer.clone()) {
+                wanted.push((id, peer.clone()));
+            }
+        }
+        wanted
+    };
+    if wanted.is_empty() {
+        return;
+    }
+    let account = account.clone();
+    let spawned = std::thread::Builder::new().name("messages-pictures".into()).spawn(move || {
+        let participants: Vec<String> = wanted.iter().map(|(_, peer)| peer.clone()).collect();
+        let pictures = match account.drive.thumbnails(&participants) {
+            Ok(pictures) => pictures,
+            // Asked again on the next connection.
+            Err(why) => return tracing::warn!("chatd: Messages: pictures: {why}"),
+        };
+        for (participant, bytes) in pictures {
+            // A new picture is a new id, so the shell never draws the old one in its place.
+            let id = format!("messages:avatar:{participant}:{:016x}", blobs::fnv_bytes(&bytes));
+            let file = MediaFile::new(id.clone(), MediaKind::Avatar);
+            if account.ctx.landed(&file, &format!("messages://avatar/{participant}"), &bytes).is_none() {
+                continue;
+            }
+            for (conversation, _) in wanted.iter().filter(|(_, peer)| *peer == participant) {
+                let _ = account.ctx.avatar(conversation, &id);
+            }
+        }
+    });
+    if let Err(err) = spawned {
+        tracing::warn!("chatd: Messages: {err}");
+    }
+}
+
 fn offline(ctx: &Context, command: Command) {
     let why = "Messages is offline. Keep your phone online.".to_owned();
     match command {
@@ -658,7 +745,7 @@ fn serve(account: &Arc<Account>, command: Command) {
             message_id,
         } => {
             if let Err(why) = account.drive.mark_read(&conversation_id, &message_id) {
-                eprintln!("chatd: Messages: {why}");
+                tracing::warn!("chatd: Messages: {why}");
             }
         }
         Command::Send {
@@ -742,6 +829,7 @@ fn serve(account: &Arc<Account>, command: Command) {
             let _ = reply.send(answer);
         }
         Command::Wanted(ids) => wanted(account, &ids),
+        Command::Watch(watching) => pictures(account, &watching),
         Command::Typing(conversation_id) => {
             let _ = account.drive.typing(&conversation_id);
         }
@@ -763,13 +851,26 @@ fn outgoing(account: &Account, id: String, text: String) -> Message {
     message
 }
 
+/// The second tick or the read mark, when the phone says one of my messages has it.
+fn receipt(account: &Account, conversation: &str, note: &bugle::Note) {
+    if !(note.outgoing || note.author == account.me) {
+        return;
+    }
+    let _ = match bugle::receipt(note.status) {
+        Some(bugle::Receipt::Delivered) => account.ctx.delivered(conversation, &note.id),
+        Some(bugle::Receipt::Read) => account.ctx.seen(conversation, &note.id),
+        None => Ok(()),
+    };
+}
+
 fn backfill(account: &Account, conversation: &str) {
     match account.drive.history(conversation) {
         Ok(notes) => {
             for note in notes {
                 let _ = account.ctx.message(conversation, &message(account, &note));
+                receipt(account, conversation, &note);
             }
         }
-        Err(why) => eprintln!("chatd: Messages: {why}"),
+        Err(why) => tracing::warn!("chatd: Messages: {why}"),
     }
 }

@@ -6,7 +6,7 @@ Everything I do to write a message and to act on one. Mockups: `mockups/04-compo
 
 1. **One editor.** Editing a sent message happens in the composer, not in the row. One text entity, no row that changes height inside a virtual list, same behavior in a thread pane.
 2. **Plain text with visible markup.** No WYSIWYG. `**bold**`, `_italic_`, `~~strike~~`, `` `code` ``, fenced blocks, `> quote`, `- list` stay as typed, with the markup characters in `text_faint`. One dialect on every network; the adapter writes each network's own.
-3. **Text sends optimistically; attachments hold the composer.** Text-only: the row appears at once and the field empties (S1). With attachments: the composer locks and shows progress until the upload ends, so a failure leaves text and chips exactly where they were (story 21).
+3. **Text sends as a pending row; the composer stays free.** Text-only and attachments both become a pending row, and the field is free for the next message (`design.md` ruling 9). On a Tiny server that advertises `file_scan`, the chips stay in that conversation and Send stays blocked there until the upload and the message settle. The caption is "Scanning that file before it sends." (or "those files"). Other conversations can send. An older Tiny server, and every other network, clears the chips when the pending row is stored. A scanning server that refuses archives rejects them at staging with "This server doesn't take archives."
 4. **Delete asks once; no undo toast.** No network can restore a message, and an undo toast means secretly delaying the delete while others still read it.
 5. **Offline does not disable the composer.** Return still works (S3). Only signed-out, read-only and no-permission replace it.
 6. **Escape never clears typed text.** It closes, then cancels, in the order of the key table.
@@ -70,7 +70,7 @@ Dock: `px 20`, `pb 16`. Above it the 20 px typing slot (live signals), always re
 
 ## What the input must do (GPUI: custom element)
 
-Soft wrap at the field width; caret and selection across wrapped and hard lines; click, drag, double-click word, triple-click line; arrow, word and line motion; IME marked text and the system emoji picker through the same input handler `input.rs` already has; undo stack; internal scroll. **Atomic tokens:** a completed mention or channel is stored as a range with an id and drawn as `accent` text on an `accent_soft` 4 px-radius pill; the caret cannot enter it, one Backspace removes it whole, copy yields its label. Custom emoji are the text `:name:` tinted `text_soft` (no inline images in the field). Unicode emoji are ordinary characters. It does not: render bold or italic, show images inline, spell-check with underlines (P2 through `NSSpellChecker`), auto-correct, auto-pair brackets, convert `:)` to an emoji, or turn a long paste into a file.
+Soft wrap at the field width; caret and selection across wrapped and hard lines; click, drag, double-click word, triple-click line; arrow, word and line motion; IME marked text and the system emoji picker through the same input handler `input.rs` already has; undo stack; internal scroll. **Atomic tokens:** a completed mention or channel is stored as a range with an id and drawn as `accent` text on an `accent_soft` 4 px-radius pill; the caret cannot enter it, one Backspace removes it whole, copy yields its label. Custom emoji are the text `:name:` tinted `text_soft` (no inline images in the field). Unicode emoji are ordinary characters. It does not: render bold or italic, show images inline, spell-check with underlines (P2 through `NSSpellChecker`), auto-correct, auto-pair brackets, or turn a long paste into a file. With Settings › Messages › Convert emoticons to emoji on, `:)` `:(` `:D` `;)` `<3` become emoji on send, never inside code. The switch is off by default.
 
 ## Autocomplete (frame 7)
 
@@ -135,6 +135,8 @@ What may be added follows the conversation's rules, asked when it opens (`Reacti
 | Slack | The standard emoji chatd can name, in any tone; the workspace's custom emoji | 23 | 50 | |
 | Teams | The emoji Teams has a key for here | No limit | No limit | |
 | Signal | Any one emoji | 1; a new one replaces mine | No limit | |
+| Messages | Any emoji | 1; a new one replaces mine | The phone's own limit | |
+| Tiny server | Unicode emoji | The adapter's default rules | The adapter's default rules | |
 
 Where nothing may be added (reactions off, only joining allowed, a message at its cap) the toolbar's Add reaction, the menu's React and the `+` chip are absent; the `+` chip stays laid out so the row keeps its height. A chip that cannot be joined is not clickable and its tooltip says why. A chatd that does not answer `Reactions` leaves everything offered, as before.
 

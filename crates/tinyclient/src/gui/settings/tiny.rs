@@ -237,6 +237,6 @@ fn failure(answer: std::io::Result<Response>) -> String {
     match answer {
         Ok(Response::Error { detail, .. }) => detail,
         Ok(_) => crate::client::OTHER_ANSWER.to_owned(),
-        Err(err) => crate::client::trouble_words(&err),
+        Err(err) => crate::client::trouble_words("tiny", &err),
     }
 }

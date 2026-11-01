@@ -119,7 +119,7 @@ impl Flow {
                 // code, a few times, before the sheet says so.
                 Err(Fault::Net(why)) if tries + 1 < TRIES => {
                     tries += 1;
-                    eprintln!("chatd: Signal: linking: {}", super::super::net::redact(&why));
+                    tracing::warn!("chatd: Signal: linking: {}", super::super::net::redact(&why));
                     self.show(SignInStep::Qr { link: String::new(), expires: 0, problem: Some(SignInProblem::Unreachable) });
                     linker = match super::linker() {
                         Ok(linker) => linker,

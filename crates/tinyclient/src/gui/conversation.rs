@@ -118,6 +118,8 @@ struct Open {
     /// What it takes as reactions, once chatd said. `None` until then, or from a chatd that
     /// does not say: everything is offered, as before there were rules.
     reactions: Option<protocol::ReactionRules>,
+    /// What became of my newest message, from the conversation's row.
+    receipt: Option<protocol::Receipt>,
     #[cfg_attr(not(feature = "gui-shot"), allow(dead_code))]
     started: Instant,
 }
@@ -371,13 +373,16 @@ impl Pane {
         self.thread
     }
 
-    /// Shows this conversation. The same one again only takes its new title and picture.
+    /// Shows this conversation. The same one again only takes its new title, picture and the
+    /// mark on my newest message.
     /// `typing`: it has a composer, which takes the focus; otherwise the messages do.
     fn show(&mut self, conversation: &Conversation, me: &str, picture: Option<MediaFile>, typing: bool, cx: &mut Context<Self>) {
+        let receipt = conversation.receipt();
         if let Some(open) = self.open.as_mut().filter(|open| open.key == conversation.key) {
-            if open.title != conversation.title || open.picture != picture {
+            if open.title != conversation.title || open.picture != picture || open.receipt != receipt {
                 open.title.clone_from(&conversation.title);
                 open.picture = picture;
+                open.receipt = receipt;
                 cx.notify();
             }
             return;
@@ -392,6 +397,7 @@ impl Pane {
         self.wants_focus = !typing;
         if let Some(open) = self.open.as_mut() {
             open.picture = picture;
+            open.receipt = receipt;
         }
     }
 
@@ -426,6 +432,7 @@ impl Pane {
             marker_known: false,
             root,
             reactions: None,
+            receipt: None,
             started: Instant::now(),
         });
         self.window = pages::Window::default();
@@ -571,7 +578,7 @@ impl Pane {
                     self.older_failed = Some(match other {
                         Ok(Response::Error { detail, .. }) => detail,
                         Ok(_) => crate::client::OTHER_ANSWER.to_owned(),
-                        Err(err) => crate::client::trouble_words(&err),
+                        Err(err) => crate::client::trouble_words("send", &err),
                     });
                     if purpose == Purpose::Open {
                         // Nothing is known about this conversation, least of all that it is
@@ -1350,7 +1357,7 @@ impl Shell {
         }
     }
 
-    pub(super) fn conversation(&self, snapshot: &Snapshot, window: &Window, cx: &mut Context<Self>) -> Div {
+    pub(super) fn conversation(&self, snapshot: &Snapshot, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let Some(open) = snapshot.open.as_ref() else {
             return div()
                 .size_full()

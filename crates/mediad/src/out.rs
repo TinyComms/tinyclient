@@ -17,7 +17,7 @@ pub fn send(frame: &MediaResponse) {
 /// Says why the call cannot go on, then exits: chatd shows the reason and reaps us.
 pub fn fail(reason: CallFailure, detail: impl Into<String>) -> ! {
     let detail = detail.into();
-    eprintln!("mediad: failed ({reason:?}): {detail}");
+    tracing::warn!("mediad: failed ({reason:?}): {detail}");
     send(&MediaResponse::Failed { reason, detail });
     std::process::exit(2);
 }

@@ -1,22 +1,22 @@
 # Downloads are the files GitHub Actions built and attached to the newest release. Each release
 # also carries these names without the version (.github/workflows/release.yml), so the links
 # never change. 302: the target moves with every release.
-/download/macos              https://github.com/itz4blitz/tinyclient/releases/latest/download/tinyclient-macos.dmg                      302
-/download/macos-zip          https://github.com/itz4blitz/tinyclient/releases/latest/download/tinyclient-macos.zip                      302
-/download/deb                https://github.com/itz4blitz/tinyclient/releases/latest/download/tinyclient-linux-x86_64.deb               302
-/download/rpm                https://github.com/itz4blitz/tinyclient/releases/latest/download/tinyclient-linux-x86_64.rpm               302
-/download/appimage           https://github.com/itz4blitz/tinyclient/releases/latest/download/tinyclient-linux-x86_64.AppImage          302
-/download/linux-tar          https://github.com/itz4blitz/tinyclient/releases/latest/download/tinyclient-linux-x86_64.tar.gz            302
-/download/deb-arm64          https://github.com/itz4blitz/tinyclient/releases/latest/download/tinyclient-linux-aarch64.deb              302
-/download/rpm-arm64          https://github.com/itz4blitz/tinyclient/releases/latest/download/tinyclient-linux-aarch64.rpm              302
-/download/appimage-arm64     https://github.com/itz4blitz/tinyclient/releases/latest/download/tinyclient-linux-aarch64.AppImage         302
-/download/linux-tar-arm64    https://github.com/itz4blitz/tinyclient/releases/latest/download/tinyclient-linux-aarch64.tar.gz           302
-/download/windows            https://github.com/itz4blitz/tinyclient/releases/latest/download/tinyclient-windows-x86_64-setup.exe       302
-/download/windows-portable   https://github.com/itz4blitz/tinyclient/releases/latest/download/tinyclient-windows-x86_64.zip             302
-/download/checksums          https://github.com/itz4blitz/tinyclient/releases/latest/download/SHA256SUMS                                302
+/download/macos              https://github.com/TinyComms/tinyclient/releases/latest/download/tinyclient-macos.dmg                      302
+/download/macos-zip          https://github.com/TinyComms/tinyclient/releases/latest/download/tinyclient-macos.zip                      302
+/download/deb                https://github.com/TinyComms/tinyclient/releases/latest/download/tinyclient-linux-x86_64.deb               302
+/download/rpm                https://github.com/TinyComms/tinyclient/releases/latest/download/tinyclient-linux-x86_64.rpm               302
+/download/appimage           https://github.com/TinyComms/tinyclient/releases/latest/download/tinyclient-linux-x86_64.AppImage          302
+/download/linux-tar          https://github.com/TinyComms/tinyclient/releases/latest/download/tinyclient-linux-x86_64.tar.gz            302
+/download/deb-arm64          https://github.com/TinyComms/tinyclient/releases/latest/download/tinyclient-linux-aarch64.deb              302
+/download/rpm-arm64          https://github.com/TinyComms/tinyclient/releases/latest/download/tinyclient-linux-aarch64.rpm              302
+/download/appimage-arm64     https://github.com/TinyComms/tinyclient/releases/latest/download/tinyclient-linux-aarch64.AppImage         302
+/download/linux-tar-arm64    https://github.com/TinyComms/tinyclient/releases/latest/download/tinyclient-linux-aarch64.tar.gz           302
+/download/windows            https://github.com/TinyComms/tinyclient/releases/latest/download/tinyclient-windows-x86_64-setup.exe       302
+/download/windows-portable   https://github.com/TinyComms/tinyclient/releases/latest/download/tinyclient-windows-x86_64.zip             302
+/download/checksums          https://github.com/TinyComms/tinyclient/releases/latest/download/SHA256SUMS                                302
 # Linux has four formats to choose from, so its link goes to the choice.
 /download/linux              /docs/#linux                                                                                               302
 /download                    /docs/                                                                                                     302
-/releases                    https://github.com/itz4blitz/tinyclient/releases                                                           302
-/source                      https://github.com/itz4blitz/tinyclient                                                                    302
-/github                      https://github.com/itz4blitz/tinyclient                                                                    302
+/releases                    https://github.com/TinyComms/tinyclient/releases                                                           302
+/source                      https://github.com/TinyComms/tinyclient                                                                    302
+/github                      https://github.com/TinyComms/tinyclient                                                                    302
