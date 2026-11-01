@@ -361,6 +361,8 @@ impl Flow {
     fn stop(&self) {
         if let Some(out) = &self.out {
             out.stop.store(true, Ordering::Relaxed);
+            // A phone's authentication session goes with it.
+            browser::close_auth();
         }
     }
 
@@ -395,6 +397,8 @@ impl Flow {
             (Err(reason), _) | (_, Err(reason)) => return SignInStep::Failed { reason },
         };
         let redirect_uri = format!("http://127.0.0.1:{port}/callback");
+        // A phone's authentication session is told where the page comes back to.
+        browser::set_callback(&redirect_uri);
         let invite = (!self.code.is_empty()).then_some(self.code.as_str());
         let authorize_url = match auth_start(&self.server, &redirect_uri, &browser::challenge(&verifier), &state, invite) {
             Ok(url) if browser::web_link(&url) => url,
@@ -476,6 +480,8 @@ struct Wait {
 impl Wait {
     fn run(self, listener: TcpListener) {
         let back = browser::wait(listener, &self.state, self.patience, &self.stop);
+        // The page came back, or it never will: a phone takes its authentication session away.
+        browser::close_auth();
         let stopped = |problem| SignInStep::Browser {
             server: self.server.clone(),
             provider: self.provider.clone(),
@@ -775,6 +781,72 @@ mod tests {
     }
 
     /// The whole join: a pasted code, the browser out and back, and the session kept as before.
+    /// A phone's authentication session (`protocol::web_sign_in`), as a fake: it catches the
+    /// provider's redirect and hands it over instead of loading it, and records being closed.
+    struct Phone {
+        heard: Arc<Mutex<Heard>>,
+        closed: Arc<std::sync::atomic::AtomicBool>,
+        callbacks: Mutex<Vec<String>>,
+    }
+
+    struct Session(Arc<std::sync::atomic::AtomicBool>);
+
+    impl protocol::web_sign_in::AuthHandle for Session {
+        fn closed(&mut self) -> bool {
+            false
+        }
+        fn close(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+
+    impl protocol::web_sign_in::WebSignIn for Phone {
+        fn open_page(&self, _: protocol::web_sign_in::WebPage) -> Result<Box<dyn protocol::web_sign_in::WebPageHandle>, String> {
+            Err("a Tiny sign-in opens no in-app page".to_owned())
+        }
+        fn open_auth(&self, auth: protocol::web_sign_in::AuthRequest) -> Result<Box<dyn protocol::web_sign_in::AuthHandle>, String> {
+            let mut heard = self.heard.lock().unwrap();
+            heard.opened.push(auth.url.clone());
+            let (redirect, state) = heard.starts.last().cloned().unwrap_or_default();
+            assert_eq!(auth.callback, redirect, "the session is told the loopback redirect");
+            self.callbacks.lock().unwrap().push(auth.callback.clone());
+            // Someone else's redirect first: it is not delivered.
+            (auth.redirected)("http://127.0.0.1:1/callback?code=stolen&state=x".to_owned());
+            (auth.redirected)(format!("{redirect}?code=one-time-code&state={state}"));
+            Ok(Box::new(Session(self.closed.clone())))
+        }
+    }
+
+    #[test]
+    fn a_phone_signs_in_through_its_authentication_session_and_it_is_closed_after() {
+        let _one = one_sheet();
+        cancel();
+        let heard = Arc::new(Mutex::new(Heard::default()));
+        let base = server(heard.clone());
+        let packed = protocol::pack_join(&base, "invite").unwrap();
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let phone = Arc::new(Phone { heard: heard.clone(), closed: closed.clone(), callbacks: Mutex::default() });
+        protocol::web_sign_in::register(phone.clone());
+        let kept = Arc::new(Mutex::new(None::<String>));
+        let keep = kept.clone();
+        let hub = hub();
+        let mut since = hub.seq();
+        // The system opener, as a phone runs it: no browser, the platform's session.
+        step_with(&hub, None, Box::new(move |session| {
+            *keep.lock().unwrap() = Some(session.to_owned());
+            Ok(Vec::new())
+        }), Browser::system).unwrap();
+        let shown = step(&hub, Some(SignInInput::Invite { code: packed }), adopt()).unwrap();
+        assert!(matches!(shown, SignInStep::Browser { waiting: true, problem: None, .. }), "{shown:?}");
+        let done = next_step(&hub, &mut since);
+        protocol::web_sign_in::unregister();
+        assert_eq!(done, SignInStep::Done { account: Some(AccountKey { network: Network::Tiny, account: ADA.into() }) });
+        assert!(kept.lock().unwrap().as_deref().is_some_and(|session| session.contains("tok_join")));
+        assert_eq!(heard.lock().unwrap().opened, ["https://auth.example/authorize?client_id=tinyserver&state=server-state"]);
+        assert!(phone.callbacks.lock().unwrap()[0].starts_with("http://127.0.0.1:"));
+        assert!(closed.load(Ordering::Relaxed), "the authentication session is taken away once the page came back");
+    }
+
     #[test]
     fn a_code_signs_in_through_the_browser_and_the_server_gets_only_the_token() {
         let _one = one_sheet();

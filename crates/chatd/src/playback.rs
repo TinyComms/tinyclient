@@ -12,9 +12,9 @@ use protocol::{
     read_frame, write_frame, AccountKey, Change, Key, PlayRequest, PlayState, Playback, PlayerEvent,
     PlayerRequest, RATES,
 };
-use std::io::{self, BufReader};
+use std::io::{self, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{ChildStdin, Command, Stdio};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -32,7 +32,7 @@ struct Slot {
     path: PathBuf,
     output: Option<String>,
     /// The running mediad's stdin. Closing it is the pause.
-    stdin: Option<ChildStdin>,
+    stdin: Option<Box<dyn Write + Send>>,
     /// Tells this start from the next, for the threads that read an earlier mediad.
     generation: u64,
 }
@@ -120,11 +120,13 @@ impl Player {
     }
 
     /// Runs `mediad --play` for the slot's file, from the slot's place.
-    fn spawn(&self, hub: &Arc<Hub>, slot: &Slot, generation: u64) -> io::Result<ChildStdin> {
+    fn spawn(&self, hub: &Arc<Hub>, slot: &Slot, generation: u64) -> io::Result<Box<dyn Write + Send>> {
         let shown = slot.shown.as_ref().expect("a file to play");
-        let mut child = protocol::launch::no_console(Command::new(mediad_path()?).arg("--play")).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
-        let mut stdin = child.stdin.take().expect("stdin is piped");
-        let mut stdout = BufReader::new(child.stdout.take().expect("stdout is piped"));
+        // The process on a desktop; mediad's threads in this process on a phone.
+        let spawned = protocol::media_host::spawn(protocol::launch::no_console(Command::new(mediad_path()?).arg("--play")))?;
+        let protocol::media_host::Spawned { mut child, stdin, stdout } = spawned;
+        let mut stdin = stdin.expect("stdin is piped");
+        let mut stdout = BufReader::new(stdout.expect("stdout is piped"));
         let open = PlayerRequest::Open {
             path: slot.path.display().to_string(),
             at: shown.at,

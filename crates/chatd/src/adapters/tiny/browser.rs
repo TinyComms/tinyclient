@@ -8,7 +8,8 @@ use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use protocol::web_sign_in::{AuthHandle, AuthRequest, WebSignIn};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Opens a page in the system browser. Tests answer the page themselves.
@@ -52,14 +53,86 @@ pub fn web_link(url: &str) -> bool {
         && !url.chars().any(|c| c.is_whitespace() || c.is_control() || c == '"')
 }
 
-/// The system browser, at `url`. Only a web link is opened.
+/// The system browser, at `url`. Only a web link is opened. On a phone, which has no browser to
+/// start, the platform's authentication session (`protocol::web_sign_in`) shows it instead.
 pub fn system() -> Opener {
     Arc::new(|url: &str| {
         if !web_link(url) {
             return Err("That isn't a web page.".to_owned());
         }
+        if let Some(web) = protocol::web_sign_in::provider() {
+            return phone_open(&*web, url);
+        }
         system_open(url)
     })
+}
+
+/// The loopback redirect of the sign-in that is out, for a phone's authentication session.
+static CALLBACK: Mutex<Option<String>> = Mutex::new(None);
+/// The authentication session showing, closed when the sign-in ends.
+static AUTH: Mutex<Option<Box<dyn AuthHandle>>> = Mutex::new(None);
+
+/// Names the redirect the next page opened on a phone comes back to.
+pub fn set_callback(redirect_uri: &str) {
+    *CALLBACK.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(redirect_uri.to_owned());
+}
+
+/// Takes a phone's authentication session away: the sign-in is over, one way or another. Nothing
+/// on a desktop, whose browser tab stays and says it can be closed.
+pub fn close_auth() {
+    let showing = AUTH.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
+    if let Some(mut showing) = showing {
+        showing.close();
+    }
+}
+
+/// Opens `url` in the platform's authentication session. The provider's page comes back to the
+/// loopback listener `wait` holds, as a desktop browser does. Should the platform catch the
+/// redirect itself, it hands it over and it is delivered to that listener here (`replay`), so
+/// either way the one listener decides.
+fn phone_open(web: &dyn WebSignIn, url: &str) -> Result<(), String> {
+    let callback = CALLBACK.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone().ok_or_else(|| NOT_OPENED.to_owned())?;
+    let to = callback.clone();
+    let auth = AuthRequest {
+        url: url.to_owned(),
+        callback,
+        redirected: Arc::new(move |redirect: String| {
+            let to = to.clone();
+            std::thread::spawn(move || replay(&to, &redirect));
+        }),
+    };
+    let showing = web.open_auth(auth).map_err(|why| {
+        tracing::warn!("chatd: the sign-in page could not be shown: {why}");
+        NOT_OPENED.to_owned()
+    })?;
+    if let Some(mut old) = AUTH.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).replace(showing) {
+        old.close();
+    }
+    Ok(())
+}
+
+/// Delivers a redirect the platform caught to the loopback listener, as the browser would have:
+/// one `GET /callback?…`. Only a redirect to this sign-in's own callback is delivered.
+pub fn replay(callback: &str, redirect: &str) {
+    let Some(rest) = redirect.strip_prefix(callback) else {
+        return;
+    };
+    if !(rest.is_empty() || rest.starts_with('?')) {
+        return;
+    }
+    let Some(host) = callback.strip_prefix("http://").and_then(|rest| rest.split('/').next()) else {
+        return;
+    };
+    if !host.starts_with("127.0.0.1:") {
+        return;
+    }
+    let Ok(mut stream) = TcpStream::connect(host) else {
+        return;
+    };
+    let _ = stream.set_read_timeout(Some(READ));
+    let _ = write!(stream, "GET /callback{rest} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    let mut answer = Vec::new();
+    let _ = stream.read_to_end(&mut answer);
 }
 
 #[cfg(target_os = "macos")]

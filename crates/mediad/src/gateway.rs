@@ -52,7 +52,7 @@ pub struct Socket {
 
 /// `TINYCLIENT_VOICE_PLAIN` drops TLS, for a fake voice server on localhost. Discord is always TLS.
 fn url(endpoint: &str) -> String {
-    let scheme = if std::env::var_os("TINYCLIENT_VOICE_PLAIN").is_some() { "ws" } else { "wss" };
+    let scheme = if crate::out::var_os("TINYCLIENT_VOICE_PLAIN").is_some() { "ws" } else { "wss" };
     let endpoint = endpoint.trim_start_matches("wss://").trim_end_matches('/');
     format!("{scheme}://{endpoint}/?v=8")
 }
@@ -61,10 +61,11 @@ fn url(endpoint: &str) -> String {
 /// exception, for tests: in a scratch directory (`TINYCLIENT_DIR` set, as every test and demo
 /// runs) `TINYCLIENT_VOICE_TRUST` names a PEM certificate to trust as well, so a fake voice server
 /// can speak real TLS. Without `TINYCLIENT_DIR` the variable is ignored.
+#[cfg(not(target_os = "android"))]
 fn connector() -> io::Result<native_tls::TlsConnector> {
     let mut builder = native_tls::TlsConnector::builder();
-    let scratch = std::env::var_os("TINYCLIENT_DIR").is_some();
-    if let Some(path) = std::env::var_os("TINYCLIENT_VOICE_TRUST").filter(|_| scratch) {
+    let scratch = crate::out::var_os("TINYCLIENT_DIR").is_some();
+    if let Some(path) = crate::out::var_os("TINYCLIENT_VOICE_TRUST").filter(|_| scratch) {
         let certificate = native_tls::Certificate::from_pem(&std::fs::read(path)?).map_err(io::Error::other)?;
         builder.add_root_certificate(certificate);
     }
@@ -76,6 +77,7 @@ fn connector() -> io::Result<native_tls::TlsConnector> {
 /// The handshake is done here and not by `tungstenite::client_tls`: the socket has a read
 /// timeout, and tungstenite 0.30 panics ("TLS handshake not blocked") when a handshake runs
 /// into one, which a voice server that is slow to answer is enough to cause.
+#[cfg(not(target_os = "android"))]
 fn secure(url: &str, host: &str, stream: TcpStream) -> io::Result<MaybeTlsStream<TcpStream>> {
     if url.starts_with("ws://") {
         return Ok(MaybeTlsStream::Plain(stream));
@@ -88,6 +90,37 @@ fn secure(url: &str, host: &str, stream: TcpStream) -> io::Result<MaybeTlsStream
         }
         Err(native_tls::HandshakeError::Failure(err)) => Err(io::Error::other(err)),
     }
+}
+
+/// Android has no system TLS this crate can link, so the voice websocket uses rustls with the
+/// bundled WebPKI roots, as chatd does there (`chatd::tls`). The handshake is driven here for
+/// the same reason as above, and a read timeout during it is a timeout. The test-only extra root
+/// (`TINYCLIENT_VOICE_TRUST`) is a desktop affair and not read.
+#[cfg(target_os = "android")]
+fn secure(url: &str, host: &str, mut stream: TcpStream) -> io::Result<MaybeTlsStream<TcpStream>> {
+    use std::sync::Arc;
+    if url.starts_with("ws://") {
+        return Ok(MaybeTlsStream::Plain(stream));
+    }
+    let name = host.rsplit_once(':').map_or(host, |(name, _)| name).to_owned();
+    let roots = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .map_err(io::Error::other)?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let server = rustls::pki_types::ServerName::try_from(name).map_err(io::Error::other)?;
+    let mut connection = rustls::ClientConnection::new(Arc::new(config), server).map_err(io::Error::other)?;
+    while connection.is_handshaking() {
+        match connection.complete_io(&mut stream) {
+            Ok(_) => {}
+            Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                return Err(io::Error::new(ErrorKind::TimedOut, "the voice server did not finish the TLS handshake in time"));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(MaybeTlsStream::Rustls(rustls::StreamOwned::new(connection, stream)))
 }
 
 /// The server's address. The system resolver has no time limit of its own, so it is asked on a
@@ -128,7 +161,10 @@ impl Socket {
         })?;
         match ws.get_ref() {
             MaybeTlsStream::Plain(stream) => stream.set_read_timeout(Some(POLL))?,
+            #[cfg(not(target_os = "android"))]
             MaybeTlsStream::NativeTls(stream) => stream.get_ref().set_read_timeout(Some(POLL))?,
+            #[cfg(target_os = "android")]
+            MaybeTlsStream::Rustls(stream) => stream.get_ref().set_read_timeout(Some(POLL))?,
             _ => {}
         }
         Ok(Socket { ws, seq_ack })

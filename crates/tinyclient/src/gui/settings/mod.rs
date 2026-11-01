@@ -1050,8 +1050,9 @@ fn mediad_path() -> std::path::PathBuf {
 
 /// The system's devices, by the names a call takes. `None` when mediad could not say.
 fn read_devices() -> Option<Devices> {
-    let output = protocol::launch::no_console(std::process::Command::new(mediad_path()).arg("--devices")).stderr(std::process::Stdio::null()).output().ok()?;
-    let json: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    // The process on a desktop; mediad's threads in this process on a phone.
+    let stdout = protocol::media_host::output(protocol::launch::no_console(std::process::Command::new(mediad_path()).arg("--devices")).stderr(std::process::Stdio::null())).ok()?;
+    let json: serde_json::Value = serde_json::from_slice(&stdout).ok()?;
     // With ids; a mediad from before ids had names alone, which stand in for both.
     let devices = |key: &str, names: &str| -> Vec<protocol::AudioDevice> {
         match serde_json::from_value::<Vec<protocol::AudioDevice>>(json[key].clone()) {

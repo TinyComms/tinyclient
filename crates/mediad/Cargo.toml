@@ -9,11 +9,9 @@ publish.workspace = true
 protocol.workspace = true
 tracing.workspace = true
 serde_json.workspace = true
+serde.workspace = true
 # The voice gateway. Same versions and TLS (Security.framework) as chatd, so nothing is built twice.
-tungstenite = { version = "0.30", default-features = false, features = ["handshake", "native-tls"] }
-# The same TLS tungstenite uses, named here only to hand it one more certificate to trust when a
-# test's fake voice server speaks `wss` (see `gateway::connector`).
-native-tls = "0.2"
+tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 # Discord's end-to-end encryption (DAVE, MLS on OpenMLS). Pinned: Discord moves the floor, and a
 # new version must be read before it is taken.
 davey = "=0.1.5"
@@ -48,16 +46,33 @@ symphonia = { version = "0.5", default-features = false, features = ["ogg", "mkv
 # (`webrtc-audio-processing`) needs meson and ninja to build, and none of the other pure-Rust
 # echo cancellers is WebRTC's. Pinned: a port moves fast, and a new version must be heard first.
 sonora = "=0.2.0"
-# Cisco's OpenH264 2.6.0 binary, loaded at runtime (`libloading`). The `source` feature
-# compiles the codec from C, which this tree does not. The binary is downloaded from Cisco
-# the first time a picture is encoded, and checked against the crate's known hashes.
-openh264 = { version = "0.9.9", default-features = false, features = ["libloading"] }
 # The watched picture is a JPEG on disk. The jpeg encoder is pure Rust.
 image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
+
+# Desktop: the system's TLS (Security.framework, SChannel, OpenSSL), and Cisco's OpenH264.
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+# Cisco's OpenH264 2.6.0 binary, loaded at runtime (`libloading`). The `source` feature
+# compiles the codec from C, which this tree does not. The binary is downloaded from Cisco
+# the first time a picture is encoded, and checked against the crate's known hashes. A phone
+# may not download code, so phones encode and decode through `platform` instead.
+openh264 = { version = "0.9.9", default-features = false, features = ["libloading"] }
 # The Cisco binary is bz2. Pure Rust, so the release image needs no libbz2.
 bzip2-rs = "0.1.2"
 # The download of that binary. native-tls is already linked.
 ureq = { version = "2.12.1", default-features = false, features = ["native-tls"] }
+
+# The voice gateway's TLS, the system's, as chatd's everywhere but Android (`chatd::tls`).
+[target.'cfg(not(target_os = "android"))'.dependencies]
+tungstenite = { version = "0.30", default-features = false, features = ["handshake", "native-tls"] }
+# The same TLS tungstenite uses, named here only to hand it one more certificate to trust when a
+# test's fake voice server speaks `wss` (see `gateway::connector`).
+native-tls = "0.2"
+
+# Android: rustls with ring and the bundled Mozilla roots, as chatd there. Nothing to cross-build.
+[target.'cfg(target_os = "android")'.dependencies]
+tungstenite = { version = "0.30", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
 
 [target.'cfg(windows)'.dependencies]
 # MMCSS scheduling for the device callbacks and the call's tick, and the 1 ms system timer a
