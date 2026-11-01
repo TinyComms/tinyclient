@@ -1,0 +1,40 @@
+[package]
+name = "e2ee"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The client side of tinyserver's end-to-end encrypted text and attachments
+# (`docs/e2ee-text.md`). A pure library: no network, no async runtime, no GUI. The only file it
+# writes is through the `Store` trait and the temp file `attachment::decrypt_to_temp`.
+
+[dependencies]
+# MLS (RFC 9420), at the version Cargo.lock already holds through davey and mediad. The
+# ciphersuite is MLS_128_DHKEMP256_AES128GCM_SHA256_P256, as for calls.
+openmls = "0.8.1"
+openmls_traits = "0.5.0"
+openmls_rust_crypto = "0.5.1"
+# AES-256-GCM, used by the sealed attachment (STREAM, `aead::stream`), by the state snapshot and by
+# the local cache. `stream` is the only feature added to what the tree already builds.
+aes-gcm = { version = "0.10", features = ["stream", "zeroize"] }
+# P-256 ECDSA for the device identity and its cross-signatures. Already linked by openmls.
+p256 = { version = "0.13", features = ["ecdsa"] }
+sha2 = "0.10"
+# A fresh sub-key per sealed blob, so one long-lived state key never meets a nonce twice.
+hkdf = "0.12"
+zeroize = { version = "1", features = ["derive"] }
+subtle = "2"
+getrandom = { workspace = true }
+base64 = "0.22"
+serde.workspace = true
+serde_json.workspace = true
+thiserror = "2"
+# A private (0600) temp file that removes itself, for a decrypted attachment on its way to disk.
+tempfile = "3"
+# The safety number reuses DAVE's pairwise fingerprint (scrypt over the sorted identities) and its
+# displayable code, exactly as mediad's calls do. The version mediad pins.
+davey = "=0.1.5"
+
+[dev-dependencies]
+proptest = "1"

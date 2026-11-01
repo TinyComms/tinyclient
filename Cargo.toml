@@ -4,6 +4,7 @@ members = [
     "crates/protocol",
     "crates/chatd",
     "crates/mediad",
+    "crates/e2ee",
     "crates/notifier",
     "crates/login",
     "crates/tinyclient",
