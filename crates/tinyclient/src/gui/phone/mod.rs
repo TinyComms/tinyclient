@@ -278,6 +278,9 @@ impl Shell {
         if !active() {
             return false;
         }
+        if super::settings::phone_back(cx) {
+            return true;
+        }
         if self.sidebar_state.switcher.is_some() {
             if let Some(window) = window {
                 self.close_switcher(window, cx);

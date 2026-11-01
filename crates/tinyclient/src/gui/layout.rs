@@ -514,6 +514,10 @@ impl Shell {
 
     /// Nothing is signed in: no rail, no sidebar, one centered column.
     fn first_run(&self, snapshot: &Snapshot, cx: &mut Context<Self>) -> Div {
+        // A phone has its own form: one column, the networks a phone can sign in to.
+        if super::phone::active() {
+            return self.phone_first_run(cx);
+        }
         let row = |ix: usize, network: Network| {
             let available = AVAILABLE.contains(&network);
             let waiting = self.signing_in == Some(network);
@@ -1023,7 +1027,7 @@ impl Render for Shell {
             chrome::clear_end();
             self.note_room(true, Some(width));
             let screen = self.phone_screen(snapshot, window, cx);
-            return root.child(screen).children(self.toast_layer(width, cx));
+            return root.child(screen).children(self.toast_layer(width, cx)).children(super::settings::phone_page(window, cx));
         }
         if self.snapshot.is_some() && snapshot.signed_in().is_empty() && settled {
             return root.child(self.first_run(snapshot, cx)).children(window_chrome(window));
