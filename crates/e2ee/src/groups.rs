@@ -814,6 +814,9 @@ impl Engine {
 
     /// Applies a `commit` item of the handshake feed made at `message_epoch` (the item's `epoch`).
     ///
+    /// * Bytes that are not a public commit of this group at `message_epoch` are refused first,
+    ///   whatever the epoch: they freeze nothing and leave a commit of ours in flight alone. Ours
+    ///   is dropped only for another member's commit that passed every check below.
     /// * A commit this device has applied (or made) is [`CommitOutcome::duplicate`], not an error.
     /// * A commit for an epoch below ours that is not one we applied is a rewritten history: the
     ///   group is frozen and the result is [`Error::EpochBackwards`].
@@ -848,6 +851,22 @@ impl Engine {
             // Our own commit came back through the feed: the server took it.
             return self.confirm_commit(conv);
         }
+        // Parsed before anything else, so that bytes which are not a public commit of this group at
+        // the epoch they claim cannot freeze it (below) or touch a commit of ours in flight.
+        let message = guard(|| mls::MlsMessageIn::tls_deserialize_exact(data))?
+            .map_err(|_| Error::Malformed("commit"))?;
+        let protocol = message
+            .try_into_protocol_message()
+            .map_err(|_| Error::Malformed("commit"))?;
+        if protocol.group_id().as_slice() != conv.0
+            || protocol.wire_format() != mls::WireFormat::PublicMessage
+            || protocol.content_type() != mls::ContentType::Commit
+        {
+            return Err(Error::ForbiddenCommit("not a public commit for this group"));
+        }
+        if protocol.epoch().as_u64() != message_epoch {
+            return Err(Error::Malformed("commit epoch"));
+        }
         if message_epoch < local {
             let forgotten = (local - message_epoch) as usize > self.config.commits_remembered;
             if message_epoch < entry.joined_epoch
@@ -876,21 +895,6 @@ impl Engine {
             });
         }
 
-        let message = guard(|| mls::MlsMessageIn::tls_deserialize_exact(data))?
-            .map_err(|_| Error::Malformed("commit"))?;
-        let protocol = message
-            .try_into_protocol_message()
-            .map_err(|_| Error::Malformed("commit"))?;
-        if protocol.group_id().as_slice() != conv.0
-            || protocol.wire_format() != mls::WireFormat::PublicMessage
-            || protocol.content_type() != mls::ContentType::Commit
-        {
-            return Err(Error::ForbiddenCommit("not a public commit for this group"));
-        }
-        if protocol.epoch().as_u64() != message_epoch {
-            return Err(Error::Malformed("commit epoch"));
-        }
-
         let Engine {
             groups,
             provider,
@@ -901,13 +905,9 @@ impl Engine {
         } = self;
         let group = groups.get_mut(&conv).ok_or(Error::NoGroup)?;
         let entry = meta.get_mut(&conv).ok_or(Error::NoGroup)?;
-        if group.pending_commit().is_some() {
-            // Another member's commit for the epoch we committed at: ours lost.
-            group
-                .clear_pending_commit(provider.storage())
-                .map_err(Error::mls)?;
-            entry.pending_commit = None;
-        }
+        // Our own commit for this epoch, if any, stays in flight until another member's commit
+        // has parsed, authenticated and passed every check below: bytes the server made up must
+        // not throw ours away, or this device could neither resend it nor move on.
         let processed = match guard(|| group.process_message(&*provider, protocol)) {
             Ok(Ok(processed)) => processed,
             Ok(Err(error)) => {
@@ -930,6 +930,13 @@ impl Engine {
         let (added, removed) = vet_commit(group, trust, &own, entry, committer, &staged)?;
         let removed_self = staged.self_removed();
         let before = group.epoch().as_u64();
+        if group.pending_commit().is_some() {
+            // Another member's valid commit for the epoch we committed at: ours lost.
+            group
+                .clear_pending_commit(provider.storage())
+                .map_err(Error::mls)?;
+            entry.pending_commit = None;
+        }
         if let Err(error) = group.merge_staged_commit(&*provider, *staged) {
             groups.remove(&conv);
             return Err(Error::mls(error));

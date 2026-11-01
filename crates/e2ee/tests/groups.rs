@@ -1504,3 +1504,126 @@ fn a_commit_older_than_the_ones_remembered_is_taken_for_shown_again_not_for_a_re
     }
     world.say(all[0], &[all[1], all[7]], "fine");
 }
+
+#[test]
+fn a_bad_commit_at_our_epoch_does_not_throw_away_our_commit_in_flight() {
+    use e2ee::groups::Forge;
+    let mut world = World::new();
+    let (a, b, c, d) = (
+        world.person("a"),
+        world.person("b"),
+        world.person("c"),
+        world.person("d"),
+    );
+    world.sync_trust();
+    world.start(a);
+    world.change(&[a], a, &[b, c], &[]);
+    let conv = world.conv();
+    let epoch = world.epoch(a);
+    // c, a member gone bad, makes a commit for this epoch that swaps its own identity (made
+    // before c holds the server's proposals, so the commit carries nothing else).
+    let impostor = e2ee::identity::DeviceIdentity::generate(world.clients[c].user()).unwrap();
+    let forged = world.clients[c]
+        .engine
+        .forge_commit(conv, Forge::ReplaceIdentity(&impostor))
+        .unwrap();
+    let package = world.clients[d].engine.key_packages(1).unwrap().remove(0);
+    let proposals = world.ds.proposals(&[&package], &[], epoch);
+    for at in [a, b, c] {
+        world.clients[at]
+            .engine
+            .handle_proposals(conv, &proposals)
+            .unwrap();
+    }
+    let ours = world.clients[a]
+        .engine
+        .commit_pending(conv)
+        .unwrap()
+        .unwrap();
+    // b commits the same proposals at the same time, and will lose.
+    let theirs = world.clients[b]
+        .engine
+        .commit_pending(conv)
+        .unwrap()
+        .unwrap();
+    assert_ne!(theirs.commit, ours.commit);
+
+    // The server shows a, at the epoch a committed at: a commit by a member that breaks the rules,
+    // and bytes that are no commit at all. Both are refused, and a's commit is still in flight.
+    let mut flipped = ours.commit.clone();
+    let last = flipped.len() - 1;
+    flipped[last] ^= 1;
+    for (what, junk) in [
+        ("a forbidden commit", forged.as_slice()),
+        ("our commit with a flipped bit", flipped.as_slice()),
+        ("garbage", &[0u8, 1, 2, 3][..]),
+    ] {
+        assert!(
+            world.clients[a]
+                .engine
+                .handle_commit(conv, epoch, junk)
+                .is_err(),
+            "{what} was taken"
+        );
+        let kept = world.clients[a].engine.pending_commit(conv);
+        assert_eq!(
+            kept.map(|bundle| bundle.commit),
+            Some(ours.commit.clone()),
+            "{what} threw away our commit in flight"
+        );
+        assert_eq!(world.epoch(a), epoch, "{what}: the epoch moved");
+    }
+    // The real answer still settles it: the server took ours, and the feed shows it.
+    let outcome = world.clients[a]
+        .engine
+        .handle_commit(conv, ours.epoch, &ours.commit)
+        .unwrap();
+    assert_eq!(outcome.epoch, epoch + 1);
+    for at in [b, c] {
+        world.clients[at]
+            .engine
+            .handle_commit(conv, ours.epoch, &ours.commit)
+            .unwrap();
+    }
+    // b's own commit lost to a valid one, which is what drops it.
+    assert!(world.clients[b].engine.pending_commit(conv).is_none());
+    assert_eq!(world.epoch(b), epoch + 1);
+    let key = world.ds.public();
+    world.clients[d]
+        .engine
+        .handle_welcome(conv, &ours.welcomes[0].data, Some(&key))
+        .unwrap();
+    world.say(a, &[b, c, d], "our commit survived the junk");
+}
+
+#[test]
+fn bytes_shown_for_an_old_epoch_that_are_no_commit_do_not_freeze_the_group() {
+    let mut world = World::new();
+    let (a, b, c) = (world.person("a"), world.person("b"), world.person("c"));
+    world.sync_trust();
+    world.start(a);
+    world.change(&[a], a, &[b], &[]);
+    world.change(&[a, b], a, &[c], &[]);
+    let conv = world.conv();
+    assert_eq!(world.epoch(b), 2);
+    for junk in [&[][..], &[0u8; 40][..], b"not a commit"] {
+        let err = world.clients[b].engine.handle_commit(conv, 1, junk);
+        assert!(
+            matches!(
+                err,
+                Err(Error::Malformed(_)) | Err(Error::ForbiddenCommit(_))
+            ),
+            "{err:?}"
+        );
+        assert!(
+            world.clients[b].engine.frozen(conv).is_none(),
+            "junk froze the group"
+        );
+    }
+    // A message for this group under the wrong epoch label is refused too, without freezing.
+    let message = world.send(a, "a ciphertext, not a commit");
+    let err = world.clients[b].engine.handle_commit(conv, 1, &message);
+    assert!(err.is_err(), "{err:?}");
+    assert!(world.clients[b].engine.frozen(conv).is_none());
+    world.say(a, &[b, c], "nothing froze");
+}
