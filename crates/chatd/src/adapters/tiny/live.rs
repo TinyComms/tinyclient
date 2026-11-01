@@ -89,6 +89,8 @@ const MEDIA_LOST: &str = "The server stopped hearing this call's audio, so you'v
 /// The sentence mediad used to end a Tiny call that did not come back. Said once the resume
 /// budget is spent, in the same voice as a Discord call that did not come back.
 const DROPPED: &str = "The connection to the server dropped and didn't come back. You've left the call.";
+/// A reason this build has no words of its own for: a newer server's.
+const SERVER_ENDED: &str = "The server ended this call.";
 const KICKED: &str = "You were removed from the call.";
 const ROOM_GONE: &str = "The room was deleted, so the call ended.";
 const ELSEWHERE: &str = "You joined a call on another device.";
@@ -122,7 +124,8 @@ pub enum Ask {
     E2ee { frame: String },
     /// A renegotiation offer from mediad, for `call.offer`.
     Offer { sdp: String },
-    /// mediad lost the link, and the call is still up. Join again after the resume pause.
+    /// mediad lost the link, and the call is still up. Join again after the resume pause. Not
+    /// kept while the socket is down: the call's state says it, and `ready` reads that.
     Resume,
     /// Media is flowing again. The resume clock starts over once the link has held.
     Settled,
@@ -201,8 +204,8 @@ impl Live {
                     self.wake.signal();
                 }
             }
-            // A hang-up while down needs nothing sent: the seat is not taken again without the
-            // call (`rejoin`), and the server lets it go after its grace.
+            // A hang-up while down needs nothing sent now: the seat is not taken again without
+            // the call (`rejoin`), and one the server kept is left on `ready` (`seat_kept`).
             ask if !inner.connected => ask.refuse(OFFLINE),
             ask @ Ask::Join { .. } if inner.media == "down" => ask.refuse(AUDIO_DOWN),
             ask if inner.queued.len() >= QUEUED => ask.refuse(BUSY),
@@ -478,11 +481,13 @@ pub(super) fn keep_live(ctx: &Context, saved: &Saved, live: &Live, timing: &Timi
             End::SignedOut => {
                 tracing::warn!("chatd: {}: the session ended", ctx.account.network.label());
                 ctx.hub.set_link(&ctx.account, Link::Expired, ENDED);
+                call_gone(ctx, &mut seat, CallFailure::Refused, ENDED);
                 return;
             }
             End::Removed => {
                 tracing::warn!("chatd: {}: removed from the server", ctx.account.network.label());
                 ctx.hub.set_link(&ctx.account, Link::Expired, REMOVED);
+                call_gone(ctx, &mut seat, CallFailure::Refused, REMOVED);
                 return;
             }
             End::Replaced => {
@@ -490,6 +495,7 @@ pub(super) fn keep_live(ctx: &Context, saved: &Saved, live: &Live, timing: &Timi
                 tracing::warn!("chatd: {}: replaced by another device; waiting for the user", ctx.account.network.label());
                 ctx.hub.set_offline(&ctx.account, false);
                 ctx.attention(REPLACED);
+                call_gone(ctx, &mut seat, CallFailure::Refused, REPLACED);
                 if hold(ctx, live) {
                     return;
                 }
@@ -643,11 +649,13 @@ fn serve(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, timing: &Ti
                         return end;
                     }
                     if ready && frame.get("type").and_then(Value::as_str) == Some("ready") {
-                        if let Some(room) = rejoin(seat) {
-                            refs += 1;
-                            if let Err(err) = rejoin_with(ctx, saved, live, seat, wire, pending, refs, room, timing) {
-                                return End::Dropped(err.to_string());
-                            }
+                        refs += 1;
+                        let sent = match rejoin(seat) {
+                            Some(room) => rejoin_with(ctx, saved, live, seat, wire, pending, refs, room, timing),
+                            None => seat_kept(ctx, live, seat, wire, pending, refs, timing),
+                        };
+                        if let Err(err) = sent {
+                            return End::Dropped(err.to_string());
                         }
                     }
                     if let Some(room) = seat.move_to.take() {
@@ -776,7 +784,12 @@ fn serve(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, timing: &Ti
                     if late.reply.is_some() {
                         ctx.call_over(room);
                     } else {
-                        ctx.call_failed(room, CallFailure::Lost, NO_ANSWER);
+                        // A half-dead socket, most likely. The swap this rejoin would have made
+                        // never came, so no echo of it will either.
+                        seat.echo = false;
+                        if !spend_resume(seat) {
+                            ctx.call_failed(room, CallFailure::Lost, DROPPED);
+                        }
                     }
                 }
             }
@@ -952,6 +965,25 @@ fn rejoin_with(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, wire:
             Ok(())
         }
     }
+}
+
+/// `ready` lists our seat, so working media is left alone. What the socket could not carry while
+/// it was down is settled here: a call hung up meanwhile leaves the seat the server kept for it,
+/// and a call whose media went meanwhile (mediad says so once, and that word was refused, or the
+/// join it started went with the socket) is resumed now.
+fn seat_kept(ctx: &Context, live: &Live, seat: &mut Seat, wire: &mut Wire, pending: &mut Vec<Pending>, refs: u64, timing: &Timing) -> io::Result<()> {
+    let Some(room) = seat.wanted.clone().filter(|_| !live.seats_only()) else {
+        return Ok(());
+    };
+    if !ctx.in_call(&room) {
+        let reference = refs.to_string();
+        pending.push(Pending { reference: reference.clone(), asked: Asked::Leave, until: Instant::now() + timing.answer, reply: None });
+        return wire.send(json!({"type": "call.leave", "ref": reference}).to_string());
+    }
+    if call_is_down(ctx, &room) {
+        resume_media(ctx, seat, pending);
+    }
+    Ok(())
 }
 
 fn seated_in(seat: &Seat, room: &str) -> bool {
@@ -1319,8 +1351,8 @@ fn unseat(seat: &mut Seat, room: &str, user: &str) {
     }
 }
 
-/// We left a room's call on the server. If chatd's call is in it, it ends: in words when
-/// something took it from us, quietly when we left it ourselves somewhere.
+/// We left a room's call on the server. If chatd's call is in it, it ends: in words, unless we
+/// left it ourselves somewhere.
 fn left(ctx: &Context, seat: &mut Seat, room: &str, reason: &str) {
     // Moved by a moderator: `call.moved` carries the call on to the new room, before this
     // frame or after it.
@@ -1349,16 +1381,26 @@ fn left(ctx: &Context, seat: &mut Seat, room: &str, reason: &str) {
             return;
         }
     }
+    // The grace ran out on the socket that held the seat (a server that does not rebind one):
+    // the seat is gone and the media with it, and the call takes it again as for any drop.
+    if reason == "disconnected" && seat.wanted.as_deref() == Some(room) && (seat.resume_at.is_some() || seat.rejoining || seat.recover.is_some() || spend_resume(seat)) {
+        return;
+    }
     forget_resume(seat);
     let words = match reason {
         "media_timeout" => Some((CallFailure::Lost, MEDIA_TIMEOUT)),
         "media_lost" => Some((CallFailure::Lost, MEDIA_LOST)),
+        "disconnected" => Some((CallFailure::Lost, DROPPED)),
         "kicked" => Some((CallFailure::Refused, KICKED)),
         "room_deleted" => Some((CallFailure::Refused, ROOM_GONE)),
         "joined_elsewhere" => Some((CallFailure::Refused, ELSEWHERE)),
         "banned" => Some((CallFailure::Refused, BANNED)),
         "timed_out" => Some((CallFailure::Refused, TIMED_OUT)),
-        _ => None,
+        "removed" => Some((CallFailure::Refused, REMOVED)),
+        "session_ended" => Some((CallFailure::Refused, ENDED)),
+        // Only our own hang-up, here or on another device, ends a call without a word.
+        "left" => None,
+        _ => Some((CallFailure::Lost, SERVER_ENDED)),
     };
     // Put out by someone: the cue that says so plays out as the call ends.
     if matches!(reason, "kicked" | "banned" | "timed_out" | "room_deleted") {
@@ -1397,7 +1439,9 @@ fn plan(used: u32, up_since: Option<Instant>, now: Instant) -> Plan {
         return Plan::GiveUp;
     }
     let used = used + 1;
-    Plan::Resume { resumes: used, pause: Duration::from_secs(u64::from(used)) }
+    // What noticed the drop has already waited. A second try means the first did not hold.
+    let pause = if used == 1 { Duration::ZERO } else { Duration::from_secs(u64::from(used)) };
+    Plan::Resume { resumes: used, pause }
 }
 
 /// The call is up, or already reconnecting, with mediad still running.
@@ -1410,6 +1454,21 @@ fn may_resume(ctx: &Context, room: &str) -> bool {
 fn call_is_joined(ctx: &Context, room: &str) -> bool {
     let (call, running) = ctx.hub.calls.describe();
     running && call.is_some_and(|call| call.conversation == ctx.key(room) && call.state == CallState::Joined)
+}
+
+/// This socket is not coming back to bring the call back. It would sit reconnecting, so it ends,
+/// in words.
+fn call_gone(ctx: &Context, seat: &mut Seat, reason: CallFailure, words: &str) {
+    forget_resume(seat);
+    if let Some(room) = seat.wanted.take().filter(|room| ctx.in_call(room)) {
+        ctx.call_failed(&room, reason, words);
+    }
+}
+
+/// mediad has said the call's media is down, and nothing has brought it back.
+fn call_is_down(ctx: &Context, room: &str) -> bool {
+    let (call, running) = ctx.hub.calls.describe();
+    running && call.is_some_and(|call| call.conversation == ctx.key(room) && call.state == CallState::Reconnecting)
 }
 
 /// The user left, or the call ended: nothing joins again, and the next call starts its count over.
@@ -1449,18 +1508,24 @@ fn resume_media(ctx: &Context, seat: &mut Seat, pending: &[Pending]) {
     if !may_resume(ctx, &room) {
         return;
     }
-    match plan(seat.resumes, seat.up_at, Instant::now()) {
+    if !spend_resume(seat) {
+        ctx.call_failed(&room, CallFailure::Lost, DROPPED);
+    }
+}
+
+/// Counts one drop against the budget and sets its join going. False once the budget is spent.
+fn spend_resume(seat: &mut Seat) -> bool {
+    match plan(seat.resumes, seat.up_at.take(), Instant::now()) {
         Plan::GiveUp => {
             seat.resume_at = None;
-            seat.up_at = None;
             tracing::warn!("chatd: Tiny server: the connection dropped and didn't come back");
-            ctx.call_failed(&room, CallFailure::Lost, DROPPED);
+            false
         }
         Plan::Resume { resumes, pause } => {
             seat.resumes = resumes;
-            seat.up_at = None;
             seat.resume_at = Some(Instant::now() + pause);
             tracing::warn!("chatd: Tiny server: media dropped; resume {resumes} of {RESUMES} in {}s", pause.as_secs());
+            true
         }
     }
 }
@@ -1471,7 +1536,8 @@ fn settled(seat: &mut Seat) {
         seat.resumes = seat.resumes.saturating_sub(1);
     }
     seat.up_at = Some(Instant::now());
-    seat.echo = false;
+    // Media came back under a join still in flight: its swap will report this link as lost.
+    seat.echo = seat.rejoining;
 }
 
 /// Whether a call that lost its media may join again now, counting this time if so.
