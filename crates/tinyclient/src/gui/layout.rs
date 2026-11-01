@@ -327,6 +327,9 @@ impl Shell {
     }
 
     pub(super) fn open_menu(&mut self, menu: Menu, cx: &mut Context<Self>) {
+        if matches!(menu, Menu::Own) && !matches!(self.layout_state.menu, Some(Menu::Own)) {
+            self.own_menu_opened(cx);
+        }
         self.layout_state.menu = Some(menu);
         cx.notify();
     }

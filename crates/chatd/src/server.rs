@@ -339,7 +339,7 @@ impl Chat {
             tracing::warn!("chatd: {}: {err}", account.network.label());
         }
         self.hub.reload_settings();
-        self.hub.forget_live(account);
+        self.hub.forget_all_live(account);
     }
 
     /// Stores a setting and has whatever reads it take it up now.

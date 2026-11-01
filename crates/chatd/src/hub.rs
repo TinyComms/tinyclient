@@ -713,13 +713,26 @@ impl Hub {
         typists.filter(|typist| typist.until > now).cloned().collect()
     }
 
-    /// Drops what is known live about an account, for sign-out and for a dropped socket. A
-    /// voice channel that was shown as occupied is told to the shell as empty: nothing else
-    /// would ever take the people off its row.
+    /// Drops what is known live about an account when its socket drops. Our own presence is
+    /// kept: it is a setting the network keeps for us, and a resume does not say it again, so
+    /// dropping it would show the account with no state until the next full connect. A voice
+    /// channel that was shown as occupied is told to the shell as empty: nothing else would
+    /// ever take the people off its row.
     pub fn forget_live(&self, account: &AccountKey) {
+        let me = self.store().accounts().unwrap_or_default().into_iter().find(|row| row.key == *account).map(|row| row.me);
+        let own = me.filter(|me| !me.is_empty()).map(|me| Key::new(account, me));
+        self.drop_live(account, own.as_ref());
+    }
+
+    /// The same for an account that is signed out: our own presence goes too.
+    pub fn forget_all_live(&self, account: &AccountKey) {
+        self.drop_live(account, None);
+    }
+
+    fn drop_live(&self, account: &AccountKey, keep: Option<&Key>) {
         let emptied: Vec<Key> = {
             let mut live = lock(&self.live);
-            live.presence.retain(|person, _| person.account() != *account);
+            live.presence.retain(|person, _| person.account() != *account || Some(person) == keep);
             live.typing.retain(|conversation, _| conversation.account() != *account);
             let emptied = live.occupants.keys().filter(|conversation| conversation.account() == *account).cloned().collect();
             live.occupants.retain(|conversation, _| conversation.account() != *account);

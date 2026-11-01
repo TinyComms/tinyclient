@@ -1169,7 +1169,7 @@ fn keep_connected_with_backoff(ctx: &Context, mut connect: impl FnMut() -> Failu
         match failure {
             Failure::SignedOut(why) => {
                 tracing::warn!("chatd: {}: signed out: {}", ctx.account.network.label(), net::redact(&why));
-                ctx.hub.forget_live(&ctx.account);
+                ctx.hub.forget_all_live(&ctx.account);
                 ctx.hub.set_link(&ctx.account, Link::Expired, &why);
                 return;
             }

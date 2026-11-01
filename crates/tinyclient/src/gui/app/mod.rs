@@ -549,6 +549,7 @@ impl Shell {
             kept: self.prefs_kept.clone(),
             autoplay: super::anim::autoplay(),
             tiny_members: self.tiny_state.members_open(),
+            me: prefs::me(),
         }
     }
 

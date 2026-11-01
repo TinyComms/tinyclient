@@ -173,6 +173,9 @@ pub fn stage_status(menu: &Entity<StatusMenu>, cx: &mut Context<Shell>) {
     if wants("own-status") && once(&DONE) {
         menu.update(cx, |menu, cx| menu.stage("heads down until 4", cx));
     }
+    if wants("own-edit") && once(&DONE) {
+        menu.update(cx, |menu, cx| menu.stage_edit("Justin", cx));
+    }
 }
 
 pub fn stage_members(members: &Entity<MemberList>, open: Option<Key>, cx: &mut Context<Shell>) {
@@ -217,7 +220,7 @@ impl Shell {
         if wants("members") {
             self.toggle_members(cx);
         }
-        if wants("own") || wants("own-status") {
+        if wants("own") || wants("own-status") || wants("own-edit") {
             self.open_menu(Menu::Own, cx);
         }
         if wants("profile-body") {

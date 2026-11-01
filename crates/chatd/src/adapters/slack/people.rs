@@ -632,16 +632,22 @@ impl Slack {
     }
 
     /// `presence_change`, for one person or a batch. Away is all Slack says of someone not
-    /// active, so it is drawn as offline.
+    /// active, so it is drawn as offline; ours is Away, the state the user can set.
     pub(super) fn presence_changed(&self, event: &Value) {
-        let presence = match event["presence"].as_str() {
-            Some("active") => Presence::Online,
-            Some("away") => Presence::Offline,
+        let away = match event["presence"].as_str() {
+            Some("active") => false,
+            Some("away") => true,
             _ => return,
         };
+        let me = self.me.get();
         let one = event["user"].as_str().into_iter();
         let many = event["users"].as_array().into_iter().flatten().filter_map(Value::as_str);
         for id in one.chain(many) {
+            let presence = match (away, me.is_some_and(|me| me == id)) {
+                (false, _) => Presence::Online,
+                (true, true) => Presence::Idle,
+                (true, false) => Presence::Offline,
+            };
             let status = self.cached(id).map(|user| user.status).unwrap_or_default();
             self.ctx.presence(id, presence, &status, self.owned(id));
         }
