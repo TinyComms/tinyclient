@@ -79,9 +79,10 @@ impl Searches {
         }
     }
 
-    /// True when this query was already sent and the caller should say the search is finished.
-    /// A query already waiting is left to finish. Anything else is queued after the pause.
-
+    /// True when this query was already sent. The caller names that account on the `People`
+    /// answer. It is not a new search: the shell reads the list again after every result, and
+    /// nothing is said on the hub. A query already waiting is left to finish. Anything else is
+    /// queued after the pause.
     fn ask(&self, account: AccountKey, query: &str) -> bool {
         let mut state = lock(&self.state);
         let fresh = state.sent.get(&account).filter(|(_, at)| at.elapsed() < SEARCH_AGAIN).map(|(sent, _)| sent.clone());
@@ -104,7 +105,7 @@ impl Searches {
 
 /// What to do with a people search the shell just asked for again.
 enum SearchFate {
-    /// Sent recently: tell the shell it is already done, so a spinner does not stay up.
+    /// Sent recently. The shell is reading again, which is not a new search.
     Repeated,
     /// The same letters are already waiting out the pause.
     Waiting,
@@ -618,15 +619,18 @@ impl Chat {
         // An explicit Telegram username lookup still searches cached display names/handles.
         let cached_query = query.as_deref().map(|query| query.trim_start_matches('@'));
         let found = self.hub.store().people(network, relation, cached_query, offset, limit.min(PAGE_LIMIT));
+        let mut settled = Vec::new();
         if let (Some(query), 0) = (&query, offset) {
             // The cache answers at once; the network's own search lands as a `People` change,
             // once the typing has paused and only for a query long enough to mean something.
+            // One already sent is named on this answer instead, so the shell does not wait
+            // for a change that will not come.
             let worth = query.chars().count() >= SEARCH_MIN_CHARS;
             for linked in self.hub.links() {
                 let account = linked.account;
                 if worth && linked.link == Link::Connected && network.is_none_or(|network| network == account.network) {
                     if self.searches.ask(account.clone(), query) {
-                        self.hub.changed(Change::Searched { account, query: query.clone() });
+                        settled.push(account);
                     }
                 }
             }
@@ -635,6 +639,7 @@ impl Chat {
             Ok((people, total)) => Response::People {
                 people: self.with_presence(people),
                 total,
+                settled,
             },
             Err(err) => internal(err),
         }

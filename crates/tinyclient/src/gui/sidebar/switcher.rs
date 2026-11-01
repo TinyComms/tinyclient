@@ -15,7 +15,7 @@ use gpui::{
     div, prelude::*, px, Context, Div, Entity, Focusable, FontWeight, HighlightStyle, MouseButton, ScrollHandle, SharedString, Stateful,
     StyledText, Subscription, Window,
 };
-use protocol::{AccountStatus, Badge, Conversation, ConversationKind, Key, Link, Network, Person, Relation, Request, Response, Space, SEARCH_MIN_CHARS};
+use protocol::{AccountKey, AccountStatus, Badge, Conversation, ConversationKind, Key, Link, Network, Person, Relation, Request, Response, Space, SEARCH_MIN_CHARS};
 use std::ops::Range;
 use std::rc::Rc;
 use std::time::Duration;
@@ -173,6 +173,11 @@ fn live_networks(accounts: &[AccountStatus], wanted: Option<Network>) -> Vec<Net
         }
     }
     live
+}
+
+/// Drops a network from "Asking…" once every connected account of it already searched.
+fn retain_asking(asking: &mut Vec<Network>, live: &[AccountKey], settled: &[AccountKey]) {
+    asking.retain(|network| live.iter().any(|account| account.network == *network && !settled.contains(account)));
 }
 
 /// Only a search narrowed to Telegram carries an explicit username lookup request.
@@ -481,13 +486,24 @@ impl Shell {
     fn ask_people(&mut self, name: String, network: Option<Network>, asked: u64, cx: &mut Context<Self>) {
         let request = Request::People { network, relation: None, query: Some(name), offset: 0, limit: 20 };
         self.off_thread(cx, move || ask(&request), move |this, answer, cx| {
-            let (Ok(Response::People { people, .. }), Some(switcher)) = (answer, &mut this.sidebar_state.switcher) else {
+            let Ok(Response::People { people, settled, .. }) = answer else {
                 return;
             };
-            if switcher.people_asked != asked {
-                return;
+            let live = this.snapshot.as_ref().map(|snapshot| {
+                snapshot.accounts.iter().filter(|account| account.link == Link::Connected).map(|account| account.key.clone()).collect::<Vec<_>>()
+            }).unwrap_or_default();
+            {
+                let Some(switcher) = &mut this.sidebar_state.switcher else {
+                    return;
+                };
+                if switcher.people_asked != asked {
+                    return;
+                }
+                switcher.people = people;
+                if !settled.is_empty() {
+                    retain_asking(&mut switcher.asking, &live, &settled);
+                }
             }
-            switcher.people = people;
             this.rehit(true, cx);
         });
     }
@@ -790,6 +806,16 @@ mod tests {
             vec![Network::Teams]
         );
         assert!(live_networks(&accounts, Some(Network::Slack)).is_empty());
+        let key = |network, id: &str| AccountKey { network, account: id.into() };
+        let (discord, other, slack) = (key(Network::Discord, "d"), key(Network::Discord, "d2"), key(Network::Slack, "s"));
+        let live = vec![discord.clone(), other.clone(), slack.clone()];
+        let mut asking = vec![Network::Discord, Network::Slack];
+        retain_asking(&mut asking, &live, &[discord.clone()]);
+        assert_eq!(asking, vec![Network::Discord, Network::Slack]);
+        retain_asking(&mut asking, &live, &[discord, other]);
+        assert_eq!(asking, vec![Network::Slack]);
+        retain_asking(&mut asking, &live, &[slack]);
+        assert!(asking.is_empty());
     }
 
     #[test]

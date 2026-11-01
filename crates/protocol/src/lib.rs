@@ -1897,6 +1897,11 @@ pub enum Response {
     People {
         people: Vec<Person>,
         total: u32,
+        /// Connected accounts that already searched this query, so no `Searched` follows for
+        /// them. The shell takes their "Asking…" down. Empty when the query is new, too short,
+        /// or a later page.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        settled: Vec<AccountKey>,
     },
     Members {
         /// Discord cache miss: rows will arrive through the active viewport subscription.

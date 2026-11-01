@@ -1072,10 +1072,12 @@ fn people_are_answered_looked_up_and_searched_for_only_when_the_typing_pauses() 
     let heard = searched(chatd.changes(seq, Duration::from_millis(1_500)));
     assert_eq!(heard, ["yusuf"], "only the query the typing stopped on");
     // Reading the list again with the same query, as a shell does after every result, is not
-    // a new search.
+    // a new search. The answer names the account, so the shell can drop "Asking…".
     let seq = chatd.seq();
-    search("yusuf");
+    let request = Request::People { network: Some(Network::Discord), relation: None, query: Some("yusuf".into()), offset: 0, limit: 20 };
+    let Response::People { settled, .. } = chatd.ask(request) else { panic!("not people") };
     assert_eq!(searched(chatd.changes(seq, Duration::from_millis(900))), Vec::<String>::new());
+    assert_eq!(settled, vec![account.clone()]);
 }
 
 #[test]
