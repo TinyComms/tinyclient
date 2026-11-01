@@ -24,11 +24,15 @@ const OTHER_ROOM: &str = "44444444-4444-4444-4444-444444444444";
 /// Short enough that a test is quick, long enough that a loaded machine keeps the order.
 const QUICK: Timing = Timing {
     ping: Duration::from_secs(30),
+    call_ping: Duration::from_secs(30),
+    pong: Duration::from_secs(2),
+    doubt: Duration::from_secs(2),
     answer: Duration::from_secs(2),
     first: Duration::from_millis(40),
     cap: Duration::from_millis(160),
     held: Duration::from_secs(60),
     absent: Duration::from_millis(200),
+    stranded: Duration::from_secs(30),
 };
 
 /// What the fake saw.
@@ -577,6 +581,104 @@ fn pings_go_on_time_and_a_silent_server_is_dropped() {
     // reason, since a drop climbs from the first.
     assert_eq!(running.pauses().first(), Some(&timing.first));
     until("connected again", || running.link().0 == Link::Connected);
+}
+
+/// A half-dead socket is given up a pong deadline after the ping, not a whole interval later.
+#[test]
+fn a_ping_nobody_answers_is_given_up_at_its_deadline() {
+    let timing = Timing { ping: Duration::from_millis(1500), pong: Duration::from_millis(100), ..QUICK };
+    let fake = fake(&[], |n, mut conn| {
+        conn.send(ready(1, &[ME], json!([])));
+        conn.pong = n != 0;
+        conn.idle(Duration::from_secs(10));
+    });
+    let _running = run(&fake.base, timing);
+    let (_, _, first) = fake.connected(Duration::from_secs(5)).expect("a connection");
+    let (_, _, second) = fake.connected(Duration::from_secs(5)).expect("a reconnect");
+    assert!(second - first < timing.ping * 2, "a ping interval and its deadline, not two intervals: {:?}", second - first);
+}
+
+/// Nothing else says a socket died during a call, so it is looked at more often then. The
+/// interval goes back once the call is over.
+#[test]
+fn a_seat_pings_faster_until_it_is_left() {
+    let timing = Timing { ping: Duration::from_secs(20), call_ping: Duration::from_millis(50), ..QUICK };
+    let fake = fake(&[], |_, mut conn| {
+        conn.send(ready(1, &[ME], json!([])));
+        while let Some(frame) = conn.next(Duration::from_secs(10)) {
+            conn.send(json!({"type": "ok", "ref": frame["ref"]}));
+            if frame["type"] == "call.join" {
+                conn.send(json!({"type": "call.joined", "room_id": ROOM, "user_id": ME}));
+            }
+            if frame["type"] == "call.leave" {
+                conn.send(left_with(ROOM, "left"));
+            }
+        }
+    });
+    let running = run(&fake.base, timing);
+    until("connected", || running.link().0 == Link::Connected);
+    assert_eq!(running.ask(|reply| Ask::Join { room_id: ROOM.into(), reply }), Ok(()));
+    let pings = || running.did().iter().filter(|did| matches!(did, Did::Pinged { .. })).count();
+    until("pings during the call", || pings() >= 4);
+    assert_eq!(running.ask(|reply| Ask::Leave { reply }), Ok(()));
+    let after = pings();
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(pings() <= after + 1, "back to the idle interval");
+}
+
+/// Media dropped: the path that carried it may have taken the socket too, so the socket is
+/// asked at once and has little time to say. A rejoin does not wait out a dead socket.
+#[test]
+fn a_media_drop_finds_a_dead_socket_at_once() {
+    with_mediad();
+    let timing = Timing { doubt: Duration::from_millis(200), pong: Duration::from_secs(20), answer: Duration::from_secs(20), ..QUICK };
+    let (said, heard) = channel();
+    let fake = fake_with("up", &[], move |n, mut conn| {
+        conn.send(ready(1, &[ME], json!([])));
+        match n {
+            0 => {
+                answer_join(&mut conn, "c-1");
+                conn.pong = false;
+                conn.idle(Duration::from_secs(20));
+            }
+            _ => {
+                let _ = said.send(answer_resume(&mut conn, "c-2", false));
+                conn.idle(Duration::from_secs(5));
+            }
+        }
+    });
+    let running = in_a_call(&fake, timing);
+    running.hub.calls.set_state(&running.hub, &running.key(ROOM), protocol::CallState::Reconnecting);
+    let asked = Instant::now();
+    running.live.ask(Ask::Resume);
+    heard.recv_timeout(Duration::from_secs(10)).expect("a join on a new socket");
+    assert!(asked.elapsed() < Duration::from_secs(5), "{:?}", asked.elapsed());
+}
+
+/// Media is down and the socket that could bring it back stays down: the budget cannot be spent
+/// without a socket, so a clock says when to stop.
+#[test]
+fn a_call_whose_media_and_socket_stay_down_ends_in_words() {
+    with_mediad();
+    static DOWN: [(usize, u16); 40] = {
+        let mut down = [(0, 503); 40];
+        let mut n = 0;
+        while n < 40 {
+            down[n].0 = n + 1;
+            n += 1;
+        }
+        down
+    };
+    let timing = Timing { stranded: Duration::from_millis(300), ..QUICK };
+    let fake = fake_with("up", &DOWN, |_, mut conn| {
+        conn.send(ready(1, &[ME], json!([])));
+        answer_join(&mut conn, "c-1");
+        conn.idle(Duration::from_millis(300));
+        conn.close(1006);
+    });
+    let running = in_a_call(&fake, timing);
+    running.hub.calls.set_state(&running.hub, &running.key(ROOM), protocol::CallState::Reconnecting);
+    until("the call failed in words", || failed_with(&running, CallFailure::Lost, super::DROPPED));
 }
 
 /// The server's side of call requests: a full room, a kick that is refused, and one that is
