@@ -133,6 +133,13 @@ fn tool(id: impl Into<ElementId>, child: impl IntoElement) -> Stateful<Div> {
         .child(child)
 }
 
+/// How many quick reactions a phone's action sheet shows in a window `width` wide: 44 pt discs
+/// 8 apart inside 16 pt gutters, one kept for the picker when more may be added; one to six.
+fn sheet_quick(width: f32, adds: bool) -> usize {
+    let discs = ((width - 32. + 8.) / 52.).floor().max(0.) as usize;
+    discs.saturating_sub(usize::from(adds)).clamp(1, 6)
+}
+
 fn glyph_of(emoji: &str) -> Div {
     div().text_size(px(15.)).line_height(px(20.)).child(SharedString::from(emoji::display(emoji)))
 }
@@ -257,8 +264,15 @@ impl Pane {
         let task = cx.spawn(async move |this, cx| {
             cx.background_executor().timer(LONG_PRESS).await;
             let _ = this.update(cx, |this, cx| {
-                this.hover = Some(id);
-                cx.notify();
+                // The press held: the message's actions come up as a sheet, as the desktop's
+                // right-click menu does, for one that can be acted on or that did not go.
+                let Some(message) = this.find(&id) else {
+                    return;
+                };
+                let can = this.can(&message);
+                if can.act || can.unsent {
+                    this.open_menu(message, at, cx);
+                }
             });
         });
         self.press = Some((task, (f32::from(at.x), f32::from(at.y))));
@@ -281,7 +295,8 @@ impl Pane {
     pub(super) fn toolbar(&self, message: &Rc<Message>, cx: &mut Context<Self>) -> Option<AnyElement> {
         // Not while text is being selected: it would sit under the drag. Never over a menu or
         // under a scrim (polish/01 §2): the row that owns a menu is lit instead.
-        if self.hover.as_deref() != Some(message.id.as_str()) || self.dragging || self.overlay_up(cx) {
+        // A phone has no toolbar: its actions are the long-press sheet.
+        if crate::gui::phone::active() || self.hover.as_deref() != Some(message.id.as_str()) || self.dragging || self.overlay_up(cx) {
             return None;
         }
         let can = self.can(message);
@@ -500,6 +515,191 @@ impl Pane {
         message_link(key, open.space.as_deref(), message)
     }
 
+    /// A phone's message menu: a sheet from the bottom with the message it is about, the quick
+    /// reactions as a row of 44 pt discs, then the desktop menu's items as 48 pt rows.
+    fn menu_sheet(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        use crate::gui::composer::picker::{sheet_panel, sheet_scrim};
+        use crate::gui::phone::tokens::{self, PhoneType};
+        let Menu { message, at } = self.menu.as_ref()?;
+        let can = self.can(message);
+        let network = self.network().label();
+        let row_height = (tokens::scaled(22.) + 26.).max(48.);
+        let row = |id: &'static str, icon: &'static str, words: SharedString, danger: bool| {
+            let tone = if danger { theme::danger() } else { theme::text() };
+            div()
+                .id(id)
+                .h(px(row_height))
+                .mx(px(8.))
+                .px(px(12.))
+                .rounded(px(theme::R_CARD))
+                .flex()
+                .items_center()
+                .gap(px(14.))
+                .cursor_pointer()
+                .active(|style| style.bg(theme::pressed()))
+                .child(crate::gui::components::glyph(icon, 20., if danger { theme::danger() } else { theme::text_soft() }))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(tokens::scaled(16.)))
+                        .line_height(px(tokens::scaled(22.)))
+                        .text_color(tone)
+                        .child(words),
+                )
+        };
+        let rule = || div().flex_none().h(px(1.)).mx(px(20.)).my(px(4.)).bg(theme::hairline());
+        let then = |act: fn(&mut Pane, &Rc<Message>, &mut Window, &mut Context<Pane>)| {
+            let message = message.clone();
+            cx.listener(move |this: &mut Pane, _: &gpui::ClickEvent, window, cx| {
+                this.close_menu(cx);
+                act(this, &message, window, cx);
+            })
+        };
+        let mut rows: Vec<AnyElement> = Vec::new();
+        // What it is about: who said it, when, and its first words.
+        let who = if message.outgoing { "You".to_owned() } else { message.sender.name.clone() };
+        let said = if message.text.trim().is_empty() { "Attachment".to_owned() } else { message.text.replace('\n', " ") };
+        let about = div()
+            .flex_none()
+            .px(px(20.))
+            .pt(px(4.))
+            .pb(px(10.))
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .child(
+                div()
+                    .flex()
+                    .items_baseline()
+                    .gap(px(8.))
+                    .child(div().min_w_0().truncate().phone_row().font_weight(theme::SEMIBOLD).child(who))
+                    .child(div().flex_none().phone_stamp().text_color(theme::text_faint()).child(time::clock(message.sent))),
+            )
+            .child(div().line_clamp(2).phone_preview().text_color(theme::text_soft()).child(said));
+        if can.unsent {
+            if matches!(message.state, SendState::Failed { .. }) {
+                rows.push(
+                    row("sheet-retry", "icons/refresh-cw.svg", "Retry".into(), false)
+                        .on_click(then(|this, message, _, cx| {
+                            let (Some(conversation), client_id) = (this.key().cloned(), message.client_id.clone().unwrap_or_else(|| message.id.clone())) else {
+                                return;
+                            };
+                            let _ = this.shell.update(cx, |shell, cx| shell.retry_send(conversation, client_id, cx));
+                        }))
+                        .into_any_element(),
+                );
+            }
+            rows.push(row("sheet-copy", "icons/copy.svg", "Copy text".into(), false).on_click(then(|this, message, _, cx| this.copy_text(message, cx))).into_any_element());
+            rows.push(rule().into_any_element());
+            rows.push(
+                row("sheet-delete", "icons/trash-2.svg", "Delete".into(), true)
+                    .on_click(then(|this, message, window, cx| this.delete(message, true, window, cx)))
+                    .into_any_element(),
+            );
+        } else {
+            if can.reply {
+                rows.push(row("sheet-reply", "icons/corner-up-left.svg", "Reply".into(), false).on_click(then(|this, message, window, cx| this.reply(message, window, cx))).into_any_element());
+            }
+            if can.thread {
+                rows.push(
+                    row("sheet-thread", "icons/message-square.svg", "Open thread".into(), false)
+                        .on_click(then(|_, message, _, cx| cx.emit(PaneEvent::OpenThread(message.clone()))))
+                        .into_any_element(),
+                );
+            }
+            if can.edit {
+                rows.push(row("sheet-edit", "icons/pencil.svg", "Edit".into(), false).on_click(then(|this, message, window, cx| this.edit(message, window, cx))).into_any_element());
+            }
+            if !message.text.is_empty() {
+                rows.push(row("sheet-copy", "icons/copy.svg", "Copy text".into(), false).on_click(then(|this, message, _, cx| this.copy_text(message, cx))).into_any_element());
+            }
+            if let Some(link) = self.link_of(message, cx) {
+                let open = link.clone();
+                rows.push(
+                    row("sheet-link", "icons/link.svg", "Copy link".into(), false)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.close_menu(cx);
+                            cx.write_to_clipboard(ClipboardItem::new_string(link.clone()));
+                        }))
+                        .into_any_element(),
+                );
+                rows.push(
+                    row("sheet-open-in", "icons/external-link.svg", format!("Open in {network}").into(), false)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.close_menu(cx);
+                            cx.open_url(&open);
+                        }))
+                        .into_any_element(),
+                );
+            }
+            if can.delete {
+                rows.push(rule().into_any_element());
+                rows.push(
+                    row("sheet-delete", "icons/trash-2.svg", "Delete…".into(), true)
+                        .on_click(then(|this, message, window, cx| this.delete(message, false, window, cx)))
+                        .into_any_element(),
+                );
+            }
+        }
+        // The quick reactions, then the whole picker: one row of discs a thumb can find.
+        let quick_row = (can.act).then(|| {
+            let adds = self.adds(message);
+            // As many 44 pt discs as fit 8 apart inside the 16 pt gutters: six and the picker at
+            // 390, five and the picker at 360.
+            let fit = sheet_quick(f32::from(window.viewport_size().width), adds);
+            let quick = emoji::quick(self.rules(), &message.reactions, fit);
+            let disc = |id: ElementId| {
+                div()
+                    .id(id)
+                    .size(px(44.))
+                    .flex_none()
+                    .rounded_full()
+                    .bg(theme::hover())
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .active(|style| style.bg(theme::pressed()))
+            };
+            let mut strip = div().flex_none().px(px(16.)).py(px(6.)).flex().items_center().justify_between();
+            for (slot, quick) in quick.into_iter().enumerate() {
+                let (id, react) = (message.id.clone(), quick.clone());
+                let mine = message.reactions.iter().any(|have| have.mine && protocol::bare_emoji(&have.emoji) == protocol::bare_emoji(&quick));
+                strip = strip.child(
+                    disc(("sheet-quick", slot).into())
+                        .when(mine, |disc| disc.bg(theme::accent_soft()).border_1().border_color(theme::accent()))
+                        .child(glyph_of(&quick).text_size(px(22.)).line_height(px(28.)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.close_menu(cx);
+                            this.react_toggle(&id, &react, cx);
+                        })),
+                );
+            }
+            if adds {
+                let (id, at) = (message.id.clone(), *at);
+                strip = strip.child(
+                    disc("sheet-react".into()).child(icon(Icon::SmilePlus, 22., theme::text_soft())).on_click(cx.listener(move |this, _, window, cx| {
+                        this.close_menu(cx);
+                        this.open_picker(&id, at, window, cx);
+                    })),
+                );
+            }
+            strip
+        });
+        let panel = sheet_panel()
+            .max_h(px(f32::from(window.viewport_size().height) * 0.85))
+            .child(about)
+            .child(div().flex_none().h(px(1.)).bg(theme::hairline()))
+            .children(quick_row.map(|strip| div().flex_none().flex().flex_col().child(strip).child(div().h(px(1.)).mt(px(4.)).bg(theme::hairline()))))
+            .child(div().id("sheet-rows").flex_1().min_h_0().overflow_y_scroll().pt(px(4.)).flex().flex_col().children(rows));
+        let scrim = sheet_scrim(window)
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| this.close_menu(cx)))
+            .child(panel);
+        Some(deferred(anchored().position(point(px(0.), px(0.))).child(fade_in("message-sheet", 160, scrim))).priority(1).into_any_element())
+    }
+
     fn menu_layer(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let Menu { message, at } = self.menu.as_ref()?;
         let can = self.can(message);
@@ -655,6 +855,21 @@ impl Pane {
         found
     }
 
+    /// A phone's reaction picker: a sheet the window's width, the emoji grid centred in it.
+    fn picker_sheet(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        use crate::gui::composer::picker::{sheet_panel, sheet_scrim};
+        let picking = self.picker.as_ref()?;
+        let size = window.viewport_size();
+        let (wide, tall) = (f32::from(size.width), f32::from(size.height));
+        picking.picker.update(cx, |picker, cx| {
+            picker.set_width(wide, cx);
+            picker.set_height((tall * 0.6).min(crate::gui::composer::picker::HEIGHT), cx);
+        });
+        let panel = sheet_panel().child(picking.picker.clone());
+        let scrim = sheet_scrim(window).on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| this.close_picker(cx))).child(panel);
+        Some(deferred(anchored().position(point(px(0.), px(0.))).child(fade_in("picker-sheet", 160, scrim))).priority(1).into_any_element())
+    }
+
     fn picker_layer(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let picking = self.picker.as_ref()?;
         let panel = popover()
@@ -697,8 +912,10 @@ impl Pane {
             )
             .child(div().line_clamp(2).type_ui().text_color(theme::text_soft()).child(words));
         let target = message.clone();
+        // A phone's dialog keeps 16 pt of the window either side.
+        let room = f32::from(window.viewport_size().width) - 32.;
         let panel = modal("Delete this message?")
-            .w(px(400.))
+            .w(px(if crate::gui::phone::active() { room.min(400.) } else { 400. }))
             .child(modal_body(consequence))
             .child(quoted)
             .child(
@@ -735,6 +952,9 @@ impl Pane {
     }
 
     pub(super) fn action_layers(&self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        if crate::gui::phone::active() {
+            return [self.menu_sheet(window, cx), self.picker_sheet(window, cx), self.confirm_layer(window, cx)].into_iter().flatten().collect();
+        }
         [self.menu_layer(cx), self.picker_layer(cx), self.confirm_layer(window, cx)].into_iter().flatten().collect()
     }
 
@@ -783,6 +1003,15 @@ mod tests {
         assert_eq!(pointed_row(point(px(100.), px(140.)), viewport, &seen, held), Some(0));
         assert_eq!(pointed_row(point(px(801.), px(140.)), viewport, &seen, held), None);
         assert_eq!(pointed_row(point(px(700.), px(-1.)), viewport, &seen, held), None);
+    }
+
+    #[test]
+    fn the_action_sheet_fits_its_quick_reactions_to_the_phone() {
+        assert_eq!(sheet_quick(390., true), 6);
+        assert_eq!(sheet_quick(360., true), 5);
+        assert_eq!(sheet_quick(360., false), 6);
+        assert_eq!(sheet_quick(200., true), 2);
+        assert_eq!(sheet_quick(40., true), 1);
     }
 
     #[test]

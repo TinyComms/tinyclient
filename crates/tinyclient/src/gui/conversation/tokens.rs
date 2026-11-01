@@ -39,8 +39,9 @@ pub struct Metrics {
 impl Metrics {
     pub const FULL: Metrics = Metrics { inset: 20., avatar: 36., gap: 12., media: 400. };
     pub const DENSE: Metrics = Metrics { inset: 16., avatar: 28., gap: 10., media: 310. };
-    /// A phone conversation: 16 from the edge, a 32 pt avatar, and a picture 300 wide at most.
-    pub const PHONE: Metrics = Metrics { inset: 16., avatar: 32., gap: 10., media: 300. };
+    /// A phone conversation: 16 from the edge, the desktop's 36 pt avatar 10 from the words, and
+    /// a picture as wide as the column (the column, not this, is what limits it).
+    pub const PHONE: Metrics = Metrics { inset: 16., avatar: 36., gap: 10., media: 400. };
 
     /// Where the body starts, from the row's left edge.
     pub fn gutter(self) -> f32 {
