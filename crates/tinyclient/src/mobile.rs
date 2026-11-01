@@ -8,16 +8,24 @@
 //! * the web sign-in (`protocol::web_sign_in::WebSignIn`): Discord, Slack and Teams in an in-app
 //!   web view, a Tiny server's OIDC page in the system's authentication session.
 //!
-//! The last two are stubs here that say plainly they are not built yet: the Android and iOS
-//! work replaces `Phone`'s bodies (or registers platform types of its own in `register`) and
-//! nothing else. Every rule a platform must keep (threads, blocking, frame formats) is in
-//! `docs/mobile-platform.md` and on the traits themselves.
+//! On Android the last two are `android` (JNI over the app's Java classes, which also routes the
+//! call screen's hooks). On iOS they are still the `Phone` stubs below, which say plainly they are
+//! not built yet: the iOS work replaces `Phone`'s bodies (or registers platform types of its own
+//! in `register`) and nothing else. Every rule a platform must keep (threads, blocking, frame
+//! formats) is in `docs/mobile-platform.md` and on the traits themselves.
 
+#[cfg(target_os = "android")]
+mod android;
+
+#[cfg(not(target_os = "android"))]
 use mediad::platform::{CameraRequest, EncoderConfig, FrameSink, H264Decoder, H264Encoder, Permission, Platform};
+#[cfg(not(target_os = "android"))]
 use protocol::web_sign_in::{AuthHandle, AuthRequest, WebPage, WebPageHandle, WebSignIn};
+#[cfg(not(target_os = "android"))]
 use std::sync::Arc;
 
 /// Said by every stub.
+#[cfg(not(target_os = "android"))]
 #[cfg_attr(target_os = "ios", allow(dead_code))]
 const NOT_YET: &str = "This isn't available on this phone yet.";
 
@@ -30,20 +38,23 @@ mod ios;
 pub fn register() {
     protocol::media_host::register(mediad::inproc::start);
     #[cfg(target_os = "ios")]
+    ios::register();
+    #[cfg(target_os = "android")]
+    android::register();
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
-        ios::register();
-        return;
+        let phone = Arc::new(Phone);
+        mediad::platform::register(phone.clone());
+        protocol::web_sign_in::register(phone);
     }
-    #[allow(unreachable_code)]
-    let phone = Arc::new(Phone);
-    mediad::platform::register(phone.clone());
-    protocol::web_sign_in::register(phone);
 }
 
-/// The phone, until the platform code fills it in. iOS registers `ios` instead.
+/// The phone, until the platform code fills it in. iOS and Android register their own.
+#[cfg(not(target_os = "android"))]
 #[cfg_attr(target_os = "ios", allow(dead_code))]
 struct Phone;
 
+#[cfg(not(target_os = "android"))]
 impl Platform for Phone {
     fn request_permission(&self, permission: Permission) -> Result<(), String> {
         log::warn!("tinyclient: {permission:?} permission is not wired to the platform yet");
@@ -81,6 +92,7 @@ impl Platform for Phone {
     }
 }
 
+#[cfg(not(target_os = "android"))]
 impl WebSignIn for Phone {
     fn open_page(&self, page: WebPage) -> Result<Box<dyn WebPageHandle>, String> {
         log::warn!("tinyclient: the {} sign-in page is not wired to the platform yet", page.network);

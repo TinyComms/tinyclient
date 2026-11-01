@@ -30,6 +30,9 @@ use gpui::{div, prelude::*, px, AnyElement, Context, Div, ElementId, MouseButton
 use protocol::{Call, CallState, Content, ConversationKind, Direction, Key, Network};
 
 /// The strip under the status bar: minimise, where the call is, the people.
+/// A redraw for my own camera's picture is already on its way.
+static SELF_REFRESH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 const HEADER: f32 = 56.;
 /// The bar a minimised call draws over every screen, under the status bar.
 const BAR: f32 = 56.;
@@ -381,6 +384,16 @@ impl Shell {
         }
         let size = window.viewport_size();
         let (wide, tall) = (f32::from(size.width), f32::from(size.height));
+        // My own camera's picture changes with every frame the platform writes, not with chatd's
+        // answers: draw again soon while there is one.
+        if hooks::self_frame().is_some() && !SELF_REFRESH.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(std::time::Duration::from_millis(100)).await;
+                SELF_REFRESH.store(false, std::sync::atomic::Ordering::Relaxed);
+                let _ = this.update(cx, |_, cx| cx.notify());
+            })
+            .detach();
+        }
         let body: AnyElement = match self.call_shown(snapshot) {
             Some(call) => {
                 let subject = Subject::of(self, snapshot, &call);

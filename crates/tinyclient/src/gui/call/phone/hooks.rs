@@ -5,6 +5,7 @@
 //! what a desktop can: open the system's privacy settings, keep the audio route as chosen here,
 //! and say nothing was refused. Nothing here blocks the UI thread.
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -54,9 +55,10 @@ struct Hooks {
     routes: OnceLock<fn() -> Vec<Route>>,
     route: OnceLock<fn(Route)>,
     flip: OnceLock<fn(bool)>,
+    selfie: OnceLock<fn() -> Option<PathBuf>>,
 }
 
-static HOOKS: Hooks = Hooks { settings: OnceLock::new(), routes: OnceLock::new(), route: OnceLock::new(), flip: OnceLock::new() };
+static HOOKS: Hooks = Hooks { settings: OnceLock::new(), routes: OnceLock::new(), route: OnceLock::new(), flip: OnceLock::new(), selfie: OnceLock::new() };
 
 /// Refused permissions, as the platform last said: bit 0 the microphone, bit 1 the camera.
 static DENIED: AtomicU8 = AtomicU8::new(0);
@@ -87,6 +89,18 @@ pub(crate) fn route_audio(routes: fn() -> Vec<Route>, choose: fn(Route)) {
 #[allow(dead_code)] // Registered by the mobile layer.
 pub(crate) fn route_flip(flip: fn(bool)) {
     let _ = HOOKS.flip.set(flip);
+}
+
+/// The mobile layer: my own camera's newest picture, a JPEG it rewrites under a new name as
+/// frames come (the camera runs in this process on a phone, so the call screen can show it).
+#[allow(dead_code)] // Registered by the mobile layer.
+pub(crate) fn route_self_frame(frame: fn() -> Option<PathBuf>) {
+    let _ = HOOKS.selfie.set(frame);
+}
+
+/// My own camera's newest picture, when the platform has one.
+pub(crate) fn self_frame() -> Option<PathBuf> {
+    HOOKS.selfie.get().and_then(|frame| frame())
 }
 
 /// The platform says whether `kind` is refused. A refused microphone fails a call before it is

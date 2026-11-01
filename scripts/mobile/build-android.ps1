@@ -193,5 +193,5 @@ try {
 $apk = Join-Path $androidDir 'app/build/outputs/apk/debug/app-debug.apk'
 if (-not (Test-Path $apk)) { Fail "Gradle reported success but $apk does not exist." }
 Note "APK $apk"
-Note "install with: adb install -r `"$apk`" ; adb shell am start -n dev.tinyclient.app/dev.gpui.mobile.GpuiInputActivity"
+Note "install with: adb install -r `"$apk`" ; adb shell am start -n dev.tinyclient.app/.TinyActivity"
 Note "16 KB check: llvm-readelf -lW <so> | grep LOAD  (every Align 0x4000), then zipalign -c -P 16 4 <apk>"

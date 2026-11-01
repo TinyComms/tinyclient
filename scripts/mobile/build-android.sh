@@ -149,5 +149,5 @@ fi
 apk="$android_dir/app/build/outputs/apk/debug/app-debug.apk"
 [ -f "$apk" ] || fail "Gradle reported success but $apk does not exist."
 note "APK $apk"
-note "install with: adb install -r \"$apk\" && adb shell am start -n dev.tinyclient.app/dev.gpui.mobile.GpuiInputActivity"
+note "install with: adb install -r \"$apk\" && adb shell am start -n dev.tinyclient.app/.TinyActivity"
 note "16 KB check: llvm-readelf -lW <so> | grep LOAD  (every Align 0x4000), then zipalign -c -P 16 4 <apk>"
