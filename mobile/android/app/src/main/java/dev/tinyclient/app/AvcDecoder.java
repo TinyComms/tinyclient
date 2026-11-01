@@ -50,7 +50,7 @@ public final class AvcDecoder {
         try {
             if (!keyed) {
                 // A decoder fed P-frames before its first SPS/IDR only complains; wait for one.
-                if (!AvcEncoder.nalTypes(annexB).contains("7")) {
+                if (!java.util.Arrays.asList(AvcEncoder.nalTypes(annexB).split(",")).contains("7")) {
                     return new byte[0];
                 }
                 keyed = true;

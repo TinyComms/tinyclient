@@ -45,11 +45,13 @@ public final class AvcEncoder {
                 format.setInteger(MediaFormat.KEY_BIT_RATE, bitrate);
                 format.setInteger(MediaFormat.KEY_FRAME_RATE, fps);
                 format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, screen ? 10 : 4);
-                format.setInteger(MediaFormat.KEY_PREPEND_HEADER_TO_SYNC_FRAMES, 1);
-                format.setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0);
-                format.setInteger(MediaFormat.KEY_LATENCY, 1);
-                format.setInteger(MediaFormat.KEY_PRIORITY, 0);
+                // The last try is the plainest format: SPS/PPS are then put in front of each
+                // IDR here (encode), and the codec's defaults stand.
                 if (profile >= 0) {
+                    format.setInteger(MediaFormat.KEY_PREPEND_HEADER_TO_SYNC_FRAMES, 1);
+                    format.setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0);
+                    format.setInteger(MediaFormat.KEY_LATENCY, 1);
+                    format.setInteger(MediaFormat.KEY_PRIORITY, 0);
                     format.setInteger(MediaFormat.KEY_PROFILE, profile);
                     format.setInteger(MediaFormat.KEY_LEVEL, MediaCodecInfo.CodecProfileLevel.AVCLevel31);
                 }
