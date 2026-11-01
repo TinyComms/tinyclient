@@ -141,6 +141,7 @@ impl Call {
                     session::run(join, controls);
                     // The other side ended the call, or chatd hung up: either way we are done.
                     tracing::warn!("mediad: call over, exiting");
+                    out::flush();
                     std::process::exit(0);
                 });
                 match spawned {
@@ -224,6 +225,7 @@ impl Call {
                 let spawned = std::thread::Builder::new().name("tiny".to_owned()).spawn(move || {
                     tiny::run(link, user_id, controls);
                     tracing::warn!("mediad: call over, exiting");
+                    out::flush();
                     std::process::exit(0);
                 });
                 match spawned {
@@ -459,6 +461,7 @@ fn main() -> ExitCode {
         Some("test") => {
             mediad::probe::run();
             tracing::warn!("mediad: test over, exiting");
+            out::flush();
             return ExitCode::SUCCESS;
         }
         _ => {}
@@ -468,7 +471,9 @@ fn main() -> ExitCode {
         tracing::warn!("mediad: no active call, exiting");
         return ExitCode::SUCCESS;
     }
-    match serve() {
+    let served = serve();
+    out::flush();
+    match served {
         Ok(()) => {
             tracing::warn!("mediad: call ended, exiting");
             ExitCode::SUCCESS

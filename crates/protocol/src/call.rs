@@ -36,8 +36,8 @@ pub enum PictureKind {
     Share,
 }
 
-/// The picture on screen: a JPEG written by mediad. The path's name includes `generation`,
-/// because the window caches an image by its path.
+/// The picture on screen: a JPEG written by mediad, and removed once the next one is written.
+/// The window reads it into an image of its own (`gui/tiny/feed.rs`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CallPicture {
     pub path: String,

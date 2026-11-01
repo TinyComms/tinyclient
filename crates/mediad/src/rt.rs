@@ -18,6 +18,23 @@ pub fn tick_thread() {
     windows::promote("Audio");
 }
 
+/// Puts the calling thread below the tick: video's capture, codecs and files, which may run late
+/// and may not make the tick do so.
+pub fn worker_thread() {
+    #[cfg(windows)]
+    windows::below_normal();
+    // SAFETY: plain calls about this thread, which take no pointers. On Linux a nice value is
+    // the thread's own, and `0` means this one.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::setpriority(libc::PRIO_PROCESS, 0, 10);
+    }
+    #[cfg(target_os = "macos")]
+    unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0);
+    }
+}
+
 /// The system timer at 1 ms for as long as this is held.
 pub struct FineTimer {
     #[cfg(windows)]
@@ -48,7 +65,7 @@ impl Drop for FineTimer {
 mod windows {
     use std::cell::Cell;
     use windows_sys::Win32::Media::{timeBeginPeriod, timeEndPeriod};
-    use windows_sys::Win32::System::Threading::AvSetMmThreadCharacteristicsW;
+    use windows_sys::Win32::System::Threading::{AvSetMmThreadCharacteristicsW, GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL};
 
     thread_local! {
         static PROMOTED: Cell<bool> = const { Cell::new(false) };
@@ -71,6 +88,13 @@ mod windows {
         if handle.is_null() {
             // Not fatal: the call plays on at normal priority, and the log says why it may glitch.
             tracing::warn!("mediad: the {class} thread could not get MMCSS scheduling");
+        }
+    }
+
+    pub fn below_normal() {
+        // SAFETY: the pseudo-handle of this thread needs no closing.
+        unsafe {
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
         }
     }
 

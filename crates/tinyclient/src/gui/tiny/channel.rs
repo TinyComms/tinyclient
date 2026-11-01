@@ -15,7 +15,6 @@ use crate::gui::state::Shell;
 use crate::gui::theme::{self, Type};
 use gpui::{div, img, prelude::*, px, AnyElement, Context, Div, MouseButton, MouseDownEvent, ObjectFit, SharedString, Stateful};
 use protocol::{Call, CallPicture, CallState, Content, Direction, MediaRequest, PictureKind, Request, TinyRoom, TinySeat};
-use std::path::PathBuf;
 
 const TILE_W: f32 = 196.;
 const TILE_H: f32 = 148.;
@@ -301,7 +300,7 @@ impl Shell {
             PictureKind::Camera => "camera",
         };
         let caption = format!("{name}'s {kind} · {}", room.name);
-        let path = PathBuf::from(&picture.path);
+        let frame = self.call_state.feed.shown().map(|frame| img(frame.clone()).size_full().object_fit(ObjectFit::Contain));
         Some(
             div().flex_none().px(px(20.)).pt(px(16.)).child(
                 div()
@@ -313,7 +312,7 @@ impl Shell {
                     .overflow_hidden()
                     .flex()
                     .flex_col()
-                    .child(div().w_full().aspect_ratio(16. / 9.).max_h(px(420.)).min_h(px(160.)).p(px(6.)).child(img(path).size_full().object_fit(ObjectFit::Contain)))
+                    .child(div().w_full().aspect_ratio(16. / 9.).max_h(px(420.)).min_h(px(160.)).p(px(6.)).children(frame))
                     .child(
                         div()
                             .min_h(px(32.))

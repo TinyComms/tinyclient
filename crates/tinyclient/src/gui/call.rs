@@ -212,6 +212,8 @@ pub(super) struct Confirm {
 /// What the call views keep between frames, beyond the call itself (`Snapshot::call`).
 #[derive(Default)]
 pub struct State {
+    /// The frames of the picture being watched.
+    pub(in crate::gui) feed: super::tiny::feed::Feed<std::sync::Arc<gpui::RenderImage>>,
     /// Made the first time the dock is drawn.
     counter: OnceCell<Entity<Counter>>,
     /// The same count, for a Tiny channel's stage: a second text, ticking on its own.
