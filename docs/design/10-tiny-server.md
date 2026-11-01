@@ -184,7 +184,7 @@ once: the four steps, the `tc1.` code in a field with Copy, where it opens and i
 A full-window overlay over the rail and every pane (`canvas`), Escape or the round close
 button (top right, `ESC` under it) leaves. Left column 232 on `sidebar`: the server's icon and
 name, then pages under group labels: **Server** Overview, Roles · **People** Members, Invites,
-Bans · **Voice** Channels, Voice & media · **Security** Audit log, Sign-in, Danger zone (in
+Bans · **Voice** Channels, Voice & media · **Security** Audit log, Privacy, Sign-in, Danger zone (in
 `danger`). A page shows only where `settings::Page::visible` allows. Content at most 740 wide,
 title 20/600 and one sentence. A page that edits keeps a draft; while it differs, an
 unsaved-changes bar floats at the foot (`overlay`, radius 10, `shadow_modal`): "You have
@@ -253,6 +253,13 @@ its top.
   rows reads as one ("The server was set up, and 3 owner invites were printed."). Load older
   entries reads the next 50 (`TinyAudit`, `before` the last row) until a short page says that's
   everything. An older server shows the rows it sent with the page, unfiltered.
+- **Privacy** (a server with `first_run_setup`): what the server keeps about its members — what a
+  new account keeps from a sign-in provider, who sees when members were last online, and how they
+  sign in. Everyone reads it: a member as three short cards in fixed words
+  (`tiny_setup::keeps`, from the three values `GET /v1/server` gives everyone), an owner in the
+  server's own words under "Right now", with "Change it" below, which is the form of the first-run
+  screen and saves from the unsaved-changes bar. An owner who never answered also gets "Keep what
+  I have".
 - **Sign-in:** the provider (its name from `/v1/auth/config`, kept by chatd as
   `TinyCommunity::provider`), the server, how many joined by sign-in group, and a note that
   group mapping is set on the server; me — avatar, name, "Signed in through {provider}" (or "Signed in through the server's provider" when the name is missing), email,
@@ -261,8 +268,39 @@ its top.
   an owner myself", Transfer ownership… (typed confirmation; makes them an owner first, then
   unmakes me); Revoke every invite (typed confirmation).
 
+### First-run setup
+
+The first time an owner opens a server that lists `first_run_setup` and whose `GET /v1/setup`
+says `needed`, a full-window page (`canvas`, 760 wide, the same overlay as Server Settings and
+drawn above everything else) asks "Set up {server}". Escape or Later puts it away, and it comes
+back the next time the server is opened; nothing is applied until the owner says so, and the
+server is the only place the answer is kept. It shows, in this order:
+
+1. The two presets as radio cards (the server's `title` and `summary`; Privacy faint, with the
+   server's `unavailable` words, where the server has no passkeys).
+2. Customize, which opens each choice with the server's `question` and every option's `title` and
+   `effect`. A choice with nothing to act on here (`relevant: false`) is dimmed and says so. An
+   option that needs passkeys the server lacks is faint; one that needs a passkey of the owner's
+   own says so while it is picked.
+3. The server's `always` lines.
+4. What a choice touches (how many members have no passkey, how many addresses are stored) and
+   "Also remove the email addresses already on file", off, with a plain warning that it cannot be
+   undone.
+5. A refusal, in words, with a way on: `owner_needs_passkey` offers "Add a passkey for me"
+   (`TinyPasskeyLink`: chatd asks `POST /v1/me/passkeys/link` and opens the link in the system
+   browser; a sign-in older than ten minutes is told to sign in again first);
+   `members_without_passkey` says how many cannot sign in until given a passkey link and offers
+   "Do it anyway" (`allow_lockout`); `passkeys_unavailable` says the server has none.
+
+The foot holds Later, Keep what I have (an empty answer, `{}`, and a complete one) and Apply
+(or "Use Privacy" with a preset picked). What it shows and sends is `tiny_setup.rs`, tested
+without a window. It is shown to no one but an owner of a server with the feature: not an admin
+with every permission, not a bot, and not on an older server.
+
 `TINYCLIENT_SHOT_CALL=tiny_<state>` (`gui/call/shot.rs`) draws a made-up call in the room I
 sit in, `--tiny-menu stats` opens Call health and `--tiny-focus n` focuses the nth tile.
 `--tiny-settings <page>` opens a page for a screenshot, with `--tiny-pick n` (the nth role,
 channel, or n members ticked), `--tiny-override <role>`, `--tiny-scroll <px>`, `--tiny-owner`
-and `--tiny-confirm transfer`. The demo's Night Shift has data for every page.
+and `--tiny-confirm transfer`. `--tiny-setup first|custom|refused|privacy|member` draws first-run
+setup (with Privacy picked and the choices open, or after a refusal) or the Privacy page, over a
+made-up outline. The demo's Night Shift has data for every page.
