@@ -191,4 +191,54 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
     Write-Host "room: $($seed.room.name) $($seed.room.id)"
 }
 
+function Get-Seed { Get-Content (Join-Path $State 'seed.json') -Raw | ConvertFrom-Json }
+
+function Start-Desktop {
+    $seed = Get-Seed
+    $exe = Join-Path $Repo 'target\debug\tinyclient.exe'
+    if (-not (Test-Path $exe)) { throw "build first: cargo build -p tinyclient --features gui -p chatd -p mediad" }
+    $dir = Join-Path $State 'desktop-a'
+    Remove-Item -Recurse -Force $dir -ErrorAction SilentlyContinue
+    New-Item -ItemType Directory -Force $dir | Out-Null
+    # TINYCLIENT_DIR turns the keyring off and makes chatd read the session from this variable
+    # (crates/chatd/src/session.rs); the name carries the network label, space and all.
+    $session = $seed.sessions.a | ConvertTo-Json -Compress
+    $vars = @{
+        'TINYCLIENT_DIR'               = $dir
+        'TINYCLIENT_SESSION_TINY SERVER' = $session
+        'TINYCLIENT_MEDIAD_AUDIO'      = $Audio
+        'TINYCLIENT_MEDIAD_SINK'       = (Join-Path $dir 'played.pcm')
+        'TINYCLIENT_LOG_LEVEL'         = 'debug'
+    }
+    foreach ($k in $vars.Keys) { [Environment]::SetEnvironmentVariable($k, $vars[$k], 'Process') }
+    $p = Start-Process -PassThru $exe -WorkingDirectory $dir
+    foreach ($k in $vars.Keys) { [Environment]::SetEnvironmentVariable($k, $null, 'Process') }
+    Save-Pid 'tinyclient-a' $p.Id
+    # A fixed window size keeps the click positions below stable.
+    $win = Join-Path $PSScriptRoot 'win-window.ps1'
+    for ($i = 0; $i -lt 60; $i++) {
+        try { & $win -ProcessId $p.Id -Action place -X 40 -Y 40 -W 1280 -H 820; break } catch { Start-Sleep 1 }
+    }
+    Write-Host "desktop tinyclient pid $($p.Id), TINYCLIENT_DIR $dir, logs $dir\logs"
+}
+
+function Push-AndroidSession {
+    $seed = Get-Seed
+    $b = $seed.sessions.b.psobject.Copy()
+    # The emulator reaches the host's loopback at 10.0.2.2.
+    $b.base_url = "http://10.0.2.2:$HttpPort"
+    $json = $b | ConvertTo-Json -Compress
+    $entry = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
+    $file = Join-Path $State 'android-sessions.json'
+    [IO.File]::WriteAllText($file, (@{ 'tinyclient/Tiny server' = $entry } | ConvertTo-Json -Compress))
+    $pkg = 'dev.tinyclient.app'
+    adb -s $Serial shell am force-stop $pkg
+    adb -s $Serial push $file /data/local/tmp/tiny-sessions.json | Out-Null
+    adb -s $Serial shell "run-as $pkg sh -c 'mkdir -p files && cp /data/local/tmp/tiny-sessions.json files/sessions.json && chmod 600 files/sessions.json && ls -l files'"
+    adb -s $Serial shell rm /data/local/tmp/tiny-sessions.json
+    Write-Host "Bea's session written to $pkg files/sessions.json (base_url $($b.base_url))"
+}
+
 if ($Phase -in 'server', 'all') { Start-Server }
+if ($Phase -in 'desktop', 'all') { Start-Desktop }
+if ($Phase -in 'android', 'all') { Push-AndroidSession }
