@@ -470,6 +470,10 @@ struct Call {
     estimate: Option<u64>,
     /// What the tracks may spend now, and what the estimator was told to look for.
     rates: Rates,
+    /// Whether that estimate is to be believed.
+    uplink: video::Uplink,
+    /// Video bytes handed to str0m so far.
+    video_bytes: u64,
     desired: u64,
     /// When padding was last thrown away ([`Call::transmit`]).
     padding_dropped: Option<Instant>,
@@ -540,6 +544,8 @@ impl Call {
         self.offered = None;
         self.estimate = None;
         self.rates = Rates::default();
+        self.uplink = video::Uplink::default();
+        self.video_bytes = 0;
         self.desired = 0;
         self.padding_dropped = None;
         self.video.reset();
@@ -610,6 +616,8 @@ impl Call {
                 self.meter.round_trip(pair.and_then(|pair| pair.current_round_trip_time), stats.rtt);
                 let egress = egress_loss(stats.egress_loss_fraction, self.padding_dropped, Instant::now());
                 self.meter.path_loss(egress, stats.ingress_loss_fraction);
+                let sent = video::Sent { media: stats.bytes_tx, video: self.video_bytes, estimate: self.estimate, loss: egress, rtt: stats.rtt };
+                self.uplink.heard(sent, Instant::now());
                 // Only host candidates are offered: the path is UDP or ICE-TCP, never a relay.
                 if let Some(pair) = pair {
                     self.meter.path = match pair.protocol {
@@ -970,10 +978,11 @@ impl Call {
         let keep_camera = self.controls.camera();
         let share = self.connected && self.sending_share && self.controls.share();
         let camera = self.connected && self.sending_camera && keep_camera;
+        let desired = video::desired(share, camera);
         if let Some(estimate) = self.estimate {
+            let estimate = self.uplink.usable(estimate, desired, Instant::now());
             self.rates = video::allocate(estimate, share, camera, self.rates);
         }
-        let desired = video::desired(share, camera);
         if desired != self.desired {
             if self.desired == 0 {
                 self.link.rtc.bwe().reset(Bitrate::bps(START_BPS));
@@ -1031,7 +1040,10 @@ impl Call {
             Some(rid) => writer.rid(Rid::from(rid)),
             None => writer,
         };
-        let _ = writer.write(pt, at, MediaTime::new(rtp, Frequency::NINETY_KHZ), payload);
+        let size = payload.len() as u64;
+        if writer.write(pt, at, MediaTime::new(rtp, Frequency::NINETY_KHZ), payload).is_ok() {
+            self.video_bytes += size;
+        }
     }
 
     fn picture_in(&mut self, data: MediaData) {
@@ -1302,6 +1314,8 @@ pub fn run(link: Link, user_id: String, controls: Arc<Controls>) {
         video: Video::new(controls.clone()),
         estimate: None,
         rates: Rates::default(),
+        uplink: video::Uplink::default(),
+        video_bytes: 0,
         desired: 0,
         padding_dropped: None,
         sending_share: false,

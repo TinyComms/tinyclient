@@ -114,6 +114,96 @@ pub fn allocate(estimate: u64, share: bool, camera: bool, was: Rates) -> Rates {
     Rates { share, high, low }
 }
 
+/// How much of the estimate must have gone out for it to say anything about the path.
+const BUSY_PERCENT: u64 = 80;
+/// The loss that shows a link is full. Less is what a lossy link does at any rate.
+const FULL_LOSS: f32 = 0.10;
+/// The round trip above its lowest that shows a queue building. Jitter alone stays under it.
+const FULL_QUEUE: Duration = Duration::from_millis(200);
+/// The least video worth blaming, in bits a second. The voice is never given up, so a voice that
+/// fills a lossy link's low estimate says nothing about what stopping video would do.
+const VIDEO_LEAST: u64 = 50_000;
+/// How long the estimate is obeyed once the link showed it is full, and the most that grows to
+/// while each try at more finds it full again.
+const OBEY_FIRST: Duration = Duration::from_secs(5);
+const OBEY_MOST: Duration = Duration::from_secs(60);
+
+/// What one second of stats said about what we sent.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Sent {
+    /// Media bytes out so far, not counting padding, and how many of those were video.
+    pub media: u64,
+    pub video: u64,
+    /// The estimate now, in bits a second.
+    pub estimate: Option<u64>,
+    pub loss: Option<f32>,
+    pub rtt: Option<Duration>,
+}
+
+/// Whether the estimate is news of the path, or only of how little we sent. It follows what is
+/// sent, so a still screen falls from megabits to next to nothing on a perfect link, and a share
+/// held to that would stop itself. So video gives way only to a link that is plainly full, as the
+/// server's own rule has it (`congested` in its `video.rs`): most of the estimate sent, some of
+/// it video, and loss or a queue to show for it, two seconds running. It is then tried again,
+/// sooner or later, so what was taken always comes back.
+#[derive(Debug, Default)]
+pub struct Uplink {
+    /// Bytes as of the last second, and when that was.
+    last: Option<(u64, u64, Instant)>,
+    least_rtt: Option<Duration>,
+    /// The last second showed a full link.
+    full: bool,
+    obey_until: Option<Instant>,
+    obey_for: Duration,
+}
+
+impl Uplink {
+    /// The bits a second that `bytes` of a counter's growth come to.
+    fn rate(bytes: u64, over: Duration) -> u64 {
+        bytes.saturating_mul(8_000_000) / over.as_micros().max(1) as u64
+    }
+
+    /// One second's stats.
+    pub fn heard(&mut self, sent: Sent, now: Instant) {
+        let was = self.last.replace((sent.media, sent.video, now));
+        if let Some(rtt) = sent.rtt {
+            self.least_rtt = Some(self.least_rtt.map_or(rtt, |least| least.min(rtt)));
+        }
+        let Some((media, video, at)) = was else {
+            return;
+        };
+        let over = now.saturating_duration_since(at);
+        let media = Uplink::rate(sent.media.saturating_sub(media), over);
+        let video = Uplink::rate(sent.video.saturating_sub(video), over);
+        let queue = sent.rtt.zip(self.least_rtt).map(|(rtt, least)| rtt.saturating_sub(least));
+        let busy = video >= VIDEO_LEAST && sent.estimate.is_some_and(|estimate| media * 100 >= estimate * BUSY_PERCENT);
+        let shows = sent.loss.is_some_and(|loss| loss >= FULL_LOSS) || queue.is_some_and(|queue| queue >= FULL_QUEUE);
+        tracing::debug!(media, video, estimate = ?sent.estimate, loss = ?sent.loss, ?queue, busy, shows, "uplink");
+        let full = busy && shows;
+        let twice = full && self.full;
+        self.full = full;
+        if twice && !self.obeying(now) {
+            // Full again soon after the last try: this link needs longer.
+            let again = self.obey_until.is_some_and(|until| now.saturating_duration_since(until) < self.obey_for * 2);
+            self.obey_for = if again { (self.obey_for * 2).min(OBEY_MOST) } else { OBEY_FIRST };
+            self.obey_until = Some(now + self.obey_for);
+        }
+    }
+
+    fn obeying(&self, now: Instant) -> bool {
+        self.obey_until.is_some_and(|until| now < until)
+    }
+
+    /// The estimate to spend by, for tracks that would spend `desired`.
+    pub fn usable(&self, estimate: u64, desired: u64, now: Instant) -> u64 {
+        if self.obeying(now) {
+            estimate
+        } else {
+            estimate.max(desired)
+        }
+    }
+}
+
 /// What to have the estimator look for: what these tracks would spend, with the voice.
 pub fn desired(share: bool, camera: bool) -> u64 {
     let share = if share { u64::from(SHARE_BPS) } else { 0 };
@@ -126,7 +216,7 @@ pub fn desired(share: bool, camera: bool) -> u64 {
     if video == 0 {
         return 0;
     }
-    (video + VOICE_BPS) * 100 / SPEND_PERCENT
+    ((video + VOICE_BPS) * 100).div_ceil(SPEND_PERCENT)
 }
 
 /// What the tick wants sent.
@@ -294,6 +384,28 @@ struct Orders {
     changed: Condvar,
 }
 
+/// What one track's encoder made of a second.
+#[derive(Default)]
+struct Tally {
+    since: Option<Instant>,
+    frames: u32,
+    skipped: u32,
+    bytes: u64,
+}
+
+impl Tally {
+    fn note(&mut self, track: Track, bps: u32, bytes: usize, at: Instant) {
+        let since = *self.since.get_or_insert(at);
+        self.frames += u32::from(bytes > 0);
+        self.skipped += u32::from(bytes == 0);
+        self.bytes += bytes as u64;
+        if at.saturating_duration_since(since) >= Duration::from_secs(1) {
+            tracing::debug!(?track, bps, frames = self.frames, skipped = self.skipped, kbps = self.bytes * 8 / 1000, "encoded");
+            *self = Tally::default();
+        }
+    }
+}
+
 /// The capture thread's own state.
 struct Capture<S> {
     source: S,
@@ -301,6 +413,7 @@ struct Capture<S> {
     tell: SyncSender<Word>,
     /// Share, high, low.
     gates: [KeyGate; 3],
+    tallies: [Tally; 3],
     epoch: Option<Instant>,
 }
 
@@ -329,6 +442,9 @@ impl<S: Source> Capture<S> {
         at: Instant,
     ) -> bool {
         let wanted_key = asked.is_some_and(|ask| ask.key);
+        if let Some(ask) = asked {
+            self.tallies[track as usize].note(track, ask.bps, coded.bytes.len(), at);
+        }
         if coded.bytes.is_empty() {
             // The encoder skipped the frame, to keep to its rate. A skipped keyframe is still owed.
             if wanted_key {
@@ -691,6 +807,7 @@ fn start_capture<S: Source>(
                 controls,
                 tell,
                 gates: Default::default(),
+                tallies: Default::default(),
                 epoch: None,
             };
             capture(work, &theirs);
@@ -884,6 +1001,94 @@ mod tests {
     use crate::e2ee::E2ee;
     use protocol::TinyE2ee;
     use std::path::PathBuf;
+
+    /// One second after another on an `Uplink`, each `(kb/s sent, of it video, estimate in kb/s,
+    /// loss, round trip in ms)`.
+    fn seconds(uplink: &mut Uplink, start: Instant, from: u64, rows: &[(u64, u64, u64, f32, u64)], bytes: &mut (u64, u64)) -> Instant {
+        let mut now = start;
+        for (n, &(media, video, estimate, loss, rtt)) in rows.iter().enumerate() {
+            bytes.0 += media * 1000 / 8;
+            bytes.1 += video * 1000 / 8;
+            now = start + Duration::from_secs(from + n as u64);
+            uplink.heard(
+                Sent {
+                    media: bytes.0,
+                    video: bytes.1,
+                    estimate: Some(estimate * 1000),
+                    loss: Some(loss),
+                    rtt: Some(Duration::from_millis(rtt)),
+                },
+                now,
+            );
+        }
+        now
+    }
+
+    /// Measured in a real call: a clean, near still share's estimate fell from 3730 to 144 kb/s
+    /// with nothing lost, and the share stopped itself.
+    #[test]
+    fn a_still_share_keeps_going_as_its_estimate_falls() {
+        let mut uplink = Uplink::default();
+        let (start, wanted) = (Instant::now(), desired(true, false));
+        let rows: Vec<_> = [3730, 2493, 1349, 640, 300, 144].iter().map(|&estimate| (100, 20, estimate, 0., 5)).collect();
+        let now = seconds(&mut uplink, start, 0, &rows, &mut (0, 0));
+        let spend = uplink.usable(144_000, wanted, now);
+        assert_eq!(allocate(spend, true, false, Rates::default()).share, SHARE_BPS);
+    }
+
+    #[test]
+    fn a_full_link_takes_two_seconds_of_evidence_with_video_in_it() {
+        let wanted = desired(true, false);
+        let usable = |rows: &[(u64, u64, u64, f32, u64)]| {
+            let mut uplink = Uplink::default();
+            let start = Instant::now();
+            let now = seconds(&mut uplink, start, 0, rows, &mut (0, 0));
+            uplink.usable(300_000, wanted, now) == 300_000
+        };
+        let quiet = (0, 0, 1000, 0., 5);
+        let full = (300, 200, 300, 0.2, 5);
+        assert!(usable(&[quiet, quiet, full, full]), "lost a fifth with the estimate spent");
+        let queued = (300, 200, 300, 0., 210);
+        assert!(usable(&[quiet, quiet, queued, queued]), "a queue");
+        assert!(!usable(&[quiet, quiet, full, (300, 200, 300, 0., 5)]), "one second can be noise");
+        assert!(!usable(&[quiet, quiet, (300, 200, 300, 0.05, 150), (300, 200, 300, 0.05, 150)]), "a lossy, jittery link");
+        assert!(!usable(&[quiet, quiet, (300, 200, 800, 0.2, 5), (300, 200, 800, 0.2, 5)]), "under 80% of the estimate");
+        assert!(!usable(&[quiet, quiet, (100, 40, 100, 0.2, 5), (100, 40, 100, 0.2, 5)]), "voice filling a lossy link's low estimate");
+    }
+
+    #[test]
+    fn a_link_that_stays_full_is_tried_again_ever_less_often_and_a_clear_one_gets_it_back() {
+        let mut uplink = Uplink::default();
+        let start = Instant::now();
+        let wanted = desired(true, false);
+        let mut bytes = (0, 0);
+        let full = [(0, 0, 300, 0., 5), (300, 200, 300, 0.2, 5), (300, 200, 300, 0.2, 5)];
+        let obeyed_for = |uplink: &Uplink, from: Instant| {
+            (0..200).find(|n| uplink.usable(300_000, wanted, from + Duration::from_secs(*n)) != 300_000).unwrap()
+        };
+        let mut at = 0;
+        let mut waits = Vec::new();
+        for _ in 0..6 {
+            let now = seconds(&mut uplink, start, at, &full, &mut bytes);
+            let wait = obeyed_for(&uplink, now);
+            waits.push(wait);
+            at += 2 + wait;
+        }
+        assert_eq!(waits, [5, 10, 20, 40, 60, 60]);
+        // Evidence while the estimate is being obeyed does not add to the wait.
+        let mut uplink = Uplink::default();
+        let now = seconds(&mut uplink, start, 0, &[(0, 0, 300, 0., 5), (300, 200, 300, 0.2, 5), (300, 200, 300, 0.2, 5), (300, 200, 300, 0.2, 5), (300, 200, 300, 0.2, 5)], &mut (0, 0));
+        assert_eq!(obeyed_for(&uplink, now), 3);
+    }
+
+    #[test]
+    fn a_second_with_no_round_trip_does_not_forget_the_lowest() {
+        let mut uplink = Uplink::default();
+        let now = Instant::now();
+        uplink.heard(Sent { rtt: Some(Duration::from_millis(5)), ..Sent::default() }, now);
+        uplink.heard(Sent::default(), now + Duration::from_secs(1));
+        assert_eq!(uplink.least_rtt, Some(Duration::from_millis(5)));
+    }
 
     #[test]
     fn a_good_path_gets_everything() {
@@ -1081,6 +1286,7 @@ mod tests {
                 controls,
                 tell,
                 gates: Default::default(),
+                tallies: Default::default(),
                 epoch: None,
             },
             words,
