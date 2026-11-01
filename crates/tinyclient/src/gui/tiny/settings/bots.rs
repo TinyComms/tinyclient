@@ -103,28 +103,37 @@ impl Shell {
             cx,
             move || ask(&Request::TinyBotCreate { account, name, scopes }),
             move |this, answer, cx| {
-                let Some(draft) = this.tiny_state.settings.as_mut().map(|overlay| &mut overlay.bots) else {
-                    return;
+                let reload = {
+                    let Some(draft) = this.tiny_state.settings.as_mut().map(|overlay| &mut overlay.bots) else {
+                        return;
+                    };
+                    match answer {
+                        Ok(Response::TinyBotCreated { token, .. }) => {
+                            draft.token = Some(token);
+                            draft.loading = false;
+                            true
+                        }
+                        Ok(Response::Error { detail, .. }) => {
+                            draft.loading = false;
+                            draft.error = Some(detail);
+                            false
+                        }
+                        Ok(_) => {
+                            draft.loading = false;
+                            draft.error = Some(crate::client::OTHER_ANSWER.to_owned());
+                            false
+                        }
+                        Err(err) => {
+                            draft.loading = false;
+                            draft.error = Some(crate::client::trouble_words("tiny", &err));
+                            false
+                        }
+                    }
                 };
-                draft.loading = false;
-                match answer {
-                    Ok(Response::TinyBotCreated { token, .. }) => {
-                        draft.token = Some(token);
-                        drop(draft);
-                        this.tiny_bots_load(cx);
-                    }
-                    Ok(Response::Error { detail, .. }) => {
-                        draft.error = Some(detail);
-                        cx.notify();
-                    }
-                    Ok(_) => {
-                        draft.error = Some(crate::client::OTHER_ANSWER.to_owned());
-                        cx.notify();
-                    }
-                    Err(err) => {
-                        draft.error = Some(crate::client::trouble_words("tiny", &err));
-                        cx.notify();
-                    }
+                if reload {
+                    this.tiny_bots_load(cx);
+                } else {
+                    cx.notify();
                 }
             },
         );
@@ -143,27 +152,36 @@ impl Shell {
             cx,
             move || ask(&Request::TinyBotRevoke { account, bot_id }),
             move |this, answer, cx| {
-                let Some(draft) = this.tiny_state.settings.as_mut().map(|overlay| &mut overlay.bots) else {
-                    return;
+                let reload = {
+                    let Some(draft) = this.tiny_state.settings.as_mut().map(|overlay| &mut overlay.bots) else {
+                        return;
+                    };
+                    match answer {
+                        Ok(Response::Ok) => {
+                            draft.loading = false;
+                            true
+                        }
+                        Ok(Response::Error { detail, .. }) => {
+                            draft.loading = false;
+                            draft.error = Some(detail);
+                            false
+                        }
+                        Ok(_) => {
+                            draft.loading = false;
+                            draft.error = Some(crate::client::OTHER_ANSWER.to_owned());
+                            false
+                        }
+                        Err(err) => {
+                            draft.loading = false;
+                            draft.error = Some(crate::client::trouble_words("tiny", &err));
+                            false
+                        }
+                    }
                 };
-                draft.loading = false;
-                match answer {
-                    Ok(Response::Ok) => {
-                        drop(draft);
-                        this.tiny_bots_load(cx);
-                    }
-                    Ok(Response::Error { detail, .. }) => {
-                        draft.error = Some(detail);
-                        cx.notify();
-                    }
-                    Ok(_) => {
-                        draft.error = Some(crate::client::OTHER_ANSWER.to_owned());
-                        cx.notify();
-                    }
-                    Err(err) => {
-                        draft.error = Some(crate::client::trouble_words("tiny", &err));
-                        cx.notify();
-                    }
+                if reload {
+                    this.tiny_bots_load(cx);
+                } else {
+                    cx.notify();
                 }
             },
         );
