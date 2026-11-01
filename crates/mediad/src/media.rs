@@ -392,7 +392,7 @@ pub(crate) fn listen(controls: &Controls, audio: &mut Audio, processor: &mut Pro
         processor.capture(frame);
     }
     let heard = if captured { level(frame) } else { 0 };
-    let (open, hold) = crate::talk::opening(controls.input(), &controls.keys(), heard, Instant::now());
+    let (open, hold) = crate::talk::opening(controls.input(), &controls.keys(), heard, gate.talking(), Instant::now());
     (gate.step(frame, captured, muted, open, hold), heard)
 }
 
