@@ -20,15 +20,20 @@ static SHARING: AtomicBool = AtomicBool::new(false);
 static LAST_US: AtomicU64 = AtomicU64::new(0);
 /// Frames handed on at most this often.
 const EVERY_US: u64 = 200_000;
+/// Video samples ReplayKit delivered, and the last one's pixel format, for the log.
+static SAMPLES: AtomicU64 = AtomicU64::new(0);
+static FORMAT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// Starts sharing and returns once frames come or the user (or the system) refuses.
 pub(super) fn start(sink: FrameSink) -> Result<(), String> {
     stop();
+    LAST_US.store(0, Ordering::Relaxed);
     let (sender, started) = mpsc::channel::<Result<(), String>>();
     let handler = RcBlock::new(move |sample: NonNull<CMSampleBuffer>, kind: RPSampleBufferType, error: *mut NSError| {
         if !error.is_null() || kind != RPSampleBufferType::Video {
             return;
         }
+        SAMPLES.fetch_add(1, Ordering::Relaxed);
         let now = super::pixels::now_us();
         if now.saturating_sub(LAST_US.load(Ordering::Relaxed)) < EVERY_US {
             return;
@@ -38,6 +43,8 @@ pub(super) fn start(sink: FrameSink) -> Result<(), String> {
         let Some(image) = (unsafe { sample.as_ref().image_buffer() }) else {
             return;
         };
+        // SAFETY: reading the buffer's format.
+        FORMAT.store(unsafe { objc2_core_video::CVPixelBufferGetPixelFormatType(&image) }, Ordering::Relaxed);
         if let Some(frame) = super::pixels::frame_of(&image) {
             sink(frame);
         }
@@ -80,6 +87,12 @@ pub(super) fn stop() {
     if !SHARING.swap(false, Ordering::Relaxed) {
         return;
     }
+    let format = FORMAT.swap(0, Ordering::Relaxed).to_be_bytes();
+    log::info!(
+        "tinyclient: screen share delivered {} video samples (format {:?})",
+        SAMPLES.swap(0, Ordering::Relaxed),
+        String::from_utf8_lossy(&format)
+    );
     super::on_main(|_| {
         // SAFETY: the shared recorder, on the main thread.
         unsafe { RPScreenRecorder::sharedRecorder().stopCaptureWithHandler(None) };
