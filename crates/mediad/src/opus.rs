@@ -30,13 +30,59 @@ const LOSS_MARGIN: i32 = 2;
 const LOSS_ATTACK: f32 = 0.5;
 const LOSS_RELEASE: f32 = 0.05;
 
+/// The bitrates a speaker steps down through while the server keeps missing packets, in percent
+/// of the room's, and the least it goes: below this there is no room for in-band FEC.
+const RUNGS: [i32; 3] = [100, 75, 50];
+const RUNGS_FLOOR: i32 = 16_000;
+/// Smoothed loss over this for `DOWN_AFTER` reports, one a second, is a step down; under
+/// `UP_BELOW` for `UP_AFTER`, a step back up. Wide apart, so the rate does not hunt.
+const DOWN_ABOVE: f32 = 0.08;
+const DOWN_AFTER: u32 = 5;
+const UP_BELOW: f32 = 0.02;
+const UP_AFTER: u32 = 30;
+/// How much of each report goes into that smoothed loss.
+const LADDER_SMOOTHING: f32 = 0.3;
+
+/// Where on [`RUNGS`] a speaker is. Loss that lasts is a link that cannot carry the rate.
+#[derive(Debug, Default)]
+struct Ladder {
+    rung: usize,
+    loss: f32,
+    /// Reports in a row over `DOWN_ABOVE`, and under `UP_BELOW`.
+    over: u32,
+    under: u32,
+}
+
+impl Ladder {
+    fn report(&mut self, fraction: f32) {
+        self.loss += (fraction - self.loss) * LADDER_SMOOTHING;
+        self.over = if self.loss > DOWN_ABOVE { self.over + 1 } else { 0 };
+        self.under = if self.loss < UP_BELOW { self.under + 1 } else { 0 };
+        if self.over >= DOWN_AFTER {
+            self.over = 0;
+            self.rung = (self.rung + 1).min(RUNGS.len() - 1);
+        } else if self.under >= UP_AFTER {
+            self.under = 0;
+            self.rung = self.rung.saturating_sub(1);
+        }
+    }
+
+    /// The rate to encode at in a room of `room`, never over it.
+    fn rate(&self, room: i32) -> i32 {
+        (room * RUNGS[self.rung] / 100).max(RUNGS_FLOOR.min(room))
+    }
+}
+
 pub struct Encoder {
     state: *mut OpusEncoder,
     /// One channel: each stereo frame is folded to mono before it is encoded.
     mono: bool,
-    /// The bitrate it was made at, and the one it encodes at now.
+    /// The bitrate it was made at, the one it was last asked for (a Tiny room's), and the one it
+    /// encodes at now: the same, unless [`Ladder`] has stepped it down.
     default: i32,
+    room: i32,
     bitrate: i32,
+    ladder: Ladder,
     /// The packet loss, in percent, FEC is planned for, and the smoothed reports behind it.
     loss: i32,
     reported: f32,
@@ -84,12 +130,15 @@ impl Encoder {
             opus_encoder_ctl!(state, OPUS_SET_DTX_REQUEST, i32::from(dtx));
         }
         let reported = (LOSS_PLANNED - LOSS_MARGIN) as f32 / 100.;
-        Some(Encoder { state, mono: channels == 1, default: bitrate, bitrate, loss: LOSS_PLANNED, reported })
+        Some(Encoder { state, mono: channels == 1, default: bitrate, room: bitrate, bitrate, ladder: Ladder::default(), loss: LOSS_PLANNED, reported })
     }
 
     /// The far end's reports say it is losing `fraction` of our packets: FEC is planned for
-    /// that, smoothed, a little more, and never less than [`LOSS_FLOOR`].
+    /// that, smoothed, a little more, and never less than [`LOSS_FLOOR`]. If it goes on, the
+    /// bitrate comes down too.
     pub fn set_loss(&mut self, fraction: f32) {
+        self.ladder.report(fraction);
+        self.apply_bitrate();
         let rate = if fraction > self.reported { LOSS_ATTACK } else { LOSS_RELEASE };
         self.reported += (fraction - self.reported) * rate;
         let wanted = ((self.reported * 100.).round() as i32 + LOSS_MARGIN).clamp(LOSS_FLOOR, 30);
@@ -102,10 +151,15 @@ impl Encoder {
         }
     }
 
-    /// Encodes at `bitrate` bits a second from the next frame on (a Tiny room's, `Bitrate`);
-    /// `None` goes back to the rate it was made at.
+    /// Encodes at up to `bitrate` bits a second from the next frame on (a Tiny room's,
+    /// `Bitrate`); `None` goes back to the rate it was made at.
     pub fn set_bitrate(&mut self, bitrate: Option<i32>) {
-        let wanted = bitrate.unwrap_or(self.default);
+        self.room = bitrate.unwrap_or(self.default);
+        self.apply_bitrate();
+    }
+
+    fn apply_bitrate(&mut self) {
+        let wanted = self.ladder.rate(self.room);
         if wanted != self.bitrate {
             // SAFETY: `state` is a live encoder and the request takes one i32.
             unsafe {
@@ -527,6 +581,62 @@ mod tests {
             let len = encoder.encode(&quiet, &mut packet).unwrap();
             assert!(len > 2, "{len} bytes of silence");
         }
+    }
+
+    /// The rate after each of `reports`.
+    fn rates(encoder: &mut Encoder, reports: &[f32]) -> Vec<i32> {
+        reports
+            .iter()
+            .map(|&loss| {
+                encoder.set_loss(loss);
+                encoder.bitrate()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn lasting_loss_steps_the_bitrate_down_and_a_long_clean_spell_brings_it_back() {
+        let mut encoder = Encoder::voice().unwrap();
+        encoder.set_bitrate(Some(64_000));
+        let going = rates(&mut encoder, &[0.15; 30]);
+        assert!(going[..5].iter().all(|&rate| rate == 64_000), "five seconds first: {going:?}");
+        assert_eq!(going[29], 32_000, "as far as the ladder goes: {going:?}");
+        assert!(going.contains(&48_000), "one step at a time: {going:?}");
+        let coming = rates(&mut encoder, &[0.; 90]);
+        assert!(coming[..30].iter().all(|&rate| rate == 32_000), "{coming:?}");
+        assert_eq!(coming[89], 64_000, "{coming:?}");
+        assert!(coming.iter().all(|&rate| rate <= 64_000));
+    }
+
+    #[test]
+    fn a_burst_of_loss_is_not_a_reason_to_change_the_bitrate() {
+        let mut encoder = Encoder::voice().unwrap();
+        encoder.set_bitrate(Some(64_000));
+        let rates = rates(&mut encoder, &[0., 0., 0.3, 0., 0., 0., 0., 0.25, 0., 0., 0., 0.]);
+        assert!(rates.iter().all(|&rate| rate == 64_000), "{rates:?}");
+    }
+
+    #[test]
+    fn loss_between_the_two_marks_leaves_the_bitrate_where_it_is() {
+        let mut encoder = Encoder::voice().unwrap();
+        encoder.set_bitrate(Some(64_000));
+        rates(&mut encoder, &[0.2; 8]);
+        let stepped = encoder.bitrate();
+        assert!(stepped < 64_000);
+        let rates = rates(&mut encoder, &[0.04; 120]);
+        assert!(rates.iter().skip(10).all(|&rate| rate == rates[10]), "{rates:?}");
+    }
+
+    #[test]
+    fn the_ladder_keeps_under_the_room_and_over_the_floor() {
+        let mut encoder = Encoder::voice().unwrap();
+        encoder.set_bitrate(Some(20_000));
+        rates(&mut encoder, &[0.2; 30]);
+        assert_eq!(encoder.bitrate(), RUNGS_FLOOR);
+        encoder.set_bitrate(Some(12_000));
+        assert_eq!(encoder.bitrate(), 12_000, "a room under the floor is still the room");
+        encoder.set_bitrate(Some(96_000));
+        assert_eq!(encoder.bitrate(), 48_000, "the step down holds in a new room");
     }
 
     #[test]
