@@ -114,7 +114,9 @@ gpui_platform = { package = "gpui_ce_platform", version = "0.3.0", optional = tr
 gpui_platform = { package = "gpui_ce_platform", version = "0.3.0", optional = true, default-features = false, features = ["runtime_shaders"] }
 # The iOS call platform and web sign-in (`src/mobile/ios`), written against Apple's frameworks
 # through objc2: the same objc2 0.6 / framework 0.3 line gpui-ce's iOS backend already links.
-objc2 = { version = "0.6", optional = true }
+# The debug-build encoding check rejects some correct Apple messages (NSUUID initWithUUIDBytes:,
+# isEqualToString: on Swift-backed strings) and panics across the Objective-C boundary.
+objc2 = { version = "0.6", optional = true, features = ["disable-encoding-assertions"] }
 block2 = { version = "0.6", optional = true }
 dispatch2 = { version = "0.3", optional = true }
 objc2-foundation = { version = "0.3", optional = true }

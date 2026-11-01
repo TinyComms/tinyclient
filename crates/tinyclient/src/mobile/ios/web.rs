@@ -270,7 +270,15 @@ fn data_store(network: &str) -> Retained<AnyObject> {
         bytes.copy_from_slice(&digest[..16]);
         bytes[6] = (bytes[6] & 0x0f) | 0x50;
         bytes[8] = (bytes[8] & 0x3f) | 0x80;
-        let uuid = NSUUID::from_bytes(bytes);
+        let text = format!(
+            "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+            u32::from_be_bytes(bytes[0..4].try_into().unwrap_or_default()),
+            u16::from_be_bytes([bytes[4], bytes[5]]),
+            u16::from_be_bytes([bytes[6], bytes[7]]),
+            u16::from_be_bytes([bytes[8], bytes[9]]),
+            bytes[10..16].iter().fold(0u64, |value, byte| value << 8 | *byte as u64),
+        );
+        let uuid = NSUUID::from_string(&NSString::from_str(&text)).unwrap_or_else(NSUUID::new);
         // SAFETY: iOS 17's persistent store by identifier, on the main thread.
         unsafe { msg_send![class, dataStoreForIdentifier: &*uuid] }
     } else {
