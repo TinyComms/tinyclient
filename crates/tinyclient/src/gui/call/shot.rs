@@ -124,6 +124,7 @@ pub(super) fn security(members: &[String]) -> Option<CallSecurity> {
         members,
         unsupported: Vec::new(),
         server_lacks: mode == SecurityMode::Transport,
+        required: false,
     })
 }
 

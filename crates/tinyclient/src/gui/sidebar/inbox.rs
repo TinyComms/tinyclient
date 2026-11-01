@@ -180,7 +180,10 @@ pub fn items(rows: &[Rc<Conversation>], filter: InboxFilter, now: i64, apps_open
 /// The Inbox while its order is held: the rows stay where they are drawn, each showing what is
 /// new about it; rows that newly belong in it wait. Answers the drawn rows and how many have
 /// news that would move them, for the "n new" pill.
-pub fn hold(drawn: &[Rc<Conversation>], fresh: &[Rc<Conversation>]) -> (Vec<Rc<Conversation>>, usize) {
+///
+/// `read_missing` is the Unread and Mentions chips. A row that left the fresh query was read,
+/// so it stays put with its badge cleared. The chip change is what lets it leave.
+pub fn hold(drawn: &[Rc<Conversation>], fresh: &[Rc<Conversation>], read_missing: bool) -> (Vec<Rc<Conversation>>, usize) {
     let by_key: HashMap<&Key, &Rc<Conversation>> = fresh.iter().map(|row| (&row.key, row)).collect();
     let mut waiting = 0;
     let kept = drawn
@@ -193,7 +196,16 @@ pub fn hold(drawn: &[Rc<Conversation>], fresh: &[Rc<Conversation>]) -> (Vec<Rc<C
                 Rc::clone(now)
             }
             // Gone from the list: it stays until the order is let go.
-            None => Rc::clone(row),
+            None => {
+                if read_missing && (row.unread > 0 || row.mentions > 0) {
+                    let mut cleared = (**row).clone();
+                    cleared.unread = 0;
+                    cleared.mentions = 0;
+                    Rc::new(cleared)
+                } else {
+                    Rc::clone(row)
+                }
+            }
         })
         .collect();
     let drawn_keys: std::collections::HashSet<&Key> = drawn.iter().map(|row| &row.key).collect();
@@ -299,10 +311,21 @@ mod tests {
         let drawn = vec![row("a", 10), row("b", 9), row("c", 8)];
         // b spoke, d is new, c left the list.
         let fresh = vec![row("b", 20), row("d", 15), row("a", 10)];
-        let (kept, waiting) = hold(&drawn, &fresh);
+        let (kept, waiting) = hold(&drawn, &fresh, false);
         let order: Vec<(&str, i64)> = kept.iter().map(|c| (c.key.id.as_str(), c.updated)).collect();
         assert_eq!(order, [("a", 10), ("b", 20), ("c", 8)]);
         assert_eq!(waiting, 2);
-        assert_eq!(hold(&fresh, &fresh).1, 0);
+        assert_eq!(hold(&fresh, &fresh, false).1, 0);
+    }
+
+    #[test]
+    fn a_row_that_leaves_the_unread_chip_keeps_its_place_and_loses_its_badge() {
+        let drawn = vec![with(&row("a", 10), |c| c.unread = 1)];
+        let fresh = vec![row("b", 20)];
+        let (kept, _) = hold(&drawn, &fresh, true);
+        assert_eq!(kept[0].key.id, "a");
+        assert_eq!((kept[0].unread, kept[0].mentions), (0, 0));
+        let (kept, _) = hold(&drawn, &fresh, false);
+        assert_eq!(kept[0].unread, 1);
     }
 }

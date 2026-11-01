@@ -215,7 +215,8 @@ fn shell_bindings() -> Vec<KeyBinding> {
 /// `--sign-in-failed closed|unreachable|blocked` (first launch, with nothing signed in),
 /// `--state starting|keychain|denied|reconnecting|failed` (a window state, forced),
 /// `--crash-toast` (the toast after a crash relaunch), `--menu row-right|row-bottom` (the row
-/// menu opened at the window's edges), `--text-step N`, `--start-chatd` (let the shot start
+/// menu opened at the window's edges), `--text-step N`, `--mark-all` (marks the inbox read,
+/// then waits so the shot shows the cleared list), `--start-chatd` (let the shot start
 /// chatd when it is not running; off by default so a shot leaves no process behind),
 /// `--autoplay always|hover|never` (when GIFs play), `--frames N` (N frames 150 ms apart, as
 /// `out-1.png` …, to see moving pictures move). On a Tiny server (`--mode tiny`): `--tiny-room
@@ -230,7 +231,7 @@ mod shot {
     use super::app::service::Shown;
     use super::{components, flag, theme};
     use gpui::{div, point, prelude::*, px, App, Context, Window};
-    use protocol::{InboxFilter, Network};
+    use protocol::{ConversationKind, InboxFilter, Network};
     use std::time::Duration;
 
     fn has(name: &str) -> bool {
@@ -316,7 +317,14 @@ mod shot {
                         }
                     }
                     Some("row") => {
-                        if let Some(row) = shell.sidebar_state.inbox.get(1).cloned() {
+                        let rows = shell.sidebar_state.inbox.all();
+                        let row = rows
+                            .iter()
+                            .find(|row| row.kind == ConversationKind::Direct)
+                            .or_else(|| rows.iter().find(|row| row.kind.is_direct()))
+                            .cloned()
+                            .or_else(|| shell.sidebar_state.inbox.get(1).cloned());
+                        if let Some(row) = row {
                             shell.open_menu(Menu::Row(row, point(px(240.), px(180.))), cx);
                         }
                     }
@@ -540,6 +548,10 @@ mod shot {
             for step in 0..3 {
                 let _ = window.update(cx, |shell, window, cx| stage(shell, step, window, cx));
                 cx.background_executor().timer(settle).await;
+            }
+            if has("--mark-all") {
+                let _ = window.update(cx, |shell, _, cx| shell.mark_all_read(cx));
+                cx.background_executor().timer(Duration::from_millis(1200)).await;
             }
             // Each press waits for what the one before it read.
             for _ in 0..flag("--walk").and_then(|n| n.parse::<usize>().ok()).unwrap_or(0) {

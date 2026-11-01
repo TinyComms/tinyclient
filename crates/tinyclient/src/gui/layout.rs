@@ -15,7 +15,7 @@ use gpui::{
     div, prelude::*, px, AnyElement, App, Context, Div, MouseButton, MouseMoveEvent, Pixels, Point, Rgba,
     SharedString, Window, WindowControlArea,
 };
-use protocol::{CallState, Conversation, Key, Link, Network, Presence};
+use protocol::{CallState, Conversation, ConversationKind, Key, Link, Network, Presence};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -754,6 +754,12 @@ impl Shell {
                             && !matches!(call.state, CallState::Failed { .. })
                     });
                 let joinable = super::sidebar::joins_from_list(&*conversation) && !ours;
+                let readable = conversation.clone();
+                let closable = conversation.key.clone();
+                let forgettable = conversation.clone();
+                let show_read = conversation.unread > 0 || conversation.mentions > 0;
+                let is_dm = conversation.kind == ConversationKind::Direct;
+                let can_forget = conversation.kind.is_direct();
                 let items = menu()
                     .w(px(220.))
                     // A native voice channel joins from its menu too; a stage never does (07 §1).
@@ -779,12 +785,34 @@ impl Shell {
                         )
                     }))
                     .child(menu_separator())
+                    .children(show_read.then(|| {
+                        let key = readable.key.clone();
+                        menu_item("mark-read", Some("icons/check.svg"), "Mark as read", None).on_click(cx.listener(move |this, _, _, cx| {
+                            this.close_menu(cx);
+                            this.mark_conversation_read(key.clone(), cx);
+                        }))
+                    }))
+                    .children(is_dm.then(|| {
+                        let key = closable.clone();
+                        menu_item("close-dm", Some("icons/x.svg"), "Close conversation", None).on_click(cx.listener(move |this, _, _, cx| {
+                            this.close_menu(cx);
+                            this.close_direct(key.clone(), cx);
+                        }))
+                    }))
                     .child(
                         menu_item("open", Some(NO_GLYPH), "Open", Some("↵")).on_click(cx.listener(move |this, _, _, cx| {
                             this.close_menu(cx);
                             this.select(unpinned.key.clone(), &unpinned.title, cx);
                         })),
-                    );
+                    )
+                    .children(can_forget.then(menu_separator))
+                    .children(can_forget.then(|| {
+                        let row = (*forgettable).clone();
+                        menu_item_danger("forget", Some("icons/trash-2.svg"), "Delete from inbox").on_click(cx.listener(move |this, _, _, cx| {
+                            this.close_menu(cx);
+                            this.forget_conversation(row.clone(), cx);
+                        }))
+                    }));
                 placed("menu-row-at", Place::Pointer(*position), Layer::Menu, window, fade_in("menu-row", 120, items))
             }
         };

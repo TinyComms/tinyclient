@@ -9,7 +9,7 @@ use crate::client::ask;
 use gpui::{Context, FocusHandle, Subscription, Task, Window};
 use protocol::{
     AccountKey, AccountStatus, Call, Change, Conversation, ErrorCode, Group, Key, Link,
-    MediaFile, Network, NetworkStatus, Occupants, Page, Request, Response, Space,
+    MediaFile, Network, NetworkStatus, Occupants, Page, Relation, Request, Response, Space,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -732,6 +732,12 @@ impl Shell {
     /// Opens without adding to history: what back and forward do.
     pub(super) fn open_now(&mut self, key: Key, title: &str, cx: &mut Context<Self>) {
         let row = self.sidebar_state.find(&self.trees, &key);
+        let catch_up = row.as_ref().and_then(|row| {
+            if row.unread == 0 && row.mentions == 0 {
+                return None;
+            }
+            row.peer.clone().map(|peer| (row.key.clone(), peer))
+        });
         let known = row.is_some();
         if let Some(snapshot) = &mut self.snapshot {
             // Until its row is read, a conversation no list holds is its key and title.
@@ -745,6 +751,37 @@ impl Shell {
         // A floating sidebar closes on pick.
         self.layout_state.floating = false;
         self.rebuild_rows(cx);
+        if let Some((conversation, peer)) = catch_up {
+            self.catch_up_if_blocked(conversation, peer, cx);
+        }
+    }
+
+    /// Opening a DM with someone we blocked clears the badge even when their history will not
+    /// load. A screenshot never does this, so an unread row stays unread in a shot.
+    fn catch_up_if_blocked(&mut self, conversation: Key, peer: String, cx: &mut Context<Self>) {
+        if cfg!(feature = "gui-shot") {
+            return;
+        }
+        let person = Key { id: peer.clone(), ..conversation.clone() };
+        if let Some(found) = self.people_state.hub().person(&person) {
+            if found.relation == Relation::Blocked {
+                self.mark_conversation_read(conversation, cx);
+            }
+            return;
+        }
+        let request = Request::People {
+            network: Some(conversation.network),
+            relation: Some(Relation::Blocked),
+            query: None,
+            offset: 0,
+            limit: protocol::PAGE_LIMIT,
+        };
+        self.off_thread(cx, move || ask(&request), move |this, answer, cx| {
+            let blocked = matches!(answer, Ok(Response::People { people, .. }) if people.iter().any(|person| person.key.id == peer));
+            if blocked && this.open.as_ref() == Some(&conversation) {
+                this.mark_conversation_read(conversation, cx);
+            }
+        });
     }
 
     /// What stands for a conversation's row before chatd has answered with it.

@@ -391,6 +391,7 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
             )
         }
         ("POST", ["channels", _, "messages", _, "ack"]) => (200, json!({"token": null})),
+        ("POST", ["read-states", "ack-bulk"]) => (200, json!({})),
         ("POST", ["channels", _, "typing"]) => (204, Value::Null),
         ("POST", ["channels", _, "call", "stop-ringing"]) => (204, Value::Null),
         ("POST", ["users", "@me", "channels"]) => {
@@ -1375,6 +1376,61 @@ fn sending_echoes_once_and_failures_say_why() {
     world.send("3002", "1730000000000000008", "and again", None);
     assert_eq!(world.failure("3002", "1730000000000000008"), why);
     assert_eq!(world.discord.requests.lock().unwrap().len(), asked, "a challenged account sends nothing");
+}
+
+#[test]
+fn a_blocked_persons_refused_ack_does_not_bring_the_unread_back() {
+    let world = World::start();
+    assert!(world.conversation("3001").unread > 0);
+    world.discord.script(
+        "/channels/3001/messages/1300000010000000010/ack",
+        403,
+        json!({"message": "Cannot send messages to this user", "code": 50007}),
+    );
+    assert_eq!(
+        world.ask(Request::MarkRead { conversation: world.key("3001"), message_id: String::new() }),
+        Response::Ok
+    );
+    let row = world.conversation("3001");
+    assert_eq!(row.unread, 0);
+    assert_eq!(row.last_read.as_deref(), Some("1300000010000000010"));
+    let acked = wait("the refused acknowledgement", || {
+        world.discord.requests_to("POST", "/channels/3001/messages/1300000010000000010/ack").pop()
+    });
+    assert_eq!(acked.body["token"], json!(null));
+    let bulk = wait("the bulk acknowledgement", || {
+        let found = world.discord.requests_to("POST", "/read-states/ack-bulk");
+        (!found.is_empty()).then_some(found)
+    });
+    assert_eq!(bulk[0].body["read_states"][0]["channel_id"], "3001");
+    assert_eq!(bulk[0].body["read_states"][0]["message_id"], "1300000010000000010");
+
+    let heard = world.discord.sequence.load(Ordering::Relaxed);
+    world.discord.push(
+        "MESSAGE_ACK",
+        json!({"channel_id": "3001", "message_id": "1300000000000000005", "mention_count": 2, "version": 814}),
+    );
+    wait("the stale ack to be dispatched", || (world.discord.sequence.load(Ordering::Relaxed) > heard).then_some(()));
+    sleep(Duration::from_millis(300));
+    let row = world.conversation("3001");
+    assert_eq!(row.unread, 0, "an older marker must not unread a chat we already caught up");
+    assert_eq!(row.last_read.as_deref(), Some("1300000010000000010"));
+}
+
+#[test]
+fn marking_everything_read_tells_discord_in_one_bulk_ack() {
+    let world = World::start();
+    assert!(world.conversation("3001").unread > 0);
+    assert_eq!(world.ask(Request::MarkAllRead { network: None }), Response::Ok);
+    assert_eq!(world.conversation("3001").unread, 0);
+    let bulk = wait("the bulk ack", || {
+        let found = world.discord.requests_to("POST", "/read-states/ack-bulk");
+        (!found.is_empty()).then_some(found)
+    });
+    let named = bulk.iter().any(|seen| {
+        seen.body["read_states"].as_array().is_some_and(|rows| rows.iter().any(|row| row["channel_id"] == "3001"))
+    });
+    assert!(named, "channel 3001 is in the bulk ack");
 }
 
 #[test]

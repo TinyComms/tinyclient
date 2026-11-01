@@ -5,6 +5,7 @@
 
 use super::super::{About, ConversationAbout, Refusal, Reply, SearchScope, SharedPage, SpaceAbout};
 use super::model::{self, number, GuildSettings, Posted};
+use super::rest::Refused;
 use super::{escaped, refusal, Discord};
 use crate::hub::now;
 use protocol::{ConversationKind, MediaKind, Message, MessageHit, Notify, SharedItem, SharedKind, Style};
@@ -273,7 +274,15 @@ impl Discord {
             (_, true) => return Err(refused("Only a direct message can be closed.")),
             (_, false) => return Err(refused("Leave servers and their channels in Discord.")),
         };
-        self.call("DELETE", &path, None).map_err(refusal)?;
+        if let Err(failed) = self.call("DELETE", &path, None) {
+            // Closing a DM with someone who blocked us is refused. Hide it here instead, so the
+            // row and its badge do not come back on the next READY.
+            let blocked = matches!(failed, Refused::Status { code: 50007 | 50001 | 50003, .. } | Refused::Status { status: 403, .. });
+            if close && blocked {
+                return self.ctx.forget_conversation(channel).map_err(refused);
+            }
+            return Err(refusal(failed));
+        }
         {
             let mut state = crate::hub::lock(&self.state);
             state.privates.remove(channel);

@@ -342,6 +342,16 @@ impl Discord {
         let Some(conversation) = self.ctx.known(&acked.channel_id)? else {
             return Ok(());
         };
+        // An ack of a marker we have already passed is Discord repeating the old one. Applying
+        // it would unread a blocked DM whose ack Discord refused.
+        if let Some(last) = conversation.last_read.as_deref().filter(|id| !id.is_empty()) {
+            let ack_n = number(&acked.message_id);
+            let last_n = number(last);
+            let already = conversation.unread == 0 && conversation.mentions == 0;
+            if last_n > ack_n || (last_n >= ack_n && already) {
+                return Ok(());
+            }
+        }
         let caught_up = seconds(&acked.message_id) >= conversation.updated;
         let mentions = acked.mention_count.unwrap_or(0);
         let (unread, mentions) = match (caught_up, conversation.kind.is_direct()) {
