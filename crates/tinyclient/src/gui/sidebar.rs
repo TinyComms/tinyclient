@@ -580,6 +580,60 @@ impl Shell {
         self.off_thread(cx, move || ask(&request), |_, _, _| {});
     }
 
+    pub(super) fn mark_conversation_read(&mut self, conversation: Key, cx: &mut Context<Self>) {
+        let request = Request::MarkRead { conversation, message_id: String::new() };
+        self.off_thread(cx, move || ask(&request), |this, answer, cx| {
+            if let Ok(Response::Error { detail, .. }) = &answer {
+                this.toast(Some(("icons/circle-alert.svg", theme::danger())), detail.clone(), cx);
+            }
+            let pages = this.sidebar_state.inbox.stale();
+            this.load_inbox(pages, cx);
+        });
+    }
+
+    pub(super) fn mark_all_read(&mut self, cx: &mut Context<Self>) {
+        let request = Request::MarkAllRead { network: None };
+        self.off_thread(cx, move || ask(&request), |this, answer, cx| {
+            match answer {
+                Ok(Response::Ok) => {
+                    // The Unread page never lists muted rows, so the catch-up note would keep
+                    // naming conversations this just read.
+                    this.sidebar_state.muted_news.clear();
+                    this.sidebar_state.muted_open = false;
+                    this.toast(Some(("icons/check.svg", theme::text_soft())), "Marked as read", cx);
+                }
+                Ok(Response::Error { detail, .. }) => this.toast(Some(("icons/circle-alert.svg", theme::danger())), detail, cx),
+                Err(err) => this.toast(Some(("icons/circle-alert.svg", theme::danger())), crate::client::trouble_words("inbox", &err), cx),
+                _ => {}
+            }
+            let pages = this.sidebar_state.inbox.stale();
+            this.load_inbox(pages, cx);
+        });
+    }
+
+    /// Removes a direct or group conversation from this Inbox. The network keeps the messages.
+    pub(super) fn forget_conversation(&mut self, conversation: Conversation, cx: &mut Context<Self>) {
+        let title = conversation.title.clone();
+        let network = conversation.key.network;
+        let request = Request::Forget { conversation: conversation.key };
+        self.off_thread(cx, move || ask(&request), move |this, answer, cx| {
+            match answer {
+                Ok(Response::Ok) => {
+                    let words = match network {
+                        Network::Discord => format!("{title} was deleted from your inbox. A new message brings it back. Discord still has the messages."),
+                        _ => format!("{title} was deleted from your inbox. A new message brings it back."),
+                    };
+                    this.toast(Some(("icons/trash-2.svg", theme::text_soft())), words, cx);
+                }
+                Ok(Response::Error { detail, .. }) => this.toast(Some(("icons/circle-alert.svg", theme::danger())), detail, cx),
+                Err(err) => this.toast(Some(("icons/circle-alert.svg", theme::danger())), crate::client::trouble_words("inbox", &err), cx),
+                _ => {}
+            }
+            let pages = this.sidebar_state.inbox.stale();
+            this.load_inbox(pages, cx);
+        });
+    }
+
     pub(super) fn star(&mut self, conversation: Key, starred: bool, cx: &mut Context<Self>) {
         let request = Request::Star { conversation, starred };
         self.off_thread(cx, move || ask(&request), |this, _, cx| {
@@ -1330,13 +1384,26 @@ impl Shell {
                 let pick = |this: &mut Shell, ix: usize, cx: &mut Context<Shell>| {
                     this.set_filter([InboxFilter::All, InboxFilter::Unread, InboxFilter::Mentions][ix], cx);
                 };
+                // Mark all as read sits at the strip's end; on a phone it waits in the row menu
+                // and Details, where a thumb finds it, so the title and segment keep their room.
+                let marked = (counts.unread > 0 || counts.mentions > 0) && !super::phone::active();
                 // A phone's larger text has no room for both on one line: the segment takes a
                 // row of its own under the title.
                 if super::phone::active() && super::phone::tokens::text_scale() > 1.25 {
                     let segments = self.segments(&choices, cx, pick);
                     return div().flex_none().flex().flex_col().child(strip.child(pane_title("Inbox"))).child(div().flex_none().px(px(theme::PANE_PAD)).pb(px(8.)).flex().child(segments));
                 }
-                strip.child(pane_title("Inbox")).child(self.segments(&choices, cx, pick))
+                strip
+                    .child(pane_title("Inbox"))
+                    .child(self.segments(&choices, cx, pick))
+                    .child(div().flex_1())
+                    .when(marked, |strip| {
+                        strip.child(
+                            quiet(icon_button("mark-all", "icons/check-check.svg", false))
+                                .tooltip(tip("Mark all as read", None))
+                                .on_click(cx.listener(|this, _, _, cx| this.mark_all_read(cx))),
+                        )
+                    })
             }
             Mode::People => strip.child(pane_title("People")),
             Mode::Network(Network::Slack) => self.slack_title(strip, cx),

@@ -352,6 +352,8 @@ pub struct SettingsWindow {
     pub(super) section: Section,
     pub(super) confirm: Option<Confirm>,
     pub(super) picker: Option<Picker>,
+    /// The choice menu that is open, by its row id (S2, N2, N7, …).
+    pub(super) choice: Option<&'static str>,
     /// The device pickers' buttons, by `Picker`, so closing a menu gives the key back to its
     /// button; and the open menu, which takes ↑ ↓ Return Space and letters.
     pub(super) picker_focus: [FocusHandle; 2],
@@ -379,6 +381,8 @@ pub struct SettingsWindow {
     pub(super) storage: Option<(u64, u64)>,
     /// The row whose value could not be stored, or whose action did not happen.
     pub(super) failed: Option<&'static str>,
+    /// Why the last sound file could not be added (S13), in the picker's own words.
+    pub(super) sound_error: Option<String>,
     /// When the test sound was asked for, while it plays.
     pub(super) playing: Option<Instant>,
     /// "Copied", for 4 s after Copy diagnostics.
@@ -422,6 +426,7 @@ impl SettingsWindow {
                 if let InputEvent::Changed = event {
                     this.query = input.read(cx).text().to_owned();
                     this.picker = None;
+                    this.choice = None;
                     cx.notify();
                 }
             }),
@@ -447,6 +452,7 @@ impl SettingsWindow {
             section,
             confirm: None,
             picker: None,
+            choice: None,
             picker_focus: [cx.focus_handle().tab_index(0).tab_stop(true), cx.focus_handle().tab_index(0).tab_stop(true)],
             menu_focus: cx.focus_handle(),
             menu_cursor: 0,
@@ -464,6 +470,7 @@ impl SettingsWindow {
             devices: None,
             storage: None,
             failed: None,
+            sound_error: None,
             playing: None,
             copied: None,
             log_note: None,
@@ -498,6 +505,7 @@ impl SettingsWindow {
         self.section = section;
         self.close_modal(cx);
         self.picker = None;
+        self.choice = None;
         self.highlight = None;
         if self.phone {
             self.listing = false;
@@ -820,6 +828,23 @@ impl SettingsWindow {
         cx.notify();
     }
 
+    /// Opens a choice menu (a long segmented row, or Pause) on the checked item.
+    pub(super) fn open_choice(&mut self, id: &'static str, current: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.picker = None;
+        self.menu_cursor = current;
+        self.choice = Some(id);
+        window.focus(&self.menu_focus, cx);
+        cx.notify();
+    }
+
+    /// Closes the choice menu and gives the keys back to the window.
+    pub(super) fn close_choice(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.choice.take().is_some() && self.menu_focus.is_focused(window) {
+            window.focus(&self.focus, cx);
+        }
+        cx.notify();
+    }
+
     pub(super) fn pick_device(&mut self, picker: Picker, name: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
         self.close_picker(window, cx);
         let (row, key) = match picker {
@@ -886,6 +911,8 @@ impl SettingsWindow {
     fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.picker.is_some() {
             self.close_picker(window, cx);
+        } else if self.choice.is_some() {
+            self.close_choice(window, cx);
         } else if self.confirm.is_some() {
             self.close_modal(cx);
         } else if self.recording.is_some() {
@@ -959,7 +986,8 @@ impl SettingsWindow {
             .w(px(168.))
             .child(div().flex_1().min_w_0().child(self.search.clone()))
             // Past +1 the placeholder and the keycap do not both fit; the placeholder stays.
-            .when(!searching && !focused && theme::text_step() <= 1, |field| field.child(keycap("⌘F")))
+            // ⌘F fits beside the placeholder. Ctrl+F does not, and the two were drawing on top of each other.
+            .when(!searching && !focused && theme::text_step() <= 1 && cfg!(target_os = "macos"), |field| field.child(keycap("⌘F")))
             .when(searching, |field| {
                 field.child(
                     div()
@@ -1130,7 +1158,7 @@ impl Render for SettingsWindow {
             return self.phone_render(window, cx);
         }
         let modal = self.confirm.clone().map(|confirm| self.modal(&confirm, cx));
-        let menu = self.picker.and_then(|picker| self.device_menu(picker, window, cx));
+        let menu = self.picker.and_then(|picker| self.device_menu(picker, window, cx)).or_else(|| self.choice.and_then(|id| self.choice_menu(id, window, cx)));
         let toast = self.log_note.as_ref().filter(|(at, _)| at.elapsed() < Duration::from_secs(4)).map(|(_, note)| {
             div().absolute().bottom(px(16.)).left_0().right_0().flex().justify_center().child(
                 super::components::toast(Some(("icons/check.svg", theme::text_soft())), note.clone()).w(px(360.)),
@@ -1168,10 +1196,12 @@ impl Render for SettingsWindow {
             .on_action(cx.listener(|this, _: &Dismiss, window, cx| this.dismiss(window, cx)))
             .on_action(cx.listener(|this, _: &NextControl, window, cx| {
                 this.close_picker(window, cx);
+                this.close_choice(window, cx);
                 window.focus_next(cx);
             }))
             .on_action(cx.listener(|this, _: &PreviousControl, window, cx| {
                 this.close_picker(window, cx);
+                this.close_choice(window, cx);
                 window.focus_prev(cx);
             }))
             .on_action(cx.listener(|this, _: &super::CloseWindow, window, cx| {
@@ -1293,6 +1323,9 @@ pub fn shot(cx: &mut App) {
             if flag("--settings-menu").as_deref() == Some("input") {
                 settings.picker = Some(Picker::Input);
             }
+            if let Some(id) = flag("--settings-choice").as_deref() {
+                settings.choice = pages::choice_id(id);
+            }
             if let Some(down) = flag("--settings-scroll").and_then(|n| n.parse::<f32>().ok()) {
                 settings.pane_scroll.set_offset(point(px(0.), px(-down)));
             }
@@ -1311,3 +1344,4 @@ pub fn shot(cx: &mut App) {
     })
     .detach();
 }
+

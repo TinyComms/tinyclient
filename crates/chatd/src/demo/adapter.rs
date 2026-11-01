@@ -715,6 +715,7 @@ impl Demo {
             | Command::OpenHome
             | Command::OpenThreads(_)
             | Command::MarkRead { .. }
+            | Command::AckBulk { .. }
             | Command::Typing(_)
             | Command::Watch(_)
             | Command::Wanted(_)

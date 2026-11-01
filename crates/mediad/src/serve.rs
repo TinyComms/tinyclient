@@ -425,6 +425,23 @@ pub fn run(args: &[String]) -> u8 {
                 }
             };
         }
+        // S13: checks a sound file the user chose and saves it beside the database.
+        Some("--import-sound") => {
+            let (Some(source), Some(id)) = (args.get(1), args.get(2)) else {
+                tracing::warn!("mediad: --import-sound needs a file and an id");
+                return 2;
+            };
+            let dir = protocol::support_dir();
+            return match crate::alert::import(source, id, &dir) {
+                Ok(()) => 0,
+                Err(err) => {
+                    // The shell shows this line as it is.
+                    out::print_line(&err.to_string());
+                    tracing::warn!("mediad: import: {err}");
+                    1
+                }
+            };
+        }
         // Settings' microphone test and test sound, with no call (`probe`).
         Some("test") => {
             crate::probe::run();

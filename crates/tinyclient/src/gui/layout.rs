@@ -16,7 +16,7 @@ use gpui::{
     div, prelude::*, px, AnyElement, App, Context, Div, MouseButton, MouseMoveEvent, Pixels, Point, Rgba,
     SharedString, Window, WindowControlArea,
 };
-use protocol::{CallState, Conversation, Key, Link, Network, Presence};
+use protocol::{CallState, Conversation, ConversationKind, Key, Link, Network, Presence};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -856,6 +856,28 @@ impl Shell {
                     );
                 }
                 items.push(menu_separator().into_any_element());
+                if conversation.unread > 0 || conversation.mentions > 0 {
+                    let read = conversation.key.clone();
+                    items.push(
+                        menu_item("mark-read", Some("icons/check.svg"), "Mark as read", None)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.close_menu(cx);
+                                this.mark_conversation_read(read.clone(), cx);
+                            }))
+                            .into_any_element(),
+                    );
+                }
+                if conversation.kind == ConversationKind::Direct {
+                    let closed = conversation.key.clone();
+                    items.push(
+                        menu_item("close-dm", Some("icons/x.svg"), "Close conversation", None)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.close_menu(cx);
+                                this.close_direct(closed.clone(), cx);
+                            }))
+                            .into_any_element(),
+                    );
+                }
                 // A phone has no Return key to name.
                 let keys = if super::phone::active() { None } else { Some("↵") };
                 items.push(
@@ -866,6 +888,18 @@ impl Shell {
                         }))
                         .into_any_element(),
                 );
+                if conversation.kind.is_direct() {
+                    let row = (**conversation).clone();
+                    items.push(menu_separator().into_any_element());
+                    items.push(
+                        menu_item_danger("forget", Some("icons/trash-2.svg"), "Delete from inbox")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.close_menu(cx);
+                                this.forget_conversation(row.clone(), cx);
+                            }))
+                            .into_any_element(),
+                    );
+                }
             }
         }
         items
@@ -1004,6 +1038,20 @@ impl Shell {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.close_menu(cx);
                         this.confirm_leave(left.clone(), cx);
+                    }))
+                    .into_any_element(),
+            );
+        }
+        if row.kind.is_direct() {
+            let forgotten = row.clone();
+            if !(close || leave) {
+                items.push(menu_separator().into_any_element());
+            }
+            items.push(
+                menu_item_danger("row-forget", Some("icons/trash-2.svg"), "Delete from inbox")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.close_menu(cx);
+                        this.forget_conversation(forgotten.clone(), cx);
                     }))
                     .into_any_element(),
             );

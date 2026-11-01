@@ -757,8 +757,56 @@ impl Discord {
                 let answer: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
                 crate::hub::lock(&self.state).ack_token = answer["token"].as_str().map(str::to_owned);
             }
+            // A blocked person, or a DM Discord will not let us ack. The web client falls back
+            // to the bulk route. The store is already read; this only tries to move Discord's
+            // marker so the next READY does not put the badge back.
+            Err(refused) if ack_refused(&refused) => {
+                let reads = [(channel.to_owned(), message.to_owned())];
+                if let Err(again) = self.ack_bulk(&reads) {
+                    self.log("mark read", again);
+                }
+            }
             Err(refused) => self.log("mark read", refused),
         }
+    }
+
+    /// Discord's "mark inbox read": one request, up to 50 channels. `reads` is `(channel, message)`.
+    fn ack_bulk(&self, reads: &[(String, String)]) -> Result<(), Refused> {
+        for chunk in reads.chunks(50) {
+            let states: Vec<Value> = chunk
+                .iter()
+                .filter(|(_, message)| !message.is_empty())
+                .map(|(channel, message)| json!({"channel_id": channel, "message_id": message, "read_state_type": 0}))
+                .collect();
+            if states.is_empty() {
+                continue;
+            }
+            self.call("POST", "/read-states/ack-bulk", Some(json!({"read_states": states})))?;
+        }
+        Ok(())
+    }
+
+    /// Discord still says this channel is unread. If we have already read through its newest
+    /// message, that report is the old marker (a blocked DM refuses the ack) and it is dropped.
+    /// A message newer than our marker still counts, and our marker is not moved backwards.
+    fn settled(&self, channel: &str, newest: Option<&str>, unread: u32, mentions: u32, marker: Option<String>) -> (u32, u32, Option<String>) {
+        if unread == 0 && mentions == 0 {
+            return (unread, mentions, marker);
+        }
+        let Some(newest) = newest.filter(|id| !id.is_empty()) else {
+            return (unread, mentions, marker);
+        };
+        let stored = self.ctx.known(channel).ok().flatten().and_then(|row| row.last_read).filter(|id| !id.is_empty());
+        let Some(stored) = stored else {
+            return (unread, mentions, marker);
+        };
+        if number(&stored) >= number(newest) {
+            return (0, 0, None);
+        }
+        if marker.as_deref().is_some_and(|id| number(&stored) > number(id)) {
+            return (unread, mentions, None);
+        }
+        (unread, mentions, marker)
     }
 
     fn send(&self, channel: &str, client_id: &str, text: &str, reply_to: Option<&str>) -> Result<Message, String> {
@@ -1046,6 +1094,11 @@ impl Discord {
             }
             Command::OpenSpace(space) => self.open_space(&space),
             Command::MarkRead { conversation_id, message_id } => self.mark_read(&conversation_id, &message_id),
+            Command::AckBulk { reads } => {
+                if let Err(refused) = self.ack_bulk(&reads) {
+                    self.log("mark read", refused);
+                }
+            }
             Command::Send { conversation_id, client_id, text, reply_to } => {
                 let outcome = self.send(&conversation_id, &client_id, &text, reply_to.as_deref());
                 self.ctx.sent(&conversation_id, &client_id, outcome);
@@ -1117,6 +1170,12 @@ fn thread_name(text: &str) -> String {
     let name: String = flat.chars().take(100).collect();
     let name = name.trim().to_owned();
     if name.is_empty() { "Thread".to_owned() } else { name }
+}
+
+/// Discord will not move this channel's read marker. 50007 is "cannot message this user"
+/// (blocked, or they closed DMs). 50001 and 50003 are missing access and an unknown channel.
+fn ack_refused(refused: &Refused) -> bool {
+    matches!(refused, Refused::Status { code: 50007 | 50001 | 50003, .. } | Refused::Status { status: 403, .. })
 }
 
 /// Sends the answer to a command the shell is waiting on.

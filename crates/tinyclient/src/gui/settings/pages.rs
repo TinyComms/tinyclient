@@ -8,7 +8,7 @@ use super::rows::{self, Row};
 use super::{modal_panel, Confirm, Picker, Section, SettingsWindow};
 use crate::gui::anim::{self, Autoplay};
 use crate::gui::app::prefs::{self, Choices};
-use crate::gui::components::{button, glyph, keycap, menu, menu_item_check, menu_separator, network_icon, placed, segment, segmented, ButtonKind, Layer, Place};
+use crate::gui::components::{button, glyph, keycap, menu, menu_item, menu_item_check, menu_separator, network_icon, placed, segment, segmented, ButtonKind, Layer, Place};
 use crate::gui::layout::NETWORK_ORDER;
 use crate::gui::phone::{self, tokens::PhoneType};
 use crate::gui::theme::{self, Type};
@@ -21,6 +21,119 @@ use protocol::settings::{
 };
 use protocol::{AccountStatus, Link, Network, Request, Response};
 use std::rc::Rc;
+
+/// Choice sets whose pills do not fit beside their label. Short pairs stay pills.
+pub(super) fn menu_choice(id: &str) -> bool {
+    matches!(id, "S2" | "S3" | "S4" | "N2" | "N4" | "NL" | "N6" | "M5" | "P4" | "D2" | "V8")
+}
+
+/// `--settings-choice` names one of these.
+pub(super) fn choice_id(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "S2" => "S2",
+        "S3" => "S3",
+        "S4" => "S4",
+        "N2" => "N2",
+        "N4" => "N4",
+        "NL" => "NL",
+        "N6" => "N6",
+        "N7" => "N7",
+        "M5" => "M5",
+        "P4" => "P4",
+        "D2" => "D2",
+        "V8" => "V8",
+        _ => return None,
+    })
+}
+
+/// A stable number for a row id, so a menu's element id can be `(&str, usize)`.
+fn choice_slot(id: &str) -> usize {
+    match id {
+        "S2" => 2,
+        "S3" => 3,
+        "S4" => 4,
+        "N2" => 12,
+        "N4" => 14,
+        "NL" => 21,
+        "N6" => 16,
+        "N7" => 17,
+        "M5" => 25,
+        "P4" => 34,
+        "D2" => 42,
+        "V8" => 48,
+        _ => 0,
+    }
+}
+
+/// The words a menu shows, which one is current, and which is the default: the word stored
+/// with its label, so a sound's name ("Rain on the roof") and its word (`custom:ab12…`) can
+/// differ.
+fn choice_list(id: &str) -> Option<(Vec<(String, String)>, usize, usize)> {
+    if let Some(sounds) = sound_choice_list(id) {
+        return Some(sounds);
+    }
+    if let Some((key, words, labels)) = super::notify::choices(id) {
+        let values = prefs::values();
+        let defaults = Values::default();
+        let current_word = values.word(GLOBAL, key).to_owned();
+        let default_word = defaults.word(GLOBAL, key).to_owned();
+        let current = words.iter().position(|word| *word == current_word.as_str()).unwrap_or(0);
+        let default = words.iter().position(|word| *word == default_word.as_str()).unwrap_or(0);
+        return Some((words.iter().zip(labels).map(|(word, label)| ((*word).to_owned(), (*label).to_owned())).collect(), current, default));
+    }
+    let values = prefs::values();
+    let pairs = |labels: &[&str]| labels.iter().map(|label| ((*label).to_owned(), (*label).to_owned())).collect::<Vec<_>>();
+    Some(match id {
+        "M5" => (pairs(&["Automatically", "On hover", "Never"]), anim::autoplay() as usize, 0),
+        "P4" => {
+            let days = values.number(KEEP_DAYS);
+            let at = KEEP_DAYS_CHOICES.iter().position(|d| *d == days).unwrap_or(2);
+            (pairs(&["7 days", "30 days", "90 days"]), at, 2)
+        }
+        "D2" => {
+            let cap = values.number(CACHE_MB);
+            let at = CACHE_MB_CHOICES.iter().position(|mb| *mb == cap).unwrap_or(1);
+            (pairs(&["250 MB", "500 MB", "1 GB", "2 GB"]), at, 1)
+        }
+        "V8" => (pairs(&["Voice activation", "Push to talk"]), usize::from(values.on(PUSH_TO_TALK)), 0),
+        "N7" => (pairs(&["1 hour", "Until tomorrow", "Until I resume"]), 0, 0),
+        _ => return None,
+    })
+}
+
+/// S2, S3 and S4: the bundled sounds, then the files the user added, then None. A chosen file
+/// that was removed stays on the list as "Missing sound" rather than the row quietly changing.
+pub(super) fn sound_choice_list(id: &str) -> Option<(Vec<(String, String)>, usize, usize)> {
+    let values = prefs::values();
+    let (key, words, labels): (&str, &[&str], &[&str]) = match id {
+        "S2" => (keys::MESSAGE_SOUND, &keys::SOUND_CHOICES, &["Pebble", "Drop", "Tap", "Chime", "Glass", "Marimba", "Bell", "None"]),
+        "S3" => (
+            keys::MENTION_SOUND,
+            &keys::MENTION_SOUND_CHOICES,
+            &["Same as messages", "Pebble", "Drop", "Tap", "Chime", "Glass", "Marimba", "Bell", "None"],
+        ),
+        "S4" => (keys::RING_SOUND, &keys::RING_CHOICES, &["Soft ring", "Classic ring", "Ripple", "None"]),
+        _ => return None,
+    };
+    let mut choices: Vec<(String, String)> = words.iter().zip(labels).map(|(word, label)| ((*word).to_owned(), (*label).to_owned())).collect();
+    let customs = values.custom_sounds();
+    if !customs.is_empty() {
+        // Your own sounds sit above None, where people look for them.
+        let none = choices.pop();
+        choices.extend(customs.into_iter().map(|sound| (sound.word(), sound.name)));
+        choices.extend(none);
+    }
+    let current_word = values.word(GLOBAL, key).to_owned();
+    let defaults = Values::default();
+    let default_word = defaults.word(GLOBAL, key).to_owned();
+    let mut current = choices.iter().position(|(word, _)| word == &current_word);
+    let default = choices.iter().position(|(word, _)| word == &default_word).unwrap_or(0);
+    if current.is_none() {
+        choices.push((current_word.to_owned(), "Missing sound".to_owned()));
+        current = Some(choices.len() - 1);
+    }
+    Some((choices, current.unwrap_or(0), default))
+}
 
 /// How a slider reads, stores and labels its value.
 pub struct Slider {
@@ -35,8 +148,9 @@ pub struct Slider {
 pub fn slider(id: &str) -> Slider {
     let percent = |value: u32| format!("{value} %");
     match id {
-        // Text size: five stops, −1 to +3, stored as 0 to 4.
-        "A2" => Slider { range: (0, 4), default: 1, read: || (theme::text_step() + 1) as u32, stops: Some(5), width: controls::TRACK, words: |v| format!("{} pt", 13 + v) },
+        // Text size: five stops, −1 to +3, stored as 0 to 4. Narrower than the other tracks
+        // so the two A glyphs and the point size stay inside the column.
+        "A2" => Slider { range: (0, 4), default: 1, read: || (theme::text_step() + 1) as u32, stops: Some(5), width: controls::TRACK - 32., words: |v| format!("{} pt", 13 + v) },
         "SV" => Slider { range: (0, 100), default: 70, read: || prefs::values().number(keys::ALERT_VOLUME), stops: None, width: controls::TRACK, words: percent },
         // Narrower than the others: its row also carries the test sound's button.
         "S10" => Slider { range: (0, 100), default: 50, read: || prefs::values().number(CUE_VOLUME), stops: None, width: 160., words: percent },
@@ -114,7 +228,7 @@ fn failure_words(row: &str, reachable: bool) -> &'static str {
     }
 }
 
-fn label_of(id: &str) -> &'static str {
+pub(super) fn label_of(id: &str) -> &'static str {
     // The one label that names the machine names the phone on a phone.
     if id == "P4" {
         return crate::host::keep_messages();
@@ -474,9 +588,7 @@ impl SettingsWindow {
                     (Autoplay::Always, true) => Some("Reduce Motion is on, so they play under the pointer.".to_owned()),
                     _ => None,
                 };
-                self.segmented_row(id, &["Automatically", "On hover", "Never"], at, 0, second, |this, ix, cx| {
-                    this.set_autoplay([Autoplay::Always, Autoplay::Hover, Autoplay::Never][ix], cx)
-                }, cx)
+                self.menu_choice_row(id, &["Automatically", "On hover", "Never"], at, 0, second, None, cx)
             }
             "P3" => {
                 let second = (!choices.images).then(|| "Nothing is fetched until you click it.".to_owned());
@@ -489,14 +601,14 @@ impl SettingsWindow {
             "P4" => {
                 let days = values.number(KEEP_DAYS);
                 let at = KEEP_DAYS_CHOICES.iter().position(|d| *d == days).unwrap_or(2);
-                self.segmented_row(id, &["7 days", "30 days", "90 days"], at, 2, None, move |this, ix, cx| this.pick_retention(KEEP_DAYS_CHOICES[ix], cx), cx)
+                self.menu_choice_row(id, &["7 days", "30 days", "90 days"], at, 2, None, None, cx)
             }
             "P1" | "P2" => return self.per_account_rows(id, cx).unwrap_or_else(div),
             "V1" | "V2" => self.device_row(id, cx),
             "V3" => self.meter_row(cx),
             "V8" => {
                 let push = values.on(PUSH_TO_TALK);
-                self.segmented_row(id, &["Voice activation", "Push to talk"], usize::from(push), 0, None, move |this, ix, cx| this.set_switch(id, PUSH_TO_TALK, ix == 1, false, cx), cx)
+                self.menu_choice_row(id, &["Voice activation", "Push to talk"], usize::from(push), 0, None, None, cx)
             }
             "V14" => wide_row(label, None, self.slider_control(id, cx)),
             "V19" => {
@@ -535,11 +647,7 @@ impl SettingsWindow {
                 let cap = values.number(CACHE_MB);
                 let at = CACHE_MB_CHOICES.iter().position(|mb| *mb == cap).unwrap_or(1);
                 let second = Some("The oldest unused go first.".to_owned());
-                self.segmented_row(id, &["250 MB", "500 MB", "1 GB", "2 GB"], at, 1, second, move |this, ix, cx| {
-                    let mb = CACHE_MB_CHOICES[ix];
-                    let stored = (mb != Values::default_number(CACHE_MB)).then(|| mb.to_string());
-                    this.set("D2", GLOBAL.into(), CACHE_MB, stored, cx);
-                }, cx)
+                self.menu_choice_row(id, &["250 MB", "500 MB", "1 GB", "2 GB"], at, 1, second, None, cx)
             }
             "D3" => row(
                 label,
@@ -552,28 +660,35 @@ impl SettingsWindow {
             "B1" => row(
                 label,
                 Some(crate::host::diagnostics().into()),
-                div().flex().gap(px(8.)).child(
-                    controls::touch(button("B1", ButtonKind::Secondary, "Copy")).on_click(cx.listener(|this, _, _, cx| this.copy_diagnostics(cx))),
-                ).child(
-                    controls::touch(button("B1-log", ButtonKind::Secondary, "Save debug log")).on_click(cx.listener(|this, _, _, cx| this.save_debug_log(cx))),
-                ),
+                controls::touch(button("B1", ButtonKind::Secondary, "Copy").w(px(controls::ABOUT_ACTION)))
+                    .on_click(cx.listener(|this, _, _, cx| this.copy_diagnostics(cx))),
             ),
             "B2" => row(
                 label,
                 None,
-                button("B2", ButtonKind::Secondary, crate::host::REVEAL).on_click(cx.listener(|_, _, _, cx| {
-                    let logs = protocol::log_policy::logs_dir();
-                    if logs.is_dir() {
-                        cx.reveal_path(&logs);
-                    } else {
-                        cx.open_with_system(&protocol::support_dir());
-                    }
-                })),
+                div()
+                    .flex()
+                    .gap(px(8.))
+                    .child(
+                        button("B1-log", ButtonKind::Secondary, "Save debug log")
+                            .w(px(controls::ABOUT_ACTION))
+                            .on_click(cx.listener(|this, _, _, cx| this.save_debug_log(cx))),
+                    )
+                    .child(button("B2", ButtonKind::Secondary, crate::host::REVEAL).w(px(controls::ABOUT_ACTION)).on_click(cx.listener(
+                        |_, _, _, cx| {
+                            let logs = protocol::log_policy::logs_dir();
+                            if logs.is_dir() {
+                                cx.reveal_path(&logs);
+                            } else {
+                                cx.open_with_system(&protocol::support_dir());
+                            }
+                        },
+                    ))),
             ),
             "B3" => row(
                 label,
                 None,
-                controls::touch(button("B3", ButtonKind::Danger, "Reset…")).on_click(cx.listener(|this, _, _, cx| {
+                controls::touch(button("B3", ButtonKind::Danger, "Reset…").w(px(controls::ABOUT_ACTION))).on_click(cx.listener(|this, _, _, cx| {
                     this.confirm = Some(Confirm::Reset);
                     cx.notify();
                 })),
@@ -719,6 +834,212 @@ impl SettingsWindow {
         wide_row(label, second.map(SharedString::from), div().when(touch, |line| line.flex_1()).flex().items_center().child(reset_slot(reset)).child(control))
     }
 
+    /// A choice set drawn as a menu: the pills would run past the column. Every menu button is
+    /// the same width, so the column lines up whichever name is showing. A longer name ellipsizes;
+    /// the menu and the tooltip say it in full.
+    pub(super) fn menu_choice_row(
+        &mut self,
+        id: &'static str,
+        labels: &[&str],
+        current: usize,
+        default: usize,
+        second: Option<String>,
+        trailing: Option<AnyElement>,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let label = label_of(id);
+        let count = labels.len();
+        let shown = labels.get(current).copied().unwrap_or("").to_owned();
+        let reset_name = labels.get(default).copied().unwrap_or("").to_owned();
+        let anchors = self.anchors.clone();
+        let open = self.choice == Some(id);
+        let button = div()
+            .id(SharedString::from(format!("{id}-popup")))
+            .relative()
+            .w(px(controls::POPUP_WIDTH))
+            .h(px(theme::CONTROL))
+            .pl(px(10.))
+            .pr(px(8.))
+            .rounded(px(theme::R_CONTROL))
+            .bg(theme::hover())
+            .border_1()
+            .border_color(theme::border())
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(6.))
+            .cursor_pointer()
+            .tab_index(0)
+            .role(gpui::Role::ComboBox)
+            .aria_label(label)
+            .aria_value(shown.clone())
+            .tooltip(crate::gui::components::tip(shown.clone(), None))
+            .hover(|style| style.bg(theme::selected()).border_color(theme::border_strong()))
+            .focus_visible(|style| style.shadow(theme::focus_ring()))
+            .on_key_down(cx.listener(move |this, event: &gpui::KeyDownEvent, window, cx| {
+                let next = match event.keystroke.key.as_str() {
+                    "left" if current > 0 => current - 1,
+                    "right" if current + 1 < count => current + 1,
+                    "down" | "enter" | "space" => {
+                        cx.stop_propagation();
+                        if open {
+                            this.close_choice(window, cx);
+                        } else {
+                            this.open_choice(id, current, window, cx);
+                        }
+                        return;
+                    }
+                    _ => return,
+                };
+                cx.stop_propagation();
+                this.apply_choice(id, next, window, cx);
+            }))
+            .child(div().flex_1().min_w_0().truncate().type_ui().font_weight(theme::MEDIUM).text_color(theme::text()).child(shown))
+            .child(glyph("icons/chevron-down.svg", 14., theme::text_soft()))
+            .child(canvas(move |bounds, _, _| { anchors.borrow_mut().insert(id, bounds); }, |_, _, _, _| {}).absolute().top_0().left_0().size_full())
+            .on_click(cx.listener(move |this, _, window, cx| {
+                cx.stop_propagation();
+                if this.choice == Some(id) {
+                    this.close_choice(window, cx);
+                } else {
+                    this.open_choice(id, current, window, cx);
+                }
+            }));
+        let reset = (current != default).then(|| {
+            reset_button(SharedString::from(format!("{id}-reset")), format!("Reset {label} to {reset_name}").into()).on_click(cx.listener(
+                move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.apply_choice(id, default, window, cx);
+                },
+            ))
+        });
+        let control = div()
+            .flex()
+            .items_center()
+            .child(reset_slot(reset))
+            .child(button)
+            .children(trailing.map(|trailing| div().flex_none().ml(px(4.)).child(trailing)));
+        row(label, second.map(SharedString::from), control)
+    }
+
+    /// Stores choice `ix` of row `id` and closes its menu.
+    pub(super) fn apply_choice(&mut self, id: &'static str, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_choice(window, cx);
+        if let Some((choices, _, _)) = sound_choice_list(id) {
+            let Some((word, _)) = choices.get(ix) else { return };
+            let key = match id {
+                "S2" => keys::MESSAGE_SOUND,
+                "S3" => keys::MENTION_SOUND,
+                _ => keys::RING_SOUND,
+            };
+            let defaults = Values::default();
+            let default = defaults.word(GLOBAL, key);
+            let stored = (word != default).then(|| word.clone());
+            self.set(id, GLOBAL.into(), key, stored, cx);
+            self.preview_sound(id, cx);
+            return;
+        }
+        if let Some((key, words, _)) = super::notify::choices(id) {
+            let Some(word) = words.get(ix).copied() else { return };
+            let defaults = Values::default();
+            let default = defaults.word(GLOBAL, key);
+            let stored = (word != default).then(|| word.to_owned());
+            self.set(id, GLOBAL.into(), key, stored, cx);
+            if matches!(id, "S2" | "S3" | "S4") {
+                self.preview_sound(id, cx);
+            }
+            return;
+        }
+        match id {
+            "M5" => self.set_autoplay([Autoplay::Always, Autoplay::Hover, Autoplay::Never][ix], cx),
+            "P4" => self.pick_retention(KEEP_DAYS_CHOICES[ix], cx),
+            "D2" => {
+                let mb = CACHE_MB_CHOICES[ix];
+                let stored = (mb != Values::default_number(CACHE_MB)).then(|| mb.to_string());
+                self.set("D2", GLOBAL.into(), CACHE_MB, stored, cx);
+            }
+            "V8" => self.set_switch(id, PUSH_TO_TALK, ix == 1, false, cx),
+            "N7" => {
+                let now = crate::view::now();
+                let until = match ix {
+                    0 => Some((now + 3_600).to_string()),
+                    1 => Some(super::notify::tomorrow_morning(now).to_string()),
+                    _ => Some("resume".to_owned()),
+                };
+                self.set("N7", GLOBAL.into(), keys::PAUSED_UNTIL, until, cx);
+            }
+            _ => {}
+        }
+    }
+
+    /// The open choice menu, under its button.
+    pub(super) fn choice_menu(&mut self, id: &'static str, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let bounds = self.anchors.borrow().get(id).copied()?;
+        let (choices, current, _) = choice_list(id)?;
+        let labels: Vec<String> = choices.iter().map(|(_, label)| label.clone()).collect();
+        let cursor = self.menu_cursor.min(labels.len().saturating_sub(1));
+        let hinted = labels.iter().any(|label| super::notify::sound_hint(label).is_some());
+        let min = f32::from(bounds.size.width).max(if hinted { 260. } else { 0. });
+        let mut items = menu().min_w(px(min)).max_w(px(400.));
+        for (ix, label) in labels.iter().enumerate() {
+            let hint = super::notify::sound_hint(label);
+            let item = if id == "N7" {
+                menu_item((id, ix), None, label.clone(), None)
+            } else {
+                menu_item_check((id, ix), ix == current, label.clone(), hint)
+            };
+            let item = item.when(ix == cursor, |item| item.bg(theme::selected())).on_click(cx.listener(move |this, _, window, cx| {
+                this.apply_choice(id, ix, window, cx);
+            }));
+            items = items.child(item);
+        }
+        if matches!(id, "S2" | "S3" | "S4") {
+            items = items.child(menu_separator()).child(
+                menu_item(("choice-add", choice_slot(id)), Some("icons/plus.svg"), "Add a sound…", None)
+                    .on_click(cx.listener(|this, _, window, cx| this.add_sound(window, cx))),
+            );
+        }
+        let menu = div()
+            .track_focus(&self.menu_focus)
+            .on_key_down(cx.listener(move |this, event: &gpui::KeyDownEvent, window, cx| {
+                if this.choice_key(id, &event.keystroke, window, cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            .on_mouse_down_out(cx.listener(|this, _, window, cx| this.close_choice(window, cx)))
+            .child(items);
+        Some(placed(("choice-menu", choice_slot(id)), Place::Below(bounds), Layer::Menu, window, menu))
+    }
+
+    /// ↑ ↓ move, Return and Space pick, a letter jumps. Esc is the window's.
+    fn choice_key(&mut self, id: &'static str, keystroke: &gpui::Keystroke, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some((choices, _, _)) = choice_list(id) else { return false };
+        let labels: Vec<String> = choices.into_iter().map(|(_, label)| label).collect();
+        let last = labels.len().saturating_sub(1);
+        let modified = keystroke.modifiers.platform || keystroke.modifiers.control || keystroke.modifiers.alt;
+        match keystroke.key.as_str() {
+            "up" => self.menu_cursor = self.menu_cursor.saturating_sub(1),
+            "down" => self.menu_cursor = (self.menu_cursor + 1).min(last),
+            "home" => self.menu_cursor = 0,
+            "end" => self.menu_cursor = last,
+            "enter" | "space" => {
+                self.apply_choice(id, self.menu_cursor, window, cx);
+                return true;
+            }
+            key if !modified && key.chars().count() == 1 => {
+                let letter = key.to_lowercase();
+                let next = (1..=labels.len()).map(|step| (self.menu_cursor + step) % labels.len()).find(|ix| labels[*ix].to_lowercase().starts_with(&letter));
+                match next {
+                    Some(ix) => self.menu_cursor = ix,
+                    None => return false,
+                }
+            }
+            _ => return false,
+        }
+        cx.notify();
+        true
+    }
+
     /// The track, its value and its reset, for slider `id`.
     pub(super) fn slider_control(&mut self, id: &'static str, cx: &mut Context<Self>) -> Div {
         let spec = slider(id);
@@ -763,8 +1084,8 @@ impl SettingsWindow {
             .child(slider_track(value, spec.range, spec.stops, Some(spec.default), self.track_width(id, spec.width, stored != spec.default)))
             .child(canvas(move |bounds, _, _| { anchors.borrow_mut().insert(id, bounds); }, |_, _, _, _| {}).absolute().top_0().left_0().size_full());
         let ends = |size: f32| div().w(px(16.)).flex().justify_center().type_ui().text_size(px(size)).text_color(theme::text_soft()).child("A");
-        // The thumb overhangs each end of the track by 8: 16 keeps 8 clear of the glyphs.
-        let track = if id == "A2" { div().flex().items_center().gap(px(controls::VALUE_GAP)).child(ends(11.)).child(track).child(ends(16.)) } else { div().child(track) };
+        // 8 outside the track, as the spec: a wider gap plus the full track ran past the column.
+        let track = if id == "A2" { div().flex().items_center().gap(px(8.)).child(ends(11.)).child(track).child(ends(16.)) } else { div().child(track) };
         div().flex().items_center().child(reset_slot(reset)).child(track).child(div().w(px(controls::VALUE_GAP))).child(slider_value((spec.words)(value)))
     }
 
@@ -900,7 +1221,7 @@ impl SettingsWindow {
         Some(card.when(self.waits_on_chatd(id, cx), |card| card.opacity(0.4)).children(failed))
     }
 
-    /// The menu button of a device picker (V1, V2). As wide as what it says, 120 to 240; the
+    /// The menu button of a device picker (V1, V2). The same width as every other menu; the
     /// whole name is in its tooltip and in the menu.
     fn device_row(&mut self, id: &'static str, cx: &mut Context<Self>) -> Div {
         let (key, picker, noun) = if id == "V1" { (INPUT, Picker::Input, "microphone") } else { (OUTPUT, Picker::Output, "speaker") };
@@ -936,8 +1257,7 @@ impl SettingsWindow {
         let picker_button = div()
             .id(SharedString::from(format!("{id}-picker")))
             .track_focus(&self.picker_focus[picker as usize])
-            .min_w(px(120.))
-            .max_w(px(240.))
+            .w(px(controls::POPUP_WIDTH))
             .h(px(theme::CONTROL))
             .pl(px(10.))
             .pr(px(8.))
@@ -1077,7 +1397,7 @@ impl SettingsWindow {
             (false, false) => "Below the line nothing is sent and your speaking ring stays off.",
             (false, true) => "In push to talk the line does nothing; it is used when you go back to voice activation.",
         };
-        let label = |words: &'static str| div().w(px(96.)).type_ui().text_color(theme::text()).child(words);
+        let label = |words: &'static str| div().flex_none().type_ui().text_color(theme::text()).child(words);
         let meter = div()
             .id("V3-meter")
             .role(gpui::Role::Meter)
@@ -1504,25 +1824,26 @@ impl SettingsWindow {
             Some(commit) => format!("Version {} ({commit})", env!("CARGO_PKG_VERSION")),
             None => format!("Version {}", env!("CARGO_PKG_VERSION")),
         };
-        // The app's own mark, as the first launch and the empty window show it.
+        // The commit tells two builds of the same version apart (above); the app's own mark, as
+        // the first launch and the empty window show it.
         let plate = crate::gui::components::brand_mark(if phone::active() { 80. } else { 96. });
-        let credit = |words: &'static str| div().px(px(controls::side())).py(px(10.)).type_small().when(phone::active(), |line| line.py(px(12.)).phone_preview()).text_color(theme::text_soft()).child(words);
-        // A phone has no folder to show the log in.
+        let credit = |words: &'static str| div().px(px(controls::side())).py(px(6.)).type_small().when(phone::active(), |line| line.py(px(12.)).phone_preview()).text_color(theme::text_soft()).child(words);
+        // A phone has no folder to show, nor a debug log to save into one (B2).
         let tools = if phone::active() { self.group(&["B1", "B3"], None, window, cx) } else { self.group(&["B1", "B2", "B3"], None, window, cx) };
         div()
             .flex()
             .flex_col()
             .items_center()
-            .gap(px(6.))
+            .gap(px(4.))
             .child(plate)
-            .child(div().pt(px(10.)).type_headline().text_color(theme::text()).child("tinyclient"))
+            .child(div().pt(px(2.)).type_headline().text_color(theme::text()).child("tinyclient"))
             .child(div().type_small().text_color(theme::text_faint()).child(version))
             .children(self.update_status(cx))
             .child(div().type_ui().when(phone::active(), |line| line.text_center().phone_row()).text_color(theme::text_soft()).child(about_line()))
             .child(
                 div()
                     .w_full()
-                    .pt(px(18.))
+                    .pt(px(10.))
                     .flex()
                     .flex_col()
                     .child(group_label("Acknowledgements"))
@@ -1530,10 +1851,10 @@ impl SettingsWindow {
                         card()
                             .child(credit("Network icons: Dashboard Icons (homarr-labs/dashboard-icons), Apache-2.0. The logos are trademarks of their owners."))
                             .child(rule())
-                            .child(credit("Interface icons: Lucide, ISC. Sounds: made by tinyclient's own code."))
+                            .child(credit("Interface icons: Lucide, ISC. Sounds: made by tinyclient's own code.")),
                     ),
             )
-            .child(div().w_full().pt(px(20.)).child(tools))
+            .child(div().w_full().pt(px(8.)).child(tools))
     }
 
     /// Search results: each a breadcrumb and its live row, best first; or the honest line.
@@ -1629,4 +1950,23 @@ mod tests {
         assert_eq!(slider("S10").default, Values::default_number(CUE_VOLUME));
         assert_eq!(slider("V5").default, Values::default_number(VOICE_VOLUME));
     }
+
+    #[test]
+    fn long_choice_sets_are_menus_and_the_button_stays_in_the_column() {
+        for id in ["S2", "S3", "S4", "N2", "N4", "NL", "N6", "M5", "P4", "D2", "V8"] {
+            assert!(menu_choice(id), "{id}");
+        }
+        for id in ["A3", "M1", "M2", "N5", "N7"] {
+            assert!(!menu_choice(id), "{id}");
+        }
+        // One width for every menu: wide enough for the longest name, narrow enough that the
+        // longest row label still has a line of its own.
+        assert_eq!(controls::POPUP_WIDTH, 220.);
+        let name = "Direct messages and mentions".chars().count() as f32 * 6.2 + 38.;
+        assert!(controls::POPUP_WIDTH >= name, "{name}");
+        let room = controls::COLUMN - 24. - 16. - controls::RESET_SLOT - controls::POPUP_WIDTH;
+        let label = "Play GIFs and animated stickers".chars().count() as f32 * 6.2;
+        assert!(room + 8. >= label, "{room} for {label}");
+    }
 }
+

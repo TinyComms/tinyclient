@@ -257,7 +257,7 @@ impl GuildInfo {
 struct Tree {
     groups: Vec<Group>,
     rows: Vec<ConversationRow>,
-    counts: Vec<(String, u32, u32, Option<String>, i64)>,
+    counts: Vec<(String, u32, u32, Option<String>, i64, Option<String>)>,
 }
 
 impl Discord {
@@ -321,7 +321,14 @@ impl Discord {
             });
             let read_to = (marker > 0).then(|| marker.to_string());
             let mentions = state.map_or(0, |state| state.mention_count);
-            (channel.id.clone(), u32::from(unread).max(u32::from(mentions > 0)), mentions, read_to, last.map_or(0, seconds))
+            (
+                channel.id.clone(),
+                u32::from(unread).max(u32::from(mentions > 0)),
+                mentions,
+                read_to,
+                last.map_or(0, seconds),
+                last.map(str::to_owned),
+            )
         };
         for channel in &guild.channels {
             if channel.kind == model::CATEGORY || !info.can_view(&guild.id, me, channel) {
@@ -390,8 +397,19 @@ impl Discord {
         // CONTRACT: unread state and mute are written a row at a time, each its own commit.
         // The first connect of an account with 3,000 channels is some 6,000 of them and takes
         // about 2.5 s (`tests/discord.rs`, the READY of real size); later ones change little.
-        for (id, unread, mentions, read_to, updated) in &tree.counts {
-            self.ctx.counts(id, *unread, *mentions, read_to.as_deref(), *updated)?;
+        for (id, unread, mentions, read_to, updated, newest) in &tree.counts {
+            let interesting = *unread > 0 || *mentions > 0;
+            if interesting {
+                if let Some(newest) = newest {
+                    self.ctx.note_newest(id, newest)?;
+                }
+            }
+            let (unread, mentions, read_to) = if interesting {
+                self.settled(id, newest.as_deref(), *unread, *mentions, read_to.clone())
+            } else {
+                (*unread, *mentions, read_to.clone())
+            };
+            self.ctx.counts(id, unread, mentions, read_to.as_deref(), *updated)?;
         }
         for row in &tree.rows {
             self.ctx.muted(&row.id, info.quiet.mutes(&row.id, row.group.as_deref(), now))?;
@@ -793,6 +811,10 @@ impl Discord {
             let unread = if behind { state.map_or(1, |state| state.mention_count.max(1)) } else { 0 };
             let read_to = (marker > 0).then(|| marker.to_string());
             let updated = last.map_or(0, seconds);
+            if let Some(last) = last.filter(|id| !id.is_empty()) {
+                self.ctx.note_newest(&row.id, last)?;
+            }
+            let (unread, _, read_to) = self.settled(&row.id, *last, unread, 0, read_to);
             self.ctx.counts(&row.id, unread, 0, read_to.as_deref(), updated)?;
             let muted = self.state.lock().unwrap().quiet_directs.mutes(&row.id, None, now);
             self.ctx.muted(&row.id, muted)?;

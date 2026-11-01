@@ -289,7 +289,7 @@ impl Notes {
             } else {
                 String::new()
             },
-            sound: verdict.sound.as_deref().and_then(sound_file).filter(|_| notifier::SYSTEM_PLAYS_SOUND),
+            sound: verdict.sound.as_deref().filter(|word| system_plays(word)).and_then(sound_file),
             locked_body: what.to_owned(),
         };
         if let Err(err) = self.sink.post(&note) {
@@ -300,7 +300,7 @@ impl Notes {
         let sound = verdict.sound.clone()?;
         group.sounded = Some(at);
         self.sounded = Some(at);
-        (!notifier::SYSTEM_PLAYS_SOUND).then_some(sound)
+        (!system_plays(&sound)).then_some(sound)
     }
 
     /// The conversation was read up to its newest message, here or on another device.
@@ -331,9 +331,10 @@ impl Notes {
                 self.stop_ring();
                 let verdict = verdict?;
                 self.ringing = Some(key.clone());
-                let sound = verdict.sound.clone().filter(|_| !notifier::SYSTEM_PLAYS_SOUND);
+                // A ring nobody is told about still has to be heard: the card is all the
+                // window shows, so chatd plays every sound the system will not.
                 if !verdict.banner {
-                    return sound;
+                    return verdict.sound;
                 }
                 let caller = if from.is_empty() { place.to_owned() } else { from };
                 let (title, subtitle) = match verdict.preview {
@@ -348,14 +349,16 @@ impl Notes {
                     body: "Incoming call".to_owned(),
                     kind: Kind::Call,
                     reply_hint: String::new(),
-                    sound: verdict.sound.as_deref().and_then(sound_file).filter(|_| notifier::SYSTEM_PLAYS_SOUND),
+                    sound: verdict.sound.as_deref().filter(|word| system_plays(word)).and_then(sound_file),
                     locked_body: "Incoming call".to_owned(),
                 };
                 if let Err(err) = self.sink.post(&note) {
                     tracing::warn!("chatd: ring not shown: {err}");
+                    // No banner means no system sound; play it here instead.
+                    return verdict.sound;
                 }
                 self.ids.insert(id, key);
-                sound
+                verdict.sound.filter(|word| !system_plays(word))
             }
             (None, Some(_)) => {
                 self.stop_ring();
@@ -391,14 +394,14 @@ impl Notes {
             body,
             kind: Kind::Plain,
             reply_hint: String::new(),
-            sound: sound.as_deref().and_then(sound_file).filter(|_| notifier::SYSTEM_PLAYS_SOUND),
+            sound: sound.as_deref().filter(|word| system_plays(word)).and_then(sound_file),
             locked_body: "New message".to_owned(),
         };
         match self.sink.post(&note) {
             Ok(()) => {
                 let listed = self.sink.listed("test");
                 let detail = if listed { String::new() } else { "The system took it but does not list it: check Focus or Do Not Disturb.".to_owned() };
-                (listed, detail, sound.filter(|_| !notifier::SYSTEM_PLAYS_SOUND))
+                (listed, detail, sound.filter(|word| !system_plays(word)))
             }
             Err(err) => (false, err, None),
         }
@@ -414,6 +417,12 @@ fn sound_file(word: &str) -> Option<String> {
         _ => return None,
     };
     Some(format!("tinyclient-{stem}"))
+}
+
+/// Whether the notification itself makes this sound. False means chatd must: a custom file,
+/// a sound added after the bundled seven, or a platform whose notifications are silent.
+fn system_plays(word: &str) -> bool {
+    notifier::SYSTEM_PLAYS_SOUND && sound_file(word).is_some()
 }
 
 /// Minutes after local midnight at `unix`.
@@ -524,10 +533,13 @@ fn moment(hub: &Hub, conversation: &Key, notes: &Notes, at: Instant) -> Moment {
 }
 
 /// One sound through mediad. A ring is kept so it can be stopped.
-fn play(word: &str, volume: u32) -> Option<MediaChild> {
+fn play(word: &str, volume: u32, repeat: Option<u64>, limit: u64) -> Option<MediaChild> {
     let mediad = crate::media::mediad_path().ok()?;
     let mut command = Command::new(mediad);
     command.arg("--sound").arg(word).arg(volume.min(100).to_string()).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    if let Some(gap) = repeat {
+        command.arg("--repeat").arg(gap.to_string()).arg("--for").arg(limit.to_string());
+    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -542,15 +554,47 @@ fn play(word: &str, volume: u32) -> Option<MediaChild> {
     command.spawn().map(MediaChild::from).map_err(|err| tracing::warn!("chatd: sound: {err}")).ok()
 }
 
+/// How long an incoming ring sounds before it gives up by itself: past the network's own
+/// 60 s no-answer deadline, so the two never disagree.
+const RING_FOR: u64 = 65;
+/// The silence between one ring and the next.
+const RING_GAP: u64 = 1_500;
+/// A ring back runs under the same deadline, with a longer breath between rings.
+const RINGBACK_FOR: u64 = 62;
+const RINGBACK_GAP: u64 = 2_000;
+
+/// The word a ring back plays, if it should play at all (S14, S1 and S4).
+fn ringback_word(values: &Values) -> Option<String> {
+    let word = values.word(GLOBAL, settings::RING_SOUND);
+    (values.on(settings::SOUNDS) && values.ringback() && word != "none").then(|| word.to_owned())
+}
+
+fn stop(child: &mut Option<MediaChild>) {
+    if let Some(mut child) = child.take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+/// Stops the ring back, if one is playing.
+fn stop_back(back: &mut Option<(String, MediaChild)>) {
+    if let Some((_, mut child)) = back.take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
 fn run(hub: &Arc<Hub>, chat: &Weak<Chat>, mut notes: Notes, told: &Receiver<Event>) {
     let mut ring: Option<MediaChild> = None;
+    // The word a running ring back plays, so a change to S4 replaces it rather than layering
+    // a second tone over the first.
+    let mut back: Option<(String, MediaChild)> = None;
     let mut playing: Vec<MediaChild> = Vec::new();
     while let Ok(event) = told.recv() {
         playing.retain_mut(|child| matches!(child.try_wait(), Ok(None)));
-        // Rows and calls change many times a second; most need no settings at all.
+        // Rows change many times a second; most need no settings at all.
         let busy = match &event {
             Event::Row(conversation) => !notes.has(conversation),
-            Event::Call(call) => notes.ringing.is_none() && !call.as_ref().is_some_and(|call| matches!(call.state, CallState::RingingIn { .. })),
             _ => false,
         };
         if busy {
@@ -569,7 +613,7 @@ fn run(hub: &Arc<Hub>, chat: &Weak<Chat>, mut notes: Notes, told: &Receiver<Even
                 moment.dnd = dnd(hub, &conversation);
                 let Some(verdict) = decide(&values, &row, &message, &moment) else { continue };
                 if let Some(word) = notes.message(&row, &message, &verdict, at) {
-                    playing.extend(play(&word, volume));
+                    playing.extend(play(&word, volume, None, 0));
                 }
             }
             Event::Row(conversation) => {
@@ -592,19 +636,31 @@ fn run(hub: &Arc<Hub>, chat: &Weak<Chat>, mut notes: Notes, told: &Receiver<Even
                     }
                     None => (None, String::new()),
                 };
-                let network = ringing.as_ref().map_or("", |key| key.network.label());
-                match notes.call(call.as_ref(), verdict, &place, network).as_deref() {
-                    Some("") => {
-                        if let Some(mut child) = ring.take() {
-                            let _ = child.kill();
-                            let _ = child.wait();
+                // A ring back is mine, not a notification: it plays while I am calling
+                // someone, on every network, and stops the instant they answer or I cancel.
+                let calling = call.as_ref().is_some_and(|call| call.state == CallState::RingingOut);
+                match (calling, ringback_word(&values)) {
+                    (true, Some(word)) => {
+                        let already = back.as_ref().is_some_and(|(playing, _)| *playing == word);
+                        if !already {
+                            stop_back(&mut back);
+                            if let Some(child) = play(&word, volume, Some(RINGBACK_GAP), RINGBACK_FOR) {
+                                tracing::info!("chatd: ringing back with {word}");
+                                back = Some((word, child));
+                            }
                         }
                     }
+                    _ => stop_back(&mut back),
+                }
+                let network = ringing.as_ref().map_or("", |key| key.network.label());
+                match notes.call(call.as_ref(), verdict, &place, network).as_deref() {
+                    Some("") => stop(&mut ring),
                     Some(word) => {
-                        if let Some(mut child) = ring.take() {
-                            let _ = child.kill();
+                        stop(&mut ring);
+                        ring = play(word, volume, Some(RING_GAP), RING_FOR);
+                        if ring.is_some() {
+                            tracing::info!("chatd: ringing with {word}");
                         }
-                        ring = play(word, volume);
                     }
                     None => {}
                 }
@@ -613,11 +669,11 @@ fn run(hub: &Arc<Hub>, chat: &Weak<Chat>, mut notes: Notes, told: &Receiver<Even
             Event::Test(answer) => {
                 let (posted, detail, sound) = notes.test(&values, notifier::screen_locked());
                 if let Some(word) = sound {
-                    playing.extend(play(&word, volume));
+                    playing.extend(play(&word, volume, None, 0));
                 }
                 let _ = answer.send((posted, detail));
             }
-            Event::Play(word) => playing.extend(play(&word, volume)),
+            Event::Play(word) => playing.extend(play(&word, volume, None, 0)),
         }
     }
 }

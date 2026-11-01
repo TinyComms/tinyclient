@@ -79,6 +79,7 @@ pub const MIRELA: usize = 5;
 pub const HARUTO: usize = 6;
 pub const DITA: usize = 9;
 pub const YUSUF: usize = 12;
+pub const VEX: usize = 27;
 pub const BOT: usize = 29;
 /// Past the end of the cast: us.
 pub const YOU: usize = usize::MAX;
@@ -457,6 +458,11 @@ fn direct(s: &mut Seeder, account: &AccountKey, cast: &[Who], me: &Who) -> Falli
         (KOFI, 12000, "Thanks for the lift back. I owe you a coffee."),
         (YOU, 11990, "You owe me three. I am keeping count."),
     ])?;
+
+    // Blocked on Discord, and still unread: the badge that would not clear.
+    let vex = open(s, VEX)?;
+    s.say(&vex, &cast[VEX], 2, "Okay. Do let me know so we can still hang out.")?;
+    s.counts(&vex, 1, 0, None)?;
 
     // Read. `live` keeps this one moving.
     let yusuf = open(s, YUSUF)?;

@@ -508,6 +508,12 @@ fn word<T: Serialize>(value: &T) -> String {
     }
 }
 
+/// Discord snowflakes, Telegram integer ids and Slack timestamps of one width all sort this
+/// way: a longer id is newer, and equal lengths compare as text.
+pub(crate) fn id_is_ahead(newer: &str, older: &str) -> bool {
+    (newer.len(), newer) > (older.len(), older)
+}
+
 fn from_word<T: DeserializeOwned>(word: String) -> rusqlite::Result<T> {
     serde_json::from_value(serde_json::Value::String(word))
         .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))
@@ -1702,15 +1708,126 @@ impl Store {
         self.set_flag(conversation, "starred", starred)
     }
 
-    /// The user read the conversation up to `message_id`. True if anything was unread.
+    /// The user read the conversation up to `message_id`. An empty id means the newest message
+    /// this store knows (`preview_id`), which is how "mark as read" works before history has
+    /// loaded. A marker older than the one already stored is ignored, so seeing an earlier
+    /// message on screen cannot undo a catch-up. True when the row changed.
     pub fn mark_read(&mut self, conversation: &Key, message_id: &str) -> rusqlite::Result<bool> {
+        let target = if message_id.is_empty() { self.preview_id(conversation)? } else { message_id.to_owned() };
+        let current: Option<(u32, u32, String)> = self
+            .db
+            .query_row(
+                "SELECT unread, mentions, last_read FROM conversation
+                  WHERE network = ?1 AND account = ?2 AND id = ?3",
+                params![word(&conversation.network), conversation.account, conversation.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((unread, mentions, last_read)) = current else {
+            return Ok(false);
+        };
+        // Never move the marker backwards. An empty target still clears a badge.
+        let marker = if !target.is_empty() && (last_read.is_empty() || !id_is_ahead(&last_read, &target)) {
+            target
+        } else {
+            last_read.clone()
+        };
+        if unread == 0 && mentions == 0 && marker == last_read {
+            return Ok(false);
+        }
         let changed = self.db.execute(
             "UPDATE conversation SET unread = 0, mentions = 0, last_read = ?4
+              WHERE network = ?1 AND account = ?2 AND id = ?3",
+            params![word(&conversation.network), conversation.account, conversation.id, marker],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// The newest message id the network named, without touching the preview text. Moves only
+    /// forward, so a later history page cannot replace a newer id with an older one.
+    pub fn note_newest(&mut self, conversation: &Key, message_id: &str) -> rusqlite::Result<bool> {
+        if message_id.is_empty() {
+            return Ok(false);
+        }
+        let changed = self.db.execute(
+            "UPDATE conversation SET preview_id = ?4
               WHERE network = ?1 AND account = ?2 AND id = ?3
-                AND (unread != 0 OR mentions != 0 OR last_read != ?4)",
+                AND (preview_id = '' OR (length(preview_id), preview_id) < (length(?4), ?4))",
             params![word(&conversation.network), conversation.account, conversation.id, message_id],
         )?;
         Ok(changed == 1)
+    }
+
+    fn preview_id(&self, conversation: &Key) -> rusqlite::Result<String> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT preview_id FROM conversation WHERE network = ?1 AND account = ?2 AND id = ?3",
+                params![word(&conversation.network), conversation.account, conversation.id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or_default())
+    }
+
+    /// Drops the cached messages and the badge. A direct or group conversation is also hidden,
+    /// so it leaves the Inbox until a newer live message arrives. The other person's copy on
+    /// the network is left alone. True when the row was there.
+    pub fn forget_conversation(&mut self, conversation: &Key) -> rusqlite::Result<bool> {
+        let tx = self.db.transaction()?;
+        let have: Option<(String, String, String)> = tx
+            .query_row(
+                "SELECT preview_id, last_read, kind FROM conversation
+                  WHERE network = ?1 AND account = ?2 AND id = ?3",
+                params![word(&conversation.network), conversation.account, conversation.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((preview, last_read, kind)) = have else {
+            return Ok(false);
+        };
+        tx.execute(
+            "DELETE FROM message WHERE network = ?1 AND account = ?2 AND conversation = ?3",
+            params![word(&conversation.network), conversation.account, conversation.id],
+        )?;
+        let marker = if last_read.is_empty() || id_is_ahead(&preview, &last_read) { preview } else { last_read };
+        let hide = kind == "direct" || kind == "group";
+        tx.execute(
+            "UPDATE conversation SET unread = 0, mentions = 0, preview = '', preview_from = '', preview_mine = 0,
+                 last_read = CASE WHEN ?4 = '' THEN last_read ELSE ?4 END,
+                 hidden = CASE WHEN ?5 THEN 1 ELSE hidden END
+              WHERE network = ?1 AND account = ?2 AND id = ?3",
+            params![word(&conversation.network), conversation.account, conversation.id, marker, hide],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Every conversation with a badge. The message id is the newest known, for the ack.
+    /// The bool is a message request: read here, and not told to the network.
+    pub fn unread_marks(&self, network: Option<Network>) -> rusqlite::Result<Vec<(Key, String, bool)>> {
+        let mut stmt = self.db.prepare(
+            "SELECT network, account, id, preview_id, last_read, special FROM conversation
+              WHERE (unread > 0 OR mentions > 0) AND (?1 IS NULL OR network = ?1)",
+        )?;
+        let network = network.map(|network| word(&network));
+        let rows = stmt.query_map(params![network], |row| {
+            let key = Key {
+                network: from_word(row.get(0)?)?,
+                account: row.get(1)?,
+                id: row.get(2)?,
+            };
+            let preview: String = row.get(3)?;
+            let last_read: String = row.get(4)?;
+            let request = row.get::<_, String>(5)? == "request";
+            let marker = if !preview.is_empty() && (last_read.is_empty() || id_is_ahead(&preview, &last_read)) {
+                preview
+            } else {
+                last_read
+            };
+            Ok((key, marker, request))
+        })?;
+        rows.collect()
     }
 
     // Messages.
@@ -1776,7 +1893,9 @@ impl Store {
                          preview_mine = CASE WHEN ?5 >= updated THEN ?7 ELSE preview_mine END,
                          preview_id = CASE WHEN ?5 >= updated THEN ?6 ELSE preview_id END,
                          preview = CASE WHEN ?5 >= updated THEN ?4 ELSE preview END,
-                         updated = max(updated, ?5)
+                         updated = max(updated, ?5),
+                         hidden = CASE WHEN ?12 AND last_read != ''
+                             AND (length(last_read), last_read) < (length(?6), ?6) THEN 0 ELSE hidden END
                       WHERE network = ?1 AND account = ?2 AND id = ?3",
                     params![
                         network,
@@ -1790,6 +1909,7 @@ impl Store {
                         u32::from(counts && message.mentions_me),
                         pending,
                         if message.outgoing { "" } else { message.sender.name.as_str() },
+                        unread,
                     ],
                 )?;
             }
@@ -2842,6 +2962,39 @@ mod tests {
         assert!(!store.mark_read(&key, "2").unwrap(), "reading twice is not a change");
         let row = store.conversation(&key).unwrap().unwrap();
         assert_eq!((row.unread, row.mentions, row.last_read.as_deref()), (0, 0, Some("2")));
+    }
+
+    #[test]
+    fn a_read_does_not_rewind_and_forgetting_a_direct_hides_it_until_a_newer_message() {
+        let (mut store, key) = store();
+        let account = key.account();
+        let dm = Key::new(&account, "dm");
+        store.upsert_conversation(&account, &ConversationRow::new("dm", ConversationKind::Direct, "Mara")).unwrap();
+        store.ingest(&dm, &said("10", "hello", 10), true).unwrap();
+        assert!(store.note_newest(&dm, "20").unwrap());
+        assert!(!store.note_newest(&dm, "5").unwrap(), "an older id does not replace the newest");
+        assert!(store.mark_read(&dm, "").unwrap(), "an empty id catches up to the newest known");
+        let row = store.conversation(&dm).unwrap().unwrap();
+        assert_eq!((row.unread, row.last_read.as_deref()), (0, Some("20")));
+        assert!(!store.mark_read(&dm, "10").unwrap(), "an older marker does not rewind a caught-up chat");
+        assert_eq!(store.conversation(&dm).unwrap().unwrap().last_read.as_deref(), Some("20"));
+
+        store.set_counts(&dm, 1, 0, None, 10).unwrap();
+        let marks = store.unread_marks(Some(Network::Discord)).unwrap();
+        assert!(marks.iter().any(|(found, marker, request)| found == &dm && marker == "20" && !request));
+        assert!(store.forget_conversation(&dm).unwrap());
+        let row = store.conversation(&dm).unwrap().unwrap();
+        assert!(row.hidden);
+        assert_eq!((row.unread, row.preview.as_str(), row.last_read.as_deref()), (0, "", Some("20")));
+        assert!(store.messages(&dm, &Page::Newest, 10, NOW).unwrap().unwrap().messages.is_empty());
+        // A message that is not newer leaves it hidden, as a history fill of what was deleted would.
+        store.ingest(&dm, &said("20", "hello", 20), false).unwrap();
+        assert!(store.conversation(&dm).unwrap().unwrap().hidden);
+        store.ingest(&dm, &said("30", "again", 30), true).unwrap();
+        let row = store.conversation(&dm).unwrap().unwrap();
+        assert!(!row.hidden);
+        assert_eq!(row.unread, 1);
+        let _ = key;
     }
 
     #[test]

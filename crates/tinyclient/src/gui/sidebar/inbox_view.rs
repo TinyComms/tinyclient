@@ -39,7 +39,8 @@ impl Shell {
         state.counts = counts;
         let held = !state.inbox.fresh && state.mode == Mode::Inbox && state.hold.holding(Instant::now());
         let applied = if held {
-            let (kept, waiting) = inbox::hold(state.inbox.all(), &fresh);
+            let triage = matches!(state.filter, InboxFilter::Unread | InboxFilter::Mentions);
+            let (kept, waiting) = inbox::hold(state.inbox.all(), &fresh, triage);
             let kept_total = kept.len() as u32;
             state.pill = waiting;
             state.waiting = Some(fresh);

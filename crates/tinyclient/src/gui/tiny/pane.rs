@@ -17,14 +17,22 @@ impl Shell {
     /// channel list is drawn at the pane's left so the server can still be walked.
     pub(in crate::gui) fn tiny_page(&self, beside: bool, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let Some(page) = self.tiny_page_facts() else {
-            let words = self.tiny_state.error.clone().unwrap_or_else(|| "Loading this server.".to_owned());
-            let bad = self.tiny_state.error.is_some();
-            return div()
+            let strip = div()
                 .size_full()
                 .flex()
                 .flex_col()
-                .child(drags_window(div()).h(px(TOP_BAR)).flex_none().px(px(theme::PANE_PAD)).flex().items_center().gap(px(8.)).when(!crate::gui::phone::active(), |bar| bar.child(self.strip_controls(window, cx))).child(pane_title("Tiny server")))
-                .child(div().px(px(theme::PANE_PAD)).pt(px(8.)).whitespace_normal().map(|line| if bad { line.type_small().text_color(theme::danger()) } else { line.type_ui().text_color(theme::text_soft()) }).child(words));
+                .child(drags_window(div()).h(px(TOP_BAR)).flex_none().px(px(theme::PANE_PAD)).flex().items_center().gap(px(8.)).when(!crate::gui::phone::active(), |bar| bar.child(self.strip_controls(window, cx))).child(pane_title("Tiny server")));
+            let Some(detail) = self.tiny_state.error.clone() else {
+                return strip.child(self.tiny_loading_pane(beside));
+            };
+            return strip.child(
+                div()
+                    .px(px(theme::PANE_PAD))
+                    .pt(px(8.))
+                    .whitespace_normal()
+                    .map(|line| line.type_small().text_color(theme::danger()))
+                    .child(detail),
+            );
         };
         // A phone walks the server from its own sidebar, so the page is one column.
         let phone = crate::gui::phone::active();
