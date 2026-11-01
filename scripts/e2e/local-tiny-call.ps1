@@ -12,7 +12,8 @@
                   Writes <State>\seed.json and session files for each person.
   -Phase desktop  Starts this checkout's tinyclient GUI signed in as Alice with an isolated
                   TINYCLIENT_DIR (never the real keyring or %APPDATA%\tinyclient), test audio
-                  from mediad (TINYCLIENT_MEDIAD_AUDIO), and joins the room through UI Automation.
+                  from mediad (TINYCLIENT_MEDIAD_AUDIO). With -Join it posts window messages that open
+                  the room and join (GPUI has no UI Automation tree on Windows); -Camera turns the camera on.
   -Phase android  Writes Bea's session into the installed debug app (run-as) for emulator-5554.
   -Phase all      server, desktop, android.
   -Stop           Stops only the processes this script started (pids in <State>\pids.json) and
@@ -25,6 +26,10 @@ param(
     [ValidateSet('server', 'desktop', 'android', 'all')]
     [string]$Phase = 'all',
     [switch]$Stop,
+    # Desktop: post clicks that open the community, the room, and Join channel; -Camera also
+    # turns the camera on (a real webcam if one is attached).
+    [switch]$Join,
+    [switch]$Camera,
     # A clean tinyserver checkout. Default: a detached worktree of tinyserver's origin/main next
     # to it, made on first run, so a dirty feature branch in the main checkout does not matter.
     [string]$TinyServerDir = '',
@@ -214,12 +219,34 @@ function Start-Desktop {
     $p = Start-Process -PassThru $exe -WorkingDirectory $dir
     foreach ($k in $vars.Keys) { [Environment]::SetEnvironmentVariable($k, $null, 'Process') }
     Save-Pid 'tinyclient-a' $p.Id
-    # A fixed window size keeps the click positions below stable.
+    # Maximized on the primary display keeps the positions below stable (MoveWindow to a fixed
+    # size misbehaves across monitors with different scaling). Then it goes behind every other
+    # window so it does not cover someone working at the desk; PrintWindow still captures it.
     $win = Join-Path $PSScriptRoot 'win-window.ps1'
     for ($i = 0; $i -lt 60; $i++) {
-        try { & $win -ProcessId $p.Id -Action place -X 40 -Y 40 -W 1280 -H 820; break } catch { Start-Sleep 1 }
+        try { & $win -ProcessId $p.Id -Action max; break } catch { Start-Sleep 1 }
     }
+    Start-Sleep 3
+    & $win -ProcessId $p.Id -Action back
     Write-Host "desktop tinyclient pid $($p.Id), TINYCLIENT_DIR $dir, logs $dir\logs"
+    if ($Join) {
+        # Window pixels for a maximized window on a 1920x1080 primary display at 100% scale,
+        # measured from shots (win-window.ps1 -Action shot). Posted messages, not real input.
+        $steps = @(
+            @{ what = 'community'; x = 43; y = 195 },
+            @{ what = 'room Proof'; x = 135; y = 102 },
+            @{ what = 'Join channel'; x = 1037; y = 625 }
+        )
+        if ($Camera) { $steps += @{ what = 'Turn camera on'; x = 1010; y = 991 } }
+        foreach ($s in $steps) {
+            Start-Sleep 3
+            & $win -ProcessId $p.Id -Action post -X $s.x -Y $s.y
+            Write-Host "posted click: $($s.what)"
+        }
+        Start-Sleep 5
+        & $win -ProcessId $p.Id -Action shot -Path (Join-Path $State 'desktop-a-joined.png')
+        Get-Content (Join-Path $dir 'logs\chatd.log') | Select-String 'call state' | Select-Object -Last 2
+    }
 }
 
 function Push-AndroidSession {
@@ -242,3 +269,4 @@ function Push-AndroidSession {
 if ($Phase -in 'server', 'all') { Start-Server }
 if ($Phase -in 'desktop', 'all') { Start-Desktop }
 if ($Phase -in 'android', 'all') { Push-AndroidSession }
+
