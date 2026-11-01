@@ -16,6 +16,7 @@ use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row, Transaction};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use std::collections::HashMap;
 use std::path::Path;
 
 /// Raise this when a table changes. `open` then drops the cache and starts over.
@@ -1341,11 +1342,14 @@ impl Store {
         );
         let in_folder_pins = "(SELECT instr(f.pinned, ',' || c.id || ',') FROM folder f
                                 WHERE f.network = c.network AND f.account = c.account AND f.id = ?3)";
-        // Where the whole network's list puts a chat's pins: its own pin, and the best place it
-        // holds among the folder pins, whichever is higher. Telegram's "all chats" lifts the
-        // pins of every folder; `nullif` keeps a folder holding the chat unpinned from counting.
-        let folder_pin_anywhere = "(SELECT min(nullif(instr(f.pinned, ',' || c.id || ','), 0))
-                                    FROM folder f WHERE f.network = c.network AND f.account = c.account)";
+        // Where the whole network's list puts a chat's pins: its own pin, else how its folders
+        // rank it. Telegram's own all-chats tab lifts the pins of every folder, an order that
+        // only makes sense folder by folder: the folder comes first, then the chat's place in
+        // it, so one folder's first pin does not out-rank another folder's twelfth.
+        let folder_pin_anywhere = "(SELECT min(f.position * 100000 + instr(f.pinned, ',' || c.id || ','))
+                                    FROM folder f
+                                    WHERE f.network = c.network AND f.account = c.account
+                                      AND instr(f.pinned, ',' || c.id || ',') > 0)";
         let order = match folder {
             // A folder is a filter: its own pins on top, in its own order.
             Some(_) => format!("coalesce(nullif({in_folder_pins}, 0), 2147483647),"),
@@ -1363,7 +1367,7 @@ impl Store {
             key,
             counts_from,
         )?;
-        let rows = self
+        let mut rows = self
             .db
             .prepare(&format!(
                 "{CONVERSATION} WHERE {belongs}
@@ -1375,8 +1379,45 @@ impl Store {
                 params![word(&network), account.map(|account| account.account.as_str()), folder, limit, offset],
                 conversation_from,
             )?
-            .collect::<rusqlite::Result<_>>()?;
+            .collect::<rusqlite::Result<Vec<protocol::Conversation>>>()?;
+        // A chat a folder pins is pinned, the way the shell draws the list: its place among
+        // that folder's pins (all of them, when no folder is on show) is written into the
+        // answer, since the stored row keeps no folder places. A pin of the chat's own stands.
+        let pins = self.folder_pins(&word(&network), folder)?;
+        for row in &mut rows {
+            if row.pin.is_none() {
+                if let Some(place) = pins.get(&(row.key.account.clone(), row.key.id.clone())) {
+                    row.pin = Some(*place);
+                }
+            }
+        }
         Ok((rows, counts.all, counts))
+    }
+
+    /// Which chats a folder pins, by account and chat id, with the folder's place for each.
+    /// Every folder of the network, when no folder is named.
+    fn folder_pins(&self, network: &str, folder: Option<&str>) -> rusqlite::Result<HashMap<(String, String), i32>> {
+        let sql = match folder {
+            Some(_) => "SELECT account, pinned FROM folder WHERE network = ?1 AND id = ?2 AND pinned != ''",
+            None => "SELECT account, pinned FROM folder WHERE network = ?1 AND pinned != ''",
+        };
+        let mut statement = self.db.prepare(sql)?;
+        let held: Vec<(String, String)> = match folder {
+            Some(folder) => statement
+                .query_map(params![network, folder], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?,
+            None => statement
+                .query_map(params![network], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?,
+        };
+        let mut pins: HashMap<(String, String), i32> = HashMap::new();
+        for (account, pinned) in held {
+            for (at, id) in from_id_list(&pinned).into_iter().enumerate() {
+                let place = at as i32 + 1;
+                pins.entry((account.clone(), id)).and_modify(|kept| *kept = (*kept).min(place)).or_insert(place);
+            }
+        }
+        Ok(pins)
     }
 
     /// A forum's topics: its pins in order, then newest first, and how many there are.
@@ -2976,14 +3017,30 @@ mod tests {
             assert_eq!(rows.len() as u32, total);
             rows.into_iter().map(|row| row.key.id).collect()
         };
+        // The rows carry where they are pinned: its own pin where one stands, else the
+        // folder's place, so the shell keeps the pinned chats in one group and draws the pin.
+        let pins = |store: &Store, folder: Option<&str>| -> Vec<(String, Option<i32>)> {
+            store
+                .home(Network::Discord, None, folder, Shelf::Main, 0, 20, &[])
+                .unwrap()
+                .0
+                .into_iter()
+                .map(|row| (row.key.id, row.pin))
+                .collect()
+        };
         // Pins in their order, then newest first; the channel of the Space is not in it. A chat
         // pinned by a folder alone climbs on the list with the pin's place (`fin`), what one
         // folder holds read stays below.
         assert_eq!(ids(&store, None, Shelf::Main), ["cy", "ben", "fin", "ana"]);
+        assert_eq!(
+            pins(&store, None),
+            [("cy".to_owned(), Some(0)), ("ben".to_owned(), Some(1)), ("fin".to_owned(), Some(2)), ("ana".to_owned(), None)]
+        );
         assert_eq!(ids(&store, None, Shelf::Archive), ["dee"]);
         assert_eq!(ids(&store, None, Shelf::Requests), ["eve"]);
         // A chat in two folders is in both; a folder's own pins come first, archived or not.
         assert_eq!(ids(&store, Some("work"), Shelf::Main), ["ben", "fin", "ana"]);
+        assert_eq!(pins(&store, Some("work")), [("ben".to_owned(), Some(1)), ("fin".to_owned(), Some(2)), ("ana".to_owned(), None)]);
         assert_eq!(ids(&store, Some("family"), Shelf::Main), ["dee", "ana"]);
         let folders = store.folders(Some(Network::Discord)).unwrap();
         let counted: Vec<(String, u32)> = folders.into_iter().map(|folder| (folder.name, folder.unread)).collect();
