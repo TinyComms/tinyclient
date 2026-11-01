@@ -25,6 +25,8 @@
 //! user chose for that person, ducked under a priority speaker (`hear`); the encoder runs at the
 //! room's bitrate; and str0m's statistics, once a second, give the round trip and the path for
 //! `Stats`.
+//!
+//! A path that dies is noticed from what comes back, not from voice: see [`SILENT`].
 
 use crate::audio::{level, Audio};
 use crate::cue::Playing;
@@ -62,6 +64,20 @@ const H264_PROFILE: u32 = 0x42e01f;
 const H264_PT: u8 = 108;
 const H264_RTX_PT: u8 = 109;
 
+/// The most between STUN checks, and so how often a working path is checked, even in silence.
+/// str0m's 3 s, with its 9 tries, takes up to 21 s to call a path dead.
+const STUN_MAX_RTO: Duration = Duration::from_secs(1);
+/// Unanswered checks before a path is dead. About 7 s on a path that was working and 6 s on one
+/// that never was: [`SILENT`] speaks first on the one, and this bounds a new link on the other,
+/// with room for a slow first connect (TCP included) and for a lossy network's run of bad luck.
+const STUN_RETRANSMITS: usize = 7;
+/// A link that was up and has answered no STUN check for this long is lost, though ICE has not
+/// said so yet. Voice cannot say: a quiet room sends none, and the gate sends nothing between
+/// words. Nor can the server's RTCP, which goes on arriving on a path that only died our way.
+/// STUN can: the server, ICE-lite, sends it only to answer us, each [`STUN_MAX_RTO`] in any room,
+/// and by now several checks, retries included, have gone unanswered.
+const SILENT: Duration = Duration::from_secs(3);
+
 /// Opus for audio, H.264 for video, and no hold for a missing audio packet. str0m's default
 /// waits for 15 later packets or a second, and the talk spurt has already ended by then.
 /// Video keeps its own hold.
@@ -73,6 +89,8 @@ fn rtc_config() -> RtcConfig {
         .set_reordering_size_audio(0)
         .set_reordering_timeout_audio(Some(Duration::from_millis(40)));
     config.codec_config().add_h264(H264_PT.into(), Some(H264_RTX_PT.into()), true, H264_PROFILE);
+    config.set_max_stun_rto(STUN_MAX_RTO);
+    config.set_max_stun_retransmits(STUN_RETRANSMITS);
     config
 }
 
@@ -356,6 +374,10 @@ struct Call {
     announced: bool,
     /// Lost media, and since when. chatd resumes the call; nothing here ends it on a clock.
     lost: Option<Instant>,
+    /// When the link last answered a STUN check.
+    heard: Instant,
+    /// [`SILENT`] called this link lost. ICE never did, so ICE will not say if it came back.
+    silenced: bool,
     audio: Option<Audio>,
     devices: Option<Devices>,
     microphone_unasked: bool,
@@ -436,6 +458,7 @@ impl Call {
             out::send(&MediaResponse::Interrupted);
         }
         self.lost.get_or_insert_with(Instant::now);
+        self.silenced = false;
         self.sending_share = false;
         self.sending_camera = false;
         self.offered = None;
@@ -581,7 +604,25 @@ impl Call {
         self.connected = true;
         self.announced = false;
         self.lost = None;
+        self.silenced = false;
+        // Opening the devices above can take longer than the watchdog waits.
+        self.heard = Instant::now();
         out::send(&MediaResponse::Connected { ssrc: 0, dave_version: 0 });
+    }
+
+    /// No answer on a link that was up: lost, without waiting for ICE to run out of tries. It
+    /// goes the way any drop does, so the dock says Reconnecting and chatd joins again. One that
+    /// answers again before the new link is here carries on.
+    fn watch_link(&mut self, now: Instant) {
+        let silent = now.saturating_duration_since(self.heard) >= SILENT;
+        if self.connected && silent {
+            tracing::warn!("mediad: the server answered no STUN check for {SILENT:?}");
+            self.silenced = true;
+            self.fell();
+        } else if self.silenced && !silent {
+            tracing::warn!("mediad: the server is heard again");
+            self.up();
+        }
     }
 
     /// The link died, or never came up after we had already been in the call. Told once per
@@ -696,6 +737,10 @@ impl Call {
         let (Some(destination), Ok(contents)) = (local, packet.as_slice().try_into()) else {
             return true;
         };
+        // RFC 7983: a first byte below 4 is STUN.
+        if packet.first().is_some_and(|byte| *byte < 4) {
+            self.heard = Instant::now();
+        }
         let receive = Receive { proto, source, destination, contents };
         self.link.rtc.handle_input(Input::Receive(Instant::now(), receive)).is_ok()
     }
@@ -1056,10 +1101,13 @@ impl Call {
             if now >= next {
                 next += TICK;
                 if now > next + 5 * TICK {
-                    // The machine slept or stalled: do not replay the missed ticks.
+                    // The machine slept or stalled: do not replay the missed ticks, and do not
+                    // lay on the link what this loop did not read.
+                    self.heard += now.saturating_duration_since(next);
                     next = now + TICK;
                 }
                 self.tick();
+                self.watch_link(now);
                 if self.ticks.is_multiple_of(SECOND) {
                     self.overdue();
                 }
@@ -1125,6 +1173,8 @@ pub fn run(link: Link, user_id: String, controls: Arc<Controls>) {
         connected: false,
         announced: false,
         lost: None,
+        heard: Instant::now(),
+        silenced: false,
         audio: None,
         devices: None,
         microphone_unasked,
@@ -1175,6 +1225,32 @@ mod tests {
         let config = rtc_config();
         assert_eq!(config.reordering_size_audio(), 0);
         assert_eq!(config.reordering_timeout_audio(), Some(Duration::from_millis(40)));
+    }
+
+    /// How long str0m takes to give up on a path that never answers, on its own clock.
+    #[test]
+    fn a_path_that_answers_nothing_is_given_up_in_seconds() {
+        let offer = Offer::new(&spec(1)).unwrap();
+        let mut peer = rtc_config().build(Instant::now());
+        peer.add_local_candidate(Candidate::host("127.0.0.1:9".parse().unwrap(), "udp").unwrap());
+        let incoming = str0m::change::SdpOffer::from_sdp_string(offer.sdp()).expect("offer");
+        let answer = peer.sdp_api().accept_offer(incoming).expect("answer");
+        let mut link = offer.accept(&answer.to_sdp_string()).expect("accept");
+        let began = Instant::now();
+        let mut now = began;
+        loop {
+            match link.rtc.poll_output().expect("output") {
+                Output::Timeout(at) => {
+                    now = at.max(now + Duration::from_millis(1));
+                    link.rtc.handle_input(Input::Timeout(now)).expect("a timeout");
+                }
+                Output::Event(Event::IceConnectionStateChange(IceConnectionState::Disconnected)) => break,
+                _ => {}
+            }
+            assert!(now - began < Duration::from_secs(30), "still trying after {:?}", now - began);
+        }
+        let taken = now - began;
+        assert!((Duration::from_secs(4)..=Duration::from_secs(7)).contains(&taken), "gave up after {taken:?}");
     }
 
     #[test]

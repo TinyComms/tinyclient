@@ -71,6 +71,8 @@ struct Sfu {
     joins: Sender<Join>,
     seen: Arc<Mutex<Seen>>,
     stop: Arc<AtomicBool>,
+    /// Everything that reaches the fake is dropped, as on a path that died.
+    deaf: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -91,10 +93,11 @@ impl Sfu {
         let (joins, asked) = channel();
         let seen = Arc::new(Mutex::new(Seen::default()));
         let stop = Arc::new(AtomicBool::new(false));
-        let mut fake = Fake { udp, listener, addr, poll, peers: Vec::new(), streams: HashMap::new(), next: 2, seen: seen.clone() };
+        let deaf = Arc::new(AtomicBool::new(false));
+        let mut fake = Fake { udp, listener, addr, poll, peers: Vec::new(), streams: HashMap::new(), next: 2, seen: seen.clone(), deaf: deaf.clone() };
         let halt = stop.clone();
         let thread = std::thread::spawn(move || fake.run(&asked, &halt));
-        Sfu { joins, seen, stop, thread: Some(thread) }
+        Sfu { joins, seen, stop, deaf, thread: Some(thread) }
     }
 
     /// The answer to `offer`, and the receive slots it names, in order.
@@ -137,6 +140,7 @@ struct Fake {
     streams: HashMap<Token, (SocketAddr, Conn, Option<usize>)>,
     next: usize,
     seen: Arc<Mutex<Seen>>,
+    deaf: Arc<AtomicBool>,
 }
 
 impl Fake {
@@ -259,6 +263,9 @@ impl Fake {
 
     /// Hands a packet to whichever peer's ICE credentials it carries, then drains it.
     fn input(&mut self, proto: Protocol, source: SocketAddr, packet: &[u8], known: Option<usize>) -> Option<usize> {
+        if self.deaf.load(Ordering::Relaxed) {
+            return None;
+        }
         let contents = packet.try_into().ok()?;
         let input = Input::Receive(Instant::now(), Receive { proto, source, destination: self.addr, contents });
         let at = known.filter(|&at| self.peers[at].rtc.accepts(&input)).or_else(|| self.peers.iter().position(|peer| peer.rtc.accepts(&input)))?;
@@ -493,6 +500,44 @@ fn two_people_hear_each_other_over_ice_tcp_alone() {
 #[test]
 fn with_both_offered_udp_carries_the_call() {
     call("both", Protocol::Udp);
+}
+
+/// A muted person alone in a room sends nothing and hears nothing, and only STUN's answers say
+/// the path is alive: that is enough to stay up for longer than the watchdog waits. When those
+/// stop too, the call says so in seconds, and a new link brings it back with no restart.
+#[test]
+fn a_quiet_room_stays_up_and_a_dead_path_is_noticed_in_seconds() {
+    let sfu = Sfu::start();
+    let sink = sink("quiet");
+    let mut ada = Mediad::start("udp", &sink);
+    let offer = ada.offer("ada");
+    let (answer, _) = sfu.join("ada", &offer);
+    assert_eq!(ada.ask(MediaRequest::TinyAnswer { sdp: answer }), MediaResponse::Done);
+    ada.event("Connected", |event| matches!(event, MediaResponse::Connected { .. }));
+    assert_eq!(ada.ask(MediaRequest::Audio { muted: true, deafened: false }), MediaResponse::Done);
+    sleep(Duration::from_millis(300));
+    let quiet = sfu.frames("ada");
+    sleep(Duration::from_secs(5));
+    assert_eq!(sfu.frames("ada"), quiet, "nothing but STUN went out");
+    assert_eq!(ada.ask(MediaRequest::Audio { muted: true, deafened: false }), MediaResponse::Done);
+    assert!(!ada.seen.iter().any(|event| matches!(event, MediaResponse::Interrupted)), "a quiet room is not a lost one: {:?}", ada.seen);
+
+    sfu.deaf.store(true, Ordering::Relaxed);
+    let lost = Instant::now();
+    ada.event("Interrupted", |event| matches!(event, MediaResponse::Interrupted));
+    let noticed = lost.elapsed();
+    assert!(noticed < Duration::from_secs(5), "noticed after {noticed:?}");
+
+    sfu.deaf.store(false, Ordering::Relaxed);
+    let again = Instant::now();
+    let offer = ada.offer("ada");
+    let (answer, _) = sfu.join("ada", &offer);
+    assert_eq!(ada.ask(MediaRequest::TinyAnswer { sdp: answer }), MediaResponse::Done);
+    ada.event("Connected on the new link", |event| matches!(event, MediaResponse::Connected { .. }));
+    let back = again.elapsed();
+    assert!(back < Duration::from_secs(2), "back after {back:?}");
+    ada.hang_up();
+    let _ = std::fs::remove_file(&sink);
 }
 
 #[test]
