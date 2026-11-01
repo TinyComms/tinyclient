@@ -36,5 +36,11 @@ tempfile = "3"
 # displayable code, exactly as mediad's calls do. The version mediad pins.
 davey = "=0.1.5"
 
+[features]
+# Test-only helpers (`Engine::forge_message`). Never enabled by a client build.
+test-hooks = []
+
 [dev-dependencies]
+# The crate's own integration tests see the test-only helpers.
+e2ee = { path = ".", features = ["test-hooks"] }
 proptest = "1"

@@ -316,7 +316,10 @@ impl Engine {
     /// A ciphertext under this device's leaf, at the generation its next real message will use,
     /// signed by `signer` instead of this device's key: what a member gone bad can make for any
     /// other member's leaf, since every member holds the whole secret tree. For tests of the
-    /// receiving side. Nothing is spent: this device's state is put back as it was.
+    /// receiving side. Nothing is spent: this device's state is put back as it was. Built only
+    /// with the `test-hooks` feature, which this crate's own tests turn on: a release build has
+    /// no function that signs a message as anyone but this device.
+    #[cfg(feature = "test-hooks")]
     #[doc(hidden)]
     pub fn forge_message(
         &mut self,
