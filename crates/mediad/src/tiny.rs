@@ -505,6 +505,7 @@ impl Call {
             Event::PeerStats(stats) => {
                 let pair = stats.selected_candidate_pair.as_ref();
                 self.meter.round_trip(pair.and_then(|pair| pair.current_round_trip_time), stats.rtt);
+                self.meter.path_loss(stats.egress_loss_fraction, stats.ingress_loss_fraction);
                 // Only host candidates are offered: the path is UDP or ICE-TCP, never a relay.
                 if let Some(pair) = pair {
                     self.meter.path = match pair.protocol {
@@ -515,8 +516,13 @@ impl Call {
             }
             // What the server sees of our microphone: its FEC is planned for that loss.
             Event::MediaEgressStats(stats) if stats.mid == self.link.microphone => {
-                if let Some(loss) = stats.loss {
-                    self.encoder.set_loss(loss);
+                if self.meter.spoke(stats.packets) {
+                    if let Some(loss) = stats.loss {
+                        self.encoder.set_loss(loss);
+                    }
+                    if let Some(remote) = stats.remote {
+                        self.meter.uplink_jitter(remote.jitter);
+                    }
                 }
             }
             Event::MediaData(data) if self.link.is_picture(data.mid) => self.picture_in(data),
@@ -1136,7 +1142,7 @@ pub fn run(link: Link, user_id: String, controls: Arc<Controls>) {
         cue: None,
         processor: Processor::new(),
         limiter: Limiter::default(),
-        meter: Meter::new(CallPath::Unknown),
+        meter: Meter::own_path(CallPath::Unknown),
         pictures: Pictures::default(),
         sending_share: false,
         sending_camera: false,

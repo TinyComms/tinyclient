@@ -488,11 +488,20 @@ pub struct CallStats {
     /// Round trip, in milliseconds. 0 until measured.
     #[serde(default)]
     pub rtt_ms: u32,
+    /// How unevenly packets travel. On a Tiny call, our own path's.
     #[serde(default)]
     pub jitter_ms: u32,
-    /// Packets lost of every thousand received.
+    /// Of every thousand packets, those lost and not repaired. On a Tiny call, on our own path.
     #[serde(default)]
     pub loss_permille: u16,
+    /// Something flowed in the last second, so `jitter_ms` and `loss_permille` mean something.
+    /// While it did not they read 0, which says nothing about the link.
+    #[serde(default)]
+    pub link_measured: bool,
+    /// Of every thousand frames expected from the others, those that did not come, on anyone's
+    /// path. The jitter buffers count these, so a sender's own trouble is in here.
+    #[serde(default)]
+    pub voice_loss_permille: u16,
     #[serde(default)]
     pub send_kbps: u32,
     #[serde(default)]
