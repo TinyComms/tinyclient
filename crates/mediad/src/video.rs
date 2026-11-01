@@ -503,6 +503,19 @@ struct Queue {
     stop: bool,
 }
 
+impl Queue {
+    /// `word` in place of everything queued, but for a clear not yet done: the picture on the
+    /// screen would stay there. A clear is a reset as well, except that it asks for no keyframe.
+    fn replace(&mut self, word: In) {
+        let clearing = self.frames.iter().any(|next| matches!(next, In::Clear));
+        self.frames.clear();
+        if clearing && word != In::Clear {
+            self.frames.push_back(In::Clear);
+        }
+        self.frames.push_back(word);
+    }
+}
+
 #[derive(Default)]
 struct Inbox {
     queue: Mutex<Queue>,
@@ -519,8 +532,7 @@ impl Inbox {
         if fits {
             queue.frames.push_back(In::Frame(frame));
         } else {
-            queue.frames.clear();
-            queue.frames.push_back(In::Reset);
+            queue.replace(In::Reset);
         }
         self.arrived.notify_one();
         fits
@@ -528,9 +540,7 @@ impl Inbox {
 
     /// Goes ahead of every frame: those belong to what this replaces.
     fn replace(&self, word: In) {
-        let mut queue = self.queue.lock().unwrap();
-        queue.frames.clear();
-        queue.frames.push_back(word);
+        self.queue.lock().unwrap().replace(word);
         self.arrived.notify_one();
     }
 
@@ -1374,6 +1384,36 @@ mod tests {
         assert_eq!(inbox.take(), Some(In::Reset), "what was queued is gone");
         inbox.queue.lock().unwrap().stop = true;
         assert_eq!(inbox.take(), None);
+    }
+
+    /// The picture must come off the screen whatever the decoder is busy with when it is told.
+    #[test]
+    fn a_reset_does_not_wipe_a_clear_still_queued() {
+        let inbox = Inbox::default();
+        inbox.replace(In::Clear);
+        inbox.replace(In::Reset);
+        assert_eq!(inbox.take(), Some(In::Clear));
+        assert_eq!(inbox.take(), Some(In::Reset), "the next picture still starts from a keyframe");
+    }
+
+    #[test]
+    fn an_overflow_does_not_wipe_a_clear_still_queued() {
+        let inbox = Inbox::default();
+        inbox.replace(In::Clear);
+        for n in 0..RECEIVED {
+            inbox.put(frame(n as u8, false));
+        }
+        assert_eq!(inbox.take(), Some(In::Clear));
+        assert_eq!(inbox.take(), Some(In::Reset));
+    }
+
+    #[test]
+    fn a_clear_stays_one_clear() {
+        let inbox = Inbox::default();
+        inbox.replace(In::Clear);
+        inbox.replace(In::Clear);
+        assert_eq!(inbox.take(), Some(In::Clear));
+        assert_eq!(inbox.queue.lock().unwrap().frames.len(), 0);
     }
 
     #[test]
