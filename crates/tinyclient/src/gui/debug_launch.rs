@@ -3,7 +3,7 @@
 //! channel" makes. For end-to-end call tests on machines where nobody can tap: Android's debug
 //! launch extras (`am start -n dev.tinyclient.app/.TinyActivity --es tiny.join "<server>|<room>"
 //! --ez tiny.camera true --ez tiny.speaker true`) and, on a desktop, `TINYCLIENT_DEBUG_JOIN`
-//! (`<server>|<room>[|camera][|speaker]`).
+//! (`<server>|<room>[|camera][|speaker][|share]`).
 //!
 //! `<server>` matches a signed-in Tiny account's name or id (empty: the only one); `<room>` a
 //! room's id or name. Every step is logged as `tinyclient: debug launch: ...`. Compiled only
@@ -22,6 +22,8 @@ pub struct Launch {
     pub room: String,
     pub camera: bool,
     pub speaker: bool,
+    /// Share the screen once in (desktop; a phone asks for consent first).
+    pub share: bool,
 }
 
 impl Launch {
@@ -35,6 +37,7 @@ impl Launch {
             match flag {
                 "camera" => launch.camera = true,
                 "speaker" => launch.speaker = true,
+                "share" => launch.share = true,
                 _ => {}
             }
         }
@@ -137,6 +140,10 @@ impl Shell {
                     log::info!("tinyclient: debug launch: turning the camera on");
                     self.call_ask(Request::Media(MediaRequest::Camera { on: true }), cx);
                 }
+                if launch.share {
+                    log::info!("tinyclient: debug launch: sharing the screen");
+                    self.call_ask(Request::Media(MediaRequest::ShareSend { on: true }), cx);
+                }
             }
         }
     }
@@ -162,7 +169,7 @@ mod tests {
     fn a_launch_names_a_server_a_room_and_flags() {
         assert_eq!(
             Launch::parse("Tiny server|Proof|camera|speaker"),
-            Some(Launch { server: "Tiny server".into(), room: "Proof".into(), camera: true, speaker: true })
+            Some(Launch { server: "Tiny server".into(), room: "Proof".into(), camera: true, speaker: true, share: false })
         );
         assert_eq!(Launch::parse("|r1"), Some(Launch { server: String::new(), room: "r1".into(), ..Launch::default() }));
         assert_eq!(Launch::parse("server only"), None);
