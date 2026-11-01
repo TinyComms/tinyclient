@@ -107,6 +107,7 @@ assets!(
     "icons/x.svg",
     "icons/arrow-right-left.svg",
     "icons/ban.svg",
+    "icons/bot.svg",
     "icons/crown.svg",
     "icons/folder-plus.svg",
     "icons/server.svg",

@@ -17,7 +17,7 @@
 use super::{asked, endpoint, explain, open, refused, rows, safe_id, tiny_name, Missing, Saved, CHECK, NOT_YOURS, UNREACHABLE, UNREADABLE};
 use protocol::{
     tiny_allowed, AccountKey, Response, TinyAccess, TinyAuditFilter, TinyBan, TinyCapabilities, TinyCategory, TinyCode,
-    TinyInviteOptions, TinyLayoutGroup, TinyRole, TinyRoleEdit, TinyRoom, TinyRoomEdit, TinySeat, TinyServerEdit, TinyServerInfo,
+    TinyBot, TinyInviteOptions, TinyLayoutGroup, TinyRole, TinyRoleEdit, TinyRoom, TinyRoomEdit, TinySeat, TinyServerEdit, TinyServerInfo,
     TinySetup, TinySetupApplied, TinySetupApply, TinySetupRefusal,
     TINY_ALL, TINY_BITRATE_MAX, TINY_BITRATE_MIN, TINY_DESCRIPTION_MAX, TINY_FEATURE_AUDIT_QUERY, TINY_FEATURE_BANS,
     TINY_FEATURE_CATEGORIES, TINY_FEATURE_INVITE_OPTIONS, TINY_FEATURE_ROLES, TINY_FEATURE_SERVER, TINY_FEATURE_TIMEOUTS,
@@ -31,6 +31,8 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 const OLDER: &str = "This server can't do that yet. Ask its owner to update tinyserver.";
+const BOT_NAME: &str = "A bot name is 1 to 80 characters.";
+const BOT_SCOPES: &str = "A bot can be granted rooms.read, rooms.write, and members.read.";
 const CATEGORY_NAME_SIZE: &str = "A category name is 1 to 80 characters.";
 const ROLE_NAME_SIZE: &str = "A role name is 1 to 80 characters.";
 const SERVER_NAME_SIZE: &str = "A server name is 1 to 80 characters.";
@@ -1022,6 +1024,71 @@ pub(crate) fn audit(account: AccountKey, filter: TinyAuditFilter) -> Response {
         },
         Ok((status, body)) => refused(explain(status, &body, Missing::Plain)),
     }
+}
+
+const BOT_SCOPE: [&str; 3] = ["rooms.read", "rooms.write", "members.read"];
+
+/// The server's bots. The rows have no token.
+pub(crate) fn bots_list(account: AccountKey) -> Response {
+    let saved = match allowed(&account, None, "community.bots.manage") {
+        Ok(saved) => saved,
+        Err(answer) => return answer,
+    };
+    match asked("GET", &saved, "/v1/bots", None) {
+        Err(detail) => refused(detail),
+        Ok((200, body)) => match serde_json::from_value::<Vec<TinyBot>>(body) {
+            Ok(bots) => Response::TinyBots { bots },
+            Err(_) => refused(UNREADABLE),
+        },
+        Ok((status, body)) => refused(explain(status, &body, Missing::Plain)),
+    }
+}
+
+/// Creates a bot. The token comes back once, in `TinyBotCreated`, and is not stored here.
+pub(crate) fn bots_create(account: AccountKey, name: String, scopes: Vec<String>) -> Response {
+    let saved = match allowed(&account, None, "community.bots.manage") {
+        Ok(saved) => saved,
+        Err(answer) => return answer,
+    };
+    let Some(name) = text_within(&name, 80).filter(|name| !name.is_empty()) else {
+        return refused(BOT_NAME);
+    };
+    if scopes.len() > BOT_SCOPE.len() || scopes.iter().any(|scope| !BOT_SCOPE.contains(&scope.as_str())) {
+        return refused(BOT_SCOPES);
+    }
+    let mut granted = Vec::new();
+    for scope in scopes {
+        if !granted.contains(&scope) {
+            granted.push(scope);
+        }
+    }
+    match asked("POST", &saved, "/v1/bots", Some(json!({ "name": name, "scopes": granted }))) {
+        Err(detail) => refused(detail),
+        Ok((201, body)) => match created_bot(body) {
+            Some((bot, token)) => Response::TinyBotCreated { bot, token },
+            None => refused(UNREADABLE),
+        },
+        Ok((status, body)) => refused(explain(status, &body, Missing::Plain)),
+    }
+}
+
+/// Revokes one bot. A 204 is done.
+pub(crate) fn bots_revoke(account: AccountKey, bot_id: String) -> Response {
+    if !safe_id(&bot_id) {
+        return refused(CHECK);
+    }
+    let saved = match allowed(&account, None, "community.bots.manage") {
+        Ok(saved) => saved,
+        Err(answer) => return answer,
+    };
+    sent(&saved, "DELETE", &format!("/v1/bots/{bot_id}"), None, Missing::Plain)
+}
+
+/// `POST /v1/bots` returns the bot and its one-time token. The token is not logged.
+fn created_bot(body: Value) -> Option<(TinyBot, String)> {
+    let token = body.get("token").and_then(Value::as_str).filter(|token| !token.is_empty())?.to_owned();
+    let bot = serde_json::from_value(body).ok()?;
+    Some((bot, token))
 }
 
 /// The checks before a call request goes to the live socket: the server has the feature, this
