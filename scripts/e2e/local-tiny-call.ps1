@@ -30,7 +30,7 @@
   pwsh scripts/e2e/local-tiny-call.ps1 -Phase all
 #>
 param(
-    [ValidateSet('server', 'desktop', 'android', 'all', 'call')]
+    [ValidateSet('server', 'desktop', 'android', 'all', 'call', 'vm', 'phone', 'collect')]
     [string]$Phase = 'all',
     [switch]$Stop,
     # Desktop: post clicks that open the community, the room, and Join channel; -Camera also
@@ -95,7 +95,7 @@ function Stop-Ours {
         ((Get-Process -Id $_.ParentProcessId -ErrorAction SilentlyContinue) -eq $null -or $_.CommandLine -match [regex]::Escape($dir))
     } | ForEach-Object { Write-Host "stop orphan $($_.Name) ($($_.ProcessId))"; Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     docker rm -f tiny-e2e-pg 2>$null | Out-Null
-    if ($Phase -eq 'call') {
+    if ($Phase -in 'call', 'collect') {
         ssh $VmHost "bash $VmDir/src/scripts/e2e/vm-desktop.sh stop $VmDir/run 2>/dev/null; true" | Out-Null
         adb -s $Serial shell am force-stop dev.tinyclient.app 2>$null
     }
@@ -349,6 +349,9 @@ function Save-Evidence {
 if ($Phase -in 'server', 'all', 'call') { Start-Server }
 if ($Phase -in 'desktop', 'all') { Start-Desktop }
 if ($Phase -in 'android', 'all') { Push-AndroidSession }
+if ($Phase -eq 'vm') { Start-Vm }
+if ($Phase -eq 'phone') { Start-Android }
+if ($Phase -eq 'collect') { Save-Evidence }
 if ($Phase -eq 'call') {
     Start-Vm
     Start-Android

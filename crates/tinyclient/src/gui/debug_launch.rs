@@ -9,6 +9,14 @@
 //! room's id or name. Every step is logged as `tinyclient: debug launch: ...`. Compiled only
 //! with `debug_assertions`: a release build has none of it.
 
+/// To the desktop's log file (tracing) and to Android's logcat (log).
+macro_rules! say {
+    ($($arg:tt)*) => {{
+        tracing::info!($($arg)*);
+        log::info!($($arg)*);
+    }};
+}
+
 use super::sidebar::Mode;
 use super::state::Shell;
 use gpui::Context;
@@ -59,7 +67,7 @@ static PENDING: Mutex<Option<(Launch, Stage)>> = Mutex::new(None);
 
 /// Asks for `launch`; the shell carries it out as soon as it can.
 pub fn request(launch: Launch) {
-    log::info!("tinyclient: debug launch: asked {launch:?}");
+    say!("tinyclient: debug launch: asked {launch:?}");
     *PENDING.lock().unwrap_or_else(|p| p.into_inner()) = Some((launch, Stage::Account));
 }
 
@@ -92,7 +100,7 @@ impl Shell {
         };
         match *stage {
             Stage::Account => {
-                log::info!("tinyclient: debug launch: opening the Tiny server {}", account.account);
+                say!("tinyclient: debug launch: opening the Tiny server {}", account.account);
                 *stage = Stage::Rooms(Instant::now());
                 drop(pending);
                 self.go(Mode::Network(Network::Tiny), cx);
@@ -108,12 +116,12 @@ impl Shell {
                 };
                 let wanted = launch.room.to_lowercase();
                 let Some(room) = page.community.rooms.iter().find(|r| r.id == launch.room || r.name.to_lowercase() == wanted) else {
-                    log::warn!("tinyclient: debug launch: no room {:?} on this server", launch.room);
+                    say!("tinyclient: debug launch: no room {:?} on this server", launch.room);
                     *pending = None;
                     return;
                 };
                 let room = room.id.clone();
-                log::info!("tinyclient: debug launch: opening room {room} and joining its call");
+                say!("tinyclient: debug launch: opening room {room} and joining its call");
                 *stage = Stage::Joining(Instant::now());
                 drop(pending);
                 self.tiny_pick_channel(Some(room.clone()), cx);
@@ -123,7 +131,7 @@ impl Shell {
                 let joined = self.tiny_call().is_some_and(|call| call.state == CallState::Joined);
                 if !joined {
                     if since.elapsed() > Duration::from_secs(30) {
-                        log::warn!("tinyclient: debug launch: the call is not up after 30 s; joining again");
+                        say!("tinyclient: debug launch: the call is not up after 30 s; joining again");
                         *stage = Stage::Rooms(Instant::now());
                     }
                     return;
@@ -131,17 +139,17 @@ impl Shell {
                 let launch = launch.clone();
                 *pending = None;
                 drop(pending);
-                log::info!("tinyclient: debug launch: in the call");
+                say!("tinyclient: debug launch: in the call");
                 if launch.speaker {
-                    log::info!("tinyclient: debug launch: sound to the speaker");
+                    say!("tinyclient: debug launch: sound to the speaker");
                     super::call::phone::hooks::choose_route(super::call::phone::hooks::Route::Speaker);
                 }
                 if launch.camera {
-                    log::info!("tinyclient: debug launch: turning the camera on");
+                    say!("tinyclient: debug launch: turning the camera on");
                     self.call_ask(Request::Media(MediaRequest::Camera { on: true }), cx);
                 }
                 if launch.share {
-                    log::info!("tinyclient: debug launch: sharing the screen");
+                    say!("tinyclient: debug launch: sharing the screen");
                     self.call_ask(Request::Media(MediaRequest::ShareSend { on: true }), cx);
                 }
             }

@@ -24,6 +24,13 @@ start)
     mkdir -p "$run/data"
     : > "$run/pids"
     export DISPLAY=:0 XAUTHORITY=/run/user/1000/gdm/Xauthority
+    # mediad fetches OpenH264 from Cisco on first use, but a debug Linux build has no TLS backend
+    # for that request ("Unknown Scheme"), so the screen share would never start. Fetch it here.
+    h264="$HOME/.cache/tinyclient/libopenh264-2.6.0-linux64.8.so"
+    if [ ! -s "$h264" ]; then
+        mkdir -p "$(dirname "$h264")"
+        curl -sfL https://ciscobinary.openh264.org/libopenh264-2.6.0-linux64.8.so.bz2 | bunzip2 > "$h264"
+    fi
     # The screen, recorded for the proof, from before the client opens.
     ffmpeg -nostdin -loglevel error -y -f x11grab -framerate 10 -video_size "$(xdpyinfo | awk '/dimensions/{print $2}')" -i :0 \
         -c:v libx264 -preset ultrafast -pix_fmt yuv420p "$run/screen.mp4" > "$run/ffmpeg.log" 2>&1 &
