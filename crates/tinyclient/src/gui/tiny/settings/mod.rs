@@ -19,6 +19,7 @@ mod audit;
 mod bans;
 mod channels;
 mod danger;
+mod encryption;
 mod invites;
 mod kit;
 mod members;
@@ -61,11 +62,12 @@ pub(in crate::gui) enum Page {
     Voice,
     Audit,
     SignIn,
+    Encryption,
     Danger,
 }
 
 impl Page {
-    pub const ALL: [Page; 10] = [Page::Overview, Page::Roles, Page::Members, Page::Invites, Page::Bans, Page::Channels, Page::Voice, Page::Audit, Page::SignIn, Page::Danger];
+    pub const ALL: [Page; 11] = [Page::Overview, Page::Roles, Page::Members, Page::Invites, Page::Bans, Page::Channels, Page::Voice, Page::Audit, Page::SignIn, Page::Encryption, Page::Danger];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -78,6 +80,7 @@ impl Page {
             Page::Voice => "Voice & media",
             Page::Audit => "Audit log",
             Page::SignIn => "Sign-in",
+            Page::Encryption => "Encryption",
             Page::Danger => "Danger zone",
         }
     }
@@ -93,6 +96,7 @@ impl Page {
             Page::Voice => "icons/signal.svg",
             Page::Audit => "icons/list.svg",
             Page::SignIn => "icons/key.svg",
+            Page::Encryption => "icons/lock.svg",
             Page::Danger => "icons/triangle-alert.svg",
         }
     }
@@ -103,7 +107,7 @@ impl Page {
             Page::Overview | Page::Roles => "Server",
             Page::Members | Page::Invites | Page::Bans => "People",
             Page::Channels | Page::Voice => "Voice",
-            Page::Audit | Page::SignIn | Page::Danger => "Security",
+            Page::Audit | Page::SignIn | Page::Encryption | Page::Danger => "Security",
         }
     }
 
@@ -123,6 +127,8 @@ impl Page {
             Page::Voice => may.edit_server,
             Page::Audit => may.read_audit,
             Page::SignIn => may.edit_server || may.owner,
+            // Everyone's own devices and the people they talk to: not a power over the server.
+            Page::Encryption => true,
             Page::Danger => may.owner,
         }
     }
@@ -139,6 +145,7 @@ pub(in crate::gui) struct Overlay {
     pub channels: channels::Draft,
     pub audit: audit::Draft,
     pub danger: danger::Draft,
+    pub encryption: encryption::Draft,
     /// A save is with the server.
     pub saving: bool,
     /// What the server said no to, in the unsaved-changes bar.
@@ -160,6 +167,7 @@ impl Overlay {
             channels: Default::default(),
             audit: Default::default(),
             danger: Default::default(),
+            encryption: Default::default(),
             saving: false,
             error: None,
             saved: false,
@@ -186,6 +194,10 @@ pub(in crate::gui) struct Fields {
     pub category_name: Entity<TextInput>,
     /// What a dangerous modal asks to be typed.
     pub confirm: Entity<TextInput>,
+    /// A new device's link code, on the Encryption page.
+    pub link_code: Entity<TextInput>,
+    /// A recovery key typed to check it.
+    pub recovery_check: Entity<TextInput>,
 }
 
 impl Fields {
@@ -203,7 +215,9 @@ impl Fields {
         let room_topic = cx.new(|cx| TextInput::new("What the channel is for", cx));
         let category_name = cx.new(|cx| TextInput::new("Category name", cx));
         let confirm = cx.new(|cx| TextInput::new("Type the server's name", cx));
-        for input in [&name, &description, &welcome, &image_max, &file_max, &role_name, &role_color, &member_search, &ban_search, &room_name, &room_topic, &category_name, &confirm] {
+        let link_code = cx.new(|cx| TextInput::new("tiny-device-…", cx));
+        let recovery_check = cx.new(|cx| TextInput::new("Type your recovery key to check it", cx));
+        for input in [&name, &description, &welcome, &image_max, &file_max, &role_name, &role_color, &member_search, &ban_search, &room_name, &room_topic, &category_name, &confirm, &link_code, &recovery_check] {
             cx.subscribe(input, |_, _, _: &crate::gui::input::InputEvent, cx| cx.notify()).detach();
             // Escape in a field leaves Server Settings, as it does anywhere else in it.
             cx.subscribe(input, |this, _, key: &crate::gui::input::InputKey, cx| {
@@ -213,7 +227,7 @@ impl Fields {
             })
             .detach();
         }
-        Fields { name, description, welcome, image_max, file_max, role_name, role_color, member_search, ban_search, room_name, room_topic, category_name, confirm }
+        Fields { name, description, welcome, image_max, file_max, role_name, role_color, member_search, ban_search, room_name, room_topic, category_name, confirm, link_code, recovery_check }
     }
 }
 
@@ -281,6 +295,9 @@ impl Shell {
     fn tiny_settings_enter(&mut self, page: Page, cx: &mut Context<Self>) {
         if page == Page::Audit && self.tiny_state.settings.as_ref().is_some_and(|overlay| !overlay.audit.asked) {
             self.tiny_audit_load(false, cx);
+        }
+        if page == Page::Encryption && self.tiny_state.settings.as_ref().is_some_and(|overlay| !overlay.encryption.asked) {
+            self.tiny_e2ee_load(cx);
         }
     }
 
@@ -458,6 +475,7 @@ impl Shell {
             Page::Voice => voice::voice(self, facts, window, cx),
             Page::Audit => audit::audit(self, facts, window, cx),
             Page::SignIn => signin::signin(self, facts, window, cx),
+            Page::Encryption => encryption::encryption(self, facts, window, cx),
             Page::Danger => danger::danger(self, facts, window, cx),
         };
         let dirty = self.tiny_settings_dirty(cx);

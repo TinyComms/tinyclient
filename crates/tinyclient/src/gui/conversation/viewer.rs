@@ -288,7 +288,12 @@ impl Pane {
                     let free = (1..100)
                         .map(|n| if n == 1 { folder.join(&name) } else { folder.join(format!("{stem} {n}{extension}")) })
                         .find(|path| !path.exists())?;
-                    std::fs::copy(from, &free).ok().map(|_| free)
+                    std::fs::copy(from, &free).ok()?;
+                    // Marked as from the internet, so the system checks it when it is opened.
+                    if let Err(err) = protocol::quarantine::mark(&free) {
+                        tracing::warn!("tinyclient: a saved file was not marked as downloaded: {err}");
+                    }
+                    Some(free)
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
