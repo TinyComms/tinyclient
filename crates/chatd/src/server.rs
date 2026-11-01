@@ -2100,6 +2100,9 @@ impl Chat {
             Request::TinySetupRead { account } => adapters::tiny::manage::setup_read(account),
             Request::TinySetupApply { account, apply } => adapters::tiny::manage::setup_apply(account, apply),
             Request::TinyPasskeyLink { account } => adapters::tiny::manage::passkey_link(account),
+            Request::TinyBots { account } => adapters::tiny::manage::bots_list(account),
+            Request::TinyBotCreate { account, name, scopes } => adapters::tiny::manage::bots_create(account, name, scopes),
+            Request::TinyBotRevoke { account, bot_id } => adapters::tiny::manage::bots_revoke(account, bot_id),
             Request::TinyCallModerate { account, room_id, user_id, server_muted, server_deafened } => {
                 let mut needs = Vec::new();
                 if server_muted.is_some() {

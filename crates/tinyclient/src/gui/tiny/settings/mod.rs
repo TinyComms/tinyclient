@@ -17,6 +17,7 @@
 
 mod audit;
 mod bans;
+mod bots;
 mod channels;
 mod danger;
 mod encryption;
@@ -58,6 +59,7 @@ pub(in crate::gui) enum Page {
     Overview,
     Roles,
     Members,
+    Bots,
     Invites,
     Bans,
     Channels,
@@ -70,13 +72,28 @@ pub(in crate::gui) enum Page {
 }
 
 impl Page {
-    pub const ALL: [Page; 12] = [Page::Overview, Page::Roles, Page::Members, Page::Invites, Page::Bans, Page::Channels, Page::Voice, Page::Audit, Page::Privacy, Page::SignIn, Page::Encryption, Page::Danger];
+    pub const ALL: [Page; 13] = [
+        Page::Overview,
+        Page::Roles,
+        Page::Members,
+        Page::Bots,
+        Page::Invites,
+        Page::Bans,
+        Page::Channels,
+        Page::Voice,
+        Page::Audit,
+        Page::Privacy,
+        Page::SignIn,
+        Page::Encryption,
+        Page::Danger,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             Page::Overview => "Overview",
             Page::Roles => "Roles",
             Page::Members => "Members",
+            Page::Bots => "Bots",
             Page::Invites => "Invites",
             Page::Bans => "Bans",
             Page::Channels => "Channels",
@@ -94,6 +111,7 @@ impl Page {
             Page::Overview => "icons/server.svg",
             Page::Roles => "icons/shield.svg",
             Page::Members => "icons/users.svg",
+            Page::Bots => "icons/bot.svg",
             Page::Invites => "icons/user-plus.svg",
             Page::Bans => "icons/ban.svg",
             Page::Channels => "icons/volume-2.svg",
@@ -110,7 +128,7 @@ impl Page {
     fn group(self) -> &'static str {
         match self {
             Page::Overview | Page::Roles => "Server",
-            Page::Members | Page::Invites | Page::Bans => "People",
+            Page::Members | Page::Bots | Page::Invites | Page::Bans => "People",
             Page::Channels | Page::Voice => "Voice",
             Page::Audit | Page::Privacy | Page::SignIn | Page::Encryption | Page::Danger => "Security",
         }
@@ -126,6 +144,7 @@ impl Page {
             Page::Overview => true,
             Page::Roles => community.has(protocol::TINY_FEATURE_ROLES) && may.manage_roles,
             Page::Members => may.manage_roles || can("community.members.remove") || can("community.members.timeout") || can("community.members.ban"),
+            Page::Bots => can("community.bots.manage"),
             Page::Invites => may.read_invites,
             Page::Bans => may.read_bans,
             Page::Channels => may.make_room || may.edit_room || may.delete_room,
@@ -150,6 +169,7 @@ pub(in crate::gui) struct Overlay {
     pub roles: roles::Draft,
     pub members: members::Draft,
     pub channels: channels::Draft,
+    pub bots: bots::Draft,
     pub audit: audit::Draft,
     pub danger: danger::Draft,
     pub encryption: encryption::Draft,
@@ -172,6 +192,7 @@ impl Overlay {
             roles: Default::default(),
             members: Default::default(),
             channels: Default::default(),
+            bots: Default::default(),
             audit: Default::default(),
             danger: Default::default(),
             encryption: Default::default(),
@@ -199,6 +220,8 @@ pub(in crate::gui) struct Fields {
     pub room_name: Entity<TextInput>,
     pub room_topic: Entity<TextInput>,
     pub category_name: Entity<TextInput>,
+    /// The name of a bot about to be created.
+    pub bot_name: Entity<TextInput>,
     /// What a dangerous modal asks to be typed.
     pub confirm: Entity<TextInput>,
     /// A new device's link code, on the Encryption page.
@@ -221,10 +244,11 @@ impl Fields {
         let room_name = cx.new(|cx| TextInput::new("Channel name", cx));
         let room_topic = cx.new(|cx| TextInput::new("What the channel is for", cx));
         let category_name = cx.new(|cx| TextInput::new("Category name", cx));
+        let bot_name = cx.new(|cx| TextInput::new("Bot name", cx));
         let confirm = cx.new(|cx| TextInput::new("Type the server's name", cx));
         let link_code = cx.new(|cx| TextInput::new("tiny-device-…", cx));
         let recovery_check = cx.new(|cx| TextInput::new("Type your recovery key to check it", cx));
-        for input in [&name, &description, &welcome, &image_max, &file_max, &role_name, &role_color, &member_search, &ban_search, &room_name, &room_topic, &category_name, &confirm, &link_code, &recovery_check] {
+        for input in [&name, &description, &welcome, &image_max, &file_max, &role_name, &role_color, &member_search, &ban_search, &room_name, &room_topic, &category_name, &bot_name, &confirm, &link_code, &recovery_check] {
             cx.subscribe(input, |_, _, _: &crate::gui::input::InputEvent, cx| cx.notify()).detach();
             // Escape in a field leaves Server Settings, as it does anywhere else in it.
             cx.subscribe(input, |this, _, key: &crate::gui::input::InputKey, cx| {
@@ -234,7 +258,7 @@ impl Fields {
             })
             .detach();
         }
-        Fields { name, description, welcome, image_max, file_max, role_name, role_color, member_search, ban_search, room_name, room_topic, category_name, confirm, link_code, recovery_check }
+        Fields { name, description, welcome, image_max, file_max, role_name, role_color, member_search, ban_search, room_name, room_topic, category_name, bot_name, confirm, link_code, recovery_check }
     }
 }
 
@@ -302,6 +326,9 @@ impl Shell {
     fn tiny_settings_enter(&mut self, page: Page, cx: &mut Context<Self>) {
         if page == Page::Audit && self.tiny_state.settings.as_ref().is_some_and(|overlay| !overlay.audit.asked) {
             self.tiny_audit_load(false, cx);
+        }
+        if page == Page::Bots && self.tiny_state.settings.as_ref().is_some_and(|overlay| !overlay.bots.asked) {
+            self.tiny_bots_load(cx);
         }
         if page == Page::Encryption && self.tiny_state.settings.as_ref().is_some_and(|overlay| !overlay.encryption.asked) {
             self.tiny_e2ee_load(cx);
@@ -492,6 +519,7 @@ impl Shell {
             Page::Overview => overview::overview(self, facts, window, cx),
             Page::Roles => roles::roles(self, facts, window, cx),
             Page::Members => members::members(self, facts, window, cx),
+            Page::Bots => bots::bots(self, facts, window, cx),
             Page::Invites => invites::invites(self, facts, window, cx),
             Page::Bans => bans::bans(self, facts, window, cx),
             Page::Channels => channels::channels(self, facts, window, cx),

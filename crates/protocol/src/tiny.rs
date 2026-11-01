@@ -114,6 +114,20 @@ pub struct TinyAudit {
     pub reason: String,
 }
 
+/// One application bot. The token is not here: the server shows it once, on create.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TinyBot {
+    pub id: String,
+    #[serde(default, deserialize_with = "text_or_null")]
+    pub name: String,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    #[serde(default)]
+    pub permissions: i64,
+    #[serde(default, deserialize_with = "text_or_null")]
+    pub created_at: String,
+}
+
 /// One room, and who is in its call now, in the order they joined.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TinyRoom {
@@ -702,7 +716,7 @@ fn tiny_bits(id: &str) -> Option<u64> {
         "community.members.ban" | "community.bans.read" => TINY_BAN_MEMBERS,
         "community.members.timeout" => TINY_TIMEOUT_MEMBERS,
         "community.audit.read" => TINY_VIEW_AUDIT_LOG,
-        "community.server.edit" => TINY_MANAGE_SERVER,
+        "community.server.edit" | "community.bots.manage" => TINY_MANAGE_SERVER,
         "community.rooms.create" | "community.rooms.rename" | "community.rooms.delete" | "community.rooms.edit" | "community.categories.manage" => {
             TINY_MANAGE_CHANNELS
         }
@@ -1293,7 +1307,8 @@ pub fn tiny_can(role: &str, id: &str) -> bool {
         | "community.members.role"
         | "community.members.remove"
         | "community.invites.revoke"
-        | "community.audit.read" => matches!(role, "owner" | "admin"),
+        | "community.audit.read"
+        | "community.bots.manage" => matches!(role, "owner" | "admin"),
         "account.name.edit" | "account.sessions.end" | "community.calls.join" => {
             matches!(role, "owner" | "admin" | "member")
         }
@@ -1469,6 +1484,7 @@ mod tests {
             "community.members.role",
             "community.members.remove",
             "community.audit.read",
+            "community.bots.manage",
             "community.rooms.create",
             "community.rooms.rename",
             "community.rooms.delete",
