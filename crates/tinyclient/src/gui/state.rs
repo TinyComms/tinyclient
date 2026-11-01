@@ -256,6 +256,8 @@ impl Shell {
         Self::watch(cx);
         Self::watch_updates(cx);
         Self::wake_at_thresholds(cx);
+        #[cfg(debug_assertions)]
+        Self::debug_launch_watch(cx);
         let subscriptions = [
             cx.observe_window_activation(window, |this, window, cx| {
                 this.active = window.is_window_active();

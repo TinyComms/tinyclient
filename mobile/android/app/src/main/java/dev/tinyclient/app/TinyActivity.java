@@ -19,9 +19,23 @@ public class TinyActivity extends GpuiInputActivity {
     }
 
     private void selfTest(Intent intent) {
-        String what = intent == null ? null : intent.getStringExtra("tiny.selftest");
-        if (what != null && (getApplicationInfo().flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0) {
+        if (intent == null || (getApplicationInfo().flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) == 0) {
+            return;
+        }
+        String what = intent.getStringExtra("tiny.selftest");
+        if (what != null) {
             TinyPlatform.nativeSelfTest(what);
+        }
+        // A debug launch for call tests without taps:
+        //   am start -n dev.tinyclient.app/.TinyActivity --es tiny.join "<server>|<room>" \
+        //       --ez tiny.camera true --ez tiny.speaker true
+        String join = intent.getStringExtra("tiny.join");
+        if (join != null) {
+            try {
+                TinyPlatform.nativeDebugJoin(join, intent.getBooleanExtra("tiny.camera", false), intent.getBooleanExtra("tiny.speaker", false));
+            } catch (UnsatisfiedLinkError notDebugRust) {
+                android.util.Log.w("tinyclient", "tiny.join needs a debug build of the Rust library");
+            }
         }
     }
 

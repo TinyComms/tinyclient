@@ -14,6 +14,8 @@ mod chrome;
 mod components;
 mod composer;
 mod conversation;
+#[cfg(debug_assertions)]
+pub(crate) mod debug_launch;
 mod hotkeys;
 mod input;
 mod layout;

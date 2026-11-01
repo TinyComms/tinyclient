@@ -16,6 +16,13 @@
                   the room and join (GPUI has no UI Automation tree on Windows); -Camera turns the camera on.
   -Phase android  Writes Bea's session into the installed debug app (run-as) for emulator-5554.
   -Phase all      server, desktop, android.
+  -Phase call     The whole proof with nothing on this PC's screen: server, then Alice on the
+                  tiny-linux VM's X11 desktop (vm-desktop.sh: built there, TINYCLIENT_DEBUG_JOIN,
+                  screen share, watching Bea, 440 Hz tone, ffmpeg recording), then Bea on the emulator by a debug
+                  launch (tiny.join, camera on, speaker, watching Alice's share, 660 Hz tone), -CallSeconds in the call,
+                  then logs, recording and both ends' received audio into -Proof with
+                  tone-check.py's verdict, and everything stopped.
+                  pwsh scripts/e2e/local-tiny-call.ps1 -Phase call -BuildApk -Proof <dir>
   -Stop           Stops only the processes this script started (pids in <State>\pids.json) and
                   removes the Postgres container.
 
@@ -23,7 +30,7 @@
   pwsh scripts/e2e/local-tiny-call.ps1 -Phase all
 #>
 param(
-    [ValidateSet('server', 'desktop', 'android', 'all')]
+    [ValidateSet('server', 'desktop', 'android', 'all', 'call', 'serve', 'vm', 'phone', 'collect')]
     [string]$Phase = 'all',
     [switch]$Stop,
     # Desktop: post clicks that open the community, the room, and Join channel; -Camera also
@@ -40,7 +47,16 @@ param(
     [int]$MediaPort = 50100,
     [int]$PgPort = 54351,
     [int]$OidcPort = 54352,
-    [string]$Serial = 'emulator-5554'
+    [string]$Serial = 'emulator-5554',
+    # -Phase call: the VM that runs the desktop participant (scripts/e2e/vm-desktop.sh).
+    [string]$VmHost = 'tiny-linux',
+    [string]$VmDir = '~/tiny-e2e',
+    [switch]$SkipVmBuild,
+    [switch]$InstallApk,
+    # Build the debug APK (x86_64, stripped) before installing it.
+    [switch]$BuildApk,
+    [int]$CallSeconds = 60,
+    [string]$Proof = (Join-Path $env:LOCALAPPDATA 'tiny-e2e\proof')
 )
 $ErrorActionPreference = 'Stop'
 $Repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
@@ -56,6 +72,7 @@ if (-not $TinyServerDir) {
 $TinyServerDir = (Resolve-Path $TinyServerDir).Path
 New-Item -ItemType Directory -Force $State | Out-Null
 $PidFile = Join-Path $State 'pids.json'
+$ServerTarget = Join-Path $env:LOCALAPPDATA 'tiny-e2e\server-target'
 $Logs = Join-Path $State 'logs'
 New-Item -ItemType Directory -Force $Logs | Out-Null
 
@@ -81,6 +98,10 @@ function Stop-Ours {
         ((Get-Process -Id $_.ParentProcessId -ErrorAction SilentlyContinue) -eq $null -or $_.CommandLine -match [regex]::Escape($dir))
     } | ForEach-Object { Write-Host "stop orphan $($_.Name) ($($_.ProcessId))"; Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     docker rm -f tiny-e2e-pg 2>$null | Out-Null
+    if ($Phase -in 'call', 'collect' -or $Stop) {
+        ssh -n $VmHost "bash $VmDir/src/scripts/e2e/vm-desktop.sh stop $VmDir/run 2>/dev/null; true" | Out-Null
+        adb -s $Serial shell am force-stop dev.tinyclient.app 2>$null
+    }
 }
 
 if ($Stop) { Stop-Ours; return }
@@ -151,7 +172,8 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
     if (-not (Test-Path (Join-Path $seedDir 'Cargo.lock'))) { Copy-Item (Join-Path $TinyServerDir 'Cargo.lock') $seedDir }
     cargo build -q --manifest-path (Join-Path $seedDir 'Cargo.toml')
     if ($LASTEXITCODE) { throw 'tiny-seed build failed' }
-    cargo build -q -p tinyserver --manifest-path (Join-Path $TinyServerDir 'Cargo.toml')
+    # Our own target directory: the shared worktree's target/ has been cleaned under a running test.
+    cargo build -q -p tinyserver --manifest-path (Join-Path $TinyServerDir 'Cargo.toml') --target-dir $ServerTarget
     if ($LASTEXITCODE) { throw 'tinyserver build failed' }
 
     $env:DATABASE_URL_MIGRATE = $MigrateUrl
@@ -173,6 +195,13 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
     Save-Pid 'fake-oidc' $oidc.Id
     Wait-Http "http://127.0.0.1:$OidcPort/.well-known/openid-configuration" | Out-Null
 
+    Start-TinyServer
+    Write-Host "room: $($seed.room.name) $($seed.room.id)"
+}
+
+# `tinyserver serve` on the database Start-Server made; also -Phase serve after a crash. Run under
+# cmd so its exit code lands in the log: a debug tinyserver has died silently when a call ended.
+function Start-TinyServer {
     $tailnet = (tailscale ip -4 2>$null | Select-Object -First 1)
     $lan = (Get-NetIPAddress -AddressFamily IPv4 -InterfaceAlias 'Ethernet', 'Wi-Fi' -ErrorAction SilentlyContinue | Select-Object -First 1).IPAddress
     $env:BIND = "0.0.0.0:$HttpPort"
@@ -187,13 +216,18 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
     $env:TINYSERVER_OIDC_CLIENT_SECRET = 'dev-only'
     $env:TINYSERVER_ALLOW_FAKE_SCAN = '1'
     $env:RUST_LOG = 'info,sfu=debug,api::live=debug'
-    $exe = Join-Path $TinyServerDir 'target\debug\tinyserver.exe'
-    $srv = Start-Process -PassThru -WindowStyle Hidden $exe -ArgumentList 'serve' -WorkingDirectory $State `
-        -RedirectStandardOutput (Join-Path $Logs 'tinyserver.out.log') -RedirectStandardError (Join-Path $Logs 'tinyserver.log')
-    Save-Pid 'tinyserver' $srv.Id
+    $exe = Join-Path $ServerTarget 'debug\tinyserver.exe'
+    $env:DATABASE_URL_MIGRATE = $MigrateUrl
+    $env:DATABASE_URL = $RuntimeUrl
+    $log = Join-Path $Logs 'tinyserver.log'
+    $wrap = Join-Path $State 'tinyserver.cmd'
+    "@`"$exe`" serve >> `"$log.out`" 2>> `"$log`"`r`n@echo tinyserver exited with code %errorlevel% >> `"$log`"`r`n" | Set-Content -NoNewline $wrap
+    $srv = Start-Process -PassThru -WindowStyle Hidden cmd -WorkingDirectory $State -ArgumentList '/c', "`"$wrap`""
+    Save-Pid 'tinyserver-cmd' $srv.Id
     $health = Wait-Http "http://127.0.0.1:$HttpPort/health" 90
+    $child = Get-CimInstance Win32_Process -Filter "ParentProcessId=$($srv.Id) and Name='tinyserver.exe'"
+    Save-Pid 'tinyserver' $child.ProcessId
     Write-Host "tinyserver up: $($health | ConvertTo-Json -Compress)"
-    Write-Host "room: $($seed.room.name) $($seed.room.id)"
 }
 
 function Get-Seed { Get-Content (Join-Path $State 'seed.json') -Raw | ConvertFrom-Json }
@@ -266,7 +300,95 @@ function Push-AndroidSession {
     Write-Host "Bea's session written to $pkg files/sessions.json (base_url $($b.base_url))"
 }
 
-if ($Phase -in 'server', 'all') { Start-Server }
+function Get-LanIp {
+    (Get-NetIPAddress -AddressFamily IPv4 -InterfaceAlias 'Ethernet', 'Wi-Fi' -ErrorAction SilentlyContinue | Select-Object -First 1).IPAddress
+}
+
+# The desktop participant on a Linux VM's own X11 desktop (scripts/e2e/vm-desktop.sh), so the
+# test never opens a window on this PC. Alice, joined by TINYCLIENT_DEBUG_JOIN, sharing the VM's
+# screen, sending a 440 Hz tone and keeping what she hears in played.pcm; ffmpeg records the screen.
+function Start-Vm {
+    $seed = Get-Seed
+    $lan = Get-LanIp
+    if (-not $SkipVmBuild) {
+        $tar = Join-Path $State 'src.tar.gz'
+        git -C $Repo archive --format=tar.gz -o $tar HEAD
+        scp -q $tar "${VmHost}:/tmp/tiny-e2e-src.tar.gz"
+        ssh -n $VmHost "rm -rf $VmDir/src && mkdir -p $VmDir/src && tar xzf /tmp/tiny-e2e-src.tar.gz -C $VmDir/src && rm /tmp/tiny-e2e-src.tar.gz"
+        ssh -n $VmHost "bash $VmDir/src/scripts/e2e/vm-desktop.sh build $VmDir/src > $VmDir/build.log 2>&1; echo build exit `$?"
+    }
+    # The VM must reach this PC's server: health over the LAN.
+    ssh -n $VmHost "curl -s --max-time 5 http://${lan}:$HttpPort/health" | Write-Host
+    $a = $seed.sessions.a.psobject.Copy()
+    $a.base_url = "http://${lan}:$HttpPort"
+    $session = ($a | ConvertTo-Json -Compress) -replace "'", "'\''"
+    $join = "|$($seed.room.name)|share|watch"
+    ssh -n $VmHost "bash $VmDir/src/scripts/e2e/vm-desktop.sh stop $VmDir/run >/dev/null 2>&1; rm -rf $VmDir/run; bash $VmDir/src/scripts/e2e/vm-desktop.sh start $VmDir/src $VmDir/run '$session' '$join' tone:440"
+}
+
+# Bea on the emulator: her session, the debug APK, then a debug launch that opens the room and
+# joins with the camera on and the sound on the speaker; mediad sends a 660 Hz tone and keeps
+# what it hears in the app's files/played.pcm. No taps.
+function Start-Android {
+    Push-AndroidSession
+    $apk = Join-Path $Repo 'mobile\android\app\build\outputs\apk\debug\app-debug.apk'
+    if ($BuildApk) {
+        # The debug .so is 1.3 GB with its debug info; stripped it installs in seconds, and it
+        # keeps debug_assertions (the debug launch). Gradle from PATH or ~/.gradle/dists-manual.
+        & (Join-Path $Repo 'scripts\mobile\build-android.ps1') -Abi x86_64 -SkipGradle
+        if ($LASTEXITCODE) { throw 'cargo ndk build failed' }
+        $strip = Get-ChildItem "$env:LOCALAPPDATA\Android\Sdk\ndk\*\toolchains\llvm\prebuilt\*\bin\llvm-strip.exe" | Select-Object -Last 1 -ExpandProperty FullName
+        & $strip --strip-debug (Join-Path $Repo 'mobile\android\app\src\main\jniLibs\x86_64\libtinyclient.so')
+        $manual = Get-ChildItem "$env:USERPROFILE\.gradle\dists-manual\gradle-*\bin" -ErrorAction SilentlyContinue | Select-Object -Last 1
+        if (-not (Get-Command gradle -ErrorAction SilentlyContinue) -and $manual) { $env:PATH = "$($manual.FullName);$env:PATH" }
+        Push-Location (Join-Path $Repo 'mobile\android'); gradle -q assembleDebug; $code = $LASTEXITCODE; Pop-Location
+        if ($code) { throw 'gradle assembleDebug failed' }
+        $InstallApk = $true
+    }
+    if ($InstallApk) {
+        adb -s $Serial install -r $apk | Write-Host
+        Push-AndroidSession
+    }
+    $seed = Get-Seed
+    $pkg = 'dev.tinyclient.app'
+    adb -s $Serial shell pm grant $pkg android.permission.CAMERA
+    adb -s $Serial shell pm grant $pkg android.permission.RECORD_AUDIO
+    adb -s $Serial shell pm grant $pkg android.permission.POST_NOTIFICATIONS 2>$null
+    adb -s $Serial logcat -c
+    $join = "|$($seed.room.name)|watch|audio=tone:660|sink=/data/user/0/$pkg/files/played.pcm"
+    adb -s $Serial shell "am start -n $pkg/.TinyActivity --es tiny.join '$join' --ez tiny.camera true --ez tiny.speaker true" | Write-Host
+}
+
+# Logs, the VM's recording and both ends' received audio into $Proof, then the 440/660 Hz check.
+function Save-Evidence {
+    New-Item -ItemType Directory -Force $Proof | Out-Null
+    Copy-Item (Join-Path $Logs '*') $Proof -Force
+    Copy-Item (Join-Path $State 'seed.json') $Proof -Force
+    adb -s $Serial logcat -d > (Join-Path $Proof 'android-logcat.txt')
+    # PowerShell's > is text; cmd's keeps the bytes.
+    cmd /c "adb -s $Serial exec-out run-as dev.tinyclient.app cat files/played.pcm > `"$(Join-Path $Proof 'android-played.pcm')`""
+    ssh -n $VmHost "bash $VmDir/src/scripts/e2e/vm-desktop.sh stop $VmDir/run"
+    ssh -n $VmHost "cd $VmDir/run && tar czf /tmp/tiny-e2e-vm.tgz screen.mp4 played.pcm tinyclient.log ffmpeg.log data/logs 2>/dev/null; true"
+    scp -q "${VmHost}:/tmp/tiny-e2e-vm.tgz" (Join-Path $Proof 'vm.tgz')
+    tar xzf (Join-Path $Proof 'vm.tgz') -C $Proof
+    Remove-Item (Join-Path $Proof 'vm.tgz')
+    python -I (Join-Path $PSScriptRoot 'tone-check.py') (Join-Path $Proof 'played.pcm') (Join-Path $Proof 'android-played.pcm') | Tee-Object (Join-Path $Proof 'tone-check.txt')
+}
+
+if ($Phase -in 'server', 'all', 'call') { Start-Server }
 if ($Phase -in 'desktop', 'all') { Start-Desktop }
 if ($Phase -in 'android', 'all') { Push-AndroidSession }
+if ($Phase -eq 'serve') { Start-TinyServer }
+if ($Phase -eq 'vm') { Start-Vm }
+if ($Phase -eq 'phone') { Start-Android }
+if ($Phase -eq 'collect') { Save-Evidence }
+if ($Phase -eq 'call') {
+    Start-Vm
+    Start-Android
+    Write-Host "in the call for $CallSeconds s"
+    Start-Sleep $CallSeconds
+    Save-Evidence
+    Stop-Ours
+    Write-Host "evidence in $Proof"
+}
 
