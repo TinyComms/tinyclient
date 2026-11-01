@@ -30,7 +30,7 @@
   pwsh scripts/e2e/local-tiny-call.ps1 -Phase all
 #>
 param(
-    [ValidateSet('server', 'desktop', 'android', 'all', 'call', 'vm', 'phone', 'collect')]
+    [ValidateSet('server', 'desktop', 'android', 'all', 'call', 'serve', 'vm', 'phone', 'collect')]
     [string]$Phase = 'all',
     [switch]$Stop,
     # Desktop: post clicks that open the community, the room, and Join channel; -Camera also
@@ -70,6 +70,7 @@ if (-not $TinyServerDir) {
 $TinyServerDir = (Resolve-Path $TinyServerDir).Path
 New-Item -ItemType Directory -Force $State | Out-Null
 $PidFile = Join-Path $State 'pids.json'
+$ServerTarget = Join-Path $env:LOCALAPPDATA 'tiny-e2e\server-target'
 $Logs = Join-Path $State 'logs'
 New-Item -ItemType Directory -Force $Logs | Out-Null
 
@@ -95,7 +96,7 @@ function Stop-Ours {
         ((Get-Process -Id $_.ParentProcessId -ErrorAction SilentlyContinue) -eq $null -or $_.CommandLine -match [regex]::Escape($dir))
     } | ForEach-Object { Write-Host "stop orphan $($_.Name) ($($_.ProcessId))"; Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     docker rm -f tiny-e2e-pg 2>$null | Out-Null
-    if ($Phase -in 'call', 'collect') {
+    if ($Phase -in 'call', 'collect' -or $Stop) {
         ssh $VmHost "bash $VmDir/src/scripts/e2e/vm-desktop.sh stop $VmDir/run 2>/dev/null; true" | Out-Null
         adb -s $Serial shell am force-stop dev.tinyclient.app 2>$null
     }
@@ -169,7 +170,8 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
     if (-not (Test-Path (Join-Path $seedDir 'Cargo.lock'))) { Copy-Item (Join-Path $TinyServerDir 'Cargo.lock') $seedDir }
     cargo build -q --manifest-path (Join-Path $seedDir 'Cargo.toml')
     if ($LASTEXITCODE) { throw 'tiny-seed build failed' }
-    cargo build -q -p tinyserver --manifest-path (Join-Path $TinyServerDir 'Cargo.toml')
+    # Our own target directory: the shared worktree's target/ has been cleaned under a running test.
+    cargo build -q -p tinyserver --manifest-path (Join-Path $TinyServerDir 'Cargo.toml') --target-dir $ServerTarget
     if ($LASTEXITCODE) { throw 'tinyserver build failed' }
 
     $env:DATABASE_URL_MIGRATE = $MigrateUrl
@@ -191,6 +193,13 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
     Save-Pid 'fake-oidc' $oidc.Id
     Wait-Http "http://127.0.0.1:$OidcPort/.well-known/openid-configuration" | Out-Null
 
+    Start-TinyServer
+    Write-Host "room: $($seed.room.name) $($seed.room.id)"
+}
+
+# `tinyserver serve` on the database Start-Server made; also -Phase serve after a crash. Run under
+# cmd so its exit code lands in the log: a debug tinyserver has died silently when a call ended.
+function Start-TinyServer {
     $tailnet = (tailscale ip -4 2>$null | Select-Object -First 1)
     $lan = (Get-NetIPAddress -AddressFamily IPv4 -InterfaceAlias 'Ethernet', 'Wi-Fi' -ErrorAction SilentlyContinue | Select-Object -First 1).IPAddress
     $env:BIND = "0.0.0.0:$HttpPort"
@@ -205,13 +214,18 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
     $env:TINYSERVER_OIDC_CLIENT_SECRET = 'dev-only'
     $env:TINYSERVER_ALLOW_FAKE_SCAN = '1'
     $env:RUST_LOG = 'info,sfu=debug,api::live=debug'
-    $exe = Join-Path $TinyServerDir 'target\debug\tinyserver.exe'
-    $srv = Start-Process -PassThru -WindowStyle Hidden $exe -ArgumentList 'serve' -WorkingDirectory $State `
-        -RedirectStandardOutput (Join-Path $Logs 'tinyserver.out.log') -RedirectStandardError (Join-Path $Logs 'tinyserver.log')
-    Save-Pid 'tinyserver' $srv.Id
+    $exe = Join-Path $ServerTarget 'debug\tinyserver.exe'
+    $env:DATABASE_URL_MIGRATE = $MigrateUrl
+    $env:DATABASE_URL = $RuntimeUrl
+    $log = Join-Path $Logs 'tinyserver.log'
+    $wrap = Join-Path $State 'tinyserver.cmd'
+    "@`"$exe`" serve >> `"$log.out`" 2>> `"$log`"`r`n@echo tinyserver exited with code %errorlevel% >> `"$log`"`r`n" | Set-Content -NoNewline $wrap
+    $srv = Start-Process -PassThru -WindowStyle Hidden cmd -WorkingDirectory $State -ArgumentList '/c', "`"$wrap`""
+    Save-Pid 'tinyserver-cmd' $srv.Id
     $health = Wait-Http "http://127.0.0.1:$HttpPort/health" 90
+    $child = Get-CimInstance Win32_Process -Filter "ParentProcessId=$($srv.Id) and Name='tinyserver.exe'"
+    Save-Pid 'tinyserver' $child.ProcessId
     Write-Host "tinyserver up: $($health | ConvertTo-Json -Compress)"
-    Write-Host "room: $($seed.room.name) $($seed.room.id)"
 }
 
 function Get-Seed { Get-Content (Join-Path $State 'seed.json') -Raw | ConvertFrom-Json }
@@ -349,6 +363,7 @@ function Save-Evidence {
 if ($Phase -in 'server', 'all', 'call') { Start-Server }
 if ($Phase -in 'desktop', 'all') { Start-Desktop }
 if ($Phase -in 'android', 'all') { Push-AndroidSession }
+if ($Phase -eq 'serve') { Start-TinyServer }
 if ($Phase -eq 'vm') { Start-Vm }
 if ($Phase -eq 'phone') { Start-Android }
 if ($Phase -eq 'collect') { Save-Evidence }
