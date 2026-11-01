@@ -207,7 +207,7 @@ Some calls never carry on unencrypted, and the panel offers no button, only leav
 - with **Only join end-to-end encrypted calls** on (Settings › Privacy › Calls,
   `require_call_e2ee`, off by default because an older tinyserver or one older app in a room
   cannot do it);
-- on an **Incognito host** (`incognito.tinyclient.io`, `tinycloud.chat` and names under them),
+- on an **Incognito host** (`incognito.tinyclient.io` and names under it),
   whose communities promise end-to-end encrypted calls, whatever the setting;
 - in a room the server lists as **`e2ee_required`**.
 

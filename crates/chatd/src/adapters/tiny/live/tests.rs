@@ -1417,9 +1417,10 @@ fn an_incognito_host_or_a_requiring_room_never_carries_a_call_on_unencrypted() {
     assert_eq!(must_encrypt("chat.example.org", false, true), Ok(false));
     assert_eq!(must_encrypt("192.168.1.120", false, false), Ok(false), "a server with no e2ee is joined, and says so");
     // Incognito promises encrypted calls: required, and not joined at all without encryption.
-    assert_eq!(must_encrypt("c-7f3k2x9q.tinycloud.chat", false, true), Ok(true));
+    assert_eq!(must_encrypt("c-7f3k2x9q.incognito.tinyclient.io", false, true), Ok(true));
     assert_eq!(must_encrypt("incognito.tinyclient.io", false, false), Err(INCOGNITO_CANNOT_ENCRYPT));
-    assert_eq!(must_encrypt("eviltinycloud.chat", false, true), Ok(false), "only Incognito's own names");
+    assert_eq!(must_encrypt("evilincognito.tinyclient.io", false, true), Ok(false), "only Incognito's own names");
+    assert_eq!(must_encrypt("c-1.tinycloud.chat", false, true), Ok(false), "not a domain Incognito owns");
     // A room that requires it, on any server.
     assert_eq!(must_encrypt("chat.example.org", true, true), Ok(true));
     assert_eq!(must_encrypt("chat.example.org", true, false), Err(ROOM_CANNOT_ENCRYPT));

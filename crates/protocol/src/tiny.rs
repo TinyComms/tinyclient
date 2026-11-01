@@ -333,13 +333,13 @@ pub const TINY_FEATURE_AUDIT_QUERY: &str = "audit_query";
 pub const TINY_FEATURE_VOICE_MODERATION: &str = "voice_moderation";
 /// Calls can be end-to-end encrypted: MLS between the apps, which the server only relays.
 pub const TINY_FEATURE_E2EE_CALLS: &str = "e2ee_calls";
-/// The domains Incognito hosts communities under. A community there promises calls that are end
+/// The domain Incognito hosts communities under. A community there promises calls that are end
 /// to end encrypted, so tinyclient never carries one on unencrypted, whatever the server says.
-pub const INCOGNITO_DOMAINS: [&str; 2] = ["incognito.tinyclient.io", "tinycloud.chat"];
+pub const INCOGNITO_DOMAINS: [&str; 1] = ["incognito.tinyclient.io"];
 
-/// `host` is one of Incognito's, or a name under one: `c-7f3k2x9q.tinycloud.chat`. A host, not a
+/// `host` is Incognito's, or a name under it: `c-7f3k2x9q.incognito.tinyclient.io`. A host, not a
 /// URL: no scheme, port or path. Case and a trailing dot do not matter; a name that only ends in
-/// the same letters (`eviltinycloud.chat`) is not one.
+/// the same letters (`evilincognito.tinyclient.io`) is not one.
 pub fn incognito_host(host: &str) -> bool {
     let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
     INCOGNITO_DOMAINS.iter().any(|domain| host == *domain || host.strip_suffix(domain).is_some_and(|label| label.ends_with('.') && label.len() > 1))
@@ -1195,10 +1195,10 @@ mod tests {
 
     #[test]
     fn incognito_hosts_are_its_domains_and_the_names_under_them() {
-        for host in ["incognito.tinyclient.io", "c-7f3k2x9q.tinycloud.chat", "tinycloud.chat", "C-7F3K2.TinyCloud.Chat", "c-1.tinycloud.chat."] {
+        for host in ["incognito.tinyclient.io", "c-7f3k2x9q.incognito.tinyclient.io", "C-7F3K2.Incognito.TinyClient.IO", "c-1.incognito.tinyclient.io."] {
             assert!(incognito_host(host), "{host}");
         }
-        for host in ["eviltinycloud.chat", "tinycloud.chat.evil.example", "tinyclient.io", "chat.example.org", ".tinycloud.chat", "", "192.168.1.120", "localhost"] {
+        for host in ["evilincognito.tinyclient.io", "incognito.tinyclient.io.evil.example", "tinyclient.io", "chat.tinyclient.io", "tinycloud.chat", "c-1.tinycloud.chat", "chat.example.org", ".incognito.tinyclient.io", "", "192.168.1.120", "localhost"] {
             assert!(!incognito_host(host), "{host}");
         }
     }
