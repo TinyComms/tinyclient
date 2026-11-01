@@ -99,7 +99,7 @@ function Stop-Ours {
     } | ForEach-Object { Write-Host "stop orphan $($_.Name) ($($_.ProcessId))"; Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     docker rm -f tiny-e2e-pg 2>$null | Out-Null
     if ($Phase -in 'call', 'collect' -or $Stop) {
-        ssh $VmHost "bash $VmDir/src/scripts/e2e/vm-desktop.sh stop $VmDir/run 2>/dev/null; true" | Out-Null
+        ssh -n $VmHost "bash $VmDir/src/scripts/e2e/vm-desktop.sh stop $VmDir/run 2>/dev/null; true" | Out-Null
         adb -s $Serial shell am force-stop dev.tinyclient.app 2>$null
     }
 }
@@ -314,16 +314,16 @@ function Start-Vm {
         $tar = Join-Path $State 'src.tar.gz'
         git -C $Repo archive --format=tar.gz -o $tar HEAD
         scp -q $tar "${VmHost}:/tmp/tiny-e2e-src.tar.gz"
-        ssh $VmHost "rm -rf $VmDir/src && mkdir -p $VmDir/src && tar xzf /tmp/tiny-e2e-src.tar.gz -C $VmDir/src && rm /tmp/tiny-e2e-src.tar.gz"
-        ssh $VmHost "bash $VmDir/src/scripts/e2e/vm-desktop.sh build $VmDir/src > $VmDir/build.log 2>&1; echo build exit `$?"
+        ssh -n $VmHost "rm -rf $VmDir/src && mkdir -p $VmDir/src && tar xzf /tmp/tiny-e2e-src.tar.gz -C $VmDir/src && rm /tmp/tiny-e2e-src.tar.gz"
+        ssh -n $VmHost "bash $VmDir/src/scripts/e2e/vm-desktop.sh build $VmDir/src > $VmDir/build.log 2>&1; echo build exit `$?"
     }
     # The VM must reach this PC's server: health over the LAN.
-    ssh $VmHost "curl -s --max-time 5 http://${lan}:$HttpPort/health" | Write-Host
+    ssh -n $VmHost "curl -s --max-time 5 http://${lan}:$HttpPort/health" | Write-Host
     $a = $seed.sessions.a.psobject.Copy()
     $a.base_url = "http://${lan}:$HttpPort"
     $session = ($a | ConvertTo-Json -Compress) -replace "'", "'\''"
     $join = "|$($seed.room.name)|share|watch"
-    ssh $VmHost "bash $VmDir/src/scripts/e2e/vm-desktop.sh stop $VmDir/run >/dev/null 2>&1; rm -rf $VmDir/run; bash $VmDir/src/scripts/e2e/vm-desktop.sh start $VmDir/src $VmDir/run '$session' '$join' tone:440"
+    ssh -n $VmHost "bash $VmDir/src/scripts/e2e/vm-desktop.sh stop $VmDir/run >/dev/null 2>&1; rm -rf $VmDir/run; bash $VmDir/src/scripts/e2e/vm-desktop.sh start $VmDir/src $VmDir/run '$session' '$join' tone:440"
 }
 
 # Bea on the emulator: her session, the debug APK, then a debug launch that opens the room and
@@ -367,8 +367,8 @@ function Save-Evidence {
     adb -s $Serial logcat -d > (Join-Path $Proof 'android-logcat.txt')
     # PowerShell's > is text; cmd's keeps the bytes.
     cmd /c "adb -s $Serial exec-out run-as dev.tinyclient.app cat files/played.pcm > `"$(Join-Path $Proof 'android-played.pcm')`""
-    ssh $VmHost "bash $VmDir/src/scripts/e2e/vm-desktop.sh stop $VmDir/run"
-    ssh $VmHost "cd $VmDir/run && tar czf /tmp/tiny-e2e-vm.tgz screen.mp4 played.pcm tinyclient.log ffmpeg.log data/logs 2>/dev/null; true"
+    ssh -n $VmHost "bash $VmDir/src/scripts/e2e/vm-desktop.sh stop $VmDir/run"
+    ssh -n $VmHost "cd $VmDir/run && tar czf /tmp/tiny-e2e-vm.tgz screen.mp4 played.pcm tinyclient.log ffmpeg.log data/logs 2>/dev/null; true"
     scp -q "${VmHost}:/tmp/tiny-e2e-vm.tgz" (Join-Path $Proof 'vm.tgz')
     tar xzf (Join-Path $Proof 'vm.tgz') -C $Proof
     Remove-Item (Join-Path $Proof 'vm.tgz')
