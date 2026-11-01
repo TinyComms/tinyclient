@@ -102,19 +102,8 @@ impl H264Decoder for Decoder {
         let Some(out) = out else {
             return Err("The video decoder stopped.".to_owned());
         };
-        Ok(picture(&out, at))
+        Ok(super::wire::decoded_picture(&out).map(|(width, height, data)| VideoFrame { width, height, format: PixelFormat::I420, data: data.to_vec(), timestamp_us: at }))
     }
-}
-
-/// The decoder's answer: 8 bytes of width and height (big-endian), then I420; empty for none.
-fn picture(out: &[u8], at: u64) -> Option<VideoFrame> {
-    if out.len() < 8 {
-        return None;
-    }
-    let width = u32::from_be_bytes([out[0], out[1], out[2], out[3]]);
-    let height = u32::from_be_bytes([out[4], out[5], out[6], out[7]]);
-    let frame = VideoFrame { width, height, format: PixelFormat::I420, data: out[8..].to_vec(), timestamp_us: at };
-    frame.is_whole().then_some(frame)
 }
 
 impl Drop for Decoder {

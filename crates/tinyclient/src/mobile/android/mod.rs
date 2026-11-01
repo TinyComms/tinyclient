@@ -22,6 +22,7 @@ mod loopback;
 mod natives;
 mod selfie;
 mod web;
+mod wire;
 
 use crate::gui::call::phone::hooks;
 use jni::objects::JValue;
@@ -122,18 +123,6 @@ fn sentence(what: &str, class: &'static str, method: &str, sig: &str, args: &[JV
     words.map_or(Ok(()), Err)
 }
 
-fn refusal(permission: Permission, code: i32) -> String {
-    let (thing, why) = match permission {
-        Permission::Microphone => ("microphone", "for calls"),
-        Permission::Camera => ("camera", "to send video"),
-    };
-    match code {
-        2 => format!("Tiny isn't allowed to use the {thing}. Turn it on in Settings to use it {why}."),
-        3 => format!("Tiny can't ask for the {thing} right now. Open the app and try again."),
-        _ => format!("Tiny needs the {thing} {why}."),
-    }
-}
-
 impl Platform for Android {
     fn request_permission(&self, permission: Permission) -> Result<(), String> {
         let kind = match permission {
@@ -150,7 +139,7 @@ impl Platform for Android {
         if code == 0 {
             Ok(())
         } else {
-            Err(refusal(permission, code))
+            Err(wire::refusal(permission == Permission::Microphone, code))
         }
     }
 

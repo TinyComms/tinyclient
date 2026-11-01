@@ -72,10 +72,7 @@ impl WebPageHandle for Page {
         let Some(state) = self.text("read the sign-in page", "state", "()Ljava/lang/String;", &[]) else {
             return PageState { url: String::new(), closed: false, load_failed: false };
         };
-        let mut chars = state.chars();
-        let closed = chars.next() == Some('1');
-        let load_failed = chars.next() == Some('1');
-        PageState { url: chars.as_str().to_owned(), closed, load_failed }
+        super::wire::page_state(&state)
     }
 
     fn evaluate(&mut self, script: &str) -> Option<String> {

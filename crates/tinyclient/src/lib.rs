@@ -40,6 +40,10 @@ mod view;
 /// sign-in (`src/mobile.rs`). Its platform parts are stubs for the Android and iOS work to fill.
 #[cfg(all(feature = "mobile", any(target_os = "ios", target_os = "android")))]
 mod mobile;
+/// The Android layer's JNI-free half, checked by the host's tests.
+#[cfg(all(test, feature = "mobile", not(target_os = "android")))]
+#[path = "mobile/android/wire.rs"]
+mod android_wire;
 
 /// Starts the window on iOS.
 ///

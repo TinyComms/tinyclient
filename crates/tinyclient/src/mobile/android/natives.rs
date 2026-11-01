@@ -86,11 +86,7 @@ pub extern "system" fn Java_dev_tinyclient_app_TinyPlatform_nativeNavigate(mut e
         let Some(navigate) = PAGES.get(page) else {
             return "A".to_owned();
         };
-        match navigate(&url) {
-            Navigation::Allow => "A".to_owned(),
-            Navigation::Cancel => "C".to_owned(),
-            Navigation::Load(other) => format!("L{other}"),
-        }
+        super::wire::navigation_word(navigate(&url))
     }))
     .unwrap_or_else(|_| "A".to_owned());
     env.new_string(answer).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
