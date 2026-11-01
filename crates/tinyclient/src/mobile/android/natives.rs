@@ -103,6 +103,28 @@ pub extern "system" fn Java_dev_tinyclient_app_TinyPlatform_nativeSelfTest(mut e
     }));
 }
 
+/// A debug launch's `tiny.join` extra (`<server>|<room>`), with `tiny.camera` and `tiny.speaker`:
+/// open that room and join its call once signed in (`gui::debug_launch`). Debug builds only; Java
+/// calls it only when the app is debuggable.
+#[cfg(debug_assertions)]
+#[no_mangle]
+pub extern "system" fn Java_dev_tinyclient_app_TinyPlatform_nativeDebugJoin(mut env: JNIEnv, _class: JClass, join: JString, camera: jni::sys::jboolean, speaker: jni::sys::jboolean) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let Ok(text) = env.get_string(&join) else {
+            return;
+        };
+        let text: String = text.into();
+        match crate::gui::debug_launch::Launch::parse(&text) {
+            Some(mut launch) => {
+                launch.camera |= camera != 0;
+                launch.speaker |= speaker != 0;
+                crate::gui::debug_launch::request(launch);
+            }
+            None => log::warn!("tinyclient: debug launch: tiny.join {text:?} is not <server>|<room>"),
+        }
+    }));
+}
+
 #[no_mangle]
 pub extern "system" fn Java_dev_tinyclient_app_TinyPlatform_nativeRedirected(mut env: JNIEnv, _class: JClass, auth: jlong, url: JString) {
     let _ = catch_unwind(AssertUnwindSafe(|| {

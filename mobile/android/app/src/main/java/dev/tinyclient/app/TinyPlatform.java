@@ -216,4 +216,6 @@ public final class TinyPlatform {
      * {@code tiny.selftest} (adb shell am start -n dev.tinyclient.app/.TinyActivity --es tiny.selftest codec).
      */
     static native void nativeSelfTest(String what);
+    /** Debug builds only: open a Tiny room and join its call (gui/debug_launch.rs). */
+    static native void nativeDebugJoin(String join, boolean camera, boolean speaker);
 }
