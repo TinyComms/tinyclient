@@ -310,7 +310,7 @@ fn stage(pane: &mut Pane, window: &mut Window, cx: &mut Context<Pane>) {
     let at = gpui::point(bounds.right() - px(120.), bounds.top() + px(12.));
     // A phone has no hover: what a held finger brings up is the menu's sheet.
     if pane.script.menu.is_some() || (pane.script.hover.is_some() && crate::gui::phone::active()) {
-        pane.open_menu(message, at, cx);
+        pane.open_menu(message, at, window, cx);
     } else if pane.script.picker.is_some() {
         pane.open_picker(&id, gpui::point(bounds.right() - px(60.), bounds.top()), window, cx);
     } else if pane.script.confirm.is_some() {

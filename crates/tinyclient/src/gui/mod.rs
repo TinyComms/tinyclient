@@ -235,7 +235,8 @@ fn shell_bindings() -> Vec<KeyBinding> {
 /// `out-1.png` …, to see moving pictures move). On a Tiny server (`--mode tiny`): `--tiny-room
 /// N` (the Nth channel), `--tiny-menu header|channel|person:N` (N: the Nth seat, `:sub` adds its
 /// Move submenu), `--tiny-modal invite|code|kick|ban|profile`, `--tiny-settings`, `--tiny-card N`
-/// (the Nth member's hover card).
+/// (the Nth member's hover card), `--tiny-setup first|custom|refused|nopasskeys|privacy|change|member` (first-run
+/// setup, or Server Settings › Privacy, over a made-up outline).
 ///
 /// `--demo` draws made-up data instead of live data: a fake chatd answers every request
 /// (`shot_demo`), chatd is never started or asked, and nobody's real chats are read.

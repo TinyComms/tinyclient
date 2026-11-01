@@ -15,7 +15,7 @@ use gpui::{div, prelude::*, px, AnyElement, Context, MouseButton, MouseMoveEvent
 impl Shell {
     pub(in crate::gui) fn tiny_layer(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let state = &self.tiny_state;
-        if state.float.is_none() && state.modal.is_none() && state.settings.is_none() && state.card.is_none() {
+        if state.float.is_none() && state.modal.is_none() && state.settings.is_none() && state.card.is_none() && !state.setup.prompt {
             return None;
         }
         let page = self.tiny_page_facts()?;
@@ -49,6 +49,10 @@ impl Shell {
         if let Some(modal) = state.modal.clone() {
             let panel = self.tiny_modal(&page, &modal, window, cx);
             layer = layer.child(super::modals::layer(panel, cx));
+        }
+        // Above everything else, until the owner answers or puts it off with Later or Escape.
+        if state.setup.prompt {
+            layer = layer.child(self.tiny_setup_overlay(&page, cx));
         }
         Some(layer.into_any_element())
     }

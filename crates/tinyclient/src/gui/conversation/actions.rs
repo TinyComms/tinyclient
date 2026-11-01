@@ -7,8 +7,9 @@ use super::icons::{icon, Icon};
 use super::rows::Item;
 use super::{Pane, PaneEvent};
 use crate::client::ask;
+use crate::gui::components::place::{max_height, placed, Layer, Place};
 use crate::gui::components::{
-    button, fade_in, menu, menu_item, menu_item_danger, menu_separator, modal, modal_body, modal_buttons, popover, tip,
+    button, fade_in, menu, menu_item, menu_item_danger, menu_separator, menu_step, modal, modal_body, modal_buttons, popover, tip,
     ButtonKind,
 };
 use crate::gui::theme::{self, Type};
@@ -27,17 +28,38 @@ const TOOLBAR_REACH: f32 = 320.;
 /// that a scroll never reads as one, short enough that the actions feel like an answer.
 pub(super) const LONG_PRESS: std::time::Duration = std::time::Duration::from_millis(450);
 
+const TOOLBAR_H: f32 = 30.;
+
+/// Top of the toolbar within its row. Negative sits above the row. When that rise would
+/// leave the viewport, the bar starts at the viewport's top edge, inside the row.
+pub(super) fn toolbar_offset(row_top: f32, viewport_top: f32) -> f32 {
+    if row_top - TOOLBAR_RISE >= viewport_top {
+        -TOOLBAR_RISE
+    } else {
+        (viewport_top - row_top).max(0.)
+    }
+}
+
+fn toolbar_box(row: Bounds<Pixels>, viewport: Bounds<Pixels>) -> Bounds<Pixels> {
+    let offset = toolbar_offset(f32::from(row.top()), f32::from(viewport.top()));
+    let top = row.top() + px(offset);
+    let bottom = if offset < 0. {
+        row.top() + px(TOOLBAR_RISE + 8.)
+    } else {
+        top + px(TOOLBAR_H)
+    };
+    Bounds::from_corners(
+        point(row.right() - px(TOOLBAR_REACH), top),
+        point(row.right(), bottom),
+    )
+}
+
 /// Hover ownership is geometric: the toolbar occludes the pane's hitbox, but
 /// crossing onto its buttons must keep the current hover owner.
 fn pointed_row(position: Point<Pixels>, viewport: Bounds<Pixels>, seen: &[(usize, Bounds<Pixels>)], held: Option<usize>) -> Option<usize> {
     if !viewport.contains(&position) { return None; }
-    let toolbar = held.and_then(|held| seen.iter().find(|(ix, bounds)| {
-        let rise = Bounds::from_corners(
-            point(bounds.right() - px(TOOLBAR_REACH), bounds.top() - px(TOOLBAR_RISE)),
-            point(bounds.right(), bounds.top() + px(TOOLBAR_RISE + 8.)),
-        );
-        *ix == held && rise.contains(&position)
-    }));
+    let toolbar = held.and_then(|held| seen.iter().find(|(ix, bounds)|
+        *ix == held && toolbar_box(*bounds, viewport).contains(&position)));
     toolbar.or_else(|| seen.iter().find(|(_, bounds)| bounds.contains(&position))).map(|(ix, _)| *ix)
 }
 
@@ -45,6 +67,8 @@ fn pointed_row(position: Point<Pixels>, viewport: Bounds<Pixels>, seen: &[(usize
 pub struct Menu {
     pub message: Rc<Message>,
     pub at: Point<Pixels>,
+    /// Which actionable row the keyboard has selected.
+    pub cursor: usize,
 }
 
 /// The reaction picker, open for a message.
@@ -171,6 +195,72 @@ fn glyph_of(emoji: &str) -> Div {
     div().text_size(px(15.)).line_height(px(20.)).child(SharedString::from(emoji::display(emoji)))
 }
 
+/// One row of a message menu that a click or a key can run. The order is [`menu_acts`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MenuAct {
+    Retry,
+    Copy,
+    /// An unsent message, removed here without asking.
+    Drop,
+    Quick(usize),
+    Reply,
+    Thread,
+    React,
+    Edit,
+    Link,
+    Open,
+    /// A sent message: ask, unless the click held Shift.
+    Delete,
+}
+
+/// What the menu offers, in the order it is drawn and the order Up and Down move.
+/// `quick` is how many quick reactions the menu shows. An unsent message ignores the rest.
+fn menu_acts(
+    can: Can,
+    failed: bool,
+    quick: usize,
+    adds: bool,
+    has_text: bool,
+    has_link: bool,
+) -> Vec<MenuAct> {
+    if can.unsent {
+        let mut acts = Vec::new();
+        if failed {
+            acts.push(MenuAct::Retry);
+        }
+        acts.push(MenuAct::Copy);
+        acts.push(MenuAct::Drop);
+        return acts;
+    }
+    let mut acts = Vec::new();
+    for slot in 0..quick {
+        acts.push(MenuAct::Quick(slot));
+    }
+    if can.reply {
+        acts.push(MenuAct::Reply);
+    }
+    if can.thread {
+        acts.push(MenuAct::Thread);
+    }
+    if can.act && adds {
+        acts.push(MenuAct::React);
+    }
+    if can.edit {
+        acts.push(MenuAct::Edit);
+    }
+    if has_text {
+        acts.push(MenuAct::Copy);
+    }
+    if has_link {
+        acts.push(MenuAct::Link);
+        acts.push(MenuAct::Open);
+    }
+    if can.delete {
+        acts.push(MenuAct::Delete);
+    }
+    acts
+}
+
 impl Pane {
     fn network(&self) -> Network {
         self.open.as_ref().map_or(Network::Discord, |open| open.key.network)
@@ -287,26 +377,26 @@ impl Pane {
 
     /// A phone's press on a message went down: the actions come up if it holds still for
     /// [`LONG_PRESS`]. Any other press clears the ones showing, so a tap elsewhere dismisses them.
-    pub(super) fn press_message(&mut self, id: &str, at: Point<Pixels>, cx: &mut Context<Self>) {
+    pub(super) fn press_message(&mut self, id: &str, at: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
         self.hover = None;
         let id = id.to_owned();
-        let task = cx.spawn(async move |this, cx| {
+        let task = cx.spawn_in(window, async move |this, cx| {
             cx.background_executor().timer(LONG_PRESS).await;
-            let _ = this.update(cx, |this, cx| this.hold_message(&id, at, cx));
+            let _ = this.update_in(cx, |this, window, cx| this.hold_message(&id, at, window, cx));
         });
         self.press = Some((task, (f32::from(at.x), f32::from(at.y))));
     }
 
     /// A press on a message held: its actions come up as a sheet, as the desktop's right-click
     /// menu does, for one that can be acted on or that did not go.
-    pub(super) fn hold_message(&mut self, id: &str, at: Point<Pixels>, cx: &mut Context<Self>) {
+    pub(super) fn hold_message(&mut self, id: &str, at: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
         self.hover = None;
         let Some(message) = self.find(id) else {
             return;
         };
         let can = self.can(&message);
         if can.act || can.unsent {
-            self.open_menu(message, at, cx);
+            self.open_menu(message, at, window, cx);
         }
     }
 
@@ -341,6 +431,25 @@ impl Pane {
         true
     }
 
+    /// Where this row's toolbar sits. Above the row when the rise stays in the viewport,
+    /// and at the viewport's top edge inside the row when it would not.
+    fn toolbar_rise(&self, message: &Message) -> f32 {
+        let seen = self.seen.borrow();
+        let row = seen.iter().find(|(ix, _)| {
+            self.items
+                .get(*ix)
+                .and_then(Item::message)
+                .is_some_and(|row| row.id == message.id)
+        });
+        match row {
+            Some((_, bounds)) => toolbar_offset(
+                f32::from(bounds.top()),
+                f32::from(self.list.viewport_bounds().top()),
+            ),
+            None => -TOOLBAR_RISE,
+        }
+    }
+
     /// The toolbar of the row under the pointer: one instance, straddling the row's top edge.
     pub(super) fn toolbar(&self, message: &Rc<Message>, cx: &mut Context<Self>) -> Option<AnyElement> {
         // Not while text is being selected: it would sit under the drag. Never over a menu or
@@ -357,7 +466,7 @@ impl Pane {
         let phone = crate::gui::phone::active();
         let mut bar = div()
             .absolute()
-            .top(px(-TOOLBAR_RISE))
+            .top(px(self.toolbar_rise(message)))
             .right(px(16.))
             .h(px(30.))
             .p(px(2.))
@@ -419,8 +528,8 @@ impl Pane {
         bar = bar.child(
             tool("more", icon(Icon::More, 16., theme::text_soft()))
                 .when(!phone, |t| t.tooltip(tip("More", None)))
-                .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
-                    this.open_menu(more.clone(), event.position(), cx);
+                .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                    this.open_menu(more.clone(), event.position(), window, cx);
                 })),
         );
         Some(bar.into_any_element())
@@ -539,16 +648,109 @@ impl Pane {
 
     // The menu.
 
-    pub(super) fn open_menu(&mut self, message: Rc<Message>, at: Point<Pixels>, cx: &mut Context<Self>) {
+    pub(super) fn open_menu(&mut self, message: Rc<Message>, at: Point<Pixels>,
+        window: &mut Window, cx: &mut Context<Self>) {
         self.close_picker(cx);
         self.hover = Some(message.id.clone());
-        self.menu = Some(Menu { message, at });
+        self.menu = Some(Menu { message, at,
+            cursor: 0, });
+        window.focus(&self.focus, cx);
         cx.notify();
     }
 
     fn close_menu(&mut self, cx: &mut Context<Self>) {
         if self.menu.take().is_some() {
             cx.notify();
+        }
+    }
+
+    /// The actionable rows of the open menu, and which one the keyboard has selected.
+    fn menu_state(&self, cx: &Context<Self>) -> Option<(Vec<MenuAct>, usize)> {
+        let menu = self.menu.as_ref()?;
+        let message = &menu.message;
+        let can = self.can(message);
+        let quick = if can.unsent || !can.act {
+            0
+        } else {
+            emoji::quick(self.rules(), &message.reactions, 6).len()
+        };
+        let acts = menu_acts(
+            can,
+            matches!(message.state, SendState::Failed { .. }),
+            quick,
+            self.adds(message),
+            !message.text.is_empty(),
+            self.link_of(message, cx).is_some(),
+        );
+        let cursor = if acts.is_empty() {
+            0
+        } else {
+            menu.cursor.min(acts.len() - 1)
+        };
+        Some((acts, cursor))
+    }
+
+    /// Does the row the keyboard has selected. A click on Delete passes Shift through as `at_once`.
+    fn run_act(
+        &mut self,
+        act: MenuAct,
+        at_once: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(menu) = self.menu.as_ref() else {
+            return;
+        };
+        let message = menu.message.clone();
+        let at = menu.at;
+        let emoji = match act {
+            MenuAct::Quick(slot) => emoji::quick(self.rules(), &message.reactions, 6)
+                .get(slot)
+                .cloned(),
+            _ => None,
+        };
+        let link = match act {
+            MenuAct::Link | MenuAct::Open => self.link_of(&message, cx),
+            _ => None,
+        };
+        self.close_menu(cx);
+        match act {
+            MenuAct::Retry => {
+                let (Some(conversation), client_id) = (
+                    self.key().cloned(),
+                    message
+                        .client_id
+                        .clone()
+                        .unwrap_or_else(|| message.id.clone()),
+                ) else {
+                    return;
+                };
+                let _ = self.shell.update(cx, |shell, cx| {
+                    shell.retry_send(conversation, client_id, cx)
+                });
+            }
+            MenuAct::Copy => self.copy_text(&message, cx),
+            MenuAct::Drop => self.delete(&message, true, window, cx),
+            MenuAct::Quick(_) => {
+                if let Some(emoji) = emoji {
+                    self.react_toggle(&message.id, &emoji, cx);
+                }
+            }
+            MenuAct::Reply => self.reply(&message, window, cx),
+            MenuAct::Thread => cx.emit(PaneEvent::OpenThread(message)),
+            MenuAct::React => self.open_picker(&message.id, at, window, cx),
+            MenuAct::Edit => self.edit(&message, window, cx),
+            MenuAct::Link => {
+                if let Some(link) = link {
+                    cx.write_to_clipboard(ClipboardItem::new_string(link));
+                }
+            }
+            MenuAct::Open => {
+                if let Some(link) = link {
+                    cx.open_url(&link);
+                }
+            }
+            MenuAct::Delete => self.delete(&message, at_once, window, cx),
         }
     }
 
@@ -570,7 +772,7 @@ impl Pane {
     fn menu_sheet(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         use crate::gui::composer::picker::{sheet_panel, sheet_scrim};
         use crate::gui::phone::tokens::{self, PhoneType};
-        let Menu { message, at } = self.menu.as_ref()?;
+        let Menu { message, at, .. } = self.menu.as_ref()?;
         let can = self.can(message);
         let network = self.network().label();
         let row_height = (tokens::scaled(22.) + 26.).max(48.);
@@ -750,105 +952,100 @@ impl Pane {
         Some(deferred(anchored().position(point(px(0.), px(0.))).child(fade_in("message-sheet", 160, scrim))).priority(1).into_any_element())
     }
 
-    fn menu_layer(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let Menu { message, at } = self.menu.as_ref()?;
-        let can = self.can(message);
+    fn menu_layer(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let shown = self.menu.as_ref()?;
+        let message = shown.message.clone();
+        let at = shown.at;
+        let can = self.can(&message);
         let network = self.network().label();
+        let chosen = self
+            .menu_state(cx)
+            .and_then(|(acts, cursor)| acts.get(cursor).copied());
+        let lit = |act: MenuAct| chosen == Some(act);
         let mut items = menu().w(px(248.));
-        let then = |act: fn(&mut Pane, &Rc<Message>, &gpui::ClickEvent, &mut Window, &mut Context<Pane>)| {
-            let message = message.clone();
-            cx.listener(move |this: &mut Pane, event: &gpui::ClickEvent, window, cx| {
-                this.close_menu(cx);
-                act(this, &message, event, window, cx);
+        let go = |act: MenuAct| {
+            cx.listener(move |this: &mut Pane, _: &gpui::ClickEvent, window, cx| {
+                this.run_act(
+                act, false, window, cx)
             })
         };
         if can.unsent {
             // A row that did not go: send it again, copy it, or drop it.
             if matches!(message.state, SendState::Failed { .. }) {
-                items = items.child(menu_item("retry", Some("icons/refresh-cw.svg"), "Retry", None).on_click(then(
-                    |this, message, _, _, cx| {
-                        let (Some(conversation), client_id) = (this.key().cloned(), message.client_id.clone().unwrap_or_else(|| message.id.clone()))
-                        else {
-                            return;
-                        };
-                        let _ = this.shell.update(cx, |shell, cx| shell.retry_send(conversation, client_id, cx));
-                    },
+                items = items.child(menu_item("retry", Some("icons/refresh-cw.svg"), "Retry", None).when(lit(MenuAct::Retry), |row| row.bg (theme::selected())).on_click(go(MenuAct::Retry
                 )));
             }
             items = items
-                .child(menu_item("copy", Some("icons/copy.svg"), "Copy text", None).on_click(then(|this, message, _, _, cx| this.copy_text(message, cx))))
+                .child(menu_item("copy", Some("icons/copy.svg"), "Copy text", None).when(lit(MenuAct::Copy), |row| row.bg(theme::selected()))
+                        .on_click(go(MenuAct::Copy)))
                 .child(menu_separator())
-                .child(menu_item_danger("delete", Some("icons/trash-2.svg"), "Delete").on_click(then(|this, message, _, window, cx| {
-                    this.delete(message, true, window, cx);
-                })));
+                .child(menu_item_danger("delete", Some("icons/trash-2.svg"), "Delete").when(lit(MenuAct::Drop), |row| row.bg(theme::danger_soft()))
+                        .on_click(go(MenuAct::Drop)));
         } else {
             let quick = if can.act { emoji::quick(self.rules(), &message.reactions, 6) } else { Vec::new() };
             if !quick.is_empty() {
                 let mut strip = div().h(px(36.)).px(px(2.)).flex().items_center().justify_between();
                 for (slot, quick) in quick.into_iter().enumerate() {
-                    let (id, react) = (message.id.clone(), quick.clone());
-                    strip = strip.child(tool(("menu-quick", slot), glyph_of(&quick).text_size(px(18.))).size(px(32.)).on_click(cx.listener(
-                        move |this, _, _, cx| {
-                            this.close_menu(cx);
-                            this.react_toggle(&id, &react, cx);
-                        },
+                    let act = MenuAct::Quick (slot);
+                    strip = strip.child(tool(("menu-quick", slot), glyph_of(&quick).text_size(px(18.))).size(px(32.)).when(lit(act), |row| row.bg(theme::selected()))
+                            .on_click(go(act
                     )));
                 }
                 items = items.child(strip).child(menu_separator());
             }
             if can.reply {
-                items = items.child(menu_item("reply", Some("icons/corner-up-left.svg"), "Reply", None).on_click(then(|this, message, _, window, cx| this.reply(message, window, cx))));
+                items = items.child(menu_item("reply", Some("icons/corner-up-left.svg"), "Reply", None).when(lit(MenuAct::Reply), |row| row.bg(theme::selected()))
+                        .on_click(go(MenuAct::Reply)));
             }
             if can.thread {
-                items = items.child(menu_item("thread", Some("icons/message-square.svg"), thread_label(message), None).on_click(then(
-                    |_, message, _, _, cx| cx.emit(PaneEvent::OpenThread(message.clone())),
+                items = items.child(menu_item("thread", Some("icons/message-square.svg"), thread_label(&message), None).when(lit(MenuAct::Thread), |row| row.bg(theme::selected()))
+                    .on_click(go(MenuAct::Thread
                 )));
             }
-            if can.act && self.adds(message) {
-                let at = *at;
-                let id = message.id.clone();
-                items = items.child(menu_item("react", Some("icons/smile-plus.svg"), "React", None).on_click(cx.listener(
-                    move |this, _, window, cx| {
-                        this.close_menu(cx);
-                        this.open_picker(&id, at, window, cx);
-                    },
-                )));
+            if can.act && self.adds(&message) {
+                items = items.child(menu_item("react", Some("icons/smile-plus.svg"), "React", None).when(lit(MenuAct::React), |row| row.bg(theme::selected()))
+                        .on_click(go(MenuAct::React)));
             }
             if can.edit {
-                items = items.child(menu_item("edit", Some("icons/pencil.svg"), "Edit", None).on_click(then(|this, message, _, window, cx| this.edit(message, window, cx))));
+                items = items.child(menu_item("edit", Some("icons/pencil.svg"), "Edit", None).when(lit(MenuAct::Edit), |row| row.bg(theme::selected()))
+                        .on_click(go(MenuAct::Edit)));
             }
-            let selected = self.selection.as_ref().is_some_and(|s| s.message == message.id && s.head.is_some());
+            let selected = self.selection.as_ref().is_some_and(|selection| {
+                selection.message == message.id && selection.head.is_some()
+            });
             let copy = if selected { "Copy selection" } else { "Copy text" };
             if !message.text.is_empty() {
                 items = items
                     .child(menu_separator())
-                    .child(menu_item("copy", Some("icons/copy.svg"), copy, Some("⌘C")).on_click(then(|this, message, _, _, cx| this.copy_text(message, cx))));
+                    .child(menu_item("copy", Some("icons/copy.svg"), copy, Some("⌘C")).when(lit(MenuAct::Copy), |row| row.bg(theme::selected()))
+                        .on_click(go(MenuAct::Copy)));
             }
-            if let Some(link) = self.link_of(message, cx) {
-                let open = link.clone();
+            if self.link_of(&message, cx).is_some() {
                 items = items
-                    .child(menu_item("link", Some("icons/link.svg"), "Copy link", None).on_click(cx.listener(move |this, _, _, cx| {
-                        this.close_menu(cx);
-                        cx.write_to_clipboard(ClipboardItem::new_string(link.clone()));
-                    })))
+                    .child(menu_item("link", Some("icons/link.svg"), "Copy link", None).when(lit(MenuAct::Link), |row| row.bg(theme::selected()))
+                            .on_click(go(MenuAct::Link)))
                     .child(menu_separator())
-                    .child(menu_item("open-in", Some("icons/external-link.svg"), format!("Open in {network}"), None).on_click(cx.listener(
-                        move |this, _, _, cx| {
-                            this.close_menu(cx);
-                            cx.open_url(&open);
-                        },
+                    .child(menu_item("open-in", Some("icons/external-link.svg"), format!("Open in {network}"), None).when(lit(MenuAct::Open), |row| row.bg(theme::selected()))
+                        .on_click(go(MenuAct::Open
                     )));
             }
             if can.delete {
                 items = items.child(menu_separator()).child(
-                    menu_item_danger("delete", Some("icons/trash-2.svg"), "Delete…").on_click(then(|this, message, event, window, cx| {
-                        this.delete(message, event.modifiers().shift, window, cx);
+                    menu_item_danger("delete", Some("icons/trash-2.svg"), "Delete…").when(lit(MenuAct::Delete), |row| row.bg(theme::danger_soft()))
+                        .on_click(cx.listener(|this, event: &gpui::ClickEvent, window, cx| {
+                        this.run_act(MenuAct::Delete, event.modifiers().shift, window, cx);
                     })),
                 );
             }
         }
         let items = items.on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_menu(cx)));
-        Some(deferred(anchored().position(*at).snap_to_window().child(fade_in("message-menu", 120, items))).priority(1).into_any_element())
+        Some(placed(
+            "message-menu-scroll",
+            Place::Pointer(at),
+            Layer::Menu,
+            window,
+            fade_in("message-menu", 120, items),
+        ))
     }
 
     // The picker.
@@ -920,16 +1117,30 @@ impl Pane {
         Some(deferred(anchored().position(point(px(0.), px(0.))).child(fade_in("picker-sheet", 160, scrim))).priority(1).into_any_element())
     }
 
-    fn picker_layer(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn picker_layer(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let picking = self.picker.as_ref()?;
+        let place = Place::Pointer(picking.at);
+        let viewport = window.viewport_size();
+        let room = max_height(
+            place,
+            (f32::from(viewport.width), f32::from(viewport.height)),
+        );
+        picking.picker.update(cx, |picker, cx| {
+            picker.set_height(room.min(emoji::HEIGHT), cx)
+        });
         let panel = popover()
             .p(px(0.))
+            .w(px(emoji::WIDTH))
             .max_w(px(emoji::WIDTH))
             .child(picking.picker.clone())
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_picker(cx)));
-        // Beside the pointer, to its left: the toolbar it came from is at the pane's right edge.
-        let at = point(picking.at.x - px(emoji::WIDTH - 24.), picking.at.y + px(14.));
-        Some(deferred(anchored().position(at).snap_to_window().child(fade_in("picker", 120, panel))).priority(1).into_any_element())
+        Some(placed(
+            "reaction-picker-scroll",
+            place,
+            Layer::Popover,
+            window,
+            fade_in("picker", 120, panel),
+        ))
     }
 
     // The delete dialog.
@@ -1005,10 +1216,11 @@ impl Pane {
         if crate::gui::phone::active() {
             return [self.menu_sheet(window, cx), self.picker_sheet(window, cx), self.confirm_layer(window, cx)].into_iter().flatten().collect();
         }
-        [self.menu_layer(cx), self.picker_layer(cx), self.confirm_layer(window, cx)].into_iter().flatten().collect()
+        [self.menu_layer(window, cx), self.picker_layer(window, cx), self.confirm_layer(window, cx)].into_iter().flatten().collect()
     }
 
     /// Keys for whatever floats over the messages. True when the key was theirs.
+    /// A menu takes Up, Down, Enter and Escape. Anything else, including Copy, is left alone.
     pub(super) fn action_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let key = event.keystroke.key.as_str();
         if let Some(message) = self.confirm.clone() {
@@ -1022,8 +1234,35 @@ impl Pane {
             }
             return true;
         }
-        if key == "escape" && (self.menu.is_some() || self.picker.is_some()) {
-            self.close_menu(cx);
+        if self.menu.is_some() {
+            let bare = !event.keystroke.modifiers.modified();
+            match key {
+                "escape" => {
+                    self.close_menu(cx);
+                    self.close_picker(cx);
+                    return true;
+                }
+                "up" | "down" if bare => {
+                    let len = self.menu_state(cx).map(|(acts, _)| acts.len()).unwrap_or(0);
+                    if let Some(menu) = self.menu.as_mut() {
+                        menu.cursor = menu_step(len, menu.cursor, key == "down");
+                    }
+                    cx.notify();
+                    return true;
+                }
+                "enter" if bare => {
+                    if let Some(act) = self
+                        .menu_state(cx)
+                        .and_then(|(acts, cursor)| acts.get(cursor).copied())
+                    {
+                        self.run_act(act, false, window, cx);
+                    }
+                    return true;
+                }
+                _ => return false,
+            }
+        }
+        if key == "escape" && self.picker.is_some() {
             self.close_picker(cx);
             return true;
         }
@@ -1052,7 +1291,68 @@ mod tests {
         }
         assert_eq!(pointed_row(point(px(100.), px(140.)), viewport, &seen, held), Some(0));
         assert_eq!(pointed_row(point(px(801.), px(140.)), viewport, &seen, held), None);
-        assert_eq!(pointed_row(point(px(700.), px(-1.)), viewport, &seen, held), None);
+        assert_eq!(pointed_row(point(px(700.), px(-1.)), viewport, &seen, held), None
+        );
+    }
+
+    #[test]
+    fn a_toolbar_flush_with_the_viewport_moves_into_the_row() {
+        let viewport = Bounds::from_corners(point(px(0.), px(0.)), point(px(800.), px(600.)));
+        let flush = [(
+            0,
+            Bounds::from_corners(point(px(0.), px(0.)), point(px(800.), px(80.))),
+        )];
+        assert_eq!(toolbar_offset(0., 0.), 0.);
+        assert_eq!(
+            pointed_row(point(px(700.), px(10.)), viewport, &flush, Some(0)),
+            Some(0)
+        );
+        assert_eq!(
+            pointed_row(point(px(700.), px(-2.)), viewport, &flush, Some(0)),
+            None
+        );
+        // A few points down: the gap above the row is inside the window and is not the toolbar.
+        let near = [(
+            0,
+            Bounds::from_corners(point(px(0.), px(8.)), point(px(800.), px(80.))),
+        )];
+        assert_eq!(toolbar_offset(8., 0.), 0.);
+        assert_eq!(
+            pointed_row(point(px(700.), px(2.)), viewport, &near, Some(0)),
+            None
+        );
+        assert_eq!(
+            pointed_row(point(px(700.), px(12.)), viewport, &near, Some(0)),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn a_menu_lists_what_the_message_can_do_in_one_order() {
+        let channel = ConversationKind::Channel;
+        let said = Message::plain("1", "Mara", "hello", 1, false);
+        let on = can(&said, Network::Discord, channel, false);
+        assert_eq!(
+            menu_acts(on, false, 2, true, true, true),
+            vec![
+                MenuAct::Quick(0),
+                MenuAct::Quick(1),
+                MenuAct::Reply,
+                MenuAct::Thread,
+                MenuAct::React,
+                MenuAct::Copy,
+                MenuAct::Link,
+                MenuAct::Open,
+            ]
+        );
+        let mut mine = Message::plain("2", "Robin", "on it", 2, true);
+        mine.state = SendState::Failed {
+            reason: "Slow mode".into(),
+        };
+        let failed = can(&mine, Network::Discord, channel, false);
+        assert_eq!(
+            menu_acts(failed, true, 3, true, true, false),
+            vec![MenuAct::Retry, MenuAct::Copy, MenuAct::Drop]);
     }
 
     #[test]

@@ -33,6 +33,8 @@ mod lottie;
 #[cfg(all(feature = "gui", any(target_os = "ios", target_os = "android")))]
 mod tiny_attach;
 #[cfg(all(feature = "gui", any(target_os = "ios", target_os = "android")))]
+mod tiny_setup;
+#[cfg(all(feature = "gui", any(target_os = "ios", target_os = "android")))]
 mod update;
 #[cfg(all(feature = "gui", any(target_os = "ios", target_os = "android")))]
 mod view;

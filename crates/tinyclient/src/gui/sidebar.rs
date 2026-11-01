@@ -583,8 +583,8 @@ impl Shell {
     pub(super) fn mark_conversation_read(&mut self, conversation: Key, cx: &mut Context<Self>) {
         let request = Request::MarkRead { conversation, message_id: String::new() };
         self.off_thread(cx, move || ask(&request), |this, answer, cx| {
-            if let Ok(Response::Error { detail, .. }) = &answer {
-                this.toast(Some(("icons/circle-alert.svg", theme::danger())), detail.clone(), cx);
+            if let Some(words) = refused(&answer) {
+                this.toast(Some(("icons/circle-alert.svg", theme::danger())), words, cx);
             }
             let pages = this.sidebar_state.inbox.stale();
             this.load_inbox(pages, cx);
@@ -636,7 +636,10 @@ impl Shell {
 
     pub(super) fn star(&mut self, conversation: Key, starred: bool, cx: &mut Context<Self>) {
         let request = Request::Star { conversation, starred };
-        self.off_thread(cx, move || ask(&request), |this, _, cx| {
+        self.off_thread(cx, move || ask(&request), |this, answer, cx| {
+            if let Some(words) = refused(&answer) {
+                this.toast(Some(("icons/circle-alert.svg", theme::danger())), words, cx);
+            }
             let pages = this.sidebar_state.inbox.stale();
             this.load_inbox(pages, cx);
         });
@@ -1871,6 +1874,16 @@ fn banner_words(network: Network, several: bool, status: &protocol::AccountStatu
     }
 }
 
+/// Why a sidebar action did not happen, in words. `Ok` is silence.
+fn refused(answer: &std::io::Result<Response>) -> Option<String> {
+    match answer {
+        Ok(Response::Ok) => None,
+        Ok(Response::Error { detail, .. }) => Some(detail.clone()),
+        Err(err) => Some(crate::client::trouble_words("inbox", err)),
+        _ => Some(crate::client::OTHER_ANSWER.to_owned()),
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -1896,6 +1909,21 @@ pub(crate) mod tests {
             status: String::new(),
             can: Default::default(),
         }
+    }
+
+    #[test]
+    fn a_sidebar_action_says_when_it_was_refused_or_never_arrived() {
+        assert_eq!(refused(&Ok(Response::Ok)), None);
+        let detail = refused(&Ok(Response::Error {
+            code: protocol::ErrorCode::Internal,
+            detail: "no".into(),
+        }));
+        assert_eq!(detail.as_deref(), Some("no"));
+        assert!(refused(&Err(std::io::Error::other("down"))).is_some());
+        assert_eq!(
+            refused(&Ok(Response::Pong)).as_deref(),
+            Some(crate::client::OTHER_ANSWER)
+        );
     }
 
     #[test]

@@ -78,13 +78,15 @@ struct Sfu {
 
 impl Sfu {
     fn start() -> Sfu {
-        // One port for both. The system may hold the port UDP got for TCP (Windows reserves
-        // ranges of them, refusing with "access denied"): then another is tried.
-        let (mut udp, addr, mut listener) = (0..50)
+        // One port for both. Windows excludes ranges of TCP ports, so a port UDP got from
+        // :0 is often refused for TCP. A free TCP port is asked for first, then UDP binds
+        // it. A miss, or another test taking it, tries another.
+        let (mut udp, addr, mut listener) = (0..100)
             .find_map(|_| {
-                let udp = UdpSocket::bind("127.0.0.1:0".parse().unwrap()).ok()?;
-                let addr = udp.local_addr().ok()?;
-                Some((udp, addr, TcpListener::bind(addr).ok()?))
+                let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap()).ok()?;
+                let addr = listener.local_addr().ok()?;
+                let udp = UdpSocket::bind(addr).ok()?;
+                Some((udp, addr, listener))
             })
             .expect("a port free for both UDP and TCP");
         let poll = Poll::new().unwrap();

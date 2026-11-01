@@ -464,10 +464,29 @@ pub struct TinyServerInfo {
     pub allow_archives: bool,
     #[serde(default, deserialize_with = "text_or_null")]
     pub created_at: String,
+    /// What the server keeps about its members, from a server with `first_run_setup`. Every
+    /// member may read it. Empty when the server did not say (an older one): the page then says
+    /// nothing about it, rather than guessing.
+    #[serde(default, deserialize_with = "text_or_null", skip_serializing_if = "String::is_empty")]
+    pub provider_profile: String,
+    #[serde(default, deserialize_with = "text_or_null", skip_serializing_if = "String::is_empty")]
+    pub activity_visibility: String,
+    #[serde(default, deserialize_with = "text_or_null", skip_serializing_if = "String::is_empty")]
+    pub sign_in_methods: String,
+    /// When the owner first made those choices. Empty until then, and on an older server.
+    #[serde(default, deserialize_with = "text_or_null", skip_serializing_if = "String::is_empty")]
+    pub setup_completed_at: String,
     /// The icon as a file on this computer, filled in by chatd. Empty while there is none or it
     /// could not be fetched.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub icon_path: String,
+}
+
+impl TinyServerInfo {
+    /// The three choices the server keeps, as it last said them.
+    pub fn posture(&self) -> TinyPosture {
+        TinyPosture { provider_profile: self.provider_profile.clone(), activity_visibility: self.activity_visibility.clone(), sign_in_methods: self.sign_in_methods.clone() }
+    }
 }
 
 impl Default for TinyServerInfo {
@@ -484,6 +503,10 @@ impl Default for TinyServerInfo {
             file_max_bytes: TINY_FILE_MAX_DEFAULT,
             allow_archives: false,
             created_at: String::new(),
+            provider_profile: String::new(),
+            activity_visibility: String::new(),
+            sign_in_methods: String::new(),
+            setup_completed_at: String::new(),
             icon_path: String::new(),
         }
     }
@@ -745,6 +768,205 @@ pub struct TinyServerEdit {
     /// Whether archives may be uploaded. `None` leaves the server's flag as it is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_archives: Option<bool>,
+}
+
+// ---------------------------------------------------------------------------------------------
+// First-run setup (tinyserver's `docs/server-setup.md`). An owner decides what the community
+// keeps about its members: three choices, two presets that make all three at once, and one record
+// of when. The server writes the words for every choice and option, so this client draws what it
+// is told and keeps no copy of that text. Only the people who are not owners, who cannot ask the
+// server for those words, get a fixed description (`tiny_setup.rs` in the shell).
+
+/// The server lists this when it has setup. Without it, nothing about setup is shown.
+pub const TINY_FEATURE_FIRST_RUN_SETUP: &str = "first_run_setup";
+
+/// The values each choice takes, as the server names them. A value is kept as text so one from a
+/// newer server still reads; these are the ones this build has words for.
+pub const TINY_PROVIDER_PROFILES: [&str; 3] = ["full", "name", "none"];
+pub const TINY_ACTIVITY_VISIBILITIES: [&str; 3] = ["everyone", "admins", "nobody"];
+pub const TINY_SIGN_IN_METHODS: [&str; 2] = ["any", "passkey"];
+
+/// The three choices, each as the server names its value. Empty is "not said".
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TinyPosture {
+    /// What a new account keeps from a sign-in provider: `full`, `name` or `none`.
+    #[serde(default, deserialize_with = "text_or_null")]
+    pub provider_profile: String,
+    /// Who sees last-online and how a member joined: `everyone`, `admins` or `nobody`.
+    #[serde(default, deserialize_with = "text_or_null")]
+    pub activity_visibility: String,
+    /// How members sign in: `any` or `passkey`.
+    #[serde(default, deserialize_with = "text_or_null")]
+    pub sign_in_methods: String,
+}
+
+impl TinyPosture {
+    /// The value of the choice named `choice`, or `None` for a choice this build does not know.
+    pub fn value(&self, choice: &str) -> Option<&str> {
+        match choice {
+            "provider_profile" => Some(&self.provider_profile),
+            "activity_visibility" => Some(&self.activity_visibility),
+            "sign_in_methods" => Some(&self.sign_in_methods),
+            _ => None,
+        }
+    }
+
+    /// Sets one choice. A choice this build does not know is left alone, and `false` says so.
+    pub fn set(&mut self, choice: &str, value: &str) -> bool {
+        let slot = match choice {
+            "provider_profile" => &mut self.provider_profile,
+            "activity_visibility" => &mut self.activity_visibility,
+            "sign_in_methods" => &mut self.sign_in_methods,
+            _ => return false,
+        };
+        *slot = value.to_owned();
+        true
+    }
+}
+
+/// What the server was started with.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TinyDeployment {
+    /// Passkey sign-in is on.
+    #[serde(default, deserialize_with = "or_default")]
+    pub passkeys: bool,
+    /// At least one single sign-on provider is set up.
+    #[serde(default, deserialize_with = "or_default")]
+    pub sso: bool,
+}
+
+/// What a choice would touch, for saying so before the owner commits.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TinySetupCounts {
+    #[serde(default, deserialize_with = "or_default")]
+    pub members: u32,
+    #[serde(default, deserialize_with = "or_default")]
+    pub members_without_passkey: u32,
+    /// Email addresses the server holds.
+    #[serde(default, deserialize_with = "or_default")]
+    pub emails_stored: u32,
+    #[serde(default, deserialize_with = "or_default")]
+    pub owner_has_passkey: bool,
+}
+
+/// One way to settle all three choices at once, with the server's own words for it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TinyPreset {
+    /// `convenience` or `privacy`.
+    pub id: String,
+    #[serde(default, deserialize_with = "text_or_null")]
+    pub title: String,
+    #[serde(default, deserialize_with = "text_or_null")]
+    pub summary: String,
+    /// What it sets.
+    #[serde(default, deserialize_with = "or_default")]
+    pub choices: TinyPosture,
+    /// False where this server cannot do it; `unavailable` says why.
+    #[serde(default = "yes", deserialize_with = "true_or_null")]
+    pub available: bool,
+    #[serde(default, deserialize_with = "text_or_null")]
+    pub unavailable: String,
+}
+
+/// One of the three choices: its question, and each option with what it does.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TinyChoice {
+    /// `provider_profile`, `activity_visibility` or `sign_in_methods`.
+    pub id: String,
+    #[serde(default, deserialize_with = "text_or_null")]
+    pub title: String,
+    #[serde(default, deserialize_with = "text_or_null")]
+    pub question: String,
+    /// False when this server has nothing for the choice to act on: show it dimmed.
+    #[serde(default = "yes", deserialize_with = "true_or_null")]
+    pub relevant: bool,
+    #[serde(default, deserialize_with = "readable_rows")]
+    pub options: Vec<TinyOption>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TinyOption {
+    pub id: String,
+    #[serde(default, deserialize_with = "text_or_null")]
+    pub title: String,
+    /// What choosing it does, in the server's words.
+    #[serde(default, deserialize_with = "text_or_null")]
+    pub effect: String,
+    /// What it depends on: `passkeys`, `owner_has_passkey`.
+    #[serde(default, deserialize_with = "or_default")]
+    pub needs: Vec<String>,
+}
+
+/// `GET /v1/setup`, for an owner.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TinySetup {
+    /// Nobody has answered yet. Missing reads as not needed: a client that is unsure asks nothing.
+    #[serde(default, deserialize_with = "or_default")]
+    pub needed: bool,
+    #[serde(default, deserialize_with = "text_or_null")]
+    pub completed_at: String,
+    #[serde(default, deserialize_with = "or_default")]
+    pub current: TinyPosture,
+    #[serde(default, deserialize_with = "or_default")]
+    pub deployment: TinyDeployment,
+    #[serde(default, deserialize_with = "or_default")]
+    pub counts: TinySetupCounts,
+    #[serde(default, deserialize_with = "readable_rows")]
+    pub presets: Vec<TinyPreset>,
+    #[serde(default, deserialize_with = "readable_rows")]
+    pub choices: Vec<TinyChoice>,
+    /// Facts that hold whatever is chosen.
+    #[serde(default, deserialize_with = "readable_rows")]
+    pub always: Vec<String>,
+}
+
+/// `PUT /v1/setup`. A preset sets all three choices and any named choice then overrides it; `{}`
+/// keeps everything as it is and finishes setup. Only what is set is sent.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TinySetupApply {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity_visibility: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sign_in_methods: Option<String>,
+    /// Remove the email address of every member. One way.
+    #[serde(default, skip_serializing_if = "crate::is_false")]
+    pub erase_emails: bool,
+    /// Choose passkeys only although some members have no passkey yet.
+    #[serde(default, skip_serializing_if = "crate::is_false")]
+    pub allow_lockout: bool,
+}
+
+/// What `PUT /v1/setup` answered: the whole settings, and what applying did beyond the choices.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TinySetupApplied {
+    #[serde(default, deserialize_with = "or_default")]
+    pub settings: TinyServerInfo,
+    #[serde(default, deserialize_with = "or_default")]
+    pub emails_erased: u32,
+    #[serde(default, deserialize_with = "or_default")]
+    pub last_seen_cleared: u32,
+}
+
+/// Why the server would not apply the choices, when the owner can do something about it. Nothing
+/// was changed, and setup is not marked done.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "why", rename_all = "snake_case")]
+pub enum TinySetupRefusal {
+    /// Passkeys only, on a server started without passkey sign-in.
+    PasskeysUnavailable,
+    /// Passkeys only, while the owner has no passkey of their own.
+    OwnerNeedsPasskey,
+    /// Passkeys only, while this many members have none: they could not sign in.
+    MembersWithoutPasskey { count: u32 },
+}
+
+/// A list where a row that cannot be read is left out, so one odd row never empties the rest.
+fn readable_rows<'de, D: serde::Deserializer<'de>, T: DeserializeOwned>(from: D) -> Result<Vec<T>, D::Error> {
+    Ok(Option::<Value>::deserialize(from)?.and_then(tiny_rows).map(|(rows, _)| rows).unwrap_or_default())
 }
 
 /// A role to make, or a change to one. Only what is `Some` is sent; `color: Some("")` clears
@@ -1455,6 +1677,156 @@ mod tests {
         let names: Vec<&str> = TINY_PERMISSIONS.iter().map(|(_, name)| *name).collect();
         assert_eq!(names.len(), 20);
         assert!(TINY_PERMISSIONS.iter().enumerate().all(|(n, (bit, _))| *bit == 1 << n));
+    }
+
+    /// `GET /v1/server` as `docs/server-setup.md` describes it, and as a server from before setup
+    /// sends it.
+    #[test]
+    fn the_server_says_what_it_keeps_and_an_older_one_says_nothing() {
+        let newer: TinyServerInfo = serde_json::from_str(
+            r#"{"name":"AtomicStudio","description":"","welcome":"","icon":null,"default_room_id":null,"afk_room_id":null,"afk_timeout_secs":0,
+                "image_max_bytes":8388608,"file_max_bytes":26214400,"allow_archives":false,
+                "provider_profile":"name","activity_visibility":"admins","sign_in_methods":"passkey",
+                "setup_completed_at":"2026-11-01T10:00:00Z","created_at":"2026-10-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        assert_eq!((newer.provider_profile.as_str(), newer.activity_visibility.as_str(), newer.sign_in_methods.as_str()), ("name", "admins", "passkey"));
+        assert_eq!(newer.setup_completed_at, "2026-11-01T10:00:00Z");
+        assert_eq!(newer.posture(), TinyPosture { provider_profile: "name".into(), activity_visibility: "admins".into(), sign_in_methods: "passkey".into() });
+        // Before the owner answers, the server sends the time as null.
+        let waiting: TinyServerInfo = serde_json::from_str(r#"{"name":"A","provider_profile":"full","activity_visibility":"everyone","sign_in_methods":"any","setup_completed_at":null}"#).unwrap();
+        assert_eq!(waiting.setup_completed_at, "");
+        assert_eq!(waiting.provider_profile, "full");
+        // An older server sends none of them: they read as "not said", and stay off the wire.
+        let older: TinyServerInfo = serde_json::from_str(r#"{"name":"AtomicStudio","description":"","welcome":"","icon":null,"afk_timeout_secs":0,"created_at":"t"}"#).unwrap();
+        assert_eq!(older.posture(), TinyPosture::default());
+        assert_eq!(older.setup_completed_at, "");
+        let json = serde_json::to_string(&older).unwrap();
+        assert!(!json.contains("provider_profile") && !json.contains("activity_visibility") && !json.contains("sign_in_methods") && !json.contains("setup_completed_at"), "{json}");
+        let json = serde_json::to_string(&newer).unwrap();
+        assert!(json.contains(r#""sign_in_methods":"passkey""#), "a shell reads it back: {json}");
+        // A value from a newer server than this build still reads.
+        let future: TinyServerInfo = serde_json::from_str(r#"{"name":"A","sign_in_methods":"hardware_key"}"#).unwrap();
+        assert_eq!(future.sign_in_methods, "hardware_key");
+    }
+
+    /// The reply of `GET /v1/setup`, as the contract shows it.
+    const SETUP_JSON: &str = r#"{
+        "needed": true,
+        "completed_at": null,
+        "current": {"provider_profile": "full", "activity_visibility": "everyone", "sign_in_methods": "any"},
+        "deployment": {"passkeys": true, "sso": false},
+        "counts": {"members": 1, "members_without_passkey": 1, "emails_stored": 1, "owner_has_passkey": false},
+        "presets": [
+          {"id": "convenience", "title": "Convenience", "summary": "Easiest to run.",
+           "choices": {"provider_profile": "full", "activity_visibility": "everyone", "sign_in_methods": "any"}, "available": true},
+          {"id": "privacy", "title": "Privacy", "summary": "Keeps the least.",
+           "choices": {"provider_profile": "none", "activity_visibility": "nobody", "sign_in_methods": "passkey"}, "available": false,
+           "unavailable": "This server was started without passkey sign-in."}
+        ],
+        "choices": [
+          {"id": "provider_profile", "title": "What to keep from a sign-in provider", "question": "What should the server keep?", "relevant": false,
+           "options": [{"id": "full", "title": "Name and email address", "effect": "Keeps both."}, {"id": "name", "title": "Name only", "effect": "Keeps the name."}]},
+          {"id": "sign_in_methods", "title": "How members sign in", "question": "Which?", "relevant": true,
+           "options": [{"id": "any", "title": "Whatever this server offers", "effect": "Passkey."},
+                       {"id": "passkey", "title": "Passkeys only", "effect": "Nothing else.", "needs": ["passkeys", "owner_has_passkey"]}]}
+        ],
+        "always": ["There are no usernames.", "The server sends no analytics or crash reports anywhere."]
+    }"#;
+
+    #[test]
+    fn the_setup_outline_reads_as_the_server_sends_it() {
+        let setup: TinySetup = serde_json::from_str(SETUP_JSON).unwrap();
+        assert!(setup.needed);
+        assert_eq!(setup.completed_at, "", "null until an owner answers");
+        assert_eq!(setup.current, TinyPosture { provider_profile: "full".into(), activity_visibility: "everyone".into(), sign_in_methods: "any".into() });
+        assert_eq!(setup.deployment, TinyDeployment { passkeys: true, sso: false });
+        assert_eq!(setup.counts, TinySetupCounts { members: 1, members_without_passkey: 1, emails_stored: 1, owner_has_passkey: false });
+        assert_eq!(setup.presets.iter().map(|preset| (preset.id.as_str(), preset.available)).collect::<Vec<_>>(), [("convenience", true), ("privacy", false)]);
+        assert_eq!(setup.presets[0].unavailable, "", "an available preset has no reason");
+        assert_eq!(setup.presets[1].unavailable, "This server was started without passkey sign-in.");
+        assert_eq!(setup.presets[1].choices.value("sign_in_methods"), Some("passkey"));
+        assert!(!setup.choices[0].relevant && setup.choices[1].relevant);
+        assert_eq!(setup.choices[0].question, "What should the server keep?");
+        assert_eq!(setup.choices[1].options[1].needs, ["passkeys", "owner_has_passkey"]);
+        assert!(setup.choices[0].options[0].needs.is_empty());
+        assert_eq!(setup.always.len(), 2);
+        // The convenience preset in the contract sets exactly what a server did before setup.
+        let done: TinySetup = serde_json::from_str(r#"{"needed":false,"completed_at":"2026-11-01T10:00:00Z"}"#).unwrap();
+        assert!(!done.needed && done.completed_at == "2026-11-01T10:00:00Z" && done.presets.is_empty());
+    }
+
+    #[test]
+    fn a_setup_outline_with_odd_parts_still_reads_and_a_missing_flag_is_not_needed() {
+        // Nothing said about `needed`: ask nothing.
+        assert!(!serde_json::from_str::<TinySetup>("{}").unwrap().needed);
+        // A row that cannot be read is left out; the rest stays. `available` and `relevant`, when
+        // missing or null, are yes; a field from a newer server is ignored.
+        let odd: TinySetup = serde_json::from_str(
+            r#"{"needed":true,"presets":[{"id":"convenience","available":null,"future":1},{"title":"no id"},"nope"],
+                "choices":[{"id":"sign_in_methods","relevant":null,"options":[{"id":"any"},{"effect":"no id"},7]}],
+                "always":["one",null,"two"],"counts":null,"deployment":null,"current":null,"extra":{"a":1}}"#,
+        )
+        .unwrap();
+        assert_eq!(odd.presets.len(), 1);
+        assert!(odd.presets[0].available);
+        assert_eq!(odd.choices[0].options.iter().map(|option| option.id.as_str()).collect::<Vec<_>>(), ["any"]);
+        assert!(odd.choices[0].relevant);
+        assert_eq!(odd.always, ["one", "two"]);
+        assert_eq!((odd.counts, odd.deployment, odd.current), (TinySetupCounts::default(), TinyDeployment::default(), TinyPosture::default()));
+        // Not a list at all: no rows.
+        let none: TinySetup = serde_json::from_str(r#"{"needed":true,"presets":"x","choices":null}"#).unwrap();
+        assert!(none.presets.is_empty() && none.choices.is_empty());
+    }
+
+    #[test]
+    fn the_answer_to_setup_sends_only_what_is_set() {
+        let body = |apply: &TinySetupApply| serde_json::to_string(apply).unwrap();
+        assert_eq!(body(&TinySetupApply::default()), "{}", "keep what I have");
+        assert_eq!(body(&TinySetupApply { preset: Some("privacy".into()), ..TinySetupApply::default() }), r#"{"preset":"privacy"}"#);
+        let every = TinySetupApply {
+            preset: Some("privacy".into()),
+            provider_profile: Some("name".into()),
+            activity_visibility: Some("admins".into()),
+            sign_in_methods: Some("any".into()),
+            erase_emails: true,
+            allow_lockout: true,
+        };
+        assert_eq!(
+            body(&every),
+            r#"{"preset":"privacy","provider_profile":"name","activity_visibility":"admins","sign_in_methods":"any","erase_emails":true,"allow_lockout":true}"#
+        );
+        assert_eq!(serde_json::from_str::<TinySetupApply>(&body(&every)).unwrap(), every);
+    }
+
+    #[test]
+    fn what_setup_answered_carries_the_whole_settings_and_the_counts() {
+        let applied: TinySetupApplied = serde_json::from_str(
+            r#"{"settings":{"name":"AtomicStudio","description":"","welcome":"","icon":null,"default_room_id":null,"afk_room_id":null,"afk_timeout_secs":0,
+                 "image_max_bytes":8388608,"file_max_bytes":26214400,"allow_archives":false,
+                 "provider_profile":"none","activity_visibility":"nobody","sign_in_methods":"passkey",
+                 "setup_completed_at":"2026-11-01T10:00:00Z","created_at":"2026-10-01T00:00:00Z"},
+                "emails_erased":3,"last_seen_cleared":5}"#,
+        )
+        .unwrap();
+        assert_eq!((applied.emails_erased, applied.last_seen_cleared), (3, 5));
+        assert_eq!(applied.settings.posture().provider_profile, "none");
+        assert_eq!(applied.settings.setup_completed_at, "2026-11-01T10:00:00Z");
+        let refusals = [TinySetupRefusal::PasskeysUnavailable, TinySetupRefusal::OwnerNeedsPasskey, TinySetupRefusal::MembersWithoutPasskey { count: 4 }];
+        let json = serde_json::to_string(&refusals).unwrap();
+        assert_eq!(json, r#"[{"why":"passkeys_unavailable"},{"why":"owner_needs_passkey"},{"why":"members_without_passkey","count":4}]"#);
+        assert_eq!(serde_json::from_str::<Vec<TinySetupRefusal>>(&json).unwrap(), refusals);
+    }
+
+    #[test]
+    fn every_choice_the_posture_names_can_be_read_and_set() {
+        let mut posture = TinyPosture::default();
+        for (choice, value) in [("provider_profile", "name"), ("activity_visibility", "admins"), ("sign_in_methods", "passkey")] {
+            assert!(posture.set(choice, value));
+            assert_eq!(posture.value(choice), Some(value));
+        }
+        assert!(!posture.set("mystery", "x") && posture.value("mystery").is_none());
+        assert!(TINY_PROVIDER_PROFILES.contains(&"full") && TINY_ACTIVITY_VISIBILITIES.contains(&"nobody") && TINY_SIGN_IN_METHODS.contains(&"passkey"));
     }
 
     #[test]

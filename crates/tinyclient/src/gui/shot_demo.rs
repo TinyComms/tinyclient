@@ -1079,7 +1079,7 @@ pub fn answer(request: &Request) -> std::io::Result<Response> {
                 .map(person_of)
                 .collect();
             let total = people.len() as u32;
-            Response::People { people: people.into_iter().skip(*offset as usize).take(*limit as usize).collect(), total }
+            Response::People { people: people.into_iter().skip(*offset as usize).take(*limit as usize).collect(), total, settled: Vec::new() }
         }
         Request::Around { network } => {
             let mine = |w: &&Who| network.is_none_or(|n| w.network == n);

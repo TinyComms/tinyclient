@@ -16,7 +16,7 @@ use gpui::{
     div, prelude::*, px, Context, Div, Entity, Focusable, FontWeight, HighlightStyle, MouseButton, ScrollHandle, SharedString, Stateful,
     StyledText, Subscription, Window,
 };
-use protocol::{Badge, Conversation, ConversationKind, Key, Network, Person, Relation, Request, Response, Space, SEARCH_MIN_CHARS};
+use protocol::{AccountKey, AccountStatus, Badge, Conversation, ConversationKind, Key, Link, Network, Person, Relation, Request, Response, Space, SEARCH_MIN_CHARS};
 use std::ops::Range;
 use std::rc::Rc;
 use std::time::Duration;
@@ -157,6 +157,28 @@ fn narrowed(query: &str) -> (Option<Network>, &str) {
         }
     }
     (None, typed)
+}
+
+/// Networks chatd will actually search: connected accounts, optionally one network, once each.
+fn live_networks(accounts: &[AccountStatus], wanted: Option<Network>) -> Vec<Network> {
+    let mut live = Vec::new();
+    for account in accounts {
+        if account.link != Link::Connected {
+            continue;
+        }
+        if wanted.is_some_and(|wanted| wanted != account.key.network) {
+            continue;
+        }
+        if !live.contains(&account.key.network) {
+            live.push(account.key.network);
+        }
+    }
+    live
+}
+
+/// Drops a network from "Asking…" once every connected account of it already searched.
+fn retain_asking(asking: &mut Vec<Network>, live: &[AccountKey], settled: &[AccountKey]) {
+    asking.retain(|network| live.iter().any(|account| account.network == *network && !settled.contains(account)));
 }
 
 /// Only a search narrowed to Telegram carries an explicit username lookup request.
@@ -381,9 +403,16 @@ impl Shell {
     fn rehit(&mut self, keep: bool, cx: &mut Context<Self>) {
         let can_search = self.slots.search.is_some();
         let open = self.open.clone();
+        let live = self
+            .snapshot
+            .as_ref()
+            .map(|snapshot| live_networks(&snapshot.accounts, None));
         let Some(switcher) = &mut self.sidebar_state.switcher else {
             return;
         };
+        if let Some(live) = &live {
+            switcher.asking.retain(|network| live.contains(network));
+        }
         let query = switcher.input.read(cx).text().to_owned();
         let fresh = if narrowed(query.trim()).1.trim_start_matches(['#', '@']).is_empty() && !query.trim().starts_with('@') {
             waiting_and_recent(&switcher.conversations, &switcher.recent, open.as_ref())
@@ -443,11 +472,11 @@ impl Shell {
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(PAUSE).await;
             let _ = this.update(cx, |this, cx| {
-                let connected: Vec<Network> = this.snapshot.as_ref().map(|s| s.signed_in()).unwrap_or_default();
+                let connected = this.snapshot.as_ref().map(|snapshot| live_networks(&snapshot.accounts, network)).unwrap_or_default();
                 let Some(switcher) = this.sidebar_state.switcher.as_mut().filter(|s| s.people_asked == people_asked) else {
                     return;
                 };
-                switcher.asking = connected.into_iter().filter(|n| network.is_none_or(|wanted| wanted == *n)).collect();
+                switcher.asking = connected;
                 this.rehit(true, cx);
                 this.ask_people(name, network, people_asked, cx);
             });
@@ -458,13 +487,24 @@ impl Shell {
     fn ask_people(&mut self, name: String, network: Option<Network>, asked: u64, cx: &mut Context<Self>) {
         let request = Request::People { network, relation: None, query: Some(name), offset: 0, limit: 20 };
         self.off_thread(cx, move || ask(&request), move |this, answer, cx| {
-            let (Ok(Response::People { people, .. }), Some(switcher)) = (answer, &mut this.sidebar_state.switcher) else {
+            let Ok(Response::People { people, settled, .. }) = answer else {
                 return;
             };
-            if switcher.people_asked != asked {
-                return;
+            let live = this.snapshot.as_ref().map(|snapshot| {
+                snapshot.accounts.iter().filter(|account| account.link == Link::Connected).map(|account| account.key.clone()).collect::<Vec<_>>()
+            }).unwrap_or_default();
+            {
+                let Some(switcher) = &mut this.sidebar_state.switcher else {
+                    return;
+                };
+                if switcher.people_asked != asked {
+                    return;
+                }
+                switcher.people = people;
+                if !settled.is_empty() {
+                    retain_asking(&mut switcher.asking, &live, &settled);
+                }
             }
-            switcher.people = people;
             this.rehit(true, cx);
         });
     }
@@ -754,6 +794,58 @@ impl super::State {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use protocol::{AccountKey, Presence};
+
+    fn account(network: Network, link: Link) -> AccountStatus {
+        AccountStatus {
+            key: AccountKey {
+                network,
+                account: network.label().into(),
+            },
+            name: String::new(),
+            link,
+            detail: String::new(),
+            me: String::new(),
+            attention: 0,
+            unread: false,
+            reconnecting: false,
+            required: String::new(),
+            avatar: None,
+            presence: Presence::Unknown,
+            status: String::new(),
+            can: Default::default(),
+        }
+    }
+
+    #[test]
+    fn people_search_waits_only_on_networks_that_are_connected() {
+        let accounts = vec![
+            account(Network::Discord, Link::Connected),
+            account(Network::Slack, Link::Offline),
+            account(Network::Teams, Link::Connected),
+            account(Network::Discord, Link::Connected),
+            account(Network::Telegram, Link::Expired),
+        ];
+        assert_eq!(
+            live_networks(&accounts, None),
+            vec![Network::Discord, Network::Teams]
+        );
+        assert_eq!(
+            live_networks(&accounts, Some(Network::Teams)),
+            vec![Network::Teams]
+        );
+        assert!(live_networks(&accounts, Some(Network::Slack)).is_empty());
+        let key = |network, id: &str| AccountKey { network, account: id.into() };
+        let (discord, other, slack) = (key(Network::Discord, "d"), key(Network::Discord, "d2"), key(Network::Slack, "s"));
+        let live = vec![discord.clone(), other.clone(), slack.clone()];
+        let mut asking = vec![Network::Discord, Network::Slack];
+        retain_asking(&mut asking, &live, &[discord.clone()]);
+        assert_eq!(asking, vec![Network::Discord, Network::Slack]);
+        retain_asking(&mut asking, &live, &[discord, other]);
+        assert_eq!(asking, vec![Network::Slack]);
+        retain_asking(&mut asking, &live, &[slack]);
+        assert!(asking.is_empty());
+    }
 
     #[test]
     fn network_narrowing_handles_unicode_queries() {

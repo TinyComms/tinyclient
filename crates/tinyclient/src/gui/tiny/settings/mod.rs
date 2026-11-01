@@ -8,7 +8,7 @@
 //! pub(in crate::gui::tiny) fn <page>(shell: &Shell, facts: &Facts, window: &mut Window, cx: &mut Context<Shell>) -> AnyElement
 //! ```
 //!
-//! A page that edits also gives `dirty`, `save` and `reset` (Overview, Roles, Channels), which the
+//! A page that edits also gives `dirty`, `save` and `reset` (Overview, Roles, Channels, Privacy), which the
 //! frame calls from [`Shell::tiny_settings_dirty`], [`Shell::tiny_settings_save`] and
 //! [`Shell::tiny_settings_reset`]. Its draft lives in [`Overlay`] (and text fields, which need a
 //! window context to make, in [`Fields`]). What goes at once (a role made, a new order, a revoke)
@@ -24,6 +24,7 @@ mod invites;
 mod kit;
 mod members;
 mod overview;
+mod privacy;
 mod roles;
 mod signin;
 mod voice;
@@ -41,6 +42,7 @@ pub(in crate::gui) use bans::banned_name;
 pub(in crate::gui) use channels::Sel;
 pub(in crate::gui) use danger::confirmed;
 pub(in crate::gui) use invites::revocable;
+pub(in crate::gui::tiny) use kit::check_box;
 #[cfg(feature = "gui-shot")]
 pub(in crate::gui) use members::selectable as tickable;
 
@@ -61,13 +63,14 @@ pub(in crate::gui) enum Page {
     Channels,
     Voice,
     Audit,
+    Privacy,
     SignIn,
     Encryption,
     Danger,
 }
 
 impl Page {
-    pub const ALL: [Page; 11] = [Page::Overview, Page::Roles, Page::Members, Page::Invites, Page::Bans, Page::Channels, Page::Voice, Page::Audit, Page::SignIn, Page::Encryption, Page::Danger];
+    pub const ALL: [Page; 12] = [Page::Overview, Page::Roles, Page::Members, Page::Invites, Page::Bans, Page::Channels, Page::Voice, Page::Audit, Page::Privacy, Page::SignIn, Page::Encryption, Page::Danger];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -79,6 +82,7 @@ impl Page {
             Page::Channels => "Channels",
             Page::Voice => "Voice & media",
             Page::Audit => "Audit log",
+            Page::Privacy => "Privacy",
             Page::SignIn => "Sign-in",
             Page::Encryption => "Encryption",
             Page::Danger => "Danger zone",
@@ -95,6 +99,7 @@ impl Page {
             Page::Channels => "icons/volume-2.svg",
             Page::Voice => "icons/signal.svg",
             Page::Audit => "icons/list.svg",
+            Page::Privacy => "icons/eye-off.svg",
             Page::SignIn => "icons/key.svg",
             Page::Encryption => "icons/lock.svg",
             Page::Danger => "icons/triangle-alert.svg",
@@ -107,7 +112,7 @@ impl Page {
             Page::Overview | Page::Roles => "Server",
             Page::Members | Page::Invites | Page::Bans => "People",
             Page::Channels | Page::Voice => "Voice",
-            Page::Audit | Page::SignIn | Page::Encryption | Page::Danger => "Security",
+            Page::Audit | Page::Privacy | Page::SignIn | Page::Encryption | Page::Danger => "Security",
         }
     }
 
@@ -126,6 +131,8 @@ impl Page {
             Page::Channels => may.make_room || may.edit_room || may.delete_room,
             Page::Voice => may.edit_server,
             Page::Audit => may.read_audit,
+            // What the server keeps about everyone in it: every member may read it, an owner changes it.
+            Page::Privacy => crate::tiny_setup::offered(community),
             Page::SignIn => may.edit_server || may.owner,
             // Everyone's own devices and the people they talk to: not a power over the server.
             Page::Encryption => community.has(protocol::TINY_FEATURE_E2EE_TEXT),
@@ -299,6 +306,10 @@ impl Shell {
         if page == Page::Encryption && self.tiny_state.settings.as_ref().is_some_and(|overlay| !overlay.encryption.asked) {
             self.tiny_e2ee_load(cx);
         }
+        // An owner's page is the server's own outline, read once.
+        if page == Page::Privacy {
+            self.tiny_privacy_enter(cx);
+        }
     }
 
     pub(in crate::gui) fn tiny_close_settings(&mut self, cx: &mut Context<Self>) {
@@ -323,6 +334,7 @@ impl Shell {
         self.tiny_overview_reset(cx);
         self.tiny_roles_reset(cx);
         self.tiny_channels_reset(cx);
+        self.tiny_privacy_reset();
     }
 
     /// The page on show has changes not yet saved.
@@ -334,6 +346,7 @@ impl Shell {
             Page::Overview => self.tiny_overview_dirty(cx),
             Page::Roles => self.tiny_roles_dirty(cx),
             Page::Channels => self.tiny_channels_dirty(cx),
+            Page::Privacy => self.tiny_privacy_dirty(),
             _ => false,
         }
     }
@@ -349,6 +362,7 @@ impl Shell {
             Page::Overview => self.tiny_overview_save(cx),
             Page::Roles => self.tiny_roles_save(cx),
             Page::Channels => self.tiny_channels_save(cx),
+            Page::Privacy => self.tiny_privacy_save(cx),
             _ => {}
         }
     }
@@ -364,6 +378,7 @@ impl Shell {
             Page::Overview => self.tiny_overview_reset(cx),
             Page::Roles => self.tiny_roles_reset(cx),
             Page::Channels => self.tiny_channels_reset(cx),
+            Page::Privacy => self.tiny_privacy_reset(),
             _ => {}
         }
         cx.notify();
@@ -403,6 +418,14 @@ impl Shell {
             (channels.limit, channels.bitrate, channels.video, channels.ptt) = (None, None, None, None);
             channels.overrides.clear();
             let _ = cx;
+        }
+    }
+
+    /// A save was refused in a way the page says itself, beside what can be done: the bar stops
+    /// saying "Saving" and has nothing to add.
+    pub(in crate::gui::tiny) fn tiny_settings_unsaved(&mut self) {
+        if let Some(overlay) = self.tiny_state.settings.as_mut() {
+            overlay.saving = false;
         }
     }
 
@@ -466,7 +489,6 @@ impl Shell {
             );
         }
         let body = self.tiny_settings_body(shown, facts, window, cx);
-
         let dirty = self.tiny_settings_dirty(cx);
         let close = div()
             .id("tiny-settings-close")
@@ -538,6 +560,7 @@ impl Shell {
             Page::Channels => channels::channels(self, facts, window, cx),
             Page::Voice => voice::voice(self, facts, window, cx),
             Page::Audit => audit::audit(self, facts, window, cx),
+            Page::Privacy => privacy::privacy(self, facts, window, cx),
             Page::SignIn => signin::signin(self, facts, window, cx),
             Page::Encryption => encryption::encryption(self, facts, window, cx),
             Page::Danger => danger::danger(self, facts, window, cx),
@@ -635,10 +658,15 @@ mod tests {
         modern.capabilities.features = ["server", "roles", "categories", "bans", "timeouts", "invite_options", "audit_query", "voice_moderation", "e2ee_text"].map(String::from).to_vec();
         modern.access = Some(TinyAccess { permissions: TINY_KICK_MEMBERS | TINY_VIEW_AUDIT_LOG, ..TinyAccess::default() });
         assert_eq!(shown(&modern), ["Overview", "Members", "Audit log", "Encryption"], "a moderator sees what they moderate, and everyone sees Encryption where the server has it");
+        // Privacy is for everyone on a server that has setup, and only there.
+        modern.capabilities.features.push("first_run_setup".to_owned());
+        assert_eq!(shown(&modern), ["Overview", "Members", "Audit log", "Privacy", "Encryption"]);
         modern.access = Some(TinyAccess { permissions: TINY_ALL, rank: 3, ..TinyAccess::default() });
         assert!(!shown(&modern).contains(&"Danger zone"), "only owners see the danger zone");
         modern.access = Some(TinyAccess { owner: true, ..TinyAccess::default() });
         assert_eq!(shown(&modern).len(), Page::ALL.len());
+        modern.capabilities.features.retain(|feature| feature != "first_run_setup");
+        assert!(!shown(&modern).contains(&"Privacy"), "an older server has nothing to show");
     }
 
     #[test]

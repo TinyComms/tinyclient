@@ -690,7 +690,7 @@ fn a_public_username_resolves_a_person_outside_contacts_and_global_search_result
     assert_eq!(calls.iter().filter(|call| *call == "contacts.Search @forest_wren").count(), 1);
     // Cache lookup strips the explicit lookup marker, matching both handles and names.
     for query in ["@rob", "@forest_wren"] {
-        let Response::People { people, total } = world.ask(Request::People {
+        let Response::People { people, total, .. } = world.ask(Request::People {
             network: Some(Network::Telegram), relation: None, query: Some(query.into()), offset: 0, limit: 20,
         }) else { panic!("no people response") };
         assert_eq!(total, 1);

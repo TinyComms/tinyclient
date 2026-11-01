@@ -277,6 +277,14 @@ struct Draft {
     text: String,
     tokens: Vec<Token>,
     files: Vec<Staged>,
+    /// A refusal or note that belongs to this conversation, shown again on the way back.
+    note: Option<(String, Tone)>,
+}
+
+/// The parked text is still the message that went. A follow-up typed before the
+/// answer arrived is a different draft and stays.
+fn parked_text_is_the_send(parked: &str, sent_field: &str) -> bool {
+    parked == draft_text(sent_field)
 }
 
 struct Reply {
@@ -522,11 +530,12 @@ impl Composer {
             let draft = self.drafts.get(&target.key).cloned().unwrap_or_else(|| Draft { text: stored.to_owned(), ..Draft::default() });
             self.saved = draft_text(&draft.text);
             self.set_field(&draft, cx);
+            let note = draft.note.clone();
             self.tray = draft.files;
             self.offered = stored.to_owned();
             self.touched = false;
             self.reply = None;
-            self.caption = self.scan_caption_for(&target.key);
+            self.caption = self.scan_caption_for(&target.key).or(note);
             self.sending = false;
             self.no_preview = false;
             self.armed = None;
@@ -567,7 +576,8 @@ impl Composer {
         let Some(old) = self.target.as_ref().map(|old| old.key.clone()) else {
             return;
         };
-        let draft = Draft { text: draft_text(self.input.read(cx).text()), tokens: self.tokens.clone(), files };
+        let draft = Draft { text: draft_text(self.input.read(cx).text()), tokens: self.tokens.clone(), files,
+            note: self.caption.clone(), };
         self.remember(old, draft);
     }
 
@@ -782,7 +792,10 @@ impl Composer {
 
     fn dispatch(&mut self, out: Outgoing, with: protocol::Outgoing, cx: &mut Context<Self>) {
         let files = !with.files.is_empty();
-        if self.target.as_ref().is_some_and(|target| crate::tiny_attach::hold_chips(target.key.network, files, &target.can)) {
+        let scan = self.target.as_ref().is_some_and(|target| {
+            target.key == out.key && crate::tiny_attach::hold_chips(target.key.network, files, &target.can)
+        });
+        if scan {
             self.pending_file = Some((out.key.clone(), out.client_id.clone()));
         }
         if with.silent {
@@ -800,7 +813,7 @@ impl Composer {
         cx.notify();
         let this = cx.weak_entity();
         ask_later(cx, request, move |answer, cx| {
-            let _ = this.update(cx, |this, cx| this.sent(out, files, answer, cx));
+            let _ = this.update(cx, |this, cx| this.sent(out, files, scan, answer, cx));
         });
     }
 
@@ -865,12 +878,14 @@ impl Composer {
         cx.notify();
     }
 
-    fn sent(&mut self, out: Outgoing, files: bool, answer: std::io::Result<Response>, cx: &mut Context<Self>) {
+    fn sent(&mut self, out: Outgoing, files: bool,
+        scan: bool, answer: std::io::Result<Response>, cx: &mut Context<Self>) {
+        if self.target.as_ref().is_some_and(|now| now.key == out.key) {
         self.sending = false;
+        }
         if self.pending_file.as_ref().is_some_and(|(_, id)| id == &out.client_id) {
             self.pending_file = None;
         }
-        let hold = files && self.target.as_ref().is_some_and(|target| crate::tiny_attach::hold_chips(target.key.network, true, &target.can));
         let refused = match answer {
             Ok(Response::Sent { .. }) => {
                 let (key, client_id, made) = (out.key.clone(), out.client_id.clone(), out.made.clone());
@@ -883,8 +898,7 @@ impl Composer {
                 None
             }
             Ok(Response::Error { code: ErrorCode::Offline, .. }) if files => {
-                self.caption = Some(("Files need a connection. Your text and files are kept.".to_owned(), Tone::Offline));
-                cx.notify();
+                self.tell(&out.key, ("Files need a connection. Your text and files are kept.".to_owned(), Tone::Offline), cx);
                 return;
             }
             Ok(Response::Error { code: ErrorCode::Offline, .. }) => {
@@ -905,9 +919,27 @@ impl Composer {
             Err(_) => Some(format!("{NOT_ANSWERING} Not sent.")),
         };
         match refused {
-            Some(words) => self.caption = Some((words, Tone::Refused)),
-            None if hold => self.hold_tiny_files(out, cx),
+            Some(words) => self.tell(&out.key, (words, Tone::Refused), cx),
+            None if scan => self.hold_tiny_files(out, cx),
             None => self.went(&out, cx),
+        }
+        cx.notify();
+    }
+
+    /// A sentence about `key`. On screen it is the caption. Parked, it waits on that draft.
+    fn tell(&mut self, key: &Key, note: (String, Tone), cx: &mut Context<Self>) {
+        if self.target.as_ref().is_some_and(|now| &now.key == key) {
+            self.caption = Some(note);
+        } else if let Some(draft) = self.drafts.get_mut(key) {
+            draft.note = Some(note);
+        } else {
+            self.remember(
+                key.clone(),
+                Draft {
+                    note: Some(note),
+                    ..Draft::default()
+                },
+            );
         }
         cx.notify();
     }
@@ -944,7 +976,7 @@ impl Composer {
     /// The pending row is stored, and the file is still with the server. The chips stay, named
     /// once the verdict arrives. A verdict that arrived first is applied now.
     fn hold_tiny_files(&mut self, out: Outgoing, cx: &mut Context<Self>) {
-        self.caption = Some((crate::tiny_attach::scanning_words(out.chips.len()), Tone::Note));
+        self.tell(&out.key, (crate::tiny_attach::scanning_words(out.chips.len()), Tone::Note), cx);
         let settled = self.shell.update(cx, |shell, _| shell.take_tiny_file(&out.client_id)).ok().flatten();
         match settled {
             Some(Ok(())) => self.went(&out, cx),
@@ -968,8 +1000,7 @@ impl Composer {
     /// A blocked file stays in the tray, with the server's reason on the chip.
     fn refuse_tiny_files(&mut self, out: &Outgoing, reason: &str, cx: &mut Context<Self>) {
         let Some(words) = crate::tiny_attach::blocked_reason(reason) else {
-            self.caption = Some((format!("Not sent. {reason}"), Tone::Refused));
-            cx.notify();
+            self.tell(&out.key, (format!("Not sent. {reason}"), Tone::Refused), cx);
             return;
         };
         let mark = |chips: &mut [Staged]| {
@@ -982,11 +1013,10 @@ impl Composer {
         let here = self.target.as_ref().is_some_and(|now| now.key == out.key);
         if here {
             mark(&mut self.tray);
-            self.caption = Some((format!("Not sent. {words}"), Tone::Refused));
         } else if let Some(draft) = self.drafts.get_mut(&out.key) {
             mark(&mut draft.files);
         }
-        cx.notify();
+        self.tell(&out.key, (format!("Not sent. {words}"), Tone::Refused), cx);
     }
 
     /// The message is chatd's or the hold's now: the field empties, the chips that went leave
@@ -994,12 +1024,25 @@ impl Composer {
     fn went(&mut self, out: &Outgoing, cx: &mut Context<Self>) {
         let here = self.target.as_ref().is_some_and(|now| now.key == out.key);
         if !here {
+            // A GIF or sticker sent nothing that was typed. The follow-up stays.
+            if out.field.is_empty() && out.chips.is_empty() {
+                return;
+            }
+            let keep = self
+                .drafts
+                .get(&out.key)
+                .is_some_and(|draft| !parked_text_is_the_send(&draft.text, &out.field));
             if let Some(draft) = self.drafts.get_mut(&out.key) {
                 draft.files.retain(|chip| !out.chips.contains(&chip.id));
-                draft.text.clear();
-                draft.tokens.clear();
+                if !keep {
+                    draft.text.clear();
+                    draft.tokens.clear();
+                    draft.note = None;
+                }
             }
-            self.store_draft(out.key.clone(), String::new(), cx);
+            if !keep {
+                self.store_draft(out.key.clone(), String::new(), cx);
+            }
             return;
         }
         self.caption = None;
@@ -1029,13 +1072,32 @@ impl Composer {
 
     fn stage_files(&mut self, paths: Vec<PathBuf>, owned: bool, cx: &mut Context<Self>) {
         let Some(target) = self.target.clone().filter(|target| target.locked().is_none()) else {
+            if owned {
+                delete_later(paths);
+            }
             return;
         };
+        self.stage_files_for(target, paths, owned, cx);
+    }
+
+    /// Stages into `target`, the conversation the files were offered to, even if the user has
+    /// moved on while they were read.
+    fn stage_files_for(
+        &mut self,
+        target: Target,
+        paths: Vec<PathBuf>,
+        owned: bool,
+        cx: &mut Context<Self>,
+    ) {
         if paths.is_empty() {
             return;
         }
-        if !self.controls().attach {
-            self.refuse_files(cx);
+        if !controls(target.key.network, &target.can, false).attach {
+            let why = format!("{} can't take files here.", target.key.network.label());
+            self.tell(&target.key, (why, Tone::Note), cx);
+            if owned {
+                delete_later(paths);
+            }
             return;
         }
         let this = cx.weak_entity();
@@ -1044,55 +1106,116 @@ impl Composer {
                 .background_executor()
                 .spawn(async move { paths.into_iter().map(|path| (attach::look(&path), path)).map(|(found, path)| (path, found)).collect() })
                 .await;
-            let _ = this.update(cx, |this, cx| this.admit(&target.key, found, owned, cx));
+            let _ = this.update(cx, |this, cx| this.admit(target, found, owned, cx));
         })
         .detach();
     }
 
-    fn admit(&mut self, key: &Key, found: Vec<(PathBuf, Found)>, owned: bool, cx: &mut Context<Self>) {
-        let Some(target) = self.target.clone().filter(|target| target.key == *key) else {
-            if owned {
-                delete_later(found.into_iter().map(|(path, _)| path).collect());
+    fn admit(&mut self,
+        target: Target, found: Vec<(PathBuf, Found)>, owned: bool, cx: &mut Context<Self>) {
+        let here = self.target.as_ref().is_some_and(|now| now.key == target.key);
+        if !here && !self.drafts.contains_key(&target.key) {
+            self.remember(target.key.clone(), Draft::default());
             }
-            return;
-        };
         let network = target.key.network;
+        let can = target.can.clone();
+        let room = if here {
+            self.tray.len()
+        } else {
+            self.drafts
+                .get(&target.key)
+                .map_or(0, |draft| draft.files.len())
+        };
         let incoming: Vec<Staged> = found
             .into_iter()
             .map(|(path, found)| {
                 let id = self.next_chip;
                 self.next_chip += 1;
-                let mut chip = Staged::new(id, path, found, &target.can, network);
+                let mut chip = Staged::new(id, path, found, &can, network);
                 chip.owned = owned;
                 chip
             })
             .collect();
         let converting: Vec<(u64, PathBuf)> = incoming.iter().filter(|chip| chip.converting).map(|chip| (chip.id, chip.path.clone())).collect();
         let kept: Vec<u64> = incoming.iter().map(|chip| chip.id).collect();
-        let turned_away: Vec<PathBuf> = incoming.iter().skip(attach::most(&target.can).saturating_sub(self.tray.len())).filter(|chip| chip.owned).map(|chip| chip.path.clone()).collect();
-        let left = attach::admit(&mut self.tray, incoming, &target.can);
+        let turned_away: Vec<PathBuf> = incoming.iter().skip(attach::most(&can).saturating_sub(room)).filter(|chip| chip.owned).map(|chip| chip.path.clone()).collect();
+        let destination = if here {
+            &mut self.tray
+        } else {
+            let Some(draft) = self.drafts.get_mut(&target.key) else {
+                if owned {
+                    delete_later(
+                        incoming
+                            .into_iter()
+                            .filter(|chip| chip.owned)
+                            .map(|chip| chip.path)
+                            .collect(),
+                    );
+                }
+                return;
+            };
+            &mut draft.files
+        };
+        let left = attach::admit(destination, incoming, &can);
         delete_later(turned_away);
-        self.caption = (left > 0).then(|| (attach::overflow_words(network, &target.can, left), Tone::Note));
-        let staged: Vec<(u64, PathBuf)> = converting.into_iter().filter(|(id, _)| kept.contains(id) && self.tray.iter().any(|chip| chip.id == *id)).collect();
-        for (id, heic) in staged {
-            self.convert(id, heic, cx);
+        if left > 0 {
+            self.tell(&target.key, (attach::overflow_words(network, &can, left), Tone::Note), cx);
+        } else if here {
+            self.caption = None;
         }
-        self.focus_next = true;
+        let staged: Vec<(u64, PathBuf)> = converting.into_iter().filter(|(id, _)| kept.contains(id) && self.chip_held(&target.key, *id))
+            .collect();
+        let key = target.key.clone();
+        for (id, heic) in staged {
+            self.convert(key.clone(), id, heic, cx);
+        }
+        if here {
+            self.focus_next = true;
+        }
         cx.notify();
+    }
+
+    fn chip_held(&self, key: &Key, id: u64) -> bool {
+        let in_tray = self.target.as_ref().is_some_and(|now| &now.key == key)
+            && self.tray.iter().any(|chip| chip.id == id);
+        in_tray
+            || self
+                .drafts
+                .get(key)
+                .is_some_and(|draft| draft.files.iter().any(|chip| chip.id == id))
+    }
+
+    /// Applies `change` to the chip in the open tray or in the draft it was parked with.
+    fn with_chip(&mut self, key: &Key, id: u64, change: impl FnOnce(&mut Staged)) -> bool {
+        if self.target.as_ref().is_some_and(|now| &now.key == key) {
+            if let Some(chip) =
+            self.tray.iter_mut().find(|chip| chip.id == id) {
+                change(chip);
+                return true;
+        }
+        }
+        if let Some(chip) =
+        self.drafts
+            .get_mut(key)
+            .and_then(|draft| draft.files.iter_mut().find(|chip| chip.id == id))
+        {
+            change(chip);
+            return true;
+        }
+        false
     }
 
     /// A HEIC becomes a JPEG off the main thread; the chip sends that unless asked for the
     /// original.
-    fn convert(&mut self, id: u64, heic: PathBuf, cx: &mut Context<Self>) {
+    fn convert(&mut self, key: Key, id: u64, heic: PathBuf, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             let jpeg = cx.background_executor().spawn(async move { attach::heic_to_jpeg(&attach::outbox(), &heic) }).await;
             let _ = this.update(cx, |this, cx| {
-                match this.tray.iter_mut().find(|chip| chip.id == id) {
-                    Some(chip) => {
+                let applied = this.with_chip(&key, id, |chip| {
                         chip.converting = false;
-                        chip.converted = jpeg;
-                    }
-                    None => delete_later(jpeg.into_iter().collect()),
+                        chip.converted = jpeg.clone();
+                    });
+                if !applied { delete_later(jpeg.into_iter().collect());
                 }
                 cx.notify();
             });
@@ -1116,25 +1239,24 @@ impl Composer {
     /// A screenshot pasted: its pixels are written to `outbox/` off the main thread, then
     /// staged like any file.
     fn stage_pasted(&mut self, image: gpui::Image, cx: &mut Context<Self>) {
-        if self.target.as_ref().is_none_or(|target| target.locked().is_some()) {
+        let Some(target) = self.target.clone().filter(|target| target.locked().is_none())
+        else {
             return;
-        }
+        };
         if !self.controls().attach {
             self.refuse_files(cx);
             return;
         }
         let extension = image.format.extension();
+        let key = target.key.clone();
         cx.spawn(async move |this, cx| {
             let written = cx
                 .background_executor()
                 .spawn(async move { attach::write_pasted(&attach::outbox(), &image.bytes, extension, SystemTime::now()) })
                 .await;
             let _ = this.update(cx, |this, cx| match written {
-                Ok(path) => this.stage_files(vec![path], true, cx),
-                Err(err) => {
-                    this.caption = Some((format!("The picture couldn't be kept for sending: {err}."), Tone::Refused));
-                    cx.notify();
-                }
+                Ok(path) => this.stage_files_for(target, vec![path], true, cx),
+                Err(err) => this.tell(&key, (format!("The picture couldn't be kept for sending: {err}."), Tone::Refused), cx),
             });
         })
         .detach();
@@ -1142,13 +1264,17 @@ impl Composer {
 
     /// ⌘U: the system's file panel, several at once.
     fn attach_files(&mut self, cx: &mut Context<Self>) {
-        if !self.controls().attach || self.target.as_ref().is_none_or(|target| target.locked().is_some()) {
+        let Some(target) = self.target.clone().filter(|target| target.locked().is_none())
+        else {
+            return;
+        };
+        if !self.controls().attach {
             return;
         }
         let asked = cx.prompt_for_paths(PathPromptOptions { files: true, directories: false, multiple: true, prompt: Some("Attach".into()) });
         cx.spawn(async move |this, cx| {
             if let Ok(Ok(Some(paths))) = asked.await {
-                let _ = this.update(cx, |this, cx| this.stage_paths(paths, cx));
+                let _ = this.update(cx, |this, cx| this.stage_files_for(target, paths, false, cx));
             }
         })
         .detach();
@@ -1159,6 +1285,10 @@ impl Composer {
         if !self.controls().gif || self.target.as_ref().is_none_or(|target| target.key.network != Network::Tiny || target.locked().is_some()) {
             return;
         }
+        let Some(target) = self.target.clone() else {
+            return;
+        };
+        let key = target.key.clone();
         let asked = cx.prompt_for_paths(PathPromptOptions { files: true, directories: false, multiple: true, prompt: Some("Send a GIF".into()) });
         cx.spawn(async move |this, cx| {
             if let Ok(Ok(Some(paths))) = asked.await {
@@ -1168,11 +1298,10 @@ impl Composer {
                         .filter(|path| path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("gif")))
                         .collect();
                     if gifs.is_empty() {
-                        this.caption = Some(("Choose a GIF.".to_owned(), Tone::Refused));
-                        cx.notify();
+                        this.tell(&key, ("Choose a GIF.".to_owned(), Tone::Refused), cx);
                         return;
                     }
-                    this.stage_paths(gifs, cx);
+                    this.stage_files_for(target, gifs, false, cx);
                 });
             }
         })
@@ -1358,12 +1487,14 @@ impl Composer {
                 self.draft_timer = None;
                 self.follow_text(cx);
                 let files = std::mem::take(&mut self.tray);
-                (Draft { text: self.input.read(cx).text().to_owned(), tokens: self.tokens.clone(), files }, self.reply.take())
+                (Draft { text: self.input.read(cx).text().to_owned(), tokens: self.tokens.clone(), files,
+                        note: self.caption.clone(), }, self.reply.take())
             }
         };
         let (text, tokens) = mention::source(message);
         self.editing = Some(Editing { id: message.id.clone(), original: text.clone(), stash, reply });
-        self.set_field(&Draft { text, tokens, files: Vec::new() }, cx);
+        self.set_field(&Draft { text, tokens, files: Vec::new(),
+                note: None, }, cx);
         self.close_picker(cx);
         self.caption = None;
         self.armed = None;
@@ -2244,7 +2375,8 @@ impl Composer {
     /// The states `--composer` names. Nothing here asks chatd for anything that changes it.
     #[cfg(feature = "gui-shot")]
     fn stage_flag(&mut self, cx: &mut Context<Self>) {
-        let field = |text: &str, tokens: Vec<Token>| Draft { text: text.to_owned(), tokens, files: Vec::new() };
+        let field = |text: &str, tokens: Vec<Token>| Draft { text: text.to_owned(), tokens, files: Vec::new(),
+            note: None, };
         let Some(target) = self.target.clone() else {
             return;
         };
@@ -3060,6 +3192,14 @@ mod tests {
     fn the_placeholder_names_where_the_message_goes() {
         assert_eq!(placeholder("#platform", false), "Message #platform");
         assert_eq!(placeholder("#platform", true), "Reply in thread");
+    }
+
+    #[test]
+    fn a_follow_up_typed_before_the_send_lands_is_kept() {
+        assert!(parked_text_is_the_send("hello", "hello"));
+        assert!(parked_text_is_the_send("", "   "));
+        assert!(!parked_text_is_the_send("hello!", "hello"));
+        assert!(!parked_text_is_the_send("hello", ""));
     }
 
     fn target(link: Link, kind: ConversationKind, read_only: bool) -> Target {
