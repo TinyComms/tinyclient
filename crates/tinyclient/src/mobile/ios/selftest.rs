@@ -20,8 +20,16 @@ pub(super) fn maybe_start(platform: Arc<dyn Platform>) {
     if !cfg!(debug_assertions) {
         return;
     }
-    let asked = NSProcessInfo::processInfo().arguments().iter().any(|argument| argument.to_string() == "-tinySelfTest");
-    if !asked {
+    let arguments: Vec<String> = NSProcessInfo::processInfo().arguments().iter().map(|argument| argument.to_string()).collect();
+    if let Some(at) = arguments.iter().position(|argument| argument == "-tinyAuthTest") {
+        if let Some(page) = arguments.get(at + 1).cloned() {
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(4));
+                auth(&page);
+            });
+        }
+    }
+    if !arguments.iter().any(|argument| argument == "-tinySelfTest") {
         return;
     }
     std::thread::spawn(move || {
@@ -29,6 +37,57 @@ pub(super) fn maybe_start(platform: Arc<dyn Platform>) {
         std::thread::sleep(Duration::from_secs(4));
         run(&*platform);
     });
+}
+
+/// The Tiny sign-in's platform half, as chatd drives it: a loopback listener on
+/// `127.0.0.1:<port>/callback`, `open_auth` with the provider page `page` (given
+/// `redirect_uri` = that callback), then whatever reaches the listener, logged as `selftest:`.
+fn auth(page: &str) {
+    use std::io::{Read, Write};
+    let Some(provider) = protocol::web_sign_in::provider() else {
+        return log::info!("selftest: auth FAILED: no web sign-in registered");
+    };
+    let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
+        Ok(listener) => listener,
+        Err(error) => return log::info!("selftest: auth FAILED: loopback bind: {error}"),
+    };
+    let port = listener.local_addr().map(|address| address.port()).unwrap_or(0);
+    let callback = format!("http://127.0.0.1:{port}/callback");
+    let separator = if page.contains('?') { '&' } else { '?' };
+    let url = format!("{page}{separator}redirect_uri={callback}&state=selftest-state");
+    let request = protocol::web_sign_in::AuthRequest {
+        url: url.clone(),
+        callback: callback.clone(),
+        redirected: Arc::new(|url| log::info!("selftest: auth session handed back {url}")),
+    };
+    let mut handle = match provider.open_auth(request) {
+        Ok(handle) => handle,
+        Err(words) => return log::info!("selftest: auth FAILED: {words}"),
+    };
+    log::info!("selftest: auth session opened at {url}");
+    let _ = listener.set_nonblocking(true);
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    while std::time::Instant::now() < deadline {
+        if handle.closed() {
+            return log::info!("selftest: auth session closed by the user");
+        }
+        if let Ok((mut stream, _)) = listener.accept() {
+            let _ = stream.set_nonblocking(false);
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            let mut buffer = [0u8; 2048];
+            let read = stream.read(&mut buffer).unwrap_or(0);
+            let first = String::from_utf8_lossy(&buffer[..read]).lines().next().unwrap_or("").to_owned();
+            let body = "<!doctype html><body style=\"font:20px -apple-system;padding:24px\">Signed in. You can go back to Tiny.</body>";
+            let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            log::info!("selftest: loopback callback received: {first}");
+            std::thread::sleep(Duration::from_secs(3));
+            handle.close();
+            return log::info!("selftest: auth session closed by the app");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    handle.close();
+    log::info!("selftest: auth timed out");
 }
 
 fn synthetic(width: u32, height: u32, tick: u32) -> VideoFrame {

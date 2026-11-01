@@ -37,10 +37,9 @@ define_class!(
 
     unsafe impl NSObjectProtocol for Anchor {}
 
-    unsafe impl ASWebAuthenticationPresentationContextProviding for Anchor {}
-
-    impl Anchor {
-        /// The protocol's one method; objc2 declares it for macOS only, so it is defined here.
+    unsafe impl ASWebAuthenticationPresentationContextProviding for Anchor {
+        /// The protocol's one required method (objc2 declares its Rust signature for macOS
+        /// only; the class must still register it in the protocol's block).
         #[unsafe(method(presentationAnchorForWebAuthenticationSession:))]
         fn anchor(&self, _session: &ASWebAuthenticationSession) -> *mut UIWindow {
             // UIKit keeps the key window alive; it is returned at +0, as `method_family = none` says.
