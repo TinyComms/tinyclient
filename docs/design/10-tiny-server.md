@@ -31,6 +31,10 @@ or move; Kick removes, Roles is Owner / Admin / Member.
   — · Servers (a check per signed-in server, when there are several) · Join another server ·
   Sign out of this server… (`danger`, asks first). Only what is allowed shows; Server settings
   always shows, its pages read-only where they must be.
+- **Before the server answers,** the column is its own list as shapes: a section label, four text
+  channel rows, then two categories with their rooms and a seat under the first, all at the
+  heights and insets those rows will take, in static `hover` and `raised` blocks. They are not
+  controls until they are rows, so nothing lights under the pointer.
 - **Text channels** come first, under a header "TEXT CHANNELS" (omitted when there are none).
   A row is 28: hash glyph, name. A click opens that conversation in the ordinary pane. Direct
   messages are not rows here. Message, in the person menu, opens one in People.
@@ -77,6 +81,10 @@ or move; Kick removes, Roles is Owner / Admin / Member.
   and its topic (`text_soft`, truncating), and chips: `3 of 12` (or `3 in call`, `warning`
   when full), `Push to talk` (`accent_soft`), `96 kb/s`. At the right, the member list toggle
   (28, lit while shown), clear of the window's buttons.
+- **Before the server answers,** the pane is the splash of `01-system.md` §3: the server's mark
+  56, `Tiny server` 20/600, and one line, "Getting this server's channels, people and rooms.",
+  with the mark breathing while it waits. In a window too narrow for the sidebar the column's
+  shapes sit above it, as the list sits above the home or the channel once it loads.
 - **Home,** a column at most 720 wide, 32 in: icon 72 squared, name 20/600, description, then
   `11 members · 8 online · 3 in voice` 12 `text_faint`. Invite people (primary, if allowed)
   and Join <default channel>. The welcome in a card (`raised`, hairline, radius 8, 16 in) with

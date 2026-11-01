@@ -20,6 +20,7 @@ mod channel;
 pub(super) mod column;
 mod home;
 mod layer;
+mod loading;
 mod members;
 mod menus;
 mod modals;
@@ -404,7 +405,7 @@ impl Shell {
     }
 
     pub(super) fn tiny_open(&self) -> bool {
-        self.tiny_state.seen
+        self.tiny_state.seen || loading::shot_loading()
     }
 
     /// The server the page is showing, when one has been chosen.
@@ -489,6 +490,9 @@ impl Shell {
 
     /// The page, when it has loaded.
     pub(super) fn tiny_page_facts(&self) -> Option<Page<'_>> {
+        if loading::shot_loading() {
+            return None;
+        }
         let community = self.tiny_state.community.as_ref()?;
         let account = self.tiny_state.account.as_ref()?;
         let me = if community.me.is_empty() { account.account.as_str() } else { community.me.as_str() };
