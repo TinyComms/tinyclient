@@ -51,6 +51,11 @@ struct Flow {
     step: SignInStep,
     adopt: Arc<Adopt>,
     browser: Browser,
+    /// The server the person was last told is reached over plain http, off their own network. The
+    /// same server asked for again is their yes; any other starts the question over.
+    warned: String,
+    /// They said yes to `server`. It goes into the session, so that the session may be used.
+    plain_http_ok: bool,
     /// The browser is out: the page it was sent to, and the switch that stops listening for it.
     out: Option<Out>,
 }
@@ -154,6 +159,8 @@ fn bare_token(raw: &str) -> bool {
     !raw.is_empty() && raw.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
+/// What to do to go on past the plain-http warning.
+const CONFIRM_PLAIN_HTTP: &str = "To go on anyway, continue again.";
 const OVER: &str = "That sign-in is over. Start again.";
 const DENIED: &str = "The sign-in was turned down in your browser.";
 const FAILED: &str = "The server couldn't finish the sign-in. Try again.";
@@ -187,6 +194,8 @@ pub(crate) fn step_with(
             },
             adopt: Arc::new(adopt),
             browser: browser(),
+            warned: String::new(),
+            plain_http_ok: false,
             out: None,
         });
         return Ok(flow.step.clone());
@@ -369,6 +378,9 @@ impl Flow {
     fn begin_browser(&mut self) -> SignInStep {
         self.stop();
         self.out = None;
+        if let Some(step) = self.plain_http_gate() {
+            return step;
+        }
         let (stay, failed) = match auth_config(&self.server) {
             Ok(provider) => {
                 self.provider = provider;
@@ -416,6 +428,7 @@ impl Flow {
             patience: self.browser.patience,
             stop: stop.clone(),
             adopt: self.adopt.clone(),
+            plain_http_ok: self.plain_http_ok,
         };
         let spawned = std::thread::Builder::new()
             .name("tiny-signin".into())
@@ -425,6 +438,25 @@ impl Flow {
         }
         self.out = Some(Out { authorize_url, stop });
         self.open_again()
+    }
+
+    /// A server reached over plain http that is not on this computer or a network of the person's
+    /// own gets nothing sent to it until the person has been told in words and asks for the same
+    /// server again: nothing is asked of it, not even its sign-in page. The yes is kept
+    /// (`plain_http_ok`) and goes into the session. An address on this computer or the person's
+    /// own network is not stopped; the sheet shows it a warning of its own.
+    fn plain_http_gate(&mut self) -> Option<SignInStep> {
+        self.plain_http_ok = false;
+        if protocol::reach(&self.server) != protocol::Reach::Open {
+            return None;
+        }
+        if self.warned == self.server {
+            self.plain_http_ok = true;
+            return None;
+        }
+        self.warned = self.server.clone();
+        let words = protocol::plain_http_words(protocol::Reach::Open).unwrap_or_default();
+        Some(self.stay(SignInProblem::Other { reason: format!("{words} {CONFIRM_PLAIN_HTTP}") }))
     }
 
     /// A problem before the browser is out. The first try stays on the step that asked; a try
@@ -471,6 +503,7 @@ struct Wait {
     patience: Duration,
     stop: Arc<AtomicBool>,
     adopt: Arc<Adopt>,
+    plain_http_ok: bool,
 }
 
 impl Wait {
@@ -508,7 +541,8 @@ impl Wait {
         self.show(next);
     }
 
-    fn kept(&self, saved: super::Saved) -> SignInStep {
+    fn kept(&self, mut saved: super::Saved) -> SignInStep {
+        saved.plain_http_ok = self.plain_http_ok;
         let account = saved.user_id.clone();
         let Ok(session) = serde_json::to_string(&saved) else {
             return SignInStep::Failed {
@@ -756,6 +790,75 @@ mod tests {
         cancel();
     }
 
+
+    #[test]
+    fn plain_http_off_the_persons_network_is_asked_about_before_anything_is_sent() {
+        let _one = one_sheet();
+        cancel();
+        let hub = hub();
+        step(&hub, None, adopt()).unwrap();
+        step(&hub, Some(SignInInput::HaveCode { url: String::new() }), adopt()).unwrap();
+        let typed = |hub: &Arc<Hub>, url: &str| step(hub, Some(SignInInput::Server { url: url.into() }), adopt()).unwrap();
+        let words = |step: SignInStep| match step {
+            SignInStep::Server { problem: Some(SignInProblem::Other { reason }) } => reason,
+            other => panic!("not the question: {other:?}"),
+        };
+        // First try: a question in words, on the address that was typed. `.invalid` never
+        // resolves, so had anything been sent the answer would be "could not reach".
+        let asked = words(typed(&hub, "http://chat.example.invalid"));
+        assert!(asked.contains("http, not https") && asked.contains("not on your own network"), "{asked}");
+        assert!(asked.contains("continue again"), "it says how to go on: {asked}");
+        // A different address starts the question over.
+        assert!(words(typed(&hub, "http://other.example.invalid")).contains("http, not https"));
+        // The same one again is a yes: now it is asked for its sign-in page, which fails here.
+        assert_eq!(
+            typed(&hub, "http://other.example.invalid"),
+            SignInStep::Server { problem: Some(SignInProblem::Unreachable) },
+            "past the question the sign-in goes ahead"
+        );
+        // This computer is not stopped. (A person's own network is not either: see `protocol::reach`.)
+        let reply = typed(&hub, "http://127.0.0.1:9");
+        assert_eq!(reply, SignInStep::Server { problem: Some(SignInProblem::Unreachable) });
+        // https is never asked about.
+        assert_eq!(
+            typed(&hub, "https://chat.example.invalid"),
+            SignInStep::Server { problem: Some(SignInProblem::Unreachable) }
+        );
+        cancel();
+    }
+
+    #[test]
+    fn a_yes_to_plain_http_goes_into_the_session_and_nothing_else_does() {
+        let kept = Arc::new(Mutex::new(Vec::<String>::new()));
+        let wait = |ok: bool| {
+            let kept = kept.clone();
+            let adopt: Adopt = Box::new(move |session: &str| {
+                kept.lock().unwrap().push(session.to_owned());
+                Ok(Vec::new())
+            });
+            Wait {
+                hub: hub(),
+                server: "http://chat.example.invalid".into(),
+                provider: String::new(),
+                state: String::new(),
+                verifier: String::new(),
+                patience: Duration::from_secs(1),
+                stop: Arc::new(AtomicBool::new(false)),
+                adopt: Arc::new(adopt),
+                plain_http_ok: ok,
+            }
+        };
+        let session = || super::super::saved_from("http://chat.example.invalid", serde_json::json!({ "token": "t", "user_id": ADA, "email": null, "display_name": "Ada", "role": "member" })).ok().expect("a session");
+        for ok in [false, true] {
+            // A fresh answer from the server never carries the flag itself.
+            assert!(!session().plain_http_ok);
+            wait(ok).kept(session());
+        }
+        let kept = kept.lock().unwrap();
+        assert!(!kept[0].contains("plain_http_ok"), "no yes, no field: {}", kept[0]);
+        assert!(kept[1].contains("\"plain_http_ok\":true"), "{}", kept[1]);
+        assert!(super::super::parse(&kept[1]).is_ok());
+    }
     #[test]
     fn the_address_is_an_origin() {
         assert_eq!(base_url("  https://Example.com/  ").as_deref(), Some("https://Example.com"));

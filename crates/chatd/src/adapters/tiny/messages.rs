@@ -1115,6 +1115,7 @@ mod tests {
             email: Some("ada@example.com".to_owned()),
             display_name: "Ada".to_owned(),
             role: "owner".to_owned(),
+            plain_http_ok: false,
         }
     }
 

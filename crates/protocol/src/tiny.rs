@@ -1068,6 +1068,106 @@ pub fn tiny_can(role: &str, id: &str) -> bool {
     }
 }
 
+/// How far what is sent to a Tiny server can be read on the way, from the address alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reach {
+    /// `https`.
+    Secure,
+    /// `http` to this computer: nothing leaves it.
+    Loopback,
+    /// `http` to a machine that is, by its address or its name, on a network of the person's own
+    /// (a private or link-local address, a Tailscale address, a bare machine name, `.local`,
+    /// `.lan`, `.home.arpa`, `.internal`, `.ts.net`). Anyone on that network can read it.
+    PrivateNetwork,
+    /// `http` to anything else: the open internet, or a name this cannot place.
+    Open,
+}
+
+/// What an address reaches. A typed host with no scheme is `https`, except a machine on this
+/// computer, which is `http`, as the sign-in sheet reads it. A scheme other than `http` and
+/// `https` is [`Reach::Open`]: nothing here sends over it.
+pub fn reach(raw: &str) -> Reach {
+    let raw = raw.trim();
+    let (scheme, rest) = match raw.split_once("://") {
+        Some((scheme, rest)) => (Some(scheme.to_ascii_lowercase()), rest),
+        None => (None, raw),
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    let host = match authority.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or(""),
+        None => match authority.rsplit_once(':') {
+            Some((host, port)) if port.bytes().all(|byte| byte.is_ascii_digit()) => host,
+            _ => authority,
+        },
+    };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    match scheme.as_deref() {
+        Some("https") => Reach::Secure,
+        Some("http") => host_reach(&host),
+        None if matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1" | "0.0.0.0") => Reach::Loopback,
+        None => Reach::Secure,
+        Some(_) => Reach::Open,
+    }
+}
+
+fn host_reach(host: &str) -> Reach {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    fn v4(ip: Ipv4Addr) -> Reach {
+        let [a, b, ..] = ip.octets();
+        if ip.is_loopback() || ip.is_unspecified() {
+            Reach::Loopback
+        } else if ip.is_private() || ip.is_link_local() || (a == 100 && (64..128).contains(&b)) {
+            Reach::PrivateNetwork
+        } else {
+            Reach::Open
+        }
+    }
+    fn v6(ip: Ipv6Addr) -> Reach {
+        if let Some(mapped) = ip.to_ipv4_mapped() {
+            return v4(mapped);
+        }
+        let first = ip.segments()[0];
+        if ip.is_loopback() || ip.is_unspecified() {
+            Reach::Loopback
+        } else if first & 0xfe00 == 0xfc00 || first & 0xffc0 == 0xfe80 {
+            Reach::PrivateNetwork
+        } else {
+            Reach::Open
+        }
+    }
+    if host.is_empty() {
+        return Reach::Open;
+    }
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(ip)) => return v4(ip),
+        Ok(IpAddr::V6(ip)) => return v6(ip),
+        Err(_) => {}
+    }
+    if host == "localhost" || host.ends_with(".localhost") {
+        return Reach::Loopback;
+    }
+    let named_for_a_private_network = [".local", ".lan", ".home.arpa", ".internal", ".ts.net"].iter().any(|suffix| host.ends_with(suffix));
+    // A bare machine name, but not a bare number: some resolvers read one as an address.
+    let bare = !host.contains('.') && !host.bytes().all(|byte| byte.is_ascii_digit());
+    if named_for_a_private_network || bare {
+        Reach::PrivateNetwork
+    } else {
+        Reach::Open
+    }
+}
+
+/// What to tell a person about an `http` address, or nothing for one that needs no telling.
+pub fn plain_http_words(reach: Reach) -> Option<&'static str> {
+    match reach {
+        Reach::Secure | Reach::Loopback => None,
+        Reach::PrivateNetwork => Some("This address uses http, not https. Anyone on your network between you and the server can read what you send, your sign-in included."),
+        Reach::Open => Some(
+            "This address uses http, not https, and the server is not on your own network. Anyone between you and it can read what you send, your sign-in included, and take over your account. Use https if the server has it.",
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -1340,5 +1440,72 @@ mod tests {
         assert!(!json.contains("accepted"));
         let back: TinyInvite = serde_json::from_str(r#"{"id":"1","role":"member","created_by":"a","expires_at":"t"}"#).unwrap();
         assert_eq!(back, invite);
+    }
+
+    #[test]
+    fn an_address_reaches_as_far_as_its_scheme_and_host_say() {
+        use super::Reach::*;
+        let cases = [
+            ("https://chat.example", Secure),
+            ("HTTPS://chat.example:8443/x", Secure),
+            ("chat.example", Secure),
+            ("chat.example:8080", Secure),
+            ("http://localhost:8080", Loopback),
+            ("http://127.0.0.1:8080", Loopback),
+            ("http://127.9.9.9", Loopback),
+            ("http://[::1]:8080", Loopback),
+            ("http://0.0.0.0:8080", Loopback),
+            ("http://dev.localhost", Loopback),
+            ("localhost", Loopback),
+            ("127.0.0.1:8080", Loopback),
+            ("[::1]:8080", Loopback),
+            ("http://192.168.1.120", PrivateNetwork),
+            ("http://10.0.0.5:8080", PrivateNetwork),
+            ("http://172.16.0.1", PrivateNetwork),
+            ("http://172.31.255.254", PrivateNetwork),
+            ("http://169.254.10.10", PrivateNetwork),
+            ("http://100.73.171.76", PrivateNetwork),
+            ("http://100.127.101.103", PrivateNetwork),
+            ("http://[fd12:3456::1]", PrivateNetwork),
+            ("http://[fe80::1]", PrivateNetwork),
+            ("http://[::ffff:192.168.1.5]", PrivateNetwork),
+            ("http://atomicstudio", PrivateNetwork),
+            ("http://atomicstudio:8080", PrivateNetwork),
+            ("http://printer.local", PrivateNetwork),
+            ("http://nas.lan", PrivateNetwork),
+            ("http://box.home.arpa", PrivateNetwork),
+            ("http://svc.internal", PrivateNetwork),
+            ("http://atomicstudio.tail1234.ts.net", PrivateNetwork),
+            ("http://172.32.0.1", Open),
+            ("http://100.128.0.1", Open),
+            ("http://100.63.0.1", Open),
+            ("http://8.8.8.8", Open),
+            ("http://chat.example", Open),
+            ("http://chat.example:80", Open),
+            ("http://localhost.example.com", Open),
+            ("http://192.168.1.1.example.com", Open),
+            ("http://[2001:db8::1]", Open),
+            ("http://2130706433", Open),
+            ("http://127.1", Open),
+            ("http://", Open),
+            ("ftp://chat.example", Open),
+        ];
+        for (address, expected) in cases {
+            assert_eq!(super::reach(address), expected, "{address}");
+        }
+        // A user name does not move the host: what is before the `@` is not the server.
+        assert_eq!(super::reach("http://192.168.1.1@chat.example"), Open);
+        assert_eq!(super::reach("http://chat.example@192.168.1.1"), PrivateNetwork);
+    }
+
+    #[test]
+    fn only_a_plain_http_address_off_this_computer_is_warned_about_and_the_open_one_says_so_plainly() {
+        use super::Reach::*;
+        assert_eq!(super::plain_http_words(Secure), None);
+        assert_eq!(super::plain_http_words(Loopback), None);
+        let own = super::plain_http_words(PrivateNetwork).unwrap();
+        assert!(own.contains("http, not https") && own.contains("your network"));
+        let open = super::plain_http_words(Open).unwrap();
+        assert!(open.contains("http, not https") && open.contains("not on your own network") && open.contains("take over your account"));
     }
 }
