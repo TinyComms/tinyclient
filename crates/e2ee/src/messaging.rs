@@ -150,6 +150,9 @@ impl Engine {
     /// that is not the claimed author or device ([`Error::SenderMismatch`]); a kind or target other
     /// than what the sender signed ([`Error::AadMismatch`]); an envelope that does not parse.
     ///
+    /// A message that is refused, for any of these reasons, spends no key: the state is put back
+    /// as it was, so the genuine message for that sender and generation still opens.
+    ///
     /// A message this device sent cannot be opened by it (MLS does not allow it): keep the
     /// plaintext when you send.
     pub fn decrypt(
@@ -186,43 +189,57 @@ impl Engine {
                 local,
             });
         }
-        let processed = match guard(|| group.process_message(&*provider, protocol)) {
-            Ok(Ok(processed)) => processed,
-            Ok(Err(_)) | Err(_) => {
-                // The key may have been advanced in memory before the check failed; the stored
-                // state has not. Reload it, so a forged message cannot spend a real one's key.
+        // OpenMLS writes the advanced secret tree to the storage once the AEAD opens, before it
+        // checks the sender's signature. Any member can make a ciphertext that opens under another
+        // member's leaf and generation (they all hold the tree) with a bad signature; without
+        // this, it would spend the real message's key for good. So every failure from here on
+        // puts the storage back as it was and reloads the group from it: a message that is not
+        // accepted spends nothing.
+        let checkpoint = provider.checkpoint();
+        let opened = (|| -> Result<(DeviceRef, Envelope)> {
+            let processed = match guard(|| group.process_message(&*provider, protocol)) {
+                Ok(Ok(processed)) => processed,
+                Ok(Err(_)) | Err(_) => return Err(Error::Undecryptable),
+            };
+            let mls::Sender::Member(leaf) = *processed.sender() else {
+                return Err(Error::SenderMismatch);
+            };
+            let member = group.member_at(leaf).ok_or(Error::SenderMismatch)?;
+            let sender = {
+                let (user, device) =
+                    crate::ids::parse_credential(member.credential.serialized_content())?;
+                DeviceRef {
+                    user,
+                    device,
+                    signature_key: member.signature_key.clone(),
+                }
+            };
+            if claimed.author.is_some_and(|author| author != sender.user)
+                || claimed.device.is_some_and(|device| device != sender.device)
+            {
+                return Err(Error::SenderMismatch);
+            }
+            if processed.aad() != aad(claimed.kind, claimed.target_id).as_slice() {
+                return Err(Error::AadMismatch);
+            }
+            let mls::ProcessedMessageContent::ApplicationMessage(application) =
+                processed.into_content()
+            else {
+                return Err(Error::Malformed("ciphertext"));
+            };
+            let plaintext = Zeroizing::new(application.into_bytes());
+            let envelope = Envelope::decode(claimed.kind, &plaintext)?;
+            Ok((sender, envelope))
+        })();
+        let (sender, envelope) = match opened {
+            Ok(opened) => opened,
+            Err(error) => {
+                provider.restore(checkpoint);
                 groups.remove(&conv);
-                return Err(Error::Undecryptable);
+                return Err(error);
             }
         };
-        let mls::Sender::Member(leaf) = *processed.sender() else {
-            return Err(Error::SenderMismatch);
-        };
-        let member = group.member_at(leaf).ok_or(Error::SenderMismatch)?;
-        let sender = {
-            let (user, device) =
-                crate::ids::parse_credential(member.credential.serialized_content())?;
-            DeviceRef {
-                user,
-                device,
-                signature_key: member.signature_key.clone(),
-            }
-        };
-        if claimed.author.is_some_and(|author| author != sender.user)
-            || claimed.device.is_some_and(|device| device != sender.device)
-        {
-            return Err(Error::SenderMismatch);
-        }
-        if processed.aad() != aad(claimed.kind, claimed.target_id).as_slice() {
-            return Err(Error::AadMismatch);
-        }
-        let mls::ProcessedMessageContent::ApplicationMessage(application) =
-            processed.into_content()
-        else {
-            return Err(Error::Malformed("ciphertext"));
-        };
-        let plaintext = Zeroizing::new(application.into_bytes());
-        let envelope = Envelope::decode(claimed.kind, &plaintext)?;
+        drop(checkpoint);
         let sender_trusted = trust.is_trusted(sender.user, sender.device, &sender.signature_key);
         self.persist(false)?;
         Ok(Incoming {
@@ -233,6 +250,35 @@ impl Engine {
             target_id: claimed.target_id.map(str::to_owned),
             envelope,
         })
+    }
+
+    /// A ciphertext under this device's leaf, at the generation its next real message will use,
+    /// signed by `signer` instead of this device's key: what a member gone bad can make for any
+    /// other member's leaf, since every member holds the whole secret tree. For tests of the
+    /// receiving side. Nothing is spent: this device's state is put back as it was.
+    #[doc(hidden)]
+    pub fn forge_message(
+        &mut self,
+        conv: ConversationId,
+        signer: &crate::identity::DeviceKey,
+        envelope: &Envelope,
+    ) -> Result<Vec<u8>> {
+        self.usable(conv)?;
+        self.load_group(conv)?;
+        let Engine {
+            groups, provider, ..
+        } = self;
+        let group = groups.get_mut(&conv).ok_or(Error::NoGroup)?;
+        let checkpoint = provider.checkpoint();
+        let plaintext = Zeroizing::new(envelope.encode(Kind::Message)?);
+        group.set_aad(aad(Kind::Message, None));
+        let message = group
+            .create_message(&*provider, signer, &plaintext)
+            .map_err(Error::mls)
+            .and_then(|message| message.tls_serialize_detached().map_err(Error::mls));
+        provider.restore(checkpoint);
+        groups.remove(&conv);
+        message
     }
 
     /// The safety number between this person and `other`, over the devices each is trusted to

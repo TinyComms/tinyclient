@@ -123,7 +123,9 @@ fn replay_tamper_and_wrong_sender_are_refused() {
         Err(Error::Undecryptable)
     ));
 
-    // Tamper: flipping any byte fails, and does not spend the real message's key.
+    // Tamper: flipping any byte fails (in parsing or in the AEAD, before any key is spent), and
+    // the real message still opens. A forgery that gets past the AEAD is
+    // `a_forged_signature_does_not_spend_the_real_message_key`.
     let ciphertext = world.send(a, "genuine");
     for at in [0, 9, ciphertext.len() / 2, ciphertext.len() - 1] {
         let mut bad = ciphertext.clone();
@@ -135,7 +137,7 @@ fn replay_tamper_and_wrong_sender_are_refused() {
     }
     let opened = world
         .open(b, &ciphertext, a)
-        .expect("the real message still opens after forgeries");
+        .expect("the real message still opens after tampered copies");
     assert_eq!(opened.envelope.text, "genuine");
 
     // Truncation.
@@ -160,7 +162,9 @@ fn replay_tamper_and_wrong_sender_are_refused() {
         },
     );
     assert!(matches!(err, Err(Error::SenderMismatch)), "{err:?}");
-    // The failed check spent the key (the message opened before the check); send another.
+    // A refused message spends no key: under the true claims the same ciphertext opens.
+    let opened = world.open(c, &ciphertext, a).unwrap();
+    assert_eq!(opened.envelope.text, "from alice");
     let ciphertext = world.send(a, "from alice again");
     let err = world.clients[c].engine.decrypt(
         conv,
@@ -1626,4 +1630,57 @@ fn bytes_shown_for_an_old_epoch_that_are_no_commit_do_not_freeze_the_group() {
     assert!(err.is_err(), "{err:?}");
     assert!(world.clients[b].engine.frozen(conv).is_none());
     world.say(a, &[b, c], "nothing froze");
+}
+
+#[test]
+fn a_forged_signature_does_not_spend_the_real_message_key() {
+    // Every member holds the whole secret tree, so a member gone bad can make a ciphertext that
+    // opens under another member's leaf and next generation; only the signature is wrong. OpenMLS
+    // stores the advanced key before it checks the signature: the refusal must put it back, or
+    // the real message for that generation can never be opened.
+    let mut world = World::new();
+    let (a, b, c) = (world.person("a"), world.person("b"), world.person("c"));
+    world.sync_trust();
+    world.start(a);
+    world.change(&[a], a, &[b, c], &[]);
+    world.say(a, &[b, c], "a first message, so the generation is not zero");
+    let conv = world.conv();
+    let wrong_key = DeviceKey::generate().unwrap();
+    let forged = world.clients[a]
+        .engine
+        .forge_message(conv, &wrong_key, &envelope("forged"))
+        .unwrap();
+    for at in [b, c] {
+        for _ in 0..2 {
+            assert!(
+                matches!(world.open(at, &forged, a), Err(Error::Undecryptable)),
+                "a forged signature was accepted"
+            );
+        }
+    }
+    // The real message uses the generation the forgery claimed.
+    let genuine = world.send(a, "genuine");
+    for at in [b, c] {
+        let opened = world
+            .open(at, &genuine, a)
+            .expect("the real message opens after a forgery under its key");
+        assert_eq!(opened.envelope.text, "genuine");
+        assert!(matches!(
+            world.open(at, &genuine, a),
+            Err(Error::Undecryptable)
+        ));
+    }
+    // And the forgery is refused even now that its generation has been used, and in a restarted
+    // engine: the refused message left nothing behind in the state.
+    let key = e2ee::store::StateKey::generate().unwrap();
+    let saved = world.clients[b].engine.snapshot(&key, "state").unwrap();
+    let mut restarted = e2ee::Engine::from_snapshot(&key, "state", &saved).unwrap();
+    let claimed = Claimed {
+        author: Some(world.clients[a].user()),
+        device: Some(world.clients[a].device()),
+        kind: Kind::Message,
+        target_id: None,
+    };
+    assert!(restarted.decrypt(conv, &forged, &claimed).is_err());
+    world.say(a, &[b, c], "and on it goes");
 }
