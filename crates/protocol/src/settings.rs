@@ -51,6 +51,11 @@ pub const SYSTEM_DEFAULT: &str = "@system";
 pub const JOIN_MUTED: &str = "join_muted";
 /// V19: "You're muted" shows when the microphone hears speech while I am muted in a call.
 pub const MUTED_TALK: &str = "muted_talk";
+/// Only join Tiny calls that are end-to-end encrypted. On: a call whose server turns encryption off
+/// stops sending and playing (mediad `Blocked`), and a server that cannot encrypt is not joined.
+/// Off by default on purpose: an older server or an older app in the room cannot do it, and
+/// turning it on by default would stop those calls working. See `SECURITY.md`.
+pub const REQUIRE_CALL_E2EE: &str = "require_call_e2ee";
 /// V5. Everyone's voice, 0 to 100.
 pub const VOICE_VOLUME: &str = "voice_volume";
 /// V6. The level, 0 to 100, from which our microphone counts as speech, and in voice
@@ -183,7 +188,7 @@ fn kind(key: &str) -> Option<Kind> {
         NOTIFY_ABOUT => Kind::Word(&ABOUT_CHOICES, "mentions"),
         SOUND => Kind::Word(&SOUND_CHOICES, "pebble"),
         ECHO_CANCELLATION | NOISE_SUPPRESSION | AUTO_GAIN => Kind::Switch(true),
-        JOIN_MUTED | PUSH_TO_TALK => Kind::Switch(false),
+        JOIN_MUTED | PUSH_TO_TALK | REQUIRE_CALL_E2EE => Kind::Switch(false),
         MUTED_TALK => Kind::Switch(true),
         PTT_RELEASE_MS => Kind::Choice(&PTT_RELEASE_CHOICES, 200),
         CUE_VOLUME => Kind::Percent(50),
@@ -594,6 +599,22 @@ mod tests {
         assert!(!valid(&discord, RECEIPTS, "off"), "Discord has no receipts");
         assert!(valid(&account_scope(&account(Network::Teams)), RECEIPTS, "off"));
         assert!(valid(GLOBAL, INPUT, "Studio Display Microphone") && !valid(GLOBAL, INPUT, ""));
+    }
+
+    #[test]
+    fn requiring_end_to_end_encrypted_calls_is_a_switch_that_is_off_until_chosen() {
+        // Off by default on purpose: a server or an app that cannot encrypt would stop working.
+        assert!(!Values::default().on(REQUIRE_CALL_E2EE));
+        assert!(valid(GLOBAL, REQUIRE_CALL_E2EE, "on") && valid(GLOBAL, REQUIRE_CALL_E2EE, "off"));
+        assert!(!valid(GLOBAL, REQUIRE_CALL_E2EE, "yes") && !valid(GLOBAL, REQUIRE_CALL_E2EE, "1") && !valid(GLOBAL, REQUIRE_CALL_E2EE, ""));
+        assert!(!valid(&account_scope(&account(Network::Tiny)), REQUIRE_CALL_E2EE, "on"), "it is global");
+        assert!(known(GLOBAL, REQUIRE_CALL_E2EE));
+        let mut values = Values::default();
+        values.set(GLOBAL, REQUIRE_CALL_E2EE, Some("on".into()));
+        assert!(values.on(REQUIRE_CALL_E2EE));
+        // A stored value no build can read falls back to the default, which is off.
+        values.set(GLOBAL, REQUIRE_CALL_E2EE, Some("maybe".into()));
+        assert!(!values.on(REQUIRE_CALL_E2EE));
     }
 
     #[test]

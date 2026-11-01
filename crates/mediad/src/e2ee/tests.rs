@@ -22,7 +22,7 @@ fn b64(bytes: &[u8]) -> String {
 fn app(user: &str) -> E2ee {
     let mut e2ee = E2ee::default();
     e2ee.with_identity(SigningKeyPair::generate());
-    e2ee.offer(user, Some(&TinyE2ee { room_id: ROOM.into(), identity: String::new() }));
+    e2ee.offer(user, Some(&TinyE2ee { room_id: ROOM.into(), identity: String::new(), required: false }));
     e2ee.roster(vec![ADA.into(), BEA.into(), CY.into()]);
     e2ee
 }
@@ -224,6 +224,80 @@ fn off_is_transport_only_and_says_who_cannot() {
     assert_eq!(ada.open(BEA, &[1, 2, 0xfa, 0xfa]), None, "a frame sealed for the old group is not Opus");
 }
 
+
+/// One app that only joins end-to-end encrypted calls.
+fn requiring(user: &str) -> E2ee {
+    let mut e2ee = E2ee::default();
+    e2ee.with_identity(SigningKeyPair::generate());
+    e2ee.offer(user, Some(&TinyE2ee { room_id: ROOM.into(), identity: String::new(), required: true }));
+    e2ee.roster(vec![ADA.into(), BEA.into(), CY.into()]);
+    e2ee
+}
+
+#[test]
+fn off_blocks_a_call_that_must_be_end_to_end() {
+    let server = mls::Server::new();
+    let mut ada = requiring(ADA);
+    start(&server, &mut ada);
+    ada.frame(&json!({"type": "call.e2ee", "op": "off", "user_ids": [CY]}).to_string());
+    let security = ada.security();
+    assert_eq!(security.mode, SecurityMode::Blocked);
+    assert_eq!(security.unsupported, [CY], "who cannot is still said");
+    assert!(!security.server_lacks);
+    assert!(security.code.is_empty() && security.members.is_empty(), "nothing claimed that does not hold");
+    // Nothing goes out and nothing is played, audio or video, clear or sealed.
+    assert_eq!(ada.seal(TONE), None);
+    assert_eq!(ada.seal(&[0xf8, 0xff, 0xfe]), None, "not even silence");
+    assert_eq!(ada.seal_video(&[1, 2, 3, 4]), None);
+    assert_eq!(ada.open(BEA, TONE), None, "clear audio is not played");
+    assert_eq!(ada.open(BEA, &[1, 2, 0xfa, 0xfa]), None);
+    assert_eq!(ada.open_video(BEA, &[1, 2, 3, 4]), None);
+}
+
+#[test]
+fn off_without_the_requirement_still_carries_on_as_transport() {
+    let server = mls::Server::new();
+    let mut ada = app(ADA);
+    start(&server, &mut ada);
+    ada.frame(&json!({"type": "call.e2ee", "op": "off", "user_ids": [CY]}).to_string());
+    assert_eq!(ada.security().mode, SecurityMode::Transport);
+    assert_eq!(ada.seal(TONE).as_deref(), Some(TONE));
+    assert_eq!(ada.seal_video(&[1, 2, 3, 4]).as_deref(), Some(&[1u8, 2, 3, 4][..]));
+    assert_eq!(ada.open(BEA, TONE).as_deref(), Some(TONE));
+}
+
+#[test]
+fn a_blocked_call_recovers_when_the_server_starts_the_group_again() {
+    let server = mls::Server::new();
+    let mut ada = requiring(ADA);
+    start(&server, &mut ada);
+    ada.frame(&json!({"type": "call.e2ee", "op": "off", "user_ids": [CY]}).to_string());
+    assert_eq!(ada.security().mode, SecurityMode::Blocked);
+    // The person who could not do it left: the server starts the group again.
+    start(&server, &mut ada);
+    let security = ada.security();
+    assert_eq!(security.mode, SecurityMode::Pending, "a group again, with no keys until it is committed");
+    assert!(security.unsupported.is_empty());
+    assert_eq!(ada.seal(TONE), None, "still nothing in clear");
+    // And a later `off` blocks again: the requirement is the person's, not the call's.
+    ada.frame(&json!({"type": "call.e2ee", "op": "off", "user_ids": [BEA]}).to_string());
+    assert_eq!(ada.security().mode, SecurityMode::Blocked);
+}
+
+#[test]
+fn a_fresh_offer_takes_the_requirement_from_the_offer() {
+    let mut ada = requiring(ADA);
+    ada.frame(&json!({"type": "call.e2ee", "op": "off"}).to_string());
+    assert_eq!(ada.security().mode, SecurityMode::Blocked);
+    // Joining again with the setting off is a call that may carry on.
+    ada.offer(ADA, Some(&TinyE2ee { room_id: ROOM.into(), identity: String::new(), required: false }));
+    ada.frame(&json!({"type": "call.e2ee", "op": "off"}).to_string());
+    assert_eq!(ada.security().mode, SecurityMode::Transport);
+    // A server with no end-to-end encryption at all is transport, with the lack said.
+    ada.offer(ADA, None);
+    let security = ada.security();
+    assert_eq!((security.mode, security.server_lacks), (SecurityMode::Transport, true));
+}
 #[test]
 fn a_server_without_end_to_end_encryption_is_said_to_lack_it() {
     let mut e2ee = E2ee::default();
@@ -250,7 +324,7 @@ fn until_the_server_says_which_call_this_is_nothing_goes_out() {
 #[test]
 fn a_rejoin_starts_afresh() {
     let (server, mut ada, _, _) = three();
-    ada.offer(ADA, Some(&TinyE2ee { room_id: ROOM.into(), identity: String::new() }));
+    ada.offer(ADA, Some(&TinyE2ee { room_id: ROOM.into(), identity: String::new(), required: false }));
     assert_eq!(ada.security().mode, SecurityMode::Pending);
     start(&server, &mut ada);
     assert_eq!(ada.seal(TONE), None, "a member again only once a commit adds it");
@@ -267,6 +341,28 @@ fn the_identity_key_is_kept_and_read_back() {
     std::fs::write(&path, "garbage").unwrap();
     let (fresh, _) = identity(&path);
     assert!(fresh != made, "an unreadable file gives a new key");
+    // The damaged file is kept, not destroyed with its replacement.
+    assert_eq!(
+        std::fs::read_to_string(path.with_extension("key.unreadable")).unwrap(),
+        "garbage"
+    );
+    // The replacement is read back as itself.
+    let (again, _) = identity(&path);
+    assert!(again == fresh);
+    // Writing leaves nothing but the key and the moved-aside file: no temp file.
+    let mut names: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["identity.key", "identity.key.unreadable"]);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600, "only the owner reads the key");
+        assert_eq!(mode(&dir), 0o700);
+    }
     let _ = std::fs::remove_dir_all(dir);
 }
 

@@ -63,7 +63,12 @@ pub fn group_id(room: &str) -> u64 {
 
 /// This account's identity key: made on first use and kept in `path`, so a person's key, and
 /// with it everyone's safety number with them, stays the same from call to call. A file that
-/// cannot be read or written gives a key for this call alone, and says so.
+/// cannot be written gives a key for this call alone, and says so.
+///
+/// A file that exists but cannot be read is not overwritten. It is moved aside to
+/// `<name>.unreadable`, so a key that was only damaged is not destroyed with its replacement,
+/// and a new key is made. Everyone who verified this person then sees a changed key, which is
+/// correct: it is a different key.
 pub fn identity(path: &Path) -> (SigningKeyPair, bool) {
     if let Ok(text) = std::fs::read_to_string(path) {
         let mut lines = text.lines().map(str::trim);
@@ -72,7 +77,12 @@ pub fn identity(path: &Path) -> (SigningKeyPair, bool) {
                 return (SigningKeyPair { private, public }, true);
             }
         }
-        tracing::warn!("mediad: e2ee: the identity key file could not be read; a new one is made");
+        let aside = path.with_extension("key.unreadable");
+        let moved = std::fs::rename(path, &aside).is_ok();
+        tracing::warn!(
+            moved,
+            "mediad: e2ee: the identity key file could not be read; a new key is made and people who verified this account will see it change"
+        );
     }
     let made = SigningKeyPair::generate();
     let kept = write_private(path, &format!("{}\n{}\n", hex(&made.private), hex(&made.public))).is_ok();
@@ -82,19 +92,41 @@ pub fn identity(path: &Path) -> (SigningKeyPair, bool) {
     (made, kept)
 }
 
+/// Writes `text` to `path` so that a reader sees the old file or the whole new one and never
+/// half of it: a file of its own next to it, flushed to disk, then renamed over it. Only the
+/// owner can read it where the platform says so (mode 0600, directory 0700 on Unix). On Windows
+/// the file inherits the folder's access list, which for a person's profile is that person.
 fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
-    if let Some(dir) = path.parent() {
+    use std::io::Write;
+    let dir = path.parent().filter(|dir| !dir.as_os_str().is_empty());
+    if let Some(dir) = dir {
         std::fs::create_dir_all(dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        }
     }
+    let temp = path.with_extension(format!("tmp-{}", std::process::id()));
     let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    use std::io::Write;
-    options.open(path)?.write_all(text.as_bytes())
+    let _ = std::fs::remove_file(&temp);
+    let written = options.open(&temp).and_then(|mut file| {
+        file.write_all(text.as_bytes())?;
+        file.sync_all()
+    });
+    match written.and_then(|()| std::fs::rename(&temp, path)) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = std::fs::remove_file(&temp);
+            Err(error)
+        }
+    }
 }
 
 pub fn hex(bytes: &[u8]) -> String {
@@ -122,6 +154,10 @@ enum Mode {
     Waiting,
     /// End-to-end: the group is being made, or has keys.
     Group,
+    /// The person asked to join only end-to-end encrypted calls, and the server turned it off. We
+    /// send nothing and play nothing until it says `start` again. Not `Transport`: that would
+    /// carry on unencrypted, which is what the setting exists to refuse.
+    Blocked,
 }
 
 pub struct E2ee {
@@ -130,6 +166,8 @@ pub struct E2ee {
     mode: Mode,
     /// The server has `e2ee_calls`.
     offered: bool,
+    /// The person only joins end-to-end encrypted calls: a downgrade blocks the call.
+    required: bool,
     identity: Option<SigningKeyPair>,
     session: Option<DaveSession>,
     /// Everyone in the room's call, us included, as chatd last said.
@@ -152,6 +190,7 @@ impl Default for E2ee {
             room: String::new(),
             mode: Mode::Transport,
             offered: false,
+            required: false,
             identity: None,
             session: None,
             roster: Vec::new(),
@@ -180,10 +219,12 @@ impl E2ee {
                 }
                 self.room = e2ee.room_id.clone();
                 self.offered = true;
+                self.required = e2ee.required;
                 self.mode = Mode::Waiting;
             }
             None => {
                 self.offered = false;
+                self.required = false;
                 self.mode = Mode::Transport;
             }
         }
@@ -229,7 +270,9 @@ impl E2ee {
                 }
             }
             "off" => {
-                self.mode = Mode::Transport;
+                // The server turning a call to transport only is the one thing a person who
+                // requires end-to-end encryption said they would not accept.
+                self.mode = if self.required { Mode::Blocked } else { Mode::Transport };
                 self.session = None;
                 let ids = frame.get("user_ids").and_then(Value::as_array).into_iter().flatten();
                 self.unsupported = ids.filter_map(Value::as_str).take(64).map(str::to_owned).collect();
@@ -347,7 +390,7 @@ impl E2ee {
     pub fn seal(&mut self, opus: &[u8]) -> Option<Vec<u8>> {
         match self.mode {
             Mode::Transport => Some(opus.to_vec()),
-            Mode::Waiting => None,
+            Mode::Waiting | Mode::Blocked => None,
             Mode::Group if opus == SILENCE => Some(opus.to_vec()),
             Mode::Group => {
                 if !self.ready() {
@@ -369,7 +412,7 @@ impl E2ee {
     pub fn seal_video(&mut self, frame: &[u8]) -> Option<Vec<u8>> {
         match self.mode {
             Mode::Transport => Some(frame.to_vec()),
-            Mode::Waiting => None,
+            Mode::Waiting | Mode::Blocked => None,
             Mode::Group => {
                 if !self.ready() {
                     return None;
@@ -392,7 +435,7 @@ impl E2ee {
         let sealed = frame.ends_with(&MARKER);
         match self.mode {
             Mode::Transport => return (!sealed).then(|| frame.to_vec()),
-            Mode::Waiting => return None,
+            Mode::Waiting | Mode::Blocked => return None,
             Mode::Group => {}
         }
         if !sealed || user.is_empty() || !self.ready() {
@@ -425,7 +468,7 @@ impl E2ee {
         let sealed = frame.ends_with(&MARKER);
         match self.mode {
             Mode::Transport => return (!sealed).then(|| frame.to_vec()),
-            Mode::Waiting => return None,
+            Mode::Waiting | Mode::Blocked => return None,
             Mode::Group => {}
         }
         // Clear audio in an end-to-end call is the server speaking, or someone who is not in
@@ -481,6 +524,7 @@ impl E2ee {
         security.mode = match self.mode {
             Mode::Transport => SecurityMode::Transport,
             Mode::Waiting => SecurityMode::Pending,
+            Mode::Blocked => SecurityMode::Blocked,
             Mode::Group if self.ready() => SecurityMode::EndToEnd,
             Mode::Group => SecurityMode::Pending,
         };

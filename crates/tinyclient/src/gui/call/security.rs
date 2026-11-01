@@ -52,6 +52,9 @@ pub(super) enum Badge {
     Transport,
     /// End to end, but a verified key changed or the group holds someone the call does not.
     Check,
+    /// The person only joins end-to-end encrypted calls, and the server turned encryption off.
+    /// Nothing is sent or played. Not the shield of `Transport`: that call carries on.
+    Blocked,
 }
 
 /// Something in the encrypted group is not as it should be: a key changed since it was
@@ -80,6 +83,7 @@ pub(super) fn badge(security: &CallSecurity, alone: bool) -> Badge {
         SecurityMode::Pending if alone => Badge::Alone,
         SecurityMode::Pending => Badge::Pending,
         SecurityMode::Transport => Badge::Transport,
+        SecurityMode::Blocked => Badge::Blocked,
     }
 }
 
@@ -89,6 +93,7 @@ pub(super) fn badge_words(badge: Badge) -> &'static str {
         Badge::Pending => "Setting up encryption…",
         Badge::Transport => "Encrypted to the server",
         Badge::Check => "Check security",
+        Badge::Blocked => "Encryption was turned off",
     }
 }
 
@@ -98,7 +103,7 @@ fn badge_look(badge: Badge) -> (&'static str, Rgba) {
         Badge::Pending => ("icons/clock.svg", theme::text_faint()),
         // Not a lock: the server could hear it. Not alarming either: it is what most calls are.
         Badge::Transport => ("icons/shield.svg", theme::text_faint()),
-        Badge::Check => ("icons/triangle-alert.svg", theme::warning()),
+        Badge::Check | Badge::Blocked => ("icons/triangle-alert.svg", theme::warning()),
     }
 }
 
@@ -140,12 +145,17 @@ pub(super) fn summary(security: &CallSecurity, alone: bool) -> (&'static str, &'
         Badge::Check => ("Check who is in this call", "The call is end-to-end encrypted, but something about who holds its keys changed. Read below before you trust it."),
         Badge::Pending => ("Setting up end-to-end encryption", "Your microphone waits until it's done, so nothing you say reaches the server unlocked."),
         Badge::Transport => ("Encrypted to the server", "Encrypted between each app and the server. The server could hear this call."),
+        Badge::Blocked => (
+            "Encryption was turned off",
+            "You asked to join only end-to-end encrypted calls. The server turned encryption off, so nothing is sent or played. Leave, or change the setting in Privacy to carry on.",
+        ),
     }
 }
 
-/// Why a call is only encrypted to the server, one line each.
+/// Why a call is not end to end, one line each: only encrypted to the server, or blocked because
+/// the server turned encryption off. For anything else there is nothing to explain.
 pub(super) fn why_transport(call: &Call, security: &CallSecurity) -> Vec<String> {
-    if security.mode != SecurityMode::Transport {
+    if !matches!(security.mode, SecurityMode::Transport | SecurityMode::Blocked) {
         return Vec::new();
     }
     if security.server_lacks {
@@ -480,6 +490,9 @@ mod tests {
         assert_eq!(badge_words(badge(&transport, false)), "Encrypted to the server");
         assert_ne!(badge_look(badge(&transport, true)).0, "icons/lock.svg");
         assert!(!summary(&transport, true).0.contains("End-to-end encrypted"));
+        let blocked = CallSecurity { mode: SecurityMode::Blocked, ..CallSecurity::default() };
+        assert_eq!(badge(&blocked, true), Badge::Blocked);
+        assert!(summary(&blocked, true).1.contains("nothing is sent or played"));
     }
 
     #[test]
@@ -525,5 +538,38 @@ mod tests {
         assert_eq!(why_transport(&call_, &someone), ["Bea's app can't encrypt end to end."]);
         assert!(why_transport(&call_, &secure(vec![])).is_empty());
         assert!(summary(&someone, false).1.contains("The server could hear this call."));
+    }
+
+    #[test]
+    fn a_blocked_call_says_what_happened_and_is_never_dressed_as_encrypted() {
+        let blocked = CallSecurity { mode: SecurityMode::Blocked, unsupported: vec!["bea".into()], ..CallSecurity::default() };
+        // Alone or not, it is the same badge: the setting was refused, not the keys unfinished.
+        for alone in [true, false] {
+            assert_eq!(badge(&blocked, alone), Badge::Blocked);
+            let (headline, sentence) = summary(&blocked, alone);
+            assert_eq!(headline, "Encryption was turned off");
+            assert_eq!(
+                sentence,
+                "You asked to join only end-to-end encrypted calls. The server turned encryption off, so nothing is sent or played. Leave, or change the setting in Privacy to carry on."
+            );
+        }
+        assert_eq!(badge_words(Badge::Blocked), "Encryption was turned off");
+        // A warning, not a lock and not the transport shield: it is neither encrypted nor carrying on.
+        assert_eq!(badge_look(Badge::Blocked).0, "icons/triangle-alert.svg");
+        for other in [Badge::EndToEnd, Badge::Alone, Badge::Transport, Badge::Pending] {
+            assert_ne!(badge_look(Badge::Blocked).0, badge_look(other).0);
+            assert_ne!(badge_words(Badge::Blocked), badge_words(other));
+        }
+        assert!(!summary(&blocked, false).0.contains("End-to-end encrypted"));
+        // It still says whose app could not do it, as a transport-only call does, and nothing
+        // for a call that is encrypted or still being set up.
+        let call_ = call(blocked.clone());
+        assert_eq!(why_transport(&call_, &blocked), ["Bea's app can't encrypt end to end."]);
+        let nobody = CallSecurity { mode: SecurityMode::Blocked, ..CallSecurity::default() };
+        assert_eq!(why_transport(&call_, &nobody), ["Someone in this call uses an app that can't encrypt end to end."]);
+        let pending = CallSecurity { mode: SecurityMode::Pending, unsupported: vec!["bea".into()], ..CallSecurity::default() };
+        assert!(why_transport(&call_, &pending).is_empty());
+        // A blocked call claims no keys: the panel shows none of an encrypted call's detail.
+        assert!(!alarming(&CallSecurity { members: vec![member("", Trust::Changed)], ..blocked }));
     }
 }

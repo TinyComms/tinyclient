@@ -891,7 +891,7 @@ fn ask_join(wire: &mut Wire, pending: &mut Vec<Pending>, refs: u64, room_id: Str
 fn offer(ctx: &Context, saved: &Saved, seat: &mut Seat, room: &str) -> Result<Offered, String> {
     let host = tungstenite::http::Uri::try_from(saved.base_url.as_str()).ok().and_then(|uri| uri.host().map(|host| host.trim_matches(['[', ']']).to_owned()));
     let identity = || crate::verified::identity_path(&ctx.account).to_string_lossy().into_owned();
-    let e2ee = seat.e2ee.then(|| TinyE2ee { room_id: room.to_owned(), identity: identity() });
+    let e2ee = seat.e2ee.then(|| TinyE2ee { room_id: room.to_owned(), identity: identity(), required: false });
     let offered = e2ee.is_some();
     let offer = TinyOffer { user_id: seat.me.clone(), host: host.unwrap_or_default(), slots: ROOM_CAP - 1, muted: false, deafened: false, e2ee };
     let sdp = ctx.tiny_offer(room, offer)?;

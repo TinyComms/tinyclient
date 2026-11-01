@@ -232,6 +232,10 @@ pub enum SecurityMode {
     Pending,
     /// Only the people in the call hold the keys. The server forwards what it cannot read.
     EndToEnd,
+    /// The person only joins end-to-end encrypted calls, and the server turned this one to
+    /// transport only. Nothing is sent or played. It is not [`SecurityMode::Transport`]: that
+    /// would be a call carrying on unencrypted, which the person refused.
+    Blocked,
 }
 
 /// One other person in the encrypted group.
@@ -264,6 +268,10 @@ pub enum Trust {
 pub struct TinyE2ee {
     pub room_id: String,
     pub identity: String,
+    /// The person only joins end-to-end encrypted calls. If the server turns this one to
+    /// transport only, the call is blocked ([`SecurityMode::Blocked`]) and not carried on.
+    #[serde(default, skip_serializing_if = "crate::is_false")]
+    pub required: bool,
 }
 
 /// What Discord's end-to-end encryption needs from mediad.
@@ -666,5 +674,35 @@ impl MediaResponse {
                 | MediaResponse::Refused { .. }
                 | MediaResponse::LogsSaved { .. }
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_requirement_is_sent_only_when_it_is_made_and_read_as_off_when_absent() {
+        // An older chatd or mediad does not send it: that is "not required", never an error.
+        let older: TinyE2ee = serde_json::from_str(r#"{"room_id":"r","identity":"/keys/ada"}"#).unwrap();
+        assert!(!older.required);
+        // Not required stays off the wire, so a frame is the one an older build already reads.
+        let off = TinyE2ee { room_id: "r".into(), identity: "/keys/ada".into(), required: false };
+        assert_eq!(serde_json::to_string(&off).unwrap(), r#"{"room_id":"r","identity":"/keys/ada"}"#);
+        let on = TinyE2ee { required: true, ..off };
+        let json = serde_json::to_string(&on).unwrap();
+        assert_eq!(json, r#"{"room_id":"r","identity":"/keys/ada","required":true}"#);
+        assert_eq!(serde_json::from_str::<TinyE2ee>(&json).unwrap(), on);
+    }
+
+    #[test]
+    fn a_blocked_call_round_trips_and_is_not_transport() {
+        let security = CallSecurity { mode: SecurityMode::Blocked, unsupported: vec!["bea".into()], ..CallSecurity::default() };
+        let json = serde_json::to_string(&security).unwrap();
+        assert!(json.contains(r#""mode":"blocked""#), "{json}");
+        assert_eq!(serde_json::from_str::<CallSecurity>(&json).unwrap(), security);
+        assert_ne!(SecurityMode::Blocked, SecurityMode::Transport);
+        // The default is still the one that says nothing more than holds.
+        assert_eq!(SecurityMode::default(), SecurityMode::Transport);
     }
 }
