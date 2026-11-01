@@ -75,10 +75,13 @@ fn codec(platform: &dyn mediad::platform::Platform) {
             }
         };
         let (mut units, mut bytes, mut idr, mut sps) = (0, 0, 0, 0);
-        let started = Instant::now();
+        let mut spent = Duration::ZERO;
         for n in 0..45 {
             let frame = picture(width, height, n);
-            match encoder.encode(&frame, n == 0 || n == 30) {
+            let at = Instant::now();
+            let coded = encoder.encode(&frame, n == 0 || n == 30);
+            spent += at.elapsed();
+            match coded {
                 Ok(out) if out.is_empty() => {}
                 Ok(out) => {
                     let types = nal_types(&out);
@@ -97,8 +100,8 @@ fn codec(platform: &dyn mediad::platform::Platform) {
             }
         }
         log::info!(
-            "tinyclient: selftest codec: {width}x{height} at {bitrate} bit/s: 45 frames in, {units} access units out, {bytes} bytes, {idr} IDR, {sps} SPS, {:.1} ms a frame",
-            started.elapsed().as_secs_f64() * 1000.0 / 45.0
+            "tinyclient: selftest codec: {width}x{height} at {bitrate} bit/s: 45 frames in, {units} access units out, {bytes} bytes, {idr} IDR, {sps} SPS, {:.1} ms an encode call",
+            spent.as_secs_f64() * 1000.0 / 45.0
         );
     }
     let mut decoder = match platform.h264_decoder() {

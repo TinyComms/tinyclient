@@ -24,6 +24,7 @@ public final class AvcEncoder {
     private final int height;
     private final MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
     private byte[] config = new byte[0];
+    private final java.util.ArrayDeque<byte[]> ready = new java.util.ArrayDeque<>();
     private long frames;
     private long nals;
 
@@ -35,8 +36,16 @@ public final class AvcEncoder {
 
     /** A started encoder, or null when no H.264 encoder takes this configuration. */
     public static AvcEncoder create(int width, int height, int bitrate, int fps, boolean screen) {
-        int[] profiles = {MediaCodecInfo.CodecProfileLevel.AVCProfileConstrainedBaseline, MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline, -1};
-        for (int profile : profiles) {
+        int cb = MediaCodecInfo.CodecProfileLevel.AVCProfileConstrainedBaseline;
+        int base = MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline;
+        // From the most asked to the plainest: a codec that refuses a key (Codec2's software
+        // encoder refuses the real-time ones) gets the next. SPS/PPS go in front of each IDR
+        // here when the codec does not prepend them (encode); B-frames are off by default in
+        // baseline.
+        int[][] tries = {{cb, 1}, {cb, 0}, {base, 0}, {-1, 0}};
+        for (int[] attempt : tries) {
+            int profile = attempt[0];
+            boolean realtime = attempt[1] == 1;
             MediaCodec codec = null;
             try {
                 codec = MediaCodec.createEncoderByType(AVC);
@@ -45,13 +54,13 @@ public final class AvcEncoder {
                 format.setInteger(MediaFormat.KEY_BIT_RATE, bitrate);
                 format.setInteger(MediaFormat.KEY_FRAME_RATE, fps);
                 format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, screen ? 10 : 4);
-                // The last try is the plainest format: SPS/PPS are then put in front of each
-                // IDR here (encode), and the codec's defaults stand.
-                if (profile >= 0) {
+                if (realtime) {
                     format.setInteger(MediaFormat.KEY_PREPEND_HEADER_TO_SYNC_FRAMES, 1);
                     format.setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0);
                     format.setInteger(MediaFormat.KEY_LATENCY, 1);
                     format.setInteger(MediaFormat.KEY_PRIORITY, 0);
+                }
+                if (profile >= 0) {
                     format.setInteger(MediaFormat.KEY_PROFILE, profile);
                     format.setInteger(MediaFormat.KEY_LEVEL, MediaCodecInfo.CodecProfileLevel.AVCLevel31);
                 }
@@ -60,10 +69,10 @@ public final class AvcEncoder {
                 }
                 codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
                 codec.start();
-                Log.i(TinyPlatform.TAG, "H.264 encoder " + codec.getName() + " " + width + "x" + height + " " + bitrate + " bit/s, profile " + profile);
+                Log.i(TinyPlatform.TAG, "H.264 encoder " + codec.getName() + " " + width + "x" + height + " " + bitrate + " bit/s, profile " + profile + (realtime ? ", real-time keys" : ""));
                 return new AvcEncoder(codec, width, height);
             } catch (Exception e) {
-                Log.w(TinyPlatform.TAG, "H.264 encoder with profile " + profile + " refused: " + e);
+                Log.i(TinyPlatform.TAG, "H.264 encoder refused profile " + profile + (realtime ? " with real-time keys" : "") + ": " + e);
                 if (codec != null) {
                     codec.release();
                 }
@@ -93,8 +102,9 @@ public final class AvcEncoder {
                 codec.queueInputBuffer(in, 0, nv12.length, timestampUs, 0);
                 frames++;
             }
-            ByteArrayOutputStream out = new ByteArrayOutputStream();
-            long wait = FIRST_OUTPUT_WAIT_US;
+            // Everything the codec has done goes to `ready`, one picture each; one is answered per
+            // call, so a codec that falls a frame behind still sends one picture a tick.
+            long wait = ready.isEmpty() ? FIRST_OUTPUT_WAIT_US : 0;
             while (true) {
                 int index = codec.dequeueOutputBuffer(info, wait);
                 wait = 0;
@@ -116,14 +126,27 @@ public final class AvcEncoder {
                     continue;
                 }
                 if (isKey && config.length > 0 && !startsWithSps(chunk)) {
-                    out.write(config, 0, config.length);
+                    byte[] whole = new byte[config.length + chunk.length];
+                    System.arraycopy(config, 0, whole, 0, config.length);
+                    System.arraycopy(chunk, 0, whole, config.length, chunk.length);
+                    chunk = whole;
                 }
-                out.write(chunk, 0, chunk.length);
                 if (nals++ < 3 || isKey) {
                     Log.i(TinyPlatform.TAG, "H.264 encoder " + width + "x" + height + " out " + chunk.length + " bytes, NAL types " + nalTypes(chunk) + (isKey ? " (IDR)" : ""));
                 }
+                ready.add(chunk);
             }
-            return out.toByteArray();
+            // Never more than a few behind: dropping a picture would break every one after it
+            // until the next keyframe, so a long backlog goes out at once instead.
+            if (ready.size() > 4) {
+                ByteArrayOutputStream all = new ByteArrayOutputStream();
+                for (byte[] picture; (picture = ready.poll()) != null; ) {
+                    all.write(picture, 0, picture.length);
+                }
+                return all.toByteArray();
+            }
+            byte[] next = ready.poll();
+            return next == null ? new byte[0] : next;
         } catch (Exception e) {
             Log.w(TinyPlatform.TAG, "H.264 encode", e);
             return null;
@@ -160,6 +183,24 @@ public final class AvcEncoder {
         int vRow = planes[2].getRowStride();
         int vPix = planes[2].getPixelStride();
         int base = width * height;
+        if (uPix == 1 && vPix == 1) {
+            // Planar (what Codec2's software encoder asks for): split each CbCr row, put it whole.
+            int half = width / 2;
+            byte[] rowU = new byte[half];
+            byte[] rowV = new byte[half];
+            for (int r = 0; r < height / 2; r++) {
+                int src = base + r * width;
+                for (int c = 0; c < half; c++) {
+                    rowU[c] = nv12[src + 2 * c];
+                    rowV[c] = nv12[src + 2 * c + 1];
+                }
+                u.position(r * uRow);
+                u.put(rowU, 0, half);
+                v.position(r * vRow);
+                v.put(rowV, 0, half);
+            }
+            return;
+        }
         for (int r = 0; r < height / 2; r++) {
             for (int c = 0; c < width / 2; c++) {
                 int src = base + r * width + 2 * c;
