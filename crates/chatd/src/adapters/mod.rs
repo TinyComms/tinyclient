@@ -615,6 +615,12 @@ impl Context {
         Ok(())
     }
 
+    /// How far this user has read one conversation here, as far as the store says. It stays what
+    /// they did, and a network count older than it is a lost tell of it, not the truth.
+    pub fn read_up_to(&self, conversation_id: &str) -> Option<String> {
+        self.hub.store().conversation(&self.key(conversation_id)).ok().flatten().and_then(|row| row.last_read)
+    }
+
     /// The network's own mute setting, after its rules (overrides, suppress flags) are applied.
     pub fn muted(&self, conversation_id: &str, muted: bool) -> Stores {
         let conversation = self.key(conversation_id);

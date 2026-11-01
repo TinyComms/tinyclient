@@ -72,7 +72,7 @@ use peers::{Directory, Who};
 use protocol::{Link, MemberSection, Person, Presence, Relation};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use wire::{Event, Fault, Wire};
@@ -87,8 +87,8 @@ const PAGE: i32 = 50;
 const TYPING_EVERY: Duration = Duration::from_secs(8);
 /// How long "is typing" stays without another signal.
 const TYPING_SHOWN: i64 = 6;
-/// Being here is told at most this often, and only when the user acts. Telegram lets it lapse
-/// by itself, so going away is never sent.
+/// Being here is told at most this often: when the connection opens, on a cadence while it
+/// lives, and when the user acts. Telegram lets it lapse by itself, so going away is never sent.
 const HERE_EVERY: Duration = Duration::from_secs(240);
 /// Messages whose conversation is remembered, for a deletion that names only the message.
 const PLACED: usize = 4_096;
@@ -419,14 +419,25 @@ fn connect(ctx: &Context, saved: &Saved, current: &Mutex<Option<Arc<Account>>>) 
     }
     ctx.link(Link::Connected);
     account.keep_session();
+    // Telegram fades an account to offline by itself, so being here is said on opening the
+    // connection and then on a cadence while it lives; `here` keeps it to one call per
+    // HERE_EVERY however often it is asked. The event loop is otherwise idle, so its wait is
+    // that cadence: a tick with nothing to read sends it. Nothing outlives the connection.
+    account.here();
+    let mut said = Instant::now();
     let ended = loop {
-        match events.recv() {
+        let wait = HERE_EVERY.saturating_sub(said.elapsed());
+        match events.recv_timeout(wait) {
             Ok(Event::Update { update, users, chats }) => {
                 account.learn(&users, &chats);
                 live::apply(&account, &update);
             }
             Ok(Event::Closed(why)) => break why,
-            Err(_) => break "the connection closed".to_owned(),
+            Err(RecvTimeoutError::Timeout) => {
+                account.here();
+                said = Instant::now();
+            }
+            Err(RecvTimeoutError::Disconnected) => break "the connection closed".to_owned(),
         }
         if ctx.stopped() {
             break "stopped".to_owned();

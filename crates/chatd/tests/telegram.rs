@@ -534,6 +534,24 @@ fn a_forum_topic_is_a_thread_under_the_forum() {
 }
 
 #[test]
+fn a_read_lost_on_the_way_is_told_again_and_the_badge_stays() {
+    let world = World::signed_in();
+    world.connected();
+    // Telegram never heard that the group was read up to 20, the way it goes when a tell went
+    // out while the link was down for it: its dialog counts unread again, up to what it had.
+    world.steer("lost-read");
+    // A default notify change defers the chats to when they are asked for, which is now.
+    world.steer("notify-changed");
+    world.ask(Request::Home { network: Network::Telegram, account: None, folder: None, shelf: Shelf::Main, offset: 0, limit: 200 });
+    // The read goes again, and what that tell left is counted, so the badge is not pushed back
+    // to the unread the network forgot.
+    world.until("the read to be told again", || (world.called("ReadHistory g8001 20") == 1).then_some(()));
+    world.until("the counts to be asked again", || (world.called("GetPeerDialogs g8001") == 1).then_some(()));
+    let read = world.conversation("g8001").unwrap();
+    assert_eq!((read.unread, read.last_read.as_deref()), (0, Some("20")));
+}
+
+#[test]
 fn typing_reading_and_presence_go_both_ways_and_are_never_withheld() {
     let world = World::signed_in();
     world.connected();
@@ -568,8 +586,12 @@ fn typing_reading_and_presence_go_both_ways_and_are_never_withheld() {
     world.until("reading to be told", || world.calls().contains(&"channels.ReadHistory c9001 5".to_owned()).then_some(()));
     sleep(Duration::from_millis(200));
     assert_eq!(world.called("SetTyping u7003"), 1);
-    // g8001 was already read up to 20, so there was nothing to tell for it.
-    assert_eq!((world.called("ReadHistory g8001"), world.called("UpdateStatus")), (0, 1));
+    // g8001 was already read up to 20, so there was nothing to tell for it. Being here is said
+    // once at connect, before any acting, and never again: acting's own here() is throttled.
+    let calls = world.calls();
+    let connect_here = calls.iter().position(|call| call == "UpdateStatus");
+    let acting = calls.iter().position(|call| call.starts_with("SetTyping u7003"));
+    assert!(connect_here.is_some_and(|at| acting.is_some_and(|last| at < last)), "the connect must say we are here before acting does");
 }
 
 #[test]
