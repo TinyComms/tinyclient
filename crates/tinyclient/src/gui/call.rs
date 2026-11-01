@@ -10,7 +10,7 @@ mod dock;
 pub(in crate::gui) mod health;
 mod people;
 mod permission;
-pub(in crate::gui) mod phone;
+pub(crate) mod phone;
 pub(in crate::gui) mod security;
 #[cfg(feature = "gui-shot")]
 mod shot;

@@ -129,6 +129,18 @@ xcodebuild -project Tiny.xcodeproj -scheme Tiny \
 `mobile/ios/TinyCore.xcframework`. Two simulator slices cannot be passed to
 `-create-xcframework` separately: it refuses two libraries with the same platform+variant.
 
+`CODE_SIGNING_ALLOWED=NO` builds, but an app built that way has no keychain entitlement and
+chatd cannot keep a sign-in ("tinyclient can't read its sign-ins"). To run it on a simulator,
+sign ad hoc so `Tiny.entitlements` is embedded:
+
+```bash
+scripts/mobile/build-ios.sh --debug --sim-only    # Apple-silicon simulator slice only
+cd mobile/ios && xcodegen generate
+xcodebuild -project Tiny.xcodeproj -scheme Tiny \
+  -destination 'platform=iOS Simulator,name=iPhone 18 Pro' -configuration Debug \
+  CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual build
+```
+
 ### Demo data for a desktop check
 
 ```powershell

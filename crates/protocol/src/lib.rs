@@ -2082,7 +2082,16 @@ pub const SUN_PATH_MAX: usize = if cfg!(target_vendor = "apple") { 104 } else { 
 pub fn chat_sock_path_in(dir: &std::path::Path) -> PathBuf {
     if cfg!(target_os = "ios") {
         let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/tmp"));
-        return short_sock_path(&home);
+        let short = short_sock_path(&home);
+        if short.as_os_str().len() < SUN_PATH_MAX {
+            return short;
+        }
+        // The simulator's container lives under the Mac's ~/Library/Developer/CoreSimulator, about
+        // 150 bytes deep, and a simulated app may use the Mac's /tmp: one directory per container.
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        home.as_os_str().hash(&mut hasher);
+        return PathBuf::from(format!("/tmp/tinyclient-{:016x}", hasher.finish())).join(CHAT_SOCK_NAME);
     }
     dir.join(CHAT_SOCK_NAME)
 }

@@ -214,12 +214,32 @@ redirect URI the server knows does not change, and nothing about the flow is pho
   from any platform thread, are quick, and never call back into the platform synchronously.
 * Nothing in the core runs on the platform's UI thread, and the core never assumes one.
 
+## iOS (`crates/tinyclient/src/mobile/ios`)
+
+Registered by `crate::mobile::register` on iOS instead of the stub. All through objc2; no Swift.
+
+| Piece | File | How |
+|---|---|---|
+| Permissions | `audio.rs` | `AVCaptureDevice.authorizationStatus` / `requestAccess(for:)`, the caller's thread waiting on a channel; refusals go to the call screen (`hooks::note_permission`); Settings opens `UIApplication.openSettingsURLString` |
+| Audio session | `audio.rs` | `.playAndRecord`, `.voiceChat`, `.allowBluetooth`, active; `.notifyOthersOnDeactivation` at the end. Routes for the call screen (`hooks::route_audio`): earpiece or wired, speaker, Bluetooth HFP, by `overrideOutputAudioPort` and `setPreferredInput`. A camera that starts moves an unchosen route to the speaker. `UIBackgroundModes` `audio` keeps a call going in the background |
+| Camera | `camera.rs` | `AVCaptureSession` (640×480 preset), front or back wide-angle camera, `AVCaptureVideoDataOutput` in `420v`, portrait, frames copied tight to NV12. Flip (`hooks::route_flip`) restarts on the other camera. No camera (the simulator) is the words "This device has no camera." |
+| Screen share | `screen.rs` | `RPScreenRecorder.startCapture` (this app's screen), at most 5 frames a second to the sink. System-wide sharing needs a Broadcast Upload Extension (not built) |
+| H.264 | `codec.rs` | `VTCompressionSession` (constrained baseline, real time, no reordering, keyframe on request) with AVCC turned into Annex B and SPS/PPS before each IDR; `VTDecompressionSession` made from the stream's SPS/PPS, decoding synchronously to NV12 |
+| Web pages | `web.rs` | `WKWebView` in a page sheet over the window's top view controller, with a Close button; one `WKWebsiteDataStore(forIdentifier:)` per network (iOS 17+). objc2 binds `WKWebView` for macOS only, so WebKit is messaged dynamically |
+| Tiny server | `auth.rs` | `ASWebAuthenticationSession`, `prefersEphemeralWebBrowserSession = false`, a callback scheme nothing uses; chatd's loopback listener receives the redirect |
+
+Debug builds take two launch arguments for checking the platform on a phone or simulator
+(`selftest.rs`): `-tinySelfTest` (permissions, session, routes, camera, H.264 round trips at
+the three sizes mediad uses, ReplayKit) and `-tinyAuthTest <provider page>` (open_auth with a
+loopback listener, as chatd does). Records go to the unified log and to
+`Library/Application Support/tinyclient/ios-platform.log`.
+
 ## Open questions
 
 * A speaker/earpiece control in the call UI needs a request to mediad (`MediaRequest`); until then
   the platform keeps its own default route (earpiece for voice, speaker for video).
 * Screen share on iOS beyond the app needs a Broadcast Upload Extension, a separate process: its
   frames must reach the app (App Group shared memory) before the sink.
-* Background audio (iOS `audio` background mode, Android foreground service of type
+* Background audio (iOS: the `audio` background mode is set; Android foreground service of type
   `microphone`/`phoneCall`) keeps a call alive when the app is backgrounded; not wired.
 * CallKit / ConnectionService integration for incoming rings is not part of this interface.

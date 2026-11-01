@@ -42,6 +42,9 @@ targets:
         GENERATE_INFOPLIST_FILE: NO
         INFOPLIST_FILE: Info.plist
         SWIFT_OBJC_BRIDGING_HEADER: Sources/Tiny-Bridging-Header.h
+        # The keychain access group chatd's sessions need (see the file). A simulator build signs
+        # ad hoc (CODE_SIGN_IDENTITY=-) so the entitlement is in the binary.
+        CODE_SIGN_ENTITLEMENTS: Tiny.entitlements
         # A static library cannot carry the system frameworks it needs, so the app target links
         # them: libc++ for the Rust deps that use C++, zlib and sqlite3 for the core's storage.
         OTHER_LDFLAGS:
@@ -55,6 +58,19 @@ targets:
       - framework: TinyCore.xcframework
         embed: false
         link: true
+      # The call platform and web sign-in (crates/tinyclient/src/mobile/ios). A static library
+      # carries no framework links, so the app names each one. WebKit is messaged dynamically
+      # (objc2 binds WKWebView for macOS only), so nothing would pull it in otherwise.
+      # mediad's cpal opens the microphone and speaker through AudioToolbox's audio units.
+      - sdk: AudioToolbox.framework
+      - sdk: AVFoundation.framework
+      - sdk: AVFAudio.framework
+      - sdk: CoreMedia.framework
+      - sdk: CoreVideo.framework
+      - sdk: VideoToolbox.framework
+      - sdk: ReplayKit.framework
+      - sdk: WebKit.framework
+      - sdk: AuthenticationServices.framework
 
 schemes:
   Tiny:
