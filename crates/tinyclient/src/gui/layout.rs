@@ -992,6 +992,12 @@ impl Render for Shell {
                     }
                 }),
             );
+        // A phone's window does not shrink for the soft keyboard (Android's NativeActivity and
+        // iOS's full-screen view both keep their size and report the keyboard as an inset), so
+        // the shell lifts its content above it; the composer then sits on the keyboard's edge
+        // (`tokens::bottom_padding`).
+        let keyboard = if super::phone::active() { super::phone::tokens::keyboard() } else { 0. };
+        let root = root.when(keyboard > 0., |root| root.pb(px(keyboard)));
         let root = root.children(super::signin::layer(window, cx));
         #[cfg(feature = "gui-shot")]
         if self.sheet {
