@@ -37,7 +37,7 @@ use crate::process::Processor;
 use crate::rtp::SILENCE;
 use crate::session::Controls;
 use crate::stats::Meter;
-use crate::video::{Rates, Received, Track, Video, Wants, Word};
+use crate::video::{self, Rates, Received, Track, Video, Wants, Word};
 use crate::{out, rt, FRAME, FRAME_SAMPLES};
 use mio::net::{TcpStream, UdpSocket};
 use mio::{Events, Interest, Poll, Token};
@@ -48,6 +48,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use str0m::bwe::{Bitrate, BweKind};
 use str0m::change::{SdpAnswer, SdpPendingOffer};
 use str0m::media::{Direction, Frequency, KeyframeRequestKind, MediaData, MediaKind, MediaTime, Mid, Rid, Simulcast, SimulcastLayer};
 use str0m::net::{Protocol, Receive, TcpType};
@@ -62,14 +63,21 @@ const H264_PROFILE: u32 = 0x42e01f;
 const H264_PT: u8 = 108;
 const H264_RTX_PT: u8 = 109;
 
+/// The bandwidth estimate a connection starts from, until the server's feedback says better.
+const START_BPS: u64 = 1_000_000;
+
 /// Opus for audio, H.264 for video, and no hold for a missing audio packet. str0m's default
 /// waits for 15 later packets or a second, and the talk spurt has already ended by then.
-/// Video keeps its own hold.
+/// Video keeps its own hold. Bandwidth estimation from the server's TWCC feedback is what turns
+/// on str0m's pacer: a keyframe leaves spread out, and audio, which it does not pace, goes
+/// around it. It looks for more bandwidth only once there is video to spend it on, so a voice
+/// call sends no padding.
 fn rtc_config() -> RtcConfig {
     let mut config = RtcConfig::new()
         .clear_codecs()
         .enable_opus(true, false)
         .set_stats_interval(Some(Duration::from_secs(1)))
+        .enable_bwe(Some(Bitrate::bps(START_BPS)))
         .set_reordering_size_audio(0)
         .set_reordering_timeout_audio(Some(Duration::from_millis(40)));
     config.codec_config().add_h264(H264_PT.into(), Some(H264_RTX_PT.into()), true, H264_PROFILE);
@@ -417,6 +425,11 @@ struct Call {
     meter: Meter,
     /// The picture's threads. This loop only moves their bytes.
     video: Video,
+    /// What the path can take, from TWCC feedback. `None` until this connection has said.
+    estimate: Option<u64>,
+    /// What the tracks may spend now, and what the estimator was told to look for.
+    rates: Rates,
+    desired: u64,
     /// What the last accepted answer left sending. str0m's direction flips before the answer.
     sending_share: bool,
     sending_camera: bool,
@@ -481,6 +494,9 @@ impl Call {
         self.sending_share = false;
         self.sending_camera = false;
         self.offered = None;
+        self.estimate = None;
+        self.rates = Rates::default();
+        self.desired = 0;
         self.video.reset();
         self.shown = None;
         // The new link has not been announced dead. A death of the one we just left already was.
@@ -561,6 +577,7 @@ impl Call {
                     self.encoder.set_loss(loss);
                 }
             }
+            Event::EgressBitrateEstimate(BweKind::Twcc { estimate, .. }) => self.estimate = Some(estimate.as_u64()),
             Event::MediaData(data) if self.link.is_picture(data.mid) => self.picture_in(data),
             Event::KeyframeRequest(request) if request.mid == self.link.share_mid() => self.video.ask_key(Track::Share),
             Event::KeyframeRequest(request) if request.mid == self.link.camera_mid() => match request.rid {
@@ -867,13 +884,18 @@ impl Call {
                 }
             }
         }
-        let camera = self.controls.camera();
-        self.video.want(Wants {
-            share: self.connected && self.sending_share && self.controls.share(),
-            camera: self.connected && self.sending_camera && camera,
-            keep_camera: camera,
-            rates: Rates::default(),
-        });
+        let keep_camera = self.controls.camera();
+        let share = self.connected && self.sending_share && self.controls.share();
+        let camera = self.connected && self.sending_camera && keep_camera;
+        if let Some(estimate) = self.estimate {
+            self.rates = video::allocate(estimate, share, camera, self.rates);
+        }
+        let desired = video::desired(share, camera);
+        if desired != self.desired {
+            self.desired = desired;
+            self.link.rtc.bwe().set_desired_bitrate(Bitrate::bps(desired));
+        }
+        self.video.want(Wants { share, camera, keep_camera, rates: self.rates });
         while let Some(word) = self.video.next() {
             match word {
                 Word::Frame { track, payload, rtp, at } => self.write_video(track, payload, rtp, at),
@@ -1181,6 +1203,9 @@ pub fn run(link: Link, user_id: String, controls: Arc<Controls>) {
         limiter: Limiter::default(),
         meter: Meter::new(CallPath::Unknown),
         video: Video::new(controls.clone()),
+        estimate: None,
+        rates: Rates::default(),
+        desired: 0,
         sending_share: false,
         sending_camera: false,
         offered: None,
@@ -1353,6 +1378,145 @@ mod tests {
         let answer = peer.sdp_api().accept_offer(incoming).expect("answer");
         let link = offer.accept(&answer.to_sdp_string()).expect("accept");
         (link, peer)
+    }
+
+    /// Moves packets between two connections on a clock of the test's, a millisecond at a time.
+    /// `sent` hears each packet the first one sends, and `events` what it reports.
+    struct Wire {
+        now: Instant,
+        ours: SocketAddr,
+        theirs: SocketAddr,
+        sent: Vec<(Instant, Vec<u8>)>,
+        events: Vec<String>,
+        estimates: Vec<u64>,
+    }
+
+    impl Wire {
+        fn step(&mut self, link: &mut Link, peer: &mut Rtc) {
+            self.now += Duration::from_millis(1);
+            let now = self.now;
+            link.rtc.handle_input(Input::Timeout(now)).unwrap();
+            peer.handle_input(Input::Timeout(now)).unwrap();
+            let mut to_peer = Vec::new();
+            let mut to_link = Vec::new();
+            loop {
+                match link.rtc.poll_output().unwrap() {
+                    Output::Timeout(_) => break,
+                    Output::Transmit(transmit) => {
+                        self.sent.push((now, transmit.contents.to_vec()));
+                        to_peer.push(transmit.contents.to_vec());
+                    }
+                    Output::Event(Event::EgressBitrateEstimate(BweKind::Twcc { estimate, .. })) => self.estimates.push(estimate.as_u64()),
+                    Output::Event(event) => self.events.push(format!("{event:?}")),
+                }
+            }
+            loop {
+                match peer.poll_output().unwrap() {
+                    Output::Timeout(_) => break,
+                    Output::Transmit(transmit) => to_link.push(transmit.contents.to_vec()),
+                    Output::Event(_) => {}
+                }
+            }
+            for packet in to_peer {
+                let contents = packet.as_slice().try_into().unwrap();
+                let receive = Receive { proto: Protocol::Udp, source: self.ours, destination: self.theirs, contents };
+                peer.handle_input(Input::Receive(now, receive)).unwrap();
+            }
+            for packet in to_link {
+                let contents = packet.as_slice().try_into().unwrap();
+                let receive = Receive { proto: Protocol::Udp, source: self.theirs, destination: self.ours, contents };
+                link.rtc.handle_input(Input::Receive(now, receive)).unwrap();
+            }
+        }
+
+        fn run(&mut self, link: &mut Link, peer: &mut Rtc, for_ms: u32) {
+            for _ in 0..for_ms {
+                self.step(link, peer);
+            }
+        }
+
+        /// RTP packets with this payload type sent since `from`.
+        fn rtp(&self, pt: u8, from: Instant) -> Vec<Instant> {
+            let is = |packet: &Vec<u8>| packet.len() > 12 && packet[0] >> 6 == 2 && packet[1] & 0x7f == pt;
+            self.sent.iter().filter(|(at, packet)| *at >= from && is(packet)).map(|(at, _)| *at).collect()
+        }
+    }
+
+    /// A connection and a peer standing in for the SFU, connected, with the share turned on.
+    fn sharing() -> (Link, Rtc, Wire) {
+        let theirs = SocketAddr::from(([127, 0, 0, 1], 40_000));
+        let offer = Offer::new(&TinyOffer { user_id: "me".into(), host: "127.0.0.1".into(), slots: 1, muted: false, deafened: false, e2ee: None }).unwrap();
+        let ours = offer.link.local_udp.unwrap();
+        let mut peer = rtc_config().build(Instant::now());
+        peer.add_local_candidate(Candidate::host(theirs, "udp").unwrap());
+        let incoming = str0m::change::SdpOffer::from_sdp_string(offer.sdp()).unwrap();
+        let answer = peer.sdp_api().accept_offer(incoming).unwrap();
+        let mut link = offer.accept(&answer.to_sdp_string()).unwrap();
+        let mut wire = Wire { now: Instant::now(), ours, theirs, sent: Vec::new(), events: Vec::new(), estimates: Vec::new() };
+        for _ in 0..3000 {
+            wire.step(&mut link, &mut peer);
+            if wire.events.iter().any(|event| event == "Connected") {
+                break;
+            }
+        }
+        assert!(wire.events.iter().any(|event| event == "Connected"), "{:?}", wire.events);
+        let sdp = link.offer_send(true, true).unwrap();
+        let answer = peer.sdp_api().accept_offer(str0m::change::SdpOffer::from_sdp_string(&sdp).unwrap()).unwrap();
+        link.take_answer(&answer.to_sdp_string()).unwrap();
+        wire.run(&mut link, &mut peer, 50);
+        (link, peer, wire)
+    }
+
+    fn annex_b(len: usize, name: u8) -> Vec<u8> {
+        let mut frame = vec![0, 0, 0, 1, name];
+        frame.resize(len, 0x55);
+        frame
+    }
+
+    /// Without the pacer a keyframe left as one burst, every packet in one millisecond, in front
+    /// of whatever audio came next. With it the keyframe spreads out, audio goes straight past,
+    /// and the feedback gives an estimate for the encoders.
+    #[test]
+    fn a_keyframe_is_paced_audio_is_not_and_feedback_gives_an_estimate() {
+        let (mut link, mut peer, mut wire) = sharing();
+        let share = link.share_mid();
+        let video_pt = link.rtc.writer(share).unwrap().payload_params().next().unwrap().pt();
+        let microphone = link.microphone_mid();
+        let audio_pt = link.rtc.writer(microphone).unwrap().payload_params().next().unwrap().pt();
+        let start = wire.now;
+        let writer = link.rtc.writer(share).unwrap();
+        writer.write(video_pt, start, MediaTime::new(0, Frequency::NINETY_KHZ), annex_b(150_000, 0x65)).unwrap();
+        wire.step(&mut link, &mut peer);
+
+        let spoke = wire.now;
+        let writer = link.rtc.writer(microphone).unwrap();
+        writer.write(audio_pt, spoke, MediaTime::new(960, Frequency::FORTY_EIGHT_KHZ), vec![0x78; 80]).unwrap();
+        wire.run(&mut link, &mut peer, 2);
+        let audio = wire.rtp(*audio_pt, spoke);
+        assert_eq!(audio.len(), 1, "audio does not wait for the keyframe");
+        assert!(audio[0] <= spoke + Duration::from_millis(2));
+
+        wire.run(&mut link, &mut peer, 3000);
+        let video = wire.rtp(*video_pt, start);
+        assert!(video.len() > 100, "all of it went: {}", video.len());
+        let span = *video.last().unwrap() - video[0];
+        assert!(span > Duration::from_millis(100), "the keyframe was spread out: {span:?}");
+        assert!(video.iter().filter(|at| **at == video[0]).count() < video.len() / 4, "and not one burst");
+        assert!(!wire.estimates.is_empty(), "the feedback gave an estimate");
+    }
+
+    #[test]
+    fn a_voice_call_sends_no_padding_for_the_estimator() {
+        let (mut link, mut peer, mut wire) = sharing();
+        let sdp = link.offer_send(true, false).unwrap();
+        let answer = peer.sdp_api().accept_offer(str0m::change::SdpOffer::from_sdp_string(&sdp).unwrap()).unwrap();
+        link.take_answer(&answer.to_sdp_string()).unwrap();
+        wire.run(&mut link, &mut peer, 100);
+        let start = wire.now;
+        wire.run(&mut link, &mut peer, 2000);
+        let bytes: usize = wire.sent.iter().filter(|(at, _)| *at >= start).map(|(_, packet)| packet.len()).sum();
+        // Keepalives and reports only: 50 kb/s of padding would be 12,500 bytes.
+        assert!(bytes < 4_000, "{bytes} bytes in two seconds of nothing");
     }
 
     /// The share stays inactive until its answer is in. An empty answer is a refusal

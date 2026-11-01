@@ -71,6 +71,52 @@ impl Default for Rates {
     }
 }
 
+/// Kept for the voice and the packets' headers out of what the estimate says the path can take.
+const VOICE_BPS: u64 = 96_000;
+/// The share of the estimate that is spent. The estimate lags a path that is getting worse.
+const SPEND_PERCENT: u64 = 85;
+/// Below these a track says more by stopping: a smear of text or of a face helps nobody.
+const SHARE_FLOOR: u64 = 250_000;
+const HIGH_FLOOR: u64 = 200_000;
+const LOW_FLOOR: u64 = 60_000;
+/// What a stopped track needs over its floor to start again, so a path sitting on the line does
+/// not switch it on and off.
+const RESTART_PERCENT: u64 = 125;
+/// A rate moves in steps of this, so a wandering estimate does not reconfigure encoders.
+const STEP: u64 = 10_000;
+
+/// What each track may spend on a path good for `estimate` bits a second. The voice comes first
+/// and is never asked to give way, then the camera's low layer, which a watcher can always fall
+/// back on, then a share, because text matters more than a face, as the server's own plan has
+/// it; the high layer gets what is left. So it is the high layer and then the share that stop.
+pub fn allocate(estimate: u64, share: bool, camera: bool, was: Rates) -> Rates {
+    let mut left = (estimate * SPEND_PERCENT / 100).saturating_sub(VOICE_BPS);
+    let mut take = |wanted: bool, most: u32, floor: u64, was: u32| -> u32 {
+        let needs = if was > 0 { floor } else { floor * RESTART_PERCENT / 100 };
+        if !wanted || left < needs {
+            return 0;
+        }
+        let got = left.min(u64::from(most)) / STEP * STEP;
+        left -= got;
+        got as u32
+    };
+    let low = if camera { take(true, CAMERA_LOW_BPS, 0, 1).max(LOW_FLOOR as u32) } else { 0 };
+    let share = take(share, SHARE_BPS, SHARE_FLOOR, was.share);
+    let high = take(camera, CAMERA_HIGH_BPS, HIGH_FLOOR, was.high);
+    Rates { share, high, low }
+}
+
+/// What to have the estimator look for: what these tracks would spend, with the voice.
+pub fn desired(share: bool, camera: bool) -> u64 {
+    let share = if share { u64::from(SHARE_BPS) } else { 0 };
+    let camera = if camera { u64::from(CAMERA_HIGH_BPS + CAMERA_LOW_BPS) } else { 0 };
+    let video = share + camera;
+    if video == 0 {
+        return 0;
+    }
+    (video + VOICE_BPS) * 100 / SPEND_PERCENT
+}
+
 /// What the tick wants sent.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Wants {
@@ -792,6 +838,57 @@ mod tests {
     use crate::e2ee::E2ee;
     use protocol::TinyE2ee;
     use std::path::PathBuf;
+
+    #[test]
+    fn a_good_path_gets_everything() {
+        let rates = allocate(5_000_000, true, true, Rates::default());
+        assert_eq!(rates, Rates::default());
+        assert!(desired(true, true) > 2_150_000);
+    }
+
+    #[test]
+    fn a_share_alone_follows_the_estimate_down_and_then_stops() {
+        let was = Rates::default();
+        let rates = allocate(1_000_000, true, false, was);
+        assert_eq!(rates.share, 750_000, "85% of the estimate, less the voice");
+        assert_eq!((rates.high, rates.low), (0, 0));
+        assert_eq!(allocate(300_000, true, false, rates).share, 0, "under its floor a share stops");
+    }
+
+    #[test]
+    fn the_high_layer_stops_first_and_the_low_layer_never_does() {
+        let was = Rates::default();
+        let rates = allocate(600_000, false, true, was);
+        assert_eq!(rates.low, CAMERA_LOW_BPS);
+        assert_eq!(rates.high, 260_000);
+        let rates = allocate(400_000, false, true, rates);
+        assert_eq!((rates.high, rates.low), (0, CAMERA_LOW_BPS), "h gives way before l");
+        let rates = allocate(50_000, false, true, rates);
+        assert_eq!(rates.low, LOW_FLOOR as u32, "l is what there is to fall back on");
+    }
+
+    #[test]
+    fn with_both_on_the_share_outranks_the_high_layer() {
+        let rates = allocate(1_500_000, true, true, Rates::default());
+        assert_eq!(rates.low, CAMERA_LOW_BPS);
+        assert!(rates.share > rates.high, "{rates:?}");
+        let rates = allocate(900_000, true, true, rates);
+        assert_eq!(rates.high, 0, "{rates:?}");
+        assert!(rates.share > 0, "{rates:?}");
+    }
+
+    #[test]
+    fn a_stopped_track_needs_a_margin_to_start_again() {
+        let stopped = Rates { share: 0, high: 0, low: 0 };
+        let barely = (SHARE_FLOOR + VOICE_BPS) * 100 / SPEND_PERCENT + 10_000;
+        assert_eq!(allocate(barely, true, false, stopped).share, 0, "still stopped at its floor");
+        assert!(allocate(barely, true, false, Rates::default()).share > 0, "while one running stays on");
+    }
+
+    #[test]
+    fn nothing_to_send_looks_for_no_bandwidth() {
+        assert_eq!(desired(false, false), 0, "a voice call never probes");
+    }
 
     #[test]
     fn rtp_time_comes_from_the_clock_at_90_khz() {
