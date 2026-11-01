@@ -6,7 +6,9 @@
 //! Jitter is RFC 3550's interarrival jitter, kept per voice by `media::Stream`; the worst voice
 //! is reported. Loss is the packets the jitter buffers found missing, of all they expected.
 //! Round trip: a Discord call times the voice server's echo of our keepalive; a Tiny call takes
-//! str0m's, from RTCP or the ICE checks on the chosen pair.
+//! the ICE checks on the chosen pair. str0m's own `rtt` is a TWCC feedback's arrival less a
+//! packet's send time: the 50 ms between feedbacks is in it, and it stands still while we send
+//! nothing. It only stands in until the first check is answered.
 
 use crate::audio::Troubles;
 use crate::RATE;
@@ -101,8 +103,9 @@ impl Meter {
         }
     }
 
-    pub fn round_trip(&mut self, rtt: Option<Duration>) {
-        if let Some(rtt) = rtt {
+    /// What a Tiny call's link says: the last ICE check's round trip, and str0m's `rtt`.
+    pub fn round_trip(&mut self, check: Option<Duration>, feedback: Option<Duration>) {
+        if let Some(rtt) = check.or(feedback) {
             self.rtt_ms = rtt.as_millis().min(u128::from(u32::MAX)) as u32;
         }
     }
@@ -192,6 +195,18 @@ mod tests {
         meter.troubles = Troubles { mic_glitches: 3, speaker_glitches: 1, overruns: 2, underruns: 5, gaps: 7, skips: 0 };
         let stats = meter.second(std::iter::empty());
         assert_eq!((stats.device_glitches, stats.capture_overruns, stats.capture_gaps, stats.playout_underruns), (4, 2, 7, 5));
+    }
+
+    #[test]
+    fn the_round_trip_is_the_ice_check_and_not_the_feedback_timing() {
+        let mut meter = Meter::new(CallPath::Udp);
+        let ms = |ms| Some(Duration::from_millis(ms));
+        meter.round_trip(None, ms(90));
+        assert_eq!(meter.rtt_ms, 90, "better than nothing until a check is answered");
+        meter.round_trip(ms(31), ms(90));
+        assert_eq!(meter.rtt_ms, 31);
+        meter.round_trip(None, None);
+        assert_eq!(meter.rtt_ms, 31, "the last one stands");
     }
 
     #[test]

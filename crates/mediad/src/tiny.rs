@@ -504,7 +504,7 @@ impl Call {
             }
             Event::PeerStats(stats) => {
                 let pair = stats.selected_candidate_pair.as_ref();
-                self.meter.round_trip(stats.rtt.or_else(|| pair.and_then(|pair| pair.current_round_trip_time)));
+                self.meter.round_trip(pair.and_then(|pair| pair.current_round_trip_time), stats.rtt);
                 // Only host candidates are offered: the path is UDP or ICE-TCP, never a relay.
                 if let Some(pair) = pair {
                     self.meter.path = match pair.protocol {
