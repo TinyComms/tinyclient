@@ -22,6 +22,13 @@ const VOICE_BITRATE: i32 = 32_000;
 /// least it ever plans for: enough that every speech packet carries a copy of the one before.
 const LOSS_FLOOR: i32 = 5;
 const LOSS_PLANNED: i32 = 10;
+/// What is planned for is added onto what the reports say.
+const LOSS_MARGIN: i32 = 2;
+/// How much of a report goes into the loss planned for: half when it says worse, so the copies
+/// are there for the next packets; a twentieth when it says better, about 20 s to come back
+/// down, since loss comes in bursts and the next one is usually not far off.
+const LOSS_ATTACK: f32 = 0.5;
+const LOSS_RELEASE: f32 = 0.05;
 
 pub struct Encoder {
     state: *mut OpusEncoder,
@@ -30,8 +37,9 @@ pub struct Encoder {
     /// The bitrate it was made at, and the one it encodes at now.
     default: i32,
     bitrate: i32,
-    /// The packet loss, in percent, FEC is planned for.
+    /// The packet loss, in percent, FEC is planned for, and the smoothed reports behind it.
     loss: i32,
+    reported: f32,
 }
 
 // One thread owns each codec; the pointer is to plain heap state.
@@ -75,13 +83,16 @@ impl Encoder {
             opus_encoder_ctl!(state, OPUS_SET_PACKET_LOSS_PERC_REQUEST, LOSS_PLANNED);
             opus_encoder_ctl!(state, OPUS_SET_DTX_REQUEST, i32::from(dtx));
         }
-        Some(Encoder { state, mono: channels == 1, default: bitrate, bitrate, loss: LOSS_PLANNED })
+        let reported = (LOSS_PLANNED - LOSS_MARGIN) as f32 / 100.;
+        Some(Encoder { state, mono: channels == 1, default: bitrate, bitrate, loss: LOSS_PLANNED, reported })
     }
 
     /// The far end's reports say it is losing `fraction` of our packets: FEC is planned for
-    /// that, a little more, and never less than [`LOSS_FLOOR`].
+    /// that, smoothed, a little more, and never less than [`LOSS_FLOOR`].
     pub fn set_loss(&mut self, fraction: f32) {
-        let wanted = ((fraction * 100.).round() as i32 + 2).clamp(LOSS_FLOOR, 30);
+        let rate = if fraction > self.reported { LOSS_ATTACK } else { LOSS_RELEASE };
+        self.reported += (fraction - self.reported) * rate;
+        let wanted = ((self.reported * 100.).round() as i32 + LOSS_MARGIN).clamp(LOSS_FLOOR, 30);
         if wanted != self.loss {
             // SAFETY: `state` is a live encoder and the request takes one i32.
             unsafe {
@@ -516,6 +527,37 @@ mod tests {
             let len = encoder.encode(&quiet, &mut packet).unwrap();
             assert!(len > 2, "{len} bytes of silence");
         }
+    }
+
+    #[test]
+    fn the_loss_planned_for_rises_fast_and_falls_slowly() {
+        let mut encoder = Encoder::voice().unwrap();
+        for _ in 0..200 {
+            encoder.set_loss(0.);
+        }
+        assert_eq!(encoder.loss, LOSS_FLOOR, "the floor stands");
+        encoder.set_loss(0.3);
+        let burst = encoder.loss;
+        assert!(burst >= 15, "one bad report is believed: {burst}");
+        encoder.set_loss(0.);
+        assert!((burst - 2..=burst).contains(&encoder.loss), "one clean report is not: {}", encoder.loss);
+        for _ in 0..60 {
+            encoder.set_loss(0.);
+        }
+        assert_eq!(encoder.loss, LOSS_FLOOR);
+    }
+
+    #[test]
+    fn the_loss_planned_for_does_not_follow_every_report() {
+        let mut encoder = Encoder::voice().unwrap();
+        let mut planned = Vec::new();
+        for n in 0..100 {
+            encoder.set_loss(if n % 2 == 0 { 0.1 } else { 0. });
+            planned.push(encoder.loss);
+        }
+        let settled = &planned[40..];
+        let (least, most) = (settled.iter().min().unwrap(), settled.iter().max().unwrap());
+        assert!(most - least <= 3, "{least} to {most}");
     }
 
     #[test]
