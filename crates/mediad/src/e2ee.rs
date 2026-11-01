@@ -623,6 +623,27 @@ impl crate::session::Controls {
         answer
     }
 
+    /// [`Controls::e2ee`] for the call's tick, which never waits. `None` while the lock is held,
+    /// by MLS applying a commit above all: davey keeps the sender keys inside the session and
+    /// gives no way to hold them apart from it, so the frame waits its turn instead (`Unsealed`,
+    /// `unopened` in `tiny`) and then goes through [`E2ee::seal`] or [`E2ee::open`] like any
+    /// other. Nothing gets past them for being in a hurry.
+    pub fn try_e2ee<R>(&self, with: impl FnOnce(&mut E2ee) -> R) -> Option<R> {
+        let (answer, outbox) = {
+            let mut e2ee = match self.tiny_e2ee.try_lock() {
+                Ok(e2ee) => e2ee,
+                Err(std::sync::TryLockError::WouldBlock) => return None,
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => panic!("{poisoned}"),
+            };
+            let answer = with(&mut e2ee);
+            (answer, e2ee.take_outbox())
+        };
+        for frame in outbox {
+            crate::out::send(&protocol::MediaResponse::TinyE2ee { frame });
+        }
+        Some(answer)
+    }
+
     /// Makes the safety numbers the group's new members need, outside the lock the call's loop
     /// takes for every frame, then tells chatd how the call is protected if that changed.
     pub fn e2ee_report(&self) {

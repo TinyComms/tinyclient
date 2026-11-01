@@ -49,7 +49,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use str0m::change::{SdpAnswer, SdpPendingOffer};
-use str0m::media::{Direction, Frequency, KeyframeRequestKind, MediaKind, MediaTime, Mid, Rid, Simulcast, SimulcastLayer};
+use str0m::media::{Direction, Frequency, KeyframeRequestKind, MediaData, MediaKind, MediaTime, Mid, Rid, Simulcast, SimulcastLayer};
 use str0m::net::{Protocol, Receive, TcpType};
 use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcConfig};
 
@@ -367,6 +367,18 @@ fn after(tick_at: Instant, now: Instant) -> Instant {
     }
 }
 
+/// Voice frames held at most while the encryption is busy, each way: half a second of one
+/// voice. Past it the oldest is dropped, as a frame with no keys is.
+const HELD: usize = 25;
+
+/// A frame of ours waiting its turn at the encryption.
+struct Unsealed {
+    opus: Vec<u8>,
+    tick: u64,
+    level: i8,
+    voice: bool,
+}
+
 /// One receive slot: whose voice it carries, and that voice on its way to the mix.
 struct Slot {
     user: String,
@@ -380,6 +392,10 @@ struct Call {
     poll: Poll,
     next_token: usize,
     packets: VecDeque<Packet>,
+    /// Voice the encryption could not take yet, in order. An MLS commit holds it for a moment,
+    /// and the tick does not wait for that: these go first thing on the next turn of the loop.
+    unsealed: VecDeque<Unsealed>,
+    unopened: VecDeque<MediaData>,
     /// Media flows on this link.
     connected: bool,
     /// This drop was already told to chatd. Cleared when media flows, or when a new link takes
@@ -460,6 +476,8 @@ impl Call {
             tracing::warn!("mediad: the new connection's socket: {err}");
         }
         self.packets.clear();
+        self.unsealed.clear();
+        self.unopened.clear();
         // Still connected as far as we could tell (the server stopped hearing us, or restarted
         // before ICE noticed): this is the loss, and it gets its cue as `down` gives one. The
         // Back cue follows when media flows on the new link (`up`).
@@ -556,37 +574,57 @@ impl Call {
             Event::KeyframeRequest(request) if request.mid == self.link.share_mid() => self.key_share = true,
             Event::KeyframeRequest(request) if request.mid == self.link.camera_mid() => self.key_camera = true,
             Event::MediaData(data) => {
-                let mid = data.mid.to_string();
-                if !self.slots.contains_key(&mid) {
-                    // Audio before the map that names its speaker: heard, and named later.
-                    if self.slots.len() >= SLOTS {
-                        return;
-                    }
-                    let Some(stream) = Stream::new() else {
-                        return;
-                    };
-                    self.slots.insert(mid.clone(), Slot { user: String::new(), stream });
+                if self.unopened.len() >= HELD {
+                    self.unopened.pop_front();
                 }
-                let Some(slot) = self.slots.get_mut(&mid) else {
-                    return;
-                };
-                // End-to-end encryption's half of the frame transform: what does not open with
-                // its sender's key is dropped here, before the jitter buffer.
-                let Some(opus) = self.controls.e2ee(|e2ee| e2ee.open(&slot.user, &data.data)) else {
-                    return;
-                };
-                let stream = &mut slot.stream;
-                stream.last_packet = Instant::now();
-                // The RTP clock is 48 kHz, as ours.
-                stream.arrivals.arrived(data.time.numer() as u32, data.network_time);
-                stream.heard |= opus[..] != SILENCE[..];
-                if !self.controls.deafened.load(Ordering::Relaxed) {
-                    // The SFU writes a fresh sequence, so a lost frame is a hole in the RTP
-                    // time and not in `seq_range`. The jitter buffer only sees sequence numbers.
-                    stream.jitter.insert(frame_sequence(data.time.numer() as u64), opus);
-                }
+                self.unopened.push_back(data);
+                self.open_voice();
             }
             _ => {}
+        }
+    }
+
+    /// Voice in, as far as the encryption will take it now.
+    fn open_voice(&mut self) {
+        while let Some(data) = self.unopened.front() {
+            let mid = data.mid.to_string();
+            if !self.slots.contains_key(&mid) {
+                // Audio before the map that names its speaker: heard, and named later.
+                if self.slots.len() >= SLOTS {
+                    self.unopened.pop_front();
+                    continue;
+                }
+                let Some(stream) = Stream::new() else {
+                    self.unopened.pop_front();
+                    continue;
+                };
+                self.slots.insert(mid.clone(), Slot { user: String::new(), stream });
+            }
+            let Some(slot) = self.slots.get_mut(&mid) else {
+                self.unopened.pop_front();
+                continue;
+            };
+            // End-to-end encryption's half of the frame transform: what does not open with
+            // its sender's key is dropped here, before the jitter buffer.
+            let Some(opened) = self.controls.try_e2ee(|e2ee| e2ee.open(&slot.user, &data.data)) else {
+                return;
+            };
+            let Some(data) = self.unopened.pop_front() else {
+                return;
+            };
+            let Some(opus) = opened else {
+                continue;
+            };
+            let stream = &mut slot.stream;
+            stream.last_packet = Instant::now();
+            // The RTP clock is 48 kHz, as ours.
+            stream.arrivals.arrived(data.time.numer() as u32, data.network_time);
+            stream.heard |= opus[..] != SILENCE[..];
+            if !self.controls.deafened.load(Ordering::Relaxed) {
+                // The SFU writes a fresh sequence, so a lost frame is a hole in the RTP
+                // time and not in `seq_range`. The jitter buffer only sees sequence numbers.
+                stream.jitter.insert(frame_sequence(data.time.numer() as u64), opus);
+            }
         }
     }
 
@@ -735,18 +773,35 @@ impl Call {
 
     /// One Opus packet on the microphone's m-line, stamped `tick` × 960.
     fn write(&mut self, opus: &[u8], tick: u64, level: i8, voice: bool) {
-        let Some(writer) = self.link.rtc.writer(self.link.microphone) else {
-            return;
-        };
-        let Some(pt) = writer.payload_params().next().map(|params| params.pt()) else {
-            return;
-        };
-        // The other half: sealed for the room's group, or held back while it has no keys.
-        let Some(payload) = self.controls.e2ee(|e2ee| e2ee.seal(opus)) else {
-            return;
-        };
-        let time = MediaTime::new(tick * FRAME as u64, Frequency::FORTY_EIGHT_KHZ);
-        let _ = writer.audio_level(level, voice).write(pt, Instant::now(), time, payload);
+        if self.unsealed.len() >= HELD {
+            self.unsealed.pop_front();
+        }
+        self.unsealed.push_back(Unsealed { opus: opus.to_vec(), tick, level, voice });
+        self.seal_voice();
+    }
+
+    /// Voice out, as far as the encryption will take it now.
+    fn seal_voice(&mut self) {
+        while let Some(frame) = self.unsealed.front() {
+            // The other half: sealed for the room's group, or held back while it has no keys.
+            let Some(sealed) = self.controls.try_e2ee(|e2ee| e2ee.seal(&frame.opus)) else {
+                return;
+            };
+            let Some(frame) = self.unsealed.pop_front() else {
+                return;
+            };
+            let Some(payload) = sealed else {
+                continue;
+            };
+            let Some(writer) = self.link.rtc.writer(self.link.microphone) else {
+                continue;
+            };
+            let Some(pt) = writer.payload_params().next().map(|params| params.pt()) else {
+                continue;
+            };
+            let time = MediaTime::new(frame.tick * FRAME as u64, Frequency::FORTY_EIGHT_KHZ);
+            let _ = writer.audio_level(frame.level, frame.voice).write(pt, Instant::now(), time, payload);
+        }
     }
 
     /// One renegotiation at a time, then frames on the lines whose answers are in.
@@ -1071,6 +1126,8 @@ impl Call {
             if let Some(map) = map {
                 self.apply_slots(&map);
             }
+            self.seal_voice();
+            self.open_voice();
             self.picture_step();
             // A connection str0m has given up on waits for the next one, or for the bound.
             let timeout = match self.drain() {
@@ -1157,6 +1214,8 @@ pub fn run(link: Link, user_id: String, controls: Arc<Controls>) {
         poll,
         next_token: 1,
         packets: VecDeque::new(),
+        unsealed: VecDeque::new(),
+        unopened: VecDeque::new(),
         connected: false,
         announced: false,
         lost: None,
