@@ -176,16 +176,18 @@ impl Shell {
                 let Some(room) = page.community.rooms.iter().find(|r| r.id == call.conversation.id) else {
                     return;
                 };
-                // Someone else's share, else their camera: what the Watch button offers.
-                let others: Vec<_> = room.participants.iter().filter(|seat| seat.user_id != me).collect();
-                let Some(seat) = others.iter().find(|seat| seat.sharing).or_else(|| others.iter().find(|seat| seat.camera)) else {
-                    return;
-                };
-                if call.picture.as_ref().is_some_and(|picture| !picture.path.is_empty() && picture.user_id == seat.user_id) {
-                    say!("tinyclient: debug launch: watching {} ({})", seat.user_id, if seat.sharing { "share" } else { "camera" });
+                if let Some(picture) = call.picture.as_ref().filter(|picture| !picture.path.is_empty()) {
+                    say!("tinyclient: debug launch: watching {} ({:?}, {}x{})", picture.user_id, picture.kind, picture.width, picture.height);
                     *pending = None;
                     return;
                 }
+                // Someone else's share, else their camera: what the Watch button offers. With
+                // neither flagged on the seats, the first other person: in a Tiny call watching
+                // takes whatever the server's video slot carries.
+                let others: Vec<_> = room.participants.iter().filter(|seat| seat.user_id != me).collect();
+                let Some(seat) = others.iter().find(|seat| seat.sharing).or_else(|| others.iter().find(|seat| seat.camera)).or_else(|| others.first()) else {
+                    return;
+                };
                 say!("tinyclient: debug launch: asking to watch {}", seat.user_id);
                 let source = Some(seat.user_id.clone());
                 *stage = Stage::Watching(Some(Instant::now()));
