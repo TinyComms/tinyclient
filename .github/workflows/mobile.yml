@@ -77,20 +77,28 @@ jobs:
           shared-key: mobile-android
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      # The action's default list asks for `tools`, which the SDK no longer carries, and fails.
       - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
 
       - name: NDK r30
-        run: sdkmanager --install "ndk;$NDK_VERSION" >/dev/null
+        run: |
+          sdkmanager --install "ndk;$NDK_VERSION" >/dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
 
       - name: cargo-ndk
         run: cargo install cargo-ndk --version "$CARGO_NDK_VERSION" --locked
 
       - name: Build the Rust library
         env:
-          ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/${{ env.NDK_VERSION }}
+          # chatd runs in the app, and its build script refuses a release without these.
+          TINYCLIENT_TELEGRAM_API_ID: ${{ secrets.TINYCLIENT_TELEGRAM_API_ID }}
+          TINYCLIENT_TELEGRAM_API_HASH: ${{ secrets.TINYCLIENT_TELEGRAM_API_HASH }}
         # Output is the layout AGP packages automatically: jniLibs/<abi>/libtinyclient.so.
+        # `--platform 29` matches minSdk: below it the NDK has no libnativewindow to link.
         run: |
-          cargo ndk -t arm64-v8a -t x86_64 \
+          cargo ndk -t arm64-v8a -t x86_64 --platform 29 \
             -o mobile/android/app/src/main/jniLibs \
             build --release -p tinyclient --lib --features mobile
 
@@ -171,6 +179,10 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build device + simulator and make the xcframework
+        env:
+          # chatd runs in the app, and its build script refuses a release without these.
+          TINYCLIENT_TELEGRAM_API_ID: ${{ secrets.TINYCLIENT_TELEGRAM_API_ID }}
+          TINYCLIENT_TELEGRAM_API_HASH: ${{ secrets.TINYCLIENT_TELEGRAM_API_HASH }}
         run: |
           chmod +x scripts/mobile/build-ios.sh
           scripts/mobile/build-ios.sh
