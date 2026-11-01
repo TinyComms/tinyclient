@@ -534,6 +534,16 @@ fn a_forum_topic_is_a_thread_under_the_forum() {
 }
 
 #[test]
+fn a_chat_pinned_by_a_folder_beyond_the_pages_gets_its_row() {
+    // The Work folder pins a chat that no dialog page the sign-on read carries: only the
+    // folder rule speaks of it, and what nothing stored says of is asked for alone.
+    let world = World::with(Some(SESSION), "30", &[("TINYCLIENT_TELEGRAM_LOST_PIN", "1")]);
+    world.connected();
+    world.until("the pinned chat to be asked for", || (world.called("GetPeerDialogs g8001") >= 1).then_some(()));
+    assert!(world.conversation("g8001").is_some(), "the folder's pinned chat gets its row");
+}
+
+#[test]
 fn a_read_lost_on_the_way_is_told_again_and_the_badge_stays() {
     let world = World::signed_in();
     world.connected();

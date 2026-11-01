@@ -329,7 +329,56 @@ pub(super) fn dialogs(account: &Account) -> Result<(), Fault> {
             }
         }
     }
+    // Folder pins name chats the pages may never have carried: a pin whose dialog lies past
+    // the newest 500 would sit missing for ever, so what nothing stored says of is asked
+    // for alone. The order the folders hold is already in the store.
+    pinned_missing(account);
     Ok(())
+}
+
+/// The chats the folder rules pin that no dialog page carried: each one dialog, asked of
+/// `getPeerDialogs`, so a pin never sits missing only because it lies far down the list.
+fn pinned_missing(account: &Account) {
+    let rules = account.live().filed.rules.clone();
+    let mut asked = HashSet::new();
+    for rule in rules {
+        for who in rule.pinned {
+            if !asked.insert(who) {
+                continue;
+            }
+            let id = who.text();
+            if matches!(account.ctx.known(&id), Ok(Some(_))) {
+                continue;
+            }
+            let Ok(peer) = account.input(who) else {
+                continue;
+            };
+            let request = tl::functions::messages::GetPeerDialogs {
+                peers: vec![tl::enums::InputDialogPeer::Peer(tl::types::InputDialogPeer { peer })],
+            };
+            let found = match account.ask(&request) {
+                Ok(tl::enums::messages::PeerDialogs::Dialogs(found)) => found,
+                _ => {
+                    continue;
+                }
+            };
+            account.learn(&found.users, &found.chats);
+            for dialog in found.dialogs {
+                if let tl::enums::Dialog::Dialog(dialog) = dialog {
+                    let list = usize::from(dialog.folder_id == Some(1));
+                    let newest = found
+                        .messages
+                        .iter()
+                        .find(|message| match message {
+                            tl::enums::Message::Message(before) => before.id == dialog.top_message,
+                            tl::enums::Message::Service(before) => before.id == dialog.top_message,
+                            tl::enums::Message::Empty(_) => false,
+                        });
+                    record(account, list, &dialog, newest);
+                }
+            }
+        }
+    }
 }
 
 /// One page of a list (0 the main list, 1 the archive) from `offset`, written row by row.

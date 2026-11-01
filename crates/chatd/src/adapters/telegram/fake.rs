@@ -316,7 +316,15 @@ impl World {
         match id {
             WORK => {
                 filter.title = named("Work");
-                filter.include_peers = vec![tl::types::InputPeerChannel { channel_id: WORKSHOP, access_hash: 0 }.into(), crew];
+                let channel: tl::enums::InputPeer =
+                    tl::types::InputPeerChannel { channel_id: WORKSHOP, access_hash: 0 }.into();
+                if lost_pin() {
+                    // A pin whose chat lies past the pages the test's dialogs pass carries.
+                    filter.pinned_peers = vec![crew.clone()];
+                    filter.include_peers = vec![channel];
+                } else {
+                    filter.include_peers = vec![channel, crew];
+                }
             }
             _ => {
                 filter.title = named("Family");
@@ -468,6 +476,12 @@ fn resolve_username(username: &str) -> Result<Vec<u8>, Fault> {
         peer: Who::User(id).peer(), chats: Vec::new(), users: vec![user(id, first, last, handle).into()],
     };
     answer(tl::enums::contacts::ResolvedPeer::Peer(found))
+}
+
+/// Whether the Work folder pins a chat that no dialog page carries, what Telegram looks like
+/// when a pin sits past the newest 500: its folder rule speaks of a chat nothing stored has.
+fn lost_pin() -> bool {
+    std::env::var_os("TINYCLIENT_TELEGRAM_LOST_PIN").is_some()
 }
 
 fn input_who(peer: &tl::enums::InputPeer) -> Who {
@@ -897,6 +911,10 @@ impl World {
                     for at in 0..crowd() {
                         let who = Who::User(CROWD + at);
                         all.push((dialog(who, 1, 1, 0, false, None), who, who.text()));
+                    }
+                    if lost_pin() {
+                        // The pinned chat is no longer in the pages at all.
+                        all.retain(|held| held.1 != Who::Group(CREW));
                     }
                     all
                 }
