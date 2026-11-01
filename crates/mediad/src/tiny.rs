@@ -336,6 +336,37 @@ pub fn remap(held: &mut HashMap<String, String>, map: &[TinySlot]) -> (Vec<Strin
     (reset, freed)
 }
 
+/// What the call's loop does next.
+#[derive(Debug, PartialEq)]
+enum Next {
+    Tick,
+    Packet,
+    Wait,
+}
+
+/// A tick that is due goes first, whatever has queued up: a flood of packets may delay a packet,
+/// and may not delay the microphone or the speakers.
+fn next_step(now: Instant, tick_at: Instant, packets: bool) -> Next {
+    if now >= tick_at {
+        Next::Tick
+    } else if packets {
+        Next::Packet
+    } else {
+        Next::Wait
+    }
+}
+
+/// When the tick after the one due at `tick_at` runs. The machine slept or stalled: the missed
+/// ticks are not replayed.
+fn after(tick_at: Instant, now: Instant) -> Instant {
+    let next = tick_at + TICK;
+    if now > next + 5 * TICK {
+        now + TICK
+    } else {
+        next
+    }
+}
+
 /// One receive slot: whose voice it carries, and that voice on its way to the mix.
 struct Slot {
     user: String,
@@ -385,6 +416,8 @@ struct Call {
     generation: u64,
     shown: Option<TinyPicture>,
     watching: bool,
+    /// The codec was looked for. Once is enough: `load_api` starts a download that is still owed.
+    warmed: bool,
     share_noted: bool,
     camera_noted: bool,
 }
@@ -757,7 +790,8 @@ impl Call {
             self.painted = None;
         }
         self.watching = watching;
-        if self.controls.share() || self.controls.camera() || watching {
+        if !self.warmed && (self.controls.share() || self.controls.camera() || watching) {
+            self.warmed = true;
             crate::picture::warm();
         }
         if self.offered.is_none() && !self.link.pending() {
@@ -1046,24 +1080,25 @@ impl Call {
                     next
                 }
             };
-            if let Some(packet) = self.packets.pop_front() {
-                if !self.input(packet) {
-                    tracing::warn!("mediad: str0m refused a packet");
-                }
-                continue;
-            }
             let now = Instant::now();
-            if now >= next {
-                next += TICK;
-                if now > next + 5 * TICK {
-                    // The machine slept or stalled: do not replay the missed ticks.
-                    next = now + TICK;
+            match next_step(now, next, !self.packets.is_empty()) {
+                Next::Tick => {
+                    next = after(next, now);
+                    self.tick();
+                    if self.ticks.is_multiple_of(SECOND) {
+                        self.overdue();
+                    }
+                    continue;
                 }
-                self.tick();
-                if self.ticks.is_multiple_of(SECOND) {
-                    self.overdue();
+                Next::Packet => {
+                    if let Some(packet) = self.packets.pop_front() {
+                        if !self.input(packet) {
+                            tracing::warn!("mediad: str0m refused a packet");
+                        }
+                    }
+                    continue;
                 }
-                continue;
+                Next::Wait => {}
             }
             let wait = timeout.min(next).saturating_duration_since(now).max(Duration::from_millis(1));
             if let Err(err) = self.poll.poll(&mut events, Some(wait)) {
@@ -1152,6 +1187,7 @@ pub fn run(link: Link, user_id: String, controls: Arc<Controls>) {
         generation: 0,
         shown: None,
         watching: false,
+        warmed: false,
         share_noted: false,
         camera_noted: false,
     };
@@ -1168,6 +1204,18 @@ mod tests {
 
     fn slot(mid: &str, user: &str) -> TinySlot {
         TinySlot { mid: mid.into(), user_id: user.into() }
+    }
+
+    #[test]
+    fn a_due_tick_goes_ahead_of_any_packets_and_a_stall_is_not_replayed() {
+        let start = Instant::now();
+        assert_eq!(next_step(start + TICK, start + TICK, true), Next::Tick, "packets queued do not hold the tick back");
+        assert_eq!(next_step(start, start + TICK, true), Next::Packet);
+        assert_eq!(next_step(start, start + TICK, false), Next::Wait);
+        assert_eq!(after(start, start + TICK), start + TICK, "on time");
+        assert_eq!(after(start, start + 5 * TICK), start + TICK, "a short slip catches up one tick at a time");
+        let late = start + 7 * TICK;
+        assert_eq!(after(start, late), late + TICK, "past the bound the missed ticks are gone");
     }
 
     #[test]
