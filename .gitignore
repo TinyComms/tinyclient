@@ -5,6 +5,11 @@
 /dist
 /.direnv/
 /.envrc.local
+<<<<<<< HEAD
 
 # UAT and design screenshots are outputs, not sources.
 /reports/
+=======
+# Local build credentials (Telegram's app id and hash) for the release's own builds.
+/telegram.env
+>>>>>>> eb2b079 (Telegram's build credentials may sit in telegram.env next to the tree, so a local build does not silently lose Telegram the way a release build refuses to)
