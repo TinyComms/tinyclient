@@ -18,7 +18,7 @@ use crate::hub::Hub;
 use protocol::{
     AccountKey, Change, MediaKind, Network, Request, Response, TinyAccess, TinyAudit, TinyBan,
     TinyCapabilities, TinyCategory, TinyCode, TinyCommunity, TinyInvite, TinyMember, TinyOverride,
-    TinyRole, TinyRoleEdit, TinyRoom, TinySeat, TinyServerInfo, TINY_ALL, TINY_BAN_MEMBERS,
+    TinyBot, TinyRole, TinyRoleEdit, TinyRoom, TinySeat, TinyServerInfo, TINY_ALL, TINY_BAN_MEMBERS,
     TINY_CREATE_INVITES, TINY_DEAFEN_MEMBERS, TINY_DISCONNECT_MEMBERS, TINY_EVERYONE_DEFAULT,
     TINY_KICK_MEMBERS, TINY_MOVE_MEMBERS, TINY_MUTE_MEMBERS, TINY_PRIORITY_SPEAKER, TINY_SPEAK,
     TINY_TIMEOUT_MEMBERS, TINY_VIEW_AUDIT_LOG, TINY_VOICE_ACTIVITY,
@@ -33,6 +33,16 @@ const ORIGIN: &str = "https://nightshift.example";
 /// has not, whenever the demo is seeded.
 fn from_now(hours: i64) -> String {
     protocol::tiny_time(crate::hub::now() + hours * 3_600)
+}
+
+/// Bots made in this process. The demo has no tinyserver behind it.
+fn bots_store() -> std::sync::MutexGuard<'static, Vec<TinyBot>> {
+    static BOTS: Mutex<Vec<TinyBot>> = Mutex::new(Vec::new());
+    BOTS.lock().unwrap_or_else(|poison| poison.into_inner())
+}
+
+fn demo_bots() -> Vec<TinyBot> {
+    bots_store().clone()
 }
 
 pub fn account() -> AccountKey {
@@ -1317,6 +1327,23 @@ pub fn answer(hub: &Hub, request: &Request) -> Option<Response> {
         Request::TinyAudit { account, filter } if ours(account) => Some(Response::TinyAudit {
             audit: audit_page(&community.audit, filter),
         }),
+        Request::TinyBots { account } if ours(account) => Some(Response::TinyBots { bots: demo_bots() }),
+        Request::TinyBotCreate { account, name, scopes } if ours(account) => {
+            let mut bots = bots_store();
+            let bot = TinyBot {
+                id: format!("bot-{}", bots.len() + 1),
+                name: name.clone(),
+                scopes: scopes.clone(),
+                permissions: 0,
+                created_at: from_now(0),
+            };
+            bots.push(bot.clone());
+            Some(Response::TinyBotCreated { bot, token: "shown-once-token".to_owned() })
+        }
+        Request::TinyBotRevoke { account, bot_id } if ours(account) => {
+            bots_store().retain(|bot| bot.id != *bot_id);
+            Some(Response::Ok)
+        }
         _ => None,
     }
 }

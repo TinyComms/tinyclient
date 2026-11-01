@@ -1695,6 +1695,22 @@ pub enum Request {
     TinyPasskeyLink {
         account: AccountKey,
     },
+    /// The server's application bots. Answers `TinyBots`. A member is refused.
+    TinyBots {
+        account: AccountKey,
+    },
+    /// Creates a bot and answers `TinyBotCreated`. `scopes` are `rooms.read`, `rooms.write`,
+    /// and `members.read`. The token is in that answer once.
+    TinyBotCreate {
+        account: AccountKey,
+        name: String,
+        scopes: Vec<String>,
+    },
+    /// Revokes one bot. Answers `Ok`.
+    TinyBotRevoke {
+        account: AccountKey,
+        bot_id: String,
+    },
     /// Server-mutes or server-deafens someone in a room's call, or undoes it; `None` leaves
     /// that one as it is (`voice_moderation`, mute_members / deafen_members).
     TinyCallModerate {
@@ -2057,6 +2073,15 @@ pub enum Response {
     /// The server would not apply the choices, and said what the owner can do. Nothing changed.
     TinySetupRefused {
         refusal: TinySetupRefusal,
+    },
+    /// The server's application bots. None of them carries a token.
+    TinyBots {
+        bots: Vec<TinyBot>,
+    },
+    /// A bot just created. `token` is shown once and is not kept.
+    TinyBotCreated {
+        bot: TinyBot,
+        token: String,
     },
     /// What `E2eeAsk::Status` asked.
     TinyE2ee {
