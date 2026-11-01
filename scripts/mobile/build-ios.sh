@@ -4,6 +4,7 @@
 #
 #   scripts/mobile/build-ios.sh            # release
 #   scripts/mobile/build-ios.sh --debug
+#   scripts/mobile/build-ios.sh --debug --demo   # proof build: made-up chats from launch (`demo`)
 #
 # Nothing here needs UniFFI: the shell calls one C symbol (`tinyclient_ios_main`). See
 # docs/mobile-build.md. This script does NOT build the .app — that is xcodebuild's job, and the
@@ -20,12 +21,14 @@ xcframework="$ios_dir/TinyCore.xcframework"
 profile="release"
 profile_dir="release"
 extra_args=(--release)
+features="mobile"
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --debug) profile="debug"; profile_dir="debug"; extra_args=() ;;
         --release) profile="release"; profile_dir="release"; extra_args=(--release) ;;
-        -h|--help) sed -n '2,14p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --demo) features="mobile demo" ;;
+        -h|--help) sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "build-ios: unknown argument: $1 (try --help)" >&2; exit 2 ;;
     esac
     shift
@@ -35,6 +38,9 @@ fail() {
     printf 'build-ios: %s\n' "$1" >&2
     exit 1
 }
+
+# The made-up chatd shows invented data and never reaches the real core: never in a release.
+[ "$features" = "mobile" ] || [ "$profile" = "debug" ] || fail "--demo is for debug proof builds only, never a release."
 
 note() {
     printf 'build-ios: %s\n' "$1"
@@ -75,7 +81,7 @@ done
 build() {
     local triple="$1"
     note "cargo build $profile --target $triple"
-    (cd "$root" && cargo build "${extra_args[@]}" -p tinyclient --lib --features mobile --target "$triple")
+    (cd "$root" && cargo build "${extra_args[@]}" -p tinyclient --lib --features "$features" --target "$triple")
 }
 
 for triple in "${targets[@]}"; do

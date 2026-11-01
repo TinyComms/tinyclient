@@ -55,6 +55,11 @@ gui-shot = ["gui", "gpui/test-support", "gpui_platform/test-support"]
 # Desktop-only modules inside `gui/` (window chrome, menubar, settings window, self-update) still
 # compile on mobile for now; see docs/mobile-build.md, "Feature gating".
 mobile = ["gui", "dep:android-activity", "dep:chatd"]
+# The made-up chatd of `--shot --demo` (src/gui/shot_demo.rs) without the screenshot harness, for
+# proof builds on a phone: `--features "mobile demo"`. On Android and iOS it is on from launch (a
+# phone has no flags), and the pictures it shows are compiled in. Never in a release or a default
+# build: it answers every request with invented data and never reaches the real core.
+demo = ["gui"]
 
 [target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
 # Avoid an OpenSSL cross-build on Android; rustls validates against bundled WebPKI roots.

@@ -973,6 +973,7 @@ impl Render for Shell {
             let frame = FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             eprintln!("tinyclient: frame {frame} at {} ms", super::LAUNCHED.get().map_or(0, |at| at.elapsed().as_millis()));
         }
+        super::feed_platform_insets(window);
         let root = self
             .keys(div(), cx)
             .size_full()

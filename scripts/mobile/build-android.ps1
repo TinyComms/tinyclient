@@ -4,6 +4,7 @@
 #   .\scripts\mobile\build-android.ps1                 # arm64-v8a + x86_64, debug APK
 #   .\scripts\mobile\build-android.ps1 -Profile release
 #   .\scripts\mobile\build-android.ps1 -SkipGradle     # only the .so files
+#   .\scripts\mobile\build-android.ps1 -Demo           # debug proof build: made-up chats from launch
 #
 # Prerequisites are checked here rather than left to fail deep inside cargo or Gradle; every
 # failure says what to install. See docs/mobile-build.md.
@@ -16,7 +17,11 @@ param(
     [ValidateSet('arm64-v8a', 'x86_64')]
     [string[]]$Abi = @('arm64-v8a', 'x86_64'),
 
-    [switch]$SkipGradle
+    [switch]$SkipGradle,
+
+    # A proof build with the made-up chatd on from launch (feature `demo`, src/gui/shot_demo.rs).
+    # Never for a release: it shows invented data and never reaches the real core.
+    [switch]$Demo
 )
 
 Set-StrictMode -Version Latest
@@ -105,7 +110,9 @@ $cargoArgs.Add('build')
 if ($Profile -eq 'release') { $cargoArgs.Add('--release') }
 # `--lib` because the package also has the desktop binary; `mobile` is the entry point + gui.
 $cargoArgs.Add('-p'); $cargoArgs.Add('tinyclient')
-$cargoArgs.Add('--lib'); $cargoArgs.Add('--features'); $cargoArgs.Add('mobile')
+if ($Demo -and $Profile -eq 'release') { Fail "-Demo is for debug proof builds only, never a release." }
+$features = if ($Demo) { 'mobile demo' } else { 'mobile' }
+$cargoArgs.Add('--lib'); $cargoArgs.Add('--features'); $cargoArgs.Add($features)
 
 Note "cargo $($cargoArgs -join ' ')"
 Push-Location $root
