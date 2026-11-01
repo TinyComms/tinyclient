@@ -6,6 +6,15 @@
 //! the same author. They are therefore bound into the ciphertext: they are the MLS message's
 //! authenticated data (`"tiny-e2ee-v1 msg" 0x00 kind 0x00 target_id`), and a ciphertext whose
 //! authenticated data is not what the row says is [`Error::AadMismatch`].
+//!
+//! **Padding** (design `security.md` 2.9). The envelope's length is rounded up to the next
+//! bucket of [`PADDING_BUCKETS`] (256 B to 16 KiB, the envelope cap), and MLS's own padding fills
+//! the encrypted part of the `PrivateMessage` (the envelope, its length prefix, the signature and
+//! the AEAD tag) to exactly that bucket plus [`PADDING_HEADROOM`]. So every message of one bucket,
+//! with the same authenticated data, is the same number of bytes on the wire whatever its text and
+//! whatever the length of its DER signature: the server learns the bucket, not the length. The
+//! receiver strips the padding as MLS defines it (zero bytes after the content, checked by
+//! OpenMLS), so nothing changes in the format and older clients read it.
 
 use crate::engine::Engine;
 use crate::envelope::{Envelope, Kind};
@@ -14,9 +23,53 @@ use crate::ids::{ConversationId, DeviceId, DeviceRef, UserId};
 use crate::wire::guard;
 use openmls::prelude as mls;
 use openmls::prelude::tls_codec::{Deserialize as _, Serialize as _};
+use openmls_traits::OpenMlsProvider as _;
 use zeroize::Zeroizing;
 
 const AAD_LABEL: &[u8] = b"tiny-e2ee-v1 msg";
+
+/// The sizes an envelope is padded up to: 256 B for most chat messages, reactions and control
+/// messages, up to 16 KiB, the envelope cap ([`crate::envelope::MAX_ENVELOPE_BYTES`]).
+pub const PADDING_BUCKETS: [usize; 7] = [256, 512, 1024, 2048, 4096, 8192, 16 * 1024];
+
+/// Room in each padded size for what MLS puts next to the envelope inside the encryption: the
+/// envelope's length prefix (at most 4 bytes), the signature's (2) and the signature (a DER P-256
+/// ECDSA signature, at most 72), and the AEAD tag (16), 94 bytes in all. Constant, so it hides
+/// nothing and leaks nothing: the bucket alone sets the size.
+pub const PADDING_HEADROOM: usize = 128;
+
+/// The size the encrypted part of a `PrivateMessage` is padded to for an envelope of `len` bytes:
+/// its bucket plus [`PADDING_HEADROOM`]. An envelope over the largest bucket (refused by the
+/// encoder before it gets here) is rounded up to a multiple of it.
+pub fn padded_len(len: usize) -> usize {
+    let largest = PADDING_BUCKETS[PADDING_BUCKETS.len() - 1];
+    let bucket = PADDING_BUCKETS
+        .iter()
+        .copied()
+        .find(|bucket| len <= *bucket)
+        .unwrap_or_else(|| len.div_ceil(largest) * largest);
+    bucket + PADDING_HEADROOM
+}
+
+/// `config` with MLS padding set to `padding_size`, every other setting kept exactly. OpenMLS
+/// has no setter for one field of a group's configuration, and its builder cannot read the others
+/// back, so this goes through the configuration's own serialized form.
+fn with_padding(
+    config: &mls::MlsGroupJoinConfig,
+    padding_size: usize,
+) -> Result<mls::MlsGroupJoinConfig> {
+    let mut value = serde_json::to_value(config).map_err(|_| Error::Malformed("group config"))?;
+    let field = value
+        .get_mut("padding_size")
+        .ok_or(Error::Malformed("group config"))?;
+    *field = serde_json::Value::from(padding_size);
+    let changed: mls::MlsGroupJoinConfig =
+        serde_json::from_value(value).map_err(|_| Error::Malformed("group config"))?;
+    if changed.padding_size() != padding_size {
+        return Err(Error::Malformed("group config"));
+    }
+    Ok(changed)
+}
 
 fn aad(kind: Kind, target_id: Option<&str>) -> Vec<u8> {
     let mut aad = Vec::new();
@@ -124,6 +177,14 @@ impl Engine {
             return Err(Error::PendingProposals);
         }
         let plaintext = Zeroizing::new(envelope.encode(kind)?);
+        let padding = padded_len(plaintext.len());
+        if group.configuration().padding_size() != padding {
+            let config = with_padding(group.configuration(), padding)?;
+            if let Err(error) = group.set_configuration(provider.storage(), &config) {
+                groups.remove(&conv);
+                return Err(Error::mls(error));
+            }
+        }
         group.set_aad(aad(kind, target_id));
         let message = group
             .create_message(&*provider, &identity.key, &plaintext)
@@ -302,5 +363,26 @@ impl Engine {
     ) -> Result<crate::safety::SafetyNumber> {
         let roster = self.roster(conv)?;
         crate::safety::safety_number(self.identity.user, &roster, other, &roster)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn changing_the_padding_keeps_every_other_setting() {
+        let config = mls::MlsGroupJoinConfig::builder()
+            .wire_format_policy(mls::PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
+            .use_ratchet_tree_extension(true)
+            .max_past_epochs(7)
+            .number_of_resumption_psks(3)
+            .padding_size(128)
+            .sender_ratchet_configuration(mls::SenderRatchetConfiguration::new(11, 222))
+            .build();
+        let changed = with_padding(&config, padded_len(300)).unwrap();
+        assert_eq!(changed.padding_size(), 512 + PADDING_HEADROOM);
+        assert_ne!(changed, config);
+        assert_eq!(with_padding(&changed, 128).unwrap(), config);
     }
 }

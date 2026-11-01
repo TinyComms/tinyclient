@@ -1684,3 +1684,101 @@ fn a_forged_signature_does_not_spend_the_real_message_key() {
     assert!(restarted.decrypt(conv, &forged, &claimed).is_err());
     world.say(a, &[b, c], "and on it goes");
 }
+
+#[test]
+fn messages_are_padded_to_buckets_so_the_server_sees_short_medium_or_long() {
+    use e2ee::envelope::{Envelope, MAX_ENVELOPE_BYTES};
+    use e2ee::messaging::{padded_len, PADDING_BUCKETS, PADDING_HEADROOM};
+    // What tinyserver accepts for one ciphertext (`CIPHERTEXT_MAX` in its e2ee_text/mls.rs).
+    const SERVER_CIPHERTEXT_MAX: usize = 20 * 1024;
+
+    assert_eq!(PADDING_BUCKETS, [256, 512, 1024, 2048, 4096, 8192, 16384]);
+    assert_eq!(*PADDING_BUCKETS.last().unwrap(), MAX_ENVELOPE_BYTES);
+    assert_eq!(padded_len(0), 256 + PADDING_HEADROOM);
+    assert_eq!(padded_len(256), 256 + PADDING_HEADROOM);
+    assert_eq!(padded_len(257), 512 + PADDING_HEADROOM);
+    assert_eq!(padded_len(16384), 16384 + PADDING_HEADROOM);
+
+    let mut world = World::new();
+    let (a, b) = (world.person("a"), world.person("b"));
+    world.sync_trust();
+    world.start(a);
+    world.change(&[a], a, &[b], &[]);
+    let conv = world.conv();
+
+    // A text whose envelope is exactly `len` bytes.
+    let text_for = |len: usize| -> String {
+        let base = envelope("").encode(Kind::Message).unwrap().len();
+        let text = "x".repeat(len - base);
+        assert_eq!(envelope(&text).encode(Kind::Message).unwrap().len(), len);
+        text
+    };
+    let base = envelope("").encode(Kind::Message).unwrap().len();
+    let mut sizes = Vec::new();
+    let mut lower = base;
+    for bucket in PADDING_BUCKETS {
+        // The smallest and the largest envelope of the bucket, and some between.
+        let mut lens = vec![lower, lower + 1, (lower + bucket) / 2, bucket - 1, bucket];
+        lens.dedup();
+        let mut lengths = Vec::new();
+        for len in lens {
+            let text = text_for(len);
+            let sealed = world.clients[a]
+                .engine
+                .encrypt(conv, Kind::Message, None, &envelope(&text))
+                .unwrap();
+            lengths.push(sealed.ciphertext.len());
+            let opened = world.open(b, &sealed.ciphertext, a).unwrap();
+            assert_eq!(opened.envelope.text, text, "the padding was not stripped");
+        }
+        assert!(
+            lengths.iter().all(|len| *len == lengths[0]),
+            "bucket {bucket}: sizes {lengths:?}"
+        );
+        assert!(lengths[0] <= SERVER_CIPHERTEXT_MAX, "bucket {bucket}");
+        sizes.push((bucket, lengths[0]));
+        lower = bucket + 1;
+    }
+    // One bucket to the next is a different size, and the rest of the message is fixed: the
+    // bucket is all the size tells. (The ciphertext's own length prefix grows by 2 bytes at
+    // 16 KiB, as MLS's variable-length integers do: that is a function of the bucket too.)
+    let header = sizes[0].1 - (sizes[0].0 + PADDING_HEADROOM);
+    for (bucket, size) in &sizes {
+        let prefix_growth = if bucket + PADDING_HEADROOM >= 16384 {
+            2
+        } else {
+            0
+        };
+        assert_eq!(
+            *size,
+            bucket + PADDING_HEADROOM + header + prefix_growth,
+            "{sizes:?}"
+        );
+    }
+    // A message one byte over the cap is not sent at all.
+    let mut too_long = envelope("");
+    too_long.text = "x".repeat(MAX_ENVELOPE_BYTES);
+    assert!(world.clients[a]
+        .engine
+        .encrypt(conv, Kind::Message, None, &too_long)
+        .is_err());
+
+    // Edits are padded the same way (their authenticated data names the target, which the server
+    // stores in the clear anyway): a one-letter and a hundred-letter edit are the same size.
+    let edits: Vec<usize> = ["e", &"x".repeat(100)]
+        .iter()
+        .map(|text| {
+            let edit = Envelope {
+                text: (*text).to_owned(),
+                ..Envelope::default()
+            };
+            world.clients[a]
+                .engine
+                .encrypt(conv, Kind::Edit, Some("m-1"), &edit)
+                .unwrap()
+                .ciphertext
+                .len()
+        })
+        .collect();
+    assert_eq!(edits[0], edits[1]);
+}

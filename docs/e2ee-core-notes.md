@@ -169,7 +169,16 @@ here rests on the cross-signature chain, not on lifetimes.
 * **A Welcome for an epoch already held** is `Error::Duplicate` and changes nothing; it does not
   freeze. (A first version froze the group: a feed read twice would have killed a healthy group.)
 * **Wire format policy** is `PURE_PLAINTEXT` for handshakes (the server must read commits and the
-  external proposals) and application messages are always `PrivateMessage`, padded to 128 bytes.
+  external proposals) and application messages are always `PrivateMessage`.
+* **Message padding** (security.md 2.9). The envelope's length is rounded up to the next bucket
+  of 256 B, 512 B, 1, 2, 4, 8 or 16 KiB, and MLS's own padding (`padding_size`, set per message)
+  fills the encrypted part to exactly the bucket plus 128 bytes of headroom for the length
+  prefixes, the variable DER signature (at most 72 bytes) and the tag. Every message of one bucket
+  is then the same size on the wire, whatever its text. The receiver strips MLS padding as the RFC
+  defines it, so the wire format is unchanged; the largest message is about 16.6 KiB, under the
+  server's 20 KiB `CIPHERTEXT_MAX`. OpenMLS has no setter for one field of a group's
+  configuration, so the crate changes `padding_size` through the configuration's serialized form
+  and checks the rest is kept.
 * **Safety number.** `safety::safety_number` reuses DAVE's pairwise fingerprint and displayable code
   from `davey` (the same construction `mediad` uses for calls). DAVE has one key per person, a person
   here has a set of devices, so each person's input is `SHA-256("tiny-e2ee-v1 safety" || user_id ||
@@ -296,7 +305,7 @@ the fuzz `Cargo.toml` so it builds the same versions as the workspace.
   when the engine is dropped; the snapshot's plaintext is built in a zeroing buffer but its
   intermediate strings are not. Device and attachment keys, the state key, the cache key and the
   chunk buffers are zeroed.
-* No ciphertext padding beyond MLS's (128 bytes); sizes of attachments are visible to the server.
+* Attachment sizes are visible to the server.
 * The local cache helper seals a value; the schema, the key's place in the keychain and the
   retention of decrypted text are the caller's.
 

@@ -51,8 +51,6 @@ pub struct Config {
     pub out_of_order_tolerance: u32,
     /// How many messages ahead of the last one seen from a sender are skipped.
     pub maximum_forward_distance: u32,
-    /// Application messages are padded to a multiple of this many bytes.
-    pub padding: usize,
     /// How many applied commits each conversation remembers (by hash), to tell a commit shown again
     /// from a rewritten history. A commit for an epoch older than these is taken for shown again:
     /// it cannot be told apart, and `observe_server_epoch` is what notices a server gone back.
@@ -65,7 +63,6 @@ impl Default for Config {
             max_past_epochs: 4,
             out_of_order_tolerance: 64,
             maximum_forward_distance: 2000,
-            padding: 128,
             commits_remembered: 256,
         }
     }

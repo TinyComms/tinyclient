@@ -328,7 +328,7 @@ fn create_config(
         .wire_format_policy(mls::PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
         .use_ratchet_tree_extension(true)
         .max_past_epochs(config.max_past_epochs)
-        .padding_size(config.padding)
+        .padding_size(crate::messaging::padded_len(0))
         .sender_ratchet_configuration(mls::SenderRatchetConfiguration::new(
             config.out_of_order_tolerance,
             config.maximum_forward_distance,
@@ -344,7 +344,7 @@ fn join_config(config: &Config) -> mls::MlsGroupJoinConfig {
         .wire_format_policy(mls::PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
         .use_ratchet_tree_extension(true)
         .max_past_epochs(config.max_past_epochs)
-        .padding_size(config.padding)
+        .padding_size(crate::messaging::padded_len(0))
         .sender_ratchet_configuration(mls::SenderRatchetConfiguration::new(
             config.out_of_order_tolerance,
             config.maximum_forward_distance,
