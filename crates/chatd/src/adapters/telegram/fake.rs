@@ -1011,7 +1011,7 @@ impl World {
                     &put(T0 - 80_000),
                     &put(forum.peer()),
                     &put(title.to_owned()),
-                    &put(0i32),
+                    &put(3i32),
                     &put(top),
                     &put(0i32),
                     &put(0i32),

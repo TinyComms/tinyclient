@@ -13,7 +13,7 @@ mod overlay;
 pub mod place;
 
 #[allow(unused_imports)]
-pub use avatar::{group_faces, initials, pair, pair_or, presence_dot, square, tint_of, Avatar, Shape};
+pub use avatar::{group_faces, initials, pair, pair_or, presence_dot, square, tint_from, tint_of, Avatar, Shape};
 #[allow(unused_imports)]
 pub use overlay::*;
 #[allow(unused_imports)]
