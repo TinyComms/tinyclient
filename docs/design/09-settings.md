@@ -180,6 +180,7 @@ Caption: "Text size is also ⌘+, ⌘− and ⌘0. Reduce Motion and Increase Co
 | Let others see what I have read | Telegram, Signal | Fixed "Always on" / "Set on your phone" | |
 | | "Load images and link previews automatically" (P3) | Switch | Off: "Nothing is fetched until you click it." |
 | | "Keep messages on this Mac for" (P4) | Segmented: "7 days" / "30 days" / "90 days" | |
+| Calls | "Only join end-to-end encrypted calls" (PE) | Switch | Caption: "A call whose encryption is turned off then stops sending and playing, instead of carrying on. A Tiny server that cannot encrypt calls is not joined. Takes effect the next time you join. Off by default, so servers and apps that cannot do it still work." |
 
 Captions. Under the read group: "Discord and Slack have no read receipts." If no signed-in account has receipts, the group is just that caption under the label. Under P4: "Older messages are deleted here, never on the networks. Each conversation also keeps at most its newest 2,000."
 
