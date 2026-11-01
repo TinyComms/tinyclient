@@ -501,3 +501,25 @@ fn what_is_told_is_told_once() {
     assert_eq!(e2ee.changed().map(|s| s.mode), Some(SecurityMode::Transport));
 }
 
+/// A panic while the lock was held (`seal_video` on the capture thread) leaves encryption in an
+/// unknown state. The tick ends the call and says so. `fail` ends the process, so this happens
+/// in a copy of this test run on its own.
+#[test]
+fn a_poisoned_lock_fails_the_call_in_words() {
+    const ALONE: &str = "MEDIAD_TEST_POISON";
+    if std::env::var_os(ALONE).is_some() {
+        let controls = std::sync::Arc::new(crate::session::Controls::default());
+        let holder = controls.clone();
+        let _ = std::thread::spawn(move || {
+            let _held = holder.tiny_e2ee.lock().unwrap();
+            panic!("seal_video");
+        })
+        .join();
+        let _ = controls.try_e2ee(|e2ee| e2ee.seal(TONE));
+        return;
+    }
+    let test = "e2ee::tests::a_poisoned_lock_fails_the_call_in_words";
+    let alone = std::process::Command::new(std::env::current_exe().unwrap()).args([test, "--exact"]).env(ALONE, "1").output().unwrap();
+    assert_eq!(alone.status.code(), Some(2), "{alone:?}");
+    assert!(String::from_utf8_lossy(&alone.stdout).contains(BROKEN), "{alone:?}");
+}

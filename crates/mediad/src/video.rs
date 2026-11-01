@@ -20,7 +20,7 @@ use crate::{out, rt};
 use protocol::{MediaResponse, PictureKind};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{channel, sync_channel, Receiver, RecvTimeoutError, Sender, SyncSender};
+use std::sync::mpsc::{channel, sync_channel, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -747,6 +747,8 @@ pub struct Video {
     wants: Wants,
     /// A thread that could not start is not tried again on every turn of the loop.
     refused: bool,
+    /// What a capture thread that died still has to say.
+    owed: Vec<Word>,
 }
 
 impl Video {
@@ -757,6 +759,7 @@ impl Video {
             watcher: None,
             wants: Wants::default(),
             refused: false,
+            owed: Vec::new(),
         }
     }
 
@@ -791,9 +794,29 @@ impl Video {
         }
     }
 
-    /// The next thing the capture thread has for the tick. Never waits.
-    pub fn next(&self) -> Option<Word> {
-        self.sender.as_ref()?.words.try_recv().ok()
+    /// The next thing the capture thread has for the tick. Never waits. That thread ends before
+    /// this is dropped only by panicking, and what it was sending then fails as any capture does,
+    /// so nothing stays on with a frozen picture. Asking for a picture again starts a new one.
+    pub fn next(&mut self) -> Option<Word> {
+        if let Some(word) = self.owed.pop() {
+            return Some(word);
+        }
+        match self.sender.as_ref()?.words.try_recv() {
+            Ok(word) => Some(word),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => {
+                tracing::warn!("mediad: the capture thread died");
+                self.sender = None;
+                let failed = |share, words: &str| Word::Failed { share, words: words.to_owned() };
+                if self.wants.share {
+                    self.owed.push(failed(true, "Screen sharing stopped working."));
+                }
+                if self.wants.camera {
+                    self.owed.push(failed(false, "The camera stopped working."));
+                }
+                self.owed.pop()
+            }
+        }
     }
 
     /// Someone may be about to show a picture: the decode thread starts, and the codec with it.
@@ -1173,6 +1196,46 @@ mod tests {
                 words: "No screen.".to_owned()
             })
         );
+    }
+
+    /// Panics on the first capture, as a broken encoder or `seal_video` would.
+    struct Doomed;
+
+    impl Source for Doomed {
+        fn share(&mut self, _ask: Ask) -> Result<Encoded, String> {
+            panic!("the capture thread dies here");
+        }
+        fn camera(&mut self, _high: Option<Ask>, _low: Option<Ask>) -> Result<(Encoded, Encoded), String> {
+            panic!("the capture thread dies here");
+        }
+        fn close_camera(&mut self) {}
+    }
+
+    /// A video thread that died, with `wants` asked of it.
+    fn died(wants: Wants) -> Video {
+        let mut video = Video::new(Arc::default());
+        video.sender = Some(start_capture(|| Doomed, Arc::default()).unwrap());
+        video.want(wants);
+        let done = &video.sender.as_ref().unwrap().done;
+        assert_eq!(done.recv_timeout(Duration::from_secs(5)), Err(RecvTimeoutError::Disconnected));
+        video
+    }
+
+    #[test]
+    fn a_capture_thread_that_dies_turns_a_share_off_in_words() {
+        let mut video = died(wanting(true, false));
+        assert!(matches!(video.next(), Some(Word::Failed { share: true, .. })));
+        assert_eq!(video.next(), None, "told once");
+        assert!(video.sender.is_none(), "and asking again starts a new one");
+    }
+
+    #[test]
+    fn a_capture_thread_that_dies_says_so_for_each_thing_it_was_sending() {
+        let mut video = died(wanting(true, true));
+        let words = [video.next(), video.next(), video.next()];
+        assert!(words.iter().any(|word| matches!(word, Some(Word::Failed { share: true, .. }))), "{words:?}");
+        assert!(words.iter().any(|word| matches!(word, Some(Word::Failed { share: false, .. }))), "{words:?}");
+        assert_eq!(words[2], None);
     }
 
     #[test]

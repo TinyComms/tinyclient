@@ -10,6 +10,7 @@
 use protocol::{write_frame, CallFailure, MediaResponse};
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Write};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -166,6 +167,15 @@ pub fn fail(reason: CallFailure, detail: impl Into<String>) -> ! {
     std::process::exit(2);
 }
 
+/// Runs what the call lives on. Should it panic, the call is over and chatd is told: a thread
+/// that just ended leaves this process up with no call in it, and nothing says so.
+pub fn or_fail<R>(reason: CallFailure, detail: &str, work: impl FnOnce() -> R) -> R {
+    match catch_unwind(AssertUnwindSafe(work)) {
+        Ok(done) => done,
+        Err(_) => fail(reason, detail),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,6 +199,19 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    /// `fail` ends the process, so the panic happens in a copy of this test run on its own.
+    #[test]
+    fn a_panic_in_the_call_fails_it_in_words() {
+        const ALONE: &str = "MEDIAD_TEST_OR_FAIL";
+        if std::env::var_os(ALONE).is_some() {
+            or_fail(CallFailure::Engine, "the call stopped", || panic!("the tick"));
+        }
+        let test = "out::tests::a_panic_in_the_call_fails_it_in_words";
+        let alone = std::process::Command::new(std::env::current_exe().unwrap()).args([test, "--exact"]).env(ALONE, "1").output().unwrap();
+        assert_eq!(alone.status.code(), Some(2), "{alone:?}");
+        assert!(String::from_utf8_lossy(&alone.stdout).contains("the call stopped"), "{alone:?}");
     }
 
     fn stalled() -> (Arc<Line>, std::sync::mpsc::SyncSender<()>, Arc<Mutex<Vec<u8>>>) {

@@ -30,7 +30,7 @@ use crate::rtp::SILENCE;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use davey::{Codec, DaveSession, MediaType, ProposalsOperationType, SigningKeyPair};
-use protocol::{CallSecurity, SecureMember, SecurityMode, TinyE2ee};
+use protocol::{CallFailure, CallSecurity, SecureMember, SecurityMode, TinyE2ee};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -605,6 +605,9 @@ pub fn safety_number(id: u64, key: &[u8], me: u64, mine: &[u8]) -> String {
         .unwrap_or_default()
 }
 
+/// A panic with the keys in hand: they cannot be trusted, and nothing goes out without them.
+const BROKEN: &str = "The call's encryption stopped working. Try joining again.";
+
 #[cfg(test)]
 mod tests;
 
@@ -613,7 +616,7 @@ impl crate::session::Controls {
     /// Runs `with` on the call's encryption, then sends what it has for the server.
     pub fn e2ee<R>(&self, with: impl FnOnce(&mut E2ee) -> R) -> R {
         let (answer, outbox) = {
-            let mut e2ee = self.tiny_e2ee.lock().unwrap();
+            let mut e2ee = self.tiny_e2ee.lock().unwrap_or_else(|_| crate::out::fail(CallFailure::Engine, BROKEN));
             let answer = with(&mut e2ee);
             (answer, e2ee.take_outbox())
         };
@@ -633,7 +636,7 @@ impl crate::session::Controls {
             let mut e2ee = match self.tiny_e2ee.try_lock() {
                 Ok(e2ee) => e2ee,
                 Err(std::sync::TryLockError::WouldBlock) => return None,
-                Err(std::sync::TryLockError::Poisoned(poisoned)) => panic!("{poisoned}"),
+                Err(std::sync::TryLockError::Poisoned(_)) => crate::out::fail(CallFailure::Engine, BROKEN),
             };
             let answer = with(&mut e2ee);
             (answer, e2ee.take_outbox())
