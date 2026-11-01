@@ -5,6 +5,7 @@
 #   scripts/mobile/build-ios.sh            # release
 #   scripts/mobile/build-ios.sh --debug
 #   scripts/mobile/build-ios.sh --debug --demo   # proof build: made-up chats from launch (`demo`)
+#   scripts/mobile/build-ios.sh --debug --sim-only   # Apple-silicon simulator slice only (fast loop)
 #
 # Nothing here needs UniFFI: the shell calls one C symbol (`tinyclient_ios_main`). See
 # docs/mobile-build.md. This script does NOT build the .app — that is xcodebuild's job, and the
@@ -22,12 +23,14 @@ profile="release"
 profile_dir="release"
 extra_args=(--release)
 features="mobile"
+sim_only=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --debug) profile="debug"; profile_dir="debug"; extra_args=() ;;
         --release) profile="release"; profile_dir="release"; extra_args=(--release) ;;
         --demo) features="mobile demo" ;;
+        --sim-only) sim_only=1 ;;
         -h|--help) sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "build-ios: unknown argument: $1 (try --help)" >&2; exit 2 ;;
     esac
@@ -67,6 +70,7 @@ command -v lipo >/dev/null 2>&1 || fail "lipo is not on PATH. It ships with Xcod
 # slice is what `xcodebuild -create-xcframework` wants: it refuses two slices of the same
 # platform+variant, so both simulator architectures must be lipo'd into one first.
 targets=(aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios)
+[ "$sim_only" = 1 ] && targets=(aarch64-apple-ios-sim)
 installed="$(rustup target list --installed)"
 for triple in "${targets[@]}"; do
     if ! printf '%s\n' "$installed" | grep -qx "$triple"; then
@@ -87,6 +91,13 @@ build() {
 for triple in "${targets[@]}"; do
     build "$triple"
 done
+
+if [ "$sim_only" = 1 ]; then
+    rm -rf "$xcframework"
+    note "xcodebuild -create-xcframework (simulator slice only) -> $xcframework"
+    xcodebuild -create-xcframework -library "$root/target/aarch64-apple-ios-sim/$profile_dir/libtinyclient.a" -output "$xcframework"
+    exit 0
+fi
 
 device_lib="$root/target/aarch64-apple-ios/$profile_dir/libtinyclient.a"
 sim_arm_lib="$root/target/aarch64-apple-ios-sim/$profile_dir/libtinyclient.a"

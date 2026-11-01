@@ -18,17 +18,30 @@ use protocol::web_sign_in::{AuthHandle, AuthRequest, WebPage, WebPageHandle, Web
 use std::sync::Arc;
 
 /// Said by every stub.
+#[cfg_attr(target_os = "ios", allow(dead_code))]
 const NOT_YET: &str = "This isn't available on this phone yet.";
+
+/// The iOS phone (`mobile/ios`): AVFoundation, VideoToolbox, ReplayKit, WebKit and
+/// AuthenticationServices behind the same two traits.
+#[cfg(target_os = "ios")]
+mod ios;
 
 /// Registers everything. Idempotent enough to call once per launch.
 pub fn register() {
     protocol::media_host::register(mediad::inproc::start);
+    #[cfg(target_os = "ios")]
+    {
+        ios::register();
+        return;
+    }
+    #[allow(unreachable_code)]
     let phone = Arc::new(Phone);
     mediad::platform::register(phone.clone());
     protocol::web_sign_in::register(phone);
 }
 
-/// The phone, until the platform code fills it in.
+/// The phone, until the platform code fills it in. iOS registers `ios` instead.
+#[cfg_attr(target_os = "ios", allow(dead_code))]
 struct Phone;
 
 impl Platform for Phone {

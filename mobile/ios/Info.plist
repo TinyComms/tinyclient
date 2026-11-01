@@ -56,6 +56,18 @@
 		<string></string>
 	</dict>
 
+	<!-- Calls (src/mobile/ios/audio.rs asks with AVCaptureDevice.requestAccess). -->
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Tiny uses the microphone for voice and video calls and voice messages.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>Tiny uses the camera for video calls.</string>
+
+	<!-- A call keeps its audio session (and its sound) when the app goes to the background. -->
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>audio</string>
+	</array>
+
 	<key>UISupportedInterfaceOrientations</key>
 	<array>
 		<string>UIInterfaceOrientationPortrait</string>

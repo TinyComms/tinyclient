@@ -60,7 +60,9 @@ gui-shot = ["gui", "gpui/test-support", "gpui_platform/test-support"]
 # pulls GPUI's test support, which has no meaning on a phone (device shots come from adb/simctl).
 # Desktop-only modules inside `gui/` (window chrome, menubar, settings window, self-update) still
 # compile on mobile for now; see docs/mobile-build.md, "Feature gating".
-mobile = ["gui", "dep:android-activity", "dep:chatd", "dep:mediad"]
+mobile = ["gui", "dep:android-activity", "dep:chatd", "dep:mediad", "ios-platform"]
+# The iOS platform crates (objc2 and Apple's frameworks); only linked on iOS.
+ios-platform = ["dep:objc2", "dep:block2", "dep:dispatch2", "dep:objc2-foundation", "dep:objc2-core-foundation", "dep:objc2-ui-kit", "dep:objc2-avf-audio", "dep:objc2-av-foundation", "dep:objc2-core-media", "dep:objc2-core-video", "dep:objc2-video-toolbox", "dep:objc2-web-kit", "dep:objc2-authentication-services", "dep:objc2-replay-kit"]
 # The made-up chatd of `--shot --demo` (src/gui/shot_demo.rs) without the screenshot harness, for
 # proof builds on a phone: `--features "mobile demo"`. On Android and iOS it is on from launch (a
 # phone has no flags), and the pictures it shows are compiled in. Never in a release or a default
@@ -110,3 +112,19 @@ gpui_platform = { package = "gpui_ce_platform", version = "0.3.0", optional = tr
 
 [target.'cfg(target_os = "ios")'.dependencies]
 gpui_platform = { package = "gpui_ce_platform", version = "0.3.0", optional = true, default-features = false, features = ["runtime_shaders"] }
+# The iOS call platform and web sign-in (`src/mobile/ios`), written against Apple's frameworks
+# through objc2: the same objc2 0.6 / framework 0.3 line gpui-ce's iOS backend already links.
+objc2 = { version = "0.6", optional = true }
+block2 = { version = "0.6", optional = true }
+dispatch2 = { version = "0.3", optional = true }
+objc2-foundation = { version = "0.3", optional = true }
+objc2-core-foundation = { version = "0.3", optional = true }
+objc2-ui-kit = { version = "0.3", optional = true }
+objc2-avf-audio = { version = "0.3", optional = true }
+objc2-av-foundation = { version = "0.3", optional = true }
+objc2-core-media = { version = "0.3", optional = true }
+objc2-core-video = { version = "0.3", optional = true }
+objc2-video-toolbox = { version = "0.3", optional = true }
+objc2-web-kit = { version = "0.3", optional = true }
+objc2-authentication-services = { version = "0.3", optional = true }
+objc2-replay-kit = { version = "0.3", optional = true }
