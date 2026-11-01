@@ -235,6 +235,15 @@ impl Decoder {
         samples
     }
 
+    /// `frames` went by that the decoder will never see and no tick stands in for. Whatever it
+    /// decodes next starts from a clean state, as after that many concealed frames in a row.
+    pub(crate) fn missed(&mut self, frames: u32) {
+        if frames > 0 {
+            self.carry_on();
+            self.misses = self.misses.saturating_add(frames);
+        }
+    }
+
     /// Stands in for a lost packet when the one after it cannot rebuild it ([`Decoder::recover`]).
     /// After CELT, libopus conceals it. After a SILK or hybrid packet it may not:
     /// `unsafe-libopus` 0.2.0 saturates there (a test below holds it to that, so a fixed library

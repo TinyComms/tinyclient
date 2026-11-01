@@ -156,7 +156,15 @@ impl Stream {
                 // Not a loss yet. Pitch carries the voice; the decoder stays put so the packet
                 // after a real gap can still rebuild it.
                 Pop::Hold => Some(self.decoder.bridge(FRAME, &mut pcm)),
-                Pop::Lost => {
+                Pop::Spurt(packet) => {
+                    // Cut off in mid-speech and never resumed: what came between is gone.
+                    if std::mem::take(&mut self.stalled) {
+                        self.decoder.missed(2);
+                    }
+                    self.played(&packet, &mut pcm)
+                }
+                Pop::Lost(frames) => {
+                    self.decoder.missed(frames - 1);
                     // The packet after the hole may carry a copy of what was lost.
                     let rebuilt = self.jitter.next().and_then(|next| self.decoder.recover(next, &mut pcm));
                     self.rebuilt += u64::from(rebuilt.is_some());
@@ -168,10 +176,7 @@ impl Stream {
                     self.stalled |= !self.jitter.hushed;
                     Some(self.decoder.late(FRAME, &mut pcm))
                 }
-                Pop::Empty => {
-                    self.stalled = false;
-                    break;
-                }
+                Pop::Empty => break,
             };
             match decoded {
                 Some(samples) => self.pcm.extend(&pcm[..samples * CHANNELS]),
@@ -1325,6 +1330,45 @@ mod receive_tests {
                 packet[..len].to_vec()
             })
             .collect()
+    }
+
+    /// A pause through the whole receive path, as the gate leaves it: speech, the trail of
+    /// silence, 200 ms of nothing with the RTP clock running, and speech again.
+    #[test]
+    fn the_words_after_a_pause_play_at_once_and_the_pause_loses_nothing() {
+        let mut encoder = Encoder::voice().unwrap();
+        let tone = |at: usize| {
+            let mut pcm = [0i16; FRAME_SAMPLES];
+            for (n, pair) in pcm.as_chunks_mut::<CHANNELS>().0.iter_mut().enumerate() {
+                let t = (at * FRAME + n) as f64 / 48_000.;
+                pair.fill(((t * 440. * std::f64::consts::TAU).sin() * 8000.) as i16);
+            }
+            pcm
+        };
+        let mut encode = |pcm: &[i16; FRAME_SAMPLES]| {
+            let mut packet = [0u8; 1275];
+            let len = encoder.encode(pcm, &mut packet).unwrap();
+            packet[..len].to_vec()
+        };
+        let mut sent: Vec<(u16, Vec<u8>)> = (0..20).map(|n| (n as u16, encode(&tone(n)))).collect();
+        sent.extend((20..25).map(|n| (n as u16, encode(&[0; FRAME_SAMPLES]))));
+        let resumed = 35usize;
+        sent.extend((resumed..resumed + 20).map(|n| (n as u16, encode(&tone(n)))));
+        let mut stream = Stream::new().unwrap();
+        let mut heard_at = None;
+        for tick in 0..resumed + 20 {
+            if let Some((sequence, packet)) = sent.iter().find(|(sequence, _)| usize::from(*sequence) == tick) {
+                stream.jitter.insert(*sequence, packet.clone());
+            }
+            let loud = stream.pull(&"pause").is_some_and(|frame| level(&frame) >= VOICE);
+            if tick >= resumed && loud && heard_at.is_none() {
+                heard_at = Some(tick);
+            }
+        }
+        let late = heard_at.expect("the words play") - resumed;
+        assert!(late <= 5, "the words came {late} ticks after they arrived");
+        assert_eq!(stream.jitter.lost, 0, "a pause is not a loss");
+        assert_eq!(stream.gaps, 0);
     }
 
     /// A packet 60 ms late in the middle of a word: the voice fades and comes back. Nothing is
