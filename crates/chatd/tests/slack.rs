@@ -1825,7 +1825,7 @@ fn presence_a_profile_and_signing_out() {
     assert_eq!(world.fake.calls(ALPHA, "users.setPresence").len(), 3);
     // Set away from another device: Slack says so on the socket.
     world.fake.push(ALPHA, json!({"type": "manual_presence_change", "presence": "away"}));
-    world.until("my own presence from elsewhere", || (world.account("T01ALPHA").presence == Presence::Offline).then_some(()));
+    world.until("my own presence from elsewhere", || (world.account("T01ALPHA").presence == Presence::Idle).then_some(()));
 
     // A profile card is one request, and only because it was opened.
     let before = world.fake.calls(ALPHA, "users.info").len();

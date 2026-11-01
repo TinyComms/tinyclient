@@ -78,6 +78,8 @@ pub(in crate::gui) struct Own {
     pub key: AccountKey,
     pub name: String,
     pub link: Link,
+    /// Offline, but trying again soon.
+    pub reconnecting: bool,
     /// Our own person id on it.
     pub me: String,
     pub presence: Presence,
@@ -305,6 +307,7 @@ impl Shell {
                     key: account.key.clone(),
                     name: account.name.clone(),
                     link: account.link,
+                    reconnecting: account.reconnecting,
                     me: account.me.clone(),
                     presence: account.presence,
                     status: account.status.clone(),
@@ -615,6 +618,13 @@ impl Shell {
         }
         let count = self.people_state.members.get().and_then(|members| members.read(cx).total());
         self.open_right(RightPane { kind: RightKind::Members, title: "Members".into(), count, body: draw_members }, cx);
+    }
+
+    /// The rail's avatar menu is opening: its head shows us, not a half-made edit.
+    pub(super) fn own_menu_opened(&mut self, cx: &mut Context<Self>) {
+        if let Some(menu) = self.people_state.status.get() {
+            menu.update(cx, |menu, cx| menu.opened(cx));
+        }
     }
 
     /// Our own presence, for the rail's avatar: the most available among the connected accounts.

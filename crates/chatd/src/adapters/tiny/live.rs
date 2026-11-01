@@ -1123,6 +1123,10 @@ fn ready_heard(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, heard
     for user in heard.online.iter().take(NAMES) {
         ctx.presence(user, Presence::Online, "", true);
     }
+    // The server counts us online while this socket is up, but may not list us to ourselves.
+    if !seat.me.is_empty() {
+        ctx.presence(&seat.me, Presence::Online, "", true);
+    }
     let before: Vec<String> = seat.calls.keys().cloned().collect();
     let calls: Vec<CallFrame> = super::rows(heard.calls, "calls").unwrap_or_default();
     seat.calls = calls

@@ -60,6 +60,31 @@ static CHOICES: Mutex<Choices> = Mutex::new(Choices {
     section: Section::Accounts,
 });
 static VALUES: Mutex<Option<Values>> = Mutex::new(None);
+static ME: Mutex<Me> = Mutex::new(Me { name: String::new(), picture: String::new() });
+
+/// How Tiny shows the user to themselves on this device: the rail's avatar and the head of its
+/// menu. Never sent to a network; each still shows the name and picture the user has there.
+/// Empty fields fall back to what the accounts say.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Me {
+    pub name: String,
+    /// A file name in the support directory, copied there when chosen.
+    pub picture: String,
+}
+
+impl Me {
+    pub fn picture_path(&self) -> Option<std::path::PathBuf> {
+        (!self.picture.is_empty()).then(|| protocol::support_dir().join(&self.picture))
+    }
+}
+
+pub fn me() -> Me {
+    ME.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+}
+
+pub fn set_me(me: Me) {
+    *ME.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = me;
+}
 
 pub fn choices() -> Choices {
     *CHOICES.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -107,6 +132,7 @@ pub struct Prefs {
     /// those away from 100 % and heard.
     /// The Tiny server's member list is shown beside the pane.
     pub tiny_members: bool,
+    pub me: Me,
 }
 
 impl Default for Prefs {
@@ -125,6 +151,7 @@ impl Default for Prefs {
             kept: Vec::new(),
             autoplay: Autoplay::Always,
             tiny_members: true,
+            me: Me::default(),
         }
     }
 }
@@ -215,6 +242,14 @@ pub fn parse(text: &str) -> Prefs {
             // Each person's volume once lived here; chatd keeps it now (`CallGain`).
             "tiny_gain" => {}
             "tiny_members" => prefs.tiny_members = fields.next() != Some("off"),
+            "me_name" => prefs.me.name = fields.next().unwrap_or("").trim().to_owned(),
+            // Only a bare file name: the picture always lives in the support directory.
+            "me_picture" => {
+                let file = fields.next().unwrap_or("");
+                if !file.is_empty() && !file.contains(['/', '\\']) && !file.starts_with('.') {
+                    prefs.me.picture = file.to_owned();
+                }
+            }
             "settings_section" => prefs.choices.section = fields.next().and_then(Section::from_word).unwrap_or(Section::Accounts),
             _ if !line.trim().is_empty() => prefs.kept.push(line.to_owned()),
             _ => {}
@@ -272,6 +307,12 @@ pub fn write(prefs: &Prefs) -> String {
     if !prefs.tiny_members {
         text.push_str("tiny_members\toff\n");
     }
+    if !prefs.me.name.is_empty() {
+        text.push_str(&format!("me_name\t{}\n", clean(&prefs.me.name)));
+    }
+    if !prefs.me.picture.is_empty() {
+        text.push_str(&format!("me_picture\t{}\n", clean(&prefs.me.picture)));
+    }
     if prefs.autoplay != Autoplay::default() {
         text.push_str(&format!("autoplay\t{}\n", prefs.autoplay.word()));
     }
@@ -317,12 +358,24 @@ mod tests {
             kept: Vec::new(),
             autoplay: Autoplay::Hover,
             tiny_members: false,
+            me: Me { name: "Justin\tS".into(), picture: "me-17.png".into() },
         };
         let read = parse(&write(&saved));
-        assert_eq!(read, Prefs { open: Some((key(Network::Discord, "c1"), "#general with a tab".into())), ..saved.clone() });
+        let me = Me { name: "Justin S".into(), picture: "me-17.png".into() };
+        assert_eq!(read, Prefs { open: Some((key(Network::Discord, "c1"), "#general with a tab".into())), me, ..saved.clone() });
         for mode in [Mode::Inbox, Mode::People, Mode::Network(Network::Telegram)] {
             assert_eq!(parse(&write(&Prefs { mode: mode.clone(), ..Prefs::default() })).mode, mode);
         }
+    }
+
+    #[test]
+    fn our_picture_is_only_ever_a_file_in_the_support_directory() {
+        for bad in ["../secret.png", "C:\\Users\\x.png", "/etc/x.png", ".hidden.png", ""] {
+            assert_eq!(parse(&format!("me_picture\t{bad}\n")).me.picture, "", "{bad}");
+        }
+        assert_eq!(parse("me_picture\tme-1.webp\n").me.picture, "me-1.webp");
+        // Nothing is written for a profile left to the accounts.
+        assert!(!write(&Prefs::default()).contains("me_"));
     }
 
     #[test]

@@ -1384,6 +1384,14 @@ fn a_dropped_socket_resumes_and_a_refused_token_expires_the_account() {
     world.incoming("3002", None, "before the drop", json!({}));
     wait("the message before the drop", || world.messages("3002").pop());
     let heard = world.discord.sequence.load(Ordering::Relaxed);
+    let own = || match world.ask(Request::Status) {
+        Response::Status { accounts, .. } => accounts[0].presence,
+        other => panic!("{other:?}"),
+    };
+    let set = Request::SetPresence { account: world.account(), presence: Presence::Dnd, status: None };
+    assert_eq!(world.ask(set), Response::Ok);
+    let mine = own();
+    assert_eq!(mine, Presence::Dnd);
 
     world.discord.control.lock().unwrap().send(Control::Drop).unwrap();
     wait("the link going down", || (world.link() == Link::Offline).then_some(()));
@@ -1399,6 +1407,8 @@ fn a_dropped_socket_resumes_and_a_refused_token_expires_the_account() {
     wait("friends' presence after the resume", || {
         world.people(Some(Relation::Friend), None).iter().any(|person| person.presence == Presence::Online).then_some(())
     });
+    // Nor ours: it is a setting chatd keeps across the drop, not something to forget.
+    assert_eq!(own(), mine);
     let id = world.incoming("3002", None, "after the resume", json!({}));
     wait("a message on the resumed session", || world.messages("3002").pop().filter(|message| message.id == id));
     // The heartbeat keeps going on the new socket.

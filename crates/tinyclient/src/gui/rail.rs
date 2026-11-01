@@ -168,15 +168,21 @@ impl Shell {
             places = places.child(self.rail_button(("rail-pin", ix), place, cx));
         }
 
-        // My picture: the first signed-in account that has one, fetched if it is not here yet.
+        // My picture: the one chosen on this device, else the first signed-in account that has
+        // one, fetched if it is not here yet.
+        let local = super::app::prefs::me();
         let me = snapshot.accounts.iter().find(|account| account.avatar.is_some()).or(snapshot.accounts.first());
         let mine = match me {
             Some(account) => {
                 let key = protocol::Key::new(&account.key, account.me.clone());
-                let name = self.people_state.hub().person(&key).map_or_else(|| account.name.clone(), |person| person.name);
-                Avatar::new(&key, &name, 32.).image_at(self.person_picture(&key, cx).or_else(|| self.own_avatar(&account.key)))
+                let name = match local.name.is_empty() {
+                    true => self.people_state.hub().person(&key).map_or_else(|| account.name.clone(), |person| person.name),
+                    false => local.name.clone(),
+                };
+                let picture = local.picture_path().or_else(|| self.person_picture(&key, cx)).or_else(|| self.own_avatar(&account.key));
+                Avatar::new(&key, &name, 32.).image_at(picture)
             }
-            None => Avatar::named("", 32.),
+            None => Avatar::named(&local.name, 32.).image_at(local.picture_path()),
         };
         let mine = mine.build().children(
             presence::Shape::of(self.own_presence()).and_then(|shape| presence::dot(shape, 32., &presence::Ring::on(theme::rail()))),
