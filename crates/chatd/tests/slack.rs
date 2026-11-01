@@ -791,7 +791,9 @@ impl World {
         self.messages(conversation).into_iter().find(|message| message.id == id)
     }
 
-    /// Both workspaces connected, and the first one's sidebar and unread state loaded.
+    /// Both workspaces connected, the first one's sidebar and unread state loaded, and the
+    /// second one's sidebar too. Connected is not loaded: each workspace writes its tree on its
+    /// own, so a test that reads the second one's must wait for it as well.
     fn ready(&self) {
         self.until("both workspaces to connect", || {
             let connected = self.accounts().iter().filter(|account| account.link == Link::Connected).count();
@@ -799,6 +801,9 @@ impl World {
         });
         self.until("the sidebar and Slack's unread state", || {
             self.conversation(&alpha("C0DEP")).filter(|row| row.mentions == 2).map(|_| ())
+        });
+        self.until("the second workspace's sidebar", || {
+            self.tree(&beta("T02BETA")).filter(|(groups, rows)| !groups.is_empty() && !rows.is_empty()).map(|_| ())
         });
     }
 
