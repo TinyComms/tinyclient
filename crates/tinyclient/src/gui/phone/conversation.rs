@@ -1,12 +1,12 @@
-//! A conversation pushed over the list: a 44 pt back chevron, the title, and Details. Its body
-//! is the desktop pane (`conversation::Pane`) at `Metrics::PHONE`; the strip and the back
-//! gesture are the phone's (`01-ia-navigation.md` §3.2, §5.1). The connection's state is a
-//! banner under the strip, never in it, so the title keeps the width it needs.
+//! A conversation pushed over the list: the desktop strip with a 44 pt back chevron in place of
+//! its travel buttons. Its body is the desktop pane (`conversation::Pane`) at `Metrics::PHONE`.
+//! The connection's state is a banner under the strip, never in it, so the title keeps the
+//! width it needs.
 
 use crate::gui::components::{banner, banner_action, icon_button, network_icon, Tone};
 use crate::gui::phone::tokens::{self, PhoneType};
-use crate::gui::theme;
 use crate::gui::state::Shell;
+use crate::gui::theme;
 use gpui::{div, prelude::*, px, Context, Div, MouseButton, Window};
 use protocol::{Conversation, ConversationKind, Link};
 
@@ -22,57 +22,72 @@ pub fn trouble(link: Link) -> Option<(&'static str, Tone, bool)> {
 }
 
 impl Shell {
-    /// The strip, and under it the banner when the link is in trouble. The banner is 32 pt inside
-    /// 8 of air, so it reads as a line of state, not a second title.
+    /// The desktop strip at a phone's size: back where the desktop has its travel buttons, the
+    /// conversation's picture and title, the call, then Members and Details as the desktop
+    /// strip has them. Under it the banner when the link is in trouble.
     pub(in crate::gui) fn phone_strip(&self, open: &Conversation, link: Link, _window: &Window, cx: &mut Context<Self>) -> Div {
-        let title = open.title.trim_start_matches('#').to_owned();
-        let direct = matches!(open.kind, ConversationKind::Direct | ConversationKind::Group);
-        // The face the desktop strip draws, at 32: the conversation's own picture, never a
-        // generic person glyph. Channels keep their space mark and the info button.
-        let face = direct.then(|| {
+        let direct = open.kind == ConversationKind::Direct;
+        let size = 28.;
+        // The face its row in the sidebar wears, so the page and the row it came from match.
+        let face = self.conversation_avatar(open, size, theme::canvas(), cx);
+        // The network's icon leads the title where networks are mixed, as on the desktop.
+        let mixed = open.space.is_none();
+        let place = open.space_title.trim().to_owned();
+        let subtitle = (!direct && !place.is_empty())
+            .then(|| div().min_w_0().truncate().phone_stamp().font_weight(theme::REGULAR).text_color(theme::text_faint()).child(place));
+        let call = self.snapshot.as_ref().and_then(|snapshot| self.call_pill(snapshot, cx)).map(|call| {
+            // Only the 14 pt glyph fits beside a phone's title, as in a narrow desktop strip: it
+            // is centered in a 32 box and the words are pushed past its edge.
             div()
                 .flex_none()
-                .ml(px(4.))
-                .mr(px(2.))
-                .child(self.conversation_avatar(open, 32., theme::sidebar(), cx))
+                .mx(px(6.))
+                .child(call.h(px(32.)).w(px(32.)).pl(px(8.)).pr_0().gap(px(32.)).overflow_hidden().rounded(px(theme::R_CONTROL)).whitespace_nowrap())
         });
+        let action = |id: &'static str, icon: &'static str| {
+            icon_button(id, icon, false).size(px(tokens::TOUCH)).on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        };
+        let members = (!direct).then(|| action("phone-members", "icons/users.svg").on_click(cx.listener(|this, _, _, cx| this.toggle_member_list(cx))));
+        let details = action("phone-details", if direct { "icons/user.svg" } else { "icons/info.svg" })
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_details(cx)));
         let strip = div()
             .flex_none()
             .h(px(tokens::NAV))
-            .pl(px(4.))
+            .pl(px(2.))
             .pr(px(4.))
             .flex()
             .items_center()
-            .gap(px(4.))
-            .bg(theme::sidebar())
-            .shadow(tokens::top_highlight())
+            .bg(theme::canvas())
             .border_b_1()
             .border_color(theme::hairline())
             .child(
                 icon_button("phone-back", "icons/chevron-left.svg", false)
                     .size(px(tokens::TOUCH))
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.phone_back(cx);
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.phone_back(Some(window), cx);
                     })),
             )
-            .children(face)
+            .child(div().flex_none().mr(px(10.)).child(face))
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
                     .flex()
-                    .items_center()
-                    .gap(px(6.))
-                    .children((!direct).then(|| div().flex_none().child(network_icon(open.key.network, 14.))))
-                    .child(div().flex_1().min_w_0().truncate().phone_title().child(title)),
+                    .flex_col()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .children(mixed.then(|| div().flex_none().child(network_icon(open.key.network, 14.))))
+                            .child(div().min_w_0().truncate().phone_title().child(open.title.clone())),
+                    )
+                    .children(subtitle),
             )
-            .child(
-                icon_button("phone-details", if direct { "icons/user.svg" } else { "icons/info.svg" }, false)
-                    .size(px(tokens::TOUCH))
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_details(cx))),
-            );
+            .children(call)
+            .children(members)
+            .child(details);
         let state = trouble(link).map(|(words, tone, sign_in)| {
             let row = banner(tone, words);
             let row = if sign_in {

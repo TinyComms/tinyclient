@@ -104,6 +104,11 @@ pub fn set_end(end: End, window: &Window) {
     END.with(|cell| cell.set((end, width(window))));
 }
 
+/// No buttons over any strip: a phone draws none.
+pub fn clear_end() {
+    END.with(|cell| cell.set((End::Conversation, 0.)));
+}
+
 /// The right padding for `at`'s strip: `pad`, or enough to clear the buttons when they sit
 /// over it.
 pub fn end_pad(at: End, pad: f32) -> f32 {

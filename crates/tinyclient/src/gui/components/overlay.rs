@@ -110,7 +110,8 @@ fn menu_row(
         .focus_visible(|style| style.shadow(theme::focus_ring_inset()))
         .children(lead)
         .child(div().flex_1().min_w_0().truncate().child(label.into()))
-        .children(shortcut.map(|keys| {
+        // A phone has no keyboard: its menus name no keys.
+        .children(shortcut.filter(|_| !crate::gui::phone::active()).map(|keys| {
             div()
                 .flex_none()
                 .type_small()

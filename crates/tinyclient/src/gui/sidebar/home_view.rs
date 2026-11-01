@@ -261,7 +261,7 @@ impl Shell {
         };
         let focused = self.sidebar_state.listed() && self.sidebar_state.cursor == Some(ix) && (self.sidebar_state.focus.is_focused(window) || self.focus.is_focused(window));
         let network = self.sidebar_state.home.network;
-        let click = move |row: Stateful<Div>, cx: &mut Context<Self>| row.on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| this.activate_home(ix, cx)));
+        let click = |row: Stateful<Div>, cx: &mut Context<Self>| self.tap(row, crate::gui::phone::token(&["home-item", &ix.to_string()]), None, move |this, cx| this.activate_home(ix, cx), cx);
         match item {
             Item::Header { label, first } => section_header(label, first).into_any_element(),
             Item::Chat(c) => {
@@ -386,7 +386,7 @@ impl Shell {
             );
         let picked = c.clone();
         list_row(super::row_id("voice", &c.key), theme::row_height(theme::ROW_TWO), selected, focused, content)
-            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| this.pick_row(&picked, cx)))
+            .map(|row| self.tap(row, crate::gui::phone::token(&["row", picked.key.network.label(), &picked.key.account, &picked.key.id]), Some(picked.clone()), move |this, cx| this.pick_row(&picked, cx), cx))
     }
 
     /// Telegram's folder tabs under the jump strip: All, then each folder with its count.

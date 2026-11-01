@@ -1,12 +1,8 @@
-//! The phone's own numbers and palette (`research_notes/mobile/design/10-visual-direction.md`,
-//! "Paper Signal"). The desktop palette stays as it is: at 600 and wider none of the colour
-//! values here are read, and `theme` only branches on [`super::active`].
-//!
-//! The palette is deliberately a step quieter than the desktop's: a near-black page, opaque
-//! chrome one step up, raised surfaces for anything that floats, and hairlines that are lines
-//! rather than borders. Amber is still the only accent, and it means "for you".
+//! The phone's own numbers: the platform's insets, the touch slop, the strip and target
+//! heights, and the text run a platform font scale sets. Colour comes from `theme` alone; the
+//! phone draws the desktop's palette.
 
-use gpui::{hsla, point, px, rgb, rgba, BoxShadow, Rgba, Styled};
+use gpui::{hsla, point, px, rgba, BoxShadow, Styled};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 /// The fallback status bar and home indicator: the iOS values. The platform feeds the real ones
@@ -15,19 +11,11 @@ pub const SAFE_TOP: f32 = 44.;
 pub const SAFE_BOTTOM: f32 = 34.;
 /// How far a press may travel before it is a scroll, not a tap. A thumb wobbles about 4 pt.
 pub const SLOP: f32 = 10.;
-/// A sheet may take this share of the window's height, and no more: the list behind stays visible.
-pub const SHEET_CAP: f32 = 0.6;
-/// Chrome heights: the nav strip and the tab bar. The tab bar carries the safe area below it.
+/// The strip that heads a pushed page, and the smallest thing a thumb is asked to hit.
 pub const NAV: f32 = 52.;
-/// 8 above the icon, 22 of it, 10 between it and the label, 14 of label, 2 under: 56.
-pub const TAB: f32 = 56.;
-/// A conversation row. 64, not 56: a thumb can find it and the two lines breathe.
-pub const ROW: f32 = 64.;
 pub const TOUCH: f32 = 44.;
 /// The gutter every list row, header and message shares.
 pub const GUTTER: f32 = 16.;
-/// Where a row's rule starts: past the 40 pt avatar and its 16 + 12 of air.
-pub const RULE_START: f32 = 76.;
 
 // Insets. What the platform still owes: iOS `safeAreaInsets` and the keyboard frame, and on
 // Android the status and navigation bar insets and whether the IME is visible. It calls
@@ -90,11 +78,6 @@ pub fn within_slop(from: (f32, f32), to: (f32, f32)) -> bool {
     dx * dx + dy * dy <= SLOP * SLOP
 }
 
-/// The tallest a sheet may be in a window `window_height` tall.
-pub fn sheet_cap(window_height: f32) -> f32 {
-    window_height * SHEET_CAP
-}
-
 // A 200% text run multiplies the phone's type, not the desktop's. 1 by default. The platform's
 // font scale is fed through `set_text_scale`; the desktop's own step (`theme::text_step`) is read
 // directly, so a step chosen in Settings reaches the phone too.
@@ -128,47 +111,11 @@ pub fn scaled(size: f32) -> f32 {
     type_size(size, crate::gui::theme::text_step(), text_scale())
 }
 
-/// A row height for a desktop step and a phone run. Rows grow with their text, so nothing clips.
-/// The step adds 4 a level, as the desktop's 48-point rows do.
-pub fn row_height_for(step: i32, scale: f32) -> f32 {
-    ROW + 4. * step as f32 + (scale - 1.) * 32.
-}
-
-/// A row height now: 64 at 100%, 96 at 200%, and the desktop step on top.
-pub fn row_height() -> f32 {
-    row_height_for(crate::gui::theme::text_step(), text_scale())
-}
-
-/// A sheet's one-line choice: 56 at 100%, 68 at 200%, so a 40 pt line of type keeps its air.
-pub fn sheet_row() -> f32 {
-    56. + (text_scale() - 1.) * 12.
-}
-
-/// Lines a tab label may take: one at 100%, two once the run is above it, so "Needs me" wraps
-/// at 200% instead of truncating.
-pub fn tab_lines(scale: f32) -> u32 {
-    if scale > 1. {
-        2
-    } else {
-        1
-    }
-}
-
-/// The tab cell's height: 56 with one 14 pt line of label under the icon, growing by the label's
-/// extra lines. The icon and its badge stay where they are at every scale.
-pub fn tab_height_for(lines: u32, label_line: f32) -> f32 {
-    TAB - 14. + lines as f32 * label_line
-}
-
-pub fn tab_height() -> f32 {
-    tab_height_for(tab_lines(text_scale()), scaled(14.))
-}
-
-/// A sheet floats above the page: a real, soft shadow under a 12 pt top edge.
+/// A sheet floats above the page: a real, soft shadow cast upward from its 12 pt top edge.
 pub fn shadow_sheet() -> Vec<BoxShadow> {
     vec![BoxShadow {
         color: hsla(0., 0., 0., 0.45).into(),
-        offset: point(px(0.), px(8.)),
+        offset: point(px(0.), px(-8.)),
         blur_radius: px(24.),
         spread_radius: px(0.),
         inset: false,
@@ -186,37 +133,17 @@ pub fn top_highlight() -> Vec<BoxShadow> {
     }]
 }
 
-/// A ring painted outside a shape: what separates a badge from the icon under it.
-pub fn ring(color: Rgba, width: f32) -> Vec<BoxShadow> {
-    vec![BoxShadow {
-        color: color.into(),
-        offset: point(px(0.), px(0.)),
-        blur_radius: px(0.),
-        spread_radius: px(width),
-        inset: false,
-    }]
-}
-
-/// The phone's type scale: 17/24 body, 15/20 interface, 13/18 previews, 12/16 timestamps,
-/// 11/14 tab labels. One point larger than the desktop at every step, because the eye is 30 cm
-/// from the glass, not 60. Every size goes through [`scaled`], so the desktop step and the
-/// phone's run both reach it.
+/// The phone's type for its own strips and sheets: 17/22 titles, 13/18 lines, 12/16 stamps.
+/// Every size goes through [`scaled`], so the desktop step and the phone's run both reach it.
 pub trait PhoneType: Styled + Sized {
     fn phone_title(self) -> Self {
         self.text_size(px(scaled(17.))).line_height(px(scaled(22.))).font_weight(crate::gui::theme::SEMIBOLD)
-    }
-    fn phone_row(self) -> Self {
-        self.text_size(px(scaled(15.))).line_height(px(scaled(20.)))
     }
     fn phone_preview(self) -> Self {
         self.text_size(px(scaled(13.))).line_height(px(scaled(18.)))
     }
     fn phone_stamp(self) -> Self {
         self.text_size(px(scaled(12.))).line_height(px(scaled(16.))).font_weight(crate::gui::theme::MEDIUM)
-    }
-    /// Tab labels: 11/14 at 100%, and they scale with the run. The icon and badge do not.
-    fn phone_tab(self) -> Self {
-        self.text_size(px(scaled(11.))).line_height(px(scaled(14.))).font_weight(crate::gui::theme::MEDIUM)
     }
 }
 
@@ -227,19 +154,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_tab_bar_is_56_plus_the_safe_area() {
-        assert_eq!(TAB + SAFE_BOTTOM, 90.);
-        assert!(ROW >= TOUCH);
+    fn a_thumb_can_hit_the_strip() {
         assert!(NAV >= TOUCH);
-    }
-
-    #[test]
-    fn a_row_grows_with_the_phone_run_and_the_desktop_step_and_never_shrinks() {
-        assert_eq!(row_height_for(0, 1.), 64.);
-        assert_eq!(row_height_for(0, 2.), 96.);
-        assert_eq!(row_height_for(2, 1.), 72.);
-        assert_eq!(row_height_for(-1, 1.), 60.);
-        assert!(row_height_for(0, 1.5) > row_height_for(0, 1.));
     }
 
     #[test]
@@ -253,26 +169,12 @@ mod tests {
     }
 
     #[test]
-    fn the_tab_cell_is_56_at_one_line_and_grows_only_with_extra_lines() {
-        assert_eq!(tab_height_for(1, 14.), TAB);
-        assert_eq!(tab_height_for(2, 14.), 70.);
-        assert_eq!(tab_lines(1.), 1);
-        assert_eq!(tab_lines(2.), 2);
-    }
-
-    #[test]
     fn a_press_stays_a_tap_within_the_slop_and_becomes_a_scroll_past_it() {
         assert!(within_slop((10., 10.), (10., 10.)));
         assert!(within_slop((10., 10.), (16., 16.)));
         assert!(within_slop((0., 0.), (SLOP, 0.)));
         assert!(!within_slop((0., 0.), (SLOP + 0.5, 0.)));
         assert!(!within_slop((0., 0.), (0., 40.)));
-    }
-
-    #[test]
-    fn a_sheet_takes_sixty_percent_of_the_window_and_no_more() {
-        assert!((sheet_cap(800.) - 480.).abs() < 1e-3);
-        assert!(sheet_cap(640.) < 640.);
     }
 
     #[test]

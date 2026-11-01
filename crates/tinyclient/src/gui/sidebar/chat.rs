@@ -226,7 +226,7 @@ impl Shell {
     /// Line two, first match wins: not sent, typing, a draft when nothing is unread, then the
     /// preview with its sender and my ticks.
     pub(super) fn line_two(&self, c: &Conversation, look: Look, color: Rgba) -> Div {
-        let line = div().flex_1().min_w_0().h(px(16. + theme::text_step() as f32)).overflow_hidden().flex().items_center().gap(px(4.)).type_small();
+        let line = div().flex_1().min_w_0().h(theme::line(16.)).overflow_hidden().flex().items_center().gap(px(4.)).type_small();
         // A4 off: no words of any message, for screen sharing. Typing and Not sent still say so.
         let previews = crate::gui::app::prefs::choices().previews;
         if self.send_failed_in(&c.key) {
@@ -271,7 +271,7 @@ impl Shell {
     /// in a call, then an activity, then their status. `muted` is the one color of a muted row.
     fn doing(&self, c: &Conversation, muted: Option<Rgba>) -> Option<Div> {
         let peer = Key { id: c.peer.clone()?, ..c.key.clone() };
-        let line = |color: Rgba| div().flex_1().min_w_0().h(px(16. + theme::text_step() as f32)).overflow_hidden().flex().items_center().gap(px(4.)).type_small().text_color(muted.unwrap_or(color));
+        let line = |color: Rgba| div().flex_1().min_w_0().h(theme::line(16.)).overflow_hidden().flex().items_center().gap(px(4.)).type_small().text_color(muted.unwrap_or(color));
         let glyph = |icon: &'static str, size: f32, color: Rgba| glyph(icon, size, muted.unwrap_or(color));
         let person = self.people_state.hub().person(&peer);
         let voice = person.as_ref().and_then(|p| p.activity.as_ref()).filter(|a| a.kind == protocol::ActivityKind::InVoice && !a.name.is_empty());
@@ -331,7 +331,7 @@ impl Shell {
         // Six letters and the ellipsis, or nothing.
         let context = context.filter(|_| room > 6. * 7. + 14.);
         let line_one = div()
-            .h(px(18. + theme::text_step() as f32))
+            .h(theme::line(18.))
             .flex_none()
             .overflow_hidden()
             .flex()
@@ -365,11 +365,11 @@ impl Shell {
                     .flex()
                     .flex_col()
                     .child(line_one)
-                    .child(div().h(px(16. + theme::text_step() as f32)).flex_none().overflow_hidden().flex().items_center().gap(px(6.)).child(self.line_two(c, look, tone.preview)).children(badge)),
+                    .child(div().h(theme::line(16.)).flex_none().overflow_hidden().flex().items_center().gap(px(6.)).child(self.line_two(c, look, tone.preview)).children(badge)),
             );
         let (picked, menu_row) = (c.clone(), c.clone());
         list_row(row_id(id, &c.key), theme::row_height(theme::ROW_TWO), selected, focused, content)
-            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| this.pick_row(&picked, cx)))
+            .map(|row| self.tap(row, crate::gui::phone::token(&[id, picked.key.network.label(), &picked.key.account, &picked.key.id]), Some(picked.clone()), move |this, cx| this.pick_row(&picked, cx), cx))
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {

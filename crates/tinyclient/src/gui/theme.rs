@@ -218,8 +218,20 @@ pub fn compact() -> bool {
 /// points out.
 pub fn row_height(base: f32) -> f32 {
     let per_step = if base >= ROW_TWO { 4. } else { 2. };
+    if phone() {
+        // A thumb's row: every row at least 44, a two-line row 56, and both grow with the
+        // phone's text run so nothing in them clips.
+        let (floor, lines) = if base >= ROW_TWO { (56., 34.) } else { (44., 18.) };
+        return floor + per_step * text_step() as f32 + (phone_tokens::text_scale() - 1.) * lines;
+    }
     let dense = if base >= ROW_TWO && compact() { 8. } else { 0. };
     base - dense + per_step * text_step() as f32
+}
+
+/// A line box for type of this line height, at the current step and, on a phone, its run: what
+/// a row's line holds so its text never clips.
+pub fn line(height: f32) -> gpui::Pixels {
+    sized(height)
 }
 
 /// The avatar of a conversation row: 32, or 28 when compact.

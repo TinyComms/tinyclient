@@ -9,6 +9,7 @@ use super::components::{
     toast, ButtonKind, Layer, Place, NO_GLYPH,
 };
 use super::chrome::{self, End};
+use super::phone::tokens::PhoneType;
 use super::state::{Shell, Snapshot};
 use super::theme::{self, Type};
 use gpui::{
@@ -37,6 +38,19 @@ pub const PHONE: f32 = 600.;
 /// Whether this window is drawn as a phone.
 pub fn phone(window: f32) -> bool {
     window < PHONE
+}
+
+/// The rail on a phone: the desktop's buttons and badges, 8 pt narrower so a 360 pt screen
+/// keeps 296 for the sidebar.
+pub const RAIL_PHONE: f32 = 64.;
+
+/// The rail's width in this window's form.
+pub fn rail_width() -> f32 {
+    if super::phone::active() {
+        RAIL_PHONE
+    } else {
+        RAIL_WIDTH
+    }
 }
 /// Height of the strip that starts every region, level with the traffic lights.
 pub const TOP_BAR: f32 = 52.;
@@ -358,6 +372,10 @@ impl Shell {
     /// Closes the top layer: switcher, menu, floating sidebar, right pane. False when there was
     /// none, so the key can mean something else.
     pub(super) fn close_top(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        // On a phone Escape is back: one pushed page, sheet or switcher at a time.
+        if super::phone::active() {
+            return self.phone_back(Some(window), cx);
+        }
         if self.sidebar_state.switcher.is_some() {
             self.close_switcher(window, cx);
         } else if self.layout_state.menu.is_some() {
@@ -651,95 +669,16 @@ impl Shell {
                 let content = fade_in("menu-own", 120, popover().p(px(4.)).child(content));
                 placed("menu-own-at", Place::Beside(rail_button(8.)), Layer::Popover, window, content)
             }
-            Menu::Network(network) => {
-                let network = *network;
-                let mut items = menu().w(px(220.));
-                let current = self.tiny_account().cloned();
-                let many = network == Network::Tiny && snapshot.accounts_of(network) > 1;
-                for account in snapshot.accounts.iter().filter(|a| a.key.network == network) {
-                    let key = account.key.clone();
-                    if many {
-                        let on = current.as_ref() == Some(&account.key);
-                        let show = key.clone();
-                        items = items.child(
-                            menu_item_check(("show-server", items_id(&account.key.account)), on, account.name.clone(), None).on_click(
-                                cx.listener(move |this, _, _, cx| {
-                                    this.close_menu(cx);
-                                    this.prefer_tiny(show.clone(), cx);
-                                }),
-                            ),
-                        );
-                    } else {
-                        items = items.child(menu_label(account.name.clone()));
-                    }
-                    items = items.child(
-                        menu_item_danger(("sign-out", items_id(&account.key.account)), Some("icons/log-out.svg"), "Sign out")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.close_menu(cx);
-                                this.sign_out(key.clone(), cx);
-                            })),
-                    );
-                }
-                if network == Network::Tiny {
-                    items = items
-                        .child(menu_separator())
-                        .child(menu_item("join-server", Some("icons/log-in.svg"), "Join a server", None).on_click(cx.listener(|this, _, _, cx| {
-                            this.close_menu(cx);
-                            this.sign_in(Network::Tiny, cx);
-                        })));
-                }
+            Menu::Network(_) => {
+                let items = menu().w(px(220.)).children(self.menu_items(open, snapshot, cx));
                 placed("menu-network-at", Place::Below(strip_button), Layer::Menu, window, fade_in("menu-network", 120, items))
             }
-            // CONTRACT: of the Space menu in `02-layout-navigation.md` only pinning has a
-            // request behind it. Nothing marks a whole Space read or mutes it, and a Space
-            // carries no link to open it in the network's app, so those items are left out.
-            Menu::Space(space) => {
-                let pinned = self.sidebar_state.pins.contains(space);
-                let key = space.clone();
-                let shown = space.clone();
-                let items = menu()
-                    .w(px(200.))
-                    .child(menu_item("details", Some("icons/info.svg"), "Details", None).on_click(cx.listener(move |this, _, _, cx| {
-                        this.close_menu(cx);
-                        this.details_space(shown.clone(), cx);
-                    })))
-                    .child(
-                        menu_item("pin", Some("icons/pin.svg"), if pinned { "Unpin from rail" } else { "Pin to rail" }, None)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.close_menu(cx);
-                                this.pin(key.clone(), !pinned, cx);
-                            })),
-                    );
+            Menu::Space(_) => {
+                let items = menu().w(px(200.)).children(self.menu_items(open, snapshot, cx));
                 placed("menu-space-at", Place::Below(strip_button), Layer::Menu, window, fade_in("menu-space", 120, items))
             }
-            Menu::Row(conversation, position) => {
-                let (key, starred) = (conversation.key.clone(), conversation.starred);
-                let unpinned = conversation.clone();
-                let space = conversation.space.as_ref().map(|space| Key { id: space.clone(), ..conversation.key.clone() });
-                let items = menu()
-                    .w(px(220.))
-                    .child(
-                        menu_item("star", Some("icons/pin.svg"), if starred { "Unpin from Inbox" } else { "Pin to top of Inbox" }, None)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.close_menu(cx);
-                                this.star(key.clone(), !starred, cx);
-                            })),
-                    )
-                    .children(space.map(|space| {
-                        menu_item("reveal", Some("icons/corner-down-right.svg"), "Show in sidebar", None).on_click(
-                            cx.listener(move |this, _, _, cx| {
-                                this.close_menu(cx);
-                                this.go(super::sidebar::Mode::Space(space.clone()), cx);
-                            }),
-                        )
-                    }))
-                    .child(menu_separator())
-                    .child(
-                        menu_item("open", Some(NO_GLYPH), "Open", Some("↵")).on_click(cx.listener(move |this, _, _, cx| {
-                            this.close_menu(cx);
-                            this.select(unpinned.key.clone(), &unpinned.title, cx);
-                        })),
-                    );
+            Menu::Row(_, position) => {
+                let items = menu().w(px(220.)).children(self.menu_items(open, snapshot, cx));
                 placed("menu-row-at", Place::Pointer(*position), Layer::Menu, window, fade_in("menu-row", 120, items))
             }
         };
@@ -756,9 +695,180 @@ impl Shell {
         )
     }
 
+    /// The items of a Network, Space or Row menu, the same as a popover or as a phone's sheet.
+    fn menu_items(&self, open: &Menu, snapshot: &Snapshot, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let mut items: Vec<AnyElement> = Vec::new();
+        match open {
+            Menu::Add | Menu::Own => {}
+            Menu::Network(network) => {
+                let network = *network;
+                let current = self.tiny_account().cloned();
+                let many = network == Network::Tiny && snapshot.accounts_of(network) > 1;
+                for account in snapshot.accounts.iter().filter(|a| a.key.network == network) {
+                    let key = account.key.clone();
+                    if many {
+                        let on = current.as_ref() == Some(&account.key);
+                        let show = key.clone();
+                        items.push(
+                            menu_item_check(("show-server", items_id(&account.key.account)), on, account.name.clone(), None)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.close_menu(cx);
+                                    this.prefer_tiny(show.clone(), cx);
+                                }))
+                                .into_any_element(),
+                        );
+                    } else {
+                        items.push(menu_label(account.name.clone()).into_any_element());
+                    }
+                    items.push(
+                        menu_item_danger(("sign-out", items_id(&account.key.account)), Some("icons/log-out.svg"), "Sign out")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.close_menu(cx);
+                                this.sign_out(key.clone(), cx);
+                            }))
+                            .into_any_element(),
+                    );
+                }
+                if network == Network::Tiny {
+                    items.push(menu_separator().into_any_element());
+                    items.push(
+                        menu_item("join-server", Some("icons/log-in.svg"), "Join a server", None)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.close_menu(cx);
+                                this.sign_in(Network::Tiny, cx);
+                            }))
+                            .into_any_element(),
+                    );
+                }
+            }
+            // CONTRACT: of the Space menu in `02-layout-navigation.md` only pinning has a
+            // request behind it. Nothing marks a whole Space read or mutes it, and a Space
+            // carries no link to open it in the network's app, so those items are left out.
+            Menu::Space(space) => {
+                let pinned = self.sidebar_state.pins.contains(space);
+                let key = space.clone();
+                let shown = space.clone();
+                items.push(
+                    menu_item("details", Some("icons/info.svg"), "Details", None)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.close_menu(cx);
+                            this.details_space(shown.clone(), cx);
+                        }))
+                        .into_any_element(),
+                );
+                items.push(
+                    menu_item("pin", Some("icons/pin.svg"), if pinned { "Unpin from rail" } else { "Pin to rail" }, None)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.close_menu(cx);
+                            this.pin(key.clone(), !pinned, cx);
+                        }))
+                        .into_any_element(),
+                );
+            }
+            Menu::Row(conversation, _) => {
+                let (key, starred) = (conversation.key.clone(), conversation.starred);
+                let unpinned = conversation.clone();
+                let space = conversation.space.as_ref().map(|space| Key { id: space.clone(), ..conversation.key.clone() });
+                items.push(
+                    menu_item("star", Some("icons/pin.svg"), if starred { "Unpin from Inbox" } else { "Pin to top of Inbox" }, None)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.close_menu(cx);
+                            this.star(key.clone(), !starred, cx);
+                        }))
+                        .into_any_element(),
+                );
+                if let Some(space) = space {
+                    items.push(
+                        menu_item("reveal", Some("icons/corner-down-right.svg"), "Show in sidebar", None)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.close_menu(cx);
+                                this.go(super::sidebar::Mode::Space(space.clone()), cx);
+                            }))
+                            .into_any_element(),
+                    );
+                }
+                items.push(menu_separator().into_any_element());
+                // A phone has no Return key to name.
+                let keys = if super::phone::active() { None } else { Some("↵") };
+                items.push(
+                    menu_item("open", Some(NO_GLYPH), "Open", keys)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.close_menu(cx);
+                            this.select(unpinned.key.clone(), &unpinned.title, cx);
+                        }))
+                        .into_any_element(),
+                );
+            }
+        }
+        items
+    }
+
+    /// The open menu on a phone: a bottom sheet holding what the desktop's popover holds, each
+    /// row a full-width 44 pt target, headed by what it is about.
+    pub(super) fn phone_menu(&self, snapshot: &Snapshot, window: &mut Window, cx: &mut Context<Self>) -> Option<Div> {
+        let open = self.layout_state.menu.as_ref()?;
+        let tall = f32::from(window.viewport_size().height);
+        let close = cx.listener(|this, _: &gpui::MouseDownEvent, _, cx| this.close_menu(cx));
+        let column = || div().w_full().flex().flex_col();
+        let body: AnyElement = match open {
+            Menu::Add => column().child(super::phone::sheet_title("Add an account")).children(self.add_rows(snapshot, cx)).into_any_element(),
+            Menu::Own => self.phone_own(snapshot, window, cx).into_any_element(),
+            Menu::Network(network) => {
+                let head = div().flex().items_center().gap(px(10.)).px(px(8.)).h(px(44.)).child(network_icon(*network, 20.)).child(div().phone_title().child(network.label()));
+                column().child(head).children(self.menu_items(open, snapshot, cx)).into_any_element()
+            }
+            Menu::Space(space) => {
+                let found = self.spaces.iter().find(|s| &s.key == space);
+                let name = found.map_or_else(String::new, |s| s.name.clone());
+                let icon = found.and_then(|s| self.media_path(&s.key, s.icon.as_ref()));
+                let head = div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .px(px(8.))
+                    .h(px(52.))
+                    .child(super::components::Avatar::new(space, &name, 28.).shape(super::components::Shape::Place).image_at(icon).build())
+                    .child(div().min_w_0().truncate().phone_title().child(name));
+                column().child(head).children(self.menu_items(open, snapshot, cx)).into_any_element()
+            }
+            Menu::Row(conversation, _) => {
+                let head = div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .px(px(8.))
+                    .h(px(52.))
+                    .child(self.conversation_avatar(conversation, 28., theme::overlay(), cx))
+                    .child(network_icon(conversation.key.network, 14.))
+                    .child(div().flex_1().min_w_0().truncate().phone_title().child(conversation.title.clone()));
+                column().child(head).child(menu_separator()).children(self.menu_items(open, snapshot, cx)).into_any_element()
+            }
+        };
+        Some(super::phone::sheet("phone-menu", tall, body, close))
+    }
+
+    /// The rail avatar's sheet on a phone: who I am, my presence on each account and Settings
+    /// (the desktop's own status menu, full width), then adding an account.
+    fn phone_own(&self, snapshot: &Snapshot, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let status = self.slots.own_menu.and_then(|draw| draw(self, window, cx));
+        let status = status.unwrap_or_else(|| self.accounts_menu(snapshot, cx).into_any_element());
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .child(status)
+            .child(menu_item("own-add", Some("icons/plus.svg"), "Add an account", None).on_click(cx.listener(|this, _, _, cx| this.open_menu(Menu::Add, cx))))
+    }
+
     /// The add popover: networks not signed in, another Slack workspace, another Tiny server,
     /// then what comes later.
     fn add_menu(&self, snapshot: &Snapshot, cx: &mut Context<Self>) -> Div {
+        popover().p(px(4.)).w(px(300.)).flex().flex_col().children(self.add_rows(snapshot, cx))
+    }
+
+    /// The add menu's rows: 48 in the popover, 56 in a phone's sheet.
+    fn add_rows(&self, snapshot: &Snapshot, cx: &mut Context<Self>) -> Vec<gpui::Stateful<Div>> {
+        let phone = super::phone::active();
         let row = |ix: usize, network: Network, title: SharedString, line: SharedString, available: bool| {
             let waiting = self.signing_in == Some(network);
             let failed = self.sign_in_failed.as_ref().filter(|(failed, _)| *failed == network).map(|(_, why)| why.clone());
@@ -795,23 +905,22 @@ impl Shell {
                         ),
                 )
         };
-        let mut list = popover().p(px(4.)).w(px(300.)).flex().flex_col();
-        let mut ix = 0;
-        let mut add = |list: Div, network, title: &str, line: &str, available| {
-            ix += 1;
-            list.child(row(ix, network, title.to_owned().into(), line.to_owned().into(), available))
+        let mut list = Vec::new();
+        let mut add = |network, title: &str, line: &str, available| {
+            let ix = list.len() + 1;
+            list.push(row(ix, network, title.to_owned().into(), line.to_owned().into(), available).when(phone, |row| row.h(px(56.))));
         };
         for network in AVAILABLE {
             if snapshot.link(network) == Link::SignedOut {
-                list = add(list, network, network.label(), "Sign in", true);
+                add(network, network.label(), "Sign in", true);
             } else if network == Network::Slack {
-                list = add(list, network, "Add a Slack workspace", "Sign in to another workspace", true);
+                add(network, "Add a Slack workspace", "Sign in to another workspace", true);
             } else if network == Network::Tiny {
-                list = add(list, network, "Add a Tiny server", "Join with a code", true);
+                add(network, "Add a Tiny server", "Join with a code", true);
             }
         }
         for network in NETWORK_ORDER.into_iter().filter(|network| !AVAILABLE.contains(network)) {
-            list = add(list, network, network.label(), "Not available yet", false);
+            add(network, network.label(), "Not available yet", false);
         }
         list
     }
@@ -891,9 +1000,6 @@ impl Render for Shell {
         // own entities exist before any of its screens is drawn.
         let phone_form = super::phone::form(super::phone::active(), f32::from(window.viewport_size().width));
         super::phone::set_active(phone_form);
-        if phone_form {
-            self.phone_prepare(cx);
-        }
         // Before the first answer the window is still drawn: rail, strips, an empty list, and
         // what it waits on. Never a blank canvas, never a developer message.
         let placeholder;
@@ -908,13 +1014,16 @@ impl Render for Shell {
         // first-launch screen waits until it is done.
         let settled = !self.service.keychain.reading && self.shown().empty_state().is_none();
         let width = f32::from(window.viewport_size().width);
-        self.phone_state.sync(self.snapshot.as_ref().and_then(|snapshot| snapshot.open.as_ref()));
         if phone_form {
             if self.snapshot.is_some() && snapshot.signed_in().is_empty() && settled {
                 return root.child(self.first_run(snapshot, cx));
             }
+            // A phone has no window buttons to clear, and every pane it shows is the whole
+            // screen: never beside the conversation, so sticky Details waits until asked.
+            chrome::clear_end();
+            self.note_room(true, Some(width));
             let screen = self.phone_screen(snapshot, window, cx);
-            return root.children(self.toast_layer(width, cx)).child(screen);
+            return root.child(screen).children(self.toast_layer(width, cx));
         }
         if self.snapshot.is_some() && snapshot.signed_in().is_empty() && settled {
             return root.child(self.first_run(snapshot, cx)).children(window_chrome(window));
@@ -1021,11 +1130,13 @@ impl Shell {
         if crash.is_none() && toast.is_none() && update.is_none() {
             return None;
         }
+        // On a phone the toast clears the home indicator.
+        let bottom = 16. + if super::phone::active() { super::phone::tokens::safe_bottom() } else { 0. };
         Some(
             div()
                 .absolute()
                 .right(px(16.))
-                .bottom(px(16.))
+                .bottom(px(bottom))
                 .flex()
                 .flex_col()
                 .gap(px(8.))

@@ -107,9 +107,9 @@ impl Shell {
         root.track_focus(&self.focus)
             .key_context("Shell")
             .on_action(cx.listener(|this, _: &Switcher, window, cx| this.open_switcher("", window, cx)))
-            .on_action(cx.listener(|this, _: &Back, _, cx| {
-                // On a phone back pops the tab's stack; at a tab root it is the platform's.
-                if !this.phone_back(cx) {
+            .on_action(cx.listener(|this, _: &Back, window, cx| {
+                // On a phone back pops one pushed page; at the home it is the platform's.
+                if !this.phone_back(Some(window), cx) {
                     this.travel(true, cx);
                 }
             }))
@@ -218,8 +218,8 @@ fn shell_bindings() -> Vec<KeyBinding> {
 /// `--cursor N`, `--switcher [letters]`, `--menu add|own|network|space|row`, `--float`,
 /// `--hide-sidebar`, `--right thread|members`, `--pin N`, `--toast`, `--components`,
 /// `--walk N` (N presses of the unread walk), `--back N` (N steps back in history),
-/// `--tab needs|inbox|search|you` (a phone tab), `--scope` (the phone's account sheet open),
-/// `--text-scale N` (the phone's type, 2 for a 200% run),
+/// `--right details|member-list` (the strip's own buttons, as tapped), `--menu account` (the
+/// rail avatar's menu; a phone's account sheet), `--text-scale N` (the phone's type, 2 for a 200% run),
 /// `--sign-in-failed closed|unreachable|blocked` (first launch, with nothing signed in),
 /// `--state starting|keychain|denied|reconnecting|failed` (a window state, forced),
 /// `--crash-toast` (the toast after a crash relaunch), `--menu row-right|row-bottom` (the row
@@ -231,7 +231,7 @@ fn shell_bindings() -> Vec<KeyBinding> {
 /// `--demo` draws made-up data instead of live data: a fake chatd answers every request
 /// (`shot_demo`), chatd is never started or asked, and nobody's real chats are read.
 /// `--demo-empty` is the same with nothing signed in (first run). With either:
-/// `--phone-search WORDS` (the phone's Search field, typed), `--compose WORDS` (the open
+/// `--compose WORDS` (the open
 /// conversation's composer, typed). Other states come from the views' own shot hooks:
 /// `TINYCLIENT_SHOT_HOVER=<message id>` (the message toolbar, as a long press shows it),
 /// `TINYCLIENT_SHOT_MENU=<message id>`, `TINYCLIENT_SHOT_AT=<message id>` (`m01`…`m25` in the
@@ -296,16 +296,6 @@ mod shot {
                     Some("mentions") => shell.set_filter(InboxFilter::Mentions, cx),
                     _ => {}
                 }
-                match flag("--tab").as_deref() {
-                    Some("needs") => shell.phone_state.tab = super::phone::Tab::Needs,
-                    Some("inbox") => shell.phone_state.tab = super::phone::Tab::Inbox,
-                    Some("search") => shell.phone_state.tab = super::phone::Tab::Search,
-                    Some("you") => shell.phone_state.tab = super::phone::Tab::You,
-                    _ => {}
-                }
-                if has("--scope") {
-                    shell.phone_state.scope_open = true;
-                }
                 if let Some(scale) = flag("--text-scale").and_then(|n| n.parse::<f32>().ok()) {
                     super::phone::tokens::set_text_scale(scale);
                 }
@@ -332,13 +322,16 @@ mod shot {
                 }
                 match flag("--right").as_deref() {
                     Some("info") => shell.toggle_info(cx),
-                    Some("members") => shell.open_right(RightPane { kind: RightKind::Members, title: "Members".into(), count: Some(128), body: demo_pane }, cx),
+                    // The strip's own buttons, as a tap on them does.
+                    Some("details") => shell.toggle_details(cx),
+                    Some("member-list") => shell.toggle_member_list(cx),
+                    Some("members") =>shell.open_right(RightPane { kind: RightKind::Members, title: "Members".into(), count: Some(128), body: demo_pane }, cx),
                     Some(_) => shell.open_right(RightPane { kind: RightKind::Thread, title: "Thread".into(), count: Some(6), body: demo_pane }, cx),
                     None => {}
                 }
                 match flag("--menu").as_deref() {
                     Some("add") => shell.open_menu(Menu::Add, cx),
-                    Some("own") => shell.open_menu(Menu::Own, cx),
+                    Some("own" | "account") => shell.open_menu(Menu::Own, cx),
                     Some("network") => shell.open_menu(Menu::Network(shell.sidebar_state.mode.network().unwrap_or(Network::Discord)), cx),
                     Some("space") => {
                         if let Mode::Space(space) = shell.sidebar_state.mode.clone() {
@@ -385,11 +378,6 @@ mod shot {
                 }
                 if has("--components") {
                     shell.sheet = true;
-                }
-                if let Some(words) = flag("--phone-search") {
-                    if let Some(field) = shell.phone_state.search.clone() {
-                        field.update(cx, |field, cx| field.set_text(&words, cx));
-                    }
                 }
                 if let Some(words) = flag("--compose") {
                     shell.composer_type(&words, window, cx);

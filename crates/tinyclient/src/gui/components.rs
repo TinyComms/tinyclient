@@ -205,18 +205,24 @@ pub fn list_row(
     focused: bool,
     content: Div,
 ) -> Stateful<Div> {
-    div().id(id).w_full().h(px(height)).px(px(theme::INSET)).py(px(1.)).cursor_pointer().child(
-        content
-            .size_full()
-            .px(px(8.))
-            .rounded(px(theme::R_CONTROL))
-            .flex()
-            .items_center()
-            .when(!selected, |row| row.hover(|style| style.bg(theme::hover())))
-            .when(selected, |row| row.bg(theme::selected()))
-            // Rows abut, so the keyboard's ring is inset, over any fill.
-            .when(focused, |row| row.shadow(theme::focus_ring_inset())),
-    )
+    // A finger has no hover: on a phone the row shows its press instead.
+    let phone = super::phone::active();
+    let face = content
+        .size_full()
+        .px(px(8.))
+        .rounded(px(theme::R_CONTROL))
+        .flex()
+        .items_center()
+        .when(!selected && !phone, |row| row.hover(|style| style.bg(theme::hover())))
+        .when(selected, |row| row.bg(theme::selected()))
+        // Rows abut, so the keyboard's ring is inset, over any fill.
+        .when(focused, |row| row.shadow(theme::focus_ring_inset()));
+    let row = div().id(id).w_full().h(px(height)).px(px(theme::INSET)).py(px(1.)).cursor_pointer();
+    if phone && !selected {
+        row.child(face.id("row-face").active(|style| style.bg(theme::pressed())))
+    } else {
+        row.child(face)
+    }
 }
 
 /// A list's section header (`polish/01-system.md` §2): 28 tall (24 for the first in a list),

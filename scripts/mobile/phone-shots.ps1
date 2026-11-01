@@ -88,25 +88,34 @@ function Shot([string]$name, [string]$size, [string[]]$arguments, [hashtable]$va
 
 # Row 1 of the list is "Foray carpool 🍄", the conversation with one of every kind of message;
 # row 2 is the direct conversation with Yusuf Demirci; row 3 is Slack's #platform.
-$carpool = @('--tab', 'inbox', '--open', '1')
+$carpool = @('--open', '1')
+# The phone is the desktop's rail and sidebar; a conversation and the right pane push over them.
 $phone = @(
-    @{ n = '01-needs-me';            a = @('--tab', 'needs') },
-    @{ n = '02-inbox';               a = @('--tab', 'inbox') },
-    @{ n = '03-search-all';          a = @('--tab', 'search') },
-    @{ n = '04-search-query';        a = @('--tab', 'search', '--phone-search', 'trail') },
-    @{ n = '05-you';                 a = @('--tab', 'you') },
-    @{ n = '06-scope-sheet';         a = @('--tab', 'inbox', '--scope') },
-    @{ n = '07-conversation-bottom'; a = $carpool },
-    @{ n = '08-conversation-top';    a = $carpool; v = @{ TINYCLIENT_SHOT_AT = 'm01' } },
-    @{ n = '09-conversation-link-image'; a = $carpool; v = @{ TINYCLIENT_SHOT_AT = 'm08' } },
-    @{ n = '10-conversation-code-reply-file'; a = $carpool; v = @{ TINYCLIENT_SHOT_AT = 'm12' } },
-    @{ n = '11-composer-text';       a = $carpool + @('--compose', 'Running 10 min late, save me a coffee') },
-    @{ n = '12-message-actions';     a = $carpool; v = @{ TINYCLIENT_SHOT_HOVER = 'm25' } },
-    @{ n = '13-message-menu';        a = $carpool; v = @{ TINYCLIENT_SHOT_MENU = 'm25' } },
-    # The person's card over the direct conversation: the one people surface the phone draws.
-    @{ n = '14-profile-card';        a = @('--tab', 'inbox', '--open', '2'); v = @{ TINYCLIENT_S6 = 'd-card' } },
-    @{ n = '15-first-run';           a = @('--demo-empty') },
-    @{ n = '16-sign-in-sheet';       a = @('--demo-empty'); v = @{ TINYCLIENT_SIGNIN_SHOT = 'phone' } }
+    @{ n = '01-inbox';               a = @() },
+    @{ n = '02-inbox-unread';        a = @('--filter', 'unread') },
+    @{ n = '03-inbox-mentions';      a = @('--filter', 'mentions') },
+    @{ n = '04-people';              a = @('--mode', 'people') },
+    @{ n = '05-discord';             a = @('--mode', 'discord') },
+    @{ n = '06-discord-server';      a = @('--mode', 'space', '--space', '1') },
+    @{ n = '07-slack';               a = @('--mode', 'slack') },
+    @{ n = '08-jump-to';             a = @('--switcher') },
+    @{ n = '09-account-sheet';       a = @('--menu', 'account') },
+    @{ n = '10-add-sheet';           a = @('--menu', 'add') },
+    @{ n = '11-row-sheet';           a = @('--menu', 'row') },
+    @{ n = '12-conversation-bottom'; a = $carpool },
+    @{ n = '13-conversation-top';    a = $carpool; v = @{ TINYCLIENT_SHOT_AT = 'm01' } },
+    @{ n = '14-conversation-link-image'; a = $carpool; v = @{ TINYCLIENT_SHOT_AT = 'm08' } },
+    @{ n = '15-conversation-code-reply-file'; a = $carpool; v = @{ TINYCLIENT_SHOT_AT = 'm12' } },
+    @{ n = '16-composer-text';       a = $carpool + @('--compose', 'Running 10 min late, save me a coffee') },
+    @{ n = '17-message-actions';     a = $carpool; v = @{ TINYCLIENT_SHOT_HOVER = 'm25' } },
+    @{ n = '18-message-menu';        a = $carpool; v = @{ TINYCLIENT_SHOT_MENU = 'm25' } },
+    # The right pane as a pushed page: a channel's Details and members, a person's profile.
+    @{ n = '19-channel-details';     a = @('--open', '3', '--right', 'details') },
+    @{ n = '20-channel-members';     a = @('--open', '3', '--right', 'member-list') },
+    @{ n = '21-profile';             a = @('--open', '2', '--right', 'details') },
+    @{ n = '22-profile-card';        a = @('--open', '2'); v = @{ TINYCLIENT_S6 = 'd-card' } },
+    @{ n = '23-first-run';           a = @('--demo-empty') },
+    @{ n = '24-sign-in-sheet';       a = @('--demo-empty'); v = @{ TINYCLIENT_SIGNIN_SHOT = 'phone' } }
 )
 
 try {
@@ -117,18 +126,18 @@ try {
             Shot $shot.n $size $shot.a $vars
         }
         # Settings is its own window: drawn at the phone's size beside a held main window.
-        $settings = Join-Path $Out "17-settings-$size.png"
+        $settings = Join-Path $Out "25-settings-$size.png"
         Remove-Item $settings -ErrorAction SilentlyContinue
         foreach ($var in $hookVars) { Remove-Item "Env:$var" -ErrorAction SilentlyContinue }
         $throwaway = Join-Path $scratch 'settings-main.png'
-        & $exe --shot $throwaway --size $size --demo --tab you --hold 3 --settings accounts --settings-shot $settings --settings-size $size 2>&1 | Out-Null
+        & $exe --shot $throwaway --size $size --demo --hold 3 --settings accounts --settings-shot $settings --settings-size $size 2>&1 | Out-Null
         if (Test-Path $settings) { $made.Add((Split-Path -Leaf $settings)); Write-Host "  $(Split-Path -Leaf $settings)" }
         else { $missing.Add((Split-Path -Leaf $settings)); Write-Host "  $(Split-Path -Leaf $settings): not written" -ForegroundColor Yellow }
     }
 
     Write-Host 'phone-shots: 150% text'
-    Shot '18-inbox-text150' '390x844' @('--tab', 'inbox', '--text-scale', '1.5')
-    Shot '19-conversation-text150' '390x844' ($carpool + @('--text-scale', '1.5'))
+    Shot '26-inbox-text150' '390x844' @('--text-scale', '1.5')
+    Shot '27-conversation-text150' '390x844' ($carpool + @('--text-scale', '1.5'))
 
     Write-Host 'phone-shots: desktop, for reference'
     Shot 'desktop-inbox' '1280x800' @()

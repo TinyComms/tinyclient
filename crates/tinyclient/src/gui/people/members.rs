@@ -20,7 +20,10 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 pub const SOURCE: &str = "members";
-const ROW: f32 = theme::ROW_ONE;
+/// A member row: the desktop's 28, and a thumb's 44 on a phone.
+fn row() -> f32 {
+    if crate::gui::phone::active() { theme::row_height(theme::ROW_ONE) } else { theme::ROW_ONE }
+}
 const PAGE: u32 = 50;
 /// Pages of members held; the ones farthest from the viewport go first.
 const PAGES_KEPT: usize = 64;
@@ -409,7 +412,7 @@ impl MemberList {
         let in_call = !person.bot && in_call(&self.hub, &self.scene, &person.key);
         let (profile, shell) = (person.key.clone(), self.shell.clone());
         let (menu_of, menu_shell) = (person.key.clone(), self.shell.clone());
-        div().id(("member", ix)).w_full().h(px(ROW)).px(px(theme::INSET)).child(
+        div().id(("member", ix)).w_full().h(px(row())).px(px(theme::INSET)).child(
             div()
                 .group("member")
                 .size_full()
@@ -448,7 +451,7 @@ impl MemberList {
 fn header(title: &str) -> Div {
     div()
         .w_full()
-        .h(px(ROW))
+        .h(px(row()))
         .px(px(16.))
         .pb(px(4.))
         .flex()
@@ -462,7 +465,7 @@ fn header(title: &str) -> Div {
 fn waiting_row() -> Div {
     div()
         .w_full()
-        .h(px(ROW))
+        .h(px(row()))
         .px(px(16.))
         .flex()
         .items_center()

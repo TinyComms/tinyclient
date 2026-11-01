@@ -198,7 +198,7 @@ impl StatusMenu {
         let account = own.key.clone();
         div()
             .id(("own-account", ix))
-            .h(px(theme::ROW_ONE))
+            .h(px(if crate::gui::phone::active() { theme::row_height(theme::ROW_ONE) } else { theme::ROW_ONE }))
             .px(px(8.))
             .rounded(px(theme::R_CONTROL))
             .flex()
@@ -226,7 +226,7 @@ impl StatusMenu {
             choices = choices.child(
                 div()
                     .id(("own-state", ix * 8 + at))
-                    .h(px(theme::ROW_ONE))
+                    .h(px(if crate::gui::phone::active() { theme::row_height(theme::ROW_ONE) } else { theme::ROW_ONE }))
                     .px(px(8.))
                     .rounded(px(theme::R_CONTROL))
                     .flex()
@@ -310,7 +310,8 @@ impl Render for StatusMenu {
         let ring = presence::Ring::on(theme::overlay());
         let best = most_available(connected(scene).map(|own| own.presence));
         let mut list = div()
-            .w(px(WIDTH))
+            .when(!crate::gui::phone::active(), |list| list.w(px(WIDTH)))
+            .when(crate::gui::phone::active(), |list| list.w_full())
             .flex()
             .flex_col()
             .child(
