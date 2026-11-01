@@ -1168,7 +1168,25 @@ impl Shell {
                 if super::phone::active() {
                     let token = super::phone::token(&["place", picked.key.network.label(), &picked.key.account, &picked.key.id]);
                     let menu = Some(picked.clone());
-                    return self.tap(row, token, menu, move |this, cx| this.pick_row(&picked, cx), cx);
+                    // A voice channel is a place to be, not to read: a tap joins it, as the
+                    // desktop's double-click does, and the call screen comes up. Once I am in
+                    // it, a tap brings that screen back. Its chat is the call screen's.
+                    let voice = picked.kind == ConversationKind::Voice;
+                    return self.tap(
+                        row,
+                        token,
+                        menu,
+                        move |this, cx| {
+                            if voice && ours {
+                                this.call_phone_restore(cx);
+                            } else if join {
+                                this.call_start(picked.key.clone(), cx);
+                            } else {
+                                this.pick_row(&picked, cx);
+                            }
+                        },
+                        cx,
+                    );
                 }
                 row.on_mouse_down(
                     MouseButton::Left,

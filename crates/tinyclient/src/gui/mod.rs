@@ -583,6 +583,11 @@ mod shot {
                 let _ = window.update(cx, |shell, _, cx| shell.travel(true, cx));
                 cx.background_executor().timer(settle).await;
             }
+            // `--settle 4000` waits that long more before the picture: for steps that take time
+            // (`TINYCLIENT_SHOT_STEPS`), such as the demo's call ringing and connecting.
+            if let Some(ms) = flag("--settle").and_then(|n| n.parse::<u64>().ok()) {
+                cx.background_executor().timer(Duration::from_millis(ms)).await;
+            }
             let frames = flag("--frames").and_then(|n| n.parse::<usize>().ok()).unwrap_or(1).max(1);
             if frames > 1 {
                 super::anim::SHOT_FRAMES.store(true, std::sync::atomic::Ordering::Relaxed);

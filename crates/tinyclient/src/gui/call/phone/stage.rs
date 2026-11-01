@@ -180,6 +180,10 @@ impl Shell {
         if let Some(frame) = crate::gui::call::shot::phone_frame("", false) {
             return Some(frame);
         }
+        // The demo has no camera: its own call shows my portrait there (`shot_demo::live`).
+        if crate::gui::shot_demo::on() {
+            return crate::gui::shot_demo::live::self_frame().map(PathBuf::from);
+        }
         None
     }
 
