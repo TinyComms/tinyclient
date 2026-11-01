@@ -252,7 +252,7 @@ impl Shell {
                     .flex_none()
                     .w_full()
                     .h(px(tokens::safe_top()))
-                    .bg(tokens::surface())
+                    .bg(theme::sidebar())
                     .shadow(tokens::top_highlight()),
             );
         if snapshot.open.is_some() {
@@ -300,7 +300,7 @@ impl Shell {
         let cells = Tab::ALL.into_iter().enumerate().map(|(ix, tab)| {
             let on = self.phone_state.tab == tab;
             // Selected #F2F3F5, unselected #8A909B: the one difference besides the bar.
-            let color = if on { tokens::text() } else { tokens::text_faint() };
+            let color = if on { theme::text() } else { theme::text_faint() };
             let badge = match tab {
                 Tab::Needs if needs > 0 => Some(self.tab_badge(needs)),
                 Tab::Inbox if unread => Some(
@@ -310,8 +310,8 @@ impl Shell {
                         .right(px(-5.))
                         .size(px(8.))
                         .rounded(px(4.))
-                        .bg(if mentioned { tokens::accent() } else { theme::text_soft() })
-                        .shadow(tokens::ring(tokens::surface(), 2.))
+                        .bg(if mentioned { theme::accent() } else { theme::text_soft() })
+                        .shadow(tokens::ring(theme::sidebar(), 2.))
                         .into_any_element(),
                 ),
                 _ => None,
@@ -329,7 +329,7 @@ impl Shell {
                         .build();
                     mine.children(
                         presence::Shape::of(self.own_presence())
-                            .and_then(|shape| presence::dot(shape, 22., &presence::Ring::on(tokens::surface()))),
+                            .and_then(|shape| presence::dot(shape, 22., &presence::Ring::on(theme::sidebar()))),
                     )
                     .into_any_element()
                 }
@@ -346,7 +346,7 @@ impl Shell {
                 .pt(px(8.))
                 .pb(px(2.))
                 .cursor_pointer()
-                .active(|cell| cell.bg(tokens::pressed()))
+                .active(|cell| cell.bg(theme::pressed()))
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.phone_state.tab = tab;
                     if tab == Tab::Search {
@@ -363,7 +363,7 @@ impl Shell {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .child(div().h(px(2.)).w(px(16.)).rounded(px(1.)).bg(if on { tokens::accent() } else { gpui::rgba(0x00000000) })),
+                        .child(div().h(px(2.)).w(px(16.)).rounded(px(1.)).bg(if on { theme::accent() } else { gpui::rgba(0x00000000) })),
                 )
                 // A label may take two lines at a larger run (`tokens::tab_lines`); at 100% it is one.
                 .child(
@@ -382,10 +382,10 @@ impl Shell {
             .flex_none()
             .flex()
             .flex_col()
-            .bg(tokens::surface())
+            .bg(theme::sidebar())
             .shadow(tokens::top_highlight())
             .border_t_1()
-            .border_color(tokens::hairline())
+            .border_color(theme::hairline())
             .child(div().h(px(tokens::tab_height())).flex().children(cells))
             .child(div().h(px(tokens::safe_bottom())))
     }
@@ -400,13 +400,13 @@ impl Shell {
             .min_w(px(18.))
             .px(px(5.))
             .rounded(px(9.))
-            .bg(tokens::accent())
+            .bg(theme::accent())
             // A 2 pt ring of chrome, so the badge reads as a thing on the icon, not a smear.
-            .shadow(tokens::ring(tokens::surface(), 2.))
+            .shadow(tokens::ring(theme::sidebar(), 2.))
             .flex()
             .items_center()
             .justify_center()
-            .child(div().phone_tab().text_color(tokens::on_accent()).child(SharedString::from(words)))
+            .child(div().phone_tab().text_color(theme::on_accent()).child(SharedString::from(words)))
             .into_any_element()
     }
 
@@ -439,10 +439,10 @@ impl Shell {
             .flex()
             .items_center()
             .gap(px(8.))
-            .bg(tokens::surface())
+            .bg(theme::sidebar())
             .shadow(tokens::top_highlight())
             .border_b_1()
-            .border_color(tokens::hairline())
+            .border_color(theme::hairline())
             .child(title_el)
     }
 
@@ -462,11 +462,11 @@ impl Shell {
                 .flex()
                 .items_center()
                 .gap(px(12.))
-                .when(on, |row| row.bg(tokens::selected()))
-                .active(|row| row.bg(tokens::pressed()))
+                .when(on, |row| row.bg(theme::selected()))
+                .active(|row| row.bg(theme::pressed()))
                 .cursor_pointer()
                 .child(div().flex_1().min_w_0().truncate().phone_row().font_weight(if on { theme::SEMIBOLD } else { theme::REGULAR }).child(name))
-                .when(on, |row| row.child(glyph("icons/check.svg", 16., tokens::accent())))
+                .when(on, |row| row.child(glyph("icons/check.svg", 16., theme::accent())))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.phone_state.scope = pick.clone();
                     this.phone_state.scope_open = false;
@@ -508,11 +508,11 @@ impl Shell {
                         .right_0()
                         .bottom_0()
                         .max_h(px(tokens::sheet_cap(f32::from(window.viewport_size().height))))
-                        .bg(tokens::raised())
-                        .shadow(tokens::shadow_sheet())
+                        .bg(theme::raised())
+                        .shadow(theme::shadow_modal())
                         .rounded_t(px(theme::R_MODAL))
                         .border_t_1()
-                        .border_color(tokens::hairline_strong())
+                        .border_color(theme::border())
                         .px(px(20.))
                         .pt(px(20.))
                         .pb(px(20. + tokens::safe_bottom()))

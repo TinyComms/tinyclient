@@ -164,100 +164,6 @@ pub fn tab_height() -> f32 {
     tab_height_for(tab_lines(text_scale()), scaled(14.))
 }
 
-// Surfaces. A ladder, not one flat black: the page is the floor, chrome sits one step above
-// it, and anything that floats (a card, a field, a sheet) one above that.
-/// The page behind every phone screen.
-pub fn page() -> Rgba {
-    rgb(0x14151a)
-}
-/// Nav strips, tab bars, the composer's dock: anything pinned.
-pub fn surface() -> Rgba {
-    rgb(0x1b1d22)
-}
-/// Cards, fields, the composer card, sheets.
-pub fn raised() -> Rgba {
-    rgb(0x23262c)
-}
-
-// Lines. 0.07 and 0.12: a hairline reads as a seam, a strong hairline as an edge. A row's rule
-// is quieter than a seam (0.055) and starts past the avatar, so the column of faces stays whole.
-/// Chrome edges and section dividers.
-pub fn hairline() -> Rgba {
-    rgba(0xffffff12)
-}
-/// Between two rows of a list: 1 pt at 5.5%, inset to x = 76.
-pub fn rule() -> Rgba {
-    rgba(0xffffff0e)
-}
-/// The edge of a floating surface: a sheet's top, a field's border.
-pub fn hairline_strong() -> Rgba {
-    rgba(0xffffff1f)
-}
-/// The 1 pt light along the top of a bar: chrome catches the room, it does not glow.
-pub fn highlight() -> Rgba {
-    rgba(0xffffff0f)
-}
-
-// Text.
-pub fn text() -> Rgba {
-    rgb(0xf2f3f5)
-}
-/// 8.96:1 on the page; the preview and the row's second line.
-pub fn text_soft() -> Rgba {
-    rgb(0xaeb3bd)
-}
-/// 5.73:1 on the page; the lowest level that may still carry meaning.
-pub fn text_faint() -> Rgba {
-    rgb(0x8a909b)
-}
-
-// The one accent: amber means "for you" — a mention, the Needs me badge, the Inbox dot, and
-// the rule beside a message of mine.
-pub fn accent() -> Rgba {
-    rgb(0xe9a23b)
-}
-pub fn accent_text() -> Rgba {
-    rgb(0xffc56e)
-}
-pub fn on_accent() -> Rgba {
-    rgb(0x1a1204)
-}
-/// 18% amber, for the edit mark.
-pub fn accent_soft() -> Rgba {
-    rgba(0xe9a23b2e)
-}
-/// The accent under a hover, on the phone. The desktop's own is in `theme`.
-pub fn accent_hover() -> Rgba {
-    rgb(0xf2b45c)
-}
-/// The accent under a press.
-pub fn accent_pressed() -> Rgba {
-    rgb(0xd08e2c)
-}
-/// 10% amber under a message that mentions me.
-pub fn accent_wash() -> Rgba {
-    rgba(0xe9a23b1a)
-}
-/// The 35% amber halo of a focused field.
-pub fn accent_halo() -> Rgba {
-    rgba(0xe9a23b59)
-}
-/// Selected text in a field: 45% amber.
-pub fn selection() -> Rgba {
-    rgba(0xe9a23b73)
-}
-
-/// The 6% white a press leaves. No colour shift, no scale.
-pub fn pressed() -> Rgba {
-    rgba(0xffffff0f)
-}
-pub fn hover() -> Rgba {
-    rgba(0xffffff0a)
-}
-pub fn selected() -> Rgba {
-    rgba(0xffffff14)
-}
-
 /// A sheet floats above the page: a real, soft shadow under a 12 pt top edge.
 pub fn shadow_sheet() -> Vec<BoxShadow> {
     vec![BoxShadow {
@@ -272,7 +178,7 @@ pub fn shadow_sheet() -> Vec<BoxShadow> {
 /// The 1 pt light at the top of a bar, painted inside it.
 pub fn top_highlight() -> Vec<BoxShadow> {
     vec![BoxShadow {
-        color: highlight().into(),
+        color: rgba(0xffffff0f).into(),
         offset: point(px(0.), px(1.)),
         blur_radius: px(0.),
         spread_radius: px(0.),
@@ -376,12 +282,4 @@ mod tests {
         assert_eq!(bottom_padding(0., 0.), 0.);
     }
 
-    #[test]
-    fn the_surfaces_are_a_ladder_with_the_page_lowest() {
-        let lum = |c: Rgba| c.red + c.green + c.blue;
-        assert!(lum(page()) < lum(surface()));
-        assert!(lum(surface()) < lum(raised()));
-        // 6% white for a press, 5.5% for a row's rule: the rule is the quieter of the two.
-        assert!(rule().alpha < pressed().alpha);
-    }
 }

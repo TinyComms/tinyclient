@@ -50,8 +50,8 @@ impl Shell {
                 .items_center()
                 .gap(px(12.))
                 .cursor_pointer()
-                .when(ix > 0, |row| row.border_t_1().border_color(tokens::rule()))
-                .active(|row| row.bg(tokens::pressed()))
+                .when(ix > 0, |row| row.border_t_1().border_color(theme::hairline()))
+                .active(|row| row.bg(theme::pressed()))
                 .child(glyph(section.icon(), 20., theme::text_soft()))
                 .child(div().flex_1().min_w_0().truncate().phone_row().text_color(theme::text()).child(words))
                 .child(glyph("icons/chevron-right.svg", 18., theme::text_faint()))
@@ -79,10 +79,10 @@ impl Shell {
                     .pl(px(tokens::GUTTER))
                     .flex()
                     .items_center()
-                    .bg(tokens::surface())
+                    .bg(theme::sidebar())
                     .shadow(tokens::top_highlight())
                     .border_b_1()
-                    .border_color(tokens::hairline())
+                    .border_color(theme::hairline())
                     .child(div().phone_title().child("You")),
             )
             // The page below the strip scrolls: at 200% the rows are taller than a small screen.
@@ -113,7 +113,7 @@ impl Shell {
                             ),
                     )
                     .children(add)
-                    .child(div().h(px(1.)).bg(tokens::hairline()))
+                    .child(div().h(px(1.)).bg(theme::hairline()))
                     .children(rows)
                     .child(div().h(px(24.))),
             )

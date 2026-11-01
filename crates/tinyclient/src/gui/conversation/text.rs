@@ -372,7 +372,7 @@ impl Element for Rich {
         }
         if let Some(selection) = &self.selection {
             for part in segments(&layout, selection) {
-                window.paint_quad(fill(part, tokens::selection()));
+                window.paint_quad(fill(part, theme::selection()));
             }
         }
         self.text.paint(None, inspector, bounds, &mut (), &mut (), window, cx);

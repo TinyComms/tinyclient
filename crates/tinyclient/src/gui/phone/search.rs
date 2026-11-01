@@ -92,10 +92,10 @@ impl Shell {
                     .pl(px(tokens::GUTTER))
                     .flex()
                     .items_center()
-                    .bg(tokens::surface())
+                    .bg(theme::sidebar())
                     .shadow(tokens::top_highlight())
                     .border_b_1()
-                    .border_color(tokens::hairline())
+                    .border_color(theme::hairline())
                     .child(div().phone_title().child("Search")),
             )
             .child(field)

@@ -225,7 +225,7 @@ impl Shell {
                             .gap(px(8.))
                             .child(div().flex_1().min_w_0().truncate().phone_preview().text_color(tone.preview).child(preview))
                             .children((count > 0).then(|| {
-                                let color = if hot { tokens::accent() } else { theme::text_soft() };
+                                let color = if hot { theme::accent() } else { theme::text_soft() };
                                 let words = if count > 99 { "99+".to_owned() } else { count.to_string() };
                                 div().flex_none().phone_stamp().text_color(color).child(SharedString::from(words))
                             }))
@@ -240,8 +240,8 @@ impl Shell {
         list_row(("phone-row", ix), tokens::row_height(), false, false, content)
             .relative()
             // 1 pt at 5.5% from x = 76 to the edge: the seam is between rows, not around them.
-            .children((!last).then(|| div().absolute().bottom_0().left(px(tokens::RULE_START)).right_0().h(px(1.)).bg(tokens::rule())))
-            .active(|row| row.bg(tokens::pressed()))
+            .children((!last).then(|| div().absolute().bottom_0().left(px(tokens::RULE_START)).right_0().h(px(1.)).bg(theme::hairline())))
+            .active(|row| row.bg(theme::pressed()))
             .on_mouse_down(MouseButton::Left, cx.listener(move |this, event: &gpui::MouseDownEvent, _, _| {
                 this.phone_state.press_down(press_key.clone(), at(event.position));
             }))

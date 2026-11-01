@@ -12,31 +12,31 @@ fn phone() -> bool {
 
 // Surfaces. The rail is not a third stripe: it takes the sidebar's value. On a phone the same
 // slots hold the quieter "Paper Signal" values; the desktop never reads them.
-pub fn rail() -> Rgba { if phone() { phone_tokens::surface() } else { rgb(0x121315) } }
-pub fn sidebar() -> Rgba { if phone() { phone_tokens::surface() } else { rgb(0x121315) } }
-pub fn canvas() -> Rgba { if phone() { phone_tokens::page() } else { rgb(0x18191c) } }
+pub fn rail() -> Rgba { rgb(0x121315) }
+pub fn sidebar() -> Rgba { rgb(0x121315) }
+pub fn canvas() -> Rgba { rgb(0x18191c) }
 /// Cards, code, banners, image placeholders, the neutral avatar plate. Opaque.
-pub fn raised() -> Rgba { if phone() { phone_tokens::raised() } else { rgb(0x1f2023) } }
+pub fn raised() -> Rgba { rgb(0x1f2023) }
 /// Anything that floats: menu, popover, modal, toast.
-pub fn overlay() -> Rgba { if phone() { phone_tokens::raised() } else { rgb(0x25262a) } }
+pub fn overlay() -> Rgba { rgb(0x25262a) }
 pub fn tooltip() -> Rgba { rgb(0x2c2d32) }
 pub fn scrim() -> Rgba { rgba(0x00000080) }
 
 // Lines.
 /// Pane and section dividers.
-pub fn hairline() -> Rgba { if phone() { phone_tokens::hairline() } else { rgba(0xffffff14) } }
+pub fn hairline() -> Rgba { rgba(0xffffff14) }
 /// Control and overlay edges.
-pub fn border() -> Rgba { if phone() { phone_tokens::hairline_strong() } else { rgba(0xffffff1f) } }
+pub fn border() -> Rgba { rgba(0xffffff1f) }
 /// Field hover, checkbox edge.
-pub fn border_strong() -> Rgba { if phone() { rgba(0xffffff2e) } else { rgba(0xffffff33) } }
+pub fn border_strong() -> Rgba { rgba(0xffffff33) }
 /// The 1 pt edge of a floating surface.
-pub fn overlay_edge() -> Rgba { if phone() { phone_tokens::hairline_strong() } else { rgba(0xffffff1a) } }
+pub fn overlay_edge() -> Rgba { rgba(0xffffff1a) }
 
 // State fills. Alpha, so they sit on any surface; `over` gives the opaque result where a ring
 // must match what is behind it.
-pub fn hover() -> Rgba { if phone() { phone_tokens::hover() } else { rgba(0xffffff0f) } }
-pub fn selected() -> Rgba { if phone() { phone_tokens::selected() } else { rgba(0xffffff1f) } }
-pub fn pressed() -> Rgba { if phone() { phone_tokens::pressed() } else { rgba(0xffffff29) } }
+pub fn hover() -> Rgba { rgba(0xffffff0f) }
+pub fn selected() -> Rgba { rgba(0xffffff1f) }
+pub fn pressed() -> Rgba { rgba(0xffffff29) }
 /// A text field at rest.
 pub fn field() -> Rgba { rgba(0xffffff0a) }
 /// The lit segment of a segmented switch.
@@ -49,83 +49,47 @@ pub fn count_fill() -> Rgba { rgba(0xffffff29) }
 pub fn quiet_fill() -> Rgba { rgba(0xffffff1f) }
 
 // Text.
-pub fn text() -> Rgba { if phone() { phone_tokens::text() } else { rgb(0xedeef0) } }
-pub fn text_soft() -> Rgba { if phone() { phone_tokens::text_soft() } else { rgb(0xa8abb3) } }
+pub fn text() -> Rgba { rgb(0xedeef0) }
+pub fn text_soft() -> Rgba { rgb(0xa8abb3) }
 /// The lowest level that may carry meaning.
-pub fn text_faint() -> Rgba { if phone() { phone_tokens::text_faint() } else { rgb(0x858993) } }
+pub fn text_faint() -> Rgba { rgb(0x858993) }
 pub fn text_disabled() -> Rgba { rgb(0x53565e) }
 
 // Accent: "for you" or "this will act". Never plain unread. On a phone it is the one amber
 // of "Paper Signal"; the desktop keeps its blue.
 pub fn accent() -> Rgba {
-    if crate::gui::phone::active() {
-        crate::gui::phone::tokens::accent()
-    } else {
-        rgb(0x2f6feb)
-    }
+    rgb(0x2f6feb)
 }
 pub fn accent_hover() -> Rgba {
-    if crate::gui::phone::active() {
-        phone_tokens::accent_hover()
-    } else {
-        rgb(0x3a77ee)
-    }
+    rgb(0x3a77ee)
 }
 pub fn accent_pressed() -> Rgba {
-    if crate::gui::phone::active() {
-        phone_tokens::accent_pressed()
-    } else {
-        rgb(0x2861d3)
-    }
+    rgb(0x2861d3)
 }
 /// Links, @mentions, the "New" label, the caret.
 pub fn accent_text() -> Rgba {
-    if crate::gui::phone::active() {
-        crate::gui::phone::tokens::accent_text()
-    } else {
-        rgb(0x8ab4ff)
-    }
+    rgb(0x8ab4ff)
 }
 pub fn focus() -> Rgba {
     accent_text()
 }
 pub fn accent_soft() -> Rgba {
-    if crate::gui::phone::active() {
-        crate::gui::phone::tokens::accent_soft()
-    } else {
-        rgba(0x2f6feb2e)
-    }
+    rgba(0x2f6feb2e)
 }
 /// A message that mentions me.
 pub fn accent_wash() -> Rgba {
-    if crate::gui::phone::active() {
-        phone_tokens::accent_wash()
-    } else {
-        rgba(0x2f6feb1a)
-    }
+    rgba(0x2f6feb1a)
 }
 /// The halo of a focused field.
 pub fn accent_halo() -> Rgba {
-    if crate::gui::phone::active() {
-        phone_tokens::accent_halo()
-    } else {
-        rgba(0x2f6feb59)
-    }
+    rgba(0x2f6feb59)
 }
 /// Selected text in a field.
 pub fn selection() -> Rgba {
-    if crate::gui::phone::active() {
-        phone_tokens::selection()
-    } else {
-        rgba(0x2f6feb73)
-    }
+    rgba(0x2f6feb73)
 }
 pub fn on_accent() -> Rgba {
-    if crate::gui::phone::active() {
-        crate::gui::phone::tokens::on_accent()
-    } else {
-        rgb(0xffffff)
-    }
+    rgb(0xffffff)
 }
 
 // Semantic.

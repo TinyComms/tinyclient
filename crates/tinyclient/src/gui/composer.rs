@@ -2323,9 +2323,9 @@ impl Render for Composer {
             // light and hairline every pinned strip wears. The desktop dock keeps no fill.
             .when(phone, |dock| {
                 use crate::gui::phone::tokens as phone_tokens;
-                dock.bg(phone_tokens::surface())
+                dock.bg(theme::sidebar())
                     .border_t_1()
-                    .border_color(phone_tokens::hairline())
+                    .border_color(theme::hairline())
                     .shadow(phone_tokens::top_highlight())
             })
             .flex()

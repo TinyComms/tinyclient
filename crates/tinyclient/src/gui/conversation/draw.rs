@@ -685,7 +685,7 @@ impl Pane {
                             .font_weight(theme::SEMIBOLD)
                             // Mine, on a phone: the label itself turns amber. An underline read
                             // as a link, and a rule beside the words read as chrome.
-                            .when(mine, |name| name.text_color(tokens_phone::accent_text()))
+                            .when(mine, |name| name.text_color(theme::accent_text()))
                             .child(name),
                     )
                     .child(

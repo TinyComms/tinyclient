@@ -5,6 +5,7 @@
 
 use crate::gui::components::{banner, banner_action, icon_button, network_icon, Tone};
 use crate::gui::phone::tokens::{self, PhoneType};
+use crate::gui::theme;
 use crate::gui::state::Shell;
 use gpui::{div, prelude::*, px, Context, Div, MouseButton, Window};
 use protocol::{Conversation, ConversationKind, Link};
@@ -33,7 +34,7 @@ impl Shell {
                 .flex_none()
                 .ml(px(4.))
                 .mr(px(2.))
-                .child(self.conversation_avatar(open, 32., tokens::surface(), cx))
+                .child(self.conversation_avatar(open, 32., theme::sidebar(), cx))
         });
         let strip = div()
             .flex_none()
@@ -43,10 +44,10 @@ impl Shell {
             .flex()
             .items_center()
             .gap(px(4.))
-            .bg(tokens::surface())
+            .bg(theme::sidebar())
             .shadow(tokens::top_highlight())
             .border_b_1()
-            .border_color(tokens::hairline())
+            .border_color(theme::hairline())
             .child(
                 icon_button("phone-back", "icons/chevron-left.svg", false)
                     .size(px(tokens::TOUCH))
