@@ -20,13 +20,13 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 pub const SOURCE: &str = "members";
-/// A member row: the desktop's 28, and a thumb's 44 on a phone.
+/// A member row: the desktop's 28, and on a phone 48, as the other pages' person rows.
 fn row() -> f32 {
-    if crate::gui::phone::active() { theme::row_height(theme::ROW_ONE) } else { theme::ROW_ONE }
+    if crate::gui::phone::active() { theme::row_height(theme::ROW_ONE).max(48.) } else { theme::ROW_ONE }
 }
-/// A member's face: the desktop's 20, and 28 on a phone, beside its larger name.
+/// A member's face: the desktop's 20, and 32 on a phone, beside its larger name.
 fn face() -> f32 {
-    if crate::gui::phone::active() { 28. } else { 20. }
+    if crate::gui::phone::active() { 32. } else { 20. }
 }
 const PAGE: u32 = 50;
 /// Pages of members held; the ones farthest from the viewport go first.
@@ -459,8 +459,10 @@ impl MemberList {
                     div()
                         .min_w_0()
                         .truncate()
-                        .type_ui()
-                        .text_color(if away { theme::text_faint() } else { theme::text_soft() })
+                        // A phone's names are the size the other pages' rows are (Details, a
+                        // profile, the sidebar): 16, not the desktop's interface size scaled.
+                        .map(|name| if phone { name.type_body() } else { name.type_ui() })
+                        .text_color(if away { theme::text_faint() } else if phone { theme::text() } else { theme::text_soft() })
                         .child(person.name.clone()),
                 )
                 .when(person.bot, |row| row.child(super::list::bot_tag())),

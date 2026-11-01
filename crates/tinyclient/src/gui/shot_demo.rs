@@ -647,13 +647,24 @@ fn messages_of(key: &Key) -> &'static [Message] {
 }
 
 fn conversations(rows: Vec<Conversation>, offset: u32, limit: u32) -> Response {
-    let total = rows.len() as u32;
-    let counts = InboxCounts {
-        all: total,
+    let counts = counts_of(&rows);
+    rows_page(rows, counts, offset, limit)
+}
+
+/// How many rows each Inbox filter holds: counted over the whole list, whatever filter is on,
+/// as chatd counts them (`InboxCounts`). Counted over the filtered rows, Unread said 6 under
+/// All and 2 under Mentions.
+fn counts_of(rows: &[Conversation]) -> InboxCounts {
+    InboxCounts {
+        all: rows.len() as u32,
         unread: rows.iter().filter(|r| r.unread > 0 && !r.muted).count() as u32,
         mentions: rows.iter().filter(|r| r.mentions > 0).count() as u32,
         apps: 0,
-    };
+    }
+}
+
+fn rows_page(rows: Vec<Conversation>, counts: InboxCounts, offset: u32, limit: u32) -> Response {
+    let total = rows.len() as u32;
     let page = rows.into_iter().skip(offset as usize).take(limit.max(1) as usize).collect();
     Response::Conversations { conversations: page, total, counts }
 }
@@ -861,7 +872,7 @@ pub fn answer(request: &Request) -> std::io::Result<Response> {
             std::thread::sleep(Duration::from_secs(20));
             return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "the demo is quiet"));
         }
-        Request::Inbox { network, filter, offset, limit } => conversations(inbox(*network, *filter), *offset, *limit),
+        Request::Inbox { network, filter, offset, limit } => rows_page(inbox(*network, *filter), counts_of(&inbox(*network, InboxFilter::All)), *offset, *limit),
         Request::Spaces { network } => Response::Spaces {
             spaces: fixture.spaces.iter().filter(|s| network.is_none_or(|n| s.key.network == n)).cloned().collect(),
         },

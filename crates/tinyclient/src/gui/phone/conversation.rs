@@ -21,6 +21,17 @@ pub fn trouble(link: Link) -> Option<(&'static str, Tone, bool)> {
     }
 }
 
+/// The strip's line about encryption, short enough to share a 360 pt strip with the place's
+/// name: "Not end-to-end encrypted" was cut to "Not end-to-…" beside a room's server. The
+/// longer words are on the Encryption page the line opens.
+pub fn phone_words(encryption: protocol::Encryption) -> &'static str {
+    match encryption {
+        protocol::Encryption::Unknown => "",
+        protocol::Encryption::Plain => "Server can read",
+        protocol::Encryption::EndToEnd => "Encrypted",
+    }
+}
+
 impl Shell {
     /// The desktop strip at a phone's size: back where the desktop has its travel buttons, the
     /// conversation's picture and title, the call, then Members and Details as the desktop
@@ -55,7 +66,7 @@ impl Shell {
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(move |this, _, window, cx| this.tiny_open_encryption(&account, window, cx)))
                 .child(div().flex_none().child(glyph(icon, 11., tone)))
-                .child(div().min_w_0().truncate().child(open.encryption.words()))
+                .child(div().min_w_0().truncate().child(phone_words(open.encryption)))
         });
         // The call is one of the strip's glyphs (`call_pill` draws it so on a phone): 44 pt, no
         // box, beside Members and Details.

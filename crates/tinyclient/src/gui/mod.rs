@@ -607,6 +607,16 @@ mod shot {
                 tracing::warn!("tinyclient: holding, pid {}", std::process::id());
                 cx.background_executor().timer(Duration::from_secs(seconds)).await;
             }
+            // The windows go first. A focused field is registered with its window as the
+            // platform's input handler, which holds the field: quitting with the window still up
+            // left that handle alive past the app, and the test platform's leak check panicked
+            // (exit 101) after the image was written.
+            cx.update(|cx| {
+                for handle in cx.windows() {
+                    let _ = handle.update(cx, |_, window, _| window.remove_window());
+                }
+            });
+            cx.background_executor().timer(Duration::from_millis(50)).await;
             cx.update(|cx| cx.quit());
         })
         .detach();

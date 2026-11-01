@@ -21,6 +21,13 @@ pub fn badge() -> Rgba { rgba(0x000000a6) }
 pub fn scrim() -> Rgba { rgba(0x0b0b0df0) }
 pub fn selection() -> Rgba { rgba(0x2f6feb73) }
 
+/// Code's face. Menlo is on Apple systems only: Android has its own mono face (`theme::MONO`),
+/// and without it a code span fell back to the proportional system face there.
+// TODO(design): the desktops off Apple likely want `theme::MONO` too; left as drawn so their
+// screenshots stay put.
+#[cfg(target_os = "android")]
+pub const MONO: &str = crate::gui::theme::MONO;
+#[cfg(not(target_os = "android"))]
 pub const MONO: &str = "Menlo";
 
 /// The widest a line of text, a code block or a card may be.
