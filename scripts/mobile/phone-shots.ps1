@@ -13,7 +13,9 @@
 [CmdletBinding()]
 param(
     [string]$Out = (Join-Path (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $PSScriptRoot))) '_proof\design\before'),
-    [switch]$NoBuild
+    [switch]$NoBuild,
+    # Only the call screens (40-59) and the desktop call dock, for work on calls.
+    [switch]$CallsOnly
 )
 
 Set-StrictMode -Version Latest
@@ -138,6 +140,30 @@ $phone = @(
     @{ n = '32-reply-bar';           a = $carpool + @('--composer', 'reply') },
     @{ n = '33-emoji-picker';        a = $carpool + @('--composer', 'picker-emoji') }
 )
+# A call on a phone (`gui/call/phone`): its own screen, the bar over every other screen when it
+# is minimised, its pages and sheets. Each is a made-up call (`gui/call/shot.rs`, `phone_*`).
+$callShots = @(
+    @{ n = '40-call-voice';          c = 'phone_voice' },
+    @{ n = '41-call-video';          c = 'phone_video' },
+    @{ n = '42-call-group';          c = 'phone_group' },
+    @{ n = '43-call-crowd';          c = 'phone_crowd' },
+    @{ n = '44-call-share';          c = 'phone_share' },
+    @{ n = '45-call-incoming';       c = 'phone_incoming' },
+    @{ n = '46-call-incoming-video'; c = 'phone_incoming_video' },
+    @{ n = '47-call-outgoing';       c = 'phone_outgoing' },
+    @{ n = '48-call-connecting';     c = 'phone_connecting' },
+    @{ n = '49-call-reconnecting';   c = 'phone_reconnecting' },
+    @{ n = '50-call-pill-inbox';     c = 'phone_pill' },
+    @{ n = '51-call-pill-conversation'; c = 'phone_pill'; a = @('--open', '1') },
+    @{ n = '52-call-people';         c = 'phone_people' },
+    @{ n = '53-call-devices';        c = 'phone_devices' },
+    @{ n = '54-call-more';           c = 'phone_more' },
+    @{ n = '55-call-security';       c = 'phone_security' },
+    @{ n = '56-call-mic-denied';     c = 'phone_denied' },
+    @{ n = '57-call-camera-denied';  c = 'phone_camera_denied' },
+    @{ n = '58-call-no-answer';      c = 'phone_failed' },
+    @{ n = '59-call-ended';          c = 'phone_ended' }
+)
 # Settings on a phone is a page of the one window (`gui/settings/phone_page.rs`); the shot draws
 # that page in a window of its own at the phone's size. `list` is the list of sections.
 $settingsShots = @(
@@ -152,8 +178,24 @@ $settingsShots = @(
     @{ n = '25h-settings-search';    a = @('--settings', 'list', '--settings-search', 'text') }
 )
 
+function CallShots([string]$size) {
+    Write-Host "phone-shots: calls at $size"
+    foreach ($shot in $callShots) {
+        $arguments = if ($shot.ContainsKey('a')) { $shot.a } else { @() }
+        Shot $shot.n $size $arguments @{ TINYCLIENT_SHOT_CALL = $shot.c }
+    }
+}
+
 try {
+    if ($CallsOnly) {
+        foreach ($size in @('390x844', '360x780')) { CallShots $size }
+        Shot 'desktop-call-dock' '1280x800' @('--open', '1') @{ TINYCLIENT_SHOT_CALL = 'joined' }
+        Write-Host "phone-shots: $($made.Count) written to $Out"
+        if ($missing.Count -gt 0) { Write-Host "phone-shots: not written: $($missing -join ', ')" -ForegroundColor Yellow; exit 1 }
+        exit 0
+    }
     foreach ($size in @('390x844', '360x780')) {
+        CallShots $size
         Write-Host "phone-shots: phone at $size"
         foreach ($shot in $phone) {
             $vars = if ($shot.ContainsKey('v')) { $shot.v } else { @{} }

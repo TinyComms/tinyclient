@@ -726,8 +726,17 @@ fn premier() -> protocol::TinyCommunity {
         display_name: name.into(),
         role: role.into(),
         created_at: stamp(on_day(days, 12, 0)),
+        ..Default::default()
     };
     protocol::TinyCommunity {
+        capabilities: Default::default(),
+        access: None,
+        me: ME.into(),
+        server: None,
+        roles: Vec::new(),
+        categories: Vec::new(),
+        bans: Vec::new(),
+        provider: String::new(),
         role: "owner".into(),
         members: vec![
             member(ME, ME_NAME, "robin@example.com", "owner", 120),
@@ -741,15 +750,15 @@ fn premier() -> protocol::TinyCommunity {
             expires_at: stamp(now() + 5 * 86_400),
             accepted_at: None,
             accepted_by: None,
+            ..Default::default()
         }],
         audit: Vec::new(),
         origin: "https://premier.example".into(),
         rooms: vec![
-            protocol::TinyRoom { id: "c-lobby".into(), name: "lobby".into(), participants: Vec::new() },
+            protocol::TinyRoom::new("c-lobby", "lobby"),
             protocol::TinyRoom {
-                id: "r-games".into(),
-                name: "game night".into(),
-                participants: vec![protocol::TinySeat { user_id: "halvard".into(), muted: false, deafened: false, speaking: false }],
+                participants: vec![protocol::TinySeat { user_id: "halvard".into(), ..Default::default() }],
+                ..protocol::TinyRoom::new("r-games", "game night")
             },
         ],
         online: vec![ME.into(), "halvard".into()],

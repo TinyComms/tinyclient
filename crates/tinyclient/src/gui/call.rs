@@ -10,9 +10,16 @@ mod dock;
 pub(in crate::gui) mod health;
 mod people;
 mod permission;
+pub(in crate::gui) mod phone;
 pub(in crate::gui) mod security;
 #[cfg(feature = "gui-shot")]
 mod shot;
+
+// The platform's side of a phone call: the mobile layer routes these (`phone::hooks`).
+#[allow(unused_imports)]
+pub(crate) use phone::hooks::{
+    note_permission, open_system_settings, route_audio, route_flip, route_system_settings, Permission, Route,
+};
 
 #[allow(unused_imports)]
 pub(super) use people::occupants;
@@ -216,6 +223,10 @@ pub struct State {
     counter: OnceCell<Entity<Counter>>,
     /// The same count, for a Tiny channel's stage: a second text, ticking on its own.
     stage_counter: OnceCell<Entity<Counter>>,
+    /// The same count again, for the phone's call screen and its call bar (one shows at a time).
+    phone_counter: OnceCell<Entity<Counter>>,
+    /// What the phone's call screen keeps: minimised or not, its page and sheets, the camera tile.
+    pub(in crate::gui) phone: phone::State,
     /// Talking while muted: what the meter heard, and the redraw that takes the pill away.
     muted_talk: health::MutedTalk,
     muted_talk_task: Option<Task<()>>,
@@ -433,6 +444,11 @@ fn system_open(url: &str) -> Result<(), String> {
 
 /// The dock, in the shape of the sidebar's slot (`layout::Slots::call_dock`).
 pub(super) fn dock(shell: &Shell, _: &mut Window, cx: &mut Context<Shell>) -> Option<AnyElement> {
+    // A phone draws every state of a call full-screen, or as the bar over every screen
+    // (`phone`), never as a card at the end of the list.
+    if super::phone::active() {
+        return None;
+    }
     let snapshot = shell.snapshot.as_ref()?;
     shell.call_dock(snapshot, cx).map(IntoElement::into_any_element)
 }
@@ -452,6 +468,7 @@ impl Shell {
         };
         let last = call.as_ref().map(|call| (call.conversation.clone(), discriminant(&call.state)));
         if self.call_state.last != last {
+            self.call_state.phone.state_changed(call.as_ref(), self.call_state.last.as_ref().map(|(key, _)| key));
             self.call_state.last = last;
             self.call_state.since = now();
             self.call_state.error = None;
@@ -486,6 +503,10 @@ impl Shell {
                     self.call_menu_set(None, cx);
                 }
                 self.call_device_notice(call, cx);
+                // Answered with video on a phone: the camera goes on once the call is up.
+                if call.state == CallState::Joined && std::mem::take(&mut self.call_state.phone.video_on_join) {
+                    self.call_ask(Request::Media(protocol::MediaRequest::Camera { on: true }), cx);
+                }
                 if !call.deafened {
                     self.call_state.mute_before_deafen = None;
                 }
@@ -888,11 +909,15 @@ impl Shell {
         self.call_asked();
         let state = &mut self.call_state;
         (state.error, state.local, state.ended) = (None, None, None);
+        // A call asked for here opens full-screen on a phone.
+        state.phone.minimised = false;
+        // The phone's platform says when the microphone is refused (`phone::hooks`).
+        let phone_denied = phone::hooks::denied(Permission::Microphone);
         cx.notify();
         cx.spawn(async move |this, cx| {
             let work = async move {
                 // A picture of the dock never asks anyone for the microphone.
-                let allowed = cfg!(feature = "gui-shot") || permission::ensure() != permission::Microphone::Denied;
+                let allowed = cfg!(feature = "gui-shot") || (!phone_denied && permission::ensure() != permission::Microphone::Denied);
                 if !allowed {
                     return Err(None);
                 }
@@ -1026,6 +1051,17 @@ impl Shell {
         let words = |words: SharedString| (!phone).then_some(words);
         let glyph = |size: f32| if phone { 16. } else { size };
 
+        // On a phone my own call is a screen of its own: the strip's glyph goes back to it.
+        if let Some(call) = mine.as_ref().filter(|_| phone) {
+            let live = in_call(call);
+            let color = if live { theme::positive() } else { theme::text_soft() };
+            return Some(
+                pill.border_color(gpui::transparent_black())
+                    .tooltip(tip("Back to the call", Some("⌘⇧J")))
+                    .on_click(cx.listener(|this, _, _, cx| this.call_phone_restore(cx)))
+                    .child(icon(if live { "icons/audio-lines.svg" } else { "icons/phone.svg" }, 18., color, None)),
+            );
+        }
         if let Some(call) = mine {
             let incoming = matches!(call.state, CallState::RingingIn { .. });
             let word = match call.state {

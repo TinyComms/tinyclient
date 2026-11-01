@@ -8,7 +8,8 @@ mod anim;
 mod app;
 mod attention;
 mod assets;
-mod call;
+// `pub(crate)` so the mobile layer can reach the call's platform hooks (`call::phone::hooks`).
+pub(crate) mod call;
 mod chrome;
 mod components;
 mod composer;
