@@ -33,15 +33,15 @@ use crate::hear::{Ear, Limiter};
 use crate::media::{self, announce, finish_cue, listen, mixdown, Devices, Gate, Send, Stream, MICROPHONE_DENIED};
 use crate::opus::Encoder;
 use crate::permission::{microphone, Microphone};
-use crate::picture::Pictures;
 use crate::process::Processor;
 use crate::rtp::SILENCE;
 use crate::session::Controls;
 use crate::stats::Meter;
+use crate::video::{Rates, Received, Track, Video, Wants, Word};
 use crate::{out, rt, FRAME, FRAME_SAMPLES};
 use mio::net::{TcpStream, UdpSocket};
 use mio::{Events, Interest, Poll, Token};
-use protocol::{CallFailure, CallPath, Cue, MediaResponse, PictureKind, TinyOffer, TinyPicture, TinySlot};
+use protocol::{CallFailure, CallPath, Cue, MediaResponse, TinyOffer, TinyPicture, TinySlot};
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, ErrorKind};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
@@ -415,25 +415,16 @@ struct Call {
     processor: Processor,
     limiter: Limiter,
     meter: Meter,
-    pictures: Pictures,
+    /// The picture's threads. This loop only moves their bytes.
+    video: Video,
     /// What the last accepted answer left sending. str0m's direction flips before the answer.
     sending_share: bool,
     sending_camera: bool,
     /// `Some(true)` is a share offer still out; `Some(false)` is a camera offer.
     offered: Option<bool>,
-    video_at: Option<Instant>,
-    camera_n: u64,
-    share_n: u64,
-    key_share: bool,
-    key_camera: bool,
-    wait_key: bool,
     pli_at: Option<Instant>,
-    painted: Option<Instant>,
-    generation: u64,
     shown: Option<TinyPicture>,
     watching: bool,
-    /// The codec was looked for. Once is enough: `load_api` starts a download that is still owed.
-    warmed: bool,
     share_noted: bool,
     camera_noted: bool,
 }
@@ -490,7 +481,7 @@ impl Call {
         self.sending_share = false;
         self.sending_camera = false;
         self.offered = None;
-        self.wait_key = true;
+        self.video.reset();
         self.shown = None;
         // The new link has not been announced dead. A death of the one we just left already was.
         self.announced = false;
@@ -571,8 +562,15 @@ impl Call {
                 }
             }
             Event::MediaData(data) if self.link.is_picture(data.mid) => self.picture_in(data),
-            Event::KeyframeRequest(request) if request.mid == self.link.share_mid() => self.key_share = true,
-            Event::KeyframeRequest(request) if request.mid == self.link.camera_mid() => self.key_camera = true,
+            Event::KeyframeRequest(request) if request.mid == self.link.share_mid() => self.video.ask_key(Track::Share),
+            Event::KeyframeRequest(request) if request.mid == self.link.camera_mid() => match request.rid {
+                Some(rid) if rid == Rid::from("l") => self.video.ask_key(Track::Low),
+                Some(_) => self.video.ask_key(Track::High),
+                None => {
+                    self.video.ask_key(Track::High);
+                    self.video.ask_key(Track::Low);
+                }
+            },
             Event::MediaData(data) => {
                 if self.unopened.len() >= HELD {
                     self.unopened.pop_front();
@@ -827,28 +825,18 @@ impl Call {
             let changed = slot.as_ref().map(|pictured| (pictured.user_id.clone(), pictured.kind)) != self.shown.as_ref().map(|pictured| (pictured.user_id.clone(), pictured.kind));
             self.shown = slot;
             if changed {
-                self.wait_key = true;
-                self.pictures.reset_decoder();
+                self.video.reset();
                 self.ask_keyframe();
             }
         }
         let watching = self.controls.watch();
         if self.watching && !watching {
-            out::send(&MediaResponse::Picture {
-                path: String::new(),
-                width: 0,
-                height: 0,
-                generation: 0,
-                user_id: String::new(),
-                kind: PictureKind::Camera,
-            });
-            self.painted = None;
+            self.video.clear();
+        }
+        if watching {
+            self.video.watch();
         }
         self.watching = watching;
-        if !self.warmed && (self.controls.share() || self.controls.camera() || watching) {
-            self.warmed = true;
-            crate::picture::warm();
-        }
         if self.offered.is_none() && !self.link.pending() {
             let (want_share, want_camera) = (self.controls.share(), self.controls.camera());
             if want_share != self.sending_share {
@@ -860,7 +848,6 @@ impl Call {
                 match self.link.offer_send(true, want_share) {
                     Ok(sdp) => {
                         self.offered = Some(true);
-                        self.key_share = want_share;
                         out::send(&MediaResponse::TinyRenegotiate { sdp });
                     }
                     Err(err) => tracing::warn!("mediad: the share could not be offered: {err}"),
@@ -874,28 +861,23 @@ impl Call {
                 match self.link.offer_send(false, want_camera) {
                     Ok(sdp) => {
                         self.offered = Some(false);
-                        self.key_camera = want_camera;
                         out::send(&MediaResponse::TinyRenegotiate { sdp });
                     }
                     Err(err) => tracing::warn!("mediad: the camera could not be offered: {err}"),
                 }
             }
         }
-        if !self.connected || self.video_at.is_some_and(|at| at.elapsed() < Duration::from_millis(66)) {
-            return;
-        }
-        let mut sent = false;
-        if self.sending_share && self.controls.share() {
-            match self.pictures.share(self.key_share || self.share_n == 0) {
-                Ok(frame) => {
-                    self.key_share = false;
-                    self.share_noted = false;
-                    self.write_video(self.link.share_mid(), None, &frame, self.share_n);
-                    self.share_n += 1;
-                    sent = true;
-                }
-                Err(words) if words == crate::picture::CODEC_LATER => {}
-                Err(words) => {
+        let camera = self.controls.camera();
+        self.video.want(Wants {
+            share: self.connected && self.sending_share && self.controls.share(),
+            camera: self.connected && self.sending_camera && camera,
+            keep_camera: camera,
+            rates: Rates::default(),
+        });
+        while let Some(word) = self.video.next() {
+            match word {
+                Word::Frame { track, payload, rtp, at } => self.write_video(track, payload, rtp, at),
+                Word::Failed { share: true, words } => {
                     if !self.share_noted {
                         self.share_noted = true;
                         self.controls.set_share(false);
@@ -903,21 +885,7 @@ impl Call {
                         out::send(&MediaResponse::Sending { share: false, camera: self.sending_camera });
                     }
                 }
-            }
-        }
-        if self.sending_camera && self.controls.camera() {
-            match self.pictures.camera(self.key_camera || self.camera_n == 0) {
-                Ok((high, low)) => {
-                    self.key_camera = false;
-                    self.camera_noted = false;
-                    let n = self.camera_n;
-                    self.write_video(self.link.camera_mid(), Some("h"), &high, n);
-                    self.write_video(self.link.camera_mid(), Some("l"), &low, n);
-                    self.camera_n += 1;
-                    sent = true;
-                }
-                Err(words) if words == crate::picture::CODEC_LATER => {}
-                Err(words) => {
+                Word::Failed { share: false, words } => {
                     if !self.camera_noted {
                         self.camera_noted = true;
                         self.controls.set_camera(false);
@@ -927,15 +895,22 @@ impl Call {
                 }
             }
         }
-        if sent {
-            self.video_at = Some(Instant::now());
+        if self.video.key_wanted() {
+            self.ask_keyframe();
         }
     }
 
-    fn write_video(&mut self, mid: Mid, rid: Option<&str>, annex_b: &[u8], n: u64) {
-        let Some(payload) = self.controls.e2ee(|e2ee| e2ee.seal_video(annex_b)) else {
-            return;
+    /// One sealed frame on its way. One that outlived what it was for (a reconnect, a line
+    /// turned off) goes no further.
+    fn write_video(&mut self, track: Track, payload: Vec<u8>, rtp: u64, at: Instant) {
+        let (mid, rid, sending) = match track {
+            Track::Share => (self.link.share_mid(), None, self.sending_share),
+            Track::High => (self.link.camera_mid(), Some("h"), self.sending_camera),
+            Track::Low => (self.link.camera_mid(), Some("l"), self.sending_camera),
         };
+        if !sending {
+            return;
+        }
         let Some(writer) = self.link.rtc.writer(mid) else {
             return;
         };
@@ -946,47 +921,20 @@ impl Call {
             Some(rid) => writer.rid(Rid::from(rid)),
             None => writer,
         };
-        let time = MediaTime::new(n * 6000, Frequency::NINETY_KHZ);
-        let _ = writer.write(pt, Instant::now(), time, payload);
+        let _ = writer.write(pt, at, MediaTime::new(rtp, Frequency::NINETY_KHZ), payload);
     }
 
-    fn picture_in(&mut self, data: str0m::media::MediaData) {
+    fn picture_in(&mut self, data: MediaData) {
         if data.mid != self.link.screen_mid() || !self.controls.watch() {
-            return;
-        }
-        if !data.contiguous || (self.wait_key && !data.is_keyframe()) {
-            self.wait_key = true;
-            self.ask_keyframe();
             return;
         }
         let user = self.shown.as_ref().map(|pictured| pictured.user_id.clone()).unwrap_or_default();
         let kind = self.shown.as_ref().map(|pictured| pictured.kind).unwrap_or_default();
-        let Some(frame) = self.controls.e2ee(|e2ee| e2ee.open_video(&user, &data.data)) else {
-            self.wait_key = true;
+        let key = data.is_keyframe();
+        let frame = Received { key, contiguous: data.contiguous, data: data.data, user, kind };
+        if !self.video.picture(frame) {
             self.ask_keyframe();
-            return;
-        };
-        if data.is_keyframe() {
-            self.wait_key = false;
         }
-        if self.painted.is_some_and(|at| at.elapsed() < Duration::from_millis(100)) {
-            return;
-        }
-        self.generation = self.generation.wrapping_add(1);
-        let Some((path, width, height)) = self.pictures.decode(&frame, self.generation) else {
-            self.wait_key = true;
-            self.ask_keyframe();
-            return;
-        };
-        self.painted = Some(Instant::now());
-        out::send(&MediaResponse::Picture {
-            path: path.display().to_string(),
-            width,
-            height,
-            generation: self.generation,
-            user_id: user,
-            kind,
-        });
     }
 
     fn ask_keyframe(&mut self) {
@@ -1187,6 +1135,7 @@ impl Call {
         if let Some(devices) = &mut self.devices {
             devices.stop();
         }
+        std::mem::replace(&mut self.video, Video::new(self.controls.clone())).stop();
     }
 }
 
@@ -1208,7 +1157,7 @@ pub fn run(link: Link, user_id: String, controls: Arc<Controls>) {
         out::fail(CallFailure::Engine, ENGINE);
     };
     let mut call = Call {
-        controls,
+        controls: controls.clone(),
         user_id,
         link,
         poll,
@@ -1231,22 +1180,13 @@ pub fn run(link: Link, user_id: String, controls: Arc<Controls>) {
         processor: Processor::new(),
         limiter: Limiter::default(),
         meter: Meter::new(CallPath::Unknown),
-        pictures: Pictures::default(),
+        video: Video::new(controls.clone()),
         sending_share: false,
         sending_camera: false,
         offered: None,
-        video_at: None,
-        camera_n: 0,
-        share_n: 0,
-        key_share: false,
-        key_camera: false,
-        wait_key: true,
         pli_at: None,
-        painted: None,
-        generation: 0,
         shown: None,
         watching: false,
-        warmed: false,
         share_noted: false,
         camera_noted: false,
     };
