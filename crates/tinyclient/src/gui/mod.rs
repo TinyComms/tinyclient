@@ -653,6 +653,13 @@ pub(crate) fn links_through_gpui() -> bool {
 }
 
 pub fn run() {
+    run_with(gpui_platform::application());
+}
+
+/// Runs the window on an application the caller built. Android builds its own (see
+/// `android_main`): `gpui_platform::application()` there has no NativeActivity session, so
+/// GPUI would open the window before the surface exists.
+pub(crate) fn run_with(application: gpui::Application) {
     #[cfg(feature = "gui-shot")]
     LAUNCHED.get_or_init(std::time::Instant::now);
     app::crash::install();
@@ -663,7 +670,7 @@ pub fn run() {
     theme::set_text_step(prefs.text_step);
     app::prefs::set_choices(prefs.choices);
     anim::set_autoplay(prefs.autoplay);
-    let application = gpui_platform::application().with_assets(assets::Assets);
+    let application = application.with_assets(assets::Assets);
     // The Dock icon brings the hidden window back unchanged.
     application.on_reopen(|cx| cx.activate(true));
     application.run(move |cx: &mut App| {

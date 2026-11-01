@@ -72,8 +72,10 @@ pub extern "C" fn tinyclient_ios_main() {
 /// Before the window starts this names the app's internal data directory for chatd's support
 /// directory (`protocol::set_support_dir`): Android has no `HOME`, so `protocol::support_dir` would
 /// otherwise put the socket and database under `/tmp`. Then chatd's core starts in this process.
-/// The pinned Zed GPUI has no Android backend (see [`ios_main`]), so this is still not a working
-/// app: `gpui_platform::application()` has no Android arm and the build stops there.
+/// GPUI (gpui-ce) runs on the NativeActivity session that `init_platform` opens for this `app`.
+/// The session's guard stays alive until the window's event loop returns. The platform must come
+/// from that session: `gpui_platform::application()` on Android builds a platform with no session,
+/// which fires the launch callback before any window exists.
 #[cfg(all(feature = "mobile", target_os = "android"))]
 #[no_mangle]
 pub extern "C" fn android_main(app: android_activity::AndroidApp) {
@@ -84,7 +86,18 @@ pub extern "C" fn android_main(app: android_activity::AndroidApp) {
     }
     inprocess::register();
     inprocess::start_now();
-    gui::run();
+    let _session = match gpui_mobile::android::jni::init_platform(&app) {
+        Ok(session) => session,
+        Err(err) => {
+            log::error!("tinyclient: the NativeActivity session did not start: {err}");
+            return;
+        }
+    };
+    let Some(platform) = gpui_mobile::android::jni::shared_platform() else {
+        log::error!("tinyclient: the NativeActivity session has no platform");
+        return;
+    };
+    gui::run_with(gpui::Application::with_platform(platform.into_rc()));
 }
 
 /// chatd on a phone: the core runs in this process, on a thread of its own, over the socket in the

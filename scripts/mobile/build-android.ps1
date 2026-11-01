@@ -98,6 +98,9 @@ $cargoArgs = [System.Collections.Generic.List[string]]::new()
 $cargoArgs.Add('ndk')
 foreach ($a in $Abi) { $cargoArgs.Add('-t'); $cargoArgs.Add($a) }
 $cargoArgs.Add('-o'); $cargoArgs.Add($jniLibs)
+# cargo-ndk defaults to API 21, where libnativewindow/libandroid's newer symbols are missing
+# (`ld.lld: unable to find library -lnativewindow`). Match minSdk in app/build.gradle.kts.
+$cargoArgs.Add('--platform'); $cargoArgs.Add('29')
 $cargoArgs.Add('build')
 if ($Profile -eq 'release') { $cargoArgs.Add('--release') }
 # `--lib` because the package also has the desktop binary; `mobile` is the entry point + gui.

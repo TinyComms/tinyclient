@@ -111,7 +111,8 @@ cargo_args=(ndk)
 for abi in "${abis[@]}"; do
     cargo_args+=(-t "$abi")
 done
-cargo_args+=(-o "$jni_libs" build)
+# cargo-ndk defaults to API 21, where libnativewindow is missing. Match minSdk in app/build.gradle.kts.
+cargo_args+=(-o "$jni_libs" --platform 29 build)
 [ "$profile" = "release" ] && cargo_args+=(--release)
 # `--lib` because the package also has the desktop binary; `mobile` is the entry point + gui.
 cargo_args+=(-p tinyclient --lib --features mobile)
