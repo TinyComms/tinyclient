@@ -34,7 +34,13 @@ pub(crate) const APPLIED_KEPT: usize = 32;
 /// What every leaf of ours says it supports: this ciphersuite, basic credentials, and the last-resort
 /// key package extension (a key package that carries an extension must list it).
 pub(crate) fn capabilities() -> mls::Capabilities {
-    mls::Capabilities::new(None, Some(&[CIPHERSUITE]), Some(&[mls::ExtensionType::LastResort]), None, Some(&[mls::CredentialType::Basic]))
+    mls::Capabilities::new(
+        None,
+        Some(&[CIPHERSUITE]),
+        Some(&[mls::ExtensionType::LastResort]),
+        None,
+        Some(&[mls::CredentialType::Basic]),
+    )
 }
 
 /// Tunables, with the values the protocol was designed with. Not persisted; set them after
@@ -54,7 +60,12 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Config {
-        Config { max_past_epochs: 4, out_of_order_tolerance: 64, maximum_forward_distance: 2000, padding: 128 }
+        Config {
+            max_past_epochs: 4,
+            out_of_order_tolerance: 64,
+            maximum_forward_distance: 2000,
+            padding: 128,
+        }
     }
 }
 
@@ -116,7 +127,10 @@ pub struct Engine {
 
 impl std::fmt::Debug for Engine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Engine").field("user", &self.identity.user).field("device", &self.identity.device).finish_non_exhaustive()
+        f.debug_struct("Engine")
+            .field("user", &self.identity.user)
+            .field("device", &self.identity.device)
+            .finish_non_exhaustive()
     }
 }
 
@@ -143,12 +157,21 @@ impl Engine {
 
     /// A new device for `user` that writes its state to `store` under `name` (a plain file
     /// name), sealed with `key`. Fails if `store` already holds state under `name`: open it.
-    pub fn create(user: UserId, store: Box<dyn Store + Send>, key: StateKey, name: &str) -> Result<Engine> {
+    pub fn create(
+        user: UserId,
+        store: Box<dyn Store + Send>,
+        key: StateKey,
+        name: &str,
+    ) -> Result<Engine> {
         if store.load(name)?.is_some() {
             return Err(Error::Storage("state already exists".into()));
         }
         let mut engine = Engine::detached(user)?;
-        engine.persistence = Some(Persistence { store, key, name: name.to_owned() });
+        engine.persistence = Some(Persistence {
+            store,
+            key,
+            name: name.to_owned(),
+        });
         engine.persist(true)?;
         Ok(engine)
     }
@@ -160,7 +183,11 @@ impl Engine {
             return Ok(None);
         };
         let mut engine = Engine::from_snapshot(&key, name, &blob)?;
-        engine.persistence = Some(Persistence { store, key, name: name.to_owned() });
+        engine.persistence = Some(Persistence {
+            store,
+            key,
+            name: name.to_owned(),
+        });
         Ok(Some(engine))
     }
 
@@ -172,14 +199,23 @@ impl Engine {
 
     pub fn from_snapshot(key: &StateKey, name: &str, blob: &[u8]) -> Result<Engine> {
         let plain = open_state(key, name, blob)?;
-        let snapshot: Snapshot = serde_json::from_slice(&plain).map_err(|_| Error::Malformed("state"))?;
+        let snapshot: Snapshot =
+            serde_json::from_slice(&plain).map_err(|_| Error::Malformed("state"))?;
         if snapshot.version != SNAPSHOT_VERSION {
             return Err(Error::UnsupportedVersion);
         }
         let signing = DeviceKey::from_bytes(&snapshot.signing_key)?;
-        let entries = snapshot.storage.into_iter().map(|(key, value)| (key.0, value.0)).collect();
+        let entries = snapshot
+            .storage
+            .into_iter()
+            .map(|(key, value)| (key.0, value.0))
+            .collect();
         Ok(Engine {
-            identity: DeviceIdentity { user: snapshot.user, device: snapshot.device, key: signing },
+            identity: DeviceIdentity {
+                user: snapshot.user,
+                device: snapshot.device,
+                key: signing,
+            },
             trust: snapshot.trust,
             provider: TinyProvider::from_entries(entries),
             meta: snapshot.meta,
@@ -199,9 +235,16 @@ impl Engine {
             signing_key: Bytes(self.identity.key.secret_bytes().to_vec()),
             trust: self.trust.clone(),
             meta: self.meta.clone(),
-            storage: self.provider.entries().into_iter().map(|(key, value)| (Bytes(key), Bytes(value))).collect(),
+            storage: self
+                .provider
+                .entries()
+                .into_iter()
+                .map(|(key, value)| (Bytes(key), Bytes(value)))
+                .collect(),
         };
-        serde_json::to_vec(&snapshot).map(Zeroizing::new).map_err(|_| Error::Malformed("state"))
+        serde_json::to_vec(&snapshot)
+            .map(Zeroizing::new)
+            .map_err(|_| Error::Malformed("state"))
     }
 
     /// Writes the state if anything changed since the last write; returns the last failure of a
@@ -231,7 +274,8 @@ impl Engine {
         }
         let plain = self.snapshot_plain()?;
         let result = match &self.persistence {
-            Some(persistence) => seal_state(&persistence.key, &persistence.name, &plain).and_then(|blob| persistence.store.save(&persistence.name, &blob)),
+            Some(persistence) => seal_state(&persistence.key, &persistence.name, &plain)
+                .and_then(|blob| persistence.store.save(&persistence.name, &blob)),
             None => Ok(()),
         };
         match result {
@@ -281,7 +325,11 @@ impl Engine {
     /// Verifies the server's device list for `user` and records the result (see
     /// [`Trust::verify_list`]). Call it for every member whenever the server says their devices
     /// changed (`e2ee.device`) and before a conversation is joined or committed to.
-    pub fn verify_devices(&mut self, user: UserId, list: &[crate::identity::DeviceRecord]) -> Result<crate::identity::ChainReport> {
+    pub fn verify_devices(
+        &mut self,
+        user: UserId,
+        list: &[crate::identity::DeviceRecord],
+    ) -> Result<crate::identity::ChainReport> {
         let report = self.trust.verify_list(user, list)?;
         self.persist(true)?;
         Ok(report)
@@ -327,11 +375,23 @@ impl Engine {
     }
 
     fn build_key_package(&mut self, last_resort: bool) -> Result<Vec<u8>> {
-        let mut builder = mls::KeyPackage::builder().key_package_lifetime(mls::Lifetime::new(KEY_PACKAGE_LIFETIME)).leaf_node_capabilities(capabilities());
+        let mut builder = mls::KeyPackage::builder()
+            .key_package_lifetime(mls::Lifetime::new(KEY_PACKAGE_LIFETIME))
+            .leaf_node_capabilities(capabilities());
         if last_resort {
             builder = builder.mark_as_last_resort();
         }
-        let bundle = builder.build(CIPHERSUITE, &self.provider, &self.identity.key, self.credential()).map_err(Error::mls)?;
-        bundle.key_package().tls_serialize_detached().map_err(Error::mls)
+        let bundle = builder
+            .build(
+                CIPHERSUITE,
+                &self.provider,
+                &self.identity.key,
+                self.credential(),
+            )
+            .map_err(Error::mls)?;
+        bundle
+            .key_package()
+            .tls_serialize_detached()
+            .map_err(Error::mls)
     }
 }

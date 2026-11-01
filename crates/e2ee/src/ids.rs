@@ -99,7 +99,11 @@ fn parse_uuid(text: &str) -> Option<[u8; 16]> {
         return None;
     }
     // Hyphens only where a UUID has them.
-    if text.len() == 36 && [8, 13, 18, 23].iter().any(|at| text.as_bytes()[*at] != b'-') {
+    if text.len() == 36
+        && [8, 13, 18, 23]
+            .iter()
+            .any(|at| text.as_bytes()[*at] != b'-')
+    {
         return None;
     }
     if text.len() != 36 && text.len() != 32 {
@@ -142,5 +146,8 @@ pub fn parse_credential(bytes: &[u8]) -> Result<(UserId, DeviceId)> {
     if bytes.len() != CREDENTIAL_LEN {
         return Err(Error::Malformed("credential"));
     }
-    Ok((UserId::from_slice(&bytes[..16])?, DeviceId::from_slice(&bytes[16..])?))
+    Ok((
+        UserId::from_slice(&bytes[..16])?,
+        DeviceId::from_slice(&bytes[16..])?,
+    ))
 }

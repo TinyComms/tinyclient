@@ -32,8 +32,15 @@ impl OpenMlsProvider for TinyProvider {
 impl TinyProvider {
     /// The storage's entries, sorted so that two snapshots of one state are the same bytes.
     pub(crate) fn entries(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
-        let values = self.storage.values.read().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut entries: Vec<(Vec<u8>, Vec<u8>)> = values.iter().map(|(key, value)| (key.clone(), value.clone())).collect();
+        let values = self
+            .storage
+            .values
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut entries: Vec<(Vec<u8>, Vec<u8>)> = values
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
         entries.sort();
         entries
     }
@@ -41,7 +48,11 @@ impl TinyProvider {
     pub(crate) fn from_entries(entries: Vec<(Vec<u8>, Vec<u8>)>) -> TinyProvider {
         let provider = TinyProvider::default();
         {
-            let mut values = provider.storage.values.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut values = provider
+                .storage
+                .values
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             values.extend(entries);
         }
         provider

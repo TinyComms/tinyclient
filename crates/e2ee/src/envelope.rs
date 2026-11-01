@@ -115,7 +115,11 @@ fn decode_b32(text: &str, what: &'static str) -> Result<[u8; 32]> {
 
 impl Envelope {
     pub fn message(text: impl Into<String>) -> Envelope {
-        Envelope { text: text.into(), sent_at: None, ..Envelope::default() }
+        Envelope {
+            text: text.into(),
+            sent_at: None,
+            ..Envelope::default()
+        }
     }
 
     /// Encodes for `kind`. An edit carries `v`, `text` and `attachments` only.
@@ -127,7 +131,10 @@ impl Envelope {
             .attachments
             .iter()
             .map(|attachment| {
-                if attachment.id.len() > MAX_ID || attachment.name.len() > MAX_NAME || attachment.mime.len() > MAX_MIME {
+                if attachment.id.len() > MAX_ID
+                    || attachment.name.len() > MAX_NAME
+                    || attachment.mime.len() > MAX_MIME
+                {
                     return Err(Error::TooLarge("attachment field"));
                 }
                 Ok(WireAttachment {
@@ -145,9 +152,17 @@ impl Envelope {
         let wire = Wire {
             v: VERSION,
             text: self.text.clone(),
-            reply_to: if kind == Kind::Message { self.reply_to.clone() } else { None },
+            reply_to: if kind == Kind::Message {
+                self.reply_to.clone()
+            } else {
+                None
+            },
             attachments,
-            sent_at: if kind == Kind::Message { self.sent_at } else { None },
+            sent_at: if kind == Kind::Message {
+                self.sent_at
+            } else {
+                None
+            },
         };
         let bytes = serde_json::to_vec(&wire).map_err(|_| Error::Malformed("envelope"))?;
         if bytes.len() > MAX_ENVELOPE_BYTES {
@@ -177,7 +192,11 @@ impl Envelope {
             .attachments
             .into_iter()
             .map(|attachment| {
-                if attachment.id.is_empty() || attachment.id.len() > MAX_ID || attachment.name.len() > MAX_NAME || attachment.mime.len() > MAX_MIME {
+                if attachment.id.is_empty()
+                    || attachment.id.len() > MAX_ID
+                    || attachment.name.len() > MAX_NAME
+                    || attachment.mime.len() > MAX_MIME
+                {
                     return Err(Error::Malformed("attachment"));
                 }
                 Ok(AttachmentRef {
@@ -196,6 +215,11 @@ impl Envelope {
             Kind::Message => (wire.reply_to, wire.sent_at),
             Kind::Edit => (None, None),
         };
-        Ok(Envelope { text: wire.text, reply_to, attachments, sent_at })
+        Ok(Envelope {
+            text: wire.text,
+            reply_to,
+            attachments,
+            sent_at,
+        })
     }
 }

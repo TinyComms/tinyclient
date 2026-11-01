@@ -85,21 +85,39 @@ impl Engine {
     /// proposal is pending (commit them first: [`Engine::commit_pending`]), and while a commit of
     /// ours waits for the server. The state is written before the ciphertext is returned, so a
     /// crash cannot make this device use one message key twice.
-    pub fn encrypt(&mut self, conv: ConversationId, kind: Kind, target_id: Option<&str>, envelope: &Envelope) -> Result<Sealed> {
+    pub fn encrypt(
+        &mut self,
+        conv: ConversationId,
+        kind: Kind,
+        target_id: Option<&str>,
+        envelope: &Envelope,
+    ) -> Result<Sealed> {
         if (kind == Kind::Edit) != target_id.is_some() {
             return Err(Error::Malformed("edit target"));
         }
         self.usable(conv)?;
         self.load_group(conv)?;
-        let Engine { groups, provider, identity, meta, .. } = self;
+        let Engine {
+            groups,
+            provider,
+            identity,
+            meta,
+            ..
+        } = self;
         let group = groups.get_mut(&conv).ok_or(Error::NoGroup)?;
-        if meta.get(&conv).is_some_and(|entry| entry.self_removal_pending) {
+        if meta
+            .get(&conv)
+            .is_some_and(|entry| entry.self_removal_pending)
+        {
             return Err(Error::PendingRemove);
         }
         if group.pending_commit().is_some() {
             return Err(Error::CommitInFlight);
         }
-        if group.pending_proposals().any(|queued| matches!(queued.proposal(), mls::Proposal::Remove(_))) {
+        if group
+            .pending_proposals()
+            .any(|queued| matches!(queued.proposal(), mls::Proposal::Remove(_)))
+        {
             return Err(Error::PendingRemove);
         }
         if group.has_pending_proposals() {
@@ -107,7 +125,9 @@ impl Engine {
         }
         let plaintext = Zeroizing::new(envelope.encode(kind)?);
         group.set_aad(aad(kind, target_id));
-        let message = group.create_message(&*provider, &identity.key, &plaintext).map_err(Error::mls);
+        let message = group
+            .create_message(&*provider, &identity.key, &plaintext)
+            .map_err(Error::mls);
         let epoch = group.epoch().as_u64();
         let message = match message {
             Ok(message) => message,
@@ -132,20 +152,39 @@ impl Engine {
     ///
     /// A message this device sent cannot be opened by it (MLS does not allow it): keep the
     /// plaintext when you send.
-    pub fn decrypt(&mut self, conv: ConversationId, ciphertext: &[u8], claimed: &Claimed<'_>) -> Result<Incoming> {
+    pub fn decrypt(
+        &mut self,
+        conv: ConversationId,
+        ciphertext: &[u8],
+        claimed: &Claimed<'_>,
+    ) -> Result<Incoming> {
         self.usable(conv)?;
         self.load_group(conv)?;
-        let message = guard(|| mls::MlsMessageIn::tls_deserialize_exact(ciphertext))?.map_err(|_| Error::Malformed("ciphertext"))?;
-        let protocol = message.try_into_protocol_message().map_err(|_| Error::Malformed("ciphertext"))?;
-        if protocol.group_id().as_slice() != conv.0 || protocol.wire_format() != mls::WireFormat::PrivateMessage || protocol.content_type() != mls::ContentType::Application {
+        let message = guard(|| mls::MlsMessageIn::tls_deserialize_exact(ciphertext))?
+            .map_err(|_| Error::Malformed("ciphertext"))?;
+        let protocol = message
+            .try_into_protocol_message()
+            .map_err(|_| Error::Malformed("ciphertext"))?;
+        if protocol.group_id().as_slice() != conv.0
+            || protocol.wire_format() != mls::WireFormat::PrivateMessage
+            || protocol.content_type() != mls::ContentType::Application
+        {
             return Err(Error::Malformed("ciphertext"));
         }
         let epoch = protocol.epoch().as_u64();
-        let Engine { groups, provider, trust, .. } = self;
+        let Engine {
+            groups,
+            provider,
+            trust,
+            ..
+        } = self;
         let group = groups.get_mut(&conv).ok_or(Error::NoGroup)?;
         let local = group.epoch().as_u64();
         if epoch > local {
-            return Err(Error::FutureEpoch { message: epoch, local });
+            return Err(Error::FutureEpoch {
+                message: epoch,
+                local,
+            });
         }
         let processed = match guard(|| group.process_message(&*provider, protocol)) {
             Ok(Ok(processed)) => processed,
@@ -161,23 +200,39 @@ impl Engine {
         };
         let member = group.member_at(leaf).ok_or(Error::SenderMismatch)?;
         let sender = {
-            let (user, device) = crate::ids::parse_credential(member.credential.serialized_content())?;
-            DeviceRef { user, device, signature_key: member.signature_key.clone() }
+            let (user, device) =
+                crate::ids::parse_credential(member.credential.serialized_content())?;
+            DeviceRef {
+                user,
+                device,
+                signature_key: member.signature_key.clone(),
+            }
         };
-        if claimed.author.is_some_and(|author| author != sender.user) || claimed.device.is_some_and(|device| device != sender.device) {
+        if claimed.author.is_some_and(|author| author != sender.user)
+            || claimed.device.is_some_and(|device| device != sender.device)
+        {
             return Err(Error::SenderMismatch);
         }
         if processed.aad() != aad(claimed.kind, claimed.target_id).as_slice() {
             return Err(Error::AadMismatch);
         }
-        let mls::ProcessedMessageContent::ApplicationMessage(application) = processed.into_content() else {
+        let mls::ProcessedMessageContent::ApplicationMessage(application) =
+            processed.into_content()
+        else {
             return Err(Error::Malformed("ciphertext"));
         };
         let plaintext = Zeroizing::new(application.into_bytes());
         let envelope = Envelope::decode(claimed.kind, &plaintext)?;
         let sender_trusted = trust.is_trusted(sender.user, sender.device, &sender.signature_key);
         self.persist(false)?;
-        Ok(Incoming { sender, sender_trusted, epoch, kind: claimed.kind, target_id: claimed.target_id.map(str::to_owned), envelope })
+        Ok(Incoming {
+            sender,
+            sender_trusted,
+            epoch,
+            kind: claimed.kind,
+            target_id: claimed.target_id.map(str::to_owned),
+            envelope,
+        })
     }
 
     /// The safety number between this person and `other`, over the devices each is trusted to
@@ -194,7 +249,11 @@ impl Engine {
 
     /// Like [`Engine::safety_number`], from the devices that are in the conversation's group
     /// instead of the trust lists.
-    pub fn safety_number_in_group(&mut self, conv: ConversationId, other: UserId) -> Result<crate::safety::SafetyNumber> {
+    pub fn safety_number_in_group(
+        &mut self,
+        conv: ConversationId,
+        other: UserId,
+    ) -> Result<crate::safety::SafetyNumber> {
         let roster = self.roster(conv)?;
         crate::safety::safety_number(self.identity.user, &roster, other, &roster)
     }

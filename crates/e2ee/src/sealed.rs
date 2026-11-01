@@ -20,7 +20,9 @@ const TAG_LEN: usize = 16;
 
 fn cipher(key: &[u8; 32], label: &[u8], salt: &[u8]) -> Result<Aes256Gcm> {
     let mut sub = Zeroizing::new([0u8; 32]);
-    Hkdf::<Sha256>::new(Some(salt), key).expand(label, &mut *sub).map_err(|_| Error::Authentication)?;
+    Hkdf::<Sha256>::new(Some(salt), key)
+        .expand(label, &mut *sub)
+        .map_err(|_| Error::Authentication)?;
     Ok(Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&*sub)))
 }
 
@@ -30,7 +32,13 @@ pub(crate) fn seal(key: &[u8; 32], label: &[u8], aad: &[u8], plaintext: &[u8]) -
     getrandom::fill(&mut salt).map_err(|_| Error::Random)?;
     getrandom::fill(&mut nonce).map_err(|_| Error::Random)?;
     let sealed = cipher(key, label, &salt)?
-        .encrypt(Nonce::from_slice(&nonce), Payload { msg: plaintext, aad })
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
         .map_err(|_| Error::Authentication)?;
     let mut out = Vec::with_capacity(1 + SALT_LEN + NONCE_LEN + sealed.len());
     out.push(VERSION);
@@ -40,7 +48,12 @@ pub(crate) fn seal(key: &[u8; 32], label: &[u8], aad: &[u8], plaintext: &[u8]) -
     Ok(out)
 }
 
-pub(crate) fn open(key: &[u8; 32], label: &[u8], aad: &[u8], blob: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+pub(crate) fn open(
+    key: &[u8; 32],
+    label: &[u8],
+    aad: &[u8],
+    blob: &[u8],
+) -> Result<Zeroizing<Vec<u8>>> {
     if blob.len() < 1 + SALT_LEN + NONCE_LEN + TAG_LEN {
         return Err(Error::Malformed("sealed blob"));
     }

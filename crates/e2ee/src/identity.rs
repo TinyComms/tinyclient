@@ -9,10 +9,10 @@
 
 use crate::error::{Error, Result};
 use crate::ids::{credential_bytes, DeviceId, DeviceRef, UserId};
+use crate::wire::Bytes;
 use p256::ecdsa::signature::{Signer as _, Verifier as _};
 use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
-use crate::wire::Bytes;
 use std::collections::{BTreeMap, BTreeSet};
 use zeroize::Zeroizing;
 
@@ -40,7 +40,9 @@ impl DeviceKey {
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<DeviceKey> {
-        SigningKey::from_slice(bytes).map(DeviceKey).map_err(|_| Error::Malformed("signing key"))
+        SigningKey::from_slice(bytes)
+            .map(DeviceKey)
+            .map_err(|_| Error::Malformed("signing key"))
     }
 
     pub(crate) fn secret_bytes(&self) -> Zeroizing<Vec<u8>> {
@@ -49,7 +51,11 @@ impl DeviceKey {
 
     /// The public key, uncompressed (65 bytes).
     pub fn public_key(&self) -> Vec<u8> {
-        self.0.verifying_key().to_encoded_point(false).as_bytes().to_vec()
+        self.0
+            .verifying_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec()
     }
 
     /// ECDSA P-256/SHA-256 over `message`, DER encoded (as MLS encodes its signatures).
@@ -60,7 +66,10 @@ impl DeviceKey {
 }
 
 impl openmls_traits::signatures::Signer for DeviceKey {
-    fn sign(&self, payload: &[u8]) -> std::result::Result<Vec<u8>, openmls_traits::signatures::SignerError> {
+    fn sign(
+        &self,
+        payload: &[u8],
+    ) -> std::result::Result<Vec<u8>, openmls_traits::signatures::SignerError> {
         Ok(DeviceKey::sign(self, payload))
     }
 
@@ -86,7 +95,11 @@ pub struct DeviceIdentity {
 impl DeviceIdentity {
     /// A new device for `user`, with a random device id and a fresh key.
     pub fn generate(user: UserId) -> Result<DeviceIdentity> {
-        Ok(DeviceIdentity { user, device: DeviceId::random()?, key: DeviceKey::generate()? })
+        Ok(DeviceIdentity {
+            user,
+            device: DeviceId::random()?,
+            key: DeviceKey::generate()?,
+        })
     }
 
     pub fn credential(&self) -> [u8; 32] {
@@ -94,7 +107,11 @@ impl DeviceIdentity {
     }
 
     pub fn device_ref(&self) -> DeviceRef {
-        DeviceRef { user: self.user, device: self.device, signature_key: self.key.public_key() }
+        DeviceRef {
+            user: self.user,
+            device: self.device,
+            signature_key: self.key.public_key(),
+        }
     }
 
     /// Approves a new device of the same person: signs its id and key. The result goes in
@@ -102,7 +119,11 @@ impl DeviceIdentity {
     /// pairing flow the app has. Only a device that is itself trusted should be asked to.
     pub fn cross_sign(&self, new_device: DeviceId, new_signature_key: &[u8]) -> Result<Vec<u8>> {
         check_key(new_signature_key)?;
-        Ok(self.key.sign(&cross_signature_message(self.user, new_device, new_signature_key)))
+        Ok(self.key.sign(&cross_signature_message(
+            self.user,
+            new_device,
+            new_signature_key,
+        )))
     }
 }
 
@@ -125,7 +146,13 @@ fn check_key(key: &[u8]) -> Result<VerifyingKey> {
 
 /// Checks that `signer_key` signed the addition of `device` with `signature_key` to `user`'s
 /// devices. The signature is DER, or the 64 byte `r || s` form; both are accepted.
-pub fn verify_cross_signature(signer_key: &[u8], user: UserId, device: DeviceId, signature_key: &[u8], signature: &[u8]) -> Result<()> {
+pub fn verify_cross_signature(
+    signer_key: &[u8],
+    user: UserId,
+    device: DeviceId,
+    signature_key: &[u8],
+    signature: &[u8],
+) -> Result<()> {
     let signer = check_key(signer_key)?;
     check_key(signature_key)?;
     let signature = match signature.len() {
@@ -134,7 +161,12 @@ pub fn verify_cross_signature(signer_key: &[u8], user: UserId, device: DeviceId,
         _ => return Err(Error::Malformed("signature")),
     }
     .map_err(|_| Error::Malformed("signature"))?;
-    signer.verify(&cross_signature_message(user, device, signature_key), &signature).map_err(|_| Error::BadSignature)
+    signer
+        .verify(
+            &cross_signature_message(user, device, signature_key),
+            &signature,
+        )
+        .map_err(|_| Error::BadSignature)
 }
 
 /// One entry of `GET /v1/e2ee/users/{id}/devices`.
@@ -198,14 +230,27 @@ impl Trust {
 
     /// True when `user`'s device `device` is trusted with exactly this key.
     pub fn is_trusted(&self, user: UserId, device: DeviceId, signature_key: &[u8]) -> bool {
-        self.users.get(&user).and_then(|trust| trust.devices.get(&device)).is_some_and(|key| key[..] == *signature_key)
+        self.users
+            .get(&user)
+            .and_then(|trust| trust.devices.get(&device))
+            .is_some_and(|key| key[..] == *signature_key)
     }
 
     /// The trusted devices of `user`, in id order.
     pub fn devices(&self, user: UserId) -> Vec<DeviceRef> {
         self.users
             .get(&user)
-            .map(|trust| trust.devices.iter().map(|(device, key)| DeviceRef { user, device: *device, signature_key: key.0.clone() }).collect())
+            .map(|trust| {
+                trust
+                    .devices
+                    .iter()
+                    .map(|(device, key)| DeviceRef {
+                        user,
+                        device: *device,
+                        signature_key: key.0.clone(),
+                    })
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -235,7 +280,11 @@ impl Trust {
     /// never trusted, so an Add for it is refused too.
     pub fn verify_list(&mut self, user: UserId, list: &[DeviceRecord]) -> Result<ChainReport> {
         let entry = self.users.get(&user).cloned().unwrap_or_default();
-        let before: BTreeMap<DeviceId, Vec<u8>> = entry.devices.iter().map(|(device, key)| (*device, key.0.clone())).collect();
+        let before: BTreeMap<DeviceId, Vec<u8>> = entry
+            .devices
+            .iter()
+            .map(|(device, key)| (*device, key.0.clone()))
+            .collect();
         let mut accepted: BTreeMap<DeviceId, Vec<u8>> = BTreeMap::new();
         let mut rejected: Vec<(DeviceId, Rejection)> = Vec::new();
         let mut seen = BTreeSet::new();
@@ -278,10 +327,16 @@ impl Trust {
             let mut still = Vec::new();
             for record in std::mem::take(&mut pending) {
                 let signed = record.cross_signature.as_deref().is_some_and(|signature| {
-                    before
-                        .iter()
-                        .chain(accepted.iter())
-                        .any(|(_, signer)| verify_cross_signature(signer, user, record.device_id, &record.signature_key, signature).is_ok())
+                    before.iter().chain(accepted.iter()).any(|(_, signer)| {
+                        verify_cross_signature(
+                            signer,
+                            user,
+                            record.device_id,
+                            &record.signature_key,
+                            signature,
+                        )
+                        .is_ok()
+                    })
                 });
                 if signed {
                     accepted.insert(record.device_id, record.signature_key.clone());
@@ -303,12 +358,36 @@ impl Trust {
             return Err(Error::IdentityChanged);
         }
 
-        let added: Vec<DeviceId> = accepted.keys().filter(|device| !before.contains_key(device)).copied().collect();
-        let removed: Vec<DeviceId> = before.keys().filter(|device| !accepted.contains_key(device)).copied().collect();
-        let trusted = accepted.iter().map(|(device, key)| DeviceRef { user, device: *device, signature_key: key.clone() }).collect();
+        let added: Vec<DeviceId> = accepted
+            .keys()
+            .filter(|device| !before.contains_key(device))
+            .copied()
+            .collect();
+        let removed: Vec<DeviceId> = before
+            .keys()
+            .filter(|device| !accepted.contains_key(device))
+            .copied()
+            .collect();
+        let trusted = accepted
+            .iter()
+            .map(|(device, key)| DeviceRef {
+                user,
+                device: *device,
+                signature_key: key.clone(),
+            })
+            .collect();
         let pinned = entry.pinned || !accepted.is_empty();
-        let devices = accepted.iter().map(|(device, key)| (*device, Bytes(key.clone()))).collect();
+        let devices = accepted
+            .iter()
+            .map(|(device, key)| (*device, Bytes(key.clone())))
+            .collect();
         self.users.insert(user, UserTrust { pinned, devices });
-        Ok(ChainReport { trusted, rejected, added, removed, first_contact })
+        Ok(ChainReport {
+            trusted,
+            rejected,
+            added,
+            removed,
+            first_contact,
+        })
     }
 }

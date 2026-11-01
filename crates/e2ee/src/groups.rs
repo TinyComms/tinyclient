@@ -125,13 +125,21 @@ pub struct JoinOutcome {
 
 pub(crate) fn parse_server_key(bytes: &[u8]) -> Result<(Vec<u8>, mls::ExternalSender)> {
     let (key, sender) = if bytes.len() == SIGNATURE_KEY_LEN && bytes[0] == 0x04 {
-        let credential = mls::Credential::from(mls::BasicCredential::new(SERVER_CREDENTIAL.to_vec()));
-        (bytes.to_vec(), mls::ExternalSender::new(mls::SignaturePublicKey::from(bytes.to_vec()), credential))
+        let credential =
+            mls::Credential::from(mls::BasicCredential::new(SERVER_CREDENTIAL.to_vec()));
+        (
+            bytes.to_vec(),
+            mls::ExternalSender::new(mls::SignaturePublicKey::from(bytes.to_vec()), credential),
+        )
     } else {
-        let sender = guard(|| mls::ExternalSender::tls_deserialize_exact(bytes))?.map_err(|_| Error::Malformed("external sender"))?;
+        let sender = guard(|| mls::ExternalSender::tls_deserialize_exact(bytes))?
+            .map_err(|_| Error::Malformed("external sender"))?;
         (external_sender_key(&sender)?, sender)
     };
-    if key.len() != SIGNATURE_KEY_LEN || key[0] != 0x04 || VerifyingKey::from_sec1_bytes(&key).is_err() {
+    if key.len() != SIGNATURE_KEY_LEN
+        || key[0] != 0x04
+        || VerifyingKey::from_sec1_bytes(&key).is_err()
+    {
         return Err(Error::Malformed("external sender key"));
     }
     Ok((key, sender))
@@ -145,7 +153,9 @@ fn external_sender_key(sender: &mls::ExternalSender) -> Result<Vec<u8>> {
 }
 
 fn group_server_key(group_extensions: &mls::Extensions<mls::GroupContext>) -> Result<Vec<u8>> {
-    let senders = group_extensions.external_senders().ok_or(Error::Malformed("group without an external sender"))?;
+    let senders = group_extensions
+        .external_senders()
+        .ok_or(Error::Malformed("group without an external sender"))?;
     match senders.as_slice() {
         [only] => external_sender_key(only),
         _ => Err(Error::Malformed("group with more than one external sender")),
@@ -157,7 +167,11 @@ fn device_of_credential(credential: &mls::Credential, signature_key: &[u8]) -> R
         return Err(Error::Malformed("credential type"));
     }
     let (user, device) = parse_credential(credential.serialized_content())?;
-    Ok(DeviceRef { user, device, signature_key: signature_key.to_vec() })
+    Ok(DeviceRef {
+        user,
+        device,
+        signature_key: signature_key.to_vec(),
+    })
 }
 
 fn device_of_member(member: &mls::Member) -> Result<DeviceRef> {
@@ -184,7 +198,11 @@ fn parse_proposal_messages(data: &[u8]) -> Result<Vec<mls::MlsMessageIn>> {
                 Some((0 | 1, rest)) => Vec::<mls::MlsMessageIn>::tls_deserialize_exact(rest).ok(),
                 _ => None,
             })
-            .or_else(|| mls::MlsMessageIn::tls_deserialize_exact(data).ok().map(|message| vec![message]))
+            .or_else(|| {
+                mls::MlsMessageIn::tls_deserialize_exact(data)
+                    .ok()
+                    .map(|message| vec![message])
+            })
     })?
     .ok_or(Error::Malformed("proposals"))?;
     if messages.len() > MAX_PROPOSALS {
@@ -193,14 +211,20 @@ fn parse_proposal_messages(data: &[u8]) -> Result<Vec<mls::MlsMessageIn>> {
     Ok(messages)
 }
 
-fn create_config(config: &Config, extensions: mls::Extensions<mls::GroupContext>) -> mls::MlsGroupCreateConfig {
+fn create_config(
+    config: &Config,
+    extensions: mls::Extensions<mls::GroupContext>,
+) -> mls::MlsGroupCreateConfig {
     mls::MlsGroupCreateConfig::builder()
         .ciphersuite(CIPHERSUITE)
         .wire_format_policy(mls::PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
         .use_ratchet_tree_extension(true)
         .max_past_epochs(config.max_past_epochs)
         .padding_size(config.padding)
-        .sender_ratchet_configuration(mls::SenderRatchetConfiguration::new(config.out_of_order_tolerance, config.maximum_forward_distance))
+        .sender_ratchet_configuration(mls::SenderRatchetConfiguration::new(
+            config.out_of_order_tolerance,
+            config.maximum_forward_distance,
+        ))
         .lifetime(mls::Lifetime::new(LEAF_LIFETIME))
         .capabilities(capabilities())
         .with_group_context_extensions(extensions)
@@ -213,7 +237,10 @@ fn join_config(config: &Config) -> mls::MlsGroupJoinConfig {
         .use_ratchet_tree_extension(true)
         .max_past_epochs(config.max_past_epochs)
         .padding_size(config.padding)
-        .sender_ratchet_configuration(mls::SenderRatchetConfiguration::new(config.out_of_order_tolerance, config.maximum_forward_distance))
+        .sender_ratchet_configuration(mls::SenderRatchetConfiguration::new(
+            config.out_of_order_tolerance,
+            config.maximum_forward_distance,
+        ))
         .build()
 }
 
@@ -245,7 +272,9 @@ impl Engine {
         if self.groups.contains_key(&conv) {
             return Ok(());
         }
-        let group = mls::MlsGroup::load(self.provider.storage(), &group_id(conv)).map_err(Error::mls)?.ok_or(Error::NoGroup)?;
+        let group = mls::MlsGroup::load(self.provider.storage(), &group_id(conv))
+            .map_err(Error::mls)?
+            .ok_or(Error::NoGroup)?;
         self.groups.insert(conv, group);
         Ok(())
     }
@@ -265,7 +294,12 @@ impl Engine {
     /// The group's epoch.
     pub fn epoch(&mut self, conv: ConversationId) -> Result<u64> {
         self.load_group(conv)?;
-        Ok(self.groups.get(&conv).ok_or(Error::NoGroup)?.epoch().as_u64())
+        Ok(self
+            .groups
+            .get(&conv)
+            .ok_or(Error::NoGroup)?
+            .epoch()
+            .as_u64())
     }
 
     /// Why the conversation's group is frozen, if it is. A frozen group does nothing further: it
@@ -288,13 +322,27 @@ impl Engine {
             return Err(Error::GroupExists);
         }
         let (key, sender) = parse_server_key(server_key)?;
-        let extensions = mls::Extensions::single(mls::Extension::ExternalSenders(vec![sender])).map_err(Error::mls)?;
+        let extensions = mls::Extensions::single(mls::Extension::ExternalSenders(vec![sender]))
+            .map_err(Error::mls)?;
         let config = create_config(&self.config, extensions);
         // A group of ours from before (we left it) is replaced.
         self.groups.remove(&conv);
-        let group = mls::MlsGroup::new_with_group_id(&self.provider, &self.identity.key, &config, group_id(conv), self.credential()).map_err(Error::mls)?;
+        let group = mls::MlsGroup::new_with_group_id(
+            &self.provider,
+            &self.identity.key,
+            &config,
+            group_id(conv),
+            self.credential(),
+        )
+        .map_err(Error::mls)?;
         self.groups.insert(conv, group);
-        self.meta.insert(conv, ConvMeta { server_key: key.into(), ..ConvMeta::default() });
+        self.meta.insert(
+            conv,
+            ConvMeta {
+                server_key: key.into(),
+                ..ConvMeta::default()
+            },
+        );
         self.persist(true)
     }
 
@@ -302,7 +350,9 @@ impl Engine {
     pub fn forget_conversation(&mut self, conv: ConversationId) -> Result<()> {
         if let Some(mut group) = self.groups.remove(&conv) {
             group.delete(self.provider.storage()).map_err(Error::mls)?;
-        } else if let Some(mut group) = mls::MlsGroup::load(self.provider.storage(), &group_id(conv)).map_err(Error::mls)? {
+        } else if let Some(mut group) =
+            mls::MlsGroup::load(self.provider.storage(), &group_id(conv)).map_err(Error::mls)?
+        {
             group.delete(self.provider.storage()).map_err(Error::mls)?;
         }
         self.meta.remove(&conv);
@@ -313,13 +363,25 @@ impl Engine {
     pub fn roster(&mut self, conv: ConversationId) -> Result<Vec<DeviceRef>> {
         self.load_group(conv)?;
         let group = self.groups.get(&conv).ok_or(Error::NoGroup)?;
-        group.members().map(|member| device_of_member(&member)).collect()
+        group
+            .members()
+            .map(|member| device_of_member(&member))
+            .collect()
     }
 
     /// What the server says the epoch is now: an epoch below ours means the server's database went
     /// back in time, and the group is frozen.
     pub fn observe_server_epoch(&mut self, conv: ConversationId, shown: u64) -> Result<()> {
-        let local = self.meta.get(&conv).ok_or(Error::NoGroup)?.high_epoch.max(if self.has_group(conv) { self.epoch(conv)? } else { 0 });
+        let local =
+            self.meta
+                .get(&conv)
+                .ok_or(Error::NoGroup)?
+                .high_epoch
+                .max(if self.has_group(conv) {
+                    self.epoch(conv)?
+                } else {
+                    0
+                });
         if shown < local {
             self.freeze(conv, "epoch went backwards");
             return Err(Error::EpochBackwards { local, shown });
@@ -358,7 +420,9 @@ impl Engine {
         let mut pending = Pending::default();
         for queued in group.pending_proposals() {
             match queued.proposal() {
-                mls::Proposal::Add(add) => pending.adds.push(device_of_key_package(add.key_package())?),
+                mls::Proposal::Add(add) => {
+                    pending.adds.push(device_of_key_package(add.key_package())?)
+                }
                 mls::Proposal::Remove(remove) => {
                     if let Some(member) = group.member_at(remove.removed()) {
                         pending.removes.push(device_of_member(&member)?);
@@ -377,24 +441,41 @@ impl Engine {
     /// credential is `user_id || device_id` of a device this client trusts (cross-signed, see
     /// [`Engine::verify_devices`]) with exactly the trusted signing key, or a Remove of a leaf in
     /// the roster. Accepted proposals are pending until [`Engine::commit_pending`].
-    pub fn handle_proposals(&mut self, conv: ConversationId, data: &[u8]) -> Result<ProposalOutcome> {
+    pub fn handle_proposals(
+        &mut self,
+        conv: ConversationId,
+        data: &[u8],
+    ) -> Result<ProposalOutcome> {
         self.usable(conv)?;
         self.load_group(conv)?;
         let messages = parse_proposal_messages(data)?;
         let mut outcome = ProposalOutcome::default();
-        let Engine { groups, provider, trust, meta, .. } = self;
+        let Engine {
+            groups,
+            provider,
+            trust,
+            meta,
+            ..
+        } = self;
         let group = groups.get_mut(&conv).ok_or(Error::NoGroup)?;
         let own_leaf = group.own_leaf_index();
         let local_epoch = group.epoch().as_u64();
         let mut changed = false;
         let mut discard = false;
         for message in messages {
-            let reject = |outcome: &mut ProposalOutcome, kind: Option<ProposalKind>, reason: RejectReason| outcome.rejected.push(Rejected { kind, reason });
+            let reject = |outcome: &mut ProposalOutcome,
+                          kind: Option<ProposalKind>,
+                          reason: RejectReason| {
+                outcome.rejected.push(Rejected { kind, reason })
+            };
             let Ok(protocol) = message.try_into_protocol_message() else {
                 reject(&mut outcome, None, RejectReason::Invalid);
                 continue;
             };
-            if protocol.group_id().as_slice() != conv.0 || protocol.wire_format() != mls::WireFormat::PublicMessage || protocol.content_type() != mls::ContentType::Proposal {
+            if protocol.group_id().as_slice() != conv.0
+                || protocol.wire_format() != mls::WireFormat::PublicMessage
+                || protocol.content_type() != mls::ContentType::Proposal
+            {
                 reject(&mut outcome, None, RejectReason::Invalid);
                 continue;
             }
@@ -404,7 +485,10 @@ impl Engine {
                 continue;
             }
             if epoch > local_epoch {
-                return Err(Error::FutureEpoch { message: epoch, local: local_epoch });
+                return Err(Error::FutureEpoch {
+                    message: epoch,
+                    local: local_epoch,
+                });
             }
             let processed = match guard(|| group.process_message(&*provider, protocol)) {
                 Ok(Ok(processed)) => processed,
@@ -423,7 +507,8 @@ impl Engine {
                 reject(&mut outcome, None, RejectReason::Invalid);
                 continue;
             }
-            let mls::ProcessedMessageContent::ProposalMessage(queued) = processed.into_content() else {
+            let mls::ProcessedMessageContent::ProposalMessage(queued) = processed.into_content()
+            else {
                 reject(&mut outcome, None, RejectReason::Invalid);
                 continue;
             };
@@ -443,7 +528,10 @@ impl Engine {
                     // Stored all the same: the commit that evicts this device refers to it.
                 }
             }
-            if group.pending_proposals().any(|pending| pending.proposal_reference_ref() == queued.proposal_reference_ref()) {
+            if group
+                .pending_proposals()
+                .any(|pending| pending.proposal_reference_ref() == queued.proposal_reference_ref())
+            {
                 outcome.already += 1;
                 continue;
             }
@@ -451,7 +539,9 @@ impl Engine {
                 reject(&mut outcome, Some(kind), RejectReason::TooMany);
                 continue;
             }
-            group.store_pending_proposal(provider.storage(), *queued).map_err(Error::mls)?;
+            group
+                .store_pending_proposal(provider.storage(), *queued)
+                .map_err(Error::mls)?;
             outcome.accepted.push(kind);
             changed = true;
         }
@@ -471,12 +561,21 @@ impl Engine {
     pub fn commit_pending(&mut self, conv: ConversationId) -> Result<Option<CommitBundle>> {
         self.usable(conv)?;
         self.load_group(conv)?;
-        let Engine { groups, provider, identity, meta, .. } = self;
+        let Engine {
+            groups,
+            provider,
+            identity,
+            meta,
+            ..
+        } = self;
         let group = groups.get_mut(&conv).ok_or(Error::NoGroup)?;
         if group.pending_commit().is_some() {
             return Err(Error::CommitInFlight);
         }
-        if meta.get(&conv).is_some_and(|entry| entry.self_removal_pending) {
+        if meta
+            .get(&conv)
+            .is_some_and(|entry| entry.self_removal_pending)
+        {
             return Err(Error::SelfRemoval);
         }
         if !group.has_pending_proposals() {
@@ -506,25 +605,46 @@ impl Engine {
             let staged = group.pending_commit().ok_or(Error::Malformed("commit"))?;
             changes_of(group, staged)?
         };
-        let welcome = welcome.map(|welcome| welcome.tls_serialize_detached().map_err(Error::mls)).transpose()?;
+        let welcome = welcome
+            .map(|welcome| welcome.tls_serialize_detached().map_err(Error::mls))
+            .transpose()?;
         let welcomes = match welcome {
-            Some(data) => added.iter().map(|device| WelcomeFor { device: device.clone(), data: data.clone() }).collect(),
+            Some(data) => added
+                .iter()
+                .map(|device| WelcomeFor {
+                    device: device.clone(),
+                    data: data.clone(),
+                })
+                .collect(),
             None => Vec::new(),
         };
         if let Some(entry) = meta.get_mut(&conv) {
             entry.pending_commit = Some(sha256(&commit).to_vec().into());
         }
         self.persist(true)?;
-        Ok(Some(CommitBundle { epoch, commit, welcomes, added, removed }))
+        Ok(Some(CommitBundle {
+            epoch,
+            commit,
+            welcomes,
+            added,
+            removed,
+        }))
     }
 
     /// The server accepted our commit (`204`): merge it. The epoch advances.
     pub fn confirm_commit(&mut self, conv: ConversationId) -> Result<CommitOutcome> {
         self.usable(conv)?;
         self.load_group(conv)?;
-        let Engine { groups, provider, meta, .. } = self;
+        let Engine {
+            groups,
+            provider,
+            meta,
+            ..
+        } = self;
         let group = groups.get_mut(&conv).ok_or(Error::NoGroup)?;
-        let staged = group.pending_commit().ok_or(Error::Malformed("no commit is in flight"))?;
+        let staged = group
+            .pending_commit()
+            .ok_or(Error::Malformed("no commit is in flight"))?;
         let (added, removed) = changes_of(group, staged)?;
         let before = group.epoch().as_u64();
         if let Err(error) = group.merge_pending_commit(&*provider) {
@@ -534,18 +654,36 @@ impl Engine {
         let epoch = group.epoch().as_u64();
         let entry = meta.get_mut(&conv).ok_or(Error::NoGroup)?;
         let hash = entry.pending_commit.take();
-        record_applied(entry, before, hash.map(|bytes| bytes.0).unwrap_or_default(), epoch);
+        record_applied(
+            entry,
+            before,
+            hash.map(|bytes| bytes.0).unwrap_or_default(),
+            epoch,
+        );
         self.persist(true)?;
-        Ok(CommitOutcome { epoch, added, removed, removed_self: false, duplicate: false })
+        Ok(CommitOutcome {
+            epoch,
+            added,
+            removed,
+            removed_self: false,
+            duplicate: false,
+        })
     }
 
     /// The server refused our commit (`409 stale_epoch`: another member's won). Our pending
     /// proposals stay; process the winning commit from the feed next.
     pub fn abort_commit(&mut self, conv: ConversationId) -> Result<()> {
         self.load_group(conv)?;
-        let Engine { groups, provider, meta, .. } = self;
+        let Engine {
+            groups,
+            provider,
+            meta,
+            ..
+        } = self;
         let group = groups.get_mut(&conv).ok_or(Error::NoGroup)?;
-        group.clear_pending_commit(provider.storage()).map_err(Error::mls)?;
+        group
+            .clear_pending_commit(provider.storage())
+            .map_err(Error::mls)?;
         if let Some(entry) = meta.get_mut(&conv) {
             entry.pending_commit = None;
         }
@@ -560,45 +698,90 @@ impl Engine {
     /// * The committer must be a member. Only Add and Remove proposals are allowed; every added
     ///   device must be one this client trusts ([`Error::UntrustedDevices`] says which to look up);
     ///   no member's credential or signing key may change; the external sender key may not change.
-    pub fn handle_commit(&mut self, conv: ConversationId, message_epoch: u64, data: &[u8]) -> Result<CommitOutcome> {
+    pub fn handle_commit(
+        &mut self,
+        conv: ConversationId,
+        message_epoch: u64,
+        data: &[u8],
+    ) -> Result<CommitOutcome> {
         if data.len() > MAX_HANDSHAKE_BYTES {
             return Err(Error::TooLarge("commit"));
         }
         self.usable(conv)?;
         self.load_group(conv)?;
         let hash = sha256(data);
-        let local = self.groups.get(&conv).ok_or(Error::NoGroup)?.epoch().as_u64();
+        let local = self
+            .groups
+            .get(&conv)
+            .ok_or(Error::NoGroup)?
+            .epoch()
+            .as_u64();
         let entry = self.meta.get(&conv).ok_or(Error::NoGroup)?;
-        if entry.pending_commit.as_ref().is_some_and(|pending| pending.0 == hash) && message_epoch == local {
+        if entry
+            .pending_commit
+            .as_ref()
+            .is_some_and(|pending| pending.0 == hash)
+            && message_epoch == local
+        {
             // Our own commit came back through the feed: the server took it.
             return self.confirm_commit(conv);
         }
         if message_epoch < local {
-            if message_epoch < entry.joined_epoch || entry.applied.iter().any(|(epoch, applied)| *epoch == message_epoch && applied.0 == hash) {
-                return Ok(CommitOutcome { epoch: local, duplicate: true, ..CommitOutcome::default() });
+            if message_epoch < entry.joined_epoch
+                || entry
+                    .applied
+                    .iter()
+                    .any(|(epoch, applied)| *epoch == message_epoch && applied.0 == hash)
+            {
+                return Ok(CommitOutcome {
+                    epoch: local,
+                    duplicate: true,
+                    ..CommitOutcome::default()
+                });
             }
             self.freeze(conv, "epoch went backwards");
-            return Err(Error::EpochBackwards { local, shown: message_epoch });
+            return Err(Error::EpochBackwards {
+                local,
+                shown: message_epoch,
+            });
         }
         if message_epoch > local {
-            return Err(Error::MissingCommit { message: message_epoch, local });
+            return Err(Error::MissingCommit {
+                message: message_epoch,
+                local,
+            });
         }
 
-        let message = guard(|| mls::MlsMessageIn::tls_deserialize_exact(data))?.map_err(|_| Error::Malformed("commit"))?;
-        let protocol = message.try_into_protocol_message().map_err(|_| Error::Malformed("commit"))?;
-        if protocol.group_id().as_slice() != conv.0 || protocol.wire_format() != mls::WireFormat::PublicMessage || protocol.content_type() != mls::ContentType::Commit {
+        let message = guard(|| mls::MlsMessageIn::tls_deserialize_exact(data))?
+            .map_err(|_| Error::Malformed("commit"))?;
+        let protocol = message
+            .try_into_protocol_message()
+            .map_err(|_| Error::Malformed("commit"))?;
+        if protocol.group_id().as_slice() != conv.0
+            || protocol.wire_format() != mls::WireFormat::PublicMessage
+            || protocol.content_type() != mls::ContentType::Commit
+        {
             return Err(Error::ForbiddenCommit("not a public commit for this group"));
         }
         if protocol.epoch().as_u64() != message_epoch {
             return Err(Error::Malformed("commit epoch"));
         }
 
-        let Engine { groups, provider, trust, meta, identity, .. } = self;
+        let Engine {
+            groups,
+            provider,
+            trust,
+            meta,
+            identity,
+            ..
+        } = self;
         let group = groups.get_mut(&conv).ok_or(Error::NoGroup)?;
         let entry = meta.get_mut(&conv).ok_or(Error::NoGroup)?;
         if group.pending_commit().is_some() {
             // Another member's commit for the epoch we committed at: ours lost.
-            group.clear_pending_commit(provider.storage()).map_err(Error::mls)?;
+            group
+                .clear_pending_commit(provider.storage())
+                .map_err(Error::mls)?;
             entry.pending_commit = None;
         }
         let processed = match guard(|| group.process_message(&*provider, protocol)) {
@@ -615,7 +798,8 @@ impl Engine {
         let mls::Sender::Member(committer) = *processed.sender() else {
             return Err(Error::ForbiddenCommit("committer is not a member"));
         };
-        let mls::ProcessedMessageContent::StagedCommitMessage(staged) = processed.into_content() else {
+        let mls::ProcessedMessageContent::StagedCommitMessage(staged) = processed.into_content()
+        else {
             return Err(Error::ForbiddenCommit("not a commit"));
         };
         let own = identity.device_ref();
@@ -636,7 +820,13 @@ impl Engine {
             entry.removed = true;
         }
         self.persist(false)?;
-        Ok(CommitOutcome { epoch, added, removed, removed_self, duplicate: false })
+        Ok(CommitOutcome {
+            epoch,
+            added,
+            removed,
+            removed_self,
+            duplicate: false,
+        })
     }
 
     /// Joins a conversation from a `welcome` item of the handshake feed (raw TLS `Welcome`, or a
@@ -649,13 +839,20 @@ impl Engine {
     /// already pinned for the conversation, or `server_key` (from `GET /v1/e2ee/conversations/{id}`),
     /// or, with neither, it is pinned now. A Welcome below the epoch this device has reached is
     /// [`Error::EpochBackwards`]. Messages from before this epoch can never be opened.
-    pub fn handle_welcome(&mut self, conv: ConversationId, data: &[u8], server_key: Option<&[u8]>) -> Result<JoinOutcome> {
+    pub fn handle_welcome(
+        &mut self,
+        conv: ConversationId,
+        data: &[u8],
+        server_key: Option<&[u8]>,
+    ) -> Result<JoinOutcome> {
         if data.len() > MAX_HANDSHAKE_BYTES {
             return Err(Error::TooLarge("welcome"));
         }
         let welcome = guard(|| match mls::Welcome::tls_deserialize_exact(data) {
             Ok(welcome) => Some(welcome),
-            Err(_) => match mls::MlsMessageIn::tls_deserialize_exact(data).map(mls::MlsMessageIn::extract) {
+            Err(_) => match mls::MlsMessageIn::tls_deserialize_exact(data)
+                .map(mls::MlsMessageIn::extract)
+            {
                 Ok(mls::MlsMessageBodyIn::Welcome(welcome)) => Some(welcome),
                 _ => None,
             },
@@ -669,7 +866,12 @@ impl Engine {
                 return Err(Error::ServerKeyChanged);
             }
         }
-        let expected_pin = match (self.meta.get(&conv).filter(|entry| !entry.server_key.is_empty()), server_key) {
+        let expected_pin = match (
+            self.meta
+                .get(&conv)
+                .filter(|entry| !entry.server_key.is_empty()),
+            server_key,
+        ) {
             (Some(entry), _) => Some(entry.server_key.0.clone()),
             (None, Some(shown)) => Some(parse_server_key(shown)?.0),
             (None, None) => None,
@@ -678,15 +880,27 @@ impl Engine {
         // Staging spends the key package this Welcome names. A refusal below must give it back.
         let spent = welcome.secrets().iter().find_map(|secret| {
             let reference = secret.new_member();
-            self.provider.storage().key_package::<mls::KeyPackageRef, mls::KeyPackageBundle>(&reference).ok().flatten().map(|bundle| (reference, bundle))
+            self.provider
+                .storage()
+                .key_package::<mls::KeyPackageRef, mls::KeyPackageBundle>(&reference)
+                .ok()
+                .flatten()
+                .map(|bundle| (reference, bundle))
         });
         let restore = |engine: &Engine| {
             if let Some((reference, bundle)) = &spent {
-                let _ = engine.provider.storage().write_key_package(reference, bundle);
+                let _ = engine
+                    .provider
+                    .storage()
+                    .write_key_package(reference, bundle);
             }
         };
-        let staged = match mls::StagedWelcome::build_from_welcome(&self.provider, &config, welcome) {
-            Ok(builder) => builder.replace_old_group().skip_lifetime_validation().build(),
+        let staged = match mls::StagedWelcome::build_from_welcome(&self.provider, &config, welcome)
+        {
+            Ok(builder) => builder
+                .replace_old_group()
+                .skip_lifetime_validation()
+                .build(),
             Err(error) => {
                 restore(self);
                 return Err(Error::mls(error));
@@ -710,14 +924,28 @@ impl Engine {
                 return Err(Error::ServerKeyChanged);
             }
             let epoch = context.epoch().as_u64();
-            let members = staged.members().map(|member| device_of_member(&member)).collect::<Result<Vec<_>>>()?;
+            let members = staged
+                .members()
+                .map(|member| device_of_member(&member))
+                .collect::<Result<Vec<_>>>()?;
             let own = self.identity.device_ref();
-            let untrusted: Vec<DeviceRef> = members.iter().filter(|device| **device != own && !self.trust.is_trusted(device.user, device.device, &device.signature_key)).cloned().collect();
+            let untrusted: Vec<DeviceRef> = members
+                .iter()
+                .filter(|device| {
+                    **device != own
+                        && !self
+                            .trust
+                            .is_trusted(device.user, device.device, &device.signature_key)
+                })
+                .cloned()
+                .collect();
             if !untrusted.is_empty() {
                 return Err(Error::UntrustedDevices(untrusted));
             }
             if !members.contains(&own) {
-                return Err(Error::Malformed("welcome that does not include this device"));
+                return Err(Error::Malformed(
+                    "welcome that does not include this device",
+                ));
             }
             Ok((epoch, members, key))
         })();
@@ -730,11 +958,20 @@ impl Engine {
         };
 
         if let Some(entry) = self.meta.get(&conv) {
-            if entry.high_epoch > epoch || (!entry.removed && self.groups.get(&conv).is_some_and(|group| group.epoch().as_u64() >= epoch)) {
+            if entry.high_epoch > epoch
+                || (!entry.removed
+                    && self
+                        .groups
+                        .get(&conv)
+                        .is_some_and(|group| group.epoch().as_u64() >= epoch))
+            {
                 restore(self);
                 let local = entry.high_epoch;
                 self.freeze(conv, "epoch went backwards");
-                return Err(Error::EpochBackwards { local, shown: epoch });
+                return Err(Error::EpochBackwards {
+                    local,
+                    shown: epoch,
+                });
             }
         }
         let group = match staged.into_group(&self.provider) {
@@ -746,15 +983,33 @@ impl Engine {
         };
         let pinned_now = expected_pin.is_none();
         self.groups.insert(conv, group);
-        self.meta.insert(conv, ConvMeta { server_key: key.into(), high_epoch: epoch, joined_epoch: epoch, ..ConvMeta::default() });
+        self.meta.insert(
+            conv,
+            ConvMeta {
+                server_key: key.into(),
+                high_epoch: epoch,
+                joined_epoch: epoch,
+                ..ConvMeta::default()
+            },
+        );
         self.persist(true)?;
-        Ok(JoinOutcome { epoch, members, pinned_now })
+        Ok(JoinOutcome {
+            epoch,
+            members,
+            pinned_now,
+        })
     }
 }
 
 /// Which devices a staged commit adds and removes (removals by the leaves' current credentials).
-fn changes_of(group: &mls::MlsGroup, staged: &mls::StagedCommit) -> Result<(Vec<DeviceRef>, Vec<DeviceRef>)> {
-    let added = staged.add_proposals().map(|queued| device_of_key_package(queued.add_proposal().key_package())).collect::<Result<Vec<_>>>()?;
+fn changes_of(
+    group: &mls::MlsGroup,
+    staged: &mls::StagedCommit,
+) -> Result<(Vec<DeviceRef>, Vec<DeviceRef>)> {
+    let added = staged
+        .add_proposals()
+        .map(|queued| device_of_key_package(queued.add_proposal().key_package()))
+        .collect::<Result<Vec<_>>>()?;
     let mut removed = Vec::new();
     for queued in staged.remove_proposals() {
         if let Some(member) = group.member_at(queued.remove_proposal().removed()) {
@@ -774,7 +1029,11 @@ fn record_applied(entry: &mut ConvMeta, made_at: u64, hash: Vec<u8>, now: u64) {
 }
 
 /// Decides one external proposal: what it is, and whether it may be taken.
-fn vet_proposal(group: &mls::MlsGroup, trust: &crate::identity::Trust, queued: &mls::QueuedProposal) -> (Option<ProposalKind>, std::result::Result<(), RejectReason>) {
+fn vet_proposal(
+    group: &mls::MlsGroup,
+    trust: &crate::identity::Trust,
+    queued: &mls::QueuedProposal,
+) -> (Option<ProposalKind>, std::result::Result<(), RejectReason>) {
     match queued.proposal() {
         mls::Proposal::Add(add) => {
             let package = add.key_package();
@@ -785,17 +1044,34 @@ fn vet_proposal(group: &mls::MlsGroup, trust: &crate::identity::Trust, queued: &
             if package.ciphersuite() != CIPHERSUITE {
                 return (kind, Err(RejectReason::Invalid));
             }
-            if group.members().any(|member| device_of_member(&member).is_ok_and(|existing| existing.user == device.user && existing.device == device.device)) {
+            if group.members().any(|member| {
+                device_of_member(&member).is_ok_and(|existing| {
+                    existing.user == device.user && existing.device == device.device
+                })
+            }) {
                 return (kind, Err(RejectReason::AlreadyMember));
             }
             if trust.is_trusted(device.user, device.device, &device.signature_key) {
                 return (kind, Ok(()));
             }
             // Known device, other key: forged. Not known: not yet fetched.
-            let known = trust.devices(device.user).iter().any(|trusted| trusted.device == device.device);
-            (kind, Err(if known { RejectReason::KeyMismatch } else { RejectReason::UnknownDevice }))
+            let known = trust
+                .devices(device.user)
+                .iter()
+                .any(|trusted| trusted.device == device.device);
+            (
+                kind,
+                Err(if known {
+                    RejectReason::KeyMismatch
+                } else {
+                    RejectReason::UnknownDevice
+                }),
+            )
         }
-        mls::Proposal::Remove(remove) => match group.member_at(remove.removed()).and_then(|member| device_of_member(&member).ok()) {
+        mls::Proposal::Remove(remove) => match group
+            .member_at(remove.removed())
+            .and_then(|member| device_of_member(&member).ok())
+        {
             Some(device) => (Some(ProposalKind::Remove(device)), Ok(())),
             None => (None, Err(RejectReason::NotInRoster)),
         },
@@ -816,22 +1092,49 @@ fn vet_commit(
     for queued in staged.queued_proposals() {
         match queued.proposal() {
             mls::Proposal::Add(_) | mls::Proposal::Remove(_) => {}
-            _ => return Err(Error::ForbiddenCommit("only Add and Remove proposals are allowed")),
+            _ => {
+                return Err(Error::ForbiddenCommit(
+                    "only Add and Remove proposals are allowed",
+                ))
+            }
+        }
+        // Who is in the group is the server's decision (it proposes, we vet): a member does not
+        // add or remove anyone on its own, so a proposal a commit carries by value, or that a member
+        // made, is refused.
+        if !matches!(queued.sender(), mls::Sender::External(_)) {
+            return Err(Error::ForbiddenCommit(
+                "membership changes come from the server's proposals only",
+            ));
         }
     }
     // The committer keeps its identity and its key: a new path leaf may only rotate encryption keys.
     if let Some(leaf) = staged.update_path_leaf_node() {
-        let before = group.member_at(committer).ok_or(Error::ForbiddenCommit("unknown committer"))?;
-        if leaf.credential() != &before.credential || leaf.signature_key().as_slice() != before.signature_key.as_slice() {
-            return Err(Error::ForbiddenCommit("a member's credential or signing key changed"));
+        let before = group
+            .member_at(committer)
+            .ok_or(Error::ForbiddenCommit("unknown committer"))?;
+        if leaf.credential() != &before.credential
+            || leaf.signature_key().as_slice() != before.signature_key.as_slice()
+        {
+            return Err(Error::ForbiddenCommit(
+                "a member's credential or signing key changed",
+            ));
         }
     }
     let (added, removed) = changes_of(group, staged)?;
-    let untrusted: Vec<DeviceRef> = added.iter().filter(|device| *device != own && !trust.is_trusted(device.user, device.device, &device.signature_key)).cloned().collect();
+    let untrusted: Vec<DeviceRef> = added
+        .iter()
+        .filter(|device| {
+            *device != own && !trust.is_trusted(device.user, device.device, &device.signature_key)
+        })
+        .cloned()
+        .collect();
     if !untrusted.is_empty() {
         return Err(Error::UntrustedDevices(untrusted));
     }
-    if added.iter().any(|device| device.user == own.user && device.device == own.device) {
+    if added
+        .iter()
+        .any(|device| device.user == own.user && device.device == own.device)
+    {
         return Err(Error::ForbiddenCommit("adds this device again"));
     }
     let keys = group_server_key(staged.group_context().extensions())?;
@@ -862,13 +1165,24 @@ pub fn fuzz_all(bytes: &[u8]) {
             })();
             *slot = built.ok();
         }
-        let Some((engine, conv)) = slot.as_mut() else { return };
+        let Some((engine, conv)) = slot.as_mut() else {
+            return;
+        };
         let conv = *conv;
         let epoch = engine.epoch(conv).unwrap_or(0);
         let _ = engine.handle_proposals(conv, bytes);
         let _ = engine.handle_commit(conv, epoch, bytes);
         let _ = engine.handle_welcome(conv, bytes, None);
-        let _ = engine.decrypt(conv, bytes, &crate::messaging::Claimed { author: None, device: None, kind: crate::envelope::Kind::Message, target_id: None });
+        let _ = engine.decrypt(
+            conv,
+            bytes,
+            &crate::messaging::Claimed {
+                author: None,
+                device: None,
+                kind: crate::envelope::Kind::Message,
+                target_id: None,
+            },
+        );
         let _ = parse_server_key(bytes);
     });
 }
@@ -877,9 +1191,101 @@ impl Engine {
     /// The leaf index of a member's device in the group's tree: what a Remove proposal names. The
     /// server reads it from the public tree; this is for tests that play the server.
     #[doc(hidden)]
-    pub fn leaf_index(&mut self, conv: ConversationId, device: crate::ids::DeviceId) -> Result<Option<u32>> {
+    pub fn leaf_index(
+        &mut self,
+        conv: ConversationId,
+        device: crate::ids::DeviceId,
+    ) -> Result<Option<u32>> {
         self.load_group(conv)?;
         let group = self.groups.get(&conv).ok_or(Error::NoGroup)?;
-        Ok(group.members().find(|member| device_of_member(member).is_ok_and(|found| found.device == device)).map(|member| member.index.u32()))
+        Ok(group
+            .members()
+            .find(|member| device_of_member(member).is_ok_and(|found| found.device == device))
+            .map(|member| member.index.u32()))
+    }
+}
+
+/// Commits that a malicious (or buggy) member could make, to test the receiving side. They are
+/// built, not kept: the forging engine's group stays at its epoch.
+#[doc(hidden)]
+pub enum Forge<'a> {
+    /// A path leaf with another credential or another signing key than the committer's.
+    ReplaceIdentity(&'a crate::identity::DeviceIdentity),
+    /// A group context change that swaps the external sender for this key.
+    ChangeServerKey(&'a [u8]),
+    /// An Add, by value, of a key package: a device nobody vouched for.
+    AddKeyPackage(&'a [u8]),
+}
+
+impl Engine {
+    #[doc(hidden)]
+    pub fn forge_commit(&mut self, conv: ConversationId, forge: Forge<'_>) -> Result<Vec<u8>> {
+        self.load_group(conv)?;
+        let Engine {
+            groups,
+            provider,
+            identity,
+            ..
+        } = self;
+        let group = groups.get_mut(&conv).ok_or(Error::NoGroup)?;
+        let bundle = match forge {
+            Forge::ReplaceIdentity(other) => {
+                let credential_with_key = mls::CredentialWithKey {
+                    credential: mls::BasicCredential::new(other.credential().to_vec()).into(),
+                    signature_key: other.key.public_key().into(),
+                };
+                let new_signer = mls::NewSignerBundle {
+                    signer: &other.key,
+                    credential_with_key,
+                };
+                group
+                    .self_update_with_new_signer(
+                        &*provider,
+                        &identity.key,
+                        new_signer,
+                        mls::LeafNodeParameters::default(),
+                    )
+                    .map_err(Error::mls)?
+            }
+            Forge::ChangeServerKey(key) => {
+                let (_, sender) = parse_server_key(key)?;
+                let extensions =
+                    mls::Extensions::single(mls::Extension::ExternalSenders(vec![sender]))
+                        .map_err(Error::mls)?;
+                group
+                    .commit_builder()
+                    .propose_group_context_extensions(extensions)
+                    .map_err(Error::mls)?
+                    .load_psks(provider.storage())
+                    .map_err(Error::mls)?
+                    .build(provider.rand(), provider.crypto(), &identity.key, |_| true)
+                    .map_err(Error::mls)?
+                    .stage_commit(&*provider)
+                    .map_err(Error::mls)?
+            }
+            Forge::AddKeyPackage(bytes) => {
+                let package = mls::KeyPackageIn::tls_deserialize_exact(bytes)
+                    .map_err(|_| Error::Malformed("key package"))?
+                    .validate(provider.crypto(), mls::ProtocolVersion::Mls10)
+                    .map_err(Error::mls)?;
+                group
+                    .commit_builder()
+                    .propose_adds(Some(package))
+                    .load_psks(provider.storage())
+                    .map_err(Error::mls)?
+                    .build(provider.rand(), provider.crypto(), &identity.key, |_| true)
+                    .map_err(Error::mls)?
+                    .stage_commit(&*provider)
+                    .map_err(Error::mls)?
+            }
+        };
+        let commit = bundle
+            .commit()
+            .tls_serialize_detached()
+            .map_err(Error::mls)?;
+        group
+            .clear_pending_commit(provider.storage())
+            .map_err(Error::mls)?;
+        Ok(commit)
     }
 }

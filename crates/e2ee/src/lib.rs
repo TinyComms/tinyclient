@@ -59,6 +59,12 @@ pub mod parsers {
     /// The sealed attachment as a whole, opened with a fixed key.
     pub fn sealed_blob(bytes: &[u8]) {
         let key = crate::attachment::AttachmentKey::from_bytes([7u8; 32]);
-        let _ = crate::attachment::open(&key, b"", bytes, std::io::sink(), crate::attachment::Expect::default());
+        let _ = crate::attachment::open(
+            &key,
+            b"",
+            bytes,
+            std::io::sink(),
+            crate::attachment::Expect::default(),
+        );
     }
 }

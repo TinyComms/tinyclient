@@ -102,7 +102,10 @@ impl Header {
         }
         let mut nonce_prefix = [0u8; NONCE_PREFIX_LEN];
         nonce_prefix.copy_from_slice(&bytes[6..HEADER_LEN]);
-        Ok(Header { chunk_log2, nonce_prefix })
+        Ok(Header {
+            chunk_log2,
+            nonce_prefix,
+        })
     }
 
     pub fn to_bytes(&self) -> [u8; HEADER_LEN] {
@@ -132,7 +135,11 @@ pub fn sealed_len(plain_len: u64) -> u64 {
     let chunk = 1u64 << CHUNK_LOG2;
     // A file of exact multiples still ends in a full last chunk; an empty file has one empty chunk.
     let chunks = (plain_len / chunk) + 1;
-    let chunks = if plain_len > 0 && plain_len % chunk == 0 { chunks - 1 } else { chunks };
+    let chunks = if plain_len > 0 && plain_len.is_multiple_of(chunk) {
+        chunks - 1
+    } else {
+        chunks
+    };
     HEADER_LEN as u64 + plain_len + chunks * TAG_LEN as u64
 }
 
@@ -180,15 +187,35 @@ fn first_aad(header: &[u8], context: &[u8]) -> Vec<u8> {
 
 /// Seals everything `reader` yields into `writer`, with a fresh random nonce prefix. Memory is two
 /// 64 KiB buffers whatever the length.
-pub fn seal<R: Read, W: Write>(key: &AttachmentKey, context: &[u8], reader: R, writer: W) -> Result<SealInfo> {
+pub fn seal<R: Read, W: Write>(
+    key: &AttachmentKey,
+    context: &[u8],
+    reader: R,
+    writer: W,
+) -> Result<SealInfo> {
     let mut nonce_prefix = [0u8; NONCE_PREFIX_LEN];
     getrandom::fill(&mut nonce_prefix).map_err(|_| Error::Random)?;
-    seal_with_header(key, context, Header { chunk_log2: CHUNK_LOG2, nonce_prefix }, reader, writer)
+    seal_with_header(
+        key,
+        context,
+        Header {
+            chunk_log2: CHUNK_LOG2,
+            nonce_prefix,
+        },
+        reader,
+        writer,
+    )
 }
 
 /// [`seal`] with a given header (deterministic, for known-answer tests). A nonce prefix must
 /// never be used twice with one key: callers outside tests use [`seal`].
-pub fn seal_with_header<R: Read, W: Write>(key: &AttachmentKey, context: &[u8], header: Header, mut reader: R, mut writer: W) -> Result<SealInfo> {
+pub fn seal_with_header<R: Read, W: Write>(
+    key: &AttachmentKey,
+    context: &[u8],
+    header: Header,
+    mut reader: R,
+    mut writer: W,
+) -> Result<SealInfo> {
     let chunk = header.chunk_len();
     let header_bytes = header.to_bytes();
     let mut hasher = Sha256::new();
@@ -198,7 +225,10 @@ pub fn seal_with_header<R: Read, W: Write>(key: &AttachmentKey, context: &[u8], 
     let mut plain_len = 0u64;
 
     let aad_first = first_aad(&header_bytes, context);
-    let mut encryptor = Some(EncryptorBE32::from_aead(cipher(key), GenericArray::from_slice(&header.nonce_prefix)));
+    let mut encryptor = Some(EncryptorBE32::from_aead(
+        cipher(key),
+        GenericArray::from_slice(&header.nonce_prefix),
+    ));
     let mut current: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::with_capacity(chunk + TAG_LEN));
     let mut next: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::with_capacity(chunk + TAG_LEN));
     fill(&mut reader, &mut current, chunk)?;
@@ -213,9 +243,17 @@ pub fn seal_with_header<R: Read, W: Write>(key: &AttachmentKey, context: &[u8], 
         plain_len += current.len() as u64;
         let aad: &[u8] = if first { &aad_first } else { &[] };
         if last {
-            encryptor.take().ok_or(Error::Authentication)?.encrypt_last_in_place(aad, &mut *current).map_err(|_| Error::Authentication)?;
+            encryptor
+                .take()
+                .ok_or(Error::Authentication)?
+                .encrypt_last_in_place(aad, &mut *current)
+                .map_err(|_| Error::Authentication)?;
         } else {
-            encryptor.as_mut().ok_or(Error::Authentication)?.encrypt_next_in_place(aad, &mut *current).map_err(|_| Error::Authentication)?;
+            encryptor
+                .as_mut()
+                .ok_or(Error::Authentication)?
+                .encrypt_next_in_place(aad, &mut *current)
+                .map_err(|_| Error::Authentication)?;
         }
         io(writer.write_all(&current))?;
         hasher.update(&*current);
@@ -227,7 +265,11 @@ pub fn seal_with_header<R: Read, W: Write>(key: &AttachmentKey, context: &[u8], 
         first = false;
     }
     io(writer.flush())?;
-    Ok(SealInfo { sha256: hasher.finalize().into(), sealed_len, plain_len })
+    Ok(SealInfo {
+        sha256: hasher.finalize().into(),
+        sealed_len,
+        plain_len,
+    })
 }
 
 /// What a caller already knows about a blob and wants checked while it is opened.
@@ -250,7 +292,13 @@ pub struct OpenInfo {
 /// Opens a sealed blob from `reader` into `writer`, chunk by chunk. Any wrong key, wrong
 /// `context`, changed bit, cut, reorder or repeat is [`Error::Authentication`]. See the module
 /// notes: on an error the bytes already written are not to be used.
-pub fn open<R: Read, W: Write>(key: &AttachmentKey, context: &[u8], mut reader: R, mut writer: W, expect: Expect<'_>) -> Result<OpenInfo> {
+pub fn open<R: Read, W: Write>(
+    key: &AttachmentKey,
+    context: &[u8],
+    mut reader: R,
+    mut writer: W,
+    expect: Expect<'_>,
+) -> Result<OpenInfo> {
     let mut header_bytes = [0u8; HEADER_LEN];
     {
         let mut buffer = Vec::with_capacity(HEADER_LEN);
@@ -266,7 +314,10 @@ pub fn open<R: Read, W: Write>(key: &AttachmentKey, context: &[u8], mut reader: 
     hasher.update(header_bytes);
 
     let aad_first = first_aad(&header_bytes, context);
-    let mut decryptor = Some(DecryptorBE32::from_aead(cipher(key), GenericArray::from_slice(&header.nonce_prefix)));
+    let mut decryptor = Some(DecryptorBE32::from_aead(
+        cipher(key),
+        GenericArray::from_slice(&header.nonce_prefix),
+    ));
     let mut current: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::with_capacity(sealed_chunk));
     let mut next: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::with_capacity(sealed_chunk));
     fill(&mut reader, &mut current, sealed_chunk)?;
@@ -290,9 +341,17 @@ pub fn open<R: Read, W: Write>(key: &AttachmentKey, context: &[u8], mut reader: 
         }
         let aad: &[u8] = if first { &aad_first } else { &[] };
         if last {
-            decryptor.take().ok_or(Error::Authentication)?.decrypt_last_in_place(aad, &mut *current).map_err(|_| Error::Authentication)?;
+            decryptor
+                .take()
+                .ok_or(Error::Authentication)?
+                .decrypt_last_in_place(aad, &mut *current)
+                .map_err(|_| Error::Authentication)?;
         } else {
-            decryptor.as_mut().ok_or(Error::Authentication)?.decrypt_next_in_place(aad, &mut *current).map_err(|_| Error::Authentication)?;
+            decryptor
+                .as_mut()
+                .ok_or(Error::Authentication)?
+                .decrypt_next_in_place(aad, &mut *current)
+                .map_err(|_| Error::Authentication)?;
         }
         io(writer.write_all(&current))?;
         plain_len += current.len() as u64;
@@ -309,7 +368,10 @@ pub fn open<R: Read, W: Write>(key: &AttachmentKey, context: &[u8], mut reader: 
             return Err(Error::Authentication);
         }
     }
-    if expect.plain_len.is_some_and(|expected| expected != plain_len) {
+    if expect
+        .plain_len
+        .is_some_and(|expected| expected != plain_len)
+    {
         return Err(Error::Authentication);
     }
     Ok(OpenInfo { sha256, plain_len })
@@ -333,14 +395,30 @@ pub fn sha256_of<R: Read>(mut reader: R) -> Result<[u8; 32]> {
 /// [`open`] for a blob that can be read twice (a downloaded file): the first pass hashes the
 /// sealed blob and compares it, in constant time, with `sha256` from the message; nothing is
 /// decrypted, and nothing reaches `writer`, unless it matches.
-pub fn open_verified<R: Read + Seek, W: Write>(key: &AttachmentKey, context: &[u8], mut reader: R, writer: W, sha256: &[u8; 32], plain_len: Option<u64>) -> Result<OpenInfo> {
+pub fn open_verified<R: Read + Seek, W: Write>(
+    key: &AttachmentKey,
+    context: &[u8],
+    mut reader: R,
+    writer: W,
+    sha256: &[u8; 32],
+    plain_len: Option<u64>,
+) -> Result<OpenInfo> {
     io(reader.seek(SeekFrom::Start(0)))?;
     let actual = sha256_of(&mut reader)?;
     if !bool::from(actual.ct_eq(sha256)) {
         return Err(Error::Authentication);
     }
     io(reader.seek(SeekFrom::Start(0)))?;
-    open(key, context, reader, writer, Expect { sha256: Some(sha256), plain_len })
+    open(
+        key,
+        context,
+        reader,
+        writer,
+        Expect {
+            sha256: Some(sha256),
+            plain_len,
+        },
+    )
 }
 
 /// A decrypted attachment in a private temp file. Dropping it removes the file; only
@@ -360,7 +438,9 @@ impl PlainTemp {
 
     /// Moves the file to `path` (on the same filesystem it was made on) and keeps it.
     pub fn persist(self, path: &Path) -> Result<std::fs::File> {
-        self.file.persist(path).map_err(|err| Error::Io(err.error.to_string()))
+        self.file
+            .persist(path)
+            .map_err(|err| Error::Io(err.error.to_string()))
     }
 }
 
@@ -369,10 +449,18 @@ impl PlainTemp {
 /// dropped, or the thread panics, the file is removed: no plaintext of a blob that did not
 /// authenticate is left behind. A process killed in between leaves a `.tnya-*` file;
 /// [`remove_stale_temps`] clears those at start-up.
-pub fn decrypt_to_temp<R: Read>(key: &AttachmentKey, context: &[u8], reader: R, dir: &Path, expect: Expect<'_>) -> Result<PlainTemp> {
+pub fn decrypt_to_temp<R: Read>(
+    key: &AttachmentKey,
+    context: &[u8],
+    reader: R,
+    dir: &Path,
+    expect: Expect<'_>,
+) -> Result<PlainTemp> {
     let mut builder = tempfile::Builder::new();
     builder.prefix(TEMP_PREFIX);
-    let mut file = builder.tempfile_in(dir).map_err(|err| Error::Io(err.to_string()))?;
+    let mut file = builder
+        .tempfile_in(dir)
+        .map_err(|err| Error::Io(err.to_string()))?;
     {
         let mut writer = std::io::BufWriter::with_capacity(64 * 1024, file.as_file_mut());
         open(key, context, reader, &mut writer, expect)?;
@@ -393,11 +481,15 @@ pub fn remove_stale_temps(dir: &Path, older_than: std::time::Duration) -> Result
         if !name.to_string_lossy().starts_with(TEMP_PREFIX) {
             continue;
         }
-        let old = entry.metadata().and_then(|meta| meta.modified()).ok().and_then(|modified| now.duration_since(modified).ok()).is_some_and(|age| age >= older_than);
+        let old = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age >= older_than);
         if old && std::fs::remove_file(entry.path()).is_ok() {
             removed += 1;
         }
     }
     Ok(removed)
 }
-

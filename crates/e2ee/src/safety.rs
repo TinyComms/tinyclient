@@ -46,7 +46,12 @@ impl SafetyNumber {
 
     /// 12 groups of 5 digits, separated by spaces, for showing.
     pub fn grouped(&self) -> String {
-        self.digits.as_bytes().chunks(GROUP as usize).map(|group| String::from_utf8_lossy(group).into_owned()).collect::<Vec<_>>().join(" ")
+        self.digits
+            .as_bytes()
+            .chunks(GROUP as usize)
+            .map(|group| String::from_utf8_lossy(group).into_owned())
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 }
 
@@ -57,7 +62,10 @@ impl std::fmt::Debug for SafetyNumber {
 }
 
 fn identity(user: UserId, devices: &[DeviceRef]) -> Vec<u8> {
-    let mut sorted: Vec<&DeviceRef> = devices.iter().filter(|device| device.user == user).collect();
+    let mut sorted: Vec<&DeviceRef> = devices
+        .iter()
+        .filter(|device| device.user == user)
+        .collect();
     sorted.sort_by_key(|device| device.device);
     sorted.dedup_by_key(|device| device.device);
     let mut hasher = Sha256::new();
@@ -78,11 +86,23 @@ fn short(user: UserId) -> u64 {
 /// The safety number between `a` and `b`, from each one's devices (only the entries of
 /// `a_devices` whose user is `a`, and of `b_devices` whose user is `b`, count). Symmetric: the
 /// same for both people.
-pub fn safety_number(a: UserId, a_devices: &[DeviceRef], b: UserId, b_devices: &[DeviceRef]) -> Result<SafetyNumber> {
+pub fn safety_number(
+    a: UserId,
+    a_devices: &[DeviceRef],
+    b: UserId,
+    b_devices: &[DeviceRef],
+) -> Result<SafetyNumber> {
     let ours = identity(a, a_devices);
     let theirs = identity(b, b_devices);
-    let fingerprint = davey::generate_pairwise_fingerprint(0, &ours, short(a), &theirs, short(b)).map_err(|_| Error::Malformed("safety number input"))?;
-    let digits = davey::generate_displayable_code(&fingerprint, DIGITS, GROUP).map_err(|_| Error::Malformed("safety number input"))?;
-    let fingerprint: [u8; 64] = fingerprint.try_into().map_err(|_| Error::Malformed("safety number input"))?;
-    Ok(SafetyNumber { fingerprint, digits })
+    let fingerprint = davey::generate_pairwise_fingerprint(0, &ours, short(a), &theirs, short(b))
+        .map_err(|_| Error::Malformed("safety number input"))?;
+    let digits = davey::generate_displayable_code(&fingerprint, DIGITS, GROUP)
+        .map_err(|_| Error::Malformed("safety number input"))?;
+    let fingerprint: [u8; 64] = fingerprint
+        .try_into()
+        .map_err(|_| Error::Malformed("safety number input"))?;
+    Ok(SafetyNumber {
+        fingerprint,
+        digits,
+    })
 }

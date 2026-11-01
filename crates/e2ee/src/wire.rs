@@ -18,7 +18,10 @@ impl Serialize for Bytes {
 impl<'de> Deserialize<'de> for Bytes {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Bytes, D::Error> {
         let text = <std::borrow::Cow<'de, str>>::deserialize(deserializer)?;
-        STANDARD.decode(text.as_bytes()).map(Bytes).map_err(serde::de::Error::custom)
+        STANDARD
+            .decode(text.as_bytes())
+            .map(Bytes)
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -53,10 +56,19 @@ pub(crate) fn read_vl(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
     let first = *bytes.first()?;
     let (len, header): (usize, usize) = match first >> 6 {
         0 => (usize::from(first & 0x3f), 1),
-        1 => (usize::from(first & 0x3f) << 8 | usize::from(*bytes.get(1)?), 2),
+        1 => (
+            usize::from(first & 0x3f) << 8 | usize::from(*bytes.get(1)?),
+            2,
+        ),
         2 => {
             let rest = bytes.get(1..4)?;
-            (usize::from(first & 0x3f) << 24 | usize::from(rest[0]) << 16 | usize::from(rest[1]) << 8 | usize::from(rest[2]), 4)
+            (
+                usize::from(first & 0x3f) << 24
+                    | usize::from(rest[0]) << 16
+                    | usize::from(rest[1]) << 8
+                    | usize::from(rest[2]),
+                4,
+            )
         }
         _ => return None,
     };
@@ -72,5 +84,6 @@ pub(crate) fn read_vl(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
 /// here. A panic in the middle of a group operation may leave that group half changed in memory:
 /// callers reload it.
 pub(crate) fn guard<T>(f: impl FnOnce() -> T) -> crate::error::Result<T> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|_| crate::error::Error::Malformed("input"))
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+        .map_err(|_| crate::error::Error::Malformed("input"))
 }

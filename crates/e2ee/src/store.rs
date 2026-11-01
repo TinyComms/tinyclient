@@ -69,16 +69,27 @@ pub struct MemoryStore {
 
 impl Store for MemoryStore {
     fn load(&self, name: &str) -> Result<Option<Vec<u8>>> {
-        Ok(self.blobs.lock().map_err(|_| Error::Storage("poisoned".into()))?.get(name).cloned())
+        Ok(self
+            .blobs
+            .lock()
+            .map_err(|_| Error::Storage("poisoned".into()))?
+            .get(name)
+            .cloned())
     }
 
     fn save(&self, name: &str, blob: &[u8]) -> Result<()> {
-        self.blobs.lock().map_err(|_| Error::Storage("poisoned".into()))?.insert(name.to_owned(), blob.to_vec());
+        self.blobs
+            .lock()
+            .map_err(|_| Error::Storage("poisoned".into()))?
+            .insert(name.to_owned(), blob.to_vec());
         Ok(())
     }
 
     fn remove(&self, name: &str) -> Result<()> {
-        self.blobs.lock().map_err(|_| Error::Storage("poisoned".into()))?.remove(name);
+        self.blobs
+            .lock()
+            .map_err(|_| Error::Storage("poisoned".into()))?
+            .remove(name);
         Ok(())
     }
 }
@@ -97,7 +108,12 @@ impl FileStore {
 
     fn path(&self, name: &str) -> Result<PathBuf> {
         // A name is a file name: letters, digits, `.`, `_`, `-`.
-        let plain = !name.is_empty() && name.len() <= 128 && !name.starts_with('.') && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+        let plain = !name.is_empty()
+            && name.len() <= 128
+            && !name.starts_with('.')
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
         if !plain {
             return Err(Error::Storage("not a plain name".into()));
         }
@@ -122,7 +138,8 @@ impl Store for FileStore {
         let mut temp = tempfile::NamedTempFile::new_in(&self.dir)?;
         temp.write_all(blob)?;
         temp.as_file().sync_all()?;
-        temp.persist(&path).map_err(|err| Error::Storage(err.error.to_string()))?;
+        temp.persist(&path)
+            .map_err(|err| Error::Storage(err.error.to_string()))?;
         Ok(())
     }
 
@@ -139,7 +156,11 @@ pub(crate) fn seal_state(key: &StateKey, name: &str, plaintext: &[u8]) -> Result
     sealed::seal(key.as_bytes(), STATE_LABEL, name.as_bytes(), plaintext)
 }
 
-pub(crate) fn open_state(key: &StateKey, name: &str, blob: &[u8]) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+pub(crate) fn open_state(
+    key: &StateKey,
+    name: &str,
+    blob: &[u8],
+) -> Result<zeroize::Zeroizing<Vec<u8>>> {
     sealed::open(key.as_bytes(), STATE_LABEL, name.as_bytes(), blob)
 }
 
@@ -152,6 +173,10 @@ pub fn seal_cache_value(key: &CacheKey, row_id: &[u8], plaintext: &[u8]) -> Resu
 }
 
 /// The reverse of [`seal_cache_value`]; any other key, row id or any altered byte is refused.
-pub fn open_cache_value(key: &CacheKey, row_id: &[u8], blob: &[u8]) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+pub fn open_cache_value(
+    key: &CacheKey,
+    row_id: &[u8],
+    blob: &[u8],
+) -> Result<zeroize::Zeroizing<Vec<u8>>> {
     sealed::open(key.as_bytes(), CACHE_LABEL, row_id, blob)
 }
