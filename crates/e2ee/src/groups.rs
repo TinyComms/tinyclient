@@ -6,18 +6,54 @@ use crate::engine::{capabilities, Config, ConvMeta, Engine, APPLIED_KEPT, CIPHER
 use crate::error::{Error, Result};
 use crate::identity::SIGNATURE_KEY_LEN;
 use crate::ids::{parse_credential, ConversationId, DeviceRef};
-use crate::wire::{guard, read_vl, sha256};
+use crate::wire::{guard, read_vl, sha256, Bytes};
 use openmls::prelude as mls;
 use openmls::prelude::tls_codec::{Deserialize as _, Serialize as _};
 use openmls_traits::storage::StorageProvider as _;
 use openmls_traits::OpenMlsProvider as _;
 use p256::ecdsa::VerifyingKey;
+use serde::{Deserialize, Serialize};
 
 /// The credential the server's key carries in the group's external senders extension when it is
 /// given as a bare public key.
 pub const SERVER_CREDENTIAL: &[u8] = b"tinyserver";
 /// The most a handshake message (proposals, commit, Welcome) may be.
 pub const MAX_HANDSHAKE_BYTES: usize = 8 * 1024 * 1024;
+/// The sizes the server accepts (`docs/e2ee-text.md` and its `e2ee_text` code), so that a commit it
+/// would refuse is refused here, in words, and not left in flight.
+pub mod limits {
+    /// A commit.
+    pub const COMMIT: usize = 256 * 1024;
+    /// One Welcome.
+    pub const WELCOME: usize = 1024 * 1024;
+    /// All the Welcomes of one commit together (each device has its own copy of the bytes).
+    pub const WELCOMES: usize = 4 * 1024 * 1024;
+    /// Welcomes in one commit: devices a single commit may add.
+    pub const WELCOMES_PER_COMMIT: usize = 100;
+    /// A key package.
+    pub const KEY_PACKAGE: usize = 8 * 1024;
+    /// An application ciphertext.
+    pub const CIPHERTEXT: usize = 20 * 1024;
+}
+
+fn check_limits(commit: &[u8], welcomes: &[WelcomeFor]) -> Result<()> {
+    if commit.len() > limits::COMMIT {
+        return Err(Error::TooLarge("commit"));
+    }
+    if welcomes.len() > limits::WELCOMES_PER_COMMIT {
+        return Err(Error::TooLarge("welcomes in one commit"));
+    }
+    let total: usize = welcomes.iter().map(|welcome| welcome.data.len()).sum();
+    if welcomes
+        .iter()
+        .any(|welcome| welcome.data.len() > limits::WELCOME)
+        || total > limits::WELCOMES
+    {
+        return Err(Error::TooLarge("welcomes"));
+    }
+    Ok(())
+}
+
 const MAX_PROPOSALS: usize = 4096;
 /// Leaves the group gives itself, as far as OpenMLS lets a leaf's lifetime run.
 const LEAF_LIFETIME: u64 = 60 * 60 * 24 * 84;
@@ -94,10 +130,82 @@ pub struct CommitBundle {
     pub epoch: u64,
     /// A MLS message, public (`PublicMessage`), TLS encoded.
     pub commit: Vec<u8>,
-    /// Raw TLS `Welcome` (what DAVE carries), one per added device; empty if nobody is added.
+    /// A TLS `MLSMessage` holding the `Welcome`, one entry per added device (all the same bytes:
+    /// one Welcome holds the secrets of every device the commit adds); empty if nobody is added.
     pub welcomes: Vec<WelcomeFor>,
     pub added: Vec<DeviceRef>,
     pub removed: Vec<DeviceRef>,
+}
+
+/// A [`CommitBundle`] as the state keeps it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct StoredBundle {
+    epoch: u64,
+    commit: Bytes,
+    welcome: Option<Bytes>,
+    added: Vec<StoredDevice>,
+    removed: Vec<StoredDevice>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredDevice {
+    user: crate::ids::UserId,
+    device: crate::ids::DeviceId,
+    key: Bytes,
+}
+
+impl StoredDevice {
+    fn from_ref(device: &DeviceRef) -> StoredDevice {
+        StoredDevice {
+            user: device.user,
+            device: device.device,
+            key: Bytes(device.signature_key.clone()),
+        }
+    }
+
+    fn to_ref(&self) -> DeviceRef {
+        DeviceRef {
+            user: self.user,
+            device: self.device,
+            signature_key: self.key.0.clone(),
+        }
+    }
+}
+
+impl StoredBundle {
+    fn from_bundle(bundle: &CommitBundle) -> StoredBundle {
+        StoredBundle {
+            epoch: bundle.epoch,
+            commit: Bytes(bundle.commit.clone()),
+            welcome: bundle
+                .welcomes
+                .first()
+                .map(|welcome| Bytes(welcome.data.clone())),
+            added: bundle.added.iter().map(StoredDevice::from_ref).collect(),
+            removed: bundle.removed.iter().map(StoredDevice::from_ref).collect(),
+        }
+    }
+
+    fn to_bundle(&self) -> CommitBundle {
+        let added: Vec<DeviceRef> = self.added.iter().map(StoredDevice::to_ref).collect();
+        let welcomes = match &self.welcome {
+            Some(data) => added
+                .iter()
+                .map(|device| WelcomeFor {
+                    device: device.clone(),
+                    data: data.0.clone(),
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        CommitBundle {
+            epoch: self.epoch,
+            commit: self.commit.0.clone(),
+            welcomes,
+            added,
+            removed: self.removed.iter().map(StoredDevice::to_ref).collect(),
+        }
+    }
 }
 
 /// What applying a commit (ours, once confirmed, or another's) did.
@@ -605,8 +713,13 @@ impl Engine {
             let staged = group.pending_commit().ok_or(Error::Malformed("commit"))?;
             changes_of(group, staged)?
         };
+        // An MLSMessage holding the Welcome: what the server parses (and what a client reads back).
         let welcome = welcome
-            .map(|welcome| welcome.tls_serialize_detached().map_err(Error::mls))
+            .map(|welcome| {
+                mls::MlsMessageOut::from_welcome(welcome, mls::ProtocolVersion::Mls10)
+                    .tls_serialize_detached()
+                    .map_err(Error::mls)
+            })
             .transpose()?;
         let welcomes = match welcome {
             Some(data) => added
@@ -618,17 +731,27 @@ impl Engine {
                 .collect(),
             None => Vec::new(),
         };
-        if let Some(entry) = meta.get_mut(&conv) {
-            entry.pending_commit = Some(sha256(&commit).to_vec().into());
+        if let Err(error) = check_limits(&commit, &welcomes) {
+            // The server would refuse it; do not leave it in flight. The proposals stay pending.
+            if let Some(group) = groups.get_mut(&conv) {
+                group
+                    .clear_pending_commit(provider.storage())
+                    .map_err(Error::mls)?;
+            }
+            return Err(error);
         }
-        self.persist(true)?;
-        Ok(Some(CommitBundle {
+        let bundle = CommitBundle {
             epoch,
             commit,
             welcomes,
             added,
             removed,
-        }))
+        };
+        if let Some(entry) = meta.get_mut(&conv) {
+            entry.pending_commit = Some(StoredBundle::from_bundle(&bundle));
+        }
+        self.persist(true)?;
+        Ok(Some(bundle))
     }
 
     /// The server accepted our commit (`204`): merge it. The epoch advances.
@@ -653,13 +776,12 @@ impl Engine {
         }
         let epoch = group.epoch().as_u64();
         let entry = meta.get_mut(&conv).ok_or(Error::NoGroup)?;
-        let hash = entry.pending_commit.take();
-        record_applied(
-            entry,
-            before,
-            hash.map(|bytes| bytes.0).unwrap_or_default(),
-            epoch,
-        );
+        let hash = entry
+            .pending_commit
+            .take()
+            .map(|pending| sha256(&pending.commit).to_vec())
+            .unwrap_or_default();
+        record_applied(entry, before, hash, epoch);
         self.persist(true)?;
         Ok(CommitOutcome {
             epoch,
@@ -720,7 +842,7 @@ impl Engine {
         if entry
             .pending_commit
             .as_ref()
-            .is_some_and(|pending| pending.0 == hash)
+            .is_some_and(|pending| sha256(&pending.commit) == hash)
             && message_epoch == local
         {
             // Our own commit came back through the feed: the server took it.
@@ -829,16 +951,16 @@ impl Engine {
         })
     }
 
-    /// Joins a conversation from a `welcome` item of the handshake feed (raw TLS `Welcome`, or a
-    /// `MlsMessage` holding one).
+    /// Joins a conversation from a `welcome` item of the handshake feed (a `MLSMessage` holding the
+    /// `Welcome`, or a raw TLS `Welcome`).
     ///
     /// Every device in the group's tree must be one this client trusts (this device's own included,
     /// by its identity): [`Error::UntrustedDevices`] lists those that are not; verify their
     /// people's device lists and call again (the key package this Welcome uses is not spent by a
     /// refusal). The group's external sender key must be exactly one key, and must match the key
     /// already pinned for the conversation, or `server_key` (from `GET /v1/e2ee/conversations/{id}`),
-    /// or, with neither, it is pinned now. A Welcome below the epoch this device has reached is
-    /// [`Error::EpochBackwards`]. Messages from before this epoch can never be opened.
+    /// or, with neither, it is pinned now. A Welcome for an epoch this device has already been in is
+    /// [`Error::Duplicate`] and changes nothing. Messages from before this epoch can never be opened.
     pub fn handle_welcome(
         &mut self,
         conv: ConversationId,
@@ -877,6 +999,7 @@ impl Engine {
             (None, None) => None,
         };
         let config = join_config(&self.config);
+        let active = self.meta.get(&conv).is_some_and(|entry| !entry.removed);
         // Staging spends the key package this Welcome names. A refusal below must give it back.
         let spent = welcome.secrets().iter().find_map(|secret| {
             let reference = secret.new_member();
@@ -903,6 +1026,11 @@ impl Engine {
                 .build(),
             Err(error) => {
                 restore(self);
+                // A Welcome for a key package that is gone, in a conversation this device is already
+                // in: the one it joined by, delivered again.
+                if active && matches!(error, mls::WelcomeError::NoMatchingKeyPackage) {
+                    return Err(Error::Duplicate);
+                }
                 return Err(Error::mls(error));
             }
         };
@@ -910,6 +1038,9 @@ impl Engine {
             Ok(staged) => staged,
             Err(error) => {
                 restore(self);
+                if active && matches!(error, mls::WelcomeError::NoMatchingKeyPackage) {
+                    return Err(Error::Duplicate);
+                }
                 return Err(Error::mls(error));
             }
         };
@@ -957,21 +1088,13 @@ impl Engine {
             }
         };
 
+        // A Welcome for an epoch this device has already been in is one it has had before (a feed
+        // read again, or an old Welcome replayed to a device whose last-resort key package still
+        // opens it). Nothing is changed, so nothing is frozen: it is only not taken.
         if let Some(entry) = self.meta.get(&conv) {
-            if entry.high_epoch > epoch
-                || (!entry.removed
-                    && self
-                        .groups
-                        .get(&conv)
-                        .is_some_and(|group| group.epoch().as_u64() >= epoch))
-            {
+            if entry.high_epoch > 0 && epoch <= entry.high_epoch {
                 restore(self);
-                let local = entry.high_epoch;
-                self.freeze(conv, "epoch went backwards");
-                return Err(Error::EpochBackwards {
-                    local,
-                    shown: epoch,
-                });
+                return Err(Error::Duplicate);
             }
         }
         let group = match staged.into_group(&self.provider) {
@@ -1287,5 +1410,19 @@ impl Engine {
             .clear_pending_commit(provider.storage())
             .map_err(Error::mls)?;
         Ok(commit)
+    }
+}
+
+impl Engine {
+    /// The commit of ours that waits for the server's answer, whole, as `commit_pending` returned
+    /// it: after a restart or a reply that never came, send it again. The server decides by epoch,
+    /// so sending it twice is safe. Do not guess from a `409`: read the handshake feed and give the
+    /// `commit` item to [`Engine::handle_commit`], which confirms ours if it is the one that won
+    /// and drops ours and applies the winner if it is not.
+    pub fn pending_commit(&self, conv: ConversationId) -> Option<CommitBundle> {
+        self.meta
+            .get(&conv)
+            .and_then(|entry| entry.pending_commit.as_ref())
+            .map(StoredBundle::to_bundle)
     }
 }

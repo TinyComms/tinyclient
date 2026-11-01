@@ -89,8 +89,9 @@ pub(crate) struct ConvMeta {
     pub server_key_alert: bool,
     /// `(epoch the commit was made at, SHA-256 of the commit)`, oldest first.
     pub applied: Vec<(u64, Bytes)>,
-    /// SHA-256 of our commit that waits for the server's answer.
-    pub pending_commit: Option<Bytes>,
+    /// Our commit that waits for the server's answer, kept whole so that a restart (or a lost
+    /// reply) can send it again: see [`Engine::pending_commit`].
+    pub pending_commit: Option<crate::groups::StoredBundle>,
 }
 
 /// Where a device keeps its state and under which key.

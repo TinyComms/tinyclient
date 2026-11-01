@@ -1121,3 +1121,351 @@ fn a_forged_cross_signature_does_not_get_a_device_added() {
     let key = world.ds.public();
     assert!(ghost.handle_welcome(conv, &[0u8; 8], Some(&key)).is_err());
 }
+
+/// The proposal references a commit applies, read from the bytes of the MLSMessage as the server
+/// reads them (its `e2ee_text::mls::commit_references`): version, wire format, group id, epoch,
+/// sender, authenticated data, content type, then the list of proposals, each `2` (a reference)
+/// and a 32 byte hash. `None` if any is by value.
+fn references_of(data: &[u8]) -> Option<Vec<[u8; 32]>> {
+    fn vector(bytes: &[u8], at: &mut usize) -> Option<Vec<u8>> {
+        let first = *bytes.get(*at)?;
+        let (len, header) = match first >> 6 {
+            0 => (usize::from(first & 0x3f), 1),
+            1 => (
+                usize::from(first & 0x3f) << 8 | usize::from(*bytes.get(*at + 1)?),
+                2,
+            ),
+            2 => {
+                let rest = bytes.get(*at + 1..*at + 4)?;
+                (
+                    usize::from(first & 0x3f) << 24
+                        | usize::from(rest[0]) << 16
+                        | usize::from(rest[1]) << 8
+                        | usize::from(rest[2]),
+                    4,
+                )
+            }
+            _ => return None,
+        };
+        let out = bytes.get(*at + header..*at + header + len)?.to_vec();
+        *at += header + len;
+        Some(out)
+    }
+    let mut at = 0;
+    let mut take = |n: usize| -> Option<Vec<u8>> {
+        let out = data.get(at..at + n)?.to_vec();
+        at += n;
+        Some(out)
+    };
+    if take(2)? != [0, 1] || take(2)? != [0, 1] {
+        return None;
+    }
+    let mut cursor = at;
+    vector(data, &mut cursor)?; // group id
+    cursor += 8; // epoch
+    if *data.get(cursor)? != 1 {
+        return None; // not a member sender
+    }
+    cursor += 5; // sender type and leaf
+    vector(data, &mut cursor)?; // authenticated data
+    if *data.get(cursor)? != 3 {
+        return None; // not a commit
+    }
+    cursor += 1;
+    let list = vector(data, &mut cursor)?;
+    let mut inner = 0;
+    let mut out = Vec::new();
+    while inner < list.len() {
+        if list[inner] != 2 {
+            return None;
+        }
+        inner += 1;
+        let hash = vector(&list, &mut inner)?;
+        out.push(<[u8; 32]>::try_from(hash.as_slice()).ok()?);
+    }
+    Some(out)
+}
+
+#[test]
+fn the_commit_and_the_welcome_have_the_shape_the_server_checks() {
+    use openmls::prelude::tls_codec::DeserializeBytes as _;
+    use openmls::prelude::{ContentType, MlsMessageBodyIn, MlsMessageIn, ProtocolMessage, Sender};
+    let mut world = World::new();
+    let (a, b, c) = (world.person("a"), world.person("b"), world.person("c"));
+    world.sync_trust();
+    world.start(a);
+    let conv = world.conv();
+    let packages: Vec<Vec<u8>> = [b, c]
+        .iter()
+        .map(|at| world.clients[*at].engine.key_packages(1).unwrap().remove(0))
+        .collect();
+    let refs: Vec<&[u8]> = packages.iter().map(Vec::as_slice).collect();
+    world.clients[a]
+        .engine
+        .handle_proposals(conv, &world.ds.proposals(&refs, &[], 0))
+        .unwrap();
+    let bundle = world.clients[a]
+        .engine
+        .commit_pending(conv)
+        .unwrap()
+        .unwrap();
+
+    // The commit: an MLSMessage holding a PublicMessage commit for this group and epoch, from a
+    // member's leaf, that applies the two proposals by reference and none by value.
+    let message = MlsMessageIn::tls_deserialize_exact_bytes(&bundle.commit).unwrap();
+    let ProtocolMessage::PublicMessage(public) = message.try_into_protocol_message().unwrap()
+    else {
+        panic!("not a public message")
+    };
+    assert_eq!(public.content_type(), ContentType::Commit);
+    assert_eq!(public.group_id().as_slice(), conv.0);
+    assert_eq!(public.epoch().as_u64(), 0);
+    assert!(matches!(public.sender(), Sender::Member(_)));
+    assert_eq!(
+        references_of(&bundle.commit)
+            .expect("proposals by reference")
+            .len(),
+        2
+    );
+
+    // The Welcome: an MLSMessage holding a Welcome, one entry per added device, naming each
+    // device's key package (what the server matches the entries against).
+    assert_eq!(bundle.welcomes.len(), 2);
+    let MlsMessageBodyIn::Welcome(welcome) =
+        MlsMessageIn::tls_deserialize_exact_bytes(&bundle.welcomes[0].data)
+            .unwrap()
+            .extract()
+    else {
+        panic!("not a Welcome")
+    };
+    assert_eq!(welcome.secrets().len(), 2);
+    let added: Vec<_> = bundle.welcomes.iter().map(|w| w.device.device).collect();
+    assert!(
+        added.contains(&world.clients[b].device()) && added.contains(&world.clients[c].device())
+    );
+    // Raw `Welcome` bytes are read too.
+    use openmls::prelude::tls_codec::Serialize as _;
+    let raw = welcome.tls_serialize_detached().unwrap();
+    world.clients[a].engine.confirm_commit(conv).unwrap();
+    let key = world.ds.public();
+    world.clients[b]
+        .engine
+        .handle_welcome(conv, &raw, Some(&key))
+        .unwrap();
+    world.clients[c]
+        .engine
+        .handle_welcome(conv, &bundle.welcomes[1].data, Some(&key))
+        .unwrap();
+    world.say(b, &[a, c], "both forms join");
+    // Within every size the server accepts.
+    assert!(bundle.commit.len() <= e2ee::groups::limits::COMMIT);
+}
+
+#[test]
+fn a_commit_the_server_would_refuse_for_size_is_refused_here_and_not_left_in_flight() {
+    let mut world = World::new();
+    let a = world.person("a");
+    world.sync_trust();
+    world.start(a);
+    let conv = world.conv();
+    // 101 devices at once: one more than a commit may carry Welcomes for.
+    let joiners: Vec<usize> = (0..101).map(|n| world.person(&format!("j{n}"))).collect();
+    world.sync_trust();
+    let packages: Vec<Vec<u8>> = joiners
+        .iter()
+        .map(|at| world.clients[*at].engine.key_packages(1).unwrap().remove(0))
+        .collect();
+    let refs: Vec<&[u8]> = packages.iter().map(Vec::as_slice).collect();
+    let outcome = world.clients[a]
+        .engine
+        .handle_proposals(conv, &world.ds.proposals(&refs, &[], 0))
+        .unwrap();
+    assert_eq!(outcome.accepted.len(), 101);
+    let err = world.clients[a].engine.commit_pending(conv);
+    assert!(
+        matches!(err, Err(Error::TooLarge("welcomes in one commit"))),
+        "{err:?}"
+    );
+    // Nothing is in flight: the group is where it was and can be asked again.
+    assert!(matches!(
+        world.clients[a].engine.commit_pending(conv),
+        Err(Error::TooLarge(_))
+    ));
+    assert!(matches!(
+        world.clients[a].engine.confirm_commit(conv),
+        Err(Error::Malformed(_))
+    ));
+}
+
+#[test]
+fn the_external_sender_may_be_given_as_a_tls_external_sender_or_as_a_bare_key() {
+    use openmls::prelude::tls_codec::Serialize as _;
+    use openmls::prelude::{BasicCredential, ExternalSender};
+    let mut world = World::new();
+    let (a, b) = (world.person("a"), world.person("b"));
+    world.sync_trust();
+    let conv = world.conv();
+    // As the server hands it out in `GET /v1/e2ee/conversations/{id}`: the TLS ExternalSender.
+    let tls = ExternalSender::new(
+        world.ds.public().into(),
+        BasicCredential::new(b"tinyserver".to_vec()).into(),
+    )
+    .tls_serialize_detached()
+    .unwrap();
+    world.clients[a].engine.create_group(conv, &tls).unwrap();
+    assert_eq!(
+        world.clients[a].engine.server_key(conv).unwrap(),
+        world.ds.public()
+    );
+    let package = world.clients[b].engine.key_packages(1).unwrap().remove(0);
+    world.clients[a]
+        .engine
+        .handle_proposals(conv, &world.ds.proposals(&[&package], &[], 0))
+        .unwrap();
+    let bundle = world.clients[a]
+        .engine
+        .commit_pending(conv)
+        .unwrap()
+        .unwrap();
+    world.clients[a].engine.confirm_commit(conv).unwrap();
+    // The joiner is shown the bare key and the group's context holds the TLS one: the same key.
+    let bare = world.ds.public();
+    world.clients[b]
+        .engine
+        .handle_welcome(conv, &bundle.welcomes[0].data, Some(&bare))
+        .unwrap();
+    // Observing it in either form agrees; another key in either form does not.
+    world.clients[b]
+        .engine
+        .observe_server_key(conv, &tls)
+        .unwrap();
+    world.clients[b]
+        .engine
+        .observe_server_key(conv, &bare)
+        .unwrap();
+    let other = DeviceKey::generate().unwrap().public_key();
+    let other_tls = ExternalSender::new(
+        other.clone().into(),
+        BasicCredential::new(b"tinyserver".to_vec()).into(),
+    )
+    .tls_serialize_detached()
+    .unwrap();
+    assert!(matches!(
+        world.clients[b].engine.observe_server_key(conv, &other_tls),
+        Err(Error::ServerKeyChanged)
+    ));
+    // Junk is malformed, not a key.
+    assert!(world.clients[a]
+        .engine
+        .observe_server_key(conv, &[1, 2, 3])
+        .is_err());
+    assert!(world.clients[a]
+        .engine
+        .observe_server_key(conv, &[0u8; 65])
+        .is_err());
+    world.say(a, &[], "the group is fine");
+}
+
+#[test]
+fn a_welcome_delivered_again_is_not_taken_and_does_not_disturb_the_group() {
+    let mut world = World::new();
+    let (a, b) = (world.person("a"), world.person("b"));
+    world.sync_trust();
+    world.start(a);
+    let conv = world.conv();
+    // b joins with a last-resort key package, which a replayed Welcome can still open.
+    let key = world.ds.public();
+    let package = world.clients[b].engine.last_resort_key_package().unwrap();
+    world.clients[a]
+        .engine
+        .handle_proposals(conv, &world.ds.proposals(&[&package], &[], 0))
+        .unwrap();
+    let bundle = world.clients[a]
+        .engine
+        .commit_pending(conv)
+        .unwrap()
+        .unwrap();
+    world.clients[a].engine.confirm_commit(conv).unwrap();
+    world.clients[b]
+        .engine
+        .handle_welcome(conv, &bundle.welcomes[0].data, Some(&key))
+        .unwrap();
+    world.say(a, &[b], "first");
+    // The Welcome shows up again in the feed: refused, not an error that freezes anything.
+    let again = world.clients[b]
+        .engine
+        .handle_welcome(conv, &bundle.welcomes[0].data, Some(&key));
+    assert!(matches!(again, Err(Error::Duplicate)), "{again:?}");
+    assert!(world.clients[b].engine.frozen(conv).is_none());
+    world.say(a, &[b], "still fine");
+    // The same for a Welcome of a regular key package, which is gone by now.
+    let mut world = World::new();
+    let (a, b) = (world.person("a"), world.person("b"));
+    world.sync_trust();
+    world.start(a);
+    let conv = world.conv();
+    let key = world.ds.public();
+    let bundle = world.change(&[a], a, &[b], &[]);
+    let again = world.clients[b]
+        .engine
+        .handle_welcome(conv, &bundle.welcomes[0].data, Some(&key));
+    assert!(matches!(again, Err(Error::Duplicate)), "{again:?}");
+    world.say(b, &[a], "unharmed");
+}
+
+#[test]
+fn a_commit_in_flight_survives_a_restart_and_is_sent_again_whole() {
+    let mut world = World::new();
+    let (a, b) = (world.person("a"), world.person("b"));
+    world.sync_trust();
+    world.start(a);
+    let conv = world.conv();
+    let package = world.clients[b].engine.key_packages(1).unwrap().remove(0);
+    world.clients[a]
+        .engine
+        .handle_proposals(conv, &world.ds.proposals(&[&package], &[], 0))
+        .unwrap();
+    let made = world.clients[a]
+        .engine
+        .commit_pending(conv)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        world.clients[a].engine.pending_commit(conv),
+        Some(made.clone())
+    );
+    // The process is killed before the answer. From the stored state it is all still there.
+    let key = e2ee::store::StateKey::generate().unwrap();
+    let blob = world.clients[a].engine.snapshot(&key, "s").unwrap();
+    let mut restarted = e2ee::Engine::from_snapshot(&key, "s", &blob).unwrap();
+    assert_eq!(restarted.pending_commit(conv), Some(made.clone()));
+    // The server had taken it: the commit comes back through the feed and settles it.
+    let outcome = restarted
+        .handle_commit(conv, made.epoch, &made.commit)
+        .unwrap();
+    assert_eq!(outcome.epoch, 1);
+    assert!(restarted.pending_commit(conv).is_none());
+    let sealed = restarted
+        .encrypt(conv, Kind::Message, None, &envelope("after restart"))
+        .unwrap();
+    let key = world.ds.public();
+    world.clients[b]
+        .engine
+        .handle_welcome(conv, &made.welcomes[0].data, Some(&key))
+        .unwrap();
+    let claimed = Claimed {
+        author: Some(restarted.user_id()),
+        device: None,
+        kind: Kind::Message,
+        target_id: None,
+    };
+    assert_eq!(
+        world.clients[b]
+            .engine
+            .decrypt(conv, &sealed.ciphertext, &claimed)
+            .unwrap()
+            .envelope
+            .text,
+        "after restart"
+    );
+}
