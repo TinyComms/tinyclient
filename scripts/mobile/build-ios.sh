@@ -81,6 +81,10 @@ done
 
 # --- Build -----------------------------------------------------------------
 
+# The app's floor (project.yml). Unset, rustc links the library's cdylib for iOS 10, where
+# the C dependencies built against the current SDK find no ___chkstk_darwin.
+export IPHONEOS_DEPLOYMENT_TARGET="${IPHONEOS_DEPLOYMENT_TARGET:-16.0}"
+
 # `--lib` because the package also has the desktop binary; `mobile` is the entry point + gui.
 build() {
     local triple="$1"
