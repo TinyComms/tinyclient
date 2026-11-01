@@ -15,23 +15,77 @@ use unsafe_libopus::{
 pub const MAX_FRAME: usize = FRAME * 6;
 /// Discord's ceiling for voice outside boosted servers.
 const BITRATE: i32 = 64_000;
-/// What a Tiny server's SFU expects of each speaker (tinyserver's `docs/calls.md`), and forwards
-/// up to twice of.
+/// Where a Tiny call starts, until the room says its own rate (`Bitrate`, up to 128 kb/s), which
+/// is the one that counts from then on.
 const VOICE_BITRATE: i32 = 32_000;
 /// The loss the encoder plans its in-band FEC for until the far end says what it sees, and the
 /// least it ever plans for: enough that every speech packet carries a copy of the one before.
 const LOSS_FLOOR: i32 = 5;
 const LOSS_PLANNED: i32 = 10;
+/// What is planned for is added onto what the reports say.
+const LOSS_MARGIN: i32 = 2;
+/// How much of a report goes into the loss planned for: half when it says worse, so the copies
+/// are there for the next packets; a twentieth when it says better, about 20 s to come back
+/// down, since loss comes in bursts and the next one is usually not far off.
+const LOSS_ATTACK: f32 = 0.5;
+const LOSS_RELEASE: f32 = 0.05;
+
+/// The bitrates a speaker steps down through while the server keeps missing packets, in percent
+/// of the room's, and the least it goes: below this there is no room for in-band FEC.
+const RUNGS: [i32; 3] = [100, 75, 50];
+const RUNGS_FLOOR: i32 = 16_000;
+/// Smoothed loss over this for `DOWN_AFTER` reports, one a second, is a step down; under
+/// `UP_BELOW` for `UP_AFTER`, a step back up. Wide apart, so the rate does not hunt.
+const DOWN_ABOVE: f32 = 0.08;
+const DOWN_AFTER: u32 = 5;
+const UP_BELOW: f32 = 0.02;
+const UP_AFTER: u32 = 30;
+/// How much of each report goes into that smoothed loss.
+const LADDER_SMOOTHING: f32 = 0.3;
+
+/// Where on [`RUNGS`] a speaker is. Loss that lasts is a link that cannot carry the rate.
+#[derive(Debug, Default)]
+struct Ladder {
+    rung: usize,
+    loss: f32,
+    /// Reports in a row over `DOWN_ABOVE`, and under `UP_BELOW`.
+    over: u32,
+    under: u32,
+}
+
+impl Ladder {
+    fn report(&mut self, fraction: f32) {
+        self.loss += (fraction - self.loss) * LADDER_SMOOTHING;
+        self.over = if self.loss > DOWN_ABOVE { self.over + 1 } else { 0 };
+        self.under = if self.loss < UP_BELOW { self.under + 1 } else { 0 };
+        if self.over >= DOWN_AFTER {
+            self.over = 0;
+            self.rung = (self.rung + 1).min(RUNGS.len() - 1);
+        } else if self.under >= UP_AFTER {
+            self.under = 0;
+            self.rung = self.rung.saturating_sub(1);
+        }
+    }
+
+    /// The rate to encode at in a room of `room`, never over it.
+    fn rate(&self, room: i32) -> i32 {
+        (room * RUNGS[self.rung] / 100).max(RUNGS_FLOOR.min(room))
+    }
+}
 
 pub struct Encoder {
     state: *mut OpusEncoder,
     /// One channel: each stereo frame is folded to mono before it is encoded.
     mono: bool,
-    /// The bitrate it was made at, and the one it encodes at now.
+    /// The bitrate it was made at, the one it was last asked for (a Tiny room's), and the one it
+    /// encodes at now: the same, unless [`Ladder`] has stepped it down.
     default: i32,
+    room: i32,
     bitrate: i32,
-    /// The packet loss, in percent, FEC is planned for.
+    ladder: Ladder,
+    /// The packet loss, in percent, FEC is planned for, and the smoothed reports behind it.
     loss: i32,
+    reported: f32,
 }
 
 // One thread owns each codec; the pointer is to plain heap state.
@@ -48,9 +102,10 @@ impl Encoder {
         Encoder::made(CHANNELS, OPUS_APPLICATION_AUDIO, bitrate, false)
     }
 
-    /// Mono speech at 32 kbit/s, with in-band FEC, for a Tiny server call. No DTX: the speech
-    /// gate already sends nothing in silence, and DTX's skipped frames inside a talk spurt (the
-    /// pauses between words) reach the far end as losses it has to make up.
+    /// Mono speech with in-band FEC, for a Tiny server call, at [`VOICE_BITRATE`] until the room's
+    /// rate arrives. No DTX: the speech gate already sends nothing in silence, and DTX's skipped
+    /// frames inside a talk spurt (the pauses between words) reach the far end as losses it has
+    /// to make up.
     pub fn voice() -> Option<Encoder> {
         Encoder::made(1, OPUS_APPLICATION_VOIP, VOICE_BITRATE, false)
     }
@@ -75,13 +130,19 @@ impl Encoder {
             opus_encoder_ctl!(state, OPUS_SET_PACKET_LOSS_PERC_REQUEST, LOSS_PLANNED);
             opus_encoder_ctl!(state, OPUS_SET_DTX_REQUEST, i32::from(dtx));
         }
-        Some(Encoder { state, mono: channels == 1, default: bitrate, bitrate, loss: LOSS_PLANNED })
+        let reported = (LOSS_PLANNED - LOSS_MARGIN) as f32 / 100.;
+        Some(Encoder { state, mono: channels == 1, default: bitrate, room: bitrate, bitrate, ladder: Ladder::default(), loss: LOSS_PLANNED, reported })
     }
 
     /// The far end's reports say it is losing `fraction` of our packets: FEC is planned for
-    /// that, a little more, and never less than [`LOSS_FLOOR`].
+    /// that, smoothed, a little more, and never less than [`LOSS_FLOOR`]. If it goes on, the
+    /// bitrate comes down too.
     pub fn set_loss(&mut self, fraction: f32) {
-        let wanted = ((fraction * 100.).round() as i32 + 2).clamp(LOSS_FLOOR, 30);
+        self.ladder.report(fraction);
+        self.apply_bitrate();
+        let rate = if fraction > self.reported { LOSS_ATTACK } else { LOSS_RELEASE };
+        self.reported += (fraction - self.reported) * rate;
+        let wanted = ((self.reported * 100.).round() as i32 + LOSS_MARGIN).clamp(LOSS_FLOOR, 30);
         if wanted != self.loss {
             // SAFETY: `state` is a live encoder and the request takes one i32.
             unsafe {
@@ -91,10 +152,15 @@ impl Encoder {
         }
     }
 
-    /// Encodes at `bitrate` bits a second from the next frame on (a Tiny room's, `Bitrate`);
-    /// `None` goes back to the rate it was made at.
+    /// Encodes at up to `bitrate` bits a second from the next frame on (a Tiny room's,
+    /// `Bitrate`); `None` goes back to the rate it was made at.
     pub fn set_bitrate(&mut self, bitrate: Option<i32>) {
-        let wanted = bitrate.unwrap_or(self.default);
+        self.room = bitrate.unwrap_or(self.default);
+        self.apply_bitrate();
+    }
+
+    fn apply_bitrate(&mut self) {
+        let wanted = self.ladder.rate(self.room);
         if wanted != self.bitrate {
             // SAFETY: `state` is a live encoder and the request takes one i32.
             unsafe {
@@ -227,17 +293,21 @@ impl Decoder {
     /// and the decoder is left where the last real frame put it: counting this wait as a loss
     /// makes [`Decoder::forget`] drop that state, and the frames after a real loss come out loud.
     pub(crate) fn bridge(&mut self, samples: usize, pcm: &mut [i16]) -> usize {
-        if !self.concealing {
-            self.pitch = pitch(&self.last);
-            self.cursor = 0;
-            self.gain = 1.;
-            self.concealing = true;
-        }
+        self.carry_on();
         let out = &mut pcm[..samples * CHANNELS];
         for pair in out.as_chunks_mut::<CHANNELS>().0 {
             *pair = self.extend();
         }
         samples
+    }
+
+    /// `frames` went by that the decoder will never see and no tick stands in for. Whatever it
+    /// decodes next starts from a clean state, as after that many concealed frames in a row.
+    pub(crate) fn missed(&mut self, frames: u32) {
+        if frames > 0 {
+            self.carry_on();
+            self.misses = self.misses.saturating_add(frames);
+        }
     }
 
     /// Stands in for a lost packet when the one after it cannot rebuild it ([`Decoder::recover`]).
@@ -256,15 +326,9 @@ impl Decoder {
                 return decoded;
             }
         }
-        if !self.concealing {
-            self.pitch = pitch(&self.last);
-            self.cursor = 0;
-            self.gain = 1.;
-            self.concealing = true;
-        }
+        self.carry_on();
         let out = &mut pcm[..samples * CHANNELS];
-        // Each lost frame takes the level down by a third of the way to nothing.
-        let fall = 1. / (3 * samples.max(1)) as f32;
+        let fall = 1. / (FADE_FRAMES * samples.max(1)) as f32;
         for pair in out.as_chunks_mut::<CHANNELS>().0 {
             *pair = self.extend();
             self.gain = (self.gain - fall).max(0.);
@@ -272,30 +336,44 @@ impl Decoder {
         samples
     }
 
-    /// The talk spurt ended. Ramp from the last sample that was actually played down to zero.
-    /// Starting a pitch repeat here jumps, and that jump is the pop at the end of a sentence.
-    /// The decoder is left alone for one frame, so a packet that was only late still continues
-    /// it; a longer gap counts as concealment and the next real frame starts clean.
-    pub(crate) fn release(&mut self, samples: usize, pcm: &mut [i16]) -> usize {
-        let out = &mut pcm[..samples * CHANNELS];
+    /// One tick with nothing to play: a packet running late, or the end of a sentence, and only
+    /// the next packet can tell. Nothing is lost so far, so the decoder stays where the last real
+    /// frame left it and a late packet simply continues it. Meanwhile the voice carries on,
+    /// fading out, from the sample that was actually played: starting the pitch repeat cold
+    /// jumps, and that jump is the pop at the end of a sentence.
+    pub(crate) fn late(&mut self, samples: usize, pcm: &mut [i16]) -> usize {
         let from = self.ending();
-        let steps = samples.max(1) as f32;
-        for (n, pair) in out.chunks_mut(CHANNELS).enumerate() {
-            let gain = 1. - (n as f32 + 1.) / steps;
-            for (sample, &start) in pair.iter_mut().zip(&from) {
-                *sample = (f32::from(start) * gain) as i16;
+        let ease = if self.concealing { 0 } else { RESUME };
+        self.carry_on();
+        let out = &mut pcm[..samples * CHANNELS];
+        let fall = 1. / (FADE_FRAMES * samples.max(1)) as f32;
+        for (n, pair) in out.as_chunks_mut::<CHANNELS>().0.iter_mut().enumerate() {
+            *pair = self.extend();
+            self.gain = (self.gain - fall).max(0.);
+            if n < ease {
+                let toward = (n + 1) as f32 / (ease + 1) as f32;
+                for (sample, start) in pair.iter_mut().zip(from) {
+                    *sample = (f32::from(start) * (1. - toward) + f32::from(*sample) * toward) as i16;
+                }
             }
         }
-        self.last.clear();
-        self.gain = 0.;
-        self.concealing = true;
-        self.misses = self.misses.saturating_add(1);
         samples
+    }
+
+    /// The pitch repeat of what was last heard, ready to go on from, unless it already is.
+    fn carry_on(&mut self) {
+        if !self.concealing {
+            self.pitch = pitch(&self.last);
+            self.cursor = 0;
+            self.gain = 1.;
+            self.concealing = true;
+        }
     }
 
     /// After we concealed frames the decoder never saw, its state is the speech of before the
     /// gap; going on from it puts a burst in the first frame back. It starts afresh instead,
-    /// and [`Decoder::resume`] fades from the concealment into what it makes.
+    /// and [`Decoder::resume`] fades from the concealment into what it makes. Ticks where the
+    /// voice only ran late do not count: the decoder missed nothing.
     fn forget(&mut self) {
         if self.concealing && self.misses > 1 {
             // SAFETY: `state` is a live decoder; the request takes no argument.
@@ -382,6 +460,8 @@ impl Drop for Decoder {
 
 /// Frames over which a real frame after concealment fades in from it: 5 ms.
 const RESUME: usize = 240;
+/// Lost or late packets the concealment fades to nothing over: 60 ms.
+const FADE_FRAMES: usize = 3;
 
 /// The pitch period of a stereo frame, in frames: the lag between 2.5 and 16 ms (400 down to
 /// 62.5 Hz) at which the frame best matches itself. Unvoiced sound has none worth the name and
@@ -504,6 +584,93 @@ mod tests {
         }
     }
 
+    /// The rate after each of `reports`.
+    fn rates(encoder: &mut Encoder, reports: &[f32]) -> Vec<i32> {
+        reports
+            .iter()
+            .map(|&loss| {
+                encoder.set_loss(loss);
+                encoder.bitrate()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn lasting_loss_steps_the_bitrate_down_and_a_long_clean_spell_brings_it_back() {
+        let mut encoder = Encoder::voice().unwrap();
+        encoder.set_bitrate(Some(64_000));
+        let going = rates(&mut encoder, &[0.15; 30]);
+        assert!(going[..5].iter().all(|&rate| rate == 64_000), "five seconds first: {going:?}");
+        assert_eq!(going[29], 32_000, "as far as the ladder goes: {going:?}");
+        assert!(going.contains(&48_000), "one step at a time: {going:?}");
+        let coming = rates(&mut encoder, &[0.; 90]);
+        assert!(coming[..30].iter().all(|&rate| rate == 32_000), "{coming:?}");
+        assert_eq!(coming[89], 64_000, "{coming:?}");
+        assert!(coming.iter().all(|&rate| rate <= 64_000));
+    }
+
+    #[test]
+    fn a_burst_of_loss_is_not_a_reason_to_change_the_bitrate() {
+        let mut encoder = Encoder::voice().unwrap();
+        encoder.set_bitrate(Some(64_000));
+        let rates = rates(&mut encoder, &[0., 0., 0.3, 0., 0., 0., 0., 0.25, 0., 0., 0., 0.]);
+        assert!(rates.iter().all(|&rate| rate == 64_000), "{rates:?}");
+    }
+
+    #[test]
+    fn loss_between_the_two_marks_leaves_the_bitrate_where_it_is() {
+        let mut encoder = Encoder::voice().unwrap();
+        encoder.set_bitrate(Some(64_000));
+        rates(&mut encoder, &[0.2; 8]);
+        let stepped = encoder.bitrate();
+        assert!(stepped < 64_000);
+        let rates = rates(&mut encoder, &[0.04; 120]);
+        assert!(rates.iter().skip(10).all(|&rate| rate == rates[10]), "{rates:?}");
+    }
+
+    #[test]
+    fn the_ladder_keeps_under_the_room_and_over_the_floor() {
+        let mut encoder = Encoder::voice().unwrap();
+        encoder.set_bitrate(Some(20_000));
+        rates(&mut encoder, &[0.2; 30]);
+        assert_eq!(encoder.bitrate(), RUNGS_FLOOR);
+        encoder.set_bitrate(Some(12_000));
+        assert_eq!(encoder.bitrate(), 12_000, "a room under the floor is still the room");
+        encoder.set_bitrate(Some(96_000));
+        assert_eq!(encoder.bitrate(), 48_000, "the step down holds in a new room");
+    }
+
+    #[test]
+    fn the_loss_planned_for_rises_fast_and_falls_slowly() {
+        let mut encoder = Encoder::voice().unwrap();
+        for _ in 0..200 {
+            encoder.set_loss(0.);
+        }
+        assert_eq!(encoder.loss, LOSS_FLOOR, "the floor stands");
+        encoder.set_loss(0.3);
+        let burst = encoder.loss;
+        assert!(burst >= 15, "one bad report is believed: {burst}");
+        encoder.set_loss(0.);
+        assert!((burst - 2..=burst).contains(&encoder.loss), "one clean report is not: {}", encoder.loss);
+        for _ in 0..60 {
+            encoder.set_loss(0.);
+        }
+        assert_eq!(encoder.loss, LOSS_FLOOR);
+    }
+
+    #[test]
+    fn the_loss_planned_for_does_not_follow_every_report() {
+        let mut encoder = Encoder::voice().unwrap();
+        let mut planned = Vec::new();
+        for n in 0..100 {
+            encoder.set_loss(if n % 2 == 0 { 0.1 } else { 0. });
+            planned.push(encoder.loss);
+        }
+        let settled = &planned[40..];
+        let (least, most) = (settled.iter().min().unwrap(), settled.iter().max().unwrap());
+        assert!(most - least <= 3, "{least} to {most}");
+    }
+
     #[test]
     fn a_lost_packet_is_concealed_not_silent() {
         let (mut encoder, mut decoder) = (Encoder::new().unwrap(), Decoder::new().unwrap());
@@ -520,6 +687,51 @@ mod tests {
 
     fn peak(pcm: &[i16]) -> u16 {
         pcm.iter().map(|s| s.unsigned_abs()).max().unwrap()
+    }
+
+    /// A packet that is only late must not cost the decoder its state. It used to, after two
+    /// ticks: the frames after it then came from a decoder started afresh.
+    #[test]
+    fn a_late_packet_continues_the_decoder_exactly_where_it_stopped() {
+        let mut encoder = Encoder::voice().unwrap();
+        let (mut waited, mut steady) = (Decoder::new().unwrap(), Decoder::new().unwrap());
+        let (mut pcm, mut reference) = (vec![0i16; MAX_FRAME * CHANNELS], vec![0i16; MAX_FRAME * CHANNELS]);
+        for (n, frame) in tone(20).chunks(FRAME * CHANNELS).enumerate() {
+            let mut packet = [0u8; 1500];
+            let len = encoder.encode(frame, &mut packet).unwrap();
+            if n == 12 {
+                for _ in 0..5 {
+                    waited.late(FRAME, &mut pcm);
+                }
+            }
+            waited.decode(Some(&packet[..len]), 0, &mut pcm).unwrap();
+            steady.decode(Some(&packet[..len]), 0, &mut reference).unwrap();
+            if n >= 12 {
+                let from = RESUME * CHANNELS;
+                assert_eq!(pcm[from..FRAME * CHANNELS], reference[from..FRAME * CHANNELS], "frame {n}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_late_tick_fades_from_the_last_sample_played_and_ends_in_silence() {
+        let mut encoder = Encoder::voice().unwrap();
+        let mut decoder = Decoder::new().unwrap();
+        let mut pcm = vec![0i16; MAX_FRAME * CHANNELS];
+        for frame in tone(10).chunks(FRAME * CHANNELS) {
+            let mut packet = [0u8; 1500];
+            let len = encoder.encode(frame, &mut packet).unwrap();
+            decoder.decode(Some(&packet[..len]), 0, &mut pcm).unwrap();
+        }
+        let before = pcm[FRAME * CHANNELS - CHANNELS];
+        decoder.late(FRAME, &mut pcm);
+        let step = (i32::from(pcm[0]) - i32::from(before)).abs();
+        assert!(step < 1_000, "the fade steps {step} from the last sample");
+        assert!(energy(&pcm[..FRAME * CHANNELS]) > 1_000., "the voice carries on");
+        for _ in 0..FADE_FRAMES {
+            decoder.late(FRAME, &mut pcm);
+        }
+        assert_eq!(peak(&pcm[..FRAME * CHANNELS]), 0, "and then it is silence");
     }
 
     /// At 12 kbit/s libopus sends speech-mode (SILK) packets, as a low-bitrate voice channel

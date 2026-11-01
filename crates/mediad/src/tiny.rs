@@ -593,7 +593,8 @@ impl Call {
             }
             Event::PeerStats(stats) => {
                 let pair = stats.selected_candidate_pair.as_ref();
-                self.meter.round_trip(stats.rtt.or_else(|| pair.and_then(|pair| pair.current_round_trip_time)));
+                self.meter.round_trip(pair.and_then(|pair| pair.current_round_trip_time), stats.rtt);
+                self.meter.path_loss(stats.egress_loss_fraction, stats.ingress_loss_fraction);
                 // Only host candidates are offered: the path is UDP or ICE-TCP, never a relay.
                 if let Some(pair) = pair {
                     self.meter.path = match pair.protocol {
@@ -604,8 +605,13 @@ impl Call {
             }
             // What the server sees of our microphone: its FEC is planned for that loss.
             Event::MediaEgressStats(stats) if stats.mid == self.link.microphone => {
-                if let Some(loss) = stats.loss {
-                    self.encoder.set_loss(loss);
+                if self.meter.spoke(stats.packets) {
+                    if let Some(loss) = stats.loss {
+                        self.encoder.set_loss(loss);
+                    }
+                    if let Some(remote) = stats.remote {
+                        self.meter.uplink_jitter(remote.jitter);
+                    }
                 }
             }
             Event::EgressBitrateEstimate(BweKind::Twcc { estimate, .. }) => self.estimate = Some(estimate.as_u64()),
@@ -1120,7 +1126,7 @@ impl Call {
             self.meter.troubles = audio.troubles();
         }
         if self.ticks.is_multiple_of(SECOND) && self.connected {
-            let stats = self.meter.second(self.slots.values().map(|slot| slot.stream.counts()));
+            let stats = self.meter.second(self.slots.values_mut().map(|slot| slot.stream.counts()));
             self.controls.publish_stats(stats);
         }
         if let Some(devices) = &mut self.devices {
@@ -1273,7 +1279,7 @@ pub fn run(link: Link, user_id: String, controls: Arc<Controls>) {
         cue: None,
         processor: Processor::new(),
         limiter: Limiter::default(),
-        meter: Meter::new(CallPath::Unknown),
+        meter: Meter::own_path(CallPath::Unknown),
         video: Video::new(controls.clone()),
         estimate: None,
         rates: Rates::default(),
@@ -1359,9 +1365,7 @@ mod tests {
         }
         assert!(matches!(jitter.pop(), Pop::Packet(_)));
         assert!(matches!(jitter.pop(), Pop::Packet(_)));
-        assert_eq!(jitter.pop(), Pop::Hold);
-        assert_eq!(jitter.pop(), Pop::Hold);
-        assert_eq!(jitter.pop(), Pop::Lost);
+        assert_eq!(jitter.pop(), Pop::Lost(1));
         assert_eq!(jitter.next(), Some(&[4u8][..]));
     }
 

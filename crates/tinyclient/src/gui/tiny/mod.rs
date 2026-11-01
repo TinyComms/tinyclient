@@ -36,13 +36,14 @@ use super::input::{InputEvent, InputKey, TextInput};
 use super::sidebar::Mode;
 use super::state::Shell;
 use crate::client::ask;
+use crate::gui::call::health;
 use gpui::{prelude::*, Bounds, ClipboardItem, Context, Entity, Focusable, PathPromptOptions, Pixels, Point, Task, Window};
 use protocol::{AccountKey, CallStats, Change, Key, Link, Network, Presence, Request, Response, TinyCommunity};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Shown when the server's token cannot be wrapped with this server's address.
 const UNMADE: &str = "The invite could not be made into a code.";
@@ -195,6 +196,8 @@ pub struct State {
     /// The poll before `stats`, so the audio counters (counts over the whole call) can be read
     /// as what grew in the last second.
     stats_before: Option<CallStats>,
+    /// The polls over the last several seconds: what the bars and the numbers show.
+    steady: health::Steady,
     /// Why there are no numbers, when mediad said.
     stats_note: Option<String>,
     stats_task: Option<Task<()>>,
@@ -274,6 +277,7 @@ impl State {
             sliding: None,
             stats: None,
             stats_before: None,
+            steady: health::Steady::default(),
             stats_note: None,
             stats_task: None,
             name_input,
@@ -839,6 +843,7 @@ impl Shell {
             if self.tiny_state.stats_task.take().is_some() {
                 self.tiny_state.stats = None;
                 self.tiny_state.stats_before = None;
+                self.tiny_state.steady = health::Steady::default();
                 self.tiny_state.stats_note = None;
             }
             return;
@@ -861,6 +866,7 @@ impl Shell {
             let going = this.update(cx, |this, cx| {
                 match answer {
                     Ok(Response::CallStats { stats }) => {
+                        this.tiny_state.steady.feed(&stats, Instant::now());
                         this.tiny_state.stats_before = this.tiny_state.stats.replace(stats);
                         this.tiny_state.stats_note = None;
                     }
@@ -868,6 +874,7 @@ impl Shell {
                     Ok(Response::Error { detail, .. }) => {
                         this.tiny_state.stats = None;
                         this.tiny_state.stats_before = None;
+                        this.tiny_state.steady = health::Steady::default();
                         this.tiny_state.stats_note = Some(detail);
                     }
                     _ => {}

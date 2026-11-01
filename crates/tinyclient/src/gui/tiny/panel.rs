@@ -10,7 +10,7 @@ use crate::gui::components::{glyph, tip, Avatar};
 use crate::gui::state::Shell;
 use crate::gui::theme::{self, Type};
 use gpui::{div, prelude::*, px, Context, Div, Rgba, SharedString, Stateful};
-use protocol::{CallPath, CallState, CallStats, Presence};
+use protocol::{CallPath, CallState, Presence};
 
 pub(super) const PANEL: f32 = 52.;
 
@@ -35,8 +35,8 @@ fn panel_button(id: &'static str, icon: &'static str, off: bool) -> Stateful<Div
 
 /// How good the link is, from its round trip, loss and jitter: the colour of the panel's words.
 /// Not measured yet reads as connected.
-pub(super) fn quality(stats: &CallStats) -> Rgba {
-    match Health::from_stats(stats).grade() {
+pub(super) fn quality(health: &Health) -> Rgba {
+    match health.grade() {
         Grade::Unknown => theme::positive(),
         grade => grade.color(),
     }
@@ -44,13 +44,13 @@ pub(super) fn quality(stats: &CallStats) -> Rgba {
 
 /// The panel's second line while this server has a call, and whether a click on it opens
 /// Call health. `None` when the call is not one to speak of (failed: the dock says so).
-fn call_line(state: &CallState, stats: Option<&CallStats>) -> Option<(String, Rgba)> {
+fn call_line(state: &CallState, health: Option<&Health>) -> Option<(String, Rgba)> {
     Some(match state {
         CallState::Connecting | CallState::RingingOut => ("Connecting…".to_owned(), theme::warning()),
         CallState::Reconnecting => ("Reconnecting…".to_owned(), theme::warning()),
-        CallState::Joined => match stats {
-            Some(stats) if stats.rtt_ms > 0 => (format!("Voice connected · {} ms", stats.rtt_ms), quality(stats)),
-            _ => ("Voice connected".to_owned(), theme::positive()),
+        CallState::Joined => match health.and_then(|health| Some((health, health.rtt_ms?))) {
+            Some((health, ms)) => (format!("Voice connected · {ms} ms"), quality(health)),
+            None => ("Voice connected".to_owned(), theme::positive()),
         },
         CallState::Failed { .. } | CallState::RingingIn { .. } => return None,
     })
@@ -78,8 +78,9 @@ impl Shell {
         let (muted, deafened) = self.tiny_quiet();
         let call = self.tiny_call();
         let room = page.mine.and_then(|id| page.community.rooms.iter().find(|room| room.id == id));
-        let in_call = call.as_ref().and_then(|call| call_line(&call.state, self.tiny_state.stats.as_ref()));
-        let grade = self.tiny_state.stats.as_ref().map_or(Grade::Unknown, |stats| Health::from_stats(stats).grade());
+        let health = self.tiny_health();
+        let in_call = call.as_ref().and_then(|call| call_line(&call.state, health.as_ref()));
+        let grade = health.map_or(Grade::Unknown, |health| health.grade());
         let joined = call.as_ref().is_some_and(|call| call.state == CallState::Joined);
         let (line, color, clickable): (String, Rgba, bool) = match (in_call, room) {
             (Some((line, color)), _) => (line, color, true),
@@ -161,7 +162,7 @@ impl Shell {
     /// How this server's call is doing, while it has one.
     pub(in crate::gui) fn tiny_health(&self) -> Option<Health> {
         let before = self.tiny_state.stats_before.as_ref();
-        self.tiny_state.stats.as_ref().map(|stats| Health::from_polls(before, stats))
+        self.tiny_state.stats.as_ref().map(|stats| self.tiny_state.steady.applied(Health::from_polls(before, stats)))
     }
 
     /// Call health, over the panel: the link graded, what to do about it in words, then the
@@ -207,9 +208,9 @@ impl Shell {
         match &self.tiny_state.stats {
             Some(stats) => {
                 card = card
-                    .child(row("Ping", format!("{} ms", stats.rtt_ms)))
-                    .child(row("Jitter", format!("{} ms", stats.jitter_ms)))
-                    .child(row("Packet loss", format!("{:.1} %", f32::from(stats.loss_permille) / 10.)))
+                    .child(row("Ping", format!("{} ms", health.rtt_ms.unwrap_or(0))))
+                    .child(row("Jitter", format!("{} ms", health.jitter_ms.unwrap_or(0))))
+                    .child(row("Packet loss", format!("{:.1} %", f32::from(health.loss_permille.unwrap_or(0)) / 10.)))
                     .child(row("Sending", format!("{} kb/s", stats.send_kbps)))
                     .child(row("Receiving", format!("{} kb/s", stats.receive_kbps)))
                     .child(row("Path", path_words(stats.path).to_owned()))
@@ -227,10 +228,11 @@ impl Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use protocol::CallStats;
 
     #[test]
     fn the_panel_says_what_the_call_is_doing_not_just_that_there_is_one() {
-        let good = CallStats { rtt_ms: 38, jitter_ms: 3, ..CallStats::default() };
+        let good = Health::from_stats(&CallStats { rtt_ms: 38, jitter_ms: 3, ..CallStats::default() });
         assert_eq!(call_line(&CallState::Joined, Some(&good)).map(|line| line.0), Some("Voice connected · 38 ms".to_owned()));
         assert_eq!(call_line(&CallState::Joined, None).map(|line| line.0), Some("Voice connected".to_owned()));
         assert_eq!(call_line(&CallState::Connecting, Some(&good)), Some(("Connecting…".to_owned(), theme::warning())));
@@ -241,10 +243,10 @@ mod tests {
 
     #[test]
     fn the_link_is_coloured_by_its_round_trip_and_loss() {
-        let stats = |rtt_ms, loss_permille| CallStats { rtt_ms, loss_permille, ..CallStats::default() };
+        let stats = |rtt_ms, loss_permille| Health::from_stats(&CallStats { rtt_ms, loss_permille, ..CallStats::default() });
         assert_eq!(quality(&stats(40, 0)), theme::positive());
-        assert_eq!(quality(&stats(180, 0)), theme::warning());
-        assert_eq!(quality(&stats(40, 30)), theme::warning());
+        assert_eq!(quality(&stats(250, 0)), theme::warning());
+        assert_eq!(quality(&stats(40, 40)), theme::warning());
         assert_eq!(quality(&stats(400, 0)), theme::danger());
         assert_eq!(path_words(CallPath::Relay), "Relayed");
     }
