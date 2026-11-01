@@ -48,7 +48,9 @@ const CLOSE_BELOW: u8 = 10;
 pub fn opening(mode: InputMode, keys: &Keys, heard: u8, talking: bool, now: Instant) -> (bool, u32) {
     match mode {
         InputMode::Voice { threshold } => {
-            let needed = if talking { threshold.saturating_sub(CLOSE_BELOW) } else { threshold };
+            // Never down to zero from above it: every level is at least that, so the gate would
+            // not close again. A threshold of zero is the gate left open, and stays so.
+            let needed = if talking { threshold.saturating_sub(CLOSE_BELOW).max(threshold.min(1)) } else { threshold };
             (heard >= needed || keys.priority, HOLD)
         }
         InputMode::PushToTalk { release_ms } => {
@@ -87,7 +89,19 @@ mod tests {
         assert!(opening(voice, &keys, 30, true, now).0);
         assert!(!opening(voice, &keys, 29, true, now).0, "quiet is quiet");
         let low = InputMode::Voice { threshold: 3 };
-        assert!(opening(low, &keys, 0, true, now).0, "a threshold near zero does not wrap");
+        assert!(opening(low, &keys, 1, true, now).0, "a threshold near zero does not wrap");
+    }
+
+    #[test]
+    fn a_low_threshold_still_closes_in_silence() {
+        let now = Instant::now();
+        let keys = Keys::default();
+        for threshold in 1..=10 {
+            let voice = InputMode::Voice { threshold };
+            assert!(!opening(voice, &keys, 0, true, now).0, "stuck open at {threshold}");
+        }
+        let always = InputMode::Voice { threshold: 0 };
+        assert!(opening(always, &keys, 0, true, now).0, "zero is the gate left open");
     }
 
     #[test]
