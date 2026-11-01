@@ -4,6 +4,7 @@
 
 use palette::IntoColor;
 use crate::gui::components::glyph;
+use crate::gui::phone::{self, tokens::{self, PhoneType}};
 use crate::gui::theme::{self, Type};
 use gpui::{div, prelude::*, px, Div, ElementId, Hsla, Rgba, SharedString, Stateful};
 
@@ -24,31 +25,60 @@ fn knob() -> Rgba {
     gpui::rgb(0xffffff)
 }
 
-/// A group of rows: `raised`, radius 8, no border (a step, not a line).
-pub fn card() -> Div {
-    div().w_full().flex().flex_col().rounded(px(theme::R_CARD)).bg(theme::raised())
+/// A row's side padding: 12 on the desktop, the phone's 16 gutter on a phone.
+pub fn side() -> f32 {
+    if phone::active() {
+        tokens::GUTTER
+    } else {
+        12.
+    }
 }
 
-/// The 1 pt line between two rows of a card, inset 12 on both sides.
+/// The page's column: 480 on the desktop, the whole width on a phone.
+pub fn column() -> Div {
+    if phone::active() {
+        div().w_full()
+    } else {
+        div().w(px(COLUMN))
+    }
+}
+
+/// A group of rows: `raised`, radius 8, no border (a step, not a line). 12 on a phone.
+pub fn card() -> Div {
+    div().w_full().flex().flex_col().rounded(px(if phone::active() { 12. } else { theme::R_CARD })).bg(theme::raised())
+}
+
+/// The 1 pt line between two rows of a card, inset 12 on both sides (16 on a phone).
 pub fn rule() -> Div {
-    div().flex_none().h(px(1.)).mx(px(12.)).bg(theme::hairline())
+    div().flex_none().h(px(1.)).mx(px(side())).bg(theme::hairline())
 }
 
 /// The label above a card.
 pub fn group_label(words: impl Into<SharedString>) -> Div {
-    div().h(px(24.)).pl(px(12.)).flex().items_end().pb(px(4.)).type_micro().text_color(theme::text_faint()).child(words.into())
+    let label = div().h(px(24.)).pl(px(side())).flex().items_end().pb(px(4.)).type_micro().text_color(theme::text_faint());
+    label.when(phone::active(), |label| label.h(px(32.)).pb(px(6.)).text_size(px(tokens::scaled(12.)))).child(words.into())
 }
 
 /// The words under a card, 6 below it.
 pub fn caption(words: impl Into<SharedString>) -> Div {
     let words: SharedString = words.into();
-    div().pt(px(6.)).px(px(12.)).max_w(px(456.)).type_small().text_color(theme::text_faint()).child(crate::gui::shortcuts::label(&words))
+    div()
+        .pt(px(6.))
+        .px(px(side()))
+        .max_w(px(456.))
+        .type_small()
+        .when(phone::active(), |caption| caption.pt(px(8.)).max_w(gpui::relative(1.)).phone_preview())
+        .text_color(theme::text_faint())
+        .child(crate::gui::shortcuts::label(&words))
 }
 
 /// A row: its label (and the line saying what the value does) on the left, the control on the
 /// right. 40 high with one line, 52 with two, 2 more for each text step past +0, as the rows
 /// of the main window grow. 6 above and below at least, so a label that wraps has room.
 pub fn row(label: impl Into<SharedString>, second: Option<SharedString>, control: impl IntoElement) -> Div {
+    if phone::active() {
+        return phone_row(label.into(), second, control, false);
+    }
     let step = theme::text_step().max(0) as f32 * 2.;
     let two = second.is_some();
     div()
@@ -71,8 +101,50 @@ pub fn row(label: impl Into<SharedString>, second: Option<SharedString>, control
         .child(div().flex_none().flex().items_center().child(control))
 }
 
+/// A row whose control is wider than a phone's row leaves beside its label: a segmented
+/// control, a slider, a field. On a phone the control goes under the label, the row's whole
+/// width; on the desktop this is [`row`].
+pub fn wide_row(label: impl Into<SharedString>, second: Option<SharedString>, control: impl IntoElement) -> Div {
+    if phone::active() {
+        return phone_row(label.into(), second, control, true);
+    }
+    row(label, second, control)
+}
+
+/// A row on a phone: 15 pt label and 13 pt line, 52 high with one line and 64 with two, so a
+/// thumb lands on it. `stacked` puts the control under the words.
+fn phone_row(label: SharedString, second: Option<SharedString>, control: impl IntoElement, stacked: bool) -> Div {
+    let two = second.is_some();
+    let words = div()
+        .flex_1()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .gap(px(2.))
+        .child(div().phone_row().text_color(theme::text()).child(label))
+        .children(second.map(|line| div().phone_preview().text_color(theme::text_soft()).child(line)));
+    let row = div().min_h(px(if two { 64. } else { 52. })).px(px(tokens::GUTTER)).py(px(10.));
+    if stacked {
+        return row.flex().flex_col().gap(px(10.)).child(words).child(div().w_full().flex().items_center().child(control));
+    }
+    row.flex().items_center().gap(px(12.)).child(words).child(div().flex_none().flex().items_center().child(control))
+}
+
+/// A row's button sized for a thumb on a phone: 36 high, a pill. The desktop's own elsewhere.
+pub fn touch<E: Styled>(button: E) -> E {
+    if phone::active() {
+        button.h(px(36.)).px(px(16.)).rounded(px(18.)).text_size(px(tokens::scaled(15.)))
+    } else {
+        button
+    }
+}
+
 /// The reset slot: 28 kept whether or not the button shows, so controls stay in one column.
+/// A phone keeps no empty slot: the control sits on the row's edge until it has a reset.
 pub fn reset_slot(button: Option<Stateful<Div>>) -> Div {
+    if phone::active() {
+        return div().flex_none().flex().items_center().children(button.map(|button| button.mr(px(8.)).size(px(32.))));
+    }
     div().flex_none().w(px(RESET_SLOT)).h(px(28.)).flex().items_center().children(button)
 }
 
@@ -100,6 +172,24 @@ pub fn reset_button(id: impl Into<ElementId>, label: SharedString) -> Stateful<D
 pub fn switch(id: impl Into<ElementId>, label: &str, on: bool) -> Stateful<Div> {
     let track = if on { theme::accent() } else { switch_off() };
     let hover: Rgba = if on { theme::accent_hover() } else { theme::border_strong() };
+    if phone::active() {
+        // 48 × 28 under a thumb, the knob 24.
+        return div()
+            .id(id)
+            .flex_none()
+            .w(px(48.))
+            .h(px(28.))
+            .rounded(px(14.))
+            .p(px(2.))
+            .flex()
+            .when(on, |track| track.justify_end())
+            .bg(track)
+            .cursor_pointer()
+            .role(gpui::Role::Switch)
+            .aria_label(SharedString::from(label.to_owned()))
+            .aria_toggled(if on { gpui::Toggled::True } else { gpui::Toggled::False })
+            .child(div().size(px(24.)).rounded_full().bg(knob()));
+    }
     div()
         .id(id)
         .flex_none()

@@ -496,6 +496,10 @@ impl Shell {
 
     /// Nothing is signed in: no rail, no sidebar, one centered column.
     fn first_run(&self, snapshot: &Snapshot, cx: &mut Context<Self>) -> Div {
+        // A phone has its own form: one column, the networks a phone can sign in to.
+        if super::phone::active() {
+            return self.phone_first_run(cx);
+        }
         let row = |ix: usize, network: Network| {
             let available = AVAILABLE.contains(&network);
             let waiting = self.signing_in == Some(network);

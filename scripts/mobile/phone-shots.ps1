@@ -106,7 +106,30 @@ $phone = @(
     # The person's card over the direct conversation: the one people surface the phone draws.
     @{ n = '14-profile-card';        a = @('--tab', 'inbox', '--open', '2'); v = @{ TINYCLIENT_S6 = 'd-card' } },
     @{ n = '15-first-run';           a = @('--demo-empty') },
-    @{ n = '16-sign-in-sheet';       a = @('--demo-empty'); v = @{ TINYCLIENT_SIGNIN_SHOT = 'phone' } }
+    @{ n = '16-sign-in-sheet';       a = @('--demo-empty'); v = @{ TINYCLIENT_SIGNIN_SHOT = 'phone' } },
+    # Every sign-in flow as a phone page (`gui/signin/page.rs`), with made-up steps.
+    @{ n = '16a-sign-in-telegram';   a = @('--demo-empty'); v = @{ TINYCLIENT_SIGNIN_SHOT = 'qr' } },
+    @{ n = '16b-sign-in-code-wrong'; a = @('--demo-empty'); v = @{ TINYCLIENT_SIGNIN_SHOT = 'code-wrong' } },
+    @{ n = '16c-sign-in-password';   a = @('--demo-empty'); v = @{ TINYCLIENT_SIGNIN_SHOT = 'password' } },
+    @{ n = '16d-sign-in-tiny';       a = @('--demo-empty'); v = @{ TINYCLIENT_SIGNIN_SHOT = 'tiny' } },
+    @{ n = '16e-sign-in-tiny-error'; a = @('--demo-empty'); v = @{ TINYCLIENT_SIGNIN_SHOT = 'tiny-error' } },
+    @{ n = '16f-sign-in-discord';    a = @('--demo-empty'); v = @{ TINYCLIENT_SIGNIN_SHOT = 'discord' } },
+    @{ n = '16g-sign-in-discord-waiting'; a = @('--demo-empty'); v = @{ TINYCLIENT_SIGNIN_SHOT = 'discord-waiting' } },
+    @{ n = '16h-sign-in-slack';      a = @('--demo-empty'); v = @{ TINYCLIENT_SIGNIN_SHOT = 'slack' } },
+    @{ n = '16i-sign-in-teams';      a = @('--demo-empty'); v = @{ TINYCLIENT_SIGNIN_SHOT = 'teams' } }
+)
+# Settings on a phone is a page of the one window (`gui/settings/phone_page.rs`); the shot draws
+# that page in a window of its own at the phone's size. `list` is the list of sections.
+$settingsShots = @(
+    @{ n = '17-settings';            a = @('--settings', 'accounts') },
+    @{ n = '17a-settings-list';      a = @('--settings', 'list') },
+    @{ n = '17b-settings-appearance'; a = @('--settings', 'appearance') },
+    @{ n = '17c-settings-messages';  a = @('--settings', 'messages') },
+    @{ n = '17d-settings-privacy';   a = @('--settings', 'privacy') },
+    @{ n = '17e-settings-storage';   a = @('--settings', 'storage') },
+    @{ n = '17f-settings-about';     a = @('--settings', 'about') },
+    @{ n = '17g-settings-confirm';   a = @('--settings', 'about', '--settings-confirm', 'reset') },
+    @{ n = '17h-settings-search';    a = @('--settings', 'list', '--settings-search', 'text') }
 )
 
 try {
@@ -116,14 +139,17 @@ try {
             $vars = if ($shot.ContainsKey('v')) { $shot.v } else { @{} }
             Shot $shot.n $size $shot.a $vars
         }
-        # Settings is its own window: drawn at the phone's size beside a held main window.
-        $settings = Join-Path $Out "17-settings-$size.png"
-        Remove-Item $settings -ErrorAction SilentlyContinue
-        foreach ($var in $hookVars) { Remove-Item "Env:$var" -ErrorAction SilentlyContinue }
-        $throwaway = Join-Path $scratch 'settings-main.png'
-        & $exe --shot $throwaway --size $size --demo --tab you --hold 3 --settings accounts --settings-shot $settings --settings-size $size 2>&1 | Out-Null
-        if (Test-Path $settings) { $made.Add((Split-Path -Leaf $settings)); Write-Host "  $(Split-Path -Leaf $settings)" }
-        else { $missing.Add((Split-Path -Leaf $settings)); Write-Host "  $(Split-Path -Leaf $settings): not written" -ForegroundColor Yellow }
+        # Settings: drawn at the phone's size beside a held main window.
+        foreach ($shot in $settingsShots) {
+            $settings = Join-Path $Out "$($shot.n)-$size.png"
+            Remove-Item $settings -ErrorAction SilentlyContinue
+            foreach ($var in $hookVars) { Remove-Item "Env:$var" -ErrorAction SilentlyContinue }
+            $throwaway = Join-Path $scratch 'settings-main.png'
+            $all = @('--shot', $throwaway, '--size', $size, '--demo', '--tab', 'you', '--hold', '3') + $shot.a + @('--settings-shot', $settings, '--settings-size', $size)
+            & $exe @all 2>&1 | Out-Null
+            if (Test-Path $settings) { $made.Add((Split-Path -Leaf $settings)); Write-Host "  $(Split-Path -Leaf $settings)" }
+            else { $missing.Add((Split-Path -Leaf $settings)); Write-Host "  $(Split-Path -Leaf $settings): not written" -ForegroundColor Yellow }
+        }
     }
 
     Write-Host 'phone-shots: 150% text'
@@ -135,6 +161,8 @@ try {
     Shot 'desktop-conversation' '1280x800' @('--open', '1')
     # The call dock lives in the desktop sidebar; the phone form does not draw it.
     Shot 'desktop-call-dock' '1280x800' @('--open', '1') @{ TINYCLIENT_SHOT_CALL = 'joined' }
+    Shot 'desktop-first-run' '1280x800' @('--demo-empty')
+    Shot 'desktop-sign-in-sheet' '1280x800' @('--demo-empty') @{ TINYCLIENT_SIGNIN_SHOT = 'phone' }
 } finally {
     $env:APPDATA = $saved.APPDATA
     $env:LOCALAPPDATA = $saved.LOCALAPPDATA

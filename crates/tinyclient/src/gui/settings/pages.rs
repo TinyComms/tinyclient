@@ -3,13 +3,14 @@
 //! result is the same live row its section shows.
 
 use super::accounts::network_name;
-use super::controls::{self, caption, card, group_label, reset_button, reset_slot, row, rule, slider_track, slider_value, switch};
+use super::controls::{self, caption, card, group_label, reset_button, reset_slot, row, rule, slider_track, slider_value, switch, wide_row};
 use super::rows::{self, Row};
 use super::{modal_panel, Confirm, Picker, Section, SettingsWindow};
 use crate::gui::anim::{self, Autoplay};
 use crate::gui::app::prefs::{self, Choices};
 use crate::gui::components::{button, glyph, keycap, menu, menu_item_check, menu_separator, network_icon, placed, segment, segmented, ButtonKind, Layer, Place};
 use crate::gui::layout::NETWORK_ORDER;
+use crate::gui::phone::{self, tokens::PhoneType};
 use crate::gui::theme::{self, Type};
 use gpui::{canvas, div, prelude::*, px, AnyElement, ClipboardItem, Context, Div, MouseButton, SharedString, Window};
 use protocol::settings::{
@@ -140,7 +141,7 @@ pub fn retention_words(prunable: Option<(u64, u64)>) -> String {
 
 impl SettingsWindow {
     pub(super) fn page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
-        let column = div().w(px(controls::COLUMN)).flex().flex_col();
+        let column = controls::column().flex().flex_col();
         let groups: Vec<Div> = match self.section {
             Section::Accounts => return column.child(self.accounts(window, cx)),
             Section::General => vec![
@@ -154,7 +155,8 @@ impl SettingsWindow {
             ],
             Section::Appearance => vec![
                 self.group(&["A2", "A3", "A4"], None, window, cx)
-                    .child(caption(crate::host::APPEARANCE_CAPTION)),
+                    // The caption is about keyboard shortcuts, which a phone has none of.
+                    .when(!phone::active(), |group| group.child(caption(crate::host::APPEARANCE_CAPTION))),
             ],
             Section::Messages => vec![self.group(&["M1", "M2", "M3", "M4", "M5"], None, window, cx)],
             Section::Privacy => {
@@ -317,9 +319,9 @@ impl SettingsWindow {
                     // be told from one that did nothing.
                     .child(glyph(if playing { "icons/square.svg" } else { "icons/play.svg" }, 16., if playing { theme::accent() } else { theme::text_soft() }))
                     .on_click(cx.listener(|this, _, _, cx| this.play_test_sound(cx)));
-                row(label, None, div().flex().items_center().child(self.slider_control(id, cx)).child(play))
+                wide_row(label, None, div().flex().items_center().child(self.slider_control(id, cx)).child(play))
             }
-            "A2" => row(label, None, self.slider_control(id, cx)),
+            "A2" => wide_row(label, None, self.slider_control(id, cx)),
             "A3" => {
                 let second = choices.compact.then(|| "List rows are 40 instead of 48.".to_owned());
                 self.segmented_row(id, &["Comfortable", "Compact"], usize::from(choices.compact), 0, second, |this, ix, cx| this.choose(|c| c.compact = ix == 1, cx), cx)
@@ -361,8 +363,8 @@ impl SettingsWindow {
             "P1" | "P2" => return self.per_account_rows(id, cx),
             "V1" | "V2" => self.device_row(id, cx),
             "V3" => self.meter_row(cx),
-            "V6" => row(label, None, self.slider_control(id, cx)),
-            "V5" => row(label, None, self.slider_control(id, cx)),
+            "V6" => wide_row(label, None, self.slider_control(id, cx)),
+            "V5" => wide_row(label, None, self.slider_control(id, cx)),
             "V4" => {
                 let on = values.on(JOIN_MUTED);
                 self.switch_row(id, on, false, None, move |this, on, cx| this.set_switch(id, JOIN_MUTED, on, false, cx), cx)
@@ -381,7 +383,7 @@ impl SettingsWindow {
             "D3" => row(
                 label,
                 None,
-                button("D3", ButtonKind::Danger, "Clear…").on_click(cx.listener(|this, _, _, cx| {
+                controls::touch(button("D3", ButtonKind::Danger, "Clear…")).on_click(cx.listener(|this, _, _, cx| {
                     this.confirm = Some(Confirm::Clear);
                     cx.notify();
                 })),
@@ -389,7 +391,7 @@ impl SettingsWindow {
             "B1" => row(
                 label,
                 Some(crate::host::DIAGNOSTICS.into()),
-                button("B1", ButtonKind::Secondary, "Copy").on_click(cx.listener(|this, _, _, cx| this.copy_diagnostics(cx))),
+                controls::touch(button("B1", ButtonKind::Secondary, "Copy")).on_click(cx.listener(|this, _, _, cx| this.copy_diagnostics(cx))),
             ),
             "B2" => row(
                 label,
@@ -406,7 +408,7 @@ impl SettingsWindow {
             "B3" => row(
                 label,
                 None,
-                button("B3", ButtonKind::Danger, "Reset…").on_click(cx.listener(|this, _, _, cx| {
+                controls::touch(button("B3", ButtonKind::Danger, "Reset…")).on_click(cx.listener(|this, _, _, cx| {
                     this.confirm = Some(Confirm::Reset);
                     cx.notify();
                 })),
@@ -525,10 +527,15 @@ impl SettingsWindow {
             cx.stop_propagation();
             keys(this, next, cx);
         }));
+        let touch = phone::active();
+        if touch {
+            control = control.flex_1().h(px(40.)).p(px(3.)).rounded(px(10.));
+        }
         for (ix, choice) in choices.iter().enumerate() {
             let pick = pick.clone();
             control = control.child(
                 segment(SharedString::from(format!("{id}-{ix}")), *choice, ix == current)
+                    .when(touch, |segment| segment.flex_1().h(px(34.)).px(px(6.)).justify_center().rounded(px(8.)).text_size(px(crate::gui::phone::tokens::scaled(14.))))
                     .role(gpui::Role::RadioButton)
                     .aria_label(crate::gui::shortcuts::label(choice))
                     .aria_selected(ix == current)
@@ -544,7 +551,7 @@ impl SettingsWindow {
             reset_button(SharedString::from(format!("{id}-reset")), format!("Reset {label} to {}", choices[default]).into())
                 .on_click(cx.listener(move |this, _, _, cx| reset_to(this, default, cx)))
         });
-        row(label, second.map(SharedString::from), div().flex().items_center().child(reset_slot(reset)).child(control))
+        wide_row(label, second.map(SharedString::from), div().when(touch, |line| line.flex_1()).flex().items_center().child(reset_slot(reset)).child(control))
     }
 
     /// The track, its value and its reset, for slider `id`.
@@ -588,12 +595,29 @@ impl SettingsWindow {
                     cx.stop_propagation();
                 }
             }))
-            .child(slider_track(value, spec.range, spec.stops, Some(spec.default), spec.width))
+            .child(slider_track(value, spec.range, spec.stops, Some(spec.default), self.track_width(id, spec.width, stored != spec.default)))
             .child(canvas(move |bounds, _, _| { anchors.borrow_mut().insert(id, bounds); }, |_, _, _, _| {}).absolute().top_0().left_0().size_full());
         let ends = |size: f32| div().w(px(16.)).flex().justify_center().type_ui().text_size(px(size)).text_color(theme::text_soft()).child("A");
         // The thumb overhangs each end of the track by 8: 16 keeps 8 clear of the glyphs.
         let track = if id == "A2" { div().flex().items_center().gap(px(controls::VALUE_GAP)).child(ends(11.)).child(track).child(ends(16.)) } else { div().child(track) };
         div().flex().items_center().child(reset_slot(reset)).child(track).child(div().w(px(controls::VALUE_GAP))).child(slider_value((spec.words)(value)))
+    }
+
+    /// A slider's track: its own width on the desktop; on a phone what the row under its label
+    /// leaves after the reset, the value and, for text size and the call cue, what flanks it.
+    fn track_width(&self, id: &str, width: f32, reset: bool) -> f32 {
+        if !phone::active() {
+            return width;
+        }
+        let flanks = match id {
+            "A2" => 16. * 2. + controls::VALUE_GAP * 2.,
+            "S10" => 32.,
+            _ => 0.,
+        };
+        // The page's and the row's gutters, the reset's room, the gap and the value.
+        let reset = if reset { 40. } else { 0. };
+        let room = self.width - 4. * crate::gui::phone::tokens::GUTTER - reset - controls::VALUE_GAP - controls::VALUE_BOX - flanks;
+        room.clamp(120., 400.)
     }
 
     /// P1 and P2: a card per setting, one row per account, fixed rows where the network decides.
@@ -646,7 +670,7 @@ impl SettingsWindow {
                 .gap(px(8.))
                 .when(account.link == Link::Expired, |lead| lead.opacity(0.4))
                 .child(network_icon(network, 16.))
-                .child(div().type_ui().text_color(theme::text()).child(name.clone()));
+                .child(div().type_ui().when(phone::active(), |name| name.phone_row()).text_color(theme::text()).child(name.clone()));
             let control: AnyElement = match fixed {
                 Some(words) => div().type_ui().text_color(theme::text_soft()).child(words).into_any_element(),
                 None => {
@@ -674,9 +698,10 @@ impl SettingsWindow {
                 }
             };
             let step = theme::text_step().max(0) as f32 * 2.;
+            let tall = if phone::active() { 12. } else { 0. };
             let line = div()
-                .min_h(px(if second.is_some() { 52. } else { 40. } + step))
-                .px(px(12.))
+                .min_h(px(if second.is_some() { 52. } else { 40. } + step + tall))
+                .px(px(controls::side()))
                 .py(px(if second.is_some() { 8. } else { 6. }))
                 .flex()
                 .items_center()
@@ -852,7 +877,7 @@ impl SettingsWindow {
         let first = (messages as f32 / total as f32 * width).round();
         let legend = |color: gpui::Rgba, words: String| div().flex().items_center().gap(px(6.)).child(div().size(px(8.)).rounded(px(2.)).bg(color)).child(words);
         div()
-            .px(px(12.))
+            .px(px(controls::side()))
             .py(px(8.))
             .flex()
             .flex_col()
@@ -862,11 +887,14 @@ impl SettingsWindow {
                     .flex()
                     .items_center()
                     .child(div().flex_1().type_ui().font_weight(theme::SEMIBOLD).text_color(theme::text()).child(crate::host::on_here(&total_words)))
-                    .child(button("D1", ButtonKind::Ghost, crate::host::REVEAL).on_click(cx.listener(|_, _, _, cx| cx.open_with_system(&protocol::support_dir())))),
+                    .when(!phone::active(), |line| {
+                        line.child(button("D1", ButtonKind::Ghost, crate::host::REVEAL).on_click(cx.listener(|_, _, _, cx| cx.open_with_system(&protocol::support_dir()))))
+                    }),
             )
             .child(
                 div()
                     .w(px(width))
+                    .when(phone::active(), |bar| bar.w_full())
                     .h(px(8.))
                     .rounded(px(4.))
                     .overflow_hidden()
@@ -1077,8 +1105,9 @@ impl SettingsWindow {
             .items_center()
             .justify_center()
             .child(glyph("icons/messages-square.svg", 52., gpui::rgb(0xa3acff)));
-        let credit = |words: &'static str| div().px(px(12.)).py(px(10.)).type_small().text_color(theme::text_soft()).child(words);
-        let tools = self.group(&["B1", "B2", "B3"], None, window, cx);
+        let credit = |words: &'static str| div().px(px(controls::side())).py(px(10.)).type_small().when(phone::active(), |line| line.py(px(12.)).phone_preview()).text_color(theme::text_soft()).child(words);
+        // A phone has no folder to show the log in.
+        let tools = if phone::active() { self.group(&["B1", "B3"], None, window, cx) } else { self.group(&["B1", "B2", "B3"], None, window, cx) };
         div()
             .flex()
             .flex_col()
@@ -1088,7 +1117,7 @@ impl SettingsWindow {
             .child(div().pt(px(10.)).type_headline().text_color(theme::text()).child("tinyclient"))
             .child(div().type_small().text_color(theme::text_faint()).child(version))
             .children(self.update_status(cx))
-            .child(div().type_ui().text_color(theme::text_soft()).child("One small app for Slack, Discord, Telegram, Teams and Signal."))
+            .child(div().type_ui().when(phone::active(), |line| line.text_center().phone_row()).text_color(theme::text_soft()).child("One small app for Slack, Discord, Telegram, Teams and Signal."))
             .child(
                 div()
                     .w_full()
@@ -1109,9 +1138,10 @@ impl SettingsWindow {
     /// Search results: each a breadcrumb and its live row, best first; or the honest line.
     pub(super) fn results(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let query = self.query.clone();
-        let found: Vec<&'static Row> = rows::search(&query);
-        let keys = rows::shortcuts(&query);
-        let mut column = div().w(px(controls::COLUMN)).flex().flex_col().gap(px(12.));
+        let found: Vec<&'static Row> = rows::search(&query).into_iter().filter(|row| !phone::active() || super::on_phone(row.section)).collect();
+        // A phone has no keyboard shortcuts to find.
+        let keys = if phone::active() { Vec::new() } else { rows::shortcuts(&query) };
+        let mut column = controls::column().flex().flex_col().gap(px(12.));
         if found.is_empty() && (keys.is_empty() || query.trim().len() < 2) {
             let honest = rows::not_yet(&query);
             return column.child(

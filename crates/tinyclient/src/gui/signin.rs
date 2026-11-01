@@ -18,19 +18,23 @@
 //! What is typed (a code, a password) is held only by its field, is cleared from it the moment
 //! it is sent, and is never logged.
 
+mod page;
 mod qr;
 #[cfg(feature = "gui-shot")]
 mod shot;
+pub(super) mod welcome;
 
 use super::components::{button, button_disabled, fade_in, field, glyph, network_icon, scrim, ButtonKind};
 use super::input::{InputEvent, InputKey, TextInput};
+use super::phone;
+use super::phone::tokens::PhoneType;
 use super::state::Shell;
 use super::theme::{self, Type};
 use super::time::clock;
 use crate::client::ask;
 use gpui::{
     canvas, deferred, div, fill, point, prelude::*, px, rgb, size, App, Bounds, Context, Deferred, Div, Entity,
-    FocusHandle, Focusable, Global, MouseButton, Rgba, SharedString, Stateful, Task, Window,
+    FocusHandle, Focusable, Global, MouseButton, Rgba, SharedString, Stateful, Task, WeakEntity, Window,
 };
 use protocol::{Change, CodeVia, ErrorCode, Network, Request, Response, SignInInput, SignInProblem, SignInStep};
 use std::io;
@@ -60,6 +64,9 @@ enum Face {
     Step(SignInStep),
     /// This build cannot sign in to the network at all. chatd's words; only "Close".
     Unsupported(String),
+    /// Phone only: Discord, Slack or Teams, which sign in on the network's own page. The page
+    /// says what happens, then hands over to the shell's sign-in; `started` once it has.
+    Web { started: bool },
 }
 
 /// The sheet's state: an entity of its own, so the shell holds nothing for it.
@@ -100,6 +107,10 @@ pub struct Sheet {
     launched: bool,
     /// A made-up step for a screenshot: chatd is never asked.
     canned: bool,
+    /// The shell that opened the sheet: a web sign-in on a phone is the shell's to run.
+    shell: Option<WeakEntity<Shell>>,
+    /// The next `open` of this network is the shell going on to its own sign-in: let it through.
+    pass: Option<Network>,
 }
 
 struct Holder(Entity<Sheet>);
@@ -118,10 +129,22 @@ fn holder(cx: &mut App) -> Entity<Sheet> {
 /// Opens the sheet for a network that signs in here. `false` for one that signs in through its
 /// own web page, so the caller goes on to the helper window.
 pub fn open(network: Network, cx: &mut Context<Shell>) -> bool {
-    if !matches!(network, Network::Telegram | Network::Signal | Network::Messages | Network::Tiny) {
+    let sheet = holder(cx);
+    // The phone's own page for a web sign-in handed over: the shell goes on.
+    if sheet.update(cx, |sheet, _| sheet.pass.take_if(|pass| *pass == network).is_some()) {
         return false;
     }
-    holder(cx).update(cx, |sheet, cx| sheet.open(network, cx));
+    // On a phone there is no helper window to come back from: Discord, Slack and Teams get a page
+    // of their own that says what happens next, then hand over (`Face::Web`).
+    let native = matches!(network, Network::Telegram | Network::Signal | Network::Messages | Network::Tiny);
+    if !native && !phone::active() {
+        return false;
+    }
+    let shell = cx.entity().downgrade();
+    sheet.update(cx, |sheet, cx| {
+        sheet.shell = Some(shell);
+        sheet.open(network, cx);
+    });
     cx.notify();
     true
 }
@@ -336,6 +359,8 @@ impl Sheet {
             before: None,
             launched: false,
             canned: false,
+            shell: None,
+            pass: None,
         }
     }
 
@@ -357,6 +382,7 @@ impl Sheet {
     #[cfg(feature = "gui-shot")]
     fn show_canned(&mut self, canned: shot::Canned, cx: &mut Context<Sheet>) {
         self.canned = true;
+        self.network = canned.network;
         self.clear_fields(cx);
         match canned.face {
             Face::Step(step) => self.show(step, cx),
@@ -377,6 +403,12 @@ impl Sheet {
         }
         self.network = network;
         self.clear_fields(cx);
+        if !matches!(network, Network::Telegram | Network::Signal | Network::Messages | Network::Tiny) {
+            self.face = Some(Face::Web { started: false });
+            self.refocus = true;
+            cx.notify();
+            return;
+        }
         // The tile is up at once, saying a code is on its way.
         self.face = Some(Face::Step(waiting_for(network)));
         self.refocus = true;
@@ -386,9 +418,11 @@ impl Sheet {
 
     /// Closes the sheet. `cancel` tells chatd to drop the sign-in; after `Done` there is none.
     fn close(&mut self, cancel: bool, cx: &mut Context<Sheet>) {
-        if self.face.take().is_none() {
+        let Some(face) = self.face.take() else {
             return;
-        }
+        };
+        // A web sign-in is the shell's: chatd holds no sheet sign-in to drop.
+        let cancel = cancel && !matches!(face, Face::Web { .. });
         self.epoch += 1;
         self.listener = None;
         self.resend_timer = None;
@@ -741,7 +775,11 @@ impl Sheet {
     // Drawing.
 
     /// The first row: the way back on the later steps, the network's icon, the title.
-    fn header(&self, title: &'static str, back: bool, cx: &Context<Sheet>) -> Div {
+    fn header(&self, title: impl Into<SharedString>, back: bool, cx: &Context<Sheet>) -> Div {
+        let title: SharedString = title.into();
+        if phone::active() {
+            return self.phone_header(title, back, cx);
+        }
         let back = back.then(|| {
             div()
                 .id("signin-back")
@@ -770,16 +808,19 @@ impl Sheet {
     }
 
     fn cancel(&self, label: &'static str, cx: &Context<Sheet>) -> Stateful<Div> {
+        // A phone page says Cancel once, in its top bar.
+        if phone::active() {
+            return div().id("signin-cancel");
+        }
         button("signin-cancel", ButtonKind::Secondary, label).on_click(cx.listener(|this, _, _, cx| this.close(true, cx)))
     }
 
     /// A dialog's main action, off while an answer is awaited.
     fn primary(&self, label: impl Into<SharedString>, act: fn(&mut Sheet, &mut Context<Sheet>), cx: &Context<Sheet>) -> gpui::AnyElement {
         if self.busy {
-            return button_disabled(label).h(px(32.)).into_any_element();
+            return page::wide(button_disabled(label).h(px(32.))).into_any_element();
         }
-        button("signin-primary", ButtonKind::Primary, label)
-            .h(px(32.))
+        page::wide(button("signin-primary", ButtonKind::Primary, label).h(px(32.)))
             .on_click(cx.listener(move |this, _, _, cx| act(this, cx)))
             .into_any_element()
     }
@@ -806,6 +847,11 @@ impl Sheet {
             Network::Telegram | Network::Discord | Network::Slack | Network::Teams => ["Open Telegram on your phone.", "Go to Settings > Devices > Link Desktop Device.", "Point the phone at this code."],
         };
         // Signal and Messages link a computer only from the phone: there is no other way in to offer.
+        // On a phone the code cannot be scanned by the phone it is on: the number is the way in,
+        // and the code is for linking from another device.
+        if phone::active() && !phone_only {
+            return self.phone_qr_step(tile, steps, cx);
+        }
         let other_way = (!phone_only).then(|| self.answer_link("signin-use-phone", "Use a phone number instead", || SignInInput::UsePhone, cx));
         div()
             .flex()
@@ -1102,7 +1148,7 @@ impl Sheet {
             .child(div().mt(px(16.)).text_center().text_color(theme::text_soft()).child(words.to_owned()))
             .child(
                 footer(20.).child(div()).child(
-                    button("signin-close", ButtonKind::Secondary, "Close").on_click(cx.listener(|this, _, _, cx| this.close(false, cx))),
+                    page::wide(button("signin-close", ButtonKind::Secondary, "Close")).on_click(cx.listener(|this, _, _, cx| this.close(false, cx))),
                 ),
             )
     }
@@ -1117,6 +1163,7 @@ fn link(id: &'static str, words: impl Into<SharedString>) -> Stateful<Div> {
         .text_color(theme::accent_text())
         .cursor_pointer()
         .hover(|style| style.underline())
+        .when(phone::active(), page::touch_link)
         .child(words.into())
 }
 
@@ -1128,6 +1175,7 @@ fn run_your_own() -> Div {
     div()
         .mt(px(10.))
         .flex()
+        .when(phone::active(), |line| line.flex_wrap().items_center().phone_preview())
         .gap(px(4.))
         .type_small()
         .text_color(theme::text_faint())
@@ -1171,16 +1219,23 @@ fn stopped_words(server: &str, provider: &str) -> String {
 
 /// A problem, in the sheet's words: 12 in `danger`.
 fn error_line(words: String) -> Div {
-    div().type_small().text_color(theme::danger()).child(words)
+    div().type_small().when(phone::active(), |line| line.phone_preview()).text_color(theme::danger()).child(words)
 }
 
-/// The last row: something quiet on the left, the buttons on the right.
+/// The last row: something quiet on the left, the buttons on the right. On a phone the buttons
+/// come first, full width, and the quiet line is centred under them.
 fn footer(above: f32) -> Div {
+    if phone::active() {
+        return div().mt(px(above + 8.)).flex().flex_col_reverse().items_center().gap(px(8.));
+    }
     div().mt(px(above)).flex().items_center().justify_between().gap(px(12.))
 }
 
-/// Buttons sit 8 apart, the main action last.
+/// Buttons sit 8 apart, the main action last. On a phone the main action is on top.
 fn buttons() -> Div {
+    if phone::active() {
+        return div().w_full().flex().flex_col_reverse().gap(px(10.));
+    }
     div().flex_none().flex().items_center().gap(px(8.))
 }
 
@@ -1189,6 +1244,7 @@ fn numbered(number: usize, words: &'static str) -> Div {
     div()
         .flex()
         .gap(px(10.))
+        .when(phone::active(), |line| line.gap(px(12.)).phone_row())
         .text_color(theme::text_soft())
         .child(
             div()
@@ -1216,6 +1272,7 @@ fn tall_field(focused: bool, bad: bool) -> Div {
         .px(px(12.))
         .type_body()
         .bg(theme::over(theme::field(), theme::overlay()))
+        .when(phone::active(), page::touch_field)
         .when(bad && !focused, |field| field.border_color(theme::danger()))
 }
 
@@ -1313,6 +1370,9 @@ macro_rules! swallow {
 
 impl Render for Sheet {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Sheet>) -> impl IntoElement {
+        if !self.web_moved(cx) {
+            return div();
+        }
         let Some(face) = self.face.clone() else {
             return div();
         };
@@ -1325,6 +1385,7 @@ impl Render for Sheet {
         }
         let body = match &face {
             Face::Unsupported(words) => self.unsupported(words, cx),
+            Face::Web { started } => self.web_step(*started, cx),
             Face::Step(step) => {
                 // A problem found here shows where chatd's would.
                 let problem = self.local.clone().or_else(|| step_problem(step).cloned());
@@ -1359,6 +1420,9 @@ impl Render for Sheet {
             CloseRight, NextRow, PreviousRow, NextUnread, PreviousUnread, Place1, Place2, Place3, Place4, Place5, Place6, Place7,
             Place8, Place9
         );
+        if phone::active() {
+            return root.child(fade_in("signin-page", 160, page::page(body, cx)));
+        }
         root.child(scrim()).child(
             div()
                 .absolute()
