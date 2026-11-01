@@ -244,7 +244,7 @@ impl Coded {
 
 /// The encoder for one track at this size: the one it has, or a new one, which starts with a
 /// keyframe.
-fn coded<'a>(slot: &'a mut Option<Coded>, width: u32, height: u32, nominal: u32, screen: bool) -> Result<&'a mut Coded, String> {
+fn coded(slot: &mut Option<Coded>, width: u32, height: u32, nominal: u32, screen: bool) -> Result<&mut Coded, String> {
     if !slot.as_ref().is_some_and(|coded| coded.width == width && coded.height == height) {
         *slot = Some(Coded::open(width, height, nominal, screen)?);
     }
@@ -325,6 +325,7 @@ impl Incoming {
     /// Decodes one received Annex B frame, and paints it if `paint`. Every frame goes through the
     /// decoder, painted or not: the next one is built on it. `Err` means it did not decode;
     /// `Ok(None)` that there is nothing to paint.
+    #[allow(clippy::result_unit_err)]
     pub fn decode(&mut self, annex_b: &[u8], paint: bool) -> Result<Option<Painted>, ()> {
         if self.decoder.is_none() {
             let api = load_api().map_err(|_| ())?;
@@ -776,7 +777,7 @@ mod tests {
         for n in 0..90usize {
             // Noise that moves, so the encoder has to work for its bits.
             let mut rgba = vec![0u8; width * height * 4];
-            for (at, pixel) in rgba.chunks_exact_mut(4).enumerate() {
+            for (at, pixel) in rgba.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                 let value = ((at * 2654435761 + n * 40503) >> 7) as u8;
                 pixel.copy_from_slice(&[value, value / 2, 255 - value, 255]);
             }
@@ -791,7 +792,7 @@ mod tests {
             if n > 0 && n != 30 {
                 assert!(!encoded.key, "uiIntraPeriod 0 makes no keyframe of its own at {n}");
             }
-            if n >= 5 && n < 45 && n != 30 {
+            if (5..45).contains(&n) && n != 30 {
                 bytes_high += encoded.bytes.len();
             }
             if n >= 55 {

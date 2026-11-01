@@ -92,7 +92,11 @@ const STEP: u64 = 10_000;
 pub fn allocate(estimate: u64, share: bool, camera: bool, was: Rates) -> Rates {
     let mut left = (estimate * SPEND_PERCENT / 100).saturating_sub(VOICE_BPS);
     let mut take = |wanted: bool, most: u32, floor: u64, was: u32| -> u32 {
-        let needs = if was > 0 { floor } else { floor * RESTART_PERCENT / 100 };
+        let needs = if was > 0 {
+            floor
+        } else {
+            floor * RESTART_PERCENT / 100
+        };
         if !wanted || left < needs {
             return 0;
         }
@@ -100,7 +104,11 @@ pub fn allocate(estimate: u64, share: bool, camera: bool, was: Rates) -> Rates {
         left -= got;
         got as u32
     };
-    let low = if camera { take(true, CAMERA_LOW_BPS, 0, 1).max(LOW_FLOOR as u32) } else { 0 };
+    let low = if camera {
+        take(true, CAMERA_LOW_BPS, 0, 1).max(LOW_FLOOR as u32)
+    } else {
+        0
+    };
     let share = take(share, SHARE_BPS, SHARE_FLOOR, was.share);
     let high = take(camera, CAMERA_HIGH_BPS, HIGH_FLOOR, was.high);
     Rates { share, high, low }
@@ -109,7 +117,11 @@ pub fn allocate(estimate: u64, share: bool, camera: bool, was: Rates) -> Rates {
 /// What to have the estimator look for: what these tracks would spend, with the voice.
 pub fn desired(share: bool, camera: bool) -> u64 {
     let share = if share { u64::from(SHARE_BPS) } else { 0 };
-    let camera = if camera { u64::from(CAMERA_HIGH_BPS + CAMERA_LOW_BPS) } else { 0 };
+    let camera = if camera {
+        u64::from(CAMERA_HIGH_BPS + CAMERA_LOW_BPS)
+    } else {
+        0
+    };
     let video = share + camera;
     if video == 0 {
         return 0;
@@ -539,6 +551,7 @@ impl Inbox {
 /// The decoder and what it paints. `Incoming`, or a stand-in for a test.
 pub trait Screen {
     /// Decodes one frame, always, and paints it if `paint`. `Err` when it did not decode.
+    #[allow(clippy::result_unit_err)]
     fn decode(&mut self, annex_b: &[u8], paint: bool) -> Result<Option<Painted>, ()>;
     fn reset(&mut self);
     /// The painted file goes.
@@ -852,7 +865,11 @@ mod tests {
         let rates = allocate(1_000_000, true, false, was);
         assert_eq!(rates.share, 750_000, "85% of the estimate, less the voice");
         assert_eq!((rates.high, rates.low), (0, 0));
-        assert_eq!(allocate(300_000, true, false, rates).share, 0, "under its floor a share stops");
+        assert_eq!(
+            allocate(300_000, true, false, rates).share,
+            0,
+            "under its floor a share stops"
+        );
     }
 
     #[test]
@@ -862,9 +879,16 @@ mod tests {
         assert_eq!(rates.low, CAMERA_LOW_BPS);
         assert_eq!(rates.high, 260_000);
         let rates = allocate(400_000, false, true, rates);
-        assert_eq!((rates.high, rates.low), (0, CAMERA_LOW_BPS), "h gives way before l");
+        assert_eq!(
+            (rates.high, rates.low),
+            (0, CAMERA_LOW_BPS),
+            "h gives way before l"
+        );
         let rates = allocate(50_000, false, true, rates);
-        assert_eq!(rates.low, LOW_FLOOR as u32, "l is what there is to fall back on");
+        assert_eq!(
+            rates.low, LOW_FLOOR as u32,
+            "l is what there is to fall back on"
+        );
     }
 
     #[test]
@@ -879,10 +903,21 @@ mod tests {
 
     #[test]
     fn a_stopped_track_needs_a_margin_to_start_again() {
-        let stopped = Rates { share: 0, high: 0, low: 0 };
+        let stopped = Rates {
+            share: 0,
+            high: 0,
+            low: 0,
+        };
         let barely = (SHARE_FLOOR + VOICE_BPS) * 100 / SPEND_PERCENT + 10_000;
-        assert_eq!(allocate(barely, true, false, stopped).share, 0, "still stopped at its floor");
-        assert!(allocate(barely, true, false, Rates::default()).share > 0, "while one running stays on");
+        assert_eq!(
+            allocate(barely, true, false, stopped).share,
+            0,
+            "still stopped at its floor"
+        );
+        assert!(
+            allocate(barely, true, false, Rates::default()).share > 0,
+            "while one running stays on"
+        );
     }
 
     #[test]
@@ -1078,7 +1113,10 @@ mod tests {
         assert!(capture.source.share[0].key);
         assert_eq!(words.try_iter().count(), 0, "a skipped frame sends nothing");
         capture.round(&wants, start, 15.);
-        assert!(capture.source.share[1].key, "the keyframe that was skipped comes on the next frame");
+        assert!(
+            capture.source.share[1].key,
+            "the keyframe that was skipped comes on the next frame"
+        );
         assert_eq!(words.try_iter().count(), 1);
 
         // The call is to be end to end and has no keys: held back, and owed.

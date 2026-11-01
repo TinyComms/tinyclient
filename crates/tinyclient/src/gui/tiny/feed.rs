@@ -23,7 +23,11 @@ pub(in crate::gui) struct Feed<I> {
 
 impl<I> Default for Feed<I> {
     fn default() -> Self {
-        Feed { shown: None, newest: None, reading: None }
+        Feed {
+            shown: None,
+            newest: None,
+            reading: None,
+        }
     }
 }
 
@@ -39,7 +43,11 @@ impl<I> Feed<I> {
             self.newest = None;
             return (None, self.shown.take());
         };
-        if self.newest.as_ref().is_some_and(|(generation, _)| *generation == picture.0) {
+        if self
+            .newest
+            .as_ref()
+            .is_some_and(|(generation, _)| *generation == picture.0)
+        {
             return (None, None);
         }
         self.newest = Some(picture);
@@ -55,7 +63,11 @@ impl<I> Feed<I> {
             Some(image) if wanted => self.shown.replace(image),
             image => image,
         };
-        if self.newest.as_ref().is_some_and(|(newest, _)| *newest == generation) {
+        if self
+            .newest
+            .as_ref()
+            .is_some_and(|(newest, _)| *newest == generation)
+        {
             return (gone, None);
         }
         (gone, self.next())
@@ -73,7 +85,9 @@ impl<I> Feed<I> {
 
 /// A JPEG as the BGRA GPUI draws.
 fn bgra(jpeg: &[u8]) -> Option<RgbaImage> {
-    let mut pixels = image::load_from_memory_with_format(jpeg, image::ImageFormat::Jpeg).ok()?.into_rgba8();
+    let mut pixels = image::load_from_memory_with_format(jpeg, image::ImageFormat::Jpeg)
+        .ok()?
+        .into_rgba8();
     for pixel in pixels.chunks_exact_mut(4) {
         pixel.swap(0, 2);
     }
@@ -90,7 +104,9 @@ fn frame(path: &Path) -> Option<Arc<RenderImage>> {
 impl Shell {
     /// The call changed: the frame it names is read, and one no longer named is let go.
     pub(in crate::gui) fn feed_follow(&mut self, call: Option<&Call>, cx: &mut Context<Self>) {
-        let picture = call.and_then(|call| call.picture.as_ref()).map(|picture| (picture.generation, picture.path.clone()));
+        let picture = call
+            .and_then(|call| call.picture.as_ref())
+            .map(|picture| (picture.generation, picture.path.clone()));
         let (read, gone) = self.call_state.feed.offer(picture);
         if let Some(gone) = gone {
             cx.drop_image(gone, None);
@@ -103,7 +119,10 @@ impl Shell {
 
     fn feed_read(&mut self, (generation, path): (u64, String), cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
-            let image = cx.background_executor().spawn(async move { frame(Path::new(&path)) }).await;
+            let image = cx
+                .background_executor()
+                .spawn(async move { frame(Path::new(&path)) })
+                .await;
             let _ = this.update(cx, |this, cx| {
                 let (gone, next) = this.call_state.feed.landed(generation, image);
                 if let Some(gone) = gone {
@@ -134,7 +153,11 @@ mod tests {
         assert_eq!(feed.landed(1, Some(1)), (None, None));
         assert_eq!(feed.shown(), Some(&1));
         assert_eq!(feed.offer(at(2)), (at(2), None));
-        assert_eq!(feed.landed(2, Some(2)), (Some(1), None), "frame 1 is released");
+        assert_eq!(
+            feed.landed(2, Some(2)),
+            (Some(1), None),
+            "frame 1 is released"
+        );
         assert_eq!(feed.shown(), Some(&2));
     }
 
@@ -166,7 +189,11 @@ mod tests {
         feed.offer(at(2));
         assert_eq!(feed.offer(None), (None, Some(1)));
         assert_eq!(feed.shown(), None);
-        assert_eq!(feed.landed(2, Some(2)), (Some(2), None), "nobody wants it any more");
+        assert_eq!(
+            feed.landed(2, Some(2)),
+            (Some(2), None),
+            "nobody wants it any more"
+        );
         assert_eq!(feed.shown(), None);
     }
 
@@ -174,10 +201,17 @@ mod tests {
     fn a_jpeg_arrives_as_bgra() {
         let mut jpeg = Vec::new();
         let red = image::RgbImage::from_pixel(16, 16, image::Rgb([250, 0, 0]));
-        red.write_to(&mut std::io::Cursor::new(&mut jpeg), image::ImageFormat::Jpeg).unwrap();
+        red.write_to(
+            &mut std::io::Cursor::new(&mut jpeg),
+            image::ImageFormat::Jpeg,
+        )
+        .unwrap();
         let pixels = bgra(&jpeg).unwrap();
         let pixel = pixels.get_pixel(8, 8).0;
-        assert!(pixel[2] > 200 && pixel[0] < 60, "red is in the third byte: {pixel:?}");
+        assert!(
+            pixel[2] > 200 && pixel[0] < 60,
+            "red is in the third byte: {pixel:?}"
+        );
         assert!(bgra(b"not a jpeg").is_none());
     }
 }

@@ -70,8 +70,7 @@ const START_BPS: u64 = 1_000_000;
 /// waits for 15 later packets or a second, and the talk spurt has already ended by then.
 /// Video keeps its own hold. Bandwidth estimation from the server's TWCC feedback is what turns
 /// on str0m's pacer: a keyframe leaves spread out, and audio, which it does not pace, goes
-/// around it. It looks for more bandwidth only once there is video to spend it on, so a voice
-/// call sends no padding.
+/// around it. It looks for more bandwidth only once there is video to spend it on.
 fn rtc_config() -> RtcConfig {
     let mut config = RtcConfig::new()
         .clear_codecs()
@@ -82,6 +81,14 @@ fn rtc_config() -> RtcConfig {
         .set_reordering_timeout_audio(Some(Duration::from_millis(40)));
     config.codec_config().add_h264(H264_PT.into(), Some(H264_RTX_PT.into()), true, H264_PROFILE);
     config
+}
+
+/// Padding on an RTX stream. str0m keeps 50 kb/s or more of it going on any line that has RTX,
+/// inactive or not, once any media flows, with no way to turn it off, so a call sending no video
+/// has to throw it away here (see [`Call::transmit`]). Only RTP is ever this byte: RTCP's types
+/// start at 192 and STUN and DTLS leave the top two bits clear.
+fn is_padding(packet: &[u8]) -> bool {
+    matches!(packet, [first, second, ..] if first >> 6 == 2 && second & 0x7f == H264_RTX_PT)
 }
 
 /// The jitter buffer's sequence for an RTP timestamp at 48 kHz. One 20 ms frame is 960.
@@ -640,7 +647,7 @@ impl Call {
             if !self.controls.deafened.load(Ordering::Relaxed) {
                 // The SFU writes a fresh sequence, so a lost frame is a hole in the RTP
                 // time and not in `seq_range`. The jitter buffer only sees sequence numbers.
-                stream.jitter.insert(frame_sequence(data.time.numer() as u64), opus);
+                stream.jitter.insert(frame_sequence(data.time.numer()), opus);
             }
         }
     }
@@ -692,8 +699,13 @@ impl Call {
         out::send(&MediaResponse::Interrupted);
     }
 
-    /// Sends one packet. Over TCP, the first one to an address opens the stream.
+    /// Sends one packet. Over TCP, the first one to an address opens the stream. With no video
+    /// to send, a voice call does not pay for padding. The feedback then counts it as lost, so
+    /// the estimate starts afresh when video does ([`Call::picture_step`]).
     fn transmit(&mut self, proto: Protocol, to: SocketAddr, packet: &[u8]) {
+        if self.desired == 0 && is_padding(packet) {
+            return;
+        }
         match proto {
             Protocol::Udp => {
                 if let Some(udp) = &self.link.udp {
@@ -894,6 +906,11 @@ impl Call {
         }
         let desired = video::desired(share, camera);
         if desired != self.desired {
+            if self.desired == 0 {
+                self.link.rtc.bwe().reset(Bitrate::bps(START_BPS));
+                self.estimate = None;
+                self.rates = Rates::default();
+            }
             self.desired = desired;
             self.link.rtc.bwe().set_desired_bitrate(Bitrate::bps(desired));
         }
@@ -1391,6 +1408,8 @@ mod tests {
         sent: Vec<(Instant, Vec<u8>)>,
         events: Vec<String>,
         estimates: Vec<u64>,
+        /// As [`Call::transmit`] does with no video to send.
+        no_padding: bool,
     }
 
     impl Wire {
@@ -1405,6 +1424,9 @@ mod tests {
                 match link.rtc.poll_output().unwrap() {
                     Output::Timeout(_) => break,
                     Output::Transmit(transmit) => {
+                        if self.no_padding && is_padding(&transmit.contents) {
+                            continue;
+                        }
                         self.sent.push((now, transmit.contents.to_vec()));
                         to_peer.push(transmit.contents.to_vec());
                     }
@@ -1444,8 +1466,8 @@ mod tests {
         }
     }
 
-    /// A connection and a peer standing in for the SFU, connected, with the share turned on.
-    fn sharing() -> (Link, Rtc, Wire) {
+    /// A connection and a peer standing in for the SFU, connected.
+    fn connected() -> (Link, Rtc, Wire) {
         let theirs = SocketAddr::from(([127, 0, 0, 1], 40_000));
         let offer = Offer::new(&TinyOffer { user_id: "me".into(), host: "127.0.0.1".into(), slots: 1, muted: false, deafened: false, e2ee: None }).unwrap();
         let ours = offer.link.local_udp.unwrap();
@@ -1454,7 +1476,7 @@ mod tests {
         let incoming = str0m::change::SdpOffer::from_sdp_string(offer.sdp()).unwrap();
         let answer = peer.sdp_api().accept_offer(incoming).unwrap();
         let mut link = offer.accept(&answer.to_sdp_string()).unwrap();
-        let mut wire = Wire { now: Instant::now(), ours, theirs, sent: Vec::new(), events: Vec::new(), estimates: Vec::new() };
+        let mut wire = Wire { now: Instant::now(), ours, theirs, sent: Vec::new(), events: Vec::new(), estimates: Vec::new(), no_padding: false };
         for _ in 0..3000 {
             wire.step(&mut link, &mut peer);
             if wire.events.iter().any(|event| event == "Connected") {
@@ -1462,6 +1484,12 @@ mod tests {
             }
         }
         assert!(wire.events.iter().any(|event| event == "Connected"), "{:?}", wire.events);
+        (link, peer, wire)
+    }
+
+    /// The same, with the share turned on.
+    fn sharing() -> (Link, Rtc, Wire) {
+        let (mut link, mut peer, mut wire) = connected();
         let sdp = link.offer_send(true, true).unwrap();
         let answer = peer.sdp_api().accept_offer(str0m::change::SdpOffer::from_sdp_string(&sdp).unwrap()).unwrap();
         link.take_answer(&answer.to_sdp_string()).unwrap();
@@ -1507,18 +1535,69 @@ mod tests {
         assert!(!wire.estimates.is_empty(), "the feedback gave an estimate");
     }
 
+    fn talk(link: &mut Link, peer: &mut Rtc, wire: &mut Wire, ms: u64) {
+        let microphone = link.microphone_mid();
+        let pt = link.rtc.writer(microphone).unwrap().payload_params().next().unwrap().pt();
+        for n in 0..ms / 20 {
+            let writer = link.rtc.writer(microphone).unwrap();
+            writer.write(pt, wire.now, MediaTime::new(n * 960, Frequency::FORTY_EIGHT_KHZ), vec![0x78; 40]).unwrap();
+            wire.run(link, peer, 20);
+        }
+    }
+
+    fn padding_after(wire: &Wire, from: Instant) -> usize {
+        wire.sent.iter().filter(|(at, packet)| *at >= from && is_padding(packet)).map(|(_, packet)| packet.len()).sum()
+    }
+
+    /// str0m pads an inactive line. This is what makes that visible, and what stops it.
     #[test]
-    fn a_voice_call_sends_no_padding_for_the_estimator() {
-        let (mut link, mut peer, mut wire) = sharing();
-        let sdp = link.offer_send(true, false).unwrap();
+    fn a_voice_call_sends_no_padding() {
+        let (mut link, mut peer, mut wire) = connected();
+        talk(&mut link, &mut peer, &mut wire, 3000);
+        assert!(padding_after(&wire, wire.now - Duration::from_secs(1)) > 1000, "str0m still pads, or this test proves nothing");
+
+        let (mut link, mut peer, mut wire) = connected();
+        wire.no_padding = true;
+        let start = wire.now;
+        talk(&mut link, &mut peer, &mut wire, 3000);
+        assert_eq!(padding_after(&wire, start), 0);
+        assert!(!wire.rtp(*link.rtc.writer(link.microphone).unwrap().payload_params().next().unwrap().pt(), start).is_empty());
+    }
+
+    #[test]
+    fn only_rtx_rtp_counts_as_padding() {
+        assert!(is_padding(&[0xa0, H264_RTX_PT, 0, 1]));
+        assert!(is_padding(&[0xa0, H264_RTX_PT | 0x80, 0, 1]));
+        assert!(!is_padding(&[0x80, H264_PT, 0, 1]), "video");
+        assert!(!is_padding(&[0x81, 205, 0, 1]), "RTCP");
+        assert!(!is_padding(&[0x00, H264_RTX_PT]), "STUN");
+        assert!(!is_padding(&[22, 254]), "DTLS");
+        assert!(!is_padding(&[]));
+    }
+
+    /// The padding thrown away reads as loss to the estimator, so video starts from a fresh one.
+    #[test]
+    fn video_after_a_quiet_voice_call_starts_from_a_fresh_estimate() {
+        let (mut link, mut peer, mut wire) = connected();
+        wire.no_padding = true;
+        talk(&mut link, &mut peer, &mut wire, 4000);
+        let sdp = link.offer_send(true, true).unwrap();
         let answer = peer.sdp_api().accept_offer(str0m::change::SdpOffer::from_sdp_string(&sdp).unwrap()).unwrap();
         link.take_answer(&answer.to_sdp_string()).unwrap();
-        wire.run(&mut link, &mut peer, 100);
-        let start = wire.now;
-        wire.run(&mut link, &mut peer, 2000);
-        let bytes: usize = wire.sent.iter().filter(|(at, _)| *at >= start).map(|(_, packet)| packet.len()).sum();
-        // Keepalives and reports only: 50 kb/s of padding would be 12,500 bytes.
-        assert!(bytes < 4_000, "{bytes} bytes in two seconds of nothing");
+        wire.no_padding = false;
+        link.rtc.bwe().reset(Bitrate::bps(START_BPS));
+        link.rtc.bwe().set_desired_bitrate(Bitrate::bps(2_000_000));
+        wire.estimates.clear();
+        let share = link.share_mid();
+        let pt = link.rtc.writer(share).unwrap().payload_params().next().unwrap().pt();
+        for n in 0..45u64 {
+            let name = if n == 0 { 0x65 } else { 0x41 };
+            let writer = link.rtc.writer(share).unwrap();
+            writer.write(pt, wire.now, MediaTime::new(n * 6000, Frequency::NINETY_KHZ), annex_b(6000, name)).unwrap();
+            wire.run(&mut link, &mut peer, 66);
+        }
+        let last = wire.estimates.last().copied().unwrap_or(0);
+        assert!(last >= 500_000, "{:?}", wire.estimates);
     }
 
     /// The share stays inactive until its answer is in. An empty answer is a refusal
