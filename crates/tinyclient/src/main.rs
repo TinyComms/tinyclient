@@ -12,6 +12,10 @@ mod update;
 mod frames;
 #[cfg(any(feature = "gui", test))]
 mod tiny_attach;
+// The window draws what it says; without one, only its tests use it.
+#[cfg(any(feature = "gui", test))]
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+mod tiny_setup;
 #[cfg(feature = "gui")]
 mod gui;
 #[cfg(feature = "gui")]
