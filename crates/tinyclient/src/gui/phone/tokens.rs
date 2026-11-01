@@ -139,6 +139,10 @@ pub trait PhoneType: Styled + Sized {
     fn phone_title(self) -> Self {
         self.text_size(px(scaled(17.))).line_height(px(scaled(22.))).font_weight(crate::gui::theme::SEMIBOLD)
     }
+    /// 15/20: a sheet row's label.
+    fn phone_row(self) -> Self {
+        self.text_size(px(scaled(15.))).line_height(px(scaled(20.)))
+    }
     fn phone_preview(self) -> Self {
         self.text_size(px(scaled(13.))).line_height(px(scaled(18.)))
     }
