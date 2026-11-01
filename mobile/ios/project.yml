@@ -58,6 +58,8 @@ targets:
       # The call platform and web sign-in (crates/tinyclient/src/mobile/ios). A static library
       # carries no framework links, so the app names each one. WebKit is messaged dynamically
       # (objc2 binds WKWebView for macOS only), so nothing would pull it in otherwise.
+      # mediad's cpal opens the microphone and speaker through AudioToolbox's audio units.
+      - sdk: AudioToolbox.framework
       - sdk: AVFoundation.framework
       - sdk: AVFAudio.framework
       - sdk: CoreMedia.framework

@@ -17,8 +17,10 @@ mod audio;
 mod auth;
 mod camera;
 mod codec;
+mod unified;
 mod pixels;
 mod screen;
+mod selftest;
 mod web;
 
 use mediad::platform::{CameraRequest, EncoderConfig, FrameSink, H264Decoder, H264Encoder, Permission, Platform};
@@ -28,11 +30,14 @@ use std::sync::Arc;
 
 /// Registers the iOS phone with mediad, chatd's sign-in and the call screen.
 pub(super) fn register() {
+    unified::install();
     let phone = Arc::new(Ios);
     mediad::platform::register(phone.clone());
-    protocol::web_sign_in::register(phone);
+    protocol::web_sign_in::register(phone.clone());
     audio::register_hooks();
     camera::register_hooks();
+    selftest::maybe_start(phone);
+    log::info!("tinyclient: iOS platform registered");
 }
 
 /// Runs `work` on the main thread and returns its result. On the main thread already, runs it
