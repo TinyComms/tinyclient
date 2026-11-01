@@ -209,4 +209,11 @@ public final class TinyPlatform {
 
     /** The Tiny sign-in's browser reached the callback with {@code url}. */
     static native void nativeRedirected(long auth, String url);
+
+    /**
+     * A check of the platform from Rust, logged: {@code codec} encodes synthetic frames through
+     * the call platform's H.264 encoder and decodes them back. Started by a launch with the extra
+     * {@code tiny.selftest} (adb shell am start -n dev.tinyclient.app/.TinyActivity --es tiny.selftest codec).
+     */
+    static native void nativeSelfTest(String what);
 }

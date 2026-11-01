@@ -21,6 +21,7 @@ mod jvm;
 mod loopback;
 mod natives;
 mod selfie;
+mod selftest;
 mod web;
 mod wire;
 

@@ -93,6 +93,17 @@ pub extern "system" fn Java_dev_tinyclient_app_TinyPlatform_nativeNavigate(mut e
 }
 
 #[no_mangle]
+pub extern "system" fn Java_dev_tinyclient_app_TinyPlatform_nativeSelfTest(mut env: JNIEnv, _class: JClass, what: JString) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let Ok(text) = env.get_string(&what) else {
+            return;
+        };
+        let what: String = text.into();
+        std::thread::spawn(move || super::selftest::run(&what));
+    }));
+}
+
+#[no_mangle]
 pub extern "system" fn Java_dev_tinyclient_app_TinyPlatform_nativeRedirected(mut env: JNIEnv, _class: JClass, auth: jlong, url: JString) {
     let _ = catch_unwind(AssertUnwindSafe(|| {
         let Ok(text) = env.get_string(&url) else {

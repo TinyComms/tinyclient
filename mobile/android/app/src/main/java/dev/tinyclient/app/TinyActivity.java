@@ -15,6 +15,14 @@ public class TinyActivity extends GpuiInputActivity {
     protected void onCreate(Bundle savedInstanceState) {
         TinyPlatform.attach(this);
         super.onCreate(savedInstanceState);
+        selfTest(getIntent());
+    }
+
+    private void selfTest(Intent intent) {
+        String what = intent == null ? null : intent.getStringExtra("tiny.selftest");
+        if (what != null && (getApplicationInfo().flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0) {
+            TinyPlatform.nativeSelfTest(what);
+        }
     }
 
     @Override
@@ -45,6 +53,7 @@ public class TinyActivity extends GpuiInputActivity {
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         setIntent(intent);
+        selfTest(intent);
     }
 
     @Override
