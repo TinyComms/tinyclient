@@ -1341,6 +1341,18 @@ impl Store {
         );
         let in_folder_pins = "(SELECT instr(f.pinned, ',' || c.id || ',') FROM folder f
                                 WHERE f.network = c.network AND f.account = c.account AND f.id = ?3)";
+        // Where the whole network's list puts a chat's pins: its own pin, and the best place it
+        // holds among the folder pins, whichever is higher. Telegram's "all chats" lifts the
+        // pins of every folder; `nullif` keeps a folder holding the chat unpinned from counting.
+        let folder_pin_anywhere = "(SELECT min(nullif(instr(f.pinned, ',' || c.id || ','), 0))
+                                    FROM folder f WHERE f.network = c.network AND f.account = c.account)";
+        let order = match folder {
+            // A folder is a filter: its own pins on top, in its own order.
+            Some(_) => format!("coalesce(nullif({in_folder_pins}, 0), 2147483647),"),
+            None => format!(
+                "min(coalesce(c.pin, 2147483647), coalesce({folder_pin_anywhere}, 2147483647)),"
+            ),
+        };
         let key = params![word(&network), account.map(|account| account.account.as_str()), folder];
         let counts = self.db.query_row(
             &format!(
@@ -1355,8 +1367,7 @@ impl Store {
             .db
             .prepare(&format!(
                 "{CONVERSATION} WHERE {belongs}
-                 ORDER BY CASE WHEN ?3 IS NULL THEN coalesce(c.pin, 2147483647)
-                               ELSE coalesce(nullif({in_folder_pins}, 0), 2147483647) END,
+                 ORDER BY {order}
                           c.updated DESC, c.account, c.id
                  LIMIT ?4 OFFSET ?5"
             ))?
@@ -2944,6 +2955,7 @@ mod tests {
             chat("ben", &["work"], Some(1), false),
             chat("cy", &[], Some(0), false),
             chat("dee", &["family"], None, true),
+            chat("fin", &["work"], None, false),
             ConversationRow { special: Special::Request, ..ConversationRow::new("eve", ConversationKind::Direct, "eve") },
         ] {
             store.upsert_conversation(&account, &row).unwrap();
@@ -2955,7 +2967,7 @@ mod tests {
         }
         store
             .replace_folders(&account, &[
-                FolderRow { id: "work".into(), name: "Work".into(), position: 0, pinned: vec!["ben".into()], ..FolderRow::default() },
+                FolderRow { id: "work".into(), name: "Work".into(), position: 0, pinned: vec!["ben".into(), "fin".into()], ..FolderRow::default() },
                 FolderRow { id: "family".into(), name: "Family".into(), position: 1, pinned: vec!["dee".into()], ..FolderRow::default() },
             ])
             .unwrap();
@@ -2964,12 +2976,14 @@ mod tests {
             assert_eq!(rows.len() as u32, total);
             rows.into_iter().map(|row| row.key.id).collect()
         };
-        // Pins in their order, then newest first; the channel of the Space is not in it.
-        assert_eq!(ids(&store, None, Shelf::Main), ["cy", "ben", "ana"]);
+        // Pins in their order, then newest first; the channel of the Space is not in it. A chat
+        // pinned by a folder alone climbs on the list with the pin's place (`fin`), what one
+        // folder holds read stays below.
+        assert_eq!(ids(&store, None, Shelf::Main), ["cy", "ben", "fin", "ana"]);
         assert_eq!(ids(&store, None, Shelf::Archive), ["dee"]);
         assert_eq!(ids(&store, None, Shelf::Requests), ["eve"]);
         // A chat in two folders is in both; a folder's own pins come first, archived or not.
-        assert_eq!(ids(&store, Some("work"), Shelf::Main), ["ben", "ana"]);
+        assert_eq!(ids(&store, Some("work"), Shelf::Main), ["ben", "fin", "ana"]);
         assert_eq!(ids(&store, Some("family"), Shelf::Main), ["dee", "ana"]);
         let folders = store.folders(Some(Network::Discord)).unwrap();
         let counted: Vec<(String, u32)> = folders.into_iter().map(|folder| (folder.name, folder.unread)).collect();
@@ -2977,9 +2991,9 @@ mod tests {
 
         // A tree reload that does not know the filing leaves it; one that does replaces it.
         store.upsert_conversation(&account, &ConversationRow::new("ben", ConversationKind::Direct, "ben")).unwrap();
-        assert_eq!(ids(&store, Some("work"), Shelf::Main), ["ben", "ana"]);
+        assert_eq!(ids(&store, Some("work"), Shelf::Main), ["ben", "fin", "ana"]);
         assert!(store.set_filing(&Key::new(&account, "ben"), &Filing::default()).unwrap());
-        assert_eq!(ids(&store, Some("work"), Shelf::Main), ["ana"]);
+        assert_eq!(ids(&store, Some("work"), Shelf::Main), ["fin", "ana"]);
     }
 
     #[test]
