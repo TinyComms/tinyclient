@@ -42,7 +42,7 @@ impl Arrivals {
     }
 }
 
-/// One voice's counts, for the loss of the last second.
+/// One voice's counts since the meter last asked.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Counts {
     pub received: u64,
@@ -57,8 +57,6 @@ pub struct Meter {
     sent: u64,
     received: u64,
     since: Instant,
-    /// Received, lost and rebuilt over every voice, as last summed.
-    seen: (u64, u64, u64),
     /// Over the whole call: lost frames made up, and rebuilt from the next packet.
     concealed: u64,
     recovered: u64,
@@ -72,7 +70,7 @@ pub struct Meter {
 
 impl Meter {
     pub fn new(path: CallPath) -> Meter {
-        Meter { sent: 0, received: 0, since: Instant::now(), seen: (0, 0, 0), concealed: 0, recovered: 0, troubles: Troubles::default(), rtt_ms: 0, path, probe: None }
+        Meter { sent: 0, received: 0, since: Instant::now(), concealed: 0, recovered: 0, troubles: Troubles::default(), rtt_ms: 0, path, probe: None }
     }
 
     pub fn sent(&mut self, bytes: usize) {
@@ -102,7 +100,7 @@ impl Meter {
         }
     }
 
-    /// The last second, from every voice's running counts; and the counting starts again.
+    /// The last second, from what each voice counted in it; and the counting starts again.
     pub fn second(&mut self, voices: impl Iterator<Item = Counts>) -> CallStats {
         let (mut received, mut lost, mut rebuilt, mut jitter) = (0, 0, 0, 0);
         for voice in voices {
@@ -111,21 +109,17 @@ impl Meter {
             rebuilt += voice.rebuilt;
             jitter = jitter.max(voice.jitter_ms);
         }
-        // A voice that left takes its counts with it: never less than nothing.
-        let fresh = (received.saturating_sub(self.seen.0), lost.saturating_sub(self.seen.1));
-        let fresh_rebuilt = rebuilt.saturating_sub(self.seen.2);
-        self.seen = (received, lost, rebuilt);
-        self.recovered += fresh_rebuilt;
-        self.concealed += fresh.1.saturating_sub(fresh_rebuilt);
+        self.recovered += rebuilt;
+        self.concealed += lost.saturating_sub(rebuilt);
         let count = |n: u64| n.min(u64::from(u32::MAX)) as u32;
         let troubles = self.troubles;
-        let expected = fresh.0 + fresh.1;
+        let expected = received + lost;
         let elapsed = self.since.elapsed().as_secs_f64().max(0.001);
         let kbps = |bytes: u64| (bytes as f64 * 8. / 1000. / elapsed).round() as u32;
         let stats = CallStats {
             rtt_ms: self.rtt_ms,
             jitter_ms: jitter,
-            loss_permille: (fresh.1 * 1000).checked_div(expected).map_or(0, |permille| permille.min(1000) as u16),
+            loss_permille: (lost * 1000).checked_div(expected).map_or(0, |permille| permille.min(1000) as u16),
             send_kbps: kbps(self.sent),
             receive_kbps: kbps(self.received),
             path: self.path,
@@ -172,8 +166,7 @@ mod tests {
         assert_eq!(first.jitter_ms, 9);
         assert_eq!(first.path, CallPath::Udp);
         assert!(first.send_kbps > 0 && first.receive_kbps > first.send_kbps);
-        // The next second counts only what is new.
-        let second = meter.second([Counts { received: 190, lost: 10, rebuilt: 4, jitter_ms: 2 }, Counts { received: 50, lost: 0, rebuilt: 0, jitter_ms: 1 }].into_iter());
+        let second = meter.second([Counts { received: 100, jitter_ms: 2, ..Counts::default() }, Counts { jitter_ms: 1, ..Counts::default() }].into_iter());
         assert_eq!(second.loss_permille, 0);
         // Concealment and FEC count over the whole call.
         assert_eq!((first.concealed_frames, first.fec_recovered), (6, 4));

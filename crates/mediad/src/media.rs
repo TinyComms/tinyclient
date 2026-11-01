@@ -87,6 +87,8 @@ pub(crate) struct Stream {
     /// The gain the last frame ended at (`hear`), so the next one starts from it.
     gain: Option<f32>,
     pub(crate) arrivals: Arrivals,
+    /// The running counts as the connection meter last had them.
+    reported: Counts,
 }
 
 impl Stream {
@@ -103,6 +105,7 @@ impl Stream {
             rebuilt: 0,
             gain: None,
             arrivals: Arrivals::default(),
+            reported: Counts::default(),
         })
     }
 
@@ -112,9 +115,12 @@ impl Stream {
         self.gain = Some(to);
     }
 
-    /// What the connection meter needs of this voice.
-    pub(crate) fn counts(&self) -> Counts {
-        Counts { received: self.jitter.received, lost: self.jitter.lost, rebuilt: self.rebuilt, jitter_ms: self.arrivals.ms() }
+    /// What the connection meter needs of this voice: what it counted since it was last asked.
+    /// A voice that leaves takes its running counts with it, so a sum of those would go backwards.
+    pub(crate) fn counts(&mut self) -> Counts {
+        let now = Counts { received: self.jitter.received, lost: self.jitter.lost, rebuilt: self.rebuilt, jitter_ms: self.arrivals.ms() };
+        let was = std::mem::replace(&mut self.reported, now);
+        Counts { received: now.received - was.received, lost: now.lost - was.lost, rebuilt: now.rebuilt - was.rebuilt, jitter_ms: now.jitter_ms }
     }
 
     /// Deafened: nothing is played, and nothing is kept to play later.
@@ -550,7 +556,7 @@ impl Loop {
         }
         self.setup.audio.log_glitches();
         self.meter.troubles = self.setup.audio.troubles();
-        let stats = self.meter.second(self.streams.values().map(Stream::counts));
+        let stats = self.meter.second(self.streams.values_mut().map(Stream::counts));
         self.setup.controls.publish_stats(stats);
         let users = self.setup.users.lock().unwrap();
         self.streams.retain(|ssrc, stream| {
@@ -1229,6 +1235,21 @@ mod loss_tests {
 #[cfg(test)]
 mod receive_tests {
     use super::*;
+
+    /// Two voices' running counts were summed, so one leaving took the sum backwards: nothing
+    /// looked received, and the next lost packet read as 1000 per mille.
+    #[test]
+    fn a_voice_that_leaves_does_not_read_as_a_loss_spike() {
+        let mut meter = Meter::new(CallPath::Udp);
+        let (mut ada, mut bea) = (Stream::new().unwrap(), Stream::new().unwrap());
+        ada.jitter.received = 1000;
+        bea.jitter.received = 1000;
+        meter.second([ada.counts(), bea.counts()].into_iter());
+        // Bea leaves. Ada goes on, and one of her next 50 packets is lost.
+        ada.jitter.received += 49;
+        ada.jitter.lost += 1;
+        assert_eq!(meter.second([ada.counts()].into_iter()).loss_permille, 20);
+    }
 
     #[test]
     fn the_end_of_a_spurt_ramps_to_silence_instead_of_stepping() {

@@ -998,7 +998,7 @@ impl Call {
             self.meter.troubles = audio.troubles();
         }
         if self.ticks.is_multiple_of(SECOND) && self.connected {
-            let stats = self.meter.second(self.slots.values().map(|slot| slot.stream.counts()));
+            let stats = self.meter.second(self.slots.values_mut().map(|slot| slot.stream.counts()));
             self.controls.publish_stats(stats);
         }
         if let Some(devices) = &mut self.devices {
