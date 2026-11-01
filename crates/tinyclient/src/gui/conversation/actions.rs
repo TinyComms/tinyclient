@@ -292,19 +292,22 @@ impl Pane {
         let id = id.to_owned();
         let task = cx.spawn(async move |this, cx| {
             cx.background_executor().timer(LONG_PRESS).await;
-            let _ = this.update(cx, |this, cx| {
-                // The press held: the message's actions come up as a sheet, as the desktop's
-                // right-click menu does, for one that can be acted on or that did not go.
-                let Some(message) = this.find(&id) else {
-                    return;
-                };
-                let can = this.can(&message);
-                if can.act || can.unsent {
-                    this.open_menu(message, at, cx);
-                }
-            });
+            let _ = this.update(cx, |this, cx| this.hold_message(&id, at, cx));
         });
         self.press = Some((task, (f32::from(at.x), f32::from(at.y))));
+    }
+
+    /// A press on a message held: its actions come up as a sheet, as the desktop's right-click
+    /// menu does, for one that can be acted on or that did not go.
+    pub(super) fn hold_message(&mut self, id: &str, at: Point<Pixels>, cx: &mut Context<Self>) {
+        self.hover = None;
+        let Some(message) = self.find(id) else {
+            return;
+        };
+        let can = self.can(&message);
+        if can.act || can.unsent {
+            self.open_menu(message, at, cx);
+        }
     }
 
     /// The pointer moved during a press. Past the slop it was a scroll, so nothing will show.

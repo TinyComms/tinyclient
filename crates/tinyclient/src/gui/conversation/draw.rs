@@ -629,7 +629,14 @@ impl Pane {
             // not on a hover a finger never makes. A press that moves past the slop is a scroll.
             .when(metrics == Metrics::PHONE, |row| {
                 let down = message.id.clone();
-                row.on_mouse_down(
+                // A finger's long press comes as its own event: its mouse-down only comes when it
+                // lifts, so the press timer never starts for one.
+                let held = message.id.clone();
+                row.child(crate::gui::phone::long_press(cx.listener(move |this, event: &gpui::LongPressEvent, _, cx| {
+                    this.release_message();
+                    this.hold_message(&held, event.start_position, cx);
+                })))
+                .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| this.press_message(&down, event.position, cx)),
                 )

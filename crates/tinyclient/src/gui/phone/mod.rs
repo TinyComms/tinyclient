@@ -34,17 +34,82 @@ pub fn active() -> bool {
 /// under `layout::PHONE`; once a window is a phone it stays one until it is 40 pt wider than that,
 /// so a width that hovers at the edge (a split screen being dragged, a fold opening) does not
 /// flip the layout every frame.
-pub fn form(was_phone: bool, width: f32) -> bool {
+///
+/// A phone turned on its side is still a phone: what decides is the device, not the window's
+/// width. On Android and iOS that is the screen's shorter side (a phone's is under 600 pt, a
+/// tablet's is not, so a tablet in either orientation may be the desktop). Anywhere, a window
+/// wider than tall and shorter than a desktop window may ever be (`layout::WINDOW_MIN`) is a
+/// phone in landscape, which is also how the screenshot harness draws one.
+pub fn form(was_phone: bool, width: f32, height: f32) -> bool {
     let edge = crate::gui::layout::PHONE;
+    let landscape_phone = width > height && height < crate::gui::layout::WINDOW_MIN.1;
+    let side = if HANDHELD || landscape_phone { width.min(height) } else { width };
     if was_phone {
-        width < edge + 40.
+        side < edge + 40.
     } else {
-        width < edge
+        side < edge
     }
 }
 
+/// Built for a phone or a tablet, whose window is the whole screen.
+pub const HANDHELD: bool = cfg!(any(target_os = "android", target_os = "ios"));
+
 /// How long a finger rests on a row before it is a long press: the row's menu, not a tap.
 pub const LONG_PRESS: Duration = Duration::from_millis(450);
+
+/// A touch screen's long press over the element this is laid inside (its parent must be
+/// `relative`): `act` runs where the finger went down, and the press is claimed, so lifting the
+/// finger is not a tap too. A mouse never makes one; a mouse's long press is the press timer the
+/// rows and messages keep (`State::press_held`, `press_message`). gpui-ce delivers a finger's
+/// mouse-down only when it lifts, so that timer never runs on a touch screen: this is what does.
+pub fn long_press(act: impl Fn(&gpui::LongPressEvent, &mut Window, &mut gpui::App) + 'static) -> impl IntoElement {
+    gpui::canvas(
+        |bounds, window, _| window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal),
+        move |_, hitbox, window, _| {
+            window.on_mouse_event(move |event: &gpui::LongPressEvent, phase, window, cx| {
+                if !phase.bubble() || event.phase != gpui::TouchPhase::Started || window.default_prevented() || !hitbox.is_hovered(window) {
+                    return;
+                }
+                window.prevent_default();
+                cx.stop_propagation();
+                act(event, window, cx);
+            });
+        },
+    )
+    .absolute()
+    .top_0()
+    .left_0()
+    .size_full()
+}
+
+/// A finger's drag that starts on the element this is laid inside (its parent `relative`): the
+/// touch is claimed as a drag, not a tap or a scroll, and `act` hears each of its phases. A
+/// finger's mouse events come only when it lifts, so a drag on a touch screen is this or nothing.
+pub fn touch_drag(act: impl Fn(&gpui::TouchDragEvent, &mut Window, &mut gpui::App) + 'static) -> impl IntoElement {
+    gpui::canvas(
+        |bounds, window, _| window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal),
+        move |_, hitbox, window, _| {
+            window.on_mouse_event(move |event: &gpui::TouchDragEvent, phase, window, cx| {
+                // Every phase is told where the touch began, so the hit test holds all through.
+                if !phase.bubble() || !hitbox.is_hovered(window) {
+                    return;
+                }
+                if event.phase == gpui::TouchPhase::Started {
+                    if window.default_prevented() {
+                        return;
+                    }
+                    window.prevent_default();
+                }
+                cx.stop_propagation();
+                act(event, window, cx);
+            });
+        },
+    )
+    .absolute()
+    .top_0()
+    .left_0()
+    .size_full()
+}
 
 /// A pointer position as the two numbers the slop test wants.
 pub fn at(point: Point<Pixels>) -> (f32, f32) {
@@ -168,7 +233,7 @@ impl Shell {
     /// The phone, whole: what is pushed on top (the right pane's page, else the conversation),
     /// or the home of rail and sidebar; then the switcher and the open menu over it.
     pub(in crate::gui) fn phone_screen(&self, snapshot: &Snapshot, window: &mut Window, cx: &mut Context<Self>) -> Div {
-        let width = f32::from(window.viewport_size().width);
+        let width = f32::from(window.viewport_size().width) - tokens::safe_left() - tokens::safe_right();
         // A call is the whole phone while it shows (`call::phone`), over everything else.
         if let Some(call) = self.call_phone_screen(snapshot, window, cx) {
             return div().size_full().relative().flex().flex_col().bg(theme::canvas()).text_color(theme::text()).child(call);
@@ -188,6 +253,9 @@ impl Shell {
         };
         // What covers the whole window measures from the real status bar again.
         tokens::take_top(false);
+        // A phone on its side keeps its screens clear of the cutout and the rounded corners at
+        // the sides; the sheets and the switcher over them span the screen, as the platform's do.
+        let (left, right) = (tokens::safe_left(), tokens::safe_right());
         div()
             .size_full()
             .relative()
@@ -196,7 +264,7 @@ impl Shell {
             .bg(theme::canvas())
             .text_color(theme::text())
             .children(bar)
-            .child(div().flex_1().min_h_0().child(screen))
+            .child(div().flex_1().min_h_0().pl(px(left)).pr(px(right)).bg(theme::sidebar()).child(screen))
             .children(self.switcher(window, cx))
             .children(self.phone_slack_sheet(window, cx))
             .children(self.phone_menu(snapshot, window, cx))
@@ -254,7 +322,11 @@ impl Shell {
                 icon_button("phone-right-back", "icons/chevron-left.svg", false)
                     .size(px(tokens::TOUCH))
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_click(cx.listener(|this, _, _, cx| this.close_right(None, cx))),
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if !this.pane_pop(cx) {
+                            this.close_right(None, cx);
+                        }
+                    })),
             )
             .child(
                 div()
@@ -315,12 +387,16 @@ impl Shell {
         if self.close_slack_menu(cx) {
             return true;
         }
-        if self.tiny_settings_open() {
-            self.tiny_close_settings(cx);
+        // Server Settings: a page of it goes back to the list, the list closes; a Tiny dialog or
+        // card closes first.
+        if self.tiny_back(cx) {
             return true;
         }
         if self.layout_state.right.is_some() && !self.pane_tucked() {
-            self.close_right(None, cx);
+            // A page pushed over another (a Profile from Members) goes back to that one.
+            if !self.pane_pop(cx) {
+                self.close_right(None, cx);
+            }
             return true;
         }
         if self.open.is_some() || self.snapshot.as_ref().is_some_and(|snapshot| snapshot.open.is_some()) {
@@ -385,6 +461,14 @@ impl Shell {
             .bottom(px(tokens::safe_bottom()))
             .left_0()
             .w(px(20.))
+            // A finger: its drag from the edge, claimed when it begins.
+            .child(touch_drag(cx.listener(|this, event: &gpui::TouchDragEvent, _, cx| match event.phase {
+                gpui::TouchPhase::Started => this.phone_state.arm_edge(f32::from(event.start_position.x)),
+                gpui::TouchPhase::Moved => {
+                    this.phone_drag_back(f32::from(event.position.x), true, cx);
+                }
+                gpui::TouchPhase::Ended | gpui::TouchPhase::Cancelled => this.phone_release_edge(),
+            })))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
@@ -406,13 +490,24 @@ mod tests {
     #[test]
     fn a_form_flips_below_the_phone_width_and_back_only_past_the_band() {
         let edge = crate::gui::layout::PHONE;
-        assert!(form(false, edge - 1.));
-        assert!(!form(false, edge));
+        assert!(form(false, edge - 1., 800.));
+        assert!(!form(false, edge, 800.));
         // Once a phone, it stays one through the band above the edge ...
-        assert!(form(true, edge));
-        assert!(form(true, edge + 39.));
+        assert!(form(true, edge, 800.));
+        assert!(form(true, edge + 39., 800.));
         // ... and is a desktop again only past it.
-        assert!(!form(true, edge + 40.));
+        assert!(!form(true, edge + 40., 800.));
+    }
+
+    #[test]
+    fn a_phone_on_its_side_stays_a_phone() {
+        // 844 x 390: an iPhone in landscape, shorter than any desktop window may be.
+        assert!(form(false, 844., 390.));
+        assert!(form(true, 932., 430.));
+        // A desktop window that is merely short and wide is still the desktop.
+        assert!(!form(false, 1280., 600.));
+        // A tablet on its side is not a phone.
+        assert!(!form(false, 1180., 820.));
     }
 
     #[test]
