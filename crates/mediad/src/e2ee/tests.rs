@@ -338,6 +338,17 @@ fn the_identity_key_is_kept_and_read_back() {
     assert!(kept);
     let (read, _) = identity(&path);
     assert!(read == made, "the same key the next call");
+    // A key an older build left readable by others is narrowed when it is read.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (again, _) = identity(&path);
+        assert!(again == made);
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!((mode(&path), mode(&dir)), (0o600, 0o700));
+    }
     std::fs::write(&path, "garbage").unwrap();
     let (fresh, _) = identity(&path);
     assert!(fresh != made, "an unreadable file gives a new key");

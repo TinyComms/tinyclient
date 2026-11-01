@@ -74,6 +74,11 @@ pub fn identity(path: &Path) -> (SigningKeyPair, bool) {
         let mut lines = text.lines().map(str::trim);
         if let (Some(Ok(private)), Some(Ok(public))) = (lines.next().map(hex_decode), lines.next().map(hex_decode)) {
             if private.len() == 32 && public.len() == 65 {
+                // A key an older build left readable by others is narrowed now it is used.
+                protocol::private::tighten_file(path);
+                if let Some(dir) = path.parent() {
+                    protocol::private::tighten_dir(dir);
+                }
                 return (SigningKeyPair { private, public }, true);
             }
         }
