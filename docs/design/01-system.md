@@ -75,7 +75,7 @@ Easing is ease-out for entering, linear for leaving. Reduce Motion sets every du
 | Toast | opacity and 8 pt rise, 160 ms. Leaves in 100 ms |
 | Scrollbar thumb | fades out over 150 ms, 800 ms after scrolling stops |
 
-Never animates: hover, press, selection, focus, tab and segment changes, tooltips (appear whole after 500 ms), a message arriving, badges, presence, typing ("Wren is typing…" is static text), skeletons, progress (the bar moves only when the value does), connection state. No spinner exists. Reason: the idle budget, and instant state change is what reads as fast.
+Never animates: hover, press, selection, focus, tab and segment changes, tooltips (appear whole after 500 ms), a message arriving, badges, presence, typing ("Wren is typing…" is static text), skeletons, progress (the bar moves only when the value does), connection state. No spinner exists. Reason: the idle budget, and instant state change is what reads as fast. The one thing that breathes is a server page's loading mark (§3, Loading), because a screen with nothing on it yet has no other way to say it is working.
 
 ### Focus, targets, scrollbars
 - **Focus ring:** 2 pt `focus`, drawn outside the edge, on keyboard focus only. On a filled button, a 2 pt gap of the surface color comes first. A focused text field shows it always, as a `focus` border plus a 3 pt halo of accent 35%.
@@ -121,7 +121,7 @@ States are rest / hover / pressed / focus / disabled unless listed. Every hover 
 - **Tabs.** Height 32, 16 apart, 13/500 `text_soft`; selected `text` with a 2 pt `text` bar on the hairline.
 - **Switch, checkbox.** 32 × 18 with a 14 knob; 16 square, radius 4. On is `accent`.
 - **Divider.** 1 pt `hairline`. Day: 11/500 `text_faint` label, centered, 12 from the rules. New: 1 pt `accent` rule with "New" 11/600 `accent_text` at its right end.
-- **Loading.** Skeleton blocks are static `hover`-filled rectangles (radius 4, 10 high for a title, 8 for a preview) in the row's final geometry, shown only after 150 ms. An image is its final box in `raised`. Known progress is a 4 pt bar (white 10% track, `accent` fill). Unknown progress is a sentence.
+- **Loading.** Skeleton blocks are static `hover`-filled rectangles (radius 4, 10 high for a title, 8 for a preview) in the row's final geometry, shown only after 150 ms. An image is its final box in `raised`. Known progress is a 4 pt bar (white 10% track, `accent` fill). Unknown progress is a sentence. A server's own page, while it is still being read, is the one splash: the server's icon in its own colors at 56 (`network_icon`), 16, its name 20/600, 6, one line 14 `text_soft` (max 320), centered in the pane, as the first launch says hello. While it waits the mark breathes: its opacity 0.62 to 1 and back over 2.4 s, full at the start of each breath, and nothing else moves. Reduce Motion holds it at full. The column beside it is that server's own list as skeletons, at its rows' own heights, so the page shapes up where its content will land.
 - **Empty state.** Centered: glyph 20 `text_faint`, 12, title 16/600, 4, one line 13 `text_soft` (max 320), 16, at most one secondary button. No disc, no illustration. The one exception is where the window speaks as tinyclient itself, with nothing open and on the first launch: the app's mark in its own colors at 56 (`brand_mark`, `assets/brand/tinyclient.svg`) in place of the glyph.
 
 ## 4. Craft rules

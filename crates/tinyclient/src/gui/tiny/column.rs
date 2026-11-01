@@ -6,11 +6,11 @@
 
 use super::model::{self, Line};
 use super::{Dragged, Float, Modal, Page};
-use crate::gui::components::{glyph, list_row, tip, Avatar, Shape as AvatarShape};
+use crate::gui::components::{glyph, list_row, network_icon, tip, Avatar, Shape as AvatarShape};
 use crate::gui::state::Shell;
 use crate::gui::theme::{self, Type};
 use gpui::{div, prelude::*, px, AnyElement, Context, Div, MouseButton, MouseDownEvent, Render, SharedString, Stateful, Window};
-use protocol::{Conversation, ConversationKind, Key, TinyRoom, TinySeat};
+use protocol::{Conversation, ConversationKind, Key, Network, TinyRoom, TinySeat};
 use std::rc::Rc;
 
 /// Text channels only. A direct message is a People chat, not a row in the server.
@@ -124,9 +124,13 @@ impl Shell {
     pub(in crate::gui) fn tiny_header(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let page = self.tiny_page_facts();
         let name = page.as_ref().map(|page| page.name.clone()).unwrap_or_else(|| "Tiny server".to_owned());
-        let icon = page.as_ref().and_then(Page::icon);
+        // Before the server answers there is no icon to show: the network's mark stands in, as
+        // the pane's splash wears it.
+        let avatar = match page.as_ref() {
+            Some(page) => Avatar::named(&name, 24.).shape(AvatarShape::Place).image_at(page.icon()).build().into_any_element(),
+            None => div().size(px(24.)).flex_none().child(network_icon(Network::Tiny, 24.)).into_any_element(),
+        };
         let open = self.tiny_state.float == Some(Float::Header);
-        let avatar = Avatar::named(&name, 24.).shape(AvatarShape::Place).image_at(icon).build();
         div()
             .id("tiny-header")
             .flex_1()
@@ -154,16 +158,15 @@ impl Shell {
             .child(glyph(if open { "icons/x.svg" } else { "icons/chevron-down.svg" }, 14., theme::text_soft()))
     }
 
-    /// The channel list. Loading and failure say so in its place.
+    /// The channel list. Loading shows the rows it will hold as shapes; a failure says so in its
+    /// place.
     pub(in crate::gui) fn tiny_directory(&self, cx: &mut Context<Self>) -> AnyElement {
         let Some(page) = self.tiny_page_facts() else {
-            let (words, bad) = match &self.tiny_state.error {
-                Some(detail) => (detail.clone(), true),
-                None => ("Loading this server.".to_owned(), false),
+            let Some(detail) = self.tiny_state.error.clone() else {
+                return self.tiny_loading_column();
             };
             let line = div().px(px(theme::PANE_PAD)).pt(px(12.)).whitespace_normal();
-            let line = if bad { line.type_small().text_color(theme::danger()) } else { line.type_ui().text_color(theme::text_soft()) };
-            return line.child(words).into_any_element();
+            return line.type_small().text_color(theme::danger()).child(detail).into_any_element();
         };
         let lines = model::lines(page.community, &self.tiny_state.folded, page.mine);
         let mut list = div().id("tiny-channels").size_full().overflow_y_scroll().pt(px(4.)).pb(px(12.)).flex().flex_col();
