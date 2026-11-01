@@ -181,7 +181,7 @@ fn inputs() -> Vec<Retained<AVAudioSessionPortDescription>> {
 
 fn port_of(kind: &NSString) -> Option<Retained<AVAudioSessionPortDescription>> {
     // SAFETY: reading the port's type.
-    inputs().into_iter().find(|port| unsafe { port.portType() }.isEqualToString(kind))
+    inputs().into_iter().find(|port| unsafe { port.portType() }.to_string() == kind.to_string())
 }
 
 fn bluetooth_port() -> Option<Retained<AVAudioSessionPortDescription>> {
@@ -199,7 +199,7 @@ fn headphones_out() -> bool {
     // SAFETY: reading the current route.
     unsafe {
         let headphones = AVAudioSessionPortHeadphones.expect("Headphones");
-        session().currentRoute().outputs().iter().any(|port| port.portType().isEqualToString(headphones))
+        session().currentRoute().outputs().iter().any(|port| port.portType().to_string() == headphones.to_string())
     }
 }
 

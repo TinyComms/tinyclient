@@ -84,7 +84,7 @@ fn url_of(web: &AnyObject) -> String {
 fn network_failure(error: &NSError) -> bool {
     // SAFETY: Foundation's constant.
     let domain = unsafe { NSURLErrorDomain };
-    error.domain().isEqualToString(domain)
+    error.domain().to_string() == domain.to_string()
         && matches!(error.code(), -1001 | -1003 | -1004 | -1005 | -1006 | -1009 | -1018 | -1020 | -2000 | -1206..=-1200)
 }
 

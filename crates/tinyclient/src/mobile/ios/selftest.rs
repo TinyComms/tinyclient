@@ -10,7 +10,7 @@
 //! 5. ReplayKit's in-app screen capture for three seconds (the system asks first).
 
 use mediad::platform::{CameraRequest, EncoderConfig, Facing, FrameSink, Permission, PixelFormat, Platform, VideoFrame};
-use objc2_foundation::{NSProcessInfo, NSString};
+use objc2_foundation::NSProcessInfo;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -20,7 +20,7 @@ pub(super) fn maybe_start(platform: Arc<dyn Platform>) {
     if !cfg!(debug_assertions) {
         return;
     }
-    let asked = NSProcessInfo::processInfo().arguments().iter().any(|argument| argument.isEqualToString(&NSString::from_str("-tinySelfTest")));
+    let asked = NSProcessInfo::processInfo().arguments().iter().any(|argument| argument.to_string() == "-tinySelfTest");
     if !asked {
         return;
     }
