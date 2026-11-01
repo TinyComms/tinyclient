@@ -768,14 +768,6 @@ fn premier() -> protocol::TinyCommunity {
         ..Default::default()
     };
     protocol::TinyCommunity {
-        capabilities: Default::default(),
-        access: None,
-        me: ME.into(),
-        server: None,
-        roles: Vec::new(),
-        categories: Vec::new(),
-        bans: Vec::new(),
-        provider: String::new(),
         role: "owner".into(),
         members: vec![
             member(ME, ME_NAME, "robin@example.com", "owner", 120),
