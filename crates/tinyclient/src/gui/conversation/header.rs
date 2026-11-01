@@ -20,6 +20,16 @@ impl Shell {
         hub.avatar(&open.key.account(), file.as_ref(), cx)
     }
 
+    /// Where that picture is on disk. A Tiny member's picture, already fetched for the server
+    /// page, is used when the people hub has none. The bytes are not logged.
+    pub(in crate::gui) fn conversation_face(&self, open: &Conversation, cx: &mut Context<Self>) -> Option<std::path::PathBuf> {
+        if let Some(path) = self.conversation_picture(open, cx).and_then(|file| file.path).filter(|path| !path.is_empty()) {
+            return Some(std::path::PathBuf::from(path));
+        }
+        let id = open.peer.as_deref().filter(|id| !id.is_empty())?;
+        self.tiny_member_picture(&open.key.account(), id)
+    }
+
     /// My own picture on the account a conversation belongs to.
     pub(super) fn own_picture(&self, conversation: &Key) -> Option<MediaFile> {
         let account = conversation.account();
@@ -28,7 +38,9 @@ impl Shell {
     }
 
     /// The strip above the messages (07 §1): panel, back and forward, picture, title and the
-    /// line after it on one baseline, the call, then the pane's buttons with Details last.
+    /// line after it on one center, the call, then the pane's buttons with Details last.
+    /// The encryption chip carries an icon, so the row centers instead of sharing a text
+    /// baseline: a baseline puts that chip below the name and the presence word.
     pub(super) fn strip(&self, open: &Conversation, link: Link, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let direct = open.kind == ConversationKind::Direct;
         let teams_channel = open.key.network == protocol::Network::Teams && open.kind == ConversationKind::Channel;
@@ -42,9 +54,10 @@ impl Shell {
             ConversationKind::Channel => Avatar::channel("icons/hash.svg", 24.),
         };
         let shape = if open.kind.is_direct() { Shape::Person } else { Shape::Place };
-        let picture = picture.shape(shape).image(self.conversation_picture(open, cx).as_ref());
-        // A group has one face across the window: the same one its row and the switcher draw.
-        let face = if open.kind == ConversationKind::Group || teams_channel {
+        let picture = picture.shape(shape).image_at(self.conversation_face(open, cx));
+        // A direct conversation and a group share one face with their row: the picture, and
+        // for a person the presence dot.
+        let face = if direct || open.kind == ConversationKind::Group || teams_channel {
             self.conversation_avatar(open, 24., theme::canvas(), cx)
         } else if saved {
             Avatar::channel("icons/bookmark.svg", 24.).build()
@@ -57,7 +70,8 @@ impl Shell {
             Link::Expired => Some("Signed out by the network"),
             Link::SignedOut => Some("Signed out"),
         };
-        let subtitle = self.header_line(open);
+        let beside = self.beside(open);
+        let role = self.tiny_header_role(open);
         // The network's icon leads a title only where networks are mixed: a conversation in
         // no Space was reached from the Inbox, which lists every network together. One with a
         // Space says where it is in words.
@@ -121,6 +135,7 @@ impl Shell {
             .truncate()
             .type_title()
             .tooltip(tip(title_tip, direct.then_some("⌘.")))
+            .when_some(role.as_ref().and_then(|role| role.color), |title, color| title.text_color(gpui::rgb(color)))
             .child(open.title.clone());
         let title = if direct {
             title
@@ -132,8 +147,9 @@ impl Shell {
             title
         };
         let space = open.space.clone().map(|id| Key { id, ..open.key.clone() });
-        let line = (!subtitle.is_empty()).then(|| {
-            div()
+        let line = beside.map(|beside| match beside {
+            Beside::Person(line) => person_line(&line).into_any_element(),
+            Beside::Path(subtitle) => div()
                 .id("reveal")
                 .flex_1()
                 .min_w_0()
@@ -150,6 +166,7 @@ impl Shell {
                     None => this.go(crate::gui::sidebar::Mode::Inbox, cx),
                 }))
                 .child(subtitle)
+                .into_any_element(),
         });
         drags_window(div())
             .h(px(TOP_BAR))
@@ -170,11 +187,12 @@ impl Shell {
                     // Nothing in this row draws over the call or the buttons, however narrow.
                     .overflow_hidden()
                     .flex()
-                    .items_baseline()
+                    .items_center()
                     .gap(px(8.))
-                    .children(mixed.then(|| div().flex_none().mr(px(-2.)).child(network_icon(open.key.network, 14.))))
+                    .children(mixed.then(|| div().flex_none().self_center().mr(px(-2.)).child(network_icon(open.key.network, 14.))))
                     .child(title)
                     .children(mark(open.mark))
+                    .children(role.map(|role| role_chip(&role.name, role.color)))
                     .children(self.encryption_chip(open, cx))
                     .children(line)
                     .children(trouble.map(|words| div().flex_none().type_small().text_color(theme::text_faint()).child(words))),
@@ -192,12 +210,16 @@ impl Shell {
             return None;
         }
         let sealed = open.encryption == protocol::Encryption::EndToEnd;
-        let (icon, tone) = if sealed { ("icons/lock.svg", theme::text_soft()) } else { ("icons/triangle-alert.svg", theme::text_faint()) };
+        // Green when only the members' devices can read it. Amber when the server can.
+        // A plaintext conversation is never drawn with the lock.
+        let (icon, tone) = if sealed { ("icons/lock.svg", theme::online()) } else { ("icons/triangle-alert.svg", theme::warning()) };
         let account = open.key.account();
         Some(
             div()
                 .id("conversation-encryption")
                 .flex_none()
+                .self_center()
+                .h(px(18.))
                 .flex()
                 .items_center()
                 .gap(px(4.))
@@ -215,14 +237,53 @@ impl Shell {
 
     /// The line after the title (07 §1): beside a direct conversation the person's status or
     /// presence; elsewhere where it is (`Space › group`) and its topic.
-    fn header_line(&self, open: &Conversation) -> String {
+    fn beside(&self, open: &Conversation) -> Option<Beside> {
         if open.kind == ConversationKind::Direct {
-            if let Some(status) = self.header_status(&open.key) {
-                return status.to_string();
+            if let Some(line) = self.peer_line(&open.key) {
+                return Some(Beside::Person(line));
             }
         }
-        path_line(&open.subtitle())
+        let path = path_line(&open.subtitle());
+        (!path.is_empty()).then(|| Beside::Path(path))
     }
+}
+
+/// What follows the title. A person's presence is not a place, so it does not reveal the sidebar.
+enum Beside {
+    Person(crate::gui::people::PeerLine),
+    Path(String),
+}
+
+/// The presence word in its color, then what they say. Online is green.
+fn person_line(line: &crate::gui::people::PeerLine) -> Div {
+    let mut row = div().flex_1().min_w_0().flex().items_center().gap(px(6.)).overflow_hidden();
+    if !line.word.is_empty() {
+        row = row.child(div().flex_none().type_ui().text_color(line.tone).child(line.word));
+    }
+    if !line.extra.is_empty() {
+        if !line.word.is_empty() {
+            row = row.child(div().flex_none().type_ui().text_color(theme::text_faint()).child("·"));
+        }
+        row = row.child(div().min_w_0().truncate().type_ui().text_color(theme::text_faint()).child(line.extra.clone()));
+    }
+    row
+}
+
+/// The other person's role on this server. One chip, the most senior. No email.
+fn role_chip(name: &str, color: Option<u32>) -> Div {
+    let tone = color.map(gpui::rgb).unwrap_or(theme::text_soft());
+    div()
+        .flex_none()
+        .self_center()
+        .h(px(18.))
+        .px(px(6.))
+        .rounded(px(9.))
+        .bg(theme::hover())
+        .flex()
+        .items_center()
+        .gap(px(4.))
+        .child(div().size(px(6.)).flex_none().rounded_full().bg(tone))
+        .child(div().type_small().text_color(theme::text()).child(name.to_owned()))
 }
 
 /// One path glyph everywhere: `›`.

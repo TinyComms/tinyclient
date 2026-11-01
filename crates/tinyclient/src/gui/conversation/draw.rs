@@ -730,6 +730,15 @@ impl Pane {
         self.open.as_ref().and_then(|open| open.root.as_ref()).map(|(root, _)| root)
     }
 
+    /// A Tiny member's picture, already fetched for the server page. The path is not logged.
+    fn tiny_sender_picture(&self, user_id: &str, cx: &Context<Self>) -> Option<std::path::PathBuf> {
+        let open = self.open.as_ref()?;
+        if open.key.network != protocol::Network::Tiny || user_id.is_empty() {
+            return None;
+        }
+        self.shell.upgrade()?.read(cx).tiny_member_picture(&open.key.account(), user_id)
+    }
+
     /// My own picture on this account.
     fn own_picture(&self, cx: &mut Context<Self>) -> Option<MediaFile> {
         let key = self.key()?;
@@ -753,6 +762,14 @@ impl Pane {
         };
         // An app never reads as a person: its picture is squared.
         let shape = if sender.bot { Shape::Place } else { Shape::Person };
+        // A Tiny picture already on disk for the server page, when the message named none.
+        let landed = file.as_ref().and_then(|file| file.path.as_deref()).is_some_and(|path| !path.is_empty());
+        if !landed {
+            if let Some(path) = self.tiny_sender_picture(id, cx) {
+                let shown = plate.shape(shape).image_at(Some(path)).build();
+                return div().pt(px(2.)).flex_none().when(message.deleted, |avatar| avatar.opacity(0.4)).child(shown);
+            }
+        }
         let face = self.face(plate.shape(shape), file.as_ref(), size, shape, window, cx);
         div().pt(px(2.)).flex_none().when(message.deleted, |avatar| avatar.opacity(0.4)).child(face)
     }

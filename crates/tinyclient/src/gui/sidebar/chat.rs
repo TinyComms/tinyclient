@@ -173,8 +173,7 @@ impl Shell {
     /// The picture of a conversation: a person round with their presence, a group as two of its
     /// people, a channel as its Space's icon, a Telegram place as a rounded square.
     pub(in crate::gui) fn conversation_avatar(&self, c: &Conversation, size: f32, surface: Rgba, cx: &mut Context<Self>) -> Div {
-        let hub = self.people_state.hub();
-        let picture = hub.avatar(&c.key.account(), c.avatar.as_ref(), cx).and_then(|file| file.path).map(std::path::PathBuf::from);
+        let picture = self.conversation_face(c, cx);
         match c.special {
             // My own notes: Telegram's Saved Messages is its bookmark; Teams' Notes and Slack's
             // DM to myself are my picture, the bookmark until it lands.
