@@ -378,6 +378,8 @@ fn after(tick_at: Instant, now: Instant) -> Instant {
 /// Voice frames held at most while the encryption is busy, each way: half a second of one
 /// voice. Past it the oldest is dropped, as a frame with no keys is.
 const HELD: usize = 25;
+/// The same half second of a full room's voices, on their way in.
+const HELD_IN: usize = HELD * 12;
 
 /// A frame of ours waiting its turn at the encryption.
 struct Unsealed {
@@ -589,7 +591,7 @@ impl Call {
                 }
             },
             Event::MediaData(data) => {
-                if self.unopened.len() >= HELD {
+                if self.unopened.len() >= HELD_IN {
                     self.unopened.pop_front();
                 }
                 self.unopened.push_back(data);

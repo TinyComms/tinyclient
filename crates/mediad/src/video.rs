@@ -1075,13 +1075,10 @@ mod tests {
         capture.gate(Track::Share).force();
         capture.source.skip_next = true;
         capture.round(&wants, start, 15.);
-        assert_eq!(capture.source.share[0].key, true);
+        assert!(capture.source.share[0].key);
         assert_eq!(words.try_iter().count(), 0, "a skipped frame sends nothing");
         capture.round(&wants, start, 15.);
-        assert_eq!(
-            capture.source.share[1].key, true,
-            "the keyframe that was skipped comes on the next frame"
-        );
+        assert!(capture.source.share[1].key, "the keyframe that was skipped comes on the next frame");
         assert_eq!(words.try_iter().count(), 1);
 
         // The call is to be end to end and has no keys: held back, and owed.
@@ -1248,6 +1245,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::type_complexity)]
     fn decode(
         glass: Glass,
     ) -> (
