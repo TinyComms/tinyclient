@@ -1185,7 +1185,7 @@ dependencies = [
 
 [[package]]
 name = "chatd"
-version = "0.2.39"
+version = "0.2.40"
 dependencies = [
  "aes 0.8.4",
  "aes-gcm",
@@ -2422,7 +2422,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "e2ee"
-version = "0.2.39"
+version = "0.2.40"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",
@@ -5355,7 +5355,7 @@ dependencies = [
 
 [[package]]
 name = "login"
-version = "0.2.39"
+version = "0.2.40"
 dependencies = [
  "block2 0.6.2",
  "embed-resource",
@@ -5527,7 +5527,7 @@ checksum = "7ebb8d8732c6a6df3d8f032a82911cfc747e00efb95cc46e8d0acd5b5b88570c"
 
 [[package]]
 name = "mediad"
-version = "0.2.39"
+version = "0.2.40"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",
@@ -5892,7 +5892,7 @@ checksum = "0676bb32a98c1a483ce53e500a81ad9c3d5b3f7c920c28c24e9cb0980d0b5bc8"
 
 [[package]]
 name = "notifier"
-version = "0.2.39"
+version = "0.2.40"
 dependencies = [
  "block2 0.6.2",
  "objc2 0.6.5",
@@ -7629,7 +7629,7 @@ dependencies = [
 
 [[package]]
 name = "protocol"
-version = "0.2.39"
+version = "0.2.40"
 dependencies = [
  "getrandom 0.3.4",
  "interprocess",
@@ -9913,7 +9913,7 @@ dependencies = [
 
 [[package]]
 name = "tinyclient"
-version = "0.2.39"
+version = "0.2.40"
 dependencies = [
  "embed-resource",
  "futures-channel",
