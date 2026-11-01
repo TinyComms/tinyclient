@@ -16,6 +16,7 @@ use protocol::TinyServerInfo;
 
 /// One line of a card: what is kept, then what that means.
 fn line(heading: &str, value: Option<String>, words: impl Into<SharedString>, last: bool) -> Div {
+    let words: SharedString = words.into();
     div()
         .px(px(14.))
         .py(px(12.))
@@ -25,8 +26,9 @@ fn line(heading: &str, value: Option<String>, words: impl Into<SharedString>, la
         .when(!last, |row| row.border_b_1().border_color(theme::hairline()))
         .child(div().type_micro().text_color(theme::text_faint()).child(heading.to_uppercase()))
         .children(value.map(|value| div().type_ui().font_weight(theme::MEDIUM).text_color(theme::text()).child(value)))
-        .child(div().whitespace_normal().type_small().text_color(theme::text_soft()).child(words.into()))
+        .when(!words.is_empty(), |row| row.child(div().whitespace_normal().type_small().text_color(theme::text_soft()).child(words.clone())))
 }
+
 
 /// What a member who is not an owner reads: the three values, in fixed words, and whether the
 /// owner has chosen them yet.
@@ -92,10 +94,15 @@ pub(in crate::gui::tiny) fn privacy(shell: &Shell, facts: &Facts, window: &mut W
     let mut now = card();
     let kept = tiny_setup::right_now(setup);
     let count = kept.len();
-    for (ix, (heading, option, effect)) in kept.into_iter().enumerate() {
-        now = now.child(line(&heading, Some(option), effect, ix + 1 == count));
+    for (ix, (heading, option, _effect)) in kept.into_iter().enumerate() {
+        now = now.child(line(&heading, Some(option), "", ix + 1 == count));
     }
     page = page.child(section("Right now").child(now));
-    page = page.child(shell.tiny_setup_form("tiny-privacy", "Change it", setup, cx));
+    // What is chosen is short to read; the form opens when the owner wants to change it.
+    page = if state.changing || setup.needed {
+        page.child(shell.tiny_setup_form("tiny-privacy", "Change it", setup, cx))
+    } else {
+        page.child(div().flex().child(button("tiny-privacy-change", ButtonKind::Secondary, "Change").on_click(cx.listener(|this, _, _, cx| this.tiny_privacy_change(cx)))))
+    };
     page.into_any_element()
 }

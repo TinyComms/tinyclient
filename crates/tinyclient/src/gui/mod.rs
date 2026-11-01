@@ -222,7 +222,7 @@ fn shell_bindings() -> Vec<KeyBinding> {
 /// `out-1.png` …, to see moving pictures move). On a Tiny server (`--mode tiny`): `--tiny-room
 /// N` (the Nth channel), `--tiny-menu header|channel|person:N` (N: the Nth seat, `:sub` adds its
 /// Move submenu), `--tiny-modal invite|code|kick|ban|profile`, `--tiny-settings`, `--tiny-card N`
-/// (the Nth member's hover card), `--tiny-setup first|custom|refused|privacy|member` (first-run
+/// (the Nth member's hover card), `--tiny-setup first|custom|refused|nopasskeys|privacy|change|member` (first-run
 /// setup, or Server Settings › Privacy, over a made-up outline).
 #[cfg(feature = "gui-shot")]
 mod shot {

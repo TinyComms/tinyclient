@@ -34,6 +34,8 @@ pub(super) struct State {
     put_off: bool,
     /// The choices are open under the presets.
     customizing: bool,
+    /// The Privacy page shows the form, not only what is chosen.
+    pub(super) changing: bool,
     /// An answer is with the server.
     pub(super) sending: bool,
     send_epoch: u64,
@@ -243,6 +245,12 @@ impl Shell {
         cx.notify();
     }
 
+    /// "Change" on the Privacy page.
+    pub(super) fn tiny_privacy_change(&mut self, cx: &mut Context<Self>) {
+        self.tiny_state.setup.changing = true;
+        cx.notify();
+    }
+
     fn tiny_setup_toggle_customize(&mut self, cx: &mut Context<Self>) {
         let state = &mut self.tiny_state.setup;
         state.customizing = !state.customizing;
@@ -300,6 +308,7 @@ impl Shell {
                 let state = &mut self.tiny_state.setup;
                 state.prompt = false;
                 state.put_off = false;
+                state.changing = false;
                 state.reset_form();
                 self.toast(Some(("icons/check.svg", theme::text_soft())), tiny_setup::applied_words(&applied), cx);
                 self.tiny_settings_saved(cx);
@@ -418,7 +427,11 @@ impl Shell {
         for (ix, preset) in setup.presets.iter().enumerate() {
             let on = form.preset.as_deref() == Some(preset.id.as_str());
             let preset_id = preset.id.clone();
-            let mut words = div().flex_1().min_w_0().flex().flex_col().gap(px(3.)).child(title(preset.title.clone())).child(about(preset.summary.clone()));
+            let mut words = div().flex_1().min_w_0().flex().flex_col().gap(px(3.)).child(title(preset.title.clone()));
+            // What a preset means is said once it is picked, so the choice stays short to read.
+            if on || !preset.available {
+                words = words.child(about(preset.summary.clone()));
+            }
             if !preset.available && !preset.unavailable.is_empty() {
                 words = words.child(div().whitespace_normal().type_small().text_color(theme::warning()).child(preset.unavailable.clone()));
             }
@@ -447,7 +460,10 @@ impl Shell {
                     let on = form.is_picked(&choice.id, &option.id);
                     let blocked = tiny_setup::blocked(setup, &option.needs);
                     let (choice_id, option_id) = (choice.id.clone(), option.id.clone());
-                    let mut words = div().flex_1().min_w_0().flex().flex_col().gap(px(3.)).child(title(option.title.clone())).child(about(option.effect.clone()));
+                    let mut words = div().flex_1().min_w_0().flex().flex_col().gap(px(3.)).child(title(option.title.clone()));
+                    if on {
+                        words = words.child(about(option.effect.clone()));
+                    }
                     if let Some(why) = blocked {
                         words = words.child(div().whitespace_normal().type_small().text_color(theme::warning()).child(why));
                     } else if on && tiny_setup::hint(setup, &option.needs) == Some(Hint::AddPasskey) {
@@ -469,8 +485,9 @@ impl Shell {
             body = body.child(choices);
         }
 
-        // What always holds.
-        if !setup.always.is_empty() {
+        // What always holds, what a choice would touch and the switch for erasing the addresses on
+        // file: with the choices, so the first screen stays two cards.
+        if customizing && !setup.always.is_empty() {
             let mut always = div().w_full().flex().flex_col().gap(px(8.));
             for line in &setup.always {
                 always = always.child(aside("icons/info.svg", theme::text_faint(), line.clone()));
@@ -481,7 +498,7 @@ impl Shell {
         // What a choice would touch, before the owner commits, and the one thing it can erase.
         let counts = tiny_setup::counts_words(setup);
         let erasable = setup.counts.emails_stored > 0;
-        if !counts.is_empty() || erasable {
+        if customizing && (!counts.is_empty() || erasable) {
             let mut touch = section("What this touches").gap(px(8.));
             for line in counts {
                 touch = touch.child(div().whitespace_normal().type_ui().text_color(theme::text()).child(line));
@@ -564,9 +581,7 @@ impl Shell {
             .flex_col()
             .gap(px(6.))
             .child(div().type_headline().text_color(theme::text()).child(format!("Set up {}", page.name)))
-            .child(about(
-                "Before you invite anyone, choose what this server keeps about its members. You can change it later in Server Settings › Privacy. Nothing is applied until you say so.",
-            ));
+            .child(about("Choose what this server keeps about its members. You can change it later in Server Settings › Privacy."));
         let apply_label: SharedString = match form.preset.as_deref().and_then(|id| setup.presets.iter().find(|preset| preset.id == id)) {
             Some(preset) if !state.customizing => format!("Use {}", preset.title).into(),
             _ => "Apply".into(),
@@ -601,7 +616,7 @@ impl Shell {
                     .items_center()
                     .gap(px(8.))
                     .child(button("tiny-setup-later", ButtonKind::Ghost, "Later").on_click(cx.listener(|this, _, _, cx| this.tiny_setup_later(cx))))
-                    .child(div().flex_1().whitespace_normal().type_small().text_color(theme::text_faint()).child("Keeping what you have changes nothing."))
+                    .child(div().flex_1())
                     .child(keep)
                     .child(apply),
             );
@@ -662,13 +677,13 @@ const SHOT_OUTLINE: &str = r#"{
 
 #[cfg(feature = "gui-shot")]
 impl Shell {
-    /// `--tiny-setup first|custom|refused|privacy|member`: the first-run screen (`custom` with
+    /// `--tiny-setup first|custom|refused|nopasskeys|privacy|change|member`: the first-run screen (`custom` with
     /// Privacy picked and the choices open, `refused` after a refusal), Server Settings › Privacy
     /// as an owner reads it, or as a member does, over a made-up outline. Nothing is asked of a
     /// server.
     pub(super) fn tiny_shot_setup(&mut self, how: &str, window: &mut gpui::Window, cx: &mut Context<Self>) {
         let owner = how != "member";
-        let first = matches!(how, "first" | "custom" | "refused");
+        let first = matches!(how, "first" | "custom" | "refused" | "nopasskeys");
         let Some(community) = self.tiny_state.community.as_mut() else {
             return;
         };
@@ -684,8 +699,22 @@ impl Shell {
         }
         let mut setup: TinySetup = serde_json::from_str(SHOT_OUTLINE).expect("the outline reads");
         setup.needed = first;
+        if how == "nopasskeys" {
+            // A server started without passkey sign-in: Privacy cannot be chosen as it stands.
+            setup.deployment.passkeys = false;
+            setup.counts.members_without_passkey = 0;
+            if let Some(preset) = setup.presets.iter_mut().find(|preset| preset.id == "privacy") {
+                preset.available = false;
+                preset.unavailable = "This server was started without passkey sign-in. Choose Privacy with \"How members sign in\" left as it is to take the rest.".into();
+            }
+            if let Some(choice) = setup.choices.iter_mut().find(|choice| choice.id == "sign_in_methods") {
+                choice.relevant = false;
+            }
+        }
         let state = &mut self.tiny_state.setup;
         state.form = Form::starting(&setup);
+        state.customizing = how == "nopasskeys";
+        state.changing = how == "change";
         if matches!(how, "custom" | "refused") {
             state.form.pick_preset(&setup, "privacy");
             state.customizing = how == "custom";
