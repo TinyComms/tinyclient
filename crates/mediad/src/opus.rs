@@ -15,8 +15,8 @@ use unsafe_libopus::{
 pub const MAX_FRAME: usize = FRAME * 6;
 /// Discord's ceiling for voice outside boosted servers.
 const BITRATE: i32 = 64_000;
-/// What a Tiny server's SFU expects of each speaker (tinyserver's `docs/calls.md`), and forwards
-/// up to twice of.
+/// Where a Tiny call starts, until the room says its own rate (`Bitrate`, up to 128 kb/s), which
+/// is the one that counts from then on.
 const VOICE_BITRATE: i32 = 32_000;
 /// The loss the encoder plans its in-band FEC for until the far end says what it sees, and the
 /// least it ever plans for: enough that every speech packet carries a copy of the one before.
@@ -102,9 +102,10 @@ impl Encoder {
         Encoder::made(CHANNELS, OPUS_APPLICATION_AUDIO, bitrate, false)
     }
 
-    /// Mono speech at 32 kbit/s, with in-band FEC, for a Tiny server call. No DTX: the speech
-    /// gate already sends nothing in silence, and DTX's skipped frames inside a talk spurt (the
-    /// pauses between words) reach the far end as losses it has to make up.
+    /// Mono speech with in-band FEC, for a Tiny server call, at [`VOICE_BITRATE`] until the room's
+    /// rate arrives. No DTX: the speech gate already sends nothing in silence, and DTX's skipped
+    /// frames inside a talk spurt (the pauses between words) reach the far end as losses it has
+    /// to make up.
     pub fn voice() -> Option<Encoder> {
         Encoder::made(1, OPUS_APPLICATION_VOIP, VOICE_BITRATE, false)
     }
