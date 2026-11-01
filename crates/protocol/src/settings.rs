@@ -51,10 +51,12 @@ pub const SYSTEM_DEFAULT: &str = "@system";
 pub const JOIN_MUTED: &str = "join_muted";
 /// V19: "You're muted" shows when the microphone hears speech while I am muted in a call.
 pub const MUTED_TALK: &str = "muted_talk";
-/// Only join Tiny calls that are end-to-end encrypted. On: a call whose server turns encryption off
-/// stops sending and playing (mediad `Blocked`), and a server that cannot encrypt is not joined.
-/// Off by default on purpose: an older server or an older app in the room cannot do it, and
-/// turning it on by default would stop those calls working. See `SECURITY.md`.
+/// Only join Tiny calls that are end-to-end encrypted. A call whose server turns encryption off
+/// always stops sending and playing (mediad `Blocked`); off, the person may choose to carry on
+/// unencrypted, on, they may not, and a server that cannot encrypt is not joined. Off by default:
+/// an older server or an older app in the room cannot do it. An Incognito host
+/// ([`crate::incognito_host`]) or an `e2ee_required` room acts as on whatever this says. See
+/// `SECURITY.md`.
 pub const REQUIRE_CALL_E2EE: &str = "require_call_e2ee";
 /// V5. Everyone's voice, 0 to 100.
 pub const VOICE_VOLUME: &str = "voice_volume";

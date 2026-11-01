@@ -216,7 +216,7 @@ impl SettingsWindow {
                 );
                 groups.push(
                     self.group(&["PE"], Some("Calls"), window, cx).child(caption(
-                        "A call whose encryption is turned off then stops sending and playing, instead of carrying on. A Tiny server that cannot encrypt calls is not joined. Takes effect the next time you join. Off by default, so servers and apps that cannot do it still work.",
+                        "When a server turns a call's encryption off, the call stops until you choose to carry on unencrypted. With this on you can't: you leave instead, and a Tiny server that cannot encrypt calls is not joined. Always the case on Incognito servers and in rooms that require it. Takes effect the next time you join.",
                     )),
                 );
                 groups
