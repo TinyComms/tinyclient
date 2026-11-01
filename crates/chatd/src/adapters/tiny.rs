@@ -31,7 +31,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
-use ureq::tls::{TlsConfig, TlsProvider};
 
 /// How long one request may take. A redirect is not followed, so this is one host.
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -217,11 +216,7 @@ fn saved_for(session: &str, user_id: &str) -> Result<Saved, String> {
 
 fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
-        .tls_config(
-            TlsConfig::builder()
-                .provider(TlsProvider::NativeTls)
-                .build(),
-        )
+        .tls_config(crate::tls::config())
         .timeout_global(Some(TIMEOUT))
         .http_status_as_error(false)
         .max_redirects(0)

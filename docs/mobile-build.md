@@ -157,17 +157,12 @@ Run on this Windows machine, Rust stable 1.99.1:
 | `build-android.ps1`, `seed-demo.ps1` | PowerShell parser: clean |
 | `build-android.sh`, `build-ios.sh` | `bash -n`: clean |
 
-The Android cross-check stops at **`openssl-sys 0.9.117`**:
-
-```
-error: failed to run custom build command for `openssl-sys v0.9.117`
-Could not find openssl via pkg-config
-```
-
-The chain is `openssl-sys ← native-tls ← ureq ← tinyclient` (the Wikipedia cards in
-`gui/conversation/wiki.rs`). This is the single largest porting cost named in
-`research_notes/mobile/core-portability-audit.md`: on Android `native-tls` means OpenSSL, not the
-platform store. The fix is rustls + `rustls-platform-verifier`, not a build flag.
+TLS on Android is rustls. `native-tls` on Android means OpenSSL, which is not cross-built here, so
+the Android build uses rustls wherever the desktop uses the system TLS: `chatd` (`Cargo.toml`
+target tables, `src/tls.rs`), and tinyclient's Wikipedia client (`ureq` under
+`cfg(target_os = "android")`, `gui/conversation/wiki.rs`). `cargo ndk -t arm64-v8a check -p chatd
+--no-default-features` passes with this. Before this change the Android check stopped at
+`openssl-sys 0.9.117` through `native-tls ← ureq ← tinyclient`.
 
 Behind that, from reading the pin (`Cargo.toml`: Zed `cb13b37`): `gpui_platform` has arms for
 macOS, Windows, Linux/FreeBSD and wasm only, and the pin has no `gpui_ios`/`gpui_android` crate.
@@ -233,10 +228,14 @@ this needs a 16 KB emulator image or device.
    `ios_main`/`android_main` are seams that call `gui::run()`, which calls
    `gpui_platform::application()`. `gpui_ce_mobile` 0.3.0 (gpui-ce) is an Android backend that is
    not adopted yet, and its Java classes must come with it (see "Feature gating" above).
-   Phones run with no chatd (`gui::mobile_core_available()` is false there) and open links and
-   files through GPUI (`gui::links_through_gpui()`); the in-process core replaces the first.
-2. **OpenSSL on Android**, above. Needs rustls before `mobile` can compile past the `gui`
-   feature's `ureq` dependency.
+   Phones open links and files through GPUI (`gui::links_through_gpui()`). chatd runs in the
+   app on phones (`chatd::start_in_process`, `tinyclient::inprocess`): the `mobile` build
+   registers it with `protocol::launch::register_in_process`, so the shell's start path runs
+   the core on a thread instead of looking for a binary. Without `mobile`, phones run with no
+   chatd (`gui::mobile_core_available()` is false there).
+2. **Android sign-ins** are a file in the app's data directory (`chatd::session::app_file`,
+   mode 0600, values base64-encoded, not encrypted), not a keystore. Private to the app's
+   sandbox. Not run on a device.
 3. **No NDK/SDK/adb here**, so Android stops at the compiler and nothing is packaged.
 4. **No Mac here**, so iOS is unbuilt and the Swift code is review-only. The first thing a Mac
    or CI run will hit is `gpui_platform` on Android and the same on iOS, before Xcode sees the

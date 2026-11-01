@@ -308,10 +308,8 @@ impl Wire {
         let config = WebSocketConfig::default().max_frame_size(Some(64 << 20)).max_message_size(Some(128 << 20));
         let (socket, _) =
             tungstenite::client::connect_with_config(request, Some(config), 3).map_err(io::Error::other)?;
-        let tcp = match socket.get_ref() {
-            MaybeTlsStream::NativeTls(tls) => tls.get_ref(),
-            MaybeTlsStream::Plain(tcp) => tcp,
-            _ => return Err(io::Error::other("unexpected stream")),
+        let Some(tcp) = crate::tls::tcp(socket.get_ref()) else {
+            return Err(io::Error::other("unexpected stream"));
         };
         tcp.set_nonblocking(true)?;
         let poll = Pollable::from_tcp(tcp);

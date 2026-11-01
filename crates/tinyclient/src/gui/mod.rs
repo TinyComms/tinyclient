@@ -639,10 +639,11 @@ fn window_bounds(saved: Option<(f32, f32, f32, f32)>, cx: &App) -> Bounds<gpui::
 }
 
 /// Whether chatd can run beside the window. True on desktop, where the shell starts and asks
-/// it. False on phones: there is no separate chatd there yet, so the shell runs with no service,
-/// which reads as zero signed-in accounts (`app::watch`). Replace with the in-process core.
+/// it. On phones it is true only in the `mobile` build, which runs the core in the app
+/// (`lib.rs`, `inprocess`). Without it the shell runs with no service, which reads as zero
+/// signed-in accounts (`app::watch`).
 pub(crate) fn mobile_core_available() -> bool {
-    !cfg!(any(target_os = "android", target_os = "ios"))
+    !cfg!(any(target_os = "android", target_os = "ios")) || cfg!(feature = "mobile")
 }
 
 /// Whether links and files open through GPUI (`cx.open_url`) rather than a desktop helper such

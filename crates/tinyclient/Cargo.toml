@@ -54,11 +54,14 @@ gui-shot = ["gui", "gpui/test-support", "gpui_platform/test-support"]
 # pulls GPUI's test support, which has no meaning on a phone (device shots come from adb/simctl).
 # Desktop-only modules inside `gui/` (window chrome, menubar, settings window, self-update) still
 # compile on mobile for now; see docs/mobile-build.md, "Feature gating".
-mobile = ["gui", "dep:android-activity"]
+mobile = ["gui", "dep:android-activity", "dep:chatd"]
 
 [target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
 # Avoid an OpenSSL cross-build on Android; rustls validates against bundled WebPKI roots.
 ureq = { version = "3", default-features = false, features = ["rustls"], optional = true }
+# The core, run inside the app on phones (`src/lib.rs`, `inprocess`). Default features are off:
+# the phone build does not link libsignal.
+chatd = { path = "../chatd", optional = true, default-features = false }
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 # Keep the desktop's existing native TLS provider and behavior.

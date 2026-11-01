@@ -6,6 +6,10 @@
 use keyring::Entry;
 use protocol::Network;
 
+/// Android has no keyring here: sign-ins go to a file in the app's private directory.
+#[cfg(target_os = "android")]
+pub mod app_file;
+
 const SERVICE: &str = "tinyclient";
 // Some providers wait for GPG inside GetSecret, outside the Secret Service prompt
 // protocol. The backend's two-second method timeout must not end the whole read.
@@ -109,11 +113,16 @@ pub const STORE_REFUSED: &str = if cfg!(target_os = "macos") {
 /// Whether sign-ins are kept until deleted: the macOS keychain, the Windows credential store,
 /// the Secret Service on Linux. Asked once.
 pub fn persistent() -> bool {
+    #[cfg(not(target_os = "android"))]
     use keyring::credential::CredentialPersistence;
     static PERSISTENT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *PERSISTENT.get_or_init(|| {
-        let persistence = keyring::default::default_credential_builder().persistence();
-        let kept = matches!(persistence, CredentialPersistence::UntilDelete);
+        // Android's store is installed by the mobile entry; the platform default there is the
+        // in-memory mock, which would refuse every sign-in.
+        #[cfg(target_os = "android")]
+        let kept = app_file::installed();
+        #[cfg(not(target_os = "android"))]
+        let kept = matches!(keyring::default::default_credential_builder().persistence(), CredentialPersistence::UntilDelete);
         if !kept {
             eprintln!("chatd: the keyring does not keep sign-ins past a restart; refusing to read or save any");
         }

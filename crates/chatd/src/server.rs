@@ -104,6 +104,8 @@ pub struct Chat {
     searches: Arc<Searches>,
     /// Itself, for the work a request starts that outlives the request (`ReadSessions`).
     this: OnceLock<Weak<Chat>>,
+    /// Running inside an app (`start_in_process`): a `Shutdown` must not end the process.
+    in_process: bool,
 }
 
 /// A refusal on its way out of a helper. Boxed, because a `Response` is large.
@@ -155,6 +157,15 @@ impl Chat {
     /// Everything but the sessions: those are read by [`serve`] once the socket answers
     /// (`read_sessions`), because a keychain read can wait on the user for as long as they like.
     pub fn new(store: Store) -> Chat {
+        Chat::build(store, false)
+    }
+
+    /// The same core for a process that is an app (phones): see `shutdown`.
+    pub fn in_process(store: Store) -> Chat {
+        Chat::build(store, true)
+    }
+
+    fn build(store: Store, in_process: bool) -> Chat {
         let hub = Arc::new(Hub::new(store));
         let chat = Chat {
             blobs: Blobs::new(hub.clone(), support_dir().join("media")),
@@ -162,6 +173,7 @@ impl Chat {
             adapters: Arc::default(),
             searches: Arc::default(),
             this: OnceLock::new(),
+            in_process,
         };
         // A call that fails here (mediad died, a deadline passed) is still up on the network
         // until the adapter leaves: the other side would go on ringing, the channel go on
@@ -367,6 +379,11 @@ impl Chat {
     /// chatd stops: the call is left on the network first, and the answer goes out before the
     /// process does.
     fn shutdown(&self) -> Response {
+        // Inside an app the core is the app's: exiting would close the window too. Refused, not
+        // answered Ok, so no caller reads a stop that did not happen.
+        if self.in_process {
+            return error(ErrorCode::Unsupported, "chatd runs inside the app and stops when the app does");
+        }
         if let Some(conversation) = self.hub.calls.end(&self.hub) {
             self.command(&conversation.account(), Command::CallLeave(conversation.id));
         }
