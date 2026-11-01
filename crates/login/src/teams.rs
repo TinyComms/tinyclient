@@ -20,7 +20,7 @@
 //! The session printed: `{"client_id", "oid", "name", "upn", "tenants": [{"id", "name",
 //! "refresh_token"}]}`, the user's own tenant first.
 //!
-//! Ends the process itself when Microsoft refuses: 4 when the organization does not allow
+//! A refusal from Microsoft ends the sign-in (`Flow`; the helper exits with it): 4 when the organization does not allow
 //! this app (the reason on stderr), 6 when the sign-in was refused for another reason.
 //! CONTRACT: 6 is new, like Slack's 5; chatd answers "The sign-in window stopped before it
 //! finished." for it. And `blocked` in `main.rs` knows only the 53000 codes, so for the
@@ -28,7 +28,7 @@
 //! page showed the refusal, instead of staying until the user closes it.
 
 use super::Site;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Teams' own desktop client, the registration third-party clients sign in as.
@@ -45,51 +45,114 @@ const REFUSED: i32 = 6;
 /// How long Microsoft's page stays up once it has shown a refusal `main.rs` does not know.
 const READ_IT: Duration = Duration::from_secs(20);
 
-/// What one run of the helper made up for its one authorize request.
-struct Flow {
+/// The secrets one sign-in made up for its one authorize request, and what it has seen.
+pub struct Flow {
     verifier: String,
     state: String,
+    /// When Microsoft's own page first showed a refusal `blocked` does not know.
+    shown: Mutex<Option<Instant>>,
 }
 
-static FLOW: OnceLock<Flow> = OnceLock::new();
+/// How a Teams sign-in ended, when it has: the session, or the helper's exit code for why not.
+pub type Ending = Result<serde_json::Value, i32>;
 
 /// The page's address and the start of its text, once Microsoft has redirected to the client's
 /// own address or shown an error with its code; otherwise null.
-const PROBE: &str = "(()=>{try{const u=location.href;\
+pub const PROBE: &str = "(()=>{try{const u=location.href;\
     const t=document.body?document.body.innerText.slice(0,4000):'';\
     if(u.startsWith('https://login.microsoftonline.com/common/oauth2/nativeclient')||t.includes('AADSTS'))\
     return JSON.stringify({url:u,text:t});return null}catch(e){return null}})()";
 
-/// Microsoft OAuth redirect observed from navigation as well as from the page probe.
-pub(super) fn navigated(url: &str) {
-    let Some(flow) = FLOW.get() else {
-        return;
-    };
-    match landed(url, &flow.state) {
-        Some(Landed::Code(code)) => {
-            let probed = signed_in(&code, &flow.verifier);
-            super::finish(super::session(probed, None, &super::user_agent()));
+pub const TITLE: &str = "Sign in to Teams";
+
+impl Flow {
+    /// A fresh verifier and state. `Err` with the exit code when the system has no randomness.
+    pub fn new() -> Result<Flow, i32> {
+        let made = random(48).and_then(|verifier| Ok((verifier, random(16)?)));
+        match made {
+            Ok((verifier, state)) => Ok(Flow { verifier, state, shown: Mutex::new(None) }),
+            Err(err) => {
+                tracing::warn!("tinyclient-login: no randomness to sign in with: {err}");
+                Err(super::LOAD_FAILED)
+            }
         }
-        Some(Landed::Refused { error, description }) => refuse(&error, &description),
-        None => {}
+    }
+
+    /// Microsoft's authorize page for this sign-in.
+    pub fn start(&self) -> String {
+        authorize_url(&challenge(&self.verifier), &self.state)
+    }
+
+    /// True for a navigation to the redirect, which the page cannot show and need not load.
+    pub fn is_redirect(url: &str) -> bool {
+        url.starts_with(REDIRECT)
+    }
+
+    /// A navigation the page made. `Some` once it is Microsoft's redirect for this sign-in: the
+    /// code redeemed for the session (blocking, over the network), or why not.
+    pub fn navigated(&self, url: &str) -> Option<Ending> {
+        match landed(url, &self.state)? {
+            Landed::Code(code) => Some(signed_in(&code, &self.verifier)),
+            Landed::Refused { error, description } => Some(Err(refusal(&error, &description))),
+        }
+    }
+
+    /// What `PROBE` read: Microsoft's redirect, or a page of its own that shows an error.
+    pub fn read(&self, found: &str) -> Option<Ending> {
+        let page: serde_json::Value = serde_json::from_str(found).ok()?;
+        let (url, text) = (page["url"].as_str().unwrap_or(""), page["text"].as_str().unwrap_or(""));
+        if let Some(ending) = self.navigated(url) {
+            return Some(ending);
+        }
+        // A refusal shown on Microsoft's own page. The ones `blocked` knows keep the window open
+        // until the user closes it; the rest are given time to be read.
+        let code = aadsts(text).filter(|code| organization(code) && !super::blocked(url, text))?;
+        let mut shown = self.shown.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let since = shown.get_or_insert_with(|| {
+            tracing::warn!("tinyclient-login: the organization does not allow this sign-in ({code})");
+            Instant::now()
+        });
+        (since.elapsed() >= READ_IT).then_some(Err(super::BLOCKED))
     }
 }
 
-pub(super) fn site() -> Site {
-    let flow = FLOW.get_or_init(|| Flow {
-        verifier: random(48),
-        state: random(16),
-    });
-    let start = authorize_url(&challenge(&flow.verifier), &flow.state);
+// The helper binary's one sign-in, which ends the process when it ends.
+
+static FLOW: OnceLock<Flow> = OnceLock::new();
+
+fn end(ending: Ending) -> ! {
+    match ending {
+        Ok(probed) => super::finish(super::session(probed, None, &super::user_agent())),
+        Err(code) => std::process::exit(code),
+    }
+}
+
+/// Microsoft OAuth redirect observed from navigation as well as from the page probe. For the
+/// helper binary: ends the process once the sign-in has ended.
+pub fn navigated(url: &str) {
+    if let Some(ending) = FLOW.get().and_then(|flow| flow.navigated(url)) {
+        end(ending);
+    }
+}
+
+/// The helper binary's Teams site. Ends the process if no sign-in can be made.
+pub fn site() -> Site {
+    let flow = FLOW.get_or_init(|| Flow::new().unwrap_or_else(|code| std::process::exit(code)));
     Site {
-        title: "Sign in to Teams",
+        title: TITLE,
         // One per run of the helper, which is one sign-in.
-        start: Box::leak(start.into_boxed_str()),
+        start: Box::leak(flow.start().into_boxed_str()),
         probe: PROBE,
         read,
         cookie: None,
         detour: None,
     }
+}
+
+/// `Site::read` for the helper binary.
+fn read(found: &str) -> Option<serde_json::Value> {
+    let ending = FLOW.get()?.read(found)?;
+    end(ending)
 }
 
 // Small things the standard library does not have.
@@ -147,14 +210,10 @@ fn sha256(data: &[u8]) -> [u8; 32] {
 }
 
 /// `bytes` bytes nobody can guess, in the URL alphabet. There is no sign-in without them.
-fn random(bytes: usize) -> String {
+fn random(bytes: usize) -> Result<String, String> {
     let mut buffer = vec![0u8; bytes];
-    let read = random_bytes(&mut buffer);
-    if let Err(err) = read {
-        tracing::warn!("tinyclient-login: no randomness to sign in with: {err}");
-        std::process::exit(super::LOAD_FAILED);
-    }
-    encode(&buffer)
+    random_bytes(&mut buffer)?;
+    Ok(encode(&buffer))
 }
 
 fn random_bytes(buffer: &mut [u8]) -> Result<(), String> {
@@ -275,45 +334,21 @@ fn provider_failure(code: &str) -> String {
     format!("{class} {code}")
 }
 
-fn refuse(error: &str, description: &str) -> ! {
+/// The exit code for a refusal from Microsoft, logged with its class and code.
+fn refusal(error: &str, description: &str) -> i32 {
     let code = aadsts(description).unwrap_or(error);
     let recorded = provider_failure(code);
     let class = recorded.split(' ').next().unwrap_or("provider");
     if organization(code) {
         tracing::warn!(network = "teams", class, reason = code, "login failed");
-        std::process::exit(super::BLOCKED);
+        return super::BLOCKED;
     }
     // Declining the page's own prompt is closing the window by another button.
     if error == "access_denied" && aadsts(description).is_none() {
-        std::process::exit(super::CLOSED);
+        return super::CLOSED;
     }
     tracing::warn!(network = "teams", class, reason = code, "login failed");
-    std::process::exit(REFUSED);
-}
-
-/// What the probe read: Microsoft's redirect, or a page of its own that shows an error.
-fn read(found: &str) -> Option<serde_json::Value> {
-    let page: serde_json::Value = serde_json::from_str(found).ok()?;
-    let (url, text) = (page["url"].as_str().unwrap_or(""), page["text"].as_str().unwrap_or(""));
-    let flow = FLOW.get()?;
-    match landed(url, &flow.state) {
-        Some(Landed::Code(code)) => Some(signed_in(&code, &flow.verifier)),
-        Some(Landed::Refused { error, description }) => refuse(&error, &description),
-        None => {
-            // A refusal shown on Microsoft's own page. The ones `main.rs` knows keep the window
-            // open until the user closes it; the rest are given time to be read.
-            static SHOWN: OnceLock<Instant> = OnceLock::new();
-            let code = aadsts(text).filter(|code| organization(code) && !super::blocked(url, text))?;
-            let since = SHOWN.get_or_init(|| {
-                tracing::warn!("tinyclient-login: the organization does not allow this sign-in ({code})");
-                Instant::now()
-            });
-            if since.elapsed() >= READ_IT {
-                std::process::exit(super::BLOCKED);
-            }
-            None
-        }
-    }
+    REFUSED
 }
 
 // After the redirect: Microsoft and Teams are asked directly, as the same browser.
@@ -323,9 +358,21 @@ struct Asked {
     body: serde_json::Value,
 }
 
+/// The system's TLS and roots; on Android, which has none this crate links, rustls and the
+/// bundled roots (as `chatd::tls`).
+#[cfg(not(target_os = "android"))]
+fn tls() -> ureq::tls::TlsConfig {
+    ureq::tls::TlsConfig::builder().provider(ureq::tls::TlsProvider::NativeTls).root_certs(ureq::tls::RootCerts::PlatformVerifier).build()
+}
+
+#[cfg(target_os = "android")]
+fn tls() -> ureq::tls::TlsConfig {
+    ureq::tls::TlsConfig::builder().provider(ureq::tls::TlsProvider::Rustls).build()
+}
+
 fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
-        .tls_config(ureq::tls::TlsConfig::builder().provider(ureq::tls::TlsProvider::NativeTls).root_certs(ureq::tls::RootCerts::PlatformVerifier).build())
+        .tls_config(tls())
         .timeout_global(Some(Duration::from_secs(30)))
         .http_status_as_error(false)
         .max_redirects(0)
@@ -391,16 +438,16 @@ fn fallback_name(upn: &str) -> String {
     letters.next().map(|first| first.to_uppercase().chain(letters).collect()).unwrap_or_default()
 }
 
-/// Redeems the code and finds the tenants the sign-in reaches. Ends the helper if Microsoft
+/// Redeems the code and finds the tenants the sign-in reaches. `Err` with the exit code if Microsoft
 /// refuses the code; anything that fails after that only leaves the guest tenants out.
-fn signed_in(code: &str, verifier: &str) -> serde_json::Value {
+fn signed_in(code: &str, verifier: &str) -> Ending {
     let agent = agent();
     let grant = [("grant_type", "authorization_code"), ("code", code), ("redirect_uri", REDIRECT), ("code_verifier", verifier)];
     let redeemed = match token(&agent, TENANT, &grant) {
         Ok(redeemed) => redeemed,
         Err(why) => {
             tracing::warn!("tinyclient-login: Microsoft could not be reached to finish the sign-in: {why}");
-            std::process::exit(super::LOAD_FAILED);
+            return Err(super::LOAD_FAILED);
         }
     };
     let text = |value: &serde_json::Value| value.as_str().unwrap_or("").to_owned();
@@ -408,12 +455,12 @@ fn signed_in(code: &str, verifier: &str) -> serde_json::Value {
     if redeemed.status != 200 || access.is_empty() || refresh.is_empty() {
         let error = text(&redeemed.body["error"]);
         let error = if error.is_empty() { format!("HTTP {}", redeemed.status) } else { error };
-        refuse(&error, redeemed.body["error_description"].as_str().unwrap_or("no refresh token was issued"));
+        return Err(refusal(&error, redeemed.body["error_description"].as_str().unwrap_or("no refresh token was issued")));
     }
     let claims = claims(redeemed.body["id_token"].as_str().unwrap_or(""));
     let home = text(&claims["tid"]);
     if home.is_empty() {
-        refuse("no_tenant", "Microsoft did not say which organization signed in");
+        return Err(refusal("no_tenant", "Microsoft did not say which organization signed in"));
     }
     // Where this user's Teams is, then which tenants they are in.
     let authz = asked(agent.post(AUTHZ).header("Authorization", &format!("Bearer {access}")).header("Accept", "application/json; ver=1.0").send_empty());
@@ -438,7 +485,7 @@ fn signed_in(code: &str, verifier: &str) -> serde_json::Value {
             _ => tracing::warn!("tinyclient-login: guest tenant {name:?} did not accept this sign-in and is left out"),
         }
     }
-    session(&claims, &tenants)
+    Ok(session(&claims, &tenants))
 }
 
 #[cfg(test)]
@@ -457,7 +504,7 @@ mod tests {
         assert!(url.contains("&code_challenge=CHALLENGE&code_challenge_method=S256&state=STATE&"));
         assert!(!url.contains("client_secret") && !url.contains(' '));
         // Each run makes its own secrets, long enough to be a verifier.
-        let (one, other) = (random(48), random(48));
+        let (one, other) = (random(48).unwrap(), random(48).unwrap());
         assert_eq!(one.len(), 64);
         assert!(one != other && one.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'));
     }

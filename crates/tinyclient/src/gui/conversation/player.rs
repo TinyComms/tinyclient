@@ -16,6 +16,7 @@ use gpui::{
 };
 use protocol::{Message, PlayState, Playback};
 use std::rc::Rc;
+use palette::IntoColor;
 
 /// Bars of a voice message's waveform.
 const BARS: usize = 40;
@@ -111,7 +112,7 @@ pub fn along(bounds: Bounds<Pixels>, at: Point<Pixels>) -> f32 {
 }
 
 /// Play or pause, as one glyph.
-pub(in crate::gui) fn glyph(playing: bool, size: f32, color: impl Into<Hsla>) -> gpui::Svg {
+pub(in crate::gui) fn glyph(playing: bool, size: f32, color: impl IntoColor<Hsla>) -> gpui::Svg {
     icon(if playing { Icon::Pause } else { Icon::Play }, size, color)
 }
 

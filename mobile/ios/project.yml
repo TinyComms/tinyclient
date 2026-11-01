@@ -1,0 +1,83 @@
+# XcodeGen project definition. The .xcodeproj is generated, never committed, so this file is
+# editable from Windows and there are no .pbxproj merge conflicts.
+#
+#   cd mobile/ios
+#   xcodegen generate
+#
+# The Rust library must exist first: scripts/mobile/build-ios.sh writes TinyCore.xcframework
+# beside this file. It is a static-library xcframework, so it is linked, not embedded.
+name: Tiny
+
+options:
+  bundleIdPrefix: dev.tinyclient
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+  # Xcode 27.2 (2026-10-29) is the current toolchain; xcode-27 is a CI preview image.
+  xcodeVersion: "27.0"
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    IPHONEOS_DEPLOYMENT_TARGET: "16.0"
+    # Xcode 15+ sandboxes Run Script phases by default; the first build phase that calls cargo
+    # gets an opaque "Sandbox: bash deny file-write" instead of a cargo error. This project
+    # links a prebuilt xcframework instead of running cargo, but the setting is cheap insurance
+    # for the day someone adds that phase.
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+
+targets:
+  Tiny:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.tinyclient.app
+        PRODUCT_NAME: Tiny
+        TARGETED_DEVICE_FAMILY: "1,2"
+        # The plist is hand-written (see Info.plist) so its scene manifest and encryption
+        # placeholder stay reviewable; nothing is generated from project.yml.
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: Info.plist
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/Tiny-Bridging-Header.h
+        # The keychain access group chatd's sessions need (see the file). A simulator build signs
+        # ad hoc (CODE_SIGN_IDENTITY=-) so the entitlement is in the binary.
+        CODE_SIGN_ENTITLEMENTS: Tiny.entitlements
+        # A static library cannot carry the system frameworks it needs, so the app target links
+        # them: libc++ for the Rust deps that use C++, zlib and sqlite3 for the core's storage.
+        OTHER_LDFLAGS:
+          - "-lc++"
+          - "-lz"
+          - "-lsqlite3"
+        # No signing material is assumed to exist on a fresh checkout or a CI runner; the
+        # mobile workflow archives with CODE_SIGNING_ALLOWED=NO.
+        CODE_SIGN_STYLE: Automatic
+    dependencies:
+      - framework: TinyCore.xcframework
+        embed: false
+        link: true
+      # The call platform and web sign-in (crates/tinyclient/src/mobile/ios). A static library
+      # carries no framework links, so the app names each one. WebKit is messaged dynamically
+      # (objc2 binds WKWebView for macOS only), so nothing would pull it in otherwise.
+      # mediad's cpal opens the microphone and speaker through AudioToolbox's audio units.
+      - sdk: AudioToolbox.framework
+      - sdk: AVFoundation.framework
+      - sdk: AVFAudio.framework
+      - sdk: CoreMedia.framework
+      - sdk: CoreVideo.framework
+      - sdk: VideoToolbox.framework
+      - sdk: ReplayKit.framework
+      - sdk: WebKit.framework
+      - sdk: AuthenticationServices.framework
+
+schemes:
+  Tiny:
+    build:
+      targets:
+        Tiny: all
+    run:
+      config: Debug
+    archive:
+      config: Release

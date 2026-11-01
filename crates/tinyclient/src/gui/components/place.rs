@@ -197,7 +197,7 @@ pub fn placed(id: impl Into<ElementId>, place: Place, layer: Layer, window: &Win
         // The scroll clips what it holds, so the floating shadow is drawn by the wrapper.
         .shadow(theme::shadow_popover())
         .child(content);
-    deferred(Placed { place, child: Some(body.into_any_element()) }).with_priority(layer as usize).into_any_element()
+    deferred(Placed { place, child: Some(body.into_any_element()) }).priority(layer as usize).into_any_element()
 }
 
 /// Measures its one child and puts it where [`fit`] says.

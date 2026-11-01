@@ -829,6 +829,45 @@ impl Shell {
     }
 
     /// Opens a row the user chose by hand: the unread walk starts over from there.
+    /// A row's press. On the desktop it acts at once, as every list row does. On a phone it acts
+    /// on release, when the finger lifts where it went down (a drag past the slop is a scroll),
+    /// and resting on a row with a `menu` opens that menu instead.
+    pub(in crate::gui) fn tap(
+        &self,
+        row: Stateful<Div>,
+        token: u64,
+        menu: Option<Rc<Conversation>>,
+        act: impl Fn(&mut Shell, &mut Context<Shell>) + 'static,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        if !super::phone::active() {
+            return row.on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| act(this, cx)));
+        }
+        // A finger's long press: the timer below never starts for one, as its mouse-down only
+        // comes when it lifts.
+        let held = menu.clone().map(|row| {
+            super::phone::long_press(cx.listener(move |this, event: &gpui::LongPressEvent, _, cx| {
+                this.phone_state.press_cancel();
+                this.open_menu(Menu::Row(row.clone(), event.start_position), cx);
+            }))
+        });
+        row.relative().children(held).on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                let menu = menu.clone().map(|row| Menu::Row(row, event.position));
+                this.phone_press(token, super::phone::at(event.position), menu, cx);
+            }),
+        )
+        .on_mouse_up(
+            MouseButton::Left,
+            cx.listener(move |this, event: &gpui::MouseUpEvent, _, cx| {
+                if this.phone_state.press_up(token, super::phone::at(event.position)) {
+                    act(this, cx);
+                }
+            }),
+        )
+    }
+
     fn pick_row(&mut self, row: &Conversation, cx: &mut Context<Self>) {
         self.sidebar_state.walked.clear();
         if row.key.network == Network::Discord && row.kind.is_direct() && matches!(&self.sidebar_state.mode, Mode::Space(space) if space.network == Network::Discord) {
@@ -1025,7 +1064,7 @@ impl Shell {
                     (count, false) => Some(super::components::badge_count_unread(count)),
                 };
                 self.action_row(("threads", ix), Some("icons/messages-square.svg"), "Threads".into(), *count > 0, trailing, focused)
-                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| this.activate(ix, cx)))
+                    .map(|row| self.tap(row, super::phone::token(&["tree", &ix.to_string()]), None, move |this, cx| this.activate(ix, cx), cx))
             }
             Row::Fold { words, depth, .. } => {
                 let content = div()
@@ -1034,7 +1073,7 @@ impl Shell {
                     .child(div().size(px(20.)).flex_none().flex().items_center().justify_center().child(glyph("icons/ellipsis.svg", 14., theme::text_faint())))
                     .child(div().flex_1().min_w_0().truncate().type_ui().text_color(theme::text_faint()).child(words.clone()));
                 list_row(("fold", ix), height, false, focused, content)
-                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| this.activate(ix, cx)))
+                    .map(|row| self.tap(row, super::phone::token(&["tree", &ix.to_string()]), None, move |this, cx| this.activate(ix, cx), cx))
             }
             Row::More { words, depth } => {
                 let content = div().children(indent(*depth, 0.)).child(div().pl(px(28.)).type_small().text_color(theme::text_faint()).child(words.clone()));
@@ -1050,7 +1089,7 @@ impl Shell {
                     .when(occupant.muted && !occupant.deafened, |row| row.child(glyph("icons/mic-off.svg", 14., theme::danger())))
                     .when(occupant.deafened, |row| row.child(glyph("icons/headphone-off.svg", 14., theme::danger())));
                 list_row(row_id("occupant", &occupant.person), height, false, false, content)
-                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| this.activate(ix, cx)))
+                    .map(|row| self.tap(row, super::phone::token(&["tree", &ix.to_string()]), None, move |this, cx| this.activate(ix, cx), cx))
             }
             Row::Group { id, name, collapsed, rollup, depth, .. } => {
                 let lit = *collapsed && (rollup.attention > 0 || rollup.unread);
@@ -1066,7 +1105,7 @@ impl Shell {
                     .child(div().flex_1())
                     .children(dot);
                 list_row((gpui::ElementId::from("group"), id.clone()), height, false, focused, content)
-                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| this.activate(ix, cx)))
+                    .map(|row| self.tap(row, super::phone::token(&["tree", &ix.to_string()]), None, move |this, cx| this.activate(ix, cx), cx))
             }
             Row::Conversation { conversation: c, depth } => self.place_row(c, *depth, focused, cx),
         }
@@ -1098,8 +1137,14 @@ impl Shell {
                 format!("Join {}. People there will see you arrive.", title),
                 None,
             ))
-            .invisible()
-            .group_hover("voice", |style| style.visible())
+            // A phone has no hover: there the pill is always on the row, at a thumb's size.
+            .map(|pill| {
+                if super::phone::active() {
+                    pill.h(px(30.)).px(px(12.)).rounded(px(15.)).text_size(px(13.))
+                } else {
+                    pill.invisible().group_hover("voice", |style| style.visible())
+                }
+            })
             // The press belongs to the pill: the row's open must not fire with it.
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(move |this, _, _, cx| this.call_start(key.clone(), cx)))
@@ -1176,17 +1221,42 @@ impl Shell {
             .children(row_badge(c))
             .when(join, |row| row.group("voice"));
         list_row(row_id("tree", &c.key), theme::row_height(theme::ROW_ONE), selected, focused, content)
-            .on_mouse_down(
-                MouseButton::Left,
-                // A voice row joins on a double-click; a single click only opens its chat.
-                cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
-                    if join && event.click_count == 2 {
-                        this.call_start(picked.key.clone(), cx);
-                    } else {
-                        this.pick_row(&picked, cx);
-                    }
-                }),
-            )
+            .map(|row| {
+                if super::phone::active() {
+                    let token = super::phone::token(&["place", picked.key.network.label(), &picked.key.account, &picked.key.id]);
+                    let menu = Some(picked.clone());
+                    // A voice channel is a place to be, not to read: a tap joins it, as the
+                    // desktop's double-click does, and the call screen comes up. Once I am in
+                    // it, a tap brings that screen back. Its chat is the call screen's.
+                    let voice = picked.kind == ConversationKind::Voice;
+                    return self.tap(
+                        row,
+                        token,
+                        menu,
+                        move |this, cx| {
+                            if voice && ours {
+                                this.call_phone_restore(cx);
+                            } else if join {
+                                this.call_start(picked.key.clone(), cx);
+                            } else {
+                                this.pick_row(&picked, cx);
+                            }
+                        },
+                        cx,
+                    );
+                }
+                row.on_mouse_down(
+                    MouseButton::Left,
+                    // A voice row joins on a double-click; a single click only opens its chat.
+                    cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                        if join && event.click_count == 2 {
+                            this.call_start(picked.key.clone(), cx);
+                        } else {
+                            this.pick_row(&picked, cx);
+                        }
+                    }),
+                )
+            })
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
@@ -1252,7 +1322,13 @@ impl Shell {
 
     /// `All · Unread n · Mentions n`: counts in faint numerals after the label, hidden at 0.
     fn segments(&self, choices: &[(&'static str, &'static str, u32, bool)], cx: &mut Context<Self>, pick: impl Fn(&mut Shell, usize, &mut Context<Shell>) + Clone + 'static) -> Div {
-        let roomy = self.sidebar_state.width.get() >= 300.;
+        // A phone's 326 (a 390 screen) holds the counts too, at its baseline type: its title and
+        // segment are the strip's only content. A 360 screen's 296 keeps the title whole instead.
+        let roomy = if super::phone::active() {
+            self.sidebar_state.width.get() >= 310. && super::phone::tokens::text_scale() <= 1.25
+        } else {
+            self.sidebar_state.width.get() >= 300.
+        };
         let mut out = segmented();
         for (ix, (id, label, count, on)) in choices.iter().copied().enumerate() {
             let pick = pick.clone();
@@ -1311,7 +1387,15 @@ impl Shell {
                 let pick = |this: &mut Shell, ix: usize, cx: &mut Context<Shell>| {
                     this.set_filter([InboxFilter::All, InboxFilter::Unread, InboxFilter::Mentions][ix], cx);
                 };
-                let marked = counts.unread > 0 || counts.mentions > 0;
+                // Mark all as read sits at the strip's end; on a phone it waits in the row menu
+                // and Details, where a thumb finds it, so the title and segment keep their room.
+                let marked = (counts.unread > 0 || counts.mentions > 0) && !super::phone::active();
+                // A phone's larger text has no room for both on one line: the segment takes a
+                // row of its own under the title.
+                if super::phone::active() && super::phone::tokens::text_scale() > 1.25 {
+                    let segments = self.segments(&choices, cx, pick);
+                    return div().flex_none().flex().flex_col().child(strip.child(pane_title("Inbox"))).child(div().flex_none().px(px(theme::PANE_PAD)).pb(px(8.)).flex().child(segments));
+                }
                 strip
                     .child(pane_title("Inbox"))
                     .child(self.segments(&choices, cx, pick))
@@ -1474,7 +1558,8 @@ impl Shell {
         }
         let current = self.slack_space();
         let snapshot = self.snapshot.as_ref()?;
-        let mut menu = super::components::menu().w(px(280.));
+        let phone = super::phone::active();
+        let mut menu = if phone { div().w_full().flex().flex_col() } else { super::components::menu().w(px(280.)) };
         let workspaces: Vec<&protocol::Space> = self.spaces.iter().filter(|s| s.key.network == Network::Slack).collect();
         if workspaces.len() > 1 {
             menu = menu.child(super::components::menu_label("Workspaces"));
@@ -1484,7 +1569,7 @@ impl Shell {
                 let words = (link != Link::Connected).then(|| super::components::link_word(link));
                 let row = div()
                     .id(("workspace", ix))
-                    .h(px(28.))
+                    .h(px(if phone { theme::row_height(theme::ROW_ONE) } else { 28. }))
                     .px(px(8.))
                     .mx(px(4.))
                     .rounded(px(theme::R_CONTROL))
@@ -1493,7 +1578,7 @@ impl Shell {
                     .gap(px(8.))
                     .cursor_pointer()
                     .when(current.as_ref() == Some(&space.key), |row| row.bg(theme::selected()))
-                    .hover(|style| style.bg(theme::hover()))
+                    .when(!phone, |row| row.hover(|style| style.bg(theme::hover())))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.sidebar_state.slack = Some(key.clone());
                         this.sidebar_state.slack_menu = false;
@@ -1515,6 +1600,10 @@ impl Shell {
                 this.sign_out(account, cx);
             }
         })));
+        if phone {
+            // A phone's menu is a sheet over the whole screen, drawn by `phone_slack_sheet`.
+            return Some(menu);
+        }
         Some(
             div()
                 .absolute()
@@ -1529,6 +1618,26 @@ impl Shell {
         )
     }
 
+    /// Closes the Slack header's menu. False when it was not open.
+    pub(in crate::gui) fn close_slack_menu(&mut self, cx: &mut Context<Self>) -> bool {
+        let was = std::mem::take(&mut self.sidebar_state.slack_menu);
+        if was {
+            cx.notify();
+        }
+        was
+    }
+
+    /// The Slack header's menu on a phone: the same rows as a bottom sheet over the screen.
+    pub(in crate::gui) fn phone_slack_sheet(&self, window: &Window, cx: &mut Context<Self>) -> Option<Div> {
+        let body = self.slack_menu(cx)?;
+        let tall = f32::from(window.viewport_size().height);
+        let close = cx.listener(|this, _: &gpui::MouseDownEvent, _, cx| {
+            this.sidebar_state.slack_menu = false;
+            cx.notify();
+        });
+        Some(super::phone::sheet("phone-slack-menu", tall, body, close))
+    }
+
     fn set_home_unread(&mut self, unread: bool, cx: &mut Context<Self>) {
         self.sidebar_state.home_unread = unread;
         self.sidebar_state.cursor = None;
@@ -1538,8 +1647,11 @@ impl Shell {
     /// The jump strip: a field that opens the switcher, and the compose button. People draws
     /// its own search here instead.
     fn jump_strip(&self, cx: &mut Context<Self>) -> Div {
+        // A thumb's field on a phone: 36 at least, and it grows with the text run.
+        let phone = super::phone::active();
+        let field = if phone { f32::from(theme::line(18.)).max(20.) + 16. } else { theme::CONTROL };
         div()
-            .h(px(44.))
+            .h(px(if phone { field + 12. } else { 44. }))
             .flex_none()
             .px(px(theme::PANE_PAD))
             .pb(px(8.))
@@ -1550,7 +1662,7 @@ impl Shell {
                 div()
                     .id("jump")
                     .flex_1()
-                    .h(px(theme::CONTROL))
+                    .h(px(field))
                     .px(px(8.))
                     .rounded(px(theme::R_CONTROL))
                     .bg(theme::field())
@@ -1564,10 +1676,11 @@ impl Shell {
                     .on_click(cx.listener(|this, _, window, cx| this.open_switcher("", window, cx)))
                     .child(glyph("icons/search.svg", 14., theme::text_faint()))
                     .child(div().flex_1().type_ui().text_color(theme::text_faint()).child("Jump to…"))
-                    .child(keycap("⌘K")),
+                    .when(!super::phone::active(), |field| field.child(keycap("⌘K"))),
             )
             .child(
                 icon_button("compose", "icons/square-pen.svg", false)
+                    .when(phone, |button| button.size(px(field)))
                     .tooltip(tip("New message", Some("⌘N")))
                     .on_click(cx.listener(|this, _, window, cx| this.open_switcher("@", window, cx))),
             )
@@ -1628,6 +1741,7 @@ impl Shell {
         };
         let banners = self.banners(snapshot, cx);
         let tabs = self.folder_tabs(cx);
+        let phone = super::phone::active();
         div()
             .relative()
             .w(px(width))
@@ -1636,17 +1750,35 @@ impl Shell {
             .flex()
             .flex_col()
             .bg(theme::sidebar())
-            .border_r_1()
-            .border_color(theme::hairline())
+            // A phone's sidebar is the screen's right edge: no hairline, and it keeps clear of
+            // the status bar and the home indicator.
+            .when(!phone, |sidebar| sidebar.border_r_1().border_color(theme::hairline()))
+            .when(phone, |sidebar| sidebar.pt(px(super::phone::tokens::safe_top())).pb(px(super::phone::tokens::safe_bottom())))
             .child(self.title_strip(&self.sidebar_state.mode, cx))
             .when(!people && !tiny && !messages, |sidebar| sidebar.child(self.jump_strip(cx)))
             .children(tabs)
             .when(!banners.is_empty(), |sidebar| sidebar.child(div().flex_none().px(px(theme::INSET)).pb(px(8.)).flex().flex_col().gap(px(4.)).children(banners)))
-            .child(div().id("sidebar-list").flex_1().min_h_0().track_focus(&self.sidebar_state.focus).key_context("Sidebar").child(body))
+            .child(
+                div()
+                    .id("sidebar-list")
+                    .flex_1()
+                    .min_h_0()
+                    .track_focus(&self.sidebar_state.focus)
+                    .key_context("Sidebar")
+                    // A press that travels past the slop is a scroll: the rows check it on release.
+                    .when(phone, |list| {
+                        list.on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, _| {
+                            if event.pressed_button == Some(MouseButton::Left) {
+                                this.phone_state.press_move(super::phone::at(event.position));
+                            }
+                        }))
+                    })
+                    .child(body),
+            )
             .children(super::playing::draw(self, window, cx))
             .children(self.slots.call_dock.and_then(|draw| draw(self, window, cx)))
             .children(tiny.then(|| self.tiny_user_panel(cx)).flatten())
-            .children(self.slack_menu(cx))
+            .when(!phone, |sidebar| sidebar.children(self.slack_menu(cx)))
     }
 }
 

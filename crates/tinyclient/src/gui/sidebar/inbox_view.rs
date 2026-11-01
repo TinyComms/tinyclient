@@ -120,7 +120,7 @@ impl Shell {
             Item::App(app) => self.app_row(ix, &app, look.mark, focused, cx).into_any_element(),
             Item::AppsMore(more) => self
                 .action_row(("apps-more", ix), Some("icons/chevron-down.svg"), format!("Show {more} more").into(), false, None, focused)
-                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| this.activate_inbox(ix, cx)))
+                .map(|row| self.tap(row, crate::gui::phone::token(&["inbox-item", &ix.to_string()]), None, move |this, cx| this.activate_inbox(ix, cx), cx))
                 .into_any_element(),
             Item::End => self.end_line(cx).into_any_element(),
         }
@@ -154,7 +154,7 @@ impl Shell {
                     .flex_col()
                     .child(
                         div()
-                            .h(px(18. + theme::text_step() as f32)).flex_none().overflow_hidden()
+                            .h(theme::line(18.)).flex_none().overflow_hidden()
                             .flex()
                             .items_center()
                             .gap(px(4.))
@@ -165,7 +165,7 @@ impl Shell {
                     )
                     .child(
                         div()
-                            .h(px(16. + theme::text_step() as f32)).flex_none().overflow_hidden()
+                            .h(theme::line(16.)).flex_none().overflow_hidden()
                             .flex()
                             .items_center()
                             .gap(px(6.))
@@ -174,7 +174,7 @@ impl Shell {
                     ),
             );
         list_row(("apps", ix), theme::row_height(theme::ROW_TWO), false, focused, content)
-            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| this.activate_inbox(ix, cx)))
+            .map(|row| self.tap(row, crate::gui::phone::token(&["inbox-item", &ix.to_string()]), None, move |this, cx| this.activate_inbox(ix, cx), cx))
     }
 
     /// An app under the open Apps row, 28: its square, name, last line, time and dot.
@@ -194,7 +194,7 @@ impl Shell {
             .children(super::super::components::row_badge(app));
         let picked = app.clone();
         list_row(("app", ix), theme::row_height(theme::ROW_ONE), selected, focused, content)
-            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| this.pick_row(&picked, cx)))
+            .map(|row| self.tap(row, crate::gui::phone::token(&["row", picked.key.network.label(), &picked.key.account, &picked.key.id]), Some(picked.clone()), move |this, cx| this.pick_row(&picked, cx), cx))
     }
 
     /// "Older conversations are in Discord · Slack": each opens that network's home.

@@ -123,7 +123,7 @@ pub(in crate::gui::tiny) fn danger(shell: &Shell, facts: &Facts, window: &mut Wi
             )));
         }
         let list = list.on_mouse_down_out(cx.listener(|this, _, _, cx| this.tiny_danger_draft(cx, |draft| draft.picking = false)));
-        picker = picker.child(deferred(anchored().snap_to_window().child(div().mt(px(4.)).child(list))).with_priority(2));
+        picker = picker.child(deferred(anchored().snap_to_window().child(div().mt(px(4.)).child(list))).priority(2));
     }
     let step_down = draft.step_down;
     let transfer_button = match &draft.heir {

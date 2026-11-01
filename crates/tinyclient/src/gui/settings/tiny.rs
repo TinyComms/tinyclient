@@ -3,7 +3,7 @@
 //! shown here is read from the server's member list. There is no password here: the server's
 //! sign-in provider keeps it.
 
-use super::controls::{rule, row};
+use super::controls::{rule, row, wide_row};
 use super::{Confirm, SettingsWindow};
 use crate::gui::components::{button, button_disabled, field, ButtonKind};
 use crate::gui::input::{InputEvent, InputKey, TextInput};
@@ -64,17 +64,19 @@ impl SettingsWindow {
             let save = if busy {
                 button_disabled("Save").into_any_element()
             } else {
-                button(("tiny-name-save", ix), ButtonKind::Primary, "Save").on_click(cx.listener(|this, _, _, cx| this.save_tiny_name(cx))).into_any_element()
+                super::controls::touch(button(("tiny-name-save", ix), ButtonKind::Primary, "Save")).on_click(cx.listener(|this, _, _, cx| this.save_tiny_name(cx))).into_any_element()
             };
-            row(
+            let touch = crate::gui::phone::active();
+            wide_row(
                 "Name",
                 None,
                 div()
                     .flex()
+                    .when(touch, |line| line.flex_1())
                     .items_center()
                     .gap(px(8.))
-                    .child(field(focused).w(px(200.)).child(self.tiny.name.clone()))
-                    .child(button(("tiny-name-cancel", ix), ButtonKind::Secondary, "Cancel").on_click(cx.listener(|this, _, _, cx| {
+                    .child(field(focused).w(px(200.)).when(touch, |field| field.flex_1().w_auto().h(px(40.))).child(self.tiny.name.clone()))
+                    .child(super::controls::touch(button(("tiny-name-cancel", ix), ButtonKind::Secondary, "Cancel")).on_click(cx.listener(|this, _, _, cx| {
                         this.tiny.naming = None;
                         cx.notify();
                     })))
@@ -86,7 +88,7 @@ impl SettingsWindow {
             row(
                 "Name",
                 Some(known.unwrap_or_else(|| "What people on this server see.".to_owned()).into()),
-                button(("tiny-name-edit", ix), ButtonKind::Secondary, "Change…").on_click(cx.listener(move |this, _, window, cx| {
+                super::controls::touch(button(("tiny-name-edit", ix), ButtonKind::Secondary, "Change…")).on_click(cx.listener(move |this, _, window, cx| {
                     this.tiny.naming = Some(key.clone());
                     this.tiny.line = None;
                     this.tiny.name.update(cx, |input, cx| input.set_text(&shown, cx));
@@ -105,7 +107,7 @@ impl SettingsWindow {
             .child(row(
                 "Sign out everywhere",
                 Some("Every device signed in as you, this one too.".into()),
-                button(("tiny-everywhere", ix), ButtonKind::Ghost, "Sign out everywhere…").on_click(cx.listener(move |this, _, _, cx| {
+                super::controls::touch(button(("tiny-everywhere", ix), ButtonKind::Ghost, if crate::gui::phone::active() { "Sign out…" } else { "Sign out everywhere…" })).on_click(cx.listener(move |this, _, _, cx| {
                     this.tiny.line = None;
                     this.confirm = Some(Confirm::TinyEverywhere(everywhere.clone()));
                     cx.notify();

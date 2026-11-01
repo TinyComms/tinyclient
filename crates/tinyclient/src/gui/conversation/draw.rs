@@ -2,6 +2,7 @@
 //! network. Every box that holds a picture is sized from what the network said about it, so a
 //! row is its final height before any file arrives.
 
+use palette::IntoColor;
 use super::emoji;
 use super::icons::{icon, Icon};
 use super::images::Picture;
@@ -14,6 +15,7 @@ use super::when;
 use super::{Pane, PaneEvent, Selection, Then};
 use crate::gui::anim::{self, Play};
 use crate::gui::components::{glyph, tip, Avatar, Shape};
+use crate::gui::phone::tokens as tokens_phone;
 use crate::gui::theme::{self, Type};
 use crate::gui::time;
 use crate::view::{age, now};
@@ -79,7 +81,13 @@ fn named(path: &str, name: &str) -> std::path::PathBuf {
 /// Opens a cached file under its own name: in Quick Look, or in the system's app for it (a
 /// video in the system's player). Both are processes of their own; a thread waits for them so
 /// nothing of ours blocks, and makes the link off the main thread.
-pub fn open_file(path: &str, name: &str, then: Then) {
+pub fn open_file(path: &str, name: &str, then: Then, cx: &mut gpui::App) {
+    // A phone has no xdg-open: the file goes to GPUI's URL open, on this thread.
+    if super::super::links_through_gpui() {
+        let _ = then;
+        cx.open_url(&format!("file://{}", named(path, name).display()));
+        return;
+    }
     let (path, name) = (path.to_owned(), name.to_owned());
     std::thread::spawn(move || {
         let path = named(&path, &name);
@@ -124,6 +132,28 @@ fn short_clock(unix: i64) -> String {
 
 fn day_line(at: i64, metrics: Metrics) -> Div {
     let rule = || div().flex_1().h(px(1.)).bg(theme::hairline());
+    if metrics == Metrics::PHONE {
+        // 24 above, 12 below, a 12/16 label between two hairlines.
+        return div()
+            .w_full()
+            .pt(px(24.))
+            .pb(px(12.))
+            .px(px(metrics.inset))
+            .flex()
+            .items_center()
+            .gap(px(12.))
+            .child(rule())
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(px(tokens_phone::scaled(12.)))
+                    .line_height(px(tokens_phone::scaled(16.)))
+                    .font_weight(theme::MEDIUM)
+                    .text_color(theme::text_faint())
+                    .child(when::day_label(now(), at)),
+            )
+            .child(rule());
+    }
     div()
         .h(px(36.))
         .px(px(metrics.inset))
@@ -135,20 +165,23 @@ fn day_line(at: i64, metrics: Metrics) -> Div {
         .child(rule())
 }
 
-/// The line above the first unread message: accent, ending in a filled tab.
+/// The line above the first unread message: 2 pt of accent, 12 pt of air above it, no pill.
 fn new_line(metrics: Metrics) -> Div {
+    let phone = metrics == Metrics::PHONE;
     div()
-        .h(px(24.))
+        .w_full()
+        .when(phone, |line| line.pt(px(12.)).pb(px(6.)))
+        .when(!phone, |line| line.h(px(24.)))
         .px(px(metrics.inset))
         .flex()
         .items_center()
-        .gap(px(6.))
-        .child(div().flex_1().h(px(1.)).bg(theme::accent()))
+        .gap(px(8.))
+        .child(div().flex_1().h(px(if phone { 2. } else { 1. })).rounded(px(1.)).bg(theme::accent()))
         .child(
             div()
                 .flex_none()
-                .text_size(px(11.))
-                .line_height(px(14.))
+                .text_size(px(if phone { tokens_phone::scaled(12.) } else { 11. }))
+                .line_height(px(if phone { tokens_phone::scaled(16.) } else { 14. }))
                 .font_weight(theme::SEMIBOLD)
                 .text_color(theme::accent_text())
                 .child("New"),
@@ -288,27 +321,68 @@ impl Pane {
         let Some(open) = &self.open else {
             return div();
         };
-        const SIZE: f32 = 80.;
+        let phone = self.metrics == Metrics::PHONE;
+        let size: f32 = if phone { 48. } else { 80. };
         let direct = open.kind.is_direct();
         let words = if direct {
             format!("This is the start of your conversation with {}.", open.title)
         } else {
             format!("This is the start of #{}.", open.title.trim_start_matches('#'))
         };
-        let plate = if direct { Avatar::new(&open.key, &open.title, SIZE) } else { Avatar::channel("icons/hash.svg", SIZE) };
+        // A phone's header already carries the face and the name, so the opening is one quiet
+        // line, not a cover that floats in the middle of a short conversation.
+        if phone {
+            return div()
+                .px(px(self.metrics.inset))
+                .pt(px(16.))
+                .pb(px(12.))
+                .flex()
+                .justify_center()
+                .child(
+                    div()
+                        .max_w(px(300.))
+                        .text_align(gpui::TextAlign::Center)
+                        .text_size(px(tokens_phone::scaled(13.)))
+                        .line_height(px(tokens_phone::scaled(18.)))
+                        .text_color(theme::text_faint())
+                        .child(words),
+                );
+        }
+        let plate = if direct { Avatar::new(&open.key, &open.title, size) } else { Avatar::channel("icons/hash.svg", size) };
         let shape = if direct { Shape::Person } else { Shape::Place };
         let (title, file) = (open.title.clone(), open.picture.clone());
-        let picture = self.face(plate.shape(shape), file.as_ref(), SIZE, shape, window, cx);
+        let picture = self.face(plate.shape(shape), file.as_ref(), size, shape, window, cx);
+        let gap = if phone { 12. } else { 8. };
+        let head: AnyElement = if phone {
+            div()
+                .text_size(px(tokens_phone::scaled(17.)))
+                .line_height(px(tokens_phone::scaled(22.)))
+                .font_weight(theme::SEMIBOLD)
+                .child(title)
+                .into_any_element()
+        } else {
+            div().type_headline().child(title).into_any_element()
+        };
+        let line: AnyElement = if phone {
+            div()
+                .text_size(px(tokens_phone::scaled(13.)))
+                .line_height(px(tokens_phone::scaled(18.)))
+                .text_color(theme::text_soft())
+                .child(words)
+                .into_any_element()
+        } else {
+            div().type_ui().text_color(theme::text_soft()).child(words).into_any_element()
+        };
         div()
             .px(px(self.metrics.inset))
-            .pt(px(32.))
+            .pt(px(if phone { 16. } else { 32. }))
             .pb(px(12.))
             .flex()
             .flex_col()
-            .gap(px(8.))
+            .gap(px(gap))
             .child(picture)
-            .child(div().type_headline().child(title))
-            .child(div().type_ui().text_color(theme::text_soft()).child(words))
+            .child(head)
+            .child(line)
     }
 
     /// An avatar with its picture drawn from this pane's own decodes, asked for at the size it
@@ -405,6 +479,41 @@ impl Pane {
     /// "Jump to latest". A click, or Escape with nothing else open, goes to the newest.
     pub(super) fn jump_button(&self, cx: &mut Context<Self>) -> AnyElement {
         let words = if self.unseen > 0 { format!("{} new", self.unseen) } else { "Jump to latest".to_owned() };
+        if self.metrics == Metrics::PHONE {
+            // A phone: a round 44 pt button over the right edge of the list, the arrow alone;
+            // with unread below it grows into a pill that says how many, in the accent.
+            let unseen = self.unseen > 0;
+            return div()
+                .id("jump")
+                .absolute()
+                .bottom(px(16.))
+                .right(px(16.))
+                .h(px(44.))
+                .min_w(px(44.))
+                .when(unseen, |button| button.pl(px(12.)).pr(px(16.)))
+                .rounded_full()
+                .bg(if unseen { theme::accent() } else { theme::overlay() })
+                .border_1()
+                .border_color(if unseen { theme::accent() } else { theme::border() })
+                .shadow(theme::shadow_popover())
+                .flex()
+                .items_center()
+                .justify_center()
+                .gap(px(6.))
+                .cursor_pointer()
+                .active(|style| style.opacity(0.85))
+                .child(glyph("icons/arrow-down.svg", 18., if unseen { theme::on_accent() } else { theme::text() }))
+                .children(unseen.then(|| {
+                    div()
+                        .text_size(px(tokens_phone::scaled(15.)))
+                        .line_height(px(tokens_phone::scaled(20.)))
+                        .font_weight(theme::SEMIBOLD)
+                        .text_color(theme::on_accent())
+                        .child(words.clone())
+                }))
+                .on_click(cx.listener(|this, _, _, cx| this.jump(cx)))
+                .into_any_element();
+        }
         div()
             .id("jump")
             .absolute()
@@ -456,8 +565,9 @@ impl Pane {
         let bar = if editing { Some(theme::accent()) } else { bar };
         let owns = self.owns_overlay(&message.id);
 
-        let gutter = if head {
-            self.avatar(message, window, cx).into_any_element()
+        let gutter: Option<AnyElement> = Some(if head {
+            let face = self.avatar(message, window, cx);
+            self.author_tap(face, "author-face", message, cx)
         } else {
             div()
                 .w(px(metrics.avatar))
@@ -471,7 +581,7 @@ impl Pane {
                 .group_hover("row", |style| style.text_color(theme::text_faint()))
                 .child(short_clock(message.sent))
                 .into_any_element()
-        };
+        });
 
         let mut sent = div().flex().flex_col();
         if message.deleted {
@@ -498,6 +608,7 @@ impl Pane {
         if pending {
             sent = sent.opacity(0.55);
         }
+        // Mine reads as everyone's does, as on the desktop: left, face in the gutter, "You".
         // My newest message's mark goes after its time, or at the row's right edge on its first
         // line when it is grouped under an earlier one and has no header.
         let receipt = self.receipt_on(message);
@@ -507,7 +618,10 @@ impl Pane {
             .min_w_0()
             .flex()
             .flex_col()
-            .children(head.then(|| self.header(message, in_header)))
+            .children(head.then(|| {
+                let header = self.header(message, in_header);
+                self.author_tap(header, "author-name", message, cx)
+            }))
             .child(sent)
             .children(self.reactions(message, window, cx))
             .children(self.thread_line(message, window, cx))
@@ -521,7 +635,9 @@ impl Pane {
             .relative()
             .px(px(metrics.inset))
             .when(head, |row| row.pt(px(3.)).pb(px(3.)))
-            .when(!head, |row| row.py(px(1.)))
+            // A phone gives messages of one group 12 pt of air (6 + 6); the desktop keeps its
+            // tighter paragraph flow.
+            .when(!head, |row| row.py(px(if metrics == Metrics::PHONE { 6. } else { 1. })))
             .when(editing, |row| row.bg(theme::accent_soft()))
             .when(mentioned && !editing, |row| row.bg(theme::accent_wash()))
             // The row that owns an open menu, picker or dialog keeps `selected` (polish/01 §2).
@@ -536,7 +652,7 @@ impl Pane {
                     }
                 }),
             )
-            .children(bar.map(|color| div().absolute().left_0().top_0().bottom_0().w(px(2.)).bg(color)))
+            .children(bar.map(|color| div().absolute().top_0().bottom_0().w(px(2.)).left_0().bg(color)))
             .children(flashing.then(|| {
                 div()
                     .absolute()
@@ -545,14 +661,54 @@ impl Pane {
                     .with_animation(name_id("flash", &message.id), Animation::new(FLASH), |tint, done| tint.opacity(1. - done))
             }))
             .children(message.reply_to.as_ref().map(|reply| self.reply_line(reply, window, cx)))
-            .child(div().flex().gap(px(metrics.gap)).child(gutter).child(column))
+            .child(
+                div()
+                    .flex()
+                    .gap(px(metrics.gap))
+                    .children(gutter)
+                    .child(column),
+            )
             .children(at_edge.map(|receipt| {
                 div().absolute().top(px(1.)).right(px(metrics.inset)).h(px(20.)).flex().items_center().child(receipt_mark(&message.id, receipt))
             }))
+            // On a phone the actions come up on a long press that holds still (`press_message`),
+            // not on a hover a finger never makes. A press that moves past the slop is a scroll.
+            .when(metrics == Metrics::PHONE, |row| {
+                let down = message.id.clone();
+                // A finger's long press comes as its own event: its mouse-down only comes when it
+                // lifts, so the press timer never starts for one.
+                let held = message.id.clone();
+                row.child(crate::gui::phone::long_press(cx.listener(move |this, event: &gpui::LongPressEvent, window, cx| {
+                    this.release_message();
+                    this.hold_message(&held, event.start_position, window, cx);
+                })))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| this.press_message(&down, event.position, window, cx)),
+                )
+                .on_mouse_up(MouseButton::Left, cx.listener(|this, _: &gpui::MouseUpEvent, _, _| this.release_message()))
+                .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, _| this.drag_message(event.position)))
+            })
             // Last, so it is over the row; it rises past the row's top edge, which nothing clips.
             .children(self.toolbar(message, cx));
         // The gap above a group is outside the row, so it does not light up on hover.
         div().w_full().when(head && !root, |row| row.pt(px(8.))).child(inner).into_any_element()
+    }
+
+    /// On a phone a tap on who said it, their face or their name, opens their Profile page, as
+    /// a click on an @mention does. Mine and an app's open nothing; the desktop draws them as is.
+    fn author_tap(&self, part: Div, what: &'static str, message: &Message, cx: &mut Context<Self>) -> AnyElement {
+        let person = self.person(&message.sender.id).filter(|_| self.metrics == Metrics::PHONE && !message.outgoing && !message.sender.bot);
+        let Some(person) = person else {
+            return part.into_any_element();
+        };
+        part.id(name_id(what, &message.id))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, window, cx| {
+                let (person, at) = (person.clone(), window.mouse_position());
+                let _ = this.shell.update(cx, |shell, cx| shell.open_profile(person, at, cx));
+            }))
+            .into_any_element()
     }
 
     fn person(&self, id: &str) -> Option<Key> {
@@ -625,8 +781,10 @@ impl Pane {
         receipt_for(message, &self.window, receipt)
     }
 
+    /// The head line: who, when, and the marks a message carries.
     fn header(&self, message: &Message, receipt: Option<Receipt>) -> Div {
         let name = if message.outgoing { "You".to_owned() } else { message.sender.name.clone() };
+        let phone = self.metrics == Metrics::PHONE;
         let tag = |words: &'static str| {
             div()
                 .flex_none()
@@ -642,7 +800,7 @@ impl Pane {
                 .child(words)
         };
         div()
-            .h(px(20.))
+            .h(px(if phone { tokens_phone::scaled(20.) } else { 20. }))
             .flex()
             .items_center()
             .gap(px(8.))
@@ -652,12 +810,21 @@ impl Pane {
                     .flex()
                     .items_baseline()
                     .gap(px(8.))
-                    .child(div().min_w_0().truncate().type_body().font_weight(theme::SEMIBOLD).child(name))
+                    .child(
+                        div()
+                            .relative()
+                            .min_w_0()
+                            .truncate()
+                            .type_body()
+                            .when(phone, |name| name.text_size(px(tokens_phone::scaled(15.))).line_height(px(tokens_phone::scaled(20.))))
+                            .font_weight(theme::SEMIBOLD)
+                            .child(name),
+                    )
                     .child(
                         div()
                             .flex_none()
-                            .text_size(px(11.))
-                            .line_height(px(20.))
+                            .text_size(px(if phone { tokens_phone::scaled(12.) } else { 11. }))
+                            .line_height(px(if phone { tokens_phone::scaled(20.) } else { 20. }))
                             .font_weight(theme::MEDIUM)
                             .text_color(theme::text_faint())
                             .child(time::clock(message.sent)),
@@ -683,6 +850,7 @@ impl Pane {
 
     fn content(&mut self, message: &Rc<Message>, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let edited = || div().h(px(16.)).type_micro().text_color(theme::text_faint()).child("(edited)").into_any_element();
+        let phone = self.metrics == Metrics::PHONE;
         // An encrypted message this device can't open says so, quietly, and never as its text.
         if message.seal == protocol::Seal::Undecryptable {
             return vec![div()
@@ -691,6 +859,7 @@ impl Pane {
                 .items_center()
                 .gap(px(6.))
                 .type_body()
+                .when(phone, |div| div.text_size(px(tokens_phone::scaled(17.))).line_height(px(tokens_phone::scaled(24.))))
                 .italic()
                 .text_color(theme::text_faint())
                 .child(crate::gui::components::glyph("icons/lock.svg", 12., theme::text_faint()))
@@ -712,10 +881,15 @@ impl Pane {
         let mut out = Vec::with_capacity(blocks.len() + 1);
         for (ix, block) in blocks.iter().enumerate() {
             let element = match block {
+                // A flex column, so the text is a flex item that is measured on its own: in a
+                // block its layout belongs to the line box, and `Rich` reads its own layout.
                 Block::Text(inline) => div()
                     .max_w(px(MEASURE))
+                    .flex()
+                    .flex_col()
                     .type_body()
-                    .child(self.rich(message, ix, inline, theme::text().into(), window, cx))
+                    .when(phone, |div| div.text_size(px(tokens_phone::scaled(17.))).line_height(px(tokens_phone::scaled(24.))))
+                    .child(self.rich(message, ix, inline, theme::text().into_color(), window, cx))
                     .into_any_element(),
                 Block::Quote(inline) => div()
                     .max_w(px(MEASURE))
@@ -726,8 +900,11 @@ impl Pane {
                         div()
                             .pl(px(12.))
                             .min_w_0()
+                            .flex()
+                            .flex_col()
                             .type_body()
-                            .child(self.rich(message, ix, inline, theme::text_soft().into(), window, cx)),
+                            .when(phone, |div| div.text_size(px(tokens_phone::scaled(17.))).line_height(px(tokens_phone::scaled(24.))))
+                            .child(self.rich(message, ix, inline, theme::text_soft().into_color(), window, cx)),
                     )
                     .into_any_element(),
                 Block::Item { ordered, depth, number, text } => {
@@ -737,8 +914,9 @@ impl Pane {
                         .pl(px(22. * f32::from(*depth)))
                         .flex()
                         .type_body()
+                        .when(phone, |div| div.text_size(px(tokens_phone::scaled(17.))).line_height(px(tokens_phone::scaled(24.))))
                         .child(div().w(px(22.)).flex_none().text_color(theme::text_faint()).child(marker))
-                        .child(div().min_w_0().flex_1().child(self.rich(message, ix, text, theme::text().into(), window, cx)))
+                        .child(div().min_w_0().flex_1().flex().flex_col().child(self.rich(message, ix, text, theme::text().into_color(), window, cx)))
                         .into_any_element()
                 }
                 Block::Code { language, text } => self.code_block(message, ix, language, text, cx),
@@ -895,6 +1073,9 @@ impl Pane {
         };
         let copied = self.copied.as_ref() == Some(&key);
         let (copy, text) = (key.clone(), text.to_owned());
+        // A phone: the block is the column's width and the code scrolls sideways inside it; its
+        // copy button is a thumb's 36 and the code follows the phone's run.
+        let phone = self.metrics == Metrics::PHONE;
         let mut body = div().id(("code", block)).overflow_x_scroll().px(px(12.)).pt(px(2.)).pb(px(9.));
         // The wheel over a code block still scrolls the conversation; only sideways scrolls the code.
         body.style().restrict_scroll_to_axis = Some(true);
@@ -909,7 +1090,7 @@ impl Pane {
             .overflow_hidden()
             .child(
                 div()
-                    .h(px(28.))
+                    .h(px(if phone { 36. } else { 28. }))
                     .pl(px(12.))
                     .pr(px(2.))
                     .flex()
@@ -917,8 +1098,8 @@ impl Pane {
                     .justify_between()
                     .child(div().type_micro().text_color(theme::text_faint()).child(language.to_owned()))
                     .child(
-                        tool(("copy", block), if copied { Icon::Check } else { Icon::Copy }, 24.)
-                            .tooltip(tip("Copy code", None))
+                        tool(("copy", block), if copied { Icon::Check } else { Icon::Copy }, if phone { 36. } else { 24. })
+                            .when(!phone, |copy| copy.tooltip(tip("Copy code", None)))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
                                 this.copied = Some(copy.clone());
@@ -937,7 +1118,13 @@ impl Pane {
                             })),
                     ),
             )
-            .child(body.child(div().type_code().whitespace_nowrap().child(shown)))
+            .child(body.child(
+                div()
+                    .type_code()
+                    .when(phone, |code| code.text_size(px(tokens_phone::scaled(14.))).line_height(px(tokens_phone::scaled(20.))))
+                    .whitespace_nowrap()
+                    .child(shown),
+            ))
             .children(folded.then(|| {
                 div()
                     .id(("more", block))
@@ -1046,10 +1233,11 @@ impl Pane {
     /// loads it.
     fn load_box(&self, holder: Stateful<Div>, file: &MediaFile, what: &str, bytes: u64, words: bool, cx: &mut Context<Self>) -> Stateful<Div> {
         let id = file.id.clone();
+        let tap = if crate::gui::phone::active() { "Tap to load" } else { "Click to load" };
         let line = match (words, bytes) {
             (false, _) => "Load".to_owned(),
-            (true, 0) => format!("{what} · Click to load"),
-            (true, bytes) => format!("{what} · {} · Click to load", media::size_label(bytes)),
+            (true, 0) => format!("{what} · {tap}"),
+            (true, bytes) => format!("{what} · {} · {tap}", media::size_label(bytes)),
         };
         holder
             .child(div().absolute().inset_0().flex().items_center().justify_center().type_small().text_color(theme::text_soft()).child(line))
@@ -1251,11 +1439,12 @@ impl Pane {
             _ => (meta, theme::text_faint()),
         };
         let look = attachment.clone();
+        let phone = self.metrics == Metrics::PHONE;
         let row = div()
             .id(("file", index))
             .w(px(360.))
             .max_w_full()
-            .h(px(56.))
+            .h(px(if phone { 60. } else { 56. }))
             .pl(px(10.))
             .pr(px(8.))
             .rounded(px(theme::R_FLOAT))
@@ -1285,9 +1474,36 @@ impl Pane {
                     .min_w_0()
                     .flex()
                     .flex_col()
-                    .child(div().truncate().type_ui().font_weight(theme::MEDIUM).child(attachment.name.clone()))
-                    .child(div().truncate().type_micro().font_weight(theme::REGULAR).text_color(tone).child(meta)),
+                    .child(
+                        div()
+                            .truncate()
+                            .type_ui()
+                            .when(phone, |name| name.text_size(px(tokens_phone::scaled(15.))).line_height(px(tokens_phone::scaled(20.))))
+                            .font_weight(theme::MEDIUM)
+                            .child(attachment.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .truncate()
+                            .type_micro()
+                            .when(phone, |meta| meta.text_size(px(tokens_phone::scaled(12.))).line_height(px(tokens_phone::scaled(16.))))
+                            .font_weight(theme::REGULAR)
+                            .text_color(tone)
+                            .child(meta),
+                    ),
             );
+        // A phone has no folder to show a file in: a tap opens it, and the one button downloads
+        // or opens it, at a thumb's size.
+        if phone {
+            let open = attachment.clone();
+            let which = if on_disk.is_some() { Icon::External } else { Icon::Download };
+            return row
+                .child(tool("open", which, 40.).on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.fetch_then(&open, Then::Open, cx);
+                })))
+                .into_any_element();
+        }
         let row = match on_disk {
             Some(path) => {
                 let (open, reveal) = (attachment.clone(), path);
@@ -1343,7 +1559,8 @@ impl Pane {
             .children((!card.fields.is_empty()).then(|| div().mt(px(2.)).flex().flex_wrap().gap_x(px(12.)).gap_y(px(6.)).children(card.fields.iter().map(field))))
             .children((!card.footer.is_empty()).then(|| div().mt(px(2.)).type_small().text_color(theme::text_faint()).child(card.footer.clone())));
         let framed = div()
-            .w(px(440.))
+            // The column's width on a phone, so its wrapped words measure against it (`card`).
+            .w(px(if self.metrics == Metrics::PHONE { self.media_width() } else { 440. }))
             .max_w_full()
             .rounded(px(theme::R_FLOAT))
             .bg(tokens::card())
@@ -1377,6 +1594,18 @@ impl Pane {
         // Only the first card may be large, and only for a picture wide enough to deserve it.
         let large = index == 0
             && image.is_some_and(|image| image.width >= 400 && image.width as f32 >= image.height as f32 * 1.3);
+        // A phone's card follows the phone's run: 12 / 16 / 14 over the desktop's 11 / 15 / 13.
+        let phone = self.metrics == Metrics::PHONE;
+        let sized = move |line: Div, size: f32, height: f32| match phone {
+            true => line.text_size(px(tokens_phone::scaled(size))).line_height(px(tokens_phone::scaled(height))),
+            false => line,
+        };
+        // Two lines at most. A phone holds them to two lines' height: the clamp's ellipsis is
+        // measured past a narrow card's edge, and its last line ran out of the card.
+        let clamp = move |line: Div, height: f32| match phone {
+            true => line.max_h(px(2. * tokens_phone::scaled(height))).overflow_hidden(),
+            false => line.line_clamp(2),
+        };
         let words = div()
             .flex_1()
             .min_w_0()
@@ -1384,18 +1613,20 @@ impl Pane {
             .flex_col()
             .gap(px(2.))
             .children((!preview.site.is_empty()).then(|| {
-                div().truncate().type_micro().font_weight(theme::REGULAR).text_color(theme::text_faint()).child(preview.site.clone())
+                sized(div().truncate().type_micro(), 12., 16.).font_weight(theme::REGULAR).text_color(theme::text_faint()).child(preview.site.clone())
             }))
             .children((!preview.title.is_empty()).then(|| {
-                div().line_clamp(2).type_body().font_weight(theme::SEMIBOLD).child(preview.title.clone())
+                clamp(sized(div().type_body(), 16., 22.), 22.).font_weight(theme::SEMIBOLD).child(preview.title.clone())
             }))
             .children((!preview.description.is_empty()).then(|| {
-                div().line_clamp(2).type_ui().text_color(theme::text_soft()).child(preview.description.clone())
+                clamp(sized(div().type_ui(), 14., 20.), 20.).text_color(theme::text_soft()).child(preview.description.clone())
             }));
         let url = preview.url.clone();
+        // A phone's card is exactly the column's width: wrapped words then measure against it,
+        // not against the desktop's 440, and never run past its edge.
         let card = div()
             .id(("card", index))
-            .w(px(440.))
+            .w(px(if phone { self.media_width() } else { 440. }))
             .max_w_full()
             .px(px(12.))
             .py(px(10.))
@@ -1413,7 +1644,9 @@ impl Pane {
         };
         let shown = |image, radius: f32| anim::picture(image, ObjectFit::Cover, radius, Play::Inline);
         if large {
-            let wide = self.media_width().min(416.);
+            // On a phone the card is the column's width, so the picture is what its 12 pt
+            // padding and 1 pt edges leave inside it.
+            let wide = if self.metrics == Metrics::PHONE { self.media_width() - 26. } else { self.media_width().min(416.) };
             let tall = (wide * image.height as f32 / image.width.max(1) as f32).round().min(210.);
             let edge = media::decode_edge((image.width, image.height), wide, tall, Fit::Cover, scale);
             if self.held_back(&image) {
@@ -1448,12 +1681,16 @@ impl Pane {
         }
         let edge = media::square_size(18., window.scale_factor());
         let acts = self.can(message).act;
+        // A phone's chip is a thumb's target: 32 tall, its glyph and count a step larger.
+        let phone = self.metrics == Metrics::PHONE;
         let chip = |id: ElementId, mine: bool| {
             let chip = div()
                 .id(id)
                 .flex_none()
-                .h(px(26.))
-                .px(px(8.))
+                .h(px(if phone { 32. } else { 26. }))
+                .min_w(px(if phone { 48. } else { 0. }))
+                .px(px(if phone { 10. } else { 8. }))
+                .justify_center()
                 .rounded_full()
                 .border_1()
                 .flex()
@@ -1466,7 +1703,7 @@ impl Pane {
                 chip.bg(theme::raised()).border_color(gpui::transparent_black()).hover(|style| style.border_color(tokens::border_strong()))
             }
         };
-        let mut row = div().mt(px(6.)).mb(px(3.)).flex().flex_wrap().gap(px(6.));
+        let mut row = div().mt(px(6.)).mb(px(3.)).flex().flex_wrap().gap(px(if phone { 8. } else { 6. }));
         for (ix, reaction) in message.reactions.iter().take(CHIPS).enumerate() {
             let picture = match &reaction.file {
                 Some(file) => match self.still(file, edge, edge, None, cx) {
@@ -1477,10 +1714,12 @@ impl Pane {
             };
             // A custom emoji is its name until its image is here.
             let emoji = picture.unwrap_or_else(|| {
-                div().text_size(px(15.)).line_height(px(20.)).child(emoji::display(&reaction.emoji)).into_any_element()
+                let (size, line) = if phone { (17., 22.) } else { (15., 20.) };
+                div().text_size(px(size)).line_height(px(line)).child(emoji::display(&reaction.emoji)).into_any_element()
             });
             let count = div()
                 .type_small()
+                .when(phone, |count| count.text_size(px(tokens_phone::scaled(14.))).line_height(px(tokens_phone::scaled(18.))))
                 .font_weight(theme::MEDIUM)
                 .text_color(if reaction.mine { theme::accent_text() } else { theme::text_soft() })
                 .child(reaction.count.to_string());
@@ -1500,7 +1739,7 @@ impl Pane {
                 chip(("chip", ix).into(), reaction.mine)
                     .child(emoji)
                     .child(count)
-                    .when(acts, |chip| chip.tooltip(tip(words, None)))
+                    .when(acts && !phone, |chip| chip.tooltip(tip(words, None)))
                     .when(joins, |chip| chip.on_click(cx.listener(move |this, _, _, cx| this.react(&id, &toggled, on, cx))))
                     .when(!joins, |chip| chip.cursor_default()),
             );
@@ -1510,15 +1749,19 @@ impl Pane {
             row = row.child(chip("chips-more".into(), false).type_small().text_color(theme::text_soft()).child(format!("+{hidden}")));
         }
         // Always laid out and shown on hover only, so hovering a row never changes its height.
-        // Where nothing more may be added it stays laid out and never shows.
+        // Where nothing more may be added it stays laid out and never shows. A phone has no
+        // hover: there it is always shown where a reaction may be added, and absent where not.
         let id = message.id.clone();
         let adds = acts && self.adds(message);
+        if phone && !adds {
+            return Some(row.into_any_element());
+        }
         let add = chip("chip-add".into(), false)
-            .opacity(0.)
-            .when(adds, |chip| chip.group_hover("row", |style| style.opacity(1.)))
-            .child(icon(Icon::SmilePlus, 16., theme::text_soft()))
+            .when(!phone, |chip| chip.opacity(0.))
+            .when(adds && !phone, |chip| chip.group_hover("row", |style| style.opacity(1.)))
+            .child(icon(Icon::SmilePlus, if phone { 18. } else { 16. }, theme::text_soft()))
             .when(adds, |chip| {
-                chip.tooltip(tip("Add reaction", None)).on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                chip.when(!phone, |chip| chip.tooltip(tip("Add reaction", None))).on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
                     this.open_picker(&id, event.position(), window, cx);
                 }))
             });

@@ -9,7 +9,7 @@ use crate::audio::Speaker;
 use crate::decode::Source;
 use crate::stretch::Stretch;
 use crate::{CHANNELS, RATE};
-use protocol::{read_frame, write_frame, PlayerEvent, PlayerRequest, RATES};
+use protocol::{read_frame, PlayerEvent, PlayerRequest, RATES};
 use std::io::{self, ErrorKind};
 use std::path::Path;
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError};
@@ -21,24 +21,23 @@ const AHEAD: Duration = Duration::from_millis(250);
 /// How often the speaker is looked at while it holds enough.
 const NAP: Duration = Duration::from_millis(20);
 
+/// One event to chatd. A closed pipe is chatd gone, and with it whoever wanted to hear this:
+/// `out::write` exits.
 fn send(event: &PlayerEvent) {
-    if write_frame(io::stdout().lock(), event).is_err() {
-        // chatd is gone, and with it whoever wanted to hear this.
-        std::process::exit(0);
-    }
+    crate::out::write(event);
 }
 
 fn fail(detail: impl Into<String>) -> ! {
     send(&PlayerEvent::Failed { detail: detail.into() });
-    std::process::exit(2);
+    crate::out::exit(2);
 }
 
 /// chatd's requests, read on their own thread so the loop never blocks on stdin. `None` is
 /// stdin closing.
 fn requests() -> Receiver<Option<PlayerRequest>> {
     let (tell, told) = channel();
-    let _ = std::thread::Builder::new().name("requests".to_owned()).spawn(move || {
-        let mut stdin = io::stdin().lock();
+    let _ = crate::out::spawn(std::thread::Builder::new().name("requests".to_owned()), move || {
+        let mut stdin = crate::out::stdin();
         loop {
             match read_frame::<PlayerRequest>(&mut stdin) {
                 Ok(request) => {

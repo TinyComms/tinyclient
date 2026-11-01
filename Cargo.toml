@@ -30,6 +30,18 @@ getrandom = "0.3"
 [profile.dev.package."*"]
 opt-level = 2
 
+# `wgpu::InstanceFlags::default()` (what gpui_ce_wgpu asks for) turns on the Vulkan debug-utils and
+# validation layers when wgpu-types is built with debug_assertions. On the Android emulator's
+# Vulkan driver that segfaults in `vk_common_SetDebugUtilsObjectNameEXT` on the first labelled
+# object, so a debug APK died before its first frame. The flag is read in wgpu-types; wgpu-hal is
+# turned off with it so the Vulkan backend never takes the debug-utils path on its own. Desktop
+# debug builds lose wgpu's validation with this, which they never relied on.
+[profile.dev.package.wgpu-types]
+debug-assertions = false
+
+[profile.dev.package.wgpu-hal]
+debug-assertions = false
+
 # chatd's optional `signal` feature pins libsignal v0.94, which builds only against Signal's fork of
 # curve25519-dalek; a patch here is the only way a git dependency gets it. The fork is upstream
 # 4.1.3 with a `lizard` module added and `field` made public (compared 2026-10-14), so mediad's
@@ -37,4 +49,15 @@ opt-level = 2
 # It can go when presage can move past libsignal v0.97: that waits on davey, whose MLS stack
 # pins hax-lib 0.3.6 where libsignal v0.98 wants 0.3.7.
 [patch.crates-io]
+# gpui_ce_wgpu 0.3.0 with one fix (vendor/gpui_ce_wgpu, `WgpuRenderer::destroy`, marked "tinyclient
+# patch"): it dropped the GPU resources but left the surface marked configured, so the next frame
+# after an Android app went to the background panicked ("GPU resources not available") and the
+# process aborted. Drop this when a gpui_ce_wgpu release resets `configured` in `destroy`.
+gpui_ce_wgpu = { path = "vendor/gpui_ce_wgpu" }
+# gpui_ce_ios 0.3.0 with one fix (vendor/gpui_ce_ios, src/ios/text_input.rs, marked "tinyclient
+# patch"): UIKit (the keyboard, and accessibility clients such as the XCTest runner) sends
+# `textInRange:` and its siblings a nil range or position, which objc2 turned into a panic across
+# the Objective-C boundary and an abort at launch. The parameters are optional now and nil is "no
+# range". Drop this when a gpui_ce_ios release takes nil there.
+gpui_ce_ios = { path = "vendor/gpui_ce_ios" }
 curve25519-dalek = { git = "https://github.com/signalapp/curve25519-dalek", tag = "signal-curve25519-4.1.3" }

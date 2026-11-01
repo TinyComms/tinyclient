@@ -1,0 +1,234 @@
+name: Mobile
+
+# The desktop workflow (ci.yml) already builds and tests the host. This one proves the two
+# things it cannot: that the crate still compiles for the phones, and that the native shells
+# package. Nothing here is signed or uploaded to a store.
+#
+# Versions are the ones checked against vendor docs on 2026-10-31
+# (research_notes/mobile/build-ci-release.md, rust-core-native-shells.md):
+#   NDK r30 LTS 30.0.16248370 · cargo-ndk 4.1.2 · AGP 9.5.0 · Gradle 9.6 · JDK 17+
+#   macos-26 (Xcode 26.6) until the April 2027 iOS 27 SDK mandate.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/tinyclient/**"
+      - "crates/protocol/**"
+      - "mobile/**"
+      - "scripts/mobile/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/mobile.yml"
+  pull_request:
+    paths:
+      - "crates/tinyclient/**"
+      - "crates/protocol/**"
+      - "mobile/**"
+      - "scripts/mobile/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/mobile.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: mobile-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NDK_VERSION: "4.1.2"
+  NDK_VERSION: "30.0.16248370"
+  GRADLE_VERSION: "9.6.0"
+
+jobs:
+  # The cheap one: does `mobile` break the desktop build? This is the check that catches a
+  # feature-graph mistake before either expensive job runs.
+  host-check:
+    name: host check (gui + mobile)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: mobile-host
+      - name: Window
+        run: cargo check -p tinyclient --features gui
+      - name: Window with the mobile feature enabled
+        # The cfg(target_os = "ios"|"android") arms are not type-checked on this host; this
+        # proves the feature does not disturb the desktop arms.
+        run: cargo check -p tinyclient --features "gui mobile"
+
+  android-libs:
+    name: android libs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust
+          shared-key: mobile-android
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # The action's default list asks for `tools`, which the SDK no longer carries, and fails.
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+
+      - name: NDK r30
+        run: |
+          sdkmanager --install "ndk;$NDK_VERSION" >/dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+
+      - name: cargo-ndk
+        run: cargo install cargo-ndk --version "$CARGO_NDK_VERSION" --locked
+
+      - name: Build the Rust library
+        env:
+          # chatd runs in the app, and its build script refuses a release without these.
+          TINYCLIENT_TELEGRAM_API_ID: ${{ secrets.TINYCLIENT_TELEGRAM_API_ID }}
+          TINYCLIENT_TELEGRAM_API_HASH: ${{ secrets.TINYCLIENT_TELEGRAM_API_HASH }}
+        # Output is the layout AGP packages automatically: jniLibs/<abi>/libtinyclient.so.
+        # `--platform 29` matches minSdk: below it the NDK has no libnativewindow to link.
+        run: |
+          cargo ndk -t arm64-v8a -t x86_64 --platform 29 \
+            -o mobile/android/app/src/main/jniLibs \
+            build --release -p tinyclient --lib --features mobile
+
+      - name: 16 KB page check
+        # Play blocks updates without 16 KB support from 2027-02-01, and a misaligned ELF
+        # segfaults at load on a 16 KB device while looking perfect on 4 KB test hardware.
+        # Every PT_LOAD alignment must be 0x4000, not 0x1000.
+        run: |
+          readelf="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+          so=mobile/android/app/src/main/jniLibs/arm64-v8a/libtinyclient.so
+          "$readelf" -lW "$so" | awk '/LOAD/ { print $NF }' | tee /tmp/align.txt
+          if grep -qv '^0x4000$' /tmp/align.txt; then
+            echo "::error::$so has a PT_LOAD segment that is not 16 KB aligned"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: android-jniLibs
+          path: mobile/android/app/src/main/jniLibs
+          if-no-files-found: error
+
+  android-app:
+    name: android app (assembleDebug)
+    needs: android-libs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      # The wrapper jar is not committed, so CI supplies Gradle itself.
+      - uses: gradle/actions/setup-gradle@v5
+        with:
+          gradle-version: ${{ env.GRADLE_VERSION }}
+
+      - uses: actions/download-artifact@v6
+        with:
+          name: android-jniLibs
+          path: mobile/android/app/src/main/jniLibs
+
+      - name: assembleDebug
+        working-directory: mobile/android
+        run: gradle :app:assembleDebug --console=plain
+
+      - name: APK alignment
+        run: |
+          apk=mobile/android/app/build/outputs/apk/debug/app-debug.apk
+          test -f "$apk"
+          zipalign="$(ls "$ANDROID_HOME"/build-tools/*/zipalign | sort -V | tail -n 1)"
+          "$zipalign" -c -P 16 4 "$apk"
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: tinyclient-android-debug
+          path: mobile/android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+
+  ios-libs:
+    name: ios libs (xcframework)
+    # Xcode is macOS-only. macos-26 carries Xcode 26.6 / iOS 26.5 SDK, which satisfies the
+    # current mandate; move to the xcode-27 preview image before April 2027.
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust
+          shared-key: mobile-ios
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build device + simulator and make the xcframework
+        env:
+          # chatd runs in the app, and its build script refuses a release without these.
+          TINYCLIENT_TELEGRAM_API_ID: ${{ secrets.TINYCLIENT_TELEGRAM_API_ID }}
+          TINYCLIENT_TELEGRAM_API_HASH: ${{ secrets.TINYCLIENT_TELEGRAM_API_HASH }}
+        run: |
+          chmod +x scripts/mobile/build-ios.sh
+          scripts/mobile/build-ios.sh
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: TinyCore.xcframework
+          path: mobile/ios/TinyCore.xcframework
+          if-no-files-found: error
+
+  ios-app:
+    name: ios app (unsigned archive)
+    needs: ios-libs
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v6
+        with:
+          name: TinyCore.xcframework
+          path: mobile/ios/TinyCore.xcframework
+
+      - name: XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate the project
+        working-directory: mobile/ios
+        run: xcodegen generate
+
+      - name: Archive without signing
+        # Signing needs an Apple Developer Program team and certificates; this job only proves
+        # the project, plist and library link. `-allowProvisioningUpdates` belongs in the
+        # release workflow, with an App Store Connect API key.
+        working-directory: mobile/ios
+        run: |
+          xcodebuild \
+            -project Tiny.xcodeproj \
+            -scheme Tiny \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/Tiny.xcarchive \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            archive
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: tinyclient-ios-unsigned
+          path: mobile/ios/build/Tiny.xcarchive/Products/Applications/Tiny.app
+          if-no-files-found: error

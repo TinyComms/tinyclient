@@ -8,22 +8,28 @@ mod anim;
 mod app;
 mod attention;
 mod assets;
-mod call;
+// `pub(crate)` so the mobile layer can reach the call's platform hooks (`call::phone::hooks`).
+pub(crate) mod call;
 mod chrome;
 mod components;
 mod composer;
 mod conversation;
+#[cfg(debug_assertions)]
+pub(crate) mod debug_launch;
 mod hotkeys;
 mod input;
 mod layout;
 mod pane;
 mod people;
+mod phone;
 mod playing;
 mod rail;
 mod settings;
 mod sidebar;
 mod signin;
 mod shortcuts;
+#[cfg(any(feature = "gui-shot", feature = "demo"))]
+pub(crate) mod shot_demo;
 mod state;
 mod theme;
 mod tiny;
@@ -106,7 +112,12 @@ impl Shell {
         root.track_focus(&self.focus)
             .key_context("Shell")
             .on_action(cx.listener(|this, _: &Switcher, window, cx| this.open_switcher("", window, cx)))
-            .on_action(cx.listener(|this, _: &Back, _, cx| this.travel(true, cx)))
+            .on_action(cx.listener(|this, _: &Back, window, cx| {
+                // On a phone back pops one pushed page; at the home it is the platform's.
+                if !this.phone_back(Some(window), cx) {
+                    this.travel(true, cx);
+                }
+            }))
             .on_action(cx.listener(|this, _: &Forward, _, cx| this.travel(false, cx)))
             .on_action(cx.listener(|this, _: &UpLevel, _, cx| this.up_level(cx)))
             .on_action(cx.listener(|this, _: &ToggleSidebar, window, cx| this.toggle_sidebar(window, cx)))
@@ -212,6 +223,8 @@ fn shell_bindings() -> Vec<KeyBinding> {
 /// `--cursor N`, `--switcher [letters]`, `--menu add|own|network|space|row`, `--float`,
 /// `--hide-sidebar`, `--right thread|members`, `--pin N`, `--toast`, `--components`,
 /// `--walk N` (N presses of the unread walk), `--back N` (N steps back in history),
+/// `--right details|member-list` (the strip's own buttons, as tapped), `--menu account` (the
+/// rail avatar's menu; a phone's account sheet), `--text-scale N` (the phone's type, 2 for a 200% run),
 /// `--sign-in-failed closed|unreachable|blocked` (first launch, with nothing signed in),
 /// `--state starting|keychain|denied|reconnecting|failed` (a window state, forced),
 /// `--crash-toast` (the toast after a crash relaunch), `--menu row-right|row-bottom` (the row
@@ -224,6 +237,19 @@ fn shell_bindings() -> Vec<KeyBinding> {
 /// Move submenu), `--tiny-modal invite|code|kick|ban|profile`, `--tiny-settings`, `--tiny-card N`
 /// (the Nth member's hover card), `--tiny-setup first|custom|refused|nopasskeys|privacy|change|member` (first-run
 /// setup, or Server Settings › Privacy, over a made-up outline).
+///
+/// `--demo` draws made-up data instead of live data: a fake chatd answers every request
+/// (`shot_demo`), chatd is never started or asked, and nobody's real chats are read.
+/// `--demo-empty` is the same with nothing signed in (first run). With either:
+/// `--compose WORDS` (the open
+/// conversation's composer, typed). Other states come from the views' own shot hooks:
+/// `TINYCLIENT_SHOT_HOVER=<message id>` (the message toolbar, as a long press shows it),
+/// `TINYCLIENT_SHOT_MENU=<message id>`, `TINYCLIENT_SHOT_AT=<message id>` (`m01`…`m25` in the
+/// demo's "Foray carpool"), `TINYCLIENT_S6=d-card` (the open conversation's person card),
+/// `TINYCLIENT_SHOT_CALL=joined` (the call dock, desktop only), `TINYCLIENT_SIGNIN_SHOT=phone`
+/// (the sign-in sheet), and `--settings <section> --settings-shot out.png` with
+/// `--settings-size WxH` (the Settings window at that size). `scripts/mobile/phone-shots.ps1`
+/// renders all of them.
 #[cfg(feature = "gui-shot")]
 mod shot {
     use super::layout::{Menu, RightKind, RightPane};
@@ -281,6 +307,9 @@ mod shot {
                     Some("mentions") => shell.set_filter(InboxFilter::Mentions, cx),
                     _ => {}
                 }
+                if let Some(scale) = flag("--text-scale").and_then(|n| n.parse::<f32>().ok()) {
+                    super::phone::tokens::set_text_scale(scale);
+                }
             }
             1 => {
                 let row = if has("--open-first") { Some(0) } else { flag("--open").and_then(|n| n.parse::<usize>().ok()) };
@@ -304,13 +333,16 @@ mod shot {
                 }
                 match flag("--right").as_deref() {
                     Some("info") => shell.toggle_info(cx),
-                    Some("members") => shell.open_right(RightPane { kind: RightKind::Members, title: "Members".into(), count: Some(128), body: demo_pane }, cx),
+                    // The strip's own buttons, as a tap on them does.
+                    Some("details") => shell.toggle_details(cx),
+                    Some("member-list") => shell.toggle_member_list(cx),
+                    Some("members") =>shell.open_right(RightPane { kind: RightKind::Members, title: "Members".into(), count: Some(128), body: demo_pane }, cx),
                     Some(_) => shell.open_right(RightPane { kind: RightKind::Thread, title: "Thread".into(), count: Some(6), body: demo_pane }, cx),
                     None => {}
                 }
                 match flag("--menu").as_deref() {
                     Some("add") => shell.open_menu(Menu::Add, cx),
-                    Some("own") => shell.open_menu(Menu::Own, cx),
+                    Some("own" | "account") => shell.open_menu(Menu::Own, cx),
                     Some("network") => shell.open_menu(Menu::Network(shell.sidebar_state.mode.network().unwrap_or(Network::Discord)), cx),
                     Some("space") => {
                         if let Mode::Space(space) = shell.sidebar_state.mode.clone() {
@@ -364,6 +396,9 @@ mod shot {
                 }
                 if has("--components") {
                     shell.sheet = true;
+                }
+                if let Some(words) = flag("--compose") {
+                    shell.composer_type(&words, window, cx);
                 }
                 shell.tiny_shot(flag, window, cx);
                 cx.notify();
@@ -563,6 +598,11 @@ mod shot {
                 let _ = window.update(cx, |shell, _, cx| shell.travel(true, cx));
                 cx.background_executor().timer(settle).await;
             }
+            // `--settle 4000` waits that long more before the picture: for steps that take time
+            // (`TINYCLIENT_SHOT_STEPS`), such as the demo's call ringing and connecting.
+            if let Some(ms) = flag("--settle").and_then(|n| n.parse::<u64>().ok()) {
+                cx.background_executor().timer(Duration::from_millis(ms)).await;
+            }
             let frames = flag("--frames").and_then(|n| n.parse::<usize>().ok()).unwrap_or(1).max(1);
             if frames > 1 {
                 super::anim::SHOT_FRAMES.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -587,6 +627,16 @@ mod shot {
                 tracing::warn!("tinyclient: holding, pid {}", std::process::id());
                 cx.background_executor().timer(Duration::from_secs(seconds)).await;
             }
+            // The windows go first. A focused field is registered with its window as the
+            // platform's input handler, which holds the field: quitting with the window still up
+            // left that handle alive past the app, and the test platform's leak check panicked
+            // (exit 101) after the image was written.
+            cx.update(|cx| {
+                for handle in cx.windows() {
+                    let _ = handle.update(cx, |_, window, _| window.remove_window());
+                }
+            });
+            cx.background_executor().timer(Duration::from_millis(50)).await;
             cx.update(|cx| cx.quit());
         })
         .detach();
@@ -637,7 +687,52 @@ fn window_bounds(saved: Option<(f32, f32, f32, f32)>, cx: &App) -> Bounds<gpui::
     bounds
 }
 
+/// Whether chatd can run beside the window. True on desktop, where the shell starts and asks
+/// it. On phones it is true only in the `mobile` build, which runs the core in the app
+/// (`lib.rs`, `inprocess`). Without it the shell runs with no service, which reads as zero
+/// signed-in accounts (`app::watch`).
+pub(crate) fn mobile_core_available() -> bool {
+    !cfg!(any(target_os = "android", target_os = "ios")) || cfg!(feature = "mobile")
+}
+
+/// Whether links and files open through GPUI (`cx.open_url`) rather than a desktop helper such
+/// as `xdg-open`. True on phones, where those helpers do not exist.
+pub(crate) fn links_through_gpui() -> bool {
+    cfg!(any(target_os = "android", target_os = "ios"))
+}
+
+/// Feeds the platform's safe area (status bar, cutout, home indicator or navigation bar) and the
+/// soft keyboard into the phone's tokens. GPUI refreshes the window whenever the platform reports
+/// new insets, and the shell calls this on every frame, so each change reaches the next draw. All
+/// zero means the platform has not reported yet, and the tokens keep their stand-ins.
+pub(crate) fn feed_platform_insets(window: &gpui::Window) {
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    {
+        let insets = window.insets();
+        if insets != gpui::WindowInsets::default() {
+            phone::tokens::set_insets(phone::tokens::Insets {
+                top: f32::from(insets.safe_area.top),
+                bottom: f32::from(insets.safe_area.bottom),
+                keyboard: f32::from(insets.ime.bottom),
+                left: f32::from(insets.safe_area.left),
+                right: f32::from(insets.safe_area.right),
+            });
+        }
+    }
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    let _ = window;
+}
+
+/// Opens the window. `invite` is a `tinyclient://join#…` link the launch carried; `incoming`
+/// delivers the links a second launch hands this one.
 pub fn run(invite: Option<String>, incoming: Option<std::sync::mpsc::Receiver<String>>) {
+    run_with(gpui_platform::application(), invite, incoming);
+}
+
+/// Runs the window on an application the caller built. Android builds its own (see
+/// `android_main`): `gpui_platform::application()` there has no NativeActivity session, so
+/// GPUI would open the window before the surface exists.
+pub(crate) fn run_with(application: gpui::Application, invite: Option<String>, incoming: Option<std::sync::mpsc::Receiver<String>>) {
     #[cfg(feature = "gui-shot")]
     LAUNCHED.get_or_init(std::time::Instant::now);
     app::crash::install();
@@ -646,10 +741,13 @@ pub fn run(invite: Option<String>, incoming: Option<std::sync::mpsc::Receiver<St
     time::read_clock_preference();
     // Read before the window opens, so its first frame draws where the user was.
     let prefs = app::prefs::read();
+    // A demo shot draws only made-up data: nothing the user last had open is restored.
+    #[cfg(any(feature = "gui-shot", feature = "demo"))]
+    let prefs = if shot_demo::on() { app::prefs::Prefs::default() } else { prefs };
     theme::set_text_step(prefs.text_step);
     app::prefs::set_choices(prefs.choices);
     anim::set_autoplay(prefs.autoplay);
-    let application = gpui_platform::application().with_assets(assets::Assets);
+    let application = application.with_assets(assets::Assets);
     // macOS delivers both launch and subsequent links as open-URL events. Keep them in
     // memory until the current sign-in sheet closes; never discard an active flow.
     let links = std::rc::Rc::new(std::cell::RefCell::new(std::collections::VecDeque::<String>::new()));
@@ -676,7 +774,10 @@ pub fn run(invite: Option<String>, incoming: Option<std::sync::mpsc::Receiver<St
 
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(window_bounds(prefs.frame, cx))),
-                window_min_size: Some(size(px(layout::WINDOW_MIN.0), px(layout::WINDOW_MIN.1))),
+                // A phone window asks for no minimum: folded and split-screen windows must be
+                // allowed to be smaller than the frame we chose.
+                window_min_size: (!layout::phone(window_size().0) && !phone::form(false, window_size().0, window_size().1))
+                    .then_some(size(px(layout::WINDOW_MIN.0), px(layout::WINDOW_MIN.1))),
                 titlebar: Some(TitlebarOptions {
                     title: Some("tinyclient".into()),
                     appears_transparent: true,
@@ -704,7 +805,11 @@ pub fn run(invite: Option<String>, incoming: Option<std::sync::mpsc::Receiver<St
                 Ok(window) => window,
                 Err(err) => {
                     // No window (no GPU, a headless session): say so and leave, never panic.
+                    // Nothing can be drawn without a window, so the record is the only report.
                     tracing::warn!("tinyclient: the window could not open: {err}");
+                    // On Android the `log` records are what reach logcat (`lib.rs`, `android_log`).
+                    #[cfg(target_os = "android")]
+                    log::error!("tinyclient: the window could not open: {err}");
                     cx.quit();
                     return;
                 }

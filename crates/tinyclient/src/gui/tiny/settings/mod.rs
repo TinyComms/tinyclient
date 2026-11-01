@@ -515,21 +515,7 @@ impl Shell {
                     .child(div().type_ui().text_color(if danger { theme::danger() } else if on { theme::text() } else { theme::text_soft() }).child(page.label())),
             );
         }
-        let body = match shown {
-            Page::Overview => overview::overview(self, facts, window, cx),
-            Page::Roles => roles::roles(self, facts, window, cx),
-            Page::Members => members::members(self, facts, window, cx),
-            Page::Bots => bots::bots(self, facts, window, cx),
-            Page::Invites => invites::invites(self, facts, window, cx),
-            Page::Bans => bans::bans(self, facts, window, cx),
-            Page::Channels => channels::channels(self, facts, window, cx),
-            Page::Voice => voice::voice(self, facts, window, cx),
-            Page::Audit => audit::audit(self, facts, window, cx),
-            Page::Privacy => privacy::privacy(self, facts, window, cx),
-            Page::SignIn => signin::signin(self, facts, window, cx),
-            Page::Encryption => encryption::encryption(self, facts, window, cx),
-            Page::Danger => danger::danger(self, facts, window, cx),
-        };
+        let body = self.tiny_settings_body(shown, facts, window, cx);
         let dirty = self.tiny_settings_dirty(cx);
         let close = div()
             .id("tiny-settings-close")
@@ -589,7 +575,93 @@ impl Shell {
             .child(content)
             .into_any_element()
     }
-}
+
+    /// One page's body, as the desktop overlay and the phone's pushed page both show it.
+    fn tiny_settings_body(&self, shown: Page, facts: &Facts, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        match shown {
+            Page::Overview => overview::overview(self, facts, window, cx),
+            Page::Roles => roles::roles(self, facts, window, cx),
+            Page::Members => members::members(self, facts, window, cx),
+            Page::Bots => bots::bots(self, facts, window, cx),
+            Page::Invites => invites::invites(self, facts, window, cx),
+            Page::Bans => bans::bans(self, facts, window, cx),
+            Page::Channels => channels::channels(self, facts, window, cx),
+            Page::Voice => voice::voice(self, facts, window, cx),
+            Page::Audit => audit::audit(self, facts, window, cx),
+            Page::Privacy => privacy::privacy(self, facts, window, cx),
+            Page::SignIn => signin::signin(self, facts, window, cx),
+            Page::Encryption => encryption::encryption(self, facts, window, cx),
+            Page::Danger => danger::danger(self, facts, window, cx),
+        }
+    }
+
+    /// Server Settings on a phone: the page that was opened (Encryption from a conversation's
+    /// strip, where the safety numbers are), pushed full-screen as the phone's other pages are.
+    /// Back where the desktop has its column of pages and its close button; the unsaved-changes
+    /// bar over the home indicator. None when no page is open.
+    pub(in crate::gui) fn tiny_settings_phone_page(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        use crate::gui::phone::tokens::{self, PhoneType};
+        let overlay = self.tiny_state.settings.as_ref()?;
+        let facts = self.tiny_page_facts()?;
+        let shown = if overlay.page.visible(&facts) { overlay.page } else { Page::Overview };
+        let body = self.tiny_settings_body(shown, &facts, window, cx);
+        let dirty = self.tiny_settings_dirty(cx);
+        let strip = div()
+            .flex_none()
+            .h(px(tokens::NAV))
+            .pl(px(4.))
+            .pr(px(tokens::GUTTER))
+            .flex()
+            .items_center()
+            .gap(px(4.))
+            .border_b_1()
+            .border_color(theme::hairline())
+            .child(
+                crate::gui::components::icon_button("phone-tiny-settings-back", "icons/chevron-left.svg", false)
+                    .size(px(tokens::TOUCH))
+                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(|this, _, _, cx| this.tiny_close_settings(cx))),
+            )
+            .child(div().flex_1().min_w_0().truncate().phone_title().child(shown.label()));
+        let page = div()
+            .id("phone-tiny-settings")
+            .relative()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(theme::canvas())
+            .text_color(theme::text())
+            .child(div().flex_none().w_full().h(px(tokens::safe_top())))
+            .child(strip)
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .child(
+                        div()
+                            .id("phone-tiny-settings-scroll")
+                            .size_full()
+                            .overflow_y_scroll()
+                            .track_scroll(&overlay.scroll)
+                            .child(div().w_full().px(px(tokens::GUTTER)).pt(px(16.)).pb(px(96. + tokens::safe_bottom())).child(body)),
+                    ),
+            )
+            .when(dirty || overlay.error.is_some(), |page| {
+                page.child(
+                    div()
+                        .absolute()
+                        .bottom(px(12. + tokens::safe_bottom()))
+                        .left(px(tokens::GUTTER))
+                        .right(px(tokens::GUTTER))
+                        .flex()
+                        .child(unsaved_bar(overlay.saving, overlay.error.clone(), cx)),
+                )
+            })
+            .child(div().flex_none().h(px(tokens::safe_bottom())))
+            // The back swipe from the left edge, as every pushed page has.
+            .child(self.phone_edge(cx));
+        Some(page.into_any_element())
+    }}
 
 #[cfg(test)]
 mod tests {

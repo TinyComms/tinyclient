@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- chatd keeps each network's session in the keychain (crates/chatd session::account). An app
+	     without a keychain access group gets errSecMissingEntitlement, which the window shows as
+	     "tinyclient can't read its sign-ins". With no team (simulator, ad-hoc) the prefix is empty. -->
+	<key>keychain-access-groups</key>
+	<array>
+		<string>$(AppIdentifierPrefix)$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	</array>
+</dict>
+</plist>

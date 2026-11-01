@@ -5,8 +5,9 @@
 use super::rich::Inline;
 use super::tokens;
 use crate::gui::theme;
+use palette::IntoColor;
 use gpui::{
-    fill, font, point, prelude::*, px, quad, size, App, BorderStyle, Bounds, CursorStyle,
+    fill, font, point, prelude::*, px, quad, size, App, BorderStyle, Bounds, CaretPosition, CursorStyle,
     DispatchPhase, ElementId, FontStyle, FontWeight, GlobalElementId, Hitbox, HitboxBehavior, Hsla,
     InspectorElementId, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
     RenderImage, StrikethroughStyle, StyledText, TextLayout, TextRun, UnderlineStyle, Window,
@@ -101,16 +102,16 @@ impl Rich {
                 face.style = FontStyle::Italic;
             }
             if run.strike || run.emoji.is_some() {
-                color = theme::text_soft().into();
+                color = theme::text_soft().into_color();
             }
             if run.mark {
-                color = theme::text_faint().into();
+                color = theme::text_faint().into_color();
             }
             if run.code {
-                boxes.push((range.clone(), tokens::code_inline().into()));
+                boxes.push((range.clone(), tokens::code_inline().into_color()));
             }
             if run.link.is_some() {
-                color = tokens::link().into();
+                color = tokens::link().into_color();
                 underline |= look.hovered == Some(ix);
                 hot.push((range.clone(), ix));
             }
@@ -121,19 +122,19 @@ impl Rich {
                     MentionKind::Channel => false,
                 };
                 face.weight = FontWeight::MEDIUM;
-                color = if mine { gpui::white() } else { tokens::link().into() };
-                let fill: Hsla = if mine { tokens::mention_me().into() } else { theme::accent_soft().into() };
+                color = if mine { gpui::white() } else { tokens::link().into_color() };
+                let fill: Hsla = if mine { tokens::mention_me().into_color() } else { theme::accent_soft().into_color() };
                 boxes.push((range.clone(), fill));
                 hot.push((range.clone(), ix));
             }
             if let Some(spoiler) = run.spoiler {
                 if (look.revealed)(spoiler) {
-                    boxes.push((range.clone(), tokens::code_inline().into()));
+                    boxes.push((range.clone(), tokens::code_inline().into_color()));
                 } else {
                     // Hidden text is painted in the color of its cover, so nothing shows through.
-                    color = tokens::spoiler().into();
+                    color = tokens::spoiler().into_color();
                     underline = false;
-                    boxes.push((range.clone(), tokens::spoiler().into()));
+                    boxes.push((range.clone(), tokens::spoiler().into_color()));
                     hot.retain(|(_, run)| *run != ix);
                     hot.push((range.clone(), ix));
                 }
@@ -155,6 +156,7 @@ impl Rich {
                     thickness: px(1.),
                     color: Some(color),
                 }),
+                letter_spacing: None,
             });
         }
         let shown: gpui::SharedString = inline.text.clone().into();
@@ -193,20 +195,18 @@ fn parts(layout: &TextLayout, range: &Range<usize>) -> Vec<(Range<usize>, Bounds
     let mut line_start = 0;
     let mut y = origin.y;
     for line in layout.line_layouts() {
-        let unwrapped = &line.unwrapped_layout;
-        // A boundary names the glyph that starts the next visual line.
-        let breaks = line.wrap_boundaries().iter().map(|at| line.runs()[at.run_ix].glyphs[at.glyph_ix].index);
-        let mut row_start = 0;
-        for row_end in breaks.chain([line.len()]) {
-            let start = range.start.max(line_start + row_start);
-            let end = range.end.min(line_start + row_end);
+        // Each visual line is one row; a soft wrap starts the next row at its first byte.
+        for row in line.visual_lines() {
+            let start = range.start.max(line_start + row.text_range.start);
+            let end = range.end.min(line_start + row.text_range.end);
             if start < end {
-                let row_x = unwrapped.x_for_index(row_start);
-                let left = unwrapped.x_for_index(start - line_start) - row_x;
-                let right = unwrapped.x_for_index(end - line_start) - row_x;
+                // Positions are measured within the visual line, so a row starts at 0. The right
+                // edge stays on this row: at a soft wrap the caret is placed before the break.
+                let x_at = |caret: CaretPosition| line.visual_position_for_caret(caret, line_height).map_or(px(0.), |at| at.x);
+                let left = x_at(CaretPosition::attached_to_next_cluster(start - line_start));
+                let right = x_at(CaretPosition::attached_to_previous_cluster(end - line_start));
                 found.push((start..end, Bounds::new(point(origin.x + left, y), size(right - left, line_height))));
             }
-            row_start = row_end;
             y += line_height;
         }
         line_start += line.len() + 1;
@@ -251,9 +251,9 @@ impl Glue {
         let mut line_start = 0;
         let mut found = Vec::new();
         for line in layout.line_layouts() {
-            for at in line.wrap_boundaries() {
-                let at = line_start + line.runs()[at.run_ix].glyphs[at.glyph_ix].index;
-                found.extend(orphan_break(shown, at));
+            // Every visual line after the first starts with a soft-wrap break.
+            for row in line.visual_lines().iter().skip(1) {
+                found.extend(orphan_break(shown, line_start + row.text_range.start));
             }
             line_start += line.len() + 1;
         }
@@ -372,7 +372,7 @@ impl Element for Rich {
         }
         if let Some(selection) = &self.selection {
             for part in segments(&layout, selection) {
-                window.paint_quad(fill(part, tokens::selection()));
+                window.paint_quad(fill(part, theme::selection()));
             }
         }
         self.text.paint(None, inspector, bounds, &mut (), &mut (), window, cx);

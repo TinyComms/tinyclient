@@ -5,12 +5,14 @@
 //!   or `network/account/id` one of any account.
 //! - `TINYCLIENT_SHOT_AT=<message id>`: jump to it, as a reply quote would.
 //! - `TINYCLIENT_SHOT_UP=<points>`: scroll up this far from the bottom.
+//! - `TINYCLIENT_SHOT_BOTTOM=1`: after the open lands, scroll to the newest message.
 //! - `TINYCLIENT_SHOT_THREAD=<message id>`: open the thread under it.
 //! - `TINYCLIENT_SHOT_VIEW=<message id>`: open the viewer on its first picture.
 //! - `TINYCLIENT_SHOT_ZOOM=<percent>`: with `VIEW`, zoom the viewer to it (`100`, `250`).
 //! - `TINYCLIENT_SHOT_VIEW_STEPS=<n>`: with `VIEW`, go on through that many pictures, which
 //!   decodes more than the ceiling holds, and print what was dropped.
-//! - `TINYCLIENT_SHOT_HOVER=<message id>`: show the toolbar on it, as the pointer would.
+//! - `TINYCLIENT_SHOT_HOVER=<message id>`: show the toolbar on it, as the pointer would. A phone
+//!   has no toolbar: there it opens the message's action sheet, as a long press does.
 //! - `TINYCLIENT_SHOT_MENU=<message id>`: open its context menu.
 //! - `TINYCLIENT_SHOT_PICKER=<message id>`: open the reaction picker for it.
 //! - `TINYCLIENT_SHOT_CONFIRM=<message id>`: open the delete dialog for it.
@@ -47,6 +49,10 @@ pub struct Script {
     staged: bool,
     stats: bool,
     page_back: Option<usize>,
+    /// The open was asked to end at the newest message.
+    bottom: bool,
+    /// ... and has.
+    bottomed: bool,
     opened: bool,
     drawn: bool,
     /// Messages asked for so far while paging back.
@@ -90,6 +96,8 @@ impl Script {
             staged: false,
             stats: var("TINYCLIENT_SHOT_STATS").is_some(),
             page_back: var("TINYCLIENT_SHOT_PAGE_BACK").and_then(|messages| messages.parse().ok()),
+            bottom: var("TINYCLIENT_SHOT_BOTTOM").is_some(),
+            bottomed: false,
             opened: false,
             drawn: false,
             paged: 0,
@@ -207,6 +215,11 @@ pub fn drawn(pane: &mut Pane, window: &mut Window, cx: &mut Context<Pane>) {
     if pane.is_thread() || !pane.script.opened {
         return;
     }
+    // The newest message, for a picture of the end of a conversation that opened on unread.
+    if pane.script.bottom && pane.script.opened && !pane.script.bottomed {
+        pane.script.bottomed = true;
+        pane.go_to_bottom(cx);
+    }
     // A step at a time: the list only knows the heights of rows it has drawn.
     if let Some(left) = pane.script.up.filter(|left| *left > 0.) {
         let step = left.min(400.);
@@ -295,7 +308,8 @@ fn stage(pane: &mut Pane, window: &mut Window, cx: &mut Context<Pane>) {
     pane.script.staged = true;
     pane.hover = Some(id.clone());
     let at = gpui::point(bounds.right() - px(120.), bounds.top() + px(12.));
-    if pane.script.menu.is_some() {
+    // A phone has no hover: what a held finger brings up is the menu's sheet.
+    if pane.script.menu.is_some() || (pane.script.hover.is_some() && crate::gui::phone::active()) {
         pane.open_menu(message, at, window, cx);
     } else if pane.script.picker.is_some() {
         pane.open_picker(&id, gpui::point(bounds.right() - px(60.), bounds.top()), window, cx);
@@ -348,6 +362,20 @@ pub fn steps(cx: &mut gpui::Context<crate::gui::state::Shell>) {
                             shell.open_listed(row, cx);
                         }
                     }
+                    // `profile:<person id>`: a tap on someone of the open conversation, as on a
+                    // member's row (over Members, the Profile is pushed on it).
+                    Some(("profile", id)) => {
+                        let open = shell.snapshot.as_ref().and_then(|s| s.open.as_ref()).map(|open| open.key.clone());
+                        if let Some(open) = open {
+                            shell.open_profile(protocol::Key { id: id.to_owned(), ..open }, gpui::point(gpui::px(0.), gpui::px(0.)), cx);
+                        }
+                    }
+                    // `start:<conversation id>`: the demo's conversation's call, as its Call or
+                    // Join button (a voice channel's row on a phone) starts it.
+                    Some(("start", id)) => match crate::gui::shot_demo::key_of(id) {
+                        Some(key) => shell.call_start(key, cx),
+                        None => tracing::warn!("shot: no demo conversation {id}"),
+                    },
                     _ => match step.as_str() {
                         "members" => shell.toggle_member_list(cx),
                         "details" => shell.toggle_details(cx),
@@ -357,6 +385,21 @@ pub fn steps(cx: &mut gpui::Context<crate::gui::state::Shell>) {
                         // Escape in the composer with nothing of its own to close.
                         "escape" => shell.composer_escaped(cx),
                         "members-on" => shell.members_switch_on(cx),
+                        // The open conversation's call, then the call screen's own buttons.
+                        "call" => {
+                            if let Some(key) = shell.snapshot.as_ref().and_then(|s| s.open.as_ref()).map(|open| open.key.clone()) {
+                                shell.call_start(key, cx);
+                            }
+                        }
+                        "mute" => shell.call_mute(cx),
+                        "camera" => {
+                            let on = shell.snapshot.as_ref().and_then(|s| s.call.as_ref()).is_some_and(|call| {
+                                call.video.iter().any(|stream| stream.direction == protocol::Direction::Encode && stream.content == protocol::Content::Camera)
+                            });
+                            shell.call_ask(protocol::Request::Media(protocol::MediaRequest::Camera { on: !on }), cx);
+                        }
+                        "minimise" => shell.call_phone_minimise(cx),
+                        "leave" => shell.call_leave(cx),
                         "thread" => {
                             let pane = shell.conversation_state.pane.get().cloned();
                             let found = pane.and_then(|pane| {

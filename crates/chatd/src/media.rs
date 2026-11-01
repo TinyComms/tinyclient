@@ -16,7 +16,8 @@ use protocol::{
 };
 use std::io::{self, BufReader};
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use protocol::media_host::MediaChild;
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex};
@@ -90,8 +91,8 @@ struct Live {
 struct ActiveCall {
     /// Tells this call from the next one, for the threads that outlive it.
     id: u64,
-    child: Child,
-    stdin: Option<ChildStdin>,
+    child: MediaChild,
+    stdin: Option<Box<dyn std::io::Write + Send>>,
     /// Replies to requests, passed on by the thread that reads mediad's stdout.
     replies: Receiver<MediaResponse>,
     /// The call as the shell sees it, also written by that thread as events arrive.
@@ -133,8 +134,8 @@ pub struct Calls {
 /// after 30 s of metering. Nothing waits on its replies.
 struct Tester {
     id: u64,
-    child: Child,
-    stdin: Option<ChildStdin>,
+    child: MediaChild,
+    stdin: Option<Box<dyn std::io::Write + Send>>,
 }
 
 impl Tester {
@@ -144,9 +145,9 @@ impl Tester {
         command.arg("test");
         protocol::launch::no_console(&mut command);
         protocol::log_policy::share_session(&mut command);
-        let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
-        let stdin = child.stdin.take();
-        let mut stdout = BufReader::new(child.stdout.take().expect("stdout is piped"));
+        // The process on a desktop; mediad's threads in this process on a phone.
+        let protocol::media_host::Spawned { child, stdin, stdout } = protocol::media_host::spawn(&mut command)?;
+        let mut stdout = BufReader::new(stdout.expect("stdout is piped"));
         let reader = hub.clone();
         std::thread::Builder::new().stack_size(256 * 1024).spawn(move || {
             // Ends when mediad exits.
@@ -454,13 +455,13 @@ impl ActiveCall {
         command.arg("1");
         protocol::launch::no_console(&mut command);
         protocol::log_policy::share_session(&mut command);
-        let spawned = command.stdin(Stdio::piped()).stdout(Stdio::piped()).spawn();
-        let mut child = spawned.map_err(|err| {
+        // The process on a desktop; mediad's threads in this process on a phone.
+        let spawned = protocol::media_host::spawn(&mut command);
+        let protocol::media_host::Spawned { mut child, stdin, stdout } = spawned.map_err(|err| {
             tracing::warn!("chatd: could not run {}: {err}", path.display());
             io::Error::other(ENGINE_MISSING)
         })?;
-        let stdin = child.stdin.take();
-        let mut stdout = BufReader::new(child.stdout.take().expect("stdout is piped"));
+        let mut stdout = BufReader::new(stdout.expect("stdout is piped"));
         // Ready is the first thing a healthy mediad says. The read waits on a thread of its own,
         // for `Calls::start` holds the one call slot across this: a helper that never speaks (a
         // stale binary, one wedged before its first word) must fail the call rather than hold

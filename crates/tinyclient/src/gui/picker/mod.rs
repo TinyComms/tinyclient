@@ -21,6 +21,7 @@ mod table;
 // One decoder and one picture budget for the whole window, shared with the conversation.
 pub(in crate::gui) use crate::gui::conversation::images;
 
+use palette::IntoColor;
 use crate::frames;
 use crate::gui::anim::{self, Play};
 use crate::gui::components::{field, glyph, segment, segmented};
@@ -144,6 +145,8 @@ pub struct Picker {
     tab: Tab,
     input: Entity<TextInput>,
     height: f32,
+    /// [`WIDTH`] in a popover; a phone's sheet makes it the window's width.
+    width: f32,
     customs: Vec<Custom>,
     recent: Vec<String>,
     rows: Vec<Row>,
@@ -268,6 +271,7 @@ impl Picker {
             tab,
             input,
             height: HEIGHT,
+            width: WIDTH,
             customs,
             recent: emoji::recent(),
             rows: Vec::new(),
@@ -316,6 +320,37 @@ impl Picker {
         if (self.height - height).abs() > 0.5 {
             self.height = height;
             cx.notify();
+        }
+    }
+
+    /// The width it is shown at: a phone's sheet spans the window, and the grid sits centred in
+    /// it. Never narrower than [`WIDTH`]'s grid.
+    pub fn set_width(&mut self, width: f32, cx: &mut Context<Self>) {
+        let width = width.max(WIDTH);
+        if (self.width - width).abs() > 0.5 {
+            self.width = width;
+            self.requery(cx);
+            cx.notify();
+        }
+    }
+
+    /// The bands' side padding: the popover's [`PAD`], or, in a phone's wider sheet, the grid's
+    /// own edge, so the tabs, the search field, the section strip and the footer line up with
+    /// the emoji under them.
+    fn side(&self) -> f32 {
+        if self.width > WIDTH + 0.5 {
+            self.grid_pad()
+        } else {
+            PAD
+        }
+    }
+
+    /// The emoji grid's side padding: the popover's 6, or what centres its columns when wider.
+    fn grid_pad(&self) -> f32 {
+        if self.width > WIDTH + 0.5 {
+            ((self.width - COLUMNS as f32 * CELL) / 2.).floor().max(PAD - 4.)
+        } else {
+            PAD - 4.
         }
     }
 
@@ -389,7 +424,7 @@ impl Picker {
                     }));
                 }
                 let sectioned = self.gifs.answered.is_empty();
-                self.set_lines(gif_lines(&self.gifs.items, WIDTH - 2. * PAD, sectioned, &self.favorites));
+                self.set_lines(gif_lines(&self.gifs.items, self.width - 2. * PAD, sectioned, &self.favorites));
             }
             Tab::Stickers => {
                 let lines = sticker_lines(&self.stickers.items, &query, self.pack.as_deref(), &self.favorites, &self.recent_stickers);
@@ -768,12 +803,12 @@ impl Picker {
                     })),
             );
         }
-        Some(div().flex_none().h(px(TABS)).px(px(PAD)).pt(px(6.)).child(control).into_any_element())
+        Some(div().flex_none().h(px(TABS)).px(px(self.side())).pt(px(6.)).child(control).into_any_element())
     }
 
     fn search_band(&self) -> AnyElement {
         let field = field(true).w_full().child(glyph("icons/search.svg", 14., theme::text_faint())).child(div().flex_1().min_w_0().child(self.input.clone()));
-        div().flex_none().h(px(SEARCH)).px(px(PAD)).pb(px(8.)).flex().items_end().child(field).into_any_element()
+        div().flex_none().h(px(SEARCH)).px(px(self.side())).pb(px(8.)).flex().items_end().child(field).into_any_element()
     }
 
     fn strip_band(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -790,7 +825,9 @@ impl Picker {
                 .when(selected, |button| button.bg(theme::selected()))
                 .hover(|style| style.bg(theme::hover()))
         };
-        let strip = div().flex_none().h(px(STRIP)).px(px(PAD)).flex().items_center().gap(px(2.)).overflow_hidden();
+        // A phone's sheet spreads the sections across the grid's width.
+        let wide = self.width > WIDTH + 0.5;
+        let strip = div().flex_none().h(px(STRIP)).px(px(self.side())).flex().items_center().gap(px(2.)).when(wide, |strip| strip.justify_between()).overflow_hidden();
         match self.tab {
             Tab::Emoji if self.query(cx).is_empty() => {
                 let mut strip = strip;
@@ -872,7 +909,7 @@ impl Picker {
         let footer = div()
             .flex_none()
             .h(px(FOOTER))
-            .px(px(PAD))
+            .px(px(self.side()))
             .border_t_1()
             .border_color(theme::hairline())
             .flex()
@@ -1179,7 +1216,7 @@ impl Picker {
                     .justify_center()
                     .cursor_pointer()
                     .tooltip(crate::gui::components::tip(if starred { "Remove from Favorites  F" } else { "Add to Favorites  F" }, None))
-                    .child(glyph("icons/star.svg", 14., if starred { theme::warning() } else { gpui::white().into() }))
+                    .child(glyph("icons/star.svg", 14., if starred { theme::warning().into_color() } else { gpui::white() }))
                     // The star is not the cell: a click here never sends.
                     .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -1411,7 +1448,7 @@ impl Render for Picker {
                     .track_scroll(&self.scroll)
                     .h(px(grid_height))
                     .w_full()
-                    .px(px(PAD - 4.))
+                    .px(px(self.grid_pad()))
                     .into_any_element(),
                 // The list lays its rows edge to edge: the padding is its holder's.
                 _ => div()
@@ -1423,7 +1460,7 @@ impl Render for Picker {
             },
         };
         div()
-            .w(px(WIDTH))
+            .w(px(self.width))
             .h(px(self.height))
             .flex()
             .flex_col()
@@ -1440,6 +1477,35 @@ impl Render for Picker {
             // After the cells are laid out: frames of cells scrolled away go.
             .child(canvas(|_, _, _| (), move |_, (), window, cx| this.update(cx, |this, cx| this.images.sweep(window, cx))).absolute().size_0())
     }
+}
+
+/// A phone's bottom sheet: the scope sheet's surface (raised, 12 pt top corners, the border
+/// along its top edge, the modal shadow) with a grabber, and the home indicator's room under
+/// whatever the caller puts in it. Full width, at the window's bottom.
+pub(in crate::gui) fn sheet_panel() -> gpui::Div {
+    use crate::gui::phone::tokens;
+    div()
+        .w_full()
+        .bg(theme::raised())
+        .shadow(theme::shadow_modal())
+        .rounded_t(px(theme::R_MODAL))
+        .border_t_1()
+        .border_color(theme::border())
+        .pt(px(8.))
+        .pb(px(8. + tokens::bottom_padding(tokens::safe_bottom(), tokens::keyboard())))
+        .flex()
+        .flex_col()
+        .occlude()
+        // A press on the sheet is not a press on the scrim behind it.
+        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .child(div().flex_none().h(px(12.)).flex().justify_center().child(div().w(px(36.)).h(px(4.)).rounded_full().bg(theme::border_strong())))
+}
+
+/// What a sheet stands on: the window, dimmed, its content at the bottom. The caller closes the
+/// sheet on a press of the returned scrim.
+pub(in crate::gui) fn sheet_scrim(window: &Window) -> gpui::Stateful<gpui::Div> {
+    let size = window.viewport_size();
+    div().id("sheet-scrim").w(size.width).h(size.height).bg(theme::scrim()).occlude().flex().flex_col().justify_end()
 }
 
 #[cfg(test)]

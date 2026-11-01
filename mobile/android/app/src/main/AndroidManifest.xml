@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- The product talks to a hub over the network; the demo build does not need it but the
+         permission is harmless and avoids a manifest edit in the first real build. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- Calls (src/mobile/android, java/dev/tinyclient/app): the microphone and camera are asked
+         for at run time; the foreground service keeps a call going in the background, with the
+         types of what it uses; Bluetooth headsets are routed with BLUETOOTH_CONNECT (31+). -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+
+    <uses-feature android:name="android.hardware.camera.any" android:required="false" />
+    <uses-feature android:name="android.hardware.microphone" android:required="false" />
+
+    <!-- The Tiny sign-in opens a Custom Tab; Android 11+ hides the browsers that offer one unless
+         asked for here. -->
+    <queries>
+        <intent>
+            <action android:name="android.support.customtabs.action.CustomTabsService" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="https" />
+        </intent>
+    </queries>
+
+    <application
+        android:allowBackup="false"
+        android:hasCode="true"
+        android:label="Tiny"
+        android:supportsRtl="true"
+        android:theme="@android:style/Theme.Material.NoActionBar.Fullscreen">
+
+        <!-- NativeActivity with gpui_ce_mobile's Java half (java/dev/gpui/mobile): the soft
+             keyboard's text and composition, and the system-bar, cutout and keyboard insets,
+             which NativeActivity alone cannot deliver. The UI is still all the Rust library.
+             `android.app.lib_name` is the
+             cdylib's name without `lib`/`.so`; cargo builds `libtinyclient.so` from the
+             `tinyclient` package. `android_activity` provides `ANativeActivity_onCreate`,
+             which calls the `android_main` in src/lib.rs. -->
+        <activity
+            android:name="dev.tinyclient.app.TinyActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode|density"
+            android:exported="true"
+            android:enableOnBackInvokedCallback="false"
+            android:windowSoftInputMode="adjustResize">
+
+            <meta-data
+                android:name="android.app.lib_name"
+                android:value="tinyclient" />
+
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- Discord, Slack and Teams sign-in pages (WebSignInActivity, driven from Rust). -->
+        <activity
+            android:name="dev.tinyclient.app.WebSignInActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode"
+            android:exported="false"
+            android:theme="@android:style/Theme.Material.NoActionBar"
+            android:windowSoftInputMode="adjustResize" />
+
+        <!-- A call in progress: its notification, and the microphone, camera and screen share
+             kept running in the background. -->
+        <service
+            android:name="dev.tinyclient.app.CallService"
+            android:exported="false"
+            android:foregroundServiceType="microphone|camera|mediaProjection" />
+    </application>
+
+</manifest>

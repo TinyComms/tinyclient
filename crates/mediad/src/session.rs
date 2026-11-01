@@ -542,9 +542,9 @@ impl Call {
             stop: stop.clone(),
             microphone_unasked: self.microphone_unasked,
         };
-        let thread = std::thread::Builder::new()
-            .name("media".to_owned())
-            .spawn(move || media::run(setup))
+        let thread = out::spawn(std::thread::Builder::new()
+            .name("media".to_owned()),
+            move || media::run(setup))
             .map_err(|err| {
                 tracing::warn!("mediad: the media thread did not start: {err}");
                 End::Fatal(CallFailure::Engine, ENGINE.to_owned())
@@ -784,6 +784,8 @@ impl Call {
 /// Runs the call to its end. Returns when chatd hung up or the other side ended it; a failure
 /// does not return (`out::fail` exits).
 pub fn run(join: VoiceJoin, controls: Arc<Controls>) {
+    // A phone's audio session, for as long as the call runs. Nothing on a desktop.
+    let _audio_session = crate::platform::call_audio();
     let (Ok(user), Ok(room)) = (join.user_id.parse::<u64>(), join.channel_id.parse::<u64>()) else {
         tracing::warn!("mediad: the voice session's ids are not numbers ({:?}, {:?})", join.user_id, join.channel_id);
         out::fail(CallFailure::Refused, UNUSABLE);

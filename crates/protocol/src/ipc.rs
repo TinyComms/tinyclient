@@ -18,8 +18,15 @@ pub struct ChatStream {
 }
 
 impl ChatListener {
-    /// Removes a stale socket file, then listens.
+    /// Removes a stale socket file, then listens. The directory is made if it is missing.
     pub fn bind(path: &Path) -> io::Result<Self> {
+        #[cfg(not(windows))]
+        {
+            check_sun_path(path)?;
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
         #[cfg(not(windows))]
         if path.exists() {
             let _ = std::fs::remove_file(path);
@@ -49,6 +56,8 @@ impl ChatStream {
     }
 
     pub fn connect(path: &Path) -> io::Result<Self> {
+        #[cfg(not(windows))]
+        check_sun_path(path)?;
         let owned = socket_path(path);
         let name = owned.to_fs_name::<GenericFilePath>()?;
         Ok(Self::new(Stream::connect(name)?))
@@ -122,6 +131,20 @@ impl io::Write for ChatStream {
     fn flush(&mut self) -> io::Result<()> {
         self.stream.flush()
     }
+}
+
+/// A Unix socket path longer than `sun_path` cannot be bound or connected. Said here, by name,
+/// instead of as the system's generic failure.
+#[cfg(not(windows))]
+fn check_sun_path(path: &Path) -> io::Result<()> {
+    let len = path.as_os_str().len();
+    if len < crate::SUN_PATH_MAX {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("socket path is {len} bytes; this system allows {} ({})", crate::SUN_PATH_MAX - 1, path.display()),
+    ))
 }
 
 /// Unix keeps the filesystem socket path. Windows named pipes are `\\.\pipe\...`, so the logical

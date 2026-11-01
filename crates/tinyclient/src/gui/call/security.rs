@@ -98,7 +98,7 @@ pub(super) fn badge_words(badge: Badge) -> &'static str {
     }
 }
 
-fn badge_look(badge: Badge) -> (&'static str, Rgba) {
+pub(super) fn badge_look(badge: Badge) -> (&'static str, Rgba) {
     match badge {
         Badge::EndToEnd | Badge::Alone => ("icons/lock.svg", theme::positive()),
         Badge::Pending => ("icons/clock.svg", theme::text_faint()),
@@ -285,7 +285,7 @@ impl Shell {
                 .on_mouse_down_out(cx.listener(|this, _, _, cx| this.call_menu_close(cx)))
                 .child(self.call_security_panel(call, cx));
             let panel = if place == Place::TopBar { panel.top(px(30.)) } else { panel.bottom(px(30.)) };
-            indicator = indicator.relative().child(deferred(panel).with_priority(1));
+            indicator = indicator.relative().child(deferred(panel).priority(1));
         }
         Some(indicator.into_any_element())
     }

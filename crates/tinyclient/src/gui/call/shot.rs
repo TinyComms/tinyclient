@@ -19,6 +19,7 @@
 //! `tiny_security_bar` from the column's compact bar. `tiny_poor`'s numbers carry audio trouble
 //! too, for the health hints.
 
+use super::phone::{Sheet, Shown};
 use super::security::Place;
 use super::{now, Confirm, Ended, Menu, Subject};
 use crate::gui::state::Snapshot;
@@ -151,6 +152,9 @@ fn key(id: &str) -> Key {
 
 pub(super) fn call(snapshot: &Snapshot) -> Option<Call> {
     let name = named()?;
+    if name.starts_with("phone_") {
+        return phone_shot().and_then(|shot| shot.call);
+    }
     if matches!(name.as_str(), "ended" | "join_call") {
         return None;
     }
@@ -269,6 +273,9 @@ pub(super) fn subject(snapshot: &Snapshot) -> Option<Subject> {
     if tiny() {
         return None;
     }
+    if let Some(shot) = phone_shot() {
+        return Some(shot.subject);
+    }
     if channel(&named()?) {
         let space = Some("tinyclient-dev".to_owned());
         return Some(Subject { title: "Lounge".to_owned(), kind: ConversationKind::Voice, avatar: None, space });
@@ -292,7 +299,7 @@ pub(super) fn menu() -> Option<Menu> {
 
 /// The other side hung up after twelve minutes and four seconds.
 pub(super) fn ended() -> Option<Ended> {
-    (named()? == "ended").then(|| Ended { conversation: key("shot"), subject: mara(), seconds: 724 })
+    matches!(named()?.as_str(), "ended" | "phone_ended").then(|| Ended { conversation: key("shot"), subject: mara(), seconds: 724 })
 }
 
 /// The question the card asks before leaving Lounge.
@@ -321,4 +328,254 @@ pub(super) fn running() -> Option<Occupants> {
         speaking: false,
     };
     (named()? == "join_call").then(|| Occupants { people: vec![there("Iris Navarro"), there("Jun Aoki")], total: 3 })
+}
+
+// The phone's call screen (`phone`): `phone_` before a state names one of its faces. Faces and
+// "camera" pictures are the chatd demo's portraits; a screen share is its schematic.
+//
+// `phone_voice` (1:1, voice), `phone_video` (1:1, both cameras), `phone_group` (four, two
+// cameras), `phone_crowd` (seven, voice), `phone_share` (a screen share), `phone_incoming`,
+// `phone_incoming_video`, `phone_outgoing`, `phone_connecting`, `phone_reconnecting`,
+// `phone_pill` (minimised over the screen behind), `phone_people`, `phone_devices`,
+// `phone_more`, `phone_security`, `phone_security_blocked`, `phone_denied` (the microphone refused),
+// `phone_camera_denied`, `phone_failed`, `phone_ended`.
+
+/// One face of the phone's call screen: the call, who or where it is, and what is open.
+pub(super) struct PhoneShot {
+    pub call: Option<Call>,
+    pub subject: Subject,
+    pub view: Shown,
+}
+
+fn photo(name: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("{}/../chatd/src/demo/photos/{name}", env!("CARGO_MANIFEST_DIR")))
+}
+
+fn phone_named() -> Option<String> {
+    named().filter(|name| name.starts_with("phone_"))
+}
+
+fn seat(id: &str, name: &str) -> Participant {
+    Participant { id: id.to_owned(), name: name.to_owned(), ..Participant::default() }
+}
+
+fn bare(conversation: Key, state: CallState, participants: Vec<Participant>, joined: i64) -> Call {
+    Call {
+        conversation,
+        state,
+        participants,
+        muted: false,
+        deafened: false,
+        joined,
+        input: "iPhone Microphone".to_owned(),
+        output: "iPhone Speaker".to_owned(),
+        input_id: String::new(),
+        output_id: String::new(),
+        device_notice: None,
+        device_stuck: false,
+        engine_linked: true,
+        video: Vec::new(),
+        speaking: false,
+        level: None,
+        output_level: None,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        security: None,
+        picture: None,
+    }
+}
+
+fn camera_on(call: &mut Call) {
+    call.video.push(protocol::VideoStream { direction: protocol::Direction::Encode, content: protocol::Content::Camera, source: String::new() });
+}
+
+fn sealed(call: &mut Call) {
+    let members: Vec<String> = call.participants.iter().map(|who| who.id.clone()).collect();
+    call.security = Some(CallSecurity {
+        mode: SecurityMode::EndToEnd,
+        code: "382910475563019284716650938271".to_owned(),
+        epoch: 4,
+        members: members
+            .iter()
+            .enumerate()
+            .map(|(ix, id)| SecureMember {
+                user_id: id.clone(),
+                key: format!("{:064x}", ix + 1),
+                safety: "123456789013579246801122334455667788990012121".to_owned(),
+                trust: if ix == 0 { Trust::Verified } else { Trust::Unverified },
+            })
+            .collect(),
+        unsupported: Vec::new(),
+        server_lacks: false,
+        required: false,
+    });
+}
+
+fn tiny_key(id: &str) -> Key {
+    Key { network: Network::Tiny, account: "shot".to_owned(), id: id.to_owned() }
+}
+
+fn lounge() -> Subject {
+    Subject { title: "Lounge".to_owned(), kind: ConversationKind::Voice, avatar: None, space: Some("Premier".to_owned()) }
+}
+
+fn direct(title: &str) -> Subject {
+    Subject { title: title.to_owned(), kind: ConversationKind::Direct, avatar: None, space: None }
+}
+
+/// The four in Lounge: two cameras on, one of them speaking, one person muted.
+fn group(joined: i64) -> Call {
+    let halvard = Participant { camera: true, ..seat("halvard-eide", "Halvard Eide") };
+    let ines = Participant { camera: true, speaking: true, ..seat("ines-marchetti", "Ines Marchetti") };
+    let dev = Participant { muted: true, ..seat("dev-patel", "Dev Patel") };
+    let mut call = bare(tiny_key("lounge"), CallState::Joined, vec![halvard, ines, dev], joined);
+    sealed(&mut call);
+    call
+}
+
+/// Lounge with Farah sharing her screen.
+fn sharing(joined: i64) -> Call {
+    let farah = Participant { sharing: true, speaking: true, ..seat("farah-siddiqui", "Farah Siddiqui") };
+    let halvard = Participant { camera: true, ..seat("halvard-eide", "Halvard Eide") };
+    let ines = seat("ines-marchetti", "Ines Marchetti");
+    let dev = Participant { muted: true, deafened: true, ..seat("dev-patel", "Dev Patel") };
+    let mut call = bare(tiny_key("lounge"), CallState::Joined, vec![farah, halvard, ines, dev], joined);
+    sealed(&mut call);
+    call
+}
+
+pub(super) fn phone_shot() -> Option<PhoneShot> {
+    let name = phone_named()?;
+    let up = now() - 724;
+    let mara_key = || key("mara");
+    let mara_seat = || seat("mara-okafor", "Mara Okafor");
+    let screen = Shown::Screen;
+    let shot = |call: Call, subject: Subject, view: Shown| Some(PhoneShot { call: Some(call), subject, view });
+    match name.as_str() {
+        "phone_voice" | "phone_devices" => {
+            let mara = Participant { speaking: true, ..mara_seat() };
+            let mut call = bare(mara_key(), CallState::Joined, vec![mara], up);
+            let view = if name == "phone_devices" {
+                call.level = Some(62);
+                let device = |id: &str, name: &str, auto: bool| protocol::AudioDevice { id: id.into(), name: name.into(), default: auto, auto, is_virtual: false };
+                call.inputs = vec![device("phone", "iPhone Microphone", true), device("airpods", "AirPods Pro", false)];
+                call.input_id = "phone".into();
+                Shown::Sheet(Sheet::Devices)
+            } else {
+                screen
+            };
+            shot(call, direct("Mara Okafor"), view)
+        }
+        "phone_video" => {
+            let ana = Participant { camera: true, speaking: true, ..seat("ana-ruiz", "Ana Ruiz") };
+            let mut call = bare(tiny_key("dm-ana"), CallState::Joined, vec![ana], now() - 318);
+            camera_on(&mut call);
+            sealed(&mut call);
+            shot(call, direct("Ana Ruiz"), screen)
+        }
+        // The server turned the call's encryption off: blocked until the person leaves or carries on.
+        "phone_security_blocked" => {
+            let mut call = group(now() - 271);
+            if let Some(security) = call.security.as_mut() {
+                security.mode = SecurityMode::Blocked;
+            }
+            shot(call, lounge(), Shown::Sheet(Sheet::Security))
+        }
+        "phone_group" | "phone_pill" | "phone_more" | "phone_security" | "phone_camera_denied" => {
+            let view = match name.as_str() {
+                "phone_pill" => Shown::Bar,
+                "phone_more" => Shown::Sheet(Sheet::More),
+                "phone_security" => Shown::Sheet(Sheet::Security),
+                "phone_camera_denied" => Shown::Sheet(Sheet::Camera),
+                _ => screen,
+            };
+            shot(group(now() - 271), lounge(), view)
+        }
+        "phone_crowd" => {
+            let people = [
+                ("yusuf-demirci", "Yusuf Demirci", true, false, false),
+                ("ines-marchetti", "Ines Marchetti", false, false, false),
+                ("tomasz-brandt", "Tomasz Brandt", false, true, false),
+                ("kofi-asante", "Kofi Asante", false, true, true),
+                ("dita-novak", "Dita Novak", false, false, false),
+                ("priya-raman", "Priya Raman", false, true, false),
+            ];
+            let seats = people
+                .iter()
+                .map(|(id, name, speaking, muted, deafened)| Participant { speaking: *speaking, muted: *muted, deafened: *deafened, ..seat(id, name) })
+                .collect();
+            let call = bare(key("campfire"), CallState::Joined, seats, now() - 1_953);
+            let subject = Subject { title: "Campfire".to_owned(), kind: ConversationKind::Voice, avatar: None, space: Some("Moss & Lichen".to_owned()) };
+            shot(call, subject, screen)
+        }
+        "phone_share" | "phone_people" => {
+            let view = if name == "phone_people" { Shown::People } else { screen };
+            let mut call = sharing(now() - 1_204);
+            if name == "phone_people" {
+                camera_on(&mut call);
+            }
+            shot(call, lounge(), view)
+        }
+        "phone_incoming" => shot(bare(mara_key(), CallState::RingingIn { from: "Mara Okafor".to_owned() }, vec![mara_seat()], 0), direct("Mara Okafor"), screen),
+        "phone_incoming_video" => {
+            let state = CallState::RingingIn { from: "Ana Ruiz".to_owned() };
+            shot(bare(tiny_key("dm-ana"), state, vec![seat("ana-ruiz", "Ana Ruiz")], 0), direct("Ana Ruiz"), screen)
+        }
+        "phone_outgoing" => shot(bare(mara_key(), CallState::RingingOut, vec![mara_seat()], now() - 12), direct("Mara Okafor"), screen),
+        "phone_connecting" => shot(bare(tiny_key("lounge"), CallState::Connecting, Vec::new(), 0), lounge(), screen),
+        "phone_reconnecting" => shot(bare(mara_key(), CallState::Reconnecting, vec![mara_seat()], now() - 8), direct("Mara Okafor"), screen),
+        "phone_denied" => {
+            let state = CallState::Failed { reason: CallFailure::Audio, detail: "Allow the microphone in the system settings, then call again.".to_owned() };
+            shot(bare(mara_key(), state, Vec::new(), 0), direct("Mara Okafor"), screen)
+        }
+        "phone_failed" => {
+            let state = CallState::Failed { reason: CallFailure::NoAnswer, detail: "Nobody picked up.".to_owned() };
+            shot(bare(mara_key(), state, Vec::new(), 0), direct("Mara Okafor"), screen)
+        }
+        "phone_ended" => Some(PhoneShot { call: None, subject: mara(), view: screen }),
+        _ => None,
+    }
+}
+
+/// How the phone's call screen shows under `--shot`.
+pub(super) fn phone_view() -> Option<Shown> {
+    phone_shot().map(|shot| shot.view)
+}
+
+/// The demo's portrait of `id`.
+pub(super) fn phone_face(id: &str) -> Option<std::path::PathBuf> {
+    phone_named()?;
+    let path = photo(&format!("avatar-{id}.jpg"));
+    path.exists().then_some(path)
+}
+
+/// Me, in the phone's call shots.
+pub(super) fn phone_me() -> Option<(String, Option<std::path::PathBuf>)> {
+    phone_named()?;
+    Some(("Robin Vale".to_owned(), Some(photo("avatar-robin-vale.jpg"))))
+}
+
+/// The picture of `id`'s camera (or of mine, `""`), or of their screen: whoever has it on in
+/// the shot's call shows a picture.
+pub(super) fn phone_frame(id: &str, share: bool) -> Option<std::path::PathBuf> {
+    let call = phone_shot()?.call?;
+    if id.is_empty() {
+        let mine = call.video.iter().any(|stream| stream.direction == protocol::Direction::Encode && stream.content == protocol::Content::Camera);
+        return (mine && !share).then(|| photo("avatar-robin-vale.jpg"));
+    }
+    let who = call.participants.iter().find(|who| who.id == id)?;
+    if share {
+        who.sharing.then(|| photo("schematic.webp"))
+    } else {
+        who.camera.then(|| photo(&format!("avatar-{id}.jpg")))
+    }
+}
+
+/// The microphone (or, with `camera`, the camera) is refused in the shot.
+pub(super) fn phone_denied(camera: bool) -> bool {
+    match phone_named().as_deref() {
+        Some("phone_camera_denied") => camera,
+        Some("phone_denied") => !camera,
+        _ => false,
+    }
 }

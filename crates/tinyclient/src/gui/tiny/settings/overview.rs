@@ -310,7 +310,7 @@ fn room_picker(shell: &Shell, facts: &Facts, pick: Pick, chosen: Option<String>,
             })));
         }
         let list = list.on_mouse_down_out(cx.listener(|this, _, _, cx| this.tiny_overview_draft(cx, |overlay| overlay.overview.picking = None)));
-        wrap = wrap.child(deferred(anchored().snap_to_window().child(list)).with_priority(2));
+        wrap = wrap.child(deferred(anchored().snap_to_window().child(list)).priority(2));
     }
     wrap
 }

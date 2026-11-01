@@ -79,6 +79,24 @@ use typing::TypingRow;
 const DRAFTS: usize = 64;
 /// The card and the bars that replace it are the same height, so the layout never moves.
 const CARD: f32 = 40.;
+
+/// The card's height: 40 on the desktop, 48 on a phone, where a thumb needs the room.
+fn card_height() -> f32 {
+    if crate::gui::phone::active() {
+        48.
+    } else {
+        CARD
+    }
+}
+
+/// An icon button on the card: 28 on the desktop, 44 on a phone.
+fn card_control() -> f32 {
+    if crate::gui::phone::active() {
+        44.
+    } else {
+        theme::CONTROL
+    }
+}
 /// A draft goes to chatd once the keys have been still this long.
 const DRAFT_QUIET: Duration = Duration::from_millis(500);
 /// A completion is looked up once the keys have been still this long.
@@ -1816,7 +1834,7 @@ impl Composer {
         };
         let expired = action == Some("Sign in again");
         div()
-            .h(px(CARD))
+            .h(px(card_height()))
             .pl(px(12.))
             .pr(px(6.))
             .rounded(px(theme::R_FLOAT))
@@ -1838,8 +1856,10 @@ impl Composer {
 
     /// The 32 pt bar inside the card that says what Return will do: reply, or save an edit.
     fn mode_bar(&self, cx: &mut Context<Self>) -> Option<Div> {
+        // A phone's bar is the same line at the phone's run, 40 tall, its close a 36 pt target.
+        let phone = crate::gui::phone::active();
         let bar = div()
-            .h(px(32.))
+            .h(px(if phone { (crate::gui::phone::tokens::scaled(18.) + 22.).max(40.) } else { 32. }))
             .flex_none()
             .pl(px(12.))
             .pr(px(4.))
@@ -1849,13 +1869,17 @@ impl Composer {
             .items_center()
             .gap(px(6.))
             .type_small()
+            .when(phone, |bar| {
+                use crate::gui::phone::tokens::PhoneType;
+                bar.phone_preview()
+            })
             .text_color(theme::text_soft())
             .cursor_default();
-        let strong = |words: String| div().flex_none().max_w(px(220.)).truncate().font_weight(theme::SEMIBOLD).text_color(theme::text()).child(words);
+        let strong = |words: String| div().flex_none().max_w(px(if phone { 140. } else { 220. })).truncate().font_weight(theme::SEMIBOLD).text_color(theme::text()).child(words);
         let faint = |words: String| div().flex_1().min_w_0().truncate().text_color(theme::text_faint()).child(words);
         let close = div()
             .id("mode-close")
-            .size(px(24.))
+            .size(px(if phone { 36. } else { 24. }))
             .flex_none()
             .rounded(px(theme::R_CONTROL))
             .flex()
@@ -1879,7 +1903,8 @@ impl Composer {
                 bar.child(glyph("icons/pencil.svg", 14., theme::accent_text()))
                     .child(strong("Editing message".to_owned()))
                     .child(div().flex_1())
-                    .child(div().flex_none().text_color(theme::text_faint()).child("Return to save · Esc to cancel"))
+                    // A phone's keyboard has no Esc, and its Return is the send button.
+                    .when(!phone, |bar| bar.child(div().flex_none().text_color(theme::text_faint()).child("Return to save · Esc to cancel")))
                     .child(close),
             );
         }
@@ -1891,7 +1916,7 @@ impl Composer {
             div()
                 .id("reply-ping")
                 .flex_none()
-                .h(px(24.))
+                .h(px(if phone { 36. } else { 24. }))
                 .px(px(6.))
                 .rounded(px(theme::R_CONTROL))
                 .flex()
@@ -1916,7 +1941,8 @@ impl Composer {
         });
         Some(
             bar.child(glyph("icons/corner-up-left.svg", 14., theme::accent_text()))
-                .child(div().flex_none().child("Replying to"))
+                // A phone says only whom: the column has no room for the whole phrase.
+                .when(!phone, |bar| bar.child(div().flex_none().child("Replying to")))
                 .child(strong(reply.name.clone()))
                 .child(faint(reply.snippet.clone()))
                 .children(ping)
@@ -1928,7 +1954,7 @@ impl Composer {
     fn card_button(&self, id: &'static str, icon: Option<&'static str>, toggled: bool, slot: Option<Trigger>) -> gpui::Stateful<Div> {
         let anchors = self.anchors.clone();
         let content = match icon {
-            Some(icon) => glyph(icon, 16., if toggled { theme::text() } else { theme::text_soft() }).into_any_element(),
+            Some(icon) => glyph(icon, if crate::gui::phone::active() { 18. } else { 16. }, if toggled { theme::text() } else { theme::text_soft() }).into_any_element(),
             // CONTRACT: the design's `gif-16` glyph is not among slice A's assets; the word in a
             // 16 × 12 outline stands in for it.
             None => div()
@@ -1951,7 +1977,7 @@ impl Composer {
             .id(id)
             .relative()
             .flex_none()
-            .size(px(theme::CONTROL))
+            .size(px(card_control()))
             .rounded(px(theme::R_CONTROL))
             .flex()
             .items_center()
@@ -2002,20 +2028,34 @@ impl Composer {
                 .on_click(cx.listener(|this, _, window, cx| this.toggle_picker(Tab::Emoji, window, cx)))
         });
         let anchors = self.anchors.clone();
+        let phone = crate::gui::phone::active();
+        // A phone's send is the desktop's filled square drawn at 36 inside a 44 pt target, so a
+        // ready one reads as a button and not as a slab beside the field.
         let send = div()
             .id("send")
             .relative()
-            .size(px(theme::CONTROL))
+            .size(px(card_control()))
             .flex_none()
             .rounded(px(theme::R_CONTROL))
             .flex()
             .items_center()
             .justify_center()
-            .when(ready, |send| {
+            .when(ready && !phone, |send| {
                 send.bg(theme::accent())
                     .cursor_pointer()
                     .hover(|style| style.bg(theme::accent_hover()))
                     .active(|style| style.bg(theme::accent_pressed()))
+            })
+            .when(ready && phone, |send| {
+                send.cursor_pointer().child(
+                    div()
+                        .absolute()
+                        .top(px(4.))
+                        .left(px(4.))
+                        .size(px(36.))
+                        .rounded(px(theme::R_FLOAT))
+                        .bg(theme::accent()),
+                )
             })
             .tooltip(tip(send_tip, None))
             .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -2027,33 +2067,59 @@ impl Composer {
                 }),
             )
             .on_click(cx.listener(|this, _, _, cx| this.send(false, cx)))
-            .child(glyph(send_icon, 16., if ready { theme::on_accent() } else { theme::text_disabled() }))
+            .child(glyph(send_icon, if crate::gui::phone::active() { 18. } else { 16. }, if ready { theme::on_accent() } else { theme::text_disabled() }))
             .child(canvas(move |bounds, _, _| anchors.send.set(Some(bounds)), |_, _, _, _| {}).absolute().top_0().left_0().size_full());
-        let row = div()
-            .min_h(px(CARD - 2.))
-            .pl(px(if controls.attach { 5. } else { 12. }))
-            .pr(px(5.))
-            .py(px(5.))
+        // The field: 44 pt at its shortest, growing to five lines at any text size, and never
+        // wider than the room the buttons leave it.
+        let field = div()
+            .flex_1()
+            .min_w_0()
             .flex()
-            .items_end()
-            .children(attach.map(|attach| attach.mr(px(4.))))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .py(px(4.))
-                    .mr(px(4.))
-                    .flex()
-                    .type_body()
-                    .text_color(theme::text())
-                    .child(self.input.clone()),
-            )
-            .children(gif.map(|gif| gif.mr(px(2.))))
-            .children(smile.map(|smile| smile.mr(px(4.))))
-            .child(send);
+            .items_center()
+            .when(phone, |field| field.min_h(px(44.)).py(px(2.)).pl(px(2.)))
+            .when(!phone, |field| field.py(px(4.)).mr(px(4.)))
+            .type_body()
+            // The phone's typing size follows its run, as the messages above it do.
+            .when(phone, |field| {
+                use crate::gui::phone::tokens::scaled;
+                field.text_size(px(scaled(16.))).line_height(px(scaled(22.)))
+            })
+            .text_color(theme::text())
+            .child(self.input.clone());
+        let row = if phone {
+            // A real flex row: 44 | field | 44 | 44. Every button keeps its size; only the field
+            // gives way, so nothing can overlap at 100% or at 200%. GIFs and stickers are inside
+            // the emoji picker's own tabs, so the row has no fifth button.
+            div()
+                .min_h(px(52.))
+                // Without the attach button (an edit), the words keep the desktop's 12 from the edge.
+                .pl(px(if controls.attach { 4. } else { 10. }))
+                .pr(px(4.))
+                .py(px(4.))
+                .flex()
+                .items_end()
+                .gap(px(2.))
+                .children(attach)
+                .child(field)
+                .children(smile)
+                .child(send)
+        } else {
+            div()
+                .min_h(px(card_height() - 2.))
+                .pl(px(if controls.attach { 5. } else { 12. }))
+                .pr(px(5.))
+                .py(px(5.))
+                .flex()
+                .items_end()
+                .children(attach.map(|attach| attach.mr(px(4.))))
+                .child(field)
+                .children(gif.map(|gif| gif.mr(px(2.))))
+                .children(smile.map(|smile| smile.mr(px(4.))))
+                .child(send)
+        };
         let armed = self.armed.is_some();
         div()
-            .min_h(px(CARD))
+            .min_h(px(card_height()))
             .rounded(px(theme::R_FLOAT))
             .bg(theme::raised())
             .border_1()
@@ -2172,7 +2238,7 @@ impl Composer {
                 }
             };
             let drawn = colon::draw(colon, customs, tone, image, pick);
-            return Some(deferred(div().absolute().left_0().bottom(relative(1.)).pb(px(6.)).child(drawn)).with_priority(1).into_any_element());
+            return Some(deferred(div().absolute().left_0().bottom(relative(1.)).pb(px(6.)).child(drawn)).priority(1).into_any_element());
         }
         let list = self.list.as_ref().filter(|list| !list.rows.is_empty())?;
         let this = cx.weak_entity();
@@ -2180,12 +2246,30 @@ impl Composer {
             let _ = this.update(cx, |this, cx| this.complete(row, cx));
         };
         let drawn = complete::draw(list, &self.hub, pick, cx);
-        Some(deferred(div().absolute().left_0().bottom(relative(1.)).pb(px(6.)).child(drawn)).with_priority(1).into_any_element())
+        Some(deferred(div().absolute().left_0().bottom(relative(1.)).pb(px(6.)).child(drawn)).priority(1).into_any_element())
     }
 
     /// The picker, above the card, right edge on its trigger's, inside the window.
     fn picker_layer(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         let picking = self.picking.as_ref()?;
+        if crate::gui::phone::active() {
+            // A phone: a bottom sheet the window's width, over a dimmed conversation.
+            let size = window.viewport_size();
+            let (wide, tall) = (f32::from(size.width), f32::from(size.height));
+            picking.picker.update(cx, |picker, cx| {
+                picker.set_width(wide, cx);
+                picker.set_height((tall * 0.6).min(picker::HEIGHT), cx);
+            });
+            let panel = picker::sheet_panel().child(picking.picker.clone());
+            let scrim = picker::sheet_scrim(window)
+                .on_mouse_down(gpui::MouseButton::Left, cx.listener(|this, _, _, cx| this.close_picker(cx)))
+                .child(panel);
+            return Some(
+                gpui::deferred(gpui::anchored().position(gpui::point(px(0.), px(0.))).child(crate::gui::components::fade_in("picker-sheet", 160, scrim)))
+                    .priority(1)
+                    .into_any_element(),
+            );
+        }
         let tab = picking.picker.read(cx).tab();
         let anchor = match tab {
             Tab::Gifs => self.anchors.gif.get().or(self.anchors.smile.get()),
@@ -2261,7 +2345,7 @@ impl Composer {
                     .border_2()
                     .border_color(border)
                     // The messages stay faintly visible under it; the words must read over them.
-                    .bg(Rgba { a: 0.9, ..theme::over(wash, theme::canvas()) })
+                    .bg(Rgba { alpha: 0.9, ..theme::over(wash, theme::canvas()) })
                     .flex()
                     .flex_col()
                     .items_center()
@@ -2272,7 +2356,7 @@ impl Composer {
                     .child(div().type_ui().text_color(theme::text_soft()).child(line)),
             );
         let at = gpui::point(bounds.left(), px(top));
-        Some(deferred(gpui::anchored().position(at).child(frame)).with_priority(Layer::Float as usize).into_any_element())
+        Some(deferred(gpui::anchored().position(at).child(frame)).priority(Layer::Float as usize).into_any_element())
     }
 
     #[cfg(feature = "gui-shot")]
@@ -2525,10 +2609,23 @@ impl Render for Composer {
         #[cfg(feature = "gui-shot")]
         self.stage_picker(window, cx);
 
+        let phone = crate::gui::phone::active();
         let dock = div()
             .flex_none()
-            .px(px(20.))
-            .pb(px(16.))
+            // A phone dock keeps the messages' 16 pt gutters, so the card's edges line up with
+            // the words above it; its first control starts at 21, past the back-swipe strip's 20.
+            .pl(px(if phone { 16. } else { 20. }))
+            .pr(px(if phone { 16. } else { 20. }))
+            .pt(px(if phone { 4. } else { 0. }))
+            .pb(px(if phone {
+                use crate::gui::phone::tokens;
+                // 8 over the home indicator, 8 over the keyboard's edge while it is up.
+                8. + tokens::bottom_padding(tokens::safe_bottom(), tokens::keyboard())
+            } else {
+                16.
+            }))
+            // The desktop's dock, on a phone too: no fill and no rule, the card floating on the
+            // page the messages are on.
             .flex()
             .flex_col()
             .key_context("Composer")

@@ -10,8 +10,14 @@ mod accounts;
 pub(in crate::gui) mod controls;
 mod notify;
 mod pages;
+mod phone_page;
 pub mod rows;
 mod tiny;
+
+// The phone layout's entry points (`phone_page.rs`): it draws the page and hands it the back
+// gesture. Unused until the layout calls them.
+#[allow(unused_imports)]
+pub use phone_page::{open_list, phone_back, phone_page, phone_shown};
 
 use super::app::prefs;
 use super::app::service::Phase;
@@ -55,6 +61,14 @@ pub enum Section {
     About,
 }
 
+/// Whether a phone shows `section`. General is the desktop's window and updates, Audio & video
+/// needs the desktop's media helper, and Shortcuts are a keyboard's. Notifications are the
+/// desktop's system notifications and taskbar badge, and Voice is the desktop's media helper and
+/// its global keys; a phone has neither yet.
+pub fn on_phone(section: Section) -> bool {
+    !matches!(section, Section::General | Section::Notifications | Section::Audio | Section::Voice | Section::Shortcuts)
+}
+
 impl Section {
     /// In list order; About is pinned to the bottom.
     pub const ALL: [Section; 12] = [
@@ -89,7 +103,7 @@ impl Section {
         }
     }
 
-    fn icon(self) -> &'static str {
+    pub(super) fn icon(self) -> &'static str {
         match self {
             Section::Accounts => "icons/users.svg",
             Section::General => "icons/settings.svg",
@@ -189,15 +203,23 @@ impl Devices {
 struct Host {
     shell: Option<WeakEntity<Shell>>,
     window: Option<WindowHandle<SettingsWindow>>,
+    /// On a phone: Settings as a page of the one window, once it has been opened.
+    page: Option<Entity<SettingsWindow>>,
+    /// On a phone: what was asked for since the page last drew.
+    wanted: Option<phone_page::Wanted>,
 }
 
 impl Global for Host {}
 
 /// The Settings window redraws. Safe to call while the shell is already being updated.
 pub fn redraw(cx: &mut App) {
-    let window = cx.default_global::<Host>().window;
+    let host = cx.default_global::<Host>();
+    let (window, page) = (host.window, host.page.clone());
     if let Some(window) = window {
         let _ = window.update(cx, |_, _, cx| cx.notify());
+    }
+    if let Some(page) = page {
+        page.update(cx, |_, cx| cx.notify());
     }
 }
 
@@ -206,6 +228,10 @@ pub fn note_changed(cx: &mut App) {
     let host = cx.default_global::<Host>();
     let window = host.window;
     let shell = host.shell.clone();
+    let page = host.page.clone();
+    if let Some(page) = page {
+        page.update(cx, |_, cx| cx.notify());
+    }
     if let Some(shell) = shell {
         let _ = shell.update(cx, |shell, cx| {
             if crate::update::announced() {
@@ -233,22 +259,33 @@ pub fn attach(shell: WeakEntity<Shell>, cx: &mut App) {
 
 /// The microphone test's level, from `Change::Meter`; `None` once it is over.
 pub fn meter(level: Option<u8>, cx: &mut App) {
-    let Some(window) = cx.default_global::<Host>().window else {
-        return;
-    };
-    let _ = window.update(cx, |settings, _, cx| {
+    let host = cx.default_global::<Host>();
+    let (window, page) = (host.window, host.page.clone());
+    let heard = |settings: &mut SettingsWindow, cx: &mut Context<SettingsWindow>| {
         settings.level = level;
         if level.is_none() {
             settings.testing = None;
         }
         cx.notify();
-    });
+    };
+    if let Some(page) = page {
+        page.update(cx, heard);
+    }
+    let Some(window) = window else {
+        return;
+    };
+    let _ = window.update(cx, |settings, _, cx| heard(settings, cx));
 }
 
 /// Opens Settings on `section`, or brings the open window forward and shows `section` there.
 /// Safe to call while the shell is already being updated: the shell's own buttons call it from
 /// inside its update, and a new window reads the shell as it first draws.
 pub fn open(section: Section, cx: &mut App) {
+    // A phone has one window: Settings is a page of it (`phone_page`).
+    if super::phone::active() {
+        phone_page::want(phone_page::Wanted::Section(section), cx);
+        return;
+    }
     cx.defer(move |cx| open_now(section, cx));
 }
 
@@ -260,13 +297,24 @@ fn open_now(section: Section, cx: &mut App) {
     if let Some(window) = host.window {
         let shown = window.update(cx, |settings, window, cx| {
             settings.show(section, window, cx);
-            window.activate_window();
+            window.activate();
         });
         if shown.is_ok() {
             return;
         }
     }
-    let bounds = Bounds::centered(None, size(px(SIZE.0), px(SIZE.1)), cx);
+    #[allow(unused_mut)]
+    let mut wanted = SIZE;
+    // `--settings-size 390x844`: the window at a phone's size, for a shot.
+    #[cfg(feature = "gui-shot")]
+    if let Some((wide, tall)) = std::env::args()
+        .skip_while(|arg| arg != "--settings-size")
+        .nth(1)
+        .and_then(|size| size.split_once('x').and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?))))
+    {
+        wanted = (wide, tall);
+    }
+    let bounds = Bounds::centered(None, size(px(wanted.0), px(wanted.1)), cx);
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         titlebar: Some(TitlebarOptions {
@@ -291,7 +339,7 @@ fn open_now(section: Section, cx: &mut App) {
             }
             true
         });
-        cx.new(|cx| SettingsWindow::new(shell, section, window, cx))
+        cx.new(|cx| SettingsWindow::new(shell, section, false, window, cx))
     });
     match opened {
         Ok(window) => cx.default_global::<Host>().window = Some(window),
@@ -347,6 +395,14 @@ pub struct SettingsWindow {
     pub(super) highlight: Option<&'static str>,
     /// The Tiny server account's name field.
     tiny: tiny::TinyAccount,
+    /// Drawn as the phone's page: a list of sections, then one section at a time.
+    pub(super) phone: bool,
+    /// On a phone: the list of sections is on show, not `section`.
+    pub(super) listing: bool,
+    /// On a phone: the page is up. Closing it hides it; nothing is lost.
+    pub(super) shown: bool,
+    /// The width last drawn at, for a phone's slider tracks.
+    pub(super) width: f32,
     /// The key recorder taking the next key (V13, V15 to V17), and what has the keys while it
     /// does. The modifiers held so far with no other key, for a modifier bound on its own.
     pub(super) recording: Option<&'static str>,
@@ -363,7 +419,7 @@ pub struct SettingsWindow {
 }
 
 impl SettingsWindow {
-    fn new(shell: WeakEntity<Shell>, section: Section, window: &mut Window, cx: &mut Context<Self>) -> SettingsWindow {
+    fn new(shell: WeakEntity<Shell>, section: Section, phone: bool, window: &mut Window, cx: &mut Context<Self>) -> SettingsWindow {
         let search = cx.new(|cx| TextInput::new("Search settings", cx));
         let mut subscriptions = vec![
             cx.subscribe_in(&search, window, |this, input, event: &InputEvent, _, cx| {
@@ -421,6 +477,10 @@ impl SettingsWindow {
             tested: None,
             highlight: None,
             tiny,
+            phone,
+            listing: phone,
+            shown: phone,
+            width: f32::from(window.viewport_size().width),
             recording: None,
             recorder_focus: cx.focus_handle(),
             held_modifiers: gpui::Modifiers::default(),
@@ -447,7 +507,11 @@ impl SettingsWindow {
         self.picker = None;
         self.choice = None;
         self.highlight = None;
-        window.set_window_title(section.name());
+        if self.phone {
+            self.listing = false;
+        } else {
+            window.set_window_title(section.name());
+        }
         self.entered(section, cx);
         let mut choices = prefs::choices();
         if choices.section != section {
@@ -857,6 +921,8 @@ impl SettingsWindow {
             self.query.clear();
             self.search.update(cx, |input, cx| input.set_text("", cx));
             cx.notify();
+        } else if self.phone {
+            self.phone_up(cx);
         } else {
             self.stop_test(cx);
             self.stop_recording(cx);
@@ -1012,8 +1078,9 @@ fn mediad_path() -> std::path::PathBuf {
 
 /// The system's devices, by the names a call takes. `None` when mediad could not say.
 fn read_devices() -> Option<Devices> {
-    let output = protocol::launch::no_console(std::process::Command::new(mediad_path()).arg("--devices")).stderr(std::process::Stdio::null()).output().ok()?;
-    let json: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    // The process on a desktop; mediad's threads in this process on a phone.
+    let stdout = protocol::media_host::output(protocol::launch::no_console(std::process::Command::new(mediad_path()).arg("--devices")).stderr(std::process::Stdio::null())).ok()?;
+    let json: serde_json::Value = serde_json::from_slice(&stdout).ok()?;
     // With ids; a mediad from before ids had names alone, which stand in for both.
     let devices = |key: &str, names: &str| -> Vec<protocol::AudioDevice> {
         match serde_json::from_value::<Vec<protocol::AudioDevice>>(json[key].clone()) {
@@ -1040,6 +1107,9 @@ fn read_devices() -> Option<Devices> {
 
 /// A modal: title, sentences, Cancel and the action, over a scrim that cancels on a click.
 pub(super) fn modal_panel(title: impl Into<SharedString>, words: Vec<String>, action: gpui::Stateful<Div>, cx: &mut Context<SettingsWindow>) -> Div {
+    if super::phone::active() {
+        return phone_page::modal_sheet(title.into(), words, action, cx);
+    }
     let panel = super::components::modal(title)
         .children(words.into_iter().map(|line| div().mt(px(8.)).type_ui().text_color(theme::text_soft()).child(line)))
         .child(
@@ -1056,6 +1126,9 @@ pub(super) fn modal_panel(title: impl Into<SharedString>, words: Vec<String>, ac
 
 /// A panel over the whole window. A click on the scrim closes it.
 pub(super) fn modal_layer(panel: Div, cx: &mut Context<SettingsWindow>) -> Div {
+    if super::phone::active() {
+        return phone_page::sheet_layer(panel, cx);
+    }
     div()
         .absolute()
         .inset_0()
@@ -1081,6 +1154,9 @@ pub(super) fn modal_layer(panel: Div, cx: &mut Context<SettingsWindow>) -> Div {
 
 impl Render for SettingsWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.phone {
+            return self.phone_render(window, cx);
+        }
         let modal = self.confirm.clone().map(|confirm| self.modal(&confirm, cx));
         let menu = self.picker.and_then(|picker| self.device_menu(picker, window, cx)).or_else(|| self.choice.and_then(|id| self.choice_menu(id, window, cx)));
         let toast = self.log_note.as_ref().filter(|(at, _)| at.elapsed() < Duration::from_secs(4)).map(|(_, note)| {
@@ -1193,13 +1269,38 @@ pub fn shot(cx: &mut App) {
     cx.spawn(async move |cx| {
         cx.background_executor().timer(std::time::Duration::from_millis(900)).await;
         let open_on = Section::ALL.into_iter().find(|s| s.name().to_lowercase().starts_with(&section.to_lowercase())).unwrap_or(Section::Accounts);
-        // From inside the shell's update, as the shell's own buttons open it.
-        cx.update(|cx| {
-            if let Some(shell) = cx.default_global::<Host>().shell.clone() {
-                let _ = shell.update(cx, |_, cx| open(open_on, cx));
-            }
-        });
-        let Some(window) = cx.update(|cx| cx.default_global::<Host>().window) else {
+        // A phone's Settings is a page of its one window (`phone_page`). The shot draws that page
+        // in a window of its own at the phone's size, as the layout would draw it full screen.
+        let window = if cx.update(|_| super::phone::active()) {
+            let listing = section == "list";
+            cx.update(|cx| {
+                let shell = cx.default_global::<Host>().shell.clone()?;
+                let wanted = flag("--settings-size")
+                    .and_then(|size| size.split_once('x').and_then(|(w, h)| Some((w.parse::<f32>().ok()?, h.parse::<f32>().ok()?))))
+                    .unwrap_or((390., 844.));
+                let bounds = Bounds::centered(None, size(px(wanted.0), px(wanted.1)), cx);
+                let options = WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), is_resizable: false, ..Default::default() };
+                cx.open_window(options, |window, cx| {
+                    cx.new(|cx| {
+                        let mut settings = SettingsWindow::new(shell, open_on, true, window, cx);
+                        if !listing && on_phone(open_on) {
+                            settings.show(open_on, window, cx);
+                        }
+                        settings
+                    })
+                })
+                .ok()
+            })
+        } else {
+            // From inside the shell's update, as the shell's own buttons open it.
+            cx.update(|cx| {
+                if let Some(shell) = cx.default_global::<Host>().shell.clone() {
+                    let _ = shell.update(cx, |_, cx| open(open_on, cx));
+                }
+            });
+            cx.update(|cx| cx.default_global::<Host>().window)
+        };
+        let Some(window) = window else {
             return;
         };
         let _ = window.update(cx, |settings, _, cx| {

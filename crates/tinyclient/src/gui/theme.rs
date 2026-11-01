@@ -2,8 +2,16 @@
 //! every value from here and nowhere else. Dark only until the light values have been checked.
 
 use gpui::{hsla, point, px, rgb, rgba, BoxShadow, FontWeight, Hsla, Rgba, Styled};
+use palette::IntoColor;
 
-// Surfaces. The rail is not a third stripe: it takes the sidebar's value.
+use super::phone::tokens as phone_tokens;
+
+fn phone() -> bool {
+    super::phone::active()
+}
+
+// Surfaces. The rail is not a third stripe: it takes the sidebar's value. On a phone the same
+// slots hold the quieter "Paper Signal" values; the desktop never reads them.
 pub fn rail() -> Rgba { rgb(0x121315) }
 pub fn sidebar() -> Rgba { rgb(0x121315) }
 pub fn canvas() -> Rgba { rgb(0x18191c) }
@@ -47,21 +55,42 @@ pub fn text_soft() -> Rgba { rgb(0xa8abb3) }
 pub fn text_faint() -> Rgba { rgb(0x858993) }
 pub fn text_disabled() -> Rgba { rgb(0x53565e) }
 
-// Accent: "for you" or "this will act". Never plain unread.
-pub fn accent() -> Rgba { rgb(0x2f6feb) }
-pub fn accent_hover() -> Rgba { rgb(0x3a77ee) }
-pub fn accent_pressed() -> Rgba { rgb(0x2861d3) }
+// Accent: "for you" or "this will act". Never plain unread. On a phone it is the one amber
+// of "Paper Signal"; the desktop keeps its blue.
+pub fn accent() -> Rgba {
+    rgb(0x2f6feb)
+}
+pub fn accent_hover() -> Rgba {
+    rgb(0x3a77ee)
+}
+pub fn accent_pressed() -> Rgba {
+    rgb(0x2861d3)
+}
 /// Links, @mentions, the "New" label, the caret.
-pub fn accent_text() -> Rgba { rgb(0x8ab4ff) }
-pub fn focus() -> Rgba { accent_text() }
-pub fn accent_soft() -> Rgba { rgba(0x2f6feb2e) }
+pub fn accent_text() -> Rgba {
+    rgb(0x8ab4ff)
+}
+pub fn focus() -> Rgba {
+    accent_text()
+}
+pub fn accent_soft() -> Rgba {
+    rgba(0x2f6feb2e)
+}
 /// A message that mentions me.
-pub fn accent_wash() -> Rgba { rgba(0x2f6feb1a) }
+pub fn accent_wash() -> Rgba {
+    rgba(0x2f6feb1a)
+}
 /// The halo of a focused field.
-pub fn accent_halo() -> Rgba { rgba(0x2f6feb59) }
+pub fn accent_halo() -> Rgba {
+    rgba(0x2f6feb59)
+}
 /// Selected text in a field.
-pub fn selection() -> Rgba { rgba(0x2f6feb73) }
-pub fn on_accent() -> Rgba { rgb(0xffffff) }
+pub fn selection() -> Rgba {
+    rgba(0x2f6feb73)
+}
+pub fn on_accent() -> Rgba {
+    rgb(0xffffff)
+}
 
 // Semantic.
 pub fn positive() -> Rgba { rgb(0x3fbf7a) }
@@ -82,12 +111,14 @@ pub fn unread() -> Rgba { text() }
 
 /// `fill` composited on an opaque `surface`: the color a ring needs to match a row's fill.
 pub fn over(fill: Rgba, surface: Rgba) -> Rgba {
-    let mix = |top: f32, bottom: f32| top * fill.a + bottom * (1. - fill.a);
+    let mix = |top: f32, bottom: f32| top * fill.alpha + bottom * (1. - fill.alpha);
     Rgba {
-        r: mix(fill.r, surface.r),
-        g: mix(fill.g, surface.g),
-        b: mix(fill.b, surface.b),
-        a: 1.,
+        color: palette::rgb::Rgb::new(
+            mix(fill.red, surface.red),
+            mix(fill.green, surface.green),
+            mix(fill.blue, surface.blue),
+        ),
+        alpha: 1.,
     }
 }
 
@@ -100,8 +131,27 @@ pub fn row_surface(selected: bool) -> Rgba {
     }
 }
 
+// The faces per platform. `.SystemUIFont` is the system face wherever GPUI maps it (macOS, iOS,
+// Windows, and the desktop Linux builds that already use it). Android has no such alias, and
+// fontique there does not resolve the generic `sans-serif`: the run fell through gpui_ce_mobile's
+// script fallback list to Noto Sans CJK, whose Latin is Source Sans with a full-width-looking
+// word gap. Roboto is the family gpui_ce_mobile names as the system font, present on every
+// Android release.
+#[cfg(not(target_os = "android"))]
 pub const FONT: &str = ".SystemUIFont";
+#[cfg(target_os = "android")]
+pub const FONT: &str = "Roboto";
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub const MONO: &str = "Menlo";
+#[cfg(target_os = "windows")]
+pub const MONO: &str = "Consolas";
+// Android: the generic `monospace` does not resolve either (see FONT); Droid Sans Mono is the
+// mono face in /system/fonts.
+#[cfg(target_os = "android")]
+pub const MONO: &str = "Droid Sans Mono";
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "windows", target_os = "android")))]
+pub const MONO: &str = "monospace";
 
 /// Weights: 400, 500 and 600 only.
 pub const REGULAR: FontWeight = FontWeight::NORMAL;
@@ -175,8 +225,21 @@ pub fn compact() -> bool {
 /// points out.
 pub fn row_height(base: f32) -> f32 {
     let per_step = if base >= ROW_TWO { 4. } else { 2. };
+    if phone() {
+        // A thumb's row: every row at least 44, a two-line row 56, which hold the phone's
+        // baseline type (`phone::tokens::BASELINE`); both grow with the platform's text run so
+        // nothing in them clips.
+        let (floor, lines) = if base >= ROW_TWO { (56., 34.) } else { (44., 18.) };
+        return floor + per_step * text_step() as f32 + (phone_tokens::type_factor() - phone_tokens::BASELINE) * lines;
+    }
     let dense = if base >= ROW_TWO && compact() { 8. } else { 0. };
     base - dense + per_step * text_step() as f32
+}
+
+/// A line box for type of this line height, at the current step and, on a phone, its run: what
+/// a row's line holds so its text never clips.
+pub fn line(height: f32) -> gpui::Pixels {
+    sized(height)
 }
 
 /// The avatar of a conversation row: 32, or 28 when compact.
@@ -189,7 +252,12 @@ pub fn row_avatar() -> f32 {
 }
 
 fn sized(size: f32) -> gpui::Pixels {
-    px(size + text_step() as f32)
+    let base = size + text_step() as f32;
+    if phone() {
+        px((base * phone_tokens::type_factor() * 2.).round() / 2.)
+    } else {
+        px(base)
+    }
 }
 /// Pane padding; lists are inset `INSET` from pane edges.
 pub const PANE_PAD: f32 = 16.;
@@ -231,7 +299,7 @@ impl<T: Styled + Sized> Type for T {}
 
 fn shadow(y: f32, blur: f32, spread: f32, alpha: f32) -> BoxShadow {
     BoxShadow {
-        color: hsla(0., 0., 0., alpha),
+        color: hsla(0., 0., 0., alpha).into(),
         offset: point(px(0.), px(y)),
         blur_radius: px(blur),
         spread_radius: px(spread),
@@ -255,7 +323,7 @@ pub fn shadow_modal() -> Vec<BoxShadow> {
 /// The sidebar when it floats over the conversation in a narrow window.
 pub fn shadow_pane() -> Vec<BoxShadow> {
     vec![BoxShadow {
-        color: hsla(0., 0., 0., 0.6),
+        color: hsla(0., 0., 0., 0.6).into(),
         offset: point(px(16.), px(0.)),
         blur_radius: px(48.),
         spread_radius: px(0.),
@@ -263,9 +331,9 @@ pub fn shadow_pane() -> Vec<BoxShadow> {
     }]
 }
 
-fn ring(color: impl Into<Hsla>, spread: f32) -> BoxShadow {
+fn ring(color: impl IntoColor<Hsla>, spread: f32) -> BoxShadow {
     BoxShadow {
-        color: color.into(),
+        color: color.into_color().into(),
         offset: point(px(0.), px(0.)),
         blur_radius: px(0.),
         spread_radius: px(spread),

@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>Tiny</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.2.15</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
+
+	<!-- Export compliance. An E2EE messenger is normally "uses non-exempt encryption" with an
+	     exemption claim, not "no". This is a PLACEHOLDER: the honest value plus the
+	     ITSEncryptionExportComplianceCode App Store Connect issues go here before the first
+	     TestFlight upload. See research_notes/mobile/build-ci-release.md §3.3 and
+	     docs/mobile-build.md. -->
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<true/>
+
+	<!-- Scene lifecycle, mandated by iOS 27. The delegate class is resolved in the app's module
+	     so it works without an @objc(SceneDelegate) name. -->
+	<key>UIApplicationSceneManifest</key>
+	<dict>
+		<key>UIApplicationSupportsMultipleScenes</key>
+		<false/>
+		<key>UISceneConfigurations</key>
+		<dict>
+			<key>UIWindowSceneSessionRoleApplication</key>
+			<array>
+				<dict>
+					<key>UISceneConfigurationName</key>
+					<string>Default Configuration</string>
+				</dict>
+			</array>
+		</dict>
+	</dict>
+
+	<!-- Required by the iOS 27 SDK: a launch screen, even an empty one. -->
+	<key>UILaunchScreen</key>
+	<dict>
+		<key>UIColorName</key>
+		<string></string>
+	</dict>
+
+	<!-- Calls (src/mobile/ios/audio.rs asks with AVCaptureDevice.requestAccess). -->
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Tiny uses the microphone for voice and video calls and voice messages.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>Tiny uses the camera for video calls.</string>
+
+	<!-- A call keeps its audio session (and its sound) when the app goes to the background. -->
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>audio</string>
+	</array>
+
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
+	<key>UIRequiredDeviceCapabilities</key>
+	<array>
+		<string>arm64</string>
+	</array>
+</dict>
+</plist>

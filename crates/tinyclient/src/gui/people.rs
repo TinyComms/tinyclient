@@ -485,6 +485,11 @@ impl Shell {
     /// Opens the profile card of a person beside `anchor`: a click's position, or an avatar's
     /// corner. Escape or a click outside closes it.
     pub(super) fn open_profile(&mut self, person: Key, anchor: Point<Pixels>, cx: &mut Context<Self>) {
+        // A phone has no room for a card over the conversation: the person opens as the
+        // Profile page, the right pane pushed full-screen.
+        if super::phone::active() {
+            return self.phone_profile(person, cx);
+        }
         // With the side pane on people (a member list, or someone already), a person clicked
         // goes there and stays while the conversation is read. A thread is not given up for it.
         if matches!(self.right_kind(), Some(RightKind::Members | RightKind::Info)) {
@@ -494,6 +499,13 @@ impl Shell {
         let floating = self.floating_entity(cx);
         floating.update(cx, |floating, cx| floating.open(Float::Card(person), anchor, cx));
         cx.notify();
+    }
+
+    /// A person on a phone: their Profile page, seen from the open conversation's Space.
+    pub(super) fn phone_profile(&mut self, person: Key, cx: &mut Context<Self>) {
+        let open = self.snapshot.as_ref().and_then(|snapshot| snapshot.open.as_ref());
+        let space = info::space_of(open, &person).map(|(key, _)| key);
+        self.details_person(person, space, cx);
     }
 
     fn open_row_menu(&mut self, person: Key, anchor: Point<Pixels>, cx: &mut Context<Self>) {

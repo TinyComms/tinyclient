@@ -17,6 +17,7 @@ pub mod crash;
 mod e2ee;
 pub mod hotkey;
 pub mod log_policy;
+pub mod media_host;
 pub mod private;
 mod info;
 pub mod ipc;
@@ -28,6 +29,7 @@ mod react;
 pub mod settings;
 mod signin;
 mod tiny;
+pub mod web_sign_in;
 
 pub use call::*;
 pub use crash::redact;
@@ -2102,10 +2104,23 @@ pub enum Response {
     },
 }
 
+/// The phone's app-private data directory, set once by the mobile entry (`set_support_dir`).
+static APP_SUPPORT_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Names the app's private data directory on a phone. The Android shell calls it before the window
+/// starts, because Android has no `HOME` and the fallback below would land in `/tmp`. Not an
+/// environment variable: `TINYCLIENT_DIR` marks a scratch run, which keeps no sign-ins.
+pub fn set_support_dir(dir: PathBuf) {
+    let _ = APP_SUPPORT_DIR.set(dir);
+}
+
 /// `TINYCLIENT_DIR` moves the socket and database, for tests and the demo seed.
 pub fn support_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("TINYCLIENT_DIR") {
         return PathBuf::from(dir);
+    }
+    if let Some(dir) = APP_SUPPORT_DIR.get() {
+        return dir.clone();
     }
     if cfg!(target_os = "macos") {
         let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/tmp"));
@@ -2128,7 +2143,37 @@ pub fn support_dir() -> PathBuf {
 }
 
 pub fn chat_sock_path() -> PathBuf {
-    support_dir().join(CHAT_SOCK_NAME)
+    chat_sock_path_in(&support_dir())
+}
+
+/// The bytes a Unix socket path may hold, NUL included (`sun_path`): 104 on Apple systems, 108
+/// elsewhere. A longer path fails at bind or connect, so [`ipc`] checks it first.
+pub const SUN_PATH_MAX: usize = if cfg!(target_vendor = "apple") { 104 } else { 108 };
+
+/// chatd's socket for a support directory. On iOS the directory is not used: an app's container
+/// path alone is about 76 bytes, and the socket under the support directory would run past
+/// [`SUN_PATH_MAX`]. The socket goes to `tmp/cs` under the container instead.
+pub fn chat_sock_path_in(dir: &std::path::Path) -> PathBuf {
+    if cfg!(target_os = "ios") {
+        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/tmp"));
+        let short = short_sock_path(&home);
+        if short.as_os_str().len() < SUN_PATH_MAX {
+            return short;
+        }
+        // The simulator's container lives under the Mac's ~/Library/Developer/CoreSimulator, about
+        // 150 bytes deep, and a simulated app may use the Mac's /tmp: one directory per container.
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        home.as_os_str().hash(&mut hasher);
+        return PathBuf::from(format!("/tmp/tinyclient-{:016x}", hasher.finish())).join(CHAT_SOCK_NAME);
+    }
+    dir.join(CHAT_SOCK_NAME)
+}
+
+/// The socket under an app container: `<container>/tmp/cs/chat.sock`.
+#[cfg_attr(not(target_os = "ios"), allow(dead_code))]
+fn short_sock_path(container: &std::path::Path) -> PathBuf {
+    container.join("tmp").join("cs").join(CHAT_SOCK_NAME)
 }
 
 /// The largest frame either side writes or reads.
@@ -2395,5 +2440,42 @@ mod tests {
             assert!(!json.contains(absent), "{absent} in {json}");
         }
         assert_eq!(serde_json::from_str::<Message>(&json).unwrap(), message);
+    }
+}
+
+#[cfg(test)]
+mod sock_path_tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn ios_socket_path_fits_sun_path_in_a_device_container() {
+        // A device container: iOS gives every app a root of this shape, its UUID 36 bytes long.
+        let container = Path::new("/var/mobile/Containers/Data/Application/0A1B2C3D-4E5F-6071-8293-A4B5C6D7E8F9");
+        let path = short_sock_path(container);
+        assert!(path.as_os_str().len() < 104, "{} bytes: {}", path.as_os_str().len(), path.display());
+    }
+
+    #[test]
+    fn android_socket_path_fits_sun_path_in_the_app_data_dir() {
+        let dir = Path::new("/data/user/0/dev.tinyclient.app/files");
+        let path = chat_sock_path_in(dir);
+        assert!(path.as_os_str().len() < 104, "{} bytes: {}", path.as_os_str().len(), path.display());
+    }
+
+    #[test]
+    fn desktop_socket_stays_in_the_support_dir() {
+        if !cfg!(target_os = "ios") {
+            assert_eq!(chat_sock_path_in(Path::new("/x/tinyclient")), Path::new("/x/tinyclient/chat.sock"));
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn an_over_long_socket_path_is_refused_by_name() {
+        let long = Path::new("/tmp").join("x".repeat(200)).join("chat.sock");
+        let err = ChatStream::connect(&long).err().expect("a path past sun_path cannot connect");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("bytes"), "{err}");
     }
 }

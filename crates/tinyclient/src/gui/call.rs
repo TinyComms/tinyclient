@@ -10,9 +10,16 @@ mod dock;
 pub(in crate::gui) mod health;
 mod people;
 mod permission;
+pub(crate) mod phone;
 pub(in crate::gui) mod security;
 #[cfg(feature = "gui-shot")]
 mod shot;
+
+// The platform's side of a phone call: the mobile layer routes these (`phone::hooks`).
+#[allow(unused_imports)]
+pub(crate) use phone::hooks::{
+    note_permission, open_system_settings, route_audio, route_flip, route_system_settings, Permission, Route,
+};
 
 #[allow(unused_imports)]
 pub(super) use people::occupants;
@@ -24,7 +31,7 @@ use super::theme;
 use crate::client::ask;
 use gpui::{
     div, prelude::*, px, Action, AnyElement, App, Context, Div, Entity, FontWeight, Global, KeyBinding,
-    MouseButton, Rgba, Stateful, Svg, Task, WeakEntity, Window,
+    MouseButton, Rgba, SharedString, Stateful, Svg, Task, WeakEntity, Window,
 };
 use protocol::settings::MUTED_TALK;
 use protocol::{
@@ -216,6 +223,10 @@ pub struct State {
     counter: OnceCell<Entity<Counter>>,
     /// The same count, for a Tiny channel's stage: a second text, ticking on its own.
     stage_counter: OnceCell<Entity<Counter>>,
+    /// The same count again, for the phone's call screen and its call bar (one shows at a time).
+    phone_counter: OnceCell<Entity<Counter>>,
+    /// What the phone's call screen keeps: minimised or not, its page and sheets, the camera tile.
+    pub(in crate::gui) phone: phone::State,
     /// Talking while muted: what the meter heard, and the redraw that takes the pill away.
     muted_talk: health::MutedTalk,
     muted_talk_task: Option<Task<()>>,
@@ -388,11 +399,18 @@ fn handoff_label(network: Network) -> String {
     }
 }
 
-/// Hands a link to the system. Only something with a scheme, never an option.
-pub(in crate::gui) fn open(url: &str) -> Result<(), String> {
+/// Only something with a scheme, never an option.
+fn checked_link(url: &str) -> Result<(), String> {
     if url.starts_with('-') || !url.contains(':') {
         return Err(format!("Not a link: {url}"));
     }
+    Ok(())
+}
+
+/// Hands a link to the system. Only something with a scheme, never an option. Not used on
+/// phones (`links_through_gpui`): there the caller opens it on the UI thread with `cx.open_url`.
+pub(in crate::gui) fn open(url: &str) -> Result<(), String> {
+    checked_link(url)?;
     system_open(url)
 }
 
@@ -426,6 +444,11 @@ fn system_open(url: &str) -> Result<(), String> {
 
 /// The dock, in the shape of the sidebar's slot (`layout::Slots::call_dock`).
 pub(super) fn dock(shell: &Shell, _: &mut Window, cx: &mut Context<Shell>) -> Option<AnyElement> {
+    // A phone draws every state of a call full-screen, or as the bar over every screen
+    // (`phone`), never as a card at the end of the list.
+    if super::phone::active() {
+        return None;
+    }
     let snapshot = shell.snapshot.as_ref()?;
     shell.call_dock(snapshot, cx).map(IntoElement::into_any_element)
 }
@@ -445,6 +468,7 @@ impl Shell {
         };
         let last = call.as_ref().map(|call| (call.conversation.clone(), discriminant(&call.state)));
         if self.call_state.last != last {
+            self.call_state.phone.state_changed(call.as_ref(), self.call_state.last.as_ref().map(|(key, _)| key));
             self.call_state.last = last;
             self.call_state.since = now();
             self.call_state.error = None;
@@ -479,6 +503,10 @@ impl Shell {
                     self.call_menu_set(None, cx);
                 }
                 self.call_device_notice(call, cx);
+                // Answered with video on a phone: the camera goes on once the call is up.
+                if call.state == CallState::Joined && std::mem::take(&mut self.call_state.phone.video_on_join) {
+                    self.call_ask(Request::Media(protocol::MediaRequest::Camera { on: true }), cx);
+                }
                 if !call.deafened {
                     self.call_state.mute_before_deafen = None;
                 }
@@ -881,11 +909,15 @@ impl Shell {
         self.call_asked();
         let state = &mut self.call_state;
         (state.error, state.local, state.ended) = (None, None, None);
+        // A call asked for here opens full-screen on a phone.
+        state.phone.minimised = false;
+        // The phone's platform says when the microphone is refused (`phone::hooks`).
+        let phone_denied = phone::hooks::denied(Permission::Microphone);
         cx.notify();
         cx.spawn(async move |this, cx| {
             let work = async move {
                 // A picture of the dock never asks anyone for the microphone.
-                let allowed = cfg!(feature = "gui-shot") || permission::ensure() != permission::Microphone::Denied;
+                let allowed = cfg!(feature = "gui-shot") || (!phone_denied && permission::ensure() != permission::Microphone::Denied);
                 if !allowed {
                     return Err(None);
                 }
@@ -946,19 +978,25 @@ impl Shell {
     pub(super) fn call_handoff(&mut self, conversation: Key, cx: &mut Context<Self>) {
         self.call_state.error = None;
         cx.spawn(async move |this, cx| {
+            // Ok(Some(url)): a phone opens it below, on the UI thread, through GPUI.
             let work = async move {
                 match ask(&Request::Handoff { conversation }) {
-                    Ok(Response::Link { url }) => open(&url),
+                    Ok(Response::Link { url }) if super::links_through_gpui() => checked_link(&url).map(|()| Some(url)),
+                    Ok(Response::Link { url }) => open(&url).map(|()| None),
                     Ok(Response::Error { detail, .. }) => Err(detail),
                     Ok(_) => Err(crate::client::OTHER_ANSWER.to_owned()),
                     Err(err) => Err(crate::client::trouble_words("call", &err)),
                 }
             };
-            let refused = cx.background_executor().spawn(work).await.err();
+            let outcome = cx.background_executor().spawn(work).await;
             let _ = this.update(cx, |this, cx| {
-                if refused.is_some() {
-                    this.call_state.error = refused.clone();
-                    this.refused = refused;
+                match outcome {
+                    Ok(Some(url)) => cx.open_url(&url),
+                    Ok(None) => {}
+                    Err(refused) => {
+                        this.call_state.error = Some(refused.clone());
+                        this.refused = Some(refused);
+                    }
                 }
                 cx.notify();
             });
@@ -977,23 +1015,53 @@ impl Shell {
         let mine = self.call_shown(snapshot).filter(|call| {
             call.conversation == key && !matches!(call.state, CallState::Failed { .. })
         });
-        let pill = div()
-            .id("call")
-            .group("call-pill")
-            .flex_none()
-            .h(px(30.))
-            .px(px(12.))
-            .rounded(px(15.))
-            .border_1()
-            .flex()
-            .items_center()
-            .gap(px(7.))
-            .text_size(px(12.5))
-            .font_weight(FontWeight::MEDIUM)
-            .cursor_pointer()
-            // Keep the press from also dragging the window.
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+        // On a phone the strip's actions are glyphs in 44 pt targets, Members and Details beside
+        // it: the call is one more of them, its glyph alone, tinted by what it does.
+        let phone = super::phone::active();
+        let pill = if phone {
+            div()
+                .id("call")
+                .group("call-pill")
+                .flex_none()
+                .size(px(44.))
+                .rounded(px(theme::R_CONTROL))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .active(|style| style.bg(theme::pressed()))
+        } else {
+            div()
+                .id("call")
+                .group("call-pill")
+                .flex_none()
+                .h(px(30.))
+                .px(px(12.))
+                .rounded(px(15.))
+                .border_1()
+                .flex()
+                .items_center()
+                .gap(px(7.))
+                .text_size(px(12.5))
+                .font_weight(FontWeight::MEDIUM)
+                .cursor_pointer()
+        }
+        // Keep the press from also dragging the window.
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+        let words = |words: SharedString| (!phone).then_some(words);
+        let glyph = |size: f32| if phone { 16. } else { size };
 
+        // On a phone my own call is a screen of its own: the strip's glyph goes back to it.
+        if let Some(call) = mine.as_ref().filter(|_| phone) {
+            let live = in_call(call);
+            let color = if live { theme::positive() } else { theme::text_soft() };
+            return Some(
+                pill.border_color(gpui::transparent_black())
+                    .tooltip(tip("Back to the call", Some("⌘⇧J")))
+                    .on_click(cx.listener(|this, _, _, cx| this.call_phone_restore(cx)))
+                    .child(icon(if live { "icons/audio-lines.svg" } else { "icons/phone.svg" }, 18., color, None)),
+            );
+        }
         if let Some(call) = mine {
             let incoming = matches!(call.state, CallState::RingingIn { .. });
             let word = match call.state {
@@ -1003,7 +1071,7 @@ impl Shell {
             };
             let hint = if incoming { ("Decline the call", "⌘⇧R") } else { ("Leave the call", "⌘⇧H") };
             return Some(
-                pill.bg(theme::danger_soft())
+                pill.when(!phone, |pill| pill.bg(theme::danger_soft()))
                     .border_color(gpui::transparent_black())
                     .text_color(theme::danger())
                     .hover(|style| style.bg(theme::danger_fill()).text_color(theme::on_accent()))
@@ -1015,8 +1083,8 @@ impl Shell {
                             this.call_leave(cx);
                         }
                     }))
-                    .child(icon("icons/phone-off.svg", 14., theme::danger(), Some(("call-pill", theme::on_accent()))))
-                    .child(word),
+                    .child(icon("icons/phone-off.svg", glyph(14.), theme::danger(), Some(("call-pill", theme::on_accent()))))
+                    .children(words(word.into())),
             );
         }
         let network = key.network;
@@ -1033,17 +1101,17 @@ impl Shell {
                 let running = shot.as_ref().or(running);
                 if let Some(there) = running {
                     return Some(
-                        pill.bg(theme::accent_soft())
+                        pill.when(!phone, |pill| pill.bg(theme::accent_soft()))
                             .border_color(gpui::transparent_black())
                             .text_color(theme::accent())
                             .hover(|style| style.bg(theme::accent_wash()))
                             .tooltip(tip(named(there), None))
                             .on_click(cx.listener(move |this, _, _, cx| this.call_start(key.clone(), cx)))
-                            .child(icon("icons/phone.svg", 14., theme::accent(), None))
-                            .child(format!("Join call · {}", there.total)),
+                            .child(icon("icons/phone.svg", glyph(14.), theme::accent(), None))
+                            .children(words(format!("Join call · {}", there.total).into())),
                     );
                 }
-                let (glyph, word, hint) = if voice {
+                let (mark, word, hint) = if voice {
                     (
                         "icons/volume-2.svg",
                         "Join voice",
@@ -1053,14 +1121,14 @@ impl Shell {
                     ("icons/phone.svg", "Call", format!("Call {} on {}", open.title, network.label()))
                 };
                 Some(
-                    pill.bg(theme::raised())
+                    pill.when(!phone, |pill| pill.bg(theme::raised()))
                         .border_color(theme::hairline())
                         .text_color(theme::text())
                         .hover(|style| style.bg(theme::selected()))
                         .tooltip(tip(hint, None))
                         .on_click(cx.listener(move |this, _, _, cx| this.call_start(key.clone(), cx)))
-                        .child(icon(glyph, 14., theme::text(), None))
-                        .child(word),
+                        .child(icon(mark, glyph(14.), if phone { theme::text_soft() } else { theme::text() }, None))
+                        .children(words(word.into())),
                 )
             }
             // Never says "Call": it is a different object, and it starts nothing here.
@@ -1078,11 +1146,14 @@ impl Shell {
                     .hover(|style| style.bg(theme::hover()).text_color(theme::text()))
                     .tooltip(tip(hint, None))
                     .on_click(cx.listener(move |this, _, _, cx| this.call_handoff(key.clone(), cx)))
-                    .child(network_icon(network, 14.));
+                    .child(network_icon(network, glyph(14.)));
                 if quiet {
-                    pill = pill.px(px(7.)).size(px(28.)).rounded(px(theme::R_CONTROL)).justify_center();
+                    let side = if phone { 44. } else { 28. };
+                    pill = pill.px(px(7.)).size(px(side)).rounded(px(theme::R_CONTROL)).justify_center();
                 } else {
-                    pill = pill.child(handoff_label(network)).child(icon("icons/arrow-up-right.svg", 12., theme::text_faint(), None));
+                    pill = pill
+                        .children(words(handoff_label(network).into()))
+                        .children((!phone).then(|| icon("icons/arrow-up-right.svg", 12., theme::text_faint(), None)));
                 }
                 Some(pill)
             }

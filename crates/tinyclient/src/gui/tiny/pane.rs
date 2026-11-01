@@ -21,7 +21,7 @@ impl Shell {
                 .size_full()
                 .flex()
                 .flex_col()
-                .child(drags_window(div()).h(px(TOP_BAR)).flex_none().px(px(theme::PANE_PAD)).flex().items_center().gap(px(8.)).child(self.strip_controls(window, cx)).child(pane_title("Tiny server")));
+                .child(drags_window(div()).h(px(TOP_BAR)).flex_none().px(px(theme::PANE_PAD)).flex().items_center().gap(px(8.)).when(!crate::gui::phone::active(), |bar| bar.child(self.strip_controls(window, cx))).child(pane_title("Tiny server")));
             let Some(detail) = self.tiny_state.error.clone() else {
                 return strip.child(self.tiny_loading_pane(beside));
             };
@@ -34,6 +34,8 @@ impl Shell {
                     .child(detail),
             );
         };
+        // A phone walks the server from its own sidebar, so the page is one column.
+        let phone = crate::gui::phone::active();
         let room = self.tiny_state.channel.as_ref().and_then(|id| page.community.rooms.iter().find(|room| room.id == *id));
         let width = f32::from(window.viewport_size().width) - RAIL_WIDTH - if beside { self.layout_state.sidebar_width } else { 0. };
         let members = self.tiny_state.members_open && width - MEMBERS_WIDTH - if beside { 0. } else { 260. } >= MAIN_MIN;
@@ -92,7 +94,8 @@ impl Shell {
             .flex()
             .items_center()
             .gap(px(8.))
-            .child(self.strip_controls(window, cx))
+            // A phone has no sidebar to hide and goes back with its own gesture.
+            .when(!phone, |bar| bar.child(self.strip_controls(window, cx)))
             .child(title)
             .child(toggle);
         let main = match room {
@@ -109,7 +112,7 @@ impl Shell {
                     .flex_1()
                     .min_h_0()
                     .flex()
-                    .when(!beside, |row| row.child(div().w(px(260.)).h_full().flex_none().flex().flex_col().bg(theme::sidebar()).border_r_1().border_color(theme::hairline()).child(self.tiny_directory(cx))))
+                    .when(!beside && !phone, |row| row.child(div().w(px(260.)).h_full().flex_none().flex().flex_col().bg(theme::sidebar()).border_r_1().border_color(theme::hairline()).child(self.tiny_directory(cx))))
                     .child(div().flex_1().min_w_0().h_full().child(main))
                     .when(members, |row| row.child(self.tiny_members(&page, window, cx))),
             )

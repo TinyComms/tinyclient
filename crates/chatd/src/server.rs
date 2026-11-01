@@ -130,6 +130,8 @@ pub struct Chat {
     searches: Arc<Searches>,
     /// Itself, for the work a request starts that outlives the request (`ReadSessions`).
     this: OnceLock<Weak<Chat>>,
+    /// Running inside an app (`start_in_process`): a `Shutdown` must not end the process.
+    in_process: bool,
 }
 
 /// A refusal on its way out of a helper. Boxed, because a `Response` is large.
@@ -162,6 +164,18 @@ pub(crate) fn login_path() -> io::Result<PathBuf> {
     Ok(std::env::current_exe()?.with_file_name(format!("tinyclient-login{}", std::env::consts::EXE_SUFFIX)))
 }
 
+/// How a web sign-in that did not finish ended, in the user's words: the helper's exit code
+/// (`crates/login`), or the same code from `login::web` on a phone.
+fn sign_in_ended(network: Network, code: Option<i32>) -> Response {
+    let name = network.label();
+    match code {
+        Some(1) => error(ErrorCode::SignIn, "The sign-in window was closed."),
+        Some(3) => error(ErrorCode::SignInUnreachable, format!("{name}'s sign-in page could not be loaded. Check the connection and try again.")),
+        Some(4) => error(ErrorCode::SignInBlocked, format!("Your organization does not allow signing in to {name} this way.")),
+        _ => error(ErrorCode::SignIn, "The sign-in window stopped before it finished."),
+    }
+}
+
 /// `TINYCLIENT_TEST_KEYCHAIN_MS`: in a scratch directory, a session read takes this long, as one
 /// held up by a keychain prompt does. Never read otherwise.
 fn test_keychain_delay() -> Option<Duration> {
@@ -181,6 +195,15 @@ impl Chat {
     /// Everything but the sessions: those are read by [`serve`] once the socket answers
     /// (`read_sessions`), because a keychain read can wait on the user for as long as they like.
     pub fn new(store: Store) -> Chat {
+        Chat::build(store, false)
+    }
+
+    /// The same core for a process that is an app (phones): see `shutdown`.
+    pub fn in_process(store: Store) -> Chat {
+        Chat::build(store, true)
+    }
+
+    fn build(store: Store, in_process: bool) -> Chat {
         let hub = Arc::new(Hub::new(store));
         let chat = Chat {
             blobs: Blobs::new(hub.clone(), support_dir().join("media")),
@@ -188,6 +211,7 @@ impl Chat {
             adapters: Arc::default(),
             searches: Arc::default(),
             this: OnceLock::new(),
+            in_process,
         };
         // A call that fails here (mediad died, a deadline passed) is still up on the network
         // until the adapter leaves: the other side would go on ringing, the channel go on
@@ -434,6 +458,11 @@ impl Chat {
     /// chatd stops: the call is left on the network first, and the answer goes out before the
     /// process does.
     fn shutdown(&self) -> Response {
+        // Inside an app the core is the app's: exiting would close the window too. Refused, not
+        // answered Ok, so no caller reads a stop that did not happen.
+        if self.in_process {
+            return error(ErrorCode::Unsupported, "chatd runs inside the app and stops when the app does");
+        }
         if let Some(conversation) = self.hub.calls.end(&self.hub) {
             self.command(&conversation.account(), Command::CallLeave(conversation.id));
         }
@@ -1515,31 +1544,21 @@ impl Chat {
         }
         // A scratch directory signs nobody in. A test may still name a helper of its own, to
         // see what it is run with and how its answer is told; its session is never kept.
-        if !session::enabled() && std::env::var_os("TINYCLIENT_LOGIN").is_none() {
+        // A phone shows the page in its own web view (`protocol::web_sign_in`) and the same
+        // logic as the helper's runs here (`login::web`); a desktop runs the helper.
+        let web = protocol::web_sign_in::provider();
+        if !session::enabled() && std::env::var_os("TINYCLIENT_LOGIN").is_none() && web.is_none() {
             return error(ErrorCode::SignIn, "sign-in is off while TINYCLIENT_DIR is set");
         }
-        let helper = login_path().and_then(|path| {
-            let mut helper = std::process::Command::new(path);
-            protocol::log_policy::share_session(&mut helper);
-            protocol::launch::no_console(&mut helper).arg(network.label().to_lowercase());
-            if let Some((x, y)) = at {
-                helper.args(["--at", &format!("{x},{y}")]);
-            }
-            helper.stderr(std::process::Stdio::inherit()).output()
-        });
-        let name = network.label();
-        let session = match helper {
-            Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout).trim().to_owned(),
-            // The helper's own words for how it ended (`crates/login`).
-            Ok(output) => {
-                return match output.status.code() {
-                    Some(1) => error(ErrorCode::SignIn, "The sign-in window was closed."),
-                    Some(3) => error(ErrorCode::SignInUnreachable, format!("{name}'s sign-in page could not be loaded. Check the connection and try again.")),
-                    Some(4) => error(ErrorCode::SignInBlocked, format!("Your organization does not allow signing in to {name} this way.")),
-                    _ => error(ErrorCode::SignIn, "The sign-in window stopped before it finished."),
-                }
-            }
-            Err(err) => return error(ErrorCode::SignIn, format!("sign-in could not start: {err}")),
+        let session = match web {
+            Some(web) => match login::web::sign_in(&*web, &network.label().to_lowercase()) {
+                Ok(session) => session,
+                Err(code) => return sign_in_ended(network, Some(code)),
+            },
+            None => match self.sign_in_helper(network, at) {
+                Ok(session) => session,
+                Err(answer) => return *answer,
+            },
         };
         // The new session replaces every adapter of the network: an expired account comes back,
         // and the accounts that were fine reconnect once.
@@ -1550,6 +1569,24 @@ impl Chat {
         match started {
             Ok(()) => self.status(),
             Err(why) => error(ErrorCode::SignIn, why),
+        }
+    }
+
+    /// The desktop's sign-in: the helper window (`tinyclient-login`), and the session it prints.
+    fn sign_in_helper(&self, network: Network, at: Option<(i32, i32)>) -> Result<String, Refused> {
+        let helper = login_path().and_then(|path| {
+            let mut helper = std::process::Command::new(path);
+            protocol::log_policy::share_session(&mut helper);
+            protocol::launch::no_console(&mut helper).arg(network.label().to_lowercase());
+            if let Some((x, y)) = at {
+                helper.args(["--at", &format!("{x},{y}")]);
+            }
+            helper.stderr(std::process::Stdio::inherit()).output()
+        });
+        match helper {
+            Ok(output) if output.status.success() => Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned()),
+            Ok(output) => Err(Box::new(sign_in_ended(network, output.status.code()))),
+            Err(err) => Err(Box::new(error(ErrorCode::SignIn, format!("sign-in could not start: {err}")))),
         }
     }
 

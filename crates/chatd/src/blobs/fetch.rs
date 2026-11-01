@@ -7,7 +7,6 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::mpsc::{channel, Sender};
 use std::time::Duration;
-use ureq::tls::{TlsConfig, TlsProvider};
 
 /// How long an adapter has to say where a file is.
 const ANSWER: Duration = Duration::from_secs(30);
@@ -118,7 +117,7 @@ pub fn cap(file: &MediaFile, cache: u64) -> u64 {
 
 pub fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
-        .tls_config(TlsConfig::builder().provider(TlsProvider::NativeTls).root_certs(ureq::tls::RootCerts::PlatformVerifier).build())
+        .tls_config(crate::tls::config())
         .timeout_connect(Some(Duration::from_secs(10)))
         .timeout_recv_response(Some(Duration::from_secs(30)))
         // A large file on a slow line is still one download, so no limit on the whole call.

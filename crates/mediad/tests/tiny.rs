@@ -23,7 +23,9 @@ use protocol::{read_frame, write_frame, CallPath, Cue, InputMode, MediaRequest, 
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use protocol::media_host::{MediaChild, Spawned};
+use std::io::Write;
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -318,8 +320,8 @@ impl Fake {
 // ---- mediad, as chatd runs it ----
 
 struct Mediad {
-    child: Child,
-    stdin: Option<ChildStdin>,
+    child: MediaChild,
+    stdin: Option<Box<dyn Write + Send>>,
     frames: Receiver<MediaResponse>,
     seen: Vec<MediaResponse>,
 }
@@ -331,17 +333,29 @@ impl Mediad {
 
     /// A mediad whose microphone is `audio` (`TINYCLIENT_MEDIAD_AUDIO`).
     fn saying(audio: &str, ice: &str, sink: &PathBuf) -> Mediad {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_mediad"))
+        Mediad::launch(audio, ice, sink, false)
+    }
+
+    /// The same mediad on threads of this test process, as a phone runs it (`mediad::inproc`),
+    /// over the in-memory pipe instead of stdin and stdout.
+    fn in_process(ice: &str, sink: &PathBuf) -> Mediad {
+        Mediad::launch("tone", ice, sink, true)
+    }
+
+    fn launch(audio: &str, ice: &str, sink: &PathBuf, in_process: bool) -> Mediad {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_mediad"));
+        command
             .arg("1")
             .env("TINYCLIENT_MEDIAD_AUDIO", audio)
             .env("TINYCLIENT_MEDIAD_SINK", sink)
-            .env("TINYCLIENT_MEDIAD_ICE", ice)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let stdin = child.stdin.take();
-        let mut stdout = child.stdout.take().unwrap();
+            .env("TINYCLIENT_MEDIAD_ICE", ice);
+        let spawned = if in_process {
+            protocol::media_host::spawn_with(mediad::inproc::start, &command)
+        } else {
+            protocol::media_host::spawn(&mut command)
+        };
+        let Spawned { child, stdin, stdout } = spawned.unwrap();
+        let mut stdout = stdout.unwrap();
         let (found, frames) = channel();
         std::thread::spawn(move || {
             while let Ok(frame) = read_frame::<MediaResponse>(&mut stdout) {
@@ -438,9 +452,15 @@ fn wait_for(what: &str, done: impl Fn() -> bool) {
 
 /// Ada and Bea join, each through the fake, and each hears the other's tone.
 fn call(ice: &str, over: Protocol) {
+    call_with(ice, over, false);
+}
+
+/// As `call`, with Ada's mediad on threads of the test process when `ada_in_process`.
+fn call_with(ice: &str, over: Protocol, ada_in_process: bool) {
     let sfu = Sfu::start();
-    let (ada_sink, bea_sink) = (sink(&format!("{ice}-ada")), sink(&format!("{ice}-bea")));
-    let mut ada = Mediad::start(ice, &ada_sink);
+    let tag = if ada_in_process { format!("{ice}-inproc") } else { ice.to_owned() };
+    let (ada_sink, bea_sink) = (sink(&format!("{tag}-ada")), sink(&format!("{tag}-bea")));
+    let mut ada = if ada_in_process { Mediad::in_process(ice, &ada_sink) } else { Mediad::start(ice, &ada_sink) };
     let mut bea = Mediad::start(ice, &bea_sink);
     let mut slots = Vec::new();
     for (who, mediad) in [("ada", &mut ada), ("bea", &mut bea)] {
@@ -489,6 +509,37 @@ fn two_people_hear_each_other_over_udp() {
 #[test]
 fn two_people_hear_each_other_over_ice_tcp_alone() {
     call("tcp", Protocol::Tcp);
+}
+
+/// A phone's mediad, in process (`mediad::inproc`), in the same call as a desktop's process:
+/// the same frames over the in-memory pipe, the test platform registered, and its hang-up ends
+/// it with code 0 without ending this process.
+#[test]
+fn an_in_process_mediad_hears_and_is_heard_like_a_process() {
+    let fake = std::sync::Arc::new(mediad::platform::fake::FakePlatform::default());
+    mediad::platform::register(fake.clone());
+    call_with("udp", Protocol::Udp, true);
+    // On a desktop host no audio session is asked for; a phone's call loop would ask once.
+    let sessions = fake.log.audio_sessions.load(Ordering::Relaxed);
+    assert_eq!(sessions, usize::from(cfg!(any(target_os = "android", target_os = "ios"))));
+}
+
+/// A panic or `exit` inside an in-process mediad ends that mediad, not the process that holds it.
+#[test]
+fn an_in_process_mediad_that_is_killed_ends_and_the_test_process_goes_on() {
+    let sink = sink("killed");
+    let mut mediad = Mediad::in_process("udp", &sink);
+    mediad.child.kill().unwrap();
+    assert_eq!(mediad.child.wait().unwrap(), protocol::media_host::Status { code: None });
+    // Its threads stop and its stdout closes, which the reader sees as the end.
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        match mediad.frames.recv_timeout(Duration::from_millis(100)) {
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            _ => assert!(Instant::now() < deadline, "the killed mediad's stdout never closed"),
+        }
+    }
+    let _ = std::fs::remove_file(&sink);
 }
 
 /// Both kinds offered, as a real call does: UDP carries it where it can.

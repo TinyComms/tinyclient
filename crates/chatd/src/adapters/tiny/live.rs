@@ -1672,10 +1672,8 @@ impl Wire {
             Err(HandshakeError::Failure(err)) => return Err(failed(&err)),
             Err(HandshakeError::Interrupted(_)) => return Err(Opened::Failed("the server did not finish the handshake".to_owned())),
         };
-        let tcp = match socket.get_ref() {
-            MaybeTlsStream::NativeTls(tls) => tls.get_ref(),
-            MaybeTlsStream::Plain(tcp) => tcp,
-            _ => return Err(Opened::Failed("unexpected stream".to_owned())),
+        let Some(tcp) = crate::tls::tcp(socket.get_ref()) else {
+            return Err(Opened::Failed("unexpected stream".to_owned()));
         };
         tcp.set_nonblocking(true).map_err(|err| failed(&err))?;
         let poll = Pollable::from_tcp(tcp);

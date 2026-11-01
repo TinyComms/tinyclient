@@ -9,6 +9,7 @@ use super::components::{
     toast, ButtonKind, Layer, Place, NO_GLYPH,
 };
 use super::chrome::{self, End};
+use super::phone::tokens::PhoneType;
 use super::state::{Shell, Snapshot};
 use super::theme::{self, Type};
 use gpui::{
@@ -27,7 +28,30 @@ pub const RIGHT_WIDTH: f32 = 300.;
 pub const RIGHT_RANGE: (f32, f32) = (260., 420.);
 /// The conversation is the only region that gives up width, down to this.
 pub const CONVERSATION_MIN: f32 = 392.;
-pub const WINDOW_MIN: (f32, f32) = (540., 440.);
+/// A window may be a phone: the minimum is the smallest phone in portrait, not a desktop
+/// window that happens to be narrow (`20-implementation-map.md` §1.2).
+pub const WINDOW_MIN: (f32, f32) = (360., 480.);
+/// Below this width a window is a phone: one full-screen surface and a tab bar, never a rail
+/// beside a list. Above every phone in portrait, below every tablet split.
+pub const PHONE: f32 = 600.;
+
+/// Whether this window is drawn as a phone.
+pub fn phone(window: f32) -> bool {
+    window < PHONE
+}
+
+/// The rail on a phone: the desktop's buttons and badges, 8 pt narrower so a 360 pt screen
+/// keeps 296 for the sidebar.
+pub const RAIL_PHONE: f32 = 64.;
+
+/// The rail's width in this window's form.
+pub fn rail_width() -> f32 {
+    if super::phone::active() {
+        RAIL_PHONE
+    } else {
+        RAIL_WIDTH
+    }
+}
 /// Height of the strip that starts every region, level with the traffic lights.
 pub const TOP_BAR: f32 = 52.;
 /// Networks in the order the rail and first launch list them.
@@ -166,6 +190,11 @@ pub struct Plan {
 }
 
 pub fn plan(window: f32, sidebar: f32, hidden: bool, right: Option<f32>) -> Plan {
+    // A phone has no room for two columns: the sidebar never sits in the row, and the right
+    // pane always replaces the conversation it was opened from.
+    if phone(window) {
+        return Plan { sidebar: None, right: right.map(|_right| (window, true)) };
+    }
     let fits = window - RAIL_WIDTH - sidebar >= CONVERSATION_MIN;
     let sidebar = (fits && !hidden).then_some(sidebar);
     let left = RAIL_WIDTH + sidebar.unwrap_or(0.);
@@ -194,6 +223,9 @@ pub fn narrow(window: f32, sidebar: f32, hidden: bool, right: f32) -> bool {
 
 /// The conversation region's width as drawn, for what its strip can hold.
 pub fn conversation_width(window: f32, plan: &Plan) -> f32 {
+    if phone(window) {
+        return window;
+    }
     let beside = plan.right.filter(|(_, replaces)| !replaces).map_or(0., |(width, _)| width);
     window - RAIL_WIDTH - plan.sidebar.unwrap_or(0.) - beside
 }
@@ -343,6 +375,10 @@ impl Shell {
     /// Closes the top layer: switcher, menu, floating sidebar, right pane. False when there was
     /// none, so the key can mean something else.
     pub(super) fn close_top(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        // On a phone Escape is back: one pushed page, sheet or switcher at a time.
+        if super::phone::active() {
+            return self.phone_back(Some(window), cx);
+        }
         if self.sidebar_state.switcher.is_some() {
             self.close_switcher(window, cx);
         } else if self.layout_state.menu.is_some() {
@@ -515,6 +551,10 @@ impl Shell {
 
     /// Nothing is signed in: no rail, no sidebar, one centered column.
     fn first_run(&self, snapshot: &Snapshot, cx: &mut Context<Self>) -> Div {
+        // A phone has its own form: one column, the networks a phone can sign in to.
+        if super::phone::active() {
+            return self.phone_first_run(cx);
+        }
         let row = |ix: usize, network: Network| {
             let available = AVAILABLE.contains(&network);
             let waiting = self.signing_in == Some(network);
@@ -579,7 +619,7 @@ impl Shell {
         };
         let _ = snapshot;
         let mut card = div()
-            .w(px(440.))
+            .w(px(if super::phone::active() { 326. } else { 440. }))
             .rounded(px(theme::R_CARD))
             .bg(theme::raised())
             .border_1()
@@ -612,6 +652,9 @@ impl Shell {
                         div()
                             .mt(px(6.))
                             .mb(px(28.))
+                            .px(px(24.))
+                            .max_w(px(360.))
+                            .text_align(gpui::TextAlign::Center)
                             .type_body()
                             .text_color(theme::text_soft())
                             .child("Sign in to one network to start. Add the others whenever you like."),
@@ -622,7 +665,7 @@ impl Shell {
                             .mt(px(16.))
                             .type_small()
                             .text_color(theme::text_faint())
-                            .child(crate::host::SIGN_IN_KEPT),
+                            .child(crate::host::sign_in_kept()),
                     ),
             )
     }
@@ -678,141 +721,16 @@ impl Shell {
                 let content = fade_in("menu-own", 120, popover().p(px(4.)).child(content));
                 placed("menu-own-at", Place::Beside(rail_button(8.)), Layer::Popover, window, content)
             }
-            Menu::Network(network) => {
-                let network = *network;
-                let mut items = menu().w(px(220.));
-                let current = self.tiny_account().cloned();
-                let many = network == Network::Tiny && snapshot.accounts_of(network) > 1;
-                for account in snapshot.accounts.iter().filter(|a| a.key.network == network) {
-                    let key = account.key.clone();
-                    if many {
-                        let on = current.as_ref() == Some(&account.key);
-                        let show = key.clone();
-                        items = items.child(
-                            menu_item_check(("show-server", items_id(&account.key.account)), on, account.name.clone(), None).on_click(
-                                cx.listener(move |this, _, _, cx| {
-                                    this.close_menu(cx);
-                                    this.prefer_tiny(show.clone(), cx);
-                                }),
-                            ),
-                        );
-                    } else {
-                        items = items.child(menu_label(account.name.clone()));
-                    }
-                    items = items.child(
-                        menu_item_danger(("sign-out", items_id(&account.key.account)), Some("icons/log-out.svg"), "Sign out")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.close_menu(cx);
-                                this.sign_out(key.clone(), cx);
-                            })),
-                    );
-                }
-                if network == Network::Tiny {
-                    items = items
-                        .child(menu_separator())
-                        .child(menu_item("join-server", Some("icons/log-in.svg"), "Join a server", None).on_click(cx.listener(|this, _, _, cx| {
-                            this.close_menu(cx);
-                            this.sign_in(Network::Tiny, cx);
-                        })));
-                }
+            Menu::Network(_) => {
+                let items = menu().w(px(220.)).children(self.menu_items(open, snapshot, cx));
                 placed("menu-network-at", Place::Below(menu_anchor), Layer::Menu, window, fade_in("menu-network", 120, items))
             }
-            // CONTRACT: of the Space menu in `02-layout-navigation.md` only pinning has a
-            // request behind it. Nothing marks a whole Space read or mutes it, and a Space
-            // carries no link to open it in the network's app, so those items are left out.
-            Menu::Space(space) => {
-                let pinned = self.sidebar_state.pins.contains(space);
-                let key = space.clone();
-                let shown = space.clone();
-                let items = menu()
-                    .w(px(200.))
-                    .child(menu_item("details", Some("icons/info.svg"), "Details", None).on_click(cx.listener(move |this, _, _, cx| {
-                        this.close_menu(cx);
-                        this.details_space(shown.clone(), cx);
-                    })))
-                    .child(
-                        menu_item("pin", Some("icons/pin.svg"), if pinned { "Unpin from rail" } else { "Pin to rail" }, None)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.close_menu(cx);
-                                this.pin(key.clone(), !pinned, cx);
-                            })),
-                    );
+            Menu::Space(_) => {
+                let items = menu().w(px(200.)).children(self.menu_items(open, snapshot, cx));
                 placed("menu-space-at", Place::Below(menu_anchor), Layer::Menu, window, fade_in("menu-space", 120, items))
             }
-            Menu::Row(conversation, position) => {
-                let (key, starred) = (conversation.key.clone(), conversation.starred);
-                let unpinned = conversation.clone();
-                let join = conversation.clone();
-                let shown = conversation.clone();
-                let space = conversation.space.as_ref().map(|space| Key { id: space.clone(), ..conversation.key.clone() });
-                let ours = self
-                    .snapshot
-                    .as_ref()
-                    .and_then(|snapshot| snapshot.call.as_ref())
-                    .map_or(false, |call| {
-                        call.conversation == conversation.key
-                            && !matches!(call.state, CallState::Failed { .. })
-                    });
-                let joinable = super::sidebar::joins_from_list(&*conversation) && !ours;
-                let readable = conversation.clone();
-                let closable = conversation.key.clone();
-                let forgettable = conversation.clone();
-                let show_read = conversation.unread > 0 || conversation.mentions > 0;
-                let is_dm = conversation.kind == ConversationKind::Direct;
-                let can_forget = conversation.kind.is_direct();
-                let items = menu()
-                    .w(px(220.))
-                    // A native voice channel joins from its menu too; a stage never does (07 §1).
-                     .children(joinable.then(|| {
-                        menu_item("join", Some("icons/volume-2.svg"), "Join voice", None).on_click(cx.listener(move |this, _, _, cx| {
-                            this.close_menu(cx);
-                            this.call_start(join.key.clone(), cx);
-                        }))
-                    }))
-                    .child(
-                        menu_item("star", Some("icons/pin.svg"), if starred { "Unpin from Inbox" } else { "Pin to top of Inbox" }, None)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.close_menu(cx);
-                                this.star(key.clone(), !starred, cx);
-                            })),
-                    )
-                    .children(space.map(|_space| {
-                        menu_item("reveal", Some("icons/corner-down-right.svg"), "Show in sidebar", None).on_click(
-                            cx.listener(move |this, _, _, cx| {
-                                this.close_menu(cx);
-                                this.reveal_in_sidebar(&shown, cx);
-                            }),
-                        )
-                    }))
-                    .child(menu_separator())
-                    .children(show_read.then(|| {
-                        let key = readable.key.clone();
-                        menu_item("mark-read", Some("icons/check.svg"), "Mark as read", None).on_click(cx.listener(move |this, _, _, cx| {
-                            this.close_menu(cx);
-                            this.mark_conversation_read(key.clone(), cx);
-                        }))
-                    }))
-                    .children(is_dm.then(|| {
-                        let key = closable.clone();
-                        menu_item("close-dm", Some("icons/x.svg"), "Close conversation", None).on_click(cx.listener(move |this, _, _, cx| {
-                            this.close_menu(cx);
-                            this.close_direct(key.clone(), cx);
-                        }))
-                    }))
-                    .child(
-                        menu_item("open", Some(NO_GLYPH), "Open", Some("↵")).on_click(cx.listener(move |this, _, _, cx| {
-                            this.close_menu(cx);
-                            this.select(unpinned.key.clone(), &unpinned.title, cx);
-                        })),
-                    )
-                    .children(can_forget.then(menu_separator))
-                    .children(can_forget.then(|| {
-                        let row = (*forgettable).clone();
-                        menu_item_danger("forget", Some("icons/trash-2.svg"), "Delete from inbox").on_click(cx.listener(move |this, _, _, cx| {
-                            this.close_menu(cx);
-                            this.forget_conversation(row.clone(), cx);
-                        }))
-                    }));
+            Menu::Row(_, position) => {
+                let items = menu().w(px(220.)).children(self.menu_items(open, snapshot, cx));
                 placed("menu-row-at", Place::Pointer(*position), Layer::Menu, window, fade_in("menu-row", 120, items))
             }
         };
@@ -829,9 +747,340 @@ impl Shell {
         )
     }
 
+    /// The items of a Network, Space or Row menu, the same as a popover or as a phone's sheet.
+    fn menu_items(&self, open: &Menu, snapshot: &Snapshot, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let mut items: Vec<AnyElement> = Vec::new();
+        match open {
+            Menu::Add | Menu::Own => {}
+            Menu::Network(network) => {
+                let network = *network;
+                let current = self.tiny_account().cloned();
+                let many = network == Network::Tiny && snapshot.accounts_of(network) > 1;
+                for account in snapshot.accounts.iter().filter(|a| a.key.network == network) {
+                    let key = account.key.clone();
+                    if many {
+                        let on = current.as_ref() == Some(&account.key);
+                        let show = key.clone();
+                        items.push(
+                            menu_item_check(("show-server", items_id(&account.key.account)), on, account.name.clone(), None)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.close_menu(cx);
+                                    this.prefer_tiny(show.clone(), cx);
+                                }))
+                                .into_any_element(),
+                        );
+                    } else {
+                        items.push(menu_label(account.name.clone()).into_any_element());
+                    }
+                    items.push(
+                        menu_item_danger(("sign-out", items_id(&account.key.account)), Some("icons/log-out.svg"), "Sign out")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.close_menu(cx);
+                                this.sign_out(key.clone(), cx);
+                            }))
+                            .into_any_element(),
+                    );
+                }
+                if network == Network::Tiny {
+                    items.push(menu_separator().into_any_element());
+                    items.push(
+                        menu_item("join-server", Some("icons/log-in.svg"), "Join a server", None)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.close_menu(cx);
+                                this.sign_in(Network::Tiny, cx);
+                            }))
+                            .into_any_element(),
+                    );
+                }
+            }
+            // CONTRACT: of the Space menu in `02-layout-navigation.md` only pinning has a
+            // request behind it. Nothing marks a whole Space read or mutes it, and a Space
+            // carries no link to open it in the network's app, so those items are left out.
+            Menu::Space(space) => {
+                let pinned = self.sidebar_state.pins.contains(space);
+                let key = space.clone();
+                let shown = space.clone();
+                items.push(
+                    menu_item("details", Some("icons/info.svg"), "Details", None)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.close_menu(cx);
+                            this.details_space(shown.clone(), cx);
+                        }))
+                        .into_any_element(),
+                );
+                items.push(
+                    menu_item("pin", Some("icons/pin.svg"), if pinned { "Unpin from rail" } else { "Pin to rail" }, None)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.close_menu(cx);
+                            this.pin(key.clone(), !pinned, cx);
+                        }))
+                        .into_any_element(),
+                );
+            }
+            Menu::Row(conversation, _) => {
+                let (key, starred) = (conversation.key.clone(), conversation.starred);
+                let unpinned = conversation.clone();
+                let join = conversation.clone();
+                let shown = conversation.clone();
+                let ours = snapshot
+                    .call
+                    .as_ref()
+                    .is_some_and(|call| call.conversation == conversation.key && !matches!(call.state, CallState::Failed { .. }));
+                // A native voice channel joins from its menu too; a stage never does (07 §1).
+                if super::sidebar::joins_from_list(&**conversation) && !ours {
+                    items.push(
+                        menu_item("join", Some("icons/volume-2.svg"), "Join voice", None)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.close_menu(cx);
+                                this.call_start(join.key.clone(), cx);
+                            }))
+                            .into_any_element(),
+                    );
+                }
+                items.push(
+                    menu_item("star", Some("icons/pin.svg"), if starred { "Unpin from Inbox" } else { "Pin to top of Inbox" }, None)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.close_menu(cx);
+                            this.star(key.clone(), !starred, cx);
+                        }))
+                        .into_any_element(),
+                );
+                if conversation.space.is_some() {
+                    items.push(
+                        menu_item("reveal", Some("icons/corner-down-right.svg"), "Show in sidebar", None)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.close_menu(cx);
+                                this.reveal_in_sidebar(&shown, cx);
+                            }))
+                            .into_any_element(),
+                    );
+                }
+                items.push(menu_separator().into_any_element());
+                if conversation.unread > 0 || conversation.mentions > 0 {
+                    let read = conversation.key.clone();
+                    items.push(
+                        menu_item("mark-read", Some("icons/check.svg"), "Mark as read", None)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.close_menu(cx);
+                                this.mark_conversation_read(read.clone(), cx);
+                            }))
+                            .into_any_element(),
+                    );
+                }
+                if conversation.kind == ConversationKind::Direct {
+                    let closed = conversation.key.clone();
+                    items.push(
+                        menu_item("close-dm", Some("icons/x.svg"), "Close conversation", None)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.close_menu(cx);
+                                this.close_direct(closed.clone(), cx);
+                            }))
+                            .into_any_element(),
+                    );
+                }
+                // A phone has no Return key to name.
+                let keys = if super::phone::active() { None } else { Some("↵") };
+                items.push(
+                    menu_item("open", Some(NO_GLYPH), "Open", keys)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.close_menu(cx);
+                            this.select(unpinned.key.clone(), &unpinned.title, cx);
+                        }))
+                        .into_any_element(),
+                );
+                if conversation.kind.is_direct() {
+                    let row = (**conversation).clone();
+                    items.push(menu_separator().into_any_element());
+                    items.push(
+                        menu_item_danger("forget", Some("icons/trash-2.svg"), "Delete from inbox")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.close_menu(cx);
+                                this.forget_conversation(row.clone(), cx);
+                            }))
+                            .into_any_element(),
+                    );
+                }
+            }
+        }
+        items
+    }
+
+    /// The open menu on a phone: a bottom sheet holding what the desktop's popover holds, each
+    /// row a full-width 44 pt target, headed by what it is about.
+    pub(super) fn phone_menu(&self, snapshot: &Snapshot, window: &mut Window, cx: &mut Context<Self>) -> Option<Div> {
+        let open = self.layout_state.menu.as_ref()?;
+        let tall = f32::from(window.viewport_size().height);
+        let close = cx.listener(|this, _: &gpui::MouseDownEvent, _, cx| this.close_menu(cx));
+        let column = || div().w_full().flex().flex_col();
+        let body: AnyElement = match open {
+            Menu::Add => column().child(super::phone::sheet_title("Add an account")).children(self.add_rows(snapshot, cx)).into_any_element(),
+            Menu::Own => self.phone_own(snapshot, window, cx).into_any_element(),
+            Menu::Network(network) => {
+                let head = div().flex().items_center().gap(px(10.)).px(px(8.)).h(px(44.)).child(network_icon(*network, 20.)).child(div().phone_title().child(network.label()));
+                column().child(head).children(self.menu_items(open, snapshot, cx)).into_any_element()
+            }
+            Menu::Space(space) => {
+                let found = self.spaces.iter().find(|s| &s.key == space);
+                let name = found.map_or_else(String::new, |s| s.name.clone());
+                let icon = found.and_then(|s| self.media_path(&s.key, s.icon.as_ref()));
+                let head = div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .px(px(8.))
+                    .h(px(52.))
+                    .child(super::components::Avatar::new(space, &name, 28.).shape(super::components::Shape::Place).image_at(icon).build())
+                    .child(div().min_w_0().truncate().phone_title().child(name));
+                column().child(head).children(self.menu_items(open, snapshot, cx)).into_any_element()
+            }
+            Menu::Row(conversation, _) => {
+                // What the sheet is about: the row's own face and title, and where it lives.
+                let place = conversation.space_title.trim();
+                let place = if place.is_empty() || conversation.kind.is_direct() { conversation.key.network.label().to_owned() } else { format!("{} · {place}", conversation.key.network.label()) };
+                let head = div()
+                    .flex()
+                    .items_center()
+                    .gap(px(12.))
+                    .px(px(12.))
+                    .pt(px(4.))
+                    .pb(px(12.))
+                    .child(self.conversation_avatar(conversation, 40., theme::overlay(), cx))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(div().min_w_0().truncate().phone_title().child(conversation.title.clone()))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.))
+                                    .child(network_icon(conversation.key.network, 14.))
+                                    .child(div().min_w_0().truncate().phone_preview().text_color(theme::text_soft()).child(place)),
+                            ),
+                    );
+                column().child(head).child(menu_separator()).children(self.phone_row_items(conversation, cx)).into_any_element()
+            }
+        };
+        Some(super::phone::sheet("phone-menu", tall, body, close))
+    }
+
+    /// A conversation row's sheet on a phone: the desktop's row menu, then what Details and its
+    /// "…" offer for the conversation, each where its network can do it.
+    fn phone_row_items(&self, conversation: &Conversation, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let mut items: Vec<AnyElement> = Vec::new();
+        let row = conversation.clone();
+        let key = row.key.clone();
+        let network = key.network;
+        let act = |id: &'static str, icon: &'static str, words: SharedString, then: Box<dyn Fn(&mut Shell, &mut Context<Shell>)>| {
+            menu_item(id, Some(icon), words, None)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.close_menu(cx);
+                    then(this, cx);
+                }))
+                .into_any_element()
+        };
+        let opened = row.clone();
+        items.push(act("row-open", "icons/message-square.svg", "Open".into(), Box::new(move |this, cx| this.select(opened.key.clone(), &opened.title, cx))));
+        if row.unread > 0 || row.mentions > 0 {
+            let read = key.clone();
+            items.push(act("row-read", "icons/check.svg", "Mark as read".into(), Box::new(move |this, cx| this.mark_read(read.clone(), cx))));
+        }
+        let starred = row.starred;
+        let star = key.clone();
+        let words = if starred { "Unpin from Inbox" } else { "Pin to top of Inbox" };
+        items.push(act("row-star", "icons/pin.svg", words.into(), Box::new(move |this, cx| this.star(star.clone(), !starred, cx))));
+        // CONTRACT: muting has a request on Discord, Slack, Teams and Telegram (chatd's adapters).
+        if matches!(network, Network::Discord | Network::Slack | Network::Teams | Network::Telegram) {
+            let (muted, mute) = (row.muted, key.clone());
+            let (icon, words) = if muted { ("icons/bell.svg", "Unmute notifications") } else { ("icons/bell-off.svg", "Mute notifications") };
+            items.push(act("row-mute", icon, words.into(), Box::new(move |this, cx| this.set_row_mute(mute.clone(), !muted, cx))));
+        }
+        let details = key.clone();
+        let person = row.kind == protocol::ConversationKind::Direct;
+        let words = if person { "Profile" } else { "Details" };
+        items.push(act("row-details", if person { "icons/user.svg" } else { "icons/info.svg" }, words.into(), Box::new(move |this, cx| this.details_conversation(details.clone(), cx))));
+        if let Some(space) = row.space.as_ref().map(|space| Key { id: space.clone(), ..key.clone() }) {
+            items.push(act("row-reveal", "icons/corner-down-right.svg", "Show in sidebar".into(), Box::new(move |this, cx| this.go(super::sidebar::Mode::Space(space.clone()), cx))));
+        }
+        let (link, leave) = self.row_reach(&row);
+        if let Some(link) = link {
+            items.push(menu_separator().into_any_element());
+            let copied = link.clone();
+            items.push(act(
+                "row-link",
+                "icons/link.svg",
+                "Copy link".into(),
+                Box::new(move |this, cx| {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(copied.clone()));
+                    this.toast(Some(("icons/check.svg", theme::text_soft())), "Link copied".to_owned(), cx);
+                }),
+            ));
+            items.push(act("row-open-in", "icons/external-link.svg", format!("Open in {}", network.label()).into(), Box::new(move |_, cx| cx.open_url(&link))));
+        }
+        // CONTRACT: closing a DM has a request on Discord only; leaving, where `can_leave` says.
+        let close = row.kind == protocol::ConversationKind::Direct && network == Network::Discord;
+        if close || leave {
+            items.push(menu_separator().into_any_element());
+        }
+        if close {
+            let closed = key.clone();
+            items.push(act("row-close", "icons/x.svg", "Close conversation".into(), Box::new(move |this, cx| this.close_direct(closed.clone(), cx))));
+        }
+        if leave {
+            let left = row.clone();
+            let words = if row.kind == protocol::ConversationKind::Group { "Leave group" } else { "Leave" };
+            items.push(
+                menu_item_danger("row-leave", Some("icons/log-out.svg"), words)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.close_menu(cx);
+                        this.confirm_leave(left.clone(), cx);
+                    }))
+                    .into_any_element(),
+            );
+        }
+        if row.kind.is_direct() {
+            let forgotten = row.clone();
+            if !(close || leave) {
+                items.push(menu_separator().into_any_element());
+            }
+            items.push(
+                menu_item_danger("row-forget", Some("icons/trash-2.svg"), "Delete from inbox")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.close_menu(cx);
+                        this.forget_conversation(forgotten.clone(), cx);
+                    }))
+                    .into_any_element(),
+            );
+        }
+        items
+    }
+
+    /// The rail avatar's sheet on a phone: who I am, my presence on each account and Settings
+    /// (the desktop's own status menu, full width), then adding an account.
+    fn phone_own(&self, snapshot: &Snapshot, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let status = self.slots.own_menu.and_then(|draw| draw(self, window, cx));
+        let status = status.unwrap_or_else(|| self.accounts_menu(snapshot, cx).into_any_element());
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .child(status)
+            .child(menu_item("own-add", Some("icons/plus.svg"), "Add an account", None).on_click(cx.listener(|this, _, _, cx| this.open_menu(Menu::Add, cx))))
+    }
+
     /// The add popover: networks not signed in, another Slack workspace, another Tiny server,
     /// then what comes later.
     fn add_menu(&self, snapshot: &Snapshot, cx: &mut Context<Self>) -> Div {
+        popover().p(px(4.)).w(px(300.)).flex().flex_col().children(self.add_rows(snapshot, cx))
+    }
+
+    /// The add menu's rows: 48 in the popover, 56 in a phone's sheet.
+    fn add_rows(&self, snapshot: &Snapshot, cx: &mut Context<Self>) -> Vec<gpui::Stateful<Div>> {
+        let phone = super::phone::active();
         let row = |ix: usize, network: Network, title: SharedString, line: SharedString, available: bool| {
             let waiting = self.signing_in == Some(network);
             let failed = self.sign_in_failed.as_ref().filter(|(failed, _)| *failed == network).map(|(_, why)| why.clone());
@@ -854,7 +1103,7 @@ impl Shell {
                     div()
                         .flex_1()
                         .min_w_0()
-                        .child(div().truncate().text_color(if available { theme::text() } else { theme::text_soft() }).child(title))
+                        .child(div().truncate().when(phone, |title| title.phone_row()).text_color(if available { theme::text() } else { theme::text_soft() }).child(title))
                         .child(
                             div()
                                 .truncate()
@@ -868,23 +1117,25 @@ impl Shell {
                         ),
                 )
         };
-        let mut list = popover().p(px(4.)).w(px(300.)).flex().flex_col();
-        let mut ix = 0;
-        let mut add = |list: Div, network, title: &str, line: &str, available| {
-            ix += 1;
-            list.child(row(ix, network, title.to_owned().into(), line.to_owned().into(), available))
+        let mut list = Vec::new();
+        let mut add = |network, title: &str, line: &str, available| {
+            let ix = list.len() + 1;
+            list.push(row(ix, network, title.to_owned().into(), line.to_owned().into(), available).when(phone, |row| row.h(px(56.))));
         };
-        for network in AVAILABLE {
+        // A phone offers only the networks it can sign in to (`signin::welcome::on_phone`), as
+        // its first run does: Signal and Messages link from a computer.
+        let offered = |network: &Network| !phone || super::signin::welcome::on_phone(*network);
+        for network in AVAILABLE.into_iter().filter(offered) {
             if snapshot.link(network) == Link::SignedOut {
-                list = add(list, network, network.label(), "Sign in", true);
+                add(network, network.label(), "Sign in", true);
             } else if network == Network::Slack {
-                list = add(list, network, "Add a Slack workspace", "Sign in to another workspace", true);
+                add(network, "Add a Slack workspace", "Sign in to another workspace", true);
             } else if network == Network::Tiny {
-                list = add(list, network, "Add a Tiny server", "Join with a code", true);
+                add(network, "Add a Tiny server", "Join with a code", true);
             }
         }
-        for network in NETWORK_ORDER.into_iter().filter(|network| !AVAILABLE.contains(network)) {
-            list = add(list, network, network.label(), "Not available yet", false);
+        for network in NETWORK_ORDER.into_iter().filter(|network| !AVAILABLE.contains(network)).filter(offered) {
+            add(network, network.label(), "Not available yet", false);
         }
         list
     }
@@ -933,6 +1184,7 @@ impl Render for Shell {
             let frame = FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tracing::warn!("tinyclient: frame {frame} at {} ms", super::LAUNCHED.get().map_or(0, |at| at.elapsed().as_millis()));
         }
+        super::feed_platform_insets(window);
         let root = self
             .keys(div(), cx)
             .size_full()
@@ -955,6 +1207,12 @@ impl Render for Shell {
             self.go(super::sidebar::Mode::Network(protocol::Network::Tiny), cx);
             self.prefer_tiny(account, cx);
         }
+        // A phone's window does not shrink for the soft keyboard (Android's NativeActivity and
+        // iOS's full-screen view both keep their size and report the keyboard as an inset), so
+        // the shell lifts its content above it; the composer then sits on the keyboard's edge
+        // (`tokens::bottom_padding`).
+        let keyboard = if super::phone::active() { super::phone::tokens::keyboard() } else { 0. };
+        let root = root.when(keyboard > 0., |root| root.pb(px(keyboard)));
         let root = root.children(super::signin::layer(window, cx));
         #[cfg(feature = "gui-shot")]
         if self.sheet {
@@ -964,6 +1222,12 @@ impl Render for Shell {
         self.follow_changes(cx);
         self.refresh_menus(cx);
         self.note_tiny_page(cx);
+        // The form is decided once per frame, with hysteresis (`phone::form`), and the phone's
+        // own entities exist before any of its screens is drawn.
+        let viewport = window.viewport_size();
+        let phone_form = super::phone::form(super::phone::active(), f32::from(viewport.width), f32::from(viewport.height));
+        super::phone::set_active(phone_form);
+        super::phone::tokens::set_landscape(phone_form && viewport.width > viewport.height);
         // Before the first answer the window is still drawn: rail, strips, an empty list, and
         // what it waits on. Never a blank canvas, never a developer message.
         let placeholder;
@@ -977,12 +1241,23 @@ impl Render for Shell {
         // While the keychain is still being read, accounts arrive one network at a time: the
         // first-launch screen waits until it is done.
         let settled = !self.service.keychain.reading && self.shown().empty_state().is_none();
+        let width = f32::from(window.viewport_size().width);
+        if phone_form {
+            if self.snapshot.is_some() && snapshot.signed_in().is_empty() && settled {
+                return root.child(self.first_run(snapshot, cx));
+            }
+            // A phone has no window buttons to clear, and every pane it shows is the whole
+            // screen: never beside the conversation, so sticky Details waits until asked.
+            chrome::clear_end();
+            self.note_room(true, Some(width));
+            let screen = self.phone_screen(snapshot, window, cx);
+            return root.child(screen).children(self.toast_layer(width, cx)).children(super::settings::phone_page(window, cx));
+        }
         if self.snapshot.is_some() && snapshot.signed_in().is_empty() && settled {
             return root.child(self.first_run(snapshot, cx)).children(window_chrome(window));
         }
 
         let state = &self.layout_state;
-        let (width, tall) = (f32::from(window.viewport_size().width), f32::from(window.viewport_size().height));
         // Where a sign-in window should open: over this one.
         let origin = window.bounds().origin;
         self.window_at.set(Some((f32::from(origin.x) as i32, f32::from(origin.y) as i32)));
@@ -994,10 +1269,13 @@ impl Render for Shell {
         self.note_room(self.pane_narrow(), Some(conversation_width(width - overview, &plan)));
         let floating = plan.sidebar.is_none() && state.floating;
         let replaced = plan.right.is_some_and(|(_, replaces)| replaces);
-        // With nothing open in a window too narrow for the sidebar, the list is the main view:
-        // something on screen always offers it.
-        let list_alone = snapshot.open.is_none() && plan.sidebar.is_none() && !state.sidebar_hidden && !floating && !replaced;
-        let _ = tall;
+        // With nothing open on a phone, the list is the whole screen: there is no sidebar
+        // column to fall back to, and the conversation only exists when something is open.
+        let list_alone = if phone(width) {
+            snapshot.open.is_none()
+        } else {
+            snapshot.open.is_none() && plan.sidebar.is_none() && !state.sidebar_hidden && !floating && !replaced
+        };
         // Where the window's own buttons sit, on Windows and a Linux that leaves them to us.
         let end = match () {
             _ if plan.right.is_some() => End::Right,
@@ -1081,11 +1359,13 @@ impl Shell {
         if crash.is_none() && toast.is_none() && update.is_none() {
             return None;
         }
+        // On a phone the toast clears the home indicator.
+        let bottom = 16. + if super::phone::active() { super::phone::tokens::safe_bottom() } else { 0. };
         Some(
             div()
                 .absolute()
                 .right(px(16.))
-                .bottom(px(16.))
+                .bottom(px(bottom))
                 .flex()
                 .flex_col()
                 .gap(px(8.))
@@ -1127,8 +1407,9 @@ mod tests {
         // 780 keeps the sidebar; one point less and it leaves the row.
         assert_eq!(plan(780., 316., false, None).sidebar, Some(316.));
         assert_eq!(plan(779., 316., false, None).sidebar, None);
-        // At the minimum window the right pane takes everything but the rail.
-        assert_eq!(plan(540., 316., false, Some(340.)), Plan { sidebar: None, right: Some((468., true)) });
+        // Below the phone boundary the right pane takes the whole window: there is no rail
+        // beside it to keep.
+        assert_eq!(plan(540., 316., false, Some(340.)), Plan { sidebar: None, right: Some((540., true)) });
         // A sidebar dragged narrow keeps its place in a narrower window.
         assert_eq!(plan(730., 260., false, None).sidebar, Some(260.));
         // Hidden by hand: the conversation takes its room.
@@ -1151,6 +1432,28 @@ mod tests {
             Some((_, true)) => "pane replaces",
         };
         (plan.sidebar, pane)
+    }
+
+    #[test]
+    fn a_phone_is_one_column_and_the_sidebar_never_sits_beside_it() {
+        assert!(phone(390.) && !phone(600.));
+        // 390 asks for a 316 sidebar and a 300 thread: both would leave nothing, so neither
+        // is beside the conversation. The right pane takes the whole window.
+        assert_eq!(plan(390., 316., false, None), Plan { sidebar: None, right: None });
+        assert_eq!(plan(390., 316., false, Some(300.)), Plan { sidebar: None, right: Some((390., true)) });
+        assert_eq!(conversation_width(390., &plan(390., 316., false, None)), 390.);
+        // A hidden sidebar and a floating one change nothing on a phone.
+        assert_eq!(plan(390., 316., true, None).sidebar, None);
+        // The first width that is not a phone is unchanged by the phone rule.
+        assert_eq!(plan(600., 316., false, None).sidebar, None);
+        assert_eq!(plan(780., 316., false, None).sidebar, Some(316.));
+    }
+
+    #[test]
+    fn the_window_can_be_a_phone() {
+        assert_eq!(WINDOW_MIN, (360., 480.));
+        assert!(WINDOW_MIN.0 < PHONE);
+        assert!(phone(WINDOW_MIN.0));
     }
 
     #[test]
