@@ -69,6 +69,14 @@ unsafe impl<T> Send for Shared<T> {}
 // SAFETY: as above.
 unsafe impl<T> Sync for Shared<T> {}
 
+impl<T> Shared<T> {
+    /// The value. A method, so a closure that calls it captures the whole wrapper (and so is
+    /// `Send`), not the field.
+    pub(super) fn get(&self) -> &T {
+        &self.0
+    }
+}
+
 /// The phone.
 struct Ios;
 

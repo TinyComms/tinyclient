@@ -8,14 +8,14 @@ use mediad::platform::{EncoderConfig, H264Decoder, H264Encoder, VideoFrame};
 use objc2::runtime::AnyObject;
 use objc2_core_foundation::{CFDictionary, CFRetained, CFString, CFType};
 use objc2_core_media::{
-    kCMTimeInvalid, kCMVideoCodecType_H264, CMBlockBuffer, CMBlockBufferFlags, CMFormatDescription, CMSampleBuffer,
+    kCMTimeInvalid, kCMVideoCodecType_H264, CMBlockBuffer, CMFormatDescription, CMSampleBuffer,
     CMTime, CMVideoFormatDescriptionCreateFromH264ParameterSets, CMVideoFormatDescriptionGetH264ParameterSetAtIndex,
 };
 use objc2_core_video::{
     kCVPixelBufferHeightKey, kCVPixelBufferPixelFormatTypeKey, kCVPixelBufferWidthKey,
     kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, CVImageBuffer, CVPixelBuffer, CVPixelBufferCreate,
 };
-use objc2_foundation::{NSDictionary, NSNumber, NSString};
+use objc2_foundation::{NSCopying, NSDictionary, NSNumber, NSString};
 use objc2_video_toolbox::{
     kVTCompressionPropertyKey_AllowFrameReordering, kVTCompressionPropertyKey_AverageBitRate,
     kVTCompressionPropertyKey_ExpectedFrameRate, kVTCompressionPropertyKey_MaxKeyFrameInterval,
@@ -53,12 +53,12 @@ enum CFValue {
 impl CFValue {
     fn object(self) -> objc2::rc::Retained<AnyObject> {
         match self {
-            CFValue::Bool(value) => objc2::rc::Retained::into_super(objc2::rc::Retained::into_super(NSNumber::new_bool(value))),
-            CFValue::Int(value) => objc2::rc::Retained::into_super(objc2::rc::Retained::into_super(NSNumber::new_i64(value))),
+            CFValue::Bool(value) => objc2::rc::Retained::into_super(objc2::rc::Retained::into_super(NSNumber::new_bool(value))).into(),
+            CFValue::Int(value) => objc2::rc::Retained::into_super(objc2::rc::Retained::into_super(NSNumber::new_i64(value))).into(),
             // SAFETY: CFString and NSString are toll-free bridged; retained for the copy.
             CFValue::Str(value) => unsafe {
                 let string: &NSString = &*(value as *const CFString as *const NSString);
-                objc2::rc::Retained::into_super(objc2::rc::Retained::into_super(string.copy()))
+                objc2::rc::Retained::into_super(string.copy()).into()
             },
         }
     }
@@ -466,7 +466,7 @@ impl H264Decoder for Decoder {
                 std::ptr::null(),
                 0,
                 avcc.len(),
-                CMBlockBufferFlags(0),
+                0,
                 NonNull::from(&mut block),
             );
             let block = NonNull::new(block)

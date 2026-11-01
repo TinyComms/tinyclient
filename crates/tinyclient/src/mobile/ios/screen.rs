@@ -52,7 +52,7 @@ pub(super) fn start(sink: FrameSink) -> Result<(), String> {
     });
     let blocks = super::Shared((handler, done));
     super::on_main(move |_| {
-        let (handler, done) = &blocks.0;
+        let (handler, done) = blocks.get();
         // SAFETY: the shared recorder, started on the main thread; ReplayKit copies the blocks.
         unsafe {
             let recorder = RPScreenRecorder::sharedRecorder();

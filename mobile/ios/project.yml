@@ -55,6 +55,17 @@ targets:
       - framework: TinyCore.xcframework
         embed: false
         link: true
+      # The call platform and web sign-in (crates/tinyclient/src/mobile/ios). A static library
+      # carries no framework links, so the app names each one. WebKit is messaged dynamically
+      # (objc2 binds WKWebView for macOS only), so nothing would pull it in otherwise.
+      - sdk: AVFoundation.framework
+      - sdk: AVFAudio.framework
+      - sdk: CoreMedia.framework
+      - sdk: CoreVideo.framework
+      - sdk: VideoToolbox.framework
+      - sdk: ReplayKit.framework
+      - sdk: WebKit.framework
+      - sdk: AuthenticationServices.framework
 
 schemes:
   Tiny:

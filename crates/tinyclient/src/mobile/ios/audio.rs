@@ -4,6 +4,9 @@
 //! ask `AVCaptureDevice` (the same answer `AVAudioApplication` gives for the microphone, and one
 //! API for both) and wait on the caller's thread for the user.
 
+// `AllowBluetooth` is renamed `AllowBluetoothHFP` in the iOS 27 SDK; the old name keeps iOS 16.
+#![allow(deprecated)]
+
 use crate::gui::call::phone::hooks::{self, Route};
 use block2::RcBlock;
 use mediad::platform::Permission;
@@ -97,7 +100,7 @@ fn ask(kind: Permission) -> bool {
     let block = super::Shared(block);
     super::on_main(move |_| {
         // SAFETY: the block lives as long as AVFoundation keeps it (it copies it).
-        unsafe { AVCaptureDevice::requestAccessForMediaType_completionHandler(media_type(kind), &block.0) };
+        unsafe { AVCaptureDevice::requestAccessForMediaType_completionHandler(media_type(kind), block.get()) };
     });
     // A person may take a while; ten minutes is "never answered".
     answer.recv_timeout(Duration::from_secs(600)).unwrap_or(false)

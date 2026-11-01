@@ -6,9 +6,13 @@
 //! end on a URL anyway, that URL goes to `AuthRequest::redirected`. A user's Cancel marks the
 //! handle closed.
 
+// `initWithURL:callbackURLScheme:` is deprecated from iOS 17.4 for the callback variant, which
+// takes https or a custom scheme only; the loopback redirect needs neither, and iOS 16 needs this.
+#![allow(deprecated)]
+
 use objc2::rc::Retained;
 use objc2::runtime::{NSObject, NSObjectProtocol, ProtocolObject};
-use objc2::{define_class, msg_send, MainThreadMarker, MainThreadOnly};
+use objc2::{define_class, msg_send, AllocAnyThread, MainThreadMarker, MainThreadOnly};
 use objc2_authentication_services::{ASWebAuthenticationPresentationContextProviding, ASWebAuthenticationSession};
 use objc2_foundation::{NSError, NSString, NSURL};
 use objc2_ui_kit::{UIApplication, UIWindow, UIWindowScene};
@@ -38,21 +42,19 @@ define_class!(
     impl Anchor {
         /// The protocol's one method; objc2 declares it for macOS only, so it is defined here.
         #[unsafe(method(presentationAnchorForWebAuthenticationSession:))]
-        fn anchor(&self, _session: &ASWebAuthenticationSession) -> Retained<UIWindow> {
-            key_window(self.mtm()).unwrap_or_else(|| UIWindow::new(self.mtm()))
+        fn anchor(&self, _session: &ASWebAuthenticationSession) -> *mut UIWindow {
+            // UIKit keeps the key window alive; it is returned at +0, as `method_family = none` says.
+            key_window(self.mtm()).map(|window| Retained::as_ptr(&window) as *mut UIWindow).unwrap_or(std::ptr::null_mut())
         }
     }
 );
 
 fn key_window(mtm: MainThreadMarker) -> Option<Retained<UIWindow>> {
     let app = UIApplication::sharedApplication(mtm);
-    // SAFETY: UIKit's scene and window lists, on the main thread.
-    unsafe {
-        app.connectedScenes().iter().filter_map(|scene| scene.downcast::<UIWindowScene>().ok()).find_map(|scene| {
-            let windows = scene.windows();
-            windows.iter().find(|window| window.isKeyWindow()).or_else(|| windows.firstObject())
-        })
-    }
+    app.connectedScenes().iter().filter_map(|scene| scene.downcast::<UIWindowScene>().ok()).find_map(|scene| {
+        let windows = scene.windows();
+        windows.iter().find(|window| window.isKeyWindow()).or_else(|| windows.firstObject())
+    })
 }
 
 /// A showing session, kept on the main thread.

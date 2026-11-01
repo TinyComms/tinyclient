@@ -4,6 +4,10 @@
 //! The simulator has no camera: `start` then says so in words the call screen shows, and the
 //! call goes on without video.
 
+// The connection's portrait orientation (`videoOrientation`) is deprecated from iOS 17 for
+// rotation angles; the app still supports iOS 16.
+#![allow(deprecated)]
+
 use super::Shared;
 use crate::gui::call::phone::hooks;
 use dispatch2::{DispatchQueue, DispatchRetained};
@@ -95,7 +99,7 @@ pub(super) fn start(request: CameraRequest, sink: FrameSink) -> Result<(), Strin
     // and the session is started and stopped off the main thread as Apple recommends.
     unsafe {
         let device = AVCaptureDevice::defaultDeviceWithDeviceType_mediaType_position(
-            AVCaptureDeviceTypeBuiltInWideAngleCamera.expect("wide angle"),
+            AVCaptureDeviceTypeBuiltInWideAngleCamera,
             AVMediaTypeVideo,
             position,
         )
@@ -105,8 +109,8 @@ pub(super) fn start(request: CameraRequest, sink: FrameSink) -> Result<(), Strin
             .map_err(|error| format!("The camera could not be opened ({}).", error.localizedDescription()))?;
         let session = AVCaptureSession::new();
         session.beginConfiguration();
-        if session.canSetSessionPreset(AVCaptureSessionPreset640x480.expect("preset")) {
-            session.setSessionPreset(AVCaptureSessionPreset640x480.expect("preset"));
+        if session.canSetSessionPreset(AVCaptureSessionPreset640x480) {
+            session.setSessionPreset(AVCaptureSessionPreset640x480);
         }
         if !session.canAddInput(&input) {
             return Err("The camera is in use by something else.".to_owned());

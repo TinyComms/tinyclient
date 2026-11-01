@@ -5,21 +5,18 @@
 //! navigations, which probes) stays in Rust (`login::web::sign_in`); this only shows the page,
 //! answers navigations through `WebPage::navigate`, runs scripts and reads cookies.
 
-use objc2::rc::Retained;
-use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject};
+use block2::DynBlock;
+use objc2::rc::{Allocated, Retained};
+use objc2::runtime::{AnyClass, AnyObject, NSObject, NSObjectProtocol, ProtocolObject};
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_core_foundation::CGRect;
 use objc2_foundation::{
-    NSArray, NSError, NSHTTPCookie, NSJSONSerialization, NSJSONWritingOptions, NSString, NSURLErrorDomain, NSURLRequest,
-    NSUUID, NSURL,
+    NSArray, NSError, NSHTTPCookie, NSInteger, NSJSONSerialization, NSJSONWritingOptions, NSString, NSURLErrorDomain,
+    NSURLRequest, NSUUID, NSURL,
 };
 use objc2_ui_kit::{
     UIAdaptivePresentationControllerDelegate, UIApplication, UIBarButtonItem, UIBarButtonSystemItem,
-    UINavigationController, UIPresentationController, UIViewController, UIWindowScene,
-};
-use objc2_web_kit::{
-    WKNavigation, WKNavigationAction, WKNavigationActionPolicy, WKNavigationDelegate, WKUIDelegate, WKUserScript,
-    WKUserScriptInjectionTime, WKWebView, WKWebViewConfiguration, WKWebsiteDataStore, WKWindowFeatures,
+    UINavigationController, UIPresentationController, UIView, UIViewController, UIWindowScene,
 };
 use protocol::web_sign_in::{Navigation, PageState, WebPage, WebPageHandle};
 use std::cell::RefCell;
@@ -48,9 +45,10 @@ struct Ivars {
     inner: Arc<Mutex<Inner>>,
 }
 
-/// The views of a showing page, kept on the main thread.
+/// The views of a showing page, kept on the main thread. The web view is a `WKWebView`; objc2's
+/// WebKit crate binds it for macOS only, so WebKit is messaged dynamically here.
 struct Views {
-    web: Retained<WKWebView>,
+    web: Retained<AnyObject>,
     sheet: Retained<UINavigationController>,
     _delegate: Retained<PageDelegate>,
 }
@@ -62,8 +60,24 @@ thread_local! {
 
 static NEXT: AtomicU64 = AtomicU64::new(1);
 
+/// `WKNavigationActionPolicy`.
+const ALLOW: NSInteger = 1;
+const CANCEL: NSInteger = 0;
+/// `WKUserScriptInjectionTimeAtDocumentStart`.
+const AT_DOCUMENT_START: NSInteger = 0;
+
+fn webkit(name: &std::ffi::CStr) -> &'static AnyClass {
+    AnyClass::get(name).unwrap_or_else(|| panic!("WebKit has no {name:?}; is WebKit.framework linked?"))
+}
+
 fn text(url: Option<Retained<NSURL>>) -> String {
     url.and_then(|url| url.absoluteString()).map(|text| text.to_string()).unwrap_or_default()
+}
+
+/// The web view's current URL (main thread).
+fn url_of(web: &AnyObject) -> String {
+    // SAFETY: `URL` on a WKWebView, on the main thread.
+    text(unsafe { msg_send![web, URL] })
 }
 
 /// The URL error codes that mean "no network": offline, DNS, unreachable, timeout, TLS.
@@ -75,8 +89,9 @@ fn network_failure(error: &NSError) -> bool {
 }
 
 define_class!(
-    // SAFETY: NSObject has no subclassing requirements. Main-thread only, as every protocol it
-    // adopts is.
+    // SAFETY: NSObject has no subclassing requirements. Main-thread only, as UIKit's and
+    // WebKit's delegates are. The WebKit delegate methods are defined without the Rust protocol
+    // traits (macOS-only in objc2); WebKit asks `respondsToSelector:` before calling each.
     #[unsafe(super(NSObject))]
     #[thread_kind = MainThreadOnly]
     #[name = "TinyWebPageDelegate"]
@@ -84,82 +99,6 @@ define_class!(
     struct PageDelegate;
 
     unsafe impl NSObjectProtocol for PageDelegate {}
-
-    unsafe impl WKNavigationDelegate for PageDelegate {
-        #[unsafe(method(webView:decidePolicyForNavigationAction:decisionHandler:))]
-        fn decide(
-            &self,
-            web: &WKWebView,
-            action: &WKNavigationAction,
-            handler: &block2::DynBlock<dyn Fn(WKNavigationActionPolicy)>,
-        ) {
-            // SAFETY: reading the action's request and frame.
-            let (url, main) = unsafe {
-                (text(action.request().URL()), action.targetFrame().map(|frame| frame.isMainFrame()).unwrap_or(true))
-            };
-            if !main || url.is_empty() || url == "about:blank" {
-                handler.call((WKNavigationActionPolicy::Allow,));
-                return;
-            }
-            match (self.ivars().navigate)(&url) {
-                Navigation::Allow => handler.call((WKNavigationActionPolicy::Allow,)),
-                Navigation::Cancel => handler.call((WKNavigationActionPolicy::Cancel,)),
-                Navigation::Load(other) => {
-                    handler.call((WKNavigationActionPolicy::Cancel,));
-                    load_in(web, &other);
-                }
-            }
-        }
-
-        #[unsafe(method(webView:didCommitNavigation:))]
-        fn committed(&self, web: &WKWebView, _navigation: Option<&WKNavigation>) {
-            if let Ok(mut inner) = self.ivars().inner.lock() {
-                inner.load_failed = false;
-                // SAFETY: reading the web view's URL on the main thread.
-                inner.url = text(unsafe { web.URL() });
-            }
-        }
-
-        #[unsafe(method(webView:didFinishNavigation:))]
-        fn finished(&self, web: &WKWebView, _navigation: Option<&WKNavigation>) {
-            if let Ok(mut inner) = self.ivars().inner.lock() {
-                // SAFETY: reading the web view's URL on the main thread.
-                inner.url = text(unsafe { web.URL() });
-            }
-        }
-
-        #[unsafe(method(webView:didFailProvisionalNavigation:withError:))]
-        fn failed_early(&self, _web: &WKWebView, _navigation: Option<&WKNavigation>, error: &NSError) {
-            self.failed(error);
-        }
-
-        #[unsafe(method(webView:didFailNavigation:withError:))]
-        fn failed_late(&self, _web: &WKWebView, _navigation: Option<&WKNavigation>, error: &NSError) {
-            self.failed(error);
-        }
-    }
-
-    unsafe impl WKUIDelegate for PageDelegate {
-        #[unsafe(method(webView:createWebViewWithConfiguration:forNavigationAction:windowFeatures:))]
-        fn new_window(
-            &self,
-            web: &WKWebView,
-            _configuration: &WKWebViewConfiguration,
-            action: &WKNavigationAction,
-            _features: &WKWindowFeatures,
-        ) -> Option<Retained<WKWebView>> {
-            // SAFETY: reading the action's request.
-            let url = text(unsafe { action.request().URL() });
-            if !url.is_empty() {
-                match (self.ivars().navigate)(&url) {
-                    Navigation::Allow => load_in(web, &url),
-                    Navigation::Load(other) => load_in(web, &other),
-                    Navigation::Cancel => {}
-                }
-            }
-            None
-        }
-    }
 
     unsafe impl UIAdaptivePresentationControllerDelegate for PageDelegate {
         #[unsafe(method(presentationControllerDidDismiss:))]
@@ -171,6 +110,81 @@ define_class!(
     }
 
     impl PageDelegate {
+        #[unsafe(method(webView:decidePolicyForNavigationAction:decisionHandler:))]
+        fn decide(&self, web: &AnyObject, action: &AnyObject, handler: &DynBlock<dyn Fn(NSInteger)>) {
+            // SAFETY: a WKNavigationAction's request and target frame.
+            let (url, main) = unsafe {
+                let request: Retained<NSURLRequest> = msg_send![action, request];
+                let frame: Option<Retained<AnyObject>> = msg_send![action, targetFrame];
+                let main: bool = match frame {
+                    Some(frame) => msg_send![&*frame, isMainFrame],
+                    None => true,
+                };
+                (text(request.URL()), main)
+            };
+            if !main || url.is_empty() || url == "about:blank" {
+                handler.call((ALLOW,));
+                return;
+            }
+            match (self.ivars().navigate)(&url) {
+                Navigation::Allow => handler.call((ALLOW,)),
+                Navigation::Cancel => handler.call((CANCEL,)),
+                Navigation::Load(other) => {
+                    handler.call((CANCEL,));
+                    load_in(web, &other);
+                }
+            }
+        }
+
+        #[unsafe(method(webView:didCommitNavigation:))]
+        fn committed(&self, web: &AnyObject, _navigation: Option<&AnyObject>) {
+            if let Ok(mut inner) = self.ivars().inner.lock() {
+                inner.load_failed = false;
+                inner.url = url_of(web);
+            }
+        }
+
+        #[unsafe(method(webView:didFinishNavigation:))]
+        fn finished(&self, web: &AnyObject, _navigation: Option<&AnyObject>) {
+            if let Ok(mut inner) = self.ivars().inner.lock() {
+                inner.url = url_of(web);
+            }
+        }
+
+        #[unsafe(method(webView:didFailProvisionalNavigation:withError:))]
+        fn failed_early(&self, _web: &AnyObject, _navigation: Option<&AnyObject>, error: &NSError) {
+            self.failed(error);
+        }
+
+        #[unsafe(method(webView:didFailNavigation:withError:))]
+        fn failed_late(&self, _web: &AnyObject, _navigation: Option<&AnyObject>, error: &NSError) {
+            self.failed(error);
+        }
+
+        /// A new-window request (`window.open`, `target=_blank`): asked about, then loaded here.
+        #[unsafe(method(webView:createWebViewWithConfiguration:forNavigationAction:windowFeatures:))]
+        fn new_window(
+            &self,
+            web: &AnyObject,
+            _configuration: &AnyObject,
+            action: &AnyObject,
+            _features: &AnyObject,
+        ) -> *mut AnyObject {
+            // SAFETY: a WKNavigationAction's request.
+            let url = text(unsafe {
+                let request: Retained<NSURLRequest> = msg_send![action, request];
+                request.URL()
+            });
+            if !url.is_empty() {
+                match (self.ivars().navigate)(&url) {
+                    Navigation::Allow => load_in(web, &url),
+                    Navigation::Load(other) => load_in(web, &other),
+                    Navigation::Cancel => {}
+                }
+            }
+            std::ptr::null_mut()
+        }
+
         #[unsafe(method(closeTapped:))]
         fn close_tapped(&self, _sender: Option<&AnyObject>) {
             self.mark_closed();
@@ -202,26 +216,25 @@ impl PageDelegate {
     }
 }
 
-fn load_in(web: &WKWebView, url: &str) {
+fn load_in(web: &AnyObject, url: &str) {
     if let Some(url) = NSURL::URLWithString(&NSString::from_str(url)) {
-        // SAFETY: loading a request on the main thread.
-        unsafe { web.loadRequest(&NSURLRequest::requestWithURL(&url)) };
+        let request = NSURLRequest::requestWithURL(&url);
+        // SAFETY: `loadRequest:` on a WKWebView, on the main thread.
+        let _: Option<Retained<AnyObject>> = unsafe { msg_send![web, loadRequest: &*request] };
     }
 }
 
 /// Takes page `id` away (main thread).
 fn dismiss(id: u64) {
     if let Some(views) = PAGES.with(|pages| pages.borrow_mut().remove(&id)) {
-        // SAFETY: dismissing the sheet this module presented, on the main thread.
-        unsafe { views.sheet.dismissViewControllerAnimated_completion(true, None) };
+        views.sheet.dismissViewControllerAnimated_completion(true, None);
     }
 }
 
 /// The view controller on top of the key window, to present over.
 pub(super) fn top_controller(mtm: MainThreadMarker) -> Option<Retained<UIViewController>> {
     let app = UIApplication::sharedApplication(mtm);
-    // SAFETY: walking UIKit's scene and window lists on the main thread.
-    unsafe {
+    {
         let mut root = None;
         for scene in app.connectedScenes().iter() {
             let Ok(scene) = scene.downcast::<UIWindowScene>() else {
@@ -248,7 +261,8 @@ pub(super) fn top_controller(mtm: MainThreadMarker) -> Option<Retained<UIViewCon
 }
 
 /// A store of its own per network, so its cookies and storage persist between sign-ins.
-fn data_store(mtm: MainThreadMarker, network: &str) -> Retained<WKWebsiteDataStore> {
+fn data_store(network: &str) -> Retained<AnyObject> {
+    let class = webkit(c"WKWebsiteDataStore");
     if objc2::available!(ios = 17.0) {
         use sha2::Digest;
         let digest = sha2::Sha256::digest(format!("tinyclient web sign-in {network}").as_bytes());
@@ -258,10 +272,10 @@ fn data_store(mtm: MainThreadMarker, network: &str) -> Retained<WKWebsiteDataSto
         bytes[8] = (bytes[8] & 0x3f) | 0x80;
         let uuid = NSUUID::from_bytes(bytes);
         // SAFETY: iOS 17's persistent store by identifier, on the main thread.
-        unsafe { WKWebsiteDataStore::dataStoreForIdentifier(&uuid, mtm) }
+        unsafe { msg_send![class, dataStoreForIdentifier: &*uuid] }
     } else {
         // SAFETY: the default persistent store, on the main thread.
-        unsafe { WKWebsiteDataStore::defaultDataStore(mtm) }
+        unsafe { msg_send![class, defaultDataStore] }
     }
 }
 
@@ -272,27 +286,34 @@ pub(super) fn open(page: WebPage) -> Result<IosPage, String> {
     let shared = inner.clone();
     super::on_main(move |mtm| -> Result<(), String> {
         let top = top_controller(mtm).ok_or_else(|| "The sign-in page has no window to open over.".to_owned())?;
-        // SAFETY: WebKit and UIKit set up on the main thread, as their APIs say.
+        // SAFETY: WebKit and UIKit set up on the main thread, as their APIs say; every message
+        // is one WKWebView, WKWebViewConfiguration and WKUserScript document.
         unsafe {
-            let configuration = WKWebViewConfiguration::new(mtm);
-            configuration.setWebsiteDataStore(&data_store(mtm, &page.network));
+            let configuration: Retained<AnyObject> = msg_send![webkit(c"WKWebViewConfiguration"), new];
+            let store = data_store(&page.network);
+            let _: () = msg_send![&*configuration, setWebsiteDataStore: &*store];
             if let Some(script) = &page.init_script {
-                let script = WKUserScript::initWithSource_injectionTime_forMainFrameOnly(
-                    WKUserScript::alloc(mtm),
-                    &NSString::from_str(script),
-                    WKUserScriptInjectionTime::AtDocumentStart,
-                    false,
-                );
-                configuration.userContentController().addUserScript(&script);
+                let script_alloc: Allocated<AnyObject> = msg_send![webkit(c"WKUserScript"), alloc];
+                let script: Retained<AnyObject> = msg_send![
+                    script_alloc,
+                    initWithSource: &*NSString::from_str(script),
+                    injectionTime: AT_DOCUMENT_START,
+                    forMainFrameOnly: false
+                ];
+                let contents: Retained<AnyObject> = msg_send![&*configuration, userContentController];
+                let _: () = msg_send![&*contents, addUserScript: &*script];
             }
-            let web = WKWebView::initWithFrame_configuration(WKWebView::alloc(mtm), CGRect::default(), &configuration);
-            web.setCustomUserAgent(Some(&NSString::from_str(&page.user_agent)));
+            let web_alloc: Allocated<AnyObject> = msg_send![webkit(c"WKWebView"), alloc];
+            let web: Retained<AnyObject> =
+                msg_send![web_alloc, initWithFrame: CGRect::default(), configuration: &*configuration];
+            let _: () = msg_send![&*web, setCustomUserAgent: &*NSString::from_str(&page.user_agent)];
             let delegate = PageDelegate::new(mtm, Ivars { id, navigate: page.navigate.clone(), inner: shared });
-            web.setNavigationDelegate(Some(ProtocolObject::from_ref(&*delegate)));
-            web.setUIDelegate(Some(ProtocolObject::from_ref(&*delegate)));
+            let _: () = msg_send![&*web, setNavigationDelegate: &*delegate];
+            let _: () = msg_send![&*web, setUIDelegate: &*delegate];
 
             let controller = UIViewController::new(mtm);
-            controller.setView(Some(&web));
+            let view: &UIView = &*(&*web as *const AnyObject as *const UIView);
+            controller.setView(Some(view));
             controller.setTitle(Some(&NSString::from_str(&page.title)));
             let close = UIBarButtonItem::initWithBarButtonSystemItem_target_action(
                 UIBarButtonItem::alloc(mtm),
@@ -322,7 +343,7 @@ pub(super) struct IosPage {
 }
 
 /// The page's web view, if it is still showing (main thread).
-fn web_of(id: u64) -> Option<Retained<WKWebView>> {
+fn web_of(id: u64) -> Option<Retained<AnyObject>> {
     PAGES.with(|pages| pages.borrow().get(&id).map(|views| views.web.clone()))
 }
 
@@ -348,7 +369,7 @@ fn json(value: Option<&AnyObject>) -> Option<String> {
 impl WebPageHandle for IosPage {
     fn state(&mut self) -> PageState {
         let id = self.id;
-        let url = super::on_main(move |_| web_of(id).map(|web| text(unsafe { web.URL() })));
+        let url = super::on_main(move |_| web_of(id).map(|web| url_of(&web)));
         let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(url) = url.filter(|url| !url.is_empty()) {
             inner.url = url;
@@ -370,7 +391,8 @@ impl WebPageHandle for IosPage {
                 let _ = sender.send(answer);
             });
             // SAFETY: running a script in the main frame, on the main thread.
-            unsafe { web.evaluateJavaScript_completionHandler(&NSString::from_str(&script), Some(&block)) };
+            let block: &DynBlock<dyn Fn(*mut AnyObject, *mut NSError)> = &block;
+            let _: () = unsafe { msg_send![&*web, evaluateJavaScript: &*NSString::from_str(&script), completionHandler: block] };
             true
         });
         if !shown {
@@ -399,7 +421,13 @@ impl WebPageHandle for IosPage {
                 let _ = sender.send(found);
             });
             // SAFETY: the page's own store, read on the main thread.
-            unsafe { web.configuration().websiteDataStore().httpCookieStore().getAllCookies(&block) };
+            let block: &DynBlock<dyn Fn(std::ptr::NonNull<NSArray<NSHTTPCookie>>)> = &block;
+            unsafe {
+                let configuration: Retained<AnyObject> = msg_send![&*web, configuration];
+                let store: Retained<AnyObject> = msg_send![&*configuration, websiteDataStore];
+                let cookies: Retained<AnyObject> = msg_send![&*store, httpCookieStore];
+                let _: () = msg_send![&*cookies, getAllCookies: block];
+            }
             true
         });
         if !shown {
