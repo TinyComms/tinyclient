@@ -270,8 +270,10 @@ impl Trust {
     /// * No device of `user` is known: the earliest device on the list is the root (trusted on
     ///   first use), and every other device must chain to it.
     /// * Otherwise a device is trusted if this client already trusted it with the same key, or if
-    ///   a cross-signature over it verifies against a device trusted before this call or accepted
-    ///   earlier in it. A device that was trusted and is off the list is revoked and trusts nobody.
+    ///   a cross-signature over it verifies against a device this call accepts: one trusted before
+    ///   that is still on the list with the same key, or one accepted earlier in the call. A device
+    ///   that was trusted and is off the list is revoked and signs for nobody, not even for a
+    ///   device on the same list that revokes it.
     /// * If devices are known, the list has devices, and none could be trusted, the person has
     ///   no chain to what this client pinned: [`Error::IdentityChanged`], nothing is updated.
     ///   The same when every device was revoked and a fresh unsigned one appears.
@@ -321,13 +323,16 @@ impl Trust {
             }
         }
 
-        // Signers: what was trusted before this call, and what this call has accepted so far.
+        // Signers: only what this call has accepted so far. That holds every device trusted
+        // before that is still on the list with its key (accepted above), and never one that is
+        // off it: a revoked device (a stolen key, say) cannot sign in a new one, even on the list
+        // that revokes it.
         loop {
             let mut progressed = false;
             let mut still = Vec::new();
             for record in std::mem::take(&mut pending) {
                 let signed = record.cross_signature.as_deref().is_some_and(|signature| {
-                    before.iter().chain(accepted.iter()).any(|(_, signer)| {
+                    accepted.iter().any(|(_, signer)| {
                         verify_cross_signature(
                             signer,
                             user,

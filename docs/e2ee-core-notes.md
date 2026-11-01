@@ -145,9 +145,11 @@ here rests on the cross-signature chain, not on lifetimes.
   signed by one since revoked still looks like that). Every other device must chain to it. A server
   that is present at first contact controls this and nothing can be done about it (spec section 8).
 * **Who may sign.** A new device is accepted if a cross-signature over it verifies against a device
-  trusted *before this call* or accepted earlier in it. A device that has been removed from the list
-  no longer signs for anyone. A device the person revoked in the same breath as approving another
-  still counts for the approval if the client had seen it trusted.
+  this call accepts: one trusted before that is still on the list with the same key, or one
+  accepted earlier in the call. A device that is off the list no longer signs for anyone, even on
+  the list that revokes it, so a stolen key cannot sign in a new device while the server drops the
+  stolen one. The cost: a person who replaces their only device must approve the new one before
+  revoking the old one; done in one step, it reads as a new identity (`Error::IdentityChanged`).
 * **A new identity** (devices pinned, none now on the list verifies, the list is not empty, or every
   device was revoked and an unsigned one appears) is `Error::IdentityChanged`; nothing is trusted
   until `accept_new_identity`.

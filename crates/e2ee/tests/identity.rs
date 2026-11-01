@@ -325,6 +325,40 @@ fn revoking_a_device_removes_trust_and_its_signatures_stop_counting() {
 }
 
 #[test]
+fn a_device_revoked_on_the_same_list_cannot_sign_in_a_new_one() {
+    let u = user();
+    let (a, b, thief) = (device(u), device(u), device(u));
+    let mut trust = Trust::new();
+    trust
+        .verify_list(u, &[record(&a, None, 1), record(&b, Some(&a), 2)])
+        .unwrap();
+    // The list that drops a (its key stolen) also carries a device that only a vouches for: the
+    // thief's. a is off the list, so its signature counts for nothing.
+    let report = trust
+        .verify_list(u, &[record(&b, Some(&a), 2), record(&thief, Some(&a), 3)])
+        .unwrap();
+    assert_eq!(report.removed, vec![a.device]);
+    assert_eq!(
+        report.rejected,
+        vec![(thief.device, Rejection::NotCrossSigned)]
+    );
+    assert!(report.added.is_empty());
+    assert!(!trust.is_trusted(u, thief.device, &thief.key.public_key()));
+    assert!(!trust.is_trusted(u, a.device, &a.key.public_key()));
+    assert!(trust.is_trusted(u, b.device, &b.key.public_key()));
+
+    // Every device revoked at once, with a new one signed only by a revoked device: no chain to
+    // what was pinned, so it is a new identity, not a silent hand-over.
+    let mut trust = Trust::new();
+    trust.verify_list(u, &[record(&a, None, 1)]).unwrap();
+    assert!(matches!(
+        trust.verify_list(u, &[record(&thief, Some(&a), 3)]),
+        Err(Error::IdentityChanged)
+    ));
+    assert!(!trust.is_trusted(u, thief.device, &thief.key.public_key()));
+}
+
+#[test]
 fn a_new_identity_is_reported_and_needs_the_person_to_agree() {
     let u = user();
     let (a, fresh) = (device(u), device(u));
