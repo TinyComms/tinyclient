@@ -50,6 +50,11 @@ const CAPTURE_MAX: usize = FRAME_SAMPLES * 10;
 /// Three 20 ms ticks, so one late tick cannot run the speaker dry.
 const CAPTURE_LOW_MS: f64 = 30.;
 const PLAYOUT_LOW_MS: f64 = 60.;
+/// The deepest the speaker's cushion grows, what each underrun adds to it, and the ticks without
+/// one (a minute) after which it gives that back.
+const CUSHION_MOST_MS: u32 = 80;
+const CUSHION_STEP_MS: u32 = 10;
+const CUSHION_CLEAN: u32 = 3_000;
 
 /// What went wrong on a pair of devices, counted by their callbacks.
 #[derive(Debug, Default)]
@@ -140,13 +145,51 @@ impl Drift {
         (self.adjust * 1e6).round() as i32
     }
 
-    /// Keeps 10 ms more than before, up to 80 ms.
-    fn deepen(&mut self) {
-        self.target_ms = (self.target_ms + 10.).min(80.);
+    /// Keeps `ms` from now on.
+    fn aim(&mut self, ms: f64) {
+        self.target_ms = ms;
     }
 
     fn restart(&mut self) {
         *self = Drift::new(self.target_ms);
+    }
+}
+
+/// How much the speaker's ring keeps, in ms: both what a refill waits for and what the drift
+/// control holds at its low point, so the two never disagree about what is normal. An underrun
+/// is a machine that kept the tick waiting, and it may do so again; a minute without one and it
+/// is not worth the delay any more.
+#[derive(Debug)]
+struct Cushion {
+    ms: u32,
+    /// Ticks since the last underrun, or the last step back.
+    clean: u32,
+}
+
+impl Cushion {
+    fn new() -> Cushion {
+        Cushion { ms: PLAYOUT_LOW_MS as u32, clean: 0 }
+    }
+
+    fn underran(&mut self) {
+        self.ms = (self.ms + CUSHION_STEP_MS).min(CUSHION_MOST_MS);
+        self.clean = 0;
+    }
+
+    /// One tick with no underrun. True when that was the one that made it shallower.
+    fn tick(&mut self) -> bool {
+        self.clean += 1;
+        if self.clean < CUSHION_CLEAN || self.ms <= PLAYOUT_LOW_MS as u32 {
+            return false;
+        }
+        self.clean = 0;
+        self.ms -= CUSHION_STEP_MS;
+        true
+    }
+
+    /// In samples of the ring, at a device's `rate`.
+    fn samples(&self, rate: u32) -> usize {
+        rate as usize * self.ms as usize / 1000 * CHANNELS
     }
 }
 
@@ -594,6 +637,7 @@ struct Output {
     rate: u32,
     most: usize,
     fill: usize,
+    cushion: Cushion,
     resampled: Vec<f32>,
     /// Underruns already answered with a deeper cushion.
     answered: u64,
@@ -831,6 +875,7 @@ fn output_path(rate: u32, channels: usize, health: &Arc<Health>, adaptive: bool)
         rate,
         most: (rate as f32 * PLAYOUT_MAX) as usize * CHANNELS,
         fill,
+        cushion: Cushion::new(),
         resampled: Vec::with_capacity(FRAME_SAMPLES * 4),
         answered: 0,
         life,
@@ -1157,11 +1202,15 @@ impl Audio {
             }
             Sink::Device(Some(output)) => {
                 let underruns = self.health.underruns.load(Ordering::Relaxed);
-                if underruns > output.answered {
+                let underran = underruns > output.answered;
+                if underran {
                     // The tick came later than the cushion could cover: keep more from now on.
                     output.answered = underruns;
-                    output.drift.deepen();
-                    output.fill = (output.fill + output.rate as usize / 100 * CHANNELS).min(output.most / 2);
+                    output.cushion.underran();
+                }
+                if underran || output.cushion.tick() {
+                    output.drift.aim(f64::from(output.cushion.ms));
+                    output.fill = output.cushion.samples(output.rate);
                     output.control.fill.store(output.fill, Ordering::Relaxed);
                 }
                 let held = output.held_ms();
@@ -1592,6 +1641,38 @@ mod tests {
     fn the_speaker_keeps_three_ticks_of_slack() {
         assert!(PLAYOUT_LOW_MS >= 60., "{PLAYOUT_LOW_MS}");
         assert!(PREBUFFER * 1000. >= PLAYOUT_LOW_MS as f32, "prebuffer {PREBUFFER} is under the target");
+    }
+
+    #[test]
+    fn each_underrun_deepens_the_cushion_up_to_a_limit_both_sides_share() {
+        let mut cushion = Cushion::new();
+        assert_eq!(cushion.ms, 60);
+        cushion.underran();
+        assert_eq!(cushion.ms, 70);
+        for _ in 0..50 {
+            cushion.underran();
+        }
+        assert_eq!(cushion.ms, CUSHION_MOST_MS);
+        // In both channels, and under where a backlog is skipped at any rate.
+        assert_eq!(cushion.samples(48_000), 7_680);
+        assert!(cushion.samples(192_000) < (192_000. * PLAYOUT_MAX) as usize * CHANNELS);
+    }
+
+    #[test]
+    fn a_clean_minute_gives_a_step_of_the_cushion_back() {
+        let mut cushion = Cushion::new();
+        cushion.underran();
+        cushion.underran();
+        assert_eq!(cushion.ms, 80);
+        assert!(!(0..CUSHION_CLEAN - 1).any(|_| cushion.tick()), "not yet");
+        cushion.underran();
+        assert!(!(0..CUSHION_CLEAN - 1).any(|_| cushion.tick()), "an underrun starts the minute again");
+        assert!(cushion.tick());
+        assert_eq!(cushion.ms, 70);
+        assert!(!(0..CUSHION_CLEAN - 1).any(|_| cushion.tick()));
+        assert!(cushion.tick());
+        assert_eq!(cushion.ms, 60);
+        assert!(!(0..CUSHION_CLEAN * 3).any(|_| cushion.tick()), "and no shallower than it began");
     }
 
     #[test]
