@@ -114,6 +114,16 @@ pub extern "system" fn Java_dev_tinyclient_app_TinyPlatform_nativeDebugJoin(mut 
             return;
         };
         let text: String = text.into();
+        // `<server>|<room>|...|audio=tone:660|sink=<path>`: mediad's test source and sink
+        // (TINYCLIENT_MEDIAD_AUDIO, TINYCLIENT_MEDIAD_SINK) instead of the microphone and
+        // speaker, so a test hears a known tone and keeps what the far end sent.
+        for part in text.split('|') {
+            if let Some(kind) = part.strip_prefix("audio=") {
+                std::env::set_var("TINYCLIENT_MEDIAD_AUDIO", kind);
+            } else if let Some(path) = part.strip_prefix("sink=") {
+                std::env::set_var("TINYCLIENT_MEDIAD_SINK", path);
+            }
+        }
         match crate::gui::debug_launch::Launch::parse(&text) {
             Some(mut launch) => {
                 launch.camera |= camera != 0;
