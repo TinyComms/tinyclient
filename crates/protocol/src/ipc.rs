@@ -159,8 +159,12 @@ mod tests {
         });
         assert!(listener.accept().is_ok());
         assert!(client.join().unwrap().is_ok());
-        // A stale socket from a chatd that died is replaced, and the new one is owner-only too.
-        drop(listener);
+        // A stale socket from a chatd that died is replaced, and the new one is owner-only too. A
+        // chatd that dies runs no destructor, so the listener is forgotten, not dropped: dropping
+        // it lets interprocess unlink the socket file (it reclaims the name), and there would be
+        // no stale file left to replace.
+        std::mem::forget(listener);
+        assert!(path.exists(), "the stale socket is still there");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
         let _again = ChatListener::bind(&path).unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
