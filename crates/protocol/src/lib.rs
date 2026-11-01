@@ -464,6 +464,10 @@ pub struct Conversation {
     pub special: Special,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mark: Option<Mark>,
+    /// Telegram's own topic color for a `Thread` row that hangs off a forum (its palette
+    /// index), the tile the row draws its icon with. `None` on every other row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic_icon: Option<i32>,
     /// The user did not opt in to it (Discord's "show all channels" off): drawn only under the
     /// tree's "Browse n more channels".
     #[serde(default, skip_serializing_if = "is_false")]
@@ -540,6 +544,7 @@ impl Conversation {
             meeting: false,
             special: Special::None,
             mark: None,
+            topic_icon: None,
             opted_out: false,
             quiet: false,
             preview_from: String::new(),

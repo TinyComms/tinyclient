@@ -531,6 +531,9 @@ fn a_forum_topic_is_a_thread_under_the_forum() {
     // Read in a topic is told for the topic.
     world.ask(Request::MarkRead { conversation: key("c9002_31"), message_id: "42".into() });
     world.until("the topic to be read", || world.calls().contains(&"ReadDiscussion c9002_31 42".to_owned()).then_some(()));
+    // The topic's own color, the tile the list draws its icon with.
+    let topic = world.conversation("c9002_31").unwrap();
+    assert_eq!(topic.topic_icon, Some(3), "the topic's own icon color");
 }
 
 #[test]

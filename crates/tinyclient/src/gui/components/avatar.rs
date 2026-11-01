@@ -134,6 +134,11 @@ pub fn tint_of(key: &Key) -> usize {
     (hash(&[key.network.label(), &key.id]) % 8) as usize
 }
 
+/// A tint the conversation names itself (Telegram's topic color): over the hash when there.
+pub fn tint_from(key: &Key, icon: Option<i32>) -> usize {
+    icon.filter(|icon| *icon >= 0 && *icon < 8).map(|icon| icon as usize).unwrap_or_else(|| tint_of(key))
+}
+
 pub struct Avatar {
     name: String,
     tint: usize,
@@ -180,6 +185,12 @@ impl Avatar {
             letters: None,
             play: Play::Hover,
         }
+    }
+
+    /// A tint the conversation names itself, over the id's hash.
+    pub fn tint(mut self, tint: usize) -> Avatar {
+        self.tint = tint;
+        self
     }
 
     /// A channel: its glyph on a neutral plate.

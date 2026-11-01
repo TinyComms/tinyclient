@@ -22,7 +22,7 @@ use std::path::Path;
 /// Raise this when a table changes. `open` then drops the cache and starts over.
 /// 6 rebuilds caches written at 5 before `conversation.voice_limit` existed. That column
 /// was added without a version change, so Win+K died with `no such column: c.voice_limit`.
-const SCHEMA: i32 = 6;
+const SCHEMA: i32 = 7;
 
 /// Retention: the newest messages kept per conversation.
 pub const KEEP_MESSAGES: u32 = 2_000;
@@ -145,6 +145,9 @@ const TABLES: &str = "
         -- The newest of my messages the other side has read, and has received.
         seen_to   TEXT NOT NULL DEFAULT '',
         delivered_to TEXT NOT NULL DEFAULT '',
+        -- Telegram's own topic color for a forum topic row (a palette index), never absent for
+        -- a topic and always empty for anything else.
+        icon INTEGER,
         PRIMARY KEY (network, account, id)
     ) WITHOUT ROWID;
     CREATE INDEX conversation_threads ON conversation (network, account, parent) WHERE parent != '';
@@ -245,7 +248,7 @@ const CONVERSATION: &str = "
            (c.preview_mine AND c.delivered_to != '' AND (length(c.delivered_to), c.delivered_to) >= (length(c.preview_id), c.preview_id)),
            (c.preview_mine AND EXISTS (SELECT 1 FROM message f WHERE f.network = c.network AND f.account = c.account
                                          AND f.conversation = c.id AND f.id = c.preview_id AND f.pending = 1)),
-           c.voice_limit
+           c.voice_limit, c.icon
     FROM conversation c
     LEFT JOIN media m ON m.network = c.network AND m.account = c.account AND m.id = c.avatar
     LEFT JOIN space s ON s.network = c.network AND s.account = c.account AND s.id = c.space
@@ -321,6 +324,9 @@ pub struct ConversationRow {
     pub mark: Option<Mark>,
     /// Not opted in to (Discord's "show all channels" off).
     pub opted_out: bool,
+    /// Telegram's own topic color for a forum topic row (a palette index), `None`
+    /// otherwise.
+    pub icon: Option<i32>,
     /// How the network files it. `None` leaves what is stored, so a tree that does not know
     /// (a Slack tree reload) never undoes a pin or a follow; `Some` replaces it.
     pub filing: Option<Filing>,
@@ -410,6 +416,7 @@ impl ConversationRow {
             mark: None,
             opted_out: false,
             filing: None,
+            icon: None,
         }
     }
 }
@@ -624,6 +631,7 @@ fn conversation_from(row: &Row) -> rusqlite::Result<Conversation> {
         quiet: row.get(45)?,
         delivered: row.get(46)?,
         sending: row.get(47)?,
+        topic_icon: row.get(49)?,
     })
 }
 
@@ -740,9 +748,9 @@ fn upsert_conversation(tx: &Transaction, account: &AccountKey, row: &Conversatio
         "INSERT INTO conversation
              (network, account, id, kind, title, space, section, position, avatar, peer, call, listed,
               topic, parent, root, read_only, private, bot, meeting, special, mark, opted_out,
-              folders, archived, pin, hidden, followed, voice_limit)
+              folders, archived, pin, hidden, followed, voice_limit, icon)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
-                 ?20, ?21, ?22, ?24, ?25, ?26, ?27, ?28, ?29)
+                 ?20, ?21, ?22, ?24, ?25, ?26, ?27, ?28, ?29, ?30)
          ON CONFLICT (network, account, id) DO UPDATE SET
              kind = excluded.kind, title = excluded.title, space = excluded.space,
              section = excluded.section, position = excluded.position, avatar = excluded.avatar,
@@ -751,6 +759,7 @@ fn upsert_conversation(tx: &Transaction, account: &AccountKey, row: &Conversatio
              read_only = excluded.read_only, private = excluded.private, bot = excluded.bot,
              meeting = excluded.meeting, special = excluded.special, mark = excluded.mark,
              opted_out = excluded.opted_out, voice_limit = excluded.voice_limit,
+             icon = excluded.icon,
              folders = CASE WHEN ?23 THEN excluded.folders ELSE folders END,
              archived = CASE WHEN ?23 THEN excluded.archived ELSE archived END,
              pin = CASE WHEN ?23 THEN excluded.pin ELSE pin END,
@@ -786,6 +795,7 @@ fn upsert_conversation(tx: &Transaction, account: &AccountKey, row: &Conversatio
             filing.hidden,
             filing.followed,
             row.limit,
+            row.icon,
         ],
     )?;
     Ok(())

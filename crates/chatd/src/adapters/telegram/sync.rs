@@ -621,6 +621,8 @@ fn topics(account: &Account, forum: Who) -> Result<usize, Fault> {
         };
         let id = thread_id(forum, topic.id);
         let mut thread = ConversationRow::new(id.clone(), ConversationKind::Thread, topic.title.clone());
+        // The topic's own icon color: the tile it draws wherever its list shows.
+        thread.icon = Some(topic.icon_color);
         thread.parent = Some(forum.text());
         thread.root = Some(topic.id.to_string());
         // Pinned topics first, then as Telegram lists them: the most recently active first.
