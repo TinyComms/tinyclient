@@ -27,7 +27,7 @@ Under the support directory (`TINYCLIENT_DIR`, otherwise the platform data dir):
 | `logs/mediad.log` | Voice. Same roll |
 | `logs/login.log` | The sign-in window. Same roll |
 | `logs/bundles/<session>-<process>-<utc>.log` | The in-memory ring, written only by Save debug log |
-| `crash.log` | A panic, already passed through `redact` |
+| `crash.log` | A panic, already passed through `redact`. Mode `0600` on Unix |
 
 The old `chatd.log` at the top of the support directory is not opened, copied, or deleted.
 

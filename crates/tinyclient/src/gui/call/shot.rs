@@ -87,6 +87,7 @@ pub(super) fn security(members: &[String]) -> Option<CallSecurity> {
     let mode = match name.as_str() {
         "e2ee_pending" => SecurityMode::Pending,
         "transport" => SecurityMode::Transport,
+        "blocked" => SecurityMode::Blocked,
         _ => SecurityMode::EndToEnd,
     };
     let end_to_end = mode == SecurityMode::EndToEnd;
@@ -124,6 +125,7 @@ pub(super) fn security(members: &[String]) -> Option<CallSecurity> {
         members,
         unsupported: Vec::new(),
         server_lacks: mode == SecurityMode::Transport,
+        required: false,
     })
 }
 
@@ -335,7 +337,7 @@ pub(super) fn running() -> Option<Occupants> {
 // cameras), `phone_crowd` (seven, voice), `phone_share` (a screen share), `phone_incoming`,
 // `phone_incoming_video`, `phone_outgoing`, `phone_connecting`, `phone_reconnecting`,
 // `phone_pill` (minimised over the screen behind), `phone_people`, `phone_devices`,
-// `phone_more`, `phone_security`, `phone_denied` (the microphone refused),
+// `phone_more`, `phone_security`, `phone_security_blocked`, `phone_denied` (the microphone refused),
 // `phone_camera_denied`, `phone_failed`, `phone_ended`.
 
 /// One face of the phone's call screen: the call, who or where it is, and what is open.
@@ -405,6 +407,7 @@ fn sealed(call: &mut Call) {
             .collect(),
         unsupported: Vec::new(),
         server_lacks: false,
+        required: false,
     });
 }
 
@@ -469,6 +472,14 @@ pub(super) fn phone_shot() -> Option<PhoneShot> {
             camera_on(&mut call);
             sealed(&mut call);
             shot(call, direct("Ana Ruiz"), screen)
+        }
+        // The server turned the call's encryption off: blocked until the person leaves or carries on.
+        "phone_security_blocked" => {
+            let mut call = group(now() - 271);
+            if let Some(security) = call.security.as_mut() {
+                security.mode = SecurityMode::Blocked;
+            }
+            shot(call, lounge(), Shown::Sheet(Sheet::Security))
         }
         "phone_group" | "phone_pill" | "phone_more" | "phone_security" | "phone_camera_denied" => {
             let view = match name.as_str() {

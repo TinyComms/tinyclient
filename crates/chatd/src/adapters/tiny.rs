@@ -13,10 +13,12 @@
 //! Text channels and direct messages are conversations (`messages`): the shell's own pane
 //! draws them.
 
+pub(crate) mod e2ee;
 pub(crate) mod live;
 pub(crate) mod manage;
 mod browser;
 mod messages;
+mod sealing;
 pub mod signin;
 
 use super::{serve_commands, Command, Context, Signed};
@@ -48,6 +50,15 @@ pub(crate) struct Saved {
     email: Option<String>,
     display_name: String,
     role: String,
+    /// The person was told this server is reached over plain http, off their own network, and
+    /// chose to sign in anyway. Absent in a session from before there was a question: such a
+    /// session is not used for a server like that, until they sign in again and confirm.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    plain_http_ok: bool,
+    /// The keys of this install's end-to-end encryption device on this server (`e2ee`): kept in
+    /// the keychain with the session and nowhere else. Absent until the device is first made.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    e2ee: Option<e2ee::Secrets>,
 }
 
 struct Me {
@@ -76,6 +87,27 @@ fn safe_id(id: &str) -> bool {
         && id
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+}
+
+/// Said when a saved session would send its token over plain http to a server off the person's
+/// own network and they never agreed to it.
+const PLAIN_HTTP_REFUSED: &str = "This server is reached over plain http, off your own network, and you have not agreed to that. Sign in again to choose.";
+
+/// Whether a session may be used: its server is reached over https, or is on this computer or a
+/// network of the person's own, or they confirmed plain http at sign-in. Anything else would send
+/// the session's token where anyone on the way can read it.
+pub(crate) fn plain_http_allowed(base_url: &str, confirmed: bool) -> bool {
+    protocol::reach(base_url) != protocol::Reach::Open || confirmed
+}
+
+/// `saved`, if it may be used. This is where a session is let start making requests.
+fn permitted(saved: Saved) -> Result<Saved, String> {
+    if plain_http_allowed(&saved.base_url, saved.plain_http_ok) {
+        Ok(saved)
+    } else {
+        tracing::warn!("chatd: a Tiny session over plain http outside the person's network was not used");
+        Err(PLAIN_HTTP_REFUSED.to_owned())
+    }
 }
 
 pub(crate) fn parse(session: &str) -> Result<Saved, String> {
@@ -424,6 +456,9 @@ fn saved_from(base: &str, body: Value) -> Result<Saved, Fault> {
         email: answer.email.filter(|email| !email.is_empty()),
         display_name: answer.display_name,
         role: answer.role,
+        // Set by the sign-in, which is the one that asked.
+        plain_http_ok: false,
+        e2ee: None,
     })
 }
 
@@ -571,8 +606,9 @@ fn open(account: &AccountKey) -> Result<Saved, Response> {
             ));
         }
     };
-    match saved_for(&session, &account.account) {
+    match saved_for(&session, &account.account).and_then(permitted) {
         Ok(saved) => Ok(saved),
+        Err(why) if why == PLAIN_HTTP_REFUSED => Err(refused(PLAIN_HTTP_REFUSED)),
         Err(_) => Err(refused("You can't do that.")),
     }
 }
@@ -1006,6 +1042,16 @@ pub(crate) fn rename(account: AccountKey, display_name: String) -> Response {
 
 /// Ends every session of this account on the server. A 401 is already the same thing: the
 /// caller forgets the session either way.
+/// `Request::TinyE2ee`: this account's encryption device, its people and their safety numbers.
+pub(crate) fn e2ee_ask(account: AccountKey, ask: protocol::E2eeAsk) -> Response {
+    let saved = match open(&account) {
+        Ok(saved) => saved,
+        Err(answer) => return answer,
+    };
+    let names: std::collections::HashMap<String, String> = members_of(&saved).map(|members| members.into_iter().map(|member| (member.user_id, member.display_name)).collect()).unwrap_or_default();
+    e2ee::answer(&saved, ask, &names)
+}
+
 pub(crate) fn end_sessions(account: &AccountKey) -> Result<(), Response> {
     let saved = open(account)?;
     match asked("DELETE", &saved, "/v1/sessions", None) {
@@ -1020,7 +1066,7 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
 }
 
 pub(crate) fn start_with(ctx: Context, session: &str, inbox: Receiver<Command>, timing: live::Timing) -> Result<(), String> {
-    let saved = parse(session)?;
+    let saved = permitted(parse(session)?)?;
     if saved.user_id != ctx.account.account {
         return Err("the Tiny server session is for another account".to_owned());
     }
@@ -1033,6 +1079,9 @@ pub(crate) fn start_with(ctx: Context, session: &str, inbox: Receiver<Command>, 
     std::thread::Builder::new()
         .name("tiny-commands".into())
         .spawn(move || {
+            // This install as an encryption device of the person, before any conversation is read:
+            // made, registered, key packages up. Never stops the account.
+            e2ee::begin(&saved);
             messages::refresh(&ctx, &saved);
             serve_commands(
                 &ctx,
@@ -1045,6 +1094,9 @@ pub(crate) fn start_with(ctx: Context, session: &str, inbox: Receiver<Command>, 
                     Command::CallLeave(room_id) => live.ask(live::Ask::Hangup { room_id }),
                     Command::CallAudio { muted, deafened } => live.ask(live::Ask::State { muted, deafened }),
                     Command::SignOut(reply) => {
+                        // This install stops being a device of the person: revoked on the server
+                        // while the session still works, its keys and cache forgotten here.
+                        e2ee::sign_out(&saved);
                         delete_session(&saved);
                         let _ = reply.send(Ok(()));
                     }
@@ -1075,6 +1127,59 @@ pub(crate) mod tests {
         assert_eq!(explain_media(415, &body("unsupported_media")), "That file isn't a kind this server takes.");
         assert_eq!(explain(413, &body("too_large"), Missing::Plain), "That picture is too big. The most is 256 KB.");
         assert_eq!(explain(415, &body("unsupported_media"), Missing::Plain), "That picture isn't a PNG, JPEG or WebP.");
+    }
+
+    fn session_at(base: &str, confirmed: Option<bool>) -> String {
+        let flag = confirmed.map(|yes| format!(r#","plain_http_ok":{yes}"#)).unwrap_or_default();
+        format!(r#"{{"base_url":"{base}","token":"t","user_id":"11111111-1111-1111-1111-111111111111","email":null,"display_name":"Ada","role":"owner"{flag}}}"#)
+    }
+
+    #[test]
+    fn a_session_is_used_over_plain_http_only_where_the_person_can_stand_it_or_said_yes() {
+        // Never asked, never said: a session from before the question, or one made over https.
+        for allowed in [
+            "https://chat.example",
+            "http://127.0.0.1:8080",
+            "http://localhost:8080",
+            "http://192.168.1.120:8080",
+            "http://10.0.0.5",
+            "http://100.73.171.76:8080",
+            "http://atomicstudio:8080",
+            "http://atomicstudio.tail1234.ts.net",
+        ] {
+            let saved = parse(&session_at(allowed, None)).unwrap();
+            assert!(permitted(saved).is_ok(), "{allowed}");
+        }
+        // Plain http to anything else is not used, until the person agreed to it.
+        for refused in ["http://chat.example", "http://203.0.113.9:8080", "http://chat.example:80"] {
+            let saved = parse(&session_at(refused, None)).unwrap();
+            assert_eq!(permitted(saved).err().as_deref(), Some(PLAIN_HTTP_REFUSED), "{refused}");
+            let saved = parse(&session_at(refused, Some(false))).unwrap();
+            assert!(permitted(saved).is_err(), "{refused} with a no");
+            let saved = parse(&session_at(refused, Some(true))).unwrap();
+            assert!(permitted(saved).is_ok(), "{refused} with a yes");
+        }
+        assert!(plain_http_allowed("http://chat.example", true) && !plain_http_allowed("http://chat.example", false));
+        // The yes survives being saved and read back, and its absence is not written.
+        let saved = parse(&session_at("http://chat.example", Some(true))).unwrap();
+        let again = serde_json::to_string(&saved).unwrap();
+        assert!(again.contains("\"plain_http_ok\":true") && parse(&again).unwrap().plain_http_ok);
+        let plain = parse(&session_at("https://chat.example", None)).unwrap();
+        assert!(!serde_json::to_string(&plain).unwrap().contains("plain_http_ok"));
+    }
+
+    #[test]
+    fn a_session_that_may_not_be_used_is_still_listed_and_can_be_signed_out_of() {
+        // Refusing to use it must not hide it or trap it: the other accounts in the blob and the
+        // person's way to remove this one stay as they were.
+        let one = session_at("http://chat.example", None);
+        let accounts = accounts(&one).unwrap();
+        assert_eq!(accounts.len(), 1);
+        assert!(without(&one, &accounts[0].account).is_none(), "signing out of it empties the session");
+        let both = format!("[{one},{}]", session_at("https://other.example", None).replace("1111", "2222"));
+        assert_eq!(super::accounts(&both).unwrap().len(), 2);
+        let left = without(&both, "11111111-1111-1111-1111-111111111111").unwrap();
+        assert_eq!(super::accounts(&left).unwrap().len(), 1);
     }
 
     #[test]

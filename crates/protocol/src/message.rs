@@ -362,6 +362,10 @@ pub struct Message {
     /// What the shell called it when sending. Set on our own messages only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
+    /// End-to-end encrypted and opened, or encrypted and not opened here. `Plain` for every
+    /// network that does not say, and for a plaintext message of a Tiny server.
+    #[serde(default, skip_serializing_if = "crate::Seal::is_plain")]
+    pub seal: crate::Seal,
 }
 
 impl Message {
@@ -397,6 +401,7 @@ impl Message {
             kind: MessageKind::Normal,
             state: SendState::Sent,
             client_id: None,
+            seal: crate::Seal::Plain,
         }
     }
 

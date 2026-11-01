@@ -9,7 +9,7 @@
 //! server has the adapter leave on the network, so nobody is left ringing or shown in a channel.
 
 use crate::hub::{now, Hub};
-use protocol::settings::{GLOBAL, INPUT, JOIN_MUTED, OUTPUT};
+use protocol::settings::{GLOBAL, INPUT, JOIN_MUTED, OUTPUT, REQUIRE_CALL_E2EE};
 use protocol::{
     clip, read_frame, write_frame, AudioDevice, Call, CallFailure, CallPicture, CallState, Change, Content, Cue, Direction, Key, MediaRequest,
     MediaResponse, Participant, TinyOffer, TinySlot, VideoStream, VoiceJoin, DEVICES_LIMIT, OCCUPANTS_LIMIT,
@@ -1153,12 +1153,37 @@ impl Calls {
     }
 }
 
+/// Shown when the person only joins end-to-end encrypted calls and the server cannot encrypt them.
+pub const SERVER_CANNOT_ENCRYPT: &str =
+    "This server cannot encrypt calls end to end, and you chose to join only encrypted calls. Turn that off in Settings › Privacy to join anyway.";
+
+/// What "only join end-to-end encrypted calls" asks of an offer. Off: the offer is as the adapter
+/// made it. On: the offer carries `required`, so mediad blocks the call if the server later turns
+/// encryption off, and an offer with no encryption at all (the server lacks it) is refused here
+/// in words, before mediad is started, so nothing is sent to a server that cannot encrypt.
+fn require_end_to_end(required: bool, offer: &mut TinyOffer) -> Result<(), String> {
+    if !required {
+        return Ok(());
+    }
+    match offer.e2ee.as_mut() {
+        Some(e2ee) => {
+            e2ee.required = true;
+            Ok(())
+        }
+        None => Err(SERVER_CANNOT_ENCRYPT.to_owned()),
+    }
+}
+
 impl Calls {
     /// A Tiny server call: mediad makes the offer for the room `conversation` names, started
     /// first if it is not running for that room. The same room again is a rejoin, and keeps the
     /// call. A Tiny call in another room of the same account gives way, since the server moves
-    /// the seat; any other call is in the way. What failed is said in words.
+    /// the seat; any other call is in the way. What failed is said in words. A person who only
+    /// joins end-to-end encrypted calls (`REQUIRE_CALL_E2EE`) has `required` set on the offer, and
+    /// is refused here when the offer has no encryption.
     pub fn tiny_offer(&self, hub: &Arc<Hub>, conversation: &Key, mut offer: TinyOffer) -> Result<String, String> {
+        let required = hub.settings().on(REQUIRE_CALL_E2EE);
+        require_end_to_end(required, &mut offer)?;
         let (call, running) = self.describe();
         let here = call.as_ref().is_some_and(|call| call.conversation == *conversation) && running;
         if !here {
@@ -1398,6 +1423,51 @@ mod tests {
         assert!(live.call.participants.iter().all(|who| who.id != "me"));
     }
 
+
+    fn tiny_offer(e2ee: Option<protocol::TinyE2ee>) -> TinyOffer {
+        TinyOffer { user_id: "me".into(), host: "127.0.0.1".into(), slots: 11, muted: false, deafened: false, e2ee }
+    }
+
+    fn sealed_offer() -> TinyOffer {
+        tiny_offer(Some(protocol::TinyE2ee { room_id: "room".into(), identity: "/keys/me".into(), required: false }))
+    }
+
+    #[test]
+    fn the_setting_sets_required_on_an_offer_that_has_encryption() {
+        let mut offer = sealed_offer();
+        require_end_to_end(false, &mut offer).unwrap();
+        assert_eq!(offer.e2ee.as_ref().map(|e2ee| e2ee.required), Some(false), "off leaves the offer as the adapter made it");
+        require_end_to_end(true, &mut offer).unwrap();
+        assert_eq!(offer.e2ee.as_ref().map(|e2ee| e2ee.required), Some(true));
+        // Off with no encryption on the server is a call that carries on, as before.
+        let mut plain = tiny_offer(None);
+        require_end_to_end(false, &mut plain).unwrap();
+        assert!(plain.e2ee.is_none());
+    }
+
+    #[test]
+    fn a_person_who_requires_encryption_does_not_join_a_server_that_lacks_it() {
+        let mut plain = tiny_offer(None);
+        assert_eq!(require_end_to_end(true, &mut plain), Err(SERVER_CANNOT_ENCRYPT.to_owned()));
+        assert!(SERVER_CANNOT_ENCRYPT.contains("Settings"), "it says where to change it");
+    }
+
+    #[test]
+    fn tiny_offer_reads_the_setting_and_refuses_before_mediad_is_started() {
+        let dir = std::env::temp_dir().join(format!("tc-media-require-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let hub = Arc::new(Hub::new(crate::store::Store::open(&dir.join("chat.sqlite")).unwrap()));
+        let key = Key { network: Network::Tiny, account: "me".into(), id: "room".into() };
+        // Required, and the offer has no encryption: refused in words, with no call started.
+        hub.set_setting(GLOBAL, REQUIRE_CALL_E2EE, Some("on".into())).unwrap();
+        assert!(hub.settings().on(REQUIRE_CALL_E2EE));
+        assert_eq!(hub.calls.tiny_offer(&hub, &key, tiny_offer(None)), Err(SERVER_CANNOT_ENCRYPT.to_owned()));
+        let (call, running) = hub.calls.describe();
+        assert!(call.is_none() && !running, "nothing was started for a server that cannot encrypt");
+        drop(hub);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     #[test]
     fn a_device_saved_by_name_learns_its_id_and_survives_a_restart() {
         let dir = std::env::temp_dir().join(format!("tc-media-devices-{}", std::process::id()));

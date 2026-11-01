@@ -3,7 +3,7 @@
 //! The connection's state is a banner under the strip, never in it, so the title keeps the
 //! width it needs.
 
-use crate::gui::components::{banner, banner_action, icon_button, network_icon, Tone};
+use crate::gui::components::{banner, banner_action, glyph, icon_button, network_icon, Tone};
 use crate::gui::phone::tokens::{self, PhoneType};
 use crate::gui::state::Shell;
 use crate::gui::theme;
@@ -34,7 +34,29 @@ impl Shell {
         let mixed = open.space.is_none();
         let place = open.space_title.trim().to_owned();
         let subtitle = (!direct && !place.is_empty())
-            .then(|| div().min_w_0().truncate().phone_stamp().font_weight(theme::REGULAR).text_color(theme::text_faint()).child(place));
+            .then(|| div().flex_none().max_w(px(120.)).truncate().phone_stamp().font_weight(theme::REGULAR).text_color(theme::text_faint()).child(place));
+        // Whether it is end-to-end encrypted, where the network says: the desktop strip's chip,
+        // as the subtitle's line here (a lock and the words, or that the server can read it).
+        // A tap opens Encryption, where the safety numbers are.
+        let encryption = (!open.encryption.is_unknown()).then(|| {
+            let sealed = open.encryption == protocol::Encryption::EndToEnd;
+            let (icon, tone) = if sealed { ("icons/lock.svg", theme::text_soft()) } else { ("icons/triangle-alert.svg", theme::text_faint()) };
+            let account = open.key.account();
+            div()
+                .id("phone-encryption")
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .items_center()
+                .gap(px(4.))
+                .phone_stamp()
+                .font_weight(theme::REGULAR)
+                .text_color(tone)
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, window, cx| this.tiny_open_encryption(&account, window, cx)))
+                .child(div().flex_none().child(glyph(icon, 11., tone)))
+                .child(div().min_w_0().truncate().child(open.encryption.words()))
+        });
         // The call is one of the strip's glyphs (`call_pill` draws it so on a phone): 44 pt, no
         // box, beside Members and Details.
         let call = self.snapshot.as_ref().and_then(|snapshot| self.call_pill(snapshot, cx));
@@ -78,7 +100,10 @@ impl Shell {
                             .children(mixed.then(|| div().flex_none().child(network_icon(open.key.network, 14.))))
                             .child(div().min_w_0().truncate().phone_title().child(open.title.clone())),
                     )
-                    .children(subtitle),
+                    // One line under the title: where it is, then whether it is encrypted.
+                    .when(subtitle.is_some() || encryption.is_some(), |column| {
+                        column.child(div().min_w_0().flex().items_center().gap(px(6.)).children(subtitle).children(encryption))
+                    }),
             )
             .children(call)
             .children(members)

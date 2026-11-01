@@ -845,6 +845,7 @@ mod tests {
             limit: 0,
             read_only: false,
             private: false,
+            encryption: protocol::Encryption::Unknown,
             draft: String::new(),
             folders: Vec::new(),
             archived: false,

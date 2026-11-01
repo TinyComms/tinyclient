@@ -177,8 +177,11 @@ impl Shell {
         let bar = self.call_phone_bar(snapshot, cx);
         tokens::take_top(bar.is_some());
         let right = self.layout_state.right.is_some() && !self.pane_tucked();
+        // Server Settings, when a page of it is open (Encryption, from a conversation's strip).
+        let tiny_settings = self.tiny_settings_phone_page(window, cx);
         let screen: AnyElement = match self.keychain_state(window, cx) {
             Some(waiting) if snapshot.open.is_none() => self.phone_page(waiting).into_any_element(),
+            _ if tiny_settings.is_some() => tiny_settings.unwrap_or_else(|| div().into_any_element()),
             _ if right => self.phone_right_page(window, cx).into_any_element(),
             _ if snapshot.open.is_some() => self.phone_page(self.conversation(snapshot, window, cx)).into_any_element(),
             _ => self.phone_home(snapshot, width, window, cx).into_any_element(),
@@ -310,6 +313,10 @@ impl Shell {
             return true;
         }
         if self.close_slack_menu(cx) {
+            return true;
+        }
+        if self.tiny_settings_open() {
+            self.tiny_close_settings(cx);
             return true;
         }
         if self.layout_state.right.is_some() && !self.pane_tucked() {

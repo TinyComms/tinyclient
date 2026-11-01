@@ -1,0 +1,44 @@
+[package]
+name = "e2ee-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# An empty [workspace] keeps this crate out of the tinyclient workspace (it needs a nightly
+# toolchain and cargo-fuzz; `cargo test --workspace` must not build it), as tinyserver's fuzz crate is.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+e2ee = { path = ".." }
+
+[[bin]]
+name = "envelope"
+path = "fuzz_targets/envelope.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "blob_header"
+path = "fuzz_targets/blob_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sealed_blob"
+path = "fuzz_targets/sealed_blob.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mls_message"
+path = "fuzz_targets/mls_message.rs"
+test = false
+doc = false
+bench = false

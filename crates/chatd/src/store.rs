@@ -21,7 +21,7 @@ use std::path::Path;
 /// Raise this when a table changes. `open` then drops the cache and starts over.
 /// 6 rebuilds caches written at 5 before `conversation.voice_limit` existed. That column
 /// was added without a version change, so Win+K died with `no such column: c.voice_limit`.
-const SCHEMA: i32 = 6;
+const SCHEMA: i32 = 7;
 
 /// Retention: the newest messages kept per conversation.
 pub const KEEP_MESSAGES: u32 = 2_000;
@@ -144,6 +144,8 @@ const TABLES: &str = "
         -- The newest of my messages the other side has read, and has received.
         seen_to   TEXT NOT NULL DEFAULT '',
         delivered_to TEXT NOT NULL DEFAULT '',
+        -- End-to-end encrypted or not, where the network says: 'unknown', 'plain', 'end_to_end'.
+        encryption TEXT NOT NULL DEFAULT 'unknown',
         PRIMARY KEY (network, account, id)
     ) WITHOUT ROWID;
     CREATE INDEX conversation_threads ON conversation (network, account, parent) WHERE parent != '';
@@ -244,7 +246,7 @@ const CONVERSATION: &str = "
            (c.preview_mine AND c.delivered_to != '' AND (length(c.delivered_to), c.delivered_to) >= (length(c.preview_id), c.preview_id)),
            (c.preview_mine AND EXISTS (SELECT 1 FROM message f WHERE f.network = c.network AND f.account = c.account
                                          AND f.conversation = c.id AND f.id = c.preview_id AND f.pending = 1)),
-           c.voice_limit
+           c.voice_limit, c.encryption
     FROM conversation c
     LEFT JOIN media m ON m.network = c.network AND m.account = c.account AND m.id = c.avatar
     LEFT JOIN space s ON s.network = c.network AND s.account = c.account AND s.id = c.space
@@ -312,6 +314,8 @@ pub struct ConversationRow {
     /// We may read it but not post.
     pub read_only: bool,
     pub private: bool,
+    /// End-to-end encrypted or not, where the network says.
+    pub encryption: protocol::Encryption,
     /// The other side is a bot or app.
     pub bot: bool,
     /// A meeting's chat.
@@ -403,6 +407,7 @@ impl ConversationRow {
             root: None,
             read_only: false,
             private: false,
+            encryption: protocol::Encryption::Unknown,
             bot: false,
             meeting: false,
             special: Special::None,
@@ -623,6 +628,7 @@ fn conversation_from(row: &Row) -> rusqlite::Result<Conversation> {
         quiet: row.get(45)?,
         delivered: row.get(46)?,
         sending: row.get(47)?,
+        encryption: from_word(row.get(49)?)?,
     })
 }
 
@@ -739,9 +745,9 @@ fn upsert_conversation(tx: &Transaction, account: &AccountKey, row: &Conversatio
         "INSERT INTO conversation
              (network, account, id, kind, title, space, section, position, avatar, peer, call, listed,
               topic, parent, root, read_only, private, bot, meeting, special, mark, opted_out,
-              folders, archived, pin, hidden, followed, voice_limit)
+              folders, archived, pin, hidden, followed, voice_limit, encryption)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
-                 ?20, ?21, ?22, ?24, ?25, ?26, ?27, ?28, ?29)
+                 ?20, ?21, ?22, ?24, ?25, ?26, ?27, ?28, ?29, ?30)
          ON CONFLICT (network, account, id) DO UPDATE SET
              kind = excluded.kind, title = excluded.title, space = excluded.space,
              section = excluded.section, position = excluded.position, avatar = excluded.avatar,
@@ -750,6 +756,7 @@ fn upsert_conversation(tx: &Transaction, account: &AccountKey, row: &Conversatio
              read_only = excluded.read_only, private = excluded.private, bot = excluded.bot,
              meeting = excluded.meeting, special = excluded.special, mark = excluded.mark,
              opted_out = excluded.opted_out, voice_limit = excluded.voice_limit,
+             encryption = CASE WHEN excluded.encryption = 'unknown' THEN encryption ELSE excluded.encryption END,
              folders = CASE WHEN ?23 THEN excluded.folders ELSE folders END,
              archived = CASE WHEN ?23 THEN excluded.archived ELSE archived END,
              pin = CASE WHEN ?23 THEN excluded.pin ELSE pin END,
@@ -785,6 +792,7 @@ fn upsert_conversation(tx: &Transaction, account: &AccountKey, row: &Conversatio
             filing.hidden,
             filing.followed,
             row.limit,
+            word(&row.encryption),
         ],
     )?;
     Ok(())
@@ -806,6 +814,12 @@ const SETTINGS_VERSION: u32 = 1;
 
 impl Store {
     pub fn open(path: &Path) -> rusqlite::Result<Store> {
+        // Owner-only before SQLite creates it, so it never exists with wider rights (Unix), and
+        // narrowed if an older build made it wide. SQLite gives `-wal` and `-shm` the file's
+        // own mode when it makes them; the ones already there are narrowed below.
+        if path != Path::new(":memory:") {
+            let _ = protocol::private::touch(path);
+        }
         let db = Connection::open(path)?;
         // A 1 MB page cache, half SQLite's default: every list read is one page of rows, the
         // file is on a local disk the system already caches, and chatd's idle budget is tight.
@@ -814,6 +828,11 @@ impl Store {
         // flushed the disk at every write; on Windows four chatds seeding the demo at once took
         // over a minute that way, and 3 s this way.
         db.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA cache_size = -1024;")?;
+        for suffix in ["-wal", "-shm"].into_iter().filter(|_| path != Path::new(":memory:")) {
+            let mut side = path.as_os_str().to_owned();
+            side.push(suffix);
+            protocol::private::tighten_file(Path::new(&side));
+        }
         let version: i32 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if version != SCHEMA {
             let old: Vec<String> = db
@@ -3235,6 +3254,55 @@ mod tests {
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
+    #[test]
+    fn a_stored_notification_preview_survives_a_restart_unchanged() {
+        let path = scratch("preview");
+        {
+            let mut store = Store::open(&path).unwrap();
+            store.set_setting("", "preview", Some("full")).unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let rows: Vec<_> = store.settings().unwrap().into_iter().filter(|s| s.key == "preview").map(|s| s.value).collect();
+        assert_eq!(rows, ["full"], "opening the store does not rewrite a choice");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn the_database_and_its_side_files_are_for_their_owner_alone() {
+        let path = scratch("modes");
+        let _ = Store::open(&path).unwrap();
+        assert!(path.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            let side = |suffix: &str| {
+                let mut side = path.as_os_str().to_owned();
+                side.push(suffix);
+                std::path::PathBuf::from(side)
+            };
+            assert_eq!(mode(&path), 0o600);
+            // A database an older build made wide is narrowed on the next start, with its logs.
+            for file in [path.clone(), side("-wal"), side("-shm")] {
+                if file.exists() {
+                    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+                }
+            }
+            let store = Store::open(&path).unwrap();
+            for file in [path.clone(), side("-wal"), side("-shm")] {
+                if file.exists() {
+                    assert_eq!(mode(&file), 0o600, "{}", file.display());
+                }
+            }
+            // The log and the index SQLite makes while it runs follow the file.
+            store.db.execute_batch("CREATE TABLE IF NOT EXISTS probe (x); INSERT INTO probe VALUES (1);").unwrap();
+            for suffix in ["-wal", "-shm"] {
+                assert!(side(suffix).exists(), "{suffix} exists while the store is open");
+                assert_eq!(mode(&side(suffix)), 0o600, "{suffix}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
     #[test]
     fn a_cache_from_before_the_voice_limit_column_is_rebuilt() {
         let path = scratch("voice-limit");

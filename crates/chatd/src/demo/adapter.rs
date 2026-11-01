@@ -680,7 +680,7 @@ impl Demo {
             Command::StartDirect { person_id, reply } => drop(reply.send(demo.start_direct(&person_id))),
             Command::StartThread { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SearchPeople(query) => demo.ctx.searched(&query),
-            Command::Download { url, reply, .. } => drop(reply.send(Ok(Download { url, headers: Vec::new() }))),
+            Command::Download { url, reply, .. } => drop(reply.send(Ok(Download { url, headers: Vec::new(), sealed: None }))),
             Command::Handoff { conversation_id, reply } => {
                 let account = &demo.ctx.account.account;
                 let link = match demo.ctx.account.network {

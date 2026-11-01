@@ -1992,6 +1992,7 @@ impl Chat {
                 }
                 Err(err) => error(ErrorCode::Refused, format!("That key couldn't be remembered: {err}")),
             },
+            Request::TinyE2ee { account, ask } => adapters::tiny::e2ee_ask(account, ask),
             Request::TinyInvite { account, role } => adapters::tiny::invite(account, role),
             Request::TinyRole { account, user_id, role } => adapters::tiny::set_role(account, user_id, role),
             Request::TinyRemove { account, user_id } => adapters::tiny::remove(account, user_id),
@@ -2072,6 +2073,13 @@ impl Chat {
                 self.hub.calls.gain(&self.hub, &account, user_id, percent, muted);
                 Response::Ok
             }
+            // Only ever from the person's own click: nothing else turns a blocked call to clear.
+            Request::CallCarryOnUnencrypted => match self.hub.calls.request(&self.hub, &MediaRequest::TinyTransport) {
+                Ok(protocol::MediaResponse::Done) => Response::Ok,
+                Ok(protocol::MediaResponse::Refused { detail }) => error(ErrorCode::Refused, detail),
+                Ok(_) => error(ErrorCode::Unsupported, "This call can't carry on without encryption."),
+                Err(err) => call_error(err),
+            },
             Request::CallStats => match self.hub.calls.request(&self.hub, &MediaRequest::Stats) {
                 Ok(protocol::MediaResponse::Stats(stats)) => Response::CallStats { stats },
                 Ok(protocol::MediaResponse::Refused { detail }) => error(ErrorCode::Unsupported, detail),

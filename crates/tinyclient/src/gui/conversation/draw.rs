@@ -64,7 +64,13 @@ fn named(path: &str, name: &str) -> std::path::PathBuf {
     let made = std::fs::create_dir_all(&dir)
         .and_then(|()| std::fs::hard_link(path, &target).or_else(|_| std::fs::copy(path, &target).map(drop)));
     match made {
-        Ok(()) => target,
+        Ok(()) => {
+            // Opened by the system's app: marked as from the internet first, so it is checked.
+            if let Err(err) = protocol::quarantine::mark(&target) {
+                tracing::warn!("tinyclient: a file was not marked as downloaded: {err}");
+            }
+            target
+        }
         Err(err) => {
             tracing::warn!("tinyclient: could not name {name} for opening: {err}");
             std::path::PathBuf::from(path)
@@ -775,6 +781,21 @@ impl Pane {
     fn content(&mut self, message: &Rc<Message>, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let edited = || div().h(px(16.)).type_micro().text_color(theme::text_faint()).child("(edited)").into_any_element();
         let phone = self.metrics == Metrics::PHONE;
+        // An encrypted message this device can't open says so, quietly, and never as its text.
+        if message.seal == protocol::Seal::Undecryptable {
+            return vec![div()
+                .max_w(px(MEASURE))
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .type_body()
+                .when(phone, |div| div.text_size(px(tokens_phone::scaled(17.))).line_height(px(tokens_phone::scaled(24.))))
+                .italic()
+                .text_color(theme::text_faint())
+                .child(crate::gui::components::glyph("icons/lock.svg", 12., theme::text_faint()))
+                .child(protocol::UNDECRYPTABLE)
+                .into_any_element()];
+        }
         if message.text.trim().is_empty() {
             return message.edited.then(edited).into_iter().collect();
         }

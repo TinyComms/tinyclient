@@ -117,7 +117,7 @@ impl Shell {
             }))
         });
         let security = call.security.as_ref().map(|security| {
-            let words = super::super::security::badge_words(super::super::security::badge(security));
+            let words = super::super::security::badge_words(super::super::security::badge(security, call.participants.is_empty()));
             row("call-phone-more-security", "icons/lock.svg", "Call security", Some(words.to_owned()), Some(chevron())).on_click(cx.listener(|this, _, _, cx| this.call_phone_open_sheet(Sheet::Security, cx)))
         });
         div()

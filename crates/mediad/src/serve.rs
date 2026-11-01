@@ -4,7 +4,7 @@
 use crate::session::{self, Controls};
 use crate::{audio, out, permission, picture, tiny};
 use protocol::{
-    media_process_needed, read_frame, Content, Direction, MediaRequest, MediaResponse, VideoStream,
+    media_process_needed, read_frame, Content, Direction, MediaRequest, MediaResponse, SecurityMode, VideoStream,
     DEVICES_LIMIT,
 };
 use std::io::{self, ErrorKind};
@@ -22,6 +22,8 @@ const DEVICES_EVERY: Duration = Duration::from_secs(2);
 const NO_VIDEO: &str = "Screen sharing and video are not built yet. This call carries voice only.";
 const ENGINE: &str = "The call engine could not start. Try again.";
 const NOT_YET: &str = "The call isn't connected yet, so there's nothing to measure.";
+/// Once, when the server turns a call's end-to-end encryption off and the call is blocked.
+const BLOCKED_NOTICE: &str = "The server turned this call's encryption off. Nothing is sent or played. Open the call's security panel to leave or decide.";
 
 /// The video sessions of one call. Each field is one session, so a second share replaces the
 /// first instead of adding a tile.
@@ -238,9 +240,25 @@ impl Call {
                 return MediaResponse::Done;
             }
             MediaRequest::TinyE2ee { frame } => {
-                self.controls.e2ee(|e2ee| e2ee.frame(&frame));
+                let blocked = self.controls.e2ee(|e2ee| {
+                    let before = e2ee.security().mode;
+                    e2ee.frame(&frame);
+                    before != SecurityMode::Blocked && e2ee.security().mode == SecurityMode::Blocked
+                });
                 self.controls.e2ee_report();
+                if blocked {
+                    // Said once, so a call gone quiet is not taken for a network problem.
+                    out::send(&MediaResponse::Notice { detail: BLOCKED_NOTICE.to_owned() });
+                }
                 return MediaResponse::Done;
+            }
+            MediaRequest::TinyTransport => {
+                let chosen = self.controls.e2ee(|e2ee| e2ee.carry_on_unencrypted());
+                self.controls.e2ee_report();
+                return match chosen {
+                    Ok(()) => MediaResponse::Done,
+                    Err(why) => MediaResponse::Refused { detail: why.to_owned() },
+                };
             }
             MediaRequest::TinyRoster { user_ids } => {
                 self.controls.e2ee(|e2ee| e2ee.roster(user_ids));

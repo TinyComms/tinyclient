@@ -71,13 +71,11 @@ fn set_in(base: &Path, account: &AccountKey, user_id: &str, key: &str, verified:
     }
     let path = verified_path(base, account);
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        protocol::private::dir(parent)?;
     }
     let text = serde_json::to_vec_pretty(&known).map_err(io::Error::other)?;
-    // Written beside and moved over, so a crash never leaves half a file.
-    let partial = path.with_extension("json.partial");
-    std::fs::write(&partial, text)?;
-    std::fs::rename(partial, path)
+    // Written beside, flushed and moved over, owner-only: a crash never leaves half a file.
+    protocol::private::write_atomic(&path, &text)
 }
 
 /// mediad's report with each member's trust filled in from what the user verified.
@@ -126,6 +124,28 @@ mod tests {
         assert_eq!(trusted(security).members[0].trust, Trust::Unverified);
         assert!(set("ada", "not hex", true).is_err());
         assert!(set("", "aa", true).is_err());
+        let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    #[test]
+    fn the_verified_list_is_written_whole_and_for_its_owner_alone() {
+        let scratch = std::env::temp_dir().join(format!("chatd-verified-modes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        let account = AccountKey { network: Network::Tiny, account: "me".into() };
+        set_in(&scratch, &account, "ada", "aa01", true).unwrap();
+        set_in(&scratch, &account, "bea", "bb02", true).unwrap();
+        let folder = dir(&scratch, &account);
+        let mut names: Vec<_> = std::fs::read_dir(&folder).unwrap().map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        assert_eq!(names, ["verified.json"], "no partial file is left");
+        assert_eq!(read(&scratch, &account).len(), 2);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&verified_path(&scratch, &account)), 0o600);
+            assert_eq!(mode(&folder), 0o700);
+        }
         let _ = std::fs::remove_dir_all(scratch);
     }
 }

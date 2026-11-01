@@ -34,6 +34,10 @@ impl ChatListener {
         let owned = socket_path(path);
         let name = owned.to_fs_name::<GenericFilePath>()?;
         let listener = ListenerOptions::new().name(name).create_sync()?;
+        // Explicit, not whatever the umask leaves: only this user can connect. The folder above
+        // is owner-only as well, so the socket is never reachable in the time between the two.
+        #[cfg(not(windows))]
+        crate::private::tighten_file(path);
         Ok(Self(listener))
     }
 
@@ -156,5 +160,37 @@ fn socket_path(path: &Path) -> PathBuf {
     #[cfg(not(windows))]
     {
         path.to_path_buf()
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn the_chat_socket_is_for_its_owner_alone_and_still_answers() {
+        let dir = std::env::temp_dir().join(format!("protocol-ipc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        crate::private::dir(&dir).unwrap();
+        let path = dir.join(crate::CHAT_SOCK_NAME);
+        let listener = ChatListener::bind(&path).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        let client = std::thread::spawn({
+            let path = path.clone();
+            move || ChatStream::connect(&path).map(drop)
+        });
+        assert!(listener.accept().is_ok());
+        assert!(client.join().unwrap().is_ok());
+        // A stale socket from a chatd that died is replaced, and the new one is owner-only too. A
+        // chatd that dies runs no destructor, so the listener is forgotten, not dropped: dropping
+        // it lets interprocess unlink the socket file (it reclaims the name), and there would be
+        // no stale file left to replace.
+        std::mem::forget(listener);
+        assert!(path.exists(), "the stale socket is still there");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let _again = ChatListener::bind(&path).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -403,10 +403,13 @@ fn build() -> Fixture {
     let mut lobby = in_space(row(&t, "c-lobby", ConversationKind::Channel, "lobby", ago(300)), premier, "Premier", "rooms", "Rooms", 0);
     lobby.unread = 5;
     lobby.call = protocol::CallSupport::Native;
+    lobby.encryption = protocol::Encryption::Plain;
     said(&mut lobby, "halvard", "who's up for a call later?");
 
     let mut ana = direct(&t, "dm-ana", "ana", ago(400));
     ana.unread = 1;
+    // A Tiny server encrypts its direct messages end to end; its rooms stay readable by the server.
+    ana.encryption = protocol::Encryption::EndToEnd;
     said(&mut ana, "ana", "Did the invite come through?");
 
     let mut lichen = in_space(row(&d, "th-lichen", ConversationKind::Thread, "Lichen ID help", on_day(1, 21, 15)), moss, "Moss & Lichen", "text", "Text channels", 2);
@@ -504,7 +507,11 @@ fn build() -> Fixture {
                 ("ana", "We should do a game night", 120),
                 ("halvard", "who's up for a call later?", 0),
             ],
-            "dm-ana" => vec![(ME, "Sent you an invite to the Premier server", 600), ("ana", "Did the invite come through?", 0)],
+            "dm-ana" => vec![
+                ("ana", "(sent before this device joined)", 900),
+                (ME, "Sent you an invite to the Premier server", 600),
+                ("ana", "Did the invite come through?", 0),
+            ],
             "th-lichen" => vec![
                 ("dita", "Found this on the fence posts by the second footbridge.", 30),
                 ("kofi", "Ooh, those little cups are lovely", 20),
@@ -532,6 +539,16 @@ fn build() -> Fixture {
             _ => Vec::new(),
         };
         let mut said = history(row, &lines);
+        if row.encryption == protocol::Encryption::EndToEnd {
+            // Opened on this device, but the first was sent before it joined: it says so, and never
+            // what it was.
+            for (ix, message) in said.iter_mut().enumerate() {
+                message.seal = if ix == 0 { protocol::Seal::Undecryptable } else { protocol::Seal::Encrypted };
+                if ix == 0 {
+                    message.text = protocol::UNDECRYPTABLE.into();
+                }
+            }
+        }
         if row.key.id == "c-showcase" {
             if let Some(last) = said.last_mut() {
                 last.attachments = vec![Attachment::new("moss-frost.webp", picture("moss-frost", MediaKind::Image, "moss-frost.webp", 640, 480))];
@@ -794,7 +811,8 @@ fn premier() -> protocol::TinyCommunity {
         ],
         online: vec![ME.into(), "halvard".into()],
         media: "up".into(),
-        capabilities: Default::default(),
+        // It speaks end-to-end encrypted text, so Encryption is one of its settings' pages.
+        capabilities: protocol::TinyCapabilities { version: String::new(), features: vec![protocol::TINY_FEATURE_E2EE_TEXT.into()] },
         access: None,
         me: ME.into(),
         server: None,
@@ -993,6 +1011,11 @@ pub fn answer(request: &Request) -> std::io::Result<Response> {
         Request::Prunable { .. } => Response::Prunable { messages: 0, bytes: 0 },
         Request::SignIn { .. } => Response::Error { code: protocol::ErrorCode::SignIn, detail: "The sign-in window was closed.".into() },
         Request::TinyCommunity { .. } => Response::TinyCommunity { community: premier() },
+        Request::TinyE2ee { ask: protocol::E2eeAsk::Status, .. } => Response::TinyE2ee { status: e2ee_status() },
+        Request::TinyE2ee { ask: protocol::E2eeAsk::Person { user_id }, .. } => match e2ee_status().people.into_iter().find(|person| person.user_id == *user_id) {
+            Some(person) => Response::TinyE2eePerson { person },
+            None => Response::Error { code: protocol::ErrorCode::NotFound, detail: "Nobody by that id.".into() },
+        },
         Request::SignInBegin { .. }
         | Request::Handoff { .. }
         | Request::CallStart { .. }
@@ -1003,6 +1026,47 @@ pub fn answer(request: &Request) -> std::io::Result<Response> {
     Ok(answer)
 }
 
+/// Encryption on Premier, as this device sees it: set up, a second device of mine, and the two
+/// people met in encrypted conversations, one verified and one whose number changed.
+fn e2ee_status() -> protocol::E2eeStatus {
+    use protocol::{DeviceState, E2eeDevice, E2eePerson, E2eeStatus, Trust};
+    let digits = |seed: u32| -> String { (0..60u32).map(|n| char::from(b'0' + ((n * 7 + seed * 3 + n / 5) % 10) as u8)).collect() };
+    let device = |id: &str, label: &str, fingerprint: &str, this: bool| E2eeDevice {
+        device_id: id.into(),
+        label: label.into(),
+        created_at: "2026-10-02T09:14:00Z".into(),
+        fingerprint: fingerprint.into(),
+        this,
+        untrusted: false,
+    };
+    E2eeStatus {
+        mode: "optional".into(),
+        device: DeviceState::Ready,
+        device_id: "dev-phone".into(),
+        fingerprint: "3f9a 41c2 07be d815".into(),
+        devices: vec![device("dev-phone", "Robin's phone", "3f9a 41c2 07be d815", true), device("dev-laptop", "Work laptop", "a17e 9c04 52fd 3b60", false)],
+        people: vec![
+            E2eePerson {
+                user_id: "ana".into(),
+                name: "Ana Ruiz".into(),
+                safety: digits(1),
+                devices: vec![device("dev-ana", "", "c4d2 8e11 f093 6a7b", false)],
+                trust: Trust::Verified,
+                identity_changed: false,
+            },
+            E2eePerson {
+                user_id: "halvard".into(),
+                name: "Halvard Eide".into(),
+                safety: digits(4),
+                devices: vec![device("dev-halvard", "", "7b30 e5a9 1d6c 0f42", false)],
+                trust: Trust::Changed,
+                identity_changed: false,
+            },
+        ],
+        recovery_set: true,
+        backup: false,
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

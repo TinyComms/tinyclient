@@ -17,7 +17,7 @@ use crate::gui::hotkeys::{self, Action, Reach};
 use protocol::settings::{
     self as keys, account_scope, DeviceChoice, Values, AUTO_GAIN, CACHE_MB, CACHE_MB_CHOICES, CUE_CONNECTION, CUE_JOINS, CUE_MINE, CUE_VOLUME,
     ECHO_CANCELLATION, GLOBAL, INPUT, JOIN_MUTED, KEEP_DAYS, KEEP_DAYS_CHOICES, KEEP_RUNNING, NOISE_SUPPRESSION, OUTPUT, PTT_RELEASE_CHOICES,
-    PTT_RELEASE_MS, PUSH_TO_TALK, RECEIPTS, SENSITIVITY, SOUNDS, TYPING, VOICE_VOLUME,
+    PTT_RELEASE_MS, PUSH_TO_TALK, RECEIPTS, REQUIRE_CALL_E2EE, SENSITIVITY, SOUNDS, TYPING, VOICE_VOLUME,
 };
 use protocol::{AccountStatus, Link, Network, Request, Response};
 use std::rc::Rc;
@@ -234,6 +234,11 @@ impl SettingsWindow {
                 groups.push(
                     self.group(&["P4"], None, window, cx)
                         .child(caption("Older messages are deleted here, never on the networks. Each conversation also keeps at most its newest 2,000.")),
+                );
+                groups.push(
+                    self.group(&["PE"], Some("Calls"), window, cx).child(caption(
+                        "When a server turns a call's encryption off, the call stops until you choose to carry on unencrypted. With this on you can't: you leave instead, and a Tiny server that cannot encrypt calls is not joined. Always the case on Incognito servers and in rooms that require it. Takes effect the next time you join.",
+                    )),
                 );
                 groups
             }
@@ -476,6 +481,10 @@ impl SettingsWindow {
             "P3" => {
                 let second = (!choices.images).then(|| "Nothing is fetched until you click it.".to_owned());
                 self.switch_row(id, choices.images, true, second, |this, on, cx| this.choose(|c| c.images = on, cx), cx)
+            }
+            "PE" => {
+                let on = values.on(REQUIRE_CALL_E2EE);
+                self.switch_row(id, on, false, None, move |this, on, cx| this.set_switch(id, REQUIRE_CALL_E2EE, on, false, cx), cx)
             }
             "P4" => {
                 let days = values.number(KEEP_DAYS);

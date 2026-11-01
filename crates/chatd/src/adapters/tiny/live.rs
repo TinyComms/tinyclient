@@ -885,13 +885,34 @@ fn ask_join(wire: &mut Wire, pending: &mut Vec<Pending>, refs: u64, room_id: Str
     wire.send(frame.to_string())
 }
 
+/// Said when a call that must be end to end is on a server that does not offer it.
+const INCOGNITO_CANNOT_ENCRYPT: &str =
+    "This is an Incognito server, whose calls are always end-to-end encrypted, but it didn't offer encryption. tinyclient won't join it unencrypted.";
+const ROOM_CANNOT_ENCRYPT: &str = "This room only takes end-to-end encrypted calls, but the server didn't offer encryption. tinyclient won't join it unencrypted.";
+
+/// Whether a call on `host` in a room that requires it (`room_required`) may never carry on
+/// unencrypted, and, when the server does not offer encryption at all (`!offered`), why it is
+/// not joined. An Incognito host promises end-to-end encrypted calls, so its own `off`, or its
+/// lack of `e2ee_calls`, is never taken at its word.
+fn must_encrypt(host: &str, room_required: bool, offered: bool) -> Result<bool, &'static str> {
+    let required = protocol::incognito_host(host) || room_required;
+    match (required, offered) {
+        (true, false) if protocol::incognito_host(host) => Err(INCOGNITO_CANNOT_ENCRYPT),
+        (true, false) => Err(ROOM_CANNOT_ENCRYPT),
+        _ => Ok(required),
+    }
+}
+
 /// mediad's offer for a room, with mediad started for it, then what the room asks of the call.
 /// On a server that encrypts calls end to end, the offer says so, with the room that names the
 /// group and where this account keeps its identity key; mediad then hears who is in the call.
+/// On an Incognito host, or in a room that requires it, the offer is `required`: the server
+/// turning encryption off blocks the call for good, and a server that offers none is not joined.
 fn offer(ctx: &Context, saved: &Saved, seat: &mut Seat, room: &str) -> Result<Offered, String> {
     let host = tungstenite::http::Uri::try_from(saved.base_url.as_str()).ok().and_then(|uri| uri.host().map(|host| host.trim_matches(['[', ']']).to_owned()));
+    let required = must_encrypt(host.as_deref().unwrap_or(""), super::manage::room_e2ee_required(saved, room), seat.e2ee)?;
     let identity = || crate::verified::identity_path(&ctx.account).to_string_lossy().into_owned();
-    let e2ee = seat.e2ee.then(|| TinyE2ee { room_id: room.to_owned(), identity: identity() });
+    let e2ee = seat.e2ee.then(|| TinyE2ee { room_id: room.to_owned(), identity: identity(), required });
     let offered = e2ee.is_some();
     let offer = TinyOffer { user_id: seat.me.clone(), host: host.unwrap_or_default(), slots: ROOM_CAP - 1, muted: false, deafened: false, e2ee };
     let sdp = ctx.tiny_offer(room, offer)?;

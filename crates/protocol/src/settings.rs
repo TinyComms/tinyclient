@@ -51,6 +51,13 @@ pub const SYSTEM_DEFAULT: &str = "@system";
 pub const JOIN_MUTED: &str = "join_muted";
 /// V19: "You're muted" shows when the microphone hears speech while I am muted in a call.
 pub const MUTED_TALK: &str = "muted_talk";
+/// Only join Tiny calls that are end-to-end encrypted. A call whose server turns encryption off
+/// always stops sending and playing (mediad `Blocked`); off, the person may choose to carry on
+/// unencrypted, on, they may not, and a server that cannot encrypt is not joined. Off by default:
+/// an older server or an older app in the room cannot do it. An Incognito host
+/// ([`crate::incognito_host`]) or an `e2ee_required` room acts as on whatever this says. See
+/// `SECURITY.md`.
+pub const REQUIRE_CALL_E2EE: &str = "require_call_e2ee";
 /// V5. Everyone's voice, 0 to 100.
 pub const VOICE_VOLUME: &str = "voice_volume";
 /// V6. The level, 0 to 100, from which our microphone counts as speech, and in voice
@@ -99,7 +106,9 @@ pub const NOTIFY_DIRECT: &str = "notify_direct";
 pub const NOTIFY_GROUPS: &str = "notify_groups";
 pub const NOTIFY_MENTIONS: &str = "notify_mentions";
 pub const NOTIFY_TINY: &str = "notify_tiny";
-/// N4. What a notification shows: `full`, `sender` or `nothing`.
+/// N4. What a notification shows: `full`, `sender` or `nothing`. The default is `sender`: the
+/// sender and "New message", no text. A row is stored only when it differs from the default, so
+/// a person who chose `full` under the old default (`full`) has no row and reads `sender` now.
 pub const PREVIEW: &str = "preview";
 /// N4 while the screen is locked. Windows and Linux; macOS has its own "when unlocked".
 pub const PREVIEW_LOCKED: &str = "preview_locked";
@@ -171,7 +180,7 @@ fn kind(key: &str) -> Option<Kind> {
         QUIET_TO => Kind::Minute(8 * 60),
         PAUSED_UNTIL => Kind::Until,
         ALERT_VOLUME => Kind::Percent(70),
-        PREVIEW => Kind::Word(&PREVIEW_CHOICES, "full"),
+        PREVIEW => Kind::Word(&PREVIEW_CHOICES, "sender"),
         PREVIEW_LOCKED => Kind::Word(&PREVIEW_CHOICES, "sender"),
         CALLS => Kind::Word(&CALLS_CHOICES, "ring"),
         IN_CALL => Kind::Word(&IN_CALL_CHOICES, "banners"),
@@ -183,7 +192,7 @@ fn kind(key: &str) -> Option<Kind> {
         NOTIFY_ABOUT => Kind::Word(&ABOUT_CHOICES, "mentions"),
         SOUND => Kind::Word(&SOUND_CHOICES, "pebble"),
         ECHO_CANCELLATION | NOISE_SUPPRESSION | AUTO_GAIN => Kind::Switch(true),
-        JOIN_MUTED | PUSH_TO_TALK => Kind::Switch(false),
+        JOIN_MUTED | PUSH_TO_TALK | REQUIRE_CALL_E2EE => Kind::Switch(false),
         MUTED_TALK => Kind::Switch(true),
         PTT_RELEASE_MS => Kind::Choice(&PTT_RELEASE_CHOICES, 200),
         CUE_VOLUME => Kind::Percent(50),
@@ -597,6 +606,22 @@ mod tests {
     }
 
     #[test]
+    fn requiring_end_to_end_encrypted_calls_is_a_switch_that_is_off_until_chosen() {
+        // Off by default on purpose: a server or an app that cannot encrypt would stop working.
+        assert!(!Values::default().on(REQUIRE_CALL_E2EE));
+        assert!(valid(GLOBAL, REQUIRE_CALL_E2EE, "on") && valid(GLOBAL, REQUIRE_CALL_E2EE, "off"));
+        assert!(!valid(GLOBAL, REQUIRE_CALL_E2EE, "yes") && !valid(GLOBAL, REQUIRE_CALL_E2EE, "1") && !valid(GLOBAL, REQUIRE_CALL_E2EE, ""));
+        assert!(!valid(&account_scope(&account(Network::Tiny)), REQUIRE_CALL_E2EE, "on"), "it is global");
+        assert!(known(GLOBAL, REQUIRE_CALL_E2EE));
+        let mut values = Values::default();
+        values.set(GLOBAL, REQUIRE_CALL_E2EE, Some("on".into()));
+        assert!(values.on(REQUIRE_CALL_E2EE));
+        // A stored value no build can read falls back to the default, which is off.
+        values.set(GLOBAL, REQUIRE_CALL_E2EE, Some("maybe".into()));
+        assert!(!values.on(REQUIRE_CALL_E2EE));
+    }
+
+    #[test]
     fn typing_defaults_follow_the_network_and_the_switch_overrides_it() {
         let mut values = Values::default();
         let (discord, slack, telegram) = (account(Network::Discord), account(Network::Slack), account(Network::Telegram));
@@ -649,7 +674,7 @@ mod tests {
     fn notification_settings_default_and_take_their_words_by_scope() {
         let values = Values::default();
         assert!(values.on(NOTIFY) && values.on(NOTIFY_DIRECT) && values.on(CALLS_THROUGH) && !values.on(QUIET_HOURS));
-        assert_eq!((values.word(GLOBAL, NOTIFY_ABOUT), values.word(GLOBAL, PREVIEW), values.word(GLOBAL, PREVIEW_LOCKED)), ("mentions", "full", "sender"));
+        assert_eq!((values.word(GLOBAL, NOTIFY_ABOUT), values.word(GLOBAL, PREVIEW), values.word(GLOBAL, PREVIEW_LOCKED)), ("mentions", "sender", "sender"));
         assert_eq!((values.word(GLOBAL, MESSAGE_SOUND), values.word(GLOBAL, MENTION_SOUND), values.word(GLOBAL, RING_SOUND)), ("pebble", "same", "soft_ring"));
         assert_eq!((values.minute(QUIET_FROM), values.minute(QUIET_TO), values.number(ALERT_VOLUME)), (1320, 480, 70));
         let discord = account_scope(&account(Network::Discord));
@@ -664,6 +689,20 @@ mod tests {
         assert!(!valid(&discord, PREVIEW, "full"), "preview is global");
         assert!(known(&channel, SOUND) && !known(GLOBAL, SOUND));
         assert_eq!(values.stored(&channel, NOTIFY_ABOUT), None);
+    }
+
+    #[test]
+    fn a_stored_preview_is_never_rewritten_by_a_new_default() {
+        // The default moved from `full` to `sender`: what a person stored stays what it was.
+        let stored = |word: &str| Values::new([Setting { scope: GLOBAL.into(), key: PREVIEW.into(), value: word.into() }]);
+        assert_eq!(stored("full").word(GLOBAL, PREVIEW), "full");
+        assert_eq!(stored("nothing").word(GLOBAL, PREVIEW), "nothing");
+        assert_eq!(stored("sender").word(GLOBAL, PREVIEW), "sender");
+        // Nothing stored is the default, and a word no build knows is nothing stored.
+        assert_eq!(Values::default().word(GLOBAL, PREVIEW), "sender");
+        assert_eq!(stored("everything").word(GLOBAL, PREVIEW), "sender");
+        // The lock screen has its own word and its own default, which did not move.
+        assert_eq!(stored("full").word(GLOBAL, PREVIEW_LOCKED), "sender");
     }
 
     #[test]

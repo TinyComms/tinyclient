@@ -90,6 +90,11 @@ pub(crate) fn room_audio(saved: &Saved, room_id: &str) -> (u32, bool) {
     (room.bitrate(), room.ptt_only || no_voice_activity)
 }
 
+/// The room only takes end-to-end encrypted calls (`e2ee_required`), as the server last said.
+pub(crate) fn room_e2ee_required(saved: &Saved, room_id: &str) -> bool {
+    known(saved).rooms.iter().any(|room| room.id == room_id && room.e2ee_required)
+}
+
 /// `GET /v1/capabilities`. Anything but a readable 200 is an older server: no features.
 pub(crate) fn capabilities_of(saved: &Saved) -> TinyCapabilities {
     match asked("GET", saved, "/v1/capabilities", None) {

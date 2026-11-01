@@ -468,7 +468,7 @@ impl Shell {
         let counted = if hero { call.state == CallState::Joined } else { call.state != CallState::Connecting };
         let clock = counted.then(|| self.call_phone_clock(call, cx)).flatten();
         let security = call.security.as_ref().map(|security| {
-            let shown = super::security::badge(security);
+            let shown = super::security::badge(security, call.participants.is_empty());
             let (icon, tint) = super::security::badge_look(shown);
             div()
                 .id("call-phone-security")

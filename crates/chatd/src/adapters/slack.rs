@@ -624,7 +624,7 @@ impl Slack {
     /// is the one the user signed in with.
     fn download(&self, url: String) -> Download {
         let headers = download_headers(&self.session.user_agent, &self.session.token, &self.cookie(), self.private(&url));
-        Download { url, headers }
+        Download { url, headers, sealed: None }
     }
 
     /// Waits for the method's turn: [`GAP`] after the last call of any kind, and never more

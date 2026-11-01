@@ -908,7 +908,7 @@ impl Teams {
             headers.push(("Cookie".to_owned(), cookie));
             headers.push(("Referer".to_owned(), "https://teams.microsoft.com/".to_owned()));
         }
-        Ok(Download { url, headers })
+        Ok(Download { url, headers, sealed: None })
     }
 
     /// Tells the conversation the user is typing, at most once per [`TYPING_EVERY`].

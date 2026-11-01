@@ -76,6 +76,18 @@ fn invite_notice(input: &str, server: &str) -> String {
     }
 }
 
+/// A warning for an address that is plain `http` and not on this computer: what is sent to it,
+/// the sign-in included, can be read on the way. Nothing for https, and nothing for this computer.
+/// Whether the address is on the person's own network changes the words, and chatd refuses the
+/// ones that are not until they have agreed (`SignInProblem::Other`, from chatd).
+fn plain_http_note(address: &str) -> Option<&'static str> {
+    protocol::plain_http_words(protocol::reach(address))
+}
+
+fn note_line(words: &'static str) -> Div {
+    div().type_small().text_color(theme::warning()).mt(px(8.)).child(words)
+}
+
 /// What the sheet shows.
 #[derive(Clone, PartialEq, Eq)]
 enum Face {
@@ -1172,6 +1184,7 @@ impl Sheet {
                     .child("A server you already have an account on. Type the host. Add a port when it is not the usual one."),
             )
             .child(input)
+            .children(plain_http_note(self.url.read(cx).text()).map(note_line))
             .children(problem.map(|problem| error_line(problem_words(self.network, problem)).mt(px(6.))))
             .child(
                 footer(22.)
@@ -1210,6 +1223,7 @@ impl Sheet {
             .children(existing.then(|| div().mt(px(8.)).type_small().text_color(theme::text_soft())
                 .child("You already have this server. Open it, or choose Sign in again to replace the saved account.")))
             .children(self.local_servers.is_none().then(|| div().mt(px(8.)).type_small().child("Checking saved servers…")))
+            .children(plain_http_note(&protocol::parse_invite_link(self.invite.read(cx).text()).map_or_else(|| server.to_owned(), |(origin, _)| origin)).map(note_line))
             .children(problem.map(|problem| error_line(problem_words(self.network, problem)).mt(px(6.))))
             .children(fresh.then(run_your_own))
             .child(
@@ -1266,6 +1280,7 @@ impl Sheet {
             .flex_col()
             .child(self.header(title, true, cx))
             .child(div().mt(px(6.)).whitespace_normal().text_color(theme::text_soft()).child(line))
+            .children(plain_http_note(server).map(note_line))
             .children(problem.map(|problem| error_line(problem_words(self.network, problem)).mt(px(12.))))
             .child(footer)
     }
@@ -1708,6 +1723,20 @@ mod tests {
         assert_eq!(stopped_words("https://chat.example", "Tinyauth"), "chat.example signs you in with Tinyauth, in your browser.");
     }
 }
+
+    #[test]
+    fn plain_http_off_this_computer_gets_a_warning_in_words_and_nothing_else_does() {
+        for quiet in ["", "chat.example", "https://chat.example", "localhost:8080", "http://127.0.0.1:8080", "http://[::1]:8080", "http://localhost"] {
+            assert_eq!(plain_http_note(quiet), None, "{quiet:?}");
+        }
+        let own = plain_http_note("http://192.168.1.120:8080").unwrap();
+        assert!(own.contains("http, not https") && own.contains("your network"));
+        let open = plain_http_note("http://chat.example").unwrap();
+        assert!(open.contains("http, not https") && open.contains("not on your own network"));
+        assert_ne!(own, open);
+        // What is typed is read as chatd will read it, so the warning is there before Continue.
+        assert!(plain_http_note("HTTP://Chat.Example:8080/rooms").is_some());
+    }
     #[test]
     fn invite_notice_names_actual_destination_and_warns_about_replacement() {
         let link = protocol::invite_url("http://other.example:8080", "token").unwrap();

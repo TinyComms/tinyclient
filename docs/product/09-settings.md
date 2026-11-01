@@ -15,7 +15,7 @@ The tables under "Information architecture" are the control design. A row marked
 | Sounds | S1–S4, SV | Five message sounds, two rings, or None. No "System alert sound". SV is notification volume and is hidden on macOS. |
 | Appearance | A2, A3, A4 | Text size, density, list previews. No theme control. The app is dark. |
 | Messages | M1–M5 | Send key, where a conversation opens, typing line, emoticons, GIF and sticker autoplay. |
-| Privacy | P1–P4 | Typing and read receipts per account, image loading, keep-for 7 / 30 / 90 days. Telegram typing and receipts are fixed on. Signal says the phone. Messages says the phone. |
+| Privacy | P1–P4, PE | Typing and read receipts per account, image loading, keep-for 7 / 30 / 90 days. Telegram typing and receipts are fixed on. Signal says the phone. Messages says the phone. |
 | Audio & video | V1, V2, V4, V5 | Microphone, speaker, join muted, call volume. |
 | Voice | V3, V6, V8, V10–V19, S7–S10 | Input level, sensitivity, voice activation or push-to-talk, echo cancellation, noise suppression, automatic gain, key recorders, release delay, call cues and their volume. |
 | Storage | D1–D3 | Usage, cap (default 500 MB), clear. Sign-ins, drafts, and settings stay. |
@@ -141,7 +141,7 @@ tinyclient in System Settings." with "Open System Settings".
 | N1 | Show notifications | Switch | On | G | d | Off: chatd posts no message notifications. Counts and badge keep working. Calls follow N5 | in |
 | N2 | Notify me about | ND, NG, NM, NT: "Direct messages", "Group chats", "Mentions in channels", "Tiny servers" | DMs, groups, and mentions | G | d | Which arriving messages chatd posts. Muted conversations never notify (04 C2). These are global, not per account. | in |
 | N3 | Per account: Notify me about | Menu | | A | d | Not a row. chatd can store an account-level notify word; the window does not show N3. | not in 0.2.35 |
-| N4 | Show in notifications | Segmented: "Sender and message" / "Sender only" / "Nothing" | Sender and message | G | d | Sender only: title is the sender, body "New message" or "New mention". Nothing: title is the network, body "New message". For screen sharing | in |
+| N4 | Show in notifications | Segmented: "Sender and message" / "Sender only" / "Nothing" | Sender only | G | d | Sender only: title is the sender, body "New message" or "New mention". Nothing: title is the network, body "New message". For screen sharing | in |
 | NL | Lock-screen preview | Switch | | G | d | Hidden on macOS, where the OS does that. | in |
 | N5 | Incoming calls | Segmented: "Ring" / "Notify silently" / "Don't notify" | Ring | G | d | Ring posts the call notification with the ring sound (S4). Silently posts it with no sound. Don't notify posts nothing; the in-window card and the missed-call row still appear | in |
 | N6 | During a call | Segmented: "Banners only" / "Banners and sounds" / "Nothing" | Banners only | G | d | What message notifications do while I am in a call. Rings follow 07 §4 regardless | in |
@@ -222,6 +222,7 @@ no control.
 | P2 | Let others see what I have read | Teams switch; fixed rows for Telegram, Signal, and Messages | Teams on. Telegram "Always on". Signal "Set on your phone". Messages: the phone decides. | A | d | Teams off: no consumption-horizon update is sent; the chat is still marked read here. Caption: "Off also leaves chats unread on your other devices." Group caption: "Discord and Slack have no read receipts." | in |
 | P3 | Load images and link previews automatically | Switch | On | G | s | Off: each image or preview is one line with its size; a click loads it. Nothing is fetched until clicked | in |
 | P4 | Keep messages on this computer for | Segmented: "7 days" / "30 days" / "90 days" | 90 days | G | d | The age half of the retention rule (`store.rs`); the 2,000 per conversation cap stays. Pruned within 1 min of the change and daily | in |
+| PE | Only join end-to-end encrypted calls | Switch | Off | G | s | Off on purpose: a server or an app that cannot encrypt calls would stop working. Either way a Tiny call whose server turns encryption off stops sending and playing ("Encryption was turned off" on the call badge); off, the security panel offers "Carry on without encryption", on, it offers only leaving, and a server with no end-to-end calls is not joined. Incognito hosts (`incognito.tinyclient.io` and names under it) and `e2ee_required` rooms behave as on whatever the switch says. Read when a call is joined | in |
 | P5 | Hide tinyclient from screen sharing and recordings | Switch | | G | s | | Later (spike: macOS 15 capture may ignore `sharingType`) |
 | P6 | Lock with Touch ID | Switch | | G | s | | Later |
 | P7 | Signal: always relay calls | Switch | | A | d | | Later, with Signal calls |

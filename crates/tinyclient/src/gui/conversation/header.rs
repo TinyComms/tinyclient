@@ -175,12 +175,42 @@ impl Shell {
                     .children(mixed.then(|| div().flex_none().mr(px(-2.)).child(network_icon(open.key.network, 14.))))
                     .child(title)
                     .children(mark(open.mark))
+                    .children(self.encryption_chip(open, cx))
                     .children(line)
                     .children(trouble.map(|words| div().flex_none().type_small().text_color(theme::text_faint()).child(words))),
             )
             .children(search)
             .children(call.map(|call| div().flex_none().ml(px(8.)).child(call)))
             .child(div().flex_none().ml(px(8.)).flex().gap(px(4.)).children(members).children(details))
+    }
+
+    /// Whether the conversation is end-to-end encrypted, where its network says: a lock and the
+    /// words, or the plain words that the server can read it. A plaintext conversation keeps that
+    /// label for good; it is never called encrypted. Opens Encryption, where the safety numbers are.
+    fn encryption_chip(&self, open: &Conversation, cx: &mut Context<Self>) -> Option<gpui::Stateful<Div>> {
+        if open.encryption.is_unknown() {
+            return None;
+        }
+        let sealed = open.encryption == protocol::Encryption::EndToEnd;
+        let (icon, tone) = if sealed { ("icons/lock.svg", theme::text_soft()) } else { ("icons/triangle-alert.svg", theme::text_faint()) };
+        let account = open.key.account();
+        Some(
+            div()
+                .id("conversation-encryption")
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(4.))
+                .cursor_pointer()
+                .type_small()
+                .text_color(tone)
+                .hover(|style| style.text_color(theme::text()))
+                .tooltip(tip(open.encryption.explained(), None))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, window, cx| this.tiny_open_encryption(&account, window, cx)))
+                .child(glyph(icon, 12., tone))
+                .child(open.encryption.words()),
+        )
     }
 
     /// The line after the title (07 §1): beside a direct conversation the person's status or

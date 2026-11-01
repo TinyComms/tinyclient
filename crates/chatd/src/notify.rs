@@ -45,9 +45,10 @@ pub enum Preview {
 impl Preview {
     fn of(word: &str) -> Preview {
         match word {
+            "full" => Preview::Full,
             "sender" => Preview::Sender,
             "nothing" => Preview::Nothing,
-            _ => Preview::Full,
+            _ => Preview::Sender,
         }
     }
 }

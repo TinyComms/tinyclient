@@ -15,10 +15,13 @@
 //! the call code everyone in the call compares, and each other member's safety number with
 //! "Mark as verified".
 //!
-//! It never says more than holds. "End-to-end encrypted" and the lock appear only while mediad
-//! says the group has keys; a call that is only encrypted to the server says so, and why. A key
-//! that changed since it was verified, or someone in the encrypted group the server does not
-//! list in the call, turns the lock into a warning.
+//! It never says more than holds. "End-to-end encrypted" and the green lock appear while mediad
+//! says the group has keys, and also when you are the only person in the call: there is nobody
+//! to finish a group with, and the panel says the microphone stays off until someone joins. A
+//! call that is only encrypted to the server says so, and why. While other people are already
+//! in the call and the keys are not ready, the clock stays. A key that changed since it was
+//! verified, or someone in the encrypted group the server does not list in the call, turns the
+//! lock into a warning.
 
 use super::{in_call, Menu};
 use crate::gui::components::{glyph, tip};
@@ -41,12 +44,18 @@ pub(in crate::gui) enum Place {
 pub(super) enum Badge {
     /// Only the people in the call hold the keys.
     EndToEnd,
-    /// End-to-end encryption is being set up.
+    /// End to end is on, and nobody else is in the call yet, so there is no group to finish.
+    Alone,
+    /// Other people are in the call and the keys are not ready.
     Pending,
     /// Encrypted between each app and the server only.
     Transport,
     /// End to end, but a verified key changed or the group holds someone the call does not.
     Check,
+    /// The server turned encryption off. Nothing is sent or played until the person chooses to
+    /// carry on unencrypted, which a `required` call does not offer. Not the shield of
+    /// `Transport`: that call carries on.
+    Blocked,
 }
 
 /// Something in the encrypted group is not as it should be: a key changed since it was
@@ -66,31 +75,36 @@ fn twice(security: &CallSecurity, member: &SecureMember) -> bool {
     security.members.iter().filter(|other| other.user_id == member.user_id).count() > 1
 }
 
-pub(super) fn badge(security: &CallSecurity) -> Badge {
+pub(super) fn badge(security: &CallSecurity, alone: bool) -> Badge {
     match security.mode {
         SecurityMode::EndToEnd if alarming(security) => Badge::Check,
         SecurityMode::EndToEnd => Badge::EndToEnd,
+        // One person has nobody to exchange keys with. The clock would sit there until someone
+        // joined, which reads as encryption being stuck.
+        SecurityMode::Pending if alone => Badge::Alone,
         SecurityMode::Pending => Badge::Pending,
         SecurityMode::Transport => Badge::Transport,
+        SecurityMode::Blocked => Badge::Blocked,
     }
 }
 
 pub(super) fn badge_words(badge: Badge) -> &'static str {
     match badge {
-        Badge::EndToEnd => "End-to-end encrypted",
+        Badge::EndToEnd | Badge::Alone => "End-to-end encrypted",
         Badge::Pending => "Setting up encryption…",
         Badge::Transport => "Encrypted to the server",
         Badge::Check => "Check security",
+        Badge::Blocked => "Encryption was turned off",
     }
 }
 
 pub(super) fn badge_look(badge: Badge) -> (&'static str, Rgba) {
     match badge {
-        Badge::EndToEnd => ("icons/lock.svg", theme::positive()),
+        Badge::EndToEnd | Badge::Alone => ("icons/lock.svg", theme::positive()),
         Badge::Pending => ("icons/clock.svg", theme::text_faint()),
         // Not a lock: the server could hear it. Not alarming either: it is what most calls are.
         Badge::Transport => ("icons/shield.svg", theme::text_faint()),
-        Badge::Check => ("icons/triangle-alert.svg", theme::warning()),
+        Badge::Check | Badge::Blocked => ("icons/triangle-alert.svg", theme::warning()),
     }
 }
 
@@ -125,18 +139,37 @@ fn first_name(name: &str) -> &str {
 }
 
 /// The headline and the sentence under it.
-pub(super) fn summary(security: &CallSecurity) -> (&'static str, &'static str) {
-    match badge(security) {
+pub(super) fn summary(security: &CallSecurity, alone: bool) -> (&'static str, &'static str) {
+    match badge(security, alone) {
         Badge::EndToEnd => ("End-to-end encrypted", "Only the people in this call can hear it. The server passes along audio it cannot unlock."),
+        Badge::Alone => ("End-to-end encrypted", "You're the only one in this call. Your microphone stays off until someone joins, so nothing you say reaches the server unlocked."),
         Badge::Check => ("Check who is in this call", "The call is end-to-end encrypted, but something about who holds its keys changed. Read below before you trust it."),
         Badge::Pending => ("Setting up end-to-end encryption", "Your microphone waits until it's done, so nothing you say reaches the server unlocked."),
         Badge::Transport => ("Encrypted to the server", "Encrypted between each app and the server. The server could hear this call."),
+        Badge::Blocked if security.required => (
+            "Encryption was turned off",
+            "This call only goes on end-to-end encrypted, and the server turned encryption off, so nothing is sent or played. Leave the call.",
+        ),
+        Badge::Blocked => (
+            "Encryption was turned off",
+            "The server turned encryption off, so nothing is sent or played. Leave, or carry on knowing the server could hear the call.",
+        ),
     }
 }
 
-/// Why a call is only encrypted to the server, one line each.
+/// The one button that turns a blocked call to clear.
+pub(super) const CARRY_ON: &str = "Carry on without encryption";
+
+/// A blocked call that may carry on unencrypted, if the person chooses. A `required` call may not:
+/// the person's setting, an Incognito host, or a room that requires it.
+pub(super) fn offers_carry_on(security: &CallSecurity) -> bool {
+    security.mode == SecurityMode::Blocked && !security.required
+}
+
+/// Why a call is not end to end, one line each: only encrypted to the server, or blocked because
+/// the server turned encryption off. For anything else there is nothing to explain.
 pub(super) fn why_transport(call: &Call, security: &CallSecurity) -> Vec<String> {
-    if security.mode != SecurityMode::Transport {
+    if !matches!(security.mode, SecurityMode::Transport | SecurityMode::Blocked) {
         return Vec::new();
     }
     if security.server_lacks {
@@ -210,7 +243,7 @@ impl Shell {
     /// about its protection. 24 × 24, as the call health bars beside it.
     pub(in crate::gui) fn call_security(&self, call: &Call, place: Place, cx: &mut Context<Self>) -> Option<AnyElement> {
         let security = call.security.as_ref()?;
-        let shown = badge(security);
+        let shown = badge(security, call.participants.is_empty());
         let (icon, color) = badge_look(shown);
         let open = self.call_security_open(place);
         let mut indicator = div()
@@ -277,6 +310,11 @@ impl Shell {
         self.call_ask(request, cx);
     }
 
+    /// The person chose to carry on without end-to-end encryption. Only ever from their click.
+    fn call_carry_on_unencrypted(&mut self, cx: &mut Context<Self>) {
+        self.call_ask(Request::CallCarryOnUnencrypted, cx);
+    }
+
     /// The panel the lock opens.
     pub(super) fn call_security_panel(&self, call: &Call, cx: &mut Context<Self>) -> Stateful<Div> {
         let mut panel = div()
@@ -290,9 +328,10 @@ impl Shell {
         let Some(security) = call.security.clone() else {
             return panel;
         };
-        let shown = badge(&security);
+        let alone = call.participants.is_empty();
+        let shown = badge(&security, alone);
         let (icon, color) = badge_look(shown);
-        let (headline, sentence) = summary(&security);
+        let (headline, sentence) = summary(&security, alone);
         panel = panel
             .child(
                 div()
@@ -311,6 +350,27 @@ impl Shell {
             )
             .child(words(sentence.to_owned(), theme::text_soft()))
             .children(why_transport(call, &security).into_iter().map(|line| words(line, theme::text_soft())));
+        if offers_carry_on(&security) && in_call(call) {
+            panel = panel.child(
+                div()
+                    .id("call-carry-on-unencrypted")
+                    .flex_none()
+                    .h(px(26.))
+                    .px(px(10.))
+                    .rounded(px(6.))
+                    .bg(theme::hover())
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(12.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(theme::warning())
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme::selected()))
+                    .child(CARRY_ON)
+                    .on_click(cx.listener(|this, _, _, cx| this.call_carry_on_unencrypted(cx))),
+            );
+        }
         if security.mode != SecurityMode::EndToEnd {
             return panel;
         }
@@ -455,29 +515,37 @@ mod tests {
 
     #[test]
     fn the_badge_says_end_to_end_only_when_it_is() {
-        assert_eq!(badge_words(badge(&secure(vec![member("bea", Trust::Unverified)]))), "End-to-end encrypted");
+        assert_eq!(badge_words(badge(&secure(vec![member("bea", Trust::Unverified)]), false)), "End-to-end encrypted");
         let pending = CallSecurity { mode: SecurityMode::Pending, ..CallSecurity::default() };
-        assert_eq!(badge_words(badge(&pending)), "Setting up encryption…");
+        // Alone: the green lock, and the panel says why the microphone is still off.
+        assert_eq!(badge(&pending, true), Badge::Alone);
+        assert_eq!(badge_words(Badge::Alone), "End-to-end encrypted");
+        assert_eq!(badge_look(Badge::Alone).0, "icons/lock.svg");
+        assert_eq!(summary(&pending, true).0, "End-to-end encrypted");
+        assert!(summary(&pending, true).1.contains("only one"));
+        // Other people are already in the call: keys are actually being made.
+        assert_eq!(badge_words(badge(&pending, false)), "Setting up encryption…");
+        assert_ne!(badge_look(badge(&pending, false)).0, "icons/lock.svg");
         let transport = CallSecurity { mode: SecurityMode::Transport, ..CallSecurity::default() };
-        assert_eq!(badge_words(badge(&transport)), "Encrypted to the server");
-        // Neither the lock nor its words for anything but end to end.
-        for security in [&pending, &transport] {
-            assert_ne!(badge_look(badge(security)).0, "icons/lock.svg");
-            assert!(!summary(security).0.contains("End-to-end encrypted"));
-        }
+        assert_eq!(badge_words(badge(&transport, false)), "Encrypted to the server");
+        assert_ne!(badge_look(badge(&transport, true)).0, "icons/lock.svg");
+        assert!(!summary(&transport, true).0.contains("End-to-end encrypted"));
+        let blocked = CallSecurity { mode: SecurityMode::Blocked, ..CallSecurity::default() };
+        assert_eq!(badge(&blocked, true), Badge::Blocked);
+        assert!(summary(&blocked, true).1.contains("nothing is sent or played"));
     }
 
     #[test]
     fn a_changed_key_or_an_unlisted_member_is_a_warning() {
         assert!(!alarming(&secure(vec![member("bea", Trust::Verified), member("cy", Trust::Unverified)])));
-        assert_eq!(badge(&secure(vec![member("bea", Trust::Changed)])), Badge::Check);
-        assert_eq!(badge(&secure(vec![member("", Trust::Unverified)])), Badge::Check);
+        assert_eq!(badge(&secure(vec![member("bea", Trust::Changed)]), false), Badge::Check);
+        assert_eq!(badge(&secure(vec![member("", Trust::Unverified)]), false), Badge::Check);
         assert_eq!(badge_words(Badge::Check), "Check security");
         // One person twice in the group: someone else's key under their name.
-        assert_eq!(badge(&secure(vec![member("bea", Trust::Unverified), member("bea", Trust::Unverified)])), Badge::Check);
+        assert_eq!(badge(&secure(vec![member("bea", Trust::Unverified), member("bea", Trust::Unverified)]), false), Badge::Check);
         // A transport-only call has no group to be wrong about.
         let transport = CallSecurity { mode: SecurityMode::Transport, members: vec![member("", Trust::Changed)], ..CallSecurity::default() };
-        assert_eq!(badge(&transport), Badge::Transport);
+        assert_eq!(badge(&transport, false), Badge::Transport);
     }
 
     #[test]
@@ -509,6 +577,47 @@ mod tests {
         let someone = CallSecurity { mode: SecurityMode::Transport, unsupported: vec!["bea".into()], ..CallSecurity::default() };
         assert_eq!(why_transport(&call_, &someone), ["Bea's app can't encrypt end to end."]);
         assert!(why_transport(&call_, &secure(vec![])).is_empty());
-        assert!(summary(&someone).1.contains("The server could hear this call."));
+        assert!(summary(&someone, false).1.contains("The server could hear this call."));
+    }
+
+    #[test]
+    fn a_blocked_call_says_what_happened_and_is_never_dressed_as_encrypted() {
+        let blocked = CallSecurity { mode: SecurityMode::Blocked, unsupported: vec!["bea".into()], ..CallSecurity::default() };
+        let refused = CallSecurity { required: true, ..blocked.clone() };
+        // Alone or not, it is the same badge: the server turned it off, not the keys unfinished.
+        for alone in [true, false] {
+            assert_eq!(badge(&blocked, alone), Badge::Blocked);
+            assert_eq!(badge(&refused, alone), Badge::Blocked);
+            let (headline, sentence) = summary(&blocked, alone);
+            assert_eq!(headline, "Encryption was turned off");
+            assert!(sentence.contains("nothing is sent or played") && sentence.contains("could hear"), "{sentence}");
+            let (headline, sentence) = summary(&refused, alone);
+            assert_eq!(headline, "Encryption was turned off");
+            assert!(sentence.contains("only goes on end-to-end encrypted") && sentence.contains("Leave"), "{sentence}");
+        }
+        // The way on unencrypted is offered only when the call allows it, and only when blocked.
+        assert!(offers_carry_on(&blocked));
+        assert!(!offers_carry_on(&refused));
+        for mode in [SecurityMode::Transport, SecurityMode::Pending, SecurityMode::EndToEnd] {
+            assert!(!offers_carry_on(&CallSecurity { mode, ..CallSecurity::default() }));
+        }
+        assert_eq!(badge_words(Badge::Blocked), "Encryption was turned off");
+        // A warning, not a lock and not the transport shield: it is neither encrypted nor carrying on.
+        assert_eq!(badge_look(Badge::Blocked).0, "icons/triangle-alert.svg");
+        for other in [Badge::EndToEnd, Badge::Alone, Badge::Transport, Badge::Pending] {
+            assert_ne!(badge_look(Badge::Blocked).0, badge_look(other).0);
+            assert_ne!(badge_words(Badge::Blocked), badge_words(other));
+        }
+        assert!(!summary(&blocked, false).0.contains("End-to-end encrypted"));
+        // It still says whose app could not do it, as a transport-only call does, and nothing
+        // for a call that is encrypted or still being set up.
+        let call_ = call(blocked.clone());
+        assert_eq!(why_transport(&call_, &blocked), ["Bea's app can't encrypt end to end."]);
+        let nobody = CallSecurity { mode: SecurityMode::Blocked, ..CallSecurity::default() };
+        assert_eq!(why_transport(&call_, &nobody), ["Someone in this call uses an app that can't encrypt end to end."]);
+        let pending = CallSecurity { mode: SecurityMode::Pending, unsupported: vec!["bea".into()], ..CallSecurity::default() };
+        assert!(why_transport(&call_, &pending).is_empty());
+        // A blocked call claims no keys: the panel shows none of an encrypted call's detail.
+        assert!(!alarming(&CallSecurity { members: vec![member("", Trust::Changed)], ..blocked }));
     }
 }

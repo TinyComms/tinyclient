@@ -138,7 +138,13 @@ $phone = @(
     # The Tiny server "Premier" as its owner sees it, in the sidebar's place.
     @{ n = '31-tiny-server';         a = @('--mode', 'tiny') },
     @{ n = '32-reply-bar';           a = $carpool + @('--composer', 'reply') },
-    @{ n = '33-emoji-picker';        a = $carpool + @('--composer', 'picker-emoji') }
+    @{ n = '33-emoji-picker';        a = $carpool + @('--composer', 'picker-emoji') },
+    # End-to-end encrypted text on a Tiny server: Ana's direct conversation says so under its
+    # title (a tap opens Encryption), and a message sent before this device joined says it can't
+    # be opened. Encryption itself, with the safety numbers, is a pushed page on a phone.
+    @{ n = '34-tiny-encrypted-dm';   a = @('--open', '6') },
+    @{ n = '35-tiny-encryption';     a = @('--mode', 'tiny', '--tiny-settings', 'encryption') },
+    @{ n = '36-tiny-encryption-people'; a = @('--mode', 'tiny', '--tiny-settings', 'encryption', '--tiny-scroll', '600') }
 )
 # A call on a phone (`gui/call/phone`): its own screen, the bar over every other screen when it
 # is minimised, its pages and sheets. Each is a made-up call (`gui/call/shot.rs`, `phone_*`).
@@ -159,6 +165,7 @@ $callShots = @(
     @{ n = '53-call-devices';        c = 'phone_devices' },
     @{ n = '54-call-more';           c = 'phone_more' },
     @{ n = '55-call-security';       c = 'phone_security' },
+    @{ n = '55a-call-security-blocked'; c = 'phone_security_blocked' },
     @{ n = '56-call-mic-denied';     c = 'phone_denied' },
     @{ n = '57-call-camera-denied';  c = 'phone_camera_denied' },
     @{ n = '58-call-no-answer';      c = 'phone_failed' },

@@ -818,6 +818,7 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
     // Our own client's nonce is the shell's client id: digits, at most 25.
     let client_id = posted.nonce.clone().filter(|nonce| outgoing && digits(nonce) && nonce.len() <= 25);
     let message = Message {
+        seal: protocol::Seal::Plain,
         card,
         deleted: false,
         forwarded: forwarded_from,
