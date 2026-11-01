@@ -181,6 +181,7 @@ impl Shell {
             return Some(frame);
         }
         // The demo has no camera: its own call shows my portrait there (`shot_demo::live`).
+        #[cfg(any(feature = "gui-shot", feature = "demo"))]
         if crate::gui::shot_demo::on() {
             return crate::gui::shot_demo::live::self_frame().map(PathBuf::from);
         }

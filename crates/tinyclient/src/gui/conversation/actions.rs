@@ -323,6 +323,24 @@ impl Pane {
         self.press = None;
     }
 
+    /// Back on a phone, over the messages: the picture viewer, the delete question, the
+    /// message's sheet or the reaction picker closes before the conversation does. False when
+    /// none of them was up.
+    pub(in crate::gui) fn phone_back(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.viewer.is_some() {
+            self.close_viewer(cx);
+        } else if self.confirm.is_some() {
+            self.confirm = None;
+            cx.notify();
+        } else if self.menu.is_some() || self.picker.is_some() {
+            self.close_menu(cx);
+            self.close_picker(cx);
+        } else {
+            return false;
+        }
+        true
+    }
+
     /// The toolbar of the row under the pointer: one instance, straddling the row's top edge.
     pub(super) fn toolbar(&self, message: &Rc<Message>, cx: &mut Context<Self>) -> Option<AnyElement> {
         // Not while text is being selected: it would sit under the drag. Never over a menu or

@@ -387,6 +387,10 @@ impl Shell {
         if self.close_slack_menu(cx) {
             return true;
         }
+        // A picture, a message's sheet or the reaction picker over the messages.
+        if self.panes_back(cx) {
+            return true;
+        }
         // Server Settings: a page of it goes back to the list, the list closes; a Tiny dialog or
         // card closes first.
         if self.tiny_back(cx) {

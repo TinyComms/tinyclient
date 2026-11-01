@@ -362,6 +362,14 @@ pub fn steps(cx: &mut gpui::Context<crate::gui::state::Shell>) {
                             shell.open_listed(row, cx);
                         }
                     }
+                    // `profile:<person id>`: a tap on someone of the open conversation, as on a
+                    // member's row (over Members, the Profile is pushed on it).
+                    Some(("profile", id)) => {
+                        let open = shell.snapshot.as_ref().and_then(|s| s.open.as_ref()).map(|open| open.key.clone());
+                        if let Some(open) = open {
+                            shell.open_profile(protocol::Key { id: id.to_owned(), ..open }, gpui::point(gpui::px(0.), gpui::px(0.)), cx);
+                        }
+                    }
                     // `start:<conversation id>`: the demo's conversation's call, as its Call or
                     // Join button (a voice channel's row on a phone) starts it.
                     Some(("start", id)) => match crate::gui::shot_demo::key_of(id) {
