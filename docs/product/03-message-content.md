@@ -1,25 +1,29 @@
 # 03. What is inside a conversation
 
-Scope: what a message can contain, what I can do to it, and the composer. One model for Slack, Discord, Telegram and Teams. `(u)` marks a protocol detail not verified against a primary source; verify before building on it.
+Scope: what a message can contain, what I can do to it, and the composer. One model for every signed-in network. The protocol table below covers Discord, Slack, Telegram, and Teams. `(u)` marks a protocol detail not verified against a primary source.
 
-## Decisions
+## Decisions that the code already follows
 
-1. **One message model.** A message is: rich text (a string plus styled ranges and blocks), attachments, link previews, reactions, an optional reply-to, an optional thread summary, an optional forwarded-from card, and the flags edited, pinned, mentions-me. Adapters translate into it; the shell never sees Slack mrkdwn, Discord markdown, Telegram entities or Teams HTML.
-2. **Nothing is ever blank.** Content tinyclient cannot draw (poll, location, contact, canvas, bot buttons, Teams card) shows as one labelled line, e.g. "Poll: Lunch? Open in Telegram", with a link into the real app. This rule is P0 and is what makes every later cut safe.
-3. **Media lives on disk, and chatd fetches it.** chatd holds the sessions, so it streams bytes to `media/` under the support directory and never decodes them. The socket carries paths and sizes, never bytes (frames stay under 1 MiB). The shell decodes at display size only for rows on screen and drops the pixels when they scroll off.
-4. **Never fetch an arbitrary URL.** tinyclient shows only the preview the network supplies, and loads preview images only through that network's own proxy or file store. If there is no proxied image, the card shows without one. Reasons: fetching a pasted URL tells a stranger's server my IP and that I read the message (tracking pixels work this way); it needs an HTML parser and a redirect and size policy in the always-on process; and all four networks already do the fetch server-side or sender-side.
-5. **Images open in tinyclient; everything else opens in Quick Look.** One in-app image viewer (zoom, previous/next in the conversation, copy, save). Video, PDF and documents download and open in the system Quick Look panel or, for video, the system's player, which run outside our process and cost no binary weight. "Open" hands off to the default app. Voice messages and audio files play in the message, through `mediad --play` (`docs/architecture.md`). No inline video player yet.
-6. **Reply is inline, thread is a pane.** Two separate things in the model. A *reply* points at one earlier message and draws a one-line quote above the body; clicking it jumps there. A *thread* is a sub-conversation hanging off a root message; the root shows "N replies, last 2:14 PM" and opens in a pane on the right of the conversation (it replaces the conversation below 900 px width). Thread replies never appear in the main timeline unless the network also posted them there.
-7. **Limits come from the session, not from constants.** Upload size and message length are read from the account or chat at sign-in and checked before sending.
+1. **One message.** `protocol::Message` is plain `text` (mentions already names, no Slack or Discord markup left in the string), `spans`, `attachments`, `previews`, `reactions`, `reply_to`, `thread`, `forwarded`, `card`, and the flags `edited`, `pinned`, `mentions_me`, `deleted`. `SendState` is `sent`, `pending`, or `failed`. Adapters translate into that. The shell does not parse mrkdwn, Discord markdown, Telegram entities, or Teams HTML.
+2. **Nothing is blank.** `MessageKind::Unsupported` is one line, for example "Poll: Lunch?", and a link. The row draws "Open in {network}".
+3. **Media is files.** chatd writes under the support directory. The frame limit is 1 MiB. The shell decodes what is on screen.
+4. **No arbitrary URL fetch.** Previews are the ones the network already built. Fetching a pasted URL would tell a stranger's server this machine's address and that the message was read. The networks already build the preview.
+5. **Pictures.** GIF, animated WebP, and APNG follow Settings › Messages › "Play GIFs and animated stickers" (automatically, on hover, never). Video and MP4 GIFs show a still and a play badge; a click opens the system player. No inline video player yet. The shell does not link a video decoder. Voice messages and audio files play in the message.
+6. **Reply and thread.** A reply is a quote. A thread is the pane on the right (`conversation/side.rs`). `StartThread` creates a Discord thread channel. Slack and Teams name the thread from the message.
+7. **Limits** are the account's or the chat's, checked before the upload. The disk cache defaults to 500 MB. Settings can pick 250 MB, 500 MB, 1 GB, or 2 GB.
+
+Edits and deletes are applied. Discord merges a partial `MESSAGE_UPDATE` (`discord/content.rs`). Slack handles `message_changed` and `message_deleted` apart from ordinary messages (`slack/message.rs`).
+
+Video and an MP4 GIF open in the system player. Mention completion is in the composer (`composer/mention.rs`). A Discord name not yet seen uses the visible member range, the same rule as `02-people.md`, not a scrape.
 
 ## Content ranked by daily frequency
 
-The order is my estimate from how the four networks are used, not measured data.
+The order is an estimate of daily use, not measured data.
 
 | # | Content | Priority | Note |
 | --- | --- | --- | --- |
 | 1 | Text with links | P0 | Links open in the default browser. |
-| 2 | Mentions of people, channels, roles, everyone | P0 | Today these show as raw ids such as `<@U123>`. |
+| 2 | Mentions of people, channels, roles, everyone | P0 | The message text already uses the name. No Slack or Discord markup is left in the string. |
 | 3 | Unicode emoji | P0 | System emoji font. Emoji-only messages draw larger (P1). |
 | 4 | Reactions | P0 | Show and toggle. |
 | 5 | Images and screenshots | P0 | The owner's complaint. |
@@ -40,7 +44,7 @@ The order is my estimate from how the four networks are used, not measured data.
 | 20 | Spoilers | P1 | Hidden until clicked. |
 | 21 | Pins | P2 | |
 | 22 | Polls, location, contacts, tables, headings | P2 | Placeholder line until then. |
-| — | Recording voice, GIF picker, slash commands, bot buttons and forms, canvases, scheduled send, edit history, read receipts per message | cut | |
+| — | Recording a voice message, slash commands, bot buttons and forms, canvases, scheduled send, edit history, read receipts per message | cut | The GIF and sticker picker is in. Buttons are `MessageKind::Unsupported` plus "Open in {network}". |
 
 ## Stories
 
@@ -55,7 +59,7 @@ Each check is observable from outside the process: on the chat socket, on disk, 
 5. **Scrolling pictures does not cost memory.** *Check:* after scrolling through 200 images and back to text, the shell's footprint is within 10 MB of where it started; chatd's does not move by more than 1 MB.
 6. **A file is a row I can act on.** Icon by type, name, size, and a download button with progress. Files never download on their own. *Check:* `media/` gains the file only after I ask; cancelling removes the partial file.
 7. **Mentions read as names.** `@Priya`, `#deploys`, `@backend`, `@everyone` draw as pills; a message that mentions me has a tinted row. *Check:* `open` returns mention ranges with kind, id and label, and no body contains `<@`, `<#` or `<!`.
-8. **Formatting looks the same on every network.** Bold, italic, strike, inline code, code block (monospace, horizontal scroll, copy button), quote bar, bulleted and numbered lists, links. *Check:* the same seeded sentence on all four networks returns the same ranges and blocks.
+8. **Formatting looks the same on every network.** Bold, italic, strike, inline code, code block (monospace, horizontal scroll, copy button), quote bar, bulleted and numbered lists, links. *Check:* the same seeded sentence on each network in the table below returns the same ranges and blocks.
 9. **I see and give reactions.** Chips under the message with emoji and count; mine is outlined; click toggles; a smiley on hover adds one. *Check:* a reaction added in the official app shows within 2 s without reopening; `react` on the socket changes the count in the official app.
 10. **I reply to a message.** Reply from the hover bar puts "Replying to Priya" above the composer; the sent message carries the quote. *Check:* the official app shows it as a reply to that message; `open` returns reply-to with id, sender and snippet.
 11. **I read and answer a thread.** The root shows the reply count; the pane shows the root and its replies with its own composer. *Check:* a Slack thread reply is absent from `open` on the channel, present in `thread_open`, and bumps the root's count live.
@@ -92,11 +96,11 @@ Each check is observable from outside the process: on the chat socket, on disk, 
 
 ## What each network gives a user session
 
-| | Discord | Slack | Telegram (TDLib) | Teams |
+| | Discord | Slack | Telegram (schema; grammers in this client) | Teams |
 | --- | --- | --- | --- | --- |
 | Text markup | Markdown in `content`, parsed by the client: `**` `*` `__` `~~` `` ` `` ```` ``` ```` `>` `\|\|spoiler\|\|` `-` `1.` `#` `[t](u)` | `blocks` of type `rich_text` (structured; use this), else mrkdwn `text`: `*b*` `_i_` `~s~` `<url\|t>`. No spoiler. | `formattedText`: plain text plus entities by UTF-16 offset (bold, italic, underline, strike, spoiler, code, pre, blockQuote, textUrl, customEmoji). No lists. | HTML in `content`: `b i u s code pre blockquote ul ol a table`. Tokenize into the model; never render HTML. |
 | Mentions | `<@id>` `<@&role>` `<#chan>` `@everyone`; the message carries `mentions` user objects, so no lookup | `<@U>` `<#C\|name>` `<!here>` `<!subteam^S>`; ids resolve through the existing name cache | `mention` (@username), `mentionName` (user id) | `<span itemtype=".../Mention">` plus `properties.mentions` with display names (u) |
-| Image / file | `attachments[]`: `url`, `proxy_url`, `width`, `height`, `size`, `content_type`, `placeholder` (blur hash). Resize by adding `width`, `height`, `format` to the `media.discordapp.net` URL (params u). URLs are signed and expire (`ex`, `is`, `hm`); refetch the message or `POST /attachments/refresh-urls`. Key the disk cache by attachment id. | `files[]`: `thumb_360/480/720/960/1024` with `_w` `_h`, `thumb_tiny`, `url_private`, `mimetype`, `size`. Every fetch needs `Authorization: Bearer` and, for our `xoxc` token, the `d` cookie. `mode: hidden_by_limit` (free-plan history) and `file_access: check_file_info` need a placeholder or `files.info`. | `messagePhoto` sizes, `minithumbnail` (inline tiny JPEG), `messageDocument`, `messageVideo`, `messageAnimation`. `downloadFile(file_id, priority)` writes to TDLib's own directory and reports `updateFile` progress. | Inline `<img itemtype=".../AMSImage">` pointing at `*.asm.skype.com/v1/objects/{id}/views/imgo`, fetched with the skype token (u). Files are SharePoint or OneDrive links in `properties.files` and need a second token audience (u). |
+| Image / file | `attachments[]`: `url`, `proxy_url`, `width`, `height`, `size`, `content_type`, `placeholder` (blur hash). Resize by adding `width`, `height`, `format` to the `media.discordapp.net` URL (params u). URLs are signed and expire (`ex`, `is`, `hm`); refetch the message or `POST /attachments/refresh-urls`. Key the disk cache by attachment id. | `files[]`: `thumb_360/480/720/960/1024` with `_w` `_h`, `thumb_tiny`, `url_private`, `mimetype`, `size`. Every fetch needs `Authorization: Bearer` and, for our `xoxc` token, the `d` cookie. `mode: hidden_by_limit` (free-plan history) and `file_access: check_file_info` need a placeholder or `files.info`. | `messagePhoto` sizes, `minithumbnail` (inline tiny JPEG), `messageDocument`, `messageVideo`, `messageAnimation`. The file download reports progress. grammers writes under the support directory and does not keep a second database. | Inline `<img itemtype=".../AMSImage">` pointing at `*.asm.skype.com/v1/objects/{id}/views/imgo`, fetched with the skype token (u). Files are SharePoint or OneDrive links in `properties.files` and need a second token audience (u). |
 | Video / GIF / voice | Video attachment has a poster through the proxy. Tenor and Giphy arrive as `gifv` embeds (MP4 plus thumbnail). Voice: message flag plus `duration_secs` and `waveform`, Ogg/Opus. | `thumb_video`, transcoded `mp4`. Clips are files with a transcript (u). | `messageVoiceNote` (Ogg/Opus, waveform), `messageVideoNote`, `messageAnimation` (MP4). | Giphy is an `<img>`; video is a file link. Voice messages (u). |
 | Link preview | `embeds[]` built by Discord; images through `proxy_url`. Arrives in a later `MESSAGE_UPDATE`. | `attachments[]` built by Slack; arrives as `message_changed`. Image through Slack's image proxy (u), else no image. | `linkPreview` built by Telegram's servers; image is a Telegram file. | Card inserted by the sender's client (u). We read it; when sending we send the bare link. |
 | Reactions | `reactions[]` on the message; `MESSAGE_REACTION_ADD/REMOVE/REMOVE_ALL`; `PUT .../reactions/{emoji}/@me` | `reactions[]` (`name`, `users`, `count`); `reaction_added/removed`; `reactions.add/remove`; images from `emoji.list` | `interaction_info.reactions`; `updateMessageInteractionInfo`; `addMessageReaction`; the chat limits which are allowed | `properties.emotions` (key plus users); set through the message properties endpoint (u) |
@@ -107,17 +111,12 @@ Each check is observable from outside the process: on the chat socket, on disk, 
 | Send a file | Ask `POST /channels/{id}/attachments` for an upload URL, `PUT` the bytes, name it in the message (user-client flow, u). 20 MB free as of Aug 2026 by one source (10 MB before), 50 MB Nitro Basic, 500 MB Nitro. | `files.getUploadURLExternal`, upload, `files.completeUploadExternal` (with `thread_ts`). `files.upload` is retired. | `sendMessage` with `inputMessagePhoto` or `inputMessageDocument` and a local path; 2 GB, 4 GB Premium | Pasted image: create an AMS object and reference it (u). File: upload to my OneDrive and share (u); P1. |
 | Text limit | 2,000 (4,000 Nitro) | 40,000 | 4,096; caption 1,024 | about 28 KB of HTML (u) |
 
-## Consequences for the rest of the product
+Telegram in this client is grammers. The TDLib method names in this table are the schema, not a library we ship. Signal, Messages, and Tiny are not in this table.
 
-- `protocol::Message` grows from a `body` string into the model in decision 1, and the socket gains thread open, react, edit, delete, download, and send-with-attachments. The store needs update and delete by message id, and a media table mapping attachment id to path, size and last use.
-- The media cache is unencrypted like the message cache, capped (default 1 GB, least recently used goes first), and removed on sign-out with the rest of that network's data.
-- Both adapters currently treat every `MESSAGE_UPDATE` / `message_changed` as noise. Link previews arrive through the same events, so P0 edits and P1 previews share one code path.
-- Three risks to size before committing: an Ogg/Opus decoder for voice (small), playing MP4 "GIFs" in place without a general video player, and the Teams rows marked `(u)`, which are most of that column.
+The media cache is unencrypted like the message cache, capped (default 500 MB, least recently used goes first), and removed on sign-out with the rest of that network's data. Teams rows marked `(u)` were not re-read in this pass.
 
-## Open questions for the owner
+## Open, still
 
-1. **Moving pictures.** Is "still frame, plays on click" acceptable for GIFs, and static-only for animated stickers? Autoplay and Lottie/WebM stickers are the largest weight items in this area.
-2. **Video.** Is opening video in Quick Look enough, or must it play inside the message? Inline playback means linking a player into the shell.
-3. **Mention autocomplete on Discord.** Completing a name that has not spoken recently needs a member search on the gateway as I type. The README promises tinyclient does not scrape member lists. Allow the per-keystroke search, or complete only from people already seen?
-4. **Bot buttons.** Cutting interactive controls means I cannot approve a deploy or answer a bot prompt from tinyclient; I get an "Open in Slack" link. Acceptable?
-5. **Disk.** Is a 1 GB default media cache right for a machine that is "already full", and should thumbnails download on any connection or only when a conversation is opened?
+Bot buttons, modals, and slash-command forms are not drawn. The text is. Approving a deploy stays "Open in Slack" (or whichever network sent it).
+
+Lottie, TGS, and WebM stickers are still a weight cut unless a later pass finds a decoder. This pass did not re-read every sticker path.

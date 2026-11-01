@@ -83,6 +83,7 @@ assets!(
     "icons/pin.svg",
     "icons/play.svg",
     "icons/plus.svg",
+    "icons/radio.svg",
     "icons/refresh-cw.svg",
     "icons/reply.svg",
     "icons/rotate-ccw.svg",
@@ -104,6 +105,17 @@ assets!(
     "icons/volume-x.svg",
     "icons/wifi-off.svg",
     "icons/x.svg",
+    "icons/arrow-right-left.svg",
+    "icons/ban.svg",
+    "icons/crown.svg",
+    "icons/folder-plus.svg",
+    "icons/server.svg",
+    "icons/shield.svg",
+    "icons/signal.svg",
+    "icons/timer.svg",
+    "icons/upload.svg",
+    "icons/user-plus.svg",
+    "icons/user-x.svg",
 );
 
 /// The icons, compiled in. Nothing is read from disk or fetched at run time.

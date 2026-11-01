@@ -148,7 +148,7 @@ impl Teams {
         self.state().listed = Some(Instant::now());
         if first {
             if let Err(fault) = self.activity_feed() {
-                eprintln!("chatd: Teams: activity: {}", super::reason(fault));
+                tracing::warn!("chatd: Teams: activity: {}", super::reason(fault));
             }
         }
         Ok(())

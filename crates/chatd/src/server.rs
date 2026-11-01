@@ -8,7 +8,7 @@ use protocol::settings;
 use protocol::{
     clip, read_frame_bytes, support_dir, write_frame, CatalogKind, ConversationInfo, MediaFile, MediaKind, Outgoing, SharedKind, SpaceInfo, AccountKey, AccountStatus, CallSupport, Capabilities,
     Change, ChatListener, ChatStream, Conversation, ConversationKind, ErrorCode, InboxCounts, Key,
-    Link, Media, MediaRequest, Message, Network, NetworkStatus, Page, Person, Presence,
+    Link, Media, MediaRequest, Message, MessageKind, Network, NetworkStatus, Page, Person, Presence,
     Profile, Reaction, RelateAction, Relation, Request, Response, SendState, Watching,
     MUTUAL_SPACES, PAGE_LIMIT, SEARCH_MIN_CHARS, WATCH_LIMIT,
 };
@@ -131,7 +131,7 @@ fn call_error(err: CallError) -> Response {
 }
 
 /// `TINYCLIENT_LOGIN`, or the `tinyclient-login` next to this binary.
-fn login_path() -> io::Result<PathBuf> {
+pub(crate) fn login_path() -> io::Result<PathBuf> {
     if let Some(path) = std::env::var_os("TINYCLIENT_LOGIN") {
         return Ok(PathBuf::from(path));
     }
@@ -184,10 +184,44 @@ impl Chat {
                 adapter.command(Command::CallLeave(conversation.id.clone()));
             }
         });
+        // What mediad has for a Tiny server's live socket (its end-to-end encryption) goes out
+        // through that account's adapter.
+        let adapters = chat.adapters.clone();
+        chat.hub.calls.on_signal(move |conversation, frame| {
+            if let Some(adapter) = lock(&adapters).get(&conversation.account()) {
+                adapter.command(Command::Tiny(adapters::tiny::live::Ask::E2ee { frame }));
+            }
+        });
+        let adapters = chat.adapters.clone();
+        chat.hub.calls.on_offer(move |conversation, sdp| {
+            if let Some(adapter) = lock(&adapters).get(&conversation.account()) {
+                adapter.command(Command::Tiny(adapters::tiny::live::Ask::Offer { sdp }));
+            }
+        });
+        // Tiny media dropped, or came back, while the call is still up. The live socket joins
+        // again, or notes that the link held. A Discord call does this inside mediad.
+        let adapters = chat.adapters.clone();
+        chat.hub.calls.on_tiny_down(move |conversation| {
+            if conversation.network != Network::Tiny {
+                return;
+            }
+            if let Some(adapter) = lock(&adapters).get(&conversation.account()) {
+                adapter.command(Command::Tiny(adapters::tiny::live::Ask::Resume));
+            }
+        });
+        let adapters = chat.adapters.clone();
+        chat.hub.calls.on_tiny_up(move |conversation| {
+            if conversation.network != Network::Tiny {
+                return;
+            }
+            if let Some(adapter) = lock(&adapters).get(&conversation.account()) {
+                adapter.command(Command::Tiny(adapters::tiny::live::Ask::Settled));
+            }
+        });
         let (searches, adapters) = (chat.searches.clone(), chat.adapters.clone());
         let spawned = std::thread::Builder::new().name("search".into()).stack_size(256 * 1024).spawn(move || searches.run(&adapters));
         if let Err(err) = spawned {
-            eprintln!("chatd: people search: {err}");
+            tracing::warn!("chatd: people search: {err}");
         }
         // A seeded demo serves its own accounts.
         lock(&chat.adapters).extend(crate::demo::attach(&chat.hub));
@@ -201,7 +235,7 @@ impl Chat {
             match hub.store().prune(now(), days) {
                 Ok(0) | Err(_) => {}
                 Ok(gone) => {
-                    eprintln!("chatd: pruned {gone} old messages");
+                    tracing::warn!("chatd: pruned {gone} old messages");
                     // What is on screen may be gone.
                     hub.reset();
                 }
@@ -229,7 +263,7 @@ impl Chat {
                     session::Stored::Found(session) => {
                         match chat.connect(network, &session) {
                             Ok(()) => settled.push(network),
-                            Err(err) => eprintln!("chatd: {}: {err}; keeping its cache", network.label()),
+                            Err(err) => tracing::warn!("chatd: {}: {err}; keeping its cache", network.label()),
                         }
                         chat.hub.read_now(network, false, false);
                     }
@@ -240,7 +274,7 @@ impl Chat {
                     // A refused keychain prompt is not a sign-out. What was cached stays, and
                     // `ReadSessions` (or the next start) asks again.
                     session::Stored::Unreadable(why) => {
-                        eprintln!("chatd: {}: the keychain did not hand over the session ({why}); keeping its cache", network.label());
+                        tracing::warn!("chatd: {}: the keychain did not hand over the session ({why}); keeping its cache", network.label());
                         chat.hub.read_now(network, false, true);
                     }
                 }
@@ -250,7 +284,7 @@ impl Chat {
             }
         });
         if let Err(err) = spawned {
-            eprintln!("chatd: sessions: {err}");
+            tracing::warn!("chatd: sessions: {err}");
         }
     }
 
@@ -314,10 +348,10 @@ impl Chat {
         self.hub.player.forget(&self.hub, account);
         self.blobs.forget(account);
         if let Err(err) = self.hub.store().forget(account) {
-            eprintln!("chatd: {}: {err}", account.network.label());
+            tracing::warn!("chatd: {}: {err}", account.network.label());
         }
         self.hub.reload_settings();
-        self.hub.forget_live(account);
+        self.hub.forget_all_live(account);
     }
 
     /// Stores a setting and has whatever reads it take it up now.
@@ -341,7 +375,13 @@ impl Chat {
             | settings::CUE_CONNECTION
             | settings::CUE_VOLUME
             | settings::VOICE_VOLUME
-            | settings::SENSITIVITY => self.hub.calls.retune(&self.hub),
+            | settings::SENSITIVITY
+            | settings::PUSH_TO_TALK
+            | settings::PTT_RELEASE_MS
+            | settings::ECHO_CANCELLATION
+            | settings::NOISE_SUPPRESSION
+            | settings::AUTO_GAIN => self.hub.calls.retune(&self.hub),
+            settings::INPUT | settings::OUTPUT => self.hub.calls.redevice(&self.hub),
             _ => {}
         }
         Response::Ok
@@ -355,6 +395,7 @@ impl Chat {
         self.blobs.cap_changed();
         self.hub.prune_soon();
         self.hub.calls.retune(&self.hub);
+        self.hub.calls.redevice(&self.hub);
         Response::Ok
     }
 
@@ -390,7 +431,7 @@ impl Chat {
         let spawned = std::thread::Builder::new().name("shutdown".into()).stack_size(64 * 1024).spawn(|| {
             // Time for this answer to be written and the adapter to say goodbye.
             std::thread::sleep(Duration::from_millis(300));
-            eprintln!("chatd: asked to stop, exiting");
+            tracing::warn!("chatd: asked to stop, exiting");
             std::process::exit(0);
         });
         if spawned.is_err() {
@@ -494,6 +535,7 @@ impl Chat {
             seq: self.hub.seq(),
             keychain,
             started: self.hub.started,
+            session: protocol::log_policy::session_id().to_owned(),
         }
     }
 
@@ -565,7 +607,9 @@ impl Chat {
         limit: u32,
     ) -> Response {
         let query = query.map(|query| query.trim().to_owned()).filter(|query| !query.is_empty());
-        let found = self.hub.store().people(network, relation, query.as_deref(), offset, limit.min(PAGE_LIMIT));
+        // An explicit Telegram username lookup still searches cached display names/handles.
+        let cached_query = query.as_deref().map(|query| query.trim_start_matches('@'));
+        let found = self.hub.store().people(network, relation, cached_query, offset, limit.min(PAGE_LIMIT));
         if let (Some(query), 0) = (&query, offset) {
             // The cache answers at once; the network's own search lands as a `People` change,
             // once the typing has paused and only for a query long enough to mean something.
@@ -596,7 +640,11 @@ impl Chat {
             known.collect()
         };
         let typists = watching.conversation.as_ref().map_or_else(Vec::new, |open| self.hub.typists(open));
-        if self.hub.watch(watching) {
+        // Focus alone is chatd's own business (notifications): the networks are not told again.
+        let mut before = (*self.hub.watching()).clone();
+        before.focused = watching.focused;
+        let for_networks = before != watching;
+        if self.hub.watch(watching) && for_networks {
             let watching = self.hub.watching();
             for adapter in lock(&self.adapters).values() {
                 adapter.command(Command::Watch(watching.clone()));
@@ -627,6 +675,101 @@ impl Chat {
         }
     }
 
+    /// A Slack or Teams thread id names its parent, so the conversation can exist before the
+    /// network has a reply in it. Opening or sending is what records it. Discord's thread is a
+    /// new channel (`StartThread`) and is not derived from the id.
+    fn ensure_thread(&self, conversation: &Key) -> rusqlite::Result<()> {
+        let mut store = self.hub.store();
+        if store.conversation(conversation)?.is_some() {
+            return Ok(());
+        }
+        let Some((parent_id, root_id)) = derivable_thread(conversation) else {
+            return Ok(());
+        };
+        let parent_key = Key { id: parent_id.clone(), ..conversation.clone() };
+        let Some(parent) = store.conversation(&parent_key)? else {
+            return Ok(());
+        };
+        if parent.kind == ConversationKind::Thread {
+            return Ok(());
+        }
+        // A Teams chat quotes. Only a channel's reply chain is a thread.
+        if conversation.network == Network::Teams
+            && !matches!(parent.kind, ConversationKind::Channel | ConversationKind::Announcement)
+        {
+            return Ok(());
+        }
+        let title = match conversation.network {
+            Network::Teams => {
+                let text = store.message(&parent_key, &root_id)?.map(|message| message.text).unwrap_or_default();
+                let title = first_line(&text, 40);
+                if title.is_empty() { "Replies".to_owned() } else { title }
+            }
+            Network::Slack => {
+                if parent.kind.is_direct() {
+                    format!("Thread with {}", parent.title)
+                } else {
+                    format!("Thread in {}", parent.title)
+                }
+            }
+            _ => return Ok(()),
+        };
+        let mut row = crate::store::ConversationRow::new(&conversation.id, ConversationKind::Thread, title);
+        row.parent = Some(parent_id);
+        row.root = Some(root_id);
+        row.private = parent.private;
+        row.read_only = parent.read_only;
+        let account = conversation.account();
+        store.upsert_conversation(&account, &row)?;
+        drop(store);
+        self.hub.changed(Change::Conversation { conversation: conversation.clone() });
+        Ok(())
+    }
+
+    /// Discord creates the thread channel. The name comes from the message, so the click does
+    /// not ask for one. The adapter records the conversation before it answers.
+    fn start_thread(&self, conversation: Key, message: String) -> Response {
+        if conversation.network != Network::Discord {
+            return error(ErrorCode::Unsupported, format!("{} cannot do this yet", conversation.network.label()));
+        }
+        if let Err(refused) = self.online(&conversation.account()) {
+            return *refused;
+        }
+        let parent = match self.hub.store().conversation(&conversation) {
+            Ok(Some(parent)) => parent,
+            Ok(None) => return error(ErrorCode::NotFound, "no such conversation"),
+            Err(err) => return internal(err),
+        };
+        if !matches!(parent.kind, ConversationKind::Channel | ConversationKind::Announcement) {
+            return error(ErrorCode::Refused, "A thread starts from a channel message.");
+        }
+        let stored = match self.hub.store().message(&conversation, &message) {
+            Ok(Some(stored)) => stored,
+            Ok(None) => return error(ErrorCode::NotFound, "no such message"),
+            Err(err) => return internal(err),
+        };
+        if stored.deleted || matches!(stored.kind, MessageKind::System) {
+            return error(ErrorCode::Refused, "That message cannot start a thread.");
+        }
+        let name = thread_name(&stored.text);
+        let conversation_id = conversation.id.clone();
+        let started = self.ask(&conversation.account(), |reply| Command::StartThread {
+            conversation_id,
+            message_id: message,
+            name,
+            reply,
+        });
+        let id = match started {
+            Ok(id) => id,
+            Err(refused) => return *refused,
+        };
+        match self.hub.store().conversation(&Key::new(&conversation.account(), id)) {
+            Ok(Some(thread)) => Response::Conversation { conversation: self.row(thread) },
+            Ok(None) => error(ErrorCode::Internal, "the thread started, but was not recorded"),
+            Err(err) => internal(err),
+        }
+    }
+
     fn messages(&self, conversation: Key, page: Page, limit: u32) -> Response {
         if !self.shows(&conversation.account()) {
             return Response::Messages {
@@ -636,6 +779,10 @@ impl Chat {
                 older: false,
                 newer: false,
             };
+        }
+        // A Slack or Teams thread is named by its parent, so the row can exist before any reply.
+        if let Err(err) = self.ensure_thread(&conversation) {
+            return internal(err);
         }
         let read = {
             let mut store = self.hub.store();
@@ -714,12 +861,16 @@ impl Chat {
         if let Err(refused) = self.allowed(&account, &with) {
             return *refused;
         }
+        if let Err(err) = self.ensure_thread(&conversation) {
+            return internal(err);
+        }
         let client_id = message.id.clone();
         message.state = SendState::Pending;
         message.sent = now();
         let stored = {
             let mut store = self.hub.store();
             match store.conversation(&conversation) {
+                Ok(Some(row)) if row.read_only => return error(ErrorCode::Refused, format!("You can read {} but not post in it.", row.title)),
                 Ok(Some(_)) => store.ingest(&conversation, &message, false),
                 Ok(None) => return error(ErrorCode::NotFound, "no such conversation"),
                 Err(err) => Err(err),
@@ -1280,6 +1431,7 @@ impl Chat {
         }
         let helper = login_path().and_then(|path| {
             let mut helper = std::process::Command::new(path);
+            protocol::log_policy::share_session(&mut helper);
             protocol::launch::no_console(&mut helper).arg(network.label().to_lowercase());
             if let Some((x, y)) = at {
                 helper.args(["--at", &format!("{x},{y}")]);
@@ -1371,6 +1523,19 @@ impl Chat {
         if let Err(answer) = adapters::tiny::call_allowed(account, may, &ids) {
             return answer;
         }
+        self.tiny_ask(account, ask)
+    }
+
+    /// Server mute, deafen or move, on a server with voice moderation, over its live socket.
+    fn tiny_moderate(&self, account: &AccountKey, needs: &[&str], ids: &[&str], ask: impl FnOnce(Reply<()>) -> adapters::tiny::live::Ask) -> Response {
+        let feature = protocol::TINY_FEATURE_VOICE_MODERATION;
+        if let Err(answer) = adapters::tiny::manage::call_allowed(account, feature, needs, ids) {
+            return answer;
+        }
+        self.tiny_ask(account, ask)
+    }
+
+    fn tiny_ask(&self, account: &AccountKey, ask: impl FnOnce(Reply<()>) -> adapters::tiny::live::Ask) -> Response {
         if let Err(refused) = self.online(account) {
             return *refused;
         }
@@ -1430,6 +1595,10 @@ impl Chat {
     }
 
     pub fn handle(&self, request: Request) -> Response {
+        // A seeded demo's Tiny server has no HTTP behind it: the demo answers for it.
+        if let Some(answer) = crate::demo::tiny_answer(&self.hub, &request) {
+            return answer;
+        }
         match request {
             Request::Ping => Response::Pong,
             Request::Status => self.status(),
@@ -1665,6 +1834,7 @@ impl Chat {
                     Err(err) => internal(err),
                 }
             }
+            Request::StartThread { conversation, message } => self.start_thread(conversation, message),
             Request::Profile { person, space } => self.profile(person, space),
             Request::ConversationInfo { conversation } => self.conversation_info(conversation),
             Request::SpaceInfo { space } => self.space_info(space),
@@ -1750,6 +1920,9 @@ impl Chat {
                 if let Err(err) = prepared {
                     return internal(err);
                 }
+                if retry {
+                    self.blobs.retried(&account, ids);
+                }
                 match self.blobs.request(&account, ids, adapter.clone()) {
                     Ok(files) => {
                         // What the cache has never heard of may be the adapter's to fetch itself.
@@ -1777,6 +1950,7 @@ impl Chat {
                 Response::Ok
             }
             Request::SignOut { account } => self.sign_out(account),
+            Request::TinyLocalServers => adapters::tiny::local_servers(),
             Request::TinyCommunity { account } => {
                 // Opening the server is the user asking: a socket another device replaced connects again.
                 self.command(&account, Command::Tiny(adapters::tiny::live::Ask::Look));
@@ -1791,6 +1965,13 @@ impl Chat {
                 let ids = [room_id.clone(), user_id.clone()];
                 self.tiny_call(&account, "community.calls.kick", &ids, |reply| adapters::tiny::live::Ask::Kick { room_id, user_id, reply })
             }
+            Request::TinyVerify { account, user_id, key, verified } => match crate::verified::set(&account, &user_id, &key, verified) {
+                Ok(()) => {
+                    self.hub.calls.reverify(&self.hub, &account);
+                    Response::Ok
+                }
+                Err(err) => error(ErrorCode::Refused, format!("That key couldn't be remembered: {err}")),
+            },
             Request::TinyInvite { account, role } => adapters::tiny::invite(account, role),
             Request::TinyRole { account, user_id, role } => adapters::tiny::set_role(account, user_id, role),
             Request::TinyRemove { account, user_id } => adapters::tiny::remove(account, user_id),
@@ -1800,6 +1981,82 @@ impl Chat {
             Request::TinySignOutEverywhere { account } => match adapters::tiny::end_sessions(&account) {
                 Ok(()) => self.sign_out(account),
                 Err(answer) => answer,
+            },
+            Request::TinyServerUpdate { account, edit } => adapters::tiny::manage::server_update(account, edit),
+            Request::TinyServerIcon { account, path } => adapters::tiny::manage::server_icon(account, path),
+            Request::TinyAvatar { account, path } => adapters::tiny::manage::user_avatar(account, path),
+            Request::TinyRoleCreate { account, role } => adapters::tiny::manage::role_create(account, role),
+            Request::TinyRoleUpdate { account, role_id, role } => adapters::tiny::manage::role_update(account, role_id, role),
+            Request::TinyRoleDelete { account, role_id } => adapters::tiny::manage::role_delete(account, role_id),
+            Request::TinyRoleOrder { account, role_ids } => adapters::tiny::manage::role_order(account, role_ids),
+            Request::TinyMemberRoles { account, user_id, role_ids } => adapters::tiny::manage::member_roles(account, user_id, role_ids),
+            Request::TinyMemberOwner { account, user_id, owner } => adapters::tiny::manage::member_owner(account, user_id, owner),
+            Request::TinyTimeout { account, user_id, until, reason } => adapters::tiny::manage::timeout(account, user_id, until, reason),
+            Request::TinyKick { account, user_id, reason } => adapters::tiny::manage::kick(account, user_id, reason),
+            Request::TinyBan { account, user_id, reason, expires_at } => adapters::tiny::manage::ban(account, user_id, reason, expires_at),
+            Request::TinyUnban { account, user_id } => adapters::tiny::manage::unban(account, user_id),
+            Request::TinyCategoryCreate { account, name } => adapters::tiny::manage::category_create(account, name),
+            Request::TinyCategoryRename { account, category_id, name } => adapters::tiny::manage::category_rename(account, category_id, name),
+            Request::TinyCategoryDelete { account, category_id } => adapters::tiny::manage::category_delete(account, category_id),
+            Request::TinyLayout { account, groups } => adapters::tiny::manage::layout(account, groups),
+            Request::TinyRoomCreateWith { account, room } => adapters::tiny::manage::room_create(account, room),
+            Request::TinyRoomUpdate { account, room_id, room } => adapters::tiny::manage::room_update(account, room_id, room),
+            Request::TinyOverrideSet { account, room_id, role_id, allow, deny } => adapters::tiny::manage::override_set(account, room_id, role_id, allow, deny),
+            Request::TinyOverrideClear { account, room_id, role_id } => adapters::tiny::manage::override_clear(account, room_id, role_id),
+            Request::TinyInviteWith { account, options } => adapters::tiny::manage::invite_with(account, options),
+            Request::TinyAudit { account, filter } => adapters::tiny::manage::audit(account, filter),
+            Request::TinyCallModerate { account, room_id, user_id, server_muted, server_deafened } => {
+                let mut needs = Vec::new();
+                if server_muted.is_some() {
+                    needs.push("community.calls.mute");
+                }
+                if server_deafened.is_some() {
+                    needs.push("community.calls.deafen");
+                }
+                if needs.is_empty() {
+                    return Response::Ok;
+                }
+                let ids = [room_id.as_str(), user_id.as_str()];
+                let ask = |reply| adapters::tiny::live::Ask::Moderate { room_id: room_id.clone(), user_id: user_id.clone(), server_muted, server_deafened, reply };
+                self.tiny_moderate(&account, &needs, &ids, ask)
+            }
+            Request::TinyCallMove { account, user_id, room_id } => {
+                let ids = [room_id.as_str(), user_id.as_str()];
+                let ask = |reply| adapters::tiny::live::Ask::Move { user_id: user_id.clone(), room_id: room_id.clone(), reply };
+                self.tiny_moderate(&account, &["community.calls.move"], &ids, ask)
+            }
+            // The key is the mediad's to act on; a priority key on a Tiny call is also the
+            // server's to hear, as `call.state`.
+            Request::CallTalk { held, priority } => match self.hub.calls.request(&self.hub, &MediaRequest::Talk { held, priority }) {
+                Ok(_) => {
+                    if let Some(call) = self.hub.calls.describe().0.filter(|call| call.conversation.network == Network::Tiny) {
+                        let on = held && priority;
+                        self.command(&call.conversation.account(), Command::Tiny(adapters::tiny::live::Ask::Priority { on }));
+                    }
+                    Response::Ok
+                }
+                Err(err) => call_error(err),
+            },
+            // Kept per account and person, and applied to the call at once if it is on that
+            // account. A call that is not up is no reason to refuse: the choice is kept.
+            Request::CallGain { account, user_id, percent, muted } => {
+                let key = settings::gain_key(&user_id);
+                let (scope, value) = (settings::account_scope(&account), settings::gain_value(percent, muted));
+                let allowed = value.as_deref().map_or_else(|| settings::known(&scope, &key), |value| settings::valid(&scope, &key, value));
+                if !allowed {
+                    return error(ErrorCode::Refused, "That volume can't be kept for them.");
+                }
+                if let Err(err) = self.hub.set_setting(&scope, &key, value) {
+                    return internal(err);
+                }
+                self.hub.calls.gain(&self.hub, &account, user_id, percent, muted);
+                Response::Ok
+            }
+            Request::CallStats => match self.hub.calls.request(&self.hub, &MediaRequest::Stats) {
+                Ok(protocol::MediaResponse::Stats(stats)) => Response::CallStats { stats },
+                Ok(protocol::MediaResponse::Refused { detail }) => error(ErrorCode::Unsupported, detail),
+                Ok(_) => error(ErrorCode::Unsupported, "This call can't report its connection."),
+                Err(err) => call_error(err),
             },
 
             Request::CallStart { conversation } => self.call_start(conversation),
@@ -1864,7 +2121,7 @@ impl Chat {
                 Ok((messages, bytes)) => Response::Prunable { messages, bytes },
                 Err(err) => internal(err),
             },
-            Request::TestMicrophone { on } => match self.hub.calls.test_microphone(&self.hub, on) {
+            Request::TestMicrophone { on, loopback } => match self.hub.calls.test_microphone(&self.hub, on, loopback) {
                 Ok(()) => Response::Ok,
                 Err(err) => call_error(err),
             },
@@ -1872,6 +2129,44 @@ impl Chat {
                 Ok(()) => Response::Ok,
                 Err(err) => call_error(err),
             },
+            Request::NotifyTest => {
+                if !crate::notify::enabled() {
+                    return Response::NotifyTested { posted: false, detail: crate::notify::DISABLED.to_owned() };
+                }
+                let (tell, told) = std::sync::mpsc::channel();
+                self.hub.notify(crate::notify::Event::Test(tell));
+                match told.recv_timeout(Duration::from_secs(5)) {
+                    Ok((posted, detail)) => Response::NotifyTested { posted, detail },
+                    Err(_) => Response::NotifyTested { posted: false, detail: "Notifications are not running in tinyclient's background service.".to_owned() },
+                }
+            }
+            Request::SaveLogs => {
+                let mut paths = Vec::new();
+                let Some(guard) = protocol::log_policy::current() else {
+                    return Response::LogsSaved { paths };
+                };
+                let policy = guard.policy();
+                if !policy.export_enabled() || !policy.ring_enabled() {
+                    return Response::LogsSaved { paths };
+                }
+                if let Ok(Some(path)) = guard.export_bundle() {
+                    paths.push(path.display().to_string());
+                }
+                if let Ok(protocol::MediaResponse::LogsSaved { path }) = self.hub.calls.request(&self.hub, &protocol::MediaRequest::SaveLogs) {
+                    if !path.is_empty() {
+                        paths.push(path);
+                    }
+                }
+                Response::LogsSaved { paths }
+            }
+            Request::PlaySound { sound } => {
+                let known = settings::SOUND_CHOICES.iter().chain(&settings::RING_CHOICES).any(|word| *word == sound && sound != "none");
+                if !known {
+                    return error(ErrorCode::NotFound, "no such sound");
+                }
+                self.hub.notify(crate::notify::Event::Play(sound));
+                Response::Ok
+            }
         }
     }
 }
@@ -1950,12 +2245,13 @@ fn serve_connection(chat: &Chat, mut stream: ChatStream) -> io::Result<()> {
 pub fn serve(listener: ChatListener, chat: Chat) -> io::Result<()> {
     let chat = Arc::new(chat);
     let _ = chat.this.set(Arc::downgrade(&chat));
+    crate::notify::start(chat.hub.clone(), Arc::downgrade(&chat));
     Chat::read_sessions(&chat, Network::ALL.to_vec(), true);
     loop {
         let stream = match listener.accept() {
             Ok(stream) => stream,
             Err(err) => {
-                eprintln!("chatd: accept: {err}");
+                tracing::warn!("chatd: accept: {err}");
                 std::thread::sleep(Duration::from_millis(100));
                 continue;
             }
@@ -1963,11 +2259,11 @@ pub fn serve(listener: ChatListener, chat: Chat) -> io::Result<()> {
         let chat = chat.clone();
         let spawned = std::thread::Builder::new().name("connection".into()).stack_size(256 * 1024).spawn(move || {
             if let Err(err) = serve_connection(&chat, stream) {
-                eprintln!("chatd: connection: {err}");
+                tracing::warn!("chatd: connection: {err}");
             }
         });
         if let Err(err) = spawned {
-            eprintln!("chatd: connection thread: {err}");
+            tracing::warn!("chatd: connection thread: {err}");
             std::thread::sleep(Duration::from_millis(100));
         }
     }
@@ -2087,6 +2383,46 @@ fn typed_profile(person: Person, mut about: About) -> Profile {
     profile
 }
 
+/// Slack `{channel}:{ts}` and Teams `{channel};messageid={root}`, when neither part is itself
+/// a thread id. A Discord id is a channel and is not derived.
+fn derivable_thread(conversation: &Key) -> Option<(String, String)> {
+    match conversation.network {
+        Network::Slack => {
+            let (channel, root) = conversation.id.split_once(':')?;
+            if channel.is_empty() || root.is_empty() || root.contains(':') {
+                return None;
+            }
+            Some((channel.to_owned(), root.to_owned()))
+        }
+        Network::Teams => {
+            let (channel, root) = conversation.id.split_once(";messageid=")?;
+            if channel.is_empty() || root.is_empty() || root.contains(";messageid=") {
+                return None;
+            }
+            Some((channel.to_owned(), root.to_owned()))
+        }
+        _ => None,
+    }
+}
+
+/// The first non-empty line, cut to `most` characters with an ellipsis when it ran over.
+fn first_line(text: &str, most: usize) -> String {
+    let first = text.lines().map(str::trim).find(|line| !line.is_empty()).unwrap_or("");
+    if first.chars().count() > most {
+        format!("{}…", first.chars().take(most).collect::<String>().trim_end())
+    } else {
+        first.to_owned()
+    }
+}
+
+/// A Discord thread name: whitespace flattened, at most 100 characters, never empty.
+fn thread_name(text: &str) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let name: String = flat.chars().take(100).collect();
+    let name = name.trim().to_owned();
+    if name.is_empty() { "Thread".to_owned() } else { name }
+}
+
 /// The link the shell uses to decide a network is on the rail. A live connection wins. When the
 /// adapter has not reported one, an account kept on screen (its session is unread, refused, or
 /// still in the keychain) stays as offline instead of disappearing.
@@ -2112,5 +2448,28 @@ mod tests {
         assert_eq!(published_link(Link::SignedOut, std::iter::empty()), Link::SignedOut);
         assert_eq!(published_link(Link::Connected, [Link::Offline]), Link::Connected);
         assert_eq!(published_link(Link::Expired, [Link::Offline]), Link::Expired);
+    }
+
+    #[test]
+    fn a_thread_id_names_its_parent_and_a_discord_name_is_one_line() {
+        use protocol::{AccountKey, Key, Network};
+        let key = |network, id: &str| Key::new(&AccountKey { network, account: "a".into() }, id);
+        assert_eq!(
+            super::derivable_thread(&key(Network::Slack, "C0:1.2")).as_ref().map(|(parent, root)| (parent.as_str(), root.as_str())),
+            Some(("C0", "1.2"))
+        );
+        assert_eq!(
+            super::derivable_thread(&key(Network::Teams, "19:c@thread.tacv2;messageid=9"))
+                .as_ref()
+                .map(|(parent, root)| (parent.as_str(), root.as_str())),
+            Some(("19:c@thread.tacv2", "9"))
+        );
+        assert_eq!(super::derivable_thread(&key(Network::Slack, "C0:1.2:3")), None);
+        assert_eq!(super::derivable_thread(&key(Network::Discord, "4101")), None);
+        assert_eq!(super::thread_name("  Hello\nthere"), "Hello there");
+        assert_eq!(super::thread_name("   "), "Thread");
+        assert_eq!(super::thread_name(&"x".repeat(150)).chars().count(), 100);
+        assert_eq!(super::first_line("Release train\nWho drives", 40), "Release train");
+        assert!(super::first_line("A post with no subject that goes on for quite a while", 40).ends_with('…'));
     }
 }

@@ -58,6 +58,12 @@ deb|deb-full)
         (cd "$tmp" && "$start/$base.AppImage" --appimage-extract >/dev/null)
         all_answer "$tmp/squashfs-root/usr/bin"
         desktop-file-validate "$tmp/squashfs-root/$id.desktop"
+        # The keyboard libraries the AppImage carries (packaging/linux.sh) are the ones tinyclient
+        # loads, though this system has its own.
+        for soname in libxkbcommon.so.0 libxkbcommon-x11.so.0 libxcb-xkb.so.1; do
+            ldd "$tmp/squashfs-root/usr/bin/tinyclient" | grep -q "$soname => $tmp/squashfs-root/usr/bin/../lib/$soname " ||
+                { echo "smoke.sh: the AppImage's tinyclient does not load its own $soname" >&2; ldd "$tmp/squashfs-root/usr/bin/tinyclient" >&2; exit 1; }
+        done
 
         # The .tar.gz, for a user with no root, then for everyone.
         useradd -m tester
@@ -69,7 +75,7 @@ deb|deb-full)
             tar -xzf /tmp/tinyclient.tar.gz
             tinyclient/install.sh
             test \"\$(~/.local/bin/tinyclient --version)\" = 'tinyclient $VERSION'
-            grep -q '^Exec=/home/tester/.local/lib/tinyclient/tinyclient$' ~/.local/share/applications/$id.desktop
+            grep -q '^Exec=/home/tester/.local/lib/tinyclient/tinyclient %u$' ~/.local/share/applications/$id.desktop
             desktop-file-validate ~/.local/share/applications/$id.desktop
             test -f ~/.local/share/icons/hicolor/16x16/apps/$id.png
             ~/.local/lib/tinyclient/install.sh --uninstall

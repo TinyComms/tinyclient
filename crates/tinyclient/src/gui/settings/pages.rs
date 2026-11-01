@@ -13,9 +13,11 @@ use crate::gui::layout::NETWORK_ORDER;
 use crate::gui::phone::{self, tokens::PhoneType};
 use crate::gui::theme::{self, Type};
 use gpui::{canvas, div, prelude::*, px, AnyElement, ClipboardItem, Context, Div, MouseButton, SharedString, Window};
+use crate::gui::hotkeys::{self, Action, Reach};
 use protocol::settings::{
-    self as keys, account_scope, Values, CACHE_MB, CACHE_MB_CHOICES, CUE_CONNECTION, CUE_JOINS, CUE_MINE, CUE_VOLUME, GLOBAL,
-    INPUT, JOIN_MUTED, KEEP_DAYS, KEEP_DAYS_CHOICES, KEEP_RUNNING, OUTPUT, RECEIPTS, SENSITIVITY, SOUNDS, TYPING, VOICE_VOLUME,
+    self as keys, account_scope, DeviceChoice, Values, AUTO_GAIN, CACHE_MB, CACHE_MB_CHOICES, CUE_CONNECTION, CUE_JOINS, CUE_MINE, CUE_VOLUME,
+    ECHO_CANCELLATION, GLOBAL, INPUT, JOIN_MUTED, KEEP_DAYS, KEEP_DAYS_CHOICES, KEEP_RUNNING, NOISE_SUPPRESSION, OUTPUT, PTT_RELEASE_CHOICES,
+    PTT_RELEASE_MS, PUSH_TO_TALK, RECEIPTS, SENSITIVITY, SOUNDS, TYPING, VOICE_VOLUME,
 };
 use protocol::{AccountStatus, Link, Network, Request, Response};
 use std::rc::Rc;
@@ -35,9 +37,12 @@ pub fn slider(id: &str) -> Slider {
     match id {
         // Text size: five stops, −1 to +3, stored as 0 to 4.
         "A2" => Slider { range: (0, 4), default: 1, read: || (theme::text_step() + 1) as u32, stops: Some(5), width: controls::TRACK, words: |v| format!("{} pt", 13 + v) },
+        "SV" => Slider { range: (0, 100), default: 70, read: || prefs::values().number(keys::ALERT_VOLUME), stops: None, width: controls::TRACK, words: percent },
         // Narrower than the others: its row also carries the test sound's button.
         "S10" => Slider { range: (0, 100), default: 50, read: || prefs::values().number(CUE_VOLUME), stops: None, width: 160., words: percent },
         "V5" => Slider { range: (0, 100), default: 100, read: || prefs::values().number(VOICE_VOLUME), stops: None, width: controls::TRACK, words: percent },
+        // Release delay: one stop for each of the six choices.
+        "V14" => Slider { range: (0, 5), default: 2, read: release_stop, stops: Some(6), width: controls::TRACK, words: release_words },
         _ => Slider { range: (0, 100), default: 25, read: || prefs::values().number(SENSITIVITY), stops: None, width: controls::METER, words: |v| v.to_string() },
     }
 }
@@ -46,12 +51,52 @@ pub fn store_slider(window: &mut SettingsWindow, id: &'static str, value: u32, c
     let key = match id {
         "A2" => return window.set_text_step(value as i32 - 1, cx),
         "S10" => CUE_VOLUME,
+        "SV" => keys::ALERT_VOLUME,
         "V5" => VOICE_VOLUME,
+        "V14" => {
+            let ms = PTT_RELEASE_CHOICES[(value as usize).min(PTT_RELEASE_CHOICES.len() - 1)];
+            let stored = (ms != Values::default_number(PTT_RELEASE_MS)).then(|| ms.to_string());
+            return window.set(id, GLOBAL.into(), PTT_RELEASE_MS, stored, cx);
+        }
         _ => SENSITIVITY,
     };
     // Only what differs from the default is stored.
     let stored = (value != Values::default_number(key)).then(|| value.to_string());
     window.set(id, GLOBAL.into(), key, stored, cx);
+}
+
+/// V14's stop for the release delay stored.
+fn release_stop() -> u32 {
+    let ms = prefs::values().number(PTT_RELEASE_MS);
+    PTT_RELEASE_CHOICES.iter().position(|choice| *choice == ms).unwrap_or(2) as u32
+}
+
+fn release_words(stop: u32) -> String {
+    match PTT_RELEASE_CHOICES.get(stop as usize) {
+        Some(1000) => "1 s".to_owned(),
+        Some(ms) => format!("{ms} ms"),
+        None => String::new(),
+    }
+}
+
+/// The key action a key row records.
+pub fn key_action(id: &str) -> Option<Action> {
+    Some(match id {
+        "V13" => Action::Talk,
+        "V15" => Action::Priority,
+        "V16" => Action::Mute,
+        "V17" => Action::Deafen,
+        _ => return None,
+    })
+}
+
+/// What the Keys group says the keys can reach on this system.
+fn keys_caption() -> &'static str {
+    match hotkeys::reach() {
+        Reach::Everywhere => "These keys work in any app, even with tinyclient in the background.",
+        Reach::Permission => "To work in other apps, these keys need Input Monitoring in System Settings › Privacy & Security.",
+        Reach::Window => "This system shows keys only to the app in front: they work while tinyclient's window is, and push to talk needs an X11 session.",
+    }
 }
 
 /// The length of the test sound (`Cue::Test`), for its button's playing state.
@@ -144,15 +189,20 @@ impl SettingsWindow {
         let column = controls::column().flex().flex_col();
         let groups: Vec<Div> = match self.section {
             Section::Accounts => return column.child(self.accounts(window, cx)),
-            Section::General => vec![
-                self.group(&["G2"], None, window, cx).child(caption(self.keep_running_caption())),
-                self.group(&["G4"], None, window, cx).child(caption(self.updates_caption())),
-            ],
-            Section::Sounds => vec![
-                self.group(&["S1"], None, window, cx),
-                self.group(&["S7", "S8", "S9", "S10"], Some("In calls"), window, cx)
-                    .child(caption("Call sounds play on your call speaker, quieter than voices. Voice volume is in Audio & video.")),
-            ],
+            Section::General => {
+                let mut groups = Vec::new();
+                if cfg!(target_os = "macos") {
+                    groups.push(self.group(&["G2"], None, window, cx).child(caption(self.keep_running_caption())));
+                }
+                groups.push(self.group(&["G4"], None, window, cx).child(caption(self.updates_caption())));
+                groups
+            }
+            Section::Notifications => self.notifications_page(window, cx),
+            Section::Sounds => {
+                let mut groups = vec![self.group(&["S1"], None, window, cx).child(caption("Which call sounds play, and how loud, is in Voice."))];
+                groups.extend(self.sound_groups(window, cx));
+                groups
+            }
             Section::Appearance => vec![
                 self.group(&["A2", "A3", "A4"], None, window, cx)
                     // The caption is about keyboard shortcuts, which a phone has none of.
@@ -169,13 +219,37 @@ impl SettingsWindow {
                 groups
             }
             Section::Audio => vec![
-                self.group(&["V1", "V3"], Some("Microphone"), window, cx),
+                self.group(&["V1"], Some("Microphone"), window, cx).child(caption("How your microphone opens, its level and its processing are in Voice.")),
                 self.group(&["V2", "V5"], Some("Speaker"), window, cx)
                     .child(caption("Picking a device in a call's menu changes that call only. These are the defaults.")),
                 self.group(&["V4"], Some("Joining"), window, cx),
             ],
+            Section::Voice => {
+                let values = prefs::values();
+                let push = values.on(PUSH_TO_TALK);
+                let mut input = vec!["V8", "V3", "V18"];
+                let mode = if push {
+                    input.push("V14");
+                    if values.hotkey(keys::PTT_KEY).is_none() {
+                        "Pick a push-to-talk key below: until then your microphone never opens."
+                    } else {
+                        "Your microphone opens while the key is held. A room that requires push to talk uses it, whatever you pick here."
+                    }
+                } else {
+                    "A room that requires push to talk uses it, whatever you pick here."
+                };
+                input.push("V19");
+                vec![
+                    self.group(&input, None, window, cx).child(caption(mode)),
+                    self.group(&["V13", "V15", "V16", "V17"], Some("Keys"), window, cx).child(caption(keys_caption())),
+                    self.group(&["V10", "V11", "V12"], Some("Processing"), window, cx)
+                        .child(caption("Echo cancellation takes out what your speakers play, so others don't hear themselves when you talk without headphones.")),
+                    self.group(&["S7", "S8", "S9", "S10"], Some("Call sounds"), window, cx)
+                        .child(caption("Call sounds play on your call speaker, quieter than voices. Voice volume is in Audio & video.")),
+                ]
+            }
             Section::Storage => vec![self.group(&["D1", "D2", "D3"], None, window, cx).child(caption("Sign-ins, drafts and settings are not part of this."))],
-            Section::Shortcuts => return column.child(self.shortcuts("")),
+            Section::Shortcuts => return column.child(self.shortcuts("", cx)),
             Section::About => return column.child(self.about(window, cx)),
         };
         let banner = self.banner(cx);
@@ -184,15 +258,19 @@ impl SettingsWindow {
 
     /// A banner over sections whose rows chatd keeps, when chatd does not answer.
     fn banner(&self, cx: &mut Context<Self>) -> Option<Div> {
-        let chatd = matches!(self.section, Section::General | Section::Sounds | Section::Privacy | Section::Audio | Section::Storage);
+        let chatd = matches!(self.section, Section::General | Section::Notifications | Section::Sounds | Section::Privacy | Section::Audio | Section::Voice | Section::Storage);
         let denied = self.section == Section::Audio && self.devices.as_ref().is_some_and(|d| d.microphone == "denied");
+        let unwatched = self.section == Section::Voice && hotkeys::reach() == Reach::Permission;
         let (icon, words, action): (&'static str, &'static str, Option<(&'static str, &'static str)>) = if chatd && !self.reachable(cx) {
             ("icons/wifi-off.svg", "Can't reach tinyclient's background service. These settings return when it does.", None)
         } else if denied {
+            let (words, action) = Self::microphone_denied();
+            ("icons/mic-off.svg", words, action)
+        } else if unwatched {
             (
-                "icons/mic-off.svg",
-                "tinyclient can't use the microphone. Allow it in System Settings › Privacy & Security › Microphone.",
-                Some(("Open System Settings", "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")),
+                "icons/key.svg",
+                "Your voice keys work only in tinyclient until you allow Input Monitoring for it.",
+                Some(("Open System Settings", "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent")),
             )
         } else {
             return None;
@@ -246,6 +324,22 @@ impl SettingsWindow {
         }
     }
 
+    fn microphone_denied() -> (&'static str, Option<(&'static str, &'static str)>) {
+        if cfg!(target_os = "macos") {
+            (
+                "tinyclient can't use the microphone. Allow it in System Settings › Privacy & Security › Microphone.",
+                Some(("Open System Settings", "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")),
+            )
+        } else if cfg!(windows) {
+            (
+                "tinyclient can't use the microphone. Allow it in Settings › Privacy & security › Microphone.",
+                Some(("Open Settings", "ms-settings:privacy-microphone")),
+            )
+        } else {
+            ("tinyclient can't use the microphone. Allow it for tinyclient in your system's privacy settings.", None)
+        }
+    }
+
     fn keep_running_caption(&self) -> &'static str {
         if prefs::values().on(KEEP_RUNNING) {
             "Closing the window leaves tinyclient running. Quit with ⌘Q to stop it."
@@ -279,7 +373,7 @@ impl SettingsWindow {
             }
             "S1" => {
                 let on = values.on(SOUNDS);
-                let second = (!on).then(|| "Calls make no sounds. Your choices below are kept.".to_owned());
+                let second = (!on).then(|| "Notifications arrive silently and calls make no sounds. Your choices below are kept.".to_owned());
                 self.switch_row(id, on, true, second, move |this, on, cx| this.set_switch(id, SOUNDS, on, true, cx), cx)
             }
             "S7" | "S8" | "S9" => {
@@ -292,8 +386,9 @@ impl SettingsWindow {
                 self.switch_row(id, on, true, None, move |this, on, cx| this.set_switch(id, key, on, true, cx), cx)
             }
             "S10" => {
-                let output = self.devices.as_ref().map(|d| d.default_output.clone()).unwrap_or_default();
-                let device = values.device(OUTPUT).unwrap_or(output);
+                let choice = values.device_choice(OUTPUT);
+                let listed = self.devices.as_ref().and_then(|d| d.means(&choice, Picker::Output)).map(|d| d.name.clone());
+                let device = listed.or_else(|| choice.name().map(str::to_owned)).unwrap_or_default();
                 let playing = self.playing.is_some();
                 let tip = match (playing, device.is_empty()) {
                     (true, _) => "Playing test sound".to_owned(),
@@ -331,8 +426,8 @@ impl SettingsWindow {
                 self.switch_row(id, choices.previews, true, second, |this, on, cx| this.choose(|c| c.previews = on, cx), cx)
             }
             "M1" => {
-                let second = if choices.command_return { "Return adds a line." } else { "⇧Return adds a line." };
-                self.segmented_row(id, &["Return", "⌘Return"], usize::from(choices.command_return), 0, Some(second.to_owned()), |this, ix, cx| this.choose(|c| c.command_return = ix == 1, cx), cx)
+                let second = crate::gui::shortcuts::label(if choices.command_return { "Return adds a line." } else { "⇧Return adds a line." });
+                self.segmented_row(id, &["Return", "⌘Return"], usize::from(choices.command_return), 0, Some(second), |this, ix, cx| this.choose(|c| c.command_return = ix == 1, cx), cx)
             }
             "M2" => self.segmented_row(id, &["First unread", "Newest message"], usize::from(choices.newest), 0, None, |this, ix, cx| this.choose(|c| c.newest = ix == 1, cx), cx),
             "M3" => self.switch_row(id, choices.typing, true, None, |this, on, cx| this.choose(|c| c.typing = on, cx), cx),
@@ -360,9 +455,39 @@ impl SettingsWindow {
                 let at = KEEP_DAYS_CHOICES.iter().position(|d| *d == days).unwrap_or(2);
                 self.segmented_row(id, &["7 days", "30 days", "90 days"], at, 2, None, move |this, ix, cx| this.pick_retention(KEEP_DAYS_CHOICES[ix], cx), cx)
             }
-            "P1" | "P2" => return self.per_account_rows(id, cx),
+            "P1" | "P2" => return self.per_account_rows(id, cx).unwrap_or_else(div),
             "V1" | "V2" => self.device_row(id, cx),
             "V3" => self.meter_row(cx),
+            "V8" => {
+                let push = values.on(PUSH_TO_TALK);
+                self.segmented_row(id, &["Voice activation", "Push to talk"], usize::from(push), 0, None, move |this, ix, cx| this.set_switch(id, PUSH_TO_TALK, ix == 1, false, cx), cx)
+            }
+            "V14" => wide_row(label, None, self.slider_control(id, cx)),
+            "V19" => {
+                let on = values.on(keys::MUTED_TALK);
+                let second = Some("Your microphone listens while you're muted, only to say so. Nothing is sent.".to_owned());
+                self.switch_row(id, on, true, second, move |this, on, cx| this.set_switch(id, keys::MUTED_TALK, on, true, cx), cx)
+            }
+            "V18" => {
+                let second = Some("Plays your microphone back as others would hear it. Not during a call.".to_owned());
+                self.switch_row(id, self.loopback, false, second, |this, on, cx| this.set_loopback(on, cx), cx)
+            }
+            "V10" | "V11" | "V12" => {
+                let key = match id {
+                    "V10" => ECHO_CANCELLATION,
+                    "V11" => NOISE_SUPPRESSION,
+                    _ => AUTO_GAIN,
+                };
+                let on = values.on(key);
+                let second = match (id, on) {
+                    ("V10", false) => Some("Wear headphones, or others hear themselves when you talk."),
+                    ("V11", false) => Some("Fans, typing and traffic go through as they are."),
+                    ("V12", false) => Some("Your voice is sent at the level your microphone gives."),
+                    _ => None,
+                };
+                self.switch_row(id, on, true, second.map(str::to_owned), move |this, on, cx| this.set_switch(id, key, on, true, cx), cx)
+            }
+            "V13" | "V15" | "V16" | "V17" => return self.key_row(id, cx),
             "V6" => wide_row(label, None, self.slider_control(id, cx)),
             "V5" => wide_row(label, None, self.slider_control(id, cx)),
             "V4" => {
@@ -391,15 +516,19 @@ impl SettingsWindow {
             "B1" => row(
                 label,
                 Some(crate::host::DIAGNOSTICS.into()),
-                controls::touch(button("B1", ButtonKind::Secondary, "Copy")).on_click(cx.listener(|this, _, _, cx| this.copy_diagnostics(cx))),
+                div().flex().gap(px(8.)).child(
+                    controls::touch(button("B1", ButtonKind::Secondary, "Copy")).on_click(cx.listener(|this, _, _, cx| this.copy_diagnostics(cx))),
+                ).child(
+                    controls::touch(button("B1-log", ButtonKind::Secondary, "Save debug log")).on_click(cx.listener(|this, _, _, cx| this.save_debug_log(cx))),
+                ),
             ),
             "B2" => row(
                 label,
                 None,
                 button("B2", ButtonKind::Secondary, crate::host::REVEAL).on_click(cx.listener(|_, _, _, cx| {
-                    let log = protocol::support_dir().join(protocol::launch::CHATD_LOG);
-                    if log.exists() {
-                        cx.reveal_path(&log);
+                    let logs = protocol::log_policy::logs_dir();
+                    if logs.is_dir() {
+                        cx.reveal_path(&logs);
                     } else {
                         cx.open_with_system(&protocol::support_dir());
                     }
@@ -413,7 +542,7 @@ impl SettingsWindow {
                     cx.notify();
                 })),
             ),
-            _ => div(),
+            _ => self.notify_row(id, cx).unwrap_or_else(div),
         };
         let _ = window;
         let lit = self.highlight == Some(id);
@@ -456,13 +585,13 @@ impl SettingsWindow {
         });
     }
 
-    fn set_switch(&mut self, row: &'static str, key: &'static str, on: bool, default: bool, cx: &mut Context<Self>) {
+    pub(super) fn set_switch(&mut self, row: &'static str, key: &'static str, on: bool, default: bool, cx: &mut Context<Self>) {
         let stored = (on != default).then(|| if on { "on" } else { "off" }.to_owned());
         self.set(row, GLOBAL.into(), key, stored, cx);
     }
 
     /// A row whose whole width toggles its switch, with the reset slot before it.
-    fn switch_row(
+    pub(super) fn switch_row(
         &mut self,
         id: &'static str,
         on: bool,
@@ -498,7 +627,7 @@ impl SettingsWindow {
 
     /// Two to four choices, ← → moving between them when it has the keys.
     #[allow(clippy::too_many_arguments)]
-    fn segmented_row(
+    pub(super) fn segmented_row(
         &mut self,
         id: &'static str,
         choices: &[&'static str],
@@ -555,7 +684,7 @@ impl SettingsWindow {
     }
 
     /// The track, its value and its reset, for slider `id`.
-    fn slider_control(&mut self, id: &'static str, cx: &mut Context<Self>) -> Div {
+    pub(super) fn slider_control(&mut self, id: &'static str, cx: &mut Context<Self>) -> Div {
         let spec = slider(id);
         let stored = (spec.read)();
         let value = self.pending.get(id).copied().unwrap_or(stored);
@@ -627,18 +756,34 @@ impl SettingsWindow {
             return vec![div().flex().flex_col().child(group_label("Let others see")).child(caption("Sign in to an account to choose what it shares.").pt(px(0.)))];
         }
         let _ = window;
-        let typing = div().flex().flex_col().child(group_label(label_of("P1"))).child(self.per_account_rows("P1", cx));
-        let receipts = div()
-            .pt(px(20.))
-            .flex()
-            .flex_col()
-            .child(group_label(label_of("P2")))
-            .child(self.per_account_rows("P2", cx))
-            .child(caption("Discord and Slack have no read receipts."));
-        vec![typing, receipts]
+        let mut groups = Vec::new();
+        if let Some(rows) = self.per_account_rows("P1", cx) {
+            groups.push(div().flex().flex_col().child(group_label(label_of("P1"))).child(rows));
+        }
+        let receipts = self.per_account_rows("P2", cx);
+        let gap = if groups.is_empty() { 0. } else { 20. };
+        match receipts {
+            Some(rows) => groups.push(
+                div()
+                    .pt(px(gap))
+                    .flex()
+                    .flex_col()
+                    .child(group_label(label_of("P2")))
+                    .child(rows)
+                    .child(caption("Discord and Slack have no read receipts.")),
+            ),
+            None if accounts.iter().any(|account| matches!(account.key.network, Network::Discord | Network::Slack)) => {
+                groups.push(div().pt(px(gap)).flex().flex_col().child(group_label(label_of("P2"))).child(caption("Discord and Slack have no read receipts.")));
+            }
+            None if accounts.iter().all(|account| account.key.network == Network::Tiny) => {
+                groups.push(div().flex().flex_col().child(caption("Tiny does not share typing or read receipts from tinyclient.").pt(px(0.))));
+            }
+            None => {}
+        }
+        groups
     }
 
-    fn per_account_rows(&mut self, id: &'static str, cx: &mut Context<Self>) -> Div {
+    fn per_account_rows(&mut self, id: &'static str, cx: &mut Context<Self>) -> Option<Div> {
         let values = prefs::values();
         let accounts = accounts(self, cx);
         let several = |network: Network| accounts.iter().filter(|a| a.key.network == network).count() > 1;
@@ -651,6 +796,7 @@ impl SettingsWindow {
                 ("P1", Network::Telegram) | ("P2", Network::Telegram) => (Some("Always on"), Some("Telegram does not let an app turn this off.")),
                 ("P1", Network::Signal) | ("P2", Network::Signal) => (Some("Set on your phone"), Some("Signal takes this from your phone's settings.")),
                 ("P1", Network::Messages) => (Some("Sent to the phone"), Some("Messages shows typing on your other devices.")),
+                ("P2", Network::Messages) => (Some("On your devices"), Some("Messages does not let tinyclient change read receipts.")),
                 ("P2", Network::Discord | Network::Slack) | ("P1" | "P2", Network::Tiny) => continue,
                 _ => (None, None),
             };
@@ -711,27 +857,43 @@ impl SettingsWindow {
             card = card.when(drawn > 0, |card| card.child(rule())).child(line);
             drawn += 1;
         }
+        if drawn == 0 {
+            return None;
+        }
         let failed = (self.failed == Some(id)).then(|| div().px(px(12.)).pb(px(8.)).type_small().text_color(theme::danger()).child(failure_words(id, true)));
-        card.when(self.waits_on_chatd(id, cx), |card| card.opacity(0.4)).children(failed)
+        Some(card.when(self.waits_on_chatd(id, cx), |card| card.opacity(0.4)).children(failed))
     }
 
     /// The menu button of a device picker (V1, V2). As wide as what it says, 120 to 240; the
     /// whole name is in its tooltip and in the menu.
     fn device_row(&mut self, id: &'static str, cx: &mut Context<Self>) -> Div {
         let (key, picker, noun) = if id == "V1" { (INPUT, Picker::Input, "microphone") } else { (OUTPUT, Picker::Output, "speaker") };
-        let stored = prefs::values().device(key);
+        let choice = prefs::values().device_choice(key);
+        let stored = (choice != DeviceChoice::Auto).then_some(());
         let devices = self.devices.clone().unwrap_or_default();
-        let (listed, default) = if id == "V1" { (&devices.inputs, &devices.default_input) } else { (&devices.outputs, &devices.default_output) };
-        let gone = stored.as_ref().is_some_and(|name| self.devices.is_some() && !listed.contains(name));
-        let (shown, whole) = match &stored {
-            Some(name) if gone => (format!("{name} (not connected)"), format!("{name} (not connected)")),
-            Some(name) => (name.clone(), name.clone()),
-            None if listed.is_empty() && self.devices.is_some() => (format!("No {noun} found"), format!("No {noun} found")),
-            None if default.is_empty() => ("System default".to_owned(), "System default".to_owned()),
-            // The device the default is now is the menu's to say: here it only crowds the name.
-            None => ("System default".to_owned(), format!("System default: {default}")),
+        let listed = devices.listed(picker);
+        let means = devices.means(&choice, picker).map(|d| d.name.clone());
+        let gone = matches!(choice, DeviceChoice::Device { .. }) && self.devices.is_some() && means.is_none();
+        let virtual_picked = devices.means(&choice, picker).is_some_and(|d| d.is_virtual);
+        let (shown, whole) = match &choice {
+            DeviceChoice::Device { name, .. } if gone => (format!("{name} (not connected)"), format!("{name} (not connected)")),
+            DeviceChoice::Device { name, .. } => {
+                let name = means.clone().unwrap_or_else(|| name.clone());
+                (name.clone(), if virtual_picked { format!("{name} (virtual)") } else { name })
+            }
+            _ if listed.is_empty() && self.devices.is_some() => (format!("No {noun} found"), format!("No {noun} found")),
+            // The device it means now is the menu's to say: here it only crowds the name.
+            DeviceChoice::System => ("System default".to_owned(), means.map_or("System default".to_owned(), |name| format!("System default: {name}"))),
+            DeviceChoice::Auto => ("Automatic".to_owned(), means.map_or("Automatic".to_owned(), |name| format!("Automatic: {name}"))),
         };
-        let second = gone.then(|| "Calls use the system default until it is back.".into());
+        let stand_in = devices.means(&DeviceChoice::Auto, picker).map_or("another device".to_owned(), |d| d.name.clone());
+        let second = if gone {
+            Some(format!("Calls use {stand_in} until it is back, then switch back by themselves.").into())
+        } else if choice == DeviceChoice::Auto && listed.iter().any(|d| d.default && d.is_virtual) {
+            Some("The system default is a virtual device, so calls use your hardware. Pick it to use it.".into())
+        } else {
+            None
+        };
         let anchors = self.anchors.clone();
         let anchor: &'static str = if id == "V1" { "V1-menu" } else { "V2-menu" };
         let label = label_of(id);
@@ -768,36 +930,63 @@ impl SettingsWindow {
                 }
             }));
         let reset = stored.as_ref().map(|_| {
-            reset_button(SharedString::from(format!("{id}-reset")), format!("Reset {label} to the system default").into())
+            reset_button(SharedString::from(format!("{id}-reset")), format!("Reset {label} to automatic").into())
                 .on_click(cx.listener(move |this, _, _, cx| this.set(id, GLOBAL.into(), key, None, cx)))
         });
         row(label, second, div().flex().items_center().child(reset_slot(reset)).child(picker_button))
     }
 
-    /// A picker's choices in menu order, by the value stored and the words shown: the system
-    /// default first, then every device listed, then the stored one if it is not connected.
+    /// A picker's choices in menu order, by the value stored and the words shown: Automatic,
+    /// System default, the hardware, the virtual devices, then the chosen one if it is not
+    /// connected.
     pub(super) fn picker_choices(&self, picker: Picker) -> Vec<(Option<String>, String)> {
         let devices = self.devices.clone().unwrap_or_default();
-        let (listed, default, key) = match picker {
-            Picker::Input => (devices.inputs, devices.default_input, INPUT),
-            Picker::Output => (devices.outputs, devices.default_output, OUTPUT),
+        let listed = devices.listed(picker);
+        let key = if picker == Picker::Input { INPUT } else { OUTPUT };
+        let now = |choice: DeviceChoice, words: &str| match devices.means(&choice, picker) {
+            Some(device) => format!("{words} ({})", device.name),
+            None => words.to_owned(),
         };
-        let system = if default.is_empty() { "System default".to_owned() } else { format!("System default ({default})") };
-        let mut choices = vec![(None, system)];
-        let stored = prefs::values().device(key);
-        let missing = stored.filter(|name| !listed.contains(name));
-        choices.extend(listed.into_iter().map(|name| (Some(name.clone()), name)));
-        choices.extend(missing.map(|name| (Some(name.clone()), format!("{name} (not connected)"))));
+        let mut choices = vec![(None, now(DeviceChoice::Auto, "Automatic")), (DeviceChoice::System.value(), now(DeviceChoice::System, "System default"))];
+        let device = |d: &protocol::AudioDevice| {
+            let words = if d.is_virtual { format!("{} (virtual)", d.name) } else { d.name.clone() };
+            (DeviceChoice::device(&d.name, &d.id).value(), words)
+        };
+        choices.extend(listed.iter().filter(|d| !d.is_virtual).map(device));
+        choices.extend(listed.iter().filter(|d| d.is_virtual).map(device));
+        let choice = prefs::values().device_choice(key);
+        if let DeviceChoice::Device { name, .. } = &choice {
+            if devices.means(&choice, picker).is_none() {
+                choices.push((choice.value(), format!("{name} (not connected)")));
+            }
+        }
         choices
     }
 
+    /// Which of [`Self::picker_choices`] is the one chosen.
+    pub(super) fn picker_checked(&self, picker: Picker) -> usize {
+        let key = if picker == Picker::Input { INPUT } else { OUTPUT };
+        let choice = prefs::values().device_choice(key);
+        let devices = self.devices.clone().unwrap_or_default();
+        let listed = devices.listed(picker);
+        match &choice {
+            DeviceChoice::Auto => 0,
+            DeviceChoice::System => 1,
+            DeviceChoice::Device { .. } => {
+                let ordered = listed.iter().filter(|d| !d.is_virtual).chain(listed.iter().filter(|d| d.is_virtual));
+                let found = ordered.clone().position(|d| choice.is(d, listed));
+                2 + found.unwrap_or(ordered.count())
+            }
+        }
+    }
+
     pub(super) fn device_menu(&mut self, picker: Picker, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let (key, anchor) = match picker {
-            Picker::Input => (INPUT, "V1-menu"),
-            Picker::Output => (OUTPUT, "V2-menu"),
+        let anchor = match picker {
+            Picker::Input => "V1-menu",
+            Picker::Output => "V2-menu",
         };
         let bounds = self.anchors.borrow().get(anchor).copied()?;
-        let stored = prefs::values().device(key);
+        let checked = self.picker_checked(picker);
         let choices = self.picker_choices(picker);
         let cursor = self.menu_cursor.min(choices.len().saturating_sub(1));
         // As wide as the system's names, up to 440, so two devices that differ only at the end
@@ -807,7 +996,7 @@ impl SettingsWindow {
             if ix == 1 {
                 items = items.child(menu_separator());
             }
-            let item = menu_item_check(("device", ix), stored == value, words, None)
+            let item = menu_item_check(("device", ix), ix == checked, words, None)
                 .when(ix == cursor, |item| item.bg(theme::selected()))
                 .on_click(cx.listener(move |this, _, window, cx| this.pick_device(picker, value.clone(), window, cx)));
             items = items.child(item);
@@ -845,7 +1034,13 @@ impl SettingsWindow {
                     this.toggle_test(cx);
                 }
             }));
-        let second = if testing { "Speak normally. Green is what others would hear." } else { "Below the line nothing is sent and your speaking ring stays off." };
+        let push = prefs::values().on(PUSH_TO_TALK);
+        let second = match (testing, push) {
+            (true, false) => "Speak normally. Green is what others would hear.",
+            (true, true) => "Speak normally. In push to talk the key opens your microphone, not the line.",
+            (false, false) => "Below the line nothing is sent and your speaking ring stays off.",
+            (false, true) => "In push to talk the line does nothing; it is used when you go back to voice activation.",
+        };
         let label = |words: &'static str| div().w(px(96.)).type_ui().text_color(theme::text()).child(words);
         let meter = div()
             .id("V3-meter")
@@ -864,6 +1059,109 @@ impl SettingsWindow {
             // sits under the meter and the value ends where every other value does.
             .child(div().flex().items_center().child(label("Sensitivity")).child(div().flex_1()).child(self.slider_control("V6", cx)))
             .child(div().pt(px(2.)).type_small().text_color(theme::text_soft()).child(second))
+    }
+
+    /// V13, V15 to V17: a key recorder (design 3.8). Click, then press a key, a key with
+    /// modifiers, a modifier alone, or the middle or a side mouse button; Esc cancels and ⌫
+    /// clears. A key another action has is refused in words and the old one stays.
+    fn key_row(&mut self, id: &'static str, cx: &mut Context<Self>) -> Div {
+        let label = label_of(id);
+        let Some(action) = key_action(id) else {
+            return div();
+        };
+        let bound = prefs::values().hotkey(action.key());
+        let recording = self.recording == Some(id);
+        let shown: AnyElement = match (recording, bound) {
+            (true, _) => div().type_ui().text_color(theme::text()).child("Press a key…").into_any_element(),
+            (false, Some(binding)) => keycap(binding.label()).into_any_element(),
+            (false, None) => div().type_ui().text_color(theme::text_faint()).child("Click to record").into_any_element(),
+        };
+        let mut field = div()
+            .id(SharedString::from(format!("{id}-key")))
+            .w(px(140.))
+            .h(px(28.))
+            .px(px(8.))
+            .rounded(px(theme::R_CONTROL))
+            .border_1()
+            .border_color(if recording { theme::accent() } else { theme::border() })
+            .flex()
+            .items_center()
+            .cursor_pointer()
+            .tab_index(0)
+            .role(gpui::Role::Button)
+            .aria_label(SharedString::from(format!("{label}: {}", bound.map_or("none".to_owned(), |b| b.label()))))
+            .focus_visible(|style| style.shadow(theme::focus_ring()))
+            .child(shown)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                if this.recording == Some(id) {
+                    this.stop_recording(cx);
+                } else {
+                    this.start_recording(id, window, cx);
+                }
+            }));
+        if recording {
+            field = field
+                .track_focus(&self.recorder_focus)
+                .on_key_down(cx.listener(move |this, event: &gpui::KeyDownEvent, _, cx| {
+                    if this.recording != Some(id) {
+                        return;
+                    }
+                    cx.stop_propagation();
+                    match event.keystroke.key.as_str() {
+                        "escape" => this.stop_recording(cx),
+                        "backspace" if !event.keystroke.modifiers.modified() => this.recorded(None, cx),
+                        _ => {
+                            if let Some(binding) = hotkeys::binding_of(&event.keystroke) {
+                                this.recorded(Some(binding), cx);
+                            }
+                        }
+                    }
+                }))
+                .on_modifiers_changed(cx.listener(move |this, event: &gpui::ModifiersChangedEvent, _, cx| {
+                    if this.recording != Some(id) {
+                        return;
+                    }
+                    let now = event.modifiers;
+                    if now.modified() {
+                        let held = &mut this.held_modifiers;
+                        held.control |= now.control;
+                        held.alt |= now.alt;
+                        held.shift |= now.shift;
+                        held.platform |= now.platform;
+                    } else {
+                        // Let go with no other key: the modifier alone is the key.
+                        let alone = hotkeys::modifier_binding(std::mem::take(&mut this.held_modifiers));
+                        if alone.is_some() {
+                            this.recorded(alone, cx);
+                        }
+                    }
+                }));
+        }
+        let reset = bound.map(|_| {
+            reset_button(SharedString::from(format!("{id}-reset")), format!("Clear {label}").into()).on_click(cx.listener(move |this, _, _, cx| {
+                this.stop_recording(cx);
+                this.set(id, GLOBAL.into(), action.key(), None, cx);
+            }))
+        });
+        let side = bound.is_some_and(|b| matches!(b.key, protocol::hotkey::Key::Mouse4 | protocol::hotkey::Key::Mouse5)) && !hotkeys::side_buttons();
+        let second = match action {
+            Action::Priority => Some("Push to talk that also asks to be heard over everyone, where you hold priority speech."),
+            _ if side => Some("This system doesn't show the mouse's side buttons to apps. Pick a key."),
+            _ => None,
+        };
+        let clash = self.clash.as_ref().filter(|(row, _)| *row == id).map(|(_, words)| div().px(px(12.)).pb(px(8.)).type_small().text_color(theme::danger()).child(words.clone()));
+        let failed = self.failed.filter(|row| *row == id).map(|row| div().px(px(12.)).pb(px(8.)).type_small().text_color(theme::danger()).child(failure_words(row, self.reachable(cx))));
+        let waiting = self.waits_on_chatd(id, cx);
+        let lit = self.highlight == Some(id);
+        div()
+            .flex()
+            .flex_col()
+            .rounded(px(theme::R_CARD))
+            .when(lit, |row| row.bg(theme::selected()))
+            .when(waiting, |row| row.opacity(0.4))
+            .child(row(label, second.map(SharedString::from), div().flex().items_center().child(reset_slot(reset)).child(field)))
+            .children(clash)
+            .children(failed)
     }
 
     /// D1: what tinyclient keeps on this Mac, as a two-part bar.
@@ -999,6 +1297,34 @@ impl SettingsWindow {
         });
     }
 
+    fn save_debug_log(&mut self, cx: &mut Context<Self>) {
+        self.off_thread(cx, || {
+            let mut paths = Vec::new();
+            if let Some(guard) = protocol::log_policy::current() {
+                if let Ok(Some(path)) = guard.export_bundle() {
+                    paths.push(path.display().to_string());
+                }
+            }
+            if let Ok(Response::LogsSaved { paths: more }) = crate::client::ask(&Request::SaveLogs) {
+                paths.extend(more);
+            }
+            paths
+        }, |this, paths, cx| {
+            let note = if paths.is_empty() {
+                "Debug logs are turned off.".to_owned()
+            } else {
+                protocol::log_policy::logs_dir().join("bundles").display().to_string()
+            };
+            this.log_note = Some((std::time::Instant::now(), note));
+            cx.notify();
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(std::time::Duration::from_secs(4)).await;
+                let _ = this.update(cx, |_, cx| cx.notify());
+            })
+            .detach();
+        });
+    }
+
     fn copy_diagnostics(&mut self, cx: &mut Context<Self>) {
         let Some(shell) = self.shell.upgrade() else {
             return;
@@ -1017,11 +1343,28 @@ impl SettingsWindow {
     }
 
     /// The Shortcuts section, or its lines that match `query`.
-    pub(super) fn shortcuts(&self, query: &str) -> Div {
+    pub(super) fn shortcuts(&self, query: &str, cx: &gpui::App) -> Div {
         let mut column = div().flex().flex_col();
         if query.is_empty() {
             column = column.child(caption(crate::host::SHORTCUTS_CAPTION).pt(px(0.)).pb(px(14.)));
         }
+        let (open_in, places) = self.shell.upgrade().map(|shell| {
+            let shell = shell.read(cx);
+            let open_in = shell.open.as_ref().map(|key| format!("Open in {}", key.network.label()));
+            let modes = shell.places();
+            let names = modes
+                .into_iter()
+                .skip(2)
+                .take(7)
+                .map(|mode| match mode {
+                    crate::gui::sidebar::Mode::Network(network) => network.label().to_owned(),
+                    crate::gui::sidebar::Mode::Space(key) => shell.spaces.iter().find(|space| space.key == key).map(|space| space.name.clone()).unwrap_or(key.id),
+                    crate::gui::sidebar::Mode::Inbox => "Inbox".to_owned(),
+                    crate::gui::sidebar::Mode::People => "People".to_owned(),
+                })
+                .collect::<Vec<_>>();
+            (open_in, rows::place_keys(&names))
+        }).unwrap_or_else(|| (None, Vec::new()));
         let found = rows::shortcuts(query);
         let mut menus: Vec<&str> = Vec::new();
         for shortcut in &found {
@@ -1029,13 +1372,27 @@ impl SettingsWindow {
                 menus.push(shortcut.menu);
             }
         }
+        let query_folded = query.trim().to_lowercase();
+        let place_hits: Vec<&rows::PlaceKey> = places.iter().filter(|place| !query_folded.is_empty() && place.command.to_lowercase().contains(&query_folded)).collect();
         for (ix, name) in menus.iter().enumerate() {
             let mut card = card();
-            for (n, shortcut) in found.iter().filter(|s| s.menu == *name).enumerate() {
+            let mut n = 0;
+            for shortcut in found.iter().filter(|s| s.menu == *name) {
+                if *name == "View" && shortcut.command == "Quick Switcher" {
+                    for place in places.iter().filter(|place| query_folded.is_empty() || place.command.to_lowercase().contains(&query_folded)) {
+                        let keys = div().flex().gap(px(2.)).child(keycap(place.keys));
+                        card = card.when(n > 0, |card| card.child(rule())).child(
+                            div().h(px(32.)).px(px(12.)).flex().items_center().child(div().flex_1().type_ui().text_color(theme::text()).child(place.command.clone())).child(keys),
+                        );
+                        n += 1;
+                    }
+                }
+                let command = if shortcut.command == "Open in App" { open_in.clone().unwrap_or_else(|| shortcut.command.to_owned()) } else { shortcut.command.to_owned() };
                 let keys = div().flex().gap(px(2.)).child(keycap(shortcut.keys));
                 card = card.when(n > 0, |card| card.child(rule())).child(
-                    div().h(px(32.)).px(px(12.)).flex().items_center().child(div().flex_1().type_ui().text_color(theme::text()).child(shortcut.command)).child(keys),
+                    div().h(px(32.)).px(px(12.)).flex().items_center().child(div().flex_1().type_ui().text_color(theme::text()).child(command)).child(keys),
                 );
+                n += 1;
             }
             // In search results each group says where it is, as every other result does.
             let label = if query.is_empty() {
@@ -1045,6 +1402,18 @@ impl SettingsWindow {
             };
             let gap = if query.is_empty() { 20. } else { 12. };
             column = column.child(div().when(ix > 0, |group| group.pt(px(gap))).flex().flex_col().child(label).child(card));
+        }
+        // A rail place is not a static shortcut row. A search for its name still lists it.
+        if !place_hits.is_empty() && !found.iter().any(|shortcut| shortcut.menu == "View" && shortcut.command == "Quick Switcher") {
+            let mut card = card();
+            for (n, place) in place_hits.iter().enumerate() {
+                let keys = div().flex().gap(px(2.)).child(keycap(place.keys));
+                card = card.when(n > 0, |card| card.child(rule())).child(
+                    div().h(px(32.)).px(px(12.)).flex().items_center().child(div().flex_1().type_ui().text_color(theme::text()).child(place.command.clone())).child(keys),
+                );
+            }
+            let label = div().pl(px(12.)).pb(px(4.)).type_small().text_color(theme::text_faint()).child("Shortcuts › View");
+            column = column.child(div().flex().flex_col().child(label).child(card));
         }
         column
     }
@@ -1094,7 +1463,11 @@ impl SettingsWindow {
     }
 
     fn about(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
-        let version = format!("Version {}", env!("CARGO_PKG_VERSION"));
+        // The commit tells two builds of the same version apart.
+        let version = match crate::update::short_commit() {
+            Some(commit) => format!("Version {} ({commit})", env!("CARGO_PKG_VERSION")),
+            None => format!("Version {}", env!("CARGO_PKG_VERSION")),
+        };
         let plate = div()
             .size(px(96.))
             .rounded(px(22.))
@@ -1141,8 +1514,21 @@ impl SettingsWindow {
         let found: Vec<&'static Row> = rows::search(&query).into_iter().filter(|row| !phone::active() || super::on_phone(row.section)).collect();
         // A phone has no keyboard shortcuts to find.
         let keys = if phone::active() { Vec::new() } else { rows::shortcuts(&query) };
+        let folded = query.trim().to_lowercase();
+        let place_hit = folded.len() >= 2 && self.shell.upgrade().is_some_and(|shell| {
+            let shell = shell.read(cx);
+            shell.places().into_iter().skip(2).take(7).any(|mode| {
+                let name = match mode {
+                    crate::gui::sidebar::Mode::Network(network) => network.label().to_owned(),
+                    crate::gui::sidebar::Mode::Space(key) => shell.spaces.iter().find(|space| space.key == key).map(|space| space.name.clone()).unwrap_or(key.id),
+                    crate::gui::sidebar::Mode::Inbox => "Inbox".to_owned(),
+                    crate::gui::sidebar::Mode::People => "People".to_owned(),
+                };
+                name.to_lowercase().contains(&folded)
+            })
+        });
         let mut column = controls::column().flex().flex_col().gap(px(12.));
-        if found.is_empty() && (keys.is_empty() || query.trim().len() < 2) {
+        if found.is_empty() && !place_hit && (keys.is_empty() || query.trim().len() < 2) {
             let honest = rows::not_yet(&query);
             return column.child(
                 div()
@@ -1156,6 +1542,7 @@ impl SettingsWindow {
                     .children(honest.map(|line| div().type_ui().text_color(theme::text_soft()).child(line))),
             );
         }
+        let honest = (!found.is_empty()).then(|| rows::not_yet(&query)).flatten();
         for row in found {
             let breadcrumb = div()
                 .id(SharedString::from(format!("crumb-{}", row.id)))
@@ -1170,10 +1557,10 @@ impl SettingsWindow {
             let live = if rows::draws_label(row.id) { card().child(self.control_row(row.id, window, cx)) } else { self.control_row(row.id, window, cx) };
             column = column.child(div().flex().flex_col().gap(px(4.)).child(breadcrumb).child(live));
         }
-        if !keys.is_empty() && query.trim().len() >= 2 {
-            column = column.child(self.shortcuts(&query));
+        if place_hit || (!keys.is_empty() && query.trim().len() >= 2) {
+            column = column.child(self.shortcuts(&query, cx));
         }
-        column
+        column.children(honest.map(|line| div().px(px(12.)).type_ui().text_color(theme::text_soft()).child(line)))
     }
 }
 

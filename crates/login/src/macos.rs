@@ -101,7 +101,8 @@ define_class!(
             error: &NSError,
         ) {
             if load_failed(&error.domain().to_string(), error.code()) {
-                eprintln!("tinyclient-login: the page did not load: {}", error.localizedDescription());
+                // The WebKit sentence often includes the page URL. Keep the class only.
+                tracing::warn!(class = "network", "login failed");
                 std::process::exit(LOAD_FAILED);
             }
         }
@@ -201,7 +202,7 @@ pub fn run(site: Site, at: Option<(f64, f64)>) {
         }
         on_client.set(web_client(&at).then(|| on_client.get().unwrap_or_else(Instant::now)));
         if on_client.get().is_some_and(|since| since.elapsed() >= NO_TOKEN_AFTER) {
-            eprintln!(
+            tracing::warn!(
                 "tinyclient-login: signed in to Slack, but the browser holds no token to read after \
                  {} seconds; Enterprise Grid organizations are known to do this",
                 NO_TOKEN_AFTER.as_secs()
@@ -215,7 +216,7 @@ pub fn run(site: Site, at: Option<(f64, f64)>) {
             if let Some(page) = page {
                 let (url, text) = (page["url"].as_str().unwrap_or(""), page["text"].as_str().unwrap_or(""));
                 if blocked(url, text) && !refused.replace(true) {
-                    eprintln!("tinyclient-login: the organization does not allow this sign-in");
+                    tracing::warn!("tinyclient-login: the organization does not allow this sign-in");
                 }
             }
         });

@@ -2,7 +2,7 @@
 
 Mockups: `mockups/07-calls.html` (frame numbers below refer to it). Requirements: `../product/06-calls.md`.
 
-**One idea.** Every call state on every network lives in one place: the **call dock** at the bottom of the sidebar. Ringing out, ringing in, connecting, in a call and failed are five faces of the same 300 px card. A voice call is that card and nothing else; the 212 px "call surface" card in today's shell goes away. Video is one surface at the top of the conversation pane, and only when asked for.
+**One idea.** Every call state on every network lives in one place: the **call dock** at the bottom of the sidebar. Ringing out, ringing in, connecting, in a call and failed are five faces of the same 300 px card. A voice call is that card and nothing else; the 212 px "call surface" card in today's shell goes away. **Video is a Tiny call** (§6). Discord voice is audio only and is joined from the server list.
 
 **Why the dock is at the bottom of the sidebar, not the top of the conversation.** The conversation pane changes on every navigation and belongs to whatever is open; the sidebar does not. A call in Lounge has nothing to do with the Slack channel I am reading, so it should not sit in that channel's header. The dock is also directly under the voice-channel tree it came from, and it never pushes messages down. Cost: the conversation list loses 112 px while a call exists, and only then.
 
@@ -33,19 +33,19 @@ One pill in the conversation header, 30 px high, radius 15, 12 px side padding, 
 | Native, voice channel | `raised` fill, `volume` | **Join voice** | "Join Lounge. People there will see you arrive." |
 | Native, a call is already running | `accent_soft` fill, `accent` text | **Join call · 3** | "Iris, Jun and 1 more are in this call" |
 | This conversation's call is mine | `danger_soft`, `phone-off` | **Leave** (ringing/connecting: **Cancel**) | "Leave the call  ⌘⇧H" |
-| Hand-off | no fill, 1 px `hairline_strong` border, `text_soft`; the **network's own icon** 14 px, then label, then `arrow-up-right` 12 px `text_faint` | **Open in Teams** · **Open huddle in Slack** · **Open in Telegram** · **Open in Discord** | "Teams calls open in the Teams app. tinyclient doesn't carry them." / "Huddles open in Slack. Press the headphones there to join." |
-| None (a Discord text channel) | no button | | |
+| Hand-off | no fill, 1 px `hairline_strong` border, `text_soft`; the **network's own icon** 14 px, then label, then `arrow-up-right` 12 px `text_faint` | **Open in Teams** · **Open huddle in Slack** · **Open in Telegram** · **Open in Discord** · **Open in Messages** | "Teams calls open in the Teams app. tinyclient doesn't carry them." / "Huddles open in Slack. Press the headphones there to join." |
+| None (a Discord text channel, or Signal, where calls are not built) | no button | | |
 
-The hand-off reads as deliberate because it is a different object: outlined, branded, with an out-arrow and a destination in its name. It never says "Call". If the official app is missing, a 32 px line appears under the header: "Teams isn't installed. **Open in browser ↗**". There is no separate video or share button in the header: camera and share are turned on inside a call. Pressing Call while in another call asks in the dock first ("Leave Lounge and call Mara Okafor?"). A voice channel joins from its header pill, its hover **Join** pill, or a double-click; a single click only opens its chat, because joining is seen by everyone there.
+The hand-off reads as deliberate because it is a different object: outlined, branded, with an out-arrow and a destination in its name. It never says "Call". If the official app is missing, a 32 px line appears under the header: "Teams isn't installed. **Open in browser ↗**". There is no separate video or share button in the header: camera and share are turned on inside a call. Pressing Call while in another call asks in the dock first ("Leave Lounge and call Mara Okafor?"). A voice channel joins from its header pill, its hover **Join** pill, or a double-click; a single click only opens its chat, because joining is seen by everyone there. Discord voice is audio only and is joined from the server list.
 
 ## 2. The call dock and bar (frames 2–5, 7)
 
 Dock: full sidebar width (316), 8 px padding, 1 px `hairline` top border, present only when a call state exists. Card: 300 wide, radius 12, `raised` fill, 1 px `hairline` border, 10 px padding, 8 px row gap. **Height 96** (dock 112). Optional 32 px strips stack on top inside the card.
 
 - **Row 1, 36 px, the title row.** 28 px avatar (person: round, in a 4 px speaking-ring slot; voice channel: 28 px square, radius 8, `positive_soft` fill, `volume` glyph in `positive`). Title 13 px semibold. Sub-line 11.5 px `text_soft`: network icon 11 px + context + state. Right side: the peer's `mic-off` glyph (DM), or an avatar stack (group, channel): up to three 20 px avatars overlapping 6 px, then "+N". Click the row: open that conversation ("Go to Lounge"). Click the stack: participant list.
-- **Row 2, 32 px, controls.** Icon buttons 40 × 32, radius 8, 4 px gap, 16 px glyphs, left to right: mute, deafen, share, camera, devices. A flexible gap, then Leave, 48 × 32, at the right edge. Controls a stage or a network cannot do are absent, not greyed: stage 2 shows mute, deafen, devices, Leave.
+- **Row 2, the controls.** Joined controls share one row equally and wrap as a set: mute, deafen, share, camera, devices, Leave. Share and camera are included only on a Tiny room that allows video. Each button grows to the same width. The place name wraps on the line under the title. The elapsed clock sits with the signal bars and the security slot, not beside the name. Controls a stage or a network cannot do are absent, not greyed: stage 2 shows mute, deafen, devices, Leave.
 
-Sub-line wording: `Ringing… 0:12` · `Connecting…` · `Discord · 12:04` (DM) · `tinyclient-dev · 4:31` (channel: server name) · `Reconnecting… 0:08` (`warning`) · `Call ended · 12:04`. The sub-line's tooltip in a Discord call: "End-to-end encrypted by Discord". Left alone in a DM call: `Mara left · 12:40`; tinyclient does not hang up for me.
+Sub-line wording: `Ringing… 0:12` · `Connecting…` · `Discord · 12:04` (DM) · `tinyclient-dev · 4:31` (channel: server name) · `Reconnecting…` (`warning`) · `Call ended · 12:04`. A Tiny call does not count down time left. The sub-line's tooltip in a Discord call: "End-to-end encrypted by Discord". Discord DAVE seals Opus only. Left alone in a DM call: `Mara left · 12:40`; tinyclient does not hang up for me.
 
 | Control | Rest | On | Tooltip / shortcut |
 |---|---|---|---|
@@ -59,6 +59,12 @@ Sub-line wording: `Ringing… 0:12` · `Connecting…` · `Discord · 12:04` (DM
 Hover on any rest state: `selected` fill, `text` glyph. Disabled: 40 % opacity, no hover; used while reconnecting (all but Leave) and for a moderator's mute ("Muted by a moderator in Lounge"). Ringing and connecting show only mute and devices (both may be preset) and a text **Cancel** button (32 high, `danger_soft`).
 
 **Shortcuts** work in any tinyclient window: ⌘⇧M mute, ⌘⇧D deafen, ⌘⇧H leave or cancel, ⌘⇧A accept, ⌘⇧R decline, ⌘⇧J jump to the call's conversation. Mute can also be system-wide: off by default, a Settings switch ("Mute works while tinyclient is in the background"), registered only while a call exists. Layout and navigation arbitrates any clash with these.
+
+**On a Tiny server** the user panel sits under the dock (`10-tiny-server.md` §1). Over that server's column the dock is the compact bar: signal bars, `Voice connected`, the place (`Lounge / Night Shift`), the security slot, and Leave. Anywhere else the same call is the full card.
+
+### 2a. You're muted
+
+While muted in a call that is up, a Tiny stage shows a `danger_fill` pill over the call bar, "You're muted · ⌘⇧M to talk" (`10-tiny-server.md`). The dock says the same on its sub-line.
 
 ## 3. Outgoing and failed (frames 2, 8)
 
@@ -89,17 +95,31 @@ Ringing shows who, an elapsed counter and Cancel, in the dock; the header pill b
 - **Honest limit:** Discord reports speaking only on the voice connection I joined. Other channels show who is there and their mute, deafen, share and camera state, never a ring.
 - **Participant list** (popover from the avatar stack; the roster for group calls and whenever the tree is not on screen): 280 wide, 32 px rows, 22 px avatars, the same glyphs and ring, header "LOUNGE · 21 PEOPLE", ten rows visible then it scrolls as a virtual list.
 
-## 6. The video surface (frame 6)
+## 6. The picture in a Tiny channel
 
-- **Opt-in.** A share or camera never opens by itself. A 32 px strip on top of the bar says "Dev Patel is sharing their screen" with a **Watch** pill (22 px high); two shares: "2 people are sharing" · **Choose…**; cameras: "Mara Okafor's camera is on" · **Watch**. Watch starts the one decode.
-- **Where.** Top of the conversation pane under the header, in whatever conversation is open: it belongs to the call. Margins 20 px side, 16 px top. Card: radius 12, black fill, 1 px `hairline`, 6 px bezel, the picture aspect-fit inside, then a **32 px caption strip**: 18 px avatar, "**Dev Patel's screen** · Lounge", and at the right Pop out (`picture-in-picture-2`) and Stop watching (`x`), 28 × 24 each. No control is drawn over the picture.
-- **Size.** Default: 16:9 at pane width, at most 45 % of pane height, at least 160 px. The bottom edge is a 6 px drag zone; the height is remembered. **Pop out** moves the same surface to its own window (still one decode); the pane keeps a 36 px line, "Watching in its own window · **Bring back**". Full screen is that window's green button (⌃⌘F). Double-click the picture: pop out.
-- **Precedence.** The surface shows what I last chose. A watched share ending closes the surface, or falls back to cameras if I was watching cameras before. While watching cameras it follows the active speaker, switching at most once every 2 s. A share starting never replaces what I am watching; the strip offers it. Choosing a second share replaces the first.
-- **My share.** Share opens the macOS system picker (screen or one window). While sharing: the button is on, and an `accent_soft` strip tops the bar: "You're sharing Zed — mod.rs" · **Stop**. macOS shows its own indicator. I do not see a preview of my own share. Permission missing: nothing starts and the strip reads, in `warning`, "tinyclient can't record the screen. Allow it in System Settings › Privacy & Security › Screen & System Audio Recording." · **Open System Settings**. Camera on is the button state alone; no self-view.
+**Video is a Tiny call.** Share and Camera appear on the dock, and on the channel's call bar, only while a Tiny room that allows video is joined. Any other joined call refuses them: "Screen sharing and video are not built yet. This call carries voice only."
+
+On a Tiny voice channel the stage is the grid of tiles in `10-tiny-server.md`. The call sends and receives one H.264 picture, drawn in that channel (the share, otherwise the active speaker's camera). It does not follow you into another network's conversation. Sending a camera is Windows only. Elsewhere the engine says "A camera isn't available on this system yet. You can still share your screen." Screen share is Windows, macOS, and Linux X11. A Wayland session with no X11 display cannot share: "This session has no X11 display, so the screen can't be shared."
+
+Watch is opt-in for that picture. A share or camera never opens the picture by itself.
+
+When the server offers `e2ee_calls`, the client seals Opus and the H.264 picture and leaves the one-byte NAL header clear. Discord DAVE seals Opus only.
+
+Settings has no camera device row (`09`).
 
 ## 7. Device menu (frame 7)
 
 Popover above the devices button, 300 wide, radius 12, 6 px padding, `popover` fill, 1 px border, one shadow. MICROPHONE: radio rows 30 px (14 px radio, `accent` when chosen), "System default *MacBook Pro Microphone*" first. Then a level meter: twelve 4 px segments, 2 px gaps, `positive` when lit, labelled "Input level"; it stays live while muted so the mic can be tested, with "Muted: others can't hear you" as the label. SPEAKER: the same rows, then **Play test sound** and a link, **Call settings…** (defaults live in Settings). A device unplugged mid-call: the call continues on the system default and the sub-line reads "Now using MacBook Pro Microphone" for 4 s.
+
+## 7a. Processing and reconnect
+
+Echo cancellation, noise suppression, and automatic gain are switches and default on. While echo cancellation is off, a Tiny channel still says to wear headphones.
+
+A Tiny call that loses its media resumes three times in two minutes, pausing 1 s, then 2 s, then 3 s. The sub-line and the channel banner say `Reconnecting…`. They do not count down time left. The link grade on the signal bars is `positive`, `warning` at Fair, and `danger` at Poor (`10-tiny-server.md`).
+
+## 7b. What the call seals
+
+When the server offers `e2ee_calls`, the client seals Opus and the H.264 picture and leaves the one-byte NAL header clear. Discord DAVE seals Opus only. The security slot is the call's one indicator of that protection (`gui/call/security.rs`); a call that says nothing about protection draws none.
 
 ## 8. Ending and what remains (frames 4, 8, 9)
 
@@ -122,14 +142,14 @@ Voice channels leave no rows. A failed call leaves its card in the dock, not a r
 
 ## GPUI notes
 
-- **What repaints.** The duration and ringing counters: one text element, once a second, stopped while the window is hidden. A speaking ring: one avatar's border color, on a flip only; mediad sends edges with a 250 ms hold so it cannot flicker, about 4 repaints a second per talker at worst. The level meter: 10 Hz, only while the device menu is open. The video surface: at the stream's frame rate, in its own element. Nothing else in a call animates; idle stays idle.
+- **What repaints.** The duration and ringing counters: one text element, once a second, stopped while the window is hidden. A speaking ring: one avatar's border color, on a flip only; mediad sends edges with a 250 ms hold so it cannot flicker, about 4 repaints a second per talker at worst. The level meter: 10 Hz, only while the device menu is open. The one H.264 picture: at the stream's frame rate, in its own element in the Tiny channel. Nothing else in a call animates; idle stays idle.
 - The ring slot (2 px gap + 2 px border) is always laid out with a transparent border, so a ring switching on moves nothing. Tree and participant list are uniform lists of fixed-height rows.
 - The dock is a flex-none child at the end of the sidebar column; the list above it shrinks.
-- The 6 px bezel exists because a video surface may not clip to rounded corners. If it can, drop it.
+- The one received picture is drawn in the Tiny channel (`10-tiny-server.md`), not as a card that follows the open conversation.
 - Strips, the incoming card and failures are the same card with different children: one component.
 - The share picker and both permission prompts are the system's; tinyclient draws none of them. Whether the system picker avoids the blanket Screen Recording permission is unverified.
 - Notification action buttons show only when the user's style for tinyclient is Alerts; under Banners they sit behind "Options". First run should say so. Unverified on current macOS.
 
 ## Deliberately absent
 
-A gallery or grid; a self-view; any control over the picture; a ringtone or call sounds of our own; a pulsing ring, waveform or animated meter; a full-window call screen; a card for voice-only calls; greyed-out buttons for things not built; a second simultaneous call; per-person volume (later, as a row menu in the participant list); noise suppression, soundboard, recording, captions, reactions; a menu-bar item; a custom screen picker with thumbnails; connection-quality bars; auto-rejoin after a failure; auto-opening a share; any in-call state before the network confirms the join.
+A gallery or grid outside a Tiny stage; a self-view; any control over the picture; a ringtone or call sounds of our own; a pulsing ring, waveform or animated meter; a full-window call screen; a card for voice-only calls; greyed-out buttons for things not built; a second simultaneous call; soundboard, recording, captions, reactions; a menu-bar item; a custom screen picker with thumbnails; auto-rejoin after a failure (a Tiny blip resumes three times in two minutes, §7a); auto-opening a share; any in-call state before the network confirms the join.

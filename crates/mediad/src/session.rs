@@ -14,11 +14,11 @@ use crate::media::{self, FromMedia, MICROPHONE_DENIED};
 use crate::permission::{microphone, Microphone};
 use crate::rtp::{self, Cipher, Sender};
 use crate::out;
-use protocol::{CallFailure, Cue, MediaResponse, TinySlot, Tuning, VoiceJoin};
+use protocol::{AudioProcessing, CallFailure, CallStats, Cue, InputMode, MediaResponse, TinyPicture, TinySlot, Tuning, VoiceJoin};
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap};
 use std::net::UdpSocket;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender as Reports};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -81,6 +81,29 @@ pub struct Controls {
     pub(crate) tiny_link: Mutex<Option<crate::tiny::Link>>,
     /// A Tiny server's newest slot map, not yet applied.
     pub(crate) tiny_slots: Mutex<Option<Vec<TinySlot>>>,
+    /// The camera and the share the user asked for, and whether the one picture is watched.
+    share: AtomicBool,
+    camera: AtomicBool,
+    watch: AtomicBool,
+    /// An answer to the renegotiation offer, or an empty SDP when the server refused it.
+    picture_answer: Mutex<Option<String>>,
+    /// Who the one video slot carries. `None` inside means the server sent no picture.
+    picture_slot: Mutex<Option<Option<TinyPicture>>>,
+    /// A Tiny server call's end-to-end encryption (`e2ee`), shared by chatd's requests and the
+    /// call's loop.
+    pub(crate) tiny_e2ee: Mutex<crate::e2ee::E2ee>,
+    /// How the microphone opens. `None` until chatd says: voice activation at the tuning's gate.
+    input: Mutex<Option<InputMode>>,
+    /// The push-to-talk keys.
+    keys: Mutex<crate::talk::Keys>,
+    /// Each person's volume for me, and who holds priority speech.
+    ear: Mutex<crate::hear::Ear>,
+    /// Echo cancellation, noise suppression, automatic gain. `None` until chatd says: off.
+    processing: Mutex<Option<AudioProcessing>>,
+    /// What our voice is encoded at, in kb/s. 0: the call's own default.
+    bitrate: AtomicU32,
+    /// The connection over the last second, from the loop that carries the call.
+    stats: Mutex<Option<CallStats>>,
 }
 
 impl Controls {
@@ -121,6 +144,49 @@ impl Controls {
         *self.tiny_slots.lock().unwrap() = Some(map);
     }
 
+    pub fn set_share(&self, on: bool) {
+        self.share.store(on, Ordering::Relaxed);
+    }
+
+    pub fn share(&self) -> bool {
+        self.share.load(Ordering::Relaxed)
+    }
+
+    pub fn set_camera(&self, on: bool) {
+        self.camera.store(on, Ordering::Relaxed);
+    }
+
+    pub fn camera(&self) -> bool {
+        self.camera.load(Ordering::Relaxed)
+    }
+
+    pub fn set_watch(&self, on: bool) {
+        self.watch.store(on, Ordering::Relaxed);
+    }
+
+    pub fn watch(&self) -> bool {
+        self.watch.load(Ordering::Relaxed)
+    }
+
+    /// The answer to the last renegotiation, taken once by the call's loop.
+    pub fn picture_answer(&self, sdp: String) {
+        *self.picture_answer.lock().unwrap() = Some(sdp);
+    }
+
+    pub(crate) fn take_picture_answer(&self) -> Option<String> {
+        self.picture_answer.lock().unwrap().take()
+    }
+
+    /// Who the video slot carries now. The outer `Some` means the server said; the inner is
+    /// `None` when it sent `video: null`.
+    pub fn set_picture(&self, picture: Option<TinyPicture>) {
+        *self.picture_slot.lock().unwrap() = Some(picture);
+    }
+
+    pub(crate) fn take_picture(&self) -> Option<Option<TinyPicture>> {
+        self.picture_slot.lock().unwrap().take()
+    }
+
     /// The devices chosen so far, for a call that opens them now. Any choice waiting for the
     /// media loop is part of it.
     pub(crate) fn take_chosen(&self) -> Devices {
@@ -143,8 +209,10 @@ impl Controls {
         let wanted = match cue {
             Cue::Test => true,
             Cue::Joined | Cue::Left => tuning.joins && !self.deafened.load(Ordering::Relaxed),
+            // Our own room changed: as a join, but heard while deafened, since it is ours.
+            Cue::Moved => tuning.joins,
             Cue::Muted | Cue::Unmuted | Cue::Deafened | Cue::Undeafened => tuning.mine,
-            Cue::Lost | Cue::Back => tuning.connection,
+            Cue::Lost | Cue::Back | Cue::Disconnected => tuning.connection,
         };
         if wanted {
             *self.cue.lock().unwrap() = Some(cue);
@@ -161,6 +229,75 @@ impl Controls {
         if let Some(cue) = mine(was, (muted, deafened)) {
             self.cue(cue);
         }
+    }
+
+    pub fn set_input(&self, mode: InputMode) {
+        *self.input.lock().unwrap() = Some(mode);
+    }
+
+    /// How the microphone opens now.
+    pub fn input(&self) -> InputMode {
+        self.input.lock().unwrap().unwrap_or(InputMode::Voice { threshold: self.tuning().gate })
+    }
+
+    /// A push-to-talk key went down or up.
+    pub fn talk(&self, held: bool, priority: bool) {
+        self.keys.lock().unwrap().press(held, priority, std::time::Instant::now());
+    }
+
+    pub fn keys(&self) -> crate::talk::Keys {
+        *self.keys.lock().unwrap()
+    }
+
+    /// One person's volume for me. 100 % and heard is forgotten, as never named.
+    pub fn gain(&self, user_id: String, percent: u16, muted: bool) {
+        let mut ear = self.ear.lock().unwrap();
+        if percent == 100 && !muted {
+            ear.gains.remove(&user_id);
+        } else {
+            ear.gains.insert(user_id, (percent.min(protocol::GAIN_MAX), muted));
+        }
+    }
+
+    pub fn priority(&self, user_ids: Vec<String>) {
+        self.ear.lock().unwrap().priority = user_ids;
+    }
+
+    /// Everyone's volume and who holds priority, for one tick's mix.
+    pub fn ear(&self) -> crate::hear::Ear {
+        self.ear.lock().unwrap().clone()
+    }
+
+    pub fn set_processing(&self, processing: AudioProcessing) {
+        *self.processing.lock().unwrap() = Some(processing);
+    }
+
+    pub fn processing(&self) -> Option<AudioProcessing> {
+        *self.processing.lock().unwrap()
+    }
+
+    pub fn set_bitrate(&self, kbps: u32) {
+        self.bitrate.store(kbps, Ordering::Relaxed);
+    }
+
+    /// The bitrate asked for, in bits a second; `None` for the call's default.
+    pub fn bitrate(&self) -> Option<i32> {
+        let kbps = self.bitrate.load(Ordering::Relaxed);
+        (kbps > 0).then(|| (kbps.clamp(6, 510) * 1000) as i32)
+    }
+
+    pub fn publish_stats(&self, stats: CallStats) {
+        *self.stats.lock().unwrap() = Some(stats);
+    }
+
+    /// The connection as last measured; `None` before media has flowed for a second.
+    pub fn stats(&self) -> Option<CallStats> {
+        self.stats.lock().unwrap().clone()
+    }
+
+    /// Whether a cue is waiting to be played.
+    pub fn cue_waiting(&self) -> bool {
+        self.cue.lock().unwrap().is_some()
     }
 
     /// The call moved to another voice server or session: the voice thread takes it from here.
@@ -284,7 +421,7 @@ impl Call {
     /// connection starts DAVE from a fresh key package, whatever came before).
     fn move_to(&mut self, next: VoiceJoin) {
         self.stop_media();
-        eprintln!("mediad: the call moved to {}", next.endpoint);
+        tracing::warn!("mediad: the call moved to {}", next.endpoint);
         self.join = next;
         self.seq_ack = None;
         self.transport = None;
@@ -315,7 +452,7 @@ impl Call {
         let port = d["port"].as_u64().and_then(|n| u16::try_from(n).ok()).ok_or_else(malformed)?;
         let offered: Vec<String> = d["modes"].as_array().into_iter().flatten().filter_map(text).collect();
         let Some(mode) = rtp::choose_mode(&offered) else {
-            eprintln!("mediad: no transport mode in common; offered {offered:?}");
+            tracing::warn!("mediad: no transport mode in common; offered {offered:?}");
             return Err(End::Fatal(CallFailure::Encryption, NO_CIPHER.to_owned()));
         };
 
@@ -365,7 +502,7 @@ impl Call {
             .filter_map(|byte| byte.as_u64().and_then(|b| u8::try_from(b).ok()))
             .collect();
         let (Some(seal), Some(open)) = (Cipher::new(mode, &key), Cipher::new(mode, &key)) else {
-            eprintln!("mediad: the voice server chose {mode:?} with a {} byte key", key.len());
+            tracing::warn!("mediad: the voice server chose {mode:?} with a {} byte key", key.len());
             return Err(End::Fatal(CallFailure::Encryption, NO_CIPHER.to_owned()));
         };
         let version = number(&d["dave_protocol_version"]).unwrap_or(0) as u16;
@@ -409,7 +546,7 @@ impl Call {
             .name("media".to_owned())
             .spawn(move || media::run(setup))
             .map_err(|err| {
-                eprintln!("mediad: the media thread did not start: {err}");
+                tracing::warn!("mediad: the media thread did not start: {err}");
                 End::Fatal(CallFailure::Engine, ENGINE.to_owned())
             })?;
         self.media = Some(Media { stop, thread });
@@ -564,7 +701,7 @@ impl Call {
                 Ok(Incoming::Json { op, d }) => self.json(socket, op, d),
                 Ok(Incoming::Binary { op, payload }) => self.binary(socket, op, &payload),
                 Ok(Incoming::Closed(code)) => {
-                    eprintln!("mediad: the voice server closed the socket ({code:?})");
+                    tracing::warn!("mediad: the voice server closed the socket ({code:?})");
                     return match closed(code) {
                         Closed::Resume => End::Dropped(Why::Silent, format!("the voice server closed the connection ({code:?})")),
                         Closed::Ended => End::Ended,
@@ -648,7 +785,7 @@ impl Call {
 /// does not return (`out::fail` exits).
 pub fn run(join: VoiceJoin, controls: Arc<Controls>) {
     let (Ok(user), Ok(room)) = (join.user_id.parse::<u64>(), join.channel_id.parse::<u64>()) else {
-        eprintln!("mediad: the voice session's ids are not numbers ({:?}, {:?})", join.user_id, join.channel_id);
+        tracing::warn!("mediad: the voice session's ids are not numbers ({:?}, {:?})", join.user_id, join.channel_id);
         out::fail(CallFailure::Refused, UNUSABLE);
     };
     if join.dave.required && join.dave.max_version.min(dave::MAX_VERSION) == 0 {
@@ -704,7 +841,7 @@ pub fn run(join: VoiceJoin, controls: Arc<Controls>) {
                 out::fail(CallFailure::Lost, DROPPED);
             }
             resumes += 1;
-            eprintln!("mediad: resume {resumes} of {RESUMES}");
+            tracing::warn!("mediad: resume {resumes} of {RESUMES}");
             out::send(&MediaResponse::Interrupted);
             // Heard once per drop, not once per try.
             if resumes == 1 {
@@ -721,7 +858,7 @@ pub fn run(join: VoiceJoin, controls: Arc<Controls>) {
                 out::fail(CallFailure::Lost, words);
             }
             attempt += 1;
-            eprintln!("mediad: joining {}, try {attempt} of {ATTEMPTS}", call.join.endpoint);
+            tracing::warn!("mediad: joining {}, try {attempt} of {ATTEMPTS}", call.join.endpoint);
             BACKOFF * (attempt - 1)
         };
         match call.wait(pause, false) {
@@ -738,7 +875,7 @@ pub fn run(join: VoiceJoin, controls: Arc<Controls>) {
             End::Fatal(reason, detail) => out::fail(reason, detail),
             End::Moved => {}
             End::Removed => {
-                eprintln!("mediad: the voice server dropped us; waiting {MOVE:?} to hear where the call moved");
+                tracing::warn!("mediad: the voice server dropped us; waiting {MOVE:?} to hear where the call moved");
                 out::send(&MediaResponse::Interrupted);
                 match call.wait(MOVE, true) {
                     Waited::Moved => {}
@@ -747,7 +884,7 @@ pub fn run(join: VoiceJoin, controls: Arc<Controls>) {
                 }
             }
             End::Dropped(kind, detail) => {
-                eprintln!("mediad: connection dropped: {detail}");
+                tracing::warn!("mediad: connection dropped: {detail}");
                 if resume && began.elapsed() > HELD {
                     resumes = 0;
                 }

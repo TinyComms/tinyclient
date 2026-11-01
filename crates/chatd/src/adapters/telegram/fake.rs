@@ -13,7 +13,8 @@
 //! her own number); Tobin Reyes (7003); a group "Trail crew" (8001); a channel "Field Notes"
 //! (9001, muted, with a sponsored message); a forum "Workshop" (9002) with topics General and
 //! "Tools" (31). The phone +1 555 010 0142 signs in with the code 24680; +1 555 010 0199 also
-//! wants the password "correct horse".
+//! wants the password "correct horse". Username resolution serves only `gif` and `forest_wren`;
+//! `flood_wait` returns a flood wait, and every other name returns USERNAME_NOT_OCCUPIED.
 
 use super::peers::Who;
 use super::wire::{Event, Fault, Wire};
@@ -435,6 +436,25 @@ fn asked<R: RemoteCall + Identifiable + Deserializable>(body: &[u8]) -> Option<R
 
 fn answer<T: Serializable>(value: T) -> Result<Vec<u8>, Fault> {
     Ok(value.to_bytes())
+}
+
+// Keep these large schema values off the upload thread's small request-handler stack.
+#[inline(never)]
+fn resolve_username(username: &str) -> Result<Vec<u8>, Fault> {
+    if username == "flood_wait" {
+        return Err(rpc(420, "FLOOD_WAIT", Some(60)));
+    }
+    let (id, first, last, handle) = if username.eq_ignore_ascii_case("forest_wren") {
+        (7_011, "Robin", "Vale", "forest_wren")
+    } else if username == "gif" {
+        (GIF_BOT, "GIF Search", "", "gif")
+    } else {
+        return Err(rpc(400, "USERNAME_NOT_OCCUPIED", None));
+    };
+    let found = tl::types::contacts::ResolvedPeer {
+        peer: Who::User(id).peer(), chats: Vec::new(), users: vec![user(id, first, last, handle).into()],
+    };
+    answer(tl::enums::contacts::ResolvedPeer::Peer(found))
 }
 
 fn input_who(peer: &tl::enums::InputPeer) -> Who {
@@ -1144,6 +1164,20 @@ impl World {
             self.log(&format!("Search {} {name} {}", peer.text(), request.offset_id));
             let held = self.messages.get(&peer.text());
             let mut messages: Vec<tl::enums::Message> = ids.iter().filter_map(|id| held.and_then(|held| held.get(id)).cloned()).collect();
+            if matches!(request.filter, tl::enums::MessagesFilter::InputMessagesFilterEmpty) {
+                self.log(&format!("SearchText {} {} topic={:?}", peer.text(), request.q, request.top_msg_id));
+                let query = request.q.to_lowercase();
+                let held = self.messages.get(&key(peer, request.top_msg_id));
+                messages = held.into_iter().flat_map(|held| held.values()).filter(|message| match message {
+                    tl::enums::Message::Message(message) => message.message.to_lowercase().contains(&query),
+                    _ => false,
+                }).cloned().collect();
+                messages.sort_by_key(|message| std::cmp::Reverse(match message {
+                    tl::enums::Message::Message(message) => message.id,
+                    _ => 0,
+                }));
+                messages.truncate(request.limit.max(0) as usize);
+            }
             if name == "links" {
                 let mut linked = message(peer, 17, ODALYS, T0 - 30, "Route map");
                 linked.entities = Some(vec![tl::types::MessageEntityTextUrl { offset: 0, length: 5, url: "https://example.org/route".to_owned() }.into()]);
@@ -1242,8 +1276,7 @@ impl World {
         }
         if let Some(request) = asked::<f::contacts::ResolveUsername>(body) {
             self.log(&format!("ResolveUsername {}", request.username));
-            let found = tl::types::contacts::ResolvedPeer { peer: Who::User(GIF_BOT).peer(), chats: Vec::new(), users: vec![user(GIF_BOT, "GIF Search", "", "gif").into()] };
-            return Some(answer(tl::enums::contacts::ResolvedPeer::Peer(found)));
+            return Some(resolve_username(&request.username));
         }
         if let Some(request) = asked::<f::messages::GetInlineBotResults>(body) {
             self.log(&format!("GetInlineBotResults {} {}", request.query, request.offset));

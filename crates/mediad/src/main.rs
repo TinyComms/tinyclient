@@ -1,5 +1,5 @@
 use mediad::session::{self, Controls};
-use mediad::{audio, out, permission, tiny};
+use mediad::{audio, out, permission, picture, tiny};
 use protocol::{
     media_process_needed, read_frame, Content, Direction, MediaRequest, MediaResponse, VideoStream,
     DEVICES_LIMIT,
@@ -20,6 +20,7 @@ const DEVICES_EVERY: Duration = Duration::from_secs(2);
 
 const NO_VIDEO: &str = "Screen sharing and video are not built yet. This call carries voice only.";
 const ENGINE: &str = "The call engine could not start. Try again.";
+const NOT_YET: &str = "The call isn't connected yet, so there's nothing to measure.";
 
 /// macOS reads the reason for the microphone prompt from the Info.plist of the process it holds
 /// responsible. Inside `tinyclient.app` that is the app, whose Info.plist says it. When mediad is
@@ -30,31 +31,31 @@ const ENGINE: &str = "The call engine could not start. Try again.";
 #[link_section = "__TEXT,__info_plist"]
 static INFO_PLIST: [u8; include_bytes!("../Info.plist").len()] = *include_bytes!("../Info.plist");
 
-/// The video codec sessions of one call. Each field is one session, so a second share replaces
-/// the first instead of adding a tile. Bookkeeping only: video is not carried yet.
+/// The video sessions of one call. Each field is one session, so a second share replaces the
+/// first instead of adding a tile.
 #[derive(Default)]
 struct Video {
     share_encode: bool,
+    camera_encode: bool,
     share_decode: Option<String>,
     speaker_decode: Option<String>,
 }
 
 impl Video {
     fn streams(&self) -> Vec<VideoStream> {
-        let decode = |content, source: &Option<String>| {
+        let decode = |content: Content, source: &Option<String>| {
             source.clone().map(|source| VideoStream {
                 direction: Direction::Decode,
                 content,
                 source,
             })
         };
-        let encode = self.share_encode.then(|| VideoStream {
-            direction: Direction::Encode,
-            content: Content::Share,
-            source: String::new(),
-        });
-        encode
+        let encode = |on: bool, content: Content| {
+            on.then(|| VideoStream { direction: Direction::Encode, content, source: String::new() })
+        };
+        encode(self.share_encode, Content::Share)
             .into_iter()
+            .chain(encode(self.camera_encode, Content::Camera))
             .chain(decode(Content::Share, &self.share_decode))
             .chain(decode(Content::Speaker, &self.speaker_decode))
             .collect()
@@ -85,13 +86,46 @@ impl Call {
             MediaRequest::ShareSend { on: true }
             | MediaRequest::ShareWatch { source: Some(_) }
             | MediaRequest::Speaker { source: Some(_) }
-                if self.voice.is_some() =>
+            | MediaRequest::Camera { on: true }
+                if self.voice.is_some() && self.tiny.is_none() =>
             {
                 return MediaResponse::Refused { detail: NO_VIDEO.to_owned() };
             }
-            MediaRequest::ShareSend { on } => self.video.share_encode = on,
-            MediaRequest::ShareWatch { source } => self.video.share_decode = source,
-            MediaRequest::Speaker { source } => self.video.speaker_decode = source,
+            MediaRequest::ShareSend { on } => {
+                if self.tiny.is_some() && on {
+                    if let Err(words) = picture::probe_screen() {
+                        return MediaResponse::Refused { detail: words };
+                    }
+                }
+                self.video.share_encode = on;
+                if self.tiny.is_some() {
+                    self.controls.set_share(on);
+                }
+            }
+            MediaRequest::Camera { on } => {
+                if self.tiny.is_some() && on {
+                    if let Err(words) = picture::probe_camera() {
+                        return MediaResponse::Refused { detail: words };
+                    }
+                }
+                self.video.camera_encode = on;
+                if self.tiny.is_some() {
+                    self.controls.set_camera(on);
+                }
+            }
+            MediaRequest::ShareWatch { source } => {
+                self.video.share_decode = source.clone();
+                if self.tiny.is_some() {
+                    self.controls.set_watch(source.is_some());
+                }
+            }
+            // A Tiny room's SFU already follows the active speaker. The bookkeeping stays for a
+            // call that has no engine yet, which is what chatd's lifecycle test drives.
+            MediaRequest::Speaker { source } => {
+                if self.tiny.is_none() || self.voice.is_none() {
+                    self.video.speaker_decode = source;
+                }
+            }
             MediaRequest::Join(join) => {
                 if self.voice.is_some() {
                     return MediaResponse::Refused { detail: "This call is already connecting.".to_owned() };
@@ -104,13 +138,13 @@ impl Call {
                 let spawned = std::thread::Builder::new().name("voice".to_owned()).spawn(move || {
                     session::run(join, controls);
                     // The other side ended the call, or chatd hung up: either way we are done.
-                    eprintln!("mediad: call over, exiting");
+                    tracing::warn!("mediad: call over, exiting");
                     std::process::exit(0);
                 });
                 match spawned {
                     Ok(voice) => self.voice = Some(voice),
                     Err(err) => {
-                        eprintln!("mediad: the voice thread did not start: {err}");
+                        tracing::warn!("mediad: the voice thread did not start: {err}");
                         return MediaResponse::Refused { detail: ENGINE.to_owned() };
                     }
                 }
@@ -151,6 +185,10 @@ impl Call {
                     self.controls.muted.store(spec.muted, Ordering::Relaxed);
                     self.controls.deafened.store(spec.deafened, Ordering::Relaxed);
                 }
+                // A fresh seat starts its encryption afresh; the server says after its answer
+                // whether this call is end to end.
+                self.controls.e2ee(|e2ee| e2ee.offer(&spec.user_id, spec.e2ee.as_ref()));
+                self.controls.e2ee_report();
                 return match tiny::Offer::new(&spec) {
                     Ok(offer) => {
                         let sdp = offer.sdp().to_owned();
@@ -159,7 +197,7 @@ impl Call {
                         MediaResponse::Offer { sdp }
                     }
                     Err(err) => {
-                        eprintln!("mediad: the offer could not be made: {err}");
+                        tracing::warn!("mediad: the offer could not be made: {err}");
                         MediaResponse::Refused { detail: ENGINE.to_owned() }
                     }
                 };
@@ -171,7 +209,7 @@ impl Call {
                 let link = match offer.accept(&sdp) {
                     Ok(link) => link,
                     Err(err) => {
-                        eprintln!("mediad: the server's answer was refused: {err}");
+                        tracing::warn!("mediad: the server's answer was refused: {err}");
                         return MediaResponse::Refused { detail: "The server's audio setup didn't work with tinyclient. Try again.".to_owned() };
                     }
                 };
@@ -183,13 +221,13 @@ impl Call {
                 let (controls, user_id) = (self.controls.clone(), self.tiny.clone().unwrap_or_default());
                 let spawned = std::thread::Builder::new().name("tiny".to_owned()).spawn(move || {
                     tiny::run(link, user_id, controls);
-                    eprintln!("mediad: call over, exiting");
+                    tracing::warn!("mediad: call over, exiting");
                     std::process::exit(0);
                 });
                 match spawned {
                     Ok(voice) => self.voice = Some(voice),
                     Err(err) => {
-                        eprintln!("mediad: the call thread did not start: {err}");
+                        tracing::warn!("mediad: the call thread did not start: {err}");
                         return MediaResponse::Refused { detail: ENGINE.to_owned() };
                     }
                 }
@@ -199,9 +237,71 @@ impl Call {
                 self.controls.tiny_slots(audio);
                 return MediaResponse::Done;
             }
+            MediaRequest::TinyRenegotiation { sdp } => {
+                self.controls.picture_answer(sdp);
+                return MediaResponse::Done;
+            }
+            MediaRequest::TinyPicture { picture } => {
+                self.controls.set_picture(picture);
+                return MediaResponse::Done;
+            }
+            MediaRequest::TinyE2ee { frame } => {
+                self.controls.e2ee(|e2ee| e2ee.frame(&frame));
+                self.controls.e2ee_report();
+                return MediaResponse::Done;
+            }
+            MediaRequest::TinyRoster { user_ids } => {
+                self.controls.e2ee(|e2ee| e2ee.roster(user_ids));
+                self.controls.e2ee_report();
+                return MediaResponse::Done;
+            }
             MediaRequest::Devices { input, output } => {
                 self.controls.choose(input, output);
                 return MediaResponse::Done;
+            }
+            // The sound of the call, as the shell and the room decide it. Each holds until sent
+            // again, through a reconnect or a move, and is read by whichever loop carries the
+            // call: Gain and Priority in its mix (`hear`; a Tiny call names voices through the
+            // slot map), Input and Talk at its gate (`talk`), Processing on the microphone
+            // (`process`), Bitrate at its encoder.
+            MediaRequest::Gain { user_id, percent, muted } => {
+                self.controls.gain(user_id, percent, muted);
+                return MediaResponse::Done;
+            }
+            MediaRequest::Input(mode) => {
+                self.controls.set_input(mode);
+                return MediaResponse::Done;
+            }
+            MediaRequest::Talk { held, priority } => {
+                self.controls.talk(held, priority);
+                return MediaResponse::Done;
+            }
+            MediaRequest::Priority { user_ids } => {
+                self.controls.priority(user_ids);
+                return MediaResponse::Done;
+            }
+            MediaRequest::Processing(processing) => {
+                self.controls.set_processing(processing);
+                return MediaResponse::Done;
+            }
+            MediaRequest::Bitrate { kbps } => {
+                self.controls.set_bitrate(kbps);
+                return MediaResponse::Done;
+            }
+            // Measured once a second by the call's loop (`stats`).
+            MediaRequest::Stats => {
+                return match self.controls.stats() {
+                    Some(stats) if self.voice.is_some() => MediaResponse::Stats(stats),
+                    _ => MediaResponse::Refused { detail: NOT_YET.to_owned() },
+                };
+            }
+            MediaRequest::Loopback { .. } => return MediaResponse::Refused { detail: "A call can't play your microphone back to you.".to_owned() },
+            MediaRequest::SaveLogs => {
+                let path = protocol::log_policy::current()
+                    .and_then(|guard| guard.export_requested().ok().flatten())
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default();
+                return MediaResponse::LogsSaved { path };
             }
         }
         MediaResponse::Streams { video: self.video.streams() }
@@ -256,12 +356,16 @@ fn watch_devices(controls: &Controls) {
 
 /// `--devices`: every device, the defaults, whether macOS lets this process hear the
 /// microphone, and which process macOS holds responsible for it, as one JSON object. Nothing is
-/// opened and nobody is asked for permission.
+/// opened and nobody is asked for permission. `inputs` and `outputs` are the names alone, as
+/// older shells read them; `input_devices` and `output_devices` are `AudioDevice`s, with ids.
 fn list_devices() {
     let listing = audio::listing();
+    let names = |devices: &[protocol::AudioDevice]| devices.iter().map(|d| d.name.clone()).collect::<Vec<_>>();
     let json = serde_json::json!({
-        "inputs": listing.inputs,
-        "outputs": listing.outputs,
+        "inputs": names(&listing.inputs),
+        "outputs": names(&listing.outputs),
+        "input_devices": listing.inputs,
+        "output_devices": listing.outputs,
         "default_input": listing.default_input,
         "default_output": listing.default_output,
         // The answer is about whoever `responsible` names, not about mediad as such.
@@ -277,13 +381,14 @@ fn list_devices() {
 }
 
 fn main() -> ExitCode {
-    protocol::crash::install_panic_hook("mediad");
     let first = env::args().nth(1);
+    if first.as_deref() == Some("--version") {
+        println!("mediad {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
+    let _log = protocol::log_policy::install("mediad", protocol::log_policy::LogPolicy::from_env());
+    protocol::crash::install_panic_hook("mediad");
     match first.as_deref() {
-        Some("--version") => {
-            println!("mediad {}", env!("CARGO_PKG_VERSION"));
-            return ExitCode::SUCCESS;
-        }
         Some("--devices") => {
             list_devices();
             return ExitCode::SUCCESS;
@@ -298,7 +403,18 @@ fn main() -> ExitCode {
             return match mediad::play::run() {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(err) => {
-                    eprintln!("mediad: {err}");
+                    tracing::warn!("mediad: {err}");
+                    ExitCode::from(1)
+                }
+            };
+        }
+        // One notification sound, for chatd: the word, the volume, the speaker (`alert`).
+        Some("--sound") => {
+            let args: Vec<String> = env::args().skip(2).collect();
+            return match mediad::alert::run(&args) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(err) => {
+                    tracing::warn!("mediad: {err}");
                     ExitCode::from(1)
                 }
             };
@@ -306,23 +422,23 @@ fn main() -> ExitCode {
         // Settings' microphone test and test sound, with no call (`probe`).
         Some("test") => {
             mediad::probe::run();
-            eprintln!("mediad: test over, exiting");
+            tracing::warn!("mediad: test over, exiting");
             return ExitCode::SUCCESS;
         }
         _ => {}
     }
     let calls = first.and_then(|s| s.parse().ok()).unwrap_or(0);
     if !media_process_needed(calls) {
-        eprintln!("mediad: no active call, exiting");
+        tracing::warn!("mediad: no active call, exiting");
         return ExitCode::SUCCESS;
     }
     match serve() {
         Ok(()) => {
-            eprintln!("mediad: call ended, exiting");
+            tracing::warn!("mediad: call ended, exiting");
             ExitCode::SUCCESS
         }
         Err(err) => {
-            eprintln!("mediad: {err}");
+            tracing::warn!("mediad: {err}");
             ExitCode::from(1)
         }
     }

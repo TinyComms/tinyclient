@@ -225,6 +225,11 @@ impl Flight {
         self.sending.contains_key(conversation)
     }
 
+    /// The client ids still on their way in this conversation.
+    pub fn sending_ids(&self, conversation: &Key) -> Vec<String> {
+        self.sending.get(conversation).cloned().unwrap_or_default()
+    }
+
     pub fn failed_in(&self, conversation: &Key) -> bool {
         self.failed.contains_key(conversation)
     }

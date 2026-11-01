@@ -172,6 +172,7 @@ impl Dirty {
             | Change::Playback { .. }
             | Change::Settings
             | Change::Meter { .. }
+            | Change::Open { .. }
             | Change::Tiny { .. } => {}
             Change::Folders { .. } => self.spaces = true,
         }
@@ -258,6 +259,7 @@ impl Shell {
         let subscriptions = [
             cx.observe_window_activation(window, |this, window, cx| {
                 this.active = window.is_window_active();
+                this.focus_changed(this.active, cx);
                 cx.notify();
             }),
             // A move draws nothing, so render never sees it: the frame is noted here.
@@ -314,6 +316,8 @@ impl Shell {
         shell.layout_state.details_channels = prefs.details_channels;
         shell.layout_state.details_directs = prefs.details_directs;
         shell.sidebar_state.pins = prefs.pins;
+        shell.tiny_state.set_members_open(prefs.tiny_members);
+        app::prefs::set_me(prefs.me.clone());
         shell.saved_prefs.replace(app::prefs::write(&shell.current_prefs()));
         if crate::update::announce().is_some() {
             shell.layout_state.update_alert = true;
@@ -387,6 +391,8 @@ impl Shell {
         }
         // A signed-out account keeps its cache on disk and shows none of it.
         self.drop_signed_out(cx);
+        let accounts = self.snapshot.as_ref().map(|snapshot| snapshot.accounts.clone()).unwrap_or_default();
+        self.attention_changed(&accounts, cx);
         cx.notify();
     }
 
@@ -477,6 +483,7 @@ impl Shell {
                 Change::Occupants { conversation, occupants } => self.occupants_changed(conversation, occupants, cx),
                 Change::Playback { playback } => self.playback_changed(playback.clone(), cx),
                 Change::Settings => self.load_settings(cx),
+                Change::Open { conversation } => self.open_from_notification(conversation, cx),
                 Change::Meter { level } => super::settings::meter(*level, cx),
                 _ => {}
             }
@@ -592,7 +599,7 @@ impl Shell {
             #[cfg(feature = "gui-shot")]
             if let (true, Some(launched)) = (this.sidebar_state.inbox.fresh, super::LAUNCHED.get()) {
                 // The rows are in hand here and drawn on the next frame.
-                eprintln!("tinyclient: first list after {} ms", launched.elapsed().as_millis());
+                tracing::warn!("tinyclient: first list after {} ms", launched.elapsed().as_millis());
             }
             this.inbox_read(epoch, rows, total, counts, cx);
         });

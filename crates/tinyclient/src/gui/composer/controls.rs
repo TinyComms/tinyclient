@@ -23,10 +23,12 @@ pub struct Controls {
 /// `editing`: edit mode is text only on every network.
 pub fn controls(network: Network, can: &Capabilities, editing: bool) -> Controls {
     // Slack and Teams have GIF pickers whose client calls are not captured yet (ruling 09):
-    // hidden there whatever a session reports.
-    let gifs = can.gifs && matches!(network, Network::Discord | Network::Telegram);
+    // hidden there whatever a session reports. Tiny has no GIF catalog; the button sends a
+    // .gif file through the attachment path.
+    let catalog = can.gifs && matches!(network, Network::Discord | Network::Telegram);
+    let tiny_gif = network == Network::Tiny && can.max_file_bytes > 0;
     let mut tabs = vec![Tab::Emoji];
-    if gifs && !editing {
+    if catalog && !editing {
         tabs.push(Tab::Gifs);
     }
     if can.stickers && !editing {
@@ -34,7 +36,7 @@ pub fn controls(network: Network, can: &Capabilities, editing: bool) -> Controls
     }
     Controls {
         attach: can.max_file_bytes > 0 && !editing,
-        gif: gifs && !editing,
+        gif: (catalog || tiny_gif) && !editing,
         emoji: true,
         tabs,
         silent: can.silent && !editing,
@@ -80,10 +82,18 @@ mod tests {
         assert!(t.gif && t.silent && !t.ping && !t.custom_emoji);
         assert_eq!(t.tabs, [Tab::Emoji, Tab::Gifs, Tab::Stickers]);
 
-        let teams = Capabilities { max_file_bytes: 250 << 20, max_files: 10, suppress_embeds: true, ..Capabilities::default() };
+        let teams = Capabilities { max_file_bytes: 250 << 20, max_files: 10, suppress_embeds: true, gifs: true, ..Capabilities::default() };
         let m = controls(Network::Teams, &teams, false);
         assert!(m.attach && !m.gif && !m.silent && !m.link_chip);
         assert_eq!(m.tabs, [Tab::Emoji]);
+
+        let tiny = Capabilities { max_file_bytes: 8 << 20, max_files: 10, ..Capabilities::default() };
+        let y = controls(Network::Tiny, &tiny, false);
+        assert!(y.attach && y.gif && y.emoji && !y.custom_emoji);
+        assert_eq!(y.tabs, [Tab::Emoji]);
+        let bare = controls(Network::Tiny, &Capabilities::default(), false);
+        assert!(!bare.attach && !bare.gif && bare.emoji);
+        assert_eq!(bare.tabs, [Tab::Emoji]);
     }
 
     #[test]

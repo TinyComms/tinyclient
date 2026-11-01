@@ -3,8 +3,11 @@
 //!
 //! While the window is open it asks GitHub's public release about once an hour, and again
 //! shortly after launch, whether a newer one exists. A newer release is said in the window
-//! until it is dismissed. The request's
-//! user agent is `tinyclient/<version>` and it carries nothing else: no account, no machine id.
+//! until it is dismissed. When that release has this copy's version, a second request asks
+//! GitHub to compare the release's tag with the commit this copy was built from: a build from
+//! before the tag (a copy made from main ahead of the release) is offered the release too. Each
+//! request's user agent is `tinyclient/<version>` and it carries nothing else: no account, no
+//! machine id. The commit in the second request's address is the public one this build is from.
 //! With automatic install on, and only when this process is the installed app (not a build under
 //! `target/`), the archive is downloaded, checked against the release's `SHA256SUMS`, and on
 //! macOS the new app is checked with `codesign` before it is kept. It replaces this copy when
@@ -21,6 +24,7 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const FEED: &str = "https://api.github.com/repos/itz4blitz/tinyclient/releases/latest";
+const COMPARE: &str = "https://api.github.com/repos/itz4blitz/tinyclient/compare";
 const RELEASES: &str = "https://github.com/itz4blitz/tinyclient/releases/latest";
 const ARCHIVE_LIMIT: u64 = 200 * 1024 * 1024;
 
@@ -103,6 +107,16 @@ pub fn current() -> &'static str {
     PINNED
         .get_or_init(|| std::env::var("TINYCLIENT_UPDATE_AS").unwrap_or_else(|_| env!("CARGO_PKG_VERSION").to_owned()))
         .as_str()
+}
+
+/// The commit this build is from (`build.rs`), or empty when it was built without git.
+pub fn commit() -> &'static str {
+    env!("TINYCLIENT_COMMIT")
+}
+
+/// The commit as people read it next to the version: its first seven characters.
+pub fn short_commit() -> Option<&'static str> {
+    commit().get(..7)
 }
 
 /// This build's archive, as `.github/workflows/release.yml` names the unversioned copy.
@@ -288,12 +302,19 @@ enum Outcome {
 fn fetch(download: bool) -> Outcome {
     let now = unix_now();
     let Some(body) = http_text(FEED, true) else {
+        tracing::warn!(phase = "check", "updater failed");
         return Outcome::Unchanged;
     };
     let Some(release) = parse_release(&body) else {
         return Outcome::Unchanged;
     };
-    if !newer(&release.version, current()) {
+    // The compare is asked only for the same version: a newer one is offered without it.
+    let compared = if cmp_version(&release.version, current()).is_eq() {
+        compare(&release.tag, commit())
+    } else {
+        None
+    };
+    if !offered(&release.version, current(), compared.as_deref()) {
         let _ = fs::remove_dir_all(work_dir().join("staged"));
         return Outcome::Set {
             shown: Shown::Quiet,
@@ -340,6 +361,7 @@ fn fetch(download: bool) -> Outcome {
 }
 
 struct Release {
+    tag: String,
     version: String,
     page: String,
     archive: String,
@@ -352,7 +374,10 @@ fn stage(release: &Release) -> Result<(), ()> {
     fs::create_dir_all(&dir).map_err(|_| ())?;
     let incoming = dir.join("incoming.part");
     let _ = fs::remove_file(&incoming);
-    http_file(&release.archive_url, &incoming)?;
+    if http_file(&release.archive_url, &incoming).is_err() {
+        tracing::warn!(phase = "download", "updater failed");
+        return Err(());
+    }
     let len = fs::metadata(&incoming).map_err(|_| ())?.len();
     if len == 0 || len > ARCHIVE_LIMIT {
         let _ = fs::remove_file(&incoming);
@@ -363,6 +388,7 @@ fn stage(release: &Release) -> Result<(), ()> {
     let got = sha256_file(&incoming).map_err(|_| ())?;
     if !got.eq_ignore_ascii_case(want) {
         let _ = fs::remove_file(&incoming);
+        tracing::warn!(phase = "verify", "updater failed");
         return Err(());
     }
     let staged = dir.join("staged");
@@ -685,6 +711,44 @@ pub fn newer(latest: &str, current: &str) -> bool {
     cmp_version(latest, current).is_gt()
 }
 
+/// Whether `latest` is offered to this copy. A newer version always is. The same version is only
+/// when GitHub's compare of the release's tag with this build's commit said `behind`: this build
+/// is from before the tag. Anything else (the same commit, a build past the tag or off to the
+/// side of it, a commit GitHub does not have, no answer) says nothing, as an older release does.
+fn offered(latest: &str, current: &str, compared: Option<&str>) -> bool {
+    newer(latest, current) || (cmp_version(latest, current).is_eq() && compared == Some("behind"))
+}
+
+/// GitHub's word for how `commit` stands to `tag`: `identical`, `ahead`, `behind` or `diverged`.
+/// None without a commit, or when GitHub does not answer.
+fn compare(tag: &str, commit: &str) -> Option<String> {
+    let plain = |text: &str| {
+        !text.is_empty() && text.len() <= 64 && text.chars().all(|c| c.is_ascii_alphanumeric() || "._-+".contains(c))
+    };
+    if !plain(tag) || !plain(commit) {
+        return None;
+    }
+    // One commit per page: a build behind the tag has none of its own to list.
+    let body = http_text(&format!("{COMPARE}/{tag}...{commit}?per_page=1"), true)?;
+    compare_status(&body).map(str::to_owned)
+}
+
+/// The compare's top-level `status`. Each changed file has a `status` of its own, but never one
+/// of these four words.
+fn compare_status(json: &str) -> Option<&str> {
+    let mut rest = json;
+    while let Some(at) = rest.find("\"status\"") {
+        rest = &rest[at..];
+        if let Some(status) = json_string(rest, "status") {
+            if ["identical", "ahead", "behind", "diverged"].contains(&status) {
+                return Some(status);
+            }
+        }
+        rest = &rest["\"status\"".len()..];
+    }
+    None
+}
+
 fn cmp_version(left: &str, right: &str) -> std::cmp::Ordering {
     let (left, right) = (split_version(left), split_version(right));
     let len = left.numbers.len().max(right.numbers.len());
@@ -731,9 +795,8 @@ fn parse_release(json: &str) -> Option<Release> {
     if json.len() > 2 * 1024 * 1024 {
         return None;
     }
-    let version = json_string(json, "tag_name")?
-        .trim_start_matches('v')
-        .to_owned();
+    let tag = json_string(json, "tag_name")?.to_owned();
+    let version = tag.trim_start_matches('v').to_owned();
     if version.is_empty() || version.len() > 40 {
         return None;
     }
@@ -750,6 +813,7 @@ fn parse_release(json: &str) -> Option<Release> {
         .or_else(|| assets.iter().find(|(name, _)| name.ends_with(suffix)))?;
     let sums = assets.iter().find(|(name, _)| name == "SHA256SUMS")?;
     Some(Release {
+        tag,
         version,
         page,
         archive: archive.0.clone(),
@@ -815,6 +879,48 @@ mod tests {
     }
 
     #[test]
+    fn the_same_version_is_offered_only_to_a_build_behind_the_tag() {
+        assert!(offered("0.2.15", "0.2.15", Some("behind")));
+        assert!(offered("v0.2.15", "0.2.15", Some("behind")));
+        for compared in [None, Some("identical"), Some("ahead"), Some("diverged"), Some("nonsense")] {
+            assert!(!offered("0.2.15", "0.2.15", compared));
+        }
+        // A newer release does not need the compare, and an older one is never offered by it.
+        assert!(offered("0.2.16", "0.2.15", None));
+        assert!(offered("0.2.16", "0.2.15", Some("ahead")));
+        assert!(!offered("0.2.14", "0.2.15", Some("behind")));
+        assert!(!offered("0.2.15-beta", "0.2.15", Some("behind")));
+    }
+
+    #[test]
+    fn the_compare_status_is_the_top_level_one() {
+        let json = r#"{
+            "base_commit": {"commit": {"message": "Say \"status\": \"behind\" in a message"}},
+            "status": "ahead",
+            "ahead_by": 1,
+            "files": [{"filename": "a.rs", "status": "modified"}]
+        }"#;
+        assert_eq!(compare_status(json), Some("ahead"));
+        assert_eq!(compare_status(r#"{"status":"behind","behind_by":3}"#), Some("behind"));
+        assert_eq!(compare_status(r#"{"files":[{"status":"modified"}]}"#), None);
+        assert_eq!(compare_status(r#"{"message":"Not Found","status":"404"}"#), None);
+    }
+
+    #[test]
+    fn a_compare_is_not_asked_without_a_plain_tag_and_commit() {
+        assert_eq!(compare("v0.2.15", ""), None);
+        assert_eq!(compare("v0.2.15/../x", "5d854b4"), None);
+        assert_eq!(compare("", "5d854b4"), None);
+    }
+
+    #[test]
+    fn the_build_commit_is_a_full_sha_or_nothing() {
+        let sha = commit();
+        assert!(sha.is_empty() || (sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit())));
+        assert_eq!(short_commit().map(str::len), (!sha.is_empty()).then_some(7));
+    }
+
+    #[test]
     fn the_release_json_picks_this_machines_archive_and_the_sums() {
         let json = r#"{
             "tag_name": "v0.9.0",
@@ -829,6 +935,7 @@ mod tests {
             ]
         }"#;
         let release = parse_release(json).expect("parsed");
+        assert_eq!(release.tag, "v0.9.0");
         assert_eq!(release.version, "0.9.0");
         assert!(release.page.contains("/releases/tag/v0.9.0"));
         let name = archive_name().expect("this test machine has a release archive");

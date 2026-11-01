@@ -202,7 +202,7 @@ impl Demo {
             crate::blobs::upload::discard(&with.files);
         });
         if let Err(err) = spawned {
-            eprintln!("chatd: demo: upload: {err}");
+            tracing::warn!("chatd: demo: upload: {err}");
         }
     }
 
@@ -409,18 +409,24 @@ impl Demo {
         CatalogPage { items, cursor }
     }
 
-    /// Rows on screen with no preview: the "network" says what was said last.
+    /// Rows on screen with no preview. A stored message is that line. A chat with none
+    /// stays "No messages yet" instead of a line the network never sent.
     fn previews(&self, ids: &[String]) {
         for id in ids {
-            let line = PreviewLine {
-                id: format!("{}000", now()),
-                text: "Calendar invite: kickoff on Monday".to_owned(),
-                sender: "Ana Ruiz".to_owned(),
-                mine: false,
-                sent: self.ctx.known(id).ok().flatten().map_or_else(now, |row| row.updated.max(1)),
+            let sent = self.ctx.known(id).ok().flatten().map_or_else(now, |row| row.updated.max(1));
+            let line = match self.hub.store().newest_line(&self.key(id)) {
+                Ok(Some(mut line)) => {
+                    line.sent = line.sent.max(sent);
+                    line
+                }
+                Ok(None) => PreviewLine { id: String::new(), text: "No messages yet".to_owned(), sender: String::new(), mine: false, sent },
+                Err(err) => {
+                    tracing::warn!("chatd: demo: preview: {err}");
+                    continue;
+                }
             };
             if let Err(err) = self.ctx.preview(id, &line) {
-                eprintln!("chatd: demo: preview: {err}");
+                tracing::warn!("chatd: demo: preview: {err}");
             }
         }
     }
@@ -525,6 +531,7 @@ impl Demo {
                 speaking: false,
                 muted: occupant.muted,
                 deafened: occupant.deafened,
+                ..Participant::default()
             });
             demo.ctx.participants(conversation_id, roster.collect());
         }
@@ -558,7 +565,7 @@ impl Demo {
             demo.ctx.answered(&conversation_id);
             let peer = demo.ctx.known(&conversation_id).ok().flatten().and_then(|row| Some((row.peer?, row.title)));
             if let Some((id, name)) = peer {
-                let them = Participant { id, name, speaking: false, muted: false, deafened: false };
+                let them = Participant { id, name, ..Participant::default() };
                 demo.ctx.participants(&conversation_id, vec![them]);
             }
         });
@@ -671,6 +678,7 @@ impl Demo {
             Command::Previews(ids) => demo.previews(&ids),
             Command::Members { conversation_id, offset, limit, reply } => drop(reply.send(demo.members(&conversation_id, offset, limit))),
             Command::StartDirect { person_id, reply } => drop(reply.send(demo.start_direct(&person_id))),
+            Command::StartThread { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SearchPeople(query) => demo.ctx.searched(&query),
             Command::Download { url, reply, .. } => drop(reply.send(Ok(Download { url, headers: Vec::new() }))),
             Command::Handoff { conversation_id, reply } => {

@@ -2,9 +2,9 @@
 
 use super::chat::Look;
 use super::home::{self, Act, Drill, Item};
-use super::{on_screen, respliced, Mode};
+use super::{joins_from_list, on_screen, respliced, Mode};
 use crate::client::ask;
-use crate::gui::components::{badge_dot, empty_state, glyph, list_row, pair, rollup_badge, section_header, Avatar, Shape};
+use crate::gui::components::{badge_dot, empty_state, glyph, icon_button, list_row, rollup_badge, section_header, Avatar, Shape};
 use crate::gui::state::{Shell, Snapshot};
 use crate::gui::theme::{self, Type};
 use crate::view::now;
@@ -228,6 +228,11 @@ impl Shell {
                 Act::MoreVoice => home.voice_all = true,
                 Act::MoreChats => home.chats_all = true,
                 Act::Meetings => home.meetings_open = !home.meetings_open,
+                Act::Hidden(id) => {
+                    if !home.hidden_shown.remove(&id) {
+                        home.hidden_shown.insert(id);
+                    }
+                }
             },
             Item::Folder { id, .. } => {
                 if !home.opened.remove(&id) {
@@ -267,12 +272,23 @@ impl Shell {
             Item::Chat(c) => {
                 let look = match network {
                     Some(Network::Discord) if self.sidebar_state.drill.is_none() => Look { status: true, ..Look::default() },
-                    Some(Network::Telegram | Network::Teams | Network::Signal | Network::Messages) => Look { time: true, ticks: true, ..Look::default() },
                     _ => Look { time: true, context: false, ..Look::default() },
                 };
                 self.chat_row("home", &c, look, focused, cx).into_any_element()
             }
             Item::Voice(c) => self.voice_row(&c, focused, cx).into_any_element(),
+            Item::Action { act: Act::Meetings, icon, words, after, .. } => {
+                // The subjects use the row that remains after the label. The chevron says the fold is open.
+                let open = self.sidebar_state.home.meetings_open;
+                let chevron = if open { "icons/chevron-down.svg" } else { "icons/chevron-right.svg" };
+                let content = div()
+                    .gap(px(8.))
+                    .child(div().size(px(20.)).flex_none().flex().items_center().justify_center().child(glyph(icon, 16., theme::text_soft())))
+                    .child(div().flex_none().type_ui().text_color(theme::text_soft()).child(words))
+                    .child(div().flex_1().min_w_0().truncate().type_small().text_color(theme::text_faint()).child(after))
+                    .child(glyph(chevron, 12., theme::text_faint()));
+                click(list_row(("home-action", ix), theme::row_height(theme::ROW_ONE), false, focused, content), cx).into_any_element()
+            }
             Item::Action { act, icon, words, after, dot } => {
                 // Folds and drills keep their words quiet; a number or dot says what is inside.
                 let lit = act == Act::Friends && self.sidebar_state.home.friend_requests > 0;
@@ -284,7 +300,8 @@ impl Shell {
                     _ if after.is_empty() => None,
                     _ => Some(faint_words(after.clone())),
                 };
-                let chevron = matches!(act, Act::Archive | Act::Requests).then(|| glyph("icons/chevron-right.svg", 12., theme::text_faint()));
+                // Message requests is a mail glyph and a count. Archive is the row that drills.
+                let chevron = matches!(act, Act::Archive).then(|| glyph("icons/chevron-right.svg", 12., theme::text_faint()));
                 let trailing = match (trailing, chevron) {
                     (Some(trailing), Some(chevron)) => Some(div().flex().items_center().gap(px(6.)).child(trailing).child(chevron)),
                     (None, chevron) => chevron.map(|chevron| div().child(chevron)),
@@ -343,7 +360,41 @@ impl Shell {
             let color = if color == 0 { theme::text_faint() } else { gpui::rgb(color) };
             div().absolute().left(px(16.)).top_0().bottom_0().w(px(3.)).bg(color).opacity(0.7)
         });
-        list_row(super::row_id("space", &space.key), theme::row_height(theme::ROW_ONE), here, focused, content).relative().children(spine)
+        list_row(super::row_id("space", &space.key), theme::row_height(theme::ROW_ONE), here, focused, content)
+            .tooltip(crate::gui::components::tip(space.name.clone(), None))
+            .relative()
+            .children(spine)
+    }
+
+    /// The people in a voice row. Their photos come from the person keys, not the channel key.
+    fn voice_faces(&self, c: &Conversation, surface: gpui::Rgba, cx: &mut Context<Self>) -> Div {
+        let people = c.occupants.as_ref().map(|inside| inside.people.as_slice()).unwrap_or(&[]);
+        let size = 32.;
+        match people {
+            [] => self.conversation_avatar(c, size, surface, cx),
+            [one] => Avatar::new(&one.person, &one.name, size).image_at(self.person_picture(&one.person, cx)).build(),
+            [back, front, ..] => {
+                let small = (size * 0.66).round();
+                let face = |person: &protocol::Occupant, cx: &mut Context<Self>| {
+                    Avatar::new(&person.person, &person.name, small).image_at(self.person_picture(&person.person, cx)).build()
+                };
+                div()
+                    .relative()
+                    .size(px(size))
+                    .flex_none()
+                    .child(div().absolute().top_0().left_0().child(face(back, cx)))
+                    .child(
+                        div()
+                            .absolute()
+                            .right(px(-2.))
+                            .bottom(px(-2.))
+                            .rounded(px(small / 2. + 2.))
+                            .border_2()
+                            .border_color(surface)
+                            .child(face(front, cx)),
+                    )
+            }
+        }
     }
 
     /// Friends in a voice channel or a DM call: their faces, where, and who.
@@ -352,17 +403,22 @@ impl Shell {
         let surface = theme::row_surface(selected);
         let people: Vec<&str> = c.occupants.as_ref().map(|inside| inside.people.iter().map(|p| p.name.as_str()).collect()).unwrap_or_default();
         let total = c.occupants.as_ref().map_or(0, |inside| inside.total as usize);
-        let faces = match people.as_slice() {
-            [] => self.conversation_avatar(c, 32., surface, cx),
-            [one] => Avatar::new(&c.key, one, 32.).build(),
-            [one, two, ..] => pair(&c.key, &format!("{one}, {two}"), 32., surface),
-        };
+        let faces = self.voice_faces(c, surface, cx);
         let firsts: Vec<&str> = people.iter().take(3).map(|name| name.split_whitespace().next().unwrap_or(name)).collect();
         let who = match total.saturating_sub(firsts.len()) {
             0 => firsts.join(", "),
             more => format!("{} +{more}", firsts.join(", ")),
         };
         let (title, glyph_name) = if c.kind.is_direct() { ("Call in your DMs".to_owned(), "icons/phone.svg") } else { (c.title.trim_start_matches('#').to_owned(), "icons/volume-2.svg") };
+        let ours = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.call.as_ref())
+            .map_or(false, |call| {
+                call.conversation == c.key
+                    && !matches!(call.state, protocol::CallState::Failed { .. })
+            });
+        let join = joins_from_list(c) && !ours;
         let content = div()
             .gap(px(10.))
             .child(faces)
@@ -383,10 +439,29 @@ impl Shell {
                             .children((!c.space_title.is_empty()).then(|| div().flex_1().min_w_0().truncate().type_ui().text_color(theme::text_faint()).child(c.space_title.clone()))),
                     )
                     .child(div().h(px(16.)).truncate().type_small().text_color(theme::text_soft()).child(who)),
-            );
+            )
+            .children(join.then(|| self.join_pill(c, cx)))
+            .when(join, |row| row.group("voice"));
         let picked = c.clone();
         list_row(super::row_id("voice", &c.key), theme::row_height(theme::ROW_TWO), selected, focused, content)
-            .map(|row| self.tap(row, crate::gui::phone::token(&["row", picked.key.network.label(), &picked.key.account, &picked.key.id]), Some(picked.clone()), move |this, cx| this.pick_row(&picked, cx), cx))
+            .map(|row| {
+                if crate::gui::phone::active() {
+                    let token = crate::gui::phone::token(&["row", picked.key.network.label(), &picked.key.account, &picked.key.id]);
+                    let menu = Some(picked.clone());
+                    return self.tap(row, token, menu, move |this, cx| this.pick_row(&picked, cx), cx);
+                }
+                row.on_mouse_down(
+                    MouseButton::Left,
+                    // A voice channel joins on a double-click here too; a single click only opens.
+                    cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                        if join && event.click_count == 2 {
+                            this.call_start(picked.key.clone(), cx);
+                        } else {
+                            this.pick_row(&picked, cx);
+                        }
+                    }),
+                )
+            })
     }
 
     /// Telegram's folder tabs under the jump strip: All, then each folder with its count.
@@ -423,13 +498,56 @@ impl Shell {
                 .children(count)
                 .children(on.then(|| div().absolute().bottom_0().left(px(8.)).right(px(8.)).h(px(2.)).rounded(px(1.)).bg(theme::text())))
         };
-        let mut tabs = div().id("folder-tabs").flex_none().h(px(32.)).px(px(8.)).mb(px(4.)).flex().items_center().gap(px(4.)).overflow_x_scroll();
+        let scroll = state.folder_tabs_scroll.clone();
+        let mut tabs = div()
+            .id("folder-tabs")
+            .flex_none()
+            .h(px(32.))
+            .px(px(8.))
+            .flex()
+            .items_center()
+            .gap(px(4.))
+            .overflow_x_scroll()
+            .track_scroll(&scroll);
         tabs = tabs.child(tab(None, "All".into(), 0, 0, cx));
         let folders = state.home.folders.clone();
         for folder in folders {
             tabs = tabs.child(tab(Some(folder.key.id.clone()), folder.name.clone(), folder.unread, folder.mentions, cx));
         }
-        Some(div().child(tabs))
+
+        let max = scroll.max_offset().x;
+        let can_left = scroll.offset().x < px(0.);
+        let can_right = scroll.offset().x > -max;
+
+        if max <= px(0.) {
+            return Some(div().flex().items_center().mb(px(4.)).child(tabs));
+        }
+
+        let arrow = |icon: &'static str, enabled: bool, direction: i32, cx: &mut Context<Shell>| {
+            let id = if direction < 0 { "folder-tabs-scroll-left" } else { "folder-tabs-scroll-right" };
+            icon_button(id, icon, false)
+                .size(px(24.))
+                .when(!enabled, |b| b.opacity(0.35).cursor_default())
+                .when(enabled, |b| {
+                    b.on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                        let scroll = this.sidebar_state.folder_tabs_scroll.clone();
+                        let current = scroll.offset().x;
+                        let new_x = (current - px(120. * direction as f32)).clamp(-max, px(0.));
+                        scroll.set_offset(gpui::point(new_x, px(0.)));
+                        cx.notify();
+                    }))
+                })
+        };
+
+        Some(
+            div()
+                .flex()
+                .items_center()
+                .mb(px(4.))
+                .child(arrow("icons/chevron-left.svg", can_left, -1, cx))
+                .child(div().flex_1().min_w_0().child(tabs))
+                .child(arrow("icons/chevron-right.svg", can_right, 1, cx)),
+        )
     }
 
     fn home_empty(&self) -> Div {

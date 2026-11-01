@@ -14,6 +14,7 @@
 //! draws them.
 
 pub(crate) mod live;
+pub(crate) mod manage;
 mod browser;
 mod messages;
 pub mod signin;
@@ -22,7 +23,7 @@ use super::{serve_commands, Command, Context, Signed};
 use crate::hub::Hub;
 use crate::session;
 use protocol::{
-    join_host, text_or_null, tiny_can, tiny_name, AccountKey, ErrorCode, Key, Network,
+    join_host, text_or_null, tiny_allowed, tiny_name, tiny_rows, AccountKey, ErrorCode, Key, Network,
     Presence, Response, TinyAudit, TinyCode, TinyCommunity, TinyInvite, TinyMember, TinyRoom,
     TinySeat,
 };
@@ -34,6 +35,8 @@ use std::time::Duration;
 
 /// How long one request may take. A redirect is not followed, so this is one host.
 const TIMEOUT: Duration = Duration::from_secs(10);
+/// Cold DNS/TLS setup on slower computers needs more time during authentication.
+const AUTH_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct Saved {
@@ -143,6 +146,24 @@ pub fn accounts(session: &str) -> Result<Vec<Signed>, String> {
     Ok(found)
 }
 
+/// Exact server origins for locally saved accounts, without contacting any server or exposing tokens.
+fn local_origins(session: &str) -> Result<Vec<(AccountKey, String)>, String> {
+    Ok(saved_rows(session)?.into_iter().map(|saved| (
+        AccountKey { network: Network::Tiny, account: saved.user_id }, saved.base_url,
+    )).collect())
+}
+
+pub fn local_servers() -> Response {
+    match session::read(Network::Tiny) {
+        session::Stored::Found(session) => match local_origins(&session) {
+            Ok(servers) => Response::TinyLocalServers { servers },
+            Err(_) => error(ErrorCode::Internal, "The Tiny server session is unreadable.".to_owned()),
+        },
+        session::Stored::Absent => Response::TinyLocalServers { servers: Vec::new() },
+        session::Stored::Unreadable(_) => error(ErrorCode::Internal, "The Tiny server session is unreadable.".to_owned()),
+    }
+}
+
 /// The session with one server removed. `None` only when that was the last one. An account that
 /// is not in the blob leaves the original string untouched.
 pub fn without(session: &str, account: &str) -> Option<String> {
@@ -215,9 +236,13 @@ fn saved_for(session: &str, user_id: &str) -> Result<Saved, String> {
 }
 
 fn agent() -> ureq::Agent {
+    agent_with_timeout(TIMEOUT)
+}
+
+fn agent_with_timeout(timeout: Duration) -> ureq::Agent {
     ureq::Agent::config_builder()
         .tls_config(crate::tls::config())
-        .timeout_global(Some(TIMEOUT))
+        .timeout_global(Some(timeout))
         .http_status_as_error(false)
         .max_redirects(0)
         .max_redirects_will_error(false)
@@ -233,7 +258,17 @@ fn call(
     token: Option<&str>,
     body: Option<Value>,
 ) -> Result<(u16, Value), Fault> {
-    let agent = agent();
+    call_with_timeout(method, url, token, body, TIMEOUT)
+}
+
+fn call_with_timeout(
+    method: &str,
+    url: &str,
+    token: Option<&str>,
+    body: Option<Value>,
+    timeout: Duration,
+) -> Result<(u16, Value), Fault> {
+    let agent = agent_with_timeout(timeout);
     let bearer = token.map(|token| format!("Bearer {token}"));
     let sent = match method {
         "GET" => {
@@ -305,7 +340,7 @@ fn endpoint(base: &str, path: &str) -> String {
 /// The provider's name, from `GET /v1/auth/config`. A server that does not sign in through a
 /// provider (a tinyserver from before it did) is told apart from one that cannot be reached.
 fn auth_config(base: &str) -> Result<String, Fault> {
-    let (status, body) = call("GET", &endpoint(base, "/v1/auth/config"), None, None)?;
+    let (status, body) = call_with_timeout("GET", &endpoint(base, "/v1/auth/config"), None, None, AUTH_TIMEOUT)?;
     match status {
         200 => {
             let answer: ConfigAnswer = serde_json::from_value(body).map_err(|_| Fault::BadAnswer)?;
@@ -333,13 +368,14 @@ fn auth_start(base: &str, redirect_uri: &str, challenge: &str, state: &str, invi
     if let Some(invite) = invite {
         body["invite"] = Value::String(invite.to_owned());
     }
-    let (status, body) = call("POST", &endpoint(base, "/v1/auth/start"), None, Some(body))?;
+    let (status, body) = call_with_timeout("POST", &endpoint(base, "/v1/auth/start"), None, Some(body), AUTH_TIMEOUT)?;
     match status {
         200 => body
             .get("authorize_url")
             .and_then(Value::as_str)
             .map(str::to_owned)
             .ok_or(Fault::BadAnswer),
+        _ if banned(&body) => Err(Fault::Words(BANNED)),
         400 => Err(Fault::Words(CHECK)),
         429 => Err(Fault::SlowDown),
         500..=599 => Err(Fault::Unavailable),
@@ -347,18 +383,26 @@ fn auth_start(base: &str, redirect_uri: &str, challenge: &str, state: &str, invi
     }
 }
 
+/// A server with bans refuses a banned person's invite, provider groups and sign-in alike.
+fn banned(body: &Value) -> bool {
+    body.get("error").and_then(Value::as_str) == Some("banned")
+}
+
 /// The one-time code the browser brought back, and the verifier it was made for, for a session:
 /// `POST /v1/auth/token`. The same answer, and the same saved session, as a password once gave.
 fn auth_token(base: &str, code: &str, verifier: &str) -> Result<Saved, Fault> {
-    let (status, body) = call(
+    let (status, body) = call_with_timeout(
         "POST",
         &endpoint(base, "/v1/auth/token"),
         None,
         Some(serde_json::json!({ "code": code, "code_verifier": verifier })),
+        AUTH_TIMEOUT,
     )?;
     match status {
         200 => saved_from(base, body),
-        400 | 401 => Err(Fault::Words(RAN_OUT)),
+        _ if banned(&body) => Err(Fault::Words(BANNED)),
+        400 | 401 if body.get("error").and_then(Value::as_str) == Some("invalid_grant") => Err(Fault::Words(RAN_OUT)),
+        400 | 401 => Err(Fault::Words("The server rejected this sign-in. Open the sign-in page again to try again.")),
         429 => Err(Fault::SlowDown),
         500..=599 => Err(Fault::Unavailable),
         _ => Err(Fault::Unreachable),
@@ -444,16 +488,21 @@ const UNREADABLE: &str = "The server's answer could not be read.";
 const UNREACHABLE: &str = "Couldn't reach that server. Check the address and your connection.";
 const SIGNED_OUT: &str = "Tiny server signed you out.";
 const NO_BROWSER: &str = "This server doesn't sign in through a browser yet. Ask its owner to update tinyserver.";
-const RAN_OUT: &str = "This sign-in ran out before it finished. Try again.";
+const RAN_OUT: &str = "The server no longer accepts this sign-in code. Open the sign-in page again to try again.";
+const BANNED: &str = "You're banned from this server.";
 const NAME_SIZE: &str = "A name is 1 to 80 characters.";
 const ROOM_NAME_SIZE: &str = "A room name is 1 to 80 characters.";
 const NOT_YOURS: &str = "You can't do that.";
+pub(crate) const HIERARCHY: &str = "You can only do that to people whose roles are below yours.";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Missing {
     Member,
     Invite,
     Room,
+    Role,
+    Category,
+    Ban,
     Plain,
 }
 
@@ -468,16 +517,38 @@ fn refused(detail: &str) -> Response {
     error(ErrorCode::Refused, detail)
 }
 
+/// A file upload's refusal. Picture uploads keep [`explain`]'s picture sentences.
+fn explain_media(status: u16, body: &Value) -> &'static str {
+    let code = body.get("error").and_then(Value::as_str).unwrap_or("");
+    match (status, code) {
+        (413, "too_large") => "That file is too big for this server.",
+        (415, "unsupported_media") => "That file isn't a kind this server takes.",
+        _ => explain(status, body, Missing::Plain),
+    }
+}
+
 fn explain(status: u16, body: &Value, missing: Missing) -> &'static str {
     let code = body.get("error").and_then(Value::as_str).unwrap_or("");
     match (status, code) {
         (401, _) => SIGNED_OUT,
+        (403, "blocked") => "Tiny blocked that file",
+        (503, "unavailable") => "Tiny couldn't scan that file",
+        (_, "hierarchy") => HIERARCHY,
+        (_, "default_role") => "@everyone can't be deleted or moved.",
+        (_, "room_full") => "That room is full.",
+        (_, "banned") => BANNED,
+        (_, "timed_out") => "You're timed out on this server for now.",
+        (_, "too_large") => "That picture is too big. The most is 256 KB.",
+        (_, "unsupported_media") => "That picture isn't a PNG, JPEG or WebP.",
         (403, _) => "You can't do that.",
         (409, "last_owner") => "This server needs an owner. Make someone else the owner first.",
         (409, "already_member") => "That person is already on this server.",
         (404, _) if missing == Missing::Member => "That person is no longer on this server.",
         (404, _) if missing == Missing::Invite => "That invite is gone or was already used.",
         (404, _) if missing == Missing::Room => "That room is gone.",
+        (404, _) if missing == Missing::Role => "That role is gone.",
+        (404, _) if missing == Missing::Category => "That category is gone.",
+        (404, _) if missing == Missing::Ban => "That person isn't banned.",
         (400, _) => CHECK,
         (429, _) => "Too many tries. Wait a minute, then try again.",
         (500..=599, _) => "The server had a problem. Try again in a moment.",
@@ -532,18 +603,23 @@ fn listed<T>(saved: &Saved, path: &str, parse: impl FnOnce(Value) -> Result<T, (
     }
 }
 
+/// The rows of one list the server sent. A row that cannot be read is left out and noted, so
+/// one odd row (an invite the server made itself, a field from a newer server) never empties
+/// the page. Not a list at all is unreadable.
+pub(crate) fn rows<T: serde::de::DeserializeOwned>(body: Value, what: &str) -> Result<Vec<T>, ()> {
+    let (rows, skipped) = tiny_rows(body).ok_or(())?;
+    if skipped > 0 {
+        tracing::warn!("chatd: Tiny server: left out {skipped} {what} that could not be read");
+    }
+    Ok(rows)
+}
+
 fn members_of(saved: &Saved) -> Result<Vec<TinyMember>, &'static str> {
     match asked("GET", saved, "/v1/members", None) {
         Err(detail) => Err(detail),
-        Ok((200, body)) => serde_json::from_value(body).map_err(|_| UNREADABLE),
+        Ok((200, body)) => rows(body, "members").map_err(|()| UNREADABLE),
         Ok((status, body)) => Err(explain(status, &body, Missing::Plain)),
     }
-}
-
-#[derive(Deserialize)]
-struct RoomWire {
-    id: String,
-    name: String,
 }
 
 /// A server older than rooms answers 404: it has none.
@@ -551,16 +627,17 @@ fn rooms_of(saved: &Saved) -> Listed<Vec<TinyRoom>> {
     match asked("GET", saved, "/v1/rooms", None) {
         Err(detail) => Listed::Failed(detail),
         Ok((403 | 404, _)) => Listed::Empty,
-        Ok((200, body)) => match serde_json::from_value::<Vec<RoomWire>>(body) {
-            Ok(rows) => Listed::Rows(rows.into_iter().map(|row| TinyRoom { id: row.id, name: row.name, participants: Vec::new() }).collect()),
-            Err(_) => Listed::Failed(UNREADABLE),
+        // Who sits in each call comes from the live socket, never from this list.
+        Ok((200, body)) => match rows::<TinyRoom>(body, "rooms") {
+            Ok(rooms) => Listed::Rows(rooms.into_iter().map(|room| TinyRoom { participants: Vec::new(), ..room }).collect()),
+            Err(()) => Listed::Failed(UNREADABLE),
         },
         Ok((status, body)) => Listed::Failed(explain(status, &body, Missing::Plain)),
     }
 }
 
 fn invites_of(saved: &Saved) -> Listed<Vec<TinyInvite>> {
-    listed(saved, "/v1/invites", |body| serde_json::from_value(body).map_err(|_| ()))
+    listed(saved, "/v1/invites", |body| rows(body, "invites"))
 }
 
 #[derive(Deserialize)]
@@ -568,11 +645,22 @@ struct AuditWire {
     id: i64,
     #[serde(default)]
     actor_id: Option<String>,
+    #[serde(default, deserialize_with = "text_or_null")]
     action: String,
+    #[serde(default, deserialize_with = "text_or_null")]
     subject: String,
     #[serde(default)]
     detail: Option<Value>,
+    #[serde(default, deserialize_with = "text_or_null")]
     created_at: String,
+    #[serde(default, deserialize_with = "text_or_null")]
+    actor_name: String,
+    #[serde(default)]
+    subject_user_id: Option<String>,
+    #[serde(default, deserialize_with = "text_or_null")]
+    subject_name: String,
+    #[serde(default, deserialize_with = "text_or_null")]
+    reason: String,
 }
 
 fn detail_text(detail: Option<Value>) -> String {
@@ -582,21 +670,28 @@ fn detail_text(detail: Option<Value>) -> String {
     }
 }
 
+/// Audit rows, each detail object kept as its JSON text.
+fn audit_rows(body: Value) -> Result<Vec<TinyAudit>, ()> {
+    let read: Vec<AuditWire> = rows(body, "audit rows")?;
+    Ok(read
+        .into_iter()
+        .map(|row| TinyAudit {
+            id: row.id,
+            actor_id: row.actor_id,
+            action: row.action,
+            subject: row.subject,
+            detail: detail_text(row.detail),
+            created_at: row.created_at,
+            actor_name: row.actor_name,
+            subject_user_id: row.subject_user_id,
+            subject_name: row.subject_name,
+            reason: row.reason,
+        })
+        .collect())
+}
+
 fn audit_of(saved: &Saved) -> Listed<Vec<TinyAudit>> {
-    listed(saved, "/v1/audit?limit=50", |body| {
-        let rows: Vec<AuditWire> = serde_json::from_value(body).map_err(|_| ())?;
-        Ok(rows
-            .into_iter()
-            .map(|row| TinyAudit {
-                id: row.id,
-                actor_id: row.actor_id,
-                action: row.action,
-                subject: row.subject,
-                detail: detail_text(row.detail),
-                created_at: row.created_at,
-            })
-            .collect())
-    })
+    listed(saved, "/v1/audit?limit=50", audit_rows)
 }
 
 /// The page: members, invites and the audit over REST, then the rooms with who is in each
@@ -606,13 +701,17 @@ pub(crate) fn community(hub: &Hub, account: AccountKey) -> Response {
         Ok(saved) => saved,
         Err(error) => return error,
     };
-    let members = match members_of(&saved) {
+    let mut members = match members_of(&saved) {
         Ok(members) => members,
         Err(detail) => return refused(detail),
     };
+    manage::remember_avatars(&saved, &account, &mut members);
+    // What the server can do and what this account may, read afresh with each load. An older
+    // server has no features and no access; the saved legacy role then decides, as it did.
+    let known = manage::learn(&saved);
+    let may = |id| tiny_allowed(known.access.as_ref(), &saved.role, id);
     // A 403 on invites or the audit is an empty list. Any other failure fails the load.
-    // The role is the one that was saved, not a role from the member list.
-    let invites = if tiny_can(&saved.role, "community.invites.read") {
+    let invites = if may("community.invites.read") {
         match invites_of(&saved) {
             Listed::Rows(rows) => rows,
             Listed::Empty => Vec::new(),
@@ -621,7 +720,7 @@ pub(crate) fn community(hub: &Hub, account: AccountKey) -> Response {
     } else {
         Vec::new()
     };
-    let audit = if tiny_can(&saved.role, "community.audit.read") {
+    let audit = if may("community.audit.read") {
         match audit_of(&saved) {
             Listed::Rows(rows) => rows,
             Listed::Empty => Vec::new(),
@@ -635,21 +734,61 @@ pub(crate) fn community(hub: &Hub, account: AccountKey) -> Response {
         Listed::Empty => Vec::new(),
         Listed::Failed(detail) => return refused(detail),
     };
+    manage::remember(&saved, |kept| kept.rooms = rooms.clone());
+    // A call in one of these rooms follows a change to its bitrate or push-to-talk.
+    if let Some(call) = hub.calls.describe().0.filter(|call| call.conversation.account() == account) {
+        if rooms.iter().any(|room| room.id == call.conversation.id) {
+            let (kbps, push_to_talk) = manage::room_audio(&saved, &call.conversation.id);
+            hub.calls.tiny_room(hub, &call.conversation, kbps, push_to_talk);
+        }
+    }
+    // Who sits where is the hub's, as the live socket put it; what the server says of each seat
+    // beyond mute and deafen is kept beside it.
     for room in &mut rooms {
         if let Some(inside) = hub.occupants(&Key::new(&account, &room.id)) {
+            let flagged = known.seats.get(&room.id);
             room.participants = inside
                 .people
                 .into_iter()
-                .map(|occupant| TinySeat { user_id: occupant.person.id, muted: occupant.muted, deafened: occupant.deafened, speaking: occupant.speaking })
+                .map(|occupant| {
+                    let flags = flagged.and_then(|seats| seats.iter().find(|seat| seat.user_id == occupant.person.id)).cloned().unwrap_or_default();
+                    TinySeat {
+                        user_id: occupant.person.id,
+                        muted: occupant.muted,
+                        deafened: occupant.deafened,
+                        speaking: occupant.speaking,
+                        server_muted: flags.server_muted,
+                        server_deafened: flags.server_deafened,
+                        suppressed: flags.suppressed,
+                        priority: flags.priority,
+                        camera: flags.camera,
+                        sharing: flags.sharing,
+                    }
+                })
                 .collect();
         }
     }
+    let extras = if known.capabilities.features.is_empty() { None } else { Some(manage::extras(&saved, &account, &known)) };
     let online = members
         .iter()
         .filter(|member| hub.presence(&Key::new(&account, &member.user_id)) == Presence::Online)
         .map(|member| member.user_id.clone())
         .collect();
     let media = media_of(&saved.base_url);
+    // The provider's name is asked once per server and kept: it changes only with the server's
+    // own setup.
+    let provider = match known.provider.clone() {
+        Some(provider) => provider,
+        None => {
+            let provider = auth_config(&saved.base_url).unwrap_or_default();
+            manage::remember(&saved, |kept| kept.provider = Some(provider.clone()));
+            provider
+        }
+    };
+    let (server, roles, categories, bans) = match extras {
+        Some(extras) => (extras.server, extras.roles, extras.categories, extras.bans),
+        None => (None, Vec::new(), Vec::new(), Vec::new()),
+    };
     Response::TinyCommunity {
         community: TinyCommunity {
             role: saved.role,
@@ -660,6 +799,14 @@ pub(crate) fn community(hub: &Hub, account: AccountKey) -> Response {
             rooms,
             online,
             media,
+            capabilities: known.capabilities,
+            access: known.access,
+            me: saved.user_id,
+            server,
+            roles,
+            categories,
+            bans,
+            provider,
         },
     }
 }
@@ -673,10 +820,11 @@ pub(crate) fn media_of(base: &str) -> String {
     }
 }
 
-/// The signed-in session, when its role may do `id`. Nothing is asked of the server here.
+/// The signed-in session, when it may do `id`: by its permissions on a server with roles, as
+/// last read, else by its saved role. Nothing is asked of the server here.
 pub(crate) fn may(account: &AccountKey, id: &str) -> Result<Saved, Response> {
     let saved = open(account)?;
-    if !tiny_can(&saved.role, id) {
+    if !tiny_allowed(manage::known(&saved).access.as_ref(), &saved.role, id) {
         return Err(refused(NOT_YOURS));
     }
     Ok(saved)
@@ -817,7 +965,7 @@ pub(crate) fn revoke(account: AccountKey, invite_id: String) -> Response {
         Ok(saved) => saved,
         Err(error) => return error,
     };
-    if !tiny_can(&saved.role, "community.invites.revoke") {
+    if !tiny_allowed(manage::known(&saved).access.as_ref(), &saved.role, "community.invites.revoke") {
         return refused("You can't do that.");
     }
     if !safe_id(&invite_id) {
@@ -919,6 +1067,17 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_blocked_upload_and_a_missed_scan_are_said_in_words() {
+        let body = |code: &str| serde_json::json!({ "error": code });
+        assert_eq!(explain(403, &body("blocked"), Missing::Plain), "Tiny blocked that file");
+        assert_eq!(explain(503, &body("unavailable"), Missing::Plain), "Tiny couldn't scan that file");
+        assert_eq!(explain_media(413, &body("too_large")), "That file is too big for this server.");
+        assert_eq!(explain_media(415, &body("unsupported_media")), "That file isn't a kind this server takes.");
+        assert_eq!(explain(413, &body("too_large"), Missing::Plain), "That picture is too big. The most is 256 KB.");
+        assert_eq!(explain(415, &body("unsupported_media"), Missing::Plain), "That picture isn't a PNG, JPEG or WebP.");
+    }
+
+    #[test]
     fn a_session_is_one_account_and_a_bad_one_is_an_error() {
         let signed = accounts(session()).unwrap();
         assert_eq!(signed.len(), 1);
@@ -944,6 +1103,18 @@ pub(crate) mod tests {
 
     fn other() -> &'static str {
         r#"{"base_url":"https://other.example","token":"u","user_id":"22222222-2222-2222-2222-222222222222","email":"bea@example.com","display_name":"Bea","role":"member"}"#
+    }
+
+    #[test]
+    fn local_servers_return_origins_without_session_credentials() {
+        let both = combine(session(), other()).unwrap();
+        let origins = local_origins(&both).unwrap();
+        assert_eq!(origins.len(), 2);
+        assert_eq!(origins[0].1, "http://127.0.0.1:8080");
+        assert_eq!(origins[1].1, "https://other.example");
+        let wire = serde_json::to_string(&origins).unwrap();
+        assert!(!wire.contains("\"token\""));
+        assert!(local_origins("not json").is_err());
     }
 
     #[test]
@@ -980,6 +1151,15 @@ pub(crate) mod tests {
         assert!(combine("not json", other()).is_err());
     }
 
+    #[test]
+    fn authentication_allows_a_server_slower_than_ten_seconds() {
+        let base = serve(|_| {
+            std::thread::sleep(Duration::from_secs(11));
+            http(200, "OK", r#"{"methods":["oidc"],"provider_name":"Slow provider"}"#)
+        });
+        assert_eq!(auth_config(&base).ok().as_deref(), Some("Slow provider"));
+    }
+
     /// Speaks the sign-in and session routes on a local socket: the provider's name, where to
     /// send the browser, the code for a session, me, delete, and a redirect that must not be
     /// followed.
@@ -1004,6 +1184,9 @@ pub(crate) mod tests {
                 return http(200, "OK", r#"{"authorize_url":"https://auth.example/authorize?state=s"}"#);
             }
             if first.starts_with("POST /v1/auth/token ") {
+                if body.contains("rejected") {
+                    return http(401, "Unauthorized", r#"{"error":"invalid_client"}"#);
+                }
                 if body.contains("used") {
                     return http(400, "Bad Request", r#"{"error":"invalid_grant"}"#);
                 }
@@ -1040,6 +1223,7 @@ pub(crate) mod tests {
         assert!(matches!(start("bad"), Err(Fault::Words(CHECK))));
         assert_eq!(start("fine").ok().as_deref(), Some("https://auth.example/authorize?state=s"));
         assert!(matches!(auth_token(&base, "used", "verifier"), Err(Fault::Words(RAN_OUT))));
+        assert!(matches!(auth_token(&base, "rejected", "verifier"), Err(Fault::Words(words)) if words != RAN_OUT));
         let saved = match auth_token(&base, "one-time", "verifier") {
             Ok(saved) => saved,
             Err(_) => panic!("token failed"),
@@ -1067,6 +1251,9 @@ pub(crate) mod tests {
         assert!(matches!(bounced, Err(Fault::Unreachable)));
 
         // A tinyserver from before the browser sign-in has no config route.
+        let barred = serve(|_| http(403, "Forbidden", r#"{"error":"banned"}"#));
+        assert!(matches!(auth_start(&barred, "http://127.0.0.1:5/callback", "c", "s", Some("invite")), Err(Fault::Words(BANNED))));
+        assert!(matches!(auth_token(&barred, "code", "verifier"), Err(Fault::Words(BANNED))));
         let older = serve(|_| http(404, "Not Found", r#"{"error":"not_found"}"#));
         assert!(matches!(auth_config(&older), Err(Fault::Words(NO_BROWSER))));
         let passwords = serve(|_| http(200, "OK", r#"{"methods":["password"]}"#));
@@ -1118,7 +1305,7 @@ pub(crate) mod tests {
         assert!(matches!(get_me(&saved), Err(Fault::Unauthorized)));
     }
 
-    fn with_session(base: &str, role: &str, run: impl FnOnce(AccountKey)) {
+    pub(crate) fn with_session(base: &str, role: &str, run: impl FnOnce(AccountKey)) {
         let user_id = "11111111-1111-1111-1111-111111111111";
         let session = format!(
             r#"{{"base_url":{base:?},"token":"t","user_id":{user_id:?},"email":"ada@example.com","display_name":"Ada","role":{role:?}}}"#
@@ -1269,7 +1456,49 @@ pub(crate) mod tests {
         assert!(lines.iter().any(|line| line.contains("GET /v1/audit?limit=50")));
     }
 
-    fn test_hub() -> Arc<Hub> {
+    /// The server's own owner invite has no creator, and a newer server sends fields this
+    /// client does not know. Neither fails the page; a row that cannot be read is left out.
+    #[test]
+    fn an_invite_without_a_creator_and_one_bad_row_still_load_the_page() {
+        let base = serve(move |request| {
+            let first = request.lines().next().unwrap_or("");
+            if first.starts_with("GET /v1/members ") {
+                return http(
+                    200,
+                    "OK",
+                    r#"[{"user_id":"11111111-1111-1111-1111-111111111111","email":null,"display_name":"Ada","role":"owner","created_at":"2020-01-01T00:00:00Z","owner":true,"roles":[],"last_seen_at":null},{"display_name":"No id"}]"#,
+                );
+            }
+            if first.starts_with("GET /v1/invites ") {
+                return http(
+                    200,
+                    "OK",
+                    r#"[{"id":"inv1","role":"owner","created_by":null,"created_by_name":null,"expires_at":"2030-01-01T00:00:00Z","label":null,"uses":0},{"id":7},{"role":"member"},{"id":"inv2","role":"member","created_by":"11111111-1111-1111-1111-111111111111","expires_at":"2030-01-01T00:00:00Z"}]"#,
+                );
+            }
+            if first.starts_with("GET /v1/audit") {
+                return http(200, "OK", r#"[{"id":1,"actor_id":null,"action":"server.bootstrap","subject":null,"detail":null,"created_at":"t","actor_name":null},{"id":"two"}]"#);
+            }
+            if first.starts_with("GET /v1/rooms ") {
+                return http(200, "OK", r#"[{"id":"r1","name":"Lobby","position":0,"topic":null},{"name":"No id"}]"#);
+            }
+            http(404, "Not Found", r#"{"error":"not_found"}"#)
+        });
+        with_session(&base, "owner", |account| match community(&test_hub(), account) {
+            Response::TinyCommunity { community } => {
+                assert_eq!(community.members.len(), 1);
+                assert_eq!(community.members[0].email, "");
+                assert_eq!(community.invites.iter().map(|invite| invite.id.as_str()).collect::<Vec<_>>(), ["inv1", "inv2"]);
+                assert_eq!(community.invites[0].created_by, "", "the server's own invite has no creator");
+                assert_eq!(community.audit.len(), 1);
+                assert_eq!(community.audit[0].subject, "");
+                assert_eq!(community.rooms.len(), 1);
+            }
+            other => panic!("load: {other:?}"),
+        });
+    }
+
+    pub(crate) fn test_hub() -> Arc<Hub> {
         Arc::new(Hub::new(crate::store::Store::open(std::path::Path::new(":memory:")).expect("a store in memory")))
     }
 
@@ -1307,7 +1536,7 @@ pub(crate) mod tests {
                 Response::TinyCommunity { community } => {
                     assert_eq!(community.rooms.len(), 2);
                     assert_eq!(community.rooms[0].name, "Lobby");
-                    assert_eq!(community.rooms[0].participants, [TinySeat { user_id: BEA.into(), muted: true, deafened: false, speaking: false }]);
+                    assert_eq!(community.rooms[0].participants, [TinySeat { user_id: BEA.into(), muted: true, ..TinySeat::default() }]);
                     assert_eq!(community.media, "up");
                     assert!(community.rooms[1].participants.is_empty());
                     assert_eq!(community.online, [BEA]);
@@ -1578,7 +1807,7 @@ pub(crate) mod tests {
         });
     }
 
-    fn json_body(request: &str) -> serde_json::Value {
+    pub(crate) fn json_body(request: &str) -> serde_json::Value {
         let body = request.split("\r\n\r\n").nth(1).unwrap_or("");
         serde_json::from_str(body).unwrap_or_else(|err| panic!("body {err}"))
     }
@@ -1612,7 +1841,8 @@ pub(crate) mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("addr").port();
         std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            // Long enough for a test that waits its turn for the session lock.
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
             listener.set_nonblocking(true).expect("nonblocking");
             while std::time::Instant::now() < deadline {
                 match listener.accept() {

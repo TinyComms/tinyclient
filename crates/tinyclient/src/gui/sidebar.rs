@@ -29,12 +29,15 @@ use super::state::{Shell, Snapshot, SpaceTree, TROUBLE_SHOWN};
 use super::theme::{self, Type};
 use crate::client::ask;
 use gpui::{
-    div, prelude::*, px, uniform_list, Context, Div, FocusHandle, ListAlignment, ListState, MouseButton,
+    div, prelude::*, px, uniform_list, Context, Div, FocusHandle, FontWeight, ListAlignment, ListState, MouseButton,
     ScrollStrategy, SharedString, Stateful, UniformListScrollHandle, Window,
 };
 use history::History;
 use pages::Pages;
-use protocol::{AccountKey, Badge, Conversation, ConversationKind, InboxCounts, InboxFilter, Key, Link, Network, Request, Response, PAGE_LIMIT};
+use protocol::{
+    AccountKey, Badge, CallSupport, Conversation, ConversationKind, InboxCounts, InboxFilter, Key, Link, Network,
+    Occupants, Request, Response, PAGE_LIMIT,
+};
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::rc::Rc;
@@ -119,6 +122,7 @@ pub struct State {
     /// The tree on show, flat. Rebuilt on collapse and when its data changes.
     pub rows: Rc<Vec<Row>>,
     tree_scroll: UniformListScrollHandle,
+    folder_tabs_scroll: gpui::ScrollHandle,
     /// The row the keyboard is on. Moving it opens nothing.
     pub cursor: Option<usize>,
     pub focus: FocusHandle,
@@ -185,6 +189,7 @@ impl State {
             opted_shown: HashSet::new(),
             rows: Rc::new(Vec::new()),
             tree_scroll: UniformListScrollHandle::new(),
+            folder_tabs_scroll: gpui::ScrollHandle::new(),
             cursor: None,
             focus: cx.focus_handle(),
             pins: Vec::new(),
@@ -255,17 +260,25 @@ impl State {
 }
 
 /// The glyph of a conversation in a tree. A channel only invited people see shows a lock.
-pub fn kind_glyph(kind: ConversationKind, private: bool) -> &'static str {
+pub fn kind_glyph(kind: ConversationKind, private: bool, call: CallSupport) -> &'static str {
     match kind {
-        ConversationKind::Channel if private => "icons/lock.svg",
+        ConversationKind::Channel | ConversationKind::Voice if private => "icons/lock.svg",
         ConversationKind::Direct => "icons/user.svg",
         ConversationKind::Group => "icons/users.svg",
         ConversationKind::Channel => "icons/hash.svg",
         ConversationKind::Announcement => "icons/megaphone.svg",
+        // A stage is a voice row handed to Discord (`02` §4): radio, not speaker.
+        ConversationKind::Voice if call == CallSupport::Handoff => "icons/radio.svg",
         ConversationKind::Voice => "icons/volume-2.svg",
         ConversationKind::Forum => "icons/messages-square.svg",
         ConversationKind::Thread => "icons/corner-down-right.svg",
     }
+}
+
+/// A voice row the server list lets you join from: a native voice channel, never a stage,
+/// which opens in Discord instead (07 §1).
+pub fn joins_from_list(c: &Conversation) -> bool {
+    c.kind == ConversationKind::Voice && c.call == CallSupport::Native
 }
 
 fn row_id(prefix: &'static str, key: &Key) -> gpui::ElementId {
@@ -354,6 +367,28 @@ impl Shell {
         }
         self.remember();
         self.set_mode(mode, cx);
+    }
+
+    /// Show this conversation in its network home and scroll to the row. Slack stays on the
+    /// workspace home: Space mode drops the Threads row and the All / Unread segments.
+    pub(super) fn reveal_in_sidebar(&mut self, conversation: &Conversation, cx: &mut Context<Self>) {
+        if conversation.key.network == Network::Slack {
+            if let Some(id) = conversation.space.clone() {
+                self.sidebar_state.slack = Some(Key { id, ..conversation.key.clone() });
+            }
+            if matches!(self.sidebar_state.mode, Mode::Network(Network::Slack)) {
+                self.show_mode(cx);
+            } else {
+                self.go(Mode::Network(Network::Slack), cx);
+            }
+        } else if let Some(id) = conversation.space.clone() {
+            self.go(Mode::Space(Key { id, ..conversation.key.clone() }), cx);
+        }
+        let key = conversation.key.clone();
+        if let Some(ix) = self.sidebar_state.rows.iter().position(|row| row.conversation().is_some_and(|c| c.key == key)) {
+            self.sidebar_state.cursor = Some(ix);
+            self.scroll_to(ix);
+        }
     }
 
     fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
@@ -1011,20 +1046,59 @@ impl Shell {
         }
     }
 
+    /// The hover Join pill of a voice row: the header pill's look, shrunk to the row (07 §1).
+    /// Invisible until the row is hovered, so a plain view of the list stays quiet.
+    pub(super) fn join_pill(&self, conversation: &Conversation, cx: &mut Context<Self>) -> Stateful<Div> {
+        let key = conversation.key.clone();
+        let title = conversation.title.clone();
+        div()
+            .id(row_id("join", &key))
+            .flex_none()
+            .h(px(20.))
+            .px(px(8.))
+            .rounded(px(10.))
+            .border_1()
+            .flex()
+            .items_center()
+            .gap(px(5.))
+            .text_size(px(11.))
+            .font_weight(FontWeight::MEDIUM)
+            .cursor_pointer()
+            .bg(theme::raised())
+            .border_color(theme::hairline())
+            .text_color(theme::text())
+            .hover(|style| style.bg(theme::selected()))
+            .tooltip(tip(
+                format!("Join {}. People there will see you arrive.", title),
+                None,
+            ))
+            .invisible()
+            .group_hover("voice", |style| style.visible())
+            // The press belongs to the pill: the row's open must not fire with it.
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(move |this, _, _, cx| this.call_start(key.clone(), cx)))
+            .child(glyph("icons/volume-2.svg", 12., theme::text()))
+            .child("Join")
+    }
+
     /// A conversation in a tree, 28: glyph or avatar 20, the name, then what is going on.
     fn place_row(&self, c: &Rc<Conversation>, depth: u8, focused: bool, cx: &mut Context<Self>) -> Stateful<Div> {
         let selected = self.open.as_ref() == Some(&c.key);
         let tone = row_tone(c, selected, true);
         let surface = theme::row_surface(selected);
-        let occupied = c.occupants.as_ref().filter(|inside| inside.total > 0);
-        // An empty voice channel rests at a muted row's weight (`02` §4).
-        let empty_voice = c.kind == ConversationKind::Voice && occupied.is_none() && !selected;
+        let inside = c.occupants.as_ref().filter(|row| row.total > 0);
+        // A stage is Discord's: its row counts who is on stage, not who is in it.
+        let stage = c.key.network == Network::Discord && c.kind == ConversationKind::Voice && c.call == CallSupport::Handoff;
+        let live = stage.then(|| inside.and_then(stage_line)).flatten();
+        // An empty voice channel rests at a muted row's weight, and a stage with nobody on
+        // stage reads as one (`02` §4).
+        let empty_voice = empty_voice_row(c.kind, stage, selected, inside.is_some(), live.is_some());
         let title_color = if empty_voice { theme::text_faint() } else { tone.title };
         let leading = match c.kind {
             ConversationKind::Direct | ConversationKind::Group => self.conversation_avatar(c, 20., surface, cx).into_any_element(),
             kind => {
                 let icon_color = if c.muted || empty_voice { theme::text_faint() } else { theme::text_soft() };
-                let icon = if c.key.network == Network::Teams && kind == ConversationKind::Channel && !c.private { None } else { Some(kind_glyph(kind, c.private)) };
+                let icon = if c.key.network == Network::Teams && kind == ConversationKind::Channel && !c.private { None } else { Some(kind_glyph(kind, c.private, c.call)) };
                 div().size(px(20.)).flex_none().flex().items_center().justify_center().children(icon.map(|icon| glyph(icon, if kind == ConversationKind::Thread { 14. } else { 16. }, icon_color))).into_any_element()
             }
         };
@@ -1035,9 +1109,23 @@ impl Shell {
             .and_then(|peer| self.people_state.hub().person(&Key { id: peer.clone(), ..c.key.clone() }))
             .map(|person| person.emoji)
             .filter(|emoji| !emoji.is_empty());
-        let limit = occupied.map(|inside| inside.total.to_string());
+        // The `4/12` is a native voice channel. A stage trails "Live · n speaking" instead.
+        let count = if stage {
+            None
+        } else {
+            inside.and_then(|row| voice_count(row.total, if c.call == CallSupport::Native { c.limit } else { 0 }))
+        };
         let draft = (!self.draft_of(c).is_empty() && !selected).then(|| glyph("icons/pencil.svg", 14., theme::text_faint()));
         let (picked, menu_row) = (c.clone(), c.clone());
+        let ours = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.call.as_ref())
+            .map_or(false, |call| {
+                call.conversation == c.key
+                    && !matches!(call.state, protocol::CallState::Failed { .. })
+            });
+        let join = joins_from_list(c) && !ours;
         let content = div()
             // 16 a level less the gap after it (none at the top), as the tree's other rows.
             .children((depth > 0).then(|| div().flex_none().w(px(16. * f32::from(depth) - 8.))))
@@ -1055,11 +1143,31 @@ impl Shell {
             .children(status.map(|emoji| div().flex_none().type_small().child(emoji)))
             .children(chat::name_mark(c).filter(|_| c.kind.is_direct()))
             .child(div().flex_1())
+            .children(join.then(|| self.join_pill(c, cx)))
             .children(draft)
-            .children(limit.map(|total| div().flex_none().flex().items_center().gap(px(2.)).child(glyph("icons/volume-2.svg", 12., theme::text_faint())).child(div().type_micro().text_color(theme::text_faint()).child(total))))
-            .children(row_badge(c));
+            .children(count.map(|(count, soft)| div().flex_none().flex().items_center().gap(px(2.)).child(glyph("icons/volume-2.svg", 12., theme::text_faint())).child(div().type_micro().text_color(if soft { theme::text_soft() } else { theme::text_faint() }).child(count))))
+            .children(live.map(|line| div().flex_none().type_micro().text_color(theme::text_faint()).child(line)))
+            .children(row_badge(c))
+            .when(join, |row| row.group("voice"));
         list_row(row_id("tree", &c.key), theme::row_height(theme::ROW_ONE), selected, focused, content)
-            .map(|row| self.tap(row, super::phone::token(&["place", picked.key.network.label(), &picked.key.account, &picked.key.id]), Some(picked.clone()), move |this, cx| this.pick_row(&picked, cx), cx))
+            .map(|row| {
+                if super::phone::active() {
+                    let token = super::phone::token(&["place", picked.key.network.label(), &picked.key.account, &picked.key.id]);
+                    let menu = Some(picked.clone());
+                    return self.tap(row, token, menu, move |this, cx| this.pick_row(&picked, cx), cx);
+                }
+                row.on_mouse_down(
+                    MouseButton::Left,
+                    // A voice row joins on a double-click; a single click only opens its chat.
+                    cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                        if join && event.click_count == 2 {
+                            this.call_start(picked.key.clone(), cx);
+                        } else {
+                            this.pick_row(&picked, cx);
+                        }
+                    }),
+                )
+            })
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
@@ -1138,9 +1246,13 @@ impl Shell {
                 let words = if count > 99 { "99+".to_owned() } else { count.to_string() };
                 div().ml(px(5.)).text_size(px(11.)).font_weight(theme::MEDIUM).text_color(if on { theme::text() } else { theme::text_faint() }).child(words)
             });
+            let mention_tip = (label == "Mentions" && count > 0).then(|| {
+                if count == 1 { "1 conversation mentions you".to_owned() } else { format!("{count} conversations mention you") }
+            });
             out = out.child(
                 segment(id, label, on)
                     .children(counted)
+                    .when_some(mention_tip, |segment, words| segment.tooltip(tip(words, None)))
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(move |this, _, _, cx| pick(this, ix, cx))),
             );
@@ -1195,6 +1307,10 @@ impl Shell {
             }
             Mode::People => strip.child(pane_title("People")),
             Mode::Network(Network::Slack) => self.slack_title(strip, cx),
+            // A Tiny server's strip is its header: its icon and name, which open its menu.
+            Mode::Network(Network::Tiny) if self.snapshot.as_ref().is_some_and(|snapshot| snapshot.link(Network::Tiny) == Link::Connected) => {
+                strip.child(self.tiny_header(cx))
+            }
             Mode::Network(network) => {
                 let network = *network;
                 let strip = strip.child(network_icon(network, 20.));
@@ -1365,11 +1481,10 @@ impl Shell {
                         this.sidebar_state.slack_menu = false;
                         this.show_mode(cx);
                     }))
-                    .child(Avatar::new(&space.key, &space.name, 20.).shape(Shape::Place).build())
+                    .child(Avatar::new(&space.key, &space.name, 20.).shape(Shape::Place).image_at(self.media_path(&space.key, space.icon.as_ref())).build())
                     .child(div().flex_1().min_w_0().truncate().type_ui().text_color(theme::text()).child(space.name.clone()))
                     .children(words.map(|words| div().type_small().text_color(theme::text_soft()).child(words)))
-                    .children(rollup_badge(space.attention, space.unread))
-                    .when(!phone, |row| row.child(div().type_small().text_color(theme::text_soft()).child(crate::gui::shortcuts::label(&format!("⌃{}", ix + 1)))));
+                    .children(rollup_badge(space.attention, space.unread));
                 menu = menu.child(row);
             }
             menu = menu.child(super::components::menu_separator());
@@ -1510,6 +1625,8 @@ impl Shell {
     pub(super) fn sidebar(&self, snapshot: &Snapshot, width: f32, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let people = self.sidebar_state.mode == Mode::People;
         let tiny = matches!(self.sidebar_state.mode, Mode::Network(Network::Tiny));
+        // Messages has no StartDirect, so the compose button would open a switcher that cannot start a text.
+        let messages = matches!(self.sidebar_state.mode, Mode::Network(Network::Messages));
         if !matches!(&self.sidebar_state.mode, Mode::Space(space) if space.network == Network::Discord) {
             self.sidebar_state.width.set(width);
         }
@@ -1535,7 +1652,7 @@ impl Shell {
             .when(!phone, |sidebar| sidebar.border_r_1().border_color(theme::hairline()))
             .when(phone, |sidebar| sidebar.pt(px(super::phone::tokens::safe_top())).pb(px(super::phone::tokens::safe_bottom())))
             .child(self.title_strip(&self.sidebar_state.mode, cx))
-            .when(!people && !tiny, |sidebar| sidebar.child(self.jump_strip(cx)))
+            .when(!people && !tiny && !messages, |sidebar| sidebar.child(self.jump_strip(cx)))
             .children(tabs)
             .when(!banners.is_empty(), |sidebar| sidebar.child(div().flex_none().px(px(theme::INSET)).pb(px(8.)).flex().flex_col().gap(px(4.)).children(banners)))
             .child(
@@ -1557,8 +1674,38 @@ impl Shell {
             )
             .children(super::playing::draw(self, window, cx))
             .children(self.slots.call_dock.and_then(|draw| draw(self, window, cx)))
+            .children(tiny.then(|| self.tiny_user_panel(cx)).flatten())
             .when(!phone, |sidebar| sidebar.children(self.slack_menu(cx)))
     }
+}
+
+/// An occupied voice row's trailing count: `4/12` when the channel has a user limit, else just
+/// `4` (`02` §4), and whether the number is drawn `text_soft`. `None` for an empty channel.
+fn voice_count(total: u32, limit: u32) -> Option<(String, bool)> {
+    (total > 0).then(|| {
+        let limited = limit > 0;
+        (if limited { format!("{total}/{limit}") } else { total.to_string() }, limited)
+    })
+}
+
+/// A stage channel's trailing words: only who is on stage counts, the audience does not.
+/// Nobody on stage reads as an empty channel, so nothing (`02` §4).
+fn stage_line(occupants: &Occupants) -> Option<String> {
+    let speaking = occupants.people.iter().filter(|occupant| occupant.speaking).count();
+    (speaking > 0).then(|| format!("Live · {speaking} speaking"))
+}
+
+/// Whether a voice row draws its title faint: an empty voice channel, or a stage with
+/// nobody on stage. An audience-only stage is therefore faint, even though its people
+/// are still listed.
+fn empty_voice_row(kind: ConversationKind, stage: bool, selected: bool, has_occupants: bool, has_live: bool) -> bool {
+    kind == ConversationKind::Voice && !selected && (!has_occupants || (stage && !has_live))
+}
+
+/// The count a row trails: a normal voice channel shows how many are in it; a stage
+/// shows none, since its trailing words are the live count instead.
+fn row_count(stage: bool, inside: Option<&Occupants>) -> Option<String> {
+    if stage { None } else { inside.map(|row| row.total.to_string()) }
 }
 
 /// A tree row's name: a channel without its `#`; a Slack group DM by first names, "Mara,
@@ -1668,6 +1815,14 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn an_occupied_voice_row_counts_4_of_12_when_limited_and_bare_without() {
+        assert_eq!(voice_count(4, 12), Some(("4/12".to_owned(), true)));
+        assert_eq!(voice_count(4, 0), Some(("4".to_owned(), false)));
+        // An empty channel has nothing trailing, limit or not.
+        assert_eq!(voice_count(0, 12), None);
+    }
+
+    #[test]
     fn the_most_urgent_account_speaks_signed_out_then_needs_you_then_reconnecting() {
         let mut tones = vec![Tone::Warning, Tone::Attention, Tone::Danger];
         tones.sort_by_key(|tone| urgency(*tone));
@@ -1682,5 +1837,73 @@ pub(crate) mod tests {
         assert_eq!(on_screen(&list, 40, |_| 48.), 0..19);
         list.scroll_to(gpui::ListOffset { item_ix: 5, offset_in_item: px(10.) });
         assert_eq!(on_screen(&list, 40, |_| 100.).start, 5);
+    }
+
+    #[test]
+    fn a_stage_row_reads_as_a_radio_and_a_voice_channel_as_a_speaker() {
+        let stage = Conversation { call: CallSupport::Handoff, ..row("stage", ConversationKind::Voice) };
+        let voice = row("voice", ConversationKind::Voice);
+        assert_eq!(kind_glyph(stage.kind, stage.private, stage.call), "icons/radio.svg");
+        assert_eq!(kind_glyph(voice.kind, voice.private, voice.call), "icons/volume-2.svg");
+        assert_eq!(kind_glyph(ConversationKind::Channel, false, CallSupport::None), "icons/hash.svg");
+    }
+
+    #[test]
+    fn a_native_voice_row_joins_from_the_list_and_nothing_else_does() {
+        let voice = |call| {
+            let mut c = row("lounge", ConversationKind::Voice);
+            c.call = call;
+            c
+        };
+        assert!(joins_from_list(&voice(CallSupport::Native)));
+        // A stage opens in Discord instead, and an empty channel's pill cannot join either.
+        assert!(!joins_from_list(&voice(CallSupport::Handoff)));
+        assert!(!joins_from_list(&voice(CallSupport::None)));
+        // A text channel's click only opens, and a DM call joins from its header.
+        assert!(!joins_from_list(&row("general", ConversationKind::Channel)));
+        assert!(!joins_from_list(&row("mara", ConversationKind::Direct)));
+    }
+
+    fn on_stage(speaking: &[bool]) -> Occupants {
+        let person = row("2001", ConversationKind::Voice).key;
+        Occupants {
+            people: speaking
+                .iter()
+                .map(|live| protocol::Occupant { person: person.clone(), name: "Mara O".into(), muted: false, deafened: false, streaming: false, speaking: *live })
+                .collect(),
+            total: speaking.len() as u32,
+        }
+    }
+
+    #[test]
+    fn a_stage_row_says_who_is_live_and_an_audience_only_one_reads_as_empty() {
+        assert_eq!(stage_line(&on_stage(&[false, true, true])).as_deref(), Some("Live · 2 speaking"));
+        assert_eq!(stage_line(&on_stage(&[true])).as_deref(), Some("Live · 1 speaking"));
+        // Only the audience: the design's empty stage, so no words trail.
+        assert_eq!(stage_line(&on_stage(&[false, false])), None);
+        assert_eq!(stage_line(&Occupants::default()), None);
+    }
+
+    #[test]
+    fn a_stage_row_carries_no_count_and_faints_when_only_the_audience_is_present() {
+        let occupants = on_stage(&[false, false]);
+        let inside = Some(&occupants);
+        // A stage never trails a total: its trailing words are the live count.
+        assert_eq!(row_count(true, inside), None);
+        assert_eq!(row_count(true, None), None);
+        // A normal voice channel still trails its total.
+        assert_eq!(row_count(false, inside), Some("2".to_owned()));
+        assert_eq!(row_count(false, None), None);
+
+        // An audience-only stage reads as empty, so its title is faint.
+        assert!(empty_voice_row(ConversationKind::Voice, true, false, true, false));
+        // A stage with someone on it is not faint.
+        assert!(!empty_voice_row(ConversationKind::Voice, true, false, true, true));
+        // An empty voice channel is faint too.
+        assert!(empty_voice_row(ConversationKind::Voice, false, false, false, false));
+        // A selected row is never faint, even when empty.
+        assert!(!empty_voice_row(ConversationKind::Voice, true, true, true, false));
+        // Non-voice rows are untouched.
+        assert!(!empty_voice_row(ConversationKind::Channel, true, false, true, false));
     }
 }

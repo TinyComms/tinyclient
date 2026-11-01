@@ -7,6 +7,9 @@ publish.workspace = true
 
 [dependencies]
 protocol.workspace = true
+tracing.workspace = true
+# The system's notifications (`notify.rs`).
+notifier = { path = "../notifier" }
 # Ships SQLite in the crate so Windows and Linux builds need no system libsqlite3.
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde.workspace = true
@@ -53,9 +56,11 @@ presage = { git = "https://github.com/whisperfish/presage", rev = "9e1f0b8d", op
 aes-gcm-siv = { version = "0.11", optional = true }
 futures = { version = "0.3", default-features = false, features = ["std", "async-await"], optional = true }
 getrandom = "0.3"
-# Android Messages (Google Messages for web): AES-256-CTR and HMAC on the phone relay, and an
-# ECDSA key the phone learns from the QR code. No second TLS stack: requests go through ureq.
-p256 = { version = "0.13", features = ["pkcs8"] }
+# Google Messages: UKEY2 P-256 pairing, HKDF relay keys, and SAPISID request authentication.
+# Requests use the same system TLS through ureq.
+p256 = { version = "0.13", features = ["pkcs8", "ecdh"] }
+hkdf = "0.12"
+sha1 = "0.10"
 aes = "0.8"
 ctr = "0.9"
 hmac = "0.12"

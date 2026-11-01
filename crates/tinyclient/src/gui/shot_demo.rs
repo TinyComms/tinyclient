@@ -708,6 +708,8 @@ pub fn answer(request: &Request) -> std::io::Result<Response> {
             seq: 1,
             keychain: protocol::Keychain::default(),
             started: 1,
+            // No session: a shot starts nothing that would share it.
+            session: String::new(),
         },
         // Nothing ever changes: the wait runs out and is asked again, as a quiet chatd's does.
         Request::Wait { .. } => {

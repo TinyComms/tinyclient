@@ -140,7 +140,7 @@ fn footprint() -> (f64, f64) {
 
 fn report(pane: &Pane, what: &str) {
     let (now, peak) = footprint();
-    eprintln!(
+    tracing::warn!(
         "s5: {what}: footprint {now:.1} MB (highest {peak:.1} MB), {} messages held, pictures {:.1} MB (peak {:.1} MB, {} dropped), frames here {:.1} MB, all moving pictures {:.1} MB, moving avatars {:.1} MB",
         pane.window.messages.len(),
         pane.images.bytes() as f64 / 1_048_576.,
@@ -159,7 +159,7 @@ pub fn opened(pane: &mut Pane, cx: &mut Context<Pane>) {
     }
     if pane.script.stats {
         let took = pane.open.as_ref().map(|open| open.started.elapsed());
-        eprintln!("s5: first page applied {took:?} after opening");
+        tracing::warn!("s5: first page applied {took:?} after opening");
     }
     if let Some(id) = pane.script.at.clone() {
         pane.jump_to(&id, cx);
@@ -234,7 +234,7 @@ pub fn drawn(pane: &mut Pane, window: &mut Window, cx: &mut Context<Pane>) {
             let message = pane.items.get(*ix).and_then(super::rows::Item::message)?;
             (message.id == id).then(|| f32::from(bounds.top() - top))
         });
-        eprintln!("s5: older page landed: {id} was {was:.1} below the top, is now {now:.1?}");
+        tracing::warn!("s5: older page landed: {id} was {was:.1} below the top, is now {now:.1?}");
     }
     stage(pane, window, cx);
     if pane.script.stats && pane.script.drawn && pane.script.up.is_none_or(|left| left <= 0.) {
@@ -249,7 +249,7 @@ pub fn drawn(pane: &mut Pane, window: &mut Window, cx: &mut Context<Pane>) {
     }
     if pane.script.stats {
         let took = pane.open.as_ref().map(|open| open.started.elapsed());
-        eprintln!("s5: first rows drawn {took:?} after opening");
+        tracing::warn!("s5: first rows drawn {took:?} after opening");
         report(pane, "first draw");
     }
     let viewed = pane.script.view.clone().and_then(|id| pane.find(&id));
@@ -345,7 +345,7 @@ pub fn steps(cx: &mut gpui::Context<crate::gui::state::Shell>) {
                     let _ = pane.update(cx, |pane, cx| {
                         pane.jump_to(id, cx);
                         let Some(message) = pane.find(id) else {
-                            return eprintln!("shot: no message {id}");
+                            return tracing::warn!("shot: no message {id}");
                         };
                         let playable = |a: &protocol::Attachment| matches!(media::shape(a), media::Shape::Voice | media::Shape::Audio);
                         if let Some(index) = message.attachments.iter().position(playable) {
@@ -382,7 +382,7 @@ pub fn steps(cx: &mut gpui::Context<crate::gui::state::Shell>) {
                                 shell.open_thread_of(conversation, root, cx);
                             }
                         }
-                        other => eprintln!("shot: unknown step {other}"),
+                        other => tracing::warn!("shot: unknown step {other}"),
                     },
                 }
                 cx.notify();
@@ -397,7 +397,7 @@ pub fn steps(cx: &mut gpui::Context<crate::gui::state::Shell>) {
                 let open = shell.snapshot.as_ref().and_then(|s| s.open.as_ref()).map(|open| open.title.clone());
                 let stack = &shell.conversation_state.side.stack;
                 let thread = shell.conversation_state.thread.borrow().as_ref().and_then(|thread| thread.read(cx).key().cloned());
-                eprintln!(
+                tracing::warn!(
                     "shot: after {step}: open {open:?}, pane {:?} over {:?}, slot {:?}, thread view {:?}",
                     stack.push.as_ref().map(crate::gui::pane::Layer::title),
                     stack.base.as_ref().map(crate::gui::pane::Layer::title),

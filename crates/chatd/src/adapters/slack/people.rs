@@ -250,7 +250,7 @@ impl Slack {
             if std::env::var_os("TINYCLIENT_SHAPES").is_some() {
                 // Field names only, never values: for comparing what Slack sends with what is read.
                 let keys = |value: &Value| value.as_object().map(|map| map.keys().cloned().collect::<Vec<_>>().join(",")).unwrap_or_default();
-                eprintln!("chatd: Slack: user shape [{}] profile [{}]", keys(user), keys(profile));
+                tracing::warn!("chatd: Slack: user shape [{}] profile [{}]", keys(user), keys(profile));
             }
             // Slack's rule for the name it shows: the display name, else the real one.
             let names = [&profile["display_name"], &profile["real_name"], &user["real_name"], &user["name"]];
@@ -264,7 +264,7 @@ impl Slack {
             });
             if let Some(avatar) = &avatar {
                 if let Err(err) = self.register_avatar(avatar, &picture, &large) {
-                    eprintln!("chatd: Slack: {err}");
+                    tracing::warn!("chatd: Slack: {err}");
                 }
             }
             let status_emoji = profile["status_emoji"].as_str().unwrap_or("").trim_matches(':');
@@ -297,7 +297,7 @@ impl Slack {
             learned.push((id.to_owned(), known));
         }
         if let Err(err) = self.ctx.people(&rows).and_then(|()| self.ctx.details(&details)) {
-            eprintln!("chatd: Slack: {err}");
+            tracing::warn!("chatd: Slack: {err}");
         }
         // The status emoji and a huddle, kept like presence: only for people the user owns or
         // has on screen.
@@ -325,7 +325,7 @@ impl Slack {
         }
         if !kept.user.avatar.is_empty() {
             if let Err(err) = self.register_avatar(&kept.user.avatar, &kept.picture, &kept.large) {
-                eprintln!("chatd: Slack: {err}");
+                tracing::warn!("chatd: Slack: {err}");
             }
         }
         self.remember(id, &kept.user);
@@ -632,16 +632,22 @@ impl Slack {
     }
 
     /// `presence_change`, for one person or a batch. Away is all Slack says of someone not
-    /// active, so it is drawn as offline.
+    /// active, so it is drawn as offline; ours is Away, the state the user can set.
     pub(super) fn presence_changed(&self, event: &Value) {
-        let presence = match event["presence"].as_str() {
-            Some("active") => Presence::Online,
-            Some("away") => Presence::Offline,
+        let away = match event["presence"].as_str() {
+            Some("active") => false,
+            Some("away") => true,
             _ => return,
         };
+        let me = self.me.get();
         let one = event["user"].as_str().into_iter();
         let many = event["users"].as_array().into_iter().flatten().filter_map(Value::as_str);
         for id in one.chain(many) {
+            let presence = match (away, me.is_some_and(|me| me == id)) {
+                (false, _) => Presence::Online,
+                (true, true) => Presence::Idle,
+                (true, false) => Presence::Offline,
+            };
             let status = self.cached(id).map(|user| user.status).unwrap_or_default();
             self.ctx.presence(id, presence, &status, self.owned(id));
         }

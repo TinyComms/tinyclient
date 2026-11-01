@@ -180,6 +180,8 @@ fn capabilities(premium: bool) -> Capabilities {
         reply_ping: false,
         // Telegram lets a message be edited for 48 hours (unverified for every chat kind).
         edit_window: 48 * 3_600,
+        file_scan: false,
+        allow_archives: false,
     }
 }
 
@@ -445,7 +447,7 @@ pub(super) fn on_screen(account: &Account, watching: &Watching) {
         };
         if let Some(next) = next {
             if let Err(fault) = read_page(account, list, Some(next)) {
-                eprintln!("chatd: Telegram: more chats: {fault}");
+                tracing::warn!("chatd: Telegram: more chats: {fault}");
             }
         }
     }
@@ -469,7 +471,7 @@ pub(super) fn previews(account: &Account, ids: &[String]) {
         let raw = match fetch(account, who, topic, &Around::Newest, 1) {
             Ok(raw) => raw,
             Err(fault) => {
-                eprintln!("chatd: Telegram: preview: {fault}");
+                tracing::warn!("chatd: Telegram: preview: {fault}");
                 continue;
             }
         };
@@ -662,7 +664,7 @@ pub(super) fn history(account: &Account, conversation: &str, around: Around) -> 
     let raw = match fetch(account, who, topic, &around, PAGE) {
         Ok(raw) => raw,
         Err(fault) => {
-            eprintln!("chatd: Telegram: history: {fault}");
+            tracing::warn!("chatd: Telegram: history: {fault}");
             return None;
         }
     };
@@ -711,7 +713,7 @@ pub(super) fn backfill(account: &Account, conversation: &str) {
     // A forum's own row holds no messages: opening it lists its topics.
     if forum && topic.is_none() {
         if let Err(fault) = topics(account, who) {
-            eprintln!("chatd: Telegram: topics: {fault}");
+            tracing::warn!("chatd: Telegram: topics: {fault}");
         }
         return;
     }

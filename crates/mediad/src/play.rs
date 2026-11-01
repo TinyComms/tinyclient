@@ -48,7 +48,7 @@ fn requests() -> Receiver<Option<PlayerRequest>> {
                 }
                 Err(err) => {
                     if err.kind() != ErrorKind::UnexpectedEof {
-                        eprintln!("mediad: {err}");
+                        tracing::warn!("mediad: {err}");
                     }
                     let _ = tell.send(None);
                     return;
@@ -90,7 +90,7 @@ pub fn run() -> io::Result<()> {
     let (path, at, rate, output) = match told.recv() {
         Ok(Some(PlayerRequest::Open { path, at, rate, output })) => (path, at, rate, output),
         Ok(Some(other)) => {
-            eprintln!("mediad: {other:?} before Open");
+            tracing::warn!("mediad: {other:?} before Open");
             fail("Playing could not start.")
         }
         _ => return Ok(()),
@@ -98,7 +98,7 @@ pub fn run() -> io::Result<()> {
     let mut source = Source::open(Path::new(&path)).unwrap_or_else(|detail| fail(detail));
     let duration = source.duration();
     let mut speaker = Speaker::open(output.as_deref()).unwrap_or_else(|err| {
-        eprintln!("mediad: speaker: {err:?}");
+        tracing::warn!("mediad: speaker: {err:?}");
         fail("The speaker could not be opened.")
     });
     let mut stretch = Stretch::new(rate_of(rate));
@@ -135,7 +135,7 @@ pub fn run() -> io::Result<()> {
                 send(&PlayerEvent::Playing { at: clock.from, duration, rate: stretch.rate() });
                 continue;
             }
-            Ok(Some(PlayerRequest::Open { .. })) => eprintln!("mediad: a second Open is ignored"),
+            Ok(Some(PlayerRequest::Open { .. })) => tracing::warn!("mediad: a second Open is ignored"),
             Ok(None) | Err(RecvTimeoutError::Disconnected) => {
                 send(&PlayerEvent::Stopped { at: clock.heard(&stretch, &speaker) });
                 return Ok(());

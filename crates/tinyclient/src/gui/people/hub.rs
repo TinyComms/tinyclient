@@ -26,6 +26,10 @@ const TYPING_SECONDS: i64 = 12;
 const PRESENCE_LIMIT: usize = 2000;
 const PEOPLE_LIMIT: usize = 4000;
 const FILE_LIMIT: usize = 2048;
+/// A file that did not arrive is asked for again when it is next drawn this long after. chatd
+/// answers at once and fetches nothing for a file that failed for good; one that failed for a
+/// moment's trouble (the line was down) it fetches again.
+const FILE_AGAIN: Duration = Duration::from_secs(60);
 /// Voice channels whose occupants are remembered.
 const VOICE_LIMIT: usize = 256;
 
@@ -56,6 +60,8 @@ pub struct WatchSet {
     conversation: Option<Key>,
     members: Option<(u32, u32)>,
     space: Option<Key>,
+    /// The window is the one being typed in.
+    focused: bool,
     sent: Option<Watching>,
     /// When the unsent changes began and when the last one came.
     changing: Option<(Instant, Instant)>,
@@ -92,6 +98,16 @@ impl WatchSet {
         } else {
             self.rows.insert(source, rows);
         }
+        self.touched(now);
+        true
+    }
+
+    /// Whether the window has focus: what arrives in the open conversation then is read.
+    pub fn focused(&mut self, focused: bool, now: Instant) -> bool {
+        if self.focused == focused {
+            return false;
+        }
+        self.focused = focused;
         self.touched(now);
         true
     }
@@ -140,6 +156,7 @@ impl WatchSet {
         Watching {
             space: self.space.clone(),
             conversation: self.conversation.clone(),
+            focused: self.focused,
             people,
             members: self.members,
             rows: {
@@ -174,6 +191,7 @@ impl WatchSet {
                 sent.conversation == wanted.conversation
                     && sent.members == wanted.members
                     && sent.space == wanted.space
+                    && sent.focused == wanted.focused
                     && sent.rows == wanted.rows
                     && same_people(sent)
             }
@@ -208,8 +226,25 @@ enum Fetched {
     /// `Fetch` was sent; the file lands as a `Media` change.
     Asked,
     Here(String),
-    /// The network could not give it. The fallback stays.
-    Failed,
+    /// The network could not give it, at this moment. The fallback stays, and the file is asked
+    /// for again once [`FILE_AGAIN`] has passed.
+    Failed(Instant),
+}
+
+impl Fetched {
+    /// What a `Media` change or a `Fetch` answer says of a file: here, or not arriving.
+    fn of(file: &MediaFile, at: Instant) -> Option<Fetched> {
+        match (&file.path, &file.failed) {
+            (Some(path), _) => Some(Fetched::Here(path.clone())),
+            (None, Some(_)) => Some(Fetched::Failed(at)),
+            (None, None) => None,
+        }
+    }
+
+    /// Whether the file should be asked for now.
+    fn ask_again(&self, at: Instant) -> bool {
+        matches!(self, Fetched::Failed(failed) if at.duration_since(*failed) >= FILE_AGAIN)
+    }
 }
 
 /// Repaints the window.
@@ -267,6 +302,13 @@ impl Hub {
     pub fn watch_rows(&self, source: &'static str, rows: impl IntoIterator<Item = Key>, cx: &mut App) {
         let rows = rows.into_iter().collect();
         if self.0.borrow_mut().watch.rows(source, rows, Instant::now()) {
+            self.schedule(cx);
+        }
+    }
+
+    /// Whether the window has focus, for chatd's notifications.
+    pub fn watch_focus(&self, focused: bool, cx: &mut App) {
+        if self.0.borrow_mut().watch.focused(focused, Instant::now()) {
             self.schedule(cx);
         }
     }
@@ -362,7 +404,7 @@ impl Hub {
                 }
             }
             Change::Media { account, file } => {
-                let fetched = file.path.clone().map_or(Fetched::Failed, Fetched::Here);
+                let fetched = Fetched::of(file, Instant::now()).unwrap_or(Fetched::Failed(Instant::now()));
                 self.0.borrow_mut().files.insert((account.clone(), file.id.clone()), fetched);
                 self.notify(cx);
             }
@@ -494,11 +536,12 @@ impl Hub {
             Some(Fetched::Here(path)) => {
                 return MediaFile { path: Some(path.clone()), ..file.clone() };
             }
-            Some(Fetched::Asked | Fetched::Failed) => return file.clone(),
-            None => {}
+            Some(fetched) if !fetched.ask_again(Instant::now()) => return file.clone(),
+            Some(_) | None => {}
         }
-        inner.files.insert(id.clone(), Fetched::Asked);
-        inner.file_order.push_back(id.clone());
+        if inner.files.insert(id.clone(), Fetched::Asked).is_none() {
+            inner.file_order.push_back(id.clone());
+        }
         if inner.file_order.len() > FILE_LIMIT {
             if let Some(old) = inner.file_order.pop_front() {
                 inner.files.remove(&old);
@@ -542,11 +585,14 @@ impl Hub {
                     return;
                 };
                 let mut landed = false;
+                let at = Instant::now();
                 for file in files {
-                    if let Some(path) = file.path {
-                        hub.0.borrow_mut().files.insert((account.clone(), file.id), Fetched::Here(path));
-                        landed = true;
-                    }
+                    // Not arriving, for now: asked for again later rather than never.
+                    let Some(fetched) = Fetched::of(&file, at) else {
+                        continue;
+                    };
+                    landed |= matches!(fetched, Fetched::Here(_));
+                    hub.0.borrow_mut().files.insert((account.clone(), file.id), fetched);
                 }
                 if landed {
                     hub.notify(cx);
@@ -758,5 +804,22 @@ mod tests {
         assert_eq!(names(105), ["tomasz"]);
         assert_eq!(names(111), ["tomasz"]);
         assert!(names(112).is_empty());
+    }
+
+    #[test]
+    fn a_picture_that_did_not_arrive_is_asked_for_again_after_a_while() {
+        let at = Instant::now();
+        let mut file = MediaFile::new("a", protocol::MediaKind::Avatar);
+        // Queued: it lands as a change, nothing to note yet.
+        assert!(Fetched::of(&file, at).is_none());
+        file.failed = Some("The download failed: tls: invalid peer certificate.".into());
+        let failed = Fetched::of(&file, at).unwrap();
+        assert!(!failed.ask_again(at));
+        assert!(!failed.ask_again(at + FILE_AGAIN / 2));
+        assert!(failed.ask_again(at + FILE_AGAIN));
+        // What landed, or is on its way, is never asked for twice.
+        assert!(!Fetched::Asked.ask_again(at + FILE_AGAIN * 10));
+        file.path = Some("/media/a".into());
+        assert!(matches!(Fetched::of(&file, at), Some(Fetched::Here(_))));
     }
 }

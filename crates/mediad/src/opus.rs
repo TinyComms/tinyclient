@@ -3,10 +3,12 @@
 
 use crate::{CHANNELS, FRAME, RATE};
 use unsafe_libopus::{
-    opus_decode, opus_decoder_create, opus_decoder_destroy, opus_encode, opus_encoder_create,
+    opus_decode, opus_decoder_create, opus_decoder_ctl, opus_decoder_destroy, opus_encode, opus_encoder_create,
     opus_encoder_ctl, opus_encoder_destroy, opus_packet_get_nb_samples, OpusDecoder, OpusEncoder,
-    OPUS_APPLICATION_AUDIO, OPUS_APPLICATION_VOIP, OPUS_SET_BITRATE_REQUEST, OPUS_SET_DTX_REQUEST,
-    OPUS_SET_INBAND_FEC_REQUEST, OPUS_SET_PACKET_LOSS_PERC_REQUEST,
+    OPUS_APPLICATION_AUDIO, OPUS_APPLICATION_VOIP, OPUS_BANDWIDTH_FULLBAND, OPUS_SET_BITRATE_REQUEST,
+    OPUS_SET_COMPLEXITY_REQUEST, OPUS_SET_DTX_REQUEST, OPUS_SET_INBAND_FEC_REQUEST,
+    OPUS_SET_MAX_BANDWIDTH_REQUEST, OPUS_SET_PACKET_LOSS_PERC_REQUEST, OPUS_SET_SIGNAL_REQUEST,
+    OPUS_RESET_STATE, OPUS_SIGNAL_VOICE,
 };
 
 /// The longest frame Opus defines is 120 ms.
@@ -16,11 +18,20 @@ const BITRATE: i32 = 64_000;
 /// What a Tiny server's SFU expects of each speaker (tinyserver's `docs/calls.md`), and forwards
 /// up to twice of.
 const VOICE_BITRATE: i32 = 32_000;
+/// The loss the encoder plans its in-band FEC for until the far end says what it sees, and the
+/// least it ever plans for: enough that every speech packet carries a copy of the one before.
+const LOSS_FLOOR: i32 = 5;
+const LOSS_PLANNED: i32 = 10;
 
 pub struct Encoder {
     state: *mut OpusEncoder,
     /// One channel: each stereo frame is folded to mono before it is encoded.
     mono: bool,
+    /// The bitrate it was made at, and the one it encodes at now.
+    default: i32,
+    bitrate: i32,
+    /// The packet loss, in percent, FEC is planned for.
+    loss: i32,
 }
 
 // One thread owns each codec; the pointer is to plain heap state.
@@ -37,10 +48,11 @@ impl Encoder {
         Encoder::made(CHANNELS, OPUS_APPLICATION_AUDIO, bitrate, false)
     }
 
-    /// Mono speech at 32 kbit/s, with in-band FEC and DTX, for a Tiny server call. DTX makes
-    /// the encoder say "nothing to send" (a packet of two bytes or less) in silence.
+    /// Mono speech at 32 kbit/s, with in-band FEC, for a Tiny server call. No DTX: the speech
+    /// gate already sends nothing in silence, and DTX's skipped frames inside a talk spurt (the
+    /// pauses between words) reach the far end as losses it has to make up.
     pub fn voice() -> Option<Encoder> {
-        Encoder::made(1, OPUS_APPLICATION_VOIP, VOICE_BITRATE, true)
+        Encoder::made(1, OPUS_APPLICATION_VOIP, VOICE_BITRATE, false)
     }
 
     fn made(channels: usize, application: i32, bitrate: i32, dtx: bool) -> Option<Encoder> {
@@ -53,11 +65,47 @@ impl Encoder {
         // SAFETY: `state` is a live encoder and each request takes one i32.
         unsafe {
             opus_encoder_ctl!(state, OPUS_SET_BITRATE_REQUEST, bitrate);
+            // libopus 1.3 defaults to 9; 10 is its best, and a 20 ms frame of speech is cheap.
+            opus_encoder_ctl!(state, OPUS_SET_COMPLEXITY_REQUEST, 10);
+            opus_encoder_ctl!(state, OPUS_SET_MAX_BANDWIDTH_REQUEST, OPUS_BANDWIDTH_FULLBAND);
+            if application == OPUS_APPLICATION_VOIP {
+                opus_encoder_ctl!(state, OPUS_SET_SIGNAL_REQUEST, OPUS_SIGNAL_VOICE);
+            }
             opus_encoder_ctl!(state, OPUS_SET_INBAND_FEC_REQUEST, 1);
-            opus_encoder_ctl!(state, OPUS_SET_PACKET_LOSS_PERC_REQUEST, 10);
+            opus_encoder_ctl!(state, OPUS_SET_PACKET_LOSS_PERC_REQUEST, LOSS_PLANNED);
             opus_encoder_ctl!(state, OPUS_SET_DTX_REQUEST, i32::from(dtx));
         }
-        Some(Encoder { state, mono: channels == 1 })
+        Some(Encoder { state, mono: channels == 1, default: bitrate, bitrate, loss: LOSS_PLANNED })
+    }
+
+    /// The far end's reports say it is losing `fraction` of our packets: FEC is planned for
+    /// that, a little more, and never less than [`LOSS_FLOOR`].
+    pub fn set_loss(&mut self, fraction: f32) {
+        let wanted = ((fraction * 100.).round() as i32 + 2).clamp(LOSS_FLOOR, 30);
+        if wanted != self.loss {
+            // SAFETY: `state` is a live encoder and the request takes one i32.
+            unsafe {
+                opus_encoder_ctl!(self.state, OPUS_SET_PACKET_LOSS_PERC_REQUEST, wanted);
+            }
+            self.loss = wanted;
+        }
+    }
+
+    /// Encodes at `bitrate` bits a second from the next frame on (a Tiny room's, `Bitrate`);
+    /// `None` goes back to the rate it was made at.
+    pub fn set_bitrate(&mut self, bitrate: Option<i32>) {
+        let wanted = bitrate.unwrap_or(self.default);
+        if wanted != self.bitrate {
+            // SAFETY: `state` is a live encoder and the request takes one i32.
+            unsafe {
+                opus_encoder_ctl!(self.state, OPUS_SET_BITRATE_REQUEST, wanted);
+            }
+            self.bitrate = wanted;
+        }
+    }
+
+    pub fn bitrate(&self) -> i32 {
+        self.bitrate
     }
 
     /// One 20 ms frame of interleaved stereo in, one Opus packet out.
@@ -89,10 +137,18 @@ pub struct Decoder {
     state: *mut OpusDecoder,
     /// The last packet was CELT-only, the mode whose concealment libopus is trusted with here.
     celt: bool,
+    /// A packet has been decoded: the decoder has a mode, and a last sample to fade from.
+    started: bool,
     /// The last frame that came out, for concealing a loss ourselves.
     last: Vec<i16>,
     /// Losses concealed in a row.
     misses: u32,
+    /// Our concealment: the pitch period it repeats (frames), how far into the repeat it is,
+    /// and the gain it ended at. While `Some`, the next real frame is crossfaded from it.
+    pitch: usize,
+    cursor: usize,
+    gain: f32,
+    concealing: bool,
 }
 
 unsafe impl Send for Decoder {}
@@ -102,7 +158,17 @@ impl Decoder {
         let mut error = 0;
         // SAFETY: as for the encoder.
         let state = unsafe { opus_decoder_create(RATE as i32, CHANNELS as i32, &mut error) };
-        (!state.is_null() && error == 0).then_some(Decoder { state, celt: false, last: Vec::new(), misses: 0 })
+        (!state.is_null() && error == 0).then_some(Decoder {
+            state,
+            celt: false,
+            started: false,
+            last: Vec::new(),
+            misses: 0,
+            pitch: FRAME,
+            cursor: 0,
+            gain: 0.,
+            concealing: false,
+        })
     }
 
     /// Decodes one packet into `pcm` (room for [`MAX_FRAME`] samples per channel). `None` as the
@@ -112,14 +178,32 @@ impl Decoder {
         let Some(packet) = packet else {
             return Some(self.conceal(lost.min(room), pcm));
         };
+        self.forget();
+        // After a SILK or hybrid packet, libopus builds a CELT-only one out of 5 ms of SILK
+        // packet-loss concealment. A packet from an encoder carries a redundant CELT frame to
+        // splice there; the fixed silence packet does not, and this build's concealment
+        // saturates. The mode change resets CELT anyway, so start from a clean state instead.
+        let celt = packet[0] >> 3 >= 16;
+        let switched = celt && !self.celt && self.started;
+        if switched {
+            // SAFETY: `state` is a live decoder; the request takes no argument.
+            unsafe {
+                opus_decoder_ctl!(self.state, OPUS_RESET_STATE);
+            }
+        }
         // SAFETY: `pcm` has room for `room` samples per channel.
         let decoded = unsafe { opus_decode(self.state, packet.as_ptr(), packet.len() as i32, pcm.as_mut_ptr(), room as i32, 0) };
         let samples = usize::try_from(decoded).ok()?;
         // The table-of-contents byte's top five bits are the configuration; 16 and up are CELT.
-        self.celt = packet[0] >> 3 >= 16;
-        self.misses = 0;
-        self.last.clear();
-        self.last.extend_from_slice(&pcm[..samples * CHANNELS]);
+        self.celt = celt;
+        self.started = true;
+        if switched {
+            // No waveform continues across the switch, so fade this frame in from the sample
+            // the speech ended on. A step there is the click.
+            self.start_afresh(&mut pcm[..samples * CHANNELS]);
+        } else {
+            self.resume(&mut pcm[..samples * CHANNELS]);
+        }
         Some(samples)
     }
 
@@ -130,20 +214,39 @@ impl Decoder {
         if !has_fec(next) || pcm.len() < FRAME * CHANNELS {
             return None;
         }
+        self.forget();
         // SAFETY: `pcm` has room for FRAME samples per channel, the length of the lost frame.
         let decoded = unsafe { opus_decode(self.state, next.as_ptr(), next.len() as i32, pcm.as_mut_ptr(), FRAME as i32, 1) };
         let samples = usize::try_from(decoded).ok().filter(|&samples| samples > 0)?;
-        self.misses = 0;
-        self.last.clear();
-        self.last.extend_from_slice(&pcm[..samples * CHANNELS]);
+        self.started = true;
+        self.resume(&mut pcm[..samples * CHANNELS]);
         Some(samples)
+    }
+
+    /// One playout tick while a packet may still be out of order. The last pitch period continues
+    /// and the decoder is left where the last real frame put it: counting this wait as a loss
+    /// makes [`Decoder::forget`] drop that state, and the frames after a real loss come out loud.
+    pub(crate) fn bridge(&mut self, samples: usize, pcm: &mut [i16]) -> usize {
+        if !self.concealing {
+            self.pitch = pitch(&self.last);
+            self.cursor = 0;
+            self.gain = 1.;
+            self.concealing = true;
+        }
+        let out = &mut pcm[..samples * CHANNELS];
+        for pair in out.as_chunks_mut::<CHANNELS>().0 {
+            *pair = self.extend();
+        }
+        samples
     }
 
     /// Stands in for a lost packet when the one after it cannot rebuild it ([`Decoder::recover`]).
     /// After CELT, libopus conceals it. After a SILK or hybrid packet it may not:
     /// `unsafe-libopus` 0.2.0 saturates there (a test below holds it to that, so a fixed library
-    /// is noticed), so the last frame is repeated, quieter each time, and the decoder is left
-    /// untouched.
+    /// is noticed), so the decoder is left untouched and the voice is carried on here instead:
+    /// the last pitch period of what was heard, repeated from exactly where it left off, fading
+    /// to silence over 60 ms. Repeating the whole last frame instead jumps at each seam, and
+    /// that jump is a click every lost packet.
     fn conceal(&mut self, samples: usize, pcm: &mut [i16]) -> usize {
         self.misses += 1;
         if self.celt {
@@ -153,17 +256,120 @@ impl Decoder {
                 return decoded;
             }
         }
-        let gain = match self.misses {
-            1 => 0.5,
-            2 => 0.25,
-            _ => 0.,
-        };
+        if !self.concealing {
+            self.pitch = pitch(&self.last);
+            self.cursor = 0;
+            self.gain = 1.;
+            self.concealing = true;
+        }
         let out = &mut pcm[..samples * CHANNELS];
-        out.fill(0);
-        for (out, &last) in out.iter_mut().zip(&self.last) {
-            *out = (f32::from(last) * gain) as i16;
+        // Each lost frame takes the level down by a third of the way to nothing.
+        let fall = 1. / (3 * samples.max(1)) as f32;
+        for pair in out.as_chunks_mut::<CHANNELS>().0 {
+            *pair = self.extend();
+            self.gain = (self.gain - fall).max(0.);
         }
         samples
+    }
+
+    /// The talk spurt ended. Ramp from the last sample that was actually played down to zero.
+    /// Starting a pitch repeat here jumps, and that jump is the pop at the end of a sentence.
+    /// The decoder is left alone for one frame, so a packet that was only late still continues
+    /// it; a longer gap counts as concealment and the next real frame starts clean.
+    pub(crate) fn release(&mut self, samples: usize, pcm: &mut [i16]) -> usize {
+        let out = &mut pcm[..samples * CHANNELS];
+        let from = self.ending();
+        let steps = samples.max(1) as f32;
+        for (n, pair) in out.chunks_mut(CHANNELS).enumerate() {
+            let gain = 1. - (n as f32 + 1.) / steps;
+            for (sample, &start) in pair.iter_mut().zip(&from) {
+                *sample = (f32::from(start) * gain) as i16;
+            }
+        }
+        self.last.clear();
+        self.gain = 0.;
+        self.concealing = true;
+        self.misses = self.misses.saturating_add(1);
+        samples
+    }
+
+    /// After we concealed frames the decoder never saw, its state is the speech of before the
+    /// gap; going on from it puts a burst in the first frame back. It starts afresh instead,
+    /// and [`Decoder::resume`] fades from the concealment into what it makes.
+    fn forget(&mut self) {
+        if self.concealing && self.misses > 1 {
+            // SAFETY: `state` is a live decoder; the request takes no argument.
+            unsafe {
+                opus_decoder_ctl!(self.state, OPUS_RESET_STATE);
+            }
+        }
+    }
+
+    /// The next frame of concealment at its current gain, moving on.
+    fn extend(&mut self) -> [i16; CHANNELS] {
+        let frames = self.last.len() / CHANNELS;
+        if frames == 0 || self.pitch == 0 {
+            return [0; CHANNELS];
+        }
+        let pitch = self.pitch.min(frames);
+        let at = frames - pitch + self.cursor % pitch;
+        self.cursor += 1;
+        let gain = self.gain;
+        [0, 1].map(|channel| (f32::from(self.last[at * CHANNELS + channel]) * gain) as i16)
+    }
+
+    /// A real frame came out, into `pcm`: crossfaded from the concealment it follows, if any,
+    /// so speaking again after a loss does not click either.
+    fn resume(&mut self, pcm: &mut [i16]) {
+        if self.concealing {
+            let frames = pcm.len() / CHANNELS;
+            let fade = RESUME.min(frames);
+            for n in 0..fade {
+                let made = self.extend();
+                let toward = (n + 1) as f32 / (fade + 1) as f32;
+                for (channel, made) in made.into_iter().enumerate() {
+                    let real = &mut pcm[n * CHANNELS + channel];
+                    *real = (f32::from(made) * (1. - toward) + f32::from(*real) * toward) as i16;
+                }
+            }
+            self.concealing = false;
+        }
+        self.record(pcm);
+    }
+
+    /// A frame in another mode came out of a decoder that was reset for it: no waveform
+    /// continues across the switch, so fade it in from the sample the last frame ended on.
+    /// Stepping from that sample to wherever the new mode starts is the click.
+    fn start_afresh(&mut self, pcm: &mut [i16]) {
+        let from = self.ending();
+        let frames = pcm.len() / CHANNELS;
+        let fade = RESUME.min(frames);
+        for n in 0..fade {
+            let toward = (n + 1) as f32 / (fade + 1) as f32;
+            for (channel, sample) in pcm[n * CHANNELS..(n + 1) * CHANNELS].iter_mut().enumerate() {
+                *sample = (f32::from(from[channel]) * (1. - toward) + f32::from(*sample) * toward) as i16;
+            }
+        }
+        self.concealing = false;
+        self.record(pcm);
+    }
+
+    /// The sample the last frame ended on: what a frame that does not continue it fades from.
+    fn ending(&self) -> [i16; CHANNELS] {
+        if self.last.len() >= CHANNELS {
+            let at = self.last.len() - CHANNELS;
+            [self.last[at], self.last[at + 1]]
+        } else {
+            [0; CHANNELS]
+        }
+    }
+
+    /// The frame just played: where the next fade or concealment starts, and the end of a run
+    /// of losses.
+    fn record(&mut self, pcm: &[i16]) {
+        self.misses = 0;
+        self.last.clear();
+        self.last.extend_from_slice(pcm);
     }
 }
 
@@ -172,6 +378,37 @@ impl Drop for Decoder {
         // SAFETY: created by `opus_decoder_create` and dropped once.
         unsafe { opus_decoder_destroy(self.state) }
     }
+}
+
+/// Frames over which a real frame after concealment fades in from it: 5 ms.
+const RESUME: usize = 240;
+
+/// The pitch period of a stereo frame, in frames: the lag between 2.5 and 16 ms (400 down to
+/// 62.5 Hz) at which the frame best matches itself. Unvoiced sound has none worth the name and
+/// gets 10 ms, which repeats it without a buzz in the speech range.
+fn pitch(stereo: &[i16]) -> usize {
+    let mono: Vec<f32> = stereo.as_chunks::<CHANNELS>().0.iter().map(|pair| (f32::from(pair[0]) + f32::from(pair[1])) / 2.).collect();
+    let (shortest, longest) = (120, 768.min(mono.len() / 2));
+    if longest <= shortest {
+        return mono.len().max(1);
+    }
+    let window = mono.len() - longest;
+    let tail = &mono[mono.len() - window..];
+    let energy: f32 = tail.iter().map(|s| s * s).sum();
+    let (mut best, mut score) = (480, 0.5f32);
+    for lag in shortest..=longest {
+        let before = &mono[mono.len() - window - lag..mono.len() - lag];
+        let (mut cross, mut power) = (0f32, 0f32);
+        for (a, b) in tail.iter().zip(before) {
+            cross += a * b;
+            power += b * b;
+        }
+        let normal = cross / (energy * power).sqrt().max(1.);
+        if normal > score {
+            (best, score) = (lag, normal);
+        }
+    }
+    best
 }
 
 /// True when a packet carries a low-rate copy of the frame before it (SILK's LBRR). Only the
@@ -257,15 +494,14 @@ mod tests {
         let level = energy(&heard[4 * FRAME * CHANNELS..]);
         assert!((4000. ..7000.).contains(&level), "level {level}");
         assert!(heard.chunks(2).all(|pair| pair[0] == pair[1]), "the same voice in both ears");
-        // A second of silence: DTX says there is nothing to send most of the time.
+        // A second of silence: no DTX, so every frame is a frame (the speech gate, not the
+        // codec, stops sending in silence), and a small one.
         let quiet = vec![0i16; FRAME * CHANNELS];
-        let skipped = (0..50)
-            .filter(|_| {
-                let mut packet = [0u8; 1500];
-                encoder.encode(&quiet, &mut packet).unwrap() <= 2
-            })
-            .count();
-        assert!(skipped > 30, "{skipped} of 50 silent frames had nothing to send");
+        for _ in 0..50 {
+            let mut packet = [0u8; 1500];
+            let len = encoder.encode(&quiet, &mut packet).unwrap();
+            assert!(len > 2, "{len} bytes of silence");
+        }
     }
 
     #[test]
@@ -301,7 +537,7 @@ mod tests {
                 let concealed = decoder.decode(None, FRAME, &mut pcm).unwrap();
                 assert_eq!(concealed, FRAME);
                 let level = peak(&pcm[..FRAME * CHANNELS]);
-                assert!((2000..6000).contains(&level), "concealment peaks at {level}");
+                assert!((2000..9_500).contains(&level), "concealment peaks at {level}");
                 continue;
             }
             let decoded = decoder.decode(Some(&packet[..len]), 0, &mut pcm).unwrap();
@@ -386,6 +622,59 @@ mod tests {
         let decoded = decoder.decode(Some(&SILENCE), 0, &mut pcm).unwrap();
         assert_eq!(decoded, FRAME);
         assert!(energy(&pcm[..FRAME * CHANNELS]) < 10.);
+    }
+
+    /// The canned silence packet is CELT-only, and the sentence before it is SILK or hybrid. The
+    /// decoder used to take that for a mode switch and splice 5 ms of SILK concealment onto the
+    /// front, which this build saturates: a full-scale tick at the start of "silence". It is
+    /// decoded from a clean state and faded in from the sample the speech ended on instead.
+    /// A decoder that never heard speech (`the_silence_frame_is_opus_and_decodes_to_quiet`)
+    /// cannot see this.
+    #[test]
+    fn a_silence_packet_after_speech_fades_in_instead_of_banging() {
+        let mut encoder = Encoder::voice().unwrap();
+        let mut decoder = Decoder::new().unwrap();
+        let mut pcm = vec![0i16; MAX_FRAME * CHANNELS];
+        for frame in tone(10).chunks(FRAME * CHANNELS) {
+            let mut packet = [0u8; 1500];
+            let len = encoder.encode(frame, &mut packet).unwrap();
+            assert!(packet[0] >> 3 < 16, "a speech-mode packet");
+            decoder.decode(Some(&packet[..len]), 0, &mut pcm).unwrap();
+        }
+        let before = pcm[FRAME * CHANNELS - CHANNELS];
+        let decoded = decoder.decode(Some(&SILENCE), 0, &mut pcm).unwrap();
+        assert_eq!(decoded, FRAME);
+        let level = peak(&pcm[..FRAME * CHANNELS]);
+        assert!(level < 12_000, "the silence after speech peaks at {level}");
+        let step = (i32::from(pcm[0]) - i32::from(before)).abs();
+        assert!(step < 1_000, "the silence steps {step} from the last sample");
+        let tail = energy(&pcm[RESUME * CHANNELS..FRAME * CHANNELS]);
+        assert!(tail < 10., "the rest of the silence is not quiet: {tail}");
+    }
+
+    /// What a Tiny call sends in place of the canned packet: real frames of silence in the mode
+    /// the encoder is in. They drain its lookahead, and the first carries the in-band copy of
+    /// the speech before it, so the far decoder never has to change mode at the end of a
+    /// sentence.
+    #[test]
+    fn silent_frames_stay_in_speech_mode_and_carry_the_frame_before() {
+        let mut encoder = Encoder::voice().unwrap();
+        for frame in tone(6).chunks(FRAME * CHANNELS) {
+            let mut packet = [0u8; 1500];
+            let len = encoder.encode(frame, &mut packet).unwrap();
+            assert!(len > 2, "speech is not a DTX packet");
+            assert!(packet[0] >> 3 < 16, "a speech-mode packet");
+        }
+        let quiet = vec![0i16; FRAME * CHANNELS];
+        for n in 0..5 {
+            let mut packet = [0u8; 1500];
+            let len = encoder.encode(&quiet, &mut packet).unwrap();
+            assert!(len > 2, "silence {n} is a DTX packet");
+            assert!(packet[0] >> 3 < 16, "silence {n} left the speech mode");
+            if n == 0 {
+                assert!(has_fec(&packet[..len]), "the first silence carries the copy of the speech before it");
+            }
+        }
     }
 
     #[test]

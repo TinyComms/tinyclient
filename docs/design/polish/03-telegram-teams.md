@@ -24,8 +24,7 @@ invents a Space (03 §2.1, 04 §2.1).
 - **Badges** (C6): a mention is an accent pill with the number, no `@`. Messages to me in a person, group, bot or forum
   chat are an unfilled count (`text` on unread). Ambient unread is an 8 dot: channels, folds, collapsed teams, and Teams'
   boolean unread.
-- **Dates:** the system formatter: `10:12 PM`, `Yesterday`, `Mon`, `Oct 2`, `Oct 2, 2025`. Never relative ("Last reply
-  10:22 AM", not "2h ago").
+- **Dates** follow `crates/tinyclient/src/gui/time.rs` (the table at the top of that file, which cites `polish/01` §2). Today is the clock (`10:37 PM` or `22:37`). Yesterday is `Yesterday`. Two to six days is the weekday (`Mon`) on a row and the long weekday on a divider. This year is `Oct 2` on a row and `Friday, October 2` on a divider. Older is `10/2/25` on a row (day-first where the locale says so) and `October 2, 2025` on a divider. Tooltips use the long form (`Tuesday, October 13, 2026 at 10:37 PM`). No relative times. The thread reply line in `conversation/draw.rs` still says "Last reply just now" / "Last reply {ago} ago"; that line is unfinished.
 
 ## 2. Telegram home (frames A, B, D)
 - **Order:** a `Pinned` header over Telegram's pins in Telegram's order, then `Chats` by recency. In a folder, the

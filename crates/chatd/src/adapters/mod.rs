@@ -25,6 +25,7 @@ pub(crate) mod slack;
 pub(crate) mod teams;
 pub mod telegram;
 pub mod tiny;
+pub mod tiny_bots;
 
 use crate::hub::{lock, now, Hub};
 use crate::session;
@@ -249,6 +250,14 @@ pub enum Command {
     },
     /// The id of the direct conversation with a person, created if there is none.
     StartDirect { person_id: String, reply: Reply<String> },
+    /// The id of the thread a channel message starts. Discord only: create the thread channel,
+    /// record it, and answer with its id. `name` is already one line, at most 100 characters.
+    StartThread {
+        conversation_id: String,
+        message_id: String,
+        name: String,
+        reply: Reply<String>,
+    },
     /// One person's card. One request to the network, and only because the user opened it.
     Profile { person_id: String, reply: Reply<About> },
     /// The same, opened from inside a Space: add the nickname, roles and join date there. An
@@ -351,7 +360,7 @@ impl Command {
     pub fn unsupported(self, ctx: &Context) {
         match self {
             Command::Members { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
-            Command::StartDirect { reply, .. } | Command::Handoff { reply, .. } => {
+            Command::StartDirect { reply, .. } | Command::StartThread { reply, .. } | Command::Handoff { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }
             Command::Profile { reply, .. } | Command::ProfileIn { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -486,7 +495,7 @@ impl Context {
         match session::rewrite(self.account.network, rewrite) {
             Ok(saved) => saved,
             Err(why) => {
-                eprintln!("chatd: {}: the session was not saved: {}", self.account.network.label(), net::redact(&why));
+                tracing::warn!("chatd: {}: the session was not saved: {}", self.account.network.label(), net::redact(&why));
                 false
             }
         }
@@ -640,6 +649,16 @@ impl Context {
         Ok(())
     }
 
+    /// My messages up to this one reached the other side's device (Signal's and Google
+    /// Messages' second tick).
+    pub fn delivered(&self, conversation_id: &str, message_id: &str) -> Stores {
+        let conversation = self.key(conversation_id);
+        if self.hub.store().set_delivered(&conversation, message_id)? {
+            self.hub.changed(Change::Conversation { conversation });
+        }
+        Ok(())
+    }
+
     fn row_changed(&self, conversation_id: &str, space: Option<&str>) {
         self.hub.changed(Change::Conversation { conversation: self.key(conversation_id) });
         if let Some(space) = space {
@@ -672,6 +691,8 @@ impl Context {
         let stored = self.hub.store().ingest(&conversation, message, true)?;
         if stored == Stored::New && !message.outgoing {
             self.typing_stopped(conversation_id, &message.sender.id);
+            // After the row counted it, so a notification's read check sees it unread.
+            self.hub.notify(crate::notify::Event::Message { conversation: conversation.clone(), message: Box::new(message.clone()) });
         }
         self.stored(&conversation, &[stored], true);
         Ok(())
@@ -742,7 +763,7 @@ impl Context {
         };
         match stored {
             Ok(stored) => self.stored(&conversation, &[stored], true),
-            Err(err) => eprintln!("chatd: {}: {}", self.account.network.label(), net::redact(&err.to_string())),
+            Err(err) => tracing::warn!("chatd: {}: {}", self.account.network.label(), net::redact(&err.to_string())),
         }
     }
 
@@ -884,6 +905,50 @@ impl Context {
         self.hub.store().media_refreshed(&self.account, id, url)
     }
 
+    /// A file the adapter fetched over its own session, where the cache could not (Signal's
+    /// and Messages' pictures), kept as the cache keeps what it fetched: written under the
+    /// account's directory, registered, recorded as landed, and announced. `address` only names
+    /// where it came from; nothing fetches it. Answers the file with its path.
+    pub fn landed(&self, file: &MediaFile, address: &str, bytes: &[u8]) -> Option<MediaFile> {
+        let media = protocol::support_dir().join("media");
+        let path = crate::blobs::path_of(&media, &self.account, &file.id);
+        let part = path.with_extension("part");
+        std::fs::create_dir_all(crate::blobs::dir_under(&media, &self.account)).ok()?;
+        std::fs::write(&part, bytes).ok()?;
+        if std::fs::rename(&part, &path).is_err() {
+            let _ = std::fs::remove_file(&part);
+            return None;
+        }
+        let landed = {
+            let mut store = self.hub.store();
+            store.register_media(&self.account, &[(file.clone(), address.to_owned())]).ok()?;
+            store.media_landed(&self.account, &file.id, &path.to_string_lossy(), bytes.len() as u64, now()).ok()??
+        };
+        self.hub.changed(Change::Media { account: self.account.clone(), file: landed.clone() });
+        Some(landed)
+    }
+
+    /// A picture kept with [`Context::landed`] is the avatar of the row and of the person this
+    /// id names, whichever are recorded. Rows and people the adapter records later should name
+    /// it too, or they take it away again.
+    pub fn avatar(&self, id: &str, avatar: &str) -> Stores {
+        let (row, person) = self.hub.store().set_avatar(&self.account, id, avatar)?;
+        if row {
+            self.row_changed(id, None);
+        }
+        if person {
+            self.hub.changed(Change::People { account: self.account.clone() });
+        }
+        Ok(())
+    }
+
+    /// The avatar the row or the person of this id names now, so a row recorded again keeps it.
+    pub fn avatar_of(&self, id: &str) -> Option<String> {
+        let store = self.hub.store();
+        let row = store.conversation(&self.key(id)).ok().flatten().and_then(|row| row.avatar);
+        row.or_else(|| store.person(&self.key(id)).ok().flatten().and_then(|person| person.avatar)).map(|file| file.id)
+    }
+
     // Calls. Signalling only; mediad carries the media.
 
     /// Someone is calling us in a conversation.
@@ -937,6 +1002,26 @@ impl Context {
     /// The call in this room is over and the network already knows: mediad goes, quietly.
     pub fn call_over(&self, conversation_id: &str) -> bool {
         self.hub.calls.end_if(&self.hub, &self.key(conversation_id))
+    }
+
+    /// A Tiny server moved us from one room to another: the call there, its mediad, devices,
+    /// mute and deafen, now belong to the new room. False when no call was in `from`.
+    pub fn tiny_moved(&self, from: &str, to: &str) -> bool {
+        self.hub.calls.retarget(&self.hub, &self.key(from), self.key(to))
+    }
+
+    /// A Tiny room's bitrate and whether it requires push-to-talk, for the call in it.
+    pub fn tiny_room(&self, conversation_id: &str, kbps: u32, push_to_talk: bool) {
+        if self.in_call(conversation_id) {
+            self.hub.calls.tiny_room(&self.hub, &self.key(conversation_id), kbps, push_to_talk);
+        }
+    }
+
+    /// Tells the call's mediad, if there is one: who holds priority speech.
+    pub fn tell_media(&self, conversation_id: &str, request: protocol::MediaRequest) {
+        if self.in_call(conversation_id) {
+            let _ = self.hub.calls.request(&self.hub, &request);
+        }
     }
 
     /// The call is up for this conversation, with its mediad.
@@ -1005,7 +1090,7 @@ impl Context {
     /// account is offline with [`BROKEN`] until the user restarts tinyclient.
     fn panicked(&self, thread: &str) -> bool {
         let count = self.stop.panics.fetch_add(1, Ordering::Relaxed) + 1;
-        eprintln!("chatd: {}: the {thread} thread panicked ({count})", self.account.network.label());
+        tracing::warn!("chatd: {}: the {thread} thread panicked ({count})", self.account.network.label());
         self.hub.forget_live(&self.account);
         if count > 1 {
             self.stop.stopped.store(true, Ordering::Relaxed);
@@ -1061,6 +1146,7 @@ fn keep_connected(ctx: &Context, connect: impl FnMut() -> Failure) {
 
 fn keep_connected_with_backoff(ctx: &Context, mut connect: impl FnMut() -> Failure, mut pause: Duration) {
     let mut drops = Drops::default();
+    let mut attempt = 0u64;
     while !ctx.stopped() {
         let generation = ctx.stop.recovery.load(Ordering::Relaxed);
         let began = Instant::now();
@@ -1082,19 +1168,26 @@ fn keep_connected_with_backoff(ctx: &Context, mut connect: impl FnMut() -> Failu
         }
         match failure {
             Failure::SignedOut(why) => {
-                eprintln!("chatd: {}: signed out: {}", ctx.account.network.label(), net::redact(&why));
-                ctx.hub.forget_live(&ctx.account);
+                tracing::warn!("chatd: {}: signed out: {}", ctx.account.network.label(), net::redact(&why));
+                ctx.hub.forget_all_live(&ctx.account);
                 ctx.hub.set_link(&ctx.account, Link::Expired, &why);
                 return;
             }
             Failure::Dropped(why) => {
-                eprintln!("chatd: {}: {}", ctx.account.network.label(), net::redact(&why));
+                tracing::warn!("chatd: {}: {}", ctx.account.network.label(), net::redact(&why));
             }
         }
         // A connection that held for a while earns a quick retry, unless it has been dropping
         // often. One that never holds backs off to a quarter of an hour: unattended, that is
         // under a hundred sign-ons a day, not 1,400.
         pause = drops.next(Instant::now(), began.elapsed() > Duration::from_secs(60), pause);
+        attempt = attempt.saturating_add(1);
+        tracing::info!(
+            network = ctx.account.network.label(),
+            attempt,
+            pause_ms = u64::try_from(pause.as_millis()).unwrap_or(u64::MAX),
+            "reconnect scheduled"
+        );
         ctx.hub.forget_live(&ctx.account);
         ctx.hub.set_offline(&ctx.account, pause <= RECONNECTING);
         // Not on the second: many clients retrying in step is what a network watches for.
@@ -1108,7 +1201,7 @@ fn keep_connected_with_backoff(ctx: &Context, mut connect: impl FnMut() -> Failu
                 drops = Drops::default();
                 pause = Duration::from_secs(1);
                 ctx.hub.set_offline(&ctx.account, true);
-                eprintln!("chatd: {}: network changed or system resumed; retrying connection", ctx.account.network.label());
+                tracing::warn!("chatd: {}: network changed or system resumed; retrying connection", ctx.account.network.label());
                 // Consume bursts on the next iteration and never attempt more
                 // often than once per second, even if hints keep arriving.
                 if ctx.pause(Duration::from_secs(1).saturating_sub(began.elapsed())) { return; }

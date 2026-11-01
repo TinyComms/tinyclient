@@ -5,7 +5,7 @@
 use base64::Engine;
 use protocol::{
     read_frame, write_frame, AccountKey, Call, CallState, CallSupport, Change, Conversation, ConversationKind,
-    ErrorCode, Key, Link, MediaKind, MentionKind, Message, MessageKind, Network, Page, Person,
+    ErrorCode, Key, Link, MediaKind, MentionKind, Message, MessageKind, Network, Occupants, Page, Person,
     Presence, ReactionSet, EmojiScope, RelateAction, Relation, Request, Response, SendState, Style, Watching,
 };
 use serde_json::{json, Value};
@@ -370,6 +370,25 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
             // The gateway tells every session, the sender's included.
             shared.push("MESSAGE_CREATE", message.clone());
             (200, message)
+        }
+        ("POST", ["channels", channel, "messages", _message, "threads"]) => {
+            let id = shared.snowflake();
+            let name = seen.body["name"].as_str().unwrap_or("Thread");
+            (
+                200,
+                json!({
+                    "id": id,
+                    "type": 11,
+                    "name": name,
+                    "parent_id": channel,
+                    "guild_id": "4000",
+                    "owner_id": "1000",
+                    "message_count": 0,
+                    "member_count": 1,
+                    "thread_metadata": {"archived": false, "locked": false},
+                    "newly_created": true,
+                }),
+            )
         }
         ("POST", ["channels", _, "messages", _, "ack"]) => (200, json!({"token": null})),
         ("POST", ["channels", _, "typing"]) => (204, Value::Null),
@@ -916,16 +935,19 @@ fn ready_fills_spaces_trees_people_and_unread_state() {
     // The tree: categories and channels in Discord's order, hidden ones left out.
     let (groups, rows) = world.tree("4000");
     assert_eq!(groups, ["Text", "Voice"], "a category whose channels are all hidden is not listed");
-    assert_eq!(ids(&rows), ["4105", "4101", "4500", "4102", "4104", "4106", "4201"]);
+    assert_eq!(ids(&rows), ["4105", "4101", "4500", "4102", "4104", "4106", "4201", "4202"]);
     let row = |id: &str| rows.iter().find(|row| row.key.id == id).unwrap();
     let kinds: Vec<ConversationKind> = rows.iter().map(|row| row.kind).collect();
     use ConversationKind::{Announcement, Channel, Forum, Thread, Voice};
-    assert_eq!(kinds, [Channel, Channel, Thread, Announcement, Channel, Forum, Voice]);
+    assert_eq!(kinds, [Channel, Channel, Thread, Announcement, Channel, Forum, Voice, Voice]);
     assert_eq!(row("4105").group, None);
     assert_eq!(row("4101").group.as_deref(), Some("4100"));
     assert_eq!(row("4500").group.as_deref(), Some("4100"), "a thread sits under its channel");
     assert_eq!(row("4201").group.as_deref(), Some("4200"));
     assert_eq!(row("4201").call, CallSupport::Native);
+    assert_eq!(row("4201").limit, 12, "the Lounge's user limit");
+    assert_eq!(row("4101").limit, 0, "a channel without a limit has none");
+    assert_eq!(row("4202").call, CallSupport::Handoff, "a stage is handed to Discord");
     // #staff is denied to everyone and allowed to a role we lack; #mods-only to one we hold.
     assert!(!ids(&rows).contains(&"4103") && !ids(&rows).contains(&"4301"));
     let state = |id: &str| (row(id).unread, row(id).mentions, row(id).muted);
@@ -1176,6 +1198,52 @@ fn messages_map_to_the_one_model_and_follow_live_events() {
 }
 
 #[test]
+fn a_channel_message_can_start_a_thread_and_a_direct_message_cannot() {
+    let world = World::start();
+    let general = wait("the channel's history", || Some(world.messages("4101")).filter(|messages| messages.len() == 3));
+    let starter = "1300000000000000094";
+    assert!(general.iter().any(|message| message.id == starter && message.thread.is_none()));
+
+    // One that already has a thread answers with it and does not create another.
+    let existing = "1300000000000000100";
+    let opened = world.ask(Request::StartThread { conversation: world.key("4101"), message: existing.to_owned() });
+    let Response::Conversation { conversation } = opened else { panic!("{opened:?}") };
+    assert_eq!(conversation.key.id, "4500");
+    assert!(world.discord.requests_to("POST", "/channels/4101/messages/1300000000000000100/threads").is_empty());
+
+    let started = world.ask(Request::StartThread { conversation: world.key("4101"), message: starter.to_owned() });
+    let Response::Conversation { conversation } = started else { panic!("{started:?}") };
+    assert_eq!(conversation.kind, ConversationKind::Thread);
+    assert_eq!((conversation.parent.as_deref(), conversation.root.as_deref()), (Some("4101"), Some(starter)));
+    let posts = world.discord.requests_to("POST", &format!("/channels/4101/messages/{starter}/threads"));
+    assert_eq!(posts.len(), 1);
+    let name = posts[0].body["name"].as_str().unwrap_or("");
+    assert!(!name.is_empty() && name.chars().count() <= 100, "{name}");
+    let hung = world.messages("4101").into_iter().find(|message| message.id == starter).unwrap();
+    assert_eq!(hung.thread.as_ref().map(|thread| thread.id.as_str()), Some(conversation.key.id.as_str()));
+
+    // The same click again is the thread that now exists, not a second channel.
+    let again = world.ask(Request::StartThread { conversation: world.key("4101"), message: starter.to_owned() });
+    let Response::Conversation { conversation: again } = again else { panic!("{again:?}") };
+    assert_eq!(again.key.id, conversation.key.id);
+    assert_eq!(world.discord.requests_to("POST", &format!("/channels/4101/messages/{starter}/threads")).len(), 1);
+
+    let system = world.ask(Request::StartThread {
+        conversation: world.key("4101"),
+        message: "1300000000000000095".to_owned(),
+    });
+    assert!(matches!(system, Response::Error { code: ErrorCode::Refused, .. }), "{system:?}");
+
+    wait("the direct conversation", || Some(world.messages("3001")).filter(|messages| !messages.is_empty()));
+    let direct = world.ask(Request::StartThread {
+        conversation: world.key("3001"),
+        message: "1300000010000000010".to_owned(),
+    });
+    assert!(matches!(direct, Response::Error { code: ErrorCode::Refused, .. }), "{direct:?}");
+    assert!(world.discord.requests_to("POST", "/channels/3001/messages/").iter().all(|seen| !seen.path.contains("/threads")));
+}
+
+#[test]
 fn typing_appears_expires_and_is_paced_on_the_way_out() {
     let world = World::start();
     let dm = world.key("3001");
@@ -1316,6 +1384,14 @@ fn a_dropped_socket_resumes_and_a_refused_token_expires_the_account() {
     world.incoming("3002", None, "before the drop", json!({}));
     wait("the message before the drop", || world.messages("3002").pop());
     let heard = world.discord.sequence.load(Ordering::Relaxed);
+    let own = || match world.ask(Request::Status) {
+        Response::Status { accounts, .. } => accounts[0].presence,
+        other => panic!("{other:?}"),
+    };
+    let set = Request::SetPresence { account: world.account(), presence: Presence::Dnd, status: None };
+    assert_eq!(world.ask(set), Response::Ok);
+    let mine = own();
+    assert_eq!(mine, Presence::Dnd);
 
     world.discord.control.lock().unwrap().send(Control::Drop).unwrap();
     wait("the link going down", || (world.link() == Link::Offline).then_some(()));
@@ -1331,6 +1407,8 @@ fn a_dropped_socket_resumes_and_a_refused_token_expires_the_account() {
     wait("friends' presence after the resume", || {
         world.people(Some(Relation::Friend), None).iter().any(|person| person.presence == Presence::Online).then_some(())
     });
+    // Nor ours: it is a setting chatd keeps across the drop, not something to forget.
+    assert_eq!(own(), mine);
     let id = world.incoming("3002", None, "after the resume", json!({}));
     wait("a message on the resumed session", || world.messages("3002").pop().filter(|message| message.id == id));
     // The heartbeat keeps going on the new socket.
@@ -1647,7 +1725,7 @@ fn servers_channels_people_and_settings_follow_live_events() {
     };
     world.discord.push("CHANNEL_CREATE", channel(json!([])));
     wait("the new channel", || tree_ids("4000").contains(&"4107".to_owned()).then_some(()));
-    assert_eq!(tree_ids("4000"), ["4105", "4101", "4500", "4102", "4104", "4106", "4107", "4201"]);
+    assert_eq!(tree_ids("4000"), ["4105", "4101", "4500", "4102", "4104", "4106", "4107", "4201", "4202"]);
     world.discord.push("CHANNEL_UPDATE", channel(json!([{"id": "4000", "type": 0, "allow": "0", "deny": "1024"}])));
     wait("the channel being hidden", || (!tree_ids("4000").contains(&"4107".to_owned())).then_some(()));
     world.discord.push("CHANNEL_UPDATE", json!({"id": "4102", "type": 5, "name": "news", "position": 1, "parent_id": "4100", "guild_id": "4000", "permission_overwrites": []}));
@@ -1663,7 +1741,7 @@ fn servers_channels_people_and_settings_follow_live_events() {
     };
     world.discord.push("THREAD_CREATE", thread(false));
     wait("the thread", || tree_ids("4000").contains(&"4501".to_owned()).then_some(()));
-    assert_eq!(tree_ids("4000"), ["4105", "4101", "4500", "4102", "4501", "4106", "4201"]);
+    assert_eq!(tree_ids("4000"), ["4105", "4101", "4500", "4102", "4501", "4106", "4201", "4202"]);
     world.discord.push("THREAD_UPDATE", thread(true));
     wait("the thread leaving the tree", || (!tree_ids("4000").contains(&"4501".to_owned())).then_some(()));
     assert_eq!(world.conversation("4501").kind, ConversationKind::Thread);
@@ -1809,6 +1887,153 @@ fn calls_ring_in_and_voice_channels_are_joined_on_the_gateway() {
     world.ask(Request::CallEnd);
     let left = wait("the leave", || voice_states().pop().filter(|frame| frame["d"]["channel_id"].is_null()));
     assert_eq!(left["d"]["guild_id"], "4000");
+}
+
+#[test]
+fn a_voice_channel_lists_its_people_friends_first_then_by_name() {
+    let world = World::start();
+    let in_voice = || match world.ask(Request::InVoice { network: Some(Network::Discord) }) {
+        Response::Conversations { conversations, .. } => conversations,
+        other => panic!("{other:?}"),
+    };
+    // Dev (a friend) sits in Lounge from the connect's voice states, so the friend rule tells
+    // the channel wherever it is.
+    let told = wait("the friend's channel", || {
+        in_voice().into_iter().find(|row| row.key.id == "4201").and_then(|row| row.occupants).filter(|inside| inside.total == 1 && inside.people[0].person.id == "2002")
+    });
+    assert_eq!((told.people[0].person.id.as_str(), told.people[0].name.as_str(), told.people[0].muted), ("2002", "Dev Patel", true));
+
+    // A stranger joins whose name sorts before the friend's: name order alone would list her
+    // first, friends first keeps Dev at the top.
+    let stranger = json!({"guild_id": "4000", "channel_id": "4201", "user_id": "2099", "session_id": "voice-ann",
+                          "self_mute": false, "self_deaf": false, "mute": false, "deaf": false,
+                          "member": {"user": {"id": "2099", "username": "ann", "global_name": "Ann Earlier"}, "roles": []}});
+    world.discord.push("VOICE_STATE_UPDATE", stranger);
+    let both = wait("the stranger", || {
+        in_voice().into_iter().find(|row| row.key.id == "4201").and_then(|row| row.occupants).filter(|inside| inside.total == 2)
+    });
+    let order: Vec<(&str, &str)> = both.people.iter().map(|who| (who.person.id.as_str(), who.name.as_str())).collect();
+    assert_eq!(order, [("2002", "Dev Patel"), ("2099", "Ann Earlier")], "friends first, then by name");
+}
+
+#[test]
+fn a_stage_channel_lists_who_is_on_it_and_leaves_the_join_to_discord() {
+    let world = World::start();
+    // The server's tree is on screen, as it is when the stage's row is drawn.
+    world.ask(Request::Watch(Watching { space: Some(world.key("4000")), ..Watching::default() }));
+    // The stage's states: two on it (`suppress` false — muting is another matter) and one
+    // audience. `suppress` says something else again in a voice channel, so the Lounge next
+    // door never counts anyone as on stage.
+    let state = |user: &str, suppress: bool, muted: bool| {
+        json!({"guild_id": "4000", "channel_id": "4202", "user_id": user, "session_id": format!("voice-{user}"),
+               "self_mute": muted, "self_deaf": false, "mute": false, "deaf": false, "suppress": suppress})
+    };
+    world.discord.push("VOICE_STATE_UPDATE", state("2001", false, true));
+    world.discord.push("VOICE_STATE_UPDATE", json!({"guild_id": "4000", "channel_id": "4202", "user_id": "2006", "session_id": "voice-2006",
+        "self_mute": false, "self_deaf": true, "mute": false, "deaf": false, "suppress": true,
+        "member": {"user": {"id": "2006", "username": "sam", "global_name": "Sam Whitlock"}, "nick": null, "roles": []}}));
+    world.discord.push("VOICE_STATE_UPDATE", state("2003", false, false));
+    fn stage(world: &World, wanted: impl Fn(&[(String, bool)]) -> bool, what: &str) -> (CallSupport, Vec<(String, bool)>) {
+        wait(what, || match world.ask(Request::InVoice { network: Some(Network::Discord) }) {
+            Response::Conversations { conversations, .. } => {
+                let row = conversations.iter().find(|row| row.key.id == "4202")?;
+                let occupants = row.occupants.as_ref()?;
+                let heard: Vec<(String, bool)> = occupants.people.iter().map(|person| (person.person.id.clone(), person.speaking)).collect();
+                wanted(&heard).then(|| (row.call, heard))
+            }
+            other => panic!("{other:?}"),
+        })
+    }
+    let (call, on_stage) = stage(&world, |heard| heard.len() == 3, "the stage's occupants");
+    assert_eq!(call, CallSupport::Handoff, "a stage is joined in Discord's own app");
+    assert!(on_stage.contains(&("2001".to_owned(), true)), "on stage, though muted: {on_stage:?}");
+    assert!(on_stage.contains(&("2003".to_owned(), true)));
+    assert!(on_stage.contains(&("2006".to_owned(), false)), "the audience is not on stage: {on_stage:?}");
+    // The voice channel beside it: `suppress` absent, so nobody counts as heard there.
+    let lounge = wait("the lounge's occupants", || match world.ask(Request::InVoice { network: Some(Network::Discord) }) {
+        Response::Conversations { conversations, .. } => {
+            let row = conversations.iter().find(|row| row.key.id == "4201")?;
+            let occupants = row.occupants.as_ref()?;
+            (!occupants.people.is_empty()).then(|| {
+                (row.call, occupants.people.iter().map(|person| (person.person.id.clone(), person.speaking)).collect::<Vec<_>>())
+            })
+        }
+        other => panic!("{other:?}"),
+    });
+    assert_eq!(lounge, (CallSupport::Native, vec![("2002".to_owned(), false)]));
+
+    // Held back, Mara is audience from then on; leaving, she is out of the row at once. The
+    // row is read as the sidebar reads it: as part of the server's tree.
+    world.discord.push("VOICE_STATE_UPDATE", state("2001", true, false));
+    let quieter = stage(&world, |heard| heard.contains(&("2001".to_owned(), false)), "Mara held back");
+    assert!(quieter.1.contains(&("2003".to_owned(), true)));
+    world.discord.push("VOICE_STATE_UPDATE", json!({"guild_id": "4000", "channel_id": null, "user_id": "2001", "session_id": "voice-2001"}));
+    let gone = wait("Mara gone from the stage", || {
+        match world.ask(Request::Tree { space: world.key("4000"), offset: 0, limit: 500, peek: true }) {
+            Response::Tree { conversations, .. } => {
+                let row = conversations.iter().find(|row| row.key.id == "4202")?;
+                let occupants = row.occupants.as_ref()?;
+                let heard: Vec<(String, bool)> = occupants.people.iter().map(|person| (person.person.id.clone(), person.speaking)).collect();
+                (!heard.iter().any(|(id, _)| id == "2001")).then_some(heard)
+            }
+            other => panic!("{other:?}"),
+        }
+    });
+    assert_eq!(gone, [("2003".to_owned(), true), ("2006".to_owned(), false)]);
+}
+
+#[test]
+fn a_stage_arriving_with_a_guild_create_counts_who_is_on_it_at_once() {
+    let world = World::start();
+    // A server arrives whole, stage and all: its channels are planted before its voice
+    // states are read, so the first report already knows who the platform holds back.
+    world.discord.push("GUILD_CREATE", json!({
+        "id": "7000", "name": "Stage Place", "icon": null, "owner_id": "2001", "joined_at": "2026-10-13T08:00:00+00:00",
+        "roles": [{"id": "7000", "name": "@everyone", "permissions": "1024", "position": 0}],
+        "channels": [{"id": "7002", "type": 13, "name": "Assembly", "position": 0, "parent_id": null, "bitrate": 64000, "user_limit": 0, "permission_overwrites": []}],
+        "threads": [],
+        "voice_states": [{"user_id": "2001", "channel_id": "7002", "session_id": "voice-mara",
+                          "self_mute": false, "self_deaf": false, "mute": false, "deaf": false, "suppress": false}],
+        "members": [{"user": me(), "roles": [], "joined_at": "2026-10-13T08:00:00+00:00"}],
+    }));
+    let on_stage = wait("the stage planted and its speaker told", || {
+        match world.ask(Request::InVoice { network: Some(Network::Discord) }) {
+            Response::Conversations { conversations, .. } => {
+                let row = conversations.iter().find(|row| row.key.id == "7002")?;
+                let occupants = row.occupants.as_ref()?;
+                (occupants.people.len() == 1).then(|| {
+                    (row.call, occupants.people.iter().map(|person| (person.person.id.clone(), person.speaking)).collect::<Vec<_>>())
+                })
+            }
+            other => panic!("{other:?}"),
+        }
+    });
+    assert_eq!(on_stage, (CallSupport::Handoff, vec![("2001".to_owned(), true)]));
+}
+
+#[test]
+fn a_stage_with_more_than_a_row_of_occupants_keeps_its_speakers_visible() {
+    let world = World::start();
+    world.ask(Request::Watch(Watching { space: Some(world.key("4000")), ..Watching::default() }));
+    // Two speakers whose names sort last, plus an audience whose name sorts first.
+    world.discord.push("VOICE_STATE_UPDATE", json!({"guild_id": "4000", "channel_id": "4202", "user_id": "2001", "session_id": "voice-2001",
+        "self_mute": false, "self_deaf": false, "mute": false, "deaf": false, "suppress": false}));
+    world.discord.push("VOICE_STATE_UPDATE", json!({"guild_id": "4000", "channel_id": "4202", "user_id": "2003", "session_id": "voice-2003",
+        "self_mute": false, "self_deaf": false, "mute": false, "deaf": false, "suppress": false}));
+    world.discord.push("VOICE_STATE_UPDATE", json!({"guild_id": "4000", "channel_id": "4202", "user_id": "2006", "session_id": "voice-2006",
+        "self_mute": false, "self_deaf": true, "mute": false, "deaf": false, "suppress": true,
+        "member": {"user": {"id": "2006", "username": "sam", "global_name": "AAA Early"}, "nick": null, "roles": []}}));
+    let on_stage = wait("the stage's occupants", || {
+        match world.ask(Request::InVoice { network: Some(Network::Discord) }) {
+            Response::Conversations { conversations, .. } => {
+                let row = conversations.iter().find(|row| row.key.id == "4202")?;
+                let occupants = row.occupants.as_ref()?;
+                (occupants.people.iter().filter(|p| p.speaking).count() == 2).then(|| occupants.people.iter().filter(|p| p.speaking).count())
+            }
+            other => panic!("{other:?}"),
+        }
+    });
+    assert_eq!(on_stage, 2);
 }
 
 /// Waits until everything pushed so far has been handled: a marker message sent after it is
@@ -2337,6 +2562,7 @@ fn who_may_see_a_channel_follows_roles_membership_and_categories_live() {
     world.discord.push("GUILD_MEMBER_UPDATE", member(json!(["4010", "4011"])));
     wait("the core team's channel", || has("4103").then_some(()));
     assert!(has("4104") && has("4500"), "{:?}", rows());
+    assert_eq!(world.conversation("4201").limit, 12, "the limit survives the tree being worked out again");
     assert_eq!(world.conversation("4101").mentions, 1, "unread state survives the tree being worked out again");
     // We lose the mod role: its channel goes.
     world.discord.push("GUILD_MEMBER_UPDATE", member(json!(["4011"])));
@@ -2357,6 +2583,12 @@ fn who_may_see_a_channel_follows_roles_membership_and_categories_live() {
     world.discord.push("CHANNEL_UPDATE", general);
     wait("the channel to be read only", || world.conversation("4101").read_only.then_some(()));
     assert_eq!(world.conversation("4101").topic, "Anything goes. Be kind.");
+
+    // A voice channel's limit changed in Discord follows; none reads 0.
+    let mut lounge = channel("4201");
+    lounge["user_limit"] = json!(0);
+    world.discord.push("CHANNEL_UPDATE", lounge);
+    wait("the limit to lift", || (world.conversation("4201").limit == 0).then_some(()));
 
     // A category renamed is renamed at once.
     let mut text = channel("4100");

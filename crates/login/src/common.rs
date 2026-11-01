@@ -55,40 +55,8 @@ pub fn hands_off(url: &str) -> bool {
 pub const PAGE: &str = "JSON.stringify({url:location.href,\
                     text:document.body?document.body.innerText.slice(0,4000):''})";
 
-#[cfg(target_os = "macos")]
 pub fn user_agent() -> String {
-    let installed = std::process::Command::new("/usr/bin/defaults")
-        .args([
-            "read",
-            "/Applications/Safari.app/Contents/Info",
-            "CFBundleShortVersionString",
-        ])
-        .output()
-        .ok()
-        .and_then(|out| String::from_utf8(out.stdout).ok())
-        .map(|version| version.trim().to_string())
-        .filter(|version| {
-            !version.is_empty() && version.chars().all(|c| c.is_ascii_digit() || c == '.')
-        });
-    format!(
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 \
-         (KHTML, like Gecko) Version/{} Safari/605.1.15",
-        installed.as_deref().unwrap_or("26.0")
-    )
-}
-
-#[cfg(target_os = "windows")]
-pub fn user_agent() -> String {
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) \
-     Chrome/131.0.0.0 Safari/537.36"
-        .to_owned()
-}
-
-#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
-pub fn user_agent() -> String {
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) \
-     Chrome/131.0.0.0 Safari/537.36"
-        .to_owned()
+    protocol::browser::user_agent()
 }
 
 pub fn slack_session(local_config: &str) -> Option<serde_json::Value> {

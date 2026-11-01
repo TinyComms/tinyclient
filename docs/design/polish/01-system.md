@@ -5,8 +5,7 @@ The rules the other six polish designers draw with. Mockup: `mockups/01-system.h
 
 ## 1. Calm by default: rules you can check on a screenshot
 
-"Thrown all at you" is too many signals per row in too many shapes: a current Inbox row has a colored logo, Space,
-`›`, channel, pin, time, `@n` pill and a preview starting with my own name. Eight marks; the target is four.
+The clutter these rules were written against put eight marks on one Inbox row: a colored logo, a Space, `›`, a channel, a pin, a time, an `@n` pill, and a preview that started with the reader's own name. C3 keeps four signals. The rules below are the check, not a screenshot of an old build.
 
 | # | Rule | Check on a screenshot |
 |---|---|---|
@@ -141,7 +140,9 @@ stays on screen whenever there is one. The service is never named: users see "ti
 | Account needs you | verification, captcha | that network's home and the Inbox, banner | "Discord wants you to verify your account." | "Open Discord" |
 | Signed out (expired) | token rejected | home + Inbox banner; its rows stay readable | "Slack signed you out of Harbor Labs." | "Sign in" |
 | Network late | adapter reconnecting > 5 s | home banner; in the Inbox too, naming it | "Slack is reconnecting. Showing what was saved at 10:42." | — |
-| All signed out | no account | sidebar empty state; conversation empty state | Title "Sign in to start". Line "Discord, Slack, Telegram and Teams in one small window." | four network buttons (secondary, 32) |
+| All signed out | no account | sidebar empty state; conversation empty state | Title "Sign in to start". Line names every network in `layout::NETWORK_ORDER`, each with `Network::label` ("Tiny server" for Tiny). | One secondary 32 button per network in that order. |
+
+`conversation.rs` still shows "Telegram, Discord, Slack and Teams, in one list." when nothing is open. That string is behind the seven-network window. The design line is the seven names.
 
 ## 6. Mac chrome
 
@@ -157,12 +158,10 @@ stays on screen whenever there is one. The service is never named: users see "ti
 | Window | Minimize ⌘M · Zoom · (macOS tiling items) · — · tinyclient · Bring All to Front |
 | Help | Keyboard Shortcuts ⌘/ · Release Notes · — · Copy Diagnostics · Report a Problem… |
 
-Items that do not apply are disabled, never hidden; names follow the open place ("Open in Slack"). Esc is no item.
+A command whose handler is not registered shows disabled (Attach File, Show Details, Mute…, Start Call, Open in <network>). A command with nothing built is omitted: Mark as Unread, Mark Server as Read, Copy Link, Release Notes, Report a Problem…. Open in uses `Network::label` ("Open in Tiny server").
 
-- **About** opens Settings › About (`08-first-run-settings` §7). **Settings**: own 720 × 560 window, ⌘,. Sections:
-  Accounts · General · Notifications · Appearance · Privacy · Audio & video · Storage · About.
-- **Close versus quit** (ruling 11): ⌘W and the red button hide the window; chatd keeps receiving and the Dock badge
-  counting; the Dock icon or Window › tinyclient shows it unchanged. ⌘Q stops both; in a call it asks "End the call and quit?".
+- **About** opens Settings › About (`08-first-run-settings` §7). **Settings**: own 720 × 560 window, ⌘,. Sections, in list order: Accounts, General, Notifications, Sounds, Appearance, Messages, Privacy, Audio & video, Voice, Storage, Shortcuts, About.
+- **Close versus quit.** On macOS, with Keep receiving on, ⌘W and the red button hide the window and leave chatd receiving. Otherwise closing quits. On Linux and Windows, closing quits. ⌘Q stops the application-managed chatd. In a call it asks "End the call and quit?".
 - **Frame**: saved 500 ms after a move or resize with its display; restored if that display exists and half the frame
   is visible, else 1120 × 720 centered on the main display. Minimum 540 × 440. Double-click on a strip does what macOS
   is set to. The window title is the open conversation ("#showcase · Moss & Lichen"). Full screen keeps every strip 52.

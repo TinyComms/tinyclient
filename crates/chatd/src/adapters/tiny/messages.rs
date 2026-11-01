@@ -21,8 +21,6 @@ use std::collections::{HashMap, HashSet};
 const SPACE: &str = "server";
 const PAGE: u32 = 50;
 const PAGE_MAX: u32 = 100;
-/// What the shell may attach. The server is asked with the file itself.
-const FILE_BYTES: u64 = 100 * 1024 * 1024;
 const DIRECTS_AT: i32 = 500_000;
 const ROOMS_AT: i32 = 1_000_000;
 const TYPING_FOR: i64 = 8;
@@ -34,11 +32,7 @@ pub(crate) fn refresh(ctx: &Context, saved: &Saved) {
 
 /// The same as [`refresh`], with names the caller already loaded (a fresh `ready` has them).
 pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, String>) {
-    ctx.capabilities(Capabilities {
-        max_file_bytes: FILE_BYTES,
-        max_files: protocol::ATTACHMENTS_LIMIT as u32,
-        ..Capabilities::default()
-    });
+    ctx.capabilities(account_caps(saved));
     let _ = ctx.spaces(&[SpaceRow {
         id: SPACE.to_owned(),
         name: join_host(&saved.base_url),
@@ -55,7 +49,7 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
         super::Listed::Rows(rows) => rows,
         super::Listed::Empty => Vec::new(),
         super::Listed::Failed(detail) => {
-            eprintln!("chatd: Tiny server: rooms: {detail}");
+            tracing::warn!("chatd: Tiny server: rooms: {detail}");
             return;
         }
     };
@@ -170,6 +164,7 @@ pub(crate) fn on_live(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
         }
         "reaction.updated" => merge_reaction(ctx, saved, frame),
         "read.updated" => read_updated(ctx, saved, frame),
+        "server.updated" => ctx.capabilities(account_caps(saved)),
         _ => {}
     }
 }
@@ -431,7 +426,7 @@ fn load_page(ctx: &Context, saved: &Saved, conversation_id: &str, before: Option
     let limit = limit.clamp(1, PAGE_MAX);
     let before = before.as_deref().filter(|id| super::safe_id(id));
     if let Err(detail) = fetch_page(ctx, saved, conversation_id, before, limit) {
-        eprintln!("chatd: Tiny server: {conversation_id}: {detail}");
+        tracing::warn!("chatd: Tiny server: {conversation_id}: {detail}");
     }
 }
 
@@ -491,6 +486,15 @@ fn send_with(ctx: &Context, saved: &Saved, conversation_id: String, client_id: S
         ctx.sent(&conversation_id, &client_id, Err("Too many files.".to_owned()));
         return;
     }
+    let limits = upload_limits(saved);
+    for file in &outgoing.files {
+        let cap = cap_for(file, &limits);
+        let len = std::fs::metadata(&file.path).map(|meta| meta.len()).unwrap_or(0);
+        if len > cap {
+            ctx.sent(&conversation_id, &client_id, Err("That file is too big for this server.".to_owned()));
+            return;
+        }
+    }
     let saved = saved.clone();
     let posting = ctx.clone();
     let files = outgoing.files;
@@ -501,7 +505,10 @@ fn send_with(ctx: &Context, saved: &Saved, conversation_id: String, client_id: S
         for at in 0..upload.files().len() {
             upload.check()?;
             let target = Target::post(super::endpoint(&saved.base_url, "/v1/media")).header("Authorization", &format!("Bearer {}", saved.token));
-            let answer = upload.send_form(at, &target, "file", &[])?;
+            let answer = match upload.send_form(at, &target, "file", &[]) {
+                Ok(answer) => answer,
+                Err(why) => return Err(media_failure(&why)),
+            };
             let body: Value = serde_json::from_str(&answer.body).unwrap_or(Value::Null);
             let id = body.get("id").and_then(Value::as_str).or_else(|| body.pointer("/media/id").and_then(Value::as_str)).unwrap_or("");
             if !super::safe_id(id) {
@@ -572,8 +579,8 @@ fn mark_read(saved: &Saved, conversation_id: &str, message_id: &str) {
     let path = format!("/v1/conversations/{conversation_id}/read");
     match super::asked("POST", saved, &path, Some(json!({ "message_id": message_id }))) {
         Ok((200 | 204, _)) => {}
-        Ok((status, _)) => eprintln!("chatd: Tiny server: read answered {status}"),
-        Err(detail) => eprintln!("chatd: Tiny server: read: {detail}"),
+        Ok((status, _)) => tracing::warn!("chatd: Tiny server: read answered {status}"),
+        Err(detail) => tracing::warn!("chatd: Tiny server: read: {detail}"),
     }
 }
 
@@ -648,7 +655,6 @@ fn map_message(saved: &Saved, names: &HashMap<String, String>, wire: &WireMessag
     message.client_id = wire.client_id.clone().filter(|id| !id.is_empty());
     message.reply_to = reply_of(wire.reply_to.as_ref());
     if !deleted {
-        let base = saved.base_url.trim_end_matches('/');
         for file in &wire.attachments {
             if !super::safe_id(&file.id) {
                 continue;
@@ -661,7 +667,7 @@ fn map_message(saved: &Saved, names: &HashMap<String, String>, wire: &WireMessag
             let mut attachment = Attachment::new(title_or(&file.name, &file.id), stored);
             attachment.mime = file.mime.clone();
             attachment.duration = file.duration;
-            media.push((attachment.file.clone(), format!("{base}/v1/media/{}", file.id)));
+            media.push((attachment.file.clone(), fetched_url(saved, file)));
             message.attachments.push(attachment);
         }
     }
@@ -717,6 +723,87 @@ fn same_server(base: &str, url: &str) -> bool {
     !base.is_empty() && (url == base || url.starts_with(&format!("{base}/")))
 }
 
+struct UploadLimits {
+    image: u64,
+    file: u64,
+    archives: bool,
+}
+
+/// What this account may send. `file_scan` is absent on an older server, which keeps today's upload.
+fn account_caps(saved: &Saved) -> Capabilities {
+    let limits = upload_limits(saved);
+    let scans = super::manage::capabilities_of(saved).has(protocol::TINY_FEATURE_FILE_SCAN);
+    Capabilities {
+        max_file_bytes: limits.image.max(limits.file),
+        max_files: protocol::ATTACHMENTS_LIMIT as u32,
+        file_scan: scans,
+        allow_archives: scans && limits.archives,
+        ..Capabilities::default()
+    }
+}
+
+/// The caps `GET /v1/server` reports. An older server, or one that does not answer, keeps the original 8 MiB and 25 MiB.
+fn upload_limits(saved: &Saved) -> UploadLimits {
+    let fallback = UploadLimits { image: protocol::TINY_IMAGE_MAX_DEFAULT as u64, file: protocol::TINY_FILE_MAX_DEFAULT as u64, archives: false };
+    let Ok((200, body)) = super::asked("GET", saved, "/v1/server", None) else {
+        return fallback;
+    };
+    UploadLimits {
+        image: byte_cap(&body, "image_max_bytes", fallback.image),
+        file: byte_cap(&body, "file_max_bytes", fallback.file),
+        archives: body.get("allow_archives").and_then(Value::as_bool).unwrap_or(false),
+    }
+}
+
+/// The upload helper names a Tiny refusal `tiny-media`, then the status, then the body. The
+/// server's `error` becomes the sentence the chip shows. Anything else is left as it arrived.
+fn media_failure(why: &str) -> String {
+    let Some(rest) = why.strip_prefix("tiny-media\n") else {
+        return why.to_owned();
+    };
+    let Some((status, body)) = rest.split_once('\n') else {
+        return why.to_owned();
+    };
+    let Ok(status) = status.parse::<u16>() else {
+        return why.to_owned();
+    };
+    let body = serde_json::from_str(body).unwrap_or(Value::Null);
+    super::explain_media(status, &body).to_owned()
+}
+
+/// The address the file is fetched from. An absolute `url` on this server is kept. A path
+/// (`/v1/media/{id}?ex=&is=&hm=`, which is what mint returns) is joined onto the server base
+/// so the query is not dropped. Anything else uses the plain media path. The bearer is added
+/// when the file is fetched, not here.
+fn fetched_url(saved: &Saved, file: &WireFile) -> String {
+    let offered = file.url.trim();
+    let base = saved.base_url.trim_end_matches('/');
+    if !offered.is_empty() && same_server(base, offered) {
+        return offered.to_owned();
+    }
+    if let Some(path) = offered.strip_prefix('/').filter(|path| !path.starts_with('/')) {
+        return format!("{base}/{path}");
+    }
+    format!("{base}/v1/media/{}", file.id)
+}
+
+fn byte_cap(body: &Value, key: &str, fallback: u64) -> u64 {
+    let Some(bytes) = body.get(key).and_then(Value::as_i64).and_then(|bytes| u64::try_from(bytes).ok()) else {
+        return fallback;
+    };
+    let ceiling = protocol::TINY_UPLOAD_MAX as u64;
+    if (1..=ceiling).contains(&bytes) { bytes } else { fallback }
+}
+
+fn cap_for(file: &protocol::OutgoingFile, limits: &UploadLimits) -> u64 {
+    let named = if file.name.is_empty() { file.path.as_str() } else { file.name.as_str() };
+    let ext = named.rsplit(['/', '\\', '.']).next().unwrap_or("").to_ascii_lowercase();
+    match ext.as_str() {
+        "png" | "jpg" | "jpeg" | "webp" | "gif" => limits.image,
+        _ => limits.file,
+    }
+}
+
 fn member_names(saved: &Saved) -> HashMap<String, String> {
     super::members_of(saved).map(|members| members.into_iter().map(|member| (member.user_id, member.display_name)).collect()).unwrap_or_default()
 }
@@ -742,16 +829,16 @@ fn optional_list<T: serde::de::DeserializeOwned>(saved: &Saved, path: &str, key:
         Ok((200, body)) => match list_of(body, key) {
             Ok(rows) => Some(rows),
             Err(()) => {
-                eprintln!("chatd: Tiny server: {path} could not be read");
+                tracing::warn!("chatd: Tiny server: {path} could not be read");
                 None
             }
         },
         Ok((status, _)) => {
-            eprintln!("chatd: Tiny server: {path} answered {status}");
+            tracing::warn!("chatd: Tiny server: {path} answered {status}");
             None
         }
         Err(detail) => {
-            eprintln!("chatd: Tiny server: {path}: {detail}");
+            tracing::warn!("chatd: Tiny server: {path}: {detail}");
             None
         }
     }
@@ -989,6 +1076,9 @@ struct WireFile {
     height: u32,
     #[serde(default, deserialize_with = "flex_u32")]
     duration: u32,
+    /// A signed fetch address (`ex`, `is`, `hm`). Empty on an older server: the id's path is used.
+    #[serde(default)]
+    url: String,
 }
 
 #[derive(Deserialize)]
@@ -1098,6 +1188,20 @@ mod tests {
         assert_eq!(room.call, CallSupport::Native);
         let (rows, _) = ctx.hub.store().inbox(Some(Network::Tiny), InboxFilter::All, 0, 20, &[]).unwrap();
         assert!(rows.iter().any(|row| row.key.id == "direct-1"));
+    }
+
+    #[test]
+    fn the_composer_uses_the_servers_upload_caps() {
+        let (_adapter, ctx, saved) = fixture(|request| {
+            if request.starts_with("GET /v1/server ") {
+                return Some(http(200, "OK", r#"{"name":"Tiny","image_max_bytes":1048576,"file_max_bytes":2097152}"#));
+            }
+            None
+        });
+        // Caps are stored only once the account is linked, which start does before refresh.
+        ctx.link(protocol::Link::Offline);
+        refresh(&ctx, &saved);
+        assert_eq!(ctx.hub.capabilities(&ctx.account).max_file_bytes, 2_097_152);
     }
 
     #[test]
@@ -1255,5 +1359,134 @@ mod tests {
         let (no_tx, no_rx) = std::sync::mpsc::channel();
         serve(&ctx, &saved, &Live::new().unwrap(), Command::Download { id: "x".into(), url: "https://evil.example/v1/media/x".into(), reply: no_tx });
         assert!(no_rx.recv().unwrap().is_err());
+    }
+
+    #[test]
+    fn a_signed_media_url_is_fetched_and_the_bearer_stays() {
+        let saved = saved("https://chat.example");
+        let wire: WireMessage = serde_json::from_value(json!({
+            "id": "m-1",
+            "author_id": ME,
+            "body": "",
+            "created_at": WHEN,
+            "attachments": [{
+                "id": "file-1",
+                "name": "a.png",
+                "mime": "image/png",
+                "kind": "image",
+                "url": "https://chat.example/v1/media/file-1?ex=1&is=2&hm=ab"
+            }]
+        }))
+        .unwrap();
+        let mut media = Vec::new();
+        map_message(&saved, &HashMap::new(), &wire, &mut media).unwrap();
+        assert_eq!(media[0].1, "https://chat.example/v1/media/file-1?ex=1&is=2&hm=ab");
+        let foreign: WireMessage = serde_json::from_value(json!({
+            "id": "m-2",
+            "author_id": ME,
+            "attachments": [{ "id": "file-2", "url": "https://evil.example/v1/media/file-2?hm=no" }]
+        }))
+        .unwrap();
+        let mut media = Vec::new();
+        map_message(&saved, &HashMap::new(), &foreign, &mut media).unwrap();
+        assert_eq!(media[0].1, "https://chat.example/v1/media/file-2");
+        let (_adapter, ctx) = open_ctx();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let url = "https://chat.example/v1/media/file-1?ex=1&is=2&hm=ab";
+        serve(&ctx, &saved, &Live::new().unwrap(), Command::Download { id: "file-1".into(), url: url.into(), reply: tx });
+        let download = rx.recv().unwrap().unwrap();
+        assert_eq!(download.url, url);
+        assert_eq!(download.headers[0].0, "Authorization");
+        assert!(download.headers[0].1.starts_with("Bearer "));
+    }
+
+    #[test]
+    fn a_minted_media_path_is_joined_onto_the_server_and_keeps_the_bearer() {
+        let saved = saved("https://chat.example");
+        let path = "/v1/media/file-1?ex=1700086400&is=1700000000&hm=ab";
+        let wire: WireMessage = serde_json::from_value(json!({
+            "id": "m-1",
+            "author_id": ME,
+            "body": "",
+            "created_at": WHEN,
+            "attachments": [{
+                "id": "file-1",
+                "name": "a.png",
+                "mime": "image/png",
+                "kind": "image",
+                "url": path
+            }]
+        }))
+        .unwrap();
+        let mut media = Vec::new();
+        map_message(&saved, &HashMap::new(), &wire, &mut media).unwrap();
+        let joined = format!("https://chat.example{path}");
+        assert_eq!(media[0].1, joined);
+        let (_adapter, ctx) = open_ctx();
+        let (tx, rx) = std::sync::mpsc::channel();
+        serve(&ctx, &saved, &Live::new().unwrap(), Command::Download { id: "file-1".into(), url: joined.clone(), reply: tx });
+        let download = rx.recv().unwrap().unwrap();
+        assert_eq!(download.url, joined);
+        assert_eq!(download.headers[0].0, "Authorization");
+        assert!(download.headers[0].1.starts_with("Bearer "));
+    }
+
+    #[test]
+    fn a_blocked_media_upload_does_not_post_the_message() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let posted = Arc::new(AtomicBool::new(false));
+        let bearer = Arc::new(AtomicBool::new(false));
+        let (posted_flag, bearer_flag) = (posted.clone(), bearer.clone());
+        let dir = std::env::temp_dir().join(format!("tiny-blocked-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("notes.pdf");
+        std::fs::write(&path, b"%PDF-1.1\n").unwrap();
+        let (_adapter, ctx, saved) = fixture(move |request| {
+            if request.starts_with("GET /v1/server ") {
+                return Some(http(200, "OK", r#"{"name":"Tiny","image_max_bytes":8388608,"file_max_bytes":26214400}"#));
+            }
+            if request.starts_with("POST /v1/media ") {
+                if request.to_ascii_lowercase().contains("authorization: bearer t") {
+                    bearer_flag.store(true, Ordering::Relaxed);
+                }
+                return Some(http(403, "Forbidden", r#"{"error":"blocked"}"#));
+            }
+            if request.starts_with("POST /v1/conversations/") {
+                posted_flag.store(true, Ordering::Relaxed);
+                return Some(http(201, "Created", "{}"));
+            }
+            None
+        });
+        let mut pending = Message::plain("client-9", "Ada", "hi", 1, true);
+        pending.sender.id = ME.to_owned();
+        pending.state = SendState::Pending;
+        ctx.hub.store().ingest(&ctx.key("direct-1"), &pending, false).unwrap();
+        let outgoing = Outgoing {
+            files: vec![protocol::OutgoingFile {
+                path: path.to_string_lossy().into_owned(),
+                name: "notes.pdf".into(),
+                spoiler: false,
+                as_file: false,
+                original: false,
+            }],
+            ..Outgoing::default()
+        };
+        send_with(&ctx, &saved, "direct-1".into(), "client-9".into(), "hi".into(), None, outgoing);
+        let started = std::time::Instant::now();
+        let mut failed = None;
+        while started.elapsed() < std::time::Duration::from_secs(5) {
+            if let Ok(Some(message)) = ctx.stored_message("direct-1", "client-9") {
+                if let SendState::Failed { reason } = &message.state {
+                    failed = Some(reason.clone());
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(failed.as_deref(), Some("Tiny blocked that file"));
+        assert!(bearer.load(Ordering::Relaxed), "the upload keeps the bearer");
+        assert!(!posted.load(Ordering::Relaxed), "a blocked upload must not post the message");
     }
 }

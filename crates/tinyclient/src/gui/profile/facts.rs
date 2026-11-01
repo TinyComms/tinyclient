@@ -566,7 +566,8 @@ fn tidy(mut items: Vec<Item>) -> Vec<Item> {
 /// already opens them in the network's app; a row's menu has no foot, so it says it here.
 pub fn person_menu(person: &Person, seen: &Seen, alt: bool, pane: bool) -> Vec<Item> {
     let mut items = Vec::new();
-    if let Some((_, muted)) = seen.direct.filter(|_| !seen.in_their_dm) {
+    // Signal, Messages, and Tiny do not serve mute. A switch that snaps back is left out.
+    if let Some((_, muted)) = seen.direct.filter(|_| !seen.in_their_dm && !matches!(person.key.network, Network::Signal | Network::Messages | Network::Tiny)) {
         items.extend([Item::Mute { muted }, Item::Separator]);
     }
     if !person.handle.trim_start_matches('@').is_empty() {
@@ -598,6 +599,10 @@ pub fn person_menu(person: &Person, seen: &Seen, alt: bool, pane: bool) -> Vec<I
 
 /// A group DM, or a Telegram group or channel: the user can leave it from the pane.
 pub fn can_leave(conversation: &Conversation) -> bool {
+    // A linked Signal device cannot leave a group. The item stays off until it can.
+    if conversation.key.network == Network::Signal {
+        return false;
+    }
     conversation.kind == ConversationKind::Group
         || (conversation.key.network == Network::Telegram
             && matches!(conversation.kind, ConversationKind::Channel | ConversationKind::Announcement))
@@ -690,19 +695,28 @@ pub fn confirm_words(act: Act, name: &str, network: Network) -> (String, String,
 pub enum NotifyControl {
     /// On or off: DMs, group DMs, Telegram.
     Switch,
-    /// All · Mentions · Nothing: channels on Discord, Slack and Teams.
+    /// All · Mentions · Nothing: channels on Discord and Slack. Teams is All · Nothing.
     Segmented,
+    /// The phone or the server owns this. The words are shown and nothing is sent.
+    Held(&'static str),
 }
 
 pub fn notify_control(conversation: &Conversation) -> NotifyControl {
-    let channel = matches!(
-        conversation.kind,
-        ConversationKind::Channel | ConversationKind::Announcement | ConversationKind::Voice | ConversationKind::Forum
-    );
-    if channel && conversation.key.network != Network::Telegram {
-        NotifyControl::Segmented
-    } else {
-        NotifyControl::Switch
+    match conversation.key.network {
+        Network::Signal => NotifyControl::Held("Set on your phone"),
+        Network::Messages => NotifyControl::Held("Stays on your phone"),
+        Network::Tiny => NotifyControl::Held("Not available on Tiny"),
+        _ => {
+            let channel = matches!(
+                conversation.kind,
+                ConversationKind::Channel | ConversationKind::Announcement | ConversationKind::Voice | ConversationKind::Forum
+            );
+            if channel && conversation.key.network != Network::Telegram {
+                NotifyControl::Segmented
+            } else {
+                NotifyControl::Switch
+            }
+        }
     }
 }
 
@@ -784,7 +798,8 @@ pub fn conversation_tag(conversation: &Conversation, info: Option<&ConversationI
             _ => "Shared".to_owned(),
         });
     }
-    if conversation.private {
+    // Signal marks every chat private because the chat is encrypted. That is not a private channel.
+    if conversation.private && conversation.key.network != Network::Signal {
         return Some("Private".to_owned());
     }
     conversation.read_only.then(|| "Read-only".to_owned())
@@ -827,6 +842,7 @@ mod tests {
             last_read: None,
             call: CallSupport::None,
             occupants: None,
+            limit: 0,
             read_only: false,
             private: false,
             draft: String::new(),
@@ -844,6 +860,8 @@ mod tests {
             preview_from: String::new(),
             preview_mine: false,
             seen: false,
+            delivered: false,
+            sending: false,
         }
     }
 
@@ -1026,6 +1044,13 @@ mod tests {
         assert_eq!(notify_control(&slack), NotifyControl::Segmented);
         assert_eq!(conversation_line(&slack, None), "Harbor Labs");
         assert_eq!(conversation_tag(&slack, None).as_deref(), Some("Private"));
+        let mut signal = row(Network::Signal, ConversationKind::Direct);
+        signal.private = true;
+        assert_eq!(conversation_tag(&signal, None), None);
+        assert_eq!(notify_control(&signal), NotifyControl::Held("Set on your phone"));
+        assert!(!can_leave(&row(Network::Signal, ConversationKind::Group)));
+        assert_eq!(notify_control(&row(Network::Messages, ConversationKind::Direct)), NotifyControl::Held("Stays on your phone"));
+        assert_eq!(notify_control(&row(Network::Teams, ConversationKind::Channel)), NotifyControl::Segmented);
         info.external = "Northwind".into();
         assert_eq!(conversation_tag(&slack, Some(&info)).as_deref(), Some("External · Northwind"));
         info.creator = "Dev Patel".into();

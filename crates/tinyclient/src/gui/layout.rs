@@ -4,7 +4,7 @@
 //! slots the other slices fill.
 
 use super::components::{
-    brand_mark, brand_state, button, button_disabled, divider, fade_in, glyph, icon_button, menu, menu_item,
+    brand_mark, brand_state, button, button_disabled, divider, fade_in, icon_button, menu, menu_item,
     menu_item_check, menu_item_danger, menu_label, menu_separator, network_icon, place, placed, popover, scrim, tip,
     toast, ButtonKind, Layer, Place, NO_GLYPH,
 };
@@ -16,7 +16,7 @@ use gpui::{
     div, prelude::*, px, AnyElement, App, Context, Div, MouseButton, MouseMoveEvent, Pixels, Point, Rgba,
     SharedString, Window, WindowControlArea,
 };
-use protocol::{Conversation, Key, Link, Network, Presence};
+use protocol::{CallState, Conversation, Key, Link, Network, Presence};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -359,6 +359,9 @@ impl Shell {
     }
 
     pub(super) fn open_menu(&mut self, menu: Menu, cx: &mut Context<Self>) {
+        if matches!(menu, Menu::Own) && !matches!(self.layout_state.menu, Some(Menu::Own)) {
+            self.own_menu_opened(cx);
+        }
         self.layout_state.menu = Some(menu);
         cx.notify();
     }
@@ -380,6 +383,8 @@ impl Shell {
             self.close_switcher(window, cx);
         } else if self.layout_state.menu.is_some() {
             self.layout_state.menu = None;
+        } else if self.tiny_escape(cx) {
+            return true;
         } else if self.layout_state.floating {
             self.layout_state.floating = false;
         } else {
@@ -451,50 +456,82 @@ impl Shell {
     fn right_pane(&self, width: f32, replaces: bool, window: &mut Window, cx: &mut Context<Self>) -> Option<Div> {
         let pane = self.layout_state.right.as_ref()?;
         let back_to = self.snapshot.as_ref().and_then(|s| s.open.as_ref()).map(|open| open.title.clone());
-        let strip = drags_window(div())
-            .h(px(TOP_BAR))
-            .flex_none()
+        // The window's own buttons end this strip at the window's right edge, on Windows and a
+        // client-drawn Linux frame. The close dismisses the pane, which is an app action, so it
+        // leads the strip, at the other end from that cluster, and never trails the title: there
+        // it would sit beside minimize and read as another window button.
+        let close_words = if pane.kind == RightKind::Thread { "Close thread" } else { "Close" };
+        let close = icon_button("right-close", "icons/x.svg", false)
+            .tooltip(tip(close_words, Some("⌘.")))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(|this, _, window, cx| this.close_right(Some(window), cx)));
+        let title = div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .items_baseline()
+            .gap(px(8.))
+            .child(div().min_w_0().truncate().type_title().child(pane.title.clone()))
+            .children(pane.count.map(|count| {
+                div().flex_none().type_ui().text_color(theme::text_faint()).child(count.to_string())
+            }));
+        // Over the conversation it stands for, the pane is a page with a heading: the person or
+        // channel it belongs to is centred over the body, not tucked into the crumb beside the
+        // title, where it reads as a path instead of a name.
+        let heading = back_to.filter(|_| replaces).map(|name| {
+            div()
+                .absolute()
+                .left_0()
+                .right_0()
+                .top_0()
+                .h(px(TOP_BAR))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .min_w_0()
+                        .max_w(px((width * 0.5).max(80.)))
+                        .truncate()
+                        .type_ui()
+                        .font_weight(theme::MEDIUM)
+                        .text_color(theme::text_soft())
+                        .child(name),
+                )
+        });
+        // The strip's own padding sits on an inner row, so a heading can centre on the whole pane
+        // rather than on what the window's buttons leave of it.
+        let row = div()
+            .h_full()
             .pl(px(theme::PANE_PAD))
             .pr(px(chrome::end_pad(End::Right, 12.)))
             .flex()
             .items_center()
             .gap(px(8.))
-            .border_b_1()
-            .border_color(theme::hairline())
             // With the sidebar out of the row too, the floating sidebar is one click away here
             // as in the conversation's strip.
-            .when(replaces, |strip| strip.children(self.panel_button(window, cx)))
-            // With the conversation gone from the row, this is the way back to it.
-            .when(replaces, |strip| {
-                strip.child(
-                    button("right-back", ButtonKind::Ghost, back_to.unwrap_or_default())
-                        .h(px(24.))
-                        .pl(px(4.))
-                        .pr(px(8.))
-                        .child(glyph("icons/chevron-left.svg", 16., theme::text_soft()))
-                        .flex_row_reverse()
+            .when(replaces, |row| row.children(self.panel_button(window, cx)))
+            // With the conversation gone from the row, this chevron is the way back to it, and so
+            // the way out of the pane: it leads in the close's place, and there is no second one.
+            .when(replaces, |row| {
+                row.child(
+                    icon_button("right-back", "icons/chevron-left.svg", false)
+                        .tooltip(tip(close_words, Some("⌘.")))
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .on_click(cx.listener(|this, _, window, cx| this.close_right(Some(window), cx))),
                 )
             })
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .items_baseline()
-                    .gap(px(8.))
-                    .child(div().min_w_0().truncate().type_title().child(pane.title.clone()))
-                    .children(pane.count.map(|count| {
-                        div().flex_none().type_ui().text_color(theme::text_faint()).child(count.to_string())
-                    })),
-            )
-            .child(
-                icon_button("right-close", "icons/x.svg", false)
-                    .tooltip(tip("Close", Some("⌘.")))
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_click(cx.listener(|this, _, window, cx| this.close_right(Some(window), cx))),
-            );
+            // Beside the conversation nothing leads the strip, so the close does.
+            .when(!replaces, |row| row.child(close))
+            .child(title);
+        let strip = drags_window(div())
+            .relative()
+            .h(px(TOP_BAR))
+            .flex_none()
+            .border_b_1()
+            .border_color(theme::hairline())
+            .child(row)
+            .children(heading);
         let resizable = !replaces;
         Some(
             div()
@@ -662,6 +699,17 @@ impl Shell {
         let strip_left = RAIL_WIDTH + if matches!(open, Menu::Space(_)) { overview } else { 0. };
         let strip_width = if overview > 0. && matches!(open, Menu::Network(_)) { overview } else { sidebar };
         let strip_button = place::anchor(strip_left + strip_width - 12. - 28., 12., 28., 28.);
+        // Discord, a multi-server Tiny title, and a server name are the buttons on the left.
+        // The 28-point box at the strip's right is the ellipsis, and it sits under Unread.
+        let named = match open {
+            Menu::Network(Network::Discord) => true,
+            Menu::Network(Network::Tiny) => snapshot.accounts_of(Network::Tiny) > 1,
+            Menu::Space(_) => true,
+            _ => false,
+        };
+        let title_width = (strip_width * 0.55).clamp(140., 260.);
+        let title_anchor = place::anchor(strip_left + 8., 6., title_width, 32.);
+        let menu_anchor = if named { title_anchor } else { strip_button };
         let placed: AnyElement = match open {
             Menu::Add => {
                 let content = fade_in("menu-add", 120, self.add_menu(snapshot, cx));
@@ -675,11 +723,11 @@ impl Shell {
             }
             Menu::Network(_) => {
                 let items = menu().w(px(220.)).children(self.menu_items(open, snapshot, cx));
-                placed("menu-network-at", Place::Below(strip_button), Layer::Menu, window, fade_in("menu-network", 120, items))
+                placed("menu-network-at", Place::Below(menu_anchor), Layer::Menu, window, fade_in("menu-network", 120, items))
             }
             Menu::Space(_) => {
                 let items = menu().w(px(200.)).children(self.menu_items(open, snapshot, cx));
-                placed("menu-space-at", Place::Below(strip_button), Layer::Menu, window, fade_in("menu-space", 120, items))
+                placed("menu-space-at", Place::Below(menu_anchor), Layer::Menu, window, fade_in("menu-space", 120, items))
             }
             Menu::Row(_, position) => {
                 let items = menu().w(px(220.)).children(self.menu_items(open, snapshot, cx));
@@ -772,7 +820,23 @@ impl Shell {
             Menu::Row(conversation, _) => {
                 let (key, starred) = (conversation.key.clone(), conversation.starred);
                 let unpinned = conversation.clone();
-                let space = conversation.space.as_ref().map(|space| Key { id: space.clone(), ..conversation.key.clone() });
+                let join = conversation.clone();
+                let shown = conversation.clone();
+                let ours = snapshot
+                    .call
+                    .as_ref()
+                    .is_some_and(|call| call.conversation == conversation.key && !matches!(call.state, CallState::Failed { .. }));
+                // A native voice channel joins from its menu too; a stage never does (07 §1).
+                if super::sidebar::joins_from_list(&**conversation) && !ours {
+                    items.push(
+                        menu_item("join", Some("icons/volume-2.svg"), "Join voice", None)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.close_menu(cx);
+                                this.call_start(join.key.clone(), cx);
+                            }))
+                            .into_any_element(),
+                    );
+                }
                 items.push(
                     menu_item("star", Some("icons/pin.svg"), if starred { "Unpin from Inbox" } else { "Pin to top of Inbox" }, None)
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -781,12 +845,12 @@ impl Shell {
                         }))
                         .into_any_element(),
                 );
-                if let Some(space) = space {
+                if conversation.space.is_some() {
                     items.push(
                         menu_item("reveal", Some("icons/corner-down-right.svg"), "Show in sidebar", None)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.close_menu(cx);
-                                this.go(super::sidebar::Mode::Space(space.clone()), cx);
+                                this.reveal_in_sidebar(&shown, cx);
                             }))
                             .into_any_element(),
                     );
@@ -971,7 +1035,7 @@ impl Render for Shell {
         if std::env::var_os("TINYCLIENT_FRAMES").is_some() {
             static FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let frame = FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            eprintln!("tinyclient: frame {frame} at {} ms", super::LAUNCHED.get().map_or(0, |at| at.elapsed().as_millis()));
+            tracing::warn!("tinyclient: frame {frame} at {} ms", super::LAUNCHED.get().map_or(0, |at| at.elapsed().as_millis()));
         }
         let root = self
             .keys(div(), cx)
@@ -991,6 +1055,10 @@ impl Render for Shell {
                     }
                 }),
             );
+        if let Some(account) = super::signin::take_open_existing(cx) {
+            self.go(super::sidebar::Mode::Network(protocol::Network::Tiny), cx);
+            self.prefer_tiny(account, cx);
+        }
         let root = root.children(super::signin::layer(window, cx));
         #[cfg(feature = "gui-shot")]
         if self.sheet {
@@ -1108,6 +1176,7 @@ impl Render for Shell {
                 )
             })
             .children(self.switcher(window, cx))
+            .children(self.tiny_layer(window, cx))
             .children(self.menu_layer(snapshot, plan.sidebar.unwrap_or(state.sidebar_width), overview, window, cx))
             .children(self.toast_layer(width, cx))
             .children(window_chrome(window))

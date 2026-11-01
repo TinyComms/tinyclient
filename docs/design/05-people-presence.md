@@ -1,15 +1,12 @@
 # 05 People and presence
 
 Requirements: `docs/product/02-people.md`. Mockups: `mockups/05-people-presence.html`. One person-row, one avatar, one
-presence glyph on all four networks. All sizes are points.
+presence glyph on every signed-in network, including Signal, Messages, and a Tiny server. All sizes are points.
 
 ## Decisions that touch other agents
-- **People lives in the sidebar**, behind a `Chats | People` switch (30 px high, in the sidebar's 52 px head). The open
-  conversation stays in the main pane, so picking a person opens their thread beside the list. The rail's network buttons
-  narrow People exactly as they narrow Chats. No rail button of its own is needed; if layout wants one, it selects the same
-  switch.
+- **People is a rail destination.** Inbox and People are the first two rail buttons. People puts its list in the sidebar and leaves the open conversation alone. There is no Chats | People switch. Order is online first, then A to Z (`design.md` ruling 5).
 - **The network icon leaves the avatar.** The avatar's bottom-right corner belongs to presence. The network is a 14 px icon at
-  the row's trailing edge, shown only in all-network views. Inside a single-network view (rail filter on, member list, a
+  the row's trailing edge, shown only in a list that mixes networks. Inside a single-network view (rail filter on, member list, a
   server) it is not drawn at all.
 - **Rows need opaque hover and selected fills**, because the presence ring repaints the row background (see New tokens).
 
@@ -66,20 +63,20 @@ glyph centered in it.
 - In the conversation header: `[network icon 13] Network · Word · emoji text` on one line.
 
 ## People view (sidebar, 316 px)
-Top to bottom: switch (52 px head), search field (36 px, margin 8 16 0), scope chips (28 px high, radius 8, margin-top 10),
+Top to bottom: title strip (52 px head), search field (36 px, margin 8 16 0), scope chips (28 px high, radius 8, margin-top 10),
 list.
 
 | Rail filter | Chips | Sections inside "All" |
 | --- | --- | --- |
 | All networks | Online, All, Requests n (only when n > 0) | Online n, Everyone n |
 | Discord | Online, All, Pending n, Blocked | Online n, Everyone n |
-| Slack, Teams, Telegram | Online, All | Online n, Everyone n |
+| Slack, Teams, Telegram, Signal, Messages, Tiny server | Online, All | Online n, Everyone n |
 
 - **Order.** Online section: every state except offline and unknown, A to Z by display name. Everyone: the rest, A to Z.
   (Story 4 wins over the product table's "Slack most recent first".) A person on two networks is two rows. Regrouping after a
   presence change is applied in a batch, at most every 2 s, and never while a row menu is open.
 - **Section header**: 32 px, 11 px semibold uppercase, tracking 0.06 em, `text_faint`, "ONLINE — 7", left padding 20.
-- **Row**: 56 px, inset 8 px from the sidebar edges, radius 10, padding 0 10. Avatar 40 with dot, gap 12, then two lines: name
+- **Row**: 48 px, or 40 when Density is Compact, inset 8 px from the sidebar edges, radius 10, padding 0 10. Avatar 40 with dot, gap 12, then two lines: name
   14 px semibold (plus `BOT` tag), status line 13 px `text_soft`. Trailing: network icon 14 px (all-network view only).
 - **States**: rest (ring `sidebar`), hover (`sidebar_hover`), selected when that person's conversation is open
   (`sidebar_selected`). Blocked rows: avatar 45% opacity, name `text_faint`.
@@ -87,7 +84,7 @@ list.
   10, top 14, on a patch of the row's own opaque color with 10 px left padding, covering the text's end so nothing reflows:
   `phone` (only where tinyclient can carry or hand off the call) and `ellipsis` (Profile, Open in network, Remove friend,
   Block). There is no separate Message button; the row is the button.
-- **Request rows** (same 56 px): line 2 is "Wants to be friends" plus mutual-server count, or "Request sent Oct 9". Actions
+- **Request rows** (same height): line 2 is "Wants to be friends" plus mutual-server count, or "Request sent Oct 9". Actions
   are always visible, not hover-only: incoming `check` (`positive_soft` fill, `positive` glyph) and `x`; outgoing `x` only.
   Accept turns the row into a friend in place; nothing is ever sent without a click.
 - **Search.** Every keystroke filters the held lists locally (name and handle, case- and accent-insensitive) under "In your
@@ -98,7 +95,7 @@ list.
   Esc clears.
 - **Empty states** (glyph `users`, headline, one line). Discord, no friends: "No friends on Discord yet / Friends you add in
   Discord appear here." Online chip, nobody on: "Nobody is online / 23 people are in All." Pending: "No pending requests".
-  Slack or Teams: "No direct messages yet / Type a name to find anyone in Northwind." Telegram: "No contacts yet / Type a
+  Slack or Teams: "No direct messages yet / Type a name to find anyone in Northwind." Signal or Messages: "No direct messages yet / Type a name to find anyone." Tiny server: "Nothing here yet." Telegram: "No contacts yet / Type a
   @username to find someone." Search: "No one matches “x” / Checked your lists and 3 directories."
 - **Network down**: rows stay, drawn without dots, under one `warning` line, 13 px: "Discord is offline. Presence is paused."
 
@@ -107,7 +104,7 @@ list.
   icon; a person with no thread says "New message" at the right in `text_faint`. **From a profile card**: Message.
 - All three call `start` and open the pane at once. With no existing thread the pane has the normal header and, centered,
   avatar 80 with dot, name 18 px semibold, `[icon] @handle · Network` 13 px, then "No messages yet. Nothing is created on
-  Telegram until you send one." in `text_faint`. The composer is focused. No row appears in Chats until the first send
+  Telegram until you send one." in `text_faint`. The composer is focused. No row appears in the Inbox until the first send
   succeeds; a typed draft is kept per person. A Discord non-friend adds one line: "You are not friends on Discord. They may
   not receive this."
 
@@ -149,11 +146,11 @@ card):
 
 - Head: avatar 40, name, one line of truth ("Do not disturb on 3 networks").
 - Status text field 36 px: emoji button, text, "clears in 1 h" (never, 30 min, 1 h, 4 h, today), clear `x`. Sent to Discord,
-  Slack and Teams; Telegram has none and says so in its row.
-- "All networks": four 32 px rows with the presence glyph (12 px), label, a faint note where a network differs ("Away on Slack
+  Slack and Teams. Telegram, Signal, Messages, and a Tiny server have no status text.
+- "All networks": one 32 px row per signed-in network, with the presence glyph (12 px), label, a faint note where a network differs ("Away on Slack
   and Teams", "Discord and Teams only"), check on the current one.
-- "Per network": four 32 px rows: icon 16, name, current glyph and word, chevron. Each opens a 208 px submenu listing only
-  that network's states. Telegram reads "Online while open" and has no submenu. A disconnected network reads "Offline" in
+- "Per network": one 32 px row per signed-in network: icon 16, name, current glyph and word, chevron. Each opens a 208 px submenu listing only
+  that network's states. Telegram reads "Online while open" and has no submenu. Signal, Messages, and a Tiny server have no submenu. A disconnected network reads "Offline" in
   `warning` and is not settable.
 
 ## New tokens
@@ -169,7 +166,7 @@ card):
 ## GPUI notes
 - `avatar(kind, id, name, image, size)` and `presence(state, size, ring)`; every call site passes the opaque color under it.
   Each glyph is two or three plain divs: no masks, no SVG.
-- People is a `list` with two known heights (32, 56); member list the same (32, 44). Offsets are a prefix sum of section
+- People is a `list` with two known heights (32, 48; 40 when compact); member list the same (32, 44). Offsets are a prefix sum of section
   counts, so neither measures rows.
 - A group composite costs two decodes; count it twice against the ~256 cap. Rows drop bitmaps when they leave the viewport;
   the fallback needs no bitmap.
@@ -178,6 +175,6 @@ card):
 
 ## Deliberately absent
 Mobile indicator; activity detail ("Playing X"); role colors on names; avatar decorations, banners and profile themes; merged
-identities across networks; a People button in the rail; a Message button on rows; a video-style member grid; multi-select
+identities across networks; a Message button on rows; a video-style member grid; multi-select
 "new group"; add friend and block UI beyond the menu items (P2); browsing a directory A to Z without typing; spinners and
 skeleton shimmer.

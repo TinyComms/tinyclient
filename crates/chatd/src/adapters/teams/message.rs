@@ -420,7 +420,7 @@ impl Teams {
             parsed.spans.push(Span { start, end: parsed.text.len() as u32, style: Style::Link { url: url.to_owned() } });
         }
         if let Err(err) = self.ctx.media(&media) {
-            eprintln!("chatd: Teams: {err}");
+            tracing::warn!("chatd: Teams: {err}");
         }
         message.text = parsed.text;
         message.spans = parsed.spans;

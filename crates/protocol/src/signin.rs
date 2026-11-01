@@ -109,6 +109,8 @@ pub enum SignInStep {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         problem: Option<SignInProblem>,
     },
+    /// Google Messages asks the user to select this emoji on the paired phone.
+    Emoji { emoji: String },
     /// Signed in. The account is in `Status` from now on.
     Done {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -165,6 +167,13 @@ impl fmt::Debug for SignInInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn messages_emoji_challenge_round_trips() {
+        let json = r#"{"step":"emoji","emoji":"🐢"}"#;
+        let step: SignInStep = serde_json::from_str(json).expect("Google account pairing challenge");
+        assert_eq!(serde_json::to_string(&step).unwrap(), json);
+    }
 
     #[test]
     fn what_was_typed_is_never_printed_and_bare_steps_read() {

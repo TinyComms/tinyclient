@@ -26,11 +26,14 @@ A separate window, 720 × 560, not resizable, not minimizable, transparent title
 | 6 | Messages | `message-square` | |
 | 7 | Privacy | `lock` | |
 | 8 | Audio & video | `mic` | |
-| 9 | Storage | `hard-drive` | new |
+| 9 | Voice | `headphones` | |
+| | Storage | `hard-drive` | new |
 | | Shortcuts | `command` | new |
 | | About | `info` | |
 
-Height check: 52 + 28 + 8 + 10 × 30 = 388, and About ends at 548. A section whose rows are all out of this build (none in v1) is absent from the list; it is never shown empty.
+⌘1 through ⌘9 reach Accounts through Voice. Storage, Shortcuts, and About have no digit.
+
+Height check: 52 + 28 + 8 + 11 × 30 = 418. About stays pinned 12 from the list's bottom. A section whose rows are all out of this build (none in v1) is absent from the list; it is never shown empty.
 
 ## 2. Page anatomy
 
@@ -110,10 +113,10 @@ As 08 §5 and §6 with 01 sizes: one group per network labelled with the network
 ### General
 | Row | Control | Second line |
 |---|---|---|
-| "Open at login" (G1) | Switch | On: "Receives messages from login. The window opens when you click the Dock icon." |
-| "Keep receiving when the window is closed" (G2) | Switch | |
+| "Keep receiving when the window is closed" (G2) | Switch, on. macOS only. | On: "Closing the window leaves tinyclient running. Quit with ⌘Q to stop it." |
+| "Install updates automatically" (G4) | Switch, on | On: a newer version downloads while the app is open and installs when you quit. |
 
-Caption: on, "Closing the window leaves tinyclient running. Quit with ⌘Q to stop it."; off, "Closing the window quits tinyclient. Nothing arrives until you open it again." If macOS reports that login needs approval, G1's second line becomes, in `warning` with `triangle-alert` 14: "Waiting for approval in System Settings › General › Login Items." and a link "Open Login Items".
+Caption, when G2 is off: "Closing the window quits tinyclient. Nothing arrives until you open it again." Elsewhere the G2 row is absent and closing quits (`06` §8).
 
 ### Notifications
 | Group | Row | Control | Second line |
@@ -153,7 +156,7 @@ Captions. Under Notification sounds: "Notification sounds use the alert volume i
 ### Appearance
 | Row | Control | Second line |
 |---|---|---|
-| "Theme" (A1) | Segmented: "Match system" / "Dark" / "Light" | |
+| "Theme" (A1) | Absent. Search says "tinyclient is dark only for now." | The segmented control is specified for when light values are checked. It is not drawn. |
 | "Text size" (A2) | Stepped slider, five stops (−1 to +3), value "13 pt" … "17 pt", "Default" at 14 | |
 | "Density" (A3) | Segmented: "Comfortable" / "Compact" | Compact: "List rows are 40 instead of 48." |
 | "Show message previews in the list" (A4) | Switch | Off: "Rows show names and times only." |
@@ -193,7 +196,10 @@ Captions. Under the read group: "Discord and Slack have no read receipts." If no
 
 The meter row is min 96 tall (8, 28, 6, 28, 2, 16, 8): "Input level" left of the meter and "Test" on the first line, "Sensitivity" left of the slider on the second, the second line under both. Without the meter (§6), Sensitivity is an ordinary slider row. **Test is a toggle, not a hold** (product said held): holding a key or button is impossible for many keyboard and switch users. A test stops on "Stop", after 30 s, when the section changes or the window closes; mediad then exits within 3 s as specified. During a call, Test uses the running mediad and starts nothing.
 
-Caption under Speaker: "Picking a device in a call's menu changes that call only. These are the defaults." Echo cancellation has no row; it is always on.
+Caption under Speaker: "Picking a device in a call's menu changes that call only. These are the defaults." There is no Camera row. Search for camera answers "tinyclient has no camera yet." A Tiny call can still send a camera on Windows (`07`).
+
+### Voice
+Echo cancellation (V10), noise suppression (V11), and automatic gain (V12) are switches. Each defaults on. While echo cancellation is off, a Tiny channel still says to wear headphones (`07` §7a, `10`).
 
 ### Storage
 | Row | Control |
@@ -208,7 +214,7 @@ Caption: "Sign-ins, drafts and settings are not part of this."
 Read-only. One card per menu (tinyclient, File, Edit, View, Conversation, Window, Help), labelled with the menu's name, then a "Calls" card for the 07 §2 call keys (⌘⇧M, ⌘⇧D, ⌘⇧H, ⌘⇧A, ⌘⇧R, ⌘⇧J). Those are in no menu today, so App Shortcuts cannot rebind them; they need a menu (Conversation or a new Call menu) before the caption below is true for them. Rows: 32 high, command 13/18 `text`, keys at the right as keycaps (3.8). The search field filters this list too. Caption at the top: "To change a shortcut, add it in System Settings › Keyboard › Keyboard Shortcuts › App Shortcuts." with the link "Open Keyboard Shortcuts". ⌘/ opens this section.
 
 ### About
-As 08 §7, with "One small app for Slack, Discord, Telegram, Teams and Signal." Below the acknowledgements, one card:
+As 08 §7, with "One small app for Slack, Discord, Telegram, Teams, Signal, and Messages, and for Tiny servers you run." The window still draws "One small app for Slack, Discord, Telegram, Teams and Signal." until that copy is updated. Below the acknowledgements, one card:
 
 | Row | Control |
 |---|---|
@@ -248,7 +254,6 @@ Per-conversation settings live with the conversation and are mirrored in Sounds 
 | chatd unreachable | Every section with chatd rows | Banner, `wifi-off` `warning`: "Can't reach tinyclient's background service. These settings return when it does." · "Restart it". Rows homed in chatd are disabled with their last known value; shell rows stay live |
 | A write fails | The row | Value returns to the stored one; 12/16 `danger` line in the row: "Couldn't save. Try again." Cleared by the next change |
 | Same From and To | Quiet hours | 01 input error: `danger` border, "Start and end can't be the same." Not stored |
-| Login item needs approval | General | G1 line in §4 |
 | Search, no match | Pane | 01 empty state, glyph `search`: "No settings match “proxy”." For a Later or Never term a line follows, 13 `text_soft`: "tinyclient has no proxy setting yet." |
 
 ## 7. Search
@@ -351,13 +356,13 @@ New Lucide glyphs: `sun-moon`, `hard-drive`, `command`, `play`, `rotate-ccw`, at
 
 ## In this build (2026-10-14)
 
-The window has Accounts, General, Sounds, Appearance, Messages, Privacy, Audio & video, Storage, Shortcuts and About; ⌘1 to ⌘9 reach the first nine in that order. Notifications is absent, and so are Sounds' notification groups, S11's play buttons and the Theme row (product: Built so far). Sounds therefore holds S1 and In calls, and S1's second line says it silences calls. The pieces live in `crates/tinyclient/src/gui/settings/`: `rows.rs` (the row table, search, Shortcuts), `controls.rs` (card, row, switch, slider, meter, reset slot), `pages.rs` (sections, results, modals, device menus). Device pickers are as wide as their words, 120 to 240, and say "System default" alone; the menu, up to 440 wide, names the default device and takes ↑ ↓ Return Space and letters. The section list is one Tab stop. Two-line rows grow 2 a text step. The Accounts row's ⋯ menu, the time field and the conversation popover (§5) wait on Notifications.
+Section order is Accounts, General, Notifications, Sounds, Appearance, Messages, Privacy, Audio & video, Voice, Storage, Shortcuts, About. ⌘1 through ⌘9 reach Accounts through Voice. Storage, Shortcuts, and About have no digit. The Theme row is absent. There is no Camera row. The Accounts row's ⋯ menu, N3's per-account rows, the time field, and the conversation notification popover (§5) are still absent. The pieces live in `crates/tinyclient/src/gui/settings/`: `rows.rs` (the row table, search, Shortcuts), `controls.rs` (card, row, switch, slider, meter, reset slot), `pages.rs` (sections, results, modals, device menus). Device pickers are as wide as their words, 120 to 240, and say "System default" alone; the menu, up to 440 wide, names the default device and takes ↑ ↓ Return Space and letters. The section list is one Tab stop. Two-line rows grow 2 a text step.
 
 ## Deliberately absent
 
 - Disabled rows for unbuilt features, "coming soon", "beta" or "experimental" labels.
 - A key editor (Shortcuts is read-only; the recorder in 3.8 exists only for V8, Later).
-- A slider for notification volume; toggles for echo cancellation, gain or noise suppression.
+- A notification-volume slider on macOS. Windows and Linux have "Notification volume" (SV). macOS uses the alert volume, and the row is absent there.
 - Previewing sounds while moving through an open menu; any looping preview; a waveform.
 - Per-row "changed" dots or accent marks; color for inherited values beyond grey.
 - Animation of switches, sliders, the meter or section changes; a sliding sidebar of sections.

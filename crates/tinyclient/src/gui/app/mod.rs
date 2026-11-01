@@ -19,7 +19,7 @@ use super::components::{banner, banner_action, button, empty_state_with, glyph, 
 use super::layout::{self, drags_window};
 use super::state::Shell;
 use super::theme;
-use crate::client::{ask, ask_within, is_gone, is_other_version, is_slow};
+use crate::client::{ask, is_gone, is_other_version, is_slow};
 use gpui::{div, prelude::*, px, AnyElement, ClipboardItem, Context, Div, Window};
 use protocol::{Request, Response};
 use service::{Phase, Shown, Stopped};
@@ -125,10 +125,15 @@ impl Shell {
             .detach();
             return;
         }
+        // The voice keys work in any app for as long as the window lives.
+        super::hotkeys::start(cx.entity().downgrade(), cx);
         cx.spawn(async move |this, cx| loop {
-            let status = cx.background_executor().spawn(async { ask_within(&Request::Status, Some(service::SLOW)) }).await;
+            let status = crate::client::ask_within_async(Request::Status, Some(service::SLOW)).await;
             match status {
-                Ok(Response::Status { networks, accounts, call, seq, keychain, started, .. }) => {
+                Ok(Response::Status { networks, accounts, call, seq, keychain, started, session, .. }) => {
+                    if !session.is_empty() {
+                        protocol::log_policy::adopt_session(&session);
+                    }
                     let applied = this.update(cx, |this, cx| {
                         let came_back = this.service.phase == Phase::Reconnecting;
                         let restarted = this.service.answered(started, keychain, unix_now());
@@ -145,8 +150,7 @@ impl Shell {
                     }
                     let mut since = seq;
                     loop {
-                        let wait = async move { ask(&Request::Wait { since }) };
-                        match cx.background_executor().spawn(wait).await {
+                        match crate::client::ask_async(Request::Wait { since }).await {
                             Ok(Response::Changes { seq, reset, changes }) => {
                                 since = seq;
                                 let applied = this.update(cx, |this, cx| {
@@ -558,15 +562,22 @@ impl Shell {
             choices: prefs::choices(),
             kept: self.prefs_kept.clone(),
             autoplay: super::anim::autoplay(),
+            tiny_members: self.tiny_state.members_open(),
+            me: prefs::me(),
         }
     }
 
     /// Reads chatd's settings: at start, after a restart, and whenever one changes. Every
     /// window draws again with them.
     pub(in crate::gui) fn load_settings(&mut self, cx: &mut Context<Self>) {
-        self.off_thread(cx, || ask(&Request::Settings), |_, answer, cx| {
+        self.off_thread(cx, || ask(&Request::Settings), |this, answer, cx| {
             if let Ok(Response::Settings { values }) = answer {
-                prefs::set_values(protocol::settings::Values::new(values));
+                let values = protocol::settings::Values::new(values);
+                if let Some(guard) = protocol::log_policy::current() {
+                    guard.apply(protocol::log_policy::LogPolicy::for_settings(&values));
+                }
+                prefs::set_values(values);
+                this.badge_setting_changed();
                 cx.refresh_windows();
             }
         });
@@ -629,8 +640,9 @@ impl Shell {
 
     pub(in crate::gui) fn diagnostics(&self) -> String {
         let mut text = format!(
-            "tinyclient {}\n{} {}\nservice: {:?}{}, keychain: {:?}, started {}\n",
+            "tinyclient {}{}\n{} {}\nservice: {:?}{}, keychain: {:?}, started {}\n",
             env!("CARGO_PKG_VERSION"),
+            crate::update::short_commit().map(|commit| format!(" ({commit})")).unwrap_or_default(),
             std::env::consts::OS,
             std::env::consts::ARCH,
             self.service.phase,

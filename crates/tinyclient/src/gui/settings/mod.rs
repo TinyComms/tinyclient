@@ -7,7 +7,8 @@
 //! snapshot, read each frame.
 
 mod accounts;
-mod controls;
+pub(in crate::gui) mod controls;
+mod notify;
 mod pages;
 mod phone_page;
 pub mod rows;
@@ -48,32 +49,38 @@ gpui::actions!(settings, [Find, Dismiss, NextControl, PreviousControl]);
 pub enum Section {
     Accounts,
     General,
+    Notifications,
     Sounds,
     Appearance,
     Messages,
     Privacy,
     Audio,
+    Voice,
     Storage,
     Shortcuts,
     About,
 }
 
 /// Whether a phone shows `section`. General is the desktop's window and updates, Audio & video
-/// needs the desktop's media helper, and Shortcuts are a keyboard's.
+/// needs the desktop's media helper, and Shortcuts are a keyboard's. Notifications are the
+/// desktop's system notifications and taskbar badge, and Voice is the desktop's media helper and
+/// its global keys; a phone has neither yet.
 pub fn on_phone(section: Section) -> bool {
-    !matches!(section, Section::General | Section::Audio | Section::Shortcuts)
+    !matches!(section, Section::General | Section::Notifications | Section::Audio | Section::Voice | Section::Shortcuts)
 }
 
 impl Section {
     /// In list order; About is pinned to the bottom.
-    pub const ALL: [Section; 10] = [
+    pub const ALL: [Section; 12] = [
         Section::Accounts,
         Section::General,
+        Section::Notifications,
         Section::Sounds,
         Section::Appearance,
         Section::Messages,
         Section::Privacy,
         Section::Audio,
+        Section::Voice,
         Section::Storage,
         Section::Shortcuts,
         Section::About,
@@ -83,11 +90,13 @@ impl Section {
         match self {
             Section::Accounts => "Accounts",
             Section::General => "General",
+            Section::Notifications => "Notifications",
             Section::Sounds => "Sounds",
             Section::Appearance => "Appearance",
             Section::Messages => "Messages",
             Section::Privacy => "Privacy",
             Section::Audio => "Audio & video",
+            Section::Voice => "Voice",
             Section::Storage => "Storage",
             Section::Shortcuts => "Shortcuts",
             Section::About => "About",
@@ -98,11 +107,13 @@ impl Section {
         match self {
             Section::Accounts => "icons/users.svg",
             Section::General => "icons/settings.svg",
+            Section::Notifications => "icons/bell.svg",
             Section::Sounds => "icons/volume-2.svg",
             Section::Appearance => "icons/sun-moon.svg",
             Section::Messages => "icons/message-square.svg",
             Section::Privacy => "icons/lock.svg",
             Section::Audio => "icons/mic.svg",
+            Section::Voice => "icons/headphones.svg",
             Section::Storage => "icons/hard-drive.svg",
             Section::Shortcuts => "icons/command.svg",
             Section::About => "icons/info.svg",
@@ -114,11 +125,13 @@ impl Section {
         match self {
             Section::Accounts => "accounts",
             Section::General => "general",
+            Section::Notifications => "notifications",
             Section::Sounds => "sounds",
             Section::Appearance => "appearance",
             Section::Messages => "messages",
             Section::Privacy => "privacy",
             Section::Audio => "audio",
+            Section::Voice => "voice",
             Section::Storage => "storage",
             Section::Shortcuts => "shortcuts",
             Section::About => "about",
@@ -154,14 +167,35 @@ pub(super) enum Picker {
     Output,
 }
 
-/// What `mediad --devices` said: every device by name, the defaults, the microphone permission.
+/// What `mediad --devices` said: every device with its id, the defaults, the microphone
+/// permission.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(super) struct Devices {
-    pub inputs: Vec<String>,
-    pub outputs: Vec<String>,
+    pub inputs: Vec<protocol::AudioDevice>,
+    pub outputs: Vec<protocol::AudioDevice>,
     pub default_input: String,
     pub default_output: String,
     pub microphone: String,
+}
+
+impl Devices {
+    pub fn listed(&self, picker: Picker) -> &[protocol::AudioDevice] {
+        match picker {
+            Picker::Input => &self.inputs,
+            Picker::Output => &self.outputs,
+        }
+    }
+
+    /// The device `choice` means now, as far as the list says. `None` when it is not listed.
+    pub fn means(&self, choice: &protocol::settings::DeviceChoice, picker: Picker) -> Option<&protocol::AudioDevice> {
+        use protocol::settings::DeviceChoice;
+        let listed = self.listed(picker);
+        match choice {
+            DeviceChoice::Auto => listed.iter().find(|d| d.auto),
+            DeviceChoice::System => listed.iter().find(|d| d.default),
+            DeviceChoice::Device { .. } => listed.iter().find(|d| choice.is(d, listed)),
+        }
+    }
 }
 
 /// The shell the window reads, and the window once it is open.
@@ -295,10 +329,13 @@ fn open_now(section: Section, cx: &mut App) {
         ..Default::default()
     };
     let opened = cx.open_window(options, |window, cx| {
-        // A microphone test ends with the window.
+        // A microphone test and a key recorder end with the window.
         window.on_window_should_close(cx, |_, cx| {
             if let Some(window) = cx.default_global::<Host>().window {
-                let _ = window.update(cx, |settings, _, cx| settings.stop_test(cx));
+                let _ = window.update(cx, |settings, _, cx| {
+                    settings.stop_test(cx);
+                    settings.stop_recording(cx);
+                });
             }
             true
         });
@@ -306,7 +343,7 @@ fn open_now(section: Section, cx: &mut App) {
     });
     match opened {
         Ok(window) => cx.default_global::<Host>().window = Some(window),
-        Err(err) => eprintln!("tinyclient: the Settings window could not open: {err}"),
+        Err(err) => tracing::warn!("tinyclient: the Settings window could not open: {err}"),
     }
 }
 
@@ -346,6 +383,10 @@ pub struct SettingsWindow {
     pub(super) playing: Option<Instant>,
     /// "Copied", for 4 s after Copy diagnostics.
     pub(super) copied: Option<Instant>,
+    /// Where a debug bundle was written, or that export is off. Shown for 4 s.
+    pub(super) log_note: Option<(Instant, String)>,
+    /// What the test notification came to, and when (N13).
+    pub(super) tested: Option<(Instant, String)>,
     /// A row opened from search, lit for 1.5 s.
     pub(super) highlight: Option<&'static str>,
     /// The Tiny server account's name field.
@@ -358,6 +399,18 @@ pub struct SettingsWindow {
     pub(super) shown: bool,
     /// The width last drawn at, for a phone's slider tracks.
     pub(super) width: f32,
+    /// The key recorder taking the next key (V13, V15 to V17), and what has the keys while it
+    /// does. The modifiers held so far with no other key, for a modifier bound on its own.
+    pub(super) recording: Option<&'static str>,
+    pub(super) recorder_focus: FocusHandle,
+    pub(super) held_modifiers: gpui::Modifiers,
+    /// A key that is already another action's, refused, and the words that say so.
+    pub(super) clash: Option<(&'static str, String)>,
+    /// V18: the microphone test also plays the microphone back. The window's alone.
+    pub(super) loopback: bool,
+    /// The section's pane, so a shot can draw it scrolled (`--settings-scroll`).
+    #[cfg(feature = "gui-shot")]
+    pane_scroll: gpui::ScrollHandle,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -413,12 +466,21 @@ impl SettingsWindow {
             failed: None,
             playing: None,
             copied: None,
+            log_note: None,
+            tested: None,
             highlight: None,
             tiny,
             phone,
             listing: phone,
             shown: phone,
             width: f32::from(window.viewport_size().width),
+            recording: None,
+            recorder_focus: cx.focus_handle(),
+            held_modifiers: gpui::Modifiers::default(),
+            clash: None,
+            loopback: false,
+            #[cfg(feature = "gui-shot")]
+            pane_scroll: gpui::ScrollHandle::new(),
             _subscriptions: subscriptions,
         };
         window.focus(&this.focus, cx);
@@ -431,6 +493,7 @@ impl SettingsWindow {
     pub(super) fn show(&mut self, section: Section, window: &mut Window, cx: &mut Context<Self>) {
         if self.section != section {
             self.stop_test(cx);
+            self.stop_recording(cx);
         }
         self.section = section;
         self.close_modal(cx);
@@ -625,7 +688,8 @@ impl SettingsWindow {
         }
         self.testing = Some(Instant::now());
         self.level = None;
-        self.off_thread(cx, || crate::client::ask(&Request::TestMicrophone { on: true }), |this, answer, cx| {
+        let loopback = self.loopback;
+        self.off_thread(cx, move || crate::client::ask(&Request::TestMicrophone { on: true, loopback }), |this, answer, cx| {
             if !matches!(answer, Ok(Response::Ok)) {
                 this.testing = None;
                 this.failed = Some("V3");
@@ -645,7 +709,62 @@ impl SettingsWindow {
         }
         self.level = None;
         self.test_timer = None;
-        self.off_thread(cx, || crate::client::ask(&Request::TestMicrophone { on: false }), |_, _, _| {});
+        self.off_thread(cx, || crate::client::ask(&Request::TestMicrophone { on: false, loopback: false }), |_, _, _| {});
+    }
+
+    /// V18: the test plays the microphone back, or stops. A test running starts again with it.
+    pub(super) fn set_loopback(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.loopback = on;
+        if self.testing.is_some() {
+            let loopback = on;
+            self.off_thread(cx, move || crate::client::ask(&Request::TestMicrophone { on: true, loopback }), |_, _, _| {});
+        }
+        cx.notify();
+    }
+
+    /// A key recorder takes the next key pressed, or mouse button. Nothing else hears it: the
+    /// global keys stop meanwhile.
+    pub(super) fn start_recording(&mut self, id: &'static str, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.reachable(cx) {
+            return;
+        }
+        if super::hotkeys::reach() == super::hotkeys::Reach::Permission {
+            super::hotkeys::ask_permission();
+        }
+        self.recording = Some(id);
+        self.held_modifiers = gpui::Modifiers::default();
+        self.clash = None;
+        super::hotkeys::pause(true);
+        window.focus(&self.recorder_focus, cx);
+        cx.notify();
+    }
+
+    pub(super) fn stop_recording(&mut self, cx: &mut Context<Self>) {
+        if self.recording.take().is_some() {
+            super::hotkeys::pause(false);
+            cx.notify();
+        }
+    }
+
+    /// The recorder heard `binding` (`None`: cleared). Taken unless another key action has it.
+    pub(super) fn recorded(&mut self, binding: Option<protocol::hotkey::Binding>, cx: &mut Context<Self>) {
+        let Some(id) = self.recording else {
+            return;
+        };
+        self.stop_recording(cx);
+        let Some(action) = pages::key_action(id) else {
+            return;
+        };
+        let values = prefs::values();
+        if let Some(binding) = binding {
+            let taken = super::hotkeys::Action::ALL.into_iter().filter(|other| *other != action).find(|other| values.hotkey(other.key()) == Some(binding));
+            if let Some(other) = taken {
+                self.clash = Some((id, format!("{} is already {}.", binding.label(), other.name())));
+                cx.notify();
+                return;
+            }
+        }
+        self.set(id, protocol::settings::GLOBAL.into(), action.key(), binding.map(|b| b.to_string()), cx);
     }
 
     /// Lists the devices with `mediad --devices`, which opens nothing and exits.
@@ -653,9 +772,23 @@ impl SettingsWindow {
         self.off_thread(cx, read_devices, |this, devices, cx| {
             if devices.is_some() && this.devices != devices {
                 this.devices = devices;
+                this.learn_devices(cx);
                 cx.notify();
             }
         });
+    }
+
+    /// A device chosen by name alone (as builds before ids stored it) is stored again with its
+    /// id once it is listed, so it is found when Windows renames it.
+    fn learn_devices(&mut self, cx: &mut Context<Self>) {
+        let Some(devices) = self.devices.clone() else {
+            return;
+        };
+        for (row, key, picker) in [("V1", protocol::settings::INPUT, Picker::Input), ("V2", protocol::settings::OUTPUT, Picker::Output)] {
+            if let Some(better) = prefs::values().device_choice(key).upgrade(devices.listed(picker)) {
+                self.set(row, protocol::settings::GLOBAL.into(), key, better.value(), cx);
+            }
+        }
     }
 
     pub(super) fn read_storage(&mut self, cx: &mut Context<Self>) {
@@ -669,12 +802,7 @@ impl SettingsWindow {
 
     /// Opens a device menu with the keys on the item that is checked.
     pub(super) fn open_picker(&mut self, picker: Picker, window: &mut Window, cx: &mut Context<Self>) {
-        let key = match picker {
-            Picker::Input => protocol::settings::INPUT,
-            Picker::Output => protocol::settings::OUTPUT,
-        };
-        let stored = prefs::values().device(key);
-        self.menu_cursor = self.picker_choices(picker).iter().position(|(value, _)| *value == stored).unwrap_or(0);
+        self.menu_cursor = self.picker_checked(picker);
         self.picker = Some(picker);
         window.focus(&self.menu_focus, cx);
         // The list is read again as the menu opens: a device may have come or gone.
@@ -713,8 +841,10 @@ impl SettingsWindow {
             "home" => self.menu_cursor = 0,
             "end" => self.menu_cursor = last,
             "enter" | "space" => {
-                if let Some((value, _)) = choices.into_iter().nth(self.menu_cursor) {
-                    self.pick_device(picker, value, window, cx);
+                if let Some((value, words)) = choices.into_iter().nth(self.menu_cursor) {
+                    if !words.starts_with("No ") {
+                        self.pick_device(picker, value, window, cx);
+                    }
                 }
                 return true;
             }
@@ -758,6 +888,8 @@ impl SettingsWindow {
             self.close_picker(window, cx);
         } else if self.confirm.is_some() {
             self.close_modal(cx);
+        } else if self.recording.is_some() {
+            self.stop_recording(cx);
         } else if !self.query.is_empty() {
             self.query.clear();
             self.search.update(cx, |input, cx| input.set_text("", cx));
@@ -766,6 +898,7 @@ impl SettingsWindow {
             self.phone_up(cx);
         } else {
             self.stop_test(cx);
+            self.stop_recording(cx);
             window.remove_window();
         }
     }
@@ -881,6 +1014,9 @@ impl SettingsWindow {
         let searching = !self.query.trim().is_empty();
         let heading = if searching { "Results" } else { self.section.name() };
         let body = if searching { self.results(window, cx) } else { self.page(window, cx) };
+        let scroller = div().id(SharedString::from(format!("pane-{}", self.section.name()))).flex_1().min_h_0().overflow_y_scroll();
+        #[cfg(feature = "gui-shot")]
+        let scroller = scroller.track_scroll(&self.pane_scroll);
         div()
             .flex_1()
             .min_w_0()
@@ -899,14 +1035,7 @@ impl SettingsWindow {
                     .text_color(theme::text())
                     .child(heading),
             )
-            .child(
-                div()
-                    .id(SharedString::from(format!("pane-{}", self.section.name())))
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .child(div().w(px(controls::COLUMN + 56.)).px(px(28.)).pb(px(28.)).child(body)),
-            )
+            .child(scroller.child(div().w(px(controls::COLUMN + 56.)).px(px(28.)).pb(px(28.)).child(body)))
     }
 }
 
@@ -923,13 +1052,24 @@ fn mediad_path() -> std::path::PathBuf {
 fn read_devices() -> Option<Devices> {
     let output = protocol::launch::no_console(std::process::Command::new(mediad_path()).arg("--devices")).stderr(std::process::Stdio::null()).output().ok()?;
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
-    let names = |key: &str| -> Vec<String> {
-        json[key].as_array().into_iter().flatten().filter_map(|name| name.as_str().map(str::to_owned)).take(protocol::DEVICES_LIMIT).collect()
+    // With ids; a mediad from before ids had names alone, which stand in for both.
+    let devices = |key: &str, names: &str| -> Vec<protocol::AudioDevice> {
+        match serde_json::from_value::<Vec<protocol::AudioDevice>>(json[key].clone()) {
+            Ok(devices) => devices.into_iter().take(protocol::DEVICES_LIMIT).collect(),
+            Err(_) => json[names]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|name| name.as_str())
+                .take(protocol::DEVICES_LIMIT)
+                .map(|name| protocol::AudioDevice { id: name.to_owned(), name: name.to_owned(), ..Default::default() })
+                .collect(),
+        }
     };
     let text = |key: &str| json[key].as_str().unwrap_or_default().to_owned();
     Some(Devices {
-        inputs: names("inputs"),
-        outputs: names("outputs"),
+        inputs: devices("input_devices", "inputs"),
+        outputs: devices("output_devices", "outputs"),
         default_input: text("default_input"),
         default_output: text("default_output"),
         microphone: text("microphone"),
@@ -990,10 +1130,16 @@ impl Render for SettingsWindow {
         }
         let modal = self.confirm.clone().map(|confirm| self.modal(&confirm, cx));
         let menu = self.picker.and_then(|picker| self.device_menu(picker, window, cx));
-        let toast = self.copied.filter(|at| at.elapsed() < Duration::from_secs(4)).map(|_| {
+        let toast = self.log_note.as_ref().filter(|(at, _)| at.elapsed() < Duration::from_secs(4)).map(|(_, note)| {
             div().absolute().bottom(px(16.)).left_0().right_0().flex().justify_center().child(
-                super::components::toast(Some(("icons/check.svg", theme::text_soft())), "Copied").w(px(200.)),
+                super::components::toast(Some(("icons/check.svg", theme::text_soft())), note.clone()).w(px(360.)),
             )
+        }).or_else(|| {
+            self.copied.filter(|at| at.elapsed() < Duration::from_secs(4)).map(|_| {
+                div().absolute().bottom(px(16.)).left_0().right_0().flex().justify_center().child(
+                    super::components::toast(Some(("icons/check.svg", theme::text_soft())), "Copied").w(px(200.)),
+                )
+            })
         });
         macro_rules! section_keys {
             ($root:expr, $($action:ident => $ix:expr),*) => {
@@ -1029,6 +1175,7 @@ impl Render for SettingsWindow {
             }))
             .on_action(cx.listener(|this, _: &super::CloseWindow, window, cx| {
                 this.stop_test(cx);
+                this.stop_recording(cx);
                 window.remove_window();
             }))
             .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
@@ -1044,6 +1191,19 @@ impl Render for SettingsWindow {
                     }
                 }),
             );
+        // A key recorder takes the middle and side buttons anywhere in the window.
+        let root = [gpui::MouseButton::Middle, gpui::MouseButton::Navigate(gpui::NavigationDirection::Back), gpui::MouseButton::Navigate(gpui::NavigationDirection::Forward)]
+            .into_iter()
+            .fold(root, |root, button| {
+                root.on_mouse_down(
+                    button,
+                    cx.listener(move |this, _, _, cx| {
+                        if this.recording.is_some() {
+                            this.recorded(super::hotkeys::mouse_binding(button), cx);
+                        }
+                    }),
+                )
+            });
         let root = section_keys!(root, Place1 => 0, Place2 => 1, Place3 => 2, Place4 => 3, Place5 => 4, Place6 => 5, Place7 => 6, Place8 => 7, Place9 => 8);
         // The top strip moves the window: drawn first, it takes only the presses nothing above it does.
         let strip = super::layout::drags_window(div().absolute().top_0().left_0().w_full().h(px(theme::STRIP)));
@@ -1051,6 +1211,7 @@ impl Render for SettingsWindow {
             window,
             cx.listener(|this, _: &gpui::ClickEvent, window, cx| {
                 this.stop_test(cx);
+                this.stop_recording(cx);
                 window.remove_window();
             }),
         );
@@ -1067,7 +1228,7 @@ impl Render for SettingsWindow {
 /// `--settings <section> --settings-shot out.png`, with `--shot`: opens Settings on a section
 /// once the shell has its first answer and writes that window's frame. `--settings-search
 /// <words>` types into the search; `--settings-confirm sign-out|clear|reset|retention|tiny-everywhere` opens
-/// that question.
+/// that question. `--settings-scroll <points>` draws the section scrolled down that far.
 #[cfg(feature = "gui-shot")]
 pub fn shot(cx: &mut App) {
     let flag = |name: &str| std::env::args().skip_while(|arg| arg != name).nth(1);
@@ -1131,6 +1292,9 @@ pub fn shot(cx: &mut App) {
             if flag("--settings-menu").as_deref() == Some("input") {
                 settings.picker = Some(Picker::Input);
             }
+            if let Some(down) = flag("--settings-scroll").and_then(|n| n.parse::<f32>().ok()) {
+                settings.pane_scroll.set_offset(point(px(0.), px(-down)));
+            }
             cx.notify();
         });
         // Pictures and answers land on the first frames; draw again once they have.
@@ -1141,7 +1305,7 @@ pub fn shot(cx: &mut App) {
         cx.background_executor().timer(std::time::Duration::from_millis(200)).await;
         match window.update(cx, |_, window, _| window.render_to_image()) {
             Ok(Ok(image)) => image.save(&path).expect("the Settings shot is written"),
-            _ => eprintln!("tinyclient: no Settings shot"),
+            _ => tracing::warn!("tinyclient: no Settings shot"),
         }
     })
     .detach();

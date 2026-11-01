@@ -43,7 +43,7 @@ mod linux {
         }
         START.call_once(|| {
             if let Err(err) = std::thread::Builder::new().name("network-recovery".into()).spawn(run) {
-                eprintln!("chatd: could not watch network recovery: {err}");
+                tracing::warn!("chatd: could not watch network recovery: {err}");
             }
         });
     }
@@ -70,7 +70,7 @@ mod linux {
             if let (Some(bus), Some(subscription)) = (bus, subscription) { bus.signal_unsubscribe(subscription); }
             monitor.disconnect(handler);
         });
-        if let Err(err) = result { eprintln!("chatd: could not watch network recovery: {err}"); }
+        if let Err(err) = result { tracing::warn!("chatd: could not watch network recovery: {err}"); }
     }
 }
 

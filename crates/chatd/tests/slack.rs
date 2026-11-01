@@ -1369,6 +1369,30 @@ fn a_thread_is_a_conversation_that_can_be_read_and_answered() {
 }
 
 #[test]
+fn a_message_with_no_replies_can_start_its_thread() {
+    let world = World::start();
+    world.ready();
+    world.general();
+    let thread = alpha("C0GEN:1760000300.000300");
+    // Looking the conversation up does not invent the row. Sending does.
+    assert!(matches!(
+        world.ask(Request::Conversation { conversation: thread.clone() }),
+        Response::Error { code: ErrorCode::NotFound, .. }
+    ));
+    let pending = world.send(&thread, "1760400000999999", "In the thread.");
+    assert_eq!(pending.state, SendState::Pending);
+    let row = world.conversation(&thread).expect("the thread row");
+    assert_eq!((row.kind, row.title.as_str()), (ConversationKind::Thread, "Thread in #general"));
+    assert_eq!((row.parent.as_deref(), row.root.as_deref()), (Some("C0GEN"), Some("1760000300.000300")));
+    let posted = world.until("the first reply to reach Slack", || {
+        world.fake.calls(ALPHA, "chat.postMessage").into_iter().find(|call| {
+            call.params.get("thread_ts").map(String::as_str) == Some("1760000300.000300")
+        })
+    });
+    assert_eq!(posted.params.get("channel").map(String::as_str), Some("C0GEN"));
+}
+
+#[test]
 fn sending_typing_presence_and_people_go_through_slack() {
     let world = World::start();
     world.ready();
@@ -1449,7 +1473,7 @@ fn sending_typing_presence_and_people_go_through_slack() {
     assert_eq!((typist.id.as_str(), typist.name.as_str()), ("U0ANA", "Ana"));
     let left = typist.until - now();
     assert!((1..=6).contains(&left), "the line lasts as long as Slack's own: {left} s");
-    let watching = |people: Vec<Key>| match world.ask(Request::Watch(Watching { space: None, conversation: Some(general.clone()), people, members: None, rows: Vec::new() })) {
+    let watching = |people: Vec<Key>| match world.ask(Request::Watch(Watching { space: None, conversation: Some(general.clone()), people, members: None, rows: Vec::new(), focused: false })) {
         Response::Watching { people, typists } => (people, typists),
         other => panic!("{other:?}"),
     };
@@ -1801,7 +1825,7 @@ fn presence_a_profile_and_signing_out() {
     assert_eq!(world.fake.calls(ALPHA, "users.setPresence").len(), 3);
     // Set away from another device: Slack says so on the socket.
     world.fake.push(ALPHA, json!({"type": "manual_presence_change", "presence": "away"}));
-    world.until("my own presence from elsewhere", || (world.account("T01ALPHA").presence == Presence::Offline).then_some(()));
+    world.until("my own presence from elsewhere", || (world.account("T01ALPHA").presence == Presence::Idle).then_some(()));
 
     // A profile card is one request, and only because it was opened.
     let before = world.fake.calls(ALPHA, "users.info").len();
