@@ -86,6 +86,7 @@ pub(super) fn security(members: &[String]) -> Option<CallSecurity> {
     let mode = match name.as_str() {
         "e2ee_pending" => SecurityMode::Pending,
         "transport" => SecurityMode::Transport,
+        "blocked" => SecurityMode::Blocked,
         _ => SecurityMode::EndToEnd,
     };
     let end_to_end = mode == SecurityMode::EndToEnd;

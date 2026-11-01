@@ -220,6 +220,11 @@ pub struct CallSecurity {
     /// Only with [`SecurityMode::Transport`]: the server itself has no end-to-end encryption.
     #[serde(default, skip_serializing_if = "crate::is_false")]
     pub server_lacks: bool,
+    /// This call is never carried on unencrypted: the person chose so, the server is an Incognito
+    /// host, or the room only takes end-to-end encrypted calls. A [`SecurityMode::Blocked`] call
+    /// then offers no way on but leaving.
+    #[serde(default, skip_serializing_if = "crate::is_false")]
+    pub required: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -232,6 +237,12 @@ pub enum SecurityMode {
     Pending,
     /// Only the people in the call hold the keys. The server forwards what it cannot read.
     EndToEnd,
+    /// The server said this call is to be transport only (`call.e2ee` `off`). That frame is the
+    /// server's word alone, so it is never obeyed silently: nothing is sent or played until the
+    /// person chooses to carry on unencrypted ([`MediaRequest::TinyTransport`]), which a
+    /// [`CallSecurity::required`] call does not allow. It is not [`SecurityMode::Transport`]:
+    /// that is a call carrying on unencrypted.
+    Blocked,
 }
 
 /// One other person in the encrypted group.
@@ -264,6 +275,11 @@ pub enum Trust {
 pub struct TinyE2ee {
     pub room_id: String,
     pub identity: String,
+    /// The call is never carried on unencrypted: if the server turns it to transport only, it is
+    /// blocked ([`SecurityMode::Blocked`]) and the person cannot choose to carry on. Set by
+    /// chatd for the person's setting, an Incognito host, or a room that requires it.
+    #[serde(default, skip_serializing_if = "crate::is_false")]
+    pub required: bool,
 }
 
 /// What Discord's end-to-end encryption needs from mediad.
@@ -381,6 +397,10 @@ pub enum MediaRequest {
     /// Everyone in the room's call, us included, whenever it changes: whom the MLS group may
     /// hold.
     TinyRoster { user_ids: Vec<String> },
+    /// The person chose to carry on without end-to-end encryption after the server turned it
+    /// off ([`SecurityMode::Blocked`]). Answered `Done`, or `Refused` in words when the call is
+    /// not blocked or may not carry on unencrypted ([`CallSecurity::required`]).
+    TinyTransport,
 
     // What the shell and the room decide about the sound, for mediad to apply. Each is answered
     // `Done`, and each holds until sent again.
@@ -666,5 +686,35 @@ impl MediaResponse {
                 | MediaResponse::Refused { .. }
                 | MediaResponse::LogsSaved { .. }
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_requirement_is_sent_only_when_it_is_made_and_read_as_off_when_absent() {
+        // An older chatd or mediad does not send it: that is "not required", never an error.
+        let older: TinyE2ee = serde_json::from_str(r#"{"room_id":"r","identity":"/keys/ada"}"#).unwrap();
+        assert!(!older.required);
+        // Not required stays off the wire, so a frame is the one an older build already reads.
+        let off = TinyE2ee { room_id: "r".into(), identity: "/keys/ada".into(), required: false };
+        assert_eq!(serde_json::to_string(&off).unwrap(), r#"{"room_id":"r","identity":"/keys/ada"}"#);
+        let on = TinyE2ee { required: true, ..off };
+        let json = serde_json::to_string(&on).unwrap();
+        assert_eq!(json, r#"{"room_id":"r","identity":"/keys/ada","required":true}"#);
+        assert_eq!(serde_json::from_str::<TinyE2ee>(&json).unwrap(), on);
+    }
+
+    #[test]
+    fn a_blocked_call_round_trips_and_is_not_transport() {
+        let security = CallSecurity { mode: SecurityMode::Blocked, unsupported: vec!["bea".into()], ..CallSecurity::default() };
+        let json = serde_json::to_string(&security).unwrap();
+        assert!(json.contains(r#""mode":"blocked""#), "{json}");
+        assert_eq!(serde_json::from_str::<CallSecurity>(&json).unwrap(), security);
+        assert_ne!(SecurityMode::Blocked, SecurityMode::Transport);
+        // The default is still the one that says nothing more than holds.
+        assert_eq!(SecurityMode::default(), SecurityMode::Transport);
     }
 }

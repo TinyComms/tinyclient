@@ -23,9 +23,9 @@ use std::process::Command;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const FEED: &str = "https://api.github.com/repos/itz4blitz/tinyclient/releases/latest";
-const COMPARE: &str = "https://api.github.com/repos/itz4blitz/tinyclient/compare";
-const RELEASES: &str = "https://github.com/itz4blitz/tinyclient/releases/latest";
+const FEED: &str = "https://api.github.com/repos/TinyComms/tinyclient/releases/latest";
+const COMPARE: &str = "https://api.github.com/repos/TinyComms/tinyclient/compare";
+const RELEASES: &str = "https://github.com/TinyComms/tinyclient/releases/latest";
 const ARCHIVE_LIMIT: u64 = 200 * 1024 * 1024;
 
 /// What the window is allowed to say. Quiet is said by saying nothing.
@@ -579,8 +579,51 @@ fn shell_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\\''"))
 }
 
+/// Where the updater may talk to, and be sent on to: GitHub's API, its release pages, and the two
+/// hosts it serves release files from. Anything else, in a link from the release or in a redirect,
+/// is not followed.
+const TRUSTED_HOSTS: [&str; 4] = ["api.github.com", "github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com"];
+/// How many redirects one fetch follows. GitHub sends a release file through one or two.
+const MAX_HOPS: u8 = 5;
+
+/// An `https` address on a host the updater trusts, with no user name in it and no port other than
+/// the default.
+fn trusted_url(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() || authority.contains(['@', '\\', ' ']) {
+        return false;
+    }
+    let host = authority.strip_suffix(":443").unwrap_or(authority);
+    TRUSTED_HOSTS.iter().any(|trusted| host.eq_ignore_ascii_case(trusted))
+}
+
+/// What to do with a fetch's answer: it is the file, it sends us on, or it is refused.
+#[derive(Debug, PartialEq, Eq)]
+enum Hop {
+    Done,
+    Follow(String),
+    Refuse,
+}
+
+/// A redirect is followed only to a trusted `https` address, and only so many times.
+fn after(status: u32, redirect: &str, hops: u8) -> Hop {
+    match status {
+        200..=299 => Hop::Done,
+        301 | 302 | 303 | 307 | 308 if hops < MAX_HOPS && trusted_url(redirect) => Hop::Follow(redirect.to_owned()),
+        _ => Hop::Refuse,
+    }
+}
+
 fn http_text(url: &str, api: bool) -> Option<String> {
-    let bytes = curl(url, None, if api { 20 } else { 60 }, api).ok()?;
+    let scratch = work_dir().join(format!("fetch-{}.tmp", std::process::id()));
+    fs::create_dir_all(work_dir()).ok()?;
+    let got = curl(url, &scratch, if api { 20 } else { 60 }, api, 2 * 1024 * 1024);
+    let bytes = got.and_then(|()| fs::read(&scratch));
+    let _ = fs::remove_file(&scratch);
+    let bytes = bytes.ok()?;
     if bytes.len() > 2 * 1024 * 1024 {
         return None;
     }
@@ -588,20 +631,47 @@ fn http_text(url: &str, api: bool) -> Option<String> {
 }
 
 fn http_file(url: &str, path: &Path) -> Result<(), ()> {
-    curl(url, Some(path), 180, false)
-        .map(|_| ())
-        .map_err(|_| ())
+    curl(url, path, 180, false, ARCHIVE_LIMIT).map_err(|_| ())
 }
 
-fn curl(url: &str, out: Option<&Path>, seconds: u64, api: bool) -> io::Result<Vec<u8>> {
+/// Fetches `url` into `out`. Only `https`, to the hosts in [`TRUSTED_HOSTS`], at the first address
+/// and at every redirect: curl is told not to follow any itself, so that each hop is looked at here
+/// first. `--proto` and `--proto-redir` are a second line in curl.
+fn curl(url: &str, out: &Path, seconds: u64, api: bool, limit: u64) -> io::Result<()> {
+    let mut url = url.to_owned();
+    for hops in 0..=MAX_HOPS {
+        if !trusted_url(&url) {
+            return Err(io::Error::other("the update is not at an address the updater trusts"));
+        }
+        let (status, redirect) = curl_once(&url, out, seconds, api, limit)?;
+        match after(status, &redirect, hops) {
+            Hop::Done => return Ok(()),
+            Hop::Follow(next) => url = next,
+            Hop::Refuse => return Err(io::Error::other("the update could not be fetched")),
+        }
+    }
+    Err(io::Error::other("the update was redirected too many times"))
+}
+
+/// One request, not following a redirect. Its status and where it sends us, if it does.
+fn curl_once(url: &str, out: &Path, seconds: u64, api: bool, limit: u64) -> io::Result<(u32, String)> {
     let mut cmd = Command::new(if cfg!(windows) { "curl.exe" } else { "curl" });
     cmd.args([
         "--fail",
         "--silent",
         "--show-error",
-        "--location",
+        "--proto",
+        "=https",
+        "--proto-redir",
+        "=https",
+        "--max-redirs",
+        "0",
         "--max-time",
         &seconds.to_string(),
+        "--max-filesize",
+        &limit.to_string(),
+        "--write-out",
+        "%{response_code} %{redirect_url}",
     ]);
     cmd.arg("--user-agent")
         .arg(format!("tinyclient/{}", current()));
@@ -609,16 +679,17 @@ fn curl(url: &str, out: Option<&Path>, seconds: u64, api: bool) -> io::Result<Ve
         cmd.arg("--header")
             .arg("Accept: application/vnd.github+json");
     }
-    if let Some(path) = out {
-        cmd.arg("--output").arg(path);
-    }
+    cmd.arg("--output").arg(out);
     cmd.arg(url);
     cmd.stdin(std::process::Stdio::null());
     let output = cmd.output()?;
     if !output.status.success() {
         return Err(io::Error::other("the update could not be fetched"));
     }
-    Ok(output.stdout)
+    let said = String::from_utf8_lossy(&output.stdout);
+    let (status, redirect) = said.trim().split_once(' ').unwrap_or((said.trim(), ""));
+    let status = status.parse().map_err(|_| io::Error::other("the update could not be fetched"))?;
+    Ok((status, redirect.to_owned()))
 }
 
 fn sha256_file(path: &Path) -> io::Result<String> {
@@ -801,7 +872,7 @@ fn parse_release(json: &str) -> Option<Release> {
         return None;
     }
     let page = json_string(json, "html_url")
-        .filter(|url| url.starts_with("https://"))
+        .filter(|url| trusted_url(url))
         .unwrap_or(RELEASES)
         .to_owned();
     let assets = asset_pairs(json);
@@ -830,7 +901,7 @@ fn asset_pairs(json: &str) -> Vec<(String, String)> {
     while let Some(at) = rest.find("\"browser_download_url\"") {
         let url = json_string(&rest[at..], "browser_download_url").unwrap_or_default();
         let name = json_string(&rest[..at], "name").unwrap_or("").to_owned();
-        if !name.is_empty() && url.starts_with("https://") {
+        if !name.is_empty() && trusted_url(url) {
             pairs.push((name, url.to_owned()));
         }
         rest = &rest[at + "\"browser_download_url\"".len()..];
@@ -924,14 +995,14 @@ mod tests {
     fn the_release_json_picks_this_machines_archive_and_the_sums() {
         let json = r#"{
             "tag_name": "v0.9.0",
-            "html_url": "https://github.com/itz4blitz/tinyclient/releases/tag/v0.9.0",
+            "html_url": "https://github.com/TinyComms/tinyclient/releases/tag/v0.9.0",
             "author": {"html_url": "https://github.com/itz4blitz"},
             "assets": [
-                {"name": "tinyclient-v0.9.0-macos.zip", "uploader": {"name": "not-the-file"}, "browser_download_url": "https://github.com/itz4blitz/tinyclient/releases/download/v0.9.0/tinyclient-v0.9.0-macos.zip"},
-                {"name": "tinyclient-macos.zip", "uploader": {"name": "not-the-file"}, "browser_download_url": "https://github.com/itz4blitz/tinyclient/releases/download/v0.9.0/tinyclient-macos.zip"},
-                {"name": "tinyclient-linux-x86_64.tar.gz", "browser_download_url": "https://github.com/itz4blitz/tinyclient/releases/download/v0.9.0/tinyclient-linux-x86_64.tar.gz"},
-                {"name": "tinyclient-windows-x86_64.zip", "browser_download_url": "https://github.com/itz4blitz/tinyclient/releases/download/v0.9.0/tinyclient-windows-x86_64.zip"},
-                {"name": "SHA256SUMS", "browser_download_url": "https://example.invalid/SHA256SUMS"}
+                {"name": "tinyclient-v0.9.0-macos.zip", "uploader": {"name": "not-the-file"}, "browser_download_url": "https://github.com/TinyComms/tinyclient/releases/download/v0.9.0/tinyclient-v0.9.0-macos.zip"},
+                {"name": "tinyclient-macos.zip", "uploader": {"name": "not-the-file"}, "browser_download_url": "https://github.com/TinyComms/tinyclient/releases/download/v0.9.0/tinyclient-macos.zip"},
+                {"name": "tinyclient-linux-x86_64.tar.gz", "browser_download_url": "https://github.com/TinyComms/tinyclient/releases/download/v0.9.0/tinyclient-linux-x86_64.tar.gz"},
+                {"name": "tinyclient-windows-x86_64.zip", "browser_download_url": "https://github.com/TinyComms/tinyclient/releases/download/v0.9.0/tinyclient-windows-x86_64.zip"},
+                {"name": "SHA256SUMS", "browser_download_url": "https://github.com/TinyComms/tinyclient/releases/download/v0.9.0/SHA256SUMS"}
             ]
         }"#;
         let release = parse_release(json).expect("parsed");
@@ -945,12 +1016,102 @@ mod tests {
     }
 
     #[test]
+    fn only_https_on_github_and_its_release_hosts_is_trusted() {
+        for good in [
+            "https://api.github.com/repos/TinyComms/tinyclient/releases/latest",
+            "https://github.com/TinyComms/tinyclient/releases/download/v1/x.zip",
+            "https://objects.githubusercontent.com/github-production-release-asset/1?X-Amz=2",
+            "https://release-assets.githubusercontent.com/github-production-release-asset/1",
+            "https://GitHub.com/a",
+            "https://github.com:443/a",
+        ] {
+            assert!(trusted_url(good), "{good}");
+        }
+        for bad in [
+            "http://github.com/a",
+            "ftp://github.com/a",
+            "https://github.com.evil.example/a",
+            "https://evil.example/github.com/a",
+            "https://evilgithub.com/a",
+            "https://notgithub.com/a",
+            "https://raw.githubusercontent.com/a",
+            "https://github.com@evil.example/a",
+            "https://user:pw@github.com/a",
+            "https://github.com:8443/a",
+            "https://github.com\\@evil.example/a",
+            "https://github.com evil.example/a",
+            "https:///a",
+            "//github.com/a",
+            "github.com/a",
+            "",
+        ] {
+            assert!(!trusted_url(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_redirect_is_followed_only_to_a_trusted_https_host_and_only_so_far() {
+        let release = "https://release-assets.githubusercontent.com/github-production-release-asset/1";
+        assert_eq!(after(200, "", 0), Hop::Done);
+        assert_eq!(after(302, release, 0), Hop::Follow(release.to_owned()));
+        assert_eq!(after(301, "https://api.github.com/repositories/1/releases/latest", 1), Hop::Follow("https://api.github.com/repositories/1/releases/latest".to_owned()));
+        // Off GitHub, down to http, or nowhere at all: refused.
+        assert_eq!(after(302, "https://evil.example/x", 0), Hop::Refuse);
+        assert_eq!(after(302, "http://github.com/x", 0), Hop::Refuse);
+        assert_eq!(after(302, "", 0), Hop::Refuse);
+        // A loop is cut off, and an error page is not a file.
+        assert_eq!(after(302, release, MAX_HOPS), Hop::Refuse);
+        assert_eq!(after(404, "", 0), Hop::Refuse);
+        assert_eq!(after(304, release, 0), Hop::Refuse);
+    }
+
+    #[test]
+    fn a_release_that_points_off_github_or_down_to_http_is_not_taken() {
+        let archive = archive_name().expect("this test machine has a release archive");
+        let release = |archive_url: &str, sums_url: &str| {
+            format!(
+                r#"{{"tag_name":"v2.0.0","html_url":"https://github.com/TinyComms/tinyclient/releases/tag/v2.0.0","assets":[
+                {{"name":"{archive}","browser_download_url":"{archive_url}"}},
+                {{"name":"SHA256SUMS","browser_download_url":"{sums_url}"}}]}}"#
+            )
+        };
+        let good = "https://github.com/TinyComms/tinyclient/releases/download/v2.0.0";
+        assert!(parse_release(&release(&format!("{good}/{archive}"), &format!("{good}/SHA256SUMS"))).is_some());
+        for bad in ["https://example.invalid/a", "http://github.com/TinyComms/tinyclient/releases/download/v2.0.0/a", "https://github.com.evil.example/a"] {
+            assert!(parse_release(&release(bad, &format!("{good}/SHA256SUMS"))).is_none(), "archive at {bad}");
+            assert!(parse_release(&release(&format!("{good}/{archive}"), bad)).is_none(), "sums at {bad}");
+        }
+        // The page link falls back to the releases page rather than opening anywhere else.
+        let elsewhere = release(&format!("{good}/{archive}"), &format!("{good}/SHA256SUMS")).replace("https://github.com/TinyComms/tinyclient/releases/tag/v2.0.0", "https://evil.example/");
+        assert_eq!(parse_release(&elsewhere).unwrap().page, RELEASES);
+    }
+
+    #[test]
+    fn the_updater_asks_github_where_the_repository_lives_now() {
+        // Checked with `gh repo view`: the repository is owned by the TinyComms organization.
+        for address in [FEED, COMPARE, RELEASES] {
+            assert!(trusted_url(address) && address.contains("/TinyComms/tinyclient"), "{address}");
+        }
+    }
+
+    /// Asks GitHub for real: the release feed and its checksums, through the redirects the real
+    /// release assets are served by. `cargo test -p tinyclient --features gui -- --ignored live_`.
+    #[test]
+    #[ignore = "asks GitHub"]
+    fn live_the_latest_release_and_its_sums_are_fetched_hop_by_hop() {
+        let feed = http_text(FEED, true).expect("the release feed");
+        let release = parse_release(&feed).expect("a release with this machine's archive");
+        let sums = http_text(&release.sums_url, false).expect("the checksums, through GitHub's redirect");
+        assert!(sum_for(&sums, &release.archive).is_some(), "{} is in SHA256SUMS", release.archive);
+    }
+
+    #[test]
     fn a_versioned_archive_is_used_when_the_stable_name_is_absent() {
         let suffix = archive_suffix().unwrap();
         let json = format!(
-            r#"{{"tag_name":"v2.0.0","html_url":"https://github.com/itz4blitz/tinyclient/releases/tag/v2.0.0","assets":[
-            {{"name":"tinyclient-v2.0.0{suffix}","browser_download_url":"https://example.invalid/archive"}},
-            {{"name":"SHA256SUMS","browser_download_url":"https://example.invalid/SHA256SUMS"}}]}}"#
+            r#"{{"tag_name":"v2.0.0","html_url":"https://github.com/TinyComms/tinyclient/releases/tag/v2.0.0","assets":[
+            {{"name":"tinyclient-v2.0.0{suffix}","browser_download_url":"https://github.com/TinyComms/tinyclient/releases/download/v2.0.0/archive"}},
+            {{"name":"SHA256SUMS","browser_download_url":"https://github.com/TinyComms/tinyclient/releases/download/v0.9.0/SHA256SUMS"}}]}}"#
         );
         let release = parse_release(&json).expect("parsed");
         assert!(release.archive.ends_with(suffix));

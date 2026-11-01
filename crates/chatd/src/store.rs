@@ -806,6 +806,12 @@ const SETTINGS_VERSION: u32 = 1;
 
 impl Store {
     pub fn open(path: &Path) -> rusqlite::Result<Store> {
+        // Owner-only before SQLite creates it, so it never exists with wider rights (Unix), and
+        // narrowed if an older build made it wide. SQLite gives `-wal` and `-shm` the file's
+        // own mode when it makes them; the ones already there are narrowed below.
+        if path != Path::new(":memory:") {
+            let _ = protocol::private::touch(path);
+        }
         let db = Connection::open(path)?;
         // A 1 MB page cache, half SQLite's default: every list read is one page of rows, the
         // file is on a local disk the system already caches, and chatd's idle budget is tight.
@@ -814,6 +820,11 @@ impl Store {
         // flushed the disk at every write; on Windows four chatds seeding the demo at once took
         // over a minute that way, and 3 s this way.
         db.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA cache_size = -1024;")?;
+        for suffix in ["-wal", "-shm"].into_iter().filter(|_| path != Path::new(":memory:")) {
+            let mut side = path.as_os_str().to_owned();
+            side.push(suffix);
+            protocol::private::tighten_file(Path::new(&side));
+        }
         let version: i32 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if version != SCHEMA {
             let old: Vec<String> = db
@@ -3235,6 +3246,55 @@ mod tests {
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
+    #[test]
+    fn a_stored_notification_preview_survives_a_restart_unchanged() {
+        let path = scratch("preview");
+        {
+            let mut store = Store::open(&path).unwrap();
+            store.set_setting("", "preview", Some("full")).unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let rows: Vec<_> = store.settings().unwrap().into_iter().filter(|s| s.key == "preview").map(|s| s.value).collect();
+        assert_eq!(rows, ["full"], "opening the store does not rewrite a choice");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn the_database_and_its_side_files_are_for_their_owner_alone() {
+        let path = scratch("modes");
+        let _ = Store::open(&path).unwrap();
+        assert!(path.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            let side = |suffix: &str| {
+                let mut side = path.as_os_str().to_owned();
+                side.push(suffix);
+                std::path::PathBuf::from(side)
+            };
+            assert_eq!(mode(&path), 0o600);
+            // A database an older build made wide is narrowed on the next start, with its logs.
+            for file in [path.clone(), side("-wal"), side("-shm")] {
+                if file.exists() {
+                    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+                }
+            }
+            let store = Store::open(&path).unwrap();
+            for file in [path.clone(), side("-wal"), side("-shm")] {
+                if file.exists() {
+                    assert_eq!(mode(&file), 0o600, "{}", file.display());
+                }
+            }
+            // The log and the index SQLite makes while it runs follow the file.
+            store.db.execute_batch("CREATE TABLE IF NOT EXISTS probe (x); INSERT INTO probe VALUES (1);").unwrap();
+            for suffix in ["-wal", "-shm"] {
+                assert!(side(suffix).exists(), "{suffix} exists while the store is open");
+                assert_eq!(mode(&side(suffix)), 0o600, "{suffix}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
     #[test]
     fn a_cache_from_before_the_voice_limit_column_is_rebuilt() {
         let path = scratch("voice-limit");

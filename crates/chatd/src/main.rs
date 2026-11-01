@@ -12,7 +12,7 @@ fn main() -> io::Result<()> {
     let _log = protocol::log_policy::install("chatd", protocol::log_policy::LogPolicy::from_env());
     protocol::crash::install_panic_hook("chatd");
     let dir = support_dir();
-    std::fs::create_dir_all(&dir)?;
+    protocol::private::dir(&dir)?;
     // One chatd per support directory. A shell starts chatd whenever it finds none answering,
     // so two may be started at once: the second finds the lock held and leaves the first be.
     // Held until the process exits.

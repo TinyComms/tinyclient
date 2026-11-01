@@ -108,8 +108,8 @@ fn a_newer_server_fills_the_page_and_its_icon_lands_on_disk() {
     assert!(fetched <= 1);
     with_session(&base, "owner", |account| drop(community(&test_hub(), account)));
     assert_eq!(sent(&log, "GET /v1/server/icon ").len(), fetched);
-    let room = known(&Saved { base_url: base.clone(), token: "t".into(), user_id: ME.into(), email: None, display_name: "Ada".into(), role: "owner".into() });
-    assert_eq!(room_audio(&Saved { base_url: base, token: "t".into(), user_id: ME.into(), email: None, display_name: "Ada".into(), role: "owner".into() }, LOBBY), (96, true));
+    let room = known(&Saved { base_url: base.clone(), token: "t".into(), user_id: ME.into(), email: None, display_name: "Ada".into(), role: "owner".into(), plain_http_ok: false });
+    assert_eq!(room_audio(&Saved { base_url: base, token: "t".into(), user_id: ME.into(), email: None, display_name: "Ada".into(), role: "owner".into(), plain_http_ok: false }, LOBBY), (96, true));
     assert_eq!(room.rooms.len(), 1);
 }
 

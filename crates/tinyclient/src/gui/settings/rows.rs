@@ -68,6 +68,7 @@ pub const ROWS: &[Row] = &[
     row("P2", Privacy, "Let others see what I have read", "Let others see what I have read", &[], &["receipts", "read receipts", "seen", "privacy"]),
     row("P3", Privacy, "", "Load images and link previews automatically", &[], &["images", "pictures", "previews", "data", "tracking"]),
     row("P4", Privacy, "", crate::host::KEEP_MESSAGES, &["7 days", "30 days", "90 days"], &["retention", "history", "delete", "days"]),
+    row("PE", Privacy, "Calls", "Only join end-to-end encrypted calls", &[], &["encryption", "encrypted", "e2ee", "end to end", "tiny", "call", "downgrade", "privacy"]),
     row("V1", Audio, "Microphone", "Microphone", &[], &["input", "mic", "device", "headset"]),
     row("V2", Audio, "Speaker", "Speaker", &[], &["output", "headphones", "device", "speakers"]),
     row("V5", Audio, "Speaker", "Call volume", &[], &["volume", "loud", "quiet", "voices"]),
@@ -209,7 +210,7 @@ pub fn kept_by_chatd(id: &str) -> bool {
     matches!(
         id,
         "N1" | "N2" | "ND" | "NG" | "NM" | "NT" | "N4" | "NL" | "N5" | "N6" | "N7" | "N8" | "N9" | "N10" | "N11" | "N13" | "S2" | "S3" | "S4" | "SV"
-            | "G2" | "S1" | "S7" | "S8" | "S9" | "S10" | "P1" | "P2" | "P4" | "V1" | "V2" | "V3" | "V4" | "V5" | "V6" | "V8" | "V10" | "V11" | "V12" | "V13" | "V14" | "V15" | "V16" | "V17" | "V19" | "D1" | "D2" | "D3"
+            | "G2" | "S1" | "S7" | "S8" | "S9" | "S10" | "P1" | "P2" | "P4" | "PE" | "V1" | "V2" | "V3" | "V4" | "V5" | "V6" | "V8" | "V10" | "V11" | "V12" | "V13" | "V14" | "V15" | "V16" | "V17" | "V19" | "D1" | "D2" | "D3"
     )
 }
 

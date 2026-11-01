@@ -221,14 +221,20 @@ pub fn install_panic_hook(process: &'static str) {
             thread.name().unwrap_or("unnamed"),
         ));
         let _ = std::io::stderr().write_all(entry.as_bytes());
-        let path = crate::support_dir().join(CRASH_LOG);
-        if std::fs::metadata(&path).is_ok_and(|meta| meta.len() > CRASH_LOG_LIMIT) {
-            let _ = std::fs::remove_file(&path);
-        }
-        if let Ok(mut log) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-            let _ = log.write_all(entry.as_bytes());
-        }
+        record(&crate::support_dir().join(CRASH_LOG), &entry);
     }));
+}
+
+/// Adds `entry` to the crash log at `path`. A log that has grown past [`CRASH_LOG_LIMIT`] is
+/// started over first. The file is owner-only (on Unix), since a panic's text can name paths and
+/// what the program was doing.
+fn record(path: &std::path::Path, entry: &str) {
+    if std::fs::metadata(path).is_ok_and(|meta| meta.len() > CRASH_LOG_LIMIT) {
+        let _ = std::fs::remove_file(path);
+    }
+    if let Ok(mut log) = crate::private::append(path) {
+        let _ = log.write_all(entry.as_bytes());
+    }
 }
 
 #[cfg(test)]
@@ -292,5 +298,30 @@ mod tests {
         ] {
             assert_eq!(redact(plain), plain);
         }
+    }
+
+    #[test]
+    fn the_crash_log_collects_entries_starts_over_when_large_and_is_for_its_owner() {
+        let dir = std::env::temp_dir().join(format!("protocol-crash-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(super::CRASH_LOG);
+        super::record(&path, "one\n");
+        super::record(&path, "two\n");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\ntwo\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&path), 0o600);
+            // A log an older build made wide is narrowed by the next entry.
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            super::record(&path, "three\n");
+            assert_eq!(mode(&path), 0o600);
+        }
+        std::fs::write(&path, vec![b'x'; super::CRASH_LOG_LIMIT as usize + 1]).unwrap();
+        super::record(&path, "fresh\n");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "fresh\n");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

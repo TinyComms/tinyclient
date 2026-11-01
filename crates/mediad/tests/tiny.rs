@@ -775,7 +775,7 @@ fn an_end_to_end_encrypted_room_is_heard_through_frames_the_sfu_cannot_read() {
     let mut people: Vec<Mediad> = sinks.iter().zip(tones).map(|(sink, tone)| Mediad::saying(tone, "udp", sink)).collect();
     let mut slots = Vec::new();
     for (name, mediad) in names.iter().zip(&mut people) {
-        let e2ee = TinyE2ee { room_id: ROOM.into(), identity: keys.join(name).to_string_lossy().into_owned() };
+        let e2ee = TinyE2ee { room_id: ROOM.into(), identity: keys.join(name).to_string_lossy().into_owned(), required: false };
         let offer = mediad.offer_with(name, Some(e2ee));
         mediad.security("pending until the server says", |security| security.mode == SecurityMode::Pending);
         let (answer, mids) = sfu.join(name, &offer);
@@ -854,7 +854,8 @@ fn an_end_to_end_encrypted_room_is_heard_through_frames_the_sfu_cannot_read() {
     let _ = std::fs::remove_dir_all(keys);
 }
 
-/// A room the server says is transport-only sends and plays in clear, and says so.
+/// A room the server says is transport-only is blocked until the person chooses to carry on
+/// unencrypted; then it sends and plays in clear, and says so.
 #[test]
 fn a_transport_only_room_says_so_and_is_heard_in_clear() {
     let sfu = Sfu::start();
@@ -865,13 +866,15 @@ fn a_transport_only_room_says_so_and_is_heard_in_clear() {
     let keys = std::env::temp_dir().join(format!("tc-tiny-off-{}", std::process::id()));
     for (name, mediad) in names.iter().zip(&mut people) {
         // Ada's app encrypts end to end; Bea's server, as Bea's app sees it, never offered it.
-        let e2ee = (*name == "ada").then(|| TinyE2ee { room_id: ROOM.into(), identity: keys.join(name).to_string_lossy().into_owned() });
+        let e2ee = (*name == "ada").then(|| TinyE2ee { room_id: ROOM.into(), identity: keys.join(name).to_string_lossy().into_owned(), required: false });
         let offer = mediad.offer_with(name, e2ee);
         let (answer, mids) = sfu.join(name, &offer);
         done(mediad, MediaRequest::TinyAnswer { sdp: answer });
         slots.push(mids);
     }
     done(&mut people[0], e2ee_frame("off", serde_json::json!({"user_ids": ["bea"]})));
+    people[0].security("blocked, not silently transport", |security| security.mode == SecurityMode::Blocked);
+    done(&mut people[0], MediaRequest::TinyTransport);
     let ada = people[0].security("transport only", |security| security.mode == SecurityMode::Transport);
     assert_eq!(ada.unsupported, ["bea"]);
     assert!(!ada.server_lacks && ada.code.is_empty());
