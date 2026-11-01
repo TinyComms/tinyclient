@@ -47,9 +47,27 @@ fn insets() -> Option<Insets> {
     INSETS.lock().ok().and_then(|held| *held)
 }
 
-/// The status bar's height now: the platform's when it has said, else [`SAFE_TOP`].
+/// The status bar's height now: the platform's when it has said, else [`SAFE_TOP`]. While a
+/// minimised call's bar sits under the status bar ([`take_top`]), the screen below it starts
+/// under that bar and keeps no room of its own: 0.
 pub fn safe_top() -> f32 {
+    if TOP_TAKEN.load(Ordering::Relaxed) {
+        return 0.;
+    }
+    status_bar()
+}
+
+/// The status bar's height, whatever sits under it.
+pub fn status_bar() -> f32 {
     insets().map_or(SAFE_TOP, |insets| insets.top)
+}
+
+static TOP_TAKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The call bar takes the status bar's room while the screen under it is built
+/// (`phone_screen`), and gives it back before anything that covers the whole window.
+pub fn take_top(taken: bool) {
+    TOP_TAKEN.store(taken, Ordering::Relaxed);
 }
 
 /// The home indicator's height now: the platform's when it has said, else [`SAFE_BOTTOM`].

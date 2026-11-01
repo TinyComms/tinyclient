@@ -84,7 +84,7 @@ pub(super) fn badge_words(badge: Badge) -> &'static str {
     }
 }
 
-fn badge_look(badge: Badge) -> (&'static str, Rgba) {
+pub(super) fn badge_look(badge: Badge) -> (&'static str, Rgba) {
     match badge {
         Badge::EndToEnd => ("icons/lock.svg", theme::positive()),
         Badge::Pending => ("icons/clock.svg", theme::text_faint()),

@@ -1072,8 +1072,14 @@ impl Shell {
                 format!("Join {}. People there will see you arrive.", title),
                 None,
             ))
-            .invisible()
-            .group_hover("voice", |style| style.visible())
+            // A phone has no hover: there the pill is always on the row, at a thumb's size.
+            .map(|pill| {
+                if super::phone::active() {
+                    pill.h(px(30.)).px(px(12.)).rounded(px(15.)).text_size(px(13.))
+                } else {
+                    pill.invisible().group_hover("voice", |style| style.visible())
+                }
+            })
             // The press belongs to the pill: the row's open must not fire with it.
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(move |this, _, _, cx| this.call_start(key.clone(), cx)))

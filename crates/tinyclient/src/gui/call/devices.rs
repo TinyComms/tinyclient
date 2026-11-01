@@ -38,25 +38,25 @@ fn lit(level: Option<u8>) -> u8 {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Side {
+pub(super) enum Side {
     Input,
     Output,
 }
 
 /// One row of a side of the menu.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Row {
-    choice: DeviceChoice,
-    label: String,
+pub(super) struct Row {
+    pub(super) choice: DeviceChoice,
+    pub(super) label: String,
     /// What the row stands for now, or why it is not there: faint, after the label.
-    detail: Option<String>,
-    chosen: bool,
-    is_virtual: bool,
+    pub(super) detail: Option<String>,
+    pub(super) chosen: bool,
+    pub(super) is_virtual: bool,
 }
 
 /// A side's rows: Automatic, System default, the hardware, then the virtual devices, then the
 /// device chosen if the system no longer lists it. `in_use` is the id of the device open now.
-fn rows(choice: &DeviceChoice, listed: &[AudioDevice], in_use: &str) -> Vec<Row> {
+pub(super) fn rows(choice: &DeviceChoice, listed: &[AudioDevice], in_use: &str) -> Vec<Row> {
     let name_of = |pick: fn(&AudioDevice) -> bool| listed.iter().find(|d| pick(d)).map(|d| d.name.clone());
     let mut rows = vec![
         Row {
@@ -155,7 +155,7 @@ impl Shell {
 
     /// Stores the choice (V1, V2) as Settings would: chatd gives it to the call at once and
     /// keeps it for every call after.
-    fn call_pick(&mut self, side: Side, choice: DeviceChoice, cx: &mut Context<Self>) {
+    pub(super) fn call_pick(&mut self, side: Side, choice: DeviceChoice, cx: &mut Context<Self>) {
         let key = if side == Side::Input { INPUT } else { OUTPUT };
         let value = choice.value();
         let mut values = prefs::values();
@@ -243,7 +243,7 @@ impl Shell {
     /// Twelve segments and what they measure. The microphone's stays live while muted so it can
     /// be tried, and says that nobody hears it. Before the call is up nothing is open, and the
     /// meters say so by staying dark.
-    fn call_level(&self, call: &Call, side: Side) -> Div {
+    pub(super) fn call_level(&self, call: &Call, side: Side) -> Div {
         let (level, words) = match side {
             Side::Input => {
                 let words = match (in_call(call), call.muted || call.deafened) {

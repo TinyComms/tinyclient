@@ -169,6 +169,13 @@ impl Shell {
     /// or the home of rail and sidebar; then the switcher and the open menu over it.
     pub(in crate::gui) fn phone_screen(&self, snapshot: &Snapshot, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let width = f32::from(window.viewport_size().width);
+        // A call is the whole phone while it shows (`call::phone`), over everything else.
+        if let Some(call) = self.call_phone_screen(snapshot, window, cx) {
+            return div().size_full().relative().flex().flex_col().bg(theme::canvas()).text_color(theme::text()).child(call);
+        }
+        // Minimised, it is a bar under the status bar, and every screen starts under that bar.
+        let bar = self.call_phone_bar(snapshot, cx);
+        tokens::take_top(bar.is_some());
         let right = self.layout_state.right.is_some() && !self.pane_tucked();
         let screen: AnyElement = match self.keychain_state(window, cx) {
             Some(waiting) if snapshot.open.is_none() => self.phone_page(waiting).into_any_element(),
@@ -176,6 +183,8 @@ impl Shell {
             _ if snapshot.open.is_some() => self.phone_page(self.conversation(snapshot, window, cx)).into_any_element(),
             _ => self.phone_home(snapshot, width, window, cx).into_any_element(),
         };
+        // What covers the whole window measures from the real status bar again.
+        tokens::take_top(false);
         div()
             .size_full()
             .relative()
@@ -183,7 +192,8 @@ impl Shell {
             .flex_col()
             .bg(theme::canvas())
             .text_color(theme::text())
-            .child(screen)
+            .children(bar)
+            .child(div().flex_1().min_h_0().child(screen))
             .children(self.switcher(window, cx))
             .children(self.phone_slack_sheet(window, cx))
             .children(self.phone_menu(snapshot, window, cx))
@@ -283,6 +293,10 @@ impl Shell {
             return false;
         }
         if super::settings::phone_back(cx) {
+            return true;
+        }
+        // The call screen first: its sheet, its people page, then down to the bar.
+        if self.call_phone_back(cx) {
             return true;
         }
         if self.sidebar_state.switcher.is_some() {
