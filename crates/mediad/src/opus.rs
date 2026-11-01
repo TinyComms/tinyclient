@@ -227,12 +227,7 @@ impl Decoder {
     /// and the decoder is left where the last real frame put it: counting this wait as a loss
     /// makes [`Decoder::forget`] drop that state, and the frames after a real loss come out loud.
     pub(crate) fn bridge(&mut self, samples: usize, pcm: &mut [i16]) -> usize {
-        if !self.concealing {
-            self.pitch = pitch(&self.last);
-            self.cursor = 0;
-            self.gain = 1.;
-            self.concealing = true;
-        }
+        self.carry_on();
         let out = &mut pcm[..samples * CHANNELS];
         for pair in out.as_chunks_mut::<CHANNELS>().0 {
             *pair = self.extend();
@@ -256,15 +251,9 @@ impl Decoder {
                 return decoded;
             }
         }
-        if !self.concealing {
-            self.pitch = pitch(&self.last);
-            self.cursor = 0;
-            self.gain = 1.;
-            self.concealing = true;
-        }
+        self.carry_on();
         let out = &mut pcm[..samples * CHANNELS];
-        // Each lost frame takes the level down by a third of the way to nothing.
-        let fall = 1. / (3 * samples.max(1)) as f32;
+        let fall = 1. / (FADE_FRAMES * samples.max(1)) as f32;
         for pair in out.as_chunks_mut::<CHANNELS>().0 {
             *pair = self.extend();
             self.gain = (self.gain - fall).max(0.);
@@ -272,30 +261,44 @@ impl Decoder {
         samples
     }
 
-    /// The talk spurt ended. Ramp from the last sample that was actually played down to zero.
-    /// Starting a pitch repeat here jumps, and that jump is the pop at the end of a sentence.
-    /// The decoder is left alone for one frame, so a packet that was only late still continues
-    /// it; a longer gap counts as concealment and the next real frame starts clean.
-    pub(crate) fn release(&mut self, samples: usize, pcm: &mut [i16]) -> usize {
-        let out = &mut pcm[..samples * CHANNELS];
+    /// One tick with nothing to play: a packet running late, or the end of a sentence, and only
+    /// the next packet can tell. Nothing is lost so far, so the decoder stays where the last real
+    /// frame left it and a late packet simply continues it. Meanwhile the voice carries on,
+    /// fading out, from the sample that was actually played: starting the pitch repeat cold
+    /// jumps, and that jump is the pop at the end of a sentence.
+    pub(crate) fn late(&mut self, samples: usize, pcm: &mut [i16]) -> usize {
         let from = self.ending();
-        let steps = samples.max(1) as f32;
-        for (n, pair) in out.chunks_mut(CHANNELS).enumerate() {
-            let gain = 1. - (n as f32 + 1.) / steps;
-            for (sample, &start) in pair.iter_mut().zip(&from) {
-                *sample = (f32::from(start) * gain) as i16;
+        let ease = if self.concealing { 0 } else { RESUME };
+        self.carry_on();
+        let out = &mut pcm[..samples * CHANNELS];
+        let fall = 1. / (FADE_FRAMES * samples.max(1)) as f32;
+        for (n, pair) in out.as_chunks_mut::<CHANNELS>().0.iter_mut().enumerate() {
+            *pair = self.extend();
+            self.gain = (self.gain - fall).max(0.);
+            if n < ease {
+                let toward = (n + 1) as f32 / (ease + 1) as f32;
+                for (sample, start) in pair.iter_mut().zip(from) {
+                    *sample = (f32::from(start) * (1. - toward) + f32::from(*sample) * toward) as i16;
+                }
             }
         }
-        self.last.clear();
-        self.gain = 0.;
-        self.concealing = true;
-        self.misses = self.misses.saturating_add(1);
         samples
+    }
+
+    /// The pitch repeat of what was last heard, ready to go on from, unless it already is.
+    fn carry_on(&mut self) {
+        if !self.concealing {
+            self.pitch = pitch(&self.last);
+            self.cursor = 0;
+            self.gain = 1.;
+            self.concealing = true;
+        }
     }
 
     /// After we concealed frames the decoder never saw, its state is the speech of before the
     /// gap; going on from it puts a burst in the first frame back. It starts afresh instead,
-    /// and [`Decoder::resume`] fades from the concealment into what it makes.
+    /// and [`Decoder::resume`] fades from the concealment into what it makes. Ticks where the
+    /// voice only ran late do not count: the decoder missed nothing.
     fn forget(&mut self) {
         if self.concealing && self.misses > 1 {
             // SAFETY: `state` is a live decoder; the request takes no argument.
@@ -382,6 +385,8 @@ impl Drop for Decoder {
 
 /// Frames over which a real frame after concealment fades in from it: 5 ms.
 const RESUME: usize = 240;
+/// Lost or late packets the concealment fades to nothing over: 60 ms.
+const FADE_FRAMES: usize = 3;
 
 /// The pitch period of a stereo frame, in frames: the lag between 2.5 and 16 ms (400 down to
 /// 62.5 Hz) at which the frame best matches itself. Unvoiced sound has none worth the name and
@@ -520,6 +525,51 @@ mod tests {
 
     fn peak(pcm: &[i16]) -> u16 {
         pcm.iter().map(|s| s.unsigned_abs()).max().unwrap()
+    }
+
+    /// A packet that is only late must not cost the decoder its state. It used to, after two
+    /// ticks: the frames after it then came from a decoder started afresh.
+    #[test]
+    fn a_late_packet_continues_the_decoder_exactly_where_it_stopped() {
+        let mut encoder = Encoder::voice().unwrap();
+        let (mut waited, mut steady) = (Decoder::new().unwrap(), Decoder::new().unwrap());
+        let (mut pcm, mut reference) = (vec![0i16; MAX_FRAME * CHANNELS], vec![0i16; MAX_FRAME * CHANNELS]);
+        for (n, frame) in tone(20).chunks(FRAME * CHANNELS).enumerate() {
+            let mut packet = [0u8; 1500];
+            let len = encoder.encode(frame, &mut packet).unwrap();
+            if n == 12 {
+                for _ in 0..5 {
+                    waited.late(FRAME, &mut pcm);
+                }
+            }
+            waited.decode(Some(&packet[..len]), 0, &mut pcm).unwrap();
+            steady.decode(Some(&packet[..len]), 0, &mut reference).unwrap();
+            if n >= 12 {
+                let from = RESUME * CHANNELS;
+                assert_eq!(pcm[from..FRAME * CHANNELS], reference[from..FRAME * CHANNELS], "frame {n}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_late_tick_fades_from_the_last_sample_played_and_ends_in_silence() {
+        let mut encoder = Encoder::voice().unwrap();
+        let mut decoder = Decoder::new().unwrap();
+        let mut pcm = vec![0i16; MAX_FRAME * CHANNELS];
+        for frame in tone(10).chunks(FRAME * CHANNELS) {
+            let mut packet = [0u8; 1500];
+            let len = encoder.encode(frame, &mut packet).unwrap();
+            decoder.decode(Some(&packet[..len]), 0, &mut pcm).unwrap();
+        }
+        let before = pcm[FRAME * CHANNELS - CHANNELS];
+        decoder.late(FRAME, &mut pcm);
+        let step = (i32::from(pcm[0]) - i32::from(before)).abs();
+        assert!(step < 1_000, "the fade steps {step} from the last sample");
+        assert!(energy(&pcm[..FRAME * CHANNELS]) > 1_000., "the voice carries on");
+        for _ in 0..FADE_FRAMES {
+            decoder.late(FRAME, &mut pcm);
+        }
+        assert_eq!(peak(&pcm[..FRAME * CHANNELS]), 0, "and then it is silence");
     }
 
     /// At 12 kbit/s libopus sends speech-mode (SILK) packets, as a low-bitrate voice channel

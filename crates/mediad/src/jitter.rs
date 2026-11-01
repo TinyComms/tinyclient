@@ -25,8 +25,11 @@ pub enum Pop {
     /// going without touching the decoder, so a copy in the next packet can still rebuild a
     /// real loss.
     Hold,
-    /// The packet due now never came: the decoder conceals it.
+    /// The packet due now never came, and a later one did: the decoder conceals it.
     Lost,
+    /// Nothing is queued while a packet is due. It may be running late, or the sender may have
+    /// stopped: only the next packet can say, and nothing counts as lost until then.
+    Late,
     /// Nothing is due: the sender is not talking, or we are still filling.
     Empty,
 }
@@ -46,6 +49,8 @@ pub struct Jitter {
     pub lost: u64,
     /// Packets taken in time to be played.
     pub received: u64,
+    /// The frame played last was quiet, as the decoder found it.
+    pub hushed: bool,
 }
 
 impl Jitter {
@@ -118,13 +123,7 @@ impl Jitter {
             self.idle = 0;
             return Pop::Empty;
         }
-        // Late or lost: conceal for a few frames rather than cut to silence.
-        Pop::Lost
-    }
-
-    /// A later packet is already queued. A loss with nothing behind it is the end of the spurt.
-    pub fn has_later(&self) -> bool {
-        !self.packets.is_empty()
+        Pop::Late
     }
 
     /// The packet due next, if it is here. After a [`Pop::Lost`] this is the one that may carry
@@ -207,7 +206,7 @@ mod tests {
         }
         // Long enough to outlast str0m's old 15-packet hold, and the old 100 ms give-up.
         for _ in 0..15 {
-            assert_eq!(jitter.pop(), Pop::Lost);
+            assert_eq!(jitter.pop(), Pop::Late);
         }
         fill(&mut jitter, &[4]);
         assert_eq!(jitter.pop(), Pop::Packet(packet(4)));
@@ -234,8 +233,9 @@ mod tests {
             assert!(matches!(jitter.pop(), Pop::Packet(_)));
         }
         let after: Vec<_> = (0..IDLE).map(|_| jitter.pop()).collect();
-        assert!(after[..IDLE as usize - 1].iter().all(|pop| *pop == Pop::Lost));
+        assert!(after[..IDLE as usize - 1].iter().all(|pop| *pop == Pop::Late));
         assert_eq!(after[IDLE as usize - 1], Pop::Empty);
+        assert_eq!(jitter.lost, 0, "a sentence that ended lost nothing");
         // The sender resumes much later, sequence numbers continuing.
         fill(&mut jitter, &[4]);
         assert_eq!(jitter.pop(), Pop::Empty, "filling again");

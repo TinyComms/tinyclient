@@ -49,6 +49,10 @@ pub struct Counts {
     pub lost: u64,
     /// Of the lost, those rebuilt from the next packet's copy (in-band FEC).
     pub rebuilt: u64,
+    /// Packets that came after their turn to play had gone.
+    pub late: u64,
+    /// Times the voice stalled in mid-speech and went on when its packet came.
+    pub gaps: u64,
     pub jitter_ms: u32,
 }
 
@@ -57,9 +61,12 @@ pub struct Meter {
     sent: u64,
     received: u64,
     since: Instant,
-    /// Over the whole call: lost frames made up, and rebuilt from the next packet.
+    /// Over the whole call: lost frames made up, and rebuilt from the next packet; packets too
+    /// late to play, and stalls in the middle of someone speaking.
     concealed: u64,
     recovered: u64,
+    late: u64,
+    gaps: u64,
     /// The devices' troubles, as the call loop last said.
     pub troubles: Troubles,
     pub rtt_ms: u32,
@@ -70,7 +77,7 @@ pub struct Meter {
 
 impl Meter {
     pub fn new(path: CallPath) -> Meter {
-        Meter { sent: 0, received: 0, since: Instant::now(), concealed: 0, recovered: 0, troubles: Troubles::default(), rtt_ms: 0, path, probe: None }
+        Meter { sent: 0, received: 0, since: Instant::now(), concealed: 0, recovered: 0, late: 0, gaps: 0, troubles: Troubles::default(), rtt_ms: 0, path, probe: None }
     }
 
     pub fn sent(&mut self, bytes: usize) {
@@ -107,6 +114,8 @@ impl Meter {
             received += voice.received;
             lost += voice.lost;
             rebuilt += voice.rebuilt;
+            self.late += voice.late;
+            self.gaps += voice.gaps;
             jitter = jitter.max(voice.jitter_ms);
         }
         self.recovered += rebuilt;
@@ -130,6 +139,8 @@ impl Meter {
             playout_underruns: count(troubles.underruns),
             concealed_frames: count(self.concealed),
             fec_recovered: count(self.recovered),
+            late_packets: count(self.late),
+            playout_gaps: count(self.gaps),
         };
         (self.sent, self.received, self.since) = (0, 0, Instant::now());
         stats
@@ -161,7 +172,7 @@ mod tests {
         let mut meter = Meter::new(CallPath::Udp);
         meter.sent(4000);
         meter.received(8000);
-        let first = meter.second([Counts { received: 90, lost: 10, rebuilt: 4, jitter_ms: 4 }, Counts { received: 50, lost: 0, rebuilt: 0, jitter_ms: 9 }].into_iter());
+        let first = meter.second([Counts { received: 90, lost: 10, rebuilt: 4, late: 2, gaps: 1, jitter_ms: 4 }, Counts { received: 50, jitter_ms: 9, ..Counts::default() }].into_iter());
         assert_eq!(first.loss_permille, 66);
         assert_eq!(first.jitter_ms, 9);
         assert_eq!(first.path, CallPath::Udp);
@@ -171,6 +182,7 @@ mod tests {
         // Concealment and FEC count over the whole call.
         assert_eq!((first.concealed_frames, first.fec_recovered), (6, 4));
         assert_eq!((second.concealed_frames, second.fec_recovered), (6, 4));
+        assert_eq!((second.late_packets, second.playout_gaps), (2, 1));
         assert_eq!(second.send_kbps, 0);
     }
 

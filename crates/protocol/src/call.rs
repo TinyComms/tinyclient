@@ -522,6 +522,12 @@ pub struct CallStats {
     /// Lost frames from others rebuilt from the copy in the next packet (Opus in-band FEC).
     #[serde(default)]
     pub fec_recovered: u32,
+    /// Packets from others that came after their turn to play had gone.
+    #[serde(default)]
+    pub late_packets: u32,
+    /// Times someone's voice stalled in mid-speech and went on when its packet came.
+    #[serde(default)]
+    pub playout_gaps: u32,
 }
 
 /// What the user chose for a call's sound. Percentages, 0 to 100.

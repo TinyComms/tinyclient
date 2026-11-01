@@ -84,6 +84,10 @@ pub(crate) struct Stream {
     undecodable: u64,
     /// Lost frames rebuilt from the packet after them.
     pub(crate) rebuilt: u64,
+    /// The voice was cut off in mid-speech, waiting for a packet.
+    stalled: bool,
+    /// Times it was, and the packet came.
+    gaps: u64,
     /// The gain the last frame ended at (`hear`), so the next one starts from it.
     gain: Option<f32>,
     pub(crate) arrivals: Arrivals,
@@ -103,6 +107,8 @@ impl Stream {
             last_packet: Instant::now(),
             undecodable: 0,
             rebuilt: 0,
+            stalled: false,
+            gaps: 0,
             gain: None,
             arrivals: Arrivals::default(),
             reported: Counts::default(),
@@ -118,9 +124,17 @@ impl Stream {
     /// What the connection meter needs of this voice: what it counted since it was last asked.
     /// A voice that leaves takes its running counts with it, so a sum of those would go backwards.
     pub(crate) fn counts(&mut self) -> Counts {
-        let now = Counts { received: self.jitter.received, lost: self.jitter.lost, rebuilt: self.rebuilt, jitter_ms: self.arrivals.ms() };
+        let jitter = &self.jitter;
+        let now = Counts { received: jitter.received, lost: jitter.lost, rebuilt: self.rebuilt, late: jitter.late, gaps: self.gaps, jitter_ms: self.arrivals.ms() };
         let was = std::mem::replace(&mut self.reported, now);
-        Counts { received: now.received - was.received, lost: now.lost - was.lost, rebuilt: now.rebuilt - was.rebuilt, jitter_ms: now.jitter_ms }
+        Counts {
+            received: now.received - was.received,
+            lost: now.lost - was.lost,
+            rebuilt: now.rebuilt - was.rebuilt,
+            late: now.late - was.late,
+            gaps: now.gaps - was.gaps,
+            jitter_ms: now.jitter_ms,
+        }
     }
 
     /// Deafened: nothing is played, and nothing is kept to play later.
@@ -135,23 +149,29 @@ impl Stream {
         let mut pcm = [0i16; MAX_FRAME * CHANNELS];
         while self.pcm.len() < FRAME_SAMPLES {
             let decoded = match self.jitter.pop() {
-                Pop::Packet(packet) => self.decoder.decode(Some(&packet), 0, &mut pcm),
+                Pop::Packet(packet) => {
+                    self.gaps += u64::from(std::mem::take(&mut self.stalled));
+                    self.played(&packet, &mut pcm)
+                }
                 // Not a loss yet. Pitch carries the voice; the decoder stays put so the packet
                 // after a real gap can still rebuild it.
                 Pop::Hold => Some(self.decoder.bridge(FRAME, &mut pcm)),
                 Pop::Lost => {
-                    if self.jitter.has_later() {
-                        // The packet after the hole may carry a copy of what was lost.
-                        let rebuilt = self.jitter.next().and_then(|next| self.decoder.recover(next, &mut pcm));
-                        self.rebuilt += u64::from(rebuilt.is_some());
-                        rebuilt.or_else(|| self.decoder.decode(None, FRAME, &mut pcm))
-                    } else {
-                        // Nothing is behind this frame. Pitch-repeating it jumps to the middle
-                        // of the last frame, which is the pop at the end of a sentence.
-                        Some(self.decoder.release(FRAME, &mut pcm))
-                    }
+                    // The packet after the hole may carry a copy of what was lost.
+                    let rebuilt = self.jitter.next().and_then(|next| self.decoder.recover(next, &mut pcm));
+                    self.rebuilt += u64::from(rebuilt.is_some());
+                    rebuilt.or_else(|| self.decoder.decode(None, FRAME, &mut pcm))
                 }
-                Pop::Empty => break,
+                Pop::Late => {
+                    // After the quiet end of a sentence this is nothing at all; while someone
+                    // is speaking, a stall the next packet may end.
+                    self.stalled |= !self.jitter.hushed;
+                    Some(self.decoder.late(FRAME, &mut pcm))
+                }
+                Pop::Empty => {
+                    self.stalled = false;
+                    break;
+                }
             };
             match decoded {
                 Some(samples) => self.pcm.extend(&pcm[..samples * CHANNELS]),
@@ -164,6 +184,13 @@ impl Stream {
             }
         }
         (self.pcm.len() >= FRAME_SAMPLES).then(|| self.pcm.drain(..FRAME_SAMPLES).collect())
+    }
+
+    /// Decodes a packet whose turn it is, and notes how loud it was.
+    fn played(&mut self, packet: &[u8], pcm: &mut [i16]) -> Option<usize> {
+        let samples = self.decoder.decode(Some(packet), 0, pcm)?;
+        self.jitter.hushed = level(&pcm[..samples * CHANNELS]) < VOICE;
+        Some(samples)
     }
 
     /// The end of a tick: whether this sender started or stopped speaking.
@@ -1278,8 +1305,48 @@ mod receive_tests {
             "the tail steps from {from} to {}",
             tail[0]
         );
-        assert_eq!(tail[tail.len() - 1], 0, "the tail ends at silence");
-        assert_eq!(tail[tail.len() - 2], 0, "the tail ends at silence");
+        let ended = (0..2).map(|_| stream.pull(&format_args!("speaker")).expect("the ending frame")).last().unwrap();
+        assert_eq!(ended[ended.len() - 1], 0, "the tail ends at silence");
+        assert_eq!((stream.jitter.lost, stream.gaps), (0, 0), "nothing was lost, and nothing came back");
+    }
+
+    /// A tone, encoded as a Tiny call does.
+    fn tone_packets(frames: usize) -> Vec<Vec<u8>> {
+        let mut encoder = Encoder::voice().unwrap();
+        (0..frames)
+            .map(|f| {
+                let mut pcm = [0i16; FRAME_SAMPLES];
+                for (n, pair) in pcm.as_chunks_mut::<CHANNELS>().0.iter_mut().enumerate() {
+                    let t = (f * FRAME + n) as f64 / 48_000.;
+                    pair.fill(((t * 440. * std::f64::consts::TAU).sin() * 8000.) as i16);
+                }
+                let mut packet = [0u8; 1275];
+                let len = encoder.encode(&pcm, &mut packet).unwrap();
+                packet[..len].to_vec()
+            })
+            .collect()
+    }
+
+    /// A packet 60 ms late in the middle of a word: the voice fades and comes back. Nothing is
+    /// lost, the decoder goes on as if nothing happened, and the stall is counted.
+    #[test]
+    fn a_late_packet_is_a_stall_and_not_the_end_of_a_sentence() {
+        let packets = tone_packets(30);
+        let mut stream = Stream::new().unwrap();
+        for (n, packet) in packets[..12].iter().enumerate() {
+            stream.jitter.insert(n as u16, packet.clone());
+        }
+        for _ in 0..12 {
+            stream.pull(&"late").unwrap();
+        }
+        let concealed: Vec<_> = (0..3).map(|_| stream.pull(&"late").unwrap()).collect();
+        assert!(level(&concealed[0]) >= VOICE, "the voice carries on through the first tick");
+        for (n, packet) in packets[12..].iter().enumerate() {
+            stream.jitter.insert((n + 12) as u16, packet.clone());
+            stream.pull(&"late").unwrap();
+        }
+        let counts = stream.counts();
+        assert_eq!((counts.lost, counts.gaps), (0, 1), "{counts:?}");
     }
 }
 
