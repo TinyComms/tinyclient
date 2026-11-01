@@ -20,9 +20,9 @@ log = "0.4"
 
 # GPUI is the shell. It is behind `gui` so `cargo test` and the daemons never pull the GPU stack.
 #   cargo run -p tinyclient --features gui
-# Pinned to a Zed commit: gpui_platform is not on crates.io. `runtime_shaders` lets it build with
-# Command Line Tools only (no Xcode `metal` compiler).
-gpui = { git = "https://github.com/zed-industries/zed", rev = "cb13b37a6d80d034119888b534aa0d9067fb5aee", optional = true }
+# gpui-ce 0.3 is the maintained fork with iOS and Android backends (gpui_ios, gpui_mobile).
+# Zed's pin had no mobile platform crate, so a phone build could not link.
+gpui = { package = "gpui-ce", version = "0.3.0", optional = true, default-features = false, features = ["font-kit"] }
 unicode-segmentation = { version = "1.10", optional = true }
 libc = { version = "0.2", optional = true }
 # Avatars are decoded at the size they are drawn. Both are already in the tree through GPUI.
@@ -30,9 +30,11 @@ image = { version = "0.25", optional = true, default-features = false, features 
 smallvec = { version = "1.6", optional = true }
 # Reads `mediad --devices` for Settings › Audio & video. Already in the tree through protocol.
 serde_json = { workspace = true, optional = true }
+# gpui-ce's colours are palette types (`Rgba`, `Hsla`). The `IntoColor` bound its own helpers take
+# is palette's trait, and gpui does not re-export palette, so the same 0.7 line as gpui-ce.
+palette = { version = "0.7", optional = true }
 
 # URL-only Wikipedia cards use the public summary API off the UI thread.
-ureq = { version = "3", default-features = false, features = ["native-tls"], optional = true }
 url = { version = "2", optional = true }
 
 # Native CPU rendering of Discord Lottie stickers, pinned for reproducible builds.
@@ -43,7 +45,7 @@ tlottie = { git = "https://github.com/dkaraush/tlottie", rev = "92df98dc209bc39b
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 
 [features]
-gui = ["dep:tlottie", "dep:ureq", "dep:url", "dep:gpui", "dep:gpui_platform", "dep:unicode-segmentation", "dep:libc", "dep:image", "dep:smallvec", "dep:serde_json", "dep:windows-sys"]
+gui = ["dep:tlottie", "dep:ureq", "dep:url", "dep:gpui", "dep:gpui_platform", "dep:unicode-segmentation", "dep:libc", "dep:image", "dep:smallvec", "dep:serde_json", "dep:palette", "dep:windows-sys"]
 # Adds `--shot out.png`: render the window to a file and quit, for design review without
 # Screen Recording permission. Pulls GPUI's test support, so it is not part of `gui`.
 gui-shot = ["gui", "gpui/test-support", "gpui_platform/test-support"]
@@ -54,16 +56,26 @@ gui-shot = ["gui", "gpui/test-support", "gpui_platform/test-support"]
 # compile on mobile for now; see docs/mobile-build.md, "Feature gating".
 mobile = ["gui", "dep:android-activity"]
 
+[target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
+# Avoid an OpenSSL cross-build on Android; rustls validates against bundled WebPKI roots.
+ureq = { version = "3", default-features = false, features = ["rustls"], optional = true }
+
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+# Keep the desktop's existing native TLS provider and behavior.
+ureq = { version = "3", default-features = false, features = ["native-tls"], optional = true }
+
 [target.'cfg(target_os = "android")'.dependencies]
 # Provides ANativeActivity_onCreate and calls our `android_main`. Only linked on Android, so a
 # host build never sees it. `native-activity` is the plain NativeActivity glue (no GameActivity).
 android-activity = { version = "0.6", optional = true, default-features = false, features = ["native-activity"] }
+gpui_platform = { package = "gpui_ce_platform", version = "0.3.0", optional = true, default-features = false }
+gpui_mobile = { package = "gpui_ce_mobile", version = "0.3.0" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "cb13b37a6d80d034119888b534aa0d9067fb5aee", optional = true, default-features = false, features = ["font-kit", "runtime_shaders"] }
+gpui_platform = { package = "gpui_ce_platform", version = "0.3.0", optional = true, default-features = false, features = ["font-kit", "runtime_shaders"] }
 
 [target.'cfg(windows)'.dependencies]
-gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "cb13b37a6d80d034119888b534aa0d9067fb5aee", optional = true, default-features = false, features = ["font-kit"] }
+gpui_platform = { package = "gpui_ce_platform", version = "0.3.0", optional = true, default-features = false, features = ["font-kit"] }
 # `--version` and `--text` print to the terminal from a windowed program, and a call's link
 # opens through ShellExecuteW. Already in the tree.
 windows-sys = { version = "0.61", optional = true, features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
@@ -75,5 +87,9 @@ embed-resource = "3"
 
 # Wayland and X11 are features of their own, off without default features: without them the
 # window cannot open at all ("the environment names no allowed Wayland or X11 display server").
-[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
-gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "cb13b37a6d80d034119888b534aa0d9067fb5aee", optional = true, default-features = false, features = ["font-kit", "wayland", "x11"] }
+# Android and iOS are unix too; they use gpui-ce's mobile backends, not a display server.
+[target.'cfg(all(unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))'.dependencies]
+gpui_platform = { package = "gpui_ce_platform", version = "0.3.0", optional = true, default-features = false, features = ["font-kit", "wayland", "x11"] }
+
+[target.'cfg(target_os = "ios")'.dependencies]
+gpui_platform = { package = "gpui_ce_platform", version = "0.3.0", optional = true, default-features = false, features = ["runtime_shaders"] }

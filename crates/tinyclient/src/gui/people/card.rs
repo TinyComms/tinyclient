@@ -611,13 +611,13 @@ impl Render for Floating {
             }
         }));
         if modal {
-            return div().child(deferred(anchored().position(point(px(0.), px(0.))).child(fade_in(("float", self.opened), 160, surface))).with_priority(3));
+            return div().child(deferred(anchored().position(point(px(0.), px(0.))).child(fade_in(("float", self.opened), 160, surface))).priority(3));
         }
         let surface = surface.on_mouse_down_out(cx.listener(|this, _, _, cx| this.close(cx)));
         let offset = if matches!(float, Float::Card(_)) { point(px(8.), px(0.)) } else { point(px(2.), px(2.)) };
         div().child(
             deferred(anchored().position(anchor + offset).snap_to_window_with_margin(px(8.)).child(fade_in(("float", self.opened), 120, surface)))
-                .with_priority(2),
+                .priority(2),
         )
     }
 }

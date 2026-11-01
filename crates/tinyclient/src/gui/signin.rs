@@ -140,7 +140,7 @@ pub fn layer(window: &mut Window, cx: &mut App) -> Option<Deferred> {
     if let Some(before) = restore {
         window.defer(cx, move |window, cx| window.focus(&before, cx));
     }
-    open.then(|| deferred(sheet).with_priority(PRIORITY))
+    open.then(|| deferred(sheet).priority(PRIORITY))
 }
 
 fn now() -> i64 {

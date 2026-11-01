@@ -2,6 +2,7 @@
 //! network. Every box that holds a picture is sized from what the network said about it, so a
 //! row is its final height before any file arrives.
 
+use palette::IntoColor;
 use super::emoji;
 use super::icons::{icon, Icon};
 use super::images::Picture;
@@ -739,7 +740,7 @@ impl Pane {
                     .type_body()
                     .when(phone, |div| div.text_size(px(tokens_phone::scaled(17.))).line_height(px(tokens_phone::scaled(24.))))
                     .when(mine, |div| div.text_align(gpui::TextAlign::Right))
-                    .child(self.rich(message, ix, inline, theme::text().into(), window, cx))
+                    .child(self.rich(message, ix, inline, theme::text().into_color(), window, cx))
                     .into_any_element(),
                 Block::Quote(inline) => div()
                     .max_w(px(MEASURE))
@@ -753,7 +754,7 @@ impl Pane {
                             .type_body()
                             .when(phone, |div| div.text_size(px(tokens_phone::scaled(17.))).line_height(px(tokens_phone::scaled(24.))))
                             .when(mine, |div| div.text_align(gpui::TextAlign::Right))
-                            .child(self.rich(message, ix, inline, theme::text_soft().into(), window, cx)),
+                            .child(self.rich(message, ix, inline, theme::text_soft().into_color(), window, cx)),
                     )
                     .into_any_element(),
                 Block::Item { ordered, depth, number, text } => {
@@ -766,7 +767,7 @@ impl Pane {
                         .when(phone, |div| div.text_size(px(tokens_phone::scaled(17.))).line_height(px(tokens_phone::scaled(24.))))
                         .when(mine, |div| div.text_align(gpui::TextAlign::Right))
                         .child(div().w(px(22.)).flex_none().text_color(theme::text_faint()).child(marker))
-                        .child(div().min_w_0().flex_1().child(self.rich(message, ix, text, theme::text().into(), window, cx)))
+                        .child(div().min_w_0().flex_1().child(self.rich(message, ix, text, theme::text().into_color(), window, cx)))
                         .into_any_element()
                 }
                 Block::Code { language, text } => self.code_block(message, ix, language, text, cx),

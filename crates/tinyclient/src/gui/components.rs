@@ -25,14 +25,15 @@ use gpui::{
     div, img, prelude::*, px, svg, Div, ElementId, Hsla, Img, Rgba, SharedString, Stateful, Svg,
 };
 use protocol::{Badge, Conversation, ConversationKind, Link, Network};
+use palette::IntoColor;
 
 /// A monochrome interface glyph, drawn with a 1.5 pt stroke at any size.
-pub fn glyph(name: &'static str, size: f32, color: impl Into<Hsla>) -> Svg {
+pub fn glyph(name: &'static str, size: f32, color: impl IntoColor<Hsla>) -> Svg {
     svg()
         .path(glyph_asset(name, size))
         .size(px(size))
         .flex_none()
-        .text_color(color.into())
+        .text_color(color.into_color())
 }
 
 /// The network's own icon, in its own colors. Never tinted or put on a plate. Only on the rail,
@@ -43,8 +44,8 @@ pub fn network_icon(network: Network, size: f32) -> Img {
 
 /// The network's mark in one color, for a list that mixes networks while two or more are signed
 /// in: 14, `text_faint`, leading the title (C5). The logo's shape drawn as a mask.
-pub fn network_mark(network: Network, size: f32, color: impl Into<Hsla>) -> Svg {
-    svg().path(network_asset(network, size)).size(px(size)).flex_none().text_color(color.into())
+pub fn network_mark(network: Network, size: f32, color: impl IntoColor<Hsla>) -> Svg {
+    svg().path(network_asset(network, size)).size(px(size)).flex_none().text_color(color.into_color())
 }
 
 // Badges.
@@ -95,9 +96,9 @@ pub fn badge_quiet(count: u32) -> Div {
 }
 
 /// A dot, centered in the 16 pt slot a badge would take so rows line up.
-pub fn badge_dot(diameter: f32, color: impl Into<Hsla>) -> Div {
+pub fn badge_dot(diameter: f32, color: impl IntoColor<Hsla>) -> Div {
     div().flex_none().size(px(16.)).flex().items_center().justify_center().child(
-        div().size(px(diameter)).rounded(px(diameter / 2.)).bg(color.into()),
+        div().size(px(diameter)).rounded(px(diameter / 2.)).bg(color.into_color()),
     )
 }
 

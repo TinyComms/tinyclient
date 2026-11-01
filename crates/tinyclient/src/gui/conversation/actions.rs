@@ -598,7 +598,7 @@ impl Pane {
             }
         }
         let items = items.on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_menu(cx)));
-        Some(deferred(anchored().position(*at).snap_to_window().child(fade_in("message-menu", 120, items))).with_priority(1).into_any_element())
+        Some(deferred(anchored().position(*at).snap_to_window().child(fade_in("message-menu", 120, items))).priority(1).into_any_element())
     }
 
     // The picker.
@@ -664,7 +664,7 @@ impl Pane {
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_picker(cx)));
         // Beside the pointer, to its left: the toolbar it came from is at the pane's right edge.
         let at = point(picking.at.x - px(emoji::WIDTH - 24.), picking.at.y + px(14.));
-        Some(deferred(anchored().position(at).snap_to_window().child(fade_in("picker", 120, panel))).with_priority(1).into_any_element())
+        Some(deferred(anchored().position(at).snap_to_window().child(fade_in("picker", 120, panel))).priority(1).into_any_element())
     }
 
     // The delete dialog.
@@ -731,7 +731,7 @@ impl Pane {
                 }),
             )
             .child(fade_in("confirm-panel", 160, panel));
-        Some(deferred(anchored().position(point(px(0.), px(0.))).child(scrim)).with_priority(1).into_any_element())
+        Some(deferred(anchored().position(point(px(0.), px(0.))).child(scrim)).priority(1).into_any_element())
     }
 
     pub(super) fn action_layers(&self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {

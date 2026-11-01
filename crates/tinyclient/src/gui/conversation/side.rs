@@ -5,6 +5,7 @@
 //! the next frame is drawn: a switch and the pane that follows it land in the same frame, and
 //! the old subject is never drawn beside the new conversation.
 
+use palette::IntoColor;
 use crate::gui::pane::{self, Layer, Showing, Stack, Step};
 use super::{Pane, PaneEvent};
 use crate::client::ask;
@@ -216,7 +217,7 @@ fn matched(text: &str, words: &str) -> Vec<Range<usize>> {
 
 /// The heavier letters a match is drawn with, as the switcher's rows do.
 fn lit() -> HighlightStyle {
-    HighlightStyle { color: Some(theme::text().into()), font_weight: Some(FontWeight::SEMIBOLD), ..Default::default() }
+    HighlightStyle { color: Some(theme::text().into_color()), font_weight: Some(FontWeight::SEMIBOLD), ..Default::default() }
 }
 
 impl Side {

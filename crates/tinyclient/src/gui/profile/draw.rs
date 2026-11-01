@@ -1,6 +1,7 @@
 //! The parts the pane, the card and Details share, drawn once: the head, the tag after a name,
 //! fact rows, role chips, the heads-up, the switch.
 
+use palette::IntoColor;
 use super::facts::{self, HeadsUpWords, PresenceLine, Role, Tone};
 use crate::gui::components::{glyph, Avatar, Shape as Plate};
 use crate::gui::people::presence::{self, Shape};
@@ -15,7 +16,7 @@ pub const AVATAR: f32 = 64.;
 /// `band(c)`: the colour at 40% over the surface.
 pub fn band(color: u32, surface: Rgba) -> Rgba {
     let mut tinted = rgb(color);
-    tinted.a = 0.4;
+    tinted.alpha = 0.4;
     theme::over(tinted, surface)
 }
 
@@ -121,11 +122,11 @@ pub fn presence_row(line: &PresenceLine, surface: Rgba, lines: usize) -> Option<
     let until = if line.until.is_empty() { String::new() } else { format!(" · {}", line.until) };
     // One run of text so it wraps as a sentence.
     let text = gpui::StyledText::new(format!("{}{said}{until}", line.word)).with_highlights([
-        (0..line.word.len(), gpui::HighlightStyle { color: Some(theme::text().into()), ..Default::default() }),
-        (line.word.len()..line.word.len() + said.len(), gpui::HighlightStyle { color: Some(theme::text_soft().into()), ..Default::default() }),
+        (0..line.word.len(), gpui::HighlightStyle { color: Some(theme::text().into_color()), ..Default::default() }),
+        (line.word.len()..line.word.len() + said.len(), gpui::HighlightStyle { color: Some(theme::text_soft().into_color()), ..Default::default() }),
         (
             line.word.len() + said.len()..line.word.len() + said.len() + until.len(),
-            gpui::HighlightStyle { color: Some(theme::text_faint().into()), ..Default::default() },
+            gpui::HighlightStyle { color: Some(theme::text_faint().into_color()), ..Default::default() },
         ),
     ]);
     Some(
@@ -179,7 +180,7 @@ pub fn fact(id: impl Into<ElementId>, icon: &'static str, words: impl Into<Share
 pub fn fact_inline(id: impl Into<ElementId>, icon: &'static str, words: String, soft: String) -> Stateful<Div> {
     let text = gpui::StyledText::new(format!("{words}{soft}")).with_highlights([(
         words.len()..words.len() + soft.len(),
-        gpui::HighlightStyle { color: Some(theme::text_soft().into()), ..Default::default() },
+        gpui::HighlightStyle { color: Some(theme::text_soft().into_color()), ..Default::default() },
     )]);
     div()
         .id(id)
@@ -242,7 +243,7 @@ pub fn role(role: &Role, place_icon: Option<Div>, chips_cap: Option<usize>) -> D
             let hidden = more + (roles.len() - cap);
             let named = gpui::StyledText::new(if nickname.is_empty() { format!("In {place}") } else { format!("{nickname} in {place}") })
                 .with_highlights((!nickname.is_empty()).then(|| {
-                    (0..nickname.len(), gpui::HighlightStyle { font_weight: Some(theme::SEMIBOLD), color: Some(theme::text().into()), ..Default::default() })
+                    (0..nickname.len(), gpui::HighlightStyle { font_weight: Some(theme::SEMIBOLD), color: Some(theme::text().into_color()), ..Default::default() })
                 }));
             div()
                 .flex()

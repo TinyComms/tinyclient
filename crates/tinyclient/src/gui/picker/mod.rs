@@ -21,6 +21,7 @@ mod table;
 // One decoder and one picture budget for the whole window, shared with the conversation.
 pub(in crate::gui) use crate::gui::conversation::images;
 
+use palette::IntoColor;
 use crate::frames;
 use crate::gui::anim::{self, Play};
 use crate::gui::components::{field, glyph, segment, segmented};
@@ -1179,7 +1180,7 @@ impl Picker {
                     .justify_center()
                     .cursor_pointer()
                     .tooltip(crate::gui::components::tip(if starred { "Remove from Favorites  F" } else { "Add to Favorites  F" }, None))
-                    .child(glyph("icons/star.svg", 14., if starred { theme::warning() } else { gpui::white().into() }))
+                    .child(glyph("icons/star.svg", 14., if starred { theme::warning().into_color() } else { gpui::white() }))
                     // The star is not the cell: a click here never sends.
                     .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(move |this, _, _, cx| {

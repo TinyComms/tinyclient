@@ -2,6 +2,7 @@
 //! group card and its rows, the switch, the slider, the level meter and the reset slot. Pure
 //! drawing; the window wires the clicks.
 
+use palette::IntoColor;
 use crate::gui::components::glyph;
 use crate::gui::theme::{self, Type};
 use gpui::{div, prelude::*, px, Div, ElementId, Hsla, Rgba, SharedString, Stateful};
@@ -174,7 +175,7 @@ pub fn slider_track(value: u32, range: (u32, u32), stops: Option<u32>, default: 
             .border_1()
             .border_color(gpui::rgba(0x0000001f))
             .shadow(vec![gpui::BoxShadow {
-                color: gpui::hsla(0., 0., 0., 0.3),
+                color: gpui::hsla(0., 0., 0., 0.3).into(),
                 offset: gpui::point(px(0.), px(1.)),
                 blur_radius: px(3.),
                 spread_radius: px(0.),
@@ -199,11 +200,11 @@ pub fn meter(level: Option<u8>, gate: u32) -> Div {
     let first_sent = (gate as usize * SEGMENTS).div_ceil(100);
     let segment = |ix: usize| {
         let color: Hsla = if ix >= lit {
-            switch_off().into()
+            switch_off().into_color()
         } else if ix >= first_sent {
-            theme::positive().into()
+            theme::positive().into_color()
         } else {
-            theme::text_faint().into()
+            theme::text_faint().into_color()
         };
         div().flex_none().w(px(10.)).h(px(8.)).rounded(px(2.)).bg(color)
     };

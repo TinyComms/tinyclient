@@ -8,12 +8,13 @@
 use super::composer::edit::{Editor, Motion, PlainRows, Rows};
 use super::theme;
 use super::components::{menu, menu_item, menu_item_disabled, menu_separator};
+use palette::IntoColor;
 use gpui::{
     actions, anchored, deferred, div, fill, point, prelude::*, px, relative, size, AnyElement, App, Bounds, ClipboardEntry, ClipboardItem, Context,
     CursorStyle, ElementId, ElementInputHandler, Entity, EntityInputHandler, EventEmitter,
     FocusHandle, Focusable, Font, GlobalElementId, Hsla, KeyBinding, LayoutId, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, ScrollWheelEvent,
-    SharedString, Style, TextAlign, TextRun, UTF16Selection, UnderlineStyle, Window, WrappedLine,
+    CaretPosition, SharedString, ShapedText, Style, TextAlign, TextRun, UTF16Selection, UnderlineStyle, Window,
 };
 use std::ops::Range;
 use std::rc::Rc;
@@ -222,23 +223,33 @@ struct Row {
     /// The hard line it is a piece of, and where that line starts in the text.
     line: usize,
     line_start: usize,
-    /// Where this row begins inside the unwrapped line.
-    start_x: Pixels,
+    /// Which visual line of its hard line this is, counted from the top.
+    index: usize,
     /// Soft-wrapped: the next row continues the same hard line.
     wraps: bool,
 }
 
 /// The field's text as shaped for one width.
 struct Laid {
-    lines: Vec<WrappedLine>,
+    lines: Vec<ShapedText>,
     rows: Vec<Row>,
     text: SharedString,
+    line_height: Pixels,
 }
 
 impl Laid {
+    /// The x of `offset` within its row. Positions are measured within each visual line, so a
+    /// row starts at 0. At the end of a soft-wrapped row the caret stays on that row, as it did
+    /// when the row was measured against the unwrapped line.
     fn x(&self, row: &Row, offset: usize) -> Pixels {
-        let layout = &self.lines[row.line].unwrapped_layout;
-        layout.x_for_index(offset.clamp(row.range.start, row.range.end) - row.line_start) - row.start_x
+        let line = &self.lines[row.line];
+        let offset = offset.clamp(row.range.start, row.range.end) - row.line_start;
+        let caret = if row.wraps && offset == row.range.end - row.line_start {
+            CaretPosition::attached_to_previous_cluster(offset)
+        } else {
+            CaretPosition::attached_to_next_cluster(offset)
+        };
+        line.visual_position_for_caret(caret, self.line_height).map_or(px(0.), |point| point.x)
     }
 }
 
@@ -257,8 +268,10 @@ impl Rows for Laid {
 
     fn offset_at(&self, row: usize, x: f32) -> usize {
         let row = &self.rows[row];
-        let layout = &self.lines[row.line].unwrapped_layout;
-        let found = row.line_start + layout.closest_index_for_x(row.start_x + px(x.max(0.)));
+        // Hit-test at the middle of the row's own band, so the y picks this visual line.
+        let y = self.line_height * row.index as f32 + self.line_height / 2.;
+        let hit = self.lines[row.line].closest_byte_index_for_pixel_point(point(px(x.max(0.)), y), self.line_height);
+        let found = row.line_start + hit.unwrap_or_else(|index| index);
         // The end of a wrapped row is the start of the next; stay on this one.
         let end = if row.wraps {
             self.text[row.range.clone()]
@@ -795,7 +808,7 @@ impl TextInput {
             .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
             .on_mouse_down_out(cx.listener(|this, _, _, cx| { this.edit_menu = None; cx.notify(); }))
             .child(cut).child(copy).child(paste).children(picture).child(menu_separator()).child(all);
-        Some(deferred(anchored().position(at).snap_to_window().child(menu)).with_priority(2).into_any_element())
+        Some(deferred(anchored().position(at).snap_to_window().child(menu)).priority(2).into_any_element())
     }
 
     fn on_mouse_down(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -1048,9 +1061,10 @@ impl Shaping {
                 wavy: false,
             }),
             strikethrough: None,
+            letter_spacing: None,
         };
-        let faint: Hsla = theme::text_faint().into();
-        let mention: Hsla = theme::accent_text().into();
+        let faint: Hsla = theme::text_faint().into_color();
+        let mention: Hsla = theme::accent_text().into_color();
         let mut lines = Vec::new();
         let mut rows = Vec::new();
         let mut line_start = 0;
@@ -1097,39 +1111,33 @@ impl Shaping {
                 .text_system()
                 .shape_text(SharedString::new(line.clone()), self.font_size, &runs, wrap, None)
                 .ok()
-                .and_then(|mut shaped| shaped.pop())
-                .unwrap_or_default();
-            let layout = &shaped.unwrapped_layout;
-            let mut row_start = (0, px(0.));
-            for boundary in shaped.wrap_boundaries.iter() {
-                let glyph = &layout.runs[boundary.run_ix].glyphs[boundary.glyph_ix];
-                rows.push(Row {
-                    range: line_start + row_start.0..line_start + glyph.index,
-                    line: lines.len(),
-                    line_start,
-                    start_x: row_start.1,
-                    wraps: true,
-                });
-                row_start = (glyph.index, glyph.position.x);
+                // A line the text system refuses is shown as nothing, as the default was before.
+                .unwrap_or_else(|| window.text_system().shape_text("", px(0.), &[], None, None).expect("empty text shapes"));
+            // The visual lines after the first each start a row: their first byte is the break.
+            let starts: Vec<usize> = shaped.visual_lines().iter().skip(1).map(|visual| visual.text_range.start).collect();
+            let mut row_start = 0;
+            for (index, &at) in starts.iter().enumerate() {
+                rows.push(Row { range: line_start + row_start..line_start + at, line: lines.len(), line_start, index, wraps: true });
+                row_start = at;
             }
             rows.push(Row {
-                range: line_start + row_start.0..line_start + line.len(),
+                range: line_start + row_start..line_start + line.len(),
                 line: lines.len(),
                 line_start,
-                start_x: row_start.1,
+                index: starts.len(),
                 wraps: false,
             });
             lines.push(shaped);
             line_start += line.len() + 1;
         }
-        Laid { lines, rows, text }
+        Laid { lines, rows, text, line_height: window.line_height() }
     }
 }
 
 /// The longest start of a placeholder that still leaves room for an ellipsis. One extra
 /// shaping pass, and only when the placeholder overflows the field.
 fn fitted(line: &str, room: Pixels, shaping: &Shaping, window: &mut Window) -> String {
-    let measure = |text: &str| -> Option<std::sync::Arc<gpui::LineLayout>> {
+    let measure = |text: &str| -> Option<ShapedText> {
         let runs = [TextRun {
             len: text.len(),
             font: shaping.font.clone(),
@@ -1137,13 +1145,12 @@ fn fitted(line: &str, room: Pixels, shaping: &Shaping, window: &mut Window) -> S
             background_color: None,
             underline: None,
             strikethrough: None,
+            letter_spacing: None,
         }];
         window
             .text_system()
             .shape_text(SharedString::from(text.to_owned()), shaping.font_size, &runs, None, None)
             .ok()
-            .and_then(|mut shaped| shaped.pop())
-            .map(|shaped| shaped.unwrapped_layout.clone())
     };
     let Some(full) = measure(line) else {
         return line.to_owned();
@@ -1152,14 +1159,14 @@ fn fitted(line: &str, room: Pixels, shaping: &Shaping, window: &mut Window) -> S
         return line.to_owned();
     }
     let dot = measure("…").map_or(px(0.), |layout| layout.width);
+    // The last character boundary whose start still leaves room for the ellipsis.
     let mut cut = 0;
-    for run in &full.runs {
-        for glyph in &run.glyphs {
-            if glyph.position.x + dot > room {
-                break;
-            }
-            cut = glyph.index;
+    for (index, _) in line.char_indices() {
+        let x = full.visual_position_for_byte_index(index, shaping.font_size).map_or(px(0.), |point| point.x);
+        if x + dot > room {
+            break;
         }
+        cut = index;
     }
     match line.get(..cut).map(str::trim_end) {
         Some(head) if !head.is_empty() => format!("{head}…"),
@@ -1339,14 +1346,14 @@ impl Element for TextElement {
         let laid = prepaint.laid.clone();
         let focused = focus_handle.is_focused(window);
         let _ = &prepaint.shaping;
-        window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
+        window.with_content_mask(Some(gpui::ContentMask { bounds, fade_out: Default::default() }), |window| {
             for selection in prepaint.selection.drain(..) {
                 window.paint_quad(selection);
             }
             let mut row = 0;
             for line in &laid.lines {
                 let origin = point(bounds.left() - scroll_x, bounds.top() - scroll_y + line_height * row as f32);
-                let rows = line.wrap_boundaries.len() + 1;
+                let rows = line.visual_lines().len().max(1);
                 let visible = origin.y < bounds.bottom() && origin.y + line_height * rows as f32 > bounds.top();
                 if visible {
                     let _ = line.paint(origin, line_height, TextAlign::Left, None, window, cx);

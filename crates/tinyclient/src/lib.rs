@@ -37,10 +37,8 @@ mod view;
 
 /// Starts the window on iOS.
 ///
-/// Called by the Swift shell. The pinned Zed GPUI revision (`Cargo.toml`) has no iOS platform
-/// backend: its `gpui_platform` has `gpui_apple|linux|macos|web|wgpu|windows` arms only, so this
-/// is a seam, not a working app. Moving to gpui-ce (`gpui-ce` 0.3.0 on crates.io) is what would
-/// add one; that migration is not made yet. Keep the body to one call so it changes one line.
+/// Called by the Swift shell. GPUI is gpui-ce 0.3.0 (`Cargo.toml`), whose `gpui_ce_platform`
+/// carries the iOS backend. Keep the body to one call.
 #[cfg(all(feature = "gui", target_os = "ios"))]
 pub fn ios_main() {
     gui::run();
@@ -63,8 +61,7 @@ pub extern "C" fn tinyclient_ios_main() {
 /// `AndroidManifest.xml` points NativeActivity at `libtinyclient.so` (`android.app.lib_name`).
 /// Before the window starts this points `TINYCLIENT_DIR` at the app's internal data directory:
 /// Android has no `HOME`, so `protocol::support_dir` would otherwise put the socket and database
-/// under `/tmp`. The pinned Zed GPUI has no Android backend (see [`ios_main`]), so this is still
-/// not a working app: `gpui_platform::application()` has no Android arm and the build stops there.
+/// under `/tmp`. GPUI's Android backend is `gpui_ce_mobile`, linked by `Cargo.toml`.
 #[cfg(all(feature = "mobile", target_os = "android"))]
 #[no_mangle]
 pub extern "C" fn android_main(app: android_activity::AndroidApp) {

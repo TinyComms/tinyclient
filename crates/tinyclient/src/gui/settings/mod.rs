@@ -228,7 +228,7 @@ fn open_now(section: Section, cx: &mut App) {
     if let Some(window) = host.window {
         let shown = window.update(cx, |settings, window, cx| {
             settings.show(section, window, cx);
-            window.activate_window();
+            window.activate();
         });
         if shown.is_ok() {
             return;

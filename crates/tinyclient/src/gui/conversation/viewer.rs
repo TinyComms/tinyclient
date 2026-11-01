@@ -672,7 +672,7 @@ impl Pane {
             .child(bar)
             .child(stage)
             .child(footer);
-        Some(deferred(anchored().position(point(px(0.), px(0.))).child(layer)).with_priority(2).into_any_element())
+        Some(deferred(anchored().position(point(px(0.), px(0.))).child(layer)).priority(2).into_any_element())
     }
 }
 

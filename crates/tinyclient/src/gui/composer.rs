@@ -1953,7 +1953,7 @@ impl Composer {
                 }
             };
             let drawn = colon::draw(colon, customs, tone, image, pick);
-            return Some(deferred(div().absolute().left_0().bottom(relative(1.)).pb(px(6.)).child(drawn)).with_priority(1).into_any_element());
+            return Some(deferred(div().absolute().left_0().bottom(relative(1.)).pb(px(6.)).child(drawn)).priority(1).into_any_element());
         }
         let list = self.list.as_ref().filter(|list| !list.rows.is_empty())?;
         let this = cx.weak_entity();
@@ -1961,7 +1961,7 @@ impl Composer {
             let _ = this.update(cx, |this, cx| this.complete(row, cx));
         };
         let drawn = complete::draw(list, &self.hub, pick, cx);
-        Some(deferred(div().absolute().left_0().bottom(relative(1.)).pb(px(6.)).child(drawn)).with_priority(1).into_any_element())
+        Some(deferred(div().absolute().left_0().bottom(relative(1.)).pb(px(6.)).child(drawn)).priority(1).into_any_element())
     }
 
     /// The picker, above the card, right edge on its trigger's, inside the window.
@@ -2042,7 +2042,7 @@ impl Composer {
                     .border_2()
                     .border_color(border)
                     // The messages stay faintly visible under it; the words must read over them.
-                    .bg(Rgba { a: 0.9, ..theme::over(wash, theme::canvas()) })
+                    .bg(Rgba { alpha: 0.9, ..theme::over(wash, theme::canvas()) })
                     .flex()
                     .flex_col()
                     .items_center()
@@ -2053,7 +2053,7 @@ impl Composer {
                     .child(div().type_ui().text_color(theme::text_soft()).child(line)),
             );
         let at = gpui::point(bounds.left(), px(top));
-        Some(deferred(gpui::anchored().position(at).child(frame)).with_priority(Layer::Float as usize).into_any_element())
+        Some(deferred(gpui::anchored().position(at).child(frame)).priority(Layer::Float as usize).into_any_element())
     }
 
     #[cfg(feature = "gui-shot")]

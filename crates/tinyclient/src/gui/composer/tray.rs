@@ -259,7 +259,7 @@ impl Composer {
             this.chip_menu = None;
             cx.notify();
         }));
-        let layer = deferred(anchored().anchor(Anchor::BottomLeft).offset(point(px(0.), px(-6.))).snap_to_window_with_margin(px(8.)).child(items)).with_priority(2);
+        let layer = deferred(anchored().anchor(Anchor::BottomLeft).offset(point(px(0.), px(-6.))).snap_to_window_with_margin(px(8.)).child(items)).priority(2);
         Some(div().absolute().top_0().left_0().child(layer).into_any_element())
     }
 }

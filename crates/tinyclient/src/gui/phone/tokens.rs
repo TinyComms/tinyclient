@@ -261,7 +261,7 @@ pub fn selected() -> Rgba {
 /// A sheet floats above the page: a real, soft shadow under a 12 pt top edge.
 pub fn shadow_sheet() -> Vec<BoxShadow> {
     vec![BoxShadow {
-        color: hsla(0., 0., 0., 0.45),
+        color: hsla(0., 0., 0., 0.45).into(),
         offset: point(px(0.), px(8.)),
         blur_radius: px(24.),
         spread_radius: px(0.),
@@ -378,10 +378,10 @@ mod tests {
 
     #[test]
     fn the_surfaces_are_a_ladder_with_the_page_lowest() {
-        let lum = |c: Rgba| c.r + c.g + c.b;
+        let lum = |c: Rgba| c.red + c.green + c.blue;
         assert!(lum(page()) < lum(surface()));
         assert!(lum(surface()) < lum(raised()));
         // 6% white for a press, 5.5% for a row's rule: the rule is the quieter of the two.
-        assert!(rule().a < pressed().a);
+        assert!(rule().alpha < pressed().alpha);
     }
 }

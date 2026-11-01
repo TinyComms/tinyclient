@@ -3,6 +3,7 @@
 //! Spaces, each ranked, and what arrives later from the networks goes in below the selected row,
 //! never above it. chatd finds the conversations (`Find`) and people (`People`); the shell ranks.
 
+use palette::IntoColor;
 use super::rank;
 use super::Mode;
 use crate::client::ask;
@@ -531,7 +532,7 @@ impl Shell {
             _ => None,
         };
         // The letters that matched are heavier: the order is the rank, and this is why.
-        let lit = HighlightStyle { color: Some(theme::text().into()), font_weight: Some(FontWeight::SEMIBOLD), ..Default::default() };
+        let lit = HighlightStyle { color: Some(theme::text().into_color()), font_weight: Some(FontWeight::SEMIBOLD), ..Default::default() };
         let title = hit.title.trim_start_matches('#');
         let shift = hit.title.len() - title.len();
         let highlights: Vec<(Range<usize>, HighlightStyle)> =

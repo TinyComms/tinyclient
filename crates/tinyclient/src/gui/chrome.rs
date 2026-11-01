@@ -156,7 +156,7 @@ pub fn buttons(window: &Window, close: impl Fn(&ClickEvent, &mut Window, &mut Ap
                 .when(button == Button::Close, |face| face.when_some(close.take(), |face, close| face.on_click(close))),
         }
     }));
-    Some(deferred(row).with_priority(PRIORITY).into_any_element())
+    Some(deferred(row).priority(PRIORITY).into_any_element())
 }
 
 /// Windows presses it: a press on a `WindowControlArea` is the caption's own, so the window
@@ -168,7 +168,7 @@ fn windows_button(face: Stateful<Div>, button: Button, icon: &'static str) -> St
         Button::Close => WindowControlArea::Close,
     };
     let (hover, pressed): (Rgba, Rgba) = match button {
-        Button::Close => (rgb(CLOSE_RED), Rgba { a: 0.8, ..rgb(CLOSE_RED) }),
+        Button::Close => (rgb(CLOSE_RED), Rgba { alpha: 0.8, ..rgb(CLOSE_RED) }),
         _ => (theme::hover(), theme::pressed()),
     };
     face.w(px(CAPTION.0))

@@ -748,7 +748,7 @@ impl Shell {
                         .on_mouse_down_out(cx.listener(|this, _, _, cx| this.call_menu_close(cx)))
                         .child(body),
                 )
-                .with_priority(1)
+                .priority(1)
             }))
     }
 
@@ -782,7 +782,7 @@ impl Shell {
         .on_click(cx.listener(|this, _, _, cx| this.call_accept(cx)));
         card()
             .h(px(CARD))
-            .border_color(Rgba { a: 0.45, ..theme::positive() })
+            .border_color(Rgba { alpha: 0.45, ..theme::positive() })
             .child(self.call_title(call, subject, words, cx))
             .child(div().h(px(32.)).flex_none().flex().gap(px(4.)).child(decline).child(accept))
     }

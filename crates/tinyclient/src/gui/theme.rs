@@ -2,6 +2,7 @@
 //! every value from here and nowhere else. Dark only until the light values have been checked.
 
 use gpui::{hsla, point, px, rgb, rgba, BoxShadow, FontWeight, Hsla, Rgba, Styled};
+use palette::IntoColor;
 
 use super::phone::tokens as phone_tokens;
 
@@ -146,12 +147,14 @@ pub fn unread() -> Rgba { text() }
 
 /// `fill` composited on an opaque `surface`: the color a ring needs to match a row's fill.
 pub fn over(fill: Rgba, surface: Rgba) -> Rgba {
-    let mix = |top: f32, bottom: f32| top * fill.a + bottom * (1. - fill.a);
+    let mix = |top: f32, bottom: f32| top * fill.alpha + bottom * (1. - fill.alpha);
     Rgba {
-        r: mix(fill.r, surface.r),
-        g: mix(fill.g, surface.g),
-        b: mix(fill.b, surface.b),
-        a: 1.,
+        color: palette::rgb::Rgb::new(
+            mix(fill.red, surface.red),
+            mix(fill.green, surface.green),
+            mix(fill.blue, surface.blue),
+        ),
+        alpha: 1.,
     }
 }
 
@@ -312,7 +315,7 @@ impl<T: Styled + Sized> Type for T {}
 
 fn shadow(y: f32, blur: f32, spread: f32, alpha: f32) -> BoxShadow {
     BoxShadow {
-        color: hsla(0., 0., 0., alpha),
+        color: hsla(0., 0., 0., alpha).into(),
         offset: point(px(0.), px(y)),
         blur_radius: px(blur),
         spread_radius: px(spread),
@@ -336,7 +339,7 @@ pub fn shadow_modal() -> Vec<BoxShadow> {
 /// The sidebar when it floats over the conversation in a narrow window.
 pub fn shadow_pane() -> Vec<BoxShadow> {
     vec![BoxShadow {
-        color: hsla(0., 0., 0., 0.6),
+        color: hsla(0., 0., 0., 0.6).into(),
         offset: point(px(16.), px(0.)),
         blur_radius: px(48.),
         spread_radius: px(0.),
@@ -344,9 +347,9 @@ pub fn shadow_pane() -> Vec<BoxShadow> {
     }]
 }
 
-fn ring(color: impl Into<Hsla>, spread: f32) -> BoxShadow {
+fn ring(color: impl IntoColor<Hsla>, spread: f32) -> BoxShadow {
     BoxShadow {
-        color: color.into(),
+        color: color.into_color().into(),
         offset: point(px(0.), px(0.)),
         blur_radius: px(0.),
         spread_radius: px(spread),
