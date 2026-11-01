@@ -122,6 +122,7 @@ pub(in crate::gui) enum View {
 }
 
 /// The shots name the view, page and sheet (`shot::phone_view`).
+#[cfg(feature = "gui-shot")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::gui) enum Shown {
     Screen,
