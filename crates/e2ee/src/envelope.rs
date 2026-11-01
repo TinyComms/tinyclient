@@ -61,7 +61,8 @@ pub struct AttachmentRef {
     pub key: AttachmentKey,
     pub name: String,
     pub mime: String,
-    /// Length of the plaintext file.
+    /// Length of the plaintext file. Only the message carries it: the sealed blob is padded
+    /// (Padme), and opening needs this to tell the file from its padding.
     pub bytes: u64,
     /// SHA-256 of the sealed blob as uploaded.
     pub sha256: [u8; 32],

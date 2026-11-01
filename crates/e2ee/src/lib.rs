@@ -96,7 +96,10 @@ pub mod parsers {
             b"",
             bytes,
             std::io::sink(),
-            crate::attachment::Expect::default(),
+            // The length a blob of this size could hold, so that the chunks are opened at all.
+            crate::attachment::Expect::length(
+                crate::attachment::padded_len_of(bytes.len() as u64).map_or(0, |padded| padded - 1),
+            ),
         );
     }
 }

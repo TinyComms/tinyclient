@@ -20,6 +20,18 @@
 //! context. Both directions hold two chunks in memory (the next one is read to know whether the
 //! current one is the last) and nothing else, so memory does not grow with the file.
 //!
+//! **Size padding (Padme).** The size of what is sealed is [`padme`] of the file's length plus
+//! one: the padding of Nikitin, Barman, Lueks, Underwood, Hubaux and Ford, "Reducing Metadata
+//! Leakage from Encrypted Files and Communication with PURBs" (PETS 2019), Algorithm 1, which
+//! rounds a length up so that, below its top bit `E`, only `floor(log2 E)` more bits may be set.
+//! That leaks O(log log L) bits of the size for under 12% more bytes (11.6% at worst, at 129
+//! bytes; usually far less), where a power of two would cost up to 100%. The padding itself is
+//! the ISO/IEC 7816-4 kind (NIST SP 800-38A, appendix A): one `0x80` byte, then zero bytes, so
+//! the end of the file is never in doubt, even if the file ends in zeros. The true length travels
+//! only inside the message ([`crate::envelope::AttachmentRef::bytes`]), and [`open`] needs it: it
+//! writes exactly that many bytes, and refuses the blob unless the padding is exactly what that
+//! length gives, so any other length is refused.
+//!
 //! **Plaintext leaves chunk by chunk, before the end of the blob has been seen.** A blob cut at a
 //! chunk boundary fails only at its end. So the writer a caller passes to [`open`] receives data
 //! that may still turn out to be a prefix: a caller that gets an error must discard everything
@@ -121,36 +133,110 @@ impl Header {
     }
 }
 
-/// What sealing produced; `sha256` and the lengths go in the message's attachment entry.
+/// What sealing produced; `sha256` and `plain_len` go in the message's attachment entry
+/// (`sha256` and `bytes`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SealInfo {
     /// SHA-256 of the whole sealed blob, header included: what the server stores.
     pub sha256: [u8; 32],
     pub sealed_len: u64,
+    /// The file's true length. Only the message carries it.
     pub plain_len: u64,
+    /// What was sealed: the file and its padding, [`padded_len`] of `plain_len`.
+    pub padded_len: u64,
 }
 
-/// The length of the sealed blob for `plain_len` bytes of file, at 64 KiB chunks.
-pub fn sealed_len(plain_len: u64) -> u64 {
+/// The first padding byte; the rest are zero.
+const PAD_MARK: u8 = 0x80;
+
+/// How many bytes are sealed for a file of `plain_len` bytes: [`padme`] of `plain_len + 1`, so
+/// that there is room for at least the padding's first byte.
+pub fn padded_len(plain_len: u64) -> Option<u64> {
+    padme(plain_len.checked_add(1)?)
+}
+
+/// Padme (Nikitin et al., PETS 2019, Algorithm 1): `len` rounded up so that, below its highest
+/// set bit `E`, only `floor(log2 E)` more bits may be set. Lengths 0 and 1 stay as they are.
+/// `None` only for a length within 2^57 of `u64::MAX`, which no file is.
+pub fn padme(len: u64) -> Option<u64> {
+    if len < 2 {
+        return Some(len);
+    }
+    let e = u64::from(63 - len.leading_zeros()); // floor(log2 len), at least 1
+    let s = u64::from(64 - e.leading_zeros()); // floor(log2 e) + 1
+    let mask = (1u64 << (e - s)) - 1;
+    len.checked_add(mask).map(|rounded| rounded & !mask)
+}
+
+/// The length of the STREAM blob for `content_len` bytes sealed, at 64 KiB chunks.
+fn stream_len(content_len: u64) -> u64 {
     let chunk = 1u64 << CHUNK_LOG2;
-    // A file of exact multiples still ends in a full last chunk; an empty file has one empty chunk.
-    let chunks = (plain_len / chunk) + 1;
-    let chunks = if plain_len > 0 && plain_len.is_multiple_of(chunk) {
+    // Exact multiples still end in a full last chunk; nothing at all is one empty chunk.
+    let chunks = (content_len / chunk) + 1;
+    let chunks = if content_len > 0 && content_len.is_multiple_of(chunk) {
         chunks - 1
     } else {
         chunks
     };
-    HEADER_LEN as u64 + plain_len + chunks * TAG_LEN as u64
+    HEADER_LEN as u64 + content_len + chunks * TAG_LEN as u64
 }
 
-/// What `sealed_len` inverts: the plaintext length of a blob of this size, or `None` if no file
-/// seals to this size.
-pub fn plain_len_of(sealed_len_value: u64) -> Option<u64> {
+/// The length of the sealed blob for a file of `plain_len` bytes, padding included, at 64 KiB
+/// chunks: what the server sees. `None` for a length that cannot be padded.
+pub fn sealed_len(plain_len: u64) -> Option<u64> {
+    padded_len(plain_len).map(stream_len)
+}
+
+/// What a blob of this size holds once opened, padding included, or `None` if no padded file
+/// seals to this size. Many file lengths share each answer, which is the point.
+pub fn padded_len_of(sealed_len_value: u64) -> Option<u64> {
     let body = sealed_len_value.checked_sub(HEADER_LEN as u64)?;
     let full = (1u64 << CHUNK_LOG2) + TAG_LEN as u64;
     let chunks = body.div_ceil(full).max(1);
-    let plain = body.checked_sub(chunks * TAG_LEN as u64)?;
-    (sealed_len(plain) == sealed_len_value).then_some(plain)
+    let content = body.checked_sub(chunks * TAG_LEN as u64)?;
+    (content > 0 && stream_len(content) == sealed_len_value && padme(content) == Some(content))
+        .then_some(content)
+}
+
+/// The file, then `0x80` and zero bytes up to [`padded_len`] of the length read: the padded
+/// plaintext, made as it is read, so that sealing still holds no more than two chunks.
+struct Padded<R> {
+    inner: R,
+    read: u64,
+    /// Padding bytes still to give, once the file has ended, and how many there are in all.
+    padding: Option<(u64, u64)>,
+}
+
+impl<R: Read> Read for Padded<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        let (left, total) = match self.padding {
+            Some(padding) => padding,
+            None => {
+                let n = self.inner.read(buffer)?;
+                if n > 0 {
+                    self.read += n as u64;
+                    return Ok(n);
+                }
+                let padded = padded_len(self.read).ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "attachment too large")
+                })?;
+                let total = padded - self.read;
+                (total, total)
+            }
+        };
+        let n = usize::try_from(left)
+            .unwrap_or(usize::MAX)
+            .min(buffer.len());
+        buffer[..n].fill(0);
+        if n > 0 && left == total {
+            buffer[0] = PAD_MARK;
+        }
+        self.padding = Some((left - n as u64, total));
+        Ok(n)
+    }
 }
 
 /// Reads until `buffer` has `want` bytes or the reader is at its end.
@@ -185,8 +271,9 @@ fn first_aad(header: &[u8], context: &[u8]) -> Vec<u8> {
     aad
 }
 
-/// Seals everything `reader` yields into `writer`, with a fresh random nonce prefix. Memory is two
-/// 64 KiB buffers whatever the length.
+/// Seals everything `reader` yields, padded to [`padded_len`] of its length (see the module
+/// notes), into `writer`, with a fresh random nonce prefix. Memory is two 64 KiB buffers whatever
+/// the length.
 pub fn seal<R: Read, W: Write>(
     key: &AttachmentKey,
     context: &[u8],
@@ -213,16 +300,21 @@ pub fn seal_with_header<R: Read, W: Write>(
     key: &AttachmentKey,
     context: &[u8],
     header: Header,
-    mut reader: R,
+    reader: R,
     mut writer: W,
 ) -> Result<SealInfo> {
+    let mut reader = Padded {
+        inner: reader,
+        read: 0,
+        padding: None,
+    };
     let chunk = header.chunk_len();
     let header_bytes = header.to_bytes();
     let mut hasher = Sha256::new();
     io(writer.write_all(&header_bytes))?;
     hasher.update(header_bytes);
     let mut sealed_len = HEADER_LEN as u64;
-    let mut plain_len = 0u64;
+    let mut padded = 0u64;
 
     let aad_first = first_aad(&header_bytes, context);
     let mut encryptor = Some(EncryptorBE32::from_aead(
@@ -240,7 +332,7 @@ pub fn seal_with_header<R: Read, W: Write>(
             fill(&mut reader, &mut next, chunk)?;
             next.is_empty()
         };
-        plain_len += current.len() as u64;
+        padded += current.len() as u64;
         let aad: &[u8] = if first { &aad_first } else { &[] };
         if last {
             encryptor
@@ -265,21 +357,37 @@ pub fn seal_with_header<R: Read, W: Write>(
         first = false;
     }
     io(writer.flush())?;
+    if padded_len(reader.read) != Some(padded) {
+        // `Padded` ends exactly there; anything else is a bug, not a file to send.
+        return Err(Error::Io("the padding did not end where it should".into()));
+    }
     Ok(SealInfo {
         sha256: hasher.finalize().into(),
         sealed_len,
-        plain_len,
+        plain_len: reader.read,
+        padded_len: padded,
     })
 }
 
-/// What a caller already knows about a blob and wants checked while it is opened.
-#[derive(Debug, Clone, Copy, Default)]
+/// What the message says about a blob, checked while it is opened.
+#[derive(Debug, Clone, Copy)]
 pub struct Expect<'a> {
     /// SHA-256 of the sealed blob, from the message. Checked, in constant time, once the whole
     /// blob has been read.
     pub sha256: Option<&'a [u8; 32]>,
-    /// Length of the plaintext, from the message.
-    pub plain_len: Option<u64>,
+    /// The file's true length, from the message (`bytes`). Required: it is what tells the file
+    /// from its padding. Exactly this many bytes reach the writer.
+    pub plain_len: u64,
+}
+
+impl<'a> Expect<'a> {
+    /// Only the length, no hash to compare.
+    pub fn length(plain_len: u64) -> Expect<'a> {
+        Expect {
+            sha256: None,
+            plain_len,
+        }
+    }
 }
 
 /// What opening produced.
@@ -289,9 +397,12 @@ pub struct OpenInfo {
     pub plain_len: u64,
 }
 
-/// Opens a sealed blob from `reader` into `writer`, chunk by chunk. Any wrong key, wrong
-/// `context`, changed bit, cut, reorder or repeat is [`Error::Authentication`]. See the module
-/// notes: on an error the bytes already written are not to be used.
+/// Opens a sealed blob from `reader` into `writer`, chunk by chunk, and writes its first
+/// `expect.plain_len` bytes: the file without its padding. Any wrong key, wrong `context`, changed
+/// bit, cut, reorder or repeat is [`Error::Authentication`]; so is a padded size that is not
+/// [`padded_len`] of `expect.plain_len`, or padding other than `0x80` then zeros at that length
+/// (both mean a wrong length). See the module notes: on an error the bytes already written are not
+/// to be used.
 pub fn open<R: Read, W: Write>(
     key: &AttachmentKey,
     context: &[u8],
@@ -309,6 +420,8 @@ pub fn open<R: Read, W: Write>(
         header_bytes.copy_from_slice(&buffer);
     }
     let header = Header::parse(&header_bytes)?;
+    let plain_len = expect.plain_len;
+    let padded = padded_len(plain_len).ok_or(Error::Malformed("attachment length"))?;
     let sealed_chunk = header.chunk_len() + TAG_LEN;
     let mut hasher = Sha256::new();
     hasher.update(header_bytes);
@@ -325,7 +438,10 @@ pub fn open<R: Read, W: Write>(
         // Not even one tag: a blob cut inside its only chunk, or inside the header's follower.
         return Err(Error::Authentication);
     }
-    let mut plain_len = 0u64;
+    // Bytes decrypted so far, and the OR of every padding byte's difference from what it must
+    // be (`0x80` first, then zeros): zero when the padding is right.
+    let mut content = 0u64;
+    let mut stray = 0u8;
     let mut first = true;
     loop {
         hasher.update(&*current);
@@ -353,8 +469,24 @@ pub fn open<R: Read, W: Write>(
                 .decrypt_next_in_place(aad, &mut *current)
                 .map_err(|_| Error::Authentication)?;
         }
-        io(writer.write_all(&current))?;
-        plain_len += current.len() as u64;
+        let file_left = plain_len.saturating_sub(content);
+        let take = usize::try_from(file_left)
+            .unwrap_or(usize::MAX)
+            .min(current.len());
+        io(writer.write_all(&current[..take]))?;
+        for (at, byte) in current[take..].iter().enumerate() {
+            let expected = if content + (take + at) as u64 == plain_len {
+                PAD_MARK
+            } else {
+                0
+            };
+            stray |= byte ^ expected;
+        }
+        content += current.len() as u64;
+        if content > padded {
+            // More than the message's length pads to: the wrong length, or the wrong blob.
+            return Err(Error::Authentication);
+        }
         if last {
             break;
         }
@@ -368,10 +500,7 @@ pub fn open<R: Read, W: Write>(
             return Err(Error::Authentication);
         }
     }
-    if expect
-        .plain_len
-        .is_some_and(|expected| expected != plain_len)
-    {
+    if content != padded || stray != 0 {
         return Err(Error::Authentication);
     }
     Ok(OpenInfo { sha256, plain_len })
@@ -401,7 +530,7 @@ pub fn open_verified<R: Read + Seek, W: Write>(
     mut reader: R,
     writer: W,
     sha256: &[u8; 32],
-    plain_len: Option<u64>,
+    plain_len: u64,
 ) -> Result<OpenInfo> {
     io(reader.seek(SeekFrom::Start(0)))?;
     let actual = sha256_of(&mut reader)?;

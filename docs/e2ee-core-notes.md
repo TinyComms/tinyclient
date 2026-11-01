@@ -179,6 +179,11 @@ here rests on the cross-signature chain, not on lifetimes.
   server's 20 KiB `CIPHERTEXT_MAX`. OpenMLS has no setter for one field of a group's
   configuration, so the crate changes `padding_size` through the configuration's serialized form
   and checks the rest is kept.
+* **A refused message spends nothing.** OpenMLS stores the advanced secret tree once a ciphertext
+  opens, before it checks the signature, so `decrypt` copies the provider's storage first and puts
+  it back on any refusal (a bad signature, a sender or kind other than the row claims, an envelope
+  that does not parse). The copy is of the whole storage, once per message, the same order of cost
+  as the state write that follows a message that opens; it is zeroed when dropped.
 * **Safety number.** `safety::safety_number` reuses DAVE's pairwise fingerprint and displayable code
   from `davey` (the same construction `mediad` uses for calls). DAVE has one key per person, a person
   here has a set of devices, so each person's input is `SHA-256("tiny-e2ee-v1 safety" || user_id ||
@@ -262,19 +267,21 @@ What the numbers say, and no more:
 
 ## 5. Tests
 
-`cargo test -p e2ee`: 90 tests in 8 files, all pass (about 30 s, 22 of it the 64 MiB memory test).
+`cargo test -p e2ee`: 100 tests, 99 in 8 files and 1 unit test, all pass (most of the time is the
+64 MiB memory test).
 `cargo clippy -p e2ee --all-targets` is clean; `cargo fmt -p e2ee -- --check` passes (this crate is
 formatted with rustfmt's defaults; the rest of the repository is not, and was not touched).
 
 | File | Tests | What |
 |---|---|---|
-| `groups.rs` | 28 | Real openmls groups: 3 and 20 devices through add, remove, commit and epoch change; removed device reads nothing later, new device nothing earlier; replay, tamper (bytes flipped, cut, forgeries do not spend the real key), wrong sender, kind or target relabelled, edit authorship; ghost device (no cross-signature, forged signature, borrowed id); proposals not from the pinned key; Remove of a non-member; the three proposals encodings; pending Remove blocks sending, the removed device cannot commit and is evicted; two commits one epoch; repeated and own commits; commit confirmed by the feed after a lost answer; commit in flight survives a restart; server key change (also in the Welcome) and re-pin; epoch backwards (server shows lower, rewritten history); a commit that adds an unknown device is held until known; a Welcome with unknown members does not spend the key package; last-resort key package serves two groups; forged commits (new key under the old name, new credential, new external sender, an Add by value); the commit and Welcome shapes the server checks, and the server's size limits; replayed Welcome; commits older than the remembered ones; key package fields |
-| `identity.rs` | 11 | Cross-signature bytes and verification (and every way to misapply one); first device, chains, order; invented, forged, replayed and borrowed devices; key changed; revocation; new identity; malformed entries; safety number |
-| `attachments.rs` | 15 | Round trip at 0, 1, 15-17, 65535, 65536, 65537, 131071-131073, 1 MiB and 10 MiB; the blob rebuilt by hand from AES-256-GCM to pin the nonce layout; truncation at every kind of boundary; reorder, repeat, drop, append; bit flips; wrong key, wrong context; header size bytes; expected hash and length; hash checked before decrypting; temp file private, removed on every failure; stale temp sweep; failing reader and writer; keys |
+| `groups.rs` | 32 | Real openmls groups: 3 and 20 devices through add, remove, commit and epoch change; removed device reads nothing later, new device nothing earlier; replay, tamper (bytes flipped, cut), a forgery that opens under another member's key with a bad signature does not spend the real message's key, a refused message spends nothing, wrong sender, kind or target relabelled, edit authorship; ghost device (no cross-signature, forged signature, borrowed id); proposals not from the pinned key; Remove of a non-member; the three proposals encodings; pending Remove blocks sending, the removed device cannot commit and is evicted; two commits one epoch; repeated and own commits; commit confirmed by the feed after a lost answer; commit in flight survives a restart; server key change (also in the Welcome) and re-pin; epoch backwards (server shows lower, rewritten history); a commit that adds an unknown device is held until known; a Welcome with unknown members does not spend the key package; last-resort key package serves two groups; forged commits (new key under the old name, new credential, new external sender, an Add by value); the commit and Welcome shapes the server checks, and the server's size limits; replayed Welcome; commits older than the remembered ones; key package fields; a bad commit at our epoch leaves our commit in flight, and a valid one drops it; junk at an old epoch does not freeze; messages padded to the 256 B to 16 KiB buckets (equal sizes within a bucket, the padding stripped, under the server's 20 KiB limit) |
+| `identity.rs` | 12 | Cross-signature bytes and verification (and every way to misapply one); first device, chains, order; invented, forged, replayed and borrowed devices; key changed; revocation; a device revoked on the same list cannot sign in a new one; new identity; malformed entries; safety number |
+| `attachments.rs` | 18 | Round trip at 0, 1, 15-17, 65535, 65536, 65537, 131071-131073, 1 MiB and 10 MiB; the blob rebuilt by hand from AES-256-GCM to pin the nonce layout and the padding; Padme against worked values; nearby sizes seal to one size; the true length is needed and every other length is refused, also for files that end in zeros or in 0x80 and zeros; truncation at every kind of boundary; reorder, repeat, drop, append; bit flips; wrong key, wrong context; header size bytes; expected hash and length; hash checked before decrypting; temp file private, removed on every failure; stale temp sweep; failing reader and writer; keys |
 | `attachment_memory.rs` | 1 | Peak heap 128 KiB over 1, 8 and 64 MiB, seal and open |
 | `kat.rs` | 4 | **84 known-answer vectors** against the exact `Aes256Gcm` the crate uses: 50 NIST CAVP `gcmEncryptExtIV256` (96-bit IV, 128-bit tag, many lengths of plaintext and AAD), 10 NIST `gcmDecrypt256` (4 pass, 6 `FAIL`), 24 Wycheproof `aes_gcm_test.json` (AES-256, 96-bit IV, 128-bit tag; 14 valid, 10 invalid). Downloaded from csrc.nist.gov and C2SP/wycheproof, embedded in `tests/vectors/mod.rs` |
 | `envelope.rs` | 10 | The spec's example; message and edit round trips; unknown fields; bad types (28 cases); version; UTF-8; the 16 KiB limit both ways; counts and lengths; deep nesting |
-| `props.rs` | 11 | proptest: envelope round trip; arbitrary chunk-boundary and short reads and writes through seal and open; damaged blobs always refused; `sealed_len` inverts; never panicking on arbitrary bytes into the envelope decoder, the blob parsers, the small parsers, and every MLS parser; hostile varint prefixes; damaged real handshakes, Welcomes and ciphertexts do not stop the group |
+| `props.rs` | 12 | proptest: envelope round trip; arbitrary chunk-boundary and short reads and writes through seal and open; damaged blobs always refused; `sealed_len` inverts to the padded length; Padme never shrinks, adds under 12% and is a fixed point; never panicking on arbitrary bytes into the envelope decoder, the blob parsers, the small parsers, and every MLS parser; hostile varint prefixes; damaged real handshakes, Welcomes and ciphertexts do not stop the group |
+| `messaging.rs` (unit) | 1 | Changing a group's MLS padding keeps every other setting |
 | `store.rs` | 10 | State survives a restart; a failed write stops encrypt and key package creation, not a decrypt; authenticated, bound to name and key; no plaintext in the blob; caller-kept snapshot; file store; cache sealing bound to its row; redacted debug; `Send` |
 
 The proptest run used 40,000 cases per parser test once, with no escaped panic (ordinary runs use
@@ -305,7 +312,10 @@ the fuzz `Cargo.toml` so it builds the same versions as the workspace.
   when the engine is dropped; the snapshot's plaintext is built in a zeroing buffer but its
   intermediate strings are not. Device and attachment keys, the state key, the cache key and the
   chunk buffers are zeroed.
-* Attachment sizes are visible to the server.
+* Attachment sizes are visible to the server only as Padme buckets: the sealed blob is the file, a
+  `0x80` byte and zeros up to Padme of its length plus one (under 12% more bytes), and the true
+  length is only in the message. Files of very different sizes stay distinguishable, as the design
+  says they must. The number of attachments per message is visible.
 * The local cache helper seals a value; the schema, the key's place in the keychain and the
   retention of decrypted text are the caller's.
 
@@ -315,6 +325,9 @@ the fuzz `Cargo.toml` so it builds the same versions as the workspace.
 * The safety number: DAVE's construction composed with the per-person digest of a device set.
 * The sealed blob: STREAM BE32 with the AAD on the first chunk only (as the spec says); `context`.
   Is first-chunk-only enough where all-chunks is as cheap? A reviewer may prefer all chunks.
+* The attachment padding: Padme (PETS 2019) of the length plus one, filled with ISO/IEC 7816-4
+  padding (`0x80`, zeros) inside the STREAM plaintext, the true length checked against it on open.
+* Message padding through MLS's `padding_size`, set per message to the envelope's bucket plus 128.
 * The authenticated data that binds `kind` and `target_id` (1.2).
 * The commit and Welcome vetting rules in `groups.rs` (what a member may and may not commit; the
   roster check; the key package given back on a refused Welcome, which writes OpenMLS's storage

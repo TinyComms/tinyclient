@@ -99,7 +99,7 @@ fn sealing_and_opening_hold_a_bounded_amount_whatever_the_size() {
                 b"mem",
                 sealed.as_slice(),
                 &mut sink,
-                Expect::default(),
+                Expect::length(len),
             )
             .unwrap();
             assert_eq!(opened.plain_len, len);

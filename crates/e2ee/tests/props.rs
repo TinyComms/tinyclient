@@ -119,10 +119,10 @@ proptest! {
         let sliced_info = attachment::seal_with_header(&key, b"ctx", header, Short::new(&plain, in_sizes), &mut sliced).unwrap();
         prop_assert_eq!(&sliced.out, &whole);
         prop_assert_eq!(info, sliced_info);
-        prop_assert_eq!(whole.len() as u64, attachment::sealed_len(len as u64));
+        prop_assert_eq!(Some(whole.len() as u64), attachment::sealed_len(len as u64));
 
         let mut opened = ShortWriter { out: Vec::new(), size: write_size };
-        let result = attachment::open(&key, b"ctx", Short::new(&whole, out_sizes), &mut opened, Expect { sha256: Some(&info.sha256), plain_len: Some(len as u64) }).unwrap();
+        let result = attachment::open(&key, b"ctx", Short::new(&whole, out_sizes), &mut opened, Expect { sha256: Some(&info.sha256), plain_len: len as u64 }).unwrap();
         prop_assert_eq!(result.plain_len, len as u64);
         prop_assert_eq!(opened.out, plain);
     }
@@ -136,17 +136,28 @@ proptest! {
         attachment::seal(&key, b"", plain.as_slice(), &mut sealed).unwrap();
         // Cut anywhere short of the whole.
         let cut_at = cut.index(sealed.len());
-        prop_assert!(attachment::open(&key, b"", Short::new(&sealed[..cut_at], sizes.clone()), std::io::sink(), Expect::default()).is_err());
+        prop_assert!(attachment::open(&key, b"", Short::new(&sealed[..cut_at], sizes.clone()), std::io::sink(), Expect::length(len as u64)).is_err());
         // Any one changed bit.
         let spot = at.index(sealed.len());
         let mut bad = sealed.clone();
         bad[spot] ^= 1 << (seed % 8);
-        prop_assert!(attachment::open(&key, b"", Short::new(&bad, sizes), std::io::sink(), Expect::default()).is_err());
+        prop_assert!(attachment::open(&key, b"", Short::new(&bad, sizes), std::io::sink(), Expect::length(len as u64)).is_err());
     }
 
     #[test]
-    fn sealed_len_inverts(plain in 0u64..(1 << 40)) {
-        prop_assert_eq!(attachment::plain_len_of(attachment::sealed_len(plain)), Some(plain));
+    fn sealed_len_inverts_to_the_padded_len(plain in 0u64..(1 << 40)) {
+        let padded = attachment::padded_len(plain).unwrap();
+        prop_assert_eq!(attachment::padded_len_of(attachment::sealed_len(plain).unwrap()), Some(padded));
+    }
+
+    /// Padme rounds up, by under 12% (the worst is 15 bytes on 129), and its output is a fixed
+    /// point.
+    #[test]
+    fn padme_rounds_up_by_little_and_is_stable(len in 0u64..(1 << 50)) {
+        let padded = attachment::padme(len).unwrap();
+        prop_assert!(padded >= len);
+        prop_assert!((padded - len) * 100 <= len * 12, "{} -> {}", len, padded);
+        prop_assert_eq!(attachment::padme(padded), Some(padded));
     }
 }
 

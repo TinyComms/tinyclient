@@ -374,7 +374,7 @@ fn attachment_throughput() {
                 std::io::sink(),
                 Expect {
                     sha256: Some(&info.sha256),
-                    plain_len: Some(len),
+                    plain_len: len,
                 },
             )
             .unwrap()
