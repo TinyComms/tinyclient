@@ -53,4 +53,10 @@ debug-assertions = false
 # after an Android app went to the background panicked ("GPU resources not available") and the
 # process aborted. Drop this when a gpui_ce_wgpu release resets `configured` in `destroy`.
 gpui_ce_wgpu = { path = "vendor/gpui_ce_wgpu" }
+# gpui_ce_ios 0.3.0 with one fix (vendor/gpui_ce_ios, src/ios/text_input.rs, marked "tinyclient
+# patch"): UIKit (the keyboard, and accessibility clients such as the XCTest runner) sends
+# `textInRange:` and its siblings a nil range or position, which objc2 turned into a panic across
+# the Objective-C boundary and an abort at launch. The parameters are optional now and nil is "no
+# range". Drop this when a gpui_ce_ios release takes nil there.
+gpui_ce_ios = { path = "vendor/gpui_ce_ios" }
 curve25519-dalek = { git = "https://github.com/signalapp/curve25519-dalek", tag = "signal-curve25519-4.1.3" }

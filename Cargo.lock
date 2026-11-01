@@ -3687,8 +3687,6 @@ dependencies = [
 [[package]]
 name = "gpui_ce_ios"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "380935ab92414a1c1c054e3a217b032a0012d1128c662e94005785cfd8cf7086"
 dependencies = [
  "accesskit_ios",
  "anyhow",
