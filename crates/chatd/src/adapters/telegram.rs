@@ -351,10 +351,11 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
                 &ctx,
                 inbox,
                 PACE,
-                |id| {
-                    if let Some(account) = account() {
-                        sync::backfill(&account, id);
-                    }
+                |id| match account() {
+                    Some(account) => sync::backfill(&account, id),
+                    // The link is down. The store holds its answer already and the ask waits
+                    // for the next connect, where it fills what was opened.
+                    None => held_back(id.to_owned()),
                 },
                 |command| match account() {
                     Some(account) => serve(&account, command),
@@ -419,6 +420,11 @@ fn connect(ctx: &Context, saved: &Saved, current: &Mutex<Option<Arc<Account>>>) 
     }
     ctx.link(Link::Connected);
     account.keep_session();
+    // The asks the link was down for go before anything else: the user's open stands, and
+    // the chats the sign-on read have the rows the ask refers to.
+    for id in held_take() {
+        sync::backfill(&account, &id);
+    }
     // Telegram fades an account to offline by itself, so being here is said on opening the
     // connection and then on a cadence while it lives; `here` keeps it to one call per
     // HERE_EVERY however often it is asked. The event loop is otherwise idle, so its wait is
@@ -450,6 +456,33 @@ fn connect(ctx: &Context, saved: &Saved, current: &Mutex<Option<Arc<Account>>>) 
         Err(fault) if fault.signed_out() => Failure::SignedOut("Telegram ended this session.".to_owned()),
         _ => Failure::Dropped(ended),
     }
+}
+
+#[derive(Default)]
+struct Held {
+    /// Ids of conversations to fill, newest last; one read twice is still one look.
+    backs: VecDeque<String>,
+}
+
+/// Asks the shell made while the link was down, that the network hears at the next
+/// connect: the conversation the user opened, whose store answer remains until then. One
+/// ask once, at most this many, and gone the moment the session ends (a sign-out), so
+/// nothing held outlives the account it was asked for.
+static HELD: Mutex<Held> = Mutex::new(Held { backs: VecDeque::new() });
+
+const HELD_BACKS: usize = 32;
+
+fn held_back(id: String) {
+    let mut held = HELD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    held.backs.retain(|held| *held != id);
+    held.backs.push_back(id);
+    while held.backs.len() > HELD_BACKS {
+        held.backs.pop_front();
+    }
+}
+
+fn held_take() -> VecDeque<String> {
+    std::mem::take(&mut HELD.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).backs)
 }
 
 /// Answers a command while there is no connection.
@@ -587,7 +620,9 @@ fn serve(account: &Arc<Account>, command: Command) {
             let _ = reply.send(link.ok_or(Refusal::Unsupported));
         }
         Command::SignOut(reply) => {
-            // Ends the session on Telegram, so the device list no longer shows it.
+            // Ends the session on Telegram, so the device list no longer shows it. What the
+            // link was down for belongs to this session and not the next.
+            held_take();
             let _ = account.ask(&tl::functions::auth::LogOut {});
             let _ = reply.send(Ok(()));
         }

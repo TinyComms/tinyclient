@@ -765,6 +765,9 @@ impl World {
             "notify-changed" => vec![update(
                 tl::types::UpdateNotifySettings { peer: tl::enums::NotifyPeer::NotifyBroadcasts, notify_settings: settings(None) }.into(),
             )],
+            // The link goes down and chatd reconnects when it is back, without the session
+            // earning its end: what Telegram carried before stands on the list.
+            "drop" => vec![Event::Closed("closed".to_owned())],
             "revoke" => {
                 self.revoked = true;
                 vec![Event::Closed("the session was ended from another device".to_owned())]

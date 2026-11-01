@@ -544,6 +544,19 @@ fn a_chat_pinned_by_a_folder_beyond_the_pages_gets_its_row() {
 }
 
 #[test]
+fn a_forum_opened_while_the_link_was_down_comes_back_at_the_next_connect() {
+    let world = World::signed_in();
+    world.connected();
+    // Telegram drops. The user opens the forum while it is down, nothing leaves chatd, the
+    // store keeps its empty answer, and the ask stands held for the next connect, which
+    // hears of it and fills the list.
+    world.steer("drop");
+    let _ = world.messages("c9002");
+    world.until("the forum's topics to be asked again", || (world.called("GetForumTopics c9002") >= 1).then_some(()));
+    world.until("the topics on the list", || world.conversation("c9002_1").map(|_| ()));
+}
+
+#[test]
 fn a_read_lost_on_the_way_is_told_again_and_the_badge_stays() {
     let world = World::signed_in();
     world.connected();
