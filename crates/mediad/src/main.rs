@@ -437,6 +437,24 @@ fn main() -> ExitCode {
                 }
             };
         }
+        // S13: checks a sound file the user chose and saves it beside the database.
+        Some("--import-sound") => {
+            let mut args = env::args().skip(2);
+            let (Some(source), Some(id)) = (args.next(), args.next()) else {
+                eprintln!("mediad: --import-sound needs a file and an id");
+                return ExitCode::from(2);
+            };
+            let dir = protocol::support_dir();
+            return match mediad::alert::import(&source, &id, &dir) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(err) => {
+                    // The shell shows this line as it is.
+                    println!("{err}");
+                    tracing::warn!("mediad: import: {err}");
+                    ExitCode::from(1)
+                }
+            };
+        }
         // Settings' microphone test and test sound, with no call (`probe`).
         Some("test") => {
             mediad::probe::run();

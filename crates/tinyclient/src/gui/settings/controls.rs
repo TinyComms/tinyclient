@@ -8,6 +8,10 @@ use gpui::{div, prelude::*, px, Div, ElementId, Hsla, Rgba, SharedString, Statef
 
 /// The content column.
 pub const COLUMN: f32 = 480.;
+/// Every menu button. One width, so a short name and a long one share a column.
+pub const POPUP_WIDTH: f32 = 220.;
+/// About's action buttons. Wide enough for "Show in File Explorer".
+pub const ABOUT_ACTION: f32 = 168.;
 /// The space kept left of every control that has a default, for its reset button.
 pub const RESET_SLOT: f32 = 28.;
 pub const TRACK: f32 = 200.;

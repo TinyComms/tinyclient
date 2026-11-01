@@ -52,10 +52,12 @@ pub const ROWS: &[Row] = &[
     row("N11", Notifications, "Attention", crate::host::BADGE_LABEL, &[], &["badge", "count", "number", "unread", "dock", "taskbar"]),
     row("N13", Notifications, "Test", "Send a test notification", &[], &["test", "try", "check", "preview"]),
     row("S1", Sounds, "", "Play sounds", &[], &["sound", "audio", "mute", "silent", "ding", "chime", "beep"]),
-    row("S2", Sounds, "Notification sounds", "Message sound", &["Pebble", "Drop", "Tap", "Chime", "Glass", "None"], &["ding", "chime", "tone", "sound for messages", "message sound"]),
-    row("S3", Sounds, "Notification sounds", "Mention sound", &["Same", "Pebble", "Drop", "Tap", "Chime", "Glass", "None"], &["ding", "mention", "tone"]),
-    row("S4", Sounds, "Notification sounds", "Ring", &["Soft ring", "Classic ring", "None"], &["ringtone", "call", "phone"]),
+    row("S2", Sounds, "Notification sounds", "Message sound", &["Pebble", "Drop", "Tap", "Chime", "Glass", "Marimba", "Bell", "None"], &["ding", "chime", "tone", "sound for messages", "message sound"]),
+    row("S3", Sounds, "Notification sounds", "Mention sound", &["Same as messages", "Pebble", "Drop", "Tap", "Chime", "Glass", "Marimba", "Bell", "None"], &["ding", "mention", "tone"]),
+    row("S4", Sounds, "Notification sounds", "Ring", &["Soft ring", "Classic ring", "Ripple", "None"], &["ringtone", "call", "phone"]),
     row("SV", Sounds, "Notification sounds", "Notification volume", &[], &["volume", "loud", "quiet", "sound"]),
+    row("S13", Sounds, "Your sounds", "Add a sound…", &[], &["custom", "custom sound", "custom sounds", "sound file", "import", "add", "my sound", "audio"]),
+    row("S14", Sounds, "Calls", "Ring back while I'm calling someone", &[], &["ringback", "ring back", "calling", "dial", "tone"]),
     row("A2", Appearance, "", "Text size", &["13 pt", "14 pt", "15 pt", "16 pt", "17 pt"], &["font", "bigger", "smaller", "zoom", "large"]),
     row("A3", Appearance, "", "Density", &["Comfortable", "Compact"], &["rows", "dense", "spacing", "compact"]),
     row("A4", Appearance, "", "Show message previews in the list", &[], &["preview", "screen sharing", "privacy", "list"]),
@@ -104,8 +106,6 @@ pub const NOT_YET: &[(&str, &str)] = &[
     ("proxy", "tinyclient has no proxy setting yet."),
     ("socks", "tinyclient has no proxy setting yet."),
     ("reaction", "tinyclient does not notify about reactions yet."),
-    ("custom sound", "tinyclient plays only its own sounds for now."),
-    ("sound file", "tinyclient plays only its own sounds for now."),
     ("login", "tinyclient has no open-at-login setting yet."),
     ("startup", "tinyclient has no open-at-login setting yet."),
     ("launch", "tinyclient has no open-at-login setting yet."),
@@ -209,7 +209,7 @@ pub fn draws_label(id: &str) -> bool {
 pub fn kept_by_chatd(id: &str) -> bool {
     matches!(
         id,
-        "N1" | "N2" | "ND" | "NG" | "NM" | "NT" | "N4" | "NL" | "N5" | "N6" | "N7" | "N8" | "N9" | "N10" | "N11" | "N13" | "S2" | "S3" | "S4" | "SV"
+        "N1" | "N2" | "ND" | "NG" | "NM" | "NT" | "N4" | "NL" | "N5" | "N6" | "N7" | "N8" | "N9" | "N10" | "N11" | "N13" | "S2" | "S3" | "S4" | "SV" | "S13" | "S14"
             | "G2" | "S1" | "S7" | "S8" | "S9" | "S10" | "P1" | "P2" | "P4" | "PE" | "V1" | "V2" | "V3" | "V4" | "V5" | "V6" | "V8" | "V10" | "V11" | "V12" | "V13" | "V14" | "V15" | "V16" | "V17" | "V19" | "D1" | "D2" | "D3"
     )
 }
@@ -342,10 +342,14 @@ mod tests {
         assert!(search("proxy").is_empty());
         assert_eq!(not_yet("proxy"), Some("tinyclient has no proxy setting yet."));
         // The words people reach for, not only the names in the product doc.
-        for words in ["launch", "start at login", "autostart", "reactions", "custom sound"] {
+        for words in ["launch", "start at login", "autostart", "reactions", "spell"] {
             assert!(search(words).is_empty(), "{words} finds a row");
             assert!(not_yet(words).is_some(), "{words} gets no line");
         }
+        // Sounds of your own are built now: the words reach the row that adds one.
+        assert_eq!(not_yet("custom sound"), None);
+        assert_eq!(not_yet("sound file"), None);
+        assert!(search("custom sound").iter().any(|row| row.id == "S13"));
         assert_eq!(not_yet("zzz"), None);
     }
 
@@ -421,3 +425,4 @@ mod tests {
         }
     }
 }
+

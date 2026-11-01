@@ -34,7 +34,7 @@ chatd keeps the notification, sound, privacy, voice, and storage values. The she
 | N3 per-account notify menu | Not a row. ND, NG, NM, and NT are global. chatd can store an account-level notify word; the window does not show N3. |
 | N14, N15 | No reaction or thread-follow notify control. |
 | S5, S6 pickers | chatd will honor an account or conversation sound if one is stored. No row was found that writes them. |
-| S13 custom files, S14 ring-back | Not offered. |
+| S13 custom files, S14 ring-back | Both are in: sounds of your own in every picker, and a ring back while you call. |
 | M6 spellcheck, P5 screen-share hide, P6 Touch ID, P7 Signal relay | In `NOT_YET` or absent. |
 | V7 camera device | "tinyclient has no camera yet." A Tiny call can still toggle the camera from the call dock. That is `06-calls.md`. |
 | V9 per-person volume | `CallGain` on a Tiny participant row, not a Settings row. |
@@ -82,7 +82,7 @@ The owner asked for sound and for breadth. These earlier rules change, on purpos
 | --- | --- | --- |
 | "In-app sounds" deliberately absent | design 06 §Deliberately absent | In-call cues play in mediad on the call's own output (S7 to S10). Message sounds still go through the system notification. |
 | "A ringtone or call sounds of our own" absent | design 07 §135 | One bundled ring, at most 4 s, played by the notification (S4). In-call cues as above. |
-| "Custom sounds" absent | design 08 §Deliberately absent | A choice of bundled sounds is in the window. Files of your own are not offered. |
+| "Custom sounds" absent | design 08 §Deliberately absent | A choice of bundled sounds is in the window, and files of your own (S13). |
 | One sound, the system default | design 06 §6 | A sound picker: five message sounds, two rings, or None. "System alert sound" is not a choice in 0.2.35. |
 | Dock bounce absent | design 06 §Deliberately absent | An option, default Off (N10). |
 | Media cache default 1 GB | design 08 §5 | 500 MB, matching `07-budgets-and-risk.md` §6 and `CACHE_BYTES`. |
@@ -185,8 +185,8 @@ The full sound design is in the next section. The controls:
 | S10 | Call sound volume | Slider 0 to 100 % | 50 % | G | d | Gain on the cues in S7 to S9 only. Voices are not affected | in |
 | S11 | Play | A small play button beside S2, S3, S4 | | | | Plays that sound once, on the device the notification would use (below). S5 is not a row. | in |
 | S12 | Play test sound | Button beside S10 | | | | mediad plays the join cue at S10's volume on the call speaker (V2) | in |
-| S13 | Add a sound file… | Picker entry | | G | d | | Later (spike) |
-| S14 | Ring-back while I am calling someone | Switch | | G | d | | Later |
+| S13 | Add a sound file… | Settings row and a picker entry | | G | d | WAV, MP3, M4A, OGG, FLAC or AIFF, up to 30 s. Listed in every picker under "Your sounds". | in |
+| S14 | Ring-back while I am calling someone | Switch | On | G | d | Plays S4 quietly, repeating, until they answer or you cancel. | in |
 
 S7–S10 live in the Voice section of the window. SV, notification volume, is hidden on macOS, where the OS owns alert volume. Caption under S2 to S4: "Notification sounds use the alert volume in System Settings › Sound." There is no "System alert sound" choice.
 
@@ -336,20 +336,36 @@ from any conversation. The OS then applies Focus, its own mute and the app's sou
 - Cues: S10, because they share the call's output and must sit under voices at the user's taste.
 - Voices: V5.
 
-### Custom files (Later, spike first)
+### Custom files (S13)
 
-"Add a sound file…" accepts `.aiff`, `.wav` or `.caf` up to 30 s and 1 MB, checked by header
-only, copied to `~/Library/Sounds/tinyclient-<hash>.<ext>` and added to every sound picker. The
-spike: does `UNNotificationSound(named:)` find a file there for a non-sandboxed, signed app on
-macOS 13 to 26. If it does, this is about 100 lines and 0 bytes at rest. If it does not, there is
-no honest way without in-app audio, and it stays out.
+"Add a sound file…" accepts WAV, MP3, M4A, OGG, OPUS, FLAC or AIFF up to 30 s and 40 MB. mediad
+decodes it, refuses silence and files past 30 s, brings it to one peak (-14 dBFS), fades both
+ends and writes it as mono 16-bit WAV in the sounds directory beside the database
+(`sounds/<hash>.wav`, the hash being the file's first sixteen SHA-256 digits, so a name chosen by
+the user never reaches a path). The row is kept in the settings table as a `sound:<hash>` scope;
+the pickers list every one under "Your sounds", up to twelve. Adding the same file twice finds
+the same hash and replaces its name rather than listing it twice. Removing one takes its file
+with it and returns any picker that chose it to its default.
+
+A sound with no file of its own that macOS knows — a custom file, and Marimba, Bell and Ripple —
+is played by chatd through `mediad --sound` with the notification itself silent, so it works with
+the window closed. The seven older bundled sounds still ride the macOS notification, so Focus and
+the alert device apply to them.
+
+### Ring back (S14, on)
+
+While an outgoing call says "Ringing…", chatd plays S4's ring through `mediad --sound` with
+`--repeat 2000 --for 62`: the 4 s ring, a 2 s breath, repeating, at the notification volume. It
+stops the instant the call answers, fails or is cancelled. S1 off silences it; S4 None rings back
+as nothing.
 
 ### Windows and Linux
 
-Same rules, mapped where the OS allows. Windows toasts can play only the system's
-`ms-winsoundevent` sounds from an unpackaged app, so the pickers list those plus "None". Linux
-uses the `sound-name` hint from the freedesktop sound theme, or "None" through `suppress-sound`.
-Where a platform cannot honour a control, the control is not shown on that platform.
+Same rules, mapped where the OS allows. Chatd plays every notification sound itself through
+mediad, because an unpackaged Windows toast can play only the system's own `ms-winsoundevent`
+sounds, and a freedesktop notification only names a theme's. The pickers therefore offer the
+same bundled sounds, and your own, on every platform. Where a platform cannot honour a control,
+the control is not shown on that platform.
 
 ## Search within Settings
 
@@ -543,8 +559,8 @@ Still absent, matching `NOT_YET` and the "Not in the window" table above. M5, V8
 | N14 Reaction notifications, N15 thread replies | No reaction or thread-follow notify control. |
 | N16 Focus filter | App Intents in a Rust bundle; check cost |
 | S5, S6 pickers | chatd reads the scopes. No writer was found in the window. |
-| S13 Custom sound files | Not offered. |
-| S14 Ring-back tone, longer looping ring | Not offered. |
+| S13 Custom sound files | Built: Settings › Sounds › Your sounds. |
+| S14 Ring-back tone, longer looping ring | Ring back is built; an optional looping ringtone is not. |
 | M6 Spellcheck | `NOT_YET`. |
 | P5 Hide from screen sharing | `NOT_YET`. |
 | P6 Touch ID lock | `NOT_YET`. |

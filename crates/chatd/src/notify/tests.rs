@@ -438,3 +438,48 @@ fn the_bundled_files_are_named_as_the_bundle_carries_them() {
 fn ours(sound: &str) -> Option<&str> {
     (!notifier::SYSTEM_PLAYS_SOUND).then_some(sound)
 }
+
+#[test]
+fn a_ring_back_plays_while_i_call_and_stops_when_the_settings_or_the_call_do() {
+    let values = Values::default();
+    assert_eq!(ringback_word(&values).as_deref(), Some("soft_ring"), "on by default");
+    let mut off = Values::default();
+    set(&mut off, GLOBAL, settings::RINGBACK, "off");
+    assert_eq!(ringback_word(&off), None, "S14 off is silence");
+    let mut quiet = Values::default();
+    set(&mut quiet, GLOBAL, settings::SOUNDS, "off");
+    assert_eq!(ringback_word(&quiet), None, "S1 off silences the ring back too");
+    let mut silent_ring = Values::default();
+    set(&mut silent_ring, GLOBAL, settings::RING_SOUND, "none");
+    assert_eq!(ringback_word(&silent_ring), None, "a ring of None rings back as nothing");
+    let mut chosen = Values::default();
+    set(&mut chosen, GLOBAL, settings::RING_SOUND, "classic_ring");
+    assert_eq!(ringback_word(&chosen).as_deref(), Some("classic_ring"), "the ring I chose rings them too");
+}
+
+#[test]
+fn a_sound_with_no_file_of_its_own_is_played_by_chatd_on_every_platform() {
+    // The seven shipped files ride a macOS notification. Anything added since, and any file
+    // the user brought, has no name the system knows, so chatd plays it itself.
+    assert_eq!(system_plays("pebble"), notifier::SYSTEM_PLAYS_SOUND);
+    assert_eq!(system_plays("soft_ring"), notifier::SYSTEM_PLAYS_SOUND);
+    assert!(!system_plays("marimba") && !system_plays("bell") && !system_plays("ripple"));
+    assert!(!system_plays("custom:0123456789abcdef"));
+    assert_eq!(sound_file("ripple"), None);
+}
+
+#[test]
+fn a_ring_with_the_window_in_focus_is_still_heard() {
+    // Its own card shows it, so no banner is posted. On macOS that would also mean no sound,
+    // and an incoming call in front of me would be silent.
+    let fake = Fake::default();
+    let mut notes = Notes::new(Box::new(fake.clone()));
+    let call = ringing(&key(Network::Slack, "D1"), "Ines Varga");
+    let values = Values::default();
+    let mut focused = moment();
+    focused.watching.focused = true;
+    let verdict = decide_ring(&values, &call.conversation, &focused).expect("a ring");
+    assert!(!verdict.banner);
+    assert_eq!(notes.call(Some(&call), Some(verdict), "", "Slack"), Some("soft_ring".to_owned()));
+    assert!(fake.log().shown.is_empty(), "the card is all the window shows");
+}
