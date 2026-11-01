@@ -1,7 +1,9 @@
 # tinyclient for Android — host skeleton
 
-This is the native shell around the Rust library. It contains no UI: `android.app.NativeActivity`
-loads `libtinyclient.so` and the Rust side draws everything. See `docs/mobile-build.md` for the
+This is the native shell around the Rust library. It contains no UI: `GpuiInputActivity`, a
+NativeActivity subclass in `app/src/main/java/dev/gpui/mobile`, loads `libtinyclient.so` and the
+Rust side draws everything. The subclass only carries the soft keyboard's text and the window
+insets to gpui_ce_mobile, which NativeActivity cannot. See `docs/mobile-build.md` for the
 full story and the verified/unverified split.
 
 ## What is here

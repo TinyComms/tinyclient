@@ -1,5 +1,6 @@
 //! `--shot … --demo`: a made-up chatd, so every screen can be drawn full of believable data
-//! without starting chatd or reading anyone's real chats. Compiled only with `gui-shot`.
+//! without starting chatd or reading anyone's real chats. Compiled with `gui-shot`, and with
+//! `demo` for phone proof builds, where it is on from launch (see `on`).
 //!
 //! It answers at the one door every request goes through (`client::ask_within`), so the window
 //! takes the same paths it takes with chatd: `Status`, the Inbox, the trees, pages of messages,
@@ -22,10 +23,16 @@ use protocol::{
 use std::sync::OnceLock;
 use std::time::Duration;
 
-/// `--demo` was passed: the made-up chatd answers instead of the real one.
+/// `--demo` was passed, or this is a `demo` build on a phone (which has no flags): the made-up
+/// chatd answers instead of the real one.
 pub fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::args().any(|arg| arg == "--demo" || arg == "--demo-empty"))
+    *ON.get_or_init(|| on_phone() || std::env::args().any(|arg| arg == "--demo" || arg == "--demo-empty"))
+}
+
+/// A `demo` build on Android or iOS: on from launch.
+fn on_phone() -> bool {
+    cfg!(all(feature = "demo", any(target_os = "android", target_os = "ios")))
 }
 
 fn empty() -> bool {
@@ -34,8 +41,40 @@ fn empty() -> bool {
 }
 
 /// Where the chatd demo keeps its pictures. Read from the source tree, as the demo itself does.
+#[cfg(not(all(feature = "demo", any(target_os = "android", target_os = "ios"))))]
 fn photo(name: &str) -> String {
     format!("{}/../chatd/src/demo/photos/{name}", env!("CARGO_MANIFEST_DIR"))
+}
+
+/// On a phone the source tree is not there, so the pictures are compiled in and written once to
+/// the app's support directory, where the window reads them like any downloaded file.
+#[cfg(all(feature = "demo", any(target_os = "android", target_os = "ios")))]
+fn photo(name: &str) -> String {
+    macro_rules! photos {
+        ($($file:literal),* $(,)?) => {
+            &[$(($file, include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../chatd/src/demo/photos/", $file)) as &[u8])),*]
+        };
+    }
+    static PHOTOS: &[(&str, &[u8])] = photos!(
+        "avatar-ana-ruiz.jpg", "avatar-dita-novak.jpg", "avatar-grandma-rosa.jpg", "avatar-halvard-eide.jpg",
+        "avatar-ines-marchetti.jpg", "avatar-kofi-asante.jpg", "avatar-mara-okafor.jpg", "avatar-priya-raman.jpg",
+        "avatar-robin-vale.jpg", "avatar-tomasz-brandt.jpg", "avatar-yusuf-demirci.jpg", "group-design-crit.webp",
+        "group-foray-carpool.webp", "icon-moss-lichen.webp", "icon-night-shift.webp", "logo-harbor-labs.png",
+        "moss-frost.webp", "preview-creek.webp", "weir-dawn.webp",
+    );
+    let dir = protocol::support_dir().join("demo-photos");
+    let path = dir.join(name);
+    if !path.exists() {
+        if let Some((_, bytes)) = PHOTOS.iter().find(|(file, _)| *file == name) {
+            let _ = std::fs::create_dir_all(&dir);
+            if let Err(err) = std::fs::write(&path, bytes) {
+                log::warn!("tinyclient demo: could not write {}: {err}", path.display());
+            }
+        } else {
+            log::warn!("tinyclient demo: no compiled-in picture {name}");
+        }
+    }
+    path.to_string_lossy().into_owned()
 }
 
 fn picture(id: &str, kind: MediaKind, name: &str, width: u32, height: u32) -> MediaFile {
@@ -726,6 +765,7 @@ fn premier() -> protocol::TinyCommunity {
         display_name: name.into(),
         role: role.into(),
         created_at: stamp(on_day(days, 12, 0)),
+        ..Default::default()
     };
     protocol::TinyCommunity {
         role: "owner".into(),
@@ -741,19 +781,27 @@ fn premier() -> protocol::TinyCommunity {
             expires_at: stamp(now() + 5 * 86_400),
             accepted_at: None,
             accepted_by: None,
+            ..Default::default()
         }],
         audit: Vec::new(),
         origin: "https://premier.example".into(),
         rooms: vec![
-            protocol::TinyRoom { id: "c-lobby".into(), name: "lobby".into(), participants: Vec::new() },
+            protocol::TinyRoom::new("c-lobby", "lobby"),
             protocol::TinyRoom {
-                id: "r-games".into(),
-                name: "game night".into(),
-                participants: vec![protocol::TinySeat { user_id: "halvard".into(), muted: false, deafened: false, speaking: false }],
+                participants: vec![protocol::TinySeat { user_id: "halvard".into(), ..Default::default() }],
+                ..protocol::TinyRoom::new("r-games", "game night")
             },
         ],
         online: vec![ME.into(), "halvard".into()],
         media: "up".into(),
+        capabilities: Default::default(),
+        access: None,
+        me: ME.into(),
+        server: None,
+        roles: Vec::new(),
+        categories: Vec::new(),
+        bans: Vec::new(),
+        provider: String::new(),
     }
 }
 

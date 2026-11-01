@@ -25,7 +25,7 @@ mod settings;
 mod sidebar;
 mod signin;
 mod shortcuts;
-#[cfg(feature = "gui-shot")]
+#[cfg(any(feature = "gui-shot", feature = "demo"))]
 pub(crate) mod shot_demo;
 mod state;
 mod theme;
@@ -670,6 +670,26 @@ pub(crate) fn links_through_gpui() -> bool {
     cfg!(any(target_os = "android", target_os = "ios"))
 }
 
+/// Feeds the platform's safe area (status bar, cutout, home indicator or navigation bar) and the
+/// soft keyboard into the phone's tokens. GPUI refreshes the window whenever the platform reports
+/// new insets, and the shell calls this on every frame, so each change reaches the next draw. All
+/// zero means the platform has not reported yet, and the tokens keep their stand-ins.
+pub(crate) fn feed_platform_insets(window: &gpui::Window) {
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    {
+        let insets = window.insets();
+        if insets != gpui::WindowInsets::default() {
+            phone::tokens::set_insets(phone::tokens::Insets {
+                top: f32::from(insets.safe_area.top),
+                bottom: f32::from(insets.safe_area.bottom),
+                keyboard: f32::from(insets.ime.bottom),
+            });
+        }
+    }
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    let _ = window;
+}
+
 /// Opens the window. `invite` is a `tinyclient://join#…` link the launch carried; `incoming`
 /// delivers the links a second launch hands this one.
 pub fn run(invite: Option<String>, incoming: Option<std::sync::mpsc::Receiver<String>>) {
@@ -689,7 +709,7 @@ pub(crate) fn run_with(application: gpui::Application, invite: Option<String>, i
     // Read before the window opens, so its first frame draws where the user was.
     let prefs = app::prefs::read();
     // A demo shot draws only made-up data: nothing the user last had open is restored.
-    #[cfg(feature = "gui-shot")]
+    #[cfg(any(feature = "gui-shot", feature = "demo"))]
     let prefs = if shot_demo::on() { app::prefs::Prefs::default() } else { prefs };
     theme::set_text_step(prefs.text_step);
     app::prefs::set_choices(prefs.choices);

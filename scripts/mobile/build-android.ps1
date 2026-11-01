@@ -4,6 +4,7 @@
 #   .\scripts\mobile\build-android.ps1                 # arm64-v8a + x86_64, debug APK
 #   .\scripts\mobile\build-android.ps1 -Profile release
 #   .\scripts\mobile\build-android.ps1 -SkipGradle     # only the .so files
+#   .\scripts\mobile\build-android.ps1 -Demo           # debug proof build: made-up chats from launch
 #
 # Prerequisites are checked here rather than left to fail deep inside cargo or Gradle; every
 # failure says what to install. See docs/mobile-build.md.
@@ -16,7 +17,11 @@ param(
     [ValidateSet('arm64-v8a', 'x86_64')]
     [string[]]$Abi = @('arm64-v8a', 'x86_64'),
 
-    [switch]$SkipGradle
+    [switch]$SkipGradle,
+
+    # A proof build with the made-up chatd on from launch (feature `demo`, src/gui/shot_demo.rs).
+    # Never for a release: it shows invented data and never reaches the real core.
+    [switch]$Demo
 )
 
 Set-StrictMode -Version Latest
@@ -90,6 +95,13 @@ if (-not $ndk) {
 }
 $env:ANDROID_NDK_HOME = $ndk
 Note "NDK $ndk"
+# Gradle needs the SDK too, and finds it only through ANDROID_HOME or local.properties. An NDK
+# under <sdk>/ndk/<version> names the SDK, so a machine with neither set still builds.
+$ndkParent = Split-Path -Parent (Split-Path -Parent $ndk)
+if (-not $env:ANDROID_HOME -and -not $env:ANDROID_SDK_ROOT -and -not (Test-Path (Join-Path $androidDir 'local.properties')) -and (Test-Path (Join-Path $ndkParent 'platforms'))) {
+    $env:ANDROID_HOME = $ndkParent
+    Note "SDK $ndkParent (from the NDK's location; set ANDROID_HOME to choose another)"
+}
 
 # --- Rust library ----------------------------------------------------------
 
@@ -105,7 +117,9 @@ $cargoArgs.Add('build')
 if ($Profile -eq 'release') { $cargoArgs.Add('--release') }
 # `--lib` because the package also has the desktop binary; `mobile` is the entry point + gui.
 $cargoArgs.Add('-p'); $cargoArgs.Add('tinyclient')
-$cargoArgs.Add('--lib'); $cargoArgs.Add('--features'); $cargoArgs.Add('mobile')
+if ($Demo -and $Profile -eq 'release') { Fail "-Demo is for debug proof builds only, never a release." }
+$features = if ($Demo) { 'mobile demo' } else { 'mobile' }
+$cargoArgs.Add('--lib'); $cargoArgs.Add('--features'); $cargoArgs.Add($features)
 
 Note "cargo $($cargoArgs -join ' ')"
 Push-Location $root
@@ -120,6 +134,31 @@ foreach ($a in $Abi) {
     $so = Join-Path $jniLibs "$a/libtinyclient.so"
     if (-not (Test-Path $so)) { Fail "cargo ndk did not write $so (is [lib] crate-type missing cdylib?)" }
     Note ("{0}: {1:N1} MB" -f $so, ((Get-Item $so).Length / 1MB))
+}
+
+# --- Emoji font --------------------------------------------------------------
+
+# Android 13+ ships only a COLRv1 emoji font, which GPUI's rasterizer (Swash) cannot draw, so
+# gpui_ce_mobile loads a bitmap (CBDT) Noto Color Emoji from the APK at `assets/fonts/
+# NotoColorEmoji.ttf` and logs "cannot load bundled emoji font" without it: every emoji is then
+# blank. Noto Emoji v2.051 is the last release with the CBDT font in its tree (OFL-1.1). It is
+# 10 MB, so it is fetched once into a cache and copied in, pinned by hash, never committed.
+$emojiUrl = 'https://raw.githubusercontent.com/googlefonts/noto-emoji/v2.051/fonts/NotoColorEmoji.ttf'
+$emojiSha = '72a635cb3d2f3524c51620cdde406b217204e8a6a06c6a096ff8ed4b5fd6e27b'
+$emojiCache = Join-Path $env:LOCALAPPDATA "tinyclient-build/NotoColorEmoji-v2.051.ttf"
+$emojiAsset = Join-Path $androidDir 'app/src/main/assets/fonts/NotoColorEmoji.ttf'
+function Test-Sha([string]$path) {
+    (Test-Path $path) -and ((Get-FileHash -Algorithm SHA256 $path).Hash.ToLower() -eq $emojiSha)
+}
+if (-not (Test-Sha $emojiCache)) {
+    Note "fetching the CBDT emoji font: $emojiUrl"
+    New-Item -ItemType Directory -Force -Path (Split-Path $emojiCache) | Out-Null
+    Invoke-WebRequest -Uri $emojiUrl -OutFile $emojiCache -UseBasicParsing
+    if (-not (Test-Sha $emojiCache)) { Fail "the emoji font at $emojiUrl does not match SHA-256 $emojiSha" }
+}
+if (-not (Test-Sha $emojiAsset)) {
+    New-Item -ItemType Directory -Force -Path (Split-Path $emojiAsset) | Out-Null
+    Copy-Item $emojiCache $emojiAsset -Force
 }
 
 if ($SkipGradle) {
@@ -154,5 +193,5 @@ try {
 $apk = Join-Path $androidDir 'app/build/outputs/apk/debug/app-debug.apk'
 if (-not (Test-Path $apk)) { Fail "Gradle reported success but $apk does not exist." }
 Note "APK $apk"
-Note "install with: adb install -r `"$apk`" ; adb shell am start -n dev.tinyclient.app/android.app.NativeActivity"
+Note "install with: adb install -r `"$apk`" ; adb shell am start -n dev.tinyclient.app/dev.gpui.mobile.GpuiInputActivity"
 Note "16 KB check: llvm-readelf -lW <so> | grep LOAD  (every Align 0x4000), then zipalign -c -P 16 4 <apk>"

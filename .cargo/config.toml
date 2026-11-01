@@ -1,0 +1,4 @@
+# rustc overflows its default stack on tinyclient with the `demo` feature (STATUS_STACK_BUFFER_OVERRUN
+# on Windows): the demo fixture's large literal tables. 64 MiB is plenty and costs nothing otherwise.
+[env]
+RUST_MIN_STACK = "67108864"
