@@ -684,6 +684,8 @@ pub(crate) fn feed_platform_insets(window: &gpui::Window) {
                 top: f32::from(insets.safe_area.top),
                 bottom: f32::from(insets.safe_area.bottom),
                 keyboard: f32::from(insets.ime.bottom),
+                left: f32::from(insets.safe_area.left),
+                right: f32::from(insets.safe_area.right),
             });
         }
     }
@@ -744,7 +746,7 @@ pub(crate) fn run_with(application: gpui::Application, invite: Option<String>, i
                 window_bounds: Some(WindowBounds::Windowed(window_bounds(prefs.frame, cx))),
                 // A phone window asks for no minimum: folded and split-screen windows must be
                 // allowed to be smaller than the frame we chose.
-                window_min_size: (!layout::phone(window_size().0))
+                window_min_size: (!layout::phone(window_size().0) && !phone::form(false, window_size().0, window_size().1))
                     .then_some(size(px(layout::WINDOW_MIN.0), px(layout::WINDOW_MIN.1))),
                 titlebar: Some(TitlebarOptions {
                     title: Some("tinyclient".into()),

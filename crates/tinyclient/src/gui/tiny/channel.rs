@@ -660,7 +660,11 @@ impl Shell {
                 pill(
                     "tiny-pill-muted",
                     "icons/mic-off.svg",
-                    format!("You're muted · {} to talk", crate::gui::shortcuts::label("⌘⇧M")),
+                    if crate::gui::phone::active() {
+                        "You're muted · tap to talk".to_owned()
+                    } else {
+                        format!("You're muted · {} to talk", crate::gui::shortcuts::label("⌘⇧M"))
+                    },
                     theme::on_accent(),
                     theme::danger_fill(),
                 )

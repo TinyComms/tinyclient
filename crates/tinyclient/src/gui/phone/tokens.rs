@@ -28,6 +28,36 @@ pub struct Insets {
     pub bottom: f32,
     /// The soft keyboard's height in points; 0 while it is down.
     pub keyboard: f32,
+    /// A cutout or rounded corner at the left and right edges, in points: a phone on its side.
+    pub left: f32,
+    pub right: f32,
+}
+
+/// The stand-ins in landscape, where the status bar goes and the cutout is at a side: an
+/// iPhone's on its side.
+pub const SAFE_SIDE_LANDSCAPE: f32 = 47.;
+pub const SAFE_BOTTOM_LANDSCAPE: f32 = 21.;
+
+static LANDSCAPE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set with the window's form, every frame: the phone is on its side.
+pub fn set_landscape(on: bool) {
+    LANDSCAPE.store(on, Ordering::Relaxed);
+}
+
+pub fn landscape() -> bool {
+    LANDSCAPE.load(Ordering::Relaxed)
+}
+
+/// The cutout's room at the left edge now: the platform's when it has said, else the stand-in
+/// for a phone on its side, else none.
+pub fn safe_left() -> f32 {
+    insets().map_or(if landscape() { SAFE_SIDE_LANDSCAPE } else { 0. }, |insets| insets.left)
+}
+
+/// The room at the right edge, as [`safe_left`].
+pub fn safe_right() -> f32 {
+    insets().map_or(if landscape() { SAFE_SIDE_LANDSCAPE } else { 0. }, |insets| insets.right)
 }
 
 static INSETS: std::sync::Mutex<Option<Insets>> = std::sync::Mutex::new(None);
@@ -59,7 +89,7 @@ pub fn safe_top() -> f32 {
 
 /// The status bar's height, whatever sits under it.
 pub fn status_bar() -> f32 {
-    insets().map_or(SAFE_TOP, |insets| insets.top)
+    insets().map_or(if landscape() { 0. } else { SAFE_TOP }, |insets| insets.top)
 }
 
 static TOP_TAKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -72,7 +102,7 @@ pub fn take_top(taken: bool) {
 
 /// The home indicator's height now: the platform's when it has said, else [`SAFE_BOTTOM`].
 pub fn safe_bottom() -> f32 {
-    insets().map_or(SAFE_BOTTOM, |insets| insets.bottom)
+    insets().map_or(if landscape() { SAFE_BOTTOM_LANDSCAPE } else { SAFE_BOTTOM }, |insets| insets.bottom)
 }
 
 /// The soft keyboard's height now: 0 while it is down, or while the platform has not said.

@@ -420,9 +420,12 @@ pub fn field_error_line(words: impl Into<SharedString>) -> Div {
     div().mt(px(4.)).type_small().text_color(theme::danger()).child(words.into())
 }
 
-/// A keycap such as `⌘K`.
+/// A keycap such as `⌘K`. A phone has no keyboard to press it on: there it is nothing.
 pub fn keycap(keys: impl Into<SharedString>) -> Div {
     let keys: SharedString = keys.into();
+    if crate::gui::phone::active() {
+        return div();
+    }
     div()
         .flex_none()
         .h(px(18.))

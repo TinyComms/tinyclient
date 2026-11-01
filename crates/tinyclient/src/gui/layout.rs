@@ -665,7 +665,7 @@ impl Shell {
                             .mt(px(16.))
                             .type_small()
                             .text_color(theme::text_faint())
-                            .child(crate::host::SIGN_IN_KEPT),
+                            .child(crate::host::sign_in_kept()),
                     ),
             )
     }
@@ -1176,8 +1176,10 @@ impl Render for Shell {
         self.note_tiny_page(cx);
         // The form is decided once per frame, with hysteresis (`phone::form`), and the phone's
         // own entities exist before any of its screens is drawn.
-        let phone_form = super::phone::form(super::phone::active(), f32::from(window.viewport_size().width));
+        let viewport = window.viewport_size();
+        let phone_form = super::phone::form(super::phone::active(), f32::from(viewport.width), f32::from(viewport.height));
         super::phone::set_active(phone_form);
+        super::phone::tokens::set_landscape(phone_form && viewport.width > viewport.height);
         // Before the first answer the window is still drawn: rail, strips, an empty list, and
         // what it waits on. Never a blank canvas, never a developer message.
         let placeholder;
