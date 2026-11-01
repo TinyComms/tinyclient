@@ -206,6 +206,33 @@ redirect URI the server knows does not change, and nothing about the flow is pho
 * `closed()` reports a user dismissal (not yet consulted; the sheet's "Open the page again"
   covers it).
 
+## Android, as built
+
+`crates/tinyclient/src/mobile/android` (Rust, JNI through `jni` 0.21 and `ndk-context`) over
+small Java classes in `mobile/android/app/src/main/java/dev/tinyclient/app`. Rust finds them
+through the activity's class loader (a thread attached from Rust sees only system classes), runs
+every call in its own local-reference frame, and turns a Java exception into an `Err`. Java calls
+back through three natives (`TinyPlatform.nativeFrame`, `nativeNavigate`, `nativeRedirected`),
+which name Rust callbacks by number and catch panics.
+
+| Interface | Java | What it does |
+|---|---|---|
+| `request_permission` | `TinyPlatform.requestPermission` via `TinyActivity` | `requestPermissions` on the UI thread, blocks on a latch until `onRequestPermissionsResult`. The microphone request also asks `POST_NOTIFICATIONS` (33+) and `BLUETOOTH_CONNECT` (31+). Refused for good (no rationale) says "Turn it on in Settings"; the call screen's state is noted (`hooks::note_permission`). |
+| Open Settings (`hooks`) | `TinyPlatform.openSettings` | `ACTION_APPLICATION_DETAILS_SETTINGS` for this package. |
+| `start/stop_audio_session` | `CallAudio`, `CallService` | `AUDIOFOCUS_GAIN_TRANSIENT` (voice communication), `MODE_IN_COMMUNICATION`, the route; a foreground service (`microphone`, plus `camera` / `mediaProjection` while used) with an ongoing call notification. Stop: route cleared, the earlier mode back, focus abandoned, service stopped. |
+| `set_speaker`, route menu (`hooks::route_audio`) | `CallAudio.routes/setRoute` | `getAvailableCommunicationDevices` / `setCommunicationDevice` (31+), else speakerphone and SCO. Earpiece by default; the speaker once the camera starts unless the user chose. |
+| `start/stop_camera`, flip (`hooks::route_flip`) | `CameraCapture` | Camera2, `ImageReader` YUV_420_888 at the size nearest the request, AE range nearest the rate, throttled to it, copied to tight NV12 and turned upright (sensor and display rotation). `start` blocks until the first frame (6 s). The newest frame also feeds the call screen's own tile (`selfie.rs`, `hooks::self_frame`, mirrored for the front camera). |
+| `start/stop_screen_share` | `ScreenCapture` | The consent dialog (`createScreenCaptureIntent`), then the service's `mediaProjection` type, then `getMediaProjection`, a `VirtualDisplay` into an RGBA `ImageReader` at most 1280 on the long side, 15 fps, tight RGBA to the sink. |
+| `h264_encoder` | `AvcEncoder` | `MediaCodec` `video/avc`, `COLOR_FormatYUV420Flexible` filled through `getInputImage`, constrained baseline (baseline, then the codec's default if refused) level 3.1, `KEY_PREPEND_HEADER_TO_SYNC_FRAMES`, no B-frames; `PARAMETER_KEY_REQUEST_SYNC_FRAME` for `keyframe`; SPS/PPS put in front of an IDR that lacks them. 20 ms input / 30 ms output waits. |
+| `h264_decoder` | `AvcDecoder` | `MediaCodec` decoder, waits for an SPS, newest output picture as tight I420 (crop rect honoured). |
+| `open_page` | `WebSession`, `WebSignInActivity` | A WebView activity with a Cancel bar. JavaScript, DOM storage, third-party cookies, the page's user agent. The first URL, every main-frame navigation and every new window (caught in a throwaway view) go through `navigate`. `state`, `evaluate` (5 s), `cookie` (`CookieManager`, HttpOnly included, the domain plus `www.`/`app.`), `load`, `close`. One WebView profile for the app, so cookies persist across sign-ins and networks. |
+| `open_auth` | `AuthSession` | A Custom Tab without androidx: `ACTION_VIEW` with the `EXTRA_SESSION` binder extra, Chrome first. chatd's loopback listener receives the redirect. `closed()` is the app coming back while the tab was open; `close()` brings `TinyActivity` back (`CLEAR_TOP|SINGLE_TOP`), which closes the tab. |
+
+The demo build (`-Demo`) adds a call with nobody in it (`gui::shot_demo`): starting it asks for
+the microphone and holds the audio session; its camera button runs mediad's real phone pictures
+(`mobile/android/loopback.rs`): camera → both layers encoded with MediaCodec → the 640×360 layer
+decoded with MediaCodec → shown as the other side's picture, next to my own tile.
+
 ## Threading summary
 
 * chatd and mediad call the platform from their own threads and may block there. The platform
@@ -220,6 +247,6 @@ redirect URI the server knows does not change, and nothing about the flow is pho
   the platform keeps its own default route (earpiece for voice, speaker for video).
 * Screen share on iOS beyond the app needs a Broadcast Upload Extension, a separate process: its
   frames must reach the app (App Group shared memory) before the sink.
-* Background audio (iOS `audio` background mode, Android foreground service of type
-  `microphone`/`phoneCall`) keeps a call alive when the app is backgrounded; not wired.
+* Background audio: Android runs its call under a foreground service (above); iOS's `audio`
+  background mode is not wired.
 * CallKit / ConnectionService integration for incoming rings is not part of this interface.
