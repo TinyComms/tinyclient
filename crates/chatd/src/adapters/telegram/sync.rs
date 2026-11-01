@@ -403,12 +403,55 @@ fn record(account: &Account, list: usize, dialog: &tl::types::Dialog, newest: Op
             let _ = account.ctx.history(&id, std::slice::from_ref(&mapped.message));
         }
     }
-    let read = (dialog.read_inbox_max_id > 0).then(|| dialog.read_inbox_max_id.to_string());
-    let _ = account.ctx.counts(&id, unread, dialog.unread_mentions_count.max(0) as u32, read.as_deref(), updated);
+    // Telegram's word on what is unread here. Where this user read further than the dialog says,
+    // the read was told while the link was down and lost on the whole: the tell goes again, and
+    // the counts are asked of the dialog once more, for the read may not have been the last word
+    // on the unread (`GetPeerDialogs` answers what the tell left). If that answer fails, the row
+    // stands untouched: the tell is on its way and the next dialog count is the truth.
+    let mut unread = unread;
+    let mut mentions = dialog.unread_mentions_count.max(0) as u32;
+    let mut read = (dialog.read_inbox_max_id > 0).then(|| dialog.read_inbox_max_id.to_string());
+    let mut counted = true;
+    if let Some(up_to) = account.ctx.read_up_to(&id) {
+        let mine = up_to.parse::<i32>().ok();
+        let theirs = read.as_deref().and_then(|value| value.parse::<i32>().ok());
+        if mine.is_some_and(|mine| theirs.is_some_and(|theirs| mine > theirs)) {
+            super::mark_read(account, &id, &up_to);
+            match peer_dialog(account, who) {
+                Some(fresh) => {
+                    unread = (fresh.unread_count.max(0) as u32).max(u32::from(fresh.unread_mark));
+                    mentions = fresh.unread_mentions_count.max(0) as u32;
+                    read = (fresh.read_inbox_max_id > 0).then(|| fresh.read_inbox_max_id.to_string());
+                }
+                None => counted = false,
+            }
+        }
+    }
+    if counted {
+        let _ = account.ctx.counts(&id, unread, mentions, read.as_deref(), updated);
+    }
     let _ = account.ctx.muted(&id, is_muted);
     // ✓✓: the other side read my messages up to here. Not for my own notes or a broadcast.
     if dialog.read_outbox_max_id > 0 && who != Who::User(account.me) && !known.broadcast {
         let _ = account.ctx.seen(&id, &dialog.read_outbox_max_id.to_string());
+    }
+}
+
+/// One dialog as the network counts it right now, what a read told again leaves.
+fn peer_dialog(account: &Account, who: Who) -> Option<tl::types::Dialog> {
+    let peer = account.input(who).ok()?;
+    let request = tl::functions::messages::GetPeerDialogs { peers: vec![tl::enums::InputDialogPeer::Peer(tl::types::InputDialogPeer { peer })] };
+    match account.ask(&request) {
+        Ok(tl::enums::messages::PeerDialogs::Dialogs(found)) => {
+            found.dialogs.into_iter().find_map(|dialog| match dialog {
+                tl::enums::Dialog::Dialog(dialog) => Some(dialog),
+                _ => None,
+            })
+        }
+        Err(fault) => {
+            eprintln!("chatd: Telegram: the read told again: {fault}");
+            None
+        }
     }
 }
 

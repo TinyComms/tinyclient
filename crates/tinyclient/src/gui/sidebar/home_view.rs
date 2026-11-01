@@ -492,14 +492,15 @@ impl Shell {
                 .children(on.then(|| div().absolute().bottom_0().left(px(8.)).right(px(8.)).h(px(2.)).rounded(px(1.)).bg(theme::text())))
         };
         let scroll = state.folder_tabs_scroll.clone();
+        // Make the strip grow to its content inside a clipping wrapper; arrows are always visible
+        // when content overflows the sidebar, and hidden once it fits.
         let mut tabs = div()
             .id("folder-tabs")
-            .flex_none()
-            .h(px(32.))
-            .px(px(8.))
             .flex()
             .items_center()
             .gap(px(4.))
+            .h(px(32.))
+            .px(px(8.))
             .overflow_x_scroll()
             .track_scroll(&scroll);
         tabs = tabs.child(tab(None, "All".into(), 0, 0, cx));
@@ -511,10 +512,9 @@ impl Shell {
         let max = scroll.max_offset().x;
         let can_left = scroll.offset().x < px(0.);
         let can_right = scroll.offset().x > -max;
-
-        if max <= px(0.) {
-            return Some(div().flex().items_center().mb(px(4.)).child(tabs));
-        }
+        // Show arrows once the scrollable range is non-zero. max_offset updates on the second layout
+        // pass, so this naturally resolves from "hidden" to "visible" once the strip is measured.
+        let wide = max > px(0.);
 
         let arrow = |icon: &'static str, enabled: bool, direction: i32, cx: &mut Context<Shell>| {
             let id = if direction < 0 { "folder-tabs-scroll-left" } else { "folder-tabs-scroll-right" };
@@ -532,14 +532,25 @@ impl Shell {
                 })
         };
 
+        // The clipping wrapper is the same width as the sidebar; any scrollable content peeks out
+        // and the arrows appear. Wrap in w_full + overflow_hidden so the strip never paints into
+        // the conversation.
         Some(
             div()
                 .flex()
+                .w_full()
+                .flex_none()
                 .items_center()
                 .mb(px(4.))
-                .child(arrow("icons/chevron-left.svg", can_left, -1, cx))
-                .child(div().flex_1().min_w_0().child(tabs))
-                .child(arrow("icons/chevron-right.svg", can_right, 1, cx)),
+                .children(wide.then(|| arrow("icons/chevron-left.svg", can_left, -1, cx)))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .child(tabs),
+                )
+                .children(wide.then(|| arrow("icons/chevron-right.svg", can_right, 1, cx))),
         )
     }
 
