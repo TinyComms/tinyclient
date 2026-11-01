@@ -399,17 +399,55 @@ impl Shell {
     /// connection's numbers are read while one is up.
     pub(super) fn note_tiny_page(&mut self, cx: &mut Context<Self>) {
         self.note_tiny_call(cx);
-        let Some(account) = self.tiny_shown() else {
-            self.tiny_state.seen = false;
-            return;
-        };
-        if self.tiny_state.seen && self.tiny_state.account.as_ref() == Some(&account) {
+        if let Some(account) = self.tiny_shown() {
+            if self.tiny_state.seen && self.tiny_state.account.as_ref() == Some(&account) {
+                return;
+            }
+            self.tiny_state.seen = true;
+            // Opening the server again asks the owner again what they put off.
+            self.tiny_state.setup.put_off_ends();
+            self.fetch(account, None, cx);
             return;
         }
-        self.tiny_state.seen = true;
-        // Opening the server again asks the owner again what they put off.
-        self.tiny_state.setup.put_off_ends();
+        self.tiny_state.seen = false;
+        self.warm_tiny_conversation(cx);
+    }
+
+    /// A Tiny conversation is open and the server home is not. The header still needs that
+    /// member's picture and role, which are on the same page the server home reads. Loaded
+    /// once. The header draws the picture and the role name, never the email.
+    fn warm_tiny_conversation(&mut self, cx: &mut Context<Self>) {
+        let Some(open) = self.snapshot.as_ref().and_then(|snapshot| snapshot.open.as_ref()) else {
+            return;
+        };
+        if open.key.network != Network::Tiny || open.peer.as_ref().is_none_or(|id| id.is_empty()) {
+            return;
+        }
+        let account = open.key.account();
+        if self.tiny_state.account.as_ref() == Some(&account) && (self.tiny_state.community.is_some() || self.tiny_state.loading) {
+            return;
+        }
         self.fetch(account, None, cx);
+    }
+
+    /// Their picture on disk, once the server page has fetched it. Nothing is logged.
+    /// Named apart from the channel strip's `tiny_picture`, which draws a call.
+    pub(in crate::gui) fn tiny_member_picture(&self, account: &AccountKey, user_id: &str) -> Option<std::path::PathBuf> {
+        if account.network != Network::Tiny || user_id.is_empty() {
+            return None;
+        }
+        let community = self.tiny_state.community.as_ref().filter(|_| self.tiny_state.account.as_ref() == Some(account))?;
+        community.member(user_id).map(|member| member.avatar_path.clone()).filter(|path| !path.is_empty()).map(std::path::PathBuf::from)
+    }
+
+    /// The role the header says for the other person of a Tiny direct conversation.
+    pub(in crate::gui) fn tiny_header_role(&self, open: &protocol::Conversation) -> Option<model::HeaderRole> {
+        if open.key.network != Network::Tiny || open.kind != protocol::ConversationKind::Direct {
+            return None;
+        }
+        let peer = open.peer.as_deref().filter(|id| !id.is_empty())?;
+        let community = self.tiny_state.community.as_ref().filter(|_| self.tiny_state.account.as_ref() == Some(&open.key.account()))?;
+        model::header_role(community, community.member(peer)?)
     }
 
     pub(super) fn tiny_open(&self) -> bool {
