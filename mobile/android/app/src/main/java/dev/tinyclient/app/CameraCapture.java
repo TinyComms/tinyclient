@@ -298,6 +298,9 @@ public final class CameraCapture {
 
     private static int displayDegrees(Context c) {
         try {
+            if (android.os.Build.VERSION.SDK_INT < 30) {
+                throw new UnsupportedOperationException();
+            }
             int r = c.getDisplay().getRotation();
             switch (r) {
                 case Surface.ROTATION_90:
