@@ -2065,6 +2065,9 @@ impl Chat {
             Request::TinyOverrideClear { account, room_id, role_id } => adapters::tiny::manage::override_clear(account, room_id, role_id),
             Request::TinyInviteWith { account, options } => adapters::tiny::manage::invite_with(account, options),
             Request::TinyAudit { account, filter } => adapters::tiny::manage::audit(account, filter),
+            Request::TinySetupRead { account } => adapters::tiny::manage::setup_read(account),
+            Request::TinySetupApply { account, apply } => adapters::tiny::manage::setup_apply(account, apply),
+            Request::TinyPasskeyLink { account } => adapters::tiny::manage::passkey_link(account),
             Request::TinyCallModerate { account, room_id, user_id, server_muted, server_deafened } => {
                 let mut needs = Vec::new();
                 if server_muted.is_some() {

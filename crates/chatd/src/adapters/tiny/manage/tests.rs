@@ -307,3 +307,261 @@ fn an_older_server_has_no_features_and_nothing_new_is_sent() {
         assert!(log.lock().unwrap().last().unwrap().starts_with("GET /v1/audit?limit=50 "));
     });
 }
+
+// First-run setup: `docs/server-setup.md` in tinyserver, against a local fake.
+
+/// `GET /v1/setup` as the contract shows it, for an owner on a server with passkeys and one
+/// member without a passkey.
+const SETUP: &str = r#"{"needed":true,"completed_at":null,
+    "current":{"provider_profile":"full","activity_visibility":"everyone","sign_in_methods":"any"},
+    "deployment":{"passkeys":true,"sso":false},
+    "counts":{"members":3,"members_without_passkey":2,"emails_stored":3,"owner_has_passkey":false},
+    "presets":[{"id":"convenience","title":"Convenience","summary":"Easiest to run.","choices":{"provider_profile":"full","activity_visibility":"everyone","sign_in_methods":"any"},"available":true},
+               {"id":"privacy","title":"Privacy","summary":"Keeps the least.","choices":{"provider_profile":"none","activity_visibility":"nobody","sign_in_methods":"passkey"},"available":true,"unavailable":null}],
+    "choices":[{"id":"provider_profile","title":"Provider","question":"Keep what?","relevant":false,"options":[{"id":"full","title":"Both","effect":"Keeps both."},{"id":"none","title":"Nothing","effect":"Keeps neither."}]}],
+    "always":["There are no usernames."]}"#;
+
+/// What `PUT /v1/setup` answers: the whole settings, and the two counts.
+fn applied(erased: u32, cleared: u32) -> String {
+    format!(
+        r#"{{"settings":{{"name":"AtomicStudio","description":"","welcome":"","icon":null,"default_room_id":null,"afk_room_id":null,"afk_timeout_secs":0,"image_max_bytes":8388608,"file_max_bytes":26214400,"allow_archives":false,"provider_profile":"none","activity_visibility":"nobody","sign_in_methods":"passkey","setup_completed_at":"2026-11-01T10:00:00Z","created_at":"t"}},"emails_erased":{erased},"last_seen_cleared":{cleared}}}"#
+    )
+}
+
+/// A tinyserver with setup. `features` is the capabilities list's inside. What `PUT /v1/setup`
+/// answers depends on what it is sent, so each test names its case in the body.
+fn with_setup(me: &'static str, features: &'static str, log: Arc<Mutex<Vec<String>>>) -> String {
+    serve(move |request| {
+        log.lock().unwrap().push(request.to_owned());
+        let first = request.lines().next().unwrap_or("");
+        let body = request.split("\r\n\r\n").nth(1).unwrap_or("");
+        let route = first.split(' ').take(2).collect::<Vec<_>>().join(" ");
+        match route.as_str() {
+            "GET /v1/capabilities" => http(200, "OK", &format!(r#"{{"version":"0.5.0","features":[{features}]}}"#)),
+            "GET /v1/me" => http(200, "OK", me),
+            "GET /v1/setup" => http(200, "OK", SETUP),
+            "GET /v1/server" => http(
+                200,
+                "OK",
+                r#"{"name":"AtomicStudio","description":"","welcome":"","icon":null,"default_room_id":null,"afk_room_id":null,"afk_timeout_secs":0,"provider_profile":"name","activity_visibility":"admins","sign_in_methods":"any","setup_completed_at":"2026-11-01T10:00:00Z","created_at":"t"}"#,
+            ),
+            "PUT /v1/setup" => {
+                let put: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+                let is = |field: &str, value: &str| put[field] == value;
+                match () {
+                    _ if put["allow_lockout"] == true => http(200, "OK", &applied(0, 0)),
+                    _ if is("activity_visibility", "admins") => http(409, "Conflict", r#"{"error":"members_without_passkey","count":3}"#),
+                    _ if is("provider_profile", "name") => http(409, "Conflict", r#"{"error":"passkeys_unavailable"}"#),
+                    _ if is("provider_profile", "none") => http(409, "Conflict", r#"{"error":"owner_needs_passkey"}"#),
+                    _ if is("sign_in_methods", "any") => http(409, "Conflict", r#"{"error":"something_new"}"#),
+                    _ if is("provider_profile", "full") => http(400, "Bad Request", r#"{"error":"invalid"}"#),
+                    _ if put["erase_emails"] == true => http(200, "OK", &applied(3, 5)),
+                    _ => http(200, "OK", &applied(0, 0)),
+                }
+            }
+            "POST /v1/me/passkeys/link" => http(200, "OK", r#"{"url":"http://127.0.0.1:9/v1/auth/passkey/claim#claim-token"}"#),
+            // What the page reads around it: nobody else, nothing to list.
+            "GET /v1/members" | "GET /v1/invites" | "GET /v1/rooms" | "GET /v1/roles" | "GET /v1/categories" | "GET /v1/bans" => http(200, "OK", "[]"),
+            _ if first.starts_with("GET /v1/audit") => http(200, "OK", "[]"),
+            _ => http(404, "Not Found", r#"{"error":"not_found"}"#),
+        }
+    })
+}
+
+const SETUP_FEATURES: &str = r#""server","roles","first_run_setup""#;
+const NOT_OWNER: &str = r#"{"user_id":"11111111-1111-1111-1111-111111111111","display_name":"Ada","role":"admin","owner":false,"roles":[],"permissions":1048575,"rank":5}"#;
+
+fn applied_to(apply: TinySetupApply, account: &AccountKey) -> Response {
+    setup_apply(account.clone(), apply)
+}
+
+#[test]
+fn an_owner_reads_the_outline_in_the_servers_words() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let base = with_setup(OWNER, SETUP_FEATURES, log.clone());
+    with_session(&base, "owner", |account| match setup_read(account) {
+        Response::TinySetup { setup } => {
+            assert!(setup.needed);
+            assert_eq!(setup.counts.emails_stored, 3);
+            assert_eq!(setup.presets[1].summary, "Keeps the least.");
+            assert_eq!(setup.presets[1].unavailable, "");
+            assert!(!setup.choices[0].relevant);
+            assert_eq!(setup.choices[0].options[1].effect, "Keeps neither.");
+            assert_eq!(setup.always, ["There are no usernames."]);
+        }
+        other => panic!("setup: {other:?}"),
+    });
+    assert_eq!(sent(&log, "GET /v1/setup ").len(), 1);
+}
+
+#[test]
+fn nothing_is_asked_of_anyone_but_an_owner_of_a_server_with_setup() {
+    // An admin with every permission is not an owner.
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let base = with_setup(NOT_OWNER, SETUP_FEATURES, log.clone());
+    with_session(&base, "admin", |account| {
+        assert_eq!(setup_read(account.clone()), said(NOT_YOURS));
+        assert_eq!(applied_to(TinySetupApply::default(), &account), said(NOT_YOURS));
+    });
+    assert!(sent(&log, "GET /v1/setup ").is_empty() && sent(&log, "PUT /v1/setup ").is_empty());
+    // An owner on a server that does not list the feature: it says so, and nothing is sent.
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let base = with_setup(OWNER, r#""server","roles""#, log.clone());
+    with_session(&base, "owner", |account| {
+        assert_eq!(setup_read(account.clone()), said(OLDER));
+        assert_eq!(applied_to(TinySetupApply::default(), &account), said(OLDER));
+    });
+    assert!(sent(&log, "GET /v1/setup ").is_empty() && sent(&log, "PUT /v1/setup ").is_empty());
+    // A server with no capabilities route at all, as before it had features.
+    let base = serve(|_| http(404, "Not Found", r#"{"error":"not_found"}"#));
+    with_session(&base, "owner", |account| assert_eq!(setup_read(account), said(OLDER)));
+}
+
+#[test]
+fn each_way_of_answering_goes_to_the_servers_route_with_only_what_is_set() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let base = with_setup(OWNER, SETUP_FEATURES, log.clone());
+    with_session(&base, "owner", |account| {
+        // Keep what I have.
+        match applied_to(TinySetupApply::default(), &account) {
+            Response::TinySetupApplied { applied } => assert_eq!(applied.settings.setup_completed_at, "2026-11-01T10:00:00Z"),
+            other => panic!("keep: {other:?}"),
+        }
+        assert_eq!(json_body(&last(&log, "PUT /v1/setup ")), serde_json::json!({}));
+        // A preset alone.
+        let preset = TinySetupApply { preset: Some("privacy".into()), ..TinySetupApply::default() };
+        assert!(matches!(applied_to(preset, &account), Response::TinySetupApplied { .. }));
+        assert_eq!(json_body(&last(&log, "PUT /v1/setup ")), serde_json::json!({"preset": "privacy"}));
+        // A preset with the email addresses erased: the server's counts come back.
+        let erase = TinySetupApply { preset: Some("privacy".into()), erase_emails: true, ..TinySetupApply::default() };
+        match applied_to(erase, &account) {
+            Response::TinySetupApplied { applied } => assert_eq!((applied.emails_erased, applied.last_seen_cleared), (3, 5)),
+            other => panic!("erase: {other:?}"),
+        }
+        assert_eq!(json_body(&last(&log, "PUT /v1/setup ")), serde_json::json!({"preset": "privacy", "erase_emails": true}));
+        // Each choice by itself, and the permission to lock people out, which goes through.
+        let lockout = TinySetupApply { activity_visibility: Some("admins".into()), allow_lockout: true, ..TinySetupApply::default() };
+        assert!(matches!(applied_to(lockout, &account), Response::TinySetupApplied { .. }));
+        assert_eq!(json_body(&last(&log, "PUT /v1/setup ")), serde_json::json!({"activity_visibility": "admins", "allow_lockout": true}));
+    });
+    // Every request carried the session.
+    assert!(sent(&log, "PUT /v1/setup ").iter().all(|put| put.to_ascii_lowercase().contains("authorization: bearer t")));
+}
+
+#[test]
+fn a_refusal_the_owner_can_act_on_is_its_own_answer_and_the_rest_are_words() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let base = with_setup(OWNER, SETUP_FEATURES, log.clone());
+    with_session(&base, "owner", |account| {
+        let sends = |apply: TinySetupApply| applied_to(apply, &account);
+        let lockout = TinySetupApply { activity_visibility: Some("admins".into()), ..TinySetupApply::default() };
+        assert_eq!(sends(lockout), Response::TinySetupRefused { refusal: TinySetupRefusal::MembersWithoutPasskey { count: 3 } });
+        let off = TinySetupApply { provider_profile: Some("name".into()), ..TinySetupApply::default() };
+        assert_eq!(sends(off), Response::TinySetupRefused { refusal: TinySetupRefusal::PasskeysUnavailable });
+        let needs = TinySetupApply { provider_profile: Some("none".into()), ..TinySetupApply::default() };
+        assert_eq!(sends(needs), Response::TinySetupRefused { refusal: TinySetupRefusal::OwnerNeedsPasskey });
+        // A 409 this build does not know, a 400 and a 403 are said in words.
+        let newer = TinySetupApply { sign_in_methods: Some("any".into()), ..TinySetupApply::default() };
+        assert_eq!(sends(newer), said(CHECK));
+        let invalid = TinySetupApply { provider_profile: Some("full".into()), ..TinySetupApply::default() };
+        assert_eq!(sends(invalid), said(CHECK));
+    });
+    // A count the server leaves out or sends too large still reads.
+    assert_eq!(setup_refusal(&serde_json::json!({"error": "members_without_passkey"})), Some(TinySetupRefusal::MembersWithoutPasskey { count: 0 }));
+    assert_eq!(setup_refusal(&serde_json::json!({"error": "members_without_passkey", "count": 1u64 << 40})), Some(TinySetupRefusal::MembersWithoutPasskey { count: u32::MAX }));
+    assert_eq!(setup_refusal(&serde_json::json!({"error": "x"})), None);
+    assert_eq!(setup_refusal(&serde_json::Value::Null), None);
+}
+
+#[test]
+fn a_bad_shape_is_refused_before_anything_is_sent() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let base = with_setup(OWNER, SETUP_FEATURES, log.clone());
+    with_session(&base, "owner", |account| {
+        drop(setup_read(account.clone()));
+        let before = log.lock().unwrap().len();
+        for odd in ["", "Privacy", "../x", "privacy\r\nX: y", &"a".repeat(33)] {
+            for apply in [
+                TinySetupApply { preset: Some(odd.into()), ..TinySetupApply::default() },
+                TinySetupApply { provider_profile: Some(odd.into()), ..TinySetupApply::default() },
+                TinySetupApply { activity_visibility: Some(odd.into()), ..TinySetupApply::default() },
+                TinySetupApply { sign_in_methods: Some(odd.into()), ..TinySetupApply::default() },
+            ] {
+                assert_eq!(applied_to(apply, &account), said(CHECK), "{odd:?}");
+            }
+        }
+        assert_eq!(log.lock().unwrap().len(), before);
+    });
+}
+
+#[test]
+fn the_outline_is_held_to_a_size_a_window_can_draw() {
+    let long = "w".repeat(SETUP_TEXT_MAX + 50);
+    let option = serde_json::json!({"id": "x", "title": long, "effect": long, "needs": vec!["n"; 40]});
+    let setup = serde_json::json!({
+        "needed": true,
+        "presets": (0..40).map(|n| serde_json::json!({"id": format!("p{n}"), "title": long, "summary": long, "unavailable": long})).collect::<Vec<_>>(),
+        "choices": (0..40).map(|n| serde_json::json!({"id": format!("c{n}"), "question": long, "options": vec![option.clone(); 40]})).collect::<Vec<_>>(),
+        "always": vec![long.clone(); 40],
+    });
+    let bounded = setup_bounded(serde_json::from_value(setup).unwrap());
+    assert_eq!((bounded.presets.len(), bounded.choices.len(), bounded.always.len()), (SETUP_ROWS_MAX, SETUP_ROWS_MAX, SETUP_ROWS_MAX));
+    assert_eq!(bounded.choices[0].options.len(), SETUP_ROWS_MAX);
+    assert_eq!(bounded.choices[0].options[0].needs.len(), SETUP_ROWS_MAX);
+    assert_eq!(bounded.presets[0].summary.chars().count(), SETUP_TEXT_MAX);
+    assert_eq!(bounded.choices[0].options[0].effect.chars().count(), SETUP_TEXT_MAX);
+    assert_eq!(bounded.always[0].chars().count(), SETUP_TEXT_MAX);
+}
+
+#[test]
+fn the_page_carries_what_the_server_keeps_through_a_read_of_the_server() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let base = with_setup(OWNER, SETUP_FEATURES, log.clone());
+    with_session(&base, "owner", |account| match community(&test_hub(), account) {
+        Response::TinyCommunity { community } => {
+            let server = community.server.expect("the server's settings");
+            assert_eq!((server.provider_profile.as_str(), server.activity_visibility.as_str(), server.sign_in_methods.as_str()), ("name", "admins", "any"));
+            assert_eq!(server.setup_completed_at, "2026-11-01T10:00:00Z");
+            assert!(community.capabilities.has(TINY_FEATURE_FIRST_RUN_SETUP));
+        }
+        other => panic!("load: {other:?}"),
+    });
+}
+
+#[test]
+fn a_passkey_link_opens_in_the_system_browser_and_goes_nowhere_else() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let base = with_setup(OWNER, SETUP_FEATURES, log.clone());
+    let opened = Arc::new(Mutex::new(Vec::new()));
+    let seen = opened.clone();
+    let browser: crate::adapters::tiny::browser::Opener = Arc::new(move |url: &str| {
+        seen.lock().unwrap().push(url.to_owned());
+        Ok(())
+    });
+    with_session(&base, "owner", |account| {
+        assert_eq!(passkey_link_with(account, &browser), Response::Ok);
+    });
+    assert_eq!(opened.lock().unwrap().as_slice(), ["http://127.0.0.1:9/v1/auth/passkey/claim#claim-token"]);
+    assert_eq!(sent(&log, "POST /v1/me/passkeys/link ").len(), 1);
+}
+
+#[test]
+fn a_passkey_link_the_server_could_not_make_is_said_in_words_and_nothing_is_opened() {
+    let nothing: crate::adapters::tiny::browser::Opener = Arc::new(|_: &str| panic!("the browser was opened"));
+    // The sign-in is too old.
+    let base = serve(|_| http(403, "Forbidden", r#"{"error":"recent_sign_in_required"}"#));
+    with_session(&base, "owner", |account| assert_eq!(passkey_link_with(account, &nothing), said(SIGN_IN_AGAIN)));
+    assert!(SIGN_IN_AGAIN.contains("sign in again"), "{SIGN_IN_AGAIN}");
+    // A server from before passkeys.
+    let base = serve(|_| http(404, "Not Found", r#"{"error":"not_found"}"#));
+    with_session(&base, "owner", |account| assert_eq!(passkey_link_with(account, &nothing), said(OLDER)));
+    // A bot, or anyone the server says no to.
+    let base = serve(|_| http(403, "Forbidden", r#"{"error":"forbidden"}"#));
+    with_session(&base, "owner", |account| assert_eq!(passkey_link_with(account, &nothing), said("You can't do that.")));
+    // An answer with no link in it.
+    let base = serve(|_| http(200, "OK", "{}"));
+    with_session(&base, "owner", |account| assert_eq!(passkey_link_with(account, &nothing), said(UNREADABLE)));
+    // A link that is not a web page never reaches the system's opener.
+    let base = serve(|_| http(200, "OK", r#"{"url":"file:///etc/passwd"}"#));
+    with_session(&base, "owner", |account| assert_eq!(passkey_link(account), said("That isn't a web page.")));
+}

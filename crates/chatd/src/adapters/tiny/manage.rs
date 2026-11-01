@@ -18,9 +18,11 @@ use super::{asked, endpoint, explain, open, refused, rows, safe_id, tiny_name, M
 use protocol::{
     tiny_allowed, AccountKey, Response, TinyAccess, TinyAuditFilter, TinyBan, TinyCapabilities, TinyCategory, TinyCode,
     TinyInviteOptions, TinyLayoutGroup, TinyRole, TinyRoleEdit, TinyRoom, TinyRoomEdit, TinySeat, TinyServerEdit, TinyServerInfo,
+    TinySetup, TinySetupApplied, TinySetupApply, TinySetupRefusal,
     TINY_ALL, TINY_BITRATE_MAX, TINY_BITRATE_MIN, TINY_DESCRIPTION_MAX, TINY_FEATURE_AUDIT_QUERY, TINY_FEATURE_BANS,
     TINY_FEATURE_CATEGORIES, TINY_FEATURE_INVITE_OPTIONS, TINY_FEATURE_ROLES, TINY_FEATURE_SERVER, TINY_FEATURE_TIMEOUTS,
-    TINY_FEATURE_FILE_SCAN, TINY_FEATURE_UPLOAD_LIMITS, TINY_ICON_MAX, TINY_SERVER_NAME_MAX, TINY_UPLOAD_MAX, TINY_WELCOME_MAX,
+    TINY_FEATURE_FILE_SCAN, TINY_FEATURE_FIRST_RUN_SETUP, TINY_FEATURE_UPLOAD_LIMITS, TINY_ICON_MAX, TINY_SERVER_NAME_MAX, TINY_UPLOAD_MAX,
+    TINY_WELCOME_MAX,
 };
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashMap};
@@ -43,8 +45,14 @@ const UPLOAD_LIMIT: &str = "An upload limit is 1 byte to 100 MiB.";
 const REASON_SIZE: &str = "A reason is at most 500 characters.";
 const ICON_SIZE: &str = "That picture is too big. The most is 256 KB.";
 const ICON_KIND: &str = "That picture isn't a PNG, JPEG or WebP.";
+const SIGN_IN_AGAIN: &str = "Adding a passkey needs a sign-in from the last ten minutes. Sign out of this server, sign in again, then try once more.";
 /// The longest reason the audit keeps from here.
 const REASON_MAX: usize = 500;
+/// The longest value of a setup choice, such as `activity_visibility`'s `everyone`, and the longest
+/// run of text, rows in a list and options the server's setup outline is kept to.
+const SETUP_WORD_MAX: usize = 32;
+const SETUP_TEXT_MAX: usize = 2000;
+const SETUP_ROWS_MAX: usize = 16;
 /// Rows of one list read at most: roles, categories, bans, rooms in a layout.
 const LIST_MAX: usize = 1000;
 
@@ -207,6 +215,10 @@ pub(crate) fn server_of(saved: &Saved, account: &AccountKey) -> Option<TinyServe
         _ => return None,
     };
     info.icon = info.icon.filter(|hash| !hash.is_empty() && hash.len() <= 128 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    for word in [&mut info.provider_profile, &mut info.activity_visibility, &mut info.sign_in_methods] {
+        protocol::clip(word, SETUP_WORD_MAX);
+    }
+    protocol::clip(&mut info.setup_completed_at, SETUP_WORD_MAX);
     if let Some(hash) = info.icon.clone() {
         info.icon_path = icon_file(saved, account, &hash).map(|path| path.to_string_lossy().into_owned()).unwrap_or_default();
     }
@@ -494,6 +506,164 @@ fn put_bytes(saved: &Saved, path: &str, kind: &str, bytes: &[u8]) -> Result<(u16
     }
     let body = if status == 204 { Value::Null } else { response.body_mut().read_json().unwrap_or(Value::Null) };
     Ok((status, body))
+}
+
+// First-run setup.
+
+/// The session, when the server has setup and this account is an owner. Setup says what the
+/// community keeps about everyone in it, so an admin with every permission is not enough: the
+/// server answers anyone else 403, and nothing is asked for them here.
+fn owner_only(account: &AccountKey) -> Result<Saved, Response> {
+    let saved = open(account)?;
+    let mut was = known(&saved);
+    if !was.checked {
+        was = learn(&saved);
+    }
+    if !was.capabilities.has(TINY_FEATURE_FIRST_RUN_SETUP) {
+        return Err(refused(OLDER));
+    }
+    if !was.access.as_ref().is_some_and(|access| access.owner) {
+        return Err(refused(NOT_YOURS));
+    }
+    Ok(saved)
+}
+
+/// Holds what the server wrote to what a window can draw. The server's text is shown as it comes,
+/// so only its size is limited.
+fn setup_bounded(mut setup: TinySetup) -> TinySetup {
+    fn words(text: &mut String) {
+        protocol::clip(text, SETUP_TEXT_MAX);
+    }
+    setup.presets.truncate(SETUP_ROWS_MAX);
+    setup.choices.truncate(SETUP_ROWS_MAX);
+    setup.always.truncate(SETUP_ROWS_MAX);
+    setup.always.iter_mut().for_each(words);
+    for preset in &mut setup.presets {
+        [&mut preset.id, &mut preset.title, &mut preset.summary, &mut preset.unavailable].into_iter().for_each(words);
+    }
+    for choice in &mut setup.choices {
+        [&mut choice.id, &mut choice.title, &mut choice.question].into_iter().for_each(words);
+        choice.options.truncate(SETUP_ROWS_MAX);
+        for option in &mut choice.options {
+            [&mut option.id, &mut option.title, &mut option.effect].into_iter().for_each(words);
+            option.needs.truncate(SETUP_ROWS_MAX);
+            option.needs.iter_mut().for_each(words);
+        }
+    }
+    setup
+}
+
+/// `GET /v1/setup`: what the owner is asked, in the server's words, with what a choice would touch.
+pub(crate) fn setup_read(account: AccountKey) -> Response {
+    let saved = match owner_only(&account) {
+        Ok(saved) => saved,
+        Err(answer) => return answer,
+    };
+    match asked("GET", &saved, "/v1/setup", None) {
+        Err(detail) => refused(detail),
+        Ok((200, body)) => match serde_json::from_value::<TinySetup>(body) {
+            Ok(setup) => Response::TinySetup { setup: setup_bounded(setup) },
+            Err(_) => refused(UNREADABLE),
+        },
+        Ok((status, body)) => refused(explain(status, &body, Missing::Plain)),
+    }
+}
+
+/// A value the server names a preset or a choice's option by: short, lower case and underscores.
+/// The server checks it again and refuses one it does not know.
+fn setup_word(word: &str) -> bool {
+    !word.is_empty() && word.len() <= SETUP_WORD_MAX && word.bytes().all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+}
+
+fn setup_body(apply: &TinySetupApply) -> Result<Value, Response> {
+    let mut body = Map::new();
+    for (field, value) in [
+        ("preset", &apply.preset),
+        ("provider_profile", &apply.provider_profile),
+        ("activity_visibility", &apply.activity_visibility),
+        ("sign_in_methods", &apply.sign_in_methods),
+    ] {
+        if let Some(value) = value {
+            if !setup_word(value) {
+                return Err(refused(CHECK));
+            }
+            body.insert(field.into(), json!(value));
+        }
+    }
+    // Left off unless asked for: the server reads a missing flag as no.
+    for (field, on) in [("erase_emails", apply.erase_emails), ("allow_lockout", apply.allow_lockout)] {
+        if on {
+            body.insert(field.into(), json!(true));
+        }
+    }
+    Ok(Value::Object(body))
+}
+
+/// A 409 from setup that the owner can do something about.
+fn setup_refusal(body: &Value) -> Option<TinySetupRefusal> {
+    match body.get("error").and_then(Value::as_str)? {
+        "passkeys_unavailable" => Some(TinySetupRefusal::PasskeysUnavailable),
+        "owner_needs_passkey" => Some(TinySetupRefusal::OwnerNeedsPasskey),
+        "members_without_passkey" => {
+            let count = body.get("count").and_then(Value::as_u64).map_or(0, |count| u32::try_from(count).unwrap_or(u32::MAX));
+            Some(TinySetupRefusal::MembersWithoutPasskey { count })
+        }
+        _ => None,
+    }
+}
+
+/// `PUT /v1/setup`. An empty `apply` keeps everything as it is and finishes setup. A refusal the
+/// owner can act on is its own answer; anything else is said in words.
+pub(crate) fn setup_apply(account: AccountKey, apply: TinySetupApply) -> Response {
+    let body = match setup_body(&apply) {
+        Ok(body) => body,
+        Err(answer) => return answer,
+    };
+    let saved = match owner_only(&account) {
+        Ok(saved) => saved,
+        Err(answer) => return answer,
+    };
+    match asked("PUT", &saved, "/v1/setup", Some(body)) {
+        Err(detail) => refused(detail),
+        Ok((200, body)) => match serde_json::from_value::<TinySetupApplied>(body) {
+            Ok(applied) => Response::TinySetupApplied { applied },
+            Err(_) => refused(UNREADABLE),
+        },
+        Ok((409, body)) => match setup_refusal(&body) {
+            Some(refusal) => Response::TinySetupRefused { refusal },
+            // A reason from a newer server than this: nothing was changed.
+            None => refused(CHECK),
+        },
+        Ok((status, body)) => refused(explain(status, &body, Missing::Plain)),
+    }
+}
+
+/// `POST /v1/me/passkeys/link`, then the link in the system browser. The link is a bearer: it
+/// goes to the browser and nowhere else, and is never logged or handed back.
+pub(crate) fn passkey_link(account: AccountKey) -> Response {
+    passkey_link_with(account, &super::browser::system())
+}
+
+pub(crate) fn passkey_link_with(account: AccountKey, browser: &super::browser::Opener) -> Response {
+    let saved = match open(&account) {
+        Ok(saved) => saved,
+        Err(answer) => return answer,
+    };
+    match asked("POST", &saved, "/v1/me/passkeys/link", None) {
+        Err(detail) => refused(detail),
+        Ok((200 | 201, body)) => match body.get("url").and_then(Value::as_str) {
+            Some(url) => match browser(url) {
+                Ok(()) => Response::Ok,
+                Err(why) => refused(&why),
+            },
+            None => refused(UNREADABLE),
+        },
+        // Making a link wants a sign-in within the last ten minutes, so a stolen old session
+        // cannot plant a passkey of its own.
+        Ok((403, body)) if body.get("error").and_then(Value::as_str) == Some("recent_sign_in_required") => refused(SIGN_IN_AGAIN),
+        Ok((404, _)) => refused(OLDER),
+        Ok((status, body)) => refused(explain(status, &body, Missing::Plain)),
+    }
 }
 
 // Roles.

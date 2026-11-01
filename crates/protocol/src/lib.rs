@@ -1674,6 +1674,25 @@ pub enum Request {
         #[serde(default)]
         filter: TinyAuditFilter,
     },
+    /// What the owner is asked about the community's privacy (`GET /v1/setup`). Answers
+    /// `TinySetup`; refused in words unless the server has `first_run_setup` and this account is
+    /// an owner.
+    TinySetupRead {
+        account: AccountKey,
+    },
+    /// The owner's answer (`PUT /v1/setup`; `apply` empty keeps what the server has and finishes
+    /// setup). Answers `TinySetupApplied`, or `TinySetupRefused` when the server says what to do
+    /// first. The server then tells every page over its live socket.
+    TinySetupApply {
+        account: AccountKey,
+        apply: TinySetupApply,
+    },
+    /// Asks the server for a link that adds a passkey for this account and opens it in the system
+    /// browser (`POST /v1/me/passkeys/link`). Answers `Ok`. The server wants a sign-in within the
+    /// last ten minutes, and chatd says so in words when it is not.
+    TinyPasskeyLink {
+        account: AccountKey,
+    },
     /// Server-mutes or server-deafens someone in a room's call, or undoes it; `None` leaves
     /// that one as it is (`voice_moderation`, mute_members / deafen_members).
     TinyCallModerate {
@@ -2019,6 +2038,18 @@ pub enum Response {
     /// One page of a Tiny server's audit, newest first. Fewer rows than the limit: the end.
     TinyAudit {
         audit: Vec<TinyAudit>,
+    },
+    /// What `TinySetupRead` asked.
+    TinySetup {
+        setup: TinySetup,
+    },
+    /// The choices went in. `applied.settings` is what the server keeps now.
+    TinySetupApplied {
+        applied: TinySetupApplied,
+    },
+    /// The server would not apply the choices, and said what the owner can do. Nothing changed.
+    TinySetupRefused {
+        refusal: TinySetupRefusal,
     },
     /// What `E2eeAsk::Status` asked.
     TinyE2ee {
