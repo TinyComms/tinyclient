@@ -783,7 +783,7 @@ fn start_direct(ctx: &Context, saved: &Saved, person_id: &str, reply: crate::ada
     });
     let encrypted = match mode {
         Some((true, mode)) => mode != "off" && !mode.is_empty(),
-        Some((false, mode)) if mode == "new_required" => {
+        Some((false, mode)) if mode == "new_required" || mode == "required" => {
             let _ = reply.send(Err(Refusal::Refused(NOT_SET_UP.to_owned())));
             return;
         }

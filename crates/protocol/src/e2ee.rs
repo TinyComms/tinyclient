@@ -158,8 +158,8 @@ pub struct E2eePerson {
     #[serde(default)]
     pub trust: Trust,
     /// None of their devices chain to the ones pinned before: they set tinyclient up again, or
-    /// someone (the server among them) put new keys in their place. Nothing is sent to them until
-    /// the person accepts it.
+    /// someone (the server among them) put new keys in their place. Their new devices are let into
+    /// no group until the person accepts it.
     #[serde(default, skip_serializing_if = "crate::is_false")]
     pub identity_changed: bool,
 }

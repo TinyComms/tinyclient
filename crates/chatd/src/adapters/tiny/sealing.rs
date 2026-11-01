@@ -113,7 +113,8 @@ pub(crate) struct Sealed {
     pub entry: AttachmentRef,
 }
 
-/// Cleans (a picture) and seals one file for `conversation_id`.
+/// Cleans (a picture) and seals one file for `conversation_id`, under an attachment id this
+/// device chooses now (the upload names it, `id`), so the blob is bound to both.
 pub(crate) fn seal(
     path: &Path,
     name: &str,
@@ -122,7 +123,8 @@ pub(crate) fn seal(
     conversation_id: &str,
 ) -> Result<Sealed, String> {
     let unreadable = |err: std::io::Error| format!("{name} could not be read: {err}.");
-    let context = super::e2ee::attachment_context(conversation_id).ok_or(super::CHECK)?;
+    let id = super::e2ee::attachment_id()?;
+    let context = super::e2ee::attachment_context(conversation_id, &id).ok_or(super::CHECK)?;
     let key = super::e2ee::attachment_key()?;
     let dir = outgoing()?;
     let mut file = tempfile::Builder::new()
@@ -164,7 +166,7 @@ pub(crate) fn seal(
         file,
         sealed_len: info.sealed_len,
         entry: AttachmentRef {
-            id: String::new(),
+            id,
             key: AttachmentKey::from_bytes(*key.as_bytes()),
             name,
             mime,
@@ -207,22 +209,23 @@ pub(crate) fn upload_sealed(
         );
         let target = Target::post(super::endpoint(&saved.base_url, "/v1/media"))
             .header("Authorization", &format!("Bearer {}", saved.token));
-        let answer = match upload.send_form(at, &target, "file", &[("sealed", "1")]) {
-            Ok(answer) => answer,
-            Err(why) => return Err(super::messages::media_failure(&why)),
-        };
+        let chosen = sealed.entry.id.clone();
+        let answer =
+            match upload.send_form(at, &target, "file", &[("sealed", "1"), ("id", &chosen)]) {
+                Ok(answer) => answer,
+                Err(why) => return Err(super::messages::media_failure(&why)),
+            };
         let body: Value = serde_json::from_str(&answer.body).unwrap_or(Value::Null);
         let id = body
             .get("id")
             .and_then(Value::as_str)
             .or_else(|| body.pointer("/media/id").and_then(Value::as_str))
             .unwrap_or("");
-        if !super::safe_id(id) {
+        // The blob opens only under the id it was sealed with: the server must have kept it.
+        if !id.eq_ignore_ascii_case(&chosen) {
             return Err(super::UNREADABLE.to_owned());
         }
-        let mut entry = sealed.entry;
-        entry.id = id.to_owned();
-        entries.push(entry);
+        entries.push(sealed.entry);
         // The temporary file goes here; the upload holds it open no longer than this send.
         drop(sealed.file);
     }
@@ -307,7 +310,7 @@ mod tests {
             "nothing readable goes up"
         );
         assert_eq!(blob.len() as u64, sealed.sealed_len);
-        let context = super::super::e2ee::attachment_context(conv).unwrap();
+        let context = super::super::e2ee::attachment_context(conv, &sealed.entry.id).unwrap();
         let mut opened = Vec::new();
         attachment::open_verified(
             &sealed.entry.key,
@@ -315,19 +318,37 @@ mod tests {
             Cursor::new(&blob),
             &mut opened,
             &sealed.entry.sha256,
-            Some(sealed.entry.bytes),
+            sealed.entry.bytes,
         )
         .unwrap();
         assert!(image::load_from_memory(&opened).is_ok());
-        let elsewhere =
-            super::super::e2ee::attachment_context("00000000-0000-4000-8000-000000000001").unwrap();
+        let elsewhere = super::super::e2ee::attachment_context(
+            "00000000-0000-4000-8000-000000000001",
+            &sealed.entry.id,
+        )
+        .unwrap();
+        let other_id =
+            super::super::e2ee::attachment_context(conv, "00000000-0000-4000-8000-000000000002")
+                .unwrap();
+        assert!(
+            attachment::open_verified(
+                &sealed.entry.key,
+                &other_id,
+                Cursor::new(&blob),
+                std::io::sink(),
+                &sealed.entry.sha256,
+                sealed.entry.bytes
+            )
+            .is_err(),
+            "nor under another attachment id"
+        );
         assert!(attachment::open_verified(
             &sealed.entry.key,
             &elsewhere,
             Cursor::new(&blob),
             std::io::sink(),
             &sealed.entry.sha256,
-            None
+            sealed.entry.bytes
         )
         .is_err());
         let original = seal(&path, "photo.jpg", "image/jpeg", true, conv).unwrap();

@@ -91,11 +91,14 @@ pub(crate) fn with_secrets(session: &str, saved: &Saved, secrets: &Secrets) -> O
     };
     let mut changed = false;
     if let Value::Array(rows) = &mut value {
-        for row in rows.iter_mut().filter(|row| matches(row)) {
+        for row in rows
+            .iter_mut()
+            .filter(|row| matches(row) && row.get("e2ee").is_none())
+        {
             row["e2ee"] = secrets.clone();
             changed = true;
         }
-    } else if value.is_object() && matches(&value) {
+    } else if value.is_object() && matches(&value) && value.get("e2ee").is_none() {
         value["e2ee"] = secrets;
         changed = true;
     }
@@ -404,6 +407,9 @@ pub(crate) struct Device {
     /// The sealed attachments seen, by their id, with their conversation: to open them when
     /// fetched.
     files: HashMap<String, (String, OpenedFile)>,
+    /// People whose device list was checked since the server last said it changed
+    /// (`e2ee.device`): a sync does not ask for theirs again.
+    checked: BTreeSet<String>,
 }
 
 type Shared = Arc<Mutex<Device>>;
@@ -619,6 +625,7 @@ impl Device {
             caches: HashMap::new(),
             encrypted: HashMap::new(),
             files: HashMap::new(),
+            checked: BTreeSet::new(),
         }
     }
 
@@ -636,13 +643,26 @@ impl Device {
 
     /// The keys for this device: from the session, else made now and put in the keychain before
     /// anything is sealed with them.
-    fn secrets(&self) -> Result<Secrets, String> {
+    fn secrets(&mut self) -> Result<Secrets, String> {
         let key = (self.saved.base_url.clone(), self.saved.user_id.clone());
         if let Some(secrets) = &self.saved.e2ee {
             return Ok(secrets.clone());
         }
         if let Some(secrets) = lock(scratch_secrets()).get(&key) {
             return Ok(secrets.clone());
+        }
+        // Another start may have made them since this session was read: never replace those.
+        if let Some(kept) = crate::session::load(protocol::Network::Tiny)
+            .and_then(|session| super::saved_rows(&session).ok())
+            .and_then(|rows| {
+                rows.into_iter().find(|row| {
+                    row.user_id == self.saved.user_id && row.base_url == self.saved.base_url
+                })
+            })
+            .and_then(|row| row.e2ee)
+        {
+            self.saved.e2ee = Some(kept.clone());
+            return Ok(kept);
         }
         let secrets = Secrets::generate()?;
         if crate::session::enabled() {
@@ -657,6 +677,7 @@ impl Device {
         } else {
             lock(scratch_secrets()).insert(key, secrets.clone());
         }
+        self.saved.e2ee = Some(secrets.clone());
         Ok(secrets)
     }
 
@@ -859,6 +880,7 @@ impl Device {
                 if !report.rejected.is_empty() {
                     tracing::warn!("chatd: Tiny e2ee: {} device(s) of a member are not cross-signed; they are not trusted", report.rejected.len());
                 }
+                self.checked.insert(user_id.to_owned());
                 if self.notes.changed.remove(user_id) | self.notes.met.insert(user_id.to_owned()) {
                     self.save_notes();
                 }
@@ -965,8 +987,13 @@ impl Device {
                 }
             }
             users.insert(self.saved.user_id.clone());
-            for user in &users {
-                if let Err(why) = self.verify_user(user) {
+            for user in users
+                .iter()
+                .filter(|user| !self.checked.contains(*user))
+                .cloned()
+                .collect::<Vec<_>>()
+            {
+                if let Err(why) = self.verify_user(&user) {
                     tracing::warn!("chatd: Tiny e2ee: {conversation_id}: {why}");
                 }
             }
@@ -1502,7 +1529,7 @@ impl Device {
     pub(crate) fn sealed_file(&self, id: &str) -> Option<crate::adapters::SealedFile> {
         let (conversation_id, file) = self.files.get(id)?;
         let mut sealed = file.sealed()?;
-        sealed.context = attachment_context(conversation_id)?;
+        sealed.context = attachment_context(conversation_id, &file.id)?;
         Some(sealed)
     }
 
@@ -1537,6 +1564,7 @@ impl Device {
             }
             "e2ee.device" => {
                 let user = field("user_id");
+                self.checked.remove(&user);
                 if user == self.saved.user_id && !self.ready() {
                     // Approved from another device, maybe.
                     self.enrol();
@@ -1855,8 +1883,19 @@ pub(crate) fn answer(
 /// of the conversation's id, which the sender knows before it uploads (the attachment's own id is
 /// the server's and comes after; see `docs/e2ee-core-notes.md` 1.1). A blob moved into another
 /// conversation does not open there.
-pub(crate) fn attachment_context(conversation_id: &str) -> Option<Vec<u8>> {
-    uuid(conversation_id).map(|id| id.to_vec())
+pub(crate) fn attachment_context(conversation_id: &str, attachment_id: &str) -> Option<Vec<u8>> {
+    let mut context = uuid(conversation_id)?.to_vec();
+    context.extend_from_slice(&uuid(attachment_id)?);
+    Some(context)
+}
+
+/// A fresh attachment id, chosen by the sender before it seals the blob: a random (version 4) UUID.
+pub(crate) fn attachment_id() -> Result<String, String> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).map_err(|_| "No randomness is available.".to_owned())?;
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Ok(ConversationId(bytes).to_string())
 }
 
 /// A new attachment key, for a file about to be sealed.
@@ -1907,6 +1946,7 @@ mod tests {
             email: None,
             display_name: String::new(),
             role: "member".into(),
+            plain_http_ok: false,
             e2ee: None,
         };
         let secrets = Secrets::generate().unwrap();
@@ -1914,6 +1954,15 @@ mod tests {
         let written = with_secrets(one, &saved("https://a", "u1"), &secrets).unwrap();
         let back = super::super::parse(&written).unwrap();
         assert!(back.e2ee.as_ref().and_then(Secrets::keys).is_some());
+        assert!(
+            with_secrets(
+                &written,
+                &saved("https://a", "u1"),
+                &Secrets::generate().unwrap()
+            )
+            .is_none(),
+            "keys already kept are never replaced"
+        );
         assert!(with_secrets(one, &saved("https://b", "u1"), &secrets).is_none());
         let two = format!("[{one},{}]", one.replace("https://a", "https://b"));
         let written: Value =

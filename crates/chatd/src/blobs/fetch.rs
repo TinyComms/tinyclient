@@ -307,6 +307,7 @@ pub fn passing(why: &str) -> bool {
 /// part file. Nothing of a blob that fails any check is kept.
 fn open_sealed(want: &Want, sealed: &crate::adapters::SealedFile) -> Result<u64, String> {
     use e2ee::attachment::{self, AttachmentKey};
+    use std::fs::File;
     let refused = || "The file did not open: it is not the one its message names.".to_owned();
     let dir = want.part.parent().ok_or_else(refused)?;
     let kept = |err: std::io::Error| format!("The file could not be kept: {err}.");
@@ -317,7 +318,7 @@ fn open_sealed(want: &Want, sealed: &crate::adapters::SealedFile) -> Result<u64,
     }
     let blob = std::io::BufReader::new(File::open(want.part).map_err(kept)?);
     let key = AttachmentKey::from_bytes(sealed.key);
-    let expect = attachment::Expect { sha256: Some(&sealed.sha256), plain_len: Some(sealed.plain_len) };
+    let expect = attachment::Expect { sha256: Some(&sealed.sha256), plain_len: sealed.plain_len };
     let opened = attachment::decrypt_to_temp(&key, &sealed.context, blob, dir, expect).map_err(|_| refused())?;
     let mut head = [0u8; 64];
     let read = {
