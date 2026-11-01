@@ -1955,6 +1955,7 @@ impl Chat {
                 }
                 Err(err) => error(ErrorCode::Refused, format!("That key couldn't be remembered: {err}")),
             },
+            Request::TinyE2ee { account, ask } => adapters::tiny::e2ee_ask(account, ask),
             Request::TinyInvite { account, role } => adapters::tiny::invite(account, role),
             Request::TinyRole { account, user_id, role } => adapters::tiny::set_role(account, user_id, role),
             Request::TinyRemove { account, user_id } => adapters::tiny::remove(account, user_id),

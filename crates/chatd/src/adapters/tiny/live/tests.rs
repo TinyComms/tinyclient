@@ -257,6 +257,7 @@ fn run(base: &str, timing: Timing) -> Running {
         display_name: "Ada".to_owned(),
         role: "owner".to_owned(),
         plain_http_ok: false,
+        e2ee: None,
     };
     let live = Arc::new(Live::new().expect("a wake pair"));
     let socket_live = live.clone();
@@ -1043,7 +1044,7 @@ fn a_seat_lost_with_the_socket_is_taken_again_and_one_left_on_purpose_is_not() {
 }
 
 fn saved_for(base: &str) -> Saved {
-    Saved { base_url: base.to_owned(), token: "t".to_owned(), user_id: ME.to_owned(), email: None, display_name: "Ada".to_owned(), role: "owner".to_owned(), plain_http_ok: false }
+    Saved { base_url: base.to_owned(), token: "t".to_owned(), user_id: ME.to_owned(), email: None, display_name: "Ada".to_owned(), role: "owner".to_owned(), plain_http_ok: false, e2ee: None }
 }
 
 /// What the page reads of one seat beyond mute and deafen.

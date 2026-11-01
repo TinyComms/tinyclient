@@ -929,6 +929,7 @@ impl Discord {
         Download {
             url,
             headers: vec![("User-Agent".to_owned(), self.rest.identity().user_agent.clone())],
+            sealed: None,
         }
     }
 

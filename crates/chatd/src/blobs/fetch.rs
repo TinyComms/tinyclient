@@ -255,8 +255,9 @@ fn get(hosts: &Hosts, agent: &ureq::Agent, want: &Want, from: &Download, buffer:
     };
     let body = response.body();
     let mime = body.mime_type().unwrap_or("").to_ascii_lowercase();
-    // A sign-in page where a file should be is the usual way a session shows it has ended.
-    if mime == "text/html" || (expects_image(want.file.kind) && !mime.starts_with("image/")) {
+    // A sign-in page where a file should be is the usual way a session shows it has ended. A
+    // sealed file is opaque bytes on the wire whatever it is; its type is checked once opened.
+    if mime == "text/html" || (expects_image(want.file.kind) && from.sealed.is_none() && !mime.starts_with("image/")) {
         return Err(Failed::Other(format!("The server sent {mime:?}, not the file.")));
     }
     let too_large = || Failed::Other(format!("The file is larger than {} MB.", want.cap.div_ceil(MB)));
@@ -300,6 +301,100 @@ pub fn passing(why: &str) -> bool {
     status.is_some_and(|status| status >= 500 || status == 429 || status == 408)
 }
 
+/// Opens a sealed attachment that just arrived in `want.part`, in place: the sealed bytes are
+/// checked against the hash the message gave before anything is decrypted, opened into a second
+/// private file, checked for being what the message says they are, and only then moved over the
+/// part file. Nothing of a blob that fails any check is kept.
+fn open_sealed(want: &Want, sealed: &crate::adapters::SealedFile) -> Result<u64, String> {
+    use e2ee::attachment::{self, AttachmentKey};
+    use std::fs::File;
+    let refused = || "The file did not open: it is not the one its message names.".to_owned();
+    let dir = want.part.parent().ok_or_else(refused)?;
+    let kept = |err: std::io::Error| format!("The file could not be kept: {err}.");
+    // The hash first: nothing is decrypted from a blob that is not the one the message names.
+    let hashed = attachment::sha256_of(File::open(want.part).map_err(kept)?).map_err(|_| refused())?;
+    if hashed != sealed.sha256 {
+        return Err(refused());
+    }
+    let blob = std::io::BufReader::new(File::open(want.part).map_err(kept)?);
+    let key = AttachmentKey::from_bytes(sealed.key);
+    let expect = attachment::Expect { sha256: Some(&sealed.sha256), plain_len: sealed.plain_len };
+    let opened = attachment::decrypt_to_temp(&key, &sealed.context, blob, dir, expect).map_err(|_| refused())?;
+    let mut head = [0u8; 64];
+    let read = {
+        let mut file = File::open(opened.path()).map_err(|err| format!("The file could not be kept: {err}."))?;
+        let mut filled = 0;
+        while filled < head.len() {
+            match file.read(&mut head[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(err) => return Err(format!("The file could not be kept: {err}.")),
+            }
+        }
+        filled
+    };
+    if let Err(why) = what_it_says(want.file.kind, &sealed.mime, &sealed.name, &head[..read]) {
+        return Err(why.to_owned());
+    }
+    let _ = std::fs::remove_file(want.part);
+    opened.persist(want.part).map_err(|err| format!("The file could not be kept: {err}."))?;
+    Ok(sealed.plain_len)
+}
+
+/// The type of a file from its first bytes, never from what anyone says it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sniffed {
+    Png,
+    Jpeg,
+    Webp,
+    Gif,
+    /// A program: PE, ELF, Mach-O, or a script with `#!`.
+    Program,
+    Other,
+}
+
+pub fn sniff(head: &[u8]) -> Sniffed {
+    let starts = |magic: &[u8]| head.starts_with(magic);
+    if starts(b"\x89PNG\r\n\x1a\n") {
+        Sniffed::Png
+    } else if starts(&[0xFF, 0xD8, 0xFF]) {
+        Sniffed::Jpeg
+    } else if head.len() >= 12 && &head[..4] == b"RIFF" && &head[8..12] == b"WEBP" {
+        Sniffed::Webp
+    } else if starts(b"GIF87a") || starts(b"GIF89a") {
+        Sniffed::Gif
+    } else if starts(b"MZ") || starts(b"\x7fELF") || starts(b"#!") || [[0xFE, 0xED, 0xFA, 0xCE], [0xFE, 0xED, 0xFA, 0xCF], [0xCE, 0xFA, 0xED, 0xFE], [0xCF, 0xFA, 0xED, 0xFE], [0xCA, 0xFE, 0xBA, 0xBE]].iter().any(|magic| starts(magic)) {
+        Sniffed::Program
+    } else {
+        Sniffed::Other
+    }
+}
+
+/// A name that says the file is a program, so opening it is no surprise.
+fn says_program(name: &str) -> bool {
+    let extension = name.rsplit_once('.').map(|(_, ext)| ext.to_ascii_lowercase()).unwrap_or_default();
+    matches!(extension.as_str(), "exe" | "dll" | "msi" | "com" | "scr" | "bat" | "cmd" | "ps1" | "sh" | "bash" | "zsh" | "py" | "pl" | "rb" | "app" | "bin" | "elf" | "so" | "dylib" | "command" | "run" | "appimage")
+}
+
+/// Whether an opened sealed file is what its message says: a picture shown as one must be one
+/// of the formats the shell decodes, and a program must not come dressed as anything else. The
+/// sender is a member, and a member can be hostile.
+pub fn what_it_says(kind: MediaKind, mime: &str, name: &str, head: &[u8]) -> Result<(), &'static str> {
+    let found = sniff(head);
+    let picture = match mime {
+        "image/png" => Some(Sniffed::Png),
+        "image/jpeg" => Some(Sniffed::Jpeg),
+        "image/webp" => Some(Sniffed::Webp),
+        "image/gif" => Some(Sniffed::Gif),
+        _ => None,
+    };
+    match kind {
+        MediaKind::Image | MediaKind::Gif | MediaKind::Avatar | MediaKind::Icon | MediaKind::Emoji if picture != Some(found) => Err("The file is not the picture its message says it is, so it was not opened."),
+        _ if found == Sniffed::Program && !says_program(name) => Err("The file is a program that says it is something else, so it was not opened."),
+        _ => Ok(()),
+    }
+}
+
 /// Fetches one file into `want.part` and answers its size and the address it came from, or why
 /// it could not be fetched, in words the user can read. Whatever a failure left of the part
 /// file is removed.
@@ -320,6 +415,7 @@ fn fetch(hosts: &Hosts, agent: &ureq::Agent, want: &Want, buffer: &mut [u8]) -> 
     let registered = Download {
         url: want.url.to_owned(),
         headers: Vec::new(),
+        sealed: None,
     };
     match hosts.trust(want.network, want.url) {
         None => Err(format!("{} does not serve files from that address.", want.network.label())),
@@ -327,7 +423,10 @@ fn fetch(hosts: &Hosts, agent: &ureq::Agent, want: &Want, buffer: &mut [u8]) -> 
         Some(Trust::Session) => {
             let from = ask(want.adapter, &want.file.id, want.url)?;
             let bytes = get(hosts, agent, want, &from, buffer).map_err(explain)?;
-            Ok((bytes, from.url))
+            match &from.sealed {
+                Some(sealed) => Ok((open_sealed(want, sealed)?, from.url)),
+                None => Ok((bytes, from.url)),
+            }
         }
         Some(Trust::Open) => {
             // An address that says it has run out is not asked: that would be a refusal from
@@ -355,6 +454,24 @@ fn fetch(hosts: &Hosts, agent: &ureq::Agent, want: &Want, buffer: &mut [u8]) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_opened_sealed_file_must_be_what_its_message_says() {
+        let png = b"\x89PNG\r\n\x1a\n....";
+        let jpeg = [0xFF, 0xD8, 0xFF, 0xE0];
+        assert_eq!(sniff(png), Sniffed::Png);
+        assert_eq!(sniff(&jpeg), Sniffed::Jpeg);
+        assert_eq!(sniff(b"RIFF\0\0\0\0WEBPVP8 "), Sniffed::Webp);
+        assert_eq!(sniff(b"MZ\x90\0"), Sniffed::Program);
+        assert_eq!(sniff(b"#!/bin/sh"), Sniffed::Program);
+        assert_eq!(sniff(b"%PDF-1.7"), Sniffed::Other);
+        assert!(what_it_says(MediaKind::Image, "image/png", "a.png", png).is_ok());
+        assert!(what_it_says(MediaKind::Image, "image/png", "a.png", &jpeg).is_err(), "a JPEG called a PNG is refused as a picture");
+        assert!(what_it_says(MediaKind::Image, "image/jpeg", "a.jpg", b"<svg").is_err(), "nothing else decodes as a picture");
+        assert!(what_it_says(MediaKind::File, "application/pdf", "report.pdf", b"MZ\x90").is_err(), "a program dressed as a document");
+        assert!(what_it_says(MediaKind::File, "application/octet-stream", "setup.exe", b"MZ\x90").is_ok(), "a program that says it is one is the OS's to check");
+        assert!(what_it_says(MediaKind::File, "application/pdf", "report.pdf", b"%PDF-1.7").is_ok());
+    }
 
     fn trust(network: Network, url: &str) -> Option<Trust> {
         Hosts { local: vec![("127.0.0.1".to_owned(), Trust::Open)] }.trust(network, url)
@@ -402,6 +519,7 @@ mod tests {
                     let _ = reply.send(Ok(Download {
                         url: to.clone(),
                         headers: vec![("Authorization".to_owned(), "Bearer xoxc-1".to_owned())],
+                        sealed: None,
                     }));
                 }
             }

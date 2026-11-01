@@ -14,6 +14,7 @@ use std::path::PathBuf;
 pub mod browser;
 mod call;
 pub mod crash;
+mod e2ee;
 pub mod hotkey;
 pub mod log_policy;
 pub mod private;
@@ -22,6 +23,7 @@ pub mod ipc;
 pub mod launch;
 mod message;
 mod play;
+pub mod quarantine;
 mod react;
 pub mod settings;
 mod signin;
@@ -29,6 +31,7 @@ mod tiny;
 
 pub use call::*;
 pub use crash::redact;
+pub use e2ee::*;
 pub use info::*;
 pub use ipc::{ChatListener, ChatStream};
 pub use message::*;
@@ -429,6 +432,10 @@ pub struct Conversation {
     /// Only invited people see it: drawn with a lock.
     #[serde(default, skip_serializing_if = "is_false")]
     pub private: bool,
+    /// End-to-end encrypted or not, where the network says (a Tiny server). Fixed when it was
+    /// made: a plaintext conversation never becomes an encrypted one.
+    #[serde(default, skip_serializing_if = "Encryption::is_unknown")]
+    pub encryption: Encryption,
     /// What the user had typed and not sent, kept by chatd across restarts (`SetDraft`).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub draft: String,
@@ -532,6 +539,7 @@ impl Conversation {
             limit: 0,
             read_only: false,
             private: false,
+            encryption: Encryption::Unknown,
             draft: String::new(),
             folders: Vec::new(),
             archived: false,
@@ -1641,6 +1649,12 @@ pub enum Request {
         account: AccountKey,
         options: TinyInviteOptions,
     },
+    /// End-to-end encrypted text: this device, this person's devices, other people's safety
+    /// numbers, approving a device, the recovery key (`E2eeAsk` says what each answers).
+    TinyE2ee {
+        account: AccountKey,
+        ask: E2eeAsk,
+    },
     /// One page of the audit. Answers `TinyAudit`.
     TinyAudit {
         account: AccountKey,
@@ -1992,6 +2006,18 @@ pub enum Response {
     /// One page of a Tiny server's audit, newest first. Fewer rows than the limit: the end.
     TinyAudit {
         audit: Vec<TinyAudit>,
+    },
+    /// What `E2eeAsk::Status` asked.
+    TinyE2ee {
+        status: E2eeStatus,
+    },
+    /// What `E2eeAsk::Person` asked.
+    TinyE2eePerson {
+        person: E2eePerson,
+    },
+    /// A recovery key just made, shown once: 24 characters in six groups.
+    TinyRecoveryKey {
+        key: String,
     },
     CallStats {
         stats: CallStats,
