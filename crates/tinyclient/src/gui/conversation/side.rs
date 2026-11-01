@@ -447,7 +447,9 @@ impl Shell {
         let shell = cx.weak_entity();
         let root = root.clone();
         let view = cx.new(|cx| {
-            let mut view = Pane::new(super::tokens::Metrics::DENSE, shell, cx);
+            // On a phone the thread is a page of its own, read as the conversation is.
+            let metrics = if crate::gui::phone::active() { super::tokens::Metrics::PHONE } else { super::tokens::Metrics::DENSE };
+            let mut view = Pane::new(metrics, true, shell, cx);
             view.show_thread(key, &title, &me, root, cx);
             view
         });

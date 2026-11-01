@@ -186,6 +186,8 @@ type Seen = Rc<RefCell<Vec<(usize, Bounds<Pixels>)>>>;
 /// The messages of one conversation, or of one thread.
 pub struct Pane {
     metrics: Metrics,
+    /// A thread's pane, not a conversation's.
+    thread: bool,
     shell: WeakEntity<Shell>,
     open: Option<Open>,
     window: pages::Window,
@@ -297,11 +299,14 @@ pub struct Pane {
 }
 
 impl Pane {
-    fn new(metrics: Metrics, shell: WeakEntity<Shell>, cx: &mut Context<Self>) -> Pane {
+    /// `thread`: the pane under a message, which reads down from its root and has no
+    /// conversation's own staging. A desktop draws it `DENSE`; a phone, as its conversations.
+    fn new(metrics: Metrics, thread: bool, shell: WeakEntity<Shell>, cx: &mut Context<Self>) -> Pane {
         // A thread reads down from its root; a conversation up from its newest message.
-        let alignment = if metrics == Metrics::DENSE { ListAlignment::Top } else { ListAlignment::Bottom };
+        let alignment = if thread { ListAlignment::Top } else { ListAlignment::Bottom };
         Pane {
             metrics,
+            thread,
             shell,
             open: None,
             window: pages::Window::default(),
@@ -358,12 +363,12 @@ impl Pane {
             opening: false,
             seen: Rc::default(),
             #[cfg(feature = "gui-shot")]
-            script: if metrics == Metrics::DENSE { shot::Script::default() } else { shot::Script::from_env() },
+            script: if thread { shot::Script::default() } else { shot::Script::from_env() },
         }
     }
 
     fn is_thread(&self) -> bool {
-        self.metrics == Metrics::DENSE
+        self.thread
     }
 
     /// Shows this conversation. The same one again only takes its new title and picture.
@@ -623,7 +628,7 @@ impl Pane {
                 self.land = !super::app::prefs::choices().newest && self.items.iter().any(|item| matches!(item, Item::New));
                 // A phone decides where the open lands once the rows are measured; placing
                 // unread wins over both.
-                self.opening = self.metrics == Metrics::PHONE && !self.land;
+                self.opening = self.metrics == Metrics::PHONE && !self.thread && !self.land;
             }
             _ if mine => self.snap_to_end(),
             _ => {}
@@ -1284,7 +1289,7 @@ impl Shell {
             .get_or_init(|| {
                 let shell = cx.weak_entity();
                 let metrics = if super::phone::active() { Metrics::PHONE } else { Metrics::FULL };
-                cx.new(|cx| Pane::new(metrics, shell, cx))
+                cx.new(|cx| Pane::new(metrics, false, shell, cx))
             })
             .clone();
         self.subscribe_pane(&pane, cx);

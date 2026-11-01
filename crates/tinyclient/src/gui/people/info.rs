@@ -963,6 +963,24 @@ impl Shell {
         self.conversation_act(Request::Leave { conversation: conversation.key.clone() }, format!("Can't leave {}", conversation.title), cx);
     }
 
+    /// Where the network's own app opens a row, and whether the user can leave it: what a row's
+    /// sheet offers on a phone.
+    pub(in crate::gui) fn row_reach(&self, row: &Conversation) -> (Option<String>, bool) {
+        (facts::conversation_link(row, None), facts::can_leave(row))
+    }
+
+    /// Asks once, then leaves: the same confirm Details' "…" asks, from a row's sheet.
+    pub(in crate::gui) fn confirm_leave(&mut self, conversation: Conversation, cx: &mut Context<Self>) {
+        self.open_float(Float::Leave(conversation), gpui::Point::default(), cx);
+    }
+
+    /// A row's notifications, from its menu: everything, or nothing. The row changes when the
+    /// network says so.
+    pub(in crate::gui) fn set_row_mute(&mut self, conversation: Key, mute: bool, cx: &mut Context<Self>) {
+        let notify = if mute { Notify::Nothing } else { Notify::All };
+        self.conversation_act(Request::SetMute { conversation, notify }, "Can't change notifications".to_owned(), cx);
+    }
+
     /// Closes a DM as the network's own ×: it leaves the list until a new message.
     pub(in crate::gui) fn close_direct(&mut self, conversation: Key, cx: &mut Context<Self>) {
         self.conversation_act(Request::CloseDirect { conversation }, "Can't close this conversation".to_owned(), cx);

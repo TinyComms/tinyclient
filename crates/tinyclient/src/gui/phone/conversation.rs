@@ -35,14 +35,9 @@ impl Shell {
         let place = open.space_title.trim().to_owned();
         let subtitle = (!direct && !place.is_empty())
             .then(|| div().min_w_0().truncate().phone_stamp().font_weight(theme::REGULAR).text_color(theme::text_faint()).child(place));
-        let call = self.snapshot.as_ref().and_then(|snapshot| self.call_pill(snapshot, cx)).map(|call| {
-            // Only the 14 pt glyph fits beside a phone's title, as in a narrow desktop strip: it
-            // is centered in a 32 box and the words are pushed past its edge.
-            div()
-                .flex_none()
-                .mx(px(6.))
-                .child(call.h(px(32.)).w(px(32.)).pl(px(8.)).pr_0().gap(px(32.)).overflow_hidden().rounded(px(theme::R_CONTROL)).whitespace_nowrap())
-        });
+        // The call is one of the strip's glyphs (`call_pill` draws it so on a phone): 44 pt, no
+        // box, beside Members and Details.
+        let call = self.snapshot.as_ref().and_then(|snapshot| self.call_pill(snapshot, cx));
         let action = |id: &'static str, icon: &'static str| {
             icon_button(id, icon, false).size(px(tokens::TOUCH)).on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         };

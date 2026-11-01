@@ -750,13 +750,18 @@ impl Shell {
 
     /// `shift-esc`: the open conversation is read up to its newest message.
     pub(super) fn mark_open_read(&mut self, cx: &mut Context<Self>) {
+        if let Some(conversation) = self.open.clone() {
+            self.mark_read(conversation, cx);
+        }
+    }
+
+    /// Marks a conversation read up to its newest message, here and on the network: a row's
+    /// menu, or the open conversation's Mark as Read.
+    pub(super) fn mark_read(&mut self, conversation: Key, cx: &mut Context<Self>) {
         // A screenshot or a driven test never reads anything on a network.
         if cfg!(feature = "gui-shot") {
             return;
         }
-        let Some(conversation) = self.open.clone() else {
-            return;
-        };
         let read = move || -> io::Result<()> {
             let newest = Request::Messages { conversation: conversation.clone(), page: Page::Newest, limit: 1 };
             if let Response::Messages { messages, .. } = ask(&newest)? {

@@ -509,8 +509,9 @@ impl Pane {
         let bar = if editing { Some(theme::accent()) } else { bar };
         let owns = self.owns_overlay(&message.id);
 
-        let gutter: Option<Div> = Some(if head {
-            self.avatar(message, window, cx)
+        let gutter: Option<AnyElement> = Some(if head {
+            let face = self.avatar(message, window, cx);
+            self.author_tap(face, "author-face", message, cx)
         } else {
             div()
                 .w(px(metrics.avatar))
@@ -523,6 +524,7 @@ impl Pane {
                 .text_color(gpui::transparent_black())
                 .group_hover("row", |style| style.text_color(theme::text_faint()))
                 .child(short_clock(message.sent))
+                .into_any_element()
         });
 
         let mut sent = div().flex().flex_col();
@@ -556,7 +558,10 @@ impl Pane {
             .min_w_0()
             .flex()
             .flex_col()
-            .children(head.then(|| self.header(message)))
+            .children(head.then(|| {
+                let header = self.header(message);
+                self.author_tap(header, "author-name", message, cx)
+            }))
             .child(sent)
             .children(self.reactions(message, window, cx))
             .children(self.thread_line(message, window, cx))
@@ -618,6 +623,22 @@ impl Pane {
             .children(self.toolbar(message, cx));
         // The gap above a group is outside the row, so it does not light up on hover.
         div().w_full().when(head && !root, |row| row.pt(px(8.))).child(inner).into_any_element()
+    }
+
+    /// On a phone a tap on who said it, their face or their name, opens their Profile page, as
+    /// a click on an @mention does. Mine and an app's open nothing; the desktop draws them as is.
+    fn author_tap(&self, part: Div, what: &'static str, message: &Message, cx: &mut Context<Self>) -> AnyElement {
+        let person = self.person(&message.sender.id).filter(|_| self.metrics == Metrics::PHONE && !message.outgoing && !message.sender.bot);
+        let Some(person) = person else {
+            return part.into_any_element();
+        };
+        part.id(name_id(what, &message.id))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, window, cx| {
+                let (person, at) = (person.clone(), window.mouse_position());
+                let _ = this.shell.update(cx, |shell, cx| shell.open_profile(person, at, cx));
+            }))
+            .into_any_element()
     }
 
     fn person(&self, id: &str) -> Option<Key> {

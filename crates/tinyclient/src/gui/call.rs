@@ -22,7 +22,7 @@ use super::theme;
 use crate::client::ask;
 use gpui::{
     div, prelude::*, px, Action, AnyElement, App, Context, Div, Entity, FontWeight, Global, KeyBinding,
-    MouseButton, Rgba, Stateful, Svg, Task, WeakEntity, Window,
+    MouseButton, Rgba, SharedString, Stateful, Svg, Task, WeakEntity, Window,
 };
 use protocol::{
     Call, CallFailure, CallState, CallSupport, Change, ConversationKind, Key, MediaFile, Network,
@@ -765,22 +765,41 @@ impl Shell {
         let mine = shown(snapshot).filter(|call| {
             call.conversation == key && !matches!(call.state, CallState::Failed { .. })
         });
-        let pill = div()
-            .id("call")
-            .group("call-pill")
-            .flex_none()
-            .h(px(30.))
-            .px(px(12.))
-            .rounded(px(15.))
-            .border_1()
-            .flex()
-            .items_center()
-            .gap(px(7.))
-            .text_size(px(12.5))
-            .font_weight(FontWeight::MEDIUM)
-            .cursor_pointer()
-            // Keep the press from also dragging the window.
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+        // On a phone the strip's actions are glyphs in 44 pt targets, Members and Details beside
+        // it: the call is one more of them, its glyph alone, tinted by what it does.
+        let phone = super::phone::active();
+        let pill = if phone {
+            div()
+                .id("call")
+                .group("call-pill")
+                .flex_none()
+                .size(px(44.))
+                .rounded(px(theme::R_CONTROL))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .active(|style| style.bg(theme::pressed()))
+        } else {
+            div()
+                .id("call")
+                .group("call-pill")
+                .flex_none()
+                .h(px(30.))
+                .px(px(12.))
+                .rounded(px(15.))
+                .border_1()
+                .flex()
+                .items_center()
+                .gap(px(7.))
+                .text_size(px(12.5))
+                .font_weight(FontWeight::MEDIUM)
+                .cursor_pointer()
+        }
+        // Keep the press from also dragging the window.
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+        let words = |words: SharedString| (!phone).then_some(words);
+        let glyph = |size: f32| if phone { 16. } else { size };
 
         if let Some(call) = mine {
             let incoming = matches!(call.state, CallState::RingingIn { .. });
@@ -791,7 +810,7 @@ impl Shell {
             };
             let hint = if incoming { ("Decline the call", "⌘⇧R") } else { ("Leave the call", "⌘⇧H") };
             return Some(
-                pill.bg(theme::danger_soft())
+                pill.when(!phone, |pill| pill.bg(theme::danger_soft()))
                     .border_color(gpui::transparent_black())
                     .text_color(theme::danger())
                     .hover(|style| style.bg(theme::danger_fill()).text_color(theme::on_accent()))
@@ -803,8 +822,8 @@ impl Shell {
                             this.call_leave(cx);
                         }
                     }))
-                    .child(icon("icons/phone-off.svg", 14., theme::danger(), Some(("call-pill", theme::on_accent()))))
-                    .child(word),
+                    .child(icon("icons/phone-off.svg", glyph(14.), theme::danger(), Some(("call-pill", theme::on_accent()))))
+                    .children(words(word.into())),
             );
         }
         let network = key.network;
@@ -821,17 +840,17 @@ impl Shell {
                 let running = shot.as_ref().or(running);
                 if let Some(there) = running {
                     return Some(
-                        pill.bg(theme::accent_soft())
+                        pill.when(!phone, |pill| pill.bg(theme::accent_soft()))
                             .border_color(gpui::transparent_black())
                             .text_color(theme::accent())
                             .hover(|style| style.bg(theme::accent_wash()))
                             .tooltip(tip(named(there), None))
                             .on_click(cx.listener(move |this, _, _, cx| this.call_start(key.clone(), cx)))
-                            .child(icon("icons/phone.svg", 14., theme::accent(), None))
-                            .child(format!("Join call · {}", there.total)),
+                            .child(icon("icons/phone.svg", glyph(14.), theme::accent(), None))
+                            .children(words(format!("Join call · {}", there.total).into())),
                     );
                 }
-                let (glyph, word, hint) = if voice {
+                let (mark, word, hint) = if voice {
                     (
                         "icons/volume-2.svg",
                         "Join voice",
@@ -841,14 +860,14 @@ impl Shell {
                     ("icons/phone.svg", "Call", format!("Call {} on {}", open.title, network.label()))
                 };
                 Some(
-                    pill.bg(theme::raised())
+                    pill.when(!phone, |pill| pill.bg(theme::raised()))
                         .border_color(theme::hairline())
                         .text_color(theme::text())
                         .hover(|style| style.bg(theme::selected()))
                         .tooltip(tip(hint, None))
                         .on_click(cx.listener(move |this, _, _, cx| this.call_start(key.clone(), cx)))
-                        .child(icon(glyph, 14., theme::text(), None))
-                        .child(word),
+                        .child(icon(mark, glyph(14.), if phone { theme::text_soft() } else { theme::text() }, None))
+                        .children(words(word.into())),
                 )
             }
             // Never says "Call": it is a different object, and it starts nothing here.
@@ -864,9 +883,9 @@ impl Shell {
                         None,
                     ))
                     .on_click(cx.listener(move |this, _, _, cx| this.call_handoff(key.clone(), cx)))
-                    .child(network_icon(network, 14.))
-                    .child(handoff_label(network))
-                    .child(icon("icons/arrow-up-right.svg", 12., theme::text_faint(), None)),
+                    .child(network_icon(network, glyph(14.)))
+                    .children(words(handoff_label(network).into()))
+                    .children((!phone).then(|| icon("icons/arrow-up-right.svg", 12., theme::text_faint(), None))),
             ),
         }
     }

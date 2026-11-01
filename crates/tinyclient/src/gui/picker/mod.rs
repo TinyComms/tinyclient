@@ -334,6 +334,17 @@ impl Picker {
         }
     }
 
+    /// The bands' side padding: the popover's [`PAD`], or, in a phone's wider sheet, the grid's
+    /// own edge, so the tabs, the search field, the section strip and the footer line up with
+    /// the emoji under them.
+    fn side(&self) -> f32 {
+        if self.width > WIDTH + 0.5 {
+            self.grid_pad()
+        } else {
+            PAD
+        }
+    }
+
     /// The emoji grid's side padding: the popover's 6, or what centres its columns when wider.
     fn grid_pad(&self) -> f32 {
         if self.width > WIDTH + 0.5 {
@@ -792,12 +803,12 @@ impl Picker {
                     })),
             );
         }
-        Some(div().flex_none().h(px(TABS)).px(px(PAD)).pt(px(6.)).child(control).into_any_element())
+        Some(div().flex_none().h(px(TABS)).px(px(self.side())).pt(px(6.)).child(control).into_any_element())
     }
 
     fn search_band(&self) -> AnyElement {
         let field = field(true).w_full().child(glyph("icons/search.svg", 14., theme::text_faint())).child(div().flex_1().min_w_0().child(self.input.clone()));
-        div().flex_none().h(px(SEARCH)).px(px(PAD)).pb(px(8.)).flex().items_end().child(field).into_any_element()
+        div().flex_none().h(px(SEARCH)).px(px(self.side())).pb(px(8.)).flex().items_end().child(field).into_any_element()
     }
 
     fn strip_band(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -814,7 +825,9 @@ impl Picker {
                 .when(selected, |button| button.bg(theme::selected()))
                 .hover(|style| style.bg(theme::hover()))
         };
-        let strip = div().flex_none().h(px(STRIP)).px(px(PAD)).flex().items_center().gap(px(2.)).overflow_hidden();
+        // A phone's sheet spreads the sections across the grid's width.
+        let wide = self.width > WIDTH + 0.5;
+        let strip = div().flex_none().h(px(STRIP)).px(px(self.side())).flex().items_center().gap(px(2.)).when(wide, |strip| strip.justify_between()).overflow_hidden();
         match self.tab {
             Tab::Emoji if self.query(cx).is_empty() => {
                 let mut strip = strip;
@@ -896,7 +909,7 @@ impl Picker {
         let footer = div()
             .flex_none()
             .h(px(FOOTER))
-            .px(px(PAD))
+            .px(px(self.side()))
             .border_t_1()
             .border_color(theme::hairline())
             .flex()

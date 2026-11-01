@@ -24,6 +24,10 @@ pub const SOURCE: &str = "members";
 fn row() -> f32 {
     if crate::gui::phone::active() { theme::row_height(theme::ROW_ONE) } else { theme::ROW_ONE }
 }
+/// A member's face: the desktop's 20, and 28 on a phone, beside its larger name.
+fn face() -> f32 {
+    if crate::gui::phone::active() { 28. } else { 20. }
+}
 const PAGE: u32 = 50;
 /// Pages of members held; the ones farthest from the viewport go first.
 const PAGES_KEPT: usize = 64;
@@ -412,7 +416,21 @@ impl MemberList {
         let in_call = !person.bot && in_call(&self.hub, &self.scene, &person.key);
         let (profile, shell) = (person.key.clone(), self.shell.clone());
         let (menu_of, menu_shell) = (person.key.clone(), self.shell.clone());
-        div().id(("member", ix)).w_full().h(px(row())).px(px(theme::INSET)).child(
+        let phone = crate::gui::phone::active();
+        let tapped = (profile.clone(), shell.clone());
+        div()
+            .id(("member", ix))
+            .w_full()
+            .h(px(row()))
+            .px(px(theme::INSET))
+            // A finger's press may be the start of a scroll: a phone opens the person on release.
+            .when(phone, |row| {
+                row.on_click(move |event, _, cx| {
+                    let (profile, shell) = tapped.clone();
+                    let _ = shell.update(cx, |shell, cx| shell.open_profile(profile, event.position(), cx));
+                })
+            })
+            .child(
             div()
                 .group("member")
                 .size_full()
@@ -420,11 +438,13 @@ impl MemberList {
                 .rounded(px(theme::R_CONTROL))
                 .flex()
                 .items_center()
-                .gap(px(8.))
+                .gap(px(if phone { 12. } else { 8. }))
                 .cursor_pointer()
-                .hover(|style| style.bg(theme::hover()))
-                .on_mouse_down(MouseButton::Left, move |event, _, cx| {
-                    let _ = shell.update(cx, |shell, cx| shell.open_profile(profile.clone(), event.position, cx));
+                .when(!phone, |row| row.hover(|style| style.bg(theme::hover())))
+                .when(!phone, |row| {
+                    row.on_mouse_down(MouseButton::Left, move |event, _, cx| {
+                        let _ = shell.update(cx, |shell, cx| shell.open_profile(profile.clone(), event.position, cx));
+                    })
                 })
                 .on_mouse_down(MouseButton::Right, move |event, _, cx| {
                     let _ = menu_shell.update(cx, |shell, cx| shell.open_row_menu(menu_of.clone(), event.position, cx));
@@ -433,7 +453,7 @@ impl MemberList {
                     div()
                         .flex_none()
                         .when(away, |avatar| avatar.opacity(0.45))
-                        .child(person_avatar(&self.hub, person, 20., &ring, in_call, cx)),
+                        .child(person_avatar(&self.hub, person, face(), &ring, in_call, cx)),
                 )
                 .child(
                     div()
@@ -470,7 +490,7 @@ fn waiting_row() -> Div {
         .flex()
         .items_center()
         .gap(px(8.))
-        .child(div().size(px(20.)).rounded(px(10.)).bg(theme::hover()))
+        .child(div().size(px(face())).rounded_full().bg(theme::hover()))
         .child(skeleton(104., 10.))
 }
 

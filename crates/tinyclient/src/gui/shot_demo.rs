@@ -512,6 +512,29 @@ fn build() -> Fixture {
                 last.spans = vec![span(&text, "@Robin", Style::Mention { kind: MentionKind::User, id: ME.into() })];
                 last.mentions_me = true;
             }
+            // The migration notice has a thread under it, as Slack keeps the talk about it.
+            if let Some(first) = said.first_mut() {
+                let thread = Key { id: "c-platform:th-pg".into(), ..row.key.clone() };
+                let replies = vec![
+                    ("theo", "Will the preview env come back on its own after?", 235),
+                    ("mara", "Yes, the deploy job restarts it. I'll check it by hand too.", 230),
+                    (ME, "I'll keep an eye on the error rate while it runs", 228),
+                    ("mara", "Thanks! I'll post the before and after numbers here.", 225),
+                ];
+                let in_thread: Vec<Message> = replies
+                    .iter()
+                    .enumerate()
+                    .map(|(ix, (from, text, minutes))| message(&format!("th-pg-{ix}"), from, text, row.updated - minutes * 60))
+                    .collect();
+                first.thread = Some(protocol::ThreadSummary {
+                    id: thread.id.clone(),
+                    replies: replies.len() as u32,
+                    last: row.updated - 225 * 60,
+                    participants: ["mara", ME, "theo"].into_iter().map(|id| Key { id: id.into(), ..row.key.clone() }).collect(),
+                    unread: 0,
+                });
+                messages.push((thread, in_thread));
+            }
         }
         messages.push((row.key.clone(), said));
     }
@@ -695,6 +718,62 @@ fn hits(query: &str, only: Option<&Key>) -> Vec<MessageHit> {
     out
 }
 
+/// The Tiny server "Premier", as its owner sees it: three people, two rooms, one open invite.
+fn premier() -> protocol::TinyCommunity {
+    let member = |user_id: &str, name: &str, email: &str, role: &str, days: i64| protocol::TinyMember {
+        user_id: user_id.into(),
+        email: email.into(),
+        display_name: name.into(),
+        role: role.into(),
+        created_at: stamp(on_day(days, 12, 0)),
+    };
+    protocol::TinyCommunity {
+        role: "owner".into(),
+        members: vec![
+            member(ME, ME_NAME, "robin@example.com", "owner", 120),
+            member("halvard", "Halvard Eide", "halvard@example.com", "admin", 90),
+            member("ana", "Ana Ruiz", "", "member", 12),
+        ],
+        invites: vec![protocol::TinyInvite {
+            id: "inv-1".into(),
+            role: "member".into(),
+            created_by: ME.into(),
+            expires_at: stamp(now() + 5 * 86_400),
+            accepted_at: None,
+            accepted_by: None,
+        }],
+        audit: Vec::new(),
+        origin: "https://premier.example".into(),
+        rooms: vec![
+            protocol::TinyRoom { id: "c-lobby".into(), name: "lobby".into(), participants: Vec::new() },
+            protocol::TinyRoom {
+                id: "r-games".into(),
+                name: "game night".into(),
+                participants: vec![protocol::TinySeat { user_id: "halvard".into(), muted: false, deafened: false, speaking: false }],
+            },
+        ],
+        online: vec![ME.into(), "halvard".into()],
+        media: "up".into(),
+    }
+}
+
+/// Unix seconds as the server writes them: RFC 3339, UTC.
+fn stamp(unix: i64) -> String {
+    let days = unix.div_euclid(86_400);
+    let seconds = unix.rem_euclid(86_400);
+    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z", seconds / 3600, seconds % 3600 / 60, seconds % 60)
+}
+
 /// What the made-up chatd says to one request.
 pub fn answer(request: &Request) -> std::io::Result<Response> {
     let fixture = fixture();
@@ -863,8 +942,8 @@ pub fn answer(request: &Request) -> std::io::Result<Response> {
         Request::Storage => Response::Storage { messages: 48_213, files: 734_003_200 },
         Request::Prunable { .. } => Response::Prunable { messages: 0, bytes: 0 },
         Request::SignIn { .. } => Response::Error { code: protocol::ErrorCode::SignIn, detail: "The sign-in window was closed.".into() },
+        Request::TinyCommunity { .. } => Response::TinyCommunity { community: premier() },
         Request::SignInBegin { .. }
-        | Request::TinyCommunity { .. }
         | Request::Handoff { .. }
         | Request::CallStart { .. }
         | Request::Media(_) => Response::Error { code: protocol::ErrorCode::Unsupported, detail: "Not in the demo.".into() },

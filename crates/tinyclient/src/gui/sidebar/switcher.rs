@@ -528,7 +528,8 @@ impl Shell {
             (_, Some(words)) => Some(div().flex_none().type_small().text_color(theme::text_soft()).child(words)),
             (Target::Conversation(c), None) => row_badge(c),
             (Target::Space(key), None) => self.spaces.iter().find(|s| &s.key == key).and_then(|s| rollup_badge(s.attention, s.unread)),
-            (Target::Search(_), None) => Some(keycap("⌘⇧F")),
+            // A phone has no keys to name.
+            (Target::Search(_), None) if !crate::gui::phone::active() => Some(keycap("⌘⇧F")),
             _ => None,
         };
         // The letters that matched are heavier: the order is the rank, and this is why.

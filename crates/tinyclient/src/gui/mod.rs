@@ -284,6 +284,7 @@ mod shot {
                     Some("people") => shell.go(Mode::People, cx),
                     Some("discord") => shell.go(Mode::Network(Network::Discord), cx),
                     Some("slack") => shell.go(Mode::Network(Network::Slack), cx),
+                    Some("tiny") => shell.go(Mode::Network(Network::Tiny), cx),
                     Some("space") => {
                         if let Some(space) = shell.spaces.get(space) {
                             shell.go(Mode::Space(space.key.clone()), cx);

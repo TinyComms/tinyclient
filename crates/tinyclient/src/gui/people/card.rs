@@ -152,6 +152,11 @@ impl Floating {
     }
 
     pub fn open(&mut self, float: Float, anchor: Point<Pixels>, cx: &mut Context<Self>) {
+        // On a phone a person's card is their Profile page, never a popover over the screen.
+        if let (true, Float::Card(person)) = (crate::gui::phone::active(), &float) {
+            let person = person.clone();
+            return self.shell_do(cx, move |shell, cx| shell.phone_profile(person, cx));
+        }
         if let Some(person) = float.person() {
             // Their presence is drawn, so it is watched for as long as this is up.
             self.hub.watch("profile", [person.clone()], cx);
@@ -542,8 +547,10 @@ impl Floating {
         let (title, words, verb) = facts::confirm_words(act, name, network);
         let size = window.viewport_size();
         let then = std::rc::Rc::new(then);
+        // A phone keeps 16 pt of screen on each side of it.
+        let wide = if crate::gui::phone::active() { CONFIRM_WIDTH.min(f32::from(size.width) - 32.) } else { CONFIRM_WIDTH };
         let panel = div()
-            .w(px(CONFIRM_WIDTH))
+            .w(px(wide))
             .p(px(20.))
             .rounded(px(theme::R_MODAL))
             .bg(theme::overlay())

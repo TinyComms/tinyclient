@@ -9,6 +9,7 @@ use crate::gui::components::{
 };
 use crate::gui::input::{InputEvent, InputKey, TextInput};
 use crate::gui::state::Shell;
+use crate::gui::phone::tokens::PhoneType;
 use crate::gui::theme::{self, Type};
 use gpui::{div, prelude::*, px, Context, Div, Entity, Focusable, Stateful, WeakEntity, Window};
 use protocol::{AccountKey, Key, Link, Network, Presence, Request, Response};
@@ -17,6 +18,11 @@ pub const SOURCE: &str = "own";
 const WIDTH: f32 = 288.;
 
 /// How available a presence is: the rail shows the most available one among our accounts.
+/// A row of the phone's status sheet: the height every phone menu row has (`menu_item`).
+fn phone_row() -> f32 {
+    (crate::gui::phone::tokens::scaled(22.) + 26.).max(48.)
+}
+
 fn rank(presence: Presence) -> u8 {
     match presence {
         Presence::Online => 4,
@@ -196,15 +202,17 @@ impl StatusMenu {
         };
         let shape = Shape::of(own.presence).filter(|_| own.link == Link::Connected);
         let account = own.key.clone();
+        let phone = crate::gui::phone::active();
         div()
             .id(("own-account", ix))
-            .h(px(if crate::gui::phone::active() { theme::row_height(theme::ROW_ONE) } else { theme::ROW_ONE }))
-            .px(px(8.))
-            .rounded(px(theme::R_CONTROL))
+            .h(px(if phone { phone_row() } else { theme::ROW_ONE }))
+            .px(px(if phone { 12. } else { 8. }))
+            .rounded(px(if phone { theme::R_CARD } else { theme::R_CONTROL }))
             .flex()
             .items_center()
-            .gap(px(8.))
-            .child(network_icon(network, 16.))
+            .gap(px(if phone { 14. } else { 8. }))
+            .when(phone, |row| row.text_size(px(crate::gui::phone::tokens::scaled(16.))).line_height(px(crate::gui::phone::tokens::scaled(22.))))
+            .child(network_icon(network, if phone { 20. } else { 16. }))
             .child(div().flex_1().min_w_0().truncate().child(account_label(&self.scene.accounts, own)))
             .children(shape.map(|shape| presence::inline(shape, 10., theme::overlay())))
             .child(div().flex_none().type_small().text_color(color).child(word))
@@ -220,14 +228,16 @@ impl StatusMenu {
     /// The open account's states, the current one checked, then its status text.
     fn choices(&self, ix: usize, own: &Own, window: &Window, cx: &mut Context<Self>) -> Div {
         let network = own.key.network;
-        let mut choices = div().pl(px(24.)).pb(px(4.)).flex().flex_col();
+        let phone = crate::gui::phone::active();
+        // On a phone the states sit under the account's name, past its 20 pt mark.
+        let mut choices = div().pl(px(if phone { 34. } else { 24. })).pb(px(4.)).flex().flex_col();
         for (at, state) in states(network).iter().copied().enumerate() {
             let account = own.key.clone();
             choices = choices.child(
                 div()
                     .id(("own-state", ix * 8 + at))
-                    .h(px(if crate::gui::phone::active() { theme::row_height(theme::ROW_ONE) } else { theme::ROW_ONE }))
-                    .px(px(8.))
+                    .h(px(if phone { theme::row_height(theme::ROW_ONE) } else { theme::ROW_ONE }))
+                    .px(px(if phone { 12. } else { 8. }))
                     .rounded(px(theme::R_CONTROL))
                     .flex()
                     .items_center()
@@ -294,18 +304,20 @@ impl Render for StatusMenu {
             (None, Some(own)) => own.name.clone(),
             (None, None) => "You".to_owned(),
         };
+        // A phone's sheet heads with the 40 pt face its row sheet has.
+        let face = if crate::gui::phone::active() { 40. } else { 32. };
         let pictured = connected(scene).find(|own| own.avatar.is_some() && !own.me.is_empty());
         let avatar = match (&me, pictured) {
             (Some(me), _) if me.avatar.is_some() => {
                 let picture = hub.avatar(&me.key.account(), me.avatar.as_ref(), cx);
-                Avatar::new(&me.key, &me.name, 32.).image(picture.as_ref())
+                Avatar::new(&me.key, &me.name, face).image(picture.as_ref())
             }
             (_, Some(own)) => {
                 let picture = hub.avatar(&own.key, own.avatar.as_ref(), cx);
-                Avatar::new(&Key::new(&own.key, own.me.clone()), &name, 32.).image(picture.as_ref())
+                Avatar::new(&Key::new(&own.key, own.me.clone()), &name, face).image(picture.as_ref())
             }
-            (Some(me), None) => Avatar::new(&me.key, &me.name, 32.),
-            (None, None) => Avatar::named(&name, 32.),
+            (Some(me), None) => Avatar::new(&me.key, &me.name, face),
+            (None, None) => Avatar::named(&name, face),
         };
         let ring = presence::Ring::on(theme::overlay());
         let best = most_available(connected(scene).map(|own| own.presence));
@@ -316,23 +328,23 @@ impl Render for StatusMenu {
             .flex_col()
             .child(
                 div()
-                    .h(px(theme::ROW_TWO))
-                    .px(px(8.))
+                    .h(px(if crate::gui::phone::active() { 60. } else { theme::ROW_TWO }))
+                    .px(px(if crate::gui::phone::active() { 12. } else { 8. }))
                     .flex()
                     .items_center()
-                    .gap(px(10.))
-                    .child(avatar.build().children(Shape::of(best).and_then(|shape| presence::dot(shape, 32., &ring))))
+                    .gap(px(if crate::gui::phone::active() { 12. } else { 10. }))
+                    .child(avatar.build().children(Shape::of(best).and_then(|shape| presence::dot(shape, face, &ring))))
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .flex()
                             .flex_col()
-                            .child(div().truncate().font_weight(theme::MEDIUM).child(name))
+                            .child(div().truncate().font_weight(theme::MEDIUM).when(crate::gui::phone::active(), |name| name.phone_title()).child(name))
                             .child(div().truncate().type_small().text_color(theme::text_soft()).child(summary(scene))),
                     ),
             )
-            .child(menu_label("Accounts"));
+            .child(menu_label("Accounts").when(crate::gui::phone::active(), |label| label.px(px(12.))));
         let accounts = self.scene.accounts.clone();
         for (ix, own) in accounts.iter().enumerate() {
             list = list.child(self.account_row(ix, own, cx));

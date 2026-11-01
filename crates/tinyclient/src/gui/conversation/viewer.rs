@@ -100,6 +100,24 @@ pub struct Viewer {
     decoded: Vec<(String, u32)>,
 }
 
+/// What is kept around the picture: the sides, the bar above it, the caption below. A phone
+/// shows the picture edge to edge, under the status bar's band and its own strip, over the home
+/// indicator's.
+fn margins() -> (f32, f32, f32) {
+    if crate::gui::phone::active() {
+        use crate::gui::phone::tokens;
+        (0., tokens::safe_top() + tokens::NAV, FOOTER + tokens::safe_bottom())
+    } else {
+        (SIDE, TOP_BAR, FOOTER)
+    }
+}
+
+/// The space the picture is fitted into, for a window this size.
+fn room_in(wide: f32, tall: f32) -> (f32, f32) {
+    let (side, top, bottom) = margins();
+    ((wide - 2. * side).max(1.), (tall - top - bottom).max(1.))
+}
+
 fn bar_button(id: impl Into<ElementId>, which: Icon) -> Stateful<Div> {
     div()
         .id(id)
@@ -236,7 +254,7 @@ impl Pane {
             return 1.;
         };
         let size = window.viewport_size();
-        let room = ((f32::from(size.width) - 2. * SIDE).max(1.), (f32::from(size.height) - TOP_BAR - FOOTER).max(1.));
+        let room = room_in(f32::from(size.width), f32::from(size.height));
         fit_zoom((attachment.file.width as f32, attachment.file.height as f32), room, window.scale_factor())
     }
 
@@ -373,8 +391,9 @@ impl Pane {
         let at = pictures.iter().position(|(held, ix)| held.id == message.id && Some(*ix) == self.viewer.as_ref().map(|v| v.attachment));
         let size = window.viewport_size();
         let (wide, tall) = (f32::from(size.width), f32::from(size.height));
-        let room = ((wide - 2. * SIDE).max(1.), (tall - TOP_BAR - FOOTER).max(1.));
+        let room = room_in(wide, tall);
         let scale = window.scale_factor();
+        let phone = crate::gui::phone::active();
 
         // The original, once it is here; the still from the row stands in until then.
         let full = &attachment.file;
@@ -444,7 +463,157 @@ impl Pane {
         }
         facts.retain(|fact| !fact.is_empty());
 
-        let bar = div()
+        let bar = if phone {
+            self.phone_bar(&message, &sender, &facts, cx)
+        } else {
+            self.desktop_bar(&message, &sender, &facts, asked, zoom, fit, window, cx)
+        };
+
+        let picture = match shown {
+            Some(image) => div()
+                .id("picture")
+                .absolute()
+                .left(px(((wide - drawn.0) / 2. + pan.0).round()))
+                .top(px(((room.1 - drawn.1) / 2. + pan.1).round()))
+                .w(px(drawn.0))
+                .h(px(drawn.1))
+                .cursor(if pannable { gpui::CursorStyle::OpenHand } else { gpui::CursorStyle::PointingHand })
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        if let Some(viewer) = this.viewer.as_mut() {
+                            viewer.grab = Some((event.position, pan));
+                            viewer.dragged = false;
+                        }
+                    }),
+                )
+                // A click that was not a drag goes between fitted and the picture's own size.
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    let dragged = this.viewer.as_ref().is_some_and(|viewer| viewer.dragged);
+                    if !dragged {
+                        this.zoom(if asked.is_some() { None } else { Some(1.) }, cx);
+                    }
+                }))
+                // Opened on purpose: a moving picture plays here whatever the autoplay setting.
+                .child(anim::picture(image, ObjectFit::Fill, 0., Play::Asked))
+                .into_any_element(),
+            None => div()
+                .type_ui()
+                .text_color(theme::text_soft())
+                .child(if failed { "Couldn't load the full image" } else { "Loading…" })
+                .into_any_element(),
+        };
+        let stage = div()
+            .flex_1()
+            .min_h_0()
+            .relative()
+            .overflow_hidden()
+            .flex()
+            .items_center()
+            .justify_center()
+            // The original is on its way: the bar moves only when a file lands, never on a timer.
+            .children(loading.then(|| div().absolute().top_0().left_0().w(px(wide * 0.3)).h(px(2.)).bg(theme::accent())))
+            .child(picture)
+            .on_scroll_wheel(cx.listener(move |this, event: &gpui::ScrollWheelEvent, _, cx| {
+                let delta = event.delta.pixel_delta(px(20.));
+                if crate::gui::shortcuts::primary(event.modifiers) {
+                    // A notch at a time, however far the wheel says it turned.
+                    if delta.y != px(0.) {
+                        this.zoom_step(delta.y > px(0.), fit, cx);
+                    }
+                } else if let Some(viewer) = this.viewer.as_mut().filter(|_| pannable) {
+                    viewer.pan = clamp_pan((pan.0 + f32::from(delta.x), pan.1 + f32::from(delta.y)), drawn, room);
+                    cx.notify();
+                }
+                cx.stop_propagation();
+            }))
+            .children(at.filter(|at| *at > 0).map(|_| {
+                side_button("previous", Icon::ChevronLeft)
+                    .left(px(12.))
+                    .top(px((room.1 - 40.) / 2.))
+                    .on_click(cx.listener(|this, _, _, cx| this.step(-1, cx)))
+            }))
+            .children(at.filter(|at| at + 1 < pictures.len()).map(|_| {
+                side_button("next", Icon::ChevronRight)
+                    .right(px(12.))
+                    .top(px((room.1 - 40.) / 2.))
+                    .on_click(cx.listener(|this, _, _, cx| this.step(1, cx)))
+            }));
+        // A phone's narrow caption says "1 of 1" for no one: only a run of pictures is counted.
+        let count = at.filter(|_| !phone || pictures.len() > 1).map(|at| format!("{} of {}", at + 1, pictures.len()));
+        // Who sent it and when, then what they said with it.
+        let caption = [count, Some(sender), Some(format!("{} {}", time::day(now(), message.sent), time::clock(message.sent)))];
+        let caption = caption.into_iter().flatten().collect::<Vec<_>>().join(" · ");
+        let said = message.text.lines().next().filter(|line| !line.trim().is_empty()).map(str::to_owned);
+        let footer = div()
+            .h(px(FOOTER))
+            .flex_none()
+            // A phone's caption may take more lines than the desktop's one: it grows, over the
+            // home indicator's band.
+            .when(phone, |footer| footer.h_auto().min_h(px(margins().2)).pt(px(8.)).pb(px(8. + crate::gui::phone::tokens::safe_bottom())).px(px(16.)).text_center())
+            .px(px(SIDE))
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(px(4.))
+            .type_small()
+            .text_color(theme::text_soft())
+            .child(div().max_w_full().child(caption))
+            // A phone has the width for two lines of what was said, and no wider window to read it in.
+            .children(said.map(|said| {
+                div().max_w_full().when(!phone, |line| line.truncate()).when(phone, |line| line.line_clamp(2).text_center()).text_color(theme::text()).child(said)
+            }))
+            .children(note.map(|note| div().text_color(theme::accent_text()).child(note)));
+
+        let layer = div()
+            .id("viewer")
+            .w(size.width)
+            .h(size.height)
+            .flex()
+            .flex_col()
+            // A phone's viewer is the whole screen, black, as its own photos are.
+            .bg(if phone { gpui::rgb(0x000000) } else { tokens::scrim() })
+            .font_family(theme::FONT)
+            .text_color(theme::text())
+            .occlude()
+            // A drag that began on the picture goes on wherever the pointer is.
+            .on_mouse_move(cx.listener(move |this, event: &gpui::MouseMoveEvent, _, cx| {
+                let Some(viewer) = this.viewer.as_mut() else {
+                    return;
+                };
+                let Some((from, start)) = viewer.grab.filter(|_| event.pressed_button == Some(MouseButton::Left)) else {
+                    viewer.grab = None;
+                    return;
+                };
+                let moved = (f32::from(event.position.x - from.x), f32::from(event.position.y - from.y));
+                if moved.0.abs() + moved.1.abs() > 3. {
+                    viewer.dragged = true;
+                }
+                if pannable && viewer.dragged {
+                    viewer.pan = clamp_pan((start.0 + moved.0, start.1 + moved.1), drawn, room);
+                    cx.notify();
+                }
+            }))
+            .on_click(cx.listener(|this, _, _, cx| {
+                // The release of a drag that ran off the picture is not a click on the scrim.
+                if this.viewer.as_mut().is_some_and(|viewer| std::mem::take(&mut viewer.dragged)) {
+                    return;
+                }
+                this.close_viewer(cx);
+            }))
+            .child(bar)
+            .child(stage)
+            .child(footer);
+        Some(deferred(anchored().position(point(px(0.), px(0.))).child(layer)).priority(2).into_any_element())
+    }
+
+    /// The desktop's bar: who sent it, then zoom, copy, save, Quick Look, Preview and close.
+    #[allow(clippy::too_many_arguments)]
+    fn desktop_bar(&self, message: &Rc<Message>, sender: &str, facts: &[String], asked: Option<f32>, zoom: f32, fit: f32, window: &Window, cx: &mut Context<Self>) -> Div {
+        let sender = sender.to_owned();
+        div()
             .h(px(TOP_BAR))
             .flex_none()
             // Clear of the window's own buttons.
@@ -541,138 +710,40 @@ impl Pane {
                 bar_button("close", Icon::Close)
                     .tooltip(tip("Close", Some("esc")))
                     .on_click(cx.listener(|this, _, _, cx| this.close_viewer(cx))),
-            );
+            )
+    }
 
-        let picture = match shown {
-            Some(image) => div()
-                .id("picture")
-                .absolute()
-                .left(px(((wide - drawn.0) / 2. + pan.0).round()))
-                .top(px(((room.1 - drawn.1) / 2. + pan.1).round()))
-                .w(px(drawn.0))
-                .h(px(drawn.1))
-                .cursor(if pannable { gpui::CursorStyle::OpenHand } else { gpui::CursorStyle::PointingHand })
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
-                        cx.stop_propagation();
-                        if let Some(viewer) = this.viewer.as_mut() {
-                            viewer.grab = Some((event.position, pan));
-                            viewer.dragged = false;
-                        }
-                    }),
-                )
-                // A click that was not a drag goes between fitted and the picture's own size.
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    let dragged = this.viewer.as_ref().is_some_and(|viewer| viewer.dragged);
-                    if !dragged {
-                        this.zoom(if asked.is_some() { None } else { Some(1.) }, cx);
-                    }
-                }))
-                // Opened on purpose: a moving picture plays here whatever the autoplay setting.
-                .child(anim::picture(image, ObjectFit::Fill, 0., Play::Asked))
-                .into_any_element(),
-            None => div()
-                .type_ui()
-                .text_color(theme::text_soft())
-                .child(if failed { "Couldn't load the full image" } else { "Loading…" })
-                .into_any_element(),
-        };
-        let stage = div()
-            .flex_1()
-            .min_h_0()
-            .relative()
-            .overflow_hidden()
-            .flex()
-            .items_center()
-            .justify_center()
-            // The original is on its way: the bar moves only when a file lands, never on a timer.
-            .children(loading.then(|| div().absolute().top_0().left_0().w(px(wide * 0.3)).h(px(2.)).bg(theme::accent())))
-            .child(picture)
-            .on_scroll_wheel(cx.listener(move |this, event: &gpui::ScrollWheelEvent, _, cx| {
-                let delta = event.delta.pixel_delta(px(20.));
-                if crate::gui::shortcuts::primary(event.modifiers) {
-                    // A notch at a time, however far the wheel says it turned.
-                    if delta.y != px(0.) {
-                        this.zoom_step(delta.y > px(0.), fit, cx);
-                    }
-                } else if let Some(viewer) = this.viewer.as_mut().filter(|_| pannable) {
-                    viewer.pan = clamp_pan((pan.0 + f32::from(delta.x), pan.1 + f32::from(delta.y)), drawn, room);
-                    cx.notify();
-                }
-                cx.stop_propagation();
-            }))
-            .children(at.filter(|at| *at > 0).map(|_| {
-                side_button("previous", Icon::ChevronLeft)
-                    .left(px(12.))
-                    .top(px((room.1 - 40.) / 2.))
-                    .on_click(cx.listener(|this, _, _, cx| this.step(-1, cx)))
-            }))
-            .children(at.filter(|at| at + 1 < pictures.len()).map(|_| {
-                side_button("next", Icon::ChevronRight)
-                    .right(px(12.))
-                    .top(px((room.1 - 40.) / 2.))
-                    .on_click(cx.listener(|this, _, _, cx| this.step(1, cx)))
-            }));
-        let count = at.map(|at| format!("{} of {}", at + 1, pictures.len()));
-        // Who sent it and when, then what they said with it.
-        let caption = [count, Some(sender), Some(format!("{} {}", time::day(now(), message.sent), time::clock(message.sent)))];
-        let caption = caption.into_iter().flatten().collect::<Vec<_>>().join(" · ");
-        let said = message.text.lines().next().filter(|line| !line.trim().is_empty()).map(str::to_owned);
-        let footer = div()
-            .h(px(FOOTER))
+    /// A phone's bar, under the status bar: close on the left as every pushed page has back,
+    /// who sent it, then copy and save. A tap on the picture goes between fitted and its own
+    /// size; a phone has no keys to zoom by and no Preview to open it in.
+    fn phone_bar(&self, message: &Rc<Message>, sender: &str, facts: &[String], cx: &mut Context<Self>) -> Div {
+        use crate::gui::phone::tokens::{self as phone, PhoneType};
+        let action = |id: &'static str, which: Icon| bar_button(id, which).size(px(phone::TOUCH));
+        div()
             .flex_none()
-            .px(px(SIDE))
-            .flex()
-            .flex_col()
-            .items_center()
-            .justify_center()
-            .gap(px(4.))
-            .type_small()
-            .text_color(theme::text_soft())
-            .child(caption)
-            .children(said.map(|said| div().max_w_full().truncate().text_color(theme::text()).child(said)))
-            .children(note.map(|note| div().text_color(theme::accent_text()).child(note)));
-
-        let layer = div()
-            .id("viewer")
-            .w(size.width)
-            .h(size.height)
-            .flex()
-            .flex_col()
-            .bg(tokens::scrim())
-            .font_family(theme::FONT)
-            .text_color(theme::text())
-            .occlude()
-            // A drag that began on the picture goes on wherever the pointer is.
-            .on_mouse_move(cx.listener(move |this, event: &gpui::MouseMoveEvent, _, cx| {
-                let Some(viewer) = this.viewer.as_mut() else {
-                    return;
-                };
-                let Some((from, start)) = viewer.grab.filter(|_| event.pressed_button == Some(MouseButton::Left)) else {
-                    viewer.grab = None;
-                    return;
-                };
-                let moved = (f32::from(event.position.x - from.x), f32::from(event.position.y - from.y));
-                if moved.0.abs() + moved.1.abs() > 3. {
-                    viewer.dragged = true;
-                }
-                if pannable && viewer.dragged {
-                    viewer.pan = clamp_pan((start.0 + moved.0, start.1 + moved.1), drawn, room);
-                    cx.notify();
-                }
-            }))
-            .on_click(cx.listener(|this, _, _, cx| {
-                // The release of a drag that ran off the picture is not a click on the scrim.
-                if this.viewer.as_mut().is_some_and(|viewer| std::mem::take(&mut viewer.dragged)) {
-                    return;
-                }
-                this.close_viewer(cx);
-            }))
-            .child(bar)
-            .child(stage)
-            .child(footer);
-        Some(deferred(anchored().position(point(px(0.), px(0.))).child(layer)).priority(2).into_any_element())
+            .pt(px(phone::safe_top()))
+            .child(
+                div()
+                    .h(px(phone::NAV))
+                    .pl(px(2.))
+                    .pr(px(4.))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(action("close", Icon::Close).on_click(cx.listener(|this, _, _, cx| this.close_viewer(cx))))
+                    .child(Avatar::named(&message.sender.name, 28.).image(message.sender.avatar.as_ref()).build())
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(div().truncate().phone_row().font_weight(theme::SEMIBOLD).child(sender.to_owned()))
+                            .child(div().truncate().phone_stamp().font_weight(theme::REGULAR).text_color(theme::text_soft()).child(facts.join(" · "))),
+                    )
+                    .child(action("copy", Icon::Copy).on_click(cx.listener(|this, _, _, cx| this.copy_viewed(cx))))
+                    .child(action("save", Icon::Download).on_click(cx.listener(|this, _, _, cx| this.save_viewed(cx)))),
+            )
     }
 }
 

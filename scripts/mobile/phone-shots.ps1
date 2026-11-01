@@ -61,7 +61,7 @@ $env:LOCALAPPDATA = Join-Path $scratch 'local'
 # The shot hooks some states are reached through. Cleared before every shot.
 $hookVars = @(
     'TINYCLIENT_SHOT_AT', 'TINYCLIENT_SHOT_HOVER', 'TINYCLIENT_SHOT_MENU', 'TINYCLIENT_SHOT_STEPS',
-    'TINYCLIENT_SHOT_CALL', 'TINYCLIENT_SIGNIN_SHOT', 'TINYCLIENT_S6'
+    'TINYCLIENT_SHOT_CALL', 'TINYCLIENT_SIGNIN_SHOT', 'TINYCLIENT_S6', 'TINYCLIENT_SHOT_VIEW'
 )
 
 $made = New-Object System.Collections.Generic.List[string]
@@ -113,6 +113,8 @@ $phone = @(
     @{ n = '19-channel-details';     a = @('--open', '3', '--right', 'details') },
     @{ n = '20-channel-members';     a = @('--open', '3', '--right', 'member-list') },
     @{ n = '21-profile';             a = @('--open', '2', '--right', 'details') },
+    # A tap on a person (their face, their name, an @mention, a member) opens their Profile
+    # page on a phone, never the desktop's card: this stages the card and shows the page.
     @{ n = '22-profile-card';        a = @('--open', '2'); v = @{ TINYCLIENT_S6 = 'd-card' } },
     @{ n = '23-first-run';           a = @('--demo-empty') },
     @{ n = '24-sign-in-sheet';       a = @('--demo-empty'); v = @{ TINYCLIENT_SIGNIN_SHOT = 'phone' } },
@@ -125,7 +127,16 @@ $phone = @(
     @{ n = '24f-sign-in-discord';    a = @('--demo-empty'); v = @{ TINYCLIENT_SIGNIN_SHOT = 'discord' } },
     @{ n = '24g-sign-in-discord-waiting'; a = @('--demo-empty'); v = @{ TINYCLIENT_SIGNIN_SHOT = 'discord-waiting' } },
     @{ n = '24h-sign-in-slack';      a = @('--demo-empty'); v = @{ TINYCLIENT_SIGNIN_SHOT = 'slack' } },
-    @{ n = '24i-sign-in-teams';      a = @('--demo-empty'); v = @{ TINYCLIENT_SIGNIN_SHOT = 'teams' } }
+    @{ n = '24i-sign-in-teams';      a = @('--demo-empty'); v = @{ TINYCLIENT_SIGNIN_SHOT = 'teams' } },
+    # Slack's #platform with the thread under its first message opened as a page.
+    @{ n = '28-slack-thread';        a = @('--open', '3'); v = @{ TINYCLIENT_SHOT_STEPS = 'wait:1500;thread' } },
+    # The viewer, from the picture in "Sunrise at the weir".
+    @{ n = '29-image-viewer';        a = $carpool; v = @{ TINYCLIENT_SHOT_VIEW = 'm10' } },
+    @{ n = '30-jump-to-query';       a = @('--switcher', 'mo') },
+    # The Tiny server "Premier" as its owner sees it, in the sidebar's place.
+    @{ n = '31-tiny-server';         a = @('--mode', 'tiny') },
+    @{ n = '32-reply-bar';           a = $carpool + @('--composer', 'reply') },
+    @{ n = '33-emoji-picker';        a = $carpool + @('--composer', 'picker-emoji') }
 )
 # Settings on a phone is a page of the one window (`gui/settings/phone_page.rs`); the shot draws
 # that page in a window of its own at the phone's size. `list` is the list of sections.

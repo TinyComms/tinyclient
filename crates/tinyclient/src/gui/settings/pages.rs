@@ -70,6 +70,10 @@ fn failure_words(row: &str, reachable: bool) -> &'static str {
 }
 
 fn label_of(id: &str) -> &'static str {
+    // The one label that names the machine names the phone on a phone.
+    if id == "P4" {
+        return crate::host::keep_messages();
+    }
     rows::find(id).map_or("", |row| row.label)
 }
 
@@ -107,6 +111,19 @@ pub fn usage_words(messages: u64, files: u64) -> (String, String, String) {
     let show = |value: f64| format!("{value:.prec$} {unit}", prec = decimals as usize);
     let part = |bytes: u64| if bytes > 0 && round(bytes) == 0. { format!("under {}", show(step)) } else { show(round(bytes)) };
     (part(messages), part(files), show(round(messages) + round(files)))
+}
+
+/// Rows a phone does not draw: Send with (its keyboard's own key sends) and Density (its rows
+/// keep a thumb's height).
+const PHONE_LESS: [&str; 2] = ["M1", "A3"];
+
+/// What About says tinyclient is for: the networks this form signs in to.
+fn about_line() -> &'static str {
+    if phone::active() {
+        "One small app for Slack, Discord, Telegram, Teams and Tiny servers."
+    } else {
+        "One small app for Slack, Discord, Telegram, Teams and Signal."
+    }
 }
 
 /// The P4 modal's sentence.
@@ -154,11 +171,13 @@ impl SettingsWindow {
                     .child(caption("Call sounds play on your call speaker, quieter than voices. Voice volume is in Audio & video.")),
             ],
             Section::Appearance => vec![
-                self.group(&["A2", "A3", "A4"], None, window, cx)
+                // A phone's rows keep a thumb's height whatever the density: it has no Density.
+                self.group(if phone::active() { &["A2", "A4"] } else { &["A2", "A3", "A4"] }, None, window, cx)
                     // The caption is about keyboard shortcuts, which a phone has none of.
                     .when(!phone::active(), |group| group.child(caption(crate::host::APPEARANCE_CAPTION))),
             ],
-            Section::Messages => vec![self.group(&["M1", "M2", "M3", "M4", "M5"], None, window, cx)],
+            // A phone has no Return key to choose: its keyboard's own key sends.
+            Section::Messages => vec![self.group(if phone::active() { &["M2", "M3", "M4", "M5"] } else { &["M1", "M2", "M3", "M4", "M5"] }, None, window, cx)],
             Section::Privacy => {
                 let mut groups = self.per_account(window, cx);
                 groups.push(self.group(&["P3"], None, window, cx));
@@ -340,6 +359,14 @@ impl SettingsWindow {
                 let second = "When you send, :) :( :D ;) <3 become 🙂 🙁 😀 😉 ❤️. Never inside code.".to_owned();
                 self.switch_row(id, choices.emoticons, false, Some(second), |this, on, cx| this.choose(|c| c.emoticons = on, cx), cx)
             }
+            // A finger never hovers: a phone plays them or it does not.
+            "M5" if phone::active() => {
+                let at = usize::from(anim::autoplay() != Autoplay::Always);
+                let second = (at == 1).then(|| "Tap one to play it.".to_owned());
+                self.segmented_row(id, &["Automatically", "Never"], at, 0, second, |this, ix, cx| {
+                    this.set_autoplay([Autoplay::Always, Autoplay::Never][ix], cx)
+                }, cx)
+            }
             "M5" => {
                 let at = anim::autoplay() as usize;
                 let second = match (anim::autoplay(), crate::gui::app::reduce_motion()) {
@@ -390,7 +417,7 @@ impl SettingsWindow {
             ),
             "B1" => row(
                 label,
-                Some(crate::host::DIAGNOSTICS.into()),
+                Some(crate::host::diagnostics().into()),
                 controls::touch(button("B1", ButtonKind::Secondary, "Copy")).on_click(cx.listener(|this, _, _, cx| this.copy_diagnostics(cx))),
             ),
             "B2" => row(
@@ -1095,16 +1122,8 @@ impl SettingsWindow {
 
     fn about(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let version = format!("Version {}", env!("CARGO_PKG_VERSION"));
-        let plate = div()
-            .size(px(96.))
-            .rounded(px(22.))
-            .bg(gpui::rgb(0x1a1c2a))
-            .border_1()
-            .border_color(theme::hairline())
-            .flex()
-            .items_center()
-            .justify_center()
-            .child(glyph("icons/messages-square.svg", 52., gpui::rgb(0xa3acff)));
+        // The app's own mark, as the first launch and the empty window show it.
+        let plate = crate::gui::components::brand_mark(if phone::active() { 80. } else { 96. });
         let credit = |words: &'static str| div().px(px(controls::side())).py(px(10.)).type_small().when(phone::active(), |line| line.py(px(12.)).phone_preview()).text_color(theme::text_soft()).child(words);
         // A phone has no folder to show the log in.
         let tools = if phone::active() { self.group(&["B1", "B3"], None, window, cx) } else { self.group(&["B1", "B2", "B3"], None, window, cx) };
@@ -1117,7 +1136,7 @@ impl SettingsWindow {
             .child(div().pt(px(10.)).type_headline().text_color(theme::text()).child("tinyclient"))
             .child(div().type_small().text_color(theme::text_faint()).child(version))
             .children(self.update_status(cx))
-            .child(div().type_ui().when(phone::active(), |line| line.text_center().phone_row()).text_color(theme::text_soft()).child("One small app for Slack, Discord, Telegram, Teams and Signal."))
+            .child(div().type_ui().when(phone::active(), |line| line.text_center().phone_row()).text_color(theme::text_soft()).child(about_line()))
             .child(
                 div()
                     .w_full()
@@ -1138,7 +1157,7 @@ impl SettingsWindow {
     /// Search results: each a breadcrumb and its live row, best first; or the honest line.
     pub(super) fn results(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let query = self.query.clone();
-        let found: Vec<&'static Row> = rows::search(&query).into_iter().filter(|row| !phone::active() || super::on_phone(row.section)).collect();
+        let found: Vec<&'static Row> = rows::search(&query).into_iter().filter(|row| !phone::active() || (super::on_phone(row.section) && !PHONE_LESS.contains(&row.id))).collect();
         // A phone has no keyboard shortcuts to find.
         let keys = if phone::active() { Vec::new() } else { rows::shortcuts(&query) };
         let mut column = controls::column().flex().flex_col().gap(px(12.));

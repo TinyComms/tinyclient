@@ -1125,9 +1125,10 @@ impl Shell {
 
     /// `All · Unread n · Mentions n`: counts in faint numerals after the label, hidden at 0.
     fn segments(&self, choices: &[(&'static str, &'static str, u32, bool)], cx: &mut Context<Self>, pick: impl Fn(&mut Shell, usize, &mut Context<Shell>) + Clone + 'static) -> Div {
-        // A phone's 296 holds the counts too: its title and segment are the strip's only content.
+        // A phone's 326 (a 390 screen) holds the counts too, at its baseline type: its title and
+        // segment are the strip's only content. A 360 screen's 296 keeps the title whole instead.
         let roomy = if super::phone::active() {
-            self.sidebar_state.width.get() >= 280. && super::phone::tokens::text_scale() <= 1.25
+            self.sidebar_state.width.get() >= 310. && super::phone::tokens::text_scale() <= 1.25
         } else {
             self.sidebar_state.width.get() >= 300.
         };

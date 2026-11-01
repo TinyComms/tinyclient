@@ -836,19 +836,115 @@ impl Shell {
                 column().child(head).children(self.menu_items(open, snapshot, cx)).into_any_element()
             }
             Menu::Row(conversation, _) => {
+                // What the sheet is about: the row's own face and title, and where it lives.
+                let place = conversation.space_title.trim();
+                let place = if place.is_empty() || conversation.kind.is_direct() { conversation.key.network.label().to_owned() } else { format!("{} · {place}", conversation.key.network.label()) };
                 let head = div()
                     .flex()
                     .items_center()
-                    .gap(px(10.))
-                    .px(px(8.))
-                    .h(px(52.))
-                    .child(self.conversation_avatar(conversation, 28., theme::overlay(), cx))
-                    .child(network_icon(conversation.key.network, 14.))
-                    .child(div().flex_1().min_w_0().truncate().phone_title().child(conversation.title.clone()));
-                column().child(head).child(menu_separator()).children(self.menu_items(open, snapshot, cx)).into_any_element()
+                    .gap(px(12.))
+                    .px(px(12.))
+                    .pt(px(4.))
+                    .pb(px(12.))
+                    .child(self.conversation_avatar(conversation, 40., theme::overlay(), cx))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(div().min_w_0().truncate().phone_title().child(conversation.title.clone()))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.))
+                                    .child(network_icon(conversation.key.network, 14.))
+                                    .child(div().min_w_0().truncate().phone_preview().text_color(theme::text_soft()).child(place)),
+                            ),
+                    );
+                column().child(head).child(menu_separator()).children(self.phone_row_items(conversation, cx)).into_any_element()
             }
         };
         Some(super::phone::sheet("phone-menu", tall, body, close))
+    }
+
+    /// A conversation row's sheet on a phone: the desktop's row menu, then what Details and its
+    /// "…" offer for the conversation, each where its network can do it.
+    fn phone_row_items(&self, conversation: &Conversation, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let mut items: Vec<AnyElement> = Vec::new();
+        let row = conversation.clone();
+        let key = row.key.clone();
+        let network = key.network;
+        let act = |id: &'static str, icon: &'static str, words: SharedString, then: Box<dyn Fn(&mut Shell, &mut Context<Shell>)>| {
+            menu_item(id, Some(icon), words, None)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.close_menu(cx);
+                    then(this, cx);
+                }))
+                .into_any_element()
+        };
+        let opened = row.clone();
+        items.push(act("row-open", "icons/message-square.svg", "Open".into(), Box::new(move |this, cx| this.select(opened.key.clone(), &opened.title, cx))));
+        if row.unread > 0 || row.mentions > 0 {
+            let read = key.clone();
+            items.push(act("row-read", "icons/check.svg", "Mark as read".into(), Box::new(move |this, cx| this.mark_read(read.clone(), cx))));
+        }
+        let starred = row.starred;
+        let star = key.clone();
+        let words = if starred { "Unpin from Inbox" } else { "Pin to top of Inbox" };
+        items.push(act("row-star", "icons/pin.svg", words.into(), Box::new(move |this, cx| this.star(star.clone(), !starred, cx))));
+        // CONTRACT: muting has a request on Discord, Slack, Teams and Telegram (chatd's adapters).
+        if matches!(network, Network::Discord | Network::Slack | Network::Teams | Network::Telegram) {
+            let (muted, mute) = (row.muted, key.clone());
+            let (icon, words) = if muted { ("icons/bell.svg", "Unmute notifications") } else { ("icons/bell-off.svg", "Mute notifications") };
+            items.push(act("row-mute", icon, words.into(), Box::new(move |this, cx| this.set_row_mute(mute.clone(), !muted, cx))));
+        }
+        let details = key.clone();
+        let person = row.kind == protocol::ConversationKind::Direct;
+        let words = if person { "Profile" } else { "Details" };
+        items.push(act("row-details", if person { "icons/user.svg" } else { "icons/info.svg" }, words.into(), Box::new(move |this, cx| this.details_conversation(details.clone(), cx))));
+        if let Some(space) = row.space.as_ref().map(|space| Key { id: space.clone(), ..key.clone() }) {
+            items.push(act("row-reveal", "icons/corner-down-right.svg", "Show in sidebar".into(), Box::new(move |this, cx| this.go(super::sidebar::Mode::Space(space.clone()), cx))));
+        }
+        let (link, leave) = self.row_reach(&row);
+        if let Some(link) = link {
+            items.push(menu_separator().into_any_element());
+            let copied = link.clone();
+            items.push(act(
+                "row-link",
+                "icons/link.svg",
+                "Copy link".into(),
+                Box::new(move |this, cx| {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(copied.clone()));
+                    this.toast(Some(("icons/check.svg", theme::text_soft())), "Link copied".to_owned(), cx);
+                }),
+            ));
+            items.push(act("row-open-in", "icons/external-link.svg", format!("Open in {}", network.label()).into(), Box::new(move |_, cx| cx.open_url(&link))));
+        }
+        // CONTRACT: closing a DM has a request on Discord only; leaving, where `can_leave` says.
+        let close = row.kind == protocol::ConversationKind::Direct && network == Network::Discord;
+        if close || leave {
+            items.push(menu_separator().into_any_element());
+        }
+        if close {
+            let closed = key.clone();
+            items.push(act("row-close", "icons/x.svg", "Close conversation".into(), Box::new(move |this, cx| this.close_direct(closed.clone(), cx))));
+        }
+        if leave {
+            let left = row.clone();
+            let words = if row.kind == protocol::ConversationKind::Group { "Leave group" } else { "Leave" };
+            items.push(
+                menu_item_danger("row-leave", Some("icons/log-out.svg"), words)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.close_menu(cx);
+                        this.confirm_leave(left.clone(), cx);
+                    }))
+                    .into_any_element(),
+            );
+        }
+        items
     }
 
     /// The rail avatar's sheet on a phone: who I am, my presence on each account and Settings
@@ -895,7 +991,7 @@ impl Shell {
                     div()
                         .flex_1()
                         .min_w_0()
-                        .child(div().truncate().text_color(if available { theme::text() } else { theme::text_soft() }).child(title))
+                        .child(div().truncate().when(phone, |title| title.phone_row()).text_color(if available { theme::text() } else { theme::text_soft() }).child(title))
                         .child(
                             div()
                                 .truncate()
@@ -914,7 +1010,10 @@ impl Shell {
             let ix = list.len() + 1;
             list.push(row(ix, network, title.to_owned().into(), line.to_owned().into(), available).when(phone, |row| row.h(px(56.))));
         };
-        for network in AVAILABLE {
+        // A phone offers only the networks it can sign in to (`signin::welcome::on_phone`), as
+        // its first run does: Signal and Messages link from a computer.
+        let offered = |network: &Network| !phone || super::signin::welcome::on_phone(*network);
+        for network in AVAILABLE.into_iter().filter(offered) {
             if snapshot.link(network) == Link::SignedOut {
                 add(network, network.label(), "Sign in", true);
             } else if network == Network::Slack {
@@ -923,7 +1022,7 @@ impl Shell {
                 add(network, "Add a Tiny server", "Join with a code", true);
             }
         }
-        for network in NETWORK_ORDER.into_iter().filter(|network| !AVAILABLE.contains(network)) {
+        for network in NETWORK_ORDER.into_iter().filter(|network| !AVAILABLE.contains(network)).filter(offered) {
             add(network, network.label(), "Not available yet", false);
         }
         list

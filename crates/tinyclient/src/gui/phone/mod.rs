@@ -22,6 +22,8 @@ static ACTIVE: AtomicBool = AtomicBool::new(false);
 
 pub fn set_active(on: bool) {
     ACTIVE.store(on, Ordering::Relaxed);
+    // What the window says of the machine it is on follows its form: "this phone".
+    crate::host::set_phone(on);
 }
 
 pub fn active() -> bool {
@@ -252,12 +254,14 @@ impl Shell {
                     .children(pane.count.map(|count| div().flex_none().phone_preview().text_color(theme::text_faint()).child(count.to_string()))),
             );
         let body = (pane.body)(self, window, cx);
+        // A thread is messages, on the conversation's page color; the rest are the sidebar's.
+        let surface = if pane.kind == crate::gui::layout::RightKind::Thread { theme::canvas() } else { theme::sidebar() };
         div()
             .relative()
             .size_full()
             .flex()
             .flex_col()
-            .bg(theme::sidebar())
+            .bg(surface)
             .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
                 if event.pressed_button == Some(MouseButton::Left) {
                     this.phone_drag_back(f32::from(event.position.x), true, cx);

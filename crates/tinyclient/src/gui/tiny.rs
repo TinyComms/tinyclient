@@ -383,6 +383,14 @@ impl Shell {
                 (title, ready_view(&ready, shown, me, people_beside, (&input, focused), &chats, open.as_ref(), cx))
             }
         };
+        // A phone shows the directory and what is chosen in one column, under the server's own
+        // name: the chosen row is already lit in the list.
+        let phone = super::phone::active();
+        let server = self.tiny_state.account.as_ref().and_then(|account| self.snapshot.as_ref()?.accounts.iter().find(|status| &status.key == account)).map(|status| status.name.clone());
+        let title = match (phone, server) {
+            (true, Some(server)) if !server.is_empty() => server,
+            _ => title,
+        };
         div()
             .size_full()
             .flex()
@@ -395,7 +403,8 @@ impl Shell {
                     .flex()
                     .items_center()
                     .gap(px(8.))
-                    .child(self.strip_controls(window, cx))
+                    // A phone has no sidebar to hide and goes back with its own gesture.
+                    .when(!phone, |strip| strip.child(self.strip_controls(window, cx)))
                     .child(pane_title(title)),
             )
             .child(body)

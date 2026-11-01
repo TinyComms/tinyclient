@@ -100,6 +100,18 @@ pub fn set_text_scale(scale: f32) -> f32 {
     scale
 }
 
+/// The phone's baseline over the desktop's type scale. The views a phone shares with the desktop
+/// (sidebar rows, section labels, Details, members, a profile, sheets) take their sizes from
+/// `theme::Type`, which is set for a pointer at arm's length; a phone held in the hand reads them
+/// 15% larger: 13 → 15, 12 → 14, 11 → 12.5. The phone's own type ([`PhoneType`], the
+/// conversation's 17 pt body) is set in phone points already and does not take it.
+pub const BASELINE: f32 = 1.15;
+
+/// What `theme::Type` multiplies by on a phone: the baseline, then the platform's text run.
+pub fn type_factor() -> f32 {
+    BASELINE * text_scale()
+}
+
 /// A type size for a desktop step and a phone run: each step adds a point, then the run
 /// multiplies, rounded to a half point.
 pub fn type_size(size: f32, step: i32, scale: f32) -> f32 {

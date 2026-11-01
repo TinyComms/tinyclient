@@ -219,10 +219,11 @@ pub fn compact() -> bool {
 pub fn row_height(base: f32) -> f32 {
     let per_step = if base >= ROW_TWO { 4. } else { 2. };
     if phone() {
-        // A thumb's row: every row at least 44, a two-line row 56, and both grow with the
-        // phone's text run so nothing in them clips.
+        // A thumb's row: every row at least 44, a two-line row 56, which hold the phone's
+        // baseline type (`phone::tokens::BASELINE`); both grow with the platform's text run so
+        // nothing in them clips.
         let (floor, lines) = if base >= ROW_TWO { (56., 34.) } else { (44., 18.) };
-        return floor + per_step * text_step() as f32 + (phone_tokens::text_scale() - 1.) * lines;
+        return floor + per_step * text_step() as f32 + (phone_tokens::type_factor() - phone_tokens::BASELINE) * lines;
     }
     let dense = if base >= ROW_TWO && compact() { 8. } else { 0. };
     base - dense + per_step * text_step() as f32
@@ -246,7 +247,7 @@ pub fn row_avatar() -> f32 {
 fn sized(size: f32) -> gpui::Pixels {
     let base = size + text_step() as f32;
     if phone() {
-        px((base * phone_tokens::text_scale() * 2.).round() / 2.)
+        px((base * phone_tokens::type_factor() * 2.).round() / 2.)
     } else {
         px(base)
     }

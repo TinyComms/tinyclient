@@ -11,6 +11,55 @@ pub const HERE: &str = if cfg!(target_os = "macos") {
     "this computer"
 };
 
+// The window is drawn as a phone (`gui::phone::set_active`): what it says of itself names the
+// phone, never the computer a build happens to run on.
+static PHONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set with the window's form, every frame.
+pub fn set_phone(on: bool) {
+    PHONE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn phone() -> bool {
+    PHONE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// [`HERE`], or "this phone" while the window is a phone.
+pub fn here() -> &'static str {
+    if phone() {
+        "this phone"
+    } else {
+        HERE
+    }
+}
+
+/// The phone's own system, for the words that name it.
+const PHONE_SYSTEM: &str = if cfg!(target_os = "ios") {
+    "iOS"
+} else if cfg!(target_os = "android") {
+    "Android"
+} else {
+    "system"
+};
+
+/// Settings › Privacy, the retention row, for the form the window is in.
+pub fn keep_messages() -> &'static str {
+    if phone() {
+        "Keep messages on this phone for"
+    } else {
+        KEEP_MESSAGES
+    }
+}
+
+/// Settings › About, under Copy diagnostics, for the form the window is in.
+pub fn diagnostics() -> String {
+    if phone() {
+        format!("Version, {PHONE_SYSTEM}, memory and connection states. No messages, names or tokens.")
+    } else {
+        DIAGNOSTICS.to_owned()
+    }
+}
+
 /// Welcome footnote: where a sign-in is kept.
 pub const SIGN_IN_KEPT: &str = if cfg!(target_os = "macos") {
     "Your sign-in is kept in the macOS keychain on this Mac."
@@ -128,42 +177,42 @@ pub const COULD_NOT_OPEN: &str = if cfg!(target_os = "macos") {
 
 /// "{network} is offline · showing what's on this computer".
 pub fn offline(network: &str) -> String {
-    format!("{network} is offline · showing what's on {HERE}")
+    format!("{network} is offline · showing what's on {}", here())
 }
 
 /// "496 MB on this computer".
 pub fn on_here(amount: &str) -> String {
-    format!("{amount} on {HERE}")
+    format!("{amount} on {}", here())
 }
 
 /// Nothing registered for a URL scheme.
 pub fn nothing_opens(url: &str) -> String {
-    format!("Nothing on {HERE} opens {url}")
+    format!("Nothing on {} opens {url}", here())
 }
 
 /// Accounts caption under the sign-out rows.
 pub fn sign_out_caption() -> String {
-    format!("Signing out removes this account's sign-in and everything tinyclient saved for it from {HERE}.")
+    format!("Signing out removes this account's sign-in and everything tinyclient saved for it from {}.", here())
 }
 
 /// Sign-out confirmation, first paragraph.
 pub fn sign_out_body(network: &str) -> String {
-    format!("This removes from {HERE} the saved sign-in and the saved messages, images and files of this account, and ends this session on {network}.")
+    format!("This removes from {} the saved sign-in and the saved messages, images and files of this account, and ends this session on {network}.", here())
 }
 
 /// Clear-cache confirmation.
 pub fn clear_saved() -> String {
-    format!("Everything tinyclient saved to show you quickly is deleted from {HERE}. It comes back from the networks as you open conversations. Sign-ins, drafts and settings stay.")
+    format!("Everything tinyclient saved to show you quickly is deleted from {}. It comes back from the networks as you open conversations. Sign-ins, drafts and settings stay.", here())
 }
 
 /// P4, when nothing is old enough to delete yet.
 pub fn retention_none_yet() -> String {
-    format!("Nothing here is that old yet. Older messages will be removed from {HERE} as they age.")
+    format!("Nothing here is that old yet. Older messages will be removed from {} as they age.", here())
 }
 
 /// P4, the shared tail: "are removed from this computer. They stay on …".
 pub fn removed_from_here() -> String {
-    format!("are removed from {HERE}. They stay on Slack, Discord and the others.")
+    format!("are removed from {}. They stay on Slack, Discord and the others.", here())
 }
 
 /// `PRETTY_NAME` from os-release(5): `/etc/os-release`, else `/usr/lib/os-release`.
