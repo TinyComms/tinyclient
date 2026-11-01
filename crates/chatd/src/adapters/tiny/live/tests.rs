@@ -948,15 +948,19 @@ fn an_end_to_end_encrypted_join_carries_mediads_key_package_and_says_how_the_cal
     assert!(package["data"].as_str().is_some_and(|data| data.len() > 100));
     let security = || the_call(&running).and_then(|call| call.security);
     let off = Instant::now() + Duration::from_secs(10);
-    while security().is_none_or(|security| security.mode != protocol::SecurityMode::Transport) {
-        assert!(Instant::now() < off, "the call says it is transport-only: {:?}", security());
+    // The server's `off` blocks the call: it is not carried on unencrypted on the server's word.
+    while security().is_none_or(|security| security.mode != protocol::SecurityMode::Blocked) {
+        assert!(Instant::now() < off, "the call says encryption was turned off: {:?}", security());
         // Until then it is being set up, and never end to end without a group.
         assert_ne!(security().map(|security| security.mode), Some(protocol::SecurityMode::EndToEnd));
         std::thread::sleep(Duration::from_millis(20));
     }
-    let security = security().expect("said");
-    assert_eq!(security.unsupported, ["55555555-5555-5555-5555-555555555555"]);
-    assert!(!security.server_lacks && security.code.is_empty() && security.members.is_empty());
+    let said = security().expect("said");
+    assert_eq!(said.unsupported, ["55555555-5555-5555-5555-555555555555"]);
+    assert!(!said.server_lacks && !said.required && said.code.is_empty() && said.members.is_empty());
+    // The person chooses to carry on: only then is it transport only.
+    assert!(matches!(running.hub.calls.request(&running.hub, &protocol::MediaRequest::TinyTransport), Ok(protocol::MediaResponse::Done)));
+    until("transport only, by choice", || security().is_some_and(|security| security.mode == protocol::SecurityMode::Transport));
     assert!(running.hub.calls.end(&running.hub).is_some());
     running.live.ask(Ask::Hangup { room_id: ROOM.into() });
 }
@@ -1405,4 +1409,18 @@ fn tiny_server_call() {
     if let Err(panic) = outcome {
         std::panic::resume_unwind(panic);
     }
+}
+
+#[test]
+fn an_incognito_host_or_a_requiring_room_never_carries_a_call_on_unencrypted() {
+    // An ordinary self-hosted server: the person decides, call by call.
+    assert_eq!(must_encrypt("chat.example.org", false, true), Ok(false));
+    assert_eq!(must_encrypt("192.168.1.120", false, false), Ok(false), "a server with no e2ee is joined, and says so");
+    // Incognito promises encrypted calls: required, and not joined at all without encryption.
+    assert_eq!(must_encrypt("c-7f3k2x9q.tinycloud.chat", false, true), Ok(true));
+    assert_eq!(must_encrypt("incognito.tinyclient.io", false, false), Err(INCOGNITO_CANNOT_ENCRYPT));
+    assert_eq!(must_encrypt("eviltinycloud.chat", false, true), Ok(false), "only Incognito's own names");
+    // A room that requires it, on any server.
+    assert_eq!(must_encrypt("chat.example.org", true, true), Ok(true));
+    assert_eq!(must_encrypt("chat.example.org", true, false), Err(ROOM_CANNOT_ENCRYPT));
 }

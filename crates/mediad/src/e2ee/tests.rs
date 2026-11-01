@@ -211,15 +211,24 @@ fn a_commit_that_does_not_apply_is_reported_and_the_app_comes_back_with_a_new_ke
 }
 
 #[test]
-fn off_is_transport_only_and_says_who_cannot() {
+fn off_is_never_obeyed_silently_and_says_who_cannot() {
     let (_, mut ada, _, _) = three();
     ada.frame(&json!({"type": "call.e2ee", "op": "off", "user_ids": [CY]}).to_string());
     let security = ada.security();
-    assert_eq!(security.mode, SecurityMode::Transport);
+    assert_eq!(security.mode, SecurityMode::Blocked, "the server's word alone does not turn encryption off");
     assert_eq!(security.unsupported, [CY]);
-    assert!(!security.server_lacks);
+    assert!(!security.server_lacks && !security.required);
     assert!(security.code.is_empty() && security.members.is_empty(), "nothing claimed that does not hold");
+    assert_eq!(ada.seal(TONE), None, "nothing in clear until the person chooses");
+    assert_eq!(ada.open(BEA, TONE), None);
+    // The person chooses to carry on: then, and only then, it is transport only.
+    assert_eq!(ada.carry_on_unencrypted(), Ok(()));
+    assert_eq!(ada.security().mode, SecurityMode::Transport);
     assert_eq!(ada.seal(TONE).as_deref(), Some(TONE));
+    // The server saying it again for the same seat is not a new downgrade to ask about.
+    ada.frame(&json!({"type": "call.e2ee", "op": "off", "user_ids": [CY, BEA]}).to_string());
+    assert_eq!(ada.security().mode, SecurityMode::Transport);
+    assert_eq!(ada.security().unsupported, [CY, BEA]);
     assert_eq!(ada.open(BEA, TONE).as_deref(), Some(TONE));
     assert_eq!(ada.open(BEA, &[1, 2, 0xfa, 0xfa]), None, "a frame sealed for the old group is not Opus");
 }
@@ -244,6 +253,7 @@ fn off_blocks_a_call_that_must_be_end_to_end() {
     assert_eq!(security.mode, SecurityMode::Blocked);
     assert_eq!(security.unsupported, [CY], "who cannot is still said");
     assert!(!security.server_lacks);
+    assert!(security.required, "the panel offers no way on");
     assert!(security.code.is_empty() && security.members.is_empty(), "nothing claimed that does not hold");
     // Nothing goes out and nothing is played, audio or video, clear or sealed.
     assert_eq!(ada.seal(TONE), None);
@@ -252,14 +262,21 @@ fn off_blocks_a_call_that_must_be_end_to_end() {
     assert_eq!(ada.open(BEA, TONE), None, "clear audio is not played");
     assert_eq!(ada.open(BEA, &[1, 2, 0xfa, 0xfa]), None);
     assert_eq!(ada.open_video(BEA, &[1, 2, 3, 4]), None);
+    // And the person cannot choose their way past it.
+    assert!(ada.carry_on_unencrypted().is_err());
+    assert_eq!(ada.security().mode, SecurityMode::Blocked);
+    assert_eq!(ada.seal(TONE), None);
 }
 
 #[test]
-fn off_without_the_requirement_still_carries_on_as_transport() {
+fn off_without_the_requirement_carries_on_only_once_the_person_chooses() {
     let server = mls::Server::new();
     let mut ada = app(ADA);
     start(&server, &mut ada);
     ada.frame(&json!({"type": "call.e2ee", "op": "off", "user_ids": [CY]}).to_string());
+    assert_eq!(ada.security().mode, SecurityMode::Blocked);
+    assert_eq!(ada.seal_video(&[1, 2, 3, 4]), None);
+    ada.carry_on_unencrypted().unwrap();
     assert_eq!(ada.security().mode, SecurityMode::Transport);
     assert_eq!(ada.seal(TONE).as_deref(), Some(TONE));
     assert_eq!(ada.seal_video(&[1, 2, 3, 4]).as_deref(), Some(&[1u8, 2, 3, 4][..]));
@@ -289,15 +306,32 @@ fn a_fresh_offer_takes_the_requirement_from_the_offer() {
     let mut ada = requiring(ADA);
     ada.frame(&json!({"type": "call.e2ee", "op": "off"}).to_string());
     assert_eq!(ada.security().mode, SecurityMode::Blocked);
-    // Joining again with the setting off is a call that may carry on.
+    assert!(ada.carry_on_unencrypted().is_err());
+    // Joining again with the setting off is a call that may carry on, once the person says so.
     ada.offer(ADA, Some(&TinyE2ee { room_id: ROOM.into(), identity: String::new(), required: false }));
     ada.frame(&json!({"type": "call.e2ee", "op": "off"}).to_string());
+    assert_eq!(ada.security().mode, SecurityMode::Blocked);
+    ada.carry_on_unencrypted().unwrap();
     assert_eq!(ada.security().mode, SecurityMode::Transport);
+    // The choice was for that seat: a fresh offer and another `off` ask again.
+    ada.offer(ADA, Some(&TinyE2ee { room_id: ROOM.into(), identity: String::new(), required: false }));
+    ada.frame(&json!({"type": "call.e2ee", "op": "off"}).to_string());
+    assert_eq!(ada.security().mode, SecurityMode::Blocked);
     // A server with no end-to-end encryption at all is transport, with the lack said.
     ada.offer(ADA, None);
     let security = ada.security();
     assert_eq!((security.mode, security.server_lacks), (SecurityMode::Transport, true));
 }
+#[test]
+fn carrying_on_unencrypted_is_refused_when_nothing_was_turned_off() {
+    let server = mls::Server::new();
+    let mut ada = app(ADA);
+    assert!(ada.carry_on_unencrypted().is_err(), "waiting for the server is not a downgrade to accept");
+    start(&server, &mut ada);
+    assert!(ada.carry_on_unencrypted().is_err(), "nor is a group being made");
+    assert_eq!(ada.seal(TONE), None);
+}
+
 #[test]
 fn a_server_without_end_to_end_encryption_is_said_to_lack_it() {
     let mut e2ee = E2ee::default();
@@ -413,6 +447,8 @@ fn what_is_told_is_told_once() {
     assert!(e2ee.changed().is_some());
     assert!(e2ee.changed().is_none());
     e2ee.frame(&json!({"type": "call.e2ee", "op": "off", "user_ids": []}).to_string());
+    assert_eq!(e2ee.changed().map(|s| s.mode), Some(SecurityMode::Blocked));
+    e2ee.carry_on_unencrypted().unwrap();
     assert_eq!(e2ee.changed().map(|s| s.mode), Some(SecurityMode::Transport));
 }
 

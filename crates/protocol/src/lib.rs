@@ -1675,6 +1675,10 @@ pub enum Request {
     },
     /// How the call's connection is doing now. Answers `CallStats`.
     CallStats,
+    /// The person chose to carry on the Tiny call without end-to-end encryption after the server
+    /// turned it off (`SecurityMode::Blocked`). Answers `Ok`, or `Refused` in words when the call
+    /// is not blocked or must stay end to end (`CallSecurity::required`).
+    CallCarryOnUnencrypted,
     /// One person's volume for me alone, 0 to [`GAIN_MAX`] percent, and whether I muted them
     /// (V9). Kept per account (`settings::gain_key`), so it holds in every call on that
     /// account, and applied by the call's mediad at once. Answers `Ok`, with or without a

@@ -2035,6 +2035,13 @@ impl Chat {
                 self.hub.calls.gain(&self.hub, &account, user_id, percent, muted);
                 Response::Ok
             }
+            // Only ever from the person's own click: nothing else turns a blocked call to clear.
+            Request::CallCarryOnUnencrypted => match self.hub.calls.request(&self.hub, &MediaRequest::TinyTransport) {
+                Ok(protocol::MediaResponse::Done) => Response::Ok,
+                Ok(protocol::MediaResponse::Refused { detail }) => error(ErrorCode::Refused, detail),
+                Ok(_) => error(ErrorCode::Unsupported, "This call can't carry on without encryption."),
+                Err(err) => call_error(err),
+            },
             Request::CallStats => match self.hub.calls.request(&self.hub, &MediaRequest::Stats) {
                 Ok(protocol::MediaResponse::Stats(stats)) => Response::CallStats { stats },
                 Ok(protocol::MediaResponse::Refused { detail }) => error(ErrorCode::Unsupported, detail),

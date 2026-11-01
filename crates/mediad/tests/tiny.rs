@@ -854,7 +854,8 @@ fn an_end_to_end_encrypted_room_is_heard_through_frames_the_sfu_cannot_read() {
     let _ = std::fs::remove_dir_all(keys);
 }
 
-/// A room the server says is transport-only sends and plays in clear, and says so.
+/// A room the server says is transport-only is blocked until the person chooses to carry on
+/// unencrypted; then it sends and plays in clear, and says so.
 #[test]
 fn a_transport_only_room_says_so_and_is_heard_in_clear() {
     let sfu = Sfu::start();
@@ -872,6 +873,8 @@ fn a_transport_only_room_says_so_and_is_heard_in_clear() {
         slots.push(mids);
     }
     done(&mut people[0], e2ee_frame("off", serde_json::json!({"user_ids": ["bea"]})));
+    people[0].security("blocked, not silently transport", |security| security.mode == SecurityMode::Blocked);
+    done(&mut people[0], MediaRequest::TinyTransport);
     let ada = people[0].security("transport only", |security| security.mode == SecurityMode::Transport);
     assert_eq!(ada.unsupported, ["bea"]);
     assert!(!ada.server_lacks && ada.code.is_empty());

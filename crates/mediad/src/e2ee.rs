@@ -19,6 +19,12 @@
 //! Never claim more than holds: until the group has keys our microphone is held back rather
 //! than sent in clear, a frame that arrives in clear while the call is end-to-end encrypted is
 //! dropped rather than played, and a call the server says is transport-only says so.
+//!
+//! Never fall back silently either. The server's `off` is its word alone: nothing in it is
+//! signed by anyone in the call, so a server that wants to hear a call need only send it. It
+//! blocks the call (nothing sent, nothing played) until the person chooses to carry on
+//! unencrypted ([`E2ee::carry_on_unencrypted`]), and a call that is `required` (the person's
+//! setting, an Incognito host, or a room that requires it) cannot carry on at all.
 
 use crate::rtp::SILENCE;
 use base64::engine::general_purpose::STANDARD;
@@ -159,9 +165,9 @@ enum Mode {
     Waiting,
     /// End-to-end: the group is being made, or has keys.
     Group,
-    /// The person asked to join only end-to-end encrypted calls, and the server turned it off. We
-    /// send nothing and play nothing until it says `start` again. Not `Transport`: that would
-    /// carry on unencrypted, which is what the setting exists to refuse.
+    /// The server turned end-to-end encryption off. We send nothing and play nothing until it
+    /// says `start` again, or the person chooses to carry on unencrypted. Not `Transport`: that
+    /// would obey a frame nobody in the call signed.
     Blocked,
 }
 
@@ -171,7 +177,7 @@ pub struct E2ee {
     mode: Mode,
     /// The server has `e2ee_calls`.
     offered: bool,
-    /// The person only joins end-to-end encrypted calls: a downgrade blocks the call.
+    /// The call is never carried on unencrypted: a downgrade blocks it for good.
     required: bool,
     identity: Option<SigningKeyPair>,
     session: Option<DaveSession>,
@@ -275,9 +281,12 @@ impl E2ee {
                 }
             }
             "off" => {
-                // The server turning a call to transport only is the one thing a person who
-                // requires end-to-end encryption said they would not accept.
-                self.mode = if self.required { Mode::Blocked } else { Mode::Transport };
+                // Unauthenticated: never obeyed by itself. The person decides, if they may. A
+                // call the person already chose to carry on unencrypted stays so: another `off`
+                // for the same seat is no new downgrade.
+                if self.mode != Mode::Transport {
+                    self.mode = Mode::Blocked;
+                }
                 self.session = None;
                 let ids = frame.get("user_ids").and_then(Value::as_array).into_iter().flatten();
                 self.unsupported = ids.filter_map(Value::as_str).take(64).map(str::to_owned).collect();
@@ -300,6 +309,20 @@ impl E2ee {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// The person chose to carry on without end-to-end encryption after the server turned it off.
+    /// Only a blocked call that is not `required` may; anything else is refused in words. It
+    /// holds for this seat: a new offer, or the server's `start`, ends it.
+    pub fn carry_on_unencrypted(&mut self) -> Result<(), &'static str> {
+        match self.mode {
+            Mode::Blocked if self.required => Err("This call only goes on end-to-end encrypted. Leave it, or ask who can't encrypt to update their app."),
+            Mode::Blocked => {
+                self.mode = Mode::Transport;
+                Ok(())
+            }
+            _ => Err("Encryption wasn't turned off in this call."),
         }
     }
 
@@ -525,7 +548,8 @@ impl E2ee {
 
     /// How the call is protected now.
     pub fn security(&self) -> CallSecurity {
-        let mut security = CallSecurity { unsupported: self.unsupported.clone(), server_lacks: !self.offered, ..CallSecurity::default() };
+        let mut security =
+            CallSecurity { unsupported: self.unsupported.clone(), server_lacks: !self.offered, required: self.required, ..CallSecurity::default() };
         security.mode = match self.mode {
             Mode::Transport => SecurityMode::Transport,
             Mode::Waiting => SecurityMode::Pending,

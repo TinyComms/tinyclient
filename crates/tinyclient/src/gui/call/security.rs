@@ -52,8 +52,9 @@ pub(super) enum Badge {
     Transport,
     /// End to end, but a verified key changed or the group holds someone the call does not.
     Check,
-    /// The person only joins end-to-end encrypted calls, and the server turned encryption off.
-    /// Nothing is sent or played. Not the shield of `Transport`: that call carries on.
+    /// The server turned encryption off. Nothing is sent or played until the person chooses to
+    /// carry on unencrypted, which a `required` call does not offer. Not the shield of
+    /// `Transport`: that call carries on.
     Blocked,
 }
 
@@ -145,11 +146,24 @@ pub(super) fn summary(security: &CallSecurity, alone: bool) -> (&'static str, &'
         Badge::Check => ("Check who is in this call", "The call is end-to-end encrypted, but something about who holds its keys changed. Read below before you trust it."),
         Badge::Pending => ("Setting up end-to-end encryption", "Your microphone waits until it's done, so nothing you say reaches the server unlocked."),
         Badge::Transport => ("Encrypted to the server", "Encrypted between each app and the server. The server could hear this call."),
+        Badge::Blocked if security.required => (
+            "Encryption was turned off",
+            "This call only goes on end-to-end encrypted, and the server turned encryption off, so nothing is sent or played. Leave the call.",
+        ),
         Badge::Blocked => (
             "Encryption was turned off",
-            "You asked to join only end-to-end encrypted calls. The server turned encryption off, so nothing is sent or played. Leave, or change the setting in Privacy to carry on.",
+            "The server turned encryption off, so nothing is sent or played. Leave, or carry on knowing the server could hear the call.",
         ),
     }
+}
+
+/// The one button that turns a blocked call to clear.
+pub(super) const CARRY_ON: &str = "Carry on without encryption";
+
+/// A blocked call that may carry on unencrypted, if the person chooses. A `required` call may not:
+/// the person's setting, an Incognito host, or a room that requires it.
+pub(super) fn offers_carry_on(security: &CallSecurity) -> bool {
+    security.mode == SecurityMode::Blocked && !security.required
 }
 
 /// Why a call is not end to end, one line each: only encrypted to the server, or blocked because
@@ -296,6 +310,11 @@ impl Shell {
         self.call_ask(request, cx);
     }
 
+    /// The person chose to carry on without end-to-end encryption. Only ever from their click.
+    fn call_carry_on_unencrypted(&mut self, cx: &mut Context<Self>) {
+        self.call_ask(Request::CallCarryOnUnencrypted, cx);
+    }
+
     /// The panel the lock opens.
     pub(super) fn call_security_panel(&self, call: &Call, cx: &mut Context<Self>) -> Stateful<Div> {
         let mut panel = div()
@@ -331,6 +350,27 @@ impl Shell {
             )
             .child(words(sentence.to_owned(), theme::text_soft()))
             .children(why_transport(call, &security).into_iter().map(|line| words(line, theme::text_soft())));
+        if offers_carry_on(&security) && in_call(call) {
+            panel = panel.child(
+                div()
+                    .id("call-carry-on-unencrypted")
+                    .flex_none()
+                    .h(px(26.))
+                    .px(px(10.))
+                    .rounded(px(6.))
+                    .bg(theme::hover())
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(12.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(theme::warning())
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme::selected()))
+                    .child(CARRY_ON)
+                    .on_click(cx.listener(|this, _, _, cx| this.call_carry_on_unencrypted(cx))),
+            );
+        }
         if security.mode != SecurityMode::EndToEnd {
             return panel;
         }
@@ -543,15 +583,23 @@ mod tests {
     #[test]
     fn a_blocked_call_says_what_happened_and_is_never_dressed_as_encrypted() {
         let blocked = CallSecurity { mode: SecurityMode::Blocked, unsupported: vec!["bea".into()], ..CallSecurity::default() };
-        // Alone or not, it is the same badge: the setting was refused, not the keys unfinished.
+        let refused = CallSecurity { required: true, ..blocked.clone() };
+        // Alone or not, it is the same badge: the server turned it off, not the keys unfinished.
         for alone in [true, false] {
             assert_eq!(badge(&blocked, alone), Badge::Blocked);
+            assert_eq!(badge(&refused, alone), Badge::Blocked);
             let (headline, sentence) = summary(&blocked, alone);
             assert_eq!(headline, "Encryption was turned off");
-            assert_eq!(
-                sentence,
-                "You asked to join only end-to-end encrypted calls. The server turned encryption off, so nothing is sent or played. Leave, or change the setting in Privacy to carry on."
-            );
+            assert!(sentence.contains("nothing is sent or played") && sentence.contains("could hear"), "{sentence}");
+            let (headline, sentence) = summary(&refused, alone);
+            assert_eq!(headline, "Encryption was turned off");
+            assert!(sentence.contains("only goes on end-to-end encrypted") && sentence.contains("Leave"), "{sentence}");
+        }
+        // The way on unencrypted is offered only when the call allows it, and only when blocked.
+        assert!(offers_carry_on(&blocked));
+        assert!(!offers_carry_on(&refused));
+        for mode in [SecurityMode::Transport, SecurityMode::Pending, SecurityMode::EndToEnd] {
+            assert!(!offers_carry_on(&CallSecurity { mode, ..CallSecurity::default() }));
         }
         assert_eq!(badge_words(Badge::Blocked), "Encryption was turned off");
         // A warning, not a lock and not the transport shield: it is neither encrypted nor carrying on.
