@@ -98,9 +98,9 @@ const ENGINE: &str = "The call engine could not start. Try again.";
 /// Which candidates to offer. `TINYCLIENT_MEDIAD_ICE` makes a test offer one kind alone: `udp`,
 /// or `tcp`, which is how a network that blocks UDP looks to the server.
 fn transports() -> (bool, bool) {
-    match std::env::var("TINYCLIENT_MEDIAD_ICE").as_deref() {
-        Ok("udp") => (true, false),
-        Ok("tcp") => (false, true),
+    match crate::out::var("TINYCLIENT_MEDIAD_ICE").as_deref() {
+        Some("udp") => (true, false),
+        Some("tcp") => (false, true),
         _ => (true, true),
     }
 }
@@ -792,6 +792,9 @@ impl Call {
                 }
             }
         }
+        // A phone's camera and screen capture run on the platform: they stop with the button.
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        self.pictures.release(self.sending_share && self.controls.share(), self.sending_camera && self.controls.camera());
         if !self.connected || self.video_at.is_some_and(|at| at.elapsed() < Duration::from_millis(66)) {
             return;
         }
@@ -1100,6 +1103,8 @@ impl Call {
 
 /// Runs the call until chatd hangs up. A failure does not return (`out::fail` exits).
 pub fn run(link: Link, user_id: String, controls: Arc<Controls>) {
+    // A phone's audio session, for as long as the call runs. Nothing on a desktop.
+    let _audio_session = crate::platform::call_audio();
     let mut microphone_unasked = false;
     if !Audio::simulated() {
         match microphone() {

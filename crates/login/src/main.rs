@@ -25,8 +25,8 @@
 //! CONTRACT: chatd's `sign_in` reads every failure as "sign-in was cancelled" and passes no
 //! `--at`; both are there for it to use.
 
-mod common;
-mod teams;
+
+pub(crate) use login::teams;
 mod messages;
 
 #[cfg(target_os = "macos")]
@@ -34,7 +34,7 @@ mod macos;
 #[cfg(not(target_os = "macos"))]
 mod desktop;
 
-pub(crate) use common::*;
+pub(crate) use login::*;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();

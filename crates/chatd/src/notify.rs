@@ -17,7 +17,8 @@ use notifier::{Activation, Kind, Note, Sink};
 use protocol::settings::{self, Values, GLOBAL};
 use protocol::{Call, CallState, Conversation, ConversationKind, Key, Message, Network, Request, Response, Special, Watching};
 use std::collections::{HashMap, VecDeque};
-use std::process::{Child, Command, Stdio};
+use protocol::media_host::MediaChild;
+use std::process::{Command, Stdio};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -522,7 +523,7 @@ fn moment(hub: &Hub, conversation: &Key, notes: &Notes, at: Instant) -> Moment {
 }
 
 /// One sound through mediad. A ring is kept so it can be stopped.
-fn play(word: &str, volume: u32) -> Option<Child> {
+fn play(word: &str, volume: u32) -> Option<MediaChild> {
     let mediad = crate::media::mediad_path().ok()?;
     let mut command = Command::new(mediad);
     command.arg("--sound").arg(word).arg(volume.min(100).to_string()).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
@@ -532,12 +533,17 @@ fn play(word: &str, volume: u32) -> Option<Child> {
         // CREATE_NO_WINDOW: no console flashes up for it.
         command.creation_flags(0x0800_0000);
     }
-    command.spawn().map_err(|err| tracing::warn!("chatd: sound: {err}")).ok()
+    // In process (phones) there is no stdio to discard: its pipes are dropped at once, and a
+    // sound says nothing on them.
+    if protocol::media_host::in_process() {
+        return protocol::media_host::spawn(&mut command).map(|spawned| spawned.child).map_err(|err| tracing::warn!("chatd: sound: {err}")).ok();
+    }
+    command.spawn().map(MediaChild::from).map_err(|err| tracing::warn!("chatd: sound: {err}")).ok()
 }
 
 fn run(hub: &Arc<Hub>, chat: &Weak<Chat>, mut notes: Notes, told: &Receiver<Event>) {
-    let mut ring: Option<Child> = None;
-    let mut playing: Vec<Child> = Vec::new();
+    let mut ring: Option<MediaChild> = None;
+    let mut playing: Vec<MediaChild> = Vec::new();
     while let Ok(event) = told.recv() {
         playing.retain_mut(|child| matches!(child.try_wait(), Ok(None)));
         // Rows and calls change many times a second; most need no settings at all.

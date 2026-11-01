@@ -36,6 +36,10 @@ mod tiny_attach;
 mod update;
 #[cfg(all(feature = "gui", any(target_os = "ios", target_os = "android")))]
 mod view;
+/// What the phone registers with the core: mediad in process, the call platform and the web
+/// sign-in (`src/mobile.rs`). Its platform parts are stubs for the Android and iOS work to fill.
+#[cfg(all(feature = "mobile", any(target_os = "ios", target_os = "android")))]
+mod mobile;
 
 /// Starts the window on iOS.
 ///
@@ -50,6 +54,7 @@ pub fn ios_main() {
         if let Some(home) = std::env::var_os("HOME") {
             protocol::set_support_dir(std::path::PathBuf::from(home).join("Library/Application Support/tinyclient"));
         }
+        mobile::register();
         inprocess::register();
         inprocess::start_now();
     }
@@ -86,6 +91,7 @@ pub extern "C" fn android_main(app: android_activity::AndroidApp) {
         Some(dir) => protocol::set_support_dir(dir),
         None => log::error!("tinyclient: Android gave no internal data path; the data falls back to /tmp"),
     }
+    mobile::register();
     inprocess::register();
     inprocess::start_now();
     let _session = match gpui_mobile::android::jni::init_platform(&app) {

@@ -16,6 +16,7 @@ mod call;
 pub mod crash;
 pub mod hotkey;
 pub mod log_policy;
+pub mod media_host;
 mod info;
 pub mod ipc;
 pub mod launch;
@@ -25,6 +26,7 @@ mod react;
 pub mod settings;
 mod signin;
 mod tiny;
+pub mod web_sign_in;
 
 pub use call::*;
 pub use crash::redact;

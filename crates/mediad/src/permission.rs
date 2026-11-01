@@ -64,7 +64,16 @@ pub fn microphone() -> Option<Microphone> {
     {
         return macos_microphone();
     }
-    #[cfg(not(target_os = "macos"))]
+    // A phone asks its platform, which shows the system's prompt and waits for the answer.
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    {
+        return Some(match crate::platform::get().map(|platform| platform.request_permission(crate::platform::Permission::Microphone)) {
+            Some(Ok(())) => Microphone::Allowed,
+            Some(Err(_)) => Microphone::Denied,
+            None => Microphone::Unasked,
+        });
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "android", target_os = "ios")))]
     {
         Some(Microphone::Unasked)
     }

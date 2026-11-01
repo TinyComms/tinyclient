@@ -36,8 +36,8 @@ fn give_up(err: crate::audio::AudioError) -> ! {
 
 pub fn run() {
     let (requests, asked) = channel();
-    let _ = std::thread::Builder::new().name("stdin".to_owned()).spawn(move || {
-        let mut stdin = std::io::stdin().lock();
+    let _ = out::spawn(std::thread::Builder::new().name("stdin".to_owned()), move || {
+        let mut stdin = out::stdin();
         loop {
             match read_frame::<MediaRequest>(&mut stdin) {
                 Ok(request) => {

@@ -5,16 +5,35 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+# The sign-in logic (`src/lib.rs`), which chatd links on phones without a window of its own.
+[lib]
+name = "login"
+path = "src/lib.rs"
+
+# The desktop helper: a window with a web view. Needs `window`.
 [[bin]]
 name = "tinyclient-login"
 path = "src/main.rs"
+required-features = ["window"]
+
+[features]
+default = ["window"]
+# The helper's own window: wry and tao on Windows and Linux (macOS uses WKWebView directly).
+window = ["dep:wry", "dep:tao"]
 
 [dependencies]
 protocol.workspace = true
 tracing.workspace = true
 serde_json.workspace = true
 tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
+ureq = { version = "3", default-features = false, features = ["json"] }
+
+# The system's TLS everywhere but Android, as chatd (`chatd::tls`).
+[target.'cfg(not(target_os = "android"))'.dependencies]
 ureq = { version = "3", default-features = false, features = ["native-tls", "json"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+ureq = { version = "3", default-features = false, features = ["rustls", "json"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
@@ -24,8 +43,8 @@ objc2-app-kit = "0.3"
 objc2-web-kit = "0.3"
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
-wry = "0.57"
-tao = "0.37"
+wry = { version = "0.57", optional = true }
+tao = { version = "0.37", optional = true }
 sha2 = "0.10"
 getrandom = "0.3"
 
