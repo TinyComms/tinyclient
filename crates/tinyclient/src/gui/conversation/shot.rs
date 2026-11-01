@@ -296,7 +296,7 @@ fn stage(pane: &mut Pane, window: &mut Window, cx: &mut Context<Pane>) {
     pane.hover = Some(id.clone());
     let at = gpui::point(bounds.right() - px(120.), bounds.top() + px(12.));
     if pane.script.menu.is_some() {
-        pane.open_menu(message, at, cx);
+        pane.open_menu(message, at, window, cx);
     } else if pane.script.picker.is_some() {
         pane.open_picker(&id, gpui::point(bounds.right() - px(60.), bounds.top()), window, cx);
     } else if pane.script.confirm.is_some() {

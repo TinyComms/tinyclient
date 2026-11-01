@@ -66,6 +66,20 @@ pub fn popover() -> Div {
     floating(theme::R_FLOAT).p(px(12.)).min_w(px(200.)).max_w(px(360.)).shadow(theme::shadow_popover())
 }
 
+/// The next row when Up or Down moves through a menu of `len` actionable rows.
+/// An empty menu stays at 0. Movement wraps.
+pub fn menu_step(len: usize, index: usize, down: bool) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let index = index % len;
+    if down {
+        (index + 1) % len
+    } else {
+        (index + len - 1) % len
+    }
+}
+
 /// A context menu: a column of [`menu_item`]s, [`menu_separator`]s and [`menu_label`]s.
 pub fn menu() -> Div {
     floating(theme::R_FLOAT)
@@ -281,4 +295,18 @@ pub fn fade_in<E: IntoElement + Styled + 'static>(
     let milliseconds = if crate::gui::app::reduce_motion() { 0 } else { milliseconds };
     let animation = Animation::new(Duration::from_millis(milliseconds.max(1))).with_easing(gpui::ease_out_quint());
     element.with_animation(id, animation, |element, delta| element.opacity(delta))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::menu_step;
+
+    #[test]
+    fn menu_keys_wrap_through_the_rows() {
+        assert_eq!(menu_step(0, 4, true), 0);
+        assert_eq!(menu_step(3, 0, false), 2);
+        assert_eq!(menu_step(3, 2, true), 0);
+        assert_eq!(menu_step(3, 1, false), 0);
+        assert_eq!(menu_step(3, 5, true), 0);
+    }
 }

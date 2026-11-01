@@ -91,6 +91,20 @@ pub(super) fn space_of(open: Option<&Conversation>, person: &Key) -> Option<(Key
     Some((Key { id, ..open.key.clone() }, open.space_title.clone()))
 }
 
+/// The override to keep after a notification change. A refusal puts the previous one back.
+fn kept_notify(
+    previous: Option<(Key, Notify)>,
+    conversation: &Key,
+    chosen: Notify,
+    accepted: bool,
+) -> Option<(Key, Notify)> {
+    if accepted {
+        Some((conversation.clone(), chosen))
+    } else {
+        previous
+    }
+}
+
 impl InfoPane {
     pub fn new(shell: WeakEntity<Shell>, hub: Hub) -> InfoPane {
         InfoPane {
@@ -389,18 +403,35 @@ impl InfoPane {
     }
 
     fn set_notify(&mut self, conversation: Key, notify: Notify, cx: &mut Context<Self>) {
+        let previous = self.notify_set.clone();
         self.notify_set = Some((conversation.clone(), notify));
         cx.notify();
         if only_draws() {
             return;
         }
+        let pane = cx.weak_entity();
         let shell = self.shell.clone();
+        let saved = conversation.clone();
         super::ask_later(cx, Request::SetMute { conversation, notify }, move |answer, cx| {
-            if let Ok(Response::Error { detail, .. }) = answer {
-                let _ = shell.update(cx, |shell, cx| {
-                    shell.toast(Some(("icons/circle-alert.svg", theme::danger())), format!("Can't change notifications: {detail}"), cx)
-                });
+            let accepted = matches!(&answer, Ok(Response::Ok));
+            let _ = pane.update(cx, |this, cx| {
+                let still = this.notify_set.as_ref().is_some_and(|(key, set)| key == &saved && *set == notify);
+                if still {
+                    this.notify_set = kept_notify(previous, &saved, notify, accepted);
+                    cx.notify();
+                }
+            });
+            if accepted {
+                return;
             }
+            let detail = match answer {
+                Ok(Response::Error { detail, .. }) => detail,
+                Err(err) => crate::client::trouble_words("save", &err),
+                _ => crate::client::OTHER_ANSWER.to_owned(),
+            };
+            let _ = shell.update(cx, |shell, cx| {
+                shell.toast(Some(("icons/circle-alert.svg", theme::danger())), format!("Can't change notifications: {detail}"), cx);
+            });
         });
     }
 
@@ -1038,5 +1069,32 @@ impl InfoPane {
             }
             Subject::Space(_) => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key() -> Key {
+        Key {
+            network: Network::Slack,
+            account: "T".into(),
+            id: "C".into(),
+        }
+    }
+
+    #[test]
+    fn a_notification_change_keeps_the_choice_only_when_it_was_saved() {
+        let previous = Some((key(), Notify::All));
+        assert_eq!(
+            kept_notify(previous.clone(), &key(), Notify::Nothing, true),
+            Some((key(), Notify::Nothing))
+        );
+        assert_eq!(
+            kept_notify(previous.clone(), &key(), Notify::Nothing, false),
+            previous
+        );
+        assert_eq!(kept_notify(None, &key(), Notify::Mentions, false), None);
     }
 }

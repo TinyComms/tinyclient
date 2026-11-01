@@ -683,8 +683,10 @@ fn picker_previews_live_in_their_own_directory_and_go_when_the_picker_closes() {
     let emoji = PathBuf::from(chatd.fetched("emoji-1").path.unwrap());
     assert!(emoji.starts_with(chatd.media_dir()));
 
-    until("the picker's files to go once it closed", || !pick_dir.exists());
-    assert!(!chatd.dir.join("media/discord/pick").exists());
+    // The account directory goes first and the network's `pick` directory straight after.
+    // Waiting on the account directory alone can observe the gap between those two removes.
+    let pick = chatd.dir.join("media/discord/pick");
+    until("the picker's files to go once it closed", || !pick.exists());
     assert!(emoji.exists(), "the emoji stays");
     // Opened again: the previews are fetched again, from the network.
     assert!(chatd.fetched(&sticker).path.is_some());

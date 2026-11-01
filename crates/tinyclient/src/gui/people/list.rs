@@ -127,6 +127,15 @@ pub fn search_ended(waiting: &mut Vec<AccountKey>, asked: Option<&str>, account:
     waiting.len() != before
 }
 
+/// Accounts named on the `People` answer already finished this query. They will not say
+/// `Searched`, so they leave the "Asking…" lines.
+pub fn search_settled(waiting: &mut Vec<AccountKey>, settled: &[AccountKey]) {
+    if settled.is_empty() {
+        return;
+    }
+    waiting.retain(|account| !settled.contains(account));
+}
+
 /// The network agreed to an action: the person's row becomes what they now are, where it is.
 pub fn apply_related(owned: &mut Vec<Rc<Person>>, blocked: &mut Vec<Rc<Person>>, person: &Key, action: RelateAction) {
     let Some(at) = owned.iter().position(|held| &held.key == person) else {
@@ -548,7 +557,7 @@ impl PeopleList {
                 if this.epoch != epoch {
                     return;
                 }
-                let Ok(Response::People { people, total }) = answer else {
+                let Ok(Response::People { people, total, .. }) = answer else {
                     this.loaded = true;
                     cx.notify();
                     return;
@@ -651,7 +660,8 @@ impl PeopleList {
     }
 
     /// The typing has paused: chatd asks each connected account in scope once, and each says
-    /// when it has finished (`Change::Searched`).
+    /// when it has finished (`Change::Searched`). One it already searched is named on the
+    /// answer, and that line comes down without a change.
     fn ask_networks(&mut self, cx: &mut Context<Self>) {
         let query = self.needle.clone();
         self.asked = Some(query.clone());
@@ -665,13 +675,14 @@ impl PeopleList {
         let request = Request::People { network: self.scope, relation: None, query: Some(query), offset: 0, limit: QUERY_ROWS };
         let (epoch, this) = (self.query_epoch, cx.weak_entity());
         super::ask_later(cx, request, move |answer, cx| {
-            let Ok(Response::People { people, .. }) = answer else {
+            let Ok(Response::People { people, settled, .. }) = answer else {
                 return;
             };
             let _ = this.update(cx, |this, cx| {
                 if this.query_epoch == epoch {
                     this.hub.learn(&people);
                     this.found = people.into_iter().filter(|p| !p.bot).map(Rc::new).collect();
+                    search_settled(&mut this.waiting, &settled);
                     this.rebuild();
                     cx.notify();
                 }
@@ -1267,6 +1278,11 @@ mod tests {
         assert!(!search_ended(&mut waiting, None, &north, "mar"));
         assert!(search_ended(&mut waiting, Some("mar"), &north, "mar"));
         assert!(!search_ended(&mut waiting, Some("mar"), &north, "mar"));
+        assert_eq!(waiting, [river.clone()]);
+        let mut waiting = vec![north.clone(), river.clone()];
+        search_settled(&mut waiting, &[]);
+        assert_eq!(waiting, [north.clone(), river.clone()]);
+        search_settled(&mut waiting, &[north]);
         assert_eq!(waiting, [river]);
     }
 

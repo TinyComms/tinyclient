@@ -355,6 +355,52 @@ impl Pane {
         }
     }
 
+    /// A failed newer page, jump, or jump-to-latest. Sits above the jump button when that is up.
+    pub(super) fn history_banner(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let miss = self.history_miss.as_ref()?;
+        let (page, purpose, words) = (miss.page.clone(), miss.purpose.clone(), miss.words.clone());
+        let bottom = if self.away { 48. } else { 12. };
+        Some(
+            div()
+                .id("history-miss")
+                .absolute()
+                .bottom(px(bottom))
+                .left(px(16.))
+                .max_w(px(420.))
+                .px(px(10.))
+                .py(px(6.))
+                .rounded(px(theme::R_CONTROL))
+                .bg(theme::overlay())
+                .border_1()
+                .border_color(theme::border())
+                .shadow(theme::shadow_popover())
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .child(
+                    div()
+                        .min_w_0()
+                        .type_small()
+                        .text_color(theme::text())
+                        .child(words),
+                )
+                .child(
+                    div()
+                        .id("history-retry")
+                        .flex_none()
+                        .type_small()
+                        .text_color(theme::accent_text())
+                        .cursor_pointer()
+                        .child("Retry")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.history_miss = None;
+                            this.load(page.clone(), purpose.clone(), cx);
+                        })),
+                )
+                .into_any_element(),
+        )
+    }
+
     /// Floats 16 from the right, 12 above the composer: "12 new" while unread is below, else
     /// "Jump to latest". A click, or Escape with nothing else open, goes to the newest.
     pub(super) fn jump_button(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -483,10 +529,10 @@ impl Pane {
             .when(!mentioned && !editing && !owns, |row| row.hover(|style| style.bg(tokens::row_hover())))
             .on_mouse_down(
                 MouseButton::Right,
-                cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
                     let can = this.can(&menu);
                     if can.act || can.unsent {
-                        this.open_menu(menu.clone(), event.position, cx);
+                        this.open_menu(menu.clone(), event.position, window, cx);
                     }
                 }),
             )
