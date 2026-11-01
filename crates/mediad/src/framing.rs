@@ -8,8 +8,9 @@ use std::io::{self, ErrorKind, Read, Write};
 /// The largest frame either side sends or takes. Larger than any packet str0m makes.
 pub const FRAME_MAX: usize = 2000;
 /// Bytes waiting to go out on one stream. A packet that would pass it is dropped, as UDP
-/// would lose it.
-const BACKLOG: usize = 256 * 1024;
+/// would lose it. Audio shares this queue, so what waits here is what every voice frame waits
+/// behind: at 2 Mb/s this is 160 ms, which is as long as a frame is still worth sending.
+const BACKLOG: usize = 32 * 1024;
 /// One read from a stream.
 const CHUNK: usize = 4096;
 
