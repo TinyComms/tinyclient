@@ -1,9 +1,23 @@
-//! One sender's packets, put back in order and handed out one every 20 ms.
+//! One sender's packets, put back in order and handed out one every 20 ms. How many are held
+//! follows that sender's measured jitter: at once when it rises, and slowly when it falls. Extra
+//! delay goes where nobody hears it, by refilling less at the start of a spurt and dropping quiet
+//! frames during one; the voice is never played faster.
 
 use std::collections::BTreeMap;
 
-/// Packets held before playing starts: 60 ms rides out ordinary reordering.
+/// Packets held before playing starts, until the sender's jitter says otherwise: 60 ms rides out
+/// ordinary reordering.
 const START: usize = 3;
+/// The least and most ever held: 40 and 200 ms.
+const LEAST: usize = 2;
+const MOST: usize = 10;
+/// Ticks the jitter must stay under what is held before one packet less is held: 5 s. It takes
+/// that long for a passing lull to prove itself, and a depth that follows every lull goes up and
+/// down with it.
+const RELEASE: u32 = 250;
+/// Packets over which the shallowest the queue got shows what is spare: half a second. A burst
+/// arriving together is not spare; what has been sitting there the whole time is.
+const WATCH: u32 = 25;
 /// More than a second queued means the clocks disagree; the oldest go.
 const CAPACITY: usize = 50;
 /// Ticks with nothing queued before the talk spurt is taken to be over: 400 ms. A shorter
@@ -39,7 +53,6 @@ pub enum Pop {
     Empty,
 }
 
-#[derive(Default)]
 pub struct Jitter {
     /// By sequence number, unwrapped so 65535 is followed by 65536.
     packets: BTreeMap<i64, Vec<u8>>,
@@ -52,12 +65,43 @@ pub struct Jitter {
     grace: u32,
     /// The next packet played starts a spurt, not the one the last was followed by.
     spurt: bool,
+    /// Packets to hold: what a spurt fills to, and past which the queue is spare.
+    target: usize,
+    /// Ticks in a row that less than `target` would have done.
+    calm: u32,
+    /// The shallowest the queue has been in this watch, over `seen` packets.
+    low: usize,
+    seen: u32,
+    /// Packets found spare in the last watch and not yet dropped.
+    spare: usize,
     pub late: u64,
     pub lost: u64,
     /// Packets taken in time to be played.
     pub received: u64,
     /// The frame played last was quiet, as the decoder found it.
     pub hushed: bool,
+}
+
+impl Default for Jitter {
+    fn default() -> Jitter {
+        Jitter {
+            packets: BTreeMap::new(),
+            newest: None,
+            due: None,
+            idle: 0,
+            grace: 0,
+            spurt: false,
+            target: START,
+            calm: 0,
+            low: usize::MAX,
+            seen: 0,
+            spare: 0,
+            late: 0,
+            lost: 0,
+            received: 0,
+            hushed: false,
+        }
+    }
 }
 
 impl Jitter {
@@ -73,7 +117,7 @@ impl Jitter {
     pub fn insert(&mut self, sequence: u16, payload: Vec<u8>) {
         let mut unwrapped = self.unwrap(sequence);
         if self.newest.is_some_and(|newest| (unwrapped - newest).abs() > RESTART) {
-            *self = Jitter { late: self.late, lost: self.lost, received: self.received, ..Jitter::default() };
+            *self = Jitter { late: self.late, lost: self.lost, received: self.received, target: self.target, ..Jitter::default() };
             unwrapped = i64::from(sequence);
         }
         if self.due.is_some_and(|due| unwrapped < due) {
@@ -91,13 +135,66 @@ impl Jitter {
         }
     }
 
+    /// The sender's jitter as measured now, once a tick. RFC 3550's figure is an average; a
+    /// packet lands up to about three times that behind, and then waits for the next tick. What
+    /// is held goes up the moment that asks for more, and comes down one packet at a time.
+    pub fn aim(&mut self, jitter_ms: u32) {
+        let wanted = (jitter_ms as usize * 3 + 20).div_ceil(20).clamp(LEAST, MOST);
+        if wanted >= self.target {
+            self.target = wanted;
+            self.calm = 0;
+        } else if self.due.is_some() {
+            self.calm += 1;
+            if self.calm >= RELEASE {
+                self.calm = 0;
+                self.target -= 1;
+            }
+        }
+    }
+
+    /// The voice stalled waiting for a packet: however calm the average, what is held was not
+    /// enough.
+    pub fn deepen(&mut self) {
+        self.target = (self.target + 1).min(MOST);
+        self.calm = 0;
+    }
+
+    /// Packets to hold now.
+    pub fn target(&self) -> usize {
+        self.target
+    }
+
+    /// Packets waiting now.
+    pub fn held(&self) -> usize {
+        self.packets.len()
+    }
+
+    /// Whether a frame can go, which uses it up. More has been queued all along than the jitter
+    /// calls for, as after a stall.
+    pub fn shed(&mut self) -> bool {
+        let spare = self.spare > 0;
+        self.spare -= usize::from(spare);
+        spare
+    }
+
+    /// Notes how deep the queue is as a packet is about to leave it.
+    fn watch(&mut self) {
+        self.low = self.low.min(self.packets.len());
+        self.seen += 1;
+        if self.seen >= WATCH {
+            self.spare = self.low.saturating_sub(self.target);
+            self.low = usize::MAX;
+            self.seen = 0;
+        }
+    }
+
     /// Called once every 20 ms.
     pub fn pop(&mut self) -> Pop {
         let Some(due) = self.due else {
             // Filling. Also start when a short burst stopped arriving, so it is not held forever.
             let waiting = !self.packets.is_empty();
             self.idle = if waiting { self.idle + 1 } else { 0 };
-            if self.packets.len() >= START || (waiting && self.idle >= START as u32) {
+            if self.packets.len() >= self.target || (waiting && self.idle >= self.target as u32) {
                 self.idle = 0;
                 self.due = self.packets.keys().next().copied();
                 return match self.pop() {
@@ -107,6 +204,9 @@ impl Jitter {
             }
             return Pop::Empty;
         };
+        if self.packets.contains_key(&due) {
+            self.watch();
+        }
         if let Some(payload) = self.packets.remove(&due) {
             self.due = Some(due + 1);
             self.idle = 0;
@@ -347,6 +447,103 @@ mod tests {
         assert_eq!(jitter.pop(), Pop::Packet(packet(100)));
         fill(&mut jitter, &[30_000, 30_001, 30_002]);
         assert_eq!(jitter.pop(), Pop::Packet(packet(30_000)));
+    }
+
+    #[test]
+    fn what_is_held_rises_at_once_and_falls_a_packet_at_a_time() {
+        let mut jitter = Jitter::default();
+        assert_eq!(jitter.target(), START);
+        jitter.aim(30);
+        assert_eq!(jitter.target(), 6, "90 ms of lateness and a tick");
+        jitter.aim(500);
+        assert_eq!(jitter.target(), MOST, "never over 200 ms");
+        // Not playing: nothing is known yet that says it can come down.
+        for _ in 0..RELEASE * 2 {
+            jitter.aim(0);
+        }
+        assert_eq!(jitter.target(), MOST);
+        fill(&mut jitter, &(0..12).collect::<Vec<u16>>());
+        assert!(matches!(jitter.pop(), Pop::Packet(_)));
+        for _ in 0..RELEASE - 1 {
+            jitter.aim(0);
+        }
+        assert_eq!(jitter.target(), MOST, "still proving itself");
+        jitter.aim(0);
+        assert_eq!(jitter.target(), MOST - 1);
+        for _ in 0..RELEASE * 20 {
+            jitter.aim(0);
+        }
+        assert_eq!(jitter.target(), LEAST, "never under 40 ms");
+    }
+
+    #[test]
+    fn a_spurt_fills_to_what_the_jitter_asks_for() {
+        let mut jitter = Jitter::default();
+        jitter.aim(30);
+        fill(&mut jitter, &[1, 2, 3, 4, 5]);
+        assert_eq!(jitter.pop(), Pop::Empty, "60 ms is not enough here");
+        fill(&mut jitter, &[6]);
+        assert_eq!(jitter.pop(), Pop::Packet(packet(1)));
+    }
+
+    /// A minute of arrivals up to 60 ms late at random, measured as the call measures them. The
+    /// depth settles and stays: a buffer that hunts changes the delay of every other sentence.
+    #[test]
+    fn what_is_held_stays_still_under_steady_jitter() {
+        use crate::stats::Arrivals;
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        let mut arrivals = Arrivals::default();
+        let mut jitter = Jitter::default();
+        let mut seed = 11u32;
+        let mut depths = Vec::new();
+        for n in 0..3_000u16 {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let wobble = u64::from(seed >> 16) * 60 / 65_536;
+            arrivals.arrived(u32::from(n) * 960, start + Duration::from_millis(u64::from(n) * 20 + wobble));
+            jitter.insert(n, packet(n));
+            jitter.aim(arrivals.ms());
+            jitter.pop();
+            depths.push(jitter.target());
+        }
+        let settled = &depths[500..];
+        let (least, most) = (*settled.iter().min().unwrap(), *settled.iter().max().unwrap());
+        assert!((4..=7).contains(&least), "{least}");
+        assert!(most - least <= 1, "{least} to {most}");
+        let changes = settled.windows(2).filter(|pair| pair[0] != pair[1]).count();
+        assert!(changes <= 6, "{changes} changes in 50 s");
+    }
+
+    #[test]
+    fn a_queue_deeper_than_it_needs_to_be_offers_up_frames() {
+        let mut jitter = Jitter::default();
+        // Eight behind, from a stall, with packets going on arriving at the rate they play.
+        fill(&mut jitter, &(0..8).collect::<Vec<u16>>());
+        for n in 8..8 + WATCH as u16 {
+            assert!(matches!(jitter.pop(), Pop::Packet(_)));
+            assert!(!jitter.shed() || n == 8 + WATCH as u16 - 1, "too soon to say at {n}");
+            fill(&mut jitter, &[n]);
+        }
+        assert_eq!(jitter.held(), 8);
+    }
+
+    #[test]
+    fn a_burst_that_passes_through_is_not_spare() {
+        let mut jitter = Jitter::default();
+        fill(&mut jitter, &[0, 1, 2]);
+        let mut next = 3u16;
+        for n in 0..WATCH * 2 {
+            assert!(matches!(jitter.pop(), Pop::Packet(_)));
+            // Now and then three come together, then none for two ticks.
+            if n % 10 == 0 {
+                fill(&mut jitter, &[next, next + 1, next + 2]);
+                next += 3;
+            } else if n % 10 > 2 {
+                fill(&mut jitter, &[next]);
+                next += 1;
+            }
+        }
+        assert!(!jitter.shed());
     }
 
     #[test]

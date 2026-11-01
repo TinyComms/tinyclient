@@ -147,11 +147,21 @@ impl Stream {
     /// log.
     pub(crate) fn pull(&mut self, who: &dyn std::fmt::Display) -> Option<Vec<i16>> {
         let mut pcm = [0i16; MAX_FRAME * CHANNELS];
+        self.jitter.aim(self.arrivals.ms());
         while self.pcm.len() < FRAME_SAMPLES {
             let decoded = match self.jitter.pop() {
                 Pop::Packet(packet) => {
-                    self.gaps += u64::from(std::mem::take(&mut self.stalled));
-                    self.played(&packet, &mut pcm)
+                    if std::mem::take(&mut self.stalled) {
+                        self.gaps += 1;
+                        self.jitter.deepen();
+                    }
+                    let decoded = self.played(&packet, &mut pcm);
+                    // More is queued than this voice calls for. A quiet frame can go: nothing
+                    // is played faster, so nothing warbles, and the delay is gone.
+                    if decoded.is_some() && self.jitter.hushed && self.jitter.shed() {
+                        continue;
+                    }
+                    decoded
                 }
                 // Not a loss yet. Pitch carries the voice; the decoder stays put so the packet
                 // after a real gap can still rebuild it.
@@ -1369,6 +1379,34 @@ mod receive_tests {
         assert!(late <= 5, "the words came {late} ticks after they arrived");
         assert_eq!(stream.jitter.lost, 0, "a pause is not a loss");
         assert_eq!(stream.gaps, 0);
+    }
+
+    /// Speech and pauses, with 60 ms too many queued, as a stall leaves it. The extra goes in
+    /// the first quiet frames, and not one frame of the speech goes with it.
+    #[test]
+    fn a_backlog_drains_through_quiet_frames_and_never_through_speech() {
+        let mut encoder = Encoder::voice().unwrap();
+        let (speech, mut spare) = (tone_packets(60), Vec::new());
+        for _ in 0..60 {
+            let mut packet = [0u8; 1275];
+            let len = encoder.encode(&[0i16; FRAME_SAMPLES], &mut packet).unwrap();
+            spare.push(packet[..len].to_vec());
+        }
+        let mut stream = Stream::new().unwrap();
+        let (sequences, mut played) = (speech.iter().chain(&spare).enumerate(), 0);
+        let mut sequences = sequences.map(|(n, packet)| (n as u16, packet.clone()));
+        for (n, packet) in sequences.by_ref().take(6) {
+            stream.jitter.insert(n, packet);
+        }
+        for (n, packet) in sequences {
+            stream.jitter.insert(n, packet);
+            played += usize::from(stream.pull(&"backlog").is_some());
+            if n == 59 {
+                assert_eq!(stream.jitter.held(), 6, "speech is never dropped");
+            }
+        }
+        assert_eq!(played, 114);
+        assert!(stream.jitter.held() <= stream.jitter.target(), "{} still queued", stream.jitter.held());
     }
 
     /// A packet 60 ms late in the middle of a word: the voice fades and comes back. Nothing is
