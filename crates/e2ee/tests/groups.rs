@@ -1469,3 +1469,38 @@ fn a_commit_in_flight_survives_a_restart_and_is_sent_again_whole() {
         "after restart"
     );
 }
+
+#[test]
+fn a_commit_older_than_the_ones_remembered_is_taken_for_shown_again_not_for_a_rewrite() {
+    let mut world = World::new();
+    let all: Vec<usize> = (0..8).map(|n| world.person(&format!("d{n}"))).collect();
+    world.sync_trust();
+    world.start(all[0]);
+    let conv = world.conv();
+    // Remember only 3 commits.
+    for at in &all {
+        let config = e2ee::Config {
+            commits_remembered: 3,
+            ..e2ee::Config::default()
+        };
+        world.clients[*at].engine.set_config(config);
+    }
+    let first = world.change(&[all[0]], all[0], &[all[1]], &[]);
+    let mut members = vec![all[0], all[1]];
+    for next in &all[2..] {
+        world.change(&members.clone(), all[0], &[*next], &[]);
+        members.push(*next);
+    }
+    assert_eq!(world.epoch(all[1]), 7);
+    // The oldest commit comes up again: all[1] joined with it (it is history for them), and all[0]
+    // made it and has forgotten it. Neither is told a rewrite, neither is frozen.
+    for at in [all[0], all[1]] {
+        let outcome = world.clients[at]
+            .engine
+            .handle_commit(conv, first.epoch, &first.commit)
+            .unwrap();
+        assert!(outcome.duplicate);
+        assert!(world.clients[at].engine.frozen(conv).is_none());
+    }
+    world.say(all[0], &[all[1], all[7]], "fine");
+}

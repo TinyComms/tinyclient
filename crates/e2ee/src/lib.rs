@@ -13,6 +13,38 @@
 //! * [`attachment`]: the sealed blob format, as streams.
 //! * [`store`]: the state store trait, the sealed snapshot's key and the local cache sealing.
 //! * [`safety`]: safety numbers.
+//!
+//! # The calls, in the order a client makes them
+//!
+//! 1. Once per install: [`Engine::create`] (or [`Engine::open`] after that). Register
+//!    `engine.device_id()` and `engine.signature_key()` with `PUT /v1/e2ee/devices/{id}`; a second
+//!    device of a person gets its `cross_signature` from a trusted one: [`Engine::cross_sign`].
+//!    Upload [`Engine::key_packages`] (up to 50) and one [`Engine::last_resort_key_package`]; top
+//!    up on `e2ee.keys_low`; replace the last-resort one within 84 days.
+//!    Every device list the server shows (members of a conversation, the person themself) goes
+//!    through [`Engine::verify_devices`] first. Nothing is added to a group that was not.
+//!    `GET /v1/e2ee/conversations/{id}`: [`Engine::observe_server_epoch`] and
+//!    [`Engine::observe_server_key`] with its `epoch` and `external_sender`.
+//! 2. The device the server tells to start the group: [`Engine::create_group`].
+//! 3. The handshake feed, in order, each item to its handler: `proposals` to
+//!    [`Engine::handle_proposals`], `commit` to [`Engine::handle_commit`], `welcome` to
+//!    [`Engine::handle_welcome`]. Proposals pending: [`Engine::commit_pending`], POST the
+//!    [`groups::CommitBundle`], then [`Engine::confirm_commit`] on `204`. On `409` or a lost reply
+//!    read the feed: the `commit` item settles it ([`Engine::pending_commit`] has ours to send
+//!    again). [`error::Error::UntrustedDevices`] means: verify those people's device lists and
+//!    call again.
+//! 4. Messages: [`Engine::encrypt`] (`Kind::Message`, or `Kind::Edit` with the target id) and
+//!    [`Engine::decrypt`] with what the row says ([`Claimed`]); an edit counts only after
+//!    [`Incoming::authorize_edit`] with the stored author of its target. Messages and commits of
+//!    one epoch: open the messages of epoch `e` before applying the commit that leaves `e`, or
+//!    within [`Config::max_past_epochs`] after it. A device cannot open its own messages: keep the
+//!    plaintext when you send.
+//! 5. Attachments: [`attachment::seal`] a file into the upload (new [`attachment::AttachmentKey`]
+//!    each), put key, `sha256` and sizes in the [`envelope::AttachmentRef`]; download into a file,
+//!    then [`attachment::decrypt_to_temp`] (or [`attachment::open_verified`]), and `persist` the
+//!    temp file only if it returned `Ok`.
+//! 6. The local cache of decrypted messages: [`store::seal_cache_value`] with the message id as
+//!    `row_id`.
 
 pub mod attachment;
 pub mod engine;

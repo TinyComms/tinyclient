@@ -2,7 +2,7 @@
 //! commits and Welcomes. Every rule that stops the server from adding a ghost device, or this
 //! device from following a rewritten history, is here.
 
-use crate::engine::{capabilities, Config, ConvMeta, Engine, APPLIED_KEPT, CIPHERSUITE};
+use crate::engine::{capabilities, Config, ConvMeta, Engine, CIPHERSUITE};
 use crate::error::{Error, Result};
 use crate::identity::SIGNATURE_KEY_LEN;
 use crate::ids::{parse_credential, ConversationId, DeviceRef};
@@ -781,7 +781,7 @@ impl Engine {
             .take()
             .map(|pending| sha256(&pending.commit).to_vec())
             .unwrap_or_default();
-        record_applied(entry, before, hash, epoch);
+        record_applied(entry, before, hash, epoch, self.config.commits_remembered);
         self.persist(true)?;
         Ok(CommitOutcome {
             epoch,
@@ -849,7 +849,9 @@ impl Engine {
             return self.confirm_commit(conv);
         }
         if message_epoch < local {
+            let forgotten = (local - message_epoch) as usize > self.config.commits_remembered;
             if message_epoch < entry.joined_epoch
+                || forgotten
                 || entry
                     .applied
                     .iter()
@@ -935,7 +937,13 @@ impl Engine {
         let epoch = group.epoch().as_u64();
         entry.pending_commit = None;
         entry.self_removal_pending = false;
-        record_applied(entry, before, hash.to_vec(), epoch);
+        record_applied(
+            entry,
+            before,
+            hash.to_vec(),
+            epoch,
+            self.config.commits_remembered,
+        );
         if removed_self {
             let mut group = groups.remove(&conv).ok_or(Error::NoGroup)?;
             group.delete(provider.storage()).map_err(Error::mls)?;
@@ -1142,10 +1150,10 @@ fn changes_of(
     Ok((added, removed))
 }
 
-fn record_applied(entry: &mut ConvMeta, made_at: u64, hash: Vec<u8>, now: u64) {
+fn record_applied(entry: &mut ConvMeta, made_at: u64, hash: Vec<u8>, now: u64, keep: usize) {
     entry.applied.push((made_at, hash.into()));
-    if entry.applied.len() > APPLIED_KEPT {
-        let excess = entry.applied.len() - APPLIED_KEPT;
+    if entry.applied.len() > keep {
+        let excess = entry.applied.len() - keep;
         entry.applied.drain(..excess);
     }
     entry.high_epoch = entry.high_epoch.max(now);

@@ -97,6 +97,10 @@ fn record(engine: &Engine) -> (e2ee::UserId, DeviceRecord) {
     )
 }
 
+/// Devices a commit adds at a time while the group grows: the server accepts at most 100
+/// Welcomes and 4 MiB of them in one commit, and every Welcome holds the whole tree.
+const BATCH: usize = 8;
+
 fn group_costs(n: usize) {
     println!("--- a group of {n} devices (one person each) ---");
     let ds = Ds {
@@ -116,21 +120,8 @@ fn group_costs(n: usize) {
         ms(took),
         per_op(took, n as u32)
     );
-    let (packages, took) = time(|| {
-        engines
-            .iter_mut()
-            .skip(1)
-            .map(|engine| engine.key_packages(1).unwrap().remove(0))
-            .collect::<Vec<_>>()
-    });
-    println!(
-        "one key package per joiner:        {} ({} each, {} bytes)",
-        ms(took),
-        per_op(took, (n - 1).max(1) as u32),
-        packages.first().map_or(0, Vec::len)
-    );
 
-    // Everyone trusts everyone (a device list each, trusted on first use).
+    // Engines 0 and 1 act: 0 makes the group and commits, 1 joins and follows. They trust everyone.
     let records: Vec<_> = engines.iter().map(record).collect();
     let (_, took) = time(|| {
         for engine in engines.iter_mut().take(2) {
@@ -146,50 +137,107 @@ fn group_costs(n: usize) {
         ms(took),
         per_op(took, (2 * n) as u32)
     );
-    // The other joiners need not trust anyone for this benchmark: only engine 0 and engine 1 act.
 
     engines[0].create_group(conv, &server_key).unwrap();
-    let proposals = ds.proposals(&packages, &[], 0);
-    let (outcome, took) = time(|| engines[0].handle_proposals(conv, &proposals).unwrap());
-    assert_eq!(
-        outcome.accepted.len(),
-        n - 1,
-        "{:?}",
-        outcome.rejected.first()
+    let mut members = 1usize;
+    let mut epoch = 0u64;
+    let mut package_time = Duration::ZERO;
+    let mut package_len = 0usize;
+    let mut proposal_time = Duration::ZERO;
+    let mut proposals_taken = 0u32;
+    let mut commit_time = Duration::ZERO;
+    let mut commits = 0u32;
+    let mut last = None;
+    let (_, build_took) = time(|| {
+        while members < n {
+            let take = if members == 1 {
+                1
+            } else {
+                BATCH.min(n - members)
+            };
+            let (packages, took) = time(|| {
+                engines[members..members + take]
+                    .iter_mut()
+                    .map(|engine| engine.key_packages(1).unwrap().remove(0))
+                    .collect::<Vec<_>>()
+            });
+            package_time += took;
+            package_len = packages[0].len();
+            let proposals = ds.proposals(&packages, &[], epoch);
+            let (_, took) = time(|| {
+                let outcome = engines[0].handle_proposals(conv, &proposals).unwrap();
+                assert_eq!(
+                    outcome.accepted.len(),
+                    take,
+                    "{:?}",
+                    outcome.rejected.first()
+                );
+            });
+            proposal_time += took;
+            proposals_taken += take as u32;
+            if members > 1 {
+                engines[1].handle_proposals(conv, &proposals).unwrap();
+            }
+            let (bundle, took) = time(|| engines[0].commit_pending(conv).unwrap().unwrap());
+            commit_time += took;
+            commits += 1;
+            engines[0].confirm_commit(conv).unwrap();
+            let apply = if members == 1 {
+                let (joined, took) = time(|| {
+                    engines[1]
+                        .handle_welcome(conv, &bundle.welcomes[0].data, Some(&server_key))
+                        .unwrap()
+                });
+                assert_eq!(joined.members.len(), 2);
+                took
+            } else {
+                time(|| {
+                    engines[1]
+                        .handle_commit(conv, bundle.epoch, &bundle.commit)
+                        .unwrap()
+                })
+                .1
+            };
+            members += take;
+            epoch += 1;
+            last = Some((
+                take,
+                members,
+                took,
+                bundle.commit.len(),
+                bundle.welcomes[0].data.len(),
+                apply,
+            ));
+        }
+    });
+    println!(
+        "key packages:                      {} each ({} bytes)",
+        per_op(package_time, (n - 1).max(1) as u32),
+        package_len
     );
     println!(
-        "take {} Add proposals ({} KiB):   {} ({} each)",
-        n - 1,
-        proposals.len() / 1024,
-        ms(took),
-        per_op(took, (n - 1).max(1) as u32)
+        "take an Add proposal:              {} each ({} taken)",
+        per_op(proposal_time, proposals_taken.max(1)),
+        proposals_taken
     );
-    let (bundle, took) = time(|| engines[0].commit_pending(conv).unwrap().unwrap());
     println!(
-        "commit adding {} devices:          {} (commit {} bytes, Welcome {} bytes)",
-        n - 1,
-        ms(took),
-        bundle.commit.len(),
-        bundle.welcomes.first().map_or(0, |w| w.data.len())
+        "grow to {n} in {commits} commits:        {} in all (commits {} of it)",
+        ms(build_took),
+        ms(commit_time)
     );
-    engines[0].confirm_commit(conv).unwrap();
-    if n > 1 {
-        let (joined, took) =
-            time(|| engines[1].handle_welcome(conv, &bundle.welcomes[0].data, Some(&server_key)));
-        // Engine 1 trusts everyone only if it verified every list (it did above).
-        let joined = joined.unwrap();
+    if let Some((take, size, took, commit, welcome, apply)) = last {
         println!(
-            "join from the Welcome:             {} ({} members)",
+            "last commit, adding {take} to {} (the group is {size} after): {} (commit {commit} bytes, Welcome {welcome} bytes), applied by a member in {}",
+            size - take,
             ms(took),
-            joined.members.len()
+            ms(apply)
         );
     }
-
     // One Remove in the full group: the cost that does not grow with the batch.
     if n > 2 {
         let last = engines[n - 1].device_id();
         let leaf = engines[0].leaf_index(conv, last).unwrap().unwrap();
-        let proposals = ds.proposals(&[], &[leaf], 1);
+        let proposals = ds.proposals(&[], &[leaf], epoch);
         engines[0].handle_proposals(conv, &proposals).unwrap();
         engines[1].handle_proposals(conv, &proposals).unwrap();
         let (bundle, took) = time(|| engines[0].commit_pending(conv).unwrap().unwrap());
@@ -208,7 +256,7 @@ fn group_costs(n: usize) {
         // A second one, now that the first commit has refreshed a path through the tree.
         let last = engines[n - 2].device_id();
         let leaf = engines[0].leaf_index(conv, last).unwrap().unwrap();
-        let proposals = ds.proposals(&[], &[leaf], 2);
+        let proposals = ds.proposals(&[], &[leaf], epoch + 1);
         engines[0].handle_proposals(conv, &proposals).unwrap();
         engines[1].handle_proposals(conv, &proposals).unwrap();
         let (bundle, took) = time(|| engines[0].commit_pending(conv).unwrap().unwrap());

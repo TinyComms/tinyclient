@@ -489,3 +489,11 @@ fn keys_are_redacted_in_debug_output() {
     let engine = Engine::detached(UserId::random().unwrap()).unwrap();
     assert!(!format!("{engine:?}").to_lowercase().contains("key"));
 }
+
+#[test]
+fn the_engine_can_move_to_another_thread() {
+    fn assert_send<T: Send>() {}
+    assert_send::<Engine>();
+    assert_send::<e2ee::identity::Trust>();
+    assert_send::<e2ee::attachment::AttachmentKey>();
+}

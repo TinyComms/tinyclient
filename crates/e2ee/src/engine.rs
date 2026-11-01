@@ -27,9 +27,6 @@ pub const MAX_KEY_PACKAGES: usize = 50;
 /// Regular key packages are good for 84 days (OpenMLS's own range limit for a leaf's lifetime).
 const KEY_PACKAGE_LIFETIME: u64 = 60 * 60 * 24 * 84;
 const SNAPSHOT_VERSION: u32 = 1;
-/// The commits whose hashes a conversation remembers, to tell a repeated commit from a rewritten
-/// history.
-pub(crate) const APPLIED_KEPT: usize = 32;
 
 /// What every leaf of ours says it supports: this ciphersuite, basic credentials, and the last-resort
 /// key package extension (a key package that carries an extension must list it).
@@ -56,6 +53,10 @@ pub struct Config {
     pub maximum_forward_distance: u32,
     /// Application messages are padded to a multiple of this many bytes.
     pub padding: usize,
+    /// How many applied commits each conversation remembers (by hash), to tell a commit shown again
+    /// from a rewritten history. A commit for an epoch older than these is taken for shown again:
+    /// it cannot be told apart, and `observe_server_epoch` is what notices a server gone back.
+    pub commits_remembered: usize,
 }
 
 impl Default for Config {
@@ -65,6 +66,7 @@ impl Default for Config {
             out_of_order_tolerance: 64,
             maximum_forward_distance: 2000,
             padding: 128,
+            commits_remembered: 256,
         }
     }
 }
