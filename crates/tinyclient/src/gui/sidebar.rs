@@ -786,7 +786,15 @@ impl Shell {
         if !super::phone::active() {
             return row.on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| act(this, cx)));
         }
-        row.on_mouse_down(
+        // A finger's long press: the timer below never starts for one, as its mouse-down only
+        // comes when it lifts.
+        let held = menu.clone().map(|row| {
+            super::phone::long_press(cx.listener(move |this, event: &gpui::LongPressEvent, _, cx| {
+                this.phone_state.press_cancel();
+                this.open_menu(Menu::Row(row.clone(), event.start_position), cx);
+            }))
+        });
+        row.relative().children(held).on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
                 let menu = menu.clone().map(|row| Menu::Row(row, event.position));
@@ -1160,7 +1168,25 @@ impl Shell {
                 if super::phone::active() {
                     let token = super::phone::token(&["place", picked.key.network.label(), &picked.key.account, &picked.key.id]);
                     let menu = Some(picked.clone());
-                    return self.tap(row, token, menu, move |this, cx| this.pick_row(&picked, cx), cx);
+                    // A voice channel is a place to be, not to read: a tap joins it, as the
+                    // desktop's double-click does, and the call screen comes up. Once I am in
+                    // it, a tap brings that screen back. Its chat is the call screen's.
+                    let voice = picked.kind == ConversationKind::Voice;
+                    return self.tap(
+                        row,
+                        token,
+                        menu,
+                        move |this, cx| {
+                            if voice && ours {
+                                this.call_phone_restore(cx);
+                            } else if join {
+                                this.call_start(picked.key.clone(), cx);
+                            } else {
+                                this.pick_row(&picked, cx);
+                            }
+                        },
+                        cx,
+                    );
                 }
                 row.on_mouse_down(
                     MouseButton::Left,

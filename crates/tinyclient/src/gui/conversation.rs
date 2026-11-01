@@ -1311,6 +1311,14 @@ impl Shell {
         accounts.filter(|status| status.key == account).map(|status| status.me.clone()).next().unwrap_or_default()
     }
 
+    /// Back on a phone: what a pane of messages has over it (the viewer, a message's sheet, the
+    /// picker, the delete question) closes first, the thread's before the conversation's.
+    pub(in crate::gui) fn panes_back(&mut self, cx: &mut Context<Self>) -> bool {
+        let thread = self.conversation_state.thread.borrow().clone().filter(|_| self.layout_state.right.is_some());
+        let main = self.conversation_state.pane.get().cloned().filter(|_| self.open.is_some());
+        thread.into_iter().chain(main).any(|pane| pane.update(cx, |pane, cx| pane.phone_back(cx)))
+    }
+
     /// Draws the panes again: a player in them moved on. Only marks them, so it is safe from
     /// inside a pane's own handler, where the pane cannot be updated.
     pub(super) fn conversation_redraw(&mut self, cx: &mut Context<Self>) {

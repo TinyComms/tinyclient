@@ -292,19 +292,22 @@ impl Pane {
         let id = id.to_owned();
         let task = cx.spawn(async move |this, cx| {
             cx.background_executor().timer(LONG_PRESS).await;
-            let _ = this.update(cx, |this, cx| {
-                // The press held: the message's actions come up as a sheet, as the desktop's
-                // right-click menu does, for one that can be acted on or that did not go.
-                let Some(message) = this.find(&id) else {
-                    return;
-                };
-                let can = this.can(&message);
-                if can.act || can.unsent {
-                    this.open_menu(message, at, cx);
-                }
-            });
+            let _ = this.update(cx, |this, cx| this.hold_message(&id, at, cx));
         });
         self.press = Some((task, (f32::from(at.x), f32::from(at.y))));
+    }
+
+    /// A press on a message held: its actions come up as a sheet, as the desktop's right-click
+    /// menu does, for one that can be acted on or that did not go.
+    pub(super) fn hold_message(&mut self, id: &str, at: Point<Pixels>, cx: &mut Context<Self>) {
+        self.hover = None;
+        let Some(message) = self.find(id) else {
+            return;
+        };
+        let can = self.can(&message);
+        if can.act || can.unsent {
+            self.open_menu(message, at, cx);
+        }
     }
 
     /// The pointer moved during a press. Past the slop it was a scroll, so nothing will show.
@@ -318,6 +321,24 @@ impl Pane {
     /// The finger lifted before the press became a long one.
     pub(super) fn release_message(&mut self) {
         self.press = None;
+    }
+
+    /// Back on a phone, over the messages: the picture viewer, the delete question, the
+    /// message's sheet or the reaction picker closes before the conversation does. False when
+    /// none of them was up.
+    pub(in crate::gui) fn phone_back(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.viewer.is_some() {
+            self.close_viewer(cx);
+        } else if self.confirm.is_some() {
+            self.confirm = None;
+            cx.notify();
+        } else if self.menu.is_some() || self.picker.is_some() {
+            self.close_menu(cx);
+            self.close_picker(cx);
+        } else {
+            return false;
+        }
+        true
     }
 
     /// The toolbar of the row under the pointer: one instance, straddling the row's top edge.

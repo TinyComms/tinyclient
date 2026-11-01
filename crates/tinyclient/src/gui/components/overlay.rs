@@ -44,6 +44,8 @@ pub fn tip(
     let words: SharedString = crate::gui::shortcuts::label(&words).into();
     move |_, cx| {
         let words = words.clone();
+        // A phone has no keyboard: a tooltip there (a long press shows one) names no keys.
+        let shortcut = shortcut.filter(|_| !crate::gui::phone::active());
         cx.new(|_| Tip { words, shortcut: shortcut.map(|keys| crate::gui::shortcuts::label(keys).into()) }).into()
     }
 }

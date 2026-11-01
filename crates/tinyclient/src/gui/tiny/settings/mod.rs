@@ -527,11 +527,6 @@ impl Shell {
             .into_any_element()
     }
 
-    /// Whether a page of Server Settings is open.
-    pub(in crate::gui) fn tiny_settings_open(&self) -> bool {
-        self.tiny_state.settings.is_some()
-    }
-
     /// One page's body, as the desktop overlay and the phone's pushed page both show it.
     fn tiny_settings_body(&self, shown: Page, facts: &Facts, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         match shown {
@@ -611,7 +606,9 @@ impl Shell {
                         .child(unsaved_bar(overlay.saving, overlay.error.clone(), cx)),
                 )
             })
-            .child(div().flex_none().h(px(tokens::safe_bottom())));
+            .child(div().flex_none().h(px(tokens::safe_bottom())))
+            // The back swipe from the left edge, as every pushed page has.
+            .child(self.phone_edge(cx));
         Some(page.into_any_element())
     }}
 

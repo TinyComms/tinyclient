@@ -21,7 +21,9 @@ use protocol::{
     Relation, ReplyTo, Request, Response, Sender, Space, SpaceInfo, Span, Style, MentionKind,
 };
 use std::sync::OnceLock;
-use std::time::Duration;
+
+#[path = "shot_demo_live.rs"]
+pub(crate) mod live;
 
 /// `--demo` was passed, or this is a `demo` build on a phone (which has no flags): the made-up
 /// chatd answers instead of the real one.
@@ -241,7 +243,8 @@ fn direct(account: &AccountKey, id: &str, peer: &str, updated: i64) -> Conversat
     let mut row = row(account, id, ConversationKind::Direct, who.name, updated);
     row.peer = Some(peer.into());
     row.avatar = who.photo.map(|name| face(who.id, name));
-    row.call = if account.network == Network::Tiny { protocol::CallSupport::Native } else { protocol::CallSupport::Handoff };
+    // Tiny and Discord calls are made here (the demo's own, `live`); a Slack huddle is Slack's.
+    row.call = if matches!(account.network, Network::Tiny | Network::Discord) { protocol::CallSupport::Native } else { protocol::CallSupport::Handoff };
     row
 }
 
@@ -458,6 +461,7 @@ fn build() -> Fixture {
     said(&mut general, "dita", "Started a thread for the lichen question");
     let announcements = in_space(row(&d, "c-announcements", ConversationKind::Announcement, "announcements", on_day(9, 10, 0)), moss, "Moss & Lichen", "info", "Information", 0);
     let mut campfire = in_space(row(&d, "v-campfire", ConversationKind::Voice, "Campfire", on_day(2, 20, 0)), moss, "Moss & Lichen", "voice", "Voice", 0);
+    campfire.call = protocol::CallSupport::Native;
     campfire.occupants = Some(Occupants {
         people: ["yusuf", "ines"]
             .into_iter()
@@ -638,6 +642,12 @@ fn networks(fixture: &Fixture) -> Vec<NetworkStatus> {
         .collect()
 }
 
+/// The key of the demo's conversation with this id, for the screenshot harness's steps.
+#[allow(dead_code)] // Read by the gui-shot steps only.
+pub(crate) fn key_of(id: &str) -> Option<Key> {
+    fixture().rows.iter().find(|row| row.key.id == id).map(|row| row.key.clone())
+}
+
 fn find(key: &Key) -> Option<&'static Conversation> {
     fixture().rows.iter().find(|row| &row.key == key)
 }
@@ -647,13 +657,24 @@ fn messages_of(key: &Key) -> &'static [Message] {
 }
 
 fn conversations(rows: Vec<Conversation>, offset: u32, limit: u32) -> Response {
-    let total = rows.len() as u32;
-    let counts = InboxCounts {
-        all: total,
+    let counts = counts_of(&rows);
+    rows_page(rows, counts, offset, limit)
+}
+
+/// How many rows each Inbox filter holds: counted over the whole list, whatever filter is on,
+/// as chatd counts them (`InboxCounts`). Counted over the filtered rows, Unread said 6 under
+/// All and 2 under Mentions.
+fn counts_of(rows: &[Conversation]) -> InboxCounts {
+    InboxCounts {
+        all: rows.len() as u32,
         unread: rows.iter().filter(|r| r.unread > 0 && !r.muted).count() as u32,
         mentions: rows.iter().filter(|r| r.mentions > 0).count() as u32,
         apps: 0,
-    };
+    }
+}
+
+fn rows_page(rows: Vec<Conversation>, counts: InboxCounts, offset: u32, limit: u32) -> Response {
+    let total = rows.len() as u32;
     let page = rows.into_iter().skip(offset as usize).take(limit.max(1) as usize).collect();
     Response::Conversations { conversations: page, total, counts }
 }
@@ -956,26 +977,26 @@ pub fn answer(request: &Request) -> std::io::Result<Response> {
             networks: networks(fixture),
             accounts: fixture.accounts.clone(),
             media: Media::Stopped,
-            call: demo_call_now(),
-            seq: 1,
+            // The loopback call (a real camera through the phone's codec) when one runs, else the
+            // simulated one.
+            call: demo_call_now().or_else(live::current),
+            seq: live::seq(),
             keychain: protocol::Keychain::default(),
             started: 1,
             // No session: a shot starts nothing that would share it.
             session: String::new(),
         },
         // Nothing ever changes: the wait runs out and is asked again, as a quiet chatd's does.
+        // The loopback call changes by itself (its picture, its clock): say so a few times a second
+        // while it runs. Otherwise only the simulated call (live) changes anything.
         Request::Wait { since } => {
-            // The demo call changes by itself (its picture, its clock): say so a few times a
-            // second while there is one, and once more when it ends.
-            for _ in 0..80 {
-                std::thread::sleep(Duration::from_millis(250));
-                if DEMO_CALL.lock().unwrap_or_else(|p| p.into_inner()).is_some() || DEMO_CALL_ENDED.swap(false, std::sync::atomic::Ordering::Relaxed) {
-                    return Ok(Response::Changes { seq: since + 1, reset: false, changes: vec![protocol::Change::Status] });
-                }
+            if DEMO_CALL.lock().unwrap_or_else(|p| p.into_inner()).is_some() || DEMO_CALL_ENDED.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                return Ok(Response::Changes { seq: since + 1, reset: false, changes: vec![protocol::Change::Status] });
             }
-            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "the demo is quiet"));
+            return live::wait(*since);
         }
-        Request::Inbox { network, filter, offset, limit } => conversations(inbox(*network, *filter), *offset, *limit),
+        Request::Inbox { network, filter, offset, limit } => rows_page(inbox(*network, *filter), counts_of(&inbox(*network, InboxFilter::All)), *offset, *limit),
         Request::Spaces { network } => Response::Spaces {
             spaces: fixture.spaces.iter().filter(|s| network.is_none_or(|n| s.key.network == n)).cloned().collect(),
         },
@@ -1130,10 +1151,15 @@ pub fn answer(request: &Request) -> std::io::Result<Response> {
             Some(person) => Response::TinyE2eePerson { person },
             None => Response::Error { code: protocol::ErrorCode::NotFound, detail: "Nobody by that id.".into() },
         },
-        Request::SignInBegin { .. }
-        | Request::Handoff { .. }
-        | Request::CallStart { .. }
-        | Request::Media(_) => Response::Error { code: protocol::ErrorCode::Unsupported, detail: "Not in the demo.".into() },
+        // A call moves by itself (`live`): ringing, connected, people talking in turn.
+        Request::CallStart { .. }
+        | Request::CallEnd
+        | Request::CallDecline
+        | Request::CallAccept
+        | Request::CallSet { .. }
+        | Request::CallTalk { .. }
+        | Request::Media(_) => return Ok(live::answer(request).unwrap_or(Response::Ok)),
+        Request::SignInBegin { .. } | Request::Handoff { .. } => Response::Error { code: protocol::ErrorCode::Unsupported, detail: "Not in the demo.".into() },
         // Everything that would change something: taken, and forgotten.
         _ => Response::Ok,
     };

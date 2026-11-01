@@ -19,6 +19,7 @@ assets!(
     "networks/signal.svg",
     "networks/messages.svg",
     "networks/tiny.svg",
+    "networks/tiny-mark.svg",
     // The phone's call screen (`gui/call/phone`).
     "icons/audio-lines.svg",
     "icons/bluetooth.svg",
@@ -191,6 +192,16 @@ pub fn network_asset(network: Network, points: f32) -> SharedString {
         Network::Tiny => "tiny",
     };
     format!("networks/{name}.svg@{}", points_key(points.ceil())).into()
+}
+
+/// The network's mark in one color, to be drawn `points` across as a mask. The same file as
+/// [`network_asset`] except for Tiny, whose full mark is a filled plate: as a mask that is a
+/// plain square, so its mark is the bubble with the ts cut out.
+pub fn network_mark_asset(network: Network, points: f32) -> SharedString {
+    match network {
+        Network::Tiny => format!("networks/tiny-mark.svg@{}", points_key(points.ceil())).into(),
+        network => network_asset(network, points),
+    }
 }
 
 /// tinyclient's own mark, to be drawn `points` across. Its own file, not the Tiny server's

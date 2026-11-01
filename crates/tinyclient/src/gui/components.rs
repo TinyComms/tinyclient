@@ -45,7 +45,7 @@ pub fn network_icon(network: Network, size: f32) -> Img {
 /// The network's mark in one color, for a list that mixes networks while two or more are signed
 /// in: 14, `text_faint`, leading the title (C5). The logo's shape drawn as a mask.
 pub fn network_mark(network: Network, size: f32, color: impl IntoColor<Hsla>) -> Svg {
-    svg().path(network_asset(network, size)).size(px(size)).flex_none().text_color(color.into_color())
+    svg().path(crate::gui::assets::network_mark_asset(network, size)).size(px(size)).flex_none().text_color(color.into_color())
 }
 
 // Badges.
@@ -420,9 +420,12 @@ pub fn field_error_line(words: impl Into<SharedString>) -> Div {
     div().mt(px(4.)).type_small().text_color(theme::danger()).child(words.into())
 }
 
-/// A keycap such as `⌘K`.
+/// A keycap such as `⌘K`. A phone has no keyboard to press it on: there it is nothing.
 pub fn keycap(keys: impl Into<SharedString>) -> Div {
     let keys: SharedString = keys.into();
+    if crate::gui::phone::active() {
+        return div();
+    }
     div()
         .flex_none()
         .h(px(18.))

@@ -583,6 +583,11 @@ mod shot {
                 let _ = window.update(cx, |shell, _, cx| shell.travel(true, cx));
                 cx.background_executor().timer(settle).await;
             }
+            // `--settle 4000` waits that long more before the picture: for steps that take time
+            // (`TINYCLIENT_SHOT_STEPS`), such as the demo's call ringing and connecting.
+            if let Some(ms) = flag("--settle").and_then(|n| n.parse::<u64>().ok()) {
+                cx.background_executor().timer(Duration::from_millis(ms)).await;
+            }
             let frames = flag("--frames").and_then(|n| n.parse::<usize>().ok()).unwrap_or(1).max(1);
             if frames > 1 {
                 super::anim::SHOT_FRAMES.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -607,6 +612,16 @@ mod shot {
                 tracing::warn!("tinyclient: holding, pid {}", std::process::id());
                 cx.background_executor().timer(Duration::from_secs(seconds)).await;
             }
+            // The windows go first. A focused field is registered with its window as the
+            // platform's input handler, which holds the field: quitting with the window still up
+            // left that handle alive past the app, and the test platform's leak check panicked
+            // (exit 101) after the image was written.
+            cx.update(|cx| {
+                for handle in cx.windows() {
+                    let _ = handle.update(cx, |_, window, _| window.remove_window());
+                }
+            });
+            cx.background_executor().timer(Duration::from_millis(50)).await;
             cx.update(|cx| cx.quit());
         })
         .detach();
@@ -684,6 +699,8 @@ pub(crate) fn feed_platform_insets(window: &gpui::Window) {
                 top: f32::from(insets.safe_area.top),
                 bottom: f32::from(insets.safe_area.bottom),
                 keyboard: f32::from(insets.ime.bottom),
+                left: f32::from(insets.safe_area.left),
+                right: f32::from(insets.safe_area.right),
             });
         }
     }
@@ -744,7 +761,7 @@ pub(crate) fn run_with(application: gpui::Application, invite: Option<String>, i
                 window_bounds: Some(WindowBounds::Windowed(window_bounds(prefs.frame, cx))),
                 // A phone window asks for no minimum: folded and split-screen windows must be
                 // allowed to be smaller than the frame we chose.
-                window_min_size: (!layout::phone(window_size().0))
+                window_min_size: (!layout::phone(window_size().0) && !phone::form(false, window_size().0, window_size().1))
                     .then_some(size(px(layout::WINDOW_MIN.0), px(layout::WINDOW_MIN.1))),
                 titlebar: Some(TitlebarOptions {
                     title: Some("tinyclient".into()),

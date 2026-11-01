@@ -947,6 +947,16 @@ impl Shell {
         cx.notify();
     }
 
+    /// Back on a phone: a submenu, menu or dialog of the Tiny page closes, then Server Settings.
+    /// The member hover card is not a page, so back passes it by. False when none was up.
+    pub(in crate::gui) fn tiny_back(&mut self, cx: &mut Context<Self>) -> bool {
+        let state = &self.tiny_state;
+        if state.sub.is_none() && state.float.is_none() && state.modal.is_none() && state.settings.is_none() {
+            return false;
+        }
+        self.tiny_escape(cx)
+    }
+
     /// Escape, from the window's keys: the top layer here closes first. False when nothing here
     /// was open.
     pub(super) fn tiny_escape(&mut self, cx: &mut Context<Self>) -> bool {

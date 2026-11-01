@@ -362,6 +362,20 @@ pub fn steps(cx: &mut gpui::Context<crate::gui::state::Shell>) {
                             shell.open_listed(row, cx);
                         }
                     }
+                    // `profile:<person id>`: a tap on someone of the open conversation, as on a
+                    // member's row (over Members, the Profile is pushed on it).
+                    Some(("profile", id)) => {
+                        let open = shell.snapshot.as_ref().and_then(|s| s.open.as_ref()).map(|open| open.key.clone());
+                        if let Some(open) = open {
+                            shell.open_profile(protocol::Key { id: id.to_owned(), ..open }, gpui::point(gpui::px(0.), gpui::px(0.)), cx);
+                        }
+                    }
+                    // `start:<conversation id>`: the demo's conversation's call, as its Call or
+                    // Join button (a voice channel's row on a phone) starts it.
+                    Some(("start", id)) => match crate::gui::shot_demo::key_of(id) {
+                        Some(key) => shell.call_start(key, cx),
+                        None => tracing::warn!("shot: no demo conversation {id}"),
+                    },
                     _ => match step.as_str() {
                         "members" => shell.toggle_member_list(cx),
                         "details" => shell.toggle_details(cx),
@@ -371,6 +385,21 @@ pub fn steps(cx: &mut gpui::Context<crate::gui::state::Shell>) {
                         // Escape in the composer with nothing of its own to close.
                         "escape" => shell.composer_escaped(cx),
                         "members-on" => shell.members_switch_on(cx),
+                        // The open conversation's call, then the call screen's own buttons.
+                        "call" => {
+                            if let Some(key) = shell.snapshot.as_ref().and_then(|s| s.open.as_ref()).map(|open| open.key.clone()) {
+                                shell.call_start(key, cx);
+                            }
+                        }
+                        "mute" => shell.call_mute(cx),
+                        "camera" => {
+                            let on = shell.snapshot.as_ref().and_then(|s| s.call.as_ref()).is_some_and(|call| {
+                                call.video.iter().any(|stream| stream.direction == protocol::Direction::Encode && stream.content == protocol::Content::Camera)
+                            });
+                            shell.call_ask(protocol::Request::Media(protocol::MediaRequest::Camera { on: !on }), cx);
+                        }
+                        "minimise" => shell.call_phone_minimise(cx),
+                        "leave" => shell.call_leave(cx),
                         "thread" => {
                             let pane = shell.conversation_state.pane.get().cloned();
                             let found = pane.and_then(|pane| {

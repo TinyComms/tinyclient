@@ -20,8 +20,10 @@ pub fn set_phone(on: bool) {
     PHONE.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Drawn as a phone, or running on one: a build for Android or iOS never names a computer, even
+/// in a frame drawn before the form is known (a settings page, a tablet's desktop form).
 fn phone() -> bool {
-    PHONE.load(std::sync::atomic::Ordering::Relaxed)
+    PHONE.load(std::sync::atomic::Ordering::Relaxed) || cfg!(any(target_os = "android", target_os = "ios"))
 }
 
 /// [`HERE`], or "this phone" while the window is a phone.
@@ -68,6 +70,17 @@ pub const SIGN_IN_KEPT: &str = if cfg!(target_os = "macos") {
 } else {
     "Your sign-in is kept in the system keyring on this computer."
 };
+
+/// [`SIGN_IN_KEPT`] for the form the window is in: a phone keeps it in its own store.
+pub fn sign_in_kept() -> &'static str {
+    if !phone() {
+        SIGN_IN_KEPT
+    } else if cfg!(target_os = "ios") {
+        "Your sign-in is kept in the iOS keychain on this phone."
+    } else {
+        "Your sign-in is kept in tinyclient's private storage on this phone."
+    }
+}
 
 /// The button that reveals a file in the system file manager.
 pub const REVEAL: &str = if cfg!(target_os = "macos") {

@@ -191,7 +191,7 @@ impl Pane {
         cx.notify();
     }
 
-    fn close_viewer(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn close_viewer(&mut self, cx: &mut Context<Self>) {
         self.let_go_originals();
         self.viewer = None;
         cx.notify();

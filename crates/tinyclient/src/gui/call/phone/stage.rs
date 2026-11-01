@@ -180,7 +180,15 @@ impl Shell {
         if let Some(frame) = crate::gui::call::shot::phone_frame("", false) {
             return Some(frame);
         }
-        super::hooks::self_frame()
+        // A platform's own camera first; the demo has none, so its own call shows my portrait.
+        if let Some(frame) = super::hooks::self_frame() {
+            return Some(frame);
+        }
+        #[cfg(any(feature = "gui-shot", feature = "demo"))]
+        if crate::gui::shot_demo::on() {
+            return crate::gui::shot_demo::live::self_frame().map(PathBuf::from);
+        }
+        None
     }
 
     /// How the stage is laid out for this call now.
