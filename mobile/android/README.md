@@ -6,6 +6,12 @@ Rust side draws everything. The subclass only carries the soft keyboard's text a
 insets to gpui_ce_mobile, which NativeActivity cannot. See `docs/mobile-build.md` for the
 full story and the verified/unverified split.
 
+The launcher activity is `dev.tinyclient.app.TinyActivity`, a `GpuiInputActivity` that also
+hands permission and screen-capture results to the call platform. The call platform and the web
+sign-in are the small classes in `app/src/main/java/dev/tinyclient/app` (permissions, audio
+session and its foreground service, Camera2, MediaProjection, MediaCodec, the sign-in WebView, the
+Custom Tab), driven from Rust by JNI; `docs/mobile-platform.md` ("Android, as built") lists them.
+
 ## What is here
 
 | File | Why |
