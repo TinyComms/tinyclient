@@ -18,6 +18,7 @@
 
 mod channel;
 pub(super) mod column;
+pub(super) mod feed;
 mod home;
 mod layer;
 mod loading;
