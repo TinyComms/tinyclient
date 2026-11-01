@@ -179,29 +179,43 @@ the library behind Discord's DAVE); the server is only the group's external send
 service: it proposes adding whoever joins and removing whoever leaves and orders the commits,
 but holds no key that opens a frame. Each Opus frame is sealed with the sender's key for the
 current epoch (AES-128-GCM, 8-byte tag), so the SFU forwards ciphertext; the RTP header and the
-RFC 6464 audio level stay in clear for it to route and to show who speaks. Every join and leave
+RFC 6464 audio level stay in clear for it to route and to show who speaks. Camera and screen
+share pictures (H.264) are sealed with the same group's keys, leaving only each NAL unit's one-byte
+header in clear so the SFU can tell a keyframe; a picture that arrives in clear during an
+end-to-end call is dropped, not shown. Every join and leave
 is a new epoch with new keys. Each account has an identity key (P-256), made on its first call and
 kept in `e2ee/<account>/identity.key` in the data directory (`0600` in a `0700` folder on Unix); it
 signs the member's MLS credential, which names its user id on the server. The key is written to a
 file beside it and renamed over, so a crash leaves the old key or the whole new one. A key file
 that exists but cannot be read is not overwritten: it is moved to `identity.key.unreadable`, a
 new key is made, and everyone who verified you sees your key change, which is correct because it
-is a different key. Until the group has keys the microphone sends nothing, and a frame that
-arrives in clear during an end-to-end call is dropped.
+is a different key. Until the group has keys the microphone and camera send nothing, and a frame
+that arrives in clear during an end-to-end call is dropped.
 
-**Only join end-to-end encrypted calls** (Settings › Privacy › Calls, `require_call_e2ee`) is off
-by default, on purpose: an older tinyserver, or one older app in a room, cannot do end-to-end
-encryption, and turning it on for everyone would stop those calls working. With it off, a server
-that turns encryption off (or says someone in the call cannot do it) still leaves the call as
-"Encrypted to the server" and the call carries on. With it on:
+**The server's `off` is never obeyed silently.** `off` and `start` are unauthenticated JSON from
+the server: nobody in the call signs them, so a server that wants to hear a call need only say
+someone cannot encrypt. When it says `off`, mediad stops sealing, sending, opening and playing,
+audio and video, and the call's badge reads "Encryption was turned off" with a warning icon,
+never a lock, naming whom the server says cannot encrypt. Nothing goes out unencrypted until you
+press "Carry on without encryption" in the call's security panel; that choice holds for that
+seat only, until the server starts a group again or you join again, and then the next `off`
+asks again. A later `start` from the server (for
+instance once the person whose app could not do it has left) puts the call back in a group.
 
-- chatd does not join a server that does not list `e2ee_calls`, and says so; nothing is sent to
-  it for that call (`Calls::tiny_offer`);
-- on a server that does, if it later sends `off`, mediad stops sealing, sending, opening and
-  playing, audio and video, and the call's badge reads "Encryption was turned off" with a
-  warning icon, never a lock. A later `start` from the server (for instance once the person whose
-  app could not do it has left) puts the call back in a group, and a later `off` blocks it again;
-- the setting is read when you join. Changing it during a call applies to the next one.
+Some calls never carry on unencrypted, and the panel offers no button, only leaving:
+
+- with **Only join end-to-end encrypted calls** on (Settings › Privacy › Calls,
+  `require_call_e2ee`, off by default because an older tinyserver or one older app in a room
+  cannot do it);
+- on an **Incognito host** (`incognito.tinyclient.io`, `tinycloud.chat` and names under them),
+  whose communities promise end-to-end encrypted calls, whatever the setting;
+- in a room the server lists as **`e2ee_required`**.
+
+For those, chatd also does not join a server that does not list `e2ee_calls`, and says so;
+nothing is sent to it for that call (`Calls::tiny_offer`). The setting and the room are read
+when you join; changing either during a call applies to the next one. A call that never had
+end-to-end encryption because the server lacks it (and is not one of those) says "Encrypted to
+the server" from the start: that is not a downgrade.
 
 It is a refusal to carry on, not a verification: the roster it protects is still the server's
 word (see "Unverified people can be impersonated" below), and it covers Tiny calls only.
@@ -239,13 +253,13 @@ Stated plainly so nobody relies on what is not there:
 - **A Tiny server sees the shape of a call**, end-to-end encrypted or not: who is in it and when,
   who is speaking and how loud (the audio level is in clear), each frame's size and timing (Opus
   frames vary with what is said), and every address. It cannot hear the words.
-- **A Tiny server can turn end-to-end encryption off** by saying someone in the room cannot do
-  it, or by ignoring a room's "require end-to-end encryption"; the `off` and `start` frames are
-  unauthenticated JSON from the server. By default the call then says "Encrypted to the server",
-  names who it says cannot, and carries on: the lock only promises not to hide it. Nothing stops
-  a malicious server, or one old app in the room, from doing so. "Only join end-to-end encrypted
-  calls" (off by default) makes the call stop instead of carrying on, and refuses a server that
-  has no end-to-end calls at all.
+- **A Tiny server can stop a call being end-to-end encrypted** by saying someone in the room
+  cannot do it; the `off` and `start` frames are unauthenticated JSON from the server. tinyclient
+  then blocks the call instead of carrying on (see above), so the server can deny an encrypted
+  call but not quietly listen to one, unless you choose to carry on. A server that never offers
+  `e2ee_calls` gets an "Encrypted to the server" call from the start, except on an Incognito
+  host, in an `e2ee_required` room, or with "Only join end-to-end encrypted calls" on. The pin
+  is per call: tinyclient does not yet remember that a community encrypted its calls before.
 - **Unverified people can be impersonated by the server.** As the group's external sender it
   could add a member of its own, or put its own key under someone's name. A member it adds shows
   in the call's security panel; a key it swaps is caught by comparing safety numbers or the call
@@ -258,8 +272,8 @@ Stated plainly so nobody relies on what is not there:
   permissions on Unix and by your profile's access list on Windows, like the cache. A key read
   off the disk lets someone pose as you in later calls until the people who verified you notice
   the change and verify again. Backing up or syncing your profile folder copies it.
-- **Video and screen share on a Tiny server are not end-to-end encrypted**: tinyclient does not
-  send them yet, and this release seals only audio.
+- **Pictures leak their shape**: a sealed camera or screen-share frame keeps its NAL headers in
+  clear, so the server sees frame types, sizes, keyframes and timing, as it does for audio.
 - **macOS releases are signed ad hoc**, not with a Developer ID, and not notarized. Check that a
   download came from this repository's Releases page.
 - **The window decodes images** sent by other people (PNG, JPEG, GIF, WebP, BMP through the
