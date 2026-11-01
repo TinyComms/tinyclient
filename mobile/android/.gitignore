@@ -6,3 +6,5 @@ build/
 local.properties
 *.iml
 .idea/
+# Fetched by scripts/mobile/build-android.ps1 (pinned by SHA-256); never committed.
+app/src/main/assets/fonts/NotoColorEmoji.ttf

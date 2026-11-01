@@ -132,18 +132,25 @@ pub fn row_surface(selected: bool) -> Rgba {
 }
 
 // The faces per platform. `.SystemUIFont` is the system face wherever GPUI maps it (macOS, iOS,
-// Windows, and the desktop Linux builds that already use it). Android has no such alias, so it
-// takes the platform's own sans and mono families; a face that is missing falls back in GPUI.
+// Windows, and the desktop Linux builds that already use it). Android has no such alias, and
+// fontique there does not resolve the generic `sans-serif`: the run fell through gpui_ce_mobile's
+// script fallback list to Noto Sans CJK, whose Latin is Source Sans with a full-width-looking
+// word gap. Roboto is the family gpui_ce_mobile names as the system font, present on every
+// Android release.
 #[cfg(not(target_os = "android"))]
 pub const FONT: &str = ".SystemUIFont";
 #[cfg(target_os = "android")]
-pub const FONT: &str = "sans-serif";
+pub const FONT: &str = "Roboto";
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub const MONO: &str = "Menlo";
 #[cfg(target_os = "windows")]
 pub const MONO: &str = "Consolas";
-#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "windows")))]
+// Android: the generic `monospace` does not resolve either (see FONT); Droid Sans Mono is the
+// mono face in /system/fonts.
+#[cfg(target_os = "android")]
+pub const MONO: &str = "Droid Sans Mono";
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "windows", target_os = "android")))]
 pub const MONO: &str = "monospace";
 
 /// Weights: 400, 500 and 600 only.

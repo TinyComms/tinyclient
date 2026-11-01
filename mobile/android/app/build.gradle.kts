@@ -49,8 +49,9 @@ android {
 
     buildTypes {
         release {
-            // No Kotlin/Java to shrink yet, and R8 would rename nothing we reflect over. Turn
-            // this on with the first Kotlin activity, and put a minified build in CI the same
+            // Little Java to shrink, and all of it (java/dev/gpui/mobile) is reached only from
+            // native code by name, so R8 would strip it. Turning this on needs a
+            // `-keep class dev.gpui.mobile.** { *; }` rule and a minified build in CI the same
             // day (research_notes/mobile/rust-core-native-shells.md §3.5).
             isMinifyEnabled = false
             if (releaseKeystore != null) {

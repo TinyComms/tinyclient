@@ -7,18 +7,20 @@
 
     <application
         android:allowBackup="false"
-        android:hasCode="false"
+        android:hasCode="true"
         android:label="Tiny"
         android:supportsRtl="true"
         android:theme="@android:style/Theme.Material.NoActionBar.Fullscreen">
 
-        <!-- NativeActivity, not a Kotlin subclass: the whole UI is the Rust library, so there
-             is no Java/Kotlin code to run (`hasCode="false"`). `android.app.lib_name` is the
+        <!-- NativeActivity with gpui_ce_mobile's Java half (java/dev/gpui/mobile): the soft
+             keyboard's text and composition, and the system-bar, cutout and keyboard insets,
+             which NativeActivity alone cannot deliver. The UI is still all the Rust library.
+             `android.app.lib_name` is the
              cdylib's name without `lib`/`.so`; cargo builds `libtinyclient.so` from the
              `tinyclient` package. `android_activity` provides `ANativeActivity_onCreate`,
              which calls the `android_main` in src/lib.rs. -->
         <activity
-            android:name="android.app.NativeActivity"
+            android:name="dev.gpui.mobile.GpuiInputActivity"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode|density"
             android:exported="true"
             android:windowSoftInputMode="adjustResize">
