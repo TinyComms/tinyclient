@@ -108,6 +108,17 @@ fn is_padding(packet: &[u8]) -> bool {
     matches!(packet, [first, second, ..] if first >> 6 == 2 && second & 0x7f == H264_RTX_PT)
 }
 
+/// What str0m's `egress_loss_fraction` looks back over, by when packets were sent.
+const EGRESS_LOSS_SPAN: Duration = Duration::from_secs(1);
+
+/// What TWCC says the server missed of what we sent, when that can be believed. str0m numbers
+/// padding for feedback before [`Call::transmit`] throws it away, so anything sent within the
+/// span of a dropped packet reads as lost, on a clean path about half of it, and for a second
+/// after video starts as well. The microphone's receiver reports stand in until then.
+fn egress_loss(fraction: Option<f32>, dropped: Option<Instant>, now: Instant) -> Option<f32> {
+    fraction.filter(|_| dropped.is_none_or(|at| now.saturating_duration_since(at) > EGRESS_LOSS_SPAN))
+}
+
 /// The jitter buffer's sequence for an RTP timestamp at 48 kHz. One 20 ms frame is 960.
 fn frame_sequence(timestamp: u64) -> u16 {
     (timestamp / FRAME as u64) as u16
@@ -460,6 +471,8 @@ struct Call {
     /// What the tracks may spend now, and what the estimator was told to look for.
     rates: Rates,
     desired: u64,
+    /// When padding was last thrown away ([`Call::transmit`]).
+    padding_dropped: Option<Instant>,
     /// What the last accepted answer left sending. str0m's direction flips before the answer.
     sending_share: bool,
     sending_camera: bool,
@@ -528,6 +541,7 @@ impl Call {
         self.estimate = None;
         self.rates = Rates::default();
         self.desired = 0;
+        self.padding_dropped = None;
         self.video.reset();
         self.shown = None;
         // The new link has not been announced dead. A death of the one we just left already was.
@@ -594,7 +608,8 @@ impl Call {
             Event::PeerStats(stats) => {
                 let pair = stats.selected_candidate_pair.as_ref();
                 self.meter.round_trip(pair.and_then(|pair| pair.current_round_trip_time), stats.rtt);
-                self.meter.path_loss(stats.egress_loss_fraction, stats.ingress_loss_fraction);
+                let egress = egress_loss(stats.egress_loss_fraction, self.padding_dropped, Instant::now());
+                self.meter.path_loss(egress, stats.ingress_loss_fraction);
                 // Only host candidates are offered: the path is UDP or ICE-TCP, never a relay.
                 if let Some(pair) = pair {
                     self.meter.path = match pair.protocol {
@@ -603,11 +618,13 @@ impl Call {
                     };
                 }
             }
-            // What the server sees of our microphone: its FEC is planned for that loss.
+            // What the server sees of our microphone: its FEC is planned for that loss, and it
+            // is the path's own word on loss for a call that drops its padding (`egress_loss`).
             Event::MediaEgressStats(stats) if stats.mid == self.link.microphone => {
                 if self.meter.spoke(stats.packets) {
                     if let Some(loss) = stats.loss {
                         self.encoder.set_loss(loss);
+                        self.meter.path_loss(Some(loss), None);
                     }
                     if let Some(remote) = stats.remote {
                         self.meter.uplink_jitter(remote.jitter);
@@ -746,10 +763,12 @@ impl Call {
     }
 
     /// Sends one packet. Over TCP, the first one to an address opens the stream. With no video
-    /// to send, a voice call does not pay for padding. The feedback then counts it as lost, so
-    /// the estimate starts afresh when video does ([`Call::picture_step`]).
+    /// to send, a voice call does not pay for padding. The feedback then counts it as lost: the
+    /// estimate, which nothing spends until video does, starts afresh then
+    /// ([`Call::picture_step`]), and the meter leaves it out ([`egress_loss`]).
     fn transmit(&mut self, proto: Protocol, to: SocketAddr, packet: &[u8]) {
         if self.desired == 0 && is_padding(packet) {
+            self.padding_dropped = Some(Instant::now());
             return;
         }
         match proto {
@@ -1284,6 +1303,7 @@ pub fn run(link: Link, user_id: String, controls: Arc<Controls>) {
         estimate: None,
         rates: Rates::default(),
         desired: 0,
+        padding_dropped: None,
         sending_share: false,
         sending_camera: false,
         offered: None,
@@ -1318,6 +1338,17 @@ mod tests {
         assert_eq!(after(start, start + 5 * TICK), start + TICK, "a short slip catches up one tick at a time");
         let late = start + 7 * TICK;
         assert_eq!(after(start, late), late + TICK, "past the bound the missed ticks are gone");
+    }
+
+    #[test]
+    fn egress_loss_counts_only_when_no_padding_was_dropped_in_its_span() {
+        let now = Instant::now();
+        let ago = |ms: u64| now - Duration::from_millis(ms);
+        assert_eq!(egress_loss(Some(0.5), Some(now), now), None, "dropping it now");
+        assert_eq!(egress_loss(Some(0.5), Some(ago(900)), now), None, "video just started: this second has some in it");
+        assert_eq!(egress_loss(Some(0.1), Some(ago(1100)), now), Some(0.1), "a second of real sends");
+        assert_eq!(egress_loss(Some(0.1), None, now), Some(0.1), "none ever dropped");
+        assert_eq!(egress_loss(None, None, now), None);
     }
 
     #[test]

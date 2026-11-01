@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{sleep, JoinHandle};
@@ -73,6 +73,8 @@ struct Sfu {
     stop: Arc<AtomicBool>,
     /// Everything that reaches the fake is dropped, as on a path that died.
     deaf: Arc<AtomicBool>,
+    /// Over zero, one in this many RTP packets reaching the fake is lost.
+    lossy: Arc<AtomicUsize>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -96,10 +98,11 @@ impl Sfu {
         let seen = Arc::new(Mutex::new(Seen::default()));
         let stop = Arc::new(AtomicBool::new(false));
         let deaf = Arc::new(AtomicBool::new(false));
-        let mut fake = Fake { udp, listener, addr, poll, peers: Vec::new(), streams: HashMap::new(), next: 2, seen: seen.clone(), deaf: deaf.clone() };
+        let lossy = Arc::new(AtomicUsize::new(0));
+        let mut fake = Fake { udp, listener, addr, poll, peers: Vec::new(), streams: HashMap::new(), next: 2, seen: seen.clone(), deaf: deaf.clone(), lossy: lossy.clone(), heard: 0 };
         let halt = stop.clone();
         let thread = std::thread::spawn(move || fake.run(&asked, &halt));
-        Sfu { joins, seen, stop, deaf, thread: Some(thread) }
+        Sfu { joins, seen, stop, deaf, lossy, thread: Some(thread) }
     }
 
     /// The answer to `offer`, and the receive slots it names, in order.
@@ -143,6 +146,9 @@ struct Fake {
     next: usize,
     seen: Arc<Mutex<Seen>>,
     deaf: Arc<AtomicBool>,
+    lossy: Arc<AtomicUsize>,
+    /// RTP packets counted for `lossy`.
+    heard: usize,
 }
 
 impl Fake {
@@ -267,6 +273,13 @@ impl Fake {
     fn input(&mut self, proto: Protocol, source: SocketAddr, packet: &[u8], known: Option<usize>) -> Option<usize> {
         if self.deaf.load(Ordering::Relaxed) {
             return None;
+        }
+        let every = self.lossy.load(Ordering::Relaxed);
+        if every > 0 && matches!(packet, [128..=191, second, ..] if !(192..=223).contains(second)) {
+            self.heard += 1;
+            if self.heard % every == 0 {
+                return None;
+            }
         }
         let contents = packet.try_into().ok()?;
         let input = Input::Receive(Instant::now(), Receive { proto, source, destination: self.addr, contents });
@@ -712,6 +725,46 @@ fn the_connection_reports_itself_and_the_bitrate_follows_the_room() {
             break;
         }
         assert!(Instant::now() < deadline, "16 kb/s sends less: {} then {}", before.send_kbps, now.send_kbps);
+    }
+    leave(people, sinks);
+}
+
+/// str0m numbers its padding for feedback, and a voice call throws that padding away. The server
+/// never saw it, which must not read as the path losing half of what was sent.
+#[test]
+fn a_clean_voice_call_reads_as_clean_while_speaking() {
+    let sfu = Sfu::start();
+    let (mut people, sinks) = room(&sfu, "clean", &["ada", "bea"]);
+    let ada = &mut people[0];
+    let mut worst = (0, 0);
+    let end = Instant::now() + Duration::from_secs(6);
+    while Instant::now() < end {
+        sleep(Duration::from_millis(250));
+        if let MediaResponse::Stats(now) = ada.ask(MediaRequest::Stats) {
+            worst = worst.max((now.loss_permille, now.send_kbps));
+        }
+    }
+    assert!(worst.0 < 50, "loss {} over a clean path, at {} kb/s", worst.0, worst.1);
+    leave(people, sinks);
+}
+
+/// Leaving TWCC out must not leave the meter blind: the server's reports on the microphone say
+/// what it missed.
+#[test]
+fn a_voice_call_that_loses_packets_says_so() {
+    let sfu = Sfu::start();
+    let (mut people, sinks) = room(&sfu, "lossy", &["ada", "bea"]);
+    sfu.lossy.store(5, Ordering::Relaxed);
+    let ada = &mut people[0];
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        sleep(Duration::from_millis(250));
+        if let MediaResponse::Stats(now) = ada.ask(MediaRequest::Stats) {
+            if now.loss_permille > 100 {
+                break;
+            }
+        }
+        assert!(Instant::now() < deadline, "a fifth of the microphone is lost, and the meter never said");
     }
     leave(people, sinks);
 }
