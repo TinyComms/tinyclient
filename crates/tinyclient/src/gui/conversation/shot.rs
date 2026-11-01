@@ -11,7 +11,8 @@
 //! - `TINYCLIENT_SHOT_ZOOM=<percent>`: with `VIEW`, zoom the viewer to it (`100`, `250`).
 //! - `TINYCLIENT_SHOT_VIEW_STEPS=<n>`: with `VIEW`, go on through that many pictures, which
 //!   decodes more than the ceiling holds, and print what was dropped.
-//! - `TINYCLIENT_SHOT_HOVER=<message id>`: show the toolbar on it, as the pointer would.
+//! - `TINYCLIENT_SHOT_HOVER=<message id>`: show the toolbar on it, as the pointer would. A phone
+//!   has no toolbar: there it opens the message's action sheet, as a long press does.
 //! - `TINYCLIENT_SHOT_MENU=<message id>`: open its context menu.
 //! - `TINYCLIENT_SHOT_PICKER=<message id>`: open the reaction picker for it.
 //! - `TINYCLIENT_SHOT_CONFIRM=<message id>`: open the delete dialog for it.
@@ -307,7 +308,8 @@ fn stage(pane: &mut Pane, window: &mut Window, cx: &mut Context<Pane>) {
     pane.script.staged = true;
     pane.hover = Some(id.clone());
     let at = gpui::point(bounds.right() - px(120.), bounds.top() + px(12.));
-    if pane.script.menu.is_some() {
+    // A phone has no hover: what a held finger brings up is the menu's sheet.
+    if pane.script.menu.is_some() || (pane.script.hover.is_some() && crate::gui::phone::active()) {
         pane.open_menu(message, at, cx);
     } else if pane.script.picker.is_some() {
         pane.open_picker(&id, gpui::point(bounds.right() - px(60.), bounds.top()), window, cx);
