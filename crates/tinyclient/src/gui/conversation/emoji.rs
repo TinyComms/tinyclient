@@ -10,6 +10,8 @@ pub use picker::{Picker, PickerEvent};
 
 /// The picker's width, for placing it.
 pub const WIDTH: f32 = picker::WIDTH;
+/// The picker's preferred height. A short window shrinks it and the rest scrolls.
+pub const HEIGHT: f32 = picker::HEIGHT;
 
 /// The quick reactions for a message: the most used, kept to what the conversation's rules
 /// let go through on it (`table::quick`).

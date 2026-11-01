@@ -92,6 +92,31 @@ enum Purpose {
     Restore(String, f32),
 }
 
+/// A page that did not load. Shown until it is retried or another page lands.
+struct HistoryMiss {
+    words: String,
+    page: Page,
+    purpose: Purpose,
+}
+
+fn history_failure(purpose: &Purpose, detail: &str) -> String {
+    let what = match purpose {
+        Purpose::Newer => "newer messages",
+        Purpose::Jump(_) => "that message",
+        Purpose::Bottom => "the latest messages",
+        _ => "older messages",
+    };
+    format!("Couldn't load {what}. {detail}")
+}
+
+fn answer_detail(answer: &io::Result<Response>) -> String {
+    match answer {
+        Ok(Response::Error { detail, .. }) => detail.clone(),
+        Ok(_) => crate::client::OTHER_ANSWER.to_owned(),
+        Err(err) => crate::client::trouble_words("load", err),
+    }
+}
+
 /// Where a conversation was left, for coming back to it in this session.
 #[derive(Clone, Debug, PartialEq)]
 struct Place {
@@ -199,6 +224,8 @@ pub struct Pane {
     loading_newer: bool,
     /// Why older history did not come.
     older_failed: Option<String>,
+    /// A newer page, a jump, or the latest page that did not load.
+    history_miss: Option<HistoryMiss>,
     /// Refreshes on their way. A change that arrives meanwhile is read once they land.
     refreshing: u32,
     stale: bool,
@@ -306,6 +333,7 @@ impl Pane {
             loading_older: false,
             loading_newer: false,
             older_failed: None,
+            history_miss: None,
             refreshing: 0,
             stale: false,
             away: false,
@@ -427,6 +455,7 @@ impl Pane {
         self.loading_older = false;
         self.loading_newer = false;
         self.older_failed = None;
+        self.history_miss = None;
         self.refreshing = 0;
         self.stale = false;
         self.away = false;
@@ -559,18 +588,22 @@ impl Pane {
                     self.load(Page::Newest, Purpose::Open, cx);
                     return;
                 }
+                let detail = answer_detail(&other);
                 if matches!(purpose, Purpose::Older | Purpose::Open) {
-                    self.older_failed = Some(match other {
-                        Ok(Response::Error { detail, .. }) => detail,
-                        Ok(_) => crate::client::OTHER_ANSWER.to_owned(),
-                        Err(err) => crate::client::trouble_words("send", &err),
-                    });
+                    self.older_failed = Some(detail);
                     if purpose == Purpose::Open {
                         // Nothing is known about this conversation, least of all that it is
                         // empty: the row that says so, with its Retry, stands in for the start.
                         self.window.older = true;
                         self.relay(true, ListOffset::default());
                     }
+                    cx.notify();
+                } else if matches!(purpose, Purpose::Newer | Purpose::Jump(_) | Purpose::Bottom) {
+                    self.history_miss = Some(HistoryMiss {
+                        words: history_failure(&purpose, &detail),
+                        page: page.clone(),
+                        purpose: purpose.clone(),
+                    });
                     cx.notify();
                 }
                 return;
@@ -584,6 +617,7 @@ impl Pane {
             self.read.sent = read.map(|message| (message.sent, message.id.len(), message.id.clone()));
         }
         self.older_failed = None;
+        self.history_miss = None;
 
         let pinned = self.pinned();
         let top = self.list.logical_scroll_top();
@@ -1013,7 +1047,11 @@ impl Pane {
             }
         }
         let last = self.items.len().saturating_sub(1);
-        if self.window.newer && !self.loading_newer && built(last) {
+        let newer_held = self
+            .history_miss
+            .as_ref()
+            .is_some_and(|miss| miss.purpose == Purpose::Newer);
+        if self.window.newer && !self.loading_newer && !newer_held && built(last) {
             if let Some(newest) = self.window.messages.last() {
                 self.load(Page::After { id: newest.id.clone() }, Purpose::Newer, cx);
             }
@@ -1225,6 +1263,7 @@ impl Render for Pane {
             }))
             .child(rows)
             .child(after)
+            .children(self.history_banner(cx))
             .children(self.away.then(|| self.jump_button(cx)))
             .children(self.action_layers(window, cx))
             .children(self.viewer_layer(window, cx))
@@ -1411,6 +1450,27 @@ fn landing(below: f32, height: f32, new: usize, mut tall: impl FnMut(usize) -> f
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_page_says_which_one_and_a_newer_failure_stops_the_retry() {
+        assert_eq!(
+            history_failure(&Purpose::Newer, "offline"),
+            "Couldn't load newer messages. offline"
+        );
+        assert_eq!(
+            history_failure(&Purpose::Jump("m".into()), "gone"),
+            "Couldn't load that message. gone"
+        );
+        assert_eq!(
+            history_failure(&Purpose::Bottom, "slow"),
+            "Couldn't load the latest messages. slow"
+        );
+        assert_eq!(
+            history_failure(&Purpose::Older, "nope"),
+            "Couldn't load older messages. nope"
+        );
+        assert!(Purpose::Jump("m".into()) != Purpose::Newer);
+    }
 
     #[test]
     fn a_pending_row_keeps_its_time_and_place_until_it_is_sent() {

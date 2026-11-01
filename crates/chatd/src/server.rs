@@ -79,21 +79,46 @@ impl Searches {
         }
     }
 
-    fn ask(&self, account: AccountKey, query: &str) {
+    /// True when this query was already sent and the caller should say the search is finished.
+    /// A query already waiting is left to finish. Anything else is queued after the pause.
+
+    fn ask(&self, account: AccountKey, query: &str) -> bool {
         let mut state = lock(&self.state);
-        let asked = |held: Option<&(String, Instant)>| held.is_some_and(|(sent, at)| sent == query && at.elapsed() < SEARCH_AGAIN);
-        if asked(state.sent.get(&account)) {
-            state.waiting.remove(&account);
-            return;
+        let fresh = state.sent.get(&account).filter(|(_, at)| at.elapsed() < SEARCH_AGAIN).map(|(sent, _)| sent.clone());
+        let waiting = state.waiting.get(&account).map(|(waiting, _)| waiting.clone());
+        match search_fate(fresh.as_deref(), waiting.as_deref(), query) {
+            SearchFate::Repeated => {
+                state.waiting.remove(&account);
+                true
+            }
+            SearchFate::Waiting => false,
+            SearchFate::Queue => {
+                state.waiting.insert(account, (query.to_owned(), Instant::now() + SEARCH_PAUSE));
+                drop(state);
+                self.wake.notify_all();
+                false
+            }
         }
-        // The pause runs from when the query last changed: asking for the same one again, as a
-        // shell does on every repaint, does not put it off.
-        if state.waiting.get(&account).is_some_and(|(waiting, _)| waiting == query) {
-            return;
-        }
-        state.waiting.insert(account, (query.to_owned(), Instant::now() + SEARCH_PAUSE));
-        drop(state);
-        self.wake.notify_all();
+    }
+}
+
+/// What to do with a people search the shell just asked for again.
+enum SearchFate {
+    /// Sent recently: tell the shell it is already done, so a spinner does not stay up.
+    Repeated,
+    /// The same letters are already waiting out the pause.
+    Waiting,
+    /// New letters: send them once the pause is over.
+    Queue,
+}
+
+fn search_fate(fresh_sent: Option<&str>, waiting: Option<&str>, query: &str) -> SearchFate {
+    if fresh_sent == Some(query) {
+        SearchFate::Repeated
+    } else if waiting == Some(query) {
+        SearchFate::Waiting
+    } else {
+        SearchFate::Queue
     }
 }
 
@@ -600,7 +625,9 @@ impl Chat {
             for linked in self.hub.links() {
                 let account = linked.account;
                 if worth && linked.link == Link::Connected && network.is_none_or(|network| network == account.network) {
-                    self.searches.ask(account, query);
+                    if self.searches.ask(account.clone(), query) {
+                        self.hub.changed(Change::Searched { account, query: query.clone() });
+                    }
                 }
             }
         }
@@ -2511,6 +2538,26 @@ fn published_link(live: Link, kept: impl IntoIterator<Item = Link>) -> Link {
 mod tests {
     use super::published_link;
     use protocol::Link;
+
+    #[test]
+    fn a_repeated_people_search_is_already_done_and_one_waiting_is_left_alone() {
+        assert!(matches!(
+            super::search_fate(Some("zoe"), None, "zoe"),
+            super::SearchFate::Repeated
+        ));
+        assert!(matches!(
+            super::search_fate(Some("amy"), Some("zoe"), "zoe"),
+            super::SearchFate::Waiting
+        ));
+        assert!(matches!(
+            super::search_fate(None, None, "zoe"),
+            super::SearchFate::Queue
+        ));
+        assert!(matches!(
+            super::search_fate(Some("zoe"), Some("zoe"), "amy"),
+            super::SearchFate::Queue
+        ));
+    }
 
     #[test]
     fn a_stored_account_stays_on_the_rail_while_its_session_is_unread() {
