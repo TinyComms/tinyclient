@@ -128,7 +128,7 @@ impl Page {
             Page::Audit => may.read_audit,
             Page::SignIn => may.edit_server || may.owner,
             // Everyone's own devices and the people they talk to: not a power over the server.
-            Page::Encryption => true,
+            Page::Encryption => community.has(protocol::TINY_FEATURE_E2EE_TEXT),
             Page::Danger => may.owner,
         }
     }
@@ -559,9 +559,9 @@ mod tests {
         assert!(admin.contains(&"Members") && admin.contains(&"Invites") && admin.contains(&"Audit log"), "{admin:?}");
         assert!(!admin.contains(&"Roles") && !admin.contains(&"Bans") && !admin.contains(&"Danger zone"), "an older server has no roles or bans: {admin:?}");
         let mut modern = legacy("member");
-        modern.capabilities.features = ["server", "roles", "categories", "bans", "timeouts", "invite_options", "audit_query", "voice_moderation"].map(String::from).to_vec();
+        modern.capabilities.features = ["server", "roles", "categories", "bans", "timeouts", "invite_options", "audit_query", "voice_moderation", "e2ee_text"].map(String::from).to_vec();
         modern.access = Some(TinyAccess { permissions: TINY_KICK_MEMBERS | TINY_VIEW_AUDIT_LOG, ..TinyAccess::default() });
-        assert_eq!(shown(&modern), ["Overview", "Members", "Audit log"], "a moderator sees what they moderate");
+        assert_eq!(shown(&modern), ["Overview", "Members", "Audit log", "Encryption"], "a moderator sees what they moderate, and everyone sees Encryption where the server has it");
         modern.access = Some(TinyAccess { permissions: TINY_ALL, rank: 3, ..TinyAccess::default() });
         assert!(!shown(&modern).contains(&"Danger zone"), "only owners see the danger zone");
         modern.access = Some(TinyAccess { owner: true, ..TinyAccess::default() });
