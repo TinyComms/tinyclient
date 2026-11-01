@@ -8,7 +8,8 @@
 //!   its header and a stage of tiles. The member list (`members`) sits beside it and toggles.
 //! - Whatever floats is drawn by `tiny_layer`: the person, channel and header menus (`menus`),
 //!   the modals (`modals`), the hover card, the connection popover, and Server Settings
-//!   (`settings`), a full-window overlay.
+//!   (`settings`), a full-window overlay. An owner of a server nobody has set up is asked about
+//!   it first, on a page over all of these (`setup`).
 //!
 //! What this account may do decides what is drawn (`model`): a control the account cannot use is
 //! absent, never disabled. On a server older than roles and capabilities, every check falls back
@@ -28,6 +29,7 @@ pub(super) mod model;
 mod pane;
 mod panel;
 pub(super) mod settings;
+mod setup;
 
 use super::input::{InputEvent, InputKey, TextInput};
 use super::sidebar::Mode;
@@ -204,6 +206,8 @@ pub struct State {
     /// Server Settings, while open.
     settings: Option<settings::Overlay>,
     settings_fields: settings::Fields,
+    /// First-run setup, for owners, and the form Server Settings › Privacy shares with it.
+    setup: setup::State,
 }
 
 impl State {
@@ -277,6 +281,7 @@ impl State {
             search_input,
             settings: None,
             settings_fields,
+            setup: setup::State::default(),
         }
     }
 
@@ -293,6 +298,7 @@ impl State {
         self.modal_error = None;
         self.card = None;
         self.settings = None;
+        self.setup = setup::State::default();
     }
 
     /// The volume and mute for me kept for someone, else 100 % and heard: what was just set
@@ -401,6 +407,8 @@ impl Shell {
             return;
         }
         self.tiny_state.seen = true;
+        // Opening the server again asks the owner again what they put off.
+        self.tiny_state.setup.put_off_ends();
         self.fetch(account, None, cx);
     }
 
@@ -436,6 +444,7 @@ impl Shell {
         let showing = matches!(self.sidebar_state.mode, Mode::Network(Network::Tiny)) && self.snapshot.as_ref().is_some_and(|snapshot| snapshot.open.is_none());
         if showing {
             self.tiny_state.seen = true;
+            self.tiny_state.setup.put_off_ends();
             self.fetch(account, None, cx);
         } else {
             self.tiny_state.account = Some(account);
@@ -590,6 +599,7 @@ impl Shell {
             self.tiny_settings_loaded(cx);
         }
         self.tiny_settings_refreshed(cx);
+        self.tiny_setup_page_loaded(first, cx);
     }
 
     /// Sends one request whose answer is `Ok` or a code, then reads the page again.
@@ -954,7 +964,9 @@ impl Shell {
     /// Escape, from the window's keys: the top layer here closes first. False when nothing here
     /// was open.
     pub(super) fn tiny_escape(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.tiny_state.sub.is_some() {
+        if self.tiny_state.setup.prompt {
+            self.tiny_setup_later(cx);
+        } else if self.tiny_state.sub.is_some() {
             self.tiny_state.sub = None;
         } else if self.tiny_state.float.is_some() {
             self.tiny_close_float(cx);
@@ -1402,6 +1414,9 @@ impl Shell {
                     me.owner = true;
                 }
             }
+        }
+        if let Some(how) = flag("--tiny-setup") {
+            self.tiny_shot_setup(&how, window, cx);
         }
         if std::env::args().any(|arg| arg == "--tiny-settings") {
             let asked = flag("--tiny-settings").unwrap_or_default();
