@@ -1329,7 +1329,9 @@ impl Store {
         hidden: &[AccountKey],
     ) -> rusqlite::Result<(Vec<Conversation>, u32, InboxCounts)> {
         let shelf = match shelf {
-            Shelf::Main => "NOT c.archived AND c.special != 'request'",
+            // A pinned chat stands on the network's own list whatever its archive holds: the pin
+            // groups it above the rest, archive without a pin stays in its own drill.
+            Shelf::Main => "(NOT c.archived OR c.pin IS NOT NULL) AND c.special != 'request'",
             Shelf::Archive => "c.archived AND c.special != 'request'",
             Shelf::Requests => "c.special = 'request'",
         };
@@ -2983,6 +2985,8 @@ mod tests {
             chat("cy", &[], Some(0), false),
             chat("dee", &["family"], None, true),
             chat("fin", &["work"], None, false),
+            // A pin stands whatever its archive says: Telegram keeps such chats on the list.
+            chat("jay", &[], Some(0), true),
             ConversationRow { special: Special::Request, ..ConversationRow::new("eve", ConversationKind::Direct, "eve") },
         ] {
             store.upsert_conversation(&account, &row).unwrap();
@@ -3017,12 +3021,12 @@ mod tests {
         // Pins in their order, then newest first; the channel of the Space is not in it. The pins
         // a folder holds never lift onto the network's own list: `fin` stays by recency, and its
         // place is on the folder's own tab alone.
-        assert_eq!(ids(&store, None, Shelf::Main), ["cy", "ben", "ana", "fin"]);
+        assert_eq!(ids(&store, None, Shelf::Main), ["cy", "jay", "ben", "ana", "fin"]);
         assert_eq!(
             pins(&store, None),
-            [("cy".to_owned(), Some(0)), ("ben".to_owned(), Some(1)), ("ana".to_owned(), None), ("fin".to_owned(), None)]
+            [("cy".to_owned(), Some(0)), ("jay".to_owned(), Some(0)), ("ben".to_owned(), Some(1)), ("ana".to_owned(), None), ("fin".to_owned(), None)]
         );
-        assert_eq!(ids(&store, None, Shelf::Archive), ["dee"]);
+        assert_eq!(ids(&store, None, Shelf::Archive), ["jay", "dee"]);
         assert_eq!(ids(&store, None, Shelf::Requests), ["eve"]);
         // A chat in two folders is in both; a folder's own pins come first, archived or not.
         assert_eq!(ids(&store, Some("work"), Shelf::Main), ["ben", "fin", "ana"]);
