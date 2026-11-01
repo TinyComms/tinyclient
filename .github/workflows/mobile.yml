@@ -41,7 +41,7 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_NDK_VERSION: "4.1.2"
   NDK_VERSION: "30.0.16248370"
-  GRADLE_VERSION: "9.6"
+  GRADLE_VERSION: "9.6.0"
 
 jobs:
   # The cheap one: does `mobile` break the desktop build? This is the check that catches a

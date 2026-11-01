@@ -106,7 +106,7 @@ Output: `mobile/android/app/build/outputs/apk/debug/app-debug.apk`.
 exist in a fresh checkout. Either bootstrap it once:
 
 ```bash
-cd mobile/android && gradle wrapper --gradle-version 9.6
+cd mobile/android && gradle wrapper --gradle-version 9.6.0
 ```
 
 or install Gradle 9.6+ and call `gradle`. The scripts try `gradlew`/`gradlew.bat` first, then

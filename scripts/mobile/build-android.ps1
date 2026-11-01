@@ -179,7 +179,7 @@ if (Test-Path $gradlew) {
 } elseif (Get-Command gradle -ErrorAction SilentlyContinue) {
     $gradle = 'gradle'
 } else {
-    Fail "No Gradle. mobile/android/gradlew.bat is missing because the wrapper jar is not committed, and gradle is not on PATH. Run 'gradle wrapper --gradle-version 9.6' in mobile/android, or install Gradle 9.6+."
+    Fail "No Gradle. mobile/android/gradlew.bat is missing because the wrapper jar is not committed, and gradle is not on PATH. Run 'gradle wrapper --gradle-version 9.6.0' in mobile/android, or install Gradle 9.6+."
 }
 
 Push-Location $androidDir

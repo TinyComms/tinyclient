@@ -141,7 +141,7 @@ if [ -x "$android_dir/gradlew" ]; then
 elif command -v gradle >/dev/null 2>&1; then
     gradle="gradle"
 else
-    fail "No Gradle. mobile/android/gradlew is missing because the wrapper jar is not committed, and gradle is not on PATH. Run 'gradle wrapper --gradle-version 9.6' in mobile/android, or install Gradle 9.6+."
+    fail "No Gradle. mobile/android/gradlew is missing because the wrapper jar is not committed, and gradle is not on PATH. Run 'gradle wrapper --gradle-version 9.6.0' in mobile/android, or install Gradle 9.6+."
 fi
 
 (cd "$android_dir" && "$gradle" :app:assembleDebug --console=plain)

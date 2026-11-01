@@ -65,7 +65,7 @@ Create it once (or install Gradle 9.6+ and call `gradle` directly — the build 
 
 ```bash
 cd mobile/android
-gradle wrapper --gradle-version 9.6
+gradle wrapper --gradle-version 9.6.0
 ```
 
 Then `./gradlew :app:assembleDebug` works. CI uses `gradle/actions/setup-gradle@v5` and does not
