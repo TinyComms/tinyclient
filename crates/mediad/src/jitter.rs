@@ -31,6 +31,10 @@ const IDLE: u32 = 20;
 /// last lost frame. With the very next packet already here there is no wait: each one spent
 /// holding is 20 ms the buffer never gives back.
 const REORDER: u32 = 2;
+/// The widest hole after a quiet frame that is taken for a loss, on a call whose sequence runs on
+/// through a pause. A sender's gate that shut stays shut for longer than this, and a word's quiet
+/// first frame can be followed by a packet lost like any other.
+const LOST_NOT_PAUSED: i64 = 2;
 /// A jump this large in sequence numbers is a new stream on the same SSRC.
 const RESTART: i64 = 1000;
 
@@ -80,6 +84,9 @@ pub struct Jitter {
     pub received: u64,
     /// The frame played last was quiet, as the decoder found it.
     pub hushed: bool,
+    /// Sequence numbers come from the RTP clock, which runs on through a pause (a Tiny call), so
+    /// a hole may be nobody talking. Otherwise they are continuous and any hole is a loss.
+    pub clocked: bool,
 }
 
 impl Default for Jitter {
@@ -100,6 +107,7 @@ impl Default for Jitter {
             lost: 0,
             received: 0,
             hushed: false,
+            clocked: false,
         }
     }
 }
@@ -117,7 +125,7 @@ impl Jitter {
     pub fn insert(&mut self, sequence: u16, payload: Vec<u8>) {
         let mut unwrapped = self.unwrap(sequence);
         if self.newest.is_some_and(|newest| (unwrapped - newest).abs() > RESTART) {
-            *self = Jitter { late: self.late, lost: self.lost, received: self.received, target: self.target, ..Jitter::default() };
+            *self = Jitter { late: self.late, lost: self.lost, received: self.received, target: self.target, clocked: self.clocked, ..Jitter::default() };
             unwrapped = i64::from(sequence);
         }
         if self.due.is_some_and(|due| unwrapped < due) {
@@ -215,7 +223,8 @@ impl Jitter {
         }
         if let Some(&next) = self.packets.keys().next() {
             let dry = self.idle > 0;
-            if self.hushed {
+            let gap = next - due;
+            if self.clocked && self.hushed && gap > LOST_NOT_PAUSED {
                 // The frame before the hole was quiet: the sender's gate shut after its trail
                 // of silence, and this is the next thing said. The RTP clock ran on all the
                 // while, so the sequence jumps, but nothing was lost. Walking that hole frame by
@@ -225,7 +234,6 @@ impl Jitter {
             }
             // A real hole. Wait out a reorder if one could still fill it, once for the whole gap.
             // A dry queue has waited already.
-            let gap = next - due;
             if gap > 1 && !dry && self.grace < REORDER {
                 self.grace += 1;
                 return Pop::Hold;
@@ -273,6 +281,10 @@ mod tests {
 
     fn packet(n: u16) -> Vec<u8> {
         n.to_be_bytes().to_vec()
+    }
+
+    fn clocked() -> Jitter {
+        Jitter { clocked: true, ..Jitter::default() }
     }
 
     fn fill(jitter: &mut Jitter, sequences: &[u16]) {
@@ -383,7 +395,7 @@ mod tests {
     /// 700 ms late, and every frame of the pause counted as lost.
     #[test]
     fn a_pause_after_a_quiet_frame_is_a_new_spurt_and_loses_nothing() {
-        let mut jitter = Jitter::default();
+        let mut jitter = clocked();
         fill(&mut jitter, &[1, 2, 3]);
         for _ in 0..3 {
             assert!(matches!(jitter.pop(), Pop::Packet(_)));
@@ -404,7 +416,7 @@ mod tests {
     /// played, so the queue never runs dry. It is still a pause.
     #[test]
     fn a_pause_that_never_empties_the_queue_is_a_pause_too() {
-        let mut jitter = Jitter::default();
+        let mut jitter = clocked();
         fill(&mut jitter, &[1, 2, 3, 4, 20, 21, 22]);
         for _ in 0..4 {
             assert!(matches!(jitter.pop(), Pop::Packet(_)));
@@ -412,6 +424,58 @@ mod tests {
         }
         assert_eq!(jitter.pop(), Pop::Spurt(packet(20)));
         assert_eq!(jitter.lost, 0);
+    }
+
+    /// A word's first frame can be quiet. The packet after it going missing is still a loss, and
+    /// the next packet may carry a copy of it.
+    #[test]
+    fn a_packet_lost_after_a_quiet_frame_is_lost_and_not_a_pause() {
+        let mut jitter = clocked();
+        fill(&mut jitter, &[1, 2, 3, 5, 6, 7]);
+        for _ in 0..3 {
+            assert!(matches!(jitter.pop(), Pop::Packet(_)));
+            jitter.hushed = true;
+        }
+        assert_eq!(jitter.pop(), Pop::Lost(1));
+        assert_eq!(jitter.next(), Some(&packet(5)[..]), "its copy of 4");
+        assert_eq!(jitter.pop(), Pop::Packet(packet(5)));
+        assert_eq!(jitter.lost, 1);
+    }
+
+    #[test]
+    fn two_packets_lost_after_a_quiet_frame_are_lost_too() {
+        let mut jitter = clocked();
+        fill(&mut jitter, &[1, 2, 3, 6, 7, 8]);
+        for _ in 0..3 {
+            assert!(matches!(jitter.pop(), Pop::Packet(_)));
+            jitter.hushed = true;
+        }
+        assert_eq!(jitter.pop(), Pop::Hold);
+        assert_eq!(jitter.pop(), Pop::Hold);
+        assert_eq!(jitter.pop(), Pop::Lost(2));
+        assert_eq!(jitter.lost, 2);
+    }
+
+    /// Discord's sequence numbers run on one by one over a pause: however wide, a hole is a loss.
+    #[test]
+    fn continuous_sequence_numbers_never_make_a_hole_a_pause() {
+        let mut jitter = Jitter::default();
+        fill(&mut jitter, &[1, 2, 3, 9, 10, 11]);
+        for _ in 0..3 {
+            assert!(matches!(jitter.pop(), Pop::Packet(_)));
+            jitter.hushed = true;
+        }
+        assert_eq!(jitter.pop(), Pop::Hold);
+        assert_eq!(jitter.pop(), Pop::Hold);
+        assert_eq!(jitter.pop(), Pop::Lost(5));
+        assert_eq!(jitter.lost, 5);
+    }
+
+    #[test]
+    fn a_restarted_stream_is_still_clocked() {
+        let mut jitter = clocked();
+        fill(&mut jitter, &[100, 30_000]);
+        assert!(jitter.clocked);
     }
 
     #[test]

@@ -96,6 +96,13 @@ pub(crate) struct Stream {
 }
 
 impl Stream {
+    /// One voice of a Tiny call, whose sequence numbers are its RTP time ([`Jitter::clocked`]).
+    pub(crate) fn clocked() -> Option<Stream> {
+        let mut stream = Stream::new()?;
+        stream.jitter.clocked = true;
+        Some(stream)
+    }
+
     pub(crate) fn new() -> Option<Stream> {
         Some(Stream {
             jitter: Jitter::default(),
@@ -1364,7 +1371,7 @@ mod receive_tests {
         sent.extend((20..25).map(|n| (n as u16, encode(&[0; FRAME_SAMPLES]))));
         let resumed = 35usize;
         sent.extend((resumed..resumed + 20).map(|n| (n as u16, encode(&tone(n)))));
-        let mut stream = Stream::new().unwrap();
+        let mut stream = Stream::clocked().unwrap();
         let mut heard_at = None;
         for tick in 0..resumed + 20 {
             if let Some((sequence, packet)) = sent.iter().find(|(sequence, _)| usize::from(*sequence) == tick) {

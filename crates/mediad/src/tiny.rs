@@ -567,7 +567,7 @@ impl Call {
             match self.slots.get_mut(&mid) {
                 Some(slot) => slot.user = user,
                 None => {
-                    if let Some(stream) = Stream::new() {
+                    if let Some(stream) = Stream::clocked() {
                         self.slots.insert(mid, Slot { user, stream });
                     }
                 }
@@ -663,7 +663,7 @@ impl Call {
                     self.unopened.pop_front();
                     continue;
                 }
-                let Some(stream) = Stream::new() else {
+                let Some(stream) = Stream::clocked() else {
                     self.unopened.pop_front();
                     continue;
                 };
