@@ -13,10 +13,12 @@
 //! Text channels and direct messages are conversations (`messages`): the shell's own pane
 //! draws them.
 
+pub(crate) mod e2ee;
 pub(crate) mod live;
 pub(crate) mod manage;
 mod browser;
 mod messages;
+mod sealing;
 pub mod signin;
 
 use super::{serve_commands, Command, Context, Signed};
@@ -54,6 +56,10 @@ pub(crate) struct Saved {
     /// session is not used for a server like that, until they sign in again and confirm.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     plain_http_ok: bool,
+    /// The keys of this install's end-to-end encryption device on this server (`e2ee`): kept in
+    /// the keychain with the session and nowhere else. Absent until the device is first made.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    e2ee: Option<e2ee::Secrets>,
 }
 
 struct Me {
@@ -457,6 +463,7 @@ fn saved_from(base: &str, body: Value) -> Result<Saved, Fault> {
         role: answer.role,
         // Set by the sign-in, which is the one that asked.
         plain_http_ok: false,
+        e2ee: None,
     })
 }
 
@@ -1040,6 +1047,16 @@ pub(crate) fn rename(account: AccountKey, display_name: String) -> Response {
 
 /// Ends every session of this account on the server. A 401 is already the same thing: the
 /// caller forgets the session either way.
+/// `Request::TinyE2ee`: this account's encryption device, its people and their safety numbers.
+pub(crate) fn e2ee_ask(account: AccountKey, ask: protocol::E2eeAsk) -> Response {
+    let saved = match open(&account) {
+        Ok(saved) => saved,
+        Err(answer) => return answer,
+    };
+    let names: std::collections::HashMap<String, String> = members_of(&saved).map(|members| members.into_iter().map(|member| (member.user_id, member.display_name)).collect()).unwrap_or_default();
+    e2ee::answer(&saved, ask, &names)
+}
+
 pub(crate) fn end_sessions(account: &AccountKey) -> Result<(), Response> {
     let saved = open(account)?;
     match asked("DELETE", &saved, "/v1/sessions", None) {
@@ -1067,6 +1084,9 @@ pub(crate) fn start_with(ctx: Context, session: &str, inbox: Receiver<Command>, 
     std::thread::Builder::new()
         .name("tiny-commands".into())
         .spawn(move || {
+            // This install as an encryption device of the person, before any conversation is read:
+            // made, registered, key packages up. Never stops the account.
+            e2ee::begin(&saved);
             messages::refresh(&ctx, &saved);
             serve_commands(
                 &ctx,
@@ -1079,6 +1099,9 @@ pub(crate) fn start_with(ctx: Context, session: &str, inbox: Receiver<Command>, 
                     Command::CallLeave(room_id) => live.ask(live::Ask::Hangup { room_id }),
                     Command::CallAudio { muted, deafened } => live.ask(live::Ask::State { muted, deafened }),
                     Command::SignOut(reply) => {
+                        // This install stops being a device of the person: revoked on the server
+                        // while the session still works, its keys and cache forgotten here.
+                        e2ee::sign_out(&saved);
                         delete_session(&saved);
                         let _ = reply.send(Ok(()));
                     }

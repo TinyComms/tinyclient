@@ -72,6 +72,16 @@ async-trait = { version = "0.1", optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock"], optional = true }
 rand = { version = "0.9", optional = true }
 
+# End-to-end encrypted text and attachments on a Tiny server (`adapters/tiny/e2ee.rs`): MLS
+# groups, sealed attachments, the device identity. All the cryptography is that crate's.
+e2ee = { path = "../e2ee" }
+# The private file a sealed attachment and the device's notes are written through. In the tree.
+tempfile = "3"
+# Re-encodes a picture before it is sealed, which drops EXIF, XMP, IPTC and GPS: the server can no
+# longer strip them once the file is end-to-end encrypted. Decoded with limits. The version and
+# features the shell already builds.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+
 [features]
 default = ["signal"]
 signal = ["dep:presage", "dep:aes-gcm-siv", "dep:futures", "dep:async-trait", "dep:chrono", "dep:rand", "tokio/rt"]
@@ -86,7 +96,7 @@ core-foundation-sys = "0.8"
 
 [target.'cfg(windows)'.dependencies]
 # chatd opens a Tiny server's sign-in page in the system browser (`adapters/tiny/browser.rs`).
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_Security", "Win32_Security_Authorization", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 [target.'cfg(windows)'.dev-dependencies]
 # tests/upload.rs reads a child's memory as often as every 20 ms; e2e and calls list mediads.

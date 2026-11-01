@@ -63,6 +63,31 @@ pub type Reply<T> = Sender<Result<T, Refusal>>;
 pub struct Download {
     pub url: String,
     pub headers: Vec<(String, String)>,
+    /// The file is a sealed (end-to-end encrypted) blob: what opens it. The cache opens it after
+    /// the download and keeps only the opened file.
+    pub sealed: Option<SealedFile>,
+}
+
+/// How to open a sealed attachment (`e2ee::attachment`), from the message that named it. Not
+/// `Debug`: it holds the file's key.
+#[derive(Clone)]
+pub struct SealedFile {
+    pub key: [u8; 32],
+    /// SHA-256 of the sealed blob, checked before anything is decrypted.
+    pub sha256: [u8; 32],
+    /// The plaintext's length, as the message says.
+    pub plain_len: u64,
+    /// The first chunk's associated data besides its header.
+    pub context: Vec<u8>,
+    /// What the sender says it is. Checked against the opened bytes, never trusted.
+    pub mime: String,
+    pub name: String,
+}
+
+impl std::fmt::Debug for SealedFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SealedFile").field("plain_len", &self.plain_len).finish_non_exhaustive()
+    }
 }
 
 /// What the search's ask names: a Space's own search, or one conversation's.

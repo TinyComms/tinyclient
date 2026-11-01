@@ -269,6 +269,18 @@ impl Upload {
         }
     }
 
+    /// Sends `file`, `bytes` long, in place of file `at`'s own bytes, under `name` and `mime`: the
+    /// sealed copy of an end-to-end encrypted send. The original is not read again, and still goes
+    /// from `outbox/` once the message went.
+    pub fn replace(&mut self, at: usize, file: File, bytes: u64, name: &str, mime: &'static str) {
+        let source = &mut self.files[at];
+        self.meter.total = self.meter.total.saturating_sub(source.bytes) + bytes;
+        source.file = file;
+        source.bytes = bytes;
+        source.name = name.to_owned();
+        source.mime = mime;
+    }
+
     /// File `at` as the whole body, with its length.
     pub fn send(&mut self, at: usize, target: &Target) -> Result<Answer, String> {
         let bytes = self.files[at].bytes;
