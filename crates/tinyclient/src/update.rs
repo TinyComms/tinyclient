@@ -1094,6 +1094,17 @@ mod tests {
         }
     }
 
+    /// Asks GitHub for real: the release feed and its checksums, through the redirects the real
+    /// release assets are served by. `cargo test -p tinyclient --features gui -- --ignored live_`.
+    #[test]
+    #[ignore = "asks GitHub"]
+    fn live_the_latest_release_and_its_sums_are_fetched_hop_by_hop() {
+        let feed = http_text(FEED, true).expect("the release feed");
+        let release = parse_release(&feed).expect("a release with this machine's archive");
+        let sums = http_text(&release.sums_url, false).expect("the checksums, through GitHub's redirect");
+        assert!(sum_for(&sums, &release.archive).is_some(), "{} is in SHA256SUMS", release.archive);
+    }
+
     #[test]
     fn a_versioned_archive_is_used_when_the_stable_name_is_absent() {
         let suffix = archive_suffix().unwrap();
