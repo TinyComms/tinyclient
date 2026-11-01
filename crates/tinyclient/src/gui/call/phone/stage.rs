@@ -173,14 +173,14 @@ impl Shell {
         Some(PathBuf::from(&picture.path))
     }
 
-    /// My own camera's picture. The platform has none to give yet; the tile says the camera is
-    /// on instead.
+    /// My own camera's picture, as the platform last wrote it (`hooks::self_frame`); without
+    /// one the tile says the camera is on instead.
     fn call_phone_self_frame(&self) -> Option<PathBuf> {
         #[cfg(feature = "gui-shot")]
         if let Some(frame) = crate::gui::call::shot::phone_frame("", false) {
             return Some(frame);
         }
-        None
+        super::hooks::self_frame()
     }
 
     /// How the stage is laid out for this call now.

@@ -823,7 +823,114 @@ fn stamp(unix: i64) -> String {
 }
 
 /// What the made-up chatd says to one request.
+/// A call in the demo: no network and no other person, only my own camera. A phone sends its
+/// camera through the real path (the platform's camera, mediad's encoders, the platform's
+/// decoder) and back as the other side's picture (`route_loopback`), which proves a phone's
+/// whole picture path without a second device. Without a platform it is a call with nobody in it.
+static DEMO_CALL: std::sync::Mutex<Option<protocol::Call>> = std::sync::Mutex::new(None);
+/// The demo call just ended: the next `Wait` says so.
+static DEMO_CALL_ENDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The loopback a phone registers: turn my camera on or off; the picture that came back.
+static LOOPBACK: OnceLock<(fn(bool), fn() -> Option<protocol::CallPicture>)> = OnceLock::new();
+/// The phone's call itself: the microphone asked for and the audio session held while it lasts.
+static LOOPBACK_CALL: OnceLock<fn(bool)> = OnceLock::new();
+
+/// The mobile layer: plugs its camera loopback and its call's audio into the demo's call.
+#[allow(dead_code)] // Registered by the Android layer's demo build.
+pub fn route_loopback(camera: fn(bool), picture: fn() -> Option<protocol::CallPicture>, call: fn(bool)) {
+    let _ = LOOPBACK.set((camera, picture));
+    let _ = LOOPBACK_CALL.set(call);
+}
+
+/// The id the loopback's picture comes back under.
+pub const LOOPBACK_ID: &str = "loopback";
+
+fn demo_call(conversation: &protocol::Key) -> protocol::Call {
+    protocol::Call {
+        conversation: conversation.clone(),
+        state: protocol::CallState::Joined,
+        participants: vec![protocol::Participant { id: LOOPBACK_ID.into(), name: "Camera loopback".into(), ..Default::default() }],
+        muted: false,
+        deafened: false,
+        joined: now(),
+        input: String::new(),
+        output: String::new(),
+        input_id: String::new(),
+        output_id: String::new(),
+        device_notice: None,
+        device_stuck: false,
+        engine_linked: true,
+        video: Vec::new(),
+        speaking: false,
+        level: None,
+        output_level: None,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        security: None,
+        picture: None,
+    }
+}
+
+/// The demo call as Status shows it now, with the loopback's newest picture.
+fn demo_call_now() -> Option<protocol::Call> {
+    let mut held = DEMO_CALL.lock().unwrap_or_else(|p| p.into_inner());
+    let call = held.as_mut()?;
+    let camera = call.video.iter().any(|stream| stream.content == protocol::Content::Camera);
+    call.picture = if camera { LOOPBACK.get().and_then(|(_, picture)| picture()) } else { None };
+    if let Some(peer) = call.participants.first_mut() {
+        peer.camera = call.picture.is_some();
+    }
+    Some(call.clone())
+}
+
+/// The demo call's own requests; `None` for the rest.
+fn demo_call_answer(request: &Request) -> Option<Response> {
+    // A desktop's `--demo` and the screenshot harness keep the demo as it was: no calls.
+    if !on_phone() {
+        return None;
+    }
+    let mut held = DEMO_CALL.lock().unwrap_or_else(|p| p.into_inner());
+    match request {
+        Request::CallStart { conversation } => {
+            *held = Some(demo_call(conversation));
+            if let Some(call) = LOOPBACK_CALL.get() {
+                call(true);
+            }
+            Some(Response::Ok)
+        }
+        Request::CallEnd => {
+            DEMO_CALL_ENDED.store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Some(call) = LOOPBACK_CALL.get() {
+                call(false);
+            }
+            if held.take().is_some_and(|call| call.video.iter().any(|s| s.content == protocol::Content::Camera)) {
+                if let Some((camera, _)) = LOOPBACK.get() {
+                    camera(false);
+                }
+            }
+            Some(Response::Ok)
+        }
+        Request::Media(protocol::MediaRequest::Camera { on }) => {
+            let call = held.as_mut()?;
+            call.video.retain(|stream| stream.content != protocol::Content::Camera);
+            if *on {
+                call.video.push(protocol::VideoStream { direction: protocol::Direction::Encode, content: protocol::Content::Camera, source: String::new() });
+            }
+            if let Some((camera, _)) = LOOPBACK.get() {
+                camera(*on);
+            }
+            Some(Response::Ok)
+        }
+        Request::Media(_) if held.is_some() => Some(Response::Ok),
+        _ => None,
+    }
+}
+
 pub fn answer(request: &Request) -> std::io::Result<Response> {
+    if let Some(answer) = demo_call_answer(request) {
+        return Ok(answer);
+    }
     let fixture = fixture();
     let answer = match request {
         Request::Ping => Response::Pong,
@@ -831,7 +938,7 @@ pub fn answer(request: &Request) -> std::io::Result<Response> {
             networks: networks(fixture),
             accounts: fixture.accounts.clone(),
             media: Media::Stopped,
-            call: None,
+            call: demo_call_now(),
             seq: 1,
             keychain: protocol::Keychain::default(),
             started: 1,
@@ -839,8 +946,15 @@ pub fn answer(request: &Request) -> std::io::Result<Response> {
             session: String::new(),
         },
         // Nothing ever changes: the wait runs out and is asked again, as a quiet chatd's does.
-        Request::Wait { .. } => {
-            std::thread::sleep(Duration::from_secs(20));
+        Request::Wait { since } => {
+            // The demo call changes by itself (its picture, its clock): say so a few times a
+            // second while there is one, and once more when it ends.
+            for _ in 0..80 {
+                std::thread::sleep(Duration::from_millis(250));
+                if DEMO_CALL.lock().unwrap_or_else(|p| p.into_inner()).is_some() || DEMO_CALL_ENDED.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                    return Ok(Response::Changes { seq: since + 1, reset: false, changes: vec![protocol::Change::Status] });
+                }
+            }
             return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "the demo is quiet"));
         }
         Request::Inbox { network, filter, offset, limit } => conversations(inbox(*network, *filter), *offset, *limit),

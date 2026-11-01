@@ -17,7 +17,10 @@
 
 mod codec;
 mod jvm;
+#[cfg(feature = "demo")]
+mod loopback;
 mod natives;
+mod selfie;
 mod web;
 
 use crate::gui::call::phone::hooks;
@@ -37,6 +40,9 @@ pub fn register() {
     hooks::route_system_settings(|_| open_settings());
     hooks::route_audio(routes, choose_route);
     hooks::route_flip(flip);
+    hooks::route_self_frame(selfie::shown);
+    #[cfg(feature = "demo")]
+    loopback::register();
 }
 
 struct Android;
@@ -95,6 +101,7 @@ fn set_route(number: i32) -> Result<(), String> {
 
 fn flip(front: bool) {
     FACING.store(if front { 1 } else { 2 }, Ordering::Relaxed);
+    selfie::mirror(front);
     std::thread::spawn(move || {
         let words = jvm::call("turn the camera", |env| {
             let out = jvm::call_static(env, CAMERA, "flip", "(Z)Ljava/lang/String;", &[JValue::Bool(front.into())])?.l()?;
@@ -172,7 +179,7 @@ impl Platform for Android {
             _ => request.facing == Facing::Front,
         };
         let id = next_id();
-        SINKS.put(id, sink);
+        SINKS.put(id, selfie::tee(sink, front));
         let old = CAMERA_SINK.swap(id, Ordering::Relaxed);
         let started = sentence(
             "start the camera",
@@ -184,6 +191,7 @@ impl Platform for Android {
         SINKS.take(old);
         if started.is_err() {
             SINKS.take(id);
+            selfie::stop();
             let _ = CAMERA_SINK.compare_exchange(id, 0, Ordering::Relaxed, Ordering::Relaxed);
         } else if USER_ROUTE.load(Ordering::Relaxed) == 0 {
             // A video call plays on the speaker unless the user chose otherwise.
@@ -195,6 +203,7 @@ impl Platform for Android {
     fn stop_camera(&self) {
         let _ = jvm::call("stop the camera", |env| jvm::call_static(env, CAMERA, "stop", "()V", &[]).map(|_| ()));
         SINKS.take(CAMERA_SINK.swap(0, Ordering::Relaxed));
+        selfie::stop();
     }
 
     fn start_screen_share(&self, sink: FrameSink) -> Result<(), String> {
