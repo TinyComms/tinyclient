@@ -234,7 +234,18 @@ fn open_now(section: Section, cx: &mut App) {
             return;
         }
     }
-    let bounds = Bounds::centered(None, size(px(SIZE.0), px(SIZE.1)), cx);
+    #[allow(unused_mut)]
+    let mut wanted = SIZE;
+    // `--settings-size 390x844`: the window at a phone's size, for a shot.
+    #[cfg(feature = "gui-shot")]
+    if let Some((wide, tall)) = std::env::args()
+        .skip_while(|arg| arg != "--settings-size")
+        .nth(1)
+        .and_then(|size| size.split_once('x').and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?))))
+    {
+        wanted = (wide, tall);
+    }
+    let bounds = Bounds::centered(None, size(px(wanted.0), px(wanted.1)), cx);
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         titlebar: Some(TitlebarOptions {

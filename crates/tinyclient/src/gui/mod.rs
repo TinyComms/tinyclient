@@ -23,6 +23,8 @@ mod settings;
 mod sidebar;
 mod signin;
 mod shortcuts;
+#[cfg(feature = "gui-shot")]
+pub(crate) mod shot_demo;
 mod state;
 mod theme;
 mod tiny;
@@ -225,6 +227,19 @@ fn shell_bindings() -> Vec<KeyBinding> {
 /// chatd when it is not running; off by default so a shot leaves no process behind),
 /// `--autoplay always|hover|never` (when GIFs play), `--frames N` (N frames 150 ms apart, as
 /// `out-1.png` …, to see moving pictures move).
+///
+/// `--demo` draws made-up data instead of live data: a fake chatd answers every request
+/// (`shot_demo`), chatd is never started or asked, and nobody's real chats are read.
+/// `--demo-empty` is the same with nothing signed in (first run). With either:
+/// `--phone-search WORDS` (the phone's Search field, typed), `--compose WORDS` (the open
+/// conversation's composer, typed). Other states come from the views' own shot hooks:
+/// `TINYCLIENT_SHOT_HOVER=<message id>` (the message toolbar, as a long press shows it),
+/// `TINYCLIENT_SHOT_MENU=<message id>`, `TINYCLIENT_SHOT_AT=<message id>` (`m01`…`m25` in the
+/// demo's "Foray carpool"), `TINYCLIENT_S6=d-card` (the open conversation's person card),
+/// `TINYCLIENT_SHOT_CALL=joined` (the call dock, desktop only), `TINYCLIENT_SIGNIN_SHOT=phone`
+/// (the sign-in sheet), and `--settings <section> --settings-shot out.png` with
+/// `--settings-size WxH` (the Settings window at that size). `scripts/mobile/phone-shots.ps1`
+/// renders all of them.
 #[cfg(feature = "gui-shot")]
 mod shot {
     use super::layout::{Menu, RightKind, RightPane};
@@ -370,6 +385,14 @@ mod shot {
                 }
                 if has("--components") {
                     shell.sheet = true;
+                }
+                if let Some(words) = flag("--phone-search") {
+                    if let Some(field) = shell.phone_state.search.clone() {
+                        field.update(cx, |field, cx| field.set_text(&words, cx));
+                    }
+                }
+                if let Some(words) = flag("--compose") {
+                    shell.composer_type(&words, window, cx);
                 }
                 cx.notify();
             }
@@ -667,6 +690,9 @@ pub(crate) fn run_with(application: gpui::Application) {
     time::read_clock_preference();
     // Read before the window opens, so its first frame draws where the user was.
     let prefs = app::prefs::read();
+    // A demo shot draws only made-up data: nothing the user last had open is restored.
+    #[cfg(feature = "gui-shot")]
+    let prefs = if shot_demo::on() { app::prefs::Prefs::default() } else { prefs };
     theme::set_text_step(prefs.text_step);
     app::prefs::set_choices(prefs.choices);
     anim::set_autoplay(prefs.autoplay);

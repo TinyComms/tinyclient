@@ -735,8 +735,12 @@ impl Pane {
         let mut out = Vec::with_capacity(blocks.len() + 1);
         for (ix, block) in blocks.iter().enumerate() {
             let element = match block {
+                // A flex column, so the text is a flex item that is measured on its own: in a
+                // block its layout belongs to the line box, and `Rich` reads its own layout.
                 Block::Text(inline) => div()
                     .max_w(px(MEASURE))
+                    .flex()
+                    .flex_col()
                     .type_body()
                     .when(phone, |div| div.text_size(px(tokens_phone::scaled(17.))).line_height(px(tokens_phone::scaled(24.))))
                     .when(mine, |div| div.text_align(gpui::TextAlign::Right))
@@ -751,6 +755,8 @@ impl Pane {
                         div()
                             .pl(px(12.))
                             .min_w_0()
+                            .flex()
+                            .flex_col()
                             .type_body()
                             .when(phone, |div| div.text_size(px(tokens_phone::scaled(17.))).line_height(px(tokens_phone::scaled(24.))))
                             .when(mine, |div| div.text_align(gpui::TextAlign::Right))
@@ -767,7 +773,7 @@ impl Pane {
                         .when(phone, |div| div.text_size(px(tokens_phone::scaled(17.))).line_height(px(tokens_phone::scaled(24.))))
                         .when(mine, |div| div.text_align(gpui::TextAlign::Right))
                         .child(div().w(px(22.)).flex_none().text_color(theme::text_faint()).child(marker))
-                        .child(div().min_w_0().flex_1().child(self.rich(message, ix, text, theme::text().into_color(), window, cx)))
+                        .child(div().min_w_0().flex_1().flex().flex_col().child(self.rich(message, ix, text, theme::text().into_color(), window, cx)))
                         .into_any_element()
                 }
                 Block::Code { language, text } => self.code_block(message, ix, language, text, cx),
