@@ -3,7 +3,7 @@
 //! channel" makes. For end-to-end call tests on machines where nobody can tap: Android's debug
 //! launch extras (`am start -n dev.tinyclient.app/.TinyActivity --es tiny.join "<server>|<room>"
 //! --ez tiny.camera true --ez tiny.speaker true`) and, on a desktop, `TINYCLIENT_DEBUG_JOIN`
-//! (`<server>|<room>[|camera][|speaker][|share]`).
+//! (`<server>|<room>[|camera][|speaker][|share][|watch]`).
 //!
 //! `<server>` matches a signed-in Tiny account's name or id (empty: the only one); `<room>` a
 //! room's id or name. Every step is logged as `tinyclient: debug launch: ...`. Compiled only
@@ -32,6 +32,8 @@ pub struct Launch {
     pub speaker: bool,
     /// Share the screen once in (desktop; a phone asks for consent first).
     pub share: bool,
+    /// Watch whoever else's share or camera the room shows, as the Watch button does.
+    pub watch: bool,
 }
 
 impl Launch {
@@ -46,6 +48,7 @@ impl Launch {
                 "camera" => launch.camera = true,
                 "speaker" => launch.speaker = true,
                 "share" => launch.share = true,
+                "watch" => launch.watch = true,
                 _ => {}
             }
         }
@@ -61,6 +64,8 @@ enum Stage {
     Rooms(Instant),
     /// Join was pressed; waiting for the call to be up.
     Joining(Instant),
+    /// In the call; waiting for someone's picture to watch, asked last at the instant.
+    Watching(Option<Instant>),
 }
 
 static PENDING: Mutex<Option<(Launch, Stage)>> = Mutex::new(None);
@@ -137,7 +142,11 @@ impl Shell {
                     return;
                 }
                 let launch = launch.clone();
-                *pending = None;
+                if launch.watch {
+                    *stage = Stage::Watching(None);
+                } else {
+                    *pending = None;
+                }
                 drop(pending);
                 say!("tinyclient: debug launch: in the call");
                 if launch.speaker {
@@ -152,6 +161,36 @@ impl Shell {
                     say!("tinyclient: debug launch: sharing the screen");
                     self.call_ask(Request::Media(MediaRequest::ShareSend { on: true }), cx);
                 }
+            }
+            Stage::Watching(asked) => {
+                if asked.is_some_and(|at| at.elapsed() < Duration::from_secs(10)) {
+                    return;
+                }
+                let Some(call) = self.tiny_call().filter(|call| call.state == CallState::Joined) else {
+                    return;
+                };
+                let Some(page) = self.tiny_page_facts() else {
+                    return;
+                };
+                let me = page.me.to_owned();
+                let Some(room) = page.community.rooms.iter().find(|r| r.id == call.conversation.id) else {
+                    return;
+                };
+                // Someone else's share, else their camera: what the Watch button offers.
+                let others: Vec<_> = room.participants.iter().filter(|seat| seat.user_id != me).collect();
+                let Some(seat) = others.iter().find(|seat| seat.sharing).or_else(|| others.iter().find(|seat| seat.camera)) else {
+                    return;
+                };
+                if call.picture.as_ref().is_some_and(|picture| !picture.path.is_empty() && picture.user_id == seat.user_id) {
+                    say!("tinyclient: debug launch: watching {} ({})", seat.user_id, if seat.sharing { "share" } else { "camera" });
+                    *pending = None;
+                    return;
+                }
+                say!("tinyclient: debug launch: asking to watch {}", seat.user_id);
+                let source = Some(seat.user_id.clone());
+                *stage = Stage::Watching(Some(Instant::now()));
+                drop(pending);
+                self.call_ask(Request::Media(MediaRequest::ShareWatch { source }), cx);
             }
         }
     }
@@ -177,7 +216,7 @@ mod tests {
     fn a_launch_names_a_server_a_room_and_flags() {
         assert_eq!(
             Launch::parse("Tiny server|Proof|camera|speaker"),
-            Some(Launch { server: "Tiny server".into(), room: "Proof".into(), camera: true, speaker: true, share: false })
+            Some(Launch { server: "Tiny server".into(), room: "Proof".into(), camera: true, speaker: true, share: false, watch: false })
         );
         assert_eq!(Launch::parse("|r1"), Some(Launch { server: String::new(), room: "r1".into(), ..Launch::default() }));
         assert_eq!(Launch::parse("server only"), None);
