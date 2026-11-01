@@ -3,7 +3,6 @@
 
 use crate::adapters::{Command, Download, Refusal};
 use protocol::{MediaFile, MediaKind, Network};
-use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::mpsc::{channel, Sender};
@@ -265,7 +264,7 @@ fn get(hosts: &Hosts, agent: &ureq::Agent, want: &Want, from: &Download, buffer:
         return Err(too_large());
     }
     let broken = |err: std::io::Error| Failed::Other(format!("The download failed: {err}."));
-    let mut out = File::create(want.part).map_err(broken)?;
+    let mut out = protocol::private::create(want.part).map_err(broken)?;
     let mut reader = response.body_mut().as_reader();
     let mut total = 0u64;
     loop {

@@ -16,6 +16,7 @@ mod call;
 pub mod crash;
 pub mod hotkey;
 pub mod log_policy;
+pub mod private;
 mod info;
 pub mod ipc;
 pub mod launch;

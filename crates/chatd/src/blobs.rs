@@ -908,7 +908,7 @@ impl Cache {
             if file.path.is_some() {
                 return Some(Ok(file));
             }
-            if let Err(err) = std::fs::create_dir_all(&dir) {
+            if let Err(err) = protocol::private::dir(&dir) {
                 return failed(&file, format!("The cache directory could not be made: {err}."));
             }
             let want = fetch::Want {
