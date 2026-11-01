@@ -18,11 +18,11 @@
   -Phase all      server, desktop, android.
   -Phase call     The whole proof with nothing on this PC's screen: server, then Alice on the
                   tiny-linux VM's X11 desktop (vm-desktop.sh: built there, TINYCLIENT_DEBUG_JOIN,
-                  screen share, 440 Hz tone, ffmpeg recording), then Bea on the emulator by a debug
-                  launch (tiny.join, camera on, speaker, 660 Hz tone), -CallSeconds in the call,
+                  screen share, watching Bea, 440 Hz tone, ffmpeg recording), then Bea on the emulator by a debug
+                  launch (tiny.join, camera on, speaker, watching Alice's share, 660 Hz tone), -CallSeconds in the call,
                   then logs, recording and both ends' received audio into -Proof with
                   tone-check.py's verdict, and everything stopped.
-                  pwsh scripts/e2e/local-tiny-call.ps1 -Phase call -InstallApk -Proof <dir>
+                  pwsh scripts/e2e/local-tiny-call.ps1 -Phase call -BuildApk -Proof <dir>
   -Stop           Stops only the processes this script started (pids in <State>\pids.json) and
                   removes the Postgres container.
 
@@ -53,6 +53,8 @@ param(
     [string]$VmDir = '~/tiny-e2e',
     [switch]$SkipVmBuild,
     [switch]$InstallApk,
+    # Build the debug APK (x86_64, stripped) before installing it.
+    [switch]$BuildApk,
     [int]$CallSeconds = 60,
     [string]$Proof = (Join-Path $env:LOCALAPPDATA 'tiny-e2e\proof')
 )
@@ -320,7 +322,7 @@ function Start-Vm {
     $a = $seed.sessions.a.psobject.Copy()
     $a.base_url = "http://${lan}:$HttpPort"
     $session = ($a | ConvertTo-Json -Compress) -replace "'", "'\''"
-    $join = "|$($seed.room.name)|share"
+    $join = "|$($seed.room.name)|share|watch"
     ssh $VmHost "bash $VmDir/src/scripts/e2e/vm-desktop.sh stop $VmDir/run >/dev/null 2>&1; rm -rf $VmDir/run; bash $VmDir/src/scripts/e2e/vm-desktop.sh start $VmDir/src $VmDir/run '$session' '$join' tone:440"
 }
 
@@ -330,6 +332,19 @@ function Start-Vm {
 function Start-Android {
     Push-AndroidSession
     $apk = Join-Path $Repo 'mobile\android\app\build\outputs\apk\debug\app-debug.apk'
+    if ($BuildApk) {
+        # The debug .so is 1.3 GB with its debug info; stripped it installs in seconds, and it
+        # keeps debug_assertions (the debug launch). Gradle from PATH or ~/.gradle/dists-manual.
+        & (Join-Path $Repo 'scripts\mobile\build-android.ps1') -Abi x86_64 -SkipGradle
+        if ($LASTEXITCODE) { throw 'cargo ndk build failed' }
+        $strip = Get-ChildItem "$env:LOCALAPPDATA\Android\Sdk\ndk\*\toolchains\llvm\prebuilt\*\bin\llvm-strip.exe" | Select-Object -Last 1 -ExpandProperty FullName
+        & $strip --strip-debug (Join-Path $Repo 'mobile\android\app\src\main\jniLibs\x86_64\libtinyclient.so')
+        $manual = Get-ChildItem "$env:USERPROFILE\.gradle\dists-manual\gradle-*\bin" -ErrorAction SilentlyContinue | Select-Object -Last 1
+        if (-not (Get-Command gradle -ErrorAction SilentlyContinue) -and $manual) { $env:PATH = "$($manual.FullName);$env:PATH" }
+        Push-Location (Join-Path $Repo 'mobile\android'); gradle -q assembleDebug; $code = $LASTEXITCODE; Pop-Location
+        if ($code) { throw 'gradle assembleDebug failed' }
+        $InstallApk = $true
+    }
     if ($InstallApk) {
         adb -s $Serial install -r $apk | Write-Host
         Push-AndroidSession
@@ -340,7 +355,7 @@ function Start-Android {
     adb -s $Serial shell pm grant $pkg android.permission.RECORD_AUDIO
     adb -s $Serial shell pm grant $pkg android.permission.POST_NOTIFICATIONS 2>$null
     adb -s $Serial logcat -c
-    $join = "|$($seed.room.name)|audio=tone:660|sink=/data/user/0/$pkg/files/played.pcm"
+    $join = "|$($seed.room.name)|watch|audio=tone:660|sink=/data/user/0/$pkg/files/played.pcm"
     adb -s $Serial shell "am start -n $pkg/.TinyActivity --es tiny.join '$join' --ez tiny.camera true --ez tiny.speaker true" | Write-Host
 }
 
