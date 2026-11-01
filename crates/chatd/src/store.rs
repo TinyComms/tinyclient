@@ -3236,6 +3236,19 @@ mod tests {
     }
 
     #[test]
+    fn a_stored_notification_preview_survives_a_restart_unchanged() {
+        let path = scratch("preview");
+        {
+            let mut store = Store::open(&path).unwrap();
+            store.set_setting("", "preview", Some("full")).unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let rows: Vec<_> = store.settings().unwrap().into_iter().filter(|s| s.key == "preview").map(|s| s.value).collect();
+        assert_eq!(rows, ["full"], "opening the store does not rewrite a choice");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
     fn a_cache_from_before_the_voice_limit_column_is_rebuilt() {
         let path = scratch("voice-limit");
         let mut store = Store::open(&path).unwrap();

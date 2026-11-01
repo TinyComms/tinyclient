@@ -242,14 +242,26 @@ fn a_sound_is_not_repeated_within_ten_seconds_here_or_three_anywhere() {
 #[test]
 fn the_preview_is_what_the_settings_allow_and_less_on_a_locked_screen() {
     let mut values = Values::default();
-    assert_eq!(decide(&values, &dm(), &message("Ines", "hi"), &moment()).unwrap().preview, Preview::Full);
+    // Out of the box a notification names the sender and carries no text, locked or not.
+    assert_eq!(decide(&values, &dm(), &message("Ines", "hi"), &moment()).unwrap().preview, Preview::Sender);
     assert_eq!(decide(&values, &dm(), &message("Ines", "hi"), &Moment { locked: true, ..moment() }).unwrap().preview, Preview::Sender);
+    // A person who wants the text has to ask for it, and gets it.
+    set(&mut values, GLOBAL, settings::PREVIEW, "full");
+    assert_eq!(decide(&values, &dm(), &message("Ines", "hi"), &moment()).unwrap().preview, Preview::Full);
+    assert_eq!(decide(&values, &dm(), &message("Ines", "hi"), &Moment { locked: true, ..moment() }).unwrap().preview, Preview::Sender, "the lock screen stays on its own setting");
     set(&mut values, GLOBAL, settings::PREVIEW_LOCKED, "nothing");
     assert_eq!(decide(&values, &dm(), &message("Ines", "hi"), &Moment { locked: true, ..moment() }).unwrap().preview, Preview::Nothing);
-    set(&mut values, GLOBAL, settings::PREVIEW, "sender");
-    assert_eq!(decide(&values, &dm(), &message("Ines", "hi"), &moment()).unwrap().preview, Preview::Sender);
+    set(&mut values, GLOBAL, settings::PREVIEW, "nothing");
+    assert_eq!(decide(&values, &dm(), &message("Ines", "hi"), &moment()).unwrap().preview, Preview::Nothing);
 }
 
+#[test]
+fn a_preview_word_nobody_can_read_is_never_more_than_the_sender() {
+    assert_eq!(Preview::of("full"), Preview::Full);
+    assert_eq!(Preview::of("sender"), Preview::Sender);
+    assert_eq!(Preview::of("nothing"), Preview::Nothing);
+    assert_eq!(Preview::of("everything"), Preview::Sender, "unknown text shows the least that is still useful, not the most");
+}
 fn post(notes: &mut Notes, conversation: &Conversation, message: &Message, preview: Preview) {
     let verdict = Verdict { banner: true, sound: None, preview, mention: message.mentions_me };
     notes.message(conversation, message, &verdict, Instant::now());
@@ -401,6 +413,10 @@ fn the_test_notification_uses_the_preview_and_the_message_sound() {
     let (posted, detail, sound) = notes.test(&Values::default(), false);
     assert!(posted && detail.is_empty());
     assert_eq!(sound.as_deref(), if notifier::SYSTEM_PLAYS_SOUND { None } else { Some("pebble") });
+    assert_eq!(fake.log().shown["test"].body, "New message", "the default preview carries no text");
+    let mut full = Values::default();
+    set(&mut full, GLOBAL, settings::PREVIEW, "full");
+    notes.test(&full, false);
     assert_eq!(fake.log().shown["test"].body, "This is how messages will look and sound.");
     let mut values = Values::default();
     set(&mut values, GLOBAL, settings::PREVIEW, "nothing");

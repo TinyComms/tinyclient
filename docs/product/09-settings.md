@@ -141,7 +141,7 @@ tinyclient in System Settings." with "Open System Settings".
 | N1 | Show notifications | Switch | On | G | d | Off: chatd posts no message notifications. Counts and badge keep working. Calls follow N5 | in |
 | N2 | Notify me about | ND, NG, NM, NT: "Direct messages", "Group chats", "Mentions in channels", "Tiny servers" | DMs, groups, and mentions | G | d | Which arriving messages chatd posts. Muted conversations never notify (04 C2). These are global, not per account. | in |
 | N3 | Per account: Notify me about | Menu | | A | d | Not a row. chatd can store an account-level notify word; the window does not show N3. | not in 0.2.35 |
-| N4 | Show in notifications | Segmented: "Sender and message" / "Sender only" / "Nothing" | Sender and message | G | d | Sender only: title is the sender, body "New message" or "New mention". Nothing: title is the network, body "New message". For screen sharing | in |
+| N4 | Show in notifications | Segmented: "Sender and message" / "Sender only" / "Nothing" | Sender only | G | d | Sender only: title is the sender, body "New message" or "New mention". Nothing: title is the network, body "New message". For screen sharing | in |
 | NL | Lock-screen preview | Switch | | G | d | Hidden on macOS, where the OS does that. | in |
 | N5 | Incoming calls | Segmented: "Ring" / "Notify silently" / "Don't notify" | Ring | G | d | Ring posts the call notification with the ring sound (S4). Silently posts it with no sound. Don't notify posts nothing; the in-window card and the missed-call row still appear | in |
 | N6 | During a call | Segmented: "Banners only" / "Banners and sounds" / "Nothing" | Banners only | G | d | What message notifications do while I am in a call. Rings follow 07 §4 regardless | in |
