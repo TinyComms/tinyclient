@@ -211,6 +211,8 @@ pub enum Command {
     OpenSpace(String),
     /// Tell the network the conversation has been read up to this message.
     MarkRead { conversation_id: String, message_id: String },
+    /// Tell Discord several conversations are read, in one request. Other networks ignore it.
+    AckBulk { reads: Vec<(String, String)> },
     /// Send, with `client_id` as the network's nonce. Always answer through [`Context::sent`].
     Send {
         conversation_id: String,
@@ -800,6 +802,25 @@ impl Context {
     /// The row as stored, or `None` for a conversation never recorded.
     pub fn known(&self, conversation_id: &str) -> rusqlite::Result<Option<protocol::Conversation>> {
         self.hub.store().conversation(&self.key(conversation_id))
+    }
+
+    /// Remembers the newest message id the network named, without a preview. "Mark as read"
+    /// before history has loaded acks this id.
+    pub fn note_newest(&self, conversation_id: &str, message_id: &str) -> Stores {
+        self.hub.store().note_newest(&self.key(conversation_id), message_id)?;
+        Ok(())
+    }
+
+    /// Drops the cached messages and hides a direct or group conversation. The network is not
+    /// told. A newer live message brings the row back.
+    pub fn forget_conversation(&self, conversation_id: &str) -> Stores {
+        let conversation = self.key(conversation_id);
+        if self.hub.store().forget_conversation(&conversation)? {
+            self.hub.changed(Change::Messages { conversation: conversation.clone() });
+            self.hub.changed(Change::Conversation { conversation });
+            self.hub.changed(Change::Status);
+        }
+        Ok(())
     }
 
     // People.

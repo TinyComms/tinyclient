@@ -1234,10 +1234,23 @@ pub enum Request {
         limit: u32,
     },
     /// The user saw the conversation up to this message: the window is active, the conversation is
-    /// open and the message is on screen. Read here and on the network.
+    /// open and the message is on screen. Read here and on the network. An empty `message_id`
+    /// means the newest message chatd knows, for "mark as read" before any message is on screen.
     MarkRead {
         conversation: Key,
         message_id: String,
+    },
+    /// Every conversation with a badge is read, here and on the network. `network` limits it to
+    /// one; `None` is the whole Inbox. Message requests are read here only.
+    MarkAllRead {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        network: Option<Network>,
+    },
+    /// Drops this conversation's cached messages and its badge. A direct or group conversation
+    /// leaves the Inbox until a newer message arrives. The network is not asked to delete
+    /// anything.
+    Forget {
+        conversation: Key,
     },
     /// Answers at once with the message as `Pending`. `client_id` is made by the shell and comes
     /// back on the message; when the network accepts it the same row turns `Sent` under its real

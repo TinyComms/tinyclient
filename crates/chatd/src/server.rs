@@ -817,18 +817,92 @@ impl Chat {
         let marked = self.hub.store().mark_read(&conversation, &message_id);
         match marked {
             Ok(true) => {
+                let marker = self
+                    .hub
+                    .store()
+                    .conversation(&conversation)
+                    .ok()
+                    .flatten()
+                    .and_then(|row| row.last_read)
+                    .filter(|id| !id.is_empty())
+                    .unwrap_or(message_id);
                 let conversation_id = conversation.id.clone();
                 // P2: off, the chat is read here and the network is not told, which is what
                 // others would see as a receipt.
                 let account = conversation.account();
-                if self.hub.settings().receipts(&account) {
-                    self.command(&account, Command::MarkRead { conversation_id, message_id });
+                if self.hub.settings().receipts(&account) && !marker.is_empty() {
+                    self.command(&account, Command::MarkRead { conversation_id, message_id: marker });
                 }
                 self.hub.changed(Change::Conversation { conversation });
                 self.hub.changed(Change::Status);
                 Response::Ok
             }
             Ok(false) => Response::Ok,
+            Err(err) => internal(err),
+        }
+    }
+
+    /// Every badge goes. Discord hears one bulk ack per account; the other networks hear the
+    /// read they already know. A message request is read here and not announced.
+    fn mark_all_read(&self, network: Option<Network>) -> Response {
+        let marks = match self.hub.store().unread_marks(network) {
+            Ok(marks) => marks,
+            Err(err) => return internal(err),
+        };
+        let mut told: HashMap<AccountKey, Vec<(String, String)>> = HashMap::new();
+        let mut touched = Vec::new();
+        {
+            let mut store = self.hub.store();
+            for (key, message_id, request) in marks {
+                match store.mark_read(&key, &message_id) {
+                    Ok(true) => {
+                        let marker = store
+                            .conversation(&key)
+                            .ok()
+                            .flatten()
+                            .and_then(|row| row.last_read)
+                            .filter(|id| !id.is_empty())
+                            .unwrap_or(message_id);
+                        if !request && !marker.is_empty() {
+                            told.entry(key.account()).or_default().push((key.id.clone(), marker));
+                        }
+                        touched.push(key);
+                    }
+                    Ok(false) => {}
+                    Err(err) => return internal(err),
+                }
+            }
+        }
+        for (account, reads) in told {
+            if !self.hub.settings().receipts(&account) {
+                continue;
+            }
+            if account.network == Network::Discord {
+                for chunk in reads.chunks(50) {
+                    self.command(&account, Command::AckBulk { reads: chunk.to_vec() });
+                }
+            } else {
+                for (conversation_id, message_id) in reads {
+                    self.command(&account, Command::MarkRead { conversation_id, message_id });
+                }
+            }
+        }
+        for conversation in touched {
+            self.hub.changed(Change::Conversation { conversation });
+        }
+        self.hub.changed(Change::Status);
+        Response::Ok
+    }
+
+    fn forget_conversation(&self, conversation: Key) -> Response {
+        match self.hub.store().forget_conversation(&conversation) {
+            Ok(true) => {
+                self.hub.changed(Change::Messages { conversation: conversation.clone() });
+                self.hub.changed(Change::Conversation { conversation });
+                self.hub.changed(Change::Status);
+                Response::Ok
+            }
+            Ok(false) => error(ErrorCode::NotFound, "no such conversation"),
             Err(err) => internal(err),
         }
     }
@@ -1836,6 +1910,8 @@ impl Chat {
 
             Request::Messages { conversation, page, limit } => self.messages(conversation, page, limit),
             Request::MarkRead { conversation, message_id } => self.mark_read(conversation, message_id),
+            Request::MarkAllRead { network } => self.mark_all_read(network),
+            Request::Forget { conversation } => self.forget_conversation(conversation),
             Request::Send { conversation, client_id, text, reply_to, with } => {
                 let message = self.new_message(&conversation, client_id, text, reply_to.as_deref(), &with);
                 self.send(conversation, message, reply_to, with)
