@@ -685,6 +685,9 @@ fn fetch_icons(account: &Account, forum: Who, topics: &[tl::enums::ForumTopic]) 
             return;
         }
     };
+    // What is fetched is a picture, never the animated file: Telegram names the still
+    // thumbnails the icon document carries ("m" first). A document without one is only an
+    // icon when it is itself a still picture ("image/…"), else nothing can be drawn.
     let wants = icons.into_iter().filter_map(|(icon, topic_row)| {
         // The picture's row: the topic whose row hung it, so the list refreshes on its turn.
         let document = documents.iter().find(|document| match document {
@@ -694,6 +697,22 @@ fn fetch_icons(account: &Account, forum: Who, topics: &[tl::enums::ForumTopic]) 
         let tl::enums::Document::Document(document) = document else {
             return None;
         };
+        let still = document.thumbs.as_ref().and_then(|thumbs| {
+            thumbs.iter().find_map(|thumb| match thumb {
+                tl::enums::PhotoSize::Size(size) if size.r#type == "m" => Some(size.r#type.clone()),
+                _ => None,
+            }).or_else(|| thumbs.iter().find_map(|thumb| match thumb {
+                tl::enums::PhotoSize::Size(size) => Some(size.r#type.clone()),
+                _ => None,
+            }))
+        });
+        let mime = document.mime_type.as_str();
+        let thumb_size = match &still {
+            Some(still) => still.clone(),
+            None if mime.starts_with("image/") => String::new(),
+            // An animated icon files nothing a still list can draw: skip until it does.
+            None => return None,
+        };
         Some(Want {
             file: MediaFile::new(format!("e{}", icon), MediaKind::Emoji),
             dc: document.dc_id,
@@ -701,7 +720,7 @@ fn fetch_icons(account: &Account, forum: Who, topics: &[tl::enums::ForumTopic]) 
                 id: document.id,
                 access_hash: document.access_hash,
                 file_reference: document.file_reference.clone(),
-                thumb_size: String::new(),
+                thumb_size,
             }),
             inline: None,
             row: Some(topic_row),
