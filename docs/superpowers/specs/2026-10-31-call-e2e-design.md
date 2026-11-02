@@ -56,6 +56,10 @@ Layout:
 
 Appium is a dependency (`webdriverio`). The click path uses the accessibility name. Tests of the scenario use a fake `Host` and assert the step order and that the scenario passes the fixture directory and two data directories. They do not launch the GUI.
 
+## Desktops
+
+`npm run fleet` runs one command on each desktop. The Windows desktop is `ssh winbuild`, the Windows VM on Atomic Studio shared by Gunmetal and Tiny (console user `builder`, QXL, logged on). OpenSSH on that guest is session 0, so the Windows leg extracts the checkout over SSH and `e2e/scripts/desk.ps1` runs the command as an interactive scheduled task in the console session, where WinCore and `gdigrab` see the window. The Mac leg is one `ssh mbp`. The Linux leg is one `ssh tiny-linux`, the Ubuntu desktop VM on Atomic Studio (`tiny-linux`, bridged to the LAN, GNOME on Xorg, autologin). `atomicstudio` is the Unraid host that runs those guests, not a desktop itself. Each remote leg streams this checkout in. `e2e/scripts/desk.sh` installs the Mac or Linux Appium driver, and `desk.ps1` installs WinCore. Appium stays on `127.0.0.1` of that desktop. The artifact tar comes back on that same ssh stdout to `e2e/artifacts/<platform>/`.
+
 ## Pass rule
 
 A desktop run is green only when both clients joined, the remote PCM RMS shows the speech clip, the recorded frame is the share picture and not the camera picture, and `mp4` exists and is longer than one second. The same scenario file is what Windows, Linux, and macOS run.

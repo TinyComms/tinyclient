@@ -69,6 +69,20 @@ function timeoutMs(): number {
 
 export async function main(argv: string[] = process.argv): Promise<void> {
   const command = argv[2] ?? "all";
+  if (command === "fleet") {
+    const { runFleet } = await import("./fleet.js");
+    await runFleet(argv[3] ?? "all", {
+      platform: process.platform,
+      repoRoot: repoRoot(),
+      env: process.env,
+      runHere,
+    });
+    return;
+  }
+  await runHere(command);
+}
+
+export async function runHere(command: string): Promise<void> {
   if (command === "doctor") {
     const checks = await diagnose(process.env, fixtureDir());
     process.stdout.write(`${formatReport(checks)}\n`);
