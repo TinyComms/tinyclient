@@ -389,7 +389,8 @@ impl Shell {
                     .flex()
                     .items_center()
                     .gap(px(12.))
-                    .child(div().flex_1().min_w_0().whitespace_normal().type_code().text_color(theme::text()).child(paste.to_owned()))
+                    .overflow_hidden()
+                    .child(div().flex_1().min_w_0().truncate().type_code().text_color(theme::text()).child(paste.to_owned()))
                     .child(
                         button("tiny-code-copy", if copied { ButtonKind::Secondary } else { ButtonKind::Primary }, if copied { "Copied" } else { "Copy" }).on_click(cx.listener(move |this, _, _, cx| {
                             cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy.clone()));
