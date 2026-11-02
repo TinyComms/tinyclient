@@ -177,6 +177,22 @@ pub(super) fn apply(account: &Account, update: &Update) {
             let conversation = place(account, Who::of(&reacted.peer), reacted.top_msg_id);
             reactions(account, &conversation, reacted.msg_id, &reacted.reactions);
         }
+        // A draft typed (or cleared) on the phone while we are here, or ours echoed back.
+        Update::DraftMessage(drafted) => {
+            let who = Who::of(&drafted.peer);
+            let id = if account.dir().get(who).is_some_and(|known| known.forum) {
+                // The draft of a forum belongs to the topic it was typed in; none named is
+                // Telegram's naming of General.
+                thread_id(who, drafted.top_msg_id.unwrap_or(1))
+            } else {
+                who.text()
+            };
+            let text = match &drafted.draft {
+                tl::enums::DraftMessage::Message(draft) => draft.message.as_str(),
+                _ => "",
+            };
+            let _ = account.ctx.draft(&id, text);
+        }
         Update::NotifySettings(settings) => match &settings.peer {
             tl::enums::NotifyPeer::Peer(peer) => {
                 let who = Who::of(&peer.peer);

@@ -547,6 +547,7 @@ fn serve(account: &Arc<Account>, command: Command) {
             let _ = reply.send(delete(account, &conversation_id, &message_id).map_err(refused));
         }
         Command::Typing(conversation_id) => typing(account, &conversation_id),
+        Command::Draft { conversation_id, text } => save_draft(account, &conversation_id, &text),
         Command::SearchPeople(query) => {
             let request = tl::functions::contacts::Search { broadcasts: false, bots: false, q: query.clone(), limit: 25 };
             if let Ok(tl::enums::contacts::Found::Found(found)) = account.ask(&request) {
@@ -795,6 +796,35 @@ fn typing(account: &Account, conversation: &str) {
         };
         // Not `ask`: a typing signal is not worth waiting out a flood for.
         let _ = wire::call(account.wire.as_ref(), &request);
+    }
+}
+
+/// Keeps the cloud draft of this conversation on Telegram: the text as it stands here, or an
+/// empty one to clear it on the phone too. Telegram's own apps save a draft as their user
+/// types; the same draft arriving back is written nowhere, being what the store already says.
+/// Not `ask`: a draft is not worth waiting out a flood for.
+fn save_draft(account: &Account, conversation: &str, text: &str) {
+    let Some((who, topic)) = Who::parse(conversation) else {
+        return;
+    };
+    let Ok(peer) = account.input(who) else {
+        return;
+    };
+    let request = tl::functions::messages::SaveDraft {
+        no_webpage: false,
+        invert_media: false,
+        // In a forum the draft belongs to the topic it was typed in.
+        reply_to: reply_header(None, topic),
+        peer,
+        message: text.to_owned(),
+        entities: None,
+        media: None,
+        effect: None,
+        suggested_post: None,
+        rich_message: None,
+    };
+    if let Err(fault) = wire::call(account.wire.as_ref(), &request) {
+        tracing::warn!("chatd: Telegram: draft: {fault}");
     }
 }
 

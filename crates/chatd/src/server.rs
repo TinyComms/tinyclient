@@ -1864,11 +1864,22 @@ impl Chat {
                     }
                 }
             }
-            Request::SetDraft { conversation, text } => match self.hub.store().set_draft(&conversation, &text) {
-                Ok(true) => Response::Ok,
-                Ok(false) => error(ErrorCode::NotFound, "no such conversation"),
-                Err(err) => internal(err),
-            },
+            Request::SetDraft { conversation, text } => {
+                let answer = match self.hub.store().set_draft(&conversation, &text) {
+                    Ok(true) => Ok(()),
+                    Ok(false) => Err(error(ErrorCode::NotFound, "no such conversation")),
+                    Err(err) => Err(internal(err)),
+                };
+                // The account hears of the settled draft beside the store, so what the
+                // networks that keep one are told of it.
+                if answer.is_ok() && self.hub.link(&conversation.account()) == Link::Connected {
+                    self.command(&conversation.account(), Command::Draft { conversation_id: conversation.id.clone(), text });
+                }
+                match answer {
+                    Ok(()) => Response::Ok,
+                    Err(response) => response,
+                }
+            }
             Request::Spaces { network } => match self.hub.store().spaces(network) {
                 Ok(spaces) => {
                     let spaces = spaces.into_iter().filter(|space| self.shows(&space.key.account())).collect();

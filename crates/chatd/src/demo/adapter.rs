@@ -717,6 +717,7 @@ impl Demo {
             | Command::MarkRead { .. }
             | Command::AckBulk { .. }
             | Command::Typing(_)
+            | Command::Draft { .. }
             | Command::Watch(_)
             | Command::Wanted(_)
             | Command::Stop => {}

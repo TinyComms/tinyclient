@@ -264,6 +264,10 @@ pub enum Command {
     },
     /// The user's draft is changing. Pace it: at most one signal per 8 s per conversation.
     Typing(String),
+    /// A conversation's cloud draft here changed to `text` (empty clears it). The shell has
+    /// already waited out the pauses between the keys, so this is one settled draft and there
+    /// is nothing to answer.
+    Draft { conversation_id: String, text: String },
     /// What the shell has on screen changed. Subscribe to presence, typing and member ranges for
     /// exactly this, and drop what is no longer in it.
     Watch(Arc<Watching>),
@@ -679,6 +683,23 @@ impl Context {
         if self.hub.store().set_seen(&conversation, message_id)? {
             self.hub.changed(Change::Conversation { conversation });
         }
+        Ok(())
+    }
+
+    /// A cloud draft the network gives one conversation, replacing the row's: the text another
+    /// device left, or nothing, for one the other side cleared. Written only where it differs,
+    /// so the echo of a draft this client told costs nothing.
+    pub fn draft(&self, conversation_id: &str, text: &str) -> Stores {
+        let conversation = self.key(conversation_id);
+        let stored = self.hub.store().conversation(&conversation).ok().flatten();
+        let newer = stored.as_ref().is_some_and(|row| row.draft != text).then_some(text);
+        match newer {
+            Some(text) => self.hub.store().set_draft(&conversation, text)?,
+            None => return Ok(()),
+        };
+        self.hub.changed(Change::Conversation { conversation: conversation.clone() });
+        // A draft holds an otherwise idle row in the Inbox, as typing nothing does.
+        self.hub.changed(Change::Status);
         Ok(())
     }
 
