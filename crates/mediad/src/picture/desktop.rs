@@ -4,9 +4,10 @@
 
 use super::*;
 use openh264::decoder::{Decoder, DecoderConfig};
-use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate, Level, Profile, UsageType};
+use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate, FrameType, Level, Profile, RateControlMode, UsageType};
 use openh264::formats::YUVSource;
-use openh264::OpenH264API;
+use openh264::{OpenH264API, Timestamp};
+use openh264_sys2::{SBitrateInfo, ENCODER_OPTION_BITRATE, ENCODER_OPTION_FRAME_RATE, SPATIAL_LAYER_ALL};
 use std::io::Read;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
@@ -39,124 +40,166 @@ struct Coded {
     encoder: Encoder,
     width: u32,
     height: u32,
+    /// What the encoder holds now.
+    bps: u32,
+    fps: f32,
+    /// OpenH264 sets up on the first frame, and takes no options before that.
+    begun: bool,
 }
 
 impl Coded {
+    /// `bps` is also the most this encoder ever spends: [`Coded::tune`] only goes under it.
     fn open(width: u32, height: u32, bps: u32, screen: bool) -> Result<Coded, String> {
         let api = load_api()?;
         let config = EncoderConfig::new()
             .bitrate(BitRate::from_bps(bps))
-            .max_frame_rate(FrameRate::from_hz(15.0))
+            .rate_control_mode(RateControlMode::Bitrate)
+            .max_frame_rate(FrameRate::from_hz(FULL_FPS))
             .usage_type(if screen { UsageType::ScreenContentRealTime } else { UsageType::CameraVideoRealTime })
             .profile(Profile::Baseline)
             .level(Level::Level_3_1);
         let encoder = Encoder::with_api_config(api, config).map_err(|err| err.to_string())?;
-        Ok(Coded { encoder, width, height })
+        Ok(Coded { encoder, width, height, bps, fps: FULL_FPS, begun: false })
     }
 
-    fn encode(&mut self, planes: &Planes, key: bool) -> Result<Vec<u8>, String> {
-        if key {
+    /// The rate and frame rate asked for, if they moved and the encoder can take them.
+    fn tune(&mut self, ask: &Ask) {
+        if !self.begun {
+            return;
+        }
+        if ask.bps != self.bps && ask.bps > 0 {
+            let mut info = SBitrateInfo { iLayer: SPATIAL_LAYER_ALL, iBitrate: ask.bps as i32 };
+            // SAFETY: OpenH264 reads this option as an `SBitrateInfo`, which outlives the call,
+            // and copies it. The encoder set up on its first frame.
+            let refused = unsafe { self.encoder.raw_api().set_option(ENCODER_OPTION_BITRATE, (&raw mut info).cast()) };
+            if refused == 0 {
+                self.bps = ask.bps;
+            } else {
+                tracing::warn!("mediad: the encoder refused a bitrate of {}: {refused}", ask.bps);
+            }
+        }
+        if ask.fps != self.fps && ask.fps > 0. {
+            let mut fps = ask.fps;
+            // SAFETY: as above, with a float, which is what this option is read as.
+            let refused = unsafe { self.encoder.raw_api().set_option(ENCODER_OPTION_FRAME_RATE, (&raw mut fps).cast()) };
+            if refused == 0 {
+                self.fps = ask.fps;
+            }
+        }
+    }
+
+    fn encode(&mut self, planes: &Planes, ask: &Ask) -> Result<Encoded, String> {
+        self.tune(ask);
+        if ask.key && self.begun {
             self.encoder.force_intra_frame();
         }
-        let encoded = self.encoder.encode(planes).map_err(|err| err.to_string())?;
-        Ok(encoded.to_vec())
+        let stamp = Timestamp::from_millis(ask.at.as_millis() as u64);
+        let encoded = self.encoder.encode_at(planes, stamp).map_err(|err| err.to_string())?;
+        let key = matches!(encoded.frame_type(), FrameType::IDR | FrameType::I);
+        let bytes = encoded.to_vec();
+        self.begun = true;
+        Ok(Encoded { bytes, key })
     }
 }
 
-/// The encoders and the one decoder a call holds. Built on the first picture, not at join.
-pub struct Pictures {
+/// The encoder for one track at this size: the one it has, or a new one, which starts with a
+/// keyframe.
+fn coded(slot: &mut Option<Coded>, width: u32, height: u32, nominal: u32, screen: bool) -> Result<&mut Coded, String> {
+    if !slot.as_ref().is_some_and(|coded| coded.width == width && coded.height == height) {
+        *slot = Some(Coded::open(width, height, nominal, screen)?);
+    }
+    slot.as_mut().ok_or_else(|| "No encoder.".to_owned())
+}
+
+/// The encoders and the capture of what a call sends. Built on the first picture, not at join.
+#[derive(Default)]
+pub struct Outgoing {
     share: Option<Coded>,
     high: Option<Coded>,
     low: Option<Coded>,
-    decoder: Option<Decoder>,
     camera: Camera,
 }
 
-impl Default for Pictures {
-    fn default() -> Self {
-        Self { share: None, high: None, low: None, decoder: None, camera: Camera::default() }
-    }
-}
-
-impl Pictures {
-    /// One share frame, Annex B, or why the screen could not be read.
-    pub fn share(&mut self, key: bool) -> Result<Vec<u8>, String> {
-        // The download must not sit on the call thread, and a capture is wasted until it loads.
+impl Outgoing {
+    /// One share frame, or why the screen could not be read.
+    pub fn share(&mut self, ask: Ask) -> Result<Encoded, String> {
+        // A capture is wasted until the codec loads.
         if self.share.is_none() {
             load_api()?;
         }
         let grabbed = capture_screen()?;
         let (width, height) = fit(grabbed.width, grabbed.height, SHARE_MAX.0, SHARE_MAX.1);
         let planes = i420(&grabbed.pixels, grabbed.width, grabbed.height, width, height, grabbed.bgra);
-        let coded = match &mut self.share {
-            Some(coded) if coded.width == width && coded.height == height => coded,
-            slot => {
-                *slot = Some(Coded::open(width, height, SHARE_BPS, true)?);
-                slot.as_mut().unwrap()
-            }
-        };
-        coded.encode(&planes, key)
+        coded(&mut self.share, width, height, SHARE_BPS, true)?.encode(&planes, &ask)
     }
 
-    /// The camera's two layers, high then low, or why the camera could not be read.
-    pub fn camera(&mut self, key: bool) -> Result<(Vec<u8>, Vec<u8>), String> {
+    /// The camera's two layers, high then low, or why the camera could not be read. A layer with
+    /// no `Ask` is stopped: nothing is spent on it and it comes back empty.
+    pub fn camera(&mut self, high: Option<Ask>, low: Option<Ask>) -> Result<(Encoded, Encoded), String> {
         if self.high.is_none() || self.low.is_none() {
             load_api()?;
         }
         let grabbed = self.camera.frame()?;
-        let (hw, hh) = fit(grabbed.width, grabbed.height, CAMERA_HIGH.0, CAMERA_HIGH.1);
-        let (lw, lh) = fit(grabbed.width, grabbed.height, CAMERA_LOW.0, CAMERA_LOW.1);
-        let high = i420(&grabbed.pixels, grabbed.width, grabbed.height, hw, hh, grabbed.bgra);
-        let low = i420(&grabbed.pixels, grabbed.width, grabbed.height, lw, lh, grabbed.bgra);
-        let high_coded = match &mut self.high {
-            Some(coded) if coded.width == hw && coded.height == hh => coded,
-            slot => {
-                *slot = Some(Coded::open(hw, hh, CAMERA_HIGH_BPS, false)?);
-                slot.as_mut().unwrap()
+        let layer = |slot: &mut Option<Coded>, ask: Option<Ask>, most: (u32, u32), nominal: u32| match ask {
+            Some(ask) => {
+                let (width, height) = fit(grabbed.width, grabbed.height, most.0, most.1);
+                let planes = i420(&grabbed.pixels, grabbed.width, grabbed.height, width, height, grabbed.bgra);
+                coded(slot, width, height, nominal, false)?.encode(&planes, &ask)
             }
+            None => Ok(Encoded::default()),
         };
-        let high_bytes = high_coded.encode(&high, key)?;
-        let low_coded = match &mut self.low {
-            Some(coded) if coded.width == lw && coded.height == lh => coded,
-            slot => {
-                *slot = Some(Coded::open(lw, lh, CAMERA_LOW_BPS, false)?);
-                slot.as_mut().unwrap()
-            }
-        };
-        Ok((high_bytes, low_coded.encode(&low, key)?))
-    }
-
-    /// Drops a decoder whose sender changed, so the next frame starts from a keyframe.
-    pub fn reset_decoder(&mut self) {
-        self.decoder = None;
-    }
-
-    /// One received Annex B frame as a JPEG path, once it decodes.
-    pub fn decode(&mut self, annex_b: &[u8], generation: u64) -> Option<(PathBuf, u32, u32)> {
-        if self.decoder.is_none() {
-            let api = load_api().ok()?;
-            self.decoder = Decoder::with_api_config(api, DecoderConfig::new()).ok();
-        }
-        let decoder = self.decoder.as_mut()?;
-        let decoded = decoder.decode(annex_b).ok().flatten()?;
-        let (width, height) = decoded.dimensions();
-        if width == 0 || height == 0 {
-            return None;
-        }
-        let planes = Planes {
-            width,
-            height,
-            y: decoded.y().to_vec(),
-            u: decoded.u().to_vec(),
-            v: decoded.v().to_vec(),
-        };
-        let colors = rgb(&planes);
-        let path = write_jpeg(&colors, width as u32, height as u32, generation).ok()?;
-        Some((path, width as u32, height as u32))
+        let high = layer(&mut self.high, high, CAMERA_HIGH, CAMERA_HIGH_BPS)?;
+        let low = layer(&mut self.low, low, CAMERA_LOW, CAMERA_LOW_BPS)?;
+        Ok((high, low))
     }
 
     pub fn close_camera(&mut self) {
         self.camera.close();
+    }
+}
+
+/// The one decoder a call holds, and the picture it last painted.
+#[derive(Default)]
+pub struct Incoming {
+    decoder: Option<Decoder>,
+    canvas: Canvas,
+}
+
+impl Incoming {
+    /// Drops a decoder whose sender changed, so the next frame starts from a keyframe.
+    pub fn reset(&mut self) {
+        self.decoder = None;
+    }
+
+    /// Decodes one received Annex B frame, and paints it if `paint`. Every frame goes through the
+    /// decoder, painted or not: the next one is built on it. `Err` means it did not decode;
+    /// `Ok(None)` that there is nothing to paint.
+    #[allow(clippy::result_unit_err)]
+    pub fn decode(&mut self, annex_b: &[u8], paint: bool) -> Result<Option<Painted>, ()> {
+        if self.decoder.is_none() {
+            let api = load_api().map_err(|_| ())?;
+            self.decoder = Decoder::with_api_config(api, DecoderConfig::new()).ok();
+        }
+        let decoder = self.decoder.as_mut().ok_or(())?;
+        let Some(decoded) = decoder.decode(annex_b).map_err(|_| ())? else {
+            return Ok(None);
+        };
+        if !paint {
+            return Ok(None);
+        }
+        let (width, height) = decoded.dimensions();
+        if width == 0 || height == 0 {
+            return Ok(None);
+        }
+        let mut colors = vec![0u8; width * height * 3];
+        // This honours the decoder's strides, which are wider than the picture.
+        decoded.write_rgb8(&mut colors);
+        Ok(self.canvas.paint(&colors, width as u32, height as u32))
+    }
+
+    /// The file on disk goes.
+    pub fn forget(&mut self) {
+        self.canvas.forget();
     }
 }
 
@@ -165,18 +208,10 @@ pub fn probe_screen() -> Result<(), String> {
     capture_screen().map(|_| ())
 }
 
+#[derive(Default)]
 struct Camera {
     #[cfg(windows)]
     inner: Option<nokhwa::Camera>,
-}
-
-impl Default for Camera {
-    fn default() -> Self {
-        Self {
-            #[cfg(windows)]
-            inner: None,
-        }
-    }
 }
 
 impl Camera {
@@ -503,4 +538,46 @@ mod tests {
         assert!(!url.contains("github.com"), "{url}");
     }
 
+    /// A camera, or a screen, through real OpenH264: `cargo test -p mediad --lib -- --ignored`
+    /// on a machine that has the binary.
+    #[test]
+    #[ignore = "needs the OpenH264 binary, which is not in the tree"]
+    fn frames_survive_the_real_codec_in_bitrate_mode_and_the_rate_moves() {
+        let (width, height) = (640usize, 360usize);
+        let mut outgoing = Coded::open(width as u32, height as u32, CAMERA_HIGH_BPS, false).unwrap();
+        let mut incoming = Incoming::default();
+        let (mut key, mut bytes_high, mut bytes_low) = (false, 0usize, 0usize);
+        for n in 0..90usize {
+            // Noise that moves, so the encoder has to work for its bits.
+            let mut rgba = vec![0u8; width * height * 4];
+            for (at, pixel) in rgba.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                let value = ((at * 2654435761 + n * 40503) >> 7) as u8;
+                pixel.copy_from_slice(&[value, value / 2, 255 - value, 255]);
+            }
+            let planes = i420(&rgba, width as u32, height as u32, width as u32, height as u32, false);
+            let bps = if n < 45 { CAMERA_HIGH_BPS } else { CAMERA_LOW_BPS };
+            let ask = Ask { key: n == 30, bps, at: Duration::from_millis(n as u64 * 66), fps: FULL_FPS };
+            let encoded = outgoing.encode(&planes, &ask).unwrap();
+            if n == 0 || n == 30 {
+                assert!(encoded.key, "frame {n} was asked to be a keyframe");
+                key = true;
+            }
+            if n > 0 && n != 30 {
+                assert!(!encoded.key, "uiIntraPeriod 0 makes no keyframe of its own at {n}");
+            }
+            if (5..45).contains(&n) && n != 30 {
+                bytes_high += encoded.bytes.len();
+            }
+            if n >= 55 {
+                bytes_low += encoded.bytes.len();
+            }
+            if !encoded.bytes.is_empty() {
+                let painted = incoming.decode(&encoded.bytes, n == 0).expect("every frame decodes");
+                assert_eq!(painted.is_some(), n == 0, "only what was asked is painted, at frame {n}");
+            }
+        }
+        incoming.forget();
+        assert!(key);
+        assert!(bytes_low * 45 / 35 < bytes_high, "the rate moved: {bytes_high} then {bytes_low}");
+    }
 }

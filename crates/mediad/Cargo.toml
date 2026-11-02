@@ -56,6 +56,8 @@ image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
 # the first time a picture is encoded, and checked against the crate's known hashes. A phone
 # may not download code, so phones encode and decode through `platform` instead.
 openh264 = { version = "0.9.9", default-features = false, features = ["libloading"] }
+# Its option names: the wrapper sets a bitrate only when it opens. The version openh264 links.
+openh264-sys2 = { version = "=0.9.9", default-features = false, features = ["libloading"] }
 # The Cisco binary is bz2. Pure Rust, so the release image needs no libbz2.
 bzip2-rs = "0.1.2"
 # The download of that binary. native-tls is already linked.
@@ -81,6 +83,10 @@ windows-sys = { version = "0.61", features = ["Win32_Media", "Win32_System_Threa
 # The first camera, through Media Foundation. Pure Rust bindings. A machine with no camera
 # says so, and the call stays a voice call.
 nokhwa = { version = "0.10.10", default-features = false, features = ["input-native"] }
+
+[target.'cfg(unix)'.dependencies]
+# The priority of video's threads. Already in the tree through mio and cpal.
+libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # AVCaptureDevice's microphone authorization, which CoreAudio does not report.

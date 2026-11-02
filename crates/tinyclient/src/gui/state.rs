@@ -481,6 +481,7 @@ impl Shell {
                         snapshot.call = call.clone();
                         cx.notify();
                     }
+                    self.feed_follow(call.as_ref(), cx);
                 }
                 Change::Occupants { conversation, occupants } => self.occupants_changed(conversation, occupants, cx),
                 Change::Playback { playback } => self.playback_changed(playback.clone(), cx),

@@ -36,8 +36,8 @@ pub enum PictureKind {
     Share,
 }
 
-/// The picture on screen: a JPEG written by mediad. The path's name includes `generation`,
-/// because the window caches an image by its path.
+/// The picture on screen: a JPEG written by mediad, and removed once the next one is written.
+/// The window reads it into an image of its own (`gui/tiny/feed.rs`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CallPicture {
     pub path: String,
@@ -488,11 +488,20 @@ pub struct CallStats {
     /// Round trip, in milliseconds. 0 until measured.
     #[serde(default)]
     pub rtt_ms: u32,
+    /// How unevenly packets travel. On a Tiny call, our own path's.
     #[serde(default)]
     pub jitter_ms: u32,
-    /// Packets lost of every thousand received.
+    /// Of every thousand packets, those lost and not repaired. On a Tiny call, on our own path.
     #[serde(default)]
     pub loss_permille: u16,
+    /// Something flowed in the last second, so `jitter_ms` and `loss_permille` mean something.
+    /// While it did not they read 0, which says nothing about the link.
+    #[serde(default)]
+    pub link_measured: bool,
+    /// Of every thousand frames expected from the others, those that did not come, on anyone's
+    /// path. The jitter buffers count these, so a sender's own trouble is in here.
+    #[serde(default)]
+    pub voice_loss_permille: u16,
     #[serde(default)]
     pub send_kbps: u32,
     #[serde(default)]
@@ -522,6 +531,12 @@ pub struct CallStats {
     /// Lost frames from others rebuilt from the copy in the next packet (Opus in-band FEC).
     #[serde(default)]
     pub fec_recovered: u32,
+    /// Packets from others that came after their turn to play had gone.
+    #[serde(default)]
+    pub late_packets: u32,
+    /// Times someone's voice stalled in mid-speech and went on when its packet came.
+    #[serde(default)]
+    pub playout_gaps: u32,
 }
 
 /// What the user chose for a call's sound. Percentages, 0 to 100.

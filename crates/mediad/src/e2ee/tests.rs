@@ -109,6 +109,55 @@ fn three_members_share_one_code_and_hear_each_other() {
     assert_eq!(ada.open(CY, &back).as_deref(), Some(TONE));
 }
 
+/// A commit holds the lock the tick seals under. The tick is told at once and does not wait, the
+/// frame is not sent in the meantime, and when it goes it goes under the new epoch's key, which
+/// who stayed can open and who left cannot.
+#[test]
+fn a_frame_waits_out_a_commit_without_waiting_on_it_and_seals_under_the_new_epoch() {
+    use crate::session::Controls;
+    use std::sync::mpsc::channel;
+    use std::sync::Arc;
+
+    let (server, mut ada, mut bea, mut cy) = three();
+    let remove = [server.remove_message(2, group_id(ROOM), 2)];
+    proposals(&mut ada, &remove, 2);
+    let commit = bytes(&proposals(&mut bea, &remove, 2), "data");
+    deliver(&mut bea, "commit", 2, &commit);
+    let controls = Arc::new(Controls::default());
+    *controls.tiny_e2ee.lock().unwrap() = ada;
+
+    let (held, holding) = channel();
+    let (done, finish) = channel::<()>();
+    let mls = controls.clone();
+    let applying = std::thread::spawn(move || {
+        mls.e2ee(|e2ee| {
+            held.send(()).unwrap();
+            finish.recv().unwrap();
+            e2ee.frame(&json!({"type": "call.e2ee", "op": "commit", "epoch": 2, "data": b64(&commit)}).to_string());
+        });
+    });
+    holding.recv().unwrap();
+    assert!(controls.try_e2ee(|e2ee| e2ee.seal(TONE)).is_none(), "the tick is not kept waiting");
+    done.send(()).unwrap();
+    applying.join().unwrap();
+
+    let sealed = controls.try_e2ee(|e2ee| e2ee.seal(TONE)).flatten().expect("sealed once the commit is in");
+    assert!(!sealed.windows(TONE.len()).any(|window| window == TONE), "never in clear");
+    assert_eq!(controls.tiny_e2ee.lock().unwrap().security().epoch, 3);
+    assert_eq!(bea.open(ADA, &sealed).as_deref(), Some(TONE));
+    assert_eq!(cy.open(ADA, &sealed), None, "who left has no key for it");
+}
+
+#[test]
+fn with_no_keys_a_frame_that_does_not_wait_is_still_held_back() {
+    use crate::session::Controls;
+
+    let controls = Controls::default();
+    *controls.tiny_e2ee.lock().unwrap() = app(ADA);
+    assert_eq!(controls.try_e2ee(|e2ee| e2ee.seal(TONE)), Some(None), "waiting for the server: nothing goes in clear");
+    assert_eq!(controls.try_e2ee(|e2ee| e2ee.open(BEA, TONE)), Some(None));
+}
+
 #[test]
 fn members_and_their_safety_numbers_are_listed_by_who_the_roster_says_they_are() {
     let (_, mut ada, mut bea, _) = three();
@@ -452,3 +501,25 @@ fn what_is_told_is_told_once() {
     assert_eq!(e2ee.changed().map(|s| s.mode), Some(SecurityMode::Transport));
 }
 
+/// A panic while the lock was held (`seal_video` on the capture thread) leaves encryption in an
+/// unknown state. The tick ends the call and says so. `fail` ends the process, so this happens
+/// in a copy of this test run on its own.
+#[test]
+fn a_poisoned_lock_fails_the_call_in_words() {
+    const ALONE: &str = "MEDIAD_TEST_POISON";
+    if std::env::var_os(ALONE).is_some() {
+        let controls = std::sync::Arc::new(crate::session::Controls::default());
+        let holder = controls.clone();
+        let _ = std::thread::spawn(move || {
+            let _held = holder.tiny_e2ee.lock().unwrap();
+            panic!("seal_video");
+        })
+        .join();
+        let _ = controls.try_e2ee(|e2ee| e2ee.seal(TONE));
+        return;
+    }
+    let test = "e2ee::tests::a_poisoned_lock_fails_the_call_in_words";
+    let alone = std::process::Command::new(std::env::current_exe().unwrap()).args([test, "--exact"]).env(ALONE, "1").output().unwrap();
+    assert_eq!(alone.status.code(), Some(2), "{alone:?}");
+    assert!(String::from_utf8_lossy(&alone.stdout).contains(BROKEN), "{alone:?}");
+}

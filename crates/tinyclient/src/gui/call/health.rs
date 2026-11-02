@@ -7,12 +7,17 @@
 //! takes what each grew by since the poll before, so a hint speaks of the last second and goes
 //! when the trouble does. A field is `None` only when nothing was polled.
 //!
+//! One second says little: a single lost packet is 2 % of it. [`Steady`] is the same numbers over
+//! several seconds, and a grade that takes its time to change, so the bars move when the call
+//! does.
+//!
 //! Also here, because it is the same kind of judgement: whether I seem to be talking while
 //! muted ([`MutedTalk`]).
 
 use crate::gui::theme;
 use gpui::{div, prelude::*, px, Div, Rgba};
 use protocol::{CallPath, CallStats};
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 /// The link and the sound, as far as `CallStats` says. `None` is "not measured", never zero.
@@ -31,11 +36,14 @@ pub(in crate::gui) struct Health {
     pub concealed_permille: Option<u16>,
     /// Lost audio recovered by forward error correction, per thousand frames.
     pub fec_permille: Option<u16>,
+    /// The grade as [`Steady`] holds it, over what one reading says.
+    pub steady: Option<Grade>,
 }
 
 impl Health {
     /// What one poll says, its audio counters taken as grown from nothing: the first poll of a
     /// call, or where only the link is wanted.
+    #[cfg(test)]
     pub fn from_stats(stats: &CallStats) -> Health {
         Health::from_polls(None, stats)
     }
@@ -52,12 +60,12 @@ impl Health {
         };
         let overruns = grew(|s| s.capture_overruns).saturating_add(grew(|s| s.capture_gaps));
         let underruns = grew(|s| s.playout_underruns);
-        // The window's lost frames were each either rebuilt (FEC) or made up: `loss_permille`
+        // The window's lost frames were each either rebuilt (FEC) or made up: the voices' loss
         // is shared out between the two as they grew.
         let (concealed, recovered) = (grew(|s| s.concealed_frames), grew(|s| s.fec_recovered));
         let share = |part: u32| {
             let lost = u64::from(concealed) + u64::from(recovered);
-            (u64::from(now.loss_permille) * u64::from(part)).checked_div(lost).map_or(0, |n| n.min(1000) as u16)
+            (u64::from(now.voice_loss_permille) * u64::from(part)).checked_div(lost).map_or(0, |n| n.min(1000) as u16)
         };
         Health {
             rtt_ms: measured(now.rtt_ms),
@@ -68,19 +76,29 @@ impl Health {
             underruns: Some(underruns),
             concealed_permille: Some(share(concealed)),
             fec_permille: Some(share(recovered)),
+            steady: None,
         }
     }
 
     pub fn grade(&self) -> Grade {
+        self.steady.unwrap_or_else(|| self.reading())
+    }
+
+    /// What these numbers mean to someone listening. Opus with in-band FEC hides a percent of
+    /// loss completely and three with little to notice; past six, words go. The round trip is to
+    /// the server: speech takes about half of it each way, and talking over each other starts
+    /// when that nears 300 ms end to end. The jitter buffer holds about three times the jitter,
+    /// so 60 ms of it is the buffer's whole 200 ms.
+    fn reading(&self) -> Grade {
         let (Some(rtt), Some(loss)) = (self.rtt_ms, self.loss_permille) else {
             return Grade::Unknown;
         };
         let jitter = self.jitter_ms.unwrap_or(0);
-        if rtt > 250 || loss > 50 || jitter > 60 {
+        if rtt > 300 || loss > 60 || jitter > 60 {
             Grade::Poor
-        } else if rtt > 120 || loss > 15 || jitter > 30 {
+        } else if rtt > 200 || loss > 30 || jitter > 30 {
             Grade::Fair
-        } else if rtt > 60 || loss > 5 || jitter > 15 {
+        } else if rtt > 100 || loss > 10 || jitter > 15 {
             Grade::Good
         } else {
             Grade::Great
@@ -100,11 +118,11 @@ impl Health {
             say(Level::Bad, "Your speaker is running dry, so voices break up. Try another speaker or headset.".to_owned());
         }
         match self.loss_permille {
-            Some(loss) if loss > 50 => say(
+            Some(loss) if loss > 60 => say(
                 Level::Bad,
                 format!("Your connection is losing {} of the audio. Move closer to Wi-Fi, or use a cable.", percent(loss)),
             ),
-            Some(loss) if loss > 15 => say(Level::Warn, format!("Some audio is lost on the way ({}). Others may hear you cut out.", percent(loss))),
+            Some(loss) if loss > 30 => say(Level::Warn, format!("Some audio is lost on the way ({}). Others may hear you cut out.", percent(loss))),
             _ => {}
         }
         if self.concealed_permille.is_some_and(|n| n > 30) {
@@ -128,6 +146,80 @@ impl Health {
             out.push(Hint { level: Level::Good, words: "Your connection is good.".to_owned() });
         }
         out
+    }
+}
+
+/// Seconds of measured loss the grade looks at. Silent seconds are not among them.
+const LOSS_WINDOW: usize = 8;
+/// How much of each new round trip and jitter reading is taken in: about five seconds' memory.
+const SMOOTHING: f32 = 0.2;
+/// How long the numbers must say worse before the bars do.
+const WORSE_AFTER: Duration = Duration::from_secs(3);
+/// And better: a call that went bad has to prove itself for longer.
+const BETTER_AFTER: Duration = Duration::from_secs(10);
+
+/// The link over the last several seconds, fed each poll, and the grade it has earned. While
+/// nothing flows nothing is known about loss or jitter, so they and the grade stay as they were.
+#[derive(Debug, Default)]
+pub(in crate::gui) struct Steady {
+    rtt: Option<f32>,
+    jitter: Option<f32>,
+    /// Per mille, one reading for each measured second, newest last.
+    loss: VecDeque<u16>,
+    grade: Option<Grade>,
+    /// What the numbers have been saying instead of `grade`, and since when.
+    leaning: Option<(Grade, Instant)>,
+}
+
+impl Steady {
+    /// One poll, read `now`.
+    pub fn feed(&mut self, stats: &CallStats, now: Instant) {
+        let smooth = |was: Option<f32>, reading: u32| Some(was.map_or(reading as f32, |was| was + (reading as f32 - was) * SMOOTHING));
+        if stats.rtt_ms > 0 {
+            self.rtt = smooth(self.rtt, stats.rtt_ms);
+        }
+        if stats.link_measured {
+            self.jitter = smooth(self.jitter, stats.jitter_ms);
+            self.loss.push_back(stats.loss_permille);
+            if self.loss.len() > LOSS_WINDOW {
+                self.loss.pop_front();
+            }
+        }
+        let wanted = self.applied(Health { rtt_ms: self.rtt.map(|_| 0), loss_permille: Some(0), ..Health::default() }).reading();
+        self.settle(wanted, now);
+    }
+
+    /// Moves the grade toward `wanted`, once it has been wanted for long enough.
+    fn settle(&mut self, wanted: Grade, now: Instant) {
+        let Some(held) = self.grade else {
+            self.grade = (wanted != Grade::Unknown).then_some(wanted);
+            return;
+        };
+        if wanted == held || wanted == Grade::Unknown {
+            self.leaning = None;
+            return;
+        }
+        let worse = |grade: Grade| grade.bars() < held.bars();
+        let since = self.leaning.filter(|(was, _)| worse(*was) == worse(wanted)).map_or(now, |(_, since)| since);
+        if now.saturating_duration_since(since) >= if worse(wanted) { WORSE_AFTER } else { BETTER_AFTER } {
+            self.grade = Some(wanted);
+            self.leaning = None;
+        } else {
+            self.leaning = Some((wanted, since));
+        }
+    }
+
+    /// `health` with the steady numbers and grade in place of one reading's.
+    pub fn applied(&self, health: Health) -> Health {
+        let round = |value: f32| value.round() as u32;
+        let mean = (!self.loss.is_empty()).then(|| (self.loss.iter().map(|&n| u32::from(n)).sum::<u32>() / self.loss.len() as u32) as u16);
+        Health {
+            rtt_ms: health.rtt_ms.map(|ms| self.rtt.map_or(ms, round)),
+            jitter_ms: self.jitter.map(round).or(health.jitter_ms),
+            loss_permille: mean.or(health.loss_permille),
+            steady: self.grade,
+            ..health
+        }
     }
 }
 
@@ -278,8 +370,10 @@ mod tests {
         assert_eq!(Health::default().grade(), Grade::Unknown);
         assert_eq!(link(0, 0, 0).grade(), Grade::Unknown, "nothing measured is not a perfect link");
         assert_eq!(link(38, 0, 4).grade(), Grade::Great);
-        assert_eq!(link(80, 0, 4).grade(), Grade::Good);
-        assert_eq!(link(38, 20, 4).grade(), Grade::Fair);
+        assert_eq!(link(80, 0, 4).grade(), Grade::Great);
+        assert_eq!(link(150, 0, 4).grade(), Grade::Good);
+        assert_eq!(link(38, 20, 4).grade(), Grade::Good, "one packet in fifty is not a Fair call");
+        assert_eq!(link(38, 40, 4).grade(), Grade::Fair);
         assert_eq!(link(38, 0, 45).grade(), Grade::Fair);
         assert_eq!(link(400, 0, 4).grade(), Grade::Poor);
         assert_eq!(link(38, 80, 4).grade(), Grade::Poor);
@@ -323,9 +417,9 @@ mod tests {
 
     #[test]
     fn the_audio_counters_speak_of_the_last_second_not_the_whole_call() {
-        let poll = |overruns, gaps, underruns, concealed, recovered, loss_permille| CallStats {
+        let poll = |overruns, gaps, underruns, concealed, recovered, voice_loss_permille| CallStats {
             rtt_ms: 40,
-            loss_permille,
+            voice_loss_permille,
             capture_overruns: overruns,
             capture_gaps: gaps,
             playout_underruns: underruns,
@@ -351,6 +445,99 @@ mod tests {
         // mediad reconnected and counts from nothing again.
         let again = Health::from_polls(Some(&first), &poll(1, 0, 0, 0, 0, 0));
         assert_eq!(again.overruns, Some(1));
+    }
+
+    /// Feeds `readings` a second apart from `start`, and gives the grade after each.
+    fn graded(steady: &mut Steady, start: Instant, readings: &[CallStats]) -> Vec<Grade> {
+        readings
+            .iter()
+            .enumerate()
+            .map(|(n, stats)| {
+                steady.feed(stats, start + Duration::from_secs(n as u64));
+                steady.applied(Health::from_stats(stats)).grade()
+            })
+            .collect()
+    }
+
+    fn second(rtt_ms: u32, loss_permille: u16, jitter_ms: u32) -> CallStats {
+        CallStats { rtt_ms, loss_permille, jitter_ms, link_measured: true, ..CallStats::default() }
+    }
+
+    #[test]
+    fn a_packet_lost_now_and_then_does_not_move_the_bars() {
+        // One packet of fifty is 20 per mille, and three in one bad second is 60: the old grade
+        // read those as Fair and Poor, then back, second by second.
+        let lost = |n: usize| match n % 16 {
+            3 => 20,
+            11 => 60,
+            _ => 0,
+        };
+        let readings: Vec<CallStats> = (0..64).map(|n| second(40, lost(n), 4)).collect();
+        let grades = graded(&mut Steady::default(), Instant::now(), &readings);
+        assert!(grades.iter().all(|grade| *grade == Grade::Great), "{grades:?}");
+    }
+
+    #[test]
+    fn a_bad_link_shows_in_seconds_and_takes_ten_to_be_forgiven() {
+        let start = Instant::now();
+        let mut steady = Steady::default();
+        graded(&mut steady, start, &vec![second(40, 0, 4); 10]);
+        let later = start + Duration::from_secs(10);
+        let grades = graded(&mut steady, later, &vec![second(40, 200, 4); 6]);
+        let first = grades.iter().position(|grade| *grade != Grade::Great).unwrap();
+        assert!((2..=5).contains(&first), "{grades:?}");
+        assert_eq!(grades[5], Grade::Poor, "{grades:?}");
+        // Clean again. The window has to clear, and then the grade waits ten seconds.
+        let later = later + Duration::from_secs(6);
+        let grades = graded(&mut steady, later, &vec![second(40, 0, 4); 30]);
+        assert!(grades[..14].iter().all(|grade| grade.bars() <= Grade::Fair.bars()), "{grades:?}");
+        assert_eq!(grades[29], Grade::Great, "{grades:?}");
+        let changes = grades.windows(2).filter(|pair| pair[0] != pair[1]).count();
+        assert!(changes <= 3, "{grades:?}");
+    }
+
+    #[test]
+    fn numbers_that_wander_over_a_line_do_not_flap_the_grade() {
+        let readings: Vec<CallStats> = (0..120).map(|n| second(if n % 6 < 3 { 90 } else { 115 }, 0, 4)).collect();
+        let grades = graded(&mut Steady::default(), Instant::now(), &readings);
+        let changes = grades.windows(2).filter(|pair| pair[0] != pair[1]).count();
+        assert!(changes <= 1, "{grades:?}");
+    }
+
+    #[test]
+    fn silence_keeps_the_last_grade_and_its_numbers() {
+        let start = Instant::now();
+        let mut steady = Steady::default();
+        graded(&mut steady, start, &vec![second(40, 100, 4); 8]);
+        assert_eq!(steady.applied(Health::default()).steady, Some(Grade::Poor));
+        // Nobody talks: mediad says 0, and says it measured nothing.
+        let quiet = CallStats { rtt_ms: 40, ..CallStats::default() };
+        let later = start + Duration::from_secs(8);
+        let grades = graded(&mut steady, later, &vec![quiet.clone(); 60]);
+        assert!(grades.iter().all(|grade| *grade == Grade::Poor), "{grades:?}");
+        assert_eq!(steady.applied(Health::from_stats(&quiet)).loss_permille, Some(100));
+    }
+
+    #[test]
+    fn a_round_trip_spike_is_smoothed_out_of_the_number_shown() {
+        let start = Instant::now();
+        let mut steady = Steady::default();
+        graded(&mut steady, start, &vec![second(40, 0, 4); 10]);
+        let spike = second(400, 0, 4);
+        graded(&mut steady, start + Duration::from_secs(10), &[spike.clone()]);
+        let shown = steady.applied(Health::from_stats(&spike)).rtt_ms.unwrap();
+        assert!((60..=130).contains(&shown), "{shown}");
+        assert_eq!(steady.applied(Health::default()).rtt_ms, None, "no reading, no number");
+    }
+
+    #[test]
+    fn a_call_with_nobody_talking_yet_is_graded_by_its_round_trip() {
+        let mut steady = Steady::default();
+        steady.feed(&CallStats { rtt_ms: 40, ..CallStats::default() }, Instant::now());
+        assert_eq!(steady.applied(Health::default()).steady, Some(Grade::Great));
+        let mut steady = Steady::default();
+        steady.feed(&CallStats::default(), Instant::now());
+        assert_eq!(steady.applied(Health::default()).grade(), Grade::Unknown);
     }
 
     #[test]

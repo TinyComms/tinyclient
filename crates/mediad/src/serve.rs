@@ -4,7 +4,7 @@
 use crate::session::{self, Controls};
 use crate::{audio, out, permission, picture, tiny};
 use protocol::{
-    media_process_needed, read_frame, Content, Direction, MediaRequest, MediaResponse, SecurityMode, VideoStream,
+    media_process_needed, read_frame, CallFailure, Content, Direction, MediaRequest, MediaResponse, SecurityMode, VideoStream,
     DEVICES_LIMIT,
 };
 use std::io::{self, ErrorKind};
@@ -21,6 +21,7 @@ const DEVICES_EVERY: Duration = Duration::from_secs(2);
 
 const NO_VIDEO: &str = "Screen sharing and video are not built yet. This call carries voice only.";
 const ENGINE: &str = "The call engine could not start. Try again.";
+const ENGINE_STOPPED: &str = "The call engine stopped. Try joining again.";
 const NOT_YET: &str = "The call isn't connected yet, so there's nothing to measure.";
 /// Once, when the server turns a call's end-to-end encryption off and the call is blocked.
 const BLOCKED_NOTICE: &str = "The server turned this call's encryption off. Nothing is sent or played. Open the call's security panel to leave or decide.";
@@ -214,7 +215,7 @@ impl Call {
                 self.video = Video::default();
                 let (controls, user_id) = (self.controls.clone(), self.tiny.clone().unwrap_or_default());
                 let spawned = out::spawn(std::thread::Builder::new().name("tiny".to_owned()), move || {
-                    tiny::run(link, user_id, controls);
+                    out::or_fail(CallFailure::Engine, ENGINE_STOPPED, || tiny::run(link, user_id, controls));
                     tracing::warn!("mediad: call over, exiting");
                     out::exit(0);
                 });

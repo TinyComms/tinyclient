@@ -25,6 +25,8 @@
 //! user chose for that person, ducked under a priority speaker (`hear`); the encoder runs at the
 //! room's bitrate; and str0m's statistics, once a second, give the round trip and the path for
 //! `Stats`.
+//!
+//! A path that dies is noticed from what comes back, not from voice: see [`SILENT`].
 
 use crate::audio::{level, Audio};
 use crate::cue::Playing;
@@ -33,23 +35,24 @@ use crate::hear::{Ear, Limiter};
 use crate::media::{self, announce, finish_cue, listen, mixdown, Devices, Gate, Send, Stream, MICROPHONE_DENIED};
 use crate::opus::Encoder;
 use crate::permission::{microphone, Microphone};
-use crate::picture::Pictures;
 use crate::process::Processor;
 use crate::rtp::SILENCE;
 use crate::session::Controls;
 use crate::stats::Meter;
+use crate::video::{self, Rates, Received, Track, Video, Wants, Word};
 use crate::{out, rt, FRAME, FRAME_SAMPLES};
 use mio::net::{TcpStream, UdpSocket};
 use mio::{Events, Interest, Poll, Token};
-use protocol::{CallFailure, CallPath, Cue, MediaResponse, PictureKind, TinyOffer, TinyPicture, TinySlot};
-use std::collections::{HashMap, VecDeque};
+use protocol::{CallFailure, CallPath, Cue, MediaResponse, TinyOffer, TinyPicture, TinySlot};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, ErrorKind};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use str0m::bwe::{Bitrate, BweKind};
 use str0m::change::{SdpAnswer, SdpPendingOffer};
-use str0m::media::{Direction, Frequency, KeyframeRequestKind, MediaKind, MediaTime, Mid, Rid, Simulcast, SimulcastLayer};
+use str0m::media::{Direction, Frequency, KeyframeRequestKind, MediaData, MediaKind, MediaTime, Mid, Rid, Simulcast, SimulcastLayer};
 use str0m::net::{Protocol, Receive, TcpType};
 use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcConfig};
 
@@ -62,18 +65,58 @@ const H264_PROFILE: u32 = 0x42e01f;
 const H264_PT: u8 = 108;
 const H264_RTX_PT: u8 = 109;
 
+/// The bandwidth estimate a connection starts from, until the server's feedback says better.
+const START_BPS: u64 = 1_000_000;
+/// The most between STUN checks, and so how often a working path is checked, even in silence.
+/// str0m's 3 s, with its 9 tries, takes up to 21 s to call a path dead.
+const STUN_MAX_RTO: Duration = Duration::from_secs(1);
+/// Unanswered checks before a path is dead. About 7 s on a path that was working and 6 s on one
+/// that never was: [`SILENT`] speaks first on the one, and this bounds a new link on the other,
+/// with room for a slow first connect (TCP included) and for a lossy network's run of bad luck.
+const STUN_RETRANSMITS: usize = 7;
+/// A link that was up and has answered no STUN check for this long is lost, though ICE has not
+/// said so yet. Voice cannot say: a quiet room sends none, and the gate sends nothing between
+/// words. Nor can the server's RTCP, which goes on arriving on a path that only died our way.
+/// STUN can: the server, ICE-lite, sends it only to answer us, each [`STUN_MAX_RTO`] in any room,
+/// and by now several checks, retries included, have gone unanswered.
+const SILENT: Duration = Duration::from_secs(3);
+
 /// Opus for audio, H.264 for video, and no hold for a missing audio packet. str0m's default
 /// waits for 15 later packets or a second, and the talk spurt has already ended by then.
-/// Video keeps its own hold.
+/// Video keeps its own hold. Bandwidth estimation from the server's TWCC feedback is what turns
+/// on str0m's pacer: a keyframe leaves spread out, and audio, which it does not pace, goes
+/// around it. It looks for more bandwidth only once there is video to spend it on.
 fn rtc_config() -> RtcConfig {
     let mut config = RtcConfig::new()
         .clear_codecs()
         .enable_opus(true, false)
         .set_stats_interval(Some(Duration::from_secs(1)))
+        .enable_bwe(Some(Bitrate::bps(START_BPS)))
         .set_reordering_size_audio(0)
         .set_reordering_timeout_audio(Some(Duration::from_millis(40)));
     config.codec_config().add_h264(H264_PT.into(), Some(H264_RTX_PT.into()), true, H264_PROFILE);
+    config.set_max_stun_rto(STUN_MAX_RTO);
+    config.set_max_stun_retransmits(STUN_RETRANSMITS);
     config
+}
+
+/// Padding on an RTX stream. str0m keeps 50 kb/s or more of it going on any line that has RTX,
+/// inactive or not, once any media flows, with no way to turn it off, so a call sending no video
+/// has to throw it away here (see [`Call::transmit`]). Only RTP is ever this byte: RTCP's types
+/// start at 192 and STUN and DTLS leave the top two bits clear.
+fn is_padding(packet: &[u8]) -> bool {
+    matches!(packet, [first, second, ..] if first >> 6 == 2 && second & 0x7f == H264_RTX_PT)
+}
+
+/// What str0m's `egress_loss_fraction` looks back over, by when packets were sent.
+const EGRESS_LOSS_SPAN: Duration = Duration::from_secs(1);
+
+/// What TWCC says the server missed of what we sent, when that can be believed. str0m numbers
+/// padding for feedback before [`Call::transmit`] throws it away, so anything sent within the
+/// span of a dropped packet reads as lost, on a clean path about half of it, and for a second
+/// after video starts as well. The microphone's receiver reports stand in until then.
+fn egress_loss(fraction: Option<f32>, dropped: Option<Instant>, now: Instant) -> Option<f32> {
+    fraction.filter(|_| dropped.is_none_or(|at| now.saturating_duration_since(at) > EGRESS_LOSS_SPAN))
 }
 
 /// The jitter buffer's sequence for an RTP timestamp at 48 kHz. One 20 ms frame is 960.
@@ -175,17 +218,31 @@ impl Offer {
             rtc.add_local_candidate(candidate(Candidate::builder().tcp().host(local).tcptype(TcpType::Active).build())?);
             local_tcp = Some(local);
         }
-        let mut change = rtc.sdp_api();
-        let microphone = change.add_media(MediaKind::Audio, Direction::SendOnly, None, None, None);
-        for _ in 0..spec.slots {
-            change.add_media(MediaKind::Audio, Direction::RecvOnly, None, None, None);
-        }
-        let mut layers = Simulcast::new();
-        layers.add_send_layer(SimulcastLayer::new("h"));
-        layers.add_send_layer(SimulcastLayer::new("l"));
-        let camera = change.add_media(MediaKind::Video, Direction::Inactive, None, None, Some(layers));
-        let share = change.add_media(MediaKind::Video, Direction::Inactive, None, None, None);
-        let screen = change.add_media(MediaKind::Video, Direction::RecvOnly, None, None, None);
+        // str0m checks a new mid against the session's, not the others in this change. So many
+        // random mids of three characters collide about once in 2,000 offers, and two m-lines on
+        // one mid break the next offer. An unapplied change leaves `rtc` as it was.
+        let (change, microphone, camera, share, screen) = loop {
+            let mut change = rtc.sdp_api();
+            let mut mids = HashSet::new();
+            let mut add = |direction, kind, layers| {
+                let mid = change.add_media(kind, direction, None, None, layers);
+                mids.insert(mid);
+                mid
+            };
+            let microphone = add(Direction::SendOnly, MediaKind::Audio, None);
+            for _ in 0..spec.slots {
+                add(Direction::RecvOnly, MediaKind::Audio, None);
+            }
+            let mut layers = Simulcast::new();
+            layers.add_send_layer(SimulcastLayer::new("h"));
+            layers.add_send_layer(SimulcastLayer::new("l"));
+            let camera = add(Direction::Inactive, MediaKind::Video, Some(layers));
+            let share = add(Direction::Inactive, MediaKind::Video, None);
+            let screen = add(Direction::RecvOnly, MediaKind::Video, None);
+            if mids.len() == spec.slots as usize + 4 {
+                break (change, microphone, camera, share, screen);
+            }
+        };
         let (offer, pending) = change.apply().ok_or_else(|| io::Error::other("nothing to offer"))?;
         let link = Link {
             rtc,
@@ -336,6 +393,51 @@ pub fn remap(held: &mut HashMap<String, String>, map: &[TinySlot]) -> (Vec<Strin
     (reset, freed)
 }
 
+/// What the call's loop does next.
+#[derive(Debug, PartialEq)]
+enum Next {
+    Tick,
+    Packet,
+    Wait,
+}
+
+/// A tick that is due goes first, whatever has queued up: a flood of packets may delay a packet,
+/// and may not delay the microphone or the speakers.
+fn next_step(now: Instant, tick_at: Instant, packets: bool) -> Next {
+    if now >= tick_at {
+        Next::Tick
+    } else if packets {
+        Next::Packet
+    } else {
+        Next::Wait
+    }
+}
+
+/// When the tick after the one due at `tick_at` runs. The machine slept or stalled: the missed
+/// ticks are not replayed.
+fn after(tick_at: Instant, now: Instant) -> Instant {
+    let next = tick_at + TICK;
+    if now > next + 5 * TICK {
+        now + TICK
+    } else {
+        next
+    }
+}
+
+/// Voice frames held at most while the encryption is busy, each way: half a second of one
+/// voice. Past it the oldest is dropped, as a frame with no keys is.
+const HELD: usize = 25;
+/// The same half second of a full room's voices, on their way in.
+const HELD_IN: usize = HELD * 12;
+
+/// A frame of ours waiting its turn at the encryption.
+struct Unsealed {
+    opus: Vec<u8>,
+    tick: u64,
+    level: i8,
+    voice: bool,
+}
+
 /// One receive slot: whose voice it carries, and that voice on its way to the mix.
 struct Slot {
     user: String,
@@ -349,6 +451,10 @@ struct Call {
     poll: Poll,
     next_token: usize,
     packets: VecDeque<Packet>,
+    /// Voice the encryption could not take yet, in order. An MLS commit holds it for a moment,
+    /// and the tick does not wait for that: these go first thing on the next turn of the loop.
+    unsealed: VecDeque<Unsealed>,
+    unopened: VecDeque<MediaData>,
     /// Media flows on this link.
     connected: bool,
     /// This drop was already told to chatd. Cleared when media flows, or when a new link takes
@@ -356,6 +462,10 @@ struct Call {
     announced: bool,
     /// Lost media, and since when. chatd resumes the call; nothing here ends it on a clock.
     lost: Option<Instant>,
+    /// When the link last answered a STUN check.
+    heard: Instant,
+    /// [`SILENT`] called this link lost. ICE never did, so ICE will not say if it came back.
+    silenced: bool,
     audio: Option<Audio>,
     devices: Option<Devices>,
     microphone_unasked: bool,
@@ -368,21 +478,25 @@ struct Call {
     processor: Processor,
     limiter: Limiter,
     meter: Meter,
-    pictures: Pictures,
+    /// The picture's threads. This loop only moves their bytes.
+    video: Video,
+    /// What the path can take, from TWCC feedback. `None` until this connection has said.
+    estimate: Option<u64>,
+    /// What the tracks may spend now, and what the estimator was told to look for.
+    rates: Rates,
+    /// Whether that estimate is to be believed.
+    uplink: video::Uplink,
+    /// Video bytes handed to str0m so far.
+    video_bytes: u64,
+    desired: u64,
+    /// When padding was last thrown away ([`Call::transmit`]).
+    padding_dropped: Option<Instant>,
     /// What the last accepted answer left sending. str0m's direction flips before the answer.
     sending_share: bool,
     sending_camera: bool,
     /// `Some(true)` is a share offer still out; `Some(false)` is a camera offer.
     offered: Option<bool>,
-    video_at: Option<Instant>,
-    camera_n: u64,
-    share_n: u64,
-    key_share: bool,
-    key_camera: bool,
-    wait_key: bool,
     pli_at: Option<Instant>,
-    painted: Option<Instant>,
-    generation: u64,
     shown: Option<TinyPicture>,
     watching: bool,
     share_noted: bool,
@@ -427,6 +541,8 @@ impl Call {
             tracing::warn!("mediad: the new connection's socket: {err}");
         }
         self.packets.clear();
+        self.unsealed.clear();
+        self.unopened.clear();
         // Still connected as far as we could tell (the server stopped hearing us, or restarted
         // before ICE noticed): this is the loss, and it gets its cue as `down` gives one. The
         // Back cue follows when media flows on the new link (`up`).
@@ -436,10 +552,17 @@ impl Call {
             out::send(&MediaResponse::Interrupted);
         }
         self.lost.get_or_insert_with(Instant::now);
+        self.silenced = false;
         self.sending_share = false;
         self.sending_camera = false;
         self.offered = None;
-        self.wait_key = true;
+        self.estimate = None;
+        self.rates = Rates::default();
+        self.uplink = video::Uplink::default();
+        self.video_bytes = 0;
+        self.desired = 0;
+        self.padding_dropped = None;
+        self.video.reset();
         self.shown = None;
         // The new link has not been announced dead. A death of the one we just left already was.
         self.announced = false;
@@ -464,7 +587,7 @@ impl Call {
             match self.slots.get_mut(&mid) {
                 Some(slot) => slot.user = user,
                 None => {
-                    if let Some(stream) = Stream::new() {
+                    if let Some(stream) = Stream::clocked() {
                         self.slots.insert(mid, Slot { user, stream });
                     }
                 }
@@ -504,7 +627,11 @@ impl Call {
             }
             Event::PeerStats(stats) => {
                 let pair = stats.selected_candidate_pair.as_ref();
-                self.meter.round_trip(stats.rtt.or_else(|| pair.and_then(|pair| pair.current_round_trip_time)));
+                self.meter.round_trip(pair.and_then(|pair| pair.current_round_trip_time), stats.rtt);
+                let egress = egress_loss(stats.egress_loss_fraction, self.padding_dropped, Instant::now());
+                self.meter.path_loss(egress, stats.ingress_loss_fraction);
+                let sent = video::Sent { media: stats.bytes_tx, video: self.video_bytes, estimate: self.estimate, loss: egress, rtt: stats.rtt };
+                self.uplink.heard(sent, Instant::now());
                 // Only host candidates are offered: the path is UDP or ICE-TCP, never a relay.
                 if let Some(pair) = pair {
                     self.meter.path = match pair.protocol {
@@ -513,47 +640,82 @@ impl Call {
                     };
                 }
             }
-            // What the server sees of our microphone: its FEC is planned for that loss.
+            // What the server sees of our microphone: its FEC is planned for that loss, and it
+            // is the path's own word on loss for a call that drops its padding (`egress_loss`).
             Event::MediaEgressStats(stats) if stats.mid == self.link.microphone => {
-                if let Some(loss) = stats.loss {
-                    self.encoder.set_loss(loss);
+                if self.meter.spoke(stats.packets) {
+                    if let Some(loss) = stats.loss {
+                        self.encoder.set_loss(loss);
+                        self.meter.path_loss(Some(loss), None);
+                    }
+                    if let Some(remote) = stats.remote {
+                        self.meter.uplink_jitter(remote.jitter);
+                    }
                 }
             }
+            Event::EgressBitrateEstimate(BweKind::Twcc { estimate, .. }) => self.estimate = Some(estimate.as_u64()),
             Event::MediaData(data) if self.link.is_picture(data.mid) => self.picture_in(data),
-            Event::KeyframeRequest(request) if request.mid == self.link.share_mid() => self.key_share = true,
-            Event::KeyframeRequest(request) if request.mid == self.link.camera_mid() => self.key_camera = true,
+            Event::KeyframeRequest(request) if request.mid == self.link.share_mid() => self.video.ask_key(Track::Share),
+            Event::KeyframeRequest(request) if request.mid == self.link.camera_mid() => match request.rid {
+                Some(rid) if rid == Rid::from("l") => self.video.ask_key(Track::Low),
+                Some(_) => self.video.ask_key(Track::High),
+                None => {
+                    self.video.ask_key(Track::High);
+                    self.video.ask_key(Track::Low);
+                }
+            },
             Event::MediaData(data) => {
-                let mid = data.mid.to_string();
-                if !self.slots.contains_key(&mid) {
-                    // Audio before the map that names its speaker: heard, and named later.
-                    if self.slots.len() >= SLOTS {
-                        return;
-                    }
-                    let Some(stream) = Stream::new() else {
-                        return;
-                    };
-                    self.slots.insert(mid.clone(), Slot { user: String::new(), stream });
+                if self.unopened.len() >= HELD_IN {
+                    self.unopened.pop_front();
                 }
-                let Some(slot) = self.slots.get_mut(&mid) else {
-                    return;
-                };
-                // End-to-end encryption's half of the frame transform: what does not open with
-                // its sender's key is dropped here, before the jitter buffer.
-                let Some(opus) = self.controls.e2ee(|e2ee| e2ee.open(&slot.user, &data.data)) else {
-                    return;
-                };
-                let stream = &mut slot.stream;
-                stream.last_packet = Instant::now();
-                // The RTP clock is 48 kHz, as ours.
-                stream.arrivals.arrived(data.time.numer() as u32, data.network_time);
-                stream.heard |= opus[..] != SILENCE[..];
-                if !self.controls.deafened.load(Ordering::Relaxed) {
-                    // The SFU writes a fresh sequence, so a lost frame is a hole in the RTP
-                    // time and not in `seq_range`. The jitter buffer only sees sequence numbers.
-                    stream.jitter.insert(frame_sequence(data.time.numer() as u64), opus);
-                }
+                self.unopened.push_back(data);
+                self.open_voice();
             }
             _ => {}
+        }
+    }
+
+    /// Voice in, as far as the encryption will take it now.
+    fn open_voice(&mut self) {
+        while let Some(data) = self.unopened.front() {
+            let mid = data.mid.to_string();
+            if !self.slots.contains_key(&mid) {
+                // Audio before the map that names its speaker: heard, and named later.
+                if self.slots.len() >= SLOTS {
+                    self.unopened.pop_front();
+                    continue;
+                }
+                let Some(stream) = Stream::clocked() else {
+                    self.unopened.pop_front();
+                    continue;
+                };
+                self.slots.insert(mid.clone(), Slot { user: String::new(), stream });
+            }
+            let Some(slot) = self.slots.get_mut(&mid) else {
+                self.unopened.pop_front();
+                continue;
+            };
+            // End-to-end encryption's half of the frame transform: what does not open with
+            // its sender's key is dropped here, before the jitter buffer.
+            let Some(opened) = self.controls.try_e2ee(|e2ee| e2ee.open(&slot.user, &data.data)) else {
+                return;
+            };
+            let Some(data) = self.unopened.pop_front() else {
+                return;
+            };
+            let Some(opus) = opened else {
+                continue;
+            };
+            let stream = &mut slot.stream;
+            stream.last_packet = Instant::now();
+            // The RTP clock is 48 kHz, as ours.
+            stream.arrivals.arrived(data.time.numer() as u32, data.network_time);
+            stream.heard |= opus[..] != SILENCE[..];
+            if !self.controls.deafened.load(Ordering::Relaxed) {
+                // The SFU writes a fresh sequence, so a lost frame is a hole in the RTP
+                // time and not in `seq_range`. The jitter buffer only sees sequence numbers.
+                stream.jitter.insert(frame_sequence(data.time.numer()), opus);
+            }
         }
     }
 
@@ -581,7 +743,25 @@ impl Call {
         self.connected = true;
         self.announced = false;
         self.lost = None;
+        self.silenced = false;
+        // Opening the devices above can take longer than the watchdog waits.
+        self.heard = Instant::now();
         out::send(&MediaResponse::Connected { ssrc: 0, dave_version: 0 });
+    }
+
+    /// No answer on a link that was up: lost, without waiting for ICE to run out of tries. It
+    /// goes the way any drop does, so the dock says Reconnecting and chatd joins again. One that
+    /// answers again before the new link is here carries on.
+    fn watch_link(&mut self, now: Instant) {
+        let silent = now.saturating_duration_since(self.heard) >= SILENT;
+        if self.connected && silent {
+            tracing::warn!("mediad: the server answered no STUN check for {SILENT:?}");
+            self.silenced = true;
+            self.fell();
+        } else if self.silenced && !silent {
+            tracing::warn!("mediad: the server is heard again");
+            self.up();
+        }
     }
 
     /// The link died, or never came up after we had already been in the call. Told once per
@@ -604,8 +784,15 @@ impl Call {
         out::send(&MediaResponse::Interrupted);
     }
 
-    /// Sends one packet. Over TCP, the first one to an address opens the stream.
+    /// Sends one packet. Over TCP, the first one to an address opens the stream. With no video
+    /// to send, a voice call does not pay for padding. The feedback then counts it as lost: the
+    /// estimate, which nothing spends until video does, starts afresh then
+    /// ([`Call::picture_step`]), and the meter leaves it out ([`egress_loss`]).
     fn transmit(&mut self, proto: Protocol, to: SocketAddr, packet: &[u8]) {
+        if self.desired == 0 && is_padding(packet) {
+            self.padding_dropped = Some(Instant::now());
+            return;
+        }
         match proto {
             Protocol::Udp => {
                 if let Some(udp) = &self.link.udp {
@@ -696,24 +883,45 @@ impl Call {
         let (Some(destination), Ok(contents)) = (local, packet.as_slice().try_into()) else {
             return true;
         };
+        // RFC 7983: a first byte below 4 is STUN.
+        if packet.first().is_some_and(|byte| *byte < 4) {
+            self.heard = Instant::now();
+        }
         let receive = Receive { proto, source, destination, contents };
         self.link.rtc.handle_input(Input::Receive(Instant::now(), receive)).is_ok()
     }
 
     /// One Opus packet on the microphone's m-line, stamped `tick` × 960.
     fn write(&mut self, opus: &[u8], tick: u64, level: i8, voice: bool) {
-        let Some(writer) = self.link.rtc.writer(self.link.microphone) else {
-            return;
-        };
-        let Some(pt) = writer.payload_params().next().map(|params| params.pt()) else {
-            return;
-        };
-        // The other half: sealed for the room's group, or held back while it has no keys.
-        let Some(payload) = self.controls.e2ee(|e2ee| e2ee.seal(opus)) else {
-            return;
-        };
-        let time = MediaTime::new(tick * FRAME as u64, Frequency::FORTY_EIGHT_KHZ);
-        let _ = writer.audio_level(level, voice).write(pt, Instant::now(), time, payload);
+        if self.unsealed.len() >= HELD {
+            self.unsealed.pop_front();
+        }
+        self.unsealed.push_back(Unsealed { opus: opus.to_vec(), tick, level, voice });
+        self.seal_voice();
+    }
+
+    /// Voice out, as far as the encryption will take it now.
+    fn seal_voice(&mut self) {
+        while let Some(frame) = self.unsealed.front() {
+            // The other half: sealed for the room's group, or held back while it has no keys.
+            let Some(sealed) = self.controls.try_e2ee(|e2ee| e2ee.seal(&frame.opus)) else {
+                return;
+            };
+            let Some(frame) = self.unsealed.pop_front() else {
+                return;
+            };
+            let Some(payload) = sealed else {
+                continue;
+            };
+            let Some(writer) = self.link.rtc.writer(self.link.microphone) else {
+                continue;
+            };
+            let Some(pt) = writer.payload_params().next().map(|params| params.pt()) else {
+                continue;
+            };
+            let time = MediaTime::new(frame.tick * FRAME as u64, Frequency::FORTY_EIGHT_KHZ);
+            let _ = writer.audio_level(frame.level, frame.voice).write(pt, Instant::now(), time, payload);
+        }
     }
 
     /// One renegotiation at a time, then frames on the lines whose answers are in.
@@ -739,27 +947,18 @@ impl Call {
             let changed = slot.as_ref().map(|pictured| (pictured.user_id.clone(), pictured.kind)) != self.shown.as_ref().map(|pictured| (pictured.user_id.clone(), pictured.kind));
             self.shown = slot;
             if changed {
-                self.wait_key = true;
-                self.pictures.reset_decoder();
+                self.video.reset();
                 self.ask_keyframe();
             }
         }
         let watching = self.controls.watch();
         if self.watching && !watching {
-            out::send(&MediaResponse::Picture {
-                path: String::new(),
-                width: 0,
-                height: 0,
-                generation: 0,
-                user_id: String::new(),
-                kind: PictureKind::Camera,
-            });
-            self.painted = None;
+            self.video.clear();
+        }
+        if watching {
+            self.video.watch();
         }
         self.watching = watching;
-        if self.controls.share() || self.controls.camera() || watching {
-            crate::picture::warm();
-        }
         if self.offered.is_none() && !self.link.pending() {
             let (want_share, want_camera) = (self.controls.share(), self.controls.camera());
             if want_share != self.sending_share {
@@ -771,7 +970,6 @@ impl Call {
                 match self.link.offer_send(true, want_share) {
                     Ok(sdp) => {
                         self.offered = Some(true);
-                        self.key_share = want_share;
                         out::send(&MediaResponse::TinyRenegotiate { sdp });
                     }
                     Err(err) => tracing::warn!("mediad: the share could not be offered: {err}"),
@@ -785,31 +983,34 @@ impl Call {
                 match self.link.offer_send(false, want_camera) {
                     Ok(sdp) => {
                         self.offered = Some(false);
-                        self.key_camera = want_camera;
                         out::send(&MediaResponse::TinyRenegotiate { sdp });
                     }
                     Err(err) => tracing::warn!("mediad: the camera could not be offered: {err}"),
                 }
             }
         }
-        // A phone's camera and screen capture run on the platform: they stop with the button.
-        #[cfg(any(target_os = "android", target_os = "ios"))]
-        self.pictures.release(self.sending_share && self.controls.share(), self.sending_camera && self.controls.camera());
-        if !self.connected || self.video_at.is_some_and(|at| at.elapsed() < Duration::from_millis(66)) {
-            return;
+        let keep_camera = self.controls.camera();
+        let share = self.connected && self.sending_share && self.controls.share();
+        let camera = self.connected && self.sending_camera && keep_camera;
+        let desired = video::desired(share, camera);
+        if let Some(estimate) = self.estimate {
+            let estimate = self.uplink.usable(estimate, desired, Instant::now());
+            self.rates = video::allocate(estimate, share, camera, self.rates);
         }
-        let mut sent = false;
-        if self.sending_share && self.controls.share() {
-            match self.pictures.share(self.key_share || self.share_n == 0) {
-                Ok(frame) => {
-                    self.key_share = false;
-                    self.share_noted = false;
-                    self.write_video(self.link.share_mid(), None, &frame, self.share_n);
-                    self.share_n += 1;
-                    sent = true;
-                }
-                Err(words) if words == crate::picture::CODEC_LATER => {}
-                Err(words) => {
+        if desired != self.desired {
+            if self.desired == 0 {
+                self.link.rtc.bwe().reset(Bitrate::bps(START_BPS));
+                self.estimate = None;
+                self.rates = Rates::default();
+            }
+            self.desired = desired;
+            self.link.rtc.bwe().set_desired_bitrate(Bitrate::bps(desired));
+        }
+        self.video.want(Wants { share, camera, keep_camera, rates: self.rates });
+        while let Some(word) = self.video.next() {
+            match word {
+                Word::Frame { track, payload, rtp, at } => self.write_video(track, payload, rtp, at),
+                Word::Failed { share: true, words } => {
                     if !self.share_noted {
                         self.share_noted = true;
                         self.controls.set_share(false);
@@ -817,21 +1018,7 @@ impl Call {
                         out::send(&MediaResponse::Sending { share: false, camera: self.sending_camera });
                     }
                 }
-            }
-        }
-        if self.sending_camera && self.controls.camera() {
-            match self.pictures.camera(self.key_camera || self.camera_n == 0) {
-                Ok((high, low)) => {
-                    self.key_camera = false;
-                    self.camera_noted = false;
-                    let n = self.camera_n;
-                    self.write_video(self.link.camera_mid(), Some("h"), &high, n);
-                    self.write_video(self.link.camera_mid(), Some("l"), &low, n);
-                    self.camera_n += 1;
-                    sent = true;
-                }
-                Err(words) if words == crate::picture::CODEC_LATER => {}
-                Err(words) => {
+                Word::Failed { share: false, words } => {
                     if !self.camera_noted {
                         self.camera_noted = true;
                         self.controls.set_camera(false);
@@ -841,15 +1028,22 @@ impl Call {
                 }
             }
         }
-        if sent {
-            self.video_at = Some(Instant::now());
+        if self.video.key_wanted() {
+            self.ask_keyframe();
         }
     }
 
-    fn write_video(&mut self, mid: Mid, rid: Option<&str>, annex_b: &[u8], n: u64) {
-        let Some(payload) = self.controls.e2ee(|e2ee| e2ee.seal_video(annex_b)) else {
-            return;
+    /// One sealed frame on its way. One that outlived what it was for (a reconnect, a line
+    /// turned off) goes no further.
+    fn write_video(&mut self, track: Track, payload: Vec<u8>, rtp: u64, at: Instant) {
+        let (mid, rid, sending) = match track {
+            Track::Share => (self.link.share_mid(), None, self.sending_share),
+            Track::High => (self.link.camera_mid(), Some("h"), self.sending_camera),
+            Track::Low => (self.link.camera_mid(), Some("l"), self.sending_camera),
         };
+        if !sending {
+            return;
+        }
         let Some(writer) = self.link.rtc.writer(mid) else {
             return;
         };
@@ -860,47 +1054,23 @@ impl Call {
             Some(rid) => writer.rid(Rid::from(rid)),
             None => writer,
         };
-        let time = MediaTime::new(n * 6000, Frequency::NINETY_KHZ);
-        let _ = writer.write(pt, Instant::now(), time, payload);
+        let size = payload.len() as u64;
+        if writer.write(pt, at, MediaTime::new(rtp, Frequency::NINETY_KHZ), payload).is_ok() {
+            self.video_bytes += size;
+        }
     }
 
-    fn picture_in(&mut self, data: str0m::media::MediaData) {
+    fn picture_in(&mut self, data: MediaData) {
         if data.mid != self.link.screen_mid() || !self.controls.watch() {
-            return;
-        }
-        if !data.contiguous || (self.wait_key && !data.is_keyframe()) {
-            self.wait_key = true;
-            self.ask_keyframe();
             return;
         }
         let user = self.shown.as_ref().map(|pictured| pictured.user_id.clone()).unwrap_or_default();
         let kind = self.shown.as_ref().map(|pictured| pictured.kind).unwrap_or_default();
-        let Some(frame) = self.controls.e2ee(|e2ee| e2ee.open_video(&user, &data.data)) else {
-            self.wait_key = true;
+        let key = data.is_keyframe();
+        let frame = Received { key, contiguous: data.contiguous, data: data.data, user, kind };
+        if !self.video.picture(frame) {
             self.ask_keyframe();
-            return;
-        };
-        if data.is_keyframe() {
-            self.wait_key = false;
         }
-        if self.painted.is_some_and(|at| at.elapsed() < Duration::from_millis(100)) {
-            return;
-        }
-        self.generation = self.generation.wrapping_add(1);
-        let Some((path, width, height)) = self.pictures.decode(&frame, self.generation) else {
-            self.wait_key = true;
-            self.ask_keyframe();
-            return;
-        };
-        self.painted = Some(Instant::now());
-        out::send(&MediaResponse::Picture {
-            path: path.display().to_string(),
-            width,
-            height,
-            generation: self.generation,
-            user_id: user,
-            kind,
-        });
     }
 
     fn ask_keyframe(&mut self) {
@@ -1001,7 +1171,7 @@ impl Call {
             self.meter.troubles = audio.troubles();
         }
         if self.ticks.is_multiple_of(SECOND) && self.connected {
-            let stats = self.meter.second(self.slots.values().map(|slot| slot.stream.counts()));
+            let stats = self.meter.second(self.slots.values_mut().map(|slot| slot.stream.counts()));
             self.controls.publish_stats(stats);
         }
         if let Some(devices) = &mut self.devices {
@@ -1040,6 +1210,8 @@ impl Call {
             if let Some(map) = map {
                 self.apply_slots(&map);
             }
+            self.seal_voice();
+            self.open_voice();
             self.picture_step();
             // A connection str0m has given up on waits for the next one, or for the bound.
             let timeout = match self.drain() {
@@ -1049,24 +1221,32 @@ impl Call {
                     next
                 }
             };
-            if let Some(packet) = self.packets.pop_front() {
-                if !self.input(packet) {
-                    tracing::warn!("mediad: str0m refused a packet");
-                }
-                continue;
-            }
             let now = Instant::now();
-            if now >= next {
-                next += TICK;
-                if now > next + 5 * TICK {
-                    // The machine slept or stalled: do not replay the missed ticks.
-                    next = now + TICK;
+            match next_step(now, next, !self.packets.is_empty()) {
+                Next::Tick => {
+                    let due = next + TICK;
+                    next = after(next, now);
+                    if next != due {
+                        // The machine slept or stalled: do not lay on the link what this loop
+                        // did not read.
+                        self.heard += now.saturating_duration_since(due);
+                    }
+                    self.tick();
+                    self.watch_link(now);
+                    if self.ticks.is_multiple_of(SECOND) {
+                        self.overdue();
+                    }
+                    continue;
                 }
-                self.tick();
-                if self.ticks.is_multiple_of(SECOND) {
-                    self.overdue();
+                Next::Packet => {
+                    if let Some(packet) = self.packets.pop_front() {
+                        if !self.input(packet) {
+                            tracing::warn!("mediad: str0m refused a packet");
+                        }
+                    }
+                    continue;
                 }
-                continue;
+                Next::Wait => {}
             }
             let wait = timeout.min(next).saturating_duration_since(now).max(Duration::from_millis(1));
             if let Err(err) = self.poll.poll(&mut events, Some(wait)) {
@@ -1098,6 +1278,7 @@ impl Call {
         if let Some(devices) = &mut self.devices {
             devices.stop();
         }
+        std::mem::replace(&mut self.video, Video::new(self.controls.clone())).stop();
     }
 }
 
@@ -1121,15 +1302,19 @@ pub fn run(link: Link, user_id: String, controls: Arc<Controls>) {
         out::fail(CallFailure::Engine, ENGINE);
     };
     let mut call = Call {
-        controls,
+        controls: controls.clone(),
         user_id,
         link,
         poll,
         next_token: 1,
         packets: VecDeque::new(),
+        unsealed: VecDeque::new(),
+        unopened: VecDeque::new(),
         connected: false,
         announced: false,
         lost: None,
+        heard: Instant::now(),
+        silenced: false,
         audio: None,
         devices: None,
         microphone_unasked,
@@ -1141,20 +1326,18 @@ pub fn run(link: Link, user_id: String, controls: Arc<Controls>) {
         cue: None,
         processor: Processor::new(),
         limiter: Limiter::default(),
-        meter: Meter::new(CallPath::Unknown),
-        pictures: Pictures::default(),
+        meter: Meter::own_path(CallPath::Unknown),
+        video: Video::new(controls.clone()),
+        estimate: None,
+        rates: Rates::default(),
+        uplink: video::Uplink::default(),
+        video_bytes: 0,
+        desired: 0,
+        padding_dropped: None,
         sending_share: false,
         sending_camera: false,
         offered: None,
-        video_at: None,
-        camera_n: 0,
-        share_n: 0,
-        key_share: false,
-        key_camera: false,
-        wait_key: true,
         pli_at: None,
-        painted: None,
-        generation: 0,
         shown: None,
         watching: false,
         share_noted: false,
@@ -1176,10 +1359,59 @@ mod tests {
     }
 
     #[test]
+    fn a_due_tick_goes_ahead_of_any_packets_and_a_stall_is_not_replayed() {
+        let start = Instant::now();
+        assert_eq!(next_step(start + TICK, start + TICK, true), Next::Tick, "packets queued do not hold the tick back");
+        assert_eq!(next_step(start, start + TICK, true), Next::Packet);
+        assert_eq!(next_step(start, start + TICK, false), Next::Wait);
+        assert_eq!(after(start, start + TICK), start + TICK, "on time");
+        assert_eq!(after(start, start + 5 * TICK), start + TICK, "a short slip catches up one tick at a time");
+        let late = start + 7 * TICK;
+        assert_eq!(after(start, late), late + TICK, "past the bound the missed ticks are gone");
+    }
+
+    #[test]
+    fn egress_loss_counts_only_when_no_padding_was_dropped_in_its_span() {
+        let now = Instant::now();
+        let ago = |ms: u64| now - Duration::from_millis(ms);
+        assert_eq!(egress_loss(Some(0.5), Some(now), now), None, "dropping it now");
+        assert_eq!(egress_loss(Some(0.5), Some(ago(900)), now), None, "video just started: this second has some in it");
+        assert_eq!(egress_loss(Some(0.1), Some(ago(1100)), now), Some(0.1), "a second of real sends");
+        assert_eq!(egress_loss(Some(0.1), None, now), Some(0.1), "none ever dropped");
+        assert_eq!(egress_loss(None, None, now), None);
+    }
+
+    #[test]
     fn a_lost_audio_packet_is_not_held_for_reordering() {
         let config = rtc_config();
         assert_eq!(config.reordering_size_audio(), 0);
         assert_eq!(config.reordering_timeout_audio(), Some(Duration::from_millis(40)));
+    }
+
+    /// How long str0m takes to give up on a path that never answers, on its own clock.
+    #[test]
+    fn a_path_that_answers_nothing_is_given_up_in_seconds() {
+        let offer = Offer::new(&spec(1)).unwrap();
+        let mut peer = rtc_config().build(Instant::now());
+        peer.add_local_candidate(Candidate::host("127.0.0.1:9".parse().unwrap(), "udp").unwrap());
+        let incoming = str0m::change::SdpOffer::from_sdp_string(offer.sdp()).expect("offer");
+        let answer = peer.sdp_api().accept_offer(incoming).expect("answer");
+        let mut link = offer.accept(&answer.to_sdp_string()).expect("accept");
+        let began = Instant::now();
+        let mut now = began;
+        loop {
+            match link.rtc.poll_output().expect("output") {
+                Output::Timeout(at) => {
+                    now = at.max(now + Duration::from_millis(1));
+                    link.rtc.handle_input(Input::Timeout(now)).expect("a timeout");
+                }
+                Output::Event(Event::IceConnectionStateChange(IceConnectionState::Disconnected)) => break,
+                _ => {}
+            }
+            assert!(now - began < Duration::from_secs(30), "still trying after {:?}", now - began);
+        }
+        let taken = now - began;
+        assert!((Duration::from_secs(4)..=Duration::from_secs(7)).contains(&taken), "gave up after {taken:?}");
     }
 
     #[test]
@@ -1194,9 +1426,7 @@ mod tests {
         }
         assert!(matches!(jitter.pop(), Pop::Packet(_)));
         assert!(matches!(jitter.pop(), Pop::Packet(_)));
-        assert_eq!(jitter.pop(), Pop::Hold);
-        assert_eq!(jitter.pop(), Pop::Hold);
-        assert_eq!(jitter.pop(), Pop::Lost);
+        assert_eq!(jitter.pop(), Pop::Lost(1));
         assert_eq!(jitter.next(), Some(&[4u8][..]));
     }
 
@@ -1311,6 +1541,207 @@ mod tests {
         let answer = peer.sdp_api().accept_offer(incoming).expect("answer");
         let link = offer.accept(&answer.to_sdp_string()).expect("accept");
         (link, peer)
+    }
+
+    /// Moves packets between two connections on a clock of the test's, a millisecond at a time.
+    /// `sent` hears each packet the first one sends, and `events` what it reports.
+    struct Wire {
+        now: Instant,
+        ours: SocketAddr,
+        theirs: SocketAddr,
+        sent: Vec<(Instant, Vec<u8>)>,
+        events: Vec<String>,
+        estimates: Vec<u64>,
+        /// As [`Call::transmit`] does with no video to send.
+        no_padding: bool,
+    }
+
+    impl Wire {
+        fn step(&mut self, link: &mut Link, peer: &mut Rtc) {
+            self.now += Duration::from_millis(1);
+            let now = self.now;
+            link.rtc.handle_input(Input::Timeout(now)).unwrap();
+            peer.handle_input(Input::Timeout(now)).unwrap();
+            let mut to_peer = Vec::new();
+            let mut to_link = Vec::new();
+            loop {
+                match link.rtc.poll_output().unwrap() {
+                    Output::Timeout(_) => break,
+                    Output::Transmit(transmit) => {
+                        if self.no_padding && is_padding(&transmit.contents) {
+                            continue;
+                        }
+                        self.sent.push((now, transmit.contents.to_vec()));
+                        to_peer.push(transmit.contents.to_vec());
+                    }
+                    Output::Event(Event::EgressBitrateEstimate(BweKind::Twcc { estimate, .. })) => self.estimates.push(estimate.as_u64()),
+                    Output::Event(event) => self.events.push(format!("{event:?}")),
+                }
+            }
+            loop {
+                match peer.poll_output().unwrap() {
+                    Output::Timeout(_) => break,
+                    Output::Transmit(transmit) => to_link.push(transmit.contents.to_vec()),
+                    Output::Event(_) => {}
+                }
+            }
+            for packet in to_peer {
+                let contents = packet.as_slice().try_into().unwrap();
+                let receive = Receive { proto: Protocol::Udp, source: self.ours, destination: self.theirs, contents };
+                peer.handle_input(Input::Receive(now, receive)).unwrap();
+            }
+            for packet in to_link {
+                let contents = packet.as_slice().try_into().unwrap();
+                let receive = Receive { proto: Protocol::Udp, source: self.theirs, destination: self.ours, contents };
+                link.rtc.handle_input(Input::Receive(now, receive)).unwrap();
+            }
+        }
+
+        fn run(&mut self, link: &mut Link, peer: &mut Rtc, for_ms: u32) {
+            for _ in 0..for_ms {
+                self.step(link, peer);
+            }
+        }
+
+        /// RTP packets with this payload type sent since `from`.
+        fn rtp(&self, pt: u8, from: Instant) -> Vec<Instant> {
+            let is = |packet: &Vec<u8>| packet.len() > 12 && packet[0] >> 6 == 2 && packet[1] & 0x7f == pt;
+            self.sent.iter().filter(|(at, packet)| *at >= from && is(packet)).map(|(at, _)| *at).collect()
+        }
+    }
+
+    /// A connection and a peer standing in for the SFU, connected.
+    fn connected() -> (Link, Rtc, Wire) {
+        let theirs = SocketAddr::from(([127, 0, 0, 1], 40_000));
+        let offer = Offer::new(&TinyOffer { user_id: "me".into(), host: "127.0.0.1".into(), slots: 1, muted: false, deafened: false, e2ee: None }).unwrap();
+        let ours = offer.link.local_udp.unwrap();
+        let mut peer = rtc_config().build(Instant::now());
+        peer.add_local_candidate(Candidate::host(theirs, "udp").unwrap());
+        let incoming = str0m::change::SdpOffer::from_sdp_string(offer.sdp()).unwrap();
+        let answer = peer.sdp_api().accept_offer(incoming).unwrap();
+        let mut link = offer.accept(&answer.to_sdp_string()).unwrap();
+        let mut wire = Wire { now: Instant::now(), ours, theirs, sent: Vec::new(), events: Vec::new(), estimates: Vec::new(), no_padding: false };
+        for _ in 0..3000 {
+            wire.step(&mut link, &mut peer);
+            if wire.events.iter().any(|event| event == "Connected") {
+                break;
+            }
+        }
+        assert!(wire.events.iter().any(|event| event == "Connected"), "{:?}", wire.events);
+        (link, peer, wire)
+    }
+
+    /// The same, with the share turned on.
+    fn sharing() -> (Link, Rtc, Wire) {
+        let (mut link, mut peer, mut wire) = connected();
+        let sdp = link.offer_send(true, true).unwrap();
+        let answer = peer.sdp_api().accept_offer(str0m::change::SdpOffer::from_sdp_string(&sdp).unwrap()).unwrap();
+        link.take_answer(&answer.to_sdp_string()).unwrap();
+        wire.run(&mut link, &mut peer, 50);
+        (link, peer, wire)
+    }
+
+    fn annex_b(len: usize, name: u8) -> Vec<u8> {
+        let mut frame = vec![0, 0, 0, 1, name];
+        frame.resize(len, 0x55);
+        frame
+    }
+
+    /// Without the pacer a keyframe left as one burst, every packet in one millisecond, in front
+    /// of whatever audio came next. With it the keyframe spreads out, audio goes straight past,
+    /// and the feedback gives an estimate for the encoders.
+    #[test]
+    fn a_keyframe_is_paced_audio_is_not_and_feedback_gives_an_estimate() {
+        let (mut link, mut peer, mut wire) = sharing();
+        let share = link.share_mid();
+        let video_pt = link.rtc.writer(share).unwrap().payload_params().next().unwrap().pt();
+        let microphone = link.microphone_mid();
+        let audio_pt = link.rtc.writer(microphone).unwrap().payload_params().next().unwrap().pt();
+        let start = wire.now;
+        let writer = link.rtc.writer(share).unwrap();
+        writer.write(video_pt, start, MediaTime::new(0, Frequency::NINETY_KHZ), annex_b(150_000, 0x65)).unwrap();
+        wire.step(&mut link, &mut peer);
+
+        let spoke = wire.now;
+        let writer = link.rtc.writer(microphone).unwrap();
+        writer.write(audio_pt, spoke, MediaTime::new(960, Frequency::FORTY_EIGHT_KHZ), vec![0x78; 80]).unwrap();
+        wire.run(&mut link, &mut peer, 2);
+        let audio = wire.rtp(*audio_pt, spoke);
+        assert_eq!(audio.len(), 1, "audio does not wait for the keyframe");
+        assert!(audio[0] <= spoke + Duration::from_millis(2));
+
+        wire.run(&mut link, &mut peer, 3000);
+        let video = wire.rtp(*video_pt, start);
+        assert!(video.len() > 100, "all of it went: {}", video.len());
+        let span = *video.last().unwrap() - video[0];
+        assert!(span > Duration::from_millis(100), "the keyframe was spread out: {span:?}");
+        assert!(video.iter().filter(|at| **at == video[0]).count() < video.len() / 4, "and not one burst");
+        assert!(!wire.estimates.is_empty(), "the feedback gave an estimate");
+    }
+
+    fn talk(link: &mut Link, peer: &mut Rtc, wire: &mut Wire, ms: u64) {
+        let microphone = link.microphone_mid();
+        let pt = link.rtc.writer(microphone).unwrap().payload_params().next().unwrap().pt();
+        for n in 0..ms / 20 {
+            let writer = link.rtc.writer(microphone).unwrap();
+            writer.write(pt, wire.now, MediaTime::new(n * 960, Frequency::FORTY_EIGHT_KHZ), vec![0x78; 40]).unwrap();
+            wire.run(link, peer, 20);
+        }
+    }
+
+    fn padding_after(wire: &Wire, from: Instant) -> usize {
+        wire.sent.iter().filter(|(at, packet)| *at >= from && is_padding(packet)).map(|(_, packet)| packet.len()).sum()
+    }
+
+    /// str0m pads an inactive line. This is what makes that visible, and what stops it.
+    #[test]
+    fn a_voice_call_sends_no_padding() {
+        let (mut link, mut peer, mut wire) = connected();
+        talk(&mut link, &mut peer, &mut wire, 3000);
+        assert!(padding_after(&wire, wire.now - Duration::from_secs(1)) > 1000, "str0m still pads, or this test proves nothing");
+
+        let (mut link, mut peer, mut wire) = connected();
+        wire.no_padding = true;
+        let start = wire.now;
+        talk(&mut link, &mut peer, &mut wire, 3000);
+        assert_eq!(padding_after(&wire, start), 0);
+        assert!(!wire.rtp(*link.rtc.writer(link.microphone).unwrap().payload_params().next().unwrap().pt(), start).is_empty());
+    }
+
+    #[test]
+    fn only_rtx_rtp_counts_as_padding() {
+        assert!(is_padding(&[0xa0, H264_RTX_PT, 0, 1]));
+        assert!(is_padding(&[0xa0, H264_RTX_PT | 0x80, 0, 1]));
+        assert!(!is_padding(&[0x80, H264_PT, 0, 1]), "video");
+        assert!(!is_padding(&[0x81, 205, 0, 1]), "RTCP");
+        assert!(!is_padding(&[0x00, H264_RTX_PT]), "STUN");
+        assert!(!is_padding(&[22, 254]), "DTLS");
+        assert!(!is_padding(&[]));
+    }
+
+    /// The padding thrown away reads as loss to the estimator, so video starts from a fresh one.
+    #[test]
+    fn video_after_a_quiet_voice_call_starts_from_a_fresh_estimate() {
+        let (mut link, mut peer, mut wire) = connected();
+        wire.no_padding = true;
+        talk(&mut link, &mut peer, &mut wire, 4000);
+        let sdp = link.offer_send(true, true).unwrap();
+        let answer = peer.sdp_api().accept_offer(str0m::change::SdpOffer::from_sdp_string(&sdp).unwrap()).unwrap();
+        link.take_answer(&answer.to_sdp_string()).unwrap();
+        wire.no_padding = false;
+        link.rtc.bwe().reset(Bitrate::bps(START_BPS));
+        link.rtc.bwe().set_desired_bitrate(Bitrate::bps(2_000_000));
+        wire.estimates.clear();
+        let share = link.share_mid();
+        let pt = link.rtc.writer(share).unwrap().payload_params().next().unwrap().pt();
+        for n in 0..45u64 {
+            let name = if n == 0 { 0x65 } else { 0x41 };
+            let writer = link.rtc.writer(share).unwrap();
+            writer.write(pt, wire.now, MediaTime::new(n * 6000, Frequency::NINETY_KHZ), annex_b(6000, name)).unwrap();
+            wire.run(&mut link, &mut peer, 66);
+        }
+        let last = wire.estimates.last().copied().unwrap_or(0);
+        assert!(last >= 500_000, "{:?}", wire.estimates);
     }
 
     /// The share stays inactive until its answer is in. An empty answer is a refusal

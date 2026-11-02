@@ -17,7 +17,7 @@ use std::io;
 /// Starts one mediad on a thread of this process and returns at once.
 pub fn start(launch: Launch) -> io::Result<()> {
     let args = launch.args.clone();
-    let instance = out::Instance::new(launch);
+    let instance = out::Instance::new(launch)?;
     let name = format!("mediad {}", args.first().map(String::as_str).unwrap_or(""));
     let held = instance.clone();
     std::thread::Builder::new().name(name).spawn(move || {

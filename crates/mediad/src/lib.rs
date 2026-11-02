@@ -7,7 +7,8 @@
 //!
 //! A Tiny server call: `tiny` is WebRTC to the server's SFU through str0m, in a 20 ms loop of its
 //! own built from the same jitter buffer, codecs, gate, mixer and devices; `framing` is its
-//! ICE-TCP. chatd carries the offer and answer over the server's live socket. `e2ee` is its
+//! ICE-TCP, and `video` the threads that keep its pictures off that loop. chatd carries the offer
+//! and answer over the server's live socket. `e2ee` is its
 //! end-to-end encryption: the MLS group, through `davey` as for DAVE, and the frame transform
 //! between the codec and str0m.
 //!
@@ -48,6 +49,7 @@ pub mod stats;
 pub mod stretch;
 pub mod talk;
 pub mod tiny;
+pub mod video;
 
 /// Samples a second, on the wire and in every buffer between the codec and the devices.
 pub const RATE: u32 = 48_000;

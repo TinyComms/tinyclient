@@ -21,5 +21,8 @@ fn main() -> ExitCode {
     }
     let _log = protocol::log_policy::install("mediad", protocol::log_policy::LogPolicy::from_env());
     protocol::crash::install_panic_hook("mediad");
-    ExitCode::from(mediad::serve::run(&args))
+    let code = mediad::serve::run(&args);
+    // What is queued for chatd goes first (`out`).
+    mediad::out::flush();
+    ExitCode::from(code)
 }

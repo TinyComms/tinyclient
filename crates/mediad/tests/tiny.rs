@@ -26,7 +26,7 @@ use std::path::PathBuf;
 use protocol::media_host::{MediaChild, Spawned};
 use std::io::Write;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{sleep, JoinHandle};
@@ -73,6 +73,10 @@ struct Sfu {
     joins: Sender<Join>,
     seen: Arc<Mutex<Seen>>,
     stop: Arc<AtomicBool>,
+    /// Everything that reaches the fake is dropped, as on a path that died.
+    deaf: Arc<AtomicBool>,
+    /// Over zero, one in this many RTP packets reaching the fake is lost.
+    lossy: Arc<AtomicUsize>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -95,10 +99,12 @@ impl Sfu {
         let (joins, asked) = channel();
         let seen = Arc::new(Mutex::new(Seen::default()));
         let stop = Arc::new(AtomicBool::new(false));
-        let mut fake = Fake { udp, listener, addr, poll, peers: Vec::new(), streams: HashMap::new(), next: 2, seen: seen.clone() };
+        let deaf = Arc::new(AtomicBool::new(false));
+        let lossy = Arc::new(AtomicUsize::new(0));
+        let mut fake = Fake { udp, listener, addr, poll, peers: Vec::new(), streams: HashMap::new(), next: 2, seen: seen.clone(), deaf: deaf.clone(), lossy: lossy.clone(), heard: 0 };
         let halt = stop.clone();
         let thread = std::thread::spawn(move || fake.run(&asked, &halt));
-        Sfu { joins, seen, stop, thread: Some(thread) }
+        Sfu { joins, seen, stop, deaf, lossy, thread: Some(thread) }
     }
 
     /// The answer to `offer`, and the receive slots it names, in order.
@@ -141,6 +147,10 @@ struct Fake {
     streams: HashMap<Token, (SocketAddr, Conn, Option<usize>)>,
     next: usize,
     seen: Arc<Mutex<Seen>>,
+    deaf: Arc<AtomicBool>,
+    lossy: Arc<AtomicUsize>,
+    /// RTP packets counted for `lossy`.
+    heard: usize,
 }
 
 impl Fake {
@@ -263,6 +273,16 @@ impl Fake {
 
     /// Hands a packet to whichever peer's ICE credentials it carries, then drains it.
     fn input(&mut self, proto: Protocol, source: SocketAddr, packet: &[u8], known: Option<usize>) -> Option<usize> {
+        if self.deaf.load(Ordering::Relaxed) {
+            return None;
+        }
+        let every = self.lossy.load(Ordering::Relaxed);
+        if every > 0 && matches!(packet, [128..=191, second, ..] if !(192..=223).contains(second)) {
+            self.heard += 1;
+            if self.heard % every == 0 {
+                return None;
+            }
+        }
         let contents = packet.try_into().ok()?;
         let input = Input::Receive(Instant::now(), Receive { proto, source, destination: self.addr, contents });
         let at = known.filter(|&at| self.peers[at].rtc.accepts(&input)).or_else(|| self.peers.iter().position(|peer| peer.rtc.accepts(&input)))?;
@@ -548,6 +568,44 @@ fn with_both_offered_udp_carries_the_call() {
     call("both", Protocol::Udp);
 }
 
+/// A muted person alone in a room sends nothing and hears nothing, and only STUN's answers say
+/// the path is alive: that is enough to stay up for longer than the watchdog waits. When those
+/// stop too, the call says so in seconds, and a new link brings it back with no restart.
+#[test]
+fn a_quiet_room_stays_up_and_a_dead_path_is_noticed_in_seconds() {
+    let sfu = Sfu::start();
+    let sink = sink("quiet");
+    let mut ada = Mediad::start("udp", &sink);
+    let offer = ada.offer("ada");
+    let (answer, _) = sfu.join("ada", &offer);
+    assert_eq!(ada.ask(MediaRequest::TinyAnswer { sdp: answer }), MediaResponse::Done);
+    ada.event("Connected", |event| matches!(event, MediaResponse::Connected { .. }));
+    assert_eq!(ada.ask(MediaRequest::Audio { muted: true, deafened: false }), MediaResponse::Done);
+    sleep(Duration::from_millis(300));
+    let quiet = sfu.frames("ada");
+    sleep(Duration::from_secs(5));
+    assert_eq!(sfu.frames("ada"), quiet, "nothing but STUN went out");
+    assert_eq!(ada.ask(MediaRequest::Audio { muted: true, deafened: false }), MediaResponse::Done);
+    assert!(!ada.seen.iter().any(|event| matches!(event, MediaResponse::Interrupted)), "a quiet room is not a lost one: {:?}", ada.seen);
+
+    sfu.deaf.store(true, Ordering::Relaxed);
+    let lost = Instant::now();
+    ada.event("Interrupted", |event| matches!(event, MediaResponse::Interrupted));
+    let noticed = lost.elapsed();
+    assert!(noticed < Duration::from_secs(5), "noticed after {noticed:?}");
+
+    sfu.deaf.store(false, Ordering::Relaxed);
+    let again = Instant::now();
+    let offer = ada.offer("ada");
+    let (answer, _) = sfu.join("ada", &offer);
+    assert_eq!(ada.ask(MediaRequest::TinyAnswer { sdp: answer }), MediaResponse::Done);
+    ada.event("Connected on the new link", |event| matches!(event, MediaResponse::Connected { .. }));
+    let back = again.elapsed();
+    assert!(back < Duration::from_secs(2), "back after {back:?}");
+    ada.hang_up();
+    let _ = std::fs::remove_file(&sink);
+}
+
 #[test]
 fn an_answer_with_no_offer_out_and_a_bad_answer_are_refused_in_words() {
     let sink = sink("refused");
@@ -718,6 +776,46 @@ fn the_connection_reports_itself_and_the_bitrate_follows_the_room() {
             break;
         }
         assert!(Instant::now() < deadline, "16 kb/s sends less: {} then {}", before.send_kbps, now.send_kbps);
+    }
+    leave(people, sinks);
+}
+
+/// str0m numbers its padding for feedback, and a voice call throws that padding away. The server
+/// never saw it, which must not read as the path losing half of what was sent.
+#[test]
+fn a_clean_voice_call_reads_as_clean_while_speaking() {
+    let sfu = Sfu::start();
+    let (mut people, sinks) = room(&sfu, "clean", &["ada", "bea"]);
+    let ada = &mut people[0];
+    let mut worst = (0, 0);
+    let end = Instant::now() + Duration::from_secs(6);
+    while Instant::now() < end {
+        sleep(Duration::from_millis(250));
+        if let MediaResponse::Stats(now) = ada.ask(MediaRequest::Stats) {
+            worst = worst.max((now.loss_permille, now.send_kbps));
+        }
+    }
+    assert!(worst.0 < 50, "loss {} over a clean path, at {} kb/s", worst.0, worst.1);
+    leave(people, sinks);
+}
+
+/// Leaving TWCC out must not leave the meter blind: the server's reports on the microphone say
+/// what it missed.
+#[test]
+fn a_voice_call_that_loses_packets_says_so() {
+    let sfu = Sfu::start();
+    let (mut people, sinks) = room(&sfu, "lossy", &["ada", "bea"]);
+    sfu.lossy.store(5, Ordering::Relaxed);
+    let ada = &mut people[0];
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        sleep(Duration::from_millis(250));
+        if let MediaResponse::Stats(now) = ada.ask(MediaRequest::Stats) {
+            if now.loss_permille > 100 {
+                break;
+            }
+        }
+        assert!(Instant::now() < deadline, "a fifth of the microphone is lost, and the meter never said");
     }
     leave(people, sinks);
 }

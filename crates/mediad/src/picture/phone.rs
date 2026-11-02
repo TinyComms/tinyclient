@@ -1,13 +1,15 @@
 //! A phone's pictures, through the registered `platform`: its camera and screen deliver frames
-//! to a sink that keeps the newest one, and its H.264 encoders and decoder code them. The call's
-//! loop pulls a frame at 15 a second exactly as on a desktop, so `tiny` does not know which it
+//! to a sink that keeps the newest one, and its H.264 encoders and decoder code them. The capture
+//! thread pulls a frame at 15 a second exactly as on a desktop, so `video` does not know which it
 //! has. Built on every target so host tests drive it with `platform::fake`; only phones use it
-//! as `picture::Pictures`.
+//! as `picture::Outgoing` and `picture::Incoming`.
+//!
+//! A platform's encoder takes its bitrate when it is made, so a track's `Ask::bps` here only says
+//! whether it runs: it stops or starts as on a desktop, and spends its full rate while it does.
 
 use super::convert::{nv12, planes};
-use super::{fit, rgb, write_jpeg, Planes, CAMERA_HIGH, CAMERA_HIGH_BPS, CAMERA_LOW, CAMERA_LOW_BPS, CODEC_LATER, SHARE_BPS, SHARE_MAX};
+use super::{fit, rgb, Ask, Canvas, Encoded, Painted, Planes, CAMERA_HIGH, CAMERA_HIGH_BPS, CAMERA_LOW, CAMERA_LOW_BPS, CODEC_LATER, SHARE_BPS, SHARE_MAX};
 use crate::platform::{self, CameraRequest, EncoderConfig, Facing, FrameSink, H264Decoder, H264Encoder, Permission, Platform, VideoFrame};
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 const FPS: u32 = 15;
@@ -76,28 +78,27 @@ fn coded<'a>(slot: &'a mut Option<Coded>, platform: &dyn Platform, width: u32, h
 }
 
 /// Encodes one layer. An encoder that holds the frame for now is "later", which the call skips.
-fn encode(coded: &mut Coded, planes: &Planes, key: bool) -> Result<Vec<u8>, String> {
+fn encode(coded: &mut Coded, planes: &Planes, key: bool) -> Result<Encoded, String> {
     let bytes = coded.encoder.encode(&nv12(planes), key)?;
     if bytes.is_empty() {
         return Err(CODEC_LATER.to_owned());
     }
-    Ok(bytes)
+    Ok(Encoded { bytes, key })
 }
 
-/// The encoders, the one decoder and the captures a call holds. Built on the first picture.
+/// The encoders and the captures of what a call sends. Built on the first picture.
 #[derive(Default)]
-pub struct Pictures {
+pub struct Outgoing {
     share: Option<Coded>,
     high: Option<Coded>,
     low: Option<Coded>,
-    decoder: Option<Box<dyn H264Decoder>>,
     camera: Option<Capture>,
     screen: Option<Capture>,
 }
 
-impl Pictures {
-    /// One share frame, Annex B, or why the screen could not be read.
-    pub fn share(&mut self, key: bool) -> Result<Vec<u8>, String> {
+impl Outgoing {
+    /// One share frame, or why the screen could not be read.
+    pub fn share(&mut self, ask: Ask) -> Result<Encoded, String> {
         let platform = platform::required()?;
         if self.screen.is_none() {
             self.screen = Some(Capture::screen(platform.clone())?);
@@ -105,11 +106,12 @@ impl Pictures {
         let grabbed = self.screen.as_ref().expect("just started").frame()?;
         let (width, height) = fit(grabbed.width, grabbed.height, SHARE_MAX.0, SHARE_MAX.1);
         let picture = planes(&grabbed, width, height);
-        encode(coded(&mut self.share, &*platform, width, height, SHARE_BPS, true)?, &picture, key)
+        encode(coded(&mut self.share, &*platform, width, height, SHARE_BPS, true)?, &picture, ask.key)
     }
 
-    /// The camera's two layers, high then low, or why the camera could not be read.
-    pub fn camera(&mut self, key: bool) -> Result<(Vec<u8>, Vec<u8>), String> {
+    /// The camera's two layers, high then low, or why the camera could not be read. A layer with
+    /// no `Ask` is stopped: nothing is spent on it and it comes back empty.
+    pub fn camera(&mut self, high: Option<Ask>, low: Option<Ask>) -> Result<(Encoded, Encoded), String> {
         let platform = platform::required()?;
         if self.camera.is_none() {
             self.camera = Some(Capture::camera(platform.clone())?);
@@ -117,50 +119,67 @@ impl Pictures {
         let grabbed = self.camera.as_ref().expect("just started").frame()?;
         let (hw, hh) = fit(grabbed.width, grabbed.height, CAMERA_HIGH.0, CAMERA_HIGH.1);
         let (lw, lh) = fit(grabbed.width, grabbed.height, CAMERA_LOW.0, CAMERA_LOW.1);
-        let high = encode(coded(&mut self.high, &*platform, hw, hh, CAMERA_HIGH_BPS, false)?, &planes(&grabbed, hw, hh), key)?;
-        let low = encode(coded(&mut self.low, &*platform, lw, lh, CAMERA_LOW_BPS, false)?, &planes(&grabbed, lw, lh), key)?;
+        let high = match high {
+            Some(ask) => encode(coded(&mut self.high, &*platform, hw, hh, CAMERA_HIGH_BPS, false)?, &planes(&grabbed, hw, hh), ask.key)?,
+            None => Encoded::default(),
+        };
+        let low = match low {
+            Some(ask) => encode(coded(&mut self.low, &*platform, lw, lh, CAMERA_LOW_BPS, false)?, &planes(&grabbed, lw, lh), ask.key)?,
+            None => Encoded::default(),
+        };
         Ok((high, low))
     }
 
-    /// Drops a decoder whose sender changed, so the next frame starts from a keyframe.
-    pub fn reset_decoder(&mut self) {
-        self.decoder = None;
-    }
-
-    /// One received Annex B frame as a JPEG path, once it decodes.
-    pub fn decode(&mut self, annex_b: &[u8], generation: u64) -> Option<(PathBuf, u32, u32)> {
-        if self.decoder.is_none() {
-            self.decoder = platform::get()?.h264_decoder().ok();
-        }
-        let decoded = self.decoder.as_mut()?.decode(annex_b).ok().flatten()?;
-        if decoded.width == 0 || decoded.height == 0 {
-            return None;
-        }
-        let (width, height) = (decoded.width & !1, decoded.height & !1);
-        let colors = rgb(&planes(&decoded, width, height));
-        let path = write_jpeg(&colors, width, height, generation).ok()?;
-        Some((path, width, height))
-    }
-
+    /// The button is off: a phone's camera light goes off with it.
     pub fn close_camera(&mut self) {
         self.camera = None;
         self.high = None;
         self.low = None;
     }
 
+    /// The share is off: the platform's capture stops.
     pub fn close_share(&mut self) {
         self.screen = None;
         self.share = None;
     }
+}
 
-    /// Stops what the call no longer sends: a phone's camera light goes off with the button.
-    pub fn release(&mut self, share: bool, camera: bool) {
-        if !share && self.screen.is_some() {
-            self.close_share();
+/// The one decoder a call holds, and the picture it last painted.
+#[derive(Default)]
+pub struct Incoming {
+    decoder: Option<Box<dyn H264Decoder>>,
+    canvas: Canvas,
+}
+
+impl Incoming {
+    /// Drops a decoder whose sender changed, so the next frame starts from a keyframe.
+    pub fn reset(&mut self) {
+        self.decoder = None;
+    }
+
+    /// Decodes one received Annex B frame, and paints it if `paint`. Every frame goes through the
+    /// decoder, painted or not: the next one is built on it. `Err` means it did not decode;
+    /// `Ok(None)` that there is nothing to paint.
+    #[allow(clippy::result_unit_err)]
+    pub fn decode(&mut self, annex_b: &[u8], paint: bool) -> Result<Option<Painted>, ()> {
+        if self.decoder.is_none() {
+            self.decoder = platform::get().ok_or(())?.h264_decoder().ok();
         }
-        if !camera && self.camera.is_some() {
-            self.close_camera();
+        let decoder = self.decoder.as_mut().ok_or(())?;
+        let Some(decoded) = decoder.decode(annex_b).map_err(|_| ())? else {
+            return Ok(None);
+        };
+        if !paint || decoded.width == 0 || decoded.height == 0 {
+            return Ok(None);
         }
+        let (width, height) = (decoded.width & !1, decoded.height & !1);
+        let colors = rgb(&planes(&decoded, width, height));
+        Ok(self.canvas.paint(&colors, width, height))
+    }
+
+    /// The file on disk goes.
+    pub fn forget(&mut self) {
+        self.canvas.forget();
     }
 }
 
@@ -202,10 +221,12 @@ mod tests {
     fn the_camera_and_the_screen_go_through_the_platform_and_come_back_as_a_picture() {
         let fake = Arc::new(FakePlatform::default());
         platform::register(fake.clone());
-        let mut pictures = Pictures::default();
+        let mut outgoing = Outgoing::default();
+        let mut incoming = Incoming::default();
+        let ask = Ask { key: true, ..Ask::default() };
 
         // Camera: asked for permission and the 640×360 front camera, coded in two layers.
-        let (high, low) = until(|| pictures.camera(true));
+        let (high, low) = until(|| outgoing.camera(Some(ask), Some(ask)));
         assert_eq!(*fake.log.permissions.lock().unwrap(), [Permission::Camera]);
         assert_eq!(fake.log.cameras.lock().unwrap()[0], CameraRequest { facing: Facing::Front, width: 640, height: 360, fps: 15 });
         let configs = fake.log.encoders.lock().unwrap().clone();
@@ -216,23 +237,33 @@ mod tests {
         assert!(fake.camera_on());
 
         // What a peer sends back decodes, through the platform's decoder, into a JPEG.
-        let (path, width, height) = pictures.decode(&high, 9_000_001).expect("the high layer decodes");
-        assert_eq!((width, height), (640, 360));
-        assert!(std::fs::metadata(&path).unwrap().len() > 0);
-        assert_eq!(pictures.decode(&low, 9_000_002).map(|(_, w, h)| (w, h)), Some((320, 180)));
-        let _ = std::fs::remove_file(path);
+        let painted = incoming.decode(&high.bytes, true).expect("the high layer decodes").expect("painted");
+        assert_eq!((painted.width, painted.height), (640, 360));
+        assert!(std::fs::metadata(&painted.path).unwrap().len() > 0);
+        let smaller = incoming.decode(&low.bytes, true).expect("the low layer decodes").expect("painted");
+        assert_eq!((smaller.width, smaller.height), (320, 180));
+        incoming.forget();
+        assert!(!smaller.path.exists());
+
+        // A layer with no `Ask` is stopped.
+        let (_, stopped) = until(|| outgoing.camera(Some(ask), None));
+        assert!(stopped.bytes.is_empty());
 
         // The button off: the platform's camera stops.
-        pictures.release(false, false);
+        outgoing.close_camera();
         assert!(!fake.camera_on());
 
         // Share: the 1920×1080 screen fitted inside 1280×720, coded as screen content.
-        let shared = until(|| pictures.share(true));
+        let shared = until(|| outgoing.share(ask));
         assert!(fake.screen_on());
         let last = *fake.log.encoders.lock().unwrap().last().unwrap();
         assert_eq!((last.width, last.height, last.bitrate_bps, last.screen), (1280, 720, SHARE_BPS, true));
-        assert!(!shared.is_empty());
-        drop(pictures);
+        assert!(!shared.bytes.is_empty());
+        outgoing.close_share();
+        assert!(!fake.screen_on());
+        until(|| outgoing.share(ask));
+        assert!(fake.screen_on(), "asked again, it starts again");
+        drop(outgoing);
         assert!(!fake.screen_on(), "dropping the call's pictures stops the share");
     }
 }

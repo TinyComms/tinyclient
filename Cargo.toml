@@ -30,6 +30,12 @@ getrandom = "0.3"
 [profile.dev.package."*"]
 opt-level = 2
 
+# What ships. A call's codecs and crypto cross crate boundaries on every frame, so they are worth
+# the longer link. Packaging and CI take the profile as it is and override only dev and test.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
 # `wgpu::InstanceFlags::default()` (what gpui_ce_wgpu asks for) turns on the Vulkan debug-utils and
 # validation layers when wgpu-types is built with debug_assertions. On the Android emulator's
 # Vulkan driver that segfaults in `vk_common_SetDebugUtilsObjectNameEXT` on the first labelled
