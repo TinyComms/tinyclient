@@ -562,8 +562,9 @@ fn a_channel_posts_comments_count_rides_the_post() {
     world.until("the channel's page", || world.message("c9001", "5"));
     world.steer("comments");
     // Telegram says the section on the post itself, as an edit: the count is its own, and the
-    // id it names is the one the footer opens the comments under.
-    let post = world.arrived("c9001", "5");
+    // id it names is the one the footer opens the comments under. The post was already stored, so
+    // wait for the edit to land on it rather than reading it the moment it exists.
+    let post = world.until("the post's comment count", || world.message("c9001", "5").filter(|post| post.thread.is_some()));
     let section = post.thread.as_ref().expect("the post carries its comment count");
     assert_eq!((section.replies, section.id.as_str(), section.last), (2, "c9001_5", 0));
     let thread = world.conversation("c9001_5").unwrap();
