@@ -22,7 +22,7 @@ use std::path::Path;
 /// Raise this when a table changes. `open` then drops the cache and starts over.
 /// 6 rebuilds caches written at 5 before `conversation.voice_limit` existed. That column
 /// was added without a version change, so Win+K died with `no such column: c.voice_limit`.
-const SCHEMA: i32 = 7;
+const SCHEMA: i32 = 8;
 
 /// Retention: the newest messages kept per conversation.
 pub const KEEP_MESSAGES: u32 = 2_000;
@@ -3553,6 +3553,55 @@ mod tests {
         let names: Vec<String> = info.query_map([], |row| row.get::<_, String>(1)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
         assert!(names.iter().any(|name| name == "voice_limit"), "{names:?}");
         assert!(store.settings().unwrap().iter().any(|setting| setting.key == "keep_days" && setting.value == "14"));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_cache_shaped_for_another_version_7_is_rebuilt() {
+        // Two builds both called their layout version 7: main's (with `encryption`, without
+        // `icon`) and the forum-topics pass's (with `icon`, without `encryption`). A cache from
+        // either opens empty here and is refilled by the networks, with today's shape.
+        let path = scratch("topic-icon-shape");
+        let mut store = Store::open(&path).unwrap();
+        store.set_setting("", "keep_days", Some("14")).unwrap();
+        store
+            .db
+            .execute_batch(
+                "DROP TABLE conversation;
+                 CREATE TABLE conversation (
+                     network TEXT NOT NULL,
+                     account TEXT NOT NULL,
+                     id TEXT NOT NULL,
+                     kind TEXT NOT NULL,
+                     title TEXT NOT NULL,
+                     space TEXT NOT NULL DEFAULT '',
+                     position INTEGER NOT NULL DEFAULT 0,
+                     avatar TEXT NOT NULL DEFAULT '',
+                     peer TEXT NOT NULL DEFAULT '',
+                     archived INTEGER NOT NULL DEFAULT 0,
+                     icon INTEGER,
+                     PRIMARY KEY (network, account, id)
+                 ) WITHOUT ROWID;
+                 PRAGMA user_version = 7;",
+            )
+            .unwrap();
+        drop(store);
+        let mut store = Store::open(&path).unwrap();
+        let version: i32 = store.db.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap();
+        assert_eq!(version, SCHEMA);
+        let names: Vec<String> = {
+            let mut info = store.db.prepare("PRAGMA table_info(conversation)").unwrap();
+            info.query_map([], |row| row.get::<_, String>(1)).unwrap().collect::<rusqlite::Result<_>>().unwrap()
+        };
+        assert!(names.iter().any(|name| name == "icon"), "{names:?}");
+        assert!(names.iter().any(|name| name == "encryption"), "{names:?}");
+        assert!(store.settings().unwrap().iter().any(|setting| setting.key == "keep_days" && setting.value == "14"));
+        // Reads on the rebuilt shape answer, and a row lands whole.
+        let account = AccountKey { network: Network::Telegram, account: "me".into() };
+        let key = Key::new(&account, "c1");
+        store.upsert_conversation(&account, &ConversationRow::new("c1", ConversationKind::Group, "Test")).unwrap();
+        let row = store.conversation(&key).unwrap().expect("the row reads back");
+        assert_eq!(row.title, "Test");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
