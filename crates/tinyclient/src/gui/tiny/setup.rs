@@ -633,7 +633,7 @@ impl Shell {
             .font_family(theme::FONT)
             .text_color(theme::text())
             .child(
-                div().id("tiny-setup-scroll").flex_1().min_h_0().w_full().overflow_y_scroll().flex().justify_center().child(
+                div().id("tiny-setup-scroll").flex_1().min_h_0().w_full().overflow_y_scroll().flex().flex_col().items_center().child(
                     div().w_full().max_w(px(760.)).px(px(40.)).pt(px(64.)).pb(px(32.)).flex().flex_col().gap(px(28.)).child(heading).child(self.tiny_setup_form("tiny-setup", "Start from", setup, cx)),
                 ),
             )
@@ -705,7 +705,7 @@ impl Shell {
             setup.counts.members_without_passkey = 0;
             if let Some(preset) = setup.presets.iter_mut().find(|preset| preset.id == "privacy") {
                 preset.available = false;
-                preset.unavailable = "This server was started without passkey sign-in. Choose Privacy with \"How members sign in\" left as it is to take the rest.".into();
+                preset.unavailable = "Needs passkey sign-in, which this server doesn't have turned on. You can still choose the other private options one by one below.".into();
             }
             if let Some(choice) = setup.choices.iter_mut().find(|choice| choice.id == "sign_in_methods") {
                 choice.relevant = false;
