@@ -403,7 +403,10 @@ impl Fake {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
-        udp.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+        // Polled, not given a read timeout. On Windows a blocking receive that times out leaves the
+        // socket "in an indeterminate state" (SO_RCVTIMEO), and a timeout as long as the gap between
+        // packets loses one now and then: sent, and never heard, with the sequence one short.
+        udp.set_nonblocking(true).unwrap();
         Fake { listener, udp, client: None, mode: AES, counter: 0 }
     }
 
@@ -461,6 +464,7 @@ impl Fake {
         let deadline = Instant::now() + PATIENCE;
         let from = loop {
             assert!(Instant::now() < deadline, "no address discovery from mediad");
+            sleep(Duration::from_millis(1));
             if let Ok((len, from)) = self.udp.recv_from(&mut request) {
                 assert_eq!(len, 74);
                 assert_eq!(request[..8], [0, 1, 0, 70, 0, 0, 0x04, 0x57], "discovery for ssrc 1111");
@@ -512,8 +516,9 @@ impl Fake {
         let mut heard = Vec::new();
         let mut datagram = [0u8; 2048];
         while Instant::now() < until {
-            if let Ok((len, _)) = self.udp.recv_from(&mut datagram) {
-                heard.extend(self.open(&datagram[..len]));
+            match self.udp.recv_from(&mut datagram) {
+                Ok((len, _)) => heard.extend(self.open(&datagram[..len])),
+                Err(_) => sleep(Duration::from_millis(1)),
             }
         }
         heard
