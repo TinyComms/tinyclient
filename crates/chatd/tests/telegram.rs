@@ -558,8 +558,10 @@ fn a_forum_topic_is_a_thread_under_the_forum() {
 fn a_channel_posts_comments_count_rides_the_post() {
     let world = World::signed_in();
     world.connected();
-    // The channel is opened: its post is stored, with nothing said of comments yet.
+    // The channel is opened: its post is stored, with nothing said of comments yet. The edit is
+    // sent only after the open's last ask, the sponsored message, so it lands on a settled channel.
     world.until("the channel's page", || world.message("c9001", "5"));
+    world.until("the channel to finish opening", || (world.called("GetSponsoredMessages c9001") >= 1).then_some(()));
     world.steer("comments");
     // Telegram says the section on the post itself, as an edit: the count is its own, and the
     // id it names is the one the footer opens the comments under. The post was already stored, so
