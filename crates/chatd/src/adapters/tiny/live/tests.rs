@@ -1445,6 +1445,26 @@ fn moderation_and_moves_reach_the_server_and_its_flags_reach_the_page() {
 }
 
 #[test]
+fn a_share_or_camera_started_mid_call_reaches_the_page() {
+    let fake = fake(&[], |_, mut conn| {
+        conn.send(ready(1, &[ME, BEA], json!([{"room_id": ROOM, "participants": [{"user_id": BEA}]}])));
+        conn.idle(Duration::from_millis(300));
+        conn.send(json!({"type": "call.state", "room_id": ROOM, "user_id": BEA, "muted": false, "deafened": false, "camera": false, "sharing": true}));
+        conn.idle(Duration::from_millis(300));
+        conn.send(json!({"type": "call.state", "room_id": ROOM, "user_id": BEA, "muted": false, "deafened": false, "camera": true, "sharing": false}));
+        conn.idle(Duration::from_secs(5));
+    });
+    let running = run(&fake.base, QUICK);
+    until("Bea seated, not sharing", || flags_of(&fake.base, ROOM, BEA).is_some_and(|seat| !seat.sharing && !seat.camera));
+    let since = running.hub.seq();
+    until("Bea sharing", || flags_of(&fake.base, ROOM, BEA).is_some_and(|seat| seat.sharing));
+    until("the page told of the share", || running.told_tiny(since));
+    let since = running.hub.seq();
+    until("Bea's camera on, share off", || flags_of(&fake.base, ROOM, BEA).is_some_and(|seat| seat.camera && !seat.sharing));
+    until("the page told of the camera", || running.told_tiny(since));
+}
+
+#[test]
 fn a_moved_call_with_audio_goes_along_muted_and_priority_reaches_the_server() {
     with_mediad();
     let (said, heard) = channel();

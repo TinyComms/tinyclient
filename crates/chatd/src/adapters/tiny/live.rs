@@ -359,9 +359,12 @@ impl Sitting {
         (self.camera, self.sharing) = (flag("camera"), flag("sharing"));
     }
 
-    /// What the server enforces changed: the page reads it again.
-    fn moderated(&self, before: &Sitting) -> bool {
-        (self.server_muted, self.server_deafened, self.suppressed) != (before.server_muted, before.server_deafened, before.suppressed)
+    /// What the server enforces changed, or a camera or share started or stopped: the page reads
+    /// it again. Its seats carry those flags, and the stage offers a picture to watch only from
+    /// them, so a share that began after the page was read would otherwise never be shown.
+    fn reread(&self, before: &Sitting) -> bool {
+        (self.server_muted, self.server_deafened, self.suppressed, self.camera, self.sharing)
+            != (before.server_muted, before.server_deafened, before.suppressed, before.camera, before.sharing)
     }
 }
 
@@ -1157,7 +1160,7 @@ fn heard_frame(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, pendi
                 if let Some(who) = seat.calls.get_mut(room).and_then(|people| people.iter_mut().find(|who| who.user == user)) {
                     let before = who.clone();
                     who.heard(frame);
-                    let moderated = who.moderated(&before);
+                    let reread = who.reread(&before);
                     if user == seat.me && before.sharing && !who.sharing {
                         ctx.tell_media(room, MediaRequest::ShareSend { on: false });
                     }
@@ -1166,7 +1169,7 @@ fn heard_frame(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, pendi
                     }
                     tell(ctx, seat, room);
                     duck(ctx, seat, room);
-                    if moderated {
+                    if reread {
                         ctx.community_changed();
                     }
                 }
