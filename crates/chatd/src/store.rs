@@ -1711,8 +1711,9 @@ impl Store {
     /// keeps a channel a day after it mentioned me.
     ///
     /// A count older than what this install already marked read is a lost tell (ack still in
-    /// flight, or a Tiny channel list with unread and no cursor), not the truth: the badge stays
-    /// cleared and `last_read` never moves backwards.
+    /// flight, or a Tiny channel list with unread and no cursor at the same `updated`), not the
+    /// truth: the badge stays cleared and `last_read` never moves backwards. A newer `updated`
+    /// with no cursor is real activity (Discord's unread push) and may raise the badge again.
     pub fn set_counts(
         &mut self,
         conversation: &Key,
@@ -1721,28 +1722,28 @@ impl Store {
         last_read: Option<&str>,
         updated: i64,
     ) -> rusqlite::Result<bool> {
-        let current: Option<(u32, u32, String, String)> = self
+        let current: Option<(u32, u32, String, String, i64)> = self
             .db
             .query_row(
-                "SELECT unread, mentions, last_read, preview_id FROM conversation
+                "SELECT unread, mentions, last_read, preview_id, updated FROM conversation
                   WHERE network = ?1 AND account = ?2 AND id = ?3",
                 params![word(&conversation.network), conversation.account, conversation.id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
             )
             .optional()?;
-        let Some((have_unread, have_mentions, have_read, preview)) = current else {
+        let Some((have_unread, have_mentions, have_read, preview, have_updated)) = current else {
             return Ok(false);
         };
         let net_read = last_read.filter(|id| !id.is_empty());
         // Local marker newer than the network's: keep ours, ignore its badge.
         let local_ahead = !have_read.is_empty() && net_read.is_some_and(|net| id_is_ahead(&have_read, net));
-        // Caught up here, and the network named no cursor (Tiny channels): never restore a badge.
+        // Caught up, no cursor, and nothing newer than we already know: Tiny's list refresh.
         let caught_up = !have_read.is_empty() && (preview.is_empty() || !id_is_ahead(&preview, &have_read));
-        let omitted_while_caught_up = net_read.is_none() && caught_up;
+        let stale_list = net_read.is_none() && caught_up && updated <= have_updated;
 
         let (unread, mentions, marker) = if local_ahead {
             (have_unread, have_mentions, None)
-        } else if omitted_while_caught_up {
+        } else if stale_list {
             (unread.min(have_unread), mentions.min(have_mentions), None)
         } else {
             (unread, mentions, net_read)
@@ -3054,10 +3055,16 @@ mod tests {
         assert!(store.mark_read(&key, "2").unwrap());
         assert_eq!(store.conversation(&key).unwrap().unwrap().unread, 0);
 
-        // Channel-style list: unread only, no last_read — the Tiny refresh path.
+        // Channel-style list: unread only, no last_read, same updated — the Tiny refresh path.
         assert!(!store.set_counts(&key, 2, 0, None, 20).unwrap());
         let row = store.conversation(&key).unwrap().unwrap();
         assert_eq!((row.unread, row.last_read.as_deref()), (0, Some("2")));
+
+        // Newer activity with no cursor still raises the badge (Discord's unread push).
+        assert!(store.set_counts(&key, 1, 0, None, 30).unwrap());
+        let row = store.conversation(&key).unwrap().unwrap();
+        assert_eq!((row.unread, row.last_read.as_deref()), (1, Some("2")));
+        assert!(store.mark_read(&key, "2").unwrap());
 
         // Direct-style list: an older cursor and a badge must not rewind what we already read.
         assert!(!store.set_counts(&key, 1, 0, Some("1"), 20).unwrap());
