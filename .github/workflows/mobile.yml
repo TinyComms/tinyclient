@@ -11,6 +11,8 @@ name: Mobile
 on:
   push:
     branches: [main]
+    # A release tag also builds the phones, so their files can go on the release (see attach-to-release).
+    tags: ["v*"]
     paths:
       - "crates/tinyclient/**"
       - "crates/protocol/**"
@@ -232,3 +234,45 @@ jobs:
           name: tinyclient-ios-unsigned
           path: mobile/ios/build/Tiny.xcarchive/Products/Applications/Tiny.app
           if-no-files-found: error
+
+  # On a release tag, put the phone builds on the GitHub release next to the desktop installers.
+  # The release is created by release.yml in parallel, so this waits for it to exist.
+  # The Android APK is a debug build; the iOS app is unsigned and only runs once re-signed.
+  attach-to-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [android-app, ios-app]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: tinyclient-android-debug
+          path: phone
+      - uses: actions/download-artifact@v7
+        with:
+          name: tinyclient-ios-unsigned
+          path: phone/Tiny.app
+      - name: Name and zip the files
+        env:
+          VERSION: ${{ github.ref_name }}
+        working-directory: phone
+        run: |
+          mv app-debug.apk "tinyclient-$VERSION-android-debug.apk"
+          zip -qr "tinyclient-$VERSION-ios-unsigned.zip" Tiny.app
+          rm -rf Tiny.app
+          ls -l
+      - name: Wait for the release, then attach
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          for attempt in $(seq 1 60); do
+            if gh release view "$VERSION" >/dev/null 2>&1; then
+              gh release upload "$VERSION" phone/* --clobber
+              exit 0
+            fi
+            sleep 30
+          done
+          echo "release $VERSION never appeared" >&2
+          exit 1
