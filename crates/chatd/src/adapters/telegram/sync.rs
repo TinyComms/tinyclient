@@ -647,34 +647,55 @@ fn topics(account: &Account, forum: Who) -> Result<usize, Fault> {
         let _ = account.ctx.counts(&id, topic.unread_count.max(0) as u32, topic.unread_mentions_count.max(0) as u32, read.as_deref(), updated);
         let _ = account.ctx.muted(&id, muted(account, forum, &topic.notify_settings));
     }
-    fetch_icons(account, &found.topics);
+    fetch_icons(account, forum, &found.topics);
     Ok(count)
 }
 
 /// The topics' own pictures: one request for every icon the pages say, and a fetch for each
 /// that is not on disk yet (the same file may hang off several topics). The pictures are the
 /// emoji documents Telegram names in the topic list, small and shown at list size.
-fn fetch_icons(account: &Account, topics: &[tl::enums::ForumTopic]) {
-    let icons = topics.iter().filter_map(|topic| match topic {
-        tl::enums::ForumTopic::Topic(topic) => topic.icon_emoji_id,
-        _ => None,
-    }).collect::<Vec<i64>>();
-    let mut icons: Vec<i64> = icons;
-    icons.sort_unstable();
-    icons.dedup();
-    if icons.is_empty() {
+fn fetch_icons(account: &Account, forum: Who, topics: &[tl::enums::ForumTopic]) {
+    // The topics that carry an icon: one pair per (emoji, row), so the rows that hang off
+    // the same picture are each told when their picture lands.
+    let mut icons: Vec<(i64, String)> = Vec::new();
+    for topic in topics {
+        let tl::enums::ForumTopic::Topic(topic) = topic else {
+            continue;
+        };
+        let Some(icon) = topic.icon_emoji_id else {
+            continue;
+        };
+        let row = thread_id(forum, topic.id);
+        if icons.iter().any(|(held, held_row)| *held == icon && *held_row == row) {
+            continue;
+        }
+        icons.push((icon, row));
+    }
+    let emoji_ids: Vec<i64> = icons.iter().map(|(icon, _)| *icon).collect();
+    let mut emoji_ids = emoji_ids;
+    emoji_ids.sort_unstable();
+    emoji_ids.dedup();
+    if emoji_ids.is_empty() {
         return;
     }
-    let documents = match account.ask(&tl::functions::messages::GetCustomEmojiDocuments { document_id: icons }) {
+    let documents = match account.ask(&tl::functions::messages::GetCustomEmojiDocuments { document_id: emoji_ids }) {
         Ok(documents) => documents,
         Err(fault) => {
             eprintln!("chatd: Telegram: topic icons: {fault}");
             return;
         }
     };
-    let wants = documents.into_iter().filter_map(|document| match document {
-        tl::enums::Document::Document(document) => Some(Want {
-            file: MediaFile::new(format!("e{}", document.id), MediaKind::Emoji),
+    let wants = icons.into_iter().filter_map(|(icon, topic_row)| {
+        // The picture's row: the topic whose row hung it, so the list refreshes on its turn.
+        let document = documents.iter().find(|document| match document {
+            tl::enums::Document::Document(document) => document.id == icon,
+            _ => false,
+        })?;
+        let tl::enums::Document::Document(document) = document else {
+            return None;
+        };
+        Some(Want {
+            file: MediaFile::new(format!("e{}", icon), MediaKind::Emoji),
             dc: document.dc_id,
             location: tl::enums::InputFileLocation::InputDocumentFileLocation(tl::types::InputDocumentFileLocation {
                 id: document.id,
@@ -683,10 +704,9 @@ fn fetch_icons(account: &Account, topics: &[tl::enums::ForumTopic]) {
                 thumb_size: String::new(),
             }),
             inline: None,
-            row: None,
+            row: Some(topic_row),
             original: false,
-        }),
-        _ => None,
+        })
     }).collect();
     account.files.want(wants);
 }
