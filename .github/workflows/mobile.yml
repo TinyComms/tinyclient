@@ -265,6 +265,8 @@ jobs:
       - name: Wait for the release, then attach
         env:
           GH_TOKEN: ${{ github.token }}
+          # No checkout in this job, so gh needs the repo named.
+          GH_REPO: ${{ github.repository }}
           VERSION: ${{ github.ref_name }}
         run: |
           for attempt in $(seq 1 60); do
