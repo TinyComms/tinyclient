@@ -1917,9 +1917,10 @@ impl Store {
     /// link preview arriving). The conversation must exist.
     ///
     /// `unread` says whether a new incoming message counts: live ones do, history does not,
-    /// because the network already said how much of it is unread. A new outgoing message that is
-    /// the newest clears the count: replying from any device means it was read. A message that
-    /// carries the `client_id` of one still pending here replaces it.
+    /// because the network already said how much of it is unread. A live outgoing message that is
+    /// the newest clears the count: replying now means it was read. History of our own past posts
+    /// must not: the network still owns how far we have read (Slack threads, Tiny lists). A
+    /// message that carries the `client_id` of one still pending here replaces it.
     pub fn ingest(&mut self, conversation: &Key, message: &Message, unread: bool) -> rusqlite::Result<Stored> {
         let tx = self.db.transaction()?;
         let (network, account, id) = (word(&conversation.network), &conversation.account, &conversation.id);
@@ -1962,6 +1963,8 @@ impl Store {
             )?;
         }
         let counts = unread && !message.outgoing;
+        // Only a live send clears the badge and advances the marker; history of ours must not.
+        let clear_read = message.outgoing && unread;
         match outcome {
             Stored::New => {
                 tx.execute(
@@ -1971,7 +1974,7 @@ impl Store {
                          last_read = CASE WHEN ?7 AND ?5 >= updated AND ?10 = 0 THEN ?6 ELSE last_read END,
                          noticed = CASE WHEN ?9 > 0 THEN max(noticed, ?5) ELSE noticed END,
                          preview_from = CASE WHEN ?5 >= updated THEN ?11 ELSE preview_from END,
-                         preview_mine = CASE WHEN ?5 >= updated THEN ?7 ELSE preview_mine END,
+                         preview_mine = CASE WHEN ?5 >= updated THEN ?13 ELSE preview_mine END,
                          preview_id = CASE WHEN ?5 >= updated THEN ?6 ELSE preview_id END,
                          preview = CASE WHEN ?5 >= updated THEN ?4 ELSE preview END,
                          updated = max(updated, ?5),
@@ -1985,12 +1988,13 @@ impl Store {
                         preview_of(message),
                         message.sent,
                         message.id,
-                        message.outgoing,
+                        clear_read,
                         u32::from(counts),
                         u32::from(counts && message.mentions_me),
                         pending,
                         if message.outgoing { "" } else { message.sender.name.as_str() },
                         unread,
+                        message.outgoing,
                     ],
                 )?;
             }
@@ -3043,6 +3047,29 @@ mod tests {
         assert!(!store.mark_read(&key, "2").unwrap(), "reading twice is not a change");
         let row = store.conversation(&key).unwrap().unwrap();
         assert_eq!((row.unread, row.mentions, row.last_read.as_deref()), (0, 0, Some("2")));
+    }
+
+    /// History of a reply we already sent must not pretend we just read the chat: Slack's thread
+    /// unread and Tiny's list still own that. A live send still clears.
+    #[test]
+    fn history_of_our_own_messages_does_not_clear_unread() {
+        let (mut store, key) = store();
+        store.ingest(&key, &said("1", "hello", 10), true).unwrap();
+        assert_eq!(store.conversation(&key).unwrap().unwrap().unread, 1);
+
+        let mut mine = said("2", "mine", 20);
+        mine.outgoing = true;
+        store.ingest(&key, &mine, false).unwrap();
+        let row = store.conversation(&key).unwrap().unwrap();
+        assert_eq!(row.unread, 1, "loading our past reply is not reading");
+        assert_eq!(row.last_read.as_deref(), None);
+        assert_eq!(row.preview.as_str(), "mine");
+
+        let mut live = said("3", "sending now", 30);
+        live.outgoing = true;
+        store.ingest(&key, &live, true).unwrap();
+        let row = store.conversation(&key).unwrap().unwrap();
+        assert_eq!((row.unread, row.last_read.as_deref()), (0, Some("3")));
     }
 
     /// Tiny OpenSpace refresh (and any late network count) must not put the badge back after
