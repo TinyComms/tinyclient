@@ -167,6 +167,15 @@ fn fetch(account: &Account, want: &Want, carried: &mut HashSet<i32>) -> Result<(
         let known = ctx.hub.store().media(&ctx.account, id).unwrap_or_default();
         known.first().and_then(|(file, _)| file.path.clone()).is_some_and(|path| std::path::Path::new(&path).exists())
     };
+    // What an older fetch kept as its gzip container is not what a shell reads: thrown
+    // away, so the fetch of this turn keeps the file inside.
+    if want.file.kind == MediaKind::Emoji {
+        if let Some(held) = ctx.hub.store().media(&ctx.account, id).unwrap_or_default().first().and_then(|(file, _)| file.path.clone()).map(std::path::PathBuf::from) {
+            if std::fs::read(&held).is_ok_and(|bytes| bytes.len() >= 2 && bytes[..2] == [0x1f, 0x8b]) {
+                let _ = std::fs::remove_file(&held);
+            }
+        }
+    }
     if on_disk(ctx) {
         return Ok(());
     }
