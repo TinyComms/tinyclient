@@ -30,6 +30,8 @@ const TREE_LIMIT: u32 = 4000;
 const MEDIA_KEPT: usize = 2000;
 /// A link that has been down this long says so: the first seconds of any connect say nothing.
 pub const TROUBLE_SHOWN: Duration = Duration::from_secs(5);
+/// A burst of conversation changes is read once. The home already waits this long.
+const LIST_QUIET: Duration = Duration::from_millis(150);
 
 /// What a sign-in that did not finish says under its row (`08-first-run-settings.md`, section
 /// 2). `None` when the user closed the window: the screen is exactly as before.
@@ -148,8 +150,8 @@ impl Dirty {
             Change::Status => self.status = true,
             Change::Conversation { conversation } => {
                 self.inbox = true;
-                // A row's unread state is also its Space's.
-                self.spaces = true;
+                // Space badges are not named here. A conversation the lists do not
+                // hold yet still asks for them; one they hold is checked after it is read.
                 if !self.rows.contains(conversation) {
                     self.rows.push(conversation.clone());
                 }
@@ -474,6 +476,11 @@ impl Shell {
         let mut dirty = Dirty::default();
         for change in changes {
             dirty.note(change);
+            if let Change::Conversation { conversation } = change {
+                if !self.lists_conversation(conversation) {
+                    dirty.spaces = true;
+                }
+            }
             match change {
                 Change::Media { account, file } => self.media_landed(account, file, cx),
                 Change::Call { call } => {
@@ -504,7 +511,13 @@ impl Shell {
             self.load_status(cx);
         }
         if dirty.spaces {
-            self.load_spaces(cx);
+            // A conversation burst already waits on the Inbox. Space badges wait with it.
+            // A Spaces or Folders change does not, and is read now.
+            if dirty.inbox {
+                self.load_spaces_soon(cx);
+            } else {
+                self.load_spaces(cx);
+            }
         }
         if dirty.inbox {
             self.inbox_arrived(&dirty.rows, cx);
@@ -569,8 +582,41 @@ impl Shell {
     }
 
     pub(super) fn reorder_inbox(&mut self, cx: &mut Context<Self>) {
-        let pages = self.sidebar_state.inbox.stale();
-        self.load_inbox(pages, cx);
+        // One read for a burst. The epoch moves when the read starts, so a late
+        // answer from before it is dropped, and a preview does not refetch 500 rows.
+        if std::mem::replace(&mut self.sidebar_state.inbox_pending, true) {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(LIST_QUIET).await;
+            let _ = this.update(cx, |this, cx| {
+                this.sidebar_state.inbox_pending = false;
+                let pages = this.sidebar_state.inbox.stale();
+                this.load_inbox(pages, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// The Inbox or a tree already shows this conversation, so its Space badge is
+    /// read only when unread, mentions, or mute moved.
+    fn lists_conversation(&self, key: &Key) -> bool {
+        self.sidebar_state.inbox.all().iter().any(|row| &row.key == key)
+            || self.trees.values().any(|tree| tree.conversations.iter().any(|row| &row.key == key))
+    }
+
+    pub(in crate::gui) fn load_spaces_soon(&mut self, cx: &mut Context<Self>) {
+        if std::mem::replace(&mut self.sidebar_state.spaces_pending, true) {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(LIST_QUIET).await;
+            let _ = this.update(cx, |this, cx| {
+                this.sidebar_state.spaces_pending = false;
+                this.load_spaces(cx);
+            });
+        })
+        .detach();
     }
 
     /// Reads the Inbox as it is filtered now, whole: it is cut at 30 days and 500 rows, and its
@@ -672,7 +718,7 @@ impl Shell {
             return;
         }
         cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(Duration::from_millis(150)).await;
+            cx.background_executor().timer(LIST_QUIET).await;
             let _ = this.update(cx, |this, cx| {
                 this.sidebar_state.home_pending = false;
                 this.load_home(cx);
@@ -694,6 +740,14 @@ impl Shell {
                 }
             }
             let fresh = Rc::new(conversation);
+            let before = this
+                .sidebar_state
+                .inbox
+                .all()
+                .iter()
+                .chain(this.trees.values().flat_map(|tree| &tree.conversations))
+                .find(|row| row.key == key)
+                .map(|row| (row.unread, row.mentions, row.muted, row.space.clone()));
             let state = &mut this.sidebar_state;
             state.inbox.replace(|row| row.key == key, &fresh);
             let home = &mut state.home;
@@ -709,6 +763,11 @@ impl Shell {
             }
             this.rebuild_inbox(cx);
             this.rebuild_rows(cx);
+            let after = (fresh.unread, fresh.mentions, fresh.muted, fresh.space.clone());
+            let spaced = fresh.space.is_some() || before.as_ref().is_some_and(|mark| mark.3.is_some());
+            if spaced && before.as_ref() != Some(&after) {
+                this.load_spaces_soon(cx);
+            }
         });
     }
 
@@ -935,11 +994,11 @@ mod tests {
         ] {
             dirty.note(&change);
         }
-        // A row changing moves the Inbox and its Space's badge; it is read once however often
-        // it was reported. The links were not touched, so `Status` is not asked.
+        // A row changing reads the Inbox once however often it was reported. Space
+        // badges are not named here. The links were not touched, so `Status` is not asked.
         let expected = Dirty {
             status: false,
-            spaces: true,
+            spaces: false,
             inbox: true,
             trees: HashSet::from([key("server")]),
             rows: vec![key("a")],

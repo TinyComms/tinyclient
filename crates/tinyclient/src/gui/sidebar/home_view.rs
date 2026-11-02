@@ -197,7 +197,7 @@ impl Shell {
         let state = &mut self.sidebar_state;
         state.home_news = news;
         if *state.home_items != items {
-            respliced(&state.home_list, &state.home_items, &items, Item::anchor);
+            respliced(&state.home_list, &state.home_items, &items, Item::anchor, |item| item.height());
             state.home_items = Rc::new(items);
             cx.notify();
         }

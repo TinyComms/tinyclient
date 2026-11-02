@@ -20,7 +20,7 @@ impl Shell {
         let items = inbox::items(state.inbox.all(), state.filter, now(), state.apps_open, state.apps_all);
         if *state.inbox_items != items {
             let anchor = |item: &Item| item.anchor().map(|key| format!("{}/{}/{}", key.network.label(), key.account, key.id));
-            respliced(&state.inbox_list, &state.inbox_items, &items, anchor);
+            respliced(&state.inbox_list, &state.inbox_items, &items, anchor, |item| item.height());
             state.inbox_items = Rc::new(items);
             cx.notify();
         }
@@ -30,6 +30,7 @@ impl Shell {
     /// the new order waits behind the pill.
     pub(in crate::gui) fn inbox_read(&mut self, epoch: u64, rows: Vec<Conversation>, total: u32, counts: InboxCounts, cx: &mut Context<Self>) {
         let fresh: Vec<Rc<Conversation>> = rows.into_iter().map(Rc::new).collect();
+        let before = self.sidebar_state.inbox.all().to_vec();
         let state = &mut self.sidebar_state;
         if state.filter == InboxFilter::All {
             state.last_seen = fresh.iter().find(|c| !c.starred && !c.bot).map(|c| (c.title.clone(), c.updated));
@@ -60,6 +61,9 @@ impl Shell {
         if applied {
             self.rebuild_inbox(cx);
             cx.notify();
+        }
+        if applied && inbox::attention_moved(&before, self.sidebar_state.inbox.all()) {
+            self.load_spaces_soon(cx);
         }
     }
 

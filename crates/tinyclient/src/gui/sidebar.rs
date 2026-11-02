@@ -141,15 +141,18 @@ pub struct State {
     pub friend_requests: u32,
     /// A read of the home is on its way.
     pub home_pending: bool,
+    /// A read of the Inbox is on its way, coalesced across a burst of changes.
+    pub inbox_pending: bool,
+    /// A read of Spaces is on its way, coalesced the same way.
+    pub spaces_pending: bool,
     pub switcher: Option<switcher::Switcher>,
 }
 
-fn list_state(cx: &mut Context<Shell>) -> ListState {
-    let list = ListState::new(0, ListAlignment::Top, px(200.));
-    // A scroll changes which rows are on screen, and so what is watched.
-    let shell = cx.entity_id();
-    list.set_scroll_handler(move |_, _, cx| cx.notify(shell));
-    list
+fn list_state(_cx: &mut Context<Shell>) -> ListState {
+    // One row ahead of the viewport. Scrolling already redraws this view, and that
+    // render is what updates who is watched. A content change that keeps the same
+    // rows does not splice, so a measured height stays measured (`respliced`).
+    ListState::new(0, ListAlignment::Top, px(48.))
 }
 
 impl State {
@@ -200,6 +203,8 @@ impl State {
             drafts: HashMap::new(),
             friend_requests: 0,
             home_pending: false,
+            inbox_pending: false,
+            spaces_pending: false,
             switcher: None,
         }
     }
@@ -303,17 +308,40 @@ pub(in crate::gui) fn on_screen(list: &ListState, count: usize, height: impl Fn(
     start..end
 }
 
+/// The slice of `old` to replace so the list matches `new`. `None` when the sequences
+/// are the same: the caller keeps every measured height.
+pub(in crate::gui) fn splice_range<T: PartialEq>(old: &[T], new: &[T]) -> Option<(Range<usize>, usize)> {
+    if old == new {
+        return None;
+    }
+    let mut prefix = 0;
+    while prefix < old.len() && prefix < new.len() && old[prefix] == new[prefix] {
+        prefix += 1;
+    }
+    let mut suffix = 0;
+    while suffix < old.len() - prefix && suffix < new.len() - prefix && old[old.len() - 1 - suffix] == new[new.len() - 1 - suffix] {
+        suffix += 1;
+    }
+    Some((prefix..old.len() - suffix, new.len() - suffix - prefix))
+}
+
 /// Replaces a list's items, keeping the first visible item where it is when it is still there.
-pub(in crate::gui) fn respliced<T>(list: &ListState, old: &[T], new: &[T], anchor: impl Fn(&T) -> Option<String>) {
+/// Same anchors and heights do not splice, so GPUI keeps the heights it already measured.
+pub(in crate::gui) fn respliced<T>(list: &ListState, old: &[T], new: &[T], anchor: impl Fn(&T) -> Option<String>, height: impl Fn(&T) -> f32) {
+    let old_sig: Vec<_> = old.iter().map(|item| (anchor(item), height(item).to_bits())).collect();
+    let new_sig: Vec<_> = new.iter().map(|item| (anchor(item), height(item).to_bits())).collect();
+    let Some((range, count)) = splice_range(&old_sig, &new_sig) else {
+        return;
+    };
     let top = list.logical_scroll_top();
     // A list at its top stays at its top: what is new there is what the user should see.
     if top.item_ix == 0 && top.offset_in_item <= px(0.) {
-        list.splice(0..old.len(), new.len());
+        list.splice(range, count);
         list.scroll_to(gpui::ListOffset::default());
         return;
     }
     let kept = old.get(top.item_ix).and_then(&anchor).and_then(|key| new.iter().position(|item| anchor(item).as_ref() == Some(&key)));
-    list.splice(0..old.len(), new.len());
+    list.splice(range, count);
     if let Some(ix) = kept {
         list.scroll_to(gpui::ListOffset { item_ix: ix, offset_in_item: top.offset_in_item });
     } else if top.item_ix > 0 {
@@ -1973,6 +2001,20 @@ pub(crate) mod tests {
         assert_eq!(on_screen(&list, 40, |_| 48.), 0..19);
         list.scroll_to(gpui::ListOffset { item_ix: 5, offset_in_item: px(10.) });
         assert_eq!(on_screen(&list, 40, |_| 100.).start, 5);
+    }
+
+    #[test]
+    fn a_preview_keeps_its_place_and_only_a_move_splices() {
+        assert_eq!(splice_range(&["a", "b", "c"], &["a", "b", "c"]), None);
+        assert_eq!(splice_range(&["a", "b"], &["a", "b", "c"]), Some((2..2, 1)));
+        assert_eq!(splice_range(&["a", "b", "c"], &["a", "c"]), Some((1..2, 0)));
+        assert_eq!(splice_range(&["a"], &["b", "a"]), Some((0..0, 1)));
+        let list = ListState::new(3, ListAlignment::Top, px(0.));
+        list.scroll_to(gpui::ListOffset { item_ix: 2, offset_in_item: px(4.) });
+        let old = ["a", "b", "c"];
+        respliced(&list, &old, &old, |item| Some((*item).to_owned()), |_| 48.);
+        let top = list.logical_scroll_top();
+        assert_eq!((top.item_ix, top.offset_in_item, list.item_count()), (2, px(4.), 3));
     }
 
     #[test]
