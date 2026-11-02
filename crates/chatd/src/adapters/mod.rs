@@ -16,10 +16,10 @@
 //! message edited, deleted or reacted to only by the command the shell's request became.
 
 mod discord;
-mod recovery;
-pub mod net;
-mod script;
 pub mod messages;
+pub mod net;
+mod recovery;
+mod script;
 pub mod signal;
 pub(crate) mod slack;
 pub(crate) mod teams;
@@ -86,7 +86,9 @@ pub struct SealedFile {
 
 impl std::fmt::Debug for SealedFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SealedFile").field("plain_len", &self.plain_len).finish_non_exhaustive()
+        f.debug_struct("SealedFile")
+            .field("plain_len", &self.plain_len)
+            .finish_non_exhaustive()
     }
 }
 
@@ -199,18 +201,30 @@ pub enum Command {
     /// The same fetch for a conversation nobody is waiting on. Runs after everything else.
     Warm(String),
     /// The user scrolled past the oldest cached message: fetch the page before it.
-    History { conversation_id: String, before: String },
+    History {
+        conversation_id: String,
+        before: String,
+    },
     /// The user is reading forward from `after` through history that is not the newest page:
     /// fetch the page after it if the cache has a gap there. Sent for every such page, so check
     /// what is stored first (`Context::stored_ids`) and ask the network only for what is missing.
-    HistoryAfter { conversation_id: String, after: String },
+    HistoryAfter {
+        conversation_id: String,
+        after: String,
+    },
     /// The user jumped to a message (a reply's original, a search hit, a link): fetch the page
     /// around it. Sent when the cache does not hold the message or runs out on either side.
-    HistoryAround { conversation_id: String, around: String },
+    HistoryAround {
+        conversation_id: String,
+        around: String,
+    },
     /// The user opened a Space: bring its tree up to date if the network needs asking.
     OpenSpace(String),
     /// Tell the network the conversation has been read up to this message.
-    MarkRead { conversation_id: String, message_id: String },
+    MarkRead {
+        conversation_id: String,
+        message_id: String,
+    },
     /// Tell Discord several conversations are read, in one request. Other networks ignore it.
     AckBulk { reads: Vec<(String, String)> },
     /// Send, with `client_id` as the network's nonce. Always answer through [`Context::sent`].
@@ -232,7 +246,10 @@ pub enum Command {
     },
     /// Stop uploading a `SendWith` and answer it through [`Context::sent`] as failed
     /// ("Cancelled"). Nothing, if it already went.
-    CancelSend { conversation_id: String, client_id: String },
+    CancelSend {
+        conversation_id: String,
+        client_id: String,
+    },
     /// Add (`on`) or take back our reaction. `emoji` is the emoji itself, or the id of a custom
     /// emoji's registered file. The store already shows it; answer `Err` and it is taken back.
     /// The network's own event for it is reported as usual and counts once.
@@ -247,7 +264,10 @@ pub enum Command {
     /// it: the chat's own set, our permissions and plan. One request at most, because the user
     /// opened it; chatd keeps the answer five minutes. `Unsupported` leaves every reaction to the
     /// network to judge.
-    ReactionRules { conversation_id: String, reply: Reply<protocol::ReactionRules> },
+    ReactionRules {
+        conversation_id: String,
+        reply: Reply<protocol::ReactionRules>,
+    },
     /// Replace the text of one of our messages. Report the edited message through
     /// [`Context::message`] before answering: nothing was changed locally.
     Edit {
@@ -267,7 +287,10 @@ pub enum Command {
     /// A conversation's cloud draft here changed to `text` (empty clears it). The shell has
     /// already waited out the pauses between the keys, so this is one settled draft and there
     /// is nothing to answer.
-    Draft { conversation_id: String, text: String },
+    Draft {
+        conversation_id: String,
+        text: String,
+    },
     /// What the shell has on screen changed. Subscribe to presence, typing and member ranges for
     /// exactly this, and drop what is no longer in it.
     Watch(Arc<Watching>),
@@ -280,7 +303,10 @@ pub enum Command {
         reply: Reply<Members>,
     },
     /// The id of the direct conversation with a person, created if there is none.
-    StartDirect { person_id: String, reply: Reply<String> },
+    StartDirect {
+        person_id: String,
+        reply: Reply<String>,
+    },
     /// The id of the thread a channel message starts. Discord only: create the thread channel,
     /// record it, and answer with its id. `name` is already one line, at most 100 characters.
     StartThread {
@@ -290,24 +316,50 @@ pub enum Command {
         reply: Reply<String>,
     },
     /// One person's card. One request to the network, and only because the user opened it.
-    Profile { person_id: String, reply: Reply<About> },
+    Profile {
+        person_id: String,
+        reply: Reply<About>,
+    },
     /// The same, opened from inside a Space: add the nickname, roles and join date there. An
     /// adapter that answers `Unsupported` is asked `Profile` instead.
-    ProfileIn { person_id: String, space_id: String, reply: Reply<About> },
+    ProfileIn {
+        person_id: String,
+        space_id: String,
+        reply: Reply<About>,
+    },
     /// A conversation's info pane: one request, because the user opened it.
-    ConversationInfo { conversation_id: String, reply: Reply<ConversationAbout> },
+    ConversationInfo {
+        conversation_id: String,
+        reply: Reply<ConversationAbout>,
+    },
     /// A Space's info, opened from its name.
-    SpaceInfo { space_id: String, reply: Reply<SpaceAbout> },
+    SpaceInfo {
+        space_id: String,
+        reply: Reply<SpaceAbout>,
+    },
     /// Set the network's notification setting. Report the new mute through [`Context::muted`]
     /// before answering.
-    SetMute { conversation_id: String, notify: Notify, reply: Reply<()> },
+    SetMute {
+        conversation_id: String,
+        notify: Notify,
+        reply: Reply<()>,
+    },
     /// Leave a group conversation. Report it gone through [`Context::conversation_gone`].
-    Leave { conversation_id: String, reply: Reply<()> },
+    Leave {
+        conversation_id: String,
+        reply: Reply<()>,
+    },
     /// Close a direct conversation as the network's own × does. Report it through
     /// [`Context::filing`] (hidden) or [`Context::conversation_gone`].
-    CloseDirect { conversation_id: String, reply: Reply<()> },
+    CloseDirect {
+        conversation_id: String,
+        reply: Reply<()>,
+    },
     /// The messages pinned in a conversation, newest first, at most 50.
-    Pinned { conversation_id: String, reply: Reply<Vec<Message>> },
+    Pinned {
+        conversation_id: String,
+        reply: Reply<Vec<Message>>,
+    },
     /// What was shared in a conversation, from the network's own search, because the user
     /// clicked "Search all". `before` continues below an item already listed.
     SearchShared {
@@ -352,7 +404,11 @@ pub enum Command {
         reply: Reply<()>,
     },
     /// A registered file is wanted: answer with where and how to fetch it now.
-    Download { id: String, url: String, reply: Reply<Download> },
+    Download {
+        id: String,
+        url: String,
+        reply: Reply<Download>,
+    },
     /// The pane's search asked the network itself: a Space's own search, or one conversation's.
     /// Answer with the hits, mapped like the cache's, or why not. `at` is when the shell
     /// asked: one queued past the shell's patience does not ask the network at all.
@@ -367,7 +423,10 @@ pub enum Command {
     /// original a picture's viewer opened, and records each as the cache would. Others ignore it.
     Wanted(Vec<String>),
     /// The link that opens this conversation's call in the official app.
-    Handoff { conversation_id: String, reply: Reply<String> },
+    Handoff {
+        conversation_id: String,
+        reply: Reply<String>,
+    },
     /// mediad is up: join or ring on the network, then report through [`Context::voice`].
     CallJoin(String),
     /// Leave, cancel or decline on the network. Also sent when the call failed here (mediad
@@ -391,21 +450,30 @@ impl Command {
     pub fn unsupported(self, ctx: &Context) {
         match self {
             Command::Members { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
-            Command::StartDirect { reply, .. } | Command::StartThread { reply, .. } | Command::Handoff { reply, .. } => {
+            Command::StartDirect { reply, .. }
+            | Command::StartThread { reply, .. }
+            | Command::Handoff { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Profile { reply, .. } | Command::ProfileIn { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }
-            Command::Profile { reply, .. } | Command::ProfileIn { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ConversationInfo { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SpaceInfo { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
-            Command::SetMute { reply, .. } | Command::Leave { reply, .. } | Command::CloseDirect { reply, .. } => {
-                drop(reply.send(Err(Refusal::Unsupported)))
-            }
+            Command::SetMute { reply, .. }
+            | Command::Leave { reply, .. }
+            | Command::CloseDirect { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Pinned { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SearchShared { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Catalog { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ReactionRules { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
-            Command::SendWith { conversation_id, client_id, .. } => {
-                let why = format!("Sending files and options is not built for {} yet.", ctx.account.network.label());
+            Command::SendWith {
+                conversation_id,
+                client_id,
+                ..
+            } => {
+                let why = format!(
+                    "Sending files and options is not built for {} yet.",
+                    ctx.account.network.label()
+                );
                 ctx.sent(&conversation_id, &client_id, Err(why));
             }
             Command::React { reply, .. }
@@ -417,8 +485,16 @@ impl Command {
             Command::SignOut(reply) => drop(reply.send(Ok(()))),
             Command::Download { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Search { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
-            Command::Send { conversation_id, client_id, .. } => {
-                ctx.sent(&conversation_id, &client_id, Err("Sending is not built for this network.".to_owned()));
+            Command::Send {
+                conversation_id,
+                client_id,
+                ..
+            } => {
+                ctx.sent(
+                    &conversation_id,
+                    &client_id,
+                    Err("Sending is not built for this network.".to_owned()),
+                );
             }
             Command::Tiny(ask) => ask.unsupported(),
             Command::CallJoin(conversation_id) => {
@@ -477,7 +553,11 @@ impl Context {
     /// One wakeup however long the wait: use this, not a loop of short sleeps.
     pub fn pause(&self, time: Duration) -> bool {
         let waiting = lock(&self.stop.waiting);
-        drop(self.stop.wake.wait_timeout_while(waiting, time, |_| !self.stopped()));
+        drop(
+            self.stop
+                .wake
+                .wait_timeout_while(waiting, time, |_| !self.stopped()),
+        );
         self.stopped()
     }
 
@@ -486,9 +566,13 @@ impl Context {
         drop(self.stop.wake.wait_timeout_while(waiting, time, |_| {
             !self.stopped() && self.stop.recovery.load(Ordering::Relaxed) == generation
         }));
-        if self.stopped() { ReconnectWait::Stopped }
-        else if self.stop.recovery.load(Ordering::Relaxed) != generation { ReconnectWait::Recovered }
-        else { ReconnectWait::Elapsed }
+        if self.stopped() {
+            ReconnectWait::Stopped
+        } else if self.stop.recovery.load(Ordering::Relaxed) != generation {
+            ReconnectWait::Recovered
+        } else {
+            ReconnectWait::Elapsed
+        }
     }
 
     pub fn key(&self, id: &str) -> Key {
@@ -499,7 +583,10 @@ impl Context {
     /// conversations and message requests stay out of it, as they stay out of the cache's own
     /// search. A conversation the store does not know is not listed.
     pub fn listable(&self, conversation_id: &str) -> bool {
-        self.hub.store().conversation_listed(&self.key(conversation_id)).unwrap_or_default()
+        self.hub
+            .store()
+            .conversation_listed(&self.key(conversation_id))
+            .unwrap_or_default()
     }
 
     // The account.
@@ -526,7 +613,11 @@ impl Context {
         match session::rewrite(self.account.network, rewrite) {
             Ok(saved) => saved,
             Err(why) => {
-                tracing::warn!("chatd: {}: the session was not saved: {}", self.account.network.label(), net::redact(&why));
+                tracing::warn!(
+                    "chatd: {}: the session was not saved: {}",
+                    self.account.network.label(),
+                    net::redact(&why)
+                );
                 false
             }
         }
@@ -544,15 +635,24 @@ impl Context {
     /// Every Space of the account, as the network lists them at connect.
     pub fn spaces(&self, spaces: &[SpaceRow]) -> Stores {
         self.hub.store().replace_spaces(&self.account, spaces)?;
-        self.hub.changed(Change::Spaces { account: self.account.clone() });
+        self.hub.changed(Change::Spaces {
+            account: self.account.clone(),
+        });
         Ok(())
     }
 
     /// One Space's whole tree: only what the user may see, in the network's order. Rows go
     /// straight to the store; keep none of them.
-    pub fn tree(&self, space_id: &str, groups: &[Group], conversations: &[ConversationRow]) -> Stores {
+    pub fn tree(
+        &self,
+        space_id: &str,
+        groups: &[Group],
+        conversations: &[ConversationRow],
+    ) -> Stores {
         let space = self.key(space_id);
-        self.hub.store().replace_tree(&space, groups, conversations)?;
+        self.hub
+            .store()
+            .replace_tree(&space, groups, conversations)?;
         self.hub.changed(Change::Tree { space });
         Ok(())
     }
@@ -579,7 +679,8 @@ impl Context {
     /// whenever it changes; an empty list when the channel empties. Never stored, and the tree
     /// is not announced: the row is told alone.
     pub fn occupants(&self, conversation_id: &str, people: Vec<Occupant>, total: u32) {
-        self.hub.set_occupants(self.key(conversation_id), Occupants { people, total });
+        self.hub
+            .set_occupants(self.key(conversation_id), Occupants { people, total });
     }
 
     /// One conversation: a direct message, or a channel created, renamed or moved.
@@ -587,14 +688,20 @@ impl Context {
         self.hub.store().upsert_conversation(&self.account, row)?;
         self.row_changed(&row.id, row.space.as_deref());
         if row.filing.is_some() {
-            self.hub.changed(Change::Folders { account: self.account.clone() });
+            self.hub.changed(Change::Folders {
+                account: self.account.clone(),
+            });
         }
         Ok(())
     }
 
     pub fn conversation_gone(&self, conversation_id: &str) -> Stores {
         let conversation = self.key(conversation_id);
-        let space = self.hub.store().conversation(&conversation)?.and_then(|row| row.space);
+        let space = self
+            .hub
+            .store()
+            .conversation(&conversation)?
+            .and_then(|row| row.space);
         self.hub.store().remove_conversation(&conversation)?;
         self.row_changed(conversation_id, space.as_deref());
         self.hub.changed(Change::Status);
@@ -612,7 +719,11 @@ impl Context {
         updated: i64,
     ) -> Stores {
         let conversation = self.key(conversation_id);
-        if self.hub.store().set_counts(&conversation, unread, mentions, last_read, updated)? {
+        if self
+            .hub
+            .store()
+            .set_counts(&conversation, unread, mentions, last_read, updated)?
+        {
             self.hub.changed(Change::Conversation { conversation });
             self.hub.changed(Change::Status);
         }
@@ -622,7 +733,12 @@ impl Context {
     /// How far this user has read one conversation here, as far as the store says. It stays what
     /// they did, and a network count older than it is a lost tell of it, not the truth.
     pub fn read_up_to(&self, conversation_id: &str) -> Option<String> {
-        self.hub.store().conversation(&self.key(conversation_id)).ok().flatten().and_then(|row| row.last_read)
+        self.hub
+            .store()
+            .conversation(&self.key(conversation_id))
+            .ok()
+            .flatten()
+            .and_then(|row| row.last_read)
     }
 
     /// The network's own mute setting, after its rules (overrides, suppress flags) are applied.
@@ -640,10 +756,16 @@ impl Context {
     pub fn filing(&self, conversation_id: &str, filing: &Filing) -> Stores {
         let conversation = self.key(conversation_id);
         if self.hub.store().set_filing(&conversation, filing)? {
-            let space = self.hub.store().conversation(&conversation)?.and_then(|row| row.space);
+            let space = self
+                .hub
+                .store()
+                .conversation(&conversation)?
+                .and_then(|row| row.space);
             self.row_changed(conversation_id, space.as_deref());
             self.hub.changed(Change::Status);
-            self.hub.changed(Change::Folders { account: self.account.clone() });
+            self.hub.changed(Change::Folders {
+                account: self.account.clone(),
+            });
         }
         Ok(())
     }
@@ -652,16 +774,26 @@ impl Context {
     /// server folders. Membership of chats is on their rows (`Filing::folders`).
     pub fn folders(&self, folders: &[FolderRow]) -> Stores {
         self.hub.store().replace_folders(&self.account, folders)?;
-        self.hub.changed(Change::Folders { account: self.account.clone() });
-        self.hub.changed(Change::Spaces { account: self.account.clone() });
+        self.hub.changed(Change::Folders {
+            account: self.account.clone(),
+        });
+        self.hub.changed(Change::Spaces {
+            account: self.account.clone(),
+        });
         Ok(())
     }
 
     /// A Space's own settings: muted as a whole, and the user's "hide muted channels".
     pub fn space_flags(&self, space_id: &str, muted: bool, hide_muted: bool) -> Stores {
         let space = self.key(space_id);
-        if self.hub.store().set_space_flags(&space, muted, hide_muted)? {
-            self.hub.changed(Change::Spaces { account: self.account.clone() });
+        if self
+            .hub
+            .store()
+            .set_space_flags(&space, muted, hide_muted)?
+        {
+            self.hub.changed(Change::Spaces {
+                account: self.account.clone(),
+            });
             self.hub.changed(Change::Tree { space });
         }
         Ok(())
@@ -692,12 +824,17 @@ impl Context {
     pub fn draft(&self, conversation_id: &str, text: &str) -> Stores {
         let conversation = self.key(conversation_id);
         let stored = self.hub.store().conversation(&conversation).ok().flatten();
-        let newer = stored.as_ref().is_some_and(|row| row.draft != text).then_some(text);
+        let newer = stored
+            .as_ref()
+            .is_some_and(|row| row.draft != text)
+            .then_some(text);
         match newer {
             Some(text) => self.hub.store().set_draft(&conversation, text)?,
             None => return Ok(()),
         };
-        self.hub.changed(Change::Conversation { conversation: conversation.clone() });
+        self.hub.changed(Change::Conversation {
+            conversation: conversation.clone(),
+        });
         // A draft holds an otherwise idle row in the Inbox, as typing nothing does.
         self.hub.changed(Change::Status);
         Ok(())
@@ -714,9 +851,13 @@ impl Context {
     }
 
     fn row_changed(&self, conversation_id: &str, space: Option<&str>) {
-        self.hub.changed(Change::Conversation { conversation: self.key(conversation_id) });
+        self.hub.changed(Change::Conversation {
+            conversation: self.key(conversation_id),
+        });
         if let Some(space) = space {
-            self.hub.changed(Change::Tree { space: self.key(space) });
+            self.hub.changed(Change::Tree {
+                space: self.key(space),
+            });
         }
     }
 
@@ -725,11 +866,15 @@ impl Context {
     /// Announces what recording messages did. `live` ones may also have changed the totals.
     fn stored(&self, conversation: &Key, stored: &[Stored], live: bool) {
         if stored.iter().any(|stored| *stored != Stored::Same) {
-            self.hub.changed(Change::Messages { conversation: conversation.clone() });
+            self.hub.changed(Change::Messages {
+                conversation: conversation.clone(),
+            });
         }
         if stored.contains(&Stored::New) {
             // A new message moves the row and changes its preview.
-            self.hub.changed(Change::Conversation { conversation: conversation.clone() });
+            self.hub.changed(Change::Conversation {
+                conversation: conversation.clone(),
+            });
             if live {
                 self.hub.changed(Change::Status);
             }
@@ -746,7 +891,10 @@ impl Context {
         if stored == Stored::New && !message.outgoing {
             self.typing_stopped(conversation_id, &message.sender.id);
             // After the row counted it, so a notification's read check sees it unread.
-            self.hub.notify(crate::notify::Event::Message { conversation: conversation.clone(), message: Box::new(message.clone()) });
+            self.hub.notify(crate::notify::Event::Message {
+                conversation: conversation.clone(),
+                message: Box::new(message.clone()),
+            });
         }
         self.stored(&conversation, &[stored], true);
         Ok(())
@@ -765,14 +913,31 @@ impl Context {
     }
 
     /// The message as stored, for networks whose updates are partial and must be merged.
-    pub fn stored_message(&self, conversation_id: &str, message_id: &str) -> rusqlite::Result<Option<Message>> {
-        self.hub.store().message(&self.key(conversation_id), message_id)
+    pub fn stored_message(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> rusqlite::Result<Option<Message>> {
+        self.hub
+            .store()
+            .message(&self.key(conversation_id), message_id)
     }
 
     /// The ids stored between two message ids, both included, oldest first, at most `limit`: a
     /// page from the network is compared against this to find what was deleted while away.
-    pub fn stored_ids(&self, conversation_id: &str, oldest: &str, newest: &str, limit: u32) -> rusqlite::Result<Vec<String>> {
-        self.hub.store().ids_between(&self.key(conversation_id), oldest, newest, limit.min(KEEP_MESSAGES))
+    pub fn stored_ids(
+        &self,
+        conversation_id: &str,
+        oldest: &str,
+        newest: &str,
+        limit: u32,
+    ) -> rusqlite::Result<Vec<String>> {
+        self.hub.store().ids_between(
+            &self.key(conversation_id),
+            oldest,
+            newest,
+            limit.min(KEEP_MESSAGES),
+        )
     }
 
     /// A message is gone. One with a thread hanging off it stays as a tombstone, and replies to
@@ -786,9 +951,19 @@ impl Context {
     }
 
     /// One person added or removed one reaction. Set `reaction.mine` when it was us.
-    pub fn reacted(&self, conversation_id: &str, message_id: &str, reaction: &Reaction, added: bool) -> Stores {
+    pub fn reacted(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+        reaction: &Reaction,
+        added: bool,
+    ) -> Stores {
         let conversation = self.key(conversation_id);
-        if self.hub.store().react(&conversation, message_id, reaction, added)? {
+        if self
+            .hub
+            .store()
+            .react(&conversation, message_id, reaction, added)?
+        {
             self.hub.changed(Change::Messages { conversation });
         }
         Ok(())
@@ -817,7 +992,11 @@ impl Context {
         };
         match stored {
             Ok(stored) => self.stored(&conversation, &[stored], true),
-            Err(err) => tracing::warn!("chatd: {}: {}", self.account.network.label(), net::redact(&err.to_string())),
+            Err(err) => tracing::warn!(
+                "chatd: {}: {}",
+                self.account.network.label(),
+                net::redact(&err.to_string())
+            ),
         }
     }
 
@@ -834,7 +1013,9 @@ impl Context {
     /// Remembers the newest message id the network named, without a preview. "Mark as read"
     /// before history has loaded acks this id.
     pub fn note_newest(&self, conversation_id: &str, message_id: &str) -> Stores {
-        self.hub.store().note_newest(&self.key(conversation_id), message_id)?;
+        self.hub
+            .store()
+            .note_newest(&self.key(conversation_id), message_id)?;
         Ok(())
     }
 
@@ -843,7 +1024,9 @@ impl Context {
     pub fn forget_conversation(&self, conversation_id: &str) -> Stores {
         let conversation = self.key(conversation_id);
         if self.hub.store().forget_conversation(&conversation)? {
-            self.hub.changed(Change::Messages { conversation: conversation.clone() });
+            self.hub.changed(Change::Messages {
+                conversation: conversation.clone(),
+            });
             self.hub.changed(Change::Conversation { conversation });
             self.hub.changed(Change::Status);
         }
@@ -855,20 +1038,32 @@ impl Context {
     /// People seen: friends, direct partners, authors, search results. Never a whole directory.
     pub fn people(&self, people: &[PersonRow]) -> Stores {
         self.hub.store().upsert_people(&self.account, people)?;
-        self.hub.changed(Change::People { account: self.account.clone() });
+        self.hub.changed(Change::People {
+            account: self.account.clone(),
+        });
         Ok(())
     }
 
     /// The whole list the user owns, by person id, as sent at connect. Record the people first.
     pub fn relations(&self, relations: &[(String, Relation)]) -> Stores {
-        self.hub.store().replace_relations(&self.account, relations)?;
-        self.hub.changed(Change::People { account: self.account.clone() });
+        self.hub
+            .store()
+            .replace_relations(&self.account, relations)?;
+        self.hub.changed(Change::People {
+            account: self.account.clone(),
+        });
         Ok(())
     }
 
     pub fn relation(&self, person_id: &str, relation: Relation) -> Stores {
-        if self.hub.store().set_relation(&self.key(person_id), relation)? {
-            self.hub.changed(Change::People { account: self.account.clone() });
+        if self
+            .hub
+            .store()
+            .set_relation(&self.key(person_id), relation)?
+        {
+            self.hub.changed(Change::People {
+                account: self.account.clone(),
+            });
         }
         Ok(())
     }
@@ -877,14 +1072,17 @@ impl Context {
     /// first.
     pub fn details(&self, people: &[(String, PersonDetails)]) -> Stores {
         self.hub.store().set_details(&self.account, people)?;
-        self.hub.changed(Change::People { account: self.account.clone() });
+        self.hub.changed(Change::People {
+            account: self.account.clone(),
+        });
         Ok(())
     }
 
     /// Their status emoji and what they are doing (playing, in voice, in a meeting), kept like
     /// presence: never stored, and only for owned lists and people the shell watches.
     pub fn activity(&self, person_id: &str, emoji: &str, activity: Option<Activity>, owned: bool) {
-        self.hub.set_activity(self.key(person_id), emoji, activity, owned);
+        self.hub
+            .set_activity(self.key(person_id), emoji, activity, owned);
     }
 
     /// What this account may send: file limits, pickers, options. Say it once the session
@@ -896,7 +1094,8 @@ impl Context {
     /// How far a `SendWith`'s files have gone, in bytes of all of them. Call as often as is
     /// convenient: the shell is told at most four times a second.
     pub fn upload(&self, conversation_id: &str, client_id: &str, sent: u64, total: u64) {
-        self.hub.set_upload(self.key(conversation_id), client_id, sent, total);
+        self.hub
+            .set_upload(self.key(conversation_id), client_id, sent, total);
     }
 
     /// The network finished a `SearchPeople`, whether or not it found anyone. Record what it
@@ -910,12 +1109,16 @@ impl Context {
 
     /// A Tiny server's people, roles, invites or rooms changed: the shell reads them again.
     pub fn community_changed(&self) {
-        self.hub.changed(Change::Tiny { account: self.account.clone() });
+        self.hub.changed(Change::Tiny {
+            account: self.account.clone(),
+        });
     }
 
     /// Rows of a conversation's member list were added, removed or moved.
     pub fn members_changed(&self, conversation_id: &str) {
-        self.hub.changed(Change::Members { conversation: self.key(conversation_id) });
+        self.hub.changed(Change::Members {
+            conversation: self.key(conversation_id),
+        });
     }
 
     /// What is held about a person's presence now, for a member row built here.
@@ -927,7 +1130,8 @@ impl Context {
     /// while the shell is watching them, so pass on whatever the network sends. Our own presence
     /// is reported the same way, under our own id and `owned`.
     pub fn presence(&self, person_id: &str, presence: Presence, status: &str, owned: bool) {
-        self.hub.set_presence(self.key(person_id), presence, status, owned);
+        self.hub
+            .set_presence(self.key(person_id), presence, status, owned);
     }
 
     /// Someone is typing, for `seconds` unless more is heard (the network's own timeout).
@@ -946,7 +1150,8 @@ impl Context {
             name: String::new(),
             until: 0,
         };
-        self.hub.set_typing(self.key(conversation_id), typist, false);
+        self.hub
+            .set_typing(self.key(conversation_id), typist, false);
     }
 
     /// What the shell has on screen, across every account. Also arrives as `Command::Watch`.
@@ -969,7 +1174,9 @@ impl Context {
     /// (for a 2x screen at least twice the normal one). `Fetch` names the size the shell draws
     /// at and chatd fetches the smallest that is large enough.
     pub fn media_variants(&self, id: &str, variants: &[(u32, String)]) -> Stores {
-        self.hub.store().register_variants(&self.account, id, variants)
+        self.hub
+            .store()
+            .register_variants(&self.account, id, variants)
     }
 
     /// A registered file's address ran out and was exchanged for this one (while serving
@@ -994,10 +1201,23 @@ impl Context {
         }
         let landed = {
             let mut store = self.hub.store();
-            store.register_media(&self.account, &[(file.clone(), address.to_owned())]).ok()?;
-            store.media_landed(&self.account, &file.id, &path.to_string_lossy(), bytes.len() as u64, now()).ok()??
+            store
+                .register_media(&self.account, &[(file.clone(), address.to_owned())])
+                .ok()?;
+            store
+                .media_landed(
+                    &self.account,
+                    &file.id,
+                    &path.to_string_lossy(),
+                    bytes.len() as u64,
+                    now(),
+                )
+                .ok()??
         };
-        self.hub.changed(Change::Media { account: self.account.clone(), file: landed.clone() });
+        self.hub.changed(Change::Media {
+            account: self.account.clone(),
+            file: landed.clone(),
+        });
         Some(landed)
     }
 
@@ -1010,7 +1230,9 @@ impl Context {
             self.row_changed(id, None);
         }
         if person {
-            self.hub.changed(Change::People { account: self.account.clone() });
+            self.hub.changed(Change::People {
+                account: self.account.clone(),
+            });
         }
         Ok(())
     }
@@ -1018,58 +1240,91 @@ impl Context {
     /// The avatar the row or the person of this id names now, so a row recorded again keeps it.
     pub fn avatar_of(&self, id: &str) -> Option<String> {
         let store = self.hub.store();
-        let row = store.conversation(&self.key(id)).ok().flatten().and_then(|row| row.avatar);
-        row.or_else(|| store.person(&self.key(id)).ok().flatten().and_then(|person| person.avatar)).map(|file| file.id)
+        let row = store
+            .conversation(&self.key(id))
+            .ok()
+            .flatten()
+            .and_then(|row| row.avatar);
+        row.or_else(|| {
+            store
+                .person(&self.key(id))
+                .ok()
+                .flatten()
+                .and_then(|person| person.avatar)
+        })
+        .map(|file| file.id)
     }
 
     // Calls. Signalling only; mediad carries the media.
 
     /// Someone is calling us in a conversation.
     pub fn ring(&self, conversation_id: &str, from: &str) {
-        self.hub.calls.ring(&self.hub, self.key(conversation_id), from);
+        self.hub
+            .calls
+            .ring(&self.hub, self.key(conversation_id), from);
     }
 
     /// The caller gave up, or another device answered.
     pub fn ring_stopped(&self, conversation_id: &str) {
-        self.hub.calls.ring_stopped(&self.hub, &self.key(conversation_id));
+        self.hub
+            .calls
+            .ring_stopped(&self.hub, &self.key(conversation_id));
     }
 
     /// We are ringing the other side of a direct call and nobody has answered yet.
     pub fn ringing_out(&self, conversation_id: &str) {
-        self.hub.calls.set_state(&self.hub, &self.key(conversation_id), CallState::RingingOut);
+        self.hub
+            .calls
+            .set_state(&self.hub, &self.key(conversation_id), CallState::RingingOut);
     }
 
     /// The other side of a call we rang picked up. Until this, a ring we placed is never shown
     /// as a call, whatever our own media is doing.
     pub fn answered(&self, conversation_id: &str) {
-        self.hub.calls.answered(&self.hub, &self.key(conversation_id));
+        self.hub
+            .calls
+            .answered(&self.hub, &self.key(conversation_id));
     }
 
     /// The network handed out the voice session for the call the user started, or a new one for
     /// a call that is already up (the voice server moved): mediad is told to join, or to rejoin.
     pub fn voice(&self, conversation_id: &str, voice: VoiceJoin) {
-        self.hub.calls.join(&self.hub, &self.key(conversation_id), voice);
+        self.hub
+            .calls
+            .join(&self.hub, &self.key(conversation_id), voice);
     }
 
     /// Everyone in the call but us, with their mute and deafen as the network shows them.
     pub fn participants(&self, conversation_id: &str, participants: Vec<Participant>) {
-        self.hub.calls.set_participants(&self.hub, &self.key(conversation_id), participants);
+        self.hub
+            .calls
+            .set_participants(&self.hub, &self.key(conversation_id), participants);
     }
 
     /// A Tiny server call: mediad's offer for this room, with mediad started for it first. A
     /// rejoin of the room the call is in keeps the call.
-    pub fn tiny_offer(&self, conversation_id: &str, offer: protocol::TinyOffer) -> Result<String, String> {
-        self.hub.calls.tiny_offer(&self.hub, &self.key(conversation_id), offer)
+    pub fn tiny_offer(
+        &self,
+        conversation_id: &str,
+        offer: protocol::TinyOffer,
+    ) -> Result<String, String> {
+        self.hub
+            .calls
+            .tiny_offer(&self.hub, &self.key(conversation_id), offer)
     }
 
     /// The server's answer to that offer: mediad connects with it.
     pub fn tiny_answer(&self, conversation_id: &str, sdp: String) {
-        self.hub.calls.tiny_answer(&self.hub, &self.key(conversation_id), sdp);
+        self.hub
+            .calls
+            .tiny_answer(&self.hub, &self.key(conversation_id), sdp);
     }
 
     /// Whose voice each receive slot carries.
     pub fn tiny_slots(&self, conversation_id: &str, audio: Vec<protocol::TinySlot>) {
-        self.hub.calls.tiny_slots(&self.hub, &self.key(conversation_id), audio);
+        self.hub
+            .calls
+            .tiny_slots(&self.hub, &self.key(conversation_id), audio);
     }
 
     /// The call in this room is over and the network already knows: mediad goes, quietly.
@@ -1080,13 +1335,17 @@ impl Context {
     /// A Tiny server moved us from one room to another: the call there, its mediad, devices,
     /// mute and deafen, now belong to the new room. False when no call was in `from`.
     pub fn tiny_moved(&self, from: &str, to: &str) -> bool {
-        self.hub.calls.retarget(&self.hub, &self.key(from), self.key(to))
+        self.hub
+            .calls
+            .retarget(&self.hub, &self.key(from), self.key(to))
     }
 
     /// A Tiny room's bitrate and whether it requires push-to-talk, for the call in it.
     pub fn tiny_room(&self, conversation_id: &str, kbps: u32, push_to_talk: bool) {
         if self.in_call(conversation_id) {
-            self.hub.calls.tiny_room(&self.hub, &self.key(conversation_id), kbps, push_to_talk);
+            self.hub
+                .calls
+                .tiny_room(&self.hub, &self.key(conversation_id), kbps, push_to_talk);
         }
     }
 
@@ -1108,7 +1367,9 @@ impl Context {
             reason,
             detail: detail.to_owned(),
         };
-        self.hub.calls.set_state(&self.hub, &self.key(conversation_id), failed);
+        self.hub
+            .calls
+            .set_state(&self.hub, &self.key(conversation_id), failed);
     }
 
     // Notes.
@@ -1154,8 +1415,16 @@ pub const BROKEN: &str = "Something went wrong in tinyclient with this account. 
 /// What the account says while it recovers from tinyclient's own failure.
 pub const RECOVERING: &str = "Something went wrong in tinyclient with this account. Trying again.";
 /// The pause before an adapter thread that panicked runs again.
-const PANIC_PAUSE: Duration = if cfg!(test) { Duration::from_millis(20) } else { Duration::from_secs(30) };
-const PANIC_PAUSE_COMMANDS: Duration = if cfg!(test) { Duration::from_millis(20) } else { Duration::from_secs(5) };
+const PANIC_PAUSE: Duration = if cfg!(test) {
+    Duration::from_millis(20)
+} else {
+    Duration::from_secs(30)
+};
+const PANIC_PAUSE_COMMANDS: Duration = if cfg!(test) {
+    Duration::from_millis(20)
+} else {
+    Duration::from_secs(5)
+};
 
 impl Context {
     /// A panic was caught on one of this adapter's threads. Answers true when it is the first
@@ -1163,7 +1432,10 @@ impl Context {
     /// account is offline with [`BROKEN`] until the user restarts tinyclient.
     fn panicked(&self, thread: &str) -> bool {
         let count = self.stop.panics.fetch_add(1, Ordering::Relaxed) + 1;
-        tracing::warn!("chatd: {}: the {thread} thread panicked ({count})", self.account.network.label());
+        tracing::warn!(
+            "chatd: {}: the {thread} thread panicked ({count})",
+            self.account.network.label()
+        );
         self.hub.forget_live(&self.account);
         if count > 1 {
             self.stop.stopped.store(true, Ordering::Relaxed);
@@ -1193,7 +1465,9 @@ impl Drops {
     /// was up longer than a minute; `pause` is the last pause, which a connection that never
     /// held doubles.
     fn next(&mut self, now: Instant, held: bool, pause: Duration) -> Duration {
-        let since = self.last.map_or(Duration::MAX, |last| now.saturating_duration_since(last));
+        let since = self
+            .last
+            .map_or(Duration::MAX, |last| now.saturating_duration_since(last));
         let decay = 0.5f64.powf(since.as_secs_f64() / DROPS_HALF_LIFE.as_secs_f64());
         self.count = self.count * decay + 1.;
         self.last = Some(now);
@@ -1217,7 +1491,11 @@ fn keep_connected(ctx: &Context, connect: impl FnMut() -> Failure) {
     keep_connected_with_backoff(ctx, connect, Duration::from_secs(1));
 }
 
-fn keep_connected_with_backoff(ctx: &Context, mut connect: impl FnMut() -> Failure, mut pause: Duration) {
+fn keep_connected_with_backoff(
+    ctx: &Context,
+    mut connect: impl FnMut() -> Failure,
+    mut pause: Duration,
+) {
     let mut drops = Drops::default();
     let mut attempt = 0u64;
     while !ctx.stopped() {
@@ -1241,19 +1519,31 @@ fn keep_connected_with_backoff(ctx: &Context, mut connect: impl FnMut() -> Failu
         }
         match failure {
             Failure::SignedOut(why) => {
-                tracing::warn!("chatd: {}: signed out: {}", ctx.account.network.label(), net::redact(&why));
+                tracing::warn!(
+                    "chatd: {}: signed out: {}",
+                    ctx.account.network.label(),
+                    net::redact(&why)
+                );
                 ctx.hub.forget_all_live(&ctx.account);
                 ctx.hub.set_link(&ctx.account, Link::Expired, &why);
                 return;
             }
             Failure::Dropped(why) => {
-                tracing::warn!("chatd: {}: {}", ctx.account.network.label(), net::redact(&why));
+                tracing::warn!(
+                    "chatd: {}: {}",
+                    ctx.account.network.label(),
+                    net::redact(&why)
+                );
             }
         }
         // A connection that held for a while earns a quick retry, unless it has been dropping
         // often. One that never holds backs off to a quarter of an hour: unattended, that is
         // under a hundred sign-ons a day, not 1,400.
-        pause = drops.next(Instant::now(), began.elapsed() > Duration::from_secs(60), pause);
+        pause = drops.next(
+            Instant::now(),
+            began.elapsed() > Duration::from_secs(60),
+            pause,
+        );
         attempt = attempt.saturating_add(1);
         tracing::info!(
             network = ctx.account.network.label(),
@@ -1267,24 +1557,33 @@ fn keep_connected_with_backoff(ctx: &Context, mut connect: impl FnMut() -> Failu
         let jitter = pause.mul_f64(0.25 * f64::from(now().unsigned_abs() as u32 % 1000) / 1000.);
         match ctx.reconnect_pause(pause + jitter, generation) {
             ReconnectWait::Stopped => return,
-            ReconnectWait::Elapsed => {},
+            ReconnectWait::Elapsed => {}
             ReconnectWait::Recovered => {
                 // A changed route or resume is a reason to try, not proof that
                 // the remote service is reachable. Failures still back off.
                 drops = Drops::default();
                 pause = Duration::from_secs(1);
                 ctx.hub.set_offline(&ctx.account, true);
-                tracing::warn!("chatd: {}: network changed or system resumed; retrying connection", ctx.account.network.label());
+                tracing::warn!(
+                    "chatd: {}: network changed or system resumed; retrying connection",
+                    ctx.account.network.label()
+                );
                 // Consume bursts on the next iteration and never attempt more
                 // often than once per second, even if hints keep arriving.
-                if ctx.pause(Duration::from_secs(1).saturating_sub(began.elapsed())) { return; }
-            },
+                if ctx.pause(Duration::from_secs(1).saturating_sub(began.elapsed())) {
+                    return;
+                }
+            }
         }
     }
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum ReconnectWait { Elapsed, Recovered, Stopped }
+enum ReconnectWait {
+    Elapsed,
+    Recovered,
+    Stopped,
+}
 
 /// A retry this close is "reconnecting"; one further off is plain offline.
 const RECONNECTING: Duration = Duration::from_secs(30);
@@ -1332,7 +1631,9 @@ pub(crate) fn serve_commands(
         let id = match urgent.pop_front() {
             Some(Command::Backfill(id)) => id,
             Some(command) => {
-                if catch_unwind(AssertUnwindSafe(|| other(command))).is_err() && (!ctx.panicked("command") || ctx.pause(PANIC_PAUSE_COMMANDS)) {
+                if catch_unwind(AssertUnwindSafe(|| other(command))).is_err()
+                    && (!ctx.panicked("command") || ctx.pause(PANIC_PAUSE_COMMANDS))
+                {
                     return;
                 }
                 continue;
@@ -1345,7 +1646,9 @@ pub(crate) fn serve_commands(
         if fetched.get(&id).is_some_and(|at| at.elapsed() < FRESH) {
             continue;
         }
-        if catch_unwind(AssertUnwindSafe(|| backfill(&id))).is_err() && (!ctx.panicked("command") || ctx.pause(PANIC_PAUSE_COMMANDS)) {
+        if catch_unwind(AssertUnwindSafe(|| backfill(&id))).is_err()
+            && (!ctx.panicked("command") || ctx.pause(PANIC_PAUSE_COMMANDS))
+        {
             return;
         }
         fetched.insert(id, Instant::now());
@@ -1379,7 +1682,12 @@ pub fn supported(network: Network) -> bool {
 /// An account id names a directory of the media cache, so it must be one plain file name:
 /// letters, digits, `.`, `_` and `-`, and neither of the two names that mean a directory.
 fn safe(id: &str) -> bool {
-    !id.is_empty() && id != "." && id != ".." && id.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+    !id.is_empty()
+        && id != "."
+        && id != ".."
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
 }
 
 /// The accounts inside one network's stored session. One Slack sign-in holds a workspace each.
@@ -1394,7 +1702,11 @@ pub fn accounts(network: Network, session: &str) -> Result<Vec<Signed>, String> 
         Network::Tiny => tiny::accounts(session)?,
     };
     match found.iter().find(|signed| !safe(&signed.account)) {
-        Some(bad) => Err(format!("{}: unusable account id {:?}", network.label(), bad.account)),
+        Some(bad) => Err(format!(
+            "{}: unusable account id {:?}",
+            network.label(),
+            bad.account
+        )),
         None => Ok(found),
     }
 }
@@ -1465,19 +1777,29 @@ mod tests {
     #[test]
     fn recovery_interrupts_a_fifteen_minute_reconnect_wait_without_rapid_attempts() {
         let hub = hub();
-        let account = AccountKey { network: Network::Signal, account: "recovery".into() };
+        let account = AccountKey {
+            network: Network::Signal,
+            account: "recovery".into(),
+        };
         let (_adapter, ctx, _inbox) = local(account.clone(), hub.clone());
         ctx.link(Link::Connected);
         let (attempted, attempts) = channel();
         let thread_ctx = ctx.clone();
         let thread = std::thread::spawn(move || {
             let mut count = 0;
-            keep_connected_with_backoff(&thread_ctx, || {
-                count += 1;
-                attempted.send(Instant::now()).unwrap();
-                if count == 1 { Failure::Dropped("offline".into()) }
-                else { Failure::SignedOut("test finished".into()) }
-            }, Duration::from_secs(900));
+            keep_connected_with_backoff(
+                &thread_ctx,
+                || {
+                    count += 1;
+                    attempted.send(Instant::now()).unwrap();
+                    if count == 1 {
+                        Failure::Dropped("offline".into())
+                    } else {
+                        Failure::SignedOut("test finished".into())
+                    }
+                },
+                Duration::from_secs(900),
+            );
         });
         let first = attempts.recv_timeout(Duration::from_secs(2)).unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -1485,28 +1807,57 @@ mod tests {
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(1));
         }
-        for _ in 0..100 { recovery::hint(&ctx.stop); }
-        let next = attempts.recv_timeout(Duration::from_secs(2)).expect("recovery must not wait out the 900 s delay");
-        assert!(next.duration_since(first) >= Duration::from_secs(1), "hints cannot create a rapid retry loop");
+        for _ in 0..100 {
+            recovery::hint(&ctx.stop);
+        }
+        let next = attempts
+            .recv_timeout(Duration::from_secs(2))
+            .expect("recovery must not wait out the 900 s delay");
+        assert!(
+            next.duration_since(first) >= Duration::from_secs(1),
+            "hints cannot create a rapid retry loop"
+        );
         thread.join().unwrap();
         assert_eq!(linked(&hub, &account).0, Link::Expired);
         recovery::hint(&ctx.stop);
-        assert!(attempts.try_recv().is_err(), "an expired session is never retried by a hint");
+        assert!(
+            attempts.try_recv().is_err(),
+            "an expired session is never retried by a hint"
+        );
     }
 
     #[test]
     fn recovery_during_a_failed_connect_is_not_lost_before_the_wait() {
-        let (_adapter, ctx, _inbox) = local(AccountKey { network: Network::Signal, account: "during".into() }, hub());
+        let (_adapter, ctx, _inbox) = local(
+            AccountKey {
+                network: Network::Signal,
+                account: "during".into(),
+            },
+            hub(),
+        );
         let generation = ctx.stop.recovery.load(Ordering::Relaxed);
         recovery::hint(&ctx.stop);
-        assert_eq!(ctx.reconnect_pause(Duration::from_secs(900), generation), ReconnectWait::Recovered);
+        assert_eq!(
+            ctx.reconnect_pause(Duration::from_secs(900), generation),
+            ReconnectWait::Recovered
+        );
         let generation = ctx.stop.recovery.load(Ordering::Relaxed);
-        assert_eq!(ctx.reconnect_pause(Duration::ZERO, generation), ReconnectWait::Elapsed, "a consumed hint does not wake every later wait");
+        assert_eq!(
+            ctx.reconnect_pause(Duration::ZERO, generation),
+            ReconnectWait::Elapsed,
+            "a consumed hint does not wake every later wait"
+        );
     }
 
     #[test]
     fn stopping_an_adapter_interrupts_its_reconnect_wait() {
-        let (adapter, ctx, _inbox) = local(AccountKey { network: Network::Signal, account: "stop".into() }, hub());
+        let (adapter, ctx, _inbox) = local(
+            AccountKey {
+                network: Network::Signal,
+                account: "stop".into(),
+            },
+            hub(),
+        );
         let thread = std::thread::spawn(move || ctx.reconnect_pause(Duration::from_secs(900), 0));
         drop(adapter);
         assert_eq!(thread.join().unwrap(), ReconnectWait::Stopped);
@@ -1514,7 +1865,13 @@ mod tests {
 
     #[test]
     fn recovery_hints_do_not_bypass_http_or_command_pacing() {
-        let (_adapter, ctx, _inbox) = local(AccountKey { network: Network::Signal, account: "pacing".into() }, hub());
+        let (_adapter, ctx, _inbox) = local(
+            AccountKey {
+                network: Network::Signal,
+                account: "pacing".into(),
+            },
+            hub(),
+        );
         let thread_ctx = ctx.clone();
         let (started, waiting) = channel();
         let thread = std::thread::spawn(move || {
@@ -1526,16 +1883,24 @@ mod tests {
         waiting.recv_timeout(Duration::from_secs(2)).unwrap();
         recovery::hint(&ctx.stop);
         // Timed inside the pause, so a slow runner cannot make it look early.
-        assert!(thread.join().unwrap() >= Duration::from_millis(150), "a hint does not cut a pacing pause short");
+        assert!(
+            thread.join().unwrap() >= Duration::from_millis(150),
+            "a hint does not cut a pacing pause short"
+        );
     }
 
     fn hub() -> Arc<Hub> {
-        Arc::new(Hub::new(Store::open(std::path::Path::new(":memory:")).expect("a store in memory")))
+        Arc::new(Hub::new(
+            Store::open(std::path::Path::new(":memory:")).expect("a store in memory"),
+        ))
     }
 
     fn linked(hub: &Hub, account: &AccountKey) -> (Link, String) {
         let links = hub.links();
-        let linked = links.iter().find(|linked| linked.account == *account).expect("the account is linked");
+        let linked = links
+            .iter()
+            .find(|linked| linked.account == *account)
+            .expect("the account is linked");
         (linked.link, linked.detail.clone())
     }
 
@@ -1551,32 +1916,53 @@ mod tests {
             pauses.push(pause.as_secs());
         }
         assert_eq!(pauses[..2], [1, 1], "the first drops retry at once");
-        assert!(pauses.windows(2).all(|pair| pair[1] >= pair[0]), "{pauses:?}");
-        assert!(pauses[11] >= 120, "after twelve drops in twelve minutes it waits minutes: {pauses:?}");
+        assert!(
+            pauses.windows(2).all(|pair| pair[1] >= pair[0]),
+            "{pauses:?}"
+        );
+        assert!(
+            pauses[11] >= 120,
+            "after twelve drops in twelve minutes it waits minutes: {pauses:?}"
+        );
         // An hour of quiet: the count has decayed, and a drop retries in a second again.
         let quiet = drops.next(t0 + minute * 80, true, pause);
         assert!(quiet <= Duration::from_secs(2), "{quiet:?}");
         // One that never held doubles, up to the ceiling, whatever the count.
-        assert_eq!(drops.next(t0 + minute * 81, false, Duration::from_secs(8)), Duration::from_secs(16));
-        assert_eq!(drops.next(t0 + minute * 82, false, RETRY_CEILING), RETRY_CEILING);
+        assert_eq!(
+            drops.next(t0 + minute * 81, false, Duration::from_secs(8)),
+            Duration::from_secs(16)
+        );
+        assert_eq!(
+            drops.next(t0 + minute * 82, false, RETRY_CEILING),
+            RETRY_CEILING
+        );
     }
 
     #[test]
     fn a_panicking_command_is_recovered_from_once_and_the_second_stops_the_account_with_words() {
         let hub = hub();
-        let account = AccountKey { network: Network::Slack, account: "T1".into() };
+        let account = AccountKey {
+            network: Network::Slack,
+            account: "T1".into(),
+        };
         let (adapter, ctx, inbox) = local(account.clone(), hub.clone());
         ctx.link(Link::Connected);
         let served = Arc::new(Mutex::new(Vec::new()));
         let seen = served.clone();
         let thread_ctx = ctx.clone();
         let thread = std::thread::spawn(move || {
-            serve_commands(&thread_ctx, inbox, Duration::ZERO, |id| {
-                if id.starts_with("bad") {
-                    panic!("a bug in the adapter");
-                }
-                lock(&seen).push(id.to_owned());
-            }, |_| {})
+            serve_commands(
+                &thread_ctx,
+                inbox,
+                Duration::ZERO,
+                |id| {
+                    if id.starts_with("bad") {
+                        panic!("a bug in the adapter");
+                    }
+                    lock(&seen).push(id.to_owned());
+                },
+                |_| {},
+            )
         });
         adapter.command(Command::Backfill("bad1".into()));
         adapter.command(Command::Backfill("good".into()));
@@ -1584,10 +1970,20 @@ mod tests {
         while lock(&served).is_empty() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(*lock(&served), ["good"], "the thread served on after the first panic");
-        assert_eq!(linked(&hub, &account), (Link::Connected, String::new()), "one recovered panic leaves the link alone");
+        assert_eq!(
+            *lock(&served),
+            ["good"],
+            "the thread served on after the first panic"
+        );
+        assert_eq!(
+            linked(&hub, &account),
+            (Link::Connected, String::new()),
+            "one recovered panic leaves the link alone"
+        );
         adapter.command(Command::Backfill("bad2".into()));
-        thread.join().expect("the panic was caught, not carried out of the thread");
+        thread
+            .join()
+            .expect("the panic was caught, not carried out of the thread");
         assert!(ctx.stopped());
         assert_eq!(linked(&hub, &account), (Link::Offline, BROKEN.to_owned()));
     }
@@ -1595,7 +1991,10 @@ mod tests {
     #[test]
     fn a_panicking_connection_says_why_and_is_connected_again_once() {
         let hub = hub();
-        let account = AccountKey { network: Network::Discord, account: "1".into() };
+        let account = AccountKey {
+            network: Network::Discord,
+            account: "1".into(),
+        };
         let (_adapter, ctx, _inbox) = local(account.clone(), hub.clone());
         let mut attempts = 0;
         let mut said = None;
@@ -1609,7 +2008,11 @@ mod tests {
             Failure::SignedOut("done".into())
         });
         assert_eq!(attempts, 2, "restarted once");
-        assert_eq!(said, Some((Link::Offline, RECOVERING.to_owned())), "while it recovered the account said why");
+        assert_eq!(
+            said,
+            Some((Link::Offline, RECOVERING.to_owned())),
+            "while it recovered the account said why"
+        );
         assert_eq!(linked(&hub, &account).0, Link::Expired);
     }
 }

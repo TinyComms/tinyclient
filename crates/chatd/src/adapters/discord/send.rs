@@ -42,11 +42,21 @@ fn shown_name(name: &str, spoiler: bool) -> String {
 impl Discord {
     /// The work of one `SendWith`, run by the upload helper on a thread of its own, which reads
     /// the files and ends the send through `Context::sent`.
-    pub(super) fn send_with(&self, channel: &str, client_id: &str, text: &str, reply_to: Option<&str>, with: &Outgoing, up: &mut Upload) -> Result<Message, String> {
+    pub(super) fn send_with(
+        &self,
+        channel: &str,
+        client_id: &str,
+        text: &str,
+        reply_to: Option<&str>,
+        with: &Outgoing,
+        up: &mut Upload,
+    ) -> Result<Message, String> {
         let premium = self.state.lock().unwrap().premium;
         let longest = if premium == 2 { 2 * LONGEST } else { LONGEST };
         if text.chars().count() > longest {
-            return Err(format!("Message too long: Discord allows {longest} characters."));
+            return Err(format!(
+                "Message too long: Discord allows {longest} characters."
+            ));
         }
         if with.schedule.is_some() {
             return Err("Discord cannot schedule a message.".to_owned());
@@ -63,14 +73,22 @@ impl Discord {
             return Err(format!("Discord takes {FILES} files in one message."));
         }
         if let Some(big) = up.files().iter().find(|file| file.bytes > most) {
-            return Err(format!("{} is too big for Discord (limit {} MB).", big.name, most >> 20));
+            return Err(format!(
+                "{} is too big for Discord (limit {} MB).",
+                big.name,
+                most >> 20
+            ));
         }
 
         let mut content = text.to_owned();
         let mut stickers = Vec::new();
         match &with.pick {
             Some(pick) if pick.kind == CatalogKind::Gifs => {
-                content = if content.is_empty() { pick.id.clone() } else { format!("{content}\n{}", pick.id) };
+                content = if content.is_empty() {
+                    pick.id.clone()
+                } else {
+                    format!("{content}\n{}", pick.id)
+                };
             }
             Some(pick) if pick.kind == CatalogKind::Stickers => stickers.push(pick.id.clone()),
             _ => {}
@@ -105,10 +123,14 @@ impl Discord {
             }
             body["message_reference"] = reference;
             // The ping toggle: the author of the original is notified only when it is on.
-            body["allowed_mentions"] = json!({"parse": ["users", "roles", "everyone"], "replied_user": with.ping});
+            body["allowed_mentions"] =
+                json!({"parse": ["users", "roles", "everyone"], "replied_user": with.ping});
         }
-        let accepted = self.call("POST", &format!("/channels/{channel}/messages"), Some(body)).map_err(|refused| refused.reason())?;
-        let posted: Posted = serde_json::from_str(&accepted).map_err(|err| format!("Discord's answer was unreadable: {err}"))?;
+        let accepted = self
+            .call("POST", &format!("/channels/{channel}/messages"), Some(body))
+            .map_err(|refused| refused.reason())?;
+        let posted: Posted = serde_json::from_str(&accepted)
+            .map_err(|err| format!("Discord's answer was unreadable: {err}"))?;
         let (message, files) = self.convert(&posted, guild.as_deref(), conversation.kind);
         let _ = files.register(&self.ctx);
         Ok(message)
@@ -121,7 +143,11 @@ impl Discord {
         if up.files().is_empty() {
             return Ok(Vec::new());
         }
-        let names: Vec<String> = up.files().iter().map(|file| shown_name(&file.name, file.spoiler)).collect();
+        let names: Vec<String> = up
+            .files()
+            .iter()
+            .map(|file| shown_name(&file.name, file.spoiler))
+            .collect();
         let named: Vec<Value> = up
             .files()
             .iter()
@@ -129,8 +155,13 @@ impl Discord {
             .enumerate()
             .map(|(at, (file, name))| json!({"id": at.to_string(), "filename": name, "file_size": file.bytes, "is_clip": false}))
             .collect();
-        let asked = self.call("POST", &format!("/channels/{channel}/attachments"), Some(json!({"files": named})));
-        let slots: Slots = serde_json::from_str(&asked.map_err(|refused| refused.reason())?).map_err(|err| format!("Discord's answer was unreadable: {err}"))?;
+        let asked = self.call(
+            "POST",
+            &format!("/channels/{channel}/attachments"),
+            Some(json!({"files": named})),
+        );
+        let slots: Slots = serde_json::from_str(&asked.map_err(|refused| refused.reason())?)
+            .map_err(|err| format!("Discord's answer was unreadable: {err}"))?;
         if slots.attachments.len() != names.len() {
             return Err("Discord did not take every file.".to_owned());
         }
@@ -138,10 +169,16 @@ impl Discord {
         let mut attachments = Vec::with_capacity(names.len());
         for (at, (slot, name)) in slots.attachments.iter().zip(&names).enumerate() {
             // The address is the storage bucket's own: the session's headers do not go there.
-            let target = Target::put(&slot.upload_url).header("Content-Type", "application/octet-stream").header("User-Agent", &agent);
+            let target = Target::put(&slot.upload_url)
+                .header("Content-Type", "application/octet-stream")
+                .header("User-Agent", &agent);
             if let Err(why) = up.send(at, &target) {
                 for gone in &slots.attachments[..at] {
-                    let _ = self.call("DELETE", &format!("/attachments/{}", gone.upload_filename), None);
+                    let _ = self.call(
+                        "DELETE",
+                        &format!("/attachments/{}", gone.upload_filename),
+                        None,
+                    );
                 }
                 return Err(why);
             }

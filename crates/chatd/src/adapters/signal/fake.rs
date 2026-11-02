@@ -29,7 +29,9 @@
 //! The account: Ada Quill (us); Grace Ombra and Alan Ferro, both contacts; the group "Bridge
 //! club" with all three of us in it.
 
-use super::wire::{Body, Contact, Event, Fault, GroupInfo, Linked, Linker, Peer, Quote, Text, Wire};
+use super::wire::{
+    Body, Contact, Event, Fault, GroupInfo, Linked, Linker, Peer, Quote, Text, Wire,
+};
 use super::Saved;
 use crate::adapters::script;
 use std::io::Write;
@@ -60,7 +62,11 @@ fn who(word: &str) -> Option<(&'static str, &'static str)> {
 
 fn record(line: &str) {
     let path = protocol::support_dir().join("signal.calls");
-    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
         let _ = writeln!(file, "{line}");
     }
 }
@@ -78,12 +84,28 @@ impl Fake {
     pub fn open(_saved: &Saved) -> Fake {
         let (events, heard) = channel();
         // What the phone says once a device connects: its contacts, its groups, its settings.
-        let grace = Contact { id: GRACE.into(), name: "Grace Ombra".into(), phone: "+15550100002".into() };
-        let alan = Contact { id: ALAN.into(), name: "Alan Ferro".into(), phone: String::new() };
+        let grace = Contact {
+            id: GRACE.into(),
+            name: "Grace Ombra".into(),
+            phone: "+15550100002".into(),
+        };
+        let alan = Contact {
+            id: ALAN.into(),
+            name: "Alan Ferro".into(),
+            phone: String::new(),
+        };
         let _ = events.send(Event::Contacts(vec![grace, alan]));
-        let club = GroupInfo { id: CLUB.into(), title: "Bridge club".into(), description: "Tuesdays, 7 pm".into(), members: 3 };
+        let club = GroupInfo {
+            id: CLUB.into(),
+            title: "Bridge club".into(),
+            description: "Tuesdays, 7 pm".into(),
+            members: 3,
+        };
         let _ = events.send(Event::Groups(vec![club]));
-        let _ = events.send(Event::Settings { read_receipts: true, typing: true });
+        let _ = events.send(Event::Settings {
+            read_receipts: true,
+            typing: true,
+        });
         let _ = events.send(Event::Caught);
         let fake = Fake {
             events,
@@ -99,25 +121,35 @@ impl Fake {
 
     /// Reads the test's lines for as long as this wire lives; closing the wire ends it.
     fn listen(&self) {
-        let (events, closed, refuse, control) = (self.events.clone(), self.closed.clone(), self.refuse.clone(), self.control.clone());
-        let _ = std::thread::Builder::new().name("signal-fake".into()).spawn(move || {
-            script::follow(&control, |line| {
-                if closed.load(Ordering::Relaxed) {
-                    return false;
-                }
-                let Some(line) = line.map(str::trim) else {
-                    return true;
-                };
-                if let Some(words) = line.strip_prefix("refuse ") {
-                    *refuse.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(words.to_owned());
-                    return true;
-                }
-                for event in steer(line) {
-                    let _ = events.send(event);
-                }
-                true
+        let (events, closed, refuse, control) = (
+            self.events.clone(),
+            self.closed.clone(),
+            self.refuse.clone(),
+            self.control.clone(),
+        );
+        let _ = std::thread::Builder::new()
+            .name("signal-fake".into())
+            .spawn(move || {
+                script::follow(&control, |line| {
+                    if closed.load(Ordering::Relaxed) {
+                        return false;
+                    }
+                    let Some(line) = line.map(str::trim) else {
+                        return true;
+                    };
+                    if let Some(words) = line.strip_prefix("refuse ") {
+                        *refuse
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                            Some(words.to_owned());
+                        return true;
+                    }
+                    for event in steer(line) {
+                        let _ = events.send(event);
+                    }
+                    true
+                });
             });
-        });
     }
 }
 
@@ -128,19 +160,33 @@ fn steer(line: &str) -> Vec<Event> {
     let mut next = || words.next().unwrap_or("");
     let direct = |id: &str| Peer::Direct(id.to_owned());
     let club = || Peer::Group(CLUB.to_owned());
-    let rest = |line: &str, skip: usize| line.split_whitespace().skip(skip).collect::<Vec<_>>().join(" ");
+    let rest = |line: &str, skip: usize| {
+        line.split_whitespace()
+            .skip(skip)
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
     match command {
         "incoming" | "group" | "mention" | "photo" | "quote" => {
             let Some((author, name)) = who(next()) else {
                 return Vec::new();
             };
             let sent = next().parse().unwrap_or(T0);
-            let mut text = Text { author: author.into(), name: name.into(), sent, ..Text::default() };
+            let mut text = Text {
+                author: author.into(),
+                name: name.into(),
+                sent,
+                ..Text::default()
+            };
             match command {
                 "photo" => text.unsupported = Some("Photo".into()),
                 "quote" => {
                     let quoted = next().parse().unwrap_or(0);
-                    text.quote = Some(Quote { sent: quoted, author: ME.into(), text: String::new() });
+                    text.quote = Some(Quote {
+                        sent: quoted,
+                        author: ME.into(),
+                        text: String::new(),
+                    });
                     text.text = rest(line, 4);
                 }
                 "mention" => {
@@ -149,14 +195,32 @@ fn steer(line: &str) -> Vec<Event> {
                 }
                 _ => text.text = rest(line, 3),
             }
-            let peer = if matches!(command, "group" | "mention") { club() } else { direct(author) };
-            vec![Event::Message { peer, text, outgoing: false }]
+            let peer = if matches!(command, "group" | "mention") {
+                club()
+            } else {
+                direct(author)
+            };
+            vec![Event::Message {
+                peer,
+                text,
+                outgoing: false,
+            }]
         }
         "mine" | "note" => {
             let sent = next().parse().unwrap_or(T0);
-            let text = Text { author: ME.into(), name: "Ada Quill".into(), sent, text: rest(line, 2), ..Text::default() };
+            let text = Text {
+                author: ME.into(),
+                name: "Ada Quill".into(),
+                sent,
+                text: rest(line, 2),
+                ..Text::default()
+            };
             let peer = direct(if command == "note" { ME } else { GRACE });
-            vec![Event::Message { peer, text, outgoing: true }]
+            vec![Event::Message {
+                peer,
+                text,
+                outgoing: true,
+            }]
         }
         "edit" | "delete" => {
             let Some((author, _)) = who(next()) else {
@@ -164,8 +228,17 @@ fn steer(line: &str) -> Vec<Event> {
             };
             let target = next().parse().unwrap_or(0);
             match command {
-                "edit" => vec![Event::Edited { peer: direct(author), author: author.into(), target, text: rest(line, 3) }],
-                _ => vec![Event::Deleted { peer: direct(author), author: author.into(), target }],
+                "edit" => vec![Event::Edited {
+                    peer: direct(author),
+                    author: author.into(),
+                    target,
+                    text: rest(line, 3),
+                }],
+                _ => vec![Event::Deleted {
+                    peer: direct(author),
+                    author: author.into(),
+                    target,
+                }],
             }
         }
         "react" | "unreact" => {
@@ -178,28 +251,49 @@ fn steer(line: &str) -> Vec<Event> {
             };
             let target = next().parse().unwrap_or(0);
             let emoji = next().to_owned();
-            vec![Event::Reacted { peer: direct(by), by: by.into(), author: author.into(), target, emoji, removed: command == "unreact" }]
+            vec![Event::Reacted {
+                peer: direct(by),
+                by: by.into(),
+                author: author.into(),
+                target,
+                emoji,
+                removed: command == "unreact",
+            }]
         }
         "read" => {
             let Some((author, _)) = who(next()) else {
                 return Vec::new();
             };
-            vec![Event::ReadElsewhere(vec![(author.into(), next().parse().unwrap_or(0))])]
+            vec![Event::ReadElsewhere(vec![(
+                author.into(),
+                next().parse().unwrap_or(0),
+            )])]
         }
         "seen" | "delivered" => {
             let Some((by, _)) = who(next()) else {
                 return Vec::new();
             };
-            vec![Event::Receipt { by: by.into(), sent: vec![next().parse().unwrap_or(0)], read: command == "seen" }]
+            vec![Event::Receipt {
+                by: by.into(),
+                sent: vec![next().parse().unwrap_or(0)],
+                read: command == "seen",
+            }]
         }
         "typing" | "typing-stop" => {
             let Some((by, name)) = who(next()) else {
                 return Vec::new();
             };
-            vec![Event::Typing { peer: direct(by), by: by.into(), name: name.into(), started: command == "typing" }]
+            vec![Event::Typing {
+                peer: direct(by),
+                by: by.into(),
+                name: name.into(),
+                started: command == "typing",
+            }]
         }
         "drop" => vec![Event::Closed("the fake dropped the connection".into())],
-        "unlinked" => vec![Event::Ended("This computer was removed from your Signal account.".into())],
+        "unlinked" => vec![Event::Ended(
+            "This computer was removed from your Signal account.".into(),
+        )],
         _ => Vec::new(),
     }
 }
@@ -210,7 +304,10 @@ fn describe(to: &Peer) -> String {
 
 impl Wire for Fake {
     fn events(&self) -> Option<Receiver<Event>> {
-        self.heard.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take()
+        self.heard
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
     }
 
     fn me(&self) -> (String, String) {
@@ -222,26 +319,54 @@ impl Wire for Fake {
             return Err(Fault::Net("closed".into()));
         }
         let line = match &body {
-            Body::Text { text, quote: Some(quote) } => format!("send {} text {text} (answering {}-{})", describe(to), quote.sent, quote.author),
+            Body::Text {
+                text,
+                quote: Some(quote),
+            } => format!(
+                "send {} text {text} (answering {}-{})",
+                describe(to),
+                quote.sent,
+                quote.author
+            ),
             Body::Text { text, quote: None } => format!("send {} text {text}", describe(to)),
-            Body::React { author, target, emoji, remove } => format!("send {} react {target}-{author} {emoji} remove={remove}", describe(to)),
+            Body::React {
+                author,
+                target,
+                emoji,
+                remove,
+            } => format!(
+                "send {} react {target}-{author} {emoji} remove={remove}",
+                describe(to)
+            ),
             Body::Edit { target, text } => format!("send {} edit {target} {text}", describe(to)),
             Body::Delete { target } => format!("send {} delete {target}", describe(to)),
         };
         record(&line);
-        if let Some(words) = self.refuse.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take() {
+        if let Some(words) = self
+            .refuse
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
             return Err(Fault::Refused(words));
         }
         Ok(self.clock.fetch_add(1_000, Ordering::Relaxed))
     }
 
     fn typing(&self, to: &Peer, started: bool) -> Result<(), Fault> {
-        record(&format!("typing {} {}", describe(to), if started { "started" } else { "stopped" }));
+        record(&format!(
+            "typing {} {}",
+            describe(to),
+            if started { "started" } else { "stopped" }
+        ));
         Ok(())
     }
 
     fn read(&self, read: &[(String, u64)], receipts: bool) -> Result<(), Fault> {
-        let read: Vec<String> = read.iter().map(|(author, sent)| format!("{sent}-{author}")).collect();
+        let read: Vec<String> = read
+            .iter()
+            .map(|(author, sent)| format!("{sent}-{author}"))
+            .collect();
         record(&format!("read receipts={receipts} {}", read.join(",")));
         Ok(())
     }
@@ -255,7 +380,10 @@ impl Wire for Fake {
     fn picture(&self, of: &Peer) -> Result<Option<Vec<u8>>, Fault> {
         record(&format!("picture {}", describe(of)));
         const PNG: &str = "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de0000000c4944415408d763f8cfc0000000020001e221bc330000000049454e44ae426082";
-        let png = (0..PNG.len()).step_by(2).filter_map(|at| u8::from_str_radix(&PNG[at..at + 2], 16).ok()).collect();
+        let png = (0..PNG.len())
+            .step_by(2)
+            .filter_map(|at| u8::from_str_radix(&PNG[at..at + 2], 16).ok())
+            .collect();
         Ok((*of == Peer::Direct(GRACE.to_owned())).then_some(png))
     }
 
@@ -275,7 +403,12 @@ impl Drop for Fake {
 pub struct FakeLinker;
 
 impl Linker for FakeLinker {
-    fn link(self: Box<Self>, device: &str, show: &dyn Fn(String), cancelled: Arc<AtomicBool>) -> Result<Linked, Fault> {
+    fn link(
+        self: Box<Self>,
+        device: &str,
+        show: &dyn Fn(String),
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<Linked, Fault> {
         record(&format!("link {device}"));
         let control = script::control("signal.signin.ctl");
         show(LINK.to_owned());
@@ -288,8 +421,16 @@ impl Linker for FakeLinker {
             }
             match line.map(str::trim) {
                 Some("scan") => {
-                    let saved = Saved { aci: ME.into(), name: "Ada Quill".into(), vault: VAULT.into() };
-                    outcome = Some(serde_json::to_string(&saved).map(|session| Linked { session }).map_err(|err| Fault::Net(err.to_string())));
+                    let saved = Saved {
+                        aci: ME.into(),
+                        name: "Ada Quill".into(),
+                        vault: VAULT.into(),
+                    };
+                    outcome = Some(
+                        serde_json::to_string(&saved)
+                            .map(|session| Linked { session })
+                            .map_err(|err| Fault::Net(err.to_string())),
+                    );
                     false
                 }
                 Some("expire") => {
@@ -303,6 +444,10 @@ impl Linker for FakeLinker {
                 _ => true,
             }
         });
-        outcome.unwrap_or_else(|| Err(Fault::Net("the fake's control file could not be read".into())))
+        outcome.unwrap_or_else(|| {
+            Err(Fault::Net(
+                "the fake's control file could not be read".into(),
+            ))
+        })
     }
 }

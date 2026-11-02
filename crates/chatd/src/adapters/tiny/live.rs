@@ -18,10 +18,13 @@
 //! without audio a join only takes a seat, and nothing here touches mediad.
 
 use super::super::discord::gateway::{wait_sockets, Pollable, WakePair, POLL_IN, POLL_OUT};
-use super::super::{net, Context, Refusal, Reply, ReconnectWait, PANIC_PAUSE, RECONNECTING};
-use crate::hub::lock;
+use super::super::{net, Context, ReconnectWait, Refusal, Reply, PANIC_PAUSE, RECONNECTING};
 use super::{members_of, Saved};
-use protocol::{join_host, CallFailure, CallState, Cue, Link, MediaRequest, Occupant, Participant, PictureKind, Presence, TinyE2ee, TinyOffer, TinyPicture, TinySeat, TinySlot};
+use crate::hub::lock;
+use protocol::{
+    join_host, CallFailure, CallState, Cue, Link, MediaRequest, Occupant, Participant, PictureKind,
+    Presence, TinyE2ee, TinyOffer, TinyPicture, TinySeat, TinySlot,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -101,11 +104,13 @@ const LOST: &str = "The connection to the server dropped. Try again.";
 const NO_ANSWER: &str = "The server didn't answer. Try again.";
 const BUSY: &str = "Wait for the last request to finish.";
 const AUDIO_DOWN: &str = "This server's audio is down. Try again later.";
-const MEDIA_TIMEOUT: &str = "Call audio couldn't connect to the server. A VPN or firewall may be blocking it.";
+const MEDIA_TIMEOUT: &str =
+    "Call audio couldn't connect to the server. A VPN or firewall may be blocking it.";
 const MEDIA_LOST: &str = "The server stopped hearing this call's audio, so you've left the call.";
 /// The sentence mediad used to end a Tiny call that did not come back. Said once the resume
 /// budget is spent, in the same voice as a Discord call that did not come back.
-const DROPPED: &str = "The connection to the server dropped and didn't come back. You've left the call.";
+const DROPPED: &str =
+    "The connection to the server dropped and didn't come back. You've left the call.";
 /// A reason this build has no words of its own for: a newer server's.
 const SERVER_ENDED: &str = "The server ended this call.";
 const KICKED: &str = "You were removed from the call.";
@@ -119,28 +124,60 @@ pub(crate) const REPLACED: &str = "This account connected on another device, so 
 
 /// What the command thread hands the socket thread.
 pub enum Ask {
-    Join { room_id: String, reply: Reply<()> },
-    Leave { reply: Reply<()> },
-    Kick { room_id: String, user_id: String, reply: Reply<()> },
+    Join {
+        room_id: String,
+        reply: Reply<()>,
+    },
+    Leave {
+        reply: Reply<()>,
+    },
+    Kick {
+        room_id: String,
+        user_id: String,
+        reply: Reply<()>,
+    },
     /// The page was opened. A socket another device replaced tries again.
     Look,
     /// The call in this room ended in chatd (hung up, or failed): leave it on the server if
     /// we are still in it there.
-    Hangup { room_id: String },
+    Hangup {
+        room_id: String,
+    },
     /// Our mute and deafen changed in a call with audio.
-    State { muted: bool, deafened: bool },
+    State {
+        muted: bool,
+        deafened: bool,
+    },
     /// The draft in this conversation is changing. The shell already paces it.
-    Type { conversation_id: String },
+    Type {
+        conversation_id: String,
+    },
     /// Server-mute or server-deafen someone in a room's call, or undo it. `None` leaves it.
-    Moderate { room_id: String, user_id: String, server_muted: Option<bool>, server_deafened: Option<bool>, reply: Reply<()> },
+    Moderate {
+        room_id: String,
+        user_id: String,
+        server_muted: Option<bool>,
+        server_deafened: Option<bool>,
+        reply: Reply<()>,
+    },
     /// Move someone in a call to another room.
-    Move { user_id: String, room_id: String, reply: Reply<()> },
+    Move {
+        user_id: String,
+        room_id: String,
+        reply: Reply<()>,
+    },
     /// The priority key is held, or let go: told to the server with our mute and deafen.
-    Priority { on: bool },
+    Priority {
+        on: bool,
+    },
     /// A `call.e2ee` frame from mediad, for the server as it is.
-    E2ee { frame: String },
+    E2ee {
+        frame: String,
+    },
     /// A renegotiation offer from mediad, for `call.offer`.
-    Offer { sdp: String },
+    Offer {
+        sdp: String,
+    },
     /// mediad lost the link, and the call is still up. Join again after the resume pause. Not
     /// kept while the socket is down: the call's state says it, and `ready` reads that.
     Resume,
@@ -151,8 +188,20 @@ pub enum Ask {
 impl Ask {
     fn into_reply(self) -> Option<Reply<()>> {
         match self {
-            Ask::Join { reply, .. } | Ask::Leave { reply } | Ask::Kick { reply, .. } | Ask::Moderate { reply, .. } | Ask::Move { reply, .. } => Some(reply),
-            Ask::Look | Ask::Hangup { .. } | Ask::State { .. } | Ask::Type { .. } | Ask::Priority { .. } | Ask::E2ee { .. } | Ask::Offer { .. } | Ask::Resume | Ask::Settled => None,
+            Ask::Join { reply, .. }
+            | Ask::Leave { reply }
+            | Ask::Kick { reply, .. }
+            | Ask::Moderate { reply, .. }
+            | Ask::Move { reply, .. } => Some(reply),
+            Ask::Look
+            | Ask::Hangup { .. }
+            | Ask::State { .. }
+            | Ask::Type { .. }
+            | Ask::Priority { .. }
+            | Ask::E2ee { .. }
+            | Ask::Offer { .. }
+            | Ask::Resume
+            | Ask::Settled => None,
         }
     }
 
@@ -251,7 +300,11 @@ impl Live {
         let refused: Vec<Ask> = {
             let mut inner = lock(&self.inner);
             inner.connected = connected;
-            if connected { Vec::new() } else { inner.queued.drain(..).collect() }
+            if connected {
+                Vec::new()
+            } else {
+                inner.queued.drain(..).collect()
+            }
         };
         refused.into_iter().for_each(|ask| ask.refuse(LOST));
     }
@@ -346,22 +399,52 @@ struct Sitting {
 
 impl Sitting {
     fn new(user: &str) -> Sitting {
-        Sitting { user: user.to_owned(), ..Sitting::default() }
+        Sitting {
+            user: user.to_owned(),
+            ..Sitting::default()
+        }
     }
 
     /// The flags a participant object carries, on the frame itself or in its `participant`.
     /// An older server sends none: all off.
     fn heard(&mut self, frame: &Value) {
-        let from = frame.get("participant").filter(|inner| inner.is_object()).unwrap_or(frame);
+        let from = frame
+            .get("participant")
+            .filter(|inner| inner.is_object())
+            .unwrap_or(frame);
         let flag = |field| from.get(field).and_then(Value::as_bool).unwrap_or(false);
         (self.muted, self.deafened) = (flag("muted"), flag("deafened"));
-        (self.server_muted, self.server_deafened, self.suppressed, self.priority) = (flag("server_muted"), flag("server_deafened"), flag("suppressed"), flag("priority"));
+        (
+            self.server_muted,
+            self.server_deafened,
+            self.suppressed,
+            self.priority,
+        ) = (
+            flag("server_muted"),
+            flag("server_deafened"),
+            flag("suppressed"),
+            flag("priority"),
+        );
         (self.camera, self.sharing) = (flag("camera"), flag("sharing"));
     }
 
-    /// What the server enforces changed: the page reads it again.
-    fn moderated(&self, before: &Sitting) -> bool {
-        (self.server_muted, self.server_deafened, self.suppressed) != (before.server_muted, before.server_deafened, before.suppressed)
+    /// What the server enforces changed, or a camera or share started or stopped: the page reads
+    /// it again. Its seats carry those flags, and the stage offers a picture to watch only from
+    /// them, so a share that began after the page was read would otherwise never be shown.
+    fn reread(&self, before: &Sitting) -> bool {
+        (
+            self.server_muted,
+            self.server_deafened,
+            self.suppressed,
+            self.camera,
+            self.sharing,
+        ) != (
+            before.server_muted,
+            before.server_deafened,
+            before.suppressed,
+            before.camera,
+            before.sharing,
+        )
     }
 }
 
@@ -413,14 +496,19 @@ fn words(someone: bool, code: &str) -> &'static str {
         "bad_frame" => "The server couldn't read that request.",
         "bad_sdp" => "The server couldn't use tinyclient's audio setup.",
         "media_unavailable" => "This server's audio isn't available. Try again later.",
-        "e2ee_required" => "This room only takes calls encrypted end to end, and this one couldn't be. Try again.",
+        "e2ee_required" => {
+            "This room only takes calls encrypted end to end, and this one couldn't be. Try again."
+        }
         _ => "That didn't work. Try again.",
     }
 }
 
 /// `http://host:8080` is `ws://host:8080/v1/live`, `https` is `wss`.
 fn live_url(base: &str, since: Option<i64>) -> Option<String> {
-    let rest = base.strip_prefix("https://").map(|rest| ("wss://", rest)).or_else(|| base.strip_prefix("http://").map(|rest| ("ws://", rest)));
+    let rest = base
+        .strip_prefix("https://")
+        .map(|rest| ("wss://", rest))
+        .or_else(|| base.strip_prefix("http://").map(|rest| ("ws://", rest)));
     let (scheme, rest) = rest?;
     let rest = rest.trim_end_matches('/');
     Some(match since {
@@ -463,7 +551,9 @@ pub(super) fn keep_live(ctx: &Context, saved: &Saved, live: &Live, timing: &Timi
     while !ctx.stopped() {
         let generation = ctx.stop.recovery.load(Ordering::Relaxed);
         let began = Instant::now();
-        let end = match catch_unwind(AssertUnwindSafe(|| connect(ctx, saved, live, &mut seat, timing))) {
+        let end = match catch_unwind(AssertUnwindSafe(|| {
+            connect(ctx, saved, live, &mut seat, timing)
+        })) {
             Ok(end) => end,
             Err(_) => {
                 live.connected(false);
@@ -506,14 +596,20 @@ pub(super) fn keep_live(ctx: &Context, saved: &Saved, live: &Live, timing: &Timi
                 return;
             }
             End::Removed => {
-                tracing::warn!("chatd: {}: removed from the server", ctx.account.network.label());
+                tracing::warn!(
+                    "chatd: {}: removed from the server",
+                    ctx.account.network.label()
+                );
                 ctx.hub.set_link(&ctx.account, Link::Expired, REMOVED);
                 call_gone(ctx, &mut seat, CallFailure::Refused, REMOVED);
                 return;
             }
             End::Replaced => {
                 // Two devices that each reconnect at once would close each other forever.
-                tracing::warn!("chatd: {}: replaced by another device; waiting for the user", ctx.account.network.label());
+                tracing::warn!(
+                    "chatd: {}: replaced by another device; waiting for the user",
+                    ctx.account.network.label()
+                );
                 ctx.hub.set_offline(&ctx.account, false);
                 ctx.attention(REPLACED);
                 call_gone(ctx, &mut seat, CallFailure::Refused, REPLACED);
@@ -538,7 +634,11 @@ pub(super) fn keep_live(ctx: &Context, saved: &Saved, live: &Live, timing: &Timi
                 timing.absent
             }
             End::Dropped(why) => {
-                tracing::warn!("chatd: {}: live socket: {}", ctx.account.network.label(), net::redact(&why));
+                tracing::warn!(
+                    "chatd: {}: live socket: {}",
+                    ctx.account.network.label(),
+                    net::redact(&why)
+                );
                 pause
             }
         };
@@ -624,7 +724,9 @@ fn connect(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, timing: &
         Ok(wire) => wire,
         Err(Opened::Status(401)) => return End::SignedOut,
         Err(Opened::Status(404)) => return End::Absent,
-        Err(Opened::Status(status)) => return End::Dropped(format!("the server answered {status}")),
+        Err(Opened::Status(status)) => {
+            return End::Dropped(format!("the server answered {status}"))
+        }
         Err(Opened::Failed(why)) => return End::Dropped(why),
     };
     let mut pending = Vec::new();
@@ -645,7 +747,15 @@ fn connect(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, timing: &
 }
 
 #[allow(clippy::too_many_arguments)]
-fn serve(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, timing: &Timing, wire: &mut Wire, pending: &mut Vec<Pending>) -> End {
+fn serve(
+    ctx: &Context,
+    saved: &Saved,
+    live: &Live,
+    seat: &mut Seat,
+    timing: &Timing,
+    wire: &mut Wire,
+    pending: &mut Vec<Pending>,
+) -> End {
     let wake = live.wake.poll_read();
     let opened = Instant::now();
     live.note(Did::Opened { at: opened });
@@ -669,14 +779,18 @@ fn serve(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, timing: &Ti
                         Ok(frame) => frame,
                         Err(_) => continue,
                     };
-                    if let Some(end) = heard_frame(ctx, saved, live, seat, pending, &mut ready, &frame) {
+                    if let Some(end) =
+                        heard_frame(ctx, saved, live, seat, pending, &mut ready, &frame)
+                    {
                         return end;
                     }
                     if ready && frame.get("type").and_then(Value::as_str) == Some("ready") {
                         seat.stranded = None;
                         refs += 1;
                         let sent = match rejoin(seat) {
-                            Some(room) => rejoin_with(ctx, saved, live, seat, wire, pending, refs, room, timing),
+                            Some(room) => rejoin_with(
+                                ctx, saved, live, seat, wire, pending, refs, room, timing,
+                            ),
                             None => seat_kept(ctx, live, seat, wire, pending, refs, timing),
                         };
                         if let Err(err) = sent {
@@ -685,14 +799,20 @@ fn serve(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, timing: &Ti
                     }
                     if let Some(room) = seat.move_to.take() {
                         refs += 1;
-                        if let Err(err) = move_with(ctx, saved, live, seat, wire, pending, refs, room, timing) {
+                        if let Err(err) =
+                            move_with(ctx, saved, live, seat, wire, pending, refs, room, timing)
+                        {
                             return End::Dropped(err.to_string());
                         }
                     }
                     if let Some(room) = seat.recover.take() {
                         refs += 1;
-                        tracing::warn!("chatd: Tiny server: the call's media was lost; joining again");
-                        if let Err(err) = rejoin_with(ctx, saved, live, seat, wire, pending, refs, room, timing) {
+                        tracing::warn!(
+                            "chatd: Tiny server: the call's media was lost; joining again"
+                        );
+                        if let Err(err) =
+                            rejoin_with(ctx, saved, live, seat, wire, pending, refs, room, timing)
+                        {
                             return End::Dropped(err.to_string());
                         }
                     }
@@ -706,9 +826,13 @@ fn serve(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, timing: &Ti
             for ask in live.take() {
                 refs += 1;
                 let sent = match ask {
-                    Ask::Join { room_id, reply } if live.seats_only() => ask_join(wire, pending, refs, room_id, None, Some(reply), timing),
+                    Ask::Join { room_id, reply } if live.seats_only() => {
+                        ask_join(wire, pending, refs, room_id, None, Some(reply), timing)
+                    }
                     Ask::Join { room_id, reply } => match offer(ctx, saved, seat, &room_id) {
-                        Ok(sdp) => ask_join(wire, pending, refs, room_id, Some(sdp), Some(reply), timing),
+                        Ok(sdp) => {
+                            ask_join(wire, pending, refs, room_id, Some(sdp), Some(reply), timing)
+                        }
                         Err(words) => {
                             let _ = reply.send(Err(Refusal::Refused(words)));
                             Ok(())
@@ -721,7 +845,12 @@ fn serve(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, timing: &Ti
                             ctx.call_over(&room);
                         }
                         let reference = refs.to_string();
-                        pending.push(Pending { reference: reference.clone(), asked: Asked::Leave, until: Instant::now() + timing.answer, reply: Some(reply) });
+                        pending.push(Pending {
+                            reference: reference.clone(),
+                            asked: Asked::Leave,
+                            until: Instant::now() + timing.answer,
+                            reply: Some(reply),
+                        });
                         wire.send(json!({"type": "call.leave", "ref": reference}).to_string())
                     }
                     Ask::Hangup { room_id } => {
@@ -732,7 +861,12 @@ fn serve(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, timing: &Ti
                         }
                         if seated_in(seat, &room_id) || joining {
                             let reference = refs.to_string();
-                            pending.push(Pending { reference: reference.clone(), asked: Asked::Leave, until: Instant::now() + timing.answer, reply: None });
+                            pending.push(Pending {
+                                reference: reference.clone(),
+                                asked: Asked::Leave,
+                                until: Instant::now() + timing.answer,
+                                reply: None,
+                            });
                             wire.send(json!({"type": "call.leave", "ref": reference}).to_string())
                         } else {
                             Ok(())
@@ -752,13 +886,31 @@ fn serve(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, timing: &Ti
                     Ask::E2ee { .. } => Ok(()),
                     Ask::Offer { sdp } if seat.call_id.is_some() => {
                         let reference = refs.to_string();
-                        pending.push(Pending { reference: reference.clone(), asked: Asked::Offer, until: Instant::now() + timing.answer, reply: None });
-                        wire.send(json!({"type": "call.offer", "ref": reference, "sdp": sdp}).to_string())
+                        pending.push(Pending {
+                            reference: reference.clone(),
+                            asked: Asked::Offer,
+                            until: Instant::now() + timing.answer,
+                            reply: None,
+                        });
+                        wire.send(
+                            json!({"type": "call.offer", "ref": reference, "sdp": sdp}).to_string(),
+                        )
                     }
                     Ask::Offer { .. } => Ok(()),
-                    Ask::Moderate { room_id, user_id, server_muted, server_deafened, reply } => {
+                    Ask::Moderate {
+                        room_id,
+                        user_id,
+                        server_muted,
+                        server_deafened,
+                        reply,
+                    } => {
                         let reference = refs.to_string();
-                        pending.push(Pending { reference: reference.clone(), asked: Asked::Moderate, until: Instant::now() + timing.answer, reply: Some(reply) });
+                        pending.push(Pending {
+                            reference: reference.clone(),
+                            asked: Asked::Moderate,
+                            until: Instant::now() + timing.answer,
+                            reply: Some(reply),
+                        });
                         let mut frame = json!({"type": "call.moderate", "ref": reference, "room_id": room_id, "user_id": user_id});
                         if let Some(muted) = server_muted {
                             frame["server_muted"] = json!(muted);
@@ -768,14 +920,32 @@ fn serve(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, timing: &Ti
                         }
                         wire.send(frame.to_string())
                     }
-                    Ask::Move { user_id, room_id, reply } => {
+                    Ask::Move {
+                        user_id,
+                        room_id,
+                        reply,
+                    } => {
                         let reference = refs.to_string();
-                        pending.push(Pending { reference: reference.clone(), asked: Asked::Moderate, until: Instant::now() + timing.answer, reply: Some(reply) });
+                        pending.push(Pending {
+                            reference: reference.clone(),
+                            asked: Asked::Moderate,
+                            until: Instant::now() + timing.answer,
+                            reply: Some(reply),
+                        });
                         wire.send(json!({"type": "call.move", "ref": reference, "user_id": user_id, "room_id": room_id}).to_string())
                     }
-                    Ask::Kick { room_id, user_id, reply } => {
+                    Ask::Kick {
+                        room_id,
+                        user_id,
+                        reply,
+                    } => {
                         let reference = refs.to_string();
-                        pending.push(Pending { reference: reference.clone(), asked: Asked::Kick, until: Instant::now() + timing.answer, reply: Some(reply) });
+                        pending.push(Pending {
+                            reference: reference.clone(),
+                            asked: Asked::Kick,
+                            until: Instant::now() + timing.answer,
+                            reply: Some(reply),
+                        });
                         wire.send(json!({"type": "call.kick", "ref": reference, "room_id": room_id, "user_id": user_id}).to_string())
                     }
                     Ask::Look => Ok(()),
@@ -789,7 +959,9 @@ fn serve(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, timing: &Ti
                         settled(seat);
                         Ok(())
                     }
-                    Ask::Type { conversation_id } => wire.send(json!({"type": "typing", "conversation_id": conversation_id}).to_string()),
+                    Ask::Type { conversation_id } => wire.send(
+                        json!({"type": "typing", "conversation_id": conversation_id}).to_string(),
+                    ),
                 };
                 if let Err(err) = sent {
                     return End::Dropped(err.to_string());
@@ -797,12 +969,17 @@ fn serve(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, timing: &Ti
             }
         }
         let now = Instant::now();
-        let (late, waiting): (Vec<Pending>, Vec<Pending>) = std::mem::take(pending).into_iter().partition(|pending| pending.until <= now);
+        let (late, waiting): (Vec<Pending>, Vec<Pending>) = std::mem::take(pending)
+            .into_iter()
+            .partition(|pending| pending.until <= now);
         *pending = waiting;
         for late in late {
             if let Asked::Offer = &late.asked {
                 if let Some(room) = seat.wanted.clone() {
-                    ctx.tell_media(&room, MediaRequest::TinyRenegotiation { sdp: String::new() });
+                    ctx.tell_media(
+                        &room,
+                        MediaRequest::TinyRenegotiation { sdp: String::new() },
+                    );
                 }
             }
             if let Asked::Join(room, media) = &late.asked {
@@ -831,7 +1008,9 @@ fn serve(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, timing: &Ti
                 if ctx.in_call(&room) && !seat.rejoining && seat.recover.is_none() {
                     refs += 1;
                     tracing::warn!("chatd: Tiny server: media dropped; joining again");
-                    if let Err(err) = rejoin_with(ctx, saved, live, seat, wire, pending, refs, room, timing) {
+                    if let Err(err) =
+                        rejoin_with(ctx, saved, live, seat, wire, pending, refs, room, timing)
+                    {
                         return End::Dropped(err.to_string());
                     }
                 }
@@ -841,19 +1020,34 @@ fn serve(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, timing: &Ti
             return End::Dropped("the server stopped answering".to_owned());
         }
         // A seat taken since the last ping brings the next one forward.
-        let every = if seat.wanted.is_some() { timing.call_ping } else { timing.ping };
+        let every = if seat.wanted.is_some() {
+            timing.call_ping
+        } else {
+            timing.ping
+        };
         next_ping = next_ping.min(pinged + every);
         if now >= next_ping {
             if let Err(err) = wire.send(json!({"type": "ping"}).to_string()) {
                 return End::Dropped(err.to_string());
             }
-            live.note(Did::Pinged { due: next_ping, sent: now });
-            let by = now + if std::mem::take(&mut doubted) { timing.doubt } else { timing.pong };
+            live.note(Did::Pinged {
+                due: next_ping,
+                sent: now,
+            });
+            let by = now
+                + if std::mem::take(&mut doubted) {
+                    timing.doubt
+                } else {
+                    timing.pong
+                };
             owed = Some(owed.map_or(by, |at| at.min(by)));
             pinged = now;
             next_ping = now + every;
         }
-        let mut until = pending.iter().map(|pending| pending.until).fold(next_ping, Instant::min);
+        let mut until = pending
+            .iter()
+            .map(|pending| pending.until)
+            .fold(next_ping, Instant::min);
         if let Some(by) = owed {
             until = until.min(by);
         }
@@ -867,12 +1061,23 @@ fn serve(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, timing: &Ti
 
 /// Our mute, deafen and priority, in a call with audio. `priority` goes only while held, so an
 /// older server never sees the field.
-fn state(wire: &mut Wire, pending: &mut Vec<Pending>, refs: u64, seat: &Seat, timing: &Timing) -> io::Result<()> {
+fn state(
+    wire: &mut Wire,
+    pending: &mut Vec<Pending>,
+    refs: u64,
+    seat: &Seat,
+    timing: &Timing,
+) -> io::Result<()> {
     if seat.call_id.is_none() {
         return Ok(());
     }
     let reference = refs.to_string();
-    pending.push(Pending { reference: reference.clone(), asked: Asked::State, until: Instant::now() + timing.answer, reply: None });
+    pending.push(Pending {
+        reference: reference.clone(),
+        asked: Asked::State,
+        until: Instant::now() + timing.answer,
+        reply: None,
+    });
     let mut frame = json!({"type": "call.state", "ref": reference, "muted": seat.muted, "deafened": seat.deafened});
     if seat.priority {
         frame["priority"] = json!(true);
@@ -883,7 +1088,17 @@ fn state(wire: &mut Wire, pending: &mut Vec<Pending>, refs: u64, seat: &Seat, ti
 /// The server moved us to `room` (`call.moved`): join it with no confirmation. A call with
 /// audio goes along, with its mediad, devices, mute and deafen, and a fresh offer.
 #[allow(clippy::too_many_arguments)]
-fn move_with(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, wire: &mut Wire, pending: &mut Vec<Pending>, refs: u64, room: String, timing: &Timing) -> io::Result<()> {
+fn move_with(
+    ctx: &Context,
+    saved: &Saved,
+    live: &Live,
+    seat: &mut Seat,
+    wire: &mut Wire,
+    pending: &mut Vec<Pending>,
+    refs: u64,
+    room: String,
+    timing: &Timing,
+) -> io::Result<()> {
     let from = seat.last.clone().or_else(|| seat.wanted.clone());
     seat.call_id = None;
     seat.speaking.clear();
@@ -891,7 +1106,9 @@ fn move_with(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, wire: &
         seat.wanted = Some(room.clone());
         return ask_join(wire, pending, refs, room, None, None, timing);
     }
-    let carried = from.as_deref().is_some_and(|from| from == room || ctx.tiny_moved(from, &room));
+    let carried = from
+        .as_deref()
+        .is_some_and(|from| from == room || ctx.tiny_moved(from, &room));
     if !carried {
         // No call of ours was in that room here: there is nothing to carry.
         seat.wanted = None;
@@ -918,7 +1135,15 @@ type Offered = (String, bool);
 const E2EE_VERSION: u16 = 1;
 
 #[allow(clippy::too_many_arguments)]
-fn ask_join(wire: &mut Wire, pending: &mut Vec<Pending>, refs: u64, room_id: String, sdp: Option<Offered>, reply: Option<Reply<()>>, timing: &Timing) -> io::Result<()> {
+fn ask_join(
+    wire: &mut Wire,
+    pending: &mut Vec<Pending>,
+    refs: u64,
+    room_id: String,
+    sdp: Option<Offered>,
+    reply: Option<Reply<()>>,
+    timing: &Timing,
+) -> io::Result<()> {
     let reference = refs.to_string();
     let mut frame = json!({"type": "call.join", "ref": reference, "room_id": room_id});
     let media = sdp.is_some();
@@ -929,7 +1154,12 @@ fn ask_join(wire: &mut Wire, pending: &mut Vec<Pending>, refs: u64, room_id: Str
             frame["e2ee"] = json!(E2EE_VERSION);
         }
     }
-    pending.push(Pending { reference, asked: Asked::Join(room_id, media), until: Instant::now() + timing.answer, reply });
+    pending.push(Pending {
+        reference,
+        asked: Asked::Join(room_id, media),
+        until: Instant::now() + timing.answer,
+        reply,
+    });
     wire.send(frame.to_string())
 }
 
@@ -957,12 +1187,36 @@ fn must_encrypt(host: &str, room_required: bool, offered: bool) -> Result<bool, 
 /// On an Incognito host, or in a room that requires it, the offer is `required`: the server
 /// turning encryption off blocks the call for good, and a server that offers none is not joined.
 fn offer(ctx: &Context, saved: &Saved, seat: &mut Seat, room: &str) -> Result<Offered, String> {
-    let host = tungstenite::http::Uri::try_from(saved.base_url.as_str()).ok().and_then(|uri| uri.host().map(|host| host.trim_matches(['[', ']']).to_owned()));
-    let required = must_encrypt(host.as_deref().unwrap_or(""), super::manage::room_e2ee_required(saved, room), seat.e2ee)?;
-    let identity = || crate::verified::identity_path(&ctx.account).to_string_lossy().into_owned();
-    let e2ee = seat.e2ee.then(|| TinyE2ee { room_id: room.to_owned(), identity: identity(), required });
+    let host = tungstenite::http::Uri::try_from(saved.base_url.as_str())
+        .ok()
+        .and_then(|uri| {
+            uri.host()
+                .map(|host| host.trim_matches(['[', ']']).to_owned())
+        });
+    let required = must_encrypt(
+        host.as_deref().unwrap_or(""),
+        super::manage::room_e2ee_required(saved, room),
+        seat.e2ee,
+    )?;
+    let identity = || {
+        crate::verified::identity_path(&ctx.account)
+            .to_string_lossy()
+            .into_owned()
+    };
+    let e2ee = seat.e2ee.then(|| TinyE2ee {
+        room_id: room.to_owned(),
+        identity: identity(),
+        required,
+    });
     let offered = e2ee.is_some();
-    let offer = TinyOffer { user_id: seat.me.clone(), host: host.unwrap_or_default(), slots: ROOM_CAP - 1, muted: false, deafened: false, e2ee };
+    let offer = TinyOffer {
+        user_id: seat.me.clone(),
+        host: host.unwrap_or_default(),
+        slots: ROOM_CAP - 1,
+        muted: false,
+        deafened: false,
+        e2ee,
+    };
     let sdp = ctx.tiny_offer(room, offer)?;
     let (kbps, push_to_talk) = super::manage::room_audio(saved, room);
     ctx.tiny_room(room, kbps, push_to_talk);
@@ -974,14 +1228,27 @@ fn offer(ctx: &Context, saved: &Saved, seat: &mut Seat, room: &str) -> Result<Of
 /// The room to take again after `ready`, when the user's seat went with the old socket.
 fn rejoin(seat: &Seat) -> Option<String> {
     let room = seat.wanted.clone()?;
-    let seated = seat.calls.values().any(|people| people.iter().any(|who| who.user == seat.me));
+    let seated = seat
+        .calls
+        .values()
+        .any(|people| people.iter().any(|who| who.user == seat.me));
     (!seated).then_some(room)
 }
 
 /// Takes the seat again. With audio, only while chatd still holds the call, and with a fresh
 /// offer: the old media session went with the server.
 #[allow(clippy::too_many_arguments)]
-fn rejoin_with(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, wire: &mut Wire, pending: &mut Vec<Pending>, refs: u64, room: String, timing: &Timing) -> io::Result<()> {
+fn rejoin_with(
+    ctx: &Context,
+    saved: &Saved,
+    live: &Live,
+    seat: &mut Seat,
+    wire: &mut Wire,
+    pending: &mut Vec<Pending>,
+    refs: u64,
+    room: String,
+    timing: &Timing,
+) -> io::Result<()> {
     if live.seats_only() {
         return ask_join(wire, pending, refs, room, None, None, timing);
     }
@@ -1006,13 +1273,26 @@ fn rejoin_with(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, wire:
 /// it was down is settled here: a call hung up meanwhile leaves the seat the server kept for it,
 /// and a call whose media went meanwhile (mediad says so once, and that word was refused, or the
 /// join it started went with the socket) is resumed now.
-fn seat_kept(ctx: &Context, live: &Live, seat: &mut Seat, wire: &mut Wire, pending: &mut Vec<Pending>, refs: u64, timing: &Timing) -> io::Result<()> {
+fn seat_kept(
+    ctx: &Context,
+    live: &Live,
+    seat: &mut Seat,
+    wire: &mut Wire,
+    pending: &mut Vec<Pending>,
+    refs: u64,
+    timing: &Timing,
+) -> io::Result<()> {
     let Some(room) = seat.wanted.clone().filter(|_| !live.seats_only()) else {
         return Ok(());
     };
     if !ctx.in_call(&room) {
         let reference = refs.to_string();
-        pending.push(Pending { reference: reference.clone(), asked: Asked::Leave, until: Instant::now() + timing.answer, reply: None });
+        pending.push(Pending {
+            reference: reference.clone(),
+            asked: Asked::Leave,
+            until: Instant::now() + timing.answer,
+            reply: None,
+        });
         return wire.send(json!({"type": "call.leave", "ref": reference}).to_string());
     }
     if call_is_down(ctx, &room) {
@@ -1022,7 +1302,9 @@ fn seat_kept(ctx: &Context, live: &Live, seat: &mut Seat, wire: &mut Wire, pendi
 }
 
 fn seated_in(seat: &Seat, room: &str) -> bool {
-    seat.calls.get(room).is_some_and(|people| people.iter().any(|who| who.user == seat.me))
+    seat.calls
+        .get(room)
+        .is_some_and(|people| people.iter().any(|who| who.user == seat.me))
 }
 
 #[derive(Deserialize)]
@@ -1076,12 +1358,22 @@ fn text<'a>(frame: &'a Value, field: &str) -> Option<&'a str> {
 }
 
 /// One frame from the server. `Some` ends the connection.
-fn heard_frame(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, pending: &mut Vec<Pending>, ready: &mut bool, frame: &Value) -> Option<End> {
+fn heard_frame(
+    ctx: &Context,
+    saved: &Saved,
+    live: &Live,
+    seat: &mut Seat,
+    pending: &mut Vec<Pending>,
+    ready: &mut bool,
+    frame: &Value,
+) -> Option<End> {
     let kind = text(frame, "type").unwrap_or("");
     match kind {
         "ready" => {
             let Ok(heard) = serde_json::from_value::<ReadyFrame>(frame.clone()) else {
-                return Some(End::Dropped("the server's ready could not be read".to_owned()));
+                return Some(End::Dropped(
+                    "the server's ready could not be read".to_owned(),
+                ));
             };
             ready_heard(ctx, saved, live, seat, heard);
             *ready = true;
@@ -1091,8 +1383,20 @@ fn heard_frame(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, pendi
         "resync" => return Some(End::Resync),
         "pong" => {}
         "presence" => {
-            if let (Some(user), Some(online)) = (text(frame, "user_id"), frame.get("online").and_then(Value::as_bool)) {
-                ctx.presence(user, if online { Presence::Online } else { Presence::Offline }, "", true);
+            if let (Some(user), Some(online)) = (
+                text(frame, "user_id"),
+                frame.get("online").and_then(Value::as_bool),
+            ) {
+                ctx.presence(
+                    user,
+                    if online {
+                        Presence::Online
+                    } else {
+                        Presence::Offline
+                    },
+                    "",
+                    true,
+                );
             }
         }
         "call.joined" => {
@@ -1125,21 +1429,41 @@ fn heard_frame(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, pendi
         // never leave it. Only for the seat that has media, in the order it came.
         "call.e2ee" => {
             if let (true, Some(room)) = (seat.call_id.is_some(), seat.wanted.clone()) {
-                ctx.tell_media(&room, MediaRequest::TinyE2ee { frame: frame.to_string() });
+                ctx.tell_media(
+                    &room,
+                    MediaRequest::TinyE2ee {
+                        frame: frame.to_string(),
+                    },
+                );
             }
         }
         "call.slots" => {
-            let current = seat.call_id.is_some() && text(frame, "call_id") == seat.call_id.as_deref();
+            let current =
+                seat.call_id.is_some() && text(frame, "call_id") == seat.call_id.as_deref();
             if let (true, Some(room)) = (current, seat.wanted.clone()) {
-                let audio = frame.get("audio").and_then(Value::as_array).into_iter().flatten().take(SEATS);
-                let audio = audio.filter_map(|slot| Some(TinySlot { mid: text(slot, "mid")?.to_owned(), user_id: text(slot, "user_id")?.to_owned() }));
+                let audio = frame
+                    .get("audio")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .take(SEATS);
+                let audio = audio.filter_map(|slot| {
+                    Some(TinySlot {
+                        mid: text(slot, "mid")?.to_owned(),
+                        user_id: text(slot, "user_id")?.to_owned(),
+                    })
+                });
                 ctx.tiny_slots(&room, audio.collect());
                 let video = frame.get("video").filter(|video| !video.is_null());
                 let picture = video.and_then(|video| {
                     Some(TinyPicture {
                         mid: text(video, "mid")?.to_owned(),
                         user_id: text(video, "user_id")?.to_owned(),
-                        kind: if text(video, "kind") == Some("share") { PictureKind::Share } else { PictureKind::Camera },
+                        kind: if text(video, "kind") == Some("share") {
+                            PictureKind::Share
+                        } else {
+                            PictureKind::Camera
+                        },
                     })
                 });
                 ctx.tell_media(&room, MediaRequest::TinyPicture { picture });
@@ -1147,17 +1471,27 @@ fn heard_frame(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, pendi
         }
         "call.speaking" => {
             if let Some(room) = text(frame, "room_id") {
-                let users = frame.get("user_ids").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).take(SEATS);
+                let users = frame
+                    .get("user_ids")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .take(SEATS);
                 seat.speaking = users.map(str::to_owned).collect();
                 tell(ctx, seat, room);
             }
         }
         "call.state" => {
             if let (Some(room), Some(user)) = (text(frame, "room_id"), text(frame, "user_id")) {
-                if let Some(who) = seat.calls.get_mut(room).and_then(|people| people.iter_mut().find(|who| who.user == user)) {
+                if let Some(who) = seat
+                    .calls
+                    .get_mut(room)
+                    .and_then(|people| people.iter_mut().find(|who| who.user == user))
+                {
                     let before = who.clone();
                     who.heard(frame);
-                    let moderated = who.moderated(&before);
+                    let reread = who.reread(&before);
                     if user == seat.me && before.sharing && !who.sharing {
                         ctx.tell_media(room, MediaRequest::ShareSend { on: false });
                     }
@@ -1166,7 +1500,7 @@ fn heard_frame(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, pendi
                     }
                     tell(ctx, seat, room);
                     duck(ctx, seat, room);
-                    if moderated {
+                    if reread {
                         ctx.community_changed();
                     }
                 }
@@ -1175,11 +1509,14 @@ fn heard_frame(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, pendi
         "ok" | "error" => answered(ctx, seat, pending, frame, kind == "ok"),
         "typing" => {
             let user = text(frame, "user_id").unwrap_or("");
-            let named = text(frame, "display_name").or_else(|| seat.names.get(user).map(String::as_str));
+            let named =
+                text(frame, "display_name").or_else(|| seat.names.get(user).map(String::as_str));
             super::messages::heard_typing(ctx, named, frame);
         }
         _ if frame.get("seq").is_some() => durable(ctx, saved, seat, kind, frame),
-        _ if super::messages::live_kind(kind) => super::messages::on_live(ctx, saved, &seat.names, kind, frame),
+        _ if super::messages::live_kind(kind) => {
+            super::messages::on_live(ctx, saved, &seat.names, kind, frame)
+        }
         // A type this client does not know yet, from a newer server.
         _ => {}
     }
@@ -1194,15 +1531,25 @@ fn ready_heard(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, heard
         seat.e2ee = super::manage::capabilities_of(saved).has(protocol::TINY_FEATURE_E2EE_CALLS);
     }
     seat.since = Some(heard.seq);
-    if heard.me.role != seat.role && matches!(heard.me.role.as_str(), "owner" | "admin" | "member") {
+    if heard.me.role != seat.role && matches!(heard.me.role.as_str(), "owner" | "admin" | "member")
+    {
         seat.role = heard.me.role;
         save_role(ctx, &seat.me, &seat.role);
     }
     if fresh || !seat.described {
         if let Ok(members) = members_of(saved) {
-            seat.names = members.iter().take(NAMES).map(|member| (member.user_id.clone(), member.display_name.clone())).collect();
+            seat.names = members
+                .iter()
+                .take(NAMES)
+                .map(|member| (member.user_id.clone(), member.display_name.clone()))
+                .collect();
             if !seat.described {
-                let email = members.iter().find(|member| member.user_id == seat.me).map_or(saved.email.as_deref().unwrap_or(""), |member| member.email.as_str());
+                let email = members
+                    .iter()
+                    .find(|member| member.user_id == seat.me)
+                    .map_or(saved.email.as_deref().unwrap_or(""), |member| {
+                        member.email.as_str()
+                    });
                 let _ = ctx.describe(&join_host(&saved.base_url), email);
                 seat.described = true;
             }
@@ -1221,7 +1568,8 @@ fn ready_heard(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, heard
         .into_iter()
         .take(ROOMS)
         .map(|call| {
-            let people: Vec<ParticipantFrame> = super::rows(call.participants, "call seats").unwrap_or_default();
+            let people: Vec<ParticipantFrame> =
+                super::rows(call.participants, "call seats").unwrap_or_default();
             let people = people.into_iter().take(SEATS).map(|who| Sitting {
                 user: who.user_id,
                 muted: who.muted,
@@ -1244,7 +1592,12 @@ fn ready_heard(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, heard
     for room in seat.calls.keys() {
         tell(ctx, seat, room);
     }
-    let ours: Vec<String> = seat.calls.keys().filter(|room| ctx.in_call(room)).cloned().collect();
+    let ours: Vec<String> = seat
+        .calls
+        .keys()
+        .filter(|room| ctx.in_call(room))
+        .cloned()
+        .collect();
     for room in ours {
         duck(ctx, seat, &room);
     }
@@ -1261,7 +1614,13 @@ fn ready_heard(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, heard
 /// holds in that room gets everyone but us as its roster.
 fn tell(ctx: &Context, seat: &Seat, room: &str) {
     let people = seat.calls.get(room).map(Vec::as_slice).unwrap_or_default();
-    let name = |user: &str| seat.names.get(user).filter(|name| !name.is_empty()).cloned().unwrap_or_else(|| "Someone".to_owned());
+    let name = |user: &str| {
+        seat.names
+            .get(user)
+            .filter(|name| !name.is_empty())
+            .cloned()
+            .unwrap_or_else(|| "Someone".to_owned())
+    };
     if ctx.in_call(room) {
         let others = people.iter().filter(|who| who.user != seat.me);
         let roster = others.map(|who| Participant {
@@ -1322,7 +1681,13 @@ fn roster(ctx: &Context, seat: &mut Seat, room: &str) {
     if !seat.e2ee || !ctx.in_call(room) {
         return;
     }
-    let people: Vec<String> = seat.calls.get(room).into_iter().flatten().map(|who| who.user.clone()).collect();
+    let people: Vec<String> = seat
+        .calls
+        .get(room)
+        .into_iter()
+        .flatten()
+        .map(|who| who.user.clone())
+        .collect();
     if people != seat.rostered {
         seat.rostered = people.clone();
         ctx.tell_media(room, MediaRequest::TinyRoster { user_ids: people });
@@ -1336,7 +1701,14 @@ fn duck(ctx: &Context, seat: &mut Seat, room: &str) {
     if !ctx.in_call(room) {
         return;
     }
-    let holders: Vec<String> = seat.calls.get(room).into_iter().flatten().filter(|who| who.priority && who.user != seat.me).map(|who| who.user.clone()).collect();
+    let holders: Vec<String> = seat
+        .calls
+        .get(room)
+        .into_iter()
+        .flatten()
+        .filter(|who| who.priority && who.user != seat.me)
+        .map(|who| who.user.clone())
+        .collect();
     if holders != seat.ducking {
         seat.ducking = holders.clone();
         ctx.tell_media(room, MediaRequest::Priority { user_ids: holders });
@@ -1345,7 +1717,14 @@ fn duck(ctx: &Context, seat: &mut Seat, room: &str) {
 
 /// One seat a person: joining a room leaves any other.
 fn seated(ctx: &Context, seat: &mut Seat, room: &str, user: &str, frame: &Value) {
-    let left: Vec<String> = seat.calls.iter().filter(|(other, people)| other.as_str() != room && people.iter().any(|who| who.user == user)).map(|(other, _)| other.clone()).collect();
+    let left: Vec<String> = seat
+        .calls
+        .iter()
+        .filter(|(other, people)| {
+            other.as_str() != room && people.iter().any(|who| who.user == user)
+        })
+        .map(|(other, _)| other.clone())
+        .collect();
     for other in &left {
         unseat(seat, other, user);
         tell(ctx, seat, other);
@@ -1418,7 +1797,13 @@ fn left(ctx: &Context, seat: &mut Seat, room: &str, reason: &str) {
     }
     // The grace ran out on the socket that held the seat (a server that does not rebind one):
     // the seat is gone and the media with it, and the call takes it again as for any drop.
-    if reason == "disconnected" && seat.wanted.as_deref() == Some(room) && (seat.resume_at.is_some() || seat.rejoining || seat.recover.is_some() || spend_resume(seat)) {
+    if reason == "disconnected"
+        && seat.wanted.as_deref() == Some(room)
+        && (seat.resume_at.is_some()
+            || seat.rejoining
+            || seat.recover.is_some()
+            || spend_resume(seat))
+    {
         return;
     }
     forget_resume(seat);
@@ -1439,7 +1824,12 @@ fn left(ctx: &Context, seat: &mut Seat, room: &str, reason: &str) {
     };
     // Put out by someone: the cue that says so plays out as the call ends.
     if matches!(reason, "kicked" | "banned" | "timed_out" | "room_deleted") {
-        ctx.tell_media(room, MediaRequest::Cue { cue: Cue::Disconnected });
+        ctx.tell_media(
+            room,
+            MediaRequest::Cue {
+                cue: Cue::Disconnected,
+            },
+        );
     }
     match words {
         // chatd then has the adapter hang up, which sends nothing: we are not in the room.
@@ -1461,34 +1851,53 @@ const MEDIA_HELD: Duration = Duration::from_secs(60);
 #[derive(Debug, PartialEq, Eq)]
 enum Plan {
     /// Join again after `pause`. `resumes` is how many of [`RESUMES`] this drop uses.
-    Resume { resumes: u32, pause: Duration },
+    Resume {
+        resumes: u32,
+        pause: Duration,
+    },
     GiveUp,
 }
 
 /// What one media drop may do. `used` is how many resumes are already spent; `up_since` is when
 /// media last came up, if it has.
 fn plan(used: u32, up_since: Option<Instant>, now: Instant) -> Plan {
-    let held = up_since.map(|at| now.saturating_duration_since(at)).unwrap_or(Duration::ZERO);
+    let held = up_since
+        .map(|at| now.saturating_duration_since(at))
+        .unwrap_or(Duration::ZERO);
     let used = if held >= MEDIA_HELD { 0 } else { used };
     if used >= RESUMES {
         return Plan::GiveUp;
     }
     let used = used + 1;
     // What noticed the drop has already waited. A second try means the first did not hold.
-    let pause = if used == 1 { Duration::ZERO } else { Duration::from_secs(u64::from(used)) };
-    Plan::Resume { resumes: used, pause }
+    let pause = if used == 1 {
+        Duration::ZERO
+    } else {
+        Duration::from_secs(u64::from(used))
+    };
+    Plan::Resume {
+        resumes: used,
+        pause,
+    }
 }
 
 /// The call is up, or already reconnecting, with mediad still running.
 fn may_resume(ctx: &Context, room: &str) -> bool {
     let (call, running) = ctx.hub.calls.describe();
-    running && call.is_some_and(|call| call.conversation == ctx.key(room) && matches!(call.state, CallState::Joined | CallState::Reconnecting))
+    running
+        && call.is_some_and(|call| {
+            call.conversation == ctx.key(room)
+                && matches!(call.state, CallState::Joined | CallState::Reconnecting)
+        })
 }
 
 /// mediad still says the call is up, so a rejoin's swap will report the old link as lost.
 fn call_is_joined(ctx: &Context, room: &str) -> bool {
     let (call, running) = ctx.hub.calls.describe();
-    running && call.is_some_and(|call| call.conversation == ctx.key(room) && call.state == CallState::Joined)
+    running
+        && call.is_some_and(|call| {
+            call.conversation == ctx.key(room) && call.state == CallState::Joined
+        })
 }
 
 /// This socket is not coming back to bring the call back. It would sit reconnecting, so it ends,
@@ -1503,7 +1912,11 @@ fn call_gone(ctx: &Context, seat: &mut Seat, reason: CallFailure, words: &str) {
 /// The socket is down. While the call's media is too, a clock runs: the budget that bounds a
 /// resume cannot be spent without a socket, and mediad will not end the call on its own.
 fn stranded(ctx: &Context, seat: &mut Seat, timing: &Timing) {
-    if !seat.wanted.as_deref().is_some_and(|room| call_is_down(ctx, room)) {
+    if !seat
+        .wanted
+        .as_deref()
+        .is_some_and(|room| call_is_down(ctx, room))
+    {
         seat.stranded = None;
         return;
     }
@@ -1516,7 +1929,10 @@ fn stranded(ctx: &Context, seat: &mut Seat, timing: &Timing) {
 /// mediad has said the call's media is down, and nothing has brought it back.
 fn call_is_down(ctx: &Context, room: &str) -> bool {
     let (call, running) = ctx.hub.calls.describe();
-    running && call.is_some_and(|call| call.conversation == ctx.key(room) && call.state == CallState::Reconnecting)
+    running
+        && call.is_some_and(|call| {
+            call.conversation == ctx.key(room) && call.state == CallState::Reconnecting
+        })
 }
 
 /// The user left, or the call ended: nothing joins again, and the next call starts its count over.
@@ -1550,7 +1966,10 @@ fn resume_media(ctx: &Context, seat: &mut Seat, pending: &[Pending]) {
     if seat.resume_at.is_some() || seat.rejoining || seat.recover.is_some() {
         return;
     }
-    if pending.iter().any(|waiting| matches!(&waiting.asked, Asked::Join(id, true) if id == &room)) {
+    if pending
+        .iter()
+        .any(|waiting| matches!(&waiting.asked, Asked::Join(id, true) if id == &room))
+    {
         return;
     }
     if !may_resume(ctx, &room) {
@@ -1572,7 +1991,10 @@ fn spend_resume(seat: &mut Seat) -> bool {
         Plan::Resume { resumes, pause } => {
             seat.resumes = resumes;
             seat.resume_at = Some(Instant::now() + pause);
-            tracing::warn!("chatd: Tiny server: media dropped; resume {resumes} of {RESUMES} in {}s", pause.as_secs());
+            tracing::warn!(
+                "chatd: Tiny server: media dropped; resume {resumes} of {RESUMES} in {}s",
+                pause.as_secs()
+            );
             true
         }
     }
@@ -1604,12 +2026,18 @@ fn answered(ctx: &Context, seat: &mut Seat, pending: &mut Vec<Pending>, frame: &
         Some(Value::Number(reference)) => reference.to_string(),
         _ => {
             if !ok {
-                tracing::warn!("chatd: Tiny server: live socket error {}", text(frame, "code").unwrap_or("?"));
+                tracing::warn!(
+                    "chatd: Tiny server: live socket error {}",
+                    text(frame, "code").unwrap_or("?")
+                );
             }
             return;
         }
     };
-    let Some(at) = pending.iter().position(|pending| pending.reference == reference) else {
+    let Some(at) = pending
+        .iter()
+        .position(|pending| pending.reference == reference)
+    else {
         return;
     };
     let pending = pending.remove(at);
@@ -1634,7 +2062,12 @@ fn answered(ctx: &Context, seat: &mut Seat, pending: &mut Vec<Pending>, frame: &
             Asked::Kick | Asked::State | Asked::Moderate => {}
             Asked::Offer => {
                 if let (Some(sdp), Some(room)) = (text(frame, "sdp"), seat.wanted.clone()) {
-                    ctx.tell_media(&room, MediaRequest::TinyRenegotiation { sdp: sdp.to_owned() });
+                    ctx.tell_media(
+                        &room,
+                        MediaRequest::TinyRenegotiation {
+                            sdp: sdp.to_owned(),
+                        },
+                    );
                 }
             }
         }
@@ -1656,7 +2089,10 @@ fn answered(ctx: &Context, seat: &mut Seat, pending: &mut Vec<Pending>, frame: &
         }
         if let Asked::Offer = &pending.asked {
             if let Some(room) = seat.wanted.clone() {
-                ctx.tell_media(&room, MediaRequest::TinyRenegotiation { sdp: String::new() });
+                ctx.tell_media(
+                    &room,
+                    MediaRequest::TinyRenegotiation { sdp: String::new() },
+                );
             }
         }
         // A rejoin nobody asked for that fails is not tried again. A refused renegotiation
@@ -1688,7 +2124,11 @@ fn durable(ctx: &Context, saved: &super::Saved, seat: &mut Seat, kind: &str, fra
             let Some(member) = frame.get("member") else {
                 return;
             };
-            let (Some(user), name, role) = (text(member, "user_id"), text(member, "display_name"), text(member, "role")) else {
+            let (Some(user), name, role) = (
+                text(member, "user_id"),
+                text(member, "display_name"),
+                text(member, "role"),
+            ) else {
                 return;
             };
             if let Some(name) = name {
@@ -1696,11 +2136,20 @@ fn durable(ctx: &Context, saved: &super::Saved, seat: &mut Seat, kind: &str, fra
                     seat.names.insert(user.to_owned(), name.to_owned());
                 }
             }
-            if let Some(role) = role.filter(|role| user == seat.me && *role != seat.role && matches!(*role, "owner" | "admin" | "member")) {
+            if let Some(role) = role.filter(|role| {
+                user == seat.me
+                    && *role != seat.role
+                    && matches!(*role, "owner" | "admin" | "member")
+            }) {
                 seat.role = role.to_owned();
                 save_role(ctx, &seat.me, &seat.role);
             }
-            let rooms: Vec<String> = seat.calls.iter().filter(|(_, people)| people.iter().any(|who| who.user == user)).map(|(room, _)| room.clone()).collect();
+            let rooms: Vec<String> = seat
+                .calls
+                .iter()
+                .filter(|(_, people)| people.iter().any(|who| who.user == user))
+                .map(|(room, _)| room.clone())
+                .collect();
             for room in rooms {
                 tell(ctx, seat, &room);
             }
@@ -1726,7 +2175,16 @@ fn durable(ctx: &Context, saved: &super::Saved, seat: &mut Seat, kind: &str, fra
     // Anything the page shows: the server, its roles, categories and order, rooms, members
     // and invites. `role.*` and `member.roles` can also change what this account may do; the
     // page's next read learns it.
-    let shown = ["server.", "role.", "roles.", "category.", "layout.", "room.", "member.", "invite."];
+    let shown = [
+        "server.",
+        "role.",
+        "roles.",
+        "category.",
+        "layout.",
+        "room.",
+        "member.",
+        "invite.",
+    ];
     if shown.iter().any(|prefix| kind.starts_with(prefix)) {
         ctx.community_changed();
     }
@@ -1761,14 +2219,33 @@ impl Wire {
     fn open(url: &str, token: &str, limit: Duration) -> Result<Wire, Opened> {
         let failed = |err: &dyn std::fmt::Display| Opened::Failed(net::redact(&err.to_string()));
         let mut request = url.into_client_request().map_err(|err| failed(&err))?;
-        let bearer = HeaderValue::from_str(&format!("Bearer {token}")).map_err(|err| failed(&err))?;
+        let bearer =
+            HeaderValue::from_str(&format!("Bearer {token}")).map_err(|err| failed(&err))?;
         request.headers_mut().insert("Authorization", bearer);
-        request.headers_mut().insert("User-Agent", HeaderValue::from_static("tinyclient"));
+        request
+            .headers_mut()
+            .insert("User-Agent", HeaderValue::from_static("tinyclient"));
         let uri = request.uri();
-        let host = uri.host().unwrap_or("").trim_start_matches('[').trim_end_matches(']').to_owned();
-        let port = uri.port_u16().unwrap_or(if uri.scheme_str() == Some("wss") { 443 } else { 80 });
-        let addrs = (host.as_str(), port).to_socket_addrs().map_err(|err| failed(&err))?;
-        let mut tcp = Err(io::Error::new(ErrorKind::NotFound, "the server's name did not resolve"));
+        let host = uri
+            .host()
+            .unwrap_or("")
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_owned();
+        let port = uri
+            .port_u16()
+            .unwrap_or(if uri.scheme_str() == Some("wss") {
+                443
+            } else {
+                80
+            });
+        let addrs = (host.as_str(), port)
+            .to_socket_addrs()
+            .map_err(|err| failed(&err))?;
+        let mut tcp = Err(io::Error::new(
+            ErrorKind::NotFound,
+            "the server's name did not resolve",
+        ));
         for addr in addrs {
             tcp = TcpStream::connect_timeout(&addr, limit);
             if tcp.is_ok() {
@@ -1777,14 +2254,24 @@ impl Wire {
         }
         let tcp = tcp.map_err(|err| failed(&err))?;
         let _ = tcp.set_nodelay(true);
-        tcp.set_read_timeout(Some(limit)).map_err(|err| failed(&err))?;
-        tcp.set_write_timeout(Some(limit)).map_err(|err| failed(&err))?;
-        let config = WebSocketConfig::default().max_frame_size(Some(FRAME)).max_message_size(Some(FRAME));
+        tcp.set_read_timeout(Some(limit))
+            .map_err(|err| failed(&err))?;
+        tcp.set_write_timeout(Some(limit))
+            .map_err(|err| failed(&err))?;
+        let config = WebSocketConfig::default()
+            .max_frame_size(Some(FRAME))
+            .max_message_size(Some(FRAME));
         let socket = match tungstenite::client_tls_with_config(request, tcp, Some(config), None) {
             Ok((socket, _)) => socket,
-            Err(HandshakeError::Failure(tungstenite::Error::Http(response))) => return Err(Opened::Status(response.status().as_u16())),
+            Err(HandshakeError::Failure(tungstenite::Error::Http(response))) => {
+                return Err(Opened::Status(response.status().as_u16()))
+            }
             Err(HandshakeError::Failure(err)) => return Err(failed(&err)),
-            Err(HandshakeError::Interrupted(_)) => return Err(Opened::Failed("the server did not finish the handshake".to_owned())),
+            Err(HandshakeError::Interrupted(_)) => {
+                return Err(Opened::Failed(
+                    "the server did not finish the handshake".to_owned(),
+                ))
+            }
         };
         let Some(tcp) = crate::tls::tcp(socket.get_ref()) else {
             return Err(Opened::Failed("unexpected stream".to_owned()));
@@ -1800,12 +2287,16 @@ impl Wire {
             match self.socket.read() {
                 Ok(Message::Text(text)) => return Ok(Some(text.as_str().to_owned())),
                 Ok(Message::Close(frame)) => {
-                    let (code, reason) = frame.map_or((0, String::new()), |f| (u16::from(f.code), f.reason.to_string()));
+                    let (code, reason) = frame.map_or((0, String::new()), |f| {
+                        (u16::from(f.code), f.reason.to_string())
+                    });
                     return Err(Lost::Closed(code, reason));
                 }
                 // WebSocket pings are answered by tungstenite on the next read or write.
                 Ok(_) => {}
-                Err(tungstenite::Error::Io(err)) if err.kind() == ErrorKind::WouldBlock => return Ok(None),
+                Err(tungstenite::Error::Io(err)) if err.kind() == ErrorKind::WouldBlock => {
+                    return Ok(None)
+                }
                 Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => {
                     return Err(Lost::Broken("the server closed the connection".to_owned()))
                 }
@@ -1820,13 +2311,19 @@ impl Wire {
         for _ in 0..50 {
             match sent {
                 Err(tungstenite::Error::Io(err)) if err.kind() == ErrorKind::WouldBlock => {
-                    wait_sockets(Instant::now() + Duration::from_millis(200), &[(self.poll, POLL_OUT)]);
+                    wait_sockets(
+                        Instant::now() + Duration::from_millis(200),
+                        &[(self.poll, POLL_OUT)],
+                    );
                     sent = self.socket.flush();
                 }
                 other => return other.map_err(io::Error::other),
             }
         }
-        Err(io::Error::new(ErrorKind::TimedOut, "the server is not taking what is sent"))
+        Err(io::Error::new(
+            ErrorKind::TimedOut,
+            "the server is not taking what is sent",
+        ))
     }
 
     /// Sleeps until the socket has something, the wake socket is written to, or `until`.

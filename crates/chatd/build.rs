@@ -27,25 +27,35 @@ fn main() {
     // their own two values, which is a packaging decision, not a build error.
     let id_ok = id.trim().parse::<i32>().ok().is_some_and(|id| id > 0);
     if !id_ok || hash.trim().is_empty() {
-        eprintln!("cargo: (chatd ships without a Telegram app id: nothing will sign in to Telegram)");
+        eprintln!(
+            "cargo: (chatd ships without a Telegram app id: nothing will sign in to Telegram)"
+        );
         return;
     }
     // `rustc-env` is what `option_env!` reads, so the build script is what brings a file's
     // credentials in reach for the adapter, no matter what the shell had.
     println!("cargo:rustc-env=TINYCLIENT_TELEGRAM_API_ID={}", id.trim());
-    println!("cargo:rustc-env=TINYCLIENT_TELEGRAM_API_HASH={}", hash.trim());
+    println!(
+        "cargo:rustc-env=TINYCLIENT_TELEGRAM_API_HASH={}",
+        hash.trim()
+    );
 }
 
 /// The two credentials a local build needs, from the `KEY = VALUE` lines of `telegram.env`
 /// next to the workspace, or the error that says why there is nothing: the file is absent, or
 /// it does not hold both keys complete.
 fn read_local() -> Result<(String, String), String> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..").join("telegram.env");
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("telegram.env");
     let file = std::fs::read_to_string(path).map_err(|err| err.to_string())?;
     let mut id = String::new();
     let mut hash = String::new();
     for line in file.lines() {
-        let Some((key, value)) = line.split_once('=') else { continue };
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
         let value = value.trim().trim_matches('"').to_owned();
         match key.trim() {
             "TINYCLIENT_TELEGRAM_API_ID" => id = value,

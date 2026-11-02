@@ -9,8 +9,14 @@ const DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/demo/photos");
 
 /// The bytes of `name`, a plain file name in `photos/`.
 pub fn bytes(name: &str) -> Option<Vec<u8>> {
-    let plain = !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.') && !name.starts_with('.');
-    plain.then(|| std::fs::read(Path::new(DIR).join(name)).ok()).flatten()
+    let plain = !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
+        && !name.starts_with('.');
+    plain
+        .then(|| std::fs::read(Path::new(DIR).join(name)).ok())
+        .flatten()
 }
 
 /// The content type a file in `photos/` is served with.
@@ -44,7 +50,10 @@ pub fn portrait(name: &str) -> Option<String> {
         }
     }
     let slug = slug.trim_end_matches('-');
-    ["webp", "jpg", "png"].into_iter().map(|ext| format!("avatar-{slug}.{ext}")).find(|file| Path::new(DIR).join(file).is_file())
+    ["webp", "jpg", "png"]
+        .into_iter()
+        .map(|ext| format!("avatar-{slug}.{ext}"))
+        .find(|file| Path::new(DIR).join(file).is_file())
 }
 
 #[cfg(test)]
@@ -53,8 +62,14 @@ mod tests {
 
     #[test]
     fn a_name_finds_its_portrait_and_nothing_leaves_the_directory() {
-        assert_eq!(portrait("Chloé Martin").as_deref(), Some("avatar-chloe-martin.jpg"));
-        assert_eq!(portrait("Haruto Senda").as_deref(), Some("avatar-haruto-senda.png"));
+        assert_eq!(
+            portrait("Chloé Martin").as_deref(),
+            Some("avatar-chloe-martin.jpg")
+        );
+        assert_eq!(
+            portrait("Haruto Senda").as_deref(),
+            Some("avatar-haruto-senda.png")
+        );
         assert_eq!(portrait("Nobody In Particular"), None);
         assert!(bytes("avatar-ines-marchetti.jpg").is_some());
         assert_eq!(bytes("../photos.rs"), None);

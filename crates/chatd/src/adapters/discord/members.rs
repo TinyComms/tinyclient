@@ -13,7 +13,8 @@ use super::super::{Failure, Members, Refusal, Reply};
 use super::model::{Member, PresenceUpdate};
 use super::{answer, gateway, Discord};
 use protocol::{
-    ConversationKind, MediaFile, MemberSection, Network, Person, Presence, Relation, Watching, SEARCH_MIN_CHARS,
+    ConversationKind, MediaFile, MemberSection, Network, Person, Presence, Relation, Watching,
+    SEARCH_MIN_CHARS,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -113,7 +114,11 @@ impl Watched {
     fn list(&mut self, channel: Option<&str>) {
         if self.list.as_deref() != channel {
             self.list = channel.map(str::to_owned);
-            self.ranges = if channel.is_some() { vec![(0, WINDOW - 1)] } else { Vec::new() };
+            self.ranges = if channel.is_some() {
+                vec![(0, WINDOW - 1)]
+            } else {
+                Vec::new()
+            };
             self.roster = None;
         }
     }
@@ -152,7 +157,10 @@ impl Roster {
 fn ranges(roster: Option<&Roster>, offset: u32, limit: u32) -> Vec<(u32, u32)> {
     let last = offset + limit.max(1) - 1;
     let (first_row, last_row) = match roster {
-        Some(roster) => (roster.row_of(offset), roster.row_of(last.min(roster.total().max(1) - 1))),
+        Some(roster) => (
+            roster.row_of(offset),
+            roster.row_of(last.min(roster.total().max(1) - 1)),
+        ),
         // Before the sections are known: a guess, corrected by the first answer.
         None => (offset, last + 8),
     };
@@ -209,8 +217,15 @@ impl ListUpdate {
         // SYNC delivers a requested window and INVALIDATE discards an old one.
         // Neither edits the roster; treating them as edits makes readers
         // invalidate the page that just arrived and starves later queued pages.
-        !self.groups.iter().map(|group| (&group.id, group.count)).eq(groups.iter().map(|(id, count)| (id, *count)))
-            || self.ops.iter().any(|op| matches!(op.op.as_str(), "UPDATE" | "INSERT" | "DELETE"))
+        !self
+            .groups
+            .iter()
+            .map(|group| (&group.id, group.count))
+            .eq(groups.iter().map(|(id, count)| (id, *count)))
+            || self
+                .ops
+                .iter()
+                .any(|op| matches!(op.op.as_str(), "UPDATE" | "INSERT" | "DELETE"))
     }
 }
 
@@ -245,7 +260,11 @@ impl Discord {
                 return;
             }
             let mut subscriptions = Map::new();
-            if let Some(old) = watched.sent.as_ref().filter(|old| Some(&old.guild) != want.as_ref().map(|want| &want.guild)) {
+            if let Some(old) = watched
+                .sent
+                .as_ref()
+                .filter(|old| Some(&old.guild) != want.as_ref().map(|want| &want.guild))
+            {
                 let off = json!({
                     "typing": false, "threads": false, "activities": false, "member_updates": false,
                     "members": [], "channels": {}, "thread_member_lists": [],
@@ -255,7 +274,11 @@ impl Discord {
             if let Some(want) = &want {
                 let mut channels = Map::new();
                 if let Some(channel) = &want.channel {
-                    let ranges: Vec<Value> = want.ranges.iter().map(|(from, to)| json!([from, to])).collect();
+                    let ranges: Vec<Value> = want
+                        .ranges
+                        .iter()
+                        .map(|(from, to)| json!([from, to]))
+                        .collect();
                     channels.insert(channel.clone(), Value::Array(ranges));
                 }
                 // Activities stay off: they are a stream of what every member is playing.
@@ -293,7 +316,8 @@ impl Discord {
             if *watched.seen == **watching {
                 // Nothing moved. A Space opened by a shell that then never said what it is
                 // looking at is let go after a while, so a shell that quit leaves nothing held.
-                let idle = **watching == Watching::default() && watched.opened.is_some_and(|at| at.elapsed() > LINGER);
+                let idle = **watching == Watching::default()
+                    && watched.opened.is_some_and(|at| at.elapsed() > LINGER);
                 if !idle || watched.on_screen.is_none() {
                     return;
                 }
@@ -317,11 +341,17 @@ impl Discord {
 
     /// Works out what `watching` puts on screen and subscribes it.
     fn place(&self, watching: &Arc<Watching>) {
-        let ours = |key: &protocol::Key| key.network == Network::Discord && key.account == self.ctx.account.account;
+        let ours = |key: &protocol::Key| {
+            key.network == Network::Discord && key.account == self.ctx.account.account
+        };
         let open = watching.conversation.as_ref().filter(|key| ours(key));
         let conversation = open.and_then(|key| self.ctx.known(&key.id).ok().flatten());
-        let guild = conversation.as_ref().and_then(|conversation| self.guild_of(conversation));
-        let listable = conversation.as_ref().is_some_and(|conversation| conversation.kind != ConversationKind::Thread);
+        let guild = conversation
+            .as_ref()
+            .and_then(|conversation| self.guild_of(conversation));
+        let listable = conversation
+            .as_ref()
+            .is_some_and(|conversation| conversation.kind != ConversationKind::Thread);
         {
             let mut state = self.state.lock().unwrap();
             let state = &mut *state;
@@ -330,13 +360,17 @@ impl Discord {
                 return;
             }
             // The tree on screen is named outright; an open conversation says it too.
-            let named = watching.space.as_ref().map(|space| ours(space).then(|| space.id.clone()));
+            let named = watching
+                .space
+                .as_ref()
+                .map(|space| ours(space).then(|| space.id.clone()));
             let guild = guild.filter(|guild| state.guilds.contains_key(guild));
             match (named, &watching.conversation, &guild) {
                 (Some(space), _, _) => {
                     let space = space.filter(|space| state.guilds.contains_key(space));
                     state.members.show(space.as_deref());
-                    let list = open.filter(|_| watching.members.is_some() && listable && guild == space);
+                    let list =
+                        open.filter(|_| watching.members.is_some() && listable && guild == space);
                     state.members.list(list.map(|key| key.id.as_str()));
                 }
                 (None, Some(_), Some(guild)) => {
@@ -353,17 +387,44 @@ impl Discord {
                     // Round to GUI cache pages so both edge pages are available.
                     let first = offset / 50 * 50;
                     let end = offset.saturating_add(count).saturating_add(49) / 50 * 50;
-                    state.members.ranges = ranges(state.members.roster.as_ref(), first, end.saturating_sub(first));
+                    state.members.ranges = ranges(
+                        state.members.roster.as_ref(),
+                        first,
+                        end.saturating_sub(first),
+                    );
                 }
             }
-            let listed: HashSet<String> = state.members.roster.as_ref().into_iter().flat_map(|roster| roster.rows.iter())
-                .filter(|(row, _)| state.members.ranges.iter().any(|(from, to)| *row >= from && *row <= to))
-                .filter_map(|(_, entry)| match entry { Entry::Member(person) => Some(person.key.id.clone()), _ => None }).collect();
+            let listed: HashSet<String> = state
+                .members
+                .roster
+                .as_ref()
+                .into_iter()
+                .flat_map(|roster| roster.rows.iter())
+                .filter(|(row, _)| {
+                    state
+                        .members
+                        .ranges
+                        .iter()
+                        .any(|(from, to)| *row >= from && *row <= to)
+                })
+                .filter_map(|(_, entry)| match entry {
+                    Entry::Member(person) => Some(person.key.id.clone()),
+                    _ => None,
+                })
+                .collect();
             // Friends' presence arrives unasked. Anyone else on screen is asked for by id, and
             // only as part of the server that is on screen anyway.
             let relations = &state.relations;
-            let strangers = watching.people.iter().filter(|key| ours(key)).map(|key| &key.id);
-            let strangers = strangers.filter(|id| !listed.contains(*id) && relations.get(*id) != Some(&Relation::Friend) && **id != state.me);
+            let strangers = watching
+                .people
+                .iter()
+                .filter(|key| ours(key))
+                .map(|key| &key.id);
+            let strangers = strangers.filter(|id| {
+                !listed.contains(*id)
+                    && relations.get(*id) != Some(&Relation::Friend)
+                    && **id != state.me
+            });
             state.members.people = match state.members.on_screen {
                 Some(_) => strangers.take(PEOPLE).cloned().collect(),
                 None => Vec::new(),
@@ -393,48 +454,95 @@ impl Discord {
     /// a cache miss is pending data, never a request that blocks later scrolling.
     pub(super) fn members(&self, channel: String, offset: u32, limit: u32, reply: Reply<Members>) {
         let conversation = self.ctx.known(&channel).ok().flatten();
-        let guild = conversation.as_ref().and_then(|conversation| self.guild_of(conversation));
-        let in_tree = conversation.as_ref().is_some_and(|conversation| conversation.space.is_some());
-        let (Some(guild), true) = (guild, in_tree) else { return answer(reply, Err(Refusal::Unsupported)); };
+        let guild = conversation
+            .as_ref()
+            .and_then(|conversation| self.guild_of(conversation));
+        let in_tree = conversation
+            .as_ref()
+            .is_some_and(|conversation| conversation.space.is_some());
+        let (Some(guild), true) = (guild, in_tree) else {
+            return answer(reply, Err(Refusal::Unsupported));
+        };
         if conversation.is_some_and(|conversation| conversation.kind == ConversationKind::Thread) {
             return answer(reply, Err(Refusal::Unsupported));
         }
         let (groups, members, pending) = {
             let mut state = self.state.lock().unwrap();
             if !state.guilds.contains_key(&guild) {
-                if !state.guilds.is_empty() { return answer(reply, Err(Refusal::Unsupported)); }
+                if !state.guilds.is_empty() {
+                    return answer(reply, Err(Refusal::Unsupported));
+                }
                 // Before READY no server is known yet: the list is still to come, not refused.
                 // Nothing is placed here; READY places the Watch once it has said what the servers are.
-                return answer(reply, Ok(Members { pending: true, sections: Vec::new(), members: Vec::new() }));
+                return answer(
+                    reply,
+                    Ok(Members {
+                        pending: true,
+                        sections: Vec::new(),
+                        members: Vec::new(),
+                    }),
+                );
             }
             let watched = &mut state.members;
             if watched.seen.members.is_some() && watched.list.as_deref() != Some(&channel) {
                 // A delayed query from a previous conversation cannot take over
                 // a viewport already selected by Watch.
-                return answer(reply, Ok(Members { pending: true, sections: Vec::new(), members: Vec::new() }));
+                return answer(
+                    reply,
+                    Ok(Members {
+                        pending: true,
+                        sections: Vec::new(),
+                        members: Vec::new(),
+                    }),
+                );
             }
             let opening = watched.list.as_deref() != Some(&channel);
             watched.show(Some(&guild));
             watched.list(Some(&channel));
             // Bootstrap the first window before its sections make a viewport possible.
             // Subsequent cache queries must never move the subscribed window.
-            if opening { watched.ranges = ranges(watched.roster.as_ref(), offset, limit.clamp(1, WINDOW)); }
-            let groups = watched.roster.as_ref().map_or_else(Vec::new, |roster| roster.groups.clone());
-            let found = watched.roster.as_ref().and_then(|roster| roster.window(offset, limit.clamp(1, WINDOW)));
+            if opening {
+                watched.ranges = ranges(watched.roster.as_ref(), offset, limit.clamp(1, WINDOW));
+            }
+            let groups = watched
+                .roster
+                .as_ref()
+                .map_or_else(Vec::new, |roster| roster.groups.clone());
+            let found = watched
+                .roster
+                .as_ref()
+                .and_then(|roster| roster.window(offset, limit.clamp(1, WINDOW)));
             let pending = found.is_none();
             (groups, found.unwrap_or_default(), pending)
         };
         self.sync_subscription();
-        let roster = Roster { channel, groups, rows: BTreeMap::new() };
-        answer(reply, Ok(Members { pending, sections: self.sections(&guild, &roster), members }));
+        let roster = Roster {
+            channel,
+            groups,
+            rows: BTreeMap::new(),
+        };
+        answer(
+            reply,
+            Ok(Members {
+                pending,
+                sections: self.sections(&guild, &roster),
+                members,
+            }),
+        );
     }
 
-    fn person(&self, member: &Member, files: &mut Vec<(MediaFile, String)>) -> Option<(Person, Presence, String)> {
+    fn person(
+        &self,
+        member: &Member,
+        files: &mut Vec<(MediaFile, String)>,
+    ) -> Option<(Person, Presence, String)> {
         let user = member.user.as_ref()?;
         let (avatar, url) = user.avatar();
         files.push((avatar.clone(), url));
         let presence = member.presence.as_ref();
-        let (shown, status) = presence.map_or((Presence::Unknown, ""), |presence| (presence.presence(), presence.status()));
+        let (shown, status) = presence.map_or((Presence::Unknown, ""), |presence| {
+            (presence.presence(), presence.status())
+        });
         let person = Person {
             link: super::model::user_link(&user.id),
             key: self.ctx.key(&user.id),
@@ -457,7 +565,11 @@ impl Discord {
         let mut seen = Vec::new();
         let shown;
         let changed;
-        let mut entry = |item: &ListItem| match item.member.as_ref().and_then(|member| self.person(member, &mut files)) {
+        let mut entry = |item: &ListItem| match item
+            .member
+            .as_ref()
+            .and_then(|member| self.person(member, &mut files))
+        {
             Some((person, presence, status)) => {
                 seen.push((person.key.id.clone(), presence, status));
                 Entry::Member(Box::new(person))
@@ -493,7 +605,11 @@ impl Discord {
             }
             shown = channel.clone();
             changed = update.changes_roster(&roster.groups);
-            roster.groups = update.groups.iter().map(|group| (group.id.clone(), group.count)).collect();
+            roster.groups = update
+                .groups
+                .iter()
+                .map(|group| (group.id.clone(), group.count))
+                .collect();
             for (op, range, index, mut entries) in ops {
                 match (op.as_str(), range, index) {
                     ("SYNC", Some((from, _)), _) => {
@@ -501,7 +617,9 @@ impl Discord {
                             roster.rows.insert(from + offset as u32, entry);
                         }
                     }
-                    ("INVALIDATE", Some((from, to)), _) => roster.rows.retain(|row, _| *row < from || *row > to),
+                    ("INVALIDATE", Some((from, to)), _) => {
+                        roster.rows.retain(|row, _| *row < from || *row > to)
+                    }
                     ("UPDATE", _, Some(index)) => {
                         if let Some(entry) = entries.pop() {
                             roster.rows.insert(index, entry);
@@ -511,8 +629,11 @@ impl Discord {
                         // Every row from here on moves by one.
                         let inserted = op == "INSERT";
                         let tail = roster.rows.split_off(&index);
-                        let moved = tail.into_iter().filter(|(row, _)| inserted || *row != index);
-                        let moved = moved.map(|(row, entry)| (if inserted { row + 1 } else { row - 1 }, entry));
+                        let moved = tail
+                            .into_iter()
+                            .filter(|(row, _)| inserted || *row != index);
+                        let moved = moved
+                            .map(|(row, entry)| (if inserted { row + 1 } else { row - 1 }, entry));
                         roster.rows.extend(moved);
                         if let Some(entry) = entries.pop().filter(|_| inserted) {
                             roster.rows.insert(index, entry);
@@ -524,11 +645,17 @@ impl Discord {
             // Only the windows asked for are kept.
             if roster.rows.len() > ROSTER {
                 let ranges = &watched.ranges;
-                roster.rows.retain(|row, _| ranges.iter().any(|(from, to)| row >= from && row <= to));
+                roster
+                    .rows
+                    .retain(|row, _| ranges.iter().any(|(from, to)| row >= from && row <= to));
             }
             for entry in roster.rows.values_mut() {
                 if let Entry::Member(person) = entry {
-                    person.relation = state.relations.get(&person.key.id).copied().unwrap_or_default();
+                    person.relation = state
+                        .relations
+                        .get(&person.key.id)
+                        .copied()
+                        .unwrap_or_default();
                 }
             }
         }
@@ -567,13 +694,24 @@ impl Discord {
         if search.done.contains(&(guild.clone(), query.to_lowercase())) {
             return self.ctx.searched(query);
         }
-        if search.sent.as_ref().is_some_and(|(sent, _, _)| sent == query) {
+        if search
+            .sent
+            .as_ref()
+            .is_some_and(|(sent, _, _)| sent == query)
+        {
             return;
         }
         let soon = |at: Option<&Instant>, gap: Duration| at.is_some_and(|at| at.elapsed() < gap);
-        if search.sent.is_some() || soon(search.last.as_ref(), SEARCH_GAP) || soon(search.asked.get(&guild), SEARCH_AGAIN) {
+        if search.sent.is_some()
+            || soon(search.last.as_ref(), SEARCH_GAP)
+            || soon(search.asked.get(&guild), SEARCH_AGAIN)
+        {
             // Whatever waited before is overtaken: it is done, with what the cache has.
-            if let Some(overtaken) = search.waiting.replace(query.to_owned()).filter(|before| before != query) {
+            if let Some(overtaken) = search
+                .waiting
+                .replace(query.to_owned())
+                .filter(|before| before != query)
+            {
                 self.ctx.searched(&overtaken);
             }
             return;
@@ -591,12 +729,29 @@ impl Discord {
         let (unanswered, due) = {
             let mut state = self.state.lock().unwrap();
             let state = &mut *state;
-            let late = state.search.sent.as_ref().is_some_and(|(_, _, at)| at.elapsed() > PATIENCE);
-            let unanswered = state.search.sent.take_if(|_| late).map(|(query, _, _)| query);
+            let late = state
+                .search
+                .sent
+                .as_ref()
+                .is_some_and(|(_, _, at)| at.elapsed() > PATIENCE);
+            let unanswered = state
+                .search
+                .sent
+                .take_if(|_| late)
+                .map(|(query, _, _)| query);
             let guild = state.members.on_screen.as_ref();
             let free = state.search.sent.is_none()
-                && state.search.last.is_none_or(|at| at.elapsed() >= SEARCH_GAP)
-                && guild.is_none_or(|guild| state.search.asked.get(guild).is_none_or(|at| at.elapsed() >= SEARCH_AGAIN));
+                && state
+                    .search
+                    .last
+                    .is_none_or(|at| at.elapsed() >= SEARCH_GAP)
+                && guild.is_none_or(|guild| {
+                    state
+                        .search
+                        .asked
+                        .get(guild)
+                        .is_none_or(|at| at.elapsed() >= SEARCH_AGAIN)
+                });
             (unanswered, state.search.waiting.take_if(|_| free))
         };
         if let Some(query) = unanswered {
@@ -612,14 +767,24 @@ impl Discord {
     pub(super) fn members_chunk(&self, chunk: Chunk) -> Result<(), Failure> {
         let asked = {
             let state = self.state.lock().unwrap();
-            state.search.sent.as_ref().map(|(query, nonce, _)| (query.clone(), nonce.clone()))
+            state
+                .search
+                .sent
+                .as_ref()
+                .map(|(query, nonce, _)| (query.clone(), nonce.clone()))
         };
-        let Some((query, _)) = asked.filter(|(_, nonce)| chunk.nonce.as_ref() == Some(nonce)) else {
+        let Some((query, _)) = asked.filter(|(_, nonce)| chunk.nonce.as_ref() == Some(nonce))
+        else {
             return Ok(());
         };
         let mut files = Vec::new();
         let mut people = Vec::new();
-        for user in chunk.members.iter().filter_map(|member| member.user.as_ref()).take(25) {
+        for user in chunk
+            .members
+            .iter()
+            .filter_map(|member| member.user.as_ref())
+            .take(25)
+        {
             // People keeps who someone is everywhere: a nickname we gave a friend, else their
             // own name. A server nickname belongs to that server's messages and member list.
             let nickname = self.state.lock().unwrap().users.get(&user.id).cloned();
@@ -639,7 +804,10 @@ impl Discord {
                 state.search.done.clear();
             }
             if let Some(guild) = &state.members.on_screen {
-                state.search.done.insert((guild.clone(), query.to_lowercase()));
+                state
+                    .search
+                    .done
+                    .insert((guild.clone(), query.to_lowercase()));
             }
         }
         self.ctx.searched(&query);
@@ -656,7 +824,8 @@ mod paging_tests {
         let mut update: ListUpdate = serde_json::from_value(json!({
             "guild_id": "guild", "groups": [{"id": "online", "count": 200}],
             "ops": [{"op": "SYNC", "range": [100, 199], "items": []}]
-        })).unwrap();
+        }))
+        .unwrap();
         let groups = vec![("online".to_owned(), 200)];
         assert!(!update.changes_roster(&groups));
         // Every page in a multi-page viewport must be able to land without
@@ -666,13 +835,22 @@ mod paging_tests {
             assert!(!update.changes_roster(&groups));
         }
         update.ops[0].op = "INVALIDATE".to_owned();
-        assert!(!update.changes_roster(&groups), "discarding an old window must not restart visible reads");
+        assert!(
+            !update.changes_roster(&groups),
+            "discarding an old window must not restart visible reads"
+        );
         update.groups[0].count = 201;
-        assert!(update.changes_roster(&groups), "section counts still invalidate cached offsets");
+        assert!(
+            update.changes_roster(&groups),
+            "section counts still invalidate cached offsets"
+        );
         update.groups[0].count = 200;
         for op in ["UPDATE", "INSERT", "DELETE"] {
             update.ops[0].op = op.to_owned();
-            assert!(update.changes_roster(&groups), "{op} must refresh cached members");
+            assert!(
+                update.changes_roster(&groups),
+                "{op} must refresh cached members"
+            );
         }
     }
 }

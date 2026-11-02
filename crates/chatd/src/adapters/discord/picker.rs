@@ -69,7 +69,9 @@ impl Gif {
 fn escaped(text: &str) -> String {
     text.bytes()
         .map(|byte| match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (byte as char).to_string(),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (byte as char).to_string()
+            }
             other => format!("%{other:02X}"),
         })
         .collect()
@@ -77,7 +79,9 @@ fn escaped(text: &str) -> String {
 
 /// A stable name for an address, for a preview's file id.
 fn fnv(text: &str) -> u64 {
-    text.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3))
+    text.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+    })
 }
 
 impl Discord {
@@ -88,19 +92,33 @@ impl Discord {
             return;
         };
         if let Some(emojis) = changed.emojis {
-            info.emojis = emojis.into_iter().filter(|emoji| emoji.available).filter_map(|emoji| {
-                let roles = emoji.roles.iter().map(|role| model::number(role)).collect();
-                Some(Pickable { id: emoji.id?, name: emoji.name, animated: emoji.animated, format: 0, roles })
-            }).collect();
+            info.emojis = emojis
+                .into_iter()
+                .filter(|emoji| emoji.available)
+                .filter_map(|emoji| {
+                    let roles = emoji.roles.iter().map(|role| model::number(role)).collect();
+                    Some(Pickable {
+                        id: emoji.id?,
+                        name: emoji.name,
+                        animated: emoji.animated,
+                        format: 0,
+                        roles,
+                    })
+                })
+                .collect();
         }
         if let Some(stickers) = changed.stickers {
-            info.stickers = stickers.into_iter().filter(|sticker| sticker.available).map(|sticker| Pickable {
-                animated: sticker.format_type != 1,
-                format: sticker.format_type,
-                id: sticker.id,
-                name: sticker.name,
-                roles: Box::default(),
-            }).collect();
+            info.stickers = stickers
+                .into_iter()
+                .filter(|sticker| sticker.available)
+                .map(|sticker| Pickable {
+                    animated: sticker.format_type != 1,
+                    format: sticker.format_type,
+                    id: sticker.id,
+                    name: sticker.name,
+                    roles: Box::default(),
+                })
+                .collect();
         }
     }
 
@@ -108,39 +126,75 @@ impl Discord {
     /// Nitro only the server the message is said in (none in a DM) and no animated emoji, with
     /// it every server's. An emoji limited to roles we lack is never offered. GIFs are Discord's
     /// own search (trending when nothing is typed).
-    pub(super) fn catalog(&self, kind: CatalogKind, space: Option<&str>, query: &str, cursor: Option<&str>) -> Result<CatalogPage, Refusal> {
+    pub(super) fn catalog(
+        &self,
+        kind: CatalogKind,
+        space: Option<&str>,
+        query: &str,
+        cursor: Option<&str>,
+    ) -> Result<CatalogPage, Refusal> {
         match kind {
             CatalogKind::Gifs => self.gifs(query),
             CatalogKind::Emoji | CatalogKind::Stickers => {
                 let from: usize = cursor.and_then(|cursor| cursor.parse().ok()).unwrap_or(0);
                 let (items, files, more) = self.pickables(kind, space, query, from);
-                self.ctx.media(&files).map_err(|err| Refusal::Refused(err.to_string()))?;
-                Ok(CatalogPage { items, cursor: more.then(|| (from + PAGE).to_string()) })
+                self.ctx
+                    .media(&files)
+                    .map_err(|err| Refusal::Refused(err.to_string()))?;
+                Ok(CatalogPage {
+                    items,
+                    cursor: more.then(|| (from + PAGE).to_string()),
+                })
             }
         }
     }
 
-    fn pickables(&self, kind: CatalogKind, space: Option<&str>, query: &str, from: usize) -> (Vec<CatalogItem>, Vec<(MediaFile, String)>, bool) {
+    fn pickables(
+        &self,
+        kind: CatalogKind,
+        space: Option<&str>,
+        query: &str,
+        from: usize,
+    ) -> (Vec<CatalogItem>, Vec<(MediaFile, String)>, bool) {
         let state = crate::hub::lock(&self.state);
         let everywhere = matches!(state.premium, 1..=3);
-        let mut guilds: Vec<(&String, &super::GuildInfo)> = state.guilds.iter().filter(|(id, _)| everywhere || Some(id.as_str()) == space).collect();
+        let mut guilds: Vec<(&String, &super::GuildInfo)> = state
+            .guilds
+            .iter()
+            .filter(|(id, _)| everywhere || Some(id.as_str()) == space)
+            .collect();
         // The server it is said in first, then the user's own order.
         guilds.sort_by_key(|(id, info)| (Some(id.as_str()) != space, info.position));
         let query = query.trim().trim_matches(':').to_lowercase();
         let all = guilds.into_iter().flat_map(|(_, info)| {
-            let list = if kind == CatalogKind::Emoji { &info.emojis } else { &info.stickers };
+            let list = if kind == CatalogKind::Emoji {
+                &info.emojis
+            } else {
+                &info.stickers
+            };
             let usable = move |pickable: &&Pickable| {
                 let emoji = kind == CatalogKind::Emoji;
-                let allowed = pickable.roles.is_empty() || pickable.roles.iter().any(|role| info.my_roles.contains(role));
+                let allowed = pickable.roles.is_empty()
+                    || pickable
+                        .roles
+                        .iter()
+                        .any(|role| info.my_roles.contains(role));
                 // An animated emoji is Nitro's, even in its own server.
                 !emoji || (allowed && (everywhere || !pickable.animated))
             };
-            list.iter().filter(usable).map(move |pickable| (info.name.as_str(), pickable))
+            list.iter()
+                .filter(usable)
+                .map(move |pickable| (info.name.as_str(), pickable))
         });
-        let mut matching = all.filter(|(_, pickable)| query.is_empty() || pickable.name.to_lowercase().contains(&query));
+        let mut matching = all.filter(|(_, pickable)| {
+            query.is_empty() || pickable.name.to_lowercase().contains(&query)
+        });
         let page: Vec<(&str, &Pickable)> = matching.by_ref().skip(from).take(PAGE).collect();
         let more = matching.next().is_some();
-        let (mut items, mut files) = (Vec::with_capacity(page.len()), Vec::with_capacity(page.len()));
+        let (mut items, mut files) = (
+            Vec::with_capacity(page.len()),
+            Vec::with_capacity(page.len()),
+        );
         for (pack, pickable) in page {
             let registered = match kind {
                 CatalogKind::Emoji => Some(model::emoji(&pickable.id, pickable.animated)),
@@ -151,8 +205,16 @@ impl Discord {
             };
             items.push(CatalogItem {
                 // A custom emoji is named by its file, as a reaction names it; a sticker by its id.
-                id: if kind == CatalogKind::Emoji { file.id.clone() } else { pickable.id.clone() },
-                name: if kind == CatalogKind::Emoji { format!(":{}:", pickable.name) } else { pickable.name.clone() },
+                id: if kind == CatalogKind::Emoji {
+                    file.id.clone()
+                } else {
+                    pickable.id.clone()
+                },
+                name: if kind == CatalogKind::Emoji {
+                    format!(":{}:", pickable.name)
+                } else {
+                    pickable.name.clone()
+                },
                 file: Some(file.clone()),
                 pack: pack.to_owned(),
                 animated: pickable.animated,
@@ -171,13 +233,19 @@ impl Discord {
     pub(super) fn reaction_rules(&self, channel: &str) -> ReactionRules {
         let nitro = matches!(crate::hub::lock(&self.state).premium, 1..=3);
         let mut rules = ReactionRules {
-            custom: if nitro { EmojiScope::All } else { EmojiScope::Space },
+            custom: if nitro {
+                EmojiScope::All
+            } else {
+                EmojiScope::Space
+            },
             animated: nitro,
             distinct: 20,
             ..ReactionRules::default()
         };
         let row = self.ctx.known(channel).ok().flatten();
-        let thread = row.as_ref().is_some_and(|row| row.kind == protocol::ConversationKind::Thread);
+        let thread = row
+            .as_ref()
+            .is_some_and(|row| row.kind == protocol::ConversationKind::Thread);
         let Some(guild) = row.and_then(|row| row.space) else {
             if !nitro {
                 rules.custom = EmojiScope::None;
@@ -185,15 +253,26 @@ impl Discord {
             return rules;
         };
         let me = self.me();
-        let kept: Vec<model::Kept> = self.ctx.note(&format!("kept:{guild}")).and_then(|kept| serde_json::from_str(&kept).ok()).unwrap_or_default();
+        let kept: Vec<model::Kept> = self
+            .ctx
+            .note(&format!("kept:{guild}"))
+            .and_then(|kept| serde_json::from_str(&kept).ok())
+            .unwrap_or_default();
         let state = crate::hub::lock(&self.state);
         let Some(info) = state.guilds.get(&guild) else {
             return rules;
         };
         // Threads are not kept; a thread is known by its channel.
-        let parent = info.channels.iter().find(|(id, _)| thread && *id == model::number(channel)).map(|(_, parent)| parent.to_string());
+        let parent = info
+            .channels
+            .iter()
+            .find(|(id, _)| thread && *id == model::number(channel))
+            .map(|(_, parent)| parent.to_string());
         let wanted = |id: &str| id == channel || parent.as_deref() == Some(id);
-        let found = kept.into_iter().filter(|kept| wanted(&kept.id)).min_by_key(|kept| kept.id != channel);
+        let found = kept
+            .into_iter()
+            .filter(|kept| wanted(&kept.id))
+            .min_by_key(|kept| kept.id != channel);
         // A channel not kept (READY not yet seen) is left to Discord to judge.
         let Some(found) = found else {
             return rules;
@@ -211,8 +290,15 @@ impl Discord {
     /// moves for a few hundred kilobytes a page. Unverified against a real account: the routes,
     /// `media_format` and the GIF object are the community's documentation.
     fn gifs(&self, query: &str) -> Result<CatalogPage, Refusal> {
-        let asked = (self.ctx.account.account.clone(), query.trim().to_lowercase());
-        if let Some((_, page)) = crate::hub::lock(&GIF_ANSWERS).get_or_insert_default().get(&asked).filter(|(at, _)| at.elapsed() < GIFS_KEPT) {
+        let asked = (
+            self.ctx.account.account.clone(),
+            query.trim().to_lowercase(),
+        );
+        if let Some((_, page)) = crate::hub::lock(&GIF_ANSWERS)
+            .get_or_insert_default()
+            .get(&asked)
+            .filter(|(at, _)| at.elapsed() < GIFS_KEPT)
+        {
             return Ok(page.clone());
         }
         let page = self.gifs_asked(query)?;
@@ -220,7 +306,11 @@ impl Discord {
         let held = held.get_or_insert_default();
         held.retain(|_, (at, _)| at.elapsed() < GIFS_KEPT);
         if held.len() >= GIFS_HELD {
-            if let Some(oldest) = held.iter().min_by_key(|(_, (at, _))| *at).map(|(key, _)| key.clone()) {
+            if let Some(oldest) = held
+                .iter()
+                .min_by_key(|(_, (at, _))| *at)
+                .map(|(key, _)| key.clone())
+            {
                 held.remove(&oldest);
             }
         }
@@ -231,12 +321,19 @@ impl Discord {
     fn gifs_asked(&self, query: &str) -> Result<CatalogPage, Refusal> {
         let path = match query.trim() {
             "" => format!("/gifs/trending-gifs?media_format=tinygif&locale=en-US&limit={GIFS}"),
-            query => format!("/gifs/search?q={}&media_format=tinygif&locale=en-US&limit={GIFS}", escaped(query)),
+            query => format!(
+                "/gifs/search?q={}&media_format=tinygif&locale=en-US&limit={GIFS}",
+                escaped(query)
+            ),
         };
         let answer = self.call("GET", &path, None).map_err(refusal)?;
-        let gifs: Vec<Gif> = serde_json::from_str(&answer).map_err(|err| Refusal::Refused(err.to_string()))?;
+        let gifs: Vec<Gif> =
+            serde_json::from_str(&answer).map_err(|err| Refusal::Refused(err.to_string()))?;
         let (mut items, mut files) = (Vec::new(), Vec::new());
-        for gif in gifs.into_iter().filter(|gif| !gif.url.is_empty() && gif.shown().starts_with("http")) {
+        for gif in gifs
+            .into_iter()
+            .filter(|gif| !gif.url.is_empty() && gif.shown().starts_with("http"))
+        {
             let shown = gif.shown().to_owned();
             let file = MediaFile {
                 width: gif.width,
@@ -252,8 +349,13 @@ impl Discord {
                 animated: true,
             });
         }
-        self.ctx.media(&files).map_err(|err| Refusal::Refused(err.to_string()))?;
-        Ok(CatalogPage { items, cursor: None })
+        self.ctx
+            .media(&files)
+            .map_err(|err| Refusal::Refused(err.to_string()))?;
+        Ok(CatalogPage {
+            items,
+            cursor: None,
+        })
     }
 }
 
@@ -263,10 +365,23 @@ mod tests {
 
     #[test]
     fn a_cell_shows_the_small_moving_gif_and_falls_back_to_the_still() {
-        let gif = |src: &str| Gif { url: "https://tenor.com/view/x".into(), title: String::new(), src: src.into(), preview: "https://media.tenor.com/x.png".into(), width: 220, height: 124 };
-        assert_eq!(gif("https://media.tenor.com/xAAAM/cat.gif").shown(), "https://media.tenor.com/xAAAM/cat.gif");
+        let gif = |src: &str| Gif {
+            url: "https://tenor.com/view/x".into(),
+            title: String::new(),
+            src: src.into(),
+            preview: "https://media.tenor.com/x.png".into(),
+            width: 220,
+            height: 124,
+        };
+        assert_eq!(
+            gif("https://media.tenor.com/xAAAM/cat.gif").shown(),
+            "https://media.tenor.com/xAAAM/cat.gif"
+        );
         // An MP4 needs a video decoder the window does not have; nothing at all is no picture.
-        assert_eq!(gif("https://media.tenor.com/xAAPo/cat.mp4").shown(), "https://media.tenor.com/x.png");
+        assert_eq!(
+            gif("https://media.tenor.com/xAAPo/cat.mp4").shown(),
+            "https://media.tenor.com/x.png"
+        );
         assert_eq!(gif("").shown(), "https://media.tenor.com/x.png");
     }
 }

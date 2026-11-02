@@ -4,7 +4,10 @@
 use super::{escaped, Auth, Body, Fault, Teams, PRESENCE, REMEMBERED, SPACES};
 use crate::adapters::{About, Members};
 use crate::store::{PersonDetails, PersonRow};
-use protocol::{Activity, ActivityKind, Contact, ContactKind, Mark, MediaFile, MediaKind, MemberSection, Person, Presence, Relation};
+use protocol::{
+    Activity, ActivityKind, Contact, ContactKind, Mark, MediaFile, MediaKind, MemberSection,
+    Person, Presence, Relation,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
@@ -92,7 +95,9 @@ impl Teams {
     }
 
     pub(super) fn name_of(&self, id: &str) -> Option<String> {
-        self.cached(id).map(|known| known.name).filter(|name| !name.is_empty())
+        self.cached(id)
+            .map(|known| known.name)
+            .filter(|name| !name.is_empty())
     }
 
     /// A person's picture, registered for fetching the first time it is wanted this run. Teams
@@ -118,9 +123,20 @@ impl Teams {
         };
         if first {
             let at = |size: u32| {
-                format!("{}/beta/users/{}/profilepicturev2?displayname={}&size=HR{size}x{size}", place.middle, escaped(id), escaped(name))
+                format!(
+                    "{}/beta/users/{}/profilepicturev2?displayname={}&size=HR{size}x{size}",
+                    place.middle,
+                    escaped(id),
+                    escaped(name)
+                )
             };
-            let registered = self.ctx.media(&[(file.clone(), at(AVATAR))]).and_then(|()| self.ctx.media_variants(&file.id, &[(AVATAR * 2, at(AVATAR * 2))]));
+            let registered = self
+                .ctx
+                .media(&[(file.clone(), at(AVATAR))])
+                .and_then(|()| {
+                    self.ctx
+                        .media_variants(&file.id, &[(AVATAR * 2, at(AVATAR * 2))])
+                });
             if let Err(err) = registered {
                 tracing::warn!("chatd: Teams: {err}");
             }
@@ -144,20 +160,32 @@ impl Teams {
             };
             let text = |name: &str| user[name].as_str().unwrap_or("").trim().to_owned();
             let name = match text("displayName") {
-                name if name.is_empty() => format!("{} {}", text("givenName"), text("surname")).trim().to_owned(),
+                name if name.is_empty() => format!("{} {}", text("givenName"), text("surname"))
+                    .trim()
+                    .to_owned(),
                 name => name,
             };
             let known = Known {
                 name,
-                mail: Some(text("userPrincipalName")).filter(|mail| !mail.is_empty()).unwrap_or_else(|| text("email")),
+                mail: Some(text("userPrincipalName"))
+                    .filter(|mail| !mail.is_empty())
+                    .unwrap_or_else(|| text("email")),
                 title: text("jobTitle"),
                 department: text("department"),
-                bot: id.starts_with("28:") || user["type"].as_str().is_some_and(|kind| kind.eq_ignore_ascii_case("bot")),
-                guest: user["userType"].as_str().is_some_and(|kind| kind.eq_ignore_ascii_case("guest")),
+                bot: id.starts_with("28:")
+                    || user["type"]
+                        .as_str()
+                        .is_some_and(|kind| kind.eq_ignore_ascii_case("bot")),
+                guest: user["userType"]
+                    .as_str()
+                    .is_some_and(|kind| kind.eq_ignore_ascii_case("guest")),
             };
             learned.push((id.to_owned(), known));
         }
-        let rows: Vec<PersonRow> = learned.iter().map(|(id, known)| self.row(id, known)).collect();
+        let rows: Vec<PersonRow> = learned
+            .iter()
+            .map(|(id, known)| self.row(id, known))
+            .collect();
         if let Err(err) = self.ctx.people(&rows) {
             tracing::warn!("chatd: Teams: {err}");
         }
@@ -165,7 +193,14 @@ impl Teams {
             .iter()
             .map(|(id, known)| {
                 let mark = known.guest.then_some(Mark::Guest);
-                (id.clone(), PersonDetails { title: known.title.clone(), mark, ..PersonDetails::default() })
+                (
+                    id.clone(),
+                    PersonDetails {
+                        title: known.title.clone(),
+                        mark,
+                        ..PersonDetails::default()
+                    },
+                )
             })
             .collect();
         if let Err(err) = self.ctx.details(&details) {
@@ -176,7 +211,10 @@ impl Teams {
             state.people.clear();
         }
         for (id, known) in &learned {
-            self.ctx.set_note(&format!("u:{id}"), &serde_json::to_string(known).unwrap_or_default());
+            self.ctx.set_note(
+                &format!("u:{id}"),
+                &serde_json::to_string(known).unwrap_or_default(),
+            );
             state.people.insert(id.clone(), known.clone());
         }
         learned
@@ -185,7 +223,11 @@ impl Teams {
     fn row(&self, id: &str, known: &Known) -> PersonRow {
         PersonRow {
             id: id.to_owned(),
-            name: if known.name.is_empty() { known.mail.clone() } else { known.name.clone() },
+            name: if known.name.is_empty() {
+                known.mail.clone()
+            } else {
+                known.name.clone()
+            },
             handle: known.mail.clone(),
             avatar: self.picture(id, &known.name).map(|file| file.id),
             bot: known.bot,
@@ -196,13 +238,18 @@ impl Teams {
 
     fn middle(&self, path: &str, body: Body) -> Result<Value, Fault> {
         let url = format!("{}{path}", self.place()?.middle);
-        Ok(self.call("POST", &url, Auth::Both(SPACES), body, true)?.body)
+        Ok(self
+            .call("POST", &url, Auth::Both(SPACES), body, true)?
+            .body)
     }
 
     /// The people an answer of the middle tier lists, under whichever name it used.
     fn listed(answer: &Value) -> &[Value] {
         let lists = [answer, &answer["value"], &answer["resolvedUsers"]];
-        lists.into_iter().find_map(Value::as_array).map_or(&[][..], Vec::as_slice)
+        lists
+            .into_iter()
+            .find_map(Value::as_array)
+            .map_or(&[][..], Vec::as_slice)
     }
 
     /// Looks up everyone in `ids` not yet known, together. Someone Teams will not name is left
@@ -210,7 +257,12 @@ impl Teams {
     pub(super) fn lookup(&self, ids: &[String]) {
         // People (`8:`) and apps and bots (`28:`), whose names the same call gives with
         // `includeBots`.
-        let mut unknown: Vec<&String> = ids.iter().filter(|id| (id.starts_with("8:") || id.starts_with("28:")) && self.cached(id).is_none()).collect();
+        let mut unknown: Vec<&String> = ids
+            .iter()
+            .filter(|id| {
+                (id.starts_with("8:") || id.starts_with("28:")) && self.cached(id).is_none()
+            })
+            .collect();
         unknown.sort();
         unknown.dedup();
         for batch in unknown.chunks(BATCH) {
@@ -239,11 +291,19 @@ impl Teams {
     fn person(&self, id: &str, known: &Known) -> Person {
         Person {
             key: self.ctx.key(id),
-            name: if known.name.is_empty() { id.to_owned() } else { known.name.clone() },
+            name: if known.name.is_empty() {
+                id.to_owned()
+            } else {
+                known.name.clone()
+            },
             handle: known.mail.clone(),
             avatar: self.picture(id, &known.name),
             bot: known.bot,
-            relation: if self.state().partners.contains_key(id) { Relation::Contact } else { Relation::None },
+            relation: if self.state().partners.contains_key(id) {
+                Relation::Contact
+            } else {
+                Relation::None
+            },
             presence: self.ctx.presence_of(id),
             status: String::new(),
             link: Teams::link(&known.mail),
@@ -252,16 +312,38 @@ impl Teams {
     }
 
     /// One window of a conversation's members, in the order Teams lists them.
-    pub(super) fn members(&self, conversation: &str, offset: u32, limit: u32) -> Result<Members, Fault> {
+    pub(super) fn members(
+        &self,
+        conversation: &str,
+        offset: u32,
+        limit: u32,
+    ) -> Result<Members, Fault> {
         let thread = super::thread_of(conversation);
-        let described = self.chat("GET", &format!("/v1/threads/{}?view=msnp24Equivalent", escaped(thread)), Body::None, true)?.body;
+        let described = self
+            .chat(
+                "GET",
+                &format!("/v1/threads/{}?view=msnp24Equivalent", escaped(thread)),
+                Body::None,
+                true,
+            )?
+            .body;
         let all: Vec<(&str, &str)> = described["members"]
             .as_array()
             .into_iter()
             .flatten()
-            .filter_map(|member| Some((member["id"].as_str()?, member["friendlyName"].as_str().unwrap_or(""))))
+            .filter_map(|member| {
+                Some((
+                    member["id"].as_str()?,
+                    member["friendlyName"].as_str().unwrap_or(""),
+                ))
+            })
             .collect();
-        let window: Vec<(&str, &str)> = all.iter().skip(offset as usize).take(limit as usize).copied().collect();
+        let window: Vec<(&str, &str)> = all
+            .iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .copied()
+            .collect();
         let ids: Vec<String> = window.iter().map(|(id, _)| (*id).to_owned()).collect();
         self.lookup(&ids);
         let members = window
@@ -276,7 +358,7 @@ impl Teams {
             })
             .collect();
         Ok(Members {
-        pending: false,
+            pending: false,
             // Teams' roster has no sections.
             sections: vec![MemberSection {
                 name: "Members".to_owned(),
@@ -298,17 +380,31 @@ impl Teams {
             "properties": {"threadType": "chat", "fixedRoster": true, "uniquerosterthread": true},
         });
         let created = self.chat("POST", "/v1/threads", Body::Json(&wanted), false)?;
-        let named = created.location.rsplit('/').next().unwrap_or("").split('?').next().unwrap_or("");
+        let named = created
+            .location
+            .rsplit('/')
+            .next()
+            .unwrap_or("")
+            .split('?')
+            .next()
+            .unwrap_or("");
         let id = match named {
             "" => super::id_of(&created.body["id"]),
-            named => named.replace("%3A", ":").replace("%3a", ":").replace("%40", "@"),
+            named => named
+                .replace("%3A", ":")
+                .replace("%3a", ":")
+                .replace("%40", "@"),
         };
         if !id.starts_with("19:") {
-            return Err(Fault::Net("Teams created the chat but did not name it".to_owned()));
+            return Err(Fault::Net(
+                "Teams created the chat but did not name it".to_owned(),
+            ));
         }
         self.lookup(&[person.to_owned()]);
         if !self.known(&id)? {
-            return Err(Fault::Net("Teams does not describe the chat it created".to_owned()));
+            return Err(Fault::Net(
+                "Teams does not describe the chat it created".to_owned(),
+            ));
         }
         // The description may not have arrived yet; the row is ours either way.
         self.state().partners.insert(person.to_owned(), id.clone());
@@ -322,13 +418,25 @@ impl Teams {
                     &includeIBBarredUsers=true&skypeTeamsInfo=true&includeBots=true";
         let found = self.middle(path, Body::Json(&json!([person])))?;
         let learned = self.learn(Teams::listed(&found));
-        let known = learned.into_iter().find(|(id, _)| id == person).map(|(_, known)| known).or_else(|| self.cached(person));
+        let known = learned
+            .into_iter()
+            .find(|(id, _)| id == person)
+            .map(|(_, known)| known)
+            .or_else(|| self.cached(person));
         let known = known.unwrap_or_default();
         let (away, away_until) = self.state().away.get(person).cloned().unwrap_or_default();
         Ok(About {
             title: known.title,
             department: known.department,
-            contacts: Some(known.mail).filter(|mail| !mail.is_empty()).map(|value| Contact { kind: ContactKind::Email, value, masked: false }).into_iter().collect(),
+            contacts: Some(known.mail)
+                .filter(|mail| !mail.is_empty())
+                .map(|value| Contact {
+                    kind: ContactKind::Email,
+                    value,
+                    masked: false,
+                })
+                .into_iter()
+                .collect(),
             away,
             away_until,
             ..About::default()
@@ -350,24 +458,50 @@ impl Teams {
             let doing_now = presence["activity"].as_str().unwrap_or("");
             // The status line: what they are doing, else out of office, else their note.
             // Unverified: the out-of-office fields' names, read off the web client's answer.
-            let oof = presence["outOfOfficeNote"]["message"].as_str().map(|note| super::html::parse(note, &Nobody, "").text).filter(|note| !note.is_empty());
-            let away = presence["calendarData"]["isOutOfOffice"] == true || oof.is_some() || doing_now == "OutOfOffice";
+            let oof = presence["outOfOfficeNote"]["message"]
+                .as_str()
+                .map(|note| super::html::parse(note, &Nobody, "").text)
+                .filter(|note| !note.is_empty());
+            let away = presence["calendarData"]["isOutOfOffice"] == true
+                || oof.is_some()
+                || doing_now == "OutOfOffice";
             let status = match (activity(doing_now), away) {
                 (words, _) if !words.is_empty() && words != "Out of office" => words.to_owned(),
                 (_, true) => "Out of office".to_owned(),
                 _ => said,
             };
             let owned = id == self.me() || self.state().partners.contains_key(id);
-            self.ctx.presence(id, presence_of(presence["availability"].as_str().unwrap_or("")), &status, owned);
+            self.ctx.presence(
+                id,
+                presence_of(presence["availability"].as_str().unwrap_or("")),
+                &status,
+                owned,
+            );
             let kind = doing(doing_now);
-            self.ctx.activity(id, "", kind.map(|kind| Activity { kind, name: String::new(), place: String::new(), conversation: None }), owned);
+            self.ctx.activity(
+                id,
+                "",
+                kind.map(|kind| Activity {
+                    kind,
+                    name: String::new(),
+                    place: String::new(),
+                    conversation: None,
+                }),
+                owned,
+            );
             let mut state = self.state();
             if away {
                 if state.away.len() >= AWAY_KEPT {
                     state.away.clear();
                 }
-                let until = presence["outOfOfficeNote"]["expiry"].as_str().map(super::seconds).filter(|until| *until > 0);
-                state.away.insert(id.to_owned(), (oof.unwrap_or_else(|| "Out of office".to_owned()), until));
+                let until = presence["outOfOfficeNote"]["expiry"]
+                    .as_str()
+                    .map(super::seconds)
+                    .filter(|until| *until > 0);
+                state.away.insert(
+                    id.to_owned(),
+                    (oof.unwrap_or_else(|| "Out of office".to_owned()), until),
+                );
             } else {
                 state.away.remove(id);
             }
@@ -379,8 +513,14 @@ impl Teams {
     /// anyone is; the same list is not asked about twice within a minute.
     pub(super) fn watch(&self) -> Result<(), Fault> {
         let watching = self.ctx.watching();
-        let mine = watching.people.iter().filter(|person| person.account() == self.ctx.account);
-        let mut ids: Vec<String> = mine.map(|person| person.id.clone()).filter(|id| id.starts_with("8:")).collect();
+        let mine = watching
+            .people
+            .iter()
+            .filter(|person| person.account() == self.ctx.account);
+        let mut ids: Vec<String> = mine
+            .map(|person| person.id.clone())
+            .filter(|id| id.starts_with("8:"))
+            .collect();
         if ids.is_empty() {
             self.state().watched.clear();
             return Ok(());
@@ -399,14 +539,26 @@ impl Teams {
         }
         let asked: Vec<Value> = ids.iter().map(|id| json!({"mri": id})).collect();
         let url = format!("{}/v1/presence/getpresence/", self.place()?.presence);
-        let found = self.call("POST", &url, Auth::Bearer(PRESENCE), Body::Json(&json!(asked)), true)?.body;
+        let found = self
+            .call(
+                "POST",
+                &url,
+                Auth::Bearer(PRESENCE),
+                Body::Json(&json!(asked)),
+                true,
+            )?
+            .body;
         self.presences(&found);
         Ok(())
     }
 
     /// Sets our own availability. A status note is not written: none of the clients read shows
     /// how Teams wants one, so it is refused rather than guessed at.
-    pub(super) fn set_presence(&self, presence: Presence, status: Option<&str>) -> Result<(), Fault> {
+    pub(super) fn set_presence(
+        &self,
+        presence: Presence,
+        status: Option<&str>,
+    ) -> Result<(), Fault> {
         let refuse = |message: &str| Fault::Refused {
             status: 400,
             message: message.to_owned(),
@@ -423,7 +575,13 @@ impl Teams {
             Presence::Unknown => return Err(refuse("Teams decides that one itself")),
         };
         let url = format!("{}/v1/me/forceavailability/", self.place()?.presence);
-        self.call("PUT", &url, Auth::Bearer(PRESENCE), Body::Json(&json!({"availability": availability})), false)?;
+        self.call(
+            "PUT",
+            &url,
+            Auth::Bearer(PRESENCE),
+            Body::Json(&json!({"availability": availability})),
+            false,
+        )?;
         Ok(())
     }
 }
@@ -452,21 +610,53 @@ mod tests {
     #[test]
     fn availability_is_one_of_five_states() {
         assert_eq!(presence_of("Available"), Presence::Online);
-        assert_eq!((presence_of("Away"), presence_of("BeRightBack"), presence_of("AvailableIdle")), (Presence::Idle, Presence::Idle, Presence::Idle));
-        assert_eq!((presence_of("Busy"), presence_of("DoNotDisturb")), (Presence::Busy, Presence::Dnd));
-        assert_eq!((doing("InAMeeting"), doing("Presenting"), doing("Available")), (Some(ActivityKind::InMeeting), Some(ActivityKind::Presenting), None));
-        assert_eq!((presence_of("Offline"), presence_of("PresenceUnknown")), (Presence::Offline, Presence::Unknown));
-        assert_eq!((activity("InACall"), activity("Available")), ("In a call", ""));
+        assert_eq!(
+            (
+                presence_of("Away"),
+                presence_of("BeRightBack"),
+                presence_of("AvailableIdle")
+            ),
+            (Presence::Idle, Presence::Idle, Presence::Idle)
+        );
+        assert_eq!(
+            (presence_of("Busy"), presence_of("DoNotDisturb")),
+            (Presence::Busy, Presence::Dnd)
+        );
+        assert_eq!(
+            (doing("InAMeeting"), doing("Presenting"), doing("Available")),
+            (
+                Some(ActivityKind::InMeeting),
+                Some(ActivityKind::Presenting),
+                None
+            )
+        );
+        assert_eq!(
+            (presence_of("Offline"), presence_of("PresenceUnknown")),
+            (Presence::Offline, Presence::Unknown)
+        );
+        assert_eq!(
+            (activity("InACall"), activity("Available")),
+            ("In a call", "")
+        );
     }
 
     #[test]
     fn people_are_read_from_whichever_list_the_middle_tier_answers_with() {
         let ana = json!({"mri": "8:orgid:ana"});
-        assert_eq!(Teams::listed(&json!({"type": "x", "value": [ana]})).len(), 1);
-        assert_eq!(Teams::listed(&json!({"resolvedUsers": [ana, ana]})).len(), 2);
+        assert_eq!(
+            Teams::listed(&json!({"type": "x", "value": [ana]})).len(),
+            1
+        );
+        assert_eq!(
+            Teams::listed(&json!({"resolvedUsers": [ana, ana]})).len(),
+            2
+        );
         assert_eq!(Teams::listed(&json!([ana])).len(), 1);
         assert!(Teams::listed(&json!({"value": null})).is_empty());
-        assert_eq!(Teams::link("ana@contoso.com"), "msteams:/l/chat/0/0?users=ana%40contoso.com");
+        assert_eq!(
+            Teams::link("ana@contoso.com"),
+            "msteams:/l/chat/0/0?users=ana%40contoso.com"
+        );
         assert_eq!(Teams::link(""), "");
     }
 }

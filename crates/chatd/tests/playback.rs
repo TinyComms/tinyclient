@@ -19,9 +19,15 @@ fn environment() {
     READY.call_once(|| {
         let chatd = Path::new(env!("CARGO_BIN_EXE_chatd"));
         let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-        let built = Command::new(cargo).args(["build", "-p", "mediad", "--bin", "mediad"]).status().unwrap();
+        let built = Command::new(cargo)
+            .args(["build", "-p", "mediad", "--bin", "mediad"])
+            .status()
+            .unwrap();
         assert!(built.success(), "could not build mediad");
-        std::env::set_var("TINYCLIENT_MEDIAD", chatd.with_file_name(format!("mediad{}", std::env::consts::EXE_SUFFIX)));
+        std::env::set_var(
+            "TINYCLIENT_MEDIAD",
+            chatd.with_file_name(format!("mediad{}", std::env::consts::EXE_SUFFIX)),
+        );
         std::env::set_var("TINYCLIENT_MEDIAD_AUDIO", "null");
     });
 }
@@ -41,18 +47,33 @@ struct World {
 fn world() -> World {
     environment();
     static NEXT: AtomicU32 = AtomicU32::new(0);
-    let dir = std::path::absolute(format!("/tmp/tinyclient-play-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed))).unwrap();
+    let dir = std::path::absolute(format!(
+        "/tmp/tinyclient-play-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ))
+    .unwrap();
     let cache = dir.join("media/telegram/1");
     std::fs::create_dir_all(&cache).unwrap();
     let voice = cache.join("voice");
-    std::fs::copy(Path::new(env!("CARGO_MANIFEST_DIR")).join("../mediad/tests/fixtures/tone.opus"), &voice).unwrap();
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../mediad/tests/fixtures/tone.opus"),
+        &voice,
+    )
+    .unwrap();
     let store = Store::open(&dir.join("chat.sqlite")).unwrap();
-    World { hub: Arc::new(Hub::new(store)), dir, voice }
+    World {
+        hub: Arc::new(Hub::new(store)),
+        dir,
+        voice,
+    }
 }
 
 impl World {
     fn ask(&self, request: PlayRequest) -> Result<(), String> {
-        self.hub.player.request(&self.hub, &self.dir.join("media"), request)
+        self.hub
+            .player
+            .request(&self.hub, &self.dir.join("media"), request)
     }
 
     fn play(&self, at: Option<u32>, rate: u16) {
@@ -70,13 +91,19 @@ impl World {
             if done(&shown) {
                 return shown;
             }
-            assert!(Instant::now() < deadline, "{what} did not happen: {shown:?}");
+            assert!(
+                Instant::now() < deadline,
+                "{what} did not happen: {shown:?}"
+            );
             sleep(Duration::from_millis(5));
         }
     }
 
     fn until_state(&self, state: PlayState) -> Playback {
-        self.until(&format!("{state:?}"), |shown| shown.as_ref().is_some_and(|shown| shown.state == state)).unwrap()
+        self.until(&format!("{state:?}"), |shown| {
+            shown.as_ref().is_some_and(|shown| shown.state == state)
+        })
+        .unwrap()
     }
 }
 
@@ -87,7 +114,10 @@ impl Drop for World {
 }
 
 fn account() -> AccountKey {
-    AccountKey { network: Network::Telegram, account: "1".into() }
+    AccountKey {
+        network: Network::Telegram,
+        account: "1".into(),
+    }
 }
 
 fn start(path: &Path, at: Option<u32>, rate: u16) -> PlayRequest {
@@ -95,7 +125,11 @@ fn start(path: &Path, at: Option<u32>, rate: u16) -> PlayRequest {
         account: account(),
         file: "d6100".into(),
         path: path.display().to_string(),
-        conversation: Key { network: Network::Telegram, account: "1".into(), id: "7002".into() },
+        conversation: Key {
+            network: Network::Telegram,
+            account: "1".into(),
+            id: "7002".into(),
+        },
         message: "15".into(),
         title: "Mara Okafor".into(),
         at,
@@ -114,7 +148,10 @@ fn mediads() -> usize {
     }
     #[cfg(not(windows))]
     {
-        let out = Command::new("pgrep").args(["-P", &std::process::id().to_string(), "mediad"]).output().unwrap();
+        let out = Command::new("pgrep")
+            .args(["-P", &std::process::id().to_string(), "mediad"])
+            .output()
+            .unwrap();
         String::from_utf8(out.stdout).unwrap().lines().count()
     }
 }
@@ -153,7 +190,11 @@ fn windows_mediads() -> usize {
         let parent = std::process::id();
         if Process32FirstW(snap, &mut entry) != 0 {
             loop {
-                let end = entry.exe.iter().position(|unit| *unit == 0).unwrap_or(entry.exe.len());
+                let end = entry
+                    .exe
+                    .iter()
+                    .position(|unit| *unit == 0)
+                    .unwrap_or(entry.exe.len());
                 let name = String::from_utf16_lossy(&entry.exe[..end]);
                 if entry.parent == parent && name.eq_ignore_ascii_case("mediad.exe") {
                     count += 1;
@@ -182,18 +223,37 @@ fn a_voice_message_plays_to_the_end_and_leaves_no_process() {
     let world = world();
     let since = world.hub.seq();
     world.play(None, 100);
-    assert_eq!(world.shown().unwrap().state, PlayState::Loading, "told at once, before mediad answers");
+    assert_eq!(
+        world.shown().unwrap().state,
+        PlayState::Loading,
+        "told at once, before mediad answers"
+    );
     let playing = world.until_state(PlayState::Playing);
-    assert!((980..=1010).contains(&playing.duration), "{} ms", playing.duration);
+    assert!(
+        (980..=1010).contains(&playing.duration),
+        "{} ms",
+        playing.duration
+    );
     assert_eq!(mediads(), 1);
     let ended = world.until_state(PlayState::Ended);
     assert_eq!(ended.at, ended.duration);
     until_no_mediad();
     // The shell was told by changes alone, the whole value each time.
     let (_, _, changes) = world.hub.wait(since, Duration::ZERO);
-    let told: Vec<&Change> = changes.iter().filter(|change| matches!(change, Change::Playback { .. })).collect();
+    let told: Vec<&Change> = changes
+        .iter()
+        .filter(|change| matches!(change, Change::Playback { .. }))
+        .collect();
     assert_eq!(told.len(), 1, "one entry, replaced each time: {told:?}");
-    assert!(matches!(told[0], Change::Playback { playback: Some(Playback { state: PlayState::Ended, .. }) }));
+    assert!(matches!(
+        told[0],
+        Change::Playback {
+            playback: Some(Playback {
+                state: PlayState::Ended,
+                ..
+            })
+        }
+    ));
 
     // Play on an ended message starts it again from the top.
     world.play(None, 200);
@@ -216,7 +276,11 @@ fn a_pause_lets_the_process_go_and_play_goes_on_from_there() {
     assert!((250..=600).contains(&paused.at), "paused at {}", paused.at);
     until_no_mediad();
     let at = world.shown().unwrap().at;
-    assert_eq!(world.shown().unwrap().position(u64::MAX), at, "a paused position does not move");
+    assert_eq!(
+        world.shown().unwrap().position(u64::MAX),
+        at,
+        "a paused position does not move"
+    );
 
     // A seek while paused only moves the place; play goes on from it.
     world.ask(PlayRequest::Seek { at: 700 }).unwrap();
@@ -237,7 +301,11 @@ fn a_second_file_replaces_the_first_and_speed_and_seek_reach_mediad() {
     world.until_state(PlayState::Playing);
     world.ask(PlayRequest::Rate { rate: 150 }).unwrap();
     assert_eq!(world.shown().unwrap().rate, 150, "the speed shows at once");
-    world.until("mediad at 1.5x", |shown| shown.as_ref().is_some_and(|shown| shown.rate == 150 && shown.state == PlayState::Playing));
+    world.until("mediad at 1.5x", |shown| {
+        shown
+            .as_ref()
+            .is_some_and(|shown| shown.rate == 150 && shown.state == PlayState::Playing)
+    });
     world.ask(PlayRequest::Seek { at: 900 }).unwrap();
     world.until_state(PlayState::Ended);
 
@@ -264,14 +332,26 @@ fn only_a_file_in_the_media_cache_is_played_and_a_bad_one_fails_in_words() {
     let _turn = alone();
     let world = world();
     let outside = world.dir.join("chat.sqlite");
-    assert_eq!(world.ask(start(&outside, None, 100)), Err("That file is not in tinyclient's media cache.".to_owned()));
+    assert_eq!(
+        world.ask(start(&outside, None, 100)),
+        Err("That file is not in tinyclient's media cache.".to_owned())
+    );
     assert_eq!(world.shown(), None);
     assert_eq!(mediads(), 0);
 
     let broken = world.voice.with_file_name("broken");
     std::fs::write(&broken, b"not a voice message").unwrap();
     world.ask(start(&broken, None, 100)).unwrap();
-    let failed = world.until("a failure", |shown| shown.as_ref().is_some_and(|shown| matches!(shown.state, PlayState::Failed { .. })));
-    assert_eq!(failed.unwrap().state, PlayState::Failed { detail: "This file can't be played.".into() });
+    let failed = world.until("a failure", |shown| {
+        shown
+            .as_ref()
+            .is_some_and(|shown| matches!(shown.state, PlayState::Failed { .. }))
+    });
+    assert_eq!(
+        failed.unwrap().state,
+        PlayState::Failed {
+            detail: "This file can't be played.".into()
+        }
+    );
     until_no_mediad();
 }

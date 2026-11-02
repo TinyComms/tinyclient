@@ -24,13 +24,18 @@ mod rest;
 mod send;
 mod voice;
 
-use super::{serve_commands, keep_connected, Command, Context, Download, Failure, Refusal, Reply, Signed};
+use super::{
+    keep_connected, serve_commands, Command, Context, Download, Failure, Refusal, Reply, Signed,
+};
 use crate::blobs::upload;
 use crate::store::ConversationRow;
 use base64::Engine;
 use content::{Files, Names, Place};
 use model::{number, Posted, User};
-use protocol::{Conversation, ConversationKind, Message, MessageKind, Presence, RelateAction, Relation, SendState, ThreadSummary};
+use protocol::{
+    Conversation, ConversationKind, Message, MessageKind, Presence, RelateAction, Relation,
+    SendState, ThreadSummary,
+};
 use rest::{Refused, Rest};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -223,7 +228,9 @@ struct Discord {
 /// by who it is.
 fn user_of(token: &str) -> Option<String> {
     let first = token.split('.').next()?;
-    let bytes = base64::engine::general_purpose::STANDARD_NO_PAD.decode(first.trim_end_matches('=')).ok()?;
+    let bytes = base64::engine::general_purpose::STANDARD_NO_PAD
+        .decode(first.trim_end_matches('='))
+        .ok()?;
     let id = String::from_utf8(bytes).ok()?;
     (!id.is_empty() && id.len() <= 20 && id.bytes().all(|byte| byte.is_ascii_digit())).then_some(id)
 }
@@ -271,10 +278,15 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
         // backfill sleeps or an HTTP request. Preserve their order on one thread.
         while let Ok(command) = inbox.recv() {
             match command {
-                command @ (Command::Members { .. } | Command::Watch(_) | Command::OpenSpace(_) | Command::SearchPeople(_)) => viewport.command(command),
+                command @ (Command::Members { .. }
+                | Command::Watch(_)
+                | Command::OpenSpace(_)
+                | Command::SearchPeople(_)) => viewport.command(command),
                 command => {
                     let stop = matches!(&command, Command::Stop);
-                    if commands.send(command).is_err() || stop { break; }
+                    if commands.send(command).is_err() || stop {
+                        break;
+                    }
                 }
             }
         }
@@ -283,18 +295,35 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
         // A send with files uploads on a thread of its own, so the commands behind it (its own
         // cancel among them) are not held up for as long as the upload takes.
         let other = |command| match command {
-            Command::SendWith { conversation_id, client_id, text, reply_to, with } => {
+            Command::SendWith {
+                conversation_id,
+                client_id,
+                text,
+                reply_to,
+                with,
+            } => {
                 discord.asked();
                 let sending = discord.clone();
                 let (channel, client) = (conversation_id.clone(), client_id.clone());
-                upload::spawn(&discord.ctx, &conversation_id, &client_id, &with.files.clone(), move |up| {
-                    sending.send_with(&channel, &client, &text, reply_to.as_deref(), &with, up)
-                });
+                upload::spawn(
+                    &discord.ctx,
+                    &conversation_id,
+                    &client_id,
+                    &with.files.clone(),
+                    move |up| {
+                        sending.send_with(&channel, &client, &text, reply_to.as_deref(), &with, up)
+                    },
+                );
             }
             // A search can wait on Discord's tight search limits: it runs on a thread of its
             // own, so the sends and reactions behind it are not held up, and one queued past
             // the shell's patience does not ask at all.
-            Command::Search { query, scope, at, reply } => {
+            Command::Search {
+                query,
+                scope,
+                at,
+                reply,
+            } => {
                 discord.asked();
                 if at.elapsed() < SEARCH_PATIENCE {
                     Discord::search_queued(&discord, query, scope, at, reply);
@@ -304,11 +333,23 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
             }
             // A profile waits its turn (one per 3 s) on a thread of its own, so a send behind it
             // is never held up, and one superseded while it waits is dropped.
-            Command::Profile { person_id, reply } => Discord::profile_queued(&discord, person_id, None, reply),
-            Command::ProfileIn { person_id, space_id, reply } => Discord::profile_queued(&discord, person_id, Some(space_id), reply),
+            Command::Profile { person_id, reply } => {
+                Discord::profile_queued(&discord, person_id, None, reply)
+            }
+            Command::ProfileIn {
+                person_id,
+                space_id,
+                reply,
+            } => Discord::profile_queued(&discord, person_id, Some(space_id), reply),
             command => discord.command(command),
         };
-        serve_commands(&discord.ctx, network_inbox, PACE, |id| discord.backfill(id), other)
+        serve_commands(
+            &discord.ctx,
+            network_inbox,
+            PACE,
+            |id| discord.backfill(id),
+            other,
+        )
     });
     Ok(())
 }
@@ -329,7 +370,10 @@ impl Names for Lookup<'_> {
     fn user(&self, id: &str) -> Option<String> {
         if let Some(user) = self.mentions.iter().find(|user| user.id == id) {
             let nick = user.member.as_ref().and_then(|member| member.nick.clone());
-            return Some(nick.filter(|nick| !nick.is_empty()).unwrap_or_else(|| user.name().to_owned()));
+            return Some(
+                nick.filter(|nick| !nick.is_empty())
+                    .unwrap_or_else(|| user.name().to_owned()),
+            );
         }
         crate::hub::lock(&self.discord.state).users.get(id).cloned()
     }
@@ -341,11 +385,19 @@ impl Names for Lookup<'_> {
     }
 
     fn channel(&self, id: &str) -> Option<String> {
-        self.discord.ctx.known(id).ok().flatten().map(|row| row.title)
+        self.discord
+            .ctx
+            .known(id)
+            .ok()
+            .flatten()
+            .map(|row| row.title)
     }
 
     fn space(&self, id: &str) -> Option<String> {
-        crate::hub::lock(&self.discord.state).guilds.get(id).map(|guild| guild.name.clone())
+        crate::hub::lock(&self.discord.state)
+            .guilds
+            .get(id)
+            .map(|guild| guild.name.clone())
     }
 }
 
@@ -354,7 +406,9 @@ fn escaped(text: &str) -> String {
     let mut out = String::with_capacity(text.len() * 3);
     for byte in text.bytes() {
         match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(byte as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
             other => out.push_str(&format!("%{other:02X}")),
         }
     }
@@ -392,7 +446,12 @@ impl Discord {
     }
 
     /// A message object into the model. Its files are returned for registering.
-    fn convert(&self, posted: &Posted, guild: Option<&str>, kind: ConversationKind) -> (Message, Files) {
+    fn convert(
+        &self,
+        posted: &Posted,
+        guild: Option<&str>,
+        kind: ConversationKind,
+    ) -> (Message, Files) {
         let me = self.me();
         let lookup = Lookup {
             discord: self,
@@ -400,8 +459,12 @@ impl Discord {
             mentions: &posted.mentions,
         };
         // Outside a server a friend goes by the nickname the user gave them.
-        let author = posted.author.as_ref().filter(|_| guild.is_none() && posted.webhook_id.is_none());
-        let author = author.and_then(|author| crate::hub::lock(&self.state).users.get(&author.id).cloned());
+        let author = posted
+            .author
+            .as_ref()
+            .filter(|_| guild.is_none() && posted.webhook_id.is_none());
+        let author =
+            author.and_then(|author| crate::hub::lock(&self.state).users.get(&author.id).cloned());
         let place = Place {
             account: &self.ctx.account,
             me: &me,
@@ -415,7 +478,13 @@ impl Discord {
     }
 
     /// Discord's own rule for a mention, with the suppress settings the user made there.
-    fn mentions_me(&self, posted: &Posted, guild: Option<&str>, kind: ConversationKind, me: &str) -> bool {
+    fn mentions_me(
+        &self,
+        posted: &Posted,
+        guild: Option<&str>,
+        kind: ConversationKind,
+        me: &str,
+    ) -> bool {
         if posted.author.as_ref().is_some_and(|author| author.id == me) {
             return false;
         }
@@ -428,8 +497,13 @@ impl Discord {
         let Some(info) = guild.and_then(|guild| state.guilds.get(guild)) else {
             return named || posted.mention_everyone;
         };
-        let role = posted.mention_roles.iter().any(|role| info.my_roles.contains(&number(role)));
-        named || (posted.mention_everyone && !info.quiet.suppress_everyone) || (role && !info.quiet.suppress_roles)
+        let role = posted
+            .mention_roles
+            .iter()
+            .any(|role| info.my_roles.contains(&number(role)));
+        named
+            || (posted.mention_everyone && !info.quiet.suppress_everyone)
+            || (role && !info.quiet.suppress_roles)
     }
 
     /// Records the thread a message started, so the shell can open it like any conversation.
@@ -480,7 +554,11 @@ impl Discord {
     fn covered_after(&self, channel: &str, after: u64) -> bool {
         let state = crate::hub::lock(&self.state);
         let stretches = state.covered.get(channel);
-        stretches.is_some_and(|stretches| stretches.iter().any(|(from, to)| *from <= after && after < *to))
+        stretches.is_some_and(|stretches| {
+            stretches
+                .iter()
+                .any(|(from, to)| *from <= after && after < *to)
+        })
     }
 
     /// One page of a conversation's history into the store.
@@ -492,7 +570,11 @@ impl Discord {
             Stretch::After(id) => format!("after={id}&limit={PAGE}"),
             Stretch::Around(id) => format!("around={id}&limit={PAGE}"),
         };
-        let text = self.call("GET", &format!("/channels/{channel}/messages?{query}"), None)?;
+        let text = self.call(
+            "GET",
+            &format!("/channels/{channel}/messages?{query}"),
+            None,
+        )?;
         let posted: Vec<Posted> = serde_json::from_str(&text)?;
         drop(text);
         let guild = self.guild_of(conversation);
@@ -528,11 +610,28 @@ impl Discord {
 
     /// What is stored between the ends of a page Discord just sent, and is not in it, was
     /// deleted while we were away.
-    fn forget_deleted(&self, channel: &str, page: &[Message], oldest: u64, newest: u64) -> rusqlite::Result<()> {
-        let stored = self.ctx.stored_ids(channel, &oldest.to_string(), &newest.to_string(), crate::store::KEEP_MESSAGES)?;
-        for id in stored.iter().filter(|id| !page.iter().any(|message| message.id == **id)) {
+    fn forget_deleted(
+        &self,
+        channel: &str,
+        page: &[Message],
+        oldest: u64,
+        newest: u64,
+    ) -> rusqlite::Result<()> {
+        let stored = self.ctx.stored_ids(
+            channel,
+            &oldest.to_string(),
+            &newest.to_string(),
+            crate::store::KEEP_MESSAGES,
+        )?;
+        for id in stored
+            .iter()
+            .filter(|id| !page.iter().any(|message| message.id == **id))
+        {
             // Only what Discord named: a message of ours still on its way has no id of its.
-            let sent = self.ctx.stored_message(channel, id)?.is_some_and(|message| message.state == SendState::Sent);
+            let sent = self
+                .ctx
+                .stored_message(channel, id)?
+                .is_some_and(|message| message.state == SendState::Sent);
             if sent && (oldest..=newest).contains(&number(id)) {
                 self.ctx.deleted(channel, id)?;
             }
@@ -560,7 +659,9 @@ impl Discord {
     fn guild_of(&self, conversation: &Conversation) -> Option<String> {
         match (&conversation.space, conversation.kind) {
             (Some(space), _) => Some(space.clone()),
-            (None, ConversationKind::Thread) => self.ctx.note(&format!("guild:{}", conversation.key.id)),
+            (None, ConversationKind::Thread) => {
+                self.ctx.note(&format!("guild:{}", conversation.key.id))
+            }
             _ => None,
         }
     }
@@ -584,7 +685,9 @@ impl Discord {
     }
 
     fn fetch(&self, conversation: &Conversation, stretch: Stretch) {
-        if let Err(Failure::SignedOut(why) | Failure::Dropped(why)) = self.page(conversation, stretch) {
+        if let Err(Failure::SignedOut(why) | Failure::Dropped(why)) =
+            self.page(conversation, stretch)
+        {
             self.log("history", why);
         }
     }
@@ -605,22 +708,39 @@ impl Discord {
                 Some(file) => reaction.emoji == emoji || file.id == emoji,
                 None => false,
             });
-            let id = known.as_ref().and_then(|reaction| reaction.file.as_ref()).map(|file| file.id.clone());
+            let id = known
+                .as_ref()
+                .and_then(|reaction| reaction.file.as_ref())
+                .map(|file| file.id.clone());
             let id = id.or_else(|| emoji.starts_with("emoji:").then(|| emoji.to_owned()));
             // CONTRACT: `:name:` says which custom emoji only while it is on the message. One
             // that is not there has to come as its file's id.
             let Some(id) = id.as_deref().and_then(|id| id.strip_prefix("emoji:")) else {
                 return Err(Refusal::Refused("That emoji is not on the message, so tinyclient cannot tell Discord which one it is.".to_owned()));
             };
-            let name = known.map_or_else(|| "emoji".to_owned(), |reaction| reaction.emoji.trim_matches(':').to_owned());
+            let name = known.map_or_else(
+                || "emoji".to_owned(),
+                |reaction| reaction.emoji.trim_matches(':').to_owned(),
+            );
             format!("{name}:{id}")
         } else {
             emoji.to_owned()
         };
-        let reaction = format!("/channels/{channel}/messages/{message}/reactions/{}", escaped(&named));
+        let reaction = format!(
+            "/channels/{channel}/messages/{message}/reactions/{}",
+            escaped(&named)
+        );
         let asked = match on {
-            true => self.call("PUT", &format!("{reaction}/%40me?location=Message%20Reaction%20Picker&type=0"), None),
-            false => self.call("DELETE", &format!("{reaction}/0/%40me?location=Message%20Inline%20Button&burst=false"), None),
+            true => self.call(
+                "PUT",
+                &format!("{reaction}/%40me?location=Message%20Reaction%20Picker&type=0"),
+                None,
+            ),
+            false => self.call(
+                "DELETE",
+                &format!("{reaction}/0/%40me?location=Message%20Inline%20Button&burst=false"),
+                None,
+            ),
         };
         asked.map(drop).map_err(refusal)
     }
@@ -628,12 +748,18 @@ impl Discord {
     /// Replaces the text of one of our messages. The store changes with Discord's answer.
     fn edit(&self, channel: &str, message: &str, text: &str) -> Result<(), Refusal> {
         if text.chars().count() > LONGEST {
-            return Err(Refusal::Refused(format!("Message too long: Discord allows {LONGEST} characters.")));
+            return Err(Refusal::Refused(format!(
+                "Message too long: Discord allows {LONGEST} characters."
+            )));
         }
         let path = format!("/channels/{channel}/messages/{message}");
-        let edited = self.call("PATCH", &path, Some(json!({"content": text}))).map_err(refusal)?;
-        let unreadable = |err: String| Refusal::Refused(format!("Discord's answer was unreadable: {err}"));
-        let mut posted: Posted = serde_json::from_str(&edited).map_err(|err| unreadable(err.to_string()))?;
+        let edited = self
+            .call("PATCH", &path, Some(json!({"content": text})))
+            .map_err(refusal)?;
+        let unreadable =
+            |err: String| Refusal::Refused(format!("Discord's answer was unreadable: {err}"));
+        let mut posted: Posted =
+            serde_json::from_str(&edited).map_err(|err| unreadable(err.to_string()))?;
         if posted.channel_id.is_empty() {
             posted.channel_id = channel.to_owned();
         }
@@ -643,8 +769,15 @@ impl Discord {
     }
 
     fn delete(&self, channel: &str, message: &str) -> Result<(), Refusal> {
-        self.call("DELETE", &format!("/channels/{channel}/messages/{message}"), None).map_err(refusal)?;
-        self.ctx.deleted(channel, message).map_err(|err| Refusal::Refused(err.to_string()))
+        self.call(
+            "DELETE",
+            &format!("/channels/{channel}/messages/{message}"),
+            None,
+        )
+        .map_err(refusal)?;
+        self.ctx
+            .deleted(channel, message)
+            .map_err(|err| Refusal::Refused(err.to_string()))
     }
 
     /// Answers, withdraws or ends a friendship, or blocks. One request, and only ever here:
@@ -654,14 +787,26 @@ impl Discord {
     /// unconfirmed against a real account.
     fn relate(&self, person: &str, action: RelateAction) -> Result<(), Refusal> {
         let path = format!("/users/@me/relationships/{person}");
-        let context = |location: &str| base64::engine::general_purpose::STANDARD.encode(json!({"location": location}).to_string());
+        let context = |location: &str| {
+            base64::engine::general_purpose::STANDARD
+                .encode(json!({"location": location}).to_string())
+        };
         let (method, body, location, becomes) = match action {
             RelateAction::Accept => ("PUT", Some(json!({})), "Friends", Relation::Friend),
-            RelateAction::Block => ("PUT", Some(json!({"type": 2})), "ContextMenu", Relation::Blocked),
-            RelateAction::Ignore | RelateAction::Cancel | RelateAction::Remove => ("DELETE", None, "Friends", Relation::None),
+            RelateAction::Block => (
+                "PUT",
+                Some(json!({"type": 2})),
+                "ContextMenu",
+                Relation::Blocked,
+            ),
+            RelateAction::Ignore | RelateAction::Cancel | RelateAction::Remove => {
+                ("DELETE", None, "Friends", Relation::None)
+            }
         };
         let context = context(location);
-        self.rest.call_with(method, &path, body, &[("X-Context-Properties", &context)]).map_err(refusal)?;
+        self.rest
+            .call_with(method, &path, body, &[("X-Context-Properties", &context)])
+            .map_err(refusal)?;
         {
             let mut state = crate::hub::lock(&self.state);
             match becomes {
@@ -672,7 +817,9 @@ impl Discord {
                 becomes => drop(state.relations.insert(person.to_owned(), becomes)),
             }
         }
-        self.ctx.relation(person, becomes).map_err(|err| Refusal::Refused(err.to_string()))
+        self.ctx
+            .relation(person, becomes)
+            .map_err(|err| Refusal::Refused(err.to_string()))
     }
 
     /// Our own presence, and the status line unless it is `None`. Both are settings: the web
@@ -691,16 +838,23 @@ impl Discord {
         };
         let (kept, text) = {
             let state = crate::hub::lock(&self.state);
-            (state.status_settings.clone(), status.clone().unwrap_or_else(|| state.own.1.clone()))
+            (
+                state.status_settings.clone(),
+                status.clone().unwrap_or_else(|| state.own.1.clone()),
+            )
         };
         let settings = proto::with_status(&kept, word, status.as_deref());
         let body = json!({"settings": proto::settings(&settings)});
-        self.call("PATCH", "/users/@me/settings-proto/1", Some(body)).map_err(refusal)?;
+        self.call("PATCH", "/users/@me/settings-proto/1", Some(body))
+            .map_err(refusal)?;
         let custom = match text.is_empty() {
             true => json!([]),
             false => json!([{"name": "Custom Status", "type": 4, "state": text, "emoji": null}]),
         };
-        self.tell(3, json!({"status": word, "since": 0, "activities": custom, "afk": false}));
+        self.tell(
+            3,
+            json!({"status": word, "since": 0, "activities": custom, "afk": false}),
+        );
         {
             let mut state = crate::hub::lock(&self.state);
             state.status_settings = settings;
@@ -714,7 +868,12 @@ impl Discord {
     /// inside that time is held, and the newest held one is sent when the time is up, once.
     fn mark_read(&self, channel: &str, message: &str) {
         // Opening a message request reads nothing on Discord: its sender is not told.
-        let request = self.ctx.known(channel).ok().flatten().is_some_and(|row| row.special == protocol::Special::Request);
+        let request = self
+            .ctx
+            .known(channel)
+            .ok()
+            .flatten()
+            .is_some_and(|row| row.special == protocol::Special::Request);
         if request {
             return;
         }
@@ -722,7 +881,9 @@ impl Discord {
             let mut state = crate::hub::lock(&self.state);
             // Only channels inside their 3 s are worth keeping.
             if state.acks.len() > 256 {
-                state.acks.retain(|_, ack| ack.held.is_some() || ack.sent.is_some_and(|at| at.elapsed() < ACK_EVERY));
+                state.acks.retain(|_, ack| {
+                    ack.held.is_some() || ack.sent.is_some_and(|at| at.elapsed() < ACK_EVERY)
+                });
             }
             let ack = state.acks.entry(channel.to_owned()).or_default();
             let first = ack.held.is_none();
@@ -730,16 +891,26 @@ impl Discord {
                 Some(held) if number(&held) > number(message) => held,
                 _ => message.to_owned(),
             };
-            if let Some(left) = ack.sent.map(|at| ACK_EVERY.saturating_sub(at.elapsed())).filter(|left| !left.is_zero()) {
+            if let Some(left) = ack
+                .sent
+                .map(|at| ACK_EVERY.saturating_sub(at.elapsed()))
+                .filter(|left| !left.is_zero())
+            {
                 // The first read held in this window sends the newest when the window ends.
                 ack.held = Some(newest.clone());
                 if first {
                     let (ctx, channel) = (self.ctx.clone(), channel.to_owned());
-                    let _ = std::thread::Builder::new().name("discord-ack".into()).stack_size(64 * 1024).spawn(move || {
-                        if !ctx.pause(left) {
-                            let _ = ctx.commands.send(Command::MarkRead { conversation_id: channel, message_id: newest });
-                        }
-                    });
+                    let _ = std::thread::Builder::new()
+                        .name("discord-ack".into())
+                        .stack_size(64 * 1024)
+                        .spawn(move || {
+                            if !ctx.pause(left) {
+                                let _ = ctx.commands.send(Command::MarkRead {
+                                    conversation_id: channel,
+                                    message_id: newest,
+                                });
+                            }
+                        });
                 }
                 return;
             }
@@ -752,10 +923,15 @@ impl Discord {
         // Unconfirmed against a real account.
         let day = (crate::hub::now() - 1_420_070_400) / 86_400;
         let body = json!({"token": token, "last_viewed": day});
-        match self.call("POST", &format!("/channels/{channel}/messages/{message}/ack"), Some(body)) {
+        match self.call(
+            "POST",
+            &format!("/channels/{channel}/messages/{message}/ack"),
+            Some(body),
+        ) {
             Ok(text) => {
                 let answer: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-                crate::hub::lock(&self.state).ack_token = answer["token"].as_str().map(str::to_owned);
+                crate::hub::lock(&self.state).ack_token =
+                    answer["token"].as_str().map(str::to_owned);
             }
             // A blocked person, or a DM Discord will not let us ack. The web client falls back
             // to the bulk route. The store is already read; this only tries to move Discord's
@@ -781,7 +957,11 @@ impl Discord {
             if states.is_empty() {
                 continue;
             }
-            self.call("POST", "/read-states/ack-bulk", Some(json!({"read_states": states})))?;
+            self.call(
+                "POST",
+                "/read-states/ack-bulk",
+                Some(json!({"read_states": states})),
+            )?;
         }
         Ok(())
     }
@@ -789,29 +969,53 @@ impl Discord {
     /// Discord still says this channel is unread. If we have already read through its newest
     /// message, that report is the old marker (a blocked DM refuses the ack) and it is dropped.
     /// A message newer than our marker still counts, and our marker is not moved backwards.
-    fn settled(&self, channel: &str, newest: Option<&str>, unread: u32, mentions: u32, marker: Option<String>) -> (u32, u32, Option<String>) {
+    fn settled(
+        &self,
+        channel: &str,
+        newest: Option<&str>,
+        unread: u32,
+        mentions: u32,
+        marker: Option<String>,
+    ) -> (u32, u32, Option<String>) {
         if unread == 0 && mentions == 0 {
             return (unread, mentions, marker);
         }
         let Some(newest) = newest.filter(|id| !id.is_empty()) else {
             return (unread, mentions, marker);
         };
-        let stored = self.ctx.known(channel).ok().flatten().and_then(|row| row.last_read).filter(|id| !id.is_empty());
+        let stored = self
+            .ctx
+            .known(channel)
+            .ok()
+            .flatten()
+            .and_then(|row| row.last_read)
+            .filter(|id| !id.is_empty());
         let Some(stored) = stored else {
             return (unread, mentions, marker);
         };
         if number(&stored) >= number(newest) {
             return (0, 0, None);
         }
-        if marker.as_deref().is_some_and(|id| number(&stored) > number(id)) {
+        if marker
+            .as_deref()
+            .is_some_and(|id| number(&stored) > number(id))
+        {
             return (unread, mentions, None);
         }
         (unread, mentions, marker)
     }
 
-    fn send(&self, channel: &str, client_id: &str, text: &str, reply_to: Option<&str>) -> Result<Message, String> {
+    fn send(
+        &self,
+        channel: &str,
+        client_id: &str,
+        text: &str,
+        reply_to: Option<&str>,
+    ) -> Result<Message, String> {
         if text.chars().count() > LONGEST {
-            return Err(format!("Message too long: Discord allows {LONGEST} characters."));
+            return Err(format!(
+                "Message too long: Discord allows {LONGEST} characters."
+            ));
         }
         let conversation = self.ctx.known(channel).map_err(|err| err.to_string())?;
         let conversation = conversation.ok_or_else(|| "This conversation is gone.".to_owned())?;
@@ -829,12 +1033,14 @@ impl Discord {
                 reference["guild_id"] = json!(guild);
             }
             body["message_reference"] = reference;
-            body["allowed_mentions"] = json!({"parse": ["users", "roles", "everyone"], "replied_user": true});
+            body["allowed_mentions"] =
+                json!({"parse": ["users", "roles", "everyone"], "replied_user": true});
         }
         let accepted = self
             .call("POST", &format!("/channels/{channel}/messages"), Some(body))
             .map_err(|refused| refused.reason())?;
-        let posted: Posted = serde_json::from_str(&accepted).map_err(|err| format!("Discord's answer was unreadable: {err}"))?;
+        let posted: Posted = serde_json::from_str(&accepted)
+            .map_err(|err| format!("Discord's answer was unreadable: {err}"))?;
         let (message, files) = self.convert(&posted, guild.as_deref(), conversation.kind);
         let _ = files.register(&self.ctx);
         Ok(message)
@@ -843,7 +1049,11 @@ impl Discord {
     fn typing(&self, channel: &str) {
         {
             let mut state = crate::hub::lock(&self.state);
-            if state.typed.get(channel).is_some_and(|at| at.elapsed() < TYPING_EVERY) {
+            if state
+                .typed
+                .get(channel)
+                .is_some_and(|at| at.elapsed() < TYPING_EVERY)
+            {
                 return;
             }
             state.typed.retain(|_, at| at.elapsed() < TYPING_EVERY);
@@ -862,10 +1072,16 @@ impl Discord {
         }
         let refuse = |why: String| Refusal::Refused(why);
         let created = self
-            .call("POST", "/users/@me/channels", Some(json!({"recipients": [person]})))
+            .call(
+                "POST",
+                "/users/@me/channels",
+                Some(json!({"recipients": [person]})),
+            )
             .map_err(|refused| refuse(refused.reason()))?;
-        let channel: model::Channel = serde_json::from_str(&created).map_err(|err| refuse(err.to_string()))?;
-        self.direct(&channel, &HashMap::new()).map_err(|err| refuse(err.to_string()))?;
+        let channel: model::Channel =
+            serde_json::from_str(&created).map_err(|err| refuse(err.to_string()))?;
+        self.direct(&channel, &HashMap::new())
+            .map_err(|err| refuse(err.to_string()))?;
         Ok(channel.id)
     }
 
@@ -878,7 +1094,10 @@ impl Discord {
             .known(channel)
             .map_err(|err| refuse(err.to_string()))?
             .ok_or_else(|| refuse("This conversation is gone.".to_owned()))?;
-        if !matches!(parent.kind, ConversationKind::Channel | ConversationKind::Announcement) {
+        if !matches!(
+            parent.kind,
+            ConversationKind::Channel | ConversationKind::Announcement
+        ) {
             return Err(refuse("A thread starts from a channel message.".to_owned()));
         }
         let stored = self
@@ -903,7 +1122,11 @@ impl Discord {
             .map_err(refusal)?;
         let thread: model::Channel = serde_json::from_str(&created)
             .map_err(|err| refuse(format!("Discord's answer was unreadable: {err}")))?;
-        let title = thread.name.clone().filter(|title| !title.trim().is_empty()).unwrap_or_else(|| name.clone());
+        let title = thread
+            .name
+            .clone()
+            .filter(|title| !title.trim().is_empty())
+            .unwrap_or_else(|| name.clone());
         self.record_thread(&parent, &thread.id, message_id, &title)?;
         let mut message = stored;
         message.thread = Some(ThreadSummary {
@@ -913,13 +1136,21 @@ impl Discord {
             participants: Vec::new(),
             unread: 0,
         });
-        self.ctx.history(channel, &[message]).map_err(|err| refuse(err.to_string()))?;
+        self.ctx
+            .history(channel, &[message])
+            .map_err(|err| refuse(err.to_string()))?;
         Ok(thread.id)
     }
 
     /// The thread's conversation, when it is not recorded yet. Its root is the message it hangs
     /// off. A thread kept outside the tree still needs its server, which `guild_of` reads back.
-    fn record_thread(&self, parent: &Conversation, thread_id: &str, root: &str, title: &str) -> Result<(), Refusal> {
+    fn record_thread(
+        &self,
+        parent: &Conversation,
+        thread_id: &str,
+        root: &str,
+        title: &str,
+    ) -> Result<(), Refusal> {
         let refuse = |err: rusqlite::Error| Refusal::Refused(err.to_string());
         if self.ctx.known(thread_id).map_err(refuse)?.is_some() {
             return Ok(());
@@ -947,7 +1178,9 @@ impl Discord {
         if id.is_empty() && url.is_empty() {
             return self.renew();
         }
-        let expires = url.split(['?', '&']).find_map(|part| i64::from_str_radix(part.strip_prefix("ex=")?, 16).ok());
+        let expires = url
+            .split(['?', '&'])
+            .find_map(|part| i64::from_str_radix(part.strip_prefix("ex=")?, 16).ok());
         if expires.is_none_or(|expires| expires >= crate::hub::now() + 60) {
             return answer(reply, Ok(self.from(url)));
         }
@@ -976,7 +1209,10 @@ impl Discord {
     fn from(&self, url: String) -> Download {
         Download {
             url,
-            headers: vec![("User-Agent".to_owned(), self.rest.identity().user_agent.clone())],
+            headers: vec![(
+                "User-Agent".to_owned(),
+                self.rest.identity().user_agent.clone(),
+            )],
             sealed: None,
         }
     }
@@ -989,29 +1225,52 @@ impl Discord {
     fn renew(&self) {
         let waiting = std::mem::take(&mut crate::hub::lock(&self.state).renewing);
         let plain = |url: &str| -> (String, String) {
-            let cut = url.find("&format=webp&width=").or_else(|| url.find("?format=webp&width="));
-            cut.map_or_else(|| (url.to_owned(), String::new()), |cut| (url[..cut].to_owned(), url[cut + 1..].to_owned()))
+            let cut = url
+                .find("&format=webp&width=")
+                .or_else(|| url.find("?format=webp&width="));
+            cut.map_or_else(
+                || (url.to_owned(), String::new()),
+                |cut| (url[..cut].to_owned(), url[cut + 1..].to_owned()),
+            )
         };
         for batch in waiting.chunks(RENEWED_TOGETHER) {
             let mut urls: Vec<String> = batch.iter().map(|(_, url, _)| plain(url).0).collect();
             urls.sort();
             urls.dedup();
-            let asked = self.call("POST", "/attachments/refresh-urls", Some(json!({"attachment_urls": urls})));
+            let asked = self.call(
+                "POST",
+                "/attachments/refresh-urls",
+                Some(json!({"attachment_urls": urls})),
+            );
             let renewed: Vec<(String, String)> = match &asked {
                 Ok(text) => {
                     let answer: Value = serde_json::from_str(text).unwrap_or(Value::Null);
-                    let pairs = answer["refreshed_urls"].as_array().map_or(&[][..], Vec::as_slice).iter();
-                    let pairs = pairs.filter_map(|pair| Some((pair["original"].as_str()?.to_owned(), pair["refreshed"].as_str()?.to_owned())));
+                    let pairs = answer["refreshed_urls"]
+                        .as_array()
+                        .map_or(&[][..], Vec::as_slice)
+                        .iter();
+                    let pairs = pairs.filter_map(|pair| {
+                        Some((
+                            pair["original"].as_str()?.to_owned(),
+                            pair["refreshed"].as_str()?.to_owned(),
+                        ))
+                    });
                     pairs.collect()
                 }
                 Err(_) => Vec::new(),
             };
             for (id, url, reply) in batch {
                 let (attachment, size) = plain(url);
-                let fresh = renewed.iter().find(|(original, _)| *original == attachment).map(|(_, fresh)| match size.is_empty() {
-                    true => fresh.clone(),
-                    false => format!("{fresh}{}{size}", if fresh.contains('?') { '&' } else { '?' }),
-                });
+                let fresh = renewed
+                    .iter()
+                    .find(|(original, _)| *original == attachment)
+                    .map(|(_, fresh)| match size.is_empty() {
+                        true => fresh.clone(),
+                        false => format!(
+                            "{fresh}{}{size}",
+                            if fresh.contains('?') { '&' } else { '?' }
+                        ),
+                    });
                 let outcome = match (fresh, &asked) {
                     (Some(fresh), _) => {
                         if let Err(err) = self.ctx.media_refreshed(id, &fresh) {
@@ -1036,7 +1295,8 @@ impl Discord {
 
     fn handoff(&self, channel: &str) -> Result<String, Refusal> {
         let conversation = self.ctx.known(channel).ok().flatten();
-        let conversation = conversation.ok_or_else(|| Refusal::Refused("This conversation is gone.".to_owned()))?;
+        let conversation = conversation
+            .ok_or_else(|| Refusal::Refused("This conversation is gone.".to_owned()))?;
         let guild = self.guild_of(&conversation);
         Ok(voice::handoff_link(guild.as_deref(), channel))
     }
@@ -1045,7 +1305,10 @@ impl Discord {
         // Everything but these is the user doing something, which is what an adapter that
         // stopped asking for a session was waiting for. The screen moving counts when it moved
         // to something of this account; a watch that lapsed names nothing.
-        let ours = |key: &Option<protocol::Key>| key.as_ref().is_some_and(|key| key.account() == self.ctx.account);
+        let ours = |key: &Option<protocol::Key>| {
+            key.as_ref()
+                .is_some_and(|key| key.account() == self.ctx.account)
+        };
         let unasked = match &command {
             Command::Watch(watching) => !ours(&watching.conversation) && !ours(&watching.space),
             Command::Warm(_)
@@ -1063,14 +1326,20 @@ impl Discord {
         match command {
             // `serve_commands` keeps these two for itself.
             Command::Backfill(id) | Command::Warm(id) => self.backfill(&id),
-            Command::History { conversation_id, before } => {
+            Command::History {
+                conversation_id,
+                before,
+            } => {
                 if let Ok(Some(conversation)) = self.ctx.known(&conversation_id) {
                     self.fetch(&conversation, Stretch::Before(&before));
                 }
             }
             // Sent for every page read forward: Discord is asked only when what follows is not
             // already stored from this session.
-            Command::HistoryAfter { conversation_id, after } => {
+            Command::HistoryAfter {
+                conversation_id,
+                after,
+            } => {
                 if self.covered_after(&conversation_id, number(&after)) {
                     return;
                 }
@@ -1078,14 +1347,28 @@ impl Discord {
                     self.fetch(&conversation, Stretch::After(&after));
                 }
             }
-            Command::HistoryAround { conversation_id, around } => {
+            Command::HistoryAround {
+                conversation_id,
+                around,
+            } => {
                 let at = number(&around);
                 let inside = {
                     let state = crate::hub::lock(&self.state);
                     let stretches = state.covered.get(&conversation_id);
-                    stretches.is_some_and(|stretches| stretches.iter().any(|(from, to)| (*from..=*to).contains(&at)))
+                    stretches.is_some_and(|stretches| {
+                        stretches
+                            .iter()
+                            .any(|(from, to)| (*from..=*to).contains(&at))
+                    })
                 };
-                if inside && self.ctx.stored_message(&conversation_id, &around).ok().flatten().is_some() {
+                if inside
+                    && self
+                        .ctx
+                        .stored_message(&conversation_id, &around)
+                        .ok()
+                        .flatten()
+                        .is_some()
+                {
                     return;
                 }
                 if let Ok(Some(conversation)) = self.ctx.known(&conversation_id) {
@@ -1093,41 +1376,105 @@ impl Discord {
                 }
             }
             Command::OpenSpace(space) => self.open_space(&space),
-            Command::MarkRead { conversation_id, message_id } => self.mark_read(&conversation_id, &message_id),
+            Command::MarkRead {
+                conversation_id,
+                message_id,
+            } => self.mark_read(&conversation_id, &message_id),
             Command::AckBulk { reads } => {
                 if let Err(refused) = self.ack_bulk(&reads) {
                     self.log("mark read", refused);
                 }
             }
-            Command::Send { conversation_id, client_id, text, reply_to } => {
+            Command::Send {
+                conversation_id,
+                client_id,
+                text,
+                reply_to,
+            } => {
                 let outcome = self.send(&conversation_id, &client_id, &text, reply_to.as_deref());
                 self.ctx.sent(&conversation_id, &client_id, outcome);
             }
-            Command::React { conversation_id, message_id, emoji, on, reply } => {
-                answer(reply, self.react(&conversation_id, &message_id, &emoji, on))
-            }
-            Command::Edit { conversation_id, message_id, text, reply } => {
-                answer(reply, self.edit(&conversation_id, &message_id, &text))
-            }
-            Command::Delete { conversation_id, message_id, reply } => answer(reply, self.delete(&conversation_id, &message_id)),
-            Command::Relate { person_id, action, reply } => answer(reply, self.relate(&person_id, action)),
-            Command::SetPresence { presence, status, reply } => answer(reply, self.set_presence(presence, status)),
+            Command::React {
+                conversation_id,
+                message_id,
+                emoji,
+                on,
+                reply,
+            } => answer(reply, self.react(&conversation_id, &message_id, &emoji, on)),
+            Command::Edit {
+                conversation_id,
+                message_id,
+                text,
+                reply,
+            } => answer(reply, self.edit(&conversation_id, &message_id, &text)),
+            Command::Delete {
+                conversation_id,
+                message_id,
+                reply,
+            } => answer(reply, self.delete(&conversation_id, &message_id)),
+            Command::Relate {
+                person_id,
+                action,
+                reply,
+            } => answer(reply, self.relate(&person_id, action)),
+            Command::SetPresence {
+                presence,
+                status,
+                reply,
+            } => answer(reply, self.set_presence(presence, status)),
             Command::Profile { person_id, reply } => answer(reply, self.profile(&person_id, None)),
-            Command::ProfileIn { person_id, space_id, reply } => answer(reply, self.profile(&person_id, Some(&space_id))),
-            Command::ConversationInfo { conversation_id, reply } => answer(reply, self.conversation_info(&conversation_id)),
+            Command::ProfileIn {
+                person_id,
+                space_id,
+                reply,
+            } => answer(reply, self.profile(&person_id, Some(&space_id))),
+            Command::ConversationInfo {
+                conversation_id,
+                reply,
+            } => answer(reply, self.conversation_info(&conversation_id)),
             Command::SpaceInfo { space_id, reply } => answer(reply, self.space_info(&space_id)),
-            Command::SetMute { conversation_id, notify, reply } => answer(reply, self.set_mute(&conversation_id, notify)),
-            Command::Leave { conversation_id, reply } => answer(reply, self.leave(&conversation_id, false)),
-            Command::CloseDirect { conversation_id, reply } => answer(reply, self.leave(&conversation_id, true)),
-            Command::Pinned { conversation_id, reply } => answer(reply, self.pinned(&conversation_id)),
-            Command::SearchShared { conversation_id, kind, before, limit, reply } => {
-                answer(reply, self.search_shared(&conversation_id, kind, before.as_deref(), limit))
-            }
+            Command::SetMute {
+                conversation_id,
+                notify,
+                reply,
+            } => answer(reply, self.set_mute(&conversation_id, notify)),
+            Command::Leave {
+                conversation_id,
+                reply,
+            } => answer(reply, self.leave(&conversation_id, false)),
+            Command::CloseDirect {
+                conversation_id,
+                reply,
+            } => answer(reply, self.leave(&conversation_id, true)),
+            Command::Pinned {
+                conversation_id,
+                reply,
+            } => answer(reply, self.pinned(&conversation_id)),
+            Command::SearchShared {
+                conversation_id,
+                kind,
+                before,
+                limit,
+                reply,
+            } => answer(
+                reply,
+                self.search_shared(&conversation_id, kind, before.as_deref(), limit),
+            ),
             Command::Search { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
-            Command::Catalog { kind, space_id, query, cursor, reply } => {
-                answer(reply, self.catalog(kind, space_id.as_deref(), &query, cursor.as_deref()))
-            }
-            Command::ReactionRules { conversation_id, reply } => drop(reply.send(Ok(self.reaction_rules(&conversation_id)))),
+            Command::Catalog {
+                kind,
+                space_id,
+                query,
+                cursor,
+                reply,
+            } => answer(
+                reply,
+                self.catalog(kind, space_id.as_deref(), &query, cursor.as_deref()),
+            ),
+            Command::ReactionRules {
+                conversation_id,
+                reply,
+            } => drop(reply.send(Ok(self.reaction_rules(&conversation_id)))),
             Command::CancelSend { client_id, .. } => upload::cancel(&self.ctx.account, &client_id),
             // Never: a fetch per DM is the burst that flags accounts. chatd does not send it,
             // and it is refused here too should it ever arrive.
@@ -1138,15 +1485,26 @@ impl Discord {
                 self.voice_watch(&watching);
             }
             Command::SearchPeople(query) => self.search_people(&query),
-            Command::Members { conversation_id, offset, limit, reply } => {
-                self.members(conversation_id, offset, limit, reply)
+            Command::Members {
+                conversation_id,
+                offset,
+                limit,
+                reply,
+            } => self.members(conversation_id, offset, limit, reply),
+            Command::StartDirect { person_id, reply } => {
+                drop(reply.send(self.start_direct(&person_id)))
             }
-            Command::StartDirect { person_id, reply } => drop(reply.send(self.start_direct(&person_id))),
-            Command::StartThread { conversation_id, message_id, name, reply } => {
-                drop(reply.send(self.start_thread(&conversation_id, &message_id, &name)))
-            }
+            Command::StartThread {
+                conversation_id,
+                message_id,
+                name,
+                reply,
+            } => drop(reply.send(self.start_thread(&conversation_id, &message_id, &name))),
             Command::Download { id, url, reply } => self.download(id, url, reply),
-            Command::Handoff { conversation_id, reply } => drop(reply.send(self.handoff(&conversation_id))),
+            Command::Handoff {
+                conversation_id,
+                reply,
+            } => drop(reply.send(self.handoff(&conversation_id))),
             Command::CallJoin(conversation_id) => self.call_join(&conversation_id),
             Command::CallLeave(conversation_id) => self.call_leave(&conversation_id),
             Command::CallAudio { muted, deafened } => self.call_audio(muted, deafened),
@@ -1169,13 +1527,23 @@ fn thread_name(text: &str) -> String {
     let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
     let name: String = flat.chars().take(100).collect();
     let name = name.trim().to_owned();
-    if name.is_empty() { "Thread".to_owned() } else { name }
+    if name.is_empty() {
+        "Thread".to_owned()
+    } else {
+        name
+    }
 }
 
 /// Discord will not move this channel's read marker. 50007 is "cannot message this user"
 /// (blocked, or they closed DMs). 50001 and 50003 are missing access and an unknown channel.
 fn ack_refused(refused: &Refused) -> bool {
-    matches!(refused, Refused::Status { code: 50007 | 50001 | 50003, .. } | Refused::Status { status: 403, .. })
+    matches!(
+        refused,
+        Refused::Status {
+            code: 50007 | 50001 | 50003,
+            ..
+        } | Refused::Status { status: 403, .. }
+    )
 }
 
 /// Sends the answer to a command the shell is waiting on.
@@ -1193,6 +1561,9 @@ mod tests {
         let found = accounts(r#"{"token":"MTAwMA.Gabcde.signature"}"#).unwrap();
         assert_eq!(found[0].account, "1000");
         // A token that does not start with an id still signs in.
-        assert_eq!(accounts(r#"{"token":"opaque"}"#).unwrap()[0].account, "main");
+        assert_eq!(
+            accounts(r#"{"token":"opaque"}"#).unwrap()[0].account,
+            "main"
+        );
     }
 }

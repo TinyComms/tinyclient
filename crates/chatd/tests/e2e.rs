@@ -1,13 +1,13 @@
 //! Runs the real chatd and mediad binaries and talks to chatd over its local socket.
 
 use chatd::store::{ConversationRow, SpaceRow, Store};
+use protocol::ChatStream;
 use protocol::{
     read_frame, write_frame, AccountKey, CallFailure, CallState, CallSupport, Change, Content,
     Conversation, ConversationKind, Direction, ErrorCode, Group, GroupKind, InboxFilter, Key, Link,
     Media, MediaFile, MediaKind, MediaRequest, Message, Network, Page, Presence, RelateAction,
     Relation, Request, Response, SendState, OCCUPANTS_LIMIT,
 };
-use protocol::ChatStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 
@@ -17,7 +17,10 @@ fn child_pids(parent: u32, name: &str) -> Vec<u32> {
     #[cfg(windows)]
     {
         use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
-        use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS};
+        use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+            TH32CS_SNAPPROCESS,
+        };
         let program = format!("{name}.exe");
         let mut found = Vec::new();
         // SAFETY: the snapshot is checked before use and closed after; the entry is sized for the
@@ -31,10 +34,18 @@ fn child_pids(parent: u32, name: &str) -> Vec<u32> {
             entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
             let mut more = Process32FirstW(snapshot, &mut entry) != 0;
             while more {
-                let end = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(entry.szExeFile.len());
+                let end = entry
+                    .szExeFile
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(entry.szExeFile.len());
                 // A process with no threads has exited and is only held open by a handle.
                 let alive = entry.cntThreads > 0;
-                if alive && entry.th32ParentProcessID == parent && String::from_utf16_lossy(&entry.szExeFile[..end]).eq_ignore_ascii_case(&program) {
+                if alive
+                    && entry.th32ParentProcessID == parent
+                    && String::from_utf16_lossy(&entry.szExeFile[..end])
+                        .eq_ignore_ascii_case(&program)
+                {
                     found.push(entry.th32ProcessID);
                 }
                 more = Process32NextW(snapshot, &mut entry) != 0;
@@ -45,8 +56,15 @@ fn child_pids(parent: u32, name: &str) -> Vec<u32> {
     }
     #[cfg(not(windows))]
     {
-        let out = Command::new("pgrep").args(["-P", &parent.to_string(), name]).output().unwrap();
-        String::from_utf8(out.stdout).unwrap().lines().filter_map(|pid| pid.trim().parse().ok()).collect()
+        let out = Command::new("pgrep")
+            .args(["-P", &parent.to_string(), name])
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .filter_map(|pid| pid.trim().parse().ok())
+            .collect()
     }
 }
 
@@ -54,16 +72,31 @@ fn process_rss_kb(pid: u32) -> u64 {
     #[cfg(windows)]
     {
         let out = Command::new("powershell")
-            .args(["-NoProfile", "-Command", &format!("(Get-Process -Id {pid}).WorkingSet64")])
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!("(Get-Process -Id {pid}).WorkingSet64"),
+            ])
             .output()
             .expect("working set");
-        let bytes: u64 = String::from_utf8(out.stdout).unwrap().trim().parse().unwrap();
+        let bytes: u64 = String::from_utf8(out.stdout)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
         return bytes / 1024;
     }
     #[cfg(not(windows))]
     {
-        let out = Command::new("ps").args(["-o", "rss=", "-p", &pid.to_string()]).output().unwrap();
-        String::from_utf8(out.stdout).unwrap().trim().parse().unwrap()
+        let out = Command::new("ps")
+            .args(["-o", "rss=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
     }
 }
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -114,7 +147,8 @@ impl Daemon {
             "/tmp/tinyclient-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
-        )).unwrap();
+        ))
+        .unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         seed(&mut Store::open(&dir.join("chat.sqlite")).unwrap());
 
@@ -155,7 +189,10 @@ impl Daemon {
             if wanted(&answer) {
                 return answer;
             }
-            assert!(Instant::now() < deadline, "{what} did not happen: {answer:?}");
+            assert!(
+                Instant::now() < deadline,
+                "{what} did not happen: {answer:?}"
+            );
             sleep(Duration::from_millis(20));
         }
     }
@@ -174,7 +211,13 @@ impl Daemon {
         let mut seen = Vec::new();
         while Instant::now() < deadline {
             let mut stream = ChatStream::connect(&socket).unwrap();
-            stream.set_read_timeout(Some(deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(1)))).unwrap();
+            stream
+                .set_read_timeout(Some(
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .max(Duration::from_millis(1)),
+                ))
+                .unwrap();
             write_frame(&mut stream, &Request::Wait { since }).unwrap();
             let Ok(Response::Changes { seq, changes, .. }) = read_frame(&mut stream) else {
                 break;
@@ -186,14 +229,20 @@ impl Daemon {
     }
 
     fn row(&self, conversation: &Key) -> Conversation {
-        match self.ask(Request::Conversation { conversation: conversation.clone() }) {
+        match self.ask(Request::Conversation {
+            conversation: conversation.clone(),
+        }) {
             Response::Conversation { conversation } => conversation,
             other => panic!("not a row: {other:?}"),
         }
     }
 
     fn newest(&self, conversation: &Key) -> Vec<Message> {
-        let request = Request::Messages { conversation: conversation.clone(), page: Page::Newest, limit: 200 };
+        let request = Request::Messages {
+            conversation: conversation.clone(),
+            page: Page::Newest,
+            limit: 200,
+        };
         match self.ask(request) {
             Response::Messages { messages, .. } => messages,
             other => panic!("not messages: {other:?}"),
@@ -218,23 +267,39 @@ fn running(pid: u32) -> bool {
     {
         // tasklist succeeds either way; a process that is gone is not in its list.
         let filter = format!("PID eq {pid}");
-        let out = Command::new("tasklist").args(["/FI", &filter, "/FO", "CSV", "/NH"]).output().unwrap();
+        let out = Command::new("tasklist")
+            .args(["/FI", &filter, "/FO", "CSV", "/NH"])
+            .output()
+            .unwrap();
         String::from_utf8_lossy(&out.stdout).contains(&format!("\"{pid}\""))
     }
     #[cfg(not(windows))]
     {
-        Command::new("kill").args(["-0", &pid.to_string()]).output().unwrap().status.success()
+        Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .output()
+            .unwrap()
+            .status
+            .success()
     }
 }
 
 fn kill_pid(pid: u32) -> bool {
     #[cfg(windows)]
     {
-        Command::new("taskkill").args(["/F", "/PID", &pid.to_string()]).status().unwrap().success()
+        Command::new("taskkill")
+            .args(["/F", "/PID", &pid.to_string()])
+            .status()
+            .unwrap()
+            .success()
     }
     #[cfg(not(windows))]
     {
-        Command::new("kill").args(["-9", &pid.to_string()]).status().unwrap().success()
+        Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status()
+            .unwrap()
+            .success()
     }
 }
 
@@ -259,15 +324,28 @@ fn key(network: Network, id: &str) -> Key {
 }
 
 /// One live incoming message, in a channel the adapter listed under `title`.
-fn incoming(store: &mut Store, title: &str, network: Network, conversation_id: &str, id: &str, body: &str) {
+fn incoming(
+    store: &mut Store,
+    title: &str,
+    network: Network,
+    conversation_id: &str,
+    id: &str,
+    body: &str,
+) {
     let conversation = key(network, conversation_id);
     let row = ConversationRow {
         listed: true,
         ..ConversationRow::new(conversation_id, ConversationKind::Channel, title)
     };
-    store.upsert_conversation(&conversation.account(), &row).unwrap();
+    store
+        .upsert_conversation(&conversation.account(), &row)
+        .unwrap();
     // Recent, so retention leaves it alone; a longer id is a later message.
-    let hour_ago = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64 - 3_600;
+    let hour_ago = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        - 3_600;
     let message = Message::plain(id, "mara", body, hour_ago + id.len() as i64, false);
     store.ingest(&conversation, &message, true).unwrap();
 }
@@ -308,7 +386,9 @@ fn callable(store: &mut Store, id: &str, call: CallSupport) {
         call,
         ..ConversationRow::new(id, ConversationKind::Group, id)
     };
-    store.upsert_conversation(&key(Network::Teams, id).account(), &row).unwrap();
+    store
+        .upsert_conversation(&key(Network::Teams, id).account(), &row)
+        .unwrap();
 }
 
 /// The meeting the call tests join: one tinyclient carries itself.
@@ -353,7 +433,13 @@ fn png_width(path: &str) -> u32 {
 fn idle_chatd_reports_four_networks_and_runs_no_mediad() {
     let chatd = Daemon::start(|_| {});
 
-    let Response::Status { networks, media, call, .. } = chatd.ask(Request::Status) else {
+    let Response::Status {
+        networks,
+        media,
+        call,
+        ..
+    } = chatd.ask(Request::Status)
+    else {
         panic!("not a status");
     };
     let seen: Vec<_> = networks.iter().map(|n| (n.network, n.link)).collect();
@@ -371,9 +457,30 @@ fn idle_chatd_reports_four_networks_and_runs_no_mediad() {
 fn opening_one_conversation_returns_its_messages_and_clears_only_its_unread() {
     // The same conversation id on two networks: they must stay separate.
     let chatd = Daemon::start(|store| {
-        incoming(store, "#platform", Network::Slack, "C01", "a", "deploy is green");
-        incoming(store, "#platform", Network::Slack, "C01", "bb", "rolling at 3");
-        incoming(store, "Release", Network::Teams, "C01", "c", "share at 2pm?");
+        incoming(
+            store,
+            "#platform",
+            Network::Slack,
+            "C01",
+            "a",
+            "deploy is green",
+        );
+        incoming(
+            store,
+            "#platform",
+            Network::Slack,
+            "C01",
+            "bb",
+            "rolling at 3",
+        );
+        incoming(
+            store,
+            "Release",
+            Network::Teams,
+            "C01",
+            "c",
+            "share at 2pm?",
+        );
     });
 
     let unread = |chatd: &Daemon| {
@@ -383,7 +490,12 @@ fn opening_one_conversation_returns_its_messages_and_clears_only_its_unread() {
             offset: 0,
             limit: 50,
         };
-        let Response::Conversations { conversations, total, .. } = chatd.ask(inbox) else {
+        let Response::Conversations {
+            conversations,
+            total,
+            ..
+        } = chatd.ask(inbox)
+        else {
             panic!("not a list");
         };
         assert_eq!(total as usize, conversations.len());
@@ -397,8 +509,20 @@ fn opening_one_conversation_returns_its_messages_and_clears_only_its_unread() {
     assert_eq!(
         unread(&chatd),
         [
-            (Network::Slack, "C01".into(), "#platform".into(), 2, "rolling at 3".into()),
-            (Network::Teams, "C01".into(), "Release".into(), 1, "share at 2pm?".into()),
+            (
+                Network::Slack,
+                "C01".into(),
+                "#platform".into(),
+                2,
+                "rolling at 3".into()
+            ),
+            (
+                Network::Teams,
+                "C01".into(),
+                "Release".into(),
+                1,
+                "share at 2pm?".into()
+            ),
         ]
     );
 
@@ -408,7 +532,13 @@ fn opening_one_conversation_returns_its_messages_and_clears_only_its_unread() {
     assert_eq!(unread(&chatd), before);
 
     let opened = open(&chatd, Network::Slack, "C01", true);
-    let Response::Messages { conversation, messages, last_read, .. } = opened else {
+    let Response::Messages {
+        conversation,
+        messages,
+        last_read,
+        ..
+    } = opened
+    else {
         panic!("not messages: {opened:?}");
     };
     assert_eq!(conversation, key(Network::Slack, "C01"));
@@ -416,7 +546,13 @@ fn opening_one_conversation_returns_its_messages_and_clears_only_its_unread() {
     assert_eq!(last_read, None);
     let bodies: Vec<_> = messages
         .iter()
-        .map(|m| (conversation.network, conversation.id.as_str(), m.text.as_str()))
+        .map(|m| {
+            (
+                conversation.network,
+                conversation.id.as_str(),
+                m.text.as_str(),
+            )
+        })
         .collect();
     assert_eq!(
         bodies,
@@ -431,17 +567,37 @@ fn opening_one_conversation_returns_its_messages_and_clears_only_its_unread() {
     assert_eq!((after[1].0, after[1].3), (Network::Teams, 1));
 
     let missing = open(&chatd, Network::Discord, "C01", true);
-    assert!(matches!(missing, Response::Error { code: ErrorCode::NotFound, .. }), "{missing:?}");
+    assert!(
+        matches!(
+            missing,
+            Response::Error {
+                code: ErrorCode::NotFound,
+                ..
+            }
+        ),
+        "{missing:?}"
+    );
 }
 
 #[test]
 fn a_waiting_shell_is_woken_by_a_change_and_not_before() {
     let chatd = Daemon::start(|store| {
-        incoming(store, "#platform", Network::Slack, "C01", "a", "deploy is green");
+        incoming(
+            store,
+            "#platform",
+            Network::Slack,
+            "C01",
+            "a",
+            "deploy is green",
+        );
     });
     // The sessions are read after the socket answers, and that is told as it happens: start
     // from after it.
-    let seq = chatd.until("the sessions to be read", Request::Status, |answer| matches!(answer, Response::Status { keychain, .. } if keychain.is_settled()));
+    let seq = chatd.until(
+        "the sessions to be read",
+        Request::Status,
+        |answer| matches!(answer, Response::Status { keychain, .. } if keychain.is_settled()),
+    );
     let Response::Status { seq, .. } = seq else {
         panic!("not a status");
     };
@@ -460,7 +616,12 @@ fn a_waiting_shell_is_woken_by_a_change_and_not_before() {
     let changed_at = Instant::now();
     open(&chatd, Network::Slack, "C01", true);
     let (woken, woken_at) = waiter.join().unwrap();
-    let Response::Changes { seq: after, reset, changes } = woken else {
+    let Response::Changes {
+        seq: after,
+        reset,
+        changes,
+    } = woken
+    else {
         panic!("not changes: {woken:?}");
     };
     assert!(after > seq, "seq stayed at {seq}");
@@ -468,26 +629,49 @@ fn a_waiting_shell_is_woken_by_a_change_and_not_before() {
     // The shell is told which row to read again, not to read everything.
     assert!(!reset);
     let conversation = key(Network::Slack, "C01");
-    assert!(changes.contains(&Change::Conversation { conversation }), "{changes:?}");
+    assert!(
+        changes.contains(&Change::Conversation { conversation }),
+        "{changes:?}"
+    );
 
     // A shell that outlived a restart, or fell too far behind, is told to start over at once.
     let stale = chatd.ask(Request::Wait { since: 7 });
-    assert!(matches!(stale, Response::Changes { reset: true, .. }), "{stale:?}");
+    assert!(
+        matches!(stale, Response::Changes { reset: true, .. }),
+        "{stale:?}"
+    );
 }
 
 #[test]
 fn sending_on_an_offline_network_is_refused_and_stores_nothing() {
     let chatd = Daemon::start(|store| {
-        incoming(store, "#platform", Network::Slack, "C01", "a", "deploy is green");
+        incoming(
+            store,
+            "#platform",
+            Network::Slack,
+            "C01",
+            "a",
+            "deploy is green",
+        );
     });
 
     let sent = chatd.ask(Request::Send {
         conversation: key(Network::Slack, "C01"),
         client_id: "draft-1".into(),
         text: "on it".into(),
-        reply_to: None, with: Default::default(),
+        reply_to: None,
+        with: Default::default(),
     });
-    assert!(matches!(sent, Response::Error { code: ErrorCode::Offline, .. }), "{sent:?}");
+    assert!(
+        matches!(
+            sent,
+            Response::Error {
+                code: ErrorCode::Offline,
+                ..
+            }
+        ),
+        "{sent:?}"
+    );
 
     let Response::Messages { messages, .. } = open(&chatd, Network::Slack, "C01", true) else {
         panic!("not messages");
@@ -502,7 +686,12 @@ fn a_call_spawns_mediad_and_ending_it_exits_mediad_while_chat_keeps_answering() 
     let idle_rss = chatd.rss_kb();
 
     let started = chatd.ask(call_start());
-    let Response::Status { media, call: Some(call), .. } = started else {
+    let Response::Status {
+        media,
+        call: Some(call),
+        ..
+    } = started
+    else {
         panic!("call did not start: {started:?}");
     };
     assert_eq!(media, Media::Running);
@@ -512,7 +701,16 @@ fn a_call_spawns_mediad_and_ending_it_exits_mediad_while_chat_keeps_answering() 
 
     // A second call is refused rather than spawning a second mediad.
     let second = chatd.ask(call_start());
-    assert!(matches!(second, Response::Error { code: ErrorCode::CallActive, .. }), "{second:?}");
+    assert!(
+        matches!(
+            second,
+            Response::Error {
+                code: ErrorCode::CallActive,
+                ..
+            }
+        ),
+        "{second:?}"
+    );
     assert_eq!(chatd.mediad_pids(), pids);
 
     assert_eq!(chatd.ask(Request::Ping), Response::Pong);
@@ -524,7 +722,14 @@ fn a_call_spawns_mediad_and_ending_it_exits_mediad_while_chat_keeps_answering() 
 
     let ended = chatd.ask(Request::CallEnd);
     assert!(
-        matches!(ended, Response::Status { media: Media::Stopped, call: None, .. }),
+        matches!(
+            ended,
+            Response::Status {
+                media: Media::Stopped,
+                call: None,
+                ..
+            }
+        ),
         "{ended:?}"
     );
     assert!(!running(pids[0]), "mediad outlived the call");
@@ -540,16 +745,59 @@ fn a_call_starts_only_where_tinyclient_carries_calls_itself_and_a_refusal_spawns
         callable(store, "stage", CallSupport::None);
     });
     for id in ["huddle", "stage"] {
-        let refused = chatd.ask(Request::CallStart { conversation: key(Network::Teams, id) });
-        assert!(matches!(refused, Response::Error { code: ErrorCode::Unsupported, .. }), "{id}: {refused:?}");
+        let refused = chatd.ask(Request::CallStart {
+            conversation: key(Network::Teams, id),
+        });
+        assert!(
+            matches!(
+                refused,
+                Response::Error {
+                    code: ErrorCode::Unsupported,
+                    ..
+                }
+            ),
+            "{id}: {refused:?}"
+        );
     }
-    let unknown = chatd.ask(Request::CallStart { conversation: key(Network::Teams, "nowhere") });
-    assert!(matches!(unknown, Response::Error { code: ErrorCode::NotFound, .. }), "{unknown:?}");
-    assert_eq!(chatd.mediad_pids(), Vec::<u32>::new(), "a refused call must not start mediad");
+    let unknown = chatd.ask(Request::CallStart {
+        conversation: key(Network::Teams, "nowhere"),
+    });
+    assert!(
+        matches!(
+            unknown,
+            Response::Error {
+                code: ErrorCode::NotFound,
+                ..
+            }
+        ),
+        "{unknown:?}"
+    );
+    assert_eq!(
+        chatd.mediad_pids(),
+        Vec::<u32>::new(),
+        "a refused call must not start mediad"
+    );
     let idle = chatd.ask(Request::Status);
-    assert!(matches!(idle, Response::Status { media: Media::Stopped, call: None, .. }), "{idle:?}");
+    assert!(
+        matches!(
+            idle,
+            Response::Status {
+                media: Media::Stopped,
+                call: None,
+                ..
+            }
+        ),
+        "{idle:?}"
+    );
 
-    assert!(matches!(chatd.ask(call_start()), Response::Status { media: Media::Running, call: Some(_), .. }));
+    assert!(matches!(
+        chatd.ask(call_start()),
+        Response::Status {
+            media: Media::Running,
+            call: Some(_),
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -560,13 +808,33 @@ fn mediad_dying_before_the_voice_session_arrives_is_a_failure_in_words_not_a_van
 
     assert!(kill_pid(pid));
     // The thread that reads mediad settles the call once its stdout closes.
-    let settled = chatd.until("the failure", Request::Status, |status| failed_with(status, CallFailure::Engine));
-    assert!(matches!(settled, Response::Status { media: Media::Stopped, .. }), "{settled:?}");
+    let settled = chatd.until("the failure", Request::Status, |status| {
+        failed_with(status, CallFailure::Engine)
+    });
+    assert!(
+        matches!(
+            settled,
+            Response::Status {
+                media: Media::Stopped,
+                ..
+            }
+        ),
+        "{settled:?}"
+    );
     assert_eq!(chatd.mediad_pids(), Vec::<u32>::new());
     // It stays until dismissed, and "try again" replaces it with a new call.
     sleep(Duration::from_millis(200));
-    assert!(failed_with(&chatd.ask(Request::Status), CallFailure::Engine));
-    assert!(matches!(chatd.ask(call_start()), Response::Status { media: Media::Running, .. }));
+    assert!(failed_with(
+        &chatd.ask(Request::Status),
+        CallFailure::Engine
+    ));
+    assert!(matches!(
+        chatd.ask(call_start()),
+        Response::Status {
+            media: Media::Running,
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -577,7 +845,10 @@ fn mediad_exits_when_chatd_is_killed_mid_call() {
 
     chatd.child.kill().unwrap();
     chatd.child.wait().unwrap();
-    assert!(gone_within(pid, Duration::from_secs(5)), "mediad was orphaned");
+    assert!(
+        gone_within(pid, Duration::from_secs(5)),
+        "mediad was orphaned"
+    );
 }
 
 #[test]
@@ -585,12 +856,29 @@ fn a_share_is_one_encode_and_one_subscribed_decode() {
     let chatd = Daemon::start(standup);
 
     let no_call = chatd.ask(Request::Media(MediaRequest::ShareSend { on: true }));
-    assert!(matches!(no_call, Response::Error { code: ErrorCode::NoCall, .. }), "{no_call:?}");
+    assert!(
+        matches!(
+            no_call,
+            Response::Error {
+                code: ErrorCode::NoCall,
+                ..
+            }
+        ),
+        "{no_call:?}"
+    );
     assert_eq!(chatd.mediad_pids(), Vec::<u32>::new());
 
     chatd.ask(call_start());
-    let watch = |source: &str| Request::Media(MediaRequest::ShareWatch { source: Some(source.into()) });
-    let speaker = |source: &str| Request::Media(MediaRequest::Speaker { source: Some(source.into()) });
+    let watch = |source: &str| {
+        Request::Media(MediaRequest::ShareWatch {
+            source: Some(source.into()),
+        })
+    };
+    let speaker = |source: &str| {
+        Request::Media(MediaRequest::Speaker {
+            source: Some(source.into()),
+        })
+    };
     chatd.ask(Request::Media(MediaRequest::ShareSend { on: true }));
     chatd.ask(watch("alice"));
     chatd.ask(speaker("carol"));
@@ -598,7 +886,10 @@ fn a_share_is_one_encode_and_one_subscribed_decode() {
     chatd.ask(speaker("dave"));
     let last = chatd.ask(watch("bob"));
 
-    let Response::Status { call: Some(call), .. } = last else {
+    let Response::Status {
+        call: Some(call), ..
+    } = last
+    else {
         panic!("no call: {last:?}");
     };
     let sources = |direction, content| -> Vec<&str> {
@@ -632,10 +923,21 @@ fn lists_and_history_come_in_pages_that_say_how_much_more_there_is() {
             offset,
             limit: 2,
         };
-        let Response::Conversations { conversations, total, .. } = chatd.ask(request) else {
+        let Response::Conversations {
+            conversations,
+            total,
+            ..
+        } = chatd.ask(request)
+        else {
             panic!("not a list");
         };
-        (conversations.into_iter().map(|c| c.title).collect::<Vec<_>>(), total)
+        (
+            conversations
+                .into_iter()
+                .map(|c| c.title)
+                .collect::<Vec<_>>(),
+            total,
+        )
     };
     // Newest first: #one has the latest message; the other two tie and fall back to their ids.
     assert_eq!(inbox(0), (vec!["#one".to_owned(), "#two".to_owned()], 3));
@@ -647,20 +949,39 @@ fn lists_and_history_come_in_pages_that_say_how_much_more_there_is() {
             page,
             limit: 2,
         };
-        let Response::Messages { messages, older, newer, .. } = chatd.ask(request) else {
+        let Response::Messages {
+            messages,
+            older,
+            newer,
+            ..
+        } = chatd.ask(request)
+        else {
             panic!("not messages");
         };
-        (messages.into_iter().map(|m| m.text).collect::<Vec<_>>(), older, newer)
+        (
+            messages.into_iter().map(|m| m.text).collect::<Vec<_>>(),
+            older,
+            newer,
+        )
     };
-    assert_eq!(page(Page::Newest), (vec!["dddd".to_owned(), "eeeee".to_owned()], true, false));
+    assert_eq!(
+        page(Page::Newest),
+        (vec!["dddd".to_owned(), "eeeee".to_owned()], true, false)
+    );
     let before = page(Page::Before { id: "dddd".into() });
-    assert_eq!(before, (vec!["bb".to_owned(), "ccc".to_owned()], true, true));
+    assert_eq!(
+        before,
+        (vec!["bb".to_owned(), "ccc".to_owned()], true, true)
+    );
     let oldest = page(Page::Before { id: "bb".into() });
     assert_eq!(oldest, (vec!["hello".to_owned()], false, true));
 
     // A limit past the cap is cut to it rather than answered with everything.
     let huge = chatd.ask(messages(Network::Slack, "C01", u32::MAX));
-    assert!(matches!(huge, Response::Messages { ref messages, .. } if messages.len() == 5), "{huge:?}");
+    assert!(
+        matches!(huge, Response::Messages { ref messages, .. } if messages.len() == 5),
+        "{huge:?}"
+    );
 }
 
 #[test]
@@ -677,7 +998,9 @@ fn what_only_a_network_can_answer_is_refused_in_words_and_the_cache_answers_the_
             height: 80,
             ..MediaFile::new("icon-1", MediaKind::Icon)
         };
-        store.register_media(&seeded, &[(icon, "https://cdn.example/icon-1".into())]).unwrap();
+        store
+            .register_media(&seeded, &[(icon, "https://cdn.example/icon-1".into())])
+            .unwrap();
         let space = SpaceRow {
             id: "G1".into(),
             name: "Rust".into(),
@@ -686,53 +1009,116 @@ fn what_only_a_network_can_answer_is_refused_in_words_and_the_cache_answers_the_
         };
         store.replace_spaces(&seeded, &[space]).unwrap();
         let channel = ConversationRow::new("C9", ConversationKind::Channel, "#gpui");
-        store.replace_tree(&key(Network::Discord, "G1"), &[], &[channel]).unwrap();
+        store
+            .replace_tree(&key(Network::Discord, "G1"), &[], &[channel])
+            .unwrap();
     });
     let conversation = key(Network::Discord, "D1");
     let unsupported = |request: Request| {
         let answer = chatd.ask(request.clone());
         assert!(
-            matches!(answer, Response::Error { code: ErrorCode::Unsupported, .. }),
+            matches!(
+                answer,
+                Response::Error {
+                    code: ErrorCode::Unsupported,
+                    ..
+                }
+            ),
             "{request:?} answered {answer:?}"
         );
     };
-    unsupported(Request::Members { conversation: conversation.clone(), offset: 0, limit: 100 });
-    unsupported(Request::StartDirect { person: key(Network::Discord, "42") });
-    unsupported(Request::Handoff { conversation: conversation.clone() });
+    unsupported(Request::Members {
+        conversation: conversation.clone(),
+        offset: 0,
+        limit: 100,
+    });
+    unsupported(Request::StartDirect {
+        person: key(Network::Discord, "42"),
+    });
+    unsupported(Request::Handoff {
+        conversation: conversation.clone(),
+    });
 
     // The tree and its Space come from the cache, with the icon's size known before its bytes.
     let Response::Spaces { spaces } = chatd.ask(Request::Spaces { network: None }) else {
         panic!("not spaces");
     };
     let icon = spaces[0].icon.clone().expect("the space has an icon");
-    assert_eq!((spaces[0].name.as_str(), icon.width, icon.path.as_deref()), ("Rust", 80, None));
-    let tree = chatd.ask(Request::Tree { space: key(Network::Discord, "G1"), offset: 0, limit: 50, peek: false });
-    let Response::Tree { conversations, total, .. } = tree else {
+    assert_eq!(
+        (spaces[0].name.as_str(), icon.width, icon.path.as_deref()),
+        ("Rust", 80, None)
+    );
+    let tree = chatd.ask(Request::Tree {
+        space: key(Network::Discord, "G1"),
+        offset: 0,
+        limit: 50,
+        peek: false,
+    });
+    let Response::Tree {
+        conversations,
+        total,
+        ..
+    } = tree
+    else {
         panic!("not a tree: {tree:?}");
     };
     assert_eq!((conversations[0].title.as_str(), total), ("#gpui", 1));
     // A channel nobody mentioned me in is in its Space, not in the Inbox.
-    let inbox = Request::Inbox { network: None, filter: InboxFilter::All, offset: 0, limit: 50 };
+    let inbox = Request::Inbox {
+        network: None,
+        filter: InboxFilter::All,
+        offset: 0,
+        limit: 50,
+    };
     let Response::Conversations { conversations, .. } = chatd.ask(inbox) else {
         panic!("not a list");
     };
-    assert_eq!(conversations.iter().map(|c| c.title.as_str()).collect::<Vec<_>>(), ["Mara"]);
+    assert_eq!(
+        conversations
+            .iter()
+            .map(|c| c.title.as_str())
+            .collect::<Vec<_>>(),
+        ["Mara"]
+    );
 
     // Asking for a file names what is known; chatd holds no bytes and invents no path.
-    let fetched = chatd.ask(Request::Fetch { retry: false, size: None, account, ids: vec!["icon-1".into(), "nope".into()] });
+    let fetched = chatd.ask(Request::Fetch {
+        retry: false,
+        size: None,
+        account,
+        ids: vec!["icon-1".into(), "nope".into()],
+    });
     assert_eq!(fetched, Response::Media { files: vec![icon] });
 
     // Typing to a network that is not connected is dropped quietly; it is not an error to type.
     assert_eq!(chatd.ask(Request::Typing { conversation }), Response::Ok);
-    let missing = chatd.ask(Request::Tree { space: key(Network::Discord, "G2"), offset: 0, limit: 50, peek: false });
-    assert!(matches!(missing, Response::Error { code: ErrorCode::NotFound, .. }), "{missing:?}");
+    let missing = chatd.ask(Request::Tree {
+        space: key(Network::Discord, "G2"),
+        offset: 0,
+        limit: 50,
+        peek: false,
+    });
+    assert!(
+        matches!(
+            missing,
+            Response::Error {
+                code: ErrorCode::NotFound,
+                ..
+            }
+        ),
+        "{missing:?}"
+    );
 }
 
 #[test]
 fn unread_and_mentions_are_different_lists_and_the_inbox_counts_each() {
     let chatd = Daemon::start(|store| {
         let account = key(Network::Slack, "").account();
-        let hour_ago = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64 - 3_600;
+        let hour_ago = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            - 3_600;
         let mut heard = |id: &str, kind, title: &str, mention: bool, muted: bool| {
             let row = ConversationRow {
                 listed: true,
@@ -741,7 +1127,9 @@ fn unread_and_mentions_are_different_lists_and_the_inbox_counts_each() {
             store.upsert_conversation(&account, &row).unwrap();
             let mut message = Message::plain("1", "mara", "hello", hour_ago, false);
             message.mentions_me = mention;
-            store.ingest(&key(Network::Slack, id), &message, true).unwrap();
+            store
+                .ingest(&key(Network::Slack, id), &message, true)
+                .unwrap();
             store.set_muted(&key(Network::Slack, id), muted).unwrap();
         };
         heard("D1", ConversationKind::Direct, "Mara", false, false);
@@ -750,8 +1138,18 @@ fn unread_and_mentions_are_different_lists_and_the_inbox_counts_each() {
         heard("D2", ConversationKind::Direct, "Dev (muted)", true, true);
     });
     let inbox = |filter| {
-        let request = Request::Inbox { network: None, filter, offset: 0, limit: 50 };
-        let Response::Conversations { conversations, total, counts } = chatd.ask(request) else {
+        let request = Request::Inbox {
+            network: None,
+            filter,
+            offset: 0,
+            limit: 50,
+        };
+        let Response::Conversations {
+            conversations,
+            total,
+            counts,
+        } = chatd.ask(request)
+        else {
             panic!("not a list");
         };
         let mut titles: Vec<String> = conversations.into_iter().map(|row| row.title).collect();
@@ -773,21 +1171,54 @@ fn unread_and_mentions_are_different_lists_and_the_inbox_counts_each() {
 fn a_row_says_where_it_is_and_a_thread_lives_and_dies_with_its_parent() {
     let chatd = Daemon::start(|store| {
         let account = key(Network::Discord, "").account();
-        let space = |id: &str, name: &str| SpaceRow { id: id.into(), name: name.into(), icon: None, position: 0 };
-        store.replace_spaces(&account, &[space("G1", "Rustaceans"), space("G2", "Moss & Lichen")]).unwrap();
-        for (space, channel, topic) in [("G1", "C1", "Borrow checker support group\nsecond line"), ("G2", "C2", "")] {
+        let space = |id: &str, name: &str| SpaceRow {
+            id: id.into(),
+            name: name.into(),
+            icon: None,
+            position: 0,
+        };
+        store
+            .replace_spaces(
+                &account,
+                &[space("G1", "Rustaceans"), space("G2", "Moss & Lichen")],
+            )
+            .unwrap();
+        for (space, channel, topic) in [
+            ("G1", "C1", "Borrow checker support group\nsecond line"),
+            ("G2", "C2", ""),
+        ] {
             let general = ConversationRow {
                 group: Some("text".into()),
                 topic: topic.into(),
                 ..ConversationRow::new(channel, ConversationKind::Channel, "general")
             };
-            store.replace_tree(&key(Network::Discord, space), &[Group::new("text", "Text channels", 0)], &[general]).unwrap();
+            store
+                .replace_tree(
+                    &key(Network::Discord, space),
+                    &[Group::new("text", "Text channels", 0)],
+                    &[general],
+                )
+                .unwrap();
         }
-        let recent = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64 - 60;
-        store.ingest(&key(Network::Discord, "C1"), &Message::plain("100", "mara", "the first message", recent, false), false).unwrap();
+        let recent = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            - 60;
+        store
+            .ingest(
+                &key(Network::Discord, "C1"),
+                &Message::plain("100", "mara", "the first message", recent, false),
+                false,
+            )
+            .unwrap();
         // One thread hangs off a message that is stored, one off a message that has aged out,
         // and one off a channel that is gone.
-        for (id, parent, root) in [("T-kept", "C1", "100"), ("T-aged", "C1", "7"), ("T-orphan", "C-gone", "1")] {
+        for (id, parent, root) in [
+            ("T-kept", "C1", "100"),
+            ("T-aged", "C1", "7"),
+            ("T-orphan", "C-gone", "1"),
+        ] {
             let thread = ConversationRow {
                 space: Some("G1".into()),
                 parent: Some(parent.into()),
@@ -795,7 +1226,13 @@ fn a_row_says_where_it_is_and_a_thread_lives_and_dies_with_its_parent() {
                 ..ConversationRow::new(id, ConversationKind::Thread, "a thread")
             };
             store.upsert_conversation(&account, &thread).unwrap();
-            store.ingest(&key(Network::Discord, id), &Message::plain("1", "mara", "a reply", recent, false), false).unwrap();
+            store
+                .ingest(
+                    &key(Network::Discord, id),
+                    &Message::plain("1", "mara", "a reply", recent, false),
+                    false,
+                )
+                .unwrap();
         }
         // The network sends the tree again: a thread that names its parent is not the tree's
         // to list, and must survive it.
@@ -804,48 +1241,120 @@ fn a_row_says_where_it_is_and_a_thread_lives_and_dies_with_its_parent() {
             topic: "Borrow checker support group\nsecond line".into(),
             ..ConversationRow::new("C1", ConversationKind::Channel, "general")
         };
-        store.replace_tree(&key(Network::Discord, "G1"), &[Group::new("text", "Text channels", 0)], &[general]).unwrap();
+        store
+            .replace_tree(
+                &key(Network::Discord, "G1"),
+                &[Group::new("text", "Text channels", 0)],
+                &[general],
+            )
+            .unwrap();
     });
 
     let general = chatd.row(&key(Network::Discord, "C1"));
-    assert_eq!((general.space_title.as_str(), general.group_title.as_str()), ("Rustaceans", "Text channels"));
-    assert_eq!(general.subtitle(), "Rustaceans › Text channels · Borrow checker support group");
+    assert_eq!(
+        (general.space_title.as_str(), general.group_title.as_str()),
+        ("Rustaceans", "Text channels")
+    );
+    assert_eq!(
+        general.subtitle(),
+        "Rustaceans › Text channels · Borrow checker support group"
+    );
     // Two channels of one name are told apart by their Space, in one answer.
-    let found = chatd.ask(Request::Find { network: None, query: "gener".into(), limit: 10 });
+    let found = chatd.ask(Request::Find {
+        network: None,
+        query: "gener".into(),
+        limit: 10,
+    });
     let Response::Conversations { conversations, .. } = found else {
         panic!("not a list: {found:?}");
     };
-    let mut places: Vec<(String, String)> = conversations.into_iter().map(|row| (row.title, row.space_title)).collect();
+    let mut places: Vec<(String, String)> = conversations
+        .into_iter()
+        .map(|row| (row.title, row.space_title))
+        .collect();
     places.sort();
-    assert_eq!(places, [("general".into(), "Moss & Lichen".into()), ("general".into(), "Rustaceans".into())]);
-    let tree = chatd.ask(Request::Tree { space: key(Network::Discord, "G1"), offset: 0, limit: 50, peek: true });
-    let Response::Tree { groups, conversations, .. } = tree else {
+    assert_eq!(
+        places,
+        [
+            ("general".into(), "Moss & Lichen".into()),
+            ("general".into(), "Rustaceans".into())
+        ]
+    );
+    let tree = chatd.ask(Request::Tree {
+        space: key(Network::Discord, "G1"),
+        offset: 0,
+        limit: 50,
+        peek: true,
+    });
+    let Response::Tree {
+        groups,
+        conversations,
+        ..
+    } = tree
+    else {
         panic!("not a tree: {tree:?}");
     };
     assert_eq!((groups[0].count, groups[0].kind), (1, GroupKind::Section));
-    assert!(conversations.iter().all(|row| row.space_title == "Rustaceans"), "{conversations:?}");
+    assert!(
+        conversations
+            .iter()
+            .all(|row| row.space_title == "Rustaceans"),
+        "{conversations:?}"
+    );
 
     let kept = chatd.row(&key(Network::Discord, "T-kept"));
-    assert_eq!((kept.parent.as_deref(), kept.root.as_deref()), (Some("C1"), Some("100")));
+    assert_eq!(
+        (kept.parent.as_deref(), kept.root.as_deref()),
+        (Some("C1"), Some("100"))
+    );
     // Retention runs behind the socket at start.
     for gone in ["T-aged", "T-orphan"] {
-        let request = Request::Conversation { conversation: key(Network::Discord, gone) };
-        chatd.until(gone, request, |answer| matches!(answer, Response::Error { code: ErrorCode::NotFound, .. }));
+        let request = Request::Conversation {
+            conversation: key(Network::Discord, gone),
+        };
+        chatd.until(gone, request, |answer| {
+            matches!(
+                answer,
+                Response::Error {
+                    code: ErrorCode::NotFound,
+                    ..
+                }
+            )
+        });
         let left = chatd.ask(messages(Network::Discord, gone, 10));
-        assert!(matches!(left, Response::Error { code: ErrorCode::NotFound, .. }), "{gone} kept its messages: {left:?}");
+        assert!(
+            matches!(
+                left,
+                Response::Error {
+                    code: ErrorCode::NotFound,
+                    ..
+                }
+            ),
+            "{gone} kept its messages: {left:?}"
+        );
     }
-    assert!(matches!(chatd.ask(messages(Network::Discord, "T-kept", 10)), Response::Messages { ref messages, .. } if messages.len() == 1));
+    assert!(
+        matches!(chatd.ask(messages(Network::Discord, "T-kept", 10)), Response::Messages { ref messages, .. } if messages.len() == 1)
+    );
 
     // A draft is chatd's to keep, and comes back on the row.
     let conversation = key(Network::Discord, "C1");
-    assert_eq!(chatd.ask(Request::SetDraft { conversation: conversation.clone(), text: "half a thou".into() }), Response::Ok);
+    assert_eq!(
+        chatd.ask(Request::SetDraft {
+            conversation: conversation.clone(),
+            text: "half a thou".into()
+        }),
+        Response::Ok
+    );
     assert_eq!(chatd.row(&conversation).draft, "half a thou");
 }
 
 #[test]
 fn an_account_id_that_is_not_one_plain_file_name_is_never_used() {
     let slack = |team: &str| {
-        let session = format!(r#"{{"cookie":"xoxd-test","teams":[{{"token":"xoxc-test","url":"https://example.slack.com/","id":"{team}","name":"Test"}}]}}"#);
+        let session = format!(
+            r#"{{"cookie":"xoxd-test","teams":[{{"token":"xoxc-test","url":"https://example.slack.com/","id":"{team}","name":"Test"}}]}}"#
+        );
         // Whatever starts must not reach a network: these point at a port nothing listens on.
         let env = [
             ("TINYCLIENT_SESSION_SLACK", session.as_str()),
@@ -854,20 +1363,43 @@ fn an_account_id_that_is_not_one_plain_file_name_is_never_used() {
         ];
         let chatd = Daemon::with(&[], &env, |_| {});
         // Sessions are read on a thread of their own while the socket already answers.
-        let read = chatd.until("the sessions to be read", Request::Status, |answer| matches!(answer, Response::Status { keychain, .. } if keychain.is_settled()));
-        let Response::Status { networks, accounts, .. } = read else {
+        let read = chatd.until(
+            "the sessions to be read",
+            Request::Status,
+            |answer| matches!(answer, Response::Status { keychain, .. } if keychain.is_settled()),
+        );
+        let Response::Status {
+            networks, accounts, ..
+        } = read
+        else {
             panic!("not a status");
         };
-        let link = networks.iter().find(|status| status.network == Network::Slack).unwrap().link;
-        (link, accounts.len(), chatd.dir.join("media").join("slack").exists())
+        let link = networks
+            .iter()
+            .find(|status| status.network == Network::Slack)
+            .unwrap()
+            .link;
+        (
+            link,
+            accounts.len(),
+            chatd.dir.join("media").join("slack").exists(),
+        )
     };
     // An id names a directory under the media cache: these two would name the cache itself
     // and its parent.
     for team in ["..", "."] {
-        assert_eq!(slack(team), (Link::SignedOut, 0, false), "{team:?} was taken as an account");
+        assert_eq!(
+            slack(team),
+            (Link::SignedOut, 0, false),
+            "{team:?} was taken as an account"
+        );
     }
     let (link, accounts, _) = slack("T0.TEST-1");
-    assert_eq!((link != Link::SignedOut, accounts), (true, 1), "a plain id must still sign in");
+    assert_eq!(
+        (link != Link::SignedOut, accounts),
+        (true, 1),
+        "a plain id must still sign in"
+    );
 }
 
 #[test]
@@ -890,7 +1422,12 @@ fn the_sign_in_window_is_told_where_to_open_and_how_it_ended_is_told_apart() {
     )
     .unwrap();
     let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
-    let compiled = Command::new(rustc).arg(&source).arg("-o").arg(&script).status().unwrap();
+    let compiled = Command::new(rustc)
+        .arg(&source)
+        .arg("-o")
+        .arg(&script)
+        .status()
+        .unwrap();
     assert!(compiled.success(), "could not build the sign-in stand-in");
     let chatd = Daemon::with(
         &[],
@@ -903,8 +1440,15 @@ fn the_sign_in_window_is_told_where_to_open_and_how_it_ended_is_told_apart() {
 
     let ended = |code: u8, at| {
         std::fs::write(helper.join("code"), code.to_string()).unwrap();
-        match chatd.ask(Request::SignIn { network: Network::Slack, at }) {
-            Response::Error { code, detail } => (code, detail, std::fs::read_to_string(helper.join("args")).unwrap()),
+        match chatd.ask(Request::SignIn {
+            network: Network::Slack,
+            at,
+        }) {
+            Response::Error { code, detail } => (
+                code,
+                detail,
+                std::fs::read_to_string(helper.join("args")).unwrap(),
+            ),
             other => panic!("signed in: {other:?}"),
         }
     };
@@ -916,11 +1460,24 @@ fn the_sign_in_window_is_told_where_to_open_and_how_it_ended_is_told_apart() {
     let (crashed, crashed_words, _) = ended(9, None);
     assert_eq!(
         (closed, unreachable, blocked, crashed),
-        (ErrorCode::SignIn, ErrorCode::SignInUnreachable, ErrorCode::SignInBlocked, ErrorCode::SignIn)
+        (
+            ErrorCode::SignIn,
+            ErrorCode::SignInUnreachable,
+            ErrorCode::SignInBlocked,
+            ErrorCode::SignIn
+        )
     );
-    let words = [&closed_words, &unreachable_words, &blocked_words, &crashed_words];
+    let words = [
+        &closed_words,
+        &unreachable_words,
+        &blocked_words,
+        &crashed_words,
+    ];
     for (at, one) in words.iter().enumerate() {
-        assert!(words.iter().skip(at + 1).all(|other| other != one), "two endings read the same: {one}");
+        assert!(
+            words.iter().skip(at + 1).all(|other| other != one),
+            "two endings read the same: {one}"
+        );
     }
     let _ = std::fs::remove_dir_all(helper);
 }
@@ -931,11 +1488,25 @@ fn what_the_user_does_to_a_message_is_shown_and_settled_by_the_network() {
     let room = demo(SHOWCASE);
     let find = |text: &str| -> Message {
         let messages = chatd.newest(&room);
-        messages.into_iter().find(|message| message.text.starts_with(text)).unwrap_or_else(|| panic!("no message {text:?}"))
+        messages
+            .into_iter()
+            .find(|message| message.text.starts_with(text))
+            .unwrap_or_else(|| panic!("no message {text:?}"))
     };
-    let reaction = |message: &Message, emoji: &str| message.reactions.iter().find(|have| have.emoji == emoji).map(|have| (have.count, have.mine));
+    let reaction = |message: &Message, emoji: &str| {
+        message
+            .reactions
+            .iter()
+            .find(|have| have.emoji == emoji)
+            .map(|have| (have.count, have.mine))
+    };
     let react = |message: &Message, emoji: &str, on| {
-        chatd.ask(Request::React { conversation: room.clone(), message_id: message.id.clone(), emoji: emoji.into(), on })
+        chatd.ask(Request::React {
+            conversation: room.clone(),
+            message_id: message.id.clone(),
+            emoji: emoji.into(),
+            on,
+        })
     };
 
     // A reaction of ours is one reaction, however many times it is told: once by the request
@@ -943,41 +1514,115 @@ fn what_the_user_does_to_a_message_is_shown_and_settled_by_the_network() {
     let loved = find("County recorder confirmed");
     assert_eq!(reaction(&loved, "👍"), Some((4, true)));
     assert_eq!(react(&loved, "👍", false), Response::Ok);
-    assert_eq!(reaction(&find("County recorder confirmed"), "👍"), Some((3, false)));
+    assert_eq!(
+        reaction(&find("County recorder confirmed"), "👍"),
+        Some((3, false))
+    );
     assert_eq!(react(&loved, "👍", true), Response::Ok);
-    assert_eq!(react(&loved, "👍", true), Response::Ok, "asking twice is not an error");
-    assert_eq!(reaction(&find("County recorder confirmed"), "👍"), Some((4, true)));
+    assert_eq!(
+        react(&loved, "👍", true),
+        Response::Ok,
+        "asking twice is not an error"
+    );
+    assert_eq!(
+        reaction(&find("County recorder confirmed"), "👍"),
+        Some((4, true))
+    );
     assert_eq!(react(&loved, "🦊", true), Response::Ok);
-    assert_eq!(reaction(&find("County recorder confirmed"), "🦊"), Some((1, true)));
+    assert_eq!(
+        reaction(&find("County recorder confirmed"), "🦊"),
+        Some((1, true))
+    );
     // A custom emoji is named by its file; the network's word for it gives it its name.
     assert_eq!(react(&loved, "emoji-lichen_ok", true), Response::Ok);
     let custom = find("County recorder confirmed");
-    let named = custom.reactions.iter().find(|have| have.emoji == ":lichen_ok:").expect("the custom reaction");
-    assert_eq!((named.count, named.mine, named.file.as_ref().map(|file| file.id.as_str())), (1, true, Some("emoji-lichen_ok")));
-    let nowhere = chatd.ask(Request::React { conversation: room.clone(), message_id: "1".into(), emoji: "👍".into(), on: true });
-    assert!(matches!(nowhere, Response::Error { code: ErrorCode::NotFound, .. }), "{nowhere:?}");
+    let named = custom
+        .reactions
+        .iter()
+        .find(|have| have.emoji == ":lichen_ok:")
+        .expect("the custom reaction");
+    assert_eq!(
+        (
+            named.count,
+            named.mine,
+            named.file.as_ref().map(|file| file.id.as_str())
+        ),
+        (1, true, Some("emoji-lichen_ok"))
+    );
+    let nowhere = chatd.ask(Request::React {
+        conversation: room.clone(),
+        message_id: "1".into(),
+        emoji: "👍".into(),
+        on: true,
+    });
+    assert!(
+        matches!(
+            nowhere,
+            Response::Error {
+                code: ErrorCode::NotFound,
+                ..
+            }
+        ),
+        "{nowhere:?}"
+    );
 
     // An edit waits for the network and then reads as edited. Someone else's is refused here.
     let mine = find("Same spot as this one");
     assert!(mine.outgoing && !mine.edited);
     let edit = |message: &Message, text: &str| {
-        chatd.ask(Request::Edit { conversation: room.clone(), message_id: message.id.clone(), text: text.into() })
+        chatd.ask(Request::Edit {
+            conversation: room.clone(),
+            message_id: message.id.clone(),
+            text: text.into(),
+        })
     };
-    assert_eq!(edit(&mine, "Same spot, and the camera was level."), Response::Ok);
+    assert_eq!(
+        edit(&mine, "Same spot, and the camera was level."),
+        Response::Ok
+    );
     let edited = find("Same spot, and the camera was level.");
-    assert_eq!((edited.id.as_str(), edited.edited), (mine.id.as_str(), true));
+    assert_eq!(
+        (edited.id.as_str(), edited.edited),
+        (mine.id.as_str(), true)
+    );
     let theirs = find("I do have the keys");
     let refused = edit(&theirs, "I lost the keys.");
-    assert!(matches!(refused, Response::Error { code: ErrorCode::Refused, .. }), "{refused:?}");
+    assert!(
+        matches!(
+            refused,
+            Response::Error {
+                code: ErrorCode::Refused,
+                ..
+            }
+        ),
+        "{refused:?}"
+    );
     assert_eq!(find("I do have the keys").id, theirs.id);
 
     // Deleting the message a reply answers leaves the reply saying so.
     let frost = find("Frost on the cushion moss");
-    assert_eq!(edited.reply_to.as_ref().map(|quoted| (quoted.id.as_str(), quoted.deleted)), Some((frost.id.as_str(), false)));
-    assert_eq!(chatd.ask(Request::Delete { conversation: room.clone(), message_id: frost.id.clone() }), Response::Ok);
+    assert_eq!(
+        edited
+            .reply_to
+            .as_ref()
+            .map(|quoted| (quoted.id.as_str(), quoted.deleted)),
+        Some((frost.id.as_str(), false))
+    );
+    assert_eq!(
+        chatd.ask(Request::Delete {
+            conversation: room.clone(),
+            message_id: frost.id.clone()
+        }),
+        Response::Ok
+    );
     let messages = chatd.newest(&room);
-    assert!(messages.iter().all(|message| message.id != frost.id), "the deleted message is still listed");
-    let orphaned = find("Same spot, and the camera was level.").reply_to.expect("still a reply");
+    assert!(
+        messages.iter().all(|message| message.id != frost.id),
+        "the deleted message is still listed"
+    );
+    let orphaned = find("Same spot, and the camera was level.")
+        .reply_to
+        .expect("still a reply");
     assert_eq!((orphaned.deleted, orphaned.snippet.as_str()), (true, ""));
     assert!(orphaned.person.is_some(), "whose it was is still known");
 
@@ -985,20 +1630,55 @@ fn what_the_user_does_to_a_message_is_shown_and_settled_by_the_network() {
     let root = find("Trail camera build log");
     let thread = root.thread.clone().expect("a thread");
     assert_eq!((thread.participants.len(), thread.unread), (3, 2));
-    assert_eq!(chatd.ask(Request::Delete { conversation: room.clone(), message_id: root.id.clone() }), Response::Ok);
-    let tomb = chatd.newest(&room).into_iter().find(|message| message.id == root.id).expect("the tombstone");
-    assert_eq!((tomb.deleted, tomb.text.as_str(), tomb.thread.as_ref()), (true, "", Some(&thread)));
+    assert_eq!(
+        chatd.ask(Request::Delete {
+            conversation: room.clone(),
+            message_id: root.id.clone()
+        }),
+        Response::Ok
+    );
+    let tomb = chatd
+        .newest(&room)
+        .into_iter()
+        .find(|message| message.id == root.id)
+        .expect("the tombstone");
+    assert_eq!(
+        (tomb.deleted, tomb.text.as_str(), tomb.thread.as_ref()),
+        (true, "", Some(&thread))
+    );
     let hanging = chatd.row(&demo(&thread.id));
-    assert_eq!((hanging.parent.as_deref(), hanging.root.as_deref()), (Some(SHOWCASE), Some(root.id.as_str())));
+    assert_eq!(
+        (hanging.parent.as_deref(), hanging.root.as_deref()),
+        (Some(SHOWCASE), Some(root.id.as_str()))
+    );
     assert_eq!(chatd.newest(&demo(&thread.id)).len(), 6);
 
     // A message sent is accepted by the network and takes the network's id.
-    let sent = chatd.ask(Request::Send { conversation: room.clone(), client_id: "9001".into(), text: "Kettle is on.".into(), reply_to: None, with: Default::default() });
-    assert!(matches!(sent, Response::Sent { ref message } if message.state == SendState::Pending), "{sent:?}");
-    let request = Request::Messages { conversation: room.clone(), page: Page::Newest, limit: 200 };
+    let sent = chatd.ask(Request::Send {
+        conversation: room.clone(),
+        client_id: "9001".into(),
+        text: "Kettle is on.".into(),
+        reply_to: None,
+        with: Default::default(),
+    });
+    assert!(
+        matches!(sent, Response::Sent { ref message } if message.state == SendState::Pending),
+        "{sent:?}"
+    );
+    let request = Request::Messages {
+        conversation: room.clone(),
+        page: Page::Newest,
+        limit: 200,
+    };
     chatd.until("the send to be accepted", request, |answer| {
-        let Response::Messages { messages, .. } = answer else { return false };
-        messages.iter().any(|message| message.text == "Kettle is on." && message.state == SendState::Sent && message.id != "9001")
+        let Response::Messages { messages, .. } = answer else {
+            return false;
+        };
+        messages.iter().any(|message| {
+            message.text == "Kettle is on."
+                && message.state == SendState::Sent
+                && message.id != "9001"
+        })
     });
 }
 
@@ -1009,48 +1689,126 @@ fn people_are_answered_looked_up_and_searched_for_only_when_the_typing_pauses() 
 
     // A friend request is answered by the user's own request and by nothing else.
     let requests = |relation| {
-        let request = Request::People { network: Some(Network::Discord), relation: Some(relation), query: None, offset: 0, limit: 50 };
-        let Response::People { people, .. } = chatd.ask(request) else { panic!("not people") };
+        let request = Request::People {
+            network: Some(Network::Discord),
+            relation: Some(relation),
+            query: None,
+            offset: 0,
+            limit: 50,
+        };
+        let Response::People { people, .. } = chatd.ask(request) else {
+            panic!("not people")
+        };
         people
     };
-    let dorian = requests(Relation::Incoming).pop().expect("a request waiting");
-    assert_eq!(dorian.link, format!("discord://-/users/{}", dorian.key.id), "the network's own link to a person");
-    assert_eq!(chatd.ask(Request::Relate { person: dorian.key.clone(), action: RelateAction::Accept }), Response::Ok);
+    let dorian = requests(Relation::Incoming)
+        .pop()
+        .expect("a request waiting");
+    assert_eq!(
+        dorian.link,
+        format!("discord://-/users/{}", dorian.key.id),
+        "the network's own link to a person"
+    );
+    assert_eq!(
+        chatd.ask(Request::Relate {
+            person: dorian.key.clone(),
+            action: RelateAction::Accept
+        }),
+        Response::Ok
+    );
     assert!(requests(Relation::Incoming).is_empty());
-    assert!(requests(Relation::Friend).iter().any(|friend| friend.key == dorian.key));
-    let sent = requests(Relation::Outgoing).pop().expect("a request we sent");
-    assert_eq!(chatd.ask(Request::Relate { person: sent.key, action: RelateAction::Cancel }), Response::Ok);
+    assert!(requests(Relation::Friend)
+        .iter()
+        .any(|friend| friend.key == dorian.key));
+    let sent = requests(Relation::Outgoing)
+        .pop()
+        .expect("a request we sent");
+    assert_eq!(
+        chatd.ask(Request::Relate {
+            person: sent.key,
+            action: RelateAction::Cancel
+        }),
+        Response::Ok
+    );
     assert!(requests(Relation::Outgoing).is_empty());
 
     // Our own presence and status, on one account.
     let own = |chatd: &Daemon| {
-        let Response::Status { accounts, .. } = chatd.ask(Request::Status) else { panic!("not a status") };
-        let ours = accounts.into_iter().find(|status| status.key == account).unwrap();
+        let Response::Status { accounts, .. } = chatd.ask(Request::Status) else {
+            panic!("not a status")
+        };
+        let ours = accounts
+            .into_iter()
+            .find(|status| status.key == account)
+            .unwrap();
         (ours.presence, ours.status, ours.avatar.is_some())
     };
     assert_eq!(own(&chatd), (Presence::Online, String::new(), true));
-    let set = Request::SetPresence { account: account.clone(), presence: Presence::Dnd, status: Some("heads down".into()) };
+    let set = Request::SetPresence {
+        account: account.clone(),
+        presence: Presence::Dnd,
+        status: Some("heads down".into()),
+    };
     assert_eq!(chatd.ask(set), Response::Ok);
     assert_eq!(own(&chatd), (Presence::Dnd, "heads down".to_owned(), true));
     // No text given leaves the text as it is.
-    assert_eq!(chatd.ask(Request::SetPresence { account: account.clone(), presence: Presence::Idle, status: None }), Response::Ok);
+    assert_eq!(
+        chatd.ask(Request::SetPresence {
+            account: account.clone(),
+            presence: Presence::Idle,
+            status: None
+        }),
+        Response::Ok
+    );
     assert_eq!(own(&chatd), (Presence::Idle, "heads down".to_owned(), true));
 
     let ines = demo("220000000000000001");
-    let Response::Profile { profile } = chatd.ask(Request::Profile { person: ines.clone(), space: None }) else {
+    let Response::Profile { profile } = chatd.ask(Request::Profile {
+        person: ines.clone(),
+        space: None,
+    }) else {
         panic!("not a profile");
     };
-    assert_eq!((profile.person.key, profile.person.name.as_str()), (ines, "Ines Marchetti"));
+    assert_eq!(
+        (profile.person.key, profile.person.name.as_str()),
+        (ines, "Ines Marchetti")
+    );
     // Discord says when we became friends and has no time zone for anyone.
-    assert!(profile.friends_since.is_some() && profile.time_zone.is_empty() && profile.utc_offset.is_none());
-    assert!((1..=protocol::MUTUAL_SPACES).contains(&profile.mutual_spaces.len()), "{:?}", profile.mutual_spaces);
-    let stranger = chatd.ask(Request::Profile { person: demo("1"), space: None });
-    assert!(matches!(stranger, Response::Error { code: ErrorCode::NotFound, .. }), "{stranger:?}");
+    assert!(
+        profile.friends_since.is_some()
+            && profile.time_zone.is_empty()
+            && profile.utc_offset.is_none()
+    );
+    assert!(
+        (1..=protocol::MUTUAL_SPACES).contains(&profile.mutual_spaces.len()),
+        "{:?}",
+        profile.mutual_spaces
+    );
+    let stranger = chatd.ask(Request::Profile {
+        person: demo("1"),
+        space: None,
+    });
+    assert!(
+        matches!(
+            stranger,
+            Response::Error {
+                code: ErrorCode::NotFound,
+                ..
+            }
+        ),
+        "{stranger:?}"
+    );
 
     // Searching: each keystroke is a request, and the network hears one query once the typing
     // has paused. The demo's network says `Searched` for every query it is given.
     let search = |query: &str| {
-        let request = Request::People { network: Some(Network::Discord), relation: None, query: Some(query.into()), offset: 0, limit: 20 };
+        let request = Request::People {
+            network: Some(Network::Discord),
+            relation: None,
+            query: Some(query.into()),
+            offset: 0,
+            limit: 20,
+        };
         assert!(matches!(chatd.ask(request), Response::People { .. }));
     };
     let searched = |changes: Vec<Change>| -> Vec<String> {
@@ -1062,7 +1820,11 @@ fn people_are_answered_looked_up_and_searched_for_only_when_the_typing_pauses() 
     };
     let seq = chatd.seq();
     search("y");
-    assert_eq!(searched(chatd.changes(seq, Duration::from_millis(900))), Vec::<String>::new(), "one letter reached the network");
+    assert_eq!(
+        searched(chatd.changes(seq, Duration::from_millis(900))),
+        Vec::<String>::new(),
+        "one letter reached the network"
+    );
 
     let seq = chatd.seq();
     for query in ["yu", "yus", "yusu", "yusuf"] {
@@ -1074,9 +1836,20 @@ fn people_are_answered_looked_up_and_searched_for_only_when_the_typing_pauses() 
     // Reading the list again with the same query, as a shell does after every result, is not
     // a new search. The answer names the account, so the shell can drop "Asking…".
     let seq = chatd.seq();
-    let request = Request::People { network: Some(Network::Discord), relation: None, query: Some("yusuf".into()), offset: 0, limit: 20 };
-    let Response::People { settled, .. } = chatd.ask(request) else { panic!("not people") };
-    assert_eq!(searched(chatd.changes(seq, Duration::from_millis(900))), Vec::<String>::new());
+    let request = Request::People {
+        network: Some(Network::Discord),
+        relation: None,
+        query: Some("yusuf".into()),
+        offset: 0,
+        limit: 20,
+    };
+    let Response::People { settled, .. } = chatd.ask(request) else {
+        panic!("not people")
+    };
+    assert_eq!(
+        searched(chatd.changes(seq, Duration::from_millis(900))),
+        Vec::<String>::new()
+    );
     assert_eq!(settled, vec![account.clone()]);
 }
 
@@ -1085,16 +1858,33 @@ fn a_voice_channel_says_who_is_in_it_and_a_call_that_fails_takes_us_out_of_it() 
     let chatd = Daemon::demo(&[]);
     let campfire = demo(CAMPFIRE);
     let names = |row: &Conversation| -> Vec<String> {
-        row.occupants.iter().flat_map(|occupants| &occupants.people).map(|who| who.name.clone()).collect()
+        row.occupants
+            .iter()
+            .flat_map(|occupants| &occupants.people)
+            .map(|who| who.name.clone())
+            .collect()
     };
 
     // The tree's rows carry who is in each voice channel, bounded, with the true total.
-    let tree = chatd.ask(Request::Tree { space: demo(MOSS), offset: 0, limit: 500, peek: true });
-    let Response::Tree { conversations, .. } = tree else { panic!("not a tree: {tree:?}") };
+    let tree = chatd.ask(Request::Tree {
+        space: demo(MOSS),
+        offset: 0,
+        limit: 500,
+        peek: true,
+    });
+    let Response::Tree { conversations, .. } = tree else {
+        panic!("not a tree: {tree:?}")
+    };
     let voice = |title: &str| conversations.iter().find(|row| row.title == title).unwrap();
-    assert_eq!(names(voice("Campfire")), ["Ines Marchetti", "Tomasz Brandt", "Wren Halloran"]);
+    assert_eq!(
+        names(voice("Campfire")),
+        ["Ines Marchetti", "Tomasz Brandt", "Wren Halloran"]
+    );
     let seats = &voice("Campfire").occupants.as_ref().unwrap().people;
-    assert_eq!((seats[1].muted, seats[2].streaming, seats[0].muted), (true, true, false));
+    assert_eq!(
+        (seats[1].muted, seats[2].streaming, seats[0].muted),
+        (true, true, false)
+    );
     let full = voice("Quiet room").occupants.as_ref().unwrap();
     assert_eq!((full.people.len(), full.total), (OCCUPANTS_LIMIT, 31));
     assert!(voice("general").occupants.is_none());
@@ -1102,26 +1892,55 @@ fn a_voice_channel_says_who_is_in_it_and_a_call_that_fails_takes_us_out_of_it() 
     // Joining puts us in it on the network. The shell hears of that row alone: the tree is
     // not announced, so it is not read again.
     let seq = chatd.seq();
-    let started = chatd.ask(Request::CallStart { conversation: campfire.clone() });
-    assert!(matches!(started, Response::Status { media: Media::Running, .. }), "{started:?}");
+    let started = chatd.ask(Request::CallStart {
+        conversation: campfire.clone(),
+    });
+    assert!(
+        matches!(
+            started,
+            Response::Status {
+                media: Media::Running,
+                ..
+            }
+        ),
+        "{started:?}"
+    );
     let told = chatd.changes(seq, Duration::from_millis(600));
     assert!(told.iter().any(|change| matches!(change,
         Change::Occupants { conversation, occupants } if *conversation == campfire && occupants.total == 4)), "{told:?}");
-    assert!(!told.iter().any(|change| matches!(change, Change::Tree { .. })), "{told:?}");
-    assert_eq!(names(&chatd.row(&campfire)).last().map(String::as_str), Some("Robin Vale"));
+    assert!(
+        !told
+            .iter()
+            .any(|change| matches!(change, Change::Tree { .. })),
+        "{told:?}"
+    );
+    assert_eq!(
+        names(&chatd.row(&campfire)).last().map(String::as_str),
+        Some("Robin Vale")
+    );
 
     // mediad dies. The call is a failure in words, and the network no longer shows us there.
     let pid = chatd.mediad_pids()[0];
     assert!(kill_pid(pid));
-    chatd.until("the failure", Request::Status, |status| failed_with(status, CallFailure::Engine));
-    let request = Request::Conversation { conversation: campfire.clone() };
+    chatd.until("the failure", Request::Status, |status| {
+        failed_with(status, CallFailure::Engine)
+    });
+    let request = Request::Conversation {
+        conversation: campfire.clone(),
+    };
     let left = |answer: &Response| matches!(answer, Response::Conversation { conversation } if names(conversation).len() == 3);
-    chatd.until("leaving the channel after mediad died", request.clone(), left);
+    chatd.until(
+        "leaving the channel after mediad died",
+        request.clone(),
+        left,
+    );
 
     // Dismissed, then tried again; this time nothing ever answers. The deadline is the
     // failure, and again we are taken out of the channel.
     chatd.ask(Request::CallEnd);
-    chatd.ask(Request::CallStart { conversation: campfire.clone() });
+    chatd.ask(Request::CallStart {
+        conversation: campfire.clone(),
+    });
     assert_eq!(names(&chatd.row(&campfire)).len(), 4);
     let deadline = Instant::now() + Duration::from_secs(13);
     while !failed_with(&chatd.ask(Request::Status), CallFailure::Lost) {
@@ -1138,8 +1957,15 @@ fn a_picture_is_fetched_again_larger_when_it_is_drawn_larger_and_never_smaller()
     let account = demo("").account();
     let emoji = "emoji-mossparrot".to_owned();
     let fetch = |size| {
-        let request = Request::Fetch { account: account.clone(), ids: vec![emoji.clone()], size, retry: false };
-        let Response::Media { mut files } = chatd.ask(request) else { panic!("not media") };
+        let request = Request::Fetch {
+            account: account.clone(),
+            ids: vec![emoji.clone()],
+            size,
+            retry: false,
+        };
+        let Response::Media { mut files } = chatd.ask(request) else {
+            panic!("not media")
+        };
         files.pop().expect("the emoji is registered")
     };
     let landed = |since: u64| -> u32 {
@@ -1153,13 +1979,23 @@ fn a_picture_is_fetched_again_larger_when_it_is_drawn_larger_and_never_smaller()
 
     // As registered: 48 pixels, already on disk.
     let small = fetch(None);
-    assert_eq!((small.width, png_width(small.path.as_deref().unwrap())), (48, 48));
-    assert!(fetch(Some(40)).path.is_some(), "what is held is large enough");
+    assert_eq!(
+        (small.width, png_width(small.path.as_deref().unwrap())),
+        (48, 48)
+    );
+    assert!(
+        fetch(Some(40)).path.is_some(),
+        "what is held is large enough"
+    );
 
     // Drawn at 40 points on a 2x screen: the 96 pixel size the network also serves.
     let seq = chatd.seq();
     let asked = fetch(Some(80));
-    assert_eq!((asked.path, asked.width), (None, 48), "the row keeps its layout size while the larger one is fetched");
+    assert_eq!(
+        (asked.path, asked.width),
+        (None, 48),
+        "the row keeps its layout size while the larger one is fetched"
+    );
     assert_eq!(landed(seq), 96);
     // Asked small again, it stays large: nothing is fetched twice to save pixels.
     assert_eq!(png_width(fetch(Some(48)).path.as_deref().unwrap()), 96);
@@ -1167,7 +2003,11 @@ fn a_picture_is_fetched_again_larger_when_it_is_drawn_larger_and_never_smaller()
     let seq = chatd.seq();
     assert_eq!(fetch(Some(2_000)).path, None);
     assert_eq!(landed(seq), 144);
-    assert_eq!(png_width(fetch(Some(4_000)).path.as_deref().unwrap()), 144, "nothing larger to ask for");
+    assert_eq!(
+        png_width(fetch(Some(4_000)).path.as_deref().unwrap()),
+        144,
+        "nothing larger to ask for"
+    );
 }
 
 #[test]
@@ -1176,51 +2016,129 @@ fn signing_out_waits_for_the_network_to_end_the_session_but_not_for_long() {
         let chatd = Daemon::demo(&[("TINYCLIENT_DEMO_SIGN_OUT_MS", network_takes)]);
         let account = harbor("").account();
         let began = Instant::now();
-        let Response::Status { accounts, .. } = chatd.ask(Request::SignOut { account: account.clone() }) else {
+        let Response::Status { accounts, .. } = chatd.ask(Request::SignOut {
+            account: account.clone(),
+        }) else {
             panic!("not a status");
         };
-        assert!(accounts.iter().all(|status| status.key != account), "still signed in");
+        assert!(
+            accounts.iter().all(|status| status.key != account),
+            "still signed in"
+        );
         // And everything stored for it is gone.
-        let gone = chatd.ask(Request::Tree { space: harbor("T04HARBOR1"), offset: 0, limit: 10, peek: true });
-        assert!(matches!(gone, Response::Error { code: ErrorCode::NotFound, .. }), "{gone:?}");
+        let gone = chatd.ask(Request::Tree {
+            space: harbor("T04HARBOR1"),
+            offset: 0,
+            limit: 10,
+            peek: true,
+        });
+        assert!(
+            matches!(
+                gone,
+                Response::Error {
+                    code: ErrorCode::NotFound,
+                    ..
+                }
+            ),
+            "{gone:?}"
+        );
         began.elapsed()
     };
     let waited = signed_out("900");
-    assert!(waited >= Duration::from_millis(900) && waited < Duration::from_secs(4), "{waited:?}");
+    assert!(
+        waited >= Duration::from_millis(900) && waited < Duration::from_secs(4),
+        "{waited:?}"
+    );
     // A network that never answers holds sign-out for five seconds and no more.
     let waited = signed_out("60000");
-    assert!(waited >= Duration::from_secs(5) && waited < Duration::from_secs(8), "{waited:?}");
+    assert!(
+        waited >= Duration::from_secs(5) && waited < Duration::from_secs(8),
+        "{waited:?}"
+    );
 }
 
 #[test]
 fn a_workspace_keeps_its_direct_conversations_in_its_own_tree() {
     let chatd = Daemon::demo(&[]);
-    let tree = chatd.ask(Request::Tree { space: harbor("T04HARBOR1"), offset: 0, limit: 500, peek: true });
-    let Response::Tree { groups, conversations, .. } = tree else { panic!("not a tree: {tree:?}") };
-    let directs = groups.iter().find(|group| group.kind == GroupKind::Directs).expect("a group of direct conversations");
-    let under: Vec<&Conversation> = conversations.iter().filter(|row| row.group.as_deref() == Some(directs.id.as_str())).collect();
+    let tree = chatd.ask(Request::Tree {
+        space: harbor("T04HARBOR1"),
+        offset: 0,
+        limit: 500,
+        peek: true,
+    });
+    let Response::Tree {
+        groups,
+        conversations,
+        ..
+    } = tree
+    else {
+        panic!("not a tree: {tree:?}")
+    };
+    let directs = groups
+        .iter()
+        .find(|group| group.kind == GroupKind::Directs)
+        .expect("a group of direct conversations");
+    let under: Vec<&Conversation> = conversations
+        .iter()
+        .filter(|row| row.group.as_deref() == Some(directs.id.as_str()))
+        .collect();
     assert_eq!(under.len() as u32, directs.count);
-    assert!(under.iter().all(|row| row.kind.is_direct() && row.space_title == "Harbor Labs"), "{under:?}");
+    assert!(
+        under
+            .iter()
+            .all(|row| row.kind.is_direct() && row.space_title == "Harbor Labs"),
+        "{under:?}"
+    );
     assert!(under.iter().any(|row| row.kind == ConversationKind::Group));
     // They are still in the Inbox, where every network's direct conversations are.
-    let request = Request::Inbox { network: Some(Network::Slack), filter: InboxFilter::Directs, offset: 0, limit: 50 };
-    let Response::Conversations { conversations, .. } = chatd.ask(request) else { panic!("not a list") };
+    let request = Request::Inbox {
+        network: Some(Network::Slack),
+        filter: InboxFilter::Directs,
+        offset: 0,
+        limit: 50,
+    };
+    let Response::Conversations { conversations, .. } = chatd.ask(request) else {
+        panic!("not a list")
+    };
     for row in under {
-        assert!(conversations.iter().any(|listed| listed.key == row.key), "{} is not in the Inbox", row.title);
+        assert!(
+            conversations.iter().any(|listed| listed.key == row.key),
+            "{} is not in the Inbox",
+            row.title
+        );
     }
     // A Slack call is the official app's to carry: asking for it here is refused, and the
     // hand-off link is what the button gets.
     let general = harbor("C04CHANNEL00");
-    let refused = chatd.ask(Request::CallStart { conversation: general.clone() });
-    assert!(matches!(refused, Response::Error { code: ErrorCode::Unsupported, .. }), "{refused:?}");
-    assert!(matches!(chatd.ask(Request::Handoff { conversation: general }), Response::Link { ref url } if url.contains("huddle")));
+    let refused = chatd.ask(Request::CallStart {
+        conversation: general.clone(),
+    });
+    assert!(
+        matches!(
+            refused,
+            Response::Error {
+                code: ErrorCode::Unsupported,
+                ..
+            }
+        ),
+        "{refused:?}"
+    );
+    assert!(
+        matches!(chatd.ask(Request::Handoff { conversation: general }), Response::Link { ref url } if url.contains("huddle"))
+    );
 }
 
 #[test]
 fn what_was_shared_in_a_conversation_is_listed_by_kind_newest_first() {
     let chatd = Daemon::demo(&[]);
     let shared = |kind, before: Option<String>, limit| {
-        let request = Request::Shared { conversation: demo(SHOWCASE), kind, before, limit, search: false };
+        let request = Request::Shared {
+            conversation: demo(SHOWCASE),
+            kind,
+            before,
+            limit,
+            search: false,
+        };
         match chatd.ask(request) {
             Response::Shared { items, more, .. } => (items, more),
             other => panic!("not shared: {other:?}"),
@@ -1229,30 +2147,99 @@ fn what_was_shared_in_a_conversation_is_listed_by_kind_newest_first() {
     let (media, more) = shared(protocol::SharedKind::Media, None, 5);
     assert!(more, "the showcase holds more than five pictures");
     assert_eq!(media.len(), 5);
-    assert!(media.windows(2).all(|pair| pair[0].sent >= pair[1].sent), "newest first");
-    let kinds: Vec<MediaKind> = media.iter().map(|item| item.attachment.as_ref().unwrap().file.kind).collect();
-    assert!(kinds.iter().all(|kind| matches!(kind, MediaKind::Image | MediaKind::Video | MediaKind::Gif)), "{kinds:?}");
-    assert!(media.iter().all(|item| !item.attachment.as_ref().unwrap().sticker), "a sticker is not shared media");
+    assert!(
+        media.windows(2).all(|pair| pair[0].sent >= pair[1].sent),
+        "newest first"
+    );
+    let kinds: Vec<MediaKind> = media
+        .iter()
+        .map(|item| item.attachment.as_ref().unwrap().file.kind)
+        .collect();
+    assert!(
+        kinds
+            .iter()
+            .all(|kind| matches!(kind, MediaKind::Image | MediaKind::Video | MediaKind::Gif)),
+        "{kinds:?}"
+    );
+    assert!(
+        media
+            .iter()
+            .all(|item| !item.attachment.as_ref().unwrap().sticker),
+        "a sticker is not shared media"
+    );
     // A thumbnail already on disk comes with its path, so the pane draws without asking.
-    assert!(media.iter().any(|item| item.attachment.as_ref().unwrap().thumb.as_ref().is_some_and(|thumb| thumb.path.is_some())));
+    assert!(media.iter().any(|item| item
+        .attachment
+        .as_ref()
+        .unwrap()
+        .thumb
+        .as_ref()
+        .is_some_and(|thumb| thumb.path.is_some())));
     // The page below continues under the last message listed.
-    let (older, _) = shared(protocol::SharedKind::Media, media.last().map(|item| item.message_id.clone()), 5);
-    assert!(older.iter().all(|item| item.sent <= media[4].sent && item.message_id != media[4].message_id));
+    let (older, _) = shared(
+        protocol::SharedKind::Media,
+        media.last().map(|item| item.message_id.clone()),
+        5,
+    );
+    assert!(older
+        .iter()
+        .all(|item| item.sent <= media[4].sent && item.message_id != media[4].message_id));
 
     let (files, _) = shared(protocol::SharedKind::Files, None, 50);
-    let mut names: Vec<&str> = files.iter().map(|item| item.attachment.as_ref().unwrap().name.as_str()).collect();
+    let mut names: Vec<&str> = files
+        .iter()
+        .map(|item| item.attachment.as_ref().unwrap().name.as_str())
+        .collect();
     names.sort();
-    assert_eq!(names, ["Trail camera wiring.pdf", "camera-logs.zip", "dawn-chorus-lynx-hollow.m4a", "voice-message.ogg"]);
+    assert_eq!(
+        names,
+        [
+            "Trail camera wiring.pdf",
+            "camera-logs.zip",
+            "dawn-chorus-lynx-hollow.m4a",
+            "voice-message.ogg"
+        ]
+    );
     let (links, _) = shared(protocol::SharedKind::Links, None, 50);
-    let lepraria = links.iter().find(|item| item.url == "https://example.org/wiki/Lepraria").expect("the previewed link");
-    assert_eq!((lepraria.title.as_str(), lepraria.sender.as_str()), ("Lepraria", "Wren Halloran"));
-    assert_eq!(links.iter().filter(|item| item.url == lepraria.url).count(), 1, "a link and its preview are one link");
-    assert!(links.iter().any(|item| item.url == "https://example.org/foray/sign-up" && item.title.is_empty()));
+    let lepraria = links
+        .iter()
+        .find(|item| item.url == "https://example.org/wiki/Lepraria")
+        .expect("the previewed link");
+    assert_eq!(
+        (lepraria.title.as_str(), lepraria.sender.as_str()),
+        ("Lepraria", "Wren Halloran")
+    );
+    assert_eq!(
+        links.iter().filter(|item| item.url == lepraria.url).count(),
+        1,
+        "a link and its preview are one link"
+    );
+    assert!(links
+        .iter()
+        .any(|item| item.url == "https://example.org/foray/sign-up" && item.title.is_empty()));
 
-    let nowhere = chatd.ask(Request::Shared { conversation: demo("1"), kind: protocol::SharedKind::Media, before: None, limit: 5, search: false });
-    assert!(matches!(nowhere, Response::Error { code: ErrorCode::NotFound, .. }), "{nowhere:?}");
+    let nowhere = chatd.ask(Request::Shared {
+        conversation: demo("1"),
+        kind: protocol::SharedKind::Media,
+        before: None,
+        limit: 5,
+        search: false,
+    });
+    assert!(
+        matches!(
+            nowhere,
+            Response::Error {
+                code: ErrorCode::NotFound,
+                ..
+            }
+        ),
+        "{nowhere:?}"
+    );
     // A profile says when they joined and what the network calls its own details.
-    let Response::Profile { profile } = chatd.ask(Request::Profile { person: demo("220000000000000001"), space: None }) else {
+    let Response::Profile { profile } = chatd.ask(Request::Profile {
+        person: demo("220000000000000001"),
+        space: None,
+    }) else {
         panic!("not a profile");
     };
     assert!(profile.since.is_some() && profile.accent.is_some());
@@ -1264,24 +2251,70 @@ fn what_was_shared_in_a_conversation_is_listed_by_kind_newest_first() {
 fn settings_are_kept_refused_when_unknown_and_acted_on_at_once() {
     use protocol::settings::{CUE_VOLUME, KEEP_DAYS, VERSION};
     let chatd = Daemon::start(|store| {
-        incoming(store, "#platform", Network::Slack, "C01", "a", "deploy is green");
-        let old = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64 - 20 * 86_400;
-        store.ingest(&key(Network::Slack, "C01"), &Message::plain("old", "mara", "three weeks ago", old, false), true).unwrap();
+        incoming(
+            store,
+            "#platform",
+            Network::Slack,
+            "C01",
+            "a",
+            "deploy is green",
+        );
+        let old = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            - 20 * 86_400;
+        store
+            .ingest(
+                &key(Network::Slack, "C01"),
+                &Message::plain("old", "mara", "three weeks ago", old, false),
+                true,
+            )
+            .unwrap();
     });
     let Response::Settings { values } = chatd.ask(Request::Settings) else {
         panic!("no settings");
     };
-    assert_eq!(values.len(), 1, "only the version row: every setting is at its default");
+    assert_eq!(
+        values.len(),
+        1,
+        "only the version row: every setting is at its default"
+    );
     assert_eq!(values[0].key, VERSION);
 
-    let set = |key: &str, value: Option<&str>| Request::Set { scope: String::new(), key: key.into(), value: value.map(str::to_owned) };
+    let set = |key: &str, value: Option<&str>| Request::Set {
+        scope: String::new(),
+        key: key.into(),
+        value: value.map(str::to_owned),
+    };
     let refused = chatd.ask(set("proxy", Some("socks5://127.0.0.1")));
-    assert!(matches!(refused, Response::Error { code: ErrorCode::Refused, .. }), "{refused:?}");
+    assert!(
+        matches!(
+            refused,
+            Response::Error {
+                code: ErrorCode::Refused,
+                ..
+            }
+        ),
+        "{refused:?}"
+    );
     let refused = chatd.ask(set(KEEP_DAYS, Some("12")));
-    assert!(matches!(refused, Response::Error { code: ErrorCode::Refused, .. }), "{refused:?}");
+    assert!(
+        matches!(
+            refused,
+            Response::Error {
+                code: ErrorCode::Refused,
+                ..
+            }
+        ),
+        "{refused:?}"
+    );
 
     // Counted before it is asked, then deleted within moments of the change.
-    let Response::Prunable { messages: prunable, .. } = chatd.ask(Request::Prunable { days: 7 }) else {
+    let Response::Prunable {
+        messages: prunable, ..
+    } = chatd.ask(Request::Prunable { days: 7 })
+    else {
         panic!("no count");
     };
     assert_eq!(prunable, 1);
@@ -1293,15 +2326,19 @@ fn settings_are_kept_refused_when_unknown_and_acted_on_at_once() {
         panic!("wait did not answer with changes");
     };
     assert!(reset || changes.contains(&Change::Settings), "{changes:?}");
-    chatd.until("the old message to be pruned", messages(Network::Slack, "C01", 10), |answer| {
-        matches!(answer, Response::Messages { messages, .. } if messages.len() == 1)
-    });
+    chatd.until(
+        "the old message to be pruned",
+        messages(Network::Slack, "C01", 10),
+        |answer| matches!(answer, Response::Messages { messages, .. } if messages.len() == 1),
+    );
 
     assert_eq!(chatd.ask(set(CUE_VOLUME, Some("80"))), Response::Ok);
     let Response::Settings { values } = chatd.ask(Request::Settings) else {
         panic!("no settings");
     };
-    assert!(values.iter().any(|s| s.key == CUE_VOLUME && s.value == "80"));
+    assert!(values
+        .iter()
+        .any(|s| s.key == CUE_VOLUME && s.value == "80"));
     assert_eq!(chatd.ask(Request::ResetSettings), Response::Ok);
     let Response::Settings { values } = chatd.ask(Request::Settings) else {
         panic!("no settings");
@@ -1309,7 +2346,10 @@ fn settings_are_kept_refused_when_unknown_and_acted_on_at_once() {
     assert_eq!(values.len(), 1, "reset leaves only the version: {values:?}");
 
     // Storage counts the database; Clear empties it of messages and keeps the conversation.
-    let Response::Storage { messages: bytes, .. } = chatd.ask(Request::Storage) else {
+    let Response::Storage {
+        messages: bytes, ..
+    } = chatd.ask(Request::Storage)
+    else {
         panic!("no storage");
     };
     assert!(bytes > 0);
@@ -1326,7 +2366,16 @@ fn reading_while_settings_change_never_stalls_chatd() {
     use protocol::settings::KEEP_RUNNING;
     // Read markers and settings writes take the store and the settings both. Taken in two
     // orders, a MarkRead and a Set at the same moment waited on each other for ever.
-    let chatd = Daemon::start(|store| incoming(store, "#platform", Network::Slack, "C01", "a", "deploy is green"));
+    let chatd = Daemon::start(|store| {
+        incoming(
+            store,
+            "#platform",
+            Network::Slack,
+            "C01",
+            "a",
+            "deploy is green",
+        )
+    });
     let (done, finished) = std::sync::mpsc::channel();
     let ask = |socket: PathBuf, request: Request| -> Response {
         let mut stream = ChatStream::connect(&socket).unwrap();
@@ -1339,10 +2388,17 @@ fn reading_while_settings_change_never_stalls_chatd() {
             for n in 0..300u32 {
                 let request = if worker % 2 == 0 {
                     // Every id is a new read marker, so each one is a write.
-                    Request::MarkRead { conversation: key(Network::Slack, "C01"), message_id: format!("{worker}-{n}") }
+                    Request::MarkRead {
+                        conversation: key(Network::Slack, "C01"),
+                        message_id: format!("{worker}-{n}"),
+                    }
                 } else {
                     let value = (n % 2 == 0).then(|| "off".to_owned());
-                    Request::Set { scope: String::new(), key: KEEP_RUNNING.into(), value }
+                    Request::Set {
+                        scope: String::new(),
+                        key: KEEP_RUNNING.into(),
+                        value,
+                    }
                 };
                 assert_eq!(ask(socket.clone(), request), Response::Ok);
             }
@@ -1350,9 +2406,14 @@ fn reading_while_settings_change_never_stalls_chatd() {
         });
     }
     for _ in 0..8 {
-        finished.recv_timeout(Duration::from_secs(30)).expect("chatd stalled with a read and a setting in flight");
+        finished
+            .recv_timeout(Duration::from_secs(30))
+            .expect("chatd stalled with a read and a setting in flight");
     }
-    assert!(matches!(chatd.ask(Request::Settings), Response::Settings { .. }));
+    assert!(matches!(
+        chatd.ask(Request::Settings),
+        Response::Settings { .. }
+    ));
 }
 
 #[test]

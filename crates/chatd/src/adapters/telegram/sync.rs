@@ -8,7 +8,10 @@ use super::wire::Fault;
 use super::{presence, Account, PAGE};
 use crate::store::{ConversationRow, Filing, PreviewLine};
 use grammers_tl_types as tl;
-use protocol::{CallSupport, Capabilities, Card, ConversationKind, EmojiScope, MediaFile, MediaKind, Message, Relation, ReplyTo, Span, Special, Style, Watching};
+use protocol::{
+    CallSupport, Capabilities, Card, ConversationKind, EmojiScope, MediaFile, MediaKind, Message,
+    Relation, ReplyTo, Span, Special, Style, Watching,
+};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
@@ -51,7 +54,11 @@ fn muted(account: &Account, who: Who, settings: &tl::enums::PeerNotifySettings) 
     }
 }
 
-pub(super) fn is_muted(account: &Account, who: Who, settings: &tl::enums::PeerNotifySettings) -> bool {
+pub(super) fn is_muted(
+    account: &Account,
+    who: Who,
+    settings: &tl::enums::PeerNotifySettings,
+) -> bool {
     muted(account, who, settings)
 }
 
@@ -133,7 +140,9 @@ pub(super) fn ensure_row(account: &Account, who: Who, topic: Option<i32>) -> boo
     }
     // A topic nobody has listed yet: the forum is asked once, and a topic it does not list (a
     // new one, heard of before its row) is recorded under a plain name until it does.
-    if !matches!(account.ctx.known(&who.text()), Ok(Some(_))) && account.ctx.conversation(&fresh(account)).is_err() {
+    if !matches!(account.ctx.known(&who.text()), Ok(Some(_)))
+        && account.ctx.conversation(&fresh(account)).is_err()
+    {
         return false;
     }
     let _ = topics(account, who);
@@ -166,14 +175,22 @@ pub(super) fn refresh_row(account: &Account, who: Who) {
 fn capabilities(premium: bool) -> Capabilities {
     Capabilities {
         // 2 GB, 4 GB with Premium: 4,000 parts of 512 KB, 8,000 with Premium.
-        max_file_bytes: if premium { 4_000 * 1024 * 1024 } else { 2_000 * 1024 * 1024 },
+        max_file_bytes: if premium {
+            4_000 * 1024 * 1024
+        } else {
+            2_000 * 1024 * 1024
+        },
         max_files: 10,
         caption_limit: if premium { 4_096 } else { 1_024 },
         spoiler: true,
         as_file: true,
         gifs: true,
         stickers: true,
-        custom_emoji: if premium { EmojiScope::All } else { EmojiScope::None },
+        custom_emoji: if premium {
+            EmojiScope::All
+        } else {
+            EmojiScope::None
+        },
         silent: true,
         schedule: true,
         suppress_embeds: true,
@@ -189,11 +206,17 @@ fn capabilities(premium: bool) -> Capabilities {
 /// default, the chats, the contacts.
 pub(super) fn sign_on(account: &Account) -> Result<(), Fault> {
     account.ask(&tl::functions::updates::GetState {})?;
-    let me = account.ask(&tl::functions::users::GetUsers { id: vec![tl::enums::InputUser::UserSelf] })?;
+    let me = account.ask(&tl::functions::users::GetUsers {
+        id: vec![tl::enums::InputUser::UserSelf],
+    })?;
     account.learn(&me, &[]);
     let (name, premium) = {
         let dir = account.dir();
-        (dir.name(Who::User(account.me)), dir.get(Who::User(account.me)).is_some_and(|known| known.premium))
+        (
+            dir.name(Who::User(account.me)),
+            dir.get(Who::User(account.me))
+                .is_some_and(|known| known.premium),
+        )
     };
     let _ = account.ctx.describe(&name, &Who::User(account.me).text());
     account.ctx.capabilities(capabilities(premium));
@@ -203,8 +226,11 @@ pub(super) fn sign_on(account: &Account) -> Result<(), Fault> {
         tl::enums::InputNotifyPeer::InputNotifyBroadcasts,
     ];
     for (index, peer) in kinds.into_iter().enumerate() {
-        let tl::enums::PeerNotifySettings::Settings(settings) = account.ask(&tl::functions::account::GetNotifySettings { peer })?;
-        account.live().muted[index] = settings.mute_until.is_some_and(|until| i64::from(until) > now());
+        let tl::enums::PeerNotifySettings::Settings(settings) =
+            account.ask(&tl::functions::account::GetNotifySettings { peer })?;
+        account.live().muted[index] = settings
+            .mute_until
+            .is_some_and(|until| i64::from(until) > now());
     }
     dialogs(account)?;
     // An earlier build kept every chat in one invented Space. The rows read just now have left
@@ -241,12 +267,25 @@ const CONTACTS_HASH: &str = "contacts:hash";
 /// Asked with the hash of the list last read: an unchanged list costs Telegram nothing, and
 /// what was stored of it stands.
 fn contacts(account: &Account) -> Result<(), Fault> {
-    let hash = account.ctx.note(CONTACTS_HASH).and_then(|hash| hash.parse::<i64>().ok()).unwrap_or(0);
-    let tl::enums::contacts::Contacts::Contacts(found) = account.ask(&tl::functions::contacts::GetContacts { hash })? else {
+    let hash = account
+        .ctx
+        .note(CONTACTS_HASH)
+        .and_then(|hash| hash.parse::<i64>().ok())
+        .unwrap_or(0);
+    let tl::enums::contacts::Contacts::Contacts(found) =
+        account.ask(&tl::functions::contacts::GetContacts { hash })?
+    else {
         return Ok(());
     };
-    let ids: Vec<i64> = found.contacts.iter().map(|tl::enums::Contact::Contact(contact)| contact.user_id).collect();
-    account.ctx.set_note(CONTACTS_HASH, &contacts_hash(found.saved_count, &ids).to_string());
+    let ids: Vec<i64> = found
+        .contacts
+        .iter()
+        .map(|tl::enums::Contact::Contact(contact)| contact.user_id)
+        .collect();
+    account.ctx.set_note(
+        CONTACTS_HASH,
+        &contacts_hash(found.saved_count, &ids).to_string(),
+    );
     account.learn(&found.users, &[]);
     let mut owned = Vec::with_capacity(found.users.len());
     for user in &found.users {
@@ -254,7 +293,9 @@ fn contacts(account: &Account) -> Result<(), Fault> {
             continue;
         };
         let id = Who::User(user.id).text();
-        account.ctx.presence(&id, presence(user.status.as_ref()), "", true);
+        account
+            .ctx
+            .presence(&id, presence(user.status.as_ref()), "", true);
         owned.push((id, Relation::Contact));
     }
     let _ = account.ctx.relations(&owned);
@@ -269,7 +310,11 @@ struct Page {
     more: bool,
 }
 
-fn page(account: &Account, folder: Option<i32>, offset: (i32, i32, tl::enums::InputPeer)) -> Result<Page, Fault> {
+fn page(
+    account: &Account,
+    folder: Option<i32>,
+    offset: (i32, i32, tl::enums::InputPeer),
+) -> Result<Page, Fault> {
     let request = tl::functions::messages::GetDialogs {
         exclude_pinned: false,
         folder_id: folder,
@@ -280,12 +325,22 @@ fn page(account: &Account, folder: Option<i32>, offset: (i32, i32, tl::enums::In
         hash: 0,
     };
     let (dialogs, messages, chats, users, more) = match account.ask(&request)? {
-        tl::enums::messages::Dialogs::Dialogs(all) => (all.dialogs, all.messages, all.chats, all.users, false),
+        tl::enums::messages::Dialogs::Dialogs(all) => {
+            (all.dialogs, all.messages, all.chats, all.users, false)
+        }
         tl::enums::messages::Dialogs::Slice(slice) => {
             let more = slice.dialogs.len() >= 100;
-            (slice.dialogs, slice.messages, slice.chats, slice.users, more)
+            (
+                slice.dialogs,
+                slice.messages,
+                slice.chats,
+                slice.users,
+                more,
+            )
         }
-        tl::enums::messages::Dialogs::NotModified(_) => (Vec::new(), Vec::new(), Vec::new(), Vec::new(), false),
+        tl::enums::messages::Dialogs::NotModified(_) => {
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), false)
+        }
     };
     account.learn(&users, &chats);
     let newest = messages
@@ -304,7 +359,11 @@ fn page(account: &Account, folder: Option<i32>, offset: (i32, i32, tl::enums::In
         // The archive's own row: its chats are read as a folder of their own.
         tl::enums::Dialog::Folder(_) => None,
     });
-    Ok(Page { dialogs: dialogs.collect(), newest, more })
+    Ok(Page {
+        dialogs: dialogs.collect(),
+        newest,
+        more,
+    })
 }
 
 /// Reads the chats at sign-on (and again when a default mute changed): the folders first, so
@@ -317,7 +376,10 @@ pub(super) fn dialogs(account: &Account) -> Result<(), Fault> {
         Err(fault) if fault.flood().is_some() || fault.signed_out() => return Err(fault),
         Err(_) => Vec::new(),
     };
-    account.live().filed = Filed { rules, ..Filed::default() };
+    account.live().filed = Filed {
+        rules,
+        ..Filed::default()
+    };
     filing::report(account);
     for (list, pages) in [(0, DIALOG_PAGES), (1, ARCHIVE_PAGES)] {
         let mut offset = None;
@@ -356,7 +418,9 @@ fn pinned_missing(account: &Account) {
                 continue;
             };
             let request = tl::functions::messages::GetPeerDialogs {
-                peers: vec![tl::enums::InputDialogPeer::Peer(tl::types::InputDialogPeer { peer })],
+                peers: vec![tl::enums::InputDialogPeer::Peer(
+                    tl::types::InputDialogPeer { peer },
+                )],
             };
             let found = match account.ask(&request) {
                 Ok(tl::enums::messages::PeerDialogs::Dialogs(found)) => found,
@@ -368,14 +432,11 @@ fn pinned_missing(account: &Account) {
             for dialog in found.dialogs {
                 if let tl::enums::Dialog::Dialog(dialog) = dialog {
                     let list = usize::from(dialog.folder_id == Some(1));
-                    let newest = found
-                        .messages
-                        .iter()
-                        .find(|message| match message {
-                            tl::enums::Message::Message(before) => before.id == dialog.top_message,
-                            tl::enums::Message::Service(before) => before.id == dialog.top_message,
-                            tl::enums::Message::Empty(_) => false,
-                        });
+                    let newest = found.messages.iter().find(|message| match message {
+                        tl::enums::Message::Message(before) => before.id == dialog.top_message,
+                        tl::enums::Message::Service(before) => before.id == dialog.top_message,
+                        tl::enums::Message::Empty(_) => false,
+                    });
                     record(account, list, &dialog, newest);
                 }
             }
@@ -385,9 +446,17 @@ fn pinned_missing(account: &Account) {
 
 /// One page of a list (0 the main list, 1 the archive) from `offset`, written row by row.
 /// Answers where the next page starts, if Telegram has one.
-fn read_page(account: &Account, list: usize, offset: Option<Cursor>) -> Result<Option<Cursor>, Fault> {
+fn read_page(
+    account: &Account,
+    list: usize,
+    offset: Option<Cursor>,
+) -> Result<Option<Cursor>, Fault> {
     let start = match offset {
-        Some((date, id, who)) => (date, id, account.input(who).unwrap_or(tl::enums::InputPeer::Empty)),
+        Some((date, id, who)) => (
+            date,
+            id,
+            account.input(who).unwrap_or(tl::enums::InputPeer::Empty),
+        ),
         None => (0, 0, tl::enums::InputPeer::Empty),
     };
     let mut page = page(account, Some(list as i32), start)?;
@@ -410,7 +479,12 @@ fn read_page(account: &Account, list: usize, offset: Option<Cursor>) -> Result<O
 
 /// One dialog to the store: its row with its filing, its newest message, counts, mute and
 /// whether the other side has read my last message.
-fn record(account: &Account, list: usize, dialog: &tl::types::Dialog, newest: Option<&tl::enums::Message>) {
+fn record(
+    account: &Account,
+    list: usize,
+    dialog: &tl::types::Dialog,
+    newest: Option<&tl::enums::Message>,
+) {
     let who = Who::of(&dialog.peer);
     let id = who.text();
     let Some(known) = account.dir().get(who).cloned() else {
@@ -421,7 +495,14 @@ fn record(account: &Account, list: usize, dialog: &tl::types::Dialog, newest: Op
     let filing = {
         let mut live = account.live();
         let filed = &mut live.filed;
-        filed.note(who, Facts { archived: list == 1, muted: is_muted, read: unread == 0 });
+        filed.note(
+            who,
+            Facts {
+                archived: list == 1,
+                muted: is_muted,
+                read: unread == 0,
+            },
+        );
         if !filed.order[list].contains(&who) {
             filed.order[list].push(who);
         }
@@ -451,7 +532,9 @@ fn record(account: &Account, list: usize, dialog: &tl::types::Dialog, newest: Op
             };
             let _ = account.ctx.preview(&id, &line);
         } else {
-            let _ = account.ctx.history(&id, std::slice::from_ref(&mapped.message));
+            let _ = account
+                .ctx
+                .history(&id, std::slice::from_ref(&mapped.message));
         }
     }
     // Telegram's word on what is unread here. Where this user read further than the dialog says,
@@ -472,14 +555,17 @@ fn record(account: &Account, list: usize, dialog: &tl::types::Dialog, newest: Op
                 Some(fresh) => {
                     unread = (fresh.unread_count.max(0) as u32).max(u32::from(fresh.unread_mark));
                     mentions = fresh.unread_mentions_count.max(0) as u32;
-                    read = (fresh.read_inbox_max_id > 0).then(|| fresh.read_inbox_max_id.to_string());
+                    read =
+                        (fresh.read_inbox_max_id > 0).then(|| fresh.read_inbox_max_id.to_string());
                 }
                 None => counted = false,
             }
         }
     }
     if counted {
-        let _ = account.ctx.counts(&id, unread, mentions, read.as_deref(), updated);
+        let _ = account
+            .ctx
+            .counts(&id, unread, mentions, read.as_deref(), updated);
     }
     let _ = account.ctx.muted(&id, is_muted);
     // The cloud draft rides the dialog: what the phone left on this chat shows on its row as
@@ -491,14 +577,20 @@ fn record(account: &Account, list: usize, dialog: &tl::types::Dialog, newest: Op
     let _ = account.ctx.draft(&id, draft_text);
     // ✓✓: the other side read my messages up to here. Not for my own notes or a broadcast.
     if dialog.read_outbox_max_id > 0 && who != Who::User(account.me) && !known.broadcast {
-        let _ = account.ctx.seen(&id, &dialog.read_outbox_max_id.to_string());
+        let _ = account
+            .ctx
+            .seen(&id, &dialog.read_outbox_max_id.to_string());
     }
 }
 
 /// One dialog as the network counts it right now, what a read told again leaves.
 fn peer_dialog(account: &Account, who: Who) -> Option<tl::types::Dialog> {
     let peer = account.input(who).ok()?;
-    let request = tl::functions::messages::GetPeerDialogs { peers: vec![tl::enums::InputDialogPeer::Peer(tl::types::InputDialogPeer { peer })] };
+    let request = tl::functions::messages::GetPeerDialogs {
+        peers: vec![tl::enums::InputDialogPeer::Peer(
+            tl::types::InputDialogPeer { peer },
+        )],
+    };
     match account.ask(&request) {
         Ok(tl::enums::messages::PeerDialogs::Dialogs(found)) => {
             found.dialogs.into_iter().find_map(|dialog| match dialog {
@@ -576,7 +668,9 @@ pub(super) fn previews(account: &Account, ids: &[String]) {
         };
         let mut mapped: Vec<Mapped> = {
             let dir = account.dir();
-            raw.iter().filter_map(|message| content::map(&dir, message)).collect()
+            raw.iter()
+                .filter_map(|message| content::map(&dir, message))
+                .collect()
         };
         for one in &mut mapped {
             finish(account, id, one, &HashMap::new());
@@ -595,7 +689,12 @@ pub(super) fn avatar(account: &Account, who: Who) -> Option<Want> {
     Some(Want {
         file,
         dc: known.photo_dc,
-        location: tl::types::InputPeerPhotoFileLocation { big: false, peer: dir.input_peer(who)?, photo_id: known.photo }.into(),
+        location: tl::types::InputPeerPhotoFileLocation {
+            big: false,
+            peer: dir.input_peer(who)?,
+            photo_id: known.photo,
+        }
+        .into(),
         inline: None,
         row: Some(who.text()),
         original: false,
@@ -629,7 +728,8 @@ fn topics(account: &Account, forum: Who) -> Result<usize, Fault> {
             continue;
         };
         let id = thread_id(forum, topic.id);
-        let mut thread = ConversationRow::new(id.clone(), ConversationKind::Thread, topic.title.clone());
+        let mut thread =
+            ConversationRow::new(id.clone(), ConversationKind::Thread, topic.title.clone());
         // The topic's own icon color: the tile it draws wherever its list shows. Its picture:
         // the custom emoji the icon names, shown wherever the row stands.
         thread.icon = Some(topic.icon_color);
@@ -646,15 +746,29 @@ fn topics(account: &Account, forum: Who) -> Result<usize, Fault> {
             pinned += 1;
             pinned - 1
         });
-        thread.filing = Some(Filing { pin, ..Filing::default() });
+        thread.filing = Some(Filing {
+            pin,
+            ..Filing::default()
+        });
         if account.ctx.conversation(&thread).is_err() {
             continue;
         }
         count += 1;
         let read = (topic.read_inbox_max_id > 0).then(|| topic.read_inbox_max_id.to_string());
-        let updated = dates.get(&topic.top_message).copied().unwrap_or(i64::from(topic.date));
-        let _ = account.ctx.counts(&id, topic.unread_count.max(0) as u32, topic.unread_mentions_count.max(0) as u32, read.as_deref(), updated);
-        let _ = account.ctx.muted(&id, muted(account, forum, &topic.notify_settings));
+        let updated = dates
+            .get(&topic.top_message)
+            .copied()
+            .unwrap_or(i64::from(topic.date));
+        let _ = account.ctx.counts(
+            &id,
+            topic.unread_count.max(0) as u32,
+            topic.unread_mentions_count.max(0) as u32,
+            read.as_deref(),
+            updated,
+        );
+        let _ = account
+            .ctx
+            .muted(&id, muted(account, forum, &topic.notify_settings));
     }
     fetch_icons(account, forum, &found.topics);
     Ok(count)
@@ -675,7 +789,10 @@ fn fetch_icons(account: &Account, forum: Who, topics: &[tl::enums::ForumTopic]) 
             continue;
         };
         let row = thread_id(forum, topic.id);
-        if icons.iter().any(|(held, held_row)| *held == icon && *held_row == row) {
+        if icons
+            .iter()
+            .any(|(held, held_row)| *held == icon && *held_row == row)
+        {
             continue;
         }
         icons.push((icon, row));
@@ -687,7 +804,9 @@ fn fetch_icons(account: &Account, forum: Who, topics: &[tl::enums::ForumTopic]) 
     if emoji_ids.is_empty() {
         return;
     }
-    let documents = match account.ask(&tl::functions::messages::GetCustomEmojiDocuments { document_id: emoji_ids }) {
+    let documents = match account.ask(&tl::functions::messages::GetCustomEmojiDocuments {
+        document_id: emoji_ids,
+    }) {
         Ok(documents) => documents,
         Err(fault) => {
             eprintln!("chatd: Telegram: topic icons: {fault}");
@@ -698,39 +817,51 @@ fn fetch_icons(account: &Account, forum: Who, topics: &[tl::enums::ForumTopic]) 
     // names in the document ("m" first) when it names one, and the document whole otherwise —
     // an animated icon is its Lottie JSON the same play the messages render, gzip unpacked
     // where the file lands.
-    let wants = icons.into_iter().filter_map(|(icon, topic_row)| {
-        // The picture's row: the topic whose row hung it, so the list refreshes on its turn.
-        let document = documents.iter().find(|document| match document {
-            tl::enums::Document::Document(document) => document.id == icon,
-            _ => false,
-        })?;
-        let tl::enums::Document::Document(document) = document else {
-            return None;
-        };
-        let still = document.thumbs.as_ref().and_then(|thumbs| {
-            thumbs.iter().find_map(|thumb| match thumb {
-                tl::enums::PhotoSize::Size(size) if size.r#type == "m" => Some(size.r#type.clone()),
-                _ => None,
-            }).or_else(|| thumbs.iter().find_map(|thumb| match thumb {
-                tl::enums::PhotoSize::Size(size) => Some(size.r#type.clone()),
-                _ => None,
-            }))
-        });
-        let thumb_size = still.unwrap_or_default();
-        Some(Want {
-            file: MediaFile::new(format!("e{}", icon), MediaKind::Emoji),
-            dc: document.dc_id,
-            location: tl::enums::InputFileLocation::InputDocumentFileLocation(tl::types::InputDocumentFileLocation {
-                id: document.id,
-                access_hash: document.access_hash,
-                file_reference: document.file_reference.clone(),
-                thumb_size,
-            }),
-            inline: None,
-            row: Some(topic_row),
-            original: false,
+    let wants = icons
+        .into_iter()
+        .filter_map(|(icon, topic_row)| {
+            // The picture's row: the topic whose row hung it, so the list refreshes on its turn.
+            let document = documents.iter().find(|document| match document {
+                tl::enums::Document::Document(document) => document.id == icon,
+                _ => false,
+            })?;
+            let tl::enums::Document::Document(document) = document else {
+                return None;
+            };
+            let still = document.thumbs.as_ref().and_then(|thumbs| {
+                thumbs
+                    .iter()
+                    .find_map(|thumb| match thumb {
+                        tl::enums::PhotoSize::Size(size) if size.r#type == "m" => {
+                            Some(size.r#type.clone())
+                        }
+                        _ => None,
+                    })
+                    .or_else(|| {
+                        thumbs.iter().find_map(|thumb| match thumb {
+                            tl::enums::PhotoSize::Size(size) => Some(size.r#type.clone()),
+                            _ => None,
+                        })
+                    })
+            });
+            let thumb_size = still.unwrap_or_default();
+            Some(Want {
+                file: MediaFile::new(format!("e{}", icon), MediaKind::Emoji),
+                dc: document.dc_id,
+                location: tl::enums::InputFileLocation::InputDocumentFileLocation(
+                    tl::types::InputDocumentFileLocation {
+                        id: document.id,
+                        access_hash: document.access_hash,
+                        file_reference: document.file_reference.clone(),
+                        thumb_size,
+                    },
+                ),
+                inline: None,
+                row: Some(topic_row),
+                original: false,
+            })
         })
-    }).collect();
+        .collect();
     account.files.want(wants);
 }
 
@@ -743,10 +874,19 @@ pub(super) enum Around<'a> {
 }
 
 /// Fills in what a reply answers from what is already known: the same page, or the store.
-fn quote(account: &Account, conversation: &str, page: &HashMap<i32, (String, String, String)>, reply: i32) -> ReplyTo {
+fn quote(
+    account: &Account,
+    conversation: &str,
+    page: &HashMap<i32, (String, String, String)>,
+    reply: i32,
+) -> ReplyTo {
     let id = reply.to_string();
     let known = page.get(&reply).cloned().or_else(|| {
-        let stored = account.ctx.stored_message(conversation, &id).ok().flatten()?;
+        let stored = account
+            .ctx
+            .stored_message(conversation, &id)
+            .ok()
+            .flatten()?;
         Some((stored.sender.id, stored.sender.name, stored.text))
     });
     match known {
@@ -758,14 +898,25 @@ fn quote(account: &Account, conversation: &str, page: &HashMap<i32, (String, Str
             deleted: false,
         },
         // Not on this page and never stored: the row says who and what once it is.
-        None => ReplyTo { id, sender: String::new(), snippet: String::new(), person: None, deleted: false },
+        None => ReplyTo {
+            id,
+            sender: String::new(),
+            snippet: String::new(),
+            person: None,
+            deleted: false,
+        },
     }
 }
 
 /// Where a message belongs: its chat, or in a forum the thread of its topic.
 pub(super) fn conversation_of(account: &Account, mapped: &Mapped) -> String {
     match mapped.peer {
-        Who::Channel(_) if account.dir().get(mapped.peer).is_some_and(|known| known.forum) => {
+        Who::Channel(_)
+            if account
+                .dir()
+                .get(mapped.peer)
+                .is_some_and(|known| known.forum) =>
+        {
             thread_id(mapped.peer, mapped.topic.unwrap_or(1))
         }
         peer => peer.text(),
@@ -773,7 +924,12 @@ pub(super) fn conversation_of(account: &Account, mapped: &Mapped) -> String {
 }
 
 /// Finishes a mapped message for the conversation it goes to: the reply's line.
-pub(super) fn finish(account: &Account, conversation: &str, mapped: &mut Mapped, page: &HashMap<i32, (String, String, String)>) {
+pub(super) fn finish(
+    account: &Account,
+    conversation: &str,
+    mapped: &mut Mapped,
+    page: &HashMap<i32, (String, String, String)>,
+) {
     if let Some(reply) = mapped.reply {
         mapped.message.reply_to = Some(quote(account, conversation, page, reply));
     }
@@ -813,18 +969,29 @@ fn comment_thread(account: &Account, conversation: &str, mapped: &mut Mapped) {
 /// once its comments were read. A page of the channel read later would otherwise stamp the
 /// post anew without one (`comment_thread` keeps the value on its way in).
 fn comment_time(account: &Account, post_at: Who, root: i32, sent: i64) {
-    let Ok(Some(mut post)) = account.ctx.stored_message(&post_at.text(), &root.to_string()) else {
+    let Ok(Some(mut post)) = account
+        .ctx
+        .stored_message(&post_at.text(), &root.to_string())
+    else {
         return;
     };
     let Some(section) = post.thread.as_mut().filter(|section| section.last < sent) else {
         return;
     };
     section.last = sent;
-    let _ = account.ctx.history(&post_at.text(), std::slice::from_ref(&post));
+    let _ = account
+        .ctx
+        .history(&post_at.text(), std::slice::from_ref(&post));
 }
 
 /// One request for a page of a conversation's messages, newest first as Telegram answers.
-fn fetch(account: &Account, who: Who, topic: Option<i32>, around: &Around, limit: i32) -> Result<Vec<tl::enums::Message>, Fault> {
+fn fetch(
+    account: &Account,
+    who: Who,
+    topic: Option<i32>,
+    around: &Around,
+    limit: i32,
+) -> Result<Vec<tl::enums::Message>, Fault> {
     let peer = account.input(who)?;
     let number = |id: &str| id.parse::<i32>().unwrap_or(0);
     let (offset_id, add_offset) = match around {
@@ -862,7 +1029,9 @@ fn fetch(account: &Account, who: Who, topic: Option<i32>, around: &Around, limit
     let (messages, chats, users) = match answer {
         tl::enums::messages::Messages::Messages(page) => (page.messages, page.chats, page.users),
         tl::enums::messages::Messages::Slice(page) => (page.messages, page.chats, page.users),
-        tl::enums::messages::Messages::ChannelMessages(page) => (page.messages, page.chats, page.users),
+        tl::enums::messages::Messages::ChannelMessages(page) => {
+            (page.messages, page.chats, page.users)
+        }
         tl::enums::messages::Messages::NotModified(_) => (Vec::new(), Vec::new(), Vec::new()),
     };
     account.learn(&users, &chats);
@@ -876,13 +1045,18 @@ pub(super) fn history(account: &Account, conversation: &str, around: Around) -> 
     if let Around::After(after) = &around {
         let mut live = account.live();
         live.after.retain(|(_, _, at)| at.elapsed() < AFTER_FRESH);
-        if live.after.iter().any(|(place, id, _)| place == conversation && id == after) {
+        if live
+            .after
+            .iter()
+            .any(|(place, id, _)| place == conversation && id == after)
+        {
             return None;
         }
         if live.after.len() >= 32 {
             live.after.pop_front();
         }
-        live.after.push_back((conversation.to_owned(), (*after).to_owned(), Instant::now()));
+        live.after
+            .push_back((conversation.to_owned(), (*after).to_owned(), Instant::now()));
     }
     let raw = match fetch(account, who, topic, &around, PAGE) {
         Ok(raw) => raw,
@@ -893,10 +1067,23 @@ pub(super) fn history(account: &Account, conversation: &str, around: Around) -> 
     };
     let mut mapped: Vec<Mapped> = {
         let dir = account.dir();
-        raw.iter().filter_map(|message| content::map(&dir, message)).collect()
+        raw.iter()
+            .filter_map(|message| content::map(&dir, message))
+            .collect()
     };
-    let page: HashMap<i32, (String, String, String)> =
-        mapped.iter().map(|one| (one.id, (one.message.sender.id.clone(), one.message.sender.name.clone(), one.message.text.clone()))).collect();
+    let page: HashMap<i32, (String, String, String)> = mapped
+        .iter()
+        .map(|one| {
+            (
+                one.id,
+                (
+                    one.message.sender.id.clone(),
+                    one.message.sender.name.clone(),
+                    one.message.text.clone(),
+                ),
+            )
+        })
+        .collect();
     let mut wants = Vec::new();
     let mut authors = HashSet::new();
     for one in &mut mapped {
@@ -909,9 +1096,17 @@ pub(super) fn history(account: &Account, conversation: &str, around: Around) -> 
     let messages: Vec<Message> = mapped.into_iter().map(|one| one.message).collect();
     // The newest page is whole: a stored message inside its range that Telegram no longer
     // lists was deleted while we were away.
-    if let (Around::Newest, Some(newest), Some(oldest)) = (&around, messages.first(), messages.last()) {
-        let stored = account.ctx.stored_ids(conversation, &oldest.id, &newest.id, 200).unwrap_or_default();
-        for gone in stored.iter().filter(|id| !page.contains_key(&id.parse::<i32>().unwrap_or(-1))) {
+    if let (Around::Newest, Some(newest), Some(oldest)) =
+        (&around, messages.first(), messages.last())
+    {
+        let stored = account
+            .ctx
+            .stored_ids(conversation, &oldest.id, &newest.id, 200)
+            .unwrap_or_default();
+        for gone in stored
+            .iter()
+            .filter(|id| !page.contains_key(&id.parse::<i32>().unwrap_or(-1)))
+        {
             let _ = account.ctx.deleted(conversation, gone);
         }
     }
@@ -920,14 +1115,23 @@ pub(super) fn history(account: &Account, conversation: &str, around: Around) -> 
     // post carries the count but not the time. A forum's topics are asked the same way, but
     // they carry no comment section and stand as rows of their own.
     if let Some((parent, Some(root))) = Who::parse(conversation) {
-        if account.dir().get(parent).is_some_and(|known| known.broadcast) {
+        if account
+            .dir()
+            .get(parent)
+            .is_some_and(|known| known.broadcast)
+        {
             if let Some(newest) = messages.first().map(|message| message.sent) {
                 comment_time(account, parent, root, newest);
             }
         }
     }
     wants.extend(avatar(account, who));
-    wants.extend(authors.into_iter().take(20).filter_map(|author| avatar(account, author)));
+    wants.extend(
+        authors
+            .into_iter()
+            .take(20)
+            .filter_map(|author| avatar(account, author)),
+    );
     account.files.want(wants);
     messages.into_iter().next()
 }
@@ -941,7 +1145,10 @@ pub(super) fn backfill(account: &Account, conversation: &str) {
     let (forum, broadcast) = {
         let dir = account.dir();
         let known = dir.get(who);
-        (known.is_some_and(|known| known.forum), known.is_some_and(|known| known.broadcast))
+        (
+            known.is_some_and(|known| known.forum),
+            known.is_some_and(|known| known.broadcast),
+        )
     };
     // A forum's own row holds no messages: opening it lists its topics.
     if forum && topic.is_none() {
@@ -995,10 +1202,22 @@ fn sponsored(account: &Account, channel: Who, conversation: &str, newest: Option
     let Some(tl::enums::SponsoredMessage::Message(ad)) = found.messages.first() else {
         return;
     };
-    let id = format!("ad{}", ad.random_id.iter().map(|byte| format!("{byte:02x}")).collect::<String>());
+    let id = format!(
+        "ad{}",
+        ad.random_id
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
     // It sorts after the channel's newest message without moving the channel in the Inbox.
     let sent = newest.as_ref().map_or_else(now, |newest| newest.sent);
-    let mut message = Message::plain(id.clone(), ad.title.clone(), ad.message.clone(), sent, false);
+    let mut message = Message::plain(
+        id.clone(),
+        ad.title.clone(),
+        ad.message.clone(),
+        sent,
+        false,
+    );
     message.spans = content::spans(&ad.message, ad.entities.as_deref().unwrap_or(&[]));
     // The button is the last line, and the whole of it is the link.
     if !ad.url.is_empty() && !ad.button_text.is_empty() {
@@ -1007,27 +1226,51 @@ fn sponsored(account: &Account, channel: Who, conversation: &str, newest: Option
             message.text.push('\n');
         }
         message.text.push_str(&ad.button_text);
-        message.spans.push(Span { start: start as u32, end: message.text.len() as u32, style: Style::Link { url: ad.url.clone() } });
+        message.spans.push(Span {
+            start: start as u32,
+            end: message.text.len() as u32,
+            style: Style::Link {
+                url: ad.url.clone(),
+            },
+        });
     }
     message.card = Some(Box::new(Card {
-        title: if ad.recommended { "Recommended".to_owned() } else { "Sponsored".to_owned() },
-        footer: ad.sponsor_info.clone().or_else(|| ad.additional_info.clone()).unwrap_or_default(),
+        title: if ad.recommended {
+            "Recommended".to_owned()
+        } else {
+            "Sponsored".to_owned()
+        },
+        footer: ad
+            .sponsor_info
+            .clone()
+            .or_else(|| ad.additional_info.clone())
+            .unwrap_or_default(),
         ..Card::default()
     }));
-    if account.ctx.history(conversation, std::slice::from_ref(&message)).is_ok() {
+    if account
+        .ctx
+        .history(conversation, std::slice::from_ref(&message))
+        .is_ok()
+    {
         account.ctx.set_note(&note, &id);
         // The store previews whatever it recorded last at the newest time. Recording the real
         // newest message again, marked as its own echo so it counts as changed, puts its words
         // back on the row: an advertisement is never what the Inbox shows of a channel.
         if let Some(mut newest) = newest {
             newest.client_id = Some(newest.id.clone());
-            let _ = account.ctx.history(conversation, std::slice::from_ref(&newest));
+            let _ = account
+                .ctx
+                .history(conversation, std::slice::from_ref(&newest));
         }
         {
             // The same advertisement asked again later is still told as viewed only once.
             let mut live = account.live();
-            let viewed = live.shown.iter().any(|(_, random, viewed)| *random == ad.random_id && *viewed);
-            live.shown.push((conversation.to_owned(), ad.random_id.clone(), viewed));
+            let viewed = live
+                .shown
+                .iter()
+                .any(|(_, random, viewed)| *random == ad.random_id && *viewed);
+            live.shown
+                .push((conversation.to_owned(), ad.random_id.clone(), viewed));
         }
         ads_on_screen(account, &account.ctx.watching());
     }
@@ -1036,7 +1279,11 @@ fn sponsored(account: &Account, channel: Who, conversation: &str, newest: Option
 /// The open conversation is a channel whose sponsored message has not been told as viewed: it
 /// is now, once.
 fn ads_on_screen(account: &Account, watching: &Watching) {
-    let Some(open) = watching.conversation.as_ref().filter(|open| open.account() == account.ctx.account) else {
+    let Some(open) = watching
+        .conversation
+        .as_ref()
+        .filter(|open| open.account() == account.ctx.account)
+    else {
         return;
     };
     let due: Vec<Vec<u8>> = {
@@ -1061,13 +1308,30 @@ fn ads_on_screen(account: &Account, watching: &Watching) {
 
 /// A list of Telegram's messages as the contract's, for the conversation they are in, and the
 /// pictures they show. Nothing is recorded.
-pub(super) fn mapped(account: &Account, conversation: &str, raw: &[tl::enums::Message]) -> (Vec<Message>, Vec<Want>) {
+pub(super) fn mapped(
+    account: &Account,
+    conversation: &str,
+    raw: &[tl::enums::Message],
+) -> (Vec<Message>, Vec<Want>) {
     let mut mapped: Vec<Mapped> = {
         let dir = account.dir();
-        raw.iter().filter_map(|message| content::map(&dir, message)).collect()
+        raw.iter()
+            .filter_map(|message| content::map(&dir, message))
+            .collect()
     };
-    let page: HashMap<i32, (String, String, String)> =
-        mapped.iter().map(|one| (one.id, (one.message.sender.id.clone(), one.message.sender.name.clone(), one.message.text.clone()))).collect();
+    let page: HashMap<i32, (String, String, String)> = mapped
+        .iter()
+        .map(|one| {
+            (
+                one.id,
+                (
+                    one.message.sender.id.clone(),
+                    one.message.sender.name.clone(),
+                    one.message.text.clone(),
+                ),
+            )
+        })
+        .collect();
     let mut wants = Vec::new();
     for one in &mut mapped {
         finish(account, conversation, one, &page);
@@ -1077,14 +1341,27 @@ pub(super) fn mapped(account: &Account, conversation: &str, raw: &[tl::enums::Me
 }
 
 /// What a `messages.search` answer holds, and the count Telegram keeps for it.
-pub(super) fn searched(account: &Account, answer: tl::enums::messages::Messages) -> (Vec<tl::enums::Message>, Option<u32>) {
+pub(super) fn searched(
+    account: &Account,
+    answer: tl::enums::messages::Messages,
+) -> (Vec<tl::enums::Message>, Option<u32>) {
     let (messages, chats, users, count) = match answer {
         tl::enums::messages::Messages::Messages(page) => {
             let count = page.messages.len() as u32;
             (page.messages, page.chats, page.users, Some(count))
         }
-        tl::enums::messages::Messages::Slice(page) => (page.messages, page.chats, page.users, Some(page.count.max(0) as u32)),
-        tl::enums::messages::Messages::ChannelMessages(page) => (page.messages, page.chats, page.users, Some(page.count.max(0) as u32)),
+        tl::enums::messages::Messages::Slice(page) => (
+            page.messages,
+            page.chats,
+            page.users,
+            Some(page.count.max(0) as u32),
+        ),
+        tl::enums::messages::Messages::ChannelMessages(page) => (
+            page.messages,
+            page.chats,
+            page.users,
+            Some(page.count.max(0) as u32),
+        ),
         tl::enums::messages::Messages::NotModified(_) => (Vec::new(), Vec::new(), Vec::new(), None),
     };
     account.learn(&users, &chats);

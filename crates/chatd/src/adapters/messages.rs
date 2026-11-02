@@ -390,7 +390,10 @@ fn apply(account: &Account, event: Event) {
         Event::Chats(chats) => {
             let mut people = Vec::new();
             {
-                let mut peers = account.peers.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                let mut peers = account
+                    .peers
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 for chat in chats.iter().filter(|chat| !chat.peer.is_empty()) {
                     peers.insert(chat.id.clone(), chat.peer.clone());
                 }
@@ -398,7 +401,10 @@ fn apply(account: &Account, event: Event) {
             for chat in &chats {
                 // A picture fetched earlier stays the row's when the row is recorded again.
                 let avatar = account.ctx.avatar_of(&chat.id);
-                let _ = account.ctx.conversation(&ConversationRow { avatar: avatar.clone(), ..row(chat) });
+                let _ = account.ctx.conversation(&ConversationRow {
+                    avatar: avatar.clone(),
+                    ..row(chat)
+                });
                 if chat.unread {
                     let _ = account.ctx.counts(&chat.id, 1, 0, None, 0);
                 }
@@ -660,11 +666,24 @@ fn wanted(account: &Account, ids: &[String]) {
 /// may be slow to answer. What lands is the row's and the person's avatar. Groups have none:
 /// the shell draws their faces.
 fn pictures(account: &Arc<Account>, watching: &protocol::Watching) {
-    let on_screen = watching.rows.iter().chain(&watching.people).chain(&watching.conversation);
-    let ours: Vec<String> = on_screen.filter(|key| key.account() == account.ctx.account).map(|key| key.id.clone()).collect();
+    let on_screen = watching
+        .rows
+        .iter()
+        .chain(&watching.people)
+        .chain(&watching.conversation);
+    let ours: Vec<String> = on_screen
+        .filter(|key| key.account() == account.ctx.account)
+        .map(|key| key.id.clone())
+        .collect();
     let wanted: Vec<(String, String)> = {
-        let peers = account.peers.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut pictured = account.pictured.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let peers = account
+            .peers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut pictured = account
+            .pictured
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut wanted = Vec::new();
         for id in ours {
             let Some(peer) = peers.get(&id) else {
@@ -680,25 +699,34 @@ fn pictures(account: &Arc<Account>, watching: &protocol::Watching) {
         return;
     }
     let account = account.clone();
-    let spawned = std::thread::Builder::new().name("messages-pictures".into()).spawn(move || {
-        let participants: Vec<String> = wanted.iter().map(|(_, peer)| peer.clone()).collect();
-        let pictures = match account.drive.thumbnails(&participants) {
-            Ok(pictures) => pictures,
-            // Asked again on the next connection.
-            Err(why) => return tracing::warn!("chatd: Messages: pictures: {why}"),
-        };
-        for (participant, bytes) in pictures {
-            // A new picture is a new id, so the shell never draws the old one in its place.
-            let id = format!("messages:avatar:{participant}:{:016x}", blobs::fnv_bytes(&bytes));
-            let file = MediaFile::new(id.clone(), MediaKind::Avatar);
-            if account.ctx.landed(&file, &format!("messages://avatar/{participant}"), &bytes).is_none() {
-                continue;
+    let spawned = std::thread::Builder::new()
+        .name("messages-pictures".into())
+        .spawn(move || {
+            let participants: Vec<String> = wanted.iter().map(|(_, peer)| peer.clone()).collect();
+            let pictures = match account.drive.thumbnails(&participants) {
+                Ok(pictures) => pictures,
+                // Asked again on the next connection.
+                Err(why) => return tracing::warn!("chatd: Messages: pictures: {why}"),
+            };
+            for (participant, bytes) in pictures {
+                // A new picture is a new id, so the shell never draws the old one in its place.
+                let id = format!(
+                    "messages:avatar:{participant}:{:016x}",
+                    blobs::fnv_bytes(&bytes)
+                );
+                let file = MediaFile::new(id.clone(), MediaKind::Avatar);
+                if account
+                    .ctx
+                    .landed(&file, &format!("messages://avatar/{participant}"), &bytes)
+                    .is_none()
+                {
+                    continue;
+                }
+                for (conversation, _) in wanted.iter().filter(|(_, peer)| *peer == participant) {
+                    let _ = account.ctx.avatar(conversation, &id);
+                }
             }
-            for (conversation, _) in wanted.iter().filter(|(_, peer)| *peer == participant) {
-                let _ = account.ctx.avatar(conversation, &id);
-            }
-        }
-    });
+        });
     if let Err(err) = spawned {
         tracing::warn!("chatd: Messages: {err}");
     }

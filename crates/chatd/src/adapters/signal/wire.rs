@@ -32,7 +32,9 @@ impl Peer {
 
     pub fn parse(conversation: &str) -> Option<Peer> {
         match conversation.strip_prefix(GROUP) {
-            Some(id) if !id.is_empty() && id.bytes().all(|c| c.is_ascii_hexdigit()) => Some(Peer::Group(id.to_owned())),
+            Some(id) if !id.is_empty() && id.bytes().all(|c| c.is_ascii_hexdigit()) => {
+                Some(Peer::Group(id.to_owned()))
+            }
             Some(_) => None,
             None if is_aci(conversation) => Some(Peer::Direct(conversation.to_owned())),
             None => None,
@@ -43,7 +45,13 @@ impl Peer {
 /// An account id as Signal writes one: a UUID in lower case.
 pub fn is_aci(text: &str) -> bool {
     text.len() == 36
-        && text.char_indices().all(|(at, c)| if matches!(at, 8 | 13 | 18 | 23) { c == '-' } else { c.is_ascii_hexdigit() && !c.is_ascii_uppercase() })
+        && text.char_indices().all(|(at, c)| {
+            if matches!(at, 8 | 13 | 18 | 23) {
+                c == '-'
+            } else {
+                c.is_ascii_hexdigit() && !c.is_ascii_uppercase()
+            }
+        })
 }
 
 /// The id of a message in the contract: when it was sent, in milliseconds, and who wrote it.
@@ -108,17 +116,46 @@ pub enum Event {
     /// The groups the account is in, whole.
     Groups(Vec<GroupInfo>),
     /// A message from someone else, or one we sent from another device (`outgoing`).
-    Message { peer: Peer, text: Text, outgoing: bool },
+    Message {
+        peer: Peer,
+        text: Text,
+        outgoing: bool,
+    },
     /// A message was edited. `target` is when it was first sent.
-    Edited { peer: Peer, author: String, target: u64, text: String },
-    Deleted { peer: Peer, author: String, target: u64 },
+    Edited {
+        peer: Peer,
+        author: String,
+        target: u64,
+        text: String,
+    },
+    Deleted {
+        peer: Peer,
+        author: String,
+        target: u64,
+    },
     /// `by` reacted to `author`'s message sent at `target`.
-    Reacted { peer: Peer, by: String, author: String, target: u64, emoji: String, removed: bool },
+    Reacted {
+        peer: Peer,
+        by: String,
+        author: String,
+        target: u64,
+        emoji: String,
+        removed: bool,
+    },
     /// The user read these messages (author, sent) on another device.
     ReadElsewhere(Vec<(String, u64)>),
     /// `by`'s phone received our messages sent at these times, or `by` read them (`read`).
-    Receipt { by: String, sent: Vec<u64>, read: bool },
-    Typing { peer: Peer, by: String, name: String, started: bool },
+    Receipt {
+        by: String,
+        sent: Vec<u64>,
+        read: bool,
+    },
+    Typing {
+        peer: Peer,
+        by: String,
+        name: String,
+        started: bool,
+    },
     /// The user's own settings, as the phone shares them.
     Settings { read_receipts: bool, typing: bool },
     /// Everything that waited while we were away has arrived.
@@ -132,10 +169,23 @@ pub enum Event {
 /// What is sent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Body {
-    Text { text: String, quote: Option<Quote> },
-    React { author: String, target: u64, emoji: String, remove: bool },
-    Edit { target: u64, text: String },
-    Delete { target: u64 },
+    Text {
+        text: String,
+        quote: Option<Quote>,
+    },
+    React {
+        author: String,
+        target: u64,
+        emoji: String,
+        remove: bool,
+    },
+    Edit {
+        target: u64,
+        text: String,
+    },
+    Delete {
+        target: u64,
+    },
 }
 
 /// Why something failed.
@@ -153,7 +203,9 @@ pub enum Fault {
 impl Fault {
     pub fn words(&self) -> String {
         match self {
-            Fault::Ended(_) => "This computer is no longer linked to Signal. Sign in again.".to_owned(),
+            Fault::Ended(_) => {
+                "This computer is no longer linked to Signal. Sign in again.".to_owned()
+            }
             Fault::Refused(why) => why.clone(),
             Fault::Net(_) => "Signal did not answer.".to_owned(),
         }
@@ -199,7 +251,12 @@ pub struct Linked {
 /// phone, and answers what to keep. Blocks for as long as that takes. A link the user cancels
 /// (`cancelled`) is undone, never left on the account.
 pub trait Linker: Send {
-    fn link(self: Box<Self>, device: &str, show: &dyn Fn(String), cancelled: Arc<AtomicBool>) -> Result<Linked, Fault>;
+    fn link(
+        self: Box<Self>,
+        device: &str,
+        show: &dyn Fn(String),
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<Linked, Fault>;
 }
 
 #[cfg(test)]
@@ -214,7 +271,10 @@ mod tests {
         assert_eq!(Peer::Group("00ff".into()).conversation(), "g.00ff");
         assert_eq!(Peer::parse("g."), None);
         assert_eq!(Peer::parse("0F6C2A3E-1B4D-4E5F-8A9B-0C1D2E3F4A5B"), None);
-        assert_eq!(parse_message_id(&message_id(1_791_892_800_123, aci)), Some((1_791_892_800_123, aci.to_owned())));
+        assert_eq!(
+            parse_message_id(&message_id(1_791_892_800_123, aci)),
+            Some((1_791_892_800_123, aci.to_owned()))
+        );
         assert_eq!(parse_message_id("17-not-an-aci"), None);
     }
 }

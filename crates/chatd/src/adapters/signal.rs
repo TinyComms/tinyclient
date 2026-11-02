@@ -97,7 +97,8 @@ pub struct Saved {
 }
 
 fn parse(session: &str) -> Result<Saved, String> {
-    let saved: Saved = serde_json::from_str(session).map_err(|_| "the Signal session is unreadable".to_owned())?;
+    let saved: Saved =
+        serde_json::from_str(session).map_err(|_| "the Signal session is unreadable".to_owned())?;
     if !wire::is_aci(&saved.aci) {
         return Err("the Signal session names no account".to_owned());
     }
@@ -108,7 +109,11 @@ pub fn accounts(session: &str) -> Result<Vec<Signed>, String> {
     let saved = parse(session)?;
     Ok(vec![Signed {
         account: saved.aci.clone(),
-        name: if saved.name.is_empty() { "Signal".to_owned() } else { saved.name },
+        name: if saved.name.is_empty() {
+            "Signal".to_owned()
+        } else {
+            saved.name
+        },
         session: session.to_owned(),
     }])
 }
@@ -189,12 +194,19 @@ struct Live {
 
 impl Live {
     fn name(&self, id: &str) -> String {
-        self.names.get(id).cloned().unwrap_or_else(|| NO_NAME.to_owned())
+        self.names
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| NO_NAME.to_owned())
     }
 
     fn unread(&mut self, conversation: &str, author: &str, sent: u64) {
         if !self.unread.contains_key(conversation) && self.unread.len() >= CONVERSATIONS_KEPT {
-            let oldest = self.unread.iter().min_by_key(|(_, held)| held.back().map_or(0, |(_, sent)| *sent)).map(|(id, _)| id.clone());
+            let oldest = self
+                .unread
+                .iter()
+                .min_by_key(|(_, held)| held.back().map_or(0, |(_, sent)| *sent))
+                .map(|(id, _)| id.clone());
             if let Some(oldest) = oldest {
                 self.unread.remove(&oldest);
             }
@@ -211,7 +223,11 @@ impl Live {
         let Some(held) = self.unread.get_mut(conversation) else {
             return Vec::new();
         };
-        let read: Vec<_> = held.iter().filter(|(_, sent)| *sent <= upto).cloned().collect();
+        let read: Vec<_> = held
+            .iter()
+            .filter(|(_, sent)| *sent <= upto)
+            .cloned()
+            .collect();
         held.retain(|(_, sent)| *sent > upto);
         if held.is_empty() {
             self.unread.remove(conversation);
@@ -260,7 +276,9 @@ struct Account {
 
 impl Account {
     fn live(&self) -> MutexGuard<'_, Live> {
-        self.live.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.live
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -275,18 +293,28 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
     // What is learned (names, settings, unread) outlives one connection.
     let live: Arc<Mutex<Live>> = Arc::default();
     let current: Arc<Mutex<Option<Arc<Account>>>> = Arc::default();
-    let (socket_ctx, held, socket_saved, socket_live) = (ctx.clone(), current.clone(), saved.clone(), live.clone());
+    let (socket_ctx, held, socket_saved, socket_live) =
+        (ctx.clone(), current.clone(), saved.clone(), live.clone());
     std::thread::Builder::new()
         .name("signal-events".into())
         .spawn(move || {
-            keep_connected(&socket_ctx, || connect(&socket_ctx, &socket_saved, &socket_live, &held));
-            held.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
+            keep_connected(&socket_ctx, || {
+                connect(&socket_ctx, &socket_saved, &socket_live, &held)
+            });
+            held.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
         })
         .map_err(|err| err.to_string())?;
     std::thread::Builder::new()
         .name("signal-commands".into())
         .spawn(move || {
-            let account = || current.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+            let account = || {
+                current
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone()
+            };
             serve_commands(
                 &ctx,
                 inbox,
@@ -313,7 +341,12 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
 }
 
 /// One connection, from opening the wire to losing it.
-fn connect(ctx: &Context, saved: &Saved, live: &Arc<Mutex<Live>>, current: &Mutex<Option<Arc<Account>>>) -> Failure {
+fn connect(
+    ctx: &Context,
+    saved: &Saved,
+    live: &Arc<Mutex<Live>>,
+    current: &Mutex<Option<Arc<Account>>>,
+) -> Failure {
     let wire = match open(saved) {
         Ok(wire) => wire,
         Err(why) => return Failure::Dropped(why),
@@ -322,10 +355,30 @@ fn connect(ctx: &Context, saved: &Saved, live: &Arc<Mutex<Live>>, current: &Mute
         return Failure::Dropped("the wire has no events".to_owned());
     };
     let (me, name) = wire.me();
-    let name = if name.is_empty() { saved.name.clone() } else { name };
-    let account = Arc::new(Account { ctx: ctx.clone(), wire, me, name, live: live.clone(), pictured: Mutex::default() });
-    let _ = ctx.describe(if account.name.is_empty() { "Signal" } else { &account.name }, &account.me);
-    *current.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(account.clone());
+    let name = if name.is_empty() {
+        saved.name.clone()
+    } else {
+        name
+    };
+    let account = Arc::new(Account {
+        ctx: ctx.clone(),
+        wire,
+        me,
+        name,
+        live: live.clone(),
+        pictured: Mutex::default(),
+    });
+    let _ = ctx.describe(
+        if account.name.is_empty() {
+            "Signal"
+        } else {
+            &account.name
+        },
+        &account.me,
+    );
+    *current
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(account.clone());
     // Dropped while connecting: the command thread has gone and will not close this wire.
     if ctx.stopped() {
         account.wire.close();
@@ -348,7 +401,10 @@ fn connect(ctx: &Context, saved: &Saved, live: &Arc<Mutex<Live>>, current: &Mute
             break Failure::Dropped("stopped".to_owned());
         }
     };
-    current.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
+    current
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
     account.wire.close();
     ended
 }
@@ -356,12 +412,19 @@ fn connect(ctx: &Context, saved: &Saved, live: &Arc<Mutex<Live>>, current: &Mute
 /// The row of a conversation, recorded the first time it is seen.
 fn ensure_row(account: &Account, peer: &Peer, title: &str) {
     // The phone need not include ourselves in its contact list.
-    let title = if matches!(peer, Peer::Direct(aci) if aci == &account.me) { "Note to Self" } else { title };
+    let title = if matches!(peer, Peer::Direct(aci) if aci == &account.me) {
+        "Note to Self"
+    } else {
+        title
+    };
     let id = peer.conversation();
     match account.ctx.known(&id) {
         Ok(Some(known)) if title.is_empty() || known.title == title => {}
         // A picture fetched earlier stays the row's.
-        Ok(Some(_)) | Ok(None) => drop(account.ctx.conversation(&ConversationRow { avatar: account.ctx.avatar_of(&id), ..row(peer, title) })),
+        Ok(Some(_)) | Ok(None) => drop(account.ctx.conversation(&ConversationRow {
+            avatar: account.ctx.avatar_of(&id),
+            ..row(peer, title)
+        })),
         Err(err) => tracing::warn!("chatd: Signal: {err}"),
     }
 }
@@ -377,7 +440,11 @@ fn row(peer: &Peer, title: &str) -> ConversationRow {
             row
         }
         Peer::Group(_) => {
-            let title = if title.is_empty() { "Signal group" } else { title };
+            let title = if title.is_empty() {
+                "Signal group"
+            } else {
+                title
+            };
             let mut row = ConversationRow::new(peer.conversation(), ConversationKind::Group, title);
             row.listed = true;
             row.private = true;
@@ -388,7 +455,11 @@ fn row(peer: &Peer, title: &str) -> ConversationRow {
 
 /// A message as the contract has it.
 fn message(account: &Account, text: &Text, outgoing: bool) -> Message {
-    let author = if outgoing { account.me.as_str() } else { text.author.as_str() };
+    let author = if outgoing {
+        account.me.as_str()
+    } else {
+        text.author.as_str()
+    };
     let name = if outgoing {
         account.name.clone()
     } else if text.name.is_empty() {
@@ -402,18 +473,30 @@ fn message(account: &Account, text: &Text, outgoing: bool) -> Message {
         (None, _) => text.text.clone(),
     };
     let sent = i64::try_from(text.sent / 1_000).unwrap_or(0);
-    let mut message = Message::plain(wire::message_id(text.sent, author), name, words, sent, outgoing);
+    let mut message = Message::plain(
+        wire::message_id(text.sent, author),
+        name,
+        words,
+        sent,
+        outgoing,
+    );
     message.sender.id = author.to_owned();
     message.mentions_me = text.mentions_me && !outgoing;
     if text.unsupported.is_some() {
-        message.kind = MessageKind::Unsupported { link: String::new() };
+        message.kind = MessageKind::Unsupported {
+            link: String::new(),
+        };
     }
     message.reply_to = text.quote.as_ref().map(|quote| reply_to(account, quote));
     message
 }
 
 fn reply_to(account: &Account, quote: &Quote) -> ReplyTo {
-    let sender = if quote.author == account.me { account.name.clone() } else { account.live().name(&quote.author) };
+    let sender = if quote.author == account.me {
+        account.name.clone()
+    } else {
+        account.live().name(&quote.author)
+    };
     ReplyTo {
         id: wire::message_id(quote.sent, &quote.author),
         sender,
@@ -431,7 +514,11 @@ fn apply(account: &Account, event: Event) {
                 .iter()
                 .map(|contact| PersonRow {
                     id: contact.id.clone(),
-                    name: if contact.name.is_empty() { NO_NAME.to_owned() } else { contact.name.clone() },
+                    name: if contact.name.is_empty() {
+                        NO_NAME.to_owned()
+                    } else {
+                        contact.name.clone()
+                    },
                     handle: String::new(),
                     avatar: ctx.avatar_of(&contact.id),
                     bot: false,
@@ -446,7 +533,10 @@ fn apply(account: &Account, event: Event) {
                 }
             }
             let _ = ctx.people(&people);
-            let owned: Vec<(String, Relation)> = contacts.iter().map(|contact| (contact.id.clone(), Relation::Contact)).collect();
+            let owned: Vec<(String, Relation)> = contacts
+                .iter()
+                .map(|contact| (contact.id.clone(), Relation::Contact))
+                .collect();
             let _ = ctx.relations(&owned);
             // A row named before the contact was known takes the contact's name.
             for contact in contacts.iter().filter(|contact| !contact.name.is_empty()) {
@@ -464,7 +554,11 @@ fn apply(account: &Account, event: Event) {
                 let _ = ctx.conversation(&row);
             }
         }
-        Event::Message { peer, text, outgoing } => {
+        Event::Message {
+            peer,
+            text,
+            outgoing,
+        } => {
             let conversation = peer.conversation();
             if !outgoing && !text.name.is_empty() {
                 let mut live = account.live();
@@ -488,30 +582,72 @@ fn apply(account: &Account, event: Event) {
             if outgoing {
                 account.live().sent(text.sent, &conversation);
             } else {
-                account.live().unread(&conversation, &text.author, text.sent);
+                account
+                    .live()
+                    .unread(&conversation, &text.author, text.sent);
             }
             let _ = ctx.message(&conversation, &message);
         }
-        Event::Edited { peer, author, target, text } => {
+        Event::Edited {
+            peer,
+            author,
+            target,
+            text,
+        } => {
             let conversation = peer.conversation();
-            if let Ok(Some(mut message)) = ctx.stored_message(&conversation, &wire::message_id(target, &author)) {
+            if let Ok(Some(mut message)) =
+                ctx.stored_message(&conversation, &wire::message_id(target, &author))
+            {
                 message.text = text;
                 message.edited = true;
                 let _ = ctx.message(&conversation, &message);
             }
         }
-        Event::Deleted { peer, author, target } => {
+        Event::Deleted {
+            peer,
+            author,
+            target,
+        } => {
             let _ = ctx.deleted(&peer.conversation(), &wire::message_id(target, &author));
         }
-        Event::Reacted { peer, by, author, target, emoji, removed } => {
+        Event::Reacted {
+            peer,
+            by,
+            author,
+            target,
+            emoji,
+            removed,
+        } => {
             let conversation = peer.conversation();
             let id = wire::message_id(target, &author);
             let mine = by == account.me;
-            let replaced = account.live().react(&id, &by, (!removed).then_some(emoji.as_str()));
+            let replaced = account
+                .live()
+                .react(&id, &by, (!removed).then_some(emoji.as_str()));
             if let Some(old) = replaced {
-                let _ = ctx.reacted(&conversation, &id, &Reaction { emoji: old, file: None, count: 1, mine }, false);
+                let _ = ctx.reacted(
+                    &conversation,
+                    &id,
+                    &Reaction {
+                        emoji: old,
+                        file: None,
+                        count: 1,
+                        mine,
+                    },
+                    false,
+                );
             }
-            let _ = ctx.reacted(&conversation, &id, &Reaction { emoji, file: None, count: 1, mine }, !removed);
+            let _ = ctx.reacted(
+                &conversation,
+                &id,
+                &Reaction {
+                    emoji,
+                    file: None,
+                    count: 1,
+                    mine,
+                },
+                !removed,
+            );
         }
         Event::ReadElsewhere(read) => read_elsewhere(account, &read),
         Event::Receipt { by, sent, read } => {
@@ -520,24 +656,44 @@ fn apply(account: &Account, event: Event) {
             };
             let conversation = {
                 let live = account.live();
-                live.sent.iter().rev().find(|(at, _)| *at == newest).map(|(_, conversation)| conversation.clone())
+                live.sent
+                    .iter()
+                    .rev()
+                    .find(|(at, _)| *at == newest)
+                    .map(|(_, conversation)| conversation.clone())
             };
             let conversation = conversation.unwrap_or_else(|| Peer::Direct(by).conversation());
             if let Ok(Some(_)) = ctx.known(&conversation) {
                 let id = wire::message_id(newest, &account.me);
-                let _ = if read { ctx.seen(&conversation, &id) } else { ctx.delivered(&conversation, &id) };
+                let _ = if read {
+                    ctx.seen(&conversation, &id)
+                } else {
+                    ctx.delivered(&conversation, &id)
+                };
             }
         }
-        Event::Typing { peer, by, name, started } => {
+        Event::Typing {
+            peer,
+            by,
+            name,
+            started,
+        } => {
             let conversation = peer.conversation();
             if started {
-                let name = if name.is_empty() { account.live().name(&by) } else { name };
+                let name = if name.is_empty() {
+                    account.live().name(&by)
+                } else {
+                    name
+                };
                 ctx.typing(&conversation, &by, &name, TYPING_SHOWN);
             } else {
                 ctx.typing_stopped(&conversation, &by);
             }
         }
-        Event::Settings { read_receipts, typing } => {
+        Event::Settings {
+            read_receipts,
+            typing,
+        } => {
             let mut live = account.live();
             live.read_receipts = read_receipts;
             live.typing = typing;
@@ -572,9 +728,24 @@ fn read_elsewhere(account: &Account, read: &[(String, u64)]) {
         }
     }
     for (conversation, upto, author) in touched {
-        let left = account.live().unread.get(&conversation).map_or(0, VecDeque::len) as u32;
-        let updated = account.ctx.known(&conversation).ok().flatten().map_or(0, |row| row.updated);
-        let _ = account.ctx.counts(&conversation, left, 0, Some(&wire::message_id(upto, &author)), updated);
+        let left = account
+            .live()
+            .unread
+            .get(&conversation)
+            .map_or(0, VecDeque::len) as u32;
+        let updated = account
+            .ctx
+            .known(&conversation)
+            .ok()
+            .flatten()
+            .map_or(0, |row| row.updated);
+        let _ = account.ctx.counts(
+            &conversation,
+            left,
+            0,
+            Some(&wire::message_id(upto, &author)),
+            updated,
+        );
     }
 }
 
@@ -582,8 +753,18 @@ fn read_elsewhere(account: &Account, read: &[(String, u64)]) {
 fn offline(ctx: &Context, command: Command) {
     let down = || Refusal::Refused("Signal is offline.".to_owned());
     match command {
-        Command::Send { conversation_id, client_id, .. } => ctx.sent(&conversation_id, &client_id, Err("Signal is offline.".to_owned())),
-        Command::React { reply, .. } | Command::Edit { reply, .. } | Command::Delete { reply, .. } => drop(reply.send(Err(down()))),
+        Command::Send {
+            conversation_id,
+            client_id,
+            ..
+        } => ctx.sent(
+            &conversation_id,
+            &client_id,
+            Err("Signal is offline.".to_owned()),
+        ),
+        Command::React { reply, .. }
+        | Command::Edit { reply, .. }
+        | Command::Delete { reply, .. } => drop(reply.send(Err(down()))),
         Command::StartDirect { reply, .. } => drop(reply.send(Err(down()))),
         Command::SearchPeople(query) => ctx.searched(&query),
         Command::ReactionRules { reply, .. } => drop(reply.send(Ok(reaction_rules()))),
@@ -595,43 +776,86 @@ fn offline(ctx: &Context, command: Command) {
 /// message, a new one replacing it (which Signal's own apps do, and its protocol carries one
 /// emoji per person). No custom emoji, and no cap on how many different ones a message holds.
 pub fn reaction_rules() -> protocol::ReactionRules {
-    protocol::ReactionRules { mine: 1, replaces: true, ..protocol::ReactionRules::default() }
+    protocol::ReactionRules {
+        mine: 1,
+        replaces: true,
+        ..protocol::ReactionRules::default()
+    }
 }
 
 fn serve(account: &Arc<Account>, command: Command) {
     let ctx = &account.ctx;
     match command {
-        Command::MarkRead { conversation_id, message_id } => mark_read(account, &conversation_id, &message_id),
-        Command::Send { conversation_id, client_id, text, reply_to } => {
+        Command::MarkRead {
+            conversation_id,
+            message_id,
+        } => mark_read(account, &conversation_id, &message_id),
+        Command::Send {
+            conversation_id,
+            client_id,
+            text,
+            reply_to,
+        } => {
             let outcome = send_text(account, &conversation_id, &text, reply_to.as_deref());
-            ctx.sent(&conversation_id, &client_id, outcome.map_err(|fault| fault.words()));
+            ctx.sent(
+                &conversation_id,
+                &client_id,
+                outcome.map_err(|fault| fault.words()),
+            );
         }
-        Command::React { conversation_id, message_id, emoji, on, reply } => {
-            let _ = reply.send(react(account, &conversation_id, &message_id, &emoji, on).map_err(refused));
+        Command::React {
+            conversation_id,
+            message_id,
+            emoji,
+            on,
+            reply,
+        } => {
+            let _ = reply
+                .send(react(account, &conversation_id, &message_id, &emoji, on).map_err(refused));
         }
         Command::ReactionRules { reply, .. } => drop(reply.send(Ok(reaction_rules()))),
-        Command::Edit { conversation_id, message_id, text, reply } => {
-            let _ = reply.send(edit(account, &conversation_id, &message_id, &text).map_err(refused));
+        Command::Edit {
+            conversation_id,
+            message_id,
+            text,
+            reply,
+        } => {
+            let _ =
+                reply.send(edit(account, &conversation_id, &message_id, &text).map_err(refused));
         }
-        Command::Delete { conversation_id, message_id, reply } => {
+        Command::Delete {
+            conversation_id,
+            message_id,
+            reply,
+        } => {
             let _ = reply.send(delete(account, &conversation_id, &message_id).map_err(refused));
         }
         Command::Typing(conversation_id) => typing(account, &conversation_id),
         Command::StartDirect { person_id, reply } => {
             // Nothing reaches the other person: the chat exists on Signal once a message does.
             let started = wire::is_aci(&person_id).then(|| {
-                let name = account.live().names.get(&person_id).cloned().unwrap_or_default();
+                let name = account
+                    .live()
+                    .names
+                    .get(&person_id)
+                    .cloned()
+                    .unwrap_or_default();
                 ensure_row(account, &Peer::Direct(person_id.clone()), &name);
                 person_id
             });
-            let _ = reply.send(started.ok_or_else(|| Refusal::Refused("That person can't be messaged from here.".to_owned())));
+            let _ = reply.send(started.ok_or_else(|| {
+                Refusal::Refused("That person can't be messaged from here.".to_owned())
+            }));
         }
         // Signal has no directory to search: the people known are the contacts already stored.
         Command::SearchPeople(query) => ctx.searched(&query),
         Command::Watch(watching) => pictures(account, &watching),
         Command::SignOut(reply) => {
             if let Err(fault) = account.wire.unlink() {
-                tracing::warn!("chatd: Signal: unlinking: {}", super::net::redact(&fault.to_string()));
+                tracing::warn!(
+                    "chatd: Signal: unlinking: {}",
+                    super::net::redact(&fault.to_string())
+                );
             }
             let _ = reply.send(Ok(()));
         }
@@ -643,9 +867,16 @@ fn serve(account: &Arc<Account>, command: Command) {
 /// asked of Signal once a connection, one after another, off the command thread since each is a
 /// trip to Signal's CDN. What lands is the row's and the person's avatar.
 fn pictures(account: &Arc<Account>, watching: &protocol::Watching) {
-    let on_screen = watching.rows.iter().chain(&watching.people).chain(&watching.conversation);
+    let on_screen = watching
+        .rows
+        .iter()
+        .chain(&watching.people)
+        .chain(&watching.conversation);
     let wanted: Vec<Peer> = {
-        let mut pictured = account.pictured.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut pictured = account
+            .pictured
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         on_screen
             .filter(|key| key.account() == account.ctx.account)
             .filter_map(|key| Peer::parse(&key.id))
@@ -657,26 +888,38 @@ fn pictures(account: &Arc<Account>, watching: &protocol::Watching) {
         return;
     }
     let account = account.clone();
-    let spawned = std::thread::Builder::new().name("signal-pictures".into()).spawn(move || {
-        for peer in wanted {
-            let bytes = match account.wire.picture(&peer) {
-                Ok(Some(bytes)) if crate::blobs::is_picture(&bytes) => bytes,
-                Ok(_) => continue,
-                // Asked again on the next connection.
-                Err(fault) => {
-                    tracing::warn!("chatd: Signal: picture: {}", super::net::redact(&fault.to_string()));
-                    continue;
+    let spawned = std::thread::Builder::new()
+        .name("signal-pictures".into())
+        .spawn(move || {
+            for peer in wanted {
+                let bytes = match account.wire.picture(&peer) {
+                    Ok(Some(bytes)) if crate::blobs::is_picture(&bytes) => bytes,
+                    Ok(_) => continue,
+                    // Asked again on the next connection.
+                    Err(fault) => {
+                        tracing::warn!(
+                            "chatd: Signal: picture: {}",
+                            super::net::redact(&fault.to_string())
+                        );
+                        continue;
+                    }
+                };
+                let conversation = peer.conversation();
+                // A new picture is a new id, so the shell never draws the old one in its place.
+                let id = format!(
+                    "signal:avatar:{conversation}:{:016x}",
+                    crate::blobs::fnv_bytes(&bytes)
+                );
+                let file = protocol::MediaFile::new(id.clone(), protocol::MediaKind::Avatar);
+                if account
+                    .ctx
+                    .landed(&file, &format!("signal://avatar/{conversation}"), &bytes)
+                    .is_some()
+                {
+                    let _ = account.ctx.avatar(&conversation, &id);
                 }
-            };
-            let conversation = peer.conversation();
-            // A new picture is a new id, so the shell never draws the old one in its place.
-            let id = format!("signal:avatar:{conversation}:{:016x}", crate::blobs::fnv_bytes(&bytes));
-            let file = protocol::MediaFile::new(id.clone(), protocol::MediaKind::Avatar);
-            if account.ctx.landed(&file, &format!("signal://avatar/{conversation}"), &bytes).is_some() {
-                let _ = account.ctx.avatar(&conversation, &id);
             }
-        }
-    });
+        });
     if let Err(err) = spawned {
         tracing::warn!("chatd: Signal: {err}");
     }
@@ -687,37 +930,88 @@ fn refused(fault: Fault) -> Refusal {
 }
 
 fn peer(conversation: &str) -> Result<Peer, Fault> {
-    Peer::parse(conversation).ok_or_else(|| Fault::Refused("That conversation isn't one Signal knows.".to_owned()))
+    Peer::parse(conversation)
+        .ok_or_else(|| Fault::Refused("That conversation isn't one Signal knows.".to_owned()))
 }
 
 /// A message id this adapter made: when it was sent, and by whom.
 fn target(message_id: &str) -> Result<(u64, String), Fault> {
-    wire::parse_message_id(message_id).ok_or_else(|| Fault::Refused("That message is no longer there.".to_owned()))
+    wire::parse_message_id(message_id)
+        .ok_or_else(|| Fault::Refused("That message is no longer there.".to_owned()))
 }
 
-fn send_text(account: &Account, conversation: &str, text: &str, reply_to: Option<&str>) -> Result<Message, Fault> {
+fn send_text(
+    account: &Account,
+    conversation: &str,
+    text: &str,
+    reply_to: Option<&str>,
+) -> Result<Message, Fault> {
     let to = peer(conversation)?;
     let quote = match reply_to.map(target).transpose()? {
         Some((sent, author)) => {
-            let text = account.ctx.stored_message(conversation, &wire::message_id(sent, &author)).ok().flatten().map_or_else(String::new, |m| m.text);
+            let text = account
+                .ctx
+                .stored_message(conversation, &wire::message_id(sent, &author))
+                .ok()
+                .flatten()
+                .map_or_else(String::new, |m| m.text);
             Some(Quote { sent, author, text })
         }
         None => None,
     };
-    let sent = account.wire.send(&to, Body::Text { text: text.to_owned(), quote: quote.clone() })?;
+    let sent = account.wire.send(
+        &to,
+        Body::Text {
+            text: text.to_owned(),
+            quote: quote.clone(),
+        },
+    )?;
     account.live().sent(sent, conversation);
-    let words = Text { author: account.me.clone(), name: account.name.clone(), sent, text: text.to_owned(), quote, ..Text::default() };
+    let words = Text {
+        author: account.me.clone(),
+        name: account.name.clone(),
+        sent,
+        text: text.to_owned(),
+        quote,
+        ..Text::default()
+    };
     Ok(message(account, &words, true))
 }
 
-fn react(account: &Account, conversation: &str, message_id: &str, emoji: &str, on: bool) -> Result<(), Fault> {
+fn react(
+    account: &Account,
+    conversation: &str,
+    message_id: &str,
+    emoji: &str,
+    on: bool,
+) -> Result<(), Fault> {
     let to = peer(conversation)?;
     let (sent, author) = target(message_id)?;
     // One reaction a person, on Signal: taking back sends the one being taken back.
-    account.wire.send(&to, Body::React { author, target: sent, emoji: emoji.to_owned(), remove: !on })?;
-    let replaced = account.live().react(message_id, &account.me, on.then_some(emoji));
+    account.wire.send(
+        &to,
+        Body::React {
+            author,
+            target: sent,
+            emoji: emoji.to_owned(),
+            remove: !on,
+        },
+    )?;
+    let replaced = account
+        .live()
+        .react(message_id, &account.me, on.then_some(emoji));
     if let Some(old) = replaced.filter(|_| on) {
-        let _ = account.ctx.reacted(conversation, message_id, &Reaction { emoji: old, file: None, count: 1, mine: true }, false);
+        let _ = account.ctx.reacted(
+            conversation,
+            message_id,
+            &Reaction {
+                emoji: old,
+                file: None,
+                count: 1,
+                mine: true,
+            },
+            false,
+        );
     }
     Ok(())
 }
@@ -725,7 +1019,9 @@ fn react(account: &Account, conversation: &str, message_id: &str, emoji: &str, o
 fn own(account: &Account, message_id: &str) -> Result<u64, Fault> {
     let (sent, author) = target(message_id)?;
     if author != account.me {
-        return Err(Fault::Refused("Only your own messages can be changed.".to_owned()));
+        return Err(Fault::Refused(
+            "Only your own messages can be changed.".to_owned(),
+        ));
     }
     Ok(sent)
 }
@@ -733,7 +1029,13 @@ fn own(account: &Account, message_id: &str) -> Result<u64, Fault> {
 fn edit(account: &Account, conversation: &str, message_id: &str, text: &str) -> Result<(), Fault> {
     let to = peer(conversation)?;
     let sent = own(account, message_id)?;
-    account.wire.send(&to, Body::Edit { target: sent, text: text.to_owned() })?;
+    account.wire.send(
+        &to,
+        Body::Edit {
+            target: sent,
+            text: text.to_owned(),
+        },
+    )?;
     if let Ok(Some(mut message)) = account.ctx.stored_message(conversation, message_id) {
         message.text = text.to_owned();
         message.edited = true;
@@ -768,7 +1070,10 @@ fn mark_read(account: &Account, conversation: &str, message_id: &str) {
         return;
     }
     if let Err(fault) = account.wire.read(&read, receipts) {
-        tracing::warn!("chatd: Signal: read: {}", super::net::redact(&fault.to_string()));
+        tracing::warn!(
+            "chatd: Signal: read: {}",
+            super::net::redact(&fault.to_string())
+        );
     }
 }
 
@@ -778,7 +1083,12 @@ fn typing(account: &Account, conversation: &str) {
     };
     {
         let mut live = account.live();
-        if !live.typing || live.typed.get(conversation).is_some_and(|told| told.elapsed() < TYPING_EVERY) {
+        if !live.typing
+            || live
+                .typed
+                .get(conversation)
+                .is_some_and(|told| told.elapsed() < TYPING_EVERY)
+        {
             return;
         }
         live.typed.retain(|_, told| told.elapsed() < TYPING_EVERY);
@@ -793,10 +1103,14 @@ mod tests {
 
     #[test]
     fn a_session_names_one_account_and_says_nothing_of_its_key() {
-        let session = r#"{"aci":"0f6c2a3e-1b4d-4e5f-8a9b-0c1d2e3f4a5b","name":"Ada","vault":"00ff"}"#;
+        let session =
+            r#"{"aci":"0f6c2a3e-1b4d-4e5f-8a9b-0c1d2e3f4a5b","name":"Ada","vault":"00ff"}"#;
         let found = accounts(session).unwrap();
         assert_eq!(found.len(), 1);
-        assert_eq!((found[0].account.as_str(), found[0].name.as_str()), ("0f6c2a3e-1b4d-4e5f-8a9b-0c1d2e3f4a5b", "Ada"));
+        assert_eq!(
+            (found[0].account.as_str(), found[0].name.as_str()),
+            ("0f6c2a3e-1b4d-4e5f-8a9b-0c1d2e3f4a5b", "Ada")
+        );
         assert!(accounts(r#"{"aci":"../etc"}"#).is_err());
         assert_eq!(without(session, &found[0].account), None);
         assert!(!protocol::redact(session).contains("00ff"));
@@ -817,7 +1131,10 @@ mod tests {
         for sent in [1, 2, 3] {
             live.unread("c", "a", sent);
         }
-        assert_eq!(live.read_upto("c", 2), vec![("a".to_owned(), 1), ("a".to_owned(), 2)]);
+        assert_eq!(
+            live.read_upto("c", 2),
+            vec![("a".to_owned(), 1), ("a".to_owned(), 2)]
+        );
         assert_eq!(live.unread["c"].len(), 1);
         assert_eq!(live.read_upto("c", 3).len(), 1);
         assert!(!live.unread.contains_key("c"));

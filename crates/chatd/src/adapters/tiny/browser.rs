@@ -4,11 +4,11 @@
 //! and stops listening. Nothing here is logged: the query holds a one-time code.
 
 use base64::Engine;
+use protocol::web_sign_in::{AuthHandle, AuthRequest, WebSignIn};
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use protocol::web_sign_in::{AuthHandle, AuthRequest, WebSignIn};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -25,7 +25,8 @@ const HEAD_MAX: usize = 8 * 1024;
 /// 32 random bytes, base64url without padding: 43 letters.
 pub fn random() -> Result<String, String> {
     let mut bytes = [0u8; 32];
-    getrandom::fill(&mut bytes).map_err(|_| "tinyclient couldn't make a sign-in key on this computer.".to_owned())?;
+    getrandom::fill(&mut bytes)
+        .map_err(|_| "tinyclient couldn't make a sign-in key on this computer.".to_owned())?;
     Ok(b64(&bytes))
 }
 
@@ -50,7 +51,9 @@ pub fn web_link(url: &str) -> bool {
     let lower = url.get(..8).unwrap_or(url).to_ascii_lowercase();
     (lower.starts_with("https://") || lower.starts_with("http://"))
         && url.len() <= 8 * 1024
-        && !url.chars().any(|c| c.is_whitespace() || c.is_control() || c == '"')
+        && !url
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || c == '"')
 }
 
 /// The system browser, at `url`. Only a web link is opened. On a phone, which has no browser to
@@ -74,13 +77,18 @@ static AUTH: Mutex<Option<Box<dyn AuthHandle>>> = Mutex::new(None);
 
 /// Names the redirect the next page opened on a phone comes back to.
 pub fn set_callback(redirect_uri: &str) {
-    *CALLBACK.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(redirect_uri.to_owned());
+    *CALLBACK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(redirect_uri.to_owned());
 }
 
 /// Takes a phone's authentication session away: the sign-in is over, one way or another. Nothing
 /// on a desktop, whose browser tab stays and says it can be closed.
 pub fn close_auth() {
-    let showing = AUTH.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
+    let showing = AUTH
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
     if let Some(mut showing) = showing {
         showing.close();
     }
@@ -91,7 +99,11 @@ pub fn close_auth() {
 /// redirect itself, it hands it over and it is delivered to that listener here (`replay`), so
 /// either way the one listener decides.
 fn phone_open(web: &dyn WebSignIn, url: &str) -> Result<(), String> {
-    let callback = CALLBACK.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone().ok_or_else(|| NOT_OPENED.to_owned())?;
+    let callback = CALLBACK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+        .ok_or_else(|| NOT_OPENED.to_owned())?;
     let to = callback.clone();
     let auth = AuthRequest {
         url: url.to_owned(),
@@ -105,7 +117,11 @@ fn phone_open(web: &dyn WebSignIn, url: &str) -> Result<(), String> {
         tracing::warn!("chatd: the sign-in page could not be shown: {why}");
         NOT_OPENED.to_owned()
     })?;
-    if let Some(mut old) = AUTH.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).replace(showing) {
+    if let Some(mut old) = AUTH
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .replace(showing)
+    {
         old.close();
     }
     Ok(())
@@ -120,7 +136,10 @@ pub fn replay(callback: &str, redirect: &str) {
     if !(rest.is_empty() || rest.starts_with('?')) {
         return;
     }
-    let Some(host) = callback.strip_prefix("http://").and_then(|rest| rest.split('/').next()) else {
+    let Some(host) = callback
+        .strip_prefix("http://")
+        .and_then(|rest| rest.split('/').next())
+    else {
         return;
     };
     if !host.starts_with("127.0.0.1:") {
@@ -130,7 +149,10 @@ pub fn replay(callback: &str, redirect: &str) {
         return;
     };
     let _ = stream.set_read_timeout(Some(READ));
-    let _ = write!(stream, "GET /callback{rest} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    let _ = write!(
+        stream,
+        "GET /callback{rest} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+    );
     let mut answer = Vec::new();
     let _ = stream.read_to_end(&mut answer);
 }
@@ -157,14 +179,26 @@ fn run_opener(program: &str, url: &str) -> Result<(), String> {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return if status.success() { Ok(()) } else { Err(NOT_OPENED.to_owned()) },
+            Ok(Some(status)) => {
+                return if status.success() {
+                    Ok(())
+                } else {
+                    Err(NOT_OPENED.to_owned())
+                }
+            }
             Ok(None) if Instant::now() < deadline => std::thread::sleep(TICK),
             result => {
                 let failed = result.is_err();
                 // Some handlers remain alive for the browser's entire lifetime.
                 // Reap them in the background and keep listening for the callback.
-                std::thread::spawn(move || { let _ = child.wait(); });
-                return if failed { Err(NOT_OPENED.to_owned()) } else { Ok(()) };
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                return if failed {
+                    Err(NOT_OPENED.to_owned())
+                } else {
+                    Ok(())
+                };
             }
         }
     }
@@ -179,7 +213,14 @@ fn system_open(url: &str) -> Result<(), String> {
     let (verb, file) = (wide("open"), wide(url));
     // SAFETY: both strings are NUL-terminated and outlive the call; the rest may be null.
     let code = unsafe {
-        ShellExecuteW(std::ptr::null_mut(), verb.as_ptr(), file.as_ptr(), std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL)
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
     } as isize;
     // Above 32 a handler took it.
     if code > 32 {
@@ -189,7 +230,8 @@ fn system_open(url: &str) -> Result<(), String> {
     }
 }
 
-const NOT_OPENED: &str = "Your browser didn't open. Choose Open the page again, or set a default browser.";
+const NOT_OPENED: &str =
+    "Your browser didn't open. Choose Open the page again, or set a default browser.";
 
 /// How the wait for the browser ended.
 #[derive(Debug, PartialEq, Eq)]
@@ -258,7 +300,11 @@ fn answer(mut stream: TcpStream, state: &str) -> Option<Back> {
         return None;
     }
     if let Some(error) = field("error") {
-        let words = if error == "not_member" { NOT_MEMBER_PAGE } else { FAILED_PAGE };
+        let words = if error == "not_member" {
+            NOT_MEMBER_PAGE
+        } else {
+            FAILED_PAGE
+        };
         reply(&mut stream, "200 OK", &page(words));
         return Some(Back::Error(error));
     }
@@ -319,9 +365,12 @@ fn decode(text: &str) -> Option<String> {
 }
 
 const DONE_PAGE: &str = "You can close this tab and return to tinyclient.";
-const NOT_MEMBER_PAGE: &str = "You're not a member of this server yet. Ask for an invite. You can close this tab.";
-const FAILED_PAGE: &str = "tinyclient couldn't finish signing in. You can close this tab and try again from tinyclient.";
-const STALE_PAGE: &str = "This sign-in didn't start in tinyclient, or it has ended. Start again from tinyclient.";
+const NOT_MEMBER_PAGE: &str =
+    "You're not a member of this server yet. Ask for an invite. You can close this tab.";
+const FAILED_PAGE: &str =
+    "tinyclient couldn't finish signing in. You can close this tab and try again from tinyclient.";
+const STALE_PAGE: &str =
+    "This sign-in didn't start in tinyclient, or it has ended. Start again from tinyclient.";
 const OTHER_PAGE: &str = "Nothing is here.";
 
 /// A page of one sentence. The words are escaped, though every one is this file's own.
@@ -370,9 +419,14 @@ mod tests {
         let verifier = random().unwrap();
         assert_eq!(verifier.len(), 43);
         assert_ne!(verifier, random().unwrap());
-        assert!(verifier.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+        assert!(verifier
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
         // RFC 7636, appendix B.
-        assert_eq!(challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"), "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM");
+        assert_eq!(
+            challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
         assert!(same("abc", "abc"));
         assert!(!same("abc", "abd"));
         assert!(!same("abc", "abcd"));
@@ -381,13 +435,19 @@ mod tests {
 
     #[test]
     fn only_the_callback_is_read_and_its_fields_are_decoded() {
-        assert_eq!(callback_query("GET /callback?code=a&state=b HTTP/1.1"), Some("code=a&state=b"));
+        assert_eq!(
+            callback_query("GET /callback?code=a&state=b HTTP/1.1"),
+            Some("code=a&state=b")
+        );
         assert_eq!(callback_query("GET /callback HTTP/1.1"), Some(""));
         assert_eq!(callback_query("GET /favicon.ico HTTP/1.1"), None);
         assert_eq!(callback_query("POST /callback?code=a HTTP/1.1"), None);
         assert_eq!(callback_query("GET /callbackx?code=a HTTP/1.1"), None);
         assert_eq!(callback_query("GET /callback?code=a"), None);
-        assert_eq!(field("code=a%2Bb%3D&state=s+t", "code").as_deref(), Some("a+b="));
+        assert_eq!(
+            field("code=a%2Bb%3D&state=s+t", "code").as_deref(),
+            Some("a+b=")
+        );
         assert_eq!(field("code=a&state=s+t", "state").as_deref(), Some("s t"));
         assert_eq!(field("code=a&code=b", "code").as_deref(), Some("a"));
         assert_eq!(field("error=not_member", "code"), None);

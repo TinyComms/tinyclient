@@ -5,7 +5,10 @@ use super::emoji;
 use super::{https_host, within, Fault, Slack, SEARCHED, SEARCH_EVERY, UNKNOWN};
 use crate::adapters::{Failure, Members};
 use crate::store::{ConversationRow, PersonDetails, PersonRow};
-use protocol::{Activity, ActivityKind, Mark, MediaFile, MediaKind, MemberSection, Person, Presence, Relation, SEARCH_MIN_CHARS};
+use protocol::{
+    Activity, ActivityKind, Mark, MediaFile, MediaKind, MemberSection, Person, Presence, Relation,
+    SEARCH_MIN_CHARS,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
@@ -59,7 +62,10 @@ const SLACKBOT: &str = "USLACKBOT";
 /// Unverified against a real workspace: `is_stranger` and the profile's `team` for someone of
 /// another organization are the community's reading of Slack Connect users.
 fn mark_of(user: &Value, workspace: &str) -> Option<Mark> {
-    let team = [&user["team_id"], &user["profile"]["team"]].into_iter().filter_map(Value::as_str).find(|team| !team.is_empty());
+    let team = [&user["team_id"], &user["profile"]["team"]]
+        .into_iter()
+        .filter_map(Value::as_str)
+        .find(|team| !team.is_empty());
     // On Enterprise Grid a colleague's team is another workspace of the same organization.
     let org = user["enterprise_user"].is_object();
     if user["deleted"] == true {
@@ -119,8 +125,13 @@ fn unescaped(text: &str) -> String {
     let bytes = text.as_bytes();
     let (mut out, mut at) = (Vec::with_capacity(bytes.len()), 0);
     while at < bytes.len() {
-        let hex = bytes.get(at + 1..at + 3).and_then(|hex| std::str::from_utf8(hex).ok());
-        match (bytes[at], hex.and_then(|hex| u8::from_str_radix(hex, 16).ok())) {
+        let hex = bytes
+            .get(at + 1..at + 3)
+            .and_then(|hex| std::str::from_utf8(hex).ok());
+        match (
+            bytes[at],
+            hex.and_then(|hex| u8::from_str_radix(hex, 16).ok()),
+        ) {
             (b'%', Some(byte)) => {
                 out.push(byte);
                 at += 3;
@@ -187,15 +198,26 @@ impl Slack {
         if self.pace(&method) {
             return Err(Fault::Net(format!("{path}: stopped")));
         }
-        let sent = self.agent.post(&url).header("Cookie", self.cookie()).send_json(&body);
+        let sent = self
+            .agent
+            .post(&url)
+            .header("Cookie", self.cookie())
+            .send_json(&body);
         let mut response = sent.map_err(|err| Fault::Net(err.to_string()))?;
         self.reissued(response.headers());
         if response.status().as_u16() == 429 {
             // Not retried: every caller has a documented call to fall back on, or can wait.
-            let wait = response.headers().get("retry-after").and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok());
+            let wait = response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse().ok());
             return Err(Fault::Limited(wait.unwrap_or(5)));
         }
-        let body: Value = response.body_mut().read_json().map_err(|err| Fault::Net(err.to_string()))?;
+        let body: Value = response
+            .body_mut()
+            .read_json()
+            .map_err(|err| Fault::Net(err.to_string()))?;
         self.checked(path, body)
     }
 
@@ -205,9 +227,15 @@ impl Slack {
         let Some(url) = profile[format!("image_{size}")].as_str() else {
             // What the web client's own lookup returns carries no addresses, only the hash the
             // web client builds them from. Seen on a real workspace: every profile was like this.
-            let hash = profile["avatar_hash"].as_str().filter(|hash| !hash.is_empty() && hash.bytes().all(|b| b.is_ascii_alphanumeric()))?;
-            let team = profile["team"].as_str().filter(|team| !team.is_empty() && team.bytes().all(|b| b.is_ascii_alphanumeric()))?;
-            return Some(format!("https://ca.slack-edge.com/{team}-{id}-{hash}-{size}"));
+            let hash = profile["avatar_hash"].as_str().filter(|hash| {
+                !hash.is_empty() && hash.bytes().all(|b| b.is_ascii_alphanumeric())
+            })?;
+            let team = profile["team"].as_str().filter(|team| {
+                !team.is_empty() && team.bytes().all(|b| b.is_ascii_alphanumeric())
+            })?;
+            return Some(format!(
+                "https://ca.slack-edge.com/{team}-{id}-{hash}-{size}"
+            ));
         };
         if self.hosted(url) {
             return Some(url.to_owned());
@@ -224,7 +252,8 @@ impl Slack {
         };
         self.ctx.media(&[(file, picture.to_owned())])?;
         if !large.is_empty() && large != picture {
-            self.ctx.media_variants(id, &[(AVATAR_LARGE, large.to_owned())])?;
+            self.ctx
+                .media_variants(id, &[(AVATAR_LARGE, large.to_owned())])?;
         }
         Ok(())
     }
@@ -241,7 +270,8 @@ impl Slack {
     /// file is registered before the person who names it, and the person before any message
     /// or row of theirs.
     pub(super) fn learn(&self, users: &[Value]) -> Vec<(String, User)> {
-        let (mut learned, mut rows, mut details, mut doing) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (mut learned, mut rows, mut details, mut doing) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for user in users {
             let Some(id) = user["id"].as_str() else {
                 continue;
@@ -249,17 +279,39 @@ impl Slack {
             let profile = &user["profile"];
             if std::env::var_os("TINYCLIENT_SHAPES").is_some() {
                 // Field names only, never values: for comparing what Slack sends with what is read.
-                let keys = |value: &Value| value.as_object().map(|map| map.keys().cloned().collect::<Vec<_>>().join(",")).unwrap_or_default();
-                tracing::warn!("chatd: Slack: user shape [{}] profile [{}]", keys(user), keys(profile));
+                let keys = |value: &Value| {
+                    value
+                        .as_object()
+                        .map(|map| map.keys().cloned().collect::<Vec<_>>().join(","))
+                        .unwrap_or_default()
+                };
+                tracing::warn!(
+                    "chatd: Slack: user shape [{}] profile [{}]",
+                    keys(user),
+                    keys(profile)
+                );
             }
             // Slack's rule for the name it shows: the display name, else the real one.
-            let names = [&profile["display_name"], &profile["real_name"], &user["real_name"], &user["name"]];
-            let name = names.into_iter().filter_map(Value::as_str).find(|name| !name.is_empty());
+            let names = [
+                &profile["display_name"],
+                &profile["real_name"],
+                &user["real_name"],
+                &user["name"],
+            ];
+            let name = names
+                .into_iter()
+                .filter_map(Value::as_str)
+                .find(|name| !name.is_empty());
             let large = self.picture(id, profile, AVATAR_LARGE).unwrap_or_default();
-            let picture = self.picture(id, profile, AVATAR).or_else(|| self.picture(id, profile, 48)).unwrap_or_else(|| large.clone());
+            let picture = self
+                .picture(id, profile, AVATAR)
+                .or_else(|| self.picture(id, profile, 48))
+                .unwrap_or_else(|| large.clone());
             let avatar = (!picture.is_empty()).then(|| {
                 // A changed picture is a new hash, so a new id.
-                let hash = profile["avatar_hash"].as_str().map_or_else(|| format!("{:x}", super::fnv(&picture)), str::to_owned);
+                let hash = profile["avatar_hash"]
+                    .as_str()
+                    .map_or_else(|| format!("{:x}", super::fnv(&picture)), str::to_owned);
                 format!("avatar:{id}:{hash}")
             });
             if let Some(avatar) = &avatar {
@@ -267,9 +319,15 @@ impl Slack {
                     tracing::warn!("chatd: Slack: {err}");
                 }
             }
-            let status_emoji = profile["status_emoji"].as_str().unwrap_or("").trim_matches(':');
+            let status_emoji = profile["status_emoji"]
+                .as_str()
+                .unwrap_or("")
+                .trim_matches(':');
             let status_emoji = emoji::standard(status_emoji).unwrap_or_default();
-            let status = format!("{status_emoji} {}", profile["status_text"].as_str().unwrap_or(""));
+            let status = format!(
+                "{status_emoji} {}",
+                profile["status_text"].as_str().unwrap_or("")
+            );
             let mark = mark_of(user, &self.session.team_id);
             let known = User {
                 name: name.unwrap_or(id).to_owned(),
@@ -284,19 +342,37 @@ impl Slack {
             rows.push(self.person_row(id, &known));
             let title = profile["title"].as_str().unwrap_or("").to_owned();
             let utc_offset = user["tz_offset"].as_i64().map(|offset| offset as i32);
-            details.push((id.to_owned(), PersonDetails { title, utc_offset, mark }));
-            doing.push((id.to_owned(), status_emoji.to_owned(), huddle(huddling(profile))));
+            details.push((
+                id.to_owned(),
+                PersonDetails {
+                    title,
+                    utc_offset,
+                    mark,
+                },
+            ));
+            doing.push((
+                id.to_owned(),
+                status_emoji.to_owned(),
+                huddle(huddling(profile)),
+            ));
             let kept = Kept {
                 user: known.clone(),
                 form: NOTE,
                 picture,
                 large,
             };
-            self.ctx.set_note(&format!("u:{id}"), &serde_json::to_string(&kept).unwrap_or_default());
+            self.ctx.set_note(
+                &format!("u:{id}"),
+                &serde_json::to_string(&kept).unwrap_or_default(),
+            );
             self.remember(id, &known);
             learned.push((id.to_owned(), known));
         }
-        if let Err(err) = self.ctx.people(&rows).and_then(|()| self.ctx.details(&details)) {
+        if let Err(err) = self
+            .ctx
+            .people(&rows)
+            .and_then(|()| self.ctx.details(&details))
+        {
             tracing::warn!("chatd: Slack: {err}");
         }
         // The status emoji and a huddle, kept like presence: only for people the user owns or
@@ -379,14 +455,18 @@ impl Slack {
         unknown.dedup();
         let mut singles = SINGLES;
         for batch in unknown.chunks(BATCH) {
-            let wanted: serde_json::Map<String, Value> = batch.iter().map(|id| ((*id).clone(), json!(0))).collect();
+            let wanted: serde_json::Map<String, Value> =
+                batch.iter().map(|id| ((*id).clone(), json!(0))).collect();
             let asked = json!({"check_interaction": true, "include_profile_only_users": true, "updated_ids": wanted});
             let found = match self.edge("users/info", asked) {
                 Ok(found) => self.learn(found["results"].as_array().map_or(&[][..], Vec::as_slice)),
                 Err(_) => Vec::new(),
             };
             // What the batch did not answer is asked the documented way, a few at a time.
-            for id in batch.iter().filter(|id| !found.iter().any(|(known, _)| known == **id)) {
+            for id in batch
+                .iter()
+                .filter(|id| !found.iter().any(|(known, _)| known == **id))
+            {
                 if singles == 0 {
                     return;
                 }
@@ -405,7 +485,11 @@ impl Slack {
             handle: user.handle.clone(),
             avatar: user.avatar(),
             bot: user.bot,
-            relation: if partner { Relation::Contact } else { Relation::None },
+            relation: if partner {
+                Relation::Contact
+            } else {
+                Relation::None
+            },
             presence: self.ctx.presence_of(id),
             status: user.status.clone(),
             ..Person::new(self.ctx.key(id), "")
@@ -420,8 +504,13 @@ impl Slack {
         let asked = query.trim().to_lowercase();
         let wait = {
             let state = self.state();
-            let worth = asked.chars().count() >= SEARCH_MIN_CHARS && !state.searched.contains(&asked);
-            worth.then(|| state.search_at.map_or(Duration::ZERO, |at| SEARCH_EVERY.saturating_sub(at.elapsed())))
+            let worth =
+                asked.chars().count() >= SEARCH_MIN_CHARS && !state.searched.contains(&asked);
+            worth.then(|| {
+                state.search_at.map_or(Duration::ZERO, |at| {
+                    SEARCH_EVERY.saturating_sub(at.elapsed())
+                })
+            })
         };
         if let Some(wait) = wait {
             if !wait.is_zero() && self.ctx.pause(wait) {
@@ -450,9 +539,18 @@ impl Slack {
     /// One window of a conversation's members. Slack pages by cursor, so the ids walked so far
     /// are kept with the cursor and a later window continues from there: nothing is fetched
     /// twice, and nothing past the first [`ROSTER`]. Only the window's people are looked up.
-    pub(super) fn members(&self, conversation: &str, offset: u32, limit: u32) -> Result<Members, Fault> {
+    pub(super) fn members(
+        &self,
+        conversation: &str,
+        offset: u32,
+        limit: u32,
+    ) -> Result<Members, Fault> {
         let channel = super::thread_of(conversation).map_or(conversation, |(channel, _)| channel);
-        let held = self.state().roster.take().filter(|roster| roster.channel == channel);
+        let held = self
+            .state()
+            .roster
+            .take()
+            .filter(|roster| roster.channel == channel);
         let mut roster = held.unwrap_or_else(|| Roster {
             channel: channel.to_owned(),
             ids: Vec::new(),
@@ -460,15 +558,24 @@ impl Slack {
             count: None,
         });
         let walked = self.walk(&mut roster, (offset as usize + limit as usize).min(ROSTER));
-        let window: Vec<String> = roster.ids.iter().skip(offset as usize).take(limit as usize).cloned().collect();
+        let window: Vec<String> = roster
+            .ids
+            .iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .cloned()
+            .collect();
         let (walked_to, count) = (roster.ids.len(), roster.count);
         // What was walked is kept even when a page failed: the next window goes on from it.
         self.state().roster = Some(roster);
         walked?;
         self.users(&window);
-        let members: Vec<Person> = window.iter().map(|id| self.person(id, &self.user(id))).collect();
+        let members: Vec<Person> = window
+            .iter()
+            .map(|id| self.person(id, &self.user(id)))
+            .collect();
         Ok(Members {
-        pending: false,
+            pending: false,
             // Slack's member list has no sections.
             sections: vec![MemberSection {
                 name: "Members".to_owned(),
@@ -485,7 +592,11 @@ impl Slack {
             let Some(cursor) = roster.cursor.take() else {
                 break;
             };
-            let asked = [("channel", roster.channel.as_str()), ("limit", MEMBERS_PAGE), ("cursor", cursor.as_str())];
+            let asked = [
+                ("channel", roster.channel.as_str()),
+                ("limit", MEMBERS_PAGE),
+                ("cursor", cursor.as_str()),
+            ];
             let listed = match self.api("conversations.members", &asked) {
                 Ok(listed) => listed,
                 Err(fault) => {
@@ -493,15 +604,30 @@ impl Slack {
                     return Err(fault);
                 }
             };
-            let page = listed["members"].as_array().into_iter().flatten().filter_map(Value::as_str);
+            let page = listed["members"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str);
             roster.ids.extend(page.map(str::to_owned));
             roster.ids.truncate(ROSTER);
-            let next = listed["response_metadata"]["next_cursor"].as_str().unwrap_or("");
-            roster.cursor = (!next.is_empty() && roster.ids.len() < ROSTER).then(|| next.to_owned());
+            let next = listed["response_metadata"]["next_cursor"]
+                .as_str()
+                .unwrap_or("");
+            roster.cursor =
+                (!next.is_empty() && roster.ids.len() < ROSTER).then(|| next.to_owned());
         }
         if roster.count.is_none() {
-            let info = self.api("conversations.info", &[("channel", &roster.channel), ("include_num_members", "true")]);
-            let counted = info.ok().and_then(|info| info["channel"]["num_members"].as_u64());
+            let info = self.api(
+                "conversations.info",
+                &[
+                    ("channel", &roster.channel),
+                    ("include_num_members", "true"),
+                ],
+            );
+            let counted = info
+                .ok()
+                .and_then(|info| info["channel"]["num_members"].as_u64());
             roster.count = Some(counted.map_or(roster.ids.len() as u32, |count| count as u32));
         }
         Ok(())
@@ -510,23 +636,34 @@ impl Slack {
     /// `member_joined_channel`, `member_left_channel`: the list on screen has a row more or
     /// less. Someone who joins a list still being walked turns up when the walk reaches them.
     pub(super) fn member_moved(&self, event: &Value) {
-        let (Some(channel), Some(user)) = (event["channel"].as_str(), event["user"].as_str()) else {
+        let (Some(channel), Some(user)) = (event["channel"].as_str(), event["user"].as_str())
+        else {
             return;
         };
         let joined = event["type"] == "member_joined_channel";
         {
             let mut state = self.state();
-            let Some(roster) = state.roster.as_mut().filter(|roster| roster.channel == channel) else {
+            let Some(roster) = state
+                .roster
+                .as_mut()
+                .filter(|roster| roster.channel == channel)
+            else {
                 return;
             };
             let at = roster.ids.iter().position(|id| id == user);
             match (joined, at) {
-                (true, None) if roster.cursor.is_none() && roster.ids.len() < ROSTER => roster.ids.push(user.to_owned()),
+                (true, None) if roster.cursor.is_none() && roster.ids.len() < ROSTER => {
+                    roster.ids.push(user.to_owned())
+                }
                 (false, Some(at)) => drop(roster.ids.remove(at)),
                 _ => {}
             }
             if let Some(count) = roster.count.as_mut() {
-                *count = if joined { *count + 1 } else { count.saturating_sub(1) };
+                *count = if joined {
+                    *count + 1
+                } else {
+                    count.saturating_sub(1)
+                };
             }
         }
         self.ctx.members_changed(channel);
@@ -535,11 +672,15 @@ impl Slack {
     /// The direct conversation with a person, opened on Slack if there was none. Opening sends
     /// nothing to them.
     pub(super) fn start_direct(&self, person: &str) -> Result<String, Fault> {
-        let opened = self.api("conversations.open", &[("users", person), ("return_im", "true")])?;
+        let opened = self.api(
+            "conversations.open",
+            &[("users", person), ("return_im", "true")],
+        )?;
         let Some(id) = opened["channel"]["id"].as_str() else {
             return Err(Fault::Net("conversations.open: no channel".to_owned()));
         };
-        self.direct_opened(id, person).map_err(|err| Fault::Net(err.to_string()))?;
+        self.direct_opened(id, person)
+            .map_err(|err| Fault::Net(err.to_string()))?;
         Ok(id.to_owned())
     }
 
@@ -553,13 +694,20 @@ impl Slack {
         let pairs = kept.split(',').filter_map(|pair| pair.split_once('='));
         let mut state = self.state();
         for (person, channel) in pairs {
-            state.partners.entry(person.to_owned()).or_insert_with(|| channel.to_owned());
+            state
+                .partners
+                .entry(person.to_owned())
+                .or_insert_with(|| channel.to_owned());
         }
     }
 
     pub(super) fn keep_partners(&self) {
         let state = self.state();
-        let mut pairs: Vec<String> = state.partners.iter().map(|(person, channel)| format!("{person}={channel}")).collect();
+        let mut pairs: Vec<String> = state
+            .partners
+            .iter()
+            .map(|(person, channel)| format!("{person}={channel}"))
+            .collect();
         drop(state);
         pairs.sort_unstable();
         self.ctx.set_note("partners", &pairs.join(","));
@@ -569,7 +717,9 @@ impl Slack {
     pub(super) fn direct_opened(&self, channel: &str, person: &str) -> rusqlite::Result<()> {
         let row = self.direct_row(channel, person);
         self.ctx.conversation(&row)?;
-        self.state().partners.insert(person.to_owned(), channel.to_owned());
+        self.state()
+            .partners
+            .insert(person.to_owned(), channel.to_owned());
         self.keep_partners();
         self.ctx.relation(person, Relation::Contact)
     }
@@ -603,7 +753,9 @@ impl Slack {
             return Ok(());
         };
         let channel = self.state().partners.get(id).cloned();
-        if let Some(channel) = channel.filter(|_| before.name != after.name || before.avatar != after.avatar) {
+        if let Some(channel) =
+            channel.filter(|_| before.name != after.name || before.avatar != after.avatar)
+        {
             if let Some(known) = self.ctx.known(&channel)? {
                 let mut row = self.direct_row(&channel, id);
                 row.group = known.group;
@@ -621,7 +773,8 @@ impl Slack {
         let partners: Vec<String> = self.state().partners.keys().cloned().collect();
         for id in partners {
             if let Some(user) = self.cached(&id) {
-                self.ctx.activity(&id, &user.emoji, huddle(user.huddle), true);
+                self.ctx
+                    .activity(&id, &user.emoji, huddle(user.huddle), true);
             }
         }
     }
@@ -641,7 +794,11 @@ impl Slack {
         };
         let me = self.me.get();
         let one = event["user"].as_str().into_iter();
-        let many = event["users"].as_array().into_iter().flatten().filter_map(Value::as_str);
+        let many = event["users"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str);
         for id in one.chain(many) {
             let presence = match (away, me.is_some_and(|me| me == id)) {
                 (false, _) => Presence::Online,
@@ -666,17 +823,29 @@ impl Slack {
     /// `presence_query` asks for the newcomers' state now.
     pub(super) fn watch(&self) {
         let watching = self.ctx.watching();
-        let mine = watching.people.iter().filter(|person| person.account() == self.ctx.account);
-        let mut ids: Vec<String> = mine.map(|person| person.id.clone()).chain(self.me.get().cloned()).collect();
+        let mine = watching
+            .people
+            .iter()
+            .filter(|person| person.account() == self.ctx.account);
+        let mut ids: Vec<String> = mine
+            .map(|person| person.id.clone())
+            .chain(self.me.get().cloned())
+            .collect();
         ids.sort();
         ids.dedup();
         let mut state = self.state();
         if state.watched == ids {
             return;
         }
-        let new: Vec<&String> = ids.iter().filter(|id| !state.watched.contains(id)).collect();
+        let new: Vec<&String> = ids
+            .iter()
+            .filter(|id| !state.watched.contains(id))
+            .collect();
         let mut frames = vec![json!({"type": "presence_sub", "ids": ids})];
-        frames.extend(new.chunks(100).map(|batch| json!({"type": "presence_query", "ids": batch})));
+        frames.extend(
+            new.chunks(100)
+                .map(|batch| json!({"type": "presence_query", "ids": batch})),
+        );
         for frame in frames {
             state.queue(frame);
         }
@@ -691,16 +860,31 @@ mod tests {
     #[test]
     fn someone_with_no_picture_of_their_own_gets_slacks_default_and_gravatar_is_never_asked() {
         let profile = "https://secure.gravatar.com/avatar/c8d4.jpg?s=72&d=https%3A%2F%2Fa.slack-edge.com%2Fdf10d%2Fimg%2Favatars%2Fava_0002-72.png";
-        assert_eq!(gravatar_default(profile).as_deref(), Some("https://a.slack-edge.com/df10d/img/avatars/ava_0002-72.png"));
+        assert_eq!(
+            gravatar_default(profile).as_deref(),
+            Some("https://a.slack-edge.com/df10d/img/avatars/ava_0002-72.png")
+        );
         // No fallback named, or not gravatar at all: nothing to register.
-        assert_eq!(gravatar_default("https://secure.gravatar.com/avatar/c8d4.jpg?s=72"), None);
-        assert_eq!(gravatar_default("https://example.org/a.png?d=https%3A%2F%2Fa.slack-edge.com%2Fa.png"), None);
-        assert_eq!(gravatar_default("https://gravatar.com.example.org/a?d=https%3A%2F%2Fa.slack-edge.com%2Fa.png"), None);
+        assert_eq!(
+            gravatar_default("https://secure.gravatar.com/avatar/c8d4.jpg?s=72"),
+            None
+        );
+        assert_eq!(
+            gravatar_default("https://example.org/a.png?d=https%3A%2F%2Fa.slack-edge.com%2Fa.png"),
+            None
+        );
+        assert_eq!(
+            gravatar_default(
+                "https://gravatar.com.example.org/a?d=https%3A%2F%2Fa.slack-edge.com%2Fa.png"
+            ),
+            None
+        );
     }
 
     #[test]
     fn a_note_in_an_older_form_reads_as_one_and_a_new_one_keeps_where_the_picture_is() {
-        let old: Kept = serde_json::from_str(r#"{"n":"Ana","h":"ana","a":"avatar:U1:abc"}"#).unwrap();
+        let old: Kept =
+            serde_json::from_str(r#"{"n":"Ana","h":"ana","a":"avatar:U1:abc"}"#).unwrap();
         assert_eq!((old.form, old.picture.as_str()), (0, ""));
         let kept = Kept {
             user: old.user,
@@ -709,6 +893,9 @@ mod tests {
             large: String::new(),
         };
         let read: Kept = serde_json::from_str(&serde_json::to_string(&kept).unwrap()).unwrap();
-        assert_eq!((read.form, read.user.name.as_str(), read.picture.as_str()), (NOTE, "Ana", kept.picture.as_str()));
+        assert_eq!(
+            (read.form, read.user.name.as_str(), read.picture.as_str()),
+            (NOTE, "Ana", kept.picture.as_str())
+        );
     }
 }

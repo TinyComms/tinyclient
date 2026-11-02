@@ -18,7 +18,9 @@ mod text;
 mod tree;
 
 use super::net::{address, browser, redact, Socket};
-use super::{keep_connected, serve_commands, About, Command, Context, Download, Failure, Refusal, Signed};
+use super::{
+    keep_connected, serve_commands, About, Command, Context, Download, Failure, Refusal, Signed,
+};
 use people::{Roster, User};
 use protocol::{Link, Message, Presence, Reaction, ReplyTo, ThreadSummary, THREAD_FACES};
 use serde::Deserialize;
@@ -77,18 +79,41 @@ const TREE_FRESH: Duration = Duration::from_secs(600);
 /// Frames kept for a socket that is down.
 const OUTBOX: usize = 64;
 /// Errors that mean this workspace's session is over. The other workspaces are untouched.
-const ENDED: &[&str] = &["invalid_auth", "not_authed", "account_inactive", "token_revoked", "token_expired"];
+const ENDED: &[&str] = &[
+    "invalid_auth",
+    "not_authed",
+    "account_inactive",
+    "token_revoked",
+    "token_expired",
+];
 /// Errors that mean Slack wants something done in its own app before it answers again, and the
 /// words for it. Unverified: these are the documented names; what a real workspace sends when
 /// it demands a second factor or a fresh organization sign-in was not seen.
 const DEMANDS: &[(&str, &str)] = &[
-    ("two_factor_setup_required", "Slack wants two-factor authentication set up. Finish that in the Slack app."),
-    ("org_login_required", "Your organization wants you to sign in again. Do that in the Slack app."),
-    ("team_access_not_granted", "This workspace has not let you in yet. Finish joining in the Slack app."),
-    ("password_change_required", "Slack wants your password changed. Do that in the Slack app."),
+    (
+        "two_factor_setup_required",
+        "Slack wants two-factor authentication set up. Finish that in the Slack app.",
+    ),
+    (
+        "org_login_required",
+        "Your organization wants you to sign in again. Do that in the Slack app.",
+    ),
+    (
+        "team_access_not_granted",
+        "This workspace has not let you in yet. Finish joining in the Slack app.",
+    ),
+    (
+        "password_change_required",
+        "Slack wants your password changed. Do that in the Slack app.",
+    ),
 ];
 /// Addresses Slack itself serves. Nothing else in a message is ever registered for fetching.
-const HOSTS: &[&str] = &["slack.com", "slack-edge.com", "slack-imgs.com", "slack-files.com"];
+const HOSTS: &[&str] = &[
+    "slack.com",
+    "slack-edge.com",
+    "slack-imgs.com",
+    "slack-files.com",
+];
 
 /// One workspace's part of the sign-in: what `accounts` hands to `start`.
 #[derive(Deserialize)]
@@ -151,30 +176,43 @@ pub(crate) fn reaction_rules() -> protocol::ReactionRules {
 /// A fault in words the user can read.
 fn reason(fault: Fault) -> String {
     let words = match fault {
-        Fault::Limited(seconds) => return format!("Slack is rate limiting you. Try again in {seconds} s."),
+        Fault::Limited(seconds) => {
+            return format!("Slack is rate limiting you. Try again in {seconds} s.")
+        }
         Fault::Auth(_) => "Slack signed you out of this workspace. Sign in again.",
         Fault::Net(_) => "Slack could not be reached.",
         Fault::Slack(error) => match error.as_str() {
             "cant_update_message" | "edit_window_closed" => "This message can no longer be edited.",
             "cant_delete_message" => "Slack does not let you delete this message.",
             "message_not_found" => "That message is gone.",
-            "too_many_reactions" => "You have added as many reactions to this message as Slack allows.",
+            "too_many_reactions" => {
+                "You have added as many reactions to this message as Slack allows."
+            }
             "too_many_emoji" => "This message has as many different reactions as Slack allows.",
             "invalid_name" => "Slack does not know that emoji.",
             "no_emoji_name" => "Slack has no name for that emoji, so it cannot be a reaction here.",
             "no_dnd_end" => "Slack's Do Not Disturb needs an end time. Set it in the Slack app.",
             "profile_set_failed" | "not_allowed" => "This workspace does not let you change that.",
             demand if DEMANDS.iter().any(|(name, _)| *name == demand) => {
-                return DEMANDS.iter().find(|(name, _)| *name == demand).map_or_else(String::new, |(_, words)| (*words).to_owned());
+                return DEMANDS
+                    .iter()
+                    .find(|(name, _)| *name == demand)
+                    .map_or_else(String::new, |(_, words)| (*words).to_owned());
             }
             "not_in_channel" => "You are not in this channel.",
             "msg_too_long" => "The message is too long for Slack.",
             "is_archived" => "This channel is archived.",
             "channel_not_found" => "Slack cannot find this conversation.",
             "no_text" => "Slack does not take an empty message.",
-            "thread_not_found" | "cannot_reply_to_message" => "That message can no longer be replied to.",
-            "user_not_found" | "user_disabled" | "cannot_dm_bot" => "Slack cannot open a conversation with them.",
-            error if error.starts_with("restricted_action") => "This workspace does not let you post here.",
+            "thread_not_found" | "cannot_reply_to_message" => {
+                "That message can no longer be replied to."
+            }
+            "user_not_found" | "user_disabled" | "cannot_dm_bot" => {
+                "Slack cannot open a conversation with them."
+            }
+            error if error.starts_with("restricted_action") => {
+                "This workspace does not let you post here."
+            }
             error => return format!("Slack refused ({error})."),
         },
     };
@@ -256,7 +294,8 @@ struct Pacer {
 /// Slack does not say whether the web client's token is counted by the same tiers.
 fn per_minute(method: &str) -> f64 {
     match method {
-        "users.setPresence" | "reactions.remove" | "emoji.list" | "usergroups.list" | "dnd.setSnooze" => 20.,
+        "users.setPresence" | "reactions.remove" | "emoji.list" | "usergroups.list"
+        | "dnd.setSnooze" => 20.,
         "conversations.members" | "users.info" | "users.profile.get" => 100.,
         // One message a second per channel, and the sign-in check is in a tier of its own.
         "chat.postMessage" | "auth.test" => 60.,
@@ -283,7 +322,9 @@ fn cover(stretches: &mut Vec<(String, String)>, oldest: &str, newest: &str) {
 
 /// The stretch that holds a message, if the cache is known to be whole around it.
 fn covering<'a>(stretches: &'a [(String, String)], ts: &str) -> Option<&'a (String, String)> {
-    stretches.iter().find(|(oldest, newest)| oldest.as_str() <= ts && ts <= newest.as_str())
+    stretches
+        .iter()
+        .find(|(oldest, newest)| oldest.as_str() <= ts && ts <= newest.as_str())
 }
 
 /// Which page of a channel is asked for.
@@ -327,11 +368,20 @@ fn escape(text: &str) -> String {
 fn mention_len(text: &str) -> Option<usize> {
     let end = text.find('>')?;
     let inner = text.strip_prefix('<')?.get(..end - 1)?;
-    let id = |rest: &str| !rest.is_empty() && rest.len() <= 24 && rest.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit());
+    let id = |rest: &str| {
+        !rest.is_empty()
+            && rest.len() <= 24
+            && rest
+                .bytes()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+    };
     let ok = match inner.as_bytes().first()? {
         b'@' => id(&inner[1..]),
         b'#' => id(&inner[1..]),
-        b'!' => matches!(&inner[1..], "here" | "channel" | "everyone") || inner[1..].strip_prefix("subteam^").is_some_and(id),
+        b'!' => {
+            matches!(&inner[1..], "here" | "channel" | "everyone")
+                || inner[1..].strip_prefix("subteam^").is_some_and(id)
+        }
         _ => false,
     };
     ok.then_some(end + 1)
@@ -339,7 +389,9 @@ fn mention_len(text: &str) -> Option<usize> {
 
 /// A part of a second that differs from call to call, for gaps that must not be in step.
 fn jitter() -> f64 {
-    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.subsec_nanos());
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.subsec_nanos());
     f64::from(nanos % 1_000_000) / 1_000_000.
 }
 
@@ -378,7 +430,11 @@ fn host(url: &str) -> &str {
 }
 
 fn text_of<'a>(value: &'a Value, names: &[&str]) -> &'a str {
-    names.iter().filter_map(|name| value[*name].as_str()).find(|text| !text.is_empty()).unwrap_or("")
+    names
+        .iter()
+        .filter_map(|name| value[*name].as_str())
+        .find(|text| !text.is_empty())
+        .unwrap_or("")
 }
 
 /// The workspaces of one sign-in: `teams` in what the helper prints now, or the single team of a
@@ -404,10 +460,16 @@ fn team_id(team: &Value) -> &str {
 /// needs the org-level token, which this has not been run against.
 pub fn accounts(session: &str) -> Result<Vec<Signed>, String> {
     let parsed: Value = serde_json::from_str(session).map_err(|err| err.to_string())?;
-    let cookie = parsed["cookie"].as_str().ok_or("the Slack session has no cookie")?;
+    let cookie = parsed["cookie"]
+        .as_str()
+        .ok_or("the Slack session has no cookie")?;
     let mut found: Vec<Signed> = Vec::new();
     for team in teams(&parsed) {
-        let (token, url, id) = (text_of(team, &["token"]), text_of(team, &["url"]), team_id(team));
+        let (token, url, id) = (
+            text_of(team, &["token"]),
+            text_of(team, &["url"]),
+            team_id(team),
+        );
         if token.is_empty() || url.is_empty() || found.iter().any(|signed| signed.account == id) {
             continue;
         }
@@ -469,54 +531,88 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
     if !api.ends_with('/') {
         api.push('/');
     }
-    let spawned = std::thread::Builder::new().name("slack".into()).spawn(move || {
-        if session.user_agent.is_empty() {
-            // A session stored before the helper recorded its browser: the same Safari.
-            session.user_agent = browser().to_owned();
-        }
-        let moved = api != session.url;
-        let agent = ureq::Agent::config_builder()
-            .tls_config(crate::tls::config())
-            .timeout_global(Some(Duration::from_secs(30)))
-            .http_status_as_error(false)
-            .user_agent(&session.user_agent)
-            .build()
-            .into();
-        let slack = Arc::new(Slack {
-            ctx,
-            agent,
-            cookie: Mutex::new(format!("d={}", session.cookie)),
-            edge: if moved { format!("{api}cache/") } else { "https://edgeapi.slack.com/cache/".to_owned() },
-            api,
-            moved,
-            session,
-            me: OnceLock::new(),
-            state: Mutex::new(State::default()),
-            pacer: Mutex::new(Pacer::default()),
-        });
-        let socket = slack.clone();
-        std::thread::spawn(move || keep_connected(&socket.ctx, || socket.connect()));
-        // A send with files uploads on a thread of its own, and previews are fetched on one,
-        // paced: the commands behind either (a cancel among them) are not held up.
-        let other = |command| match command {
-            Command::SendWith { conversation_id, client_id, text, reply_to, with } => {
-                let sending = slack.clone();
-                let (conversation, client) = (conversation_id.clone(), client_id.clone());
-                crate::blobs::upload::spawn(&slack.ctx, &conversation_id, &client_id, &with.files.clone(), move |up| {
-                    sending.send_with(&conversation, &client, &text, reply_to.as_deref(), &with, up)
-                });
+    let spawned = std::thread::Builder::new()
+        .name("slack".into())
+        .spawn(move || {
+            if session.user_agent.is_empty() {
+                // A session stored before the helper recorded its browser: the same Safari.
+                session.user_agent = browser().to_owned();
             }
-            Command::Previews(ids) => slack.previews(ids),
-            command => slack.serve(command),
-        };
-        serve_commands(&slack.ctx, inbox, PACE, |id| slack.report(slack.fetch(id)), other)
-    });
+            let moved = api != session.url;
+            let agent = ureq::Agent::config_builder()
+                .tls_config(crate::tls::config())
+                .timeout_global(Some(Duration::from_secs(30)))
+                .http_status_as_error(false)
+                .user_agent(&session.user_agent)
+                .build()
+                .into();
+            let slack = Arc::new(Slack {
+                ctx,
+                agent,
+                cookie: Mutex::new(format!("d={}", session.cookie)),
+                edge: if moved {
+                    format!("{api}cache/")
+                } else {
+                    "https://edgeapi.slack.com/cache/".to_owned()
+                },
+                api,
+                moved,
+                session,
+                me: OnceLock::new(),
+                state: Mutex::new(State::default()),
+                pacer: Mutex::new(Pacer::default()),
+            });
+            let socket = slack.clone();
+            std::thread::spawn(move || keep_connected(&socket.ctx, || socket.connect()));
+            // A send with files uploads on a thread of its own, and previews are fetched on one,
+            // paced: the commands behind either (a cancel among them) are not held up.
+            let other = |command| match command {
+                Command::SendWith {
+                    conversation_id,
+                    client_id,
+                    text,
+                    reply_to,
+                    with,
+                } => {
+                    let sending = slack.clone();
+                    let (conversation, client) = (conversation_id.clone(), client_id.clone());
+                    crate::blobs::upload::spawn(
+                        &slack.ctx,
+                        &conversation_id,
+                        &client_id,
+                        &with.files.clone(),
+                        move |up| {
+                            sending.send_with(
+                                &conversation,
+                                &client,
+                                &text,
+                                reply_to.as_deref(),
+                                &with,
+                                up,
+                            )
+                        },
+                    );
+                }
+                Command::Previews(ids) => slack.previews(ids),
+                command => slack.serve(command),
+            };
+            serve_commands(
+                &slack.ctx,
+                inbox,
+                PACE,
+                |id| slack.report(slack.fetch(id)),
+                other,
+            )
+        });
     spawned.map(drop).map_err(|err| err.to_string())
 }
 
 /// Seconds from a Slack timestamp such as `1700000000.000200`.
 fn seconds(ts: &str) -> i64 {
-    ts.split('.').next().and_then(|s| s.parse().ok()).unwrap_or(0)
+    ts.split('.')
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
 }
 
 /// A thread is a conversation of its own: its channel and the timestamp of its first message.
@@ -531,7 +627,9 @@ fn thread_of(conversation: &str) -> Option<(&str, &str)> {
 /// A stable 64-bit name for an address, for media ids. FNV-1a, so it never changes between
 /// builds the way the standard hasher may.
 fn fnv(text: &str) -> u64 {
-    text.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3))
+    text.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+    })
 }
 
 /// The shell's `client_id` (digits) as the `client_msg_id` Slack's own client would send: a
@@ -539,9 +637,20 @@ fn fnv(text: &str) -> u64 {
 /// Unverified: that Slack echoes a `client_msg_id` given to `chat.postMessage` on the socket.
 /// When it does not, the pending row is still replaced by the call's own answer.
 fn client_msg_id(client_id: &str) -> String {
-    let digits: String = client_id.chars().filter(char::is_ascii_digit).take(30).collect();
+    let digits: String = client_id
+        .chars()
+        .filter(char::is_ascii_digit)
+        .take(30)
+        .collect();
     let hex = format!("{digits:f>30}");
-    format!("{}-{}-4{}-8{}-{}", &hex[..8], &hex[8..12], &hex[12..15], &hex[15..18], &hex[18..])
+    format!(
+        "{}-{}-4{}-8{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..15],
+        &hex[15..18],
+        &hex[18..]
+    )
 }
 
 /// The `client_id` inside a `client_msg_id` of ours. `None` for any other client's.
@@ -561,7 +670,10 @@ fn client_id(client_msg_id: &str) -> Option<String> {
 
 /// The host of an `https` address, or `None` for anything that is not plainly one.
 fn https_host(url: &str) -> Option<&str> {
-    let authority = url.strip_prefix("https://")?.split(['/', '?', '#']).next()?;
+    let authority = url
+        .strip_prefix("https://")?
+        .split(['/', '?', '#'])
+        .next()?;
     if authority.contains('@') {
         return None;
     }
@@ -569,7 +681,10 @@ fn https_host(url: &str) -> Option<&str> {
 }
 
 fn within(host: &str, domain: &str) -> bool {
-    host == domain || host.strip_suffix(domain).is_some_and(|sub| sub.ends_with('.'))
+    host == domain
+        || host
+            .strip_suffix(domain)
+            .is_some_and(|sub| sub.ends_with('.'))
 }
 
 impl Slack {
@@ -581,12 +696,18 @@ impl Slack {
     /// per person per [`INFO_EVERY`], however often a card is opened or a name is unknown.
     fn info_due(&self, person: &str) -> bool {
         let mut state = self.state();
-        if state.info_asked.get(person).is_some_and(|at| at.elapsed() < INFO_EVERY) {
+        if state
+            .info_asked
+            .get(person)
+            .is_some_and(|at| at.elapsed() < INFO_EVERY)
+        {
             return false;
         }
         if state.info_asked.len() >= 1024 {
             state.info_asked.retain(|_, at| at.elapsed() < INFO_EVERY);
-            let State { info_asked, abouts, .. } = &mut *state;
+            let State {
+                info_asked, abouts, ..
+            } = &mut *state;
             abouts.retain(|person, _| info_asked.contains_key(person));
         }
         state.info_asked.insert(person.to_owned(), Instant::now());
@@ -612,7 +733,8 @@ impl Slack {
     /// True for an address that answers only to the session: uploads, on `files.slack.com` or
     /// the workspace's own host. Avatars, emoji and proxied images are public.
     fn private(&self, url: &str) -> bool {
-        (self.moved && url.starts_with(&self.api)) || https_host(url).is_some_and(|host| within(host, "slack.com"))
+        (self.moved && url.starts_with(&self.api))
+            || https_host(url).is_some_and(|host| within(host, "slack.com"))
     }
 
     /// How the media cache fetches a registered file: with the session where Slack asks for it,
@@ -623,8 +745,17 @@ impl Slack {
     /// agent, `net::browser()`, which is this session's browser only while the Safari installed
     /// is the one the user signed in with.
     fn download(&self, url: String) -> Download {
-        let headers = download_headers(&self.session.user_agent, &self.session.token, &self.cookie(), self.private(&url));
-        Download { url, headers, sealed: None }
+        let headers = download_headers(
+            &self.session.user_agent,
+            &self.session.token,
+            &self.cookie(),
+            self.private(&url),
+        );
+        Download {
+            url,
+            headers,
+            sealed: None,
+        }
     }
 
     /// Waits for the method's turn: [`GAP`] after the last call of any kind, and never more
@@ -636,8 +767,13 @@ impl Slack {
             let wait = {
                 let mut pacer = crate::hub::lock(&self.pacer);
                 let now = Instant::now();
-                let gap = pacer.last.map_or(Duration::ZERO, |last| GAP.saturating_sub(now.duration_since(last)));
-                let (a_second, most) = (per_minute(method) / 2. / 60., (per_minute(method) / 10.).max(2.));
+                let gap = pacer.last.map_or(Duration::ZERO, |last| {
+                    GAP.saturating_sub(now.duration_since(last))
+                });
+                let (a_second, most) = (
+                    per_minute(method) / 2. / 60.,
+                    (per_minute(method) / 10.).max(2.),
+                );
                 let (left, at) = pacer.left.entry(method.to_owned()).or_insert((most, now));
                 *left = (*left + now.duration_since(*at).as_secs_f64() * a_second).min(most);
                 *at = now;
@@ -646,7 +782,11 @@ impl Slack {
                     pacer.last = Some(now);
                     return false;
                 }
-                let refill = if *left < 1. { Duration::from_secs_f64((1. - *left) / a_second) } else { Duration::ZERO };
+                let refill = if *left < 1. {
+                    Duration::from_secs_f64((1. - *left) / a_second)
+                } else {
+                    Duration::ZERO
+                };
                 refill.max(gap)
             };
             if self.ctx.pause(wait) {
@@ -690,7 +830,8 @@ impl Slack {
             let old = std::mem::replace(&mut *crate::hub::lock(&self.cookie), format!("d={fresh}"));
             let old = old.trim_start_matches("d=").to_owned();
             if old != fresh {
-                self.ctx.save_session(|stored| recookied(stored, &old, fresh));
+                self.ctx
+                    .save_session(|stored| recookied(stored, &old, fresh));
             }
         }
     }
@@ -723,12 +864,24 @@ impl Slack {
             if self.pace(method) {
                 return Err(stopped());
             }
-            let sent = self.agent.post(&url).header("Cookie", self.cookie()).send_form(form.iter().copied());
+            let sent = self
+                .agent
+                .post(&url)
+                .header("Cookie", self.cookie())
+                .send_form(form.iter().copied());
             let mut response = sent.map_err(net)?;
             self.reissued(response.headers());
-            let retry = response.headers().get("retry-after").and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok());
+            let retry = response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse().ok());
             let limited = response.status().as_u16() == 429;
-            let body: Value = if limited { Value::Null } else { response.body_mut().read_json().map_err(net)? };
+            let body: Value = if limited {
+                Value::Null
+            } else {
+                response.body_mut().read_json().map_err(net)?
+            };
             if !limited && body["error"] != "ratelimited" {
                 return self.checked(method, body);
             }
@@ -798,7 +951,11 @@ impl Slack {
             Ok(socket) => socket,
             // The address above is derived, not confirmed. The one Slack hands out through
             // `rtm.connect` is known to work for this kind of session on a real workspace.
-            Err(first) => match self.api("rtm.connect", &[]).ok().and_then(|answer| answer["url"].as_str().map(str::to_owned)) {
+            Err(first) => match self
+                .api("rtm.connect", &[])
+                .ok()
+                .and_then(|answer| answer["url"].as_str().map(str::to_owned))
+            {
                 Some(url) => Socket::connect(&url, &headers, TICK)?,
                 None => return Err(first.into()),
             },
@@ -816,7 +973,10 @@ impl Slack {
         }
         // The unread state is the command thread's to fetch, paced, so the socket is never kept
         // waiting on it.
-        let _ = self.ctx.commands.send(Command::OpenSpace(self.ctx.account.account.clone()));
+        let _ = self
+            .ctx
+            .commands
+            .send(Command::OpenSpace(self.ctx.account.account.clone()));
         self.watch();
 
         let (mut heard, mut pinged) = (Instant::now(), Instant::now());
@@ -857,7 +1017,9 @@ impl Slack {
             "channel_marked" | "im_marked" | "group_marked" | "mpim_marked" => self.marked(event),
             "thread_marked" => self.thread_marked(event),
             "user_typing" => {
-                let (Some(channel), Some(user)) = (event["channel"].as_str(), event["user"].as_str()) else {
+                let (Some(channel), Some(user)) =
+                    (event["channel"].as_str(), event["user"].as_str())
+                else {
                     return Ok(());
                 };
                 if self.me.get().is_some_and(|me| me == user) {
@@ -867,7 +1029,8 @@ impl Slack {
                     Some(root) => thread_id(channel, root),
                     None => channel.to_owned(),
                 };
-                self.ctx.typing(&place, user, &self.user(user).name, TYPING_SHOWN);
+                self.ctx
+                    .typing(&place, user, &self.user(user).name, TYPING_SHOWN);
                 Ok(())
             }
             "presence_change" => {
@@ -877,16 +1040,19 @@ impl Slack {
             // A channel someone else created is not in the sidebar until joined, which is its
             // own event.
             "channel_created" => Ok(()),
-            "channel_joined" | "group_joined" | "im_open" | "mpim_open" | "group_open" | "channel_unarchive" => {
-                self.joined(event)
+            "channel_joined" | "group_joined" | "im_open" | "mpim_open" | "group_open"
+            | "channel_unarchive" => self.joined(event),
+            "channel_left" | "group_left" | "channel_deleted" | "group_deleted"
+            | "channel_archive" | "group_archive" | "im_close" | "mpim_close" | "group_close" => {
+                self.left(event)
             }
-            "channel_left" | "group_left" | "channel_deleted" | "group_deleted" | "channel_archive"
-            | "group_archive" | "im_close" | "mpim_close" | "group_close" => self.left(event),
             "channel_rename" | "group_rename" => self.renamed(event),
             // A huddle joined or left, a status set: the user object comes whole with each.
             // Unverified: `user_huddle_changed` and `user_status_changed` carry it as
             // `user_change` does (the community's reading).
-            "user_change" | "user_huddle_changed" | "user_status_changed" => self.user_changed(&event["user"]),
+            "user_change" | "user_huddle_changed" | "user_status_changed" => {
+                self.user_changed(&event["user"])
+            }
             "member_joined_channel" | "member_left_channel" => {
                 self.member_moved(event);
                 Ok(())
@@ -900,7 +1066,9 @@ impl Slack {
                 self.emoji_changed(event);
                 Ok(())
             }
-            "goodbye" => Err(Failure::Dropped("Slack asked for a new connection".to_owned())),
+            "goodbye" => Err(Failure::Dropped(
+                "Slack asked for a new connection".to_owned(),
+            )),
             "error" => {
                 let error = &event["error"];
                 let why = error["msg"].as_str().unwrap_or("socket error").to_owned();
@@ -927,7 +1095,9 @@ impl Slack {
                     return Ok(());
                 };
                 self.ctx.deleted(channel, ts)?;
-                let root = event["previous_message"]["thread_ts"].as_str().unwrap_or(ts);
+                let root = event["previous_message"]["thread_ts"]
+                    .as_str()
+                    .unwrap_or(ts);
                 self.ctx.deleted(&thread_id(channel, root), ts)?;
                 Ok(())
             }
@@ -946,10 +1116,16 @@ impl Slack {
         Some(match stored {
             Some(stored) => ReplyTo {
                 deleted: stored.deleted,
-                person: Some(&stored.sender.id).filter(|id| !id.is_empty()).map(|id| self.ctx.key(id)),
+                person: Some(&stored.sender.id)
+                    .filter(|id| !id.is_empty())
+                    .map(|id| self.ctx.key(id)),
                 id: stored.id,
                 sender: stored.sender.name,
-                snippet: if stored.deleted { String::new() } else { stored.text.chars().take(120).collect() },
+                snippet: if stored.deleted {
+                    String::new()
+                } else {
+                    stored.text.chars().take(120).collect()
+                },
             },
             None => ReplyTo {
                 deleted: false,
@@ -969,7 +1145,9 @@ impl Slack {
         let Some(mut message) = self.message(channel, event) else {
             return Ok(());
         };
-        let root = event["thread_ts"].as_str().filter(|root| *root != message.id);
+        let root = event["thread_ts"]
+            .as_str()
+            .filter(|root| *root != message.id);
         // The files of a send of ours, shared: that send records it as its own.
         if event["files"].is_array() && self.shared_here(event, &message) {
             return Ok(());
@@ -1037,7 +1215,9 @@ impl Slack {
         if let Some(mut stored) = self.ctx.stored_message(channel, ts)? {
             // The event counts the replies; how many of them are unread it does not say.
             let unread = stored.thread.as_ref().map_or(0, |summary| summary.unread);
-            stored.thread = mapped.thread.map(|summary| ThreadSummary { unread, ..summary });
+            stored.thread = mapped
+                .thread
+                .map(|summary| ThreadSummary { unread, ..summary });
             self.thread_known(channel, ts)?;
             self.ctx.history(channel, &[stored])?;
         }
@@ -1053,7 +1233,10 @@ impl Slack {
         let root = inner["thread_ts"].as_str().unwrap_or(&message.id);
         let reply = root != message.id;
         let in_channel = !reply || inner["subtype"] == "thread_broadcast";
-        let places = [Some(thread_id(channel, root)), in_channel.then(|| channel.to_owned())];
+        let places = [
+            Some(thread_id(channel, root)),
+            in_channel.then(|| channel.to_owned()),
+        ];
         for place in places.into_iter().flatten() {
             let Some(stored) = self.ctx.stored_message(&place, &message.id)? else {
                 continue;
@@ -1075,7 +1258,11 @@ impl Slack {
 
     fn reacted(&self, event: &Value) -> Result<(), Failure> {
         let item = &event["item"];
-        let (Some(channel), Some(ts), Some(name)) = (item["channel"].as_str(), item["ts"].as_str(), event["reaction"].as_str()) else {
+        let (Some(channel), Some(ts), Some(name)) = (
+            item["channel"].as_str(),
+            item["ts"].as_str(),
+            event["reaction"].as_str(),
+        ) else {
             return Ok(());
         };
         let (emoji, file) = self.reaction(name);
@@ -1090,8 +1277,13 @@ impl Slack {
         // channel, in the thread it starts, or in the thread the user has open.
         let mut places = vec![channel.to_owned(), thread_id(channel, ts)];
         let watching = self.ctx.watching();
-        let open = watching.conversation.as_ref().filter(|open| open.account() == self.ctx.account);
-        if let Some(open) = open.filter(|open| thread_of(&open.id).is_some_and(|(parent, _)| parent == channel)) {
+        let open = watching
+            .conversation
+            .as_ref()
+            .filter(|open| open.account() == self.ctx.account);
+        if let Some(open) =
+            open.filter(|open| thread_of(&open.id).is_some_and(|(parent, _)| parent == channel))
+        {
             if !places.contains(&open.id) {
                 places.push(open.id.clone());
             }
@@ -1104,7 +1296,11 @@ impl Slack {
 
     /// Everyone a page of messages was written by, looked up together before the page is read.
     fn authors(&self, entries: &[Value]) {
-        let ids: Vec<String> = entries.iter().filter_map(|entry| entry["user"].as_str()).map(str::to_owned).collect();
+        let ids: Vec<String> = entries
+            .iter()
+            .filter_map(|entry| entry["user"].as_str())
+            .map(str::to_owned)
+            .collect();
         self.users(&ids);
     }
 
@@ -1127,13 +1323,20 @@ impl Slack {
             }
         }
         // Warmed a moment ago and opened now, or the other way round: one fetch serves both.
-        if self.state().fetched.get(conversation).is_some_and(|at| at.elapsed() < FRESH) {
+        if self
+            .state()
+            .fetched
+            .get(conversation)
+            .is_some_and(|at| at.elapsed() < FRESH)
+        {
             return Ok(());
         }
         self.backfill(conversation)?;
         let mut state = self.state();
         state.fetched.retain(|_, at| at.elapsed() < FRESH);
-        state.fetched.insert(conversation.to_owned(), Instant::now());
+        state
+            .fetched
+            .insert(conversation.to_owned(), Instant::now());
         Ok(())
     }
 
@@ -1158,26 +1361,47 @@ impl Slack {
         };
         let history = self.api(
             "conversations.history",
-            &[("channel", channel), ("limit", limit), ("latest", latest), ("oldest", oldest), ("inclusive", inclusive)],
+            &[
+                ("channel", channel),
+                ("limit", limit),
+                ("latest", latest),
+                ("oldest", oldest),
+                ("inclusive", inclusive),
+            ],
         )?;
-        let entries = history["messages"].as_array().map_or(&[][..], Vec::as_slice);
+        let entries = history["messages"]
+            .as_array()
+            .map_or(&[][..], Vec::as_slice);
         if !self.known(channel)? {
             return Ok(());
         }
         self.authors(entries);
-        let mut messages: Vec<Message> = entries.iter().filter_map(|entry| self.message(channel, entry)).collect();
-        for first in messages.iter_mut().filter(|message| message.thread.is_some()) {
+        let mut messages: Vec<Message> = entries
+            .iter()
+            .filter_map(|entry| self.message(channel, entry))
+            .collect();
+        for first in messages
+            .iter_mut()
+            .filter(|message| message.thread.is_some())
+        {
             self.thread_known(channel, &first.id)?;
             // A page says how many replies a thread has, not how many are unread: what the
             // thread itself said when it was last opened stands.
-            let unread = self.ctx.stored_message(channel, &first.id)?.and_then(|stored| stored.thread).map_or(0, |summary| summary.unread);
+            let unread = self
+                .ctx
+                .stored_message(channel, &first.id)?
+                .and_then(|stored| stored.thread)
+                .map_or(0, |summary| summary.unread);
             if let Some(summary) = first.thread.as_mut().filter(|summary| summary.unread == 0) {
                 summary.unread = unread;
             }
         }
         self.ctx.history(channel, &messages)?;
 
-        let listed: Vec<&str> = entries.iter().filter_map(|entry| entry["ts"].as_str()).collect();
+        let listed: Vec<&str> = entries
+            .iter()
+            .filter_map(|entry| entry["ts"].as_str())
+            .collect();
         let (first, last) = (listed.iter().min().copied(), listed.iter().max().copied());
         if let (Some(first), Some(last)) = (first, last) {
             // Deleted while nobody was listening. A message that has only just arrived may be
@@ -1187,7 +1411,10 @@ impl Slack {
                 if listed.contains(&id.as_str()) || seconds(&id) >= settled {
                     continue;
                 }
-                let kept = self.ctx.stored_message(channel, &id)?.is_some_and(|stored| stored.reply_to.is_some());
+                let kept = self
+                    .ctx
+                    .stored_message(channel, &id)?
+                    .is_some_and(|stored| stored.reply_to.is_some());
                 if !kept {
                     self.ctx.deleted(channel, &id)?;
                 }
@@ -1204,14 +1431,23 @@ impl Slack {
         if state.covered.len() >= COVERED && !state.covered.contains_key(channel) {
             state.covered.clear();
         }
-        cover(state.covered.entry(channel.to_owned()).or_default(), oldest, newest);
+        cover(
+            state.covered.entry(channel.to_owned()).or_default(),
+            oldest,
+            newest,
+        );
         Ok(())
     }
 
     /// The page after a message, when the cache is not known to hold it: reading forward from
     /// an old message the user jumped to. Inside a stretch already fetched nothing is asked.
     fn after(&self, channel: &str, after: &str) -> Result<(), Failure> {
-        let held = self.state().covered.get(channel).and_then(|stretches| covering(stretches, after)).cloned();
+        let held = self
+            .state()
+            .covered
+            .get(channel)
+            .and_then(|stretches| covering(stretches, after))
+            .cloned();
         if let Some((_, newest)) = held {
             if newest == LIVE || self.ctx.stored_ids(channel, after, &newest, 2)?.len() > 1 {
                 return Ok(());
@@ -1222,8 +1458,14 @@ impl Slack {
 
     /// The messages around one the user jumped to: it and those before it, then those after.
     fn around(&self, channel: &str, ts: &str) -> Result<(), Failure> {
-        let held = self.state().covered.get(channel).and_then(|stretches| covering(stretches, ts)).cloned();
-        let inside = held.is_some_and(|(oldest, newest)| oldest.as_str() < ts && ts < newest.as_str());
+        let held = self
+            .state()
+            .covered
+            .get(channel)
+            .and_then(|stretches| covering(stretches, ts))
+            .cloned();
+        let inside =
+            held.is_some_and(|(oldest, newest)| oldest.as_str() < ts && ts < newest.as_str());
         if inside && self.ctx.stored_message(channel, ts)?.is_some() {
             return Ok(());
         }
@@ -1244,25 +1486,40 @@ impl Slack {
         for _ in 0..REPLY_PAGES {
             let page = self.api(
                 "conversations.replies",
-                &[("channel", channel), ("ts", root), ("limit", REPLIES), ("cursor", &cursor)],
+                &[
+                    ("channel", channel),
+                    ("ts", root),
+                    ("limit", REPLIES),
+                    ("cursor", &cursor),
+                ],
             )?;
             let entries = page["messages"].as_array().map_or(&[][..], Vec::as_slice);
             self.authors(entries);
-            let messages: Vec<Message> = entries.iter().filter_map(|entry| self.message(channel, entry)).collect();
+            let messages: Vec<Message> = entries
+                .iter()
+                .filter_map(|entry| self.message(channel, entry))
+                .collect();
             self.ctx.history(&thread, &messages)?;
             if let Some(first) = entries.iter().find(|entry| entry["ts"] == root) {
                 // The channel's copy of the first message carries the count.
                 if let Some(mut stored) = self.ctx.stored_message(channel, root)? {
-                    stored.thread = messages.iter().find(|message| message.id == root).and_then(|m| m.thread.clone());
+                    stored.thread = messages
+                        .iter()
+                        .find(|message| message.id == root)
+                        .and_then(|m| m.thread.clone());
                     self.ctx.history(channel, &[stored])?;
                 }
                 if first["subscribed"] == true {
                     let unread = first["unread_count"].as_u64().unwrap_or(0) as u32;
                     let latest = seconds(first["latest_reply"].as_str().unwrap_or(root));
-                    self.ctx.counts(&thread, unread, 0, first["last_read"].as_str(), latest)?;
+                    self.ctx
+                        .counts(&thread, unread, 0, first["last_read"].as_str(), latest)?;
                 }
             }
-            cursor = page["response_metadata"]["next_cursor"].as_str().unwrap_or("").to_owned();
+            cursor = page["response_metadata"]["next_cursor"]
+                .as_str()
+                .unwrap_or("")
+                .to_owned();
             if cursor.is_empty() {
                 break;
             }
@@ -1271,11 +1528,20 @@ impl Slack {
     }
 
     /// How many replies of a thread are unread, where the channel shows its first message.
-    pub(super) fn thread_unread(&self, channel: &str, root: &str, unread: u32) -> Result<(), Failure> {
+    pub(super) fn thread_unread(
+        &self,
+        channel: &str,
+        root: &str,
+        unread: u32,
+    ) -> Result<(), Failure> {
         let Some(mut first) = self.ctx.stored_message(channel, root)? else {
             return Ok(());
         };
-        if let Some(summary) = first.thread.as_mut().filter(|summary| summary.unread != unread) {
+        if let Some(summary) = first
+            .thread
+            .as_mut()
+            .filter(|summary| summary.unread != unread)
+        {
             summary.unread = unread;
             self.ctx.history(channel, &[first])?;
         }
@@ -1292,65 +1558,135 @@ impl Slack {
         match command {
             // A thread is fetched whole from its start when opened, so only a channel has
             // pages before, after or around a message to ask for.
-            Command::History { conversation_id, before } => {
+            Command::History {
+                conversation_id,
+                before,
+            } => {
                 if thread_of(&conversation_id).is_none() {
                     self.report(self.page(&conversation_id, Bounds::Before(&before)));
                 }
             }
-            Command::HistoryAfter { conversation_id, after } => {
+            Command::HistoryAfter {
+                conversation_id,
+                after,
+            } => {
                 if thread_of(&conversation_id).is_none() {
                     self.report(self.after(&conversation_id, &after));
                 }
             }
-            Command::HistoryAround { conversation_id, around } => {
+            Command::HistoryAround {
+                conversation_id,
+                around,
+            } => {
                 if thread_of(&conversation_id).is_none() {
                     self.report(self.around(&conversation_id, &around));
                 }
             }
             Command::OpenSpace(_) => self.report(self.open_space()),
-            Command::MarkRead { conversation_id, message_id } => self.report(self.mark_read(&conversation_id, &message_id)),
-            Command::Send { conversation_id, client_id, text, reply_to } => {
-                self.send(&conversation_id, &client_id, &text, reply_to.as_deref(), false)
+            Command::MarkRead {
+                conversation_id,
+                message_id,
+            } => self.report(self.mark_read(&conversation_id, &message_id)),
+            Command::Send {
+                conversation_id,
+                client_id,
+                text,
+                reply_to,
+            } => self.send(
+                &conversation_id,
+                &client_id,
+                &text,
+                reply_to.as_deref(),
+                false,
+            ),
+            Command::CancelSend { client_id, .. } => {
+                crate::blobs::upload::cancel(&self.ctx.account, &client_id)
             }
-            Command::CancelSend { client_id, .. } => crate::blobs::upload::cancel(&self.ctx.account, &client_id),
-            Command::ConversationInfo { conversation_id, reply } => answer(reply, self.conversation_info(&conversation_id)),
-            Command::SetMute { conversation_id, notify, reply } => answer(reply, self.set_mute(&conversation_id, notify)),
-            Command::Pinned { conversation_id, reply } => answer(reply, self.pinned(&conversation_id)),
-            Command::SearchShared { conversation_id, kind, before, limit, reply } => {
-                match self.search_shared(&conversation_id, kind, before.as_deref(), limit) {
-                    Some(found) => answer(reply, found),
-                    None => drop(reply.send(Err(Refusal::Unsupported))),
-                }
-            }
+            Command::ConversationInfo {
+                conversation_id,
+                reply,
+            } => answer(reply, self.conversation_info(&conversation_id)),
+            Command::SetMute {
+                conversation_id,
+                notify,
+                reply,
+            } => answer(reply, self.set_mute(&conversation_id, notify)),
+            Command::Pinned {
+                conversation_id,
+                reply,
+            } => answer(reply, self.pinned(&conversation_id)),
+            Command::SearchShared {
+                conversation_id,
+                kind,
+                before,
+                limit,
+                reply,
+            } => match self.search_shared(&conversation_id, kind, before.as_deref(), limit) {
+                Some(found) => answer(reply, found),
+                None => drop(reply.send(Err(Refusal::Unsupported))),
+            },
             // Only the workspace's emoji: Slack has no GIFs or stickers of its own (see
             // `capabilities`).
-            Command::Catalog { kind: protocol::CatalogKind::Emoji, query, cursor, reply, .. } => {
-                answer(reply, self.emoji_catalog(&query, cursor.as_deref()))
-            }
+            Command::Catalog {
+                kind: protocol::CatalogKind::Emoji,
+                query,
+                cursor,
+                reply,
+                ..
+            } => answer(reply, self.emoji_catalog(&query, cursor.as_deref())),
             Command::ReactionRules { reply, .. } => drop(reply.send(Ok(reaction_rules()))),
             Command::OpenThreads(_) => self.report(self.open_threads()),
-            Command::React { conversation_id, message_id, emoji, on, reply } => {
+            Command::React {
+                conversation_id,
+                message_id,
+                emoji,
+                on,
+                reply,
+            } => {
                 answer(reply, self.react(&conversation_id, &message_id, &emoji, on));
             }
-            Command::Edit { conversation_id, message_id, text, reply } => {
+            Command::Edit {
+                conversation_id,
+                message_id,
+                text,
+                reply,
+            } => {
                 answer(reply, self.edit(&conversation_id, &message_id, &text));
             }
-            Command::Delete { conversation_id, message_id, reply } => {
+            Command::Delete {
+                conversation_id,
+                message_id,
+                reply,
+            } => {
                 answer(reply, self.delete(&conversation_id, &message_id));
             }
-            Command::SetPresence { presence, status, reply } => answer(reply, self.set_presence(presence, status)),
+            Command::SetPresence {
+                presence,
+                status,
+                reply,
+            } => answer(reply, self.set_presence(presence, status)),
             Command::Profile { person_id, reply } => answer(reply, self.profile(&person_id)),
             Command::Typing(conversation) => self.typing(&conversation),
             Command::Watch(_) => self.watch(),
             Command::SearchPeople(query) => self.search(&query),
-            Command::Members { conversation_id, offset, limit, reply } => {
+            Command::Members {
+                conversation_id,
+                offset,
+                limit,
+                reply,
+            } => {
                 answer(reply, self.members(&conversation_id, offset, limit));
             }
-            Command::StartDirect { person_id, reply } => answer(reply, self.start_direct(&person_id)),
+            Command::StartDirect { person_id, reply } => {
+                answer(reply, self.start_direct(&person_id))
+            }
             Command::Download { url, reply, .. } => {
                 let _ = reply.send(Ok(self.download(url)));
             }
-            Command::Handoff { conversation_id, reply } => {
+            Command::Handoff {
+                conversation_id,
+                reply,
+            } => {
                 let _ = reply.send(Ok(self.huddle_link(&conversation_id)));
             }
             // Answered at once: there is nothing to end on Slack. The web session and its `d`
@@ -1403,12 +1739,20 @@ impl Slack {
             Some((channel, root)) => {
                 self.api(
                     "subscriptions.thread.mark",
-                    &[("channel", channel), ("thread_ts", root), ("ts", ts), ("read", "1")],
+                    &[
+                        ("channel", channel),
+                        ("thread_ts", root),
+                        ("ts", ts),
+                        ("read", "1"),
+                    ],
                 )?;
                 self.thread_unread(channel, root, 0)?;
             }
             None => {
-                self.api("conversations.mark", &[("channel", conversation), ("ts", ts)])?;
+                self.api(
+                    "conversations.mark",
+                    &[("channel", conversation), ("ts", ts)],
+                )?;
             }
         };
         Ok(())
@@ -1438,20 +1782,38 @@ impl Slack {
     /// Posts a message and ends the send. In a thread's conversation it is a reply to that
     /// thread. Slack has no reply outside threads, so a reply to a message in a channel is a
     /// reply in its thread that is also shown in the channel.
-    fn send(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, suppress: bool) {
+    fn send(
+        &self,
+        conversation: &str,
+        client_id: &str,
+        text: &str,
+        reply_to: Option<&str>,
+        suppress: bool,
+    ) {
         let outcome = self.post(conversation, client_id, text, reply_to, suppress);
         self.ctx.sent(conversation, client_id, outcome);
     }
 
     /// The post itself, answering what Slack accepted.
-    fn post(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, suppress: bool) -> Result<Message, String> {
+    fn post(
+        &self,
+        conversation: &str,
+        client_id: &str,
+        text: &str,
+        reply_to: Option<&str>,
+        suppress: bool,
+    ) -> Result<Message, String> {
         let (channel, thread) = match thread_of(conversation) {
             Some((channel, root)) => (channel, Some(root)),
             None => (conversation, None),
         };
         let nonce = client_msg_id(client_id);
         let escaped = escape(text);
-        let mut params = vec![("channel", channel), ("text", escaped.as_str()), ("client_msg_id", nonce.as_str())];
+        let mut params = vec![
+            ("channel", channel),
+            ("text", escaped.as_str()),
+            ("client_msg_id", nonce.as_str()),
+        ];
         let shown = reply_to.filter(|_| thread.is_none());
         if let Some(root) = thread.or(shown) {
             params.push(("thread_ts", root));
@@ -1489,7 +1851,9 @@ impl Slack {
         if let Some(file) = emoji.strip_prefix("emoji:") {
             return file.rsplit_once(':').map(|(name, _)| name.to_owned());
         }
-        let named = emoji.strip_prefix(':').and_then(|rest| rest.strip_suffix(':'));
+        let named = emoji
+            .strip_prefix(':')
+            .and_then(|rest| rest.strip_suffix(':'));
         match named.filter(|name| !name.is_empty()) {
             Some(name) => Some(name.to_owned()),
             // The table holds the emoji people actually use, not all of Unicode: one outside
@@ -1502,11 +1866,22 @@ impl Slack {
     /// arrives on the socket and counts once.
     fn react(&self, conversation: &str, ts: &str, emoji: &str, on: bool) -> Result<(), Fault> {
         let channel = thread_of(conversation).map_or(conversation, |(channel, _)| channel);
-        let name = self.reaction_name(emoji).ok_or_else(|| Fault::Slack("no_emoji_name".to_owned()))?;
-        let method = if on { "reactions.add" } else { "reactions.remove" };
-        match self.api(method, &[("channel", channel), ("timestamp", ts), ("name", &name)]) {
+        let name = self
+            .reaction_name(emoji)
+            .ok_or_else(|| Fault::Slack("no_emoji_name".to_owned()))?;
+        let method = if on {
+            "reactions.add"
+        } else {
+            "reactions.remove"
+        };
+        match self.api(
+            method,
+            &[("channel", channel), ("timestamp", ts), ("name", &name)],
+        ) {
             // Already as asked, from another device.
-            Err(Fault::Slack(error)) if error == "already_reacted" || error == "no_reaction" => Ok(()),
+            Err(Fault::Slack(error)) if error == "already_reacted" || error == "no_reaction" => {
+                Ok(())
+            }
             other => other.map(drop),
         }
     }
@@ -1517,10 +1892,15 @@ impl Slack {
             Some((channel, root)) => (channel, Some(root)),
             None => (conversation, None),
         };
-        let updated = self.api("chat.update", &[("channel", channel), ("ts", ts), ("text", &escape(text))])?;
+        let updated = self.api(
+            "chat.update",
+            &[("channel", channel), ("ts", ts), ("text", &escape(text))],
+        )?;
         let mut inner = match &updated["message"] {
             message @ Value::Object(_) => message.clone(),
-            _ => json!({"type": "message", "text": updated["text"].as_str().unwrap_or(&escape(text))}),
+            _ => {
+                json!({"type": "message", "text": updated["text"].as_str().unwrap_or(&escape(text))})
+            }
         };
         inner["ts"] = ts.into();
         if inner["user"].is_null() {
@@ -1542,7 +1922,10 @@ impl Slack {
             None => (conversation, ts),
         };
         self.api("chat.delete", &[("channel", channel), ("ts", ts)])?;
-        let gone = self.ctx.deleted(channel, ts).and_then(|()| self.ctx.deleted(&thread_id(channel, root), ts));
+        let gone = self
+            .ctx
+            .deleted(channel, ts)
+            .and_then(|()| self.ctx.deleted(&thread_id(channel, root), ts));
         gone.map_err(|err| Fault::Net(err.to_string()))
     }
 
@@ -1564,7 +1947,8 @@ impl Slack {
         let me = self.me.get().cloned().unwrap_or_default();
         if let Some(text) = &status {
             // An emptied emoji with a text makes Slack show its default, the speech balloon.
-            let profile = json!({"status_text": text, "status_emoji": "", "status_expiration": 0}).to_string();
+            let profile = json!({"status_text": text, "status_emoji": "", "status_expiration": 0})
+                .to_string();
             let set = self.api("users.profile.set", &[("profile", &profile)])?;
             if set["profile"].is_object() {
                 let handle = self.state().handle.clone();
@@ -1602,11 +1986,28 @@ impl Slack {
 
 /// A person's card from their `users.info` answer.
 fn about_of(user: &Value) -> About {
-    let said = |key: &str| user["profile"][key].as_str().unwrap_or("").trim().to_owned();
-    let contact = |kind, value: String| (!value.is_empty()).then_some(protocol::Contact { kind, value, masked: kind == protocol::ContactKind::Phone });
-    let contacts = [contact(protocol::ContactKind::Email, said("email")), contact(protocol::ContactKind::Phone, said("phone"))];
+    let said = |key: &str| {
+        user["profile"][key]
+            .as_str()
+            .unwrap_or("")
+            .trim()
+            .to_owned()
+    };
+    let contact = |kind, value: String| {
+        (!value.is_empty()).then_some(protocol::Contact {
+            kind,
+            value,
+            masked: kind == protocol::ContactKind::Phone,
+        })
+    };
+    let contacts = [
+        contact(protocol::ContactKind::Email, said("email")),
+        contact(protocol::ContactKind::Phone, said("phone")),
+    ];
     // Slack's status expiry, 0 for none.
-    let until = user["profile"]["status_expiration"].as_i64().filter(|until| *until > 0);
+    let until = user["profile"]["status_expiration"]
+        .as_i64()
+        .filter(|until| *until > 0);
     About {
         // Slack has no bio: the title is a title (06, story 3).
         title: said("title"),
@@ -1649,7 +2050,12 @@ fn kept(failure: Failure) -> Fault {
 
 /// The headers a file is fetched with: always the session's browser, and the session itself
 /// only for an address that answers to nobody else.
-fn download_headers(agent: &str, token: &str, cookie: &str, private: bool) -> Vec<(String, String)> {
+fn download_headers(
+    agent: &str,
+    token: &str,
+    cookie: &str,
+    private: bool,
+) -> Vec<(String, String)> {
     let mut headers = vec![("User-Agent".to_owned(), agent.to_owned())];
     if private {
         headers.push(("Authorization".to_owned(), format!("Bearer {token}")));
@@ -1664,8 +2070,14 @@ mod tests {
 
     #[test]
     fn a_typed_mention_survives_the_escapes_and_nothing_else_does() {
-        assert_eq!(super::escape("hi <@U07ABC> in <#C12> <!here> <!subteam^S9>"), "hi <@U07ABC> in <#C12> <!here> <!subteam^S9>");
-        assert_eq!(super::escape("a < b && c > d <b> <@lower> <!nope> <@>"), "a &lt; b &amp;&amp; c &gt; d &lt;b&gt; &lt;@lower&gt; &lt;!nope&gt; &lt;@&gt;");
+        assert_eq!(
+            super::escape("hi <@U07ABC> in <#C12> <!here> <!subteam^S9>"),
+            "hi <@U07ABC> in <#C12> <!here> <!subteam^S9>"
+        );
+        assert_eq!(
+            super::escape("a < b && c > d <b> <@lower> <!nope> <@>"),
+            "a &lt; b &amp;&amp; c &gt; d &lt;b&gt; &lt;@lower&gt; &lt;!nope&gt; &lt;@&gt;"
+        );
         assert_eq!(super::escape("é<@U1>é"), "é<@U1>é");
     }
 
@@ -1681,14 +2093,27 @@ mod tests {
         })
         .to_string();
         let found = accounts(&session).unwrap();
-        let listed: Vec<(&str, &str)> = found.iter().map(|signed| (signed.account.as_str(), signed.name.as_str())).collect();
+        let listed: Vec<(&str, &str)> = found
+            .iter()
+            .map(|signed| (signed.account.as_str(), signed.name.as_str()))
+            .collect();
         assert_eq!(listed, [("T1", "Acme"), ("T2", "side-project")]);
         let second: Session = serde_json::from_str(&found[1].session).unwrap();
-        assert_eq!((second.token.as_str(), second.cookie.as_str()), ("xoxc-2", "xoxd-abc"));
-        assert_eq!((second.team_id.as_str(), second.user_agent.as_str()), ("T2", "Safari/1"));
+        assert_eq!(
+            (second.token.as_str(), second.cookie.as_str()),
+            ("xoxc-2", "xoxd-abc")
+        );
+        assert_eq!(
+            (second.team_id.as_str(), second.user_agent.as_str()),
+            ("T2", "Safari/1")
+        );
 
         let left = without(&session, "T1").unwrap();
-        let ids: Vec<String> = accounts(&left).unwrap().into_iter().map(|signed| signed.account).collect();
+        let ids: Vec<String> = accounts(&left)
+            .unwrap()
+            .into_iter()
+            .map(|signed| signed.account)
+            .collect();
         assert_eq!(ids, ["T2"]);
         assert_eq!(without(&without(&left, "T3").unwrap(), "T2"), None);
     }
@@ -1697,9 +2122,15 @@ mod tests {
     fn a_session_stored_before_workspaces_were_listed_still_signs_in() {
         let old = r#"{"token":"xoxc-9","team_id":"T9","team":"Glimmr","url":"https://glimmr.slack.com/","cookie":"xoxd-z"}"#;
         let found = accounts(old).unwrap();
-        assert_eq!((found[0].account.as_str(), found[0].name.as_str()), ("T9", "Glimmr"));
+        assert_eq!(
+            (found[0].account.as_str(), found[0].name.as_str()),
+            ("T9", "Glimmr")
+        );
         let session: Session = serde_json::from_str(&found[0].session).unwrap();
-        assert_eq!((session.token.as_str(), session.user_agent.as_str()), ("xoxc-9", ""));
+        assert_eq!(
+            (session.token.as_str(), session.user_agent.as_str()),
+            ("xoxc-9", "")
+        );
         // Its one workspace is all there is, so removing it leaves nothing.
         assert_eq!(without(old, "T9"), None);
     }
@@ -1720,9 +2151,15 @@ mod tests {
 
     #[test]
     fn only_slacks_own_addresses_count_as_slack() {
-        assert_eq!(https_host("https://files.slack.com/files-pri/T1-F1/a.png"), Some("files.slack.com"));
+        assert_eq!(
+            https_host("https://files.slack.com/files-pri/T1-F1/a.png"),
+            Some("files.slack.com")
+        );
         assert_eq!(https_host("http://files.slack.com/a.png"), None);
-        assert_eq!(https_host("https://files.slack.com:pw@evil.example/a.png"), None);
+        assert_eq!(
+            https_host("https://files.slack.com:pw@evil.example/a.png"),
+            None
+        );
         assert!(within("avatars.slack-edge.com", "slack-edge.com"));
         assert!(!within("notslack-edge.com", "slack-edge.com"));
         assert!(!within("slack.com.evil.example", "slack.com"));
@@ -1735,26 +2172,58 @@ mod tests {
         cover(&mut held, "1759000400.000400", "1759000500.000500");
         cover(&mut held, "1759000500.000500", "1759990200.000200");
         assert_eq!(held.len(), 2, "{held:?}");
-        assert_eq!(covering(&held, "1759990100.000100"), Some(&("1759000400.000400".to_owned(), "1759990200.000200".to_owned())));
-        assert_eq!(covering(&held, "1760000300.000300").map(|(_, newest)| newest.as_str()), Some(LIVE));
-        assert_eq!(covering(&held, "1759995000.000000"), None, "the gap between the two is not held");
+        assert_eq!(
+            covering(&held, "1759990100.000100"),
+            Some(&(
+                "1759000400.000400".to_owned(),
+                "1759990200.000200".to_owned()
+            ))
+        );
+        assert_eq!(
+            covering(&held, "1760000300.000300").map(|(_, newest)| newest.as_str()),
+            Some(LIVE)
+        );
+        assert_eq!(
+            covering(&held, "1759995000.000000"),
+            None,
+            "the gap between the two is not held"
+        );
         // An older page that reaches the newest stretch makes it one; only a few are kept.
         cover(&mut held, "1759990200.000200", "1760000090.000090");
         assert_eq!(held, [("1759000400.000400".to_owned(), LIVE.to_owned())]);
         for at in 0..10 {
-            cover(&mut held, &format!("17000000{at}0.000000"), &format!("17000000{at}5.000000"));
+            cover(
+                &mut held,
+                &format!("17000000{at}0.000000"),
+                &format!("17000000{at}5.000000"),
+            );
         }
         assert_eq!(held.len(), STRETCHES);
-        assert_eq!(held.last().map(|(_, newest)| newest.as_str()), Some(LIVE), "the newest are the ones kept");
+        assert_eq!(
+            held.last().map(|(_, newest)| newest.as_str()),
+            Some(LIVE),
+            "the newest are the ones kept"
+        );
     }
 
     #[test]
     fn a_reissued_cookie_replaces_only_the_one_this_sign_in_was_started_with() {
         let stored = json!({"cookie": "xoxd-old", "user_agent": "Safari/1", "teams": [{"id": "T1", "token": "xoxc-1", "url": "https://a.slack.com/"}]}).to_string();
-        let fresh: Value = serde_json::from_str(&recookied(&stored, "xoxd-old", "xoxd-new").unwrap()).unwrap();
-        assert_eq!((fresh["cookie"].as_str(), fresh["teams"][0]["token"].as_str(), fresh["user_agent"].as_str()), (Some("xoxd-new"), Some("xoxc-1"), Some("Safari/1")));
+        let fresh: Value =
+            serde_json::from_str(&recookied(&stored, "xoxd-old", "xoxd-new").unwrap()).unwrap();
+        assert_eq!(
+            (
+                fresh["cookie"].as_str(),
+                fresh["teams"][0]["token"].as_str(),
+                fresh["user_agent"].as_str()
+            ),
+            (Some("xoxd-new"), Some("xoxc-1"), Some("Safari/1"))
+        );
         // Another workspace of the sign-in saved a newer one first: it stands.
-        assert_eq!(recookied(&fresh.to_string(), "xoxd-old", "xoxd-other"), None);
+        assert_eq!(
+            recookied(&fresh.to_string(), "xoxd-old", "xoxd-other"),
+            None
+        );
         assert_eq!(recookied("not json", "xoxd-old", "xoxd-new"), None);
     }
 
@@ -1763,16 +2232,36 @@ mod tests {
         let open = download_headers("Safari/1", "xoxc-1", "d=xoxd-abc", false);
         assert_eq!(open, [("User-Agent".to_owned(), "Safari/1".to_owned())]);
         let private = download_headers("Safari/1", "xoxc-1", "d=xoxd-abc", true);
-        let named: Vec<(&str, &str)> = private.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect();
-        assert_eq!(named, [("User-Agent", "Safari/1"), ("Authorization", "Bearer xoxc-1"), ("Cookie", "d=xoxd-abc")]);
+        let named: Vec<(&str, &str)> = private
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        assert_eq!(
+            named,
+            [
+                ("User-Agent", "Safari/1"),
+                ("Authorization", "Bearer xoxc-1"),
+                ("Cookie", "d=xoxd-abc")
+            ]
+        );
     }
 
     #[test]
     fn every_method_is_held_to_half_its_documented_tier() {
         // Tier 2 is 20 a minute, tier 3 is 50, tier 4 is 100; what Slack does not document is
         // treated as tier 3.
-        assert_eq!((per_minute("users.setPresence"), per_minute("conversations.history"), per_minute("conversations.members")), (20., 50., 100.));
-        assert_eq!((per_minute("client.counts"), per_minute("edge:users/info")), (50., 50.));
+        assert_eq!(
+            (
+                per_minute("users.setPresence"),
+                per_minute("conversations.history"),
+                per_minute("conversations.members")
+            ),
+            (20., 50., 100.)
+        );
+        assert_eq!(
+            (per_minute("client.counts"), per_minute("edge:users/info")),
+            (50., 50.)
+        );
         assert!(WARM_GAP.as_secs_f64() >= 2. * 60. / per_minute("conversations.history"));
         assert!((0. ..1.).contains(&jitter()));
     }
@@ -1783,12 +2272,21 @@ mod tests {
             reason(Fault::Slack("two_factor_setup_required".into())),
             "Slack wants two-factor authentication set up. Finish that in the Slack app."
         );
-        assert_eq!(reason(Fault::Slack("not_in_channel".into())), "You are not in this channel.");
+        assert_eq!(
+            reason(Fault::Slack("not_in_channel".into())),
+            "You are not in this channel."
+        );
         assert_eq!(
             reason(Fault::Slack("restricted_action_read_only_channel".into())),
             "This workspace does not let you post here."
         );
-        assert_eq!(reason(Fault::Limited(7)), "Slack is rate limiting you. Try again in 7 s.");
-        assert_eq!(reason(Fault::Slack("fatal_error".into())), "Slack refused (fatal_error).");
+        assert_eq!(
+            reason(Fault::Limited(7)),
+            "Slack is rate limiting you. Try again in 7 s."
+        );
+        assert_eq!(
+            reason(Fault::Slack("fatal_error".into())),
+            "Slack refused (fatal_error)."
+        );
     }
 }

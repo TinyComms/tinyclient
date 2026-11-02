@@ -3,7 +3,9 @@
 use super::{fnv, seconds, thread_id, thread_of, Fault, Slack};
 use crate::adapters::{Command, Failure};
 use crate::store::{ConversationRow, SpaceRow};
-use protocol::{CallSupport, Conversation, ConversationKind, Group, GroupKind, MediaFile, MediaKind, Relation};
+use protocol::{
+    CallSupport, Conversation, ConversationKind, Group, GroupKind, MediaFile, MediaKind, Relation,
+};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
@@ -61,8 +63,14 @@ impl Slack {
         if channel["is_im"] == true {
             return Some(self.direct_row(id, channel["user"].as_str()?));
         }
-        let name = channel["name"].as_str().or(channel["name_normalized"].as_str())?;
-        let said = |what: &str| channel[what]["value"].as_str().filter(|text| !text.is_empty());
+        let name = channel["name"]
+            .as_str()
+            .or(channel["name_normalized"].as_str())?;
+        let said = |what: &str| {
+            channel[what]["value"]
+                .as_str()
+                .filter(|text| !text.is_empty())
+        };
         if channel["is_mpim"] == true {
             // Group DMs are named `mpdm-ana--ben--cy-1`; everyone but me is the title.
             let people = name.strip_prefix("mpdm-").unwrap_or(name);
@@ -85,7 +93,9 @@ impl Slack {
         }
         // Unverified: `is_read_only` is the documented flag; a channel only some may post in
         // (`posting_restricted_to`) is not told apart from one I may post in.
-        row.read_only = ["is_read_only", "is_archived", "is_frozen"].iter().any(|flag| channel[*flag] == true);
+        row.read_only = ["is_read_only", "is_archived", "is_frozen"]
+            .iter()
+            .any(|flag| channel[*flag] == true);
         Some(row)
     }
 
@@ -129,7 +139,9 @@ impl Slack {
             Err(fault) => return Err(fault.into()),
         };
         match self.row(&info["channel"]) {
-            Some(row) => self.record(&row, info["channel"]["user"].as_str()).map(|()| true),
+            Some(row) => self
+                .record(&row, info["channel"]["user"].as_str())
+                .map(|()| true),
             None => {
                 self.unknown(channel);
                 Ok(false)
@@ -177,7 +189,10 @@ impl Slack {
             let info = self.api("team.info", &[]).ok()?;
             let icon = &info["team"]["icon"];
             let urls = [&icon["image_88"], &icon["image_68"], &icon["image_132"]];
-            let url = urls.into_iter().filter_map(Value::as_str).find(|url| self.hosted(url));
+            let url = urls
+                .into_iter()
+                .filter_map(Value::as_str)
+                .find(|url| self.hosted(url));
             let url = url.filter(|_| icon["image_default"] != true).unwrap_or("-");
             self.ctx.set_note("icon", url);
             Some(url.to_owned())
@@ -210,17 +225,35 @@ impl Slack {
         let Ok(listed) = self.api("users.channelSections.list", &[]) else {
             return defaults();
         };
-        let Some(all) = listed["channel_sections"].as_array().filter(|all| !all.is_empty()) else {
+        let Some(all) = listed["channel_sections"]
+            .as_array()
+            .filter(|all| !all.is_empty())
+        else {
             return defaults();
         };
-        let id_of = |section: &Value| section["channel_section_id"].as_str().unwrap_or("").to_owned();
-        let followers: HashSet<&str> = all.iter().filter_map(|section| section["next_channel_section_id"].as_str()).collect();
-        let by_id: HashMap<String, &Value> = all.iter().map(|section| (id_of(section), section)).collect();
+        let id_of = |section: &Value| {
+            section["channel_section_id"]
+                .as_str()
+                .unwrap_or("")
+                .to_owned()
+        };
+        let followers: HashSet<&str> = all
+            .iter()
+            .filter_map(|section| section["next_channel_section_id"].as_str())
+            .collect();
+        let by_id: HashMap<String, &Value> = all
+            .iter()
+            .map(|section| (id_of(section), section))
+            .collect();
         let mut ordered: Vec<&Value> = Vec::with_capacity(all.len());
-        let mut next = all.iter().find(|section| !followers.contains(id_of(section).as_str()));
+        let mut next = all
+            .iter()
+            .find(|section| !followers.contains(id_of(section).as_str()));
         while let Some(section) = next.filter(|_| ordered.len() < all.len()) {
             ordered.push(section);
-            next = section["next_channel_section_id"].as_str().and_then(|id| by_id.get(id).copied());
+            next = section["next_channel_section_id"]
+                .as_str()
+                .and_then(|id| by_id.get(id).copied());
         }
         // Anything the chain missed keeps the order Slack listed it in.
         for section in all {
@@ -232,7 +265,10 @@ impl Slack {
             .into_iter()
             .map(|listed| {
                 let kind = listed["type"].as_str().unwrap_or("standard");
-                let name = match (listed["name"].as_str().filter(|name| !name.is_empty()), kind) {
+                let name = match (
+                    listed["name"].as_str().filter(|name| !name.is_empty()),
+                    kind,
+                ) {
                     (Some(name), _) => name,
                     (None, "channels") => "Channels",
                     (None, "direct_messages") => "Direct messages",
@@ -246,11 +282,17 @@ impl Slack {
                     id: id_of(listed),
                     name: name.to_owned(),
                     kind: kind.to_owned(),
-                    channels: channels.into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect(),
+                    channels: channels
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect(),
                 }
             })
             .collect();
-        sections.retain(|section| !matches!(section.kind.as_str(), "direct_messages" | "recent_apps"));
+        sections
+            .retain(|section| !matches!(section.kind.as_str(), "direct_messages" | "recent_apps"));
         // The built-in holds whatever no other section claims, so it must exist.
         if !sections.iter().any(|section| section.kind == "channels") {
             sections.push(section("channels", "Channels"));
@@ -264,16 +306,31 @@ impl Slack {
     /// `client.counts`. Rows go to the store as they are built and are then let go.
     pub(super) fn load_tree(&self) -> Result<(), Failure> {
         let counts = self.api("client.counts", &[])?;
-        let listed = |kind: &str| counts[kind].as_array().into_iter().flatten().filter_map(|c| c["id"].as_str());
+        let listed = |kind: &str| {
+            counts[kind]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|c| c["id"].as_str())
+        };
         // Slack lists every direct conversation ever had; the sidebar shows the open ones, which
         // is what `client.counts` reports (unverified: taken from what the web client draws).
         let open: HashSet<&str> = listed("ims").chain(listed("mpims")).collect();
         let sections = self.sections();
         // The mutes and the sidebar's "unreads only" are in the same prefs, read once here.
         let prefs = self.prefs()?;
-        let unread_only = matches!(prefs["sidebar_behavior"].as_str(), Some("hide_read_channels" | "hide_read_channels_unless_starred"));
-        let default = |kind: &str| sections.iter().find(|section| section.kind == kind).map(|section| section.id.clone());
-        self.ctx.set_note("group:channel", &default("channels").unwrap_or_default());
+        let unread_only = matches!(
+            prefs["sidebar_behavior"].as_str(),
+            Some("hide_read_channels" | "hide_read_channels_unless_starred")
+        );
+        let default = |kind: &str| {
+            sections
+                .iter()
+                .find(|section| section.kind == kind)
+                .map(|section| section.id.clone())
+        };
+        self.ctx
+            .set_note("group:channel", &default("channels").unwrap_or_default());
         self.ctx.set_note("group:directs", DIRECTS);
 
         let (mut channels, mut cursor) = (Vec::<Value>::new(), String::new());
@@ -287,11 +344,17 @@ impl Slack {
                     ("cursor", &cursor),
                 ],
             )?;
-            cursor = page["response_metadata"]["next_cursor"].as_str().unwrap_or("").to_owned();
+            cursor = page["response_metadata"]["next_cursor"]
+                .as_str()
+                .unwrap_or("")
+                .to_owned();
             if let Some(Value::Array(found)) = page.get_mut("channels").map(Value::take) {
-                let direct = |channel: &Value| channel["is_im"] == true || channel["is_mpim"] == true;
+                let direct =
+                    |channel: &Value| channel["is_im"] == true || channel["is_mpim"] == true;
                 let shown = |channel: &Value| {
-                    !direct(channel) || open.is_empty() || channel["id"].as_str().is_some_and(|id| open.contains(id))
+                    !direct(channel)
+                        || open.is_empty()
+                        || channel["id"].as_str().is_some_and(|id| open.contains(id))
                 };
                 channels.extend(found.into_iter().filter(shown));
             }
@@ -299,7 +362,12 @@ impl Slack {
                 break;
             }
         }
-        let partner = |channel: &Value| channel["user"].as_str().filter(|_| channel["is_im"] == true).map(str::to_owned);
+        let partner = |channel: &Value| {
+            channel["user"]
+                .as_str()
+                .filter(|_| channel["is_im"] == true)
+                .map(str::to_owned)
+        };
         let partners: Vec<String> = channels.iter().filter_map(partner).collect();
         // Before any row: this registers each partner's picture and records them as people.
         self.users(&partners);
@@ -319,8 +387,14 @@ impl Slack {
                 continue;
             }
             // A section the user filed it under wins over the built-in for its kind.
-            let filed = sections.iter().position(|section| section.channels.contains(&row.id));
-            let at = filed.or_else(|| sections.iter().position(|section| Some(&section.id) == row.group.as_ref()));
+            let filed = sections
+                .iter()
+                .position(|section| section.channels.contains(&row.id));
+            let at = filed.or_else(|| {
+                sections
+                    .iter()
+                    .position(|section| Some(&section.id) == row.group.as_ref())
+            });
             let at = at.unwrap_or(0);
             row.group = Some(sections[at].id.clone());
             rows.push((at, row));
@@ -357,7 +431,10 @@ impl Slack {
         drop(rows);
 
         // The list the user owns on Slack: the people they have a direct conversation with.
-        let relations: Vec<(String, Relation)> = direct.keys().map(|person| (person.clone(), Relation::Contact)).collect();
+        let relations: Vec<(String, Relation)> = direct
+            .keys()
+            .map(|person| (person.clone(), Relation::Contact))
+            .collect();
         self.ctx.relations(&relations)?;
         {
             let mut state = self.state();
@@ -390,7 +467,13 @@ impl Slack {
     }
 
     pub(super) fn count(&self, id: &str, counted: &Counted) -> Result<(), Failure> {
-        self.ctx.counts(id, counted.unread, counted.mentions, counted.last_read.as_deref(), counted.latest)?;
+        self.ctx.counts(
+            id,
+            counted.unread,
+            counted.mentions,
+            counted.last_read.as_deref(),
+            counted.latest,
+        )?;
         Ok(())
     }
 
@@ -428,7 +511,10 @@ impl Slack {
         needing.sort_by_key(|(_, counted)| std::cmp::Reverse(counted.latest));
         for (id, counted) in needing.into_iter().take(WARMED) {
             self.state().warm.insert(id.to_owned(), counted);
-            let _ = self.ctx.commands.send(Command::Warm(format!("{}{id}", super::WARM)));
+            let _ = self
+                .ctx
+                .commands
+                .send(Command::Warm(format!("{}{id}", super::WARM)));
         }
         Ok(())
     }
@@ -474,15 +560,27 @@ impl Slack {
         let now: HashSet<String> = match pref {
             "muted_channels" => {
                 let list = value.as_str().unwrap_or("");
-                list.split(',').filter(|id| !id.is_empty()).map(str::to_owned).collect()
+                list.split(',')
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_owned)
+                    .collect()
             }
             "all_notifications_prefs" => {
-                let parsed = value.as_str().and_then(|text| serde_json::from_str::<Value>(text).ok());
-                let Some(parsed) = parsed.as_ref().or(Some(value)).filter(|parsed| parsed["channels"].is_object()) else {
+                let parsed = value
+                    .as_str()
+                    .and_then(|text| serde_json::from_str::<Value>(text).ok());
+                let Some(parsed) = parsed
+                    .as_ref()
+                    .or(Some(value))
+                    .filter(|parsed| parsed["channels"].is_object())
+                else {
                     return Ok(());
                 };
                 let channels = parsed["channels"].as_object().into_iter().flatten();
-                channels.filter(|(_, prefs)| prefs["muted"] == true).map(|(id, _)| id.clone()).collect()
+                channels
+                    .filter(|(_, prefs)| prefs["muted"] == true)
+                    .map(|(id, _)| id.clone())
+                    .collect()
             }
             _ => return Ok(()),
         };
@@ -492,7 +590,11 @@ impl Slack {
             let mut state = self.state();
             if !state.mutes_read {
                 let stored = self.ctx.note("muted").unwrap_or_default();
-                state.muted = stored.split(',').filter(|id| !id.is_empty()).map(str::to_owned).collect();
+                state.muted = stored
+                    .split(',')
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_owned)
+                    .collect();
                 state.mutes_read = true;
             }
             std::mem::replace(&mut state.muted, now.clone())
@@ -514,21 +616,36 @@ impl Slack {
         let Some(channel) = event["channel"].as_str() else {
             return Ok(());
         };
-        let number = |names: &[&str]| names.iter().find_map(|name| event[*name].as_u64()).unwrap_or(0) as u32;
+        let number = |names: &[&str]| {
+            names
+                .iter()
+                .find_map(|name| event[*name].as_u64())
+                .unwrap_or(0) as u32
+        };
         let mentions = number(&["mention_count_display", "mention_count", "dm_count"]);
         let unread = number(&["unread_count_display", "unread_count"]).max(mentions);
-        self.ctx.counts(channel, unread, mentions, event["ts"].as_str(), 0)?;
+        self.ctx
+            .counts(channel, unread, mentions, event["ts"].as_str(), 0)?;
         Ok(())
     }
 
     /// `thread_marked`: a thread read, or marked unread, on another device. Unverified shape.
     pub(super) fn thread_marked(&self, event: &Value) -> Result<(), Failure> {
         let subscription = &event["subscription"];
-        let (Some(channel), Some(root)) = (subscription["channel"].as_str(), subscription["thread_ts"].as_str()) else {
+        let (Some(channel), Some(root)) = (
+            subscription["channel"].as_str(),
+            subscription["thread_ts"].as_str(),
+        ) else {
             return Ok(());
         };
         let unread = subscription["unread_count"].as_u64().unwrap_or(0) as u32;
-        self.ctx.counts(&thread_id(channel, root), unread, 0, subscription["last_read"].as_str(), 0)?;
+        self.ctx.counts(
+            &thread_id(channel, root),
+            unread,
+            0,
+            subscription["last_read"].as_str(),
+            0,
+        )?;
         self.thread_unread(channel, root, unread)
     }
 
@@ -580,7 +697,11 @@ impl Slack {
 
     /// `channel_topic`, `group_topic`: the line in the header changed.
     pub(super) fn topic_changed(&self, channel: &str, topic: &str) -> Result<(), Failure> {
-        let Some(known) = self.ctx.known(channel)?.filter(|known| known.topic != topic) else {
+        let Some(known) = self
+            .ctx
+            .known(channel)?
+            .filter(|known| known.topic != topic)
+        else {
             return Ok(());
         };
         let mut row = self.again(&known);
@@ -596,6 +717,9 @@ impl Slack {
     /// opening the conversation.
     pub(super) fn huddle_link(&self, conversation: &str) -> String {
         let channel = thread_of(conversation).map_or(conversation, |(channel, _)| channel);
-        format!("https://app.slack.com/huddle/{}/{channel}", self.session.team_id)
+        format!(
+            "https://app.slack.com/huddle/{}/{channel}",
+            self.session.team_id
+        )
     }
 }

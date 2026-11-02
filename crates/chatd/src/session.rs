@@ -22,10 +22,18 @@ fn unlock_timeout(error: &keyring::Error) -> bool {
         let mut error: &(dyn std::error::Error + 'static) = error;
         loop {
             if let Some(error) = error.downcast_ref::<dbus::Error>() {
-                return matches!(error.name(), Some("org.freedesktop.DBus.Error.NoReply"
-                    | "org.freedesktop.DBus.Error.Timeout" | "org.freedesktop.DBus.Error.TimedOut"));
+                return matches!(
+                    error.name(),
+                    Some(
+                        "org.freedesktop.DBus.Error.NoReply"
+                            | "org.freedesktop.DBus.Error.Timeout"
+                            | "org.freedesktop.DBus.Error.TimedOut"
+                    )
+                );
             }
-            let Some(source) = error.source() else { return false };
+            let Some(source) = error.source() else {
+                return false;
+            };
             error = source;
         }
     }
@@ -90,12 +98,16 @@ fn pack(session: &str) -> Vec<u8> {
 #[cfg(target_os = "windows")]
 fn unpack_secret(blob: &[u8]) -> keyring::Result<String> {
     if blob.first() == Some(&PACKED) {
-        let inflated = miniz_oxide::inflate::decompress_to_vec(&blob[1..])
-            .map_err(|err| keyring::Error::PlatformFailure(Box::new(std::io::Error::other(err.to_string()))))?;
+        let inflated = miniz_oxide::inflate::decompress_to_vec(&blob[1..]).map_err(|err| {
+            keyring::Error::PlatformFailure(Box::new(std::io::Error::other(err.to_string())))
+        })?;
         return Ok(String::from_utf8_lossy(&inflated).into_owned());
     }
     // A session kept as text before the packing: the blob is its UTF-16 characters.
-    let words: Vec<u16> = blob.chunks(2).map(|pair| u16::from_le_bytes([pair[0], pair.get(1).copied().unwrap_or(0)])).collect();
+    let words: Vec<u16> = blob
+        .chunks(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair.get(1).copied().unwrap_or(0)]))
+        .collect();
     Ok(String::from_utf16_lossy(&words))
 }
 
@@ -221,19 +233,29 @@ fn read_session(network: Network, retry_timeouts: bool) -> Stored {
         let name = format!("TINYCLIENT_SESSION_{}", network.label().to_uppercase());
         // Scratch-only simulation of a provider whose GetSecret times out until unlocked.
         #[cfg(target_os = "linux")]
-        if retry_timeouts && network == Network::Signal && std::env::var_os("TINYCLIENT_TEST_KEYCHAIN_UNLOCK").is_some() {
+        if retry_timeouts
+            && network == Network::Signal
+            && std::env::var_os("TINYCLIENT_TEST_KEYCHAIN_UNLOCK").is_some()
+        {
             let mut attempts = 0;
-            let result = read_with_unlock_retry(|| {
-                attempts += 1;
-                let dir = protocol::support_dir();
-                let _ = std::fs::write(dir.join("keychain-attempts"), attempts.to_string());
-                if !dir.join("keychain-unlocked").exists() {
-                    return Err(keyring::Error::PlatformFailure(Box::new(dbus::Error::new_custom(
-                        "org.freedesktop.DBus.Error.NoReply", "test provider is still locked",
-                    ))));
-                }
-                std::env::var(&name).map_err(|_| keyring::Error::NoEntry)
-            }, UNLOCK_RETRY_WINDOW, UNLOCK_RETRY_PAUSE);
+            let result = read_with_unlock_retry(
+                || {
+                    attempts += 1;
+                    let dir = protocol::support_dir();
+                    let _ = std::fs::write(dir.join("keychain-attempts"), attempts.to_string());
+                    if !dir.join("keychain-unlocked").exists() {
+                        return Err(keyring::Error::PlatformFailure(Box::new(
+                            dbus::Error::new_custom(
+                                "org.freedesktop.DBus.Error.NoReply",
+                                "test provider is still locked",
+                            ),
+                        )));
+                    }
+                    std::env::var(&name).map_err(|_| keyring::Error::NoEntry)
+                },
+                UNLOCK_RETRY_WINDOW,
+                UNLOCK_RETRY_PAUSE,
+            );
             return match result {
                 Ok(session) => Stored::Found(session),
                 Err(keyring::Error::NoEntry) => Stored::Absent,
@@ -307,7 +329,10 @@ pub fn save(network: Network, session: &str) -> Result<(), String> {
 /// In a scratch directory nothing is kept in the keychain: the session rewritten is the one a
 /// test handed over, and the result goes to `session.<network>` in that directory (readable by
 /// the owner only) so the test can see what would have been saved.
-pub fn rewrite(network: Network, rewrite: impl FnOnce(&str) -> Option<String>) -> Result<bool, String> {
+pub fn rewrite(
+    network: Network,
+    rewrite: impl FnOnce(&str) -> Option<String>,
+) -> Result<bool, String> {
     static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _one = ONE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let Some(stored) = load(network) else {
@@ -329,14 +354,16 @@ pub fn rewrite(network: Network, rewrite: impl FnOnce(&str) -> Option<String>) -
         open.mode(0o600);
     }
     let mut file = open.open(path).map_err(|err| err.to_string())?;
-    file.write_all(fresh.as_bytes()).map_err(|err| err.to_string())?;
+    file.write_all(fresh.as_bytes())
+        .map_err(|err| err.to_string())?;
     Ok(false)
 }
 
 pub fn forget(network: Network) {
     if enabled() {
         for service in [SERVICE, RENAMED_FROM] {
-            let _ = Entry::new(service, account(network)).and_then(|entry| entry.delete_credential());
+            let _ =
+                Entry::new(service, account(network)).and_then(|entry| entry.delete_credential());
         }
     }
 }
@@ -365,9 +392,18 @@ mod apple {
 
     #[link(name = "Security", kind = "framework")]
     extern "C" {
-        fn SecAccessCreate(descriptor: CFTypeRef, trusted: CFTypeRef, access: *mut SecAccessRef) -> i32;
+        fn SecAccessCreate(
+            descriptor: CFTypeRef,
+            trusted: CFTypeRef,
+            access: *mut SecAccessRef,
+        ) -> i32;
         fn SecAccessCopyACLList(access: SecAccessRef, list: *mut CFTypeRef) -> i32;
-        fn SecACLSetContents(acl: CFTypeRef, apps: CFTypeRef, description: CFTypeRef, prompt: u16) -> i32;
+        fn SecACLSetContents(
+            acl: CFTypeRef,
+            apps: CFTypeRef,
+            description: CFTypeRef,
+            prompt: u16,
+        ) -> i32;
         fn SecACLCreateWithSimpleContents(
             access: SecAccessRef,
             apps: CFTypeRef,
@@ -388,17 +424,21 @@ mod apple {
             Ok((password, item)) => {
                 let session = match String::from_utf8(password.as_ref().to_vec()) {
                     Ok(session) => session,
-                    Err(_) => return Stored::Unreadable("the keychain item was not text".to_owned()),
+                    Err(_) => {
+                        return Stored::Unreadable("the keychain item was not text".to_owned())
+                    }
                 };
                 // `password` frees its bytes on drop. The item stays, and this process may change it.
                 drop(password);
                 trust_item(name, &item);
                 Stored::Found(session)
             }
-            Err(err) if err.code() == errSecItemNotFound => match keyring::Entry::new(SERVICE, name) {
-                Ok(entry) => moved(network, &entry, false),
-                Err(err) => Stored::Unreadable(err.to_string()),
-            },
+            Err(err) if err.code() == errSecItemNotFound => {
+                match keyring::Entry::new(SERVICE, name) {
+                    Ok(entry) => moved(network, &entry, false),
+                    Err(err) => Stored::Unreadable(err.to_string()),
+                }
+            }
             Err(err) => Stored::Unreadable(err.to_string()),
         }
     }
@@ -412,13 +452,17 @@ mod apple {
                 drop(password);
                 trust_item(name, &item);
             }
-            Err(err) => tracing::warn!("chatd: {name}: could not open the saved sign-in to keep it ({err})"),
+            Err(err) => {
+                tracing::warn!("chatd: {name}: could not open the saved sign-in to keep it ({err})")
+            }
         }
     }
 
     fn trust_item(name: &str, item: &SecKeychainItem) {
         if let Err(err) = allow_anyone(item) {
-            tracing::warn!("chatd: {name}: the sign-in will ask again after the next update ({err})");
+            tracing::warn!(
+                "chatd: {name}: the sign-in will ask again after the next update ({err})"
+            );
         }
     }
 
@@ -442,7 +486,13 @@ mod apple {
             let acls = CFArray::<*const c_void>::wrap_under_create_rule(list.cast());
             if acls.is_empty() {
                 let mut acl: CFTypeRef = ptr::null();
-                let status = SecACLCreateWithSimpleContents(access.as_concrete_TypeRef(), ptr::null(), label_ref.cast(), 0, &mut acl);
+                let status = SecACLCreateWithSimpleContents(
+                    access.as_concrete_TypeRef(),
+                    ptr::null(),
+                    label_ref.cast(),
+                    0,
+                    &mut acl,
+                );
                 if status != 0 {
                     return Err(format!("keychain access entry {status}"));
                 }
@@ -457,7 +507,10 @@ mod apple {
                     }
                 }
             }
-            let status = SecKeychainItemSetAccess(item.as_concrete_TypeRef().cast(), access.as_concrete_TypeRef());
+            let status = SecKeychainItemSetAccess(
+                item.as_concrete_TypeRef().cast(),
+                access.as_concrete_TypeRef(),
+            );
             if status != 0 {
                 return Err(format!("keychain access set {status}"));
             }
@@ -480,10 +533,14 @@ mod tests {
     #[test]
     fn dbus_timeouts_are_recognized_by_name_not_message() {
         for name in ["NoReply", "Timeout", "TimedOut"] {
-            assert!(super::unlock_timeout(&platform_error(&format!("org.freedesktop.DBus.Error.{name}"))));
+            assert!(super::unlock_timeout(&platform_error(&format!(
+                "org.freedesktop.DBus.Error.{name}"
+            ))));
         }
         for name in ["AccessDenied", "Failed", "ServiceUnknown", "Disconnected"] {
-            assert!(!super::unlock_timeout(&platform_error(&format!("org.freedesktop.DBus.Error.{name}"))));
+            assert!(!super::unlock_timeout(&platform_error(&format!(
+                "org.freedesktop.DBus.Error.{name}"
+            ))));
         }
         assert!(!super::unlock_timeout(&keyring::Error::NoEntry));
     }
@@ -492,11 +549,18 @@ mod tests {
     #[test]
     fn a_timed_out_read_recovers_after_unlocking() {
         let mut attempts = 0;
-        let result = super::read_with_unlock_retry(|| {
-            attempts += 1;
-            if attempts < 3 { Err(platform_error("org.freedesktop.DBus.Error.NoReply")) }
-            else { Ok("saved session".to_owned()) }
-        }, std::time::Duration::from_secs(1), std::time::Duration::ZERO);
+        let result = super::read_with_unlock_retry(
+            || {
+                attempts += 1;
+                if attempts < 3 {
+                    Err(platform_error("org.freedesktop.DBus.Error.NoReply"))
+                } else {
+                    Ok("saved session".to_owned())
+                }
+            },
+            std::time::Duration::from_secs(1),
+            std::time::Duration::ZERO,
+        );
         assert_eq!(result.unwrap(), "saved session");
         assert_eq!(attempts, 3);
     }
@@ -506,11 +570,21 @@ mod tests {
     fn refusals_and_expired_retry_windows_stop_reading() {
         for name in ["AccessDenied", "Failed", "NoReply"] {
             let mut attempts = 0;
-            let window = if name == "NoReply" { std::time::Duration::ZERO } else { std::time::Duration::from_secs(1) };
-            let result = super::read_with_unlock_retry(|| {
-                attempts += 1;
-                Err(platform_error(&format!("org.freedesktop.DBus.Error.{name}")))
-            }, window, std::time::Duration::ZERO);
+            let window = if name == "NoReply" {
+                std::time::Duration::ZERO
+            } else {
+                std::time::Duration::from_secs(1)
+            };
+            let result = super::read_with_unlock_retry(
+                || {
+                    attempts += 1;
+                    Err(platform_error(&format!(
+                        "org.freedesktop.DBus.Error.{name}"
+                    )))
+                },
+                window,
+                std::time::Duration::ZERO,
+            );
             assert!(result.is_err());
             assert_eq!(attempts, 1);
         }
@@ -520,13 +594,15 @@ mod tests {
         for error in [
             keyring::Error::NoEntry,
             keyring::Error::NoStorageAccess(Box::new(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied, "prompt dismissed",
+                std::io::ErrorKind::PermissionDenied,
+                "prompt dismissed",
             ))),
         ] {
             let mut error = Some(error);
             let result = super::read_with_unlock_retry(
                 || Err(error.take().expect("this read must not be retried")),
-                std::time::Duration::from_secs(1), std::time::Duration::ZERO,
+                std::time::Duration::from_secs(1),
+                std::time::Duration::ZERO,
             );
             assert!(result.is_err());
         }
@@ -542,11 +618,20 @@ mod tests {
         let keys: Vec<String> = (1..=5)
             .map(|id| format!(r#"{{"id":{id},"v4":"149.154.167.{id}:443","v6":"[2001:67c:4e8:f004::a]:443","key":"{key}"}}"#))
             .collect();
-        let session = format!(r#"{{"user":7001,"name":"Mira Kessler","home":2,"dcs":[{}]}}"#, keys.join(","));
+        let session = format!(
+            r#"{{"user":7001,"name":"Mira Kessler","home":2,"dcs":[{}]}}"#,
+            keys.join(",")
+        );
         // As UTF-16 the text itself is already over what a credential keeps.
-        assert!(session.len() > 1280, "the test session should not fit a Windows password");
+        assert!(
+            session.len() > 1280,
+            "the test session should not fit a Windows password"
+        );
         let packed = super::pack(&session);
-        assert!(packed.len() <= 2560, "the packed session should fit a Windows credential");
+        assert!(
+            packed.len() <= 2560,
+            "the packed session should fit a Windows credential"
+        );
         assert_eq!(super::unpack_secret(&packed).unwrap(), session);
         // What one stored as a text before the packing was its UTF-16 bytes.
         let legacy: Vec<u8> = session.encode_utf16().flat_map(u16::to_le_bytes).collect();
@@ -558,16 +643,24 @@ mod tests {
         // A build without a system store falls back to keyring's mock: it would find no
         // sessions and say nothing. `persistent` is what makes chatd refuse instead.
         assert!(super::persistent());
-        assert!(super::NO_STORE.ends_with('.') && super::NO_STORE.contains(super::STORE.trim_start_matches("the ")));
+        assert!(
+            super::NO_STORE.ends_with('.')
+                && super::NO_STORE.contains(super::STORE.trim_start_matches("the "))
+        );
     }
 
     #[test]
     fn each_system_names_its_own_store() {
         use super::{NO_STORE, STORE, STORE_REFUSED, STORE_WAITING};
-        assert!(STORE_REFUSED.contains(STORE) && STORE_REFUSED.ends_with("You are still signed in."));
+        assert!(
+            STORE_REFUSED.contains(STORE) && STORE_REFUSED.ends_with("You are still signed in.")
+        );
         assert!(STORE_WAITING.contains(STORE));
         if cfg!(target_os = "macos") {
-            assert_eq!(STORE_WAITING, "Waiting for permission to read your sign-in from the keychain.");
+            assert_eq!(
+                STORE_WAITING,
+                "Waiting for permission to read your sign-in from the keychain."
+            );
         } else {
             for words in [STORE, NO_STORE, STORE_WAITING, STORE_REFUSED] {
                 assert!(!words.contains("keychain"), "{words}");
@@ -575,7 +668,10 @@ mod tests {
         }
         if cfg!(windows) {
             // Credential Manager puts up no prompt to wait on.
-            assert_eq!(STORE_WAITING, "Still reading your sign-in from Credential Manager.");
+            assert_eq!(
+                STORE_WAITING,
+                "Still reading your sign-in from Credential Manager."
+            );
         }
     }
 }

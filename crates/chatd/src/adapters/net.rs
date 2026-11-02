@@ -59,7 +59,11 @@ pub struct Socket(WebSocket<MaybeTlsStream<TcpStream>>);
 
 impl Socket {
     /// `tick` bounds how long `read` blocks, so the caller can send its heartbeat.
-    pub fn connect(url: &str, headers: &[(&'static str, &str)], tick: Duration) -> io::Result<Socket> {
+    pub fn connect(
+        url: &str,
+        headers: &[(&'static str, &str)],
+        tick: Duration,
+    ) -> io::Result<Socket> {
         let mut request = url.into_client_request().map_err(io::Error::other)?;
         for (name, value) in headers {
             let value = HeaderValue::from_str(value).map_err(io::Error::other)?;
@@ -79,7 +83,8 @@ impl Socket {
             match self.0.read() {
                 Ok(Message::Text(text)) => return Ok(Some(text.as_str().to_owned())),
                 Ok(Message::Close(frame)) => {
-                    let why = frame.map_or_else(String::new, |f| format!("{} {}", f.code, f.reason));
+                    let why =
+                        frame.map_or_else(String::new, |f| format!("{} {}", f.code, f.reason));
                     return Err(io::Error::new(ErrorKind::ConnectionAborted, why));
                 }
                 // Pings are answered by tungstenite on the next read or write.
@@ -107,7 +112,10 @@ mod tests {
     fn a_logged_address_loses_its_token() {
         let logged = redact("Unable to connect to wss://wss-primary.slack.com/?token=xoxc-12-ab_C&batch=1 (timed out)");
         assert_eq!(logged, "Unable to connect to wss://wss-primary.slack.com/?token=[redacted]&batch=1 (timed out)");
-        assert_eq!(redact("cookie d=xoxd-abc%2Fdef rejected"), "cookie d=[redacted] rejected");
+        assert_eq!(
+            redact("cookie d=xoxd-abc%2Fdef rejected"),
+            "cookie d=[redacted] rejected"
+        );
         assert_eq!(redact("410 Gone"), "410 Gone");
     }
 }

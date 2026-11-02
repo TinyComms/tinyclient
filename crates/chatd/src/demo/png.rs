@@ -33,7 +33,11 @@ impl Art {
 
     /// Bytes a pixel: the shape on nothing carries an alpha channel.
     fn channels(self) -> usize {
-        if self == Art::Blob { 4 } else { 3 }
+        if self == Art::Blob {
+            4
+        } else {
+            3
+        }
     }
 
     pub fn from_letter(letter: &str) -> Option<Art> {
@@ -47,7 +51,11 @@ type Rgb = [u8; 3];
 
 /// `hue` in degrees, `saturation` and `value` in percent.
 fn hsv(hue: u32, saturation: u32, value: u32) -> Rgb {
-    let (h, s, v) = ((hue % 360) as f32 / 60.0, saturation as f32 / 100.0, value as f32 / 100.0);
+    let (h, s, v) = (
+        (hue % 360) as f32 / 60.0,
+        saturation as f32 / 100.0,
+        value as f32 / 100.0,
+    );
     let c = v * s;
     let x = c * (1.0 - (h % 2.0 - 1.0).abs());
     let (r, g, b) = match h as u32 {
@@ -77,10 +85,18 @@ fn pixel(art: Art, hue: u32, u: f32, v: f32) -> Rgb {
         Art::Person => {
             let head = inside(u, v, 0.5, 0.40, 0.19, 0.19);
             let shoulders = inside(u, v, 0.5, 1.02, 0.36, 0.34);
-            if head || shoulders { hsv(hue, 22, 96) } else { hsv(hue, 55, 72) }
+            if head || shoulders {
+                hsv(hue, 22, 96)
+            } else {
+                hsv(hue, 55, 72)
+            }
         }
         Art::Badge => {
-            if (u - 0.5).abs() + (v - 0.5).abs() < 0.3 { hsv(hue + 40, 30, 98) } else { hsv(hue, 62, 62) }
+            if (u - 0.5).abs() + (v - 0.5).abs() < 0.3 {
+                hsv(hue + 40, 30, 98)
+            } else {
+                hsv(hue, 62, 62)
+            }
         }
         _ => hsv(hue, 70, 88),
     }
@@ -103,14 +119,21 @@ fn paint(art: Art, seed: u32, width: u32, height: u32) -> Vec<u8> {
         Art::Scene => (0..width)
             .map(|x| {
                 let u = across(x);
-                (0.62 + 0.07 * (u * TAU * 1.5 + phase).sin(), 0.78 + 0.06 * (u * TAU * 2.5 + phase * 2.0).sin())
+                (
+                    0.62 + 0.07 * (u * TAU * 1.5 + phase).sin(),
+                    0.78 + 0.06 * (u * TAU * 2.5 + phase * 2.0).sin(),
+                )
             })
             .collect(),
         _ => Vec::new(),
     };
     let aspect = width as f32 / height as f32;
     let sun = (0.2 + (seed % 7) as f32 * 0.1) * aspect;
-    let (near_hill, far_hill, sunlight) = (hsv(hue + 120, 50, 38), hsv(hue + 130, 38, 55), hsv(48, 30, 100));
+    let (near_hill, far_hill, sunlight) = (
+        hsv(hue + 120, 50, 38),
+        hsv(hue + 130, 38, 55),
+        hsv(48, 30, 100),
+    );
     for y in 0..height {
         raw.push(0);
         let v = (y as f32 + 0.5) / height as f32;
@@ -118,7 +141,11 @@ fn paint(art: Art, seed: u32, width: u32, height: u32) -> Vec<u8> {
             Art::Scene => {
                 // Sixteen steps of sky, so each row is one colour and most rows repeat.
                 let step = ((v * 16.0 / 0.7) as u32).min(15);
-                let sky = mix(hsv(hue + 200, 60, 85), hsv(hue + 20, 25, 100), step as f32 / 15.0);
+                let sky = mix(
+                    hsv(hue + 200, 60, 85),
+                    hsv(hue + 20, 25, 100),
+                    step as f32 / 15.0,
+                );
                 let sunny = (v - 0.28).abs() <= 0.09;
                 for (x, (far, near)) in hills.iter().enumerate() {
                     let colour = if v > *near {
@@ -135,7 +162,8 @@ fn paint(art: Art, seed: u32, width: u32, height: u32) -> Vec<u8> {
             }
             Art::Bands => {
                 let band = (v * 5.0) as u32;
-                let blocks = [0, 1, 2].map(|block| hsv(hue + band * 24 + block * 8, 45 + block * 10, 90 - band * 9));
+                let blocks = [0, 1, 2]
+                    .map(|block| hsv(hue + band * 24 + block * 8, 45 + block * 10, 90 - band * 9));
                 for x in 0..width {
                     raw.extend_from_slice(&blocks[(x * 3 / width) as usize]);
                 }
@@ -168,7 +196,11 @@ const fn crc_table() -> [u32; 256] {
         let mut c = n as u32;
         let mut k = 0;
         while k < 8 {
-            c = if c & 1 == 1 { 0xedb8_8320 ^ (c >> 1) } else { c >> 1 };
+            c = if c & 1 == 1 {
+                0xedb8_8320 ^ (c >> 1)
+            } else {
+                c >> 1
+            };
             k += 1;
         }
         table[n] = c;
@@ -265,7 +297,8 @@ fn zlib(data: &[u8], row: usize, pixel: usize) -> Vec<u8> {
     'next: while at < data.len() {
         if at + RUN <= data.len() {
             for distance in [row, pixel] {
-                if at >= distance && data[at..at + RUN] == data[at - distance..at - distance + RUN] {
+                if at >= distance && data[at..at + RUN] == data[at - distance..at - distance + RUN]
+                {
                     deflate.repeat(distance);
                     at += RUN;
                     continue 'next;

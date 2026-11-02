@@ -123,11 +123,17 @@ fn user_name(user: &tl::types::User) -> String {
         (false, false, _) => format!("{first} {last}"),
         (false, true, _) => first.to_owned(),
         (true, false, _) => last.to_owned(),
-        (true, true, _) => user.username.clone().unwrap_or_else(|| "Unknown".to_owned()),
+        (true, true, _) => user
+            .username
+            .clone()
+            .unwrap_or_else(|| "Unknown".to_owned()),
     }
 }
 
-fn first_username(username: &Option<String>, usernames: &Option<Vec<tl::enums::Username>>) -> String {
+fn first_username(
+    username: &Option<String>,
+    usernames: &Option<Vec<tl::enums::Username>>,
+) -> String {
     let active = usernames.iter().flatten().find_map(|name| {
         let tl::enums::Username::Username(name) = name;
         name.active.then(|| name.username.clone())
@@ -165,13 +171,22 @@ fn chat_photo(photo: &tl::enums::ChatPhoto) -> (i64, i32) {
 /// `send_messages` is on, and the ban has not expired. `until_date` of 0 does not expire.
 fn send_banned(rights: &tl::enums::ChatBannedRights) -> bool {
     let tl::enums::ChatBannedRights::Rights(rights) = rights;
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|age| age.as_secs()).unwrap_or(0);
-    rights.send_messages && (rights.until_date == 0 || u64::try_from(rights.until_date).unwrap_or(0) > now)
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|age| age.as_secs())
+        .unwrap_or(0);
+    rights.send_messages
+        && (rights.until_date == 0 || u64::try_from(rights.until_date).unwrap_or(0) > now)
 }
 
 /// A member cannot post. The creator always can. A personal ban stops that one member. The
 /// group's own ban stops everyone who is not an admin.
-fn member_cannot_send(creator: bool, admin: bool, default_banned: Option<&tl::enums::ChatBannedRights>, personal: Option<&tl::enums::ChatBannedRights>) -> bool {
+fn member_cannot_send(
+    creator: bool,
+    admin: bool,
+    default_banned: Option<&tl::enums::ChatBannedRights>,
+    personal: Option<&tl::enums::ChatBannedRights>,
+) -> bool {
     if creator {
         return false;
     }
@@ -186,7 +201,14 @@ fn of_chat(chat: &tl::enums::Chat) -> Option<(Who, Known)> {
             let (photo, photo_dc) = chat_photo(&chat.photo);
             let known = Known {
                 name: chat.title.clone(),
-                read_only: chat.left || chat.deactivated || member_cannot_send(chat.creator, chat.admin_rights.is_some(), chat.default_banned_rights.as_ref(), None),
+                read_only: chat.left
+                    || chat.deactivated
+                    || member_cannot_send(
+                        chat.creator,
+                        chat.admin_rights.is_some(),
+                        chat.default_banned_rights.as_ref(),
+                        None,
+                    ),
                 photo,
                 photo_dc,
                 ..Known::default()
@@ -194,7 +216,11 @@ fn of_chat(chat: &tl::enums::Chat) -> Option<(Who, Known)> {
             (Who::Group(chat.id), known)
         }
         Chat::Forbidden(chat) => {
-            let known = Known { name: chat.title.clone(), read_only: true, ..Known::default() };
+            let known = Known {
+                name: chat.title.clone(),
+                read_only: true,
+                ..Known::default()
+            };
             (Who::Group(chat.id), known)
         }
         Chat::Channel(channel) => {
@@ -206,7 +232,12 @@ fn of_chat(chat: &tl::enums::Chat) -> Option<(Who, Known)> {
             let restricted = if channel.broadcast {
                 !may_post
             } else {
-                member_cannot_send(channel.creator, channel.admin_rights.is_some(), channel.default_banned_rights.as_ref(), channel.banned_rights.as_ref())
+                member_cannot_send(
+                    channel.creator,
+                    channel.admin_rights.is_some(),
+                    channel.default_banned_rights.as_ref(),
+                    channel.banned_rights.as_ref(),
+                )
             };
             let known = Known {
                 hash: channel.access_hash.filter(|_| !channel.min),
@@ -260,7 +291,10 @@ pub fn note_key(who: Who) -> String {
 
 impl Directory {
     pub fn new(me: i64) -> Directory {
-        Directory { map: HashMap::new(), me }
+        Directory {
+            map: HashMap::new(),
+            me,
+        }
     }
 
     pub fn get(&self, who: Who) -> Option<&Known> {
@@ -268,7 +302,9 @@ impl Directory {
     }
 
     pub fn name(&self, who: Who) -> String {
-        self.map.get(&who).map_or_else(|| "Unknown".to_owned(), |known| known.name.clone())
+        self.map
+            .get(&who)
+            .map_or_else(|| "Unknown".to_owned(), |known| known.name.clone())
     }
 
     /// Takes in what an answer or an update named. A peer seen only in passing never replaces
@@ -298,10 +334,18 @@ impl Directory {
                 continue;
             }
             if before.map(|before| before.hash) != Some(known.hash) {
-                learned.notes.extend(known.note().map(|note| (note_key(who), note)));
+                learned
+                    .notes
+                    .extend(known.note().map(|note| (note_key(who), note)));
             }
             learned.people.push(person_row(who, &known));
-            learned.details.push((who.text(), PersonDetails { mark: known.mark, ..PersonDetails::default() }));
+            learned.details.push((
+                who.text(),
+                PersonDetails {
+                    mark: known.mark,
+                    ..PersonDetails::default()
+                },
+            ));
             self.map.insert(who, known);
         }
         for chat in chats {
@@ -316,7 +360,9 @@ impl Directory {
                 continue;
             }
             if before.map(|before| before.hash) != Some(known.hash) {
-                learned.notes.extend(known.note().map(|note| (note_key(who), note)));
+                learned
+                    .notes
+                    .extend(known.note().map(|note| (note_key(who), note)));
             }
             if before.is_some() {
                 learned.chats.push(who);
@@ -332,26 +378,40 @@ impl Directory {
             return;
         };
         if let Ok(hash) = hash.parse::<i64>() {
-            self.map.entry(who).or_insert_with(|| Known { hash: Some(hash), name: name.to_owned(), ..Known::default() });
+            self.map.entry(who).or_insert_with(|| Known {
+                hash: Some(hash),
+                name: name.to_owned(),
+                ..Known::default()
+            });
         }
     }
 
     pub fn input_peer(&self, who: Who) -> Option<tl::enums::InputPeer> {
         Some(match who {
             Who::User(user_id) if user_id == self.me => tl::enums::InputPeer::PeerSelf,
-            Who::User(user_id) => tl::types::InputPeerUser { user_id, access_hash: self.map.get(&who)?.hash? }.into(),
-            Who::Group(chat_id) => tl::types::InputPeerChat { chat_id }.into(),
-            Who::Channel(channel_id) => {
-                tl::types::InputPeerChannel { channel_id, access_hash: self.map.get(&who)?.hash? }.into()
+            Who::User(user_id) => tl::types::InputPeerUser {
+                user_id,
+                access_hash: self.map.get(&who)?.hash?,
             }
+            .into(),
+            Who::Group(chat_id) => tl::types::InputPeerChat { chat_id }.into(),
+            Who::Channel(channel_id) => tl::types::InputPeerChannel {
+                channel_id,
+                access_hash: self.map.get(&who)?.hash?,
+            }
+            .into(),
         })
     }
 
     pub fn input_channel(&self, who: Who) -> Option<tl::enums::InputChannel> {
         match who {
-            Who::Channel(channel_id) => {
-                Some(tl::types::InputChannel { channel_id, access_hash: self.map.get(&who)?.hash? }.into())
-            }
+            Who::Channel(channel_id) => Some(
+                tl::types::InputChannel {
+                    channel_id,
+                    access_hash: self.map.get(&who)?.hash?,
+                }
+                .into(),
+            ),
             _ => None,
         }
     }
@@ -359,7 +419,13 @@ impl Directory {
     pub fn input_user(&self, who: Who) -> Option<tl::enums::InputUser> {
         match who {
             Who::User(user_id) if user_id == self.me => Some(tl::enums::InputUser::UserSelf),
-            Who::User(user_id) => Some(tl::types::InputUser { user_id, access_hash: self.map.get(&who)?.hash? }.into()),
+            Who::User(user_id) => Some(
+                tl::types::InputUser {
+                    user_id,
+                    access_hash: self.map.get(&who)?.hash?,
+                }
+                .into(),
+            ),
             _ => None,
         }
     }
@@ -373,7 +439,11 @@ pub fn person_row(who: Who, known: &Known) -> PersonRow {
     PersonRow {
         id: who.text(),
         name: known.name.clone(),
-        handle: if known.handle.is_empty() { String::new() } else { format!("@{}", known.handle) },
+        handle: if known.handle.is_empty() {
+            String::new()
+        } else {
+            format!("@{}", known.handle)
+        },
         avatar: known.avatar(),
         bot: known.bot,
         status: String::new(),
@@ -386,7 +456,12 @@ pub fn person_row(who: Who, known: &Known) -> PersonRow {
 
 /// Where a message opens in Telegram's own app.
 pub fn message_link(who: Who, known: Option<&Known>, message: i32) -> String {
-    match (who, known.map(|known| known.handle.as_str()).filter(|handle| !handle.is_empty())) {
+    match (
+        who,
+        known
+            .map(|known| known.handle.as_str())
+            .filter(|handle| !handle.is_empty()),
+    ) {
         (Who::Channel(_), Some(handle)) => format!("https://t.me/{handle}/{message}"),
         (Who::Channel(id), None) => format!("https://t.me/c/{id}/{message}"),
         (Who::User(id), _) => format!("tg://openmessage?user_id={id}&message_id={message}"),
@@ -413,8 +488,14 @@ mod tests {
 
     /// A megagroup. Flags off, so every optional field is absent.
     fn megagroup(title: &str) -> tl::types::Channel {
-        let mut channel: tl::types::Channel =
-            blank(&[&put(0u32), &put(0u32), &put(9i64), &put(title.to_owned()), &put(tl::enums::ChatPhoto::Empty), &put(1i32)]);
+        let mut channel: tl::types::Channel = blank(&[
+            &put(0u32),
+            &put(0u32),
+            &put(9i64),
+            &put(title.to_owned()),
+            &put(tl::enums::ChatPhoto::Empty),
+            &put(1i32),
+        ]);
         channel.megagroup = true;
         channel
     }
@@ -426,7 +507,8 @@ mod tests {
     }
 
     fn admin(post_messages: bool) -> tl::enums::ChatAdminRights {
-        let rights: tl::types::ChatAdminRights = blank(&[&put(if post_messages { 2u32 } else { 0 })]);
+        let rights: tl::types::ChatAdminRights =
+            blank(&[&put(if post_messages { 2u32 } else { 0 })]);
         rights.into()
     }
 
@@ -487,7 +569,10 @@ mod tests {
             default_banned_rights: Some(ban_send(0)),
         };
         assert!(read_only(chat.clone().into()));
-        let creator = tl::types::Chat { creator: true, ..chat };
+        let creator = tl::types::Chat {
+            creator: true,
+            ..chat
+        };
         assert!(!read_only(creator.into()));
     }
 
@@ -495,12 +580,18 @@ mod tests {
     fn ids_go_both_ways_and_a_topic_needs_a_channel() {
         assert_eq!(Who::parse("u42"), Some((Who::User(42), None)));
         assert_eq!(Who::parse("c9_31"), Some((Who::Channel(9), Some(31))));
-        assert_eq!(Who::parse(&thread_id(Who::Channel(9), 1)), Some((Who::Channel(9), Some(1))));
+        assert_eq!(
+            Who::parse(&thread_id(Who::Channel(9), 1)),
+            Some((Who::Channel(9), Some(1)))
+        );
         assert_eq!(Who::parse("g7_3"), None);
         assert_eq!(Who::parse("x1"), None);
         assert_eq!(Who::parse(""), None);
         assert_eq!(Who::Group(7).text(), "g7");
         assert_eq!(message_link(Who::Channel(9), None, 4), "https://t.me/c/9/4");
-        assert_eq!(message_link(Who::User(3), None, 4), "tg://openmessage?user_id=3&message_id=4");
+        assert_eq!(
+            message_link(Who::User(3), None, 4),
+            "tg://openmessage?user_id=3&message_id=4"
+        );
     }
 }

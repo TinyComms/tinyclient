@@ -2,14 +2,15 @@
 //! as a conversation. The read marker sits part of the way down, so there is a "New" divider.
 
 use super::discord::{self, Discord, BOT, HARUTO, INES, TOMASZ, WREN};
-use super::png::Art;
 use super::photos;
+use super::png::Art;
 use super::serve::wav_bytes;
 use super::{Fallible, Rich, Seeder, Who};
 use crate::store::ConversationRow;
 use protocol::{
-    AccountKey, Attachment, Card, ConversationKind, Forwarded, Key, MediaFile, MediaKind, MentionKind, Message,
-    MessageKind, Preview, Reaction, ReplyTo, SendState, Span, Style, ThreadSummary,
+    AccountKey, Attachment, Card, ConversationKind, Forwarded, Key, MediaFile, MediaKind,
+    MentionKind, Message, MessageKind, Preview, Reaction, ReplyTo, SendState, Span, Style,
+    ThreadSummary,
 };
 
 /// The message that is still being sent, which only the running demo can keep that way, and
@@ -22,7 +23,13 @@ pub(crate) struct Pending {
 }
 
 /// A thread hanging off a message of the showcase, as a row that names its parent and root.
-fn thread_row(id: &str, title: &str, root: &str, position: i32, group: Option<String>) -> ConversationRow {
+fn thread_row(
+    id: &str,
+    title: &str,
+    root: &str,
+    position: i32,
+    group: Option<String>,
+) -> ConversationRow {
     ConversationRow {
         space: Some(discord::MOSS.to_owned()),
         group,
@@ -37,7 +44,9 @@ fn thread_row(id: &str, title: &str, root: &str, position: i32, group: Option<St
 pub(super) fn waveform(bars: usize) -> Vec<u8> {
     (0..bars)
         .map(|bar| {
-            let swell = ((bar as f32 / bars as f32) * std::f32::consts::PI * 5.0).sin().abs();
+            let swell = ((bar as f32 / bars as f32) * std::f32::consts::PI * 5.0)
+                .sin()
+                .abs();
             (20.0 + swell * 200.0 * (0.6 + (bar % 7) as f32 / 18.0)) as u8
         })
         .collect()
@@ -45,12 +54,36 @@ pub(super) fn waveform(bars: usize) -> Vec<u8> {
 
 /// An image as a message carries it: a thumbnail on disk and an original nobody has fetched.
 /// `shows` is the photograph in `photos/`; `art` is drawn when it is not there.
-fn photo(s: &mut Seeder, account: &AccountKey, name: &str, shows: &str, art: Art, width: u32, height: u32) -> Fallible<Attachment> {
+fn photo(
+    s: &mut Seeder,
+    account: &AccountKey,
+    name: &str,
+    shows: &str,
+    art: Art,
+    width: u32,
+    height: u32,
+) -> Fallible<Attachment> {
     let id = format!("att-{:08x}", s.roll(u32::MAX as u64));
     let look = s.look(art);
-    let thumb = s.photo(account, &format!("{id}-thumb"), MediaKind::Image, shows, look, width, height)?;
+    let thumb = s.photo(
+        account,
+        &format!("{id}-thumb"),
+        MediaKind::Image,
+        shows,
+        look,
+        width,
+        height,
+    )?;
     let scale = (2400 / width.max(height)).clamp(1, 3);
-    let file = s.photo_waiting(account, &id, MediaKind::Image, shows, look, width * scale, height * scale)?;
+    let file = s.photo_waiting(
+        account,
+        &id,
+        MediaKind::Image,
+        shows,
+        look,
+        width * scale,
+        height * scale,
+    )?;
     Ok(Attachment {
         thumb: Some(thumb),
         mime: "image/png".to_owned(),
@@ -72,9 +105,20 @@ pub(super) fn gif_wall(s: &mut Seeder, room: &Key, cast: &[Who]) -> Fallible<()>
     for at in 0..30usize {
         let (shows, kind, mime, width, height) = MOVING[at % MOVING.len()];
         let look = s.look(Art::Scene);
-        let file = s.photo(&account, &format!("att-wall-{at}"), kind, shows, look, width, height)?;
+        let file = s.photo(
+            &account,
+            &format!("att-wall-{at}"),
+            kind,
+            shows,
+            look,
+            width,
+            height,
+        )?;
         let mut message = s.message(&account, &cast[at % 7], 600 - at as i64 * 15, "");
-        message.attachments.push(Attachment { mime: mime.to_owned(), ..Attachment::new(shows, file) });
+        message.attachments.push(Attachment {
+            mime: mime.to_owned(),
+            ..Attachment::new(shows, file)
+        });
         s.post(room, &message)?;
     }
     Ok(())
@@ -85,7 +129,10 @@ fn mention(text: &str, name: &str, kind: MentionKind, id: &str) -> Span {
     Span {
         start: start as u32,
         end: (start + name.len()) as u32,
-        style: Style::Mention { kind, id: id.to_owned() },
+        style: Style::Mention {
+            kind,
+            id: id.to_owned(),
+        },
     }
 }
 
@@ -108,7 +155,12 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<Pending> {
     };
 
     // Two days ago: text in every style.
-    feed.push(system(s.message(account, who(HARUTO), step(0), "Haruto Senda joined the server.")));
+    feed.push(system(s.message(
+        account,
+        who(HARUTO),
+        step(0),
+        "Haruto Senda joined the server.",
+    )));
     let styles = Rich::default()
         .plain("Text can be ")
         .styled("bold", Style::Bold)
@@ -153,64 +205,192 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<Pending> {
 
     let links = Rich::default()
         .plain("Field key is at ")
-        .styled("https://example.org/keys/bryophytes", Style::Link { url: "https://example.org/keys/bryophytes".to_owned() })
+        .styled(
+            "https://example.org/keys/bryophytes",
+            Style::Link {
+                url: "https://example.org/keys/bryophytes".to_owned(),
+            },
+        )
         .plain(" and the sign-up sheet is ")
-        .styled("here", Style::Link { url: "https://example.org/foray/sign-up".to_owned() })
+        .styled(
+            "here",
+            Style::Link {
+                url: "https://example.org/foray/sign-up".to_owned(),
+            },
+        )
         .plain(".");
     feed.push(links.into(s.message(account, who(WREN), step(11), "")));
 
     let parrot = s.look(Art::Blob);
-    let parrot = s.picture(account, "emoji-mossparrot", MediaKind::Emoji, parrot, 48, 48)?;
+    let parrot = s.picture(
+        account,
+        "emoji-mossparrot",
+        MediaKind::Emoji,
+        parrot,
+        48,
+        48,
+    )?;
     let tick = s.look(Art::Blob);
     let tick = s.picture(account, "emoji-lichen_ok", MediaKind::Emoji, tick, 48, 48)?;
     let emoji = Rich::default()
         .plain("Camera 2 is back up ")
-        .styled(":mossparrot:", Style::Emoji { file: parrot.clone() })
+        .styled(
+            ":mossparrot:",
+            Style::Emoji {
+                file: parrot.clone(),
+            },
+        )
         .plain(" and the card was fine ")
         .styled(":lichen_ok:", Style::Emoji { file: tick.clone() })
         .plain(" 🌿");
     feed.push(emoji.into(s.message(account, who(TOMASZ), step(14), "")));
     feed.push(s.message(account, who(WREN), step(2), "🎉🌿🔥"));
-    let jumbo = Rich::default().styled(":mossparrot:", Style::Emoji { file: parrot.clone() });
+    let jumbo = Rich::default().styled(
+        ":mossparrot:",
+        Style::Emoji {
+            file: parrot.clone(),
+        },
+    );
     feed.push(jumbo.into(s.message(account, who(HARUTO), step(1), "")));
     // An animated custom emoji, inline and alone, as Discord sends one: a moving WebP or GIF.
     let look = s.look(Art::Blob);
-    let wag = s.photo(account, "emoji-tailwag", MediaKind::Emoji, "emoji-tailwag.gif", look, 48, 48)?;
-    let wagging = Rich::default().plain("The marten's tail on the clip, frame by frame ").styled(":tailwag:", Style::Emoji { file: wag.clone() });
+    let wag = s.photo(
+        account,
+        "emoji-tailwag",
+        MediaKind::Emoji,
+        "emoji-tailwag.gif",
+        look,
+        48,
+        48,
+    )?;
+    let wagging = Rich::default()
+        .plain("The marten's tail on the clip, frame by frame ")
+        .styled(":tailwag:", Style::Emoji { file: wag.clone() });
     feed.push(wagging.into(s.message(account, who(WREN), step(1), "")));
-    let jumbo = Rich::default().styled(":tailwag:", Style::Emoji { file: wag.clone() }).plain(" ").styled(":tailwag:", Style::Emoji { file: wag.clone() });
+    let jumbo = Rich::default()
+        .styled(":tailwag:", Style::Emoji { file: wag.clone() })
+        .plain(" ")
+        .styled(":tailwag:", Style::Emoji { file: wag.clone() });
     feed.push(jumbo.into(s.message(account, who(TOMASZ), step(1), "")));
 
     // Yesterday: pictures and files.
-    let mut single = s.message(account, who(INES), step(1300), "Frost on the cushion moss this morning.");
-    single.attachments.push(photo(s, account, "frost-cushion.png", "moss-frost.webp", Art::Scene, 800, 600)?);
+    let mut single = s.message(
+        account,
+        who(INES),
+        step(1300),
+        "Frost on the cushion moss this morning.",
+    );
+    single.attachments.push(photo(
+        s,
+        account,
+        "frost-cushion.png",
+        "moss-frost.webp",
+        Art::Scene,
+        800,
+        600,
+    )?);
     let single_id = single.id.clone();
     feed.push(single);
     let grids: [(usize, &str, &[&str]); 4] = [
-        (2, "Before and after the thaw.", &["thaw-before.webp", "thaw-after.webp"]),
-        (3, "Three from the weir.", &["weir-1.webp", "weir-2.webp", "weir-3.webp"]),
-        (4, "The fence post, from every side.", &["fence-1.webp", "fence-2.webp", "fence-3.webp", "fence-4.webp"]),
-        (6, "Everything from camera 2 last night.", &["camera-1.webp", "camera-2.webp", "camera-3.webp", "camera-4.webp", "camera-5.webp", "camera-6.webp"]),
+        (
+            2,
+            "Before and after the thaw.",
+            &["thaw-before.webp", "thaw-after.webp"],
+        ),
+        (
+            3,
+            "Three from the weir.",
+            &["weir-1.webp", "weir-2.webp", "weir-3.webp"],
+        ),
+        (
+            4,
+            "The fence post, from every side.",
+            &[
+                "fence-1.webp",
+                "fence-2.webp",
+                "fence-3.webp",
+                "fence-4.webp",
+            ],
+        ),
+        (
+            6,
+            "Everything from camera 2 last night.",
+            &[
+                "camera-1.webp",
+                "camera-2.webp",
+                "camera-3.webp",
+                "camera-4.webp",
+                "camera-5.webp",
+                "camera-6.webp",
+            ],
+        ),
     ];
     for (count, text, shows) in grids {
-        let mut grid = s.message(account, who(if count % 2 == 0 { WREN } else { TOMASZ }), step(16), text);
+        let mut grid = s.message(
+            account,
+            who(if count % 2 == 0 { WREN } else { TOMASZ }),
+            step(16),
+            text,
+        );
         for n in 0..count {
             let (width, height) = [(400, 300), (300, 400), (420, 280)][(n + count) % 3];
-            grid.attachments.push(photo(s, account, &format!("IMG_{}.png", 4100 + count * 10 + n), shows[n], Art::Scene, width, height)?);
+            grid.attachments.push(photo(
+                s,
+                account,
+                &format!("IMG_{}.png", 4100 + count * 10 + n),
+                shows[n],
+                Art::Scene,
+                width,
+                height,
+            )?);
         }
         feed.push(grid);
     }
-    let mut tall = s.message(account, who(HARUTO), step(12), "The whole trunk, top to bottom.");
-    tall.attachments.push(photo(s, account, "trunk-panorama.png", "trunk.webp", Art::Bands, 200, 1400)?);
+    let mut tall = s.message(
+        account,
+        who(HARUTO),
+        step(12),
+        "The whole trunk, top to bottom.",
+    );
+    tall.attachments.push(photo(
+        s,
+        account,
+        "trunk-panorama.png",
+        "trunk.webp",
+        Art::Bands,
+        200,
+        1400,
+    )?);
     feed.push(tall);
     let mut wide = s.message(account, who(HARUTO), step(3), "And the ridge line.");
-    wide.attachments.push(photo(s, account, "ridge-panorama.png", "ridge.webp", Art::Scene, 800, 130)?);
+    wide.attachments.push(photo(
+        s,
+        account,
+        "ridge-panorama.png",
+        "ridge.webp",
+        Art::Scene,
+        800,
+        130,
+    )?);
     feed.push(wide);
     // Hidden until asked for. The name keeps Discord's own prefix, as the network sends it.
-    let mut hidden = s.message(account, who(WREN), step(2), "What camera 3 caught. Do not open before breakfast.");
+    let mut hidden = s.message(
+        account,
+        who(WREN),
+        step(2),
+        "What camera 3 caught. Do not open before breakfast.",
+    );
     hidden.attachments.push(Attachment {
         spoiler: true,
-        ..photo(s, account, "SPOILER_camera3-0412.png", "camera-3-catch.webp", Art::Scene, 640, 480)?
+        ..photo(
+            s,
+            account,
+            "SPOILER_camera3-0412.png",
+            "camera-3-catch.webp",
+            Art::Scene,
+            640,
+            480,
+        )?
     });
     feed.push(hidden);
 
@@ -219,28 +399,97 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<Pending> {
     let look = s.look(Art::Scene);
     let mut gif = s.message(account, who(WREN), step(20), "");
     gif.attachments.push(Attachment {
-        thumb: Some(s.photo(account, "att-gif-thumb", MediaKind::Image, "gif-greyhound.webp", look, 480, 146)?),
+        thumb: Some(s.photo(
+            account,
+            "att-gif-thumb",
+            MediaKind::Image,
+            "gif-greyhound.webp",
+            look,
+            480,
+            146,
+        )?),
         mime: "image/gif".to_owned(),
-        ..Attachment::new("greyhound-gallop.gif", s.photo_waiting(account, "att-gif", MediaKind::Gif, "gif-greyhound.webp", look, 480, 146)?)
+        ..Attachment::new(
+            "greyhound-gallop.gif",
+            s.photo_waiting(
+                account,
+                "att-gif",
+                MediaKind::Gif,
+                "gif-greyhound.webp",
+                look,
+                480,
+                146,
+            )?,
+        )
     });
     feed.push(gif);
     // A GIF with no smaller copy, as Slack and Teams send one: the file itself, decoded at the
     // size it is drawn.
-    let mut horse = s.message(account, who(INES), step(2), "Muybridge's horse, 1878. All four hooves off the ground.");
-    let galloping = s.photo(account, "att-horse", MediaKind::Gif, "gif-horse.gif", look, 210, 140)?;
-    horse.attachments.push(Attachment { mime: "image/gif".to_owned(), ..Attachment::new("horse-in-motion.gif", galloping) });
+    let mut horse = s.message(
+        account,
+        who(INES),
+        step(2),
+        "Muybridge's horse, 1878. All four hooves off the ground.",
+    );
+    let galloping = s.photo(
+        account,
+        "att-horse",
+        MediaKind::Gif,
+        "gif-horse.gif",
+        look,
+        210,
+        140,
+    )?;
+    horse.attachments.push(Attachment {
+        mime: "image/gif".to_owned(),
+        ..Attachment::new("horse-in-motion.gif", galloping)
+    });
     feed.push(horse);
     // A moving WebP sent as a picture.
-    let mut pigeons = s.message(account, who(HARUTO), step(3), "Pigeons off the barn roof, from the same plates.");
-    let flying = s.photo(account, "att-pigeons", MediaKind::Image, "pigeons.webp", look, 400, 147)?;
-    pigeons.attachments.push(Attachment { mime: "image/webp".to_owned(), ..Attachment::new("pigeons.webp", flying) });
+    let mut pigeons = s.message(
+        account,
+        who(HARUTO),
+        step(3),
+        "Pigeons off the barn roof, from the same plates.",
+    );
+    let flying = s.photo(
+        account,
+        "att-pigeons",
+        MediaKind::Image,
+        "pigeons.webp",
+        look,
+        400,
+        147,
+    )?;
+    pigeons.attachments.push(Attachment {
+        mime: "image/webp".to_owned(),
+        ..Attachment::new("pigeons.webp", flying)
+    });
     feed.push(pigeons);
     // A GIF from Tenor, which is an MP4 underneath: its still, until video plays in place.
     if let Some(bytes) = photos::bytes("camera2-clip.mp4") {
         let mut tenor = s.message(account, who(TOMASZ), step(2), "");
-        let clip = MediaFile { width: 640, height: 360, ..s.file(account, "att-tenor", MediaKind::Gif, bytes.len() as u64, "photo/camera2-clip.mp4?wait=600")? };
+        let clip = MediaFile {
+            width: 640,
+            height: 360,
+            ..s.file(
+                account,
+                "att-tenor",
+                MediaKind::Gif,
+                bytes.len() as u64,
+                "photo/camera2-clip.mp4?wait=600",
+            )?
+        };
         tenor.attachments.push(Attachment {
-            thumb: Some(s.photo(account, "att-tenor-thumb", MediaKind::Image, "gif-thumb.webp", look, 480, 270)?),
+            thumb: Some(s.photo(
+                account,
+                "att-tenor-thumb",
+                MediaKind::Image,
+                "gif-thumb.webp",
+                look,
+                480,
+                270,
+            )?),
             mime: "video/mp4".to_owned(),
             ..Attachment::new("GIF", clip)
         });
@@ -253,59 +502,144 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<Pending> {
         Some(bytes) => MediaFile {
             width: 640,
             height: 360,
-            ..s.file(account, "att-video", MediaKind::Video, bytes.len() as u64, "photo/camera2-clip.mp4?wait=600")?
+            ..s.file(
+                account,
+                "att-video",
+                MediaKind::Video,
+                bytes.len() as u64,
+                "photo/camera2-clip.mp4?wait=600",
+            )?
         },
-        None => s.broken(account, "att-video", MediaKind::Video, 1920, 1080, 19_293_798)?,
+        None => s.broken(
+            account,
+            "att-video",
+            MediaKind::Video,
+            1920,
+            1080,
+            19_293_798,
+        )?,
     };
     video.attachments.push(Attachment {
-        thumb: Some(s.photo(account, "att-video-thumb", MediaKind::Image, "video-thumb.webp", look, 640, 360)?),
+        thumb: Some(s.photo(
+            account,
+            "att-video-thumb",
+            MediaKind::Image,
+            "video-thumb.webp",
+            look,
+            640,
+            360,
+        )?),
         mime: "video/mp4".to_owned(),
         duration: 5,
         ..Attachment::new("camera2-0312.mp4", clip)
     });
     feed.push(video);
 
-    let mut files = s.message(account, who(TOMASZ), step(25), "Wiring diagram and last night's logs, as promised.");
+    let mut files = s.message(
+        account,
+        who(TOMASZ),
+        step(25),
+        "Wiring diagram and last night's logs, as promised.",
+    );
     files.attachments.push(Attachment {
         mime: "application/pdf".to_owned(),
-        ..Attachment::new("Trail camera wiring.pdf", s.file(account, "att-pdf", MediaKind::File, 188_416, "pdf/188416?wait=900")?)
+        ..Attachment::new(
+            "Trail camera wiring.pdf",
+            s.file(
+                account,
+                "att-pdf",
+                MediaKind::File,
+                188_416,
+                "pdf/188416?wait=900",
+            )?,
+        )
     });
     files.attachments.push(Attachment {
         mime: "application/zip".to_owned(),
-        ..Attachment::new("camera-logs.zip", s.file(account, "att-zip", MediaKind::File, 42_240, "zip/42240?wait=900")?)
+        ..Attachment::new(
+            "camera-logs.zip",
+            s.file(
+                account,
+                "att-zip",
+                MediaKind::File,
+                42_240,
+                "zip/42240?wait=900",
+            )?,
+        )
     });
     feed.push(files);
 
     // A voice message as Discord sends one: Ogg Opus, its length and loudness known before a
     // byte of it is fetched. Away from the source tree, a WAV of two notes stands in.
     let mut voice = s.message(account, who(INES), step(18), "");
-    voice.attachments.push(match photos::bytes("voice-ines.opus") {
-        Some(bytes) => Attachment {
-            mime: "audio/ogg".to_owned(),
-            duration: 6,
-            waveform: waveform(64),
-            ..Attachment::new("voice-message.ogg", s.file(account, "att-voice", MediaKind::Audio, bytes.len() as u64, "photo/voice-ines.opus")?)
-        },
-        None => Attachment {
-            mime: "audio/wav".to_owned(),
-            duration: 4,
-            waveform: waveform(64),
-            ..Attachment::new("voice-message.wav", s.file(account, "att-voice", MediaKind::Audio, wav_bytes(4), "wav/4")?)
-        },
-    });
+    voice
+        .attachments
+        .push(match photos::bytes("voice-ines.opus") {
+            Some(bytes) => Attachment {
+                mime: "audio/ogg".to_owned(),
+                duration: 6,
+                waveform: waveform(64),
+                ..Attachment::new(
+                    "voice-message.ogg",
+                    s.file(
+                        account,
+                        "att-voice",
+                        MediaKind::Audio,
+                        bytes.len() as u64,
+                        "photo/voice-ines.opus",
+                    )?,
+                )
+            },
+            None => Attachment {
+                mime: "audio/wav".to_owned(),
+                duration: 4,
+                waveform: waveform(64),
+                ..Attachment::new(
+                    "voice-message.wav",
+                    s.file(
+                        account,
+                        "att-voice",
+                        MediaKind::Audio,
+                        wav_bytes(4),
+                        "wav/4",
+                    )?,
+                )
+            },
+        });
     feed.push(voice);
     if let Some(bytes) = photos::bytes("dawn-chorus.m4a") {
-        let mut song = s.message(account, who(HARUTO), step(6), "Dawn chorus by the hollow, 5:40. The second trill is the wren.");
+        let mut song = s.message(
+            account,
+            who(HARUTO),
+            step(6),
+            "Dawn chorus by the hollow, 5:40. The second trill is the wren.",
+        );
         song.attachments.push(Attachment {
             mime: "audio/mp4".to_owned(),
             duration: 12,
-            ..Attachment::new("dawn-chorus-lynx-hollow.m4a", s.file(account, "att-chorus", MediaKind::Audio, bytes.len() as u64, "photo/dawn-chorus.m4a")?)
+            ..Attachment::new(
+                "dawn-chorus-lynx-hollow.m4a",
+                s.file(
+                    account,
+                    "att-chorus",
+                    MediaKind::Audio,
+                    bytes.len() as u64,
+                    "photo/dawn-chorus.m4a",
+                )?,
+            )
         });
         feed.push(song);
     }
     let look = s.look(Art::Blob);
     let mut sticker = s.message(account, who(WREN), step(4), "");
-    let stuck = s.picture(account, "sticker-moss-wave", MediaKind::Image, look, 320, 320)?;
+    let stuck = s.picture(
+        account,
+        "sticker-moss-wave",
+        MediaKind::Image,
+        look,
+        320,
+        320,
+    )?;
     // Its background is transparent: it is drawn on whatever the conversation's is.
     sticker.attachments.push(Attachment {
         thumb: Some(stuck.clone()),
@@ -316,7 +650,15 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<Pending> {
     feed.push(sticker);
     // An APNG sticker, which moves.
     let mut beating = s.message(account, who(INES), step(1), "");
-    let heart = s.photo(account, "sticker-heartbeat", MediaKind::Image, "sticker-heartbeat.png", look, 200, 150)?;
+    let heart = s.photo(
+        account,
+        "sticker-heartbeat",
+        MediaKind::Image,
+        "sticker-heartbeat.png",
+        look,
+        200,
+        150,
+    )?;
     beating.attachments.push(Attachment {
         thumb: Some(heart.clone()),
         mime: "image/png".to_owned(),
@@ -327,23 +669,55 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<Pending> {
 
     // One picture that was never fetched and one that cannot be.
     let look = s.look(Art::Scene);
-    let mut late = s.message(account, who(HARUTO), step(15), "Two more, if they load on this connection.");
+    let mut late = s.message(
+        account,
+        who(HARUTO),
+        step(15),
+        "Two more, if they load on this connection.",
+    );
     late.attachments.push(Attachment {
-        thumb: Some(s.photo_waiting(account, "att-late-thumb", MediaKind::Image, "weir-dawn.webp", look, 800, 600)?),
+        thumb: Some(s.photo_waiting(
+            account,
+            "att-late-thumb",
+            MediaKind::Image,
+            "weir-dawn.webp",
+            look,
+            800,
+            600,
+        )?),
         mime: "image/png".to_owned(),
-        ..Attachment::new("weir-dawn.png", s.photo_waiting(account, "att-late", MediaKind::Image, "weir-dawn.webp", look, 1600, 1200)?)
+        ..Attachment::new(
+            "weir-dawn.png",
+            s.photo_waiting(
+                account,
+                "att-late",
+                MediaKind::Image,
+                "weir-dawn.webp",
+                look,
+                1600,
+                1200,
+            )?,
+        )
     });
     late.attachments.push(Attachment {
         thumb: Some(s.broken(account, "att-lost-thumb", MediaKind::Image, 800, 600, 0)?),
         mime: "image/png".to_owned(),
-        ..Attachment::new("weir-dusk.png", s.broken(account, "att-lost", MediaKind::Image, 1600, 1200, 0)?)
+        ..Attachment::new(
+            "weir-dusk.png",
+            s.broken(account, "att-lost", MediaKind::Image, 1600, 1200, 0)?,
+        )
     });
     feed.push(late);
 
     let look = s.look(Art::Blob);
     let mut small = Rich::default()
         .plain("This is the one on the fence post, I think: ")
-        .styled("https://example.org/wiki/Lepraria", Style::Link { url: "https://example.org/wiki/Lepraria".to_owned() })
+        .styled(
+            "https://example.org/wiki/Lepraria",
+            Style::Link {
+                url: "https://example.org/wiki/Lepraria".to_owned(),
+            },
+        )
         .into(s.message(account, who(WREN), step(30), ""));
     small.previews.push(Preview {
         url: "https://example.org/wiki/Lepraria".to_owned(),
@@ -356,7 +730,12 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<Pending> {
     let look = s.look(Art::Bands);
     let mut large = Rich::default()
         .plain("And the county wrote up last year's foray: ")
-        .styled("https://example.org/news/spring-foray", Style::Link { url: "https://example.org/news/spring-foray".to_owned() })
+        .styled(
+            "https://example.org/news/spring-foray",
+            Style::Link {
+                url: "https://example.org/news/spring-foray".to_owned(),
+            },
+        )
         .into(s.message(account, who(INES), step(8), ""));
     large.previews.push(Preview {
         url: "https://example.org/news/spring-foray".to_owned(),
@@ -368,27 +747,60 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<Pending> {
     feed.push(large);
 
     // Today: reactions, replies, a thread, and what happens to a message afterwards.
-    let mut loved = s.message(account, who(TOMASZ), step(1150), "County recorder confirmed it: first pine marten on this ridge since 1987.");
-    let counted = [("👍", 4, true), ("❤️", 12, false), ("🎉", 9, true), ("👀", 7, false), ("🔥", 5, false), ("💯", 3, false), ("😂", 3, false), ("🙏", 2, false), ("🚀", 2, false), ("🤔", 1, false), ("🌿", 1, false)];
+    let mut loved = s.message(
+        account,
+        who(TOMASZ),
+        step(1150),
+        "County recorder confirmed it: first pine marten on this ridge since 1987.",
+    );
+    let counted = [
+        ("👍", 4, true),
+        ("❤️", 12, false),
+        ("🎉", 9, true),
+        ("👀", 7, false),
+        ("🔥", 5, false),
+        ("💯", 3, false),
+        ("😂", 3, false),
+        ("🙏", 2, false),
+        ("🚀", 2, false),
+        ("🤔", 1, false),
+        ("🌿", 1, false),
+    ];
     loved.reactions = counted
         .into_iter()
-        .map(|(emoji, count, mine)| Reaction { emoji: emoji.to_owned(), file: None, count, mine })
+        .map(|(emoji, count, mine)| Reaction {
+            emoji: emoji.to_owned(),
+            file: None,
+            count,
+            mine,
+        })
         .collect();
-    loved.reactions.insert(2, Reaction {
-        emoji: ":mossparrot:".to_owned(),
-        file: Some(parrot),
-        count: 6,
-        mine: false,
-    });
-    loved.reactions.insert(3, Reaction {
-        emoji: ":tailwag:".to_owned(),
-        file: Some(wag),
-        count: 3,
-        mine: false,
-    });
+    loved.reactions.insert(
+        2,
+        Reaction {
+            emoji: ":mossparrot:".to_owned(),
+            file: Some(parrot),
+            count: 6,
+            mine: false,
+        },
+    );
+    loved.reactions.insert(
+        3,
+        Reaction {
+            emoji: ":tailwag:".to_owned(),
+            file: Some(wag),
+            count: 3,
+            mine: false,
+        },
+    );
     feed.push(loved);
 
-    let mut reply = s.message(account, me, step(6), "Same spot as this one. The camera was pointing the right way for once.");
+    let mut reply = s.message(
+        account,
+        me,
+        step(6),
+        "Same spot as this one. The camera was pointing the right way for once.",
+    );
     reply.reply_to = Some(ReplyTo {
         id: single_id,
         sender: who(INES).name.clone(),
@@ -409,15 +821,37 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<Pending> {
     feed.push(orphan);
 
     let thread = Key::new(account, discord::BUILD_LOG);
-    let replies = s.script(&thread, &discord.cast, me, &[
-        (TOMASZ, 260, "Day 1: the sensor triggers on wind. Moved it behind the lens hood."),
-        (HARUTO, 250, "Try a longer debounce before you move anything else."),
-        (TOMASZ, 200, "Day 2: 400 ms debounce, no more wind, still catches the marten."),
-        (usize::MAX, 190, "Battery draw?"),
-        (TOMASZ, 185, "11 mA idle. A week on one pack."),
-        (INES, 75, "Put the diagram in the showcase when it is done."),
-    ])?;
-    let mut root = s.message(account, who(TOMASZ), step(12), "Trail camera build log. Notes go in the thread so the channel stays readable.");
+    let replies = s.script(
+        &thread,
+        &discord.cast,
+        me,
+        &[
+            (
+                TOMASZ,
+                260,
+                "Day 1: the sensor triggers on wind. Moved it behind the lens hood.",
+            ),
+            (
+                HARUTO,
+                250,
+                "Try a longer debounce before you move anything else.",
+            ),
+            (
+                TOMASZ,
+                200,
+                "Day 2: 400 ms debounce, no more wind, still catches the marten.",
+            ),
+            (usize::MAX, 190, "Battery draw?"),
+            (TOMASZ, 185, "11 mA idle. A week on one pack."),
+            (INES, 75, "Put the diagram in the showcase when it is done."),
+        ],
+    )?;
+    let mut root = s.message(
+        account,
+        who(TOMASZ),
+        step(12),
+        "Trail camera build log. Notes go in the thread so the channel stays readable.",
+    );
     let face = |at: usize| Key::new(account, who(at).id.clone());
     root.thread = Some(ThreadSummary {
         id: thread.id.clone(),
@@ -428,19 +862,49 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<Pending> {
     });
     // The thread's row already sits in the tree, under the showcase; now it can say what it
     // hangs off.
-    let (group, position) = s.store.conversation(&thread)?.map_or((None, 7), |row| (row.group, row.position));
-    s.conversation(account, thread_row(&thread.id, "Trail camera build log", &root.id, position, group.clone()))?;
+    let (group, position) = s
+        .store
+        .conversation(&thread)?
+        .map_or((None, 7), |row| (row.group, row.position));
+    s.conversation(
+        account,
+        thread_row(
+            &thread.id,
+            "Trail camera build log",
+            &root.id,
+            position,
+            group.clone(),
+        ),
+    )?;
     s.counts(&thread, 2, 0, Some(&replies[3]))?;
     feed.push(root);
 
     // A thread whose first message was deleted: the message stays as a tombstone.
     let mut gone = s.message(account, who(WREN), step(5), "");
     gone.deleted = true;
-    let aftermath = s.conversation(account, thread_row("400000000000000901", "Deleted message", &gone.id, position, group))?;
-    s.script(&aftermath, &discord.cast, me, &[
-        (HARUTO, 300, "What did this say? I only saw the notification."),
-        (INES, 295, "Wrong channel, apparently. Nothing to see."),
-    ])?;
+    let aftermath = s.conversation(
+        account,
+        thread_row(
+            "400000000000000901",
+            "Deleted message",
+            &gone.id,
+            position,
+            group,
+        ),
+    )?;
+    s.script(
+        &aftermath,
+        &discord.cast,
+        me,
+        &[
+            (
+                HARUTO,
+                300,
+                "What did this say? I only saw the notification.",
+            ),
+            (INES, 295, "Wrong channel, apparently. Nothing to see."),
+        ],
+    )?;
     gone.thread = Some(ThreadSummary {
         id: aftermath.id.clone(),
         replies: 2,
@@ -451,34 +915,80 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<Pending> {
     feed.push(gone);
 
     // Forwarded: what was said is the message's own text; where it came from is typed.
-    let mut forward = s.message(account, who(WREN), step(35), "Sign-up sheet is live. Twenty places, lodging for twelve.");
+    let mut forward = s.message(
+        account,
+        who(WREN),
+        step(35),
+        "Sign-up sheet is live. Twenty places, lodging for twelve.",
+    );
     forward.forwarded = Some(Box::new(Forwarded {
         from_title: "#announcements".to_owned(),
         from_space: String::new(),
-        link: format!("https://discord.com/channels/{}/400000000000000002", discord::MOSS),
+        link: format!(
+            "https://discord.com/channels/{}/400000000000000002",
+            discord::MOSS
+        ),
     }));
     feed.push(forward);
-    let mut afar = s.message(account, who(TOMASZ), step(5), "Someone got the same sensor working with a 3.3 V regulator. Schematic in their post.");
+    let mut afar = s.message(
+        account,
+        who(TOMASZ),
+        step(5),
+        "Someone got the same sensor working with a 3.3 V regulator. Schematic in their post.",
+    );
     afar.forwarded = Some(Box::new(Forwarded {
         from_title: "#show-and-tell".to_owned(),
         from_space: "Rustaceans Anonymous".to_owned(),
         link: "https://discord.com/channels/300000000000000002/410000000000000002".to_owned(),
     }));
-    afar.attachments.push(photo(s, account, "schematic.png", "schematic.webp", Art::Bands, 480, 320)?);
+    afar.attachments.push(photo(
+        s,
+        account,
+        "schematic.png",
+        "schematic.webp",
+        Art::Bands,
+        480,
+        320,
+    )?);
     feed.push(afar);
 
-    let mut edited = s.message(account, who(HARUTO), step(9), "Microscope club is Thursday at 19:00, not 18:00.");
+    let mut edited = s.message(
+        account,
+        who(HARUTO),
+        step(9),
+        "Microscope club is Thursday at 19:00, not 18:00.",
+    );
     edited.edited = true;
     feed.push(edited);
     // Everything after this one is unread.
     let marker = feed.len() - 1;
 
-    let mut pinned = s.message(account, who(INES), step(60), "Saturday: usual corner, 7:30, creek route. Boots, hand lens, packed lunch.");
+    let mut pinned = s.message(
+        account,
+        who(INES),
+        step(60),
+        "Saturday: usual corner, 7:30, creek route. Boots, hand lens, packed lunch.",
+    );
     pinned.pinned = true;
     feed.push(pinned);
-    feed.push(system(s.message(account, who(INES), step(1), "Ines Marchetti pinned a message to this channel.")));
-    feed.push(system(s.message(account, who(TOMASZ), step(40), "Tomasz Brandt started a call that lasted 14 minutes.")));
-    feed.push(system(s.message(account, who(WREN), step(30), "You missed a call from Wren Halloran.")));
+    feed.push(system(s.message(
+        account,
+        who(INES),
+        step(1),
+        "Ines Marchetti pinned a message to this channel.",
+    )));
+    feed.push(system(s.message(
+        account,
+        who(TOMASZ),
+        step(40),
+        "Tomasz Brandt started a call that lasted 14 minutes.",
+    )));
+    feed.push(system(s.message(
+        account,
+        who(WREN),
+        step(30),
+        "You missed a call from Wren Halloran.",
+    )));
 
     // What a bot posts: a line of its own, and a card of fields under it.
     let mut report = s.message(account, who(BOT), step(30), "Nightly camera report");
@@ -493,20 +1003,51 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<Pending> {
     }));
     feed.push(report);
 
-    let mut poll = s.message(account, who(INES), step(20), "Poll: Where should the autumn foray go?");
+    let mut poll = s.message(
+        account,
+        who(INES),
+        step(20),
+        "Poll: Where should the autumn foray go?",
+    );
     poll.kind = MessageKind::Unsupported {
-        link: format!("https://discord.com/channels/{}/{}", discord::MOSS, discord::SHOWCASE),
+        link: format!(
+            "https://discord.com/channels/{}/{}",
+            discord::MOSS,
+            discord::SHOWCASE
+        ),
     };
     feed.push(poll);
 
     let text = "@Robin Vale can you check #trail-cams with @Field Team before Saturday? @Tomasz Brandt has the keys. Heads up @everyone: the creek route is on.";
     let mut called = s.message(account, who(INES), step(30), text);
-    called.spans.push(mention(text, "#trail-cams", MentionKind::Channel, "400000000000000009"));
-    called.spans.push(mention(text, "@Field Team", MentionKind::Role, "380000000000000001"));
-    called.spans.push(mention(text, "@Tomasz Brandt", MentionKind::User, &who(TOMASZ).id));
-    called.spans.push(mention(text, "@everyone", MentionKind::Everyone, ""));
+    called.spans.push(mention(
+        text,
+        "#trail-cams",
+        MentionKind::Channel,
+        "400000000000000009",
+    ));
+    called.spans.push(mention(
+        text,
+        "@Field Team",
+        MentionKind::Role,
+        "380000000000000001",
+    ));
+    called.spans.push(mention(
+        text,
+        "@Tomasz Brandt",
+        MentionKind::User,
+        &who(TOMASZ).id,
+    ));
+    called
+        .spans
+        .push(mention(text, "@everyone", MentionKind::Everyone, ""));
     feed.push(called);
-    feed.push(s.message(account, who(TOMASZ), step(8), "I do have the keys. I checked twice."));
+    feed.push(s.message(
+        account,
+        who(TOMASZ),
+        step(8),
+        "I do have the keys. I checked twice.",
+    ));
 
     let mut failed = s.message(account, me, 2, "On it. Camera and tripod are by the door.");
     failed.id = "170000000000000001".to_owned();

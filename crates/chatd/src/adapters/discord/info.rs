@@ -8,7 +8,9 @@ use super::model::{self, number, GuildSettings, Posted};
 use super::rest::Refused;
 use super::{escaped, refusal, Discord};
 use crate::hub::now;
-use protocol::{ConversationKind, MediaKind, Message, MessageHit, Notify, SharedItem, SharedKind, Style};
+use protocol::{
+    ConversationKind, MediaKind, Message, MessageHit, Notify, SharedItem, SharedKind, Style,
+};
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::{Arc, Mutex};
@@ -79,14 +81,23 @@ pub(super) fn shared_items(message: &Message, kind: SharedKind) -> Vec<SharedIte
         url: url.to_owned(),
         title: title.to_owned(),
     };
-    let pictured = |kind: MediaKind| matches!(kind, MediaKind::Image | MediaKind::Video | MediaKind::Gif);
+    let pictured =
+        |kind: MediaKind| matches!(kind, MediaKind::Image | MediaKind::Video | MediaKind::Gif);
     match kind {
         SharedKind::Media | SharedKind::Files => {
-            let wanted = message.attachments.iter().filter(|attachment| !attachment.sticker && pictured(attachment.file.kind) == (kind == SharedKind::Media));
-            wanted.map(|attachment| item(Some(attachment.clone()), "", "")).collect()
+            let wanted = message.attachments.iter().filter(|attachment| {
+                !attachment.sticker && pictured(attachment.file.kind) == (kind == SharedKind::Media)
+            });
+            wanted
+                .map(|attachment| item(Some(attachment.clone()), "", ""))
+                .collect()
         }
         SharedKind::Links => {
-            let mut items: Vec<SharedItem> = message.previews.iter().map(|preview| item(None, &preview.url, &preview.title)).collect();
+            let mut items: Vec<SharedItem> = message
+                .previews
+                .iter()
+                .map(|preview| item(None, &preview.url, &preview.title))
+                .collect();
             for span in &message.spans {
                 if let Style::Link { url } = &span.style {
                     if !items.iter().any(|known| known.url == *url) {
@@ -103,7 +114,12 @@ impl Discord {
     /// A card's profile, off the command thread: it waits its turn (one per [`PROFILE_EVERY`])
     /// there, so sends and everything else behind it go on. A profile still waiting when a
     /// newer one is asked for is dropped unsent; its card was closed or replaced.
-    pub(super) fn profile_queued(discord: &Arc<Discord>, person: String, space: Option<String>, reply: Reply<About>) {
+    pub(super) fn profile_queued(
+        discord: &Arc<Discord>,
+        person: String,
+        space: Option<String>,
+        reply: Reply<About>,
+    ) {
         let asked = {
             let mut state = crate::hub::lock(&discord.state);
             state.profile_asked += 1;
@@ -116,7 +132,11 @@ impl Discord {
             if superseded() {
                 return drop(reply.send(Err(refused("A newer profile was asked for."))));
             }
-            let wait = crate::hub::lock(&discord.state).profiled.map_or(Duration::ZERO, |at| PROFILE_EVERY.saturating_sub(at.elapsed()));
+            let wait = crate::hub::lock(&discord.state)
+                .profiled
+                .map_or(Duration::ZERO, |at| {
+                    PROFILE_EVERY.saturating_sub(at.elapsed())
+                });
             if !wait.is_zero() && discord.ctx.pause(wait) {
                 return drop(reply.send(Err(refused("Stopped."))));
             }
@@ -125,7 +145,10 @@ impl Discord {
             }
             let _ = reply.send(discord.profile(&person, space.as_deref()));
         };
-        if let Err(err) = std::thread::Builder::new().name("discord-profile".into()).spawn(run) {
+        if let Err(err) = std::thread::Builder::new()
+            .name("discord-profile".into())
+            .spawn(run)
+        {
             tracing::warn!("chatd: Discord: no thread for a profile: {err}");
         }
     }
@@ -158,11 +181,17 @@ impl Discord {
             }
         }
         let state = crate::hub::lock(&self.state);
-        let shared = profile.mutual_guilds.iter().filter_map(|guild| state.guilds.get(&guild.id));
+        let shared = profile
+            .mutual_guilds
+            .iter()
+            .filter_map(|guild| state.guilds.get(&guild.id));
         let text = profile.user_profile.as_ref();
         let mut about = About {
             bio: profile.bio(),
-            mutual_spaces: shared.map(|guild| guild.name.clone()).take(protocol::MUTUAL_SPACES).collect(),
+            mutual_spaces: shared
+                .map(|guild| guild.name.clone())
+                .take(protocol::MUTUAL_SPACES)
+                .collect(),
             mutual_total: profile.mutual_guilds.len() as u32,
             pronouns: text.map(|text| text.pronouns.clone()).unwrap_or_default(),
             accent: text.and_then(|text| text.accent_color),
@@ -177,7 +206,11 @@ impl Discord {
             // Role names in the server's own order of ids, the everyone role left out; colours
             // are never sent on.
             let named = member.roles.iter().filter(|role| role.as_str() != space);
-            let names = named.filter_map(|role| guild.and_then(|guild| guild.roles.get(&number(role))).map(|role| role.name.clone()));
+            let names = named.filter_map(|role| {
+                guild
+                    .and_then(|guild| guild.roles.get(&number(role)))
+                    .map(|role| role.name.clone())
+            });
             about.roles = names.take(protocol::PROFILE_ROLES).collect();
             about.joined = member.joined_at.as_deref().and_then(model::iso_seconds);
         }
@@ -187,12 +220,23 @@ impl Discord {
     /// A conversation's info, from what READY and the settings already said: nothing is asked
     /// of Discord. Member counts of a server channel need a subscription, so there are none.
     pub(super) fn conversation_info(&self, channel: &str) -> Result<ConversationAbout, Refusal> {
-        let known = self.ctx.known(channel).map_err(refused)?.ok_or_else(|| refused("This conversation is gone."))?;
+        let known = self
+            .ctx
+            .known(channel)
+            .map_err(refused)?
+            .ok_or_else(|| refused("This conversation is gone."))?;
         let guild = self.guild_of(&known);
         // The topic whole, as kept with the server's channels; the row's is cut to one line.
-        let kept = guild.as_ref().and_then(|guild| self.ctx.note(&format!("kept:{guild}")));
-        let kept: Vec<model::Kept> = kept.and_then(|kept| serde_json::from_str(&kept).ok()).unwrap_or_default();
-        let topic = kept.into_iter().find(|kept| kept.id == channel).and_then(|kept| kept.topic);
+        let kept = guild
+            .as_ref()
+            .and_then(|guild| self.ctx.note(&format!("kept:{guild}")));
+        let kept: Vec<model::Kept> = kept
+            .and_then(|kept| serde_json::from_str(&kept).ok())
+            .unwrap_or_default();
+        let topic = kept
+            .into_iter()
+            .find(|kept| kept.id == channel)
+            .and_then(|kept| kept.topic);
         let state = crate::hub::lock(&self.state);
         let parent = known.parent.as_deref().or(known.group.as_deref());
         let notify = match guild.as_ref().map(|guild| state.guilds.get(guild)) {
@@ -218,11 +262,20 @@ impl Discord {
         if !crate::hub::lock(&self.state).guilds.contains_key(guild) {
             return Err(refused("This server is gone."));
         }
-        let answer = self.call("GET", &format!("/guilds/{guild}?with_counts=true"), None).map_err(refusal)?;
+        let answer = self
+            .call("GET", &format!("/guilds/{guild}?with_counts=true"), None)
+            .map_err(refusal)?;
         let counts: GuildCounts = serde_json::from_str(&answer).map_err(refused)?;
         let state = crate::hub::lock(&self.state);
-        let info = state.guilds.get(guild).ok_or_else(|| refused("This server is gone."))?;
-        let roles = info.my_roles.iter().filter(|role| **role != number(guild)).filter_map(|role| info.roles.get(role));
+        let info = state
+            .guilds
+            .get(guild)
+            .ok_or_else(|| refused("This server is gone."))?;
+        let roles = info
+            .my_roles
+            .iter()
+            .filter(|role| **role != number(guild))
+            .filter_map(|role| info.roles.get(role));
         let notify = match () {
             _ if info.quiet.server_muted(now()) => Notify::Nothing,
             _ if info.quiet.level == 1 => Notify::Mentions,
@@ -234,7 +287,10 @@ impl Discord {
             members: counts.approximate_member_count,
             online: counts.approximate_presence_count,
             nickname: info.nick.clone(),
-            roles: roles.map(|role| role.name.clone()).take(protocol::PROFILE_ROLES).collect(),
+            roles: roles
+                .map(|role| role.name.clone())
+                .take(protocol::PROFILE_ROLES)
+                .collect(),
             notify,
         })
     }
@@ -243,7 +299,11 @@ impl Discord {
     /// its server (`@me` for direct and group conversations). Discord answers with the server's
     /// settings whole, which are applied as if they came from the gateway.
     pub(super) fn set_mute(&self, channel: &str, notify: Notify) -> Result<(), Refusal> {
-        let known = self.ctx.known(channel).map_err(refused)?.ok_or_else(|| refused("This conversation is gone."))?;
+        let known = self
+            .ctx
+            .known(channel)
+            .map_err(refused)?
+            .ok_or_else(|| refused("This conversation is gone."))?;
         let guild = self.guild_of(&known);
         let mut setting = match notify {
             Notify::All => json!({"muted": false, "message_notifications": 0}),
@@ -252,14 +312,25 @@ impl Discord {
         };
         setting["mute_config"] = json!({"end_time": null, "selected_time_window": -1});
         let body = json!({"channel_overrides": {channel: setting}});
-        let path = format!("/users/@me/guilds/{}/settings", guild.as_deref().unwrap_or("@me"));
+        let path = format!(
+            "/users/@me/guilds/{}/settings",
+            guild.as_deref().unwrap_or("@me")
+        );
         let answer = self.call("PATCH", &path, Some(body)).map_err(refusal)?;
         match serde_json::from_str::<GuildSettings>(&answer) {
-            Ok(settings) if settings.guild_id == guild => self.settings_changed(settings).map_err(|failed| match failed {
-                super::Failure::SignedOut(why) | super::Failure::Dropped(why) => refused(why),
-            }),
+            Ok(settings) if settings.guild_id == guild => {
+                self.settings_changed(settings)
+                    .map_err(|failed| match failed {
+                        super::Failure::SignedOut(why) | super::Failure::Dropped(why) => {
+                            refused(why)
+                        }
+                    })
+            }
             // An answer that is not the settings: the row is told what was asked.
-            _ => self.ctx.muted(channel, notify == Notify::Nothing).map_err(refused),
+            _ => self
+                .ctx
+                .muted(channel, notify == Notify::Nothing)
+                .map_err(refused),
         }
     }
 
@@ -267,7 +338,11 @@ impl Discord {
     /// are one `DELETE` of the channel; a server's channel is neither. The row goes, as it does
     /// in Discord; a closed DM comes back with its next message.
     pub(super) fn leave(&self, channel: &str, close: bool) -> Result<(), Refusal> {
-        let known = self.ctx.known(channel).map_err(refused)?.ok_or_else(|| refused("This conversation is gone."))?;
+        let known = self
+            .ctx
+            .known(channel)
+            .map_err(refused)?
+            .ok_or_else(|| refused("This conversation is gone."))?;
         let path = match (known.kind, close) {
             (ConversationKind::Direct, true) => format!("/channels/{channel}"),
             (ConversationKind::Group, false) => format!("/channels/{channel}?silent=false"),
@@ -277,7 +352,13 @@ impl Discord {
         if let Err(failed) = self.call("DELETE", &path, None) {
             // Closing a DM with someone who blocked us is refused. Hide it here instead, so the
             // row and its badge do not come back on the next READY.
-            let blocked = matches!(failed, Refused::Status { code: 50007 | 50001 | 50003, .. } | Refused::Status { status: 403, .. });
+            let blocked = matches!(
+                failed,
+                Refused::Status {
+                    code: 50007 | 50001 | 50003,
+                    ..
+                } | Refused::Status { status: 403, .. }
+            );
             if close && blocked {
                 return self.ctx.forget_conversation(channel).map_err(refused);
             }
@@ -295,11 +376,26 @@ impl Discord {
     /// one answers where that one is not known. Both are the community's documentation,
     /// unconfirmed against a real account.
     pub(super) fn pinned(&self, channel: &str) -> Result<Vec<Message>, Refusal> {
-        let known = self.ctx.known(channel).map_err(refused)?.ok_or_else(|| refused("This conversation is gone."))?;
-        let posted: Vec<Posted> = match self.call("GET", &format!("/channels/{channel}/messages/pins?limit=50"), None) {
-            Ok(answer) => serde_json::from_str::<Pins>(&answer).map_err(refused)?.items.into_iter().map(|pin| pin.message).collect(),
+        let known = self
+            .ctx
+            .known(channel)
+            .map_err(refused)?
+            .ok_or_else(|| refused("This conversation is gone."))?;
+        let posted: Vec<Posted> = match self.call(
+            "GET",
+            &format!("/channels/{channel}/messages/pins?limit=50"),
+            None,
+        ) {
+            Ok(answer) => serde_json::from_str::<Pins>(&answer)
+                .map_err(refused)?
+                .items
+                .into_iter()
+                .map(|pin| pin.message)
+                .collect(),
             Err(super::Refused::Status { status: 404, .. }) => {
-                let answer = self.call("GET", &format!("/channels/{channel}/pins"), None).map_err(refusal)?;
+                let answer = self
+                    .call("GET", &format!("/channels/{channel}/pins"), None)
+                    .map_err(refusal)?;
                 serde_json::from_str(&answer).map_err(refused)?
             }
             Err(other) => return Err(refusal(other)),
@@ -318,8 +414,18 @@ impl Discord {
     /// What was shared in a conversation, from Discord's own search, because the user asked:
     /// the server's search narrowed to the channel, or the DM's own. `before` is a message id;
     /// older hits follow it. The total is Discord's count of messages, given on the first page.
-    pub(super) fn search_shared(&self, channel: &str, kind: SharedKind, before: Option<&str>, limit: u32) -> Result<SharedPage, Refusal> {
-        let known = self.ctx.known(channel).map_err(refused)?.ok_or_else(|| refused("This conversation is gone."))?;
+    pub(super) fn search_shared(
+        &self,
+        channel: &str,
+        kind: SharedKind,
+        before: Option<&str>,
+        limit: u32,
+    ) -> Result<SharedPage, Refusal> {
+        let known = self
+            .ctx
+            .known(channel)
+            .map_err(refused)?
+            .ok_or_else(|| refused("This conversation is gone."))?;
         let guild = self.guild_of(&known);
         let has = match kind {
             SharedKind::Media => "has=image&has=video",
@@ -328,7 +434,9 @@ impl Discord {
         };
         let wanted = limit.clamp(1, SEARCH_PAGE);
         let mut path = match &guild {
-            Some(guild) => format!("/guilds/{guild}/messages/search?channel_id={channel}&{has}&limit={wanted}"),
+            Some(guild) => {
+                format!("/guilds/{guild}/messages/search?channel_id={channel}&{has}&limit={wanted}")
+            }
             None => format!("/channels/{channel}/messages/search?{has}&limit={wanted}"),
         };
         // Discord's search takes the newest id it may answer; one below the item listed last.
@@ -339,7 +447,9 @@ impl Discord {
         let found: Found = serde_json::from_str(&answer).map_err(refused)?;
         // A 202 with no hits: the index is still being built.
         let Some(hits) = found.messages.filter(|_| found.code.is_none()) else {
-            return Err(refused("Discord is still indexing this conversation. Try again in a moment."));
+            return Err(refused(
+                "Discord is still indexing this conversation. Try again in a moment.",
+            ));
         };
         let mut items = Vec::new();
         for posted in hits.iter().filter_map(|hit| hit.first()) {
@@ -366,7 +476,10 @@ impl Discord {
         let run = move || {
             let _ = reply.send(searching.search_messages(&query, &scope, at));
         };
-        if let Err(err) = std::thread::Builder::new().name("discord-search".into()).spawn(run) {
+        if let Err(err) = std::thread::Builder::new()
+            .name("discord-search".into())
+            .spawn(run)
+        {
             tracing::warn!("chatd: Discord: no thread for a search: {err}");
         }
     }
@@ -374,7 +487,12 @@ impl Discord {
     /// What the network itself finds for the pane's words, from Discord's own search: the
     /// server's when a Space is the scope, the channel's when one conversation is. The hits
     /// are mapped like the cache's, so the pane can merge the two lists and tell them apart.
-    pub(super) fn search_messages(&self, query: &str, scope: &SearchScope, at: Instant) -> Result<Vec<MessageHit>, Refusal> {
+    pub(super) fn search_messages(
+        &self,
+        query: &str,
+        scope: &SearchScope,
+        at: Instant,
+    ) -> Result<Vec<MessageHit>, Refusal> {
         if at.elapsed() >= super::SEARCH_PATIENCE {
             return Err(refused("That took too long. Try again."));
         }
@@ -390,12 +508,22 @@ impl Discord {
                 format!("/guilds/{space}/messages/search?content={}", escaped(query))
             }
             SearchScope::Conversation(channel) => {
-                let known = self.ctx.known(channel).map_err(refused)?.ok_or_else(|| refused("This conversation is gone."))?;
+                let known = self
+                    .ctx
+                    .known(channel)
+                    .map_err(refused)?
+                    .ok_or_else(|| refused("This conversation is gone."))?;
                 match self.guild_of(&known) {
                     Some(guild) => {
-                        format!("/guilds/{guild}/messages/search?channel_id={channel}&content={}", escaped(query))
+                        format!(
+                            "/guilds/{guild}/messages/search?channel_id={channel}&content={}",
+                            escaped(query)
+                        )
                     }
-                    None => format!("/channels/{channel}/messages/search?content={}", escaped(query)),
+                    None => format!(
+                        "/channels/{channel}/messages/search?content={}",
+                        escaped(query)
+                    ),
                 }
             }
         };
@@ -403,10 +531,18 @@ impl Discord {
         // no client turns Enter into a burst against Discord's tight search limits.
         {
             let mut search = crate::hub::lock(&self.message_search);
-            if let Some((_, _, hits)) = search.remembered.iter().find(|(s, q, _)| s == scope && *q == key) {
+            if let Some((_, _, hits)) = search
+                .remembered
+                .iter()
+                .find(|(s, q, _)| s == scope && *q == key)
+            {
                 return Ok(hits.clone());
             }
-            if search.in_flight || search.last.is_some_and(|last| last.elapsed() < super::members::SEARCH_GAP) {
+            if search.in_flight
+                || search
+                    .last
+                    .is_some_and(|last| last.elapsed() < super::members::SEARCH_GAP)
+            {
                 return Err(refused("Discord search is paced. Try again in a moment."));
             }
             search.in_flight = true;
@@ -419,23 +555,35 @@ impl Discord {
             if search.remembered.len() >= REMEMBERED_SEARCHES {
                 search.remembered.pop_front();
             }
-            search.remembered.push_back((scope.clone(), key, hits.clone()));
+            search
+                .remembered
+                .push_back((scope.clone(), key, hits.clone()));
         }
         outcome
     }
 
-    fn run_message_search(&self, path: &str, query: &str, scope: &SearchScope) -> Result<Vec<MessageHit>, Refusal> {
+    fn run_message_search(
+        &self,
+        path: &str,
+        query: &str,
+        scope: &SearchScope,
+    ) -> Result<Vec<MessageHit>, Refusal> {
         let answer = self.call("GET", path, None).map_err(refusal)?;
         let found: Found = serde_json::from_str(&answer).map_err(refused)?;
         // A 202 with no hits: the index is still being built.
         let Some(hits) = found.messages.filter(|_| found.code.is_none()) else {
-            return Err(refused("Discord search isn't ready for this server yet. Try again in a moment."));
+            return Err(refused(
+                "Discord search isn't ready for this server yet. Try again in a moment.",
+            ));
         };
         let space_id = match scope {
             SearchScope::Space(space) => Some(space.clone()),
-            SearchScope::Conversation(channel) => {
-                self.ctx.known(channel).ok().flatten().and_then(|known| self.guild_of(&known))
-            }
+            SearchScope::Conversation(channel) => self
+                .ctx
+                .known(channel)
+                .ok()
+                .flatten()
+                .and_then(|known| self.guild_of(&known)),
         };
         let mut found_hits = Vec::new();
         for posted in hits.iter().filter_map(|hit| hit.first()) {
@@ -445,14 +593,24 @@ impl Discord {
                 continue;
             }
             let known = self.ctx.known(&posted.channel_id).ok().flatten();
-            let kind = known.as_ref().map_or(ConversationKind::Channel, |row| row.kind);
-            let title = known.as_ref().map_or_else(String::new, |row| row.title.clone());
-            let space_title = known.as_ref().map_or_else(String::new, |row| row.space_title.clone());
+            let kind = known
+                .as_ref()
+                .map_or(ConversationKind::Channel, |row| row.kind);
+            let title = known
+                .as_ref()
+                .map_or_else(String::new, |row| row.title.clone());
+            let space_title = known
+                .as_ref()
+                .map_or_else(String::new, |row| row.space_title.clone());
             let (message, _) = self.convert(posted, space_id.as_deref(), kind);
             let text = if !message.text.is_empty() {
                 message.text
             } else if let Some(first) = message.attachments.first() {
-                if first.name.is_empty() { "Attachment".to_owned() } else { first.name.clone() }
+                if first.name.is_empty() {
+                    "Attachment".to_owned()
+                } else {
+                    first.name.clone()
+                }
             } else {
                 posted.content.clone().unwrap_or_default()
             };

@@ -17,13 +17,14 @@ use async_trait::async_trait;
 use presage::libsignal_service::libsignal_account_keys::AccountEntropyPool;
 use presage::libsignal_service::pre_keys::{KyberPreKeyStoreExt, PreKeysStore};
 use presage::libsignal_service::prelude::{Content, MasterKey, ProfileKey, Uuid};
-use presage::libsignal_service::protocol::{
-    Direction, GenericSignedPreKey, IdentityChange, IdentityKey, IdentityKeyPair, IdentityKeyStore, KyberPreKeyId,
-    KyberPreKeyRecord, KyberPreKeyStore, PreKeyId, PreKeyRecord, PreKeyStore, ProtocolAddress, ProtocolStore, PublicKey,
-    SenderCertificate, SenderKeyRecord, SenderKeyStore, ServiceId, SessionRecord, SessionStore, SignalProtocolError,
-    SignedPreKeyId, SignedPreKeyRecord, SignedPreKeyStore,
-};
 use presage::libsignal_service::protocol::DeviceId;
+use presage::libsignal_service::protocol::{
+    Direction, GenericSignedPreKey, IdentityChange, IdentityKey, IdentityKeyPair, IdentityKeyStore,
+    KyberPreKeyId, KyberPreKeyRecord, KyberPreKeyStore, PreKeyId, PreKeyRecord, PreKeyStore,
+    ProtocolAddress, ProtocolStore, PublicKey, SenderCertificate, SenderKeyRecord, SenderKeyStore,
+    ServiceId, SessionRecord, SessionStore, SignalProtocolError, SignedPreKeyId,
+    SignedPreKeyRecord, SignedPreKeyStore,
+};
 use presage::libsignal_service::session_store::SessionStoreExt;
 use presage::libsignal_service::zkgroup::GroupMasterKeyBytes;
 use presage::libsignal_service::Profile;
@@ -91,7 +92,9 @@ pub struct Vault(Arc<Inner>);
 
 /// Where an account's state lives.
 pub fn path_of(name: &str) -> PathBuf {
-    protocol::support_dir().join("signal").join(format!("{name}.state"))
+    protocol::support_dir()
+        .join("signal")
+        .join(format!("{name}.state"))
 }
 
 /// The file and what SQLite keeps beside it.
@@ -112,7 +115,8 @@ pub fn new_key() -> Result<[u8; 32], String> {
 
 impl Vault {
     pub fn open(path: &Path, key: &[u8]) -> Result<Vault, String> {
-        let cipher = Aes256GcmSiv::new_from_slice(key).map_err(|_| "the Signal state key is the wrong length".to_owned())?;
+        let cipher = Aes256GcmSiv::new_from_slice(key)
+            .map_err(|_| "the Signal state key is the wrong length".to_owned())?;
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|err| err.to_string())?;
             #[cfg(unix)]
@@ -132,10 +136,19 @@ impl Vault {
              CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v BLOB NOT NULL) WITHOUT ROWID;",
         )
         .map_err(|err| err.to_string())?;
-        let vault = Vault(Arc::new(Inner { db: Mutex::new(db), cipher, path: path.to_owned() }));
+        let vault = Vault(Arc::new(Inner {
+            db: Mutex::new(db),
+            cipher,
+            path: path.to_owned(),
+        }));
         // A key that does not open what is there is the wrong key: say so now, not mid-message.
         if let Some(name) = vault.first_name().map_err(|err| err.0)? {
-            vault.get(&name).map_err(|_| format!("the Signal state does not open with the key in {}", crate::session::STORE))?;
+            vault.get(&name).map_err(|_| {
+                format!(
+                    "the Signal state does not open with the key in {}",
+                    crate::session::STORE
+                )
+            })?;
         }
         Ok(vault)
     }
@@ -145,17 +158,29 @@ impl Vault {
     }
 
     fn db(&self) -> MutexGuard<'_, Connection> {
-        self.0.db.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.0
+            .db
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn first_name(&self) -> Held<Option<String>> {
-        Ok(self.db().query_row("SELECT k FROM kv LIMIT 1", [], |row| row.get(0)).optional()?)
+        Ok(self
+            .db()
+            .query_row("SELECT k FROM kv LIMIT 1", [], |row| row.get(0))
+            .optional()?)
     }
 
     fn seal(&self, name: &str, value: &[u8]) -> Held<Vec<u8>> {
         let mut nonce = [0u8; 12];
         getrandom::fill(&mut nonce).map_err(|err| VaultError(err.to_string()))?;
-        let sealed = self.0.cipher.encrypt(Nonce::from_slice(&nonce), Payload { msg: value, aad: name.as_bytes() });
+        let sealed = self.0.cipher.encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: value,
+                aad: name.as_bytes(),
+            },
+        );
         let sealed = sealed.map_err(|_| VaultError("could not seal a value".into()))?;
         Ok([&nonce[..], &sealed].concat())
     }
@@ -165,18 +190,32 @@ impl Vault {
             return Err(VaultError(format!("{name}: too short")));
         }
         let (nonce, body) = sealed.split_at(12);
-        let opened = self.0.cipher.decrypt(Nonce::from_slice(nonce), Payload { msg: body, aad: name.as_bytes() });
+        let opened = self.0.cipher.decrypt(
+            Nonce::from_slice(nonce),
+            Payload {
+                msg: body,
+                aad: name.as_bytes(),
+            },
+        );
         opened.map_err(|_| VaultError(format!("{name}: does not open")))
     }
 
     pub fn get(&self, name: &str) -> Held<Option<Vec<u8>>> {
-        let sealed: Option<Vec<u8>> = self.db().query_row("SELECT v FROM kv WHERE k = ?1", [name], |row| row.get(0)).optional()?;
-        sealed.map(|sealed| self.open_value(name, &sealed)).transpose()
+        let sealed: Option<Vec<u8>> = self
+            .db()
+            .query_row("SELECT v FROM kv WHERE k = ?1", [name], |row| row.get(0))
+            .optional()?;
+        sealed
+            .map(|sealed| self.open_value(name, &sealed))
+            .transpose()
     }
 
     pub fn put(&self, name: &str, value: &[u8]) -> Held<()> {
         let sealed = self.seal(name, value)?;
-        self.db().execute("INSERT OR REPLACE INTO kv (k, v) VALUES (?1, ?2)", params![name, sealed])?;
+        self.db().execute(
+            "INSERT OR REPLACE INTO kv (k, v) VALUES (?1, ?2)",
+            params![name, sealed],
+        )?;
         Ok(())
     }
 
@@ -186,29 +225,42 @@ impl Vault {
     }
 
     fn remove_prefix(&self, prefix: &str) -> Held<usize> {
-        Ok(self.db().execute("DELETE FROM kv WHERE substr(k, 1, length(?1)) = ?1", [prefix])?)
+        Ok(self.db().execute(
+            "DELETE FROM kv WHERE substr(k, 1, length(?1)) = ?1",
+            [prefix],
+        )?)
     }
 
     /// The names under a prefix, in order.
     fn names(&self, prefix: &str) -> Held<Vec<String>> {
         let db = self.db();
-        let mut query = db.prepare("SELECT k FROM kv WHERE substr(k, 1, length(?1)) = ?1 ORDER BY k")?;
-        let names = query.query_map([prefix], |row| row.get(0))?.collect::<Result<Vec<String>, _>>()?;
+        let mut query =
+            db.prepare("SELECT k FROM kv WHERE substr(k, 1, length(?1)) = ?1 ORDER BY k")?;
+        let names = query
+            .query_map([prefix], |row| row.get(0))?
+            .collect::<Result<Vec<String>, _>>()?;
         Ok(names)
     }
 
     fn values(&self, prefix: &str) -> Held<Vec<(String, Vec<u8>)>> {
         let rows: Vec<(String, Vec<u8>)> = {
             let db = self.db();
-            let mut query = db.prepare("SELECT k, v FROM kv WHERE substr(k, 1, length(?1)) = ?1 ORDER BY k")?;
-            let rows = query.query_map([prefix], |row| Ok((row.get(0)?, row.get(1)?)))?.collect::<Result<Vec<_>, _>>()?;
+            let mut query =
+                db.prepare("SELECT k, v FROM kv WHERE substr(k, 1, length(?1)) = ?1 ORDER BY k")?;
+            let rows = query
+                .query_map([prefix], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<Result<Vec<_>, _>>()?;
             rows
         };
-        rows.into_iter().map(|(name, sealed)| Ok((name.clone(), self.open_value(&name, &sealed)?))).collect()
+        rows.into_iter()
+            .map(|(name, sealed)| Ok((name.clone(), self.open_value(&name, &sealed)?)))
+            .collect()
     }
 
     fn json<T: serde::de::DeserializeOwned>(&self, name: &str) -> Held<Option<T>> {
-        self.get(name)?.map(|bytes| serde_json::from_slice(&bytes).map_err(VaultError::from)).transpose()
+        self.get(name)?
+            .map(|bytes| serde_json::from_slice(&bytes).map_err(VaultError::from))
+            .transpose()
     }
 
     fn put_json<T: serde::Serialize>(&self, name: &str, value: &T) -> Held<()> {
@@ -285,7 +337,10 @@ impl StateStore for Vault {
     }
 
     async fn sender_certificate(&self) -> Held<Option<SenderCertificate>> {
-        Ok(self.get("sender_cert")?.map(|bytes| SenderCertificate::deserialize(&bytes)).transpose()?)
+        Ok(self
+            .get("sender_cert")?
+            .map(|bytes| SenderCertificate::deserialize(&bytes))
+            .transpose()?)
     }
 
     async fn save_sender_certificate(&self, certificate: &SenderCertificate) -> Held<()> {
@@ -307,7 +362,9 @@ impl StateStore for Vault {
 
     async fn fetch_master_key(&self) -> Held<Option<MasterKey>> {
         let bytes = self.get("master_key")?;
-        bytes.map(|bytes| MasterKey::from_slice(&bytes).map_err(|err| VaultError(err.to_string()))).transpose()
+        bytes
+            .map(|bytes| MasterKey::from_slice(&bytes).map_err(|err| VaultError(err.to_string())))
+            .transpose()
     }
 
     async fn store_master_key(&self, master_key: Option<&MasterKey>) -> Held<()> {
@@ -322,7 +379,9 @@ impl StateStore for Vault {
             return Ok(None);
         };
         let text = String::from_utf8(bytes).map_err(|err| VaultError(err.to_string()))?;
-        AccountEntropyPool::from_str(&text).map(Some).map_err(|err| VaultError(format!("{err:?}")))
+        AccountEntropyPool::from_str(&text)
+            .map(Some)
+            .map_err(|err| VaultError(format!("{err:?}")))
     }
 
     async fn store_account_entropy_pool(&self, aep: Option<&AccountEntropyPool>) -> Held<()> {
@@ -375,11 +434,19 @@ impl ContentsStore for Vault {
         Ok(None)
     }
 
-    async fn thread_for_sender_and_timestamp(&self, _sender: &ServiceId, _timestamp: u64) -> Held<Option<Thread>> {
+    async fn thread_for_sender_and_timestamp(
+        &self,
+        _sender: &ServiceId,
+        _timestamp: u64,
+    ) -> Held<Option<Thread>> {
         Ok(None)
     }
 
-    async fn messages(&self, _thread: &Thread, _range: impl RangeBounds<u64>) -> Held<Self::MessagesIter> {
+    async fn messages(
+        &self,
+        _thread: &Thread,
+        _range: impl RangeBounds<u64>,
+    ) -> Held<Self::MessagesIter> {
         Ok(Vec::new().into_iter())
     }
 
@@ -393,8 +460,11 @@ impl ContentsStore for Vault {
     }
 
     async fn contacts(&self) -> Held<Self::ContactsIter> {
-        let contacts: Vec<Held<Contact>> =
-            self.values("contact.")?.into_iter().map(|(_, bytes)| serde_json::from_slice(&bytes).map_err(VaultError::from)).collect();
+        let contacts: Vec<Held<Contact>> = self
+            .values("contact.")?
+            .into_iter()
+            .map(|(_, bytes)| serde_json::from_slice(&bytes).map_err(VaultError::from))
+            .collect();
         Ok(contacts.into_iter())
     }
 
@@ -407,19 +477,32 @@ impl ContentsStore for Vault {
         Ok(())
     }
 
-    async fn save_group(&self, master_key: GroupMasterKeyBytes, group: impl Into<Group>) -> Held<()> {
+    async fn save_group(
+        &self,
+        master_key: GroupMasterKeyBytes,
+        group: impl Into<Group>,
+    ) -> Held<()> {
         self.put_json(&format!("group.{}", hex(&master_key)), &group.into())
     }
 
     async fn groups(&self) -> Held<Self::GroupsIter> {
-        Ok(self.group_keys()?.into_iter().map(Ok).collect::<Vec<_>>().into_iter())
+        Ok(self
+            .group_keys()?
+            .into_iter()
+            .map(Ok)
+            .collect::<Vec<_>>()
+            .into_iter())
     }
 
     async fn group(&self, master_key: GroupMasterKeyBytes) -> Held<Option<Group>> {
         self.json(&format!("group.{}", hex(&master_key)))
     }
 
-    async fn save_group_avatar(&self, _master_key: GroupMasterKeyBytes, _avatar: &AvatarBytes) -> Held<()> {
+    async fn save_group_avatar(
+        &self,
+        _master_key: GroupMasterKeyBytes,
+        _avatar: &AvatarBytes,
+    ) -> Held<()> {
         Ok(())
     }
 
@@ -441,19 +524,30 @@ impl ContentsStore for Vault {
         let Some(bytes) = self.get(&format!("profile_key.{}", service_id.raw_uuid()))? else {
             return Ok(None);
         };
-        let bytes: [u8; 32] = bytes.as_slice().try_into().map_err(|_| VaultError("a profile key is the wrong length".into()))?;
+        let bytes: [u8; 32] = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| VaultError("a profile key is the wrong length".into()))?;
         Ok(Some(ProfileKey::create(bytes)))
     }
 
     async fn save_profile(&mut self, uuid: Uuid, key: ProfileKey, profile: Profile) -> Held<()> {
-        self.put_json(&format!("profile.{uuid}.{}", hex(&key.get_bytes())), &profile)
+        self.put_json(
+            &format!("profile.{uuid}.{}", hex(&key.get_bytes())),
+            &profile,
+        )
     }
 
     async fn profile(&self, uuid: Uuid, key: ProfileKey) -> Held<Option<Profile>> {
         self.json(&format!("profile.{uuid}.{}", hex(&key.get_bytes())))
     }
 
-    async fn save_profile_avatar(&mut self, _uuid: Uuid, _key: ProfileKey, _profile: &AvatarBytes) -> Held<()> {
+    async fn save_profile_avatar(
+        &mut self,
+        _uuid: Uuid,
+        _key: ProfileKey,
+        _profile: &AvatarBytes,
+    ) -> Held<()> {
         Ok(())
     }
 
@@ -489,11 +583,17 @@ impl Store for Vault {
     }
 
     fn aci_protocol_store(&self) -> Keys {
-        Keys { vault: self.clone(), side: "aci" }
+        Keys {
+            vault: self.clone(),
+            side: "aci",
+        }
     }
 
     fn pni_protocol_store(&self) -> Keys {
-        Keys { vault: self.clone(), side: "pni" }
+        Keys {
+            vault: self.clone(),
+            side: "pni",
+        }
     }
 }
 
@@ -522,12 +622,18 @@ impl Keys {
     }
 
     fn session_name(address: &ProtocolAddress) -> String {
-        format!("session.{}.{:03}", address.name(), u32::from(address.device_id()))
+        format!(
+            "session.{}.{:03}",
+            address.name(),
+            u32::from(address.device_id())
+        )
     }
 
     /// Ids handed out only go up, so a key consumed and removed is never issued again.
     fn next(&self, counter: &str) -> Signal<u32> {
-        let next = self.get(&format!("next.{counter}"))?.and_then(|bytes| Some(u32::from_be_bytes(bytes.try_into().ok()?)));
+        let next = self
+            .get(&format!("next.{counter}"))?
+            .and_then(|bytes| Some(u32::from_be_bytes(bytes.try_into().ok()?)));
         Ok(next.filter(|id| (1..=MAX_KEY_ID).contains(id)).unwrap_or(1))
     }
 
@@ -540,7 +646,12 @@ impl Keys {
     }
 
     fn ids(&self, kind: &str) -> Signal<Vec<u32>> {
-        Ok(self.vault.names(&self.name(&format!("{kind}.")))?.iter().filter_map(|name| id_of(name)).collect())
+        Ok(self
+            .vault
+            .names(&self.name(&format!("{kind}.")))?
+            .iter()
+            .filter_map(|name| id_of(name))
+            .collect())
     }
 
     fn last_resort(&self, id: u32) -> Signal<bool> {
@@ -559,7 +670,9 @@ impl Keys {
 
     fn registration_id(&self) -> Signal<u32> {
         let reg: Option<RegistrationData> = self.vault.json("reg")?;
-        let reg = reg.ok_or_else(|| SignalProtocolError::InvalidState("signal state", "not registered".into()))?;
+        let reg = reg.ok_or_else(|| {
+            SignalProtocolError::InvalidState("signal state", "not registered".into())
+        })?;
         Ok(match self.side {
             "pni" => reg.pni_registration_id.unwrap_or(reg.registration_id),
             _ => reg.registration_id,
@@ -570,7 +683,9 @@ impl Keys {
 #[async_trait(?Send)]
 impl IdentityKeyStore for Keys {
     async fn get_identity_key_pair(&self) -> Signal<IdentityKeyPair> {
-        let bytes = self.get("identity")?.ok_or_else(|| SignalProtocolError::InvalidState("signal state", "no identity key".into()))?;
+        let bytes = self.get("identity")?.ok_or_else(|| {
+            SignalProtocolError::InvalidState("signal state", "no identity key".into())
+        })?;
         IdentityKeyPair::try_from(bytes.as_slice())
     }
 
@@ -578,7 +693,11 @@ impl IdentityKeyStore for Keys {
         self.registration_id()
     }
 
-    async fn save_identity(&mut self, address: &ProtocolAddress, identity: &IdentityKey) -> Signal<IdentityChange> {
+    async fn save_identity(
+        &mut self,
+        address: &ProtocolAddress,
+        identity: &IdentityKey,
+    ) -> Signal<IdentityChange> {
         let name = format!("trusted.{}", address.name());
         let before = self.get(&name)?;
         self.put(&name, &identity.serialize())?;
@@ -586,12 +705,19 @@ impl IdentityKeyStore for Keys {
         Ok(IdentityChange::from_changed(replaced))
     }
 
-    async fn is_trusted_identity(&self, _address: &ProtocolAddress, _identity: &IdentityKey, _direction: Direction) -> Signal<bool> {
+    async fn is_trusted_identity(
+        &self,
+        _address: &ProtocolAddress,
+        _identity: &IdentityKey,
+        _direction: Direction,
+    ) -> Signal<bool> {
         Ok(true)
     }
 
     async fn get_identity(&self, address: &ProtocolAddress) -> Signal<Option<IdentityKey>> {
-        self.get(&format!("trusted.{}", address.name()))?.map(|bytes| IdentityKey::decode(&bytes)).transpose()
+        self.get(&format!("trusted.{}", address.name()))?
+            .map(|bytes| IdentityKey::decode(&bytes))
+            .transpose()
     }
 }
 
@@ -599,7 +725,9 @@ impl IdentityKeyStore for Keys {
 impl PreKeyStore for Keys {
     async fn get_pre_key(&self, prekey_id: PreKeyId) -> Signal<PreKeyRecord> {
         let id = u32::from(prekey_id);
-        let bytes = self.get(&format!("prekey.{id:08}"))?.ok_or(SignalProtocolError::InvalidPreKeyId)?;
+        let bytes = self
+            .get(&format!("prekey.{id:08}"))?
+            .ok_or(SignalProtocolError::InvalidPreKeyId)?;
         PreKeyRecord::deserialize(&bytes)
     }
 
@@ -610,20 +738,30 @@ impl PreKeyStore for Keys {
     }
 
     async fn remove_pre_key(&mut self, prekey_id: PreKeyId) -> Signal<()> {
-        self.vault.remove(&self.name(&format!("prekey.{:08}", u32::from(prekey_id))))?;
+        self.vault
+            .remove(&self.name(&format!("prekey.{:08}", u32::from(prekey_id))))?;
         Ok(())
     }
 }
 
 #[async_trait(?Send)]
 impl SignedPreKeyStore for Keys {
-    async fn get_signed_pre_key(&self, signed_prekey_id: SignedPreKeyId) -> Signal<SignedPreKeyRecord> {
+    async fn get_signed_pre_key(
+        &self,
+        signed_prekey_id: SignedPreKeyId,
+    ) -> Signal<SignedPreKeyRecord> {
         let id = u32::from(signed_prekey_id);
-        let bytes = self.get(&format!("signed.{id:08}"))?.ok_or(SignalProtocolError::InvalidSignedPreKeyId)?;
+        let bytes = self
+            .get(&format!("signed.{id:08}"))?
+            .ok_or(SignalProtocolError::InvalidSignedPreKeyId)?;
         SignedPreKeyRecord::deserialize(&bytes)
     }
 
-    async fn save_signed_pre_key(&mut self, signed_prekey_id: SignedPreKeyId, record: &SignedPreKeyRecord) -> Signal<()> {
+    async fn save_signed_pre_key(
+        &mut self,
+        signed_prekey_id: SignedPreKeyId,
+        record: &SignedPreKeyRecord,
+    ) -> Signal<()> {
         let id = u32::from(signed_prekey_id);
         self.put(&format!("signed.{id:08}"), &record.serialize()?)?;
         self.put("signed_current", &id.to_be_bytes())?;
@@ -635,11 +773,17 @@ impl SignedPreKeyStore for Keys {
 impl KyberPreKeyStore for Keys {
     async fn get_kyber_pre_key(&self, kyber_prekey_id: KyberPreKeyId) -> Signal<KyberPreKeyRecord> {
         let id = u32::from(kyber_prekey_id);
-        let bytes = self.get(&format!("kyber.{id:08}"))?.ok_or(SignalProtocolError::InvalidKyberPreKeyId)?;
+        let bytes = self
+            .get(&format!("kyber.{id:08}"))?
+            .ok_or(SignalProtocolError::InvalidKyberPreKeyId)?;
         KyberPreKeyRecord::deserialize(&bytes)
     }
 
-    async fn save_kyber_pre_key(&mut self, kyber_prekey_id: KyberPreKeyId, record: &KyberPreKeyRecord) -> Signal<()> {
+    async fn save_kyber_pre_key(
+        &mut self,
+        kyber_prekey_id: KyberPreKeyId,
+        record: &KyberPreKeyRecord,
+    ) -> Signal<()> {
         let id = u32::from(kyber_prekey_id);
         self.put(&format!("kyber.{id:08}"), &record.serialize()?)?;
         self.issued("kyber", id)
@@ -647,16 +791,29 @@ impl KyberPreKeyStore for Keys {
 
     /// A one-time key goes once used. A last-resort key stays, and the same use of it twice (a
     /// replayed message) is refused.
-    async fn mark_kyber_pre_key_used(&mut self, kyber_prekey_id: KyberPreKeyId, ec_prekey_id: SignedPreKeyId, base_key: &PublicKey) -> Signal<()> {
+    async fn mark_kyber_pre_key_used(
+        &mut self,
+        kyber_prekey_id: KyberPreKeyId,
+        ec_prekey_id: SignedPreKeyId,
+        base_key: &PublicKey,
+    ) -> Signal<()> {
         let id = u32::from(kyber_prekey_id);
         if !self.last_resort(id)? {
             self.vault.remove(&self.name(&format!("kyber.{id:08}")))?;
-            self.vault.remove(&self.name(&format!("kyber_stale.{id:08}")))?;
+            self.vault
+                .remove(&self.name(&format!("kyber_stale.{id:08}")))?;
             return Ok(());
         }
-        let seen = format!("kyber_used.{id:08}.{}.{}", u32::from(ec_prekey_id), hex(&base_key.serialize()));
+        let seen = format!(
+            "kyber_used.{id:08}.{}.{}",
+            u32::from(ec_prekey_id),
+            hex(&base_key.serialize())
+        );
         if self.get(&seen)?.is_some() {
-            return Err(SignalProtocolError::InvalidMessage(presage::libsignal_service::protocol::CiphertextMessageType::PreKey, "a last-resort key was used twice the same way"));
+            return Err(SignalProtocolError::InvalidMessage(
+                presage::libsignal_service::protocol::CiphertextMessageType::PreKey,
+                "a last-resort key was used twice the same way",
+            ));
         }
         self.put(&seen, b"")
     }
@@ -664,7 +821,11 @@ impl KyberPreKeyStore for Keys {
 
 #[async_trait(?Send)]
 impl KyberPreKeyStoreExt for Keys {
-    async fn store_last_resort_kyber_pre_key(&mut self, kyber_prekey_id: KyberPreKeyId, record: &KyberPreKeyRecord) -> Signal<()> {
+    async fn store_last_resort_kyber_pre_key(
+        &mut self,
+        kyber_prekey_id: KyberPreKeyId,
+        record: &KyberPreKeyRecord,
+    ) -> Signal<()> {
         let id = u32::from(kyber_prekey_id);
         self.save_kyber_pre_key(kyber_prekey_id, record).await?;
         self.put(&format!("kyber_last.{id:08}"), b"")?;
@@ -688,11 +849,15 @@ impl KyberPreKeyStoreExt for Keys {
         for what in ["kyber", "kyber_last", "kyber_stale"] {
             self.vault.remove(&self.name(&format!("{what}.{id:08}")))?;
         }
-        self.vault.remove_prefix(&self.name(&format!("kyber_used.{id:08}.")))?;
+        self.vault
+            .remove_prefix(&self.name(&format!("kyber_used.{id:08}.")))?;
         Ok(())
     }
 
-    async fn mark_all_one_time_kyber_pre_keys_stale_if_necessary(&mut self, stale_time: chrono::DateTime<chrono::Utc>) -> Signal<()> {
+    async fn mark_all_one_time_kyber_pre_keys_stale_if_necessary(
+        &mut self,
+        stale_time: chrono::DateTime<chrono::Utc>,
+    ) -> Signal<()> {
         for id in self.one_time_kyber()? {
             let name = format!("kyber_stale.{id:08}");
             if self.get(&name)?.is_none() {
@@ -704,14 +869,20 @@ impl KyberPreKeyStoreExt for Keys {
 
     /// Stale one-time keys older than `threshold` go, oldest first, while more than `min_count`
     /// one-time keys are left.
-    async fn delete_all_stale_one_time_kyber_pre_keys(&mut self, threshold: chrono::DateTime<chrono::Utc>, min_count: usize) -> Signal<()> {
+    async fn delete_all_stale_one_time_kyber_pre_keys(
+        &mut self,
+        threshold: chrono::DateTime<chrono::Utc>,
+        min_count: usize,
+    ) -> Signal<()> {
         let one_time = self.one_time_kyber()?;
         let mut left = one_time.len();
         for id in one_time {
             if left <= min_count {
                 break;
             }
-            let stale = self.get(&format!("kyber_stale.{id:08}"))?.and_then(|bytes| Some(i64::from_be_bytes(bytes.try_into().ok()?)));
+            let stale = self
+                .get(&format!("kyber_stale.{id:08}"))?
+                .and_then(|bytes| Some(i64::from_be_bytes(bytes.try_into().ok()?)));
             if stale.is_some_and(|stale| stale < threshold.timestamp_millis()) {
                 self.remove_kyber_pre_key(KyberPreKeyId::from(id)).await?;
                 left -= 1;
@@ -750,23 +921,37 @@ impl PreKeysStore for Keys {
     }
 
     async fn signed_prekey_id(&self) -> Signal<Option<SignedPreKeyId>> {
-        let current = self.get("signed_current")?.and_then(|bytes| Some(u32::from_be_bytes(bytes.try_into().ok()?)));
-        Ok(current.filter(|id| self.ids("signed").is_ok_and(|ids| ids.contains(id))).map(SignedPreKeyId::from))
+        let current = self
+            .get("signed_current")?
+            .and_then(|bytes| Some(u32::from_be_bytes(bytes.try_into().ok()?)));
+        Ok(current
+            .filter(|id| self.ids("signed").is_ok_and(|ids| ids.contains(id)))
+            .map(SignedPreKeyId::from))
     }
 
     async fn last_resort_kyber_prekey_id(&self) -> Signal<Option<KyberPreKeyId>> {
-        let current = self.get("kyber_last_current")?.and_then(|bytes| Some(u32::from_be_bytes(bytes.try_into().ok()?)));
-        Ok(current.filter(|id| self.last_resort(*id).unwrap_or(false)).map(KyberPreKeyId::from))
+        let current = self
+            .get("kyber_last_current")?
+            .and_then(|bytes| Some(u32::from_be_bytes(bytes.try_into().ok()?)));
+        Ok(current
+            .filter(|id| self.last_resort(*id).unwrap_or(false))
+            .map(KyberPreKeyId::from))
     }
 }
 
 #[async_trait(?Send)]
 impl SessionStore for Keys {
     async fn load_session(&self, address: &ProtocolAddress) -> Signal<Option<SessionRecord>> {
-        self.get(&Self::session_name(address))?.map(|bytes| SessionRecord::deserialize(&bytes)).transpose()
+        self.get(&Self::session_name(address))?
+            .map(|bytes| SessionRecord::deserialize(&bytes))
+            .transpose()
     }
 
-    async fn store_session(&mut self, address: &ProtocolAddress, record: &SessionRecord) -> Signal<()> {
+    async fn store_session(
+        &mut self,
+        address: &ProtocolAddress,
+        record: &SessionRecord,
+    ) -> Signal<()> {
         self.put(&Self::session_name(address), &record.serialize()?)
     }
 }
@@ -775,31 +960,67 @@ impl SessionStore for Keys {
 impl SessionStoreExt for Keys {
     async fn get_sub_device_sessions(&self, name: &ServiceId) -> Signal<Vec<DeviceId>> {
         let prefix = self.name(&format!("session.{}.", name.service_id_string()));
-        let devices = self.vault.names(&prefix)?.iter().filter_map(|session| id_of(session)).filter(|device| *device != 1).collect::<Vec<u32>>();
-        Ok(devices.into_iter().filter_map(|device| DeviceId::try_from(device).ok()).collect())
+        let devices = self
+            .vault
+            .names(&prefix)?
+            .iter()
+            .filter_map(|session| id_of(session))
+            .filter(|device| *device != 1)
+            .collect::<Vec<u32>>();
+        Ok(devices
+            .into_iter()
+            .filter_map(|device| DeviceId::try_from(device).ok())
+            .collect())
     }
 
     async fn delete_session(&self, address: &ProtocolAddress) -> Signal<()> {
-        if !self.vault.remove(&self.name(&Self::session_name(address)))? {
+        if !self
+            .vault
+            .remove(&self.name(&Self::session_name(address)))?
+        {
             return Err(SignalProtocolError::SessionNotFound(address.clone()));
         }
         Ok(())
     }
 
     async fn delete_all_sessions(&self, address: &ServiceId) -> Signal<usize> {
-        Ok(self.vault.remove_prefix(&self.name(&format!("session.{}.", address.service_id_string())))?)
+        Ok(self
+            .vault
+            .remove_prefix(&self.name(&format!("session.{}.", address.service_id_string())))?)
     }
 }
 
 #[async_trait(?Send)]
 impl SenderKeyStore for Keys {
-    async fn store_sender_key(&mut self, sender: &ProtocolAddress, distribution_id: Uuid, record: &SenderKeyRecord) -> Signal<()> {
-        self.put(&format!("sender_key.{}.{:03}.{distribution_id}", sender.name(), u32::from(sender.device_id())), &record.serialize()?)
+    async fn store_sender_key(
+        &mut self,
+        sender: &ProtocolAddress,
+        distribution_id: Uuid,
+        record: &SenderKeyRecord,
+    ) -> Signal<()> {
+        self.put(
+            &format!(
+                "sender_key.{}.{:03}.{distribution_id}",
+                sender.name(),
+                u32::from(sender.device_id())
+            ),
+            &record.serialize()?,
+        )
     }
 
-    async fn load_sender_key(&mut self, sender: &ProtocolAddress, distribution_id: Uuid) -> Signal<Option<SenderKeyRecord>> {
-        let name = format!("sender_key.{}.{:03}.{distribution_id}", sender.name(), u32::from(sender.device_id()));
-        self.get(&name)?.map(|bytes| SenderKeyRecord::deserialize(&bytes)).transpose()
+    async fn load_sender_key(
+        &mut self,
+        sender: &ProtocolAddress,
+        distribution_id: Uuid,
+    ) -> Signal<Option<SenderKeyRecord>> {
+        let name = format!(
+            "sender_key.{}.{:03}.{distribution_id}",
+            sender.name(),
+            u32::from(sender.device_id())
+        );
+        self.get(&name)?
+            .map(|bytes| SenderKeyRecord::deserialize(&bytes))
+            .transpose()
     }
 }
 
@@ -811,29 +1032,50 @@ mod tests {
 
     #[test]
     fn a_value_opens_only_with_its_key_and_under_its_own_name() {
-        let path = std::env::temp_dir().join(format!("tinyclient-vault-{}.state", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("tinyclient-vault-{}.state", std::process::id()));
         remove(&path);
         let key = new_key().unwrap();
         let vault = Vault::open(&path, &key).unwrap();
         vault.put("aci.identity", b"secret bytes").unwrap();
-        assert_eq!(vault.get("aci.identity").unwrap().as_deref(), Some(&b"secret bytes"[..]));
+        assert_eq!(
+            vault.get("aci.identity").unwrap().as_deref(),
+            Some(&b"secret bytes"[..])
+        );
         // On disk the value is sealed.
         let raw = std::fs::read(&path).unwrap();
         assert!(!raw.windows(12).any(|window| window == b"secret bytes"));
         // A value moved to another name does not open there.
-        let sealed: Vec<u8> = vault.db().query_row("SELECT v FROM kv WHERE k = 'aci.identity'", [], |row| row.get(0)).unwrap();
-        vault.db().execute("INSERT INTO kv (k, v) VALUES ('pni.identity', ?1)", [sealed]).unwrap();
+        let sealed: Vec<u8> = vault
+            .db()
+            .query_row("SELECT v FROM kv WHERE k = 'aci.identity'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        vault
+            .db()
+            .execute(
+                "INSERT INTO kv (k, v) VALUES ('pni.identity', ?1)",
+                [sealed],
+            )
+            .unwrap();
         assert!(vault.get("pni.identity").is_err());
         drop(vault);
-        assert!(Vault::open(&path, &new_key().unwrap()).is_err(), "another key does not open it");
+        assert!(
+            Vault::open(&path, &new_key().unwrap()).is_err(),
+            "another key does not open it"
+        );
         remove(&path);
     }
 
     #[test]
     fn key_ids_only_go_up() {
-        let path = std::env::temp_dir().join(format!("tinyclient-vault-ids-{}.state", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("tinyclient-vault-ids-{}.state", std::process::id()));
         remove(&path);
-        let keys = Vault::open(&path, &new_key().unwrap()).unwrap().aci_protocol_store();
+        let keys = Vault::open(&path, &new_key().unwrap())
+            .unwrap()
+            .aci_protocol_store();
         assert_eq!(keys.next("prekey").unwrap(), 1);
         keys.issued("prekey", 41).unwrap();
         keys.issued("prekey", 7).unwrap();

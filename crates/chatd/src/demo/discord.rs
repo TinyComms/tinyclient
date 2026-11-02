@@ -37,19 +37,43 @@ pub(crate) struct Discord {
 }
 
 const PEOPLE: &[Listed] = &[
-    ("Ines Marchetti", "ines.m", Online, "sketching trail maps", Friend),
+    (
+        "Ines Marchetti",
+        "ines.m",
+        Online,
+        "sketching trail maps",
+        Friend,
+    ),
     ("Tomasz Brandt", "tbrandt", Online, "", Friend),
     ("Wren Halloran", "wrenh", Idle, "back in 20", Friend),
-    ("Odalys Ferreira", "odalys", Dnd, "deep work until 3", Friend),
+    (
+        "Odalys Ferreira",
+        "odalys",
+        Dnd,
+        "deep work until 3",
+        Friend,
+    ),
     ("Kofi Asante", "kofi.a", Offline, "", Friend),
-    ("Mirela Dragan", "mireladragan", Online, "🎧 synthwave", Friend),
+    (
+        "Mirela Dragan",
+        "mireladragan",
+        Online,
+        "🎧 synthwave",
+        Friend,
+    ),
     ("Haruto Senda", "haru", Idle, "", Friend),
     ("Bex Lindqvist", "bexl", Offline, "on a train", Friend),
     ("Anselm Okafor", "anselm", Unknown, "", Friend),
     ("Dita Novak", "ditanovak", Online, "", Friend),
     ("Rafael Quintero", "rafaq", Dnd, "in a meeting", Friend),
     ("Saoirse Whelan", "saoirse", Offline, "", Friend),
-    ("Yusuf Demirci", "yusufd", Online, "shipping the thing", Friend),
+    (
+        "Yusuf Demirci",
+        "yusufd",
+        Online,
+        "shipping the thing",
+        Friend,
+    ),
     ("Pilar Echeverria", "pilar.e", Idle, "", Friend),
     ("Greta Sundqvist", "gretas", Unknown, "", Friend),
     ("Emeka Nwosu", "emeka", Online, "", Friend),
@@ -60,10 +84,22 @@ const PEOPLE: &[Listed] = &[
     ("Teodor Ilves", "teodor", Offline, "", Friend),
     ("Calla Winterbourne", "calla", Online, "", Friend),
     ("Ravi Subramanian", "ravi.s", Unknown, "", Friend),
-    ("Halvard Eide", "halvard", Offline, "gone fishing, literally", Friend),
+    (
+        "Halvard Eide",
+        "halvard",
+        Offline,
+        "gone fishing, literally",
+        Friend,
+    ),
     ("Suvi Laine", "suvi", Online, "", Friend),
     ("Dorian Pask", "dorianp", Unknown, "", Relation::Incoming),
-    ("Ottilie Brandvold", "ottilie", Unknown, "", Relation::Outgoing),
+    (
+        "Ottilie Brandvold",
+        "ottilie",
+        Unknown,
+        "",
+        Relation::Outgoing,
+    ),
     ("Vex Morrow", "vexm", Unknown, "", Relation::Blocked),
     ("Casimir Thorne", "casimir", Unknown, "", Relation::None),
     ("Lichen Bot", "lichenbot", Unknown, "", Relation::None),
@@ -88,65 +124,98 @@ pub const YOU: usize = usize::MAX;
 /// mentions, muted).
 type Row = (&'static str, ConversationKind, u32, u32, bool);
 const MOSS_TREE: &[(&str, &[Row])] = &[
-    ("", &[("rules", Announcement, 0, 0, false), ("announcements", Announcement, 2, 0, false)]),
-    ("Start here", &[
-        ("welcome", Channel, 0, 0, false),
-        ("introductions", Channel, 0, 0, false),
-        ("roles", Channel, 0, 0, true),
-    ]),
-    ("Trail", &[
-        ("general", Channel, 5, 2, false),
-        ("showcase", Channel, 0, 0, false),
-        ("Trail camera build log", Thread, 0, 0, false),
-        ("trail-cams", Channel, 5, 0, false),
-        ("field-notes", Channel, 0, 0, false),
-        ("route-planning", Channel, 9, 0, true),
-        ("gear-swap", Channel, 6, 1, true),
-        ("photo-dump", Channel, 0, 0, false),
-    ]),
-    ("Identification", &[
-        ("mosses", Channel, 0, 0, false),
-        ("lichens", Channel, 1, 0, false),
-        ("fungi", Channel, 0, 0, false),
-        ("ferns", Channel, 0, 0, false),
-        ("mystery-specimens", Channel, 3, 0, false),
-        ("id-help", Forum, 0, 0, false),
-    ]),
-    ("Projects", &[
-        ("herbarium-scans", Channel, 0, 0, false),
-        ("microscope-club", Channel, 0, 0, false),
-        ("map-layers", Channel, 1, 1, false),
-        ("citizen-science", Channel, 0, 0, false),
-        ("grant-writing", Channel, 0, 0, true),
-    ]),
-    ("Meetups", &[
-        ("spring-foray", Channel, 4, 0, false),
-        ("autumn-foray", Channel, 0, 0, false),
-        ("carpools", Channel, 0, 0, false),
-        ("lodging", Channel, 0, 0, false),
-    ]),
-    ("Off trail", &[
-        ("off-topic", Channel, 0, 0, false),
-        ("cooking", Channel, 0, 0, false),
-        ("music", Channel, 0, 0, true),
-        ("pets", Channel, 1, 0, false),
-        ("books", Channel, 0, 0, false),
-        ("games", Channel, 0, 0, false),
-    ]),
-    ("Voice", &[
-        ("Campfire", Voice, 0, 0, false),
-        ("Field recording", Voice, 0, 0, false),
-        ("Quiet room", Voice, 0, 0, false),
-    ]),
-    ("Staff", &[
-        ("mod-log", Channel, 0, 0, true),
-        ("mod-chat", Channel, 0, 0, false),
-        ("bot-commands", Channel, 0, 0, false),
-    ]),
+    (
+        "",
+        &[
+            ("rules", Announcement, 0, 0, false),
+            ("announcements", Announcement, 2, 0, false),
+        ],
+    ),
+    (
+        "Start here",
+        &[
+            ("welcome", Channel, 0, 0, false),
+            ("introductions", Channel, 0, 0, false),
+            ("roles", Channel, 0, 0, true),
+        ],
+    ),
+    (
+        "Trail",
+        &[
+            ("general", Channel, 5, 2, false),
+            ("showcase", Channel, 0, 0, false),
+            ("Trail camera build log", Thread, 0, 0, false),
+            ("trail-cams", Channel, 5, 0, false),
+            ("field-notes", Channel, 0, 0, false),
+            ("route-planning", Channel, 9, 0, true),
+            ("gear-swap", Channel, 6, 1, true),
+            ("photo-dump", Channel, 0, 0, false),
+        ],
+    ),
+    (
+        "Identification",
+        &[
+            ("mosses", Channel, 0, 0, false),
+            ("lichens", Channel, 1, 0, false),
+            ("fungi", Channel, 0, 0, false),
+            ("ferns", Channel, 0, 0, false),
+            ("mystery-specimens", Channel, 3, 0, false),
+            ("id-help", Forum, 0, 0, false),
+        ],
+    ),
+    (
+        "Projects",
+        &[
+            ("herbarium-scans", Channel, 0, 0, false),
+            ("microscope-club", Channel, 0, 0, false),
+            ("map-layers", Channel, 1, 1, false),
+            ("citizen-science", Channel, 0, 0, false),
+            ("grant-writing", Channel, 0, 0, true),
+        ],
+    ),
+    (
+        "Meetups",
+        &[
+            ("spring-foray", Channel, 4, 0, false),
+            ("autumn-foray", Channel, 0, 0, false),
+            ("carpools", Channel, 0, 0, false),
+            ("lodging", Channel, 0, 0, false),
+        ],
+    ),
+    (
+        "Off trail",
+        &[
+            ("off-topic", Channel, 0, 0, false),
+            ("cooking", Channel, 0, 0, false),
+            ("music", Channel, 0, 0, true),
+            ("pets", Channel, 1, 0, false),
+            ("books", Channel, 0, 0, false),
+            ("games", Channel, 0, 0, false),
+        ],
+    ),
+    (
+        "Voice",
+        &[
+            ("Campfire", Voice, 0, 0, false),
+            ("Field recording", Voice, 0, 0, false),
+            ("Quiet room", Voice, 0, 0, false),
+        ],
+    ),
+    (
+        "Staff",
+        &[
+            ("mod-log", Channel, 0, 0, true),
+            ("mod-chat", Channel, 0, 0, false),
+            ("bot-commands", Channel, 0, 0, false),
+        ],
+    ),
 ];
 
 /// The other servers: name, then categories of text channels.
-type Small = (&'static str, &'static [(&'static str, &'static [&'static str])]);
+type Small = (
+    &'static str,
+    &'static [(&'static str, &'static [&'static str])],
+);
 /// The servers' icons in `photos/`, Moss & Lichen first, then [`SMALL`] in order.
 const ICONS: &[&str] = &[
     "icon-moss-lichen.webp",
@@ -204,14 +273,26 @@ fn topic_of(name: &str) -> &'static str {
 /// are in it in all. The last one holds more people than a row may name.
 type Seat = (usize, bool, bool, bool);
 const VOICES: &[(&str, &[Seat], u32)] = &[
-    ("Campfire", &[(INES, false, false, false), (TOMASZ, true, false, false), (WREN, false, false, true)], 3),
+    (
+        "Campfire",
+        &[
+            (INES, false, false, false),
+            (TOMASZ, true, false, false),
+            (WREN, false, false, true),
+        ],
+        3,
+    ),
     ("Field recording", &[(YUSUF, true, true, false)], 1),
     ("Quiet room", &[], 31),
 ];
 
 /// Words for the names of the servers `many` adds.
-const FIRST: &[&str] = &["Quiet", "Paper", "Midnight", "Copper", "Salt", "Glass", "Northern"];
-const SECOND: &[&str] = &["Kettle", "Harbour", "Orchard", "Signal", "Lantern", "Archive"];
+const FIRST: &[&str] = &[
+    "Quiet", "Paper", "Midnight", "Copper", "Salt", "Glass", "Northern",
+];
+const SECOND: &[&str] = &[
+    "Kettle", "Harbour", "Orchard", "Signal", "Lantern", "Archive",
+];
 
 const GENERAL: &[(usize, i64, &str)] = &[
     (INES, 3200, "Morning all. Frost on the north slope, so the cushion mosses are finally showing their capsules."),
@@ -237,22 +318,44 @@ const GENERAL: &[(usize, i64, &str)] = &[
 
 /// A long, plausible history for paging: lines are put together from parts.
 const OPENERS: &[&str] = &[
-    "Has anyone tried", "I finally got around to", "Small win today:", "Question about",
-    "Reading the docs on", "Benchmarks are in for", "Still stuck on", "Hot take about",
-    "Rewrote", "Found a bug in", "Thinking out loud about", "Follow-up on",
+    "Has anyone tried",
+    "I finally got around to",
+    "Small win today:",
+    "Question about",
+    "Reading the docs on",
+    "Benchmarks are in for",
+    "Still stuck on",
+    "Hot take about",
+    "Rewrote",
+    "Found a bug in",
+    "Thinking out loud about",
+    "Follow-up on",
 ];
 const TOPICS: &[&str] = &[
-    "pinning in async traits", "the borrow checker and self-referential structs",
-    "arena allocation for the parser", "const generics in the matrix code",
-    "the embedded HAL on the nRF board", "error types that stay small",
-    "an allocation-free tokenizer", "channels versus a mutex around the queue",
-    "cross-compiling for the Pi Zero", "the lifetime elision rules",
-    "trait objects in the plugin loader", "SIMD in the checksum loop",
+    "pinning in async traits",
+    "the borrow checker and self-referential structs",
+    "arena allocation for the parser",
+    "const generics in the matrix code",
+    "the embedded HAL on the nRF board",
+    "error types that stay small",
+    "an allocation-free tokenizer",
+    "channels versus a mutex around the queue",
+    "cross-compiling for the Pi Zero",
+    "the lifetime elision rules",
+    "trait objects in the plugin loader",
+    "SIMD in the checksum loop",
 ];
 const CLOSERS: &[&str] = &[
-    "It compiles, which proves nothing.", "Halved the allocations.", "Will write it up later.",
-    "Am I holding it wrong?", "The compiler was right again.", "Twelve lines shorter now.",
-    "Opinions welcome.", "Flame graph attached in spirit.", "Clippy had thoughts.", "",
+    "It compiles, which proves nothing.",
+    "Halved the allocations.",
+    "Will write it up later.",
+    "Am I holding it wrong?",
+    "The compiler was right again.",
+    "Twelve lines shorter now.",
+    "Opinions welcome.",
+    "Flame graph attached in spirit.",
+    "Clippy had thoughts.",
+    "",
 ];
 
 fn moss(s: &mut Seeder, account: &AccountKey, cast: &[Who], me: &Who) -> Fallible<()> {
@@ -264,7 +367,10 @@ fn moss(s: &mut Seeder, account: &AccountKey, cast: &[Who], me: &Who) -> Fallibl
         let group = (!category.is_empty()).then(|| format!("350000000000000{at:03}"));
         if let Some(id) = &group {
             // The staff category is muted, so it starts collapsed.
-            groups.push(Group { muted: *category == "Staff", ..Group::new(id.clone(), *category, rows.len() as i32) });
+            groups.push(Group {
+                muted: *category == "Staff",
+                ..Group::new(id.clone(), *category, rows.len() as i32)
+            });
         }
         for (name, kind, unread, mentions, muted) in *channels {
             let id = format!("400000000000000{:03}", rows.len() + 1);
@@ -272,7 +378,11 @@ fn moss(s: &mut Seeder, account: &AccountKey, cast: &[Who], me: &Who) -> Fallibl
             rows.push(ConversationRow {
                 group: group.clone(),
                 position: rows.len() as i32,
-                call: if *kind == Voice { CallSupport::Native } else { CallSupport::None },
+                call: if *kind == Voice {
+                    CallSupport::Native
+                } else {
+                    CallSupport::None
+                },
                 // The showcase is in the Inbox too, so it is one click away.
                 listed: *name == "showcase",
                 topic: topic_of(name).to_owned(),
@@ -285,7 +395,10 @@ fn moss(s: &mut Seeder, account: &AccountKey, cast: &[Who], me: &Who) -> Fallibl
     }
     s.store.replace_tree(&space, &groups, &rows)?;
     let id_of = |name: &str| {
-        let row = rows.iter().find(|row| row.title == name).expect("a channel of the tree");
+        let row = rows
+            .iter()
+            .find(|row| row.title == name)
+            .expect("a channel of the tree");
         Key::new(account, row.id.clone())
     };
 
@@ -295,30 +408,93 @@ fn moss(s: &mut Seeder, account: &AccountKey, cast: &[Who], me: &Who) -> Fallibl
         (INES, 2900, "Spring foray is set for the second weekend of April. Sign-up sheet goes out Monday."),
         (INES, 130, "Sign-up sheet is live. Twenty places, lodging for twelve."),
     ])?;
-    s.script(&id_of("trail-cams"), cast, me, &[
-        (TOMASZ, 900, "Camera 2 caught a pine marten at 03:12. First one on this ridge in years."),
-        (WREN, 880, "That tail! Send the clip to the county recorder."),
-        (TOMASZ, 300, "Battery on camera 3 is at 11%. Who is up there next?"),
-        (HARUTO, 290, "I am, Thursday. I will swap it."),
-        (TOMASZ, 45, "Camera 1 has gone quiet. Either the card is full or a deer ate it again."),
-    ])?;
-    s.script(&id_of("mystery-specimens"), cast, me, &[
-        (WREN, 14, "Fence post, north side, about a metre up. Grey-green, powdery edges."),
-        (ODALYS, 11, "Lepraria, probably. Do you have a closer shot?"),
-        (WREN, 9, "Phone would not focus. Going back tomorrow with the hand lens."),
-    ])?;
+    s.script(
+        &id_of("trail-cams"),
+        cast,
+        me,
+        &[
+            (
+                TOMASZ,
+                900,
+                "Camera 2 caught a pine marten at 03:12. First one on this ridge in years.",
+            ),
+            (
+                WREN,
+                880,
+                "That tail! Send the clip to the county recorder.",
+            ),
+            (
+                TOMASZ,
+                300,
+                "Battery on camera 3 is at 11%. Who is up there next?",
+            ),
+            (HARUTO, 290, "I am, Thursday. I will swap it."),
+            (
+                TOMASZ,
+                45,
+                "Camera 1 has gone quiet. Either the card is full or a deer ate it again.",
+            ),
+        ],
+    )?;
+    s.script(
+        &id_of("mystery-specimens"),
+        cast,
+        me,
+        &[
+            (
+                WREN,
+                14,
+                "Fence post, north side, about a metre up. Grey-green, powdery edges.",
+            ),
+            (ODALYS, 11, "Lepraria, probably. Do you have a closer shot?"),
+            (
+                WREN,
+                9,
+                "Phone would not focus. Going back tomorrow with the hand lens.",
+            ),
+        ],
+    )?;
     super::showcase::gif_wall(s, &id_of("photo-dump"), cast)?;
-    s.script(&id_of("gear-swap"), cast, me, &[
-        (KOFI, 700, "Selling a barely used field press. Too big for my flat."),
-        (DITA, 640, "Robin was after one of those, I think?"),
-    ])?;
-    s.script(&id_of("map-layers"), cast, me, &[
-        (HARUTO, 150, "@Robin Vale the closures layer is ready for you to check against the county map."),
-    ])?;
-    s.script(&id_of("route-planning"), cast, me, &[
-        (DITA, 500, "Creek route is 11 km with the detour. Four hours at foray pace."),
-        (HARUTO, 480, "Foray pace being one kilometre an hour and a lot of kneeling."),
-    ])?;
+    s.script(
+        &id_of("gear-swap"),
+        cast,
+        me,
+        &[
+            (
+                KOFI,
+                700,
+                "Selling a barely used field press. Too big for my flat.",
+            ),
+            (DITA, 640, "Robin was after one of those, I think?"),
+        ],
+    )?;
+    s.script(
+        &id_of("map-layers"),
+        cast,
+        me,
+        &[(
+            HARUTO,
+            150,
+            "@Robin Vale the closures layer is ready for you to check against the county map.",
+        )],
+    )?;
+    s.script(
+        &id_of("route-planning"),
+        cast,
+        me,
+        &[
+            (
+                DITA,
+                500,
+                "Creek route is 11 km with the detour. Four hours at foray pace.",
+            ),
+            (
+                HARUTO,
+                480,
+                "Foray pace being one kilometre an hour and a lot of kneeling.",
+            ),
+        ],
+    )?;
     for (channel, seats, total) in VOICES {
         let seated = |&(at, muted, deafened, streaming): &Seat| Occupant {
             person: Key::new(account, cast[at].id.clone()),
@@ -331,10 +507,23 @@ fn moss(s: &mut Seeder, account: &AccountKey, cast: &[Who], me: &Who) -> Fallibl
         let mut people: Vec<Occupant> = seats.iter().map(seated).collect();
         // A full room: everyone we know who is not already talking somewhere (a person is in
         // one voice channel at a time, and Odalys is in a call), and more than a row may name.
-        let busy = |at: usize| at == ODALYS || VOICES.iter().any(|(_, seats, _)| seats.iter().any(|seat| seat.0 == at));
-        let free = (0..cast.len()).filter(|at| !busy(*at)).take((*total as usize).saturating_sub(people.len()));
+        let busy = |at: usize| {
+            at == ODALYS
+                || VOICES
+                    .iter()
+                    .any(|(_, seats, _)| seats.iter().any(|seat| seat.0 == at))
+        };
+        let free = (0..cast.len())
+            .filter(|at| !busy(*at))
+            .take((*total as usize).saturating_sub(people.len()));
         people.extend(free.map(|at| seated(&(at, at % 3 == 0, false, false))));
-        s.occupants.push((id_of(channel), Occupants { people, total: *total }));
+        s.occupants.push((
+            id_of(channel),
+            Occupants {
+                people,
+                total: *total,
+            },
+        ));
     }
 
     for (id, unread, mentions, muted) in state {
@@ -365,15 +554,29 @@ fn small(s: &mut Seeder, account: &AccountKey, cast: &[Who]) -> Fallible<()> {
                     position: rows.len() as i32,
                     // Not opted in to: listed only under "Browse more channels".
                     opted_out: at == 0 && *category == "Deep ends",
-                    ..ConversationRow::new(format!("41000000000000{at}{:03}", rows.len()), Channel, *name)
+                    ..ConversationRow::new(
+                        format!("41000000000000{at}{:03}", rows.len()),
+                        Channel,
+                        *name,
+                    )
                 });
             }
         }
         s.store.replace_tree(&space, &groups, &rows)?;
         let general = Key::new(account, rows[0].id.clone());
         if at > 0 {
-            s.say(&general, &cast[(at * 3) % 20], 600 * at as i64, "Quiet week. Anyone building anything?")?;
-            s.say(&general, &cast[(at * 5) % 20], 590 * at as i64, "Slowly. Photos when it stops looking like a fire hazard.")?;
+            s.say(
+                &general,
+                &cast[(at * 3) % 20],
+                600 * at as i64,
+                "Quiet week. Anyone building anything?",
+            )?;
+            s.say(
+                &general,
+                &cast[(at * 5) % 20],
+                590 * at as i64,
+                "Slowly. Photos when it stops looking like a fire hazard.",
+            )?;
             // One server is unread, one has a mention, the rest are read.
             s.counts(&general, u32::from(at < 3) * 2, u32::from(at == 2), None)?;
             continue;
@@ -385,8 +588,18 @@ fn small(s: &mut Seeder, account: &AccountKey, cast: &[Who]) -> Fallible<()> {
             if s.roll(3) == 0 {
                 speaker = s.roll(12) as usize;
             }
-            let (opener, topic, closer) = (s.roll(12) as usize, s.roll(12) as usize, s.roll(10) as usize);
-            let text = format!("{} {}. {} (#{})", OPENERS[opener], TOPICS[topic], CLOSERS[closer], line + 1);
+            let (opener, topic, closer) = (
+                s.roll(12) as usize,
+                s.roll(12) as usize,
+                s.roll(10) as usize,
+            );
+            let text = format!(
+                "{} {}. {} (#{})",
+                OPENERS[opener],
+                TOPICS[topic],
+                CLOSERS[closer],
+                line + 1
+            );
             s.say(&general, &cast[speaker], minutes, &text)?;
             minutes = (minutes - 1 - s.roll(26) as i64).max(1);
         }
@@ -397,71 +610,141 @@ fn small(s: &mut Seeder, account: &AccountKey, cast: &[Who]) -> Fallible<()> {
 fn direct(s: &mut Seeder, account: &AccountKey, cast: &[Who], me: &Who) -> Fallible<Key> {
     let open = |s: &mut Seeder, at: usize| {
         let who = &cast[at];
-        s.conversation(account, ConversationRow {
-            avatar: who.avatar.as_ref().map(|file| file.id.clone()),
-            peer: Some(who.id.clone()),
-            call: CallSupport::Native,
-            ..ConversationRow::new(format!("500000000000000{:03}", at + 1), ConversationKind::Direct, who.name.clone())
-        })
+        s.conversation(
+            account,
+            ConversationRow {
+                avatar: who.avatar.as_ref().map(|file| file.id.clone()),
+                peer: Some(who.id.clone()),
+                call: CallSupport::Native,
+                ..ConversationRow::new(
+                    format!("500000000000000{:03}", at + 1),
+                    ConversationKind::Direct,
+                    who.name.clone(),
+                )
+            },
+        )
     };
 
     // Unread: a number.
     let ines = open(s, INES)?;
-    let said = s.script(&ines, cast, me, &[
-        (INES, 2890, "Did you see the frost flowers by the weir this morning?"),
-        (YOU, 2885, "Missed them. I was at the wrong weir."),
-        (INES, 2884, "There is only one weir."),
-        (YOU, 2880, "Then I was at the wrong river."),
-        (INES, 9, "Van is booked for Saturday, 7:30 at the usual corner."),
-        (INES, 8, "Can you bring the trail camera and the long tripod?"),
-        (INES, 7, "And tell Tomasz, he never reads the channel."),
-    ])?;
+    let said = s.script(
+        &ines,
+        cast,
+        me,
+        &[
+            (
+                INES,
+                2890,
+                "Did you see the frost flowers by the weir this morning?",
+            ),
+            (YOU, 2885, "Missed them. I was at the wrong weir."),
+            (INES, 2884, "There is only one weir."),
+            (YOU, 2880, "Then I was at the wrong river."),
+            (
+                INES,
+                9,
+                "Van is booked for Saturday, 7:30 at the usual corner.",
+            ),
+            (
+                INES,
+                8,
+                "Can you bring the trail camera and the long tripod?",
+            ),
+            (INES, 7, "And tell Tomasz, he never reads the channel."),
+        ],
+    )?;
     s.counts(&ines, 3, 0, Some(&said[3]))?;
 
     // Read, and we spoke last.
     let tomasz = open(s, TOMASZ)?;
-    s.script(&tomasz, cast, me, &[
-        (TOMASZ, 1500, "Do you still have my soldering iron?"),
-        (YOU, 1490, "I do. It is on my desk, judging me."),
-        (TOMASZ, 1488, "Bring it Saturday and all is forgiven."),
-        (YOU, 70, "Ines says 7:30 at the usual corner. Bring batteries."),
-    ])?;
+    s.script(
+        &tomasz,
+        cast,
+        me,
+        &[
+            (TOMASZ, 1500, "Do you still have my soldering iron?"),
+            (YOU, 1490, "I do. It is on my desk, judging me."),
+            (TOMASZ, 1488, "Bring it Saturday and all is forgiven."),
+            (
+                YOU,
+                70,
+                "Ines says 7:30 at the usual corner. Bring batteries.",
+            ),
+        ],
+    )?;
 
     // No history at all.
     open(s, WREN)?;
 
     // Muted and unread: dimmed, no badge.
     let odalys = open(s, ODALYS)?;
-    s.script(&odalys, cast, me, &[
-        (ODALYS, 5000, "Sending you the draft key for the Cladonia section."),
-        (YOU, 4990, "Got it. I will read it on the train."),
-        (ODALYS, 260, "Page 4 has a mistake in couplet 12, ignore it."),
-        (ODALYS, 255, "And page 9. Ignore page 9 entirely."),
-    ])?;
+    s.script(
+        &odalys,
+        cast,
+        me,
+        &[
+            (
+                ODALYS,
+                5000,
+                "Sending you the draft key for the Cladonia section.",
+            ),
+            (YOU, 4990, "Got it. I will read it on the train."),
+            (
+                ODALYS,
+                260,
+                "Page 4 has a mistake in couplet 12, ignore it.",
+            ),
+            (ODALYS, 255, "And page 9. Ignore page 9 entirely."),
+        ],
+    )?;
     s.counts(&odalys, 2, 0, None)?;
     s.store.set_muted(&odalys, true)?;
 
     // Muted with a mention: a quiet number.
     let mirela = open(s, MIRELA)?;
-    s.script(&mirela, cast, me, &[
-        (MIRELA, 3100, "New mix is up if you want something for the drive."),
-        (YOU, 3000, "Listening now. Track three is doing a lot."),
-    ])?;
-    let ping = s.message(account, &cast[MIRELA], 95, "@Robin Vale you left your gloves in my car.");
+    s.script(
+        &mirela,
+        cast,
+        me,
+        &[
+            (
+                MIRELA,
+                3100,
+                "New mix is up if you want something for the drive.",
+            ),
+            (YOU, 3000, "Listening now. Track three is doing a lot."),
+        ],
+    )?;
+    let ping = s.message(
+        account,
+        &cast[MIRELA],
+        95,
+        "@Robin Vale you left your gloves in my car.",
+    );
     s.post(&mirela, &ping)?;
     s.counts(&mirela, 1, 1, None)?;
     s.store.set_muted(&mirela, true)?;
 
     // Read, older, and no picture: initials.
     let kofi = open(s, KOFI)?;
-    s.script(&kofi, cast, me, &[
-        (KOFI, 12000, "Thanks for the lift back. I owe you a coffee."),
-        (YOU, 11990, "You owe me three. I am keeping count."),
-    ])?;
+    s.script(
+        &kofi,
+        cast,
+        me,
+        &[
+            (KOFI, 12000, "Thanks for the lift back. I owe you a coffee."),
+            (YOU, 11990, "You owe me three. I am keeping count."),
+        ],
+    )?;
 
     // Blocked on Discord, and still unread: the badge that would not clear.
     let vex = open(s, VEX)?;
-    s.say(&vex, &cast[VEX], 2, "Okay. Do let me know so we can still hang out.")?;
+    s.say(
+        &vex,
+        &cast[VEX],
+        2,
+        "Okay. Do let me know so we can still hang out.",
+    )?;
     s.counts(&vex, 1, 0, None)?;
 
     // Read. `live` keeps this one moving.
@@ -474,48 +757,84 @@ fn direct(s: &mut Seeder, account: &AccountKey, cast: &[Who], me: &Who) -> Falli
 
     // Group conversations: one unread (a number), one read.
     let avatar = s.cover(account, "510000000000000001", "group-foray-carpool.webp")?;
-    let carpool = s.conversation(account, ConversationRow {
-        call: CallSupport::Native,
-        avatar,
-        ..ConversationRow::new("510000000000000001", ConversationKind::Group, "Foray carpool")
-    })?;
-    let said = s.script(&carpool, cast, me, &[
-        (DITA, 400, "Who is driving on Saturday?"),
-        (YOU, 395, "Ines has the van. I can take three more."),
-        (HARUTO, 60, "I need a seat and space for a tripod."),
-        (DITA, 58, "Same, minus the tripod."),
-        (INES, 50, "Van has seven seats. Robin, you take the gear."),
-        (HARUTO, 44, "Leaving from the usual corner?"),
-        (INES, 43, "Usual corner, 7:30."),
-        (DITA, 40, "I will bring pastries."),
-        (HARUTO, 39, "This is why we invite Dita."),
-        (INES, 30, "Weather says dry until two."),
-        (DITA, 22, "Boots anyway."),
-        (HARUTO, 21, "Always boots."),
-        (INES, 16, "Robin, confirm you have the camera?"),
-        (DITA, 15, "And the thermos."),
-    ])?;
+    let carpool = s.conversation(
+        account,
+        ConversationRow {
+            call: CallSupport::Native,
+            avatar,
+            ..ConversationRow::new(
+                "510000000000000001",
+                ConversationKind::Group,
+                "Foray carpool",
+            )
+        },
+    )?;
+    let said = s.script(
+        &carpool,
+        cast,
+        me,
+        &[
+            (DITA, 400, "Who is driving on Saturday?"),
+            (YOU, 395, "Ines has the van. I can take three more."),
+            (HARUTO, 60, "I need a seat and space for a tripod."),
+            (DITA, 58, "Same, minus the tripod."),
+            (INES, 50, "Van has seven seats. Robin, you take the gear."),
+            (HARUTO, 44, "Leaving from the usual corner?"),
+            (INES, 43, "Usual corner, 7:30."),
+            (DITA, 40, "I will bring pastries."),
+            (HARUTO, 39, "This is why we invite Dita."),
+            (INES, 30, "Weather says dry until two."),
+            (DITA, 22, "Boots anyway."),
+            (HARUTO, 21, "Always boots."),
+            (INES, 16, "Robin, confirm you have the camera?"),
+            (DITA, 15, "And the thermos."),
+        ],
+    )?;
     s.counts(&carpool, 12, 0, Some(&said[1]))?;
 
-    let band = s.conversation(account, ConversationRow {
-        call: CallSupport::Native,
-        ..ConversationRow::new("510000000000000002", ConversationKind::Group, "Kofi Asante, Mirela Dragan, Wren Halloran")
-    })?;
-    s.script(&band, cast, me, &[
-        (MIRELA, 8000, "Rehearsal moved to Wednesday."),
-        (KOFI, 7990, "Works for me."),
-        (YOU, 7985, "I will bring the cables this time."),
-    ])?;
+    let band = s.conversation(
+        account,
+        ConversationRow {
+            call: CallSupport::Native,
+            ..ConversationRow::new(
+                "510000000000000002",
+                ConversationKind::Group,
+                "Kofi Asante, Mirela Dragan, Wren Halloran",
+            )
+        },
+    )?;
+    s.script(
+        &band,
+        cast,
+        me,
+        &[
+            (MIRELA, 8000, "Rehearsal moved to Wednesday."),
+            (KOFI, 7990, "Works for me."),
+            (YOU, 7985, "I will bring the cables this time."),
+        ],
+    )?;
     Ok(yusuf)
 }
 
 /// `many`: enough more servers to make fifty, each a `#general` and two channels, a few unread.
-fn many(s: &mut Seeder, account: &AccountKey, cast: &[Who], spaces: &mut Vec<SpaceRow>) -> Fallible<()> {
+fn many(
+    s: &mut Seeder,
+    account: &AccountKey,
+    cast: &[Who],
+    spaces: &mut Vec<SpaceRow>,
+) -> Fallible<()> {
     let named = spaces.len();
     for at in named..50 {
         let id = format!("3100000000000000{at:02}");
         let look = s.look(Art::Badge);
-        let icon = s.picture(account, &format!("icon-many-{at}"), MediaKind::Icon, look, 96, 96)?;
+        let icon = s.picture(
+            account,
+            &format!("icon-many-{at}"),
+            MediaKind::Icon,
+            look,
+            96,
+            96,
+        )?;
         spaces.push(SpaceRow {
             id,
             name: format!("{} {}", FIRST[at % FIRST.len()], SECOND[at % SECOND.len()]),
@@ -532,13 +851,31 @@ fn many(s: &mut Seeder, account: &AccountKey, cast: &[Who], spaces: &mut Vec<Spa
             .map(|(position, name)| ConversationRow {
                 group: Some(group.clone()),
                 position: position as i32,
-                ..ConversationRow::new(format!("42000000000000{at:02}{position:02}"), Channel, *name)
+                ..ConversationRow::new(
+                    format!("42000000000000{at:02}{position:02}"),
+                    Channel,
+                    *name,
+                )
             })
             .collect();
-        s.store.replace_tree(&Key::new(account, space.id.clone()), &[Group::new(group.clone(), "Text", 0)], &rows)?;
+        s.store.replace_tree(
+            &Key::new(account, space.id.clone()),
+            &[Group::new(group.clone(), "Text", 0)],
+            &rows,
+        )?;
         let general = Key::new(account, rows[0].id.clone());
-        s.say(&general, &cast[at % 20], 90 * at as i64, "Anyone around this week?")?;
-        s.counts(&general, u32::from(at % 5 == 0) * 3, u32::from(at % 11 == 0), None)?;
+        s.say(
+            &general,
+            &cast[at % 20],
+            90 * at as i64,
+            "Anyone around this week?",
+        )?;
+        s.counts(
+            &general,
+            u32::from(at % 5 == 0) * 3,
+            u32::from(at % 11 == 0),
+            None,
+        )?;
     }
     Ok(())
 }
@@ -585,5 +922,11 @@ pub fn seed(s: &mut Seeder) -> Fallible<Discord> {
     let live = direct(s, &account, &cast, &me)?;
     // Campfire is the 35th row of the Moss & Lichen tree.
     let voice = Key::new(&account, CAMPFIRE);
-    Ok(Discord { account, me, cast, live, voice })
+    Ok(Discord {
+        account,
+        me,
+        cast,
+        live,
+        voice,
+    })
 }

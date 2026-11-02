@@ -4,16 +4,17 @@
 //! maps the server's JSON into that store and answers the commands the shell already sends.
 //! A GIF or a video is an attachment the existing viewer fetches. Reactions are Unicode emoji.
 
-use ::e2ee as e2ee_core;
 use super::e2ee::{self, Read};
 use super::live::{Ask, Live};
 use super::Saved;
+use crate::adapters::{CatalogPage, Command, Context, Download, Refusal};
 use crate::blobs::upload::{self, Target};
 use crate::store::{ConversationRow, PersonRow, PreviewLine, SpaceRow};
-use crate::adapters::{CatalogPage, Command, Context, Download, Refusal};
+use ::e2ee as e2ee_core;
 use protocol::{
-    join_host, Attachment, CallSupport, Capabilities, CatalogKind, ConversationKind, Group, GroupKind,
-    Encryption, MediaFile, MediaKind, Message, Outgoing, Reaction, ReactionRules, ReplyTo, Seal,
+    join_host, Attachment, CallSupport, Capabilities, CatalogKind, ConversationKind, Encryption,
+    Group, GroupKind, MediaFile, MediaKind, Message, Outgoing, Reaction, ReactionRules, ReplyTo,
+    Seal,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -58,7 +59,11 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
     let mut people: Vec<PersonRow> = names
         .iter()
         .filter(|(id, _)| super::safe_id(id))
-        .map(|(id, name)| PersonRow { id: id.clone(), name: name.clone(), ..PersonRow::default() })
+        .map(|(id, name)| PersonRow {
+            id: id.clone(),
+            name: name.clone(),
+            ..PersonRow::default()
+        })
         .collect();
     let mut groups = Vec::new();
     let mut rows = Vec::new();
@@ -68,12 +73,20 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
         if !super::safe_id(&channel.id) {
             continue;
         }
-        let mut row = ConversationRow::new(&channel.id, ConversationKind::Channel, title_or(&channel.name, &channel.id));
+        let mut row = ConversationRow::new(
+            &channel.id,
+            ConversationKind::Channel,
+            title_or(&channel.name, &channel.id),
+        );
         row.space = Some(SPACE.to_owned());
         row.topic = channel.topic.clone();
         row.position = channel.position;
         row.encryption = encryption_of(saved, &channel.id, channel.e2ee);
-        if let Some(category) = channel.category_id.as_deref().filter(|id| super::safe_id(id)) {
+        if let Some(category) = channel
+            .category_id
+            .as_deref()
+            .filter(|id| super::safe_id(id))
+        {
             row.group = Some(category.to_owned());
             if categories.insert(category.to_owned()) {
                 let position = channels
@@ -82,11 +95,25 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
                     .map(|other| other.position)
                     .min()
                     .unwrap_or(0);
-                let name = channel.category_name.as_deref().filter(|name| !name.is_empty()).unwrap_or(category);
+                let name = channel
+                    .category_name
+                    .as_deref()
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or(category);
                 groups.push(Group::new(category, name, position));
             }
         }
-        noted.push(Note::from_last(&channel.id, channel.unread, None, None, channel.last_message.as_ref(), false).sealed(channel.e2ee));
+        noted.push(
+            Note::from_last(
+                &channel.id,
+                channel.unread,
+                None,
+                None,
+                channel.last_message.as_ref(),
+                false,
+            )
+            .sealed(channel.e2ee),
+        );
         rows.push(row);
     }
     if !directs.is_empty() {
@@ -100,7 +127,11 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
         }
         let name = title_or(&direct.peer.display_name, "Someone");
         if !people.iter().any(|person| person.id == direct.peer.user_id) {
-            people.push(PersonRow { id: direct.peer.user_id.clone(), name: name.clone(), ..PersonRow::default() });
+            people.push(PersonRow {
+                id: direct.peer.user_id.clone(),
+                name: name.clone(),
+                ..PersonRow::default()
+            });
         }
         let mut row = ConversationRow::new(&direct.id, ConversationKind::Direct, name);
         row.space = Some(SPACE.to_owned());
@@ -108,15 +139,21 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
         row.peer = Some(direct.peer.user_id.clone());
         row.position = DIRECTS_AT + index as i32;
         row.encryption = encryption_of(saved, &direct.id, direct.e2ee);
-        let mine = direct.last_message.as_ref().is_some_and(|last| last.author_id == saved.user_id);
-        noted.push(Note::from_last(
-            &direct.id,
-            direct.unread,
-            direct.last_read.as_deref(),
-            direct.peer_read.as_deref(),
-            direct.last_message.as_ref(),
-            mine,
-        ).sealed(direct.e2ee));
+        let mine = direct
+            .last_message
+            .as_ref()
+            .is_some_and(|last| last.author_id == saved.user_id);
+        noted.push(
+            Note::from_last(
+                &direct.id,
+                direct.unread,
+                direct.last_read.as_deref(),
+                direct.peer_read.as_deref(),
+                direct.last_message.as_ref(),
+                mine,
+            )
+            .sealed(direct.e2ee),
+        );
         rows.push(row);
     }
     if !rooms.is_empty() {
@@ -126,7 +163,11 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
         if !super::safe_id(&room.id) {
             continue;
         }
-        let mut row = ConversationRow::new(&room.id, ConversationKind::Voice, title_or(&room.name, &room.id));
+        let mut row = ConversationRow::new(
+            &room.id,
+            ConversationKind::Voice,
+            title_or(&room.name, &room.id),
+        );
         row.space = Some(SPACE.to_owned());
         row.group = Some("rooms".to_owned());
         row.position = ROOMS_AT + index as i32;
@@ -145,7 +186,13 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
 }
 
 /// A durable frame, or one of the message frames a server sent without a seq.
-pub(crate) fn on_live(ctx: &Context, saved: &Saved, names: &HashMap<String, String>, kind: &str, frame: &Value) {
+pub(crate) fn on_live(
+    ctx: &Context,
+    saved: &Saved,
+    names: &HashMap<String, String>,
+    kind: &str,
+    frame: &Value,
+) {
     match kind {
         "channel.created" | "channel.updated" => channel_upsert(ctx, saved, names, frame),
         "channel.deleted" => {
@@ -174,9 +221,14 @@ pub(crate) fn on_live(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
         "e2ee.handshake" | "e2ee.keys_low" | "e2ee.device" => {
             if let Some(device) = e2ee::started(saved) {
                 let (kind, frame) = (kind.to_owned(), frame.clone());
-                let _ = std::thread::Builder::new().name("tiny-e2ee".into()).spawn(move || {
-                    device.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).heard(&kind, &frame);
-                });
+                let _ = std::thread::Builder::new()
+                    .name("tiny-e2ee".into())
+                    .spawn(move || {
+                        device
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .heard(&kind, &frame);
+                    });
             }
         }
         _ => {}
@@ -215,16 +267,26 @@ pub(crate) fn heard_typing(ctx: &Context, name: Option<&str>, frame: &Value) {
         return;
     }
     let named = field(frame, "display_name");
-    let name = name.filter(|name| !name.is_empty()).unwrap_or(if named.is_empty() { "Someone" } else { named });
+    let name = name
+        .filter(|name| !name.is_empty())
+        .unwrap_or(if named.is_empty() { "Someone" } else { named });
     ctx.typing(conversation_id, user_id, name, TYPING_FOR);
 }
 
 pub(crate) fn serve(ctx: &Context, saved: &Saved, live: &Live, command: Command) {
     match command {
         Command::Backfill(id) | Command::Warm(id) => load_page(ctx, saved, &id, None, PAGE),
-        Command::History { conversation_id, before } => load_page(ctx, saved, &conversation_id, Some(before), PAGE),
-        Command::HistoryAfter { conversation_id, .. } => load_page(ctx, saved, &conversation_id, None, PAGE),
-        Command::HistoryAround { conversation_id, around } => {
+        Command::History {
+            conversation_id,
+            before,
+        } => load_page(ctx, saved, &conversation_id, Some(before), PAGE),
+        Command::HistoryAfter {
+            conversation_id, ..
+        } => load_page(ctx, saved, &conversation_id, None, PAGE),
+        Command::HistoryAround {
+            conversation_id,
+            around,
+        } => {
             load_page(ctx, saved, &conversation_id, Some(around), PAGE);
             load_page(ctx, saved, &conversation_id, None, PAGE);
         }
@@ -234,21 +296,66 @@ pub(crate) fn serve(ctx: &Context, saved: &Saved, live: &Live, command: Command)
             }
         }
         Command::OpenSpace(_) | Command::OpenHome => refresh(ctx, saved),
-        Command::MarkRead { conversation_id, message_id } => mark_read(saved, &conversation_id, &message_id),
-        Command::Send { conversation_id, client_id, text, reply_to } => {
-            let outcome = post_message(ctx, saved, &conversation_id, &client_id, &text, reply_to.as_deref(), &[]);
+        Command::MarkRead {
+            conversation_id,
+            message_id,
+        } => mark_read(saved, &conversation_id, &message_id),
+        Command::Send {
+            conversation_id,
+            client_id,
+            text,
+            reply_to,
+        } => {
+            let outcome = post_message(
+                ctx,
+                saved,
+                &conversation_id,
+                &client_id,
+                &text,
+                reply_to.as_deref(),
+                &[],
+            );
             ctx.sent(&conversation_id, &client_id, outcome);
         }
-        Command::SendWith { conversation_id, client_id, text, reply_to, with } => {
-            send_with(ctx, saved, conversation_id, client_id, text, reply_to, *with);
+        Command::SendWith {
+            conversation_id,
+            client_id,
+            text,
+            reply_to,
+            with,
+        } => {
+            send_with(
+                ctx,
+                saved,
+                conversation_id,
+                client_id,
+                text,
+                reply_to,
+                *with,
+            );
         }
         Command::CancelSend { client_id, .. } => upload::cancel(&ctx.account, &client_id),
-        Command::React { conversation_id: _, message_id, emoji, on, reply } => react(saved, &message_id, &emoji, on, reply),
+        Command::React {
+            conversation_id: _,
+            message_id,
+            emoji,
+            on,
+            reply,
+        } => react(saved, &message_id, &emoji, on, reply),
         Command::ReactionRules { reply, .. } => {
             let _ = reply.send(Ok(ReactionRules::default()));
         }
-        Command::Edit { conversation_id, message_id, text, reply } => edit(ctx, saved, &conversation_id, &message_id, &text, reply),
-        Command::Delete { conversation_id, message_id, reply } => delete(ctx, saved, &conversation_id, &message_id, reply),
+        Command::Edit {
+            conversation_id,
+            message_id,
+            text,
+            reply,
+        } => edit(ctx, saved, &conversation_id, &message_id, &text, reply),
+        Command::Delete {
+            conversation_id,
+            message_id,
+            reply,
+        } => delete(ctx, saved, &conversation_id, &message_id, reply),
         Command::Typing(conversation_id) => {
             if super::safe_id(&conversation_id) {
                 live.ask(Ask::Type { conversation_id });
@@ -266,14 +373,24 @@ pub(crate) fn serve(ctx: &Context, saved: &Saved, live: &Live, command: Command)
         Command::Download { id, url, reply } => {
             if same_server(&saved.base_url, &url) {
                 // A sealed attachment opens with what its message said; the cache opens it.
-                let sealed = e2ee::started(saved).and_then(|device| device.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).sealed_file(&id));
+                let sealed = e2ee::started(saved).and_then(|device| {
+                    device
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .sealed_file(&id)
+                });
                 let _ = reply.send(Ok(Download {
                     url,
-                    headers: vec![("Authorization".to_owned(), format!("Bearer {}", saved.token))],
+                    headers: vec![(
+                        "Authorization".to_owned(),
+                        format!("Bearer {}", saved.token),
+                    )],
                     sealed,
                 }));
             } else {
-                let _ = reply.send(Err(Refusal::Refused("That file is on another server.".to_owned())));
+                let _ = reply.send(Err(Refusal::Refused(
+                    "That file is on another server.".to_owned(),
+                )));
             }
         }
         other => other.unsupported(ctx),
@@ -293,8 +410,19 @@ struct Note {
 }
 
 impl Note {
-    fn from_last(id: &str, unread: u32, last_read: Option<&str>, peer_read: Option<&str>, last: Option<&WireLast>, mine: bool) -> Note {
-        let kept = |value: Option<&str>| value.filter(|id| !id.is_empty() && super::safe_id(id)).map(str::to_owned);
+    fn from_last(
+        id: &str,
+        unread: u32,
+        last_read: Option<&str>,
+        peer_read: Option<&str>,
+        last: Option<&WireLast>,
+        mine: bool,
+    ) -> Note {
+        let kept = |value: Option<&str>| {
+            value
+                .filter(|id| !id.is_empty() && super::safe_id(id))
+                .map(str::to_owned)
+        };
         Note {
             id: id.to_owned(),
             sealed: false,
@@ -312,22 +440,45 @@ impl Note {
     }
 
     fn apply(&self, ctx: &Context, saved: &Saved, names: &HashMap<String, String>) {
-        let updated = self.last.as_ref().and_then(|last| rfc3339(&last.created_at)).unwrap_or(if self.mine || self.peer_read.is_some() { 1 } else { 0 });
+        let updated = self
+            .last
+            .as_ref()
+            .and_then(|last| rfc3339(&last.created_at))
+            .unwrap_or(if self.mine || self.peer_read.is_some() {
+                1
+            } else {
+                0
+            });
         // An empty direct message still belongs in the Inbox.
-        let updated = if updated == 0 && self.peer_read.is_some() { 1 } else { updated };
+        let updated = if updated == 0 && self.peer_read.is_some() {
+            1
+        } else {
+            updated
+        };
         let direct = self.peer_read.is_some() || self.last_read.is_some();
         let updated = if updated == 0 && direct { 1 } else { updated };
         let _ = ctx.counts(&self.id, self.unread, 0, self.last_read.as_deref(), updated);
         if let Some(last) = &self.last {
             if super::safe_id(&last.id) {
-                let text = if self.sealed { sealed_preview(ctx, &self.id, &last.id) } else { last.body.clone() };
-                let _ = ctx.preview(&self.id, &PreviewLine {
-                    id: last.id.clone(),
-                    text,
-                    sender: if self.mine { String::new() } else { name_of(names, saved, &last.author_id) },
-                    mine: self.mine,
-                    sent: rfc3339(&last.created_at).unwrap_or(updated),
-                });
+                let text = if self.sealed {
+                    sealed_preview(ctx, &self.id, &last.id)
+                } else {
+                    last.body.clone()
+                };
+                let _ = ctx.preview(
+                    &self.id,
+                    &PreviewLine {
+                        id: last.id.clone(),
+                        text,
+                        sender: if self.mine {
+                            String::new()
+                        } else {
+                            name_of(names, saved, &last.author_id)
+                        },
+                        mine: self.mine,
+                        sent: rfc3339(&last.created_at).unwrap_or(updated),
+                    },
+                );
             }
         }
         if let Some(peer_read) = &self.peer_read {
@@ -337,17 +488,31 @@ impl Note {
 }
 
 fn channel_upsert(ctx: &Context, saved: &Saved, names: &HashMap<String, String>, frame: &Value) {
-    let Some(channel) = nested_value(frame, "channel").and_then(|value| serde_json::from_value::<WireChannel>(value).ok()) else {
+    let Some(channel) = nested_value(frame, "channel")
+        .and_then(|value| serde_json::from_value::<WireChannel>(value).ok())
+    else {
         return;
     };
     if !super::safe_id(&channel.id) {
         return;
     }
-    if let Some(category) = channel.category_id.as_deref().filter(|id| super::safe_id(id)) {
-        let name = channel.category_name.as_deref().filter(|name| !name.is_empty()).unwrap_or(category);
+    if let Some(category) = channel
+        .category_id
+        .as_deref()
+        .filter(|id| super::safe_id(id))
+    {
+        let name = channel
+            .category_name
+            .as_deref()
+            .filter(|name| !name.is_empty())
+            .unwrap_or(category);
         let _ = ctx.group(SPACE, &Group::new(category, name, channel.position));
     }
-    let mut row = ConversationRow::new(&channel.id, ConversationKind::Channel, title_or(&channel.name, &channel.id));
+    let mut row = ConversationRow::new(
+        &channel.id,
+        ConversationKind::Channel,
+        title_or(&channel.name, &channel.id),
+    );
     row.space = Some(SPACE.to_owned());
     row.group = channel.category_id.filter(|id| super::safe_id(id));
     row.topic = channel.topic.clone();
@@ -356,18 +521,33 @@ fn channel_upsert(ctx: &Context, saved: &Saved, names: &HashMap<String, String>,
     if ctx.conversation(&row).is_err() {
         return;
     }
-    Note::from_last(&channel.id, channel.unread, None, None, channel.last_message.as_ref(), false).sealed(channel.e2ee).apply(ctx, saved, names);
+    Note::from_last(
+        &channel.id,
+        channel.unread,
+        None,
+        None,
+        channel.last_message.as_ref(),
+        false,
+    )
+    .sealed(channel.e2ee)
+    .apply(ctx, saved, names);
 }
 
 fn direct_upsert(ctx: &Context, saved: &Saved, names: &HashMap<String, String>, frame: &Value) {
-    let Some(direct) = nested_value(frame, "direct").and_then(|value| serde_json::from_value::<WireDirect>(value).ok()) else {
+    let Some(direct) = nested_value(frame, "direct")
+        .and_then(|value| serde_json::from_value::<WireDirect>(value).ok())
+    else {
         return;
     };
     if !super::safe_id(&direct.id) || !super::safe_id(&direct.peer.user_id) {
         return;
     }
     let name = title_or(&direct.peer.display_name, "Someone");
-    let _ = ctx.people(&[PersonRow { id: direct.peer.user_id.clone(), name: name.clone(), ..PersonRow::default() }]);
+    let _ = ctx.people(&[PersonRow {
+        id: direct.peer.user_id.clone(),
+        name: name.clone(),
+        ..PersonRow::default()
+    }]);
     let mut group = Group::new("directs", "Direct messages", DIRECTS_AT);
     group.kind = GroupKind::Directs;
     let _ = ctx.group(SPACE, &group);
@@ -380,11 +560,29 @@ fn direct_upsert(ctx: &Context, saved: &Saved, names: &HashMap<String, String>, 
     if ctx.conversation(&row).is_err() {
         return;
     }
-    let mine = direct.last_message.as_ref().is_some_and(|last| last.author_id == saved.user_id);
-    Note::from_last(&direct.id, direct.unread, direct.last_read.as_deref(), direct.peer_read.as_deref(), direct.last_message.as_ref(), mine).sealed(direct.e2ee).apply(ctx, saved, names);
+    let mine = direct
+        .last_message
+        .as_ref()
+        .is_some_and(|last| last.author_id == saved.user_id);
+    Note::from_last(
+        &direct.id,
+        direct.unread,
+        direct.last_read.as_deref(),
+        direct.peer_read.as_deref(),
+        direct.last_message.as_ref(),
+        mine,
+    )
+    .sealed(direct.e2ee)
+    .apply(ctx, saved, names);
 }
 
-fn deliver(ctx: &Context, saved: &Saved, names: &HashMap<String, String>, conversation_id: &str, wire: &WireMessage) {
+fn deliver(
+    ctx: &Context,
+    saved: &Saved,
+    names: &HashMap<String, String>,
+    conversation_id: &str,
+    wire: &WireMessage,
+) {
     if !super::safe_id(conversation_id) {
         return;
     }
@@ -426,7 +624,11 @@ fn refold(ctx: &Context, saved: &Saved, conversation_id: &str, opened: &HashMap<
 
 /// What the end-to-end encrypted rows of a page say. Empty for a plaintext page, and when this
 /// device has no encryption state (its rows then read "Can't be decrypted on this device").
-fn open_rows(saved: &Saved, conversation_id: &str, wires: &[&WireMessage]) -> HashMap<String, Read> {
+fn open_rows(
+    saved: &Saved,
+    conversation_id: &str,
+    wires: &[&WireMessage],
+) -> HashMap<String, Read> {
     if !wires.iter().any(|wire| wire.e2ee) {
         return HashMap::new();
     }
@@ -447,7 +649,9 @@ fn open_rows(saved: &Saved, conversation_id: &str, wires: &[&WireMessage]) -> Ha
             client_id: wire.client_id.as_deref(),
         })
         .collect();
-    let mut device = device.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut device = device
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     device.note_encrypted(conversation_id, true);
     device.read(conversation_id, &rows)
 }
@@ -455,7 +659,10 @@ fn open_rows(saved: &Saved, conversation_id: &str, wires: &[&WireMessage]) -> Ha
 /// The conversation's label: encrypted where the server says it is, and otherwise never.
 fn encryption_of(saved: &Saved, conversation_id: &str, e2ee: bool) -> Encryption {
     if let Some(device) = e2ee::started(saved) {
-        device.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).note_encrypted(conversation_id, e2ee);
+        device
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .note_encrypted(conversation_id, e2ee);
     }
     if e2ee {
         Encryption::EndToEnd
@@ -490,7 +697,10 @@ fn merge_reaction(ctx: &Context, saved: &Saved, frame: &Value) {
         None => 1,
     };
     let mine = (field(frame, "user_id") == saved.user_id).then_some(on);
-    let at = message.reactions.iter().position(|have| have.emoji == emoji);
+    let at = message
+        .reactions
+        .iter()
+        .position(|have| have.emoji == emoji);
     if count == 0 {
         if let Some(at) = at {
             message.reactions.remove(at);
@@ -501,7 +711,12 @@ fn merge_reaction(ctx: &Context, saved: &Saved, frame: &Value) {
             message.reactions[at].mine = mine;
         }
     } else {
-        message.reactions.push(Reaction { emoji: emoji.to_owned(), file: None, count, mine: mine.unwrap_or(false) });
+        message.reactions.push(Reaction {
+            emoji: emoji.to_owned(),
+            file: None,
+            count,
+            mine: mine.unwrap_or(false),
+        });
     }
     let _ = ctx.message(conversation_id, &message);
 }
@@ -525,7 +740,13 @@ fn read_updated(ctx: &Context, saved: &Saved, frame: &Value) {
     }
 }
 
-fn load_page(ctx: &Context, saved: &Saved, conversation_id: &str, before: Option<String>, limit: u32) {
+fn load_page(
+    ctx: &Context,
+    saved: &Saved,
+    conversation_id: &str,
+    before: Option<String>,
+    limit: u32,
+) {
     if !super::safe_id(conversation_id) {
         return;
     }
@@ -536,23 +757,37 @@ fn load_page(ctx: &Context, saved: &Saved, conversation_id: &str, before: Option
     }
 }
 
-fn fetch_page(ctx: &Context, saved: &Saved, conversation_id: &str, before: Option<&str>, limit: u32) -> Result<(), String> {
+fn fetch_page(
+    ctx: &Context,
+    saved: &Saved,
+    conversation_id: &str,
+    before: Option<&str>,
+    limit: u32,
+) -> Result<(), String> {
     let path = match before {
-        Some(before) => format!("/v1/conversations/{conversation_id}/messages?before={before}&limit={limit}"),
+        Some(before) => {
+            format!("/v1/conversations/{conversation_id}/messages?before={before}&limit={limit}")
+        }
         None => format!("/v1/conversations/{conversation_id}/messages?limit={limit}"),
     };
     match super::asked("GET", saved, &path, None) {
         Ok((200, body)) => {
-            let wires: Vec<WireMessage> = list_of(body, "messages").map_err(|()| super::UNREADABLE.to_owned())?;
+            let wires: Vec<WireMessage> =
+                list_of(body, "messages").map_err(|()| super::UNREADABLE.to_owned())?;
             let names = member_names(saved);
             let mut media = Vec::new();
             let opened = open_rows(saved, conversation_id, &wires.iter().collect::<Vec<_>>());
-            let messages: Vec<Message> = wires.iter().filter(|wire| wire.kind.as_deref() != Some("edit")).filter_map(|wire| map_message(saved, &names, wire, &opened, &mut media)).collect();
+            let messages: Vec<Message> = wires
+                .iter()
+                .filter(|wire| wire.kind.as_deref() != Some("edit"))
+                .filter_map(|wire| map_message(saved, &names, wire, &opened, &mut media))
+                .collect();
             if !media.is_empty() {
                 let _ = ctx.media(&media);
             }
             if !messages.is_empty() {
-                ctx.history(conversation_id, &messages).map_err(|err| err.to_string())?;
+                ctx.history(conversation_id, &messages)
+                    .map_err(|err| err.to_string())?;
             }
             Ok(())
         }
@@ -562,12 +797,29 @@ fn fetch_page(ctx: &Context, saved: &Saved, conversation_id: &str, before: Optio
     }
 }
 
-fn post_message(ctx: &Context, saved: &Saved, conversation_id: &str, client_id: &str, text: &str, reply_to: Option<&str>, attachment_ids: &[String]) -> Result<Message, String> {
+fn post_message(
+    ctx: &Context,
+    saved: &Saved,
+    conversation_id: &str,
+    client_id: &str,
+    text: &str,
+    reply_to: Option<&str>,
+    attachment_ids: &[String],
+) -> Result<Message, String> {
     if !super::safe_id(conversation_id) {
         return Err(super::CHECK.to_owned());
     }
     if sealed_here(ctx, saved, conversation_id)? {
-        return post_sealed(ctx, saved, conversation_id, client_id, text, reply_to, Vec::new(), attachment_ids);
+        return post_sealed(
+            ctx,
+            saved,
+            conversation_id,
+            client_id,
+            text,
+            reply_to,
+            Vec::new(),
+            attachment_ids,
+        );
     }
     let mut body = serde_json::Map::new();
     body.insert("body".to_owned(), Value::String(text.to_owned()));
@@ -581,7 +833,9 @@ fn post_message(ctx: &Context, saved: &Saved, conversation_id: &str, client_id: 
     let path = format!("/v1/conversations/{conversation_id}/messages");
     match super::asked("POST", saved, &path, Some(Value::Object(body))) {
         Ok((200 | 201, value)) => accept_message(ctx, saved, conversation_id, &value),
-        Ok((status, value)) => Err(super::explain(status, &value, super::Missing::Plain).to_owned()),
+        Ok((status, value)) => {
+            Err(super::explain(status, &value, super::Missing::Plain).to_owned())
+        }
         Err(detail) => Err(detail.to_owned()),
     }
 }
@@ -592,11 +846,21 @@ const NOT_SET_UP: &str = "This device isn't set up for encrypted messages yet. O
 /// Whether a send to this conversation must be end-to-end encrypted. An encrypted conversation is
 /// never sent plaintext, whatever state this device is in: it is an error instead.
 fn sealed_here(ctx: &Context, saved: &Saved, conversation_id: &str) -> Result<bool, String> {
-    let labelled = ctx.known(conversation_id).ok().flatten().is_some_and(|row| row.encryption == Encryption::EndToEnd);
+    let labelled = ctx
+        .known(conversation_id)
+        .ok()
+        .flatten()
+        .is_some_and(|row| row.encryption == Encryption::EndToEnd);
     let Some(device) = e2ee::started(saved) else {
-        return if labelled { Err(NOT_SET_UP.to_owned()) } else { Ok(false) };
+        return if labelled {
+            Err(NOT_SET_UP.to_owned())
+        } else {
+            Ok(false)
+        };
     };
-    let mut device = device.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut device = device
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let encrypted = labelled || device.is_encrypted(conversation_id);
     if encrypted && !device.ready() {
         return Err(NOT_SET_UP.to_owned());
@@ -607,32 +871,80 @@ fn sealed_here(ctx: &Context, saved: &Saved, conversation_id: &str) -> Result<bo
 /// An end-to-end encrypted message: the envelope is encrypted by this device and posted as
 /// ciphertext. What the server answers is read back through the cache, which holds the text.
 #[allow(clippy::too_many_arguments)]
-fn post_sealed(ctx: &Context, saved: &Saved, conversation_id: &str, client_id: &str, text: &str, reply_to: Option<&str>, attachments: Vec<e2ee_core::AttachmentRef>, attachment_ids: &[String]) -> Result<Message, String> {
+fn post_sealed(
+    ctx: &Context,
+    saved: &Saved,
+    conversation_id: &str,
+    client_id: &str,
+    text: &str,
+    reply_to: Option<&str>,
+    attachments: Vec<e2ee_core::AttachmentRef>,
+    attachment_ids: &[String],
+) -> Result<Message, String> {
     let device = e2ee::started(saved).ok_or(NOT_SET_UP)?;
     let mut envelope = e2ee_core::Envelope::message(text);
     envelope.reply_to = reply_to.filter(|id| super::safe_id(id)).map(str::to_owned);
     envelope.attachments = attachments;
-    envelope.sent_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok().map(|since| since.as_millis() as i64);
-    let answer = device.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).post(conversation_id, client_id, e2ee_core::Kind::Message, None, &envelope, attachment_ids)?;
+    envelope.sent_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|since| since.as_millis() as i64);
+    let answer = device
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .post(
+            conversation_id,
+            client_id,
+            e2ee_core::Kind::Message,
+            None,
+            &envelope,
+            attachment_ids,
+        )?;
     accept_message(ctx, saved, conversation_id, &answer)
 }
 
-fn send_with(ctx: &Context, saved: &Saved, conversation_id: String, client_id: String, text: String, reply_to: Option<String>, outgoing: Outgoing) {
+fn send_with(
+    ctx: &Context,
+    saved: &Saved,
+    conversation_id: String,
+    client_id: String,
+    text: String,
+    reply_to: Option<String>,
+    outgoing: Outgoing,
+) {
     if outgoing.files.is_empty() {
-        let outcome = post_message(ctx, saved, &conversation_id, &client_id, &text, reply_to.as_deref(), &[]);
+        let outcome = post_message(
+            ctx,
+            saved,
+            &conversation_id,
+            &client_id,
+            &text,
+            reply_to.as_deref(),
+            &[],
+        );
         ctx.sent(&conversation_id, &client_id, outcome);
         return;
     }
     if outgoing.files.len() > protocol::ATTACHMENTS_LIMIT {
-        ctx.sent(&conversation_id, &client_id, Err("Too many files.".to_owned()));
+        ctx.sent(
+            &conversation_id,
+            &client_id,
+            Err("Too many files.".to_owned()),
+        );
         return;
     }
     let limits = upload_limits(saved);
     for file in &outgoing.files {
         let cap = cap_for(file, &limits);
-        let len = std::fs::metadata(&file.path).map(|meta| meta.len()).unwrap_or(0);
+        let len = std::fs::metadata(&file.path)
+            .map(|meta| meta.len())
+            .unwrap_or(0);
         if len > cap {
-            ctx.sent(&conversation_id, &client_id, Err("That file is too big for this server.".to_owned()));
+            ctx.sent(
+                &conversation_id,
+                &client_id,
+                Err("That file is too big for this server.".to_owned()),
+            );
             return;
         }
     }
@@ -653,7 +965,16 @@ fn send_with(ctx: &Context, saved: &Saved, conversation_id: String, client_id: S
             let refs = super::sealing::upload_sealed(upload, &saved, &posting_id)?;
             upload.check()?;
             let ids: Vec<String> = refs.iter().map(|file| file.id.clone()).collect();
-            post_sealed(&posting, &saved, &posting_id, &posting_client, &text, reply_to.as_deref(), refs, &ids)
+            post_sealed(
+                &posting,
+                &saved,
+                &posting_id,
+                &posting_client,
+                &text,
+                reply_to.as_deref(),
+                refs,
+                &ids,
+            )
         });
         return;
     }
@@ -661,26 +982,47 @@ fn send_with(ctx: &Context, saved: &Saved, conversation_id: String, client_id: S
         let mut ids = Vec::with_capacity(upload.files().len());
         for at in 0..upload.files().len() {
             upload.check()?;
-            let target = Target::post(super::endpoint(&saved.base_url, "/v1/media")).header("Authorization", &format!("Bearer {}", saved.token));
+            let target = Target::post(super::endpoint(&saved.base_url, "/v1/media"))
+                .header("Authorization", &format!("Bearer {}", saved.token));
             let answer = match upload.send_form(at, &target, "file", &[]) {
                 Ok(answer) => answer,
                 Err(why) => return Err(media_failure(&why)),
             };
             let body: Value = serde_json::from_str(&answer.body).unwrap_or(Value::Null);
-            let id = body.get("id").and_then(Value::as_str).or_else(|| body.pointer("/media/id").and_then(Value::as_str)).unwrap_or("");
+            let id = body
+                .get("id")
+                .and_then(Value::as_str)
+                .or_else(|| body.pointer("/media/id").and_then(Value::as_str))
+                .unwrap_or("");
             if !super::safe_id(id) {
                 return Err(super::UNREADABLE.to_owned());
             }
             ids.push(id.to_owned());
         }
         upload.check()?;
-        post_message(&posting, &saved, &posting_id, &posting_client, &text, reply_to.as_deref(), &ids)
+        post_message(
+            &posting,
+            &saved,
+            &posting_id,
+            &posting_client,
+            &text,
+            reply_to.as_deref(),
+            &ids,
+        )
     });
 }
 
-fn react(saved: &Saved, message_id: &str, emoji: &str, on: bool, reply: crate::adapters::Reply<()>) {
+fn react(
+    saved: &Saved,
+    message_id: &str,
+    emoji: &str,
+    on: bool,
+    reply: crate::adapters::Reply<()>,
+) {
     if !unicode_emoji(emoji) {
-        let _ = reply.send(Err(Refusal::Refused("That reaction isn't allowed here.".to_owned())));
+        let _ = reply.send(Err(Refusal::Refused(
+            "That reaction isn't allowed here.".to_owned(),
+        )));
         return;
     }
     if !super::safe_id(message_id) {
@@ -693,14 +1035,24 @@ fn react(saved: &Saved, message_id: &str, emoji: &str, on: bool, reply: crate::a
     answer_ok(answer, reply);
 }
 
-fn edit(ctx: &Context, saved: &Saved, conversation_id: &str, message_id: &str, text: &str, reply: crate::adapters::Reply<()>) {
+fn edit(
+    ctx: &Context,
+    saved: &Saved,
+    conversation_id: &str,
+    message_id: &str,
+    text: &str,
+    reply: crate::adapters::Reply<()>,
+) {
     if !super::safe_id(message_id) {
         let _ = reply.send(Err(Refusal::Refused(super::CHECK.to_owned())));
         return;
     }
     match sealed_here(ctx, saved, conversation_id) {
         Ok(true) => {
-            let _ = reply.send(edit_sealed(ctx, saved, conversation_id, message_id, text).map_err(Refusal::Refused));
+            let _ = reply.send(
+                edit_sealed(ctx, saved, conversation_id, message_id, text)
+                    .map_err(Refusal::Refused),
+            );
             return;
         }
         Ok(false) => {}
@@ -727,13 +1079,28 @@ fn edit(ctx: &Context, saved: &Saved, conversation_id: &str, message_id: &str, t
 
 /// An edit of an encrypted message: a ciphertext of kind `edit` that names it. It keeps the
 /// message's attachments; every member's device folds it in.
-fn edit_sealed(ctx: &Context, saved: &Saved, conversation_id: &str, message_id: &str, text: &str) -> Result<(), String> {
+fn edit_sealed(
+    ctx: &Context,
+    saved: &Saved,
+    conversation_id: &str,
+    message_id: &str,
+    text: &str,
+) -> Result<(), String> {
     let device = e2ee::started(saved).ok_or(NOT_SET_UP)?;
-    let mut device = device.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut device = device
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut envelope = e2ee_core::Envelope::message(text);
     envelope.attachments = device.attachments_of(conversation_id, message_id);
     let client_id = format!("edit-{message_id}-{}", crate::hub::now());
-    device.post(conversation_id, &client_id, e2ee_core::Kind::Edit, Some(message_id), &envelope, &[])?;
+    device.post(
+        conversation_id,
+        &client_id,
+        e2ee_core::Kind::Edit,
+        Some(message_id),
+        &envelope,
+        &[],
+    )?;
     drop(device);
     if let Ok(Some(mut message)) = ctx.stored_message(conversation_id, message_id) {
         message.text = text.to_owned();
@@ -743,7 +1110,13 @@ fn edit_sealed(ctx: &Context, saved: &Saved, conversation_id: &str, message_id: 
     Ok(())
 }
 
-fn delete(ctx: &Context, saved: &Saved, conversation_id: &str, message_id: &str, reply: crate::adapters::Reply<()>) {
+fn delete(
+    ctx: &Context,
+    saved: &Saved,
+    conversation_id: &str,
+    message_id: &str,
+    reply: crate::adapters::Reply<()>,
+) {
     if !super::safe_id(message_id) {
         let _ = reply.send(Err(Refusal::Refused(super::CHECK.to_owned())));
         return;
@@ -763,14 +1136,24 @@ fn mark_read(saved: &Saved, conversation_id: &str, message_id: &str) {
         return;
     }
     let path = format!("/v1/conversations/{conversation_id}/read");
-    match super::asked("POST", saved, &path, Some(json!({ "message_id": message_id }))) {
+    match super::asked(
+        "POST",
+        saved,
+        &path,
+        Some(json!({ "message_id": message_id })),
+    ) {
         Ok((200 | 204, _)) => {}
         Ok((status, _)) => tracing::warn!("chatd: Tiny server: read answered {status}"),
         Err(detail) => tracing::warn!("chatd: Tiny server: read: {detail}"),
     }
 }
 
-fn start_direct(ctx: &Context, saved: &Saved, person_id: &str, reply: crate::adapters::Reply<String>) {
+fn start_direct(
+    ctx: &Context,
+    saved: &Saved,
+    person_id: &str,
+    reply: crate::adapters::Reply<String>,
+) {
     if !super::safe_id(person_id) {
         let _ = reply.send(Err(Refusal::Refused(super::CHECK.to_owned())));
         return;
@@ -778,7 +1161,9 @@ fn start_direct(ctx: &Context, saved: &Saved, person_id: &str, reply: crate::ada
     // A new direct message is end-to-end encrypted when this device can be in one and the server
     // allows it; a server that requires it gets nothing else.
     let mode = e2ee::started(saved).map(|device| {
-        let device = device.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let device = device
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         (device.ready(), device.mode().to_owned())
     });
     let encrypted = match mode {
@@ -789,9 +1174,18 @@ fn start_direct(ctx: &Context, saved: &Saved, person_id: &str, reply: crate::ada
         }
         _ => false,
     };
-    match super::asked("POST", saved, "/v1/directs", Some(json!({ "user_id": person_id, "e2ee": encrypted }))) {
+    match super::asked(
+        "POST",
+        saved,
+        "/v1/directs",
+        Some(json!({ "user_id": person_id, "e2ee": encrypted })),
+    ) {
         Ok((200 | 201, body)) => {
-            let id = body.get("id").and_then(Value::as_str).or_else(|| body.pointer("/direct/id").and_then(Value::as_str)).unwrap_or("");
+            let id = body
+                .get("id")
+                .and_then(Value::as_str)
+                .or_else(|| body.pointer("/direct/id").and_then(Value::as_str))
+                .unwrap_or("");
             if !super::safe_id(id) {
                 let _ = reply.send(Err(Refusal::Refused(super::UNREADABLE.to_owned())));
                 return;
@@ -809,7 +1203,9 @@ fn start_direct(ctx: &Context, saved: &Saved, person_id: &str, reply: crate::ada
             let _ = reply.send(Ok(id.to_owned()));
         }
         Ok((status, body)) => {
-            let _ = reply.send(Err(Refusal::Refused(super::explain(status, &body, super::Missing::Plain).to_owned())));
+            let _ = reply.send(Err(Refusal::Refused(
+                super::explain(status, &body, super::Missing::Plain).to_owned(),
+            )));
         }
         Err(detail) => {
             let _ = reply.send(Err(Refusal::Refused(detail.to_owned())));
@@ -823,7 +1219,9 @@ fn answer_ok(answer: Result<(u16, Value), &'static str>, reply: crate::adapters:
             let _ = reply.send(Ok(()));
         }
         Ok((status, body)) => {
-            let _ = reply.send(Err(Refusal::Refused(super::explain(status, &body, super::Missing::Plain).to_owned())));
+            let _ = reply.send(Err(Refusal::Refused(
+                super::explain(status, &body, super::Missing::Plain).to_owned(),
+            )));
         }
         Err(detail) => {
             let _ = reply.send(Err(Refusal::Refused(detail.to_owned())));
@@ -831,18 +1229,30 @@ fn answer_ok(answer: Result<(u16, Value), &'static str>, reply: crate::adapters:
     }
 }
 
-fn accept_message(ctx: &Context, saved: &Saved, conversation: &str, value: &Value) -> Result<Message, String> {
+fn accept_message(
+    ctx: &Context,
+    saved: &Saved,
+    conversation: &str,
+    value: &Value,
+) -> Result<Message, String> {
     let wire = one_wire(value).ok_or(super::UNREADABLE)?;
     let mut media = Vec::new();
     let opened = open_rows(saved, conversation, &[&wire]);
-    let message = map_message(saved, &member_names(saved), &wire, &opened, &mut media).ok_or(super::UNREADABLE)?;
+    let message = map_message(saved, &member_names(saved), &wire, &opened, &mut media)
+        .ok_or(super::UNREADABLE)?;
     if !media.is_empty() {
         let _ = ctx.media(&media);
     }
     Ok(message)
 }
 
-fn map_message(saved: &Saved, names: &HashMap<String, String>, wire: &WireMessage, opened: &HashMap<String, Read>, media: &mut Vec<(MediaFile, String)>) -> Option<Message> {
+fn map_message(
+    saved: &Saved,
+    names: &HashMap<String, String>,
+    wire: &WireMessage,
+    opened: &HashMap<String, Read>,
+    media: &mut Vec<(MediaFile, String)>,
+) -> Option<Message> {
     if !super::safe_id(&wire.id) {
         return None;
     }
@@ -850,9 +1260,24 @@ fn map_message(saved: &Saved, names: &HashMap<String, String>, wire: &WireMessag
     let sent = rfc3339(&wire.created_at).unwrap_or(0);
     let outgoing = wire.author_id == saved.user_id;
     if wire.e2ee {
-        return map_sealed(saved, names, wire, opened.get(&wire.id), deleted, sent, outgoing, media);
+        return map_sealed(
+            saved,
+            names,
+            wire,
+            opened.get(&wire.id),
+            deleted,
+            sent,
+            outgoing,
+            media,
+        );
     }
-    let mut message = Message::plain(&wire.id, name_of(names, saved, &wire.author_id), if deleted { "" } else { &wire.body }, sent, outgoing);
+    let mut message = Message::plain(
+        &wire.id,
+        name_of(names, saved, &wire.author_id),
+        if deleted { "" } else { &wire.body },
+        sent,
+        outgoing,
+    );
     message.sender.id = wire.author_id.clone();
     message.edited = present(&wire.edited_at);
     message.deleted = deleted;
@@ -879,7 +1304,12 @@ fn map_message(saved: &Saved, names: &HashMap<String, String>, wire: &WireMessag
         if reaction.count == 0 || !unicode_emoji(&reaction.emoji) {
             continue;
         }
-        message.reactions.push(Reaction { emoji: reaction.emoji.clone(), file: None, count: reaction.count, mine: reaction.me });
+        message.reactions.push(Reaction {
+            emoji: reaction.emoji.clone(),
+            file: None,
+            count: reaction.count,
+            mine: reaction.me,
+        });
     }
     Some(message)
 }
@@ -888,7 +1318,16 @@ fn map_message(saved: &Saved, names: &HashMap<String, String>, wire: &WireMessag
 /// The server's `body` is never read for one: it is empty, and a server that filled it is not
 /// believed.
 #[allow(clippy::too_many_arguments)]
-fn map_sealed(saved: &Saved, names: &HashMap<String, String>, wire: &WireMessage, read: Option<&Read>, deleted: bool, sent: i64, outgoing: bool, media: &mut Vec<(MediaFile, String)>) -> Option<Message> {
+fn map_sealed(
+    saved: &Saved,
+    names: &HashMap<String, String>,
+    wire: &WireMessage,
+    read: Option<&Read>,
+    deleted: bool,
+    sent: i64,
+    outgoing: bool,
+    media: &mut Vec<(MediaFile, String)>,
+) -> Option<Message> {
     let sender = name_of(names, saved, &wire.author_id);
     let mut message = Message::plain(&wire.id, sender, "", sent, outgoing);
     message.sender.id = wire.author_id.clone();
@@ -900,7 +1339,13 @@ fn map_sealed(saved: &Saved, names: &HashMap<String, String>, wire: &WireMessage
             Some(Read::Opened(opened)) => {
                 message.text = opened.text.clone();
                 message.edited = opened.edited_by.is_some();
-                message.reply_to = reply_of(opened.reply_to.as_ref().map(|id| Value::String(id.clone())).as_ref());
+                message.reply_to = reply_of(
+                    opened
+                        .reply_to
+                        .as_ref()
+                        .map(|id| Value::String(id.clone()))
+                        .as_ref(),
+                );
                 message.attachments = sealed_attachments(saved, opened, media);
             }
             Some(Read::Edit) => return None,
@@ -914,14 +1359,23 @@ fn map_sealed(saved: &Saved, names: &HashMap<String, String>, wire: &WireMessage
         if reaction.count == 0 || !unicode_emoji(&reaction.emoji) {
             continue;
         }
-        message.reactions.push(Reaction { emoji: reaction.emoji.clone(), file: None, count: reaction.count, mine: reaction.me });
+        message.reactions.push(Reaction {
+            emoji: reaction.emoji.clone(),
+            file: None,
+            count: reaction.count,
+            mine: reaction.me,
+        });
     }
     Some(message)
 }
 
 /// The attachments an opened message names, registered at the server's address for each sealed
 /// blob. The kind comes from what the sender says the file is; the cache checks the opened bytes.
-fn sealed_attachments(saved: &Saved, opened: &e2ee::Opened, media: &mut Vec<(MediaFile, String)>) -> Vec<Attachment> {
+fn sealed_attachments(
+    saved: &Saved,
+    opened: &e2ee::Opened,
+    media: &mut Vec<(MediaFile, String)>,
+) -> Vec<Attachment> {
     let mut out = Vec::new();
     for file in &opened.attachments {
         if !super::safe_id(&file.id) {
@@ -929,7 +1383,14 @@ fn sealed_attachments(saved: &Saved, opened: &e2ee::Opened, media: &mut Vec<(Med
         }
         let kind = match media_kind("", &file.mime) {
             // A picture is shown as one only in a format the cache checks; anything else is a file.
-            MediaKind::Image if matches!(file.mime.as_str(), "image/png" | "image/jpeg" | "image/webp") => MediaKind::Image,
+            MediaKind::Image
+                if matches!(
+                    file.mime.as_str(),
+                    "image/png" | "image/jpeg" | "image/webp"
+                ) =>
+            {
+                MediaKind::Image
+            }
             MediaKind::Gif => MediaKind::Gif,
             _ => MediaKind::File,
         };
@@ -939,7 +1400,14 @@ fn sealed_attachments(saved: &Saved, opened: &e2ee::Opened, media: &mut Vec<(Med
         stored.bytes = file.bytes;
         let mut attachment = Attachment::new(title_or(&file.name, "file"), stored);
         attachment.mime = file.mime.clone();
-        media.push((attachment.file.clone(), format!("{}/v1/media/{}", saved.base_url.trim_end_matches('/'), file.id)));
+        media.push((
+            attachment.file.clone(),
+            format!(
+                "{}/v1/media/{}",
+                saved.base_url.trim_end_matches('/'),
+                file.id
+            ),
+        ));
         out.push(attachment);
     }
     out
@@ -1009,14 +1477,21 @@ fn account_caps(saved: &Saved) -> Capabilities {
 
 /// The caps `GET /v1/server` reports. An older server, or one that does not answer, keeps the original 8 MiB and 25 MiB.
 fn upload_limits(saved: &Saved) -> UploadLimits {
-    let fallback = UploadLimits { image: protocol::TINY_IMAGE_MAX_DEFAULT as u64, file: protocol::TINY_FILE_MAX_DEFAULT as u64, archives: false };
+    let fallback = UploadLimits {
+        image: protocol::TINY_IMAGE_MAX_DEFAULT as u64,
+        file: protocol::TINY_FILE_MAX_DEFAULT as u64,
+        archives: false,
+    };
     let Ok((200, body)) = super::asked("GET", saved, "/v1/server", None) else {
         return fallback;
     };
     UploadLimits {
         image: byte_cap(&body, "image_max_bytes", fallback.image),
         file: byte_cap(&body, "file_max_bytes", fallback.file),
-        archives: body.get("allow_archives").and_then(Value::as_bool).unwrap_or(false),
+        archives: body
+            .get("allow_archives")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
     }
 }
 
@@ -1046,23 +1521,42 @@ fn fetched_url(saved: &Saved, file: &WireFile) -> String {
     if !offered.is_empty() && same_server(base, offered) {
         return offered.to_owned();
     }
-    if let Some(path) = offered.strip_prefix('/').filter(|path| !path.starts_with('/')) {
+    if let Some(path) = offered
+        .strip_prefix('/')
+        .filter(|path| !path.starts_with('/'))
+    {
         return format!("{base}/{path}");
     }
     format!("{base}/v1/media/{}", file.id)
 }
 
 fn byte_cap(body: &Value, key: &str, fallback: u64) -> u64 {
-    let Some(bytes) = body.get(key).and_then(Value::as_i64).and_then(|bytes| u64::try_from(bytes).ok()) else {
+    let Some(bytes) = body
+        .get(key)
+        .and_then(Value::as_i64)
+        .and_then(|bytes| u64::try_from(bytes).ok())
+    else {
         return fallback;
     };
     let ceiling = protocol::TINY_UPLOAD_MAX as u64;
-    if (1..=ceiling).contains(&bytes) { bytes } else { fallback }
+    if (1..=ceiling).contains(&bytes) {
+        bytes
+    } else {
+        fallback
+    }
 }
 
 fn cap_for(file: &protocol::OutgoingFile, limits: &UploadLimits) -> u64 {
-    let named = if file.name.is_empty() { file.path.as_str() } else { file.name.as_str() };
-    let ext = named.rsplit(['/', '\\', '.']).next().unwrap_or("").to_ascii_lowercase();
+    let named = if file.name.is_empty() {
+        file.path.as_str()
+    } else {
+        file.name.as_str()
+    };
+    let ext = named
+        .rsplit(['/', '\\', '.'])
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
     match ext.as_str() {
         "png" | "jpg" | "jpeg" | "webp" | "gif" => limits.image,
         _ => limits.file,
@@ -1070,25 +1564,44 @@ fn cap_for(file: &protocol::OutgoingFile, limits: &UploadLimits) -> u64 {
 }
 
 fn member_names(saved: &Saved) -> HashMap<String, String> {
-    super::members_of(saved).map(|members| members.into_iter().map(|member| (member.user_id, member.display_name)).collect()).unwrap_or_default()
+    super::members_of(saved)
+        .map(|members| {
+            members
+                .into_iter()
+                .map(|member| (member.user_id, member.display_name))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn name_of(names: &HashMap<String, String>, saved: &Saved, author: &str) -> String {
     if author == saved.user_id && !saved.display_name.is_empty() {
         return saved.display_name.clone();
     }
-    names.get(author).filter(|name| !name.is_empty()).cloned().unwrap_or_else(|| "Someone".to_owned())
+    names
+        .get(author)
+        .filter(|name| !name.is_empty())
+        .cloned()
+        .unwrap_or_else(|| "Someone".to_owned())
 }
 
 fn title_or(name: &str, fallback: &str) -> String {
-    if name.is_empty() { fallback.to_owned() } else { name.to_owned() }
+    if name.is_empty() {
+        fallback.to_owned()
+    } else {
+        name.to_owned()
+    }
 }
 
 fn present(value: &Option<String>) -> bool {
     value.as_deref().is_some_and(|text| !text.is_empty())
 }
 
-fn optional_list<T: serde::de::DeserializeOwned>(saved: &Saved, path: &str, key: &str) -> Option<Vec<T>> {
+fn optional_list<T: serde::de::DeserializeOwned>(
+    saved: &Saved,
+    path: &str,
+    key: &str,
+) -> Option<Vec<T>> {
     match super::asked("GET", saved, path, None) {
         Ok((403 | 404, _)) => Some(Vec::new()),
         Ok((200, body)) => match list_of(body, key) {
@@ -1125,11 +1638,18 @@ fn framed_message(frame: &Value) -> Option<(String, WireMessage)> {
         if !id.is_empty() {
             id.to_owned()
         } else {
-            frame.get("message").map(|message| field(message, "conversation_id").to_owned()).unwrap_or_default()
+            frame
+                .get("message")
+                .map(|message| field(message, "conversation_id").to_owned())
+                .unwrap_or_default()
         }
     };
     let wire = one_wire(frame.get("message").unwrap_or(frame))?;
-    if conversation.is_empty() { None } else { Some((conversation, wire)) }
+    if conversation.is_empty() {
+        None
+    } else {
+        Some((conversation, wire))
+    }
 }
 
 fn nested_value(frame: &Value, key: &str) -> Option<Value> {
@@ -1141,8 +1661,15 @@ fn nested_id<'a>(frame: &'a Value, object: &str, field_name: &str) -> Option<&'a
     if !id.is_empty() {
         return Some(id);
     }
-    let id = frame.get(object).map(|value| field(value, "id")).unwrap_or("");
-    if id.is_empty() { None } else { Some(id) }
+    let id = frame
+        .get(object)
+        .map(|value| field(value, "id"))
+        .unwrap_or("");
+    if id.is_empty() {
+        None
+    } else {
+        Some(id)
+    }
 }
 
 fn nested_str<'a>(frame: &'a Value, key: &str) -> &'a str {
@@ -1150,7 +1677,10 @@ fn nested_str<'a>(frame: &'a Value, key: &str) -> &'a str {
     if !id.is_empty() {
         return id;
     }
-    frame.get("message").map(|message| field(message, key)).unwrap_or("")
+    frame
+        .get("message")
+        .map(|message| field(message, key))
+        .unwrap_or("")
 }
 
 fn field<'a>(value: &'a Value, key: &str) -> &'a str {
@@ -1163,13 +1693,27 @@ fn reply_of(value: Option<&Value>) -> Option<ReplyTo> {
         Value::Object(map) => map.get("id").and_then(Value::as_str)?.to_owned(),
         _ => return None,
     };
-    if id.is_empty() { None } else { Some(ReplyTo { id, sender: String::new(), snippet: String::new(), person: None, deleted: false }) }
+    if id.is_empty() {
+        None
+    } else {
+        Some(ReplyTo {
+            id,
+            sender: String::new(),
+            snippet: String::new(),
+            person: None,
+            deleted: false,
+        })
+    }
 }
 
 fn as_u32(value: &Value) -> u32 {
     match value {
         Value::Bool(on) => u32::from(*on),
-        Value::Number(number) => number.as_u64().or_else(|| number.as_f64().map(|number| number.max(0.0) as u64)).unwrap_or(0).min(u32::MAX as u64) as u32,
+        Value::Number(number) => number
+            .as_u64()
+            .or_else(|| number.as_f64().map(|number| number.max(0.0) as u64))
+            .unwrap_or(0)
+            .min(u32::MAX as u64) as u32,
         Value::String(text) => text.parse().unwrap_or(0),
         _ => 0,
     }
@@ -1177,7 +1721,10 @@ fn as_u32(value: &Value) -> u32 {
 
 fn as_u64(value: &Value) -> u64 {
     match value {
-        Value::Number(number) => number.as_u64().or_else(|| number.as_f64().map(|number| number.max(0.0) as u64)).unwrap_or(0),
+        Value::Number(number) => number
+            .as_u64()
+            .or_else(|| number.as_f64().map(|number| number.max(0.0) as u64))
+            .unwrap_or(0),
         Value::String(text) => text.parse().unwrap_or(0),
         _ => 0,
     }
@@ -1204,7 +1751,12 @@ fn rfc3339(text: &str) -> Option<i64> {
     }
     let bytes = text.as_bytes();
     let tee = bytes.get(10).copied()?;
-    if bytes[4] != b'-' || bytes[7] != b'-' || (tee != b'T' && tee != b't') || bytes[13] != b':' || bytes[16] != b':' {
+    if bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || (tee != b'T' && tee != b't')
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+    {
         return None;
     }
     let year: i32 = text[0..4].parse().ok()?;
@@ -1213,12 +1765,20 @@ fn rfc3339(text: &str) -> Option<i64> {
     let hour: u32 = text[11..13].parse().ok()?;
     let minute: u32 = text[14..16].parse().ok()?;
     let second: u32 = text[17..19].parse().ok()?;
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || minute > 59 || second > 60 {
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
         return None;
     }
     let mut rest = &text[19..];
     if let Some(stripped) = rest.strip_prefix('.') {
-        let digits = stripped.chars().take_while(|ch| ch.is_ascii_digit()).count();
+        let digits = stripped
+            .chars()
+            .take_while(|ch| ch.is_ascii_digit())
+            .count();
         if digits == 0 {
             return None;
         }
@@ -1226,7 +1786,10 @@ fn rfc3339(text: &str) -> Option<i64> {
     }
     let offset = if rest == "Z" || rest == "z" {
         0
-    } else if rest.len() == 6 && (rest.starts_with('+') || rest.starts_with('-')) && rest.as_bytes()[3] == b':' {
+    } else if rest.len() == 6
+        && (rest.starts_with('+') || rest.starts_with('-'))
+        && rest.as_bytes()[3] == b':'
+    {
         let sign = if rest.starts_with('+') { 1 } else { -1 };
         let hours: i64 = rest[1..3].parse().ok()?;
         let mins: i64 = rest[4..6].parse().ok()?;
@@ -1409,36 +1972,57 @@ mod tests {
     }
 
     fn open_ctx() -> (crate::adapters::Adapter, Context) {
-        let hub = Arc::new(Hub::new(Store::open(std::path::Path::new(":memory:")).expect("store")));
-        let account = AccountKey { network: Network::Tiny, account: ME.to_owned() };
+        let hub = Arc::new(Hub::new(
+            Store::open(std::path::Path::new(":memory:")).expect("store"),
+        ));
+        let account = AccountKey {
+            network: Network::Tiny,
+            account: ME.to_owned(),
+        };
         let (adapter, ctx, _inbox) = local(account, hub);
         (adapter, ctx)
     }
 
     fn lists(request: &str) -> Vec<u8> {
         if request.starts_with("GET /v1/channels ") {
-            return http(200, "OK", &format!(
-                r#"{{"channels":[{{"id":"channel-1","name":"general","topic":"Hello","category_id":"cat-1","category_name":"Text","position":1,"unread":2,"last_message":{{"id":"c-9","author_id":"{PEER}","body":"hey","created_at":"{WHEN}"}}}}]}}"#
-            ));
+            return http(
+                200,
+                "OK",
+                &format!(
+                    r#"{{"channels":[{{"id":"channel-1","name":"general","topic":"Hello","category_id":"cat-1","category_name":"Text","position":1,"unread":2,"last_message":{{"id":"c-9","author_id":"{PEER}","body":"hey","created_at":"{WHEN}"}}}}]}}"#
+                ),
+            );
         }
         if request.starts_with("GET /v1/directs ") {
-            return http(200, "OK", &format!(
-                r#"{{"directs":[{{"id":"direct-1","peer":{{"user_id":"{PEER}","display_name":"Bea"}},"unread":1,"last_read":"m-1","last_message":{{"id":"m-2","author_id":"{ME}","body":"mine","created_at":"{WHEN}"}}}}]}}"#
-            ));
+            return http(
+                200,
+                "OK",
+                &format!(
+                    r#"{{"directs":[{{"id":"direct-1","peer":{{"user_id":"{PEER}","display_name":"Bea"}},"unread":1,"last_read":"m-1","last_message":{{"id":"m-2","author_id":"{ME}","body":"mine","created_at":"{WHEN}"}}}}]}}"#
+                ),
+            );
         }
         if request.starts_with("GET /v1/rooms ") {
             return http(200, "OK", r#"[{"id":"room-1","name":"Lounge"}]"#);
         }
         if request.starts_with("GET /v1/members ") {
-            return http(200, "OK", &format!(
-                r#"[{{"user_id":"{ME}","email":"ada@example.com","display_name":"Ada","role":"owner","created_at":"{WHEN}"}},{{"user_id":"{PEER}","email":"bea@example.com","display_name":"Bea","role":"member","created_at":"{WHEN}"}}]"#
-            ));
+            return http(
+                200,
+                "OK",
+                &format!(
+                    r#"[{{"user_id":"{ME}","email":"ada@example.com","display_name":"Ada","role":"owner","created_at":"{WHEN}"}},{{"user_id":"{PEER}","email":"bea@example.com","display_name":"Bea","role":"member","created_at":"{WHEN}"}}]"#
+                ),
+            );
         }
         http(404, "Not Found", "{}")
     }
 
-    fn fixture(more: impl Fn(&str) -> Option<Vec<u8>> + Send + 'static) -> (crate::adapters::Adapter, Context, Saved) {
-        let base = super::super::tests::serve(move |request| more(request).unwrap_or_else(|| lists(request)));
+    fn fixture(
+        more: impl Fn(&str) -> Option<Vec<u8>> + Send + 'static,
+    ) -> (crate::adapters::Adapter, Context, Saved) {
+        let base = super::super::tests::serve(move |request| {
+            more(request).unwrap_or_else(|| lists(request))
+        });
         let saved = saved(&base);
         let (adapter, ctx) = open_ctx();
         refresh(&ctx, &saved);
@@ -1476,7 +2060,11 @@ mod tests {
         let room = ctx.known("room-1").unwrap().unwrap();
         assert_eq!(room.kind, ConversationKind::Voice);
         assert_eq!(room.call, CallSupport::Native);
-        let (rows, _) = ctx.hub.store().inbox(Some(Network::Tiny), InboxFilter::All, 0, 20, &[]).unwrap();
+        let (rows, _) = ctx
+            .hub
+            .store()
+            .inbox(Some(Network::Tiny), InboxFilter::All, 0, 20, &[])
+            .unwrap();
         assert!(rows.iter().any(|row| row.key.id == "direct-1"));
     }
 
@@ -1484,7 +2072,11 @@ mod tests {
     fn the_composer_uses_the_servers_upload_caps() {
         let (_adapter, ctx, saved) = fixture(|request| {
             if request.starts_with("GET /v1/server ") {
-                return Some(http(200, "OK", r#"{"name":"Tiny","image_max_bytes":1048576,"file_max_bytes":2097152}"#));
+                return Some(http(
+                    200,
+                    "OK",
+                    r#"{"name":"Tiny","image_max_bytes":1048576,"file_max_bytes":2097152}"#,
+                ));
             }
             None
         });
@@ -1497,33 +2089,59 @@ mod tests {
     #[test]
     fn a_message_page_is_stored_oldest_first() {
         let (_adapter, ctx, saved) = fixture(|request| {
-            if request.starts_with("GET /v1/conversations/channel-1/messages?") && request.contains("limit=50") {
-                return Some(http(200, "OK", &format!(
-                    r#"{{"messages":[{{"id":"a-1","author_id":"{PEER}","body":"first","created_at":"2024-01-02T03:04:05Z"}},{{"id":"a-2","author_id":"{ME}","body":"second","created_at":"2024-01-02T03:05:05Z"}}]}}"#
-                )));
+            if request.starts_with("GET /v1/conversations/channel-1/messages?")
+                && request.contains("limit=50")
+            {
+                return Some(http(
+                    200,
+                    "OK",
+                    &format!(
+                        r#"{{"messages":[{{"id":"a-1","author_id":"{PEER}","body":"first","created_at":"2024-01-02T03:04:05Z"}},{{"id":"a-2","author_id":"{ME}","body":"second","created_at":"2024-01-02T03:05:05Z"}}]}}"#
+                    ),
+                ));
             }
             None
         });
         load_page(&ctx, &saved, "channel-1", None, PAGE);
-        let page = ctx.hub.store().messages(&ctx.key("channel-1"), &Page::Newest, 10, 1_800_000_000).unwrap().unwrap();
-        assert_eq!(page.messages.iter().map(|message| message.id.as_str()).collect::<Vec<_>>(), ["a-1", "a-2"]);
+        let page = ctx
+            .hub
+            .store()
+            .messages(&ctx.key("channel-1"), &Page::Newest, 10, 1_800_000_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            page.messages
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a-1", "a-2"]
+        );
         assert_eq!(page.messages[0].text, "first");
         assert!(!page.messages[0].outgoing);
         assert!(page.messages[1].outgoing);
     }
 
     #[test]
-    fn an_encrypted_conversation_is_labelled_its_rows_never_read_the_servers_body_and_nothing_goes_plain() {
+    fn an_encrypted_conversation_is_labelled_its_rows_never_read_the_servers_body_and_nothing_goes_plain(
+    ) {
         let posted = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let seen = posted.clone();
         let (_adapter, ctx, saved) = fixture(move |request| {
             if request.starts_with("GET /v1/channels ") {
-                return Some(http(200, "OK", r#"{"channels":[{"id":"sealed-1","name":"secret","e2ee":true},{"id":"plain-1","name":"open"}]}"#));
+                return Some(http(
+                    200,
+                    "OK",
+                    r#"{"channels":[{"id":"sealed-1","name":"secret","e2ee":true},{"id":"plain-1","name":"open"}]}"#,
+                ));
             }
             if request.starts_with("GET /v1/conversations/sealed-1/messages?") {
-                return Some(http(200, "OK", &format!(
-                    r#"{{"messages":[{{"id":"s-1","author_id":"{PEER}","body":"what the server says","e2ee":true,"kind":"message","ciphertext":"AAAA","epoch":3,"device_id":"d-1","created_at":"{WHEN}"}}]}}"#
-                )));
+                return Some(http(
+                    200,
+                    "OK",
+                    &format!(
+                        r#"{{"messages":[{{"id":"s-1","author_id":"{PEER}","body":"what the server says","e2ee":true,"kind":"message","ciphertext":"AAAA","epoch":3,"device_id":"d-1","created_at":"{WHEN}"}}]}}"#
+                    ),
+                ));
             }
             if request.starts_with("POST /v1/conversations/") {
                 seen.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -1532,15 +2150,34 @@ mod tests {
         });
         let encryption = |id: &str| ctx.known(id).unwrap().unwrap().encryption;
         assert_eq!(encryption("sealed-1"), Encryption::EndToEnd);
-        assert_eq!(encryption("plain-1"), Encryption::Plain, "a plaintext channel says so, and is never called encrypted");
+        assert_eq!(
+            encryption("plain-1"),
+            Encryption::Plain,
+            "a plaintext channel says so, and is never called encrypted"
+        );
         assert_eq!(encryption("direct-1"), Encryption::Plain);
         load_page(&ctx, &saved, "sealed-1", None, PAGE);
         let stored = ctx.stored_message("sealed-1", "s-1").unwrap().unwrap();
-        assert_eq!(stored.text, protocol::UNDECRYPTABLE, "never a blank, and never the server's body");
+        assert_eq!(
+            stored.text,
+            protocol::UNDECRYPTABLE,
+            "never a blank, and never the server's body"
+        );
         assert_eq!(stored.seal, Seal::Undecryptable);
-        let outcome = post_message(&ctx, &saved, "sealed-1", "client-9", "secret words", None, &[]);
+        let outcome = post_message(
+            &ctx,
+            &saved,
+            "sealed-1",
+            "client-9",
+            "secret words",
+            None,
+            &[],
+        );
         assert_eq!(outcome.err().as_deref(), Some(NOT_SET_UP));
-        assert!(!posted.load(std::sync::atomic::Ordering::SeqCst), "nothing was posted in plain text");
+        assert!(
+            !posted.load(std::sync::atomic::Ordering::SeqCst),
+            "nothing was posted in plain text"
+        );
     }
 
     #[test]
@@ -1549,19 +2186,29 @@ mod tests {
             if request.starts_with("POST /v1/conversations/direct-1/messages ") {
                 assert!(request.contains("client-1"), "{request}");
                 assert!(request.contains("hi"), "{request}");
-                return Some(http(201, "Created", &format!(
-                    r#"{{"id":"server-1","author_id":"{ME}","body":"hi","client_id":"client-1","created_at":"{WHEN}"}}"#
-                )));
+                return Some(http(
+                    201,
+                    "Created",
+                    &format!(
+                        r#"{{"id":"server-1","author_id":"{ME}","body":"hi","client_id":"client-1","created_at":"{WHEN}"}}"#
+                    ),
+                ));
             }
             None
         });
         let mut pending = Message::plain("client-1", "Ada", "hi", 1_704_164_645, true);
         pending.sender.id = ME.to_owned();
         pending.state = SendState::Pending;
-        ctx.hub.store().ingest(&ctx.key("direct-1"), &pending, false).unwrap();
+        ctx.hub
+            .store()
+            .ingest(&ctx.key("direct-1"), &pending, false)
+            .unwrap();
         let outcome = post_message(&ctx, &saved, "direct-1", "client-1", "hi", None, &[]);
         ctx.sent("direct-1", "client-1", outcome);
-        assert!(ctx.stored_message("direct-1", "client-1").unwrap().is_none());
+        assert!(ctx
+            .stored_message("direct-1", "client-1")
+            .unwrap()
+            .is_none());
         let stored = ctx.stored_message("direct-1", "server-1").unwrap().unwrap();
         assert_eq!(stored.text, "hi");
         assert_eq!(stored.client_id.as_deref(), Some("client-1"));
@@ -1571,15 +2218,22 @@ mod tests {
     fn an_edit_replaces_the_text() {
         let (_adapter, ctx, saved) = fixture(|request| {
             if request.starts_with("PATCH /v1/messages/e-1 ") {
-                return Some(http(200, "OK", &format!(
-                    r#"{{"id":"e-1","author_id":"{ME}","body":"changed","created_at":"{WHEN}","edited_at":"2024-01-02T04:04:05Z"}}"#
-                )));
+                return Some(http(
+                    200,
+                    "OK",
+                    &format!(
+                        r#"{{"id":"e-1","author_id":"{ME}","body":"changed","created_at":"{WHEN}","edited_at":"2024-01-02T04:04:05Z"}}"#
+                    ),
+                ));
             }
             None
         });
         let mut message = Message::plain("e-1", "Ada", "before", 1_704_164_645, true);
         message.sender.id = ME.to_owned();
-        ctx.hub.store().ingest(&ctx.key("direct-1"), &message, false).unwrap();
+        ctx.hub
+            .store()
+            .ingest(&ctx.key("direct-1"), &message, false)
+            .unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         edit(&ctx, &saved, "direct-1", "e-1", "changed", tx);
         assert_eq!(rx.recv().unwrap(), Ok(()));
@@ -1593,21 +2247,47 @@ mod tests {
         let (_adapter, ctx, saved) = fixture(|_| None);
         let mut message = Message::plain("r-1", "Ada", "hi", 1_704_164_645, true);
         message.sender.id = ME.to_owned();
-        ctx.hub.store().ingest(&ctx.key("direct-1"), &message, false).unwrap();
-        on_live(&ctx, &saved, &HashMap::new(), "reaction.updated", &json!({
-            "conversation_id": "direct-1", "message_id": "r-1", "emoji": "ok", "on": true, "user_id": PEER, "count": 4
-        }));
-        assert!(ctx.stored_message("direct-1", "r-1").unwrap().unwrap().reactions.is_empty());
-        on_live(&ctx, &saved, &HashMap::new(), "reaction.updated", &json!({
-            "conversation_id": "direct-1", "message_id": "r-1", "emoji": "👍", "on": true, "user_id": PEER, "count": 5
-        }));
+        ctx.hub
+            .store()
+            .ingest(&ctx.key("direct-1"), &message, false)
+            .unwrap();
+        on_live(
+            &ctx,
+            &saved,
+            &HashMap::new(),
+            "reaction.updated",
+            &json!({
+                "conversation_id": "direct-1", "message_id": "r-1", "emoji": "ok", "on": true, "user_id": PEER, "count": 4
+            }),
+        );
+        assert!(ctx
+            .stored_message("direct-1", "r-1")
+            .unwrap()
+            .unwrap()
+            .reactions
+            .is_empty());
+        on_live(
+            &ctx,
+            &saved,
+            &HashMap::new(),
+            "reaction.updated",
+            &json!({
+                "conversation_id": "direct-1", "message_id": "r-1", "emoji": "👍", "on": true, "user_id": PEER, "count": 5
+            }),
+        );
         let stored = ctx.stored_message("direct-1", "r-1").unwrap().unwrap();
         assert_eq!(stored.reactions.len(), 1);
         assert_eq!(stored.reactions[0].count, 5);
         assert!(!stored.reactions[0].mine);
-        on_live(&ctx, &saved, &HashMap::new(), "reaction.updated", &json!({
-            "conversation_id": "direct-1", "message_id": "r-1", "emoji": "👍", "on": true, "user_id": ME, "count": 6
-        }));
+        on_live(
+            &ctx,
+            &saved,
+            &HashMap::new(),
+            "reaction.updated",
+            &json!({
+                "conversation_id": "direct-1", "message_id": "r-1", "emoji": "👍", "on": true, "user_id": ME, "count": 6
+            }),
+        );
         let stored = ctx.stored_message("direct-1", "r-1").unwrap().unwrap();
         assert_eq!(stored.reactions[0].count, 6);
         assert!(stored.reactions[0].mine);
@@ -1618,27 +2298,46 @@ mod tests {
         let (_adapter, ctx, saved) = fixture(|_| None);
         assert!(ctx.known("direct-1").unwrap().unwrap().preview_mine);
         assert!(!ctx.known("direct-1").unwrap().unwrap().seen);
-        on_live(&ctx, &saved, &HashMap::new(), "read.updated", &json!({
-            "conversation_id": "direct-1", "user_id": PEER, "message_id": "m-2"
-        }));
+        on_live(
+            &ctx,
+            &saved,
+            &HashMap::new(),
+            "read.updated",
+            &json!({
+                "conversation_id": "direct-1", "user_id": PEER, "message_id": "m-2"
+            }),
+        );
         assert!(ctx.known("direct-1").unwrap().unwrap().seen);
-        on_live(&ctx, &saved, &HashMap::new(), "read.updated", &json!({
-            "conversation_id": "direct-1", "user_id": ME, "message_id": "m-2"
-        }));
-        assert_eq!(ctx.known("direct-1").unwrap().unwrap().last_read.as_deref(), Some("m-2"));
+        on_live(
+            &ctx,
+            &saved,
+            &HashMap::new(),
+            "read.updated",
+            &json!({
+                "conversation_id": "direct-1", "user_id": ME, "message_id": "m-2"
+            }),
+        );
+        assert_eq!(
+            ctx.known("direct-1").unwrap().unwrap().last_read.as_deref(),
+            Some("m-2")
+        );
     }
 
     #[test]
     fn gif_and_video_attachments_keep_their_kind() {
         let (_adapter, ctx, saved) = fixture(|request| {
             if request.starts_with("GET /v1/conversations/channel-1/messages?") {
-                return Some(http(200, "OK", &format!(
-                    r#"{{"messages":[{{"id":"g-1","author_id":"{PEER}","body":"","created_at":"{WHEN}","attachments":[
+                return Some(http(
+                    200,
+                    "OK",
+                    &format!(
+                        r#"{{"messages":[{{"id":"g-1","author_id":"{PEER}","body":"","created_at":"{WHEN}","attachments":[
                         {{"id":"gif-1","name":"a.gif","mime":"image/gif","kind":"gif","bytes":12,"width":10,"height":8}},
                         {{"id":"vid-1","name":"a.mp4","mime":"video/mp4","kind":"video","bytes":40,"width":100,"height":80,"duration":3}},
                         {{"id":"gif-2","name":"b.gif","mime":"image/gif","kind":"","bytes":4,"width":2,"height":2}}
                     ]}}]}}"#
-                )));
+                    ),
+                ));
             }
             None
         });
@@ -1657,28 +2356,59 @@ mod tests {
         let saved = saved(&base);
         let (_adapter, ctx) = open_ctx();
         let (page_tx, page_rx) = std::sync::mpsc::channel();
-        serve(&ctx, &saved, &Live::new().unwrap(), Command::Catalog {
-            kind: CatalogKind::Gifs,
-            space_id: None,
-            query: String::new(),
-            cursor: None,
-            reply: page_tx,
-        });
+        serve(
+            &ctx,
+            &saved,
+            &Live::new().unwrap(),
+            Command::Catalog {
+                kind: CatalogKind::Gifs,
+                space_id: None,
+                query: String::new(),
+                cursor: None,
+                reply: page_tx,
+            },
+        );
         assert!(page_rx.recv().unwrap().unwrap().items.is_empty());
         let (rules_tx, rules_rx) = std::sync::mpsc::channel();
-        serve(&ctx, &saved, &Live::new().unwrap(), Command::ReactionRules { conversation_id: "direct-1".into(), reply: rules_tx });
+        serve(
+            &ctx,
+            &saved,
+            &Live::new().unwrap(),
+            Command::ReactionRules {
+                conversation_id: "direct-1".into(),
+                reply: rules_tx,
+            },
+        );
         let rules = rules_rx.recv().unwrap().unwrap();
         assert!(rules.offers("👍", false));
         assert!(!rules.offers("custom", true));
         let (ok_tx, ok_rx) = std::sync::mpsc::channel();
         let url = format!("{base}/v1/media/gif-1");
-        serve(&ctx, &saved, &Live::new().unwrap(), Command::Download { id: "gif-1".into(), url: url.clone(), reply: ok_tx });
+        serve(
+            &ctx,
+            &saved,
+            &Live::new().unwrap(),
+            Command::Download {
+                id: "gif-1".into(),
+                url: url.clone(),
+                reply: ok_tx,
+            },
+        );
         let download = ok_rx.recv().unwrap().unwrap();
         assert_eq!(download.url, url);
         assert_eq!(download.headers[0].0, "Authorization");
         assert!(download.headers[0].1.starts_with("Bearer "));
         let (no_tx, no_rx) = std::sync::mpsc::channel();
-        serve(&ctx, &saved, &Live::new().unwrap(), Command::Download { id: "x".into(), url: "https://evil.example/v1/media/x".into(), reply: no_tx });
+        serve(
+            &ctx,
+            &saved,
+            &Live::new().unwrap(),
+            Command::Download {
+                id: "x".into(),
+                url: "https://evil.example/v1/media/x".into(),
+                reply: no_tx,
+            },
+        );
         assert!(no_rx.recv().unwrap().is_err());
     }
 
@@ -1701,7 +2431,10 @@ mod tests {
         .unwrap();
         let mut media = Vec::new();
         map_message(&saved, &HashMap::new(), &wire, &HashMap::new(), &mut media).unwrap();
-        assert_eq!(media[0].1, "https://chat.example/v1/media/file-1?ex=1&is=2&hm=ab");
+        assert_eq!(
+            media[0].1,
+            "https://chat.example/v1/media/file-1?ex=1&is=2&hm=ab"
+        );
         let foreign: WireMessage = serde_json::from_value(json!({
             "id": "m-2",
             "author_id": ME,
@@ -1709,12 +2442,28 @@ mod tests {
         }))
         .unwrap();
         let mut media = Vec::new();
-        map_message(&saved, &HashMap::new(), &foreign, &HashMap::new(), &mut media).unwrap();
+        map_message(
+            &saved,
+            &HashMap::new(),
+            &foreign,
+            &HashMap::new(),
+            &mut media,
+        )
+        .unwrap();
         assert_eq!(media[0].1, "https://chat.example/v1/media/file-2");
         let (_adapter, ctx) = open_ctx();
         let (tx, rx) = std::sync::mpsc::channel();
         let url = "https://chat.example/v1/media/file-1?ex=1&is=2&hm=ab";
-        serve(&ctx, &saved, &Live::new().unwrap(), Command::Download { id: "file-1".into(), url: url.into(), reply: tx });
+        serve(
+            &ctx,
+            &saved,
+            &Live::new().unwrap(),
+            Command::Download {
+                id: "file-1".into(),
+                url: url.into(),
+                reply: tx,
+            },
+        );
         let download = rx.recv().unwrap().unwrap();
         assert_eq!(download.url, url);
         assert_eq!(download.headers[0].0, "Authorization");
@@ -1745,7 +2494,16 @@ mod tests {
         assert_eq!(media[0].1, joined);
         let (_adapter, ctx) = open_ctx();
         let (tx, rx) = std::sync::mpsc::channel();
-        serve(&ctx, &saved, &Live::new().unwrap(), Command::Download { id: "file-1".into(), url: joined.clone(), reply: tx });
+        serve(
+            &ctx,
+            &saved,
+            &Live::new().unwrap(),
+            Command::Download {
+                id: "file-1".into(),
+                url: joined.clone(),
+                reply: tx,
+            },
+        );
         let download = rx.recv().unwrap().unwrap();
         assert_eq!(download.url, joined);
         assert_eq!(download.headers[0].0, "Authorization");
@@ -1765,10 +2523,17 @@ mod tests {
         std::fs::write(&path, b"%PDF-1.1\n").unwrap();
         let (_adapter, ctx, saved) = fixture(move |request| {
             if request.starts_with("GET /v1/server ") {
-                return Some(http(200, "OK", r#"{"name":"Tiny","image_max_bytes":8388608,"file_max_bytes":26214400}"#));
+                return Some(http(
+                    200,
+                    "OK",
+                    r#"{"name":"Tiny","image_max_bytes":8388608,"file_max_bytes":26214400}"#,
+                ));
             }
             if request.starts_with("POST /v1/media ") {
-                if request.to_ascii_lowercase().contains("authorization: bearer t") {
+                if request
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer t")
+                {
                     bearer_flag.store(true, Ordering::Relaxed);
                 }
                 return Some(http(403, "Forbidden", r#"{"error":"blocked"}"#));
@@ -1782,7 +2547,10 @@ mod tests {
         let mut pending = Message::plain("client-9", "Ada", "hi", 1, true);
         pending.sender.id = ME.to_owned();
         pending.state = SendState::Pending;
-        ctx.hub.store().ingest(&ctx.key("direct-1"), &pending, false).unwrap();
+        ctx.hub
+            .store()
+            .ingest(&ctx.key("direct-1"), &pending, false)
+            .unwrap();
         let outgoing = Outgoing {
             files: vec![protocol::OutgoingFile {
                 path: path.to_string_lossy().into_owned(),
@@ -1793,7 +2561,15 @@ mod tests {
             }],
             ..Outgoing::default()
         };
-        send_with(&ctx, &saved, "direct-1".into(), "client-9".into(), "hi".into(), None, outgoing);
+        send_with(
+            &ctx,
+            &saved,
+            "direct-1".into(),
+            "client-9".into(),
+            "hi".into(),
+            None,
+            outgoing,
+        );
         let started = std::time::Instant::now();
         let mut failed = None;
         while started.elapsed() < std::time::Duration::from_secs(5) {
@@ -1807,7 +2583,13 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(failed.as_deref(), Some("Tiny blocked that file"));
-        assert!(bearer.load(Ordering::Relaxed), "the upload keeps the bearer");
-        assert!(!posted.load(Ordering::Relaxed), "a blocked upload must not post the message");
+        assert!(
+            bearer.load(Ordering::Relaxed),
+            "the upload keeps the bearer"
+        );
+        assert!(
+            !posted.load(Ordering::Relaxed),
+            "a blocked upload must not post the message"
+        );
     }
 }

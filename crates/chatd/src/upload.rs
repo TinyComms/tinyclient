@@ -104,11 +104,19 @@ pub enum Method {
 
 impl Target {
     pub fn put(url: impl Into<String>) -> Target {
-        Target { method: Method::Put, url: url.into(), headers: Vec::new() }
+        Target {
+            method: Method::Put,
+            url: url.into(),
+            headers: Vec::new(),
+        }
     }
 
     pub fn post(url: impl Into<String>) -> Target {
-        Target { method: Method::Post, url: url.into(), headers: Vec::new() }
+        Target {
+            method: Method::Post,
+            url: url.into(),
+            headers: Vec::new(),
+        }
     }
 
     pub fn header(mut self, name: &str, value: &str) -> Target {
@@ -188,11 +196,26 @@ pub struct Upload {
 impl Upload {
     /// The files of a `SendWith`, opened and checked. Progress goes to `Context::upload`; the
     /// adapter stopping counts as a cancel.
-    pub fn new(ctx: &Context, conversation_id: &str, client_id: &str, files: &[OutgoingFile]) -> Result<Upload, String> {
-        let (told, conversation, client) = (ctx.clone(), conversation_id.to_owned(), client_id.to_owned());
+    pub fn new(
+        ctx: &Context,
+        conversation_id: &str,
+        client_id: &str,
+        files: &[OutgoingFile],
+    ) -> Result<Upload, String> {
+        let (told, conversation, client) = (
+            ctx.clone(),
+            conversation_id.to_owned(),
+            client_id.to_owned(),
+        );
         let report = move |sent, total| told.upload(&conversation, &client, sent, total);
         let halted = ctx.clone();
-        Upload::open(&ctx.account, client_id, files, Box::new(report), Box::new(move || halted.stopped()))
+        Upload::open(
+            &ctx.account,
+            client_id,
+            files,
+            Box::new(report),
+            Box::new(move || halted.stopped()),
+        )
     }
 
     /// The same without a `Context`: progress goes to `report` as `(sent, total)`.
@@ -202,15 +225,28 @@ impl Upload {
         files: &[OutgoingFile],
         report: impl FnMut(u64, u64) + Send + 'static,
     ) -> Result<Upload, String> {
-        Upload::open(account, client_id, files, Box::new(report), Box::new(|| false))
+        Upload::open(
+            account,
+            client_id,
+            files,
+            Box::new(report),
+            Box::new(|| false),
+        )
     }
 
-    fn open(account: &AccountKey, client_id: &str, files: &[OutgoingFile], report: Report, halted: Halted) -> Result<Upload, String> {
+    fn open(
+        account: &AccountKey,
+        client_id: &str,
+        files: &[OutgoingFile],
+        report: Report,
+        halted: Halted,
+    ) -> Result<Upload, String> {
         let mut sources = Vec::with_capacity(files.len());
         for staged in files {
             let name = shown(staged);
             let (path, outbox) = allowed(&staged.path).map_err(|why| format!("{name} {why}"))?;
-            let unreadable = |err: std::io::Error| format!("{name} could not be read: {}.", plain(&err));
+            let unreadable =
+                |err: std::io::Error| format!("{name} could not be read: {}.", plain(&err));
             let file = File::open(&path).map_err(unreadable)?;
             let meta = file.metadata().map_err(unreadable)?;
             if !meta.is_file() {
@@ -289,7 +325,13 @@ impl Upload {
     }
 
     /// `len` bytes of file `at` from `start`, with `Content-Range`.
-    pub fn send_range(&mut self, at: usize, target: &Target, start: u64, len: u64) -> Result<Answer, String> {
+    pub fn send_range(
+        &mut self,
+        at: usize,
+        target: &Target,
+        start: u64,
+        len: u64,
+    ) -> Result<Answer, String> {
         let bytes = self.files[at].bytes;
         let len = len.min(bytes.saturating_sub(start));
         let range = match len {
@@ -301,11 +343,23 @@ impl Upload {
     }
 
     /// File `at` as the form field `field`, after the text fields `fields`.
-    pub fn send_form(&mut self, at: usize, target: &Target, field: &str, fields: &[(&str, &str)]) -> Result<Answer, String> {
-        let boundary = format!("tinyclient-{:016x}", fnv(&format!("{}{}{at}", self.client_id, self.files[at].name)));
+    pub fn send_form(
+        &mut self,
+        at: usize,
+        target: &Target,
+        field: &str,
+        fields: &[(&str, &str)],
+    ) -> Result<Answer, String> {
+        let boundary = format!(
+            "tinyclient-{:016x}",
+            fnv(&format!("{}{}{at}", self.client_id, self.files[at].name))
+        );
         let mut head = String::new();
         for (name, value) in fields {
-            head.push_str(&format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{}\"\r\n\r\n{value}\r\n", quoted(name)));
+            head.push_str(&format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"{}\"\r\n\r\n{value}\r\n",
+                quoted(name)
+            ));
         }
         let source = &self.files[at];
         head.push_str(&format!(
@@ -315,7 +369,10 @@ impl Upload {
             source.mime
         ));
         let tail = format!("\r\n--{boundary}--\r\n");
-        let target = target.clone().header("Content-Type", &format!("multipart/form-data; boundary={boundary}"));
+        let target = target.clone().header(
+            "Content-Type",
+            &format!("multipart/form-data; boundary={boundary}"),
+        );
         let bytes = source.bytes;
         self.stream(at, &target, 0, bytes, head.into_bytes(), tail.into_bytes())
     }
@@ -323,14 +380,24 @@ impl Upload {
     /// File `at` in parts of `size` bytes (at most [`LARGEST_PART`]), from part `from`, each
     /// handed to `each` in order. One buffer of `size` is held, whatever the file's size. A
     /// cancel is honored between parts.
-    pub fn parts(&mut self, at: usize, size: usize, from: u32, mut each: impl FnMut(Part) -> Result<(), String>) -> Result<(), String> {
+    pub fn parts(
+        &mut self,
+        at: usize,
+        size: usize,
+        from: u32,
+        mut each: impl FnMut(Part) -> Result<(), String>,
+    ) -> Result<(), String> {
         let size = size.clamp(1, LARGEST_PART);
         let name = self.files[at].name.clone();
         let bytes = self.files[at].bytes;
         let count = bytes.div_ceil(size as u64).max(1) as u32;
         let start = from as u64 * size as u64;
-        let unreadable = |err: std::io::Error| format!("{name} could not be read: {}.", plain(&err));
-        self.files[at].file.seek(SeekFrom::Start(start.min(bytes))).map_err(unreadable)?;
+        let unreadable =
+            |err: std::io::Error| format!("{name} could not be read: {}.", plain(&err));
+        self.files[at]
+            .file
+            .seek(SeekFrom::Start(start.min(bytes)))
+            .map_err(unreadable)?;
         self.meter.set(at, start.min(bytes));
         let mut buffer = vec![0u8; size];
         for index in from..count {
@@ -345,7 +412,11 @@ impl Upload {
                     Err(err) => return Err(unreadable(err)),
                 }
             }
-            each(Part { index, count, bytes: &buffer[..want] })?;
+            each(Part {
+                index,
+                count,
+                bytes: &buffer[..want],
+            })?;
             self.meter.add(at, want as u64);
         }
         Ok(())
@@ -365,15 +436,30 @@ impl Upload {
     }
 
     /// One request whose body is `head`, `len` bytes of file `at` from `start`, and `tail`.
-    fn stream(&mut self, at: usize, target: &Target, start: u64, len: u64, head: Vec<u8>, tail: Vec<u8>) -> Result<Answer, String> {
+    fn stream(
+        &mut self,
+        at: usize,
+        target: &Target,
+        start: u64,
+        len: u64,
+        head: Vec<u8>,
+        tail: Vec<u8>,
+    ) -> Result<Answer, String> {
         self.check()?;
         let name = self.files[at].name.clone();
         let network = self.account.network;
         if !uploads_to(network, &target.url) {
-            return Err(format!("{name} could not be sent: {} does not take files at that address.", network.label()));
+            return Err(format!(
+                "{name} could not be sent: {} does not take files at that address.",
+                network.label()
+            ));
         }
-        let unreadable = |err: std::io::Error| format!("{name} could not be read: {}.", plain(&err));
-        self.files[at].file.seek(SeekFrom::Start(start)).map_err(unreadable)?;
+        let unreadable =
+            |err: std::io::Error| format!("{name} could not be read: {}.", plain(&err));
+        self.files[at]
+            .file
+            .seek(SeekFrom::Start(start))
+            .map_err(unreadable)?;
         self.meter.set(at, start);
         let length = head.len() as u64 + len + tail.len() as u64;
         let agent = self.agent();
@@ -385,7 +471,9 @@ impl Upload {
             shrank: false,
             meter,
         };
-        let mut body = std::io::Cursor::new(head).chain(&mut feed).chain(std::io::Cursor::new(tail));
+        let mut body = std::io::Cursor::new(head)
+            .chain(&mut feed)
+            .chain(std::io::Cursor::new(tail));
         let mut request = match target.method {
             Method::Put => agent.put(&target.url),
             Method::Post => agent.post(&target.url),
@@ -393,7 +481,9 @@ impl Upload {
         for (header, value) in &target.headers {
             request = request.header(header.as_str(), value.as_str());
         }
-        let sent = request.header("Content-Length", &length.to_string()).send(ureq::SendBody::from_reader(&mut body));
+        let sent = request
+            .header("Content-Length", &length.to_string())
+            .send(ureq::SendBody::from_reader(&mut body));
         drop(body);
         let (shrank, stopped) = (feed.shrank, feed.meter.stopped());
         if stopped {
@@ -402,17 +492,34 @@ impl Upload {
         if shrank {
             return Err(format!("{name} changed while it was being sent."));
         }
-        let mut response = sent.map_err(|err| format!("{name} could not be sent: {}.", crate::adapters::net::redact(&err.to_string())))?;
+        let mut response = sent.map_err(|err| {
+            format!(
+                "{name} could not be sent: {}.",
+                crate::adapters::net::redact(&err.to_string())
+            )
+        })?;
         let status = response.status().as_u16();
         if !(200..300).contains(&status) {
-            let detail = response.body_mut().with_config().limit(ANSWER_KEPT).read_to_string().unwrap_or_default();
+            let detail = response
+                .body_mut()
+                .with_config()
+                .limit(ANSWER_KEPT)
+                .read_to_string()
+                .unwrap_or_default();
             // Tiny's adapter reads the status and the JSON `error`. Other networks keep the status.
             if network == Network::Tiny {
                 return Err(format!("tiny-media\n{status}\n{detail}"));
             }
-            return Err(format!("{name} could not be sent: the server answered {status}."));
+            return Err(format!(
+                "{name} could not be sent: the server answered {status}."
+            ));
         }
-        let body = response.body_mut().with_config().limit(ANSWER_KEPT).read_to_string().unwrap_or_default();
+        let body = response
+            .body_mut()
+            .with_config()
+            .limit(ANSWER_KEPT)
+            .read_to_string()
+            .unwrap_or_default();
         Ok(Answer { status, body })
     }
 }
@@ -457,32 +564,49 @@ impl Read for Feed<'_> {
 /// Runs one `SendWith` on its own thread: opens the files, runs `work`, and answers through
 /// `Context::sent`. A cancel turns a failure into "Cancelled"; a message the network already
 /// took stays sent. The `outbox/` copies go once it went.
-pub fn spawn<F>(ctx: &Context, conversation_id: &str, client_id: &str, files: &[OutgoingFile], work: F)
-where
+pub fn spawn<F>(
+    ctx: &Context,
+    conversation_id: &str,
+    client_id: &str,
+    files: &[OutgoingFile],
+    work: F,
+) where
     F: FnOnce(&mut Upload) -> Result<Message, String> + Send + 'static,
 {
-    let (ctx, conversation_id, client_id, files) = (ctx.clone(), conversation_id.to_owned(), client_id.to_owned(), files.to_vec());
+    let (ctx, conversation_id, client_id, files) = (
+        ctx.clone(),
+        conversation_id.to_owned(),
+        client_id.to_owned(),
+        files.to_vec(),
+    );
     let answer = ctx.clone();
     let (conversation, client) = (conversation_id.clone(), client_id.clone());
-    let spawned = std::thread::Builder::new().name("upload".into()).stack_size(512 * 1024).spawn(move || {
-        let outcome = match Upload::new(&ctx, &conversation_id, &client_id, &files) {
-            Ok(mut upload) => {
-                let outcome = work(&mut upload);
-                match outcome {
-                    Ok(message) => {
-                        upload.done();
-                        Ok(message)
+    let spawned = std::thread::Builder::new()
+        .name("upload".into())
+        .stack_size(512 * 1024)
+        .spawn(move || {
+            let outcome = match Upload::new(&ctx, &conversation_id, &client_id, &files) {
+                Ok(mut upload) => {
+                    let outcome = work(&mut upload);
+                    match outcome {
+                        Ok(message) => {
+                            upload.done();
+                            Ok(message)
+                        }
+                        Err(_) if upload.cancelled() => Err(CANCELLED.to_owned()),
+                        Err(why) => Err(why),
                     }
-                    Err(_) if upload.cancelled() => Err(CANCELLED.to_owned()),
-                    Err(why) => Err(why),
                 }
-            }
-            Err(why) => Err(why),
-        };
-        ctx.sent(&conversation_id, &client_id, outcome);
-    });
+                Err(why) => Err(why),
+            };
+            ctx.sent(&conversation_id, &client_id, outcome);
+        });
     if let Err(err) = spawned {
-        answer.sent(&conversation, &client, Err(format!("The files could not be sent: {err}.")));
+        answer.sent(
+            &conversation,
+            &client,
+            Err(format!("The files could not be sent: {err}.")),
+        );
     }
 }
 
@@ -498,22 +622,36 @@ fn cancels() -> &'static Mutex<Cancels> {
 /// has not begun is cancelled when it does.
 pub fn cancel(account: &AccountKey, client_id: &str) {
     let mut held = crate::hub::lock(cancels());
-    if let Some((_, _, flag, _)) = held.iter().find(|(of, id, _, _)| of == account && id == client_id) {
+    if let Some((_, _, flag, _)) = held
+        .iter()
+        .find(|(of, id, _, _)| of == account && id == client_id)
+    {
         flag.store(true, Ordering::Relaxed);
         return;
     }
-    let early = held.iter().filter(|(_, _, _, under_way)| !under_way).count();
+    let early = held
+        .iter()
+        .filter(|(_, _, _, under_way)| !under_way)
+        .count();
     if early >= EARLY_CANCELS {
         if let Some(oldest) = held.iter().position(|(_, _, _, under_way)| !under_way) {
             held.remove(oldest);
         }
     }
-    held.push((account.clone(), client_id.to_owned(), Arc::new(AtomicBool::new(true)), false));
+    held.push((
+        account.clone(),
+        client_id.to_owned(),
+        Arc::new(AtomicBool::new(true)),
+        false,
+    ));
 }
 
 fn register(account: &AccountKey, client_id: &str) -> Arc<AtomicBool> {
     let mut held = crate::hub::lock(cancels());
-    if let Some(entry) = held.iter_mut().find(|(of, id, _, _)| of == account && id == client_id) {
+    if let Some(entry) = held
+        .iter_mut()
+        .find(|(of, id, _, _)| of == account && id == client_id)
+    {
         entry.3 = true;
         return entry.2.clone();
     }
@@ -550,11 +688,18 @@ pub fn allowed(path: &str) -> Result<(PathBuf, bool), String> {
         return Err(refused());
     }
     let link = std::fs::symlink_metadata(given).map_err(|_| "is no longer there.".to_owned())?;
-    let real = given.canonicalize().map_err(|_| "is no longer there.".to_owned())?;
+    let real = given
+        .canonicalize()
+        .map_err(|_| "is no longer there.".to_owned())?;
     let outbox = outbox();
     let outbox_real = outbox.canonicalize().ok();
-    let in_outbox = outbox_real.as_ref().is_some_and(|dir| real.starts_with(dir));
-    let named_in_outbox = given.starts_with(&outbox) || outbox_real.as_ref().is_some_and(|dir| given.starts_with(dir));
+    let in_outbox = outbox_real
+        .as_ref()
+        .is_some_and(|dir| real.starts_with(dir));
+    let named_in_outbox = given.starts_with(&outbox)
+        || outbox_real
+            .as_ref()
+            .is_some_and(|dir| given.starts_with(dir));
     // What the shell staged is a plain file it wrote. A link there could point anywhere.
     if named_in_outbox && (link.file_type().is_symlink() || !in_outbox) {
         return Err(refused());
@@ -582,10 +727,25 @@ fn forbidden(real: &Path) -> bool {
     if real.starts_with(&own) {
         return true;
     }
-    if ["/dev", "/proc", "/sys", "/etc", "/private/etc", "/var/root", "/private/var/root", "/nix/store"].iter().any(|dir| real.starts_with(dir)) {
+    if [
+        "/dev",
+        "/proc",
+        "/sys",
+        "/etc",
+        "/private/etc",
+        "/var/root",
+        "/private/var/root",
+        "/nix/store",
+    ]
+    .iter()
+    .any(|dir| real.starts_with(dir))
+    {
         return true;
     }
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from).filter(|home| home.is_absolute()) else {
+    let Some(home) = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|home| home.is_absolute())
+    else {
         return false;
     };
     let home = home.canonicalize().unwrap_or(home);
@@ -593,9 +753,12 @@ fn forbidden(real: &Path) -> bool {
         return false;
     };
     let mut parts = inside.components();
-    let first = parts.next().map(|part| part.as_os_str().to_string_lossy().into_owned());
+    let first = parts
+        .next()
+        .map(|part| part.as_os_str().to_string_lossy().into_owned());
     // A hidden directory (`~/.ssh`, `~/.config`), not a hidden file the user picked.
-    let hidden_dir = first.as_deref().is_some_and(|first| first.starts_with('.')) && parts.next().is_some();
+    let hidden_dir =
+        first.as_deref().is_some_and(|first| first.starts_with('.')) && parts.next().is_some();
     hidden_dir || first.as_deref() == Some("Library")
 }
 
@@ -612,12 +775,17 @@ mod windows_places {
             Some(share) => format!(r"\\{share}"),
             None => path.strip_prefix(r"\\?\").unwrap_or(path).to_owned(),
         };
-        path.replace('/', "\\").trim_end_matches('\\').to_lowercase()
+        path.replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_lowercase()
     }
 
     /// Whether folded `path` is `dir` or inside it; `C:\a\bc` is not inside `C:\a\b`.
     fn under(path: &str, dir: &str) -> bool {
-        !dir.is_empty() && path.strip_prefix(dir).is_some_and(|rest| rest.is_empty() || rest.starts_with('\\'))
+        !dir.is_empty()
+            && path
+                .strip_prefix(dir)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('\\'))
     }
 
     /// The places, each folded once.
@@ -634,8 +802,18 @@ mod windows_places {
     }
 
     impl Places {
-        pub fn new(never: &[String], app_data: &[String], temp: &[String], profile: Option<&str>) -> Places {
-            let folded = |dirs: &[String]| dirs.iter().map(|dir| fold(dir)).filter(|dir| !dir.is_empty()).collect();
+        pub fn new(
+            never: &[String],
+            app_data: &[String],
+            temp: &[String],
+            profile: Option<&str>,
+        ) -> Places {
+            let folded = |dirs: &[String]| {
+                dirs.iter()
+                    .map(|dir| fold(dir))
+                    .filter(|dir| !dir.is_empty())
+                    .collect()
+            };
             Places {
                 never: folded(never),
                 app_data: folded(app_data),
@@ -648,20 +826,64 @@ mod windows_places {
         #[cfg(windows)]
         pub fn here() -> Places {
             use std::path::PathBuf;
-            let real = |path: PathBuf| path.canonicalize().unwrap_or(path).to_string_lossy().into_owned();
-            let var = |name: &str| std::env::var_os(name).map(PathBuf::from).filter(|dir| dir.is_absolute());
-            let profile = var("USERPROFILE");
-            let roaming = var("APPDATA").or_else(|| profile.as_ref().map(|dir| dir.join(r"AppData\Roaming")));
-            let local = var("LOCALAPPDATA").or_else(|| profile.as_ref().map(|dir| dir.join(r"AppData\Local")));
-            let system = var("SystemRoot").unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
-            let mut never = vec![real(protocol::support_dir()), real(system.join(r"System32\config"))];
-            let within = |base: &Option<PathBuf>, parts: &[&str]| -> Vec<String> {
-                base.iter().flat_map(|base| parts.iter().map(move |part| real(base.join(part)))).collect()
+            let real = |path: PathBuf| {
+                path.canonicalize()
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .into_owned()
             };
-            never.extend(within(&roaming, &[r"Microsoft\Credentials", r"Microsoft\Protect", r"Microsoft\Crypto", r"Mozilla\Firefox"]));
-            never.extend(within(&local, &[r"Microsoft\Credentials", r"Google\Chrome\User Data", r"Microsoft\Edge\User Data", r"Mozilla\Firefox"]));
-            let app_data: Vec<String> = [profile.as_ref().map(|dir| dir.join("AppData")), roaming, local].into_iter().flatten().map(real).collect();
-            let temp: Vec<String> = [var("TEMP"), var("TMP"), Some(std::env::temp_dir())].into_iter().flatten().map(real).collect();
+            let var = |name: &str| {
+                std::env::var_os(name)
+                    .map(PathBuf::from)
+                    .filter(|dir| dir.is_absolute())
+            };
+            let profile = var("USERPROFILE");
+            let roaming =
+                var("APPDATA").or_else(|| profile.as_ref().map(|dir| dir.join(r"AppData\Roaming")));
+            let local = var("LOCALAPPDATA")
+                .or_else(|| profile.as_ref().map(|dir| dir.join(r"AppData\Local")));
+            let system = var("SystemRoot").unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+            let mut never = vec![
+                real(protocol::support_dir()),
+                real(system.join(r"System32\config")),
+            ];
+            let within = |base: &Option<PathBuf>, parts: &[&str]| -> Vec<String> {
+                base.iter()
+                    .flat_map(|base| parts.iter().map(move |part| real(base.join(part))))
+                    .collect()
+            };
+            never.extend(within(
+                &roaming,
+                &[
+                    r"Microsoft\Credentials",
+                    r"Microsoft\Protect",
+                    r"Microsoft\Crypto",
+                    r"Mozilla\Firefox",
+                ],
+            ));
+            never.extend(within(
+                &local,
+                &[
+                    r"Microsoft\Credentials",
+                    r"Google\Chrome\User Data",
+                    r"Microsoft\Edge\User Data",
+                    r"Mozilla\Firefox",
+                ],
+            ));
+            let app_data: Vec<String> = [
+                profile.as_ref().map(|dir| dir.join("AppData")),
+                roaming,
+                local,
+            ]
+            .into_iter()
+            .flatten()
+            .map(real)
+            .collect();
+            let temp: Vec<String> = [var("TEMP"), var("TMP"), Some(std::env::temp_dir())]
+                .into_iter()
+                .flatten()
+                .map(real)
+                .collect();
             Places::new(&never, &app_data, &temp, profile.map(real).as_deref())
         }
 
@@ -675,10 +897,17 @@ mod windows_places {
             if self.never.iter().any(|dir| under(&real, dir)) {
                 return true;
             }
-            if self.app_data.iter().any(|dir| under(&real, dir)) && !self.temp.iter().any(|dir| under(&real, dir)) {
+            if self.app_data.iter().any(|dir| under(&real, dir))
+                && !self.temp.iter().any(|dir| under(&real, dir))
+            {
                 return true;
             }
-            let Some(inside) = self.profile.as_deref().and_then(|profile| real.strip_prefix(profile)).and_then(|rest| rest.strip_prefix('\\')) else {
+            let Some(inside) = self
+                .profile
+                .as_deref()
+                .and_then(|profile| real.strip_prefix(profile))
+                .and_then(|rest| rest.strip_prefix('\\'))
+            else {
                 return false;
             };
             // A hidden folder (`.ssh`, `.aws`), not a hidden file the user picked.
@@ -701,7 +930,8 @@ fn uploads_to(network: Network, url: &str) -> bool {
     }
     if !crate::session::enabled() {
         let local = std::env::var("TINYCLIENT_MEDIA_HOSTS").unwrap_or_default();
-        if host == "127.0.0.1" || host == "localhost" || local.split(',').any(|named| named == host) {
+        if host == "127.0.0.1" || host == "localhost" || local.split(',').any(|named| named == host)
+        {
             return true;
         }
     }
@@ -710,11 +940,20 @@ fn uploads_to(network: Network, url: &str) -> bool {
     }
     let hosts: &[&str] = match network {
         // The API, and the bucket its attachment URLs point at.
-        Network::Discord => &["discord.com", "discordapp.com", "discord-attachments-uploads-prd.storage.googleapis.com"],
+        Network::Discord => &[
+            "discord.com",
+            "discordapp.com",
+            "discord-attachments-uploads-prd.storage.googleapis.com",
+        ],
         // `files.getUploadURLExternal` answers an address on files.slack.com.
         Network::Slack => &["slack.com"],
         // OneDrive and SharePoint for files; the Teams media service for pasted images.
-        Network::Teams => &["graph.microsoft.com", "sharepoint.com", "asm.skype.com", "teams.microsoft.com"],
+        Network::Teams => &[
+            "graph.microsoft.com",
+            "sharepoint.com",
+            "asm.skype.com",
+            "teams.microsoft.com",
+        ],
         // MTProto, through `parts`: nothing goes over HTTP.
         Network::Telegram => &[],
         // Encrypted before it leaves, by the adapter: nothing goes through this helper.
@@ -744,10 +983,22 @@ fn agent() -> ureq::Agent {
 /// The name the network shows: one plain file name, never a path.
 fn shown(file: &OutgoingFile) -> String {
     let named = match file.name.trim() {
-        "" => Path::new(&file.path).file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default(),
+        "" => Path::new(&file.path)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default(),
         name => name.to_owned(),
     };
-    let mut name: String = named.chars().map(|c| if c.is_control() || c == '/' || c == '\\' { '_' } else { c }).collect();
+    let mut name: String = named
+        .chars()
+        .map(|c| {
+            if c.is_control() || c == '/' || c == '\\' {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
     if name.is_empty() || name == "." || name == ".." {
         name = "file".to_owned();
     }
@@ -757,11 +1008,22 @@ fn shown(file: &OutgoingFile) -> String {
 
 /// A name inside a quoted header parameter.
 fn quoted(text: &str) -> String {
-    text.chars().map(|c| if c == '"' || c == '\\' || c.is_control() { '_' } else { c }).collect()
+    text.chars()
+        .map(|c| {
+            if c == '"' || c == '\\' || c.is_control() {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect()
 }
 
 fn with_default(target: &Target, header: &str, value: &str) -> Target {
-    let named = target.headers.iter().any(|(name, _)| name.eq_ignore_ascii_case(header));
+    let named = target
+        .headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case(header));
     match named {
         true => target.clone(),
         false => target.clone().header(header, value),
@@ -777,12 +1039,17 @@ fn plain(err: &std::io::Error) -> String {
 }
 
 fn fnv(text: &str) -> u64 {
-    text.bytes().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| (hash ^ byte as u64).wrapping_mul(0x0100_0000_01b3))
+    text.bytes().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
+        (hash ^ byte as u64).wrapping_mul(0x0100_0000_01b3)
+    })
 }
 
 /// The type a network is told, from the name's extension.
 pub fn mime_of(name: &str) -> &'static str {
-    let extension = name.rsplit_once('.').map(|(_, extension)| extension.to_ascii_lowercase()).unwrap_or_default();
+    let extension = name
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase())
+        .unwrap_or_default();
     match extension.as_str() {
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
@@ -830,22 +1097,50 @@ mod tests {
 
     #[test]
     fn uploads_go_only_to_the_networks_own_hosts_over_https() {
-        assert!(uploads_to(Network::Discord, "https://discord-attachments-uploads-prd.storage.googleapis.com/x?upload_id=1"));
-        assert!(uploads_to(Network::Slack, "https://files.slack.com/upload/v1/abc"));
-        assert!(uploads_to(Network::Teams, "https://contoso-my.sharepoint.com/personal/x/_api/upload"));
-        assert!(!uploads_to(Network::Discord, "https://storage.googleapis.com/other-bucket/x"));
-        assert!(!uploads_to(Network::Slack, "http://files.slack.com/upload/v1/abc"));
-        assert!(!uploads_to(Network::Slack, "https://files.slack.com.example.org/upload"));
-        assert!(!uploads_to(Network::Telegram, "https://core.telegram.org/x"));
+        assert!(uploads_to(
+            Network::Discord,
+            "https://discord-attachments-uploads-prd.storage.googleapis.com/x?upload_id=1"
+        ));
+        assert!(uploads_to(
+            Network::Slack,
+            "https://files.slack.com/upload/v1/abc"
+        ));
+        assert!(uploads_to(
+            Network::Teams,
+            "https://contoso-my.sharepoint.com/personal/x/_api/upload"
+        ));
+        assert!(!uploads_to(
+            Network::Discord,
+            "https://storage.googleapis.com/other-bucket/x"
+        ));
+        assert!(!uploads_to(
+            Network::Slack,
+            "http://files.slack.com/upload/v1/abc"
+        ));
+        assert!(!uploads_to(
+            Network::Slack,
+            "https://files.slack.com.example.org/upload"
+        ));
+        assert!(!uploads_to(
+            Network::Telegram,
+            "https://core.telegram.org/x"
+        ));
         assert!(uploads_to(Network::Tiny, "https://chat.example/v1/media"));
-        assert!(!uploads_to(Network::Tiny, "https://chat.example@evil.example/v1/media"));
+        assert!(!uploads_to(
+            Network::Tiny,
+            "https://chat.example@evil.example/v1/media"
+        ));
     }
 
     #[test]
     fn windows_places_are_matched_by_real_path_whatever_the_case() {
         let owned = |dirs: &[&str]| dirs.iter().map(|dir| dir.to_string()).collect::<Vec<_>>();
         let places = windows_places::Places::new(
-            &owned(&[r"C:\Users\Me\AppData\Roaming\tinyclient", r"C:\Windows\System32\config", r"D:\Moved\Microsoft\Credentials"]),
+            &owned(&[
+                r"C:\Users\Me\AppData\Roaming\tinyclient",
+                r"C:\Windows\System32\config",
+                r"D:\Moved\Microsoft\Credentials",
+            ]),
             &owned(&[r"\\?\C:\Users\Me\AppData\", r"D:\Moved"]),
             &owned(&[r"C:\Users\Me\AppData\Local\Temp"]),
             Some(r"C:\Users\Me"),
@@ -880,13 +1175,25 @@ mod tests {
     fn windows_secrets_are_refused_and_a_picked_file_is_not() {
         let var = |name: &str| PathBuf::from(std::env::var_os(name).unwrap());
         let real = |path: PathBuf| path.canonicalize().unwrap_or(path);
-        assert!(forbidden(&real(var("SystemRoot").join(r"System32\config\SAM"))));
-        assert!(forbidden(&real(var("USERPROFILE")).join(r".ssh\id_ed25519")));
-        assert!(forbidden(&real(var("APPDATA")).join(r"Microsoft\Credentials\blob")));
-        assert!(forbidden(&real(var("LOCALAPPDATA")).join(r"Microsoft\Edge\User Data\Default\Login Data")));
+        assert!(forbidden(&real(
+            var("SystemRoot").join(r"System32\config\SAM")
+        )));
+        assert!(forbidden(
+            &real(var("USERPROFILE")).join(r".ssh\id_ed25519")
+        ));
+        assert!(forbidden(
+            &real(var("APPDATA")).join(r"Microsoft\Credentials\blob")
+        ));
+        assert!(forbidden(
+            &real(var("LOCALAPPDATA")).join(r"Microsoft\Edge\User Data\Default\Login Data")
+        ));
         let upper = real(var("APPDATA")).to_string_lossy().to_uppercase();
-        assert!(forbidden(Path::new(&format!(r"{upper}\Microsoft\Protect\key"))), "{upper} in capitals");
-        let picked = std::env::temp_dir().join(format!("tinyclient-picked-{}.txt", std::process::id()));
+        assert!(
+            forbidden(Path::new(&format!(r"{upper}\Microsoft\Protect\key"))),
+            "{upper} in capitals"
+        );
+        let picked =
+            std::env::temp_dir().join(format!("tinyclient-picked-{}.txt", std::process::id()));
         std::fs::write(&picked, b"hello").unwrap();
         let answer = allowed(&picked.to_string_lossy());
         std::fs::remove_file(&picked).unwrap();

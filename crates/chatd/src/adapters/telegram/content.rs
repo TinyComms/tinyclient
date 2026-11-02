@@ -5,8 +5,8 @@
 use super::peers::{message_link, thread_id, Directory, Who};
 use grammers_tl_types as tl;
 use protocol::{
-    Attachment, Forwarded, MediaFile, MediaKind, MentionKind, Message, MessageKind, Preview, Reaction, Sender, Span,
-    Style, ThreadSummary,
+    Attachment, Forwarded, MediaFile, MediaKind, MentionKind, Message, MessageKind, Preview,
+    Reaction, Sender, Span, Style, ThreadSummary,
 };
 use tl::enums::{DocumentAttribute, MessageAction, MessageEntity, MessageMedia, PhotoSize};
 
@@ -105,18 +105,35 @@ pub fn spans(text: &str, entities: &[MessageEntity]) -> Vec<Span> {
             E::Underline(_) => Style::Underline,
             E::Strike(_) => Style::Strike,
             E::Code(_) => Style::Code,
-            E::Pre(pre) => Style::CodeBlock { language: pre.language.clone() },
+            E::Pre(pre) => Style::CodeBlock {
+                language: pre.language.clone(),
+            },
             E::Blockquote(_) => Style::Quote,
             E::Spoiler(_) => Style::Spoiler,
-            E::TextUrl(link) => Style::Link { url: link.url.clone() },
-            E::Url(_) if said.contains("://") => Style::Link { url: said.to_owned() },
-            E::Url(_) => Style::Link { url: format!("https://{said}") },
-            E::Email(_) => Style::Link { url: format!("mailto:{said}") },
+            E::TextUrl(link) => Style::Link {
+                url: link.url.clone(),
+            },
+            E::Url(_) if said.contains("://") => Style::Link {
+                url: said.to_owned(),
+            },
+            E::Url(_) => Style::Link {
+                url: format!("https://{said}"),
+            },
+            E::Email(_) => Style::Link {
+                url: format!("mailto:{said}"),
+            },
             // A mention by username names nobody the account has an id for: it opens in Telegram.
-            E::Mention(_) => Style::Link { url: format!("https://t.me/{}", said.trim_start_matches('@')) },
-            E::MentionName(named) => Style::Mention { kind: MentionKind::User, id: Who::User(named.user_id).text() },
+            E::Mention(_) => Style::Link {
+                url: format!("https://t.me/{}", said.trim_start_matches('@')),
+            },
+            E::MentionName(named) => Style::Mention {
+                kind: MentionKind::User,
+                id: Who::User(named.user_id).text(),
+            },
             // The text under it is the plain emoji Telegram chose as its fallback.
-            E::CustomEmoji(emoji) => Style::Emoji { file: MediaFile::new(format!("e{}", emoji.document_id), MediaKind::Emoji) },
+            E::CustomEmoji(emoji) => Style::Emoji {
+                file: MediaFile::new(format!("e{}", emoji.document_id), MediaKind::Emoji),
+            },
             _ => continue,
         };
         spans.push(Span { start, end, style });
@@ -132,7 +149,8 @@ pub fn waveform(packed: &[u8]) -> Vec<u8> {
         .map(|bar| {
             let bit = bar * 5;
             let (byte, shift) = (bit / 8, bit % 8);
-            let pair = u16::from(packed[byte]) | u16::from(*packed.get(byte + 1).unwrap_or(&0)) << 8;
+            let pair =
+                u16::from(packed[byte]) | u16::from(*packed.get(byte + 1).unwrap_or(&0)) << 8;
             let value = (pair >> shift) & 0x1f;
             (value * 255 / 31) as u8
         })
@@ -144,13 +162,29 @@ type Size<'a> = (&'a str, u32, u32, u64, Option<&'a [u8]>);
 
 fn size_of(size: &PhotoSize) -> Option<Size<'_>> {
     Some(match size {
-        PhotoSize::Size(size) => (size.r#type.as_str(), size.w as u32, size.h as u32, size.size as u64, None),
-        PhotoSize::PhotoCachedSize(size) => {
-            (size.r#type.as_str(), size.w as u32, size.h as u32, size.bytes.len() as u64, Some(size.bytes.as_slice()))
-        }
+        PhotoSize::Size(size) => (
+            size.r#type.as_str(),
+            size.w as u32,
+            size.h as u32,
+            size.size as u64,
+            None,
+        ),
+        PhotoSize::PhotoCachedSize(size) => (
+            size.r#type.as_str(),
+            size.w as u32,
+            size.h as u32,
+            size.bytes.len() as u64,
+            Some(size.bytes.as_slice()),
+        ),
         PhotoSize::Progressive(size) => {
             let bytes = size.sizes.iter().copied().max().unwrap_or(0) as u64;
-            (size.r#type.as_str(), size.w as u32, size.h as u32, bytes, None)
+            (
+                size.r#type.as_str(),
+                size.w as u32,
+                size.h as u32,
+                bytes,
+                None,
+            )
         }
         // A stripped or outline placeholder is not a picture on its own.
         _ => return None,
@@ -161,7 +195,10 @@ fn size_of(size: &PhotoSize) -> Option<Size<'_>> {
 fn pick(sizes: &[PhotoSize], least: u32) -> Option<Size<'_>> {
     let mut real: Vec<_> = sizes.iter().filter_map(size_of).collect();
     real.sort_by_key(|(_, w, h, ..)| (*w).max(*h));
-    real.iter().find(|(_, w, h, ..)| (*w).max(*h) >= least).or(real.last()).copied()
+    real.iter()
+        .find(|(_, w, h, ..)| (*w).max(*h) >= least)
+        .or(real.last())
+        .copied()
 }
 
 /// What a row shows of a photo, and no more than a row needs: 320 on its longer side.
@@ -180,14 +217,30 @@ fn photo(photo: &tl::types::Photo, spoiler: bool, wants: &mut Vec<Want>) -> Opti
     let (kind, width, height, bytes, inline) = pick(&photo.sizes, INLINE)?;
     let mut thumb = MediaFile::new(format!("p{}{kind}", photo.id), MediaKind::Image);
     (thumb.width, thumb.height, thumb.bytes) = (width, height, bytes);
-    wants.push(Want { file: thumb.clone(), dc: photo.dc_id, location: location(kind), inline: inline.map(<[u8]>::to_vec), row: None, original: false });
+    wants.push(Want {
+        file: thumb.clone(),
+        dc: photo.dc_id,
+        location: location(kind),
+        inline: inline.map(<[u8]>::to_vec),
+        row: None,
+        original: false,
+    });
     // The picture itself is the largest size Telegram keeps: the viewer fills a screen with
     // it, at the screen's own pixels.
     let mut file = thumb.clone();
-    if let Some((kind, width, height, bytes, inline)) = pick(&photo.sizes, u32::MAX).filter(|(largest, ..)| *largest != kind) {
+    if let Some((kind, width, height, bytes, inline)) =
+        pick(&photo.sizes, u32::MAX).filter(|(largest, ..)| *largest != kind)
+    {
         file.id = format!("p{}{kind}", photo.id);
         (file.width, file.height, file.bytes) = (width, height, bytes);
-        wants.push(Want { file: file.clone(), dc: photo.dc_id, location: location(kind), inline: inline.map(<[u8]>::to_vec), row: None, original: true });
+        wants.push(Want {
+            file: file.clone(),
+            dc: photo.dc_id,
+            location: location(kind),
+            inline: inline.map(<[u8]>::to_vec),
+            row: None,
+            original: true,
+        });
     }
     let mut attachment = Attachment::new("Photo", file);
     attachment.thumb = Some(thumb);
@@ -196,9 +249,15 @@ fn photo(photo: &tl::types::Photo, spoiler: bool, wants: &mut Vec<Want>) -> Opti
     Some(attachment)
 }
 
-pub(super) fn document(media: &tl::types::MessageMediaDocument, document: &tl::types::Document, wants: &mut Vec<Want>) -> Attachment {
-    let (mut name, mut size, mut duration, mut wave) = (String::new(), (0u32, 0u32), 0u32, Vec::new());
-    let (mut sticker, mut animated, mut video, mut round, mut voice, mut audio) = (false, false, false, false, false, false);
+pub(super) fn document(
+    media: &tl::types::MessageMediaDocument,
+    document: &tl::types::Document,
+    wants: &mut Vec<Want>,
+) -> Attachment {
+    let (mut name, mut size, mut duration, mut wave) =
+        (String::new(), (0u32, 0u32), 0u32, Vec::new());
+    let (mut sticker, mut animated, mut video, mut round, mut voice, mut audio) =
+        (false, false, false, false, false, false);
     for attribute in &document.attributes {
         match attribute {
             DocumentAttribute::Filename(file) => name = file.file_name.clone(),
@@ -215,7 +274,11 @@ pub(super) fn document(media: &tl::types::MessageMediaDocument, document: &tl::t
                 audio = true;
                 voice = attribute.voice;
                 duration = attribute.duration.max(0) as u32;
-                wave = attribute.waveform.as_deref().map(waveform).unwrap_or_default();
+                wave = attribute
+                    .waveform
+                    .as_deref()
+                    .map(waveform)
+                    .unwrap_or_default();
                 if name.is_empty() {
                     name = attribute.title.clone().unwrap_or_default();
                 }
@@ -224,25 +287,29 @@ pub(super) fn document(media: &tl::types::MessageMediaDocument, document: &tl::t
         }
     }
     // A still of it, where Telegram made one: what a row shows of a video, a GIF or a sticker.
-    let still = document.thumbs.as_deref().and_then(|thumbs| pick(thumbs, INLINE)).map(|(kind, width, height, bytes, inline)| {
-        let mut thumb = MediaFile::new(format!("d{}{kind}", document.id), MediaKind::Image);
-        (thumb.width, thumb.height, thumb.bytes) = (width, height, bytes);
-        wants.push(Want {
-            file: thumb.clone(),
-            dc: document.dc_id,
-            location: tl::types::InputDocumentFileLocation {
-                id: document.id,
-                access_hash: document.access_hash,
-                file_reference: document.file_reference.clone(),
-                thumb_size: kind.to_owned(),
-            }
-            .into(),
-            inline: inline.map(<[u8]>::to_vec),
-            row: None,
-            original: false,
+    let still = document
+        .thumbs
+        .as_deref()
+        .and_then(|thumbs| pick(thumbs, INLINE))
+        .map(|(kind, width, height, bytes, inline)| {
+            let mut thumb = MediaFile::new(format!("d{}{kind}", document.id), MediaKind::Image);
+            (thumb.width, thumb.height, thumb.bytes) = (width, height, bytes);
+            wants.push(Want {
+                file: thumb.clone(),
+                dc: document.dc_id,
+                location: tl::types::InputDocumentFileLocation {
+                    id: document.id,
+                    access_hash: document.access_hash,
+                    file_reference: document.file_reference.clone(),
+                    thumb_size: kind.to_owned(),
+                }
+                .into(),
+                inline: inline.map(<[u8]>::to_vec),
+                row: None,
+                original: false,
+            });
+            thumb
         });
-        thumb
-    });
     let mime = document.mime_type.as_str();
     let kind = match () {
         _ if sticker => MediaKind::Image,
@@ -277,9 +344,23 @@ pub(super) fn document(media: &tl::types::MessageMediaDocument, document: &tl::t
             file_reference: document.file_reference.clone(),
             thumb_size: String::new(),
         };
-        wants.push(Want { file: file.clone(), dc: document.dc_id, location: location.into(), inline: None, row: None, original: true });
+        wants.push(Want {
+            file: file.clone(),
+            dc: document.dc_id,
+            location: location.into(),
+            inline: None,
+            row: None,
+            original: true,
+        });
     }
-    let mut attachment = Attachment::new(if name.is_empty() { label.to_owned() } else { name }, file);
+    let mut attachment = Attachment::new(
+        if name.is_empty() {
+            label.to_owned()
+        } else {
+            name
+        },
+        file,
+    );
     attachment.thumb = still;
     attachment.mime = mime.to_owned();
     attachment.duration = duration;
@@ -305,7 +386,11 @@ fn unsupported(media: &MessageMedia) -> Option<String> {
         MessageMedia::Geo(_) => "Location".to_owned(),
         MessageMedia::GeoLive(_) => "Live location".to_owned(),
         MessageMedia::Venue(venue) => format!("Location: {}", venue.title),
-        MessageMedia::Contact(contact) => format!("Contact: {} {}", contact.first_name, contact.last_name).trim_end().to_owned(),
+        MessageMedia::Contact(contact) => {
+            format!("Contact: {} {}", contact.first_name, contact.last_name)
+                .trim_end()
+                .to_owned()
+        }
         MessageMedia::Game(media) => {
             let tl::enums::Game::Game(game) = &media.game;
             format!("Game: {}", game.title)
@@ -319,7 +404,9 @@ fn unsupported(media: &MessageMedia) -> Option<String> {
         MessageMedia::Unsupported => "A message this version of tinyclient cannot show".to_owned(),
         // A photo or document that has run out (a self-destructing one, once seen).
         MessageMedia::Photo(photo) if photo.photo.is_none() => "Photo that has expired".to_owned(),
-        MessageMedia::Document(document) if document.document.is_none() => "File that has expired".to_owned(),
+        MessageMedia::Document(document) if document.document.is_none() => {
+            "File that has expired".to_owned()
+        }
         _ => return None,
     })
 }
@@ -330,9 +417,13 @@ fn reactions(reactions: &tl::enums::MessageReactions) -> Vec<Reaction> {
         let tl::enums::ReactionCount::Count(count) = count;
         let (emoji, file) = match &count.reaction {
             tl::enums::Reaction::Emoji(emoji) => (emoji.emoticon.clone(), None),
-            tl::enums::Reaction::CustomEmoji(custom) => {
-                (":emoji:".to_owned(), Some(MediaFile::new(format!("e{}", custom.document_id), MediaKind::Emoji)))
-            }
+            tl::enums::Reaction::CustomEmoji(custom) => (
+                ":emoji:".to_owned(),
+                Some(MediaFile::new(
+                    format!("e{}", custom.document_id),
+                    MediaKind::Emoji,
+                )),
+            ),
             tl::enums::Reaction::Paid => ("⭐".to_owned(), None),
             tl::enums::Reaction::Empty => return None,
         };
@@ -356,7 +447,9 @@ fn sender(dir: &Directory, who: Who) -> Sender {
     Sender {
         id: who.text(),
         name: dir.name(who),
-        avatar: known.and_then(|known| known.avatar()).map(|id| MediaFile::new(id, MediaKind::Avatar)),
+        avatar: known
+            .and_then(|known| known.avatar())
+            .map(|id| MediaFile::new(id, MediaKind::Avatar)),
         bot: known.is_some_and(|known| known.bot),
     }
 }
@@ -389,8 +482,19 @@ fn duration_words(seconds: i32) -> String {
 
 /// A service message as one line. `who` did it; "You" when it was us.
 fn action(dir: &Directory, who: &str, action: &MessageAction) -> String {
-    let name = |id: i64| if id == dir.me { "you".to_owned() } else { dir.name(Who::User(id)) };
-    let names = |ids: &[i64]| ids.iter().map(|id| name(*id)).collect::<Vec<_>>().join(", ");
+    let name = |id: i64| {
+        if id == dir.me {
+            "you".to_owned()
+        } else {
+            dir.name(Who::User(id))
+        }
+    };
+    let names = |ids: &[i64]| {
+        ids.iter()
+            .map(|id| name(*id))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
     use MessageAction as A;
     match action {
         A::ChatCreate(a) => format!("{who} created the group \"{}\"", a.title),
@@ -398,13 +502,21 @@ fn action(dir: &Directory, who: &str, action: &MessageAction) -> String {
         A::ChatEditTitle(a) => format!("{who} renamed this to \"{}\"", a.title),
         A::ChatEditPhoto(_) => format!("{who} changed the picture"),
         A::ChatDeletePhoto => format!("{who} removed the picture"),
-        A::ChatAddUser(a) if a.users.len() == 1 && name(a.users[0]) == who.to_lowercase() => format!("{who} joined"),
+        A::ChatAddUser(a) if a.users.len() == 1 && name(a.users[0]) == who.to_lowercase() => {
+            format!("{who} joined")
+        }
         A::ChatAddUser(a) => format!("{who} added {}", names(&a.users)),
-        A::ChatDeleteUser(a) if name(a.user_id) == who.to_lowercase() || dir.name(Who::User(a.user_id)) == who => format!("{who} left"),
+        A::ChatDeleteUser(a)
+            if name(a.user_id) == who.to_lowercase() || dir.name(Who::User(a.user_id)) == who =>
+        {
+            format!("{who} left")
+        }
         A::ChatDeleteUser(a) => format!("{who} removed {}", name(a.user_id)),
         A::ChatJoinedByLink(_) => format!("{who} joined with an invite link"),
         A::ChatJoinedByRequest => format!("{who} was let in"),
-        A::ChatMigrateTo(_) | A::ChannelMigrateFrom(_) => "This group was upgraded to a supergroup".to_owned(),
+        A::ChatMigrateTo(_) | A::ChannelMigrateFrom(_) => {
+            "This group was upgraded to a supergroup".to_owned()
+        }
         A::PinMessage => format!("{who} pinned a message"),
         A::HistoryClear => "History was cleared".to_owned(),
         A::PhoneCall(call) => {
@@ -441,8 +553,18 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
             let peer = Who::of(&service.peer_id);
             let from = service.from_id.as_ref().map_or(peer, Who::of);
             let outgoing = service.out || from == Who::User(dir.me);
-            let who = if outgoing { "You".to_owned() } else { dir.name(from) };
-            let mut message = Message::plain(service.id.to_string(), "", action(dir, &who, &service.action), i64::from(service.date), outgoing);
+            let who = if outgoing {
+                "You".to_owned()
+            } else {
+                dir.name(from)
+            };
+            let mut message = Message::plain(
+                service.id.to_string(),
+                "",
+                action(dir, &who, &service.action),
+                i64::from(service.date),
+                outgoing,
+            );
             message.sender = sender(dir, from);
             message.kind = MessageKind::System;
             Some(Mapped {
@@ -463,7 +585,13 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
                 (None, peer) => peer,
             };
             let outgoing = raw.out || (from == Who::User(dir.me) && peer == Who::User(dir.me));
-            let mut message = Message::plain(raw.id.to_string(), "", raw.message.clone(), i64::from(raw.date), outgoing);
+            let mut message = Message::plain(
+                raw.id.to_string(),
+                "",
+                raw.message.clone(),
+                i64::from(raw.date),
+                outgoing,
+            );
             message.sender = sender(dir, from);
             message.spans = spans(&raw.message, raw.entities.as_deref().unwrap_or(&[]));
             message.edited = raw.edit_date.is_some() && !raw.edit_hide;
@@ -484,13 +612,18 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
                     });
                 }
             }
-            message.forwarded = raw.fwd_from.as_ref().map(|header| Box::new(forwarded(dir, header)));
+            message.forwarded = raw
+                .fwd_from
+                .as_ref()
+                .map(|header| Box::new(forwarded(dir, header)));
             let mut wants = Vec::new();
             match &raw.media {
                 None | Some(MessageMedia::Empty) => {}
                 Some(MessageMedia::Photo(media)) if media.photo.is_some() => {
                     if let Some(tl::enums::Photo::Photo(picture)) = &media.photo {
-                        message.attachments.extend(photo(picture, media.spoiler, &mut wants));
+                        message
+                            .attachments
+                            .extend(photo(picture, media.spoiler, &mut wants));
                     }
                 }
                 Some(MessageMedia::Document(media)) if media.document.is_some() => {
@@ -521,7 +654,9 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
                             false => format!("{label}\n{}", message.text),
                         };
                         message.spans.clear();
-                        message.kind = MessageKind::Unsupported { link: message_link(peer, dir.get(peer), raw.id) };
+                        message.kind = MessageKind::Unsupported {
+                            link: message_link(peer, dir.get(peer), raw.id),
+                        };
                     }
                 }
             }
@@ -544,7 +679,11 @@ fn topic_of(header: Option<&tl::enums::MessageReplyHeader>) -> (Option<i32>, Opt
     let Some(tl::enums::MessageReplyHeader::Header(header)) = header else {
         return (None, None);
     };
-    match (header.forum_topic, header.reply_to_top_id, header.reply_to_msg_id) {
+    match (
+        header.forum_topic,
+        header.reply_to_top_id,
+        header.reply_to_msg_id,
+    ) {
         (true, Some(top), reply) => (Some(top), reply),
         (true, None, top) => (top, None),
         (false, _, reply) => (None, reply),
@@ -565,16 +704,40 @@ mod tests {
         let text = "né 🇵🇹 🦀 code";
         let entities = vec![
             bold(0, 2),
-            tl::types::MessageEntityItalic { offset: 3, length: 4 }.into(),
-            tl::types::MessageEntityCode { offset: 11, length: 4 }.into(),
-            tl::types::MessageEntityTextUrl { offset: 8, length: 2, url: "https://crab.example".into() }.into(),
+            tl::types::MessageEntityItalic {
+                offset: 3,
+                length: 4,
+            }
+            .into(),
+            tl::types::MessageEntityCode {
+                offset: 11,
+                length: 4,
+            }
+            .into(),
+            tl::types::MessageEntityTextUrl {
+                offset: 8,
+                length: 2,
+                url: "https://crab.example".into(),
+            }
+            .into(),
         ];
         let spans = spans(text, &entities);
-        let said: Vec<(&str, &Style)> = spans.iter().map(|span| (&text[span.start as usize..span.end as usize], &span.style)).collect();
+        let said: Vec<(&str, &Style)> = spans
+            .iter()
+            .map(|span| (&text[span.start as usize..span.end as usize], &span.style))
+            .collect();
         assert_eq!(said[0], ("né", &Style::Bold));
         assert_eq!(said[1], ("🇵🇹", &Style::Italic));
         assert_eq!(said[2], ("code", &Style::Code));
-        assert_eq!(said[3], ("🦀", &Style::Link { url: "https://crab.example".into() }));
+        assert_eq!(
+            said[3],
+            (
+                "🦀",
+                &Style::Link {
+                    url: "https://crab.example".into()
+                }
+            )
+        );
     }
 
     #[test]
@@ -589,22 +752,65 @@ mod tests {
     fn links_mentions_and_blocks_are_named() {
         let text = "see t.me/x @wren and Wren\nfn main() {}\nquoted";
         let entities = vec![
-            tl::types::MessageEntityUrl { offset: 4, length: 6 }.into(),
-            tl::types::MessageEntityMention { offset: 11, length: 5 }.into(),
-            tl::types::MessageEntityMentionName { offset: 21, length: 4, user_id: 42 }.into(),
-            tl::types::MessageEntityPre { offset: 26, length: 12, language: "rust".into() }.into(),
-            tl::types::MessageEntityBlockquote { collapsed: false, offset: 39, length: 6 }.into(),
-            tl::types::MessageEntitySpoiler { offset: 0, length: 3 }.into(),
-            tl::types::MessageEntityHashtag { offset: 0, length: 3 }.into(),
+            tl::types::MessageEntityUrl {
+                offset: 4,
+                length: 6,
+            }
+            .into(),
+            tl::types::MessageEntityMention {
+                offset: 11,
+                length: 5,
+            }
+            .into(),
+            tl::types::MessageEntityMentionName {
+                offset: 21,
+                length: 4,
+                user_id: 42,
+            }
+            .into(),
+            tl::types::MessageEntityPre {
+                offset: 26,
+                length: 12,
+                language: "rust".into(),
+            }
+            .into(),
+            tl::types::MessageEntityBlockquote {
+                collapsed: false,
+                offset: 39,
+                length: 6,
+            }
+            .into(),
+            tl::types::MessageEntitySpoiler {
+                offset: 0,
+                length: 3,
+            }
+            .into(),
+            tl::types::MessageEntityHashtag {
+                offset: 0,
+                length: 3,
+            }
+            .into(),
         ];
-        let styles: Vec<Style> = spans(text, &entities).into_iter().map(|span| span.style).collect();
+        let styles: Vec<Style> = spans(text, &entities)
+            .into_iter()
+            .map(|span| span.style)
+            .collect();
         assert_eq!(
             styles,
             vec![
-                Style::Link { url: "https://t.me/x".into() },
-                Style::Link { url: "https://t.me/wren".into() },
-                Style::Mention { kind: MentionKind::User, id: "u42".into() },
-                Style::CodeBlock { language: "rust".into() },
+                Style::Link {
+                    url: "https://t.me/x".into()
+                },
+                Style::Link {
+                    url: "https://t.me/wren".into()
+                },
+                Style::Mention {
+                    kind: MentionKind::User,
+                    id: "u42".into()
+                },
+                Style::CodeBlock {
+                    language: "rust".into()
+                },
                 Style::Quote,
                 Style::Spoiler,
             ]
@@ -614,7 +820,13 @@ mod tests {
     #[test]
     fn a_waveform_is_unpacked_five_bits_a_bar() {
         // Bars 31, 0, 31, 0, 31, 0, 31, 0 packed low bit first.
-        let packed = [0b0001_1111, 0b0111_1100, 0b1111_0000, 0b1100_0001, 0b0000_0111];
+        let packed = [
+            0b0001_1111,
+            0b0111_1100,
+            0b1111_0000,
+            0b1100_0001,
+            0b0000_0111,
+        ];
         assert_eq!(waveform(&packed), vec![255, 0, 255, 0, 255, 0, 255, 0]);
         assert!(waveform(&[]).is_empty());
     }

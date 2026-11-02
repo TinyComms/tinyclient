@@ -15,7 +15,9 @@ fn main() -> io::Result<()> {
     let core = spawn_core(dir, Host::Process, move |store| {
         if let Some(mode) = demo {
             if std::env::var_os("TINYCLIENT_DIR").is_none() {
-                tracing::warn!("chatd: --seed-demo needs TINYCLIENT_DIR so it cannot write to the real store");
+                tracing::warn!(
+                    "chatd: --seed-demo needs TINYCLIENT_DIR so it cannot write to the real store"
+                );
                 std::process::exit(64);
             }
             chatd::demo::seed(store, &seed_dir, mode).map_err(io::Error::other)?;

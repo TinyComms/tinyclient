@@ -2,10 +2,13 @@
 //! everything done to messages: pages, sending, editing, deleting, reacting.
 
 use super::html::{self, Lookup};
-use super::{chain_id, chain_of, escaped, id_of, millis, now_ms, seconds, Body, Fault, Teams, CHAIN, PAGE, TEAMS, TYPING_SHOWN};
+use super::{
+    chain_id, chain_of, escaped, id_of, millis, now_ms, seconds, Body, Fault, Teams, CHAIN, PAGE,
+    TEAMS, TYPING_SHOWN,
+};
 use protocol::{
-    Attachment, ConversationKind, MediaFile, MediaKind, MentionKind, Message, MessageKind, Reaction,
-    ReplyTo, Span, Style, ThreadSummary,
+    Attachment, ConversationKind, MediaFile, MediaKind, MentionKind, Message, MessageKind,
+    Reaction, ReplyTo, Span, Style, ThreadSummary,
 };
 use serde_json::{json, Value};
 
@@ -13,14 +16,43 @@ use serde_json::{json, Value};
 /// offers first, then the ones people reach for. A key shaped `1f389_partypopper` says its own
 /// emoji and needs no entry to be read, only to be sent.
 const REACTIONS: &[(&str, &str)] = &[
-    ("like", "👍"), ("heart", "❤️"), ("laugh", "😆"), ("surprised", "😮"), ("sad", "🙁"), ("angry", "😠"),
-    ("cry", "😢"), ("cwl", "😂"), ("1f389_partypopper", "🎉"), ("praying", "🙏"), ("1f440_eyes", "👀"),
-    ("fire", "🔥"), ("2705_whiteheavycheckmark", "✅"), ("sarcastic", "👏"), ("smileeyes", "😊"),
-    ("wink", "😉"), ("hearteyes", "😍"), ("think", "🤔"), ("1f4af_hundredpointssymbol", "💯"),
-    ("launch", "🚀"), ("no", "👎"), ("rofl", "🤣"), ("cool", "😎"), ("loudlycrying", "😭"),
-    ("party", "🥳"), ("1f44b_wavinghand", "👋"), ("muscle", "💪"), ("2728_sparkles", "✨"),
-    ("star", "⭐"), ("274c_crossmark", "❌"), ("handshake", "🤝"), ("ok", "👌"), ("shrug", "🤷"),
-    ("salute", "🫡"), ("skull", "💀"), ("coffee", "☕"), ("yes", "👍"),
+    ("like", "👍"),
+    ("heart", "❤️"),
+    ("laugh", "😆"),
+    ("surprised", "😮"),
+    ("sad", "🙁"),
+    ("angry", "😠"),
+    ("cry", "😢"),
+    ("cwl", "😂"),
+    ("1f389_partypopper", "🎉"),
+    ("praying", "🙏"),
+    ("1f440_eyes", "👀"),
+    ("fire", "🔥"),
+    ("2705_whiteheavycheckmark", "✅"),
+    ("sarcastic", "👏"),
+    ("smileeyes", "😊"),
+    ("wink", "😉"),
+    ("hearteyes", "😍"),
+    ("think", "🤔"),
+    ("1f4af_hundredpointssymbol", "💯"),
+    ("launch", "🚀"),
+    ("no", "👎"),
+    ("rofl", "🤣"),
+    ("cool", "😎"),
+    ("loudlycrying", "😭"),
+    ("party", "🥳"),
+    ("1f44b_wavinghand", "👋"),
+    ("muscle", "💪"),
+    ("2728_sparkles", "✨"),
+    ("star", "⭐"),
+    ("274c_crossmark", "❌"),
+    ("handshake", "🤝"),
+    ("ok", "👌"),
+    ("shrug", "🤷"),
+    ("salute", "🫡"),
+    ("skull", "💀"),
+    ("coffee", "☕"),
+    ("yes", "👍"),
 ];
 
 /// What reactions a Teams conversation takes: the emoji Teams has a key for here, and nothing
@@ -36,27 +68,45 @@ pub(crate) fn reaction_rules() -> protocol::ReactionRules {
         }
     }
     // Plain only: chatd sends a toned one as its plain key, so the tone would not stay.
-    protocol::ReactionRules { set: protocol::ReactionSet::Only, only, ..protocol::ReactionRules::default() }
+    protocol::ReactionRules {
+        set: protocol::ReactionSet::Only,
+        only,
+        ..protocol::ReactionRules::default()
+    }
 }
 
 /// An emoji without the marks that do not change which one it is.
 fn bare_emoji(emoji: &str) -> String {
-    emoji.chars().filter(|c| *c != '\u{fe0f}' && !('\u{1f3fb}'..='\u{1f3ff}').contains(c)).collect()
+    emoji
+        .chars()
+        .filter(|c| *c != '\u{fe0f}' && !('\u{1f3fb}'..='\u{1f3ff}').contains(c))
+        .collect()
 }
 
 /// The emoji a reaction key is. A key Teams added since reads as `:key:`.
 fn emoji_of(key: &str) -> String {
-    let (key, tone) = key.split_once("-tone").map_or((key, None), |(key, tone)| (key, tone.parse::<u32>().ok()));
-    let known = REACTIONS.iter().find(|(known, _)| *known == key).map(|(_, emoji)| (*emoji).to_owned());
+    let (key, tone) = key
+        .split_once("-tone")
+        .map_or((key, None), |(key, tone)| (key, tone.parse::<u32>().ok()));
+    let known = REACTIONS
+        .iter()
+        .find(|(known, _)| *known == key)
+        .map(|(_, emoji)| (*emoji).to_owned());
     let spelled = || {
         let points = key.split_once('_')?.0;
-        let read: Option<String> = points.split('-').map(|hex| u32::from_str_radix(hex, 16).ok().and_then(char::from_u32)).collect();
+        let read: Option<String> = points
+            .split('-')
+            .map(|hex| u32::from_str_radix(hex, 16).ok().and_then(char::from_u32))
+            .collect();
         read.filter(|read| !read.is_empty() && points.len() >= 4)
     };
     let Some(mut emoji) = known.or_else(spelled) else {
         return format!(":{key}:");
     };
-    if let Some(tone) = tone.filter(|tone| (1..=5).contains(tone)).and_then(|tone| char::from_u32(0x1f3fa + tone)) {
+    if let Some(tone) = tone
+        .filter(|tone| (1..=5).contains(tone))
+        .and_then(|tone| char::from_u32(0x1f3fa + tone))
+    {
         emoji.push(tone);
     }
     emoji
@@ -65,7 +115,10 @@ fn emoji_of(key: &str) -> String {
 /// The key Teams knows an emoji by, for the ones in the table.
 fn key_of(emoji: &str) -> Option<&'static str> {
     let wanted = bare_emoji(emoji);
-    REACTIONS.iter().find(|(_, known)| bare_emoji(known) == wanted).map(|(key, _)| *key)
+    REACTIONS
+        .iter()
+        .find(|(_, known)| bare_emoji(known) == wanted)
+        .map(|(key, _)| *key)
 }
 
 /// The person id at the end of `https://…/v1/users/ME/contacts/8:orgid:…`, or the id itself.
@@ -77,8 +130,12 @@ fn person(from: &str) -> &str {
 /// `…/conversations/19:x@thread.tacv2;messageid=1700000000000`.
 fn placed(raw: &Value) -> Option<(String, Option<String>)> {
     let link = raw["conversationLink"].as_str().unwrap_or("");
-    let named = link.split_once("/conversations/").map(|(_, rest)| rest.split('/').next().unwrap_or(rest));
-    let named = named.or(raw["conversationid"].as_str()).filter(|named| !named.is_empty())?;
+    let named = link
+        .split_once("/conversations/")
+        .map(|(_, rest)| rest.split('/').next().unwrap_or(rest));
+    let named = named
+        .or(raw["conversationid"].as_str())
+        .filter(|named| !named.is_empty())?;
     Some(match chain_of(named) {
         Some((channel, root)) => (channel.to_owned(), Some(root.to_owned())),
         None => (named.to_owned(), None),
@@ -125,13 +182,25 @@ fn card_title(card: &Value, depth: u8) -> Option<String> {
     }
     match card {
         Value::Object(fields) => {
-            let own = ["title", "text", "subtitle"].iter().filter_map(|name| fields.get(*name)?.as_str()).find(|text| !text.trim().is_empty());
+            let own = ["title", "text", "subtitle"]
+                .iter()
+                .filter_map(|name| fields.get(*name)?.as_str())
+                .find(|text| !text.trim().is_empty());
             // What a card says comes before what its buttons say.
-            let inner = ["content", "body"].iter().filter_map(|name| fields.get(*name)).chain(fields.values());
-            own.map(str::to_owned).or_else(|| inner.into_iter().find_map(|inner| card_title(inner, depth - 1)))
+            let inner = ["content", "body"]
+                .iter()
+                .filter_map(|name| fields.get(*name))
+                .chain(fields.values());
+            own.map(str::to_owned).or_else(|| {
+                inner
+                    .into_iter()
+                    .find_map(|inner| card_title(inner, depth - 1))
+            })
         }
         Value::Array(items) => items.iter().find_map(|inner| card_title(inner, depth - 1)),
-        Value::String(text) if text.starts_with('{') => card_title(&serde_json::from_str(text).ok()?, depth - 1),
+        Value::String(text) if text.starts_with('{') => {
+            card_title(&serde_json::from_str(text).ok()?, depth - 1)
+        }
         _ => None,
     }
 }
@@ -149,7 +218,10 @@ fn echoed_client_id(raw: &Value, outgoing: bool, id: &str) -> Option<String> {
 
 /// `Event/Call`: `<partlist type="ended" …><part …><duration>125</duration></part></partlist>`.
 fn call_line(content: &str) -> String {
-    let longest = inside(content, "duration").iter().filter_map(|text| text.trim().parse::<f64>().ok()).fold(0., f64::max);
+    let longest = inside(content, "duration")
+        .iter()
+        .filter_map(|text| text.trim().parse::<f64>().ok())
+        .fold(0., f64::max);
     if content.contains("type=\"missed\"") {
         "Missed call".to_owned()
     } else if content.contains("type=\"ended\"") || content.contains("<ended") {
@@ -171,23 +243,41 @@ const GIPHY_TALL: u32 = 200;
 /// copy and is shown as it is.
 fn giphy_gif(gif: &html::Image, media: &mut Vec<(MediaFile, String)>) -> Attachment {
     let path = gif.src.split(['?', '#']).next().unwrap_or(&gif.src);
-    let object = path.trim_end_matches("/giphy.gif").rsplit('/').next().unwrap_or(path);
+    let object = path
+        .trim_end_matches("/giphy.gif")
+        .rsplit('/')
+        .next()
+        .unwrap_or(path);
     let file = MediaFile {
         width: gif.width,
         height: gif.height,
         ..MediaFile::new(format!("giphy:{}", escaped(object)), MediaKind::Gif)
     };
     media.push((file.clone(), gif.src.clone()));
-    let thumb = path.strip_suffix("/giphy.gif").filter(|_| path.contains("/media/")).map(|base| {
-        let (width, height) = match (gif.width, gif.height) {
-            (w, h) if w > 0 && h > 0 => ((u64::from(w) * u64::from(GIPHY_TALL) / u64::from(h)).max(1) as u32, GIPHY_TALL),
-            _ => (0, 0),
-        };
-        let thumb = MediaFile { width, height, ..MediaFile::new(format!("{}:small", file.id), MediaKind::Image) };
-        media.push((thumb.clone(), format!("{base}/{GIPHY_TALL}.webp")));
-        thumb
-    });
-    let named = if gif.name.trim().is_empty() { "GIF" } else { gif.name.trim() };
+    let thumb = path
+        .strip_suffix("/giphy.gif")
+        .filter(|_| path.contains("/media/"))
+        .map(|base| {
+            let (width, height) = match (gif.width, gif.height) {
+                (w, h) if w > 0 && h > 0 => (
+                    (u64::from(w) * u64::from(GIPHY_TALL) / u64::from(h)).max(1) as u32,
+                    GIPHY_TALL,
+                ),
+                _ => (0, 0),
+            };
+            let thumb = MediaFile {
+                width,
+                height,
+                ..MediaFile::new(format!("{}:small", file.id), MediaKind::Image)
+            };
+            media.push((thumb.clone(), format!("{base}/{GIPHY_TALL}.webp")));
+            thumb
+        });
+    let named = if gif.name.trim().is_empty() {
+        "GIF"
+    } else {
+        gif.name.trim()
+    };
     Attachment {
         thumb: Some(thumb.unwrap_or_else(|| file.clone())),
         mime: "image/gif".to_owned(),
@@ -199,7 +289,11 @@ fn giphy_gif(gif: &html::Image, media: &mut Vec<(MediaFile, String)>) -> Attachm
 enum Read {
     Message(Box<Message>),
     Deleted(String),
-    Typing { person: String, name: String, on: bool },
+    Typing {
+        person: String,
+        name: String,
+        on: bool,
+    },
     /// Housekeeping no reader needs to see.
     Nothing,
 }
@@ -211,7 +305,10 @@ struct Refs<'a> {
 
 impl Lookup for Refs<'_> {
     fn mention(&self, item: &str) -> Option<(MentionKind, String)> {
-        let named = self.mentions.iter().find(|mention| id_of(&mention["itemid"]) == item)?;
+        let named = self
+            .mentions
+            .iter()
+            .find(|mention| id_of(&mention["itemid"]) == item)?;
         let id = named["mri"].as_str().unwrap_or("").to_owned();
         Some(match named["mentionType"].as_str().unwrap_or("person") {
             "person" | "bot" => (MentionKind::User, id),
@@ -230,15 +327,26 @@ impl Lookup for Refs<'_> {
             return None;
         }
         let file = MediaFile::new(format!("emoji:{id}"), MediaKind::Emoji);
-        self.teams.ctx.media(&[(file.clone(), url.to_owned())]).ok()?;
+        self.teams
+            .ctx
+            .media(&[(file.clone(), url.to_owned())])
+            .ok()?;
         Some(file)
     }
 }
 
 /// The header of a quoted reply, as Teams' own client writes it.
 fn quote_markup(reply: &ReplyTo) -> String {
-    let text = |text: &str| html::compose(text).trim_start_matches("<p>").trim_end_matches("</p>").to_owned();
-    let person = reply.person.as_ref().map_or("", |person| person.id.as_str());
+    let text = |text: &str| {
+        html::compose(text)
+            .trim_start_matches("<p>")
+            .trim_end_matches("</p>")
+            .to_owned()
+    };
+    let person = reply
+        .person
+        .as_ref()
+        .map_or("", |person| person.id.as_str());
     format!(
         "<blockquote itemscope=\"\" itemtype=\"http://schema.skype.com/Reply\" itemid=\"{id}\">\
          <strong itemprop=\"mri\" itemid=\"{person}\">{name}</strong><span itemprop=\"time\" itemid=\"{id}\"></span>\
@@ -253,21 +361,34 @@ fn quote_markup(reply: &ReplyTo) -> String {
 impl Teams {
     /// Where the official app opens one message.
     fn message_link(&self, conversation: &str, id: &str) -> String {
-        let chat = if conversation.contains("@thread.tacv2") || conversation.contains("@thread.skype") {
-            ""
-        } else {
-            "&context=%7B%22contextType%22%3A%22chat%22%7D"
-        };
-        format!("{TEAMS}/l/message/{}/{id}?tenantId={}{chat}", escaped(conversation), escaped(&self.session.tenant))
+        let chat =
+            if conversation.contains("@thread.tacv2") || conversation.contains("@thread.skype") {
+                ""
+            } else {
+                "&context=%7B%22contextType%22%3A%22chat%22%7D"
+            };
+        format!(
+            "{TEAMS}/l/message/{}/{id}?tenantId={}{chat}",
+            escaped(conversation),
+            escaped(&self.session.tenant)
+        )
     }
 
     /// `ThreadActivity/…`: who joined, left or renamed the conversation, in words. Names come
     /// from what is already known; nobody is looked up for a grey line.
     fn activity(&self, kind: &str, content: &str) -> Option<String> {
-        let name = |id: &str| self.name_of(id.trim()).unwrap_or_else(|| "Someone".to_owned());
+        let name = |id: &str| {
+            self.name_of(id.trim())
+                .unwrap_or_else(|| "Someone".to_owned())
+        };
         let initiator = inside(content, "initiator").first().map(|id| name(id));
-        let targets: Vec<&str> = inside(content, "target").into_iter().map(str::trim).collect();
-        let own = inside(content, "initiator").first().is_some_and(|id| targets.len() == 1 && id.trim() == targets[0]);
+        let targets: Vec<&str> = inside(content, "target")
+            .into_iter()
+            .map(str::trim)
+            .collect();
+        let own = inside(content, "initiator")
+            .first()
+            .is_some_and(|id| targets.len() == 1 && id.trim() == targets[0]);
         let people = |ids: &[&str]| match ids {
             [] => "someone".to_owned(),
             [one] => name(one),
@@ -275,7 +396,11 @@ impl Teams {
         };
         let joined = |verb: &str| {
             let members: Value = serde_json::from_str(content).ok()?;
-            let names: Vec<&str> = members["members"].as_array()?.iter().filter_map(|member| member["friendlyname"].as_str()).collect();
+            let names: Vec<&str> = members["members"]
+                .as_array()?
+                .iter()
+                .filter_map(|member| member["friendlyname"].as_str())
+                .collect();
             let who = match names[..] {
                 [] => "Someone".to_owned(),
                 [one] => one.to_owned(),
@@ -285,12 +410,33 @@ impl Teams {
         };
         match kind.strip_prefix("ThreadActivity/")? {
             "AddMember" if own => Some(format!("{} joined", people(&targets))),
-            "AddMember" => Some(format!("{} added {}", initiator.unwrap_or_else(|| "Someone".to_owned()), people(&targets))),
+            "AddMember" => Some(format!(
+                "{} added {}",
+                initiator.unwrap_or_else(|| "Someone".to_owned()),
+                people(&targets)
+            )),
             "DeleteMember" if own => Some(format!("{} left", people(&targets))),
-            "DeleteMember" => Some(format!("{} removed {}", initiator.unwrap_or_else(|| "Someone".to_owned()), people(&targets))),
+            "DeleteMember" => Some(format!(
+                "{} removed {}",
+                initiator.unwrap_or_else(|| "Someone".to_owned()),
+                people(&targets)
+            )),
             "TopicUpdate" => {
-                let topic = inside(content, "value").first().map(|topic| html::parse(topic, &Refs { teams: self, mentions: &[] }, "").text)?;
-                Some(format!("{} named the conversation {topic}", initiator.unwrap_or_else(|| "Someone".to_owned())))
+                let topic = inside(content, "value").first().map(|topic| {
+                    html::parse(
+                        topic,
+                        &Refs {
+                            teams: self,
+                            mentions: &[],
+                        },
+                        "",
+                    )
+                    .text
+                })?;
+                Some(format!(
+                    "{} named the conversation {topic}",
+                    initiator.unwrap_or_else(|| "Someone".to_owned())
+                ))
             }
             "MemberJoined" => joined("joined"),
             "MemberLeft" => joined("left"),
@@ -322,12 +468,20 @@ impl Teams {
         if set(&props["deletetime"]) || set(&props["deletionTime"]) || set(&raw["deletetime"]) {
             return Read::Deleted(id);
         }
-        let name = match raw["imdisplayname"].as_str().filter(|name| !name.is_empty()) {
+        let name = match raw["imdisplayname"]
+            .as_str()
+            .filter(|name| !name.is_empty())
+        {
             Some(name) => name.to_owned(),
             None => self.name_of(&from).unwrap_or_default(),
         };
         let sent = match millis(&id) / 1000 {
-            0 => seconds(raw["composetime"].as_str().or(raw["originalarrivaltime"].as_str()).unwrap_or("")),
+            0 => seconds(
+                raw["composetime"]
+                    .as_str()
+                    .or(raw["originalarrivaltime"].as_str())
+                    .unwrap_or(""),
+            ),
             sent => sent,
         };
         let mut message = Message::plain(id.clone(), name.clone(), "", sent, from == me);
@@ -351,41 +505,69 @@ impl Teams {
                 return Read::Message(Box::new(message));
             }
             "RichText/Media_CallRecording" | "RichText/Media_CallTranscript" => {
-                message.kind = MessageKind::Unsupported { link: self.message_link(conversation, &id) };
+                message.kind = MessageKind::Unsupported {
+                    link: self.message_link(conversation, &id),
+                };
                 message.text = "Meeting recording".to_owned();
                 return Read::Message(Box::new(message));
             }
             _ => {}
         }
         let mentions = listed(&props["mentions"]);
-        let refs = Refs { teams: self, mentions: &mentions };
+        let refs = Refs {
+            teams: self,
+            mentions: &mentions,
+        };
         let mut parsed = match kind {
             // Plain text is taken as written, not read for markup.
             "Text" => html::parse(&html::compose(content), &refs, &me),
             _ => html::parse(content, &refs, &me),
         };
         // A channel post's headline is part of what it says.
-        let subject = [&props["subject"], &props["title"]].into_iter().filter_map(Value::as_str).find(|subject| !subject.trim().is_empty());
+        let subject = [&props["subject"], &props["title"]]
+            .into_iter()
+            .filter_map(Value::as_str)
+            .find(|subject| !subject.trim().is_empty());
         if let Some(subject) = subject.map(str::trim) {
             let shift = (subject.len() + usize::from(!parsed.text.is_empty())) as u32;
             for span in &mut parsed.spans {
                 span.start += shift;
                 span.end += shift;
             }
-            parsed.text = if parsed.text.is_empty() { subject.to_owned() } else { format!("{subject}\n{}", parsed.text) };
-            parsed.spans.insert(0, Span { start: 0, end: subject.len() as u32, style: Style::Bold });
+            parsed.text = if parsed.text.is_empty() {
+                subject.to_owned()
+            } else {
+                format!("{subject}\n{}", parsed.text)
+            };
+            parsed.spans.insert(
+                0,
+                Span {
+                    start: 0,
+                    end: subject.len() as u32,
+                    style: Style::Bold,
+                },
+            );
         }
         let mut media = Vec::new();
         for image in parsed.images {
             // `…/v1/objects/{id}/views/imgo`: the object is the picture, whatever view is asked.
-            let object = image.src.split("/objects/").nth(1).and_then(|rest| rest.split('/').next()).unwrap_or(&image.src);
+            let object = image
+                .src
+                .split("/objects/")
+                .nth(1)
+                .and_then(|rest| rest.split('/').next())
+                .unwrap_or(&image.src);
             let file = MediaFile {
                 width: image.width,
                 height: image.height,
                 ..MediaFile::new(format!("img:{}", escaped(object)), MediaKind::Image)
             };
             media.push((file.clone(), image.src.clone()));
-            let named = if image.name.trim().is_empty() { "image" } else { image.name.trim() };
+            let named = if image.name.trim().is_empty() {
+                "image"
+            } else {
+                image.name.trim()
+            };
             message.attachments.push(Attachment {
                 thumb: Some(file.clone()),
                 ..Attachment::new(named, file)
@@ -397,12 +579,22 @@ impl Teams {
         for shared in listed(&props["files"]) {
             let info = &shared["fileInfo"];
             let urls = [&info["shareUrl"], &shared["objectUrl"], &info["fileUrl"]];
-            let Some(url) = urls.into_iter().filter_map(Value::as_str).find(|url| url.starts_with("https://")) else {
+            let Some(url) = urls
+                .into_iter()
+                .filter_map(Value::as_str)
+                .find(|url| url.starts_with("https://"))
+            else {
                 continue;
             };
-            let named = [&shared["fileName"], &shared["title"]].into_iter().filter_map(Value::as_str).find(|name| !name.is_empty()).unwrap_or("File");
+            let named = [&shared["fileName"], &shared["title"]]
+                .into_iter()
+                .filter_map(Value::as_str)
+                .find(|name| !name.is_empty())
+                .unwrap_or("File");
             let sizes = [&shared["fileSize"], &shared["size"], &info["fileSize"]];
-            let key = Some(id_of(&shared["id"])).filter(|key| !key.is_empty()).unwrap_or_else(|| id_of(&shared["itemid"]));
+            let key = Some(id_of(&shared["id"]))
+                .filter(|key| !key.is_empty())
+                .unwrap_or_else(|| id_of(&shared["itemid"]));
             let file = MediaFile {
                 bytes: sizes.into_iter().find_map(Value::as_u64).unwrap_or(0),
                 ..MediaFile::new(format!("file:{id}:{}", escaped(&key)), MediaKind::File)
@@ -417,7 +609,13 @@ impl Teams {
             }
             let start = parsed.text.len() as u32;
             parsed.text.push_str(named);
-            parsed.spans.push(Span { start, end: parsed.text.len() as u32, style: Style::Link { url: url.to_owned() } });
+            parsed.spans.push(Span {
+                start,
+                end: parsed.text.len() as u32,
+                style: Style::Link {
+                    url: url.to_owned(),
+                },
+            });
         }
         if let Err(err) = self.ctx.media(&media) {
             tracing::warn!("chatd: Teams: {err}");
@@ -426,7 +624,9 @@ impl Teams {
         message.spans = parsed.spans;
         message.mentions_me = parsed.mentioned && !message.outgoing;
         message.reply_to = parsed.quote.map(|quote| ReplyTo {
-            person: Some(quote.mri).filter(|mri| !mri.is_empty()).map(|mri| self.ctx.key(&mri)),
+            person: Some(quote.mri)
+                .filter(|mri| !mri.is_empty())
+                .map(|mri| self.ctx.key(&mri)),
             id: quote.id,
             sender: quote.name,
             snippet: quote.preview.chars().take(120).collect(),
@@ -441,8 +641,12 @@ impl Teams {
                 Value::String(text) => serde_json::from_str(text).unwrap_or(Value::Null),
                 other => other.clone(),
             };
-            let title = [&meeting["meetingtitle"], &meeting["subject"]].into_iter().filter_map(Value::as_str).find(|title| !title.is_empty());
-            message.text = title.map_or_else(|| "Meeting".to_owned(), |title| format!("Meeting: {title}"));
+            let title = [&meeting["meetingtitle"], &meeting["subject"]]
+                .into_iter()
+                .filter_map(Value::as_str)
+                .find(|title| !title.is_empty());
+            message.text =
+                title.map_or_else(|| "Meeting".to_owned(), |title| format!("Meeting: {title}"));
             message.spans.clear();
             message.kind = MessageKind::Unsupported {
                 link: format!("{TEAMS}/l/meetup-join/{}/0", escaped(conversation)),
@@ -450,12 +654,19 @@ impl Teams {
         } else if parsed.card || !cards.is_empty() || kind == "RichText/Media_Card" {
             let title = cards.iter().find_map(|card| card_title(card, 6));
             if message.text.is_empty() {
-                message.text = title.map_or_else(|| "Card".to_owned(), |title| format!("Card: {}", title.chars().take(200).collect::<String>()));
+                message.text = title.map_or_else(
+                    || "Card".to_owned(),
+                    |title| format!("Card: {}", title.chars().take(200).collect::<String>()),
+                );
             }
-            message.kind = MessageKind::Unsupported { link: self.message_link(conversation, &id) };
+            message.kind = MessageKind::Unsupported {
+                link: self.message_link(conversation, &id),
+            };
         } else if message.text.is_empty() && message.attachments.is_empty() {
             message.text = "Unsupported message".to_owned();
-            message.kind = MessageKind::Unsupported { link: self.message_link(conversation, &id) };
+            message.kind = MessageKind::Unsupported {
+                link: self.message_link(conversation, &id),
+            };
         }
         message.client_id = echoed_client_id(raw, message.outgoing, &id);
         Read::Message(Box::new(message))
@@ -469,7 +680,12 @@ impl Teams {
             let Some(key) = entry["key"].as_str() else {
                 continue;
             };
-            let mut people: Vec<&str> = entry["users"].as_array().into_iter().flatten().filter_map(|user| user["mri"].as_str()).collect();
+            let mut people: Vec<&str> = entry["users"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|user| user["mri"].as_str())
+                .collect();
             people.sort_unstable();
             people.dedup();
             if people.is_empty() {
@@ -504,7 +720,11 @@ impl Teams {
             Read::Typing { person, name, on } => {
                 if person != self.me() && self.ctx.known(&place)?.is_some() {
                     if on {
-                        let name = if name.is_empty() { self.name_of(&person).unwrap_or_default() } else { name };
+                        let name = if name.is_empty() {
+                            self.name_of(&person).unwrap_or_default()
+                        } else {
+                            name
+                        };
                         self.ctx.typing(&place, &person, &name, TYPING_SHOWN);
                     } else {
                         self.ctx.typing_stopped(&place, &person);
@@ -514,7 +734,8 @@ impl Teams {
             }
             Read::Deleted(id) => {
                 self.ctx.deleted(&place, &id)?;
-                self.ctx.deleted(&chain_id(&place, root.as_deref().unwrap_or(&id)), &id)?;
+                self.ctx
+                    .deleted(&chain_id(&place, root.as_deref().unwrap_or(&id)), &id)?;
                 Ok(())
             }
             Read::Message(message) if new => self.arrived(&place, root.as_deref(), *message),
@@ -529,7 +750,10 @@ impl Teams {
         }
         // A chat the user hid comes back with a new message, as it does in Teams.
         if self.ctx.known(place)?.is_some_and(|row| row.hidden) {
-            let filing = crate::store::Filing { hidden: false, ..crate::store::Filing::default() };
+            let filing = crate::store::Filing {
+                hidden: false,
+                ..crate::store::Filing::default()
+            };
             self.ctx.filing(place, &filing)?;
         }
         let Some(root) = root.filter(|root| *root != message.id) else {
@@ -553,7 +777,10 @@ impl Teams {
     /// An edit, or a reaction given or taken back: Teams sends the whole message again. Only
     /// what is stored is updated, wherever it is: the conversation, or the chain it is in.
     fn changed(&self, place: &str, root: Option<&str>, message: Message) -> Result<(), Fault> {
-        for conversation in [place.to_owned(), chain_id(place, root.unwrap_or(&message.id))] {
+        for conversation in [
+            place.to_owned(),
+            chain_id(place, root.unwrap_or(&message.id)),
+        ] {
             let Some(stored) = self.ctx.stored_message(&conversation, &message.id)? else {
                 continue;
             };
@@ -568,7 +795,13 @@ impl Teams {
 
     /// The summary a post shows of its chain, after these replies: each one newer than the
     /// last counted adds one, so reading the same page twice counts nothing twice.
-    fn summary(&self, channel: &str, root: &str, before: Option<ThreadSummary>, replies: &[&Message]) -> Option<ThreadSummary> {
+    fn summary(
+        &self,
+        channel: &str,
+        root: &str,
+        before: Option<ThreadSummary>,
+        replies: &[&Message],
+    ) -> Option<ThreadSummary> {
         let mut summary = before.or_else(|| {
             (!replies.is_empty()).then(|| ThreadSummary {
                 id: chain_id(channel, root),
@@ -578,7 +811,10 @@ impl Teams {
                 unread: 0,
             })
         })?;
-        let mut newer: Vec<&&Message> = replies.iter().filter(|reply| reply.sent > summary.last || summary.replies == 0).collect();
+        let mut newer: Vec<&&Message> = replies
+            .iter()
+            .filter(|reply| reply.sent > summary.last || summary.replies == 0)
+            .collect();
         newer.sort_by_key(|reply| (reply.sent, millis(&reply.id)));
         for reply in newer {
             summary.replies += 1;
@@ -607,7 +843,12 @@ impl Teams {
     // Pages.
 
     /// One page of a conversation, newest first, and the cursor of the page before it.
-    pub(super) fn page(&self, conversation: &str, size: u32, window: &str) -> Result<(Vec<Value>, String), Fault> {
+    pub(super) fn page(
+        &self,
+        conversation: &str,
+        size: u32,
+        window: &str,
+    ) -> Result<(Vec<Value>, String), Fault> {
         let path = format!(
             "/v1/users/ME/conversations/{}/messages?view=msnp24Equivalent&pageSize={size}&{window}\
              &targetType=Passport%7CSkype%7CLync%7CThread%7CPSTN%7CAgent",
@@ -616,7 +857,10 @@ impl Teams {
         let mut body = self.chat("GET", &path, Body::None, true)?.body;
         let cursor = |link: &Value| {
             let query = link.as_str()?.split_once('?')?.1;
-            query.split('&').find_map(|pair| pair.strip_prefix("syncState=")).map(str::to_owned)
+            query
+                .split('&')
+                .find_map(|pair| pair.strip_prefix("syncState="))
+                .map(str::to_owned)
         };
         let older = cursor(&body["_metadata"]["backwardLink"]).unwrap_or_default();
         let messages = match body.get_mut("messages").map(Value::take) {
@@ -629,24 +873,41 @@ impl Teams {
     /// Records a page. In a channel the posts are its own and each reply goes to its chain; a
     /// chain, a chat and anything else holds every message itself.
     fn record(&self, conversation: &str, raws: &[Value]) -> Result<(), Fault> {
-        let channel = chain_of(conversation).is_none() && self.ctx.known(conversation)?.is_some_and(|row| row.kind == ConversationKind::Channel);
-        let (mut own, mut replies): (Vec<Message>, Vec<(String, Message)>) = (Vec::new(), Vec::new());
+        let channel = chain_of(conversation).is_none()
+            && self
+                .ctx
+                .known(conversation)?
+                .is_some_and(|row| row.kind == ConversationKind::Channel);
+        let (mut own, mut replies): (Vec<Message>, Vec<(String, Message)>) =
+            (Vec::new(), Vec::new());
         for raw in raws {
             let root = placed(raw).and_then(|(_, root)| root);
             match self.read(conversation, raw) {
-                Read::Message(message) => match root.filter(|root| channel && *root != message.id) {
-                    Some(root) => replies.push((root, *message)),
-                    None => own.push(*message),
-                },
+                Read::Message(message) => {
+                    match root.filter(|root| channel && *root != message.id) {
+                        Some(root) => replies.push((root, *message)),
+                        None => own.push(*message),
+                    }
+                }
                 Read::Deleted(id) => self.ctx.deleted(conversation, &id)?,
                 Read::Typing { .. } | Read::Nothing => {}
             }
         }
-        let of = |root: &str| -> Vec<&Message> { replies.iter().filter(|(of, _)| of == root).map(|(_, reply)| reply).collect() };
+        let of = |root: &str| -> Vec<&Message> {
+            replies
+                .iter()
+                .filter(|(of, _)| of == root)
+                .map(|(_, reply)| reply)
+                .collect()
+        };
         if let Some((parent, root)) = chain_of(conversation) {
             // The chain whole: the post's summary is exactly what is here.
             let answers: Vec<&Message> = own.iter().filter(|message| message.id != root).collect();
-            if let Some(mut first) = self.ctx.stored_message(parent, root)?.filter(|_| answers.len() < CHAIN as usize - 1) {
+            if let Some(mut first) = self
+                .ctx
+                .stored_message(parent, root)?
+                .filter(|_| answers.len() < CHAIN as usize - 1)
+            {
                 let exact = self.summary(parent, root, None, &answers);
                 if exact != first.thread {
                     first.thread = exact;
@@ -655,7 +916,10 @@ impl Teams {
             }
         } else if channel {
             for post in &mut own {
-                let before = self.ctx.stored_message(conversation, &post.id)?.and_then(|stored| stored.thread);
+                let before = self
+                    .ctx
+                    .stored_message(conversation, &post.id)?
+                    .and_then(|stored| stored.thread);
                 post.thread = self.summary(conversation, &post.id, before, &of(&post.id));
             }
         }
@@ -701,9 +965,16 @@ impl Teams {
 
     /// Where the page before the oldest message of this one starts, for when it is asked for.
     fn remember_cursor(&self, conversation: &str, messages: &[Value], older: &str) {
-        let oldest = messages.iter().map(|raw| id_of(&raw["id"])).filter(|id| millis(id) > 0).min_by_key(|id| millis(id));
+        let oldest = messages
+            .iter()
+            .map(|raw| id_of(&raw["id"]))
+            .filter(|id| millis(id) > 0)
+            .min_by_key(|id| millis(id));
         if let Some(oldest) = oldest.filter(|_| !older.is_empty()) {
-            self.ctx.set_note(&format!("older:{conversation}"), &format!("{oldest} {older}"));
+            self.ctx.set_note(
+                &format!("older:{conversation}"),
+                &format!("{oldest} {older}"),
+            );
         }
     }
 
@@ -713,7 +984,10 @@ impl Teams {
         if chain_of(conversation).is_some() || millis(before) == 0 {
             return Ok(());
         }
-        let note = self.ctx.note(&format!("older:{conversation}")).unwrap_or_default();
+        let note = self
+            .ctx
+            .note(&format!("older:{conversation}"))
+            .unwrap_or_default();
         let window = match note.split_once(' ') {
             Some((oldest, cursor)) if oldest == before => format!("startTime=1&syncState={cursor}"),
             _ => format!("startTime=1&endTime={}", millis(before) - 1),
@@ -734,7 +1008,8 @@ impl Teams {
         if held.len() >= PAGE as usize {
             return Ok(());
         }
-        let (messages, _) = self.page(conversation, PAGE, &format!("startTime={}", millis(after)))?;
+        let (messages, _) =
+            self.page(conversation, PAGE, &format!("startTime={}", millis(after)))?;
         self.record(conversation, &messages)
     }
 
@@ -743,7 +1018,11 @@ impl Teams {
         if chain_of(conversation).is_some() || millis(around) == 0 {
             return Ok(());
         }
-        let (messages, _) = self.page(conversation, PAGE, &format!("startTime=1&endTime={}", millis(around).saturating_add(1)))?;
+        let (messages, _) = self.page(
+            conversation,
+            PAGE,
+            &format!("startTime=1&endTime={}", millis(around).saturating_add(1)),
+        )?;
         self.record(conversation, &messages)
     }
 
@@ -766,37 +1045,67 @@ impl Teams {
 
     /// The message a reply quotes, as the line shown above it.
     fn quoted(&self, conversation: &str, id: &str) -> Result<Option<ReplyTo>, Fault> {
-        Ok(self.ctx.stored_message(conversation, id)?.map(|stored| ReplyTo {
-            person: Some(&stored.sender.id).filter(|id| !id.is_empty()).map(|id| self.ctx.key(id)),
-            id: stored.id,
-            sender: stored.sender.name,
-            snippet: stored.text.chars().take(120).collect(),
-            deleted: false,
-        }))
+        Ok(self
+            .ctx
+            .stored_message(conversation, id)?
+            .map(|stored| ReplyTo {
+                person: Some(&stored.sender.id)
+                    .filter(|id| !id.is_empty())
+                    .map(|id| self.ctx.key(id)),
+                id: stored.id,
+                sender: stored.sender.name,
+                snippet: stored.text.chars().take(120).collect(),
+                deleted: false,
+            }))
     }
 
     /// Posts a message and ends the send. `client_id` goes as Teams' own `clientmessageid`, so
     /// the copy push delivers replaces the pending row. In a chain's conversation it is a reply
     /// in that chain. A reply to a message in a chat quotes it, as Teams does; a reply to a
     /// post in a channel goes into the post's chain and is shown in the channel as a reply.
-    pub(super) fn post(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>) {
-        let outcome = self.posted(conversation, client_id, text, reply_to).map_err(super::reason);
+    pub(super) fn post(
+        &self,
+        conversation: &str,
+        client_id: &str,
+        text: &str,
+        reply_to: Option<&str>,
+    ) {
+        let outcome = self
+            .posted(conversation, client_id, text, reply_to)
+            .map_err(super::reason);
         self.ctx.sent(conversation, client_id, outcome);
     }
 
-    fn posted(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>) -> Result<Message, Fault> {
+    fn posted(
+        &self,
+        conversation: &str,
+        client_id: &str,
+        text: &str,
+        reply_to: Option<&str>,
+    ) -> Result<Message, Fault> {
         self.posted_with(conversation, client_id, text, reply_to, None)
     }
 
     /// The same, with `properties` (the files a message names) beside the body.
-    pub(super) fn posted_with(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, properties: Option<Value>) -> Result<Message, Fault> {
+    pub(super) fn posted_with(
+        &self,
+        conversation: &str,
+        client_id: &str,
+        text: &str,
+        reply_to: Option<&str>,
+        properties: Option<Value>,
+    ) -> Result<Message, Fault> {
         let mut content = html::compose(text);
         let mut target = conversation.to_owned();
         let quote = match reply_to {
             Some(original) => self.quoted(conversation, original)?,
             None => None,
         };
-        let channel = chain_of(conversation).is_none() && self.ctx.known(conversation)?.is_some_and(|row| row.kind == ConversationKind::Channel);
+        let channel = chain_of(conversation).is_none()
+            && self
+                .ctx
+                .known(conversation)?
+                .is_some_and(|row| row.kind == ConversationKind::Channel);
         match (reply_to, &quote) {
             (Some(original), _) if channel => target = chain_id(conversation, original),
             (_, Some(quote)) => content = format!("{}{content}", quote_markup(quote)),
@@ -810,7 +1119,9 @@ impl Teams {
         let answer = self.chat("POST", &path, Body::Json(&body), false)?;
         let id = id_of(&answer.body["OriginalArrivalTime"]);
         if millis(&id) == 0 {
-            return Err(Fault::Net("Teams accepted the message but did not name it".to_owned()));
+            return Err(Fault::Net(
+                "Teams accepted the message but did not name it".to_owned(),
+            ));
         }
         let me = self.me();
         let name = self.own_name();
@@ -830,18 +1141,31 @@ impl Teams {
     }
 
     fn message_path(&self, conversation: &str, id: &str) -> String {
-        format!("/v1/users/ME/conversations/{}/messages/{}", escaped(conversation), escaped(id))
+        format!(
+            "/v1/users/ME/conversations/{}/messages/{}",
+            escaped(conversation),
+            escaped(id)
+        )
     }
 
     pub(super) fn edit(&self, conversation: &str, id: &str, text: &str) -> Result<(), Fault> {
         let stored = self.ctx.stored_message(conversation, id)?;
         let mut content = html::compose(text);
         // The quote above a reply is part of the body, so it is written again.
-        if let Some(quote) = stored.as_ref().and_then(|stored| stored.reply_to.as_ref()).filter(|_| chain_of(conversation).is_none()) {
+        if let Some(quote) = stored
+            .as_ref()
+            .and_then(|stored| stored.reply_to.as_ref())
+            .filter(|_| chain_of(conversation).is_none())
+        {
             content = format!("{}{content}", quote_markup(quote));
         }
         let body = self.body(&now_ms().to_string(), &content);
-        self.chat("PUT", &self.message_path(conversation, id), Body::Json(&body), false)?;
+        self.chat(
+            "PUT",
+            &self.message_path(conversation, id),
+            Body::Json(&body),
+            false,
+        )?;
         if let Some(mut edited) = stored {
             edited.text = text.to_owned();
             edited.spans.clear();
@@ -852,7 +1176,10 @@ impl Teams {
     }
 
     pub(super) fn delete(&self, conversation: &str, id: &str) -> Result<(), Fault> {
-        let path = format!("{}?behavior=softDelete", self.message_path(conversation, id));
+        let path = format!(
+            "{}?behavior=softDelete",
+            self.message_path(conversation, id)
+        );
         self.chat("DELETE", &path, Body::None, false)?;
         self.ctx.deleted(conversation, id)?;
         // A post deleted in its channel is gone from the top of its chain too.
@@ -862,7 +1189,13 @@ impl Teams {
         Ok(())
     }
 
-    pub(super) fn react(&self, conversation: &str, id: &str, emoji: &str, on: bool) -> Result<(), Fault> {
+    pub(super) fn react(
+        &self,
+        conversation: &str,
+        id: &str,
+        emoji: &str,
+        on: bool,
+    ) -> Result<(), Fault> {
         let learned = || self.ctx.note(&format!("r:{}", bare_emoji(emoji)));
         let Some(key) = key_of(emoji).map(str::to_owned).or_else(learned) else {
             return Err(Fault::Refused {
@@ -870,7 +1203,10 @@ impl Teams {
                 message: "tinyclient does not know Teams' name for that emoji yet".to_owned(),
             });
         };
-        let path = format!("{}/properties?name=emotions", self.message_path(conversation, id));
+        let path = format!(
+            "{}/properties?name=emotions",
+            self.message_path(conversation, id)
+        );
         let (method, body) = match on {
             true => ("PUT", json!({"emotions": {"key": key, "value": now_ms()}})),
             false => ("DELETE", json!({"emotions": {"key": key}})),
@@ -886,28 +1222,63 @@ mod tests {
 
     #[test]
     fn a_giphy_gif_plays_from_giphys_small_copy_and_opens_as_the_original() {
-        let gif = html::Image { src: "https://media4.giphy.com/media/abc123/giphy.gif?cid=1&rid=giphy.gif".into(), width: 342, height: 250, name: "happy dance".into() };
+        let gif = html::Image {
+            src: "https://media4.giphy.com/media/abc123/giphy.gif?cid=1&rid=giphy.gif".into(),
+            width: 342,
+            height: 250,
+            name: "happy dance".into(),
+        };
         let mut media = Vec::new();
         let attached = giphy_gif(&gif, &mut media);
         let thumb = attached.thumb.clone().unwrap();
-        assert_eq!((attached.file.kind, attached.mime.as_str(), attached.name.as_str()), (MediaKind::Gif, "image/gif", "happy dance"));
+        assert_eq!(
+            (
+                attached.file.kind,
+                attached.mime.as_str(),
+                attached.name.as_str()
+            ),
+            (MediaKind::Gif, "image/gif", "happy dance")
+        );
         assert_eq!((thumb.width, thumb.height), (273, 200));
         let urls: Vec<&str> = media.iter().map(|(_, url)| url.as_str()).collect();
-        assert_eq!(urls, [gif.src.as_str(), "https://media4.giphy.com/media/abc123/200.webp"]);
+        assert_eq!(
+            urls,
+            [
+                gif.src.as_str(),
+                "https://media4.giphy.com/media/abc123/200.webp"
+            ]
+        );
         // An address of another shape is shown as it is.
-        let odd = html::Image { src: "https://i.giphy.com/abc123.gif".into(), width: 0, height: 0, name: String::new() };
+        let odd = html::Image {
+            src: "https://i.giphy.com/abc123.gif".into(),
+            width: 0,
+            height: 0,
+            name: String::new(),
+        };
         let mut media = Vec::new();
         let attached = giphy_gif(&odd, &mut media);
-        assert_eq!((attached.thumb.as_ref().map(|thumb| thumb.id.clone()), media.len()), (Some(attached.file.id.clone()), 1));
+        assert_eq!(
+            (
+                attached.thumb.as_ref().map(|thumb| thumb.id.clone()),
+                media.len()
+            ),
+            (Some(attached.file.id.clone()), 1)
+        );
     }
 
     #[test]
     fn a_copy_of_our_message_keeps_the_client_id_teams_echoes() {
         let raw = json!({"id": "1760001000000", "clientmessageid": "1760000999000111"});
-        assert_eq!(echoed_client_id(&raw, true, "1760001000000").as_deref(), Some("1760000999000111"));
+        assert_eq!(
+            echoed_client_id(&raw, true, "1760001000000").as_deref(),
+            Some("1760000999000111")
+        );
         // Teams writes the same id as a number in some payloads.
         let numbered = json!({"id": "1760001000000", "clientmessageid": 1760000999000111u64});
-        assert_eq!(echoed_client_id(&numbered, true, "1760001000000").as_deref(), Some("1760000999000111"));
+        assert_eq!(
+            echoed_client_id(&numbered, true, "1760001000000").as_deref(),
+            Some("1760000999000111")
+        );
         assert_eq!(echoed_client_id(&raw, false, "1760001000000"), None);
         let same = json!({"id": "1760001000000", "clientmessageid": "1760001000000"});
         assert_eq!(echoed_client_id(&same, true, "1760001000000"), None);
@@ -915,24 +1286,50 @@ mod tests {
 
     #[test]
     fn reaction_keys_read_as_emoji_and_back() {
-        assert_eq!((emoji_of("like"), emoji_of("heart"), emoji_of("sad")), ("👍".to_owned(), "❤️".to_owned(), "🙁".to_owned()));
+        assert_eq!(
+            (emoji_of("like"), emoji_of("heart"), emoji_of("sad")),
+            ("👍".to_owned(), "❤️".to_owned(), "🙁".to_owned())
+        );
         assert_eq!(emoji_of("1f389_partypopper"), "🎉");
         assert_eq!(emoji_of("1f9d1-200d-1f4bb_technologist"), "🧑\u{200d}💻");
         assert_eq!(emoji_of("like-tone3"), "👍🏽");
         assert_eq!(emoji_of("oreoyum"), ":oreoyum:");
-        assert_eq!((key_of("👍"), key_of("👍🏽"), key_of("❤"), key_of("🎉")), (Some("like"), Some("like"), Some("heart"), Some("1f389_partypopper")));
+        assert_eq!(
+            (key_of("👍"), key_of("👍🏽"), key_of("❤"), key_of("🎉")),
+            (
+                Some("like"),
+                Some("like"),
+                Some("heart"),
+                Some("1f389_partypopper")
+            )
+        );
         assert_eq!(key_of("🦑"), None);
     }
 
     #[test]
     fn a_message_says_where_it_is_and_what_chain_it_hangs_off() {
         let reply = json!({"conversationLink": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/conversations/19:gen@thread.tacv2;messageid=1760000200200"});
-        assert_eq!(placed(&reply), Some(("19:gen@thread.tacv2".to_owned(), Some("1760000200200".to_owned()))));
+        assert_eq!(
+            placed(&reply),
+            Some((
+                "19:gen@thread.tacv2".to_owned(),
+                Some("1760000200200".to_owned())
+            ))
+        );
         let chat = json!({"conversationLink": "https://x/v1/users/ME/conversations/19:a_b@unq.gbl.spaces"});
-        assert_eq!(placed(&chat), Some(("19:a_b@unq.gbl.spaces".to_owned(), None)));
-        assert_eq!(placed(&json!({"conversationid": "19:c@thread.v2"})), Some(("19:c@thread.v2".to_owned(), None)));
+        assert_eq!(
+            placed(&chat),
+            Some(("19:a_b@unq.gbl.spaces".to_owned(), None))
+        );
+        assert_eq!(
+            placed(&json!({"conversationid": "19:c@thread.v2"})),
+            Some(("19:c@thread.v2".to_owned(), None))
+        );
         assert_eq!(placed(&json!({})), None);
-        assert_eq!(person("https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/8:orgid:ana"), "8:orgid:ana");
+        assert_eq!(
+            person("https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/8:orgid:ana"),
+            "8:orgid:ana"
+        );
         assert_eq!(person("8:orgid:ana"), "8:orgid:ana");
     }
 
@@ -951,9 +1348,15 @@ mod tests {
         assert_eq!(inside(added, "target"), ["8:orgid:b", "8:orgid:c"]);
         assert_eq!(inside(added, "initiator"), ["8:orgid:a"]);
         assert!(inside("<a>unclosed", "a").is_empty());
-        assert_eq!(call_line("<partlist type=\"started\" alt=\"\"></partlist>"), "A call started");
+        assert_eq!(
+            call_line("<partlist type=\"started\" alt=\"\"></partlist>"),
+            "A call started"
+        );
         assert_eq!(call_line("<partlist type=\"ended\"><part identity=\"8:orgid:a\"><duration>125</duration></part><part><duration>90.5</duration></part></partlist>"), "A call ended · 2 min");
-        assert_eq!(call_line("<partlist type=\"missed\"></partlist>"), "Missed call");
+        assert_eq!(
+            call_line("<partlist type=\"missed\"></partlist>"),
+            "Missed call"
+        );
         let card = json!([{"content": "{\"type\":\"AdaptiveCard\",\"actions\":[{\"title\":\"Open\"}],\"body\":[{\"type\":\"TextBlock\",\"text\":\"Deploy #42\"}]}"}]);
         assert_eq!(card_title(&card, 6).as_deref(), Some("Deploy #42"));
     }
@@ -982,6 +1385,13 @@ mod tests {
         let parsed = html::parse(&format!("{}<p>yes</p>", quote_markup(&reply)), &None_, "");
         let quote = parsed.quote.unwrap();
         assert_eq!(parsed.text, "yes");
-        assert_eq!((quote.id.as_str(), quote.name.as_str(), quote.preview.as_str()), ("1760000100100", "Ana <Ruiz>", "is it \"green\"?"));
+        assert_eq!(
+            (
+                quote.id.as_str(),
+                quote.name.as_str(),
+                quote.preview.as_str()
+            ),
+            ("1760000100100", "Ana <Ruiz>", "is it \"green\"?")
+        );
     }
 }

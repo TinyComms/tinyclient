@@ -30,21 +30,38 @@ fn process_rss_kb(pid: u32) -> u64 {
         let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
         let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
         // SAFETY: `info` is as large as the call is told it is.
-        let got = unsafe { libc::proc_pidinfo(pid as libc::c_int, libc::PROC_PIDTASKINFO, 0, (&raw mut info).cast(), size) };
-        if got == size { info.pti_resident_size / 1024 } else { 0 }
+        let got = unsafe {
+            libc::proc_pidinfo(
+                pid as libc::c_int,
+                libc::PROC_PIDTASKINFO,
+                0,
+                (&raw mut info).cast(),
+                size,
+            )
+        };
+        if got == size {
+            info.pti_resident_size / 1024
+        } else {
+            0
+        }
     }
     #[cfg(target_os = "linux")]
     {
         // An exited process waiting to be reaped has no VmRSS line.
         let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
         let rss = status.lines().find_map(|line| line.strip_prefix("VmRSS:"));
-        rss.and_then(|kb| kb.trim().trim_end_matches("kB").trim().parse().ok()).unwrap_or(0)
+        rss.and_then(|kb| kb.trim().trim_end_matches("kB").trim().parse().ok())
+            .unwrap_or(0)
     }
     #[cfg(windows)]
     {
         use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
-        use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
-        use windows_sys::Win32::System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+        use windows_sys::Win32::System::ProcessStatus::{
+            GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+        };
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
         // SAFETY: the handle is checked before use and closed after; the counters are sized for
         // the call.
         unsafe {
@@ -58,13 +75,19 @@ fn process_rss_kb(pid: u32) -> u64 {
             let alive = GetExitCodeProcess(process, &mut code) != 0 && code == STILL_ACTIVE as u32;
             let read = alive && GetProcessMemoryInfo(process, &mut counters, counters.cb) != 0;
             CloseHandle(process);
-            if read { counters.WorkingSetSize as u64 / 1024 } else { 0 }
+            if read {
+                counters.WorkingSetSize as u64 / 1024
+            } else {
+                0
+            }
         }
     }
 }
 
 fn fnv(hash: u64, bytes: &[u8]) -> u64 {
-    bytes.iter().fold(hash, |hash, byte| (hash ^ *byte as u64).wrapping_mul(0x0100_0000_01b3))
+    bytes.iter().fold(hash, |hash, byte| {
+        (hash ^ *byte as u64).wrapping_mul(0x0100_0000_01b3)
+    })
 }
 
 const FNV: u64 = 0xcbf2_9ce4_8422_2325;
@@ -153,7 +176,12 @@ impl Sink {
             }
             seen.chunked |= lower.starts_with("transfer-encoding:") && lower.contains("chunked");
         }
-        let pace = seen.path.split("pace=").nth(1).and_then(|pace| pace.parse::<u64>().ok()).unwrap_or(0);
+        let pace = seen
+            .path
+            .split("pace=")
+            .nth(1)
+            .and_then(|pace| pace.parse::<u64>().ok())
+            .unwrap_or(0);
         let at = {
             let mut log = log.lock().unwrap();
             log.push(seen.clone());
@@ -169,7 +197,8 @@ impl Sink {
                     let piece = &buffer[..read];
                     seen.hash = fnv(seen.hash, piece);
                     if seen.head.len() < 512 {
-                        seen.head.extend_from_slice(&piece[..read.min(512 - seen.head.len())]);
+                        seen.head
+                            .extend_from_slice(&piece[..read.min(512 - seen.head.len())]);
                     }
                     seen.tail.extend_from_slice(piece);
                     let keep = seen.tail.len().saturating_sub(128);
@@ -206,7 +235,11 @@ struct Scratch {
 impl Scratch {
     fn new() -> Scratch {
         static NEXT: AtomicU32 = AtomicU32::new(0);
-        let root = std::env::temp_dir().join(format!("tinyclient-upload-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        let root = std::env::temp_dir().join(format!(
+            "tinyclient-upload-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
         let _ = std::fs::remove_dir_all(&root);
         let (dir, home) = (root.join("support"), root.join("home"));
         std::fs::create_dir_all(dir.join("outbox")).unwrap();
@@ -288,18 +321,31 @@ fn child() {
     let started = Instant::now();
     let told: Arc<Mutex<Vec<(u64, u64, u64)>>> = Arc::default();
     let log = told.clone();
-    let report = move |sent, total| log.lock().unwrap().push((started.elapsed().as_millis() as u64, sent, total));
+    let report = move |sent, total| {
+        log.lock()
+            .unwrap()
+            .push((started.elapsed().as_millis() as u64, sent, total))
+    };
     match case.as_str() {
         "stream" => {
             // One small upload first, so the connection code and its buffers are already paid
             // for when the large one is measured.
             let warm = PathBuf::from(var("UPLOAD_WARM"));
-            let mut first = Upload::with_progress(&account(), "c-warm", &[staged(&warm, "")], |_, _| {}).unwrap();
-            first.send(0, &Target::put(url.split('?').next().unwrap_or_default())).unwrap();
+            let mut first =
+                Upload::with_progress(&account(), "c-warm", &[staged(&warm, "")], |_, _| {})
+                    .unwrap();
+            first
+                .send(0, &Target::put(url.split('?').next().unwrap_or_default()))
+                .unwrap();
             println!("BEGIN");
             sleep(Duration::from_millis(300));
-            let mut up = Upload::with_progress(&account(), "c-big", &[staged(&file, "big.bin")], report).unwrap();
-            let answer = up.send(0, &Target::put(url).header("Authorization", "Bearer xoxc-1"));
+            let mut up =
+                Upload::with_progress(&account(), "c-big", &[staged(&file, "big.bin")], report)
+                    .unwrap();
+            let answer = up.send(
+                0,
+                &Target::put(url).header("Authorization", "Bearer xoxc-1"),
+            );
             println!("END");
             let ok = answer.is_ok();
             let body = answer.map(|answer| answer.body).unwrap_or_else(|why| why);
@@ -316,40 +362,70 @@ fn child() {
                     upload::cancel(&account, "c-cancel");
                 }
             };
-            let mut up = Upload::with_progress(&self::account(), "c-cancel", &[staged(&file, "")], report).unwrap();
+            let mut up =
+                Upload::with_progress(&self::account(), "c-cancel", &[staged(&file, "")], report)
+                    .unwrap();
             let answer = up.send(0, &Target::put(url));
-            result(json!({"answer": answer.map(|answer| answer.body).unwrap_or_else(|why| format!("Err {why}")), "cancelled": up.cancelled()}));
+            result(
+                json!({"answer": answer.map(|answer| answer.body).unwrap_or_else(|why| format!("Err {why}")), "cancelled": up.cancelled()}),
+            );
         }
         "early" => {
             // Cancel arrives before the send's upload begins.
             upload::cancel(&account(), "c-early");
-            let mut up = Upload::with_progress(&account(), "c-early", &[staged(&file, "")], |_, _| {}).unwrap();
+            let mut up =
+                Upload::with_progress(&account(), "c-early", &[staged(&file, "")], |_, _| {})
+                    .unwrap();
             let answer = up.send(0, &Target::put(url));
-            result(json!({"answer": answer.map(|answer| answer.body).unwrap_or_else(|why| format!("Err {why}"))}));
+            result(
+                json!({"answer": answer.map(|answer| answer.body).unwrap_or_else(|why| format!("Err {why}"))}),
+            );
         }
         "paths" => {
             let outcomes: Vec<Value> = var("UPLOAD_PATHS")
                 .split('\n')
-                .map(|path| match Upload::with_progress(&account(), "c-paths", &[staged(Path::new(path), "")], |_, _| {}) {
-                    Ok(_) => json!({"path": path, "ok": true}),
-                    Err(why) => json!({"path": path, "ok": false, "why": why}),
+                .map(|path| {
+                    match Upload::with_progress(
+                        &account(),
+                        "c-paths",
+                        &[staged(Path::new(path), "")],
+                        |_, _| {},
+                    ) {
+                        Ok(_) => json!({"path": path, "ok": true}),
+                        Err(why) => json!({"path": path, "ok": false, "why": why}),
+                    }
                 })
                 .collect();
             // A file that may be read, sent to a host that is not the network's.
-            let mut up = Upload::with_progress(&account(), "c-host", &[staged(&file, "notes.txt")], |_, _| {}).unwrap();
-            let elsewhere: Vec<String> = ["https://example.org/upload", "http://example.org/upload", "https://files.slack.com.example.org/upload"]
-                .iter()
-                .map(|url| up.send(0, &Target::put(*url)).err().unwrap_or_default())
-                .collect();
+            let mut up = Upload::with_progress(
+                &account(),
+                "c-host",
+                &[staged(&file, "notes.txt")],
+                |_, _| {},
+            )
+            .unwrap();
+            let elsewhere: Vec<String> = [
+                "https://example.org/upload",
+                "http://example.org/upload",
+                "https://files.slack.com.example.org/upload",
+            ]
+            .iter()
+            .map(|url| up.send(0, &Target::put(*url)).err().unwrap_or_default())
+            .collect();
             result(json!({"outcomes": outcomes, "elsewhere": elsewhere}));
         }
         "form" => {
-            let mut up = Upload::with_progress(&account(), "c-form", &[staged(&file, "cat.png")], report).unwrap();
-            let answer = up.send_form(0, &Target::post(url), "file", &[("channels", "C1")]).map(|answer| answer.status);
+            let mut up =
+                Upload::with_progress(&account(), "c-form", &[staged(&file, "cat.png")], report)
+                    .unwrap();
+            let answer = up
+                .send_form(0, &Target::post(url), "file", &[("channels", "C1")])
+                .map(|answer| answer.status);
             result(json!({"status": answer.unwrap_or(0), "told": *told.lock().unwrap()}));
         }
         "parts" => {
-            let mut up = Upload::with_progress(&account(), "c-parts", &[staged(&file, "")], report).unwrap();
+            let mut up =
+                Upload::with_progress(&account(), "c-parts", &[staged(&file, "")], report).unwrap();
             let mut parts = Vec::new();
             let mut hash = FNV;
             up.parts(0, 512 * 1024, 0, |part| {
@@ -365,7 +441,9 @@ fn child() {
                 Ok(())
             })
             .unwrap();
-            result(json!({"parts": parts, "hash": hash.to_string(), "resumed": resumed, "told": *told.lock().unwrap()}));
+            result(
+                json!({"parts": parts, "hash": hash.to_string(), "resumed": resumed, "told": *told.lock().unwrap()}),
+            );
         }
         other => panic!("no case {other}"),
     }
@@ -406,7 +484,13 @@ fn a_50_mb_file_streams_from_disk_with_memory_flat_and_progress_a_few_times_a_se
             SAMPLER.lock().unwrap().replace(sampler);
         }
     });
-    let (sampled, samples) = SAMPLER.lock().unwrap().take().expect("sampled").join().unwrap();
+    let (sampled, samples) = SAMPLER
+        .lock()
+        .unwrap()
+        .take()
+        .expect("sampled")
+        .join()
+        .unwrap();
     peak = peak.max(sampled);
     assert!(samples >= 20, "RSS was sampled {samples} times");
     assert_eq!(outcome["ok"], true, "{outcome}");
@@ -414,23 +498,47 @@ fn a_50_mb_file_streams_from_disk_with_memory_flat_and_progress_a_few_times_a_se
     // The sink got the whole file, byte for byte, with its length up front, as signed upload
     // addresses require, and the session's header the adapter named.
     let seen = sink.seen();
-    let request = seen.iter().find(|seen| seen.path.starts_with("/upload/v1/big?")).unwrap();
-    assert_eq!((request.method.as_str(), request.length, request.chunked), ("PUT", Some(50 * MB), false));
-    assert_eq!((request.received, request.hash, request.completed), (50 * MB, hash, true));
+    let request = seen
+        .iter()
+        .find(|seen| seen.path.starts_with("/upload/v1/big?"))
+        .unwrap();
+    assert_eq!(
+        (request.method.as_str(), request.length, request.chunked),
+        ("PUT", Some(50 * MB), false)
+    );
+    assert_eq!(
+        (request.received, request.hash, request.completed),
+        (50 * MB, hash, true)
+    );
 
     // Memory: one buffer, never the file.
     eprintln!("upload of 50 MB: RSS {before} KB before, {peak} KB at most, {samples} samples");
-    assert!(peak < before + 3 * 1024, "RSS rose from {before} KB to {peak} KB during a 50 MB upload");
+    assert!(
+        peak < before + 3 * 1024,
+        "RSS rose from {before} KB to {peak} KB during a 50 MB upload"
+    );
 
     // Progress: a few times a second, never per buffer, and once at the very end.
     let told: Vec<(u64, u64, u64)> = serde_json::from_value(outcome["told"].clone()).unwrap();
     let (last_at, last, total) = *told.last().unwrap();
     assert_eq!((last, total), (50 * MB, 50 * MB));
     let span = last_at - told[0].0;
-    assert!(told.len() >= 4, "progress was told {} times over {span} ms", told.len());
-    assert!(told.len() as u64 <= span / 250 + 2, "progress was told {} times over {span} ms", told.len());
+    assert!(
+        told.len() >= 4,
+        "progress was told {} times over {span} ms",
+        told.len()
+    );
+    assert!(
+        told.len() as u64 <= span / 250 + 2,
+        "progress was told {} times over {span} ms",
+        told.len()
+    );
     for pair in told[..told.len() - 1].windows(2) {
-        assert!(pair[1].0 - pair[0].0 >= 240, "two reports {} ms apart", pair[1].0 - pair[0].0);
+        assert!(
+            pair[1].0 - pair[0].0 >= 240,
+            "two reports {} ms apart",
+            pair[1].0 - pair[0].0
+        );
         assert!(pair[1].1 > pair[0].1, "progress only goes up");
     }
 
@@ -447,7 +555,10 @@ fn cancel_stops_the_body_midway_and_no_request_completes() {
     let sink = Sink::start();
     let file = scratch.outbox("clip.mov");
     write_file(&file, 40 * MB);
-    let env = [("UPLOAD_FILE", file.to_string_lossy().into_owned()), ("UPLOAD_URL", sink.url("/upload/v1/clip?pace=2000"))];
+    let env = [
+        ("UPLOAD_FILE", file.to_string_lossy().into_owned()),
+        ("UPLOAD_URL", sink.url("/upload/v1/clip?pace=2000")),
+    ];
     let outcome = scratch.run("cancel", &env, |_, _| {});
     assert_eq!(outcome["answer"], format!("Err {CANCELLED}"));
     assert_eq!(outcome["cancelled"], true);
@@ -456,14 +567,24 @@ fn cancel_stops_the_body_midway_and_no_request_completes() {
     let seen = sink.seen();
     assert_eq!(seen.len(), 1, "one request was begun");
     let request = &seen[0];
-    assert!(!request.completed, "the cut-off request was never whole, so never answered");
-    assert!(request.received >= 4 * MB && request.received < 40 * MB, "{} bytes arrived", request.received);
+    assert!(
+        !request.completed,
+        "the cut-off request was never whole, so never answered"
+    );
+    assert!(
+        request.received >= 4 * MB && request.received < 40 * MB,
+        "{} bytes arrived",
+        request.received
+    );
     // A cancelled send can be retried, so the staged file stays.
     assert!(file.exists());
 
     // Cancelled before its upload began: nothing is asked of the network at all.
     let sink = Sink::start();
-    let env = [("UPLOAD_FILE", file.to_string_lossy().into_owned()), ("UPLOAD_URL", sink.url("/upload/v1/early"))];
+    let env = [
+        ("UPLOAD_FILE", file.to_string_lossy().into_owned()),
+        ("UPLOAD_URL", sink.url("/upload/v1/early")),
+    ];
     let outcome = scratch.run("early", &env, |_, _| {});
     assert_eq!(outcome["answer"], format!("Err {CANCELLED}"));
     assert!(sink.seen().is_empty());
@@ -495,8 +616,21 @@ fn only_files_the_user_could_pick_or_the_outbox_are_read_and_only_the_networks_h
     };
     #[cfg(not(unix))]
     let links: Vec<PathBuf> = Vec::new();
-    let refused = [store.clone(), session, cached, key, keychain, home.join("Desktop"), PathBuf::from("Documents/notes.txt"), home.join("gone.txt")];
-    let paths: Vec<String> = std::iter::once(&picked).chain(refused.iter()).chain(links.iter()).map(|path| path.to_string_lossy().into_owned()).collect();
+    let refused = [
+        store.clone(),
+        session,
+        cached,
+        key,
+        keychain,
+        home.join("Desktop"),
+        PathBuf::from("Documents/notes.txt"),
+        home.join("gone.txt"),
+    ];
+    let paths: Vec<String> = std::iter::once(&picked)
+        .chain(refused.iter())
+        .chain(links.iter())
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
     let env = [
         ("UPLOAD_FILE", picked.to_string_lossy().into_owned()),
         ("UPLOAD_PATHS", paths.join("\n")),
@@ -504,7 +638,11 @@ fn only_files_the_user_could_pick_or_the_outbox_are_read_and_only_the_networks_h
     ];
     let outcome = scratch.run("paths", &env, |_, _| {});
     let outcomes = outcome["outcomes"].as_array().unwrap();
-    assert_eq!(outcomes[0]["ok"], true, "a file the user picked is read: {}", outcomes[0]);
+    assert_eq!(
+        outcomes[0]["ok"], true,
+        "a file the user picked is read: {}",
+        outcomes[0]
+    );
     for refused in &outcomes[1..] {
         assert_eq!(refused["ok"], false, "{refused}");
         // The refusal names the file, in words.
@@ -513,10 +651,24 @@ fn only_files_the_user_could_pick_or_the_outbox_are_read_and_only_the_networks_h
         let why = refused["why"].as_str().unwrap();
         assert!(why.starts_with(&*name), "{why:?} names {name}");
     }
-    let folder = outcomes.iter().find(|outcome| outcome["path"].as_str().unwrap().ends_with("Desktop")).unwrap();
-    assert!(folder["why"].as_str().unwrap().contains("Folders can't be sent"), "{folder}");
+    let folder = outcomes
+        .iter()
+        .find(|outcome| outcome["path"].as_str().unwrap().ends_with("Desktop"))
+        .unwrap();
+    assert!(
+        folder["why"]
+            .as_str()
+            .unwrap()
+            .contains("Folders can't be sent"),
+        "{folder}"
+    );
     for why in outcome["elsewhere"].as_array().unwrap() {
-        assert!(why.as_str().unwrap().starts_with("notes.txt could not be sent"), "{why}");
+        assert!(
+            why.as_str()
+                .unwrap()
+                .starts_with("notes.txt could not be sent"),
+            "{why}"
+        );
     }
     assert!(sink.seen().is_empty(), "nothing was sent anywhere");
     assert!(store.exists() && picked.exists());
@@ -528,7 +680,10 @@ fn a_form_upload_carries_the_file_as_a_named_field_and_parts_come_one_buffer_at_
     let sink = Sink::start();
     let picture = scratch.home.join("Pictures/cat.png");
     let hash = write_file(&picture, 2_400_000);
-    let env = [("UPLOAD_FILE", picture.to_string_lossy().into_owned()), ("UPLOAD_URL", sink.url("/api/files.upload"))];
+    let env = [
+        ("UPLOAD_FILE", picture.to_string_lossy().into_owned()),
+        ("UPLOAD_URL", sink.url("/api/files.upload")),
+    ];
     let outcome = scratch.run("form", &env, |_, _| {});
     assert_eq!(outcome["status"], 200);
     let request = sink.seen().pop().unwrap();
@@ -536,7 +691,10 @@ fn a_form_upload_carries_the_file_as_a_named_field_and_parts_come_one_buffer_at_
     assert!(request.completed && request.length == Some(request.received));
     let head = String::from_utf8_lossy(&request.head);
     assert!(head.contains("name=\"channels\"\r\n\r\nC1\r\n"), "{head}");
-    assert!(head.contains("name=\"file\"; filename=\"cat.png\"\r\nContent-Type: image/png\r\n\r\n"), "{head}");
+    assert!(
+        head.contains("name=\"file\"; filename=\"cat.png\"\r\nContent-Type: image/png\r\n\r\n"),
+        "{head}"
+    );
     let tail = String::from_utf8_lossy(&request.tail);
     assert!(tail.trim_end().ends_with("--"), "{tail}");
     assert!(request.received > 2_400_000 && request.received < 2_400_000 + 600);
@@ -546,12 +704,26 @@ fn a_form_upload_carries_the_file_as_a_named_field_and_parts_come_one_buffer_at_
     assert_eq!(parts.len(), 5);
     for (at, (index, count, length)) in parts.iter().enumerate() {
         assert_eq!((*index as usize, *count), (at, 5));
-        assert_eq!(*length, if at < 4 { 512 * 1024 } else { 2_400_000 - 4 * 512 * 1024 });
+        assert_eq!(
+            *length,
+            if at < 4 {
+                512 * 1024
+            } else {
+                2_400_000 - 4 * 512 * 1024
+            }
+        );
     }
-    assert_eq!(outcome["hash"], hash.to_string(), "the parts are the file, in order");
+    assert_eq!(
+        outcome["hash"],
+        hash.to_string(),
+        "the parts are the file, in order"
+    );
     assert_eq!(outcome["resumed"], json!([3, 4]));
     let told: Vec<(u64, u64, u64)> = serde_json::from_value(outcome["told"].clone()).unwrap();
-    assert_eq!(told.last().map(|(_, sent, total)| (*sent, *total)), Some((2_400_000, 2_400_000)));
+    assert_eq!(
+        told.last().map(|(_, sent, total)| (*sent, *total)),
+        Some((2_400_000, 2_400_000))
+    );
     // Not a file of the outbox, so it stays.
     assert!(picture.exists());
 }

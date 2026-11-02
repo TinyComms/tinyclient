@@ -29,7 +29,9 @@ enum Way {
     Qr,
     Phone,
     /// The second password, and the way that led to it.
-    Password { from_qr: bool },
+    Password {
+        from_qr: bool,
+    },
     Ended,
 }
 
@@ -69,22 +71,37 @@ fn current() -> MutexGuard<'static, Option<Arc<Flow>>> {
 }
 
 fn waiting() -> SignInStep {
-    SignInStep::Qr { link: String::new(), expires: 0, problem: None }
+    SignInStep::Qr {
+        link: String::new(),
+        expires: 0,
+        problem: None,
+    }
 }
 
 /// Begins a sign-in, or with `input` answers the step on show. Answers the step to draw.
 /// `Err` when this build cannot sign in to Telegram at all, and why.
-pub fn step(hub: &Arc<Hub>, input: Option<SignInInput>, adopt: Adopt) -> Result<SignInStep, String> {
+pub fn step(
+    hub: &Arc<Hub>,
+    input: Option<SignInInput>,
+    adopt: Adopt,
+) -> Result<SignInStep, String> {
     if !supported() {
         return Err(unsupported_reason());
     }
     let flow = {
         let mut held = current();
-        let live = held.as_ref().filter(|flow| flow.state().way != Way::Ended).cloned();
+        let live = held
+            .as_ref()
+            .filter(|flow| flow.state().way != Way::Ended)
+            .cloned();
         match (live, &input) {
             (Some(flow), _) => flow,
             // Nothing to answer: the sheet is told to begin again.
-            (None, Some(_)) => return Ok(SignInStep::Failed { reason: "That sign-in is over. Start again.".to_owned() }),
+            (None, Some(_)) => {
+                return Ok(SignInStep::Failed {
+                    reason: "That sign-in is over. Start again.".to_owned(),
+                })
+            }
             (None, None) => {
                 let flow = Arc::new(Flow {
                     wire: open(None)?,
@@ -151,7 +168,9 @@ fn next_via(kind: &Option<tl::enums::auth::CodeType>) -> Option<CodeVia> {
 /// What a refusal means for the step on show.
 fn problem(fault: &Fault) -> SignInProblem {
     if let Some(seconds) = fault.flood() {
-        return SignInProblem::TooMany { until: now() + seconds as i64 };
+        return SignInProblem::TooMany {
+            until: now() + seconds as i64,
+        };
     }
     match fault {
         Fault::Net(_) => SignInProblem::Unreachable,
@@ -162,15 +181,21 @@ fn problem(fault: &Fault) -> SignInProblem {
             "PHONE_CODE_INVALID" | "PHONE_CODE_EMPTY" => SignInProblem::CodeInvalid,
             "PHONE_CODE_EXPIRED" => SignInProblem::CodeExpired,
             "PASSWORD_HASH_INVALID" => SignInProblem::PasswordInvalid,
-            "PHONE_PASSWORD_FLOOD" => SignInProblem::TooMany { until: now() + 3_600 },
-            other => SignInProblem::Other { reason: format!("Telegram refused this ({other}).") },
+            "PHONE_PASSWORD_FLOOD" => SignInProblem::TooMany {
+                until: now() + 3_600,
+            },
+            other => SignInProblem::Other {
+                reason: format!("Telegram refused this ({other})."),
+            },
         },
     }
 }
 
 impl Flow {
     fn state(&self) -> MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Two threads for as long as the sign-in lasts: one hears the phone accept the code, the
@@ -192,7 +217,9 @@ impl Flow {
         });
         spawned.map_err(|err| err.to_string())?;
         let flow = self.clone();
-        let spawned = std::thread::Builder::new().name("telegram-signin".into()).spawn(move || flow.keep_code());
+        let spawned = std::thread::Builder::new()
+            .name("telegram-signin".into())
+            .spawn(move || flow.keep_code());
         spawned.map(drop).map_err(|err| err.to_string())
     }
 
@@ -205,7 +232,10 @@ impl Flow {
             changed
         };
         if changed && announce {
-            self.hub.changed(Change::SignIn { network: Network::Telegram, step: step.clone() });
+            self.hub.changed(Change::SignIn {
+                network: Network::Telegram,
+                step: step.clone(),
+            });
         }
         step
     }
@@ -232,17 +262,29 @@ impl Flow {
                     if state.way == Way::Qr {
                         break;
                     }
-                    state = self.wake.wait(state).unwrap_or_else(|poisoned| poisoned.into_inner());
+                    state = self
+                        .wake
+                        .wait(state)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
                 }
                 state.scanned = false;
                 state.retry = false;
             }
-            let request = tl::functions::auth::ExportLoginToken { api_id, api_hash: api_hash.clone(), except_ids: Vec::new() };
+            let request = tl::functions::auth::ExportLoginToken {
+                api_id,
+                api_hash: api_hash.clone(),
+                except_ids: Vec::new(),
+            };
             let mut answer = wire::call(self.wire.as_ref(), &request);
             // The account lives in another datacenter: the code is taken there.
             if let Ok(tl::enums::auth::LoginToken::MigrateTo(moved)) = &answer {
                 self.wire.set_home(moved.dc_id);
-                answer = wire::call(self.wire.as_ref(), &tl::functions::auth::ImportLoginToken { token: moved.token.clone() });
+                answer = wire::call(
+                    self.wire.as_ref(),
+                    &tl::functions::auth::ImportLoginToken {
+                        token: moved.token.clone(),
+                    },
+                );
             }
             if self.state().way != Way::Qr {
                 continue;
@@ -251,7 +293,14 @@ impl Flow {
                 Ok(tl::enums::auth::LoginToken::Token(token)) => {
                     let link = format!("tg://login?token={}", base64url(&token.token));
                     let expires = i64::from(token.expires);
-                    self.show(SignInStep::Qr { link, expires, problem: None }, true);
+                    self.show(
+                        SignInStep::Qr {
+                            link,
+                            expires,
+                            problem: None,
+                        },
+                        true,
+                    );
                     Some(expires - QR_MARGIN)
                 }
                 Ok(tl::enums::auth::LoginToken::Success(done)) => {
@@ -268,7 +317,14 @@ impl Flow {
                 // until the user asks.
                 Err(fault) => {
                     let problem = Some(problem(&fault));
-                    self.show(SignInStep::Qr { link: String::new(), expires: 0, problem }, true);
+                    self.show(
+                        SignInStep::Qr {
+                            link: String::new(),
+                            expires: 0,
+                            problem,
+                        },
+                        true,
+                    );
                     None
                 }
             };
@@ -281,9 +337,15 @@ impl Flow {
                     Some(until) if until <= now() => break,
                     Some(until) => {
                         let left = Duration::from_secs((until - now()).max(1) as u64);
-                        self.wake.wait_timeout(state, left).unwrap_or_else(|poisoned| poisoned.into_inner()).0
+                        self.wake
+                            .wait_timeout(state, left)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .0
                     }
-                    None => self.wake.wait(state).unwrap_or_else(|poisoned| poisoned.into_inner()),
+                    None => self
+                        .wake
+                        .wait(state)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()),
                 };
             }
         }
@@ -302,11 +364,15 @@ impl Flow {
                 self.wake.notify_all();
                 let step = self.state().step.clone();
                 match step {
-                    SignInStep::Qr { problem: Some(_), .. } => self.show(waiting(), false),
+                    SignInStep::Qr {
+                        problem: Some(_), ..
+                    } => self.show(waiting(), false),
                     step => step,
                 }
             }
-            (SignInInput::UseQr | SignInInput::Back, Way::Phone) if !matches!(self.state().step, SignInStep::Code { .. }) => {
+            (SignInInput::UseQr | SignInInput::Back, Way::Phone)
+                if !matches!(self.state().step, SignInStep::Code { .. }) =>
+            {
                 {
                     let mut state = self.state();
                     state.way = Way::Qr;
@@ -343,13 +409,20 @@ impl Flow {
             (SignInInput::Phone { number }, Way::Phone) => self.send_code(&number),
             (SignInInput::Resend, Way::Phone) => self.resend(),
             (SignInInput::Code { code }, Way::Phone) => self.check_code(code),
-            (SignInInput::Password { password }, Way::Password { from_qr }) => self.check_password(password, from_qr),
+            (SignInInput::Password { password }, Way::Password { from_qr }) => {
+                self.check_password(password, from_qr)
+            }
             // Not what the step on show takes: it is shown again.
             _ => self.state().step.clone(),
         }
     }
 
-    fn code_step(&self, sent: &tl::types::auth::SentCode, shown: &str, problem: Option<SignInProblem>) -> SignInStep {
+    fn code_step(
+        &self,
+        sent: &tl::types::auth::SentCode,
+        shown: &str,
+        problem: Option<SignInProblem>,
+    ) -> SignInStep {
         let (via, length) = via(&sent.r#type);
         SignInStep::Code {
             via,
@@ -364,7 +437,12 @@ impl Flow {
     fn send_code(&self, typed: &str) -> SignInStep {
         let digits: String = typed.chars().filter(char::is_ascii_digit).collect();
         if !(7..=15).contains(&digits.len()) {
-            return self.show(SignInStep::Phone { problem: Some(SignInProblem::PhoneInvalid) }, false);
+            return self.show(
+                SignInStep::Phone {
+                    problem: Some(SignInProblem::PhoneInvalid),
+                },
+                false,
+            );
         }
         let (api_id, api_hash) = self.api();
         let request = tl::functions::auth::SendCode {
@@ -386,7 +464,12 @@ impl Flow {
         };
         let mut answer = wire::call(self.wire.as_ref(), &request);
         // The number belongs to another datacenter, which Telegram names: asked once more there.
-        if let Err(Fault::Rpc { code: 303, value: Some(dc), .. }) = &answer {
+        if let Err(Fault::Rpc {
+            code: 303,
+            value: Some(dc),
+            ..
+        }) = &answer
+        {
             self.wire.set_home(*dc as i32);
             answer = wire::call(self.wire.as_ref(), &request);
         }
@@ -405,17 +488,42 @@ impl Flow {
     /// The code step again with something wrong, or the number step when there is no code out.
     fn code_again(&self, problem: SignInProblem) -> SignInStep {
         let step = match self.state().step.clone() {
-            SignInStep::Code { via, length, phone, next, resend_at, .. } => SignInStep::Code { via, length, phone, next, resend_at, problem: Some(problem) },
-            _ => SignInStep::Phone { problem: Some(problem) },
+            SignInStep::Code {
+                via,
+                length,
+                phone,
+                next,
+                resend_at,
+                ..
+            } => SignInStep::Code {
+                via,
+                length,
+                phone,
+                next,
+                resend_at,
+                problem: Some(problem),
+            },
+            _ => SignInStep::Phone {
+                problem: Some(problem),
+            },
         };
         self.show(step, false)
     }
 
     fn resend(&self) -> SignInStep {
-        let Some((number, shown, hash)) = self.state().sent.as_ref().map(|sent| (sent.number.clone(), sent.shown.clone(), sent.hash.clone())) else {
+        let Some((number, shown, hash)) = self
+            .state()
+            .sent
+            .as_ref()
+            .map(|sent| (sent.number.clone(), sent.shown.clone(), sent.hash.clone()))
+        else {
             return self.show(SignInStep::Phone { problem: None }, false);
         };
-        let request = tl::functions::auth::ResendCode { phone_number: number, phone_code_hash: hash, reason: None };
+        let request = tl::functions::auth::ResendCode {
+            phone_number: number,
+            phone_code_hash: hash,
+            reason: None,
+        };
         match wire::call(self.wire.as_ref(), &request) {
             Ok(tl::enums::auth::SentCode::Code(sent)) => {
                 let step = self.code_step(&sent, &shown, None);
@@ -425,13 +533,20 @@ impl Flow {
                 self.show(step, false)
             }
             Ok(tl::enums::auth::SentCode::Success(done)) => self.finish(done.authorization, false),
-            Ok(tl::enums::auth::SentCode::PaymentRequired(_)) => self.fail("Telegram wants a payment before it sends this number another code."),
+            Ok(tl::enums::auth::SentCode::PaymentRequired(_)) => {
+                self.fail("Telegram wants a payment before it sends this number another code.")
+            }
             Err(fault) => self.code_again(problem(&fault)),
         }
     }
 
     fn check_code(&self, code: String) -> SignInStep {
-        let Some((number, hash)) = self.state().sent.as_ref().map(|sent| (sent.number.clone(), sent.hash.clone())) else {
+        let Some((number, hash)) = self
+            .state()
+            .sent
+            .as_ref()
+            .map(|sent| (sent.number.clone(), sent.hash.clone()))
+        else {
             return self.show(SignInStep::Phone { problem: None }, false);
         };
         let request = tl::functions::auth::SignIn {
@@ -462,7 +577,9 @@ impl Flow {
             }
             Err(fault) => {
                 self.state().way = Way::Ended;
-                SignInStep::Failed { reason: format!("Telegram did not say how to check the password ({fault}).") }
+                SignInStep::Failed {
+                    reason: format!("Telegram did not say how to check the password ({fault})."),
+                }
             }
         }
     }
@@ -472,20 +589,39 @@ impl Flow {
             return self.password_step(from_qr, None);
         };
         let hint = asked.hint.clone().unwrap_or_default();
-        let (Some(tl::enums::PasswordKdfAlgo::Sha256Sha256Pbkdf2Hmacsha512iter100000Sha256ModPow(algo)), Some(g_b), Some(srp_id)) =
-            (&asked.current_algo, asked.srp_b.clone(), asked.srp_id)
+        let (
+            Some(tl::enums::PasswordKdfAlgo::Sha256Sha256Pbkdf2Hmacsha512iter100000Sha256ModPow(
+                algo,
+            )),
+            Some(g_b),
+            Some(srp_id),
+        ) = (&asked.current_algo, asked.srp_b.clone(), asked.srp_id)
         else {
             return self.fail("This account's password is kept in a way this version of tinyclient does not know. Update tinyclient.");
         };
         // Telegram's numbers are checked before anything is proved with them: a bad group
         // would give the password away.
         if !(2..=7).contains(&algo.g) || !check_p_and_g(&algo.p, &algo.g) {
-            return self.fail("Telegram sent numbers that cannot be trusted for checking the password.");
+            return self
+                .fail("Telegram sent numbers that cannot be trusted for checking the password.");
         }
-        let (m1, g_a) = calculate_2fa(&algo.salt1, &algo.salt2, &algo.p, &algo.g, g_b, asked.secure_random.clone(), password.as_bytes());
+        let (m1, g_a) = calculate_2fa(
+            &algo.salt1,
+            &algo.salt2,
+            &algo.p,
+            &algo.g,
+            g_b,
+            asked.secure_random.clone(),
+            password.as_bytes(),
+        );
         drop(password);
         let request = tl::functions::auth::CheckPassword {
-            password: tl::types::InputCheckPasswordSrp { srp_id, a: g_a.to_vec(), m1: m1.to_vec() }.into(),
+            password: tl::types::InputCheckPasswordSrp {
+                srp_id,
+                a: g_a.to_vec(),
+                m1: m1.to_vec(),
+            }
+            .into(),
         };
         match wire::call(self.wire.as_ref(), &request) {
             Ok(authorization) => self.finish(authorization, false),
@@ -503,15 +639,30 @@ impl Flow {
 
     fn fail(&self, reason: &str) -> SignInStep {
         self.state().way = Way::Ended;
-        self.show(SignInStep::Failed { reason: reason.to_owned() }, false)
+        self.show(
+            SignInStep::Failed {
+                reason: reason.to_owned(),
+            },
+            false,
+        )
     }
 
     /// Telegram let us in: the session is kept and the account started.
     fn finish(&self, authorization: tl::enums::auth::Authorization, announce: bool) -> SignInStep {
         let user = match authorization {
-            tl::enums::auth::Authorization::Authorization(tl::types::auth::Authorization { user: tl::enums::User::User(user), .. }) => user,
+            tl::enums::auth::Authorization::Authorization(tl::types::auth::Authorization {
+                user: tl::enums::User::User(user),
+                ..
+            }) => user,
             // tinyclient does not create accounts.
-            _ => return self.show(SignInStep::Phone { problem: Some(SignInProblem::PhoneUnknown) }, announce),
+            _ => {
+                return self.show(
+                    SignInStep::Phone {
+                        problem: Some(SignInProblem::PhoneUnknown),
+                    },
+                    announce,
+                )
+            }
         };
         self.wire.signed_in(&user);
         let first = user.first_name.clone().unwrap_or_default();
@@ -521,15 +672,27 @@ impl Flow {
         };
         let session = self.wire.session(user.id, &name);
         let step = match (self.adopt)(&session) {
-            Ok(accounts) => SignInStep::Done { account: accounts.into_iter().next() },
+            Ok(accounts) => SignInStep::Done {
+                account: accounts.into_iter().next(),
+            },
             Err(why) => {
-                tracing::warn!("chatd: Telegram: the sign-in was not kept: {}", super::super::net::redact(&why));
+                tracing::warn!(
+                    "chatd: Telegram: the sign-in was not kept: {}",
+                    super::super::net::redact(&why)
+                );
                 // The session exists on Telegram but not here: it is ended there, so the
                 // account's device list does not keep one nobody can use.
                 let _ = wire::call(self.wire.as_ref(), &tl::functions::auth::LogOut {});
                 let keychain = why.starts_with("keychain");
                 SignInStep::Failed {
-                    reason: if keychain { format!("tinyclient couldn't save the sign-in to {}.", crate::session::STORE) } else { why },
+                    reason: if keychain {
+                        format!(
+                            "tinyclient couldn't save the sign-in to {}.",
+                            crate::session::STORE
+                        )
+                    } else {
+                        why
+                    },
                 }
             }
         };
@@ -538,7 +701,10 @@ impl Flow {
         let step = self.show(step, announce);
         // The flow is over; its wire goes when the last thread lets go of it.
         let mut held = current();
-        if held.as_ref().is_some_and(|flow| std::ptr::eq(flow.as_ref(), self)) {
+        if held
+            .as_ref()
+            .is_some_and(|flow| std::ptr::eq(flow.as_ref(), self))
+        {
             held.take();
         }
         step

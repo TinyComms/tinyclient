@@ -17,7 +17,10 @@ const LOOK: Duration = Duration::from_millis(20);
 pub fn control(name: &str) -> PathBuf {
     let path = protocol::support_dir().join(name);
     if !path.exists() {
-        let _ = std::fs::OpenOptions::new().create(true).append(true).open(&path);
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path);
     }
     path
 }
@@ -34,7 +37,10 @@ fn taken(path: &Path) -> PathBuf {
 /// it, and no line is taken after that. Stops too if the file cannot be read.
 pub fn follow(path: &Path, mut each: impl FnMut(Option<&str>) -> bool) {
     // Kept beside the file, so a fake that comes after this one goes on from here.
-    let mut at: u64 = std::fs::read_to_string(taken(path)).ok().and_then(|at| at.trim().parse().ok()).unwrap_or(0);
+    let mut at: u64 = std::fs::read_to_string(taken(path))
+        .ok()
+        .and_then(|at| at.trim().parse().ok())
+        .unwrap_or(0);
     loop {
         if !each(None) {
             return;
@@ -44,7 +50,10 @@ pub fn follow(path: &Path, mut each: impl FnMut(Option<&str>) -> bool) {
         };
         let fresh = text.get(at as usize..).unwrap_or_default();
         // A line still being written waits for the next look.
-        let whole = fresh.iter().rposition(|byte| *byte == b'\n').map_or(0, |end| end + 1);
+        let whole = fresh
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |end| end + 1);
         if whole == 0 {
             std::thread::sleep(LOOK);
             continue;

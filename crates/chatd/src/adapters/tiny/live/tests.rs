@@ -38,7 +38,11 @@ const QUICK: Timing = Timing {
 /// What the fake saw.
 #[derive(Debug)]
 enum Seen {
-    Live { since: Option<i64>, bearer: String, at: Instant },
+    Live {
+        since: Option<i64>,
+        bearer: String,
+        at: Instant,
+    },
     Rest(String),
     Ping,
 }
@@ -66,11 +70,16 @@ impl Conn {
     }
 
     fn close(mut self, code: u16) {
-        let _ = self.ws.close(Some(CloseFrame { code: CloseCode::from(code), reason: "".into() }));
+        let _ = self.ws.close(Some(CloseFrame {
+            code: CloseCode::from(code),
+            reason: "".into(),
+        }));
         let deadline = Instant::now() + Duration::from_secs(1);
         while Instant::now() < deadline {
             match self.ws.read() {
-                Err(tungstenite::Error::Io(err)) if err.kind() == ErrorKind::WouldBlock => std::thread::sleep(Duration::from_millis(5)),
+                Err(tungstenite::Error::Io(err)) if err.kind() == ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
                 Err(_) => break,
                 Ok(_) => {}
             }
@@ -84,7 +93,8 @@ impl Conn {
         while Instant::now() < deadline {
             match self.ws.read() {
                 Ok(Message::Text(text)) => {
-                    let frame: Value = serde_json::from_str(text.as_str()).expect("the client sends JSON");
+                    let frame: Value =
+                        serde_json::from_str(text.as_str()).expect("the client sends JSON");
                     if frame["type"] == "ping" {
                         let _ = self.seen.send(Seen::Ping);
                         if self.pong {
@@ -95,7 +105,9 @@ impl Conn {
                     return Some(frame);
                 }
                 Ok(_) => {}
-                Err(tungstenite::Error::Io(err)) if err.kind() == ErrorKind::WouldBlock => std::thread::sleep(Duration::from_millis(5)),
+                Err(tungstenite::Error::Io(err)) if err.kind() == ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
                 Err(_) => return None,
             }
         }
@@ -154,12 +166,19 @@ fn members() -> String {
 
 /// A fake server. `refuse` answers the live connection with that number with an HTTP status
 /// instead of upgrading it. `script` runs each live connection that is upgraded, numbered from 0.
-fn fake(refuse: &'static [(usize, u16)], script: impl Fn(usize, Conn) + Send + Sync + 'static) -> Fake {
+fn fake(
+    refuse: &'static [(usize, u16)],
+    script: impl Fn(usize, Conn) + Send + Sync + 'static,
+) -> Fake {
     fake_with("off", refuse, script)
 }
 
 /// The same, with `/health` saying `media` of the server's audio.
-fn fake_with(media: &'static str, refuse: &'static [(usize, u16)], script: impl Fn(usize, Conn) + Send + Sync + 'static) -> Fake {
+fn fake_with(
+    media: &'static str,
+    refuse: &'static [(usize, u16)],
+    script: impl Fn(usize, Conn) + Send + Sync + 'static,
+) -> Fake {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let base = format!("http://{}", listener.local_addr().expect("addr"));
     let (seen, heard) = channel();
@@ -184,27 +203,64 @@ fn fake_with(media: &'static str, refuse: &'static [(usize, u16)], script: impl 
             });
         }
     });
-    Fake { base, seen: heard, kept: Default::default() }
+    Fake {
+        base,
+        seen: heard,
+        kept: Default::default(),
+    }
 }
 
-fn upgrade(n: usize, stream: TcpStream, refuse: &[(usize, u16)], seen: &Sender<Seen>, script: &(dyn Fn(usize, Conn) + Send + Sync)) {
-    let status = refuse.iter().find(|(at, _)| *at == n).map(|(_, status)| *status);
+fn upgrade(
+    n: usize,
+    stream: TcpStream,
+    refuse: &[(usize, u16)],
+    seen: &Sender<Seen>,
+    script: &(dyn Fn(usize, Conn) + Send + Sync),
+) {
+    let status = refuse
+        .iter()
+        .find(|(at, _)| *at == n)
+        .map(|(_, status)| *status);
     let mut asked = (None, String::new());
-    let accepted = tungstenite::accept_hdr(stream.try_clone().expect("clone"), |request: &Request, response: Response| -> Result<Response, ErrorResponse> {
-        let query = request.uri().query().unwrap_or("");
-        asked.0 = query.strip_prefix("since=").and_then(|since| since.parse().ok());
-        asked.1 = request.headers().get("Authorization").and_then(|value| value.to_str().ok()).unwrap_or("").to_owned();
-        match status {
-            Some(status) => Err(tungstenite::http::Response::builder().status(status).body(Some(r#"{"error":"no"}"#.to_owned())).expect("a response")),
-            None => Ok(response),
-        }
-    })
+    let accepted = tungstenite::accept_hdr(
+        stream.try_clone().expect("clone"),
+        |request: &Request, response: Response| -> Result<Response, ErrorResponse> {
+            let query = request.uri().query().unwrap_or("");
+            asked.0 = query
+                .strip_prefix("since=")
+                .and_then(|since| since.parse().ok());
+            asked.1 = request
+                .headers()
+                .get("Authorization")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("")
+                .to_owned();
+            match status {
+                Some(status) => Err(tungstenite::http::Response::builder()
+                    .status(status)
+                    .body(Some(r#"{"error":"no"}"#.to_owned()))
+                    .expect("a response")),
+                None => Ok(response),
+            }
+        },
+    )
     .ok();
-    let _ = seen.send(Seen::Live { since: asked.0, bearer: asked.1, at: Instant::now() });
+    let _ = seen.send(Seen::Live {
+        since: asked.0,
+        bearer: asked.1,
+        at: Instant::now(),
+    });
     let Some(ws) = accepted else { return };
     // Not a read timeout: on Windows a socket whose read timed out is not to be used again.
     let _ = stream.set_nonblocking(true);
-    script(n, Conn { ws, seen: seen.clone(), pong: true });
+    script(
+        n,
+        Conn {
+            ws,
+            seen: seen.clone(),
+            pong: true,
+        },
+    );
 }
 
 fn rest(mut stream: TcpStream, seen: &Sender<Seen>, media: &str) {
@@ -216,18 +272,33 @@ fn rest(mut stream: TcpStream, seen: &Sender<Seen>, media: &str) {
             Ok(read) => got.extend_from_slice(&buf[..read]),
         }
     }
-    let line = String::from_utf8_lossy(&got).lines().next().unwrap_or("").to_owned();
+    let line = String::from_utf8_lossy(&got)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .to_owned();
     let _ = seen.send(Seen::Rest(line.clone()));
     let (status, body) = if line.starts_with("GET /v1/members ") {
         ("200 OK", members())
     } else if line.starts_with("GET /health ") {
         // `e2ee` is a server whose audio is up and that encrypts calls end to end.
         let media = if media == "e2ee" { "up" } else { media };
-        ("200 OK", format!(r#"{{"ok":true,"database":"ok","media":"{media}"}}"#))
+        (
+            "200 OK",
+            format!(r#"{{"ok":true,"database":"ok","media":"{media}"}}"#),
+        )
     } else if line.starts_with("GET /v1/capabilities ") && media == "e2ee" {
-        ("200 OK", r#"{"version":"0.4.0","features":["server","roles","e2ee_calls"]}"#.to_owned())
+        (
+            "200 OK",
+            r#"{"version":"0.4.0","features":["server","roles","e2ee_calls"]}"#.to_owned(),
+        )
     } else if line.starts_with("GET /v1/me ") {
-        ("200 OK", format!(r#"{{"user_id":"{ME}","email":"ada@example.com","display_name":"Ada","role":"owner"}}"#))
+        (
+            "200 OK",
+            format!(
+                r#"{{"user_id":"{ME}","email":"ada@example.com","display_name":"Ada","role":"owner"}}"#
+            ),
+        )
     } else {
         ("404 Not Found", "{}".to_owned())
     };
@@ -249,8 +320,13 @@ struct Running {
 }
 
 fn run(base: &str, timing: Timing) -> Running {
-    let hub = Arc::new(Hub::new(Store::open(std::path::Path::new(":memory:")).expect("a store in memory")));
-    let account = AccountKey { network: Network::Tiny, account: ME.to_owned() };
+    let hub = Arc::new(Hub::new(
+        Store::open(std::path::Path::new(":memory:")).expect("a store in memory"),
+    ));
+    let account = AccountKey {
+        network: Network::Tiny,
+        account: ME.to_owned(),
+    };
     let (adapter, ctx, _inbox) = local(account.clone(), hub.clone());
     ctx.link(Link::Offline);
     let saved = Saved {
@@ -266,12 +342,24 @@ fn run(base: &str, timing: Timing) -> Running {
     let live = Arc::new(Live::new().expect("a wake pair"));
     let socket_live = live.clone();
     let thread = std::thread::spawn(move || keep_live(&ctx, &saved, &socket_live, &timing));
-    Running { hub, account, live, adapter: Some(adapter), thread: Some(thread) }
+    Running {
+        hub,
+        account,
+        live,
+        adapter: Some(adapter),
+        thread: Some(thread),
+    }
 }
 
 impl Running {
     fn link(&self) -> (Link, String) {
-        self.hub.links().into_iter().find(|linked| linked.account == self.account).map_or((Link::SignedOut, String::new()), |linked| (linked.link, linked.detail))
+        self.hub
+            .links()
+            .into_iter()
+            .find(|linked| linked.account == self.account)
+            .map_or((Link::SignedOut, String::new()), |linked| {
+                (linked.link, linked.detail)
+            })
     }
 
     fn key(&self, id: &str) -> Key {
@@ -280,17 +368,31 @@ impl Running {
 
     /// Who in a room's call muted or deafened themselves, by name.
     fn quiet_in(&self, room: &str) -> Vec<(String, bool, bool)> {
-        self.hub.occupants(&self.key(room)).map(|inside| inside.people.into_iter().map(|who| (who.name, who.muted, who.deafened)).collect()).unwrap_or_default()
+        self.hub
+            .occupants(&self.key(room))
+            .map(|inside| {
+                inside
+                    .people
+                    .into_iter()
+                    .map(|who| (who.name, who.muted, who.deafened))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Who is in a room's call, by name.
     fn in_room(&self, room: &str) -> Vec<String> {
-        self.hub.occupants(&self.key(room)).map(|inside| inside.people.into_iter().map(|who| who.name).collect()).unwrap_or_default()
+        self.hub
+            .occupants(&self.key(room))
+            .map(|inside| inside.people.into_iter().map(|who| who.name).collect())
+            .unwrap_or_default()
     }
 
     fn told_tiny(&self, since: u64) -> bool {
         let (_, _, changes) = self.hub.wait(since, Duration::ZERO);
-        changes.iter().any(|change| matches!(change, Change::Tiny { account } if *account == self.account))
+        changes
+            .iter()
+            .any(|change| matches!(change, Change::Tiny { account } if *account == self.account))
     }
 
     /// Asks the socket thread, as the command thread would, and waits for the answer.
@@ -300,7 +402,10 @@ impl Running {
 
     /// As `ask`, for a join with audio, which starts mediad first: a loaded machine is slow at it.
     fn join_with_audio(&self, room: &str) -> Result<(), String> {
-        self.ask_within(Duration::from_secs(30), |reply| Ask::Join { room_id: room.into(), reply })
+        self.ask_within(Duration::from_secs(30), |reply| Ask::Join {
+            room_id: room.into(),
+            reply,
+        })
     }
 
     fn ask_within(&self, wait: Duration, ask: impl FnOnce(Reply<()>) -> Ask) -> Result<(), String> {
@@ -319,11 +424,19 @@ impl Running {
     }
 
     fn pauses(&self) -> Vec<Duration> {
-        self.did().into_iter().filter_map(|did| match did { Did::Paused(wait) => Some(wait), _ => None }).collect()
+        self.did()
+            .into_iter()
+            .filter_map(|did| match did {
+                Did::Paused(wait) => Some(wait),
+                _ => None,
+            })
+            .collect()
     }
 
     fn done(&self) -> bool {
-        self.thread.as_ref().is_some_and(|thread| thread.is_finished())
+        self.thread
+            .as_ref()
+            .is_some_and(|thread| thread.is_finished())
     }
 }
 
@@ -346,7 +459,9 @@ fn until(what: &str, check: impl Fn() -> bool) {
 }
 
 fn rest_hits(seen: &[Seen], route: &str) -> usize {
-    seen.iter().filter(|seen| matches!(seen, Seen::Rest(line) if line.starts_with(route))).count()
+    seen.iter()
+        .filter(|seen| matches!(seen, Seen::Rest(line) if line.starts_with(route)))
+        .count()
 }
 
 #[test]
@@ -360,38 +475,79 @@ fn ready_fills_presence_and_rooms_and_the_frames_after_it_move_them() {
         conn.send(json!({"type": "presence", "user_id": BEA, "online": false}));
         conn.send(json!({"type": "call.joined", "room_id": OTHER_ROOM, "user_id": BEA}));
         conn.idle(Duration::from_millis(300));
-        conn.send(json!({"type": "call.left", "room_id": OTHER_ROOM, "user_id": BEA, "reason": "left"}));
+        conn.send(
+            json!({"type": "call.left", "room_id": OTHER_ROOM, "user_id": BEA, "reason": "left"}),
+        );
         conn.send(json!({"type": "something.new", "x": 1}));
         conn.idle(Duration::from_secs(5));
     });
     let running = run(&fake.base, QUICK);
     let since = running.hub.seq();
-    let (asked, bearer, _) = fake.connected(Duration::from_secs(5)).expect("a live connection");
+    let (asked, bearer, _) = fake
+        .connected(Duration::from_secs(5))
+        .expect("a live connection");
     assert_eq!(asked, None, "a first connection has nothing to resume");
-    assert_eq!(bearer, "Bearer t", "the session goes in the header, never the address");
+    assert_eq!(
+        bearer, "Bearer t",
+        "the session goes in the header, never the address"
+    );
     until("the link", || running.link().0 == Link::Connected);
     assert_eq!(running.hub.presence(&running.key(BEA)), Presence::Online);
     assert_eq!(running.hub.presence(&running.key(ME)), Presence::Online);
-    assert_eq!(running.in_room(ROOM), ["Bea"], "names come from the member list");
-    assert!(running.told_tiny(since), "the page reads the server again after a fresh ready");
-    assert_eq!(running.quiet_in(ROOM), [("Bea".to_owned(), true, false)], "ready carries each seat's mute");
-    until("Bea deafened", || running.quiet_in(ROOM) == [("Bea".to_owned(), true, true)]);
+    assert_eq!(
+        running.in_room(ROOM),
+        ["Bea"],
+        "names come from the member list"
+    );
+    assert!(
+        running.told_tiny(since),
+        "the page reads the server again after a fresh ready"
+    );
+    assert_eq!(
+        running.quiet_in(ROOM),
+        [("Bea".to_owned(), true, false)],
+        "ready carries each seat's mute"
+    );
+    until("Bea deafened", || {
+        running.quiet_in(ROOM) == [("Bea".to_owned(), true, true)]
+    });
     let seen = fake.drained();
     assert_eq!(rest_hits(&seen, "GET /v1/members "), 1);
-    assert_eq!(rest_hits(&seen, "GET /health "), 1, "a fresh ready asks whether the server has audio");
+    assert_eq!(
+        rest_hits(&seen, "GET /health "),
+        1,
+        "a fresh ready asks whether the server has audio"
+    );
 
-    until("Bea going offline", || running.hub.presence(&running.key(BEA)) == Presence::Offline);
-    until("Bea moving rooms", || running.in_room(OTHER_ROOM) == ["Bea"]);
-    assert!(running.hub.occupants(&running.key(ROOM)).is_none(), "one seat a person: the first room emptied");
-    until("Bea leaving", || running.hub.occupants(&running.key(OTHER_ROOM)).is_none());
-    assert_eq!(running.link().0, Link::Connected, "an unknown frame is ignored");
+    until("Bea going offline", || {
+        running.hub.presence(&running.key(BEA)) == Presence::Offline
+    });
+    until("Bea moving rooms", || {
+        running.in_room(OTHER_ROOM) == ["Bea"]
+    });
+    assert!(
+        running.hub.occupants(&running.key(ROOM)).is_none(),
+        "one seat a person: the first room emptied"
+    );
+    until("Bea leaving", || {
+        running.hub.occupants(&running.key(OTHER_ROOM)).is_none()
+    });
+    assert_eq!(
+        running.link().0,
+        Link::Connected,
+        "an unknown frame is ignored"
+    );
 }
 
 #[test]
 fn events_apply_in_order_a_replay_is_skipped_and_a_drop_resumes_with_since() {
     let fake = fake(&[], |n, mut conn| match n {
         0 => {
-            conn.send(ready(5, &[ME], json!([{"room_id": ROOM, "participants": [{"user_id": BEA}]}])));
+            conn.send(ready(
+                5,
+                &[ME],
+                json!([{"room_id": ROOM, "participants": [{"user_id": BEA}]}]),
+            ));
             conn.send(json!({"type": "member.renamed", "seq": 6, "member": {"user_id": BEA, "display_name": "Bea Two", "role": "member"}}));
             conn.send(json!({"type": "member.renamed", "seq": 7, "member": {"user_id": BEA, "display_name": "Bea Three", "role": "member"}}));
             // The same event again, as an overlapping replay would send it.
@@ -400,18 +556,33 @@ fn events_apply_in_order_a_replay_is_skipped_and_a_drop_resumes_with_since() {
             conn.close(1012);
         }
         _ => {
-            conn.send(ready(7, &[ME], json!([{"room_id": ROOM, "participants": [{"user_id": BEA}]}])));
+            conn.send(ready(
+                7,
+                &[ME],
+                json!([{"room_id": ROOM, "participants": [{"user_id": BEA}]}]),
+            ));
             conn.idle(Duration::from_secs(5));
         }
     });
     let running = run(&fake.base, QUICK);
-    fake.connected(Duration::from_secs(5)).expect("the first connection");
-    until("the renames, in order", || running.in_room(ROOM) == ["Bea Three"]);
-    let (since, bearer, _) = fake.connected(Duration::from_secs(5)).expect("a reconnect after 1012");
+    fake.connected(Duration::from_secs(5))
+        .expect("the first connection");
+    until("the renames, in order", || {
+        running.in_room(ROOM) == ["Bea Three"]
+    });
+    let (since, bearer, _) = fake
+        .connected(Duration::from_secs(5))
+        .expect("a reconnect after 1012");
     assert_eq!(since, Some(7), "the last seq heard, not the stale replay");
     assert_eq!(bearer, "Bearer t");
-    until("the link again", || running.link().0 == Link::Connected && running.in_room(ROOM) == ["Bea Three"]);
-    assert_eq!(rest_hits(&fake.drained(), "GET /v1/members "), 1, "a resume reads nothing over REST");
+    until("the link again", || {
+        running.link().0 == Link::Connected && running.in_room(ROOM) == ["Bea Three"]
+    });
+    assert_eq!(
+        rest_hits(&fake.drained(), "GET /v1/members "),
+        1,
+        "a resume reads nothing over REST"
+    );
 }
 
 #[test]
@@ -435,12 +606,29 @@ fn resync_starts_over_without_since_and_reads_rest_again() {
         }
     });
     let running = run(&fake.base, QUICK);
-    assert_eq!(fake.connected(Duration::from_secs(5)).expect("first").0, None);
+    assert_eq!(
+        fake.connected(Duration::from_secs(5)).expect("first").0,
+        None
+    );
     until("the first ready", || running.link().0 == Link::Connected);
     let before = running.hub.seq();
-    assert_eq!(fake.connected(Duration::from_secs(5)).expect("after resync").0, None, "a resync starts over");
-    assert_eq!(fake.connected(Duration::from_secs(5)).expect("after 4002").0, None, "so does 4002");
-    until("the third ready", || running.link().0 == Link::Connected && running.told_tiny(before));
+    assert_eq!(
+        fake.connected(Duration::from_secs(5))
+            .expect("after resync")
+            .0,
+        None,
+        "a resync starts over"
+    );
+    assert_eq!(
+        fake.connected(Duration::from_secs(5))
+            .expect("after 4002")
+            .0,
+        None,
+        "so does 4002"
+    );
+    until("the third ready", || {
+        running.link().0 == Link::Connected && running.told_tiny(before)
+    });
     // The first ready read the members, and each fresh ready after a resync reads them again.
     let mut seen = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -453,7 +641,11 @@ fn resync_starts_over_without_since_and_reads_rest_again() {
 
 #[test]
 fn a_drop_backs_off_doubling_to_the_cap_and_each_reconnect_resumes() {
-    let timing = Timing { first: Duration::from_millis(200), cap: Duration::from_millis(400), ..QUICK };
+    let timing = Timing {
+        first: Duration::from_millis(200),
+        cap: Duration::from_millis(400),
+        ..QUICK
+    };
     let fake = fake(&[(4, 503)], |n, mut conn| {
         conn.send(ready(10 + n as i64, &[ME], json!([])));
         conn.idle(Duration::from_millis(20));
@@ -470,16 +662,23 @@ fn a_drop_backs_off_doubling_to_the_cap_and_each_reconnect_resumes() {
     let running = run(&fake.base, timing);
     let mut since = Vec::new();
     for _ in 0..6 {
-        let (asked, _, _) = fake.connected(Duration::from_secs(5)).expect("a connection");
+        let (asked, _, _) = fake
+            .connected(Duration::from_secs(5))
+            .expect("a connection");
         since.push(asked);
     }
     // 1012, 1011, 4000 and 1012 resume; the 503 before the last is retried the same way.
-    assert_eq!(since, [None, Some(10), Some(11), Some(12), Some(13), Some(13)]);
+    assert_eq!(
+        since,
+        [None, Some(10), Some(11), Some(12), Some(13), Some(13)]
+    );
     // The pauses asked for: doubling from the first, held at the cap.
     let expected = [200, 400, 400, 400, 400].map(Duration::from_millis);
     until("five pauses", || running.pauses().len() >= 5);
     assert_eq!(running.pauses()[..5], expected);
-    until("connected at the end", || running.link().0 == Link::Connected);
+    until("connected at the end", || {
+        running.link().0 == Link::Connected
+    });
 }
 
 #[test]
@@ -490,7 +689,10 @@ fn a_401_at_the_door_or_a_4001_close_is_a_sign_in_and_nothing_more_is_tried() {
     until("expired", || running.link().0 == Link::Expired);
     assert_eq!(running.link().1, ENDED);
     until("the thread ends", || running.done());
-    assert!(refused.connected(Duration::from_millis(300)).is_none(), "an ended session is never retried");
+    assert!(
+        refused.connected(Duration::from_millis(300)).is_none(),
+        "an ended session is never retried"
+    );
 
     let ended = fake(&[], |_, mut conn| {
         conn.send(ready(1, &[ME], json!([])));
@@ -498,7 +700,9 @@ fn a_401_at_the_door_or_a_4001_close_is_a_sign_in_and_nothing_more_is_tried() {
         conn.close(4001);
     });
     let running = run(&ended.base, QUICK);
-    ended.connected(Duration::from_secs(5)).expect("one connection");
+    ended
+        .connected(Duration::from_secs(5))
+        .expect("one connection");
     until("expired", || running.link().0 == Link::Expired);
     assert_eq!(running.link().1, ENDED);
     until("the thread ends", || running.done());
@@ -513,11 +717,15 @@ fn a_removed_account_stops_and_says_why() {
         conn.close(4003);
     });
     let running = run(&fake.base, QUICK);
-    fake.connected(Duration::from_secs(5)).expect("one connection");
+    fake.connected(Duration::from_secs(5))
+        .expect("one connection");
     until("expired", || running.link().0 == Link::Expired);
     assert_eq!(running.link().1, REMOVED);
     until("the thread ends", || running.done());
-    assert!(fake.connected(Duration::from_millis(300)).is_none(), "a removed account is not tried again");
+    assert!(
+        fake.connected(Duration::from_millis(300)).is_none(),
+        "a removed account is not tried again"
+    );
 }
 
 #[test]
@@ -534,22 +742,42 @@ fn a_replaced_socket_waits_for_the_user_and_a_slow_down_waits_the_cap() {
         }
     });
     let running = run(&fake.base, QUICK);
-    fake.connected(Duration::from_secs(5)).expect("the first connection");
-    until("offline and held", || running.link().0 == Link::Offline && running.live.held());
-    assert!(fake.connected(Duration::from_millis(500)).is_none(), "4008 is not answered by reconnecting");
+    fake.connected(Duration::from_secs(5))
+        .expect("the first connection");
+    until("offline and held", || {
+        running.link().0 == Link::Offline && running.live.held()
+    });
+    assert!(
+        fake.connected(Duration::from_millis(500)).is_none(),
+        "4008 is not answered by reconnecting"
+    );
     assert!(!running.done());
     running.live.ask(Ask::Look);
-    let (since, _, _) = fake.connected(Duration::from_secs(5)).expect("the user opened the server");
+    let (since, _, _) = fake
+        .connected(Duration::from_secs(5))
+        .expect("the user opened the server");
     assert_eq!(since, Some(1));
-    assert!(running.pauses().is_empty(), "opening the server connects at once: {:?}", running.pauses());
-    fake.connected(Duration::from_secs(5)).expect("a reconnect after 4029");
-    assert_eq!(running.pauses(), [QUICK.cap], "4029 waits the longest pause");
+    assert!(
+        running.pauses().is_empty(),
+        "opening the server connects at once: {:?}",
+        running.pauses()
+    );
+    fake.connected(Duration::from_secs(5))
+        .expect("a reconnect after 4029");
+    assert_eq!(
+        running.pauses(),
+        [QUICK.cap],
+        "4029 waits the longest pause"
+    );
     until("connected", || running.link().0 == Link::Connected);
 }
 
 #[test]
 fn pings_go_on_time_and_a_silent_server_is_dropped() {
-    let timing = Timing { ping: Duration::from_millis(80), ..QUICK };
+    let timing = Timing {
+        ping: Duration::from_millis(80),
+        ..QUICK
+    };
     let fake = fake(&[], |n, mut conn| {
         conn.send(ready(1, &[ME], json!([])));
         if n == 0 {
@@ -562,13 +790,29 @@ fn pings_go_on_time_and_a_silent_server_is_dropped() {
         }
     });
     let running = run(&fake.base, timing);
-    fake.connected(Duration::from_secs(5)).expect("a connection");
-    let (since, _, _) = fake.connected(Duration::from_secs(5)).expect("a reconnect once pings went unanswered");
+    fake.connected(Duration::from_secs(5))
+        .expect("a connection");
+    let (since, _, _) = fake
+        .connected(Duration::from_secs(5))
+        .expect("a reconnect once pings went unanswered");
     assert_eq!(since, Some(1));
     // The pings of the first connection, as the socket thread timed them.
     let did = running.did();
-    let opened: Vec<Instant> = did.iter().filter_map(|did| match did { Did::Opened { at } => Some(*at), _ => None }).collect();
-    let pings: Vec<(Instant, Instant)> = did.iter().filter_map(|did| match did { Did::Pinged { due, sent } => Some((*due, *sent)), _ => None }).filter(|(_, sent)| opened.len() < 2 || *sent < opened[1]).collect();
+    let opened: Vec<Instant> = did
+        .iter()
+        .filter_map(|did| match did {
+            Did::Opened { at } => Some(*at),
+            _ => None,
+        })
+        .collect();
+    let pings: Vec<(Instant, Instant)> = did
+        .iter()
+        .filter_map(|did| match did {
+            Did::Pinged { due, sent } => Some((*due, *sent)),
+            _ => None,
+        })
+        .filter(|(_, sent)| opened.len() < 2 || *sent < opened[1])
+        .collect();
     assert!(pings.len() >= 3, "{} pings", pings.len());
     // The first is due one interval after the connection opened, each next one an interval
     // after the last went out, and none goes out before it is due.
@@ -586,23 +830,37 @@ fn pings_go_on_time_and_a_silent_server_is_dropped() {
 /// A half-dead socket is given up a pong deadline after the ping, not a whole interval later.
 #[test]
 fn a_ping_nobody_answers_is_given_up_at_its_deadline() {
-    let timing = Timing { ping: Duration::from_millis(1500), pong: Duration::from_millis(100), ..QUICK };
+    let timing = Timing {
+        ping: Duration::from_millis(1500),
+        pong: Duration::from_millis(100),
+        ..QUICK
+    };
     let fake = fake(&[], |n, mut conn| {
         conn.send(ready(1, &[ME], json!([])));
         conn.pong = n != 0;
         conn.idle(Duration::from_secs(10));
     });
     let _running = run(&fake.base, timing);
-    let (_, _, first) = fake.connected(Duration::from_secs(5)).expect("a connection");
+    let (_, _, first) = fake
+        .connected(Duration::from_secs(5))
+        .expect("a connection");
     let (_, _, second) = fake.connected(Duration::from_secs(5)).expect("a reconnect");
-    assert!(second - first < timing.ping * 2, "a ping interval and its deadline, not two intervals: {:?}", second - first);
+    assert!(
+        second - first < timing.ping * 2,
+        "a ping interval and its deadline, not two intervals: {:?}",
+        second - first
+    );
 }
 
 /// Nothing else says a socket died during a call, so it is looked at more often then. The
 /// interval goes back once the call is over.
 #[test]
 fn a_seat_pings_faster_until_it_is_left() {
-    let timing = Timing { ping: Duration::from_secs(20), call_ping: Duration::from_millis(50), ..QUICK };
+    let timing = Timing {
+        ping: Duration::from_secs(20),
+        call_ping: Duration::from_millis(50),
+        ..QUICK
+    };
     let fake = fake(&[], |_, mut conn| {
         conn.send(ready(1, &[ME], json!([])));
         while let Some(frame) = conn.next(Duration::from_secs(10)) {
@@ -617,8 +875,20 @@ fn a_seat_pings_faster_until_it_is_left() {
     });
     let running = run(&fake.base, timing);
     until("connected", || running.link().0 == Link::Connected);
-    assert_eq!(running.ask(|reply| Ask::Join { room_id: ROOM.into(), reply }), Ok(()));
-    let pings = || running.did().iter().filter(|did| matches!(did, Did::Pinged { .. })).count();
+    assert_eq!(
+        running.ask(|reply| Ask::Join {
+            room_id: ROOM.into(),
+            reply
+        }),
+        Ok(())
+    );
+    let pings = || {
+        running
+            .did()
+            .iter()
+            .filter(|did| matches!(did, Did::Pinged { .. }))
+            .count()
+    };
     until("pings during the call", || pings() >= 4);
     assert_eq!(running.ask(|reply| Ask::Leave { reply }), Ok(()));
     let after = pings();
@@ -631,7 +901,12 @@ fn a_seat_pings_faster_until_it_is_left() {
 #[test]
 fn a_media_drop_finds_a_dead_socket_at_once() {
     with_mediad();
-    let timing = Timing { doubt: Duration::from_millis(200), pong: Duration::from_secs(20), answer: Duration::from_secs(20), ..QUICK };
+    let timing = Timing {
+        doubt: Duration::from_millis(200),
+        pong: Duration::from_secs(20),
+        answer: Duration::from_secs(20),
+        ..QUICK
+    };
     let (said, heard) = channel();
     let fake = fake_with("up", &[], move |n, mut conn| {
         conn.send(ready(1, &[ME], json!([])));
@@ -648,11 +923,21 @@ fn a_media_drop_finds_a_dead_socket_at_once() {
         }
     });
     let running = in_a_call(&fake, timing);
-    running.hub.calls.set_state(&running.hub, &running.key(ROOM), protocol::CallState::Reconnecting);
+    running.hub.calls.set_state(
+        &running.hub,
+        &running.key(ROOM),
+        protocol::CallState::Reconnecting,
+    );
     let asked = Instant::now();
     running.live.ask(Ask::Resume);
-    heard.recv_timeout(Duration::from_secs(10)).expect("a join on a new socket");
-    assert!(asked.elapsed() < Duration::from_secs(5), "{:?}", asked.elapsed());
+    heard
+        .recv_timeout(Duration::from_secs(10))
+        .expect("a join on a new socket");
+    assert!(
+        asked.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        asked.elapsed()
+    );
 }
 
 /// Media is down and the socket that could bring it back stays down: the budget cannot be spent
@@ -669,7 +954,10 @@ fn a_call_whose_media_and_socket_stay_down_ends_in_words() {
         }
         down
     };
-    let timing = Timing { stranded: Duration::from_millis(300), ..QUICK };
+    let timing = Timing {
+        stranded: Duration::from_millis(300),
+        ..QUICK
+    };
     let fake = fake_with("up", &DOWN, |_, mut conn| {
         conn.send(ready(1, &[ME], json!([])));
         answer_join(&mut conn, "c-1");
@@ -677,19 +965,37 @@ fn a_call_whose_media_and_socket_stay_down_ends_in_words() {
         conn.close(1006);
     });
     let running = in_a_call(&fake, timing);
-    running.hub.calls.set_state(&running.hub, &running.key(ROOM), protocol::CallState::Reconnecting);
-    until("the call failed in words", || failed_with(&running, CallFailure::Lost, super::DROPPED));
+    running.hub.calls.set_state(
+        &running.hub,
+        &running.key(ROOM),
+        protocol::CallState::Reconnecting,
+    );
+    until("the call failed in words", || {
+        failed_with(&running, CallFailure::Lost, super::DROPPED)
+    });
 }
 
 /// The server's side of call requests: a full room, a kick that is refused, and one that is
 /// never answered.
 fn calls_script(_: usize, mut conn: Conn) {
-    conn.send(ready(1, &[ME, BEA], json!([{"room_id": OTHER_ROOM, "participants": [{"user_id": BEA}]}])));
+    conn.send(ready(
+        1,
+        &[ME, BEA],
+        json!([{"room_id": OTHER_ROOM, "participants": [{"user_id": BEA}]}]),
+    ));
     while let Some(frame) = conn.next(Duration::from_secs(10)) {
         let reference = frame["ref"].clone();
-        match (frame["type"].as_str().unwrap_or(""), frame["room_id"].as_str().unwrap_or(""), frame["user_id"].as_str().unwrap_or("")) {
-            ("call.join", "full", _) => conn.send(json!({"type": "error", "ref": reference, "code": "full"})),
-            ("call.join", "gone", _) => conn.send(json!({"type": "error", "ref": reference, "code": "not_found"})),
+        match (
+            frame["type"].as_str().unwrap_or(""),
+            frame["room_id"].as_str().unwrap_or(""),
+            frame["user_id"].as_str().unwrap_or(""),
+        ) {
+            ("call.join", "full", _) => {
+                conn.send(json!({"type": "error", "ref": reference, "code": "full"}))
+            }
+            ("call.join", "gone", _) => {
+                conn.send(json!({"type": "error", "ref": reference, "code": "not_found"}))
+            }
             ("call.join", "quiet", _) => {}
             ("call.join", room, _) => {
                 conn.send(json!({"type": "ok", "ref": reference}));
@@ -697,10 +1003,16 @@ fn calls_script(_: usize, mut conn: Conn) {
             }
             ("call.leave", _, _) => {
                 conn.send(json!({"type": "ok", "ref": reference}));
-                conn.send(json!({"type": "call.left", "room_id": ROOM, "user_id": ME, "reason": "left"}));
+                conn.send(
+                    json!({"type": "call.left", "room_id": ROOM, "user_id": ME, "reason": "left"}),
+                );
             }
-            ("call.kick", _, "owner") => conn.send(json!({"type": "error", "ref": reference, "code": "forbidden"})),
-            ("call.kick", _, "nobody") => conn.send(json!({"type": "error", "ref": reference, "code": "not_found"})),
+            ("call.kick", _, "owner") => {
+                conn.send(json!({"type": "error", "ref": reference, "code": "forbidden"}))
+            }
+            ("call.kick", _, "nobody") => {
+                conn.send(json!({"type": "error", "ref": reference, "code": "not_found"}))
+            }
             ("call.kick", room, user) => {
                 conn.send(json!({"type": "ok", "ref": reference}));
                 conn.send(json!({"type": "call.left", "room_id": room, "user_id": user, "reason": "kicked"}));
@@ -713,25 +1025,88 @@ fn calls_script(_: usize, mut conn: Conn) {
 #[test]
 fn joining_leaving_and_kicking_get_the_servers_answer_in_words() {
     let fake = fake(&[], calls_script);
-    let timing = Timing { answer: Duration::from_millis(400), ..QUICK };
+    let timing = Timing {
+        answer: Duration::from_millis(400),
+        ..QUICK
+    };
     let running = run(&fake.base, timing);
-    assert_eq!(running.ask(|reply| Ask::Join { room_id: ROOM.into(), reply }), Err(OFFLINE.to_owned()), "nothing is queued while down");
+    assert_eq!(
+        running.ask(|reply| Ask::Join {
+            room_id: ROOM.into(),
+            reply
+        }),
+        Err(OFFLINE.to_owned()),
+        "nothing is queued while down"
+    );
     until("connected", || running.link().0 == Link::Connected);
 
-    assert_eq!(running.ask(|reply| Ask::Join { room_id: ROOM.into(), reply }), Ok(()));
+    assert_eq!(
+        running.ask(|reply| Ask::Join {
+            room_id: ROOM.into(),
+            reply
+        }),
+        Ok(())
+    );
     until("my seat", || running.in_room(ROOM) == ["Ada"]);
-    assert_eq!(running.ask(|reply| Ask::Join { room_id: "full".into(), reply }), Err("That room is full.".to_owned()));
-    assert_eq!(running.ask(|reply| Ask::Join { room_id: "gone".into(), reply }), Err("That room is gone.".to_owned()));
-    assert_eq!(running.ask(|reply| Ask::Join { room_id: "quiet".into(), reply }), Err(NO_ANSWER.to_owned()));
-    assert_eq!(running.in_room(ROOM), ["Ada"], "a refused join keeps the seat");
+    assert_eq!(
+        running.ask(|reply| Ask::Join {
+            room_id: "full".into(),
+            reply
+        }),
+        Err("That room is full.".to_owned())
+    );
+    assert_eq!(
+        running.ask(|reply| Ask::Join {
+            room_id: "gone".into(),
+            reply
+        }),
+        Err("That room is gone.".to_owned())
+    );
+    assert_eq!(
+        running.ask(|reply| Ask::Join {
+            room_id: "quiet".into(),
+            reply
+        }),
+        Err(NO_ANSWER.to_owned())
+    );
+    assert_eq!(
+        running.in_room(ROOM),
+        ["Ada"],
+        "a refused join keeps the seat"
+    );
 
-    assert_eq!(running.ask(|reply| Ask::Kick { room_id: OTHER_ROOM.into(), user_id: "owner".into(), reply }), Err("You can't do that.".to_owned()));
-    assert_eq!(running.ask(|reply| Ask::Kick { room_id: OTHER_ROOM.into(), user_id: "nobody".into(), reply }), Err("They're not in that room's call.".to_owned()));
-    assert_eq!(running.ask(|reply| Ask::Kick { room_id: OTHER_ROOM.into(), user_id: BEA.into(), reply }), Ok(()));
-    until("Bea removed from the call", || running.hub.occupants(&running.key(OTHER_ROOM)).is_none());
+    assert_eq!(
+        running.ask(|reply| Ask::Kick {
+            room_id: OTHER_ROOM.into(),
+            user_id: "owner".into(),
+            reply
+        }),
+        Err("You can't do that.".to_owned())
+    );
+    assert_eq!(
+        running.ask(|reply| Ask::Kick {
+            room_id: OTHER_ROOM.into(),
+            user_id: "nobody".into(),
+            reply
+        }),
+        Err("They're not in that room's call.".to_owned())
+    );
+    assert_eq!(
+        running.ask(|reply| Ask::Kick {
+            room_id: OTHER_ROOM.into(),
+            user_id: BEA.into(),
+            reply
+        }),
+        Ok(())
+    );
+    until("Bea removed from the call", || {
+        running.hub.occupants(&running.key(OTHER_ROOM)).is_none()
+    });
 
     assert_eq!(running.ask(|reply| Ask::Leave { reply }), Ok(()));
-    until("my seat gone", || running.hub.occupants(&running.key(ROOM)).is_none());
+    until("my seat gone", || {
+        running.hub.occupants(&running.key(ROOM)).is_none()
+    });
 }
 
 #[test]
@@ -739,13 +1114,22 @@ fn a_server_with_audio_down_is_sent_no_join() {
     let fake = fake_with("down", &[], |_, mut conn| {
         conn.send(ready(1, &[ME], json!([])));
         let asked = conn.next(Duration::from_secs(2));
-        assert!(asked.is_none(), "no join reaches a server whose audio is down: {asked:?}");
+        assert!(
+            asked.is_none(),
+            "no join reaches a server whose audio is down: {asked:?}"
+        );
         conn.idle(Duration::from_secs(5));
     });
     let running = run(&fake.base, QUICK);
     until("connected", || running.link().0 == Link::Connected);
     until("the health read", || !running.live.seats_only());
-    assert_eq!(running.ask(|reply| Ask::Join { room_id: ROOM.into(), reply }), Err(AUDIO_DOWN.to_owned()));
+    assert_eq!(
+        running.ask(|reply| Ask::Join {
+            room_id: ROOM.into(),
+            reply
+        }),
+        Err(AUDIO_DOWN.to_owned())
+    );
 }
 
 /// The real mediad, for the joins with audio. It hears a tone, so it opens no device.
@@ -753,11 +1137,18 @@ fn with_mediad() {
     static BUILT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     BUILT.get_or_init(|| {
         let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-        let built = std::process::Command::new(cargo).args(["build", "-p", "mediad", "--bin", "mediad"]).status().expect("cargo runs");
+        let built = std::process::Command::new(cargo)
+            .args(["build", "-p", "mediad", "--bin", "mediad"])
+            .status()
+            .expect("cargo runs");
         assert!(built.success(), "mediad builds");
         // target/debug/deps/chatd-… is beside target/debug/mediad.
         let deps = std::env::current_exe().expect("the test's path");
-        let mediad = deps.parent().and_then(|deps| deps.parent()).expect("target/debug").join(format!("mediad{}", std::env::consts::EXE_SUFFIX));
+        let mediad = deps
+            .parent()
+            .and_then(|deps| deps.parent())
+            .expect("target/debug")
+            .join(format!("mediad{}", std::env::consts::EXE_SUFFIX));
         std::env::set_var("TINYCLIENT_MEDIAD", mediad);
         std::env::set_var("TINYCLIENT_MEDIAD_AUDIO", "tone");
     });
@@ -769,7 +1160,10 @@ fn answer_for(offer: &str) -> String {
     let mut lines = vec![];
     let mut candidate = true;
     for line in offer.lines() {
-        if ["a=candidate:", "a=ice-options", "a=ssrc:", "a=msid:"].iter().any(|skip| line.starts_with(skip)) {
+        if ["a=candidate:", "a=ice-options", "a=ssrc:", "a=msid:"]
+            .iter()
+            .any(|skip| line.starts_with(skip))
+        {
             continue;
         }
         let line = match line {
@@ -794,18 +1188,35 @@ fn answer_for(offer: &str) -> String {
 
 /// The mids of an offer's receive slots, in order.
 fn slot_mids(offer: &str) -> Vec<String> {
-    offer.split("m=audio").skip(1).filter(|section| section.contains("a=recvonly")).filter_map(|section| section.lines().find_map(|line| line.strip_prefix("a=mid:")).map(str::to_owned)).collect()
+    offer
+        .split("m=audio")
+        .skip(1)
+        .filter(|section| section.contains("a=recvonly"))
+        .filter_map(|section| {
+            section
+                .lines()
+                .find_map(|line| line.strip_prefix("a=mid:"))
+                .map(str::to_owned)
+        })
+        .collect()
 }
 
 fn the_call(running: &Running) -> Option<protocol::Call> {
-    running.hub.calls.describe().0.filter(|call| call.conversation == running.key(ROOM))
+    running
+        .hub
+        .calls
+        .describe()
+        .0
+        .filter(|call| call.conversation == running.key(ROOM))
 }
 
 /// The server's side of a join with audio: the answer, the seat, the slots and who speaks.
 fn answer_join(conn: &mut Conn, call_id: &str) -> Value {
     let join = conn.next(Duration::from_secs(30)).expect("a join");
     assert_eq!(join["type"], "call.join");
-    let sdp = join["sdp"].as_str().expect("a join to a server with audio carries an offer");
+    let sdp = join["sdp"]
+        .as_str()
+        .expect("a join to a server with audio carries an offer");
     conn.send(json!({"type": "call.answer", "ref": join["ref"], "call_id": call_id, "sdp": answer_for(sdp)}));
     conn.send(json!({"type": "call.joined", "room_id": ROOM, "user_id": ME}));
     conn.send(json!({"type": "call.slots", "call_id": "c-stale", "audio": [], "video": null}));
@@ -818,13 +1229,24 @@ fn a_join_with_audio_carries_mediads_offer_out_and_the_answer_back() {
     with_mediad();
     let (said, heard) = channel();
     let fake = fake_with("up", &[], move |_, mut conn| {
-        conn.send(ready(1, &[ME, BEA], json!([{"room_id": ROOM, "participants": [{"user_id": BEA}]}])));
+        conn.send(ready(
+            1,
+            &[ME, BEA],
+            json!([{"room_id": ROOM, "participants": [{"user_id": BEA}]}]),
+        ));
         let join = answer_join(&mut conn, "c-1");
         let _ = said.send(join["sdp"].as_str().unwrap_or("").to_owned());
         conn.send(json!({"type": "call.speaking", "room_id": ROOM, "user_ids": [BEA]}));
         // Muting is told to the server.
         let state = conn.next(Duration::from_secs(5)).expect("call.state");
-        assert_eq!((state["type"].as_str(), state["muted"].as_bool(), state["deafened"].as_bool()), (Some("call.state"), Some(true), Some(false)));
+        assert_eq!(
+            (
+                state["type"].as_str(),
+                state["muted"].as_bool(),
+                state["deafened"].as_bool()
+            ),
+            (Some("call.state"), Some(true), Some(false))
+        );
         conn.send(json!({"type": "ok", "ref": state["ref"]}));
         // Hanging up in chatd leaves the room.
         let leave = conn.next(Duration::from_secs(5)).expect("call.leave");
@@ -841,7 +1263,9 @@ fn a_join_with_audio_carries_mediads_offer_out_and_the_answer_back() {
             assert!(again["sdp"].is_string(), "a fresh offer: {again}");
         }
         conn.idle(Duration::from_millis(300));
-        conn.send(json!({"type": "call.left", "room_id": ROOM, "user_id": ME, "reason": "media_lost"}));
+        conn.send(
+            json!({"type": "call.left", "room_id": ROOM, "user_id": ME, "reason": "media_lost"}),
+        );
         // chatd hangs up after a failure; we are out of the room already, so nothing is sent.
         let after = conn.next(Duration::from_millis(800));
         assert!(after.is_none(), "nothing to leave: {after:?}");
@@ -852,23 +1276,63 @@ fn a_join_with_audio_carries_mediads_offer_out_and_the_answer_back() {
     until("the health read", || !running.live.seats_only());
 
     assert_eq!(running.join_with_audio(ROOM), Ok(()));
-    let offer = heard.recv_timeout(Duration::from_secs(5)).expect("the offer");
-    assert_eq!(offer.matches("m=audio").count(), ROOM_CAP as usize, "a microphone and a slot for each other seat");
+    let offer = heard
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the offer");
+    assert_eq!(
+        offer.matches("m=audio").count(),
+        ROOM_CAP as usize,
+        "a microphone and a slot for each other seat"
+    );
     assert_eq!(offer.matches("a=sendonly").count(), 1);
     let call = the_call(&running).expect("chatd holds the call");
     assert!(call.engine_linked);
-    assert_eq!(call.state, protocol::CallState::Connecting, "connecting until media flows");
-    until("Bea speaking in the room", || running.hub.occupants(&running.key(ROOM)).is_some_and(|inside| inside.people.iter().any(|who| who.name == "Bea" && who.speaking)));
+    assert_eq!(
+        call.state,
+        protocol::CallState::Connecting,
+        "connecting until media flows"
+    );
+    until("Bea speaking in the room", || {
+        running
+            .hub
+            .occupants(&running.key(ROOM))
+            .is_some_and(|inside| {
+                inside
+                    .people
+                    .iter()
+                    .any(|who| who.name == "Bea" && who.speaking)
+            })
+    });
 
-    running.live.ask(Ask::State { muted: true, deafened: false });
+    running.live.ask(Ask::State {
+        muted: true,
+        deafened: false,
+    });
     // What chatd does on CallEnd: its call goes, and the adapter is told to hang up.
     assert!(running.hub.calls.end(&running.hub).is_some());
-    running.live.ask(Ask::Hangup { room_id: ROOM.into() });
-    until("my seat gone", || running.hub.occupants(&running.key(ROOM)).is_some_and(|inside| inside.people.iter().all(|who| who.name != "Ada")));
+    running.live.ask(Ask::Hangup {
+        room_id: ROOM.into(),
+    });
+    until("my seat gone", || {
+        running
+            .hub
+            .occupants(&running.key(ROOM))
+            .is_some_and(|inside| inside.people.iter().all(|who| who.name != "Ada"))
+    });
 
     assert_eq!(running.join_with_audio(ROOM), Ok(()));
-    until("the call failed in words", || the_call(&running).is_some_and(|call| call.state == protocol::CallState::Failed { reason: CallFailure::Lost, detail: MEDIA_LOST.to_owned() }));
-    running.live.ask(Ask::Hangup { room_id: ROOM.into() });
+    until("the call failed in words", || {
+        the_call(&running).is_some_and(|call| {
+            call.state
+                == protocol::CallState::Failed {
+                    reason: CallFailure::Lost,
+                    detail: MEDIA_LOST.to_owned(),
+                }
+        })
+    });
+    running.live.ask(Ask::Hangup {
+        room_id: ROOM.into(),
+    });
     std::thread::sleep(Duration::from_millis(1000));
 }
 
@@ -877,24 +1341,65 @@ fn a_call_that_keeps_losing_its_media_stops_joining_again() {
     let start = Instant::now();
     let mut recovered = Vec::new();
     for n in 0..3 {
-        assert!(super::recovering(&mut recovered, start + Duration::from_secs(n)), "try {n}");
+        assert!(
+            super::recovering(&mut recovered, start + Duration::from_secs(n)),
+            "try {n}"
+        );
     }
-    assert!(!super::recovering(&mut recovered, start + Duration::from_secs(10)), "a fourth within two minutes is given up");
-    assert!(super::recovering(&mut recovered, start + Duration::from_secs(121)), "the first has aged out");
+    assert!(
+        !super::recovering(&mut recovered, start + Duration::from_secs(10)),
+        "a fourth within two minutes is given up"
+    );
+    assert!(
+        super::recovering(&mut recovered, start + Duration::from_secs(121)),
+        "the first has aged out"
+    );
 }
 
 /// Discord's resume budget: three tries, at once, then after 2s and 3s, and a link that held a minute starts over.
 #[test]
 fn a_link_that_held_for_a_minute_starts_the_resume_count_over() {
     let start = Instant::now();
-    assert_eq!(super::plan(0, None, start), super::Plan::Resume { resumes: 1, pause: Duration::ZERO });
-    assert_eq!(super::plan(1, None, start), super::Plan::Resume { resumes: 2, pause: Duration::from_secs(2) });
-    assert_eq!(super::plan(2, None, start), super::Plan::Resume { resumes: 3, pause: Duration::from_secs(3) });
+    assert_eq!(
+        super::plan(0, None, start),
+        super::Plan::Resume {
+            resumes: 1,
+            pause: Duration::ZERO
+        }
+    );
+    assert_eq!(
+        super::plan(1, None, start),
+        super::Plan::Resume {
+            resumes: 2,
+            pause: Duration::from_secs(2)
+        }
+    );
+    assert_eq!(
+        super::plan(2, None, start),
+        super::Plan::Resume {
+            resumes: 3,
+            pause: Duration::from_secs(3)
+        }
+    );
     assert_eq!(super::plan(3, None, start), super::Plan::GiveUp);
-    assert_eq!(super::plan(3, Some(start), start + Duration::from_secs(59)), super::Plan::GiveUp, "59s has not restored the budget");
-    let again = super::Plan::Resume { resumes: 1, pause: Duration::ZERO };
-    assert_eq!(super::plan(3, Some(start), start + Duration::from_secs(60)), again, "60s starts the count over");
-    assert_eq!(super::plan(2, Some(start), start + Duration::from_secs(60)), again);
+    assert_eq!(
+        super::plan(3, Some(start), start + Duration::from_secs(59)),
+        super::Plan::GiveUp,
+        "59s has not restored the budget"
+    );
+    let again = super::Plan::Resume {
+        resumes: 1,
+        pause: Duration::ZERO,
+    };
+    assert_eq!(
+        super::plan(3, Some(start), start + Duration::from_secs(60)),
+        again,
+        "60s starts the count over"
+    );
+    assert_eq!(
+        super::plan(2, Some(start), start + Duration::from_secs(60)),
+        again
+    );
 }
 
 /// The server's answer to a resume, and a speaking bit the test can see once that answer is in.
@@ -909,7 +1414,15 @@ fn answer_resume(conn: &mut Conn, call_id: &str, speaking: bool) -> Value {
 }
 
 fn bea_speaking(running: &Running) -> bool {
-    running.hub.occupants(&running.key(ROOM)).is_some_and(|inside| inside.people.iter().any(|who| who.name == "Bea" && who.speaking))
+    running
+        .hub
+        .occupants(&running.key(ROOM))
+        .is_some_and(|inside| {
+            inside
+                .people
+                .iter()
+                .any(|who| who.name == "Bea" && who.speaking)
+        })
 }
 
 #[test]
@@ -917,15 +1430,27 @@ fn a_media_drop_while_the_socket_is_up_joins_again_until_the_budget_is_spent() {
     with_mediad();
     let (said, heard) = channel();
     let fake = fake_with("up", &[], move |_, mut conn| {
-        conn.send(ready(1, &[ME, BEA], json!([{"room_id": ROOM, "participants": [{"user_id": BEA}]}])));
+        conn.send(ready(
+            1,
+            &[ME, BEA],
+            json!([{"room_id": ROOM, "participants": [{"user_id": BEA}]}]),
+        ));
         answer_join(&mut conn, "c-1");
         for n in 0..3 {
             let again = answer_resume(&mut conn, &format!("c-resume-{n}"), n % 2 == 0);
-            assert!(again["sdp"].as_str().is_some_and(|sdp| sdp.contains("a=ice-ufrag:")), "a fresh offer");
+            assert!(
+                again["sdp"]
+                    .as_str()
+                    .is_some_and(|sdp| sdp.contains("a=ice-ufrag:")),
+                "a fresh offer"
+            );
             let _ = said.send(n);
         }
         let extra = conn.next(Duration::from_millis(1500));
-        assert!(extra.is_none(), "the budget sends no further join: {extra:?}");
+        assert!(
+            extra.is_none(),
+            "the budget sends no further join: {extra:?}"
+        );
         let _ = said.send(3);
         conn.idle(Duration::from_secs(3));
     });
@@ -933,28 +1458,60 @@ fn a_media_drop_while_the_socket_is_up_joins_again_until_the_budget_is_spent() {
     until("connected", || running.link().0 == Link::Connected);
     until("the health read", || !running.live.seats_only());
     assert_eq!(running.join_with_audio(ROOM), Ok(()));
-    running.hub.calls.set_state(&running.hub, &running.key(ROOM), protocol::CallState::Reconnecting);
-    assert!(running.hub.calls.describe().1, "mediad is up before the drop is resumed");
+    running.hub.calls.set_state(
+        &running.hub,
+        &running.key(ROOM),
+        protocol::CallState::Reconnecting,
+    );
+    assert!(
+        running.hub.calls.describe().1,
+        "mediad is up before the drop is resumed"
+    );
 
     for n in 0..3 {
         running.live.ask(Ask::Resume);
-        assert_eq!(heard.recv_timeout(Duration::from_secs(10)).expect("the resume was answered"), n);
+        assert_eq!(
+            heard
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the resume was answered"),
+            n
+        );
         if n % 2 == 0 {
-            until("Bea speaking, so the answer is in", || bea_speaking(&running));
+            until("Bea speaking, so the answer is in", || {
+                bea_speaking(&running)
+            });
         } else {
             until("Bea quiet, so the answer is in", || !bea_speaking(&running));
         }
         let call = the_call(&running).expect("the call stays up");
-        assert!(!matches!(call.state, protocol::CallState::Failed { .. }), "resume {n} does not end the call: {:?}", call.state);
-        assert!(running.hub.calls.describe().1, "mediad stays up through resume {n}");
+        assert!(
+            !matches!(call.state, protocol::CallState::Failed { .. }),
+            "resume {n} does not end the call: {:?}",
+            call.state
+        );
+        assert!(
+            running.hub.calls.describe().1,
+            "mediad stays up through resume {n}"
+        );
     }
 
     running.live.ask(Ask::Resume);
     until("the budget is spent", || {
-        the_call(&running).is_some_and(|call| call.state == protocol::CallState::Failed { reason: CallFailure::Lost, detail: super::DROPPED.to_owned() })
+        the_call(&running).is_some_and(|call| {
+            call.state
+                == protocol::CallState::Failed {
+                    reason: CallFailure::Lost,
+                    detail: super::DROPPED.to_owned(),
+                }
+        })
     });
     assert!(!running.hub.calls.describe().1, "giving up stops mediad");
-    assert_eq!(heard.recv_timeout(Duration::from_secs(5)).expect("no further join"), 3);
+    assert_eq!(
+        heard
+            .recv_timeout(Duration::from_secs(5))
+            .expect("no further join"),
+        3
+    );
 }
 
 #[test]
@@ -965,7 +1522,10 @@ fn hangup_during_a_reconnect_leaves_at_once() {
         conn.send(ready(1, &[ME], json!([])));
         answer_join(&mut conn, "c-1");
         let leave = conn.next(Duration::from_secs(3)).expect("leave");
-        assert_eq!(leave["type"], "call.leave", "hangup leaves without joining again: {leave}");
+        assert_eq!(
+            leave["type"], "call.leave",
+            "hangup leaves without joining again: {leave}"
+        );
         conn.send(json!({"type": "ok", "ref": leave["ref"]}));
         conn.send(json!({"type": "call.left", "room_id": ROOM, "user_id": ME, "reason": "left"}));
         let extra = conn.next(Duration::from_millis(1500));
@@ -977,16 +1537,26 @@ fn hangup_during_a_reconnect_leaves_at_once() {
     until("connected", || running.link().0 == Link::Connected);
     until("the health read", || !running.live.seats_only());
     assert_eq!(running.join_with_audio(ROOM), Ok(()));
-    running.hub.calls.set_state(&running.hub, &running.key(ROOM), protocol::CallState::Reconnecting);
+    running.hub.calls.set_state(
+        &running.hub,
+        &running.key(ROOM),
+        protocol::CallState::Reconnecting,
+    );
     // Both in one wake: a first try joins at once, and the hang-up has to win that wake.
     {
         let mut inner = lock(&running.live.inner);
         inner.queued.push_back(Ask::Resume);
-        inner.queued.push_back(Ask::Hangup { room_id: ROOM.into() });
+        inner.queued.push_back(Ask::Hangup {
+            room_id: ROOM.into(),
+        });
     }
     running.live.wake();
-    heard.recv_timeout(Duration::from_secs(6)).expect("hung up without joining again");
-    until("the seat is gone", || running.hub.occupants(&running.key(ROOM)).is_none());
+    heard
+        .recv_timeout(Duration::from_secs(6))
+        .expect("hung up without joining again");
+    until("the seat is gone", || {
+        running.hub.occupants(&running.key(ROOM)).is_none()
+    });
 }
 
 fn left_with(room: &str, reason: &str) -> Value {
@@ -994,7 +1564,13 @@ fn left_with(room: &str, reason: &str) -> Value {
 }
 
 fn failed_with(running: &Running, reason: CallFailure, detail: &str) -> bool {
-    the_call(running).is_some_and(|call| call.state == protocol::CallState::Failed { reason, detail: detail.to_owned() })
+    the_call(running).is_some_and(|call| {
+        call.state
+            == protocol::CallState::Failed {
+                reason,
+                detail: detail.to_owned(),
+            }
+    })
 }
 
 /// A join with audio on a fake that has answered it, with the socket thread's reads settled.
@@ -1012,7 +1588,11 @@ fn in_a_call(fake: &Fake, timing: Timing) -> Running {
 fn a_seat_the_server_let_go_is_taken_again_and_the_end_of_the_budget_is_said() {
     with_mediad();
     let fake = fake_with("up", &[], |_, mut conn| {
-        conn.send(ready(1, &[ME, BEA], json!([{"room_id": ROOM, "participants": [{"user_id": BEA}]}])));
+        conn.send(ready(
+            1,
+            &[ME, BEA],
+            json!([{"room_id": ROOM, "participants": [{"user_id": BEA}]}]),
+        ));
         answer_join(&mut conn, "c-1");
         for n in 0..3 {
             conn.idle(Duration::from_millis(200));
@@ -1023,13 +1603,20 @@ fn a_seat_the_server_let_go_is_taken_again_and_the_end_of_the_budget_is_said() {
         conn.idle(Duration::from_millis(200));
         conn.send(left_with(ROOM, "disconnected"));
         let after = conn.next(Duration::from_millis(800));
-        assert!(after.is_none(), "the budget sends no further join: {after:?}");
+        assert!(
+            after.is_none(),
+            "the budget sends no further join: {after:?}"
+        );
         conn.idle(Duration::from_secs(5));
     });
     let running = in_a_call(&fake, QUICK);
     let long = Instant::now() + Duration::from_secs(30);
     while !failed_with(&running, CallFailure::Lost, super::DROPPED) {
-        assert!(Instant::now() < long, "the call ends in words, not in silence: {:?}", the_call(&running).map(|call| call.state));
+        assert!(
+            Instant::now() < long,
+            "the call ends in words, not in silence: {:?}",
+            the_call(&running).map(|call| call.state)
+        );
         assert!(the_call(&running).is_some(), "the call went with no words");
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -1041,7 +1628,11 @@ fn a_seat_the_server_let_go_is_taken_again_and_the_end_of_the_budget_is_said() {
 fn every_reason_the_server_gives_for_ending_a_call_has_words() {
     with_mediad();
     let fake = fake_with("up", &[], |_, mut conn| {
-        conn.send(ready(1, &[ME, BEA], json!([{"room_id": ROOM, "participants": [{"user_id": BEA}]}])));
+        conn.send(ready(
+            1,
+            &[ME, BEA],
+            json!([{"room_id": ROOM, "participants": [{"user_id": BEA}]}]),
+        ));
         for reason in ["removed", "session_ended", "something_new"] {
             answer_join(&mut conn, "c-1");
             conn.idle(Duration::from_millis(100));
@@ -1052,11 +1643,19 @@ fn every_reason_the_server_gives_for_ending_a_call_has_words() {
     let running = run(&fake.base, QUICK);
     until("connected", || running.link().0 == Link::Connected);
     until("the health read", || !running.live.seats_only());
-    for (reason, words) in [(CallFailure::Refused, REMOVED), (CallFailure::Refused, ENDED), (CallFailure::Lost, super::SERVER_ENDED)] {
+    for (reason, words) in [
+        (CallFailure::Refused, REMOVED),
+        (CallFailure::Refused, ENDED),
+        (CallFailure::Lost, super::SERVER_ENDED),
+    ] {
         assert_eq!(running.join_with_audio(ROOM), Ok(()));
-        until("the call failed in words", || failed_with(&running, reason, words));
+        until("the call failed in words", || {
+            failed_with(&running, reason, words)
+        });
         assert!(running.hub.calls.end(&running.hub).is_some());
-        running.live.ask(Ask::Hangup { room_id: ROOM.into() });
+        running.live.ask(Ask::Hangup {
+            room_id: ROOM.into(),
+        });
     }
 }
 
@@ -1065,7 +1664,11 @@ fn every_reason_the_server_gives_for_ending_a_call_has_words() {
 #[test]
 fn a_socket_closed_for_good_ends_the_call_in_words() {
     with_mediad();
-    for (code, reason, words) in [(4001, CallFailure::Refused, ENDED), (4003, CallFailure::Refused, REMOVED), (4008, CallFailure::Refused, REPLACED)] {
+    for (code, reason, words) in [
+        (4001, CallFailure::Refused, ENDED),
+        (4003, CallFailure::Refused, REMOVED),
+        (4008, CallFailure::Refused, REPLACED),
+    ] {
         let fake = fake_with("up", &[], move |_, mut conn| {
             conn.send(ready(1, &[ME], json!([])));
             answer_join(&mut conn, "c-1");
@@ -1073,7 +1676,9 @@ fn a_socket_closed_for_good_ends_the_call_in_words() {
             conn.close(code);
         });
         let running = in_a_call(&fake, QUICK);
-        until("the call failed in words", || failed_with(&running, reason, words));
+        until("the call failed in words", || {
+            failed_with(&running, reason, words)
+        });
     }
 }
 
@@ -1084,7 +1689,11 @@ fn media_lost_while_the_socket_was_down_joins_again_on_ready() {
     with_mediad();
     let (said, heard) = channel();
     let fake = fake_with("up", &[], move |n, mut conn| {
-        let seated = if n == 0 { json!([]) } else { json!([{"room_id": ROOM, "participants": [{"user_id": ME}]}]) };
+        let seated = if n == 0 {
+            json!([])
+        } else {
+            json!([{"room_id": ROOM, "participants": [{"user_id": ME}]}])
+        };
         conn.send(ready(1, &[ME], seated));
         match n {
             0 => {
@@ -1099,9 +1708,18 @@ fn media_lost_while_the_socket_was_down_joins_again_on_ready() {
         }
     });
     let running = in_a_call(&fake, QUICK);
-    running.hub.calls.set_state(&running.hub, &running.key(ROOM), protocol::CallState::Reconnecting);
-    heard.recv_timeout(Duration::from_secs(10)).expect("a fresh offer after the socket came back");
-    until("the same call goes on", || the_call(&running).is_some_and(|call| !matches!(call.state, protocol::CallState::Failed { .. })));
+    running.hub.calls.set_state(
+        &running.hub,
+        &running.key(ROOM),
+        protocol::CallState::Reconnecting,
+    );
+    heard
+        .recv_timeout(Duration::from_secs(10))
+        .expect("a fresh offer after the socket came back");
+    until("the same call goes on", || {
+        the_call(&running)
+            .is_some_and(|call| !matches!(call.state, protocol::CallState::Failed { .. }))
+    });
 }
 
 /// The same, with the resume's own join lost with the socket: it is not forgotten.
@@ -1110,12 +1728,18 @@ fn a_resume_lost_with_its_socket_is_taken_up_again_on_ready() {
     with_mediad();
     let (said, heard) = channel();
     let fake = fake_with("up", &[], move |n, mut conn| {
-        let seated = if n == 0 { json!([]) } else { json!([{"room_id": ROOM, "participants": [{"user_id": ME}]}]) };
+        let seated = if n == 0 {
+            json!([])
+        } else {
+            json!([{"room_id": ROOM, "participants": [{"user_id": ME}]}])
+        };
         conn.send(ready(1, &[ME], seated));
         match n {
             0 => {
                 answer_join(&mut conn, "c-1");
-                let lost = conn.next(Duration::from_secs(10)).expect("the resume's join");
+                let lost = conn
+                    .next(Duration::from_secs(10))
+                    .expect("the resume's join");
                 assert_eq!(lost["type"], "call.join");
                 conn.close(1006);
             }
@@ -1126,9 +1750,15 @@ fn a_resume_lost_with_its_socket_is_taken_up_again_on_ready() {
         }
     });
     let running = in_a_call(&fake, QUICK);
-    running.hub.calls.set_state(&running.hub, &running.key(ROOM), protocol::CallState::Reconnecting);
+    running.hub.calls.set_state(
+        &running.hub,
+        &running.key(ROOM),
+        protocol::CallState::Reconnecting,
+    );
     running.live.ask(Ask::Resume);
-    heard.recv_timeout(Duration::from_secs(10)).expect("a fresh offer after the socket came back");
+    heard
+        .recv_timeout(Duration::from_secs(10))
+        .expect("a fresh offer after the socket came back");
 }
 
 /// The server keeps a seat across a reconnect, so a call hung up while the socket was down has
@@ -1138,7 +1768,11 @@ fn a_seat_kept_for_a_call_hung_up_while_down_is_left_on_ready() {
     with_mediad();
     let (said, heard) = channel();
     let fake = fake_with("up", &[], move |n, mut conn| {
-        let seated = if n == 0 { json!([]) } else { json!([{"room_id": ROOM, "participants": [{"user_id": ME}]}]) };
+        let seated = if n == 0 {
+            json!([])
+        } else {
+            json!([{"room_id": ROOM, "participants": [{"user_id": ME}]}])
+        };
         conn.send(ready(1, &[ME], seated));
         match n {
             0 => {
@@ -1154,7 +1788,10 @@ fn a_seat_kept_for_a_call_hung_up_while_down_is_left_on_ready() {
     });
     let running = in_a_call(&fake, QUICK);
     assert!(running.hub.calls.end(&running.hub).is_some());
-    let frame = heard.recv_timeout(Duration::from_secs(10)).expect("the second connection").expect("a frame");
+    let frame = heard
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the second connection")
+        .expect("a frame");
     assert_eq!(frame["type"], "call.leave", "{frame}");
 }
 
@@ -1164,7 +1801,11 @@ fn a_reconnect_that_kept_the_seat_does_not_touch_working_media() {
     with_mediad();
     let (said, heard) = channel();
     let fake = fake_with("up", &[], move |n, mut conn| {
-        let seated = if n == 0 { json!([]) } else { json!([{"room_id": ROOM, "participants": [{"user_id": ME}]}]) };
+        let seated = if n == 0 {
+            json!([])
+        } else {
+            json!([{"room_id": ROOM, "participants": [{"user_id": ME}]}])
+        };
         conn.send(ready(1, &[ME], seated));
         match n {
             0 => {
@@ -1179,10 +1820,16 @@ fn a_reconnect_that_kept_the_seat_does_not_touch_working_media() {
         }
     });
     let running = in_a_call(&fake, QUICK);
-    let frame = heard.recv_timeout(Duration::from_secs(10)).expect("the second connection");
+    let frame = heard
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the second connection");
     assert!(frame.is_none(), "nothing is sent: {frame:?}");
     let call = the_call(&running).expect("the call stays up");
-    assert!(!matches!(call.state, protocol::CallState::Failed { .. }), "{:?}", call.state);
+    assert!(
+        !matches!(call.state, protocol::CallState::Failed { .. }),
+        "{:?}",
+        call.state
+    );
     assert!(running.hub.calls.describe().1, "mediad stays up");
 }
 
@@ -1202,16 +1849,31 @@ fn a_rejoin_nobody_answers_is_tried_again_within_the_budget() {
             }
         }
     });
-    let timing = Timing { answer: Duration::from_millis(300), ..QUICK };
+    let timing = Timing {
+        answer: Duration::from_millis(300),
+        ..QUICK
+    };
     let running = in_a_call(&fake, timing);
-    running.hub.calls.set_state(&running.hub, &running.key(ROOM), protocol::CallState::Reconnecting);
+    running.hub.calls.set_state(
+        &running.hub,
+        &running.key(ROOM),
+        protocol::CallState::Reconnecting,
+    );
     running.live.ask(Ask::Resume);
     let long = Instant::now() + Duration::from_secs(15);
     while !failed_with(&running, CallFailure::Lost, super::DROPPED) {
-        assert!(Instant::now() < long, "{:?}", the_call(&running).map(|call| call.state));
+        assert!(
+            Instant::now() < long,
+            "{:?}",
+            the_call(&running).map(|call| call.state)
+        );
         std::thread::sleep(Duration::from_millis(5));
     }
-    assert_eq!(tries.load(Ordering::SeqCst), 3, "each of the three resumes joined");
+    assert_eq!(
+        tries.load(Ordering::SeqCst),
+        3,
+        "each of the three resumes joined"
+    );
 }
 
 #[test]
@@ -1229,9 +1891,14 @@ fn a_join_with_audio_the_server_refuses_says_why_and_stops_mediad() {
     let running = run(&fake.base, QUICK);
     until("connected", || running.link().0 == Link::Connected);
     until("the health read", || !running.live.seats_only());
-    for words in ["The server couldn't use tinyclient's audio setup.", "This server's audio isn't available. Try again later."] {
+    for words in [
+        "The server couldn't use tinyclient's audio setup.",
+        "This server's audio isn't available. Try again later.",
+    ] {
         assert_eq!(running.join_with_audio(ROOM), Err(words.to_owned()));
-        until("no call left behind", || running.hub.calls.describe().0.is_none());
+        until("no call left behind", || {
+            running.hub.calls.describe().0.is_none()
+        });
     }
 }
 
@@ -1255,14 +1922,23 @@ fn an_end_to_end_encrypted_join_carries_mediads_key_package_and_says_how_the_cal
     with_mediad();
     let (said, heard) = channel();
     let fake = fake_with("e2ee", &[], move |_, mut conn| {
-        conn.send(ready(1, &[ME, BEA], json!([{"room_id": ROOM, "participants": [{"user_id": BEA, "e2ee": true}]}])));
+        conn.send(ready(
+            1,
+            &[ME, BEA],
+            json!([{"room_id": ROOM, "participants": [{"user_id": BEA, "e2ee": true}]}]),
+        ));
         let join = conn.next(Duration::from_secs(30)).expect("a join");
-        assert_eq!(join["e2ee"], 1, "the join offers end-to-end encryption: {join}");
+        assert_eq!(
+            join["e2ee"], 1,
+            "the join offers end-to-end encryption: {join}"
+        );
         let sdp = join["sdp"].as_str().expect("an offer");
         conn.send(json!({"type": "call.answer", "ref": join["ref"], "call_id": "c-1", "sdp": answer_for(sdp)}));
         conn.send(json!({"type": "call.e2ee", "room_id": ROOM, "op": "start", "version": 1, "external_sender": external_sender()}));
         conn.send(json!({"type": "call.joined", "room_id": ROOM, "user_id": ME, "e2ee": true}));
-        let package = conn.next(Duration::from_secs(10)).expect("mediad's key package");
+        let package = conn
+            .next(Duration::from_secs(10))
+            .expect("mediad's key package");
         let _ = said.send(package);
         // Someone without end-to-end encryption joins: the server turns it off for the room.
         conn.send(json!({"type": "call.joined", "room_id": ROOM, "user_id": "55555555-5555-5555-5555-555555555555", "e2ee": false}));
@@ -1272,30 +1948,60 @@ fn an_end_to_end_encrypted_join_carries_mediads_key_package_and_says_how_the_cal
     let running = run(&fake.base, QUICK);
     // What chatd's server does: mediad's frames for the server go to this account's socket.
     let socket = running.live.clone();
-    running.hub.calls.on_signal(move |_, frame| socket.ask(Ask::E2ee { frame }));
+    running
+        .hub
+        .calls
+        .on_signal(move |_, frame| socket.ask(Ask::E2ee { frame }));
     until("connected", || running.link().0 == Link::Connected);
     until("the health read", || !running.live.seats_only());
     assert_eq!(running.join_with_audio(ROOM), Ok(()));
-    let package = heard.recv_timeout(Duration::from_secs(15)).expect("the key package reached the server");
-    assert_eq!((package["type"].as_str(), package["op"].as_str()), (Some("call.e2ee"), Some("key_package")), "{package}");
-    assert!(package["data"].as_str().is_some_and(|data| data.len() > 100));
+    let package = heard
+        .recv_timeout(Duration::from_secs(15))
+        .expect("the key package reached the server");
+    assert_eq!(
+        (package["type"].as_str(), package["op"].as_str()),
+        (Some("call.e2ee"), Some("key_package")),
+        "{package}"
+    );
+    assert!(package["data"]
+        .as_str()
+        .is_some_and(|data| data.len() > 100));
     let security = || the_call(&running).and_then(|call| call.security);
     let off = Instant::now() + Duration::from_secs(10);
     // The server's `off` blocks the call: it is not carried on unencrypted on the server's word.
     while security().is_none_or(|security| security.mode != protocol::SecurityMode::Blocked) {
-        assert!(Instant::now() < off, "the call says encryption was turned off: {:?}", security());
+        assert!(
+            Instant::now() < off,
+            "the call says encryption was turned off: {:?}",
+            security()
+        );
         // Until then it is being set up, and never end to end without a group.
-        assert_ne!(security().map(|security| security.mode), Some(protocol::SecurityMode::EndToEnd));
+        assert_ne!(
+            security().map(|security| security.mode),
+            Some(protocol::SecurityMode::EndToEnd)
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
     let said = security().expect("said");
     assert_eq!(said.unsupported, ["55555555-5555-5555-5555-555555555555"]);
-    assert!(!said.server_lacks && !said.required && said.code.is_empty() && said.members.is_empty());
+    assert!(
+        !said.server_lacks && !said.required && said.code.is_empty() && said.members.is_empty()
+    );
     // The person chooses to carry on: only then is it transport only.
-    assert!(matches!(running.hub.calls.request(&running.hub, &protocol::MediaRequest::TinyTransport), Ok(protocol::MediaResponse::Done)));
-    until("transport only, by choice", || security().is_some_and(|security| security.mode == protocol::SecurityMode::Transport));
+    assert!(matches!(
+        running
+            .hub
+            .calls
+            .request(&running.hub, &protocol::MediaRequest::TinyTransport),
+        Ok(protocol::MediaResponse::Done)
+    ));
+    until("transport only, by choice", || {
+        security().is_some_and(|security| security.mode == protocol::SecurityMode::Transport)
+    });
     assert!(running.hub.calls.end(&running.hub).is_some());
-    running.live.ask(Ask::Hangup { room_id: ROOM.into() });
+    running.live.ask(Ask::Hangup {
+        room_id: ROOM.into(),
+    });
 }
 
 #[test]
@@ -1322,13 +2028,25 @@ fn after_a_restart_a_call_with_audio_joins_again_with_a_fresh_offer() {
     until("connected", || running.link().0 == Link::Connected);
     until("the health read", || !running.live.seats_only());
     assert_eq!(running.join_with_audio(ROOM), Ok(()));
-    let first = heard.recv_timeout(Duration::from_secs(5)).expect("the first offer");
-    let again = heard.recv_timeout(Duration::from_secs(30)).expect("the offer after the restart");
-    let ufrag = |sdp: &str| sdp.lines().find(|line| line.starts_with("a=ice-ufrag:")).map(str::to_owned);
+    let first = heard
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the first offer");
+    let again = heard
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the offer after the restart");
+    let ufrag = |sdp: &str| {
+        sdp.lines()
+            .find(|line| line.starts_with("a=ice-ufrag:"))
+            .map(str::to_owned)
+    };
     assert_ne!(ufrag(&first), ufrag(&again), "a new media session");
     until("the seat again", || running.in_room(ROOM) == ["Ada"]);
     let call = the_call(&running).expect("the same call goes on");
-    assert!(!matches!(call.state, protocol::CallState::Failed { .. }), "{:?}", call.state);
+    assert!(
+        !matches!(call.state, protocol::CallState::Failed { .. }),
+        "{:?}",
+        call.state
+    );
 }
 
 #[test]
@@ -1345,7 +2063,9 @@ fn a_seat_lost_with_the_socket_is_taken_again_and_one_left_on_purpose_is_not() {
                 conn.close(1012);
             }
             1 => {
-                let join = conn.next(Duration::from_secs(5)).expect("the seat taken again");
+                let join = conn
+                    .next(Duration::from_secs(5))
+                    .expect("the seat taken again");
                 assert_eq!(join["type"], "call.join");
                 assert_eq!(join["room_id"], ROOM);
                 conn.send(json!({"type": "ok", "ref": join["ref"]}));
@@ -1357,7 +2077,10 @@ fn a_seat_lost_with_the_socket_is_taken_again_and_one_left_on_purpose_is_not() {
             }
             _ => {
                 let unasked = conn.next(Duration::from_millis(500));
-                assert!(unasked.is_none(), "a seat taken away is not taken back: {unasked:?}");
+                assert!(
+                    unasked.is_none(),
+                    "a seat taken away is not taken back: {unasked:?}"
+                );
                 conn.idle(Duration::from_secs(5));
             }
         }
@@ -1366,23 +2089,42 @@ fn a_seat_lost_with_the_socket_is_taken_again_and_one_left_on_purpose_is_not() {
     until("connected", || running.link().0 == Link::Connected);
     assert_eq!(running.join_with_audio(ROOM), Ok(()));
     for _ in 0..2 {
-        fake.connected(Duration::from_secs(5)).expect("a connection");
+        fake.connected(Duration::from_secs(5))
+            .expect("a connection");
     }
-    until("in the room after the restart", || running.in_room(ROOM) == ["Ada"]);
-    until("the seat lost", || running.hub.occupants(&running.key(ROOM)).is_none());
-    fake.connected(Duration::from_secs(5)).expect("the third connection");
+    until("in the room after the restart", || {
+        running.in_room(ROOM) == ["Ada"]
+    });
+    until("the seat lost", || {
+        running.hub.occupants(&running.key(ROOM)).is_none()
+    });
+    fake.connected(Duration::from_secs(5))
+        .expect("the third connection");
     std::thread::sleep(Duration::from_millis(700));
     assert!(running.hub.occupants(&running.key(ROOM)).is_none());
 }
 
 fn saved_for(base: &str) -> Saved {
-    Saved { base_url: base.to_owned(), token: "t".to_owned(), user_id: ME.to_owned(), email: None, display_name: "Ada".to_owned(), role: "owner".to_owned(), plain_http_ok: false, e2ee: None }
+    Saved {
+        base_url: base.to_owned(),
+        token: "t".to_owned(),
+        user_id: ME.to_owned(),
+        email: None,
+        display_name: "Ada".to_owned(),
+        role: "owner".to_owned(),
+        plain_http_ok: false,
+        e2ee: None,
+    }
 }
 
 /// What the page reads of one seat beyond mute and deafen.
 fn flags_of(base: &str, room: &str, user: &str) -> Option<protocol::TinySeat> {
     let known = super::super::manage::known(&saved_for(base));
-    known.seats.get(room).and_then(|seats| seats.iter().find(|seat| seat.user_id == user)).cloned()
+    known
+        .seats
+        .get(room)
+        .and_then(|seats| seats.iter().find(|seat| seat.user_id == user))
+        .cloned()
 }
 
 #[test]
@@ -1393,20 +2135,30 @@ fn moderation_and_moves_reach_the_server_and_its_flags_reach_the_page() {
             let reference = frame["ref"].clone();
             match frame["type"].as_str().unwrap_or("") {
                 "call.moderate" => {
-                    assert_eq!((frame["room_id"].as_str(), frame["user_id"].as_str()), (Some(OTHER_ROOM), Some(BEA)));
+                    assert_eq!(
+                        (frame["room_id"].as_str(), frame["user_id"].as_str()),
+                        (Some(OTHER_ROOM), Some(BEA))
+                    );
                     assert_eq!(frame["server_deafened"], true);
-                    assert!(frame.get("server_muted").is_none(), "what was not asked is not sent");
+                    assert!(
+                        frame.get("server_muted").is_none(),
+                        "what was not asked is not sent"
+                    );
                     conn.send(json!({"type": "ok", "ref": reference}));
                     conn.send(json!({"type": "call.state", "room_id": OTHER_ROOM, "user_id": BEA, "muted": false, "deafened": false, "server_muted": true, "server_deafened": true, "suppressed": true, "priority": false}));
                 }
-                "call.move" if frame["user_id"] == "owner" => conn.send(json!({"type": "error", "ref": reference, "code": "hierarchy"})),
+                "call.move" if frame["user_id"] == "owner" => {
+                    conn.send(json!({"type": "error", "ref": reference, "code": "hierarchy"}))
+                }
                 "call.move" => {
                     assert_eq!(frame["room_id"], ROOM);
                     conn.send(json!({"type": "ok", "ref": reference}));
                     conn.send(json!({"type": "call.left", "room_id": OTHER_ROOM, "user_id": BEA, "reason": "moved"}));
                     conn.send(json!({"type": "call.joined", "room_id": ROOM, "user_id": BEA, "participant": {"user_id": BEA, "server_muted": true}}));
                 }
-                "call.join" if frame["room_id"] == "crowded" => conn.send(json!({"type": "error", "ref": reference, "code": "room_full"})),
+                "call.join" if frame["room_id"] == "crowded" => {
+                    conn.send(json!({"type": "error", "ref": reference, "code": "room_full"}))
+                }
                 "call.join" => {
                     let room = frame["room_id"].as_str().unwrap_or("").to_owned();
                     conn.send(json!({"type": "ok", "ref": reference}));
@@ -1424,24 +2176,96 @@ fn moderation_and_moves_reach_the_server_and_its_flags_reach_the_page() {
     });
     let running = run(&fake.base, QUICK);
     until("connected", || running.link().0 == Link::Connected);
-    until("Bea's seat as the server describes it", || flags_of(&fake.base, OTHER_ROOM, BEA).is_some_and(|seat| seat.server_muted && seat.suppressed && !seat.server_deafened));
+    until("Bea's seat as the server describes it", || {
+        flags_of(&fake.base, OTHER_ROOM, BEA)
+            .is_some_and(|seat| seat.server_muted && seat.suppressed && !seat.server_deafened)
+    });
 
     let since = running.hub.seq();
-    let moderate = |reply| Ask::Moderate { room_id: OTHER_ROOM.into(), user_id: BEA.into(), server_muted: None, server_deafened: Some(true), reply };
+    let moderate = |reply| Ask::Moderate {
+        room_id: OTHER_ROOM.into(),
+        user_id: BEA.into(),
+        server_muted: None,
+        server_deafened: Some(true),
+        reply,
+    };
     assert_eq!(running.ask(moderate), Ok(()));
-    until("Bea server-deafened", || flags_of(&fake.base, OTHER_ROOM, BEA).is_some_and(|seat| seat.server_deafened));
+    until("Bea server-deafened", || {
+        flags_of(&fake.base, OTHER_ROOM, BEA).is_some_and(|seat| seat.server_deafened)
+    });
     until("the page told", || running.told_tiny(since));
 
-    assert_eq!(running.ask(|reply| Ask::Move { user_id: "owner".into(), room_id: ROOM.into(), reply }), Err(crate::adapters::tiny::HIERARCHY.to_owned()));
-    assert_eq!(running.ask(|reply| Ask::Move { user_id: BEA.into(), room_id: ROOM.into(), reply }), Ok(()));
-    until("Bea moved, still server-muted", || running.in_room(ROOM) == ["Bea"] && flags_of(&fake.base, ROOM, BEA).is_some_and(|seat| seat.server_muted));
+    assert_eq!(
+        running.ask(|reply| Ask::Move {
+            user_id: "owner".into(),
+            room_id: ROOM.into(),
+            reply
+        }),
+        Err(crate::adapters::tiny::HIERARCHY.to_owned())
+    );
+    assert_eq!(
+        running.ask(|reply| Ask::Move {
+            user_id: BEA.into(),
+            room_id: ROOM.into(),
+            reply
+        }),
+        Ok(())
+    );
+    until("Bea moved, still server-muted", || {
+        running.in_room(ROOM) == ["Bea"]
+            && flags_of(&fake.base, ROOM, BEA).is_some_and(|seat| seat.server_muted)
+    });
     assert!(running.hub.occupants(&running.key(OTHER_ROOM)).is_none());
 
-    assert_eq!(running.ask(|reply| Ask::Join { room_id: "crowded".into(), reply }), Err("That room is full.".to_owned()));
+    assert_eq!(
+        running.ask(|reply| Ask::Join {
+            room_id: "crowded".into(),
+            reply
+        }),
+        Err("That room is full.".to_owned())
+    );
     // Moved by a moderator, we join where we were sent without being asked.
-    assert_eq!(running.ask(|reply| Ask::Join { room_id: ROOM.into(), reply }), Ok(()));
-    until("in the room we were moved to", || running.in_room(OTHER_ROOM) == ["Ada"]);
+    assert_eq!(
+        running.ask(|reply| Ask::Join {
+            room_id: ROOM.into(),
+            reply
+        }),
+        Ok(())
+    );
+    until("in the room we were moved to", || {
+        running.in_room(OTHER_ROOM) == ["Ada"]
+    });
     assert_eq!(running.in_room(ROOM), ["Bea"]);
+}
+
+#[test]
+fn a_share_or_camera_started_mid_call_reaches_the_page() {
+    let fake = fake(&[], |_, mut conn| {
+        conn.send(ready(
+            1,
+            &[ME, BEA],
+            json!([{"room_id": ROOM, "participants": [{"user_id": BEA}]}]),
+        ));
+        conn.idle(Duration::from_millis(300));
+        conn.send(json!({"type": "call.state", "room_id": ROOM, "user_id": BEA, "muted": false, "deafened": false, "camera": false, "sharing": true}));
+        conn.idle(Duration::from_millis(300));
+        conn.send(json!({"type": "call.state", "room_id": ROOM, "user_id": BEA, "muted": false, "deafened": false, "camera": true, "sharing": false}));
+        conn.idle(Duration::from_secs(5));
+    });
+    let running = run(&fake.base, QUICK);
+    until("Bea seated, not sharing", || {
+        flags_of(&fake.base, ROOM, BEA).is_some_and(|seat| !seat.sharing && !seat.camera)
+    });
+    let since = running.hub.seq();
+    until("Bea sharing", || {
+        flags_of(&fake.base, ROOM, BEA).is_some_and(|seat| seat.sharing)
+    });
+    until("the page told of the share", || running.told_tiny(since));
+    let since = running.hub.seq();
+    until("Bea's camera on, share off", || {
+        flags_of(&fake.base, ROOM, BEA).is_some_and(|seat| seat.camera && !seat.sharing)
+    });
+    until("the page told of the camera", || running.told_tiny(since));
 }
 
 #[test]
@@ -1449,17 +2273,34 @@ fn a_moved_call_with_audio_goes_along_muted_and_priority_reaches_the_server() {
     with_mediad();
     let (said, heard) = channel();
     let fake = fake_with("up", &[], move |_, mut conn| {
-        conn.send(ready(1, &[ME, BEA], json!([{"room_id": ROOM, "participants": [{"user_id": BEA, "priority": true}]}])));
+        conn.send(ready(
+            1,
+            &[ME, BEA],
+            json!([{"room_id": ROOM, "participants": [{"user_id": BEA, "priority": true}]}]),
+        ));
         answer_join(&mut conn, "c-1");
-        let state = conn.next(Duration::from_secs(5)).expect("call.state with priority");
-        assert_eq!((state["type"].as_str(), state["muted"].as_bool(), state["priority"].as_bool()), (Some("call.state"), Some(false), Some(true)));
+        let state = conn
+            .next(Duration::from_secs(5))
+            .expect("call.state with priority");
+        assert_eq!(
+            (
+                state["type"].as_str(),
+                state["muted"].as_bool(),
+                state["priority"].as_bool()
+            ),
+            (Some("call.state"), Some(false), Some(true))
+        );
         conn.send(json!({"type": "ok", "ref": state["ref"]}));
-        let state = conn.next(Duration::from_secs(5)).expect("call.state without priority");
+        let state = conn
+            .next(Duration::from_secs(5))
+            .expect("call.state without priority");
         assert!(state.get("priority").is_none(), "{state}");
         conn.send(json!({"type": "ok", "ref": state["ref"]}));
         conn.send(json!({"type": "call.moved", "room_id": OTHER_ROOM}));
         conn.send(json!({"type": "call.left", "room_id": ROOM, "user_id": ME, "reason": "moved"}));
-        let join = conn.next(Duration::from_secs(30)).expect("a join where we were moved");
+        let join = conn
+            .next(Duration::from_secs(30))
+            .expect("a join where we were moved");
         assert_eq!(join["room_id"], OTHER_ROOM);
         let sdp = join["sdp"].as_str().expect("a fresh offer");
         conn.send(json!({"type": "call.answer", "ref": join["ref"], "call_id": "c-2", "sdp": answer_for(sdp)}));
@@ -1472,19 +2313,44 @@ fn a_moved_call_with_audio_goes_along_muted_and_priority_reaches_the_server() {
     until("the health read", || !running.live.seats_only());
     assert_eq!(running.join_with_audio(ROOM), Ok(()));
     until("the call", || the_call(&running).is_some());
-    running.hub.calls.set_audio(&running.hub, true, false).expect("mute in the call");
-    until("Bea holds priority in the roster", || the_call(&running).is_some_and(|call| call.participants.iter().any(|who| who.id == BEA && who.priority)));
+    running
+        .hub
+        .calls
+        .set_audio(&running.hub, true, false)
+        .expect("mute in the call");
+    until("Bea holds priority in the roster", || {
+        the_call(&running).is_some_and(|call| {
+            call.participants
+                .iter()
+                .any(|who| who.id == BEA && who.priority)
+        })
+    });
     running.live.ask(Ask::Priority { on: true });
     running.live.ask(Ask::Priority { on: true });
     running.live.ask(Ask::Priority { on: false });
-    heard.recv_timeout(Duration::from_secs(30)).expect("the moved join answered");
+    heard
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the moved join answered");
     let moved = running.key(OTHER_ROOM);
-    until("the same call, in the new room", || running.hub.calls.describe().0.is_some_and(|call| call.conversation == moved));
+    until("the same call, in the new room", || {
+        running
+            .hub
+            .calls
+            .describe()
+            .0
+            .is_some_and(|call| call.conversation == moved)
+    });
     let call = running.hub.calls.describe().0.expect("the call");
     assert!(call.muted, "mute goes along");
-    assert!(!matches!(call.state, protocol::CallState::Failed { .. }), "{:?}", call.state);
+    assert!(
+        !matches!(call.state, protocol::CallState::Failed { .. }),
+        "{:?}",
+        call.state
+    );
     until("in the new room", || running.in_room(OTHER_ROOM) == ["Ada"]);
-    running.live.ask(Ask::Hangup { room_id: OTHER_ROOM.into() });
+    running.live.ask(Ask::Hangup {
+        room_id: OTHER_ROOM.into(),
+    });
 }
 
 #[test]
@@ -1492,25 +2358,61 @@ fn every_refusal_has_words_and_every_address_has_a_socket() {
     assert_eq!(words(false, "full"), "That room is full.");
     assert_eq!(words(false, "room_full"), "That room is full.");
     assert_eq!(words(false, "banned"), "You're banned from this server.");
-    assert_eq!(words(false, "timed_out"), "You're timed out on this server, so you can't join calls for now.");
+    assert_eq!(
+        words(false, "timed_out"),
+        "You're timed out on this server, so you can't join calls for now."
+    );
     assert_eq!(words(true, "hierarchy"), crate::adapters::tiny::HIERARCHY);
-    assert_eq!(words(false, "server_full"), "Every seat on this server is taken. Try again later.");
+    assert_eq!(
+        words(false, "server_full"),
+        "Every seat on this server is taken. Try again later."
+    );
     assert_eq!(words(false, "not_found"), "That room is gone.");
     assert_eq!(words(true, "not_found"), "They're not in that room's call.");
     assert_eq!(words(true, "forbidden"), "You can't do that.");
-    assert_eq!(words(false, "slow_down"), "Too many tries. Wait a moment, then try again.");
-    assert_eq!(words(false, "unavailable"), "The server had a problem. Try again in a moment.");
-    assert_eq!(words(false, "unknown_type"), "This server doesn't take calls yet.");
-    assert_eq!(words(false, "bad_frame"), "The server couldn't read that request.");
-    assert_eq!(words(false, "bad_sdp"), "The server couldn't use tinyclient's audio setup.");
-    assert_eq!(words(false, "media_unavailable"), "This server's audio isn't available. Try again later.");
+    assert_eq!(
+        words(false, "slow_down"),
+        "Too many tries. Wait a moment, then try again."
+    );
+    assert_eq!(
+        words(false, "unavailable"),
+        "The server had a problem. Try again in a moment."
+    );
+    assert_eq!(
+        words(false, "unknown_type"),
+        "This server doesn't take calls yet."
+    );
+    assert_eq!(
+        words(false, "bad_frame"),
+        "The server couldn't read that request."
+    );
+    assert_eq!(
+        words(false, "bad_sdp"),
+        "The server couldn't use tinyclient's audio setup."
+    );
+    assert_eq!(
+        words(false, "media_unavailable"),
+        "This server's audio isn't available. Try again later."
+    );
     assert_eq!(words(false, "share_taken"), "That didn't work. Try again.");
 
-    assert_eq!(live_url("http://127.0.0.1:8080", None).as_deref(), Some("ws://127.0.0.1:8080/v1/live"));
-    assert_eq!(live_url("https://chat.example/", Some(42)).as_deref(), Some("wss://chat.example/v1/live?since=42"));
+    assert_eq!(
+        live_url("http://127.0.0.1:8080", None).as_deref(),
+        Some("ws://127.0.0.1:8080/v1/live")
+    );
+    assert_eq!(
+        live_url("https://chat.example/", Some(42)).as_deref(),
+        Some("wss://chat.example/v1/live?since=42")
+    );
     assert_eq!(live_url("ftp://chat.example", None), None);
 
-    for (code, end) in [(4001, End::SignedOut), (4002, End::Resync), (4003, End::Removed), (4008, End::Replaced), (4029, End::SlowDown)] {
+    for (code, end) in [
+        (4001, End::SignedOut),
+        (4002, End::Resync),
+        (4003, End::Removed),
+        (4008, End::Replaced),
+        (4029, End::SlowDown),
+    ] {
         assert_eq!(closed(code, ""), end);
     }
     for code in [1011, 1012, 4000, 1009, 1006] {
@@ -1528,35 +2430,68 @@ fn live_socket_round_trip() {
     let session = std::env::var("TINY_LIVE_SESSION").expect("TINY_LIVE_SESSION");
     let saved = super::super::parse(&session).expect("a saved Tiny session");
     let base = saved.base_url.clone();
-    assert!(matches!(saved.role.as_str(), "owner" | "admin"), "the room is made by an owner or an admin");
-    let hub = Arc::new(Hub::new(Store::open(std::path::Path::new(":memory:")).expect("a store in memory")));
-    let account = AccountKey { network: Network::Tiny, account: saved.user_id.clone() };
+    assert!(
+        matches!(saved.role.as_str(), "owner" | "admin"),
+        "the room is made by an owner or an admin"
+    );
+    let hub = Arc::new(Hub::new(
+        Store::open(std::path::Path::new(":memory:")).expect("a store in memory"),
+    ));
+    let account = AccountKey {
+        network: Network::Tiny,
+        account: saved.user_id.clone(),
+    };
     let (adapter, ctx, _inbox) = local(account.clone(), hub.clone());
     ctx.link(Link::Offline);
     let live = Arc::new(Live::new().expect("a wake pair"));
     let (socket, socket_live) = (saved.clone(), live.clone());
     let thread = std::thread::spawn(move || keep_live(&ctx, &socket, &socket_live, &SERVER));
-    let running = Running { hub, account, live, adapter: Some(adapter), thread: Some(thread) };
+    let running = Running {
+        hub,
+        account,
+        live,
+        adapter: Some(adapter),
+        thread: Some(thread),
+    };
     until("the live socket", || running.link().0 == Link::Connected);
-    assert_eq!(running.hub.presence(&running.key(&saved.user_id)), Presence::Online, "ready lists me online");
+    assert_eq!(
+        running.hub.presence(&running.key(&saved.user_id)),
+        Presence::Online,
+        "ready lists me online"
+    );
 
-    let made = super::super::call("POST", &format!("{base}/v1/rooms"), Some(&saved.token), Some(json!({"name": "tinyclient live test"})));
+    let made = super::super::call(
+        "POST",
+        &format!("{base}/v1/rooms"),
+        Some(&saved.token),
+        Some(json!({"name": "tinyclient live test"})),
+    );
     let room = match made {
         Ok((201, body)) => body["id"].as_str().expect("a room id").to_owned(),
         _ => panic!("the room was not made"),
     };
     let since = running.hub.seq();
     until("room.created reaches the page", || running.told_tiny(since));
-    let joined = running.ask(|reply| Ask::Join { room_id: room.clone(), reply });
+    let joined = running.ask(|reply| Ask::Join {
+        room_id: room.clone(),
+        reply,
+    });
     let left = joined.as_ref().ok().map(|()| {
         until("my seat", || running.in_room(&room).len() == 1);
         running.ask(|reply| Ask::Leave { reply })
     });
-    let gone = super::super::call("DELETE", &format!("{base}/v1/rooms/{room}"), Some(&saved.token), None);
+    let gone = super::super::call(
+        "DELETE",
+        &format!("{base}/v1/rooms/{room}"),
+        Some(&saved.token),
+        None,
+    );
     assert!(matches!(gone, Ok((204, _))), "the room was put back");
     assert_eq!(joined, Ok(()));
     assert_eq!(left, Some(Ok(())));
-    until("the seat gone", || running.hub.occupants(&running.key(&room)).is_none());
+    until("the seat gone", || {
+        running.hub.occupants(&running.key(&room)).is_none()
+    });
     drop(running);
 }
 
@@ -1573,20 +2508,25 @@ impl Hand {
     fn join(saved: &Saved, room: &str, ice: &str, sink: &std::path::Path) -> Hand {
         let url = live_url(&saved.base_url, None).expect("a live address");
         let mut request = url.into_client_request().expect("a request");
-        request.headers_mut().insert("Authorization", HeaderValue::from_str(&format!("Bearer {}", saved.token)).expect("a header"));
+        request.headers_mut().insert(
+            "Authorization",
+            HeaderValue::from_str(&format!("Bearer {}", saved.token)).expect("a header"),
+        );
         let (ws, _) = tungstenite::connect(request).expect("the second live socket");
         if let tungstenite::stream::MaybeTlsStream::Plain(tcp) = ws.get_ref() {
-            tcp.set_read_timeout(Some(Duration::from_millis(200))).expect("a read timeout");
+            tcp.set_read_timeout(Some(Duration::from_millis(200)))
+                .expect("a read timeout");
         }
-        let mut mediad = std::process::Command::new(std::env::var_os("TINYCLIENT_MEDIAD").expect("mediad"))
-            .arg("1")
-            .env("TINYCLIENT_MEDIAD_AUDIO", "tone")
-            .env("TINYCLIENT_MEDIAD_SINK", sink)
-            .env("TINYCLIENT_MEDIAD_ICE", ice)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .expect("the second mediad");
+        let mut mediad =
+            std::process::Command::new(std::env::var_os("TINYCLIENT_MEDIAD").expect("mediad"))
+                .arg("1")
+                .env("TINYCLIENT_MEDIAD_AUDIO", "tone")
+                .env("TINYCLIENT_MEDIAD_SINK", sink)
+                .env("TINYCLIENT_MEDIAD_ICE", ice)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect("the second mediad");
         let stdin = mediad.stdin.take();
         let mut stdout = mediad.stdout.take().expect("stdout");
         let (found, frames) = channel();
@@ -1597,31 +2537,76 @@ impl Hand {
                 }
             }
         });
-        let mut hand = Hand { ws, mediad, stdin, frames };
-        assert!(matches!(hand.frames.recv_timeout(Duration::from_secs(10)), Ok(protocol::MediaResponse::Ready { .. })));
-        let host = tungstenite::http::Uri::try_from(saved.base_url.as_str()).expect("an address").host().unwrap_or("").to_owned();
-        let offer = TinyOffer { user_id: saved.user_id.clone(), host, slots: ROOM_CAP - 1, muted: false, deafened: false, e2ee: None };
-        let protocol::MediaResponse::Offer { sdp } = hand.ask(protocol::MediaRequest::TinyOffer(offer)) else {
+        let mut hand = Hand {
+            ws,
+            mediad,
+            stdin,
+            frames,
+        };
+        assert!(matches!(
+            hand.frames.recv_timeout(Duration::from_secs(10)),
+            Ok(protocol::MediaResponse::Ready { .. })
+        ));
+        let host = tungstenite::http::Uri::try_from(saved.base_url.as_str())
+            .expect("an address")
+            .host()
+            .unwrap_or("")
+            .to_owned();
+        let offer = TinyOffer {
+            user_id: saved.user_id.clone(),
+            host,
+            slots: ROOM_CAP - 1,
+            muted: false,
+            deafened: false,
+            e2ee: None,
+        };
+        let protocol::MediaResponse::Offer { sdp } =
+            hand.ask(protocol::MediaRequest::TinyOffer(offer))
+        else {
             panic!("no offer");
         };
         hand.send(json!({"type": "call.join", "ref": "join", "room_id": room, "sdp": sdp}));
         let answer = hand.until("call.answer", |frame| frame["type"] == "call.answer");
         let call_id = answer["call_id"].as_str().expect("a call id").to_owned();
-        assert_eq!(hand.ask(protocol::MediaRequest::TinyAnswer { sdp: answer["sdp"].as_str().expect("an answer").to_owned() }), protocol::MediaResponse::Done);
-        let slots = hand.until("call.slots", |frame| frame["type"] == "call.slots" && frame["call_id"] == call_id.as_str());
-        let audio = slots["audio"].as_array().into_iter().flatten().map(|slot| TinySlot { mid: slot["mid"].as_str().unwrap_or("").into(), user_id: slot["user_id"].as_str().unwrap_or("").into() });
-        assert_eq!(hand.ask(protocol::MediaRequest::TinySlots { audio: audio.collect() }), protocol::MediaResponse::Done);
+        assert_eq!(
+            hand.ask(protocol::MediaRequest::TinyAnswer {
+                sdp: answer["sdp"].as_str().expect("an answer").to_owned()
+            }),
+            protocol::MediaResponse::Done
+        );
+        let slots = hand.until("call.slots", |frame| {
+            frame["type"] == "call.slots" && frame["call_id"] == call_id.as_str()
+        });
+        let audio = slots["audio"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|slot| TinySlot {
+                mid: slot["mid"].as_str().unwrap_or("").into(),
+                user_id: slot["user_id"].as_str().unwrap_or("").into(),
+            });
+        assert_eq!(
+            hand.ask(protocol::MediaRequest::TinySlots {
+                audio: audio.collect()
+            }),
+            protocol::MediaResponse::Done
+        );
         hand
     }
 
     fn send(&mut self, frame: Value) {
-        self.ws.send(Message::text(frame.to_string())).expect("sent");
+        self.ws
+            .send(Message::text(frame.to_string()))
+            .expect("sent");
     }
 
     fn ask(&mut self, request: protocol::MediaRequest) -> protocol::MediaResponse {
         protocol::write_frame(self.stdin.as_mut().expect("stdin"), &request).expect("written");
         loop {
-            let frame = self.frames.recv_timeout(Duration::from_secs(10)).expect("mediad answered");
+            let frame = self
+                .frames
+                .recv_timeout(Duration::from_secs(10))
+                .expect("mediad answered");
             if frame.is_reply() {
                 return frame;
             }
@@ -1641,7 +2626,8 @@ impl Hand {
                     }
                 }
                 Ok(_) => {}
-                Err(tungstenite::Error::Io(err)) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+                Err(tungstenite::Error::Io(err))
+                    if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
                 Err(err) => panic!("the second live socket: {err}"),
             }
         }
@@ -1659,7 +2645,10 @@ impl Hand {
 /// The level of the last half second a mediad played into `sink`. The tone is about 5657.
 fn played_level(sink: &std::path::Path) -> f64 {
     let bytes = std::fs::read(sink).unwrap_or_default();
-    let pcm: Vec<i16> = bytes.chunks_exact(2).map(|pair| i16::from_le_bytes([pair[0], pair[1]])).collect();
+    let pcm: Vec<i16> = bytes
+        .chunks_exact(2)
+        .map(|pair| i16::from_le_bytes([pair[0], pair[1]]))
+        .collect();
     let tail = &pcm[pcm.len().saturating_sub(48_000)..];
     (tail.iter().map(|&s| f64::from(s).powi(2)).sum::<f64>() / tail.len().max(1) as f64).sqrt()
 }
@@ -1689,9 +2678,19 @@ fn tiny_server_call() {
     let session = std::env::var("TINY_LIVE_SESSION").expect("TINY_LIVE_SESSION");
     let owner = super::super::parse(&session).expect("a saved Tiny session");
     let base = owner.base_url.clone();
-    assert!(matches!(owner.role.as_str(), "owner" | "admin"), "the room is made by an owner or an admin");
-    let made = super::super::call("POST", &format!("{base}/v1/rooms"), Some(&owner.token), Some(json!({"name": "tinyclient audio test"})));
-    let Ok((201, room)) = made else { panic!("the room was not made") };
+    assert!(
+        matches!(owner.role.as_str(), "owner" | "admin"),
+        "the room is made by an owner or an admin"
+    );
+    let made = super::super::call(
+        "POST",
+        &format!("{base}/v1/rooms"),
+        Some(&owner.token),
+        Some(json!({"name": "tinyclient audio test"})),
+    );
+    let Ok((201, room)) = made else {
+        panic!("the room was not made")
+    };
     let room = room["id"].as_str().expect("a room id").to_owned();
     let bea = std::env::var("TINY_LIVE_SESSION_BEA").expect("TINY_LIVE_SESSION_BEA");
     let bea = super::super::parse(&bea).expect("Bea's saved Tiny session");
@@ -1699,34 +2698,74 @@ fn tiny_server_call() {
 
     let outcome = std::panic::catch_unwind(|| {
         for ice in ["udp", "tcp"] {
-            let (ada_sink, bea_sink) = (std::env::temp_dir().join(format!("tc-call-{ice}-ada.pcm")), std::env::temp_dir().join(format!("tc-call-{ice}-bea.pcm")));
+            let (ada_sink, bea_sink) = (
+                std::env::temp_dir().join(format!("tc-call-{ice}-ada.pcm")),
+                std::env::temp_dir().join(format!("tc-call-{ice}-bea.pcm")),
+            );
             std::env::set_var("TINYCLIENT_MEDIAD_ICE", ice);
             std::env::set_var("TINYCLIENT_MEDIAD_SINK", &ada_sink);
-            let hub = Arc::new(Hub::new(Store::open(std::path::Path::new(":memory:")).expect("a store in memory")));
-            let account = AccountKey { network: Network::Tiny, account: owner.user_id.clone() };
+            let hub = Arc::new(Hub::new(
+                Store::open(std::path::Path::new(":memory:")).expect("a store in memory"),
+            ));
+            let account = AccountKey {
+                network: Network::Tiny,
+                account: owner.user_id.clone(),
+            };
             let (adapter, ctx, _inbox) = local(account.clone(), hub.clone());
             ctx.link(Link::Offline);
             let live = Arc::new(Live::new().expect("a wake pair"));
             let (socket, socket_live) = (owner.clone(), live.clone());
-            let thread = std::thread::spawn(move || keep_live(&ctx, &socket, &socket_live, &SERVER));
-            let ada = Running { hub, account, live, adapter: Some(adapter), thread: Some(thread) };
+            let thread =
+                std::thread::spawn(move || keep_live(&ctx, &socket, &socket_live, &SERVER));
+            let ada = Running {
+                hub,
+                account,
+                live,
+                adapter: Some(adapter),
+                thread: Some(thread),
+            };
             until("the live socket", || ada.link().0 == Link::Connected);
             until("the server's audio is up", || !ada.live.seats_only());
 
             assert_eq!(ada.join_with_audio(&room), Ok(()));
             let bea_hand = Hand::join(&bea, &room, ice, &bea_sink);
             let joined = Instant::now();
-            let call = || ada.hub.calls.describe().0.filter(|call| call.conversation == ada.key(&room));
+            let call = || {
+                ada.hub
+                    .calls
+                    .describe()
+                    .0
+                    .filter(|call| call.conversation == ada.key(&room))
+            };
             while call().is_none_or(|call| call.state != protocol::CallState::Joined) {
-                assert!(joined.elapsed() < Duration::from_secs(15), "Ada's call is up over {ice}: {:?}", call());
+                assert!(
+                    joined.elapsed() < Duration::from_secs(15),
+                    "Ada's call is up over {ice}: {:?}",
+                    call()
+                );
                 std::thread::sleep(Duration::from_millis(50));
             }
-            while !((3000. ..7000.).contains(&played_level(&ada_sink)) && (3000. ..7000.).contains(&played_level(&bea_sink))) {
-                assert!(joined.elapsed() < Duration::from_secs(20), "each hears the other over {ice}: {} {}", played_level(&ada_sink), played_level(&bea_sink));
+            while !((3000. ..7000.).contains(&played_level(&ada_sink))
+                && (3000. ..7000.).contains(&played_level(&bea_sink)))
+            {
+                assert!(
+                    joined.elapsed() < Duration::from_secs(20),
+                    "each hears the other over {ice}: {} {}",
+                    played_level(&ada_sink),
+                    played_level(&bea_sink)
+                );
                 std::thread::sleep(Duration::from_millis(100));
             }
-            tracing::warn!("over {ice}: Ada hears {:.0}, Bea hears {:.0}", played_level(&ada_sink), played_level(&bea_sink));
-            assert!(call().is_some_and(|call| call.participants.iter().any(|who| who.id == bea.user_id)), "Bea is on Ada's roster");
+            tracing::warn!(
+                "over {ice}: Ada hears {:.0}, Bea hears {:.0}",
+                played_level(&ada_sink),
+                played_level(&bea_sink)
+            );
+            assert!(
+                call()
+                    .is_some_and(|call| call.participants.iter().any(|who| who.id == bea.user_id)),
+                "Bea is on Ada's roster"
+            );
             bea_hand.leave();
             assert_eq!(ada.ask(|reply| Ask::Leave { reply }), Ok(()));
             until("Ada's call over", || call().is_none());
@@ -1737,7 +2776,12 @@ fn tiny_server_call() {
     });
     std::env::remove_var("TINYCLIENT_MEDIAD_ICE");
     std::env::remove_var("TINYCLIENT_MEDIAD_SINK");
-    let gone = super::super::call("DELETE", &format!("{base}/v1/rooms/{room}"), Some(&owner.token), None);
+    let gone = super::super::call(
+        "DELETE",
+        &format!("{base}/v1/rooms/{room}"),
+        Some(&owner.token),
+        None,
+    );
     assert!(matches!(gone, Ok((204, _))), "the room was put back");
     if let Err(panic) = outcome {
         std::panic::resume_unwind(panic);
@@ -1748,13 +2792,34 @@ fn tiny_server_call() {
 fn an_incognito_host_or_a_requiring_room_never_carries_a_call_on_unencrypted() {
     // An ordinary self-hosted server: the person decides, call by call.
     assert_eq!(must_encrypt("chat.example.org", false, true), Ok(false));
-    assert_eq!(must_encrypt("192.168.1.120", false, false), Ok(false), "a server with no e2ee is joined, and says so");
+    assert_eq!(
+        must_encrypt("192.168.1.120", false, false),
+        Ok(false),
+        "a server with no e2ee is joined, and says so"
+    );
     // Incognito promises encrypted calls: required, and not joined at all without encryption.
-    assert_eq!(must_encrypt("c-7f3k2x9q.incognito.tinyclient.io", false, true), Ok(true));
-    assert_eq!(must_encrypt("incognito.tinyclient.io", false, false), Err(INCOGNITO_CANNOT_ENCRYPT));
-    assert_eq!(must_encrypt("evilincognito.tinyclient.io", false, true), Ok(false), "only Incognito's own names");
-    assert_eq!(must_encrypt("c-1.tinycloud.chat", false, true), Ok(false), "not a domain Incognito owns");
+    assert_eq!(
+        must_encrypt("c-7f3k2x9q.incognito.tinyclient.io", false, true),
+        Ok(true)
+    );
+    assert_eq!(
+        must_encrypt("incognito.tinyclient.io", false, false),
+        Err(INCOGNITO_CANNOT_ENCRYPT)
+    );
+    assert_eq!(
+        must_encrypt("evilincognito.tinyclient.io", false, true),
+        Ok(false),
+        "only Incognito's own names"
+    );
+    assert_eq!(
+        must_encrypt("c-1.tinycloud.chat", false, true),
+        Ok(false),
+        "not a domain Incognito owns"
+    );
     // A room that requires it, on any server.
     assert_eq!(must_encrypt("chat.example.org", true, true), Ok(true));
-    assert_eq!(must_encrypt("chat.example.org", true, false), Err(ROOM_CANNOT_ENCRYPT));
+    assert_eq!(
+        must_encrypt("chat.example.org", true, false),
+        Err(ROOM_CANNOT_ENCRYPT)
+    );
 }
